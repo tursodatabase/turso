@@ -1,416 +1,415 @@
 package turso
 
 import (
-	"bytes"
-	"errors"
 	"testing"
-	"unsafe"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
-// helper to require a loaded library for integration tests
-func requireLibLoaded(t *testing.T) {
-	t.Helper()
-	// If the init() in bindings.go succeeded, at least one of the function pointers should be non-nil.
-	// Choose one arbitrarily.
-	if c_turso_database_new == nil {
-		t.Skip("Turso dynamic library is not loaded; set TURSO_LIB_PATH to the shared library to run integration tests")
-	}
+type dbConn struct {
+	db   TursoDatabase
+	conn TursoConnection
 }
 
-// helper to open an in-memory database and return db, conn
-func openMemoryDB(t *testing.T) (TursoDatabase, TursoConnection) {
+func openInMemory(t *testing.T) (*dbConn, func()) {
 	t.Helper()
-	requireLibLoaded(t)
-
-	if err := turso_setup(TursoConfig{}); err != nil {
-		t.Fatalf("turso_setup failed: %v", err)
-	}
 
 	db, err := turso_database_new(TursoDatabaseConfig{
-		Path:    ":memory:",
-		AsyncIO: false,
+		Path:                 ":memory:",
+		ExperimentalFeatures: "",
+		AsyncIO:              false,
 	})
-	if err != nil {
-		t.Fatalf("turso_database_new failed: %v", err)
-	}
-	if err := turso_database_open(db); err != nil {
-		turso_database_deinit(db)
-		t.Fatalf("turso_database_open failed: %v", err)
-	}
+	require.NoError(t, err)
+	require.NotNil(t, db)
+
+	require.NoError(t, turso_database_open(db))
 
 	conn, err := turso_database_connect(db)
-	if err != nil {
+	require.NoError(t, err)
+	require.NotNil(t, conn)
+
+	cleanup := func() {
+		_ = turso_connection_close(conn)
+		turso_connection_deinit(conn)
 		turso_database_deinit(db)
-		t.Fatalf("turso_database_connect failed: %v", err)
 	}
-
-	return db, conn
+	return &dbConn{db: db, conn: conn}, cleanup
 }
 
-func closeDB(t *testing.T, db TursoDatabase, conn TursoConnection) {
+func prepExec(t *testing.T, conn TursoConnection, sql string) uint64 {
 	t.Helper()
-	_ = turso_connection_close(conn)
-	turso_connection_deinit(conn)
-	turso_database_deinit(db)
-}
-
-func TestSetupAndOpenMemoryDB(t *testing.T) {
-	db, conn := openMemoryDB(t)
-	defer closeDB(t, db, conn)
-
-	// Autocommit should be true on a new connection
-	if ac := turso_connection_get_autocommit(conn); !ac {
-		t.Fatalf("expected autocommit to be true on a new connection")
-	}
-}
-
-func TestCreateInsertSelectRoundtrip(t *testing.T) {
-	db, conn := openMemoryDB(t)
-	defer closeDB(t, db, conn)
-
-	// Create table
-	stmt, err := turso_connection_prepare_single(conn, "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT, val REAL, data BLOB, n NULL)")
-	if err != nil {
-		t.Fatalf("prepare create table failed: %v", err)
-	}
-	if _, err := turso_statement_execute(stmt); err != nil {
+	stmt, err := turso_connection_prepare_single(conn, sql)
+	require.NoError(t, err)
+	defer func() {
+		_ = turso_statement_finalize(stmt)
 		turso_statement_deinit(stmt)
-		t.Fatalf("execute create table failed: %v", err)
-	}
-	if err := turso_statement_finalize(stmt); err != nil {
-		t.Fatalf("finalize create table failed: %v", err)
-	}
-	turso_statement_deinit(stmt)
+	}()
+	changes, err := turso_statement_execute(stmt)
+	require.NoError(t, err)
+	return changes
+}
 
-	// Insert row with all types
-	stmt, err = turso_connection_prepare_single(conn, "INSERT INTO t (id, name, val, data, n) VALUES (?, ?, ?, ?, ?)")
-	if err != nil {
-		t.Fatalf("prepare insert failed: %v", err)
-	}
-	if err := turso_statement_bind_positional_int(stmt, 1, 1); err != nil {
-		t.Fatalf("bind int failed: %v", err)
-	}
-	if err := turso_statement_bind_positional_text(stmt, 2, "alice"); err != nil {
-		t.Fatalf("bind text failed: %v", err)
-	}
-	if err := turso_statement_bind_positional_double(stmt, 3, 3.14); err != nil {
-		t.Fatalf("bind double failed: %v", err)
-	}
-	if err := turso_statement_bind_positional_blob(stmt, 4, []byte{1, 2, 3}); err != nil {
-		t.Fatalf("bind blob failed: %v", err)
-	}
-	if err := turso_statement_bind_positional_null(stmt, 5); err != nil {
-		t.Fatalf("bind null failed: %v", err)
-	}
-	rows, err := turso_statement_execute(stmt)
-	if err != nil {
-		t.Fatalf("execute insert failed: %v", err)
-	}
-	if rows != 1 {
-		t.Fatalf("expected 1 row changed, got %d", rows)
-	}
-	if err := turso_statement_finalize(stmt); err != nil {
-		t.Fatalf("finalize insert failed: %v", err)
-	}
-	turso_statement_deinit(stmt)
+func prepStmt(t *testing.T, conn TursoConnection, sql string) TursoStatement {
+	t.Helper()
+	stmt, err := turso_connection_prepare_single(conn, sql)
+	require.NoError(t, err)
+	return stmt
+}
 
-	// Select row and verify values
-	stmt, err = turso_connection_prepare_single(conn, "SELECT id, name, val, data, n FROM t WHERE id = ?")
-	if err != nil {
-		t.Fatalf("prepare select failed: %v", err)
+func stepRow(t *testing.T, stmt TursoStatement) bool {
+	t.Helper()
+	code, err := turso_statement_step(stmt)
+	require.NoError(t, err)
+	if code == TURSO_ROW {
+		return true
 	}
-	if err := turso_statement_bind_positional_int(stmt, 1, 1); err != nil {
-		t.Fatalf("bind int (select) failed: %v", err)
-	}
-	status, err := turso_statement_step(stmt)
-	if err != nil {
-		t.Fatalf("step select failed: %v", err)
-	}
-	if status != TURSO_ROW {
-		t.Fatalf("expected TURSO_ROW, got %v", status)
-	}
+	require.Equal(t, TURSO_DONE, code)
+	return false
+}
 
-	if got := turso_statement_column_count(stmt); got != 5 {
-		t.Fatalf("expected 5 columns, got %d", got)
-	}
+func TestSetupAndOpenMemory(t *testing.T) {
+	conn, cleanup := openInMemory(t)
+	defer cleanup()
 
-	// Check column names are non-empty
-	for i := 0; i < 5; i++ {
-		name := turso_statement_column_name(stmt, i)
-		if name == "" {
-			t.Fatalf("column %d name is empty", i)
-		}
-	}
+	ac := turso_connection_get_autocommit(conn.conn)
+	assert.True(t, ac, "autocommit should be true for new connection")
 
-	// id
-	if kind := turso_statement_row_value_kind(stmt, 0); kind != TURSO_TYPE_INTEGER {
-		t.Fatalf("id kind expected INTEGER, got %v", kind)
-	}
-	if id := turso_statement_row_value_int(stmt, 0); id != 1 {
-		t.Fatalf("id expected 1, got %d", id)
-	}
-
-	// name
-	if kind := turso_statement_row_value_kind(stmt, 1); kind != TURSO_TYPE_TEXT {
-		t.Fatalf("name kind expected TEXT, got %v", kind)
-	}
-	if n := turso_statement_row_value_bytes_count(stmt, 1); n != int64(len("alice")) {
-		t.Fatalf("name bytes count expected %d, got %d", len("alice"), n)
-	}
-	{
-		n := turso_statement_row_value_bytes_count(stmt, 1)
-		ptr := turso_statement_row_value_bytes_ptr(stmt, 1)
-		if ptr == nil {
-			t.Fatalf("name bytes ptr is 0")
-		}
-		b := unsafe.Slice((*byte)(unsafe.Pointer(ptr)), n)
-		// copy to detach before next step
-		name := string(append([]byte{}, b...))
-		if name != "alice" {
-			t.Fatalf("name expected 'alice', got %q", name)
-		}
-	}
-
-	// val
-	if kind := turso_statement_row_value_kind(stmt, 2); kind != TURSO_TYPE_REAL {
-		t.Fatalf("val kind expected REAL, got %v", kind)
-	}
-	if v := turso_statement_row_value_double(stmt, 2); (v < 3.139) || (v > 3.141) {
-		t.Fatalf("val expected ~3.14, got %v", v)
-	}
-
-	// data
-	if kind := turso_statement_row_value_kind(stmt, 3); kind != TURSO_TYPE_BLOB {
-		t.Fatalf("data kind expected BLOB, got %v", kind)
-	}
-	if n := turso_statement_row_value_bytes_count(stmt, 3); n != 3 {
-		t.Fatalf("data bytes count expected 3, got %d", n)
-	}
-	{
-		n := turso_statement_row_value_bytes_count(stmt, 3)
-		ptr := turso_statement_row_value_bytes_ptr(stmt, 3)
-		if ptr == nil {
-			t.Fatalf("data bytes ptr is 0")
-		}
-		b := unsafe.Slice((*byte)(unsafe.Pointer(ptr)), n)
-		got := append([]byte{}, b...)
-		if !bytes.Equal(got, []byte{1, 2, 3}) {
-			t.Fatalf("data expected [1 2 3], got %v", got)
-		}
-	}
-
-	// n (NULL)
-	if kind := turso_statement_row_value_kind(stmt, 4); kind != TURSO_TYPE_NULL {
-		t.Fatalf("n kind expected NULL, got %v", kind)
-	}
-	if n := turso_statement_row_value_bytes_count(stmt, 4); n != -1 {
-		t.Fatalf("n bytes count expected -1, got %d", n)
-	}
-	if p := turso_statement_row_value_bytes_ptr(stmt, 4); p != nil {
-		t.Fatalf("n bytes ptr expected 0, got %v", p)
-	}
-	if i := turso_statement_row_value_int(stmt, 4); i != 0 {
-		t.Fatalf("n int expected 0, got %d", i)
-	}
-	if d := turso_statement_row_value_double(stmt, 4); d != 0 {
-		t.Fatalf("n double expected 0, got %v", d)
-	}
-
-	// next step should be DONE
-	status, err = turso_statement_step(stmt)
-	if err != nil {
-		t.Fatalf("second step select failed: %v", err)
-	}
-	if status != TURSO_DONE {
-		t.Fatalf("expected TURSO_DONE, got %v", status)
-	}
-
-	if err := turso_statement_finalize(stmt); err != nil {
-		t.Fatalf("finalize select failed: %v", err)
-	}
-	turso_statement_deinit(stmt)
+	// simple sanity DDL
+	changes := prepExec(t, conn.conn, "CREATE TABLE t(id INTEGER PRIMARY KEY, a INTEGER)")
+	assert.Equal(t, uint64(0), changes)
 }
 
 func TestPrepareFirstMultipleStatements(t *testing.T) {
-	db, conn := openMemoryDB(t)
-	defer closeDB(t, db, conn)
+	conn, cleanup := openInMemory(t)
+	defer cleanup()
 
-	sql := "CREATE TABLE y(x INTEGER); INSERT INTO y(x) VALUES (42); SELECT x FROM y;"
-
-	// First statement: CREATE TABLE
-	stmt, tail, err := turso_connection_prepare_first(conn, sql)
-	if err != nil {
-		t.Fatalf("prepare_first 1 failed: %v", err)
-	}
-	if stmt == nil {
-		t.Fatalf("expected a statement for first part")
-	}
-	if _, err := turso_statement_execute(stmt); err != nil {
-		t.Fatalf("execute create table failed: %v", err)
-	}
-	if err := turso_statement_finalize(stmt); err != nil {
-		t.Fatalf("finalize create failed: %v", err)
-	}
-	turso_statement_deinit(stmt)
-
-	// Second statement: INSERT
-	stmt, tail2, err := turso_connection_prepare_first(conn, sql[tail:])
-	if err != nil {
-		t.Fatalf("prepare_first 2 failed: %v", err)
-	}
-	if stmt == nil {
-		t.Fatalf("expected a statement for second part")
-	}
-	// tail2 is relative to the substring
-	if tail2 == 0 {
-		t.Fatalf("expected non-zero tail for second part")
-	}
-	rows, err := turso_statement_execute(stmt)
-	if err != nil {
-		t.Fatalf("execute insert failed: %v", err)
-	}
-	if rows != 1 {
-		t.Fatalf("expected 1 row changed from insert, got %d", rows)
-	}
-	if err := turso_statement_finalize(stmt); err != nil {
-		t.Fatalf("finalize insert failed: %v", err)
-	}
-	turso_statement_deinit(stmt)
-
-	// Third statement: SELECT
-	offset := tail + tail2
-	stmt, _, err = turso_connection_prepare_first(conn, sql[offset:])
-	if err != nil {
-		t.Fatalf("prepare_first 3 failed: %v", err)
-	}
-	if stmt == nil {
-		t.Fatalf("expected a statement for third part")
-	}
-	status, err := turso_statement_step(stmt)
-	if err != nil {
-		t.Fatalf("step select failed: %v", err)
-	}
-	if status != TURSO_ROW {
-		t.Fatalf("expected TURSO_ROW, got %v", status)
-	}
-	if c := turso_statement_column_count(stmt); c != 1 {
-		t.Fatalf("expected 1 column, got %d", c)
-	}
-	if kind := turso_statement_row_value_kind(stmt, 0); kind != TURSO_TYPE_INTEGER {
-		t.Fatalf("expected INTEGER kind, got %v", kind)
-	}
-	if x := turso_statement_row_value_int(stmt, 0); x != 42 {
-		t.Fatalf("expected x=42, got %d", x)
-	}
-	if err := turso_statement_finalize(stmt); err != nil {
-		t.Fatalf("finalize select failed: %v", err)
-	}
-	turso_statement_deinit(stmt)
-}
-
-func TestNamedPosition(t *testing.T) {
-	db, conn := openMemoryDB(t)
-	defer closeDB(t, db, conn)
-
-	stmt, err := turso_connection_prepare_single(conn, "SELECT :x + ?")
-	if err != nil {
-		t.Fatalf("prepare failed: %v", err)
-	}
-	pos := turso_statement_named_position(stmt, "x")
-	if pos <= 0 {
-		t.Fatalf("expected named position > 0 for :x, got %d", pos)
-	}
-	if err := turso_statement_finalize(stmt); err != nil {
-		t.Fatalf("finalize failed: %v", err)
-	}
-	turso_statement_deinit(stmt)
-}
-
-func TestStatementReset(t *testing.T) {
-	db, conn := openMemoryDB(t)
-	defer closeDB(t, db, conn)
-
-	// Create table and populate
-	{
-		stmt, err := turso_connection_prepare_single(conn, "CREATE TABLE z(i INTEGER)")
-		if err != nil {
-			t.Fatalf("prepare create failed: %v", err)
+	sql := "CREATE TABLE t(a INT); INSERT INTO t(a) VALUES(1); SELECT a FROM t;"
+	start := 0
+	for {
+		sub := sql[start:]
+		stmt, tail, err := turso_connection_prepare_first(conn.conn, sub)
+		require.NoError(t, err)
+		if stmt == nil {
+			break
 		}
-		if _, err := turso_statement_execute(stmt); err != nil {
-			t.Fatalf("execute create failed: %v", err)
+		if tail <= 0 {
+			break
 		}
-		if err := turso_statement_finalize(stmt); err != nil {
-			t.Fatalf("finalize create failed: %v", err)
+
+		// Execute or step depending on statement type
+		colCount := turso_statement_column_count(stmt)
+		if colCount == 0 {
+			_, err := turso_statement_execute(stmt)
+			require.NoError(t, err)
+		} else {
+			require.True(t, stepRow(t, stmt))
+			v := turso_statement_row_value_int(stmt, 0)
+			assert.Equal(t, int64(1), v)
+			require.False(t, stepRow(t, stmt))
 		}
+		_ = turso_statement_finalize(stmt)
 		turso_statement_deinit(stmt)
+		start += tail
 	}
-	{
-		stmt, err := turso_connection_prepare_single(conn, "INSERT INTO z(i) VALUES (1), (2)")
-		if err != nil {
-			t.Fatalf("prepare insert failed: %v", err)
-		}
-		if _, err := turso_statement_execute(stmt); err != nil {
-			t.Fatalf("execute insert failed: %v", err)
-		}
-		if err := turso_statement_finalize(stmt); err != nil {
-			t.Fatalf("finalize insert failed: %v", err)
-		}
+	// Verify result
+	stmt := prepStmt(t, conn.conn, "SELECT a FROM t")
+	defer func() {
+		_ = turso_statement_finalize(stmt)
 		turso_statement_deinit(stmt)
-	}
-
-	// Select with reset in between
-	stmt, err := turso_connection_prepare_single(conn, "SELECT i FROM z ORDER BY i")
-	if err != nil {
-		t.Fatalf("prepare select failed: %v", err)
-	}
-
-	// Step first row
-	status, err := turso_statement_step(stmt)
-	if err != nil || status != TURSO_ROW {
-		t.Fatalf("first step expected ROW, got %v, err=%v", status, err)
-	}
-	if turso_statement_row_value_int(stmt, 0) != 1 {
-		t.Fatalf("expected first row 1")
-	}
-
-	// Reset and step again; should start from first row again
-	if err := turso_statement_reset(stmt); err != nil {
-		t.Fatalf("reset failed: %v", err)
-	}
-	status, err = turso_statement_step(stmt)
-	if err != nil || status != TURSO_ROW {
-		t.Fatalf("after reset, expected ROW, got %v, err=%v", status, err)
-	}
-	if turso_statement_row_value_int(stmt, 0) != 1 {
-		t.Fatalf("expected first row 1 after reset")
-	}
-
-	if err := turso_statement_finalize(stmt); err != nil {
-		t.Fatalf("finalize select failed: %v", err)
-	}
-	turso_statement_deinit(stmt)
+	}()
+	require.True(t, stepRow(t, stmt))
+	assert.Equal(t, int64(1), turso_statement_row_value_int(stmt, 0))
+	require.False(t, stepRow(t, stmt))
 }
 
-func TestStatusErrorMapping(t *testing.T) {
-	// Ensure mapping without error message ptr
-	tests := []struct {
-		code TursoStatusCode
-		err  error
-	}{
-		{TURSO_BUSY, TursoBusyErr},
-		{TURSO_INTERRUPT, TursoInterruptErr},
-		{TURSO_MISUSE, TursoMisuseErr},
-		{TURSO_CONSTRAINT, TursoConstraintErr},
-		{TURSO_READONLY, TursoReadonlyErr},
-		{TURSO_DATABASE_FULL, TursoDatabaseFullErr},
-		{TURSO_NOTADB, TursoNotADbErr},
-		{TURSO_CORRUPT, TursoCorruptErr},
-		{TURSO_ERROR, TursoErrorErr},
-	}
-	for _, tt := range tests {
-		err := statusToError(tt.code, "")
-		if !errors.Is(err, tt.err) {
-			t.Fatalf("status %v expected %v, got %v", tt.code, tt.err, err)
+func TestInsertReturningMultiplePartialFetchCommits(t *testing.T) {
+	conn, cleanup := openInMemory(t)
+	defer cleanup()
+
+	prepExec(t, conn.conn, "CREATE TABLE t(a INT)")
+
+	stmt := prepStmt(t, conn.conn, "INSERT INTO t(a) VALUES (1),(2) RETURNING a")
+	require.True(t, stepRow(t, stmt))
+	first := turso_statement_row_value_int(stmt, 0)
+	assert.Equal(t, int64(1), first)
+
+	// Do not consume all rows; finalize early
+	_ = turso_statement_finalize(stmt)
+	turso_statement_deinit(stmt)
+
+	// Ensure both rows were inserted
+	stmt2 := prepStmt(t, conn.conn, "SELECT COUNT(*) FROM t")
+	defer func() {
+		_ = turso_statement_finalize(stmt2)
+		turso_statement_deinit(stmt2)
+	}()
+	require.True(t, stepRow(t, stmt2))
+	cnt := turso_statement_row_value_int(stmt2, 0)
+	assert.Equal(t, int64(2), cnt)
+	require.False(t, stepRow(t, stmt2))
+}
+
+func TestInsertReturningWithExplicitTransactionAndPartialFetch(t *testing.T) {
+	conn, cleanup := openInMemory(t)
+	defer cleanup()
+
+	prepExec(t, conn.conn, "CREATE TABLE t(a INT)")
+	prepExec(t, conn.conn, "BEGIN")
+	stmt := prepStmt(t, conn.conn, "INSERT INTO t(a) VALUES (10),(20) RETURNING a")
+	require.True(t, stepRow(t, stmt))
+	v := turso_statement_row_value_int(stmt, 0)
+	assert.Equal(t, int64(10), v)
+	// finalize without consuming all rows
+	_ = turso_statement_finalize(stmt)
+	turso_statement_deinit(stmt)
+	// Commit should still succeed
+	prepExec(t, conn.conn, "COMMIT")
+
+	// Verify data
+	stmt2 := prepStmt(t, conn.conn, "SELECT COUNT(*) FROM t")
+	defer func() {
+		_ = turso_statement_finalize(stmt2)
+		turso_statement_deinit(stmt2)
+	}()
+	require.True(t, stepRow(t, stmt2))
+	assert.Equal(t, int64(2), turso_statement_row_value_int(stmt2, 0))
+}
+
+func TestOnConflictDoNothingReturning(t *testing.T) {
+	conn, cleanup := openInMemory(t)
+	defer cleanup()
+
+	prepExec(t, conn.conn, "CREATE TABLE t(a INT PRIMARY KEY)")
+	prepExec(t, conn.conn, "INSERT INTO t(a) VALUES(1)")
+
+	stmt := prepStmt(t, conn.conn, "INSERT INTO t(a) VALUES(1) ON CONFLICT(a) DO NOTHING RETURNING a")
+	defer func() {
+		_ = turso_statement_finalize(stmt)
+		turso_statement_deinit(stmt)
+	}()
+	// Should produce no rows and be done
+	code, err := turso_statement_step(stmt)
+	require.NoError(t, err)
+	assert.Equal(t, TURSO_DONE, code)
+
+	// Ensure count unchanged
+	stmt2 := prepStmt(t, conn.conn, "SELECT COUNT(*) FROM t")
+	defer func() {
+		_ = turso_statement_finalize(stmt2)
+		turso_statement_deinit(stmt2)
+	}()
+	require.True(t, stepRow(t, stmt2))
+	assert.Equal(t, int64(1), turso_statement_row_value_int(stmt2, 0))
+}
+
+func TestSubqueries(t *testing.T) {
+	conn, cleanup := openInMemory(t)
+	defer cleanup()
+
+	prepExec(t, conn.conn, "CREATE TABLE t(a INT)")
+	prepExec(t, conn.conn, "INSERT INTO t(a) VALUES (1),(2),(3),(4)")
+
+	stmt := prepStmt(t, conn.conn, "SELECT a FROM (SELECT a FROM t WHERE a > 1) WHERE a < 4 ORDER BY a")
+	defer func() {
+		_ = turso_statement_finalize(stmt)
+		turso_statement_deinit(stmt)
+	}()
+
+	var got []int64
+	for {
+		if !stepRow(t, stmt) {
+			break
 		}
+		got = append(got, turso_statement_row_value_int(stmt, 0))
 	}
+	assert.Equal(t, []int64{2, 3}, got)
+}
+
+func TestJoin(t *testing.T) {
+	conn, cleanup := openInMemory(t)
+	defer cleanup()
+
+	prepExec(t, conn.conn, "CREATE TABLE t1(id INT PRIMARY KEY, name TEXT)")
+	prepExec(t, conn.conn, "CREATE TABLE t2(id INT PRIMARY KEY, age INT)")
+	prepExec(t, conn.conn, "INSERT INTO t1(id, name) VALUES (1,'a'),(2,'b'),(3,'c')")
+	prepExec(t, conn.conn, "INSERT INTO t2(id, age) VALUES (1,10),(3,30)")
+
+	stmt := prepStmt(t, conn.conn, "SELECT t1.id, t1.name, t2.age FROM t1 JOIN t2 ON t1.id = t2.id ORDER BY t1.id")
+	defer func() {
+		_ = turso_statement_finalize(stmt)
+		turso_statement_deinit(stmt)
+	}()
+
+	var rows [][3]int64
+	var names []string
+	for {
+		if !stepRow(t, stmt) {
+			break
+		}
+		id := turso_statement_row_value_int(stmt, 0)
+		// name as TEXT
+		name := turso_statement_row_value_text(stmt, 1)
+		age := turso_statement_row_value_int(stmt, 2)
+		rows = append(rows, [3]int64{id, int64(len(name)), age})
+		names = append(names, name)
+	}
+	assert.Equal(t, [][3]int64{{1, 1, 10}, {3, 1, 30}}, rows)
+	assert.Equal(t, []string{"a", "c"}, names)
+}
+
+func TestAlterTable(t *testing.T) {
+	conn, cleanup := openInMemory(t)
+	defer cleanup()
+
+	prepExec(t, conn.conn, "CREATE TABLE t(id INT PRIMARY KEY)")
+	prepExec(t, conn.conn, "ALTER TABLE t ADD COLUMN name TEXT")
+	// Insert with new column present
+	prepExec(t, conn.conn, "INSERT INTO t(id, name) VALUES(1, 'hello')")
+
+	stmt := prepStmt(t, conn.conn, "SELECT name FROM t WHERE id = 1")
+	defer func() {
+		_ = turso_statement_finalize(stmt)
+		turso_statement_deinit(stmt)
+	}()
+	require.True(t, stepRow(t, stmt))
+	assert.Equal(t, "hello", turso_statement_row_value_text(stmt, 0))
+	require.False(t, stepRow(t, stmt))
+}
+
+func TestGenerateSeries(t *testing.T) {
+	conn, cleanup := openInMemory(t)
+	defer cleanup()
+
+	stmt := prepStmt(t, conn.conn, "SELECT value FROM generate_series(1,5)")
+	defer func() {
+		_ = turso_statement_finalize(stmt)
+		turso_statement_deinit(stmt)
+	}()
+
+	var got []int64
+	for {
+		if !stepRow(t, stmt) {
+			break
+		}
+		got = append(got, turso_statement_row_value_int(stmt, 0))
+	}
+	assert.Equal(t, []int64{1, 2, 3, 4, 5}, got)
+}
+
+func TestJSONFunctionsBindings(t *testing.T) {
+	conn, cleanup := openInMemory(t)
+	defer cleanup()
+
+	stmt := prepStmt(t, conn.conn, "SELECT json_extract('{\"x\": [1,2,3]}', '$.x[1]'), json_array_length('[1,2,3]')")
+	defer func() {
+		_ = turso_statement_finalize(stmt)
+		turso_statement_deinit(stmt)
+	}()
+
+	require.True(t, stepRow(t, stmt))
+	kind0 := turso_statement_row_value_kind(stmt, 0)
+	kind1 := turso_statement_row_value_kind(stmt, 1)
+	assert.Equal(t, TURSO_TYPE_INTEGER, kind0)
+	assert.Equal(t, TURSO_TYPE_INTEGER, kind1)
+	assert.Equal(t, int64(2), turso_statement_row_value_int(stmt, 0))
+	assert.Equal(t, int64(3), turso_statement_row_value_int(stmt, 1))
+	require.False(t, stepRow(t, stmt))
+}
+
+func TestBindingsPositionalAndNamed(t *testing.T) {
+	conn, cleanup := openInMemory(t)
+	defer cleanup()
+
+	prepExec(t, conn.conn, "CREATE TABLE t(i INTEGER, r REAL, s TEXT, b BLOB, n NULL)")
+
+	// Positional parameters: ?1..?
+	stmt := prepStmt(t, conn.conn, "INSERT INTO t(i,r,s,b,n) VALUES (?1,?2,?3,?4,?5)")
+	require.NoError(t, turso_statement_bind_positional_int(stmt, 1, 42))
+	require.NoError(t, turso_statement_bind_positional_double(stmt, 2, 3.14))
+	require.NoError(t, turso_statement_bind_positional_text(stmt, 3, "hello"))
+	require.NoError(t, turso_statement_bind_positional_blob(stmt, 4, []byte{0xde, 0xad, 0xbe, 0xef}))
+	require.NoError(t, turso_statement_bind_positional_null(stmt, 5))
+	_, err := turso_statement_execute(stmt)
+	require.NoError(t, err)
+	_ = turso_statement_finalize(stmt)
+	turso_statement_deinit(stmt)
+
+	// Named parameters mapped to positional via named_position
+	stmt2 := prepStmt(t, conn.conn, "INSERT INTO t(i,r,s,b,n) VALUES (:i,:r,:s,:b,:n)")
+	defer func() {
+		_ = turso_statement_finalize(stmt2)
+		turso_statement_deinit(stmt2)
+	}()
+	posI := turso_statement_named_position(stmt2, "i")
+	posR := turso_statement_named_position(stmt2, "r")
+	posS := turso_statement_named_position(stmt2, "s")
+	posB := turso_statement_named_position(stmt2, "b")
+	posN := turso_statement_named_position(stmt2, "n")
+	require.Equal(t, posI, int64(1))
+	require.Equal(t, posR, int64(2))
+	require.Equal(t, posS, int64(3))
+	require.Equal(t, posB, int64(4))
+	require.Equal(t, posN, int64(5))
+
+	require.NoError(t, turso_statement_bind_positional_int(stmt2, int(posI), 7))
+	require.NoError(t, turso_statement_bind_positional_double(stmt2, int(posR), -1.5))
+	require.NoError(t, turso_statement_bind_positional_text(stmt2, int(posS), "world"))
+	require.NoError(t, turso_statement_bind_positional_blob(stmt2, int(posB), []byte{})) // empty blob
+	require.NoError(t, turso_statement_bind_positional_null(stmt2, int(posN)))
+	_, err = turso_statement_execute(stmt2)
+	require.NoError(t, err)
+
+	// Verify retrieved values using row value helpers
+	stmt3 := prepStmt(t, conn.conn, "SELECT i,r,s,b,n FROM t")
+	defer func() {
+		_ = turso_statement_finalize(stmt3)
+		turso_statement_deinit(stmt3)
+	}()
+
+	// first row
+	require.True(t, stepRow(t, stmt3))
+	assert.Equal(t, TURSO_TYPE_INTEGER, turso_statement_row_value_kind(stmt3, 0))
+	assert.Equal(t, int64(42), turso_statement_row_value_int(stmt3, 0))
+	assert.Equal(t, TURSO_TYPE_REAL, turso_statement_row_value_kind(stmt3, 1))
+	assert.InDelta(t, 3.14, turso_statement_row_value_double(stmt3, 1), 1e-9)
+	assert.Equal(t, TURSO_TYPE_TEXT, turso_statement_row_value_kind(stmt3, 2))
+	assert.Equal(t, "hello", turso_statement_row_value_text(stmt3, 2))
+	assert.Equal(t, TURSO_TYPE_BLOB, turso_statement_row_value_kind(stmt3, 3))
+	assert.Equal(t, []byte{0xde, 0xad, 0xbe, 0xef}, turso_statement_row_value_bytes(stmt3, 3))
+	assert.Equal(t, TURSO_TYPE_NULL, turso_statement_row_value_kind(stmt3, 4))
+
+	// second row
+	require.True(t, stepRow(t, stmt3))
+	assert.Equal(t, int64(7), turso_statement_row_value_int(stmt3, 0))
+	assert.InDelta(t, -1.5, turso_statement_row_value_double(stmt3, 1), 1e-9)
+	assert.Equal(t, "world", turso_statement_row_value_text(stmt3, 2))
+	// empty blob
+	assert.Nil(t, turso_statement_row_value_bytes(stmt3, 3))
+	require.False(t, stepRow(t, stmt3))
+}
+
+func TestColumnMetadata(t *testing.T) {
+	conn, cleanup := openInMemory(t)
+	defer cleanup()
+
+	prepExec(t, conn.conn, "CREATE TABLE t(id INT, name TEXT)")
+	prepExec(t, conn.conn, "INSERT INTO t(id, name) VALUES (1, 'alice')")
+
+	stmt := prepStmt(t, conn.conn, "SELECT id, name FROM t")
+	defer func() {
+		_ = turso_statement_finalize(stmt)
+		turso_statement_deinit(stmt)
+	}()
+	cc := turso_statement_column_count(stmt)
+	require.Equal(t, 2, cc)
+	n0 := turso_statement_column_name(stmt, 0)
+	n1 := turso_statement_column_name(stmt, 1)
+	assert.Equal(t, "id", n0)
+	assert.Equal(t, "name", n1)
+
+	require.True(t, stepRow(t, stmt))
+	assert.Equal(t, int64(1), turso_statement_row_value_int(stmt, 0))
+	assert.Equal(t, "alice", turso_statement_row_value_text(stmt, 1))
+	require.False(t, stepRow(t, stmt))
 }

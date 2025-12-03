@@ -105,6 +105,7 @@ func turso_setup(config TursoConig) error { ... }
     * private types MUST be used ONLY in C wrapper functions (`c_turso_.*`) and have fields with low-level C-compatible go types (uintptr, numbers, etc)
 - Document generated methods with docstrings
 - Replace `turso_status_code_t` and out error parameter with proper native golang `error`
+    * If function returns only OK or error code, do not return status explicitly from the Go binding - just return error (and any value if it was returned as out parameter)
 - Convert C-strings back and forth appropriately
     * Remember, that Golang strings are not null-terminated - so you will need to convert them to zero-terminated strings by copying data in some cases
 - Support callback in turso_setup with purego.NewCallback

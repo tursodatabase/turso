@@ -1,4 +1,4 @@
-package turso
+package turso // import "github.com/tursodatabase/turso/go"
 
 import (
 	"errors"
@@ -9,17 +9,15 @@ import (
 	"github.com/ebitengine/purego"
 )
 
-// define all package level errors here
-
-// note, that OK, DONE, ROW, IO are statuses - so you don't need to create errors for them
+// package-level errors
 var (
 	TursoBusyErr         = errors.New("turso: database is busy")
-	TursoInterruptErr    = errors.New("turso: operation interrupted")
-	TursoErrorErr        = errors.New("turso: generic error")
+	TursoInterruptErr    = errors.New("turso: interrupted")
+	TursoGenericErr      = errors.New("turso: error")
 	TursoMisuseErr       = errors.New("turso: API misuse")
 	TursoConstraintErr   = errors.New("turso: constraint failed")
-	TursoReadonlyErr     = errors.New("turso: database is read-only")
-	TursoDatabaseFullErr = errors.New("turso: database or disk is full")
+	TursoReadOnlyErr     = errors.New("turso: database is readonly")
+	TursoDatabaseFullErr = errors.New("turso: database is full")
 	TursoNotADbErr       = errors.New("turso: not a database")
 	TursoCorruptErr      = errors.New("turso: database is corrupt")
 )
@@ -27,7 +25,6 @@ var (
 // define all necessary constants first
 type TursoStatusCode int32
 
-// note, that the only real statuses are OK, DONE, ROW, IO - everything else is errors
 const (
 	TURSO_OK            TursoStatusCode = 0
 	TURSO_DONE          TursoStatusCode = 1
@@ -75,7 +72,6 @@ type TursoConnection *turso_connection_t
 type TursoStatement *turso_statement_t
 
 // define all public binding types
-// the public binding types MUST have fields with native safe go types
 type TursoLog struct {
 	Message   string
 	Target    string
@@ -85,20 +81,12 @@ type TursoLog struct {
 	Level     TursoTracingLevel
 }
 
-// Logger callback signature
-type TursoLogger func(log TursoLog)
-
 type TursoConfig struct {
-	// Logger is an optional callback to receive log events from the database.
-	// All string fields in TursoLog are copied and safe to use beyond the callback return.
-	Logger   TursoLogger
-	LogLevel string
+	// Logger is an optional callback invoked by the library.
+	Logger   func(log TursoLog)
+	LogLevel string // zero-terminated C string expected by C; wrapper converts
 }
 
-/*
-*
-Database description.
-*/
 type TursoDatabaseConfig struct {
 	// Path to the database file or ":memory:"
 	Path string
@@ -109,193 +97,69 @@ type TursoDatabaseConfig struct {
 }
 
 // define all necessary private C structs
-// private C structs MUST have fields with low level types (e.g. uintptr, numbers)
-type turso_status_code_t int32
-type turso_type_t int32
-
-// Used only for reading callback payloads.
-type c_turso_log_t struct {
-	Message   uintptr // const char*
-	Target    uintptr // const char*
-	File      uintptr // const char*
-	Timestamp uint64
-	Line      uintptr // size_t
-	Level     int32   // turso_tracing_level_t
-	_         [4]byte // padding to match C alignment (ensure 8-byte struct alignment)
+type turso_slice_ref_t struct {
+	ptr uintptr
+	len uintptr
 }
 
-type c_turso_config_t struct {
-	Logger   uintptr // void (*)(const turso_log_t*)
-	LogLevel uintptr // const char*
+type turso_log_t struct {
+	message   uintptr // const char*
+	target    uintptr // const char*
+	file      uintptr // const char*
+	timestamp uint64
+	line      uint  // size_t
+	level     int32 // turso_tracing_level_t
 }
 
-type c_turso_database_config_t struct {
-	Path                 uintptr // const char*
-	ExperimentalFeatures uintptr // const char* | NULL
-	AsyncIO              uint8   // _Bool
-	_                    [7]byte // padding to 8-byte alignment
+type turso_config_t struct {
+	logger    uintptr // void (*logger)(const turso_log_t *log)
+	log_level uintptr
 }
+
+type turso_database_config_t struct {
+	path                  uintptr // const char*
+	experimental_features uintptr // const char* or null
+	async_io              bool
+	// pad to match C ABI if needed; Go will add padding as necessary
+}
+
+// C extern method types
+type turso_status_code_t = int32
 
 // then, define C extern methods
 var (
-	// always use c_ structs here - never mix them with exported public types
-	c_turso_setup func(
-		config unsafe.Pointer,
-		errorOptOut unsafe.Pointer,
-	) turso_status_code_t
-
-	c_turso_database_new func(
-		config unsafe.Pointer,
-		database unsafe.Pointer, // turso_database_t**
-		errorOptOut unsafe.Pointer, // const char**
-	) turso_status_code_t
-
-	c_turso_database_open func(
-		database unsafe.Pointer, // const turso_database_t*
-		errorOptOut unsafe.Pointer, // const char**
-	) turso_status_code_t
-
-	c_turso_database_connect func(
-		self unsafe.Pointer, // const turso_database_t*
-		connection unsafe.Pointer, // turso_connection_t**
-		errorOptOut unsafe.Pointer, // const char**
-	) turso_status_code_t
-
-	c_turso_connection_get_autocommit func(
-		self unsafe.Pointer, // const turso_connection_t*
-	) bool
-
-	c_turso_connection_prepare_single func(
-		self unsafe.Pointer, // const turso_connection_t*
-		sql string, // const char*
-		statement unsafe.Pointer, // turso_statement_t**
-		errorOptOut unsafe.Pointer, // const char**
-	) turso_status_code_t
-
-	c_turso_connection_prepare_first func(
-		self unsafe.Pointer, // const turso_connection_t*
-		sql string, // const char*
-		statement unsafe.Pointer, // turso_statement_t**
-		tailIdx unsafe.Pointer, // size_t*
-		errorOptOut unsafe.Pointer, // const char**
-	) turso_status_code_t
-
-	c_turso_connection_close func(
-		self unsafe.Pointer, // const turso_connection_t*
-		errorOptOut unsafe.Pointer, // const char**
-	) turso_status_code_t
-
-	c_turso_statement_execute func(
-		self unsafe.Pointer, // const turso_statement_t*
-		rowsChanges unsafe.Pointer, // uint64_t*
-		errorOptOut unsafe.Pointer, // const char**
-	) turso_status_code_t
-
-	c_turso_statement_step func(
-		self unsafe.Pointer, // const turso_statement_t*
-		errorOptOut unsafe.Pointer, // const char**
-	) turso_status_code_t
-
-	c_turso_statement_run_io func(
-		self unsafe.Pointer, // const turso_statement_t*
-		errorOptOut unsafe.Pointer, // const char**
-	) turso_status_code_t
-
-	c_turso_statement_reset func(
-		self unsafe.Pointer, // const turso_statement_t*
-		errorOptOut unsafe.Pointer, // const char**
-	) turso_status_code_t
-
-	c_turso_statement_finalize func(
-		self unsafe.Pointer, // const turso_statement_t*
-		errorOptOut unsafe.Pointer, // const char**
-	) turso_status_code_t
-
-	c_turso_statement_column_count func(
-		self unsafe.Pointer, // const turso_statement_t*
-	) int64
-
-	c_turso_statement_column_name func(
-		self unsafe.Pointer, // const turso_statement_t*
-		index uintptr, // size_t
-	) unsafe.Pointer // const char*
-
-	c_turso_statement_row_value_kind func(
-		self unsafe.Pointer, // const turso_statement_t*
-		index uintptr, // size_t
-	) turso_type_t
-
-	c_turso_statement_row_value_bytes_count func(
-		self unsafe.Pointer,
-		index uintptr,
-	) int64
-
-	c_turso_statement_row_value_bytes_ptr func(
-		self unsafe.Pointer,
-		index uintptr,
-	) unsafe.Pointer // const char*
-
-	c_turso_statement_row_value_int func(
-		self unsafe.Pointer,
-		index uintptr,
-	) int64
-
-	c_turso_statement_row_value_double func(
-		self unsafe.Pointer,
-		index uintptr,
-	) float64
-
-	c_turso_statement_named_position func(
-		self unsafe.Pointer, // const turso_statement_t*
-		name string, // const char*
-	) int64
-
-	c_turso_statement_bind_positional_null func(
-		self unsafe.Pointer,
-		position uintptr, // size_t
-	) turso_status_code_t
-
-	c_turso_statement_bind_positional_int func(
-		self unsafe.Pointer,
-		position uintptr,
-		value int64,
-	) turso_status_code_t
-
-	c_turso_statement_bind_positional_double func(
-		self unsafe.Pointer,
-		position uintptr,
-		value float64,
-	) turso_status_code_t
-
-	c_turso_statement_bind_positional_blob func(
-		self unsafe.Pointer,
-		position uintptr,
-		ptr unsafe.Pointer, // const uint8_t*
-		len uintptr, // size_t
-	) turso_status_code_t
-
-	c_turso_statement_bind_positional_text func(
-		self unsafe.Pointer,
-		position uintptr,
-		ptr string, // const char*
-		len uintptr, // size_t
-	) turso_status_code_t
-
-	c_turso_str_deinit func(
-		self unsafe.Pointer, // const char*
-	)
-
-	c_turso_database_deinit func(
-		self unsafe.Pointer, // const turso_database_t*
-	)
-
-	c_turso_connection_deinit func(
-		self unsafe.Pointer, // const turso_connection_t*
-	)
-
-	c_turso_statement_deinit func(
-		self unsafe.Pointer, // const turso_statement_t*
-	)
+	c_turso_setup                            func(config *turso_config_t, error_opt_out **byte) turso_status_code_t
+	c_turso_database_new                     func(config *turso_database_config_t, database **turso_database_t, error_opt_out **byte) turso_status_code_t
+	c_turso_database_open                    func(database TursoDatabase, error_opt_out **byte) turso_status_code_t
+	c_turso_database_connect                 func(self TursoDatabase, connection **turso_connection_t, error_opt_out **byte) turso_status_code_t
+	c_turso_connection_get_autocommit        func(self TursoConnection) bool
+	c_turso_connection_last_insert_rowid     func(self TursoConnection) int64
+	c_turso_connection_prepare_single        func(self TursoConnection, sql string, statement **turso_statement_t, error_opt_out **byte) turso_status_code_t
+	c_turso_connection_prepare_first         func(self TursoConnection, sql string, statement **turso_statement_t, tail_idx *uintptr, error_opt_out **byte) turso_status_code_t
+	c_turso_connection_close                 func(self TursoConnection, error_opt_out **byte) turso_status_code_t
+	c_turso_statement_execute                func(self TursoStatement, rows_changes *uint64, error_opt_out **byte) turso_status_code_t
+	c_turso_statement_step                   func(self TursoStatement, error_opt_out **byte) turso_status_code_t
+	c_turso_statement_run_io                 func(self TursoStatement, error_opt_out **byte) turso_status_code_t
+	c_turso_statement_reset                  func(self TursoStatement, error_opt_out **byte) turso_status_code_t
+	c_turso_statement_finalize               func(self TursoStatement, error_opt_out **byte) turso_status_code_t
+	c_turso_statement_column_count           func(self TursoStatement) int64
+	c_turso_statement_column_name            func(self TursoStatement, index uintptr) *byte
+	c_turso_statement_row_value_kind         func(self TursoStatement, index uintptr) int32
+	c_turso_statement_row_value_bytes_count  func(self TursoStatement, index uintptr) int64
+	c_turso_statement_row_value_bytes_ptr    func(self TursoStatement, index uintptr) *byte
+	c_turso_statement_row_value_int          func(self TursoStatement, index uintptr) int64
+	c_turso_statement_row_value_double       func(self TursoStatement, index uintptr) float64
+	c_turso_statement_named_position         func(self TursoStatement, name string) int64
+	c_turso_statement_parameters_count       func(self TursoStatement) int64
+	c_turso_statement_bind_positional_null   func(self TursoStatement, position uintptr) turso_status_code_t
+	c_turso_statement_bind_positional_int    func(self TursoStatement, position uintptr, value int64) turso_status_code_t
+	c_turso_statement_bind_positional_double func(self TursoStatement, position uintptr, value float64) turso_status_code_t
+	c_turso_statement_bind_positional_blob   func(self TursoStatement, position uintptr, ptr *byte, len uintptr) turso_status_code_t
+	c_turso_statement_bind_positional_text   func(self TursoStatement, position uintptr, ptr *byte, len uintptr) turso_status_code_t
+	c_turso_str_deinit                       func(self *byte)
+	c_turso_database_deinit                  func(self TursoDatabase)
+	c_turso_connection_deinit                func(self TursoConnection)
+	c_turso_statement_deinit                 func(self TursoStatement)
 )
 
 // implement a function to register extern methods from loaded lib
@@ -306,6 +170,7 @@ func register_turso_db(handle uintptr) error {
 	purego.RegisterLibFunc(&c_turso_database_open, handle, "turso_database_open")
 	purego.RegisterLibFunc(&c_turso_database_connect, handle, "turso_database_connect")
 	purego.RegisterLibFunc(&c_turso_connection_get_autocommit, handle, "turso_connection_get_autocommit")
+	purego.RegisterLibFunc(&c_turso_connection_last_insert_rowid, handle, "turso_connection_last_insert_rowid")
 	purego.RegisterLibFunc(&c_turso_connection_prepare_single, handle, "turso_connection_prepare_single")
 	purego.RegisterLibFunc(&c_turso_connection_prepare_first, handle, "turso_connection_prepare_first")
 	purego.RegisterLibFunc(&c_turso_connection_close, handle, "turso_connection_close")
@@ -322,6 +187,7 @@ func register_turso_db(handle uintptr) error {
 	purego.RegisterLibFunc(&c_turso_statement_row_value_int, handle, "turso_statement_row_value_int")
 	purego.RegisterLibFunc(&c_turso_statement_row_value_double, handle, "turso_statement_row_value_double")
 	purego.RegisterLibFunc(&c_turso_statement_named_position, handle, "turso_statement_named_position")
+	purego.RegisterLibFunc(&c_turso_statement_parameters_count, handle, "turso_statement_parameters_count")
 	purego.RegisterLibFunc(&c_turso_statement_bind_positional_null, handle, "turso_statement_bind_positional_null")
 	purego.RegisterLibFunc(&c_turso_statement_bind_positional_int, handle, "turso_statement_bind_positional_int")
 	purego.RegisterLibFunc(&c_turso_statement_bind_positional_double, handle, "turso_statement_bind_positional_double")
@@ -334,477 +200,439 @@ func register_turso_db(handle uintptr) error {
 	return nil
 }
 
-// Helpers
-
-func statusToError(code TursoStatusCode, msg string) error {
-	switch code {
-	case TURSO_OK, TURSO_DONE, TURSO_ROW, TURSO_IO:
-		return nil
+// Helper: map status code to default error kind
+func statusToError(status TursoStatusCode, msg string) error {
+	var base error
+	switch status {
 	case TURSO_BUSY:
-		if msg != "" {
-			return errors.New(msg)
-		}
-		return TursoBusyErr
+		base = TursoBusyErr
 	case TURSO_INTERRUPT:
-		if msg != "" {
-			return errors.New(msg)
-		}
-		return TursoInterruptErr
+		base = TursoInterruptErr
 	case TURSO_ERROR:
-		if msg != "" {
-			return errors.New(msg)
-		}
-		return TursoErrorErr
+		base = TursoGenericErr
 	case TURSO_MISUSE:
-		if msg != "" {
-			return errors.New(msg)
-		}
-		return TursoMisuseErr
+		base = TursoMisuseErr
 	case TURSO_CONSTRAINT:
-		if msg != "" {
-			return errors.New(msg)
-		}
-		return TursoConstraintErr
+		base = TursoConstraintErr
 	case TURSO_READONLY:
-		if msg != "" {
-			return errors.New(msg)
-		}
-		return TursoReadonlyErr
+		base = TursoReadOnlyErr
 	case TURSO_DATABASE_FULL:
-		if msg != "" {
-			return errors.New(msg)
-		}
-		return TursoDatabaseFullErr
+		base = TursoDatabaseFullErr
 	case TURSO_NOTADB:
-		if msg != "" {
-			return errors.New(msg)
-		}
-		return TursoNotADbErr
+		base = TursoNotADbErr
 	case TURSO_CORRUPT:
-		if msg != "" {
-			return errors.New(msg)
-		}
-		return TursoCorruptErr
+		base = TursoCorruptErr
 	default:
-		if msg != "" {
-			return errors.New(msg)
-		}
-		return fmt.Errorf("turso: unknown status code %d", code)
+		// for unknown error codes, fallback to generic
+		base = TursoGenericErr
 	}
+	if msg != "" {
+		return fmt.Errorf("%w: %s", base, msg)
+	}
+	return base
 }
 
-func readErrorAndFree(errPtr uintptr) string {
-	if errPtr == 0 {
-		return ""
-	}
-	defer c_turso_str_deinit(unsafe.Pointer(errPtr))
-	return copyCString(unsafe.Pointer(errPtr))
-}
-
-func copyCString(p unsafe.Pointer) string {
+func decodeAndFreeCString(p *byte) string {
 	if p == nil {
 		return ""
 	}
-	// Determine length
-	base := uintptr(p)
-	n := 0
+	// determine length
+	var n uintptr
 	for {
-		b := *(*byte)(unsafe.Pointer(base + uintptr(n)))
+		b := *(*byte)(unsafe.Pointer(uintptr(unsafe.Pointer(p)) + n))
 		if b == 0 {
 			break
 		}
 		n++
 	}
-	if n == 0 {
-		return ""
-	}
-	buf := make([]byte, n)
-	for i := 0; i < n; i++ {
-		buf[i] = *(*byte)(unsafe.Pointer(base + uintptr(i)))
-	}
-	return string(buf)
+	s := string(unsafe.Slice(p, n))
+	// free C-allocated string
+	c_turso_str_deinit(p)
+	return s
 }
 
-func cStringPtr(s string) (ptr unsafe.Pointer, keepAlive func()) {
-	// Allocate Go memory with null terminator; valid during the call
-	if len(s) == 0 {
-		return nil, func() {}
+func decodeCStringNoFree(p uintptr) string {
+	if p == 0 {
+		return ""
 	}
-	b := make([]byte, len(s)+1)
-	copy(b, s)
-	return unsafe.Pointer(&b[0]), func() { runtime.KeepAlive(b) }
+	cur := (*byte)(unsafe.Pointer(p))
+	// determine length
+	var n uintptr
+	for {
+		b := *(*byte)(unsafe.Pointer(uintptr(unsafe.Pointer(cur)) + n))
+		if b == 0 {
+			break
+		}
+		n++
+	}
+	return string(unsafe.Slice(cur, n))
+}
+
+func makeCStringBytes(s string) ([]byte, uintptr) {
+	if s == "" {
+		return nil, 0
+	}
+	b := make([]byte, 0, len(s)+1)
+	b = append(b, s...)
+	b = append(b, 0)
+	return b, uintptr(unsafe.Pointer(&b[0]))
+}
+
+// ------- Logger callback plumbing --------
+var (
+	loggerCallback uintptr
+	loggerHandler  func(TursoLog)
+)
+
+func init() {
+	loggerCallback = purego.NewCallback(func(p uintptr) {
+		if p == 0 || loggerHandler == nil {
+			return
+		}
+		cl := (*turso_log_t)(unsafe.Pointer(p))
+		log := TursoLog{
+			Message:   decodeCStringNoFree(cl.message),
+			Target:    decodeCStringNoFree(cl.target),
+			File:      decodeCStringNoFree(cl.file),
+			Timestamp: cl.timestamp,
+			Line:      uint(cl.line),
+			Level:     TursoTracingLevel(cl.level),
+		}
+		// SAFETY: strings are copied above; no freeing needed.
+		loggerHandler(log)
+	})
 }
 
 // Go wrappers over imported C bindings
 
-// turso_setup initializes global database info.
-// If config.Logger is provided, it will be registered as a callback.
+// turso_setup sets up global database info.
 func turso_setup(config TursoConfig) error {
-	var cCfg c_turso_config_t
-	// Prepare logger callback if provided
+	var cconf turso_config_t
+	// Set logger callback
 	if config.Logger != nil {
-		cb := purego.NewCallback(func(logPtr uintptr) uintptr {
-			if logPtr == 0 {
-				return 0
-			}
-			cl := (*c_turso_log_t)(unsafe.Pointer(logPtr))
-			log := TursoLog{
-				Message:   copyCString(unsafe.Pointer(cl.Message)),
-				Target:    copyCString(unsafe.Pointer(cl.Target)),
-				File:      copyCString(unsafe.Pointer(cl.File)),
-				Timestamp: cl.Timestamp,
-				Line:      uint(cl.Line),
-				Level:     TursoTracingLevel(cl.Level),
-			}
-			config.Logger(log)
-			return 0
-		})
-		cCfg.Logger = cb
+		loggerHandler = config.Logger
+		cconf.logger = loggerCallback
 	}
-
-	// Prepare log level C string pointer
-	var keep func()
-	if config.LogLevel != "" {
-		ptr, k := cStringPtr(config.LogLevel)
-		cCfg.LogLevel = uintptr(ptr)
-		keep = k
-	} else {
-		keep = func() {}
+	// Log level C-string pointer
+	var levelBytes []byte
+	levelBytes, cconf.log_level = makeCStringBytes(config.LogLevel)
+	var errPtr *byte
+	status := c_turso_setup(&cconf, &errPtr)
+	// Keep Go memory alive during C call
+	runtime.KeepAlive(levelBytes)
+	if status == int32(TURSO_OK) {
+		return nil
 	}
-
-	var cerr uintptr
-	code := c_turso_setup(unsafe.Pointer(&cCfg), unsafe.Pointer(&cerr))
-	keep()
-	errMsg := readErrorAndFree(cerr)
-	return statusToError(TursoStatusCode(code), errMsg)
+	msg := decodeAndFreeCString(errPtr)
+	return statusToError(TursoStatusCode(status), msg)
 }
 
-/** Create database holder but do not open it */
+// turso_database_new creates database holder but do not open it.
 func turso_database_new(config TursoDatabaseConfig) (TursoDatabase, error) {
-	var cCfg c_turso_database_config_t
-	// Path
-	pathPtr, keepPath := cStringPtr(config.Path)
-	cCfg.Path = uintptr(pathPtr)
-	// Experimental
-	var keepExp func()
+	var cconf turso_database_config_t
+	var pathBytes []byte
+	var expBytes []byte
+	pathBytes, cconf.path = makeCStringBytes(config.Path)
 	if config.ExperimentalFeatures != "" {
-		expPtr, k := cStringPtr(config.ExperimentalFeatures)
-		cCfg.ExperimentalFeatures = uintptr(expPtr)
-		keepExp = k
-	} else {
-		keepExp = func() {}
+		expBytes, cconf.experimental_features = makeCStringBytes(config.ExperimentalFeatures)
 	}
-	if config.AsyncIO {
-		cCfg.AsyncIO = 1
+	cconf.async_io = config.AsyncIO
+
+	var db *turso_database_t
+	var errPtr *byte
+	status := c_turso_database_new(&cconf, &db, &errPtr)
+	runtime.KeepAlive(pathBytes)
+	runtime.KeepAlive(expBytes)
+	if status == int32(TURSO_OK) {
+		return TursoDatabase(db), nil
 	}
-	var db TursoDatabase
-	var cerr uintptr
-	code := c_turso_database_new(
-		unsafe.Pointer(&cCfg),
-		unsafe.Pointer(&db),
-		unsafe.Pointer(&cerr),
-	)
-	keepPath()
-	keepExp()
-	errMsg := readErrorAndFree(cerr)
-	if err := statusToError(TursoStatusCode(code), errMsg); err != nil {
-		return nil, err
-	}
-	return db, nil
+	msg := decodeAndFreeCString(errPtr)
+	return nil, statusToError(TursoStatusCode(status), msg)
 }
 
-/** Open database */
+// turso_database_open opens the database.
 func turso_database_open(database TursoDatabase) error {
-	var cerr uintptr
-	code := c_turso_database_open(unsafe.Pointer(database), unsafe.Pointer(&cerr))
-	errMsg := readErrorAndFree(cerr)
-	return statusToError(TursoStatusCode(code), errMsg)
+	var errPtr *byte
+	status := c_turso_database_open(database, &errPtr)
+	if status == int32(TURSO_OK) {
+		return nil
+	}
+	msg := decodeAndFreeCString(errPtr)
+	return statusToError(TursoStatusCode(status), msg)
 }
 
-/** Connect to the database */
+// turso_database_connect connects to the database and returns a connection.
 func turso_database_connect(self TursoDatabase) (TursoConnection, error) {
-	var conn TursoConnection
-	var cerr uintptr
-	code := c_turso_database_connect(unsafe.Pointer(self), unsafe.Pointer(&conn), unsafe.Pointer(&cerr))
-	errMsg := readErrorAndFree(cerr)
-	if err := statusToError(TursoStatusCode(code), errMsg); err != nil {
-		return nil, err
+	var conn *turso_connection_t
+	var errPtr *byte
+	status := c_turso_database_connect(self, &conn, &errPtr)
+	if status == int32(TURSO_OK) {
+		return TursoConnection(conn), nil
 	}
-	return conn, nil
+	msg := decodeAndFreeCString(errPtr)
+	return nil, statusToError(TursoStatusCode(status), msg)
 }
 
-/** Get autocommit state of the connection */
+// turso_connection_get_autocommit returns the autocommit state of the connection.
 func turso_connection_get_autocommit(self TursoConnection) bool {
-	return c_turso_connection_get_autocommit(unsafe.Pointer(self))
+	return c_turso_connection_get_autocommit(self)
 }
 
-/** Prepare single statement in a connection */
+// turso_connection_last_insert_rowid returns last insert rowid.
+func turso_connection_last_insert_rowid(self TursoConnection) int64 {
+	return c_turso_connection_last_insert_rowid(self)
+}
+
+// turso_connection_prepare_single prepares a single statement in a connection.
 func turso_connection_prepare_single(self TursoConnection, sql string) (TursoStatement, error) {
-	var stmt TursoStatement
-	var cerr uintptr
-	code := c_turso_connection_prepare_single(
-		unsafe.Pointer(self),
-		sql,
-		unsafe.Pointer(&stmt),
-		unsafe.Pointer(&cerr),
-	)
-	errMsg := readErrorAndFree(cerr)
-	if err := statusToError(TursoStatusCode(code), errMsg); err != nil {
-		return nil, err
+	var stmt *turso_statement_t
+	var errPtr *byte
+	status := c_turso_connection_prepare_single(self, sql, &stmt, &errPtr)
+	if status == int32(TURSO_OK) {
+		return TursoStatement(stmt), nil
 	}
-	return stmt, nil
+	msg := decodeAndFreeCString(errPtr)
+	return nil, statusToError(TursoStatusCode(status), msg)
 }
 
-/** Prepare first statement in a string containing multiple statements in a connection */
+// turso_connection_prepare_first prepares the first statement from a string containing multiple statements.
 func turso_connection_prepare_first(self TursoConnection, sql string) (TursoStatement, int, error) {
-	var stmt TursoStatement
-	var tailIdx uintptr
-	var cerr uintptr
-	code := c_turso_connection_prepare_first(
-		unsafe.Pointer(self),
-		sql,
-		unsafe.Pointer(&stmt),
-		unsafe.Pointer(&tailIdx),
-		unsafe.Pointer(&cerr),
-	)
-	errMsg := readErrorAndFree(cerr)
-	if err := statusToError(TursoStatusCode(code), errMsg); err != nil {
-		return nil, 0, err
+	var stmt *turso_statement_t
+	var tail uintptr
+	var errPtr *byte
+	status := c_turso_connection_prepare_first(self, sql, &stmt, &tail, &errPtr)
+	if status == int32(TURSO_OK) {
+		return TursoStatement(stmt), int(tail), nil
 	}
-	return stmt, int(tailIdx), nil
+	msg := decodeAndFreeCString(errPtr)
+	return nil, 0, statusToError(TursoStatusCode(status), msg)
 }
 
-/** Close the connection preventing any further operations executed over it */
+// turso_connection_close closes the connection preventing any further operations.
 func turso_connection_close(self TursoConnection) error {
-	var cerr uintptr
-	code := c_turso_connection_close(unsafe.Pointer(self), unsafe.Pointer(&cerr))
-	errMsg := readErrorAndFree(cerr)
-	return statusToError(TursoStatusCode(code), errMsg)
+	var errPtr *byte
+	status := c_turso_connection_close(self, &errPtr)
+	if status == int32(TURSO_OK) {
+		return nil
+	}
+	msg := decodeAndFreeCString(errPtr)
+	return statusToError(TursoStatusCode(status), msg)
 }
 
-/** Execute single statement */
-func turso_statement_execute(self TursoStatement) (uint64, error) {
-	var cerr uintptr
-	var rows uint64
-	code := c_turso_statement_execute(unsafe.Pointer(self), unsafe.Pointer(&rows), unsafe.Pointer(&cerr))
-	errMsg := readErrorAndFree(cerr)
-	return rows, statusToError(TursoStatusCode(code), errMsg)
+// turso_statement_execute executes a single statement. May return intermediate statuses like TURSO_IO.
+func turso_statement_execute(self TursoStatement) (TursoStatusCode, uint64, error) {
+	var changes uint64
+	var errPtr *byte
+	status := c_turso_statement_execute(self, &changes, &errPtr)
+	switch TursoStatusCode(status) {
+	case TURSO_OK, TURSO_DONE, TURSO_ROW, TURSO_IO:
+		return TursoStatusCode(status), changes, nil
+	default:
+		msg := decodeAndFreeCString(errPtr)
+		return TursoStatusCode(status), 0, statusToError(TursoStatusCode(status), msg)
+	}
 }
 
-/** Step statement execution once
- * Returns TURSO_DONE if execution finished
- * Returns TURSO_ROW if execution generated the row (row values can be inspected with corresponding statement methods)
- * Returns TURSO_IO if async_io was set and statement needs to execute IO to make progress
- */
+// turso_statement_step steps statement execution once. Returns DONE, ROW, IO, or error.
 func turso_statement_step(self TursoStatement) (TursoStatusCode, error) {
-	var cerr uintptr
-	code := c_turso_statement_step(unsafe.Pointer(self), unsafe.Pointer(&cerr))
-	errMsg := readErrorAndFree(cerr)
-	if err := statusToError(TursoStatusCode(code), errMsg); err != nil {
-		return TursoStatusCode(code), err
+	var errPtr *byte
+	status := c_turso_statement_step(self, &errPtr)
+	switch TursoStatusCode(status) {
+	case TURSO_OK, TURSO_DONE, TURSO_ROW, TURSO_IO:
+		return TursoStatusCode(status), nil
+	default:
+		msg := decodeAndFreeCString(errPtr)
+		return TursoStatusCode(status), statusToError(TursoStatusCode(status), msg)
 	}
-	return TursoStatusCode(code), nil
 }
 
-/** Execute one iteration of underlying IO backend */
+// turso_statement_run_io executes one iteration of underlying IO backend after TURSO_IO.
 func turso_statement_run_io(self TursoStatement) error {
-	var cerr uintptr
-	code := c_turso_statement_run_io(unsafe.Pointer(self), unsafe.Pointer(&cerr))
-	errMsg := readErrorAndFree(cerr)
-	return statusToError(TursoStatusCode(code), errMsg)
+	var errPtr *byte
+	status := c_turso_statement_run_io(self, &errPtr)
+	if status == int32(TURSO_OK) {
+		return nil
+	}
+	msg := decodeAndFreeCString(errPtr)
+	return statusToError(TursoStatusCode(status), msg)
 }
 
-/** Reset a statement */
+// turso_statement_reset resets a statement.
+// this method must be called in order to cleanup statement resources and prepare it for re-execution
+// any pending execution will be aborted - be careful and in certain cases ensure that turso_statement_finalize called before turso_statement_reset
 func turso_statement_reset(self TursoStatement) error {
-	var cerr uintptr
-	code := c_turso_statement_reset(unsafe.Pointer(self), unsafe.Pointer(&cerr))
-	errMsg := readErrorAndFree(cerr)
-	return statusToError(TursoStatusCode(code), errMsg)
+	var errPtr *byte
+	status := c_turso_statement_reset(self, &errPtr)
+	if status == int32(TURSO_OK) {
+		return nil
+	}
+	msg := decodeAndFreeCString(errPtr)
+	return statusToError(TursoStatusCode(status), msg)
 }
 
-/** Finalize a statement
- * This method must be called in the end of statement execution (either successfull or not)
- */
+// turso_statement_finalize finalizes a statement.
 func turso_statement_finalize(self TursoStatement) error {
-	var cerr uintptr
-	code := c_turso_statement_finalize(unsafe.Pointer(self), unsafe.Pointer(&cerr))
-	errMsg := readErrorAndFree(cerr)
-	return statusToError(TursoStatusCode(code), errMsg)
+	var errPtr *byte
+	status := c_turso_statement_finalize(self, &errPtr)
+	if status == int32(TURSO_OK) {
+		return nil
+	}
+	msg := decodeAndFreeCString(errPtr)
+	return statusToError(TursoStatusCode(status), msg)
 }
 
-/** Get column count */
+// turso_statement_column_count returns the number of columns.
 func turso_statement_column_count(self TursoStatement) int64 {
-	return c_turso_statement_column_count(unsafe.Pointer(self))
+	return c_turso_statement_column_count(self)
 }
 
-/** Get the column name at the index
- * C string allocated by Turso must be freed after the usage with corresponding turso_str_deinit(...) method
- */
+// turso_statement_column_name returns the column name at the index.
+// The underlying C string is freed automatically.
 func turso_statement_column_name(self TursoStatement, index int) string {
-	ptr := c_turso_statement_column_name(unsafe.Pointer(self), uintptr(index))
-	if ptr == nil {
-		return ""
-	}
-	defer c_turso_str_deinit(ptr)
-	return copyCString(ptr)
+	ptr := c_turso_statement_column_name(self, uintptr(index))
+	return decodeAndFreeCString(ptr)
 }
 
-/** Get the row value kind at the index for a current statement state */
+// turso_statement_row_value_kind returns the row value kind at index.
 func turso_statement_row_value_kind(self TursoStatement, index int) TursoType {
-	return TursoType(c_turso_statement_row_value_kind(unsafe.Pointer(self), uintptr(index)))
+	return TursoType(c_turso_statement_row_value_kind(self, uintptr(index)))
 }
 
-/** Get amount of bytes in the BLOB or TEXT values
- * Return -1 for other kinds
- */
+// turso_statement_row_value_bytes_count returns number of bytes for BLOB or TEXT, -1 otherwise.
 func turso_statement_row_value_bytes_count(self TursoStatement, index int) int64 {
-	return c_turso_statement_row_value_bytes_count(unsafe.Pointer(self), uintptr(index))
+	return c_turso_statement_row_value_bytes_count(self, uintptr(index))
 }
 
-/** Return pointer to the start of the slice  for BLOB or TEXT values
- * Return NULL for other kinds
- */
-func turso_statement_row_value_bytes_ptr(self TursoStatement, index int) unsafe.Pointer {
-	return c_turso_statement_row_value_bytes_ptr(unsafe.Pointer(self), uintptr(index))
+// turso_statement_row_value_bytes_ptr returns pointer to start of BLOB/TEXT slice, or nil otherwise.
+func turso_statement_row_value_bytes_ptr(self TursoStatement, index int) uintptr {
+	return uintptr(unsafe.Pointer(c_turso_statement_row_value_bytes_ptr(self, uintptr(index))))
 }
 
-/** Return value of INTEGER kind
- * Return 0 for other kinds
- */
+// turso_statement_row_value_int returns INTEGER value at index, or 0 otherwise.
 func turso_statement_row_value_int(self TursoStatement, index int) int64 {
-	return c_turso_statement_row_value_int(unsafe.Pointer(self), uintptr(index))
+	return c_turso_statement_row_value_int(self, uintptr(index))
 }
 
-/** Return value of REAL kind
- * Return 0 for other kinds
- */
+// turso_statement_row_value_double returns REAL value at index, or 0 otherwise.
 func turso_statement_row_value_double(self TursoStatement, index int) float64 {
-	return c_turso_statement_row_value_double(unsafe.Pointer(self), uintptr(index))
+	return c_turso_statement_row_value_double(self, uintptr(index))
 }
 
-/** Return named argument position in a statement */
+// turso_statement_named_position returns named argument position in a statement.
 func turso_statement_named_position(self TursoStatement, name string) int64 {
-	return c_turso_statement_named_position(unsafe.Pointer(self), name)
+	return c_turso_statement_named_position(self, name)
 }
 
-/** Bind a positional argument to a statement: NULL */
+// turso_statement_parameters_count returns parameters count for the statement.
+func turso_statement_parameters_count(self TursoStatement) int64 {
+	return c_turso_statement_parameters_count(self)
+}
+
+// turso_statement_bind_positional_null binds a positional argument as NULL.
 func turso_statement_bind_positional_null(self TursoStatement, position int) error {
-	code := c_turso_statement_bind_positional_null(unsafe.Pointer(self), uintptr(position))
-	return statusToError(TursoStatusCode(code), "")
+	status := c_turso_statement_bind_positional_null(self, uintptr(position))
+	if status == int32(TURSO_OK) {
+		return nil
+	}
+	return statusToError(TursoStatusCode(status), "")
 }
 
-/** Bind a positional argument to a statement: INTEGER */
+// turso_statement_bind_positional_int binds a positional argument as INTEGER.
 func turso_statement_bind_positional_int(self TursoStatement, position int, value int64) error {
-	code := c_turso_statement_bind_positional_int(unsafe.Pointer(self), uintptr(position), value)
-	return statusToError(TursoStatusCode(code), "")
+	status := c_turso_statement_bind_positional_int(self, uintptr(position), value)
+	if status == int32(TURSO_OK) {
+		return nil
+	}
+	return statusToError(TursoStatusCode(status), "")
 }
 
-/** Bind a positional argument to a statement: DOUBLE */
+// turso_statement_bind_positional_double binds a positional argument as REAL.
 func turso_statement_bind_positional_double(self TursoStatement, position int, value float64) error {
-	code := c_turso_statement_bind_positional_double(unsafe.Pointer(self), uintptr(position), value)
-	return statusToError(TursoStatusCode(code), "")
+	status := c_turso_statement_bind_positional_double(self, uintptr(position), value)
+	if status == int32(TURSO_OK) {
+		return nil
+	}
+	return statusToError(TursoStatusCode(status), "")
 }
 
-/** Bind a positional argument to a statement: BLOB */
+// turso_statement_bind_positional_blob binds a positional argument as BLOB.
 func turso_statement_bind_positional_blob(self TursoStatement, position int, value []byte) error {
-	var ptr unsafe.Pointer
-	var ln uintptr
+	var ptr *byte
+	var length uintptr
 	if len(value) > 0 {
-		ptr = unsafe.Pointer(&value[0])
-		ln = uintptr(len(value))
-	} else {
-		ptr = nil
-		ln = 0
+		ptr = &value[0]
+		length = uintptr(len(value))
 	}
-	code := c_turso_statement_bind_positional_blob(unsafe.Pointer(self), uintptr(position), ptr, ln)
-	return statusToError(TursoStatusCode(code), "")
+	status := c_turso_statement_bind_positional_blob(self, uintptr(position), ptr, length)
+	if status == int32(TURSO_OK) {
+		return nil
+	}
+	return statusToError(TursoStatusCode(status), "")
 }
 
-/** Bind a positional argument to a statement: TEXT */
+// turso_statement_bind_positional_text binds a positional argument as TEXT.
+// Note: underlying C API expects a pointer and length, not a zero-terminated string.
 func turso_statement_bind_positional_text(self TursoStatement, position int, value string) error {
-	code := c_turso_statement_bind_positional_text(unsafe.Pointer(self), uintptr(position), value, uintptr(len(value)))
-	return statusToError(TursoStatusCode(code), "")
-}
-
-/** Deallocate C string allocated by Turso */
-func turso_str_deinit(self unsafe.Pointer) {
-	if self == nil {
-		return
+	var ptr *byte
+	var length uintptr
+	if value != "" {
+		// Point directly to string data; valid for the duration of the call.
+		ptr = (*byte)(unsafe.Pointer(unsafe.StringData(value)))
+		length = uintptr(len(value))
 	}
-	c_turso_str_deinit(self)
+	status := c_turso_statement_bind_positional_text(self, uintptr(position), ptr, length)
+	if status == int32(TURSO_OK) {
+		return nil
+	}
+	return statusToError(TursoStatusCode(status), "")
 }
 
-/** Deallocate and close a database
- * SAFETY: caller must ensure that no other code can concurrently or later call methods over deinited database
- */
+// turso_database_deinit deallocates and closes a database.
+// SAFETY: caller must ensure that no other code can concurrently or later call methods over deinited database.
 func turso_database_deinit(self TursoDatabase) {
-	if self == nil {
-		return
-	}
-	c_turso_database_deinit(unsafe.Pointer(self))
+	c_turso_database_deinit(self)
 }
 
-/** Deallocate and close a connection
- * SAFETY: caller must ensure that no other code can concurrently or later call methods over deinited connection
- */
+// turso_connection_deinit deallocates and closes a connection.
+// SAFETY: caller must ensure that no other code can concurrently or later call methods over deinited connection.
 func turso_connection_deinit(self TursoConnection) {
-	if self == nil {
-		return
-	}
-	c_turso_connection_deinit(unsafe.Pointer(self))
+	c_turso_connection_deinit(self)
 }
 
-/** Deallocate and close a statement
- * SAFETY: caller must ensure that no other code can concurrently or later call methods over deinited statement
- */
+// turso_statement_deinit deallocates and closes a statement.
+// SAFETY: caller must ensure that no other code can concurrently or later call methods over deinited statement.
 func turso_statement_deinit(self TursoStatement) {
-	if self == nil {
-		return
-	}
-	c_turso_statement_deinit(unsafe.Pointer(self))
+	c_turso_statement_deinit(self)
 }
 
-// Additional ergonomic helpers (the only non-direct translations)
-
-/** Return BLOB value as a Go byte slice (copied).
- * If the value at index is not BLOB or TEXT, returns nil.
- * The underlying C memory is copied into a new Go slice.
- */
+// Additional ergonomic helpers (the only non-direct translations):
+// turso_statement_row_value_bytes returns a copy of bytes for BLOB or TEXT values, nil otherwise.
 func turso_statement_row_value_bytes(self TursoStatement, index int) []byte {
-	n := c_turso_statement_row_value_bytes_count(unsafe.Pointer(self), uintptr(index))
+	n := c_turso_statement_row_value_bytes_count(self, uintptr(index))
 	if n <= 0 {
 		return nil
 	}
-	ptr := c_turso_statement_row_value_bytes_ptr(unsafe.Pointer(self), uintptr(index))
+	ptr := c_turso_statement_row_value_bytes_ptr(self, uintptr(index))
 	if ptr == nil {
 		return nil
 	}
-	out := make([]byte, n)
-	base := uintptr(ptr)
-	for i := int64(0); i < n; i++ {
-		out[i] = *(*byte)(unsafe.Pointer(base + uintptr(i)))
-	}
-	return out
+	src := unsafe.Slice(ptr, n)
+	dst := make([]byte, n)
+	copy(dst, src)
+	return dst
 }
 
-/** Return TEXT value as a Go string (copied).
- * If the value at index is not TEXT or BLOB, returns empty string.
- * The underlying C memory is copied into a new Go string.
- */
+// turso_statement_row_value_text returns a copy of text for TEXT values, "" otherwise.
 func turso_statement_row_value_text(self TursoStatement, index int) string {
-	n := c_turso_statement_row_value_bytes_count(unsafe.Pointer(self), uintptr(index))
+	n := c_turso_statement_row_value_bytes_count(self, uintptr(index))
 	if n <= 0 {
 		return ""
 	}
-	ptr := c_turso_statement_row_value_bytes_ptr(unsafe.Pointer(self), uintptr(index))
+	ptr := c_turso_statement_row_value_bytes_ptr(self, uintptr(index))
 	if ptr == nil {
 		return ""
 	}
-	// Copy bytes and convert to string
-	buf := make([]byte, n)
-	base := uintptr(ptr)
-	for i := int64(0); i < n; i++ {
-		buf[i] = *(*byte)(unsafe.Pointer(base + uintptr(i)))
-	}
-	return string(buf)
+	bs := unsafe.Slice(ptr, n)
+	// converting []byte to string copies
+	return string(bs)
 }
