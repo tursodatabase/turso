@@ -1,6 +1,7 @@
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::cursor::{static_iterator_hack, MvccIterator};
 use crate::mvcc::persistent_storage::Storage;
+use crate::schema::Table;
 use crate::state_machine::StateMachine;
 use crate::state_machine::StateTransition;
 use crate::state_machine::TransitionResult;
@@ -25,9 +26,6 @@ use crate::File;
 use crate::IOExt;
 use crate::LimboError;
 use crate::Result;
-use crate::Statement;
-use crate::StepResult;
-use crate::Value;
 use crate::ValueRef;
 use crate::{Connection, Pager};
 use crossbeam_skiplist::map::Entry;
@@ -1203,7 +1201,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 .iter()
                 .find(|entry| entry.value().is_some_and(|value| value == root_page))
                 .map(|entry| *entry.key())
-                .expect("Positive root page is not mapped to a table id");
+                .unwrap_or_else(|| {
+                    panic!("Positive root page is not mapped to a table id: {root_page}")
+                });
             table_id
         }
     }
@@ -1226,27 +1226,39 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     }
 
     /// Bootstrap the MV store from the SQLite schema table and logical log.
-    /// 1. Get all root pages from the SQLite schema table (using bootstrap connection, which does not attempt to read from MV store)
+    /// 1. Get all root pages from the already parsed schema object
     /// 2. Assign table IDs to the root pages (table_id = -1 * root_page)
     /// 3. Recover the logical log
     /// 4. Promote the bootstrap connection to a regular connection so that it reads from the MV store again
     /// 5. Make sure schema changes reflected from deserialized logical log are captured in the schema
     pub fn bootstrap(&self, bootstrap_conn: Arc<Connection>) -> Result<()> {
-        // Get all rows from the SQLite schema table
-        let mut get_all_sqlite_schema_rows =
-            bootstrap_conn.prepare("SELECT rootpage FROM sqlite_schema WHERE type in ('table', 'index') AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '__turso_internal_%'")?;
-        let sqlite_schema_root_pages = stmt_get_all_rows(&mut get_all_sqlite_schema_rows)?
-            .into_iter()
-            .map(|row| {
-                let root_page = row[0].as_int().expect("rootpage is integer");
-                assert!(root_page > 0, "rootpage is positive integer");
-                root_page as u64
-            })
-            .collect::<Vec<u64>>();
-        // Map all existing checkpointed root pages to table ids so that if root_page=R, table_id=-R
-        for root_page in sqlite_schema_root_pages.iter() {
-            let root_page_as_table_id = MVTableId::from(-(*root_page as i64));
-            self.insert_table_id_to_rootpage(root_page_as_table_id, Some(*root_page));
+        {
+            let schema = bootstrap_conn.schema.read();
+            let sqlite_schema_root_pages = {
+                schema
+                    .tables
+                    .values()
+                    .filter_map(|t| {
+                        if let Table::BTree(btree) = t.as_ref() {
+                            Some(btree.root_page)
+                        } else {
+                            None
+                        }
+                    })
+                    .chain(
+                        schema
+                            .indexes
+                            .values()
+                            .flatten()
+                            .map(|index| index.root_page),
+                    )
+            };
+            // Map all existing checkpointed root pages to table ids so that if root_page=R, table_id=-R
+            for root_page in sqlite_schema_root_pages {
+                turso_assert!(root_page > 0, "root_page={root_page} must be positive");
+                let root_page_as_table_id = MVTableId::from(-(root_page));
+                self.insert_table_id_to_rootpage(root_page_as_table_id, Some(root_page as u64));
+            }
         }
 
         // Promote the connection to a regular one, meaning it will start reading data from the MV store.
@@ -2762,37 +2774,6 @@ fn is_end_visible(
         }
         None => true,
     }
-}
-
-fn stmt_get_all_rows(stmt: &mut Statement) -> Result<Vec<Vec<Value>>> {
-    let mut rows = Vec::new();
-    loop {
-        let step = stmt.step()?;
-        match step {
-            StepResult::Row => {
-                rows.push(
-                    stmt.row()
-                        .ok_or(LimboError::InternalError("No row available".to_string()))?
-                        .get_values()
-                        .cloned()
-                        .collect(),
-                );
-            }
-            StepResult::Done => {
-                break;
-            }
-            StepResult::IO => {
-                stmt.run_once()?;
-            }
-            StepResult::Interrupt => {
-                return Err(LimboError::InternalError("interrupted".to_string()))
-            }
-            StepResult::Busy => {
-                return Err(LimboError::Busy);
-            }
-        }
-    }
-    Ok(rows)
 }
 
 impl<Clock: LogicalClock> Debug for CommitState<Clock> {
