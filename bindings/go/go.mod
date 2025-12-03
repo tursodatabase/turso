@@ -1,4 +1,4 @@
-module github.com/tursodatabase/turso/go
+module github.com/tursodatabase/turso/bindings/go
 
 go 1.24.0
 
