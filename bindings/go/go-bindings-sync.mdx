@@ -19,7 +19,8 @@ You must generate bindings for C interface defined in turso_sync.h file.
 
 <File path="../../sync/sdk-kit/turso_sync.h" />
 
-Note, that this header file depends on the turso.h definitions for which Go bindings already exists - so you MUST just reuse them. DO NOT copy or reimplement these bindings:
+Note, that this header file depends on the turso.h definitions for which Go bindings already exists.
+You MUST just reuse them. DO NOT copy or reimplement these bindings:
 
 <File path="../../sdk-kit/turso.h" />
 <File path="./bindings_db.go" />
@@ -86,6 +87,7 @@ func turso_sync_database_new(...) ... { ... }
 - Use exactly same names as in turso_sync.h for Go method names and prepend `c_` prefix for C extern functions
 - Separate "public" types from "private" types:
     * public types MUST be used ONLY in Go bindings methods (`turso_sync_.*`) and have fields with native safe go types (string, slice, etc)
+    * public types MUST NOT use low level types explicitly (e.g. unintptr) - they must be either replaced with wrapper public type or native alternative must be used instead (e.g. int instead of uinptrt if this is size_t)
     * private types MUST be used ONLY in C wrapper functions (`c_turso_sync_.*`) and have fields with low-level C-compatible go types (uintptr, numbers, etc)
 - Document generated methods with docstrings
 - Replace `turso_status_code_t` and out error parameter with proper native golang `error`
@@ -99,7 +101,6 @@ Inspect following docstring from the official purego repository in order to unde
 
 <Link url="https://raw.githubusercontent.com/ebitengine/purego/refs/heads/main/func.go" selector="RegisterFunc#comment" />
 <Link url="https://raw.githubusercontent.com/ebitengine/purego/refs/heads/main/func.go" selector="RegisterLibFunc#comment" />
-<Link url="https://raw.githubusercontent.com/ebitengine/purego/refs/heads/main/syscall_sysv.go" selector="NewCallback#comment" />
 
 </Code>
 
