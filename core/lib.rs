@@ -1262,10 +1262,6 @@ impl Connection {
         self.executing_triggers.write().pop();
     }
     pub fn prepare(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<Statement> {
-        if self.is_mvcc_bootstrap_connection() {
-            // Never use MV store for bootstrapping - we read state directly from sqlite_schema in the DB file.
-            return self._prepare(sql);
-        }
         self._prepare(sql)
     }
 
@@ -2106,7 +2102,22 @@ impl Connection {
     }
 
     pub fn mv_store(&self) -> impl Deref<Target = Option<Arc<MvStore>>> {
-        self.db.get_mv_store()
+        struct TransparentWrapper<T>(T);
+
+        impl<T> Deref for TransparentWrapper<T> {
+            type Target = T;
+
+            fn deref(&self) -> &Self::Target {
+                &self.0
+            }
+        }
+
+        // Never use MV store for bootstrapping - we read state directly from sqlite_schema in the DB file.
+        if !self.is_mvcc_bootstrap_connection() {
+            either::Left(self.db.get_mv_store())
+        } else {
+            either::Right(TransparentWrapper(None))
+        }
     }
 
     /// Query the current value(s) of `pragma_name` associated to
