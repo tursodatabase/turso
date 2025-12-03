@@ -13,6 +13,48 @@ You must use bindings_db.go bridge from Go to C API.
 
 <File path="./bindings_db.go" />
 
+# Rules
+
+- PREPARE statement in Prepare - do not delay that
+    * Consequently, you MUST properly implement NumInputs() method for statement using `turso_statement_parameters_count` method
+- NEVER reset non-failed statement which wasn't finalized before that - this will abort all progress which is wrong semantic
+- USE `BEGIN` always as SQLite and Turso doesn't have other transaction modes except from SNAPSHOT ISOLATION
+- WATCH OUT for locks and BE CAREFUL with methods calling each other and locking same mutex
+- DO NOT USE `uint64(^int64(0))` - use `math.MaxInt64` instead
+- DO NOT USE `_ interface{ Done() <-chan struct{} }` - use `ctx context.Context` instead
+- USE simple control flow - carefully manage state and locks - but try to avoid complex wrapper high-order functions (withLock, etc)
+- STRUCTURE of the implementation 
+    * Declaration order of elements and semantic blocks MUST be exsactly the same
+    * (details and full enumerations omited in the example for brevity but you must generate full code)
+```go
+package turso
+
+// define all package level errors here
+var (
+    TursoStmtClosedErr = errors.New("turso: statement closed") // provide short but concise error message
+    ...
+)
+
+// define all package level structs here
+struct tursoDbDriver { ... }
+
+// register driver
+func init() {
+	sql.Register("turso", &tursoDbDriver{})
+}
+
+// Extra constructor for *tursoDbConnection instance which can be used to intergrate with turso Db driver
+// extr_io parameter is the arbitrary IO function which will be executed together with turso_statement_run_io
+func NewConnection(conn TursoConnection, extraIo func() error) *tursoDbConnection {
+    
+}
+
+// Implement sql.Driver methods
+...
+
+```
+
+
 # Implementation
 
 The SDK should has following components under the hood:
@@ -22,6 +64,9 @@ The SDK should has following components under the hood:
 * `type tursoDbDriver struct { }` - type to register in the sql/database as driver
 * `type tursoDbResult struct { }` - type implementing `driver.Result` interface
 * `type tursoDbTx struct { }` - type implementing `driver.Tx` interface
+* Support following DSN format: `<path>[?experimental=<string>&async=0|1]`
+* Implement multi-statement support for `Exec*` family of methods. Use `turso_connection_prepare_first` method for that
+
 
 # Go driver API
 

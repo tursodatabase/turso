@@ -1,0 +1,676 @@
+package turso
+
+import (
+	"context"
+	"database/sql"
+	"database/sql/driver"
+	"errors"
+	"fmt"
+	"io"
+	"math"
+	"net/url"
+	"strings"
+	"sync"
+	"time"
+)
+
+// define all package level errors here
+var (
+	TursoStmtClosedErr = errors.New("turso: statement closed")
+	TursoConnClosedErr = errors.New("turso: connection closed")
+	TursoRowsClosedErr = errors.New("turso: rows closed")
+	TursoTxDoneErr     = errors.New("turso: transaction done")
+)
+
+// define all package level structs here
+
+type tursoDbDriver struct{}
+
+type tursoDbConnection struct {
+	db      TursoDatabase
+	conn    TursoConnection
+	extraIo func() error
+
+	mu     sync.Mutex
+	closed bool
+	// keep flags for configuration if needed
+	async bool
+}
+
+type tursoDbStatement struct {
+	conn      *tursoDbConnection
+	sql       string
+	numInputs int
+	closed    bool
+}
+
+type tursoDbRows struct {
+	conn    *tursoDbConnection
+	stmt    TursoStatement
+	columns []string
+
+	closed bool
+	err    error
+}
+
+type tursoDbResult struct {
+	lastInsertId int64
+	rowsAffected int64
+}
+
+type tursoDbTx struct {
+	conn *tursoDbConnection
+	done bool
+}
+
+// register driver
+func init() {
+	sql.Register("turso", &tursoDbDriver{})
+}
+
+// Extra constructor for *tursoDbConnection instance which can be used to intergrate with turso Db driver
+// extr_io parameter is the arbitrary IO function which will be executed together with turso_statement_run_io
+func NewConnection(conn TursoConnection, extraIo func() error) *tursoDbConnection {
+	return &tursoDbConnection{
+		conn:    conn,
+		extraIo: extraIo,
+	}
+}
+
+// Optional helper to register a loaded dynamic library handle into bindings.
+// The library must be loaded externally (e.g. via purego.Dlopen).
+func RegisterTursoLib(handle uintptr) error {
+	return register_turso_db(handle)
+}
+
+// Optional helper to run global setup (logger and log level).
+func Setup(config TursoConfig) error {
+	return turso_setup(config)
+}
+
+// Implement sql.Driver methods
+
+func (d *tursoDbDriver) Open(dsn string) (driver.Conn, error) {
+	path, experimental, async, err := parseDSN(dsn)
+	if err != nil {
+		return nil, err
+	}
+	db, err := turso_database_new(TursoDatabaseConfig{
+		Path:                 path,
+		ExperimentalFeatures: experimental,
+		AsyncIO:              async,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if err := turso_database_open(db); err != nil {
+		turso_database_deinit(db)
+		return nil, err
+	}
+	c, err := turso_database_connect(db)
+	if err != nil {
+		turso_database_deinit(db)
+		return nil, err
+	}
+	return &tursoDbConnection{
+		db:    db,
+		conn:  c,
+		async: async,
+	}, nil
+}
+
+// --- driver.Conn and friends ---
+
+// Ensure tursoDbConnection implements required interfaces.
+var (
+	_ driver.Conn               = (*tursoDbConnection)(nil)
+	_ driver.ConnPrepareContext = (*tursoDbConnection)(nil)
+	_ driver.ExecerContext      = (*tursoDbConnection)(nil)
+	_ driver.QueryerContext     = (*tursoDbConnection)(nil)
+	_ driver.Pinger             = (*tursoDbConnection)(nil)
+	_ driver.ConnBeginTx        = (*tursoDbConnection)(nil)
+)
+
+func (c *tursoDbConnection) Prepare(query string) (driver.Stmt, error) {
+	return c.PrepareContext(context.Background(), query)
+}
+
+func (c *tursoDbConnection) PrepareContext(ctx context.Context, query string) (driver.Stmt, error) {
+	if err := c.checkOpen(); err != nil {
+		return nil, err
+	}
+	// PREPARE in Prepare - do not delay that
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	stmt, err := turso_connection_prepare_single(c.conn, query)
+	if err != nil {
+		return nil, err
+	}
+	// determine number of inputs and then finalize immediately to avoid keeping state
+	num := int(turso_statement_parameters_count(stmt))
+	_ = turso_statement_finalize(stmt)
+	turso_statement_deinit(stmt)
+
+	return &tursoDbStatement{
+		conn:      c,
+		sql:       query,
+		numInputs: num,
+	}, nil
+}
+
+func (c *tursoDbConnection) Close() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed {
+		return nil
+	}
+	// Close connection and deinit resources
+	if c.conn != nil {
+		_ = turso_connection_close(c.conn)
+		turso_connection_deinit(c.conn)
+		c.conn = nil
+	}
+	if c.db != nil {
+		turso_database_deinit(c.db)
+		c.db = nil
+	}
+	c.closed = true
+	return nil
+}
+
+func (c *tursoDbConnection) Begin() (driver.Tx, error) {
+	return c.BeginTx(context.Background(), driver.TxOptions{})
+}
+
+func (c *tursoDbConnection) BeginTx(ctx context.Context, _ driver.TxOptions) (driver.Tx, error) {
+	if err := c.checkOpen(); err != nil {
+		return nil, err
+	}
+	// Use BEGIN (snapshot isolation)
+	_, err := c.ExecContext(ctx, "BEGIN", nil)
+	if err != nil {
+		return nil, err
+	}
+	return &tursoDbTx{conn: c}, nil
+}
+
+func (c *tursoDbConnection) Ping(ctx context.Context) error {
+	if err := c.checkOpen(); err != nil {
+		return err
+	}
+	// trivial ping: simple select constant
+	_, err := c.QueryContext(ctx, "SELECT 1", nil)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (c *tursoDbConnection) ExecContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Result, error) {
+	if err := c.checkOpen(); err != nil {
+		return nil, err
+	}
+	// Multi-statement support for Exec-family
+	var totalAffected int64
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	offset := 0
+	first := true
+	var lastInsert int64 = 0
+	for {
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+		rest := query[offset:]
+		if strings.TrimSpace(rest) == "" {
+			break
+		}
+		stmt, tail, err := turso_connection_prepare_first(c.conn, rest)
+		if err != nil {
+			return nil, err
+		}
+		// Calculate absolute offset advance
+		offset += tail
+
+		// Bind only for the first statement
+		if first && len(args) > 0 {
+			if err := bindArgs(stmt, args); err != nil {
+				_ = turso_statement_finalize(stmt)
+				turso_statement_deinit(stmt)
+				return nil, err
+			}
+		}
+		// Execute statement fully
+		affected, err := c.executeFully(ctx, stmt)
+		// finalize and deinit regardless of status
+		_ = turso_statement_finalize(stmt)
+		turso_statement_deinit(stmt)
+		if err != nil {
+			return nil, err
+		}
+		// rows affected is capped at MaxInt64
+		if affected > uint64(math.MaxInt64-totalAffected) {
+			totalAffected = math.MaxInt64
+		} else {
+			totalAffected += int64(affected)
+		}
+		lastInsert = turso_connection_last_insert_rowid(c.conn)
+		first = false
+		// continue with the rest of the query string
+	}
+	return &tursoDbResult{
+		lastInsertId: lastInsert,
+		rowsAffected: totalAffected,
+	}, nil
+}
+
+func (c *tursoDbConnection) QueryContext(ctx context.Context, query string, args []driver.NamedValue) (driver.Rows, error) {
+	if err := c.checkOpen(); err != nil {
+		return nil, err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	// Only single-statement queries supported here
+	stmt, err := turso_connection_prepare_single(c.conn, query)
+	if err != nil {
+		return nil, err
+	}
+	if len(args) > 0 {
+		if err := bindArgs(stmt, args); err != nil {
+			_ = turso_statement_finalize(stmt)
+			turso_statement_deinit(stmt)
+			return nil, err
+		}
+	}
+	// Return rows wrapper; do not step yet, leave cursor before first row
+	return &tursoDbRows{
+		conn: c,
+		stmt: stmt,
+	}, nil
+}
+
+func (c *tursoDbConnection) checkOpen() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.closed || c.conn == nil {
+		return TursoConnClosedErr
+	}
+	return nil
+}
+
+// --- driver.Stmt and friends ---
+
+// Ensure tursoDbStatement implements required interfaces.
+var (
+	_ driver.Stmt             = (*tursoDbStatement)(nil)
+	_ driver.StmtExecContext  = (*tursoDbStatement)(nil)
+	_ driver.StmtQueryContext = (*tursoDbStatement)(nil)
+)
+
+func (s *tursoDbStatement) Close() error {
+	s.closed = true
+	return nil
+}
+
+func (s *tursoDbStatement) NumInput() int {
+	return s.numInputs
+}
+
+func (s *tursoDbStatement) Exec(args []driver.Value) (driver.Result, error) {
+	named := make([]driver.NamedValue, len(args))
+	for i, v := range args {
+		named[i] = driver.NamedValue{Ordinal: i + 1, Value: v}
+	}
+	return s.ExecContext(context.Background(), named)
+}
+
+func (s *tursoDbStatement) ExecContext(ctx context.Context, args []driver.NamedValue) (driver.Result, error) {
+	if s.closed {
+		return nil, TursoStmtClosedErr
+	}
+	return s.conn.ExecContext(ctx, s.sql, args)
+}
+
+func (s *tursoDbStatement) Query(args []driver.Value) (driver.Rows, error) {
+	named := make([]driver.NamedValue, len(args))
+	for i, v := range args {
+		named[i] = driver.NamedValue{Ordinal: i + 1, Value: v}
+	}
+	return s.QueryContext(context.Background(), named)
+}
+
+func (s *tursoDbStatement) QueryContext(ctx context.Context, args []driver.NamedValue) (driver.Rows, error) {
+	if s.closed {
+		return nil, TursoStmtClosedErr
+	}
+	return s.conn.QueryContext(ctx, s.sql, args)
+}
+
+// --- driver.Rows ---
+
+// Ensure tursoDbRows implements the required interface.
+var _ driver.Rows = (*tursoDbRows)(nil)
+
+func (r *tursoDbRows) Columns() []string {
+	if r.columns != nil {
+		return r.columns
+	}
+	n := int(turso_statement_column_count(r.stmt))
+	names := make([]string, n)
+	for i := 0; i < n; i++ {
+		names[i] = turso_statement_column_name(r.stmt, i)
+	}
+	r.columns = names
+	return r.columns
+}
+
+func (r *tursoDbRows) Close() error {
+	if r.closed {
+		return nil
+	}
+	r.closed = true
+	_ = turso_statement_finalize(r.stmt)
+	turso_statement_deinit(r.stmt)
+	return nil
+}
+
+func (r *tursoDbRows) Next(dest []driver.Value) error {
+	if r.closed {
+		return io.EOF
+	}
+	for {
+		status, err := turso_statement_step(r.stmt)
+		if err != nil {
+			r.err = err
+			return err
+		}
+		switch status {
+		case TURSO_ROW:
+			// Fill destination
+			n := int(turso_statement_column_count(r.stmt))
+			if len(dest) != n {
+				return fmt.Errorf("turso: expected %d dests, got %d", n, len(dest))
+			}
+			for i := 0; i < n; i++ {
+				kind := turso_statement_row_value_kind(r.stmt, i)
+				switch kind {
+				case TURSO_TYPE_NULL:
+					dest[i] = nil
+				case TURSO_TYPE_INTEGER:
+					dest[i] = turso_statement_row_value_int(r.stmt, i)
+				case TURSO_TYPE_REAL:
+					dest[i] = turso_statement_row_value_double(r.stmt, i)
+				case TURSO_TYPE_TEXT:
+					dest[i] = turso_statement_row_value_text(r.stmt, i)
+				case TURSO_TYPE_BLOB:
+					dest[i] = turso_statement_row_value_bytes(r.stmt, i)
+				default:
+					dest[i] = nil
+				}
+			}
+			return nil
+		case TURSO_DONE:
+			return io.EOF
+		case TURSO_IO:
+			// Run IO iteration
+			if r.conn.extraIo != nil {
+				if err := r.conn.extraIo(); err != nil {
+					r.err = err
+					return err
+				}
+			}
+			if err := turso_statement_run_io(r.stmt); err != nil {
+				r.err = err
+				return err
+			}
+			continue
+		case TURSO_OK:
+			// Continue stepping
+			continue
+		default:
+			return TursoGenericErr
+		}
+	}
+}
+
+// --- driver.Result ---
+
+var _ driver.Result = (*tursoDbResult)(nil)
+
+func (r *tursoDbResult) LastInsertId() (int64, error) {
+	return r.lastInsertId, nil
+}
+
+func (r *tursoDbResult) RowsAffected() (int64, error) {
+	return r.rowsAffected, nil
+}
+
+// --- driver.Tx ---
+
+var _ driver.Tx = (*tursoDbTx)(nil)
+
+func (tx *tursoDbTx) Commit() error {
+	if tx.done {
+		return TursoTxDoneErr
+	}
+	_, err := tx.conn.ExecContext(context.Background(), "COMMIT", nil)
+	tx.done = true
+	return err
+}
+
+func (tx *tursoDbTx) Rollback() error {
+	if tx.done {
+		return TursoTxDoneErr
+	}
+	_, err := tx.conn.ExecContext(context.Background(), "ROLLBACK", nil)
+	tx.done = true
+	return err
+}
+
+// Helpers
+
+// parseDSN supports format: <path>[?experimental=<string>&async=0|1]
+func parseDSN(dsn string) (path string, experimental string, async bool, err error) {
+	path = dsn
+	async = false
+	experimental = ""
+	qMark := strings.IndexByte(dsn, '?')
+	if qMark >= 0 {
+		path = dsn[:qMark]
+		rawQuery := dsn[qMark+1:]
+		vals, e := url.ParseQuery(rawQuery)
+		if e != nil {
+			return "", "", false, e
+		}
+		if v := vals.Get("experimental"); v != "" {
+			experimental = v
+		}
+		if v := vals.Get("async"); v != "" {
+			async = v == "1" || strings.EqualFold(v, "true") || strings.EqualFold(v, "yes")
+		}
+	}
+	path, err = url.QueryUnescape(path)
+	if err != nil {
+		// if unescape failed, fall back to raw
+		err = nil
+	}
+	return path, experimental, async, err
+}
+
+func (c *tursoDbConnection) executeFully(ctx context.Context, stmt TursoStatement) (uint64, error) {
+	var latest uint64
+	for {
+		if ctx != nil && ctx.Err() != nil {
+			return 0, ctx.Err()
+		}
+		status, changes, err := turso_statement_execute(stmt)
+		if err != nil {
+			return 0, err
+		}
+		latest = changes
+		switch status {
+		case TURSO_DONE:
+			return latest, nil
+		case TURSO_IO:
+			// perform one IO iteration and retry
+			if c.extraIo != nil {
+				if err := c.extraIo(); err != nil {
+					return 0, err
+				}
+			}
+			if err := turso_statement_run_io(stmt); err != nil {
+				return 0, err
+			}
+			continue
+		case TURSO_ROW:
+			// Exhaust rows until DONE
+			for {
+				if ctx != nil && ctx.Err() != nil {
+					return 0, ctx.Err()
+				}
+				st, err := turso_statement_step(stmt)
+				if err != nil {
+					return 0, err
+				}
+				if st == TURSO_ROW {
+					continue
+				}
+				if st == TURSO_DONE {
+					return latest, nil
+				}
+				if st == TURSO_IO {
+					if c.extraIo != nil {
+						if err := c.extraIo(); err != nil {
+							return 0, err
+						}
+					}
+					if err := turso_statement_run_io(stmt); err != nil {
+						return 0, err
+					}
+					continue
+				}
+				// Continue on OK or others
+			}
+		case TURSO_OK:
+			// keep going; step to progress
+			st, err := turso_statement_step(stmt)
+			if err != nil {
+				return 0, err
+			}
+			if st == TURSO_DONE {
+				return latest, nil
+			}
+			if st == TURSO_IO {
+				if c.extraIo != nil {
+					if err := c.extraIo(); err != nil {
+						return 0, err
+					}
+				}
+				if err := turso_statement_run_io(stmt); err != nil {
+					return 0, err
+				}
+			}
+			// and loop again
+		default:
+			return 0, statusToError(status, "")
+		}
+	}
+}
+
+// bindArgs binds ordered and named values to a statement.
+// Named values are resolved via turso_statement_named_position, otherwise ordinal positions are used (1-based).
+func bindArgs(stmt TursoStatement, args []driver.NamedValue) error {
+	// Validate number of inputs if no named args present
+	if len(args) > 0 {
+		hasNamed := false
+		for _, nv := range args {
+			if nv.Name != "" {
+				hasNamed = true
+				break
+			}
+		}
+		if !hasNamed {
+			paramCount := int(turso_statement_parameters_count(stmt))
+			if paramCount >= 0 && len(args) != paramCount {
+				return fmt.Errorf("turso: got %d args, want %d", len(args), paramCount)
+			}
+		}
+	}
+	for idx, nv := range args {
+		pos := idx + 1
+		if nv.Name != "" {
+			np := int(turso_statement_named_position(stmt, nv.Name))
+			if np <= 0 {
+				return fmt.Errorf("turso: unknown named parameter %q", nv.Name)
+			}
+			pos = np
+		} else if nv.Ordinal > 0 {
+			pos = nv.Ordinal
+		}
+		if err := bindOne(stmt, pos, nv.Value); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func bindOne(stmt TursoStatement, position int, v any) error {
+	if v == nil {
+		return turso_statement_bind_positional_null(stmt, position)
+	}
+	switch x := v.(type) {
+	case int:
+		return turso_statement_bind_positional_int(stmt, position, int64(x))
+	case int8:
+		return turso_statement_bind_positional_int(stmt, position, int64(x))
+	case int16:
+		return turso_statement_bind_positional_int(stmt, position, int64(x))
+	case int32:
+		return turso_statement_bind_positional_int(stmt, position, int64(x))
+	case int64:
+		return turso_statement_bind_positional_int(stmt, position, x)
+	case uint:
+		return turso_statement_bind_positional_int(stmt, position, int64(x))
+	case uint8:
+		return turso_statement_bind_positional_int(stmt, position, int64(x))
+	case uint16:
+		return turso_statement_bind_positional_int(stmt, position, int64(x))
+	case uint32:
+		return turso_statement_bind_positional_int(stmt, position, int64(x))
+	case uint64:
+		// cap at MaxInt64 to avoid overflow
+		i := int64(0)
+		if x > uint64(math.MaxInt64) {
+			i = math.MaxInt64
+		} else {
+			i = int64(x)
+		}
+		return turso_statement_bind_positional_int(stmt, position, i)
+	case float32:
+		return turso_statement_bind_positional_double(stmt, position, float64(x))
+	case float64:
+		return turso_statement_bind_positional_double(stmt, position, x)
+	case bool:
+		if x {
+			return turso_statement_bind_positional_int(stmt, position, 1)
+		}
+		return turso_statement_bind_positional_int(stmt, position, 0)
+	case []byte:
+		return turso_statement_bind_positional_blob(stmt, position, x)
+	case string:
+		return turso_statement_bind_positional_text(stmt, position, x)
+	case time.Time:
+		// encode as RFC3339Nano string
+		return turso_statement_bind_positional_text(stmt, position, x.Format(time.RFC3339Nano))
+	default:
+		// Fallback to fmt to string
+		return turso_statement_bind_positional_text(stmt, position, fmt.Sprint(v))
+	}
+}
