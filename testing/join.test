@@ -442,3 +442,78 @@ do_execsql_test hash-join-expr-equality-pred {
     ORDER BY p.name, u.email limit 2;
 } {boots|agiles@example.net
 boots|bryantrevino@example.com}
+
+do_execsql_test_on_specific_db {:memory:} inner-join-using-null {
+  create table t(a, b);
+  create table s(a, b);
+  insert into t values (1, null), (2, null); 
+  insert into s values (1, null), (2, null); 
+  select a, b from t join s using (a, b);
+} {}
+
+do_execsql_test_on_specific_db {:memory:} left-join-null-probe-key {
+  create table t(a, b);
+  create table s(a, b);
+  insert into t values (1, 'x'), (null, 'y');
+  insert into s values (1, 'x');
+  select t.a, t.b, s.a, s.b
+    from t
+    left join s on t.a = s.a and t.b = s.b
+   order by t.rowid;
+} {1|x|1|x
+|y||}
+
+do_execsql_test_on_specific_db {:memory:} three-way-left-chain-null {
+  create table t(a, b);
+  create table u(a, b);
+  create table v(a, b);
+
+  insert into t values (1, 't1'), (2, 't2'), (3, null);
+  insert into u values (1, 'u1'), (2, null);
+  insert into v values (1, 'v1'), (2, 'v2'), (3, 'v3');
+
+  select t.a, t.b, u.b, v.b
+    from t
+    left join u on t.a = u.a and t.b = u.b
+    left join v on t.a = v.a
+   order by t.a;
+} {1|t1||v1
+2|t2||v2
+3|||v3}
+
+do_execsql_test_on_specific_db {:memory:} three-way-inner-using-null {
+  create table t(a, b);
+  create table u(a, b);
+  create table v(a, b);
+
+  insert into t values (1, 'x'), (2, null), (3, 'z');
+  insert into u values (1, 'x'), (2, null), (3, 'z');
+  insert into v values (1, 'x'), (2, null), (3, 'z');
+
+  select a, b, '|' as sep
+    from t
+    join u using(a, b)
+    join v using(a, b)
+   order by a;
+} {1|x||
+3|z||}
+
+do_execsql_test_on_specific_db {:memory:} four-way-left-joins-null-keys {
+  create table t(a, b);
+  create table u(a, b);
+  create table v(a, b);
+  create table w(a, b);
+
+  insert into t values (1, 't1'), (2, null);
+  insert into u values (1, 't1'), (2, 'u2');
+  insert into v values (1, 'v1'), (2, null);
+  insert into w values (1, 'w1');
+
+  select t.a, t.b, u.b, v.b, w.b
+    from t
+    left join u on t.a = u.a and t.b = u.b
+    left join v on t.a = v.a and t.b = v.b
+    left join w on t.a = w.a
+   order by t.a;
+} {1|t1|t1||w1
+2||||}
