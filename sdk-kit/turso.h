@@ -71,8 +71,11 @@ const char *turso_version();
 
 typedef struct
 {
+    /* zero-terminated C string */
     const char *message;
+    /* zero-terminated C string */
     const char *target;
+    /* zero-terminated C string */
     const char *file;
     uint64_t timestamp;
     size_t line;
@@ -84,6 +87,7 @@ typedef struct
     /// SAFETY: turso_log_t log argument fields have lifetime scoped to the logger invocation
     /// caller must ensure that data is properly copied if it wants it to have longer lifetime
     void (*logger)(const turso_log_t *log);
+    /* zero-terminated C string */
     const char *log_level;
 } turso_config_t;
 
@@ -92,9 +96,13 @@ typedef struct
  */
 typedef struct
 {
-    /** Path to the database file or `:memory:` */
+    /** Path to the database file or `:memory:`
+     * zero-terminated C string
+     */
     const char *path;
-    /** Optional comma separated list of experimental features to enable */
+    /** Optional comma separated list of experimental features to enable
+     * zero-terminated C string or null pointer
+     */
     const char *experimental_features;
     /** Parameter which defines who drives the IO - callee or the caller */
     bool async_io;
@@ -135,6 +143,7 @@ bool turso_connection_get_autocommit(const turso_connection_t *self);
 turso_status_code_t
 turso_connection_prepare_single(
     const turso_connection_t *self,
+    /* zero-terminated C string */
     const char *sql,
     /** reference to pointer which will be set to statement instance in case of TURSO_OK result */
     turso_statement_t **statement,
@@ -145,6 +154,7 @@ turso_connection_prepare_single(
 turso_status_code_t
 turso_connection_prepare_first(
     const turso_connection_t *self,
+    /* zero-terminated C string */
     const char *sql,
     /** reference to pointer which will be set to statement instance in case of TURSO_OK result; can be null if no statements can be parsed from the input string */
     turso_statement_t **statement,
@@ -200,14 +210,27 @@ const char *turso_statement_column_name(const turso_statement_t *self, size_t in
  * Caller must make sure that any non-owning memory is copied appropriated if it will be used for longer lifetime
  */
 turso_type_t turso_statement_row_value_kind(const turso_statement_t *self, size_t index);
+/* Get amount of bytes in the BLOB or TEXT values
+ * Return -1 for other kinds
+ */
 int64_t turso_statement_row_value_bytes_count(const turso_statement_t *self, size_t index);
+/* Get pointer to the start of the slice  for BLOB or TEXT values
+ * Return NULL for other kinds
+ */
 const char *turso_statement_row_value_bytes_ptr(const turso_statement_t *self, size_t index);
+/* Return value of INTEGER kind
+ * Return 0 for other kinds
+ */
 int64_t turso_statement_row_value_int(const turso_statement_t *self, size_t index);
+/* Return value of REAL kind
+ * Return 0 for other kinds
+ */
 double turso_statement_row_value_double(const turso_statement_t *self, size_t index);
 
 /** Return named argument position in a statement */
 int64_t turso_statement_named_position(
     const turso_statement_t *self,
+    /* zero-terminated C string */
     const char *name);
 
 /** Bind a positional argument to a statement */
@@ -218,9 +241,21 @@ turso_statement_bind_positional_int(const turso_statement_t *self, size_t positi
 turso_status_code_t
 turso_statement_bind_positional_double(const turso_statement_t *self, size_t position, double value);
 turso_status_code_t
-turso_statement_bind_positional_blob(const turso_statement_t *self, size_t position, const uint8_t *ptr, size_t len);
+turso_statement_bind_positional_blob(
+    const turso_statement_t *self,
+    size_t position,
+    /* pointer to the start of BLOB slice */
+    const uint8_t *ptr,
+    /* length of BLOB slice */
+    size_t len);
 turso_status_code_t
-turso_statement_bind_positional_text(const turso_statement_t *self, size_t position, const char *ptr, size_t len);
+turso_statement_bind_positional_text(
+    const turso_statement_t *self,
+    size_t position,
+    /* pointer to the start of TEXT slice */
+    const char *ptr,
+    /* length of TEXT slice */
+    size_t len);
 
 /** Deallocate C string allocated by Turso */
 void turso_str_deinit(const char *self);
