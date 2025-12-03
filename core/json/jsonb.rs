@@ -2296,7 +2296,8 @@ impl Jsonb {
     pub fn from_str_with_mode(input: &str, mode: Conv) -> PResult<Self> {
         // Parse directly as JSON if it's already JSON subtype or strict mode is on
         if matches!(mode, Conv::ToString) {
-            let mut str = input.replace('"', "\\\"");
+            // Escape backslashes first, then double quotes
+            let mut str = input.replace('\\', "\\\\").replace('"', "\\\"");
             str.insert(0, '"');
             str.push('"');
             Jsonb::from_str(&str)
