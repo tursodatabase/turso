@@ -143,9 +143,9 @@ impl Default for turso_config_t {
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct turso_database_config_t {
-    #[doc = " Path to the database file or `:memory:`"]
+    #[doc = " Path to the database file or `:memory:`\n zero-terminated C string"]
     pub path: *const ::std::os::raw::c_char,
-    #[doc = " Optional comma separated list of experimental features to enable"]
+    #[doc = " Optional comma separated list of experimental features to enable\n zero-terminated C string or null pointer"]
     pub experimental_features: *const ::std::os::raw::c_char,
     #[doc = " Parameter which defines who drives the IO - callee or the caller"]
     pub async_io: bool,
@@ -207,6 +207,10 @@ unsafe extern "C" {
 unsafe extern "C" {
     #[doc = " Get autocommit state of the connection"]
     pub fn turso_connection_get_autocommit(self_: *const turso_connection_t) -> bool;
+}
+unsafe extern "C" {
+    #[doc = " Get last insert rowid for the connection or 0 if no inserts happened before"]
+    pub fn turso_connection_last_insert_rowid(self_: *const turso_connection_t) -> i64;
 }
 unsafe extern "C" {
     #[doc = " Prepare single statement in a connection"]
@@ -312,6 +316,10 @@ unsafe extern "C" {
         self_: *const turso_statement_t,
         name: *const ::std::os::raw::c_char,
     ) -> i64;
+}
+unsafe extern "C" {
+    #[doc = " Return parameters count for the statement\n -1 if pointer is invalid"]
+    pub fn turso_statement_parameters_count(self_: *const turso_statement_t) -> i64;
 }
 unsafe extern "C" {
     #[doc = " Bind a positional argument to a statement"]

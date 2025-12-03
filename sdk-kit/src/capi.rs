@@ -103,6 +103,17 @@ pub extern "C" fn turso_connection_get_autocommit(
 
 #[no_mangle]
 #[signature(c)]
+pub extern "C" fn turso_connection_last_insert_rowid(
+    connection: *const c::turso_connection_t,
+) -> i64 {
+    match unsafe { TursoConnection::ref_from_capi(connection) } {
+        Ok(connection) => connection.last_insert_rowid(),
+        Err(_) => 0,
+    }
+}
+
+#[no_mangle]
+#[signature(c)]
 pub unsafe extern "C" fn turso_connection_prepare_single(
     connection: *const c::turso_connection_t,
     sql: *const std::ffi::c_char,
@@ -400,6 +411,16 @@ pub extern "C" fn turso_statement_named_position(
         Ok(position) => position as i64,
         Err(_) => -1,
     }
+}
+
+#[no_mangle]
+#[signature(c)]
+pub extern "C" fn turso_statement_parameters_count(statement: *const c::turso_statement_t) -> i64 {
+    let statement = match unsafe { TursoStatement::ref_from_capi(statement) } {
+        Ok(statement) => statement,
+        Err(_) => return -1,
+    };
+    statement.parameters_count() as i64
 }
 
 #[no_mangle]

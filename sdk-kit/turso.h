@@ -139,6 +139,9 @@ turso_status_code_t turso_database_connect(
 /** Get autocommit state of the connection */
 bool turso_connection_get_autocommit(const turso_connection_t *self);
 
+/** Get last insert rowid for the connection or 0 if no inserts happened before */
+int64_t turso_connection_last_insert_rowid(const turso_connection_t *self);
+
 /** Prepare single statement in a connection */
 turso_status_code_t
 turso_connection_prepare_single(
@@ -232,6 +235,12 @@ int64_t turso_statement_named_position(
     const turso_statement_t *self,
     /* zero-terminated C string */
     const char *name);
+
+/** Return parameters count for the statement
+ * -1 if pointer is invalid
+ */
+int64_t
+turso_statement_parameters_count(const turso_statement_t *self);
 
 /** Bind a positional argument to a statement */
 turso_status_code_t
