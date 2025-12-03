@@ -41,7 +41,38 @@ enum ExistsState {
 }
 
 #[derive(Debug, Clone)]
+enum AdvanceBtreeStateForward {
+    RewindCheckBtreeKey, // Check if first key found is valid
+    NextBtree,           // Advance to next key
+    NextCheckBtreeKey,   // Check if next key found is valid, if it isn't go back to NextBtree
+}
+#[derive(Debug, Clone)]
+enum AdvanceBtreeStateBackward {
+    LastCheckBtreeKey, // Check if last key found is valid
+    PrevBtree,         // Advance to previous key
+    PrevCheckBtreeKey, // Check if previous key found is valid, if it isn't go back to PrevBtree
+}
+
+#[derive(Debug, Clone)]
+enum RewindState {
+    Advance,
+}
+#[derive(Debug, Clone)]
+enum NextState {
+    AdvanceUnitialized,
+    CheckNeedsAdvance,
+    Advance,
+}
+#[derive(Debug, Clone)]
+enum PrevState {
+    Advance,
+}
+
+#[derive(Debug, Clone)]
 enum MvccLazyCursorState {
+    Next(NextState),
+    Prev(PrevState),
+    Rewind(RewindState),
     Exists(ExistsState),
 }
 
