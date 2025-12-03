@@ -419,7 +419,9 @@ func turso_connection_close(self TursoConnection) error {
 	return statusToError(TursoStatusCode(status), msg)
 }
 
-// turso_statement_execute executes a single statement. May return intermediate statuses like TURSO_IO.
+// turso_statement_execute executes a single statement
+// * execute returns TURSO_DONE if execution completed
+// * execute returns TURSO_IO if async_io was set and execution needs IO in order to make progress
 func turso_statement_execute(self TursoStatement) (TursoStatusCode, uint64, error) {
 	var changes uint64
 	var errPtr *byte

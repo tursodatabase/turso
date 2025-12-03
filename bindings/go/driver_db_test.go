@@ -743,16 +743,13 @@ func slicesAreEq(a, b []byte) bool {
 var rowsMap = map[int]string{1: "hello", 2: "world", 3: "foo", 4: "bar", 5: "baz"}
 
 func createTable(conn *sql.DB) error {
-	log.Printf("1")
 	insert := "CREATE TABLE test (foo INT, bar TEXT, baz BLOB);"
 	stmt, err := conn.Prepare(insert)
-	log.Printf("2")
 	if err != nil {
 		return err
 	}
 	defer stmt.Close()
 	_, err = stmt.Exec()
-	log.Printf("3")
 	return err
 }
 

@@ -45,7 +45,7 @@ func prepExec(t *testing.T, conn TursoConnection, sql string) uint64 {
 		_ = turso_statement_finalize(stmt)
 		turso_statement_deinit(stmt)
 	}()
-	changes, err := turso_statement_execute(stmt)
+	_, changes, err := turso_statement_execute(stmt)
 	require.NoError(t, err)
 	return changes
 }
@@ -100,7 +100,7 @@ func TestPrepareFirstMultipleStatements(t *testing.T) {
 		// Execute or step depending on statement type
 		colCount := turso_statement_column_count(stmt)
 		if colCount == 0 {
-			_, err := turso_statement_execute(stmt)
+			_, _, err := turso_statement_execute(stmt)
 			require.NoError(t, err)
 		} else {
 			require.True(t, stepRow(t, stmt))
@@ -330,7 +330,7 @@ func TestBindingsPositionalAndNamed(t *testing.T) {
 	require.NoError(t, turso_statement_bind_positional_text(stmt, 3, "hello"))
 	require.NoError(t, turso_statement_bind_positional_blob(stmt, 4, []byte{0xde, 0xad, 0xbe, 0xef}))
 	require.NoError(t, turso_statement_bind_positional_null(stmt, 5))
-	_, err := turso_statement_execute(stmt)
+	_, _, err := turso_statement_execute(stmt)
 	require.NoError(t, err)
 	_ = turso_statement_finalize(stmt)
 	turso_statement_deinit(stmt)
@@ -357,7 +357,7 @@ func TestBindingsPositionalAndNamed(t *testing.T) {
 	require.NoError(t, turso_statement_bind_positional_text(stmt2, int(posS), "world"))
 	require.NoError(t, turso_statement_bind_positional_blob(stmt2, int(posB), []byte{})) // empty blob
 	require.NoError(t, turso_statement_bind_positional_null(stmt2, int(posN)))
-	_, err = turso_statement_execute(stmt2)
+	_, _, err = turso_statement_execute(stmt2)
 	require.NoError(t, err)
 
 	// Verify retrieved values using row value helpers
@@ -402,7 +402,7 @@ func TestColumnMetadata(t *testing.T) {
 		turso_statement_deinit(stmt)
 	}()
 	cc := turso_statement_column_count(stmt)
-	require.Equal(t, 2, cc)
+	require.Equal(t, int64(2), cc)
 	n0 := turso_statement_column_name(stmt, 0)
 	n1 := turso_statement_column_name(stmt, 1)
 	assert.Equal(t, "id", n0)
