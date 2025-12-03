@@ -16,7 +16,11 @@ use turso_core::{
     DatabaseStorage, LimboError, OpenFlags, Statement, StepResult, IO,
 };
 
-use crate::{assert_send, assert_sync, capi, ConcurrentGuard};
+use crate::{
+    assert_send, assert_sync,
+    capi::{self, c},
+    ConcurrentGuard,
+};
 
 assert_send!(TursoDatabase, TursoConnection, TursoStatement);
 assert_sync!(TursoDatabase);
@@ -41,17 +45,7 @@ pub struct TursoSetupConfig {
     pub log_level: Option<String>,
 }
 
-fn logger_wrap(
-    log: TursoLog<'_>,
-    logger: unsafe extern "C" fn(
-        *const std::ffi::c_char,
-        *const std::ffi::c_char,
-        *const std::ffi::c_char,
-        u64,
-        usize,
-        capi::c::turso_tracing_level_t,
-    ),
-) {
+fn logger_wrap(log: TursoLog<'_>, logger: unsafe extern "C" fn(*const c::turso_log_t)) {
     let Ok(message_cstr) = std::ffi::CString::new(log.message) else {
         return;
     };
@@ -62,20 +56,20 @@ fn logger_wrap(
         return;
     };
     unsafe {
-        logger(
-            message_cstr.as_ptr(),
-            target_cstr.as_ptr(),
-            file_cstr.as_ptr(),
-            log.timestamp,
-            log.line,
-            match log.level {
+        logger(&c::turso_log_t {
+            message: message_cstr.as_ptr(),
+            target: target_cstr.as_ptr(),
+            file: file_cstr.as_ptr(),
+            timestamp: log.timestamp,
+            line: log.line,
+            level: match log.level {
                 "TRACE" => capi::c::turso_tracing_level_t::TURSO_TRACING_LEVEL_TRACE,
                 "DEBUG" => capi::c::turso_tracing_level_t::TURSO_TRACING_LEVEL_DEBUG,
                 "INFO" => capi::c::turso_tracing_level_t::TURSO_TRACING_LEVEL_INFO,
                 "WARN" => capi::c::turso_tracing_level_t::TURSO_TRACING_LEVEL_WARN,
                 _ => capi::c::turso_tracing_level_t::TURSO_TRACING_LEVEL_ERROR,
             },
-        )
+        })
     };
 }
 
@@ -84,27 +78,22 @@ impl TursoSetupConfig {
     /// this method is used in the capi wrappers
     ///
     /// # Safety
-    /// [log_level] field must be valid C-string pointer or null
-    pub unsafe fn from_capi(
-        logger: Option<
-            unsafe extern "C" fn(
-                *const std::ffi::c_char,
-                *const std::ffi::c_char,
-                *const std::ffi::c_char,
-                u64,
-                usize,
-                capi::c::turso_tracing_level_t,
-            ),
-        >,
-        log_level: *const std::ffi::c_char,
-    ) -> Result<Self, TursoError> {
+    /// [c::turso_config_t::log_level] field must be valid C-string pointer or null
+    pub unsafe fn from_capi(config: *const c::turso_config_t) -> Result<Self, TursoError> {
+        if config.is_null() {
+            return Err(TursoError {
+                code: TursoStatusCode::Misuse,
+                message: Some("config pointer must be not null".to_string()),
+            });
+        }
+        let config = *config;
         Ok(Self {
-            log_level: if !log_level.is_null() {
-                Some(str_from_c_str(log_level)?.to_string())
+            log_level: if !config.log_level.is_null() {
+                Some(str_from_c_str(config.log_level)?.to_string())
             } else {
                 None
             },
-            logger: if let Some(logger) = logger {
+            logger: if let Some(logger) = config.logger {
                 Some(Box::new(move |log| logger_wrap(log, logger)))
             } else {
                 None
@@ -132,6 +121,13 @@ pub struct TursoDatabaseConfig {
     /// optional custom DatabaseStorage provided by the caller
     /// if provided, caller must guarantee that IO used by the TursoDatabase will be consistent with underlying DatabaseStorage IO
     pub db_file: Option<Arc<dyn DatabaseStorage>>,
+}
+
+pub fn turso_slice_from_bytes(bytes: &[u8]) -> capi::c::turso_slice_ref_t {
+    capi::c::turso_slice_ref_t {
+        ptr: bytes.as_ptr() as *const std::ffi::c_void,
+        len: bytes.len(),
+    }
 }
 
 /// # Safety
@@ -191,26 +187,60 @@ pub unsafe fn bytes_from_slice<'a>(
     Ok(std::slice::from_raw_parts(ptr, len))
 }
 
+/// SAFETY: slice must points to the valid memory
+pub fn bytes_from_turso_slice<'a>(
+    slice: capi::c::turso_slice_ref_t,
+) -> Result<&'a [u8], TursoError> {
+    if slice.ptr.is_null() {
+        return Err(TursoError {
+            code: TursoStatusCode::Misuse,
+            message: Some("expected slice representing utf-8 value, got null".to_string()),
+        });
+    }
+    Ok(unsafe { std::slice::from_raw_parts(slice.ptr as *const u8, slice.len) })
+}
+
+/// SAFETY: slice must points to the valid memory
+pub fn str_from_turso_slice<'a>(slice: capi::c::turso_slice_ref_t) -> Result<&'a str, TursoError> {
+    if slice.ptr.is_null() {
+        return Err(TursoError {
+            code: TursoStatusCode::Misuse,
+            message: Some("expected slice representing utf-8 value, got null".to_string()),
+        });
+    }
+    let s = unsafe { std::slice::from_raw_parts(slice.ptr as *const u8, slice.len) };
+    match std::str::from_utf8(s) {
+        Ok(s) => Ok(s),
+        Err(err) => Err(TursoError {
+            code: TursoStatusCode::Misuse,
+            message: Some(format!("expected slice representing utf-8 value: {err}")),
+        }),
+    }
+}
+
 impl TursoDatabaseConfig {
     /// helper method to restore [TursoSetupConfig] instance from C representation
     /// this method is used in the capi wrappers
     ///
     /// # Safety
-    /// [path] field must be valid C-string pointer
-    /// [experimental_features] field must be valid C-string pointer or null
-    pub unsafe fn from_capi(
-        path: *const std::ffi::c_char,
-        experimental_features: *const std::ffi::c_char,
-        async_io: bool,
-    ) -> Result<Self, TursoError> {
+    /// [c::turso_database_config_t::path] field must be valid C-string pointer
+    /// [c::turso_database_config_t::experimental_features] field must be valid C-string pointer or null
+    pub unsafe fn from_capi(config: *const c::turso_database_config_t) -> Result<Self, TursoError> {
+        if config.is_null() {
+            return Err(TursoError {
+                code: TursoStatusCode::Misuse,
+                message: Some("config pointer must be not null".to_string()),
+            });
+        }
+        let config = *config;
         Ok(Self {
-            path: str_from_c_str(path)?.to_string(),
-            experimental_features: if !experimental_features.is_null() {
-                Some(str_from_c_str(experimental_features)?.to_string())
+            path: str_from_c_str(config.path)?.to_string(),
+            experimental_features: if !config.experimental_features.is_null() {
+                Some(str_from_c_str(config.experimental_features)?.to_string())
             } else {
                 None
             },
-            async_io,
+            async_io: config.async_io,
             io: None,
             db_file: None,
         })
@@ -824,7 +854,7 @@ impl TursoStatement {
     /// # Safety
     /// value must be a pointer returned from [Self::to_capi] method
     pub unsafe fn ref_from_capi<'a>(
-        value: *mut capi::c::turso_statement_t,
+        value: *const capi::c::turso_statement_t,
     ) -> Result<&'a mut Self, TursoError> {
         if value.is_null() {
             Err(TursoError {
@@ -841,7 +871,7 @@ impl TursoStatement {
     ///
     /// # Safety
     /// value must be a pointer returned from [Self::to_capi] method
-    pub unsafe fn box_from_capi(value: *mut capi::c::turso_statement_t) -> Box<Self> {
+    pub unsafe fn box_from_capi(value: *const capi::c::turso_statement_t) -> Box<Self> {
         Box::from_raw(value as *mut Self)
     }
 }
