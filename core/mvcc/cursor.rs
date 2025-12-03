@@ -267,7 +267,7 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
                             "immutable record not initialized".to_string(),
                         ))?;
                         record.invalidate();
-                        record.start_serialization(&row.data);
+                        record.start_serialization(row.payload());
                     }
 
                     let record_ref =
@@ -902,7 +902,10 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                 ))?
                 .column_count(),
         };
-        let row = crate::mvcc::database::Row::new(row_id, record_buf, num_columns);
+        let row = match &self.mv_cursor_type {
+            MvccCursorType::Table => Row::new_table_row(row_id, record_buf, num_columns),
+            MvccCursorType::Index(_) => Row::new_index_row(row_id, num_columns),
+        };
 
         self.current_pos.replace(CursorPosition::Loaded {
             row_id: row.id.clone(),
@@ -955,11 +958,16 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
             let IOResult::Done(Some(record)) = self.record()? else {
                 crate::bail_corrupt_error!("Btree cursor should have a record when deleting a row that only exists in the btree");
             };
-            let row = crate::mvcc::database::Row::new(
-                rowid.clone(),
-                record.get_payload().to_vec(),
-                record.column_count(),
-            );
+            let row = match &self.mv_cursor_type {
+                MvccCursorType::Table => Row::new_table_row(
+                    rowid.clone(),
+                    record.get_payload().to_vec(),
+                    record.column_count(),
+                ),
+                MvccCursorType::Index(_) => {
+                    Row::new_index_row(rowid.clone(), record.column_count())
+                }
+            };
             self.db
                 .insert_tombstone_to_table_or_index(self.tx_id, rowid, row, maybe_index_id)?;
         }

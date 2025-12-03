@@ -271,7 +271,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 let mut special_write = None;
 
                 if version.row.id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
-                    let row_data = ImmutableRecord::from_bin_record(version.row.data.clone());
+                    let row_data = ImmutableRecord::from_bin_record(version.row.payload().to_vec());
                     let mut record_cursor = RecordCursor::new();
                     record_cursor
                         .parse_full_header(&row_data)
@@ -714,7 +714,8 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                             .ok_or(LimboError::InternalError(
                                 "row version not found in write set".to_string(),
                             ))?;
-                        let record = ImmutableRecord::from_bin_record(row_version.row.data.clone());
+                        let record =
+                            ImmutableRecord::from_bin_record(row_version.row.payload().to_vec());
                         let mut record_cursor = RecordCursor::new();
                         record_cursor
                             .parse_full_header(&record)
@@ -726,7 +727,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                             .collect::<Result<Vec<_>>>()?;
                         values[3] = Value::Integer(root_page as i64);
                         let record = ImmutableRecord::from_values(&values, values.len());
-                        row_version.row.data = record.get_payload().to_owned();
+                        row_version.row.data = Some(record.get_payload().to_owned());
                         row_version.clone()
                     };
                     self.created_btrees
@@ -753,7 +754,8 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                             .ok_or(LimboError::InternalError(
                                 "row version not found in write set".to_string(),
                             ))?;
-                        let record = ImmutableRecord::from_bin_record(row_version.row.data.clone());
+                        let record =
+                            ImmutableRecord::from_bin_record(row_version.row.payload().to_vec());
                         let mut record_cursor = RecordCursor::new();
                         record_cursor
                             .parse_full_header(&record)
@@ -765,7 +767,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                             .collect::<Result<Vec<_>>>()?;
                         values[3] = Value::Integer(root_page as i64);
                         let record = ImmutableRecord::from_values(&values, values.len());
-                        row_version.row.data = record.get_payload().to_owned();
+                        row_version.row.data = Some(record.get_payload().to_owned());
                         row_version.clone()
                     };
 

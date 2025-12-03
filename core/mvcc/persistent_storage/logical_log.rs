@@ -132,7 +132,7 @@ impl LogRecordType {
             RowKey::Int(rowid) => {
                 // Table row
                 write_varint_to_vec(*rowid as u64, buffer);
-                let data = &row_version.row.data;
+                let data = row_version.row.payload();
                 write_varint_to_vec(data.len() as u64, buffer);
                 buffer.extend_from_slice(data);
             }
@@ -398,7 +398,7 @@ impl StreamingLogicalLogReader {
                                     transaction_read_bytes: transaction_read_bytes
                                         + bytes_read_on_row,
                                 };
-                                let row = Row::new(
+                                let row = Row::new_table_row(
                                     RowID::new(table_id, RowKey::Int(rowid as i64)),
                                     buffer,
                                     column_count,
@@ -412,8 +412,7 @@ impl StreamingLogicalLogReader {
                                 let (key_size, nkey) = self.consume_varint(io)?;
                                 let key_bytes = self.consume_buffer(io, key_size as usize)?;
 
-                                let key_record =
-                                    ImmutableRecord::from_bin_record(key_bytes.clone());
+                                let key_record = ImmutableRecord::from_bin_record(key_bytes);
                                 let column_count = key_record.column_count();
 
                                 let index_info = get_index_info(table_id)?;
@@ -425,9 +424,8 @@ impl StreamingLogicalLogReader {
                                     transaction_read_bytes: transaction_read_bytes
                                         + bytes_read_on_row,
                                 };
-                                let row = Row::new(
+                                let row = Row::new_index_row(
                                     RowID::new(table_id, RowKey::Record(key.clone())),
-                                    key_bytes,
                                     column_count,
                                 );
                                 return Ok(StreamingResult::DeleteIndexRow {
@@ -450,7 +448,7 @@ impl StreamingLogicalLogReader {
                                     transaction_read_bytes: transaction_read_bytes
                                         + bytes_read_on_row,
                                 };
-                                let row = Row::new(
+                                let row = Row::new_table_row(
                                     RowID::new(table_id, RowKey::Int(rowid as i64)),
                                     buffer,
                                     column_count,
@@ -464,8 +462,7 @@ impl StreamingLogicalLogReader {
                                 let (key_size, nkey) = self.consume_varint(io)?;
                                 let key_bytes = self.consume_buffer(io, key_size as usize)?;
 
-                                let key_record =
-                                    ImmutableRecord::from_bin_record(key_bytes.clone());
+                                let key_record = ImmutableRecord::from_bin_record(key_bytes);
                                 let column_count = key_record.column_count();
 
                                 let index_info = get_index_info(table_id)?;
@@ -477,9 +474,8 @@ impl StreamingLogicalLogReader {
                                     transaction_read_bytes: transaction_read_bytes
                                         + bytes_read_on_row,
                                 };
-                                let row = Row::new(
+                                let row = Row::new_index_row(
                                     RowID::new(table_id, RowKey::Record(key.clone())),
-                                    key_bytes,
                                     column_count,
                                 );
                                 return Ok(StreamingResult::InsertIndexRow {
@@ -649,14 +645,11 @@ mod tests {
             mvcc_store
                 .insert(
                     tx_id,
-                    Row {
-                        id: RowID {
-                            table_id: (-1).into(),
-                            row_id: RowKey::Int(1),
-                        },
-                        data: data.as_blob().to_vec(),
-                        column_count: 5,
-                    },
+                    Row::new_table_row(
+                        RowID::new((-1).into(), RowKey::Int(1)),
+                        data.as_blob().to_vec(),
+                        5,
+                    ),
                 )
                 .unwrap();
             // now insert a row into table -2
@@ -677,7 +670,7 @@ mod tests {
             .read(tx, RowID::new((-2).into(), RowKey::Int(1)))
             .unwrap()
             .unwrap();
-        let record = ImmutableRecord::from_bin_record(row.data.clone());
+        let record = ImmutableRecord::from_bin_record(row.payload().to_vec());
         let values = record.get_values();
         let foo = values.first().unwrap();
         let ValueRef::Text(foo) = foo else {
@@ -720,14 +713,11 @@ mod tests {
             mvcc_store
                 .insert(
                     tx_id,
-                    Row {
-                        id: RowID {
-                            table_id: (-1).into(),
-                            row_id: RowKey::Int(1),
-                        },
-                        data: data.as_blob().to_vec(),
-                        column_count: 5,
-                    },
+                    Row::new_table_row(
+                        RowID::new((-1).into(), RowKey::Int(1)),
+                        data.as_blob().to_vec(),
+                        5,
+                    ),
                 )
                 .unwrap();
             commit_tx(mvcc_store.clone(), &conn, tx_id).unwrap();
@@ -755,7 +745,7 @@ mod tests {
         for (rowid, value) in &values {
             let tx = mvcc_store.begin_tx(pager.clone()).unwrap();
             let row = mvcc_store.read(tx, rowid.clone()).unwrap().unwrap();
-            let record = ImmutableRecord::from_bin_record(row.data.clone());
+            let record = ImmutableRecord::from_bin_record(row.payload().to_vec());
             let values = record.get_values();
             let foo = values.first().unwrap();
             let ValueRef::Text(foo) = foo else {
@@ -833,14 +823,11 @@ mod tests {
             mvcc_store
                 .insert(
                     tx_id,
-                    Row {
-                        id: RowID {
-                            table_id: (-1).into(),
-                            row_id: RowKey::Int(1),
-                        },
-                        data: data.as_blob().to_vec(),
-                        column_count: 5,
-                    },
+                    Row::new_table_row(
+                        RowID::new((-1).into(), RowKey::Int(1)),
+                        data.as_blob().to_vec(),
+                        5,
+                    ),
                 )
                 .unwrap();
             commit_tx(mvcc_store.clone(), &conn, tx_id).unwrap();
@@ -877,7 +864,7 @@ mod tests {
         let tx = mvcc_store.begin_tx(pager.clone()).unwrap();
         for present_rowid in present_rowids {
             let row = mvcc_store.read(tx, present_rowid.clone()).unwrap().unwrap();
-            let record = ImmutableRecord::from_bin_record(row.data.clone());
+            let record = ImmutableRecord::from_bin_record(row.payload().to_vec());
             let values = record.get_values();
             let foo = values.first().unwrap();
             let ValueRef::Text(foo) = foo else {
@@ -950,7 +937,7 @@ mod tests {
                 .read(tx, RowID::new((-2).into(), RowKey::Int(row_id)))
                 .unwrap()
                 .expect("Table row should exist");
-            let record = ImmutableRecord::from_bin_record(row.data.clone());
+            let record = ImmutableRecord::from_bin_record(row.payload().to_vec());
             let values = record.get_values();
             let data_value = values.get(1).expect("Should have data column");
             let ValueRef::Text(data_text) = data_value else {
@@ -988,7 +975,10 @@ mod tests {
                 panic!("Index row for ({data_value}, {row_id}) not found after recovery. Index rows should be in the logical log.");
             };
             // Verify the index row contains the correct data
-            let record = ImmutableRecord::from_bin_record(index_row.data.clone());
+            let RowKey::Record(sortable_key) = index_row.id.row_id else {
+                panic!("Index row should have a record row_id");
+            };
+            let record = sortable_key.key.clone();
             let values = record.get_values();
             assert_eq!(
                 values.len(),

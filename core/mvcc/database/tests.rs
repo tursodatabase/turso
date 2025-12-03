@@ -96,14 +96,11 @@ impl MvccTestDbNoConn {
 
 pub(crate) fn generate_simple_string_row(table_id: MVTableId, id: i64, data: &str) -> Row {
     let record = ImmutableRecord::from_values(&[Value::Text(Text::new(data.to_string()))], 1);
-    Row {
-        id: RowID {
-            table_id,
-            row_id: RowKey::Int(id),
-        },
-        column_count: 1,
-        data: record.as_blob().to_vec(),
-    }
+    Row::new_table_row(
+        RowID::new(table_id, RowKey::Int(id)),
+        record.as_blob().to_vec(),
+        1,
+    )
 }
 
 pub(crate) fn generate_simple_string_record(data: &str) -> ImmutableRecord {
@@ -732,7 +729,7 @@ fn setup_test_db() -> (MvccTestDb, u64) {
     for (row_id, data) in test_rows.iter() {
         let id = RowID::new(table_id, RowKey::Int(*row_id));
         let record = ImmutableRecord::from_values(&[Value::Text(Text::new(data.to_string()))], 1);
-        let row = Row::new(id, record.as_blob().to_vec(), 1);
+        let row = Row::new_table_row(id, record.as_blob().to_vec(), 1);
         db.mvcc_store.insert(tx_id, row).unwrap();
     }
 
@@ -757,7 +754,7 @@ fn setup_lazy_db(initial_keys: &[i64]) -> (MvccTestDb, u64) {
         let id = RowID::new(table_id.into(), RowKey::Int(*i));
         let data = format!("row{i}");
         let record = ImmutableRecord::from_values(&[Value::Text(Text::new(data))], 1);
-        let row = Row::new(id, record.as_blob().to_vec(), 1);
+        let row = Row::new_table_row(id, record.as_blob().to_vec(), 1);
         db.mvcc_store.insert(tx_id, row).unwrap();
     }
 
@@ -1207,14 +1204,11 @@ fn test_restart() {
         mvcc_store
             .insert(
                 tx_id,
-                Row {
-                    id: RowID {
-                        table_id: (-1).into(),
-                        row_id: RowKey::Int(1),
-                    },
-                    data: data.as_blob().to_vec(),
-                    column_count: 5,
-                },
+                Row::new_table_row(
+                    RowID::new((-1).into(), RowKey::Int(1)),
+                    data.as_blob().to_vec(),
+                    5,
+                ),
             )
             .unwrap();
         // now insert a row into table -2
@@ -1321,7 +1315,7 @@ fn test_delete_with_conn() {
 
 fn get_record_value(row: &Row) -> ImmutableRecord {
     let mut record = ImmutableRecord::new(1024);
-    record.start_serialization(&row.data);
+    record.start_serialization(row.payload());
     record
 }
 
