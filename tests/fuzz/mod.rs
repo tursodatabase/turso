@@ -1975,11 +1975,11 @@ mod fuzz_tests {
             }
         }
     }
-    // TODO: mvcc indexes
-    #[turso_macros::test()]
+    #[turso_macros::test(mvcc)]
     /// Create a table with a random number of columns and indexes, and then randomly update or delete rows from the table.
     /// Verify that the results are the same for SQLite and Turso.
     pub fn table_index_mutation_fuzz(db: TempDatabase) {
+        let is_mvcc = db.db_opts.enable_mvcc;
         /// Format a nice diff between two result sets for better error messages
         #[allow(clippy::too_many_arguments)]
         fn format_rows_diff(
@@ -2125,7 +2125,8 @@ mod fuzz_tests {
             for i in 0..num_indexes {
                 // Decide if this should be a single-column or multi-column index
                 let is_multi_column = rng.random_bool(0.5) && num_cols > 1;
-                let is_expr = rng.random_bool(0.3);
+                // Expression indexes are not supported in MVCC (at least yet)
+                let is_expr = !is_mvcc && rng.random_bool(0.3);
 
                 if is_multi_column {
                     // Create a multi-column index with 2-3 columns
@@ -2170,7 +2171,8 @@ mod fuzz_tests {
                 sqlite_conn.execute(t, params![]).unwrap();
             }
 
-            let use_trigger = rng.random_bool(1.0);
+            // Triggers are not supported in MVCC (at least yet)
+            let use_trigger = !is_mvcc;
 
             // Generate initial data
             // Triggers can cause quadratic complexity to the tested operations so limit total row count
