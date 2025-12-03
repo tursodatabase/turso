@@ -811,7 +811,7 @@ impl TursoStatement {
 
 #[cfg(test)]
 mod tests {
-    use crate::rsapi::{TursoDatabase, TursoDatabaseConfig};
+    use crate::rsapi::{TursoDatabase, TursoDatabaseConfig, TursoStatusCode};
 
     #[test]
     pub fn test_db_concurrent_use() {
@@ -842,5 +842,21 @@ mod tests {
         assert!(
             results[0].is_err() && results[1].is_ok() || results[0].is_ok() && results[1].is_err()
         );
+    }
+
+    #[test]
+    pub fn test_db_rsapi_use() {
+        let db = TursoDatabase::create(TursoDatabaseConfig {
+            path: ":memory:".to_string(),
+            experimental_features: None,
+            io: None,
+            async_io: false,
+        });
+        db.open().unwrap();
+        let conn = db.connect().unwrap();
+        let mut stmt = conn
+            .prepare_single("SELECT * FROM generate_series(1, 10000)")
+            .unwrap();
+        assert_eq!(stmt.execute().unwrap().status, TursoStatusCode::Ok);
     }
 }
