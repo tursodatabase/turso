@@ -7014,20 +7014,30 @@ pub fn op_new_rowid(
         },
         insn
     );
-    if let Some(mv_store) = mv_store {
-        // With MVCC we can't simply find last rowid and get rowid + 1 as a result. To not have two conflicting rowids concurrently we need to call `get_next_rowid`
-        // which will make sure we don't collide.
-        let rowid = {
-            let cursor = state.get_cursor(*cursor);
-            let cursor = cursor.as_btree_mut() as &mut dyn Any;
-            let mvcc_cursor = cursor
-                .downcast_mut::<MvCursor>()
-                .expect("cursor should be MvCursor in MVCC mode");
-            mvcc_cursor.get_next_rowid()
-        };
-        state.registers[*rowid_reg] = Register::Value(Value::Integer(rowid));
-        state.pc += 1;
-        return Ok(InsnFunctionStepResult::Step);
+    'mvcc_newrowid: {
+        if let Some(mv_store) = mv_store {
+            // With MVCC we can't simply find last rowid and get rowid + 1 as a result. To not have two conflicting rowids concurrently we need to call `get_next_rowid`
+            // which will make sure we don't collide.
+            let rowid = {
+                let cursor = state.get_cursor(*cursor);
+                let cursor = cursor.as_btree_mut() as &mut dyn Any;
+                let Some(mvcc_cursor) = cursor.downcast_mut::<MvCursor>() else {
+                    // Not an MvCursor - must be an ephemeral cursor (indicated by lack of WAL)
+                    let Some(ephemeral_cursor) = cursor.downcast_mut::<BTreeCursor>() else {
+                        panic!("Expected MvCursor or BTreeCursor in op_new_rowid");
+                    };
+                    turso_assert!(
+                        ephemeral_cursor.pager.wal.is_none(),
+                        "MVCC is enabled but got a non-ephemeral BTreeCursor"
+                    );
+                    break 'mvcc_newrowid;
+                };
+                mvcc_cursor.get_next_rowid()
+            };
+            state.registers[*rowid_reg] = Register::Value(Value::Integer(rowid));
+            state.pc += 1;
+            return Ok(InsnFunctionStepResult::Step);
+        }
     }
 
     const MAX_ROWID: i64 = i64::MAX;
