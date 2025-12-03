@@ -7323,7 +7323,12 @@ fn _insert_into_cell(
         payload.len() + CELL_PTR_SIZE_BYTES <= free
     };
     if !enough_space {
-        // add to overflow cell
+        #[cfg(debug_assertions)]
+        {
+            if let Some(overflow_cell) = page.overflow_cells.last() {
+                turso_assert!(overflow_cell.index + 1 == cell_idx, "multiple overflow cells can only occur when a parent overflows during balancing as divider cells are inserted into it. those cells should always be in-order and sequential");
+            }
+        }
         page.overflow_cells.push(OverflowCell {
             index: cell_idx,
             payload: Pin::new(Vec::from(payload)),
