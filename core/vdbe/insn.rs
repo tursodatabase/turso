@@ -295,6 +295,18 @@ pub enum Insn {
         flags: CmpInsFlags,
         collation: Option<CollationSeq>,
     },
+    /// Compute a hash on the key contained in the P4 registers starting with r[P3]. Check to see if that hash is found in the bloom filter hosted by register P1. If it is not present then maybe jump to P2. Otherwise fall through.
+    // False negatives are harmless. It is always safe to fall through, even if the value is in the bloom filter. A false negative causes more CPU cycles to be used, but it should still yield the correct answer. However, an incorrect answer may well arise from a false positive - if the jump is taken when it should fall through.
+    Filter {
+        cursor_id: CursorID,
+        target_pc: BranchOffset,
+        value_reg: usize,
+    },
+    /// Compute a hash on the P4 registers starting with r[P3] and add that hash to the bloom filter contained in r[P1].
+    FilterAdd {
+        cursor_id: CursorID,
+        value_reg: usize,
+    },
     /// Compare two registers and jump to the given PC if they are not equal.
     Ne {
         lhs: usize,
@@ -1449,6 +1461,8 @@ impl InsnVariants {
             InsnVariants::FkIfZero => execute::op_fk_if_zero,
             InsnVariants::VBegin => execute::op_vbegin,
             InsnVariants::VRename => execute::op_vrename,
+            InsnVariants::FilterAdd => execute::op_filter_add,
+            InsnVariants::Filter => execute::op_filter,
         }
     }
 }

@@ -69,19 +69,31 @@ impl InteractionPlan {
                 .tables()
                 .is_empty()
         {
-            let check_all_tables = Interactions::new(
-                i.connection_index,
-                InteractionsType::Property(Property::AllTableHaveExpectedContent {
-                    tables: env
-                        .connection_context(i.connection_index)
-                        .tables()
-                        .iter()
-                        .map(|t| t.name.clone())
-                        .collect(),
-                }),
-            );
+            let interactions = if let InteractionsType::Query(query) = &i.interactions {
+                assert!(query.is_dml());
+                let mut table = query.uses();
+                assert!(table.len() == 1);
+                let table = table.pop().unwrap();
 
-            return Some(check_all_tables);
+                Interactions::new(
+                    i.connection_index,
+                    InteractionsType::Property(Property::TableHasExpectedContent { table }),
+                )
+            } else {
+                Interactions::new(
+                    i.connection_index,
+                    InteractionsType::Property(Property::AllTableHaveExpectedContent {
+                        tables: env
+                            .connection_context(i.connection_index)
+                            .tables()
+                            .iter()
+                            .map(|t| t.name.clone())
+                            .collect(),
+                    }),
+                )
+            };
+
+            return Some(interactions);
         }
 
         if self.len_properties() < num_interactions {

@@ -12,7 +12,6 @@ use rand_chacha::ChaCha8Rng;
 pub(crate) struct MvccTestDbNoConn {
     pub(crate) db: Option<Arc<Database>>,
     path: Option<String>,
-    log_path: Option<String>,
     // Stored mainly to not drop the temp dir before the test is done.
     _temp_dir: Option<tempfile::TempDir>,
 }
@@ -27,7 +26,7 @@ impl MvccTestDb {
         let io = Arc::new(MemoryIO::new());
         let db = Database::open_file(io.clone(), ":memory:", true, true).unwrap();
         let conn = db.connect().unwrap();
-        let mvcc_store = db.mv_store.as_ref().unwrap().clone();
+        let mvcc_store = db.get_mv_store().clone().unwrap();
         Self {
             mvcc_store,
             db,
@@ -43,7 +42,6 @@ impl MvccTestDbNoConn {
         Self {
             db: Some(db),
             path: None,
-            log_path: None,
             _temp_dir: None,
         }
     }
@@ -59,17 +57,9 @@ impl MvccTestDbNoConn {
         println!("path: {}", path.as_os_str().to_str().unwrap());
         let db = Database::open_file(io.clone(), path.as_os_str().to_str().unwrap(), true, true)
             .unwrap();
-        let mut log_path = path.clone();
-        let log_path_filename = log_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .map(|s| format!("{s}-log"))
-            .unwrap();
-        log_path.set_file_name(log_path_filename);
         Self {
             db: Some(db),
             path: Some(path.to_str().unwrap().to_string()),
-            log_path: Some(log_path.to_str().unwrap().to_string()),
             _temp_dir: Some(temp_dir),
         }
     }
@@ -100,24 +90,17 @@ impl MvccTestDbNoConn {
     }
 
     pub fn get_mvcc_store(&self) -> Arc<MvStore<LocalClock>> {
-        self.get_db().mv_store.as_ref().unwrap().clone()
-    }
-
-    pub fn get_log_path(&self) -> &str {
-        self.log_path.as_ref().unwrap().as_str()
+        self.get_db().get_mv_store().clone().unwrap()
     }
 }
 
 pub(crate) fn generate_simple_string_row(table_id: MVTableId, id: i64, data: &str) -> Row {
     let record = ImmutableRecord::from_values(&[Value::Text(Text::new(data.to_string()))], 1);
-    Row {
-        id: RowID {
-            table_id,
-            row_id: RowKey::Int(id),
-        },
-        column_count: 1,
-        data: record.as_blob().to_vec(),
-    }
+    Row::new_table_row(
+        RowID::new(table_id, RowKey::Int(id)),
+        record.as_blob().to_vec(),
+        1,
+    )
 }
 
 pub(crate) fn generate_simple_string_record(data: &str) -> ImmutableRecord {
@@ -746,7 +729,7 @@ fn setup_test_db() -> (MvccTestDb, u64) {
     for (row_id, data) in test_rows.iter() {
         let id = RowID::new(table_id, RowKey::Int(*row_id));
         let record = ImmutableRecord::from_values(&[Value::Text(Text::new(data.to_string()))], 1);
-        let row = Row::new(id, record.as_blob().to_vec(), 1);
+        let row = Row::new_table_row(id, record.as_blob().to_vec(), 1);
         db.mvcc_store.insert(tx_id, row).unwrap();
     }
 
@@ -771,7 +754,7 @@ fn setup_lazy_db(initial_keys: &[i64]) -> (MvccTestDb, u64) {
         let id = RowID::new(table_id.into(), RowKey::Int(*i));
         let data = format!("row{i}");
         let record = ImmutableRecord::from_values(&[Value::Text(Text::new(data))], 1);
-        let row = Row::new(id, record.as_blob().to_vec(), 1);
+        let row = Row::new_table_row(id, record.as_blob().to_vec(), 1);
         db.mvcc_store.insert(tx_id, row).unwrap();
     }
 
@@ -1221,14 +1204,11 @@ fn test_restart() {
         mvcc_store
             .insert(
                 tx_id,
-                Row {
-                    id: RowID {
-                        table_id: (-1).into(),
-                        row_id: RowKey::Int(1),
-                    },
-                    data: data.as_blob().to_vec(),
-                    column_count: 5,
-                },
+                Row::new_table_row(
+                    RowID::new((-1).into(), RowKey::Int(1)),
+                    data.as_blob().to_vec(),
+                    5,
+                ),
             )
             .unwrap();
         // now insert a row into table -2
@@ -1335,7 +1315,7 @@ fn test_delete_with_conn() {
 
 fn get_record_value(row: &Row) -> ImmutableRecord {
     let mut record = ImmutableRecord::new(1024);
-    record.start_serialization(&row.data);
+    record.start_serialization(row.payload());
     record
 }
 

@@ -490,7 +490,11 @@ fn rewrite_trigger_expr_single_for_subprogram(
                 }
             }
 
-            crate::bail_parse_error!("no such column: {ns}.{col}");
+            // If the namespace is neither NEW nor OLD, this can be a regular
+            // table-qualified reference inside the SELECT statement of the
+            // trigger subprogram. Leave it untouched so the normal SELECT
+            // binding/resolution phase can handle it.
+            return Ok(());
         }
         _ => {}
     }
@@ -588,7 +592,6 @@ fn execute_trigger_commands(
 
     let turso_stmt = Statement::new(
         built_subprogram,
-        connection.mv_store().cloned(),
         connection.pager.load().clone(),
         QueryMode::Normal,
     );
