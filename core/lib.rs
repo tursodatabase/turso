@@ -56,7 +56,7 @@ use crate::vdbe::explain::{EXPLAIN_COLUMNS_TYPE, EXPLAIN_QUERY_PLAN_COLUMNS_TYPE
 use crate::vdbe::metrics::ConnectionMetrics;
 use crate::vtab::VirtualTable;
 use crate::{incremental::view::AllViewsTxState, translate::emitter::TransactionMode};
-use arc_swap::ArcSwap;
+use arc_swap::{ArcSwap, ArcSwapOption};
 use core::str;
 pub use error::{CompletionError, LimboError};
 pub use io::clock::{Clock, Instant};
@@ -231,7 +231,7 @@ static DATABASE_MANAGER: LazyLock<Mutex<HashMap<String, Weak<Database>>>> =
 /// The `Database` object contains per database file state that is shared
 /// between multiple connections.
 pub struct Database {
-    mv_store: Option<Arc<MvStore>>,
+    mv_store: ArcSwapOption<MvStore>,
     schema: Mutex<Arc<Schema>>,
     db_file: Arc<dyn DatabaseStorage>,
     path: String,
@@ -270,7 +270,7 @@ impl fmt::Debug for Database {
         };
         debug_struct.field("db_state", &db_state_value);
 
-        let mv_store_status = if self.mv_store.is_some() {
+        let mv_store_status = if self.get_mv_store().is_some() {
             "present"
         } else {
             "none"
@@ -467,9 +467,9 @@ impl Database {
             let file = io.open_file(&format!("{path}-log"), OpenFlags::default(), false)?;
             let storage = mvcc::persistent_storage::Storage::new(file);
             let mv_store = MvStore::new(mvcc::LocalClock::new(), storage);
-            Some(Arc::new(mv_store))
+            ArcSwapOption::new(Some(Arc::new(mv_store)))
         } else {
-            None
+            ArcSwapOption::empty()
         };
 
         let db_size = db_file.size()?;
@@ -545,7 +545,8 @@ impl Database {
         }
 
         if opts.enable_mvcc {
-            let mv_store = db.mv_store.as_ref().unwrap();
+            let mv_store = db.get_mv_store();
+            let mv_store = mv_store.as_ref().unwrap();
             let mvcc_bootstrap_conn = db.connect_mvcc_bootstrap()?;
             mv_store.bootstrap(mvcc_bootstrap_conn)?;
         }
@@ -921,8 +922,8 @@ impl Database {
         }
     }
 
-    pub fn get_mv_store(&self) -> Option<&Arc<MvStore>> {
-        self.mv_store.as_ref()
+    pub fn get_mv_store(&self) -> impl Deref<Target = Option<Arc<MvStore>>> {
+        self.mv_store.load()
     }
 
     pub fn experimental_views_enabled(&self) -> bool {
@@ -1261,19 +1262,11 @@ impl Connection {
         self.executing_triggers.write().pop();
     }
     pub fn prepare(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<Statement> {
-        if self.is_mvcc_bootstrap_connection() {
-            // Never use MV store for bootstrapping - we read state directly from sqlite_schema in the DB file.
-            return self._prepare(sql, None);
-        }
-        self._prepare(sql, self.db.mv_store.clone())
+        self._prepare(sql)
     }
 
     #[instrument(skip_all, level = Level::INFO)]
-    pub fn _prepare(
-        self: &Arc<Connection>,
-        sql: impl AsRef<str>,
-        mv_store: Option<Arc<MvStore>>,
-    ) -> Result<Statement> {
+    pub fn _prepare(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<Statement> {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
@@ -1306,7 +1299,7 @@ impl Connection {
             mode,
             input,
         )?;
-        Ok(Statement::new(program, mv_store, pager, mode))
+        Ok(Statement::new(program, pager, mode))
     }
 
     /// Whether this is an internal connection used for MVCC bootstrap
@@ -1470,8 +1463,7 @@ impl Connection {
                 mode,
                 input,
             )?;
-            Statement::new(program, self.db.mv_store.clone(), pager.clone(), mode)
-                .run_ignore_rows()?;
+            Statement::new(program, pager.clone(), mode).run_ignore_rows()?;
         }
         Ok(())
     }
@@ -1518,7 +1510,7 @@ impl Connection {
             mode,
             input,
         )?;
-        let stmt = Statement::new(program, self.db.mv_store.clone(), pager, mode);
+        let stmt = Statement::new(program, pager, mode);
         Ok(Some(stmt))
     }
 
@@ -1554,8 +1546,7 @@ impl Connection {
                 mode,
                 input,
             )?;
-            Statement::new(program, self.db.mv_store.clone(), pager.clone(), mode)
-                .run_ignore_rows()?;
+            Statement::new(program, pager.clone(), mode).run_ignore_rows()?;
         }
         Ok(())
     }
@@ -1586,7 +1577,7 @@ impl Connection {
             mode,
             input,
         )?;
-        let stmt = Statement::new(program, self.db.mv_store.clone(), pager.clone(), mode);
+        let stmt = Statement::new(program, pager.clone(), mode);
         Ok(Some((stmt, parser.offset())))
     }
 
@@ -1912,7 +1903,7 @@ impl Connection {
     }
 
     pub fn is_wal_auto_checkpoint_disabled(&self) -> bool {
-        self.wal_auto_checkpoint_disabled.load(Ordering::SeqCst) || self.db.mv_store.is_some()
+        self.wal_auto_checkpoint_disabled.load(Ordering::SeqCst) || self.db.get_mv_store().is_some()
     }
 
     pub fn last_insert_rowid(&self) -> i64 {
@@ -2110,8 +2101,23 @@ impl Connection {
         self.db.mvcc_enabled()
     }
 
-    pub fn mv_store(&self) -> Option<&Arc<MvStore>> {
-        self.db.mv_store.as_ref()
+    pub fn mv_store(&self) -> impl Deref<Target = Option<Arc<MvStore>>> {
+        struct TransparentWrapper<T>(T);
+
+        impl<T> Deref for TransparentWrapper<T> {
+            type Target = T;
+
+            fn deref(&self) -> &Self::Target {
+                &self.0
+            }
+        }
+
+        // Never use MV store for bootstrapping - we read state directly from sqlite_schema in the DB file.
+        if !self.is_mvcc_bootstrap_connection() {
+            either::Left(self.db.get_mv_store())
+        } else {
+            either::Right(TransparentWrapper(None))
+        }
     }
 
     /// Query the current value(s) of `pragma_name` associated to
@@ -2203,7 +2209,7 @@ impl Connection {
         }
 
         let use_indexes = self.db.schema.lock().indexes_enabled();
-        let use_mvcc = self.db.mv_store.is_some();
+        let use_mvcc = self.db.get_mv_store().is_some();
         let use_views = self.db.experimental_views_enabled();
         let use_strict = self.db.experimental_strict_enabled();
 
@@ -2493,7 +2499,7 @@ impl Connection {
     }
 
     pub(crate) fn set_mvcc_checkpoint_threshold(&self, threshold: i64) -> Result<()> {
-        match self.db.mv_store.as_ref() {
+        match self.db.get_mv_store().as_ref() {
             Some(mv_store) => {
                 mv_store.set_checkpoint_threshold(threshold);
                 Ok(())
@@ -2503,7 +2509,7 @@ impl Connection {
     }
 
     pub(crate) fn mvcc_checkpoint_threshold(&self) -> Result<i64> {
-        match self.db.mv_store.as_ref() {
+        match self.db.get_mv_store().as_ref() {
             Some(mv_store) => Ok(mv_store.checkpoint_threshold()),
             None => Err(LimboError::InternalError("MVCC not enabled".into())),
         }
@@ -2582,7 +2588,6 @@ impl BusyTimeout {
 pub struct Statement {
     program: vdbe::Program,
     state: vdbe::ProgramState,
-    mv_store: Option<Arc<MvStore>>,
     pager: Arc<Pager>,
     /// Whether the statement accesses the database.
     /// Used to determine whether we need to check for schema changes when
@@ -2610,12 +2615,7 @@ impl Drop for Statement {
 }
 
 impl Statement {
-    pub fn new(
-        program: vdbe::Program,
-        mv_store: Option<Arc<MvStore>>,
-        pager: Arc<Pager>,
-        query_mode: QueryMode,
-    ) -> Self {
+    pub fn new(program: vdbe::Program, pager: Arc<Pager>, query_mode: QueryMode) -> Self {
         let accesses_db = program.accesses_db;
         let (max_registers, cursor_count) = match query_mode {
             QueryMode::Normal => (program.max_registers, program.cursor_ref.len()),
@@ -2626,7 +2626,6 @@ impl Statement {
         Self {
             program,
             state,
-            mv_store,
             pager,
             accesses_db,
             query_mode,
@@ -2661,6 +2660,10 @@ impl Statement {
         self.state.execution_state
     }
 
+    pub fn mv_store(&self) -> impl Deref<Target = Option<Arc<MvStore>>> {
+        self.program.connection.mv_store()
+    }
+
     fn _step(&mut self, waker: Option<&Waker>) -> Result<StepResult> {
         if let Some(busy_timeout) = self.busy_timeout.as_ref() {
             if self.pager.io.now() < busy_timeout.timeout {
@@ -2675,7 +2678,7 @@ impl Statement {
         let mut res = if !self.accesses_db {
             self.program.step(
                 &mut self.state,
-                self.mv_store.as_ref(),
+                self.program.connection.mv_store().as_ref(),
                 self.pager.clone(),
                 self.query_mode,
                 waker,
@@ -2684,7 +2687,7 @@ impl Statement {
             const MAX_SCHEMA_RETRY: usize = 50;
             let mut res = self.program.step(
                 &mut self.state,
-                self.mv_store.as_ref(),
+                self.program.connection.mv_store().as_ref(),
                 self.pager.clone(),
                 self.query_mode,
                 waker,
@@ -2698,7 +2701,7 @@ impl Statement {
                 self.reprepare()?;
                 res = self.program.step(
                     &mut self.state,
-                    self.mv_store.as_ref(),
+                    self.program.connection.mv_store().as_ref(),
                     self.pager.clone(),
                     self.query_mode,
                     waker,
@@ -2957,8 +2960,12 @@ impl Statement {
 
     fn reset_internal(&mut self, max_registers: Option<usize>, max_cursors: Option<usize>) {
         // as abort uses auto_txn_cleanup value - it needs to be called before state.reset
-        self.program
-            .abort(self.mv_store.as_ref(), &self.pager, None, &mut self.state);
+        self.program.abort(
+            self.program.connection.mv_store().as_ref(),
+            &self.pager,
+            None,
+            &mut self.state,
+        );
         self.state.reset(max_registers, max_cursors);
         self.program.n_change.store(0, Ordering::SeqCst);
         self.busy = false;

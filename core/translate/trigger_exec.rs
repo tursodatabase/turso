@@ -592,7 +592,6 @@ fn execute_trigger_commands(
 
     let turso_stmt = Statement::new(
         built_subprogram,
-        connection.mv_store().cloned(),
         connection.pager.load().clone(),
         QueryMode::Normal,
     );
