@@ -7014,20 +7014,30 @@ pub fn op_new_rowid(
         },
         insn
     );
-    if let Some(mv_store) = mv_store {
-        // With MVCC we can't simply find last rowid and get rowid + 1 as a result. To not have two conflicting rowids concurrently we need to call `get_next_rowid`
-        // which will make sure we don't collide.
-        let rowid = {
-            let cursor = state.get_cursor(*cursor);
-            let cursor = cursor.as_btree_mut() as &mut dyn Any;
-            let mvcc_cursor = cursor
-                .downcast_mut::<MvCursor>()
-                .expect("cursor should be MvCursor in MVCC mode");
-            mvcc_cursor.get_next_rowid()
-        };
-        state.registers[*rowid_reg] = Register::Value(Value::Integer(rowid));
-        state.pc += 1;
-        return Ok(InsnFunctionStepResult::Step);
+    'mvcc_newrowid: {
+        if let Some(mv_store) = mv_store {
+            // With MVCC we can't simply find last rowid and get rowid + 1 as a result. To not have two conflicting rowids concurrently we need to call `get_next_rowid`
+            // which will make sure we don't collide.
+            let rowid = {
+                let cursor = state.get_cursor(*cursor);
+                let cursor = cursor.as_btree_mut() as &mut dyn Any;
+                let Some(mvcc_cursor) = cursor.downcast_mut::<MvCursor>() else {
+                    // Not an MvCursor - must be an ephemeral cursor (indicated by lack of WAL)
+                    let Some(ephemeral_cursor) = cursor.downcast_mut::<BTreeCursor>() else {
+                        panic!("Expected MvCursor or BTreeCursor in op_new_rowid");
+                    };
+                    turso_assert!(
+                        ephemeral_cursor.pager.wal.is_none(),
+                        "MVCC is enabled but got a non-ephemeral BTreeCursor"
+                    );
+                    break 'mvcc_newrowid;
+                };
+                mvcc_cursor.get_next_rowid()
+            };
+            state.registers[*rowid_reg] = Register::Value(Value::Integer(rowid));
+            state.pc += 1;
+            return Ok(InsnFunctionStepResult::Step);
+        }
     }
 
     const MAX_ROWID: i64 = i64::MAX;
@@ -9548,6 +9558,59 @@ pub fn op_journal_mode(
 
     // Always return "wal" as the current journal mode
     state.registers[*dest] = Register::Value(Value::build_text("wal"));
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_filter(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        Filter {
+            cursor_id,
+            target_pc,
+            value_reg
+        },
+        insn
+    );
+    let value = state.registers[*value_reg].get_value();
+    let filter = state
+        .get_bloom_filter(*cursor_id)
+        .expect("FilterAdd must have created a bloom filter for this cursor_id");
+    if !filter.contains_value(value) {
+        state.pc = target_pc.as_offset_int();
+    } else {
+        state.pc += 1;
+    }
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_filter_add(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        FilterAdd {
+            cursor_id,
+            value_reg
+        },
+        insn
+    );
+    let reg = &state.registers[*value_reg] as *const Register;
+    let filter = state.get_or_create_bloom_filter(*cursor_id);
+    // safety: we only need to read from reg, it's not mutated during this call
+    match unsafe { &*reg } {
+        Register::Record(ref rec) => filter.insert_record_key(&rec.get_values()),
+        Register::Value(ref value) => filter.insert_value(value),
+        _ => unreachable!(),
+    };
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }

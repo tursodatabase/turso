@@ -36,7 +36,7 @@ use crate::{
 };
 use crate::{
     translate::{
-        collate::get_collseq_from_expr,
+        collate::{get_collseq_from_expr, CollationSeq},
         emitter::UpdateRowSource,
         plan::{EvalAt, NonFromClauseSubquery},
         subquery::emit_non_from_clause_subquery,
@@ -1396,6 +1396,25 @@ fn emit_seek(
         }
     }
 
+    if let Some(idx) = seek_index {
+        if idx.ephemeral {
+            // To potentially save the Seek here, we can check the bloom filter we built alongside
+            // the ephemeral index. If the value is not present, we jump to loop_end,
+            // skip bloom filter for non-binary collations since it uses binary hashing.
+            let use_bloom_filter = idx
+                .columns
+                .first()
+                .and_then(|col| col.collation)
+                .is_none_or(|coll| matches!(coll, CollationSeq::Binary | CollationSeq::Unset));
+            if use_bloom_filter {
+                program.emit_insn(Insn::Filter {
+                    cursor_id: seek_cursor_id,
+                    value_reg: start_reg,
+                    target_pc: loop_end,
+                });
+            }
+        }
+    }
     match seek_def.start.op {
         SeekOp::GE { eq_only } => program.emit_insn(Insn::SeekGE {
             is_index,
@@ -1641,6 +1660,17 @@ fn emit_autoindex(
         index_name: Some(index.name.clone()),
         affinity_str: None,
     });
+    let use_bloom_filter = index
+        .columns
+        .first()
+        .and_then(|col| col.collation)
+        .is_none_or(|coll| matches!(coll, CollationSeq::Binary | CollationSeq::Unset));
+    if use_bloom_filter {
+        program.emit_insn(Insn::FilterAdd {
+            cursor_id: index_cursor_id,
+            value_reg: ephemeral_cols_start_reg,
+        });
+    }
     program.emit_insn(Insn::IdxInsert {
         cursor_id: index_cursor_id,
         record_reg,

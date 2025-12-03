@@ -141,6 +141,11 @@ impl Query {
                 | Self::DropIndex(..)
         )
     }
+
+    #[inline]
+    pub fn is_dml(&self) -> bool {
+        matches!(self, Self::Insert(..) | Self::Update(..) | Self::Delete(..))
+    }
 }
 
 impl Display for Query {
