@@ -453,6 +453,8 @@ Modifiers:
 | FkCounter      | Yes    |         |
 | FkIfZero       | Yes    |         |
 | Found          | Yes    |         |
+| Filter         | Yes    |         |
+| FilterAdd      | Yes    |         |
 | Function       | Yes    |         |
 | Ge             | Yes    |         |
 | Gosub          | Yes    |         |

@@ -9562,6 +9562,59 @@ pub fn op_journal_mode(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub fn op_filter(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        Filter {
+            cursor_id,
+            target_pc,
+            value_reg
+        },
+        insn
+    );
+    let value = state.registers[*value_reg].get_value();
+    let filter = state
+        .get_bloom_filter(*cursor_id)
+        .expect("FilterAdd must have created a bloom filter for this cursor_id");
+    if !filter.contains_value(value) {
+        state.pc = target_pc.as_offset_int();
+    } else {
+        state.pc += 1;
+    }
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_filter_add(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        FilterAdd {
+            cursor_id,
+            value_reg
+        },
+        insn
+    );
+    let reg = &state.registers[*value_reg] as *const Register;
+    let filter = state.get_or_create_bloom_filter(*cursor_id);
+    // safety: we only need to read from reg, it's not mutated during this call
+    match unsafe { &*reg } {
+        Register::Record(ref rec) => filter.insert_record_key(&rec.get_values()),
+        Register::Value(ref value) => filter.insert_value(value),
+        _ => unreachable!(),
+    };
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 fn with_header<T, F>(
     pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,

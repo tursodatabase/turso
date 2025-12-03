@@ -871,6 +871,9 @@ impl ProgramBuilder {
                 Insn::FkIfZero { target_pc, .. } => {
                     resolve(target_pc, "FkIfZero");
                 }
+                Insn::Filter { target_pc, .. } => {
+                    resolve(target_pc, "Filter");
+                }
                 _ => {}
             }
         }
