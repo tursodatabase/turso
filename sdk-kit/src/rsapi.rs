@@ -897,11 +897,12 @@ mod tests {
 
     #[test]
     pub fn test_db_rsapi_use() {
-        let db = TursoDatabase::create(TursoDatabaseConfig {
+        let db = TursoDatabase::new(TursoDatabaseConfig {
             path: ":memory:".to_string(),
             experimental_features: None,
-            io: None,
             async_io: false,
+            io: None,
+            db_file: None,
         });
         db.open().unwrap();
         let conn = db.connect().unwrap();
