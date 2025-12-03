@@ -99,13 +99,13 @@ type TursoSyncIoFullWriteRequest struct {
 // ------------- Private C-compatible structs -------------
 
 type turso_sync_database_config_t struct {
-	path                             uintptr // const char*
-	client_name                      uintptr // const char*
-	long_poll_timeout_ms             int32
-	bootstrap_if_empty               bool
-	reserved_bytes                   int32
+	path                              uintptr // const char*
+	client_name                       uintptr // const char*
+	long_poll_timeout_ms              int32
+	bootstrap_if_empty                bool
+	reserved_bytes                    int32
 	partial_bootstrap_strategy_prefix int32
-	partial_bootstrap_strategy_query uintptr // const char*
+	partial_bootstrap_strategy_query  uintptr // const char*
 }
 
 type turso_sync_io_http_request_t struct {
@@ -130,14 +130,14 @@ type turso_sync_io_full_write_request_t struct {
 }
 
 type turso_sync_stats_t struct {
-	cdc_operations        int64
-	main_wal_size         int64
-	revert_wal_size       int64
-	last_pull_unix_time   int64
-	last_push_unix_time   int64
-	network_sent_bytes    int64
+	cdc_operations         int64
+	main_wal_size          int64
+	revert_wal_size        int64
+	last_pull_unix_time    int64
+	last_push_unix_time    int64
+	network_sent_bytes     int64
 	network_received_bytes int64
-	revision              turso_slice_ref_t
+	revision               turso_slice_ref_t
 }
 
 // ------------- C extern function vars -------------
@@ -583,6 +583,7 @@ func turso_sync_operation_result_extract_stats(self TursoSyncOperation) (TursoSy
 }
 
 // turso_sync_database_io_take_item tries to take IO request from the sync engine IO queue.
+// if queue is empty - returns nil pointer to the TursoSyncIoItem
 func turso_sync_database_io_take_item(self TursoSyncDatabase) (TursoSyncIoItem, error) {
 	var item *turso_sync_io_item_t
 	var errPtr *byte
