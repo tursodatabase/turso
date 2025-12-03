@@ -228,12 +228,8 @@ pub extern "C" fn turso_sync_operation_result_extract_connection(
         Ok(operation) => operation,
         Err(err) => return err.to_capi(std::ptr::null_mut()),
     };
-    let result = match operation.take_result() {
+    let connection = match operation.take_connection_to_capi() {
         Ok(result) => result,
-        Err(err) => return err.to_capi(std::ptr::null_mut()),
-    };
-    let connection = match result.connection_to_capi() {
-        Ok(connection) => connection,
         Err(err) => return err.to_capi(std::ptr::null_mut()),
     };
     unsafe { *connection_ref = connection };
@@ -250,12 +246,8 @@ pub extern "C" fn turso_sync_operation_result_extract_changes(
         Ok(operation) => operation,
         Err(err) => return err.to_capi(std::ptr::null_mut()),
     };
-    let result = match operation.take_result() {
+    let changes = match operation.take_changes_to_capi() {
         Ok(result) => result,
-        Err(err) => return err.to_capi(std::ptr::null_mut()),
-    };
-    let changes = match result.changes_to_capi() {
-        Ok(changes) => changes,
         Err(err) => return err.to_capi(std::ptr::null_mut()),
     };
     unsafe { *changes_ref = changes };
@@ -272,12 +264,8 @@ pub extern "C" fn turso_sync_operation_result_extract_stats(
         Ok(operation) => operation,
         Err(err) => return err.to_capi(std::ptr::null_mut()),
     };
-    let result = match operation.take_result() {
+    let stats = match operation.get_stats_to_capi() {
         Ok(result) => result,
-        Err(err) => return err.to_capi(std::ptr::null_mut()),
-    };
-    let stats = match result.stats_to_capi() {
-        Ok(connection) => connection,
         Err(err) => return err.to_capi(std::ptr::null_mut()),
     };
     unsafe { *stats_ref = stats };
@@ -670,12 +658,7 @@ mod tests {
                 panic!("unexpected");
             }
 
-            assert_eq!(
-                collected,
-                vec![
-                    turso_core::Value::Integer(2),
-                ]
-            );
+            assert_eq!(collected, vec![turso_core::Value::Integer(2),]);
 
             turso_statement_deinit(statement);
             turso_connection_deinit(connection);

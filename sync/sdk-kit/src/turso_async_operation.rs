@@ -15,51 +15,6 @@ pub struct TursoAsyncOperationStatus {
     pub result: Option<TursoAsyncOperationResult>,
 }
 
-impl TursoAsyncOperationResult {
-    pub fn connection_to_capi(
-        self,
-    ) -> Result<*const turso_sdk_kit::capi::c::turso_connection_t, TursoError> {
-        match self {
-            TursoAsyncOperationResult::Connection { connection } => Ok(connection.to_capi()),
-            _ => Err(TursoError {
-                code: TursoStatusCode::Misuse,
-                message: Some("unexpected io request type".to_string()),
-            }),
-        }
-    }
-    pub fn changes_to_capi(self) -> Result<*const c::turso_sync_changes_t, TursoError> {
-        match self {
-            TursoAsyncOperationResult::Changes { changes } => Ok(changes.to_capi()),
-            _ => Err(TursoError {
-                code: TursoStatusCode::Misuse,
-                message: Some("unexpected io request type".to_string()),
-            }),
-        }
-    }
-    pub fn stats_to_capi(self) -> Result<c::turso_sync_stats_t, TursoError> {
-        match self {
-            TursoAsyncOperationResult::Stats { stats } => Ok(c::turso_sync_stats_t {
-                cdc_operations: stats.cdc_operations,
-                main_wal_size: stats.main_wal_size as i64,
-                revert_wal_size: stats.revert_wal_size as i64,
-                last_pull_unix_time: stats.last_pull_unix_time.unwrap_or(0),
-                last_push_unix_time: stats.last_push_unix_time.unwrap_or(0),
-                network_sent_bytes: stats.network_sent_bytes as i64,
-                network_received_bytes: stats.network_received_bytes as i64,
-                revision: if let Some(revision) = stats.revision {
-                    turso_slice_from_bytes(revision.as_bytes())
-                } else {
-                    turso_slice_ref_t::default()
-                },
-            }),
-            _ => Err(TursoError {
-                code: TursoStatusCode::Misuse,
-                message: Some("unexpected io request type".to_string()),
-            }),
-        }
-    }
-}
-
 pub enum TursoAsyncOperationResult {
     Connection {
         connection: Arc<turso_sdk_kit::rsapi::TursoConnection>,
@@ -122,6 +77,48 @@ impl TursoDatabaseAsyncOperation {
             None => Err(TursoError {
                 code: TursoStatusCode::Misuse,
                 message: Some("operation has no result".to_string()),
+            }),
+        }
+    }
+    pub fn take_connection_to_capi(
+        &self,
+    ) -> Result<*const turso_sdk_kit::capi::c::turso_connection_t, TursoError> {
+        match self.take_result()? {
+            TursoAsyncOperationResult::Connection { connection } => Ok(connection.to_capi()),
+            _ => Err(TursoError {
+                code: TursoStatusCode::Misuse,
+                message: Some("unexpected async operation result".to_string()),
+            }),
+        }
+    }
+    pub fn take_changes_to_capi(&self) -> Result<*const c::turso_sync_changes_t, TursoError> {
+        match self.take_result()? {
+            TursoAsyncOperationResult::Changes { changes } => Ok(changes.to_capi()),
+            _ => Err(TursoError {
+                code: TursoStatusCode::Misuse,
+                message: Some("unexpected async operation result".to_string()),
+            }),
+        }
+    }
+    pub fn get_stats_to_capi(&self) -> Result<c::turso_sync_stats_t, TursoError> {
+        match self.response.lock().unwrap().as_ref() {
+            Some(TursoAsyncOperationResult::Stats { stats }) => Ok(c::turso_sync_stats_t {
+                cdc_operations: stats.cdc_operations,
+                main_wal_size: stats.main_wal_size as i64,
+                revert_wal_size: stats.revert_wal_size as i64,
+                last_pull_unix_time: stats.last_pull_unix_time.unwrap_or(0),
+                last_push_unix_time: stats.last_push_unix_time.unwrap_or(0),
+                network_sent_bytes: stats.network_sent_bytes as i64,
+                network_received_bytes: stats.network_received_bytes as i64,
+                revision: if let Some(revision) = &stats.revision {
+                    turso_slice_from_bytes(revision.as_bytes())
+                } else {
+                    turso_slice_ref_t::default()
+                },
+            }),
+            _ => Err(TursoError {
+                code: TursoStatusCode::Misuse,
+                message: Some("unexpected async operation result".to_string()),
             }),
         }
     }
