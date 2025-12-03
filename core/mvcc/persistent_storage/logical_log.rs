@@ -562,36 +562,79 @@ impl StreamingLogicalLogReader {
         self.buffer.read()
     }
 
+    /// Read at least `need` bytes from the logical log, issuing multiple reads if necessary.
+    /// If at any point 0 bytes are read, that indicates corruption.
     pub fn read_more_data(&mut self, io: &Arc<dyn crate::IO>, need: usize) -> Result<()> {
         let bytes_can_read = self.bytes_can_read();
         if bytes_can_read >= need {
             return Ok(());
         }
-        let to_read = 4096.max(need);
-        let to_read = to_read.min(self.file_size - self.offset);
-        let header_buf = Arc::new(Buffer::new_temporary(to_read));
-        let buffer = self.buffer.clone();
-        let completion: Box<ReadComplete> = Box::new(move |res| {
-            let buffer = buffer.clone();
-            let mut buffer = buffer.write();
-            let Ok((buf, bytes_read)) = res else {
-                tracing::trace!("couldn't ready log err={:?}", res,);
-                return;
-            };
+
+        let initial_buffer_offset = self.buffer_offset;
+
+        loop {
+            let buffer_size_before_read = self.buffer.read().len();
             turso_assert!(
-                bytes_read as usize >= need,
-                "couldn't read enough data. Requested={need} got={bytes_read}"
+                buffer_size_before_read >= self.buffer_offset,
+                "buffer_size_before_read={buffer_size_before_read} < buffer_offset={}",
+                self.buffer_offset
             );
-            let buf = buf.as_slice();
-            buffer.extend_from_slice(buf);
-        });
-        let c = Completion::new_read(header_buf, completion);
-        let c = self.file.pread(self.offset as u64, c)?;
-        io.wait_for_completion(c)?;
-        self.offset += to_read;
+            let bytes_available_in_buffer = buffer_size_before_read - self.buffer_offset;
+            let still_need = need.saturating_sub(bytes_available_in_buffer);
+
+            if still_need == 0 {
+                break;
+            }
+
+            turso_assert!(
+                self.file_size >= self.offset,
+                "file_size={} < offset={}",
+                self.file_size,
+                self.offset
+            );
+            let to_read = 4096.max(still_need).min(self.file_size - self.offset);
+
+            if to_read == 0 {
+                // No more data available in file even though we need more -> corrupt
+                return Err(LimboError::Corrupt(format!(
+                    "Expected to read {still_need} bytes more but reached end of file at offset {}",
+                    self.offset
+                )));
+            }
+
+            let header_buf = Arc::new(Buffer::new_temporary(to_read));
+            let buffer = self.buffer.clone();
+            let completion: Box<ReadComplete> = Box::new(move |res| {
+                let buffer = buffer.clone();
+                let mut buffer = buffer.write();
+                let Ok((buf, bytes_read)) = res else {
+                    panic!("Logical log read failed: {res:?}");
+                };
+                let buf = buf.as_slice();
+                if bytes_read > 0 {
+                    buffer.extend_from_slice(&buf[..bytes_read as usize]);
+                }
+            });
+            let c = Completion::new_read(header_buf, completion);
+            let c = self.file.pread(self.offset as u64, c)?;
+            io.wait_for_completion(c)?;
+
+            let buffer_size_after_read = self.buffer.read().len();
+            let bytes_read = buffer_size_after_read - buffer_size_before_read;
+
+            if bytes_read == 0 {
+                return Err(LimboError::Corrupt(format!(
+                    "Expected to read {still_need} bytes more but read 0 bytes at offset {}",
+                    self.offset
+                )));
+            }
+
+            self.offset += bytes_read;
+        }
+
         // cleanup consumed bytes
         // this could be better for sure
-        let _ = self.buffer.write().drain(0..self.buffer_offset);
+        let _ = self.buffer.write().drain(0..initial_buffer_offset);
         self.buffer_offset = 0;
         Ok(())
     }
