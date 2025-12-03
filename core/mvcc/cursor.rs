@@ -228,6 +228,7 @@ pub struct MvccLazyCursor<Clock: LogicalClock> {
     record_cursor: RefCell<RecordCursor>,
     next_rowid_lock: Arc<RwLock<()>>,
     state: RefCell<Option<MvccLazyCursorState>>,
+    btree_advance_state: RefCell<Option<AdvanceBtreeStateForward>>,
     /// Dual-cursor peek state for proper iteration
     dual_peek: RefCell<DualCursorPeek>,
 }
@@ -259,6 +260,7 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
             record_cursor: RefCell::new(RecordCursor::new()),
             next_rowid_lock: Arc::new(RwLock::new(())),
             state: RefCell::new(None),
+            btree_advance_state: RefCell::new(None),
             dual_peek: RefCell::new(DualCursorPeek {
                 mvcc_peek: CursorPeek::Uninitialized,
                 btree_peek: CursorPeek::Uninitialized,
@@ -400,58 +402,74 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
     }
 
     /// Advance btree cursor forward and set btree peek to the first valid row key (skipping rows shadowed by MVCC)
-    fn advance_btree_forward(&mut self) -> Result<()> {
-        if !self.is_btree_allocated() {
-            let mut peek = self.dual_peek.borrow_mut();
-            peek.btree_peek = CursorPeek::Exhausted;
-            return Ok(());
-        }
-        let mut peek = self.dual_peek.borrow_mut();
-        // If the btree is uninitialized, do the equivalent of rewind() to find the first valid row
-        if peek.btree_uninitialized() {
-            while let IOResult::IO(c) = self.btree_cursor.rewind()? {
-                c.wait(self.btree_cursor.get_pager().io.as_ref())?; // FIXME: sync IO hack
-            }
-            let key = self.get_btree_current_key()?;
-            match key {
-                Some(k) if self.query_btree_version_is_valid(&k) => {
-                    peek.btree_peek = CursorPeek::Row(k);
-                    return Ok(());
-                }
-                Some(_) => {
-                    // shadowed by MVCC, continue to next
-                }
-                None => {
-                    peek.btree_peek = CursorPeek::Exhausted;
-                    return Ok(());
-                }
-            }
-        }
+    fn advance_btree_forward(&mut self) -> Result<IOResult<()>> {
         loop {
-            let found = loop {
-                match self.btree_cursor.next()? {
-                    IOResult::Done(f) => {
-                        break f;
+            let mut state = self.btree_advance_state.borrow_mut();
+            match state.as_mut() {
+                None => {
+                    if !self.is_btree_allocated() {
+                        let mut peek = self.dual_peek.borrow_mut();
+                        peek.btree_peek = CursorPeek::Exhausted;
+                        *state = None;
+                        return Ok(IOResult::Done(()));
                     }
-                    IOResult::IO(c) => {
-                        c.wait(self.btree_cursor.get_pager().io.as_ref())?; // FIXME: sync IO hack
+                    let mut peek = self.dual_peek.borrow_mut();
+                    // If the btree is uninitialized, do the equivalent of rewind() to find the first valid row
+                    if peek.btree_uninitialized() {
+                        return_if_io!(self.btree_cursor.rewind());
+                        *state = Some(AdvanceBtreeStateForward::RewindCheckBtreeKey);
+                    } else {
+                        *state = Some(AdvanceBtreeStateForward::NextBtree);
                     }
                 }
-            };
-            if !found {
-                peek.btree_peek = CursorPeek::Exhausted;
-                return Ok(());
-            }
-            let key = self.get_btree_current_key()?;
-            if let Some(key) = key {
-                if self.query_btree_version_is_valid(&key) {
-                    peek.btree_peek = CursorPeek::Row(key);
-                    return Ok(());
+                Some(AdvanceBtreeStateForward::RewindCheckBtreeKey) => {
+                    let mut peek = self.dual_peek.borrow_mut();
+                    let key = self.get_btree_current_key()?;
+                    match key {
+                        Some(k) if self.query_btree_version_is_valid(&k) => {
+                            peek.btree_peek = CursorPeek::Row(k);
+                            *state = None;
+                            return Ok(IOResult::Done(()));
+                        }
+                        Some(_) => {
+                            // shadowed by MVCC, continue to next
+                            *state = Some(AdvanceBtreeStateForward::NextBtree);
+                        }
+                        None => {
+                            peek.btree_peek = CursorPeek::Exhausted;
+                            *state = None;
+                            return Ok(IOResult::Done(()));
+                        }
+                    }
                 }
-                // Row is shadowed by MVCC, continue to next
-            } else {
-                peek.btree_peek = CursorPeek::Exhausted;
-                return Ok(());
+                Some(AdvanceBtreeStateForward::NextBtree) => {
+                    let mut peek = self.dual_peek.borrow_mut();
+                    let found = return_if_io!(self.btree_cursor.next());
+                    if !found {
+                        peek.btree_peek = CursorPeek::Exhausted;
+                        *state = None;
+                        return Ok(IOResult::Done(()));
+                    }
+                    *state = Some(AdvanceBtreeStateForward::NextCheckBtreeKey);
+                }
+                Some(AdvanceBtreeStateForward::NextCheckBtreeKey) => {
+                    let mut peek = self.dual_peek.borrow_mut();
+                    let key = self.get_btree_current_key()?;
+                    if let Some(key) = key {
+                        if self.query_btree_version_is_valid(&key) {
+                            peek.btree_peek = CursorPeek::Row(key);
+                            *state = None;
+                            return Ok(IOResult::Done(()));
+                        }
+                        // Row is shadowed by MVCC, continue to next
+                        // FIXME: do we want to iterate over all shadowed rows? If every row is shadowed by MVCC, we will iterate the whole btree in a single `next` call
+                        *state = Some(AdvanceBtreeStateForward::NextBtree);
+                    } else {
+                        peek.btree_peek = CursorPeek::Exhausted;
+                        *state = None;
+                        return Ok(IOResult::Done(()));
+                    }
+                }
             }
         }
     }
@@ -649,49 +667,94 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
     ///
     /// Uses dual-cursor approach: only advances the cursor that was just consumed.
     fn next(&mut self) -> Result<IOResult<bool>> {
-        // If BeforeFirst and peek not initialized, initialize the iterators and peek values
-        let current_pos = self.get_current_pos();
-        if matches!(current_pos, CursorPosition::BeforeFirst) {
-            let uninitialized = self.dual_peek.borrow().both_uninitialized();
-            if uninitialized {
-                // Initialize MVCC iterator and get first peek
-                self.init_mvcc_iterator_forward();
-                self.advance_mvcc_iterator();
-                self.advance_btree_forward()?;
-            }
-        }
-
-        // Determine which cursor(s) need to be advanced based on current position
-        let current_pos = self.get_current_pos();
-        let (need_advance_mvcc, need_advance_btree) = match &current_pos {
-            CursorPosition::BeforeFirst => {
-                // First call after rewind - peek values should already be populated
-                // Just need to pick the smaller one
-                (false, false)
-            }
-            CursorPosition::Loaded { in_btree, .. } => {
-                // Advance whichever cursor we just consumed
-                if *in_btree {
-                    (false, true) // Last row was from btree, advance btree
+        if self.state.borrow().is_none() {
+            // If BeforeFirst and peek not initialized, initialize the iterators and peek values
+            let current_pos = self.get_current_pos();
+            if matches!(current_pos, CursorPosition::BeforeFirst) {
+                let uninitialized = self.dual_peek.borrow().both_uninitialized();
+                if uninitialized {
+                    // Initialize MVCC iterator and get first peek
+                    self.init_mvcc_iterator_forward();
+                    self.advance_mvcc_iterator();
+                    self.state.replace(Some(MvccLazyCursorState::Next(
+                        NextState::AdvanceUnitialized,
+                    )));
                 } else {
-                    (true, false) // Last row was from MVCC, advance MVCC
+                    self.state.replace(Some(MvccLazyCursorState::Next(
+                        NextState::CheckNeedsAdvance,
+                    )));
                 }
+            } else {
+                self.state.replace(Some(MvccLazyCursorState::Next(
+                    NextState::CheckNeedsAdvance,
+                )));
             }
-            CursorPosition::End => {
-                return Ok(IOResult::Done(false));
-            }
-        };
-
-        // Advance cursors as needed and update peek state
-        if need_advance_mvcc && !self.dual_peek.borrow().mvcc_exhausted() {
-            self.advance_mvcc_iterator();
         }
-        if need_advance_btree && !self.dual_peek.borrow().btree_exhausted() {
-            self.advance_btree_forward()?;
+        // If it was uninitialized, we need to advance the btree first
+        if matches!(
+            self.state
+                .borrow()
+                .as_ref()
+                .expect("next state is not initialized"),
+            MvccLazyCursorState::Next(NextState::AdvanceUnitialized)
+        ) {
+            return_if_io!(self.advance_btree_forward());
+            self.state.replace(Some(MvccLazyCursorState::Next(
+                NextState::CheckNeedsAdvance,
+            )));
+        }
+
+        if matches!(
+            self.state
+                .borrow()
+                .as_ref()
+                .expect("next state is not initialized"),
+            MvccLazyCursorState::Next(NextState::CheckNeedsAdvance)
+        ) {
+            // Determine which cursor(s) need to be advanced based on current position
+            let current_pos = self.get_current_pos();
+            let (need_advance_mvcc, need_advance_btree) = match &current_pos {
+                CursorPosition::BeforeFirst => {
+                    // First call after rewind - peek values should already be populated
+                    // Just need to pick the smaller one
+                    (false, false)
+                }
+                CursorPosition::Loaded { in_btree, .. } => {
+                    // Advance whichever cursor we just consumed
+                    if *in_btree {
+                        (false, true) // Last row was from btree, advance btree
+                    } else {
+                        (true, false) // Last row was from MVCC, advance MVCC
+                    }
+                }
+                CursorPosition::End => {
+                    return Ok(IOResult::Done(false));
+                }
+            };
+
+            // Advance cursors as needed and update peek state
+            if need_advance_mvcc && !self.dual_peek.borrow().mvcc_exhausted() {
+                self.advance_mvcc_iterator();
+            }
+            if need_advance_btree && !self.dual_peek.borrow().btree_exhausted() {
+                self.state
+                    .replace(Some(MvccLazyCursorState::Next(NextState::Advance)));
+            }
+        }
+
+        if matches!(
+            self.state
+                .borrow()
+                .as_ref()
+                .expect("next state is not initialized"),
+            MvccLazyCursorState::Next(NextState::Advance)
+        ) {
+            return_if_io!(self.advance_btree_forward());
         }
 
         self.refresh_current_position(IterationDirection::Forwards);
         self.invalidate_record();
+        self.state.replace(None);
 
         Ok(IOResult::Done(matches!(
             self.get_current_pos(),
@@ -1099,12 +1162,28 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
     }
 
     fn rewind(&mut self) -> Result<IOResult<()>> {
-        let _ = self.table_iterator.take();
-        let _ = self.index_iterator.take();
-        self.reset_dual_peek();
+        let state = self.state.borrow().clone();
+        if state.is_none() {
+            let _ = self.table_iterator.take();
+            let _ = self.index_iterator.take();
+            self.reset_dual_peek();
+            self.state
+                .replace(Some(MvccLazyCursorState::Rewind(RewindState::Advance)));
+        }
 
+        assert!(
+            matches!(
+                self.state
+                    .borrow()
+                    .as_ref()
+                    .expect("rewind state is not initialized"),
+                MvccLazyCursorState::Rewind(RewindState::Advance)
+            ),
+            "Invalid rewind state {:?}",
+            state
+        );
         // First run btree_cursor rewind so that we don't need a explicit state machine.
-        self.advance_btree_forward()?;
+        return_if_io!(self.advance_btree_forward());
 
         self.invalidate_record();
         self.current_pos.replace(CursorPosition::BeforeFirst);
@@ -1145,6 +1224,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
         self.refresh_current_position(IterationDirection::Forwards);
 
         self.invalidate_record();
+        self.state.replace(None);
         Ok(IOResult::Done(()))
     }
 
