@@ -220,16 +220,36 @@ impl RowID {
 
 pub struct Row {
     pub id: RowID,
-    pub data: Vec<u8>,
+    /// Data is None for index rows because the key holds all the data.
+    pub data: Option<Vec<u8>>,
     pub column_count: usize,
 }
 
 impl Row {
-    pub fn new(id: RowID, data: Vec<u8>, column_count: usize) -> Self {
+    pub fn new_table_row(id: RowID, data: Vec<u8>, column_count: usize) -> Self {
         Self {
             id,
-            data,
+            data: Some(data),
             column_count,
+        }
+    }
+
+    pub fn new_index_row(id: RowID, column_count: usize) -> Self {
+        Self {
+            id,
+            data: None,
+            column_count,
+        }
+    }
+
+    pub fn is_index_row(&self) -> bool {
+        self.data.is_none()
+    }
+
+    pub fn payload(&self) -> &[u8] {
+        match self.id.row_id {
+            RowKey::Int(_) => self.data.as_ref().expect("table rows should have data"),
+            RowKey::Record(ref sortable_key) => sortable_key.key.as_blob(),
         }
     }
 }
@@ -912,10 +932,14 @@ impl StateTransition for WriteRowStateMachine {
         match self.state {
             WriteRowState::Initial => {
                 // Create the record and key
-                let mut record = ImmutableRecord::new(self.row.data.len());
-                record.start_serialization(&self.row.data);
-                self.record = Some(record);
-
+                self.record = if self.row.is_index_row() {
+                    None
+                } else {
+                    let row_data = self.row.data.as_ref().expect("table rows should have data");
+                    let mut record = ImmutableRecord::new(row_data.len());
+                    record.start_serialization(row_data);
+                    Some(record)
+                };
                 if self.requires_seek {
                     self.state = WriteRowState::Seek;
                 } else {
@@ -2538,7 +2562,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     let is_schema_row = rowid.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID;
                     if is_schema_row {
                         // Sqlite schema row version inserts
-                        let row_data = row.data.clone();
+                        let row_data = row.payload().to_vec();
                         let record = ImmutableRecord::from_bin_record(row_data);
                         let mut record_cursor = RecordCursor::new();
                         let mut record_values = record_cursor.get_values(&record);
