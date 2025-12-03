@@ -15,7 +15,6 @@ pub mod c {
     include!("bindings.rs");
 }
 
-
 pub static PKG_VERSION_C: &[u8] = concat!(env!("CARGO_PKG_VERSION"), "\0").as_bytes();
 
 #[no_mangle]
@@ -561,8 +560,8 @@ pub fn value_from_c_value(stmt: *mut c::turso_statement_t, index: usize) -> turs
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::{CStr, CString};
     use std::ffi::CString;
+    use std::ffi::{CStr, CString};
 
     use turso_core::{types::Text, Value};
 

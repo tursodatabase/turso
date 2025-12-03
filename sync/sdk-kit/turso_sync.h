@@ -58,21 +58,6 @@ typedef struct
     turso_slice_ref_t content;
 } turso_sync_io_full_write_request_t;
 
-// typeless union holding one possible value for the sync engine IO request
-typedef union
-{
-    turso_sync_io_http_request_t http;
-    turso_sync_io_full_read_request_t full_read;
-    turso_sync_io_full_write_request_t full_write;
-} turso_sync_io_request_union_t;
-
-// sync engine IO request
-typedef struct
-{
-    turso_sync_io_request_type_t type;
-    turso_sync_io_request_union_t request;
-} turso_sync_io_request_t;
-
 /******** TURSO_ASYNC_OPERATION_RESULT ********/
 
 // async operation result type
@@ -88,12 +73,9 @@ typedef enum
     TURSO_ASYNC_RESULT_STATS = 3,
 } turso_sync_operation_result_type_t;
 
-/// structure holding opaque pointer to the TursoDatabaseSyncChanges instance
+/// opaque pointer to the TursoDatabaseSyncChanges instance
 /// SAFETY: turso_sync_changes_t have independent lifetime and must be explicitly deallocated with turso_sync_changes_deinit method OR passed to the turso_sync_database_apply_changes method which gather ownership to this object
-typedef struct
-{
-    void *inner;
-} turso_sync_changes_t;
+typedef struct turso_sync_changes turso_sync_changes_t;
 
 /// structure holding opaque pointer to the SyncEngineStats instance
 /// SAFETY: revision string will be valid only during async operation lifetime (until turso_sync_operation_deinit)
@@ -109,21 +91,6 @@ typedef struct
     int64_t network_received_bytes;
     turso_slice_ref_t revision;
 } turso_sync_stats_t;
-
-// typeless union holding one possible value for async operation result
-typedef union
-{
-    turso_connection_t connection;
-    turso_sync_changes_t changes;
-    turso_sync_stats_t stats;
-} turso_sync_operation_result_union_t;
-
-// async operation result
-typedef struct
-{
-    turso_sync_operation_result_type_t type;
-    turso_sync_operation_result_union_t result;
-} turso_sync_operation_result_t;
 
 /******** MAIN TYPES ********/
 
@@ -154,83 +121,107 @@ typedef struct
     bool partial_boostrap_speculative_load;
 } turso_sync_database_config_t;
 
-/// structure holding opaque pointer to the TursoDatabaseSync instance
-typedef struct
-{
-    void *inner;
-} turso_sync_database_t;
+/// opaque pointer to the TursoDatabaseSync instance
+typedef struct turso_sync_database turso_sync_database_t;
 
-/// structure holding opaque pointer to the TursoAsyncOperation instance
+/// opaque pointer to the TursoAsyncOperation instance
 /// SAFETY: methods for the turso_sync_operation_t can't be called concurrently
-typedef struct
-{
-    void *inner;
-} turso_sync_operation_t;
+typedef struct turso_sync_operation turso_sync_operation_t;
 
-/// structure holding opaque pointer to the SyncEngineIoQueueItem instance
-typedef struct
-{
-    void *inner;
-} turso_sync_io_item_t;
+/// opaque pointer to the SyncEngineIoQueueItem instance
+typedef struct turso_sync_io_item turso_sync_io_item_t;
 
 /******** METHODS ********/
 
-typedef struct
-{
-    turso_status_t status;
-    turso_sync_database_t database_sync;
-} turso_sync_database_new_result_t;
-
 /** Create database sync holder but do not open it */
-turso_sync_database_new_result_t
-turso_sync_database_new(turso_database_config_t db_config, turso_sync_database_config_t sync_config);
-
-typedef struct
-{
-    turso_status_t status;
-    turso_sync_operation_t operation;
-} turso_sync_operation_return_t;
+turso_status_code_t turso_sync_database_new(
+    const turso_database_config_t *db_config,
+    const turso_sync_database_config_t *sync_config,
+    /** reference to pointer which will be set to database instance in case of TURSO_OK result */
+    const turso_sync_database_t **database,
+    /** Optional return error parameter (can be null) */
+    const char **error_opt_out);
 
 /** Prepare synced database for use (bootstrap if needed, setup necessary database parameters for first access)
  * AsyncOperation returns None
  */
-turso_sync_operation_return_t turso_sync_database_init(turso_sync_database_t self);
+turso_status_code_t turso_sync_database_init(
+    const turso_sync_database_t *self,
+    /** reference to pointer which will be set to async operation instance in case of TURSO_OK result */
+    const turso_sync_operation_t **operation,
+    /** Optional return error parameter (can be null) */
+    const char **error_opt_out);
 
 /** Open prepared synced database, fail if no properly setup database exists
  * AsyncOperation returns None
  */
-turso_sync_operation_return_t turso_sync_database_open(turso_sync_database_t self);
+turso_status_code_t turso_sync_database_open(
+    const turso_sync_database_t *self,
+    /** reference to pointer which will be set to async operation instance in case of TURSO_OK result */
+    const turso_sync_operation_t **operation,
+    /** Optional return error parameter (can be null) */
+    const char **error_opt_out);
 
 /** Open or prepared synced database or create it if no properly setup database exists
  * AsyncOperation returns None
  */
-turso_sync_operation_return_t turso_sync_database_create(turso_sync_database_t self);
+turso_status_code_t turso_sync_database_create(
+    const turso_sync_database_t *self,
+    /** reference to pointer which will be set to async operation instance in case of TURSO_OK result */
+    const turso_sync_operation_t **operation,
+    /** Optional return error parameter (can be null) */
+    const char **error_opt_out);
 
 /** Create turso database connection
  * SAFETY: synced database must be opened before that operation (with either turso_database_sync_create or turso_database_sync_open)
  * AsyncOperation returns Connection
  */
-turso_sync_operation_return_t turso_sync_database_connect(turso_sync_database_t self);
+turso_status_code_t turso_sync_database_connect(
+    const turso_sync_database_t *self,
+    /** reference to pointer which will be set to async operation instance in case of TURSO_OK result */
+    const turso_sync_operation_t **operation,
+    /** Optional return error parameter (can be null) */
+    const char **error_opt_out);
 
 /** Collect stats about synced database
  * AsyncOperation returns Stats
  */
-turso_sync_operation_return_t turso_sync_database_stats(turso_sync_database_t self);
+turso_status_code_t turso_sync_database_stats(
+    const turso_sync_database_t *self,
+    /** reference to pointer which will be set to async operation instance in case of TURSO_OK result */
+    const turso_sync_operation_t **operation,
+    /** Optional return error parameter (can be null) */
+    const char **error_opt_out);
 
 /** Checkpoint WAL of the synced database
  * AsyncOperation returns None
  */
-turso_sync_operation_return_t turso_sync_database_checkpoint(turso_sync_database_t self);
+turso_status_code_t turso_sync_database_checkpoint(
+    const turso_sync_database_t *self,
+    /** reference to pointer which will be set to async operation instance in case of TURSO_OK result */
+    const turso_sync_operation_t **operation,
+    /** Optional return error parameter (can be null) */
+    const char **error_opt_out);
 
 /** Push local changes to remote
  * AsyncOperation returns None
  */
-turso_sync_operation_return_t turso_sync_database_push_changes(turso_sync_database_t self);
+turso_status_code_t turso_sync_database_push_changes(
+    const turso_sync_database_t *self,
+    /** reference to pointer which will be set to async operation instance in case of TURSO_OK result */
+    const turso_sync_operation_t **operation,
+    /** Optional return error parameter (can be null) */
+    const char **error_opt_out);
 
 /** Wait for remote changes
  * AsyncOperation returns Changes (which must be properly deinited or used in the [turso_sync_database_apply_changes] method)
  */
-turso_sync_operation_return_t turso_sync_database_wait_changes(turso_sync_database_t self);
+turso_status_code_t turso_sync_database_wait_changes(
+    const turso_sync_database_t *self,
+    /** reference to pointer which will be set to async operation instance in case of TURSO_OK result */
+    const turso_sync_operation_t **operation,
+    /** Optional return error parameter (can be null) */
+    const char **error_opt_out);
 
 /** Apply remote changes locally
  * SAFETY: caller must guarantee that no other methods are executing concurrently (push/wait/checkpoint)
@@ -238,87 +229,104 @@ turso_sync_operation_return_t turso_sync_database_wait_changes(turso_sync_databa
  *
  * AsyncOperation returns None
  */
-turso_sync_operation_return_t turso_sync_database_apply_changes(turso_sync_database_t self, turso_sync_changes_t changes);
-
-typedef struct
-{
-    turso_status_t status;
-    bool empty;
-} turso_sync_changes_empty_result_t;
-
-/** Return if no changes were fetched from remote */
-turso_sync_changes_empty_result_t
-turso_sync_changes_empty(turso_sync_changes_t changes);
-
-typedef struct
-{
-    turso_status_t status;
-    turso_sync_operation_result_t result;
-} turso_sync_operation_resume_result_t;
+turso_status_code_t turso_sync_database_apply_changes(
+    const turso_sync_database_t *self,
+    const turso_sync_changes_t *changes,
+    /** reference to pointer which will be set to async operation instance in case of TURSO_OK result */
+    const turso_sync_operation_t **operation,
+    /** Optional return error parameter (can be null) */
+    const char **error_opt_out);
 
 /** Resume async operation
  * If return error status - turso_status_t must be properly cleaned up
  * If return TURSO_IO - caller must drive IO
  * If return TURSO_DONE - caller must inspect result and clean up it or use it accordingly
  */
-turso_sync_operation_resume_result_t turso_sync_operation_resume(turso_sync_operation_t self);
+turso_status_code_t turso_sync_operation_resume(
+    const turso_sync_operation_t *self,
+    /** Optional return error parameter (can be null) */
+    const char **error_opt_out);
 
-typedef struct
-{
-    turso_status_t status;
-    turso_sync_io_item_t result;
-} turso_sync_database_io_take_item_t;
+/** Extract operation result kind
+ */
+turso_sync_operation_result_type_t turso_sync_operation_result_kind(const turso_sync_operation_t *self);
+
+/** Extract Connection result from finished async operation
+ */
+turso_status_code_t turso_sync_operation_result_extract_connection(
+    const turso_sync_operation_t *self,
+    const turso_connection_t **connection);
+
+/** Extract Changes result from finished async operation
+ */
+turso_status_code_t turso_sync_operation_result_extract_changes(
+    const turso_sync_operation_t *self,
+    const turso_sync_changes_t **changes);
+
+/** Extract Stats result from finished async operation
+ */
+turso_status_code_t turso_sync_operation_result_extract_stats(
+    const turso_sync_operation_t *self,
+    turso_sync_stats_t *stats);
 
 /** Try to take IO request from the sync engine IO queue */
-turso_sync_database_io_take_item_t
-turso_sync_database_io_take_item(turso_sync_database_t self);
+turso_status_code_t
+turso_sync_database_io_take_item(
+    const turso_sync_database_t *self,
+    /** reference to pointer which will be set to async io item instance in case of TURSO_OK result */
+    const turso_sync_io_item_t **item,
+    /** Optional return error parameter (can be null) */
+    const char **error_opt_out);
 
 /** Run extra database callbacks after IO execution */
-turso_status_t
-turso_sync_database_io_step_callbacks(turso_sync_database_t self);
+turso_status_code_t
+turso_sync_database_io_step_callbacks(
+    const turso_sync_database_t *self,
+    /** Optional return error parameter (can be null) */
+    const char **error_opt_out);
 
-typedef struct
-{
-    turso_status_t status;
-    turso_sync_io_request_t request;
-} turso_sync_database_io_request_t;
+/** Get request IO kind */
+turso_sync_io_request_type_t
+turso_sync_database_io_request_kind(const turso_sync_io_item_t *self);
 
-/** Get request reference from the IO request */
-turso_sync_database_io_request_t
-turso_sync_database_io_request(turso_sync_io_item_t self);
+/** Get HTTP request header key-value pair */
+turso_status_code_t
+turso_sync_database_io_request_http(const turso_sync_io_item_t *self, turso_sync_io_http_request_t *request);
 
-typedef struct
-{
-    turso_status_t status;
-    turso_sync_io_http_header_t header;
-} turso_sync_database_io_request_header_t;
+/** Get HTTP request fields */
+turso_status_code_t
+turso_sync_database_io_request_http_header(const turso_sync_io_item_t *self, size_t index, turso_sync_io_http_header_t *header);
 
-/** Get HTTP request header reference from the IO request */
-turso_sync_database_io_request_header_t
-turso_sync_database_io_request_header(turso_sync_io_item_t self, int32_t header_idx);
+/** Get HTTP request fields */
+turso_status_code_t
+turso_sync_database_io_request_full_read(const turso_sync_io_item_t *self, turso_sync_io_full_read_request_t *request);
+
+/** Get HTTP request fields */
+turso_status_code_t
+turso_sync_database_io_request_full_write(const turso_sync_io_item_t *self, turso_sync_io_full_write_request_t *request);
 
 /** Poison IO request completion with error */
-turso_status_t turso_sync_database_io_poison(turso_sync_io_item_t self, turso_slice_ref_t error);
+turso_status_code_t turso_sync_database_io_poison(const turso_sync_io_item_t *self, turso_slice_ref_t *error);
 
 /** Set IO request completion status */
-turso_status_t turso_sync_database_io_status(turso_sync_io_item_t self, int32_t status);
+turso_status_code_t turso_sync_database_io_status(const turso_sync_io_item_t *self, int32_t status);
 
 /** Push bytes to the IO completion buffer */
-turso_status_t turso_sync_database_io_push_buffer(turso_sync_io_item_t self, turso_slice_ref_t buffer);
+turso_status_code_t turso_sync_database_io_push_buffer(const turso_sync_io_item_t *self, turso_slice_ref_t *buffer);
 
 /** Set IO request completion as done */
-turso_status_t turso_sync_database_io_done(turso_sync_io_item_t self);
+turso_status_code_t turso_sync_database_io_done(const turso_sync_io_item_t *self);
 
 /** Deallocate a TursoDatabaseSync */
-void turso_sync_database_deinit(turso_sync_database_t self);
+void turso_sync_database_deinit(const turso_sync_database_t *self);
 
 /** Deallocate a TursoAsyncOperation */
-void turso_sync_operation_deinit(turso_sync_operation_t self);
+void turso_sync_operation_deinit(const turso_sync_operation_t *self);
 
 /** Deallocate a SyncEngineIoQueueItem */
-void turso_sync_database_io_item_deinit(turso_sync_io_item_t self);
+void turso_sync_database_io_item_deinit(const turso_sync_io_item_t *self);
 
 /** Deallocate a TursoDatabaseSyncChanges */
-void turso_sync_changes_deinit(turso_sync_changes_t self);
+void turso_sync_changes_deinit(const turso_sync_changes_t *self);
 
 #endif /* TURSO_SYNC_H */
