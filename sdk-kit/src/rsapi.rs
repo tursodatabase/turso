@@ -184,7 +184,7 @@ pub unsafe fn bytes_from_slice<'a>(
             message: Some("expected slice, got null pointer".to_string()),
         });
     }
-    Ok(std::slice::from_raw_parts(ptr, len))
+    Ok(std::slice::from_raw_parts(ptr as *const u8, len))
 }
 
 /// SAFETY: slice must points to the valid memory
@@ -297,13 +297,15 @@ pub struct TursoError {
 }
 
 impl TursoError {
-    pub fn to_capi(
+    /// # Safety
+    /// error_opt_out must be a valid pointer or null
+    pub unsafe fn to_capi(
         &self,
         error_opt_out: *mut *const std::ffi::c_char,
     ) -> capi::c::turso_status_code_t {
         if !error_opt_out.is_null() {
             let message = if let Some(message) = &self.message {
-                str_to_c_string(&message)
+                str_to_c_string(message)
             } else {
                 std::ptr::null_mut()
             };

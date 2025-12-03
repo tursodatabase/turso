@@ -1,3 +1,5 @@
+#![allow(clippy::not_unsafe_ptr_arg_deref)]
+
 use turso_core::types::Text;
 use turso_sdk_kit_macros::signature;
 
@@ -23,11 +25,11 @@ pub extern "C" fn turso_setup(
 ) -> c::turso_status_code_t {
     let config = match unsafe { rsapi::TursoSetupConfig::from_capi(config) } {
         Ok(config) => config,
-        Err(err) => return err.to_capi(error_opt_out),
+        Err(err) => return unsafe { err.to_capi(error_opt_out) },
     };
     match rsapi::turso_setup(config) {
         Ok(()) => c::turso_status_code_t::TURSO_OK,
-        Err(err) => err.to_capi(error_opt_out),
+        Err(err) => unsafe { err.to_capi(error_opt_out) },
     }
 }
 
@@ -40,7 +42,7 @@ pub extern "C" fn turso_database_new(
 ) -> c::turso_status_code_t {
     let config = match unsafe { rsapi::TursoDatabaseConfig::from_capi(config) } {
         Ok(config) => config,
-        Err(err) => return err.to_capi(error_opt_out),
+        Err(err) => return unsafe { err.to_capi(error_opt_out) },
     };
     unsafe { *database = rsapi::TursoDatabase::new(config).to_capi() };
     c::turso_status_code_t::TURSO_OK
@@ -54,11 +56,11 @@ pub extern "C" fn turso_database_open(
 ) -> c::turso_status_code_t {
     let database = match unsafe { TursoDatabase::ref_from_capi(database) } {
         Ok(database) => database,
-        Err(err) => return err.to_capi(error_opt_out),
+        Err(err) => return unsafe { err.to_capi(error_opt_out) },
     };
     match database.open() {
         Ok(()) => c::turso_status_code_t::TURSO_OK,
-        Err(err) => err.to_capi(error_opt_out),
+        Err(err) => unsafe { err.to_capi(error_opt_out) },
     }
 }
 
@@ -71,14 +73,14 @@ pub extern "C" fn turso_database_connect(
 ) -> c::turso_status_code_t {
     let database = match unsafe { TursoDatabase::ref_from_capi(database) } {
         Ok(database) => database,
-        Err(err) => return err.to_capi(error_opt_out),
+        Err(err) => return unsafe { err.to_capi(error_opt_out) },
     };
     match database.connect() {
         Ok(conn) => {
             unsafe { *connection = conn.to_capi() };
             c::turso_status_code_t::TURSO_OK
         }
-        Err(err) => err.to_capi(error_opt_out),
+        Err(err) => unsafe { err.to_capi(error_opt_out) },
     }
 }
 
@@ -106,19 +108,19 @@ pub extern "C" fn turso_connection_last_insert_rowid(
 
 #[no_mangle]
 #[signature(c)]
-pub unsafe extern "C" fn turso_connection_prepare_single(
+pub extern "C" fn turso_connection_prepare_single(
     connection: *const c::turso_connection_t,
     sql: *const std::ffi::c_char,
     statement: *mut *mut c::turso_statement_t,
     error_opt_out: *mut *const std::ffi::c_char,
 ) -> c::turso_status_code_t {
-    let sql = match str_from_c_str(sql) {
+    let sql = match unsafe { str_from_c_str(sql) } {
         Ok(sql) => sql,
-        Err(err) => return err.to_capi(error_opt_out),
+        Err(err) => return unsafe { err.to_capi(error_opt_out) },
     };
     let connection = match unsafe { TursoConnection::ref_from_capi(connection) } {
         Ok(connection) => connection,
-        Err(err) => return err.to_capi(error_opt_out),
+        Err(err) => return unsafe { err.to_capi(error_opt_out) },
     };
 
     match connection.prepare_single(sql) {
@@ -126,26 +128,26 @@ pub unsafe extern "C" fn turso_connection_prepare_single(
             unsafe { *statement = stmt.to_capi() };
             c::turso_status_code_t::TURSO_OK
         }
-        Err(err) => err.to_capi(error_opt_out),
+        Err(err) => unsafe { err.to_capi(error_opt_out) },
     }
 }
 
 #[no_mangle]
 #[signature(c)]
-pub unsafe extern "C" fn turso_connection_prepare_first(
+pub extern "C" fn turso_connection_prepare_first(
     connection: *const c::turso_connection_t,
     sql: *const std::ffi::c_char,
     statement: *mut *mut c::turso_statement_t,
     tail_idx: *mut usize,
     error_opt_out: *mut *const std::ffi::c_char,
 ) -> c::turso_status_code_t {
-    let sql = match str_from_c_str(sql) {
+    let sql = match unsafe { str_from_c_str(sql) } {
         Ok(sql) => sql,
-        Err(err) => return err.to_capi(error_opt_out),
+        Err(err) => return unsafe { err.to_capi(error_opt_out) },
     };
     let connection = match unsafe { TursoConnection::ref_from_capi(connection) } {
         Ok(connection) => connection,
-        Err(err) => return err.to_capi(error_opt_out),
+        Err(err) => return unsafe { err.to_capi(error_opt_out) },
     };
     match connection.prepare_first(sql) {
         Ok(Some((stmt, tail))) => {
@@ -161,7 +163,7 @@ pub unsafe extern "C" fn turso_connection_prepare_first(
             }
             c::turso_status_code_t::TURSO_OK
         }
-        Err(err) => err.to_capi(error_opt_out),
+        Err(err) => unsafe { err.to_capi(error_opt_out) },
     }
 }
 
@@ -173,11 +175,11 @@ pub extern "C" fn turso_connection_close(
 ) -> c::turso_status_code_t {
     let connection = match unsafe { TursoConnection::ref_from_capi(connection) } {
         Ok(connection) => connection,
-        Err(err) => return err.to_capi(error_opt_out),
+        Err(err) => return unsafe { err.to_capi(error_opt_out) },
     };
     match connection.close() {
         Ok(()) => c::turso_status_code_t::TURSO_OK,
-        Err(err) => err.to_capi(error_opt_out),
+        Err(err) => unsafe { err.to_capi(error_opt_out) },
     }
 }
 
@@ -189,11 +191,11 @@ pub extern "C" fn turso_statement_run_io(
 ) -> c::turso_status_code_t {
     let statement = match unsafe { TursoStatement::ref_from_capi(statement) } {
         Ok(statement) => statement,
-        Err(err) => return err.to_capi(error_opt_out),
+        Err(err) => return unsafe { err.to_capi(error_opt_out) },
     };
     match statement.run_io() {
         Ok(()) => c::turso_status_code_t::TURSO_OK,
-        Err(err) => err.to_capi(error_opt_out),
+        Err(err) => unsafe { err.to_capi(error_opt_out) },
     }
 }
 
@@ -206,7 +208,7 @@ pub extern "C" fn turso_statement_execute(
 ) -> c::turso_status_code_t {
     let statement = match unsafe { TursoStatement::ref_from_capi(statement) } {
         Ok(statement) => statement,
-        Err(err) => return err.to_capi(error_opt_out),
+        Err(err) => return unsafe { err.to_capi(error_opt_out) },
     };
     match statement.execute() {
         Ok(result) => {
@@ -215,7 +217,7 @@ pub extern "C" fn turso_statement_execute(
             }
             result.status.to_capi()
         }
-        Err(err) => err.to_capi(error_opt_out),
+        Err(err) => unsafe { err.to_capi(error_opt_out) },
     }
 }
 
@@ -227,11 +229,11 @@ pub extern "C" fn turso_statement_step(
 ) -> c::turso_status_code_t {
     let statement = match unsafe { TursoStatement::ref_from_capi(statement) } {
         Ok(statement) => statement,
-        Err(err) => return err.to_capi(error_opt_out),
+        Err(err) => return unsafe { err.to_capi(error_opt_out) },
     };
     match statement.step() {
         Ok(status) => status.to_capi(),
-        Err(err) => err.to_capi(error_opt_out),
+        Err(err) => unsafe { err.to_capi(error_opt_out) },
     }
 }
 
@@ -243,11 +245,11 @@ pub extern "C" fn turso_statement_reset(
 ) -> c::turso_status_code_t {
     let statement = match unsafe { TursoStatement::ref_from_capi(statement) } {
         Ok(statement) => statement,
-        Err(err) => return err.to_capi(error_opt_out),
+        Err(err) => return unsafe { err.to_capi(error_opt_out) },
     };
     match statement.reset() {
         Ok(()) => c::turso_status_code_t::TURSO_OK,
-        Err(err) => err.to_capi(error_opt_out),
+        Err(err) => unsafe { err.to_capi(error_opt_out) },
     }
 }
 
@@ -259,11 +261,11 @@ pub extern "C" fn turso_statement_finalize(
 ) -> c::turso_status_code_t {
     let statement = match unsafe { TursoStatement::ref_from_capi(statement) } {
         Ok(statement) => statement,
-        Err(err) => return err.to_capi(error_opt_out),
+        Err(err) => return unsafe { err.to_capi(error_opt_out) },
     };
     match statement.finalize() {
         Ok(status) => status.to_capi(),
-        Err(err) => err.to_capi(error_opt_out),
+        Err(err) => unsafe { err.to_capi(error_opt_out) },
     }
 }
 
@@ -327,7 +329,7 @@ pub extern "C" fn turso_statement_row_value_bytes_count(
     };
     let value = statement.row_value(index);
     match value {
-        Ok(turso_core::ValueRef::Text(text)) => text.as_bytes().len() as i64,
+        Ok(turso_core::ValueRef::Text(text)) => text.len() as i64,
         Ok(turso_core::ValueRef::Blob(blob)) => blob.len() as i64,
         _ => -1,
     }
@@ -345,8 +347,8 @@ pub extern "C" fn turso_statement_row_value_bytes_ptr(
     };
     let value = statement.row_value(index);
     match value {
-        Ok(turso_core::ValueRef::Text(text)) => text.as_bytes().as_ptr(),
-        Ok(turso_core::ValueRef::Blob(blob)) => blob.as_ptr(),
+        Ok(turso_core::ValueRef::Text(text)) => text.as_bytes().as_ptr() as *const std::ffi::c_char,
+        Ok(turso_core::ValueRef::Blob(blob)) => blob.as_ptr() as *const std::ffi::c_char,
         _ => std::ptr::null(),
     }
 }
@@ -423,11 +425,11 @@ pub extern "C" fn turso_statement_bind_positional_null(
 ) -> c::turso_status_code_t {
     let statement = match unsafe { TursoStatement::ref_from_capi(statement) } {
         Ok(statement) => statement,
-        Err(err) => return err.to_capi(std::ptr::null_mut()),
+        Err(err) => return unsafe { err.to_capi(std::ptr::null_mut()) },
     };
     match statement.bind_positional(position, turso_core::Value::Null) {
         Ok(()) => c::turso_status_code_t::TURSO_OK,
-        Err(err) => err.to_capi(std::ptr::null_mut()),
+        Err(err) => unsafe { err.to_capi(std::ptr::null_mut()) },
     }
 }
 
@@ -440,11 +442,11 @@ pub extern "C" fn turso_statement_bind_positional_int(
 ) -> c::turso_status_code_t {
     let statement = match unsafe { TursoStatement::ref_from_capi(statement) } {
         Ok(statement) => statement,
-        Err(err) => return err.to_capi(std::ptr::null_mut()),
+        Err(err) => return unsafe { err.to_capi(std::ptr::null_mut()) },
     };
     match statement.bind_positional(position, turso_core::Value::Integer(value)) {
         Ok(()) => c::turso_status_code_t::TURSO_OK,
-        Err(err) => err.to_capi(std::ptr::null_mut()),
+        Err(err) => unsafe { err.to_capi(std::ptr::null_mut()) },
     }
 }
 
@@ -457,11 +459,11 @@ pub extern "C" fn turso_statement_bind_positional_double(
 ) -> c::turso_status_code_t {
     let statement = match unsafe { TursoStatement::ref_from_capi(statement) } {
         Ok(statement) => statement,
-        Err(err) => return err.to_capi(std::ptr::null_mut()),
+        Err(err) => return unsafe { err.to_capi(std::ptr::null_mut()) },
     };
     match statement.bind_positional(position, turso_core::Value::Float(value)) {
         Ok(()) => c::turso_status_code_t::TURSO_OK,
-        Err(err) => err.to_capi(std::ptr::null_mut()),
+        Err(err) => unsafe { err.to_capi(std::ptr::null_mut()) },
     }
 }
 
@@ -475,15 +477,15 @@ pub extern "C" fn turso_statement_bind_positional_text(
 ) -> c::turso_status_code_t {
     let statement = match unsafe { TursoStatement::ref_from_capi(statement) } {
         Ok(statement) => statement,
-        Err(err) => return err.to_capi(std::ptr::null_mut()),
+        Err(err) => return unsafe { err.to_capi(std::ptr::null_mut()) },
     };
     let text = match unsafe { str_from_slice(ptr, len) } {
         Ok(text) => text,
-        Err(err) => return err.to_capi(std::ptr::null_mut()),
+        Err(err) => return unsafe { err.to_capi(std::ptr::null_mut()) },
     };
     match statement.bind_positional(position, turso_core::Value::Text(Text::new(text))) {
         Ok(()) => c::turso_status_code_t::TURSO_OK,
-        Err(err) => err.to_capi(std::ptr::null_mut()),
+        Err(err) => unsafe { err.to_capi(std::ptr::null_mut()) },
     }
 }
 
@@ -497,15 +499,15 @@ pub extern "C" fn turso_statement_bind_positional_blob(
 ) -> c::turso_status_code_t {
     let statement = match unsafe { TursoStatement::ref_from_capi(statement) } {
         Ok(statement) => statement,
-        Err(err) => return err.to_capi(std::ptr::null_mut()),
+        Err(err) => return unsafe { err.to_capi(std::ptr::null_mut()) },
     };
     let bytes = match unsafe { bytes_from_slice(ptr, len) } {
         Ok(bytes) => bytes,
-        Err(err) => return err.to_capi(std::ptr::null_mut()),
+        Err(err) => return unsafe { err.to_capi(std::ptr::null_mut()) },
     };
     match statement.bind_positional(position, turso_core::Value::Blob(bytes.to_vec())) {
         Ok(()) => c::turso_status_code_t::TURSO_OK,
-        Err(err) => err.to_capi(std::ptr::null_mut()),
+        Err(err) => unsafe { err.to_capi(std::ptr::null_mut()) },
     }
 }
 
