@@ -6,7 +6,7 @@ use std::ptr::null;
 use std::slice;
 use std::sync::Arc;
 use turso_core::types::Text;
-use turso_core::{self, Connection, DatabaseOpts, IO, Statement, StepResult, Value};
+use turso_core::{self, Connection, DatabaseOpts, Statement, StepResult, Value, IO};
 
 type Error = *const i8;
 
@@ -73,10 +73,11 @@ pub fn to_value(value: TursoValue) -> Value {
         ValueType::Float => Value::Float(unsafe { value.value.real_val }),
         ValueType::Blob => Value::Blob(to_vec(unsafe { value.value.blob })),
         ValueType::Text => {
-            let slice = unsafe { slice::from_raw_parts(value.value.text.ptr, value.value.text.len) };
+            let slice =
+                unsafe { slice::from_raw_parts(value.value.text.ptr, value.value.text.len) };
             return match str::from_utf8(slice) {
                 Ok(value) => Value::Text(Text::new(value)),
-                Err(_) => Value::Null
+                Err(_) => Value::Null,
             };
         }
     }
@@ -99,8 +100,7 @@ pub unsafe extern "C" fn db_open(
     let path_cstr: &CStr = unsafe { CStr::from_ptr(path_ptr) };
     let path_str = path_cstr.to_str();
 
-    let connection_result =
-        Connection::from_uri(path_str.unwrap(), DatabaseOpts::new());
+    let connection_result = Connection::from_uri(path_str.unwrap(), DatabaseOpts::new());
     match connection_result {
         Ok((io, val)) => allocate(Database {
             io,
