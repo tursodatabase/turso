@@ -1699,6 +1699,7 @@ mod tests {
         use crate::io::Completion;
         use crate::storage::btree::{BTreeKey, CursorTrait};
         use crate::types::{IOCompletions, ImmutableRecord, IndexInfo};
+        use crate::Register;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
         /// Mock btree cursor that tracks calls and can simulate IO pending states.
@@ -1772,6 +1773,15 @@ mod tests {
                     // (The bug is that this second seek happens at all)
                     Ok(IOResult::Done(SeekResult::Found))
                 }
+            }
+
+            fn seek_unpacked(
+                &mut self,
+                _registers: &[Register],
+                _op: SeekOp,
+            ) -> Result<IOResult<SeekResult>> {
+                // Not used in these tests
+                Ok(IOResult::Done(SeekResult::NotFound))
             }
 
             fn next(&mut self) -> Result<IOResult<()>> {
