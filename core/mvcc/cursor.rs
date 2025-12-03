@@ -943,8 +943,26 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
             MvccCursorType::Index(_) => Some(self.table_id),
             MvccCursorType::Table => None,
         };
-        self.db
-            .delete_from_table_or_index(self.tx_id, rowid, maybe_index_id)?;
+        let was_deleted =
+            self.db
+                .delete_from_table_or_index(self.tx_id, rowid.clone(), maybe_index_id)?;
+        // If was_deleted is false, this can ONLY happen when we have a row that only exists
+        // in the btree but not the mv store. In this case, we create a tombstone for the row
+        // based on the btree row.
+        if !was_deleted {
+            // The btree cursor must be correctly positioned and cannot cause IO to happen
+            // because in order to get here, we must have read it already in the VDBE.
+            let IOResult::Done(Some(record)) = self.record()? else {
+                crate::bail_corrupt_error!("Btree cursor should have a record when deleting a row that only exists in the btree");
+            };
+            let row = crate::mvcc::database::Row::new(
+                rowid.clone(),
+                record.get_payload().to_vec(),
+                record.column_count(),
+            );
+            self.db
+                .insert_tombstone_to_table_or_index(self.tx_id, rowid, row, maybe_index_id)?;
+        }
         self.invalidate_record();
         Ok(IOResult::Done(()))
     }
@@ -1107,7 +1125,14 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
     }
 
     fn seek_end(&mut self) -> Result<IOResult<()>> {
-        todo!()
+        if self.is_btree_allocated() {
+            // Defer to btree cursor's seek_end implementation
+            self.btree_cursor.seek_end()
+        } else {
+            // SkipMap inserts don't require cursor positioning because
+            // SeekEnd instruction is only used for insertions.
+            Ok(IOResult::Done(()))
+        }
     }
 
     fn seek_to_last(&mut self) -> Result<IOResult<()>> {

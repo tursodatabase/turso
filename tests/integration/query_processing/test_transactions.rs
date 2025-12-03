@@ -761,6 +761,19 @@ fn helper_read_single_row(mut stmt: turso_core::Statement) -> Vec<Value> {
     ret.unwrap()
 }
 
+// Helper function to verify table contents
+fn verify_table_contents(conn: &Arc<Connection>, expected: Vec<i64>) {
+    let stmt = query_and_log(conn, "SELECT x FROM t ORDER BY x")
+        .unwrap()
+        .unwrap();
+    let rows = helper_read_all_rows(stmt);
+    let expected_values: Vec<Vec<Value>> = expected
+        .into_iter()
+        .map(|x| vec![Value::Integer(x)])
+        .collect();
+    assert_eq!(rows, expected_values);
+}
+
 #[test]
 fn test_mvcc_recovery_with_index_and_deletes() {
     let tmp_db = TempDatabase::new_with_opts(
@@ -810,4 +823,400 @@ fn test_mvcc_recovery_with_index_and_deletes() {
             vec![Value::Integer(5)],
         ]
     );
+}
+
+#[test]
+fn test_mvcc_checkpoint_before_delete_then_verify_same_session() {
+    let tmp_db = TempDatabase::new_with_opts(
+        "test_mvcc_checkpoint_before_delete_then_verify_same_session.db",
+        turso_core::DatabaseOpts::new()
+            .with_mvcc(true)
+            .with_indexes(true),
+    );
+    let conn = tmp_db.connect_limbo();
+
+    execute_and_log(&conn, "CREATE TABLE t (x)").unwrap();
+    execute_and_log(
+        &conn,
+        "INSERT INTO t SELECT value FROM generate_series(1,3)",
+    )
+    .unwrap();
+    execute_and_log(&conn, "CREATE INDEX lol ON t(x)").unwrap();
+    execute_and_log(&conn, "PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    execute_and_log(&conn, "DELETE FROM t WHERE x = 2").unwrap();
+
+    verify_table_contents(&conn, vec![1, 3]);
+}
+
+#[test]
+fn test_mvcc_checkpoint_before_delete_then_reopen() {
+    let tmp_db = TempDatabase::new_with_opts(
+        "test_mvcc_checkpoint_before_delete_then_reopen.db",
+        turso_core::DatabaseOpts::new()
+            .with_mvcc(true)
+            .with_indexes(true),
+    );
+    let conn = tmp_db.connect_limbo();
+
+    execute_and_log(&conn, "CREATE TABLE t (x)").unwrap();
+    execute_and_log(
+        &conn,
+        "INSERT INTO t SELECT value FROM generate_series(1,3)",
+    )
+    .unwrap();
+    execute_and_log(&conn, "CREATE INDEX lol ON t(x)").unwrap();
+    execute_and_log(&conn, "PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    execute_and_log(&conn, "DELETE FROM t WHERE x = 2").unwrap();
+
+    let path = tmp_db.path.clone();
+    drop(conn);
+    drop(tmp_db);
+
+    let tmp_db = TempDatabase::new_with_existent_with_opts(
+        &path,
+        turso_core::DatabaseOpts::new()
+            .with_mvcc(true)
+            .with_indexes(true),
+    );
+    let conn = tmp_db.connect_limbo();
+
+    verify_table_contents(&conn, vec![1, 3]);
+}
+
+#[test]
+fn test_mvcc_delete_then_checkpoint_then_verify_same_session() {
+    let tmp_db = TempDatabase::new_with_opts(
+        "test_mvcc_delete_then_checkpoint_then_verify_same_session.db",
+        turso_core::DatabaseOpts::new()
+            .with_mvcc(true)
+            .with_indexes(true),
+    );
+    let conn = tmp_db.connect_limbo();
+
+    execute_and_log(&conn, "CREATE TABLE t (x)").unwrap();
+    execute_and_log(
+        &conn,
+        "INSERT INTO t SELECT value FROM generate_series(1,3)",
+    )
+    .unwrap();
+    execute_and_log(&conn, "CREATE INDEX lol ON t(x)").unwrap();
+    execute_and_log(&conn, "DELETE FROM t WHERE x = 2").unwrap();
+    execute_and_log(&conn, "PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    verify_table_contents(&conn, vec![1, 3]);
+}
+
+#[test]
+fn test_mvcc_delete_then_checkpoint_then_reopen() {
+    let tmp_db = TempDatabase::new_with_opts(
+        "test_mvcc_delete_then_checkpoint_then_reopen.db",
+        turso_core::DatabaseOpts::new()
+            .with_mvcc(true)
+            .with_indexes(true),
+    );
+    let conn = tmp_db.connect_limbo();
+
+    execute_and_log(&conn, "CREATE TABLE t (x)").unwrap();
+    execute_and_log(
+        &conn,
+        "INSERT INTO t SELECT value FROM generate_series(1,3)",
+    )
+    .unwrap();
+    execute_and_log(&conn, "CREATE INDEX lol ON t(x)").unwrap();
+    execute_and_log(&conn, "DELETE FROM t WHERE x = 2").unwrap();
+    execute_and_log(&conn, "PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let path = tmp_db.path.clone();
+    drop(conn);
+    drop(tmp_db);
+
+    let tmp_db = TempDatabase::new_with_existent_with_opts(
+        &path,
+        turso_core::DatabaseOpts::new()
+            .with_mvcc(true)
+            .with_indexes(true),
+    );
+    let conn = tmp_db.connect_limbo();
+
+    verify_table_contents(&conn, vec![1, 3]);
+}
+
+#[test]
+fn test_mvcc_delete_then_reopen_no_checkpoint() {
+    let tmp_db = TempDatabase::new_with_opts(
+        "test_mvcc_delete_then_reopen_no_checkpoint.db",
+        turso_core::DatabaseOpts::new()
+            .with_mvcc(true)
+            .with_indexes(true),
+    );
+    let conn = tmp_db.connect_limbo();
+
+    execute_and_log(&conn, "CREATE TABLE t (x)").unwrap();
+    execute_and_log(
+        &conn,
+        "INSERT INTO t SELECT value FROM generate_series(1,3)",
+    )
+    .unwrap();
+    execute_and_log(&conn, "CREATE INDEX lol ON t(x)").unwrap();
+    execute_and_log(&conn, "DELETE FROM t WHERE x = 2").unwrap();
+
+    let path = tmp_db.path.clone();
+    drop(conn);
+    drop(tmp_db);
+
+    let tmp_db = TempDatabase::new_with_existent_with_opts(
+        &path,
+        turso_core::DatabaseOpts::new()
+            .with_mvcc(true)
+            .with_indexes(true),
+    );
+    let conn = tmp_db.connect_limbo();
+
+    verify_table_contents(&conn, vec![1, 3]);
+}
+
+#[test]
+fn test_mvcc_checkpoint_delete_checkpoint_then_verify_same_session() {
+    let tmp_db = TempDatabase::new_with_opts(
+        "test_mvcc_checkpoint_delete_checkpoint_then_verify_same_session.db",
+        turso_core::DatabaseOpts::new()
+            .with_mvcc(true)
+            .with_indexes(true),
+    );
+    let conn = tmp_db.connect_limbo();
+
+    execute_and_log(&conn, "CREATE TABLE t (x)").unwrap();
+    execute_and_log(
+        &conn,
+        "INSERT INTO t SELECT value FROM generate_series(1,3)",
+    )
+    .unwrap();
+    execute_and_log(&conn, "CREATE INDEX lol ON t(x)").unwrap();
+    execute_and_log(&conn, "PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    execute_and_log(&conn, "DELETE FROM t WHERE x = 2").unwrap();
+    execute_and_log(&conn, "PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    verify_table_contents(&conn, vec![1, 3]);
+}
+
+#[test]
+fn test_mvcc_checkpoint_delete_checkpoint_then_reopen() {
+    let tmp_db = TempDatabase::new_with_opts(
+        "test_mvcc_checkpoint_delete_checkpoint_then_reopen.db",
+        turso_core::DatabaseOpts::new()
+            .with_mvcc(true)
+            .with_indexes(true),
+    );
+    let conn = tmp_db.connect_limbo();
+
+    execute_and_log(&conn, "CREATE TABLE t (x)").unwrap();
+    execute_and_log(
+        &conn,
+        "INSERT INTO t SELECT value FROM generate_series(1,3)",
+    )
+    .unwrap();
+    execute_and_log(&conn, "CREATE INDEX lol ON t(x)").unwrap();
+    execute_and_log(&conn, "PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    execute_and_log(&conn, "DELETE FROM t WHERE x = 2").unwrap();
+    execute_and_log(&conn, "PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let path = tmp_db.path.clone();
+    drop(conn);
+    drop(tmp_db);
+
+    let tmp_db = TempDatabase::new_with_existent_with_opts(
+        &path,
+        turso_core::DatabaseOpts::new()
+            .with_mvcc(true)
+            .with_indexes(true),
+    );
+    let conn = tmp_db.connect_limbo();
+
+    verify_table_contents(&conn, vec![1, 3]);
+}
+
+#[test]
+fn test_mvcc_index_before_checkpoint_delete_after_checkpoint() {
+    let tmp_db = TempDatabase::new_with_opts(
+        "test_mvcc_index_before_checkpoint_delete_after_checkpoint.db",
+        turso_core::DatabaseOpts::new()
+            .with_mvcc(true)
+            .with_indexes(true),
+    );
+    let conn = tmp_db.connect_limbo();
+
+    execute_and_log(&conn, "CREATE TABLE t (x)").unwrap();
+    execute_and_log(
+        &conn,
+        "INSERT INTO t SELECT value FROM generate_series(1,3)",
+    )
+    .unwrap();
+    execute_and_log(&conn, "CREATE INDEX lol ON t(x)").unwrap();
+    execute_and_log(&conn, "PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    execute_and_log(&conn, "DELETE FROM t WHERE x = 2").unwrap();
+
+    let path = tmp_db.path.clone();
+    drop(conn);
+    drop(tmp_db);
+
+    let tmp_db = TempDatabase::new_with_existent_with_opts(
+        &path,
+        turso_core::DatabaseOpts::new()
+            .with_mvcc(true)
+            .with_indexes(true),
+    );
+    let conn = tmp_db.connect_limbo();
+
+    verify_table_contents(&conn, vec![1, 3]);
+}
+
+#[test]
+fn test_mvcc_index_after_checkpoint_delete_after_index() {
+    let tmp_db = TempDatabase::new_with_opts(
+        "test_mvcc_index_after_checkpoint_delete_after_index.db",
+        turso_core::DatabaseOpts::new()
+            .with_mvcc(true)
+            .with_indexes(true),
+    );
+    let conn = tmp_db.connect_limbo();
+
+    execute_and_log(&conn, "CREATE TABLE t (x)").unwrap();
+    execute_and_log(
+        &conn,
+        "INSERT INTO t SELECT value FROM generate_series(1,3)",
+    )
+    .unwrap();
+    execute_and_log(&conn, "PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    execute_and_log(&conn, "CREATE INDEX lol ON t(x)").unwrap();
+    execute_and_log(&conn, "DELETE FROM t WHERE x = 2").unwrap();
+
+    let path = tmp_db.path.clone();
+    drop(conn);
+    drop(tmp_db);
+
+    let tmp_db = TempDatabase::new_with_existent_with_opts(
+        &path,
+        turso_core::DatabaseOpts::new()
+            .with_mvcc(true)
+            .with_indexes(true),
+    );
+    let conn = tmp_db.connect_limbo();
+
+    verify_table_contents(&conn, vec![1, 3]);
+}
+
+#[test]
+fn test_mvcc_multiple_deletes_with_checkpoints() {
+    let tmp_db = TempDatabase::new_with_opts(
+        "test_mvcc_multiple_deletes_with_checkpoints.db",
+        turso_core::DatabaseOpts::new()
+            .with_mvcc(true)
+            .with_indexes(true),
+    );
+    let conn = tmp_db.connect_limbo();
+
+    execute_and_log(&conn, "CREATE TABLE t (x)").unwrap();
+    execute_and_log(
+        &conn,
+        "INSERT INTO t SELECT value FROM generate_series(1,5)",
+    )
+    .unwrap();
+    execute_and_log(&conn, "CREATE INDEX lol ON t(x)").unwrap();
+    execute_and_log(&conn, "PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    execute_and_log(&conn, "DELETE FROM t WHERE x = 2").unwrap();
+    execute_and_log(&conn, "PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    execute_and_log(&conn, "DELETE FROM t WHERE x = 4").unwrap();
+
+    verify_table_contents(&conn, vec![1, 3, 5]);
+
+    let path = tmp_db.path.clone();
+    drop(conn);
+    drop(tmp_db);
+
+    let tmp_db = TempDatabase::new_with_existent_with_opts(
+        &path,
+        turso_core::DatabaseOpts::new()
+            .with_mvcc(true)
+            .with_indexes(true),
+    );
+    let conn = tmp_db.connect_limbo();
+
+    verify_table_contents(&conn, vec![1, 3, 5]);
+}
+
+#[test]
+fn test_mvcc_no_index_checkpoint_delete_reopen() {
+    let tmp_db = TempDatabase::new_with_opts(
+        "test_mvcc_no_index_checkpoint_delete_reopen.db",
+        turso_core::DatabaseOpts::new()
+            .with_mvcc(true)
+            .with_indexes(true),
+    );
+    let conn = tmp_db.connect_limbo();
+
+    execute_and_log(&conn, "CREATE TABLE t (x)").unwrap();
+    execute_and_log(
+        &conn,
+        "INSERT INTO t SELECT value FROM generate_series(1,3)",
+    )
+    .unwrap();
+    execute_and_log(&conn, "PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    execute_and_log(&conn, "DELETE FROM t WHERE x = 2").unwrap();
+
+    let path = tmp_db.path.clone();
+    drop(conn);
+    drop(tmp_db);
+
+    let tmp_db = TempDatabase::new_with_existent_with_opts(
+        &path,
+        turso_core::DatabaseOpts::new()
+            .with_mvcc(true)
+            .with_indexes(true),
+    );
+    let conn = tmp_db.connect_limbo();
+
+    verify_table_contents(&conn, vec![1, 3]);
+}
+
+#[test]
+fn test_mvcc_checkpoint_before_insert_delete_after_checkpoint() {
+    let tmp_db = TempDatabase::new_with_opts(
+        "test_mvcc_checkpoint_before_insert_delete_after_checkpoint.db",
+        turso_core::DatabaseOpts::new()
+            .with_mvcc(true)
+            .with_indexes(true),
+    );
+    let conn = tmp_db.connect_limbo();
+
+    execute_and_log(&conn, "CREATE TABLE t (x)").unwrap();
+    execute_and_log(
+        &conn,
+        "INSERT INTO t SELECT value FROM generate_series(1,2)",
+    )
+    .unwrap();
+    execute_and_log(&conn, "CREATE INDEX lol ON t(x)").unwrap();
+    execute_and_log(&conn, "PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    execute_and_log(
+        &conn,
+        "INSERT INTO t SELECT value FROM generate_series(3,4)",
+    )
+    .unwrap();
+    execute_and_log(&conn, "DELETE FROM t WHERE x = 2").unwrap();
+    execute_and_log(&conn, "DELETE FROM t WHERE x = 3").unwrap();
+
+    verify_table_contents(&conn, vec![1, 4]);
+
+    let path = tmp_db.path.clone();
+    drop(conn);
+    drop(tmp_db);
+
+    let tmp_db = TempDatabase::new_with_existent_with_opts(
+        &path,
+        turso_core::DatabaseOpts::new()
+            .with_mvcc(true)
+            .with_indexes(true),
+    );
+    let conn = tmp_db.connect_limbo();
+
+    verify_table_contents(&conn, vec![1, 4]);
 }

@@ -12,7 +12,6 @@ use rand_chacha::ChaCha8Rng;
 pub(crate) struct MvccTestDbNoConn {
     pub(crate) db: Option<Arc<Database>>,
     path: Option<String>,
-    log_path: Option<String>,
     // Stored mainly to not drop the temp dir before the test is done.
     _temp_dir: Option<tempfile::TempDir>,
 }
@@ -43,7 +42,6 @@ impl MvccTestDbNoConn {
         Self {
             db: Some(db),
             path: None,
-            log_path: None,
             _temp_dir: None,
         }
     }
@@ -59,17 +57,9 @@ impl MvccTestDbNoConn {
         println!("path: {}", path.as_os_str().to_str().unwrap());
         let db = Database::open_file(io.clone(), path.as_os_str().to_str().unwrap(), true, true)
             .unwrap();
-        let mut log_path = path.clone();
-        let log_path_filename = log_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .map(|s| format!("{s}-log"))
-            .unwrap();
-        log_path.set_file_name(log_path_filename);
         Self {
             db: Some(db),
             path: Some(path.to_str().unwrap().to_string()),
-            log_path: Some(log_path.to_str().unwrap().to_string()),
             _temp_dir: Some(temp_dir),
         }
     }
@@ -101,10 +91,6 @@ impl MvccTestDbNoConn {
 
     pub fn get_mvcc_store(&self) -> Arc<MvStore<LocalClock>> {
         self.get_db().mv_store.as_ref().unwrap().clone()
-    }
-
-    pub fn get_log_path(&self) -> &str {
-        self.log_path.as_ref().unwrap().as_str()
     }
 }
 
