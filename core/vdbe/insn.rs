@@ -295,15 +295,24 @@ pub enum Insn {
         flags: CmpInsFlags,
         collation: Option<CollationSeq>,
     },
-    /// Compute a hash on the key contained in the P4 registers starting with r[P3]. Check to see if that hash is found in the bloom filter hosted by register P1. If it is not present then maybe jump to P2. Otherwise fall through.
-    // False negatives are harmless. It is always safe to fall through, even if the value is in the bloom filter. A false negative causes more CPU cycles to be used, but it should still yield the correct answer. However, an incorrect answer may well arise from a false positive - if the jump is taken when it should fall through.
+    /// Compute a hash on num_keys registers starting with r[key_reg]. Check to see if that hash
+    /// is found in the bloom filter associated with the cursor/hash_table. If it is not present
+    /// then jump to target_pc. Otherwise fall through.
+    /// False negatives are harmless. It is always safe to fall through, even if the value is
+    /// in the bloom filter. A false negative causes more CPU cycles to be used, but it should
+    /// still yield the correct answer. However, an incorrect answer may well arise from a
+    /// false positive - if the jump is taken when it should fall through.
     Filter {
         cursor_id: CursorID,
+        /// Jump target if bloom filter says "definitely not present"
         target_pc: BranchOffset,
+        /// Start register containing the key(s) to check
         key_reg: usize,
+        /// Number of key registers to hash together
         num_keys: usize,
     },
-    /// Compute a hash on the P4 registers starting with r[P3] and add that hash to the bloom filter contained in r[P1].
+    /// Compute a hash on num_keys registers starting with r[key_reg] and add that hash to
+    /// the bloom filter associated with the cursor/hash_table.
     FilterAdd {
         cursor_id: CursorID,
         key_reg: usize,

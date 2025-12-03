@@ -779,7 +779,9 @@ pub fn open_loop(
                                     false
                                 };
                                 let num_seek_keys = seek_def.size(&seek_def.start);
-                                let AutoIndexResult { use_bloom_filter } = emit_autoindex(
+                                let AutoIndexResult {
+                                    use_bloom_filter, ..
+                                } = emit_autoindex(
                                     program,
                                     index,
                                     table_cursor_id.expect(
@@ -896,6 +898,8 @@ pub fn open_loop(
                     cursor_id: probe_cursor_id,
                     pc_if_empty: loop_end,
                 });
+                // TODO: enable bloom filter for hash joins, probably should wait until we have
+                // more metadata about build table size, etc.
                 let payload_info = emit_hash_build_phase(
                     program,
                     t_ctx,
@@ -1730,7 +1734,6 @@ fn emit_seek(
             });
         }
     }
-
     if let Some(idx) = seek_index {
         if use_bloom_filter {
             turso_assert!(
