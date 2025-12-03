@@ -1,0 +1,34 @@
+---
+name: 2025-11-26-go-bindings
+---
+
+<Output path="./driver_db.go">
+
+<Code model="openai/gpt-5" language="go">
+
+Generate Go SDK for the Turso - SQLite-compatible embedded database written in Rust.
+You must use bindings_db.go bridge from Go to C API.
+
+# Bindings
+
+<File path="./bindings_db.go" />
+
+# Implementation
+
+The SDK should has following components under the hood:
+* `type tursoDbConnection struct { }` - wrapper which holds connection to the turso and protect it against concurrent use
+* `type tursoDbStatement struct { }` - wrapper which holds prepared statement to the turso and protect it against concurrent use
+* `type tursoDbRows struct { }` - wrapper which holds prepared statement and provide sqld/database compatible methods to iterate over rows of the statement
+* `type tursoDbDriver struct { }` - type to register in the sql/database as driver
+* `type tursoDbResult struct { }` - type implementing `driver.Result` interface
+* `type tursoDbTx struct { }` - type implementing `driver.Tx` interface
+
+# Go driver API
+
+Inspect go sql driver documentation and follow it during implementation:
+
+<Shell cmd="go doc -all sql" />
+
+</Code>
+
+</Output>
