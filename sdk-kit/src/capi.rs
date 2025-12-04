@@ -23,6 +23,14 @@ pub fn turso_status_ok() -> turso_status_t {
     }
 }
 
+pub static PKG_VERSION_C: &[u8] = concat!(env!("CARGO_PKG_VERSION"), "\0").as_bytes();
+
+#[no_mangle]
+#[signature(c)]
+pub extern "C" fn turso_version() -> *const std::ffi::c_char {
+    return PKG_VERSION_C.as_ptr() as *const std::ffi::c_char;
+}
+
 #[no_mangle]
 #[signature(c)]
 pub extern "C" fn turso_setup(config: c::turso_config_t) -> c::turso_status_t {
@@ -543,7 +551,7 @@ pub extern "C" fn turso_statement_deinit(statement: c::turso_statement_t) {
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::CString;
+    use std::ffi::{CStr, CString};
 
     use turso_core::types::Text;
 
@@ -559,7 +567,7 @@ mod tests {
                 turso_statement_column_count, turso_statement_deinit, turso_statement_execute,
                 turso_statement_finalize, turso_statement_row_value, turso_statement_run_io,
                 turso_statement_step, turso_status_code_t, turso_status_deinit, turso_status_t,
-                turso_value_t, turso_value_union_t,
+                turso_value_t, turso_value_union_t, turso_version,
             },
         },
         rsapi::{turso_slice_from_bytes, value_from_c_value},
@@ -573,6 +581,15 @@ mod tests {
         println!("log: {:?}", unsafe {
             std::ffi::CStr::from_ptr(log.message)
         });
+    }
+
+    #[test]
+    pub fn test_version() {
+        unsafe {
+            let version = CStr::from_ptr(turso_version()).to_str().unwrap();
+            println!("{}", version);
+            assert_eq!(version, env!("CARGO_PKG_VERSION"));
+        }
     }
 
     #[test]

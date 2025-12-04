@@ -407,6 +407,10 @@ pub fn turso_setup(config: TursoSetupConfig) -> Result<(), TursoError> {
 }
 
 impl TursoDatabase {
+    /// return turso version
+    pub const fn version() -> &'static str {
+        env!("CARGO_PKG_VERSION")
+    }
     /// method to get [turso_core::Database] instance which can be useful for code which integrates with sdk-kit
     pub fn db_core(&self) -> Result<Arc<turso_core::Database>, TursoError> {
         let db = self.db.lock().unwrap();
