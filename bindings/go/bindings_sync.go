@@ -554,6 +554,7 @@ func turso_sync_operation_result_extract_connection(self TursoSyncOperation) (Tu
 }
 
 // turso_sync_operation_result_extract_changes extracts Changes result from finished operation.
+// If no changes were fetched - return TURSO_OK and set changes to null pointer
 func turso_sync_operation_result_extract_changes(self TursoSyncOperation) (TursoSyncChanges, error) {
 	var ch *turso_sync_changes_t
 	status := c_turso_sync_operation_result_extract_changes(self, &ch)
