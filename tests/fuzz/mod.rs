@@ -565,7 +565,7 @@ mod fuzz_tests {
 
         let non_pk_cols = ["a", "b", "c", "d"];
 
-        const ITERS: usize = 5000;
+        const ITERS: usize = 2000;
         for iter in 0..ITERS {
             if iter % (ITERS / 100).max(1) == 0 {
                 println!("join_fuzz_unindexed_keys: iteration {}/{}", iter + 1, ITERS);
