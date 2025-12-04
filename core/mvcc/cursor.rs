@@ -51,6 +51,7 @@ enum AdvanceBtreeStateForward {
 enum RewindState {
     Advance,
 }
+
 #[derive(Debug, Clone)]
 enum NextState {
     AdvanceUnitialized,
@@ -479,7 +480,7 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
                     if !self.is_btree_allocated() {
                         let mut peek = self.dual_peek.borrow_mut();
                         peek.btree_peek = CursorPeek::Exhausted;
-                        self.btree_advance_state.replace(None);
+                        *state = None;
                         return Ok(IOResult::Done(()));
                     }
                     let mut peek = self.dual_peek.borrow_mut();
@@ -497,15 +498,16 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
                     match key {
                         Some(k) if self.query_btree_version_is_valid(&k) => {
                             peek.btree_peek = CursorPeek::Row(k);
-                            self.btree_advance_state.replace(None);
+                            *state = None;
                             return Ok(IOResult::Done(()));
                         }
                         Some(_) => {
                             // shadowed by MVCC, continue to prev
+                            *state = Some(AdvanceBtreeStateForward::NextBtree);
                         }
                         None => {
                             peek.btree_peek = CursorPeek::Exhausted;
-                            self.btree_advance_state.replace(None);
+                            *state = None;
                             return Ok(IOResult::Done(()));
                         }
                     }
@@ -515,7 +517,7 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
                     let found = return_if_io!(self.btree_cursor.prev());
                     if !found {
                         peek.btree_peek = CursorPeek::Exhausted;
-                        self.btree_advance_state.replace(None);
+                        *state = None;
                         return Ok(IOResult::Done(()));
                     }
                     *state = Some(AdvanceBtreeStateForward::NextCheckBtreeKey);
@@ -526,7 +528,7 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
                     match key {
                         Some(k) if self.query_btree_version_is_valid(&k) => {
                             peek.btree_peek = CursorPeek::Row(k);
-                            self.btree_advance_state.replace(None);
+                            *state = None;
                             return Ok(IOResult::Done(()));
                         }
                         Some(_) => {
@@ -535,7 +537,7 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
                         }
                         None => {
                             peek.btree_peek = CursorPeek::Exhausted;
-                            self.btree_advance_state.replace(None);
+                            *state = None;
                             return Ok(IOResult::Done(()));
                         }
                     }
@@ -627,12 +629,29 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
 
 impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
     fn last(&mut self) -> Result<IOResult<()>> {
-        let _ = self.table_iterator.take();
-        let _ = self.index_iterator.take();
-        self.reset_dual_peek();
+        let state = self.state.borrow().clone();
+        if state.is_none() {
+            let _ = self.table_iterator.take();
+            let _ = self.index_iterator.take();
+            self.reset_dual_peek();
+            self.state
+                .replace(Some(MvccLazyCursorState::Rewind(RewindState::Advance)));
+        }
+
+        assert!(
+            matches!(
+                self.state
+                    .borrow()
+                    .as_ref()
+                    .expect("rewind state is not initialized"),
+                MvccLazyCursorState::Rewind(RewindState::Advance)
+            ),
+            "Invalid last state {:?}",
+            state
+        );
 
         // Initialize btree cursor to last position
-        self.advance_btree_backward()?;
+        return_if_io!(self.advance_btree_backward());
 
         self.invalidate_record();
         self.current_pos.replace(CursorPosition::End);
@@ -669,6 +688,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
 
         self.refresh_current_position(IterationDirection::Backwards);
         self.invalidate_record();
+        self.state.replace(None);
 
         Ok(IOResult::Done(()))
     }
@@ -1166,11 +1186,13 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                     },
                     in_btree: false,
                 });
+                self.state.replace(None);
                 return Ok(IOResult::Done(exists));
             } else if self.is_btree_allocated() {
                 self.state
                     .replace(Some(MvccLazyCursorState::Exists(ExistsState::ExistsBtree)));
             } else {
+                self.state.replace(None);
                 return Ok(IOResult::Done(false));
             }
         }
