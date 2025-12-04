@@ -60,13 +60,34 @@ struct TursoSyncDbConfig {
 struct TursoSyncDb { ... }
 
 // main constructor to create synced database
-func NewTursoSyncDb(...) { ... }
+func NewTursoSyncDb(ctx context.Context, config TursoSyncDbConfig) (*TursoSyncDb, error) { ... }
 
-// create ordinary db connnection
-func (d *TursoSyncDb) Connect(...) (*sql.DB, error) { ... }
+// create turso db local connnection
+
+// internal connector to integrate with database/sql pool
+type tursoSyncConnector struct { db *TursoSyncDb }
+func (c *tursoSyncConnector) Connect(ctx context.Context) (driver.Conn, error) { ... }
+func (c *tursoSyncConnector) Driver() driver.Driver { return &tursoDbDriver{} }
+
+// create tursodb connection using NewConnection(...) from driver_db.go and tursoSyncConnector helper
+func (d *TursoSyncDb) Connect(ctx context.Context) (*sql.DB, error) { ... }
 
 // implement EXTRA sync methods
-func (d *TursoSyncDb) Pull(...) { ... }
+
+// Pull fresh data from the remote
+// Pull DO NOT sent any local changes to the remote and instead "rebase" them on top of new changes from remote
+// Return true, if new changes were applied locally - otherwise return false
+func (d *TursoSyncDb) Pull(ctx context.Context) (bool, error) { ... }
+
+// Push local changes to the remote
+// Push DO NOT fetch any remote changes
+func (d *TursoSyncDb) Push(ctx context.Context) error { ... }
+
+// Get stats for the synced database
+func (d *TursoSyncDb) Stats(ctx context.Context) (TursoSyncDbStats, error) { ... }
+
+// Checkpoint local WAL of the database
+func (d *TursoSyncDb) Checkpoint(ctx context.Context) error { ... }
 ```
 - STREAM data from the http request to the completion in chunks and spin async operation in between in order to prevent loading whole response in memory
 - AVOID unnecessary FFI calls as their cost is non zero

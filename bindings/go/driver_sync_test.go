@@ -170,7 +170,13 @@ func TestSyncPull(t *testing.T) {
 	require.Equal(t, values, []string{"hello", "turso", "sync-go"})
 	rows.Close()
 
-	require.Nil(t, db.Pull(context.Background()))
+	changes, err := db.Pull(context.Background())
+	require.Nil(t, err)
+	require.True(t, changes)
+
+	changes, err = db.Pull(context.Background())
+	require.Nil(t, err)
+	require.False(t, changes)
 
 	rows, err = conn.QueryContext(context.Background(), "SELECT * FROM t")
 	require.Nil(t, err)
@@ -182,6 +188,67 @@ func TestSyncPull(t *testing.T) {
 	}
 	require.Equal(t, values, []string{"hello", "turso", "sync-go", "pull-works"})
 	rows.Close()
+}
+
+func TestSyncPullDoNotPush(t *testing.T) {
+	server := TursoServer{AdminUrl: "http://localhost:8081", UserUrl: "http://localhost:8080"}
+	name := randomString()
+	require.Nil(t, server.CreateTenant(name))
+	require.Nil(t, server.CreateGroup(name, name))
+	require.Nil(t, server.CreateDb(name, name, name))
+	_, err := server.DbSql(name, name, name, "CREATE TABLE t(x)")
+	require.Nil(t, err)
+	_, err = server.DbSql(name, name, name, "INSERT INTO t VALUES ('hello'), ('turso'), ('sync-go')")
+	require.Nil(t, err)
+
+	db, err := NewTursoSyncDb(context.Background(), TursoSyncDbConfig{
+		Path:       ":memory:",
+		ClientName: "turso-sync-go",
+		RemoteUrl:  server.DbUrl(name, name, name),
+	})
+	require.Nil(t, err)
+	conn, err := db.Connect(context.Background())
+	require.Nil(t, err)
+
+	_, err = server.DbSql(name, name, name, "INSERT INTO t VALUES ('pull-works')")
+	require.Nil(t, err)
+
+	rows, err := conn.QueryContext(context.Background(), "SELECT * FROM t")
+	require.Nil(t, err)
+	values := make([]string, 0)
+	for rows.Next() {
+		var value string
+		require.Nil(t, rows.Scan(&value))
+		values = append(values, value)
+	}
+	require.Equal(t, values, []string{"hello", "turso", "sync-go"})
+	rows.Close()
+
+	_, err = conn.Exec("INSERT INTO t VALUES ('push-is-local')")
+	require.Nil(t, err)
+
+	changes, err := db.Pull(context.Background())
+	require.Nil(t, err)
+	require.True(t, changes)
+
+	changes, err = db.Pull(context.Background())
+	require.Nil(t, err)
+	require.False(t, changes)
+
+	rows, err = conn.QueryContext(context.Background(), "SELECT * FROM t")
+	require.Nil(t, err)
+	values = make([]string, 0)
+	for rows.Next() {
+		var value string
+		require.Nil(t, rows.Scan(&value))
+		values = append(values, value)
+	}
+	require.Equal(t, values, []string{"hello", "turso", "sync-go", "pull-works", "push-is-local"})
+	rows.Close()
+
+	remote, err := server.DbSql(name, name, name, "SELECT * FROM t")
+	require.Nil(t, err)
+	require.Equal(t, remote, [][]any{{"hello"}, {"turso"}, {"sync-go"}, {"pull-works"}})
 }
 
 func TestSyncPush(t *testing.T) {
