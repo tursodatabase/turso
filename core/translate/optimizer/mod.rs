@@ -786,14 +786,6 @@ fn optimize_table_access(
                         .enumerate()
                         .filter(|(_, c)| c.usable && c.table_col_pos.is_some())
                         .collect();
-                    if usable.is_empty() {
-                        table_references.joined_tables_mut()[table_idx].op =
-                            Operation::Scan(Scan::BTreeTable {
-                                iter_dir: *iter_dir,
-                                index: index.clone(),
-                            });
-                        continue;
-                    }
 
                     // Build a mapping from table_col_pos to index_col_pos.
                     // Multiple constraints on the same column should share the same index_col_pos.
@@ -842,10 +834,19 @@ fn optimize_table_access(
                         &best_join_order[..=i],
                     );
 
+                    if usable_constraint_refs.is_empty() {
+                        table_references.joined_tables_mut()[table_idx].op =
+                            Operation::Scan(Scan::BTreeTable {
+                                iter_dir: *iter_dir,
+                                index: index.clone(),
+                            });
+                        continue;
+                    }
                     let ephemeral_index = ephemeral_index_build(
                         &table_references.joined_tables_mut()[table_idx],
                         &usable_constraint_refs,
                     );
+
                     let ephemeral_index = Arc::new(ephemeral_index);
                     table_references.joined_tables_mut()[table_idx].op =
                         Operation::Search(Search::Seek {
