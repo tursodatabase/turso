@@ -587,7 +587,7 @@ mod tests {
     pub fn test_version() {
         unsafe {
             let version = CStr::from_ptr(turso_version()).to_str().unwrap();
-            println!("{}", version);
+            println!("{version}");
             assert_eq!(version, env!("CARGO_PKG_VERSION"));
         }
     }
