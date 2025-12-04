@@ -637,9 +637,7 @@ pub fn open_loop(
                                     false
                                 };
                                 let num_seek_keys = seek_def.size(&seek_def.start);
-                                let AutoIndexResult {
-                                    use_bloom_filter, ..
-                                } = emit_autoindex(
+                                let AutoIndexResult { use_bloom_filter } = emit_autoindex(
                                     program,
                                     index,
                                     table_cursor_id.expect(
@@ -1615,7 +1613,6 @@ fn emit_seek_termination(
 }
 
 struct AutoIndexResult {
-    _cursor_id: CursorID,
     use_bloom_filter: bool,
 }
 
@@ -1669,15 +1666,11 @@ fn emit_autoindex(
         index_name: Some(index.name.clone()),
         affinity_str: None,
     });
-    let is_eq = matches!(
-        seek_def.start.op,
-        SeekOp::GE { eq_only: true } | SeekOp::LE { eq_only: true }
-    );
     // Skip bloom filter for non-binary collations since it uses binary hashing.
     let use_bloom_filter = index.columns.iter().take(num_seek_keys).all(|col| {
         col.collation
             .is_none_or(|coll| matches!(coll, CollationSeq::Binary | CollationSeq::Unset))
-    }) && is_eq;
+    }) && seek_def.start.op.eq_only();
     if use_bloom_filter {
         program.emit_insn(Insn::FilterAdd {
             cursor_id: index_cursor_id,
@@ -1697,8 +1690,5 @@ fn emit_autoindex(
         pc_if_next: label_ephemeral_build_loop_start,
     });
     program.preassign_label_to_next_insn(label_ephemeral_build_end);
-    Ok(AutoIndexResult {
-        _cursor_id: index_cursor_id,
-        use_bloom_filter,
-    })
+    Ok(AutoIndexResult { use_bloom_filter })
 }
