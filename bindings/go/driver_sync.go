@@ -1,86 +1,97 @@
 package turso
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"database/sql/driver"
 	"errors"
 	"io"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 )
 
-// TursoSyncDbConfig configures a synced Turso database.
-// All network IO is handled by this layer (async_io=True).
+// Public configuration for a synced database.
 type TursoSyncDbConfig struct {
-	// Path to the main database file locally.
+	// path to the main database file locally
 	Path string
 
-	// Remote url for the sync.
-	// remote_url MUST be used in all sync engine operations: during bootstrap and all further operations.
+	// remote url for the sync
+	// remote_url MUST be used in all sync engine operations: during bootstrap and all further operations
 	RemoteUrl string
 
-	// Token for remote authentication.
-	// Auth token value WILL not have any prefix and must be used as "Authorization" header prepended with "Bearer ".
+	// token for remote authentication
+	// auth token value WILL not have any prefix and must be used as "Authorization" header prepended with "Bearer " prefix
 	AuthToken string
 
-	// Optional unique client name (library MUST use `turso-sync-go` if omitted).
+	// optional unique client name (library MUST use `turso-sync-go` if omitted)
 	ClientName string
 
-	// Long polling timeout in milliseconds for pull/wait operations.
+	// long polling timeout
 	LongPollTimeoutMs int
 
-	// If not set, initial bootstrap phase will be skipped and caller must call .Pull(...) explicitly in order to get initial state from remote.
-	// Default value is true.
+	// if not set, initial bootstrap phase will be skipped and caller must call .pull(...) explicitly in order to get initial state from remote
+	// default value is true
 	BootstrapIfEmpty *bool
 
-	// If positive, prefix partial bootstrap strategy will be used.
+	// if positive, prefix partial bootstrap strategy will be used
 	PartialBoostrapStrategyPrefix int
-	// If not empty, query partial bootstrap strategy will be used.
+	// if not empty, query partial bootstrap strategy will be used
 	PartialBoostrapStrategyQuery string
 
-	// Pass it as-is to the underlying connection.
+	// pass it as-is to the underlying connection
 	ExperimentalFeatures string
 }
 
-// TursoSyncDbStats represents statistics for the synced database.
+// statistics for the synced database.
 type TursoSyncDbStats struct {
-	CDcOperations        int64
-	MainWalSize          int64
-	RevertWalSize        int64
-	LastPullUnixTime     int64
-	LastPushUnixTime     int64
-	NetworkSentBytes     int64
+	// amount of local operations written since last Pull(...) call
+	CdcOperations int64
+	// size of the main WAL file
+	MainWalSize int64
+	// size of the revert WAL file
+	RevertWalSize int64
+	// last successful pull time
+	LastPullUnixTime int64
+	// last successful push time
+	LastPushUnixTime int64
+	// total amount of bytes sent over the network (both Push and Pull operations are tracked together)
+	NetworkSentBytes int64
+	// total amount of bytes received over the network (both Push and Pull operations are tracked together)
 	NetworkReceivedBytes int64
-	Revision             string
+	// opaque server revision - it MUST NOT be interpreted/parsed in any way
+	Revision string
 }
 
-// TursoSyncDb is a high-level synced database wrapper.
-// It builds on top of the base driver and exposes sync operations.
-type TursoSyncDb struct {
-	sync TursoSyncDatabase
+// define public structs here
 
-	remoteURL string
+// TursoSyncDb is a high-level synced database wrapper built over driver_db.go and bindings_sync.go.
+// It provides push/pull sync operations and creates SQL connections backed by the sync engine.
+type TursoSyncDb struct {
+	db        TursoSyncDatabase
+	baseURL   string
 	authToken string
 	client    *http.Client
 
-	// keep some config pieces for reference
-	longPollTimeoutMs int
+	mu sync.Mutex
 }
 
-// NewTursoSyncDb creates a synced database using provided config.
-// It sets async_io=True and drives the sync engine IO loop during creation.
-// Note: Caller must ensure the underlying native library is registered externally via RegisterTursoLib for DB and appropriate registration for sync bindings.
+// RegisterTursoSyncLib registers the sync API symbols from a loaded dynamic library handle.
+func RegisterTursoSyncLib(handle uintptr) error {
+	return register_turso_sync(handle)
+}
+
+// main constructor to create synced database
 func NewTursoSyncDb(ctx context.Context, config TursoSyncDbConfig) (*TursoSyncDb, error) {
 	if strings.TrimSpace(config.Path) == "" {
-		return nil, errors.New("turso: Path is required")
+		return nil, errors.New("turso: empty Path in TursoSyncDbConfig")
 	}
 	if strings.TrimSpace(config.RemoteUrl) == "" {
-		return nil, errors.New("turso: RemoteUrl is required")
+		return nil, errors.New("turso: empty RemoteUrl in TursoSyncDbConfig")
 	}
 	clientName := config.ClientName
 	if clientName == "" {
@@ -91,12 +102,13 @@ func NewTursoSyncDb(ctx context.Context, config TursoSyncDbConfig) (*TursoSyncDb
 		bootstrap = *config.BootstrapIfEmpty
 	}
 
-	dbConf := TursoDatabaseConfig{
-		Path:                 config.Path, // not used directly by sync connection creation, but passed to sync API
+	// Create sync database holder
+	dbCfg := TursoDatabaseConfig{
+		Path:                 config.Path,
 		ExperimentalFeatures: config.ExperimentalFeatures,
-		AsyncIO:              true, // REQUIRED for sync support since IO is handled here
+		AsyncIO:              true, // MUST be true for external IO handling
 	}
-	syncConf := TursoSyncDatabaseConfig{
+	syncCfg := TursoSyncDatabaseConfig{
 		Path:                           config.Path,
 		ClientName:                     clientName,
 		LongPollTimeoutMs:              config.LongPollTimeoutMs,
@@ -105,135 +117,162 @@ func NewTursoSyncDb(ctx context.Context, config TursoSyncDbConfig) (*TursoSyncDb
 		PartialBootstrapStrategyPrefix: config.PartialBoostrapStrategyPrefix,
 		PartialBootstrapStrategyQuery:  config.PartialBoostrapStrategyQuery,
 	}
-
-	sdb, err := turso_sync_database_new(dbConf, syncConf)
+	sdb, err := turso_sync_database_new(dbCfg, syncCfg)
 	if err != nil {
 		return nil, err
 	}
 
 	d := &TursoSyncDb{
-		sync:              sdb,
-		remoteURL:         config.RemoteUrl,
-		authToken:         config.AuthToken,
-		longPollTimeoutMs: config.LongPollTimeoutMs,
+		db:        sdb,
+		baseURL:   strings.TrimRight(config.RemoteUrl, "/"),
+		authToken: strings.TrimSpace(config.AuthToken),
 		client: &http.Client{
+			// No global timeout to allow long-poll; rely on request context.
 			Transport: &http.Transport{
 				Proxy:               http.ProxyFromEnvironment,
-				DisableCompression:  false,
-				MaxIdleConns:        100,
-				MaxIdleConnsPerHost: 10,
+				MaxIdleConns:        32,
+				MaxIdleConnsPerHost: 32,
 				IdleConnTimeout:     90 * time.Second,
+				DisableCompression:  false,
 			},
-			// No default timeout; contexts control deadlines.
-			Timeout: 0,
 		},
 	}
 
-	// Create or open/prepare the synced database (single entry point).
-	op, err := turso_sync_database_create(d.sync)
+	// Create/open database with bootstrap logic as needed.
+	op, err := turso_sync_database_create(d.db)
 	if err != nil {
-		turso_sync_database_deinit(d.sync)
 		return nil, err
 	}
-	if err := d.runOpNone(ctx, op); err != nil {
-		turso_sync_database_deinit(d.sync)
+	_, _, err = d.driveOpUntilDone(ctx, op)
+	if err != nil {
 		return nil, err
 	}
 	return d, nil
 }
 
+// create turso db local connnection
+
 // internal connector to integrate with database/sql pool
 type tursoSyncConnector struct{ db *TursoSyncDb }
 
 func (c *tursoSyncConnector) Connect(ctx context.Context) (driver.Conn, error) {
-	// Get a turso connection from sync database
-	op, err := turso_sync_database_connect(c.db.sync)
+	c.db.mu.Lock()
+	defer c.db.mu.Unlock()
+
+	op, err := turso_sync_database_connect(c.db.db)
 	if err != nil {
 		return nil, err
 	}
-	conn, err := c.db.runOpConn(ctx, op)
+	kind, opFinal, err := c.db.driveOpUntilDone(ctx, op)
 	if err != nil {
 		return nil, err
 	}
-	// Wrap connection using existing driver connection type; wire extra IO to sync IO loop
-	extra := func() error {
-		// Drive IO queue once and return
-		return c.db.driveIo(context.Background())
+	defer turso_sync_operation_deinit(opFinal)
+	if kind != TURSO_ASYNC_RESULT_CONNECTION {
+		return nil, errors.New("turso: unexpected result kind when connecting")
 	}
+	conn, err := turso_sync_operation_result_extract_connection(opFinal)
+	if err != nil {
+		return nil, err
+	}
+	// Integrate with the base driver; provide extra IO hook to process one IO item per iteration.
+	extra := func() error { return c.db.processOneIo() }
 	return NewConnection(conn, extra), nil
 }
 
 func (c *tursoSyncConnector) Driver() driver.Driver { return &tursoDbDriver{} }
 
-// Connect returns a sql.DB pool bound to the local synced database.
+// create tursodb connection using NewConnection(...) from driver_db.go and tursoSyncConnector helper
 func (d *TursoSyncDb) Connect(ctx context.Context) (*sql.DB, error) {
-	// database/sql uses Connector for custom open logic
-	db := sql.OpenDB(&tursoSyncConnector{db: d})
-	// Optionally ping here to ensure it works within ctx
-	if ctx != nil {
-		if err := db.PingContext(ctx); err != nil {
-			_ = db.Close()
-			return nil, err
-		}
-	}
-	return db, nil
+	return sql.OpenDB(&tursoSyncConnector{db: d}), nil
 }
 
-// Pull fresh data from the remote.
-// Pull DOES NOT send any local changes to the remote and instead "rebase" them on top of new changes from remote.
-// Returns true if new changes were applied, otherwise false.
+// implement EXTRA sync methods
+
+// Pull fresh data from the remote
+// Pull DO NOT sent any local changes to the remote and instead "rebase" them on top of new changes from remote
+// Return true, if new changes were applied locally - otherwise return false
 func (d *TursoSyncDb) Pull(ctx context.Context) (bool, error) {
-	// Wait for remote changes (long-poll).
-	waitOp, err := turso_sync_database_wait_changes(d.sync)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	// 1) Wait for remote changes
+	waitOp, err := turso_sync_database_wait_changes(d.db)
 	if err != nil {
 		return false, err
 	}
-	changes, err := d.runOpChanges(ctx, waitOp)
+	kind, waitFinal, err := d.driveOpUntilDone(ctx, waitOp)
 	if err != nil {
 		return false, err
 	}
+	defer turso_sync_operation_deinit(waitFinal)
+	if kind != TURSO_ASYNC_RESULT_CHANGES {
+		return false, errors.New("turso: unexpected result kind for wait_changes")
+	}
+	changes, err := turso_sync_operation_result_extract_changes(waitFinal)
+	if err != nil {
+		return false, err
+	}
+	// No changes available
 	if changes == nil {
-		// No changes arrived (e.g. long-poll timeout).
 		return false, nil
 	}
-	// Apply fetched changes locally.
-	applyOp, err := turso_sync_database_apply_changes(d.sync, changes)
+
+	// 2) Apply fetched changes locally
+	applyOp, err := turso_sync_database_apply_changes(d.db, changes)
 	if err != nil {
-		// cleanup extracted changes
-		turso_sync_changes_deinit(changes)
+		// changes ownership is transferred to apply_changes even in case of error
 		return false, err
 	}
-	err = d.runOpNone(ctx, applyOp)
-	// Always deinit changes after apply operation finishes
-	// turso_sync_changes_deinit(changes)
+	_, applyFinal, err := d.driveOpUntilDone(ctx, applyOp)
 	if err != nil {
 		return false, err
 	}
+	turso_sync_operation_deinit(applyFinal)
 	return true, nil
 }
 
-// Push local changes to the remote.
-// Push DOES NOT fetch any remote changes.
+// Push local changes to the remote
+// Push DO NOT fetch any remote changes
 func (d *TursoSyncDb) Push(ctx context.Context) error {
-	op, err := turso_sync_database_push_changes(d.sync)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	op, err := turso_sync_database_push_changes(d.db)
 	if err != nil {
 		return err
 	}
-	return d.runOpNone(ctx, op)
+	_, opFinal, err := d.driveOpUntilDone(ctx, op)
+	if err != nil {
+		return err
+	}
+	turso_sync_operation_deinit(opFinal)
+	return nil
 }
 
-// Stats returns metrics for the synced database.
+// Get stats for the synced database
 func (d *TursoSyncDb) Stats(ctx context.Context) (TursoSyncDbStats, error) {
-	op, err := turso_sync_database_stats(d.sync)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	op, err := turso_sync_database_stats(d.db)
 	if err != nil {
 		return TursoSyncDbStats{}, err
 	}
-	stats, err := d.runOpStats(ctx, op)
+	kind, opFinal, err := d.driveOpUntilDone(ctx, op)
+	if err != nil {
+		return TursoSyncDbStats{}, err
+	}
+	defer turso_sync_operation_deinit(opFinal)
+	if kind != TURSO_ASYNC_RESULT_STATS {
+		return TursoSyncDbStats{}, errors.New("turso: unexpected result kind for stats")
+	}
+	stats, err := turso_sync_operation_result_extract_stats(opFinal)
 	if err != nil {
 		return TursoSyncDbStats{}, err
 	}
 	return TursoSyncDbStats{
-		CDcOperations:        stats.CDcOperations,
+		CdcOperations:        stats.CDcOperations,
 		MainWalSize:          stats.MainWalSize,
 		RevertWalSize:        stats.RevertWalSize,
 		LastPullUnixTime:     stats.LastPullUnixTime,
@@ -244,335 +283,245 @@ func (d *TursoSyncDb) Stats(ctx context.Context) (TursoSyncDbStats, error) {
 	}, nil
 }
 
-// Checkpoint performs local WAL checkpoint of the database.
+// Checkpoint local WAL of the database
 func (d *TursoSyncDb) Checkpoint(ctx context.Context) error {
-	op, err := turso_sync_database_checkpoint(d.sync)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	op, err := turso_sync_database_checkpoint(d.db)
 	if err != nil {
 		return err
 	}
-	return d.runOpNone(ctx, op)
+	_, opFinal, err := d.driveOpUntilDone(ctx, op)
+	if err != nil {
+		return err
+	}
+	turso_sync_operation_deinit(opFinal)
+	return nil
 }
 
-// -------- Internal helpers --------
+// driveOpUntilDone resumes an async operation until completion, serving IO requests as needed.
+// It returns the final result kind and the operation handle that must be deinitialized by the caller.
+func (d *TursoSyncDb) driveOpUntilDone(ctx context.Context, op TursoSyncOperation) (TursoSyncOperationResultType, TursoSyncOperation, error) {
+	for {
+		if ctx != nil && ctx.Err() != nil {
+			return TURSO_ASYNC_RESULT_NONE, op, ctx.Err()
+		}
+		code, err := turso_sync_operation_resume(op)
+		if err != nil {
+			return TURSO_ASYNC_RESULT_NONE, op, err
+		}
+		switch code {
+		case TURSO_DONE:
+			return turso_sync_operation_result_kind(op), op, nil
+		case TURSO_IO:
+			if err := d.processIoQueue(ctx); err != nil {
+				return TURSO_ASYNC_RESULT_NONE, op, err
+			}
+			continue
+		case TURSO_OK:
+			// Just continue
+			continue
+		default:
+			return TURSO_ASYNC_RESULT_NONE, op, statusToError(code, "")
+		}
+	}
+}
 
-func (d *TursoSyncDb) runOpNone(ctx context.Context, op TursoSyncOperation) error {
-	defer turso_sync_operation_deinit(op)
+// processOneIo handles at most one IO item (used as extra IO iteration inside SQL driver).
+func (d *TursoSyncDb) processOneIo() error {
+	item, err := turso_sync_database_io_take_item(d.db)
+	if err != nil {
+		return err
+	}
+	if item == nil {
+		// Still run callbacks to allow engine to progress timers/state.
+		return turso_sync_database_io_step_callbacks(d.db)
+	}
+	_ = d.handleIoItem(context.Background(), item)
+	turso_sync_database_io_item_deinit(item)
+	return turso_sync_database_io_step_callbacks(d.db)
+}
+
+// processIoQueue drains IO queue until it's empty.
+func (d *TursoSyncDb) processIoQueue(ctx context.Context) error {
 	for {
 		if ctx != nil && ctx.Err() != nil {
 			return ctx.Err()
 		}
-		st, err := turso_sync_operation_resume(op)
-		if err != nil {
-			return err
-		}
-		switch st {
-		case TURSO_DONE:
-			return nil
-		case TURSO_IO:
-			if err := d.driveIo(ctx); err != nil {
-				return err
-			}
-			continue
-		case TURSO_OK:
-			continue
-		default:
-			return statusToError(st, "")
-		}
-	}
-}
-
-func (d *TursoSyncDb) runOpConn(ctx context.Context, op TursoSyncOperation) (TursoConnection, error) {
-	defer turso_sync_operation_deinit(op)
-	for {
-		if ctx != nil && ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-		st, err := turso_sync_operation_resume(op)
-		if err != nil {
-			return nil, err
-		}
-		switch st {
-		case TURSO_DONE:
-			switch turso_sync_operation_result_kind(op) {
-			case TURSO_ASYNC_RESULT_CONNECTION:
-				return turso_sync_operation_result_extract_connection(op)
-			default:
-				return nil, errors.New("turso: unexpected operation result kind for connect")
-			}
-		case TURSO_IO:
-			if err := d.driveIo(ctx); err != nil {
-				return nil, err
-			}
-		case TURSO_OK:
-			continue
-		default:
-			return nil, statusToError(st, "")
-		}
-	}
-}
-
-func (d *TursoSyncDb) runOpStats(ctx context.Context, op TursoSyncOperation) (TursoSyncStats, error) {
-	defer turso_sync_operation_deinit(op)
-	for {
-		if ctx != nil && ctx.Err() != nil {
-			return TursoSyncStats{}, ctx.Err()
-		}
-		st, err := turso_sync_operation_resume(op)
-		if err != nil {
-			return TursoSyncStats{}, err
-		}
-		switch st {
-		case TURSO_DONE:
-			switch turso_sync_operation_result_kind(op) {
-			case TURSO_ASYNC_RESULT_STATS:
-				return turso_sync_operation_result_extract_stats(op)
-			default:
-				return TursoSyncStats{}, errors.New("turso: unexpected operation result kind for stats")
-			}
-		case TURSO_IO:
-			if err := d.driveIo(ctx); err != nil {
-				return TursoSyncStats{}, err
-			}
-		case TURSO_OK:
-			continue
-		default:
-			return TursoSyncStats{}, statusToError(st, "")
-		}
-	}
-}
-
-func (d *TursoSyncDb) runOpChanges(ctx context.Context, op TursoSyncOperation) (TursoSyncChanges, error) {
-	defer turso_sync_operation_deinit(op)
-	for {
-		if ctx != nil && ctx.Err() != nil {
-			return nil, ctx.Err()
-		}
-		st, err := turso_sync_operation_resume(op)
-		if err != nil {
-			return nil, err
-		}
-		switch st {
-		case TURSO_DONE:
-			switch turso_sync_operation_result_kind(op) {
-			case TURSO_ASYNC_RESULT_CHANGES:
-				return turso_sync_operation_result_extract_changes(op)
-			default:
-				return nil, errors.New("turso: unexpected operation result kind for changes")
-			}
-		case TURSO_IO:
-			if err := d.driveIo(ctx); err != nil {
-				return nil, err
-			}
-		case TURSO_OK:
-			continue
-		default:
-			return nil, statusToError(st, "")
-		}
-	}
-}
-
-// driveIo drains sync engine IO queue, executing items and streaming data chunk-by-chunk.
-func (d *TursoSyncDb) driveIo(ctx context.Context) error {
-	for {
-		item, err := turso_sync_database_io_take_item(d.sync)
+		item, err := turso_sync_database_io_take_item(d.db)
 		if err != nil {
 			return err
 		}
 		if item == nil {
 			break
 		}
-		// Handle item
-		if err := d.handleIoItem(ctx, item); err != nil {
-			// best effort cleanup
-			turso_sync_database_io_item_deinit(item)
-			return err
-		}
+		_ = d.handleIoItem(ctx, item)
 		turso_sync_database_io_item_deinit(item)
 	}
-	// Run extra callbacks after executing IO
-	return turso_sync_database_io_step_callbacks(d.sync)
+	return turso_sync_database_io_step_callbacks(d.db)
 }
 
+// handleIoItem performs execution of a single IO item.
+// It streams data in chunks for HTTP and file operations to avoid loading whole payloads in memory.
 func (d *TursoSyncDb) handleIoItem(ctx context.Context, item TursoSyncIoItem) error {
 	switch turso_sync_database_io_request_kind(item) {
 	case TURSO_SYNC_IO_HTTP:
-		return d.handleHttpIo(ctx, item)
+		req, err := turso_sync_database_io_request_http(item)
+		if err != nil {
+			_ = turso_sync_database_io_poison(item, err.Error())
+			_ = turso_sync_database_io_done(item)
+			return err
+		}
+		// Build URL
+		url := joinURL(d.baseURL, req.Path)
+
+		// Build headers
+		hdr := make(http.Header, req.Headers+2)
+		for i := 0; i < req.Headers; i++ {
+			h, err := turso_sync_database_io_request_http_header(item, i)
+			if err != nil {
+				_ = turso_sync_database_io_poison(item, err.Error())
+				_ = turso_sync_database_io_done(item)
+				return err
+			}
+			if h.Key != "" {
+				hdr.Add(h.Key, h.Value)
+			}
+		}
+		if d.authToken != "" {
+			hdr.Set("Authorization", "Bearer "+d.authToken)
+		}
+		// Propagate sensible defaults
+		if hdr.Get("User-Agent") == "" {
+			hdr.Set("User-Agent", "turso-sync-go")
+		}
+
+		// Prepare request body reader
+		var body io.Reader
+		if len(req.Body) > 0 {
+			body = bytes.NewReader(req.Body)
+		}
+		httpReq, err := http.NewRequestWithContext(ctx, req.Method, url, body)
+		if err != nil {
+			_ = turso_sync_database_io_poison(item, err.Error())
+			_ = turso_sync_database_io_done(item)
+			return err
+		}
+		httpReq.Header = hdr
+
+		resp, err := d.client.Do(httpReq)
+		if err != nil {
+			_ = turso_sync_database_io_poison(item, err.Error())
+			_ = turso_sync_database_io_done(item)
+			return err
+		}
+		defer resp.Body.Close()
+
+		// Send status
+		_ = turso_sync_database_io_status(item, resp.StatusCode)
+
+		// Stream body
+		buf := make([]byte, 64*1024)
+		for {
+			if ctx != nil && ctx.Err() != nil {
+				_ = turso_sync_database_io_poison(item, ctx.Err().Error())
+				break
+			}
+			n, rerr := resp.Body.Read(buf)
+			if n > 0 {
+				// push the exact slice view; underlying call copies bytes synchronously
+				_ = turso_sync_database_io_push_buffer(item, buf[:n])
+			}
+			if rerr == io.EOF {
+				break
+			}
+			if rerr != nil {
+				_ = turso_sync_database_io_poison(item, rerr.Error())
+				break
+			}
+		}
+		_ = turso_sync_database_io_done(item)
+		return nil
+
 	case TURSO_SYNC_IO_FULL_READ:
-		return d.handleFullReadIo(ctx, item)
+		r, err := turso_sync_database_io_request_full_read(item)
+		if err != nil {
+			_ = turso_sync_database_io_poison(item, err.Error())
+			_ = turso_sync_database_io_done(item)
+			return err
+		}
+		f, ferr := os.Open(r.Path)
+		if ferr != nil {
+			_ = turso_sync_database_io_poison(item, ferr.Error())
+			_ = turso_sync_database_io_done(item)
+			return ferr
+		}
+		defer f.Close()
+		buf := make([]byte, 64*1024)
+		for {
+			if ctx != nil && ctx.Err() != nil {
+				_ = turso_sync_database_io_poison(item, ctx.Err().Error())
+				break
+			}
+			n, rerr := f.Read(buf)
+			if n > 0 {
+				_ = turso_sync_database_io_push_buffer(item, buf[:n])
+			}
+			if rerr == io.EOF {
+				break
+			}
+			if rerr != nil {
+				_ = turso_sync_database_io_poison(item, rerr.Error())
+				break
+			}
+		}
+		_ = turso_sync_database_io_done(item)
+		return nil
+
 	case TURSO_SYNC_IO_FULL_WRITE:
-		return d.handleFullWriteIo(ctx, item)
-	case TURSO_SYNC_IO_NONE:
-		// Nothing to do
-		return turso_sync_database_io_done(item)
+		r, err := turso_sync_database_io_request_full_write(item)
+		if err != nil {
+			_ = turso_sync_database_io_poison(item, err.Error())
+			_ = turso_sync_database_io_done(item)
+			return err
+		}
+		// Ensure directory exists
+		if dir := filepath.Dir(r.Path); dir != "" && dir != "." {
+			_ = os.MkdirAll(dir, 0o755)
+		}
+		// Write file atomically-ish by writing to a temp and renaming
+		tmp := r.Path + ".tmp"
+		if werr := os.WriteFile(tmp, r.Content, 0o644); werr != nil {
+			_ = turso_sync_database_io_poison(item, werr.Error())
+			_ = turso_sync_database_io_done(item)
+			return werr
+		}
+		if rerr := os.Rename(tmp, r.Path); rerr != nil {
+			_ = turso_sync_database_io_poison(item, rerr.Error())
+			_ = turso_sync_database_io_done(item)
+			return rerr
+		}
+		_ = turso_sync_database_io_done(item)
+		return nil
+
 	default:
-		_ = turso_sync_database_io_poison(item, "unknown IO request")
-		return errors.New("turso: unknown IO request")
+		// Unknown or none; mark done
+		_ = turso_sync_database_io_done(item)
+		return nil
 	}
 }
 
-func (d *TursoSyncDb) handleHttpIo(ctx context.Context, item TursoSyncIoItem) error {
-	req, err := turso_sync_database_io_request_http(item)
-	if err != nil {
-		_ = turso_sync_database_io_poison(item, err.Error())
-		return err
+func joinURL(base, p string) string {
+	if p == "" {
+		return base
 	}
-	fullURL := d.makeURL(req.Path)
-	var body io.Reader
-	if len(req.Body) > 0 {
-		body = strings.NewReader(bytesToStringZeroCopy(req.Body))
-		// Note: strings.NewReader avoids extra buffer copy; req.Body memory is owned by Go wrapper.
+	if strings.HasPrefix(p, "http://") || strings.HasPrefix(p, "https://") {
+		return p
 	}
-	httpReq, err := http.NewRequestWithContext(ctx, req.Method, fullURL, body)
-	if err != nil {
-		_ = turso_sync_database_io_poison(item, err.Error())
-		return err
+	b := strings.TrimRight(base, "/")
+	if !strings.HasPrefix(p, "/") {
+		p = "/" + p
 	}
-	// Add Authorization header first.
-	if d.authToken != "" {
-		httpReq.Header.Set("Authorization", "Bearer "+d.authToken)
-	}
-	// Set defaults
-	if len(req.Body) > 0 && httpReq.Header.Get("Content-Type") == "" {
-		httpReq.Header.Set("Content-Type", "application/octet-stream")
-	}
-	// Add headers provided by the engine (preserve order and allow duplicates)
-	for i := 0; i < req.Headers; i++ {
-		h, herr := turso_sync_database_io_request_http_header(item, i)
-		if herr != nil {
-			_ = turso_sync_database_io_poison(item, herr.Error())
-			return herr
-		}
-		// Engine-provided headers override ours if the same key
-		httpReq.Header.Add(h.Key, h.Value)
-	}
-
-	resp, err := d.client.Do(httpReq)
-	if err != nil {
-		_ = turso_sync_database_io_poison(item, err.Error())
-		return err
-	}
-	defer resp.Body.Close()
-
-	// Send status as soon as headers arrive.
-	if err := turso_sync_database_io_status(item, resp.StatusCode); err != nil {
-		_ = turso_sync_database_io_poison(item, err.Error())
-		return err
-	}
-
-	// Stream the body in chunks; run callbacks in-between to reduce memory footprint.
-	buf := make([]byte, 64*1024)
-	for {
-		if ctx != nil && ctx.Err() != nil {
-			_ = turso_sync_database_io_poison(item, ctx.Err().Error())
-			return ctx.Err()
-		}
-		n, rerr := resp.Body.Read(buf)
-		if n > 0 {
-			if err := turso_sync_database_io_push_buffer(item, buf[:n]); err != nil {
-				_ = turso_sync_database_io_poison(item, err.Error())
-				return err
-			}
-			// Let engine process part of the buffer if necessary.
-			if err := turso_sync_database_io_step_callbacks(d.sync); err != nil {
-				_ = turso_sync_database_io_poison(item, err.Error())
-				return err
-			}
-		}
-		if rerr != nil {
-			if rerr == io.EOF {
-				break
-			}
-			_ = turso_sync_database_io_poison(item, rerr.Error())
-			return rerr
-		}
-	}
-	return turso_sync_database_io_done(item)
-}
-
-func (d *TursoSyncDb) handleFullReadIo(ctx context.Context, item TursoSyncIoItem) error {
-	req, err := turso_sync_database_io_request_full_read(item)
-	if err != nil {
-		_ = turso_sync_database_io_poison(item, err.Error())
-		return err
-	}
-	// Read file and stream in chunks.
-	f, err := os.Open(req.Path)
-	if err != nil {
-		_ = turso_sync_database_io_poison(item, err.Error())
-		return err
-	}
-	defer f.Close()
-	buf := make([]byte, 64*1024)
-	for {
-		if ctx != nil && ctx.Err() != nil {
-			_ = turso_sync_database_io_poison(item, ctx.Err().Error())
-			return ctx.Err()
-		}
-		n, rerr := f.Read(buf)
-		if n > 0 {
-			if err := turso_sync_database_io_push_buffer(item, buf[:n]); err != nil {
-				_ = turso_sync_database_io_poison(item, err.Error())
-				return err
-			}
-			if err := turso_sync_database_io_step_callbacks(d.sync); err != nil {
-				_ = turso_sync_database_io_poison(item, err.Error())
-				return err
-			}
-		}
-		if rerr != nil {
-			if rerr == io.EOF {
-				break
-			}
-			_ = turso_sync_database_io_poison(item, rerr.Error())
-			return rerr
-		}
-	}
-	return turso_sync_database_io_done(item)
-}
-
-func (d *TursoSyncDb) handleFullWriteIo(_ context.Context, item TursoSyncIoItem) error {
-	req, err := turso_sync_database_io_request_full_write(item)
-	if err != nil {
-		_ = turso_sync_database_io_poison(item, err.Error())
-		return err
-	}
-	// Ensure directory exists.
-	if err := os.MkdirAll(filepath.Dir(req.Path), 0o755); err != nil {
-		_ = turso_sync_database_io_poison(item, err.Error())
-		return err
-	}
-	// Write atomically via temp file + rename.
-	tmp := req.Path + ".tmp"
-	if err := os.WriteFile(tmp, req.Content, 0o644); err != nil {
-		_ = turso_sync_database_io_poison(item, err.Error())
-		return err
-	}
-	if err := os.Rename(tmp, req.Path); err != nil {
-		_ = turso_sync_database_io_poison(item, err.Error())
-		return err
-	}
-	return turso_sync_database_io_done(item)
-}
-
-func (d *TursoSyncDb) makeURL(path string) string {
-	// If path is absolute URL already, return it as-is
-	if u, err := url.Parse(path); err == nil && u.Scheme != "" && u.Host != "" {
-		return path
-	}
-	base, _ := url.Parse(d.remoteURL)
-	if base == nil {
-		// Fallback to simple concat
-		return strings.TrimRight(d.remoteURL, "/") + "/" + strings.TrimLeft(path, "/")
-	}
-	rel := &url.URL{Path: "/" + strings.TrimLeft(path, "/")}
-	return base.ResolveReference(rel).String()
-}
-
-// bytesToStringZeroCopy converts a byte slice to string without additional allocation for the duration of the call.
-// It is safe here because http.NewRequestWithContext will copy or read it during the round-trip; we don't store it.
-func bytesToStringZeroCopy(b []byte) string {
-	if len(b) == 0 {
-		return ""
-	}
-	return string(b)
+	return b + p
 }

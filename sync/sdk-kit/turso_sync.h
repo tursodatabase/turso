@@ -227,6 +227,9 @@ turso_status_code_t turso_sync_database_wait_changes(
  * SAFETY: caller must guarantee that no other methods are executing concurrently (push/wait/checkpoint)
  * otherwise, operation will return MISUSE error
  *
+ * the method CONSUMES turso_sync_changes_t instance and caller no longer owns it after the call
+ * So, the changes MUST NOT be explicitly deallocated after the method call (either successful or not)
+ *
  * AsyncOperation returns None
  */
 turso_status_code_t turso_sync_database_apply_changes(
