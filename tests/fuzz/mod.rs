@@ -51,10 +51,13 @@ mod fuzz_tests {
         }
     }
 
-    // TODO: mvcc fuzz failure
     // INTEGER PRIMARY KEY is a rowid alias, so an index is not created
-    #[turso_macros::test(init_sql = "CREATE TABLE t (x INTEGER PRIMARY KEY autoincrement)")]
+    #[turso_macros::test(
+        mvcc,
+        init_sql = "CREATE TABLE t (x INTEGER PRIMARY KEY autoincrement)"
+    )]
     pub fn rowid_seek_fuzz(db: TempDatabase) {
+        let _ = tracing_subscriber::fmt::try_init();
         let sqlite_conn = rusqlite::Connection::open(db.path.clone()).unwrap();
 
         let (mut rng, _seed) = rng_from_time_or_env();
@@ -91,7 +94,7 @@ mod fuzz_tests {
         tracing::info!("rowid_seek_fuzz seed: {}", seed);
 
         for iteration in 0..2 {
-            tracing::trace!("rowid_seek_fuzz iteration: {}", iteration);
+            tracing::info!("rowid_seek_fuzz iteration: {}", iteration);
 
             for comp in COMPARISONS.iter() {
                 for order_by in ORDER_BY.iter() {
@@ -105,7 +108,7 @@ mod fuzz_tests {
                             order_by.unwrap_or("")
                         );
 
-                        log::trace!("query: {query}");
+                        tracing::info!("query: {query}");
                         let limbo_result = limbo_exec_rows(&db, &limbo_conn, &query);
                         let sqlite_result = sqlite_exec_rows(&sqlite_conn, &query);
                         assert_eq!(
@@ -166,8 +169,7 @@ mod fuzz_tests {
         values
     }
 
-    // TODO: mvcc indexes
-    #[turso_macros::test(init_sql = "CREATE TABLE t (x PRIMARY KEY)")]
+    #[turso_macros::test(mvcc, init_sql = "CREATE TABLE t (x PRIMARY KEY)")]
     pub fn index_scan_fuzz(db: TempDatabase) {
         let sqlite_conn = rusqlite::Connection::open(db.path.clone()).unwrap();
 
@@ -212,8 +214,7 @@ mod fuzz_tests {
         }
     }
 
-    // TODO: mvcc indexes
-    #[turso_macros::test()]
+    #[turso_macros::test(mvcc)]
     /// A test for verifying that index seek+scan works correctly for compound keys
     /// on indexes with various column orderings.
     pub fn index_scan_compound_key_fuzz(db: TempDatabase) {

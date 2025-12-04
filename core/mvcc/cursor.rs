@@ -70,11 +70,30 @@ enum PrevState {
 }
 
 #[derive(Debug, Clone)]
+enum SeekBtreeState {
+    /// Seeking in btree (MVCC seek already done)
+    SeekBtree,
+    /// Advance to next key in btree (if we got [SeekResult::TryAdvance], or the current row is shadowed by MVCC)
+    AdvanceBTree,
+    /// Check if current row is visible (not shadowed by MVCC)
+    CheckRow,
+}
+
+#[derive(Debug, Clone)]
+enum SeekState {
+    /// Seeking in btree (MVCC seek already done)
+    SeekBtree(SeekBtreeState),
+    /// Pick winner and finalize
+    PickWinner,
+}
+
+#[derive(Debug, Clone)]
 enum MvccLazyCursorState {
     Next(NextState),
     Prev(PrevState),
     Rewind(RewindState),
     Exists(ExistsState),
+    Seek(SeekState, IterationDirection),
 }
 
 /// We read rows from MVCC index or BTree in a dual-cursor approach.
@@ -404,6 +423,15 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
 
     /// Advance btree cursor forward and set btree peek to the first valid row key (skipping rows shadowed by MVCC)
     fn advance_btree_forward(&mut self) -> Result<IOResult<()>> {
+        self._advance_btree_forward(true)
+    }
+
+    /// Advance btree cursor forward from current position (cursor already positioned by seek)
+    fn advance_btree_forward_from_current(&mut self) -> Result<IOResult<()>> {
+        self._advance_btree_forward(false)
+    }
+
+    fn _advance_btree_forward(&mut self, initialize: bool) -> Result<IOResult<()>> {
         loop {
             let mut state = self.btree_advance_state.borrow_mut();
             match state.as_mut() {
@@ -414,9 +442,8 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
                         *state = None;
                         return Ok(IOResult::Done(()));
                     }
-                    let peek = self.dual_peek.borrow();
-                    // If the btree is uninitialized, do the equivalent of rewind() to find the first valid row
-                    if peek.btree_uninitialized() {
+                    // If the btree is uninitialized AND we should initialize, do the equivalent of rewind() to find the first valid row
+                    if initialize && self.dual_peek.borrow().btree_uninitialized() {
                         return_if_io!(self.btree_cursor.rewind());
                         *state = Some(AdvanceBtreeState::RewindCheckBtreeKey);
                     } else {
@@ -477,6 +504,15 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
 
     /// Advance btree cursor backward and set btree peek to the first valid row key (skipping rows shadowed by MVCC)
     fn advance_btree_backward(&mut self) -> Result<IOResult<()>> {
+        self._advance_btree_backward(true)
+    }
+
+    /// Advance btree cursor backward from current position (cursor already positioned by seek)
+    fn advance_btree_backward_from_current(&mut self) -> Result<IOResult<()>> {
+        self._advance_btree_backward(false)
+    }
+
+    fn _advance_btree_backward(&mut self, initialize: bool) -> Result<IOResult<()>> {
         loop {
             let mut state = self.btree_advance_state.borrow_mut();
             match state.as_mut() {
@@ -488,8 +524,9 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
                         return Ok(IOResult::Done(()));
                     }
                     let peek = self.dual_peek.borrow();
-                    // If the btree is uninitialized, do the equivalent of last() to find the last valid row
-                    if peek.btree_uninitialized() {
+                    // If the btree is uninitialized AND we should initialize, do the equivalent of last() to find the last valid row
+                    if initialize && peek.btree_uninitialized() {
+                        drop(peek);
                         return_if_io!(self.btree_cursor.last());
                         *state = Some(AdvanceBtreeState::RewindCheckBtreeKey);
                     } else {
@@ -600,6 +637,96 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
             mvcc_peek: CursorPeek::Uninitialized,
             btree_peek: CursorPeek::Uninitialized,
         });
+    }
+
+    /// Seek btree cursor and set btree_peek to the result.
+    /// Skips rows that are shadowed by MVCC.
+    /// Returns IOResult indicating if we need to yield for IO or are done.
+    fn seek_btree_and_set_peek(
+        &mut self,
+        seek_key: SeekKey<'_>,
+        op: SeekOp,
+    ) -> Result<IOResult<()>> {
+        // Fast path: btree not allocated
+        if !self.is_btree_allocated() {
+            let mut peek = self.dual_peek.borrow_mut();
+            peek.btree_peek = CursorPeek::Exhausted;
+            self.state.replace(None);
+            return Ok(IOResult::Done(()));
+        }
+
+        loop {
+            let Some(MvccLazyCursorState::Seek(SeekState::SeekBtree(btree_seek_state), direction)) =
+                self.state.borrow().clone()
+            else {
+                panic!(
+                    "Invalid btree seek state in seek_btree_and_set_peek: {:?}",
+                    self.state.borrow()
+                );
+            };
+            match btree_seek_state {
+                SeekBtreeState::SeekBtree => {
+                    let seek_result = return_if_io!(self.btree_cursor.seek(seek_key.clone(), op));
+
+                    match seek_result {
+                        SeekResult::NotFound => {
+                            let mut peek = self.dual_peek.borrow_mut();
+                            peek.btree_peek = CursorPeek::Exhausted;
+                            return Ok(IOResult::Done(()));
+                        }
+                        SeekResult::TryAdvance => {
+                            // Need to advance to find actual matching entry
+                            self.state.replace(Some(MvccLazyCursorState::Seek(
+                                SeekState::SeekBtree(SeekBtreeState::AdvanceBTree),
+                                direction,
+                            )));
+                        }
+                        SeekResult::Found => {
+                            self.state.replace(Some(MvccLazyCursorState::Seek(
+                                SeekState::SeekBtree(SeekBtreeState::CheckRow),
+                                direction,
+                            )));
+                        }
+                    }
+                }
+                SeekBtreeState::AdvanceBTree => {
+                    return_if_io!(match direction {
+                        IterationDirection::Forwards => {
+                            self.advance_btree_forward_from_current()
+                        }
+                        IterationDirection::Backwards => {
+                            self.advance_btree_backward_from_current()
+                        }
+                    });
+                    self.state.replace(Some(MvccLazyCursorState::Seek(
+                        SeekState::SeekBtree(SeekBtreeState::CheckRow),
+                        direction,
+                    )));
+                }
+                SeekBtreeState::CheckRow => {
+                    let key = self.get_btree_current_key()?;
+                    match key {
+                        Some(k) if self.query_btree_version_is_valid(&k) => {
+                            let mut peek = self.dual_peek.borrow_mut();
+                            peek.btree_peek = CursorPeek::Row(k);
+                            return Ok(IOResult::Done(()));
+                        }
+                        Some(_) => {
+                            // shadowed by MVCC, continue to next
+                            self.state.replace(Some(MvccLazyCursorState::Seek(
+                                SeekState::SeekBtree(SeekBtreeState::AdvanceBTree),
+                                direction,
+                            )));
+                        }
+                        None => {
+                            let mut peek = self.dual_peek.borrow_mut();
+                            peek.btree_peek = CursorPeek::Exhausted;
+                            return Ok(IOResult::Done(()));
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Initialize MVCC iterator for forward iteration (used when next() is called without rewind())
@@ -932,113 +1059,157 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
         // ge -> lower_bound bound included, we want first row equal to row_id or first row after row_id
         // lt -> upper_bound bound excluded, we want last row before row_id
         // le -> upper_bound bound included, we want last row equal to row_id or first row before row_id
-        match seek_key {
-            SeekKey::TableRowId(row_id) => {
-                let rowid = RowID {
-                    table_id: self.table_id,
-                    row_id: RowKey::Int(row_id),
-                };
-                let inclusive = match op {
-                    SeekOp::GT => false,
-                    SeekOp::GE { eq_only: _ } => true,
-                    SeekOp::LT => false,
-                    SeekOp::LE { eq_only: _ } => true,
-                };
-                self.invalidate_record();
-                let found_rowid = self.db.seek_rowid(
-                    rowid.clone(),
-                    inclusive,
-                    op.iteration_direction(),
-                    self.tx_id,
-                    &mut self.table_iterator,
-                );
-                if let Some(found_rowid) = found_rowid {
-                    self.current_pos.replace(CursorPosition::Loaded {
-                        row_id: found_rowid.clone(),
-                        in_btree: false,
-                    });
-                    if op.eq_only() {
-                        if found_rowid.row_id == rowid.row_id {
-                            Ok(IOResult::Done(SeekResult::Found))
-                        } else {
-                            Ok(IOResult::Done(SeekResult::NotFound))
+
+        loop {
+            let state = self.state.borrow().clone();
+            match state {
+                None => {
+                    // Initial state: Reset and do MVCC seek
+                    let _ = self.table_iterator.take();
+                    let _ = self.index_iterator.take();
+                    self.reset_dual_peek();
+                    self.invalidate_record();
+
+                    let direction = op.iteration_direction();
+                    let inclusive = matches!(op, SeekOp::GE { .. } | SeekOp::LE { .. });
+
+                    match &seek_key {
+                        SeekKey::TableRowId(row_id) => {
+                            let rowid = RowID {
+                                table_id: self.table_id,
+                                row_id: RowKey::Int(*row_id),
+                            };
+
+                            // Seek in MVCC (synchronous)
+                            let mvcc_rowid = self.db.seek_rowid(
+                                rowid.clone(),
+                                inclusive,
+                                direction,
+                                self.tx_id,
+                                &mut self.table_iterator,
+                            );
+
+                            // Set MVCC peek
+                            {
+                                let mut peek = self.dual_peek.borrow_mut();
+                                peek.mvcc_peek = match &mvcc_rowid {
+                                    Some(rid) => CursorPeek::Row(rid.row_id.clone()),
+                                    None => CursorPeek::Exhausted,
+                                };
+                            }
                         }
-                    } else {
-                        Ok(IOResult::Done(SeekResult::Found))
+                        SeekKey::IndexKey(index_key) => {
+                            let index_info = {
+                                let MvccCursorType::Index(index_info) = &self.mv_cursor_type else {
+                                    panic!("SeekKey::IndexKey requires Index cursor type");
+                                };
+                                Arc::new(IndexInfo {
+                                    key_info: index_info.key_info.clone(),
+                                    has_rowid: index_info.has_rowid,
+                                    num_cols: index_key.column_count(),
+                                })
+                            };
+                            let sortable_key =
+                                SortableIndexKey::new_from_record((*index_key).clone(), index_info);
+
+                            // Seek in MVCC (synchronous)
+                            let mvcc_rowid = self.db.seek_index(
+                                self.table_id,
+                                sortable_key.clone(),
+                                inclusive,
+                                direction,
+                                self.tx_id,
+                                &mut self.index_iterator,
+                            );
+
+                            // Set MVCC peek
+                            {
+                                let mut peek = self.dual_peek.borrow_mut();
+                                peek.mvcc_peek = match &mvcc_rowid {
+                                    Some(rid) => CursorPeek::Row(rid.row_id.clone()),
+                                    None => CursorPeek::Exhausted,
+                                };
+                            }
+                        }
                     }
-                } else {
-                    let forwards = matches!(op, SeekOp::GE { eq_only: _ } | SeekOp::GT);
-                    if forwards {
-                        let _ = self.last()?;
-                    } else {
-                        let _ = self.rewind()?;
-                    }
-                    Ok(IOResult::Done(SeekResult::NotFound))
+
+                    // Move to btree seek state
+                    self.state.replace(Some(MvccLazyCursorState::Seek(
+                        SeekState::SeekBtree(SeekBtreeState::SeekBtree),
+                        direction,
+                    )));
                 }
-            }
-            SeekKey::IndexKey(index_key) => {
-                // TODO: we should seek in both btree and mvcc
-                let index_info = {
-                    let MvccCursorType::Index(index_info) = &self.mv_cursor_type else {
-                        panic!("SeekKey::IndexKey requires Index cursor type");
-                    };
-                    Arc::new(IndexInfo {
-                        key_info: index_info.key_info.clone(),
-                        has_rowid: index_info.has_rowid,
-                        num_cols: index_key.column_count(),
-                    })
-                };
-                let key_info = index_info
-                    .key_info
-                    .iter()
-                    .take(index_key.column_count())
-                    .cloned()
-                    .collect::<Vec<_>>();
-                let sortable_key = SortableIndexKey::new_from_record(index_key.clone(), index_info);
-                let inclusive = match op {
-                    SeekOp::GT => false,
-                    SeekOp::GE { eq_only: _ } => true,
-                    SeekOp::LT => false,
-                    SeekOp::LE { eq_only: _ } => true,
-                };
-                let found_rowid = self.db.seek_index(
-                    self.table_id,
-                    sortable_key.clone(),
-                    inclusive,
-                    op.iteration_direction(),
-                    self.tx_id,
-                    &mut self.index_iterator,
-                );
-                if let Some(found_rowid) = found_rowid {
-                    self.current_pos.replace(CursorPosition::Loaded {
-                        row_id: found_rowid.clone(),
-                        in_btree: false,
-                    });
-                    if op.eq_only() {
-                        let RowKey::Record(found_rowid_key) = found_rowid.row_id else {
-                            panic!("Found rowid is not a record");
-                        };
-                        let cmp = compare_immutable(
-                            index_key.get_values(),
-                            found_rowid_key.key.get_values(),
-                            &key_info,
-                        );
-                        if cmp.is_eq() {
-                            Ok(IOResult::Done(SeekResult::Found))
+                Some(MvccLazyCursorState::Seek(SeekState::SeekBtree(_), direction)) => {
+                    return_if_io!(self.seek_btree_and_set_peek(seek_key.clone(), op));
+                    self.state.replace(Some(MvccLazyCursorState::Seek(
+                        SeekState::PickWinner,
+                        direction,
+                    )));
+                }
+                Some(MvccLazyCursorState::Seek(SeekState::PickWinner, direction)) => {
+                    // Pick winner and return result
+                    // Now pick the winner based on direction
+                    let winner = self.dual_peek.borrow().get_next(direction);
+
+                    // Clear seek state
+                    self.state.replace(None);
+
+                    if let Some((winner_key, in_btree)) = winner {
+                        self.current_pos.replace(CursorPosition::Loaded {
+                            row_id: RowID {
+                                table_id: self.table_id,
+                                row_id: winner_key.clone(),
+                            },
+                            in_btree,
+                        });
+
+                        if op.eq_only() {
+                            // Check if the winner matches the seek key
+                            let found = match &seek_key {
+                                SeekKey::TableRowId(row_id) => winner_key == RowKey::Int(*row_id),
+                                SeekKey::IndexKey(index_key) => {
+                                    let RowKey::Record(found_key) = &winner_key else {
+                                        panic!("Found rowid is not a record");
+                                    };
+                                    let MvccCursorType::Index(index_info) = &self.mv_cursor_type
+                                    else {
+                                        panic!("Index cursor expected");
+                                    };
+                                    let key_info: Vec<_> = index_info
+                                        .key_info
+                                        .iter()
+                                        .take(index_key.column_count())
+                                        .cloned()
+                                        .collect();
+                                    let cmp = compare_immutable(
+                                        index_key.get_values(),
+                                        found_key.key.get_values(),
+                                        &key_info,
+                                    );
+                                    cmp.is_eq()
+                                }
+                            };
+                            if found {
+                                return Ok(IOResult::Done(SeekResult::Found));
+                            } else {
+                                return Ok(IOResult::Done(SeekResult::NotFound));
+                            }
                         } else {
-                            Ok(IOResult::Done(SeekResult::NotFound))
+                            return Ok(IOResult::Done(SeekResult::Found));
                         }
                     } else {
-                        Ok(IOResult::Done(SeekResult::Found))
+                        // Nothing found in either cursor
+                        let forwards = matches!(op, SeekOp::GE { .. } | SeekOp::GT);
+                        if forwards {
+                            self.current_pos.replace(CursorPosition::End);
+                        } else {
+                            self.current_pos.replace(CursorPosition::BeforeFirst);
+                        }
+                        return Ok(IOResult::Done(SeekResult::NotFound));
                     }
-                } else {
-                    let forwards = matches!(op, SeekOp::GE { eq_only: _ } | SeekOp::GT);
-                    if forwards {
-                        let _ = self.last()?;
-                    } else {
-                        let _ = self.rewind()?;
-                    }
-                    Ok(IOResult::Done(SeekResult::NotFound))
+                }
+                _ => {
+                    panic!("Invalid state in seek: {:?}", self.state.borrow());
                 }
             }
         }
