@@ -257,6 +257,14 @@ impl MaterializedViewCursor {
     }
 
     pub fn next(&mut self) -> Result<IOResult<bool>> {
+        // If there's a pending seek operation (due to IO), complete it first.
+        // When do_seek is interrupted by IO, it sets current_row = None in the Init state.
+        // We must resume the seek rather than checking current_row first.
+        if !matches!(self.seek_state, SeekState::Done) {
+            let result = return_if_io!(self.do_seek(0, SeekOp::GT)); // target is ignored when resuming
+            return Ok(IOResult::Done(result == SeekResult::Found));
+        }
+
         // If cursor is not positioned (no current_row), return false
         // This matches BTreeCursor behavior when valid_state == Invalid
         let Some((current_rowid, _)) = &self.current_row else {
