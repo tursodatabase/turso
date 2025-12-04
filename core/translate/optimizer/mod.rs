@@ -780,27 +780,13 @@ fn optimize_table_access(
                     // Ephemeral indexes mirror rowid/column lookups. If the constraint targets an
                     // expression (table_col_pos == None) we cannot derive a seek key that matches
                     // the row layout, so fall back to a scan in that situation.
-                    let usable_constraints = table_constraints
+                    let usable: Vec<(usize, &Constraint)> = table_constraints
                         .constraints
                         .iter()
-                        .filter(|c| c.usable && c.table_col_pos.is_some())
-                        .cloned()
-                        .collect::<Vec<_>>();
-                    let mut temp_constraint_refs = (0..usable_constraints.len())
-                        .map(|i| ConstraintRef {
-                            constraint_vec_pos: i,
-                            index_col_pos: i,
-                            sort_order: SortOrder::Asc,
-                        })
-                        .collect::<Vec<_>>();
-                    temp_constraint_refs.sort_by_key(|x| x.index_col_pos);
-
-                    let usable_constraint_refs = usable_constraints_for_join_order(
-                        &usable_constraints,
-                        &temp_constraint_refs,
-                        &best_join_order[..=i],
-                    );
-                    if usable_constraint_refs.is_empty() {
+                        .enumerate()
+                        .filter(|(_, c)| c.usable && c.table_col_pos.is_some())
+                        .collect();
+                    if usable.is_empty() {
                         table_references.joined_tables_mut()[table_idx].op =
                             Operation::Scan(Scan::BTreeTable {
                                 iter_dir: *iter_dir,
@@ -808,6 +794,54 @@ fn optimize_table_access(
                             });
                         continue;
                     }
+
+                    // Build a mapping from table_col_pos to index_col_pos.
+                    // Multiple constraints on the same column should share the same index_col_pos.
+                    //
+                    // This is important when a column appears in multiple constraints.
+                    // For example, in:
+                    //   SELECT * FROM t1 LEFT JOIN t2 ON t1.a = t2.a AND t1.c = t2.c WHERE t2.a = 17
+                    //
+                    // The constraints on t2 are:
+                    //   t2.a = t1.a (from ON clause)
+                    //   t2.c = t1.c (from ON clause)
+                    //   t2.a = 17   (from WHERE clause)
+                    //
+                    // Both t2.a constraints must map to index_col_pos=0. If we incorrectly
+                    // assigned sequential index positions (0, 1, 2), the seek key would include
+                    // 3 components but the ephemeral index only has 2 key columns (t2.a, t2.c),
+                    // causing the seek to compare against the wrong columns and return no results.
+                    let mut unique_col_positions: Vec<usize> = usable
+                        .iter()
+                        .map(|(_, c)| c.table_col_pos.expect("table_col_pos was Some above"))
+                        .collect();
+                    unique_col_positions.sort_unstable();
+                    unique_col_positions.dedup();
+                    // Map each usable constraint to a ConstraintRef.
+                    // Multiple constraints with the same table_col_pos share the same index_col_pos.
+                    let mut temp_constraint_refs: Vec<ConstraintRef> = usable
+                        .iter()
+                        .map(|(orig_idx, c)| {
+                            let table_col_pos =
+                                c.table_col_pos.expect("table_col_pos was Some above");
+                            let index_col_pos = unique_col_positions
+                                .binary_search(&table_col_pos)
+                                .expect("table_col_pos must exist in unique_col_positions");
+                            ConstraintRef {
+                                constraint_vec_pos: *orig_idx, // index in the original constraints vec
+                                index_col_pos,
+                                sort_order: SortOrder::Asc,
+                            }
+                        })
+                        .collect();
+
+                    temp_constraint_refs.sort_by_key(|x| x.index_col_pos);
+                    let usable_constraint_refs = usable_constraints_for_join_order(
+                        &table_constraints.constraints,
+                        &temp_constraint_refs,
+                        &best_join_order[..=i],
+                    );
+
                     let ephemeral_index = ephemeral_index_build(
                         &table_references.joined_tables_mut()[table_idx],
                         &usable_constraint_refs,
