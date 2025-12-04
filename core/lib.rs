@@ -46,7 +46,6 @@ use crate::schema::Trigger;
 use crate::storage::checksum::CHECKSUM_REQUIRED_RESERVED_BYTES;
 use crate::storage::encryption::AtomicCipherMode;
 use crate::storage::pager::{AutoVacuumMode, HeaderRef};
-use crate::storage::sqlite3_ondisk::DatabaseHeader;
 use crate::translate::display::PlanContext;
 use crate::translate::pragma::TURSO_CDC_DEFAULT_TABLE_NAME;
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
@@ -565,12 +564,6 @@ impl Database {
             let syms = conn.syms.read();
             let pager = conn.pager.load().clone();
 
-            if let Some(encryption_opts) = encryption_opts {
-                conn.pragma_update("cipher", format!("'{}'", encryption_opts.cipher))?;
-                conn.pragma_update("hexkey", format!("'{}'", encryption_opts.hexkey))?;
-                // Clear page cache so the header page can be reread from disk and decrypted using the encryption context.
-                pager.clear_page_cache(false);
-            }
             db.with_schema_mut(|schema| {
                 let header_schema_cookie = pager
                     .io
@@ -1683,15 +1676,6 @@ impl Connection {
         }
         if let Some(hexkey) = opts.hexkey {
             let _ = conn.pragma_update("hexkey", format!("'{hexkey}'"));
-        }
-        if let Some(encryption_opts) = encryption_opts {
-            let _ = conn.pragma_update("cipher", encryption_opts.cipher.to_string());
-            let _ = conn.pragma_update("hexkey", encryption_opts.hexkey.to_string());
-            let pager = conn.pager.load();
-            if db.db_state.get().is_initialized() {
-                // Clear page cache so the header page can be reread from disk and decrypted using the encryption context.
-                pager.clear_page_cache(false);
-            }
         }
         Ok((io, conn))
     }

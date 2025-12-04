@@ -425,16 +425,12 @@ async fn test_encryption() {
         hexkey: "b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327".to_string(),
         cipher: "aegis256".to_string(),
     };
-    let pragma_hexkey = format!("PRAGMA hexkey = '{}';", encryption_opts.hexkey);
-    let pragma_cipher = format!("PRAGMA cipher = '{}';", encryption_opts.cipher);
     {
         let builder = Builder::new_local(db_file)
             .experimental_encryption(true)
             .with_encryption(encryption_opts.clone());
         let db = builder.build().await.unwrap();
         let conn = db.connect().unwrap();
-        conn.execute(&pragma_hexkey, ()).await.unwrap();
-        conn.execute(&pragma_cipher, ()).await.unwrap();
         conn.execute(
             "CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT);",
             (),
@@ -461,8 +457,6 @@ async fn test_encryption() {
             .with_encryption(encryption_opts.clone());
         let db = builder.build().await.unwrap();
         let conn = db.connect().unwrap();
-        conn.execute(&pragma_hexkey, ()).await.unwrap();
-        conn.execute(&pragma_cipher, ()).await.unwrap();
 
         let mut row_count = 0;
         let mut rows = conn.query("SELECT * FROM test", ()).await.unwrap();
