@@ -671,6 +671,10 @@ impl Database {
             .block(|| pager.with_header(|header| header.default_page_cache_size))
             .unwrap_or_default()
             .get();
+
+        let encryption_key = self.encryption_key.read().clone();
+        let encrytion_cipher = self.encryption_cipher_mode.get();
+
         let conn = Arc::new(Connection {
             db: self.clone(),
             pager: ArcSwap::new(pager),
@@ -696,8 +700,8 @@ impl Database {
             nestedness: AtomicI32::new(0),
             compiling_triggers: RwLock::new(Vec::new()),
             executing_triggers: RwLock::new(Vec::new()),
-            encryption_key: RwLock::new(None),
-            encryption_cipher_mode: AtomicCipherMode::new(CipherMode::None),
+            encryption_key: RwLock::new(encryption_key),
+            encryption_cipher_mode: AtomicCipherMode::new(encrytion_cipher),
             sync_mode: AtomicSyncMode::new(SyncMode::Full),
             data_sync_retry: AtomicBool::new(false),
             busy_timeout: RwLock::new(Duration::new(0, 0)),
