@@ -258,6 +258,7 @@ turso_status_code_t turso_sync_operation_result_extract_connection(
     const turso_connection_t **connection);
 
 /** Extract Changes result from finished async operation
+ * If no changes were fetched - return TURSO_OK and set changes to null pointer
  */
 turso_status_code_t turso_sync_operation_result_extract_changes(
     const turso_sync_operation_t *self,

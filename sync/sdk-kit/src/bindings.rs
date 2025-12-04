@@ -355,7 +355,7 @@ unsafe extern "C" {
     ) -> turso_status_code_t;
 }
 unsafe extern "C" {
-    #[doc = " Extract Changes result from finished async operation"]
+    #[doc = " Extract Changes result from finished async operation\n If no changes were fetched - return TURSO_OK and set changes to null pointer"]
     pub fn turso_sync_operation_result_extract_changes(
         self_: *const turso_sync_operation_t,
         changes: *mut *const turso_sync_changes_t,
