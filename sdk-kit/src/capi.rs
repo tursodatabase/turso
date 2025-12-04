@@ -28,7 +28,7 @@ pub static PKG_VERSION_C: &[u8] = concat!(env!("CARGO_PKG_VERSION"), "\0").as_by
 #[no_mangle]
 #[signature(c)]
 pub extern "C" fn turso_version() -> *const std::ffi::c_char {
-    return PKG_VERSION_C.as_ptr() as *const std::ffi::c_char;
+    PKG_VERSION_C.as_ptr() as *const std::ffi::c_char
 }
 
 #[no_mangle]
