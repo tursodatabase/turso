@@ -678,6 +678,10 @@ impl Deterministic for Func {
 
 impl Func {
     pub fn supports_star_syntax(&self) -> bool {
+        // Functions that need star expansion also support star syntax
+        if self.needs_star_expansion() {
+            return true;
+        }
         match self {
             Self::Scalar(scalar_func) => {
                 matches!(
@@ -698,6 +702,23 @@ impl Func {
             Self::Agg(_) => false,
             _ => false,
         }
+    }
+
+    /// Returns true if the function needs the `*` to be expanded to all columns
+    /// from the referenced tables. This is used for functions like `json_object(*)`
+    /// and `jsonb_object(*)` which create a JSON object with column names as keys
+    /// and column values as values.
+    #[cfg(feature = "json")]
+    pub fn needs_star_expansion(&self) -> bool {
+        matches!(
+            self,
+            Self::Json(JsonFunc::JsonObject) | Self::Json(JsonFunc::JsonbObject)
+        )
+    }
+
+    #[cfg(not(feature = "json"))]
+    pub fn needs_star_expansion(&self) -> bool {
+        false
     }
     pub fn resolve_function(name: &str, arg_count: usize) -> Result<Self, LimboError> {
         let normalized_name = crate::util::normalize_ident(name);

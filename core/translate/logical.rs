@@ -1723,6 +1723,28 @@ impl<'a> LogicalPlanBuilder<'a> {
                         args: vec![],
                         distinct: false,
                     })
+                } else if let Ok(func) = crate::function::Func::resolve_function(&func_name, 0) {
+                    // Check if this function supports star expansion (e.g., json_object, jsonb_object)
+                    if func.needs_star_expansion() {
+                        // Expand * to all columns as alternating key-value pairs
+                        let mut args = Vec::new();
+                        for col in &_schema.columns {
+                            // Add column name as string literal
+                            args.push(LogicalExpr::Literal(crate::types::Value::Text(
+                                col.name.clone().into(),
+                            )));
+                            // Add column reference
+                            args.push(LogicalExpr::Column(Column::new(col.name.clone())));
+                        }
+                        Ok(LogicalExpr::ScalarFunction {
+                            fun: func_name,
+                            args,
+                        })
+                    } else {
+                        Err(LimboError::ParseError(format!(
+                            "Function {func_name}(*) is not supported"
+                        )))
+                    }
                 } else {
                     Err(LimboError::ParseError(format!(
                         "Function {func_name}(*) is not supported"
