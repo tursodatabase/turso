@@ -502,6 +502,168 @@ mod fuzz_tests {
         }
     }
 
+    #[turso_macros::test()]
+    pub fn join_fuzz_unindexed_keys(db: TempDatabase) {
+        let _ = env_logger::try_init();
+        let (mut rng, seed) = rng_from_time_or_env();
+        println!("join_fuzz_unindexed_keys seed: {seed}");
+
+        let opts = db.db_opts;
+        let flags = db.db_flags;
+        let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
+
+        let limbo_db = builder.clone().build();
+        let sqlite_db = builder.clone().build();
+        let limbo_conn = limbo_db.connect_limbo();
+        let sqlite_conn = rusqlite::Connection::open(sqlite_db.path.clone()).unwrap();
+
+        let schema = r#"
+        CREATE TABLE t1(id INTEGER PRIMARY KEY, a INT, b INT, c INT, d INT);
+        CREATE TABLE t2(id INTEGER PRIMARY KEY, a INT, b INT, c INT, d INT);
+        CREATE TABLE t3(id INTEGER PRIMARY KEY, a INT, b INT, c INT, d INT);
+        CREATE TABLE t4(id INTEGER PRIMARY KEY, a INT, b INT, c INT, d INT);
+    "#;
+
+        sqlite_conn.execute_batch(schema).unwrap();
+        limbo_conn.prepare_execute_batch(schema).unwrap();
+
+        const ROWS_PER_TABLE: i64 = 200;
+        let tables = ["t1", "t2", "t3", "t4"];
+        for (t_idx, tname) in tables.iter().enumerate() {
+            for i in 0..ROWS_PER_TABLE {
+                // 25% chance of NULL per column.
+                let id = i + 1 + (t_idx as i64) * 10_000;
+                let gen_val = |rng: &mut ChaCha8Rng| {
+                    if rng.random_range(0..4) == 0 {
+                        None
+                    } else {
+                        Some(rng.random_range(-10..=20))
+                    }
+                };
+                let a = gen_val(&mut rng);
+                let b = gen_val(&mut rng);
+                let c = gen_val(&mut rng);
+                let d = gen_val(&mut rng);
+
+                let fmt_val = |v: Option<i32>| match v {
+                    Some(x) => x.to_string(),
+                    None => "NULL".to_string(),
+                };
+
+                let stmt = format!(
+                    "INSERT INTO {tname}(id,a,b,c,d) VALUES ({id}, {a}, {b}, {c}, {d})",
+                    a = fmt_val(a),
+                    b = fmt_val(b),
+                    c = fmt_val(c),
+                    d = fmt_val(d),
+                );
+
+                sqlite_conn.execute(&stmt, params![]).unwrap();
+                limbo_conn.execute(&stmt).unwrap();
+            }
+        }
+
+        let non_pk_cols = ["a", "b", "c", "d"];
+
+        const ITERS: usize = 5000;
+        for iter in 0..ITERS {
+            if iter % (ITERS / 100).max(1) == 0 {
+                println!("join_fuzz_unindexed_keys: iteration {}/{}", iter + 1, ITERS);
+            }
+
+            // Random number of tables: 2..4
+            let num_tables = rng.random_range(2..=4);
+            let used_tables = &tables[..num_tables];
+
+            let mut select_cols = Vec::new();
+            for t in used_tables.iter() {
+                select_cols.push(format!("{t}.id"));
+            }
+            let select_clause = select_cols.join(", ");
+
+            // FROM + JOIN clause: chain t1 JOIN t2 JOIN ... with ON predicates on a/b/c/d.
+            let mut from_clause = format!("FROM {}", used_tables[0]);
+            for i in 1..num_tables {
+                let left = used_tables[i - 1];
+                let right = used_tables[i];
+
+                let join_type = if rng.random_bool(0.5) {
+                    "JOIN" // INNER
+                } else {
+                    "LEFT JOIN"
+                };
+
+                let num_preds = rng.random_range(1..=3);
+                let mut preds = Vec::new();
+                for _ in 0..num_preds {
+                    let col = non_pk_cols[rng.random_range(0..non_pk_cols.len())];
+                    // Join on same-named, non-indexed column on both sides.
+                    preds.push(format!("{left}.{col} = {right}.{col}"));
+                }
+                // Avoid duplicate ON terms to keep queries simple.
+                preds.sort();
+                preds.dedup();
+
+                let on_clause = preds.join(" AND ");
+                from_clause = format!("{from_clause} {join_type} {right} ON {on_clause}");
+            }
+
+            // WHERE clause: 0..2 random predicates, mostly equality / IS NULL / IS NOT NULL.
+            let mut where_parts = Vec::new();
+            let num_where = rng.random_range(0..=2);
+            for _ in 0..num_where {
+                let t = used_tables[rng.random_range(0..num_tables)];
+                let col = non_pk_cols[rng.random_range(0..non_pk_cols.len())];
+                let kind = rng.random_range(0..4);
+                let cond = match kind {
+                    0 => {
+                        // equality
+                        let val = rng.random_range(-10..=20);
+                        format!("{t}.{col} = {val}")
+                    }
+                    1 => {
+                        // inequality
+                        let val = rng.random_range(-10..=20);
+                        format!("{t}.{col} <> {val}")
+                    }
+                    2 => format!("{t}.{col} IS NULL"),
+                    3 => format!("{t}.{col} IS NOT NULL"),
+                    _ => unreachable!(),
+                };
+                where_parts.push(cond);
+            }
+            let where_clause = if where_parts.is_empty() {
+                String::new()
+            } else {
+                format!("WHERE {}", where_parts.join(" AND "))
+            };
+            let order_clause = format!("ORDER BY {}", select_cols.join(", "));
+
+            let limit = 50;
+            let query = format!(
+                "SELECT {select_clause} {from_clause} {where_clause} {order_clause} LIMIT {limit}",
+            );
+            log::debug!("join_fuzz query: {query}");
+
+            let sqlite_rows = sqlite_exec_rows(&sqlite_conn, &query);
+            let limbo_rows = limbo_exec_rows(&limbo_db, &limbo_conn, &query);
+
+            if sqlite_rows != limbo_rows {
+                panic!(
+                    "JOIN FUZZ MISMATCH!\nseed: {seed}\niteration: {iter}\nquery: {query}\n\
+                 sqlite: {:?}\nlimbo: {:?}\n limbo count: {}, sqlite count: {}\n
+                 sqlite path: {:?}, limbo path: {:?}",
+                    sqlite_rows,
+                    limbo_rows,
+                    limbo_rows.len(),
+                    sqlite_rows.len(),
+                    sqlite_db.path,
+                    limbo_db.path,
+                );
+            }
+        }
+    }
+
     // TODO: Mvcc indexes
     #[turso_macros::test()]
     pub fn collation_fuzz(db: TempDatabase) {
