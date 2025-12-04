@@ -1,6 +1,7 @@
 // This module contains code for emitting bytecode instructions for SQL query execution.
 // It handles translating high-level SQL operations into low-level bytecode that can be executed by the virtual machine.
 
+use std::collections::HashMap;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
@@ -121,6 +122,24 @@ impl LimitCtx {
         }
     }
 }
+#[derive(Debug, Clone)]
+pub struct HashCtx {
+    pub match_reg: usize,
+    pub hash_table_reg: usize,
+    /// Label for hash join match processing (points to just after HashProbe instruction)
+    /// Used by HashNext to jump back to process additional matches without re-probing
+    pub match_found_label: BranchOffset,
+    /// Label for advancing to the next hash match (points to HashNext instruction).
+    /// When conditions fail within a hash join, they should jump here to try the next
+    /// hash match, rather than jumping to the outer loop's next label.
+    pub hash_next_label: BranchOffset,
+    /// Starting register where payload columns are stored after HashProbe/HashNext.
+    /// None if payload optimization is not used for this hash join.
+    pub payload_start_reg: Option<usize>,
+    /// Column indices from the build table that are stored in payload, in order.
+    /// payload_start_reg + i contains the value for column payload_columns[i].
+    pub payload_columns: Vec<usize>,
+}
 
 /// The TranslateCtx struct holds various information and labels used during bytecode generation.
 /// It is used for maintaining state and control flow during the bytecode
@@ -152,6 +171,9 @@ pub struct TranslateCtx<'a> {
     /// this metadata exists for the right table in a given left join
     pub meta_left_joins: Vec<Option<LeftJoinMetadata>>,
     pub resolver: Resolver<'a>,
+    /// Hash table contexts for hash joins, keyed by build table index.
+    /// Supports multiple hash joins in chain patterns.
+    pub hash_table_contexts: HashMap<usize, HashCtx>,
     /// A list of expressions that are not aggregates, along with a flag indicating
     /// whether the expression should be included in the output for each group.
     ///
@@ -187,6 +209,7 @@ impl<'a> TranslateCtx<'a> {
             meta_group_by: None,
             meta_left_joins: (0..table_count).map(|_| None).collect(),
             meta_sort: None,
+            hash_table_contexts: HashMap::new(),
             resolver: Resolver::new(schema, syms),
             non_aggregate_expressions: Vec::new(),
             cdc_cursor_id: None,
@@ -806,6 +829,9 @@ fn emit_delete_insns<'a>(
         },
         Operation::IndexMethodQuery(_) => {
             panic!("access through IndexMethod is not supported for delete statements")
+        }
+        Operation::HashJoin(_) => {
+            unreachable!("access through HashJoin is not supported for delete statements")
         }
     };
     let btree_table = unsafe { &*table_reference }.btree();
@@ -1616,6 +1642,9 @@ fn emit_update_insns<'a>(
         },
         Operation::IndexMethodQuery(_) => {
             panic!("access through IndexMethod is not supported for update operations")
+        }
+        Operation::HashJoin(_) => {
+            unreachable!("access through HashJoin is not supported for update operations")
         }
     };
 

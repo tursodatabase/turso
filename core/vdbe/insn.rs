@@ -295,15 +295,24 @@ pub enum Insn {
         flags: CmpInsFlags,
         collation: Option<CollationSeq>,
     },
-    /// Compute a hash on the key contained in the P4 registers starting with r[P3]. Check to see if that hash is found in the bloom filter hosted by register P1. If it is not present then maybe jump to P2. Otherwise fall through.
-    // False negatives are harmless. It is always safe to fall through, even if the value is in the bloom filter. A false negative causes more CPU cycles to be used, but it should still yield the correct answer. However, an incorrect answer may well arise from a false positive - if the jump is taken when it should fall through.
+    /// Compute a hash on num_keys registers starting with r[key_reg]. Check to see if that hash
+    /// is found in the bloom filter associated with the cursor/hash_table. If it is not present
+    /// then jump to target_pc. Otherwise fall through.
+    /// False negatives are harmless. It is always safe to fall through, even if the value is
+    /// in the bloom filter. A false negative causes more CPU cycles to be used, but it should
+    /// still yield the correct answer. However, an incorrect answer may well arise from a
+    /// false positive - if the jump is taken when it should fall through.
     Filter {
         cursor_id: CursorID,
+        /// Jump target if bloom filter says "definitely not present"
         target_pc: BranchOffset,
+        /// Start register containing the key(s) to check
         key_reg: usize,
+        /// Number of key registers to hash together
         num_keys: usize,
     },
-    /// Compute a hash on the P4 registers starting with r[P3] and add that hash to the bloom filter contained in r[P1].
+    /// Compute a hash on num_keys registers starting with r[key_reg] and add that hash to
+    /// the bloom filter associated with the cursor/hash_table.
     FilterAdd {
         cursor_id: CursorID,
         key_reg: usize,
@@ -1283,6 +1292,70 @@ pub enum Insn {
         deferred: bool,
         target_pc: BranchOffset,
     },
+
+    /// Build a hash table from a cursor for hash join.
+    /// Reads pre-computed key values from registers (key_start_reg..key_start_reg+num_keys-1),
+    /// gets the rowid from cursor_id, and inserts the (key_values, rowid) pair into the hash table.
+    /// Optionally also stores payload values (result columns from the build table) to avoid
+    /// an additional btree seek during probe phase.
+    HashBuild {
+        cursor_id: CursorID,
+        key_start_reg: usize,
+        num_keys: usize,
+        hash_table_id: usize,
+        mem_budget: usize,
+        collations: Vec<CollationSeq>,
+        /// Starting register for payload columns to store in the hash entry.
+        /// When Some: payload_start_reg..payload_start_reg+num_payload-1 contain values to cache.
+        payload_start_reg: Option<usize>,
+        /// Number of payload columns to read
+        num_payload: usize,
+    },
+
+    /// Finalize the hash table build phase. Transitions the hash table from Building to Probing state.
+    /// Should be called after the HashBuild loop completes.
+    HashBuildFinalize {
+        hash_table_id: usize,
+    },
+
+    /// Probe a hash table for matches.
+    /// Extract probe keys from registers key_start_reg..key_start_reg+num_keys-1,
+    /// hash them, and look up matches in the hash table stored in hash_table_reg.
+    /// For each match, load the build-side rowid into dest_reg and continue.
+    /// If payload columns were stored during build, they are written to
+    /// payload_dest_reg..payload_dest_reg+num_payload-1.
+    /// If no matches, jump to target_pc.
+    HashProbe {
+        hash_table_id: usize,
+        key_start_reg: usize,
+        num_keys: usize,
+        dest_reg: usize,
+        target_pc: BranchOffset,
+        /// Starting register to write payload columns from hash entry.
+        payload_dest_reg: Option<usize>,
+        /// Number of payload columns expected
+        num_payload: usize,
+    },
+
+    /// Advance to next matching row in hash table bucket.
+    /// Used for handling hash collisions and duplicate keys.
+    /// If another match is found, store rowid in dest_reg (and payload in payload_dest_reg if set).
+    /// If no more matches, jump to target_pc.
+    HashNext {
+        hash_table_id: usize,
+        dest_reg: usize,
+        target_pc: BranchOffset,
+        /// Starting register to write payload columns from hash entry, if we are caching payload.
+        payload_dest_reg: Option<usize>,
+        /// Number of payload columns expected
+        num_payload: usize,
+    },
+
+    /// Free hash table resources.
+    /// Closes the hash table referenced by hash_table_id and releases memory.
+    HashClose {
+        hash_table_id: usize,
+    },
 }
 
 const fn get_insn_virtual_table() -> [InsnFunction; InsnVariants::COUNT] {
@@ -1465,6 +1538,11 @@ impl InsnVariants {
             InsnVariants::VRename => execute::op_vrename,
             InsnVariants::FilterAdd => execute::op_filter_add,
             InsnVariants::Filter => execute::op_filter,
+            InsnVariants::HashBuild => execute::op_hash_build,
+            InsnVariants::HashBuildFinalize => execute::op_hash_build_finalize,
+            InsnVariants::HashProbe => execute::op_hash_probe,
+            InsnVariants::HashNext => execute::op_hash_next,
+            InsnVariants::HashClose => execute::op_hash_close,
         }
     }
 }
