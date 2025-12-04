@@ -853,6 +853,15 @@ fn reopen_database(env: &mut SimulatorEnv) {
     // to expose bugs related to how we handle WAL
     let mvcc = env.profile.experimental_mvcc;
     let num_conns = env.connections.len();
+
+    // Clear shadow transaction state for all connections since reopening
+    // the database resets all transaction state
+    for conn_index in 0..num_conns {
+        if env.conn_in_transaction(conn_index) {
+            env.rollback_conn(conn_index);
+        }
+    }
+
     env.connections.clear();
 
     // Clear all open files
