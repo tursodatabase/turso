@@ -46,6 +46,7 @@ use crate::schema::Trigger;
 use crate::storage::checksum::CHECKSUM_REQUIRED_RESERVED_BYTES;
 use crate::storage::encryption::AtomicCipherMode;
 use crate::storage::pager::{AutoVacuumMode, HeaderRef};
+use crate::storage::sqlite3_ondisk::DatabaseHeader;
 use crate::translate::display::PlanContext;
 use crate::translate::pragma::TURSO_CDC_DEFAULT_TABLE_NAME;
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
@@ -248,6 +249,10 @@ pub struct Database {
     builtin_syms: RwLock<SymbolTable>,
     opts: DatabaseOpts,
     n_connections: AtomicUsize,
+
+    // Encryption
+    encryption_key: RwLock<Option<EncryptionKey>>,
+    encryption_cipher_mode: AtomicCipherMode,
 }
 
 // SAFETY: This needs to be audited for thread safety.
@@ -314,11 +319,17 @@ impl Database {
         wal_path: impl Into<String>,
         io: &Arc<dyn IO>,
         db_file: Arc<dyn DatabaseStorage>,
-    ) -> Self {
+        encryption_opts: Option<EncryptionOpts>,
+    ) -> Result<Self> {
         let shared_wal = WalFileShared::new_noop();
         let mv_store = ArcSwapOption::empty();
 
-        let db_state = DbState::Initialized;
+        let db_size = db_file.size()?;
+        let db_state = if db_size == 0 {
+            DbState::Uninitialized
+        } else {
+            DbState::Initialized
+        };
 
         let shared_page_cache = Arc::new(RwLock::new(PageCache::default()));
         let syms = SymbolTable::new();
@@ -327,6 +338,16 @@ impl Database {
         } else {
             BufferPool::DEFAULT_ARENA_SIZE
         };
+
+        let (encryption_key, encryption_cipher_mode) =
+            if let Some(encryption_opts) = encryption_opts {
+                let key = EncryptionKey::from_hex_string(&encryption_opts.hexkey)?;
+                let cipher = CipherMode::try_from(encryption_opts.cipher.as_str())?;
+                (Some(key), Some(cipher))
+            } else {
+                (None, None)
+            };
+
         // opts is now passed as parameter
         let db = Database {
             mv_store,
@@ -344,11 +365,16 @@ impl Database {
             opts,
             buffer_pool: BufferPool::begin_init(io, arena_size),
             n_connections: AtomicUsize::new(0),
+
+            encryption_key: RwLock::new(encryption_key),
+            encryption_cipher_mode: AtomicCipherMode::new(
+                encryption_cipher_mode.unwrap_or(CipherMode::None),
+            ),
         };
 
         db.register_global_builtin_extensions()
             .expect("unable to register global extensions");
-        db
+        Ok(db)
     }
 
     #[cfg(feature = "fs")]
@@ -480,7 +506,15 @@ impl Database {
         opts: DatabaseOpts,
         encryption_opts: Option<EncryptionOpts>,
     ) -> Result<Arc<Database>> {
-        let mut db = Self::new(opts, flags, path, wal_path, &io, db_file);
+        let mut db = Self::new(
+            opts,
+            flags,
+            path,
+            wal_path,
+            &io,
+            db_file,
+            encryption_opts.clone(),
+        )?;
 
         // Check: https://github.com/tursodatabase/turso/pull/1761#discussion_r2154013123
 
