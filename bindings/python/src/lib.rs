@@ -3,6 +3,7 @@ use pyo3::{
     types::{PyModule, PyModuleMethods},
     wrap_pyfunction, Bound, PyResult,
 };
+use turso_sdk_kit::rsapi::TursoDatabase;
 
 use crate::{
     turso::{
@@ -23,7 +24,7 @@ pub mod turso_sync;
 
 #[pymodule]
 fn _turso(m: &Bound<PyModule>) -> PyResult<()> {
-    m.add("__version__", env!("CARGO_PKG_VERSION"))?;
+    m.add("__version__", TursoDatabase::version())?;
     // database exports
     m.add_function(wrap_pyfunction!(py_turso_setup, m)?)?;
     m.add_function(wrap_pyfunction!(py_turso_database_open, m)?)?;
