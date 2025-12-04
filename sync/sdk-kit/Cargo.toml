@@ -1,0 +1,26 @@
+[package]
+name = "turso_sync_sdk_kit"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lib]
+doc = false
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[dependencies]
+env_logger = { workspace = true, default-features = false }
+turso_core = { workspace = true }
+turso_sync_engine = { workspace = true }
+turso_sdk_kit = { workspace = true }
+turso_sdk_kit_macros = { workspace = true }
+tracing = { workspace = true }
+tracing-appender = { workspace = true }
+tracing-subscriber = { workspace = true, features = ["env-filter"] }
+genawaiter = { version = "0.99.1", default-features = false }
+parking_lot = { workspace = true, features = ["arc_lock", "send_guard"] }
+
+[build-dependencies]
+bindgen = "0.69.5"

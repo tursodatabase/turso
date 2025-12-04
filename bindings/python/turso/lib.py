@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import logging
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from types import TracebackType
@@ -155,7 +154,7 @@ def _is_insert_or_replace(sql: str) -> bool:
     return kw in ("INSERT", "REPLACE")
 
 
-def _run_execute_with_io(stmt: PyTursoStatement) -> PyTursoExecutionResult:
+def _run_execute_with_io(stmt: PyTursoStatement, extra_io: Optional[Callable[[], None]]) -> PyTursoExecutionResult:
     """
     Run PyTursoStatement.execute() handling potential async IO loops.
     """
@@ -163,13 +162,14 @@ def _run_execute_with_io(stmt: PyTursoStatement) -> PyTursoExecutionResult:
         result = stmt.execute()
         status = result.status
         if status == Status.Io:
-            # Drive IO loop; repeat.
             stmt.run_io()
+            if extra_io:
+                extra_io()
             continue
         return result
 
 
-def _step_once_with_io(stmt: PyTursoStatement) -> PyTursoStatusCode:
+def _step_once_with_io(stmt: PyTursoStatement, extra_io: Optional[Callable[[], None]]) -> PyTursoStatusCode:
     """
     Run PyTursoStatement.step() once handling potential async IO loops.
     """
@@ -177,6 +177,8 @@ def _step_once_with_io(stmt: PyTursoStatement) -> PyTursoStatusCode:
         status = stmt.step()
         if status == Status.Io:
             stmt.run_io()
+            if extra_io:
+                extra_io()
             continue
         return status
 
@@ -243,6 +245,7 @@ class Connection:
         conn: PyTursoConnection,
         *,
         isolation_level: Optional[str] = "DEFERRED",
+        extra_io: Optional[Callable[[], None]] = None,
     ) -> None:
         self._conn: PyTursoConnection = conn
         # autocommit behavior:
@@ -254,6 +257,7 @@ class Connection:
         self.isolation_level: Optional[str] = isolation_level
         self.row_factory: Callable[[Cursor, Row], object] | type[Row] | None = None
         self.text_factory: Any = str
+        self.extra_io = extra_io
 
         # If autocommit is False, ensure a transaction is open
         if self._autocommit_mode is False:
@@ -277,7 +281,7 @@ class Connection:
         """
         try:
             stmt = self._conn.prepare_single(sql)
-            _run_execute_with_io(stmt)
+            _run_execute_with_io(stmt, self.extra_io)
             # finalize to ensure completion; finalize never mixes with execute
             stmt.finalize()
         except Exception as exc:  # noqa: BLE001
@@ -565,7 +569,7 @@ class Cursor:
                 # Do not compute lastrowid here
             else:
                 # Executed statement (no rows returned)
-                result = _run_execute_with_io(stmt)
+                result = _run_execute_with_io(stmt, self._connection.extra_io)
                 # rows_changed from execution result
                 self._rowcount = int(result.rows_changed)
                 # Set description to None
@@ -592,7 +596,7 @@ class Cursor:
             q = self._connection._conn.prepare_single("SELECT last_insert_rowid()")
             # No parameters; this produces a single-row single-column result
             # Use stepping to fetch the row
-            status = _step_once_with_io(q)
+            status = _step_once_with_io(q, self._connection.extra_io)
             if status == Status.Row:
                 py_row = q.row()
                 # row() returns a Python tuple with one element
@@ -635,7 +639,7 @@ class Cursor:
                 params = self._to_positional_params(parameters)
                 if params:
                     stmt.bind(params)
-                result = _run_execute_with_io(stmt)
+                result = _run_execute_with_io(stmt, self._connection.extra_io)
                 # rowcount is "the number of modified rows" for the LAST executed statement only
                 self._rowcount = int(result.rows_changed) + (self._rowcount if self._rowcount != -1 else 0)
             # After loop, finalize statement
@@ -673,7 +677,7 @@ class Cursor:
                     break
                 stmt, tail = opt
                 # Note: per DB-API, any resulting rows are discarded
-                result = _run_execute_with_io(stmt)
+                result = _run_execute_with_io(stmt, self._connection.extra_io)
                 total_rowcount = int(result.rows_changed) if result.rows_changed > 0 else total_rowcount
                 # finalize to ensure completion
                 stmt.finalize()
@@ -692,7 +696,7 @@ class Cursor:
         if not self._active_has_rows or self._active_stmt is None:
             return None
         try:
-            status = _step_once_with_io(self._active_stmt)
+            status = _step_once_with_io(self._active_stmt, self._connection.extra_io)
             if status == Status.Row:
                 row_tuple = tuple(self._active_stmt.row())  # type: ignore[call-arg]
                 return row_tuple
@@ -849,6 +853,7 @@ def connect(
     *,
     experimental_features: Optional[str] = None,
     isolation_level: Optional[str] = "DEFERRED",
+    extra_io: Optional[Callable[[], None]] = None,
 ) -> Connection:
     """
     Open a Turso (SQLite-compatible) database and return a Connection.
@@ -866,13 +871,13 @@ def connect(
         )
         db: PyTursoDatabase = py_turso_database_open(cfg)
         conn: PyTursoConnection = db.connect()
-        return Connection(conn, isolation_level=isolation_level)
+        return Connection(conn, isolation_level=isolation_level, extra_io=extra_io)
     except Exception as exc:  # noqa: BLE001
         raise _map_turso_exception(exc)
 
 
 # Make it easy to enable logging with native `logging` Python module
-def setup_logging(level: int = logging.INFO) -> None:
+def setup_logging(level: Optional[int] = None) -> None:
     """
     Setup Turso logging to integrate with Python's logging module.
 
@@ -880,6 +885,9 @@ def setup_logging(level: int = logging.INFO) -> None:
         import turso
         turso.setup_logging(logging.DEBUG)
     """
+    import logging
+
+    level = level or logging.INFO
     logger = logging.getLogger("turso")
     logger.setLevel(level)
 
@@ -888,7 +896,6 @@ def setup_logging(level: int = logging.INFO) -> None:
         lvl_map = {
             "ERROR": logging.ERROR,
             "WARN": logging.WARNING,
-            "WARNING": logging.WARNING,
             "INFO": logging.INFO,
             "DEBUG": logging.DEBUG,
             "TRACE": logging.DEBUG,
@@ -904,6 +911,16 @@ def setup_logging(level: int = logging.INFO) -> None:
         )
 
     try:
-        py_turso_setup(PyTursoSetupConfig(logger=_py_logger, log_level=None))
+        py_turso_setup(
+            PyTursoSetupConfig(
+                logger=_py_logger,
+                log_level={
+                    logging.ERROR: "error",
+                    logging.WARN: "warn",
+                    logging.INFO: "info",
+                    logging.DEBUG: "debug",
+                }[level],
+            )
+        )
     except Exception as exc:  # noqa: BLE001
         raise _map_turso_exception(exc)

@@ -1,5 +1,6 @@
 use std::{
     borrow::Cow,
+    fmt::Display,
     sync::{Arc, Mutex, Once, RwLock},
 };
 
@@ -11,8 +12,8 @@ use tracing_subscriber::{
     EnvFilter, Layer,
 };
 use turso_core::{
-    types::AsValueRef, Connection, Database, DatabaseOpts, LimboError, OpenFlags, Statement,
-    StepResult, IO,
+    storage::database::DatabaseFile, types::AsValueRef, Connection, Database, DatabaseOpts,
+    DatabaseStorage, LimboError, OpenFlags, Statement, StepResult, IO,
 };
 
 use crate::{assert_send, assert_sync, capi, ConcurrentGuard};
@@ -69,7 +70,12 @@ fn logger_wrap(log: TursoLog<'_>, logger: unsafe extern "C" fn(capi::c::turso_lo
 }
 
 impl TursoSetupConfig {
-    pub fn from_capi(value: capi::c::turso_config_t) -> Result<Self, TursoError> {
+    /// helper method to restore [TursoSetupConfig] instance from C representation
+    /// this method is used in the capi wrappers
+    ///
+    /// # Safety
+    /// [capi::c::turso_config_t::log_level] field must be valid C-string pointer or null
+    pub unsafe fn from_capi(value: capi::c::turso_config_t) -> Result<Self, TursoError> {
         Ok(Self {
             log_level: if !value.log_level.is_null() {
                 Some(str_from_c_str(value.log_level)?.to_string())
@@ -85,6 +91,7 @@ impl TursoSetupConfig {
     }
 }
 
+#[derive(Clone)]
 pub struct TursoDatabaseConfig {
     /// path to the database file or ":memory:" for in-memory connection
     pub path: String,
@@ -93,12 +100,16 @@ pub struct TursoDatabaseConfig {
     /// this field is intentionally just a string in order to make enablement of experimental features as flexible as possible
     pub experimental_features: Option<String>,
 
-    /// optional custom IO provided by the caller
-    pub io: Option<Arc<dyn IO>>,
-
     /// if true, library methods will return Io status code and delegate Io loop to the caller
     /// if false, library will spin IO itself in case of Io status code and never return it to the caller
     pub async_io: bool,
+
+    /// optional custom IO provided by the caller
+    pub io: Option<Arc<dyn IO>>,
+
+    /// optional custom DatabaseStorage provided by the caller
+    /// if provided, caller must guarantee that IO used by the TursoDatabase will be consistent with underlying DatabaseStorage IO
+    pub db_file: Option<Arc<dyn DatabaseStorage>>,
 }
 
 pub fn value_from_c_value(value: capi::c::turso_value_t) -> Result<turso_core::Value, TursoError> {
@@ -171,14 +182,16 @@ pub fn bytes_from_turso_slice<'a>(
     Ok(unsafe { std::slice::from_raw_parts(slice.ptr as *const u8, slice.len) })
 }
 
-pub(crate) fn str_from_c_str<'a>(ptr: *const std::ffi::c_char) -> Result<&'a str, TursoError> {
+/// # Safety
+/// ptr must be valid C-string pointer or null
+pub unsafe fn str_from_c_str<'a>(ptr: *const std::ffi::c_char) -> Result<&'a str, TursoError> {
     if ptr.is_null() {
         return Err(TursoError {
             code: TursoStatusCode::Misuse,
             message: Some("expected zero terminated c string, got null pointer".to_string()),
         });
     }
-    let c_str = unsafe { std::ffi::CStr::from_ptr(ptr) };
+    let c_str = std::ffi::CStr::from_ptr(ptr);
     match c_str.to_str() {
         Ok(s) => Ok(s),
         Err(err) => Err(TursoError {
@@ -191,7 +204,13 @@ pub(crate) fn str_from_c_str<'a>(ptr: *const std::ffi::c_char) -> Result<&'a str
 }
 
 impl TursoDatabaseConfig {
-    pub fn from_capi(value: capi::c::turso_database_config_t) -> Result<Self, TursoError> {
+    /// helper method to restore [TursoSetupConfig] instance from C representation
+    /// this method is used in the capi wrappers
+    ///
+    /// # Safety
+    /// [capi::c::turso_database_config_t::path] field must be valid C-string pointer
+    /// [capi::c::turso_database_config_t::experimental_features] field must be valid C-string pointer or null
+    pub unsafe fn from_capi(value: capi::c::turso_database_config_t) -> Result<Self, TursoError> {
         Ok(Self {
             path: str_from_c_str(value.path)?.to_string(),
             experimental_features: if !value.experimental_features.is_null() {
@@ -201,6 +220,7 @@ impl TursoDatabaseConfig {
             },
             async_io: value.async_io,
             io: None,
+            db_file: None,
         })
     }
 }
@@ -255,6 +275,12 @@ impl TursoStatusCode {
 pub struct TursoError {
     pub code: TursoStatusCode,
     pub message: Option<String>,
+}
+
+impl Display for TursoError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_fmt(format_args!("{:?}: {:?}", self.code, self.message))
+    }
 }
 
 pub fn str_to_c_string(message: &str) -> *const std::ffi::c_char {
@@ -381,9 +407,20 @@ pub fn turso_setup(config: TursoSetupConfig) -> Result<(), TursoError> {
 }
 
 impl TursoDatabase {
+    /// method to get [turso_core::Database] instance which can be useful for code which integrates with sdk-kit
+    pub fn db_core(&self) -> Result<Arc<turso_core::Database>, TursoError> {
+        let db = self.db.lock().unwrap();
+        match &*db {
+            Some(db) => Ok(db.clone()),
+            None => Err(TursoError {
+                code: TursoStatusCode::Misuse,
+                message: Some("database must be opened".to_string()),
+            }),
+        }
+    }
     /// create database holder struct but do not initialize it yet
     /// this can be useful for some environments, where IO operations must be executed in certain fashion (and open do IO under the hood)
-    pub fn create(config: TursoDatabaseConfig) -> Arc<Self> {
+    pub fn new(config: TursoDatabaseConfig) -> Arc<Self> {
         Arc::new(Self {
             config,
             db: Arc::new(Mutex::new(None)),
@@ -412,6 +449,15 @@ impl TursoDatabase {
                 },
             }
         };
+        let open_flags = OpenFlags::default();
+        let db_file = if let Some(db_file) = &self.config.db_file {
+            db_file.clone()
+        } else {
+            let file = io
+                .open_file(&self.config.path, open_flags, true)
+                .map_err(turso_error_from_limbo_error)?;
+            Arc::new(DatabaseFile::new(file))
+        };
         let mut opts = DatabaseOpts::new();
         if let Some(experimental_features) = &self.config.experimental_features {
             for features in experimental_features.split(",").map(|s| s.trim()) {
@@ -425,10 +471,11 @@ impl TursoDatabase {
                 };
             }
         }
-        match turso_core::Database::open_file_with_flags(
+        match turso_core::Database::open_with_flags(
             io.clone(),
             &self.config.path,
-            OpenFlags::default(),
+            db_file,
+            open_flags,
             opts,
             None,
         ) {
@@ -453,20 +500,16 @@ impl TursoDatabase {
         let connection = db.connect();
 
         match connection {
-            Ok(connection) => Ok(Arc::new(TursoConnection {
-                async_io: self.config.async_io,
-                concurrent_guard: Arc::new(ConcurrentGuard::new()),
-                connection,
-            })),
+            Ok(connection) => Ok(TursoConnection::new(&self.config, connection)),
             Err(err) => Err(turso_error_from_limbo_error(err)),
         }
     }
 
     /// helper method to get C raw container with TursoDatabase instance
     /// this method is used in the capi wrappers
-    pub fn to_capi(self: &Arc<Self>) -> capi::c::turso_database_t {
+    pub fn to_capi(self: Arc<Self>) -> capi::c::turso_database_t {
         capi::c::turso_database_t {
-            inner: Arc::into_raw(self.clone()) as *mut std::ffi::c_void,
+            inner: Arc::into_raw(self) as *mut std::ffi::c_void,
         }
     }
 
@@ -505,6 +548,13 @@ pub struct TursoConnection {
 }
 
 impl TursoConnection {
+    pub fn new(config: &TursoDatabaseConfig, connection: Arc<Connection>) -> Arc<Self> {
+        Arc::new(Self {
+            async_io: config.async_io,
+            connection,
+            concurrent_guard: Arc::new(ConcurrentGuard::new()),
+        })
+    }
     pub fn get_auto_commit(&self) -> bool {
         self.connection.get_auto_commit()
     }
@@ -549,9 +599,9 @@ impl TursoConnection {
 
     /// helper method to get C raw container to the TursoConnection instance
     /// this method is used in the capi wrappers
-    pub fn to_capi(self: &Arc<Self>) -> capi::c::turso_connection_t {
+    pub fn to_capi(self: Arc<Self>) -> capi::c::turso_connection_t {
         capi::c::turso_connection_t {
-            inner: Arc::into_raw(self.clone()) as *mut std::ffi::c_void,
+            inner: Arc::into_raw(self) as *mut std::ffi::c_void,
         }
     }
 
@@ -815,11 +865,12 @@ mod tests {
 
     #[test]
     pub fn test_db_concurrent_use() {
-        let db = TursoDatabase::create(TursoDatabaseConfig {
+        let db = TursoDatabase::new(TursoDatabaseConfig {
             path: ":memory:".to_string(),
             experimental_features: None,
-            io: None,
             async_io: false,
+            io: None,
+            db_file: None,
         });
         db.open().unwrap();
         let conn = db.connect().unwrap();
@@ -846,11 +897,12 @@ mod tests {
 
     #[test]
     pub fn test_db_rsapi_use() {
-        let db = TursoDatabase::create(TursoDatabaseConfig {
+        let db = TursoDatabase::new(TursoDatabaseConfig {
             path: ":memory:".to_string(),
             experimental_features: None,
-            io: None,
             async_io: false,
+            io: None,
+            db_file: None,
         });
         db.open().unwrap();
         let conn = db.connect().unwrap();

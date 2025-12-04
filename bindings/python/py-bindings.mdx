@@ -44,14 +44,16 @@ class Cursor: ...
 class Row: ...
 
 def connect(
-    database: str,
+    path: str,
     *,
     experimental_features: Optional[str] = None,
     isolation_level: Optional[str] = "DEFERRED",
+    extra_io: Optional[Callable[[], None]] = None # extra IO which must be called after stmt.run_io() invocations in the driver
 ): ...
 
 # Make it easy to enable logging with native `logging` Python module
-def setup_logging(level: int = logging.INFO) -> None: ...
+# (import logging only inside this function - make an exception here)
+def setup_logging(level: Optional[int] = None) -> None: ...
 ```
 - AVOID unnecessary FFI calls as their cost is non zero
 - AVOID unnecessary strings transformations - replace them with more efficient alternatives if possible
@@ -72,6 +74,7 @@ class T:
 
 # Implementation
 
+- Accept extra_io optional parameter in the driver which will run after stmt.run_io() whenever statement execution returned TURSO_IO status
 - Put compact citations from the official DB-API doc if this is helpful
 - Driver must implement context API for Python to be used like `with ... as conn:` ...
 - Driver implementation must be type-friendly - emit types everywhere at API boundary (public methods, class fields, etc)
@@ -88,7 +91,7 @@ class Row(Sequence[Any]):
 
 You must use bindings in the lib.rs written with `pyo3` library which has certain conventions.
 
-<File path="./src/lib.rs" />
+<File path="./src/turso.rs" />
 <File path="./turso/__init__.py" />
 
 Remember, that it can accept `py: Python` argument which will be passed implicitly and exported bindings will not have this extra arg

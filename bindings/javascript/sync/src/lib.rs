@@ -13,9 +13,12 @@ use napi::bindgen_prelude::{AsyncTask, Either5, Null};
 use napi_derive::napi;
 use turso_node::{DatabaseOpts, IoLoopTask};
 use turso_sync_engine::{
-    database_sync_engine::{DatabaseSyncEngine, DatabaseSyncEngineOpts, PartialBootstrapStrategy},
-    protocol_io::ProtocolIO,
-    types::{Coro, DatabaseChangeType, DatabaseSyncEngineProtocolVersion},
+    database_sync_engine::{DatabaseSyncEngine, DatabaseSyncEngineOpts},
+    database_sync_engine_io::SyncEngineIo,
+    database_sync_operations::SyncEngineIoStats,
+    types::{
+        Coro, DatabaseChangeType, DatabaseSyncEngineProtocolVersion, PartialBootstrapStrategy,
+    },
 };
 
 use crate::{
@@ -140,7 +143,7 @@ struct SyncEngineOptsFilled {
     pub protocol_version: DatabaseSyncEngineProtocolVersion,
     pub bootstrap_if_empty: bool,
     pub remote_encryption: Option<CipherMode>,
-    pub partial_boostrap_strategy: Option<PartialBootstrapStrategy>,
+    pub partial_boostrap_strategy: PartialBootstrapStrategy,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -254,14 +257,17 @@ impl SyncEngine {
                     ))
                 }
             },
-            partial_boostrap_strategy: opts.partial_boostrap_strategy.map(|s| match s {
-                JsPartialBootstrapStrategy::Prefix { length } => PartialBootstrapStrategy::Prefix {
-                    length: length as usize,
-                },
-                JsPartialBootstrapStrategy::Query { query } => {
+            partial_boostrap_strategy: match opts.partial_boostrap_strategy {
+                Some(JsPartialBootstrapStrategy::Prefix { length }) => {
+                    PartialBootstrapStrategy::Prefix {
+                        length: length as usize,
+                    }
+                }
+                Some(JsPartialBootstrapStrategy::Query { query }) => {
                     PartialBootstrapStrategy::Query { query }
                 }
-            }),
+                None => PartialBootstrapStrategy::None,
+            },
         };
         Ok(SyncEngine {
             opts: opts_filled,
@@ -299,8 +305,14 @@ impl SyncEngine {
         let path = self.opts.path.clone();
         let generator = genawaiter::sync::Gen::new(|coro| async move {
             let coro = Coro::new((), coro);
-            let initialized =
-                DatabaseSyncEngine::new(&coro, io.clone(), protocol, &path, opts).await?;
+            let initialized = DatabaseSyncEngine::create_db(
+                &coro,
+                io.clone(),
+                SyncEngineIoStats::new(protocol),
+                &path,
+                opts,
+            )
+            .await?;
             let connection = initialized.connect_rw(&coro).await?;
 
             db.lock().unwrap().set_connected(connection).map_err(|e| {
@@ -341,7 +353,7 @@ impl SyncEngine {
 
     #[napi]
     pub fn protocol_io_step(&self) -> napi::Result<()> {
-        self.protocol()?.step_work();
+        self.protocol()?.step_io_callbacks();
         Ok(())
     }
 

@@ -8,7 +8,7 @@ use std::{
 use napi::bindgen_prelude::*;
 use napi_derive::napi;
 use turso_sync_engine::{
-    protocol_io::{DataCompletion, DataPollResult, ProtocolIO},
+    database_sync_engine_io::{DataCompletion, DataPollResult, SyncEngineIo},
     types::{DatabaseRowTransformResult, DatabaseStatementReplay},
 };
 
@@ -183,7 +183,7 @@ impl JsProtocolRequestBytes {
     }
 }
 
-impl ProtocolIO for JsProtocolIo {
+impl SyncEngineIo for JsProtocolIo {
     type DataCompletionBytes = JsDataCompletion;
     type DataCompletionTransform = JsDataCompletion;
 
@@ -242,12 +242,12 @@ impl ProtocolIO for JsProtocolIo {
         }))
     }
 
-    fn add_work(&self, callback: Box<dyn FnMut() -> bool + Send>) {
+    fn add_io_callback(&self, callback: Box<dyn FnMut() -> bool + Send>) {
         let mut work = self.work.lock().unwrap();
         work.push_back(callback);
     }
 
-    fn step_work(&self) {
+    fn step_io_callbacks(&self) {
         let mut items = {
             let mut work = self.work.lock().unwrap();
             work.drain(..).collect::<VecDeque<_>>()

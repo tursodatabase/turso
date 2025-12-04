@@ -4,7 +4,7 @@ use turso_core::{Completion, LimboError, OpenFlags};
 
 use crate::{
     database_tape::{DatabaseTape, DatabaseTapeOpts},
-    types::{Coro, ProtocolCommand},
+    types::{Coro, SyncEngineIoResult},
     Result,
 };
 
@@ -61,7 +61,7 @@ impl IoOperations for Arc<dyn turso_core::IO> {
         });
         let c = file.truncate(len as u64, c)?;
         while !c.succeeded() {
-            coro.yield_(ProtocolCommand::IO).await?;
+            coro.yield_(SyncEngineIoResult::IO).await?;
         }
         Ok(())
     }
