@@ -300,12 +300,14 @@ pub enum Insn {
     Filter {
         cursor_id: CursorID,
         target_pc: BranchOffset,
-        value_reg: usize,
+        key_reg: usize,
+        num_keys: usize,
     },
     /// Compute a hash on the P4 registers starting with r[P3] and add that hash to the bloom filter contained in r[P1].
     FilterAdd {
         cursor_id: CursorID,
-        value_reg: usize,
+        key_reg: usize,
+        num_keys: usize,
     },
     /// Compare two registers and jump to the given PC if they are not equal.
     Ne {

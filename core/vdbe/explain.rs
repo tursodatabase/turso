@@ -1613,23 +1613,23 @@ pub fn insn_to_row(
                 0,
                 "".to_string(),
             ),
-            Insn::Filter{cursor_id, target_pc, value_reg} => (
+            Insn::Filter{cursor_id, target_pc, key_reg, num_keys} => (
                 "Filter",
                 *cursor_id as i64,
                 target_pc.as_debug_int() as i64,
-                *value_reg as i64,
+                *key_reg as i64,
                 Value::build_text(""),
-                0,
-                format!("if !contains({value_reg}) goto {}", target_pc.as_debug_int()),
+                *num_keys as i64,
+                format!("if !bloom_filter(r[{}..{}]) goto {}", key_reg, key_reg + num_keys, target_pc.as_debug_int()),
             ),
-            Insn::FilterAdd{cursor_id, value_reg} => (
+            Insn::FilterAdd{cursor_id, key_reg, num_keys} => (
                 "FilterAdd",
                 *cursor_id as i64,
-                *value_reg as i64,
-                0,
+                *key_reg as i64,
+                *num_keys as i64,
                 Value::build_text(""),
                 0,
-                format!("bloom_filter_add({value_reg})"),
+                format!("bloom_filter_add(r[{}..{}])", key_reg, key_reg + num_keys),
             ),
             Insn::SetCookie {
                 db,

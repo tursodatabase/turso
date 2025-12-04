@@ -3764,6 +3764,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rapidhash"
+version = "4.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d8e65c75143ce5d47c55b510297eeb1182f3c739b6043c537670e9fc18612dae"
+dependencies = [
+ "rustversion",
+]
+
+[[package]]
 name = "rayon"
 version = "1.10.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5044,6 +5053,7 @@ dependencies = [
  "quickcheck_macros",
  "rand 0.9.2",
  "rand_chacha 0.9.0",
+ "rapidhash",
  "regex",
  "regex-syntax",
  "roaring",
