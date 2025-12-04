@@ -93,7 +93,13 @@ impl TursoDatabaseAsyncOperation {
     }
     pub fn take_changes_to_capi(&self) -> Result<*const c::turso_sync_changes_t, TursoError> {
         match self.take_result()? {
-            TursoAsyncOperationResult::Changes { changes } => Ok(changes.to_capi()),
+            TursoAsyncOperationResult::Changes { changes } => {
+                if changes.empty() {
+                    Ok(std::ptr::null())
+                } else {
+                    Ok(changes.to_capi())
+                }
+            }
             _ => Err(TursoError {
                 code: TursoStatusCode::Misuse,
                 message: Some("unexpected async operation result".to_string()),
