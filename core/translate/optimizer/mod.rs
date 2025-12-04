@@ -812,6 +812,11 @@ fn optimize_table_access(
                         .enumerate()
                         .filter(|(_, c)| c.usable && c.table_col_pos.is_some())
                         .collect();
+                    // Find this table's position in best_join_order (which excludes build tables)
+                    let join_order_pos = best_join_order
+                        .iter()
+                        .position(|m| m.original_idx == table_idx)
+                        .unwrap_or(best_join_order.len().saturating_sub(1));
 
                     // Build a mapping from table_col_pos to index_col_pos.
                     // Multiple constraints on the same column should share the same index_col_pos.
@@ -857,7 +862,7 @@ fn optimize_table_access(
                     let usable_constraint_refs = usable_constraints_for_join_order(
                         &table_constraints.constraints,
                         &temp_constraint_refs,
-                        &best_join_order[..=i],
+                        &best_join_order[..=join_order_pos],
                     );
 
                     if usable_constraint_refs.is_empty() {

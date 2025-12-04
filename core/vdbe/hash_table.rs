@@ -85,6 +85,17 @@ fn hash_join_key(key_values: &[ValueRef], collations: &[CollationSeq]) -> u64 {
     hasher.finish()
 }
 
+/// Check if any of the key values is NULL.
+/// Rows with NULL join keys should be skipped in hash joins since NULL != NULL in SQL.
+fn has_null_key(key_values: &[Value]) -> bool {
+    key_values.iter().any(|v| matches!(v, Value::Null))
+}
+
+/// Check if any of the key value refs is NULL.
+fn has_null_key_ref(key_values: &[ValueRef]) -> bool {
+    key_values.iter().any(|v| matches!(v, ValueRef::Null))
+}
+
 /// Check if two key value arrays are equal, taking collation into account.
 fn keys_equal(key1: &[Value], key2: &[ValueRef], collations: &[CollationSeq]) -> bool {
     if key1.len() != key2.len() {
@@ -100,9 +111,11 @@ fn keys_equal(key1: &[Value], key2: &[ValueRef], collations: &[CollationSeq]) ->
 }
 
 /// Check if two values are equal, using the specified collation for text comparison.
+/// NOTE: In SQL, NULL = NULL evaluates to NULL (falsy), so this returns false for NULL comparisons.
 fn values_equal(v1: ValueRef, v2: ValueRef, collation: CollationSeq) -> bool {
     match (v1, v2) {
-        (ValueRef::Null, ValueRef::Null) => true,
+        // NULL = NULL is false in SQL (actually NULL, which is falsy)
+        (ValueRef::Null, _) | (_, ValueRef::Null) => false,
         (ValueRef::Integer(i1), ValueRef::Integer(i2)) => i1 == i2,
         (ValueRef::Float(f1), ValueRef::Float(f2)) => f1 == f2,
         (ValueRef::Blob(b1), ValueRef::Blob(b2)) => b1 == b2,
@@ -848,6 +861,7 @@ impl HashTable {
 
     /// Insert a row into the hash table, returns IOResult because this may spill to disk.
     /// When memory budget is exceeded, triggers grace hash join by partitioning and spilling.
+    /// Rows with NULL join keys are skipped since NULL != NULL in SQL.
     pub fn insert(
         &mut self,
         key_values: Vec<Value>,
@@ -859,6 +873,11 @@ impl HashTable {
             "Cannot insert into hash table in state {:?}",
             self.state
         );
+
+        // Skip rows with NULL join keys - they can never match anything since NULL != NULL in SQL
+        if has_null_key(&key_values) {
+            return Ok(IOResult::Done(()));
+        }
 
         // Compute hash of the join keys using collations
         let key_refs: Vec<ValueRef> = key_values.iter().map(|v| v.as_ref()).collect();
@@ -1118,12 +1137,20 @@ impl HashTable {
 
     /// Probe the hash table with the given keys, returns the first matching entry if found.
     /// NOTE: Calling `probe` on a spilled table requires the relevant partition to be loaded.
+    /// Returns None immediately if any probe key is NULL since NULL != NULL in SQL.
     pub fn probe(&mut self, probe_keys: Vec<Value>) -> Option<&HashEntry> {
         turso_assert!(
             self.state == HashTableState::Probing,
             "Cannot probe hash table in state {:?}",
             self.state
         );
+
+        // Skip probing if any key is NULL - NULL can never match anything in SQL
+        if has_null_key(&probe_keys) {
+            self.current_probe_keys = Some(probe_keys);
+            self.current_probe_hash = None;
+            return None;
+        }
 
         // Store probe keys first
         self.current_probe_keys = Some(probe_keys);
@@ -1460,11 +1487,19 @@ impl HashTable {
 
     /// Probe a specific partition with the given keys. The partition must be loaded first via `load_spilled_partition`.
     /// VDBE *must* call load_spilled_partition(partition_idx) and get IOResult::Done before calling probe.
+    /// Returns None immediately if any probe key is NULL since NULL != NULL in SQL.
     pub fn probe_partition(
         &mut self,
         partition_idx: usize,
         probe_keys: &[Value],
     ) -> Option<&HashEntry> {
+        // Skip probing if any key is NULL - NULL can never match anything in SQL
+        if has_null_key(probe_keys) {
+            self.current_probe_keys = Some(probe_keys.to_vec());
+            self.current_probe_hash = None;
+            return None;
+        }
+
         let key_refs: Vec<ValueRef> = probe_keys.iter().map(|v| v.as_ref()).collect();
         let hash = hash_join_key(&key_refs, &self.collations);
 
@@ -2144,6 +2179,50 @@ mod hashtests {
         assert_eq!(entry.payload_values[0], Value::Null);
         assert_eq!(entry.payload_values[1], Value::Text("test".into()));
         assert_eq!(entry.payload_values[2], Value::Null);
+    }
+
+    #[test]
+    fn test_null_keys_are_skipped() {
+        // In SQL, NULL = NULL is false (actually NULL which is falsy).
+        // Hash joins should skip rows with NULL keys during both insert and probe.
+        let io = Arc::new(MemoryIO::new());
+        let config = HashTableConfig {
+            initial_buckets: 4,
+            mem_budget: 1024 * 1024,
+            num_keys: 2,
+            collations: vec![CollationSeq::Binary, CollationSeq::Binary],
+        };
+        let mut ht = HashTable::new(config, io);
+
+        // Insert entry with NULL key - should be silently skipped
+        let null_key = vec![Value::Null, Value::Integer(1)];
+        let _ = ht.insert(null_key.clone(), 100, vec![]).unwrap();
+
+        // Insert entry with non-NULL keys
+        let valid_key = vec![Value::Integer(1), Value::Integer(2)];
+        let _ = ht.insert(valid_key.clone(), 200, vec![]).unwrap();
+
+        // Insert another entry where second key is NULL
+        let null_key2 = vec![Value::Integer(1), Value::Null];
+        let _ = ht.insert(null_key2.clone(), 300, vec![]).unwrap();
+
+        let _ = ht.finalize_build();
+
+        // Only one entry should be in the table (the one with valid keys)
+        assert_eq!(ht.num_entries, 1);
+
+        // Probing with NULL key should return None
+        let result = ht.probe(null_key);
+        assert!(result.is_none());
+
+        // Probing with valid key should return the entry
+        let result = ht.probe(valid_key);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().rowid, 200);
+
+        // Probing with NULL in second position should also return None
+        let result = ht.probe(null_key2);
+        assert!(result.is_none());
     }
 
     #[test]

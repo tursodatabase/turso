@@ -886,9 +886,16 @@ impl ProgramBuilder {
         self.cursor_overrides.clear();
     }
 
+    /// Check if a cursor override is active for a given table.
+    pub fn has_cursor_override(&self, table_ref_id: TableInternalId) -> bool {
+        self.cursor_overrides.contains_key(&table_ref_id.into())
+    }
+
     // translate [CursorKey] to cursor id
     pub fn resolve_cursor_id_safe(&self, key: &CursorKey) -> Option<CursorID> {
-        // Check cursor overrides first, only apply override for table cursors
+        // Check cursor overrides first, only apply override for table cursors.
+        // Index cursor lookups are not overridden because when a cursor override is active,
+        // the calling code (translate_expr) should skip index logic entirely.
         if key.index.is_none() && !key.is_build {
             let table_id: usize = key.table_reference_id.into();
             if let Some(&cursor_id) = self.cursor_overrides.get(&table_id) {
