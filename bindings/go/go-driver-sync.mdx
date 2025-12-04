@@ -56,6 +56,26 @@ struct TursoSyncDbConfig {
     ExperimentalFeatures string
 }
 
+// statistics for the synced database.
+type TursoSyncDbStats struct {
+    // amount of local operations written since last Pull(...) call
+	CdcOperations        int64
+    // size of the main WAL file
+	MainWalSize          int64
+    // size of the revert WAL file
+	RevertWalSize        int64
+    // last successful pull time
+	LastPullUnixTime     int64
+    // last successful push time
+	LastPushUnixTime     int64
+    // total amount of bytes sent over the network (both Push and Pull operations are tracked together)
+	NetworkSentBytes     int64
+    // total amount of bytes received over the network (both Push and Pull operations are tracked together)
+	NetworkReceivedBytes int64
+    // opaque server revision - it MUST NOT be interpreted/parsed in any way
+	Revision             string
+}
+
 // define public structs here
 struct TursoSyncDb { ... }
 

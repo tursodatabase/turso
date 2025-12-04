@@ -512,6 +512,10 @@ func turso_sync_database_wait_changes(self TursoSyncDatabase) (TursoSyncOperatio
 
 // turso_sync_database_apply_changes applies remote changes locally.
 // SAFETY: caller must ensure that no other methods are executing concurrently (push/wait/checkpoint).
+//
+// the method CONSUMES turso_sync_changes_t instance and caller no longer owns it after the call
+// So, the changes MUST NOT be explicitly deallocated after the method call (either successful or not)
+//
 // AsyncOperation returns None.
 func turso_sync_database_apply_changes(self TursoSyncDatabase, changes TursoSyncChanges) (TursoSyncOperation, error) {
 	var op *turso_sync_operation_t
