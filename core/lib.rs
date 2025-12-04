@@ -516,12 +516,52 @@ impl Database {
             encryption_opts.clone(),
         )?;
 
+        // Currently, if a non-zero-sized WAL file exists, the database cannot be opened in MVCC mode.
+        // FIXME: this should initiate immediate checkpoint from WAL->DB in MVCC mode.
+        if db.mvcc_enabled()
+            && std::path::Path::exists(std::path::Path::new(wal_path))
+            && std::path::Path::new(wal_path).metadata().unwrap().len() > 0
+        {
+            return Err(LimboError::InvalidArgument(format!(
+                    "WAL file exists for database {path}, but MVCC is enabled. This is currently not supported. Open the database in non-MVCC mode and run PRAGMA wal_checkpoint(TRUNCATE) to truncate the WAL."
+                )));
+        }
+
+        // If a non-zero-sized logical log file exists, the database cannot be opened in non-MVCC mode,
+        // because the changes in the logical log would not be visible to the non-MVCC connections.
+        if !db.mvcc_enabled() {
+            let db_path = std::path::Path::new(path);
+            let log_path = db_path.with_extension("db-log");
+            if std::path::Path::exists(log_path.as_path())
+                && log_path.as_path().metadata().unwrap().len() > 0
+            {
+                return Err(LimboError::InvalidArgument(format!(
+                    "MVCC logical log file exists for database {path}, but MVCC is disabled. This is not supported. Open the database in MVCC mode and run PRAGMA wal_checkpoint(TRUNCATE) to truncate the logical log.",
+                )));
+            }
+        }
+
+        let shared_wal = WalFileShared::open_shared_if_exists(&io, wal_path)?;
+
+        let mv_store = if db.mvcc_enabled() {
+            let file = io.open_file(&format!("{path}-log"), OpenFlags::default(), false)?;
+            let storage = mvcc::persistent_storage::Storage::new(file);
+            let mv_store = MvStore::new(mvcc::LocalClock::new(), storage);
+            Some(Arc::new(mv_store))
+        } else {
+            None
+        };
+
+        db.shared_wal = shared_wal;
+        db.mv_store.store(mv_store);
+
+        let db = Arc::new(db);
+
         // Check: https://github.com/tursodatabase/turso/pull/1761#discussion_r2154013123
 
-        // parse schema
-        let conn = db._connect(db.mvcc_enabled(), Some(pager))?;
-
-        {
+        if db.db_state.get().is_initialized() {
+            // parse schema
+            let conn = db.connect()?;
             let syms = conn.syms.read();
             let pager = conn.pager.load().clone();
 
@@ -556,11 +596,56 @@ impl Database {
         if opts.enable_mvcc {
             let mv_store = db.get_mv_store();
             let mv_store = mv_store.as_ref().unwrap();
-            let mvcc_bootstrap_conn = conn;
+            let mvcc_bootstrap_conn = db._connect(true, None)?;
             mv_store.bootstrap(mvcc_bootstrap_conn)?;
         }
 
         Ok(db)
+    }
+
+    /// Necessary Pager initialization, so that we are prepared to read from Page 1
+    fn _init(&self) -> Result<Arc<Pager>> {
+        let pager = self.init_pager(None)?;
+        pager.enable_encryption(self.opts.enable_encryption);
+        let pager = Arc::new(pager);
+
+        if self.db_state.get().is_initialized() {
+            let header_ref = pager.io.block(|| HeaderRef::from_pager(&pager))?;
+
+            let header = header_ref.borrow();
+
+            let mode = if header.vacuum_mode_largest_root_page.get() > 0 {
+                if header.incremental_vacuum_enabled.get() > 0 {
+                    AutoVacuumMode::Incremental
+                } else {
+                    AutoVacuumMode::Full
+                }
+            } else {
+                AutoVacuumMode::None
+            };
+
+            // Force autovacuum to None if the experimental flag is not enabled
+            let final_mode = if !self.opts.enable_autovacuum {
+                if mode != AutoVacuumMode::None {
+                    tracing::warn!(
+                        "Database has autovacuum enabled but --experimental-autovacuum flag is not set. Forcing autovacuum to None."
+                    );
+                }
+                AutoVacuumMode::None
+            } else {
+                mode
+            };
+
+            pager.set_auto_vacuum_mode(final_mode);
+
+            tracing::debug!(
+                "Opened existing database. Detected auto_vacuum_mode from header: {:?}, final mode: {:?}",
+                mode,
+                final_mode
+            );
+        }
+
+        Ok(pager)
     }
 
     #[instrument(skip_all, level = Level::INFO)]
