@@ -336,18 +336,18 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
         Ok(())
     }
 
-    pub fn get_next_rowid(&mut self) -> i64 {
+    pub fn get_next_rowid(&mut self) -> Result<IOResult<i64>> {
         // lock so we don't get same two rowids
         let lock = self.next_rowid_lock.clone();
         let _lock = lock.write();
-        let _ = self.last();
+        return_if_io!(self.last());
         match self.current_pos.borrow().clone() {
             CursorPosition::Loaded {
                 row_id,
                 in_btree: _,
-            } => row_id.row_id.to_int_or_panic() + 1,
-            CursorPosition::BeforeFirst => 1,
-            CursorPosition::End => 1,
+            } => Ok(IOResult::Done(row_id.row_id.to_int_or_panic() + 1)),
+            CursorPosition::BeforeFirst => Ok(IOResult::Done(1)),
+            CursorPosition::End => Ok(IOResult::Done(1)),
         }
     }
 
@@ -629,6 +629,7 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
 
 impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
     fn last(&mut self) -> Result<IOResult<()>> {
+        tracing::trace!("last called, state {:?}", self.state.borrow());
         let state = self.state.borrow().clone();
         if state.is_none() {
             let _ = self.table_iterator.take();

@@ -7032,7 +7032,7 @@ pub fn op_new_rowid(
                     );
                     break 'mvcc_newrowid;
                 };
-                mvcc_cursor.get_next_rowid()
+                return_if_io!(mvcc_cursor.get_next_rowid())
             };
             state.registers[*rowid_reg] = Register::Value(Value::Integer(rowid));
             state.pc += 1;
