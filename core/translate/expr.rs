@@ -2094,13 +2094,10 @@ pub fn translate_expr(
                 crate::bail_parse_error!("unknown function {}", name.as_str());
             }
 
-            let func_ctx = FuncCtx {
-                func: func_type.unwrap(),
-                arg_count: args_count,
-            };
+            let func = func_type.unwrap();
 
             // Check if this function supports the (*) syntax by verifying it can be called with 0 args
-            match &func_ctx.func {
+            match &func {
                 Func::Agg(_) => {
                     crate::bail_parse_error!(
                         "misuse of {} function {}(*)",
@@ -2110,6 +2107,72 @@ pub fn translate_expr(
                             "aggregate"
                         },
                         name.as_str()
+                    )
+                }
+                // For functions that need star expansion (json_object, jsonb_object),
+                // expand the * to all columns from the referenced tables as key-value pairs
+                _ if func.needs_star_expansion() => {
+                    let tables = referenced_tables.ok_or_else(|| {
+                        crate::LimboError::ParseError(format!(
+                            "{}(*) requires a FROM clause",
+                            name.as_str()
+                        ))
+                    })?;
+
+                    // Verify there's at least one table to expand
+                    if tables.joined_tables().is_empty() {
+                        return Err(crate::LimboError::ParseError(format!(
+                            "{}(*) requires a FROM clause",
+                            name.as_str()
+                        )));
+                    }
+
+                    // Build arguments: alternating column_name (as string literal), column_value (as column reference)
+                    let mut args: Vec<Box<ast::Expr>> = Vec::new();
+
+                    for table in tables.joined_tables().iter() {
+                        for (col_idx, col) in table.columns().iter().enumerate() {
+                            // Skip hidden columns (like rowid in some cases)
+                            if col.hidden() {
+                                continue;
+                            }
+
+                            // Add column name as a string literal
+                            // Note: ast::Literal::String values must be wrapped in single quotes
+                            // because sanitize_string() strips the first and last character
+                            let col_name =
+                                col.name.clone().unwrap_or_else(|| format!("col{col_idx}"));
+                            let quoted_col_name = format!("'{col_name}'");
+                            args.push(Box::new(ast::Expr::Literal(ast::Literal::String(
+                                quoted_col_name,
+                            ))));
+
+                            // Add column reference using Expr::Column
+                            args.push(Box::new(ast::Expr::Column {
+                                database: None,
+                                table: table.internal_id,
+                                column: col_idx,
+                                is_rowid_alias: col.is_rowid_alias(),
+                            }));
+                        }
+                    }
+
+                    // Create a synthetic FunctionCall with the expanded arguments
+                    let synthetic_call = ast::Expr::FunctionCall {
+                        name: name.clone(),
+                        distinctness: None,
+                        args,
+                        filter_over: filter_over.clone(),
+                        order_by: vec![],
+                    };
+
+                    // Recursively call translate_expr with the synthetic function call
+                    translate_expr(
+                        program,
+                        referenced_tables,
+                        &synthetic_call,
+                        target_register,
+                        resolver,
                     )
                 }
                 // For supported functions, delegate to the existing FunctionCall logic
@@ -3930,6 +3993,23 @@ pub fn bind_and_rewrite_expr<'a>(
                         return Err(crate::LimboError::ParseError(format!(
                             "table {normalized_tbl_name} is not in FROM clause - cross-database column references require the table to be explicitly joined"
                         )));
+                    }
+                }
+                Expr::FunctionCallStar { name, .. } => {
+                    // For functions that need star expansion (json_object, jsonb_object),
+                    // mark all columns from all tables as used so the optimizer doesn't
+                    // create partial covering indexes that would miss columns.
+                    if let Some(referenced_tables) = &mut referenced_tables {
+                        if let Ok(func) = crate::function::Func::resolve_function(name.as_str(), 0)
+                        {
+                            if func.needs_star_expansion() {
+                                for table in referenced_tables.joined_tables_mut().iter_mut() {
+                                    for col_idx in 0..table.columns().len() {
+                                        table.mark_column_used(col_idx);
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 _ => {}

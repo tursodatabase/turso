@@ -1,0 +1,98 @@
+#!/usr/bin/env tclsh
+
+# Tests for json_object(*) - Turso-specific extension to create JSON object from all columns
+# This is NOT part of standard SQLite and should not be run in test-compat
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+
+# Test error handling: json_object(*) without FROM clause should fail
+do_execsql_test_in_memory_any_error json_object_star_no_from_clause {
+    SELECT json_object(*);
+}
+
+do_execsql_test json_object_star_setup {
+    DROP TABLE IF EXISTS js_products;
+    CREATE TABLE js_products (id INTEGER PRIMARY KEY, name TEXT, price REAL);
+    INSERT INTO js_products VALUES (1, 'Widget', 9.99);
+    INSERT INTO js_products VALUES (2, 'Gadget', 19.99);
+} {}
+
+do_execsql_test json_object_star_basic {
+    SELECT json_object(*) FROM js_products WHERE id = 1;
+} {{{"id":1,"name":"Widget","price":9.99}}}
+
+do_execsql_test json_object_star_multiple_rows {
+    SELECT json_object(*) FROM js_products ORDER BY id;
+} {{{"id":1,"name":"Widget","price":9.99}} {{"id":2,"name":"Gadget","price":19.99}}}
+
+do_execsql_test json_object_star_with_alias {
+    SELECT json_object(*) AS data FROM js_products WHERE id = 1;
+} {{{"id":1,"name":"Widget","price":9.99}}}
+
+do_execsql_test json_object_star_null_values {
+    DROP TABLE IF EXISTS js_items;
+    CREATE TABLE js_items (a INTEGER, b TEXT, c REAL);
+    INSERT INTO js_items VALUES (1, NULL, 3.14);
+    SELECT json_object(*) FROM js_items;
+} {{{"a":1,"b":null,"c":3.14}}}
+
+do_execsql_test json_object_star_with_where {
+    SELECT json_object(*) FROM js_products WHERE price > 10;
+} {{{"id":2,"name":"Gadget","price":19.99}}}
+
+# Test json_object(*) in UNION ALL scenario (key use case from issue)
+do_execsql_test json_object_star_union_setup {
+    DROP TABLE IF EXISTS js_services;
+    CREATE TABLE js_services (id INTEGER PRIMARY KEY, service_name TEXT, hourly_rate REAL);
+    INSERT INTO js_services VALUES (100, 'Consulting', 150.00);
+} {}
+
+do_execsql_test json_object_star_union_all {
+    SELECT json_object(*) AS data FROM js_products WHERE id = 1
+    UNION ALL
+    SELECT json_object(*) AS data FROM js_services WHERE id = 100;
+} {{{"id":1,"name":"Widget","price":9.99}} {{"id":100,"service_name":"Consulting","hourly_rate":150.0}}}
+
+# Test jsonb_object(*)
+do_execsql_test jsonb_object_star_basic {
+    SELECT json(jsonb_object(*)) FROM js_products WHERE id = 1;
+} {{{"id":1,"name":"Widget","price":9.99}}}
+
+# Test json_object(*) with table alias
+do_execsql_test json_object_star_table_alias {
+    SELECT json_object(*) FROM js_products p WHERE p.id = 2;
+} {{{"id":2,"name":"Gadget","price":19.99}}}
+
+# Test json_object(*) with join
+do_execsql_test json_object_star_join_setup {
+    DROP TABLE IF EXISTS js_categories;
+    DROP TABLE IF EXISTS js_product_cats;
+    CREATE TABLE js_categories (cat_id INTEGER PRIMARY KEY, cat_name TEXT);
+    INSERT INTO js_categories VALUES (1, 'Electronics');
+    CREATE TABLE js_product_cats (prod_id INTEGER, cat_id INTEGER);
+    INSERT INTO js_product_cats VALUES (1, 1);
+    INSERT INTO js_product_cats VALUES (2, 1);
+} {}
+
+# json_object(*) should include all columns from all tables in a join
+do_execsql_test json_object_star_join {
+    SELECT json_object(*) FROM js_products JOIN js_product_cats ON js_products.id = js_product_cats.prod_id WHERE js_products.id = 1;
+} {{{"id":1,"name":"Widget","price":9.99,"prod_id":1,"cat_id":1}}}
+
+# Test empty table
+do_execsql_test json_object_star_empty_table {
+    DROP TABLE IF EXISTS js_empty_table;
+    CREATE TABLE js_empty_table (x INTEGER, y TEXT);
+    SELECT json_object(*) FROM js_empty_table;
+} {}
+
+# Cleanup
+do_execsql_test json_object_star_cleanup {
+    DROP TABLE js_products;
+    DROP TABLE js_items;
+    DROP TABLE js_services;
+    DROP TABLE js_categories;
+    DROP TABLE js_product_cats;
+    DROP TABLE js_empty_table;
+} {}
