@@ -420,7 +420,9 @@ async fn test_concurrent_unique_constraint_regression() {
 
 #[tokio::test]
 async fn test_encryption() {
-    let db_file = "test-encrypted.db";
+    let temp_dir = tempfile::tempdir().unwrap();
+    let db_file = temp_dir.path().join("test-encrypted.db");
+    let db_file = db_file.to_str().unwrap();
     let encryption_opts = EncryptionOpts {
         hexkey: "b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327".to_string(),
         cipher: "aegis256".to_string(),
@@ -467,7 +469,4 @@ async fn test_encryption() {
         }
         assert_eq!(row_count, 1);
     }
-
-    fs::remove_file("test-encrypted.db").await.unwrap();
-    fs::remove_file("test-encrypted.db-wal").await.unwrap();
 }

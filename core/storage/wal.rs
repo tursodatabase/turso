@@ -1099,6 +1099,7 @@ impl Wal for WalFile {
         let shared_file = self.shared.clone();
         let complete = Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
             let Ok((buf, bytes_read)) = res else {
+                tracing::error!(err = ?res.unwrap_err());
                 page.clear_locked();
                 page.clear_wal_tag();
                 return;

@@ -5,14 +5,14 @@ use crate::{io::Completion, Buffer, CompletionError, Result};
 use std::sync::Arc;
 use tracing::{instrument, Level};
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub enum EncryptionOrChecksum {
     Encryption(EncryptionContext),
     Checksum(ChecksumContext),
     None,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct IOContext {
     encryption_or_checksum: EncryptionOrChecksum,
 }
@@ -121,6 +121,7 @@ impl DatabaseStorage for DatabaseFile {
                 let decrypt_complete =
                     Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
                         let Ok((buf, bytes_read)) = res else {
+                            tracing::error!(err = ?res.unwrap_err());
                             return;
                         };
                         assert!(

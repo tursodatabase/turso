@@ -693,7 +693,7 @@ impl Database {
             nestedness: AtomicI32::new(0),
             compiling_triggers: RwLock::new(Vec::new()),
             executing_triggers: RwLock::new(Vec::new()),
-            encryption_key: RwLock::new(encryption_key),
+            encryption_key: RwLock::new(encryption_key.clone()),
             encryption_cipher_mode: AtomicCipherMode::new(encrytion_cipher),
             sync_mode: AtomicSyncMode::new(SyncMode::Full),
             data_sync_retry: AtomicBool::new(false),
@@ -797,7 +797,11 @@ impl Database {
     }
 
     fn init_pager(&self, requested_page_size: Option<usize>) -> Result<Pager> {
-        let reserved_bytes = self.maybe_get_reserved_space_bytes()?;
+        let cipher = self.encryption_cipher_mode.get();
+        let encryption_key = self.encryption_key.read();
+        let reserved_bytes = self
+            .maybe_get_reserved_space_bytes()?
+            .or_else(|| matches!(cipher, CipherMode::None).then(|| cipher.metadata_size() as u8));
         let disable_checksums = if let Some(reserved_bytes) = reserved_bytes {
             // if the required reserved bytes for checksums is not present, disable checksums
             reserved_bytes != CHECKSUM_REQUIRED_RESERVED_BYTES
@@ -837,6 +841,11 @@ impl Database {
             if disable_checksums {
                 pager.reset_checksum_context();
             }
+            // Set encryption later after `disable_checksums` as it may reset the `pager.io_ctx`
+            if let Some(encryption_key) = encryption_key.as_ref() {
+                pager.enable_encryption(true);
+                pager.set_encryption_context(cipher, encryption_key)?;
+            }
             return Ok(pager);
         }
         let page_size = self.determine_actual_page_size(&shared_wal, requested_page_size)?;
@@ -866,6 +875,11 @@ impl Database {
         }
         if disable_checksums {
             pager.reset_checksum_context();
+        }
+        // Set encryption later after `disable_checksums` as it may reset the `pager.io_ctx`
+        if let Some(encryption_key) = encryption_key.as_ref() {
+            pager.enable_encryption(true);
+            pager.set_encryption_context(cipher, encryption_key)?;
         }
         let file = self
             .io
