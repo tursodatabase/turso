@@ -9573,15 +9573,39 @@ pub fn op_filter(
         Filter {
             cursor_id,
             target_pc,
-            value_reg
+            key_reg,
+            num_keys
         },
         insn
     );
-    let value = state.registers[*value_reg].get_value();
-    let filter = state
-        .get_bloom_filter(*cursor_id)
-        .expect("FilterAdd must have created a bloom filter for this cursor_id");
-    if !filter.contains_value(value) {
+    let Some(filter) = state.get_bloom_filter(*cursor_id) else {
+        // always safe to fall though, no filter present
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    };
+    let contains = if *num_keys == 1 {
+        // Single key optimization, avoid allocating a Vec
+        let value = state.registers[*key_reg].get_value();
+        if matches!(value, Value::Null) {
+            // its always safe to fall through, so this *should* be `true` but
+            // since it's always an equality predicate and we have a NULL value,
+            // we can just short-circuit to false here.
+            false
+        } else {
+            filter.contains_value(value)
+        }
+    } else {
+        let values: Vec<&Value> = (0..*num_keys)
+            .map(|i| state.registers[*key_reg + i].get_value())
+            .collect();
+        if values.iter().any(|v| matches!(*v, Value::Null)) {
+            false
+        } else {
+            filter.contains_values(&values)
+        }
+    };
+
+    if !contains {
         state.pc = target_pc.as_offset_int();
     } else {
         state.pc += 1;
@@ -9599,18 +9623,26 @@ pub fn op_filter_add(
     load_insn!(
         FilterAdd {
             cursor_id,
-            value_reg
+            key_reg,
+            num_keys
         },
         insn
     );
-    let reg = &state.registers[*value_reg] as *const Register;
-    let filter = state.get_or_create_bloom_filter(*cursor_id);
-    // safety: we only need to read from reg, it's not mutated during this call
-    match unsafe { &*reg } {
-        Register::Record(ref rec) => filter.insert_record_key(&rec.get_values()),
-        Register::Value(ref value) => filter.insert_value(value),
-        _ => unreachable!(),
-    };
+
+    if *num_keys == 1 {
+        let reg: *const Register = &state.registers[*key_reg];
+        let value = unsafe { &*reg }.get_value();
+        let filter = state.get_or_create_bloom_filter(*cursor_id);
+        filter.insert_value(value);
+    } else {
+        let values: Vec<Value> = (0..*num_keys)
+            .map(|i| state.registers[*key_reg + i].get_value().clone())
+            .collect();
+        let filter = state.get_or_create_bloom_filter(*cursor_id);
+        let value_refs: Vec<&Value> = values.iter().collect();
+        filter.insert_values(&value_refs);
+    }
+
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }

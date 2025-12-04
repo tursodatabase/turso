@@ -30,8 +30,6 @@ impl fmt::Debug for BloomFilter {
 }
 
 impl BloomFilter {
-    const NULL: u64 = u64::MAX;
-
     /// Creates a new bloom filter with default parameters.
     pub fn new() -> Self {
         Self::with_capacity(DEFAULT_EXPECTED_ITEMS, DEFAULT_FALSE_POSITIVE_RATE)
@@ -72,11 +70,9 @@ impl BloomFilter {
     }
 
     /// Inserts a Value into the bloom filter.
+    /// Safety NOTE: does not accept NULL values.
     pub fn insert_value(&mut self, value: &Value) {
         match value {
-            Value::Null => {
-                self.inner.insert(&Self::NULL);
-            }
             Value::Integer(i) => {
                 self.inner.insert(i);
             }
@@ -89,6 +85,9 @@ impl BloomFilter {
             Value::Blob(b) => {
                 self.inner.insert(&b.as_slice());
             }
+            Value::Null => {
+                // we do not insert NULLs into
+            }
         }
         self.count += 1;
     }
@@ -96,34 +95,41 @@ impl BloomFilter {
     /// Checks if a Value might be in the bloom filter.
     pub fn contains_value(&self, value: &Value) -> bool {
         match value {
-            Value::Null => self.inner.contains(&Self::NULL),
             Value::Integer(i) => self.inner.contains(i),
             Value::Float(f) => self.inner.contains(&f.to_bits()),
             Value::Text(s) => self.inner.contains(&s.as_str().as_bytes()),
             Value::Blob(b) => self.inner.contains(&b.as_slice()),
+            Value::Null => false,
         }
     }
 
-    /// Inserts a record key into the bloom filter.
-    pub fn insert_record_key(&mut self, values: &[ValueRef]) {
-        let mut hasher = twox_hash::XxHash64::default();
+    /// Inserts multiple owned Values as a composite key into the bloom filter.
+    /// This is because bloom filters only support a single value insertion, so to handle multi
+    /// join-key situations we hash the composite key into a single u64 and then insert that
+    pub fn insert_values(&mut self, values: &[&Value]) {
+        let mut hasher = rapidhash::fast::RapidHasher::default();
         for value in values {
-            hash_value(&mut hasher, value);
+            hash_value(&mut hasher, &value.as_ref());
         }
         let hash = hasher.finish();
         self.inner.insert(&hash);
         self.count += 1;
     }
 
-    /// Checks if a record key might be in the bloom filter
-    pub fn contains_record_key(&self, values: &[ValueRef]) -> bool {
-        let mut hasher = twox_hash::XxHash64::default();
+    /// Checks if multiple owned Values as a composite key might be in the bloom filter.
+    pub fn contains_values(&self, values: &[&Value]) -> bool {
+        let mut hasher = rapidhash::fast::RapidHasher::default();
         for value in values {
-            hash_value(&mut hasher, value);
+            if matches!(value, Value::Null) {
+                // if any value is NULL, we can never have a match
+                return false;
+            }
+            hash_value(&mut hasher, &value.as_ref());
         }
         let hash = hasher.finish();
         self.inner.contains(&hash)
     }
+
     pub fn count(&self) -> usize {
         self.count
     }
@@ -142,12 +148,11 @@ impl Default for BloomFilter {
     }
 }
 
-/// Hashes a Value into the provided hasher.
+/// Hashes an owned Value into the provided hasher.
 fn hash_value<H: Hasher>(hasher: &mut H, value: &ValueRef) {
     match value {
-        ValueRef::Null => {
-            0u8.hash(hasher);
-        }
+        // do nothing for NULLs as we will always return false for set membership
+        ValueRef::Null => {}
         ValueRef::Integer(i) => {
             1u8.hash(hasher);
             i.hash(hasher);
@@ -158,7 +163,7 @@ fn hash_value<H: Hasher>(hasher: &mut H, value: &ValueRef) {
         }
         ValueRef::Text(s) => {
             3u8.hash(hasher);
-            s.hash(hasher);
+            s.as_str().hash(hasher);
         }
         ValueRef::Blob(b) => {
             4u8.hash(hasher);
@@ -200,20 +205,6 @@ mod bloomtests {
         assert!(bf.contains_value(&int_val));
         assert!(bf.contains_value(&text_val));
         assert!(bf.contains_value(&null_val));
-    }
-
-    #[test]
-    fn test_bloom_filter_record_keys() {
-        let mut bf = BloomFilter::new();
-
-        let key1 = vec![ValueRef::Integer(1), ValueRef::Integer(2)];
-        let key2 = vec![ValueRef::Integer(3), ValueRef::Integer(4)];
-
-        bf.insert_record_key(&key1);
-        bf.insert_record_key(&key2);
-
-        assert!(bf.contains_record_key(&key1));
-        assert!(bf.contains_record_key(&key2));
     }
 
     #[test]

@@ -25,6 +25,7 @@ use crate::{
         plan::{DistinctCtx, Distinctness, Scan, SeekKeyComponent},
         result_row::emit_select_result,
     },
+    turso_assert,
     types::SeekOp,
     vdbe::{
         affinity,
@@ -623,8 +624,11 @@ pub fn open_loop(
                             target_pc: next,
                         });
                     }
-                    Search::Seek { index, .. } => {
+                    Search::Seek {
+                        index, seek_def, ..
+                    } => {
                         // Otherwise, it's an index/rowid scan, i.e. first a seek is performed and then a scan until the comparison expression is not satisfied anymore.
+                        let mut bloom_filter = false;
                         if let Some(index) = index {
                             if index.ephemeral {
                                 let table_has_rowid = if let Table::BTree(btree) = &table.table {
@@ -632,7 +636,10 @@ pub fn open_loop(
                                 } else {
                                     false
                                 };
-                                let _ = emit_autoindex(
+                                let num_seek_keys = seek_def.size(&seek_def.start);
+                                let AutoIndexResult {
+                                    use_bloom_filter, ..
+                                } = emit_autoindex(
                                     program,
                                     index,
                                     table_cursor_id.expect(
@@ -641,7 +648,10 @@ pub fn open_loop(
                                     index_cursor_id
                                         .expect("an ephemeral index must have an index cursor"),
                                     table_has_rowid,
+                                    num_seek_keys,
+                                    seek_def,
                                 )?;
+                                bloom_filter = use_bloom_filter;
                             }
                         }
 
@@ -652,11 +662,6 @@ pub fn open_loop(
                                 )
                             })
                         });
-                        let Search::Seek { seek_def, .. } = search else {
-                            unreachable!(
-                                "Rowid equality point lookup should have been handled above"
-                            );
-                        };
 
                         let max_registers = seek_def
                             .size(&seek_def.start)
@@ -671,6 +676,7 @@ pub fn open_loop(
                             start_reg,
                             loop_end,
                             index.as_ref(),
+                            bloom_filter,
                         )?;
                         emit_seek_termination(
                             program,
@@ -1298,6 +1304,7 @@ fn emit_seek(
     start_reg: usize,
     loop_end: BranchOffset,
     seek_index: Option<&Arc<Index>>,
+    use_bloom_filter: bool,
 ) -> Result<()> {
     let is_index = seek_index.is_some();
     if seek_def.prefix.is_empty() && matches!(seek_def.start.last_component, SeekKeyComponent::None)
@@ -1397,22 +1404,17 @@ fn emit_seek(
     }
 
     if let Some(idx) = seek_index {
-        if idx.ephemeral {
-            // To potentially save the Seek here, we can check the bloom filter we built alongside
-            // the ephemeral index. If the value is not present, we jump to loop_end,
-            // skip bloom filter for non-binary collations since it uses binary hashing.
-            let use_bloom_filter = idx
-                .columns
-                .first()
-                .and_then(|col| col.collation)
-                .is_none_or(|coll| matches!(coll, CollationSeq::Binary | CollationSeq::Unset));
-            if use_bloom_filter {
-                program.emit_insn(Insn::Filter {
-                    cursor_id: seek_cursor_id,
-                    value_reg: start_reg,
-                    target_pc: loop_end,
-                });
-            }
+        if use_bloom_filter {
+            turso_assert!(
+                idx.ephemeral,
+                "bloom filter can only be used with ephemeral indexes"
+            );
+            program.emit_insn(Insn::Filter {
+                cursor_id: seek_cursor_id,
+                key_reg: start_reg,
+                num_keys: num_regs,
+                target_pc: loop_end,
+            });
         }
     }
     match seek_def.start.op {
@@ -1612,6 +1614,11 @@ fn emit_seek_termination(
     Ok(())
 }
 
+struct AutoIndexResult {
+    _cursor_id: CursorID,
+    use_bloom_filter: bool,
+}
+
 /// Open an ephemeral index cursor and build an automatic index on a table.
 /// This is used as a last-resort to avoid a nested full table scan
 /// Returns the cursor id of the ephemeral index cursor.
@@ -1621,7 +1628,9 @@ fn emit_autoindex(
     table_cursor_id: CursorID,
     index_cursor_id: CursorID,
     table_has_rowid: bool,
-) -> Result<CursorID> {
+    num_seek_keys: usize,
+    seek_def: &SeekDef,
+) -> Result<AutoIndexResult> {
     assert!(index.ephemeral, "Index {} is not ephemeral", index.name);
     let label_ephemeral_build_end = program.allocate_label();
     // Since this typically happens in an inner loop, we only build it once.
@@ -1660,15 +1669,20 @@ fn emit_autoindex(
         index_name: Some(index.name.clone()),
         affinity_str: None,
     });
-    let use_bloom_filter = index
-        .columns
-        .first()
-        .and_then(|col| col.collation)
-        .is_none_or(|coll| matches!(coll, CollationSeq::Binary | CollationSeq::Unset));
+    let is_eq = matches!(
+        seek_def.start.op,
+        SeekOp::GE { eq_only: true } | SeekOp::LE { eq_only: true }
+    );
+    // Skip bloom filter for non-binary collations since it uses binary hashing.
+    let use_bloom_filter = index.columns.iter().take(num_seek_keys).all(|col| {
+        col.collation
+            .is_none_or(|coll| matches!(coll, CollationSeq::Binary | CollationSeq::Unset))
+    }) && is_eq;
     if use_bloom_filter {
         program.emit_insn(Insn::FilterAdd {
             cursor_id: index_cursor_id,
-            value_reg: ephemeral_cols_start_reg,
+            key_reg: ephemeral_cols_start_reg,
+            num_keys: num_seek_keys,
         });
     }
     program.emit_insn(Insn::IdxInsert {
@@ -1683,5 +1697,8 @@ fn emit_autoindex(
         pc_if_next: label_ephemeral_build_loop_start,
     });
     program.preassign_label_to_next_insn(label_ephemeral_build_end);
-    Ok(index_cursor_id)
+    Ok(AutoIndexResult {
+        _cursor_id: index_cursor_id,
+        use_bloom_filter,
+    })
 }
