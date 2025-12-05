@@ -119,7 +119,8 @@ pub fn convert_ref_dbtype_to_jsonb(val: ValueRef<'_>, strict: Conv) -> crate::Re
                 Jsonb::from_str_with_mode(&text, strict)
             } else {
                 // Handle as a string literal otherwise
-                let mut str = text.replace('"', "\\\"");
+                // Escape backslashes first, then double quotes
+                let mut str = text.replace('\\', "\\\\").replace('"', "\\\"");
                 // Quote the string to make it a JSON string
                 str.insert(0, '"');
                 str.push('"');
@@ -1292,6 +1293,37 @@ mod tests {
         let input = [key.clone(), value, key];
 
         assert!(json_object(&input).is_err());
+    }
+
+    #[test]
+    fn test_json_object_escapes_special_characters() {
+        let cases = [
+            // (key, value, expected_json)
+            ("key", r"Hello\World", r#"{"key":"Hello\\World"}"#),
+            (
+                r"key\with\backslash",
+                "value",
+                r#"{"key\\with\\backslash":"value"}"#,
+            ),
+            ("key", "Hello\nWorld", r#"{"key":"Hello\nWorld"}"#),
+            ("key", "Hello\tWorld", r#"{"key":"Hello\tWorld"}"#),
+            ("key", "Hello\rWorld", r#"{"key":"Hello\rWorld"}"#),
+            ("key", "Hello\x01World", r#"{"key":"Hello\u0001World"}"#),
+            ("key", "Hello\x08\x0cWorld", r#"{"key":"Hello\b\fWorld"}"#),
+        ];
+
+        for (key, value, expected) in cases {
+            let input = [Value::build_text(key), Value::build_text(value)];
+            let result = json_object(&input).unwrap();
+            let Value::Text(json_text) = result else {
+                panic!("Expected Value::Text");
+            };
+            assert_eq!(
+                json_text.as_str(),
+                expected,
+                "Failed for key={key:?}, value={value:?}"
+            );
+        }
     }
 
     #[test]

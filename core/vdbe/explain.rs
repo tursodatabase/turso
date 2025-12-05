@@ -1613,23 +1613,23 @@ pub fn insn_to_row(
                 0,
                 "".to_string(),
             ),
-            Insn::Filter{cursor_id, target_pc, value_reg} => (
+            Insn::Filter{cursor_id, target_pc, key_reg, num_keys} => (
                 "Filter",
                 *cursor_id as i64,
                 target_pc.as_debug_int() as i64,
-                *value_reg as i64,
+                *key_reg as i64,
                 Value::build_text(""),
-                0,
-                format!("if !contains({value_reg}) goto {}", target_pc.as_debug_int()),
+                *num_keys as i64,
+                format!("if !bloom_filter(r[{}..{}]) goto {}", key_reg, key_reg + num_keys, target_pc.as_debug_int()),
             ),
-            Insn::FilterAdd{cursor_id, value_reg} => (
+            Insn::FilterAdd{cursor_id, key_reg, num_keys} => (
                 "FilterAdd",
                 *cursor_id as i64,
-                *value_reg as i64,
-                0,
+                *key_reg as i64,
+                *num_keys as i64,
                 Value::build_text(""),
                 0,
-                format!("bloom_filter_add({value_reg})"),
+                format!("bloom_filter_add(r[{}..{}])", key_reg, key_reg + num_keys),
             ),
             Insn::SetCookie {
                 db,
@@ -1947,6 +1947,72 @@ pub fn insn_to_row(
         "FkIfZero",
             target_pc.as_debug_int() as i64,
             *deferred as i64,
+            0,
+            Value::build_text(""),
+            0,
+            String::new(),
+        ),
+        Insn::HashBuild{cursor_id, key_start_reg, num_keys, hash_table_id: hash_table_reg, mem_budget, collations: _, payload_start_reg, num_payload} => {
+            let payload_info = if let Some(p_reg) = payload_start_reg {
+                format!(" payload=r[{}]..r[{}]", p_reg, p_reg + num_payload - 1)
+            } else {
+                String::new()
+            };
+            (
+                "HashBuild",
+                *cursor_id as i64,
+                *key_start_reg as i64,
+                *num_keys as i64,
+                Value::build_text(format!("r=[{hash_table_reg}] budget={mem_budget}{payload_info}")),
+                0,
+                String::new(),
+            )
+        }
+        Insn::HashBuildFinalize{hash_table_id: hash_table_reg} => (
+            "HashBuildFinalize",
+            *hash_table_reg as i64,
+            0,
+            0,
+            Value::build_text(""),
+            0,
+            String::new(),
+        ),
+        Insn::HashProbe{hash_table_id: hash_table_reg, key_start_reg, num_keys, dest_reg, target_pc, payload_dest_reg, num_payload} => {
+            let payload_info = if let Some(p_reg) = payload_dest_reg {
+                format!(" payload=r[{}]..r[{}]", p_reg, p_reg + num_payload - 1)
+            } else {
+                String::new()
+            };
+            (
+                "HashProbe",
+                *hash_table_reg as i64,
+                *key_start_reg as i64,
+                *num_keys as i64,
+                Value::build_text(format!("r[{}]={}{}", dest_reg, target_pc.as_debug_int(), payload_info)),
+                0,
+                String::new(),
+            )
+        }
+        Insn::HashNext{hash_table_id: hash_table_reg, dest_reg, target_pc, payload_dest_reg, num_payload} => {
+            let payload_info = if let Some(p_reg) = payload_dest_reg {
+                format!(" payload=r[{}]..r[{}]", p_reg, p_reg + num_payload - 1)
+            } else {
+                String::new()
+            };
+            (
+                "HashNext",
+                *hash_table_reg as i64,
+                *dest_reg as i64,
+                target_pc.as_debug_int() as i64,
+                Value::build_text(payload_info),
+                0,
+                String::new(),
+            )
+        }
+        Insn::HashClose{hash_table_id: hash_table_reg} => (
+            "HashClose",
+            *hash_table_reg as i64,
+            0,
             0,
             Value::build_text(""),
             0,

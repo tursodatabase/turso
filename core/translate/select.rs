@@ -704,6 +704,7 @@ fn count_plan_required_cursors(plan: &SelectPlan) -> usize {
                 Search::Seek { index, .. } => 1 + index.is_some() as usize,
             }
             Operation::IndexMethodQuery(_) => 1,
+            Operation::HashJoin(_) => 2,
         } + if let Table::FromClauseSubquery(from_clause_subquery) = &t.table {
             count_plan_required_cursors(&from_clause_subquery.plan)
         } else {
@@ -724,6 +725,7 @@ fn estimate_num_instructions(select: &SelectPlan) -> usize {
             Operation::Scan { .. } => 10,
             Operation::Search(_) => 15,
             Operation::IndexMethodQuery(_) => 15,
+            Operation::HashJoin(_) => 20,
         } + if let Table::FromClauseSubquery(from_clause_subquery) = &t.table {
             10 + estimate_num_instructions(&from_clause_subquery.plan)
         } else {
@@ -748,6 +750,7 @@ fn estimate_num_labels(select: &SelectPlan) -> usize {
             Operation::Scan { .. } => 3,
             Operation::Search(_) => 3,
             Operation::IndexMethodQuery(_) => 3,
+            Operation::HashJoin(_) => 3,
         } + if let Table::FromClauseSubquery(from_clause_subquery) = &t.table {
             3 + estimate_num_labels(&from_clause_subquery.plan)
         } else {

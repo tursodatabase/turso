@@ -9,8 +9,10 @@ use crate::{
     translate::{
         collate::get_collseq_from_expr,
         emitter::UpdateRowSource,
+        expr::as_binary_components,
         expression_index::{normalize_expr_for_index_matching, single_table_column_usage},
-        optimizer::constraints::SeekRangeConstraint,
+        optimizer::constraints::{BinaryExprSide, SeekRangeConstraint},
+        planner::determine_where_to_eval_term,
     },
     vdbe::{
         affinity::Affinity,
@@ -24,7 +26,7 @@ use crate::{schema::Type, types::SeekOp};
 
 use turso_parser::ast::TableInternalId;
 
-use super::{emitter::OperationMode, planner::determine_where_to_eval_term};
+use super::emitter::OperationMode;
 
 #[derive(Debug, Clone)]
 pub struct ResultSetColumn {
@@ -121,11 +123,12 @@ impl WhereTerm {
         &self,
         join_order: &[JoinOrderMember],
         subqueries: &[NonFromClauseSubquery],
+        table_references: Option<&TableReferences>,
     ) -> bool {
         if self.consumed {
             return false;
         }
-        let Ok(eval_at) = self.eval_at(join_order, subqueries) else {
+        let Ok(eval_at) = self.eval_at(join_order, subqueries, table_references) else {
             return false;
         };
         eval_at == EvalAt::BeforeLoop
@@ -136,11 +139,12 @@ impl WhereTerm {
         loop_idx: usize,
         join_order: &[JoinOrderMember],
         subqueries: &[NonFromClauseSubquery],
+        table_references: Option<&TableReferences>,
     ) -> bool {
         if self.consumed {
             return false;
         }
-        let Ok(eval_at) = self.eval_at(join_order, subqueries) else {
+        let Ok(eval_at) = self.eval_at(join_order, subqueries, table_references) else {
             return false;
         };
         eval_at == EvalAt::Loop(loop_idx)
@@ -150,8 +154,9 @@ impl WhereTerm {
         &self,
         join_order: &[JoinOrderMember],
         subqueries: &[NonFromClauseSubquery],
+        table_references: Option<&TableReferences>,
     ) -> Result<EvalAt> {
-        determine_where_to_eval_term(self, join_order, subqueries)
+        determine_where_to_eval_term(self, join_order, subqueries, table_references)
     }
 }
 
@@ -932,6 +937,60 @@ pub struct ExpressionIndexUsage {
     pub columns_mask: ColumnUsedMask,
 }
 
+/// Represents one key pair in a hash join equality condition.
+/// For `expr1 = expr2`, this tracks which WHERE term contains the equality
+/// and which side of the equality belongs to the build table.
+#[derive(Debug, Clone, Copy)]
+pub struct HashJoinKey {
+    /// Index into the where_clause vector
+    pub where_clause_idx: usize,
+    /// Which side of the binary equality expression belongs to the build table.
+    /// The other side belongs to the probe table.
+    pub build_side: BinaryExprSide,
+}
+
+impl HashJoinKey {
+    /// Get the build table's expression from the WHERE clause.
+    pub fn get_build_expr<'a>(&self, where_clause: &'a [WhereTerm]) -> &'a ast::Expr {
+        let where_term = &where_clause[self.where_clause_idx];
+        let Ok(Some((lhs, _, rhs))) = as_binary_components(&where_term.expr) else {
+            panic!("HashJoinKey: expected a valid binary expression");
+        };
+        if self.build_side == BinaryExprSide::Lhs {
+            lhs
+        } else {
+            rhs
+        }
+    }
+
+    /// Get the probe table's expression from the WHERE clause.
+    pub fn get_probe_expr<'a>(&self, where_clause: &'a [WhereTerm]) -> &'a ast::Expr {
+        let where_term = &where_clause[self.where_clause_idx];
+        let Ok(Some((lhs, _, rhs))) = as_binary_components(&where_term.expr) else {
+            panic!("HashJoinKey: expected a valid binary expression");
+        };
+        if self.build_side == BinaryExprSide::Lhs {
+            rhs // probe is the opposite side
+        } else {
+            lhs
+        }
+    }
+}
+
+/// Hash join operation metadata
+#[derive(Debug, Clone)]
+pub struct HashJoinOp {
+    /// Index of the build table in the join order
+    pub build_table_idx: usize,
+    /// Index of the probe table in the join order
+    pub probe_table_idx: usize,
+    /// Join key references, each entry points to an equality condition in the [WhereTerm]
+    /// and indicates which side of the equality belongs to the build table.
+    pub join_keys: Vec<HashJoinKey>,
+    /// Memory budget for hash table
+    pub mem_budget: usize,
+}
+
 #[derive(Clone, Debug)]
 #[allow(clippy::large_enum_variant)]
 pub enum Operation {
@@ -944,6 +1003,11 @@ pub enum Operation {
     Search(Search),
     // Access through custom index method query
     IndexMethodQuery(IndexMethodQuery),
+    // Hash join operation
+    // This operation is used on the probe side of a hash join.
+    // The build table is accessed normally (via Scan), and the probe table
+    // uses this operation to indicate it should probe the hash table.
+    HashJoin(HashJoinOp),
 }
 
 impl Operation {
@@ -969,6 +1033,7 @@ impl Operation {
             Operation::IndexMethodQuery(IndexMethodQuery { index, .. }) => Some(index),
             Operation::Scan(_) => None,
             Operation::Search(Search::RowidEq { .. }) => None,
+            Operation::HashJoin(_) => None,
         }
     }
 }

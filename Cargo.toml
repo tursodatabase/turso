@@ -28,6 +28,7 @@ members = [
     "tests",
     "parser",
     "sync/engine",
+    "sync/sdk-kit",
     "sql_generation",
     "whopper",
     "perf/throughput/turso",
@@ -50,6 +51,7 @@ turso = { path = "bindings/rust", version = "0.4.0-pre.7" }
 turso_node = { path = "bindings/javascript", version = "0.4.0-pre.7" }
 turso_sdk_kit = { path = "sdk-kit", version = "0.4.0-pre.7" }
 turso_sdk_kit_macros = { path = "sdk-kit-macros", version = "0.4.0-pre.7" }
+turso_sync_sdk_kit = { path = "sync/sdk-kit", version = "0.4.0-pre.7" }
 limbo_completion = { path = "extensions/completion", version = "0.4.0-pre.7" }
 turso_core = { path = "core", version = "0.4.0-pre.7" }
 turso_sync_engine = { path = "sync/engine", version = "0.4.0-pre.7" }
@@ -112,6 +114,14 @@ debug = "line-tables-only"
 codegen-units = 1
 panic = "abort"
 lto = true
+
+# override settings for sdk-kit release profiles in order to reduce size of produced binaries
+# otherwise, some platforms will have enormous libs (150MB+)
+[profile.lib-release]
+inherits = "release"
+debug = false
+codegen-units = 16
+lto = false
 
 [profile.antithesis]
 inherits = "release"

@@ -671,12 +671,6 @@ impl Pager {
         })
     }
 
-    pub fn begin_statement(&self, db_size: u32) -> Result<()> {
-        self.open_subjournal()?;
-        self.open_savepoint(db_size)?;
-        Ok(())
-    }
-
     /// Open the subjournal if not yet open.
     /// The subjournal is a file that is used to store the "before images" of pages for the
     /// current savepoint. If the savepoint is rolled back, the pages can be restored from the subjournal.
@@ -767,9 +761,28 @@ impl Pager {
         Ok(())
     }
 
+    /// try to "acquire" ownership on the subjournal of the connection-scoped pager
+    /// if another statement owns the subjournal - return Busy error and let the caller retry attempt later
+    pub fn try_use_subjournal(&self) -> Result<()> {
+        let subjournal = self.subjournal.read();
+        let subjournal = subjournal.as_ref().expect("subjournal must be opened");
+        subjournal.try_use()
+    }
+
+    /// release ownership of the subjournal
+    /// caller must guarantee that [Self::stop_use_subjournal] is called only after successful call to the [Self::try_use_subjournal]
+    pub fn stop_use_subjournal(&self) {
+        let subjournal = self.subjournal.read();
+        let subjournal = subjournal.as_ref().expect("subjournal must be opened");
+        subjournal.stop_use()
+    }
+
     pub fn open_savepoint(&self, db_size: u32) -> Result<()> {
-        self.open_subjournal()?;
-        let subjournal_offset = self.subjournal.read().as_ref().unwrap().size()?;
+        let subjournal_offset = {
+            let subjournal = self.subjournal.read();
+            let subjournal = subjournal.as_ref().expect("subjournal must be opened");
+            subjournal.size()?
+        };
         // Currently as we only have anonymous savepoints opened at the start of a statement,
         // the subjournal offset should always be 0 as we should only have max 1 savepoint
         // opened at any given time.
@@ -949,6 +962,7 @@ impl Pager {
     }
 
     pub fn set_wal(&mut self, wal: Rc<RefCell<dyn Wal>>) {
+        wal.borrow_mut().set_io_context(self.io_ctx.read().clone());
         self.wal = Some(wal);
     }
 

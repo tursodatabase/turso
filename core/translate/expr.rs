@@ -305,7 +305,10 @@ fn translate_in_list(
         });
     }
 
-    program.resolve_label(label_ok, program.offset());
+    // we don't know exactly what instruction will came next and it's important to chain label to the execution flow rather then exact next instruction
+    // for example, next instruction can be register assignment, which can be moved by optimized to the constant section
+    // in this case, label_ok must be changed accordingly and be re-binded to another instruction followed the current translation unit after constants reording
+    program.preassign_label_to_next_insn(label_ok);
 
     // by default if IN expression is true we just continue to the next instruction
     if condition_metadata.jump_if_condition_is_true {
@@ -2145,9 +2148,16 @@ pub fn translate_expr(
             column,
             is_rowid_alias,
         } => {
+            // When a cursor override is active for this table, we bypass all index logic
+            // and read directly from the override cursor. This is used during hash join
+            // build phases where we iterate using a separate cursor and don't want to use any index.
+            let has_cursor_override = program.has_cursor_override(*table_ref_id);
+
             let (index, index_method, use_covering_index) = {
-                if let Some(table_reference) = referenced_tables
-                    .unwrap()
+                if has_cursor_override {
+                    (None, None, false)
+                } else if let Some(table_reference) = referenced_tables
+                    .expect("table_references needed translating Expr::Column")
                     .find_joined_table_by_internal_id(*table_ref_id)
                 {
                     (

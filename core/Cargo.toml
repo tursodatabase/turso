@@ -88,6 +88,7 @@ bloom = "0.3.2"
 rustc-hash = "2.0"
 either = { workspace = true }
 tracing-subscriber.workspace = true
+rapidhash = "4.1.1"
 
 [build-dependencies]
 chrono = { workspace = true, default-features = false }

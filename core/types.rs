@@ -2632,7 +2632,7 @@ macro_rules! return_and_restore_if_io {
     };
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 pub enum SeekResult {
     /// Record matching the [SeekOp] found in the B-tree and cursor was positioned to point onto that record
     Found,

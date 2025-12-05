@@ -136,6 +136,10 @@ typedef struct
     const char *log_level;
 } turso_config_t;
 
+// return STATIC zero-terminated C-string with turso version (sem-ver string e.g. x.y.z-...)
+// (this string DO NOT need to be deallocated as it static)
+const char *turso_version();
+
 /** Setup global database info */
 turso_status_t turso_setup(turso_config_t config);
 
@@ -146,7 +150,7 @@ typedef struct
 } turso_database_create_result_t;
 
 /** Create database holder but do not open it */
-turso_database_create_result_t turso_database_create(turso_database_config_t config);
+turso_database_create_result_t turso_database_new(turso_database_config_t config);
 
 /** Open database */
 turso_status_t turso_database_open(turso_database_t database);
