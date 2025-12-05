@@ -70,6 +70,7 @@ enum DateTimeOutput {
     // Holds the format string
     StrfTime(String),
     JuliaDay,
+    UnixEpoch,
 }
 
 fn exec_datetime<I, E, V>(values: I, output_type: DateTimeOutput) -> Value
@@ -84,18 +85,71 @@ where
         return format_dt(now, output_type, false);
     }
     let mut values = values.peekable();
-    let first = values.peek().unwrap();
-    if let Some(mut dt) = parse_naive_date_time(first) {
-        // if successful, treat subsequent entries as modifiers
-        modify_dt(&mut dt, values.skip(1), output_type)
-    } else {
-        // if the first argument is NOT a valid date/time, treat the entire set of values as modifiers.
+    let (initial_numeric_value, is_implicit_now, parsed_dt) = {
+        let first = values.peek().unwrap();
+
+        let initial_numeric = match first.as_value_ref() {
+            ValueRef::Integer(i) => Some(i as f64),
+            ValueRef::Float(f) => Some(f),
+            _ => None,
+        };
+
+        let parsed = parse_naive_date_time(first);
+
+        // Strict check. Only 'subsec' or 'subsecond' allow implicit 'now'.
+        let is_mod = if let ValueRef::Text(s) = first.as_value_ref() {
+            let s = s.as_str();
+            s.eq_ignore_ascii_case("subsec") || s.eq_ignore_ascii_case("subsecond")
+        } else {
+            false
+        };
+
+        (initial_numeric, is_mod, parsed)
+    };
+
+    if let Some(mut dt) = parsed_dt {
+        // CASE 1: Standard Date/Time
+        // Skip the first arg because we consumed it as the base date.
+        modify_dt(
+            &mut dt,
+            values.skip(1),
+            output_type,
+            initial_numeric_value,
+            true,
+        )
+    } else if is_implicit_now {
+        // CASE 2: Implicit Now (Only for 'subsec')
+        // Use 'now' as base.
+        // Do NOT skip the first arg; pass it to modifier loop so 'subsec' is applied.
         let mut dt = chrono::Local::now().to_utc().naive_utc();
-        modify_dt(&mut dt, values, output_type)
+        modify_dt(&mut dt, values, output_type, None, true)
+    } else {
+        // CASE 3: Recovery / Garbage
+        // It's not a date, and not a 'subsec' modifier.
+        // It might be an invalid number that 'unixepoch' will rescue.
+        let mut dt = DateTime::from_timestamp(0, 0).unwrap().naive_utc();
+
+        // If we have a number, it's valid pending 'unixepoch' rescue.
+        // If it's a string (like "start of month"), it's invalid -> NULL.
+        let is_valid = initial_numeric_value.is_some();
+
+        modify_dt(
+            &mut dt,
+            values.skip(1),
+            output_type,
+            initial_numeric_value,
+            is_valid,
+        )
     }
 }
 
-fn modify_dt<I, E, V>(dt: &mut NaiveDateTime, mods: I, output_type: DateTimeOutput) -> Value
+fn modify_dt<I, E, V>(
+    dt: &mut NaiveDateTime,
+    mods: I,
+    output_type: DateTimeOutput,
+    initial_numeric: Option<f64>,
+    mut is_valid: bool,
+) -> Value
 where
     V: AsValueRef,
     E: ExactSizeIterator<Item = V>,
@@ -104,31 +158,61 @@ where
     let mods = mods.into_iter();
     let mut n_floor: i64 = 0;
     let mut subsec_requested = false;
+    let mut is_first_modifier = true;
+
     for modifier in mods {
         if let ValueRef::Text(ref text_rc) = modifier.as_value_ref() {
-            // TODO: to prevent double conversion and properly support 'utc'/'localtime', we also
-            // need to keep track of the current timezone and apply it to the modifier.
-            let parsed = parse_modifier(text_rc.as_str());
-            if !matches!(parsed, Ok(Modifier::Floor) | Ok(Modifier::Ceiling)) {
-                n_floor = 0;
+            // We must determine if 'unixepoch' or 'auto' rescues a previously invalid date.
+            if is_first_modifier && initial_numeric.is_some() {
+                let m = parse_modifier(text_rc.as_str());
+                if matches!(m, Ok(Modifier::UnixEpoch)) {
+                    // UnixEpoch always rescues the date (interprets as seconds)
+                    is_valid = true;
+                } else if matches!(m, Ok(Modifier::Auto)) {
+                    // Auto rescues the date ONLY if it decides it's a Unix Timestamp.
+                    if let Some(val) = initial_numeric {
+                        if val >= 0.0 && val <= 5373484.499999 {
+                            // It is a valid Julian Day.
+                            // If is_valid was false (parse failed), it stays false.
+                        } else {
+                            // It falls through to Unix Timestamp.
+                            // This "rescues" the date.
+                            is_valid = true;
+                        }
+                    }
+                }
             }
 
-            match apply_modifier(dt, text_rc.as_str(), &mut n_floor) {
+            match apply_modifier(
+                dt,
+                text_rc.as_str(),
+                &mut n_floor,
+                initial_numeric,
+                is_first_modifier,
+            ) {
                 Ok(true) => subsec_requested = true,
                 Ok(false) => {}
-                Err(_) => return Value::build_text(""),
+                Err(_) => return Value::Null,
             }
 
-            if matches!(parsed, Ok(Modifier::Floor) | Ok(Modifier::Ceiling)) {
+            if matches!(
+                parse_modifier(text_rc.as_str()),
+                Ok(Modifier::Floor) | Ok(Modifier::Ceiling)
+            ) {
                 n_floor = 0;
             }
+            is_first_modifier = false;
         } else {
-            return Value::build_text("");
+            return Value::Null;
         }
     }
 
+    if !is_valid {
+        return Value::Null;
+    }
+
     if is_leap_second(dt) || *dt > get_max_datetime_exclusive() {
-        return Value::build_text("");
+        return Value::Null;
     }
 
     format_dt(*dt, output_type, subsec_requested)
@@ -146,7 +230,7 @@ fn format_dt(dt: NaiveDateTime, output_type: DateTimeOutput, subsec: bool) -> Va
             Value::from_text(t)
         }
         DateTimeOutput::DateTime => {
-            let t = if subsec && dt.nanosecond() != 0 {
+            let t = if subsec {
                 dt.format("%Y-%m-%d %H:%M:%S%.3f").to_string()
             } else {
                 dt.format("%Y-%m-%d %H:%M:%S").to_string()
@@ -155,6 +239,19 @@ fn format_dt(dt: NaiveDateTime, output_type: DateTimeOutput, subsec: bool) -> Va
         }
         DateTimeOutput::StrfTime(format_str) => Value::from_text(strftime_format(&dt, &format_str)),
         DateTimeOutput::JuliaDay => Value::Float(to_julian_day_exact(&dt)),
+        DateTimeOutput::UnixEpoch => {
+            if subsec {
+                // Return Float (seconds + nanoseconds)
+                let seconds = dt.and_utc().timestamp() as f64;
+                let nanos = dt.nanosecond() as f64;
+                let val = seconds + (nanos / 1_000_000_000.0);
+                Value::Float(val)
+            } else {
+                // Return Integer (truncate nanoseconds)
+                let seconds = dt.and_utc().timestamp();
+                Value::Integer(seconds)
+            }
+        }
     }
 }
 
@@ -183,16 +280,36 @@ fn strftime_format(dt: &NaiveDateTime, format_str: &str) -> String {
     }
 }
 
-fn apply_modifier(dt: &mut NaiveDateTime, modifier: &str, n_floor: &mut i64) -> Result<bool> {
+fn apply_modifier(
+    dt: &mut NaiveDateTime,
+    modifier: &str,
+    n_floor: &mut i64,
+    initial_numeric: Option<f64>,
+    is_first_modifier: bool,
+) -> Result<bool> {
     let parsed_modifier = parse_modifier(modifier)?;
 
     match parsed_modifier {
-        Modifier::Days(days) => *dt += TimeDelta::days(days),
-        Modifier::Hours(hours) => *dt += TimeDelta::hours(hours),
-        Modifier::Minutes(minutes) => *dt += TimeDelta::minutes(minutes),
-        Modifier::Seconds(seconds) => *dt += TimeDelta::seconds(seconds),
+        Modifier::Days(days) => {
+            // Convert days to nanoseconds to handle partial days (e.g., 1.5 days)
+            let nanos = (days * 86_400_000_000_000.0) as i64;
+            *dt += TimeDelta::nanoseconds(nanos);
+        }
+        Modifier::Hours(hours) => {
+            let nanos = (hours * 3_600_000_000_000.0) as i64;
+            *dt += TimeDelta::nanoseconds(nanos);
+        }
+        Modifier::Minutes(minutes) => {
+            let nanos = (minutes * 60_000_000_000.0) as i64;
+            *dt += TimeDelta::nanoseconds(nanos);
+        }
+        Modifier::Seconds(seconds) => {
+            // Split into whole seconds and remaining nanoseconds for safety
+            let s = seconds as i64;
+            let ns = ((seconds - s as f64) * 1_000_000_000.0) as i64;
+            *dt += TimeDelta::seconds(s) + TimeDelta::nanoseconds(ns);
+        }
         Modifier::Months(m) => {
-            // Convert months to years + leftover months
             let years = m / 12;
             let leftover = m % 12;
             add_years_and_months(dt, years, leftover, n_floor)?;
@@ -214,17 +331,17 @@ fn apply_modifier(dt: &mut NaiveDateTime, modifier: &str, n_floor: &mut i64) -> 
             months,
             days,
             seconds,
+            nanos,
         } => {
             add_years_and_months(dt, years, months, n_floor)?;
-            *dt += chrono::Duration::days(days as i64);
-            *dt += chrono::Duration::seconds(seconds.into());
+            *dt += TimeDelta::days(days as i64);
+            *dt += TimeDelta::seconds(seconds.into());
+            *dt += TimeDelta::nanoseconds(nanos);
         }
         Modifier::Floor => {
-            if *n_floor <= 0 {
-                return Ok(false);
+            if *n_floor > 0 {
+                *dt -= TimeDelta::days(*n_floor);
             }
-
-            *dt -= TimeDelta::days(*n_floor);
         }
         Modifier::Ceiling => {
             *n_floor = 0;
@@ -250,15 +367,55 @@ fn apply_modifier(dt: &mut NaiveDateTime, modifier: &str, n_floor: &mut i64) -> 
             let days_to_add = (target_day + 7 - current_day) % 7;
             *dt += TimeDelta::days(days_to_add as i64);
         }
-        Modifier::Auto => todo!(), // Will require storing info about the original arg passed when
-        Modifier::UnixEpoch => todo!(), // applying modifiers. All numbers passed to date/time/dt are
-        Modifier::JulianDay => todo!(), // assumed to be julianday, so adding these now is redundant
+        Modifier::UnixEpoch => {
+            if !is_first_modifier {
+                return Err(InvalidModifier(
+                    "unixepoch must be the first modifier".into(),
+                ));
+            }
+            if let Some(val) = initial_numeric {
+                let secs = val as i64;
+                let nanos = ((val - secs as f64) * 1_000_000_000.0) as u32;
+                if let Some(new_dt) = DateTime::from_timestamp(secs, nanos) {
+                    *dt = new_dt.naive_utc();
+                } else {
+                    return Err(InvalidModifier("Invalid unix timestamp".into()));
+                }
+            } else {
+                return Err(InvalidModifier("unixepoch requires numeric input".into()));
+            }
+        }
+        Modifier::JulianDay => {
+            if is_first_modifier && initial_numeric.is_none() {
+                return Err(InvalidModifier(
+                    "julianday modifier requires numeric input".into(),
+                ));
+            }
+        }
+        Modifier::Auto => {
+            if is_first_modifier {
+                if let Some(val) = initial_numeric {
+                    if val >= 0.0 && val <= 5373484.499999 {
+                        // Valid JD range. Do nothing.
+                    } else {
+                        // Unix Timestamp range.
+                        let secs = val as i64;
+                        let nanos = ((val - secs as f64) * 1_000_000_000.0) as u32;
+                        if let Some(new_dt) = DateTime::from_timestamp(secs, nanos) {
+                            *dt = new_dt.naive_utc();
+                        } else {
+                            return Err(InvalidModifier("Auto value out of range".into()));
+                        }
+                    }
+                }
+            }
+        }
+
         Modifier::Localtime => {
             let utc_dt = DateTime::<Utc>::from_naive_utc_and_offset(*dt, Utc);
             *dt = utc_dt.with_timezone(&chrono::Local).naive_local();
         }
         Modifier::Utc => {
-            // TODO: handle datetime('now', 'utc') no-op
             let local_dt = chrono::Local.from_local_datetime(dt).unwrap();
             *dt = local_dt.with_timezone(&Utc).naive_utc();
         }
@@ -420,14 +577,13 @@ fn to_julian_day_exact(dt: &NaiveDateTime) -> f64 {
     i_jd as f64 / 86400000.0
 }
 
-pub fn exec_unixepoch(time_value: &Value) -> Result<Value> {
-    let dt = parse_naive_date_time(time_value);
-    match dt {
-        Some(dt) if !is_leap_second(&dt) => {
-            Ok(Value::Integer(get_unixepoch_from_naive_datetime(dt)))
-        }
-        _ => Ok(Value::Null),
-    }
+pub fn exec_unixepoch<I, E, V>(values: I) -> Value
+where
+    V: AsValueRef,
+    E: ExactSizeIterator<Item = V>,
+    I: IntoIterator<IntoIter = E, Item = V>,
+{
+    exec_datetime(values, DateTimeOutput::UnixEpoch)
 }
 
 fn get_unixepoch_from_naive_datetime(value: NaiveDateTime) -> i64 {
@@ -608,10 +764,10 @@ fn get_max_datetime_exclusive() -> NaiveDateTime {
 #[allow(dead_code)]
 #[derive(Debug, PartialEq)]
 enum Modifier {
-    Days(i64),
-    Hours(i64),
-    Minutes(i64),
-    Seconds(i64),
+    Days(f64),    // Changed to f64
+    Hours(f64),   // Changed to f64
+    Minutes(f64), // Changed to f64
+    Seconds(f64), // Changed to f64
     Months(i32),
     Years(i32),
     TimeOffset(TimeDelta),
@@ -625,6 +781,7 @@ enum Modifier {
         months: i32,
         days: i32,
         seconds: i32,
+        nanos: i64,
     },
     Ceiling,
     Floor,
@@ -643,6 +800,12 @@ enum Modifier {
 fn parse_modifier_number(s: &str) -> Result<i64> {
     s.trim()
         .parse::<i64>()
+        .map_err(|_| InvalidModifier(format!("Invalid number: {s}")))
+}
+
+fn parse_modifier_float(s: &str) -> Result<f64> {
+    s.trim()
+        .parse::<f64>()
         .map_err(|_| InvalidModifier(format!("Invalid number: {s}")))
 }
 
@@ -715,36 +878,45 @@ fn parse_modifier(modifier: &str) -> Result<Modifier> {
         } else {
             Ok(Modifier::Weekday(day as u32))
         }
+    } else if starts_with_ignore_ascii_case(modifier, "weekday ") {
+        let s = &modifier[8..];
+        let day = parse_modifier_number(s)?;
+        if !(0..=6).contains(&day) {
+            return Err(InvalidModifier(
+                "Weekday must be between 0 and 6".to_string(),
+            ));
+        }
+        Ok(Modifier::Weekday(day as u32))
     } else if ends_with_ignore_ascii_case(modifier, " day") {
-        Ok(Modifier::Days(parse_modifier_number(
+        Ok(Modifier::Days(parse_modifier_float(
             &modifier[..modifier.len() - 4],
         )?))
     } else if ends_with_ignore_ascii_case(modifier, " days") {
-        Ok(Modifier::Days(parse_modifier_number(
+        Ok(Modifier::Days(parse_modifier_float(
             &modifier[..modifier.len() - 5],
         )?))
     } else if ends_with_ignore_ascii_case(modifier, " hour") {
-        Ok(Modifier::Hours(parse_modifier_number(
+        Ok(Modifier::Hours(parse_modifier_float(
             &modifier[..modifier.len() - 5],
         )?))
     } else if ends_with_ignore_ascii_case(modifier, " hours") {
-        Ok(Modifier::Hours(parse_modifier_number(
+        Ok(Modifier::Hours(parse_modifier_float(
             &modifier[..modifier.len() - 6],
         )?))
     } else if ends_with_ignore_ascii_case(modifier, " minute") {
-        Ok(Modifier::Minutes(parse_modifier_number(
+        Ok(Modifier::Minutes(parse_modifier_float(
             &modifier[..modifier.len() - 7],
         )?))
     } else if ends_with_ignore_ascii_case(modifier, " minutes") {
-        Ok(Modifier::Minutes(parse_modifier_number(
+        Ok(Modifier::Minutes(parse_modifier_float(
             &modifier[..modifier.len() - 8],
         )?))
     } else if ends_with_ignore_ascii_case(modifier, " second") {
-        Ok(Modifier::Seconds(parse_modifier_number(
+        Ok(Modifier::Seconds(parse_modifier_float(
             &modifier[..modifier.len() - 7],
         )?))
     } else if ends_with_ignore_ascii_case(modifier, " seconds") {
-        Ok(Modifier::Seconds(parse_modifier_number(
+        Ok(Modifier::Seconds(parse_modifier_float(
             &modifier[..modifier.len() - 8],
         )?))
     } else if ends_with_ignore_ascii_case(modifier, " month") {
@@ -776,30 +948,43 @@ fn parse_modifier(modifier: &str) -> Result<Modifier> {
         let digits_in_date = 10;
         match parts.len() {
             1 => {
-                if parts[0].len() == digits_in_date {
-                    let date = parse_modifier_date(parts[0])?;
+                if parts[0].len() == digits_in_date && parts[0].contains('-') {
+                    // Date Only
+                    let (y, m, d) = parse_offset_ymd(parts[0])?;
                     Ok(Modifier::DateOffset {
-                        years: sign * date.year(),
-                        months: sign * date.month() as i32,
-                        days: sign * date.day() as i32,
+                        years: sign * y,
+                        months: sign * m,
+                        days: sign * d,
                     })
                 } else {
-                    // time values are either 12, 8 or 5 digits
+                    // Time Only: 12:34:56.789
                     let time = parse_modifier_time(parts[0])?;
-                    let time_delta = sign * (time.num_seconds_from_midnight() as i32);
-                    Ok(Modifier::TimeOffset(TimeDelta::seconds(time_delta.into())))
+
+                    // Total seconds
+                    let time_delta_sec = sign as i64 * time.num_seconds_from_midnight() as i64;
+                    // Total nanoseconds (fractional part)
+                    let time_delta_nano = sign as i64 * time.nanosecond() as i64;
+
+                    // Construct TimeDelta from seconds + nanos
+                    let delta = TimeDelta::seconds(time_delta_sec)
+                        + TimeDelta::nanoseconds(time_delta_nano);
+                    Ok(Modifier::TimeOffset(delta))
                 }
             }
             2 => {
-                let date = parse_modifier_date(parts[0])?;
+                // Case 13: +/-YYYY-MM-DD HH:MM:SS.SSS
+                let (y, m, d) = parse_offset_ymd(parts[0])?;
                 let time = parse_modifier_time(parts[1])?;
-                // Convert time to total seconds (with sign)
-                let time_delta = sign * (time.num_seconds_from_midnight() as i32);
+
+                let time_delta_sec = sign * (time.num_seconds_from_midnight() as i32);
+                let time_delta_nano = sign as i64 * time.nanosecond() as i64;
+
                 Ok(Modifier::DateTimeOffset {
-                    years: sign * (date.year()),
-                    months: sign * (date.month() as i32),
-                    days: sign * date.day() as i32,
-                    seconds: time_delta,
+                    years: sign * y,
+                    months: sign * m,
+                    days: sign * d,
+                    seconds: time_delta_sec,
+                    nanos: time_delta_nano,
                 })
             }
             _ => Err(InvalidModifier(
@@ -813,6 +998,25 @@ fn parse_modifier(modifier: &str) -> Result<Modifier> {
     }
 }
 
+// Parses "YYYY-MM-DD" into integers without validating calendar correctness.
+// This allows offsets like "0000-01-00" (1 month, 0 days) which NaiveDate would reject.
+fn parse_offset_ymd(s: &str) -> Result<(i32, i32, i32)> {
+    let parts: Vec<&str> = s.split('-').collect();
+    if parts.len() != 3 {
+        return Err(InvalidModifier("Invalid offset date format".to_string()));
+    }
+    let y = parts[0]
+        .parse::<i32>()
+        .map_err(|_| InvalidModifier("Invalid year".to_string()))?;
+    let m = parts[1]
+        .parse::<i32>()
+        .map_err(|_| InvalidModifier("Invalid month".to_string()))?;
+    let d = parts[2]
+        .parse::<i32>()
+        .map_err(|_| InvalidModifier("Invalid day".to_string()))?;
+    Ok((y, m, d))
+}
+
 pub fn exec_timediff<I, E, V>(values: I) -> Value
 where
     V: AsValueRef,
@@ -824,47 +1028,87 @@ where
         return Value::Null;
     }
 
-    let start = parse_naive_date_time(values.next().unwrap());
-    let end = parse_naive_date_time(values.next().unwrap());
+    let p1 = parse_naive_date_time(values.next().unwrap());
+    let p2 = parse_naive_date_time(values.next().unwrap());
 
-    match (start, end) {
-        (Some(start), Some(end)) => {
-            let duration = start.signed_duration_since(end);
-            format_time_duration(&duration)
-        }
+    match (p1, p2) {
+        (Some(d1), Some(d2)) => compute_timediff(d1, d2),
         _ => Value::Null,
     }
 }
 
-/// Format the time duration as +/-YYYY-MM-DD HH:MM:SS.SSS as per SQLite's timediff() function
-fn format_time_duration(duration: &chrono::Duration) -> Value {
-    let is_negative = duration.num_seconds() < 0;
+fn compute_timediff(d1: NaiveDateTime, d2: NaiveDateTime) -> Value {
+    let sign;
+    let (start, end);
 
-    let abs_duration = if is_negative { -*duration } else { *duration };
+    // SQLite timediff(A, B) calculates the time to add to B to get A.
+    // If A < B, the result is negative.
+    if d1 < d2 {
+        sign = "-";
+        start = d1;
+        end = d2;
+    } else {
+        sign = "+";
+        start = d2;
+        end = d1;
+    }
 
-    let total_seconds = abs_duration.num_seconds();
-    let hours = (total_seconds % 86400) / 3600;
-    let minutes = (total_seconds % 3600) / 60;
-    let seconds = total_seconds % 60;
+    // We calculate the difference components: Y, M, D, H, M, S, MS
+    // We always subtract start from end (end - start) because we ensured end >= start above.
+    let mut y = end.year() - start.year();
+    let mut m = end.month() as i32 - start.month() as i32;
+    let mut d = end.day() as i32 - start.day() as i32;
 
-    let days = total_seconds / 86400;
-    let years = days / 365;
-    let remaining_days = days % 365;
-    let months = 0;
+    // Time difference in milliseconds
+    let end_ms =
+        end.num_seconds_from_midnight() as i64 * 1000 + (end.nanosecond() / 1_000_000) as i64;
+    let start_ms =
+        start.num_seconds_from_midnight() as i64 * 1000 + (start.nanosecond() / 1_000_000) as i64;
 
-    let total_millis = abs_duration.num_milliseconds();
-    let millis = total_millis % 1000;
+    let mut ms_diff = end_ms - start_ms;
 
+    // Normalize Time
+    if ms_diff < 0 {
+        // Borrow a day
+        d -= 1;
+        ms_diff += 86400 * 1000;
+    }
+
+    // Normalize Date
+    // If days are negative, borrow from months
+    if d < 0 {
+        m -= 1;
+        // To know how many days to add, we look at the "previous" month relative to the End date.
+        // Example: March 5 minus Feb 25. D = 5 - 25 = -20. M = 1.
+        // We borrow from March. We need to add the days in February (the month before March).
+        let mut prev_month = end.month() as i32 - 1;
+        let mut prev_month_year = end.year();
+        if prev_month < 1 {
+            prev_month = 12;
+            prev_month_year -= 1;
+        }
+
+        let days_in_prev_month = last_day_in_month(prev_month_year, prev_month as u32);
+        d += days_in_prev_month as i32;
+    }
+
+    // If months are negative, borrow from years
+    if m < 0 {
+        y -= 1;
+        m += 12;
+    }
+
+    // Break down total milliseconds back into H:M:S.ms
+    let total_seconds = ms_diff / 1000;
+    let final_ms = ms_diff % 1000;
+    let final_h = total_seconds / 3600;
+    let final_m = (total_seconds % 3600) / 60;
+    let final_s = total_seconds % 60;
+
+    // SQLite format: (+|-)YYYY-MM-DD HH:MM:SS.SSS
     let result = format!(
         "{}{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}",
-        if is_negative { "-" } else { "+" },
-        years,
-        months,
-        remaining_days,
-        hours,
-        minutes,
-        seconds,
-        millis
+        sign, y, m, d, final_h, final_m, final_s, final_ms
     );
 
     Value::build_text(result)
