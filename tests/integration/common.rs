@@ -352,7 +352,11 @@ pub fn limbo_exec_rows_fallible(
                 }
 
                 turso_core::StepResult::Done => break 'outer,
-                r => panic!("unexpected result {r:?}: expecting single row"),
+                r => {
+                    return Err(turso_core::LimboError::InternalError(format!(
+                        "TEST: unexpected result {r:?}: expecting single row"
+                    )))
+                }
             }
         };
         let row = row

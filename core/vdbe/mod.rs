@@ -397,6 +397,7 @@ pub struct ProgramState {
     op_hash_build_state: Option<OpHashBuildState>,
     op_hash_probe_state: Option<OpHashProbeState>,
     hash_tables: HashMap<usize, HashTable>,
+    uses_subjournal: bool,
 }
 
 impl std::fmt::Debug for Program {
@@ -464,6 +465,7 @@ impl ProgramState {
             rowsets: HashMap::new(),
             bloom_filters: HashMap::new(),
             hash_tables: HashMap::new(),
+            uses_subjournal: false,
         }
     }
 
@@ -574,6 +576,18 @@ impl ProgramState {
         pager: &Arc<Pager>,
         write: bool,
     ) -> Result<IOResult<()>> {
+        if write {
+            let db_size = return_if_io!(pager.with_header(|header| header.database_size.get()));
+            pager.open_subjournal()?;
+            pager.try_use_subjournal()?;
+            let result = pager.open_savepoint(db_size);
+            if result.is_err() {
+                pager.stop_use_subjournal();
+            }
+            result?;
+            self.uses_subjournal = true;
+        }
+
         // Store the deferred foreign key violations counter at the start of the statement.
         // This is used to ensure that if an interactive transaction had deferred FK violations and a statement subtransaction rolls back,
         // the deferred FK violations are not lost.
@@ -584,10 +598,6 @@ impl ProgramState {
         // Reset the immediate foreign key violations counter to 0. If this is nonzero when the statement completes, the statement subtransaction will roll back.
         self.fk_immediate_violations_during_stmt
             .store(0, Ordering::SeqCst);
-        if write {
-            let db_size = return_if_io!(pager.with_header(|header| header.database_size.get()));
-            pager.begin_statement(db_size)?;
-        }
         Ok(IOResult::Done(()))
     }
 
@@ -598,25 +608,33 @@ impl ProgramState {
         pager: &Arc<Pager>,
         end_statement: EndStatement,
     ) -> Result<()> {
-        match end_statement {
-            EndStatement::ReleaseSavepoint => pager.release_savepoint(),
-            EndStatement::RollbackSavepoint => {
-                let stmt_was_rolled_back = pager.rollback_to_newest_savepoint()?;
-                if !stmt_was_rolled_back {
-                    // We sometimes call end_statement() on errors without explicitly knowing whether a stmt transaction
-                    // caused the error or not. If it didn't, don't reset any FK violation counters.
-                    return Ok(());
+        let result = 'outer: {
+            match end_statement {
+                EndStatement::ReleaseSavepoint => pager.release_savepoint(),
+                EndStatement::RollbackSavepoint => {
+                    match pager.rollback_to_newest_savepoint() {
+                        // We sometimes call end_statement() on errors without explicitly knowing whether a stmt transaction
+                        // caused the error or not. If it didn't, don't reset any FK violation counters.
+                        Ok(false) => break 'outer Ok(()),
+                        Err(err) => break 'outer Err(err),
+                        _ => {}
+                    }
+                    // Reset the deferred foreign key violations counter to the value it had at the start of the statement.
+                    // This is used to ensure that if an interactive transaction had deferred FK violations, they are not lost.
+                    connection.fk_deferred_violations.store(
+                        self.fk_deferred_violations_when_stmt_started
+                            .load(Ordering::Acquire),
+                        Ordering::SeqCst,
+                    );
+                    Ok(())
                 }
-                // Reset the deferred foreign key violations counter to the value it had at the start of the statement.
-                // This is used to ensure that if an interactive transaction had deferred FK violations, they are not lost.
-                connection.fk_deferred_violations.store(
-                    self.fk_deferred_violations_when_stmt_started
-                        .load(Ordering::Acquire),
-                    Ordering::SeqCst,
-                );
-                Ok(())
             }
+        };
+        if self.uses_subjournal {
+            pager.stop_use_subjournal();
+            self.uses_subjournal = false;
         }
+        result
     }
 
     /// Gets or creates a bloom filter for the given cursor ID.
