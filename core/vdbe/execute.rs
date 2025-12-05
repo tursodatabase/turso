@@ -10,7 +10,7 @@ use crate::storage::btree::{
 };
 use crate::storage::database::DatabaseFile;
 use crate::storage::page_cache::PageCache;
-use crate::storage::pager::CreateBTreeFlags;
+use crate::storage::pager::{default_page1, CreateBTreeFlags};
 use crate::storage::sqlite3_ondisk::{read_varint_fast, DatabaseHeader, PageSize};
 use crate::translate::collate::CollationSeq;
 use crate::types::{
@@ -8358,6 +8358,10 @@ pub fn op_open_ephemeral(
             let buffer_pool = program.connection.db.buffer_pool.clone();
             let page_cache = Arc::new(RwLock::new(PageCache::default()));
 
+            // Ephemeral databases always start empty, so create their own init_page_1
+            let ephemeral_init_page_1 =
+                Arc::new(arc_swap::ArcSwapOption::new(Some(default_page1(None))));
+
             let pager = Arc::new(Pager::new(
                 db_file,
                 None,
@@ -8365,7 +8369,7 @@ pub fn op_open_ephemeral(
                 page_cache,
                 buffer_pool.clone(),
                 Arc::new(Mutex::new(())),
-                pager.init_page_1()
+                ephemeral_init_page_1,
             )?);
 
             pager.set_page_size(page_size);
@@ -8377,7 +8381,7 @@ pub fn op_open_ephemeral(
             pager
                 .begin_read_tx() // we have to begin a read tx before beginning a write
                 .expect("Failed to start read transaction");
-            // return_if_io!(pager.begin_write_tx());
+            return_if_io!(pager.begin_write_tx());
             state.op_open_ephemeral_state = OpOpenEphemeralState::CreateBtree {
                 pager: pager.clone(),
             };

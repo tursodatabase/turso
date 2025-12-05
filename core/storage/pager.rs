@@ -2378,8 +2378,12 @@ impl Pager {
         let state = self.allocate_page1_state.read().clone();
         match state {
             AllocatePage1State::Start => {
+                assert!(!self.db_initialized());
                 tracing::trace!("allocate_page1(Start)");
-                let mut default_header = DatabaseHeader::default();
+
+                let IOResult::Done(mut default_header) = self.with_header(| header| header.clone())? else {
+                    panic!("DB should be initialized and should not do any IO");
+                };
 
                 assert_eq!(default_header.database_size.get(), 0);
                 default_header.database_size = 1.into();
