@@ -937,3 +937,40 @@ pub fn upsert_conflict(limbo: TempDatabase) {
         limbo_exec_rows(&limbo, &conn, "SELECT * FROM t")
     );
 }
+
+#[turso_macros::test]
+pub fn api_misuse(limbo: TempDatabase) {
+    const COUNT: usize = 16;
+    let conn = limbo.db.connect().unwrap();
+    conn.execute("CREATE TABLE t (x);").unwrap();
+    let mut stmts = Vec::new();
+    for _ in 0..COUNT {
+        stmts.push(Some(
+            conn.prepare("INSERT INTO t VALUES (1), (2) RETURNING x")
+                .unwrap(),
+        ));
+    }
+    let (mut errors, mut oks) = (0, 0);
+    while stmts.iter().any(|x| x.is_some()) {
+        for stmt_opt in stmts.iter_mut() {
+            let Some(stmt) = stmt_opt else {
+                continue;
+            };
+            match stmt.step() {
+                Ok(StepResult::Done) => {
+                    *stmt_opt = None;
+                    oks += 1;
+                }
+                Err(err) => {
+                    println!("err: {:?}", err);
+                    *stmt_opt = None;
+                    errors += 1;
+                }
+                _ => {}
+            }
+        }
+    }
+    println!("errors: {}, oks: {}", errors, oks);
+    assert_eq!(oks, 1);
+    assert_eq!(errors, COUNT - 1);
+}
