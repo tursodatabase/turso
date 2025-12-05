@@ -3013,6 +3013,9 @@ impl Statement {
             None,
             &mut self.state,
         );
+        if !self.program.nested && self.state.execution_state.is_running() {
+            self.program.connection.end_stmt_exec();
+        }
         self.state.reset(max_registers, max_cursors);
         self.program.n_change.store(0, Ordering::SeqCst);
         self.busy = false;
