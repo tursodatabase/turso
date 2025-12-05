@@ -12,7 +12,7 @@ use crate::storage::database::DatabaseFile;
 use crate::storage::journal_mode;
 use crate::storage::page_cache::PageCache;
 use crate::storage::pager::{default_page1, CreateBTreeFlags};
-use crate::storage::sqlite3_ondisk::{read_varint_fast, DatabaseHeader, PageSize};
+use crate::storage::sqlite3_ondisk::{read_varint_fast, DatabaseHeader, PageSize, RawVersion};
 use crate::translate::collate::CollationSeq;
 use crate::types::{
     compare_immutable, compare_records_generic, AsValueRef, Extendable, IOCompletions,
@@ -9813,10 +9813,14 @@ pub fn op_journal_mode(
     }
 
     // Sync IO hack, to avoid state machine. Also DB header is most likely cached, and this code does not need to be performant
-    let prev_mode = pager
+    let prev_mode: RawVersion = pager
         .io
         .block(|| pager.with_header_mut(|header| header.read_version))?;
-    let prev_mode = journal_mode::JournalMode::try_from(prev_mode)?;
+    let prev_mode = prev_mode
+        .to_version()
+        .map_err(|val| LimboError::Corrupt(format!("Invalid read_version: {val}")))?;
+
+    let prev_mode = journal_mode::JournalMode::from(prev_mode);
     let mut ret_mode = prev_mode;
 
     // Currently, Turso only supports WAL and MVCC mode
