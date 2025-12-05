@@ -1336,9 +1336,16 @@ impl Pager {
     }
 
     /// Set the initial page size for the database. Should only be called before the database is initialized
-    pub fn set_initial_page_size(&self, size: PageSize) {
+    pub fn set_initial_page_size(&self, size: PageSize) -> Result<()> {
         assert!(!self.db_initialized());
+        let IOResult::Done(_) = self.with_header_mut(|header| {
+            header.page_size = size;
+        })?
+        else {
+            panic!("DB should not be initialized and should not do any IO");
+        };
         self.page_size.store(size.get(), Ordering::SeqCst);
+        Ok(())
     }
 
     /// Get the current page size. Returns None if not set yet.
@@ -2382,7 +2389,7 @@ impl Pager {
                 tracing::trace!("allocate_page1(Start)");
 
                 let IOResult::Done(mut default_header) = self.with_header(|header| *header)? else {
-                    panic!("DB should be initialized and should not do any IO");
+                    panic!("DB should not be initialized and should not do any IO");
                 };
 
                 assert_eq!(default_header.database_size.get(), 0);

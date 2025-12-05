@@ -2059,25 +2059,15 @@ impl Connection {
     /// is first created, if it does not already exist when the page_size pragma is issued,
     /// or at the next VACUUM command that is run on the same database connection while not in WAL mode.
     pub fn reset_page_size(&self, size: u32) -> Result<()> {
+        if self.db.initialized() {
+            return Ok(());
+        }
         let Some(size) = PageSize::new(size) else {
             return Ok(());
         };
 
         self.page_size.store(size.get_raw(), Ordering::SeqCst);
-        if self.db.initialized() {
-            return Ok(());
-        }
-
-        {
-            let mut shared_wal = self.db.shared_wal.write();
-            shared_wal.enabled.store(false, Ordering::SeqCst);
-            shared_wal.file = None;
-        }
-        self.pager.load().clear_page_cache(false);
-        let pager = self.db.init_pager(Some(size.get() as usize))?;
-        pager.enable_encryption(self.db.opts.enable_encryption);
-        self.pager.store(Arc::new(pager));
-        self.pager.load().set_initial_page_size(size);
+        self.pager.load().set_initial_page_size(size)?;
 
         Ok(())
     }
