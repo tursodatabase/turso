@@ -2381,7 +2381,7 @@ impl Pager {
                 assert!(!self.db_initialized());
                 tracing::trace!("allocate_page1(Start)");
 
-                let IOResult::Done(mut default_header) = self.with_header(| header| header.clone())? else {
+                let IOResult::Done(mut default_header) = self.with_header(|header| *header)? else {
                     panic!("DB should be initialized and should not do any IO");
                 };
 
