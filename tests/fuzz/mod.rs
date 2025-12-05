@@ -3643,6 +3643,7 @@ mod fuzz_tests {
         let number = g
             .create()
             .choice()
+            .option_symbol(rand_int(-1..2))
             .option_symbol(rand_int(-0xff..0x100))
             .option_symbol(rand_int(-0xffff..0x10000))
             .option_symbol(rand_int(-0xffffff..0x1000000))
@@ -3729,7 +3730,11 @@ mod fuzz_tests {
         }
     }
 
-    fn predicate_builders(g: &GrammarGenerator, tables: Option<&[TestTable]>) -> PredicateBuilders {
+    fn predicate_builders(
+        g: &GrammarGenerator,
+        common: &CommonBuilders,
+        tables: Option<&[TestTable]>,
+    ) -> PredicateBuilders {
         let (in_op, in_op_builder) = g.create_handle();
         let (column, column_builder) = g.create_handle();
         let mut column_builder = column_builder
@@ -3742,7 +3747,7 @@ mod fuzz_tests {
                     .push_str(")")
                     .build(),
             )
-            .option_symbol(rand_int(-0xffffffff..0x100000000))
+            .option(common.number)
             .option(
                 g.create()
                     .concat(" ")
@@ -3774,7 +3779,7 @@ mod fuzz_tests {
                 g.create()
                     .concat("")
                     .push(column)
-                    .repeat(1..5, ", ")
+                    .repeat(1..3, ", ")
                     .build(),
             )
             .push_str(")")
@@ -4249,7 +4254,7 @@ mod fuzz_tests {
             columns: vec!["x", "y", "z"],
         }];
         let builders = common_builders(&g, Some(&tables));
-        let predicate = predicate_builders(&g, Some(&tables));
+        let predicate = predicate_builders(&g, &builders, Some(&tables));
         let expr = build_logical_expr(&g, &builders, Some(&predicate));
 
         let limbo_conn = db.connect_limbo();
@@ -4265,7 +4270,7 @@ mod fuzz_tests {
                 "CREATE TABLE {} ({})",
                 table.name, columns_with_first_column_as_pk
             );
-            dbg!(&query);
+            log::info!("schema: {query}");
             let limbo = limbo_exec_rows(&db, &limbo_conn, &query);
             let sqlite = sqlite_exec_rows(&sqlite_conn, &query);
 
@@ -4280,7 +4285,7 @@ mod fuzz_tests {
 
         let mut i = 0;
         let mut primary_key_set = HashSet::with_capacity(100);
-        while i < 100 {
+        while i < 1000 {
             let x = g.generate(&mut rng, builders.number, 1);
             if primary_key_set.contains(&x) {
                 continue;
@@ -4309,7 +4314,15 @@ mod fuzz_tests {
         let sql = g
             .create()
             .concat(" ")
-            .push_str("SELECT * FROM t WHERE ")
+            .push_str("SELECT ")
+            .push(
+                g.create()
+                    .choice()
+                    .option_str("*")
+                    .option_str("COUNT(*)")
+                    .build(),
+            )
+            .push_str(" FROM t WHERE ")
             .push(expr)
             .build();
 
