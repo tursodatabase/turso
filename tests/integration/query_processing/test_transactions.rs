@@ -68,9 +68,15 @@ fn test_deferred_transaction_no_restart(tmp_db: TempDatabase) {
 
     // T2 performs a read - this establishes a snapshot and prevents restart
     let mut stmt = conn2.query("SELECT COUNT(*) FROM test").unwrap().unwrap();
-    if let StepResult::Row = stmt.step().unwrap() {
-        let row = stmt.row().unwrap();
-        assert_eq!(*row.get::<&Value>(0).unwrap(), Value::Integer(0));
+    loop {
+        match stmt.step().unwrap() {
+            StepResult::Row => {
+                let row = stmt.row().unwrap();
+                assert_eq!(*row.get::<&Value>(0).unwrap(), Value::Integer(0));
+            }
+            StepResult::Done => break,
+            _ => continue,
+        }
     }
 
     conn1

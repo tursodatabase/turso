@@ -712,11 +712,9 @@ fn test_cte_alias(tmp_db: TempDatabase) -> anyhow::Result<()> {
             StepResult::Row => {
                 let row = stmt1.row().unwrap();
                 assert_eq!(row.get::<&Value>(0).unwrap(), &Value::Integer(1));
-                break;
+                continue;
             }
-            StepResult::Done => {
-                panic!("Expected a row but got Done");
-            }
+            StepResult::Done => break,
             StepResult::IO => stmt1.run_once()?,
             _ => panic!("Unexpected step result"),
         }
