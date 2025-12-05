@@ -2873,8 +2873,7 @@ mod fuzz_tests {
         }
     }
 
-    // TODO: mvcc fails
-    #[turso_macros::test()]
+    #[turso_macros::test(mvcc)]
     pub fn compound_select_fuzz(db: TempDatabase) {
         let _ = env_logger::try_init();
         let (mut rng, seed) = rng_from_time_or_env();
