@@ -4270,7 +4270,7 @@ mod fuzz_tests {
                 "CREATE TABLE {} ({})",
                 table.name, columns_with_first_column_as_pk
             );
-            log::info!("schema: {}", query);
+            log::info!("schema: {query}");
             let limbo = limbo_exec_rows(&db, &limbo_conn, &query);
             let sqlite = sqlite_exec_rows(&sqlite_conn, &query);
 
