@@ -771,7 +771,7 @@ impl Pager {
 
     /// release ownership of the subjournal
     /// caller must guarantee that [Self::stop_use_subjournal] is called only after successful call to the [Self::try_use_subjournal]
-    pub fn stop_use_subjournal(&self) -> () {
+    pub fn stop_use_subjournal(&self) {
         let subjournal = self.subjournal.read();
         let subjournal = subjournal.as_ref().expect("subjournal must be opened");
         subjournal.stop_use()

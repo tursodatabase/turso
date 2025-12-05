@@ -953,10 +953,8 @@ pub fn concurrent_writes_over_single_connection(limbo: TempDatabase) {
     let (mut errors, mut oks) = (0, 0);
     let mut iteration = 0;
     while stmts.iter().any(|x| x.is_some()) {
-        let mut stmt_idx = 0;
-        for stmt_opt in stmts.iter_mut() {
+        for (stmt_idx, stmt_opt) in stmts.iter_mut().enumerate() {
             log::info!("it: {iteration}, stmt: {stmt_idx}");
-            stmt_idx += 1;
             let Some(stmt) = stmt_opt else {
                 continue;
             };
@@ -996,10 +994,8 @@ pub fn concurrent_ddl_over_single_connection(limbo: TempDatabase) {
     let (mut errors, mut oks) = (0, 0);
     let mut iteration = 0;
     while stmts.iter().any(|x| x.is_some()) {
-        let mut stmt_idx = 0;
-        for stmt_opt in stmts.iter_mut() {
+        for (stmt_idx, stmt_opt) in stmts.iter_mut().enumerate() {
             log::info!("it: {iteration}, stmt: {stmt_idx}");
-            stmt_idx += 1;
             let Some(stmt) = stmt_opt else {
                 continue;
             };
