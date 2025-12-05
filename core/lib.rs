@@ -563,35 +563,33 @@ impl Database {
 
         // Check: https://github.com/tursodatabase/turso/pull/1761#discussion_r2154013123
 
-        if db.initialized() {
-            // parse schema
-            let conn = db.connect()?;
-            let syms = conn.syms.read();
-            let pager = conn.pager.load().clone();
+        // parse schema
+        let conn = db.connect()?;
+        let syms = conn.syms.read();
+        let pager = conn.pager.load().clone();
 
-            db.with_schema_mut(|schema| {
-                let header_schema_cookie = pager
-                    .io
-                    .block(|| pager.with_header(|header| header.schema_cookie.get()))?;
-                schema.schema_version = header_schema_cookie;
-                let result = schema
-                    .make_from_btree(None, pager.clone(), &syms)
-                    .inspect_err(|_| pager.end_read_tx());
-                match result {
-                    Err(LimboError::ExtensionError(e)) => {
-                        // this means that a vtab exists and we no longer have the module loaded. we print
-                        // a warning to the user to load the module
-                        eprintln!("Warning: {e}");
-                    }
-                    Err(e) => return Err(e),
-                    _ => {}
+        db.with_schema_mut(|schema| {
+            let header_schema_cookie = pager
+                .io
+                .block(|| pager.with_header(|header| header.schema_cookie.get()))?;
+            schema.schema_version = header_schema_cookie;
+            let result = schema
+                .make_from_btree(None, pager.clone(), &syms)
+                .inspect_err(|_| pager.end_read_tx());
+            match result {
+                Err(LimboError::ExtensionError(e)) => {
+                    // this means that a vtab exists and we no longer have the module loaded. we print
+                    // a warning to the user to load the module
+                    eprintln!("Warning: {e}");
                 }
+                Err(e) => return Err(e),
+                _ => {}
+            }
 
-                Ok(())
-            })?;
-        }
+            Ok(())
+        })?;
 
-        if opts.enable_mvcc {
+        if db.mvcc_enabled() {
             let mv_store = db.get_mv_store();
             let mv_store = mv_store.as_ref().unwrap();
             let mvcc_bootstrap_conn = db._connect(true, None)?;
@@ -607,41 +605,39 @@ impl Database {
         pager.enable_encryption(self.opts.enable_encryption);
         let pager = Arc::new(pager);
 
-        if self.initialized() {
-            let header_ref = pager.io.block(|| HeaderRef::from_pager(&pager))?;
+        let header_ref = pager.io.block(|| HeaderRef::from_pager(&pager))?;
 
-            let header = header_ref.borrow();
+        let header = header_ref.borrow();
 
-            let mode = if header.vacuum_mode_largest_root_page.get() > 0 {
-                if header.incremental_vacuum_enabled.get() > 0 {
-                    AutoVacuumMode::Incremental
-                } else {
-                    AutoVacuumMode::Full
-                }
+        let mode = if header.vacuum_mode_largest_root_page.get() > 0 {
+            if header.incremental_vacuum_enabled.get() > 0 {
+                AutoVacuumMode::Incremental
             } else {
-                AutoVacuumMode::None
-            };
+                AutoVacuumMode::Full
+            }
+        } else {
+            AutoVacuumMode::None
+        };
 
-            // Force autovacuum to None if the experimental flag is not enabled
-            let final_mode = if !self.opts.enable_autovacuum {
-                if mode != AutoVacuumMode::None {
-                    tracing::warn!(
+        // Force autovacuum to None if the experimental flag is not enabled
+        let final_mode = if !self.opts.enable_autovacuum {
+            if mode != AutoVacuumMode::None {
+                tracing::warn!(
                         "Database has autovacuum enabled but --experimental-autovacuum flag is not set. Forcing autovacuum to None."
                     );
-                }
-                AutoVacuumMode::None
-            } else {
-                mode
-            };
+            }
+            AutoVacuumMode::None
+        } else {
+            mode
+        };
 
-            pager.set_auto_vacuum_mode(final_mode);
+        pager.set_auto_vacuum_mode(final_mode);
 
-            tracing::debug!(
+        tracing::debug!(
                 "Opened existing database. Detected auto_vacuum_mode from header: {:?}, final mode: {:?}",
                 mode,
                 final_mode
             );
-        }
 
         Ok(pager)
     }
