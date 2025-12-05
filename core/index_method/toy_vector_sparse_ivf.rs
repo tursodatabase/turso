@@ -418,7 +418,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
         );
         for sql in [inverted_index_create, stats_index_create] {
             let mut stmt = connection.prepare(&sql)?;
-            connection.start_nested();
+            connection.start_nested_stmt(&mut stmt);
             let result = stmt.run_ignore_rows();
             connection.end_nested();
             result?;
@@ -432,7 +432,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
         let stats_index_drop = format!("DROP INDEX {}", self.stats_btree);
         for sql in [inverted_index_drop, stats_index_drop] {
             let mut stmt = connection.prepare(&sql)?;
-            connection.start_nested();
+            connection.start_nested_stmt(&mut stmt);
             let result = stmt.run_ignore_rows();
             connection.end_nested();
             result?;

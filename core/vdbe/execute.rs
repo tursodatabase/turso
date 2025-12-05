@@ -7920,12 +7920,12 @@ pub fn op_parse_schema(
     conn.auto_commit.store(false, Ordering::SeqCst);
 
     let maybe_nested_stmt_err = if let Some(where_clause) = where_clause {
-        let stmt = conn.prepare(format!("SELECT * FROM sqlite_schema WHERE {where_clause}"))?;
+        let mut stmt = conn.prepare(format!("SELECT * FROM sqlite_schema WHERE {where_clause}"))?;
 
         conn.with_schema_mut(|schema| {
             // TODO: This function below is synchronous, make it async
             let existing_views = schema.incremental_views.clone();
-            conn.start_nested();
+            conn.start_nested_stmt(&mut stmt);
             parse_schema_rows(
                 stmt,
                 schema,
@@ -7935,12 +7935,12 @@ pub fn op_parse_schema(
             )
         })
     } else {
-        let stmt = conn.prepare("SELECT * FROM sqlite_schema")?;
+        let mut stmt = conn.prepare("SELECT * FROM sqlite_schema")?;
 
         conn.with_schema_mut(|schema| {
             // TODO: This function below is synchronous, make it async
             let existing_views = schema.incremental_views.clone();
-            conn.start_nested();
+            conn.start_nested_stmt(&mut stmt);
             parse_schema_rows(
                 stmt,
                 schema,

@@ -747,6 +747,8 @@ pub struct Program {
     pub trigger: Option<Arc<Trigger>>,
     pub resolve_type: ResolveType,
     pub explain_state: RwLock<ExplainState>,
+    /// Flag to mark statement as nested and allow "simultaneous" execution with its parent
+    pub nested: bool,
 }
 
 impl Program {
@@ -762,6 +764,9 @@ impl Program {
         query_mode: QueryMode,
         waker: Option<&Waker>,
     ) -> Result<StepResult> {
+        if state.execution_state == ProgramExecutionState::Init && !self.nested {
+            self.connection.try_start_stmt_exec()?;
+        }
         state.execution_state = ProgramExecutionState::Running;
         let result = match query_mode {
             QueryMode::Normal => self.normal_step(state, mv_store, pager, waker),
@@ -771,12 +776,21 @@ impl Program {
         match &result {
             Ok(StepResult::Done) => {
                 state.execution_state = ProgramExecutionState::Done;
+                if !self.nested {
+                    self.connection.end_stmt_exec();
+                }
             }
             Ok(StepResult::Interrupt) => {
                 state.execution_state = ProgramExecutionState::Interrupted;
+                if !self.nested {
+                    self.connection.end_stmt_exec();
+                }
             }
             Err(_) => {
                 state.execution_state = ProgramExecutionState::Failed;
+                if !self.nested {
+                    self.connection.end_stmt_exec();
+                }
             }
             _ => {}
         }

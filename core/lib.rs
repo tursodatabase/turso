@@ -621,6 +621,7 @@ impl Database {
             schema: RwLock::new(self.schema.lock().clone()),
             database_schemas: RwLock::new(FxHashMap::default()),
             auto_commit: AtomicBool::new(true),
+            running_statement: AtomicBool::new(false),
             transaction_state: AtomicTransactionState::new(TransactionState::None),
             last_insert_rowid: AtomicI64::new(0),
             last_change: AtomicI64::new(0),
@@ -1133,6 +1134,7 @@ pub struct Connection {
     database_schemas: RwLock<FxHashMap<usize, Arc<Schema>>>,
     /// Whether to automatically commit transaction
     auto_commit: AtomicBool,
+    running_statement: AtomicBool,
     transaction_state: AtomicTransactionState,
     last_insert_rowid: AtomicI64,
     last_change: AtomicI64,
@@ -1208,6 +1210,11 @@ impl Connection {
         self.nestedness.load(Ordering::SeqCst) > 0
     }
     /// starts nested program execution
+    pub fn start_nested_stmt(&self, stmt: &mut Statement) {
+        stmt.program.nested = true;
+        self.nestedness.fetch_add(1, Ordering::SeqCst);
+    }
+    /// used by sync-engine only in order to create "nested" execution session and avoid any preliminary commit of the intermediate operation result
     pub fn start_nested(&self) {
         self.nestedness.fetch_add(1, Ordering::SeqCst);
     }
@@ -2036,6 +2043,33 @@ impl Connection {
         self.auto_commit.load(Ordering::SeqCst)
     }
 
+    pub fn try_start_stmt_exec(&self) -> Result<()> {
+        let result = self.running_statement.compare_exchange(
+            false,
+            true,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+        if result.is_err() {
+            return Err(LimboError::InternalError(
+                "SQL statements in progress".to_string(),
+            ));
+        }
+        Ok(())
+    }
+    pub fn end_stmt_exec(&self) {
+        let result = self.running_statement.compare_exchange(
+            true,
+            false,
+            Ordering::SeqCst,
+            Ordering::SeqCst,
+        );
+        assert!(
+            result.is_ok(),
+            "end_stmt_exec must be called only after successful try_start_stmt_exec"
+        );
+    }
+
     pub fn parse_schema_rows(self: &Arc<Connection>) -> Result<()> {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
@@ -2658,6 +2692,10 @@ impl Statement {
 
     pub fn execution_state(&self) -> ProgramExecutionState {
         self.state.execution_state
+    }
+
+    pub fn execution_state_mut(&mut self) -> &mut ProgramExecutionState {
+        &mut self.state.execution_state
     }
 
     pub fn mv_store(&self) -> impl Deref<Target = Option<Arc<MvStore>>> {

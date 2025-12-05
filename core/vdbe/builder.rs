@@ -1183,6 +1183,7 @@ impl ProgramBuilder {
             trigger: self.trigger.take(),
             resolve_type: self.resolve_type,
             explain_state: RwLock::new(ExplainState::default()),
+            nested: false,
         }
     }
 }
