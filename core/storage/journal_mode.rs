@@ -1,8 +1,11 @@
 use std::sync::Arc;
 
 use crate::util::IOExt;
-use crate::{bail_corrupt_error, LimboError, MvStore};
-use crate::{storage::sqlite3_ondisk::Version, Pager, Result};
+use crate::{
+    storage::sqlite3_ondisk::{RawVersion, Version},
+    Pager, Result,
+};
+use crate::{LimboError, MvStore};
 
 #[derive(
     Debug,
@@ -49,16 +52,13 @@ impl JournalMode {
     }
 }
 
-impl TryFrom<Version> for JournalMode {
-    type Error = LimboError;
-
-    fn try_from(value: Version) -> std::result::Result<Self, Self::Error> {
-        let val = match value {
+impl From<Version> for JournalMode {
+    fn from(value: Version) -> Self {
+        match value {
+            Version::Legacy => Self::Delete,
             Version::Wal => Self::Wal,
             Version::Mvcc => Self::ExperimentalMvcc,
-            _ => bail_corrupt_error!("invalid header version: {:?}", value),
-        };
-        Ok(val)
+        }
     }
 }
 
@@ -102,11 +102,12 @@ pub fn change_mode(
     let new_version = new_mode
         .as_version()
         .expect("Should be a supported Journal Mode");
+    let raw_version = RawVersion::from(new_version);
 
     pager.io.block(|| {
         pager.with_header_mut(|header| {
-            header.read_version = new_version;
-            header.write_version = new_version;
+            header.read_version = raw_version;
+            header.write_version = raw_version;
         })
     })?;
     Ok(new_mode)
