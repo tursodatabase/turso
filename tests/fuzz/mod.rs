@@ -502,16 +502,14 @@ mod fuzz_tests {
         }
     }
 
-    #[turso_macros::test()]
-    pub fn join_fuzz_unindexed_keys(db: TempDatabase) {
+    fn join_fuzz_inner(db: TempDatabase, add_indexes: bool, iterations: usize, rows: i64) {
         let _ = env_logger::try_init();
         let (mut rng, seed) = rng_from_time_or_env();
-        println!("join_fuzz_unindexed_keys seed: {seed}");
+        println!("join_fuzz_inner (add_indexes={add_indexes}) seed: {seed}",);
 
         let opts = db.db_opts;
         let flags = db.db_flags;
         let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
-
         let limbo_db = builder.clone().build();
         let sqlite_db = builder.clone().build();
         let limbo_conn = limbo_db.connect_limbo();
@@ -521,18 +519,43 @@ mod fuzz_tests {
         CREATE TABLE t1(id INTEGER PRIMARY KEY, a INT, b INT, c INT, d INT);
         CREATE TABLE t2(id INTEGER PRIMARY KEY, a INT, b INT, c INT, d INT);
         CREATE TABLE t3(id INTEGER PRIMARY KEY, a INT, b INT, c INT, d INT);
-        CREATE TABLE t4(id INTEGER PRIMARY KEY, a INT, b INT, c INT, d INT);
-    "#;
+        CREATE TABLE t4(id INTEGER PRIMARY KEY, a INT, b INT, c INT, d INT);"#;
 
         sqlite_conn.execute_batch(schema).unwrap();
         limbo_conn.prepare_execute_batch(schema).unwrap();
 
-        const ROWS_PER_TABLE: i64 = 200;
+        if add_indexes {
+            let index_ddl = r#"
+            CREATE INDEX t1_a_idx ON t1(a);
+            CREATE INDEX t1_b_idx ON t1(b);
+            CREATE INDEX t1_c_idx ON t1(c);
+            CREATE INDEX t1_d_idx ON t1(d);
+
+            CREATE INDEX t2_a_idx ON t2(a);
+            CREATE INDEX t2_b_idx ON t2(b);
+            CREATE INDEX t2_c_idx ON t2(c);
+            CREATE INDEX t2_d_idx ON t2(d);
+
+            CREATE INDEX t3_a_idx ON t3(a);
+            CREATE INDEX t3_b_idx ON t3(b);
+            CREATE INDEX t3_c_idx ON t3(c);
+            CREATE INDEX t3_d_idx ON t3(d);
+
+            CREATE INDEX t4_a_idx ON t4(a);
+            CREATE INDEX t4_b_idx ON t4(b);
+            CREATE INDEX t4_c_idx ON t4(c);
+            CREATE INDEX t4_d_idx ON t4(d);
+        "#;
+            sqlite_conn.execute_batch(index_ddl).unwrap();
+            limbo_conn.prepare_execute_batch(index_ddl).unwrap();
+        }
+
         let tables = ["t1", "t2", "t3", "t4"];
         for (t_idx, tname) in tables.iter().enumerate() {
-            for i in 0..ROWS_PER_TABLE {
-                // 25% chance of NULL per column.
+            for i in 0..rows {
                 let id = i + 1 + (t_idx as i64) * 10_000;
+
+                // 25% chance of NULL per column.
                 let gen_val = |rng: &mut ChaCha8Rng| {
                     if rng.random_range(0..4) == 0 {
                         None
@@ -565,30 +588,31 @@ mod fuzz_tests {
 
         let non_pk_cols = ["a", "b", "c", "d"];
 
-        const ITERS: usize = 2000;
-        for iter in 0..ITERS {
-            if iter % (ITERS / 100).max(1) == 0 {
-                println!("join_fuzz_unindexed_keys: iteration {}/{}", iter + 1, ITERS);
+        for iter in 0..iterations {
+            if iter % (iterations / 100).max(1) == 0 {
+                println!(
+                    "join_fuzz_inner(add_indexes={}) iter {}/{}",
+                    add_indexes,
+                    iter + 1,
+                    iterations
+                );
             }
 
-            // Random number of tables: 2..4
             let num_tables = rng.random_range(2..=4);
             let used_tables = &tables[..num_tables];
 
-            let mut select_cols = Vec::new();
+            let mut select_cols: Vec<String> = Vec::new();
             for t in used_tables.iter() {
                 select_cols.push(format!("{t}.id"));
             }
             let select_clause = select_cols.join(", ");
-
-            // FROM + JOIN clause: chain t1 JOIN t2 JOIN ... with ON predicates on a/b/c/d.
             let mut from_clause = format!("FROM {}", used_tables[0]);
             for i in 1..num_tables {
                 let left = used_tables[i - 1];
                 let right = used_tables[i];
 
                 let join_type = if rng.random_bool(0.5) {
-                    "JOIN" // INNER
+                    "JOIN"
                 } else {
                     "LEFT JOIN"
                 };
@@ -597,10 +621,8 @@ mod fuzz_tests {
                 let mut preds = Vec::new();
                 for _ in 0..num_preds {
                     let col = non_pk_cols[rng.random_range(0..non_pk_cols.len())];
-                    // Join on same-named, non-indexed column on both sides.
                     preds.push(format!("{left}.{col} = {right}.{col}"));
                 }
-                // Avoid duplicate ON terms to keep queries simple.
                 preds.sort();
                 preds.dedup();
 
@@ -608,7 +630,7 @@ mod fuzz_tests {
                 from_clause = format!("{from_clause} {join_type} {right} ON {on_clause}");
             }
 
-            // WHERE clause: 0..2 random predicates, mostly equality / IS NULL / IS NOT NULL.
+            // WHERE clause: 0..2 predicates on non-pk cols
             let mut where_parts = Vec::new();
             let num_where = rng.random_range(0..=2);
             for _ in 0..num_where {
@@ -617,12 +639,10 @@ mod fuzz_tests {
                 let kind = rng.random_range(0..4);
                 let cond = match kind {
                     0 => {
-                        // equality
                         let val = rng.random_range(-10..=20);
                         format!("{t}.{col} = {val}")
                     }
                     1 => {
-                        // inequality
                         let val = rng.random_range(-10..=20);
                         format!("{t}.{col} <> {val}")
                     }
@@ -638,30 +658,39 @@ mod fuzz_tests {
                 format!("WHERE {}", where_parts.join(" AND "))
             };
             let order_clause = format!("ORDER BY {}", select_cols.join(", "));
-
             let limit = 50;
             let query = format!(
                 "SELECT {select_clause} {from_clause} {where_clause} {order_clause} LIMIT {limit}",
             );
-            log::debug!("join_fuzz query: {query}");
-
             let sqlite_rows = sqlite_exec_rows(&sqlite_conn, &query);
             let limbo_rows = limbo_exec_rows(&limbo_db, &limbo_conn, &query);
-
             if sqlite_rows != limbo_rows {
                 panic!(
-                    "JOIN FUZZ MISMATCH!\nseed: {seed}\niteration: {iter}\nquery: {query}\n\
-                 sqlite: {:?}\nlimbo: {:?}\n limbo count: {}, sqlite count: {}\n
-                 sqlite path: {:?}, limbo path: {:?}",
-                    sqlite_rows,
-                    limbo_rows,
-                    limbo_rows.len(),
-                    sqlite_rows.len(),
-                    sqlite_db.path,
-                    limbo_db.path,
-                );
+                "JOIN FUZZ MISMATCH (add_indexes={})\nseed: {}\niteration: {}\nquery: {}\n\
+                 sqlite ({} rows): {:?}\nlimbo ({} rows): {:?}\nsqlite path: {:?}\nlimbo path: {:?}",
+                add_indexes,
+                seed,
+                iter,
+                query,
+                sqlite_rows.len(),
+                sqlite_rows,
+                limbo_rows.len(),
+                limbo_rows,
+                sqlite_db.path,
+                limbo_db.path,
+            );
             }
         }
+    }
+
+    #[turso_macros::test()]
+    pub fn join_fuzz_unindexed_keys(db: TempDatabase) {
+        join_fuzz_inner(db, false, 2000, 200);
+    }
+
+    #[turso_macros::test()]
+    pub fn join_fuzz_indexed_keys(db: TempDatabase) {
+        join_fuzz_inner(db, true, 2000, 200);
     }
 
     // TODO: Mvcc indexes
