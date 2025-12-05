@@ -615,8 +615,8 @@ impl InteractionType {
             assert!(rows.is_some());
             let mut rows = rows.unwrap();
             let mut out = Vec::new();
-            while let Ok(row) = rows.step() {
-                match row {
+            loop {
+                match rows.step()? {
                     StepResult::Row => {
                         let row = rows.row().unwrap();
                         let mut r = Vec::new();
@@ -744,8 +744,8 @@ impl InteractionType {
             }
             let mut rows = rows.unwrap().unwrap();
             let mut out = Vec::new();
-            while let Ok(row) = rows.step() {
-                match row {
+            loop {
+                match rows.step()? {
                     StepResult::Row => {
                         let row = rows.row().unwrap();
                         let mut r = Vec::new();
