@@ -1336,7 +1336,7 @@ impl Program {
             self.connection.end_trigger_execution();
         }
         // Errors from nested statements are handled by the parent statement.
-        if !self.connection.is_nested_stmt() && !self.is_trigger_subprogram() {
+        if !self.nested {
             if err.is_some() {
                 // Any error apart from deferred FK volations causes the statement subtransaction to roll back.
                 let res =
