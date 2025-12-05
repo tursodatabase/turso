@@ -764,6 +764,11 @@ impl Program {
         query_mode: QueryMode,
         waker: Option<&Waker>,
     ) -> Result<StepResult> {
+        if state.execution_state.is_terminal() {
+            return Err(LimboError::MisuseError(
+                "statement is already in terminal state".to_string(),
+            ));
+        }
         if state.execution_state == ProgramExecutionState::Init && !self.nested {
             self.connection.try_start_stmt_exec()?;
         }
