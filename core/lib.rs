@@ -799,9 +799,16 @@ impl Database {
     fn init_pager(&self, requested_page_size: Option<usize>) -> Result<Pager> {
         let cipher = self.encryption_cipher_mode.get();
         let encryption_key = self.encryption_key.read();
-        let reserved_bytes = self
-            .maybe_get_reserved_space_bytes()?
-            .or_else(|| matches!(cipher, CipherMode::None).then(|| cipher.metadata_size() as u8));
+        let reserved_bytes = self.maybe_get_reserved_space_bytes()?.or_else(|| {
+            if !matches!(cipher, CipherMode::None) {
+                // For encryption, use the cipher's metadata size
+                Some(cipher.metadata_size() as u8)
+            } else {
+                // For non-encrypted databases, don't set reserved_bytes here.
+                // This allows checksums to be enabled by default (disable_checksums will be false).
+                None
+            }
+        });
         let disable_checksums = if let Some(reserved_bytes) = reserved_bytes {
             // if the required reserved bytes for checksums is not present, disable checksums
             reserved_bytes != CHECKSUM_REQUIRED_RESERVED_BYTES
