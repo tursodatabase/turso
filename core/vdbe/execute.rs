@@ -9,6 +9,7 @@ use crate::storage::btree::{
     integrity_check, CursorTrait, IntegrityCheckError, IntegrityCheckState, PageCategory,
 };
 use crate::storage::database::DatabaseFile;
+use crate::storage::journal_mode;
 use crate::storage::page_cache::PageCache;
 use crate::storage::pager::{default_page1, CreateBTreeFlags};
 use crate::storage::sqlite3_ondisk::{read_varint_fast, DatabaseHeader, PageSize};
@@ -19,7 +20,7 @@ use crate::types::{
 };
 use crate::util::{
     normalize_ident, rewrite_column_references_if_needed, rewrite_fk_parent_cols_if_self_ref,
-    rewrite_fk_parent_table_if_needed, rewrite_inline_col_fk_target_if_needed,
+    rewrite_fk_parent_table_if_needed, rewrite_inline_col_fk_target_if_needed, IOExt,
 };
 use crate::vdbe::affinity::{apply_numeric_affinity, try_for_float, Affinity, ParsedNumber};
 use crate::vdbe::hash_table::{HashEntry, HashTable, HashTableConfig};
@@ -53,6 +54,7 @@ use either::Either;
 use std::any::Any;
 use std::env::temp_dir;
 use std::ops::DerefMut;
+use std::str::FromStr;
 use std::{
     borrow::BorrowMut,
     num::NonZero,
@@ -9810,27 +9812,24 @@ pub fn op_journal_mode(
         ));
     }
 
-    // Currently, Turso only supports WAL mode
-    // If a new mode is specified, we validate it but always return "wal"
+    // Sync IO hack, to avoid state machine. Also DB header is most likely cached, and this code does not need to be performant
+    let prev_mode = pager
+        .io
+        .block(|| pager.with_header_mut(|header| header.read_version))?;
+    let prev_mode = journal_mode::JournalMode::try_from(prev_mode)?;
+    let mut ret_mode = prev_mode;
+
+    // Currently, Turso only supports WAL and MVCC mode
     if let Some(mode) = new_mode {
-        let mode_bytes = mode.as_bytes();
-        // Valid journal modes in SQLite are: delete, truncate, persist, memory, wal, off
-        // We accept any valid mode but always use WAL
-        match_ignore_ascii_case!(match mode_bytes {
-            b"delete" | b"truncate" | b"persist" | b"memory" | b"wal" | b"off" => {
-                // Mode is valid, but we stay in WAL mode
-            }
-            _ => {
-                // Invalid journal mode
-                return Err(LimboError::ParseError(format!(
-                    "Unknown journal mode: {mode}"
-                )));
-            }
-        })
+        let mode = journal_mode::JournalMode::from_str(mode.as_str())
+            .map_err(|err| LimboError::ParseError(format!("Unknown journal mode: {mode}")))?;
+        let db_path = program.connection.get_database_canonical_path();
+        ret_mode = journal_mode::change_mode(db_path, pager, mv_store, prev_mode, mode)?;
     }
 
+    let ret: &'static str = ret_mode.into();
     // Always return "wal" as the current journal mode
-    state.registers[*dest] = Register::Value(Value::build_text("wal"));
+    state.registers[*dest] = Register::Value(Value::build_text(ret));
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -9935,7 +9934,7 @@ where
     }
 }
 
-fn with_header_mut<T, F>(
+pub fn with_header_mut<T, F>(
     pager: &Arc<Pager>,
     mv_store: Option<&Arc<MvStore>>,
     program: &Program,

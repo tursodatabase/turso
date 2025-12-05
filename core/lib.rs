@@ -47,6 +47,7 @@ use crate::schema::Trigger;
 use crate::stats::refresh_analyze_stats;
 use crate::storage::checksum::CHECKSUM_REQUIRED_RESERVED_BYTES;
 use crate::storage::encryption::AtomicCipherMode;
+use crate::storage::journal_mode;
 use crate::storage::pager::{self, AutoVacuumMode, HeaderRef};
 use crate::translate::display::PlanContext;
 use crate::translate::pragma::TURSO_CDC_DEFAULT_TABLE_NAME;
@@ -505,10 +506,7 @@ impl Database {
 
         // Currently, if a non-zero-sized WAL file exists, the database cannot be opened in MVCC mode.
         // FIXME: this should initiate immediate checkpoint from WAL->DB in MVCC mode.
-        if db.mvcc_enabled()
-            && std::path::Path::exists(std::path::Path::new(wal_path))
-            && std::path::Path::new(wal_path).metadata().unwrap().len() > 0
-        {
+        if db.mvcc_enabled() && journal_mode::wal_exists(std::path::Path::new(wal_path)) {
             return Err(LimboError::InvalidArgument(format!(
                     "WAL file exists for database {path}, but MVCC is enabled. This is currently not supported. Open the database in non-MVCC mode and run PRAGMA wal_checkpoint(TRUNCATE) to truncate the WAL."
                 )));
@@ -516,16 +514,10 @@ impl Database {
 
         // If a non-zero-sized logical log file exists, the database cannot be opened in non-MVCC mode,
         // because the changes in the logical log would not be visible to the non-MVCC connections.
-        if !db.mvcc_enabled() {
-            let db_path = std::path::Path::new(path);
-            let log_path = db_path.with_extension("db-log");
-            if std::path::Path::exists(log_path.as_path())
-                && log_path.as_path().metadata().unwrap().len() > 0
-            {
-                return Err(LimboError::InvalidArgument(format!(
+        if !db.mvcc_enabled() && journal_mode::logical_log_exists(std::path::Path::new(path)) {
+            return Err(LimboError::InvalidArgument(format!(
                     "MVCC logical log file exists for database {path}, but MVCC is disabled. This is not supported. Open the database in MVCC mode and run PRAGMA wal_checkpoint(TRUNCATE) to truncate the logical log.",
                 )));
-            }
         }
 
         let shared_wal = WalFileShared::open_shared_if_exists(&io, wal_path)?;
