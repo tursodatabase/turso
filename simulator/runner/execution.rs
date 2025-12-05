@@ -245,8 +245,8 @@ fn limbo_integrity_check(conn: &Arc<Connection>) -> Result<()> {
     let mut rows = conn.query("PRAGMA integrity_check;")?.unwrap();
     let mut result = Vec::new();
 
-    while let Ok(row) = rows.step() {
-        match row {
+    loop {
+        match rows.step()? {
             StepResult::Row => {
                 let row = rows.row().unwrap();
 
