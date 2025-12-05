@@ -315,6 +315,7 @@ fn turso_error_from_limbo_error(err: LimboError) -> TursoError {
             LimboError::DatabaseFull(_) => TursoStatusCode::DatabaseFull,
             LimboError::ReadOnly => TursoStatusCode::Readonly,
             LimboError::Busy => TursoStatusCode::Busy,
+            LimboError::MisuseError(_) => TursoStatusCode::Misuse,
             _ => TursoStatusCode::Error,
         },
         message: Some(format!("{err}")),
