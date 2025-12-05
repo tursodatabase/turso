@@ -962,7 +962,7 @@ pub fn api_misuse(limbo: TempDatabase) {
                     oks += 1;
                 }
                 Err(err) => {
-                    println!("err: {:?}", err);
+                    println!("err: {err:?}");
                     *stmt_opt = None;
                     errors += 1;
                 }
@@ -970,7 +970,7 @@ pub fn api_misuse(limbo: TempDatabase) {
             }
         }
     }
-    println!("errors: {}, oks: {}", errors, oks);
+    println!("errors: {errors}, oks: {oks}");
     assert_eq!(oks, 1);
     assert_eq!(errors, COUNT - 1);
 }
