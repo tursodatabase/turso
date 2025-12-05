@@ -937,3 +937,120 @@ pub fn upsert_conflict(limbo: TempDatabase) {
         limbo_exec_rows(&limbo, &conn, "SELECT * FROM t")
     );
 }
+
+#[turso_macros::test]
+pub fn concurrent_writes_over_single_connection(limbo: TempDatabase) {
+    const COUNT: usize = 16;
+    let conn = limbo.db.connect().unwrap();
+    conn.execute("CREATE TABLE t (x);").unwrap();
+    let mut stmts = Vec::new();
+    for _ in 0..COUNT {
+        stmts.push(Some(
+            conn.prepare("INSERT INTO t VALUES (1), (2) RETURNING x")
+                .unwrap(),
+        ));
+    }
+    let (mut errors, mut oks) = (0, 0);
+    let mut iteration = 0;
+    while stmts.iter().any(|x| x.is_some()) {
+        let mut stmt_idx = 0;
+        for stmt_opt in stmts.iter_mut() {
+            log::info!("it: {iteration}, stmt: {stmt_idx}");
+            stmt_idx += 1;
+            let Some(stmt) = stmt_opt else {
+                continue;
+            };
+            match stmt.step() {
+                Ok(StepResult::Done) => {
+                    *stmt_opt = None;
+                    oks += 1;
+                }
+                Err(err) => {
+                    println!("err: {err:?}");
+                    *stmt_opt = None;
+                    errors += 1;
+                }
+                _ => {}
+            }
+        }
+        iteration += 1;
+    }
+    println!("errors: {errors}, oks: {oks}");
+
+    // all statement will be executed successfully - because turso return Busy error for all except one running statement
+    // and later retry operation for the failed statements
+    assert_eq!((oks, errors), (COUNT, 0));
+}
+
+#[turso_macros::test]
+pub fn concurrent_ddl_over_single_connection(limbo: TempDatabase) {
+    const COUNT: usize = 16;
+    let conn = limbo.db.connect().unwrap();
+    conn.execute("CREATE TABLE t (x);").unwrap();
+    let mut stmts = Vec::new();
+    for i in 0..COUNT {
+        stmts.push(Some(
+            conn.prepare(format!("CREATE TABLE t{i} (x)")).unwrap(),
+        ));
+    }
+    let (mut errors, mut oks) = (0, 0);
+    let mut iteration = 0;
+    while stmts.iter().any(|x| x.is_some()) {
+        let mut stmt_idx = 0;
+        for stmt_opt in stmts.iter_mut() {
+            log::info!("it: {iteration}, stmt: {stmt_idx}");
+            stmt_idx += 1;
+            let Some(stmt) = stmt_opt else {
+                continue;
+            };
+            match stmt.step() {
+                Ok(StepResult::Done) => {
+                    *stmt_opt = None;
+                    oks += 1;
+                }
+                Err(err) => {
+                    println!("err: {err:?}");
+                    *stmt_opt = None;
+                    errors += 1;
+                }
+                _ => {}
+            }
+        }
+        iteration += 1;
+    }
+    println!("errors: {errors}, oks: {oks}");
+
+    // all statement will be executed successfully - because turso return Busy error for all except one running statement
+    // and later retry operation for the failed statements
+    assert_eq!((oks, errors), (COUNT, 0));
+}
+
+#[turso_macros::test]
+pub fn concurrent_reads_over_single_connection(limbo: TempDatabase) {
+    let _ = env_logger::try_init();
+    let conn1 = limbo.db.connect().unwrap();
+    conn1.execute("CREATE TABLE t (x);").unwrap();
+    conn1.execute("INSERT INTO t VALUES (1), (2), (3)").unwrap();
+
+    let mut stmt1 = conn1.prepare("SELECT * FROM t").unwrap();
+    loop {
+        match stmt1.step().unwrap() {
+            StepResult::Row => {
+                let mut stmt2 = conn1.prepare("SELECT * FROM t").unwrap();
+                let mut rows = 0;
+                loop {
+                    match stmt2.step().unwrap() {
+                        StepResult::Row => rows += 1,
+                        StepResult::Done => break,
+                        StepResult::IO => stmt2.run_once().unwrap(),
+                        r => panic!("unexpected step result: {r:?}"),
+                    }
+                }
+                assert_eq!(rows, 3);
+            }
+            StepResult::Done => break,
+            StepResult::IO => stmt1.run_once().unwrap(),
+            r => panic!("unexpected step result: {r:?}"),
+        }
+    }
+}

@@ -1,4 +1,7 @@
-use std::sync::Arc;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use crate::{
     storage::sqlite3_ondisk::finish_read_page, Buffer, Completion, CompletionError, PageRef, Result,
@@ -7,11 +10,35 @@ use crate::{
 #[derive(Clone)]
 pub struct Subjournal {
     file: Arc<dyn crate::io::File>,
+    in_use: Arc<AtomicBool>,
 }
 
 impl Subjournal {
     pub fn new(file: Arc<dyn crate::io::File>) -> Self {
-        Self { file }
+        Self {
+            file,
+            in_use: Arc::new(AtomicBool::new(false)),
+        }
+    }
+
+    pub fn try_use(&self) -> Result<()> {
+        let result = self
+            .in_use
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst);
+        if result.is_err() {
+            return Err(crate::LimboError::Busy);
+        }
+        Ok(())
+    }
+
+    pub fn stop_use(&self) {
+        let result = self
+            .in_use
+            .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst);
+        assert!(
+            result.is_ok(),
+            "try_start_use must succeed before stop_use call"
+        );
     }
 
     pub fn size(&self) -> Result<u64> {
