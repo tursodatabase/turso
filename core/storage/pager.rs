@@ -133,6 +133,12 @@ impl HeaderRefMut {
     }
 }
 
+impl From<PageRef> for HeaderRefMut {
+    fn from(value: PageRef) -> Self {
+        Self(value)
+    }
+}
+
 pub struct PageInner {
     pub flags: AtomicUsize,
     pub contents: Option<PageContent>,
