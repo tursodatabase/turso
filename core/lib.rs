@@ -1272,6 +1272,11 @@ impl Connection {
     pub fn prepare(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<Statement> {
         self._prepare(sql)
     }
+    pub fn prepare_nested(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<Statement> {
+        let mut stmt = self._prepare(sql)?;
+        stmt.program.nested = true;
+        Ok(stmt)
+    }
 
     #[instrument(skip_all, level = Level::INFO)]
     pub fn _prepare(self: &Arc<Connection>, sql: impl AsRef<str>) -> Result<Statement> {

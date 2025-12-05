@@ -590,11 +590,12 @@ fn execute_trigger_commands(
         );
     }
 
-    let turso_stmt = Statement::new(
+    let mut turso_stmt = Statement::new(
         built_subprogram,
         connection.pager.load().clone(),
         QueryMode::Normal,
     );
+    turso_stmt.program.nested = true;
     program.emit_insn(Insn::Program {
         params,
         program: Arc::new(RwLock::new(turso_stmt)),

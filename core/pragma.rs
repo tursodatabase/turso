@@ -366,7 +366,7 @@ impl PragmaVirtualTableCursor {
             sql.push_str(&format!("=\"{arg}\""));
         }
 
-        self.stmt = Some(self.conn.prepare(sql)?);
+        self.stmt = Some(self.conn.prepare_nested(sql)?);
 
         self.next()
     }
