@@ -305,7 +305,10 @@ fn translate_in_list(
         });
     }
 
-    program.resolve_label(label_ok, program.offset());
+    // we don't know exactly what instruction will came next and it's important to chain label to the execution flow rather then exact next instruction
+    // for example, next instruction can be register assignment, which can be moved by optimized to the constant section
+    // in this case, label_ok must be changed accordingly and be re-binded to another instruction followed the current translation unit after constants reording
+    program.preassign_label_to_next_insn(label_ok);
 
     // by default if IN expression is true we just continue to the next instruction
     if condition_metadata.jump_if_condition_is_true {
