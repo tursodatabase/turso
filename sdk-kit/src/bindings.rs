@@ -318,6 +318,9 @@ impl Default for turso_config_t {
     }
 }
 unsafe extern "C" {
+    pub fn turso_version() -> *const ::std::os::raw::c_char;
+}
+unsafe extern "C" {
     #[doc = " Setup global database info"]
     pub fn turso_setup(config: turso_config_t) -> turso_status_t;
 }

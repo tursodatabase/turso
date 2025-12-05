@@ -481,7 +481,7 @@ impl std::fmt::Debug for Cipher {
     }
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct EncryptionContext {
     cipher_mode: CipherMode,
     cipher: Cipher,
@@ -742,7 +742,7 @@ impl EncryptionContext {
         let mut result = Vec::with_capacity(self.page_size);
 
         // 1. copy the header
-        result.extend_from_slice(&new_header);
+        result.append(&mut new_header);
         // 2. copy the encrypted payload
         result.extend_from_slice(&encrypted);
         // 3. now add the nonce
@@ -925,6 +925,8 @@ impl From<CipherError> for LimboError {
 #[cfg(test)]
 #[cfg(feature = "encryption")]
 mod tests {
+    use crate::storage::sqlite3_ondisk::DatabaseHeader;
+
     use super::*;
     use rand::Rng;
     const DEFAULT_ENCRYPTED_PAGE_SIZE: usize = 4096;
@@ -1036,6 +1038,11 @@ mod tests {
 
         let page_data = create_test_page_1();
         let encrypted = ctx.encrypt_page(&page_data, 1).unwrap();
+        assert_ne!(
+            &page_data[0..DatabaseHeader::SIZE],
+            &encrypted[0..DatabaseHeader::SIZE],
+            "Encrypted data should be different from the page data"
+        );
         assert_eq!(encrypted.len(), DEFAULT_ENCRYPTED_PAGE_SIZE);
 
         // check that header is readable directly from disk (not encrypted)

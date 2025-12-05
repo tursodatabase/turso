@@ -2147,4 +2147,99 @@ mod tests {
         let expected = Value::Null;
         assert_eq!(exec_timediff(&[start, end]), expected);
     }
+
+    #[test]
+    fn test_subsec_fixed_time_expansion() {
+        let result = exec_datetime(
+            &[text("2024-01-01 12:00:00"), text("subsec")],
+            DateTimeOutput::DateTime,
+        );
+        assert_eq!(
+            result,
+            text("2024-01-01 12:00:00.000"),
+            "Failed to expand zero-nanosecond time with subsec"
+        );
+    }
+
+    #[test]
+    fn test_subsec_date_only_expansion() {
+        let result = exec_datetime(
+            &[text("2024-01-01"), text("subsec")],
+            DateTimeOutput::DateTime,
+        );
+        assert_eq!(
+            result,
+            text("2024-01-01 00:00:00.000"),
+            "Failed to expand date-only input to midnight.000"
+        );
+    }
+
+    #[test]
+    fn test_subsec_iso_separator() {
+        let result = exec_datetime(
+            &[text("2024-01-01T15:30:00"), text("subsec")],
+            DateTimeOutput::DateTime,
+        );
+        assert_eq!(
+            result,
+            text("2024-01-01 15:30:00.000"),
+            "Failed to normalize ISO T separator with subsec"
+        );
+    }
+
+    #[test]
+    fn test_subsec_chaining_before_math() {
+        let result = exec_datetime(
+            &[text("2024-01-01 12:00:00"), text("subsec"), text("+1 hour")],
+            DateTimeOutput::DateTime,
+        );
+        assert_eq!(
+            result,
+            text("2024-01-01 13:00:00.000"),
+            "Subsec flag failed to persist through subsequent arithmetic"
+        );
+    }
+
+    #[test]
+    fn test_subsec_chaining_after_math() {
+        let result = exec_datetime(
+            &[text("2024-01-01 12:00:00"), text("+1 hour"), text("subsec")],
+            DateTimeOutput::DateTime,
+        );
+        assert_eq!(
+            result,
+            text("2024-01-01 13:00:00.000"),
+            "Standard chaining failed"
+        );
+    }
+
+    #[test]
+    fn test_subsec_rollover_math() {
+        let result = exec_datetime(
+            &[
+                text("2024-01-01 12:00:00.999"),
+                text("+1 second"),
+                text("subsec"),
+            ],
+            DateTimeOutput::DateTime,
+        );
+        assert_eq!(
+            result,
+            text("2024-01-01 12:00:01.999"),
+            "Rollover math with milliseconds failed"
+        );
+    }
+
+    #[test]
+    fn test_subsec_case_insensitivity() {
+        let result = exec_datetime(
+            &[text("2024-01-01 12:00:00"), text("SuBsEc")],
+            DateTimeOutput::DateTime,
+        );
+        assert_eq!(
+            result,
+            text("2024-01-01 12:00:00.000"),
+            "Case insensitivity check failed"
+        );
+    }
 }

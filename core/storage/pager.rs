@@ -949,6 +949,7 @@ impl Pager {
     }
 
     pub fn set_wal(&mut self, wal: Rc<RefCell<dyn Wal>>) {
+        wal.borrow_mut().set_io_context(self.io_ctx.read().clone());
         self.wal = Some(wal);
     }
 
