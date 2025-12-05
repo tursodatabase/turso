@@ -5898,6 +5898,9 @@ pub fn integrity_check(
     errors: &mut Vec<IntegrityCheckError>,
     pager: &Arc<Pager>,
 ) -> Result<IOResult<()>> {
+    if state.db_size == 0 {
+        return Ok(IOResult::Done(()));
+    }
     loop {
         let Some(IntegrityCheckPageEntry {
             page_idx,
@@ -7794,11 +7797,7 @@ mod tests {
     use crate::{
         io::{Buffer, MemoryIO, OpenFlags, IO},
         schema::IndexColumn,
-        storage::{
-            database::DatabaseFile,
-            page_cache::PageCache,
-            sqlite3_ondisk::PageSize,
-        },
+        storage::{database::DatabaseFile, page_cache::PageCache, sqlite3_ondisk::PageSize},
         types::Text,
         vdbe::Register,
         BufferPool, Completion, Connection, IOContext, StepResult, WalFile, WalFileShared,
