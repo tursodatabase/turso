@@ -1134,6 +1134,7 @@ pub struct Connection {
     database_schemas: RwLock<FxHashMap<usize, Arc<Schema>>>,
     /// Whether to automatically commit transaction
     auto_commit: AtomicBool,
+    /// Whether the connection is executing some statement right now
     running_statement: AtomicBool,
     transaction_state: AtomicTransactionState,
     last_insert_rowid: AtomicI64,
@@ -2043,6 +2044,8 @@ impl Connection {
         self.auto_commit.load(Ordering::SeqCst)
     }
 
+    /// try start execution of the statement
+    /// the method will return an error if the connection already execute another statement
     pub fn try_start_stmt_exec(&self) -> Result<()> {
         let result = self.running_statement.compare_exchange(
             false,
@@ -2057,6 +2060,7 @@ impl Connection {
         }
         Ok(())
     }
+    /// finish execution of the statement
     pub fn end_stmt_exec(&self) {
         let result = self.running_statement.compare_exchange(
             true,
