@@ -77,6 +77,8 @@ pub enum LimboError {
     InvalidBlobSize(usize),
     #[error("Planning error: {0}")]
     PlanningError(String),
+    #[error("Misuse error: {0}")]
+    MisuseError(String),
 }
 
 // We only propagate the error kind so we can avoid string allocation in hot path and copying/cloning enums is cheaper

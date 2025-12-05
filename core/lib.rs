@@ -2054,7 +2054,7 @@ impl Connection {
             Ordering::SeqCst,
         );
         if result.is_err() {
-            return Err(LimboError::InternalError(
+            return Err(LimboError::MisuseError(
                 "SQL statements in progress".to_string(),
             ));
         }
