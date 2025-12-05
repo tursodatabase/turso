@@ -1,7 +1,4 @@
-use std::{
-    mem::ManuallyDrop,
-    sync::{Arc, Mutex},
-};
+use std::sync::{Arc, Mutex};
 
 use turso_sdk_kit::{
     capi::c::turso_slice_ref_t,
@@ -16,57 +13,6 @@ use crate::{
 pub struct TursoAsyncOperationStatus {
     pub status: rsapi::TursoStatusCode,
     pub result: Option<TursoAsyncOperationResult>,
-}
-
-impl TursoAsyncOperationStatus {
-    pub fn to_capi(self) -> c::turso_sync_operation_resume_result_t {
-        c::turso_sync_operation_resume_result_t {
-            status: self.status.to_capi(),
-            result: match self.result {
-                Some(TursoAsyncOperationResult::Stats { stats }) => {
-                    c::turso_sync_operation_result_t {
-                        type_: c::turso_sync_operation_result_type_t::TURSO_ASYNC_RESULT_STATS,
-                        result: c::turso_sync_operation_result_union_t {
-                            stats: ManuallyDrop::new(c::turso_sync_stats_t {
-                                cdc_operations: stats.cdc_operations,
-                                main_wal_size: stats.main_wal_size as i64,
-                                revert_wal_size: stats.revert_wal_size as i64,
-                                last_pull_unix_time: stats.last_pull_unix_time.unwrap_or(0),
-                                last_push_unix_time: stats.last_push_unix_time.unwrap_or(0),
-                                network_sent_bytes: stats.network_sent_bytes as i64,
-                                network_received_bytes: stats.network_received_bytes as i64,
-                                revision: if let Some(revision) = stats.revision {
-                                    turso_slice_from_bytes(revision.as_bytes())
-                                } else {
-                                    turso_slice_ref_t::default()
-                                },
-                            }),
-                        },
-                    }
-                }
-                Some(TursoAsyncOperationResult::Connection { connection }) => {
-                    c::turso_sync_operation_result_t {
-                        type_: c::turso_sync_operation_result_type_t::TURSO_ASYNC_RESULT_CONNECTION,
-                        result: c::turso_sync_operation_result_union_t {
-                            connection: ManuallyDrop::new(connection.to_capi()),
-                        },
-                    }
-                }
-                Some(TursoAsyncOperationResult::Changes { changes }) => {
-                    c::turso_sync_operation_result_t {
-                        type_: c::turso_sync_operation_result_type_t::TURSO_ASYNC_RESULT_CHANGES,
-                        result: c::turso_sync_operation_result_union_t {
-                            changes: ManuallyDrop::new(changes.to_capi()),
-                        },
-                    }
-                }
-                None => c::turso_sync_operation_result_t {
-                    type_: c::turso_sync_operation_result_type_t::TURSO_ASYNC_RESULT_NONE,
-                    ..Default::default()
-                },
-            },
-        }
-    }
 }
 
 pub enum TursoAsyncOperationResult {
@@ -121,22 +67,83 @@ impl TursoDatabaseAsyncOperation {
             response,
         }
     }
-    pub fn resume(&self) -> Result<TursoAsyncOperationStatus, rsapi::TursoError> {
+    pub fn resume(&self) -> Result<rsapi::TursoStatusCode, rsapi::TursoError> {
         let result = self.generator.lock().unwrap().resume()?;
-        if result.status == rsapi::TursoStatusCode::Done {
-            let response = self.response.lock().unwrap().take();
-            Ok(TursoAsyncOperationStatus {
-                status: result.status,
-                result: response,
-            })
-        } else {
-            Ok(result)
+        Ok(result.status)
+    }
+    pub fn take_result(&self) -> Result<TursoAsyncOperationResult, TursoError> {
+        match self.response.lock().unwrap().take() {
+            Some(response) => Ok(response),
+            None => Err(TursoError {
+                code: TursoStatusCode::Misuse,
+                message: Some("operation has no result".to_string()),
+            }),
         }
     }
-    pub fn to_capi(self: Box<Self>) -> c::turso_sync_operation_t {
-        c::turso_sync_operation_t {
-            inner: Box::into_raw(self) as *mut std::ffi::c_void,
+    pub fn take_connection_to_capi(
+        &self,
+    ) -> Result<*const turso_sdk_kit::capi::c::turso_connection_t, TursoError> {
+        match self.take_result()? {
+            TursoAsyncOperationResult::Connection { connection } => Ok(connection.to_capi()),
+            _ => Err(TursoError {
+                code: TursoStatusCode::Misuse,
+                message: Some("unexpected async operation result".to_string()),
+            }),
         }
+    }
+    pub fn take_changes_to_capi(&self) -> Result<*const c::turso_sync_changes_t, TursoError> {
+        match self.take_result()? {
+            TursoAsyncOperationResult::Changes { changes } => {
+                if changes.empty() {
+                    Ok(std::ptr::null())
+                } else {
+                    Ok(changes.to_capi())
+                }
+            }
+            _ => Err(TursoError {
+                code: TursoStatusCode::Misuse,
+                message: Some("unexpected async operation result".to_string()),
+            }),
+        }
+    }
+    pub fn get_stats_to_capi(&self) -> Result<c::turso_sync_stats_t, TursoError> {
+        match self.response.lock().unwrap().as_ref() {
+            Some(TursoAsyncOperationResult::Stats { stats }) => Ok(c::turso_sync_stats_t {
+                cdc_operations: stats.cdc_operations,
+                main_wal_size: stats.main_wal_size as i64,
+                revert_wal_size: stats.revert_wal_size as i64,
+                last_pull_unix_time: stats.last_pull_unix_time.unwrap_or(0),
+                last_push_unix_time: stats.last_push_unix_time.unwrap_or(0),
+                network_sent_bytes: stats.network_sent_bytes as i64,
+                network_received_bytes: stats.network_received_bytes as i64,
+                revision: if let Some(revision) = &stats.revision {
+                    turso_slice_from_bytes(revision.as_bytes())
+                } else {
+                    turso_slice_ref_t::default()
+                },
+            }),
+            _ => Err(TursoError {
+                code: TursoStatusCode::Misuse,
+                message: Some("unexpected async operation result".to_string()),
+            }),
+        }
+    }
+    pub fn result_kind_to_capi(&self) -> c::turso_sync_operation_result_type_t {
+        match &*self.response.lock().unwrap() {
+            Some(TursoAsyncOperationResult::Connection { .. }) => {
+                c::turso_sync_operation_result_type_t::TURSO_ASYNC_RESULT_CONNECTION
+            }
+            Some(TursoAsyncOperationResult::Changes { .. }) => {
+                c::turso_sync_operation_result_type_t::TURSO_ASYNC_RESULT_CHANGES
+            }
+            Some(TursoAsyncOperationResult::Stats { .. }) => {
+                c::turso_sync_operation_result_type_t::TURSO_ASYNC_RESULT_STATS
+            }
+            None => c::turso_sync_operation_result_type_t::TURSO_ASYNC_RESULT_NONE,
+        }
+    }
+    pub fn to_capi(self: Box<Self>) -> *mut c::turso_sync_operation_t {
+        Box::into_raw(self) as *mut c::turso_sync_operation_t
     }
     /// helper method to restore [TursoDatabaseAsyncOperation] ref from C raw container
     /// this method is used in the capi wrappers
@@ -144,15 +151,15 @@ impl TursoDatabaseAsyncOperation {
     /// # Safety
     /// value must be a pointer returned from [Self::to_capi] method
     pub unsafe fn ref_from_capi<'a>(
-        value: c::turso_sync_operation_t,
+        value: *const c::turso_sync_operation_t,
     ) -> Result<&'a Self, TursoError> {
-        if value.inner.is_null() {
+        if value.is_null() {
             Err(TursoError {
                 code: TursoStatusCode::Misuse,
                 message: Some("got null pointer".to_string()),
             })
         } else {
-            Ok(&*(value.inner as *const Self))
+            Ok(&*(value as *const Self))
         }
     }
     /// helper method to restore [TursoDatabaseAsyncOperation] instance from C raw container
@@ -160,8 +167,8 @@ impl TursoDatabaseAsyncOperation {
     ///
     /// # Safety
     /// value must be a pointer returned from [Self::to_capi] method
-    pub unsafe fn box_from_capi(value: c::turso_sync_operation_t) -> Box<Self> {
-        Box::from_raw(value.inner as *mut Self)
+    pub unsafe fn box_from_capi(value: *const c::turso_sync_operation_t) -> Box<Self> {
+        Box::from_raw(value as *mut Self)
     }
 }
 

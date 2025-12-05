@@ -167,7 +167,7 @@ def test_partial_sync():
         partial_boostrap_strategy=turso_sync.PartialSyncPrefixBootstrap(128 * 1024),
     )
     assert conn_partial.execute("SELECT LENGTH(x) FROM t LIMIT 1").fetchall() == [(1024,)]
-    assert conn_partial.stats().network_received_bytes < 256 * 1024 * 1024
+    assert conn_partial.stats().network_received_bytes < 256 * 1024
 
     assert conn_partial.execute("SELECT SUM(LENGTH(x)) FROM t").fetchall() == [(1024 * 1024,)]
     assert conn_partial.stats().network_received_bytes > 1024 * 1024

@@ -1,0 +1,136 @@
+---
+name: 2025-11-26-go-bindings-sync
+---
+
+<Output path="./driver_sync.go">
+
+<Code model="openai/gpt-5" language="go">
+
+Turso - is the SQLite compatible database written in Rust.
+One of the important features of the Turso - is native ability to sync database with the Cloud in both directions (push local changes and pull remote changes).
+
+Your task is to generate EXTRA functionality on top of the existing Golang driver which will extend regular embedded with sync capability.
+Do not modify existing driver - its already implemented in the driver_db.go (based on bindings_db.go)
+Your task is to write extra code which will use abstractions driver_db.go + bindings_db.go and build sync support in the Gollang on top of it in the driver_sync.go file.
+
+# Rules
+
+General rules for driver implementation you **MUST** follow and never go against these rules:
+- USE already implemented driver - DO NOT copy it
+- SET async_io=True for the driver database configuration - because partial sync support requires TURSO_IO to handled externally from the bindings
+- ADD context.Context in the methods when this make sense and we have control over method API
+- STRUCTURE of the implementation 
+    * Declaration order of elements and semantic blocks MUST be exsactly the same
+    * (details and full enumerations omited in the example for brevity but you must generate full code)
+```go
+package turso
+
+struct TursoSyncDbConfig {
+    // path to the main database file locally
+    Path string
+    
+    // remote url for the sync
+    // remote_url MUST be used in all sync engine operations: during bootstrap and all further operations
+    RemoteUrl string
+    
+    // token for remote authentication
+    // auth token value WILL not have any prefix and must be used as "Authorization" header prepended with "Bearer " prefix
+    AuthToken string
+    
+    // optional unique client name (library MUST use `turso-sync-go` if omitted)
+    ClientName string
+
+    // long polling timeout
+    LongPollTimeoutMs int
+    
+    // if not set, initial bootstrap phase will be skipped and caller must call .pull(...) explicitly in order to get initial state from remote
+    // default value is true
+    BootstrapIfEmpty *bool
+    
+    // if positive, prefix partial bootstrap strategy will be used
+    PartialBoostrapStrategyPrefix int
+    // if not empty, query partial bootstrap strategy will be used
+    PartialBoostrapStrategyQuery string
+    
+    // pass it as-is to the underlying connection
+    ExperimentalFeatures string
+}
+
+// statistics for the synced database.
+type TursoSyncDbStats struct {
+    // amount of local operations written since last Pull(...) call
+	CdcOperations        int64
+    // size of the main WAL file
+	MainWalSize          int64
+    // size of the revert WAL file
+	RevertWalSize        int64
+    // last successful pull time
+	LastPullUnixTime     int64
+    // last successful push time
+	LastPushUnixTime     int64
+    // total amount of bytes sent over the network (both Push and Pull operations are tracked together)
+	NetworkSentBytes     int64
+    // total amount of bytes received over the network (both Push and Pull operations are tracked together)
+	NetworkReceivedBytes int64
+    // opaque server revision - it MUST NOT be interpreted/parsed in any way
+	Revision             string
+}
+
+// define public structs here
+struct TursoSyncDb { ... }
+
+// main constructor to create synced database
+func NewTursoSyncDb(ctx context.Context, config TursoSyncDbConfig) (*TursoSyncDb, error) { ... }
+
+// create turso db local connnection
+
+// internal connector to integrate with database/sql pool
+type tursoSyncConnector struct { db *TursoSyncDb }
+func (c *tursoSyncConnector) Connect(ctx context.Context) (driver.Conn, error) { ... }
+func (c *tursoSyncConnector) Driver() driver.Driver { return &tursoDbDriver{} }
+
+// create tursodb connection using NewConnection(...) from driver_db.go and tursoSyncConnector helper
+func (d *TursoSyncDb) Connect(ctx context.Context) (*sql.DB, error) { ... }
+
+// implement EXTRA sync methods
+
+// Pull fresh data from the remote
+// Pull DO NOT sent any local changes to the remote and instead "rebase" them on top of new changes from remote
+// Return true, if new changes were applied locally - otherwise return false
+func (d *TursoSyncDb) Pull(ctx context.Context) (bool, error) { ... }
+
+// Push local changes to the remote
+// Push DO NOT fetch any remote changes
+func (d *TursoSyncDb) Push(ctx context.Context) error { ... }
+
+// Get stats for the synced database
+func (d *TursoSyncDb) Stats(ctx context.Context) (TursoSyncDbStats, error) { ... }
+
+// Checkpoint local WAL of the database
+func (d *TursoSyncDb) Checkpoint(ctx context.Context) error { ... }
+```
+- STREAM data from the http request to the completion in chunks and spin async operation in between in order to prevent loading whole response in memory
+- AVOID unnecessary FFI calls as their cost is non zero
+- AVOID unnecessary strings transformations - replace them with more efficient alternatives if possible
+- AVOID cryptic names - prefer short but concise names (wr is BAD, full_write is GOOD)
+- FOCUS on code readability: extract helper functions if it will contribute to the code readability (do not overoptimize - it's fine to have some logic inlined especially if it is not repeated anywhere else)
+- WATCH OUT for variables scopes and do not use variables which are no longer accessible
+
+# Implementation
+
+- Annotate public API with types
+- Add comments about public API fields/functions to clarify meaning and usage scenarios
+- Use `turso_sync_database_create()` method for creation of the synced database for now - DO NOT use init + open pair
+
+# Bindings
+
+You must use bindings in the `bindings_sync.go` and intergrate with `driver_db.go` code (use `NewConnection` function for that)
+Inspect `bindings_db.go` as you will reuse some abstractions from there.
+
+<File path="./bindings_sync.go" />
+<File path="./bindings_db.go" />
+<File path="./driver_db.go" />
+
+</Code>
+
+</Output>
