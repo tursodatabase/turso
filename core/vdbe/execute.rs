@@ -10,7 +10,7 @@ use crate::storage::btree::{
 };
 use crate::storage::database::DatabaseFile;
 use crate::storage::page_cache::PageCache;
-use crate::storage::pager::{AtomicDbState, CreateBTreeFlags, DbState};
+use crate::storage::pager::CreateBTreeFlags;
 use crate::storage::sqlite3_ondisk::{read_varint_fast, DatabaseHeader, PageSize};
 use crate::translate::collate::CollationSeq;
 use crate::types::{
@@ -8364,7 +8364,6 @@ pub fn op_open_ephemeral(
                 db_file_io,
                 page_cache,
                 buffer_pool.clone(),
-                Arc::new(AtomicDbState::new(DbState::Uninitialized)),
                 Arc::new(Mutex::new(())),
                 pager.init_page_1()
             )?);
@@ -8378,7 +8377,7 @@ pub fn op_open_ephemeral(
             pager
                 .begin_read_tx() // we have to begin a read tx before beginning a write
                 .expect("Failed to start read transaction");
-            return_if_io!(pager.begin_write_tx());
+            // return_if_io!(pager.begin_write_tx());
             state.op_open_ephemeral_state = OpOpenEphemeralState::CreateBtree {
                 pager: pager.clone(),
             };

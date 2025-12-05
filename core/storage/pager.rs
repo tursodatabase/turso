@@ -26,7 +26,6 @@ use std::sync::atomic::{
 };
 use std::sync::Arc;
 use tracing::{instrument, trace, Level};
-use turso_macros::AtomicEnum;
 
 use super::btree::btree_init_page;
 use super::page_cache::{CacheError, CacheResizeResult, PageCache, PageCacheKey};
@@ -59,8 +58,9 @@ impl HeaderRef {
             tracing::trace!("HeaderRef::from_pager - {:?}", state);
             match state {
                 HeaderRefState::Start => {
-                    if !pager.db_state.get().is_initialized() {
-                        return Err(LimboError::Page1NotAlloc);
+                    // If db is not initialized, return the in-memory page
+                    if let Some(page1) = pager.init_page_1.load_full() {
+                        return Ok(IOResult::Done(Self(page1)));
                     }
 
                     let (page, c) = pager.read_page(DatabaseHeader::PAGE_ID as i64)?;
@@ -99,8 +99,9 @@ impl HeaderRefMut {
             tracing::trace!(?state);
             match state {
                 HeaderRefState::Start => {
-                    if !pager.db_state.get().is_initialized() {
-                        return Err(LimboError::Page1NotAlloc);
+                    // If db is not initialized, return the in-memory page
+                    if let Some(page1) = pager.init_page_1.load_full() {
+                        return Ok(IOResult::Done(Self(page1)));
                     }
 
                     let (page, c) = pager.read_page(DatabaseHeader::PAGE_ID as i64)?;
@@ -418,19 +419,6 @@ impl From<u8> for AutoVacuumMode {
     }
 }
 
-#[derive(Debug, AtomicEnum, Clone, Copy, PartialEq, Eq)]
-pub enum DbState {
-    Uninitialized,
-    Initializing,
-    Initialized,
-}
-
-impl DbState {
-    pub fn is_initialized(&self) -> bool {
-        matches!(self, DbState::Initialized)
-    }
-}
-
 #[derive(Debug, Clone)]
 #[cfg(not(feature = "omit_autovacuum"))]
 enum PtrMapGetState {
@@ -523,10 +511,6 @@ pub struct Pager {
     checkpoint_state: RwLock<CheckpointState>,
     syncing: Arc<AtomicBool>,
     auto_vacuum_mode: AtomicU8,
-    /// 0 -> Database is empty,
-    /// 1 -> Database is being initialized,
-    /// 2 -> Database is initialized and ready for use.
-    pub db_state: Arc<AtomicDbState>,
     /// Mutex for synchronizing database initialization to prevent race conditions
     init_lock: Arc<Mutex<()>>,
     /// The state of the current allocate page operation.
@@ -626,11 +610,10 @@ impl Pager {
         io: Arc<dyn crate::io::IO>,
         page_cache: Arc<RwLock<PageCache>>,
         buffer_pool: Arc<BufferPool>,
-        db_state: Arc<AtomicDbState>,
         init_lock: Arc<Mutex<()>>,
         init_page_1: Arc<ArcSwapOption<Page>>,
     ) -> Result<Self> {
-        let allocate_page1_state = if !db_state.get().is_initialized() {
+        let allocate_page1_state = if init_page_1.load().is_some() {
             RwLock::new(AllocatePage1State::Start)
         } else {
             RwLock::new(AllocatePage1State::Done)
@@ -654,7 +637,6 @@ impl Pager {
             checkpoint_state: RwLock::new(CheckpointState::Checkpoint),
             buffer_pool,
             auto_vacuum_mode: AtomicU8::new(AutoVacuumMode::None.into()),
-            db_state,
             init_lock,
             allocate_page1_state,
             page_size: AtomicU32::new(0), // 0 means not set
@@ -1349,9 +1331,13 @@ impl Pager {
         (page_size.get() as usize) - (reserved_space as usize)
     }
 
+    pub fn db_initialized(&self) -> bool {
+        self.init_page_1.load().is_none()
+    }
+
     /// Set the initial page size for the database. Should only be called before the database is initialized
     pub fn set_initial_page_size(&self, size: PageSize) {
-        assert_eq!(self.db_state.get(), DbState::Uninitialized);
+        assert!(!self.db_initialized());
         self.page_size.store(size.get(), Ordering::SeqCst);
     }
 
@@ -1445,19 +1431,12 @@ impl Pager {
 
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn maybe_allocate_page1(&self) -> Result<IOResult<()>> {
-        if !self.db_state.get().is_initialized() {
+        if !self.db_initialized() {
             if let Some(_lock) = self.init_lock.try_lock() {
-                match (self.db_state.get(), self.allocating_page1()) {
-                    // In case of being empty or (allocating and this connection is performing allocation) then allocate the first page
-                    (DbState::Uninitialized, false) | (DbState::Initializing, true) => {
-                        if let IOResult::IO(c) = self.allocate_page1()? {
-                            return Ok(IOResult::IO(c));
-                        } else {
-                            return Ok(IOResult::Done(()));
-                        }
-                    }
-                    // Give a chance for the allocation to happen elsewhere
-                    _ => {}
+                if let IOResult::IO(c) = self.allocate_page1()? {
+                    return Ok(IOResult::IO(c));
+                } else {
+                    return Ok(IOResult::Done(()));
                 }
             } else {
                 // Give a chance for the allocation to happen elsewhere
@@ -2400,7 +2379,6 @@ impl Pager {
         match state {
             AllocatePage1State::Start => {
                 tracing::trace!("allocate_page1(Start)");
-                self.db_state.set(DbState::Initializing);
                 let mut default_header = DatabaseHeader::default();
 
                 assert_eq!(default_header.database_size.get(), 0);
@@ -2457,7 +2435,8 @@ impl Pager {
                 cache.insert(page_key, page.clone()).map_err(|e| {
                     LimboError::InternalError(format!("Failed to insert page 1 into cache: {e:?}"))
                 })?;
-                self.db_state.set(DbState::Initialized);
+                // After we wrote the header page, we may now set this None, to signify we initialized
+                self.init_page_1.store(None);
                 *self.allocate_page1_state.write() = AllocatePage1State::Done;
                 Ok(IOResult::Done(page.clone()))
             }
@@ -2886,6 +2865,9 @@ pub fn default_page1(cipher: Option<&CipherMode>) -> PageRef {
     );
 
     contents.write_database_header(&default_header);
+    page.set_loaded();
+    page.clear_wal_tag();
+    page.get().contents.replace(contents);
 
     btree_init_page(
         &page,
@@ -2893,10 +2875,6 @@ pub fn default_page1(cipher: Option<&CipherMode>) -> PageRef {
         DatabaseHeader::SIZE, // offset of 100 bytes
         (default_header.page_size.get() - default_header.reserved_space as u32) as usize,
     );
-
-    page.set_loaded();
-    page.clear_wal_tag();
-    page.get().contents.replace(contents);
 
     page
 }
