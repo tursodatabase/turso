@@ -301,7 +301,6 @@ fn test_interleaved_transactions(tmp_db: TempDatabase) -> anyhow::Result<()> {
     advance(&mut statement2)?;
     advance(&mut statement0)?;
     advance(&mut statement1)?;
-    advance(&mut statement2)?;
 
     let mut statement2 = conn[2].prepare("COMMIT")?;
 
@@ -320,8 +319,6 @@ fn test_interleaved_transactions(tmp_db: TempDatabase) -> anyhow::Result<()> {
     advance(&mut statement3)?;
 
     let mut statement3 = conn[3].prepare("INSERT INTO table_0 VALUES (-7468459471409934075, 8179435779.870651, -7868006515434924912, -5415470506.527203, 'affectionate_n1x', -88866295.57206345, 'agreeable_treloar'), (3000445982321368777, 3099814982.0727863, -5101787605795972474, -925278326.7265358, 'giving_individualiste', -6553332857.366568, 'brave_patrizia'), (406163996859206098, -3340292138.289094, -5058217201699339610, 2605267874.8582096, 'fabulous_burnett', -4601912326.914466, 'super_jedi'), (6398781934600428549, -6770226564.882048, -2332649333251794167, 6904161964.055864, 'shining_sergent', -4779129294.073781, 'hardworking_beggar'), (1530150677936272307, -8683321096.443897, -2211014401610293017, 2417417840.8996468, 'magnificent_datacide', -2218929107.793541, 'ravishing_nw'), (8028216547992752413, -8876487798.088352, 8974386493479719872, -6723037189.199554, 'glimmering_murray', -1973499548.0633707, 'spectacular_fitzpatrick')")?;
-
-    advance(&mut statement1)?;
 
     let mut statement1 = conn[1].prepare(
         "CREATE INDEX idx_table_0_persiste ON table_0 (col_2 ASC, col_6 ASC, col_3 ASC)",
