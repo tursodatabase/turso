@@ -1501,3 +1501,11 @@ do_execsql_test_on_specific_db {:memory:} compound-headers-2 {
   VALUES(1) UNION SELECT * FROM t;
 } {column1
 1}
+
+do_execsql_test_on_specific_db {:memory:} values-select-empty-db {
+  values (1) intersect values (1);
+} {1}
+
+do_execsql_test_on_specific_db {:memory:} select-sqlite-schema-empty-db {
+  select group_concat(name) over () from sqlite_schema;
+} {}
