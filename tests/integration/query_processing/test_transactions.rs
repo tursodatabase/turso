@@ -1220,3 +1220,424 @@ fn test_mvcc_checkpoint_before_insert_delete_after_checkpoint() {
 
     verify_table_contents(&conn, vec![1, 4]);
 }
+
+// Tests for dual-iteration seek: verifying that seek works correctly
+// when there are rows in both btree (after checkpoint) and MVCC store.
+
+/// Test table seek (WHERE rowid = x) with rows in both btree and MVCC.
+/// After checkpoint, rows 1-5 are in btree. Then we insert 6-10 into MVCC.
+/// Seeking for various rowids should find them in the correct location.
+#[test]
+fn test_mvcc_dual_seek_table_rowid_basic() {
+    let tmp_db = TempDatabase::new_with_opts(
+        "test_mvcc_dual_seek_table_rowid_basic.db",
+        turso_core::DatabaseOpts::new().with_mvcc(true),
+    );
+    let conn = tmp_db.connect_limbo();
+
+    // Create table and insert initial rows
+    execute_and_log(&conn, "CREATE TABLE t (x INTEGER PRIMARY KEY, v TEXT)").unwrap();
+    for i in 1..=5 {
+        execute_and_log(&conn, &format!("INSERT INTO t VALUES ({i}, 'btree_{i}')")).unwrap();
+    }
+
+    // Checkpoint to move rows to btree
+    execute_and_log(&conn, "PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let path = tmp_db.path.clone();
+    drop(conn);
+    drop(tmp_db);
+
+    // Reopen to ensure btree is populated and MV store is empty
+    let tmp_db = TempDatabase::new_with_existent_with_opts(
+        &path,
+        turso_core::DatabaseOpts::new().with_mvcc(true),
+    );
+    let conn = tmp_db.connect_limbo();
+
+    // Insert more rows into MVCC
+    for i in 6..=10 {
+        execute_and_log(&conn, &format!("INSERT INTO t VALUES ({i}, 'mvcc_{i}')")).unwrap();
+    }
+
+    // Seek for a row in btree
+    let stmt = query_and_log(&conn, "SELECT v FROM t WHERE x = 3")
+        .unwrap()
+        .unwrap();
+    let row = helper_read_single_row(stmt);
+    assert_eq!(row, vec![Value::build_text("btree_3")]);
+
+    // Seek for a row in MVCC
+    let stmt = query_and_log(&conn, "SELECT v FROM t WHERE x = 8")
+        .unwrap()
+        .unwrap();
+    let row = helper_read_single_row(stmt);
+    assert_eq!(row, vec![Value::build_text("mvcc_8")]);
+
+    // Seek for first row (btree)
+    let stmt = query_and_log(&conn, "SELECT v FROM t WHERE x = 1")
+        .unwrap()
+        .unwrap();
+    let row = helper_read_single_row(stmt);
+    assert_eq!(row, vec![Value::build_text("btree_1")]);
+
+    // Seek for last row (MVCC)
+    let stmt = query_and_log(&conn, "SELECT v FROM t WHERE x = 10")
+        .unwrap()
+        .unwrap();
+    let row = helper_read_single_row(stmt);
+    assert_eq!(row, vec![Value::build_text("mvcc_10")]);
+
+    // Seek for non-existent row
+    let stmt = query_and_log(&conn, "SELECT v FROM t WHERE x = 100")
+        .unwrap()
+        .unwrap();
+    let rows = helper_read_all_rows(stmt);
+    assert!(rows.is_empty());
+}
+
+/// Test seek with interleaved rows in btree and MVCC.
+/// Btree has odd numbers (1,3,5,7,9), MVCC has even numbers (2,4,6,8,10).
+#[test]
+fn test_mvcc_dual_seek_interleaved_rows() {
+    let tmp_db = TempDatabase::new_with_opts(
+        "test_mvcc_dual_seek_interleaved_rows.db",
+        turso_core::DatabaseOpts::new().with_mvcc(true),
+    );
+    let conn = tmp_db.connect_limbo();
+
+    // Create table and insert odd rows
+    execute_and_log(&conn, "CREATE TABLE t (x INTEGER PRIMARY KEY, v TEXT)").unwrap();
+    for i in [1, 3, 5, 7, 9] {
+        execute_and_log(&conn, &format!("INSERT INTO t VALUES ({i}, 'btree_{i}')")).unwrap();
+    }
+
+    // Checkpoint to move rows to btree
+    execute_and_log(&conn, "PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let path = tmp_db.path.clone();
+    drop(conn);
+    drop(tmp_db);
+
+    // Reopen
+    let tmp_db = TempDatabase::new_with_existent_with_opts(
+        &path,
+        turso_core::DatabaseOpts::new().with_mvcc(true),
+    );
+    let conn = tmp_db.connect_limbo();
+
+    // Insert even rows into MVCC
+    for i in [2, 4, 6, 8, 10] {
+        execute_and_log(&conn, &format!("INSERT INTO t VALUES ({i}, 'mvcc_{i}')")).unwrap();
+    }
+
+    // Full table scan should return all rows in order
+    let stmt = query_and_log(&conn, "SELECT x, v FROM t ORDER BY x")
+        .unwrap()
+        .unwrap();
+    let rows = helper_read_all_rows(stmt);
+    assert_eq!(rows.len(), 10);
+    for (i, row) in rows.iter().enumerate() {
+        let expected_x = (i + 1) as i64;
+        assert_eq!(row[0], Value::Integer(expected_x));
+        let expected_source = if expected_x % 2 == 1 { "btree" } else { "mvcc" };
+        assert_eq!(
+            row[1],
+            Value::build_text(format!("{expected_source}_{expected_x}"))
+        );
+    }
+
+    // Seek for btree row
+    let stmt = query_and_log(&conn, "SELECT v FROM t WHERE x = 5")
+        .unwrap()
+        .unwrap();
+    let row = helper_read_single_row(stmt);
+    assert_eq!(row, vec![Value::build_text("btree_5")]);
+
+    // Seek for MVCC row
+    let stmt = query_and_log(&conn, "SELECT v FROM t WHERE x = 6")
+        .unwrap()
+        .unwrap();
+    let row = helper_read_single_row(stmt);
+    assert_eq!(row, vec![Value::build_text("mvcc_6")]);
+}
+
+/// Test index seek with rows in both btree and MVCC.
+#[test]
+fn test_mvcc_dual_seek_index_basic() {
+    let tmp_db = TempDatabase::new_with_opts(
+        "test_mvcc_dual_seek_index_basic.db",
+        turso_core::DatabaseOpts::new()
+            .with_mvcc(true)
+            .with_indexes(true),
+    );
+    let conn = tmp_db.connect_limbo();
+
+    // Create table with index
+    execute_and_log(&conn, "CREATE TABLE t (x INTEGER, v TEXT)").unwrap();
+    execute_and_log(&conn, "CREATE INDEX idx_x ON t(x)").unwrap();
+
+    // Insert initial rows
+    for i in 1..=5 {
+        execute_and_log(&conn, &format!("INSERT INTO t VALUES ({i}, 'btree_{i}')")).unwrap();
+    }
+
+    // Checkpoint
+    execute_and_log(&conn, "PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let path = tmp_db.path.clone();
+    drop(conn);
+    drop(tmp_db);
+
+    // Reopen
+    let tmp_db = TempDatabase::new_with_existent_with_opts(
+        &path,
+        turso_core::DatabaseOpts::new()
+            .with_mvcc(true)
+            .with_indexes(true),
+    );
+    let conn = tmp_db.connect_limbo();
+
+    // Insert more rows into MVCC
+    for i in 6..=10 {
+        execute_and_log(&conn, &format!("INSERT INTO t VALUES ({i}, 'mvcc_{i}')")).unwrap();
+    }
+
+    // Index seek for btree row
+    let stmt = query_and_log(&conn, "SELECT v FROM t WHERE x = 3")
+        .unwrap()
+        .unwrap();
+    let row = helper_read_single_row(stmt);
+    assert_eq!(row, vec![Value::build_text("btree_3")]);
+
+    // Index seek for MVCC row
+    let stmt = query_and_log(&conn, "SELECT v FROM t WHERE x = 8")
+        .unwrap()
+        .unwrap();
+    let row = helper_read_single_row(stmt);
+    assert_eq!(row, vec![Value::build_text("mvcc_8")]);
+
+    // Range scan should return all matching rows in order
+    let stmt = query_and_log(&conn, "SELECT x FROM t WHERE x >= 4 AND x <= 7 ORDER BY x")
+        .unwrap()
+        .unwrap();
+    let rows = helper_read_all_rows(stmt);
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Integer(4)],
+            vec![Value::Integer(5)],
+            vec![Value::Integer(6)],
+            vec![Value::Integer(7)],
+        ]
+    );
+}
+
+/// Test seek with updates: row exists in btree but is updated in MVCC.
+/// The seek should find the MVCC version (which shadows btree).
+#[test]
+fn test_mvcc_dual_seek_with_update() {
+    let tmp_db = TempDatabase::new_with_opts(
+        "test_mvcc_dual_seek_with_update.db",
+        turso_core::DatabaseOpts::new().with_mvcc(true),
+    );
+    let conn = tmp_db.connect_limbo();
+
+    // Create table and insert rows
+    execute_and_log(&conn, "CREATE TABLE t (x INTEGER PRIMARY KEY, v TEXT)").unwrap();
+    for i in 1..=5 {
+        execute_and_log(
+            &conn,
+            &format!("INSERT INTO t VALUES ({i}, 'original_{i}')"),
+        )
+        .unwrap();
+    }
+
+    // Checkpoint
+    execute_and_log(&conn, "PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let path = tmp_db.path.clone();
+    drop(conn);
+    drop(tmp_db);
+
+    // Reopen
+    let tmp_db = TempDatabase::new_with_existent_with_opts(
+        &path,
+        turso_core::DatabaseOpts::new().with_mvcc(true),
+    );
+    let conn = tmp_db.connect_limbo();
+
+    // Update row 3 (creates MVCC version that shadows btree)
+    execute_and_log(&conn, "UPDATE t SET v = 'updated_3' WHERE x = 3").unwrap();
+
+    // Seek for updated row should return MVCC version
+    let stmt = query_and_log(&conn, "SELECT v FROM t WHERE x = 3")
+        .unwrap()
+        .unwrap();
+    let row = helper_read_single_row(stmt);
+    assert_eq!(row, vec![Value::build_text("updated_3")]);
+
+    // Seek for non-updated row should still work
+    let stmt = query_and_log(&conn, "SELECT v FROM t WHERE x = 2")
+        .unwrap()
+        .unwrap();
+    let row = helper_read_single_row(stmt);
+    assert_eq!(row, vec![Value::build_text("original_2")]);
+
+    // Full scan should show correct values
+    let stmt = query_and_log(&conn, "SELECT x, v FROM t ORDER BY x")
+        .unwrap()
+        .unwrap();
+    let rows = helper_read_all_rows(stmt);
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Integer(1), Value::build_text("original_1")],
+            vec![Value::Integer(2), Value::build_text("original_2")],
+            vec![Value::Integer(3), Value::build_text("updated_3")],
+            vec![Value::Integer(4), Value::build_text("original_4")],
+            vec![Value::Integer(5), Value::build_text("original_5")],
+        ]
+    );
+}
+
+/// Test seek with delete: row exists in btree but is deleted in MVCC.
+/// The seek should NOT find the deleted row.
+#[test]
+fn test_mvcc_dual_seek_with_delete() {
+    let tmp_db = TempDatabase::new_with_opts(
+        "test_mvcc_dual_seek_with_delete.db",
+        turso_core::DatabaseOpts::new().with_mvcc(true),
+    );
+    let conn = tmp_db.connect_limbo();
+
+    // Create table and insert rows
+    execute_and_log(&conn, "CREATE TABLE t (x INTEGER PRIMARY KEY, v TEXT)").unwrap();
+    for i in 1..=5 {
+        execute_and_log(&conn, &format!("INSERT INTO t VALUES ({i}, 'value_{i}')")).unwrap();
+    }
+
+    // Checkpoint
+    execute_and_log(&conn, "PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let path = tmp_db.path.clone();
+    drop(conn);
+    drop(tmp_db);
+
+    // Reopen
+    let tmp_db = TempDatabase::new_with_existent_with_opts(
+        &path,
+        turso_core::DatabaseOpts::new().with_mvcc(true),
+    );
+    let conn = tmp_db.connect_limbo();
+
+    // Delete row 3
+    execute_and_log(&conn, "DELETE FROM t WHERE x = 3").unwrap();
+
+    // Seek for deleted row should return nothing
+    let stmt = query_and_log(&conn, "SELECT v FROM t WHERE x = 3")
+        .unwrap()
+        .unwrap();
+    let rows = helper_read_all_rows(stmt);
+    assert!(rows.is_empty());
+
+    // Seek for non-deleted row should still work
+    let stmt = query_and_log(&conn, "SELECT v FROM t WHERE x = 2")
+        .unwrap()
+        .unwrap();
+    let row = helper_read_single_row(stmt);
+    assert_eq!(row, vec![Value::build_text("value_2")]);
+
+    // Full scan should not include deleted row
+    let stmt = query_and_log(&conn, "SELECT x FROM t ORDER BY x")
+        .unwrap()
+        .unwrap();
+    let rows = helper_read_all_rows(stmt);
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Integer(1)],
+            vec![Value::Integer(2)],
+            vec![Value::Integer(4)],
+            vec![Value::Integer(5)],
+        ]
+    );
+}
+
+/// Test range seek (GT, LT operations) with dual iteration.
+#[test]
+fn test_mvcc_dual_seek_range_operations() {
+    let tmp_db = TempDatabase::new_with_opts(
+        "test_mvcc_dual_seek_range_operations.db",
+        turso_core::DatabaseOpts::new().with_mvcc(true),
+    );
+    let conn = tmp_db.connect_limbo();
+
+    // Create table and insert rows
+    execute_and_log(&conn, "CREATE TABLE t (x INTEGER PRIMARY KEY)").unwrap();
+    for i in [1, 3, 5] {
+        execute_and_log(&conn, &format!("INSERT INTO t VALUES ({i})")).unwrap();
+    }
+
+    // Checkpoint
+    execute_and_log(&conn, "PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    let path = tmp_db.path.clone();
+    drop(conn);
+    drop(tmp_db);
+
+    // Reopen
+    let tmp_db = TempDatabase::new_with_existent_with_opts(
+        &path,
+        turso_core::DatabaseOpts::new().with_mvcc(true),
+    );
+    let conn = tmp_db.connect_limbo();
+
+    // Insert more rows into MVCC
+    for i in [2, 4, 6] {
+        execute_and_log(&conn, &format!("INSERT INTO t VALUES ({i})")).unwrap();
+    }
+
+    // Range: x > 2 (should include 3,4,5,6)
+    let stmt = query_and_log(&conn, "SELECT x FROM t WHERE x > 2 ORDER BY x")
+        .unwrap()
+        .unwrap();
+    let rows = helper_read_all_rows(stmt);
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Integer(3)],
+            vec![Value::Integer(4)],
+            vec![Value::Integer(5)],
+            vec![Value::Integer(6)],
+        ]
+    );
+
+    // Range: x < 4 (should include 1,2,3)
+    let stmt = query_and_log(&conn, "SELECT x FROM t WHERE x < 4 ORDER BY x")
+        .unwrap()
+        .unwrap();
+    let rows = helper_read_all_rows(stmt);
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Integer(1)],
+            vec![Value::Integer(2)],
+            vec![Value::Integer(3)],
+        ]
+    );
+
+    // Range: x >= 3 AND x <= 5 (should include 3,4,5)
+    let stmt = query_and_log(&conn, "SELECT x FROM t WHERE x >= 3 AND x <= 5 ORDER BY x")
+        .unwrap()
+        .unwrap();
+    let rows = helper_read_all_rows(stmt);
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Integer(3)],
+            vec![Value::Integer(4)],
+            vec![Value::Integer(5)],
+        ]
+    );
+}
