@@ -8366,6 +8366,7 @@ pub fn op_open_ephemeral(
                 buffer_pool.clone(),
                 Arc::new(AtomicDbState::new(DbState::Uninitialized)),
                 Arc::new(Mutex::new(())),
+                pager.init_page_1()
             )?);
 
             pager.set_page_size(page_size);

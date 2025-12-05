@@ -9083,6 +9083,7 @@ mod tests {
                 buffer_pool,
                 Arc::new(AtomicDbState::new(DbState::Uninitialized)),
                 Arc::new(parking_lot::Mutex::new(())),
+                Default::default(),
             )
             .unwrap(),
         );

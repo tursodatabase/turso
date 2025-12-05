@@ -853,6 +853,7 @@ impl Database {
                 buffer_pool.clone(),
                 db_state,
                 self.init_lock.clone(),
+                self.init_page_1.clone(),
             )?;
             pager.set_page_size(page_size);
             if let Some(reserved_bytes) = reserved_bytes {
@@ -887,6 +888,7 @@ impl Database {
             buffer_pool.clone(),
             db_state,
             Arc::new(Mutex::new(())),
+            self.init_page_1.clone(),
         )?;
 
         pager.set_page_size(page_size);

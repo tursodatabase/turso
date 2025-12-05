@@ -15,6 +15,7 @@ use crate::{
     IOResult, LimboError, Result, TransactionState,
 };
 use crate::{io_yield_one, Buffer, CompletionError, IOContext, OpenFlags, IO};
+use arc_swap::ArcSwapOption;
 use parking_lot::{Mutex, RwLock};
 use roaring::RoaringBitmap;
 use std::cell::{RefCell, UnsafeCell};
@@ -551,6 +552,8 @@ pub struct Pager {
     pub(crate) io_ctx: RwLock<IOContext>,
     /// encryption is an opt-in feature. we will enable it only if the flag is passed
     enable_encryption: AtomicBool,
+    /// In Memory Page 1 for Empty Dbs
+    init_page_1: Arc<ArcSwapOption<Page>>,
 }
 
 // SAFETY: This needs to be audited for thread safety.
@@ -625,6 +628,7 @@ impl Pager {
         buffer_pool: Arc<BufferPool>,
         db_state: Arc<AtomicDbState>,
         init_lock: Arc<Mutex<()>>,
+        init_page_1: Arc<ArcSwapOption<Page>>,
     ) -> Result<Self> {
         let allocate_page1_state = if !db_state.get().is_initialized() {
             RwLock::new(AllocatePage1State::Start)
@@ -668,7 +672,12 @@ impl Pager {
             }),
             io_ctx: RwLock::new(IOContext::default()),
             enable_encryption: AtomicBool::new(false),
+            init_page_1,
         })
+    }
+
+    pub fn init_page_1(&self) -> Arc<ArcSwapOption<Page>> {
+        self.init_page_1.clone()
     }
 
     /// Open the subjournal if not yet open.
