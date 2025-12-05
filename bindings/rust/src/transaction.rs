@@ -90,14 +90,6 @@ pub struct Transaction<'conn> {
 }
 
 impl Transaction<'_> {
-    // Prepare a statement by passing it onto the connection.
-    // This allows a database update function to be passed a transaction,
-    // prepare a statement, and use it without needing direct access to the
-    // Connection
-    pub async fn prepare(&self, sql: &str) -> Result<Statement> {
-        self.conn.prepare(sql).await
-    }
-
     /// Begin a new transaction. Cannot be nested;
     ///
     /// Even though we don't mutate the connection, we take a `&mut Connection`
@@ -132,6 +124,14 @@ impl Transaction<'_> {
             drop_behavior: DropBehavior::Rollback,
             in_progress: true,
         })
+    }
+
+    // Use the Connection to Prepare a statement.
+    // This allows a database update function to be passed a transaction,
+    // prepare a statement, and use it without needing direct access to the
+    // Connection
+    pub async fn prepare(&self, sql: &str) -> Result<Statement> {
+        self.conn.prepare(sql).await
     }
 
     /// Get the current setting for what happens to the transaction when it is
