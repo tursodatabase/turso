@@ -1487,3 +1487,17 @@ do_execsql_test_on_specific_db {:memory:} large-values-comparison {
   SELECT CAST('8211127122155032455' AS REAL) = CAST('8211127122155032455' AS INTEGER),
     8211127122155032455 = 8211127122155033000;
 } {0|0}
+
+do_execsql_test_on_specific_db {:memory:} compound-headers-1 {
+  .headers on
+  CREATE TABLE t(x);
+  SELECT * FROM t UNION VALUES(1);
+} {x
+1}
+
+do_execsql_test_on_specific_db {:memory:} compound-headers-2 {
+  .headers on
+  CREATE TABLE t(x);
+  VALUES(1) UNION SELECT * FROM t;
+} {column1
+1}

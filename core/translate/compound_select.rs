@@ -20,7 +20,7 @@ pub fn emit_program_for_compound_select(
     plan: Plan,
 ) -> crate::Result<()> {
     let Plan::CompoundSelect {
-        left: _left,
+        left,
         right_most,
         limit,
         offset,
@@ -113,6 +113,25 @@ pub fn emit_program_for_compound_select(
     };
 
     emit_explain!(program, true, "COMPOUND QUERY".to_owned());
+
+    // This is inefficient, but emit_compound_select() takes ownership of 'plan' and we
+    // must set the result columns to the leftmost subselect's result columns to be compatible
+    // with SQLite.
+    program.result_columns = left[0].0.result_columns.clone();
+
+    // These must also be set because we make the decision to start a transaction based on whether
+    // any tables are actually touched by the query. Previously this only used the rightmost subselect's
+    // table references, but that breaks down with e.g. "SELECT * FROM t UNION VALUES(1)" where VALUES(1)
+    // does not have any table references and we would erroneously not start a transaction.
+    for (plan, _) in left {
+        program
+            .table_references
+            .extend(plan.table_references.clone());
+    }
+    program
+        .table_references
+        .extend(right_plan.table_references.clone());
+
     emit_compound_select(
         program,
         plan,
@@ -124,9 +143,6 @@ pub fn emit_program_for_compound_select(
         reg_result_cols_start,
     )?;
     program.pop_current_parent_explain();
-
-    program.result_columns = right_plan.result_columns;
-    program.table_references.extend(right_plan.table_references);
 
     Ok(())
 }
