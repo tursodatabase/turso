@@ -3172,8 +3172,8 @@ mod ptrmap_tests {
             io,
             page_cache,
             buffer_pool,
-            Arc::new(AtomicDbState::new(DbState::Uninitialized)),
             Arc::new(Mutex::new(())),
+            Default::default(),
         )
         .unwrap();
         run_until_done(|| pager.allocate_page1(), &pager).unwrap();
