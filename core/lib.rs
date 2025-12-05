@@ -248,6 +248,10 @@ pub struct Database {
     builtin_syms: RwLock<SymbolTable>,
     opts: DatabaseOpts,
     n_connections: AtomicUsize,
+
+    // Encryption
+    encryption_key: RwLock<Option<EncryptionKey>>,
+    encryption_cipher_mode: AtomicCipherMode,
 }
 
 // SAFETY: This needs to be audited for thread safety.
@@ -307,6 +311,71 @@ impl fmt::Debug for Database {
 }
 
 impl Database {
+    fn new(
+        opts: DatabaseOpts,
+        flags: OpenFlags,
+        path: impl Into<String>,
+        wal_path: impl Into<String>,
+        io: &Arc<dyn IO>,
+        db_file: Arc<dyn DatabaseStorage>,
+        encryption_opts: Option<EncryptionOpts>,
+    ) -> Result<Self> {
+        let shared_wal = WalFileShared::new_noop();
+        let mv_store = ArcSwapOption::empty();
+
+        let db_size = db_file.size()?;
+        let db_state = if db_size == 0 {
+            DbState::Uninitialized
+        } else {
+            DbState::Initialized
+        };
+
+        let shared_page_cache = Arc::new(RwLock::new(PageCache::default()));
+        let syms = SymbolTable::new();
+        let arena_size = if std::env::var("TESTING").is_ok_and(|v| v.eq_ignore_ascii_case("true")) {
+            BufferPool::TEST_ARENA_SIZE
+        } else {
+            BufferPool::DEFAULT_ARENA_SIZE
+        };
+
+        let (encryption_key, encryption_cipher_mode) =
+            if let Some(encryption_opts) = encryption_opts {
+                let key = EncryptionKey::from_hex_string(&encryption_opts.hexkey)?;
+                let cipher = CipherMode::try_from(encryption_opts.cipher.as_str())?;
+                (Some(key), Some(cipher))
+            } else {
+                (None, None)
+            };
+
+        // opts is now passed as parameter
+        let db = Database {
+            mv_store,
+            path: path.into(),
+            wal_path: wal_path.into(),
+            schema: Mutex::new(Arc::new(Schema::new(opts.enable_indexes))),
+            _shared_page_cache: shared_page_cache.clone(),
+            shared_wal,
+            db_file,
+            builtin_syms: syms.into(),
+            io: io.clone(),
+            open_flags: flags.into(),
+            db_state: Arc::new(AtomicDbState::new(db_state)),
+            init_lock: Arc::new(Mutex::new(())),
+            opts,
+            buffer_pool: BufferPool::begin_init(io, arena_size),
+            n_connections: AtomicUsize::new(0),
+
+            encryption_key: RwLock::new(encryption_key),
+            encryption_cipher_mode: AtomicCipherMode::new(
+                encryption_cipher_mode.unwrap_or(CipherMode::None),
+            ),
+        };
+
+        db.register_global_builtin_extensions()
+            .expect("unable to register global extensions");
+        Ok(db)
+    }
+
     #[cfg(feature = "fs")]
     pub fn open_file(
         io: Arc<dyn IO>,
@@ -436,9 +505,19 @@ impl Database {
         opts: DatabaseOpts,
         encryption_opts: Option<EncryptionOpts>,
     ) -> Result<Arc<Database>> {
+        let mut db = Self::new(
+            opts,
+            flags,
+            path,
+            wal_path,
+            &io,
+            db_file,
+            encryption_opts.clone(),
+        )?;
+
         // Currently, if a non-zero-sized WAL file exists, the database cannot be opened in MVCC mode.
         // FIXME: this should initiate immediate checkpoint from WAL->DB in MVCC mode.
-        if opts.enable_mvcc
+        if db.mvcc_enabled()
             && std::path::Path::exists(std::path::Path::new(wal_path))
             && std::path::Path::new(wal_path).metadata().unwrap().len() > 0
         {
@@ -449,7 +528,7 @@ impl Database {
 
         // If a non-zero-sized logical log file exists, the database cannot be opened in non-MVCC mode,
         // because the changes in the logical log would not be visible to the non-MVCC connections.
-        if !opts.enable_mvcc {
+        if !db.mvcc_enabled() {
             let db_path = std::path::Path::new(path);
             let log_path = db_path.with_extension("db-log");
             if std::path::Path::exists(log_path.as_path())
@@ -463,65 +542,28 @@ impl Database {
 
         let shared_wal = WalFileShared::open_shared_if_exists(&io, wal_path)?;
 
-        let mv_store = if opts.enable_mvcc {
+        let mv_store = if db.mvcc_enabled() {
             let file = io.open_file(&format!("{path}-log"), OpenFlags::default(), false)?;
             let storage = mvcc::persistent_storage::Storage::new(file);
             let mv_store = MvStore::new(mvcc::LocalClock::new(), storage);
-            ArcSwapOption::new(Some(Arc::new(mv_store)))
+            Some(Arc::new(mv_store))
         } else {
-            ArcSwapOption::empty()
+            None
         };
 
-        let db_size = db_file.size()?;
-        let db_state = if db_size == 0 {
-            DbState::Uninitialized
-        } else {
-            DbState::Initialized
-        };
+        db.shared_wal = shared_wal;
+        db.mv_store.store(mv_store);
 
-        let shared_page_cache = Arc::new(RwLock::new(PageCache::default()));
-        let syms = SymbolTable::new();
-        let arena_size = if std::env::var("TESTING").is_ok_and(|v| v.eq_ignore_ascii_case("true")) {
-            BufferPool::TEST_ARENA_SIZE
-        } else {
-            BufferPool::DEFAULT_ARENA_SIZE
-        };
-        // opts is now passed as parameter
-        let db = Arc::new(Database {
-            mv_store,
-            path: path.to_string(),
-            wal_path: wal_path.to_string(),
-            schema: Mutex::new(Arc::new(Schema::new(opts.enable_indexes))),
-            _shared_page_cache: shared_page_cache.clone(),
-            shared_wal,
-            db_file,
-            builtin_syms: syms.into(),
-            io: io.clone(),
-            open_flags: flags.into(),
-            db_state: Arc::new(AtomicDbState::new(db_state)),
-            init_lock: Arc::new(Mutex::new(())),
-            opts,
-            buffer_pool: BufferPool::begin_init(&io, arena_size),
-            n_connections: AtomicUsize::new(0),
-        });
-
-        db.register_global_builtin_extensions()
-            .expect("unable to register global extensions");
+        let db = Arc::new(db);
 
         // Check: https://github.com/tursodatabase/turso/pull/1761#discussion_r2154013123
-        if db_state.is_initialized() {
+
+        if db.db_state.get().is_initialized() {
             // parse schema
             let conn = db.connect()?;
-
             let syms = conn.syms.read();
             let pager = conn.pager.load().clone();
 
-            if let Some(encryption_opts) = encryption_opts {
-                conn.pragma_update("cipher", format!("'{}'", encryption_opts.cipher))?;
-                conn.pragma_update("hexkey", format!("'{}'", encryption_opts.hexkey))?;
-                // Clear page cache so the header page can be reread from disk and decrypted using the encryption context.
-                pager.clear_page_cache(false);
-            }
             db.with_schema_mut(|schema| {
                 let header_schema_cookie = pager
                     .io
@@ -547,27 +589,15 @@ impl Database {
         if opts.enable_mvcc {
             let mv_store = db.get_mv_store();
             let mv_store = mv_store.as_ref().unwrap();
-            let mvcc_bootstrap_conn = db.connect_mvcc_bootstrap()?;
+            let mvcc_bootstrap_conn = db._connect(true, None)?;
             mv_store.bootstrap(mvcc_bootstrap_conn)?;
         }
 
         Ok(db)
     }
 
-    #[instrument(skip_all, level = Level::INFO)]
-    pub fn connect(self: &Arc<Database>) -> Result<Arc<Connection>> {
-        self._connect(false)
-    }
-
-    pub(crate) fn connect_mvcc_bootstrap(self: &Arc<Database>) -> Result<Arc<Connection>> {
-        self._connect(true)
-    }
-
-    #[instrument(skip_all, level = Level::INFO)]
-    fn _connect(
-        self: &Arc<Database>,
-        is_mvcc_bootstrap_connection: bool,
-    ) -> Result<Arc<Connection>> {
+    /// Necessary Pager initialization, so that we are prepared to read from Page 1
+    fn _init(&self) -> Result<Arc<Pager>> {
         let pager = self.init_pager(None)?;
         pager.enable_encryption(self.opts.enable_encryption);
         let pager = Arc::new(pager);
@@ -608,6 +638,25 @@ impl Database {
             );
         }
 
+        Ok(pager)
+    }
+
+    #[instrument(skip_all, level = Level::INFO)]
+    pub fn connect(self: &Arc<Database>) -> Result<Arc<Connection>> {
+        self._connect(false, None)
+    }
+
+    #[instrument(skip_all, level = Level::INFO)]
+    fn _connect(
+        self: &Arc<Database>,
+        is_mvcc_bootstrap_connection: bool,
+        pager: Option<Arc<Pager>>,
+    ) -> Result<Arc<Connection>> {
+        let pager = if let Some(pager) = pager {
+            pager
+        } else {
+            self._init()?
+        };
         let page_size = pager.get_page_size_unchecked();
 
         let default_cache_size = pager
@@ -615,6 +664,10 @@ impl Database {
             .block(|| pager.with_header(|header| header.default_page_cache_size))
             .unwrap_or_default()
             .get();
+
+        let encryption_key = self.encryption_key.read().clone();
+        let encrytion_cipher = self.encryption_cipher_mode.get();
+
         let conn = Arc::new(Connection {
             db: self.clone(),
             pager: ArcSwap::new(pager),
@@ -640,8 +693,8 @@ impl Database {
             nestedness: AtomicI32::new(0),
             compiling_triggers: RwLock::new(Vec::new()),
             executing_triggers: RwLock::new(Vec::new()),
-            encryption_key: RwLock::new(None),
-            encryption_cipher_mode: AtomicCipherMode::new(CipherMode::None),
+            encryption_key: RwLock::new(encryption_key.clone()),
+            encryption_cipher_mode: AtomicCipherMode::new(encrytion_cipher),
             sync_mode: AtomicSyncMode::new(SyncMode::Full),
             data_sync_retry: AtomicBool::new(false),
             busy_timeout: RwLock::new(Duration::new(0, 0)),
@@ -744,7 +797,18 @@ impl Database {
     }
 
     fn init_pager(&self, requested_page_size: Option<usize>) -> Result<Pager> {
-        let reserved_bytes = self.maybe_get_reserved_space_bytes()?;
+        let cipher = self.encryption_cipher_mode.get();
+        let encryption_key = self.encryption_key.read();
+        let reserved_bytes = self.maybe_get_reserved_space_bytes()?.or_else(|| {
+            if !matches!(cipher, CipherMode::None) {
+                // For encryption, use the cipher's metadata size
+                Some(cipher.metadata_size() as u8)
+            } else {
+                // For non-encrypted databases, don't set reserved_bytes here.
+                // This allows checksums to be enabled by default (disable_checksums will be false).
+                None
+            }
+        });
         let disable_checksums = if let Some(reserved_bytes) = reserved_bytes {
             // if the required reserved bytes for checksums is not present, disable checksums
             reserved_bytes != CHECKSUM_REQUIRED_RESERVED_BYTES
@@ -784,6 +848,11 @@ impl Database {
             if disable_checksums {
                 pager.reset_checksum_context();
             }
+            // Set encryption later after `disable_checksums` as it may reset the `pager.io_ctx`
+            if let Some(encryption_key) = encryption_key.as_ref() {
+                pager.enable_encryption(true);
+                pager.set_encryption_context(cipher, encryption_key)?;
+            }
             return Ok(pager);
         }
         let page_size = self.determine_actual_page_size(&shared_wal, requested_page_size)?;
@@ -813,6 +882,11 @@ impl Database {
         }
         if disable_checksums {
             pager.reset_checksum_context();
+        }
+        // Set encryption later after `disable_checksums` as it may reset the `pager.io_ctx`
+        if let Some(encryption_key) = encryption_key.as_ref() {
+            pager.enable_encryption(true);
+            pager.set_encryption_context(cipher, encryption_key)?;
         }
         let file = self
             .io
@@ -1623,15 +1697,6 @@ impl Connection {
         }
         if let Some(hexkey) = opts.hexkey {
             let _ = conn.pragma_update("hexkey", format!("'{hexkey}'"));
-        }
-        if let Some(encryption_opts) = encryption_opts {
-            let _ = conn.pragma_update("cipher", encryption_opts.cipher.to_string());
-            let _ = conn.pragma_update("hexkey", encryption_opts.hexkey.to_string());
-            let pager = conn.pager.load();
-            if db.db_state.get().is_initialized() {
-                // Clear page cache so the header page can be reread from disk and decrypted using the encryption context.
-                pager.clear_page_cache(false);
-            }
         }
         Ok((io, conn))
     }
