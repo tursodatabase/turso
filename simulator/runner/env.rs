@@ -21,7 +21,7 @@ use crate::profiles::Profile;
 use crate::runner::SimIO;
 use crate::runner::io::SimulatorIO;
 use crate::runner::memory::io::MemorySimIO;
-
+const DEFAULT_CACHE_SIZE: usize = 2000;
 use super::cli::SimulatorCLI;
 
 #[derive(Debug, Copy, Clone)]
@@ -468,6 +468,7 @@ impl SimulatorEnv {
             max_time_simulation: cli_opts.maximum_time,
             disable_reopen_database: cli_opts.disable_reopen_database,
             disable_integrity_check: cli_opts.disable_integrity_check,
+            cache_size: profile.cache_size_pages.unwrap_or(DEFAULT_CACHE_SIZE),
         };
 
         // Remove existing database file if it exists
@@ -580,13 +581,17 @@ impl SimulatorEnv {
 
         match self.type_ {
             SimulationType::Default | SimulationType::Doublecheck => {
-                self.connections[connection_index] = SimConnection::LimboConnection(
-                    self.db
-                        .as_ref()
-                        .expect("db to be Some")
-                        .connect()
-                        .expect("Failed to connect to Limbo database"),
-                );
+                let conn = self
+                    .db
+                    .as_ref()
+                    .expect("db to be Some")
+                    .connect()
+                    .expect("Failed to connect to Limbo database");
+                if self.opts.cache_size != DEFAULT_CACHE_SIZE {
+                    conn.execute(format!("PRAGMA cache_size = {}", self.opts.cache_size))
+                        .expect("set pragma cache_size");
+                }
+                self.connections[connection_index] = SimConnection::LimboConnection(conn);
             }
             SimulationType::Differential => {
                 self.connections[connection_index] = SimConnection::SQLiteConnection(
@@ -735,6 +740,7 @@ pub(crate) struct SimulatorOpts {
 
     pub(crate) max_interactions: u32,
     pub(crate) page_size: usize,
+    pub(crate) cache_size: usize,
     pub(crate) max_time_simulation: usize,
 }
 

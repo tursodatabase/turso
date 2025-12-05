@@ -7,10 +7,11 @@ do_execsql_test_on_specific_db ":memory:" pragma-cache-size-default {
   PRAGMA cache_size
 } {-2000}
 
+# 200 is minimum cache size value, so we test for this
 do_execsql_test pragma-set-cache-size {
-  PRAGMA cache_size = 100;
+  PRAGMA cache_size = 200;
   PRAGMA cache_size
-} {100}
+} {200}
 
 # Even though the cache size was set to 100 in previous test, a new connection defaults back to -2000.
 do_execsql_test pragma-cache-size {

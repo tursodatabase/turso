@@ -155,7 +155,7 @@ impl CacheSize {
     pub const DEFAULT: i32 = -2000;
 
     // Minimum number of pages that cache can hold.
-    pub const MIN: i64 = 10;
+    pub const MIN: i64 = super::page_cache::MINIMUM_PAGE_CACHE_SIZE_IN_PAGES as i64;
 
     // SQLite uses this value as threshold for maximum cache size
     pub const MAX_SAFE: i64 = 2147450880;
@@ -1844,6 +1844,7 @@ impl StreamingWalReader {
             st.page_size = page_sz as usize;
             st.use_native_endian = use_native;
             st.cumulative_checksum = (c1, c2);
+            st.last_valid_checksum = (c1, c2);
             st.header_valid = true;
         }
         self.off_atomic

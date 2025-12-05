@@ -80,6 +80,11 @@ jobs:
           for i in {1..5}; do
             ./scripts/run-sim --maximum-tests 1000 --min-tick 10 --max-tick 50 --profile write_heavy --memory-io || exit 1
           done
+      - name: Simulator InsertHeavySpill
+        run: |
+          for i in {1..5}; do
+            ./scripts/run-sim --maximum-tests 1000 --min-tick 10 --max-tick 50 --profile write_heavy_spill --memory-io || exit 1
+          done
       - name: Simulator Faultless
         run: |
           for i in {1..10}; do
