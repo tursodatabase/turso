@@ -43,6 +43,7 @@ jobs:
         run: cargo build --verbose
       - name: Test Checksums
         run: |
+          echo "Runnning Checksum Tests"
           cargo test --features checksum --color=always --lib storage::checksum
           cargo test --features checksum --color=always --test integration_tests storage::checksum
       - name: Test
