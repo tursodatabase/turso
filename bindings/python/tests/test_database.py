@@ -4,6 +4,8 @@ import sqlite3
 import pytest
 import turso
 
+import logging
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s", force=True)
 
 def connect(provider, database):
     if provider == "turso":
@@ -1461,3 +1463,52 @@ def test_connection_exception_attributes_present(provider):
     assert issubclass(conn.DatabaseError, Exception)
     assert issubclass(conn.ProgrammingError, Exception)
     conn.close()
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_insert_returning_single_and_multiple_commit_without_consuming(provider):
+    # turso.setup_logging(level=logging.DEBUG)
+    conn = connect(provider, ":memory:")
+    try:
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
+        cur.execute("INSERT INTO t(name) VALUES (?), (?) RETURNING id", ("bob", 'alice'),)
+        cur.fetchone()
+        conn.commit()
+        
+        cur.execute("SELECT COUNT(*) FROM t")
+        total = (cur.fetchone())[0]
+        assert total == 2
+    finally:
+        conn.close()
+
+# @pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+# def test_insert_returning_single_and_multiple_commit_without_consuming(provider):
+#     turso.setup_logging(level=logging.DEBUG)
+#     conn = connect(provider, ":memory:")
+#     try:
+#         cur = conn.cursor()
+#         cur.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
+
+#         # Single INSERT ... RETURNING
+#         cur.execute("INSERT INTO t(name) VALUES (?) RETURNING id, name", ("alice",))
+#         one = cur.fetchone()
+#         assert one[1] == "alice"
+#         conn.commit()
+
+#         # Multiple rows with RETURNING; consume only one row and commit
+#         cur.execute(
+#             "INSERT INTO t(name) VALUES (?), (?), (?) RETURNING id, name",
+#             ("bob", "charlie", "dora"),
+#         )
+#         first = cur.fetchone()
+#         assert first[1] in ("bob", "charlie", "dora")
+#         # Do not consume remaining rows, but commit explicitly
+#         conn.commit()
+
+#         # Ensure all 3 were inserted despite not consuming all RETURNING rows
+#         cur.execute("SELECT COUNT(*) FROM t WHERE name = 'bob' OR name = 'charlie' OR name = 'dora'")
+#         print('before fetch')
+#         total = (cur.fetchone())[0]
+#         assert total == 3
+#     finally:
+#         conn.close()
