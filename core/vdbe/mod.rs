@@ -18,9 +18,12 @@
 //! https://www.sqlite.org/opcode.html
 
 pub mod affinity;
+pub mod bloom_filter;
 pub mod builder;
 pub mod execute;
 pub mod explain;
+#[allow(dead_code)]
+pub mod hash_table;
 pub mod insn;
 pub mod likeop;
 pub mod metrics;
@@ -44,6 +47,7 @@ use crate::{
             OpIdxInsertState, OpInsertState, OpInsertSubState, OpNewRowidState, OpNoConflictState,
             OpProgramState, OpRowIdState, OpSeekState, OpTransactionState,
         },
+        hash_table::HashTable,
         metrics::StatementMetrics,
     },
     ValueRef,
@@ -67,6 +71,7 @@ use execute::{
 use parking_lot::RwLock;
 use turso_parser::ast::ResolveType;
 
+use crate::vdbe::bloom_filter::BloomFilter;
 use crate::vdbe::rowset::RowSet;
 use explain::{insn_to_row_with_comment, EXPLAIN_COLUMNS, EXPLAIN_QUERY_PLAN_COLUMNS};
 use regex::Regex;
@@ -306,6 +311,33 @@ impl ProgramExecutionState {
     }
 }
 
+/// Re-entrant state for [Insn::HashBuild].
+/// Allows HashBuild to resume cleanly after async I/O without re-reading the row.
+#[derive(Debug, Default)]
+pub struct OpHashBuildState {
+    pub key_values: Vec<Value>,
+    pub key_idx: usize,
+    pub payload_values: Vec<Value>,
+    pub payload_idx: usize,
+    pub rowid: Option<i64>,
+    pub cursor_id: CursorID,
+    pub hash_table_id: usize,
+    pub key_start_reg: usize,
+    pub num_keys: usize,
+}
+
+/// Re-entrant state for [Insn::HashProbe].
+/// Allows HashProbe to resume cleanly after async I/O when loading spilled partitions.
+#[derive(Debug, Default)]
+pub struct OpHashProbeState {
+    /// Cached probe key values to avoid re-reading from registers
+    pub probe_keys: Vec<Value>,
+    /// Hash table register being probed
+    pub hash_table_id: usize,
+    /// Partition index being loaded (if any)
+    pub partition_idx: usize,
+}
+
 /// The program state describes the environment in which the program executes.
 pub struct ProgramState {
     pub io_completions: Option<IOCompletions>,
@@ -359,6 +391,13 @@ pub struct ProgramState {
     fk_immediate_violations_during_stmt: AtomicIsize,
     /// RowSet objects stored by register index
     rowsets: HashMap<usize, RowSet>,
+    /// Bloom filters stored by cursor ID for probabilistic set membership testing
+    /// Used to avoid unnecessary seeks on ephemeral indexes and hash tables
+    pub(crate) bloom_filters: HashMap<usize, BloomFilter>,
+    op_hash_build_state: Option<OpHashBuildState>,
+    op_hash_probe_state: Option<OpHashProbeState>,
+    hash_tables: HashMap<usize, HashTable>,
+    uses_subjournal: bool,
 }
 
 impl std::fmt::Debug for Program {
@@ -411,6 +450,8 @@ impl ProgramState {
                 old_record: None,
             },
             op_no_conflict_state: OpNoConflictState::Start,
+            op_hash_build_state: None,
+            op_hash_probe_state: None,
             seek_state: OpSeekState::Start,
             current_collation: None,
             op_column_state: OpColumnState::Start,
@@ -422,6 +463,9 @@ impl ProgramState {
             fk_deferred_violations_when_stmt_started: AtomicIsize::new(0),
             fk_immediate_violations_during_stmt: AtomicIsize::new(0),
             rowsets: HashMap::new(),
+            bloom_filters: HashMap::new(),
+            hash_tables: HashMap::new(),
+            uses_subjournal: false,
         }
     }
 
@@ -511,6 +555,10 @@ impl ProgramState {
         self.fk_deferred_violations_when_stmt_started
             .store(0, Ordering::SeqCst);
         self.rowsets.clear();
+        self.bloom_filters.clear();
+        self.hash_tables.clear();
+        self.op_hash_build_state = None;
+        self.op_hash_probe_state = None;
     }
 
     pub fn get_cursor(&mut self, cursor_id: CursorID) -> &mut Cursor {
@@ -528,6 +576,18 @@ impl ProgramState {
         pager: &Arc<Pager>,
         write: bool,
     ) -> Result<IOResult<()>> {
+        if write {
+            let db_size = return_if_io!(pager.with_header(|header| header.database_size.get()));
+            pager.open_subjournal()?;
+            pager.try_use_subjournal()?;
+            let result = pager.open_savepoint(db_size);
+            if result.is_err() {
+                pager.stop_use_subjournal();
+            }
+            result?;
+            self.uses_subjournal = true;
+        }
+
         // Store the deferred foreign key violations counter at the start of the statement.
         // This is used to ensure that if an interactive transaction had deferred FK violations and a statement subtransaction rolls back,
         // the deferred FK violations are not lost.
@@ -538,10 +598,6 @@ impl ProgramState {
         // Reset the immediate foreign key violations counter to 0. If this is nonzero when the statement completes, the statement subtransaction will roll back.
         self.fk_immediate_violations_during_stmt
             .store(0, Ordering::SeqCst);
-        if write {
-            let db_size = return_if_io!(pager.with_header(|header| header.database_size.get()));
-            pager.begin_statement(db_size)?;
-        }
         Ok(IOResult::Done(()))
     }
 
@@ -552,25 +608,70 @@ impl ProgramState {
         pager: &Arc<Pager>,
         end_statement: EndStatement,
     ) -> Result<()> {
-        match end_statement {
-            EndStatement::ReleaseSavepoint => pager.release_savepoint(),
-            EndStatement::RollbackSavepoint => {
-                let stmt_was_rolled_back = pager.rollback_to_newest_savepoint()?;
-                if !stmt_was_rolled_back {
-                    // We sometimes call end_statement() on errors without explicitly knowing whether a stmt transaction
-                    // caused the error or not. If it didn't, don't reset any FK violation counters.
-                    return Ok(());
+        let result = 'outer: {
+            match end_statement {
+                EndStatement::ReleaseSavepoint => pager.release_savepoint(),
+                EndStatement::RollbackSavepoint => {
+                    match pager.rollback_to_newest_savepoint() {
+                        // We sometimes call end_statement() on errors without explicitly knowing whether a stmt transaction
+                        // caused the error or not. If it didn't, don't reset any FK violation counters.
+                        Ok(false) => break 'outer Ok(()),
+                        Err(err) => break 'outer Err(err),
+                        _ => {}
+                    }
+                    // Reset the deferred foreign key violations counter to the value it had at the start of the statement.
+                    // This is used to ensure that if an interactive transaction had deferred FK violations, they are not lost.
+                    connection.fk_deferred_violations.store(
+                        self.fk_deferred_violations_when_stmt_started
+                            .load(Ordering::Acquire),
+                        Ordering::SeqCst,
+                    );
+                    Ok(())
                 }
-                // Reset the deferred foreign key violations counter to the value it had at the start of the statement.
-                // This is used to ensure that if an interactive transaction had deferred FK violations, they are not lost.
-                connection.fk_deferred_violations.store(
-                    self.fk_deferred_violations_when_stmt_started
-                        .load(Ordering::Acquire),
-                    Ordering::SeqCst,
-                );
-                Ok(())
             }
+        };
+        if self.uses_subjournal {
+            pager.stop_use_subjournal();
+            self.uses_subjournal = false;
         }
+        result
+    }
+
+    /// Gets or creates a bloom filter for the given cursor ID.
+    pub fn get_or_create_bloom_filter(&mut self, cursor_id: usize) -> &mut BloomFilter {
+        self.bloom_filters.entry(cursor_id).or_default()
+    }
+
+    /// Gets or creates a bloom filter with a specific capacity for the given cursor ID.
+    pub fn get_or_create_bloom_filter_with_capacity(
+        &mut self,
+        cursor_id: usize,
+        expected_items: u32,
+        false_positive_rate: f32,
+    ) -> &mut BloomFilter {
+        self.bloom_filters
+            .entry(cursor_id)
+            .or_insert_with(|| BloomFilter::with_capacity(expected_items, false_positive_rate))
+    }
+
+    /// Gets an existing bloom filter for the given cursor ID.
+    pub fn get_bloom_filter(&self, cursor_id: usize) -> Option<&BloomFilter> {
+        self.bloom_filters.get(&cursor_id)
+    }
+
+    /// Gets a mutable reference to an existing bloom filter for the given cursor ID.
+    pub fn get_bloom_filter_mut(&mut self, cursor_id: usize) -> Option<&mut BloomFilter> {
+        self.bloom_filters.get_mut(&cursor_id)
+    }
+
+    /// Removes and drops the bloom filter for the given cursor ID.
+    pub fn remove_bloom_filter(&mut self, cursor_id: usize) {
+        self.bloom_filters.remove(&cursor_id);
+    }
+
+    /// Checks if a bloom filter exists for the given cursor ID.
+    pub fn has_bloom_filter(&self, cursor_id: usize) -> bool {
+        self.bloom_filters.contains_key(&cursor_id)
     }
 }
 

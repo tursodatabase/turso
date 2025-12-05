@@ -28,40 +28,44 @@ members = [
     "tests",
     "parser",
     "sync/engine",
+    "sync/sdk-kit",
     "sql_generation",
     "whopper",
     "perf/throughput/turso",
     "perf/throughput/rusqlite",
-    "perf/encryption"
+    "perf/encryption",
+    "sdk-kit",
+    "sdk-kit-macros",
 ]
-exclude = [
-    "perf/latency/limbo",
-]
+exclude = ["perf/latency/limbo"]
 
 [workspace.package]
-version = "0.4.0-pre.3"
+version = "0.4.0-pre.7"
 authors = ["the Limbo authors"]
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/tursodatabase/turso"
 
 [workspace.dependencies]
-turso = { path = "bindings/rust", version = "0.4.0-pre.3" }
-turso_node = { path = "bindings/javascript", version = "0.4.0-pre.3" }
-limbo_completion = { path = "extensions/completion", version = "0.4.0-pre.3" }
-turso_core = { path = "core", version = "0.4.0-pre.3" }
-turso_sync_engine = { path = "sync/engine", version = "0.4.0-pre.3" }
-limbo_crypto = { path = "extensions/crypto", version = "0.4.0-pre.3" }
-limbo_csv = { path = "extensions/csv", version = "0.4.0-pre.3" }
-turso_ext = { path = "extensions/core", version = "0.4.0-pre.3" }
-turso_ext_tests = { path = "extensions/tests", version = "0.4.0-pre.3" }
-limbo_ipaddr = { path = "extensions/ipaddr", version = "0.4.0-pre.3" }
-turso_macros = { path = "macros", version = "0.4.0-pre.3" }
-limbo_percentile = { path = "extensions/percentile", version = "0.4.0-pre.3" }
-limbo_regexp = { path = "extensions/regexp", version = "0.4.0-pre.3" }
-limbo_uuid = { path = "extensions/uuid", version = "0.4.0-pre.3" }
-turso_parser = { path = "parser", version = "0.4.0-pre.3" }
-limbo_fuzzy = { path = "extensions/fuzzy", version = "0.4.0-pre.3" }
+turso = { path = "bindings/rust", version = "0.4.0-pre.7" }
+turso_node = { path = "bindings/javascript", version = "0.4.0-pre.7" }
+turso_sdk_kit = { path = "sdk-kit", version = "0.4.0-pre.7" }
+turso_sdk_kit_macros = { path = "sdk-kit-macros", version = "0.4.0-pre.7" }
+turso_sync_sdk_kit = { path = "sync/sdk-kit", version = "0.4.0-pre.7" }
+limbo_completion = { path = "extensions/completion", version = "0.4.0-pre.7" }
+turso_core = { path = "core", version = "0.4.0-pre.7" }
+turso_sync_engine = { path = "sync/engine", version = "0.4.0-pre.7" }
+limbo_crypto = { path = "extensions/crypto", version = "0.4.0-pre.7" }
+limbo_csv = { path = "extensions/csv", version = "0.4.0-pre.7" }
+turso_ext = { path = "extensions/core", version = "0.4.0-pre.7" }
+turso_ext_tests = { path = "extensions/tests", version = "0.4.0-pre.7" }
+limbo_ipaddr = { path = "extensions/ipaddr", version = "0.4.0-pre.7" }
+turso_macros = { path = "macros", version = "0.4.0-pre.7" }
+limbo_percentile = { path = "extensions/percentile", version = "0.4.0-pre.7" }
+limbo_regexp = { path = "extensions/regexp", version = "0.4.0-pre.7" }
+limbo_uuid = { path = "extensions/uuid", version = "0.4.0-pre.7" }
+turso_parser = { path = "parser", version = "0.4.0-pre.7" }
+limbo_fuzzy = { path = "extensions/fuzzy", version = "0.4.0-pre.7" }
 sql_generation = { path = "sql_generation" }
 strum = { version = "0.26", features = ["derive"] }
 strum_macros = "0.26"
@@ -110,6 +114,14 @@ debug = "line-tables-only"
 codegen-units = 1
 panic = "abort"
 lto = true
+
+# override settings for sdk-kit release profiles in order to reduce size of produced binaries
+# otherwise, some platforms will have enormous libs (150MB+)
+[profile.lib-release]
+inherits = "release"
+debug = false
+codegen-units = 16
+lto = false
 
 [profile.antithesis]
 inherits = "release"

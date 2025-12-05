@@ -4,8 +4,12 @@ use turso_parser::ast::TableInternalId;
 
 use crate::{
     translate::{
-        optimizer::{cost::Cost, order::plan_satisfies_order_target},
-        plan::{JoinOrderMember, JoinedTable},
+        optimizer::{
+            access_method::{try_hash_join_access_method, AccessMethodParams},
+            cost::Cost,
+            order::plan_satisfies_order_target,
+        },
+        plan::{JoinOrderMember, JoinedTable, NonFromClauseSubquery, WhereTerm},
         planner::TableMask,
     },
     LimboError, Result,
@@ -43,57 +47,272 @@ impl JoinN {
 
 /// Join n-1 tables with the n'th table.
 /// Returns None if the plan is worse than the provided cost upper bound or if no valid access method is found.
+#[allow(clippy::too_many_arguments)]
 pub fn join_lhs_and_rhs<'a>(
     lhs: Option<&JoinN>,
     rhs_table_reference: &JoinedTable,
     rhs_constraints: &'a TableConstraints,
+    all_constraints: &'a [TableConstraints],
     join_order: &[JoinOrderMember],
     maybe_order_target: Option<&OrderTarget>,
     access_methods_arena: &'a RefCell<Vec<AccessMethod>>,
     cost_upper_bound: Cost,
+    joined_tables: &[JoinedTable],
+    where_clause: &mut [WhereTerm],
+    subqueries: &[NonFromClauseSubquery],
 ) -> Result<Option<JoinN>> {
     // The input cardinality for this join is the output cardinality of the previous join.
     // For example, in a 2-way join, if the left table has 1000 rows, and the right table will return 2 rows for each of the left table's rows,
     // then the output cardinality of the join will be 2000.
     let input_cardinality = lhs.map_or(1, |l| l.output_cardinality);
 
-    let best_access_method = find_best_access_method_for_join_order(
+    let Some(method) = find_best_access_method_for_join_order(
         rhs_table_reference,
         rhs_constraints,
         join_order,
         maybe_order_target,
         input_cardinality as f64,
-    )?;
-
-    let Some(best_access_method) = best_access_method else {
+    )?
+    else {
         return Ok(None);
     };
 
     let lhs_cost = lhs.map_or(Cost(0.0), |l| l.cost);
-    let cost = lhs_cost + best_access_method.cost;
+    // If we have a previous table, consider hash join as an alternative
+    let mut best_access_method = method;
 
-    if cost > cost_upper_bound {
-        return Ok(None);
-    }
-
-    access_methods_arena.borrow_mut().push(best_access_method);
-
-    let mut best_access_methods = Vec::with_capacity(join_order.len());
-    best_access_methods.extend(lhs.map_or(vec![], |l| l.data.clone()));
-
-    let rhs_table_number = join_order.last().unwrap().original_idx;
-    best_access_methods.push((rhs_table_number, access_methods_arena.borrow().len() - 1));
-
+    // Reuse for both hash cost and output cardinality computation
     let lhs_mask = lhs.map_or(TableMask::new(), |l| {
         TableMask::from_table_number_iter(l.table_numbers())
     });
-    // Output cardinality is reduced by the product of the selectivities of the constraints that can be used with this join order.
     let output_cardinality_multiplier = rhs_constraints
         .constraints
         .iter()
         .filter(|c| lhs_mask.contains_all(&c.lhs_mask))
         .map(|c| c.selectivity)
         .product::<f64>();
+    let rhs_table_number = join_order.last().unwrap().original_idx;
+
+    // If we already have a non-empty LHS (at least one table has been joined),
+    // consider a hash-join alternative for the current RHS. We only allow hash
+    // joins when:
+    //
+    // - The would-be build table is accessed via a scan
+    // - Choosing hash join does not destroy a useful ORDER BY the nested-loop plan would satisfy.
+    // - The probe table is not using a selective index seek we’d prefer to keep.
+    // - The build table has no remaining constraints from prior tables that
+    //   are not already consumed as hash-join keys in earlier hash joins.
+    if let Some(lhs) = lhs {
+        let lhs_table_idx = join_order[join_order.len() - 2].original_idx;
+        let rhs_table_idx = join_order.last().unwrap().original_idx;
+        let lhs_table = &joined_tables[lhs_table_idx];
+
+        // If the chosen access method for the build table already uses constraints
+        // skip hash join to avoid dropping those filters.
+        let build_access_method_uses_constraints = lhs
+            .data
+            .iter()
+            .find(|(table_no, _)| *table_no == lhs_table_idx)
+            .map(|(_, am_idx)| *am_idx)
+            .map(|am_idx| {
+                let arena = access_methods_arena.borrow();
+                arena.get(am_idx).is_some_and(|am| {
+                    if let AccessMethodParams::BTreeTable {
+                        constraint_refs, ..
+                    } = &am.params
+                    {
+                        !constraint_refs.is_empty()
+                    } else {
+                        false
+                    }
+                })
+            })
+            .unwrap_or(false);
+
+        // If the query needs a specific ordering, only allow hash join when the nested-loop
+        // alternative would NOT satisfy the order target.
+        let nested_loop_preserves_order = maybe_order_target.is_some_and(|order_target| {
+            // Temporarily add the nested-loop method to the arena to evaluate ordering.
+            {
+                let mut arena = access_methods_arena.borrow_mut();
+                arena.push(best_access_method.clone());
+            }
+            let am_idx = access_methods_arena.borrow().len() - 1;
+            let mut data = lhs.data.clone();
+            data.push((rhs_table_number, am_idx));
+            let tmp_plan = JoinN {
+                data,
+                output_cardinality: 0,
+                cost: Cost(0.0),
+            };
+            let preserves = plan_satisfies_order_target(
+                &tmp_plan,
+                access_methods_arena,
+                joined_tables,
+                order_target,
+            );
+            access_methods_arena.borrow_mut().pop();
+            preserves
+        });
+
+        let build_cardinality = lhs.output_cardinality as f64;
+        let probe_cardinality = ESTIMATED_HARDCODED_ROWS_PER_TABLE as f64;
+
+        let rhs_has_selective_seek = matches!(
+            best_access_method.params,
+            AccessMethodParams::BTreeTable {
+                ref constraint_refs,
+                ..
+            } if !constraint_refs.is_empty()
+        );
+
+        // The probe table must NOT be the build table of any earlier hash join
+        let arena = access_methods_arena.borrow();
+        let probe_table_is_prior_build = lhs.data.iter().any(|(_, am_idx)| {
+            arena.get(*am_idx).is_some_and(|am| {
+                if let AccessMethodParams::HashJoin {
+                    build_table_idx, ..
+                } = &am.params
+                {
+                    *build_table_idx == rhs_table_idx
+                } else {
+                    false
+                }
+            })
+        });
+
+        // The build table must NOT have any constraints from prior tables
+        // that won't be consumed as hash join keys. When a table becomes a hash build table,
+        // its cursor is exhausted after building. If there are constraints like `prior.x = build.x`
+        // that aren't part of the build & probe hash join, they can't be evaluated because the
+        // build cursor is no longer positioned.
+        //
+        // HOWEVER: If the constraint references only tables that are the BUILD side
+        // of earlier hash joins where this proposed build table was the PROBE, then
+        // that equality is already used as a hash-join key. In that case, when we
+        // later SeekRowid into the build table for that earlier join, the cursor is
+        // correctly positioned and the constraint is effectively "consumed".
+        //
+        // Example:
+        // `SELECT... items JOIN products ON items.name = products.name JOIN order_items ON products.price = order_items.price`:
+        // - First hash join: items(build) - products(probe)
+        // - When considering: products(build) - order_items(probe)
+        // - products has constraint from items, BUT items is build of an earlier hash join where products was probe
+        // - So the constraint IS consumed, and products cursor IS positioned via SeekRowid
+        let build_has_prior_constraints = {
+            let build_constraints = &all_constraints[lhs_table_idx];
+
+            // Get the set of tables that are build tables for hash joins where lhs_table_idx was probe
+            let tables_already_hash_joined_as_build: Vec<usize> = {
+                let arena = access_methods_arena.borrow();
+                lhs.data
+                    .iter()
+                    .filter_map(|(_, am_idx)| {
+                        arena.get(*am_idx).and_then(|am| {
+                            if let AccessMethodParams::HashJoin {
+                                build_table_idx,
+                                probe_table_idx,
+                                ..
+                            } = &am.params
+                            {
+                                if *probe_table_idx == lhs_table_idx {
+                                    Some(*build_table_idx)
+                                } else {
+                                    None
+                                }
+                            } else {
+                                None
+                            }
+                        })
+                    })
+                    .collect()
+            };
+
+            build_constraints.constraints.iter().any(|c| {
+                // Check if this constraint references prior tables that are NOT already
+                // handled by a hash join where we were the probe table
+                let prior_mask = lhs_mask;
+                if !c.lhs_mask.intersects(&prior_mask) {
+                    return false; // Constraint doesn't reference prior tables
+                }
+                // Check if ALL referenced prior tables are already hash-joined with us as probe
+                // If so, the constraint is consumed and we're OK
+                for table_idx in 0..64 {
+                    if c.lhs_mask.contains_table(table_idx)
+                        && prior_mask.contains_table(table_idx)
+                        && !tables_already_hash_joined_as_build.contains(&table_idx)
+                    {
+                        // This prior table is NOT handled by a hash join, constraint not consumed
+                        return true;
+                    }
+                }
+                false // All referenced prior tables are hash-joined
+            })
+        };
+
+        // Only consider hash join when the build table is using a plain table scan
+        // (no index, no constraint-driven search). Otherwise we'd drop useful filters
+        // or break the access pattern the planner chose.
+        //
+        // We intentionally do NOT (yet) allow a table that is already the probe side of
+        // a hash join to become the build side of another hash join, the second hash join
+        // would rebuild from ALL rows of the middle table, not just the matching rows from the first.
+        let build_am_is_plain_table_scan = lhs
+            .data
+            .iter()
+            .find(|(table_no, _)| *table_no == lhs_table_idx)
+            .map(|(_, am_idx)| {
+                let arena = access_methods_arena.borrow();
+                arena.get(*am_idx).is_some_and(|am| {
+                    matches!(
+                        &am.params,
+                        AccessMethodParams::BTreeTable {
+                            index: None,
+                            constraint_refs,
+                            ..
+                        } if constraint_refs.is_empty()
+                    )
+                })
+            })
+            .unwrap_or(false);
+        if !build_access_method_uses_constraints
+            && !nested_loop_preserves_order
+            && !rhs_has_selective_seek
+            && !probe_table_is_prior_build
+            && !build_has_prior_constraints
+            && build_am_is_plain_table_scan
+        {
+            let lhs_constraints = &all_constraints[lhs_table_idx];
+            if let Some(hash_join_method) = try_hash_join_access_method(
+                lhs_table,
+                rhs_table_reference,
+                lhs_table_idx,
+                rhs_table_idx,
+                lhs_constraints,
+                rhs_constraints,
+                where_clause,
+                build_cardinality,
+                probe_cardinality,
+                input_cardinality as f64,
+                subqueries,
+            ) {
+                if hash_join_method.cost < best_access_method.cost {
+                    best_access_method = hash_join_method;
+                }
+            }
+        }
+    }
+
+    let cost = lhs_cost + best_access_method.cost;
+    if cost > cost_upper_bound {
+        return Ok(None);
+    }
+    access_methods_arena.borrow_mut().push(best_access_method);
+
+    let mut best_access_methods = Vec::with_capacity(join_order.len());
+    best_access_methods.extend(lhs.map_or(vec![], |l| l.data.clone()));
+
+    best_access_methods.push((rhs_table_number, access_methods_arena.borrow().len() - 1));
 
     // Produce a number of rows estimated to be returned when this table is filtered by the WHERE clause.
     // If this table is the rightmost table in the join order, we multiply by the input cardinality,
@@ -126,6 +345,8 @@ pub fn compute_best_join_order<'a>(
     maybe_order_target: Option<&OrderTarget>,
     constraints: &'a [TableConstraints],
     access_methods_arena: &'a RefCell<Vec<AccessMethod>>,
+    where_clause: &mut [WhereTerm],
+    subqueries: &[NonFromClauseSubquery],
 ) -> Result<Option<BestJoinOrderResult>> {
     // Skip work if we have no tables to consider.
     if joined_tables.is_empty() {
@@ -140,6 +361,8 @@ pub fn compute_best_join_order<'a>(
         maybe_order_target,
         access_methods_arena,
         constraints,
+        where_clause,
+        subqueries,
     )?;
 
     // Keep track of both 1. the best plan overall (not considering sorting), and 2. the best ordered plan (which might not be the same).
@@ -203,10 +426,14 @@ pub fn compute_best_join_order<'a>(
             None,
             table_ref,
             &constraints[i],
+            constraints,
             &join_order,
             maybe_order_target,
             access_methods_arena,
             cost_upper_bound,
+            joined_tables,
+            where_clause,
+            subqueries,
         )?;
         if let Some(rel) = rel {
             best_plan_memo.insert(mask, rel);
@@ -318,10 +545,14 @@ pub fn compute_best_join_order<'a>(
                     Some(lhs),
                     &joined_tables[rhs_idx],
                     &constraints[rhs_idx],
+                    constraints,
                     &join_order,
                     maybe_order_target,
                     access_methods_arena,
                     cost_upper_bound,
+                    joined_tables,
+                    where_clause,
+                    subqueries,
                 )?;
                 join_order.clear();
 
@@ -405,6 +636,8 @@ pub fn compute_naive_left_deep_plan<'a>(
     maybe_order_target: Option<&OrderTarget>,
     access_methods_arena: &'a RefCell<Vec<AccessMethod>>,
     constraints: &'a [TableConstraints],
+    where_clause: &mut [WhereTerm],
+    subqueries: &[NonFromClauseSubquery],
 ) -> Result<Option<JoinN>> {
     let n = joined_tables.len();
     assert!(n > 0);
@@ -424,10 +657,14 @@ pub fn compute_naive_left_deep_plan<'a>(
         None,
         &joined_tables[0],
         &constraints[0],
+        constraints,
         &join_order[..1],
         maybe_order_target,
         access_methods_arena,
         Cost(f64::MAX),
+        joined_tables,
+        where_clause,
+        subqueries,
     )?;
     if best_plan.is_none() {
         return Ok(None);
@@ -439,10 +676,14 @@ pub fn compute_naive_left_deep_plan<'a>(
             best_plan.as_ref(),
             &joined_tables[i],
             &constraints[i],
+            constraints,
             &join_order[..=i],
             maybe_order_target,
             access_methods_arena,
             Cost(f64::MAX),
+            joined_tables,
+            where_clause,
+            subqueries,
         )?;
         if best_plan.is_none() {
             return Ok(None);
@@ -537,7 +778,7 @@ mod tests {
     fn test_compute_best_join_order_empty() {
         let table_references = TableReferences::new(vec![], vec![]);
         let available_indexes = HashMap::new();
-        let where_clause = vec![];
+        let mut where_clause = vec![];
 
         let access_methods_arena = RefCell::new(Vec::new());
         let table_constraints = constraints_from_where_clause(
@@ -553,6 +794,8 @@ mod tests {
             None,
             &table_constraints,
             &access_methods_arena,
+            &mut where_clause,
+            &[],
         )
         .unwrap();
         assert!(result.is_none());
@@ -570,7 +813,7 @@ mod tests {
         )];
         let table_references = TableReferences::new(joined_tables, vec![]);
         let available_indexes = HashMap::new();
-        let where_clause = vec![];
+        let mut where_clause = vec![];
 
         let access_methods_arena = RefCell::new(Vec::new());
         let table_constraints = constraints_from_where_clause(
@@ -588,6 +831,8 @@ mod tests {
             None,
             &table_constraints,
             &access_methods_arena,
+            &mut where_clause,
+            &[],
         )
         .unwrap()
         .unwrap();
@@ -609,7 +854,7 @@ mod tests {
             table_id_counter.next(),
         )];
 
-        let where_clause = vec![_create_binary_expr(
+        let mut where_clause = vec![_create_binary_expr(
             _create_column_expr(joined_tables[0].internal_id, 0, true), // table 0, column 0 (rowid)
             ast::Operator::Equals,
             _create_numeric_literal("42"),
@@ -633,6 +878,8 @@ mod tests {
             None,
             &table_constraints,
             &access_methods_arena,
+            &mut where_clause,
+            &[],
         )
         .unwrap();
         assert!(result.is_some());
@@ -663,7 +910,7 @@ mod tests {
             table_id_counter.next(),
         )];
 
-        let where_clause = vec![_create_binary_expr(
+        let mut where_clause = vec![_create_binary_expr(
             _create_column_expr(joined_tables[0].internal_id, 0, false), // table 0, column 0 (id)
             ast::Operator::Equals,
             _create_numeric_literal("42"),
@@ -706,6 +953,8 @@ mod tests {
             None,
             &table_constraints,
             &access_methods_arena,
+            &mut where_clause,
+            &[],
         )
         .unwrap();
         assert!(result.is_some());
@@ -769,7 +1018,7 @@ mod tests {
 
         // SELECT * FROM table1 JOIN table2 WHERE table1.id = table2.id
         // expecting table2 to be chosen first due to the index on table1.id
-        let where_clause = vec![_create_binary_expr(
+        let mut where_clause = vec![_create_binary_expr(
             _create_column_expr(joined_tables[TABLE1].internal_id, 0, false), // table1.id
             ast::Operator::Equals,
             _create_column_expr(joined_tables[TABLE2].internal_id, 0, false), // table2.id
@@ -790,6 +1039,8 @@ mod tests {
             None,
             &table_constraints,
             &access_methods_arena,
+            &mut where_clause,
+            &[],
         )
         .unwrap();
         assert!(result.is_some());
@@ -939,7 +1190,7 @@ mod tests {
         // expecting customers to be chosen first due to the index on customers.id and it having a selective filter (=42)
         // then orders to be chosen next due to the index on orders.customer_id
         // then order_items to be chosen last due to the index on order_items.order_id
-        let where_clause = vec![
+        let mut where_clause = vec![
             // orders.customer_id = customers.id
             _create_binary_expr(
                 _create_column_expr(joined_tables[TABLE_NO_ORDERS].internal_id, 1, false), // orders.customer_id
@@ -975,6 +1226,8 @@ mod tests {
             None,
             &table_constraints,
             &access_methods_arena,
+            &mut where_clause,
+            &[],
         )
         .unwrap();
         assert!(result.is_some());
@@ -1057,7 +1310,7 @@ mod tests {
             ),
         ];
 
-        let where_clause = vec![
+        let mut where_clause = vec![
             // t2.foo = 42 (equality filter, more selective)
             _create_binary_expr(
                 _create_column_expr(joined_tables[1].internal_id, 1, false), // table 1, column 1 (foo)
@@ -1088,6 +1341,8 @@ mod tests {
             None,
             &table_constraints,
             &access_methods_arena,
+            &mut where_clause,
+            &[],
         )
         .unwrap()
         .unwrap();
@@ -1198,6 +1453,8 @@ mod tests {
             None,
             &table_constraints,
             &access_methods_arena,
+            &mut where_clause,
+            &[],
         )
         .unwrap();
         assert!(result.is_some());
@@ -1287,6 +1544,8 @@ mod tests {
             None,
             &table_constraints,
             &access_methods_arena,
+            &mut where_clause,
+            &[],
         )
         .unwrap()
         .unwrap();
@@ -1386,7 +1645,7 @@ mod tests {
         });
 
         // Create where clause that only references second column
-        let where_clause = vec![WhereTerm {
+        let mut where_clause = vec![WhereTerm {
             expr: Expr::Binary(
                 Box::new(Expr::Column {
                     database: None,
@@ -1416,6 +1675,8 @@ mod tests {
             None,
             &table_constraints,
             &access_methods_arena,
+            &mut where_clause,
+            &[],
         )
         .unwrap()
         .unwrap();
@@ -1488,7 +1749,7 @@ mod tests {
         });
 
         // Create where clause that references first and third columns
-        let where_clause = vec![
+        let mut where_clause = vec![
             WhereTerm {
                 expr: Expr::Binary(
                     Box::new(Expr::Column {
@@ -1534,6 +1795,8 @@ mod tests {
             None,
             &table_constraints,
             &access_methods_arena,
+            &mut where_clause,
+            &[],
         )
         .unwrap()
         .unwrap();
@@ -1610,7 +1873,7 @@ mod tests {
         });
 
         // Create where clause: c1 = 5 AND c2 > 10 AND c3 = 7
-        let where_clause = vec![
+        let mut where_clause = vec![
             WhereTerm {
                 expr: Expr::Binary(
                     Box::new(Expr::Column {
@@ -1670,6 +1933,8 @@ mod tests {
             None,
             &table_constraints,
             &access_methods_arena,
+            &mut where_clause,
+            &[],
         )
         .unwrap()
         .unwrap();
@@ -1799,6 +2064,131 @@ mod tests {
                 constraint_refs,
             } => (*iter_dir, index.clone(), constraint_refs),
             _ => panic!("expected BTreeTable access method"),
+        }
+    }
+
+    #[test]
+    /// Test that when an index is available on the join column, the optimizer prefers
+    /// index lookup over hash join.
+    fn test_prefer_index_lookup_over_hash_join() {
+        // CREATE TABLE t1(a,b,c);
+        // CREATE TABLE t2(a,b,c);
+        // CREATE INDEX idx_t2_a ON t2(a);
+        // SELECT * FROM t1 JOIN t2 ON t1.a = t2.a;
+        // Expected: SCAN t1, SEARCH t2 USING INDEX idx_t2_a (a=?)
+        // Not: HASH JOIN
+
+        let t1 = _create_btree_table("t1", _create_column_list(&["a", "b", "c"], Type::Integer));
+        let t2 = _create_btree_table("t2", _create_column_list(&["a", "b", "c"], Type::Integer));
+
+        let mut table_id_counter = TableRefIdCounter::new();
+        let joined_tables = vec![
+            _create_table_reference(t1.clone(), None, table_id_counter.next()),
+            _create_table_reference(
+                t2.clone(),
+                Some(JoinInfo {
+                    outer: false,
+                    using: vec![],
+                }),
+                table_id_counter.next(),
+            ),
+        ];
+
+        const TABLE1: usize = 0;
+        const TABLE2: usize = 1;
+
+        // Index on t2.a
+        let mut available_indexes = HashMap::new();
+        let index_t2_a = Arc::new(Index {
+            name: "idx_t2_a".to_string(),
+            table_name: "t2".to_string(),
+            where_clause: None,
+            columns: vec![IndexColumn {
+                name: "a".to_string(),
+                order: SortOrder::Asc,
+                pos_in_table: 0,
+                collation: None,
+                default: None,
+                expr: None,
+            }],
+            unique: false, // Non-unique index
+            ephemeral: false,
+            root_page: 2,
+            has_rowid: true,
+            index_method: None,
+        });
+        available_indexes.insert("t2".to_string(), VecDeque::from([index_t2_a]));
+
+        // WHERE t1.a = t2.a
+        let mut where_clause = vec![_create_binary_expr(
+            _create_column_expr(joined_tables[TABLE1].internal_id, 0, false), // t1.a
+            ast::Operator::Equals,
+            _create_column_expr(joined_tables[TABLE2].internal_id, 0, false), // t2.a
+        )];
+
+        let table_references = TableReferences::new(joined_tables, vec![]);
+        let access_methods_arena = RefCell::new(Vec::new());
+        let table_constraints = constraints_from_where_clause(
+            &where_clause,
+            &table_references,
+            &available_indexes,
+            &[],
+        )
+        .unwrap();
+
+        let result = compute_best_join_order(
+            table_references.joined_tables(),
+            None,
+            &table_constraints,
+            &access_methods_arena,
+            &mut where_clause,
+            &[],
+        )
+        .unwrap();
+        assert!(result.is_some());
+        let BestJoinOrderResult { best_plan, .. } = result.unwrap();
+
+        // Expected: t1 first (scan), t2 second (index seek)
+        assert_eq!(
+            best_plan.table_numbers().collect::<Vec<_>>(),
+            vec![TABLE1, TABLE2],
+            "Expected join order [t1, t2] to use index on t2.a"
+        );
+
+        // t1 should use table scan (no constraints)
+        let access_method_t1 = &access_methods_arena.borrow()[best_plan.data[0].1];
+        let (_, _, constraint_refs_t1) = _as_btree(access_method_t1);
+        assert!(
+            constraint_refs_t1.is_empty(),
+            "t1 should use table scan with no constraints"
+        );
+
+        // t2 should use index seek, NOT hash join
+        let access_method_t2 = &access_methods_arena.borrow()[best_plan.data[1].1];
+        match &access_method_t2.params {
+            AccessMethodParams::BTreeTable {
+                index,
+                constraint_refs,
+                ..
+            } => {
+                assert!(
+                    index.is_some(),
+                    "t2 should use index idx_t2_a, not a hash join"
+                );
+                assert_eq!(
+                    index.as_ref().unwrap().name,
+                    "idx_t2_a",
+                    "t2 should use index idx_t2_a"
+                );
+                assert!(
+                    !constraint_refs.is_empty(),
+                    "t2 should have constraints for index seek"
+                );
+            }
+            AccessMethodParams::HashJoin { .. } => {
+                panic!("Expected index lookup on t2, but got hash join instead");
+            }
+            _ => panic!("Unexpected access method for t2"),
         }
     }
 }

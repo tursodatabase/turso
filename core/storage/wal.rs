@@ -1099,6 +1099,7 @@ impl Wal for WalFile {
         let shared_file = self.shared.clone();
         let complete = Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
             let Ok((buf, bytes_read)) = res else {
+                tracing::error!(err = ?res.unwrap_err());
                 page.clear_locked();
                 page.clear_wal_tag();
                 return;
@@ -2328,7 +2329,7 @@ impl WalFileShared {
     ) -> Result<Arc<RwLock<WalFileShared>>> {
         let file = io.open_file(path, crate::io::OpenFlags::Create, false)?;
         if file.size()? == 0 {
-            return WalFileShared::new_noop();
+            return Ok(WalFileShared::new_noop());
         }
         let wal_file_shared = sqlite3_ondisk::build_shared_wal(&file, io)?;
         turso_assert!(
@@ -2344,7 +2345,7 @@ impl WalFileShared {
         Ok(self.initialized.load(Ordering::Acquire))
     }
 
-    pub fn new_noop() -> Result<Arc<RwLock<WalFileShared>>> {
+    pub fn new_noop() -> Arc<RwLock<WalFileShared>> {
         let wal_header = WalHeader {
             magic: 0,
             file_format: 0,
@@ -2378,7 +2379,7 @@ impl WalFileShared {
             initialized: AtomicBool::new(false),
             epoch: AtomicU32::new(0),
         };
-        Ok(Arc::new(RwLock::new(shared)))
+        Arc::new(RwLock::new(shared))
     }
 
     pub fn new_shared(file: Arc<dyn File>) -> Result<Arc<RwLock<WalFileShared>>> {

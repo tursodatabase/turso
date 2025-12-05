@@ -80,6 +80,7 @@ dev = [
     "pluggy>=1.6.0",
     "pytest>=8.3.1",
     "pytest-cov>=5.0.0",
+    "requests>=2.32.5",
     "ruff>=0.5.4",
     "typing-extensions>=4.13.0",
 ]

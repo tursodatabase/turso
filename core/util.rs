@@ -14,6 +14,7 @@ use crate::{
     LimboError, OpenFlags, Result, Statement, StepResult, SymbolTable,
 };
 use crate::{Connection, MvStore, IO};
+use either::Either;
 use parking_lot::Mutex;
 use std::sync::atomic::AtomicU8;
 use std::{collections::HashMap, rc::Rc, sync::Arc};
@@ -132,7 +133,7 @@ pub fn parse_schema_rows(
     mut existing_views: HashMap<String, Arc<Mutex<IncrementalView>>>,
 ) -> Result<()> {
     rows.set_mv_tx(mv_tx);
-    let mv_store = rows.mv_store.clone();
+    let mv_store = rows.mv_store().clone();
     // TODO: if we IO, this unparsed indexes is lost. Will probably need some state between
     // IO runs
     let mut from_sql_indexes = Vec::with_capacity(10);
@@ -176,9 +177,11 @@ pub fn parse_schema_rows(
                 // read the schema is actually complete?
                 rows.run_once()?;
             }
-            StepResult::Interrupt => break,
+            StepResult::Interrupt => {
+                return Err(LimboError::InternalError("interrupted".to_string()))
+            }
             StepResult::Done => break,
-            StepResult::Busy => break,
+            StepResult::Busy => return Err(LimboError::Busy),
         }
     }
 
@@ -198,8 +201,18 @@ pub fn parse_schema_rows(
 }
 
 fn cmp_numeric_strings(num_str: &str, other: &str) -> bool {
-    match (num_str.parse::<f64>(), other.parse::<f64>()) {
-        (Ok(num), Ok(other)) => num == other,
+    fn parse(s: &str) -> Option<Either<i64, f64>> {
+        if let Ok(i) = s.parse::<i64>() {
+            Some(Either::Left(i))
+        } else if let Ok(f) = s.parse::<f64>() {
+            Some(Either::Right(f))
+        } else {
+            None
+        }
+    }
+
+    match (parse(num_str), parse(other)) {
+        (Some(left), Some(right)) => left == right,
         _ => num_str == other,
     }
 }

@@ -1,0 +1,119 @@
+---
+name: 2025-11-26-py-bindings
+---
+
+<Output path="./turso/lib.py">
+
+<Code model="openai/gpt-5" language="python">
+
+Turso - is the SQLite compatible database written in Rust.
+One of the important features of the Turso - is async IO execution which can be used with modern storage backend like IO uring.
+
+Your task is to generate Python driver with the API similar to the SQLite DB-api2
+
+# Rules
+
+General rules for driver implementation you **MUST** follow and never go against these rules:
+- STRUCTURE of the implementation 
+    * Declaration order of elements and semantic blocks MUST be exsactly the same
+    * (details and full enumerations omited in the example for brevity but you must generate full code)
+```py
+# all imports must be at the beginning - no imports in the middle of function
+from typing import ...
+from ._turso import ( ... )
+
+
+# DB-API 2.0 module attributes
+apilevel = "2.0" 
+...
+
+# Exception hierarchy following DB-API 2.0
+class Warning(Exception): ... # more
+...
+
+def _map_turso_exception(exc: Exception) -> Exception:
+    """Maps Turso-specific exceptions to DB-API 2.0 exception hierarchy"""
+    if isinstance(exc, Busy): ...
+    ...
+
+# Connection goes FIRST
+class Connection: ...
+# Cursor goes SECOND
+class Cursor: ...
+# Row goes THIRD
+class Row: ...
+
+def connect(
+    path: str,
+    *,
+    experimental_features: Optional[str] = None,
+    isolation_level: Optional[str] = "DEFERRED",
+    extra_io: Optional[Callable[[], None]] = None # extra IO which must be called after stmt.run_io() invocations in the driver
+): ...
+
+# Make it easy to enable logging with native `logging` Python module
+# (import logging only inside this function - make an exception here)
+def setup_logging(level: Optional[int] = None) -> None: ...
+```
+- AVOID unnecessary FFI calls as their cost is non zero
+- AVOID unnecessary strings transformations - replace them with more efficient alternatives if possible
+- DO NOT ever mix `PyTursoStatement::execute` and `PyTursoStatement::step` methods: every statement must be either "stepped" or "executed"
+    * This is because `execute` ignores all rows
+- NEVER put import in the middle of a function - always put all necessary immports at the beginning of the file
+- SQL query can be arbitrary, be very careful writing the code which relies on properties derived from the simple string analysis
+    * ONLY ANALYZE SQL statement to detect DML statement and open implicit transaction
+    * DO NOT check for any symbols to detect multi statements, named parameters, etc - this is error prone. Use provided methods and avoid certain checks if they are impossible with current API provided from the Rust
+- FOCUS on code readability: if possible extract helper function but make sure that it will be used more than once and that it really contribute to the code readability
+- WATCH OUT for variables scopes and do not use variables which are no longer accessible
+- DO NOT TRACK transaction state manually and use `get_auto_commit` method - otherwise it can be hard to properly implement implicit transaction rules of DB API2
+- USE forward reference string in when return method type depends on its class:
+```py
+class T: 
+    def f(self) -> 'T':
+```
+
+# Implementation
+
+- Accept extra_io optional parameter in the driver which will run after stmt.run_io() whenever statement execution returned TURSO_IO status
+- Put compact citations from the official DB-API doc if this is helpful
+- Driver must implement context API for Python to be used like `with ... as conn:` ...
+- Driver implementation must be type-friendly - emit types everywhere at API boundary (public methods, class fields, etc)
+    * DO NOT forget that constructor of Row must have following signature: 
+```py
+class Row(Sequence[Any]):
+    def __new__(cls, cursor: Cursor, data: tuple[Any, ...], /) -> Self: ...
+```
+    * Make typings compatible with official types:
+    <Link url="https://raw.githubusercontent.com/python/typeshed/refs/heads/main/stdlib/sqlite3/__init__.pyi" /> 
+
+
+# Bindings
+
+You must use bindings in the lib.rs written with `pyo3` library which has certain conventions.
+
+<File path="./src/turso.rs" />
+<File path="./turso/__init__.py" />
+
+Remember, that it can accept `py: Python` argument which will be passed implicitly and exported bindings will not have this extra arg
+
+# SQLite-like DB API
+
+Make driver API similar to the SQLite DB-API2 for the python.
+
+Pay additional attention to the following aspects:
+* SQLite DB-API2 implementation implicitly opens transaction for DML queries in the execute(...) method:
+    > If autocommit is LEGACY_TRANSACTION_CONTROL, isolation_level is not None, sql is an INSERT, UPDATE, DELETE, or REPLACE statement, and there is no open transaction, a transaction is implicitly opened before executing sql.
+    - MAKE SURE this logic implemented properly
+* Implement .rowcount property correctly, be careful with `executemany(...)` methods as it must return rowcount of all executed statements (not just last statement)
+* Convert exceptions from rust layer to appropriate exceptions documented in the sqlite3 db-api2 docs
+* BE CAREFUL with implementation of transaction control. Make sure that in LEGACY_TRANSACTION_CONTROL mode implicit transaction will be properly commited in case of cursor close
+
+<Shell 
+    cmd="curl https://docs.python.org/3/library/sqlite3.html | pandoc --from html --to markdown" 
+    selector="~Connection objects|~Cursor objects|~Row objects|~Exceptions|~Transaction" 
+    ext=".md"
+/>
+
+</Code>
+
+</Output>

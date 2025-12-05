@@ -1617,10 +1617,10 @@ impl<'a> PartialOrd<ValueRef<'a>> for ValueRef<'a> {
         match (self, other) {
             (Self::Integer(int_left), Self::Integer(int_right)) => int_left.partial_cmp(int_right),
             (Self::Integer(int_left), Self::Float(float_right)) => {
-                (*int_left as f64).partial_cmp(float_right)
+                Some(sqlite_int_float_compare(*int_left, *float_right))
             }
             (Self::Float(float_left), Self::Integer(int_right)) => {
-                float_left.partial_cmp(&(*int_right as f64))
+                Some(sqlite_int_float_compare(*int_right, *float_left).reverse())
             }
             (Self::Float(float_left), Self::Float(float_right)) => {
                 float_left.partial_cmp(float_right)
@@ -2632,7 +2632,7 @@ macro_rules! return_and_restore_if_io {
     };
 }
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Clone, Copy)]
 pub enum SeekResult {
     /// Record matching the [SeekOp] found in the B-tree and cursor was positioned to point onto that record
     Found,

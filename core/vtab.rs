@@ -498,16 +498,22 @@ impl ExtVirtualTableCursor {
     ) -> crate::Result<bool> {
         tracing::trace!("xFilter");
         let ext_args = args.iter().map(|arg| arg.to_ffi()).collect::<Vec<_>>();
-        let c_idx_str = idx_str
-            .map(|s| std::ffi::CString::new(s).unwrap())
-            .map(|cstr| cstr.into_raw())
+        let idx_str = match idx_str {
+            Some(idx_str) => Some(std::ffi::CString::new(idx_str).map_err(|e| {
+                crate::LimboError::InternalError(format!("failed to convert idx_str string: {e}"))
+            })?),
+            None => None,
+        };
+        let c_idx_str_ptr = idx_str
+            .as_ref()
+            .map(|s| s.as_ptr())
             .unwrap_or(std::ptr::null_mut());
         let rc = unsafe {
             (self.implementation.filter)(
                 self.cursor.as_ptr(),
                 arg_count as i32,
                 ext_args.as_ptr(),
-                c_idx_str,
+                c_idx_str_ptr,
                 idx_num,
             )
         };

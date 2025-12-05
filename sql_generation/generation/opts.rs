@@ -27,6 +27,10 @@ pub struct Opts {
     pub table: TableOpts,
     #[garde(dive)]
     pub query: QueryOpts,
+    #[garde(skip)]
+    /// Generate arbitrary INSERT INTO ... SELECT queries. This is disabled by default, as it makes
+    /// the simulator very slow and generates huge databases.
+    pub arbitrary_insert_into_select: bool,
 }
 
 impl Default for Opts {
@@ -35,6 +39,7 @@ impl Default for Opts {
             indexes: true,
             table: Default::default(),
             query: Default::default(),
+            arbitrary_insert_into_select: false,
         }
     }
 }

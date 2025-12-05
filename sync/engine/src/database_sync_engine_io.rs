@@ -14,7 +14,7 @@ pub trait DataCompletion<T>: Send + Sync + 'static {
     fn is_done(&self) -> Result<bool>;
 }
 
-pub trait ProtocolIO: Send + Sync + 'static {
+pub trait SyncEngineIo: Send + Sync + 'static {
     type DataCompletionBytes: DataCompletion<u8>;
     type DataCompletionTransform: DataCompletion<DatabaseRowTransformResult>;
     fn full_read(&self, path: &str) -> Result<Self::DataCompletionBytes>;
@@ -30,6 +30,6 @@ pub trait ProtocolIO: Send + Sync + 'static {
         body: Option<Vec<u8>>,
         headers: &[(&str, &str)],
     ) -> Result<Self::DataCompletionBytes>;
-    fn add_work(&self, callback: Box<dyn FnMut() -> bool + Send>);
-    fn step_work(&self);
+    fn add_io_callback(&self, callback: Box<dyn FnMut() -> bool + Send>);
+    fn step_io_callbacks(&self);
 }

@@ -791,6 +791,7 @@ pub fn determine_where_to_eval_term(
     term: &WhereTerm,
     join_order: &[JoinOrderMember],
     subqueries: &[NonFromClauseSubquery],
+    table_references: Option<&TableReferences>,
 ) -> Result<EvalAt> {
     if let Some(table_id) = term.from_outer_join {
         return Ok(EvalAt::Loop(
@@ -801,7 +802,7 @@ pub fn determine_where_to_eval_term(
         ));
     }
 
-    determine_where_to_eval_expr(&term.expr, join_order, subqueries)
+    determine_where_to_eval_expr(&term.expr, join_order, subqueries, table_references)
 }
 
 /// A bitmask representing a set of tables in a query plan.
@@ -962,10 +963,13 @@ pub fn table_mask_from_expr(
     Ok(mask)
 }
 
+/// When a table referenced in the expression is not found in join_order, we check if it's
+/// a hash join build table. If so, we map the condition to the probe table's loop position.
 pub fn determine_where_to_eval_expr(
     top_level_expr: &Expr,
     join_order: &[JoinOrderMember],
     subqueries: &[NonFromClauseSubquery],
+    table_references: Option<&TableReferences>,
 ) -> Result<EvalAt> {
     // If the expression references no tables, it can be evaluated before any table loops are opened.
     let mut eval_at: EvalAt = EvalAt::BeforeLoop;
@@ -973,6 +977,22 @@ pub fn determine_where_to_eval_expr(
         match expr {
             Expr::Column { table, .. } | Expr::RowId { table, .. } => {
                 let Some(join_idx) = join_order.iter().position(|t| t.table_id == *table) else {
+                    // Table not found in join_order. Check if it's a hash join build table.
+                    // If so, we need to evaluate the condition at the probe table's loop position.
+                    if let Some(tables) = table_references {
+                        for (probe_idx, member) in join_order.iter().enumerate() {
+                            let probe_table = &tables.joined_tables()[member.original_idx];
+                            if let Operation::HashJoin(ref hj) = probe_table.op {
+                                let build_table = &tables.joined_tables()[hj.build_table_idx];
+                                if build_table.internal_id == *table {
+                                    // This table is the build side of a hash join.
+                                    // Evaluate the condition at the probe table's loop position.
+                                    eval_at = eval_at.max(EvalAt::Loop(probe_idx));
+                                    return Ok(WalkControl::Continue);
+                                }
+                            }
+                        }
+                    }
                     // Must be an outer query reference; in that case, the table is already in scope.
                     return Ok(WalkControl::Continue);
                 };

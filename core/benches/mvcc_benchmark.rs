@@ -18,7 +18,7 @@ fn bench_db() -> BenchDb {
     let io = Arc::new(MemoryIO::new());
     let db = Database::open_file(io.clone(), ":memory:", true, true).unwrap();
     let conn = db.connect().unwrap();
-    let mvcc_store = db.get_mv_store().unwrap().clone();
+    let mvcc_store = db.get_mv_store().clone().unwrap();
     BenchDb {
         _db: db,
         conn,
@@ -95,14 +95,11 @@ fn bench(c: &mut Criterion) {
             db.mvcc_store
                 .update(
                     tx_id,
-                    Row {
-                        id: RowID {
-                            table_id: (-2).into(),
-                            row_id: RowKey::Int(1),
-                        },
-                        data: record_data.clone(),
-                        column_count: 1,
-                    },
+                    Row::new_table_row(
+                        RowID::new((-2).into(), RowKey::Int(1)),
+                        record_data.clone(),
+                        1,
+                    ),
                 )
                 .unwrap();
             let mv_store = &db.mvcc_store;
@@ -123,14 +120,11 @@ fn bench(c: &mut Criterion) {
     db.mvcc_store
         .insert(
             tx_id,
-            Row {
-                id: RowID {
-                    table_id: (-2).into(),
-                    row_id: RowKey::Int(1),
-                },
-                data: record_data.clone(),
-                column_count: 1,
-            },
+            Row::new_table_row(
+                RowID::new((-2).into(), RowKey::Int(1)),
+                record_data.clone(),
+                1,
+            ),
         )
         .unwrap();
     group.bench_function("read", |b| {
@@ -152,14 +146,11 @@ fn bench(c: &mut Criterion) {
     db.mvcc_store
         .insert(
             tx_id,
-            Row {
-                id: RowID {
-                    table_id: (-2).into(),
-                    row_id: RowKey::Int(1),
-                },
-                data: record_data.clone(),
-                column_count: 1,
-            },
+            Row::new_table_row(
+                RowID::new((-2).into(), RowKey::Int(1)),
+                record_data.clone(),
+                1,
+            ),
         )
         .unwrap();
     group.bench_function("update", |b| {
@@ -167,14 +158,11 @@ fn bench(c: &mut Criterion) {
             db.mvcc_store
                 .update(
                     tx_id,
-                    Row {
-                        id: RowID {
-                            table_id: (-2).into(),
-                            row_id: RowKey::Int(1),
-                        },
-                        data: record_data.clone(),
-                        column_count: 1,
-                    },
+                    Row::new_table_row(
+                        RowID::new((-2).into(), RowKey::Int(1)),
+                        record_data.clone(),
+                        1,
+                    ),
                 )
                 .unwrap();
         })

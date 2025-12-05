@@ -8,6 +8,9 @@ use sql_generation::generation::Opts;
 pub struct QueryProfile {
     #[garde(dive)]
     pub gen_opts: Opts,
+    /// Produces a new `TableHasExpectedContent` after each freestanding DML statement
+    #[garde(skip)]
+    pub check_after_dml: bool,
     #[garde(skip)]
     pub select_weight: u32,
     #[garde(skip)]
@@ -34,6 +37,7 @@ impl Default for QueryProfile {
     fn default() -> Self {
         Self {
             gen_opts: Opts::default(),
+            check_after_dml: true,
             select_weight: 60,
             create_table_weight: 15,
             create_index_weight: 5,

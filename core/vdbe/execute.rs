@@ -22,9 +22,13 @@ use crate::util::{
     rewrite_fk_parent_table_if_needed, rewrite_inline_col_fk_target_if_needed,
 };
 use crate::vdbe::affinity::{apply_numeric_affinity, try_for_float, Affinity, ParsedNumber};
+use crate::vdbe::hash_table::{HashEntry, HashTable, HashTableConfig};
 use crate::vdbe::insn::InsertFlags;
 use crate::vdbe::value::ComparisonOp;
-use crate::vdbe::{registers_to_ref_values, EndStatement, StepResult, TxnCleanup};
+use crate::vdbe::{
+    registers_to_ref_values, EndStatement, OpHashBuildState, OpHashProbeState, StepResult,
+    TxnCleanup,
+};
 use crate::vector::{
     vector32, vector32_sparse, vector64, vector_concat, vector_distance_cos, vector_distance_dot,
     vector_distance_jaccard, vector_distance_l2, vector_extract, vector_slice,
@@ -7018,20 +7022,30 @@ pub fn op_new_rowid(
         },
         insn
     );
-    if let Some(mv_store) = mv_store {
-        // With MVCC we can't simply find last rowid and get rowid + 1 as a result. To not have two conflicting rowids concurrently we need to call `get_next_rowid`
-        // which will make sure we don't collide.
-        let rowid = {
-            let cursor = state.get_cursor(*cursor);
-            let cursor = cursor.as_btree_mut() as &mut dyn Any;
-            let mvcc_cursor = cursor
-                .downcast_mut::<MvCursor>()
-                .expect("cursor should be MvCursor in MVCC mode");
-            mvcc_cursor.get_next_rowid()
-        };
-        state.registers[*rowid_reg] = Register::Value(Value::Integer(rowid));
-        state.pc += 1;
-        return Ok(InsnFunctionStepResult::Step);
+    'mvcc_newrowid: {
+        if let Some(mv_store) = mv_store {
+            // With MVCC we can't simply find last rowid and get rowid + 1 as a result. To not have two conflicting rowids concurrently we need to call `get_next_rowid`
+            // which will make sure we don't collide.
+            let rowid = {
+                let cursor = state.get_cursor(*cursor);
+                let cursor = cursor.as_btree_mut() as &mut dyn Any;
+                let Some(mvcc_cursor) = cursor.downcast_mut::<MvCursor>() else {
+                    // Not an MvCursor - must be an ephemeral cursor (indicated by lack of WAL)
+                    let Some(ephemeral_cursor) = cursor.downcast_mut::<BTreeCursor>() else {
+                        panic!("Expected MvCursor or BTreeCursor in op_new_rowid");
+                    };
+                    turso_assert!(
+                        ephemeral_cursor.pager.wal.is_none(),
+                        "MVCC is enabled but got a non-ephemeral BTreeCursor"
+                    );
+                    break 'mvcc_newrowid;
+                };
+                return_if_io!(mvcc_cursor.get_next_rowid())
+            };
+            state.registers[*rowid_reg] = Register::Value(Value::Integer(rowid));
+            state.pc += 1;
+            return Ok(InsnFunctionStepResult::Step);
+        }
     }
 
     const MAX_ROWID: i64 = i64::MAX;
@@ -9331,6 +9345,337 @@ pub fn op_fk_if_zero(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub fn op_hash_build(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        HashBuild {
+            cursor_id,
+            key_start_reg,
+            num_keys,
+            hash_table_id,
+            mem_budget,
+            collations,
+            payload_start_reg,
+            num_payload,
+        },
+        insn
+    );
+
+    let mut op_state = state
+        .op_hash_build_state
+        .take()
+        .filter(|s| {
+            s.hash_table_id == *hash_table_id
+                && s.cursor_id == *cursor_id
+                && s.key_start_reg == *key_start_reg
+                && s.num_keys == *num_keys
+        })
+        .unwrap_or_else(|| OpHashBuildState {
+            key_values: Vec::with_capacity(*num_keys),
+            key_idx: 0,
+            payload_values: Vec::with_capacity(*num_payload),
+            payload_idx: 0,
+            rowid: None,
+            cursor_id: *cursor_id,
+            hash_table_id: *hash_table_id,
+            key_start_reg: *key_start_reg,
+            num_keys: *num_keys,
+        });
+
+    // Create hash table if it doesn't exist yet
+    if !state.hash_tables.contains_key(hash_table_id) {
+        let config = HashTableConfig {
+            initial_buckets: 1024,
+            mem_budget: *mem_budget,
+            num_keys: *num_keys,
+            collations: collations.clone(),
+        };
+        let hash_table = HashTable::new(config, pager.io.clone());
+        state.hash_tables.insert(*hash_table_id, hash_table);
+    }
+
+    // Read pre-computed key values directly from registers
+    while op_state.key_idx < *num_keys {
+        let i = op_state.key_idx;
+        let reg = &state.registers[*key_start_reg + i];
+        let value = reg.get_value().clone();
+        op_state.key_values.push(value);
+        op_state.key_idx += 1;
+    }
+
+    // Read payload values from registers if provided
+    if let Some(payload_reg) = payload_start_reg {
+        while op_state.payload_idx < *num_payload {
+            let i = op_state.payload_idx;
+            let reg = &state.registers[*payload_reg + i];
+            let value = reg.get_value().clone();
+            op_state.payload_values.push(value);
+            op_state.payload_idx += 1;
+        }
+    }
+
+    // Get the rowid from the cursor
+    if op_state.rowid.is_none() {
+        let cursor = state.get_cursor(*cursor_id);
+        let rowid_val = match cursor {
+            Cursor::BTree(btree_cursor) => {
+                let rowid_opt = match btree_cursor.rowid() {
+                    Ok(IOResult::Done(v)) => v,
+                    Ok(IOResult::IO(io)) => {
+                        state.op_hash_build_state = Some(op_state);
+                        return Ok(InsnFunctionStepResult::IO(io));
+                    }
+                    Err(e) => {
+                        state.op_hash_build_state = Some(op_state);
+                        return Err(e);
+                    }
+                };
+                rowid_opt.ok_or_else(|| {
+                    LimboError::InternalError("HashBuild: cursor has no rowid".to_string())
+                })?
+            }
+            _ => {
+                return Err(LimboError::InternalError(
+                    "HashBuild: unsupported cursor type".to_string(),
+                ));
+            }
+        };
+        op_state.rowid = Some(rowid_val);
+    }
+
+    // Insert the rowid into the hash table
+    if let Some(ht) = state.hash_tables.get_mut(hash_table_id) {
+        let rowid = op_state.rowid.expect("rowid set");
+        let key_values = std::mem::take(&mut op_state.key_values);
+        let payload_values = std::mem::take(&mut op_state.payload_values);
+        match ht.insert(key_values.clone(), rowid, payload_values.clone()) {
+            Ok(IOResult::Done(())) => {}
+            Ok(IOResult::IO(io)) => {
+                op_state.key_values = key_values;
+                op_state.payload_values = payload_values;
+                state.op_hash_build_state = Some(op_state);
+                return Ok(InsnFunctionStepResult::IO(io));
+            }
+            Err(e) => {
+                op_state.key_values = key_values;
+                op_state.payload_values = payload_values;
+                state.op_hash_build_state = Some(op_state);
+                return Err(e);
+            }
+        }
+    }
+
+    state.op_hash_build_state = None;
+    state.metrics.rows_read = state.metrics.rows_read.saturating_add(1);
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_hash_build_finalize(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+    _mv_store: Option<&Arc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(HashBuildFinalize { hash_table_id }, insn);
+    if let Some(ht) = state.hash_tables.get_mut(hash_table_id) {
+        // Finalize the build phase, may flush remaining partitions to disk if spilled
+        match ht.finalize_build()? {
+            crate::types::IOResult::Done(()) => {
+                // Partitions will be loaded on-demand during probing
+            }
+            crate::types::IOResult::IO(io) => {
+                return Ok(InsnFunctionStepResult::IO(io));
+            }
+        }
+    }
+
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Write payload values from a hash entry to registers.
+fn write_hash_payload_to_registers(
+    registers: &mut [Register],
+    entry: &HashEntry,
+    payload_dest_reg: Option<usize>,
+    num_payload: usize,
+) {
+    if let Some(dest_reg) = payload_dest_reg {
+        for (i, value) in entry.payload_values.iter().take(num_payload).enumerate() {
+            registers[dest_reg + i] = Register::Value(value.clone());
+        }
+    }
+}
+
+pub fn op_hash_probe(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        HashProbe {
+            hash_table_id,
+            key_start_reg,
+            num_keys,
+            dest_reg,
+            target_pc,
+            payload_dest_reg,
+            num_payload,
+        },
+        insn
+    );
+    let (probe_keys, partition_idx) = if let Some(op_state) = state.op_hash_probe_state.take() {
+        if op_state.hash_table_id == *hash_table_id {
+            (op_state.probe_keys, Some(op_state.partition_idx))
+        } else {
+            // Different hash table, read fresh keys
+            let mut keys = Vec::with_capacity(*num_keys);
+            for i in 0..*num_keys {
+                let reg = &state.registers[*key_start_reg + i];
+                keys.push(reg.get_value().clone());
+            }
+            (keys, None)
+        }
+    } else {
+        // First entry, read probe keys from registers
+        let mut keys = Vec::with_capacity(*num_keys);
+        for i in 0..*num_keys {
+            let reg = &state.registers[*key_start_reg + i];
+            keys.push(reg.get_value().clone());
+        }
+        (keys, None)
+    };
+
+    let hash_table = state.hash_tables.get_mut(hash_table_id).ok_or_else(|| {
+        LimboError::InternalError(format!("Hash table not found in register {hash_table_id}"))
+    })?;
+
+    // For spilled hash tables, load the appropriate partition on demand
+    if hash_table.has_spilled() {
+        let partition_idx =
+            partition_idx.unwrap_or_else(|| hash_table.partition_for_keys(&probe_keys));
+
+        // Load partition if not already loaded (may require multiple re-entries for multi-chunk partitions)
+        if !hash_table.is_partition_loaded(partition_idx) {
+            match hash_table.load_spilled_partition(partition_idx)? {
+                IOResult::Done(()) => {
+                    // Partition loaded or nothing to load
+                }
+                IOResult::IO(io) => {
+                    state.op_hash_probe_state = Some(OpHashProbeState {
+                        probe_keys,
+                        hash_table_id: *hash_table_id,
+                        partition_idx,
+                    });
+                    return Ok(InsnFunctionStepResult::IO(io));
+                }
+            }
+        }
+
+        // Probe the loaded partition
+        match hash_table.probe_partition(partition_idx, &probe_keys) {
+            Some(entry) => {
+                state.registers[*dest_reg] = Register::Value(Value::Integer(entry.rowid));
+                write_hash_payload_to_registers(
+                    &mut state.registers,
+                    entry,
+                    *payload_dest_reg,
+                    *num_payload,
+                );
+                state.pc += 1;
+                Ok(InsnFunctionStepResult::Step)
+            }
+            None => {
+                state.pc = target_pc.as_offset_int();
+                Ok(InsnFunctionStepResult::Step)
+            }
+        }
+    } else {
+        // Non-spilled hash table, use normal probe
+        match hash_table.probe(probe_keys) {
+            Some(entry) => {
+                state.registers[*dest_reg] = Register::Value(Value::Integer(entry.rowid));
+                write_hash_payload_to_registers(
+                    &mut state.registers,
+                    entry,
+                    *payload_dest_reg,
+                    *num_payload,
+                );
+                state.pc += 1;
+                Ok(InsnFunctionStepResult::Step)
+            }
+            None => {
+                state.pc = target_pc.as_offset_int();
+                Ok(InsnFunctionStepResult::Step)
+            }
+        }
+    }
+}
+
+pub fn op_hash_next(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        HashNext {
+            hash_table_id,
+            dest_reg,
+            target_pc,
+            payload_dest_reg,
+            num_payload,
+        },
+        insn
+    );
+
+    let hash_table = state.hash_tables.get_mut(hash_table_id).ok_or_else(|| {
+        LimboError::InternalError(format!("Hash table not found with ID: {hash_table_id}"))
+    })?;
+    match hash_table.next_match() {
+        Some(entry) => {
+            state.registers[*dest_reg] = Register::Value(Value::Integer(entry.rowid));
+            write_hash_payload_to_registers(
+                &mut state.registers,
+                entry,
+                *payload_dest_reg,
+                *num_payload,
+            );
+            state.pc += 1;
+            Ok(InsnFunctionStepResult::Step)
+        }
+        None => {
+            state.pc = target_pc.as_offset_int();
+            Ok(InsnFunctionStepResult::Step)
+        }
+    }
+}
+
+pub fn op_hash_close(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(HashClose { hash_table_id }, insn);
+    if let Some(mut hash_table) = state.hash_tables.remove(hash_table_id) {
+        hash_table.close();
+    }
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 fn apply_affinity_char(target: &mut Register, affinity: Affinity) -> bool {
     if let Register::Value(value) = target {
         if matches!(value, Value::Blob(_)) {
@@ -9552,6 +9897,91 @@ pub fn op_journal_mode(
 
     // Always return "wal" as the current journal mode
     state.registers[*dest] = Register::Value(Value::build_text("wal"));
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_filter(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        Filter {
+            cursor_id,
+            target_pc,
+            key_reg,
+            num_keys
+        },
+        insn
+    );
+    let Some(filter) = state.get_bloom_filter(*cursor_id) else {
+        // always safe to fall though, no filter present
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    };
+    let contains = if *num_keys == 1 {
+        // Single key optimization, avoid allocating a Vec
+        let value = state.registers[*key_reg].get_value();
+        if matches!(value, Value::Null) {
+            // its always safe to fall through, so this *should* be `true` but
+            // since it's always an equality predicate and we have a NULL value,
+            // we can just short-circuit to false here.
+            false
+        } else {
+            filter.contains_value(value)
+        }
+    } else {
+        let values: Vec<&Value> = (0..*num_keys)
+            .map(|i| state.registers[*key_reg + i].get_value())
+            .collect();
+        if values.iter().any(|v| matches!(*v, Value::Null)) {
+            false
+        } else {
+            filter.contains_values(&values)
+        }
+    };
+
+    if !contains {
+        state.pc = target_pc.as_offset_int();
+    } else {
+        state.pc += 1;
+    }
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_filter_add(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        FilterAdd {
+            cursor_id,
+            key_reg,
+            num_keys
+        },
+        insn
+    );
+
+    if *num_keys == 1 {
+        let reg: *const Register = &state.registers[*key_reg];
+        let value = unsafe { &*reg }.get_value();
+        let filter = state.get_or_create_bloom_filter(*cursor_id);
+        filter.insert_value(value);
+    } else {
+        let values: Vec<Value> = (0..*num_keys)
+            .map(|i| state.registers[*key_reg + i].get_value().clone())
+            .collect();
+        let filter = state.get_or_create_bloom_filter(*cursor_id);
+        let value_refs: Vec<&Value> = values.iter().collect();
+        filter.insert_values(&value_refs);
+    }
+
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }

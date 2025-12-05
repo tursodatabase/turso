@@ -63,7 +63,7 @@ mod tests {
             let db = db.clone();
             std::thread::spawn(move || {
                 let conn = db.get_db().connect().unwrap();
-                let mvcc_store = db.get_db().mv_store.as_ref().unwrap().clone();
+                let mvcc_store = db.get_db().get_mv_store().clone().unwrap();
                 for _ in 0..iterations {
                     let tx = mvcc_store.begin_tx(conn.pager.load().clone()).unwrap();
                     let id = IDS.fetch_add(1, Ordering::SeqCst);
@@ -88,7 +88,7 @@ mod tests {
         let th2 = {
             std::thread::spawn(move || {
                 let conn = db.get_db().connect().unwrap();
-                let mvcc_store = db.get_db().mv_store.as_ref().unwrap().clone();
+                let mvcc_store = db.get_db().get_mv_store().clone().unwrap();
                 for _ in 0..iterations {
                     let tx = mvcc_store.begin_tx(conn.pager.load().clone()).unwrap();
                     let id = IDS.fetch_add(1, Ordering::SeqCst);
@@ -125,7 +125,7 @@ mod tests {
             let db = db.clone();
             std::thread::spawn(move || {
                 let conn = db.get_db().connect().unwrap();
-                let mvcc_store = db.get_db().mv_store.as_ref().unwrap().clone();
+                let mvcc_store = db.get_db().get_mv_store().clone().unwrap();
                 let mut failed_upserts = 0;
                 for i in 0..iterations {
                     if i % 1000 == 0 {
