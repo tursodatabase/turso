@@ -88,16 +88,18 @@ async fn test_cacheflush() {
         .await
         .unwrap();
 
-    let mut res = conn.query("SELECT * FROM asdf", ()).await.unwrap();
+    {
+        let mut res = conn.query("SELECT * FROM asdf", ()).await.unwrap();
 
-    assert_eq!(
-        res.next().await.unwrap().unwrap().get_value(0).unwrap(),
-        2.into()
-    );
-    assert_eq!(
-        res.next().await.unwrap().unwrap().get_value(0).unwrap(),
-        3.into()
-    );
+        assert_eq!(
+            res.next().await.unwrap().unwrap().get_value(0).unwrap(),
+            2.into()
+        );
+        assert_eq!(
+            res.next().await.unwrap().unwrap().get_value(0).unwrap(),
+            3.into()
+        );
+    }
 
     // Tests if cache flush doesn't break a committed transaction
     conn.execute("BEGIN", ()).await.unwrap();
