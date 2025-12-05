@@ -45,7 +45,7 @@ use crate::index_method::IndexMethod;
 use crate::schema::Trigger;
 use crate::storage::checksum::CHECKSUM_REQUIRED_RESERVED_BYTES;
 use crate::storage::encryption::AtomicCipherMode;
-use crate::storage::pager::{AutoVacuumMode, HeaderRef};
+use crate::storage::pager::{self, AutoVacuumMode, HeaderRef};
 use crate::translate::display::PlanContext;
 use crate::translate::pragma::TURSO_CDC_DEFAULT_TABLE_NAME;
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
@@ -249,6 +249,9 @@ pub struct Database {
     opts: DatabaseOpts,
     n_connections: AtomicUsize,
 
+    /// In Memory Page 1 for Empty Dbs
+    init_page_1: Arc<ArcSwapOption<Page>>,
+
     // Encryption
     encryption_key: RwLock<Option<EncryptionKey>>,
     encryption_cipher_mode: AtomicCipherMode,
@@ -347,6 +350,14 @@ impl Database {
                 (None, None)
             };
 
+        let init_page_1 = if db_size == 0 {
+            let default_page_1 = pager::default_page1(encryption_cipher_mode.as_ref());
+
+            Some(default_page_1)
+        } else {
+            None
+        };
+
         // opts is now passed as parameter
         let db = Database {
             mv_store,
@@ -364,6 +375,8 @@ impl Database {
             opts,
             buffer_pool: BufferPool::begin_init(io, arena_size),
             n_connections: AtomicUsize::new(0),
+
+            init_page_1: Arc::new(ArcSwapOption::new(init_page_1)),
 
             encryption_key: RwLock::new(encryption_key),
             encryption_cipher_mode: AtomicCipherMode::new(

@@ -14,7 +14,7 @@ use crate::{
     io::CompletionGroup, return_if_io, turso_assert, types::WalFrameInfo, Completion, Connection,
     IOResult, LimboError, Result, TransactionState,
 };
-use crate::{io_yield_one, CompletionError, IOContext, OpenFlags, IO};
+use crate::{io_yield_one, Buffer, CompletionError, IOContext, OpenFlags, IO};
 use parking_lot::{Mutex, RwLock};
 use roaring::RoaringBitmap;
 use std::cell::{RefCell, UnsafeCell};
@@ -2854,6 +2854,41 @@ pub fn allocate_new_page(page_id: i64, buffer_pool: &Arc<BufferPool>, offset: us
         page.clear_wal_tag();
         page.get().contents = Some(PageContent::new(offset, buffer));
     }
+    page
+}
+
+pub fn default_page1(cipher: Option<&CipherMode>) -> PageRef {
+    // New Database header for empty Database
+    let mut default_header = DatabaseHeader::default();
+
+    if let Some(cipher) = cipher {
+        // we will set the reserved space bytes as required by either the encryption
+        let reserved_space_bytes = cipher.metadata_size() as u8;
+        default_header.reserved_space = reserved_space_bytes;
+    }
+
+    let page = Arc::new(Page::new(DatabaseHeader::PAGE_ID as i64));
+
+    let contents = PageContent::new(
+        0,
+        Arc::new(Buffer::new_temporary(
+            default_header.page_size.get() as usize
+        )),
+    );
+
+    contents.write_database_header(&default_header);
+
+    btree_init_page(
+        &page,
+        PageType::TableLeaf,
+        DatabaseHeader::SIZE, // offset of 100 bytes
+        (default_header.page_size.get() - default_header.reserved_space as u32) as usize,
+    );
+
+    page.set_loaded();
+    page.clear_wal_tag();
+    page.get().contents.replace(contents);
+
     page
 }
 
