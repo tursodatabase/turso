@@ -67,7 +67,7 @@ impl CollationSeq {
 
     #[inline(always)]
     fn rtrim_cmp(lhs: &str, rhs: &str) -> Ordering {
-        lhs.trim_end().cmp(rhs.trim_end())
+        lhs.trim_end_matches(' ').cmp(rhs.trim_end_matches(' '))
     }
 }
 
