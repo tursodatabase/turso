@@ -2533,7 +2533,25 @@ impl Jsonb {
                                 bail_parse_error!("Element with negative index not found")
                             }
                         }
-                        _ => unreachable!(),
+                        _ => {
+                            if mode.allows_insert() {
+                                let arr_pos = end_pos;
+                                let placeholder =
+                                    JsonbHeader::new(ElementType::OBJECT, 0).into_bytes();
+                                let placeholder_bytes = placeholder.as_bytes();
+
+                                self.data
+                                    .splice(arr_pos..arr_pos, placeholder_bytes.iter().copied());
+
+                                return Ok(JsonTraversalResult::with_array_index(
+                                    pos + root_header_size,
+                                    JsonLocationKind::ArrayEntry,
+                                    placeholder_bytes.len() as isize,
+                                    arr_pos,
+                                ));
+                            }
+                            bail_parse_error!("Index past end of array")
+                        }
                     }
                 } else {
                     if root_type == ElementType::OBJECT
@@ -2712,7 +2730,25 @@ impl Jsonb {
                                 bail_parse_error!("Element with negative index not found")
                             }
                         }
-                        _ => unreachable!(),
+                        _ => {
+                            if mode.allows_insert() {
+                                let arr_pos = end_pos;
+                                let placeholder =
+                                    JsonbHeader::new(ElementType::OBJECT, 0).into_bytes();
+                                let placeholder_bytes = placeholder.as_bytes();
+
+                                self.data
+                                    .splice(arr_pos..arr_pos, placeholder_bytes.iter().copied());
+
+                                return Ok(JsonTraversalResult::with_array_index(
+                                    pos,
+                                    JsonLocationKind::DocumentRoot,
+                                    placeholder_bytes.len() as isize,
+                                    arr_pos,
+                                ));
+                            }
+                            bail_parse_error!("Index past end of array")
+                        }
                     }
                 } else {
                     bail_parse_error!("Root is not an array");
@@ -2801,7 +2837,7 @@ impl Jsonb {
                     ));
                 }
 
-                if current_pos != end_pos && mode.allows_replace() {
+                if current_pos != end_pos && (mode.allows_replace() || mode.allows_insert()) {
                     let key_idx = current_pos;
 
                     current_pos = self.skip_element(current_pos)?;
@@ -2894,7 +2930,22 @@ impl Jsonb {
                                 let placeholder_bytes = placeholder.as_bytes();
                                 let insertion_point = value_idx + value_size + value_header_size;
 
-                                self.data.insert(insertion_point, placeholder_bytes[0]);
+                                self.data.splice(
+                                    insertion_point..insertion_point,
+                                    placeholder_bytes.iter().copied(),
+                                );
+                                self.write_element_header(
+                                    value_idx,
+                                    ElementType::ARRAY,
+                                    value_size + placeholder_bytes.len(),
+                                    true,
+                                )?;
+                                return Ok(JsonTraversalResult::with_array_index(
+                                    value_idx,
+                                    JsonLocationKind::ObjectProperty(key_idx),
+                                    placeholder_bytes.len() as isize,
+                                    insertion_point,
+                                ));
                             } else {
                                 bail_parse_error!("Cant insert")
                             }

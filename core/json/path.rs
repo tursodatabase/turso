@@ -285,9 +285,17 @@ fn handle_array_index(
             *index_buffer = new_num;
         }
         (ArrayIndexState::IsMax | ArrayIndexState::IsMaxNegative, '0'..='9') => (),
-        (ArrayIndexState::CollectingNumbers | ArrayIndexState::CollectingNegativeNumbers | ArrayIndexState::IsMax | ArrayIndexState::IsMaxNegative, ']') => {
+        (ArrayIndexState::CollectingNumbers | ArrayIndexState::IsMax, ']') => {
             *parser_state = PPState::ExpectDotOrBracket;
             path_components.push(PathElement::ArrayLocator(Some(*index_buffer as i32)));
+        }
+        (ArrayIndexState::CollectingNegativeNumbers | ArrayIndexState::IsMaxNegative, ']') => {
+            *parser_state = PPState::ExpectDotOrBracket;
+            if *index_buffer == 0 {
+                path_components.push(PathElement::ArrayLocator(None));
+            } else {
+                path_components.push(PathElement::ArrayLocator(Some(*index_buffer as i32)));
+            }
         }
         (_, _) => bail_parse_error!("Bad json path: {}", path),
     }
