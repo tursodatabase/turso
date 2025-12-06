@@ -2,6 +2,7 @@
 
 [package]
 name = "limbo_sim"
+default-run = "limbo_sim"
 version.workspace = true
 authors.workspace = true
 edition = "2024"
@@ -13,6 +14,10 @@ publish = false
 [[bin]]
 name = "limbo_sim"
 path = "main.rs"
+
+[[bin]]
+name = "plan_to_test"
+path = "plan_to_test.rs"
 
 [dependencies]
 turso_core = { workspace = true, features = ["simulator"]}
