@@ -653,9 +653,9 @@ impl Database {
         // Currently we always init shared wal regardless if MVCC enabled
         match (wal_exists, log_exists) {
             (true, true) => {
-                return Err(LimboError::Corrupt(format!(
-                    "Both WAL and MVCC logical log file exist"
-                )));
+                return Err(LimboError::Corrupt(
+                    "Both WAL and MVCC logical log file exist".to_string(),
+                ));
             }
             (true, false) => {
                 // Currently, if a non-zero-sized WAL file exists, the database cannot be opened in MVCC mode.
