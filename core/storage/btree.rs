@@ -2704,11 +2704,14 @@ impl BTreeCursor {
                     let number_of_cells_in_parent = cell_count + over_cell_count;
 
                     // If `seek` moved to rightmost page, cell index will be out of bounds. Meaning cell_count+1.
-                    // In any other case, `seek` will stay in the correct index.
+                    // Additionally, during trigger execution, the tree structure may have changed since the
+                    // original seek, causing the cell index to be far out of bounds. We clamp to valid bounds.
+                    let current_cell_idx = self.stack.current_cell_index();
                     let past_rightmost_pointer =
-                        self.stack.current_cell_index() as usize == number_of_cells_in_parent + 1;
+                        current_cell_idx as usize > number_of_cells_in_parent;
                     if past_rightmost_pointer {
-                        self.stack.retreat();
+                        // Clamp to the rightmost pointer position
+                        self.stack.set_cell_index(number_of_cells_in_parent as i32);
                     }
 
                     let parent_page = self.stack.get_page_at_level(parent_page_idx).unwrap();

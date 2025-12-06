@@ -761,7 +761,7 @@ do_execsql_test_on_specific_db {:memory:} trigger-multiple-before-insert-lifo {
 5|1|1|1|jussi}
 
 # dropping table should drop triggers
-do_execsql_test_on_specific_db {:memory:} trigger-drop-make-same-table{
+do_execsql_test_on_specific_db {:memory:} trigger-drop-make-same-table {
   create table a(id int primary key, x int);
   create table t(id int primary key, b int, d int, c int);
   create table t1(id int, y int); create trigger trg after insert on t begin update a set x = x - new.d + new.c where id = new.b; insert into t1(id, y) values (new.id, new.c - new.d); end; insert into a values (1, 5000);
@@ -790,14 +790,32 @@ do_execsql_test_in_memory_any_error trigger-cannot-create-on-system-table {
 do_execsql_test_on_specific_db {:memory:} trigger-col-name-trigger-subquery {
     CREATE TABLE t ( a INTEGER, b TEXT);
     CREATE TABLE t1 ( x INTEGER, y TEXT);
-    
+
     CREATE TRIGGER trg AFTER UPDATE ON t1 BEGIN
         INSERT INTO t SELECT * FROM t WHERE t.a = 42;
     END;
     insert into t VALUES (42, 'abc');
     INSERT INTO t1 VALUES (0, '');
-    UPDATE t1 SET y = 'z' WHERE TRUE; 
+    UPDATE t1 SET y = 'z' WHERE TRUE;
     select * from t union all select * from t1;
 } {2|abc
 42|abc
 0|z}
+
+# Test for trigger that causes rapid btree growth through recursive inserts.
+# This tests that balance_non_root handles stale cell indices correctly when
+# the btree structure changes during trigger execution.
+# The bug manifests after multiple bulk inserts that cause repeated page splits.
+do_execsql_test_on_specific_db {:memory:} trigger-rapid-growth-balance {
+    CREATE TABLE t (a REAL, b INTEGER, c TEXT);
+    INSERT INTO t VALUES (1.0, 100, 'row1'), (2.0, 200, 'row2'), (3.0, 300, 'row3');
+    DELETE FROM t WHERE b = 200;
+    CREATE TRIGGER tr AFTER INSERT ON t BEGIN
+        UPDATE t SET a = 999.0 WHERE TRUE;
+        INSERT INTO t SELECT * FROM t WHERE TRUE;
+    END;
+    INSERT INTO t VALUES (10.0, 1000, 'test1'), (20.0, 2000, 'test2'), (30.0, 3000, 'test3'), (40.0, 4000, 'test4'), (50.0, 5000, 'test5'), (60.0, 6000, 'test6');
+    INSERT INTO t VALUES (10.0, 1000, 'test1'), (20.0, 2000, 'test2'), (30.0, 3000, 'test3'), (40.0, 4000, 'test4'), (50.0, 5000, 'test5'), (60.0, 6000, 'test6');
+    INSERT INTO t VALUES (10.0, 1000, 'test1'), (20.0, 2000, 'test2'), (30.0, 3000, 'test3'), (40.0, 4000, 'test4'), (50.0, 5000, 'test5'), (60.0, 6000, 'test6');
+    SELECT 'done';
+} {done}
