@@ -631,7 +631,9 @@ impl Database {
         // Now check the Header Version to see which mode the DB file really is on
         match read_version {
             Version::Legacy => {
-                return Err(LimboError::InvalidArgument(format!("Database is in Legacy mode. Use `pragma journal_mode = 'wal'` in sqlite to enable wal mode")));
+                // just treat it as WAL mode
+                header_mut.read_version = RawVersion::from(Version::Wal);
+                header_mut.write_version = RawVersion::from(Version::Wal);
             }
             Version::Wal => {
                 if self.mvcc_enabled() {
