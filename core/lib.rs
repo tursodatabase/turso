@@ -3024,6 +3024,36 @@ impl Statement {
     }
 
     fn reset_internal(&mut self, max_registers: Option<usize>, max_cursors: Option<usize>) {
+        // Run write statements (INSERT/UPDATE/DELETE) to completion if still in progress.
+        // This ensures INSERT...RETURNING and similar statements complete their work
+        // even if not all returned rows were consumed.
+        // Skip for read-only statements (SELECT) as they have no side effects.
+        // Skip if we're already panicking to avoid double-panic in drop handlers.
+        while self.program.change_cnt_on
+            && !std::thread::panicking()
+            && self.state.execution_state.is_running()
+        {
+            match self.program.step(
+                &mut self.state,
+                self.program.connection.mv_store().as_ref(),
+                self.pager.clone(),
+                QueryMode::Normal,
+                None,
+            ) {
+                Ok(vdbe::StepResult::Done) | Ok(vdbe::StepResult::Row) => continue,
+                Ok(vdbe::StepResult::IO) => {
+                    if let Err(e) = self.run_once() {
+                        tracing::error!("Error running statement to completion: {}", e);
+                        break;
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("Error running statement to completion: {}", e);
+                    break;
+                }
+                Ok(vdbe::StepResult::Interrupt) | Ok(vdbe::StepResult::Busy) => break,
+            }
+        }
         // as abort uses auto_txn_cleanup value - it needs to be called before state.reset
         self.program.abort(
             self.program.connection.mv_store().as_ref(),
