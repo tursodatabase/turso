@@ -2559,3 +2559,65 @@ do_execsql_test_on_specific_db {:memory:} matview-recreate-after-drop {
 3|30.0
 3|40
 4|60}
+
+do_execsql_test_on_specific_db {:memory:} matview-cte-simple {
+    CREATE TABLE t(a);
+    CREATE MATERIALIZED VIEW mv AS
+        WITH cte AS (SELECT * FROM t)
+        SELECT * FROM cte;
+
+    INSERT INTO t VALUES (1), (2);
+    SELECT * FROM mv ORDER BY a;
+} {1
+2}
+
+do_execsql_test_on_specific_db {:memory:} matview-cte-with-filter {
+    CREATE TABLE users(id INTEGER, name TEXT, age INTEGER);
+    INSERT INTO users VALUES
+        (1, 'Alice', 25),
+        (2, 'Bob', 30),
+        (3, 'Charlie', 17),
+        (4, 'David', 22);
+
+    CREATE MATERIALIZED VIEW adult_users AS
+        WITH adults AS (SELECT * FROM users WHERE age >= 18)
+        SELECT id, name FROM adults;
+
+    SELECT * FROM adult_users ORDER BY name;
+} {1|Alice
+2|Bob
+4|David}
+
+do_execsql_test_on_specific_db {:memory:} matview-cte-with-aggregation {
+    CREATE TABLE sales(product_id INTEGER, amount INTEGER);
+    INSERT INTO sales VALUES
+        (1, 100),
+        (2, 200),
+        (1, 150),
+        (3, 300),
+        (2, 250);
+
+    CREATE MATERIALIZED VIEW product_totals AS
+        WITH product_sales AS (SELECT product_id, amount FROM sales)
+        SELECT product_id, SUM(amount) as total
+        FROM product_sales
+        GROUP BY product_id;
+
+    SELECT * FROM product_totals ORDER BY product_id;
+} {1|250.0
+2|450.0
+3|300.0}
+
+do_execsql_test_on_specific_db {:memory:} matview-cte-chained {
+    CREATE TABLE t(a INTEGER);
+    INSERT INTO t VALUES (1), (2), (3), (4), (5);
+
+    CREATE MATERIALIZED VIEW mv AS
+        WITH cte1 AS (SELECT * FROM t),
+             cte2 AS (SELECT * FROM cte1 WHERE a > 2)
+        SELECT * FROM cte2;
+
+    SELECT * FROM mv ORDER BY a;
+} {3
+4
+5}

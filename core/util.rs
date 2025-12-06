@@ -1289,9 +1289,29 @@ pub fn extract_view_columns(
     select_stmt: &ast::Select,
     schema: &Schema,
 ) -> Result<ViewColumnSchema> {
+    extract_view_columns_internal(select_stmt, schema, &HashMap::new())
+}
+
+/// Internal helper that accepts pre-existing CTE schemas for handling chained CTEs
+fn extract_view_columns_internal(
+    select_stmt: &ast::Select,
+    schema: &Schema,
+    parent_cte_schemas: &HashMap<String, ViewColumnSchema>,
+) -> Result<ViewColumnSchema> {
     let mut tables = Vec::new();
     let mut columns = Vec::new();
     let mut column_name_counts: HashMap<String, usize> = HashMap::new();
+
+    // Build a map of CTE names to their column schemas, starting with parent CTEs
+    let mut cte_schemas: HashMap<String, ViewColumnSchema> = parent_cte_schemas.clone();
+    if let Some(ref with_clause) = select_stmt.with {
+        for cte in &with_clause.ctes {
+            let cte_name = normalize_ident(cte.tbl_name.as_str());
+            // Recursively extract columns from the CTE's SELECT, passing accumulated CTEs
+            let cte_schema = extract_view_columns_internal(&cte.select, schema, &cte_schemas)?;
+            cte_schemas.insert(cte_name, cte_schema);
+        }
+    }
 
     // Navigate to the first SELECT in the statement
     if let ast::OneSelect::Select {
@@ -1356,6 +1376,16 @@ pub fn extract_view_columns(
                 .position(|t| t.name == name || t.alias.as_ref().is_some_and(|a| a == name))
         };
 
+        // Helper function to get columns from a table or CTE
+        let get_table_columns = |table_name: &str| -> Option<Vec<Column>> {
+            // First check if it's a CTE
+            if let Some(cte_schema) = cte_schemas.get(table_name) {
+                return Some(cte_schema.flat_columns());
+            }
+            // Otherwise look it up in the schema
+            schema.get_table(table_name).map(|t| t.columns().to_vec())
+        };
+
         // Process each column in the SELECT list
         for result_col in select_columns.iter() {
             match result_col {
@@ -1398,8 +1428,8 @@ pub fn extract_view_columns(
                 ast::ResultColumn::Star => {
                     // For SELECT *, expand to all columns from all tables
                     for (table_idx, table) in tables.iter().enumerate() {
-                        if let Some(table_obj) = schema.get_table(&table.name) {
-                            for table_column in table_obj.columns() {
+                        if let Some(table_columns) = get_table_columns(&table.name) {
+                            for table_column in table_columns {
                                 let col_name =
                                     table_column.name.clone().unwrap_or_else(|| "?".to_string());
 
@@ -1445,8 +1475,8 @@ pub fn extract_view_columns(
                     // For table.*, expand to all columns from the specified table
                     let table_name_str = normalize_ident(table_ref.as_str());
                     if let Some(table_idx) = find_table_index(&table_name_str) {
-                        if let Some(table) = schema.get_table(&tables[table_idx].name) {
-                            for table_column in table.columns() {
+                        if let Some(table_columns) = get_table_columns(&tables[table_idx].name) {
+                            for table_column in table_columns {
                                 let col_name =
                                     table_column.name.clone().unwrap_or_else(|| "?".to_string());
 
