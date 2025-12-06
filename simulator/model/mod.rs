@@ -327,6 +327,13 @@ impl Shadow for Drop {
 
         tables.retain(|t| t.name != self.table);
 
+        // Remove foreign keys in other tables that reference the dropped table
+        for table in tables.iter_mut() {
+            table
+                .foreign_keys
+                .retain(|fk| fk.parent_table != self.table);
+        }
+
         Ok(vec![])
     }
 }
@@ -589,6 +596,18 @@ impl Shadow for AlterTable {
     type Result = anyhow::Result<Vec<Vec<SimValue>>>;
 
     fn shadow(&self, tables: &mut ShadowTablesMut<'_>) -> Self::Result {
+        // For RenameTo, we need to update foreign keys in other tables that reference this table
+        if let AlterTableType::RenameTo { new_name } = &self.alter_table_type {
+            let old_name = &self.table_name;
+            for table in tables.iter_mut() {
+                for fk in table.foreign_keys.iter_mut() {
+                    if &fk.parent_table == old_name {
+                        fk.parent_table = new_name.clone();
+                    }
+                }
+            }
+        }
+
         let table = tables
             .iter_mut()
             .find(|t| t.name == self.table_name)
@@ -614,12 +633,26 @@ impl Shadow for AlterTable {
                         }
                     });
                 });
+                table.foreign_keys.iter_mut().for_each(|fk| {
+                    fk.child_columns.iter_mut().for_each(|col_name| {
+                        if col_name == old {
+                            *col_name = new.name.clone();
+                        }
+                    });
+                });
             }
             AlterTableType::RenameColumn { old, new } => {
                 let col = table.columns.iter_mut().find(|c| c.name == *old).unwrap();
                 col.name = new.clone();
                 table.indexes.iter_mut().for_each(|index| {
                     index.columns.iter_mut().for_each(|(col_name, _)| {
+                        if col_name == old {
+                            *col_name = new.clone();
+                        }
+                    });
+                });
+                table.foreign_keys.iter_mut().for_each(|fk| {
+                    fk.child_columns.iter_mut().for_each(|col_name| {
                         if col_name == old {
                             *col_name = new.clone();
                         }

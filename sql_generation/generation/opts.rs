@@ -52,6 +52,8 @@ pub struct TableOpts {
     /// Range of numbers of columns to generate
     #[garde(custom(range_struct_min(1)))]
     pub column_range: Range<u32>,
+    #[garde(dive)]
+    pub foreign_keys: ForeignKeyOpts,
 }
 
 impl Default for TableOpts {
@@ -60,6 +62,32 @@ impl Default for TableOpts {
             large_table: Default::default(),
             // Up to 10 columns
             column_range: 1..11,
+            foreign_keys: Default::default(),
+        }
+    }
+}
+
+/// Options for generating foreign key constraints
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Validate)]
+#[serde(deny_unknown_fields, default)]
+pub struct ForeignKeyOpts {
+    /// Whether to generate foreign keys
+    #[garde(skip)]
+    pub enabled: bool,
+    /// Probability that a new table will have a foreign key (when other tables exist)
+    #[garde(range(min = 0.0, max = 1.0))]
+    pub probability: f64,
+    /// Maximum number of foreign keys per table
+    #[garde(skip)]
+    pub max_per_table: u32,
+}
+
+impl Default for ForeignKeyOpts {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            probability: 0.3,
+            max_per_table: 2,
         }
     }
 }

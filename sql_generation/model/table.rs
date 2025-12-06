@@ -47,6 +47,7 @@ pub struct Table {
     pub columns: Vec<Column>,
     pub rows: Vec<Vec<SimValue>>,
     pub indexes: Vec<Index>,
+    pub foreign_keys: Vec<ForeignKey>,
 }
 
 impl Table {
@@ -56,6 +57,7 @@ impl Table {
             name: "".to_string(),
             columns: vec![],
             indexes: vec![],
+            foreign_keys: vec![],
         }
     }
 }
@@ -122,6 +124,17 @@ pub struct Index {
     pub table_name: String,
     pub index_name: String,
     pub columns: Vec<(String, SortOrder)>,
+}
+
+/// Represents a foreign key constraint on a table
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct ForeignKey {
+    /// Columns in the child table (the table with this FK)
+    pub child_columns: Vec<String>,
+    /// Name of the referenced (parent) table
+    pub parent_table: String,
+    /// Columns in the parent table
+    pub parent_columns: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
