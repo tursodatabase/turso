@@ -2,7 +2,7 @@ use std::collections::HashSet;
 use std::num::NonZeroUsize;
 use std::{collections::HashMap, sync::Arc};
 
-use turso_parser::ast::{self, Upsert};
+use turso_parser::ast::{self, TriggerEvent, TriggerTime, Upsert};
 
 use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
 use crate::schema::{IndexColumn, ROWID_SENTINEL};
@@ -11,6 +11,9 @@ use crate::translate::expr::{walk_expr, WalkControl};
 use crate::translate::fkeys::{emit_fk_child_update_counters, emit_parent_key_change_checks};
 use crate::translate::insert::{format_unique_violation_desc, InsertEmitCtx};
 use crate::translate::planner::ROWID_STRS;
+use crate::translate::trigger_exec::{
+    fire_trigger, get_relevant_triggers_type_and_time, TriggerContext,
+};
 use crate::vdbe::insn::CmpInsFlags;
 use crate::Connection;
 use crate::{
@@ -480,6 +483,96 @@ pub fn emit_upsert(
     }
 
     let (changed_cols, rowid_changed) = collect_changed_cols(table, set_pairs);
+
+    // Fire BEFORE UPDATE triggers
+    let preserved_old_registers: Option<Vec<usize>> = if let Some(btree_table) = table.btree() {
+        let updated_column_indices: HashSet<usize> =
+            set_pairs.iter().map(|(col_idx, _)| *col_idx).collect();
+        let relevant_before_update_triggers = get_relevant_triggers_type_and_time(
+            resolver.schema,
+            TriggerEvent::Update,
+            TriggerTime::Before,
+            Some(updated_column_indices.clone()),
+            &btree_table,
+        );
+        // OLD row values are in current_start registers
+        let old_registers: Vec<usize> = (0..num_cols)
+            .map(|i| current_start + i)
+            .chain(std::iter::once(ctx.conflict_rowid_reg))
+            .collect();
+        let has_relevant_before_triggers = relevant_before_update_triggers.clone().count() > 0;
+        if has_relevant_before_triggers {
+            // NEW row values are in new_start registers
+            let new_rowid_for_trigger = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
+            let new_registers: Vec<usize> = (0..num_cols)
+                .map(|i| new_start + i)
+                .chain(std::iter::once(new_rowid_for_trigger))
+                .collect();
+
+            let trigger_ctx = TriggerContext::new(
+                btree_table.clone(),
+                Some(new_registers),
+                Some(old_registers.clone()),
+            );
+
+            for trigger in relevant_before_update_triggers {
+                fire_trigger(program, resolver, trigger, &trigger_ctx, connection)?;
+            }
+
+            // BEFORE UPDATE triggers may have altered the btree, need to re-seek
+            program.emit_insn(Insn::NotExists {
+                cursor: ctx.cursor_id,
+                rowid_reg: ctx.conflict_rowid_reg,
+                target_pc: ctx.row_done_label,
+            });
+
+            let has_relevant_after_triggers = get_relevant_triggers_type_and_time(
+                resolver.schema,
+                TriggerEvent::Update,
+                TriggerTime::After,
+                Some(updated_column_indices),
+                &btree_table,
+            )
+            .count()
+                > 0;
+            if has_relevant_after_triggers {
+                // Preserve OLD registers for AFTER triggers
+                let preserved: Vec<usize> = old_registers
+                    .iter()
+                    .map(|old_reg| {
+                        let preserved_reg = program.alloc_register();
+                        program.emit_insn(Insn::Copy {
+                            src_reg: *old_reg,
+                            dst_reg: preserved_reg,
+                            extra_amount: 0,
+                        });
+                        preserved_reg
+                    })
+                    .collect();
+                Some(preserved)
+            } else {
+                None
+            }
+        } else {
+            // Check if we need to preserve for AFTER triggers
+            let has_relevant_after_triggers = get_relevant_triggers_type_and_time(
+                resolver.schema,
+                TriggerEvent::Update,
+                TriggerTime::After,
+                Some(updated_column_indices),
+                &btree_table,
+            )
+            .count()
+                > 0;
+            if has_relevant_after_triggers {
+                Some(old_registers)
+            } else {
+                None
+            }
+        }
+    } else {
+        None
+    };
     let rowid_alias_idx = table.columns().iter().position(|c| c.is_rowid_alias());
     let has_direct_rowid_update = set_pairs
         .iter()
@@ -884,6 +977,37 @@ pub fn emit_upsert(
                 None,
                 table.get_name(),
             )?;
+        }
+    }
+
+    // Fire AFTER UPDATE triggers
+    if let (Some(btree_table), Some(old_regs)) = (table.btree(), preserved_old_registers) {
+        let updated_column_indices: HashSet<usize> =
+            set_pairs.iter().map(|(col_idx, _)| *col_idx).collect();
+        let relevant_triggers = get_relevant_triggers_type_and_time(
+            resolver.schema,
+            TriggerEvent::Update,
+            TriggerTime::After,
+            Some(updated_column_indices),
+            &btree_table,
+        );
+        let has_relevant_triggers = relevant_triggers.clone().count() > 0;
+        if has_relevant_triggers {
+            let new_rowid_for_trigger = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
+            let new_registers_after: Vec<usize> = (0..num_cols)
+                .map(|i| new_start + i)
+                .chain(std::iter::once(new_rowid_for_trigger))
+                .collect();
+
+            let trigger_ctx_after = TriggerContext::new(
+                btree_table.clone(),
+                Some(new_registers_after),
+                Some(old_regs),
+            );
+
+            for trigger in relevant_triggers {
+                fire_trigger(program, resolver, trigger, &trigger_ctx_after, connection)?;
+            }
         }
     }
 
