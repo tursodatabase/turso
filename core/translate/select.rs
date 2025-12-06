@@ -112,28 +112,37 @@ pub fn prepare_select_plan(
             connection,
         )?)),
         false => {
+            // For compound SELECTs, the WITH clause applies to all parts.
+            // We clone the WITH clause for each SELECT in the compound so that
+            // each one can resolve CTE references independently.
+            let with = select.with;
+
             let mut last = prepare_one_select_plan(
                 select.body.select,
                 resolver,
                 program,
                 None,
                 vec![],
-                None,
+                with.clone(),
                 outer_query_refs,
                 query_destination.clone(),
                 connection,
             )?;
 
             let mut left = Vec::with_capacity(compounds.len());
-            for CompoundSelect { select, operator } in compounds {
+            for CompoundSelect {
+                select: compound_select,
+                operator,
+            } in compounds
+            {
                 left.push((last, operator));
                 last = prepare_one_select_plan(
-                    select,
+                    compound_select,
                     resolver,
                     program,
                     None,
                     vec![],
-                    None,
+                    with.clone(),
                     outer_query_refs,
                     query_destination.clone(),
                     connection,
@@ -154,10 +163,6 @@ pub fn prepare_select_plan(
             // FIXME: handle ORDER BY for compound selects
             if !select.order_by.is_empty() {
                 crate::bail_parse_error!("ORDER BY is not supported for compound SELECTs yet");
-            }
-            // FIXME: handle WITH for compound selects
-            if select.with.is_some() {
-                crate::bail_parse_error!("WITH is not supported for compound SELECTs yet");
             }
             Ok(Plan::CompoundSelect {
                 left,
