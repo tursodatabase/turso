@@ -663,7 +663,7 @@ impl BTreeNodeState {
 
 impl BTreeCursor {
     pub fn new(pager: Arc<Pager>, root_page: i64, num_columns: usize) -> Self {
-        let valid_state = if root_page == 1 && !pager.db_state.get().is_initialized() {
+        let valid_state = if root_page == 1 && !pager.db_initialized() {
             CursorValidState::Invalid
         } else {
             CursorValidState::Valid
@@ -5898,6 +5898,9 @@ pub fn integrity_check(
     errors: &mut Vec<IntegrityCheckError>,
     pager: &Arc<Pager>,
 ) -> Result<IOResult<()>> {
+    if state.db_size == 0 {
+        return Ok(IOResult::Done(()));
+    }
     loop {
         let Some(IntegrityCheckPageEntry {
             page_idx,
@@ -7794,12 +7797,7 @@ mod tests {
     use crate::{
         io::{Buffer, MemoryIO, OpenFlags, IO},
         schema::IndexColumn,
-        storage::{
-            database::DatabaseFile,
-            page_cache::PageCache,
-            pager::{AtomicDbState, DbState},
-            sqlite3_ondisk::PageSize,
-        },
+        storage::{database::DatabaseFile, page_cache::PageCache, sqlite3_ondisk::PageSize},
         types::Text,
         vdbe::Register,
         BufferPool, Completion, Connection, IOContext, StepResult, WalFile, WalFileShared,
@@ -9081,8 +9079,8 @@ mod tests {
                 io,
                 Arc::new(parking_lot::RwLock::new(PageCache::new(10))),
                 buffer_pool,
-                Arc::new(AtomicDbState::new(DbState::Uninitialized)),
                 Arc::new(parking_lot::Mutex::new(())),
+                Default::default(),
             )
             .unwrap(),
         );
