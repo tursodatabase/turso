@@ -15,7 +15,9 @@ enum ArrayIndexState {
     Start,
     AfterHash,
     CollectingNumbers,
+    CollectingNegativeNumbers,
     IsMax,
+    IsMaxNegative,
 }
 
 /// Describes a JSON path, which is a sequence of keys and/or array locators.
@@ -262,15 +264,28 @@ fn handle_array_index(
                 ch.1.to_digit(10).ok_or_else(|| {
                     crate::LimboError::ParseError(format!("failed to parse digit: {ch}", ch = ch.1))
                 })? as i128,
-                *index_buffer < 0,
+                false,
             );
             if is_max {
                 *index_state = ArrayIndexState::IsMax;
             }
             *index_buffer = new_num;
         }
-        (ArrayIndexState::IsMax, '0'..='9') => (),
-        (ArrayIndexState::CollectingNumbers | ArrayIndexState::IsMax, ']') => {
+        (ArrayIndexState::CollectingNegativeNumbers, '0'..='9') => {
+            let (new_num, is_max) = collect_num(
+                *index_buffer,
+                ch.1.to_digit(10).ok_or_else(|| {
+                    crate::LimboError::ParseError(format!("failed to parse digit: {ch}", ch = ch.1))
+                })? as i128,
+                true,
+            );
+            if is_max {
+                *index_state = ArrayIndexState::IsMaxNegative;
+            }
+            *index_buffer = new_num;
+        }
+        (ArrayIndexState::IsMax | ArrayIndexState::IsMaxNegative, '0'..='9') => (),
+        (ArrayIndexState::CollectingNumbers | ArrayIndexState::CollectingNegativeNumbers | ArrayIndexState::IsMax | ArrayIndexState::IsMaxNegative, ']') => {
             *parser_state = PPState::ExpectDotOrBracket;
             path_components.push(PathElement::ArrayLocator(Some(*index_buffer as i32)));
         }
@@ -290,7 +305,7 @@ fn handle_negative_index(
             *index_buffer = -(next_c.to_digit(10).ok_or_else(|| {
                 crate::LimboError::ParseError(format!("failed to parse digit: {next_c}"))
             })? as i128);
-            *index_state = ArrayIndexState::CollectingNumbers;
+            *index_state = ArrayIndexState::CollectingNegativeNumbers;
             Ok(())
         } else {
             bail_parse_error!("Bad json path: {}", path)
