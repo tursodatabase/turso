@@ -118,54 +118,23 @@ impl TrimType {
 
 impl Value {
     pub fn exec_lower(&self) -> Option<Self> {
-        self.cast_text()
-            .map(|s| Value::build_text(s.to_ascii_lowercase()))
+        exec_lower(self)
     }
 
     pub fn exec_length(&self) -> Self {
-        match self {
-            Value::Text(t) => {
-                let s = t.as_str();
-                let len_before_null = s.find('\0').map_or_else(
-                    || s.chars().count(),
-                    |null_pos| s[..null_pos].chars().count(),
-                );
-                Value::Integer(len_before_null as i64)
-            }
-            Value::Integer(_) | Value::Float(_) => {
-                // For numbers, SQLite returns the length of the string representation
-                Value::Integer(self.to_string().chars().count() as i64)
-            }
-            Value::Blob(blob) => Value::Integer(blob.len() as i64),
-            _ => self.to_owned(),
-        }
+        exec_length(self)
     }
 
     pub fn exec_octet_length(&self) -> Self {
-        match self {
-            Value::Text(_) | Value::Integer(_) | Value::Float(_) => {
-                Value::Integer(self.to_string().into_bytes().len() as i64)
-            }
-            Value::Blob(blob) => Value::Integer(blob.len() as i64),
-            _ => self.to_owned(),
-        }
+        exec_octet_length(self)
     }
 
     pub fn exec_upper(&self) -> Option<Self> {
-        self.cast_text()
-            .map(|s| Value::build_text(s.to_ascii_uppercase()))
+        exec_upper(self)
     }
 
     pub fn exec_sign(&self) -> Option<Value> {
-        let v = Numeric::from_value_strict(self).try_into_f64()?;
-
-        Some(Value::Integer(if v > 0.0 {
-            1
-        } else if v < 0.0 {
-            -1
-        } else {
-            0
-        }))
+        exec_sign(self)
     }
 
     /// Generates the Soundex code for a given word
@@ -447,62 +416,16 @@ impl Value {
         }
     }
 
-    pub fn exec_instr(&self, pattern: &Value) -> Value {
-        if self == &Value::Null || pattern == &Value::Null {
-            return Value::Null;
-        }
-
-        if let (Value::Blob(reg), Value::Blob(pattern)) = (self, pattern) {
-            let result = reg
-                .windows(pattern.len())
-                .position(|window| window == *pattern)
-                .map_or(0, |i| i + 1);
-            return Value::Integer(result as i64);
-        }
-
-        let reg_str;
-        let reg = match self {
-            Value::Text(s) => s.as_str(),
-            _ => {
-                reg_str = self.to_string();
-                reg_str.as_str()
-            }
-        };
-
-        let pattern_str;
-        let pattern = match pattern {
-            Value::Text(s) => s.as_str(),
-            _ => {
-                pattern_str = pattern.to_string();
-                pattern_str.as_str()
-            }
-        };
-
-        match reg.find(pattern) {
-            Some(position) => Value::Integer(position as i64 + 1),
-            None => Value::Integer(0),
-        }
+    pub fn exec_instr(&self, pattern: impl AsValueRef) -> Value {
+        exec_instr(self, pattern)
     }
 
     pub fn exec_typeof(&self) -> Value {
-        match self {
-            Value::Null => Value::build_text("null"),
-            Value::Integer(_) => Value::build_text("integer"),
-            Value::Float(_) => Value::build_text("real"),
-            Value::Text(_) => Value::build_text("text"),
-            Value::Blob(_) => Value::build_text("blob"),
-        }
+        exec_typeof(self)
     }
 
     pub fn exec_hex(&self) -> Value {
-        match self {
-            Value::Text(_) | Value::Integer(_) | Value::Float(_) => {
-                let text = self.to_string();
-                Value::build_text(hex::encode_upper(text))
-            }
-            Value::Blob(blob_bytes) => Value::build_text(hex::encode_upper(blob_bytes)),
-            Value::Null => Value::build_text(""),
-        }
+        exec_hex(self)
     }
 
     pub fn exec_unhex(&self, ignored_chars: Option<&Value>) -> Value {
@@ -536,17 +459,7 @@ impl Value {
     }
 
     pub fn exec_unicode(&self) -> Value {
-        match self {
-            Value::Text(_) | Value::Integer(_) | Value::Float(_) | Value::Blob(_) => {
-                let text = self.to_string();
-                if let Some(first_char) = text.chars().next() {
-                    Value::Integer(first_char as u32 as i64)
-                } else {
-                    Value::Null
-                }
-            }
-            _ => Value::Null,
-        }
+        exec_unicode(self)
     }
 
     pub fn exec_round(&self, precision: Option<&Value>) -> Value {
@@ -799,158 +712,68 @@ impl Value {
         }
     }
 
-    pub fn exec_math_binary(&self, rhs: &Value, function: &MathFunc) -> Value {
-        let Some(lhs) = Numeric::from_value_strict(self).try_into_f64() else {
-            return Value::Null;
-        };
-
-        let Some(rhs) = Numeric::from_value_strict(rhs).try_into_f64() else {
-            return Value::Null;
-        };
-
-        let result = match function {
-            MathFunc::Atan2 => unsafe { cmath::atan2(lhs, rhs) },
-            MathFunc::Mod => libm::fmod(lhs, rhs),
-            MathFunc::Pow | MathFunc::Power => unsafe { cmath::pow(lhs, rhs) },
-            _ => unreachable!("Unexpected mathematical binary function {:?}", function),
-        };
-
-        if result.is_nan() {
-            Value::Null
-        } else {
-            Value::Float(result)
-        }
+    pub fn exec_math_binary(&self, rhs: impl AsValueRef, function: &MathFunc) -> Value {
+        exec_math_binary(self, rhs, function)
     }
 
     pub fn exec_math_log(&self, base: Option<&Value>) -> Value {
-        let Some(f) = Numeric::from_value_strict(self).try_into_f64() else {
-            return Value::Null;
-        };
-
-        let base = match base.map(|value| Numeric::from_value_strict(value).try_into_f64()) {
-            Some(Some(f)) => f,
-            Some(None) => return Value::Null,
-            None => 10.0,
-        };
-
-        if f <= 0.0 || base <= 0.0 || base == 1.0 {
-            return Value::Null;
-        }
-
-        if base == 2.0 {
-            return Value::Float(libm::log2(f));
-        } else if base == 10.0 {
-            return Value::Float(libm::log10(f));
-        };
-
-        let log_x = libm::log(f);
-        let log_base = libm::log(base);
-
-        if log_base <= 0.0 {
-            return Value::Null;
-        }
-
-        let result = log_x / log_base;
-        Value::Float(result)
+        exec_math_log(self, base)
     }
 
-    pub fn exec_add(&self, rhs: &Value) -> Value {
-        (Numeric::from(self) + Numeric::from(rhs)).into()
+    pub fn exec_add(&self, rhs: impl AsValueRef) -> Value {
+        exec_add(self, rhs)
     }
 
-    pub fn exec_subtract(&self, rhs: &Value) -> Value {
-        (Numeric::from(self) - Numeric::from(rhs)).into()
+    pub fn exec_subtract(&self, rhs: impl AsValueRef) -> Value {
+        exec_subtract(self, rhs)
     }
 
-    pub fn exec_multiply(&self, rhs: &Value) -> Value {
-        (Numeric::from(self) * Numeric::from(rhs)).into()
+    pub fn exec_multiply(&self, rhs: impl AsValueRef) -> Value {
+        exec_multiply(self, rhs)
     }
 
-    pub fn exec_divide(&self, rhs: &Value) -> Value {
-        (Numeric::from(self) / Numeric::from(rhs)).into()
+    pub fn exec_divide(&self, rhs: impl AsValueRef) -> Value {
+        exec_divide(self, rhs)
     }
 
-    pub fn exec_bit_and(&self, rhs: &Value) -> Value {
-        (NullableInteger::from(self) & NullableInteger::from(rhs)).into()
+    pub fn exec_bit_and(&self, rhs: impl AsValueRef) -> Value {
+        exec_bit_and(self, rhs)
     }
 
-    pub fn exec_bit_or(&self, rhs: &Value) -> Value {
-        (NullableInteger::from(self) | NullableInteger::from(rhs)).into()
+    pub fn exec_bit_or(&self, rhs: impl AsValueRef) -> Value {
+        exec_bit_or(self, rhs)
     }
 
-    pub fn exec_remainder(&self, rhs: &Value) -> Value {
-        let convert_to_float = matches!(Numeric::from(self), Numeric::Float(_))
-            || matches!(Numeric::from(rhs), Numeric::Float(_));
-
-        match NullableInteger::from(self) % NullableInteger::from(rhs) {
-            NullableInteger::Null => Value::Null,
-            NullableInteger::Integer(v) => {
-                if convert_to_float {
-                    Value::Float(v as f64)
-                } else {
-                    Value::Integer(v)
-                }
-            }
-        }
+    pub fn exec_remainder(&self, rhs: impl AsValueRef) -> Value {
+        exec_remainder(self, rhs)
     }
 
     pub fn exec_bit_not(&self) -> Value {
-        (!NullableInteger::from(self)).into()
+        exec_bit_not(self)
     }
 
-    pub fn exec_shift_left(&self, rhs: &Value) -> Value {
-        (NullableInteger::from(self) << NullableInteger::from(rhs)).into()
+    pub fn exec_shift_left(&self, rhs: impl AsValueRef) -> Value {
+        exec_shift_left(self, rhs)
     }
 
-    pub fn exec_shift_right(&self, rhs: &Value) -> Value {
-        (NullableInteger::from(self) >> NullableInteger::from(rhs)).into()
+    pub fn exec_shift_right(&self, rhs: impl AsValueRef) -> Value {
+        exec_shift_right(self, rhs)
     }
 
     pub fn exec_boolean_not(&self) -> Value {
-        match Numeric::from(self).try_into_bool() {
-            None => Value::Null,
-            Some(v) => Value::Integer(!v as i64),
-        }
+        exec_boolean_not(self)
     }
 
-    pub fn exec_concat(&self, rhs: &Value) -> Value {
-        if let (Value::Blob(lhs), Value::Blob(rhs)) = (self, rhs) {
-            return Value::build_text(
-                String::from_utf8_lossy(&[lhs.as_slice(), rhs.as_slice()].concat()).into_owned(),
-            );
-        }
-
-        let Some(lhs) = self.cast_text() else {
-            return Value::Null;
-        };
-
-        let Some(rhs) = rhs.cast_text() else {
-            return Value::Null;
-        };
-
-        Value::build_text(lhs + &rhs)
+    pub fn exec_concat(&self, rhs: impl AsValueRef) -> Value {
+        exec_concat(self, rhs)
     }
 
-    pub fn exec_and(&self, rhs: &Value) -> Value {
-        match (
-            Numeric::from(self).try_into_bool(),
-            Numeric::from(rhs).try_into_bool(),
-        ) {
-            (Some(false), _) | (_, Some(false)) => Value::Integer(0),
-            (None, _) | (_, None) => Value::Null,
-            _ => Value::Integer(1),
-        }
+    pub fn exec_and(&self, rhs: impl AsValueRef) -> Value {
+        exec_and(self, rhs)
     }
 
-    pub fn exec_or(&self, rhs: &Value) -> Value {
-        match (
-            Numeric::from(self).try_into_bool(),
-            Numeric::from(rhs).try_into_bool(),
-        ) {
-            (Some(true), _) | (_, Some(true)) => Value::Integer(1),
-            (None, _) | (_, None) => Value::Null,
-            _ => Value::Integer(0),
-        }
+    pub fn exec_or(&self, rhs: impl AsValueRef) -> Value {
+        exec_or(self, rhs)
     }
 
     // Implements LIKE pattern matching. Caches the constructed regex if a cache is provided
@@ -976,58 +799,426 @@ impl Value {
     }
 
     pub fn exec_min<'a, T: Iterator<Item = &'a Value>>(regs: T) -> Value {
-        regs.min().map(|v| v.to_owned()).unwrap_or(Value::Null)
+        exec_min(regs)
     }
 
     pub fn exec_max<'a, T: Iterator<Item = &'a Value>>(regs: T) -> Value {
-        regs.max().map(|v| v.to_owned()).unwrap_or(Value::Null)
+        exec_max(regs)
     }
 
     pub fn exec_concat_strings<'a, T: Iterator<Item = &'a Self>>(registers: T) -> Self {
-        let mut result = String::new();
-        for val in registers {
-            match val {
-                Value::Null => continue,
-                Value::Blob(_) => todo!("TODO concat blob"),
-                v => result.push_str(&format!("{v}")),
-            }
-        }
-        Value::build_text(result)
+        exec_concat_strings(registers)
     }
 
-    pub fn exec_concat_ws<'a, T: ExactSizeIterator<Item = &'a Self>>(mut registers: T) -> Self {
-        if registers.len() == 0 {
-            return Value::Null;
-        }
-
-        let separator = match registers
-            .next()
-            .expect("registers should have at least one element after length check")
-        {
-            Value::Null | Value::Blob(_) => return Value::Null,
-            v => format!("{v}"),
-        };
-
-        let parts = registers.filter_map(|val| match val {
-            Value::Text(_) | Value::Integer(_) | Value::Float(_) => Some(format!("{val}")),
-            _ => None,
-        });
-
-        let result = parts.collect::<Vec<_>>().join(&separator);
-        Value::build_text(result)
+    pub fn exec_concat_ws<'a, T: ExactSizeIterator<Item = &'a Self>>(registers: T) -> Self {
+        exec_concat_ws(registers)
     }
 
     pub fn exec_char<'a, T: Iterator<Item = &'a Self>>(values: T) -> Self {
-        let result: String = values
-            .filter_map(|x| {
-                if let Value::Integer(i) = x {
-                    Some(*i as u8 as char)
-                } else {
-                    None
-                }
-            })
-            .collect();
-        Value::build_text(result)
+        exec_char(values)
+    }
+}
+
+// Free functions that accept impl AsValueRef for operations that can work with both Value and ValueRef
+
+/// Add two values
+pub fn exec_add(lhs: impl AsValueRef, rhs: impl AsValueRef) -> Value {
+    (Numeric::from(lhs.as_value_ref()) + Numeric::from(rhs.as_value_ref())).into()
+}
+
+/// Subtract two values
+pub fn exec_subtract(lhs: impl AsValueRef, rhs: impl AsValueRef) -> Value {
+    (Numeric::from(lhs.as_value_ref()) - Numeric::from(rhs.as_value_ref())).into()
+}
+
+/// Multiply two values
+pub fn exec_multiply(lhs: impl AsValueRef, rhs: impl AsValueRef) -> Value {
+    (Numeric::from(lhs.as_value_ref()) * Numeric::from(rhs.as_value_ref())).into()
+}
+
+/// Divide two values
+pub fn exec_divide(lhs: impl AsValueRef, rhs: impl AsValueRef) -> Value {
+    (Numeric::from(lhs.as_value_ref()) / Numeric::from(rhs.as_value_ref())).into()
+}
+
+/// Bitwise AND two values
+pub fn exec_bit_and(lhs: impl AsValueRef, rhs: impl AsValueRef) -> Value {
+    (NullableInteger::from(lhs.as_value_ref()) & NullableInteger::from(rhs.as_value_ref())).into()
+}
+
+/// Bitwise OR two values
+pub fn exec_bit_or(lhs: impl AsValueRef, rhs: impl AsValueRef) -> Value {
+    (NullableInteger::from(lhs.as_value_ref()) | NullableInteger::from(rhs.as_value_ref())).into()
+}
+
+/// Calculate remainder of two values
+pub fn exec_remainder(lhs: impl AsValueRef, rhs: impl AsValueRef) -> Value {
+    let lhs_ref = lhs.as_value_ref();
+    let rhs_ref = rhs.as_value_ref();
+    let convert_to_float = matches!(Numeric::from(lhs_ref), Numeric::Float(_))
+        || matches!(Numeric::from(rhs_ref), Numeric::Float(_));
+
+    match NullableInteger::from(lhs_ref) % NullableInteger::from(rhs_ref) {
+        NullableInteger::Null => Value::Null,
+        NullableInteger::Integer(v) => {
+            if convert_to_float {
+                Value::Float(v as f64)
+            } else {
+                Value::Integer(v)
+            }
+        }
+    }
+}
+
+/// Bitwise NOT a value
+pub fn exec_bit_not(val: impl AsValueRef) -> Value {
+    (!NullableInteger::from(val.as_value_ref())).into()
+}
+
+/// Shift left
+pub fn exec_shift_left(lhs: impl AsValueRef, rhs: impl AsValueRef) -> Value {
+    (NullableInteger::from(lhs.as_value_ref()) << NullableInteger::from(rhs.as_value_ref())).into()
+}
+
+/// Shift right
+pub fn exec_shift_right(lhs: impl AsValueRef, rhs: impl AsValueRef) -> Value {
+    (NullableInteger::from(lhs.as_value_ref()) >> NullableInteger::from(rhs.as_value_ref())).into()
+}
+
+/// Boolean NOT a value
+pub fn exec_boolean_not(val: impl AsValueRef) -> Value {
+    match Numeric::from(val.as_value_ref()).try_into_bool() {
+        None => Value::Null,
+        Some(v) => Value::Integer(!v as i64),
+    }
+}
+
+/// Concatenate two values
+pub fn exec_concat(lhs: impl AsValueRef, rhs: impl AsValueRef) -> Value {
+    let lhs_ref = lhs.as_value_ref();
+    let rhs_ref = rhs.as_value_ref();
+
+    if let (ValueRef::Blob(lhs_blob), ValueRef::Blob(rhs_blob)) = (lhs_ref, rhs_ref) {
+        return Value::build_text(
+            String::from_utf8_lossy(&[lhs_blob, rhs_blob].concat()).into_owned(),
+        );
+    }
+
+    let Some(lhs_text) = cast_text_ref(lhs_ref) else {
+        return Value::Null;
+    };
+
+    let Some(rhs_text) = cast_text_ref(rhs_ref) else {
+        return Value::Null;
+    };
+
+    Value::build_text(lhs_text + &rhs_text)
+}
+
+/// Logical AND two values
+pub fn exec_and(lhs: impl AsValueRef, rhs: impl AsValueRef) -> Value {
+    match (
+        Numeric::from(lhs.as_value_ref()).try_into_bool(),
+        Numeric::from(rhs.as_value_ref()).try_into_bool(),
+    ) {
+        (Some(false), _) | (_, Some(false)) => Value::Integer(0),
+        (None, _) | (_, None) => Value::Null,
+        _ => Value::Integer(1),
+    }
+}
+
+/// Logical OR two values
+pub fn exec_or(lhs: impl AsValueRef, rhs: impl AsValueRef) -> Value {
+    match (
+        Numeric::from(lhs.as_value_ref()).try_into_bool(),
+        Numeric::from(rhs.as_value_ref()).try_into_bool(),
+    ) {
+        (Some(true), _) | (_, Some(true)) => Value::Integer(1),
+        (None, _) | (_, None) => Value::Null,
+        _ => Value::Integer(0),
+    }
+}
+
+/// Helper function to cast a ValueRef to text (similar to Value::cast_text)
+fn cast_text_ref(val: ValueRef<'_>) -> Option<String> {
+    match val {
+        ValueRef::Null => None,
+        ValueRef::Text(t) => Some(t.as_str().to_string()),
+        ValueRef::Integer(i) => Some(i.to_string()),
+        ValueRef::Float(f) => Some(crate::numeric::format_float(f)),
+        ValueRef::Blob(b) => Some(String::from_utf8_lossy(b).into_owned()),
+    }
+}
+
+/// Convert value to lowercase
+pub fn exec_lower(val: impl AsValueRef) -> Option<Value> {
+    cast_text_ref(val.as_value_ref()).map(|s| Value::build_text(s.to_ascii_lowercase()))
+}
+
+/// Convert value to uppercase
+pub fn exec_upper(val: impl AsValueRef) -> Option<Value> {
+    cast_text_ref(val.as_value_ref()).map(|s| Value::build_text(s.to_ascii_uppercase()))
+}
+
+/// Get the sign of a value (-1, 0, or 1)
+pub fn exec_sign(val: impl AsValueRef) -> Option<Value> {
+    let v = Numeric::from_value_ref_strict(val.as_value_ref()).try_into_f64()?;
+
+    Some(Value::Integer(if v > 0.0 {
+        1
+    } else if v < 0.0 {
+        -1
+    } else {
+        0
+    }))
+}
+
+/// Get the length of a value
+pub fn exec_length(val: impl AsValueRef) -> Value {
+    match val.as_value_ref() {
+        ValueRef::Text(t) => {
+            let s = t.as_str();
+            let len_before_null = s.find('\0').map_or_else(
+                || s.chars().count(),
+                |null_pos| s[..null_pos].chars().count(),
+            );
+            Value::Integer(len_before_null as i64)
+        }
+        ValueRef::Integer(i) => {
+            // For numbers, SQLite returns the length of the string representation
+            Value::Integer(i.to_string().chars().count() as i64)
+        }
+        ValueRef::Float(f) => {
+            Value::Integer(crate::numeric::format_float(f).chars().count() as i64)
+        }
+        ValueRef::Blob(blob) => Value::Integer(blob.len() as i64),
+        ValueRef::Null => Value::Null,
+    }
+}
+
+/// Get the octet length of a value
+pub fn exec_octet_length(val: impl AsValueRef) -> Value {
+    match val.as_value_ref() {
+        ValueRef::Text(t) => Value::Integer(t.as_str().len() as i64),
+        ValueRef::Integer(i) => Value::Integer(i.to_string().into_bytes().len() as i64),
+        ValueRef::Float(f) => {
+            Value::Integer(crate::numeric::format_float(f).into_bytes().len() as i64)
+        }
+        ValueRef::Blob(blob) => Value::Integer(blob.len() as i64),
+        ValueRef::Null => Value::Null,
+    }
+}
+
+/// Get the type name of a value
+pub fn exec_typeof(val: impl AsValueRef) -> Value {
+    match val.as_value_ref() {
+        ValueRef::Null => Value::build_text("null"),
+        ValueRef::Integer(_) => Value::build_text("integer"),
+        ValueRef::Float(_) => Value::build_text("real"),
+        ValueRef::Text(_) => Value::build_text("text"),
+        ValueRef::Blob(_) => Value::build_text("blob"),
+    }
+}
+
+/// Convert value to hex string
+pub fn exec_hex(val: impl AsValueRef) -> Value {
+    match val.as_value_ref() {
+        ValueRef::Text(t) => Value::build_text(hex::encode_upper(t.as_str())),
+        ValueRef::Integer(i) => Value::build_text(hex::encode_upper(i.to_string())),
+        ValueRef::Float(f) => Value::build_text(hex::encode_upper(crate::numeric::format_float(f))),
+        ValueRef::Blob(blob_bytes) => Value::build_text(hex::encode_upper(blob_bytes)),
+        ValueRef::Null => Value::build_text(""),
+    }
+}
+
+/// Get unicode code point of first character
+pub fn exec_unicode(val: impl AsValueRef) -> Value {
+    let text = match val.as_value_ref() {
+        ValueRef::Text(t) => t.as_str().to_string(),
+        ValueRef::Integer(i) => i.to_string(),
+        ValueRef::Float(f) => crate::numeric::format_float(f),
+        ValueRef::Blob(b) => String::from_utf8_lossy(b).into_owned(),
+        ValueRef::Null => return Value::Null,
+    };
+
+    if let Some(first_char) = text.chars().next() {
+        Value::Integer(first_char as u32 as i64)
+    } else {
+        Value::Null
+    }
+}
+
+/// Execute binary math function
+pub fn exec_math_binary(lhs: impl AsValueRef, rhs: impl AsValueRef, function: &MathFunc) -> Value {
+    let Some(lhs_val) = Numeric::from_value_ref_strict(lhs.as_value_ref()).try_into_f64() else {
+        return Value::Null;
+    };
+
+    let Some(rhs_val) = Numeric::from_value_ref_strict(rhs.as_value_ref()).try_into_f64() else {
+        return Value::Null;
+    };
+
+    let result = match function {
+        MathFunc::Atan2 => unsafe { cmath::atan2(lhs_val, rhs_val) },
+        MathFunc::Mod => libm::fmod(lhs_val, rhs_val),
+        MathFunc::Pow | MathFunc::Power => unsafe { cmath::pow(lhs_val, rhs_val) },
+        _ => unreachable!("Unexpected mathematical binary function {:?}", function),
+    };
+
+    if result.is_nan() {
+        Value::Null
+    } else {
+        Value::Float(result)
+    }
+}
+
+/// Get minimum value from iterator
+pub fn exec_min<V: AsValueRef, T: Iterator<Item = V>>(regs: T) -> Value {
+    regs.min_by(|a, b| {
+        compare_immutable_single(a.as_value_ref(), b.as_value_ref(), CollationSeq::Binary)
+    })
+    .map(|v| v.as_value_ref().to_owned())
+    .unwrap_or(Value::Null)
+}
+
+/// Get maximum value from iterator
+pub fn exec_max<V: AsValueRef, T: Iterator<Item = V>>(regs: T) -> Value {
+    regs.max_by(|a, b| {
+        compare_immutable_single(a.as_value_ref(), b.as_value_ref(), CollationSeq::Binary)
+    })
+    .map(|v| v.as_value_ref().to_owned())
+    .unwrap_or(Value::Null)
+}
+
+/// Concatenate strings from iterator
+pub fn exec_concat_strings<V: AsValueRef, T: Iterator<Item = V>>(registers: T) -> Value {
+    let mut result = String::new();
+    for val in registers {
+        match val.as_value_ref() {
+            ValueRef::Null => continue,
+            ValueRef::Blob(_) => todo!("TODO concat blob"),
+            ValueRef::Text(t) => result.push_str(t.as_str()),
+            ValueRef::Integer(i) => result.push_str(&i.to_string()),
+            ValueRef::Float(f) => result.push_str(&crate::numeric::format_float(f)),
+        }
+    }
+    Value::build_text(result)
+}
+
+/// Concatenate strings with separator from iterator
+pub fn exec_concat_ws<V: AsValueRef, T: ExactSizeIterator<Item = V>>(mut registers: T) -> Value {
+    if registers.len() == 0 {
+        return Value::Null;
+    }
+
+    let first = registers
+        .next()
+        .expect("registers should have at least one element after length check");
+    let separator = match first.as_value_ref() {
+        ValueRef::Null | ValueRef::Blob(_) => return Value::Null,
+        ValueRef::Text(t) => t.as_str().to_string(),
+        ValueRef::Integer(i) => i.to_string(),
+        ValueRef::Float(f) => crate::numeric::format_float(f),
+    };
+
+    let parts: Vec<_> = registers
+        .filter_map(|val| match val.as_value_ref() {
+            ValueRef::Text(t) => Some(t.as_str().to_string()),
+            ValueRef::Integer(i) => Some(i.to_string()),
+            ValueRef::Float(f) => Some(crate::numeric::format_float(f)),
+            _ => None,
+        })
+        .collect();
+
+    let result = parts.join(&separator);
+    Value::build_text(result)
+}
+
+/// Build string from character codes
+pub fn exec_char<V: AsValueRef, T: Iterator<Item = V>>(values: T) -> Value {
+    let result: String = values
+        .filter_map(|x| {
+            if let ValueRef::Integer(i) = x.as_value_ref() {
+                Some(i as u8 as char)
+            } else {
+                None
+            }
+        })
+        .collect();
+    Value::build_text(result)
+}
+
+/// Execute log function with optional base
+pub fn exec_math_log<V: AsValueRef>(val: impl AsValueRef, base: Option<V>) -> Value {
+    let Some(f) = Numeric::from_value_ref_strict(val.as_value_ref()).try_into_f64() else {
+        return Value::Null;
+    };
+
+    let base = match base.map(|v| Numeric::from_value_ref_strict(v.as_value_ref()).try_into_f64()) {
+        Some(Some(f)) => f,
+        Some(None) => return Value::Null,
+        None => 10.0,
+    };
+
+    if f <= 0.0 || base <= 0.0 || base == 1.0 {
+        return Value::Null;
+    }
+
+    if base == 2.0 {
+        return Value::Float(libm::log2(f));
+    } else if base == 10.0 {
+        return Value::Float(libm::log10(f));
+    }
+
+    let log_x = libm::log(f);
+    let log_base = libm::log(base);
+
+    if log_base <= 0.0 {
+        return Value::Null;
+    }
+
+    let result = log_x / log_base;
+    Value::Float(result)
+}
+
+/// Find position of pattern in value (INSTR function)
+pub fn exec_instr(val: impl AsValueRef, pattern: impl AsValueRef) -> Value {
+    let val_ref = val.as_value_ref();
+    let pattern_ref = pattern.as_value_ref();
+
+    if matches!(val_ref, ValueRef::Null) || matches!(pattern_ref, ValueRef::Null) {
+        return Value::Null;
+    }
+
+    // Handle blob-to-blob matching
+    if let (ValueRef::Blob(val_blob), ValueRef::Blob(pattern_blob)) = (val_ref, pattern_ref) {
+        let result = val_blob
+            .windows(pattern_blob.len())
+            .position(|window| window == pattern_blob)
+            .map_or(0, |i| i + 1);
+        return Value::Integer(result as i64);
+    }
+
+    // Convert both to strings
+    let val_str = match val_ref {
+        ValueRef::Text(t) => t.as_str().to_string(),
+        ValueRef::Integer(i) => i.to_string(),
+        ValueRef::Float(f) => crate::numeric::format_float(f),
+        ValueRef::Blob(b) => String::from_utf8_lossy(b).into_owned(),
+        ValueRef::Null => unreachable!(),
+    };
+
+    let pattern_str = match pattern_ref {
+        ValueRef::Text(t) => t.as_str().to_string(),
+        ValueRef::Integer(i) => i.to_string(),
+        ValueRef::Float(f) => crate::numeric::format_float(f),
+        ValueRef::Blob(b) => String::from_utf8_lossy(b).into_owned(),
+        ValueRef::Null => unreachable!(),
+    };
+
+    match val_str.find(&pattern_str) {
+        Some(position) => Value::Integer(position as i64 + 1),
+        None => Value::Integer(0),
     }
 }
 

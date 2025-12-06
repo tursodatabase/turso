@@ -47,14 +47,18 @@ pub enum Numeric {
 
 impl Numeric {
     pub fn from_value_strict(value: &Value) -> Numeric {
+        Self::from_value_ref_strict(value.as_ref())
+    }
+
+    pub fn from_value_ref_strict(value: crate::ValueRef<'_>) -> Numeric {
         match value {
-            Value::Null | Value::Blob(_) => Self::Null,
-            Value::Integer(v) => Self::Integer(*v),
-            Value::Float(v) => match NonNan::new(*v) {
+            crate::ValueRef::Null | crate::ValueRef::Blob(_) => Self::Null,
+            crate::ValueRef::Integer(v) => Self::Integer(v),
+            crate::ValueRef::Float(v) => match NonNan::new(v) {
                 Some(v) => Self::Float(v),
                 None => Self::Null,
             },
-            Value::Text(text) => {
+            crate::ValueRef::Text(text) => {
                 let s = text.as_str();
 
                 match str_to_f64(s) {
@@ -153,6 +157,24 @@ impl From<&Value> for Numeric {
             Value::Text(text) => Numeric::from(text.as_str()),
             Value::Blob(blob) => {
                 let text = String::from_utf8_lossy(blob.as_slice());
+                Numeric::from(&text)
+            }
+        }
+    }
+}
+
+impl<'a> From<crate::ValueRef<'a>> for Numeric {
+    fn from(value: crate::ValueRef<'a>) -> Self {
+        match value {
+            crate::ValueRef::Null => Self::Null,
+            crate::ValueRef::Integer(v) => Self::Integer(v),
+            crate::ValueRef::Float(v) => match NonNan::new(v) {
+                Some(v) => Self::Float(v),
+                None => Self::Null,
+            },
+            crate::ValueRef::Text(text) => Numeric::from(text.as_str()),
+            crate::ValueRef::Blob(blob) => {
+                let text = String::from_utf8_lossy(blob);
                 Numeric::from(&text)
             }
         }
@@ -290,6 +312,21 @@ impl From<&Value> for NullableInteger {
             Value::Text(text) => Self::from(text.as_str()),
             Value::Blob(blob) => {
                 let text = String::from_utf8_lossy(blob.as_slice());
+                Self::from(text)
+            }
+        }
+    }
+}
+
+impl<'a> From<crate::ValueRef<'a>> for NullableInteger {
+    fn from(value: crate::ValueRef<'a>) -> Self {
+        match value {
+            crate::ValueRef::Null => Self::Null,
+            crate::ValueRef::Integer(v) => Self::Integer(v),
+            crate::ValueRef::Float(v) => Self::Integer(v as i64),
+            crate::ValueRef::Text(text) => Self::from(text.as_str()),
+            crate::ValueRef::Blob(blob) => {
+                let text = String::from_utf8_lossy(blob);
                 Self::from(text)
             }
         }
