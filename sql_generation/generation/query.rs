@@ -458,14 +458,20 @@ const ALTER_TABLE_NO_ALTER_COL_NO_DROP: &[AlterTableTypeDiscriminants] = &[
 // in the future maybe change this to be more efficient. This is currently acceptable because this function
 // is only called for `DropColumn`
 fn get_column_diff(table: &Table) -> IndexSet<&str> {
-    // Columns that are referenced in INDEXES cannot be dropped
+    // Columns that are referenced in INDEXES or FOREIGN KEYS cannot be dropped
     let column_cannot_drop = table
         .indexes
         .iter()
         .flat_map(|index| index.columns.iter().map(|(col_name, _)| col_name.as_str()))
+        .chain(
+            table
+                .foreign_keys
+                .iter()
+                .flat_map(|fk| fk.child_columns.iter().map(|c| c.as_str())),
+        )
         .collect::<IndexSet<_>>();
     if column_cannot_drop.len() == table.columns.len() {
-        // Optimization: all columns are present in indexes so we do not need to but the table column set
+        // Optimization: all columns are present in indexes/FKs so we do not need to build the table column set
         return IndexSet::new();
     }
 
