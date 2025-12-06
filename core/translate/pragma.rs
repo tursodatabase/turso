@@ -165,7 +165,7 @@ fn update_pragma(
             });
             program.emit_result_row(result_reg, 1);
             program.add_pragma_result_column("journal_mode".into());
-            Ok((program, TransactionMode::None))
+            Ok((program, TransactionMode::Write))
         }
         PragmaName::LegacyFileFormat => Ok((program, TransactionMode::None)),
         PragmaName::WalCheckpoint => query_pragma(

@@ -45,7 +45,9 @@ use crate::index_method::IndexMethod;
 use crate::schema::Trigger;
 use crate::storage::checksum::CHECKSUM_REQUIRED_RESERVED_BYTES;
 use crate::storage::encryption::AtomicCipherMode;
-use crate::storage::pager::{AutoVacuumMode, HeaderRef};
+use crate::storage::journal_mode;
+use crate::storage::pager::{self, AutoVacuumMode, HeaderRef, HeaderRefMut};
+use crate::storage::sqlite3_ondisk::{RawVersion, Version};
 use crate::translate::display::PlanContext;
 use crate::translate::pragma::TURSO_CDC_DEFAULT_TABLE_NAME;
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
@@ -92,7 +94,6 @@ use storage::database::DatabaseFile;
 pub use storage::database::IOContext;
 pub use storage::encryption::{CipherMode, EncryptionContext, EncryptionKey};
 use storage::page_cache::PageCache;
-use storage::pager::{AtomicDbState, DbState};
 use storage::sqlite3_ondisk::PageSize;
 pub use storage::{
     buffer_pool::BufferPool,
@@ -242,12 +243,14 @@ pub struct Database {
     // create DB connections.
     _shared_page_cache: Arc<RwLock<PageCache>>,
     shared_wal: Arc<RwLock<WalFileShared>>,
-    db_state: Arc<AtomicDbState>,
     init_lock: Arc<Mutex<()>>,
     open_flags: Cell<OpenFlags>,
     builtin_syms: RwLock<SymbolTable>,
     opts: DatabaseOpts,
     n_connections: AtomicUsize,
+
+    /// In Memory Page 1 for Empty Dbs
+    init_page_1: Arc<ArcSwapOption<Page>>,
 
     // Encryption
     encryption_key: RwLock<Option<EncryptionKey>>,
@@ -267,10 +270,10 @@ impl fmt::Debug for Database {
             .field("open_flags", &self.open_flags.get());
 
         // Database state information
-        let db_state_value = match self.db_state.get() {
-            DbState::Uninitialized => "uninitialized".to_string(),
-            DbState::Initializing => "initializing".to_string(),
-            DbState::Initialized => "initialized".to_string(),
+        let db_state_value = match &*self.init_page_1.load() {
+            // If init_page1 exists, this means the DB is empty
+            Some(_) => "uninitialized",
+            None => "initialized",
         };
         debug_struct.field("db_state", &db_state_value);
 
@@ -324,11 +327,6 @@ impl Database {
         let mv_store = ArcSwapOption::empty();
 
         let db_size = db_file.size()?;
-        let db_state = if db_size == 0 {
-            DbState::Uninitialized
-        } else {
-            DbState::Initialized
-        };
 
         let shared_page_cache = Arc::new(RwLock::new(PageCache::default()));
         let syms = SymbolTable::new();
@@ -347,6 +345,14 @@ impl Database {
                 (None, None)
             };
 
+        let init_page_1 = if db_size == 0 {
+            let default_page_1 = pager::default_page1(encryption_cipher_mode.as_ref());
+
+            Some(default_page_1)
+        } else {
+            None
+        };
+
         // opts is now passed as parameter
         let db = Database {
             mv_store,
@@ -359,11 +365,12 @@ impl Database {
             builtin_syms: syms.into(),
             io: io.clone(),
             open_flags: flags.into(),
-            db_state: Arc::new(AtomicDbState::new(db_state)),
             init_lock: Arc::new(Mutex::new(())),
             opts,
             buffer_pool: BufferPool::begin_init(io, arena_size),
             n_connections: AtomicUsize::new(0),
+
+            init_page_1: Arc::new(ArcSwapOption::new(init_page_1)),
 
             encryption_key: RwLock::new(encryption_key),
             encryption_cipher_mode: AtomicCipherMode::new(
@@ -515,81 +522,51 @@ impl Database {
             encryption_opts.clone(),
         )?;
 
-        // Currently, if a non-zero-sized WAL file exists, the database cannot be opened in MVCC mode.
-        // FIXME: this should initiate immediate checkpoint from WAL->DB in MVCC mode.
-        if db.mvcc_enabled()
-            && std::path::Path::exists(std::path::Path::new(wal_path))
-            && std::path::Path::new(wal_path).metadata().unwrap().len() > 0
+        let pager = db.header_validation()?;
+        #[cfg(debug_assertions)]
         {
-            return Err(LimboError::InvalidArgument(format!(
-                    "WAL file exists for database {path}, but MVCC is enabled. This is currently not supported. Open the database in non-MVCC mode and run PRAGMA wal_checkpoint(TRUNCATE) to truncate the WAL."
-                )));
+            let wal_enabled = db.shared_wal.read().enabled.load(Ordering::SeqCst);
+            let mv_store_enabled = db.get_mv_store().is_some();
+            assert!(
+                wal_enabled || mv_store_enabled,
+                "Either WAL or MVStore must be enabled"
+            );
         }
-
-        // If a non-zero-sized logical log file exists, the database cannot be opened in non-MVCC mode,
-        // because the changes in the logical log would not be visible to the non-MVCC connections.
-        if !db.mvcc_enabled() {
-            let db_path = std::path::Path::new(path);
-            let log_path = db_path.with_extension("db-log");
-            if std::path::Path::exists(log_path.as_path())
-                && log_path.as_path().metadata().unwrap().len() > 0
-            {
-                return Err(LimboError::InvalidArgument(format!(
-                    "MVCC logical log file exists for database {path}, but MVCC is disabled. This is not supported. Open the database in MVCC mode and run PRAGMA wal_checkpoint(TRUNCATE) to truncate the logical log.",
-                )));
-            }
-        }
-
-        let shared_wal = WalFileShared::open_shared_if_exists(&io, wal_path)?;
-
-        let mv_store = if db.mvcc_enabled() {
-            let file = io.open_file(&format!("{path}-log"), OpenFlags::default(), false)?;
-            let storage = mvcc::persistent_storage::Storage::new(file);
-            let mv_store = MvStore::new(mvcc::LocalClock::new(), storage);
-            Some(Arc::new(mv_store))
-        } else {
-            None
-        };
-
-        db.shared_wal = shared_wal;
-        db.mv_store.store(mv_store);
 
         let db = Arc::new(db);
 
         // Check: https://github.com/tursodatabase/turso/pull/1761#discussion_r2154013123
 
-        if db.db_state.get().is_initialized() {
-            // parse schema
-            let conn = db.connect()?;
-            let syms = conn.syms.read();
-            let pager = conn.pager.load().clone();
+        // parse schema
+        let conn = db._connect(false, Some(pager.clone()))?;
+        let syms = conn.syms.read();
+        let pager = conn.pager.load();
 
-            db.with_schema_mut(|schema| {
-                let header_schema_cookie = pager
-                    .io
-                    .block(|| pager.with_header(|header| header.schema_cookie.get()))?;
-                schema.schema_version = header_schema_cookie;
-                let result = schema
-                    .make_from_btree(None, pager.clone(), &syms)
-                    .inspect_err(|_| pager.end_read_tx());
-                match result {
-                    Err(LimboError::ExtensionError(e)) => {
-                        // this means that a vtab exists and we no longer have the module loaded. we print
-                        // a warning to the user to load the module
-                        eprintln!("Warning: {e}");
-                    }
-                    Err(e) => return Err(e),
-                    _ => {}
+        db.with_schema_mut(|schema| {
+            let header_schema_cookie = pager
+                .io
+                .block(|| pager.with_header(|header| header.schema_cookie.get()))?;
+            schema.schema_version = header_schema_cookie;
+            let result = schema
+                .make_from_btree(None, pager.clone(), &syms)
+                .inspect_err(|_| pager.end_read_tx());
+            match result {
+                Err(LimboError::ExtensionError(e)) => {
+                    // this means that a vtab exists and we no longer have the module loaded. we print
+                    // a warning to the user to load the module
+                    eprintln!("Warning: {e}");
                 }
+                Err(e) => return Err(e),
+                _ => {}
+            }
 
-                Ok(())
-            })?;
-        }
+            Ok(())
+        })?;
 
-        if opts.enable_mvcc {
+        if db.mvcc_enabled() {
             let mv_store = db.get_mv_store();
             let mv_store = mv_store.as_ref().unwrap();
-            let mvcc_bootstrap_conn = db._connect(true, None)?;
+            let mvcc_bootstrap_conn = db._connect(true, Some(pager.clone()))?;
             mv_store.bootstrap(mvcc_bootstrap_conn)?;
         }
 
@@ -597,48 +574,165 @@ impl Database {
     }
 
     /// Necessary Pager initialization, so that we are prepared to read from Page 1
-    fn _init(&self) -> Result<Arc<Pager>> {
+    fn _init(&self) -> Result<Pager> {
         let pager = self.init_pager(None)?;
         pager.enable_encryption(self.opts.enable_encryption);
-        let pager = Arc::new(pager);
 
-        if self.db_state.get().is_initialized() {
-            let header_ref = pager.io.block(|| HeaderRef::from_pager(&pager))?;
+        let header_ref = pager.io.block(|| HeaderRef::from_pager(&pager))?;
 
-            let header = header_ref.borrow();
+        let header = header_ref.borrow();
 
-            let mode = if header.vacuum_mode_largest_root_page.get() > 0 {
-                if header.incremental_vacuum_enabled.get() > 0 {
-                    AutoVacuumMode::Incremental
-                } else {
-                    AutoVacuumMode::Full
-                }
+        let mode = if header.vacuum_mode_largest_root_page.get() > 0 {
+            if header.incremental_vacuum_enabled.get() > 0 {
+                AutoVacuumMode::Incremental
             } else {
-                AutoVacuumMode::None
-            };
+                AutoVacuumMode::Full
+            }
+        } else {
+            AutoVacuumMode::None
+        };
 
-            // Force autovacuum to None if the experimental flag is not enabled
-            let final_mode = if !self.opts.enable_autovacuum {
-                if mode != AutoVacuumMode::None {
-                    tracing::warn!(
+        // Force autovacuum to None if the experimental flag is not enabled
+        let final_mode = if !self.opts.enable_autovacuum {
+            if mode != AutoVacuumMode::None {
+                tracing::warn!(
                         "Database has autovacuum enabled but --experimental-autovacuum flag is not set. Forcing autovacuum to None."
                     );
-                }
-                AutoVacuumMode::None
-            } else {
-                mode
-            };
+            }
+            AutoVacuumMode::None
+        } else {
+            mode
+        };
 
-            pager.set_auto_vacuum_mode(final_mode);
+        pager.set_auto_vacuum_mode(final_mode);
 
-            tracing::debug!(
+        tracing::debug!(
                 "Opened existing database. Detected auto_vacuum_mode from header: {:?}, final mode: {:?}",
                 mode,
                 final_mode
             );
-        }
 
         Ok(pager)
+    }
+
+    /// Checks the Version numbers in the DatabaseHeader, and changes it according to the required options
+    ///
+    /// Will also open MVStore and WAL if needed
+    fn header_validation(&mut self) -> Result<Arc<Pager>> {
+        let wal_exists = journal_mode::wal_exists(std::path::Path::new(&self.wal_path));
+        let log_exists = journal_mode::logical_log_exists(std::path::Path::new(&self.path));
+
+        let mut pager = self._init()?;
+        assert!(pager.wal.is_none(), "Pager should have no WAL yet");
+
+        let header: HeaderRefMut = self.io.block(|| HeaderRefMut::from_pager(&pager))?;
+        let header_mut = header.borrow_mut();
+        let (read_version, write_version) = { (header_mut.read_version, header_mut.write_version) };
+        // TODO: right now we don't support READ ONLY and no READ or WRITE in the Version header
+        // https://www.sqlite.org/fileformat.html#file_format_version_numbers
+        if read_version != write_version {
+            return Err(LimboError::Corrupt(format!(
+                "Read version `{read_version:?}` is not equal to Write version `{write_version:?} in database header`"
+            )));
+        }
+
+        let (read_version, _write_version) = (
+            read_version
+                .to_version()
+                .map_err(|val| LimboError::Corrupt(format!("Invalid read_version: {val}")))?,
+            write_version
+                .to_version()
+                .map_err(|val| LimboError::Corrupt(format!("Invalid write_version: {val}")))?,
+        );
+
+        // Now check the Header Version to see which mode the DB file really is on
+        match read_version {
+            Version::Legacy => {
+                // just treat it as WAL mode
+                header_mut.read_version = RawVersion::from(Version::Wal);
+                header_mut.write_version = RawVersion::from(Version::Wal);
+            }
+            Version::Wal => {
+                if self.mvcc_enabled() {
+                    // Change Header to MVCC
+                    header_mut.read_version = RawVersion::from(Version::Mvcc);
+                    header_mut.write_version = RawVersion::from(Version::Mvcc);
+                }
+            }
+            Version::Mvcc => {
+                if !self.mvcc_enabled() {
+                    tracing::warn!("Database is in MVCC mode, but MVCC options were not passed. Enabling MVCC mode");
+                    self.opts.enable_mvcc = true;
+                }
+            }
+        };
+
+        // Currently we always init shared wal regardless if MVCC enabled
+        match (wal_exists, log_exists) {
+            (true, true) => {
+                return Err(LimboError::Corrupt(
+                    "Both WAL and MVCC logical log file exist".to_string(),
+                ));
+            }
+            (true, false) => {
+                // Currently, if a non-zero-sized WAL file exists, the database cannot be opened in MVCC mode.
+                // FIXME: this should initiate immediate checkpoint from WAL->DB in MVCC mode.
+                if self.mvcc_enabled() {
+                    return Err(LimboError::InvalidArgument(format!(
+                        "WAL file exists for database {}, but MVCC is enabled. This is currently not supported. Open the database in non-MVCC mode and run PRAGMA wal_checkpoint(TRUNCATE) to truncate the WAL.",
+                        self.path
+                    )));
+                }
+            }
+            (false, true) => {
+                // If a non-zero-sized logical log file exists, the database cannot be opened in non-MVCC mode,
+                // because the changes in the logical log would not be visible to the non-MVCC connections.
+                if !self.mvcc_enabled() {
+                    return Err(LimboError::InvalidArgument(format!(
+                        "MVCC logical log file exists for database {}, but MVCC is disabled. This is not supported. Open the database in MVCC mode and run PRAGMA wal_checkpoint(TRUNCATE) to truncate the logical log.",
+                        self.path
+                    )));
+                }
+            }
+            (false, false) => {}
+        };
+
+        // Always Open shared wal and set it in the Database and Pager.
+        // MVCC currently requires a WAL open to function
+        let shared_wal = WalFileShared::open_shared_if_exists(&self.io, &self.wal_path)?;
+
+        let file = self
+            .io
+            .open_file(&self.wal_path, OpenFlags::Create, false)?;
+        // Enable WAL in the existing shared instance
+        shared_wal.write().create(file)?;
+
+        let wal = Rc::new(RefCell::new(WalFile::new(
+            self.io.clone(),
+            Arc::clone(&shared_wal),
+            pager.buffer_pool.clone(),
+        )));
+
+        self.shared_wal = shared_wal;
+        pager.set_wal(wal);
+
+        // Clear page cache after attaching WAL since pages may have been cached
+        // from disk reads before WAL was attached. The WAL may contain newer
+        // versions of these pages (e.g., page 1 with updated schema_cookie).
+        pager.clear_page_cache(false);
+        pager.set_schema_cookie(None);
+
+        if self.mvcc_enabled() {
+            let file =
+                self.io
+                    .open_file(&format!("{}-log", self.path), OpenFlags::default(), false)?;
+            let storage = mvcc::persistent_storage::Storage::new(file);
+            let mv_store = MvStore::new(mvcc::LocalClock::new(), storage);
+            let mv_store = Some(Arc::new(mv_store));
+            self.mv_store.store(mv_store);
+        }
+
+        Ok(Arc::new(pager))
     }
 
     #[instrument(skip_all, level = Level::INFO)]
@@ -655,7 +749,7 @@ impl Database {
         let pager = if let Some(pager) = pager {
             pager
         } else {
-            self._init()?
+            Arc::new(self._init()?)
         };
         let page_size = pager.get_page_size_unchecked();
 
@@ -719,8 +813,8 @@ impl Database {
     /// we need to read the page_size from the database header.
     fn read_page_size_from_db_header(&self) -> Result<PageSize> {
         turso_assert!(
-            self.db_state.get().is_initialized(),
-            "read_page_size_from_db_header called on uninitialized database"
+            self.initialized(),
+            "read_reserved_space_bytes_from_db_header called on uninitialized database"
         );
         turso_assert!(
             PageSize::MIN % 512 == 0,
@@ -737,7 +831,7 @@ impl Database {
 
     fn read_reserved_space_bytes_from_db_header(&self) -> Result<u8> {
         turso_assert!(
-            self.db_state.get().is_initialized(),
+            self.initialized(),
             "read_reserved_space_bytes_from_db_header called on uninitialized database"
         );
         turso_assert!(
@@ -773,7 +867,7 @@ impl Database {
                 return Ok(page_size);
             }
         }
-        if self.db_state.get().is_initialized() {
+        if self.initialized() {
             Ok(self.read_page_size_from_db_header()?)
         } else {
             let Some(size) = requested_page_size else {
@@ -789,7 +883,7 @@ impl Database {
     /// if the database is initialized i.e. it exists on disk, return the reserved space bytes from
     /// the header or None
     fn maybe_get_reserved_space_bytes(&self) -> Result<Option<u8>> {
-        if self.db_state.get().is_initialized() {
+        if self.initialized() {
             Ok(Some(self.read_reserved_space_bytes_from_db_header()?))
         } else {
             Ok(None)
@@ -817,65 +911,33 @@ impl Database {
         };
         // Check if WAL is enabled
         let shared_wal = self.shared_wal.read();
-        if shared_wal.enabled.load(Ordering::SeqCst) {
-            let page_size = self.determine_actual_page_size(&shared_wal, requested_page_size)?;
-            drop(shared_wal);
 
-            let buffer_pool = self.buffer_pool.clone();
-            if self.db_state.get().is_initialized() {
-                buffer_pool.finalize_with_page_size(page_size.get() as usize)?;
-            }
-
-            let db_state = self.db_state.clone();
-            let wal = Rc::new(RefCell::new(WalFile::new(
-                self.io.clone(),
-                self.shared_wal.clone(),
-                buffer_pool.clone(),
-            )));
-            let pager = Pager::new(
-                self.db_file.clone(),
-                Some(wal),
-                self.io.clone(),
-                Arc::new(RwLock::new(PageCache::default())),
-                buffer_pool.clone(),
-                db_state,
-                self.init_lock.clone(),
-            )?;
-            pager.set_page_size(page_size);
-            if let Some(reserved_bytes) = reserved_bytes {
-                pager.set_reserved_space_bytes(reserved_bytes);
-            }
-            if disable_checksums {
-                pager.reset_checksum_context();
-            }
-            // Set encryption later after `disable_checksums` as it may reset the `pager.io_ctx`
-            if let Some(encryption_key) = encryption_key.as_ref() {
-                pager.enable_encryption(true);
-                pager.set_encryption_context(cipher, encryption_key)?;
-            }
-            return Ok(pager);
-        }
         let page_size = self.determine_actual_page_size(&shared_wal, requested_page_size)?;
-        drop(shared_wal);
 
         let buffer_pool = self.buffer_pool.clone();
-
-        if self.db_state.get().is_initialized() {
+        if self.initialized() {
             buffer_pool.finalize_with_page_size(page_size.get() as usize)?;
         }
 
-        // No existing WAL; create one.
-        let db_state = self.db_state.clone();
-        let mut pager = Pager::new(
+        let pager_wal: Option<Rc<RefCell<dyn Wal>>> = if shared_wal.enabled.load(Ordering::SeqCst) {
+            Some(Rc::new(RefCell::new(WalFile::new(
+                self.io.clone(),
+                self.shared_wal.clone(),
+                buffer_pool.clone(),
+            ))))
+        } else {
+            None
+        };
+
+        let pager = Pager::new(
             self.db_file.clone(),
-            None,
+            pager_wal,
             self.io.clone(),
             Arc::new(RwLock::new(PageCache::default())),
             buffer_pool.clone(),
-            db_state,
-            Arc::new(Mutex::new(())),
+            self.init_lock.clone(),
+            self.init_page_1.clone(),
         )?;
-
         pager.set_page_size(page_size);
         if let Some(reserved_bytes) = reserved_bytes {
             pager.set_reserved_space_bytes(reserved_bytes);
@@ -888,22 +950,6 @@ impl Database {
             pager.enable_encryption(true);
             pager.set_encryption_context(cipher, encryption_key)?;
         }
-        let file = self
-            .io
-            .open_file(&self.wal_path, OpenFlags::Create, false)?;
-
-        // Enable WAL in the existing shared instance
-        {
-            let mut shared_wal = self.shared_wal.write();
-            shared_wal.create(file)?;
-        }
-
-        let wal = Rc::new(RefCell::new(WalFile::new(
-            self.io.clone(),
-            self.shared_wal.clone(),
-            buffer_pool,
-        )));
-        pager.set_wal(wal);
 
         Ok(pager)
     }
@@ -961,6 +1007,11 @@ impl Database {
             .unwrap();
         let db = Self::open_file_with_flags(io.clone(), path, flags, opts, encryption_opts)?;
         Ok((io, db))
+    }
+
+    #[inline]
+    pub(crate) fn initialized(&self) -> bool {
+        self.init_page_1.load().is_none()
     }
 
     pub(crate) fn can_load_extensions(&self) -> bool {
@@ -2051,25 +2102,15 @@ impl Connection {
     /// is first created, if it does not already exist when the page_size pragma is issued,
     /// or at the next VACUUM command that is run on the same database connection while not in WAL mode.
     pub fn reset_page_size(&self, size: u32) -> Result<()> {
+        if self.db.initialized() {
+            return Ok(());
+        }
         let Some(size) = PageSize::new(size) else {
             return Ok(());
         };
 
         self.page_size.store(size.get_raw(), Ordering::SeqCst);
-        if self.db.db_state.get() != DbState::Uninitialized {
-            return Ok(());
-        }
-
-        {
-            let mut shared_wal = self.db.shared_wal.write();
-            shared_wal.enabled.store(false, Ordering::SeqCst);
-            shared_wal.file = None;
-        }
-        self.pager.load().clear_page_cache(false);
-        let pager = self.db.init_pager(Some(size.get() as usize))?;
-        pager.enable_encryption(self.db.opts.enable_encryption);
-        self.pager.store(Arc::new(pager));
-        self.pager.load().set_initial_page_size(size);
+        self.pager.load().set_initial_page_size(size)?;
 
         Ok(())
     }
@@ -2226,7 +2267,7 @@ impl Connection {
     }
 
     pub fn is_db_initialized(&self) -> bool {
-        self.db.db_state.get().is_initialized()
+        self.db.initialized()
     }
 
     fn get_pager_from_database_index(&self, index: &usize) -> Arc<Pager> {
