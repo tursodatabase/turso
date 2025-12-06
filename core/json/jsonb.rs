@@ -2552,7 +2552,9 @@ impl Jsonb {
                             }
                             bail_parse_error!("Index past end of array")
                         }
-                        Some(_) => unreachable!("i32 is either >= 0 or < 0; both cases handled above"),
+                        Some(_) => {
+                            unreachable!("i32 is either >= 0 or < 0; both cases handled above")
+                        }
                     }
                 } else {
                     if root_type == ElementType::OBJECT
@@ -2750,7 +2752,9 @@ impl Jsonb {
                             }
                             bail_parse_error!("Index past end of array")
                         }
-                        Some(_) => unreachable!("i32 is either >= 0 or < 0; both cases handled above"),
+                        Some(_) => {
+                            unreachable!("i32 is either >= 0 or < 0; both cases handled above")
+                        }
                     }
                 } else {
                     bail_parse_error!("Root is not an array");
@@ -2886,7 +2890,8 @@ impl Jsonb {
                                 ));
                             }
 
-                            if arr_pos != end_pos && (mode.allows_replace() || mode.allows_insert()) {
+                            if arr_pos != end_pos && (mode.allows_replace() || mode.allows_insert())
+                            {
                                 return Ok(JsonTraversalResult::with_array_index(
                                     value_idx,
                                     JsonLocationKind::ObjectProperty(key_idx),

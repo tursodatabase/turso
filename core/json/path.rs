@@ -287,20 +287,16 @@ fn handle_array_index(
         (ArrayIndexState::IsMax | ArrayIndexState::IsMaxNegative, '0'..='9') => (),
         (ArrayIndexState::CollectingNumbers | ArrayIndexState::IsMax, ']') => {
             *parser_state = PPState::ExpectDotOrBracket;
-            if *index_buffer > i32::MAX as i128 {
-                bail_parse_error!("Array index {} exceeds maximum value", index_buffer);
-            }
-            path_components.push(PathElement::ArrayLocator(Some(*index_buffer as i32)));
+            let wrapped_index = (*index_buffer as u32) as i32;
+            path_components.push(PathElement::ArrayLocator(Some(wrapped_index)));
         }
         (ArrayIndexState::CollectingNegativeNumbers | ArrayIndexState::IsMaxNegative, ']') => {
             *parser_state = PPState::ExpectDotOrBracket;
             if *index_buffer == 0 {
                 path_components.push(PathElement::ArrayLocator(None));
             } else {
-                if *index_buffer < i32::MIN as i128 {
-                    bail_parse_error!("Array index {} exceeds minimum value", index_buffer);
-                }
-                path_components.push(PathElement::ArrayLocator(Some(*index_buffer as i32)));
+                let wrapped_index = (*index_buffer as u32) as i32;
+                path_components.push(PathElement::ArrayLocator(Some(wrapped_index)));
             }
         }
         (_, _) => bail_parse_error!("Bad json path: {}", path),
