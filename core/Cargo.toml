@@ -81,6 +81,8 @@ turso_parser = { workspace = true }
 aegis = "0.9.5"
 twox-hash = "2.1.1"
 intrusive-collections = "0.9.7"
+scc = "3.3.1"
+crossbeam-utils = "0.8.21"
 roaring = "0.11.2"
 simsimd = "6.5.3"
 arc-swap = "1.7"

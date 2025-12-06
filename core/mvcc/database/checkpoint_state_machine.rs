@@ -189,23 +189,26 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
 
     /// Determine whether the newest valid version of a row should be checkpointed.
     /// Returns the version to checkpoint if it should be checkpointed, otherwise None.
-    fn maybe_get_checkpointable_version(&self, versions: &[RowVersion]) -> Option<RowVersion> {
+    fn maybe_get_checkpointable_version<'a, I>(&self, versions: I) -> Option<RowVersion>
+    where
+        I: IntoIterator<Item = &'a RowVersion>,
+    {
         let mut version_to_checkpoint = None;
         let mut exists_in_db_file = false;
         // Iterate versions from oldest-to-newest to determine if the row exists in the database file and whether the newest version should be checkpointed.
-        for version in versions.iter() {
+        for version in versions {
             // A row is in the database file if:
             // There is a version whose begin timestamp is <= than the last checkpoint timestamp, AND
             // There is NO version whose END timestamp is <= than the last checkpoint timestamp.
             let mut begin_ts = None;
-            if let Some(TxTimestampOrID::Timestamp(b)) = version.begin {
+            if let Some(TxTimestampOrID::Timestamp(b)) = version.begin() {
                 begin_ts = Some(b);
                 if b <= self.checkpointed_txid_max_old {
                     exists_in_db_file = true;
                 }
             }
             let mut end_ts = None;
-            if let Some(TxTimestampOrID::Timestamp(e)) = version.end {
+            if let Some(TxTimestampOrID::Timestamp(e)) = version.end() {
                 end_ts = Some(e);
                 if e <= self.checkpointed_txid_max_old {
                     exists_in_db_file = false;
@@ -254,19 +257,25 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 continue;
             }
 
-            let row_versions = entry.value().read();
+            let mut row_versions = Vec::new();
+            entry.value().for_each_node(|node| {
+                if let Some(version) = node.row_version() {
+                    row_versions.push(version.clone());
+                }
+                None::<()>
+            });
 
             for version in row_versions.iter() {
-                if let Some(TxTimestampOrID::Timestamp(ts)) = version.begin {
+                if let Some(TxTimestampOrID::Timestamp(ts)) = version.begin() {
                     max_timestamp = max_timestamp.max(ts);
                 }
-                if let Some(TxTimestampOrID::Timestamp(ts)) = version.end {
+                if let Some(TxTimestampOrID::Timestamp(ts)) = version.end() {
                     max_timestamp = max_timestamp.max(ts);
                 }
             }
 
             if let Some(version) = self.maybe_get_checkpointable_version(&row_versions) {
-                let is_delete = version.end.is_some();
+                let is_delete = version.end().is_some();
 
                 let mut special_write = None;
 
@@ -411,16 +420,16 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 let versions = entry.value().read();
 
                 for version in versions.iter() {
-                    if let Some(TxTimestampOrID::Timestamp(ts)) = version.begin {
+                    if let Some(TxTimestampOrID::Timestamp(ts)) = version.begin() {
                         max_timestamp = max_timestamp.max(ts);
                     }
-                    if let Some(TxTimestampOrID::Timestamp(ts)) = version.end {
+                    if let Some(TxTimestampOrID::Timestamp(ts)) = version.end() {
                         max_timestamp = max_timestamp.max(ts);
                     }
                 }
 
-                if let Some(version) = self.maybe_get_checkpointable_version(&versions) {
-                    let is_delete = version.end.is_some();
+                if let Some(version) = self.maybe_get_checkpointable_version(versions.iter()) {
+                    let is_delete = version.end().is_some();
 
                     // Only write the row to the B-tree if it is not a delete, or if it is a delete and it exists in
                     // the database file.
@@ -791,7 +800,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 )?;
 
                 // Check if this is an insert or delete
-                if row_version.end.is_some() {
+                if row_version.end().is_some() {
                     // This is a delete operation.
                     // Don't write the deletion record to the b-tree if the b-tree was just created; we can no-op in this case,
                     // since there is no existing row to delete.
@@ -1079,9 +1088,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                         .rows
                         .get(&key)
                         .expect("sqlite_schema row not found");
-                    let mut row_versions = sqlite_schema_row.value().write();
-                    self.mvstore
-                        .insert_version_raw(&mut row_versions, row_version);
+                    sqlite_schema_row.value().insert(row_version);
                 }
 
                 // Patch in-memory schema to do the same

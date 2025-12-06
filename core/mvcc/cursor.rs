@@ -4,8 +4,8 @@ use parking_lot::RwLock;
 
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
-    create_seek_range, MVTableId, MvStore, Row, RowID, RowKey, RowVersion, RowVersionState,
-    SortableIndexKey,
+    create_seek_range, MVTableId, MvStore, Row, RowID, RowKey, RowVersion, RowVersionChain,
+    RowVersionState, SortableIndexKey,
 };
 use crate::storage::btree::{BTreeCursor, BTreeKey, CursorTrait};
 use crate::translate::plan::IterationDirection;
@@ -194,8 +194,7 @@ pub enum MvccCursorType {
     Index(Arc<IndexInfo>),
 }
 
-pub(crate) type MvccIterator<'l, T> =
-    Box<dyn Iterator<Item = Entry<'l, T, RwLock<Vec<RowVersion>>>>>;
+pub(crate) type MvccIterator<'l, K, V> = Box<dyn Iterator<Item = Entry<'l, K, V>>>;
 
 /// Extends the lifetime of a SkipMap iterator to `'static`.
 ///
@@ -218,12 +217,12 @@ pub(crate) type MvccIterator<'l, T> =
 /// - For index iterators: The `MvStore.index_rows` SkipMap is held in an `Arc<MvStore>`
 ///   that outlives the cursor.
 macro_rules! static_iterator_hack {
-    ($iter:expr, $key_type:ty) => {
+    ($iter:expr, $key_type:ty, $value_type:ty) => {
         // SAFETY: See macro documentation above.
         unsafe {
             std::mem::transmute::<
-                Box<dyn Iterator<Item = Entry<'_, $key_type, RwLock<Vec<RowVersion>>>>>,
-                Box<dyn Iterator<Item = Entry<'static, $key_type, RwLock<Vec<RowVersion>>>>>,
+                Box<dyn Iterator<Item = Entry<'_, $key_type, $value_type>>>,
+                Box<dyn Iterator<Item = Entry<'static, $key_type, $value_type>>>,
             >($iter)
         }
     };
@@ -235,9 +234,9 @@ pub struct MvccLazyCursor<Clock: LogicalClock> {
     pub db: Arc<MvStore<Clock>>,
     current_pos: RefCell<CursorPosition>,
     /// Stateful MVCC table iterator if this is a table cursor.
-    table_iterator: Option<MvccIterator<'static, RowID>>,
+    table_iterator: Option<MvccIterator<'static, RowID, RowVersionChain>>,
     /// Stateful MVCC index iterator if this is an index cursor.
-    index_iterator: Option<MvccIterator<'static, SortableIndexKey>>,
+    index_iterator: Option<MvccIterator<'static, SortableIndexKey, RwLock<Vec<RowVersion>>>>,
     mv_cursor_type: MvccCursorType,
     table_id: MVTableId,
     tx_id: u64,
@@ -743,7 +742,7 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
                 let range =
                     create_seek_range(Bound::Included(start_rowid), IterationDirection::Forwards);
                 let iter_box = Box::new(self.db.rows.range(range));
-                self.table_iterator = Some(static_iterator_hack!(iter_box, RowID));
+                self.table_iterator = Some(static_iterator_hack!(iter_box, RowID, RowVersionChain));
             }
             MvccCursorType::Index(_) => {
                 let index_rows = self
@@ -752,7 +751,11 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
                     .get_or_insert_with(self.table_id, SkipMap::new);
                 let index_rows = index_rows.value();
                 let iter_box = Box::new(index_rows.iter());
-                self.index_iterator = Some(static_iterator_hack!(iter_box, SortableIndexKey));
+                self.index_iterator = Some(static_iterator_hack!(
+                    iter_box,
+                    SortableIndexKey,
+                    RwLock<Vec<RowVersion>>
+                ));
             }
         }
     }
@@ -1454,7 +1457,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                     std::ops::Bound::Unbounded,
                 );
                 let iter_box = Box::new(self.db.rows.range(range));
-                self.table_iterator = Some(static_iterator_hack!(iter_box, RowID));
+                self.table_iterator = Some(static_iterator_hack!(iter_box, RowID, RowVersionChain));
             }
             MvccCursorType::Index(_) => {
                 // For index cursors, initialize the iterator to the beginning
@@ -1464,7 +1467,11 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                     .get_or_insert_with(self.table_id, SkipMap::new);
                 let index_rows = index_rows.value();
                 let iter_box = Box::new(index_rows.iter());
-                self.index_iterator = Some(static_iterator_hack!(iter_box, SortableIndexKey));
+                self.index_iterator = Some(static_iterator_hack!(
+                    iter_box,
+                    SortableIndexKey,
+                    RwLock<Vec<RowVersion>>
+                ));
             }
         }
 
