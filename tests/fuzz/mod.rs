@@ -2306,7 +2306,9 @@ mod fuzz_tests {
                 OUTER_ITERATIONS
             );
             let limbo_db = builder.clone().build();
-            let sqlite_db = builder.clone().build();
+            // For the sqlite comparison database, disable MVCC since rusqlite can't
+            // read databases with MVCC version (255) in the header
+            let sqlite_db = builder.clone().with_opts(opts.with_mvcc(false)).build();
             let num_cols = rng.random_range(1..=10);
             let mut table_cols = vec!["id INTEGER PRIMARY KEY AUTOINCREMENT".to_string()];
             table_cols.extend(
@@ -2655,19 +2657,22 @@ mod fuzz_tests {
                 }
 
                 // Run integrity check on limbo db using rusqlite
-                if let Err(e) = rusqlite_integrity_check(&limbo_db.path) {
-                    println!("{table_def};");
-                    for t in indexes.iter() {
-                        println!("{t};");
+                // Skip for MVCC databases since rusqlite can't read MVCC version (255)
+                if !is_mvcc {
+                    if let Err(e) = rusqlite_integrity_check(&limbo_db.path) {
+                        println!("{table_def};");
+                        for t in indexes.iter() {
+                            println!("{t};");
+                        }
+                        if let Some(trigger) = trigger {
+                            println!("{trigger};");
+                        }
+                        for t in dml_statements.iter() {
+                            println!("{t};");
+                        }
+                        println!("{query};");
+                        panic!("seed: {seed}, error: {e}");
                     }
-                    if let Some(trigger) = trigger {
-                        println!("{trigger};");
-                    }
-                    for t in dml_statements.iter() {
-                        println!("{t};");
-                    }
-                    println!("{query};");
-                    panic!("seed: {seed}, error: {e}");
                 }
 
                 if sqlite_rows.is_empty() {
