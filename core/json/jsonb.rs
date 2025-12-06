@@ -2533,7 +2533,7 @@ impl Jsonb {
                                 bail_parse_error!("Element with negative index not found")
                             }
                         }
-                        _ => {
+                        None => {
                             if mode.allows_insert() {
                                 let arr_pos = end_pos;
                                 let placeholder =
@@ -2544,7 +2544,7 @@ impl Jsonb {
                                     .splice(arr_pos..arr_pos, placeholder_bytes.iter().copied());
 
                                 return Ok(JsonTraversalResult::with_array_index(
-                                    pos + root_header_size,
+                                    pos,
                                     JsonLocationKind::ArrayEntry,
                                     placeholder_bytes.len() as isize,
                                     arr_pos,
@@ -2552,6 +2552,7 @@ impl Jsonb {
                             }
                             bail_parse_error!("Index past end of array")
                         }
+                        Some(_) => unreachable!("i32 is either >= 0 or < 0; both cases handled above"),
                     }
                 } else {
                     if root_type == ElementType::OBJECT
@@ -2730,7 +2731,7 @@ impl Jsonb {
                                 bail_parse_error!("Element with negative index not found")
                             }
                         }
-                        _ => {
+                        None => {
                             if mode.allows_insert() {
                                 let arr_pos = end_pos;
                                 let placeholder =
@@ -2749,6 +2750,7 @@ impl Jsonb {
                             }
                             bail_parse_error!("Index past end of array")
                         }
+                        Some(_) => unreachable!("i32 is either >= 0 or < 0; both cases handled above"),
                     }
                 } else {
                     bail_parse_error!("Root is not an array");
@@ -2884,7 +2886,7 @@ impl Jsonb {
                                 ));
                             }
 
-                            if arr_pos != end_pos && mode.allows_replace() {
+                            if arr_pos != end_pos && (mode.allows_replace() || mode.allows_insert()) {
                                 return Ok(JsonTraversalResult::with_array_index(
                                     value_idx,
                                     JsonLocationKind::ObjectProperty(key_idx),
