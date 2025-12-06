@@ -1102,3 +1102,52 @@ do_execsql_test_on_specific_db {:memory:} collate-unique-index-upsert {
       ON CONFLICT DO UPDATE SET v = excluded.v;
     SELECT name, v FROM co;
 } {Alice|9}
+
+do_execsql_test_on_specific_db {:memory:} upsert-fires-after-update-trigger {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, val INT);
+    CREATE TABLE log(msg TEXT);
+    CREATE TRIGGER trg AFTER UPDATE ON t BEGIN INSERT INTO log VALUES ('updated'); END;
+    INSERT INTO t VALUES (1, 100);
+    INSERT INTO t VALUES (1, 200) ON CONFLICT(id) DO UPDATE SET val=excluded.val;
+    SELECT * FROM log;
+} {updated}
+
+do_execsql_test_on_specific_db {:memory:} upsert-fires-before-update-trigger {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, val INT);
+    CREATE TABLE log(msg TEXT);
+    CREATE TRIGGER trg BEFORE UPDATE ON t BEGIN INSERT INTO log VALUES ('before'); END;
+    INSERT INTO t VALUES (1, 100);
+    INSERT INTO t VALUES (1, 200) ON CONFLICT(id) DO UPDATE SET val=excluded.val;
+    SELECT * FROM log;
+} {before}
+
+do_execsql_test_on_specific_db {:memory:} upsert-fires-after-update-trigger {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, val INT);
+    CREATE TABLE log(msg TEXT);
+    CREATE TRIGGER trg BEFORE UPDATE ON t BEGIN INSERT INTO log VALUES ('after'); END;
+    INSERT INTO t VALUES (1, 100);
+    INSERT INTO t VALUES (1, 200) ON CONFLICT(id) DO UPDATE SET val=excluded.val;
+    SELECT * FROM log;
+} {after}
+
+do_execsql_test_on_specific_db {:memory:} upsert-fires-before-and-after-triggers {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, val INT);
+    CREATE TABLE log(seq INTEGER PRIMARY KEY, msg TEXT);
+    CREATE TRIGGER trg_before BEFORE UPDATE ON t BEGIN INSERT INTO log(msg) VALUES ('before'); END;
+    CREATE TRIGGER trg_after AFTER UPDATE ON t BEGIN INSERT INTO log(msg) VALUES ('after'); END;
+    INSERT INTO t VALUES (1, 100);
+    INSERT INTO t VALUES (1, 200) ON CONFLICT(id) DO UPDATE SET val=excluded.val;
+    SELECT msg FROM log ORDER BY seq;
+} {before
+after}
+
+do_execsql_test_in_memory_error_content upsert-trigger-causes-fk-violation {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id PRIMARY KEY);
+    CREATE TABLE child_deferred(id INTEGER PRIMARY KEY, pid INT, FOREIGN KEY(pid) REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED);
+    CREATE TABLE child_immediate(id INTEGER PRIMARY KEY, pid INT, FOREIGN KEY(pid) REFERENCES parent(id));
+    CREATE TRIGGER trg AFTER UPDATE OF pid ON child_deferred BEGIN INSERT INTO child_immediate VALUES (NEW.id + 1000, NEW.pid); END;
+    INSERT INTO parent VALUES (1);
+    INSERT INTO child_deferred VALUES (1, 1);
+    INSERT INTO child_deferred VALUES (1, 999) ON CONFLICT(id) DO UPDATE SET pid=excluded.pid;
+} {FOREIGN KEY constraint failed}
