@@ -629,17 +629,26 @@ impl Database {
         );
 
         // Now check the Header Version to see which mode the DB file really is on
-        match read_version {
+        // Track if header was modified so we can write it to disk
+        let header_modified = match read_version {
             Version::Legacy => {
-                // just treat it as WAL mode
-                header_mut.read_version = RawVersion::from(Version::Wal);
-                header_mut.write_version = RawVersion::from(Version::Wal);
+                if self.mvcc_enabled() {
+                    header_mut.read_version = RawVersion::from(Version::Mvcc);
+                    header_mut.write_version = RawVersion::from(Version::Mvcc);
+                } else {
+                    header_mut.read_version = RawVersion::from(Version::Wal);
+                    header_mut.write_version = RawVersion::from(Version::Wal);
+                }
+                true
             }
             Version::Wal => {
                 if self.mvcc_enabled() {
                     // Change Header to MVCC
                     header_mut.read_version = RawVersion::from(Version::Mvcc);
                     header_mut.write_version = RawVersion::from(Version::Mvcc);
+                    true
+                } else {
+                    false
                 }
             }
             Version::Mvcc => {
@@ -647,8 +656,17 @@ impl Database {
                     tracing::warn!("Database is in MVCC mode, but MVCC options were not passed. Enabling MVCC mode");
                     self.opts.enable_mvcc = true;
                 }
+                false
             }
         };
+
+        // If header was modified, write it directly to disk before we clear the cache
+        // This must happen before WAL is attached since we need to write directly to the DB file
+        if header_modified {
+            let completion =
+                storage::sqlite3_ondisk::begin_write_btree_page(&pager, header.page())?;
+            self.io.wait_for_completion(completion)?;
+        }
 
         // Currently we always init shared wal regardless if MVCC enabled
         match (wal_exists, log_exists) {

@@ -130,6 +130,11 @@ impl HeaderRefMut {
             &mut content.buffer.as_mut_slice()[0..DatabaseHeader::SIZE],
         )
     }
+
+    /// Get a reference to the underlying page
+    pub fn page(&self) -> &PageRef {
+        &self.0
+    }
 }
 
 pub struct PageInner {
