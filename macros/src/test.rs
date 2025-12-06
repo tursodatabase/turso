@@ -43,6 +43,7 @@ impl<T: ToTokens> ToTokens for SpannedType<T> {
 struct Args {
     path: Option<SpannedType<String>>,
     mvcc: Option<SpannedType<()>>,
+    views: Option<SpannedType<()>>,
     init_sql: Option<Expr>,
 }
 
@@ -81,6 +82,17 @@ impl Args {
             }
         }
 
+        if let Some(spanned) = self
+            .views
+            .as_ref()
+            .map(|val| (*val).map(|_| quote! {.with_views(true)}))
+        {
+            db_opts = quote! {
+                #db_opts
+                #spanned
+            }
+        }
+
         builder = quote! {
             #builder
             .with_db_name(#db_name)
@@ -107,6 +119,7 @@ impl Parse for Args {
 
         let mut path = None;
         let mut mvcc = None;
+        let mut views = None;
         let mut init_sql = None;
 
         let errors = args
@@ -152,6 +165,9 @@ impl Parse for Args {
                         if p.is_ident("mvcc") {
                             mvcc = Some(SpannedType((), p.span()));
                             seen_args.insert(ident.unwrap().clone());
+                        } else if p.is_ident("views") {
+                            views = Some(SpannedType((), p.span()));
+                            seen_args.insert(ident.unwrap().clone());
                         } else {
                             return Some(syn::Error::new_spanned(p, "unexpected flag"));
                         }
@@ -174,6 +190,7 @@ impl Parse for Args {
         Ok(Args {
             path,
             mvcc,
+            views,
             init_sql,
         })
     }
