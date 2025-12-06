@@ -77,13 +77,13 @@ fn read_next_join_row(
                 _ => return Ok(IOResult::Done(None)),
             };
             let found_zset_hash = match &values[1].to_owned() {
-                Value::Blob(blob) => Hash128::from_blob(blob).ok_or_else(|| {
+                Value::Blob(ref blob) => Hash128::from_blob(blob).ok_or_else(|| {
                     crate::LimboError::InternalError("Invalid zset_hash blob".to_string())
                 })?,
                 _ => return Ok(IOResult::Done(None)),
             };
             let element_hash = match &values[2].to_owned() {
-                Value::Blob(blob) => Hash128::from_blob(blob).ok_or_else(|| {
+                Value::Blob(ref blob) => Hash128::from_blob(blob).ok_or_else(|| {
                     crate::LimboError::InternalError("Invalid element_hash blob".to_string())
                 })?,
                 _ => {
@@ -580,7 +580,7 @@ fn serialize_hashable_row(row: &HashableRow) -> Vec<u8> {
     all_values.extend_from_slice(&row.values);
 
     let record = ImmutableRecord::from_values(&all_values, all_values.len());
-    record.as_blob().clone()
+    record.as_blob().to_vec()
 }
 
 impl IncrementalOperator for JoinOperator {
@@ -656,7 +656,7 @@ impl IncrementalOperator for JoinOperator {
                         Value::Integer(self.left_storage_id()),
                         zset_hash.to_value(),
                         element_hash.to_value(),
-                        Value::Blob(row_blob),
+                        Value::from_blob(row_blob),
                     ];
 
                     // Use return_and_restore_if_io to handle I/O properly
@@ -704,7 +704,7 @@ impl IncrementalOperator for JoinOperator {
                         Value::Integer(self.right_storage_id()),
                         zset_hash.to_value(),
                         element_hash.to_value(),
-                        Value::Blob(row_blob),
+                        Value::from_blob(row_blob),
                     ];
 
                     // Use return_and_restore_if_io to handle I/O properly

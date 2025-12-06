@@ -76,7 +76,7 @@ pub fn jsonb(json_value: &Value, cache: &JsonCacheCell) -> crate::Result<Value> 
 
     let jsonbin = cache.get_or_insert_with(json_value, json_conv_fn);
     match jsonbin {
-        Ok(jsonbin) => Ok(Value::Blob(jsonbin.data())),
+        Ok(jsonbin) => Ok(Value::Blob(Cow::Owned(jsonbin.data()))),
         Err(_) => {
             bail_parse_error!("malformed JSON")
         }
@@ -529,7 +529,7 @@ pub fn json_string_to_db_type(
 ) -> crate::Result<Value> {
     let mut json_string = json.to_string();
     if matches!(flag, OutputVariant::Binary) {
-        return Ok(Value::Blob(json.data()));
+        return Ok(Value::Blob(Cow::Owned(json.data())));
     }
     match element_type {
         ElementType::ARRAY | ElementType::OBJECT => Ok(Value::Text(Text::json(json_string))),

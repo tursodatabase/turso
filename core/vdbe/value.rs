@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 
 use regex::{Regex, RegexBuilder};
@@ -273,7 +274,7 @@ impl Value {
 
         let mut blob: Vec<u8> = vec![0; length];
         fill_bytes(&mut blob);
-        Value::Blob(blob)
+        Value::Blob(Cow::Owned(blob))
     }
 
     pub fn exec_quote(&self) -> Self {
@@ -436,7 +437,7 @@ impl Value {
                     .cast_text()
                     .map(|s| hex::decode(&s[0..s.find('\0').unwrap_or(s.len())]))
                 {
-                    Some(Ok(bytes)) => Value::Blob(bytes),
+                    Some(Ok(bytes)) => Value::Blob(Cow::Owned(bytes)),
                     _ => Value::Null,
                 },
                 Some(ignore) => match ignore {
@@ -448,7 +449,7 @@ impl Value {
                             .trim_end_matches(|x| pat.contains(x))
                             .to_string();
                         match hex::decode(trimmed) {
-                            Ok(bytes) => Value::Blob(bytes),
+                            Ok(bytes) => Value::Blob(Cow::Owned(bytes)),
                             _ => Value::Null,
                         }
                     }
@@ -526,7 +527,7 @@ impl Value {
             Value::Text(s) => s.as_str().parse().unwrap_or(0),
             _ => 0,
         };
-        Value::Blob(vec![0; length.max(0) as usize])
+        Value::Blob(Cow::Owned(vec![0; length.max(0) as usize]))
     }
 
     // exec_if returns whether you should jump
@@ -548,7 +549,7 @@ impl Value {
                 // Convert to TEXT first, then interpret as BLOB
                 // TODO: handle encoding
                 let text = self.to_string();
-                Value::Blob(text.into_bytes())
+                Value::Blob(Cow::Owned(text.into_bytes()))
             }
             // TEXT To cast a BLOB value to TEXT, the sequence of bytes that make up the BLOB is interpreted as text encoded using the database encoding.
             // Casting an INTEGER or REAL value into TEXT renders the value as if via sqlite3_snprintf() except that the resulting TEXT uses the encoding of the database connection.
@@ -604,7 +605,7 @@ impl Value {
                 _ => {
                     let s = match self {
                         Value::Text(text) => text.to_string(),
-                        Value::Blob(blob) => String::from_utf8_lossy(blob.as_slice()).to_string(),
+                        Value::Blob(blob) => String::from_utf8_lossy(blob.as_ref()).to_string(),
                         _ => unreachable!(),
                     };
 

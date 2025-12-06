@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 // Aggregate operator for DBSP-style incremental computation
 
 use crate::function::{AggFunc, Func};
@@ -990,7 +991,7 @@ impl AggregateState {
         all_values.extend(self.to_value_vector(aggregates));
 
         let record = ImmutableRecord::from_values(&all_values, all_values.len());
-        record.as_blob().clone()
+        record.as_blob().to_vec()
     }
 
     pub fn from_blob(blob: &[u8]) -> Result<(Self, Vec<Value>)> {
@@ -1884,7 +1885,7 @@ impl IncrementalOperator for AggregateOperator {
 
                         // Serialize the aggregate state (only for regular aggregates, not plain DISTINCT)
                         let state_blob = agg_state.to_blob(&self.aggregates, group_key);
-                        let blob_value = Value::Blob(state_blob);
+                        let blob_value = Value::Blob(Cow::Owned(state_blob));
 
                         // Build the aggregate storage format: [operator_id, zset_hash, element_id, value, weight]
                         let operator_id_val = Value::Integer(operator_storage_id);
@@ -2976,7 +2977,7 @@ impl DistinctPersistState {
                         Value::Integer(storage_id),
                         zset_hash.to_value(),
                         element_id.to_value(),
-                        Value::Blob(weight_blob),
+                        Value::Blob(Cow::Owned(weight_blob)),
                     ];
 
                     // Write to BTree

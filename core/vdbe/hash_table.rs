@@ -190,7 +190,7 @@ impl HashEntry {
             Value::Integer(_) => 8,
             Value::Float(_) => 8,
             Value::Text(t) => t.as_str().len(),
-            Value::Blob(b) => b.len(),
+            Value::Blob(ref b) => b.len(),
         };
         let key_size: usize = self.key_values.iter().map(value_size).sum();
         let payload_size: usize = self.payload_values.iter().map(value_size).sum();
@@ -241,7 +241,7 @@ impl HashEntry {
                 buf.extend_from_slice(&varint_buf[..len]);
                 buf.extend_from_slice(bytes);
             }
-            Value::Blob(b) => {
+            Value::Blob(ref b) => {
                 buf.push(BLOB_HASH);
                 let len = write_varint(varint_buf, b.len() as u64);
                 buf.extend_from_slice(&varint_buf[..len]);
@@ -354,7 +354,7 @@ impl HashEntry {
                 }
                 let b = buf[offset..offset + blob_len as usize].to_vec();
                 offset += blob_len as usize;
-                Value::Blob(b)
+                Value::from_blob(b)
             }
             _ => {
                 return Err(LimboError::Corrupt(format!(
@@ -2248,7 +2248,7 @@ mod hashtests {
         assert!(result.is_some());
         let entry = result.unwrap();
         assert_eq!(entry.payload_values.len(), 2);
-        assert_eq!(entry.payload_values[0], Value::Blob(blob_data));
+        assert_eq!(entry.payload_values[0], Value::Blob(ref blob_data));
         assert_eq!(entry.payload_values[1], Value::Integer(42));
     }
 

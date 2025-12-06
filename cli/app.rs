@@ -1738,7 +1738,7 @@ impl Limbo {
             Value::Blob(b) => {
                 out.write_all(b"X'")?;
                 const HEX: &[u8; 16] = b"0123456789abcdef";
-                for &byte in b {
+                for &byte in b.as_ref() {
                     out.write_all(&[HEX[(byte >> 4) as usize], HEX[(byte & 0x0F) as usize]])?;
                 }
                 out.write_all(b"'")

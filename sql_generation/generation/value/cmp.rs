@@ -28,10 +28,10 @@ impl ArbitraryFrom<(&SimValue, ColumnType)> for LTValue {
             }
             Value::Blob(b) => {
                 // Either shorten the blob, or make at least one byte smaller and mutate the rest
-                let mut b = b.clone();
+                let mut b = b.clone().into_owned();
                 if rng.random_bool(0.01) {
                     b.pop();
-                    Value::Blob(b)
+                    Value::from_blob(b)
                 } else {
                     let index = rng.random_range(0..b.len());
                     b[index] -= 1;
@@ -39,7 +39,7 @@ impl ArbitraryFrom<(&SimValue, ColumnType)> for LTValue {
                     for val in b.iter_mut().skip(index + 1) {
                         *val = rng.random_range(0..=255);
                     }
-                    Value::Blob(b)
+                    Value::from_blob(b)
                 }
             }
             // A value with storage class NULL is considered less than any other value (including another value with storage class NULL)
@@ -76,10 +76,10 @@ impl ArbitraryFrom<(&SimValue, ColumnType)> for GTValue {
             }
             Value::Blob(b) => {
                 // Either lengthen the blob, or make at least one byte smaller and mutate the rest
-                let mut b = b.clone();
+                let mut b = b.clone().into_owned();
                 if rng.random_bool(0.01) {
                     b.push(rng.random_range(0..=255));
-                    Value::Blob(b)
+                    Value::from_blob(b)
                 } else {
                     let index = rng.random_range(0..b.len());
                     b[index] += 1;
@@ -87,7 +87,7 @@ impl ArbitraryFrom<(&SimValue, ColumnType)> for GTValue {
                     for val in b.iter_mut().skip(index + 1) {
                         *val = rng.random_range(0..=255);
                     }
-                    Value::Blob(b)
+                    Value::from_blob(b)
                 }
             }
             Value::Null => {

@@ -117,7 +117,7 @@ impl From<turso_core::Value> for Value {
             turso_core::Value::Integer(n) => Value::Integer(n),
             turso_core::Value::Float(n) => Value::Real(n),
             turso_core::Value::Text(t) => Value::Text(t.into()),
-            turso_core::Value::Blob(items) => Value::Blob(items),
+            turso_core::Value::Blob(items) => Value::Blob(items.into_owned()),
         }
     }
 }

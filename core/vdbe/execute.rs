@@ -53,7 +53,7 @@ use std::any::Any;
 use std::env::temp_dir;
 use std::ops::DerefMut;
 use std::{
-    borrow::BorrowMut,
+    borrow::{BorrowMut, Cow},
     num::NonZero,
     sync::{atomic::Ordering, Arc},
 };
@@ -1752,36 +1752,19 @@ pub fn op_column(
                                 }
                                 // BLOB
                                 n if n >= 12 && n & 1 == 0 => {
-                                    // Try to reuse the registers when allocation is not needed.
-                                    match state.registers[*dest] {
-                                        Register::Value(Value::Blob(ref mut existing_blob)) => {
-                                            existing_blob.do_extend(&buf);
-                                        }
-                                        _ => {
-                                            state.registers[*dest] =
-                                                Register::Value(Value::Blob(buf.to_vec()));
-                                        }
-                                    }
+                                    // Use Cow::Borrowed to avoid copying data from the page buffer.
+                                    // SAFETY: The transmute to 'static is safe because the page buffer
+                                    // remains valid as long as the cursor hasn't moved to another row.
+                                    state.registers[*dest] =
+                                        Register::Value(Value::Blob(Cow::Borrowed(buf)));
                                 }
                                 // TEXT
                                 n if n >= 13 && n & 1 == 1 => {
-                                    // Try to reuse the registers when allocation is not needed.
-                                    match state.registers[*dest] {
-                                        Register::Value(Value::Text(ref mut existing_text)) => {
-                                            // SAFETY: We know the text is valid UTF-8 because we only accept valid UTF-8 and the serial type is TEXT.
-                                            let text =
-                                                unsafe { std::str::from_utf8_unchecked(buf) };
-                                            existing_text.do_extend(&text);
-                                        }
-                                        _ => {
-                                            // SAFETY: We know the text is valid UTF-8 because we only accept valid UTF-8 and the serial type is TEXT.
-                                            let text =
-                                                unsafe { std::str::from_utf8_unchecked(buf) };
-                                            state.registers[*dest] = Register::Value(Value::Text(
-                                                Text::new(text.to_string()),
-                                            ));
-                                        }
-                                    }
+                                    // SAFETY: We know the text is valid UTF-8 because we only accept valid UTF-8 and the serial type is TEXT.
+                                    // Use Cow::Borrowed to avoid copying data from the page buffer.
+                                    let text = unsafe { std::str::from_utf8_unchecked(buf) };
+                                    state.registers[*dest] =
+                                        Register::Value(Value::Text(Text::from_borrowed(text)));
                                 }
                                 _ => panic!("Invalid serial type: {serial_type}"),
                             }
@@ -1805,7 +1788,7 @@ pub fn op_column(
                                 Value::Blob(new_blob),
                                 Register::Value(Value::Blob(existing_blob)),
                             ) => {
-                                existing_blob.do_extend(new_blob);
+                                existing_blob.to_mut().extend_from_slice(new_blob.as_ref());
                             }
                             _ => {
                                 state.registers[*dest] = Register::Value(default.clone());
@@ -2836,7 +2819,7 @@ pub fn op_blob(
     mv_store: Option<&Arc<MvStore>>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Blob { value, dest }, insn);
-    state.registers[*dest] = Register::Value(Value::Blob(value.clone()));
+    state.registers[*dest] = Register::Value(Value::Blob(Cow::Owned(value.clone())));
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -3875,11 +3858,11 @@ pub fn op_agg_step(
             }
             #[cfg(feature = "json")]
             AggFunc::JsonGroupArray | AggFunc::JsonbGroupArray => {
-                Register::Aggregate(AggContext::GroupConcat(Value::Blob(vec![])))
+                Register::Aggregate(AggContext::GroupConcat(Value::Blob(Cow::Owned(vec![]))))
             }
             #[cfg(feature = "json")]
             AggFunc::JsonGroupObject | AggFunc::JsonbGroupObject => {
-                Register::Aggregate(AggContext::GroupConcat(Value::Blob(vec![])))
+                Register::Aggregate(AggContext::GroupConcat(Value::Blob(Cow::Owned(vec![]))))
             }
             AggFunc::External(func) => match func.as_ref() {
                 ExtFunc::Aggregate {
@@ -4105,7 +4088,8 @@ pub fn op_agg_step(
             let mut val_vec = convert_dbtype_to_raw_jsonb(value.get_value())?;
 
             match acc {
-                Value::Blob(vec) => {
+                Value::Blob(cow) => {
+                    let vec = cow.to_mut();
                     if vec.is_empty() {
                         // bits for obj header
                         vec.push(12);
@@ -4131,7 +4115,8 @@ pub fn op_agg_step(
 
             let mut data = convert_dbtype_to_raw_jsonb(col.get_value())?;
             match acc {
-                Value::Blob(vec) => {
+                Value::Blob(cow) => {
+                    let vec = cow.to_mut();
                     if vec.is_empty() {
                         vec.push(11);
                         vec.append(&mut data)

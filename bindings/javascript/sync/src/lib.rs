@@ -61,7 +61,7 @@ fn js_value_to_core(value: Either5<Null, i64, f64, String, Vec<u8>>) -> turso_co
         Either5::B(value) => turso_core::Value::Integer(value),
         Either5::C(value) => turso_core::Value::Float(value),
         Either5::D(value) => turso_core::Value::Text(turso_core::types::Text::new(value)),
-        Either5::E(value) => turso_core::Value::Blob(value),
+        Either5::E(value) => turso_core::Value::from_blob(value),
     }
 }
 fn core_value_to_js(value: turso_core::Value) -> Either5<Null, i64, f64, String, Vec<u8>> {
@@ -72,7 +72,9 @@ fn core_value_to_js(value: turso_core::Value) -> Either5<Null, i64, f64, String,
         turso_core::Value::Text(value) => {
             Either5::<Null, i64, f64, String, Vec<u8>>::D(value.as_str().to_string())
         }
-        turso_core::Value::Blob(value) => Either5::<Null, i64, f64, String, Vec<u8>>::E(value),
+        turso_core::Value::Blob(value) => {
+            Either5::<Null, i64, f64, String, Vec<u8>>::E(value.into_owned())
+        }
     }
 }
 fn core_values_map_to_js(

@@ -156,7 +156,7 @@ impl From<&Value> for Numeric {
             },
             Value::Text(text) => Numeric::from(text.as_str()),
             Value::Blob(blob) => {
-                let text = String::from_utf8_lossy(blob.as_slice());
+                let text = String::from_utf8_lossy(blob.as_ref());
                 Numeric::from(&text)
             }
         }
@@ -311,7 +311,7 @@ impl From<&Value> for NullableInteger {
             Value::Float(v) => Self::Integer(*v as i64),
             Value::Text(text) => Self::from(text.as_str()),
             Value::Blob(blob) => {
-                let text = String::from_utf8_lossy(blob.as_slice());
+                let text = String::from_utf8_lossy(blob.as_ref());
                 Self::from(text)
             }
         }

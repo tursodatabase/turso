@@ -83,7 +83,7 @@ impl BloomFilter {
                 self.inner.insert(&s.as_str().as_bytes());
             }
             Value::Blob(b) => {
-                self.inner.insert(&b.as_slice());
+                self.inner.insert(&b.as_ref());
             }
             Value::Null => {
                 // we do not insert NULLs into
@@ -98,7 +98,7 @@ impl BloomFilter {
             Value::Integer(i) => self.inner.contains(i),
             Value::Float(f) => self.inner.contains(&f.to_bits()),
             Value::Text(s) => self.inner.contains(&s.as_str().as_bytes()),
-            Value::Blob(b) => self.inner.contains(&b.as_slice()),
+            Value::Blob(b) => self.inner.contains(&b.as_ref()),
             Value::Null => false,
         }
     }

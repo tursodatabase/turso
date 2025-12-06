@@ -331,7 +331,7 @@ fn py_to_db_value(obj: Bound<PyAny>) -> PyResult<Value> {
     } else if let Ok(string) = obj.extract::<String>() {
         Ok(Value::Text(string.into()))
     } else if let Ok(bytes) = obj.cast::<PyBytes>() {
-        Ok(Value::Blob(bytes.as_bytes().to_vec()))
+        Ok(Value::from_blob(bytes.as_bytes().to_vec()))
     } else {
         Err(Error::new_err(
             "unexpected parameter value, only None, numbers, strings and bytes are supported"

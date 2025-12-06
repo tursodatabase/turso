@@ -2,6 +2,7 @@ use crate::{
     types::{AsValueRef, Value},
     ValueRef,
 };
+use std::borrow::Cow;
 
 use super::{
     convert_dbtype_to_jsonb, curry_convert_dbtype_to_jsonb, json_path_from_db_value,
@@ -114,7 +115,7 @@ where
         }
     }
 
-    Ok(Value::Blob(json.data()))
+    Ok(Value::Blob(Cow::Owned(json.data())))
 }
 
 pub fn json_replace<I, E, V>(args: I, json_cache: &JsonCacheCell) -> crate::Result<Value>

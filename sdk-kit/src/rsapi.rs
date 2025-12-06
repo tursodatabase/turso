@@ -139,7 +139,7 @@ pub fn value_from_c_value(value: capi::c::turso_value_t) -> Result<turso_core::V
         }
         capi::c::turso_type_t::TURSO_TYPE_BLOB => {
             let blob = bytes_from_turso_slice(unsafe { value.value.blob })?;
-            Ok(turso_core::Value::Blob(blob.to_vec()))
+            Ok(turso_core::Value::from_blob(blob.to_vec()))
         }
     }
 }

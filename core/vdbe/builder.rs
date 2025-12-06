@@ -1132,7 +1132,7 @@ impl ProgramBuilder {
                 },
                 ast::Literal::Null => Value::Null,
                 ast::Literal::String(s) => Value::Text(sanitize_string(s).into()),
-                ast::Literal::Blob(s) => Value::Blob(
+                ast::Literal::Blob(s) => Value::from_blob(
                     // Taken from `translate_expr`
                     s.as_bytes()
                         .chunks_exact(2)

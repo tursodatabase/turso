@@ -81,6 +81,16 @@ impl Text {
             subtype: TextSubtype::Text,
         }
     }
+
+    /// Create a Text from a borrowed &'static str.
+    /// SAFETY: The caller must ensure the string remains valid for 'static lifetime.
+    pub fn from_borrowed(value: &'static str) -> Self {
+        Self {
+            value: Cow::Borrowed(value),
+            subtype: TextSubtype::Text,
+        }
+    }
+
     #[cfg(feature = "json")]
     pub fn json(value: String) -> Self {
         Self {
@@ -231,6 +241,23 @@ where
     }
 }
 
+#[cfg(feature = "serde")]
+fn serialize_blob<S>(blob: &Cow<'static, [u8]>, serializer: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    serializer.serialize_bytes(blob.as_ref())
+}
+
+#[cfg(feature = "serde")]
+fn deserialize_blob<'de, D>(deserializer: D) -> Result<Cow<'static, [u8]>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let bytes: Vec<u8> = serde::Deserialize::deserialize(deserializer)?;
+    Ok(Cow::Owned(bytes))
+}
+
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Value {
@@ -246,7 +273,14 @@ pub enum Value {
     )]
     Float(f64),
     Text(Text),
-    Blob(Vec<u8>),
+    #[cfg_attr(
+        feature = "serde",
+        serde(
+            serialize_with = "serialize_blob",
+            deserialize_with = "deserialize_blob"
+        )
+    )]
+    Blob(Cow<'static, [u8]>),
 }
 
 #[derive(Clone, Copy)]
@@ -342,7 +376,7 @@ impl Value {
                 value: &v.value,
                 subtype: v.subtype,
             }),
-            Value::Blob(v) => ValueRef::Blob(v.as_slice()),
+            Value::Blob(v) => ValueRef::Blob(v.as_ref()),
         }
     }
 
@@ -353,13 +387,19 @@ impl Value {
 
     pub fn to_blob(&self) -> Option<&[u8]> {
         match self {
-            Self::Blob(blob) => Some(blob),
+            Self::Blob(blob) => Some(blob.as_ref()),
             _ => None,
         }
     }
 
     pub fn from_blob(data: Vec<u8>) -> Self {
-        Value::Blob(data)
+        Value::Blob(Cow::Owned(data))
+    }
+
+    /// Create a blob value from a borrowed byte slice.
+    /// SAFETY: The caller must ensure the slice remains valid for 'static lifetime.
+    pub unsafe fn from_blob_borrowed(data: &'static [u8]) -> Self {
+        Value::Blob(Cow::Borrowed(data))
     }
 
     pub fn to_text(&self) -> Option<&str> {
@@ -369,16 +409,16 @@ impl Value {
         }
     }
 
-    pub fn as_blob(&self) -> &Vec<u8> {
+    pub fn as_blob(&self) -> &[u8] {
         match self {
-            Value::Blob(b) => b,
+            Value::Blob(b) => b.as_ref(),
             _ => panic!("as_blob must be called only for Value::Blob"),
         }
     }
 
     pub fn as_blob_mut(&mut self) -> &mut Vec<u8> {
         match self {
-            Value::Blob(b) => b,
+            Value::Blob(b) => b.to_mut(),
             _ => panic!("as_blob must be called only for Value::Blob"),
         }
     }
@@ -521,7 +561,7 @@ impl Value {
                 let Some(blob) = v.to_blob() else {
                     return Ok(Value::Null);
                 };
-                Ok(Value::Blob(blob))
+                Ok(Value::Blob(Cow::Owned(blob)))
             }
             ExtValueType::Error => {
                 let Some(err) = v.to_error_details() else {
@@ -588,7 +628,7 @@ impl FromValue for Vec<u8> {
     fn from_sql(val: Value) -> Result<Self> {
         match val {
             Value::Null => Err(LimboError::NullValue),
-            Value::Blob(blob) => Ok(blob),
+            Value::Blob(blob) => Ok(blob.into_owned()),
             _ => unreachable!("invalid value type"),
         }
     }
@@ -599,7 +639,10 @@ impl<const N: usize> FromValue for [u8; N] {
     fn from_sql(val: Value) -> Result<Self> {
         match val {
             Value::Null => Err(LimboError::NullValue),
-            Value::Blob(blob) => blob.try_into().map_err(|_| LimboError::InvalidBlobSize(N)),
+            Value::Blob(blob) => blob
+                .into_owned()
+                .try_into()
+                .map_err(|_| LimboError::InvalidBlobSize(N)),
             _ => unreachable!("invalid value type"),
         }
     }
@@ -982,13 +1025,13 @@ impl<'a> AppendWriter<'a> {
 impl ImmutableRecord {
     pub fn new(payload_capacity: usize) -> Self {
         Self {
-            payload: Value::Blob(Vec::with_capacity(payload_capacity)),
+            payload: Value::Blob(Cow::Owned(Vec::with_capacity(payload_capacity))),
         }
     }
 
     pub fn from_bin_record(payload: Vec<u8>) -> Self {
         Self {
-            payload: Value::Blob(payload),
+            payload: Value::Blob(Cow::Owned(payload)),
         }
     }
 
@@ -1085,20 +1128,20 @@ impl ImmutableRecord {
 
         writer.assert_finish_capacity();
         Self {
-            payload: Value::Blob(buf),
+            payload: Value::Blob(Cow::Owned(buf)),
         }
     }
 
-    pub fn as_blob(&self) -> &Vec<u8> {
+    pub fn as_blob(&self) -> &[u8] {
         match &self.payload {
-            Value::Blob(b) => b,
+            Value::Blob(b) => b.as_ref(),
             _ => panic!("payload must be a blob"),
         }
     }
 
     pub fn as_blob_mut(&mut self) -> &mut Vec<u8> {
         match &mut self.payload {
-            Value::Blob(b) => b,
+            Value::Blob(b) => b.to_mut(),
             _ => panic!("payload must be a blob"),
         }
     }
@@ -1555,7 +1598,7 @@ impl<'a> ValueRef<'a> {
                 value: text.value.to_string().into(),
                 subtype: text.subtype,
             }),
-            ValueRef::Blob(b) => Value::Blob(b.to_vec()),
+            ValueRef::Blob(b) => Value::Blob(Cow::Owned(b.to_vec())),
         }
     }
 

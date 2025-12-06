@@ -61,7 +61,7 @@ impl Hash128 {
                     s.push_str("T:");
                     s.push_str(t.as_str());
                 }
-                Value::Blob(b) => {
+                Value::Blob(ref b) => {
                     s.push_str("B:");
                     s.push_str(&hex::encode(b));
                 }
@@ -99,13 +99,13 @@ impl Hash128 {
 
     /// Convert to a Value::Blob for storage
     pub fn to_value(self) -> Value {
-        Value::Blob(self.to_blob())
+        Value::from_blob(self.to_blob())
     }
 
     /// Try to extract a Hash128 from a Value
     pub fn from_value(value: &Value) -> Option<Self> {
         match value {
-            Value::Blob(b) => Self::from_blob(b),
+            Value::Blob(ref b) => Self::from_blob(b),
             _ => None,
         }
     }

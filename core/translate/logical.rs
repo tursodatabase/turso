@@ -1911,7 +1911,16 @@ impl<'a> LogicalPlanBuilder<'a> {
                 };
                 Ok(Value::Text(unquoted.to_string().into()))
             }
-            ast::Literal::Blob(b) => Ok(Value::Blob(b.clone().into())),
+            ast::Literal::Blob(b) => Ok(Value::from_blob(
+                b.as_bytes()
+                    .chunks_exact(2)
+                    .map(|pair| {
+                        let hex_byte =
+                            std::str::from_utf8(pair).expect("parser validated hex string");
+                        u8::from_str_radix(hex_byte, 16).expect("parser validated hex digit")
+                    })
+                    .collect(),
+            )),
             ast::Literal::CurrentDate
             | ast::Literal::CurrentTime
             | ast::Literal::CurrentTimestamp => Err(LimboError::ParseError(
