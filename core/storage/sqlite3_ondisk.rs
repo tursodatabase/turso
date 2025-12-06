@@ -241,7 +241,7 @@ impl From<Version> for RawVersion {
 impl std::fmt::Debug for RawVersion {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self.to_version() {
-            Ok(v) => write!(f, "{:?}", v),
+            Ok(v) => write!(f, "{v:?}"),
             Err(v) => write!(f, "RawVersion::Invalid({v})"),
         }
     }
