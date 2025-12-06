@@ -936,6 +936,7 @@ mod tests {
             root_page: 1,
             has_rowid: true,
             index_method: None,
+            is_primary_key: false,
         });
         available_indexes.insert("test_table".to_string(), VecDeque::from([index]));
 
@@ -1013,6 +1014,7 @@ mod tests {
             root_page: 1,
             has_rowid: true,
             index_method: None,
+            is_primary_key: false,
         });
         available_indexes.insert("table1".to_string(), VecDeque::from([index1]));
 
@@ -1138,6 +1140,7 @@ mod tests {
                     root_page: 1,
                     has_rowid: true,
                     index_method: None,
+                    is_primary_key: false,
                 });
                 available_indexes.insert(table_name.to_string(), VecDeque::from([index]));
             });
@@ -1158,6 +1161,7 @@ mod tests {
             root_page: 1,
             has_rowid: true,
             index_method: None,
+            is_primary_key: false,
         });
         let order_id_idx = Arc::new(Index {
             name: "order_items_order_id_idx".to_string(),
@@ -1176,6 +1180,7 @@ mod tests {
             root_page: 1,
             has_rowid: true,
             index_method: None,
+            is_primary_key: false,
         });
 
         available_indexes
@@ -1626,6 +1631,7 @@ mod tests {
             ephemeral: false,
             has_rowid: true,
             index_method: None,
+            is_primary_key: false,
         });
 
         let mut available_indexes = HashMap::new();
@@ -1732,6 +1738,7 @@ mod tests {
             ephemeral: false,
             has_rowid: true,
             index_method: None,
+            is_primary_key: false,
         });
         available_indexes.insert("t1".to_string(), VecDeque::from([index]));
 
@@ -1856,6 +1863,7 @@ mod tests {
             has_rowid: true,
             unique: false,
             index_method: None,
+            is_primary_key: false,
         });
         available_indexes.insert("t1".to_string(), VecDeque::from([index]));
 
