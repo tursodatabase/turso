@@ -5,6 +5,7 @@ use crate::io::PlatformIO;
 use crate::mvcc::clock::LocalClock;
 use crate::mvcc::cursor::MvccCursorType;
 use crate::storage::sqlite3_ondisk::DatabaseHeader;
+use crossbeam_utils::atomic::AtomicCell;
 use parking_lot::RwLock;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
@@ -1101,9 +1102,9 @@ fn test_snapshot_isolation_tx_visible1() {
     let current_tx = new_tx(4, 4, TransactionState::Preparing);
 
     let rv_visible = |begin: Option<TxTimestampOrID>, end: Option<TxTimestampOrID>| {
+        let bound = RowVersionBound { begin, end };
         let row_version = RowVersion {
-            begin,
-            end,
+            bound: AtomicCell::new(bound),
             row: generate_simple_string_row((-2).into(), 1, "testme"),
         };
         tracing::debug!("Testing visibility of {row_version:?}");

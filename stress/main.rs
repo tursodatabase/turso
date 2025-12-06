@@ -1,7 +1,7 @@
 mod opts;
 
-use anarchist_readable_name_generator_lib::readable_name_custom;
-use antithesis_sdk::random::{get_random, AntithesisRng};
+use anarchist_readable_name_generator_lib::readable_name;
+use antithesis_sdk::random::get_random;
 use antithesis_sdk::*;
 use clap::Parser;
 use core::panic;
@@ -66,7 +66,7 @@ pub struct ArbitrarySchema {
 
 // Helper functions for generating random data
 fn generate_random_identifier() -> String {
-    readable_name_custom("_", AntithesisRng).replace('-', "_")
+    readable_name().replace('-', "_")
 }
 
 fn generate_random_data_type() -> DataType {
