@@ -19,7 +19,6 @@ use crate::translate::insert::format_unique_violation_desc;
 use crate::translate::plan::{
     ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReferences,
 };
-use crate::translate::planner::ROWID_STRS;
 use crate::vdbe::builder::CursorKey;
 use crate::vdbe::insn::{CmpInsFlags, Cookie};
 use crate::vdbe::BranchOffset;
@@ -617,10 +616,9 @@ fn validate_index_expression(expr: &Expr, table: &BTreeTable) -> bool {
         }
         match e {
             Expr::Literal(_) | Expr::RowId { .. } => {}
-            // must be a column of the target table or ROWID
+            // must be a column of the target table
             Expr::Id(n) | Expr::Name(n) => {
-                let n = n.as_str();
-                if !ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(n)) && !has_col(n) {
+                if !has_col(n.as_str()) {
                     ok = false;
                 }
             }
