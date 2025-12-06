@@ -5296,19 +5296,23 @@ pub fn op_function(
             }
             ScalarFunc::UnixEpoch => {
                 if *start_reg == 0 {
-                    let result = exec_unixepoch(&Value::build_text("now"))?;
+                    // Case: No args. Pass ["now"] as a slice.
+                    let now_val = Value::build_text("now");
+                    let args = [&now_val]; // Slice of 1 item
+                    let result = exec_unixepoch(&args);
                     state.registers[*dest] = Register::Value(result);
                 } else {
+                    // Case: Args provided.
                     let datetime_value = &state.registers[*start_reg];
-                    let unixepoch = exec_unixepoch(datetime_value.get_value());
-                    match unixepoch {
-                        Ok(time) => state.registers[*dest] = Register::Value(time),
-                        Err(e) => {
-                            return Err(LimboError::ParseError(format!(
-                                "Error encountered while parsing datetime value: {e}"
-                            )));
-                        }
-                    }
+                    let val = datetime_value.get_value();
+
+                    // Wrap the single reference in a slice to satisfy the Iterator trait
+                    let args = std::slice::from_ref(val);
+
+                    // Call function directly (It returns Value, not Result)
+                    let result = exec_unixepoch(args);
+
+                    state.registers[*dest] = Register::Value(result);
                 }
             }
             ScalarFunc::TursoVersion => {
