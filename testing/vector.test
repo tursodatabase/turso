@@ -54,3 +54,31 @@ do_execsql_test_in_memory_error_content vector-insert-double-quotes {
     INSERT INTO vector_test (id, format, vec_data)
 		VALUES (2, 'Bracketed_comma_separated', vector("[4.000000,5.000000,6.000000]"));
 } {no such column: [4.000000,5.000000,6.000000]}
+
+do_execsql_test vector-distance-dot {
+  SELECT vector_distance_dot(vector('[1, 2]'), vector('[3, 4]'));
+  SELECT vector_distance_dot(vector('[1, 0]'), vector('[0, 1]'));
+  SELECT vector_distance_dot(vector('[1, 1]'), vector('[-1, -1]'));
+  SELECT vector_distance_dot(vector('[0.5, 0.5]'), vector('[4.0, 4.0]'));
+} {
+  -11.0
+  0.0
+  2.0
+  -4.0
+}
+
+do_execsql_test_on_specific_db {:memory:} vector-distance-dot-table {
+    CREATE TABLE dot_test (
+        id INTEGER PRIMARY KEY, 
+        vec F32_BLOB(2)
+    );
+    INSERT INTO dot_test (id, vec) VALUES (1, vector('[1, 1]'));
+    INSERT INTO dot_test (id, vec) VALUES (2, vector('[2, 2]'));
+
+    SELECT vector_distance_dot(vec, vector('[1, 1]')) as dist 
+    FROM dot_test 
+    ORDER BY dist ASC;
+} {
+  -4.0
+  -2.0
+}
