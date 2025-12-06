@@ -690,12 +690,18 @@ impl Database {
 
         let wal = Arc::new(WalFile::new(
             self.io.clone(),
-            self.shared_wal.clone(),
+            Arc::clone(&shared_wal),
             pager.buffer_pool.clone(),
         ));
 
         self.shared_wal = shared_wal;
         pager.set_wal(wal);
+
+        // Clear page cache after attaching WAL since pages may have been cached
+        // from disk reads before WAL was attached. The WAL may contain newer
+        // versions of these pages (e.g., page 1 with updated schema_cookie).
+        pager.clear_page_cache(false);
+        pager.set_schema_cookie(None);
 
         if self.mvcc_enabled() {
             let file =
