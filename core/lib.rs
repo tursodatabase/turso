@@ -725,7 +725,7 @@ impl Database {
         // Clear page cache after attaching WAL since pages may have been cached
         // from disk reads before WAL was attached. The WAL may contain newer
         // versions of these pages (e.g., page 1 with updated schema_cookie).
-        pager.clear_page_cache(false);
+        pager.clear_page_cache(true);
         pager.set_schema_cookie(None);
 
         if open_mv_store {

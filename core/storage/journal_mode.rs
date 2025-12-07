@@ -1,11 +1,13 @@
 use std::sync::Arc;
 
+use crate::storage::sqlite3_ondisk::DatabaseHeader;
+use crate::storage::wal::CheckpointMode;
 use crate::util::IOExt;
 use crate::vdbe::execute::with_header_mut;
 use crate::vdbe::Program;
 use crate::{mvcc, LimboError, MvStore, OpenFlags, Result, IO};
 use crate::{
-    storage::sqlite3_ondisk::{RawVersion, Version},
+    storage::sqlite3_ondisk::{begin_write_btree_page, RawVersion, Version},
     Pager,
 };
 
@@ -70,7 +72,6 @@ pub fn change_mode(
     db_path: impl AsRef<std::path::Path>,
     program: &Program,
     pager: &Pager,
-    mv_store: Option<&Arc<MvStore>>,
     prev_mode: JournalMode,
     new_mode: JournalMode,
 ) -> Result<JournalMode> {
@@ -92,12 +93,6 @@ pub fn change_mode(
                 "MVCC is not enabled. Enable it with `--experimental-mvcc` flag in the CLI or by setting the MVCC option in `DatabaseOpts`".to_string(),
             ));
         }
-        // if wal_exists(db_path.with_extension("db-wal")) {
-        //     return Err(LimboError::InvalidArgument(format!(
-        //             "WAL file exists for database {}, but we want to enable MVCC mode. This is currently not supported. Open the database in non-MVCC mode and run PRAGMA wal_checkpoint(TRUNCATE) to truncate the WAL.",
-        //             db_path.display()
-        //         )));
-        // }
     }
 
     if matches!(new_mode, JournalMode::Wal) && logical_log_exists(db_path) {
@@ -107,22 +102,44 @@ pub fn change_mode(
                 )));
     }
 
+    // Checkpoint the WAL or MVCC
+    program.connection.checkpoint(CheckpointMode::Truncate {
+        upper_bound_inclusive: None,
+    })?;
+
     let new_version = new_mode
         .as_version()
         .expect("Should be a supported Journal Mode");
     let raw_version = RawVersion::from(new_version);
 
     pager.io.block(|| {
-        with_header_mut(pager, mv_store, program, |header| {
-            header.read_version = raw_version;
-            header.write_version = raw_version;
-        })
+        with_header_mut(
+            pager,
+            program.connection.mv_store().as_ref(),
+            program,
+            |header| {
+                header.read_version = raw_version;
+                header.write_version = raw_version;
+            },
+        )
     })?;
+
+    let (page, c) = pager.read_page(DatabaseHeader::PAGE_ID as i64)?;
+    if let Some(c) = c {
+        pager.io.wait_for_completion(c)?;
+    }
+
+    // Flush it to Disk
+    let completion = begin_write_btree_page(&pager, &page)?;
+    pager.io.wait_for_completion(completion)?;
+
+    pager.clear_page_cache(true);
 
     if matches!(new_mode, JournalMode::ExperimentalMvcc) {
         let mv_store = open_mv_store(pager.io.as_ref(), db_path)?;
         program.connection.db.mv_store.store(Some(mv_store.clone()));
-        // mv_store.bootstrap(bootstrap_conn)
+        program.connection.demote_to_mvcc_connection();
+        mv_store.bootstrap(program.connection.clone())?;
     }
 
     Ok(new_mode)
