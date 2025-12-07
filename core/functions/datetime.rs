@@ -162,25 +162,22 @@ where
 
     for modifier in mods {
         if let ValueRef::Text(ref text_rc) = modifier.as_value_ref() {
-            // We must determine if 'unixepoch' or 'auto' rescues a previously invalid date.
             if is_first_modifier && initial_numeric.is_some() {
                 let m = parse_modifier(text_rc.as_str());
                 if matches!(m, Ok(Modifier::UnixEpoch)) {
-                    // UnixEpoch always rescues the date (interprets as seconds)
                     is_valid = true;
                 } else if matches!(m, Ok(Modifier::Auto)) {
-                    // Auto rescues the date ONLY if it decides it's a Unix Timestamp.
                     if let Some(val) = initial_numeric {
-                        if val >= 0.0 && val <= 5373484.499999 {
-                            // It is a valid Julian Day.
-                            // If is_valid was false (parse failed), it stays false.
-                        } else {
-                            // It falls through to Unix Timestamp.
-                            // This "rescues" the date.
+                        if !is_julian_day_value(val) {
                             is_valid = true;
                         }
                     }
                 }
+            }
+
+            let parsed = parse_modifier(text_rc.as_str());
+            if !matches!(parsed, Ok(Modifier::Floor) | Ok(Modifier::Ceiling)) {
+                n_floor = 0;
             }
 
             match apply_modifier(
@@ -195,10 +192,7 @@ where
                 Err(_) => return Value::Null,
             }
 
-            if matches!(
-                parse_modifier(text_rc.as_str()),
-                Ok(Modifier::Floor) | Ok(Modifier::Ceiling)
-            ) {
+            if matches!(parsed, Ok(Modifier::Floor) | Ok(Modifier::Ceiling)) {
                 n_floor = 0;
             }
             is_first_modifier = false;
@@ -237,17 +231,18 @@ fn format_dt(dt: NaiveDateTime, output_type: DateTimeOutput, subsec: bool) -> Va
             };
             Value::from_text(t)
         }
-        DateTimeOutput::StrfTime(format_str) => Value::from_text(strftime_format(&dt, &format_str)),
+        DateTimeOutput::StrfTime(format_str) => match strftime_format(&dt, &format_str) {
+            Some(s) => Value::from_text(s),
+            None => Value::Null,
+        },
         DateTimeOutput::JuliaDay => Value::Float(to_julian_day_exact(&dt)),
         DateTimeOutput::UnixEpoch => {
             if subsec {
-                // Return Float (seconds + nanoseconds)
                 let seconds = dt.and_utc().timestamp() as f64;
                 let nanos = dt.nanosecond() as f64;
                 let val = seconds + (nanos / 1_000_000_000.0);
                 Value::Float(val)
             } else {
-                // Return Integer (truncate nanoseconds)
                 let seconds = dt.and_utc().timestamp();
                 Value::Integer(seconds)
             }
@@ -257,26 +252,63 @@ fn format_dt(dt: NaiveDateTime, output_type: DateTimeOutput, subsec: bool) -> Va
 
 // Not as fast as if the formatting was native to chrono, but a good enough
 // for now, just to have the feature implemented
-fn strftime_format(dt: &NaiveDateTime, format_str: &str) -> String {
+fn strftime_format(dt: &NaiveDateTime, format_str: &str) -> Option<String> {
     use crate::functions::strftime::CustomStrftimeItems;
     use std::fmt::Write;
-    // Necessary to remove %f and %J that are exclusive formatters to sqlite
-    // Chrono does not support them, so it is necessary to replace the modifiers manually
 
-    // Sqlite uses 9 decimal places for julianday in strftime
-    let copy_format = format_str
-        .to_string()
-        .replace("%J", &format!("{:.9}", to_julian_day_exact(dt)));
+    // 1. Validation Loop
+    let mut chars = format_str.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            match chars.next() {
+                Some(spec) => match spec {
+                    'd' | 'e' | 'f' | 'F' | 'G' | 'g' | 'H' | 'I' | 'j' | 'J' | 'k' | 'l' | 'm'
+                    | 'M' | 'p' | 'P' | 'R' | 's' | 'S' | 'T' | 'u' | 'U' | 'V' | 'w' | 'W'
+                    | 'Y' | '%' => continue,
+                    _ => return None,
+                },
+                None => return None,
+            }
+        }
+    }
+
+    // 2. Handle %J Formatting (Strip trailing zeros)
+    let jd = to_julian_day_exact(dt);
+    let jd_str = format!("{:.9}", jd);
+    // Remove trailing zeros/decimal if present, to match typical SQLite CLI output
+    let jd_str_clean = if jd_str.contains('.') {
+        let trimmed = jd_str.trim_end_matches('0');
+        if trimmed.ends_with('.') {
+            &trimmed[..trimmed.len() - 1] // remove trailing '.'
+        } else {
+            trimmed
+        }
+    } else {
+        &jd_str
+    };
+
+    let mut copy_format = format_str.replace("%J", jd_str_clean);
+
+    // 3. Handle %f Formatting (Rounding)
+    if copy_format.contains("%f") {
+        let nanos = dt.nanosecond();
+        let mut ms = (nanos + 500_000) / 1_000_000;
+        let mut s_dt = *dt;
+
+        if ms >= 1000 {
+            s_dt += TimeDelta::seconds(1);
+            ms = 0;
+        }
+        let replacement = format!("{:02}.{:03}", s_dt.second(), ms);
+        copy_format = copy_format.replace("%f", &replacement);
+    }
 
     let items = CustomStrftimeItems::new(&copy_format);
-
-    // The write! macro is used here as chrono's format can panic if the formatting string contains
-    // unknown specifiers. By using a writer, we can catch the panic and handle the error
     let mut formatted = String::new();
+
     match write!(formatted, "{}", dt.format_with_items(items)) {
-        Ok(_) => formatted,
-        // On sqlite when the formatting fails nothing is printed
-        Err(_) => "".to_string(),
+        Ok(_) => Some(formatted),
+        Err(_) => None,
     }
 }
 
@@ -291,7 +323,6 @@ fn apply_modifier(
 
     match parsed_modifier {
         Modifier::Days(days) => {
-            // Convert days to nanoseconds to handle partial days (e.g., 1.5 days)
             let nanos = (days * 86_400_000_000_000.0) as i64;
             *dt += TimeDelta::nanoseconds(nanos);
         }
@@ -304,7 +335,6 @@ fn apply_modifier(
             *dt += TimeDelta::nanoseconds(nanos);
         }
         Modifier::Seconds(seconds) => {
-            // Split into whole seconds and remaining nanoseconds for safety
             let s = seconds as i64;
             let ns = ((seconds - s as f64) * 1_000_000_000.0) as i64;
             *dt += TimeDelta::seconds(s) + TimeDelta::nanoseconds(ns);
@@ -317,15 +347,6 @@ fn apply_modifier(
         Modifier::Years(y) => {
             add_years_and_months(dt, y, 0, n_floor)?;
         }
-        Modifier::TimeOffset(offset) => *dt += offset,
-        Modifier::DateOffset {
-            years,
-            months,
-            days,
-        } => {
-            add_years_and_months(dt, years, months, n_floor)?;
-            *dt += TimeDelta::days(days as i64);
-        }
         Modifier::DateTimeOffset {
             years,
             months,
@@ -337,6 +358,15 @@ fn apply_modifier(
             *dt += TimeDelta::days(days as i64);
             *dt += TimeDelta::seconds(seconds.into());
             *dt += TimeDelta::nanoseconds(nanos);
+        }
+        Modifier::TimeOffset(offset) => *dt += offset,
+        Modifier::DateOffset {
+            years,
+            months,
+            days,
+        } => {
+            add_years_and_months(dt, years, months, n_floor)?;
+            *dt += TimeDelta::days(days as i64);
         }
         Modifier::Floor => {
             if *n_floor > 0 {
@@ -363,8 +393,7 @@ fn apply_modifier(
         }
         Modifier::Weekday(day) => {
             let current_day = dt.weekday().num_days_from_sunday();
-            let target_day = day;
-            let days_to_add = (target_day + 7 - current_day) % 7;
+            let days_to_add = (day + 7 - current_day) % 7;
             *dt += TimeDelta::days(days_to_add as i64);
         }
         Modifier::UnixEpoch => {
@@ -386,19 +415,26 @@ fn apply_modifier(
             }
         }
         Modifier::JulianDay => {
-            if is_first_modifier && initial_numeric.is_none() {
-                return Err(InvalidModifier(
-                    "julianday modifier requires numeric input".into(),
-                ));
+            if !is_first_modifier {
+                return Err(InvalidModifier("julianday must be first".into()));
+            }
+            if let Some(val) = initial_numeric {
+                if let Ok(new_dt) = julian_day_to_datetime(val) {
+                    *dt = new_dt;
+                }
+            } else {
+                return Err(InvalidModifier("julianday requires numeric".into()));
             }
         }
         Modifier::Auto => {
             if is_first_modifier {
                 if let Some(val) = initial_numeric {
-                    if val >= 0.0 && val <= 5373484.499999 {
-                        // Valid JD range. Do nothing.
+                    if is_julian_day_value(val) {
+                        if let Ok(new_dt) = julian_day_to_datetime(val) {
+                            *dt = new_dt;
+                        }
                     } else {
-                        // Unix Timestamp range.
+                        // Unix Timestamp
                         let secs = val as i64;
                         let nanos = ((val - secs as f64) * 1_000_000_000.0) as u32;
                         if let Some(new_dt) = DateTime::from_timestamp(secs, nanos) {
@@ -420,7 +456,6 @@ fn apply_modifier(
             *dt = local_dt.with_timezone(&Utc).naive_utc();
         }
         Modifier::Subsec => {
-            *dt = dt.with_nanosecond(dt.nanosecond()).unwrap();
             return Ok(true);
         }
     }
@@ -586,13 +621,6 @@ where
     exec_datetime(values, DateTimeOutput::UnixEpoch)
 }
 
-fn get_unixepoch_from_naive_datetime(value: NaiveDateTime) -> i64 {
-    if is_leap_second(&value) {
-        return 0;
-    }
-    value.and_utc().timestamp()
-}
-
 fn parse_naive_date_time(time_value: impl AsValueRef) -> Option<NaiveDateTime> {
     let time_value = time_value.as_value_ref();
     match time_value {
@@ -642,17 +670,26 @@ fn get_date_time_from_time_value_string(value: &str) -> Option<NaiveDateTime> {
     }
 
     for format in &datetime_formats {
-        if let Some(dt) = if format.starts_with("%H") {
-            // For time-only formats, assume date 2000-01-01
-            // Ref: https://sqlite.org/lang_datefunc.html#tmval
+        let dt_found = if format.starts_with("%H") {
             parse_datetime_with_optional_tz(
                 &format!("2000-01-01 {value}"),
                 &format!("%Y-%m-%d {format}"),
             )
         } else {
             parse_datetime_with_optional_tz(value, format)
-        } {
-            return Some(dt);
+        };
+
+        if let Some(dt) = dt_found {
+            // ROUNDING logic
+            let nanos = dt.nanosecond();
+            let ms = (nanos + 500_000) / 1_000_000;
+
+            if ms >= 1000 {
+                // CLAMP logic: Prevent rollover
+                return Some(dt.with_nanosecond(999_000_000).unwrap());
+            } else {
+                return Some(dt.with_nanosecond(ms * 1_000_000).unwrap());
+            }
         }
     }
     None
@@ -764,10 +801,10 @@ fn get_max_datetime_exclusive() -> NaiveDateTime {
 #[allow(dead_code)]
 #[derive(Debug, PartialEq)]
 enum Modifier {
-    Days(f64),    // Changed to f64
-    Hours(f64),   // Changed to f64
-    Minutes(f64), // Changed to f64
-    Seconds(f64), // Changed to f64
+    Days(f64),
+    Hours(f64),
+    Minutes(f64),
+    Seconds(f64),
     Months(i32),
     Years(i32),
     TimeOffset(TimeDelta),
@@ -803,16 +840,16 @@ fn parse_modifier_number(s: &str) -> Result<i64> {
         .map_err(|_| InvalidModifier(format!("Invalid number: {s}")))
 }
 
-fn parse_modifier_float(s: &str) -> Result<f64> {
-    s.trim()
-        .parse::<f64>()
-        .map_err(|_| InvalidModifier(format!("Invalid number: {s}")))
+fn round_to_ms(val: f64) -> f64 {
+    (val * 1000.0).round() / 1000.0
 }
 
-/// supports YYYY-MM-DD format for time shift modifiers
-fn parse_modifier_date(s: &str) -> Result<NaiveDate> {
-    NaiveDate::parse_from_str(s, "%Y-%m-%d")
-        .map_err(|_| InvalidModifier("Invalid date format".to_string()))
+fn parse_modifier_float(s: &str) -> Result<f64> {
+    let val = s
+        .trim()
+        .parse::<f64>()
+        .map_err(|_| InvalidModifier(format!("Invalid number: {s}")))?;
+    Ok(round_to_ms(val))
 }
 
 /// supports following formats for time shift modifiers
@@ -830,17 +867,8 @@ fn parse_modifier_time(s: &str) -> Result<NaiveTime> {
 }
 
 fn parse_modifier(modifier: &str) -> Result<Modifier> {
-    // Small helpers to check string suffix/prefix in a case-insensitive way with no allocation
-    fn ends_with_ignore_ascii_case(s: &str, suffix: &str) -> bool {
-        s.len() >= suffix.len() && s[s.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
-    }
-    fn starts_with_ignore_ascii_case(s: &str, prefix: &str) -> bool {
-        s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix)
-    }
-
     let modifier = modifier.trim();
 
-    // We intentionally avoid usage of match_ignore_ascii_case! macro here because it lead to enormous amount of LLVM code which signifnicantly increase compilation time (see https://github.com/tursodatabase/turso/pull/3929)
     // Fast path for exact matches
     if modifier.eq_ignore_ascii_case("ceiling") {
         return Ok(Modifier::Ceiling);
@@ -868,123 +896,107 @@ fn parse_modifier(modifier: &str) -> Result<Modifier> {
     }
 
     // Patterns
-    if starts_with_ignore_ascii_case(modifier, "weekday ") {
-        let s = &modifier[8..];
-        let day = parse_modifier_number(s)?;
-        if !(0..=6).contains(&day) {
-            Err(InvalidModifier(
-                "Weekday must be between 0 and 6".to_string(),
-            ))
-        } else {
-            Ok(Modifier::Weekday(day as u32))
-        }
-    } else if starts_with_ignore_ascii_case(modifier, "weekday ") {
-        let s = &modifier[8..];
-        let day = parse_modifier_number(s)?;
+    if let Some(rest) = strip_prefix_ignore_case(modifier, "weekday ") {
+        let day = parse_modifier_number(rest)?;
         if !(0..=6).contains(&day) {
             return Err(InvalidModifier(
                 "Weekday must be between 0 and 6".to_string(),
             ));
         }
-        Ok(Modifier::Weekday(day as u32))
-    } else if ends_with_ignore_ascii_case(modifier, " day") {
-        Ok(Modifier::Days(parse_modifier_float(
-            &modifier[..modifier.len() - 4],
-        )?))
-    } else if ends_with_ignore_ascii_case(modifier, " days") {
-        Ok(Modifier::Days(parse_modifier_float(
-            &modifier[..modifier.len() - 5],
-        )?))
-    } else if ends_with_ignore_ascii_case(modifier, " hour") {
-        Ok(Modifier::Hours(parse_modifier_float(
-            &modifier[..modifier.len() - 5],
-        )?))
-    } else if ends_with_ignore_ascii_case(modifier, " hours") {
-        Ok(Modifier::Hours(parse_modifier_float(
-            &modifier[..modifier.len() - 6],
-        )?))
-    } else if ends_with_ignore_ascii_case(modifier, " minute") {
-        Ok(Modifier::Minutes(parse_modifier_float(
-            &modifier[..modifier.len() - 7],
-        )?))
-    } else if ends_with_ignore_ascii_case(modifier, " minutes") {
-        Ok(Modifier::Minutes(parse_modifier_float(
-            &modifier[..modifier.len() - 8],
-        )?))
-    } else if ends_with_ignore_ascii_case(modifier, " second") {
-        Ok(Modifier::Seconds(parse_modifier_float(
-            &modifier[..modifier.len() - 7],
-        )?))
-    } else if ends_with_ignore_ascii_case(modifier, " seconds") {
-        Ok(Modifier::Seconds(parse_modifier_float(
-            &modifier[..modifier.len() - 8],
-        )?))
-    } else if ends_with_ignore_ascii_case(modifier, " month") {
-        Ok(Modifier::Months(
-            parse_modifier_number(&modifier[..modifier.len() - 6])? as i32,
-        ))
-    } else if ends_with_ignore_ascii_case(modifier, " months") {
-        Ok(Modifier::Months(
-            parse_modifier_number(&modifier[..modifier.len() - 7])? as i32,
-        ))
-    } else if ends_with_ignore_ascii_case(modifier, " year") {
-        Ok(Modifier::Years(
-            parse_modifier_number(&modifier[..modifier.len() - 5])? as i32,
-        ))
-    } else if ends_with_ignore_ascii_case(modifier, " years") {
-        Ok(Modifier::Years(
-            parse_modifier_number(&modifier[..modifier.len() - 6])? as i32,
-        ))
-    } else if starts_with_ignore_ascii_case(modifier, "+")
-        || starts_with_ignore_ascii_case(modifier, "-")
-    {
-        let sign = if starts_with_ignore_ascii_case(modifier, "-") {
-            -1
-        } else {
-            1
-        };
+        return Ok(Modifier::Weekday(day as u32));
+    }
+
+    if let Some(rest) = strip_suffix_ignore_case(modifier, " second") {
+        return Ok(Modifier::Seconds(parse_modifier_float(rest)?));
+    }
+    if let Some(rest) = strip_suffix_ignore_case(modifier, " seconds") {
+        return Ok(Modifier::Seconds(parse_modifier_float(rest)?));
+    }
+
+    // Minutes (Float)
+    if let Some(rest) = strip_suffix_ignore_case(modifier, " minute") {
+        return Ok(Modifier::Minutes(parse_modifier_float(rest)?));
+    }
+    if let Some(rest) = strip_suffix_ignore_case(modifier, " minutes") {
+        return Ok(Modifier::Minutes(parse_modifier_float(rest)?));
+    }
+
+    // Hours (Float)
+    if let Some(rest) = strip_suffix_ignore_case(modifier, " hour") {
+        return Ok(Modifier::Hours(parse_modifier_float(rest)?));
+    }
+    if let Some(rest) = strip_suffix_ignore_case(modifier, " hours") {
+        return Ok(Modifier::Hours(parse_modifier_float(rest)?));
+    }
+
+    // Days (Float)
+    if let Some(rest) = strip_suffix_ignore_case(modifier, " day") {
+        return Ok(Modifier::Days(parse_modifier_float(rest)?));
+    }
+    if let Some(rest) = strip_suffix_ignore_case(modifier, " days") {
+        return Ok(Modifier::Days(parse_modifier_float(rest)?));
+    }
+
+    // Months (Int)
+    if let Some(rest) = strip_suffix_ignore_case(modifier, " month") {
+        return Ok(Modifier::Months(parse_modifier_number(rest)? as i32));
+    }
+    if let Some(rest) = strip_suffix_ignore_case(modifier, " months") {
+        return Ok(Modifier::Months(parse_modifier_number(rest)? as i32));
+    }
+
+    // Years (Int)
+    if let Some(rest) = strip_suffix_ignore_case(modifier, " year") {
+        return Ok(Modifier::Years(parse_modifier_number(rest)? as i32));
+    }
+    if let Some(rest) = strip_suffix_ignore_case(modifier, " years") {
+        return Ok(Modifier::Years(parse_modifier_number(rest)? as i32));
+    }
+
+    // --- +/- Modifiers (Time Shifts) ---
+    if modifier.starts_with('+') || modifier.starts_with('-') {
+        let sign = if modifier.starts_with('-') { -1 } else { 1 };
         let rest = &modifier[1..];
-        let parts: Vec<&str> = rest.split(' ').collect();
-        let digits_in_date = 10;
+        let parts: Vec<&str> = rest.split_whitespace().collect();
+
         match parts.len() {
             1 => {
-                if parts[0].len() == digits_in_date && parts[0].contains('-') {
-                    // Date Only
-                    let (y, m, d) = parse_offset_ymd(parts[0])?;
+                // Could be Date Only (YYYY-MM-DD) OR Time Only (HH:MM:SS)
+                // A date modifier in ISO8601 must contain at least 2 hyphens (YYYY-MM-DD)
+                if parts[0].contains('-') {
+                    // Date Only: +/-YYYY-MM-DD
+                    let (y, mo, d) = parse_offset_ymd(parts[0])?;
                     Ok(Modifier::DateOffset {
                         years: sign * y,
-                        months: sign * m,
+                        months: sign * mo,
                         days: sign * d,
                     })
                 } else {
-                    // Time Only: 12:34:56.789
+                    // Time Only: +/-HH:MM:SS.SSS
                     let time = parse_modifier_time(parts[0])?;
 
-                    // Total seconds
                     let time_delta_sec = sign as i64 * time.num_seconds_from_midnight() as i64;
-                    // Total nanoseconds (fractional part)
                     let time_delta_nano = sign as i64 * time.nanosecond() as i64;
 
-                    // Construct TimeDelta from seconds + nanos
                     let delta = TimeDelta::seconds(time_delta_sec)
                         + TimeDelta::nanoseconds(time_delta_nano);
                     Ok(Modifier::TimeOffset(delta))
                 }
             }
             2 => {
-                // Case 13: +/-YYYY-MM-DD HH:MM:SS.SSS
-                let (y, m, d) = parse_offset_ymd(parts[0])?;
+                // Date AND Time: +/-YYYY-MM-DD HH:MM:SS.SSS
+                let (y, mo, d) = parse_offset_ymd(parts[0])?;
                 let time = parse_modifier_time(parts[1])?;
 
-                let time_delta_sec = sign * (time.num_seconds_from_midnight() as i32);
-                let time_delta_nano = sign as i64 * time.nanosecond() as i64;
+                let sec = sign * time.num_seconds_from_midnight() as i32;
+                let nano = sign as i64 * time.nanosecond() as i64;
 
                 Ok(Modifier::DateTimeOffset {
                     years: sign * y,
-                    months: sign * m,
+                    months: sign * mo,
                     days: sign * d,
-                    seconds: time_delta_sec,
-                    nanos: time_delta_nano,
+                    seconds: sec,
+                    nanos: nano,
                 })
             }
             _ => Err(InvalidModifier(
@@ -992,14 +1004,27 @@ fn parse_modifier(modifier: &str) -> Result<Modifier> {
             )),
         }
     } else {
-        Err(InvalidModifier(
-            "Invalid date/time offset format".to_string(),
-        ))
+        Err(InvalidModifier("Unknown modifier".to_string()))
     }
 }
 
-// Parses "YYYY-MM-DD" into integers without validating calendar correctness.
-// This allows offsets like "0000-01-00" (1 month, 0 days) which NaiveDate would reject.
+fn strip_suffix_ignore_case<'a>(s: &'a str, suffix: &str) -> Option<&'a str> {
+    if s.len() >= suffix.len() && s[s.len() - suffix.len()..].eq_ignore_ascii_case(suffix) {
+        Some(&s[..s.len() - suffix.len()])
+    } else {
+        None
+    }
+}
+
+fn strip_prefix_ignore_case<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
+    if s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix) {
+        Some(&s[prefix.len()..])
+    } else {
+        None
+    }
+}
+
+// Custom parser for YYYY-MM-DD that ignores calendar validity (allows 0000-00-00)
 fn parse_offset_ymd(s: &str) -> Result<(i32, i32, i32)> {
     let parts: Vec<&str> = s.split('-').collect();
     if parts.len() != 3 {
@@ -1038,80 +1063,56 @@ where
 }
 
 fn compute_timediff(d1: NaiveDateTime, d2: NaiveDateTime) -> Value {
-    let sign;
-    let (start, end);
-
-    // SQLite timediff(A, B) calculates the time to add to B to get A.
-    // If A < B, the result is negative.
-    if d1 < d2 {
-        sign = "-";
-        start = d1;
-        end = d2;
+    let (start, end, sign) = if d1 < d2 {
+        (d1, d2, "-")
     } else {
-        sign = "+";
-        start = d2;
-        end = d1;
-    }
+        (d2, d1, "+")
+    };
 
-    // We calculate the difference components: Y, M, D, H, M, S, MS
-    // We always subtract start from end (end - start) because we ensured end >= start above.
     let mut y = end.year() - start.year();
     let mut m = end.month() as i32 - start.month() as i32;
     let mut d = end.day() as i32 - start.day() as i32;
 
-    // Time difference in milliseconds
-    let end_ms =
-        end.num_seconds_from_midnight() as i64 * 1000 + (end.nanosecond() / 1_000_000) as i64;
-    let start_ms =
-        start.num_seconds_from_midnight() as i64 * 1000 + (start.nanosecond() / 1_000_000) as i64;
+    // Use Nanoseconds for precision
+    let start_ns =
+        start.num_seconds_from_midnight() as i64 * 1_000_000_000 + start.nanosecond() as i64;
+    let end_ns = end.num_seconds_from_midnight() as i64 * 1_000_000_000 + end.nanosecond() as i64;
 
-    let mut ms_diff = end_ms - start_ms;
+    let mut ns_diff = end_ns - start_ns;
 
-    // Normalize Time
-    if ms_diff < 0 {
-        // Borrow a day
+    if ns_diff < 0 {
         d -= 1;
-        ms_diff += 86400 * 1000;
+        ns_diff += 86_400_000_000_000; // 24 * 60 * 60 * 1e9
     }
 
-    // Normalize Date
-    // If days are negative, borrow from months
     if d < 0 {
         m -= 1;
-        // To know how many days to add, we look at the "previous" month relative to the End date.
-        // Example: March 5 minus Feb 25. D = 5 - 25 = -20. M = 1.
-        // We borrow from March. We need to add the days in February (the month before March).
         let mut prev_month = end.month() as i32 - 1;
-        let mut prev_month_year = end.year();
+        let mut prev_year = end.year();
         if prev_month < 1 {
             prev_month = 12;
-            prev_month_year -= 1;
+            prev_year -= 1;
         }
-
-        let days_in_prev_month = last_day_in_month(prev_month_year, prev_month as u32);
-        d += days_in_prev_month as i32;
+        d += last_day_in_month(prev_year, prev_month as u32) as i32;
     }
 
-    // If months are negative, borrow from years
     if m < 0 {
         y -= 1;
         m += 12;
     }
 
-    // Break down total milliseconds back into H:M:S.ms
-    let total_seconds = ms_diff / 1000;
-    let final_ms = ms_diff % 1000;
-    let final_h = total_seconds / 3600;
-    let final_m = (total_seconds % 3600) / 60;
-    let final_s = total_seconds % 60;
+    let total_sec = ns_diff / 1_000_000_000;
+    let nanos = ns_diff % 1_000_000_000;
+    let millis = nanos / 1_000_000;
 
-    // SQLite format: (+|-)YYYY-MM-DD HH:MM:SS.SSS
-    let result = format!(
+    let hh = total_sec / 3600;
+    let mm = (total_sec % 3600) / 60;
+    let ss = total_sec % 60;
+
+    Value::build_text(format!(
         "{}{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}",
-        sign, y, m, d, final_h, final_m, final_s, final_ms
-    );
-
-    Value::build_text(result)
+        sign, y, m, d, hh, mm, ss, millis
+    ))
 }
 
 #[cfg(test)]
@@ -1409,44 +1410,50 @@ mod tests {
 
     #[test]
     fn test_parse_days() {
-        assert_eq!(parse_modifier("5 days").unwrap(), Modifier::Days(5));
-        assert_eq!(parse_modifier("-3 days").unwrap(), Modifier::Days(-3));
-        assert_eq!(parse_modifier("+2 days").unwrap(), Modifier::Days(2));
-        assert_eq!(parse_modifier("4  days").unwrap(), Modifier::Days(4));
-        assert_eq!(parse_modifier("6   DAYS").unwrap(), Modifier::Days(6));
-        assert_eq!(parse_modifier("+5  DAYS").unwrap(), Modifier::Days(5));
+        assert_eq!(parse_modifier("5 days").unwrap(), Modifier::Days(5.0));
+        assert_eq!(parse_modifier("-3 days").unwrap(), Modifier::Days(-3.0));
+        assert_eq!(parse_modifier("+2 days").unwrap(), Modifier::Days(2.0));
+        assert_eq!(parse_modifier("4  days").unwrap(), Modifier::Days(4.0));
+        assert_eq!(parse_modifier("6   DAYS").unwrap(), Modifier::Days(6.0));
+        assert_eq!(parse_modifier("+5  DAYS").unwrap(), Modifier::Days(5.0));
     }
 
     #[test]
     fn test_parse_hours() {
-        assert_eq!(parse_modifier("12 hours").unwrap(), Modifier::Hours(12));
-        assert_eq!(parse_modifier("-2 hours").unwrap(), Modifier::Hours(-2));
-        assert_eq!(parse_modifier("+3  HOURS").unwrap(), Modifier::Hours(3));
+        assert_eq!(parse_modifier("12 hours").unwrap(), Modifier::Hours(12.0));
+        assert_eq!(parse_modifier("-2 hours").unwrap(), Modifier::Hours(-2.0));
+        assert_eq!(parse_modifier("+3  HOURS").unwrap(), Modifier::Hours(3.0));
     }
 
     #[test]
     fn test_parse_minutes() {
-        assert_eq!(parse_modifier("30 minutes").unwrap(), Modifier::Minutes(30));
+        assert_eq!(
+            parse_modifier("30 minutes").unwrap(),
+            Modifier::Minutes(30.0)
+        );
         assert_eq!(
             parse_modifier("-15 minutes").unwrap(),
-            Modifier::Minutes(-15)
+            Modifier::Minutes(-15.0)
         );
         assert_eq!(
             parse_modifier("+45  MINUTES").unwrap(),
-            Modifier::Minutes(45)
+            Modifier::Minutes(45.0)
         );
     }
 
     #[test]
     fn test_parse_seconds() {
-        assert_eq!(parse_modifier("45 seconds").unwrap(), Modifier::Seconds(45));
+        assert_eq!(
+            parse_modifier("45 seconds").unwrap(),
+            Modifier::Seconds(45.0)
+        );
         assert_eq!(
             parse_modifier("-10 seconds").unwrap(),
-            Modifier::Seconds(-10)
+            Modifier::Seconds(-10.0)
         );
         assert_eq!(
             parse_modifier("+20  SECONDS").unwrap(),
-            Modifier::Seconds(20)
+            Modifier::Seconds(20.0)
         );
     }
 
@@ -1517,6 +1524,7 @@ mod tests {
                 months: 5,
                 days: 15,
                 seconds: (14 * 60 + 30) * 60,
+                nanos: 0,
             }
         );
         assert_eq!(
@@ -1526,6 +1534,7 @@ mod tests {
                 months: -5,
                 days: -15,
                 seconds: -((14 * 60 + 30) * 60),
+                nanos: 0,
             }
         );
     }
@@ -1619,12 +1628,12 @@ mod tests {
     fn test_apply_modifier_days() {
         let mut dt = setup_datetime();
         let mut n_floor = 0;
-        apply_modifier(&mut dt, "5 days", &mut n_floor).unwrap();
+        apply_modifier(&mut dt, "5 days", &mut n_floor, None, false).unwrap();
         assert_eq!(dt, create_datetime(2023, 6, 20, 12, 30, 45));
 
         dt = setup_datetime();
         let mut n_floor = 0;
-        apply_modifier(&mut dt, "-3 days", &mut n_floor).unwrap();
+        apply_modifier(&mut dt, "-3 days", &mut n_floor, None, false).unwrap();
         assert_eq!(dt, create_datetime(2023, 6, 12, 12, 30, 45));
     }
 
@@ -1632,12 +1641,12 @@ mod tests {
     fn test_apply_modifier_hours() {
         let mut dt = setup_datetime();
         let mut n_floor = 0;
-        apply_modifier(&mut dt, "6 hours", &mut n_floor).unwrap();
+        apply_modifier(&mut dt, "6 hours", &mut n_floor, None, false).unwrap();
         assert_eq!(dt, create_datetime(2023, 6, 15, 18, 30, 45));
 
         dt = setup_datetime();
         let mut n_floor = 0;
-        apply_modifier(&mut dt, "-2 hours", &mut n_floor).unwrap();
+        apply_modifier(&mut dt, "-2 hours", &mut n_floor, None, false).unwrap();
         assert_eq!(dt, create_datetime(2023, 6, 15, 10, 30, 45));
     }
 
@@ -1645,12 +1654,12 @@ mod tests {
     fn test_apply_modifier_minutes() {
         let mut dt = setup_datetime();
         let mut n_floor = 0;
-        apply_modifier(&mut dt, "45 minutes", &mut n_floor).unwrap();
+        apply_modifier(&mut dt, "45 minutes", &mut n_floor, None, false).unwrap();
         assert_eq!(dt, create_datetime(2023, 6, 15, 13, 15, 45));
 
         dt = setup_datetime();
         let mut n_floor = 0;
-        apply_modifier(&mut dt, "-15 minutes", &mut n_floor).unwrap();
+        apply_modifier(&mut dt, "-15 minutes", &mut n_floor, None, false).unwrap();
         assert_eq!(dt, create_datetime(2023, 6, 15, 12, 15, 45));
     }
 
@@ -1659,12 +1668,12 @@ mod tests {
         let mut dt = setup_datetime();
 
         let mut n_floor = 0;
-        apply_modifier(&mut dt, "30 seconds", &mut n_floor).unwrap();
+        apply_modifier(&mut dt, "30 seconds", &mut n_floor, None, false).unwrap();
         assert_eq!(dt, create_datetime(2023, 6, 15, 12, 31, 15));
 
         dt = setup_datetime();
         let mut n_floor = 0;
-        apply_modifier(&mut dt, "-20 seconds", &mut n_floor).unwrap();
+        apply_modifier(&mut dt, "-20 seconds", &mut n_floor, None, false).unwrap();
         assert_eq!(dt, create_datetime(2023, 6, 15, 12, 30, 25));
     }
 
@@ -1672,12 +1681,12 @@ mod tests {
     fn test_apply_modifier_time_offset() {
         let mut dt = setup_datetime();
         let mut n_floor = 0;
-        apply_modifier(&mut dt, "+01:30", &mut n_floor).unwrap();
+        apply_modifier(&mut dt, "+01:30", &mut n_floor, None, false).unwrap();
         assert_eq!(dt, create_datetime(2023, 6, 15, 14, 0, 45));
 
         dt = setup_datetime();
         let mut n_floor = 0;
-        apply_modifier(&mut dt, "-00:45", &mut n_floor).unwrap();
+        apply_modifier(&mut dt, "-00:45", &mut n_floor, None, false).unwrap();
         assert_eq!(dt, create_datetime(2023, 6, 15, 11, 45, 45));
     }
 
@@ -1685,23 +1694,23 @@ mod tests {
     fn test_apply_modifier_date_time_offset() {
         let mut dt = setup_datetime();
         let mut n_floor = 0;
-        apply_modifier(&mut dt, "+0001-01-01 01:01", &mut n_floor).unwrap();
+        apply_modifier(&mut dt, "+0001-01-01 01:01", &mut n_floor, None, false).unwrap();
         assert_eq!(dt, create_datetime(2024, 7, 16, 13, 31, 45));
 
         dt = setup_datetime();
         let mut n_floor = 0;
-        apply_modifier(&mut dt, "-0001-01-01 01:01", &mut n_floor).unwrap();
+        apply_modifier(&mut dt, "-0001-01-01 01:01", &mut n_floor, None, false).unwrap();
         assert_eq!(dt, create_datetime(2022, 5, 14, 11, 29, 45));
 
         // Test with larger offsets
         dt = setup_datetime();
         let mut n_floor = 0;
-        apply_modifier(&mut dt, "+0002-03-04 05:06", &mut n_floor).unwrap();
+        apply_modifier(&mut dt, "+0002-03-04 05:06", &mut n_floor, None, false).unwrap();
         assert_eq!(dt, create_datetime(2025, 9, 19, 17, 36, 45));
 
         dt = setup_datetime();
         let mut n_floor = 0;
-        apply_modifier(&mut dt, "-0002-03-04 05:06", &mut n_floor).unwrap();
+        apply_modifier(&mut dt, "-0002-03-04 05:06", &mut n_floor, None, false).unwrap();
         assert_eq!(dt, create_datetime(2021, 3, 11, 7, 24, 45));
     }
 
@@ -1709,7 +1718,7 @@ mod tests {
     fn test_apply_modifier_start_of_year() {
         let mut dt = setup_datetime();
         let mut n_floor = 0;
-        apply_modifier(&mut dt, "start of year", &mut n_floor).unwrap();
+        apply_modifier(&mut dt, "start of year", &mut n_floor, None, false).unwrap();
         assert_eq!(dt, create_datetime(2023, 1, 1, 0, 0, 0));
     }
 
@@ -1717,7 +1726,7 @@ mod tests {
     fn test_apply_modifier_start_of_day() {
         let mut dt = setup_datetime();
         let mut n_floor = 0;
-        apply_modifier(&mut dt, "start of day", &mut n_floor).unwrap();
+        apply_modifier(&mut dt, "start of day", &mut n_floor, None, false).unwrap();
         assert_eq!(dt, create_datetime(2023, 6, 15, 0, 0, 0));
     }
 
@@ -1896,7 +1905,7 @@ mod tests {
         // 2023-01-01 is a Sunday => weekday 0
         let mut dt = create_datetime(2023, 1, 1, 12, 0, 0);
         let mut n_floor = 0;
-        apply_modifier(&mut dt, "weekday 0", &mut n_floor).unwrap();
+        apply_modifier(&mut dt, "weekday 0", &mut n_floor, None, false).unwrap();
         assert_eq!(dt, create_datetime(2023, 1, 1, 12, 0, 0));
         assert_eq!(weekday_sunday_based(&dt), 0);
     }
@@ -1907,7 +1916,7 @@ mod tests {
         // "weekday 1" => next Monday => 2023-01-02
         let mut dt = create_datetime(2023, 1, 1, 12, 0, 0);
         let mut n_floor = 0;
-        apply_modifier(&mut dt, "weekday 1", &mut n_floor).unwrap();
+        apply_modifier(&mut dt, "weekday 1", &mut n_floor, None, false).unwrap();
         assert_eq!(dt, create_datetime(2023, 1, 2, 12, 0, 0));
         assert_eq!(weekday_sunday_based(&dt), 1);
 
@@ -1915,7 +1924,7 @@ mod tests {
         // "weekday 5" => next Friday => 2023-01-06
         let mut dt = create_datetime(2023, 1, 3, 12, 0, 0);
         let mut n_floor = 0;
-        apply_modifier(&mut dt, "weekday 5", &mut n_floor).unwrap();
+        apply_modifier(&mut dt, "weekday 5", &mut n_floor, None, false).unwrap();
         assert_eq!(dt, create_datetime(2023, 1, 6, 12, 0, 0));
         assert_eq!(weekday_sunday_based(&dt), 5);
     }
@@ -1926,12 +1935,12 @@ mod tests {
         // "weekday 0" => next Sunday => 2023-01-08
         let mut dt = create_datetime(2023, 1, 6, 12, 0, 0);
         let mut n_floor = 0;
-        apply_modifier(&mut dt, "weekday 0", &mut n_floor).unwrap();
+        apply_modifier(&mut dt, "weekday 0", &mut n_floor, None, false).unwrap();
         assert_eq!(dt, create_datetime(2023, 1, 8, 12, 0, 0));
         assert_eq!(weekday_sunday_based(&dt), 0);
 
         // Now confirm that being on Sunday (weekday 0) and asking for "weekday 0" stays put
-        apply_modifier(&mut dt, "weekday 0", &mut n_floor).unwrap();
+        apply_modifier(&mut dt, "weekday 0", &mut n_floor, None, false).unwrap();
         assert_eq!(dt, create_datetime(2023, 1, 8, 12, 0, 0));
         assert_eq!(weekday_sunday_based(&dt), 0);
     }
@@ -1942,7 +1951,7 @@ mod tests {
         // Asking for weekday 4 => no change
         let mut dt = create_datetime(2023, 1, 5, 12, 0, 0);
         let mut n_floor = 0;
-        apply_modifier(&mut dt, "weekday 4", &mut n_floor).unwrap();
+        apply_modifier(&mut dt, "weekday 4", &mut n_floor, None, false).unwrap();
         assert_eq!(dt, create_datetime(2023, 1, 5, 12, 0, 0));
         assert_eq!(weekday_sunday_based(&dt), 4);
     }
@@ -1953,7 +1962,7 @@ mod tests {
         // Asking for weekday 5 => no change if already on Friday
         let mut dt = create_datetime(2023, 1, 6, 12, 0, 0);
         let mut n_floor = 0;
-        apply_modifier(&mut dt, "weekday 5", &mut n_floor).unwrap();
+        apply_modifier(&mut dt, "weekday 5", &mut n_floor, None, false).unwrap();
         assert_eq!(dt, create_datetime(2023, 1, 6, 12, 0, 0));
         assert_eq!(weekday_sunday_based(&dt), 5);
     }
@@ -1974,7 +1983,7 @@ mod tests {
     fn test_apply_modifier_start_of_month() {
         let mut dt = create_datetime(2023, 6, 15, 12, 30, 45);
         let mut n_floor = 0;
-        apply_modifier(&mut dt, "start of month", &mut n_floor).unwrap();
+        apply_modifier(&mut dt, "start of month", &mut n_floor, None, false).unwrap();
         assert_eq!(dt, create_datetime(2023, 6, 1, 0, 0, 0));
     }
 
@@ -1984,7 +1993,7 @@ mod tests {
         let dt_with_nanos = dt.with_nanosecond(123_456_789).unwrap();
         dt = dt_with_nanos;
         let mut n_floor = 0;
-        apply_modifier(&mut dt, "subsec", &mut n_floor).unwrap();
+        apply_modifier(&mut dt, "subsec", &mut n_floor, None, false).unwrap();
         assert_eq!(dt, dt_with_nanos);
     }
 
@@ -1993,7 +2002,7 @@ mod tests {
         let mut dt = create_datetime(2023, 6, 15, 12, 30, 45);
         let mut n_floor = 3;
 
-        apply_modifier(&mut dt, "floor", &mut n_floor).unwrap();
+        apply_modifier(&mut dt, "floor", &mut n_floor, None, false).unwrap();
         assert_eq!(dt, create_datetime(2023, 6, 12, 12, 30, 45));
     }
 
@@ -2002,11 +2011,11 @@ mod tests {
         let mut dt = create_datetime(2023, 6, 15, 12, 30, 45);
         let mut n_floor = 0;
 
-        apply_modifier(&mut dt, "floor", &mut n_floor).unwrap();
+        apply_modifier(&mut dt, "floor", &mut n_floor, None, false).unwrap();
         assert_eq!(dt, create_datetime(2023, 6, 15, 12, 30, 45));
 
         n_floor = 2;
-        apply_modifier(&mut dt, "floor", &mut n_floor).unwrap();
+        apply_modifier(&mut dt, "floor", &mut n_floor, None, false).unwrap();
         assert_eq!(dt, create_datetime(2023, 6, 13, 12, 30, 45));
     }
 
@@ -2015,7 +2024,7 @@ mod tests {
         let mut dt = create_datetime(2023, 6, 15, 12, 30, 45);
         let mut n_floor = 5;
 
-        apply_modifier(&mut dt, "ceiling", &mut n_floor).unwrap();
+        apply_modifier(&mut dt, "ceiling", &mut n_floor, None, false).unwrap();
         assert_eq!(n_floor, 0);
     }
 
@@ -2024,7 +2033,7 @@ mod tests {
         // Basic check: from mid-month to the 1st at 00:00:00.
         let mut dt = create_datetime(2023, 6, 15, 12, 30, 45);
         let mut n_floor = 0;
-        apply_modifier(&mut dt, "start of month", &mut n_floor).unwrap();
+        apply_modifier(&mut dt, "start of month", &mut n_floor, None, false).unwrap();
         assert_eq!(dt, create_datetime(2023, 6, 1, 0, 0, 0));
     }
 
@@ -2033,7 +2042,7 @@ mod tests {
         // If we're already at the start of the month, no change.
         let mut dt = create_datetime(2023, 6, 1, 0, 0, 0);
         let mut n_floor = 0;
-        apply_modifier(&mut dt, "start of month", &mut n_floor).unwrap();
+        apply_modifier(&mut dt, "start of month", &mut n_floor, None, false).unwrap();
         assert_eq!(dt, create_datetime(2023, 6, 1, 0, 0, 0));
     }
 
@@ -2042,7 +2051,7 @@ mod tests {
         // edge case: month boundary. 2023-07-31 -> start of July.
         let mut dt = create_datetime(2023, 7, 31, 23, 59, 59);
         let mut n_floor = 0;
-        apply_modifier(&mut dt, "start of month", &mut n_floor).unwrap();
+        apply_modifier(&mut dt, "start of month", &mut n_floor, None, false).unwrap();
         assert_eq!(dt, create_datetime(2023, 7, 1, 0, 0, 0));
     }
 
@@ -2052,7 +2061,7 @@ mod tests {
         let dt_with_nanos = dt.with_nanosecond(123_456_789).unwrap();
         dt = dt_with_nanos;
         let mut n_floor = 0;
-        apply_modifier(&mut dt, "subsec", &mut n_floor).unwrap();
+        apply_modifier(&mut dt, "subsec", &mut n_floor, None, false).unwrap();
         assert_eq!(dt, dt_with_nanos);
     }
 
@@ -2062,7 +2071,7 @@ mod tests {
             .with_nanosecond(891_000_000) // 891 milliseconds
             .unwrap();
         let mut n_floor = 0;
-        apply_modifier(&mut dt, "subsec", &mut n_floor).unwrap();
+        apply_modifier(&mut dt, "subsec", &mut n_floor, None, false).unwrap();
 
         let formatted = dt.format("%Y-%m-%d %H:%M:%S%.3f").to_string();
         assert_eq!(formatted, "2025-01-02 04:12:21.891");
@@ -2072,7 +2081,7 @@ mod tests {
     fn test_apply_modifier_subsec_no_fractional_seconds() {
         let mut dt = create_datetime(2025, 1, 2, 4, 12, 21);
         let mut n_floor = 0;
-        apply_modifier(&mut dt, "subsec", &mut n_floor).unwrap();
+        apply_modifier(&mut dt, "subsec", &mut n_floor, None, false).unwrap();
 
         let formatted = dt.format("%Y-%m-%d %H:%M:%S%.3f").to_string();
         assert_eq!(formatted, "2025-01-02 04:12:21.000");
@@ -2084,7 +2093,7 @@ mod tests {
             .with_nanosecond(891_123_456)
             .unwrap();
         let mut n_floor = 0;
-        apply_modifier(&mut dt, "subsec", &mut n_floor).unwrap();
+        apply_modifier(&mut dt, "subsec", &mut n_floor, None, false).unwrap();
 
         let formatted = dt.format("%Y-%m-%d %H:%M:%S%.3f").to_string();
         assert_eq!(formatted, "2025-01-02 04:12:21.891");
@@ -2146,100 +2155,5 @@ mod tests {
         let start = Value::build_text("12:00:00");
         let expected = Value::Null;
         assert_eq!(exec_timediff(&[start, end]), expected);
-    }
-
-    #[test]
-    fn test_subsec_fixed_time_expansion() {
-        let result = exec_datetime(
-            &[text("2024-01-01 12:00:00"), text("subsec")],
-            DateTimeOutput::DateTime,
-        );
-        assert_eq!(
-            result,
-            text("2024-01-01 12:00:00.000"),
-            "Failed to expand zero-nanosecond time with subsec"
-        );
-    }
-
-    #[test]
-    fn test_subsec_date_only_expansion() {
-        let result = exec_datetime(
-            &[text("2024-01-01"), text("subsec")],
-            DateTimeOutput::DateTime,
-        );
-        assert_eq!(
-            result,
-            text("2024-01-01 00:00:00.000"),
-            "Failed to expand date-only input to midnight.000"
-        );
-    }
-
-    #[test]
-    fn test_subsec_iso_separator() {
-        let result = exec_datetime(
-            &[text("2024-01-01T15:30:00"), text("subsec")],
-            DateTimeOutput::DateTime,
-        );
-        assert_eq!(
-            result,
-            text("2024-01-01 15:30:00.000"),
-            "Failed to normalize ISO T separator with subsec"
-        );
-    }
-
-    #[test]
-    fn test_subsec_chaining_before_math() {
-        let result = exec_datetime(
-            &[text("2024-01-01 12:00:00"), text("subsec"), text("+1 hour")],
-            DateTimeOutput::DateTime,
-        );
-        assert_eq!(
-            result,
-            text("2024-01-01 13:00:00.000"),
-            "Subsec flag failed to persist through subsequent arithmetic"
-        );
-    }
-
-    #[test]
-    fn test_subsec_chaining_after_math() {
-        let result = exec_datetime(
-            &[text("2024-01-01 12:00:00"), text("+1 hour"), text("subsec")],
-            DateTimeOutput::DateTime,
-        );
-        assert_eq!(
-            result,
-            text("2024-01-01 13:00:00.000"),
-            "Standard chaining failed"
-        );
-    }
-
-    #[test]
-    fn test_subsec_rollover_math() {
-        let result = exec_datetime(
-            &[
-                text("2024-01-01 12:00:00.999"),
-                text("+1 second"),
-                text("subsec"),
-            ],
-            DateTimeOutput::DateTime,
-        );
-        assert_eq!(
-            result,
-            text("2024-01-01 12:00:01.999"),
-            "Rollover math with milliseconds failed"
-        );
-    }
-
-    #[test]
-    fn test_subsec_case_insensitivity() {
-        let result = exec_datetime(
-            &[text("2024-01-01 12:00:00"), text("SuBsEc")],
-            DateTimeOutput::DateTime,
-        );
-        assert_eq!(
-            result,
-            text("2024-01-01 12:00:00.000"),
-            "Case insensitivity check failed"
-        );
     }
 }

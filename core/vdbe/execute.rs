@@ -5299,7 +5299,7 @@ pub fn op_function(
                     // Case: No args. Pass ["now"] as a slice.
                     let now_val = Value::build_text("now");
                     let args = [&now_val]; // Slice of 1 item
-                    let result = exec_unixepoch(&args);
+                    let result = exec_unixepoch(args);
                     state.registers[*dest] = Register::Value(result);
                 } else {
                     // Case: Args provided.
