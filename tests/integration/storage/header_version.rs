@@ -264,7 +264,9 @@ fn create_wal_db_with_pending_wal(db_path: &Path) {
         // Open a second connection to force WAL file creation
         let conn2 = rusqlite::Connection::open(db_path).unwrap();
         conn2.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
-        let _: i64 = conn2.query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0)).unwrap();
+        let _: i64 = conn2
+            .query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0))
+            .unwrap();
         drop(conn2);
     }
 
@@ -334,7 +336,10 @@ fn test_pragma_journal_mode_wal_to_mvcc_with_pending_wal() {
 
     // Verify WAL file exists and has content
     let wal_path = db_path.with_extension("db-wal");
-    assert!(wal_path.exists(), "WAL file should exist after limbo operations");
+    assert!(
+        wal_path.exists(),
+        "WAL file should exist after limbo operations"
+    );
     let wal_size = std::fs::metadata(&wal_path).unwrap().len();
     assert!(wal_size > 0, "WAL file should be non-empty");
 
@@ -385,8 +390,14 @@ fn test_pragma_journal_mode_wal_to_mvcc_with_pending_wal() {
             r => panic!("unexpected result {r:?}"),
         }
     }
-    assert!(rows.contains(&"test".to_string()), "Should have original test row");
-    assert!(rows.contains(&"limbo_data".to_string()), "Should have limbo_data row");
+    assert!(
+        rows.contains(&"test".to_string()),
+        "Should have original test row"
+    );
+    assert!(
+        rows.contains(&"limbo_data".to_string()),
+        "Should have limbo_data row"
+    );
 
     drop(conn);
     drop(db);

@@ -1075,7 +1075,6 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
 
             CheckpointState::CheckpointWal => {
                 tracing::debug!("Performing TRUNCATE checkpoint on WAL");
-                dbg!("Checkpointing WAL MVCC");
                 match self.checkpoint_wal()? {
                     IOResult::Done(result) => {
                         self.checkpoint_result = Some(result);

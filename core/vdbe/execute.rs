@@ -370,8 +370,10 @@ pub fn op_checkpoint_inner(
         // however.
         return Err(LimboError::TableLocked);
     }
+    // Re-fetch mv_store from connection to get the latest value.
+    // This is necessary because the mv_store may have been set by a preceding JournalMode instruction
+    // (e.g., when switching from WAL to MVCC mode via `PRAGMA journal_mode = "experimental_mvcc"`).
     let mv_store = program.connection.mv_store();
-    dbg!("Checkpoint OPCODE", mv_store.is_none());
     if let Some(mv_store) = mv_store.as_ref() {
         if !matches!(checkpoint_mode, CheckpointMode::Truncate { .. }) {
             return Err(LimboError::InvalidArgument(
@@ -384,7 +386,6 @@ pub fn op_checkpoint_inner(
             program.connection.clone(),
             true,
         ));
-        dbg!("Checkpoint MVCC");
         loop {
             let result = ckpt_sm.step(&())?;
             match result {
@@ -400,7 +401,6 @@ pub fn op_checkpoint_inner(
         }
     }
     loop {
-        dbg!(&state.op_checkpoint_state);
         match &mut state.op_checkpoint_state {
             OpCheckpointState::StartCheckpoint => {
                 let step_result = program
@@ -9864,9 +9864,14 @@ pub fn op_journal_mode(
     }
 
     // Sync IO hack, to avoid state machine. Also DB header is most likely cached, and this code does not need to be performant
-    let prev_mode: RawVersion = pager
-        .io
-        .block(|| pager.with_header_mut(|header| header.read_version))?;
+    let prev_mode: RawVersion = pager.io.block(|| {
+        with_header(
+            pager,
+            program.connection.mv_store().as_ref(),
+            program,
+            |header| header.read_version,
+        )
+    })?;
     let prev_mode = prev_mode
         .to_version()
         .map_err(|val| LimboError::Corrupt(format!("Invalid read_version: {val}")))?;
@@ -9879,7 +9884,7 @@ pub fn op_journal_mode(
         let mode = journal_mode::JournalMode::from_str(mode.as_str())
             .map_err(|err| LimboError::ParseError(format!("Unknown journal mode: {mode}")))?;
         let db_path = program.connection.get_database_canonical_path();
-        ret_mode = journal_mode::change_mode(db_path, program, pager, mv_store, prev_mode, mode)?;
+        ret_mode = journal_mode::change_mode(db_path, program, pager, prev_mode, mode)?;
     }
 
     let ret: &'static str = ret_mode.into();
