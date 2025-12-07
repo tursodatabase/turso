@@ -371,6 +371,7 @@ pub fn op_checkpoint_inner(
         return Err(LimboError::TableLocked);
     }
     let mv_store = program.connection.mv_store();
+    dbg!("Checkpoint OPCODE", mv_store.is_none());
     if let Some(mv_store) = mv_store.as_ref() {
         if !matches!(checkpoint_mode, CheckpointMode::Truncate { .. }) {
             return Err(LimboError::InvalidArgument(
@@ -383,6 +384,7 @@ pub fn op_checkpoint_inner(
             program.connection.clone(),
             true,
         ));
+        dbg!("Checkpoint MVCC");
         loop {
             let result = ckpt_sm.step(&())?;
             match result {
@@ -398,6 +400,7 @@ pub fn op_checkpoint_inner(
         }
     }
     loop {
+        dbg!(&state.op_checkpoint_state);
         match &mut state.op_checkpoint_state {
             OpCheckpointState::StartCheckpoint => {
                 let step_result = program
@@ -414,6 +417,7 @@ pub fn op_checkpoint_inner(
                     }
                     Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
                     Err(err) => {
+                        tracing::error!(?err);
                         state.op_checkpoint_state =
                             OpCheckpointState::CompleteResult { result: Err(err) };
                         continue;
@@ -9875,7 +9879,7 @@ pub fn op_journal_mode(
         let mode = journal_mode::JournalMode::from_str(mode.as_str())
             .map_err(|err| LimboError::ParseError(format!("Unknown journal mode: {mode}")))?;
         let db_path = program.connection.get_database_canonical_path();
-        ret_mode = journal_mode::change_mode(db_path, pager, mv_store, prev_mode, mode)?;
+        ret_mode = journal_mode::change_mode(db_path, program, pager, mv_store, prev_mode, mode)?;
     }
 
     let ret: &'static str = ret_mode.into();
@@ -9969,7 +9973,7 @@ pub fn op_filter_add(
 }
 
 fn with_header<T, F>(
-    pager: &Arc<Pager>,
+    pager: &Pager,
     mv_store: Option<&Arc<MvStore>>,
     program: &Program,
     f: F,
@@ -9986,7 +9990,7 @@ where
 }
 
 pub fn with_header_mut<T, F>(
-    pager: &Arc<Pager>,
+    pager: &Pager,
     mv_store: Option<&Arc<MvStore>>,
     program: &Program,
     f: F,
