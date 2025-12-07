@@ -669,6 +669,10 @@ impl Shadow for AlterTable {
                 table.rows.iter_mut().for_each(|row| {
                     row.remove(col_idx);
                 });
+                // Remove foreign keys that reference the dropped column
+                table.foreign_keys.retain(|fk| {
+                    !fk.child_columns.contains(column_name)
+                });
             }
         };
         Ok(vec![])

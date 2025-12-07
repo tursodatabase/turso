@@ -38,6 +38,7 @@ impl InteractionPlan {
             peek: None,
             iter,
             rng,
+            pending_shadow: Vec::new(),
         }
     }
 
@@ -136,84 +137,167 @@ pub struct PlanGenerator<'a, R: rand::Rng> {
     peek: Option<Interaction>,
     iter: <Vec<Interaction> as IntoIterator>::IntoIter,
     rng: &'a mut R,
+    /// Interactions yielded from the current property that haven't been shadowed yet.
+    /// These need to be shadowed before filling a Placeholder so the context is up-to-date.
+    pending_shadow: Vec<Interaction>,
 }
 
 impl<'a, R: rand::Rng> PlanGenerator<'a, R> {
     fn next_interaction(&mut self, env: &mut SimulatorEnv) -> Option<Interaction> {
-        self.iter
-            .next()
-            .or_else(|| {
-                // Iterator ended, try to create a new iterator
-                // This will not be an infinte sequence because generate_next_interaction will eventually
-                // stop generating
-                let interactions = self.plan.generate_next_interaction(self.rng, env)?;
+        // Try to get the next interaction from the current iterator,
+        // or generate new interactions if the iterator is empty
+        let interaction = self.iter.next().or_else(|| {
+            // Iterator ended, try to create a new iterator
+            // This will not be an infinte sequence because generate_next_interaction will eventually
+            // stop generating
+            let interactions = self.plan.generate_next_interaction(self.rng, env)?;
 
-                let id = self.plan.next_property_id();
+            let id = self.plan.next_property_id();
 
-                let iter = interactions.interactions(id);
+            let iter = interactions.interactions(id);
 
-                assert!(!iter.is_empty());
+            assert!(!iter.is_empty());
 
-                let mut iter = iter.into_iter();
+            let mut iter = iter.into_iter();
 
-                self.plan.push_interactions(interactions);
+            self.plan.push_interactions(interactions);
 
-                let next = iter.next();
-                self.iter = iter;
+            // Clear pending shadows when starting a new property
+            self.pending_shadow.clear();
 
-                next
-            })
-            .map(|interaction| {
-                // Certain properties can generate intermediate queries
-                // we need to generate them here and substitute
-                if let InteractionType::Query(Query::Placeholder) = &interaction.interaction {
-                    let stats = self.plan.stats();
+            let next = iter.next();
+            self.iter = iter;
 
-                    let conn_ctx = env.connection_context(interaction.connection_index);
+            next
+        })?;
 
-                    let remaining_ = Remaining::new(
-                        env.opts.max_interactions,
-                        &env.profile.query,
-                        stats,
-                        env.profile.experimental_mvcc,
-                        &conn_ctx,
-                    );
+        // Certain properties can generate intermediate queries
+        // we need to generate them here and substitute
+        let result = if let InteractionType::Query(Query::Placeholder) = &interaction.interaction {
+            // Before filling a Placeholder, we need the context to be up-to-date
+            // (e.g., a CREATE TABLE followed by an ALTER TABLE needs the CREATE
+            // to be reflected in the context). We temporarily shadow pending
+            // interactions to a cloned context, use that for query generation,
+            // but don't modify the real env (execution will shadow them).
 
-                    let Some(InteractionsType::Property(property)) = self
-                        .plan
-                        .last_interactions()
-                        .as_ref()
-                        .map(|interactions| &interactions.interactions)
-                    else {
-                        unreachable!("only properties have extensional queries");
-                    };
+            // Clone the tables for temporary context using Deref
+            let conn_tables = env.get_conn_tables(interaction.connection_index);
+            let mut temp_tables: Vec<sql_generation::model::table::Table> = (*conn_tables).clone();
 
-                    let queries = possible_queries(conn_ctx.tables());
-                    let query_distr = QueryDistribution::new(queries, &remaining_);
-
-                    let query_gen = property.get_extensional_query_gen_function();
-
-                    let mut count = 0;
-                    let new_query = loop {
-                        if count > 1_000_000 {
-                            panic!("possible infinite loop in query generation");
+            // Shadow pending interactions to the temporary context
+            for pending in self.pending_shadow.drain(..) {
+                // Use a temporary mutable wrapper for shadowing
+                // Note: we're only interested in DDL that affects schema (CREATE, ALTER, DROP)
+                if let InteractionType::Query(query) = &pending.interaction {
+                    match query {
+                        Query::Create(create) => {
+                            temp_tables.push(create.table.clone());
                         }
-                        if let Some(new_query) =
-                            (query_gen)(self.rng, &conn_ctx, &query_distr, property)
-                        {
-                            break new_query;
+                        Query::AlterTable(alter) => {
+                            if let Some(table) = temp_tables.iter_mut().find(|t| t.name == alter.table_name) {
+                                use sql_generation::model::query::alter_table::AlterTableType;
+                                match &alter.alter_table_type {
+                                    AlterTableType::AddColumn { column } => {
+                                        table.columns.push(column.clone());
+                                    }
+                                    AlterTableType::DropColumn { column_name } => {
+                                        table.columns.retain(|c| &c.name != column_name);
+                                        // Also remove FKs that reference the dropped column
+                                        table.foreign_keys.retain(|fk| {
+                                            !fk.child_columns.contains(column_name)
+                                        });
+                                    }
+                                    AlterTableType::RenameColumn { old, new } => {
+                                        if let Some(col) = table.columns.iter_mut().find(|c| &c.name == old) {
+                                            col.name = new.clone();
+                                        }
+                                    }
+                                    AlterTableType::RenameTo { new_name } => {
+                                        table.name = new_name.clone();
+                                    }
+                                    AlterTableType::AlterColumn { .. } => {
+                                        // AlterColumn changes column definition, not tracked for FK purposes
+                                    }
+                                }
+                            }
                         }
-                        count += 1;
-                    };
-
-                    InteractionBuilder::from_interaction(&interaction)
-                        .interaction(InteractionType::Query(new_query))
-                        .build()
-                        .unwrap()
-                } else {
-                    interaction
+                        Query::Drop(drop) => {
+                            temp_tables.retain(|t| t.name != drop.table);
+                        }
+                        _ => {}
+                    }
                 }
-            })
+            }
+
+            let stats = self.plan.stats();
+
+            // Create a temporary context with the updated tables
+            struct TempContext<'a> {
+                tables: &'a Vec<sql_generation::model::table::Table>,
+                opts: &'a sql_generation::generation::Opts,
+            }
+
+            impl<'a> sql_generation::generation::GenerationContext for TempContext<'a> {
+                fn tables(&self) -> &Vec<sql_generation::model::table::Table> {
+                    self.tables
+                }
+
+                fn opts(&self) -> &sql_generation::generation::Opts {
+                    self.opts
+                }
+            }
+
+            let temp_ctx = TempContext {
+                tables: &temp_tables,
+                opts: &env.profile.query.gen_opts,
+            };
+
+            let remaining_ = Remaining::new(
+                env.opts.max_interactions,
+                &env.profile.query,
+                stats,
+                env.profile.experimental_mvcc,
+                &temp_ctx,
+            );
+
+            let Some(InteractionsType::Property(property)) = self
+                .plan
+                .last_interactions()
+                .as_ref()
+                .map(|interactions| &interactions.interactions)
+            else {
+                unreachable!("only properties have extensional queries");
+            };
+
+            let queries = possible_queries(&temp_tables);
+            let query_distr = QueryDistribution::new(queries, &remaining_);
+
+            let query_gen = property.get_extensional_query_gen_function();
+
+            let mut count = 0;
+            let new_query = loop {
+                if count > 1_000_000 {
+                    panic!("possible infinite loop in query generation");
+                }
+                if let Some(new_query) =
+                    (query_gen)(self.rng, &temp_ctx, &query_distr, property)
+                {
+                    break new_query;
+                }
+                count += 1;
+            };
+
+            InteractionBuilder::from_interaction(&interaction)
+                .interaction(InteractionType::Query(new_query))
+                .build()
+                .unwrap()
+        } else {
+            // Track non-Placeholder interactions for later shadowing if we encounter a Placeholder
+            self.pending_shadow.push(interaction.clone());
+            interaction
+        };
+
+        Some(result)
     }
 
     fn peek(&mut self, env: &mut SimulatorEnv) -> Option<&Interaction> {
