@@ -1983,13 +1983,27 @@ impl Connection {
         self.pager.load().cacheflush()
     }
 
-    pub fn checkpoint(&self, mode: CheckpointMode) -> Result<CheckpointResult> {
+    pub fn checkpoint(self: &Arc<Self>, mode: CheckpointMode) -> Result<CheckpointResult> {
+        use crate::mvcc::database::CheckpointStateMachine;
+        use crate::state_machine::StateMachine;
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
-        self.pager
+        if let Some(mv_store) = self.mv_store().as_ref() {
+            let pager = self.pager.load().clone();
+            let io = pager.io.clone();
+            let mut ckpt_sm = StateMachine::new(CheckpointStateMachine::new(
+                pager,
+                mv_store.clone(),
+                self.clone(),
+                true,
+            ));
+            io.as_ref().block(|| ckpt_sm.step(&()))
+        } else {
+            self.pager
             .load()
             .blocking_checkpoint(mode, self.get_sync_mode())
+        }
     }
 
     /// Close a connection and checkpoint.
