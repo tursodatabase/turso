@@ -242,3 +242,163 @@ fn test_mvcc_db_opened_with_mvcc_stays_mvcc() {
         "MVCC DB opened with MVCC should stay MVCC (read_version=255), got {read_ver}"
     );
 }
+
+/// Create a WAL mode database with a non-empty WAL file (no checkpoint)
+fn create_wal_db_with_pending_wal(db_path: &Path) {
+    // Use exclusive locking mode to prevent automatic checkpoint on close
+    let conn = rusqlite::Connection::open(db_path).unwrap();
+    conn.pragma_update(None, "journal_mode", "wal").unwrap();
+    // Disable automatic checkpointing
+    conn.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)", ())
+        .unwrap();
+    conn.execute("INSERT INTO t (val) VALUES ('test')", ())
+        .unwrap();
+
+    // Check WAL file before closing
+    let wal_path = db_path.with_extension("db-wal");
+
+    // If WAL doesn't exist yet, it means the data is still in memory
+    // We need another connection to force the WAL to be created
+    if !wal_path.exists() {
+        // Open a second connection to force WAL file creation
+        let conn2 = rusqlite::Connection::open(db_path).unwrap();
+        conn2.pragma_update(None, "wal_autocheckpoint", 0).unwrap();
+        let _: i64 = conn2.query_row("SELECT COUNT(*) FROM t", [], |row| row.get(0)).unwrap();
+        drop(conn2);
+    }
+
+    drop(conn);
+
+    // Verify WAL file exists and is non-empty
+    let wal_exists = wal_path.exists();
+    let wal_size = if wal_exists {
+        std::fs::metadata(&wal_path).unwrap().len()
+    } else {
+        0
+    };
+
+    // If WAL doesn't exist or is empty, the test setup didn't work as expected
+    // This is okay - it means we don't have pending WAL data to test
+    // The test will still verify that mode switching works
+    if !wal_exists || wal_size == 0 {
+        eprintln!("Note: WAL file is empty or doesn't exist - test will verify mode switching without pending WAL data");
+    }
+
+    // Verify it's WAL mode (version 2)
+    let (write_ver, read_ver) = read_header_versions(db_path);
+    assert_eq!(
+        write_ver, 2,
+        "Expected WAL write_version=2, got {write_ver}"
+    );
+    assert_eq!(read_ver, 2, "Expected WAL read_version=2, got {read_ver}");
+}
+
+/// Test switching from WAL to MVCC mode via PRAGMA when there's a non-empty WAL.
+/// This tests the scenario where:
+/// 1. A database is opened in WAL mode with pending WAL data
+/// 2. User runs `PRAGMA journal_mode = "experimental_mvcc"` to switch to MVCC
+/// 3. The Checkpoint instruction should use the newly opened MvStore
+#[test]
+fn test_pragma_journal_mode_wal_to_mvcc_with_pending_wal() {
+    let tmp_dir = TempDir::new().unwrap();
+    let db_path = tmp_dir.path().join("test.db");
+
+    // Step 1: Create a WAL mode database with rusqlite
+    create_wal_db_with_pending_wal(&db_path);
+
+    // Step 2: Open with limbo WITHOUT MVCC to create WAL data, then close without checkpointing
+    {
+        let io = std::sync::Arc::new(turso_core::PlatformIO::new().unwrap());
+        let opts = DatabaseOpts::new().with_mvcc(false);
+
+        let db = Database::open_file_with_flags(
+            io.clone(),
+            db_path.to_str().unwrap(),
+            OpenFlags::default(),
+            opts,
+            None,
+        )
+        .expect("Failed to open database with limbo (non-MVCC)");
+
+        let conn = db.connect().unwrap();
+
+        // Insert some data to ensure WAL has content
+        conn.execute("INSERT INTO t (val) VALUES ('limbo_data')")
+            .expect("INSERT should work");
+
+        // Drop without checkpointing - this should leave data in WAL
+        drop(conn);
+        drop(db);
+    }
+
+    // Verify WAL file exists and has content
+    let wal_path = db_path.with_extension("db-wal");
+    assert!(wal_path.exists(), "WAL file should exist after limbo operations");
+    let wal_size = std::fs::metadata(&wal_path).unwrap().len();
+    assert!(wal_size > 0, "WAL file should be non-empty");
+
+    // Step 3: Reopen with MVCC enabled and try to switch via PRAGMA
+    let io = std::sync::Arc::new(turso_core::PlatformIO::new().unwrap());
+    let opts = DatabaseOpts::new().with_mvcc(true);
+
+    let db = Database::open_file_with_flags(
+        io.clone(),
+        db_path.to_str().unwrap(),
+        OpenFlags::default(),
+        opts,
+        None,
+    )
+    .expect("Failed to open database with limbo (MVCC enabled)");
+
+    let conn = db.connect().unwrap();
+
+    // Switch to MVCC mode via PRAGMA
+    // This should work even with pending WAL data
+    let result = conn
+        .pragma_update("journal_mode", "'experimental_mvcc'")
+        .expect("PRAGMA journal_mode update should not fail");
+
+    // Verify the journal mode was set
+    assert!(!result.is_empty(), "PRAGMA should return a result");
+    let mode = result[0][0].to_string();
+    assert_eq!(
+        mode, "experimental_mvcc",
+        "Journal mode should be experimental_mvcc after PRAGMA, got {mode}"
+    );
+
+    // Verify we can still query data (both original and new data)
+    let mut stmt = conn.prepare("SELECT val FROM t ORDER BY val").unwrap();
+    let mut rows = Vec::new();
+    loop {
+        match stmt.step().unwrap() {
+            turso_core::StepResult::Row => {
+                let row = stmt.row().unwrap();
+                let val: String = row.get::<String>(0).unwrap();
+                rows.push(val);
+            }
+            turso_core::StepResult::IO => {
+                stmt.run_once().unwrap();
+                continue;
+            }
+            turso_core::StepResult::Done => break,
+            r => panic!("unexpected result {r:?}"),
+        }
+    }
+    assert!(rows.contains(&"test".to_string()), "Should have original test row");
+    assert!(rows.contains(&"limbo_data".to_string()), "Should have limbo_data row");
+
+    drop(conn);
+    drop(db);
+
+    // Verify header is now MVCC (version 255)
+    let (write_ver, read_ver) = read_header_versions(&db_path);
+    assert_eq!(
+        write_ver, 255,
+        "After PRAGMA journal_mode switch, write_version should be 255 (MVCC), got {write_ver}"
+    );
+    assert_eq!(
+        read_ver, 255,
+        "After PRAGMA journal_mode switch, read_version should be 255 (MVCC), got {read_ver}"
+    );
+}
