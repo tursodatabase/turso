@@ -2348,6 +2348,20 @@ impl Jsonb {
             let next_is_array = matches!(path_iter.peek(), Some(PathElement::ArrayLocator(_)))
                 && !matches!(current, PathElement::ArrayLocator(_));
 
+            let is_intermediate_segment = if next_is_array {
+                let mut temp_iter = path_iter.clone();
+                temp_iter.next(); // skip the array locator
+                temp_iter.peek().is_some()
+            } else {
+                path_iter.peek().is_some()
+            };
+
+            let segment_mode = if is_intermediate_segment {
+                PathOperationMode::Upsert
+            } else {
+                mode
+            };
+
             let result = if next_is_array {
                 let array_locator = path_iter.next().ok_or_else(|| {
                     LimboError::InternalError(
@@ -2358,10 +2372,10 @@ impl Jsonb {
                 self.navigate_to_segment(
                     SegmentVariant::KeyWithArrayIndex(current, array_locator),
                     pos,
-                    mode,
+                    segment_mode,
                 )?
             } else {
-                self.navigate_to_segment(SegmentVariant::Single(current), pos, mode)?
+                self.navigate_to_segment(SegmentVariant::Single(current), pos, segment_mode)?
             };
 
             pos = match &result.array_position_info {
