@@ -327,12 +327,13 @@ impl Shadow for Drop {
 
         tables.retain(|t| t.name != self.table);
 
-        // Remove foreign keys in other tables that reference the dropped table
-        for table in tables.iter_mut() {
-            table
-                .foreign_keys
-                .retain(|fk| fk.parent_table != self.table);
-        }
+        // NOTE: We do NOT remove foreign keys in other tables that reference the dropped table.
+        // While the FK is logically "dead" (parent doesn't exist), SQLite still stores the FK
+        // constraint in the child table's schema. If we remove the FK from our shadow, we might
+        // generate an ALTER TABLE DROP COLUMN that drops a column referenced by the FK, which
+        // would cause "malformed database schema" errors in SQLite.
+        // The FK constraint will remain in the schema until the child table is dropped or
+        // the referencing columns are renamed/dropped (which SQLite will then complain about).
 
         Ok(vec![])
     }
