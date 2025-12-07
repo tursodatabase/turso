@@ -189,10 +189,25 @@ pub fn translate_create_table(
     // TODO: SetCookie
 
     let table_root_reg = program.alloc_register();
+
+    let btree_flags = if let ast::CreateTableBody::ColumnsAndConstraints { options, .. } = &body {
+        if options.contains(ast::TableOptions::WITHOUT_ROWID) {
+            tracing::debug!(
+                "CREATE TABLE: `{}` is a WITHOUT ROWID table, using index b-tree flags.",
+                normalized_tbl_name
+            );
+            CreateBTreeFlags::new_index()
+        } else {
+            CreateBTreeFlags::new_table()
+        }
+    } else {
+        CreateBTreeFlags::new_table()
+    };
+
     program.emit_insn(Insn::CreateBtree {
         db: 0,
         root: table_root_reg,
-        flags: CreateBTreeFlags::new_table(),
+        flags: btree_flags,
     });
 
     // Create an automatic index B-tree if needed
@@ -418,6 +433,17 @@ fn collect_autoindexes(
     program: &mut ProgramBuilder,
     tbl_name: &str,
 ) -> Result<Option<Vec<usize>>> {
+    let is_without_rowid = if let ast::CreateTableBody::ColumnsAndConstraints { options, .. } = body
+    {
+        options.contains(ast::TableOptions::WITHOUT_ROWID)
+    } else {
+        false
+    };
+
+    if is_without_rowid {
+        tracing::debug!("Without rowid table, no need for autoindex'{}'", tbl_name);
+    }
+
     let table = create_table(tbl_name, body, 0)?;
 
     let mut regs: Vec<usize> = Vec::new();
@@ -430,7 +456,7 @@ fn collect_autoindexes(
         };
 
         let needs_index = if us.is_primary_key {
-            !(col.primary_key() && col.is_rowid_alias())
+            !(is_without_rowid || (col.primary_key() && col.is_rowid_alias()))
         } else {
             // UNIQUE single needs an index
             true
@@ -441,7 +467,11 @@ fn collect_autoindexes(
         }
     }
 
-    for _us in table.unique_sets.iter().filter(|us| us.columns.len() > 1) {
+    for _us in table
+        .unique_sets
+        .iter()
+        .filter(|us| us.columns.len() > 1 && (!us.is_primary_key || !is_without_rowid))
+    {
         regs.push(program.alloc_register());
     }
     if regs.is_empty() {
