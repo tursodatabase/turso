@@ -28,6 +28,9 @@ pub struct Profile {
     #[garde(skip)]
     /// Experimental MVCC feature
     pub experimental_mvcc: bool,
+    #[garde(skip)]
+    /// Whether to seed simulator databases with a SQLite-generated auto-vacuum file.
+    pub seed_sqlite_autovacuum: bool,
     #[garde(range(min = 1, max = 64))]
     pub max_connections: usize,
     #[garde(dive)]
@@ -40,6 +43,7 @@ impl Default for Profile {
     fn default() -> Self {
         Self {
             experimental_mvcc: false,
+            seed_sqlite_autovacuum: true,
             max_connections: 10,
             io: Default::default(),
             query: Default::default(),
@@ -118,6 +122,7 @@ impl Profile {
             },
             experimental_mvcc: true,
             max_connections: 2,
+            seed_sqlite_autovacuum: true,
         };
         profile.validate().unwrap();
         profile
