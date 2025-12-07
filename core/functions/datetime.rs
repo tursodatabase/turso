@@ -261,28 +261,23 @@ fn strftime_format(dt: &NaiveDateTime, format_str: &str) -> Option<String> {
     while let Some(c) = chars.next() {
         if c == '%' {
             match chars.next() {
-                Some(spec) => match spec {
+                Some(
                     'd' | 'e' | 'f' | 'F' | 'G' | 'g' | 'H' | 'I' | 'j' | 'J' | 'k' | 'l' | 'm'
-                    | 'M' | 'p' | 'P' | 'R' | 's' | 'S' | 'T' | 'u' | 'U' | 'V' | 'w' | 'W'
-                    | 'Y' | '%' => continue,
-                    _ => return None,
-                },
-                None => return None,
+                    | 'M' | 'p' | 'P' | 'R' | 's' | 'S' | 'T' | 'u' | 'U' | 'V' | 'w' | 'W' | 'Y'
+                    | '%',
+                ) => continue,
+                _ => return None,
             }
         }
     }
 
     // 2. Handle %J Formatting (Strip trailing zeros)
     let jd = to_julian_day_exact(dt);
-    let jd_str = format!("{:.9}", jd);
+    let jd_str = format!("{jd:.9}");
     // Remove trailing zeros/decimal if present, to match typical SQLite CLI output
     let jd_str_clean = if jd_str.contains('.') {
         let trimmed = jd_str.trim_end_matches('0');
-        if trimmed.ends_with('.') {
-            &trimmed[..trimmed.len() - 1] // remove trailing '.'
-        } else {
-            trimmed
-        }
+        trimmed.strip_suffix('.').unwrap_or(trimmed)
     } else {
         &jd_str
     };
@@ -648,6 +643,10 @@ fn get_date_time_from_time_value_string(value: &str) -> Option<NaiveDateTime> {
     // Check for Julian day number (integer or float)
     if let Ok(julian_day) = value.parse::<f64>() {
         return get_date_time_from_time_value_float(julian_day);
+    }
+
+    if value.contains(":60") {
+        return None;
     }
 
     // Attempt to parse with various formats
@@ -1110,8 +1109,7 @@ fn compute_timediff(d1: NaiveDateTime, d2: NaiveDateTime) -> Value {
     let ss = total_sec % 60;
 
     Value::build_text(format!(
-        "{}{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}",
-        sign, y, m, d, hh, mm, ss, millis
+        "{sign}{y:04}-{m:02}-{d:02} {hh:02}:{mm:02}:{ss:02}.{millis:03}"
     ))
 }
 
