@@ -163,6 +163,16 @@ fn update_pragma(
                 dest: result_reg,
                 new_mode: Some(mode_str),
             });
+
+            let register_start = program.alloc_registers(3);
+            program.emit_insn(Insn::Checkpoint {
+                database: 0,
+                checkpoint_mode: CheckpointMode::Truncate {
+                    upper_bound_inclusive: None,
+                },
+                dest: register_start,
+            });
+
             program.emit_result_row(result_reg, 1);
             program.add_pragma_result_column("journal_mode".into());
             Ok((program, TransactionMode::Write))

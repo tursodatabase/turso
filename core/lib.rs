@@ -546,9 +546,7 @@ impl Database {
             Ok(())
         })?;
 
-        if db.mvcc_enabled() {
-            let mv_store = db.get_mv_store();
-            let mv_store = mv_store.as_ref().unwrap();
+        if let Some(mv_store) = db.get_mv_store().as_ref() {
             let mvcc_bootstrap_conn = db._connect(true, Some(pager.clone()))?;
             mv_store.bootstrap(mvcc_bootstrap_conn)?;
         }
@@ -628,11 +626,13 @@ impl Database {
                 .map_err(|val| LimboError::Corrupt(format!("Invalid write_version: {val}")))?,
         );
 
+        let mut open_mv_store = self.mvcc_enabled();
+
         // Now check the Header Version to see which mode the DB file really is on
         // Track if header was modified so we can write it to disk
         let header_modified = match read_version {
             Version::Legacy => {
-                if self.mvcc_enabled() {
+                if open_mv_store {
                     header_mut.read_version = RawVersion::from(Version::Mvcc);
                     header_mut.write_version = RawVersion::from(Version::Mvcc);
                 } else {
@@ -642,31 +642,26 @@ impl Database {
                 true
             }
             Version::Wal => {
-                if self.mvcc_enabled() {
-                    // Change Header to MVCC
+                if open_mv_store && !wal_exists {
+                    // Change Header to MVCC if WAL does not exists and we have MVCC enabled
                     header_mut.read_version = RawVersion::from(Version::Mvcc);
                     header_mut.write_version = RawVersion::from(Version::Mvcc);
                     true
                 } else {
+                    // tracing::warn!("WAL file exists for database {}, but MVCC is enabled. This is currently not supported. Open the database in non-MVCC mode and run PRAGMA wal_checkpoint(TRUNCATE) to truncate the WAL.", self.path);
+                    open_mv_store = false;
                     false
                 }
             }
             Version::Mvcc => {
-                if !self.mvcc_enabled() {
+                if !open_mv_store {
                     tracing::warn!("Database is in MVCC mode, but MVCC options were not passed. Enabling MVCC mode");
                     self.opts.enable_mvcc = true;
+                    open_mv_store = true;
                 }
                 false
             }
         };
-
-        // If header was modified, write it directly to disk before we clear the cache
-        // This must happen before WAL is attached since we need to write directly to the DB file
-        if header_modified {
-            let completion =
-                storage::sqlite3_ondisk::begin_write_btree_page(&pager, header.page())?;
-            self.io.wait_for_completion(completion)?;
-        }
 
         // Currently we always init shared wal regardless if MVCC enabled
         match (wal_exists, log_exists) {
@@ -678,7 +673,7 @@ impl Database {
             (true, false) => {
                 // Currently, if a non-zero-sized WAL file exists, the database cannot be opened in MVCC mode.
                 // FIXME: this should initiate immediate checkpoint from WAL->DB in MVCC mode.
-                if self.mvcc_enabled() {
+                if open_mv_store {
                     return Err(LimboError::InvalidArgument(format!(
                         "WAL file exists for database {}, but MVCC is enabled. This is currently not supported. Open the database in non-MVCC mode and run PRAGMA wal_checkpoint(TRUNCATE) to truncate the WAL.",
                         self.path
@@ -688,7 +683,7 @@ impl Database {
             (false, true) => {
                 // If a non-zero-sized logical log file exists, the database cannot be opened in non-MVCC mode,
                 // because the changes in the logical log would not be visible to the non-MVCC connections.
-                if !self.mvcc_enabled() {
+                if !open_mv_store {
                     return Err(LimboError::InvalidArgument(format!(
                         "MVCC logical log file exists for database {}, but MVCC is disabled. This is not supported. Open the database in MVCC mode and run PRAGMA wal_checkpoint(TRUNCATE) to truncate the logical log.",
                         self.path
@@ -697,6 +692,16 @@ impl Database {
             }
             (false, false) => {}
         };
+
+        // If header was modified, write it directly to disk before we clear the cache
+        // This must happen before WAL is attached since we need to write directly to the DB file
+        if header_modified {
+            let completion =
+                storage::sqlite3_ondisk::begin_write_btree_page(&pager, header.page())?;
+            self.io.wait_for_completion(completion)?;
+        }
+
+        drop(header);
 
         // Always Open shared wal and set it in the Database and Pager.
         // MVCC currently requires a WAL open to function
@@ -723,14 +728,9 @@ impl Database {
         pager.clear_page_cache(false);
         pager.set_schema_cookie(None);
 
-        if self.mvcc_enabled() {
-            let file =
-                self.io
-                    .open_file(&format!("{}-log", self.path), OpenFlags::default(), false)?;
-            let storage = mvcc::persistent_storage::Storage::new(file);
-            let mv_store = MvStore::new(mvcc::LocalClock::new(), storage);
-            let mv_store = Some(Arc::new(mv_store));
-            self.mv_store.store(mv_store);
+        if open_mv_store {
+            let mv_store = journal_mode::open_mv_store(self.io.as_ref(), &self.path)?;
+            self.mv_store.store(Some(mv_store));
         }
 
         Ok(Arc::new(pager))
@@ -1065,6 +1065,7 @@ impl Database {
         self.opts.enable_strict
     }
 
+    /// check if MVCC database option is enabled
     pub fn mvcc_enabled(&self) -> bool {
         self.opts.enable_mvcc
     }
@@ -1435,6 +1436,13 @@ impl Connection {
         assert!(self.is_mvcc_bootstrap_connection.load(Ordering::SeqCst));
         self.is_mvcc_bootstrap_connection
             .store(false, Ordering::SeqCst);
+    }
+
+    /// Demote regular connection to MVCC bootstrap connection so it does not read from the MV store.
+    pub fn demote_to_mvcc_connection(&self) {
+        assert!(!self.is_mvcc_bootstrap_connection.load(Ordering::SeqCst));
+        self.is_mvcc_bootstrap_connection
+            .store(true, Ordering::SeqCst);
     }
 
     /// Parse schema from scratch if version of schema for the connection differs from the schema cookie in the root page
