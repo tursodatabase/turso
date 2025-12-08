@@ -1939,8 +1939,22 @@ impl Pager {
                     self.commit_info.write().state = CommitState::Checkpoint;
                 }
                 CommitState::Checkpoint => {
-                    match self.checkpoint()? {
-                        IOResult::IO(cmp) => {
+                    match self.checkpoint() {
+                        Err(LimboError::Busy) => {
+                            // Auto-checkpoint during commit uses Passive mode, which can return
+                            // Busy if either:
+                            // 1. Another connection is already checkpointing (checkpoint_lock held)
+                            // 2. A reader is active on read slot 0 (read_locks[0] held)
+                            // In either case, skip the checkpoint and complete the commit. The WAL
+                            // frames are already written, so the commit succeeds. Checkpoint will
+                            // happen later when conditions allow.
+                            tracing::debug!("Auto-checkpoint skipped due to busy (lock conflict)");
+                            let mut commit_info = self.commit_info.write();
+                            commit_info.result = Some(PagerCommitResult::WalWritten);
+                            commit_info.state = CommitState::Done;
+                        }
+                        Err(e) => return Err(e),
+                        Ok(IOResult::IO(cmp)) => {
                             let completion = {
                                 let mut commit_info = self.commit_info.write();
                                 match cmp {
@@ -1957,7 +1971,7 @@ impl Pager {
                             // TODO: remove serialization of checkpoint path
                             io_yield_one!(completion);
                         }
-                        IOResult::Done(res) => {
+                        Ok(IOResult::Done(res)) => {
                             let mut commit_info = self.commit_info.write();
                             commit_info.result = Some(PagerCommitResult::Checkpointed(res));
                             // Skip sync if synchronous mode is OFF
