@@ -112,6 +112,11 @@ struct DualCursorPeek {
 impl DualCursorPeek {
     /// Returns the next row key and whether the row is from the BTree.
     fn get_next(&self, dir: IterationDirection) -> Option<(RowKey, bool)> {
+        tracing::trace!(
+            "get_next: mvcc_key: {:?}, btree_key: {:?}",
+            self.mvcc_peek.get_row_key(),
+            self.btree_peek.get_row_key()
+        );
         match (self.mvcc_peek.get_row_key(), self.btree_peek.get_row_key()) {
             (Some(mvcc_key), Some(btree_key)) => {
                 if dir == IterationDirection::Forwards {
@@ -359,18 +364,57 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
         Ok(())
     }
 
+    /// Get the next rowid in the table.
+    /// Since MVCC requires rowids to be sequential and not collide we need to ensure rowids supplied to concurrrent
+    /// transactions are not conflicting.
+    /// Therefore, we will always choose the highest rowid in the table, regardless of the visibility of the row to the
+    /// transaction.
     pub fn get_next_rowid(&mut self) -> Result<IOResult<i64>> {
         // lock so we don't get same two rowids
         let lock = self.next_rowid_lock.clone();
         let _lock = lock.write();
         return_if_io!(self.last());
+        let last_rowid_in_mvcc_index = self
+            .db
+            .get_last_table_rowid_without_visibility_check(self.table_id);
         match self.current_pos.borrow().clone() {
             CursorPosition::Loaded {
                 row_id,
                 in_btree: _,
-            } => Ok(IOResult::Done(row_id.row_id.to_int_or_panic() + 1)),
-            CursorPosition::BeforeFirst => Ok(IOResult::Done(1)),
-            CursorPosition::End => Ok(IOResult::Done(1)),
+            } => {
+                // Check if there is some other rowid in the MVCC index that is higher than the current rowid.
+                // Doesn't matter if it's not visible.
+                tracing::debug!(
+                    "get_next_rowid: last_rowid_in_mvcc_index={:?}, row_id={:?}",
+                    last_rowid_in_mvcc_index,
+                    row_id
+                );
+                let max_rowid = match last_rowid_in_mvcc_index {
+                    Some(k) => {
+                        if k.to_int_or_panic() > row_id.row_id.to_int_or_panic() {
+                            k.to_int_or_panic() + 1
+                        } else {
+                            row_id.row_id.to_int_or_panic() + 1
+                        }
+                    }
+                    None => row_id.row_id.to_int_or_panic() + 1,
+                };
+                Ok(IOResult::Done(max_rowid))
+            }
+            CursorPosition::BeforeFirst => {
+                let res = match last_rowid_in_mvcc_index {
+                    None => 1,
+                    Some(k) => k.to_int_or_panic() + 1,
+                };
+                Ok(IOResult::Done(res))
+            }
+            CursorPosition::End => {
+                let res = match last_rowid_in_mvcc_index {
+                    None => 1,
+                    Some(k) => k.to_int_or_panic() + 1,
+                };
+                Ok(IOResult::Done(res))
+            }
         }
     }
 
@@ -393,12 +437,12 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
     }
 
     fn query_btree_version_is_valid(&self, key: &RowKey) -> bool {
+        let res = self
+            .db
+            .find_row_last_version_state(self.table_id, key, self.tx_id);
+        tracing::trace!("query_btree_version_is_valid: {:?}, key: {:?}", res, key);
         // If the row is not found in MVCC index, this means row_id is valid in btree
-        matches!(
-            self.db
-                .find_row_last_version_state(self.table_id, key, self.tx_id),
-            RowVersionState::NotFound
-        )
+        matches!(res, RowVersionState::NotFound)
     }
 
     /// Advance MVCC iterator and return next visible row key in the direction that the iterator was initialized in.
@@ -788,12 +832,14 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
 
         // Initialize MVCC iterator to last position
         match &self.mv_cursor_type {
-            MvccCursorType::Table => match self
-                .db
-                .get_last_table_rowid(self.table_id, &mut self.table_iterator)
-            {
+            MvccCursorType::Table => match self.db.get_last_table_rowid(
+                self.table_id,
+                &mut self.table_iterator,
+                self.tx_id,
+            ) {
                 Some(k) => {
                     let mut peek = self.dual_peek.borrow_mut();
+                    tracing::trace!("last: mvcc_key: {:?}", k);
                     peek.mvcc_peek = CursorPeek::Row(k);
                 }
                 None => {

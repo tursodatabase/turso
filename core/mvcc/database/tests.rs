@@ -1682,6 +1682,7 @@ fn test_cursor_with_btree_and_mvcc_fuzz() {
     let mut rows_in_db = sorted_vec::SortedVec::new();
     let mut seen = HashSet::new();
     let (mut rng, _seed) = rng_from_time_or_env();
+    println!("seed: {_seed}");
 
     let mut maybe_conn = Some(db.connect());
     {
@@ -1733,8 +1734,9 @@ fn test_cursor_with_btree_and_mvcc_fuzz() {
                         break value;
                     }
                 };
-                conn.execute(format!("INSERT INTO t VALUES ({value})").as_str())
-                    .unwrap();
+                let query = format!("INSERT INTO t VALUES ({value})");
+                println!("inserting: {query}");
+                conn.execute(query.as_str()).unwrap();
                 rows_in_db.push(value);
             }
             Op::Delete => {
@@ -1743,23 +1745,48 @@ fn test_cursor_with_btree_and_mvcc_fuzz() {
                 }
                 let index = rng.random_range(0..rows_in_db.len());
                 let value = rows_in_db[index];
-                conn.execute(format!("DELETE FROM t WHERE x = {value}").as_str())
-                    .unwrap();
+                let query = format!("DELETE FROM t WHERE x = {value}");
+                println!("deleting: {query}");
+                conn.execute(query.as_str()).unwrap();
                 rows_in_db.remove_index(index);
                 seen.remove(&value);
             }
             Op::SelectForward => {
                 let rows = get_rows(conn, "SELECT * FROM t order by x asc");
-                assert_eq!(rows.len(), rows_in_db.len());
+                assert_eq!(
+                    rows.len(),
+                    rows_in_db.len(),
+                    "expected {} rows, got {}",
+                    rows_in_db.len(),
+                    rows.len()
+                );
                 for (row, expected_rowid) in rows.iter().zip(rows_in_db.iter()) {
-                    assert_eq!(row[0].as_int().unwrap(), *expected_rowid);
+                    assert_eq!(
+                        row[0].as_int().unwrap(),
+                        *expected_rowid,
+                        "expected row id {}  got {}",
+                        *expected_rowid,
+                        row[0].as_int().unwrap()
+                    );
                 }
             }
             Op::SelectBackward => {
                 let rows = get_rows(conn, "SELECT * FROM t order by x desc");
-                assert_eq!(rows.len(), rows_in_db.len());
+                assert_eq!(
+                    rows.len(),
+                    rows_in_db.len(),
+                    "expected {} rows, got {}",
+                    rows_in_db.len(),
+                    rows.len()
+                );
                 for (row, expected_rowid) in rows.iter().zip(rows_in_db.iter().rev()) {
-                    assert_eq!(row[0].as_int().unwrap(), *expected_rowid);
+                    assert_eq!(
+                        row[0].as_int().unwrap(),
+                        *expected_rowid,
+                        "expected row id {}  got {}",
+                        *expected_rowid,
+                        row[0].as_int().unwrap()
+                    );
                 }
             }
             Op::SeekForward => {
@@ -1774,9 +1801,21 @@ fn test_cursor_with_btree_and_mvcc_fuzz() {
                     .cloned()
                     .collect::<Vec<i64>>();
 
-                assert_eq!(rows.len(), filtered_rows_in_db.len());
+                assert_eq!(
+                    rows.len(),
+                    filtered_rows_in_db.len(),
+                    "expected {} rows, got {}",
+                    filtered_rows_in_db.len(),
+                    rows.len()
+                );
                 for (row, expected_rowid) in rows.iter().zip(filtered_rows_in_db.iter()) {
-                    assert_eq!(row[0].as_int().unwrap(), *expected_rowid);
+                    assert_eq!(
+                        row[0].as_int().unwrap(),
+                        *expected_rowid,
+                        "expected row id {}  got {}",
+                        *expected_rowid,
+                        row[0].as_int().unwrap()
+                    );
                 }
             }
             Op::SeekBackward => {
@@ -1791,9 +1830,21 @@ fn test_cursor_with_btree_and_mvcc_fuzz() {
                     .cloned()
                     .collect::<Vec<i64>>();
 
-                assert_eq!(rows.len(), filtered_rows_in_db.len());
+                assert_eq!(
+                    rows.len(),
+                    filtered_rows_in_db.len(),
+                    "expected {} rows, got {}",
+                    filtered_rows_in_db.len(),
+                    rows.len()
+                );
                 for (row, expected_rowid) in rows.iter().zip(filtered_rows_in_db.iter().rev()) {
-                    assert_eq!(row[0].as_int().unwrap(), *expected_rowid);
+                    assert_eq!(
+                        row[0].as_int().unwrap(),
+                        *expected_rowid,
+                        "expected row id {}  got {}",
+                        *expected_rowid,
+                        row[0].as_int().unwrap()
+                    );
                 }
             }
             Op::Checkpoint => {
@@ -1861,4 +1912,27 @@ fn test_cursor_with_btree_and_mvcc_seek_after_checkpoint() {
     let res = get_rows(&conn, "SELECT * FROM t WHERE x = 2");
     assert_eq!(res.len(), 1);
     assert_eq!(res[0][0].as_int().unwrap(), 2);
+}
+
+#[test]
+fn test_cursor_with_btree_and_mvcc_delete_after_checkpoint() {
+    tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_max_level(tracing_subscriber::filter::LevelFilter::TRACE)
+        .init();
+    let mut db = MvccTestDbNoConn::new_with_random_db();
+    // First write some rows and checkpoint so data is flushed to BTree file (.db)
+    {
+        let conn = db.connect();
+        conn.execute("CREATE TABLE t(x integer primary key)")
+            .unwrap();
+        conn.execute("INSERT INTO t VALUES (1)").unwrap();
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+    }
+    // Now restart so new connection will have to read data from BTree instead of MVCC.
+    db.restart();
+    let conn = db.connect();
+    conn.execute("DELETE FROM t WHERE x = 1").unwrap();
+    let rows = get_rows(&conn, "SELECT * FROM t order by x desc");
+    assert_eq!(rows.len(), 0);
 }
