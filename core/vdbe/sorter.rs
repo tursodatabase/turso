@@ -288,7 +288,7 @@ impl Sorter {
     fn next_from_chunk_heap(&mut self) -> Result<IOResult<Option<SortableImmutableRecord>>> {
         // If there is a pending IO, we must wait for it before popping from the heap,
         // otherwise we might return records out of order.
-        if let Some((completion, chunk_idx)) = self.pending_completion.take() {
+        while let Some((completion, chunk_idx)) = self.pending_completion.take() {
             if !completion.succeeded() {
                 // IO not complete - put it back and yield
                 self.pending_completion = Some((completion.clone(), chunk_idx));
@@ -298,7 +298,6 @@ impl Sorter {
             if let Some(c) = self.push_to_chunk_heap(chunk_idx)? {
                 self.pending_completion = Some((c, chunk_idx));
             }
-            return self.next_from_chunk_heap();
         }
 
         // No pending IO - safe to pop from heap
