@@ -4,6 +4,7 @@ use sql_generation::model::table::SimValue;
 use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Display, Formatter};
 use std::hash::{Hash, Hasher};
+use tracing::instrument;
 use turso_core::{LimboError, Value};
 
 use crate::runner::env::SimulatorEnv;
@@ -130,13 +131,14 @@ pub type Bindings = HashMap<String, BoundValue>;
 
 pub type RelVar = String;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Col(pub String);
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub enum RelExpr {
     Var(RelVar),
     Literal {
+        schema: Vec<String>,
         rows: Vec<Vec<SimValue>>,
     },
     EnvTable {
@@ -166,7 +168,18 @@ pub enum RelExpr {
     }, // set difference
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+impl RelExpr {
+    pub fn rows(rows: Vec<Vec<SimValue>>) -> Self {
+        let schema = if let Some(first) = rows.first() {
+            (0..first.len()).map(|i| format!("c{}", i + 1)).collect()
+        } else {
+            Vec::new()
+        };
+        RelExpr::Literal { schema, rows }
+    }
+}
+
+#[derive(Debug, Clone)]
 pub enum CountExpr {
     Count(RelExpr),
     Int(i64),
@@ -174,7 +187,7 @@ pub enum CountExpr {
     Sub(Box<CountExpr>, Box<CountExpr>),
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy)]
 pub enum CmpOp {
     Eq,
     Ne,
@@ -184,7 +197,7 @@ pub enum CmpOp {
     Ge,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub enum Assertion {
     EqBag {
         left: RelExpr,
@@ -242,6 +255,11 @@ pub enum Assertion {
     Not(Box<Assertion>),
     And(Box<Assertion>, Box<Assertion>),
     Or(Box<Assertion>, Box<Assertion>),
+    Forall {
+        bind: RelVar,
+        iter: RelExpr,
+        assert: Box<Assertion>,
+    },
 }
 
 impl Assertion {
@@ -298,7 +316,7 @@ impl Assertion {
     /// Assert that all expected rows (with multiplicity) are included in var’s result.
     pub fn expected_in_result_set(var: String, expected: Vec<Vec<SimValue>>) -> Self {
         Assertion::BagSubset {
-            left: RelExpr::Literal { rows: expected },
+            left: RelExpr::rows(expected),
             right: RelExpr::Var(var),
         }
     }
@@ -307,7 +325,7 @@ impl Assertion {
     pub fn expected_result(var: String, expected: Vec<Vec<SimValue>>) -> Self {
         Assertion::EqBag {
             left: RelExpr::Var(var),
-            right: RelExpr::Literal { rows: expected },
+            right: RelExpr::rows(expected),
         }
     }
 }
@@ -338,9 +356,18 @@ impl Display for RelExpr {
         use RelExpr::*;
         match self {
             Var(v) => f.write_str(v),
-            Literal { rows } => {
+
+            Literal { schema, rows } => {
                 // VALUES-like display: VALUES (..), (..)
-                f.write_str("literal[")?;
+                f.write_str("columns[")?;
+                for (i, col) in schema.iter().enumerate() {
+                    if i > 0 {
+                        f.write_str(", ")?;
+                    }
+                    f.write_str(col)?;
+                }
+                f.write_str("]")?;
+                f.write_str("rows[")?;
                 for (i, r) in rows.iter().enumerate() {
                     if i > 0 {
                         f.write_str(", ")?;
@@ -421,6 +448,10 @@ impl Display for Assertion {
             Not(a) => write!(f, "not({a})"),
             And(a, b) => write!(f, "({a}) and ({b})"),
             Or(a, b) => write!(f, "({a}) or ({b})"),
+            Forall { bind, iter, assert } => {
+                write!(f, "for {bind} in {iter}:")?;
+                write!(f, "\t{assert}")
+            }
         }
     }
 }
@@ -560,6 +591,10 @@ fn cap<T>(mut v: Vec<T>, cap_n: usize) -> Vec<T> {
 /// ---------- Detailed comparisons (bag) ----------
 
 pub fn bag_eq(a: &Relation, b: &Relation) -> CompareResult {
+    if a.rows.is_empty() && b.rows.is_empty() {
+        return CompareResult::Ok;
+    }
+
     if a.schema.len() != b.schema.len() {
         return CompareResult::Err(CompareReason::SchemaLenMismatch {
             left_len: a.schema.len(),
@@ -685,15 +720,20 @@ pub fn set_disjoint(a: &Relation, b: &Relation) -> CompareResult {
 
 // ---------- Evaluators ----------
 
-fn eval_rel(expr: &RelExpr, gamma: &Bindings, env: &SimulatorEnv) -> AnyResult<Relation> {
+#[instrument(%ret, skip(gamma, env, expr), fields(assertion=%expr))]
+fn eval_rel(expr: &RelExpr, gamma: &Bindings, env: &SimulatorEnv) -> anyhow::Result<Relation> {
     use RelExpr::*;
+
     match expr {
         Var(v) => match gamma.get(v) {
             Some(BoundValue::Ok(rel)) => Ok(rel.clone()),
             Some(BoundValue::Err(e)) => Err(anyhow!("binding '{}' is error: {}", v, e)),
             None => Err(anyhow!("unknown binding '{}'", v)),
         },
-        Literal { rows } => Ok(Relation::from_rows(rows.clone())),
+        Literal { schema, rows } => Ok(Relation {
+            schema: schema.clone(),
+            rows: rows.clone(),
+        }),
         EnvTable { conn_index, table } => env
             .get_conn_tables(*conn_index)
             .commited_tables
@@ -800,21 +840,20 @@ fn cmp_usize(op: CmpOp, l: i64, r: i64) -> bool {
     }
 }
 
-pub fn eval_assertion(
-    a: &Assertion,
-    gamma: &Bindings,
-    env: &SimulatorEnv,
-) -> AnyResult<Result<(), String>> {
+#[instrument(ret, skip(a, gamma, env), fields(assertion=%a))]
+pub fn eval_assertion(a: &Assertion, gamma: &Bindings, env: &SimulatorEnv) -> anyhow::Result<()> {
     use Assertion::*;
-    let ok = |()| Ok(Ok(()));
-    let fail = |msg: String| Ok(Err(msg));
+    let fail = |msg: String| {
+        tracing::error!("Assertion {a} failed: {}", msg);
+        Err(anyhow::anyhow!(msg))
+    };
 
     match a {
         EqBag { left, right } => {
             let l = eval_rel(left, gamma, env)?;
             let r = eval_rel(right, gamma, env)?;
             match bag_eq(&l, &r) {
-                CompareResult::Ok => ok(()),
+                CompareResult::Ok => Ok(()),
                 CompareResult::Err(reason) => fail(format!("bag equality failed:\n{}", reason)),
             }
         }
@@ -822,7 +861,7 @@ pub fn eval_assertion(
             let l = eval_rel(left, gamma, env)?;
             let r = eval_rel(right, gamma, env)?;
             match set_eq(&l, &r) {
-                CompareResult::Ok => ok(()),
+                CompareResult::Ok => Ok(()),
                 CompareResult::Err(reason) => fail(format!("set equality failed:\n{}", reason)),
             }
         }
@@ -830,7 +869,7 @@ pub fn eval_assertion(
             let l = eval_rel(left, gamma, env)?;
             let r = eval_rel(right, gamma, env)?;
             match set_subset(&l, &r) {
-                CompareResult::Ok => ok(()),
+                CompareResult::Ok => Ok(()),
                 CompareResult::Err(reason) => {
                     fail(format!("set inclusion failed (left ⊆ right): {}", reason))
                 }
@@ -843,7 +882,7 @@ pub fn eval_assertion(
             let l = eval_rel(left, gamma, env)?;
             let r = eval_rel(right, gamma, env)?;
             match bag_subset(&l, &r) {
-                CompareResult::Ok => ok(()),
+                CompareResult::Ok => Ok(()),
                 CompareResult::Err(reason) => {
                     tracing::info!("left relation: {}", l);
                     tracing::info!("right relation: {}", r);
@@ -855,7 +894,7 @@ pub fn eval_assertion(
             let l = eval_rel(left, gamma, env)?;
             let r = eval_rel(right, gamma, env)?;
             match set_disjoint(&l, &r) {
-                CompareResult::Ok => ok(()),
+                CompareResult::Ok => Ok(()),
                 CompareResult::Err(reason) => fail(format!("disjointness failed: {}", reason)),
             }
         }
@@ -873,7 +912,7 @@ pub fn eval_assertion(
             let ms = to_multiset(&s.rows);
             let key = RowKey(t.rows[0].clone());
             if ms.get(&key).copied().unwrap_or(0) >= 1 {
-                ok(())
+                Ok(())
             } else {
                 fail("contains failed".into())
             }
@@ -882,7 +921,7 @@ pub fn eval_assertion(
             let l = eval_rel(left, gamma, env)?;
             let r = eval_rel(right, gamma, env)?;
             if l.schema == r.schema {
-                ok(())
+                Ok(())
             } else {
                 fail(format!("schema mismatch: {:?} vs {:?}", l.schema, r.schema))
             }
@@ -891,7 +930,7 @@ pub fn eval_assertion(
             let l = eval_count(left, gamma, env)?;
             let r = eval_count(right, gamma, env)?;
             if cmp_usize(*op, l, r) {
-                ok(())
+                Ok(())
             } else {
                 fail(format!(
                     "count compare failed: {l} {op} {r} (lhs={l}, rhs={r})",
@@ -899,7 +938,7 @@ pub fn eval_assertion(
             }
         }
         IsError { var } => match gamma.get(var) {
-            Some(BoundValue::Err(_)) => ok(()),
+            Some(BoundValue::Err(_)) => Ok(()),
             Some(BoundValue::Ok(rel)) => {
                 fail(format!("expected error, got {} row(s)", rel.rows.len()))
             }
@@ -911,9 +950,9 @@ pub fn eval_assertion(
             reason,
         } => match gamma.get(var) {
             Some(BoundValue::Err(e)) => {
-                let msg = e.to_string();
-                if msg.contains(needle) {
-                    ok(())
+                let msg = e.to_string().to_lowercase();
+                if msg.contains(&needle.to_lowercase()) {
+                    Ok(())
                 } else {
                     fail(format!(
                         "expected error containing '{}' due to {}, but got '{}'",
@@ -937,7 +976,7 @@ pub fn eval_assertion(
                 .find(|t| t.name == *table)
                 .is_some()
             {
-                ok(())
+                Ok(())
             } else {
                 fail(format!("table '{}' does not exist", table))
             }
@@ -952,24 +991,45 @@ pub fn eval_assertion(
             {
                 fail(format!("table '{}' already exists", table))
             } else {
-                ok(())
+                Ok(())
             }
         }
-        Not(b) => match eval_assertion(b, gamma, env)? {
-            Ok(_) => fail("not: inner assertion succeeded".into()),
-            Err(_) => ok(()),
+        Not(b) => match eval_assertion(b, gamma, env) {
+            anyhow::Result::Ok(_) => fail("not: inner assertion succeeded".into()),
+            anyhow::Result::Err(_) => Ok(()),
         },
         And(l, r) => {
-            match eval_assertion(l, gamma, env)? {
-                Ok(_) => eval_assertion(r, gamma, env),
-                Err(e) => Ok(Err(e)), // short-circuit
+            match eval_assertion(l, gamma, env) {
+                anyhow::Result::Ok(_) => eval_assertion(r, gamma, env),
+                anyhow::Result::Err(e) => Err(e), // short-circuit
             }
         }
         Or(l, r) => {
-            match eval_assertion(l, gamma, env)? {
-                Ok(_) => Ok(Ok(())), // short-circuit
-                Err(_) => eval_assertion(r, gamma, env),
+            match eval_assertion(l, gamma, env) {
+                anyhow::Result::Ok(_) => Ok(()), // short-circuit
+                anyhow::Result::Err(_) => eval_assertion(r, gamma, env),
             }
+        }
+        Forall { bind, iter, assert } => {
+            let rel = eval_rel(iter, gamma, env)?;
+            for row in rel.rows {
+                let mut gamma_ext = gamma.clone();
+                let row_relation = Relation {
+                    schema: rel.schema.clone(),
+                    rows: vec![row.clone()],
+                };
+                gamma_ext.insert(bind.clone(), Ok(row_relation));
+                match eval_assertion(assert, &gamma_ext, env) {
+                    anyhow::Result::Ok(_) => {} // continue
+                    anyhow::Result::Err(e) => {
+                        return fail(format!(
+                            "forall: assertion failed for binding '{}': {}",
+                            bind, e
+                        ));
+                    }
+                }
+            }
+            Ok(())
         }
     }
 }

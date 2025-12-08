@@ -12,23 +12,20 @@ use sql_generation::{
         table::SimValue,
     },
 };
-use turso_core::{LimboError, types};
-use turso_parser::ast::{self, Distinctness, Expr, Literal, Name};
+use turso_core::types;
+use turso_parser::ast::{self, Distinctness, Expr, Name};
 
 use crate::{
-    common::print_diff,
     generation::{
-        Shadow as _,
-        assertion::{Assertion, CmpOp, CountExpr, RelExpr},
+        assertion::{Assertion, CmpOp, Col, CountExpr, RelExpr, RelVar},
         plan::{Control, InteractionType},
-        value_to_literal,
     },
     model::Query,
     profiles::query::QueryProfile,
     runner::env::SimulatorEnv,
 };
 
-use super::plan::{Interaction, InteractionStats, ResultSet};
+use super::plan::{Interaction, InteractionStats};
 
 /// Properties are representations of executable specifications
 /// about the database behavior.
@@ -289,7 +286,7 @@ impl Property {
                     InteractionType::Query(Query::Update(update.clone())),
                 );
 
-                // 2) Original SELECT (as provided)
+                // 2) Execute the SELECT
                 let q_sel_name = "q_sel".to_string();
                 let sel_orig = Interaction::new(
                     connection_index,
@@ -297,41 +294,29 @@ impl Property {
                 )
                 .bind(q_sel_name.clone());
 
-                // 3) Build a WHERE that adds col = value for each updated column
-                //    (keep FROM, columns, distinctness, etc. identical to `select`)
-                let mut eq_conjuncts: Vec<Predicate> = Vec::new();
-                for (col, val) in &update.set_values {
-                    // Expr/Predicate construction: adapt to your actual constructors
-                    let lhs = Expr::Name(Name::exact(col.clone()));
-                    let rhs = Expr::Literal(value_to_literal(&val.0));
-                    eq_conjuncts.push(Predicate::eq(Predicate(lhs), Predicate(rhs)));
+                let mut interactions = vec![assumption, upd, sel_orig];
+                // 3) Assert that the updated values are in the SELECT result
+                for (i, (col, val)) in update.set_values.iter().enumerate() {
+                    // for row in eval(q_sel):
+                    //     assert row[col] == val
+                    let assertion = InteractionType::Assertion(Assertion::Forall {
+                        bind: format!("row_{}", i),
+                        iter: RelExpr::Var(q_sel_name.clone()),
+                        assert: Box::new(Assertion::EqBag {
+                            left: RelExpr::Literal {
+                                schema: vec![col.clone()],
+                                rows: vec![vec![val.clone()]],
+                            },
+                            right: RelExpr::Project {
+                                input: Box::new(RelExpr::Var(format!("row_{}", i))),
+                                cols: vec![Col(col.clone())],
+                            },
+                        }),
+                    });
+                    interactions.push(Interaction::new(connection_index, assertion));
                 }
 
-                let mut where_chk_parts = vec![select.body.select.where_clause.clone()];
-                where_chk_parts.extend(eq_conjuncts);
-                let where_chk = Predicate::and(where_chk_parts);
-
-                let mut select_chk = select.clone();
-                select_chk.body.select.where_clause = where_chk;
-
-                let q_chk_name = "q_chk".to_string();
-                let sel_chk = Interaction::new(
-                    connection_index,
-                    InteractionType::Query(Query::Select(select_chk)),
-                )
-                .bind(q_chk_name.clone());
-
-                // 4) Assertion: count(q_sel) == count(q_chk)
-                let assertion = Interaction::new(
-                    connection_index,
-                    InteractionType::Assertion(Assertion::CountCmp {
-                        left: CountExpr::Count(RelExpr::Var(q_sel_name.clone())),
-                        op: CmpOp::Eq,
-                        right: CountExpr::Count(RelExpr::Var(q_chk_name.clone())),
-                    }),
-                );
-
-                vec![assumption, upd, sel_orig, sel_chk, assertion]
+                interactions
             }
 
             Property::InsertValuesSelect {
@@ -444,10 +429,13 @@ impl Property {
                         Interaction::new(connection_index, InteractionType::Assumption(a))
                     }),
                 );
-                interactions.push(Interaction::new(
-                    connection_index,
-                    InteractionType::Query(Query::Select(select.clone())),
-                ));
+                interactions.push(
+                    Interaction::new(
+                        connection_index,
+                        InteractionType::Query(Query::Select(select.clone())),
+                    )
+                    .bind("q1".to_string()),
+                );
                 interactions.push(Interaction::new(connection_index, assertion));
                 interactions
             }

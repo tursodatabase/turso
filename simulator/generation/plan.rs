@@ -720,7 +720,7 @@ impl Display for Interaction {
         if let Some(binding) = &self.binding {
             writeln!(f, "-- @bind {}", binding)?;
         }
-        write!(f, "{}; -- {}", self.interaction, self.connection_index)
+        write!(f, "{} -- {}", self.interaction, self.connection_index)
     }
 }
 
@@ -859,17 +859,12 @@ impl InteractionType {
     ) -> Result<()> {
         match self {
             Self::Assertion(assertion) => match eval_assertion(assertion, bindings, env) {
-                Ok(Ok(())) => Ok(()),
-                Ok(Err(msg)) => Err(LimboError::InternalError(format!(
-                    "Assertion '{}' failed: {msg}",
-                    assertion
-                ))
-                .into()),
-                Err(e) => Err(LimboError::InternalError(format!(
+                anyhow::Result::Ok(_) => Ok(()),
+                anyhow::Result::Err(e) => Err(LimboError::InternalError(format!(
                     "Assertion '{}' evaluation error: {e}",
                     assertion
-                ))
-                .into()),
+                )))
+                .into(),
             },
             _ => unreachable!("execute_assertion only valid for Assertion"),
         }
@@ -882,13 +877,8 @@ impl InteractionType {
     ) -> Result<()> {
         match self {
             Self::Assumption(assert) => match eval_assertion(assert, bindings, env) {
-                Ok(Ok(())) => Ok(()),
-                Ok(Err(msg)) => Err(LimboError::InternalError(format!(
-                    "Assumption '{}' failed: {}",
-                    assert, msg
-                ))
-                .into()),
-                Err(e) => Err(LimboError::InternalError(format!(
+                anyhow::Result::Ok(_) => Ok(()),
+                anyhow::Result::Err(e) => Err(LimboError::InternalError(format!(
                     "Assumption '{}' evaluation error: {e}",
                     assert
                 ))
@@ -1190,6 +1180,11 @@ fn random_delete<R: rand::Rng>(rng: &mut R, env: &SimulatorEnv, conn_index: usiz
 }
 
 fn random_update<R: rand::Rng>(rng: &mut R, env: &SimulatorEnv, conn_index: usize) -> Interactions {
+    tracing::trace!(
+        "Generating Update interaction for connection {} with env {:?}",
+        conn_index,
+        env
+    );
     Interactions::new(
         conn_index,
         InteractionsType::Query(Query::Update(Update::arbitrary(
@@ -1258,6 +1253,12 @@ impl ArbitraryFrom<(&SimulatorEnv, InteractionStats, usize)> for Interactions {
             &env.profile.query,
             &stats,
             env.profile.experimental_mvcc,
+        );
+        tracing::trace!(
+            "Generating random interaction for conn {} with remaining {:?} and stats {}",
+            conn_index,
+            remaining_,
+            stats
         );
         frequency(
             vec![

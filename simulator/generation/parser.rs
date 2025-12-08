@@ -1,7 +1,5 @@
 use std::path::Path;
 
-use pest::Parser; // bring trait into scope for PlanPest::parse
-use pest_derive::Parser;
 use turso_parser::{ast::Cmd, parser::Parser as SqlParser};
 
 use crate::{
@@ -9,13 +7,8 @@ use crate::{
     model::Query,
 };
 
-#[derive(Parser)]
-#[grammar = "generation/plan.pest"]
-struct PlanPest;
-
 pub fn parse_plan_file(plan_path: &Path) -> InteractionPlan {
     let input = std::fs::read_to_string(plan_path).unwrap();
-    let _pairs = PlanPest::parse(Rule::plan, &input).expect("plan parse error");
 
     // Fallback simple line-based extraction using SQL parser until full pest mapping is wired
     let mut plan = InteractionPlan::new(false);
@@ -37,11 +30,12 @@ pub fn parse_plan_file(plan_path: &Path) -> InteractionPlan {
         }
         let mut p = SqlParser::new(sql.as_bytes());
         if let Some(Ok(Cmd::Stmt(stmt))) = p.next() {
-            let query = Query::from(stmt);
-            plan.push(Interactions::new(
-                conn_index,
-                InteractionsType::Query(query),
-            ));
+            todo!()
+            // let query = Query::from(stmt);
+            // plan.push(Interactions::new(
+            //     conn_index,
+            //     InteractionsType::Query(query),
+            // ));
         }
     }
     plan

@@ -1,4 +1,4 @@
-use std::fmt::Display;
+use std::fmt::{Debug, Display};
 use std::mem;
 use std::ops::{Deref, DerefMut};
 use std::panic::UnwindSafe;
@@ -177,6 +177,23 @@ pub(crate) struct SimulatorEnv {
     connection_last_query: Bitmap<64>,
     // Table data that is committed into the database or wal
     pub committed_tables: Vec<Table>,
+}
+
+impl Debug for SimulatorEnv {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SimulatorEnv")
+            .field("opts", &self.opts)
+            .field("#connections", &self.connections.len())
+            .field("seed", &self.seed)
+            .field("paths", &self.paths)
+            .field("type_", &self.type_)
+            .field("phase", &self.phase)
+            .field("memory_io", &self.memory_io)
+            .field("memorized_values", &self.memorized_values)
+            .field("connection_tables", &self.connection_tables)
+            .field("committed_tables", &self.committed_tables)
+            .finish()
+    }
 }
 
 impl UnwindSafe for SimulatorEnv {}
@@ -484,7 +501,14 @@ impl SimulatorEnv {
         }
 
         let tables = self.get_conn_tables(conn_index).tables();
-
+        tracing::trace!(
+            "Generating connection context with tables: {}",
+            tables
+                .iter()
+                .map(|t| t.to_string())
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
         ConnectionGenContext {
             opts: &self.profile.query.gen_opts,
             tables,

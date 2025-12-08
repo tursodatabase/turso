@@ -38,78 +38,78 @@ pub enum Query {
     Rollback(Rollback),
 }
 
-impl From<turso_parser::ast::Stmt> for Query {
-    fn from(stmt: Stmt) -> Self {
-        match stmt {
-            Stmt::CreateTable {
-                temporary,
-                if_not_exists,
-                tbl_name,
-                body,
-            } => Query::Create(Create::from((temporary, if_not_exists, tbl_name, body))),
-            Stmt::Select(select) => Query::Select(Select::from(select)),
-            Stmt::Insert {
-                with,
-                or_conflict,
-                tbl_name,
-                columns,
-                body,
-                returning,
-            } => Query::Insert(Insert::from((
-                with,
-                or_conflict,
-                tbl_name,
-                columns,
-                body,
-                returning,
-            ))),
-            Stmt::Delete {
-                with,
-                tbl_name,
-                indexed,
-                where_clause,
-                returning,
-                order_by,
-                limit,
-            } => Query::Delete(Delete::from((
-                with,
-                tbl_name,
-                indexed,
-                where_clause,
-                returning,
-                order_by,
-                limit,
-            ))),
-            Stmt::Update(update) => Query::Update(Update::from(update)),
-            Stmt::DropTable {
-                if_exists,
-                tbl_name,
-            } => Query::Drop(Drop::from((if_exists, tbl_name))),
-            Stmt::CreateIndex {
-                unique,
-                if_not_exists,
-                idx_name,
-                tbl_name,
-                columns,
-                where_clause,
-            } => Query::CreateIndex(CreateIndex::from((
-                unique,
-                if_not_exists,
-                idx_name,
-                tbl_name,
-                columns,
-                where_clause,
-            ))),
-            Stmt::Begin { typ, name } => Query::Begin(Begin::from((typ, name))),
-            Stmt::Commit { name } => Query::Commit(Commit::from(name)),
-            Stmt::Rollback {
-                name,
-                tx_name,
-                savepoint_name,
-            } => Query::Rollback(Rollback::from((name, tx_name, savepoint_name))),
-        }
-    }
-}
+// impl From<turso_parser::ast::Stmt> for Query {
+//     fn from(stmt: Stmt) -> Self {
+//         match stmt {
+//             Stmt::CreateTable {
+//                 temporary,
+//                 if_not_exists,
+//                 tbl_name,
+//                 body,
+//             } => Query::Create(Create::from((temporary, if_not_exists, tbl_name, body))),
+//             Stmt::Select(select) => Query::Select(Select::from(select)),
+//             Stmt::Insert {
+//                 with,
+//                 or_conflict,
+//                 tbl_name,
+//                 columns,
+//                 body,
+//                 returning,
+//             } => Query::Insert(Insert::from((
+//                 with,
+//                 or_conflict,
+//                 tbl_name,
+//                 columns,
+//                 body,
+//                 returning,
+//             ))),
+//             Stmt::Delete {
+//                 with,
+//                 tbl_name,
+//                 indexed,
+//                 where_clause,
+//                 returning,
+//                 order_by,
+//                 limit,
+//             } => Query::Delete(Delete::from((
+//                 with,
+//                 tbl_name,
+//                 indexed,
+//                 where_clause,
+//                 returning,
+//                 order_by,
+//                 limit,
+//             ))),
+//             Stmt::Update(update) => Query::Update(Update::from(update)),
+//             Stmt::DropTable {
+//                 if_exists,
+//                 tbl_name,
+//             } => Query::Drop(Drop::from((if_exists, tbl_name))),
+//             Stmt::CreateIndex {
+//                 unique,
+//                 if_not_exists,
+//                 idx_name,
+//                 tbl_name,
+//                 columns,
+//                 where_clause,
+//             } => Query::CreateIndex(CreateIndex::from((
+//                 unique,
+//                 if_not_exists,
+//                 idx_name,
+//                 tbl_name,
+//                 columns,
+//                 where_clause,
+//             ))),
+//             Stmt::Begin { typ, name } => Query::Begin(Begin::from((typ, name))),
+//             Stmt::Commit { name } => Query::Commit(Commit::from(name)),
+//             Stmt::Rollback {
+//                 name,
+//                 tx_name,
+//                 savepoint_name,
+//             } => Query::Rollback(Rollback::from((name, tx_name, savepoint_name))),
+//         }
+//     }
+// }
 
 impl Query {
     pub fn dependencies(&self) -> IndexSet<String> {

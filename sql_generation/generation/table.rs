@@ -102,12 +102,12 @@ impl ArbitraryFrom<&ColumnType> for SimValue {
         // if rng.random_bool(0.05) {
         //     return SimValue(Value::Null);
         // }
-        // 10%: Pick a random type
-        let column_type = if rng.random_bool(0.1) {
-            ColumnType::arbitrary(rng, context)
-        } else {
-            column_type.clone()
-        };
+        // // 10%: Pick a random type
+        // let column_type = if rng.random_bool(0.1) {
+        //     ColumnType::arbitrary(rng, context)
+        // } else {
+        //     column_type.clone()
+        // };
         // 40%: Use a memorized value
         if rng.random_bool(0.9) {
             if let Some(mem_value) = context

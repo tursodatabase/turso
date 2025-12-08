@@ -2358,10 +2358,9 @@ dependencies = [
  "itertools 0.14.0",
  "json5",
  "log",
+ "nom",
  "notify",
  "parking_lot",
- "pest",
- "pest_derive",
  "rand 0.9.2",
  "rand_chacha 0.9.0",
  "regex",
@@ -2674,6 +2673,15 @@ name = "nohash-hasher"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2bf50223579dc7cdcfb3bfcacf7069ff68243f8c363f62ffa99cf000a6b9c451"
+
+[[package]]
+name = "nom"
+version = "8.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "df9761775871bdef83bee530e60050f7e54b1105350d6884eb0fb4f46c2f9405"
+dependencies = [
+ "memchr",
+]
 
 [[package]]
 name = "notify"

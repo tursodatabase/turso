@@ -216,6 +216,7 @@ impl Arbitrary for Select {
         // If experimental indexes are enabled, we can have selects with compounds
         // Otherwise, we just have a single select with no compounds
         let opts = &env.opts().query.select;
+        tracing::trace!("Generating Select with query size option: {:?}", opts);
         let num_compound_selects = if env.opts().indexes {
             opts.compound_selects[rng.sample(opts.compound_select_weighted_index())]
                 .num_compound_selects

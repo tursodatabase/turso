@@ -161,7 +161,7 @@ pub fn execute_interaction(
     }
 }
 
-#[instrument(skip(env, interaction, bindings), fields(conn_index = interaction.connection_index, interaction = %interaction))]
+#[instrument(ret, skip(env, interaction, bindings), fields(conn_index = interaction.connection_index, interaction = %interaction))]
 pub fn execute_interaction_turso(
     env: &mut SimulatorEnv,
     interaction: &Interaction,
@@ -171,11 +171,8 @@ pub fn execute_interaction_turso(
     else {
         unreachable!()
     };
-    // Leave this empty info! here to print the span of the execution
-    tracing::info!("");
     match &interaction.interaction {
         InteractionType::Query(query) => {
-            tracing::debug!(?interaction);
             let results = interaction
                 .execute_query(conn)
                 .inspect_err(|err| tracing::error!(?err));
@@ -262,6 +259,7 @@ pub fn execute_interaction_turso(
             }
         }
     }
+    let _ = interaction.shadow(&mut env.get_conn_tables_mut(interaction.connection_index));
     Ok(ExecutionContinuation::NextInteraction)
 }
 

@@ -48,5 +48,4 @@ either = "1.15.0"
 similar = { workspace = true }
 similar-asserts = { workspace = true }
 bitmaps = { workspace = true }
-pest = "2.7.11"
-pest_derive = "2.7.11"
+nom = "8.0.0"
