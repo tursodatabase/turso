@@ -10,9 +10,8 @@ repository.workspace = true
 description = "Turso Rust API"
 
 [features]
-default = ["experimental_indexes", "mimalloc"]
+default = ["mimalloc"]
 conn_raw_api = ["turso_core/conn_raw_api"]
-experimental_indexes = []
 antithesis = ["turso_core/antithesis"]
 tracing_release = ["turso_core/tracing_release"]
 mimalloc = ["dep:mimalloc"]

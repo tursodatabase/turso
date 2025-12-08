@@ -241,7 +241,6 @@ impl SimulatorEnv {
             turso_core::OpenFlags::default(),
             turso_core::DatabaseOpts::new()
                 .with_mvcc(self.profile.experimental_mvcc)
-                .with_indexes(self.profile.query.gen_opts.indexes)
                 .with_autovacuum(true),
             None,
         ) {
@@ -338,9 +337,6 @@ impl SimulatorEnv {
         if let Some(mvcc) = cli_opts.experimental_mvcc {
             profile.experimental_mvcc = mvcc;
         }
-        if let Some(indexes) = cli_opts.disable_experimental_indexes {
-            profile.query.gen_opts.indexes = indexes;
-        }
         if let Some(latency_prob) = cli_opts.latency_probability {
             profile.io.latency.latency_probability = latency_prob;
         }
@@ -391,7 +387,6 @@ impl SimulatorEnv {
             turso_core::OpenFlags::default(),
             turso_core::DatabaseOpts::new()
                 .with_mvcc(profile.experimental_mvcc)
-                .with_indexes(profile.query.gen_opts.indexes)
                 .with_autovacuum(true),
             None,
         ) {

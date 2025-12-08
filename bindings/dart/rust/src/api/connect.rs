@@ -23,10 +23,10 @@ pub struct ConnectArgs {
 pub async fn connect(args: ConnectArgs) -> RustConnection {
     let database = if args.url == ":memory:" {
         let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::MemoryIO::new());
-        turso_core::Database::open_file(io, args.url.as_str(), false, true)
+        turso_core::Database::open_file(io, args.url.as_str(), false)
     } else {
         let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
-        turso_core::Database::open_file(io, args.url.as_str(), false, true)
+        turso_core::Database::open_file(io, args.url.as_str(), false)
     }
     .unwrap();
     let connection = database.connect().unwrap();

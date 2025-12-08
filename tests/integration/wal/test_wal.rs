@@ -36,7 +36,7 @@ fn test_wal_checkpoint_result(tmp_db: TempDatabase) -> Result<()> {
 fn test_wal_1_writer_1_reader() -> Result<()> {
     maybe_setup_tracing();
     let tmp_db = Arc::new(Mutex::new(TempDatabase::new("test_wal.db")));
-    let db = tmp_db.lock().unwrap().limbo_database(false);
+    let db = tmp_db.lock().unwrap().limbo_database();
 
     {
         let conn = db.connect().unwrap();

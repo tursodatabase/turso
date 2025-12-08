@@ -47,7 +47,6 @@ pub enum DataType {
 pub enum Constraint {
     PrimaryKey,
     NotNull,
-    #[cfg(feature = "experimental_indexes")]
     Unique,
 }
 
@@ -80,13 +79,10 @@ fn generate_random_data_type() -> DataType {
 }
 
 fn generate_random_constraint() -> Constraint {
-    #[cfg(feature = "experimental_indexes")]
     match get_random() % 2 {
         0 => Constraint::NotNull,
         _ => Constraint::Unique,
     }
-    #[cfg(not(feature = "experimental_indexes"))]
-    Constraint::NotNull
 }
 
 fn generate_random_column() -> Column {
@@ -126,37 +122,10 @@ fn generate_random_table() -> Table {
         columns.push(column);
     }
 
-    #[cfg(feature = "experimental_indexes")]
-    {
-        // Then, randomly select one column to be the primary key
-        let pk_index = (get_random() % column_count as u64) as usize;
-        columns[pk_index].constraints.push(Constraint::PrimaryKey);
-        Table { name, columns }
-    }
-    #[cfg(not(feature = "experimental_indexes"))]
-    {
-        // Pick a random column that is exactly INTEGER type to be the primary key (INTEGER PRIMARY KEY does not require indexes,
-        // as it becomes an alias for the ROWID).
-        let pk_candidates = columns
-            .iter()
-            .enumerate()
-            .filter(|(_, col)| col.data_type == DataType::Integer)
-            .map(|(i, _)| i)
-            .collect::<Vec<_>>();
-        if pk_candidates.is_empty() {
-            // if there are no INTEGER columns, make a random column INTEGER and set it as PRIMARY KEY
-            let col_id = (get_random() % column_count as u64) as usize;
-            columns[col_id].data_type = DataType::Integer;
-            columns[col_id].constraints.push(Constraint::PrimaryKey);
-            return Table { name, columns };
-        }
-        let pk_index = pk_candidates
-            .get((get_random() % pk_candidates.len() as u64) as usize)
-            .unwrap();
-        columns[*pk_index].constraints.push(Constraint::PrimaryKey);
-
-        Table { name, columns }
-    }
+    // Then, randomly select one column to be the primary key
+    let pk_index = (get_random() % column_count as u64) as usize;
+    columns[pk_index].constraints.push(Constraint::PrimaryKey);
+    Table { name, columns }
 }
 
 pub fn gen_bool(probability_true: f64) -> bool {
@@ -224,7 +193,6 @@ fn constraint_to_sql(constraint: &Constraint) -> String {
     match constraint {
         Constraint::PrimaryKey => "PRIMARY KEY".to_string(),
         Constraint::NotNull => "NOT NULL".to_string(),
-        #[cfg(feature = "experimental_indexes")]
         Constraint::Unique => "UNIQUE".to_string(),
     }
 }

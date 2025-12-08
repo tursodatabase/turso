@@ -416,12 +416,8 @@ fn create_dedupe_index(
     program: &mut ProgramBuilder,
     left_select: &SelectPlan,
     right_select: &SelectPlan,
-    schema: &Schema,
+    _schema: &Schema,
 ) -> crate::Result<(usize, Arc<Index>)> {
-    if !schema.indexes_enabled {
-        crate::bail_parse_error!("UNION OR INTERSECT or EXCEPT is not supported without indexes");
-    }
-
     let mut dedupe_columns = right_select
         .result_columns
         .iter()

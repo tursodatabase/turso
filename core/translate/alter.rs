@@ -55,14 +55,6 @@ pub fn translate_alter_table(
 
     let table_indexes = resolver.schema.get_indices(table_name).collect::<Vec<_>>();
 
-    if !table_indexes.is_empty() && !resolver.schema.indexes_enabled() {
-        // Let's disable altering a table with indices altogether instead of checking column by
-        // column to be extra safe.
-        crate::bail_parse_error!(
-            "ALTER TABLE for table with indexes is disabled. Omit the `--experimental-indexes=false` flag to enable this feature."
-        );
-    }
-
     let Some(table) = resolver.schema.get_table(table_name) else {
         return Err(LimboError::ParseError(format!(
             "no such table: {table_name}"

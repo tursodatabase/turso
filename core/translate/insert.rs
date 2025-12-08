@@ -74,13 +74,6 @@ fn validate(table_name: &str, resolver: &Resolver, table: &Table) -> Result<()> 
     if resolver.schema.is_materialized_view(table_name) {
         crate::bail_parse_error!("cannot modify materialized view {}", table_name);
     }
-    if resolver.schema.table_has_indexes(table_name) && !resolver.schema.indexes_enabled() {
-        // Let's disable altering a table with indices altogether instead of checking column by
-        // column to be extra safe.
-        crate::bail_parse_error!(
-            "INSERT to table with indexes is disabled. Omit the `--experimental-indexes=false` flag to enable this feature."
-        );
-    }
     if table.btree().is_some_and(|t| !t.has_rowid) {
         crate::bail_parse_error!("INSERT into WITHOUT ROWID table is not supported");
     }

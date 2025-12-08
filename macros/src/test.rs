@@ -65,7 +65,6 @@ impl Args {
 
         let mut db_opts = quote! {
             turso_core::DatabaseOpts::new()
-                .with_indexes(true)
                 .with_index_method(true)
                 .with_encryption(true)
         };

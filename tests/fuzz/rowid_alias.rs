@@ -1,4 +1,4 @@
-use core_tester::common::{limbo_exec_rows, TempDatabase};
+use core_tester::common::{limbo_exec_rows, try_limbo_exec_rows, TempDatabase};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use sql_generation::{
@@ -149,20 +149,26 @@ pub fn rowid_alias_differential_fuzz() {
                 let insert = Insert::arbitrary(&mut rng, &context);
                 let insert_str = insert.to_string();
 
-                // Execute the insert in both databases
-                let _ = limbo_exec_rows(&db_with_alias, &conn_with_alias, &insert_str);
-                let _ = limbo_exec_rows(&db_without_alias, &conn_without_alias, &insert_str);
+                // Execute the insert in both databases, ignoring constraint violations
+                // (e.g., UNIQUE constraint failures on primary key)
+                let result_with_alias =
+                    try_limbo_exec_rows(&db_with_alias, &conn_with_alias, &insert_str);
+                let result_without_alias =
+                    try_limbo_exec_rows(&db_without_alias, &conn_without_alias, &insert_str);
 
-                // Update the table's rows in the context so predicate generation knows about the data
-                if let Insert::Values {
-                    table: table_name,
-                    values,
-                } = &insert
-                {
-                    for table in &mut context.tables {
-                        if table.name == *table_name {
-                            table.rows.extend(values.clone());
-                            break;
+                // Only update context if both inserts succeeded
+                if result_with_alias.is_ok() && result_without_alias.is_ok() {
+                    // Update the table's rows in the context so predicate generation knows about the data
+                    if let Insert::Values {
+                        table: table_name,
+                        values,
+                    } = &insert
+                    {
+                        for table in &mut context.tables {
+                            if table.name == *table_name {
+                                table.rows.extend(values.clone());
+                                break;
+                            }
                         }
                     }
                 }

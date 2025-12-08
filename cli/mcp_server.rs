@@ -417,9 +417,7 @@ impl TursoMcpServer {
                 &path,
                 None::<&str>,
                 OpenFlags::default(),
-                DatabaseOpts::new()
-                    .with_indexes(true)
-                    .with_autovacuum(false),
+                DatabaseOpts::new().with_autovacuum(false),
                 None,
             ) {
                 Ok((_io, db)) => match db.connect() {

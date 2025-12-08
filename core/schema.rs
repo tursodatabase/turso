@@ -181,7 +181,6 @@ pub struct Schema {
     /// table_name to list of indexes for the table
     pub indexes: HashMap<String, VecDeque<Arc<Index>>>,
     pub has_indexes: std::collections::HashSet<String>,
-    pub indexes_enabled: bool,
     pub schema_version: u32,
 
     /// Mapping from table names to the materialized views that depend on them
@@ -191,8 +190,14 @@ pub struct Schema {
     pub incompatible_views: HashSet<String>,
 }
 
+impl Default for Schema {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Schema {
-    pub fn new(indexes_enabled: bool) -> Self {
+    pub fn new() -> Self {
         let mut tables: HashMap<String, Arc<Table>> = HashMap::new();
         let has_indexes = std::collections::HashSet::new();
         let indexes: HashMap<String, VecDeque<Arc<Index>>> = HashMap::new();
@@ -223,7 +228,6 @@ impl Schema {
             triggers,
             indexes,
             has_indexes,
-            indexes_enabled,
             schema_version: 0,
             table_to_materialized_views,
             incompatible_views,
@@ -528,10 +532,6 @@ impl Schema {
         self.has_indexes.insert(table_name.to_string());
     }
 
-    pub fn indexes_enabled(&self) -> bool {
-        self.indexes_enabled
-    }
-
     /// Update [Schema] by scanning the first root page (sqlite_schema)
     pub fn make_from_btree(
         &mut self,
@@ -637,40 +637,30 @@ impl Schema {
         mvcc_enabled: bool,
     ) -> Result<()> {
         for unparsed_sql_from_index in from_sql_indexes {
-            if !self.indexes_enabled() {
-                self.table_set_has_index(&unparsed_sql_from_index.table_name);
-            } else {
-                let table = self
-                    .get_btree_table(&unparsed_sql_from_index.table_name)
-                    .unwrap();
-                let index = Index::from_sql(
-                    syms,
-                    &unparsed_sql_from_index.sql,
-                    unparsed_sql_from_index.root_page,
-                    table.as_ref(),
-                )?;
-                if mvcc_enabled {
-                    if index.columns.iter().any(|c| c.expr.is_some()) {
-                        crate::bail_parse_error!("Expression indexes are not supported with MVCC");
-                    }
-                    if index.where_clause.is_some() {
-                        crate::bail_parse_error!("Partial indexes are not supported with MVCC");
-                    }
-                    if index.index_method.is_some() {
-                        crate::bail_parse_error!(
-                            "Custom index modules are not supported with MVCC"
-                        );
-                    }
+            let table = self
+                .get_btree_table(&unparsed_sql_from_index.table_name)
+                .unwrap();
+            let index = Index::from_sql(
+                syms,
+                &unparsed_sql_from_index.sql,
+                unparsed_sql_from_index.root_page,
+                table.as_ref(),
+            )?;
+            if mvcc_enabled {
+                if index.columns.iter().any(|c| c.expr.is_some()) {
+                    crate::bail_parse_error!("Expression indexes are not supported with MVCC");
                 }
-                self.add_index(Arc::new(index))?;
+                if index.where_clause.is_some() {
+                    crate::bail_parse_error!("Partial indexes are not supported with MVCC");
+                }
+                if index.index_method.is_some() {
+                    crate::bail_parse_error!("Custom index modules are not supported with MVCC");
+                }
             }
+            self.add_index(Arc::new(index))?;
         }
 
         for automatic_index in automatic_indices {
-            if !self.indexes_enabled() {
-                self.table_set_has_index(&automatic_index.0);
-                continue;
-            }
             // Autoindexes must be parsed in definition order.
             // The SQL statement parser enforces that the column definitions come first, and compounds are defined after that,
             // e.g. CREATE TABLE t (a, b, UNIQUE(a, b)), and you can't do something like CREATE TABLE t (a, b, UNIQUE(a, b), c);
@@ -1395,7 +1385,6 @@ impl Clone for Schema {
             triggers,
             indexes,
             has_indexes: self.has_indexes.clone(),
-            indexes_enabled: self.indexes_enabled,
             schema_version: self.schema_version,
             table_to_materialized_views: self.table_to_materialized_views.clone(),
             incompatible_views,
