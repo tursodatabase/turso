@@ -1,10 +1,8 @@
 use std::sync::Arc;
 
-use turso_parser::ast;
-
 use crate::{
     bail_parse_error,
-    schema::BTreeTable,
+    schema::{BTreeTable, Index},
     storage::pager::CreateBTreeFlags,
     translate::{
         emitter::Resolver,
@@ -12,26 +10,65 @@ use crate::{
     },
     util::normalize_ident,
     vdbe::{
+        affinity::Affinity,
         builder::{CursorType, ProgramBuilder},
-        insn::{Insn, RegisterOrLiteral},
+        insn::{Cookie, Insn, RegisterOrLiteral},
     },
     Result,
 };
+use turso_parser::ast;
 
 pub fn translate_analyze(
     target_opt: Option<ast::QualifiedName>,
     resolver: &Resolver,
     mut program: ProgramBuilder,
 ) -> Result<ProgramBuilder> {
-    let Some(target) = target_opt else {
-        bail_parse_error!("ANALYZE with no target is not supported");
+    enum AnalyzeTarget {
+        Table { table: Arc<BTreeTable> },
+        Index { table: Arc<BTreeTable> },
+    }
+
+    let (target_table, target_index) = match target_opt {
+        Some(target) => {
+            let normalized = normalize_ident(target.name.as_str());
+            if let Some(table) = resolver.schema.get_btree_table(&normalized) {
+                (
+                    AnalyzeTarget::Table {
+                        table: table.clone(),
+                    },
+                    None,
+                )
+            } else {
+                // Try to find an index by this name.
+                let mut found: Option<(Arc<BTreeTable>, Arc<Index>)> = None;
+                for (table_name, indexes) in resolver.schema.indexes.iter() {
+                    if let Some(index) = indexes
+                        .iter()
+                        .find(|idx| idx.name.eq_ignore_ascii_case(&normalized))
+                    {
+                        if let Some(table) = resolver.schema.get_btree_table(table_name) {
+                            found = Some((table, index.clone()));
+                            break;
+                        }
+                    }
+                }
+                let Some((table, index)) = found else {
+                    bail_parse_error!("no such table or index: {}", target.name);
+                };
+                (
+                    AnalyzeTarget::Index {
+                        table: table.clone(),
+                    },
+                    Some(index),
+                )
+            }
+        }
+        None => bail_parse_error!("ANALYZE with no target is not supported"),
     };
-    let normalized = normalize_ident(target.name.as_str());
-    let Some(target_schema) = resolver.schema.get_table(&normalized) else {
-        bail_parse_error!("ANALYZE <schema_name> is not supported");
-    };
-    let Some(target_btree) = target_schema.btree() else {
-        bail_parse_error!("ANALYZE on index is not supported");
+
+    let target_table = match &target_table {
+        AnalyzeTarget::Table { table } => table.clone(),
+        AnalyzeTarget::Index { table, .. } => table.clone(),
     };
 
     // This is emitted early because SQLite does, and thus generated VDBE matches a bit closer.
@@ -50,11 +87,10 @@ pub fn translate_analyze(
     if let Some(sqlite_stat1) = resolver.schema.get_btree_table("sqlite_stat1") {
         sqlite_stat1_btreetable = sqlite_stat1.clone();
         sqlite_stat1_source = RegisterOrLiteral::Literal(sqlite_stat1.root_page);
-        // sqlite_stat1 already exists, so we need to remove the row
+        // sqlite_stat1 already exists, so we need to remove any rows
         // corresponding to the stats for the table which we're about to
-        // ANALYZE. SQLite implements this as a full table scan over
-        // sqlite_stat1 deleting any rows where the first column (table_name)
-        // is the targeted table.
+        // ANALYZE. SQLite implements this as a full table scan over sqlite_stat1
+        // deleting any rows where the first column (table_name) is the targeted table.
         let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(sqlite_stat1.clone()));
         program.emit_insn(Insn::OpenWrite {
             cursor_id,
@@ -77,7 +113,7 @@ pub fn translate_analyze(
         });
         let tablename_reg = program.alloc_register();
         program.emit_insn(Insn::String8 {
-            value: target_schema.get_name().to_string(),
+            value: target_table.name.to_string(),
             dest: tablename_reg,
         });
         program.mark_last_insn_constant();
@@ -152,19 +188,24 @@ pub fn translate_analyze(
             table_root_reg,
             Some(sql.to_string()),
         )?;
-        //FIXME: Emit SetCookie?
+
         let parse_schema_where_clause =
             "tbl_name = 'sqlite_stat1' AND type != 'trigger'".to_string();
         program.emit_insn(Insn::ParseSchema {
             db: sqlite_schema_cursor_id,
             where_clause: Some(parse_schema_where_clause),
         });
+
+        // Bump schema cookie so subsequent statements reparse schema.
+        program.emit_insn(Insn::SetCookie {
+            db: 0,
+            cookie: Cookie::SchemaVersion,
+            value: resolver.schema.schema_version as i32 + 1,
+            p5: 0,
+        });
     };
 
-    if target_schema.columns().iter().any(|c| c.primary_key()) {
-        bail_parse_error!("ANALYZE on tables with primary key is not supported");
-    }
-    if !target_btree.has_rowid {
+    if !target_table.has_rowid {
         bail_parse_error!("ANALYZE on tables without rowid is not supported");
     }
 
@@ -176,21 +217,117 @@ pub fn translate_analyze(
         root_page: sqlite_stat1_source,
         db: 0,
     });
-    let target_cursor = program.alloc_cursor_id(CursorType::BTreeTable(target_btree.clone()));
+
+    // Remove existing stat rows for this target before inserting fresh ones.
+    let rewind_done = program.allocate_label();
+    program.emit_insn(Insn::Rewind {
+        cursor_id: stat_cursor,
+        pc_if_empty: rewind_done,
+    });
+    let loop_start = program.allocate_label();
+    program.preassign_label_to_next_insn(loop_start);
+
+    let tbl_col_reg = program.alloc_register();
+    program.emit_insn(Insn::Column {
+        cursor_id: stat_cursor,
+        column: 0,
+        dest: tbl_col_reg,
+        default: None,
+    });
+    let target_tbl_reg = program.alloc_register();
+    program.emit_insn(Insn::String8 {
+        value: target_table.name.to_string(),
+        dest: target_tbl_reg,
+    });
+    program.mark_last_insn_constant();
+
+    let skip_label = program.allocate_label();
+    program.emit_insn(Insn::Ne {
+        lhs: tbl_col_reg,
+        rhs: target_tbl_reg,
+        target_pc: skip_label,
+        flags: Default::default(),
+        collation: None,
+    });
+
+    if let Some(idx) = target_index.clone() {
+        let idx_col_reg = program.alloc_register();
+        program.emit_insn(Insn::Column {
+            cursor_id: stat_cursor,
+            column: 1,
+            dest: idx_col_reg,
+            default: None,
+        });
+        let target_idx_reg = program.alloc_register();
+        program.emit_insn(Insn::String8 {
+            value: idx.name.to_string(),
+            dest: target_idx_reg,
+        });
+        program.mark_last_insn_constant();
+        let continue_label = program.allocate_label();
+        program.emit_insn(Insn::Ne {
+            lhs: idx_col_reg,
+            rhs: target_idx_reg,
+            target_pc: continue_label,
+            flags: Default::default(),
+            collation: None,
+        });
+        let rowid_reg = program.alloc_register();
+        program.emit_insn(Insn::RowId {
+            cursor_id: stat_cursor,
+            dest: rowid_reg,
+        });
+        program.emit_insn(Insn::Delete {
+            cursor_id: stat_cursor,
+            table_name: "sqlite_stat1".to_string(),
+            is_part_of_update: false,
+        });
+        program.emit_insn(Insn::Next {
+            cursor_id: stat_cursor,
+            pc_if_next: loop_start,
+        });
+        program.preassign_label_to_next_insn(continue_label);
+    } else {
+        let rowid_reg = program.alloc_register();
+        program.emit_insn(Insn::RowId {
+            cursor_id: stat_cursor,
+            dest: rowid_reg,
+        });
+        program.emit_insn(Insn::Delete {
+            cursor_id: stat_cursor,
+            table_name: "sqlite_stat1".to_string(),
+            is_part_of_update: false,
+        });
+        program.emit_insn(Insn::Next {
+            cursor_id: stat_cursor,
+            pc_if_next: loop_start,
+        });
+    }
+
+    program.preassign_label_to_next_insn(skip_label);
+    program.emit_insn(Insn::Next {
+        cursor_id: stat_cursor,
+        pc_if_next: loop_start,
+    });
+    program.preassign_label_to_next_insn(rewind_done);
+
+    let target_cursor = program.alloc_cursor_id(CursorType::BTreeTable(target_table.clone()));
     program.emit_insn(Insn::OpenRead {
         cursor_id: target_cursor,
-        root_page: target_btree.root_page,
+        root_page: target_table.root_page,
         db: 0,
     });
     let rowid_reg = program.alloc_register();
-    let record_reg = program.alloc_register();
     let tablename_reg = program.alloc_register();
     let indexname_reg = program.alloc_register();
+    let stat_text_reg = program.alloc_register();
+    let record_reg = program.alloc_register();
     let count_reg = program.alloc_register();
     program.emit_insn(Insn::String8 {
-        value: target_schema.get_name().to_string(),
+        value: target_table.name.to_string(),
         dest: tablename_reg,
     });
+    program.mark_last_insn_constant();
     program.emit_insn(Insn::Count {
         cursor_id: target_cursor,
         target_reg: count_reg,
@@ -205,6 +342,16 @@ pub fn translate_analyze(
     program.emit_insn(Insn::Null {
         dest: indexname_reg,
         dest_end: None,
+    });
+    // stat = CAST(count AS TEXT)
+    program.emit_insn(Insn::Copy {
+        src_reg: count_reg,
+        dst_reg: stat_text_reg,
+        extra_amount: 0,
+    });
+    program.emit_insn(Insn::Cast {
+        reg: stat_text_reg,
+        affinity: Affinity::Text,
     });
     program.emit_insn(Insn::MakeRecord {
         start_reg: tablename_reg,
@@ -228,6 +375,114 @@ pub fn translate_analyze(
         table_name: "sqlite_stat1".to_string(),
     });
     program.preassign_label_to_next_insn(after_insert);
+    // Emit index stats for this table (or for a single index target).
+    let indexes: Vec<Arc<Index>> = match target_index {
+        Some(idx) => vec![idx],
+        None => resolver
+            .schema
+            .get_indices(&target_table.name)
+            .filter(|idx| idx.index_method.is_none()) // skip virtual/custom for now
+            .cloned()
+            .collect(),
+    };
+
+    if !indexes.is_empty() {
+        let space_reg = program.alloc_register();
+        program.emit_insn(Insn::String8 {
+            value: " ".to_string(),
+            dest: space_reg,
+        });
+        program.mark_last_insn_constant();
+
+        for index in indexes {
+            let idx_cursor = program.alloc_cursor_id(CursorType::BTreeIndex(index.clone()));
+            program.emit_insn(Insn::OpenRead {
+                cursor_id: idx_cursor,
+                root_page: index.root_page,
+                db: 0,
+            });
+
+            let idx_count_reg = program.alloc_register();
+            program.emit_insn(Insn::Count {
+                cursor_id: idx_cursor,
+                target_reg: idx_count_reg,
+                exact: true,
+            });
+
+            let idx_tablename_reg = program.alloc_register();
+            let idx_name_reg = program.alloc_register();
+            let idx_stat_reg = program.alloc_register();
+            let idx_record_reg = program.alloc_register();
+
+            program.emit_insn(Insn::String8 {
+                value: target_table.name.to_string(),
+                dest: idx_tablename_reg,
+            });
+            program.mark_last_insn_constant();
+            program.emit_insn(Insn::String8 {
+                value: index.name.to_string(),
+                dest: idx_name_reg,
+            });
+            program.mark_last_insn_constant();
+
+            // idx_stat_reg starts as CAST(count AS TEXT)
+            program.emit_insn(Insn::Copy {
+                src_reg: idx_count_reg,
+                dst_reg: idx_stat_reg,
+                extra_amount: 0,
+            });
+            program.emit_insn(Insn::Cast {
+                reg: idx_stat_reg,
+                affinity: Affinity::Text,
+            });
+
+            // Append one entry per indexed column; naive fallback uses the same count value.
+            for _ in index.columns.iter() {
+                let part_reg = program.alloc_register();
+                program.emit_insn(Insn::Copy {
+                    src_reg: idx_count_reg,
+                    dst_reg: part_reg,
+                    extra_amount: 0,
+                });
+                program.emit_insn(Insn::Cast {
+                    reg: part_reg,
+                    affinity: Affinity::Text,
+                });
+                program.emit_insn(Insn::Concat {
+                    lhs: idx_stat_reg,
+                    rhs: space_reg,
+                    dest: idx_stat_reg,
+                });
+                program.emit_insn(Insn::Concat {
+                    lhs: idx_stat_reg,
+                    rhs: part_reg,
+                    dest: idx_stat_reg,
+                });
+            }
+
+            program.emit_insn(Insn::MakeRecord {
+                start_reg: idx_tablename_reg,
+                count: 3,
+                dest_reg: idx_record_reg,
+                index_name: None,
+                affinity_str: None,
+            });
+            let idx_rowid_reg = program.alloc_register();
+            program.emit_insn(Insn::NewRowid {
+                cursor: stat_cursor,
+                rowid_reg: idx_rowid_reg,
+                prev_largest_reg: 0,
+            });
+            program.emit_insn(Insn::Insert {
+                cursor: stat_cursor,
+                key_reg: idx_rowid_reg,
+                record_reg: idx_record_reg,
+                flag: Default::default(),
+                table_name: "sqlite_stat1".to_string(),
+            });
+        }
+    }
+
     // FIXME: Emit LoadAnalysis
     // FIXME: Emit Expire
     Ok(program)

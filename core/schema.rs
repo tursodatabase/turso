@@ -1,6 +1,7 @@
 use crate::function::Func;
 use crate::incremental::view::IncrementalView;
 use crate::index_method::{IndexMethodAttachment, IndexMethodConfiguration};
+use crate::stats::AnalyzeStats;
 use crate::translate::expr::{bind_and_rewrite_expr, walk_expr, BindingBehavior, WalkControl};
 use crate::translate::index::{resolve_index_method_parameters, resolve_sorted_columns};
 use crate::translate::planner::ROWID_STRS;
@@ -182,6 +183,8 @@ pub struct Schema {
     pub indexes: HashMap<String, VecDeque<Arc<Index>>>,
     pub has_indexes: std::collections::HashSet<String>,
     pub schema_version: u32,
+    /// Statistics collected via ANALYZE for regular B-tree tables and indexes.
+    pub analyze_stats: AnalyzeStats,
 
     /// Mapping from table names to the materialized views that depend on them
     pub table_to_materialized_views: HashMap<String, Vec<String>>,
@@ -229,6 +232,7 @@ impl Schema {
             indexes,
             has_indexes,
             schema_version: 0,
+            analyze_stats: AnalyzeStats::default(),
             table_to_materialized_views,
             incompatible_views,
         }
@@ -461,6 +465,7 @@ impl Schema {
     pub fn remove_table(&mut self, table_name: &str) {
         let name = normalize_ident(table_name);
         self.tables.remove(&name);
+        self.analyze_stats.remove_table(&name);
 
         // If this was a materialized view, also clean up the metadata
         if self.materialized_view_names.remove(&name) {
@@ -513,6 +518,7 @@ impl Schema {
     pub fn remove_indices_for_table(&mut self, table_name: &str) {
         let name = normalize_ident(table_name);
         self.indexes.remove(&name);
+        self.analyze_stats.remove_table(&name);
     }
 
     pub fn remove_index(&mut self, idx: &Index) {
@@ -521,6 +527,7 @@ impl Schema {
             .get_mut(&name)
             .expect("Must have the index")
             .retain_mut(|other_idx| other_idx.name != idx.name);
+        self.analyze_stats.remove_index(&name, &idx.name);
     }
 
     pub fn table_has_indexes(&self, table_name: &str) -> bool {
@@ -1386,6 +1393,7 @@ impl Clone for Schema {
             indexes,
             has_indexes: self.has_indexes.clone(),
             schema_version: self.schema_version,
+            analyze_stats: self.analyze_stats.clone(),
             table_to_materialized_views: self.table_to_materialized_views.clone(),
             incompatible_views,
         }
