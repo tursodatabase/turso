@@ -1633,7 +1633,7 @@ impl DbspCompiler {
 
         // Create an internal connection for expression compilation
         let io = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io, ":memory:", false, false)?;
+        let db = Database::open_file(io, ":memory:", false)?;
         let internal_conn = db.connect()?;
         internal_conn.set_query_only(true);
         internal_conn.auto_commit.store(false, Ordering::SeqCst);
@@ -1642,7 +1642,7 @@ impl DbspCompiler {
         let temp_syms = SymbolTable::new();
 
         // Get a minimal schema for compilation (we don't need the full schema for expressions)
-        let schema = crate::schema::Schema::new(false);
+        let schema = crate::schema::Schema::new();
 
         // Compile the expression using the existing CompiledExpression::compile
         let compiled = CompiledExpression::compile(
@@ -2274,7 +2274,7 @@ mod tests {
     // Macro to create a test schema with a users table
     macro_rules! test_schema {
         () => {{
-            let mut schema = Schema::new(false);
+            let mut schema = Schema::new();
             let users_table = BTreeTable {
                 name: "users".to_string(),
                 root_page: 2,
@@ -2557,7 +2557,7 @@ mod tests {
 
     fn setup_btree_for_circuit() -> (Arc<Pager>, i64, i64, i64) {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io.clone(), ":memory:", false, false).unwrap();
+        let db = Database::open_file(io.clone(), ":memory:", false).unwrap();
         let conn = db.connect().unwrap();
         let pager = conn.pager.load().clone();
 

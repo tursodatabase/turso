@@ -139,8 +139,6 @@ pub struct SimulatorCLI {
     pub max_tick: Option<u64>,
     #[clap(long, help = "Enable experimental MVCC feature")]
     pub experimental_mvcc: Option<bool>,
-    #[clap(long, help = "Disable experimental indexing feature")]
-    pub disable_experimental_indexes: Option<bool>,
     #[clap(
         long,
         help = "Keep all database and plan files",

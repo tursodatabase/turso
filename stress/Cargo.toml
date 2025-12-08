@@ -15,9 +15,8 @@ name = "turso_stress"
 path = "main.rs"
 
 [features]
-default = ["experimental_indexes"]
+default = []
 antithesis = ["turso/antithesis", "antithesis_sdk/full"]
-experimental_indexes = []
 
 [dependencies]
 anarchist-readable-name-generator-lib = "0.1.0"

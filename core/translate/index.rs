@@ -71,11 +71,6 @@ pub fn translate_create_index(
     if tbl_name.eq_ignore_ascii_case("sqlite_sequence") {
         crate::bail_parse_error!("table sqlite_sequence may not be indexed");
     }
-    if !resolver.schema.indexes_enabled() {
-        crate::bail_parse_error!(
-            "CREATE INDEX is disabled by default. Run with `--experimental-indexes` to enable this feature."
-        );
-    }
     if RESERVED_TABLE_PREFIXES
         .iter()
         .any(|prefix| idx_name.starts_with(prefix) || tbl_name.starts_with(prefix))
@@ -732,11 +727,6 @@ pub fn translate_drop_index(
     if_exists: bool,
     mut program: ProgramBuilder,
 ) -> crate::Result<ProgramBuilder> {
-    if !resolver.schema.indexes_enabled() {
-        crate::bail_parse_error!(
-            "DROP INDEX is disabled by default. Run with `--experimental-indexes` to enable this feature."
-        );
-    }
     let idx_name = normalize_ident(idx_name);
     let opts = crate::vdbe::builder::ProgramBuilderOpts {
         num_cursors: 5,

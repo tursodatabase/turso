@@ -773,13 +773,9 @@ fn optimize_table_access(
                 constraint_refs,
             } => {
                 if constraint_refs.is_empty() {
-                    let try_to_build_ephemeral_index = if schema.indexes_enabled() {
-                        let is_leftmost_table = i == 0;
-                        let uses_index = index.is_some();
-                        !is_leftmost_table && !uses_index
-                    } else {
-                        false
-                    };
+                    let is_leftmost_table = i == 0;
+                    let uses_index = index.is_some();
+                    let try_to_build_ephemeral_index = !is_leftmost_table && !uses_index;
 
                     if !try_to_build_ephemeral_index {
                         table_references.joined_tables_mut()[table_idx].op =

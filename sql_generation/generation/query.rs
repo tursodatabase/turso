@@ -118,11 +118,7 @@ impl Arbitrary for SelectInner {
             .flatten();
 
         SelectInner {
-            distinctness: if env.opts().indexes {
-                Distinctness::arbitrary(rng, env)
-            } else {
-                Distinctness::All
-            },
+            distinctness: Distinctness::arbitrary(rng, env),
             columns: vec![ResultColumn::Star],
             from: Some(from),
             where_clause: Predicate::arbitrary_from(rng, env, &join_table),
@@ -203,15 +199,10 @@ impl Arbitrary for SelectFree {
 impl Arbitrary for Select {
     fn arbitrary<R: Rng + ?Sized, C: GenerationContext>(rng: &mut R, env: &C) -> Self {
         // Generate a number of selects based on the query size
-        // If experimental indexes are enabled, we can have selects with compounds
-        // Otherwise, we just have a single select with no compounds
         let opts = &env.opts().query.select;
-        let num_compound_selects = if env.opts().indexes {
-            opts.compound_selects[rng.sample(opts.compound_select_weighted_index())]
-                .num_compound_selects
-        } else {
-            0
-        };
+        let num_compound_selects = opts.compound_selects
+            [rng.sample(opts.compound_select_weighted_index())]
+        .num_compound_selects;
 
         let min_column_count_across_tables =
             env.tables().iter().map(|t| t.columns.len()).min().unwrap();

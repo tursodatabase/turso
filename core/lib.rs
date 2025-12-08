@@ -114,31 +114,15 @@ pub use vdbe::{
 };
 
 /// Configuration for database features
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DatabaseOpts {
     pub enable_mvcc: bool,
-    pub enable_indexes: bool,
     pub enable_views: bool,
     pub enable_strict: bool,
     pub enable_encryption: bool,
     pub enable_index_method: bool,
     pub enable_autovacuum: bool,
     enable_load_extension: bool,
-}
-
-impl Default for DatabaseOpts {
-    fn default() -> Self {
-        Self {
-            enable_mvcc: false,
-            enable_indexes: true,
-            enable_views: false,
-            enable_strict: false,
-            enable_encryption: false,
-            enable_index_method: false,
-            enable_autovacuum: false,
-            enable_load_extension: false,
-        }
-    }
 }
 
 impl DatabaseOpts {
@@ -154,11 +138,6 @@ impl DatabaseOpts {
 
     pub fn with_mvcc(mut self, enable: bool) -> Self {
         self.enable_mvcc = enable;
-        self
-    }
-
-    pub fn with_indexes(mut self, enable: bool) -> Self {
-        self.enable_indexes = enable;
         self
     }
 
@@ -356,7 +335,7 @@ impl Database {
             mv_store,
             path: path.into(),
             wal_path: wal_path.into(),
-            schema: Mutex::new(Arc::new(Schema::new(opts.enable_indexes))),
+            schema: Mutex::new(Arc::new(Schema::new())),
             _shared_page_cache: shared_page_cache.clone(),
             shared_wal,
             db_file,
@@ -382,19 +361,12 @@ impl Database {
     }
 
     #[cfg(feature = "fs")]
-    pub fn open_file(
-        io: Arc<dyn IO>,
-        path: &str,
-        enable_mvcc: bool,
-        enable_indexes: bool,
-    ) -> Result<Arc<Database>> {
+    pub fn open_file(io: Arc<dyn IO>, path: &str, enable_mvcc: bool) -> Result<Arc<Database>> {
         Self::open_file_with_flags(
             io,
             path,
             OpenFlags::default(),
-            DatabaseOpts::new()
-                .with_mvcc(enable_mvcc)
-                .with_indexes(enable_indexes),
+            DatabaseOpts::new().with_mvcc(enable_mvcc),
             None,
         )
     }
@@ -418,16 +390,13 @@ impl Database {
         path: &str,
         db_file: Arc<dyn DatabaseStorage>,
         enable_mvcc: bool,
-        enable_indexes: bool,
     ) -> Result<Arc<Database>> {
         Self::open_with_flags(
             io,
             path,
             db_file,
             OpenFlags::default(),
-            DatabaseOpts::new()
-                .with_mvcc(enable_mvcc)
-                .with_indexes(enable_indexes),
+            DatabaseOpts::new().with_mvcc(enable_mvcc),
             None,
         )
     }
@@ -1020,10 +989,6 @@ impl Database {
         self.opts.enable_mvcc
     }
 
-    pub fn indexes_enabled(&self) -> bool {
-        self.opts.enable_indexes
-    }
-
     #[cfg(feature = "test_helper")]
     pub fn set_pending_byte(val: u32) {
         Pager::set_pending_byte(val);
@@ -1471,7 +1436,7 @@ impl Connection {
             .get();
 
         // create fresh schema as some objects can be deleted
-        let mut fresh = Schema::new(self.schema.read().indexes_enabled);
+        let mut fresh = Schema::new();
         fresh.schema_version = cookie;
 
         // Preserve existing views to avoid expensive repopulation.
@@ -2267,14 +2232,12 @@ impl Connection {
             )));
         }
 
-        let use_indexes = self.db.schema.lock().indexes_enabled();
         let use_mvcc = self.db.get_mv_store().is_some();
         let use_views = self.db.experimental_views_enabled();
         let use_strict = self.db.experimental_strict_enabled();
 
         let db_opts = DatabaseOpts::new()
             .with_mvcc(use_mvcc)
-            .with_indexes(use_indexes)
             .with_views(use_views)
             .with_strict(use_strict);
         let io: Arc<dyn IO> = if path.contains(":memory:") {

@@ -221,9 +221,6 @@ pub fn translate_create_table(
 
     let index_regs = collect_autoindexes(&body, &mut program, &normalized_tbl_name)?;
     if let Some(index_regs) = index_regs.as_ref() {
-        if !resolver.schema.indexes_enabled() {
-            bail_parse_error!("Constraints UNIQUE and PRIMARY KEY (unless INTEGER PRIMARY KEY) on table are not supported without indexes");
-        }
         for index_reg in index_regs.iter() {
             program.emit_insn(Insn::CreateBtree {
                 db: 0,
@@ -620,16 +617,6 @@ pub fn translate_drop_table(
         .eq_ignore_ascii_case("sqlite_sequence")
     {
         bail_parse_error!("table sqlite_sequence may not be dropped");
-    }
-
-    if !resolver.schema.indexes_enabled()
-        && resolver
-            .schema
-            .table_has_indexes(&tbl_name.name.to_string())
-    {
-        bail_parse_error!(
-            "DROP TABLE with indexes on the table is disabled by default. Omit the `--experimental-indexes=false` flag to enable this feature."
-        );
     }
 
     let opts = ProgramBuilderOpts {

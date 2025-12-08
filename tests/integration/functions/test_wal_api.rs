@@ -910,7 +910,7 @@ fn test_db_share_same_file() {
         path.to_str().unwrap(),
         db_file.clone(),
         turso_core::OpenFlags::Create,
-        turso_core::DatabaseOpts::new().with_indexes(true),
+        turso_core::DatabaseOpts::new(),
         None,
     )
     .unwrap();
@@ -937,7 +937,7 @@ fn test_db_share_same_file() {
         &format!("{}-wal-copy", path.to_str().unwrap()),
         db_file.clone(),
         turso_core::OpenFlags::empty(),
-        turso_core::DatabaseOpts::new().with_indexes(true),
+        turso_core::DatabaseOpts::new(),
         None,
     )
     .unwrap();

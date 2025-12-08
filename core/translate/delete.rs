@@ -32,14 +32,6 @@ pub fn translate_delete(
         crate::bail_parse_error!("table {} may not be modified", tbl_name);
     }
 
-    if resolver.schema.table_has_indexes(&tbl_name) && !resolver.schema.indexes_enabled() {
-        // Let's disable altering a table with indices altogether instead of checking column by
-        // column to be extra safe.
-        crate::bail_parse_error!(
-            "DELETE for table with indexes is disabled. Omit the `--experimental-indexes=false` flag to enable this feature."
-        );
-    }
-
     let mut delete_plan = prepare_delete_plan(
         &mut program,
         resolver.schema,

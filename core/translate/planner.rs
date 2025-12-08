@@ -84,11 +84,6 @@ pub fn resolve_window_and_aggregate_functions(
                 let args_count = args.len();
                 let distinctness = Distinctness::from_ast(distinctness.as_ref());
 
-                if !resolver.schema.indexes_enabled() && distinctness.is_distinct() {
-                    crate::bail_parse_error!(
-                        "SELECT with DISTINCT is not allowed without indexes enabled"
-                    );
-                }
                 match Func::resolve_function(name.as_str(), args_count) {
                     Ok(Func::Agg(f)) => {
                         if let Some(over_clause) = filter_over.over_clause.as_ref() {

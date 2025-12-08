@@ -198,12 +198,6 @@ fn prepare_one_select_plan(
             distinctness,
             window_clause,
         } => {
-            if !resolver.schema.indexes_enabled() && distinctness.is_some() {
-                crate::bail_parse_error!(
-                    "SELECT with DISTINCT is not allowed without indexes enabled"
-                );
-            }
-
             let col_count = columns.len();
             if col_count == 0 {
                 crate::bail_parse_error!("SELECT without columns is not allowed");

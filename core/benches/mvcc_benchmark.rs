@@ -16,7 +16,7 @@ struct BenchDb {
 
 fn bench_db() -> BenchDb {
     let io = Arc::new(MemoryIO::new());
-    let db = Database::open_file(io.clone(), ":memory:", true, true).unwrap();
+    let db = Database::open_file(io.clone(), ":memory:", true).unwrap();
     let conn = db.connect().unwrap();
     let mvcc_store = db.get_mv_store().clone().unwrap();
     BenchDb {

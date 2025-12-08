@@ -24,7 +24,7 @@ pub(crate) struct MvccTestDb {
 impl MvccTestDb {
     pub fn new() -> Self {
         let io = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io.clone(), ":memory:", true, true).unwrap();
+        let db = Database::open_file(io.clone(), ":memory:", true).unwrap();
         let conn = db.connect().unwrap();
         let mvcc_store = db.get_mv_store().clone().unwrap();
         Self {
@@ -38,7 +38,7 @@ impl MvccTestDb {
 impl MvccTestDbNoConn {
     pub fn new() -> Self {
         let io = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io.clone(), ":memory:", true, true).unwrap();
+        let db = Database::open_file(io.clone(), ":memory:", true).unwrap();
         Self {
             db: Some(db),
             path: None,
@@ -55,8 +55,7 @@ impl MvccTestDbNoConn {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         let io = Arc::new(PlatformIO::new().unwrap());
         println!("path: {}", path.as_os_str().to_str().unwrap());
-        let db = Database::open_file(io.clone(), path.as_os_str().to_str().unwrap(), true, true)
-            .unwrap();
+        let db = Database::open_file(io.clone(), path.as_os_str().to_str().unwrap(), true).unwrap();
         Self {
             db: Some(db),
             path: Some(path.to_str().unwrap().to_string()),
@@ -76,7 +75,7 @@ impl MvccTestDbNoConn {
         // Now open again.
         let io = Arc::new(PlatformIO::new().unwrap());
         let path = self.path.as_ref().unwrap();
-        let db = Database::open_file(io.clone(), path, true, true).unwrap();
+        let db = Database::open_file(io.clone(), path, true).unwrap();
         self.db.replace(db);
     }
 
