@@ -112,6 +112,11 @@ struct DualCursorPeek {
 impl DualCursorPeek {
     /// Returns the next row key and whether the row is from the BTree.
     fn get_next(&self, dir: IterationDirection) -> Option<(RowKey, bool)> {
+        tracing::trace!(
+            "get_next: mvcc_key: {:?}, btree_key: {:?}",
+            self.mvcc_peek.get_row_key(),
+            self.btree_peek.get_row_key()
+        );
         match (self.mvcc_peek.get_row_key(), self.btree_peek.get_row_key()) {
             (Some(mvcc_key), Some(btree_key)) => {
                 if dir == IterationDirection::Forwards {
@@ -393,12 +398,12 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
     }
 
     fn query_btree_version_is_valid(&self, key: &RowKey) -> bool {
+        let res = self
+            .db
+            .find_row_last_version_state(self.table_id, key, self.tx_id);
+        tracing::trace!("query_btree_version_is_valid: {:?}, key: {:?}", res, key);
         // If the row is not found in MVCC index, this means row_id is valid in btree
-        matches!(
-            self.db
-                .find_row_last_version_state(self.table_id, key, self.tx_id),
-            RowVersionState::NotFound
-        )
+        matches!(res, RowVersionState::NotFound)
     }
 
     /// Advance MVCC iterator and return next visible row key in the direction that the iterator was initialized in.
@@ -788,12 +793,14 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
 
         // Initialize MVCC iterator to last position
         match &self.mv_cursor_type {
-            MvccCursorType::Table => match self
-                .db
-                .get_last_table_rowid(self.table_id, &mut self.table_iterator)
-            {
+            MvccCursorType::Table => match self.db.get_last_table_rowid(
+                self.table_id,
+                &mut self.table_iterator,
+                self.tx_id,
+            ) {
                 Some(k) => {
                     let mut peek = self.dual_peek.borrow_mut();
+                    tracing::trace!("last: mvcc_key: {:?}", k);
                     peek.mvcc_peek = CursorPeek::Row(k);
                 }
                 None => {
