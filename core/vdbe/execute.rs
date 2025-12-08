@@ -2477,6 +2477,12 @@ pub fn op_auto_commit(
         return res;
     }
 
+    if program.is_trigger_subprogram() {
+        // Trigger subprograms never commit or rollback.
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
+    }
+
     // The logic in this opcode can be a bit confusing, so to make things a bit clearer lets be
     // very explicit about the currently existing and requested state.
     let requested_autocommit = *auto_commit;
@@ -2487,6 +2493,12 @@ pub fn op_auto_commit(
     let is_begin_req = had_autocommit && !requested_autocommit && !requested_rollback;
     let is_commit_req = !had_autocommit && requested_autocommit && !requested_rollback;
     let is_rollback_req = !had_autocommit && requested_autocommit && requested_rollback;
+
+    if (changed && requested_autocommit) || requested_rollback {
+        if !state.uses_subjournal && pager.subjournal_in_use() {
+            return Err(LimboError::Busy);
+        }
+    }
 
     if changed {
         if requested_rollback {
@@ -2531,12 +2543,6 @@ pub fn op_auto_commit(
                 "cannot use BEGIN after BEGIN CONCURRENT".to_string(),
             ));
         }
-    }
-
-    if program.is_trigger_subprogram() {
-        // Trigger subprograms never commit or rollback.
-        state.pc += 1;
-        return Ok(InsnFunctionStepResult::Step);
     }
 
     let res = program
