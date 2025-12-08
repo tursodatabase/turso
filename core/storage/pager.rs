@@ -1494,8 +1494,8 @@ impl Pager {
             connection.get_sync_mode(),
             connection.get_data_sync_retry()
         ));
-        wal.borrow().end_write_tx();
-        wal.borrow().end_read_tx();
+        wal.borrow_mut().end_write_tx();
+        wal.borrow_mut().end_read_tx();
 
         if schema_did_change {
             let schema = connection.schema.read().clone();
@@ -1522,9 +1522,9 @@ impl Pager {
         if is_write {
             self.clear_savepoints()
                 .expect("in practice, clear_savepoints() should never fail as it uses memory IO");
-            wal.borrow().end_write_tx();
+            wal.borrow_mut().end_write_tx();
         }
-        wal.borrow().end_read_tx();
+        wal.borrow_mut().end_read_tx();
         self.rollback(schema_did_change, connection, is_write);
     }
 
@@ -1533,7 +1533,7 @@ impl Pager {
         let Some(wal) = self.wal.as_ref() else {
             return;
         };
-        wal.borrow().end_read_tx();
+        wal.borrow_mut().end_read_tx();
     }
 
     /// Reads a page from disk (either WAL or DB file) bypassing page-cache

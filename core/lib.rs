@@ -1864,7 +1864,7 @@ impl Connection {
             self.auto_commit.store(true, Ordering::SeqCst);
             self.set_tx_state(TransactionState::None);
             {
-                let wal = wal.borrow_mut();
+                let mut wal = wal.borrow_mut();
                 wal.end_write_tx();
                 wal.end_read_tx();
             }
