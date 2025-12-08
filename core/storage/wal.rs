@@ -1,9 +1,10 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use parking_lot::Mutex;
+use parking_lot::{Mutex, RwLockWriteGuard};
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::ops::ControlFlow;
 use strum::EnumString;
 use tracing::{instrument, Level};
 
@@ -237,10 +238,10 @@ pub trait Wal: Debug {
     fn begin_write_tx(&mut self) -> Result<()>;
 
     /// End a read transaction.
-    fn end_read_tx(&self);
+    fn end_read_tx(&mut self);
 
     /// End a write transaction.
-    fn end_write_tx(&self);
+    fn end_write_tx(&mut self);
 
     /// Find the latest frame containing a page.
     ///
@@ -590,6 +591,8 @@ pub struct WalFile {
     /// Manages locks needed for checkpointing
     checkpoint_guard: Option<CheckpointLocks>,
 
+    transaction_lock: Option<TransactionLock>,
+
     io_ctx: RwLock<IOContext>,
 }
 
@@ -746,6 +749,167 @@ impl fmt::Debug for WalFileShared {
 }
 
 #[derive(Clone, Debug)]
+/// Locks that are held by the transaction
+struct TransactionLock {
+    /// Shared Wal that holds the locks
+    ptr: Arc<RwLock<WalFileShared>>,
+    write: bool,
+    checkpoint: Option<CheckpointMode>,
+    read_exclusive: bool,
+    /// Index of the read lock currently held
+    read_lock_index: usize,
+}
+
+impl Drop for TransactionLock {
+    fn drop(&mut self) {
+        let TransactionLock {
+            ptr: shared,
+            write,
+            checkpoint,
+            read_exclusive: _,
+            read_lock_index: index,
+        } = self;
+        let guard = shared.write();
+        let guard = &guard.locks;
+        if *write {
+            guard.write_lock.unlock();
+        }
+        guard.read_locks[*index].unlock();
+        if checkpoint.is_some() {
+            guard.checkpoint_lock.unlock();
+        }
+    }
+}
+
+impl TransactionLock {
+    #[inline]
+    fn read_unchecked(shared: Arc<RwLock<WalFileShared>>, read_lock_index: usize) -> Self {
+        Self {
+            ptr: shared,
+            write: false,
+            checkpoint: None,
+            read_exclusive: false,
+            read_lock_index,
+        }
+    }
+
+    fn _read(
+        exclusive_lock: bool,
+        shared: Arc<RwLock<WalFileShared>>,
+        read_lock_index: Option<usize>,
+    ) -> Result<Self> {
+        let guard = if exclusive_lock {
+            either::Left(shared.write())
+        } else {
+            either::Right(shared.read())
+        };
+        let index = if let Some(read_lock_index) = read_lock_index {
+            if !guard.locks.read_locks[read_lock_index].write() {
+                return Err(LimboError::Busy);
+            }
+            read_lock_index
+        } else {
+            let locked = guard.locks.read_locks.iter().enumerate().skip(1).try_fold(
+                1usize, // Does not matter
+                |_, (i, read_lock)| {
+                    let locked = if exclusive_lock {
+                        read_lock.write()
+                    } else {
+                        read_lock.read()
+                    };
+                    if locked {
+                        ControlFlow::Break(i)
+                    } else {
+                        // Continue - result does not matter
+                        ControlFlow::Continue(0)
+                    }
+                },
+            );
+            let ControlFlow::Break(index) = locked else {
+                return Err(LimboError::Busy);
+            };
+            index
+        };
+        drop(guard);
+
+        let transaction_lock = Self {
+            ptr: shared,
+            write: false,
+            checkpoint: None,
+            read_exclusive: exclusive_lock,
+            read_lock_index: index,
+        };
+
+        Ok(transaction_lock)
+    }
+
+    #[inline]
+    fn read_exclusive(
+        shared: Arc<RwLock<WalFileShared>>,
+        read_lock_index: Option<usize>,
+    ) -> Result<Self> {
+        Self::_read(true, shared, read_lock_index)
+    }
+
+    #[inline]
+    fn read_shared(
+        shared: Arc<RwLock<WalFileShared>>,
+        read_lock_index: Option<usize>,
+    ) -> Result<Self> {
+        Self::_read(false, shared, read_lock_index)
+    }
+
+    fn write(&mut self) -> Result<()> {
+        if self.write {
+            return Ok(());
+        }
+
+        let shared = self.ptr.write();
+
+        if !shared.locks.write_lock.write() {
+            return Err(LimboError::Busy);
+        }
+        self.write = true;
+        Ok(())
+    }
+
+    fn downgrade_write(&mut self) {
+        if !self.write {
+            return;
+        }
+
+        let shared = self.ptr.write();
+
+        shared.locks.write_lock.unlock();
+        self.write = false;
+    }
+
+    fn checkpoint(&mut self, mode: CheckpointMode) -> Result<()> {
+        if self.checkpoint.is_some() {
+            return Err(LimboError::Busy);
+        }
+
+        let shared = self.ptr.write();
+
+        if !shared.locks.checkpoint_lock.write() {
+            return Err(LimboError::Busy);
+        }
+        self.checkpoint = Some(mode);
+        Ok(())
+    }
+
+    #[inline]
+    fn is_write(&self) -> bool {
+        self.write
+    }
+
+    #[inline]
+    fn is_checkpoint(&self) -> bool {
+        self.checkpoint.is_some()
+    }
+}
+
+#[derive(Clone, Debug)]
 /// To manage and ensure that no locks are leaked during checkpointing in
 /// the case of errors. It is held by the WalFile while checkpoint is ongoing
 /// then transferred to the CheckpointResult if necessary.
@@ -853,6 +1017,10 @@ impl Wal for WalFile {
             self.max_frame_read_lock_index.load(Ordering::Acquire),
             NO_LOCK_HELD
         );
+        turso_assert!(
+            self.transaction_lock.is_none(),
+            "no transaction locks should exist"
+        );
         let (shared_max, nbackfills, last_checksum, checkpoint_seq, transaction_count) = self
             .with_shared(|shared| {
                 let mx = shared.max_frame.load(Ordering::Acquire);
@@ -871,10 +1039,13 @@ impl Wal for WalFile {
         if shared_max == nbackfills {
             tracing::debug!("begin_read_tx: WAL is already fully back‑filled into the main DB image, shared_max={}, nbackfills={}", shared_max, nbackfills);
             let lock_0_idx = 0;
-            if !self.with_shared(|shared| shared.locks.read_locks[lock_0_idx].read()) {
-                tracing::debug!("begin_read_tx: read lock 0 is already held, returning Busy");
-                return Err(LimboError::Busy);
-            }
+            let transaction_lock = TransactionLock::read_shared(
+                self.shared.clone(),
+                Some(lock_0_idx),
+            )
+            .inspect_err(|_| {
+                tracing::debug!("begin_read_tx: read lock 0 is already held, returning Busy")
+            })?;
             // we need to keep self.max_frame set to the appropriate
             // max frame in the wal at the time this transaction starts.
             self.max_frame.store(shared_max, Ordering::Release);
@@ -885,6 +1056,7 @@ impl Wal for WalFile {
             self.checkpoint_seq.store(checkpoint_seq, Ordering::Release);
             self.transaction_count
                 .store(transaction_count, Ordering::Release);
+            self.transaction_lock = Some(transaction_lock);
             return Ok(db_changed);
         }
 
@@ -928,15 +1100,15 @@ impl Wal for WalFile {
             return Err(LimboError::Busy);
         }
 
+        // TODO: we should retry here instead of always returning Busy
+        let transaction_lock =
+            TransactionLock::read_shared(self.shared.clone(), Some(best_idx as usize))?;
+
         // Now take a shared read on that slot, and if we are successful,
         // grab another snapshot of the shared state.
         let (mx2, nb2, cksm2, ckpt_seq2) = self.with_shared(|shared| {
-            if !shared.locks.read_locks[best_idx as usize].read() {
-                // TODO: we should retry here instead of always returning Busy
-                return Err(LimboError::Busy);
-            }
             let checkpoint_seq = shared.wal_header.lock().checkpoint_seq;
-            Ok((
+            Ok::<_, LimboError>((
                 shared.max_frame.load(Ordering::Acquire),
                 shared.nbackfills.load(Ordering::Acquire),
                 shared.last_checksum,
@@ -969,6 +1141,7 @@ impl Wal for WalFile {
             || cksm2 != last_checksum
             || ckpt_seq2 != checkpoint_seq
         {
+            // If we return Busy, the read lock will be dropped by `TransactionLock` Drop
             return Err(LimboError::Busy);
         }
         self.min_frame.store(nb2 + 1, Ordering::Release);
@@ -979,6 +1152,7 @@ impl Wal for WalFile {
         self.checkpoint_seq.store(checkpoint_seq, Ordering::Release);
         self.transaction_count
             .store(transaction_count, Ordering::Release);
+        self.transaction_lock = Some(transaction_lock);
         tracing::debug!(
             "begin_read_tx(min={}, max={}, slot={}, max_frame_in_wal={})",
             self.min_frame.load(Ordering::Acquire),
@@ -992,13 +1166,10 @@ impl Wal for WalFile {
     /// End a read transaction.
     #[inline(always)]
     #[instrument(skip_all, level = Level::DEBUG)]
-    fn end_read_tx(&self) {
-        let slot = self.max_frame_read_lock_index.load(Ordering::Acquire);
-        if slot != NO_LOCK_HELD {
-            self.with_shared_mut(|shared| shared.locks.read_locks[slot].unlock());
-            self.max_frame_read_lock_index
-                .store(NO_LOCK_HELD, Ordering::Release);
-            tracing::debug!("end_read_tx(slot={slot})");
+    fn end_read_tx(&mut self) {
+        // Drop impl of `TransactionLock` will drop the lock
+        if let Some(lock) = self.transaction_lock.take() {
+            tracing::debug!("end_read_tx(slot={})", lock.read_lock_index);
         } else {
             tracing::debug!("end_read_tx(slot=no_lock)");
         }
@@ -1007,36 +1178,55 @@ impl Wal for WalFile {
     /// Begin a write transaction
     #[instrument(skip_all, level = Level::DEBUG)]
     fn begin_write_tx(&mut self) -> Result<()> {
-        self.with_shared_mut(|shared| {
-            // sqlite/src/wal.c 3702
-            // Cannot start a write transaction without first holding a read
-            // transaction.
-            // assert(pWal->readLock >= 0);
-            // assert(pWal->writeLock == 0 && pWal->iReCksum == 0);
-            turso_assert!(
-                self.max_frame_read_lock_index.load(Ordering::Acquire) != NO_LOCK_HELD,
-                "must have a read transaction to begin a write transaction"
-            );
-            if !shared.locks.write_lock.write() {
-                return Err(LimboError::Busy);
+        // sqlite/src/wal.c 3702
+        // Cannot start a write transaction without first holding a read
+        // transaction.
+        // assert(pWal->readLock >= 0);
+        // assert(pWal->writeLock == 0 && pWal->iReCksum == 0);
+        turso_assert!(
+            self.max_frame_read_lock_index.load(Ordering::Acquire) != NO_LOCK_HELD,
+            "must have a read transaction to begin a write transaction"
+        );
+        turso_assert!(
+            self.transaction_lock.is_some(),
+            "must have a read transaction to begin a write transaction"
+        );
+        {
+            let transaction_lock = self
+                .transaction_lock
+                .as_mut()
+                .expect("must have a read transaction to begin a write transaction");
+            if transaction_lock.is_write() {
+                // Already have a write transaction
+                return Ok(());
             }
+            transaction_lock.write()?;
+        }
+        let res = self.with_shared_mut(|shared| {
             let db_changed = self.db_changed(shared);
             if !db_changed {
                 return Ok(());
             }
-
             // Snapshot is stale, give up and let caller retry from scratch
             tracing::debug!("unable to upgrade transaction from read to write: snapshot is stale, give up and let caller retry from scratch, self.max_frame={}, shared_max={}", self.max_frame.load(Ordering::Acquire), shared.max_frame.load(Ordering::Acquire));
-            shared.locks.write_lock.unlock();
             Err(LimboError::Busy)
-        })
+        });
+        if res.is_err() {
+            let transaction_lock = self
+                .transaction_lock
+                .as_mut()
+                .expect("must have a read transaction to begin a write transaction");
+            transaction_lock.downgrade_write();
+        }
+        res
     }
 
     /// End a write transaction
     #[instrument(skip_all, level = Level::DEBUG)]
-    fn end_write_tx(&self) {
+    fn end_write_tx(&mut self) {
         tracing::debug!("end_write_txn");
-        self.with_shared(|shared| shared.locks.write_lock.unlock());
+        // Drop impl of `TransactionLock` unlocks the locks
+        let _ = self.transaction_lock.take();
     }
 
     /// Find the latest frame containing a page.
@@ -1694,6 +1884,7 @@ impl WalFile {
             prev_checkpoint: CheckpointResult::default(),
             checkpoint_guard: None,
             header,
+            transaction_lock: None,
             io_ctx: RwLock::new(IOContext::default()),
         }
     }
@@ -2815,7 +3006,7 @@ pub mod test {
         // Release reader
         {
             let pager = conn2.pager.load();
-            let wal2 = pager.wal.as_ref().unwrap().borrow_mut();
+            let mut wal2 = pager.wal.as_ref().unwrap().borrow_mut();
             wal2.end_read_tx();
         }
 
@@ -3471,7 +3662,7 @@ pub mod test {
         // End the read transaction
         {
             let pager = conn2.pager.load();
-            let wal = pager.wal.as_ref().unwrap().borrow();
+            let mut wal = pager.wal.as_ref().unwrap().borrow_mut();
             wal.end_read_tx();
         }
         {
@@ -3576,7 +3767,7 @@ pub mod test {
         // Release the reader, now full mode should succeed and backfill everything
         {
             let pager = reader.pager.load();
-            let wal = pager.wal.as_ref().unwrap().borrow();
+            let mut wal = pager.wal.as_ref().unwrap().borrow_mut();
             wal.end_read_tx();
         }
 
