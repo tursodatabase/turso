@@ -6967,7 +6967,11 @@ pub fn op_new_rowid(
                 {
                     let cursor = state.get_cursor(*cursor);
                     let cursor = cursor.as_btree_mut();
-                    return_if_io!(cursor.seek_to_last());
+                    // We have an optimization in the btree cursor to not seek if we know the rightmost page and are already on it.
+                    // However, this optimization should NOT never performed in cases where we cannot be sure that the btree wasn't modified from under us
+                    // e.g. by a trigger subprogram.
+                    let always_seek = program.contains_trigger_subprograms;
+                    return_if_io!(cursor.seek_to_last(always_seek));
                 }
                 state.op_new_rowid_state = OpNewRowidState::ReadingMaxRowid;
             }

@@ -1166,6 +1166,11 @@ impl ProgramBuilder {
             self.needs_stmt_subtransactions = true;
         }
 
+        let contains_trigger_subprograms = self
+            .insns
+            .iter()
+            .any(|(insn, _)| matches!(insn, Insn::Program { .. }));
+
         Program {
             max_registers: self.next_free_register,
             insns: self.insns,
@@ -1181,6 +1186,7 @@ impl ProgramBuilder {
             accesses_db: !matches!(self.txn_mode, TransactionMode::None),
             needs_stmt_subtransactions: self.needs_stmt_subtransactions,
             trigger: self.trigger.take(),
+            contains_trigger_subprograms,
             resolve_type: self.resolve_type,
             explain_state: RwLock::new(ExplainState::default()),
         }
