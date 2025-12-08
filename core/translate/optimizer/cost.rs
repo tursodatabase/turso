@@ -47,11 +47,10 @@ pub fn estimate_cost_for_scan_or_seek(
     constraints: &[Constraint],
     usable_constraint_refs: &[RangeConstraintRef],
     input_cardinality: f64,
+    base_row_count: f64,
 ) -> Cost {
     let Some(index_info) = index_info else {
-        return estimate_page_io_cost(
-            input_cardinality * ESTIMATED_HARDCODED_ROWS_PER_TABLE as f64,
-        );
+        return estimate_page_io_cost(input_cardinality * base_row_count);
     };
 
     let selectivity_multiplier: f64 = usable_constraint_refs
@@ -76,9 +75,6 @@ pub fn estimate_cost_for_scan_or_seek(
     let covering_multiplier = if index_info.covering { 0.9 } else { 1.0 };
 
     estimate_page_io_cost(
-        selectivity_multiplier
-            * ESTIMATED_HARDCODED_ROWS_PER_TABLE as f64
-            * input_cardinality
-            * covering_multiplier,
+        selectivity_multiplier * base_row_count * input_cardinality * covering_multiplier,
     )
 }

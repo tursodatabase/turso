@@ -81,6 +81,7 @@ pub fn find_best_access_method_for_join_order(
     join_order: &[JoinOrderMember],
     maybe_order_target: Option<&OrderTarget>,
     input_cardinality: f64,
+    base_row_count: f64,
 ) -> Result<Option<AccessMethod>> {
     match &rhs_table.table {
         Table::BTree(_) => find_best_access_method_for_btree(
@@ -89,15 +90,17 @@ pub fn find_best_access_method_for_join_order(
             join_order,
             maybe_order_target,
             input_cardinality,
+            base_row_count,
         ),
         Table::Virtual(vtab) => find_best_access_method_for_vtab(
             vtab,
             &rhs_constraints.constraints,
             join_order,
             input_cardinality,
+            base_row_count,
         ),
         Table::FromClauseSubquery(_) => Ok(Some(AccessMethod {
-            cost: estimate_cost_for_scan_or_seek(None, &[], &[], input_cardinality),
+            cost: estimate_cost_for_scan_or_seek(None, &[], &[], input_cardinality, base_row_count),
             params: AccessMethodParams::Subquery,
         })),
     }
@@ -109,9 +112,11 @@ fn find_best_access_method_for_btree(
     join_order: &[JoinOrderMember],
     maybe_order_target: Option<&OrderTarget>,
     input_cardinality: f64,
+    base_row_count: f64,
 ) -> Result<Option<AccessMethod>> {
     let table_no = join_order.last().unwrap().table_id;
-    let mut best_cost = estimate_cost_for_scan_or_seek(None, &[], &[], input_cardinality);
+    let mut best_cost =
+        estimate_cost_for_scan_or_seek(None, &[], &[], input_cardinality, base_row_count);
     let mut best_params = AccessMethodParams::BTreeTable {
         iter_dir: IterationDirection::Forwards,
         index: None,
@@ -143,6 +148,7 @@ fn find_best_access_method_for_btree(
             &rhs_constraints.constraints,
             &usable_constraint_refs,
             input_cardinality,
+            base_row_count,
         );
 
         // All other things being equal, prefer an access method that satisfies the order target.
@@ -225,6 +231,7 @@ fn find_best_access_method_for_vtab(
     constraints: &[Constraint],
     join_order: &[JoinOrderMember],
     input_cardinality: f64,
+    base_row_count: f64,
 ) -> Result<Option<AccessMethod>> {
     let vtab_constraints = convert_to_vtab_constraint(constraints, join_order);
 
@@ -236,7 +243,7 @@ fn find_best_access_method_for_vtab(
         Ok(index_info) => {
             Ok(Some(AccessMethod {
                 // TODO: Base cost on `IndexInfo::estimated_cost` and output cardinality on `IndexInfo::estimated_rows`
-                cost: estimate_cost_for_scan_or_seek(None, &[], &[], input_cardinality),
+                cost: estimate_cost_for_scan_or_seek(None, &[], &[], input_cardinality, base_row_count),
                 params: AccessMethodParams::VirtualTable {
                     idx_num: index_info.idx_num,
                     idx_str: index_info.idx_str,

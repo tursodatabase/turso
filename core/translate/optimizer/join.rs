@@ -53,6 +53,7 @@ pub fn join_lhs_and_rhs<'a>(
     rhs_table_reference: &JoinedTable,
     rhs_constraints: &'a TableConstraints,
     all_constraints: &'a [TableConstraints],
+    base_table_rows: &[f64],
     join_order: &[JoinOrderMember],
     maybe_order_target: Option<&OrderTarget>,
     access_methods_arena: &'a RefCell<Vec<AccessMethod>>,
@@ -66,12 +67,16 @@ pub fn join_lhs_and_rhs<'a>(
     // then the output cardinality of the join will be 2000.
     let input_cardinality = lhs.map_or(1, |l| l.output_cardinality);
 
+    let rhs_table_number = join_order.last().unwrap().original_idx;
+    let rhs_base_rows = base_table_rows.get(rhs_table_number).copied().unwrap_or(ESTIMATED_HARDCODED_ROWS_PER_TABLE as f64);
+
     let Some(method) = find_best_access_method_for_join_order(
         rhs_table_reference,
         rhs_constraints,
         join_order,
         maybe_order_target,
         input_cardinality as f64,
+        rhs_base_rows,
     )?
     else {
         return Ok(None);
@@ -91,7 +96,6 @@ pub fn join_lhs_and_rhs<'a>(
         .filter(|c| lhs_mask.contains_all(&c.lhs_mask))
         .map(|c| c.selectivity)
         .product::<f64>();
-    let rhs_table_number = join_order.last().unwrap().original_idx;
 
     // If we already have a non-empty LHS (at least one table has been joined),
     // consider a hash-join alternative for the current RHS. We only allow hash
@@ -156,7 +160,7 @@ pub fn join_lhs_and_rhs<'a>(
         });
 
         let build_cardinality = lhs.output_cardinality as f64;
-        let probe_cardinality = ESTIMATED_HARDCODED_ROWS_PER_TABLE as f64;
+        let probe_cardinality = rhs_base_rows;
 
         let rhs_has_selective_seek = matches!(
             best_access_method.params,
@@ -318,7 +322,7 @@ pub fn join_lhs_and_rhs<'a>(
     // If this table is the rightmost table in the join order, we multiply by the input cardinality,
     // which is the output cardinality of the previous tables.
     let output_cardinality = (input_cardinality as f64
-        * ESTIMATED_HARDCODED_ROWS_PER_TABLE as f64
+        * rhs_base_rows
         * output_cardinality_multiplier)
         .ceil() as usize;
 
@@ -344,6 +348,7 @@ pub fn compute_best_join_order<'a>(
     joined_tables: &[JoinedTable],
     maybe_order_target: Option<&OrderTarget>,
     constraints: &'a [TableConstraints],
+    base_table_rows: &[f64],
     access_methods_arena: &'a RefCell<Vec<AccessMethod>>,
     where_clause: &mut [WhereTerm],
     subqueries: &[NonFromClauseSubquery],
@@ -359,6 +364,7 @@ pub fn compute_best_join_order<'a>(
     let naive_plan = compute_naive_left_deep_plan(
         joined_tables,
         maybe_order_target,
+        base_table_rows,
         access_methods_arena,
         constraints,
         where_clause,
@@ -427,6 +433,7 @@ pub fn compute_best_join_order<'a>(
             table_ref,
             &constraints[i],
             constraints,
+            base_table_rows,
             &join_order,
             maybe_order_target,
             access_methods_arena,
@@ -540,17 +547,18 @@ pub fn compute_best_join_order<'a>(
                 });
                 assert!(join_order.len() == subset_size);
 
-                // Calculate the best way to join LHS with RHS.
-                let rel = join_lhs_and_rhs(
-                    Some(lhs),
-                    &joined_tables[rhs_idx],
-                    &constraints[rhs_idx],
-                    constraints,
-                    &join_order,
-                    maybe_order_target,
-                    access_methods_arena,
-                    cost_upper_bound,
-                    joined_tables,
+        // Calculate the best way to join LHS with RHS.
+        let rel = join_lhs_and_rhs(
+            Some(lhs),
+            &joined_tables[rhs_idx],
+            &constraints[rhs_idx],
+            constraints,
+            base_table_rows,
+            &join_order,
+            maybe_order_target,
+            access_methods_arena,
+            cost_upper_bound,
+            joined_tables,
                     where_clause,
                     subqueries,
                 )?;
@@ -634,6 +642,7 @@ pub fn compute_best_join_order<'a>(
 pub fn compute_naive_left_deep_plan<'a>(
     joined_tables: &[JoinedTable],
     maybe_order_target: Option<&OrderTarget>,
+    base_table_rows: &[f64],
     access_methods_arena: &'a RefCell<Vec<AccessMethod>>,
     constraints: &'a [TableConstraints],
     where_clause: &mut [WhereTerm],
@@ -658,6 +667,7 @@ pub fn compute_naive_left_deep_plan<'a>(
         &joined_tables[0],
         &constraints[0],
         constraints,
+        base_table_rows,
         &join_order[..1],
         maybe_order_target,
         access_methods_arena,
@@ -677,6 +687,7 @@ pub fn compute_naive_left_deep_plan<'a>(
             &joined_tables[i],
             &constraints[i],
             constraints,
+            base_table_rows,
             &join_order[..=i],
             maybe_order_target,
             access_methods_arena,
@@ -762,6 +773,10 @@ mod tests {
         vdbe::builder::TableRefIdCounter,
     };
 
+    fn default_base_rows(n: usize) -> Vec<f64> {
+        vec![super::cost::ESTIMATED_HARDCODED_ROWS_PER_TABLE as f64; n]
+    }
+
     #[test]
     fn test_generate_bitmasks() {
         let bitmasks = generate_join_bitmasks(4, 2).collect::<Vec<_>>();
@@ -789,10 +804,12 @@ mod tests {
         )
         .unwrap();
 
+        let base_table_rows = default_base_rows(table_references.joined_tables().len());
         let result = compute_best_join_order(
             table_references.joined_tables(),
             None,
             &table_constraints,
+            &base_table_rows,
             &access_methods_arena,
             &mut where_clause,
             &[],
@@ -826,10 +843,12 @@ mod tests {
 
         // SELECT * from test_table
         // expecting best_best_plan() not to do any work due to empty where clause.
+        let base_table_rows = default_base_rows(table_references.joined_tables().len());
         let BestJoinOrderResult { best_plan, .. } = compute_best_join_order(
             table_references.joined_tables(),
             None,
             &table_constraints,
+            &base_table_rows,
             &access_methods_arena,
             &mut where_clause,
             &[],
@@ -873,10 +892,12 @@ mod tests {
 
         // SELECT * FROM test_table WHERE id = 42
         // expecting a RowidEq access method because id is a rowid alias.
+        let base_table_rows = default_base_rows(table_references.joined_tables().len());
         let result = compute_best_join_order(
             table_references.joined_tables(),
             None,
             &table_constraints,
+            &base_table_rows,
             &access_methods_arena,
             &mut where_clause,
             &[],
@@ -948,10 +969,12 @@ mod tests {
         .unwrap();
         // SELECT * FROM test_table WHERE id = 42
         // expecting an IndexScan access method because id is a primary key with an index
+        let base_table_rows = default_base_rows(table_references.joined_tables().len());
         let result = compute_best_join_order(
             table_references.joined_tables(),
             None,
             &table_constraints,
+            &base_table_rows,
             &access_methods_arena,
             &mut where_clause,
             &[],
@@ -1034,10 +1057,12 @@ mod tests {
         )
         .unwrap();
 
+        let base_table_rows = default_base_rows(table_references.joined_tables().len());
         let result = compute_best_join_order(
             table_references.joined_tables(),
             None,
             &table_constraints,
+            &base_table_rows,
             &access_methods_arena,
             &mut where_clause,
             &[],
@@ -1221,10 +1246,12 @@ mod tests {
         )
         .unwrap();
 
+        let base_table_rows = default_base_rows(table_references.joined_tables().len());
         let result = compute_best_join_order(
             table_references.joined_tables(),
             None,
             &table_constraints,
+            &base_table_rows,
             &access_methods_arena,
             &mut where_clause,
             &[],
@@ -1336,10 +1363,12 @@ mod tests {
         )
         .unwrap();
 
+        let base_table_rows = default_base_rows(table_references.joined_tables().len());
         let BestJoinOrderResult { best_plan, .. } = compute_best_join_order(
             table_references.joined_tables(),
             None,
             &table_constraints,
+            &base_table_rows,
             &access_methods_arena,
             &mut where_clause,
             &[],
@@ -1448,10 +1477,12 @@ mod tests {
         )
         .unwrap();
 
+        let base_table_rows = default_base_rows(table_references.joined_tables().len());
         let result = compute_best_join_order(
             table_references.joined_tables(),
             None,
             &table_constraints,
+            &base_table_rows,
             &access_methods_arena,
             &mut where_clause,
             &[],
@@ -1539,10 +1570,12 @@ mod tests {
         .unwrap();
 
         // Run the optimizer
+        let base_table_rows = default_base_rows(table_references.joined_tables().len());
         let BestJoinOrderResult { best_plan, .. } = compute_best_join_order(
             table_references.joined_tables(),
             None,
             &table_constraints,
+            &base_table_rows,
             &access_methods_arena,
             &mut where_clause,
             &[],
@@ -1670,10 +1703,12 @@ mod tests {
         )
         .unwrap();
 
+        let base_table_rows = default_base_rows(table_references.joined_tables().len());
         let BestJoinOrderResult { best_plan, .. } = compute_best_join_order(
             table_references.joined_tables(),
             None,
             &table_constraints,
+            &base_table_rows,
             &access_methods_arena,
             &mut where_clause,
             &[],
@@ -1790,10 +1825,12 @@ mod tests {
         )
         .unwrap();
 
+        let base_table_rows = default_base_rows(table_references.joined_tables().len());
         let BestJoinOrderResult { best_plan, .. } = compute_best_join_order(
             table_references.joined_tables(),
             None,
             &table_constraints,
+            &base_table_rows,
             &access_methods_arena,
             &mut where_clause,
             &[],
@@ -1928,10 +1965,12 @@ mod tests {
         )
         .unwrap();
 
+        let base_table_rows = default_base_rows(table_references.joined_tables().len());
         let BestJoinOrderResult { best_plan, .. } = compute_best_join_order(
             table_references.joined_tables(),
             None,
             &table_constraints,
+            &base_table_rows,
             &access_methods_arena,
             &mut where_clause,
             &[],
@@ -2136,10 +2175,12 @@ mod tests {
         )
         .unwrap();
 
+        let base_table_rows = default_base_rows(table_references.joined_tables().len());
         let result = compute_best_join_order(
             table_references.joined_tables(),
             None,
             &table_constraints,
+            &base_table_rows,
             &access_methods_arena,
             &mut where_clause,
             &[],

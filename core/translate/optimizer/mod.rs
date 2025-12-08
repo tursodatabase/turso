@@ -8,7 +8,7 @@ use std::{
 use constraints::{
     constraints_from_where_clause, usable_constraints_for_join_order, Constraint, ConstraintRef,
 };
-use cost::Cost;
+use cost::{Cost, ESTIMATED_HARDCODED_ROWS_PER_TABLE};
 use join::{compute_best_join_order, BestJoinOrderResult};
 use lift_common_subexpressions::lift_common_subexpressions_from_binary_or_terms;
 use order::{compute_order_target, plan_satisfies_order_target, EliminatesSortBy};
@@ -566,6 +566,26 @@ fn register_expression_index_usages_for_plan(
     }
 }
 
+/// Derive a base row-count estimate for a table, preferring ANALYZE stats.
+fn base_row_estimate(schema: &Schema, table: &JoinedTable) -> f64 {
+    match &table.table {
+        Table::BTree(btree) => {
+            if let Some(stats) = schema.analyze_stats.table_stats(&btree.name) {
+                if let Some(rows) = stats.row_count.or_else(|| {
+                    stats
+                        .index_stats
+                        .values()
+                        .find_map(|idx_stat| idx_stat.total_rows)
+                }) {
+                    return rows as f64;
+                }
+            }
+            ESTIMATED_HARDCODED_ROWS_PER_TABLE as f64
+        }
+        _ => ESTIMATED_HARDCODED_ROWS_PER_TABLE as f64,
+    }
+}
+
 /// Optimize the join order and index selection for a query.
 ///
 /// This function does the following:
@@ -629,6 +649,11 @@ fn optimize_table_access(
         available_indexes,
         subqueries,
     )?;
+    let base_table_rows = table_references
+        .joined_tables()
+        .iter()
+        .map(|t| base_row_estimate(schema, t))
+        .collect::<Vec<_>>();
 
     // Currently the expressions we evaluate as constraints are binary expressions that will never be true for a NULL operand.
     // If there are any constraints on the right hand side table of an outer join that are not part of the outer join condition,
@@ -668,6 +693,7 @@ fn optimize_table_access(
         table_references.joined_tables_mut(),
         maybe_order_target.as_ref(),
         &constraints_per_table,
+        &base_table_rows,
         &access_methods_arena,
         where_clause,
         subqueries,
