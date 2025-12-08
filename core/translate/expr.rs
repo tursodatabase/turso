@@ -1509,7 +1509,10 @@ pub fn translate_expr(
                             });
                             Ok(target_register)
                         }
-                        ScalarFunc::Date | ScalarFunc::DateTime | ScalarFunc::JulianDay => {
+                        ScalarFunc::Date
+                        | ScalarFunc::DateTime
+                        | ScalarFunc::JulianDay
+                        | ScalarFunc::UnixEpoch => {
                             let start_reg = program.alloc_registers(args.len().max(1));
                             for (i, arg) in args.iter().enumerate() {
                                 // register containing result of each argument expression
@@ -1585,30 +1588,6 @@ pub fn translate_expr(
                                 start_reg,
                                 resolver,
                             )?;
-                            program.emit_insn(Insn::Function {
-                                constant_mask: 0,
-                                start_reg,
-                                dest: target_register,
-                                func: func_ctx,
-                            });
-                            Ok(target_register)
-                        }
-                        ScalarFunc::UnixEpoch => {
-                            let mut start_reg = 0;
-                            if args.len() > 1 {
-                                crate::bail_parse_error!("epoch function with > 1 arguments. Modifiers are not yet supported.");
-                            }
-                            if args.len() == 1 {
-                                let arg_reg = program.alloc_register();
-                                let _ = translate_expr(
-                                    program,
-                                    referenced_tables,
-                                    &args[0],
-                                    arg_reg,
-                                    resolver,
-                                )?;
-                                start_reg = arg_reg;
-                            }
                             program.emit_insn(Insn::Function {
                                 constant_mask: 0,
                                 start_reg,

@@ -5295,25 +5295,11 @@ pub fn op_function(
                 state.registers[*dest] = Register::Value(result);
             }
             ScalarFunc::UnixEpoch => {
-                if *start_reg == 0 {
-                    // Case: No args. Pass ["now"] as a slice.
-                    let now_val = Value::build_text("now");
-                    let args = [&now_val]; // Slice of 1 item
-                    let result = exec_unixepoch(args);
-                    state.registers[*dest] = Register::Value(result);
-                } else {
-                    // Case: Args provided.
-                    let datetime_value = &state.registers[*start_reg];
-                    let val = datetime_value.get_value();
+                let values =
+                    registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
 
-                    // Wrap the single reference in a slice to satisfy the Iterator trait
-                    let args = std::slice::from_ref(val);
-
-                    // Call function directly (It returns Value, not Result)
-                    let result = exec_unixepoch(args);
-
-                    state.registers[*dest] = Register::Value(result);
-                }
+                let result = exec_unixepoch(values);
+                state.registers[*dest] = Register::Value(result);
             }
             ScalarFunc::TursoVersion => {
                 if !program.connection.is_db_initialized() {

@@ -446,10 +446,19 @@ fn apply_modifier(
             let utc_dt = DateTime::<Utc>::from_naive_utc_and_offset(*dt, Utc);
             *dt = utc_dt.with_timezone(&chrono::Local).naive_local();
         }
-        Modifier::Utc => {
-            let local_dt = chrono::Local.from_local_datetime(dt).unwrap();
-            *dt = local_dt.with_timezone(&Utc).naive_utc();
-        }
+        Modifier::Utc => match chrono::Local.from_local_datetime(dt) {
+            chrono::LocalResult::Single(local_dt) => {
+                *dt = local_dt.with_timezone(&Utc).naive_utc();
+            }
+            chrono::LocalResult::Ambiguous(earliest, _latest) => {
+                *dt = earliest.with_timezone(&Utc).naive_utc();
+            }
+            chrono::LocalResult::None => {
+                return Err(InvalidModifier(
+                    "Time does not exist in local timezone".into(),
+                ));
+            }
+        },
         Modifier::Subsec => {
             return Ok(true);
         }
