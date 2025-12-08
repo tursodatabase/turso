@@ -3,10 +3,8 @@ import random
 import string
 
 import pytest
-
-import turso.aio.sync
-
 import requests
+import turso.aio.sync
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s", force=True)
 

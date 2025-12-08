@@ -1,7 +1,7 @@
 import asyncio
-from typing import Any, Callable
 from queue import SimpleQueue
 from threading import Thread
+from typing import Any, Callable
 
 STOP_RUNNING_SENTINEL = object()
 

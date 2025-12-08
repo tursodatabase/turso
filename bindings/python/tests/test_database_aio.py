@@ -1,10 +1,9 @@
-import os
 import asyncio
+import logging
+import os
 import sqlite3
 
 import pytest
-import logging
-
 import turso.aio
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s", force=True)

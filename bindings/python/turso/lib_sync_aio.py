@@ -1,19 +1,20 @@
 from __future__ import annotations
 
-import asyncio
-from typing import Any, Callable, Optional, Union, Iterable, Mapping, Sequence, cast
-from queue import SimpleQueue
+from typing import Callable, Optional, Union, cast
 
-from .worker import Worker
+from .lib_aio import (
+    Connection as NonBlockingConnection,
+)
 from .lib_sync import (
     ConnectionSync as BlockingConnectionSync,
-    connect_sync as blocking_connect_sync,
+)
+from .lib_sync import (
     PartialSyncPrefixBootstrap,
     PartialSyncQueryBootstrap,
     PyTursoSyncDatabaseStats,
 )
-from .lib_aio import (
-    Connection as NonBlockingConnection,
+from .lib_sync import (
+    connect_sync as blocking_connect_sync,
 )
 
 

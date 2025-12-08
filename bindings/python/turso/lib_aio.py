@@ -1,17 +1,22 @@
 from __future__ import annotations
 
 import asyncio
-from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 from queue import SimpleQueue
+from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
 
-from .worker import Worker, STOP_RUNNING_SENTINEL
 from .lib import (
     Connection as BlockingConnection,
+)
+from .lib import (
     Cursor as BlockingCursor,
-    Row as BlockingRow,
+)
+from .lib import (
     ProgrammingError,
+)
+from .lib import (
     connect as blocking_connect,
 )
+from .worker import STOP_RUNNING_SENTINEL, Worker
 
 
 # Connection goes FIRST
