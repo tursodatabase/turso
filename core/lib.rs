@@ -2741,22 +2741,13 @@ impl Statement {
         }
 
         let mut res = if !self.accesses_db {
-            self.program.step(
-                &mut self.state,
-                self.program.connection.mv_store().as_ref(),
-                self.pager.clone(),
-                self.query_mode,
-                waker,
-            )
+            self.program
+                .step(&mut self.state, self.pager.clone(), self.query_mode, waker)
         } else {
             const MAX_SCHEMA_RETRY: usize = 50;
-            let mut res = self.program.step(
-                &mut self.state,
-                self.program.connection.mv_store().as_ref(),
-                self.pager.clone(),
-                self.query_mode,
-                waker,
-            );
+            let mut res =
+                self.program
+                    .step(&mut self.state, self.pager.clone(), self.query_mode, waker);
             for attempt in 0..MAX_SCHEMA_RETRY {
                 // Only reprepare if we still need to update schema
                 if !matches!(res, Err(LimboError::SchemaUpdated)) {
@@ -2764,13 +2755,9 @@ impl Statement {
                 }
                 tracing::debug!("reprepare: attempt={}", attempt);
                 self.reprepare()?;
-                res = self.program.step(
-                    &mut self.state,
-                    self.program.connection.mv_store().as_ref(),
-                    self.pager.clone(),
-                    self.query_mode,
-                    waker,
-                );
+                res =
+                    self.program
+                        .step(&mut self.state, self.pager.clone(), self.query_mode, waker);
             }
             res
         };
@@ -3025,12 +3012,7 @@ impl Statement {
 
     fn reset_internal(&mut self, max_registers: Option<usize>, max_cursors: Option<usize>) {
         // as abort uses auto_txn_cleanup value - it needs to be called before state.reset
-        self.program.abort(
-            self.program.connection.mv_store().as_ref(),
-            &self.pager,
-            None,
-            &mut self.state,
-        );
+        self.program.abort(&self.pager, None, &mut self.state);
         self.state.reset(max_registers, max_cursors);
         self.program.n_change.store(0, Ordering::SeqCst);
         self.busy = false;
