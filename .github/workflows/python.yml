@@ -65,6 +65,9 @@ jobs:
       - name: Run Pytest
         run: uv run pytest tests/test_database.py
 
+      - name: Run Pytest (async driver)
+        run: uv run pytest tests/test_database_aio.py
+
   lint:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
