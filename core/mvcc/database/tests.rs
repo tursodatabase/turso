@@ -1646,7 +1646,6 @@ fn test_cursor_with_btree_and_mvcc_with_backward_cursor() {
 }
 
 #[test]
-#[ignore = "we need to implement seek with btree cursor"]
 fn test_cursor_with_btree_and_mvcc_with_backward_cursor_with_delete() {
     let mut db = MvccTestDbNoConn::new_with_random_db();
     // First write some rows and checkpoint so data is flushed to BTree file (.db)
@@ -1844,7 +1843,6 @@ fn test_cursor_with_btree_and_mvcc_insert_after_checkpoint_repeated_key() {
 }
 
 #[test]
-#[ignore = "we need to implement seek with btree cursor"]
 fn test_cursor_with_btree_and_mvcc_seek_after_checkpoint() {
     let mut db = MvccTestDbNoConn::new_with_random_db();
     // First write some rows and checkpoint so data is flushed to BTree file (.db)
