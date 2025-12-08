@@ -394,24 +394,60 @@ enum NextState {
     Finish,
 }
 
+/// A sorted chunk represents a portion of sorted data that has been written to disk
+/// during external merge sort. When the in-memory buffer fills up, records are sorted
+/// and flushed to a chunk file. During the merge phase, chunks are read back and merged
+/// using a heap to produce the final sorted output.
+///
+/// # Buffer management
+///
+/// The chunk uses a fixed-size read buffer (`buffer`) to read data from disk. The buffer
+/// has two relevant sizes:
+/// - `buffer.len()` (capacity): The total allocated size of the buffer (fixed at creation)
+/// - `buffer_len`: The amount of valid data currently in the buffer (0 to capacity)
+///
+/// The difference `buffer.len() - buffer_len` is the free space available for reading
+/// more data from disk.
+///
+/// # Reading progress
+///
+/// - `chunk_size`: Total bytes of this chunk on disk (set when chunk is written)
+/// - `total_bytes_read`: Cumulative bytes read from disk so far (0 to chunk_size)
+///
+/// The difference `chunk_size - total_bytes_read` is the remaining data on disk that
+/// hasn't been read yet. When `total_bytes_read == chunk_size`, we've read all data.
+///
+/// # Record parsing
+///
+/// Data flows: disk -> buffer -> records -> caller
+///
+/// 1. `read()` fills `buffer` from disk, updates `total_bytes_read`
+/// 2. `next()` parses records from `buffer` into `records` vec, updates `buffer_len`
+/// 3. `next()` returns records one at a time from `records`
+///
+/// Incomplete records at the end of the buffer are kept (buffer compacted) until
+/// more data is read to complete them.
 struct SortedChunk {
-    /// The chunk file.
+    /// The file containing the chunk data.
     file: Arc<dyn File>,
-    /// Offset of the start of chunk in file
+    /// Byte offset where this chunk starts in the file.
     start_offset: u64,
-    /// The size of this chunk file in bytes.
+    /// Total size of this chunk in bytes (set during write, used to detect EOF during read).
     chunk_size: usize,
-    /// The read buffer.
+    /// Fixed-size buffer for reading data from disk. The capacity (`buffer.len()`) is
+    /// constant; use `buffer_len` for the amount of valid data.
     buffer: Arc<RwLock<Vec<u8>>>,
-    /// The current length of the buffer.
+    /// Amount of valid (unparsed) data in `buffer`, from index 0 to buffer_len.
+    /// This is separate from buffer.len() because we reuse the same allocation.
     buffer_len: Arc<atomic::AtomicUsize>,
-    /// The records decoded from the chunk file.
+    /// Records parsed from the buffer, waiting to be returned by `next()`.
+    /// Stored in reverse order so we can efficiently pop from the end.
     records: Vec<ImmutableRecord>,
-    /// The current IO state of the chunk.
+    /// Current async IO state (None, WaitingForRead, ReadComplete, ReadEOF, etc).
     io_state: Arc<RwLock<SortedChunkIOState>>,
-    /// The total number of bytes read from the chunk file.
+    /// Cumulative bytes read from disk. When this equals `chunk_size`, we've read everything.
     total_bytes_read: Arc<atomic::AtomicUsize>,
-    /// State machine for [SortedChunk::next]
+    /// State machine for the `next()` method.
     next_state: NextState,
 }
 
@@ -443,6 +479,14 @@ impl SortedChunk {
         self.buffer_len.store(len, atomic::Ordering::SeqCst);
     }
 
+    /// Returns the next record from this chunk, or None if exhausted.
+    ///
+    /// May return `ChunkNextResult::IO` if async IO is needed, in which case
+    /// the caller should wait for the completion and call `next()` again.
+    ///
+    /// Internally manages a two-phase state machine:
+    /// - `Start`: Parse records from buffer, issue prefetch read if needed
+    /// - `Finish`: Return the next parsed record
     fn next(&mut self) -> Result<ChunkNextResult> {
         loop {
             match self.next_state {
@@ -520,6 +564,12 @@ impl SortedChunk {
         }
     }
 
+    /// Issues an async read to fill the buffer with more data from the chunk file.
+    ///
+    /// Reads up to `min(free_buffer_space, remaining_chunk_bytes)` bytes. Returns `None`
+    /// if there's no room in the buffer or no data left to read (no IO issued).
+    ///
+    /// On completion, appends data to `buffer` and updates `buffer_len` and `total_bytes_read`.
     fn read(&mut self) -> Result<Option<Completion>> {
         let free_buffer_space = self.buffer.read().len() - self.buffer_len();
         let remaining_chunk_bytes =
