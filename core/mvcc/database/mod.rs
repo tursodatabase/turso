@@ -2521,6 +2521,23 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         }
     }
 
+    pub fn get_last_table_rowid_without_visibility_check(
+        &self,
+        table_id: MVTableId,
+    ) -> Option<RowKey> {
+        let max_rowid = RowID {
+            table_id,
+            row_id: RowKey::Int(i64::MAX),
+        };
+        let range = create_seek_range(Bound::Included(max_rowid), IterationDirection::Backwards);
+        let mut range = self.rows.range(range).rev();
+        let entry = range.next()?;
+        if entry.key().table_id != table_id {
+            return None;
+        }
+        Some(entry.key().row_id.clone())
+    }
+
     pub fn get_last_index_rowid(
         &self,
         index_id: MVTableId,

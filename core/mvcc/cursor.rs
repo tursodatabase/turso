@@ -364,18 +364,57 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
         Ok(())
     }
 
+    /// Get the next rowid in the table.
+    /// Since MVCC requires rowids to be sequential and not collide we need to ensure rowids supplied to concurrrent
+    /// transactions are not conflicting.
+    /// Therefore, we will always choose the highest rowid in the table, regardless of the visibility of the row to the
+    /// transaction.
     pub fn get_next_rowid(&mut self) -> Result<IOResult<i64>> {
         // lock so we don't get same two rowids
         let lock = self.next_rowid_lock.clone();
         let _lock = lock.write();
         return_if_io!(self.last());
+        let last_rowid_in_mvcc_index = self
+            .db
+            .get_last_table_rowid_without_visibility_check(self.table_id);
         match self.current_pos.borrow().clone() {
             CursorPosition::Loaded {
                 row_id,
                 in_btree: _,
-            } => Ok(IOResult::Done(row_id.row_id.to_int_or_panic() + 1)),
-            CursorPosition::BeforeFirst => Ok(IOResult::Done(1)),
-            CursorPosition::End => Ok(IOResult::Done(1)),
+            } => {
+                // Check if there is some other rowid in the MVCC index that is higher than the current rowid.
+                // Doesn't matter if it's not visible.
+                tracing::debug!(
+                    "get_next_rowid: last_rowid_in_mvcc_index={:?}, row_id={:?}",
+                    last_rowid_in_mvcc_index,
+                    row_id
+                );
+                let max_rowid = match last_rowid_in_mvcc_index {
+                    Some(k) => {
+                        if k.to_int_or_panic() > row_id.row_id.to_int_or_panic() {
+                            k.to_int_or_panic() + 1
+                        } else {
+                            row_id.row_id.to_int_or_panic() + 1
+                        }
+                    }
+                    None => row_id.row_id.to_int_or_panic() + 1,
+                };
+                Ok(IOResult::Done(max_rowid))
+            }
+            CursorPosition::BeforeFirst => {
+                let res = match last_rowid_in_mvcc_index {
+                    None => 1,
+                    Some(k) => k.to_int_or_panic() + 1,
+                };
+                Ok(IOResult::Done(res))
+            }
+            CursorPosition::End => {
+                let res = match last_rowid_in_mvcc_index {
+                    None => 1,
+                    Some(k) => k.to_int_or_panic() + 1,
+                };
+                Ok(IOResult::Done(res))
+            }
         }
     }
 
