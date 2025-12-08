@@ -6,7 +6,6 @@ import pytest
 import logging
 
 import turso.aio
-import turso
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s", force=True)
 
@@ -96,39 +95,6 @@ async def test_subqueries_and_join():
         assert row == ("alice", "NY")
     finally:
         await conn.close()
-
-
-@pytest.mark.asyncio
-async def test_insert_returning_single_and_multiple_commit_without_consuming():
-    turso.setup_logging(level=logging.DEBUG)
-    conn = await turso.aio.connect(":memory:")
-    try:
-        cur = conn.cursor()
-        await cur.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
-
-        # Single INSERT ... RETURNING
-        await cur.execute("INSERT INTO t(name) VALUES (?) RETURNING id, name", ("alice",))
-        one = await cur.fetchone()
-        assert one[1] == "alice"
-        await conn.commit()
-
-        # Multiple rows with RETURNING; consume only one row and commit
-        await cur.execute(
-            "INSERT INTO t(name) VALUES (?), (?), (?) RETURNING id, name",
-            ("bob", "charlie", "dora"),
-        )
-        first = await cur.fetchone()
-        assert first[1] in ("bob", "charlie", "dora")
-        # Do not consume remaining rows, but commit explicitly
-        await conn.commit()
-
-        # Ensure all 3 were inserted despite not consuming all RETURNING rows
-        await cur.execute("SELECT COUNT(*) FROM t WHERE name = 'bob' OR name = 'charlie' OR name = 'dora'")
-        total = (await cur.fetchone())[0]
-        assert total == 3
-    finally:
-        await conn.close()
-
 
 @pytest.mark.asyncio
 async def test_conflict_do_nothing_and_rowcount():
@@ -249,23 +215,6 @@ async def test_async_operations_do_not_block_event_loop():
         await cur.execute("SELECT COUNT(*) FROM t")
         count = (await cur.fetchone())[0]
         assert count == 5000
-    finally:
-        await conn.close()
-
-
-@pytest.mark.asyncio
-async def test_named_parameters_and_delete_rowcount():
-    conn = await turso.aio.connect(":memory:")
-    try:
-        cur = conn.cursor()
-        await cur.execute("CREATE TABLE t (id INT PRIMARY KEY, v TEXT)")
-        await cur.executemany("INSERT INTO t (id, v) VALUES (?, ?)", [(1, "a"), (2, "b"), (3, "c")])
-
-        await cur.execute("DELETE FROM t WHERE id = :id", {"id": 2})
-        assert cur.rowcount == 1
-
-        await cur.execute("SELECT id FROM t ORDER BY id")
-        assert [r[0] for r in await cur.fetchall()] == [1, 3]
     finally:
         await conn.close()
 

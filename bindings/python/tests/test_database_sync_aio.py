@@ -3,7 +3,8 @@ import random
 import string
 
 import pytest
-import turso.aio.sync as turso_sync
+
+import turso.aio.sync
 
 import requests
 
@@ -63,7 +64,7 @@ async def test_bootstrap():
     server.db_sql(name, name, name, "INSERT INTO t VALUES ('hello'), ('turso'), ('sync')")
     server.db_sql(name, name, name, "SELECT * FROM t")
 
-    conn = await turso_sync.connect(":memory:", server.db_url(name, name, name))
+    conn = await turso.aio.sync.connect(":memory:", server.db_url(name, name, name))
     rows = await (await conn.execute("SELECT * FROM t")).fetchall()
     assert rows == [("hello",), ("turso",), ("sync",)]
 
@@ -78,7 +79,7 @@ async def test_pull():
     server.db_sql(name, name, name, "INSERT INTO t VALUES ('hello'), ('turso'), ('sync')")
     server.db_sql(name, name, name, "SELECT * FROM t")
 
-    conn = await turso_sync.connect(":memory:", server.db_url(name, name, name))
+    conn = await turso.aio.sync.connect(":memory:", server.db_url(name, name, name))
     rows = await (await conn.execute("SELECT * FROM t")).fetchall()
     assert rows == [("hello",), ("turso",), ("sync",)]
 
@@ -105,7 +106,7 @@ async def test_push():
     server.db_sql(name, name, name, "INSERT INTO t VALUES ('hello'), ('turso'), ('sync')")
     server.db_sql(name, name, name, "SELECT * FROM t")
 
-    conn = await turso_sync.connect(":memory:", server.db_url(name, name, name))
+    conn = await turso.aio.sync.connect(":memory:", server.db_url(name, name, name))
     rows = await (await conn.execute("SELECT * FROM t")).fetchall()
     assert rows == [("hello",), ("turso",), ("sync",)]
 
@@ -129,7 +130,7 @@ async def test_checkpoint():
     server.create_group(name, name)
     server.create_db(name, name, name)
 
-    conn = await turso_sync.connect(":memory:", remote_url=server.db_url(name, name, name))
+    conn = await turso.aio.sync.connect(":memory:", remote_url=server.db_url(name, name, name))
     await conn.execute("CREATE TABLE t(x)")
     await conn.commit()
     for i in range(1024):
@@ -161,15 +162,15 @@ async def test_partial_sync():
     server.db_sql(name, name, name, "CREATE TABLE t(x)")
     server.db_sql(name, name, name, "INSERT INTO t SELECT randomblob(1024) FROM generate_series(1, 1024)")
 
-    conn_full = await turso_sync.connect(":memory:", remote_url=server.db_url(name, name, name))
+    conn_full = await turso.aio.sync.connect(":memory:", remote_url=server.db_url(name, name, name))
     assert await (await conn_full.execute("SELECT LENGTH(x) FROM t LIMIT 1")).fetchall() == [(1024,)]
     assert (await conn_full.stats()).network_received_bytes > 1024 * 1024
     assert await (await conn_full.execute("SELECT SUM(LENGTH(x)) FROM t")).fetchall() == [(1024 * 1024,)]
 
-    conn_partial = await turso_sync.connect(
+    conn_partial = await turso.aio.sync.connect(
         ":memory:",
         remote_url=server.db_url(name, name, name),
-        partial_boostrap_strategy=turso_sync.PartialSyncPrefixBootstrap(128 * 1024),
+        partial_boostrap_strategy=turso.aio.sync.PartialSyncPrefixBootstrap(128 * 1024),
     )
     assert await (await conn_partial.execute("SELECT LENGTH(x) FROM t LIMIT 1")).fetchall() == [(1024,)]
     assert (await conn_partial.stats()).network_received_bytes < 256 * 1024 * 1024
