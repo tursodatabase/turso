@@ -2494,11 +2494,10 @@ pub fn op_auto_commit(
     let is_commit_req = !had_autocommit && requested_autocommit && !requested_rollback;
     let is_rollback_req = !had_autocommit && requested_autocommit && requested_rollback;
 
-    if (changed && requested_autocommit) || requested_rollback {
-        if !state.uses_subjournal && pager.subjournal_in_use() {
+    if ((changed && requested_autocommit) || requested_rollback)
+        && !state.uses_subjournal && pager.subjournal_in_use() {
             return Err(LimboError::Busy);
         }
-    }
 
     if changed {
         if requested_rollback {
