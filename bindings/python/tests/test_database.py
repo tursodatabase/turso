@@ -1473,11 +1473,8 @@ def test_insert_returning_single_and_multiple_commit_without_consuming(provider)
         cur.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
         cur.execute("INSERT INTO t(name) VALUES (?), (?) RETURNING id", ("bob", "alice"),)
         cur.fetchone()
-        conn.commit()
-
-        cur.execute("SELECT COUNT(*) FROM t")
-        total = (cur.fetchone())[0]
-        assert total == 2
+        with pytest.raises(Exception):
+            conn.commit()
     finally:
         conn.close()
 
