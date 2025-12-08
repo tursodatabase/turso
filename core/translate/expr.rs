@@ -3817,6 +3817,13 @@ pub fn bind_and_rewrite_expr<'a>(
                     // - x in the inner query refers to t2.x.
                     if match_result.is_none() {
                         for outer_ref in referenced_tables.outer_query_refs().iter() {
+                            // CTEs (FromClauseSubquery) in outer_query_refs are only for table
+                            // lookup (e.g., FROM cte1), not for column resolution. Columns from
+                            // CTEs should only be accessible when the CTE is explicitly in the
+                            // FROM clause, not as implicit outer references.
+                            if matches!(outer_ref.table, Table::FromClauseSubquery(_)) {
+                                continue;
+                            }
                             let col_idx = outer_ref.table.columns().iter().position(|c| {
                                 c.name
                                     .as_ref()
