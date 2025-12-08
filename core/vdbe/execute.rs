@@ -30,7 +30,7 @@ use crate::vdbe::{
     TxnCleanup,
 };
 use crate::vector::{
-    vector32, vector32_sparse, vector64, vector_concat, vector_distance_cos,
+    vector32, vector32_sparse, vector64, vector_concat, vector_distance_cos, vector_distance_dot,
     vector_distance_jaccard, vector_distance_l2, vector_extract, vector_slice,
 };
 use crate::{
@@ -5480,6 +5480,10 @@ pub fn op_function(
                 }
                 VectorFunc::VectorDistanceCos => {
                     let result = vector_distance_cos(args)?;
+                    state.registers[*dest] = Register::Value(result);
+                }
+                VectorFunc::VectorDistanceDot => {
+                    let result = vector_distance_dot(args)?;
                     state.registers[*dest] = Register::Value(result);
                 }
                 VectorFunc::VectorDistanceL2 => {

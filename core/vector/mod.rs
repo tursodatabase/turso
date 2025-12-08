@@ -140,6 +140,21 @@ pub fn vector_distance_jaccard(args: &[Register]) -> Result<Value> {
     Ok(Value::Float(dist))
 }
 
+pub fn vector_distance_dot(args: &[Register]) -> Result<Value> {
+    if args.len() != 2 {
+        return Err(LimboError::ConversionError(
+            "distance_dot requires exactly two arguments".to_string(),
+        ));
+    }
+
+    let value_0 = args[0].get_value();
+    let value_1 = args[1].get_value();
+    let x = parse_vector(value_0, None)?;
+    let y = parse_vector(value_1, None)?;
+    let dist = operations::distance_dot::vector_distance_dot(&x, &y)?;
+    Ok(Value::Float(dist))
+}
+
 pub fn vector_concat(args: &[Register]) -> Result<Value> {
     if args.len() != 2 {
         return Err(LimboError::InvalidArgument(
