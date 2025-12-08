@@ -48,7 +48,6 @@ use pack1::{I32BE, U16BE, U32BE};
 use tracing::{instrument, Level};
 
 use super::pager::PageRef;
-use super::wal::TursoRwLock;
 use crate::error::LimboError;
 use crate::fast_lock::SpinLock;
 use crate::io::{Buffer, Completion, ReadComplete};
@@ -60,7 +59,6 @@ use crate::storage::btree::{payload_overflow_threshold_max, payload_overflow_thr
 use crate::storage::buffer_pool::BufferPool;
 use crate::storage::database::{DatabaseStorage, EncryptionOrChecksum};
 use crate::storage::pager::Pager;
-use crate::storage::wal::READMARK_NOT_USED;
 use crate::types::{SerialType, SerialTypeKind, TextRef, TextSubtype, ValueRef};
 use crate::{
     bail_corrupt_error, turso_assert, CompletionError, File, IOContext, Result, WalFileShared,
@@ -70,7 +68,7 @@ use rustc_hash::FxHashMap;
 use std::collections::BTreeMap;
 use std::mem::MaybeUninit;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 /// The minimum size of a cell in bytes.
@@ -1641,30 +1639,8 @@ pub fn build_shared_wal(
     let size = file.size()?;
 
     let header = Arc::new(SpinLock::new(WalHeader::default()));
-    let read_locks = std::array::from_fn(|_| TursoRwLock::new());
-    for (i, l) in read_locks.iter().enumerate() {
-        l.write();
-        l.set_value_exclusive(if i < 2 { 0 } else { READMARK_NOT_USED });
-        l.unlock();
-    }
-
-    let wal_file_shared = Arc::new(RwLock::new(WalFileShared {
-        enabled: AtomicBool::new(true),
-        wal_header: header.clone(),
-        min_frame: AtomicU64::new(0),
-        max_frame: AtomicU64::new(0),
-        nbackfills: AtomicU64::new(0),
-        transaction_count: AtomicU64::new(0),
-        frame_cache: Arc::new(SpinLock::new(FxHashMap::default())),
-        last_checksum: (0, 0),
-        file: Some(file.clone()),
-        read_locks,
-        write_lock: TursoRwLock::new(),
-        loaded: AtomicBool::new(false),
-        checkpoint_lock: TursoRwLock::new(),
-        initialized: AtomicBool::new(false),
-        epoch: AtomicU32::new(0),
-    }));
+    let wal_file_shared = WalFileShared::new(true, false, header.clone(), Some(file.clone()));
+    let wal_file_shared = Arc::new(RwLock::new(wal_file_shared));
 
     if size < WAL_HEADER_SIZE as u64 {
         wal_file_shared.write().loaded.store(true, Ordering::SeqCst);

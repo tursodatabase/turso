@@ -2,7 +2,6 @@
 
 use parking_lot::Mutex;
 use rustc_hash::{FxHashMap, FxHashSet};
-use std::array;
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use strum::EnumString;
@@ -665,6 +664,45 @@ impl fmt::Debug for WalFile {
 ** writing new content beginning at frame 1.
 */
 
+const READ_LOCK_COUNT: usize = 5;
+
+struct WalLock {
+    /// Read locks advertise the maximum WAL frame a reader may access.
+    /// Slot 0 is special, when it is held (shared) the reader bypasses the WAL and uses the main DB file.
+    /// When checkpointing, we must acquire the exclusive read lock 0 to ensure that no readers read
+    /// from a partially checkpointed db file.
+    /// Slots 1‑4 carry a frame‑number in value and may be shared by many readers. Slot 1 is the
+    /// default read lock and is to contain the max_frame in WAL.
+    read_locks: [TursoRwLock; READ_LOCK_COUNT],
+    /// There is only one write allowed in WAL mode. This lock takes care of ensuring there is only
+    /// one used.
+    write_lock: TursoRwLock,
+
+    /// Serialises checkpointer threads, only one checkpoint can be in flight at any time. Blocking and exclusive only
+    checkpoint_lock: TursoRwLock,
+}
+
+impl WalLock {
+    #[inline]
+    fn new() -> Self {
+        let read_locks = std::array::from_fn(|_| TursoRwLock::new());
+        // slot zero is always zero as it signifies that reads can be done from the db file
+        // directly, and slot 1 is the default read mark containing the max frame. in this case
+        // our max frame is zero so both slots 0 and 1 begin at 0
+        for (i, l) in read_locks.iter().enumerate() {
+            l.write();
+            l.set_value_exclusive(if i < 2 { 0 } else { READMARK_NOT_USED });
+            l.unlock();
+        }
+
+        Self {
+            read_locks,
+            write_lock: TursoRwLock::new(),
+            checkpoint_lock: TursoRwLock::new(),
+        }
+    }
+}
+
 // TODO(pere): lock only important parts + pin WalFileShared
 /// WalFileShared is the part of a WAL that will be shared between threads. A wal has information
 /// that needs to be communicated between threads so this struct does the job.
@@ -684,19 +722,7 @@ pub struct WalFileShared {
     pub frame_cache: Arc<SpinLock<FxHashMap<u64, Vec<u64>>>>,
     pub last_checksum: (u32, u32), // Check of last frame in WAL, this is a cumulative checksum over all frames in the WAL
     pub file: Option<Arc<dyn File>>,
-    /// Read locks advertise the maximum WAL frame a reader may access.
-    /// Slot 0 is special, when it is held (shared) the reader bypasses the WAL and uses the main DB file.
-    /// When checkpointing, we must acquire the exclusive read lock 0 to ensure that no readers read
-    /// from a partially checkpointed db file.
-    /// Slots 1‑4 carry a frame‑number in value and may be shared by many readers. Slot 1 is the
-    /// default read lock and is to contain the max_frame in WAL.
-    pub read_locks: [TursoRwLock; 5],
-    /// There is only one write allowed in WAL mode. This lock takes care of ensuring there is only
-    /// one used.
-    pub write_lock: TursoRwLock,
-
-    /// Serialises checkpointer threads, only one checkpoint can be in flight at any time. Blocking and exclusive only
-    pub checkpoint_lock: TursoRwLock,
+    locks: WalLock,
     pub loaded: AtomicBool,
     pub initialized: AtomicBool,
     /// Increments on each checkpoint, used to prevent stale cached pages being used for
@@ -740,6 +766,7 @@ impl CheckpointLocks {
         let ptr_clone = ptr.clone();
         {
             let shared = ptr.write();
+            let shared = &shared.locks;
             if !shared.checkpoint_lock.write() {
                 tracing::trace!("CheckpointGuard::new: checkpoint lock failed, returning Busy");
                 return Err(LimboError::Busy);
@@ -795,12 +822,14 @@ impl Drop for CheckpointLocks {
         match self {
             CheckpointLocks::Writer { ptr: shared } => {
                 let guard = shared.write();
+                let guard = &guard.locks;
                 guard.write_lock.unlock();
                 guard.read_locks[0].unlock();
                 guard.checkpoint_lock.unlock();
             }
             CheckpointLocks::Read0 { ptr: shared } => {
                 let guard = shared.write();
+                let guard = &guard.locks;
                 guard.read_locks[0].unlock();
                 guard.checkpoint_lock.unlock();
             }
@@ -842,7 +871,7 @@ impl Wal for WalFile {
         if shared_max == nbackfills {
             tracing::debug!("begin_read_tx: WAL is already fully back‑filled into the main DB image, shared_max={}, nbackfills={}", shared_max, nbackfills);
             let lock_0_idx = 0;
-            if !self.with_shared(|shared| shared.read_locks[lock_0_idx].read()) {
+            if !self.with_shared(|shared| shared.locks.read_locks[lock_0_idx].read()) {
                 tracing::debug!("begin_read_tx: read lock 0 is already held, returning Busy");
                 return Err(LimboError::Busy);
             }
@@ -867,7 +896,7 @@ impl Wal for WalFile {
         let mut best_idx: i64 = -1;
         let mut best_mark: u32 = 0;
         self.with_shared(|shared| {
-            for (idx, lock) in shared.read_locks.iter().enumerate().skip(1) {
+            for (idx, lock) in shared.locks.read_locks.iter().enumerate().skip(1) {
                 let m = lock.get_value();
                 if m != READMARK_NOT_USED && m <= shared_max as u32 && m > best_mark {
                     best_mark = m;
@@ -879,7 +908,7 @@ impl Wal for WalFile {
         // If none found or lagging, try to claim/update a slot
         if best_idx == -1 || (best_mark as u64) < shared_max {
             self.with_shared_mut(|shared| {
-                for (idx, lock) in shared.read_locks.iter_mut().enumerate().skip(1) {
+                for (idx, lock) in shared.locks.read_locks.iter_mut().enumerate().skip(1) {
                     if !lock.write() {
                         continue; // busy slot
                     }
@@ -902,7 +931,7 @@ impl Wal for WalFile {
         // Now take a shared read on that slot, and if we are successful,
         // grab another snapshot of the shared state.
         let (mx2, nb2, cksm2, ckpt_seq2) = self.with_shared(|shared| {
-            if !shared.read_locks[best_idx as usize].read() {
+            if !shared.locks.read_locks[best_idx as usize].read() {
                 // TODO: we should retry here instead of always returning Busy
                 return Err(LimboError::Busy);
             }
@@ -966,7 +995,7 @@ impl Wal for WalFile {
     fn end_read_tx(&self) {
         let slot = self.max_frame_read_lock_index.load(Ordering::Acquire);
         if slot != NO_LOCK_HELD {
-            self.with_shared_mut(|shared| shared.read_locks[slot].unlock());
+            self.with_shared_mut(|shared| shared.locks.read_locks[slot].unlock());
             self.max_frame_read_lock_index
                 .store(NO_LOCK_HELD, Ordering::Release);
             tracing::debug!("end_read_tx(slot={slot})");
@@ -988,7 +1017,7 @@ impl Wal for WalFile {
                 self.max_frame_read_lock_index.load(Ordering::Acquire) != NO_LOCK_HELD,
                 "must have a read transaction to begin a write transaction"
             );
-            if !shared.write_lock.write() {
+            if !shared.locks.write_lock.write() {
                 return Err(LimboError::Busy);
             }
             let db_changed = self.db_changed(shared);
@@ -998,7 +1027,7 @@ impl Wal for WalFile {
 
             // Snapshot is stale, give up and let caller retry from scratch
             tracing::debug!("unable to upgrade transaction from read to write: snapshot is stale, give up and let caller retry from scratch, self.max_frame={}, shared_max={}", self.max_frame.load(Ordering::Acquire), shared.max_frame.load(Ordering::Acquire));
-            shared.write_lock.unlock();
+            shared.locks.write_lock.unlock();
             Err(LimboError::Busy)
         })
     }
@@ -1007,7 +1036,7 @@ impl Wal for WalFile {
     #[instrument(skip_all, level = Level::DEBUG)]
     fn end_write_tx(&self) {
         tracing::debug!("end_write_txn");
-        self.with_shared(|shared| shared.write_lock.unlock());
+        self.with_shared(|shared| shared.locks.write_lock.unlock());
     }
 
     /// Find the latest frame containing a page.
@@ -2112,7 +2141,8 @@ impl WalFile {
             let shared_max = shared.max_frame.load(Ordering::Acquire);
             let mut max_safe_frame = shared_max;
 
-            for (read_lock_idx, read_lock) in shared.read_locks.iter_mut().enumerate().skip(1) {
+            for (read_lock_idx, read_lock) in shared.locks.read_locks.iter_mut().enumerate().skip(1)
+            {
                 let this_mark = read_lock.get_value();
                 if this_mark < max_safe_frame as u32 {
                     let busy = !read_lock.write();
@@ -2149,12 +2179,12 @@ impl WalFile {
         tracing::debug!("restart_log(mode={mode:?})");
         self.with_shared_mut(|shared| {
             // Block all readers
-            for idx in 1..shared.read_locks.len() {
-                let lock = &mut shared.read_locks[idx];
+            for idx in 1..shared.locks.read_locks.len() {
+                let lock = &mut shared.locks.read_locks[idx];
                 if !lock.write() {
                     // release everything we got so far
                     for j in 1..idx {
-                        shared.read_locks[j].unlock();
+                        shared.locks.read_locks[j].unlock();
                     }
                     // Reader is active, cannot proceed
                     return Err(LimboError::Busy);
@@ -2235,8 +2265,8 @@ impl WalFile {
     fn unlock_after_restart(shared: &Arc<RwLock<WalFileShared>>, e: Option<&LimboError>) {
         // release all read locks we just acquired, the caller will take care of the others
         let shared = shared.write();
-        for idx in 1..shared.read_locks.len() {
-            shared.read_locks[idx].unlock();
+        for idx in 1..shared.locks.read_locks.len() {
+            shared.locks.read_locks[idx].unlock();
         }
         if let Some(e) = e {
             tracing::error!(
@@ -2323,6 +2353,29 @@ impl WalFile {
 }
 
 impl WalFileShared {
+    pub fn new(
+        enabled: bool,
+        loaded: bool,
+        header: Arc<SpinLock<WalHeader>>,
+        file: Option<Arc<dyn File>>,
+    ) -> Self {
+        WalFileShared {
+            enabled: AtomicBool::new(enabled),
+            wal_header: header.clone(),
+            min_frame: AtomicU64::new(0),
+            max_frame: AtomicU64::new(0),
+            nbackfills: AtomicU64::new(0),
+            transaction_count: AtomicU64::new(0),
+            frame_cache: Arc::new(SpinLock::new(FxHashMap::default())),
+            last_checksum: (0, 0),
+            file,
+            locks: WalLock::new(),
+            loaded: AtomicBool::new(loaded),
+            initialized: AtomicBool::new(false),
+            epoch: AtomicU32::new(0),
+        }
+    }
+
     pub fn open_shared_if_exists(
         io: &Arc<dyn IO>,
         path: &str,
@@ -2356,29 +2409,8 @@ impl WalFileShared {
             checksum_1: 0,
             checksum_2: 0,
         };
-        let read_locks = array::from_fn(|_| TursoRwLock::new());
-        for (i, lock) in read_locks.iter().enumerate() {
-            lock.write();
-            lock.set_value_exclusive(if i < 2 { 0 } else { READMARK_NOT_USED });
-            lock.unlock();
-        }
-        let shared = WalFileShared {
-            enabled: AtomicBool::new(false),
-            wal_header: Arc::new(SpinLock::new(wal_header)),
-            min_frame: AtomicU64::new(0),
-            max_frame: AtomicU64::new(0),
-            nbackfills: AtomicU64::new(0),
-            transaction_count: AtomicU64::new(0),
-            frame_cache: Arc::new(SpinLock::new(FxHashMap::default())),
-            last_checksum: (0, 0),
-            file: None,
-            read_locks,
-            write_lock: TursoRwLock::new(),
-            checkpoint_lock: TursoRwLock::new(),
-            loaded: AtomicBool::new(true),
-            initialized: AtomicBool::new(false),
-            epoch: AtomicU32::new(0),
-        };
+        let shared = WalFileShared::new(false, true, Arc::new(SpinLock::new(wal_header)), None);
+
         Arc::new(RwLock::new(shared))
     }
 
@@ -2398,32 +2430,10 @@ impl WalFileShared {
             checksum_1: 0,
             checksum_2: 0,
         };
-        let read_locks = array::from_fn(|_| TursoRwLock::new());
-        // slot zero is always zero as it signifies that reads can be done from the db file
-        // directly, and slot 1 is the default read mark containing the max frame. in this case
-        // our max frame is zero so both slots 0 and 1 begin at 0
-        for (i, lock) in read_locks.iter().enumerate() {
-            lock.write();
-            lock.set_value_exclusive(if i < 2 { 0 } else { READMARK_NOT_USED });
-            lock.unlock();
-        }
-        let shared = WalFileShared {
-            enabled: AtomicBool::new(true),
-            wal_header: Arc::new(SpinLock::new(wal_header)),
-            min_frame: AtomicU64::new(0),
-            max_frame: AtomicU64::new(0),
-            nbackfills: AtomicU64::new(0),
-            transaction_count: AtomicU64::new(0),
-            frame_cache: Arc::new(SpinLock::new(FxHashMap::default())),
-            last_checksum: (0, 0),
-            file: Some(file),
-            read_locks,
-            write_lock: TursoRwLock::new(),
-            checkpoint_lock: TursoRwLock::new(),
-            loaded: AtomicBool::new(true),
-            initialized: AtomicBool::new(false),
-            epoch: AtomicU32::new(0),
-        };
+
+        let shared =
+            WalFileShared::new(true, true, Arc::new(SpinLock::new(wal_header)), Some(file));
+
         Ok(Arc::new(RwLock::new(shared)))
     }
 
@@ -2497,9 +2507,9 @@ impl WalFileShared {
 
         self.frame_cache.lock().clear();
         // read-marks
-        self.read_locks[0].set_value_exclusive(0);
-        self.read_locks[1].set_value_exclusive(0);
-        for lock in &self.read_locks[2..] {
+        self.locks.read_locks[0].set_value_exclusive(0);
+        self.locks.read_locks[1].set_value_exclusive(0);
+        for lock in &self.locks.read_locks[2..] {
             lock.set_value_exclusive(READMARK_NOT_USED);
         }
     }
@@ -2914,7 +2924,7 @@ pub mod test {
         // Verify read marks after restart
         let read_marks_after: Vec<_> = {
             let s = wal_shared.read();
-            (0..5).map(|i| s.read_locks[i].get_value()).collect()
+            (0..5).map(|i| s.locks.read_locks[i].get_value()).collect()
         };
 
         assert_eq!(read_marks_after[0], 0, "Slot 0 should remain 0");
@@ -3024,7 +3034,7 @@ pub mod test {
         }
 
         // check that read mark 1 (default reader) was updated to max_frame
-        let read_mark_1 = wal_shared.read().read_locks[1].get_value();
+        let read_mark_1 = wal_shared.read().locks.read_locks[1].get_value();
 
         assert_eq!(
             read_mark_1 as u64, max_frame_before,
