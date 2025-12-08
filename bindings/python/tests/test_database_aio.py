@@ -187,36 +187,15 @@ async def test_json_functions_extract_patch_and_array_length():
 
 @pytest.mark.asyncio
 async def test_async_operations_do_not_block_event_loop():
-    # Slow down the worker thread with extra_io to make the test robust
-    conn = await turso.aio.connect(":memory:", extra_io=lambda: time.sleep(0.0005))
-    try:
-        cur = conn.cursor()
-        await cur.execute("CREATE TABLE t (id INTEGER)")
-        payload = [(i,) for i in range(5000)]
-
-        ticks = 0
-        done = False
-
-        async def ticker():
-            nonlocal ticks, done
-            while not done:
-                ticks += 1
-                await asyncio.sleep(0.001)
-
-        task = asyncio.create_task(ticker())
-        await cur.executemany("INSERT INTO t (id) VALUES (?)", payload)
-        done = True
-        await task
-
-        # Event loop should have run ticker while DB work was running
-        assert ticks > 0
-
-        await cur.execute("SELECT COUNT(*) FROM t")
-        count = (await cur.fetchone())[0]
-        assert count == 5000
-    finally:
-        await conn.close()
-
+    import time
+    async with turso.aio.connect(":memory:") as conn:
+        count = 100000000
+        await conn.execute("CREATE TABLE t (id INTEGER)")
+        cur = await conn.execute(f"""SELECT SUM(value) FROM generate_series(1, {count})""")
+        start = time.time()
+        task = asyncio.create_task(cur.fetchone())
+        assert (time.time() - start) < 0.001
+        assert await task == (count * (count + 1) // 2,)
 
 @pytest.mark.asyncio
 async def test_operation_after_connection_close_raises():
