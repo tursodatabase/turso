@@ -1916,7 +1916,7 @@ fn test_cursor_with_btree_and_mvcc_seek_after_checkpoint() {
 
 #[test]
 fn test_cursor_with_btree_and_mvcc_delete_after_checkpoint() {
-    let _ = tracing_subscriber::fmt()
+    tracing_subscriber::fmt()
         .with_ansi(false)
         .with_max_level(tracing_subscriber::filter::LevelFilter::TRACE)
         .init();
