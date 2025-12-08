@@ -87,7 +87,8 @@ pub struct Sorter {
     insert_state: InsertState,
     /// State machine for [Sorter::init_chunk_heap]
     init_chunk_heap_state: InitChunkHeapState,
-    pending_completions: Vec<Completion>,
+    /// Pending IO completion along with the chunk index that needs to be retried after IO completes.
+    pending_completion: Option<(Completion, usize)>,
 }
 
 impl Sorter {
@@ -125,7 +126,7 @@ impl Sorter {
             sort_state: SortState::Start,
             insert_state: InsertState::Start,
             init_chunk_heap_state: InitChunkHeapState::Start,
-            pending_completions: Vec::new(),
+            pending_completion: None,
         }
     }
 
@@ -277,24 +278,38 @@ impl Sorter {
         }
     }
 
+    /// Returns the next record from the chunk heap in sorted order.
+    ///
+    /// The heap contains at most one record per chunk. When we pop a record, we try to refill
+    /// from that chunk. If IO is needed, we store it in `pending_completion` and wait for it
+    /// on the next call before popping again - this ensures all non-exhausted chunks have
+    /// a record in the heap before we decide which is smallest.
     fn next_from_chunk_heap(&mut self) -> Result<IOResult<Option<SortableImmutableRecord>>> {
-        if !self.pending_completions.is_empty() {
-            let mut group = CompletionGroup::new(|_| {});
-            for c in self.pending_completions.drain(..) {
-                group.add(&c);
+        // If there is a pending IO, we must wait for it before popping from the heap,
+        // otherwise we might return records out of order.
+        if let Some((completion, chunk_idx)) = self.pending_completion.take() {
+            if !completion.succeeded() {
+                // IO not complete - put it back and yield
+                self.pending_completion = Some((completion.clone(), chunk_idx));
+                return Ok(IOResult::IO(IOCompletions::Single(completion)));
             }
-            return Ok(IOResult::IO(IOCompletions::Single(group.build())));
-        }
-        // Make sure all chunks read at least one record into their buffer.
-        if let Some((next_record, next_chunk_idx)) = self.chunk_heap.pop() {
-            // TODO: blocking will be unnecessary here with IO completions
-            if let Some(c) = self.push_to_chunk_heap(next_chunk_idx)? {
-                self.pending_completions.push(c);
+            // IO completed - push result to heap and retry
+            if let Some(c) = self.push_to_chunk_heap(chunk_idx)? {
+                self.pending_completion = Some((c, chunk_idx));
             }
-            Ok(IOResult::Done(Some(next_record.0)))
-        } else {
-            Ok(IOResult::Done(None))
+            return self.next_from_chunk_heap();
         }
+
+        // No pending IO - safe to pop from heap
+        if let Some((next_record, chunk_idx)) = self.chunk_heap.pop() {
+            if let Some(c) = self.push_to_chunk_heap(chunk_idx)? {
+                self.pending_completion = Some((c, chunk_idx));
+            }
+            return Ok(IOResult::Done(Some(next_record.0)));
+        }
+
+        // Heap empty and no pending IO - sorter exhausted
+        Ok(IOResult::Done(None))
     }
 
     fn push_to_chunk_heap(&mut self, chunk_idx: usize) -> Result<Option<Completion>> {
