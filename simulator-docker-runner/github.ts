@@ -45,7 +45,7 @@ export class GithubClient {
   mode: 'real' | 'dry-run';
   app: App | null;
   initialized: boolean = false;
-  openIssueTitles: string[] = [];
+  openIssues: { title: string; number: number }[] = [];
   constructor() {
     this.GIT_HASH = process.env.GIT_HASH || "unknown";
     this.GITHUB_APP_PRIVATE_KEY = process.env.GITHUB_APP_PRIVATE_KEY || "";
@@ -61,7 +61,7 @@ export class GithubClient {
     }) : null;
   }
 
-  private async getOpenIssues(): Promise<string[]> {
+  private async getOpenIssues(): Promise<{ title: string; number: number }[]> {
     const octokit = await this.app!.getInstallationOctokit(this.GITHUB_APP_INSTALLATION_ID);
     const issues = await octokit.request('GET /repos/{owner}/{repo}/issues', {
       owner: this.GITHUB_ORG,
@@ -69,7 +69,7 @@ export class GithubClient {
       state: 'open',
       creator: 'app/turso-github-handyman',
     });
-    return issues.data.map((issue) => issue.title);
+    return issues.data.map((issue) => ({ title: issue.title, number: issue.number }));
   }
 
   async initialize(): Promise<void> {
@@ -78,7 +78,7 @@ export class GithubClient {
       this.initialized = true;
       return;
     }
-    this.openIssueTitles = await this.getOpenIssues();
+    this.openIssues = await this.getOpenIssues();
     this.initialized = true;
   }
 
@@ -97,10 +97,11 @@ export class GithubClient {
       return `Simulator timeout using git hash ${this.GIT_HASH}`;
     })(fault);
     title = title.slice(0, GITHUB_ISSUE_TITLE_MAX_LENGTH);
-    for (const existingIssueTitle of this.openIssueTitles) {
+    for (const existingIssue of this.openIssues) {
       const MAGIC_NUMBER = 6;
-      if (levenshtein(existingIssueTitle, title) < MAGIC_NUMBER) {
-        console.log(`Not creating issue ${title} because it is too similar to ${existingIssueTitle}`);
+      if (levenshtein(existingIssue.title, title) < MAGIC_NUMBER) {
+        console.log(`Found similar issue #${existingIssue.number}: "${existingIssue.title}"`);
+        await this.commentOnIssue(existingIssue.number, fault);
         return;
       }
     }
@@ -113,7 +114,7 @@ export class GithubClient {
       return;
     }
 
-    if (this.openIssueTitles.length >= MAX_OPEN_SIMULATOR_ISSUES) {
+    if (this.openIssues.length >= MAX_OPEN_SIMULATOR_ISSUES) {
       console.log(`Max open simulator issues reached: ${MAX_OPEN_SIMULATOR_ISSUES}`);
       console.log(`Would create issue in ${this.GITHUB_REPO} with title: ${title} and body: ${body}`);
       return;
@@ -132,32 +133,63 @@ export class GithubClient {
     });
 
     console.log(`Successfully created GitHub issue: ${response.data.html_url}`);
-    this.openIssueTitles.push(title);
+    this.openIssues.push({ title, number: response.data.number });
+  }
+
+  private async commentOnIssue(issueNumber: number, fault: Fault): Promise<void> {
+    const comment = this.createCommentBody(fault);
+
+    if (this.mode === 'dry-run') {
+      console.log(`Dry-run mode: Would comment on issue #${issueNumber} with: ${comment}`);
+      return;
+    }
+
+    const octokit = await this.app!.getInstallationOctokit(this.GITHUB_APP_INSTALLATION_ID);
+
+    const response = await octokit.request('POST /repos/{owner}/{repo}/issues/{issue_number}/comments', {
+      owner: this.GITHUB_ORG,
+      repo: this.GITHUB_REPO_NAME,
+      issue_number: issueNumber,
+      body: comment,
+    });
+
+    console.log(`Successfully commented on issue #${issueNumber}: ${response.data.html_url}`);
+  }
+
+  private createFaultDetails(fault: Fault): string {
+    const gitShortHash = this.GIT_HASH.substring(0, 7);
+    return `- **Seed**: ${fault.seed}
+- **Git Hash**: ${this.GIT_HASH}
+- **Command**: \`limbo-sim ${fault.command}\`
+- **Timestamp**: ${new Date().toISOString()}
+
+### Run locally with Docker
+
+\`\`\`
+git checkout ${this.GIT_HASH}
+docker buildx build -t limbo-sim:${gitShortHash} -f simulator-docker-runner/Dockerfile.simulator . --build-arg GIT_HASH=$(git rev-parse HEAD)
+docker run --network host limbo-sim:${gitShortHash} ${fault.command}
+\`\`\``;
+  }
+
+  private createCommentBody(fault: Fault): string {
+    return `### Duplicate occurrence detected
+
+${this.createFaultDetails(fault)}
+`;
   }
 
   private createIssueBody(fault: Fault): string {
-    const gitShortHash = this.GIT_HASH.substring(0, 7);
-    return `
- ## Simulator failure type:${fault.type}
- 
- - **Seed**: ${fault.seed}
- - **Git Hash**: ${this.GIT_HASH}
- - **Command**: \`limbo-sim ${fault.command}\`
- - **Timestamp**: ${new Date().toISOString()}
+    const output = fault.type === "panic" ? fault.stackTrace.trace : fault.type === "assertion" ? fault.failureInfo.output : fault.output;
+    return `## Simulator failure type: ${fault.type}
 
- ### Run locally with Docker
+${this.createFaultDetails(fault)}
 
- \`\`\`
- git checkout ${this.GIT_HASH}
- docker buildx build -t limbo-sim:${gitShortHash} -f simulator-docker-runner/Dockerfile.simulator . --build-arg GIT_HASH=$(git rev-parse HEAD)
- docker run --network host limbo-sim:${gitShortHash} ${fault.command}
- \`\`\`
+### ${fault.type === "panic" ? "Stack Trace" : "Output"}
 
- ### ${fault.type === "panic" ? "Stack Trace" : "Output"}
- 
- \`\`\`
- ${fault.type === "panic" ? fault.stackTrace.trace : fault.type === "assertion" ? fault.failureInfo.output : fault.output}
- \`\`\`
- `;
+\`\`\`
+${output}
+\`\`\`
+`;
   }
 }
