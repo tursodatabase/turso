@@ -294,18 +294,34 @@ impl Shadow for Delete {
     type Result = anyhow::Result<Vec<Vec<SimValue>>>;
 
     fn shadow(&self, tables: &mut ShadowTablesMut) -> Self::Result {
-        let table = tables.iter_mut().find(|t| t.name == self.table);
+        // First pass: find deleted rows and collect them
+        let deleted_rows = {
+            let table = tables.iter().find(|t| t.name == self.table);
+            if let Some(table) = table {
+                let t2 = table.clone();
+                table
+                    .rows
+                    .iter()
+                    .filter(|r| self.predicate.test(r, &t2))
+                    .cloned()
+                    .collect::<Vec<_>>()
+            } else {
+                return Err(anyhow::anyhow!(
+                    "Table {} does not exist. DELETE statement ignored.",
+                    self.table
+                ));
+            }
+        };
 
-        if let Some(table) = table {
-            // If the table exists, we can delete from it
+        // Record deleted rows for transaction tracking
+        for row in &deleted_rows {
+            tables.record_delete(self.table.clone(), row.clone());
+        }
+
+        // Second pass: actually remove the rows
+        if let Some(table) = tables.iter_mut().find(|t| t.name == self.table) {
             let t2 = table.clone();
             table.rows.retain_mut(|r| !self.predicate.test(r, &t2));
-        } else {
-            // If the table does not exist, we return an error
-            return Err(anyhow::anyhow!(
-                "Table {} does not exist. DELETE statement ignored.",
-                self.table
-            ));
         }
 
         Ok(vec![])
@@ -325,6 +341,9 @@ impl Shadow for Drop {
             ));
         }
 
+        // Record the drop for transaction tracking
+        tables.record_drop_table(self.table.clone());
+
         tables.retain(|t| t.name != self.table);
 
         Ok(vec![])
@@ -338,24 +357,43 @@ impl Shadow for Insert {
     fn shadow(&self, tables: &mut ShadowTablesMut) -> Self::Result {
         match self {
             Insert::Values { table, values } => {
-                if let Some(t) = tables.iter_mut().find(|t| &t.name == table) {
-                    t.rows.extend(values.clone());
-                } else {
+                // Check if table exists first
+                if !tables.iter().any(|t| &t.name == table) {
                     return Err(anyhow::anyhow!(
                         "Table {} does not exist. INSERT statement ignored.",
                         table
                     ));
                 }
+
+                // Record each inserted row for transaction tracking
+                for row in values {
+                    tables.record_insert(table.clone(), row.clone());
+                }
+
+                // Actually insert the rows
+                if let Some(t) = tables.iter_mut().find(|t| &t.name == table) {
+                    t.rows.extend(values.clone());
+                }
             }
             Insert::Select { table, select } => {
-                let rows = select.shadow(tables)?;
-                if let Some(t) = tables.iter_mut().find(|t| &t.name == table) {
-                    t.rows.extend(rows);
-                } else {
+                // Check if table exists first
+                if !tables.iter().any(|t| &t.name == table) {
                     return Err(anyhow::anyhow!(
                         "Table {} does not exist. INSERT statement ignored.",
                         table
                     ));
+                }
+
+                let rows = select.shadow(tables)?;
+
+                // Record each inserted row for transaction tracking
+                for row in &rows {
+                    tables.record_insert(table.clone(), row.clone());
+                }
+
+                // Actually insert the rows
+                if let Some(t) = tables.iter_mut().find(|t| &t.name == table) {
+                    t.rows.extend(rows);
                 }
             }
         }
@@ -552,31 +590,61 @@ impl Shadow for Update {
     type Result = anyhow::Result<Vec<Vec<SimValue>>>;
 
     fn shadow(&self, tables: &mut ShadowTablesMut) -> Self::Result {
-        let table = tables.iter_mut().find(|t| t.name == self.table);
+        // First pass: find rows to update and compute old/new values
+        let (columns, updates) = {
+            let table = tables.iter().find(|t| t.name == self.table);
+            let table = if let Some(table) = table {
+                table
+            } else {
+                return Err(anyhow::anyhow!(
+                    "Table {} does not exist. UPDATE statement ignored.",
+                    self.table
+                ));
+            };
 
-        let table = if let Some(table) = table {
-            table
-        } else {
-            return Err(anyhow::anyhow!(
-                "Table {} does not exist. UPDATE statement ignored.",
-                self.table
-            ));
+            let t2 = table.clone();
+            let columns = table.columns.clone();
+
+            let updates: Vec<(Vec<SimValue>, Vec<SimValue>)> = table
+                .rows
+                .iter()
+                .filter(|r| self.predicate.test(r, &t2))
+                .map(|old_row| {
+                    let mut new_row = old_row.clone();
+                    for (column, set_value) in &self.set_values {
+                        if let Some((idx, _)) =
+                            columns.iter().enumerate().find(|(_, c)| &c.name == column)
+                        {
+                            new_row[idx] = set_value.clone();
+                        }
+                    }
+                    (old_row.clone(), new_row)
+                })
+                .collect();
+
+            (columns, updates)
         };
 
-        let t2 = table.clone();
-        for row in table
-            .rows
-            .iter_mut()
-            .filter(|r| self.predicate.test(r, &t2))
-        {
-            for (column, set_value) in &self.set_values {
-                if let Some((idx, _)) = table
-                    .columns
-                    .iter()
-                    .enumerate()
-                    .find(|(_, c)| &c.name == column)
-                {
-                    row[idx] = set_value.clone();
+        // Record the operations for transaction tracking
+        for (old_row, new_row) in &updates {
+            tables.record_delete(self.table.clone(), old_row.clone());
+            tables.record_insert(self.table.clone(), new_row.clone());
+        }
+
+        // Second pass: apply the updates
+        if let Some(table) = tables.iter_mut().find(|t| t.name == self.table) {
+            let t2 = table.clone();
+            for row in table
+                .rows
+                .iter_mut()
+                .filter(|r| self.predicate.test(r, &t2))
+            {
+                for (column, set_value) in &self.set_values {
+                    if let Some((idx, _)) =
+                        columns.iter().enumerate().find(|(_, c)| &c.name == column)
+                    {
+                        row[idx] = set_value.clone();
+                    }
                 }
             }
         }
@@ -589,6 +657,11 @@ impl Shadow for AlterTable {
     type Result = anyhow::Result<Vec<Vec<SimValue>>>;
 
     fn shadow(&self, tables: &mut ShadowTablesMut<'_>) -> Self::Result {
+        // Record old_name -> new_name before the table is renamed below
+        if let AlterTableType::RenameTo { new_name } = &self.alter_table_type {
+            tables.record_rename_table(self.table_name.clone(), new_name.clone());
+        }
+
         let table = tables
             .iter_mut()
             .find(|t| t.name == self.table_name)

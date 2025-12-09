@@ -567,12 +567,7 @@ impl Shadow for InteractionType {
     type Result = anyhow::Result<Vec<Vec<SimValue>>>;
     fn shadow(&self, env: &mut ShadowTablesMut) -> Self::Result {
         match self {
-            Self::Query(query) => {
-                if !query.is_transaction() {
-                    env.add_query(query);
-                }
-                query.shadow(env)
-            }
+            Self::Query(query) => query.shadow(env),
             Self::Assumption(_)
             | Self::Assertion(_)
             | Self::Fault(_)
