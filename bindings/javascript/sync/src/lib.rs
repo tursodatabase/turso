@@ -18,6 +18,7 @@ use turso_sync_engine::{
     database_sync_operations::SyncEngineIoStats,
     types::{
         Coro, DatabaseChangeType, DatabaseSyncEngineProtocolVersion, PartialBootstrapStrategy,
+        PartialSyncOpts,
     },
 };
 
@@ -118,6 +119,13 @@ pub enum JsPartialBootstrapStrategy {
     Query { query: String },
 }
 
+#[napi(object)]
+pub struct JsPartialSyncOpts {
+    pub bootstrap_strategy: JsPartialBootstrapStrategy,
+    pub segment_size: Option<i64>,
+    pub speculative_load: Option<bool>,
+}
+
 #[napi(object, object_to_js = false)]
 pub struct SyncEngineOpts {
     pub path: String,
@@ -130,7 +138,7 @@ pub struct SyncEngineOpts {
     pub protocol_version: Option<SyncEngineProtocolVersion>,
     pub bootstrap_if_empty: bool,
     pub remote_encryption: Option<String>,
-    pub partial_boostrap_strategy: Option<JsPartialBootstrapStrategy>,
+    pub partial_sync_opts: Option<JsPartialSyncOpts>,
 }
 
 struct SyncEngineOptsFilled {
@@ -143,7 +151,7 @@ struct SyncEngineOptsFilled {
     pub protocol_version: DatabaseSyncEngineProtocolVersion,
     pub bootstrap_if_empty: bool,
     pub remote_encryption: Option<CipherMode>,
-    pub partial_boostrap_strategy: PartialBootstrapStrategy,
+    pub partial_sync_opts: Option<PartialSyncOpts>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -185,7 +193,7 @@ impl SyncEngine {
         } else {
             #[cfg(all(target_os = "linux", not(feature = "browser")))]
             {
-                if opts.partial_boostrap_strategy.is_none() {
+                if opts.partial_sync_opts.is_none() {
                     Arc::new(turso_core::PlatformIO::new().map_err(|e| {
                         napi::Error::new(
                             napi::Status::GenericFailure,
@@ -257,16 +265,22 @@ impl SyncEngine {
                     ))
                 }
             },
-            partial_boostrap_strategy: match opts.partial_boostrap_strategy {
-                Some(JsPartialBootstrapStrategy::Prefix { length }) => {
-                    PartialBootstrapStrategy::Prefix {
-                        length: length as usize,
-                    }
-                }
-                Some(JsPartialBootstrapStrategy::Query { query }) => {
-                    PartialBootstrapStrategy::Query { query }
-                }
-                None => PartialBootstrapStrategy::None,
+            partial_sync_opts: match opts.partial_sync_opts {
+                Some(partial_sync_opts) => match partial_sync_opts.bootstrap_strategy {
+                    JsPartialBootstrapStrategy::Prefix { length } => Some(PartialSyncOpts {
+                        bootstrap_strategy: PartialBootstrapStrategy::Prefix {
+                            length: length as usize,
+                        },
+                        segment_size: partial_sync_opts.segment_size.unwrap_or(0) as usize,
+                        speculative_load: partial_sync_opts.speculative_load.unwrap_or(false),
+                    }),
+                    JsPartialBootstrapStrategy::Query { query } => Some(PartialSyncOpts {
+                        bootstrap_strategy: PartialBootstrapStrategy::Query { query },
+                        segment_size: partial_sync_opts.segment_size.unwrap_or(0) as usize,
+                        speculative_load: partial_sync_opts.speculative_load.unwrap_or(false),
+                    }),
+                },
+                None => None,
             },
         };
         Ok(SyncEngine {
@@ -295,7 +309,7 @@ impl SyncEngine {
                 .remote_encryption
                 .map(|x| x.required_metadata_size())
                 .unwrap_or(0),
-            partial_bootstrap_strategy: self.opts.partial_boostrap_strategy.clone(),
+            partial_sync_opts: self.opts.partial_sync_opts.clone(),
         };
 
         let io = self.io()?;

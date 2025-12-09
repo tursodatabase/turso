@@ -7,7 +7,10 @@ use pyo3::{
 };
 use turso_sdk_kit::rsapi::{TursoDatabaseConfig, TursoStatusCode};
 use turso_sync_sdk_kit::{
-    rsapi::{self, PartialBootstrapStrategy, TursoDatabaseSync, TursoDatabaseSyncChanges},
+    rsapi::{
+        self, PartialBootstrapStrategy, PartialSyncOpts, TursoDatabaseSync,
+        TursoDatabaseSyncChanges,
+    },
     sync_engine_io::SyncEngineIoQueueItem,
     turso_async_operation::{TursoAsyncOperationResult, TursoDatabaseAsyncOperation},
 };
@@ -15,6 +18,41 @@ use turso_sync_sdk_kit::{
 use crate::turso::{
     turso_error_to_py_err, Error, Misuse, PyTursoConnection, PyTursoDatabaseConfig,
 };
+
+#[pyclass]
+#[derive(Clone)]
+pub struct PyTursoPartialSyncConfig {
+    // prefix bootstrap strategy which will enable partial sync which lazily pull necessary pages on demand and bootstrap db with pages from first N bytes of the db
+    pub bootstrap_strategy_prefix: Option<usize>,
+    // query bootstrap strategy which will enable partial sync which lazily pull necessary pages on demand and bootstrap db with pages touched by the server with given SQL query
+    pub bootstrap_strategy_query: Option<String>,
+    pub segment_size: Option<usize>,
+    pub speculative_load: Option<bool>,
+}
+
+#[pymethods]
+impl PyTursoPartialSyncConfig {
+    #[new]
+    #[pyo3(signature = (
+        bootstrap_strategy_prefix=None,
+        bootstrap_strategy_query=None,
+        segment_size=None,
+        speculative_load=None,
+    ))]
+    fn new(
+        bootstrap_strategy_prefix: Option<usize>,
+        bootstrap_strategy_query: Option<String>,
+        segment_size: Option<usize>,
+        speculative_load: Option<bool>,
+    ) -> Self {
+        Self {
+            bootstrap_strategy_prefix,
+            bootstrap_strategy_query,
+            segment_size,
+            speculative_load,
+        }
+    }
+}
 
 #[pyclass]
 pub struct PyTursoSyncDatabaseConfig {
@@ -28,10 +66,7 @@ pub struct PyTursoSyncDatabaseConfig {
     pub bootstrap_if_empty: bool,
     // reserved bytes which must be set for the database - necessary if remote encryption is set for the db in cloud
     pub reserved_bytes: Option<usize>,
-    // prefix bootstrap strategy which will enable partial sync which lazily pull necessary pages on demand and bootstrap db with pages from first N bytes of the db
-    pub partial_bootstrap_strategy_prefix: Option<usize>,
-    // query bootstrap strategy which will enable partial sync which lazily pull necessary pages on demand and bootstrap db with pages touched by the server with given SQL query
-    pub partial_bootstrap_strategy_query: Option<String>,
+    pub partial_sync_opts: Option<PyTursoPartialSyncConfig>,
 }
 
 #[pymethods]
@@ -43,8 +78,7 @@ impl PyTursoSyncDatabaseConfig {
         long_poll_timeout_ms=None,
         bootstrap_if_empty=true,
         reserved_bytes=None,
-        partial_bootstrap_strategy_prefix=None,
-        partial_bootstrap_strategy_query=None
+        partial_sync_opts=None,
     ))]
     fn new(
         path: String,
@@ -52,8 +86,7 @@ impl PyTursoSyncDatabaseConfig {
         long_poll_timeout_ms: Option<u32>,
         bootstrap_if_empty: bool,
         reserved_bytes: Option<usize>,
-        partial_bootstrap_strategy_prefix: Option<usize>,
-        partial_bootstrap_strategy_query: Option<String>,
+        partial_sync_opts: Option<&PyTursoPartialSyncConfig>,
     ) -> Self {
         Self {
             path,
@@ -61,8 +94,7 @@ impl PyTursoSyncDatabaseConfig {
             long_poll_timeout_ms,
             bootstrap_if_empty,
             reserved_bytes,
-            partial_bootstrap_strategy_prefix,
-            partial_bootstrap_strategy_query,
+            partial_sync_opts: partial_sync_opts.cloned(),
         }
     }
 }
@@ -86,16 +118,27 @@ pub fn py_turso_sync_new(
         bootstrap_if_empty: sync_config.bootstrap_if_empty,
         long_poll_timeout_ms: sync_config.long_poll_timeout_ms,
         reserved_bytes: sync_config.reserved_bytes,
-        partial_bootstrap_strategy: if let Some(prefix) =
-            sync_config.partial_bootstrap_strategy_prefix
-        {
-            PartialBootstrapStrategy::Prefix { length: prefix }
-        } else if let Some(query) = &sync_config.partial_bootstrap_strategy_query {
-            PartialBootstrapStrategy::Query {
-                query: query.clone(),
+        partial_sync_opts: match &sync_config.partial_sync_opts {
+            Some(config) => {
+                if let Some(length) = config.bootstrap_strategy_prefix {
+                    Some(PartialSyncOpts {
+                        bootstrap_strategy: PartialBootstrapStrategy::Prefix { length },
+                        segment_size: config.segment_size.unwrap_or(0) as usize,
+                        speculative_load: config.speculative_load.unwrap_or(false),
+                    })
+                } else if let Some(query) = &config.bootstrap_strategy_query {
+                    Some(PartialSyncOpts {
+                        bootstrap_strategy: PartialBootstrapStrategy::Query {
+                            query: query.clone(),
+                        },
+                        segment_size: config.segment_size.unwrap_or(0) as usize,
+                        speculative_load: config.speculative_load.unwrap_or(false),
+                    })
+                } else {
+                    None
+                }
             }
-        } else {
-            PartialBootstrapStrategy::None
+            None => None,
         },
         db_io: None,
     };

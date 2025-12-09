@@ -50,14 +50,22 @@ class Database extends DatabasePromise {
             return;
         }
 
-        let partialBoostrapStrategy = undefined;
-        if (opts.partialBootstrapStrategy != null) {
-            switch (opts.partialBootstrapStrategy.kind) {
+        let partialSyncOpts = undefined;
+        if (opts.partialSync != null) {
+            switch (opts.partialSync.bootstrapStrategy.kind) {
                 case "prefix":
-                    partialBoostrapStrategy = { type: "Prefix", length: opts.partialBootstrapStrategy.length };
+                    partialSyncOpts = {
+                        bootstrapStrategy: { type: "Prefix", length: opts.partialSync.bootstrapStrategy.length },
+                        segmentSize: opts.partialSync.segmentSize,
+                        speculativeLoad: opts.partialSync.speculativeLoad,
+                    };
                     break;
                 case "query":
-                    partialBoostrapStrategy = { type: "Query", query: opts.partialBootstrapStrategy.query };
+                    partialSyncOpts = {
+                        bootstrapStrategy: { type: "Query", query: opts.partialSync.bootstrapStrategy.query },
+                        segmentSize: opts.partialSync.segmentSize,
+                        speculativeLoad: opts.partialSync.speculativeLoad,
+                    };
                     break;
             }
         }
@@ -70,7 +78,7 @@ class Database extends DatabasePromise {
             tracing: opts.tracing,
             bootstrapIfEmpty: typeof opts.url != "function" || opts.url() != null,
             remoteEncryption: opts.remoteEncryption?.cipher,
-            partialBoostrapStrategy: partialBoostrapStrategy
+            partialSyncOpts: partialSyncOpts
         });
 
         let headers: { [K: string]: string } | (() => Promise<{ [K: string]: string }>);

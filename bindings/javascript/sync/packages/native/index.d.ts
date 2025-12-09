@@ -228,6 +228,12 @@ export type JsPartialBootstrapStrategy =
   | { type: 'Prefix', length: number }
   | { type: 'Query', query: string }
 
+export interface JsPartialSyncOpts {
+  bootstrapStrategy: JsPartialBootstrapStrategy
+  segmentSize?: number
+  speculativeLoad?: boolean
+}
+
 export type JsProtocolRequest =
   | { type: 'Http', method: string, path: string, body?: Array<number>, headers: Array<[string, string]> }
   | { type: 'FullRead', path: string }
@@ -245,7 +251,7 @@ export interface SyncEngineOpts {
   protocolVersion?: SyncEngineProtocolVersion
   bootstrapIfEmpty: boolean
   remoteEncryption?: string
-  partialBoostrapStrategy?: JsPartialBootstrapStrategy
+  partialSyncOpts?: JsPartialSyncOpts
 }
 
 export declare const enum SyncEngineProtocolVersion {
