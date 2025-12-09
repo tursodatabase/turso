@@ -585,9 +585,6 @@ pub struct WalFile {
     /// Private copy of WalHeader
     pub header: WalHeader,
 
-    /// Manages locks needed for checkpointing
-    checkpoint_guard: Option<CheckpointLocks>,
-
     transaction_lock: Option<TransactionLock>,
 
     io_ctx: RwLock<IOContext>,
@@ -752,13 +749,13 @@ impl fmt::Debug for WalFileShared {
 }
 
 #[derive(Clone, Debug)]
-/// Locks that are held by the transaction
+/// Locks that are held by the transaction.
+/// When checkpoint_mode is Some, we also hold read_locks[0] exclusively.
 struct TransactionLock {
     /// Shared Wal that holds the locks
     ptr: Arc<RwLock<WalFileShared>>,
     write: bool,
-    checkpoint: Option<CheckpointMode>,
-    read_exclusive: bool,
+    checkpoint_mode: Option<CheckpointMode>,
     /// Index of the read lock currently held
     read_lock_index: usize,
 }
@@ -768,32 +765,75 @@ impl Drop for TransactionLock {
         let TransactionLock {
             ptr: shared,
             write,
-            checkpoint,
-            read_exclusive: _,
+            checkpoint_mode,
             read_lock_index: index,
         } = self;
         let guard = shared.write();
-        let guard = &guard.locks;
+        let locks = &guard.locks;
         if *write {
-            guard.write_lock.unlock();
+            locks.write_lock.unlock();
         }
-        guard.read_locks[*index].unlock();
-        if checkpoint.is_some() {
-            guard.checkpoint_lock.unlock();
+        // NO_LOCK_HELD means the lock was transferred to a CheckpointGuard
+        if *index != NO_LOCK_HELD {
+            locks.read_locks[*index].unlock();
+        }
+        if checkpoint_mode.is_some() {
+            // When checkpointing, we always hold read_locks[0] exclusively
+            // Only unlock if not already unlocked above (checkpoint-only mode uses index=0)
+            if *index != 0 && *index != NO_LOCK_HELD {
+                locks.read_locks[0].unlock();
+            }
+            locks.checkpoint_lock.unlock();
         }
     }
 }
 
 impl TransactionLock {
-    #[inline]
-    fn read_unchecked(shared: Arc<RwLock<WalFileShared>>, read_lock_index: usize) -> Self {
-        Self {
-            ptr: shared,
-            write: false,
-            checkpoint: None,
-            read_exclusive: false,
-            read_lock_index,
+    /// Create a TransactionLock specifically for checkpoint operations.
+    /// This acquires checkpoint_lock, read_locks[0], and write_lock for non-Passive modes.
+    /// Uses read_lock_index=0, so there's no separate transaction read lock.
+    fn for_checkpoint(shared: Arc<RwLock<WalFileShared>>, mode: CheckpointMode) -> Result<Self> {
+        let write;
+        {
+            let guard = shared.write();
+            let locks = &guard.locks;
+
+            // 1. Acquire checkpoint_lock
+            if !locks.checkpoint_lock.write() {
+                tracing::trace!("for_checkpoint: checkpoint_lock failed, returning Busy");
+                return Err(LimboError::Busy);
+            }
+
+            // 2. Acquire read_locks[0] exclusively
+            if !locks.read_locks[0].write() {
+                locks.checkpoint_lock.unlock();
+                tracing::trace!("for_checkpoint: read_locks[0] failed, returning Busy");
+                return Err(LimboError::Busy);
+            }
+
+            // 3. For non-Passive modes, also acquire write_lock
+            write = match mode {
+                CheckpointMode::Passive { .. } => false,
+                CheckpointMode::Full
+                | CheckpointMode::Restart
+                | CheckpointMode::Truncate { .. } => {
+                    if !locks.write_lock.write() {
+                        locks.read_locks[0].unlock();
+                        locks.checkpoint_lock.unlock();
+                        tracing::trace!("for_checkpoint: write_lock failed, returning Busy");
+                        return Err(LimboError::Busy);
+                    }
+                    true
+                }
+            };
         }
+
+        Ok(Self {
+            ptr: shared,
+            write,
+            checkpoint_mode: Some(mode),
+            read_lock_index: 0, // Using read_locks[0] for checkpoint
+        })
     }
 
     fn _read(
@@ -807,7 +847,12 @@ impl TransactionLock {
             either::Right(shared.read())
         };
         let index = if let Some(read_lock_index) = read_lock_index {
-            if !guard.locks.read_locks[read_lock_index].write() {
+            let acquired = if exclusive_lock {
+                guard.locks.read_locks[read_lock_index].write()
+            } else {
+                guard.locks.read_locks[read_lock_index].read()
+            };
+            if !acquired {
                 return Err(LimboError::Busy);
             }
             read_lock_index
@@ -838,20 +883,11 @@ impl TransactionLock {
         let transaction_lock = Self {
             ptr: shared,
             write: false,
-            checkpoint: None,
-            read_exclusive: exclusive_lock,
+            checkpoint_mode: None,
             read_lock_index: index,
         };
 
         Ok(transaction_lock)
-    }
-
-    #[inline]
-    fn read_exclusive(
-        shared: Arc<RwLock<WalFileShared>>,
-        read_lock_index: Option<usize>,
-    ) -> Result<Self> {
-        Self::_read(true, shared, read_lock_index)
     }
 
     #[inline]
@@ -887,18 +923,70 @@ impl TransactionLock {
         self.write = false;
     }
 
+    /// Begin checkpoint mode. Acquires checkpoint_lock, read_locks[0] exclusively,
+    /// and write_lock for non-Passive modes. Reuses existing write_lock if already held.
     fn checkpoint(&mut self, mode: CheckpointMode) -> Result<()> {
-        if self.checkpoint.is_some() {
+        if self.checkpoint_mode.is_some() {
             return Err(LimboError::Busy);
         }
 
         let shared = self.ptr.write();
+        let locks = &shared.locks;
 
-        if !shared.locks.checkpoint_lock.write() {
+        // 1. Acquire checkpoint_lock
+        if !locks.checkpoint_lock.write() {
+            tracing::trace!("checkpoint: checkpoint_lock failed, returning Busy");
             return Err(LimboError::Busy);
         }
-        self.checkpoint = Some(mode);
+
+        // 2. Acquire read_locks[0] exclusively (always required for checkpoint)
+        if !locks.read_locks[0].write() {
+            locks.checkpoint_lock.unlock();
+            tracing::trace!("checkpoint: read_locks[0] failed, returning Busy");
+            return Err(LimboError::Busy);
+        }
+
+        // 3. For non-Passive modes, also need write_lock
+        match mode {
+            CheckpointMode::Passive { .. } => {}
+            CheckpointMode::Full | CheckpointMode::Restart | CheckpointMode::Truncate { .. } => {
+                // Reuse write_lock if we already have it
+                if !self.write {
+                    if !locks.write_lock.write() {
+                        locks.read_locks[0].unlock();
+                        locks.checkpoint_lock.unlock();
+                        tracing::trace!("checkpoint: write_lock failed, returning Busy");
+                        return Err(LimboError::Busy);
+                    }
+                    self.write = true;
+                }
+            }
+        }
+
+        self.checkpoint_mode = Some(mode);
         Ok(())
+    }
+
+    /// End checkpoint mode and release checkpoint-specific locks.
+    /// For checkpoint-only locks (read_lock_index == 0), also releases write_lock
+    /// and marks the lock as empty.
+    fn end_checkpoint(&mut self) {
+        let mode = self.checkpoint_mode.take();
+        if mode.is_some() {
+            let shared = self.ptr.write();
+            let locks = &shared.locks;
+            locks.read_locks[0].unlock();
+            locks.checkpoint_lock.unlock();
+            // For checkpoint-only locks, also release write_lock and mark as empty
+            // (checkpoint-only locks use read_lock_index == 0)
+            if self.read_lock_index == 0 {
+                if self.write {
+                    locks.write_lock.unlock();
+                    self.write = false;
+                }
+                self.read_lock_index = NO_LOCK_HELD;
+            }
+        }
     }
 
     #[inline]
@@ -908,17 +996,65 @@ impl TransactionLock {
 
     #[inline]
     fn is_checkpoint(&self) -> bool {
-        self.checkpoint.is_some()
+        self.checkpoint_mode.is_some()
+    }
+
+    #[inline]
+    /// Returns true if this lock holds no actual locks (was a checkpoint-only lock
+    /// that had its checkpoint guard taken).
+    fn is_empty(&self) -> bool {
+        self.read_lock_index == NO_LOCK_HELD && self.checkpoint_mode.is_none() && !self.write
+    }
+
+    /// Extract checkpoint locks into a transferable CheckpointGuard.
+    /// After this call, the TransactionLock no longer holds checkpoint locks.
+    /// For non-Passive modes, the write_lock is also transferred to the guard.
+    fn take_checkpoint_guard(&mut self) -> Option<CheckpointGuard> {
+        let mode = self.checkpoint_mode.take()?;
+
+        let holds_write = match mode {
+            CheckpointMode::Passive { .. } => false,
+            CheckpointMode::Full | CheckpointMode::Restart | CheckpointMode::Truncate { .. } => {
+                // For non-Passive modes, transfer write_lock ownership to the guard
+                let had_write = self.write;
+                self.write = false;
+                had_write
+            }
+        };
+
+        // If this was a checkpoint-only lock (read_lock_index == 0), mark it as
+        // NO_LOCK_HELD so TransactionLock::drop doesn't try to unlock it
+        // (the CheckpointGuard will handle that)
+        if self.read_lock_index == 0 {
+            self.read_lock_index = NO_LOCK_HELD;
+        }
+
+        Some(CheckpointGuard {
+            ptr: self.ptr.clone(),
+            holds_write,
+        })
     }
 }
 
 #[derive(Clone, Debug)]
-/// To manage and ensure that no locks are leaked during checkpointing in
-/// the case of errors. It is held by the WalFile while checkpoint is ongoing
-/// then transferred to the CheckpointResult if necessary.
-enum CheckpointLocks {
-    Writer { ptr: Arc<RwLock<WalFileShared>> },
-    Read0 { ptr: Arc<RwLock<WalFileShared>> },
+/// Holds checkpoint locks that can be transferred to CheckpointResult.
+/// When dropped, releases: checkpoint_lock, read_locks[0], and optionally write_lock.
+/// This replaces the old CheckpointLocks enum with a simpler, unified structure.
+struct CheckpointGuard {
+    ptr: Arc<RwLock<WalFileShared>>,
+    holds_write: bool,
+}
+
+impl Drop for CheckpointGuard {
+    fn drop(&mut self) {
+        let shared = self.ptr.write();
+        let locks = &shared.locks;
+        if self.holds_write {
+            locks.write_lock.unlock();
+        }
+        locks.read_locks[0].unlock();
+        locks.checkpoint_lock.unlock();
+    }
 }
 
 /// Database checkpointers takes the following locks, in order:
@@ -928,81 +1064,9 @@ enum CheckpointLocks {
 /// Exclusive lock on read-mark 0.
 /// Exclusive lock on read-mark slots 1-N again. These are immediately released after being taken (RESTART and TRUNCATE only).
 /// All of the above use blocking locks.
-impl CheckpointLocks {
-    fn new(ptr: Arc<RwLock<WalFileShared>>, mode: CheckpointMode) -> Result<Self> {
-        let ptr_clone = ptr.clone();
-        {
-            let shared = ptr.write();
-            let shared = &shared.locks;
-            if !shared.checkpoint_lock.write() {
-                tracing::trace!("CheckpointGuard::new: checkpoint lock failed, returning Busy");
-                return Err(LimboError::Busy);
-            }
-            match mode {
-                CheckpointMode::Passive { .. } => {
-                    if !shared.read_locks[0].write() {
-                        shared.checkpoint_lock.unlock();
-                        tracing::trace!("CheckpointGuard: read0 lock failed, returning Busy");
-                        return Err(LimboError::Busy);
-                    }
-                }
-                CheckpointMode::Full => {
-                    if !shared.read_locks[0].write() {
-                        shared.checkpoint_lock.unlock();
-                        tracing::trace!("CheckpointGuard: read0 lock failed (Full), Busy");
-                        return Err(LimboError::Busy);
-                    }
-                    if !shared.write_lock.write() {
-                        shared.read_locks[0].unlock();
-                        shared.checkpoint_lock.unlock();
-                        tracing::trace!("CheckpointGuard: write lock failed (Full), Busy");
-                        return Err(LimboError::Busy);
-                    }
-                }
-                CheckpointMode::Restart | CheckpointMode::Truncate { .. } => {
-                    if !shared.read_locks[0].write() {
-                        shared.checkpoint_lock.unlock();
-                        tracing::trace!("CheckpointGuard: read0 lock failed, returning Busy");
-                        return Err(LimboError::Busy);
-                    }
-                    if !shared.write_lock.write() {
-                        shared.checkpoint_lock.unlock();
-                        shared.read_locks[0].unlock();
-                        tracing::trace!("CheckpointGuard: write lock failed, returning Busy");
-                        return Err(LimboError::Busy);
-                    }
-                }
-            }
-        }
-
-        match mode {
-            CheckpointMode::Passive { .. } => Ok(Self::Read0 { ptr: ptr_clone }),
-            CheckpointMode::Full | CheckpointMode::Restart | CheckpointMode::Truncate { .. } => {
-                Ok(Self::Writer { ptr: ptr_clone })
-            }
-        }
-    }
-}
-
-impl Drop for CheckpointLocks {
-    fn drop(&mut self) {
-        match self {
-            CheckpointLocks::Writer { ptr: shared } => {
-                let guard = shared.write();
-                let guard = &guard.locks;
-                guard.write_lock.unlock();
-                guard.read_locks[0].unlock();
-                guard.checkpoint_lock.unlock();
-            }
-            CheckpointLocks::Read0 { ptr: shared } => {
-                let guard = shared.write();
-                let guard = &guard.locks;
-                guard.read_locks[0].unlock();
-                guard.checkpoint_lock.unlock();
-            }
-        }
-    }
-}
+///
+/// Legacy alias for backwards compatibility during migration.
+type CheckpointLocks = CheckpointGuard;
 
 impl Wal for WalFile {
     /// Begin a read transaction. The caller must ensure that there is not already
@@ -1535,7 +1599,15 @@ impl Wal for WalFile {
         mode: CheckpointMode,
     ) -> Result<IOResult<CheckpointResult>> {
         self.checkpoint_inner(pager, mode).inspect_err(|_| {
-            let _ = self.checkpoint_guard.take();
+            let should_drop = if let Some(ref mut lock) = self.transaction_lock {
+                lock.end_checkpoint();
+                lock.is_empty()
+            } else {
+                false
+            };
+            if should_drop {
+                let _ = self.transaction_lock.take();
+            }
             self.ongoing_checkpoint.state = CheckpointState::Start;
         })
     }
@@ -1871,7 +1943,6 @@ impl WalFile {
             transaction_count: AtomicU64::new(0),
             last_checksum,
             prev_checkpoint: CheckpointResult::default(),
-            checkpoint_guard: None,
             header,
             transaction_lock: None,
             io_ctx: RwLock::new(IOContext::default()),
@@ -2259,12 +2330,27 @@ impl WalFile {
                     // a. the max frame == num wal frames (everything backfilled)
                     // b. the physical db file size differs from the expected pages * page_size
                     // and truncate + sync the db file if necessary.
+                    let should_drop_lock;
                     if checkpoint_result.everything_backfilled()
                         && checkpoint_result.num_backfilled > 0
                     {
-                        checkpoint_result.maybe_guard = self.checkpoint_guard.take();
+                        checkpoint_result.maybe_guard = self
+                            .transaction_lock
+                            .as_mut()
+                            .and_then(|lock| lock.take_checkpoint_guard());
+                        // If the transaction lock is now empty (was checkpoint-only), drop it
+                        should_drop_lock =
+                            self.transaction_lock.as_ref().is_some_and(|l| l.is_empty());
                     } else {
-                        let _ = self.checkpoint_guard.take();
+                        should_drop_lock = if let Some(ref mut lock) = self.transaction_lock {
+                            lock.end_checkpoint();
+                            lock.is_empty()
+                        } else {
+                            false
+                        };
+                    }
+                    if should_drop_lock {
+                        let _ = self.transaction_lock.take();
                     }
                     self.ongoing_checkpoint.inflight_writes.clear();
                     self.ongoing_checkpoint.pending_writes.clear();
@@ -2351,9 +2437,11 @@ impl WalFile {
             "CheckpointMode must be Restart or Truncate"
         );
         turso_assert!(
-            matches!(self.checkpoint_guard, Some(CheckpointLocks::Writer { .. })),
+            self.transaction_lock
+                .as_ref()
+                .is_some_and(|lock| lock.is_checkpoint() && lock.is_write()),
             "We must hold writer and checkpoint locks to restart the log, found: {:?}",
-            self.checkpoint_guard
+            self.transaction_lock
         );
         tracing::debug!("restart_log(mode={mode:?})");
         self.with_shared_mut(|shared| {
@@ -2456,23 +2544,13 @@ impl WalFile {
     }
 
     fn acquire_proper_checkpoint_guard(&mut self, mode: CheckpointMode) -> Result<()> {
-        let needs_new_guard = !matches!(
-            (&self.checkpoint_guard, mode),
-            (
-                Some(CheckpointLocks::Read0 { .. }),
-                CheckpointMode::Passive { .. },
-            ) | (
-                Some(CheckpointLocks::Writer { .. }),
-                CheckpointMode::Restart | CheckpointMode::Truncate { .. },
-            ),
-        );
-        if needs_new_guard {
-            // Drop any existing guard
-            if self.checkpoint_guard.is_some() {
-                let _ = self.checkpoint_guard.take();
-            }
-            let guard = CheckpointLocks::new(self.shared.clone(), mode)?;
-            self.checkpoint_guard = Some(guard);
+        if let Some(ref mut lock) = self.transaction_lock {
+            // Upgrade existing transaction lock to include checkpoint
+            lock.checkpoint(mode)?;
+        } else {
+            // Create a new transaction lock just for checkpoint
+            let lock = TransactionLock::for_checkpoint(self.shared.clone(), mode)?;
+            self.transaction_lock = Some(lock);
         }
         Ok(())
     }
