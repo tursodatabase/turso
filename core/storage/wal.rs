@@ -1,6 +1,6 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use parking_lot::{Mutex, RwLockWriteGuard};
+use parking_lot::Mutex;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::borrow::Cow;
 use std::collections::BTreeMap;
@@ -10,7 +10,7 @@ use tracing::{instrument, Level};
 
 use parking_lot::RwLock;
 use std::fmt::{Debug, Formatter};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::{fmt, sync::Arc};
 
 use super::buffer_pool::BufferPool;
@@ -570,9 +570,6 @@ pub struct WalFile {
     ongoing_checkpoint: OngoingCheckpoint,
     checkpoint_threshold: usize,
     // min and max frames for this connection
-    /// This is the index to the read_lock in WalFileShared that we are holding. This lock contains
-    /// the max frame for this connection.
-    max_frame_read_lock_index: AtomicUsize,
     /// Max frame allowed to lookup range=(minframe..max_frame)
     max_frame: AtomicU64,
     /// Start of range to look for frames range=(minframe..max_frame)
@@ -604,7 +601,13 @@ impl fmt::Debug for WalFile {
             .field("shared", &self.shared)
             .field("ongoing_checkpoint", &self.ongoing_checkpoint)
             .field("checkpoint_threshold", &self.checkpoint_threshold)
-            .field("max_frame_read_lock_index", &self.max_frame_read_lock_index)
+            .field(
+                "max_frame_read_lock_index",
+                &self
+                    .transaction_lock
+                    .as_ref()
+                    .map(|lock| lock.read_lock_index),
+            )
             .field("max_frame", &self.max_frame)
             .field("min_frame", &self.min_frame)
             // Excluding other fields
@@ -1010,14 +1013,6 @@ impl Wal for WalFile {
     #[instrument(skip_all, level = Level::DEBUG)]
     fn begin_read_tx(&mut self) -> Result<bool> {
         turso_assert!(
-            self.max_frame_read_lock_index
-                .load(Ordering::Acquire)
-                .eq(&NO_LOCK_HELD),
-            "cannot start a new read tx without ending an existing one, lock_value={}, expected={}",
-            self.max_frame_read_lock_index.load(Ordering::Acquire),
-            NO_LOCK_HELD
-        );
-        turso_assert!(
             self.transaction_lock.is_none(),
             "no transaction locks should exist"
         );
@@ -1049,8 +1044,6 @@ impl Wal for WalFile {
             // we need to keep self.max_frame set to the appropriate
             // max frame in the wal at the time this transaction starts.
             self.max_frame.store(shared_max, Ordering::Release);
-            self.max_frame_read_lock_index
-                .store(lock_0_idx, Ordering::Release);
             self.min_frame.store(nbackfills + 1, Ordering::Release);
             self.last_checksum = last_checksum;
             self.checkpoint_seq.store(checkpoint_seq, Ordering::Release);
@@ -1146,8 +1139,6 @@ impl Wal for WalFile {
         }
         self.min_frame.store(nb2 + 1, Ordering::Release);
         self.max_frame.store(best_mark as u64, Ordering::Release);
-        self.max_frame_read_lock_index
-            .store(best_idx as usize, Ordering::Release);
         self.last_checksum = last_checksum;
         self.checkpoint_seq.store(checkpoint_seq, Ordering::Release);
         self.transaction_count
@@ -1183,10 +1174,6 @@ impl Wal for WalFile {
         // transaction.
         // assert(pWal->readLock >= 0);
         // assert(pWal->writeLock == 0 && pWal->iReCksum == 0);
-        turso_assert!(
-            self.max_frame_read_lock_index.load(Ordering::Acquire) != NO_LOCK_HELD,
-            "must have a read transaction to begin a write transaction"
-        );
         turso_assert!(
             self.transaction_lock.is_some(),
             "must have a read transaction to begin a write transaction"
@@ -1261,7 +1248,10 @@ impl Wal for WalFile {
         // min_frame is set to nbackfill + 1 and max_frame is set to shared_max_frame
         //
         // by default, SQLite tries to restart log file in this case - but for now let's keep it simple in the turso-db
-        if self.max_frame_read_lock_index.load(Ordering::Acquire) == 0
+        if self
+            .transaction_lock
+            .as_ref()
+            .is_some_and(|lock| lock.read_lock_index == 0)
             && self.max_frame.load(Ordering::Acquire) < self.min_frame.load(Ordering::Acquire)
         {
             tracing::debug!(
@@ -1879,7 +1869,6 @@ impl WalFile {
             syncing: Arc::new(AtomicBool::new(false)),
             min_frame: AtomicU64::new(0),
             transaction_count: AtomicU64::new(0),
-            max_frame_read_lock_index: AtomicUsize::new(NO_LOCK_HELD),
             last_checksum,
             prev_checkpoint: CheckpointResult::default(),
             checkpoint_guard: None,
@@ -1972,10 +1961,9 @@ impl WalFile {
     }
 
     fn reset_internal_states(&mut self) {
-        self.max_frame_read_lock_index
-            .store(NO_LOCK_HELD, Ordering::Release);
         self.ongoing_checkpoint.reset();
         self.syncing.store(false, Ordering::SeqCst);
+        let _ = self.transaction_lock.take();
     }
 
     /// the WAL file has been truncated and we are writing the first
@@ -3314,7 +3302,8 @@ pub mod test {
         {
             let wal_any = wal.as_any();
             if let Some(wal_file) = wal_any.downcast_ref::<WalFile>() {
-                return wal_file.max_frame_read_lock_index.load(Ordering::Acquire) == expected_slot;
+                return wal_file.transaction_lock.as_ref().unwrap().read_lock_index
+                    == expected_slot;
             }
         }
 
