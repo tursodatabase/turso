@@ -3,7 +3,10 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use turso_core::{Buffer, Completion, DatabaseStorage, File, LimboError};
+use turso_core::{
+    storage::sqlite3_ondisk::{self, PageContent},
+    Buffer, Completion, DatabaseStorage, File, LimboError,
+};
 
 use crate::{
     database_sync_engine_io::SyncEngineIo,
@@ -224,6 +227,11 @@ async fn lazy_load_pages<IO: SyncEngineIo, Ctx>(
     server_revision: &str,
     completion_page: Option<u32>,
 ) -> Result<Option<Vec<u8>>, errors::Error> {
+    tracing::info!(
+        "lazy_load_pages(pages={:?}, revision={})",
+        &page_states_guard.pages_to_load,
+        server_revision
+    );
     let loaded = pull_pages_v1(
         &coro,
         &sync_engine_io,
@@ -287,6 +295,7 @@ async fn read_page<Ctx, IO: SyncEngineIo>(
     server_revision: &str,
     page: usize,
     segment_size: usize,
+    speculative_load: bool,
     c: Completion,
 ) -> Result<(), errors::Error> {
     let read_buf = c.as_read().buf().as_mut_slice();
@@ -296,7 +305,7 @@ async fn read_page<Ctx, IO: SyncEngineIo>(
     // first, try to mark page as loading
     let page_action = guard.load_start(page)?;
 
-    if matches!(page_action, PageLoadAction::Wait) {
+    let data = if matches!(page_action, PageLoadAction::Wait) {
         tracing::info!("read_page(page={page}): wait for the page to load");
         // another connection already loading this page - so we need to wait
         loop {
@@ -307,48 +316,100 @@ async fn read_page<Ctx, IO: SyncEngineIo>(
             tracing::info!("read_page(page={page}): err={:?}", result.as_ref().err());
             let data = result?;
             assert!(data.len() == PAGE_SIZE);
-            read_buf.copy_from_slice(&data[0..read_buf_len]);
-            c.complete(data.len() as i32);
-            return Ok(());
+            break data;
         }
-    }
+    } else {
+        tracing::info!(
+            "read_page(page={page}, segment_size={segment_size}): read page from the remote server"
+        );
+        let segment_start = page * PAGE_SIZE / segment_size * segment_size;
+        let segment_end = segment_start + segment_size;
 
-    tracing::info!(
-        "PartialDatabaseStorage::read_page(page={}, segment_size={}): read page from the remote server",
-        page,
-        segment_size,
-    );
-    let segment_start = page * PAGE_SIZE / segment_size * segment_size;
-    let segment_end = segment_start + segment_size;
-
-    for segment_page in segment_start / PAGE_SIZE..segment_end / PAGE_SIZE {
-        if page != segment_page {
-            match guard.load_start(segment_page) {
-                Ok(PageLoadAction::Wait) => guard.wait_end(segment_page),
-                Ok(PageLoadAction::Load) => continue,
-                Err(_) => continue,
+        for segment_page in segment_start / PAGE_SIZE..segment_end / PAGE_SIZE {
+            if page != segment_page {
+                match guard.load_start(segment_page) {
+                    Ok(PageLoadAction::Wait) => guard.wait_end(segment_page),
+                    Ok(PageLoadAction::Load) => continue,
+                    Err(_) => continue,
+                }
             }
         }
-    }
 
-    let Some(page_data) = lazy_load_pages(
-        &coro,
-        &sync_engine_io,
-        clean_file,
-        dirty_file,
-        guard,
-        &server_revision,
-        Some(page as u32),
-    )
-    .await?
-    else {
-        panic!("page_data must be set for completion");
+        let Some(page_data) = lazy_load_pages(
+            &coro,
+            &sync_engine_io,
+            clean_file.clone(),
+            dirty_file.clone(),
+            guard,
+            &server_revision,
+            Some(page as u32),
+        )
+        .await?
+        else {
+            panic!("page_data must be set for completion");
+        };
+        page_data
     };
 
-    read_buf.copy_from_slice(&page_data[0..read_buf_len]);
-    c.complete(read_buf_len as i32);
+    let buffer = Arc::new(Buffer::new(data));
+    if speculative_load {
+        tracing::info!("read_page(page={page}): trying to speculatively load more pages");
+        let content = PageContent::new(0, buffer.clone());
+        if content.maybe_page_type().is_some() {
+            tracing::info!(
+                "read_page(page={page}): detected valid page for speculative load: {:?}",
+                content.maybe_page_type()
+            );
+            let mut page_refs = Vec::with_capacity(content.cell_count() + 1);
+            for cell_id in 0..content.cell_count() {
+                let Ok(cell) = content.cell_get(cell_id, PAGE_SIZE) else {
+                    tracing::info!(
+                        "read_page(page={page}): unable to parse cell at position {cell_id}"
+                    );
+                    break;
+                };
+                if let Some(pointer) = content.rightmost_pointer() {
+                    page_refs.push(pointer);
+                }
+                match cell {
+                    sqlite3_ondisk::BTreeCell::TableInteriorCell(cell) => {
+                        page_refs.push(cell.left_child_page);
+                    }
+                    sqlite3_ondisk::BTreeCell::IndexInteriorCell(cell) => {
+                        page_refs.push(cell.left_child_page);
+                    }
+                    sqlite3_ondisk::BTreeCell::TableLeafCell(..) => {}
+                    sqlite3_ondisk::BTreeCell::IndexLeafCell(..) => {}
+                };
+            }
+            let mut speculative_load_pages = Vec::with_capacity(page_refs.len());
+            for page_ref in page_refs {
+                match guard.load_start(page_ref as usize) {
+                    Ok(PageLoadAction::Load) => speculative_load_pages.push(page_ref),
+                    Ok(PageLoadAction::Wait) => guard.wait_end(page_ref as usize),
+                    Err(err) => {
+                        // the speculative load is an optimization; if we can't load the page this is fine
+                        tracing::info!("read_page(page={page}): unable to lock page {page_ref} for speculative load: {err}");
+                    }
+                }
+            }
+            lazy_load_pages(
+                &coro,
+                &sync_engine_io,
+                clean_file,
+                dirty_file,
+                guard,
+                &server_revision,
+                None,
+            )
+            .await?;
+        }
+    }
 
-    Ok::<(), errors::Error>(())
+    tracing::info!("read_page(page={page}): page loaded");
+    read_buf.copy_from_slice(&buffer.as_slice()[0..read_buf_len]);
+    c.complete(read_buf_len as i32);
+    Ok(())
 }
 
 impl<IO: SyncEngineIo> DatabaseStorage for LazyDatabaseStorage<IO> {
@@ -432,6 +493,7 @@ impl<IO: SyncEngineIo> DatabaseStorage for LazyDatabaseStorage<IO> {
             let dirty_file = self.dirty_file.clone();
             let page_states = self.page_states.clone();
             let segment_size = self.opts.segment_size();
+            let speculative_load = self.opts.speculative_load;
             let c = c.clone();
             move |coro| async move {
                 let coro = Coro::new((), coro);
@@ -445,9 +507,14 @@ impl<IO: SyncEngineIo> DatabaseStorage for LazyDatabaseStorage<IO> {
                     &server_revision,
                     page_idx - 1,
                     segment_size,
+                    speculative_load,
                     c,
                 )
                 .await?;
+                tracing::info!(
+                    "PartialDatabaseStorage::read_page(page={}): page read succeeded",
+                    page
+                );
                 Ok::<(), errors::Error>(())
             }
         });
