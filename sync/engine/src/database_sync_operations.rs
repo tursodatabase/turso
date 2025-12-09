@@ -29,7 +29,7 @@ use crate::{
     types::{
         Coro, DatabasePullRevision, DatabaseRowTransformResult, DatabaseSyncEngineProtocolVersion,
         DatabaseTapeOperation, DatabaseTapeRowChange, DatabaseTapeRowChangeType, DbSyncInfo,
-        DbSyncStatus, PartialBootstrapStrategy, SyncEngineIoResult,
+        DbSyncStatus, PartialBootstrapStrategy, PartialSyncOpts, SyncEngineIoResult,
     },
     wal_session::WalSession,
     Result,
@@ -350,7 +350,7 @@ pub async fn pull_pages_v1<IO: SyncEngineIo, Ctx>(
     client: &SyncEngineIoStats<IO>,
     server_revision: &str,
     pages: &[u32],
-) -> Result<Vec<u8>> {
+) -> Result<Vec<(u64, Vec<u8>)>> {
     tracing::info!("pull_pages_v1: revision={server_revision}, pages={pages:?}");
     let mut bytes = BytesMut::new();
 
@@ -396,7 +396,7 @@ pub async fn pull_pages_v1<IO: SyncEngineIo, Ctx>(
     };
     tracing::info!("pull_pages_v1: got header={:?}", header);
 
-    let mut pages = Vec::with_capacity(PAGE_SIZE * pages.len());
+    let mut pages = Vec::with_capacity(pages.len());
 
     let mut page_data_opt =
         wait_proto_message::<Ctx, PageData>(coro, &completion, &client.network_stats, &mut bytes)
@@ -412,7 +412,7 @@ pub async fn pull_pages_v1<IO: SyncEngineIo, Ctx>(
                 PAGE_SIZE
             )));
         }
-        pages.extend_from_slice(&page);
+        pages.push((page_id, page));
         page_data_opt =
             wait_proto_message(coro, &completion, &client.network_stats, &mut bytes).await?;
         tracing::info!("page_data_opt: {}", page_data_opt.is_some());
@@ -1130,11 +1130,11 @@ pub async fn bootstrap_db_file<IO: SyncEngineIo, Ctx>(
     io: &Arc<dyn turso_core::IO>,
     main_db_path: &str,
     protocol: DatabaseSyncEngineProtocolVersion,
-    partial_bootstrap_strategy: PartialBootstrapStrategy,
+    partial_sync: Option<PartialSyncOpts>,
 ) -> Result<DatabasePullRevision> {
     match protocol {
         DatabaseSyncEngineProtocolVersion::Legacy => {
-            if matches!(partial_bootstrap_strategy, PartialBootstrapStrategy::None) {
+            if !partial_sync.is_none() {
                 return Err(Error::DatabaseSyncEngineError(
                     "can't bootstrap prefix of database with legacy protocol".to_string(),
                 ));
@@ -1142,7 +1142,7 @@ pub async fn bootstrap_db_file<IO: SyncEngineIo, Ctx>(
             bootstrap_db_file_legacy(coro, client, io, main_db_path).await
         }
         DatabaseSyncEngineProtocolVersion::V1 => {
-            bootstrap_db_file_v1(coro, client, io, main_db_path, partial_bootstrap_strategy).await
+            bootstrap_db_file_v1(coro, client, io, main_db_path, partial_sync).await
         }
     }
 }
@@ -1152,9 +1152,13 @@ pub async fn bootstrap_db_file_v1<IO: SyncEngineIo, Ctx>(
     client: &SyncEngineIoStats<IO>,
     io: &Arc<dyn turso_core::IO>,
     main_db_path: &str,
-    bootstrap: PartialBootstrapStrategy,
+    partial_sync: Option<PartialSyncOpts>,
 ) -> Result<DatabasePullRevision> {
-    let server_pages_selector = if let PartialBootstrapStrategy::Prefix { length } = &bootstrap {
+    let server_pages_selector = if let Some(PartialSyncOpts {
+        bootstrap_strategy: PartialBootstrapStrategy::Prefix { length },
+        ..
+    }) = &partial_sync
+    {
         let mut bitmap = RoaringBitmap::new();
         bitmap.insert_range(0..(*length / PAGE_SIZE) as u32);
         let mut bitmap_bytes = Vec::with_capacity(bitmap.serialized_size());
@@ -1165,7 +1169,11 @@ pub async fn bootstrap_db_file_v1<IO: SyncEngineIo, Ctx>(
     } else {
         Vec::new()
     };
-    let server_query_selector = if let PartialBootstrapStrategy::Query { query } = bootstrap {
+    let server_query_selector = if let Some(PartialSyncOpts {
+        bootstrap_strategy: PartialBootstrapStrategy::Query { query },
+        ..
+    }) = partial_sync
+    {
         query
     } else {
         String::new()
