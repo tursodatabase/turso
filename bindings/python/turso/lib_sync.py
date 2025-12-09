@@ -14,12 +14,12 @@ from ._turso import (
     PyTursoAsyncOperationResultKind,
     PyTursoConnection,
     PyTursoDatabaseConfig,
+    PyTursoPartialSyncOpts,
     PyTursoSyncDatabase,
     PyTursoSyncDatabaseConfig,
     PyTursoSyncDatabaseStats,
     PyTursoSyncIoItem,
     PyTursoSyncIoItemRequestKind,
-    PyTursoPartialSyncOpts,
     py_turso_sync_new,
 )
 from .lib import Connection as _Connection

@@ -126,13 +126,18 @@ pub fn py_turso_sync_new(
                         segment_size: config.segment_size.unwrap_or(0),
                         speculative_load: config.speculative_load.unwrap_or(false),
                     })
-                } else { config.bootstrap_strategy_query.as_ref().map(|query| PartialSyncOpts {
-                        bootstrap_strategy: PartialBootstrapStrategy::Query {
-                            query: query.clone(),
-                        },
-                        segment_size: config.segment_size.unwrap_or(0),
-                        speculative_load: config.speculative_load.unwrap_or(false),
-                    }) }
+                } else {
+                    config
+                        .bootstrap_strategy_query
+                        .as_ref()
+                        .map(|query| PartialSyncOpts {
+                            bootstrap_strategy: PartialBootstrapStrategy::Query {
+                                query: query.clone(),
+                            },
+                            segment_size: config.segment_size.unwrap_or(0),
+                            speculative_load: config.speculative_load.unwrap_or(false),
+                        })
+                }
             }
             None => None,
         },
