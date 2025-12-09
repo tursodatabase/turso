@@ -27,7 +27,27 @@ pub fn translate_analyze(
     let analyze_targets: Vec<(Arc<BTreeTable>, Option<Arc<Index>>)> = match target_opt {
         Some(target) => {
             let normalized = normalize_ident(target.name.as_str());
-            if let Some(table) = resolver.schema.get_btree_table(&normalized) {
+            let db_normalized = target
+                .db_name
+                .as_ref()
+                .map(|db| normalize_ident(db.as_str()));
+            let target_is_main =
+                normalized.eq_ignore_ascii_case("main") || db_normalized.as_deref() == Some("main");
+            if target_is_main {
+                resolver
+                    .schema
+                    .tables
+                    .iter()
+                    .filter_map(|(name, table)| {
+                        if name.eq_ignore_ascii_case("sqlite_schema")
+                            || name.eq_ignore_ascii_case("sqlite_stat1")
+                        {
+                            return None;
+                        }
+                        table.btree().map(|bt| (bt, None))
+                    })
+                    .collect()
+            } else if let Some(table) = resolver.schema.get_btree_table(&normalized) {
                 vec![(
                     table.clone(),
                     None, // analyze the whole table and its indexes
