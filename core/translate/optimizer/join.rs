@@ -68,7 +68,10 @@ pub fn join_lhs_and_rhs<'a>(
     let input_cardinality = lhs.map_or(1, |l| l.output_cardinality);
 
     let rhs_table_number = join_order.last().unwrap().original_idx;
-    let rhs_base_rows = base_table_rows.get(rhs_table_number).copied().unwrap_or(ESTIMATED_HARDCODED_ROWS_PER_TABLE as f64);
+    let rhs_base_rows = base_table_rows
+        .get(rhs_table_number)
+        .copied()
+        .unwrap_or(ESTIMATED_HARDCODED_ROWS_PER_TABLE as f64);
 
     let Some(method) = find_best_access_method_for_join_order(
         rhs_table_reference,
@@ -321,10 +324,8 @@ pub fn join_lhs_and_rhs<'a>(
     // Produce a number of rows estimated to be returned when this table is filtered by the WHERE clause.
     // If this table is the rightmost table in the join order, we multiply by the input cardinality,
     // which is the output cardinality of the previous tables.
-    let output_cardinality = (input_cardinality as f64
-        * rhs_base_rows
-        * output_cardinality_multiplier)
-        .ceil() as usize;
+    let output_cardinality =
+        (input_cardinality as f64 * rhs_base_rows * output_cardinality_multiplier).ceil() as usize;
 
     Ok(Some(JoinN {
         data: best_access_methods,
@@ -547,18 +548,18 @@ pub fn compute_best_join_order<'a>(
                 });
                 assert!(join_order.len() == subset_size);
 
-        // Calculate the best way to join LHS with RHS.
-        let rel = join_lhs_and_rhs(
-            Some(lhs),
-            &joined_tables[rhs_idx],
-            &constraints[rhs_idx],
-            constraints,
-            base_table_rows,
-            &join_order,
-            maybe_order_target,
-            access_methods_arena,
-            cost_upper_bound,
-            joined_tables,
+                // Calculate the best way to join LHS with RHS.
+                let rel = join_lhs_and_rhs(
+                    Some(lhs),
+                    &joined_tables[rhs_idx],
+                    &constraints[rhs_idx],
+                    constraints,
+                    base_table_rows,
+                    &join_order,
+                    maybe_order_target,
+                    access_methods_arena,
+                    cost_upper_bound,
+                    joined_tables,
                     where_clause,
                     subqueries,
                 )?;
@@ -774,7 +775,7 @@ mod tests {
     };
 
     fn default_base_rows(n: usize) -> Vec<f64> {
-        vec![super::cost::ESTIMATED_HARDCODED_ROWS_PER_TABLE as f64; n]
+        vec![ESTIMATED_HARDCODED_ROWS_PER_TABLE as f64; n]
     }
 
     #[test]

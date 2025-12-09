@@ -243,7 +243,13 @@ fn find_best_access_method_for_vtab(
         Ok(index_info) => {
             Ok(Some(AccessMethod {
                 // TODO: Base cost on `IndexInfo::estimated_cost` and output cardinality on `IndexInfo::estimated_rows`
-                cost: estimate_cost_for_scan_or_seek(None, &[], &[], input_cardinality, base_row_count),
+                cost: estimate_cost_for_scan_or_seek(
+                    None,
+                    &[],
+                    &[],
+                    input_cardinality,
+                    base_row_count,
+                ),
                 params: AccessMethodParams::VirtualTable {
                     idx_num: index_info.idx_num,
                     idx_str: index_info.idx_str,

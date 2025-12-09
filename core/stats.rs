@@ -91,27 +91,27 @@ pub fn gather_sqlite_stat1(
     Ok(stats)
 }
 
-/// Refresh analyze_stats on the connection's schema. Best-effort: skips if unsafe.
-pub fn refresh_analyze_stats(conn: &Arc<Connection>) -> Result<()> {
+/// Best-effort refresh analyze_stats on the connection's schema.
+pub fn refresh_analyze_stats(conn: &Arc<Connection>) {
     if !conn.is_db_initialized() || conn.is_nested_stmt() {
-        return Ok(());
+        return;
     }
     if matches!(conn.get_tx_state(), TransactionState::Write { .. }) {
-        return Ok(());
+        return;
     }
 
     // Need a snapshot of the current schema to validate tables/indexes.
     let schema_snapshot = { conn.schema.read().clone() };
     if schema_snapshot.get_btree_table(STATS_TABLE).is_none() {
-        return Ok(());
+        return;
     }
 
     let mv_tx = conn.get_mv_tx();
-    let stats = gather_sqlite_stat1(conn, &schema_snapshot, mv_tx)?;
-    conn.with_schema_mut(|schema| {
-        schema.analyze_stats = stats;
-    });
-    Ok(())
+    if let Ok(stats) = gather_sqlite_stat1(conn, &schema_snapshot, mv_tx) {
+        conn.with_schema_mut(|schema| {
+            schema.analyze_stats = stats;
+        });
+    }
 }
 
 fn load_sqlite_stat1_from_stmt(
