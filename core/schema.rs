@@ -2706,24 +2706,28 @@ impl Index {
     ) -> Result<Index> {
         let (index_name, root_page) = auto_index;
 
-        let unique_cols = table
-            .columns
-            .iter()
-            .enumerate()
-            .filter_map(|(pos_in_table, col)| {
-                let (pos_in_table, sort_order) = column_indices_and_sort_orders
-                    .iter()
-                    .find(|(pos, _)| *pos == pos_in_table)?;
-                Some(IndexColumn {
-                    name: normalize_ident(col.name.as_ref().unwrap()),
-                    order: *sort_order,
-                    pos_in_table: *pos_in_table,
-                    collation: col.collation_opt(),
-                    default: col.default.clone(),
-                    expr: None,
-                })
-            })
-            .collect::<Vec<_>>();
+        let mut unique_cols = Vec::with_capacity(column_indices_and_sort_orders.len());
+        for (pos, sort_order) in &column_indices_and_sort_orders {
+            let Some((pos_in_table, col)) = table
+                .columns
+                .iter()
+                .enumerate()
+                .find(|(pos_in_table, _)| pos == pos_in_table)
+            else {
+                return Err(crate::LimboError::ParseError(format!(
+                    "Unique constraint column not found in table {}",
+                    table.name
+                )));
+            };
+            unique_cols.push(IndexColumn {
+                name: normalize_ident(col.name.as_ref().unwrap()),
+                order: *sort_order,
+                pos_in_table: pos_in_table,
+                collation: col.collation_opt(),
+                default: col.default.clone(),
+                expr: None,
+            });
+        }
 
         Ok(Index {
             name: normalize_ident(index_name.as_str()),
