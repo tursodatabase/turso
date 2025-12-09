@@ -768,6 +768,15 @@ impl Pager {
         subjournal.stop_use()
     }
 
+    /// check if subjournal is in use for some statement
+    pub fn subjournal_in_use(&self) -> bool {
+        let subjournal = self.subjournal.read();
+        let Some(subjournal) = subjournal.as_ref() else {
+            return false;
+        };
+        subjournal.in_use()
+    }
+
     pub fn open_savepoint(&self, db_size: u32) -> Result<()> {
         let subjournal_offset = {
             let subjournal = self.subjournal.read();
