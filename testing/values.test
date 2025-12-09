@@ -61,3 +61,20 @@ do_execsql_test_in_memory_any_error values-illegal-column-ref {
   CREATE TABLE t0 (c0);
   INSERT INTO t0 VALUES (c0);
 }
+
+# Unquoted identifiers in VALUES should produce a parse error
+do_execsql_test_in_memory_any_error values-unquoted-identifier-single {
+  values(asdf);
+}
+
+do_execsql_test_in_memory_any_error values-unquoted-identifier-mixed {
+  values(1, asdf);
+}
+
+# Also verify correlated VALUES references outer columns row-by-row
+do_execsql_test_on_specific_db {:memory:} values-correlated-values-in-select {
+  CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);
+  INSERT INTO users (name) VALUES ('jack'), ('jill');
+  SELECT id, (VALUES(name)) AS name_again FROM users;
+} {1|jack
+2|jill}

@@ -517,22 +517,24 @@ fn prepare_one_select_plan(
                 });
             }
 
+            let mut table_references = TableReferences::new(vec![], outer_query_refs.to_vec());
             for value_row in values.iter_mut() {
                 for value in value_row.iter_mut() {
+                    // Before binding, we check for unquoted literals. Sqlite throws an error in this case
                     bind_and_rewrite_expr(
                         value,
-                        None,
+                        Some(&mut table_references),
                         None,
                         connection,
                         // Allow sqlite quirk of inserting "double-quoted" literals (which our AST maps as identifiers)
-                        BindingBehavior::AllowUnboundIdentifiers,
+                        BindingBehavior::TryResultColumnsFirst,
                     )?;
                 }
             }
 
             let plan = SelectPlan {
                 join_order: vec![],
-                table_references: TableReferences::new(vec![], vec![]),
+                table_references,
                 result_columns,
                 where_clause: vec![],
                 group_by: None,
