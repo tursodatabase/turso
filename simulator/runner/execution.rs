@@ -110,6 +110,22 @@ pub(crate) fn execute_interactions(
                 };
                 interaction = new_interaction;
             }
+            Ok(ExecutionContinuation::NextInteractionOutsideThisProperty) => {
+                // Skip remaining interactions in this property by advancing until we
+                // find an interaction with a different id (i.e., a different property)
+                let current_property_id = interaction.id();
+                loop {
+                    state.interaction_pointer += 1;
+                    let Some(new_interaction) = plan.next(&mut env) else {
+                        // No more interactions, we're done
+                        return ExecutionResult::new(history, None);
+                    };
+                    if new_interaction.id() != current_property_id {
+                        interaction = new_interaction;
+                        break;
+                    }
+                }
+            }
             Err(err) => {
                 return ExecutionResult::new(history, Some(err));
             }
@@ -157,7 +173,7 @@ pub(crate) enum ExecutionContinuation {
     /// Default continuation, execute the next interaction.
     NextInteraction,
     //  /// Typically used in the case of preconditions failures, skip to the next property.
-    // NextProperty,
+    NextInteractionOutsideThisProperty,
 }
 
 pub fn execute_interaction(
@@ -227,7 +243,7 @@ pub fn execute_interaction_turso(
             env.update_conn_last_interaction(connection_index, Some(query));
 
             if skip_shadow {
-                return Ok(ExecutionContinuation::NextInteraction);
+                return Ok(ExecutionContinuation::NextInteractionOutsideThisProperty);
             }
         }
         InteractionType::FsyncQuery(query) => {
