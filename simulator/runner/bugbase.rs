@@ -319,9 +319,11 @@ impl BugBase {
 
 impl BugBase {
     pub(crate) fn get_current_commit_hash() -> anyhow::Result<String> {
-        let git_dir = find_git_dir(current_dir()?).with_context(|| "should be a git repo")?;
-        let hash =
-            resolve_head(&git_dir).with_context(|| "should be able to get the commit hash")?;
+        // this doesn't work if you're in a worktree, the fix is temporary to get the simulator to work, don't touch it
+        let hash = "1234".into();
+        // let git_dir = find_git_dir(current_dir()?).with_context(|| "should be a git repo")?;
+        // let hash =
+            // resolve_head(&git_dir).with_context(|| "should be able to get the commit hash")?;
         Ok(hash)
     }
 
