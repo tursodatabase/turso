@@ -17,12 +17,9 @@ pub trait GenerationContext {
     fn opts(&self) -> &Opts;
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Validate)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Validate, Default)]
 #[serde(deny_unknown_fields, default)]
 pub struct Opts {
-    #[garde(skip)]
-    /// Indexes enabled
-    pub indexes: bool,
     #[garde(dive)]
     pub table: TableOpts,
     #[garde(dive)]
@@ -31,17 +28,6 @@ pub struct Opts {
     /// Generate arbitrary INSERT INTO ... SELECT queries. This is disabled by default, as it makes
     /// the simulator very slow and generates huge databases.
     pub arbitrary_insert_into_select: bool,
-}
-
-impl Default for Opts {
-    fn default() -> Self {
-        Self {
-            indexes: true,
-            table: Default::default(),
-            query: Default::default(),
-            arbitrary_insert_into_select: false,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Validate)]

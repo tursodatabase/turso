@@ -68,14 +68,28 @@ jobs:
       - uses: useblacksmith/rust-cache@v3
         with:
           prefix-key: "v1-rust" # can be updated if we need to reset caches due to non-trivial change in the dependencies (for example, custom env var were set for single workspace project)
+      # Run these with for loops (instead of --loop flag in sim) so that each iteration gets a separate seed -- this produces much easier-to-debug traces when there's a failure since we don't have to potentially
+      # run 10 iterations of the same seed to get to the failure
       - name: Simulator default
-        run: ./scripts/run-sim --maximum-tests 1000 --min-tick 10 --max-tick 50 loop -n 10 -s
+        run: |
+          for i in {1..10}; do
+            ./scripts/run-sim --maximum-tests 1000 --min-tick 10 --max-tick 50 --memory-io || exit 1
+          done
       - name: Simulator InsertHeavy
-        run: ./scripts/run-sim --maximum-tests 1000 --min-tick 10 --max-tick 50 --profile write_heavy loop -n 10 -s
+        run: |
+          for i in {1..5}; do
+            ./scripts/run-sim --maximum-tests 1000 --min-tick 10 --max-tick 50 --profile write_heavy --memory-io || exit 1
+          done
       - name: Simulator Faultless
-        run: ./scripts/run-sim --maximum-tests 1000 --min-tick 10 --max-tick 50 --profile faultless loop -n 10 -s
+        run: |
+          for i in {1..10}; do
+            ./scripts/run-sim --maximum-tests 1000 --min-tick 10 --max-tick 50 --profile faultless --memory-io || exit 1
+          done
       - name: Simulator Differential
-        run: ./scripts/run-sim --maximum-tests 1000 --differential loop -n 10 -s
+        run: |
+          for i in {1..10}; do
+            ./scripts/run-sim --maximum-tests 1000 --differential --memory-io || exit 1
+          done
 
   test-limbo:
     runs-on: blacksmith-4vcpu-ubuntu-2404

@@ -162,6 +162,8 @@ A transaction is a sequence of one or more SQL statements that execute as a sing
 A transaction ensures **atomicity** and **isolation**, meaning that either all SQL statements are executed or none of them are, and that concurrent transactions don't interfere with other transactions.
 Transactions maintain database integrity in the presence of errors, crashes, and concurrent access.
 
+Each connection can have exactly one active transaction at a time. All statements prepared on a connection belong to the same transaction context. You cannot interleave statement execution across different transactions on a single connection. When you need concurrency (including `BEGIN CONCURRENT`), you need to use *different connections*, not parallel statements within the same connection.
+
 Turso supports three types of transactions: **deferred**, **immediate**, and **concurrent** transactions:
 
 * **Deferred (default)**: The transaction begins in a suspended state and does not acquire locks immediately. It starts a read transaction when the first read SQL statement (e.g., `SELECT`) runs, and upgrades to a write transaction only when the first write SQL statement (e.g., `INSERT`, `UPDATE`, `DELETE`) executes. This mode allows concurrency for reads and delays write locks, which can reduce contention.

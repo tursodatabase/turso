@@ -87,7 +87,8 @@ pub struct Sorter {
     insert_state: InsertState,
     /// State machine for [Sorter::init_chunk_heap]
     init_chunk_heap_state: InitChunkHeapState,
-    pending_completions: Vec<Completion>,
+    /// Pending IO completion along with the chunk index that needs to be retried after IO completes.
+    pending_completion: Option<(Completion, usize)>,
 }
 
 impl Sorter {
@@ -125,7 +126,7 @@ impl Sorter {
             sort_state: SortState::Start,
             insert_state: InsertState::Start,
             init_chunk_heap_state: InitChunkHeapState::Start,
-            pending_completions: Vec::new(),
+            pending_completion: None,
         }
     }
 
@@ -242,7 +243,8 @@ impl Sorter {
                             self.io.drain()?;
                             return Err(e);
                         }
-                        Ok(c) => group.add(&c),
+                        Ok(Some(c)) => group.add(&c),
+                        Ok(None) => {}
                     };
                 }
                 self.init_chunk_heap_state = InitChunkHeapState::PushChunk;
@@ -277,24 +279,37 @@ impl Sorter {
         }
     }
 
+    /// Returns the next record from the chunk heap in sorted order.
+    ///
+    /// The heap contains at most one record per chunk. When we pop a record, we try to refill
+    /// from that chunk. If IO is needed, we store it in `pending_completion` and wait for it
+    /// on the next call before popping again - this ensures all non-exhausted chunks have
+    /// a record in the heap before we decide which is smallest.
     fn next_from_chunk_heap(&mut self) -> Result<IOResult<Option<SortableImmutableRecord>>> {
-        if !self.pending_completions.is_empty() {
-            let mut group = CompletionGroup::new(|_| {});
-            for c in self.pending_completions.drain(..) {
-                group.add(&c);
+        // If there is a pending IO, we must wait for it before popping from the heap,
+        // otherwise we might return records out of order.
+        while let Some((completion, chunk_idx)) = self.pending_completion.take() {
+            if !completion.succeeded() {
+                // IO not complete - put it back and yield
+                self.pending_completion = Some((completion.clone(), chunk_idx));
+                return Ok(IOResult::IO(IOCompletions::Single(completion)));
             }
-            return Ok(IOResult::IO(IOCompletions::Single(group.build())));
-        }
-        // Make sure all chunks read at least one record into their buffer.
-        if let Some((next_record, next_chunk_idx)) = self.chunk_heap.pop() {
-            // TODO: blocking will be unnecessary here with IO completions
-            if let Some(c) = self.push_to_chunk_heap(next_chunk_idx)? {
-                self.pending_completions.push(c);
+            // IO completed - push result to heap and retry
+            if let Some(c) = self.push_to_chunk_heap(chunk_idx)? {
+                self.pending_completion = Some((c, chunk_idx));
             }
-            Ok(IOResult::Done(Some(next_record.0)))
-        } else {
-            Ok(IOResult::Done(None))
         }
+
+        // No pending IO - safe to pop from heap
+        if let Some((next_record, chunk_idx)) = self.chunk_heap.pop() {
+            if let Some(c) = self.push_to_chunk_heap(chunk_idx)? {
+                self.pending_completion = Some((c, chunk_idx));
+            }
+            return Ok(IOResult::Done(Some(next_record.0)));
+        }
+
+        // Heap empty and no pending IO - sorter exhausted
+        Ok(IOResult::Done(None))
     }
 
     fn push_to_chunk_heap(&mut self, chunk_idx: usize) -> Result<Option<Completion>> {
@@ -378,24 +393,60 @@ enum NextState {
     Finish,
 }
 
+/// A sorted chunk represents a portion of sorted data that has been written to disk
+/// during external merge sort. When the in-memory buffer fills up, records are sorted
+/// and flushed to a chunk file. During the merge phase, chunks are read back and merged
+/// using a heap to produce the final sorted output.
+///
+/// # Buffer management
+///
+/// The chunk uses a fixed-size read buffer (`buffer`) to read data from disk. The buffer
+/// has two relevant sizes:
+/// - `buffer.len()` (capacity): The total allocated size of the buffer (fixed at creation)
+/// - `buffer_len`: The amount of valid data currently in the buffer (0 to capacity)
+///
+/// The difference `buffer.len() - buffer_len` is the free space available for reading
+/// more data from disk.
+///
+/// # Reading progress
+///
+/// - `chunk_size`: Total bytes of this chunk on disk (set when chunk is written)
+/// - `total_bytes_read`: Cumulative bytes read from disk so far (0 to chunk_size)
+///
+/// The difference `chunk_size - total_bytes_read` is the remaining data on disk that
+/// hasn't been read yet. When `total_bytes_read == chunk_size`, we've read all data.
+///
+/// # Record parsing
+///
+/// Data flows: disk -> buffer -> records -> caller
+///
+/// 1. `read()` fills `buffer` from disk, updates `total_bytes_read`
+/// 2. `next()` parses records from `buffer` into `records` vec, updates `buffer_len`
+/// 3. `next()` returns records one at a time from `records`
+///
+/// Incomplete records at the end of the buffer are kept (buffer compacted) until
+/// more data is read to complete them.
 struct SortedChunk {
-    /// The chunk file.
+    /// The file containing the chunk data.
     file: Arc<dyn File>,
-    /// Offset of the start of chunk in file
+    /// Byte offset where this chunk starts in the file.
     start_offset: u64,
-    /// The size of this chunk file in bytes.
+    /// Total size of this chunk in bytes (set during write, used to detect EOF during read).
     chunk_size: usize,
-    /// The read buffer.
+    /// Fixed-size buffer for reading data from disk. The capacity (`buffer.len()`) is
+    /// constant; use `buffer_len` for the amount of valid data.
     buffer: Arc<RwLock<Vec<u8>>>,
-    /// The current length of the buffer.
+    /// Amount of valid (unparsed) data in `buffer`, from index 0 to buffer_len.
+    /// This is separate from buffer.len() because we reuse the same allocation.
     buffer_len: Arc<atomic::AtomicUsize>,
-    /// The records decoded from the chunk file.
+    /// Records parsed from the buffer, waiting to be returned by `next()`.
+    /// Stored in reverse order so we can efficiently pop from the end.
     records: Vec<ImmutableRecord>,
-    /// The current IO state of the chunk.
+    /// Current async IO state (None, WaitingForRead, ReadComplete, ReadEOF, etc).
     io_state: Arc<RwLock<SortedChunkIOState>>,
-    /// The total number of bytes read from the chunk file.
+    /// Cumulative bytes read from disk. When this equals `chunk_size`, we've read everything.
     total_bytes_read: Arc<atomic::AtomicUsize>,
-    /// State machine for [SortedChunk::next]
+    /// State machine for the `next()` method.
     next_state: NextState,
 }
 
@@ -427,6 +478,14 @@ impl SortedChunk {
         self.buffer_len.store(len, atomic::Ordering::SeqCst);
     }
 
+    /// Returns the next record from this chunk, or None if exhausted.
+    ///
+    /// May return `ChunkNextResult::IO` if async IO is needed, in which case
+    /// the caller should wait for the completion and call `next()` again.
+    ///
+    /// Internally manages a two-phase state machine:
+    /// - `Start`: Parse records from buffer, issue prefetch read if needed
+    /// - `Finish`: Return the next parsed record
     fn next(&mut self) -> Result<ChunkNextResult> {
         loop {
             match self.next_state {
@@ -485,17 +544,11 @@ impl SortedChunk {
                     }
 
                     self.next_state = NextState::Finish;
-                    // This check is done to see if we need to read more from the chunk before popping the record
+                    // Prefetch: if down to last record, try to read more data into the buffer.
                     if self.records.len() == 1
                         && *self.io_state.read() != SortedChunkIOState::ReadEOF
                     {
-                        // We've consumed the last record. Read more payload into the buffer.
-                        if self.chunk_size - self.total_bytes_read.load(atomic::Ordering::SeqCst)
-                            == 0
-                        {
-                            *self.io_state.write() = SortedChunkIOState::ReadEOF;
-                        } else {
-                            let c = self.read()?;
+                        if let Some(c) = self.read()? {
                             if !c.succeeded() {
                                 return Ok(ChunkNextResult::IO(c));
                             }
@@ -510,12 +563,28 @@ impl SortedChunk {
         }
     }
 
-    fn read(&mut self) -> Result<Completion> {
-        *self.io_state.write() = SortedChunkIOState::WaitingForRead;
+    /// Issues an async read to fill the buffer with more data from the chunk file.
+    ///
+    /// Reads up to `min(free_buffer_space, remaining_chunk_bytes)` bytes. Returns `None`
+    /// if there's no room in the buffer or no data left to read (no IO issued).
+    ///
+    /// On completion, appends data to `buffer` and updates `buffer_len` and `total_bytes_read`.
+    fn read(&mut self) -> Result<Option<Completion>> {
+        let free_buffer_space = self.buffer.read().len() - self.buffer_len();
+        let remaining_chunk_bytes =
+            self.chunk_size - self.total_bytes_read.load(atomic::Ordering::SeqCst);
+        let read_buffer_size = free_buffer_space.min(remaining_chunk_bytes);
 
-        let read_buffer_size = self.buffer.read().len() - self.buffer_len();
-        let read_buffer_size = read_buffer_size
-            .min(self.chunk_size - self.total_bytes_read.load(atomic::Ordering::SeqCst));
+        // If there's no room in the buffer or nothing left to read, skip the read.
+        if read_buffer_size == 0 {
+            if remaining_chunk_bytes == 0 {
+                // No more data in the chunk file.
+                *self.io_state.write() = SortedChunkIOState::ReadEOF;
+            }
+            return Ok(None);
+        }
+
+        *self.io_state.write() = SortedChunkIOState::WaitingForRead;
 
         let read_buffer = Buffer::new_temporary(read_buffer_size);
         let read_buffer_ref = Arc::new(read_buffer);
@@ -555,7 +624,7 @@ impl SortedChunk {
             self.start_offset + self.total_bytes_read.load(atomic::Ordering::SeqCst) as u64,
             c,
         )?;
-        Ok(c)
+        Ok(Some(c))
     }
 
     fn write(

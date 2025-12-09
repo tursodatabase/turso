@@ -762,7 +762,10 @@ pub struct Program {
     /// is determined by the parser flags "mayAbort" and "isMultiWrite". Essentially this means that the individual
     /// statement may need to be aborted due to a constraint conflict, etc. instead of the entire transaction.
     pub needs_stmt_subtransactions: bool,
+    /// If this Program is a trigger subprogram, a ref to the trigger is stored here.
     pub trigger: Option<Arc<Trigger>>,
+    /// Whether the program contains any trigger subprograms.
+    pub contains_trigger_subprograms: bool,
     pub resolve_type: ResolveType,
     pub explain_state: RwLock<ExplainState>,
 }
@@ -775,16 +778,15 @@ impl Program {
     pub fn step(
         &self,
         state: &mut ProgramState,
-        mv_store: Option<&Arc<MvStore>>,
         pager: Arc<Pager>,
         query_mode: QueryMode,
         waker: Option<&Waker>,
     ) -> Result<StepResult> {
         state.execution_state = ProgramExecutionState::Running;
         let result = match query_mode {
-            QueryMode::Normal => self.normal_step(state, mv_store, pager, waker),
-            QueryMode::Explain => self.explain_step(state, mv_store, pager),
-            QueryMode::ExplainQueryPlan => self.explain_query_plan_step(state, mv_store, pager),
+            QueryMode::Normal => self.normal_step(state, pager, waker),
+            QueryMode::Explain => self.explain_step(state, pager),
+            QueryMode::ExplainQueryPlan => self.explain_query_plan_step(state, pager),
         };
         match &result {
             Ok(StepResult::Done) => {
@@ -801,12 +803,7 @@ impl Program {
         result
     }
 
-    fn explain_step(
-        &self,
-        state: &mut ProgramState,
-        _mv_store: Option<&Arc<MvStore>>,
-        pager: Arc<Pager>,
-    ) -> Result<StepResult> {
+    fn explain_step(&self, state: &mut ProgramState, pager: Arc<Pager>) -> Result<StepResult> {
         debug_assert!(state.column_count() == EXPLAIN_COLUMNS.len());
         if self.connection.is_closed() {
             // Connection is closed for whatever reason, rollback the transaction.
@@ -851,7 +848,7 @@ impl Program {
                     explain_state.current_subprogram_index = Some(sub_idx + 1);
                     state.pc = 0;
                     drop(explain_state);
-                    return self.explain_step(state, _mv_store, pager);
+                    return self.explain_step(state, pager);
                 } else {
                     *explain_state = ExplainState::default();
                     return Ok(StepResult::Done);
@@ -868,7 +865,7 @@ impl Program {
             // Process the subprogram - it will handle its own explain_step internally
             // The subprogram's explain_step will process all its instructions (including any nested subprograms)
             // and return StepResult::Row for each instruction, then StepResult::Done when finished
-            let result = p.step(state, None, pager.clone(), QueryMode::Explain, None)?;
+            let result = p.step(state, pager.clone(), QueryMode::Explain, None)?;
 
             match result {
                 StepResult::Done => {
@@ -881,7 +878,7 @@ impl Program {
                         state.pc = 0;
                         // Recursively call to process the next subprogram
                         drop(explain_state);
-                        return self.explain_step(state, _mv_store, pager);
+                        return self.explain_step(state, pager);
                     } else {
                         // All subprograms done
                         *explain_state = ExplainState::default();
@@ -916,7 +913,7 @@ impl Program {
             explain_state.subprogram_start_pc = None; // Will be set when we actually start processing
             state.pc = 0; // Reset PC to 0 for the first subprogram
             drop(explain_state);
-            return self.explain_step(state, _mv_store, pager);
+            return self.explain_step(state, pager);
         }
 
         let (current_insn, _) = &self.insns[state.pc as usize];
@@ -953,7 +950,6 @@ impl Program {
     fn explain_query_plan_step(
         &self,
         state: &mut ProgramState,
-        _mv_store: Option<&Arc<MvStore>>,
         pager: Arc<Pager>,
     ) -> Result<StepResult> {
         debug_assert!(state.column_count() == EXPLAIN_QUERY_PLAN_COLUMNS.len());
@@ -1001,7 +997,6 @@ impl Program {
     fn normal_step(
         &self,
         state: &mut ProgramState,
-        mv_store: Option<&Arc<MvStore>>,
         pager: Arc<Pager>,
         waker: Option<&Waker>,
     ) -> Result<StepResult> {
@@ -1016,7 +1011,7 @@ impl Program {
                 return Err(LimboError::InternalError("Connection closed".to_string()));
             }
             if matches!(state.execution_state, ProgramExecutionState::Interrupting) {
-                self.abort(mv_store, &pager, None, state);
+                self.abort(&pager, None, state);
                 return Ok(StepResult::Interrupt);
             }
 
@@ -1027,7 +1022,7 @@ impl Program {
                 }
                 if let Some(err) = io.get_error() {
                     let err = err.into();
-                    self.abort(mv_store, &pager, Some(&err), state);
+                    self.abort(&pager, Some(&err), state);
                     return Err(err);
                 }
                 state.io_completions = None;
@@ -1042,7 +1037,7 @@ impl Program {
             // Always increment VM steps for every loop iteration
             state.metrics.vm_steps = state.metrics.vm_steps.saturating_add(1);
 
-            match insn_function(self, state, insn, &pager, mv_store) {
+            match insn_function(self, state, insn, &pager) {
                 Ok(InsnFunctionStepResult::Step) => {
                     // Instruction completed, moving to next
                     state.metrics.insn_executed = state.metrics.insn_executed.saturating_add(1);
@@ -1069,7 +1064,7 @@ impl Program {
                     return Ok(StepResult::Busy);
                 }
                 Err(err) => {
-                    self.abort(mv_store, &pager, Some(&err), state);
+                    self.abort(&pager, Some(&err), state);
                     return Err(err);
                 }
             }
@@ -1324,13 +1319,7 @@ impl Program {
 
     /// Aborts the program due to various conditions (explicit error, interrupt or reset of unfinished statement) by rolling back the transaction
     /// This method is no-op if program was already finished (either aborted or executed to completion)
-    pub fn abort(
-        &self,
-        mv_store: Option<&Arc<MvStore>>,
-        pager: &Arc<Pager>,
-        err: Option<&LimboError>,
-        state: &mut ProgramState,
-    ) {
+    pub fn abort(&self, pager: &Arc<Pager>, err: Option<&LimboError>, state: &mut ProgramState) {
         if self.is_trigger_subprogram() {
             self.connection.end_trigger_execution();
         }
@@ -1357,7 +1346,7 @@ impl Program {
                 Some(LimboError::Constraint(_)) => {}
                 _ => {
                     if state.auto_txn_cleanup != TxnCleanup::None || err.is_some() {
-                        if let Some(mv_store) = mv_store {
+                        if let Some(mv_store) = self.connection.mv_store().as_ref() {
                             if let Some(tx_id) = self.connection.get_mv_tx_id() {
                                 self.connection.auto_commit.store(true, Ordering::SeqCst);
                                 mv_store.rollback_tx(tx_id, pager.clone(), &self.connection);

@@ -852,7 +852,6 @@ fn reopen_database(env: &mut SimulatorEnv) {
     // 1. Close all connections without default checkpoint-on-close behavior
     // to expose bugs related to how we handle WAL
     let mvcc = env.profile.experimental_mvcc;
-    let indexes = env.profile.query.gen_opts.indexes;
     let num_conns = env.connections.len();
     env.connections.clear();
 
@@ -878,7 +877,6 @@ fn reopen_database(env: &mut SimulatorEnv) {
                 turso_core::OpenFlags::default(),
                 turso_core::DatabaseOpts::new()
                     .with_mvcc(mvcc)
-                    .with_indexes(indexes)
                     .with_autovacuum(true),
                 None,
             ) {

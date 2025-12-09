@@ -20,7 +20,7 @@ pub(crate) mod page_cache;
 pub(crate) mod pager;
 #[allow(dead_code)]
 pub(super) mod slot_bitmap;
-pub(crate) mod sqlite3_ondisk;
+pub mod sqlite3_ondisk;
 mod state_machines;
 pub(crate) mod subjournal;
 #[allow(clippy::arc_with_non_send_sync)]

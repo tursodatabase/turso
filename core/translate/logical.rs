@@ -2382,7 +2382,7 @@ mod tests {
     use turso_parser::parser::Parser;
 
     fn create_test_schema() -> Schema {
-        let mut schema = Schema::new(false);
+        let mut schema = Schema::new();
 
         // Create users table
         let users_table = BTreeTable {

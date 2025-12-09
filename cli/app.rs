@@ -69,8 +69,6 @@ pub struct Opts {
     pub experimental_mvcc: bool,
     #[clap(long, help = "Enable experimental views feature")]
     pub experimental_views: bool,
-    #[clap(long, help = "Enable experimental indexing feature")]
-    pub experimental_indexes: Option<bool>,
     #[clap(long, help = "Enable experimental strict schema mode")]
     pub experimental_strict: bool,
     #[clap(short = 't', long, help = "specify output file for log traces")]
@@ -188,13 +186,11 @@ impl Limbo {
             .database
             .as_ref()
             .map_or(":memory:".to_string(), |p| p.to_string_lossy().to_string());
-        let indexes_enabled = opts.experimental_indexes.unwrap_or(true);
 
         let (io, conn) = if db_file.contains([':', '?', '&', '#']) {
             Connection::from_uri(
                 &db_file,
                 DatabaseOpts::new()
-                    .with_indexes(indexes_enabled)
                     .with_mvcc(opts.experimental_mvcc)
                     .with_views(opts.experimental_views)
                     .with_strict(opts.experimental_strict)
@@ -213,7 +209,6 @@ impl Limbo {
                 flags,
                 turso_core::DatabaseOpts::new()
                     .with_mvcc(opts.experimental_mvcc)
-                    .with_indexes(indexes_enabled)
                     .with_views(opts.experimental_views)
                     .with_strict(opts.experimental_strict)
                     .with_encryption(opts.experimental_encryption)
@@ -416,10 +411,7 @@ impl Limbo {
                     _path => get_io(DbLocation::Path, &self.opts.io.to_string())?,
                 }
             };
-            (
-                io.clone(),
-                Database::open_file(io.clone(), path, false, false)?,
-            )
+            (io.clone(), Database::open_file(io.clone(), path, false)?)
         };
         self.io = io;
         self.conn = db.connect()?;
@@ -1763,7 +1755,7 @@ impl Limbo {
             anyhow::bail!("Refusing to overwrite existing file: {output_file}");
         }
         let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new()?);
-        let db = Database::open_file(io.clone(), output_file, false, true)?;
+        let db = Database::open_file(io.clone(), output_file, false)?;
         let target = db.connect()?;
 
         let mut applier = ApplyWriter::new(&target);

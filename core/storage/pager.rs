@@ -14,7 +14,8 @@ use crate::{
     io::CompletionGroup, return_if_io, turso_assert, types::WalFrameInfo, Completion, Connection,
     IOResult, LimboError, Result, TransactionState,
 };
-use crate::{io_yield_one, CompletionError, IOContext, OpenFlags, IO};
+use crate::{io_yield_one, Buffer, CompletionError, IOContext, OpenFlags, IO};
+use arc_swap::ArcSwapOption;
 use parking_lot::{Mutex, RwLock};
 use roaring::RoaringBitmap;
 use std::cell::{RefCell, UnsafeCell};
@@ -25,7 +26,6 @@ use std::sync::atomic::{
 };
 use std::sync::Arc;
 use tracing::{instrument, trace, Level};
-use turso_macros::AtomicEnum;
 
 use super::btree::btree_init_page;
 use super::page_cache::{CacheError, CacheResizeResult, PageCache, PageCacheKey};
@@ -58,8 +58,9 @@ impl HeaderRef {
             tracing::trace!("HeaderRef::from_pager - {:?}", state);
             match state {
                 HeaderRefState::Start => {
-                    if !pager.db_state.get().is_initialized() {
-                        return Err(LimboError::Page1NotAlloc);
+                    // If db is not initialized, return the in-memory page
+                    if let Some(page1) = pager.init_page_1.load_full() {
+                        return Ok(IOResult::Done(Self(page1)));
                     }
 
                     let (page, c) = pager.read_page(DatabaseHeader::PAGE_ID as i64)?;
@@ -98,8 +99,9 @@ impl HeaderRefMut {
             tracing::trace!(?state);
             match state {
                 HeaderRefState::Start => {
-                    if !pager.db_state.get().is_initialized() {
-                        return Err(LimboError::Page1NotAlloc);
+                    // If db is not initialized, return the in-memory page
+                    if let Some(page1) = pager.init_page_1.load_full() {
+                        return Ok(IOResult::Done(Self(page1)));
                     }
 
                     let (page, c) = pager.read_page(DatabaseHeader::PAGE_ID as i64)?;
@@ -417,19 +419,6 @@ impl From<u8> for AutoVacuumMode {
     }
 }
 
-#[derive(Debug, AtomicEnum, Clone, Copy, PartialEq, Eq)]
-pub enum DbState {
-    Uninitialized,
-    Initializing,
-    Initialized,
-}
-
-impl DbState {
-    pub fn is_initialized(&self) -> bool {
-        matches!(self, DbState::Initialized)
-    }
-}
-
 #[derive(Debug, Clone)]
 #[cfg(not(feature = "omit_autovacuum"))]
 enum PtrMapGetState {
@@ -522,10 +511,6 @@ pub struct Pager {
     checkpoint_state: RwLock<CheckpointState>,
     syncing: Arc<AtomicBool>,
     auto_vacuum_mode: AtomicU8,
-    /// 0 -> Database is empty,
-    /// 1 -> Database is being initialized,
-    /// 2 -> Database is initialized and ready for use.
-    pub db_state: Arc<AtomicDbState>,
     /// Mutex for synchronizing database initialization to prevent race conditions
     init_lock: Arc<Mutex<()>>,
     /// The state of the current allocate page operation.
@@ -551,6 +536,8 @@ pub struct Pager {
     pub(crate) io_ctx: RwLock<IOContext>,
     /// encryption is an opt-in feature. we will enable it only if the flag is passed
     enable_encryption: AtomicBool,
+    /// In Memory Page 1 for Empty Dbs
+    init_page_1: Arc<ArcSwapOption<Page>>,
 }
 
 // SAFETY: This needs to be audited for thread safety.
@@ -623,10 +610,10 @@ impl Pager {
         io: Arc<dyn crate::io::IO>,
         page_cache: Arc<RwLock<PageCache>>,
         buffer_pool: Arc<BufferPool>,
-        db_state: Arc<AtomicDbState>,
         init_lock: Arc<Mutex<()>>,
+        init_page_1: Arc<ArcSwapOption<Page>>,
     ) -> Result<Self> {
-        let allocate_page1_state = if !db_state.get().is_initialized() {
+        let allocate_page1_state = if init_page_1.load().is_some() {
             RwLock::new(AllocatePage1State::Start)
         } else {
             RwLock::new(AllocatePage1State::Done)
@@ -650,7 +637,6 @@ impl Pager {
             checkpoint_state: RwLock::new(CheckpointState::Checkpoint),
             buffer_pool,
             auto_vacuum_mode: AtomicU8::new(AutoVacuumMode::None.into()),
-            db_state,
             init_lock,
             allocate_page1_state,
             page_size: AtomicU32::new(0), // 0 means not set
@@ -668,7 +654,12 @@ impl Pager {
             }),
             io_ctx: RwLock::new(IOContext::default()),
             enable_encryption: AtomicBool::new(false),
+            init_page_1,
         })
+    }
+
+    pub fn init_page_1(&self) -> Arc<ArcSwapOption<Page>> {
+        self.init_page_1.clone()
     }
 
     /// Open the subjournal if not yet open.
@@ -775,6 +766,15 @@ impl Pager {
         let subjournal = self.subjournal.read();
         let subjournal = subjournal.as_ref().expect("subjournal must be opened");
         subjournal.stop_use()
+    }
+
+    /// check if subjournal is in use for some statement
+    pub fn subjournal_in_use(&self) -> bool {
+        let subjournal = self.subjournal.read();
+        let Some(subjournal) = subjournal.as_ref() else {
+            return false;
+        };
+        subjournal.in_use()
     }
 
     pub fn open_savepoint(&self, db_size: u32) -> Result<()> {
@@ -1340,10 +1340,21 @@ impl Pager {
         (page_size.get() as usize) - (reserved_space as usize)
     }
 
+    pub fn db_initialized(&self) -> bool {
+        self.init_page_1.load().is_none()
+    }
+
     /// Set the initial page size for the database. Should only be called before the database is initialized
-    pub fn set_initial_page_size(&self, size: PageSize) {
-        assert_eq!(self.db_state.get(), DbState::Uninitialized);
+    pub fn set_initial_page_size(&self, size: PageSize) -> Result<()> {
+        assert!(!self.db_initialized());
+        let IOResult::Done(_) = self.with_header_mut(|header| {
+            header.page_size = size;
+        })?
+        else {
+            panic!("DB should not be initialized and should not do any IO");
+        };
         self.page_size.store(size.get(), Ordering::SeqCst);
+        Ok(())
     }
 
     /// Get the current page size. Returns None if not set yet.
@@ -1436,19 +1447,12 @@ impl Pager {
 
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn maybe_allocate_page1(&self) -> Result<IOResult<()>> {
-        if !self.db_state.get().is_initialized() {
+        if !self.db_initialized() {
             if let Some(_lock) = self.init_lock.try_lock() {
-                match (self.db_state.get(), self.allocating_page1()) {
-                    // In case of being empty or (allocating and this connection is performing allocation) then allocate the first page
-                    (DbState::Uninitialized, false) | (DbState::Initializing, true) => {
-                        if let IOResult::IO(c) = self.allocate_page1()? {
-                            return Ok(IOResult::IO(c));
-                        } else {
-                            return Ok(IOResult::Done(()));
-                        }
-                    }
-                    // Give a chance for the allocation to happen elsewhere
-                    _ => {}
+                if let IOResult::IO(c) = self.allocate_page1()? {
+                    return Ok(IOResult::IO(c));
+                } else {
+                    return Ok(IOResult::Done(()));
                 }
             } else {
                 // Give a chance for the allocation to happen elsewhere
@@ -1944,8 +1948,22 @@ impl Pager {
                     self.commit_info.write().state = CommitState::Checkpoint;
                 }
                 CommitState::Checkpoint => {
-                    match self.checkpoint()? {
-                        IOResult::IO(cmp) => {
+                    match self.checkpoint() {
+                        Err(LimboError::Busy) => {
+                            // Auto-checkpoint during commit uses Passive mode, which can return
+                            // Busy if either:
+                            // 1. Another connection is already checkpointing (checkpoint_lock held)
+                            // 2. A reader is active on read slot 0 (read_locks[0] held)
+                            // In either case, skip the checkpoint and complete the commit. The WAL
+                            // frames are already written, so the commit succeeds. Checkpoint will
+                            // happen later when conditions allow.
+                            tracing::debug!("Auto-checkpoint skipped due to busy (lock conflict)");
+                            let mut commit_info = self.commit_info.write();
+                            commit_info.result = Some(PagerCommitResult::WalWritten);
+                            commit_info.state = CommitState::Done;
+                        }
+                        Err(e) => return Err(e),
+                        Ok(IOResult::IO(cmp)) => {
                             let completion = {
                                 let mut commit_info = self.commit_info.write();
                                 match cmp {
@@ -1962,7 +1980,7 @@ impl Pager {
                             // TODO: remove serialization of checkpoint path
                             io_yield_one!(completion);
                         }
-                        IOResult::Done(res) => {
+                        Ok(IOResult::Done(res)) => {
                             let mut commit_info = self.commit_info.write();
                             commit_info.result = Some(PagerCommitResult::Checkpointed(res));
                             // Skip sync if synchronous mode is OFF
@@ -2390,9 +2408,12 @@ impl Pager {
         let state = self.allocate_page1_state.read().clone();
         match state {
             AllocatePage1State::Start => {
+                assert!(!self.db_initialized());
                 tracing::trace!("allocate_page1(Start)");
-                self.db_state.set(DbState::Initializing);
-                let mut default_header = DatabaseHeader::default();
+
+                let IOResult::Done(mut default_header) = self.with_header(|header| *header)? else {
+                    panic!("DB should not be initialized and should not do any IO");
+                };
 
                 assert_eq!(default_header.database_size.get(), 0);
                 default_header.database_size = 1.into();
@@ -2448,7 +2469,8 @@ impl Pager {
                 cache.insert(page_key, page.clone()).map_err(|e| {
                     LimboError::InternalError(format!("Failed to insert page 1 into cache: {e:?}"))
                 })?;
-                self.db_state.set(DbState::Initialized);
+                // After we wrote the header page, we may now set this None, to signify we initialized
+                self.init_page_1.store(None);
                 *self.allocate_page1_state.write() = AllocatePage1State::Done;
                 Ok(IOResult::Done(page.clone()))
             }
@@ -2857,6 +2879,40 @@ pub fn allocate_new_page(page_id: i64, buffer_pool: &Arc<BufferPool>, offset: us
     page
 }
 
+pub fn default_page1(cipher: Option<&CipherMode>) -> PageRef {
+    // New Database header for empty Database
+    let mut default_header = DatabaseHeader::default();
+
+    if let Some(cipher) = cipher {
+        // we will set the reserved space bytes as required by either the encryption
+        let reserved_space_bytes = cipher.metadata_size() as u8;
+        default_header.reserved_space = reserved_space_bytes;
+    }
+
+    let page = Arc::new(Page::new(DatabaseHeader::PAGE_ID as i64));
+
+    let contents = PageContent::new(
+        0,
+        Arc::new(Buffer::new_temporary(
+            default_header.page_size.get() as usize
+        )),
+    );
+
+    contents.write_database_header(&default_header);
+    page.set_loaded();
+    page.clear_wal_tag();
+    page.get().contents.replace(contents);
+
+    btree_init_page(
+        &page,
+        PageType::TableLeaf,
+        DatabaseHeader::SIZE, // offset of 100 bytes
+        (default_header.page_size.get() - default_header.reserved_space as u32) as usize,
+    );
+
+    page
+}
+
 #[derive(Debug)]
 pub struct CreateBTreeFlags(pub u8);
 impl CreateBTreeFlags {
@@ -3150,8 +3206,8 @@ mod ptrmap_tests {
             io,
             page_cache,
             buffer_pool,
-            Arc::new(AtomicDbState::new(DbState::Uninitialized)),
             Arc::new(Mutex::new(())),
+            Default::default(),
         )
         .unwrap();
         run_until_done(|| pager.allocate_page1(), &pager).unwrap();

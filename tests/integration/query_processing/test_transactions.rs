@@ -778,9 +778,7 @@ fn verify_table_contents(conn: &Arc<Connection>, expected: Vec<i64>) {
 fn test_mvcc_recovery_with_index_and_deletes() {
     let tmp_db = TempDatabase::new_with_opts(
         "test_mvcc_recovery_with_index_and_deletes.db",
-        turso_core::DatabaseOpts::new()
-            .with_mvcc(true)
-            .with_indexes(true),
+        turso_core::DatabaseOpts::new().with_mvcc(true),
     );
     let conn = tmp_db.connect_limbo();
 
@@ -803,9 +801,7 @@ fn test_mvcc_recovery_with_index_and_deletes() {
     // Reopen database (triggers logical log recovery)
     let tmp_db = TempDatabase::new_with_existent_with_opts(
         &path,
-        turso_core::DatabaseOpts::new()
-            .with_mvcc(true)
-            .with_indexes(true),
+        turso_core::DatabaseOpts::new().with_mvcc(true),
     );
     let conn = tmp_db.connect_limbo();
 
@@ -829,9 +825,7 @@ fn test_mvcc_recovery_with_index_and_deletes() {
 fn test_mvcc_checkpoint_before_delete_then_verify_same_session() {
     let tmp_db = TempDatabase::new_with_opts(
         "test_mvcc_checkpoint_before_delete_then_verify_same_session.db",
-        turso_core::DatabaseOpts::new()
-            .with_mvcc(true)
-            .with_indexes(true),
+        turso_core::DatabaseOpts::new().with_mvcc(true),
     );
     let conn = tmp_db.connect_limbo();
 
@@ -852,9 +846,7 @@ fn test_mvcc_checkpoint_before_delete_then_verify_same_session() {
 fn test_mvcc_checkpoint_before_delete_then_reopen() {
     let tmp_db = TempDatabase::new_with_opts(
         "test_mvcc_checkpoint_before_delete_then_reopen.db",
-        turso_core::DatabaseOpts::new()
-            .with_mvcc(true)
-            .with_indexes(true),
+        turso_core::DatabaseOpts::new().with_mvcc(true),
     );
     let conn = tmp_db.connect_limbo();
 
@@ -874,9 +866,7 @@ fn test_mvcc_checkpoint_before_delete_then_reopen() {
 
     let tmp_db = TempDatabase::new_with_existent_with_opts(
         &path,
-        turso_core::DatabaseOpts::new()
-            .with_mvcc(true)
-            .with_indexes(true),
+        turso_core::DatabaseOpts::new().with_mvcc(true),
     );
     let conn = tmp_db.connect_limbo();
 
@@ -887,9 +877,7 @@ fn test_mvcc_checkpoint_before_delete_then_reopen() {
 fn test_mvcc_delete_then_checkpoint_then_verify_same_session() {
     let tmp_db = TempDatabase::new_with_opts(
         "test_mvcc_delete_then_checkpoint_then_verify_same_session.db",
-        turso_core::DatabaseOpts::new()
-            .with_mvcc(true)
-            .with_indexes(true),
+        turso_core::DatabaseOpts::new().with_mvcc(true),
     );
     let conn = tmp_db.connect_limbo();
 
@@ -910,9 +898,7 @@ fn test_mvcc_delete_then_checkpoint_then_verify_same_session() {
 fn test_mvcc_delete_then_checkpoint_then_reopen() {
     let tmp_db = TempDatabase::new_with_opts(
         "test_mvcc_delete_then_checkpoint_then_reopen.db",
-        turso_core::DatabaseOpts::new()
-            .with_mvcc(true)
-            .with_indexes(true),
+        turso_core::DatabaseOpts::new().with_mvcc(true),
     );
     let conn = tmp_db.connect_limbo();
 
@@ -932,9 +918,7 @@ fn test_mvcc_delete_then_checkpoint_then_reopen() {
 
     let tmp_db = TempDatabase::new_with_existent_with_opts(
         &path,
-        turso_core::DatabaseOpts::new()
-            .with_mvcc(true)
-            .with_indexes(true),
+        turso_core::DatabaseOpts::new().with_mvcc(true),
     );
     let conn = tmp_db.connect_limbo();
 
@@ -945,9 +929,7 @@ fn test_mvcc_delete_then_checkpoint_then_reopen() {
 fn test_mvcc_delete_then_reopen_no_checkpoint() {
     let tmp_db = TempDatabase::new_with_opts(
         "test_mvcc_delete_then_reopen_no_checkpoint.db",
-        turso_core::DatabaseOpts::new()
-            .with_mvcc(true)
-            .with_indexes(true),
+        turso_core::DatabaseOpts::new().with_mvcc(true),
     );
     let conn = tmp_db.connect_limbo();
 
@@ -966,9 +948,7 @@ fn test_mvcc_delete_then_reopen_no_checkpoint() {
 
     let tmp_db = TempDatabase::new_with_existent_with_opts(
         &path,
-        turso_core::DatabaseOpts::new()
-            .with_mvcc(true)
-            .with_indexes(true),
+        turso_core::DatabaseOpts::new().with_mvcc(true),
     );
     let conn = tmp_db.connect_limbo();
 
@@ -979,9 +959,7 @@ fn test_mvcc_delete_then_reopen_no_checkpoint() {
 fn test_mvcc_checkpoint_delete_checkpoint_then_verify_same_session() {
     let tmp_db = TempDatabase::new_with_opts(
         "test_mvcc_checkpoint_delete_checkpoint_then_verify_same_session.db",
-        turso_core::DatabaseOpts::new()
-            .with_mvcc(true)
-            .with_indexes(true),
+        turso_core::DatabaseOpts::new().with_mvcc(true),
     );
     let conn = tmp_db.connect_limbo();
 
@@ -1003,9 +981,7 @@ fn test_mvcc_checkpoint_delete_checkpoint_then_verify_same_session() {
 fn test_mvcc_checkpoint_delete_checkpoint_then_reopen() {
     let tmp_db = TempDatabase::new_with_opts(
         "test_mvcc_checkpoint_delete_checkpoint_then_reopen.db",
-        turso_core::DatabaseOpts::new()
-            .with_mvcc(true)
-            .with_indexes(true),
+        turso_core::DatabaseOpts::new().with_mvcc(true),
     );
     let conn = tmp_db.connect_limbo();
 
@@ -1026,9 +1002,7 @@ fn test_mvcc_checkpoint_delete_checkpoint_then_reopen() {
 
     let tmp_db = TempDatabase::new_with_existent_with_opts(
         &path,
-        turso_core::DatabaseOpts::new()
-            .with_mvcc(true)
-            .with_indexes(true),
+        turso_core::DatabaseOpts::new().with_mvcc(true),
     );
     let conn = tmp_db.connect_limbo();
 
@@ -1039,9 +1013,7 @@ fn test_mvcc_checkpoint_delete_checkpoint_then_reopen() {
 fn test_mvcc_index_before_checkpoint_delete_after_checkpoint() {
     let tmp_db = TempDatabase::new_with_opts(
         "test_mvcc_index_before_checkpoint_delete_after_checkpoint.db",
-        turso_core::DatabaseOpts::new()
-            .with_mvcc(true)
-            .with_indexes(true),
+        turso_core::DatabaseOpts::new().with_mvcc(true),
     );
     let conn = tmp_db.connect_limbo();
 
@@ -1061,9 +1033,7 @@ fn test_mvcc_index_before_checkpoint_delete_after_checkpoint() {
 
     let tmp_db = TempDatabase::new_with_existent_with_opts(
         &path,
-        turso_core::DatabaseOpts::new()
-            .with_mvcc(true)
-            .with_indexes(true),
+        turso_core::DatabaseOpts::new().with_mvcc(true),
     );
     let conn = tmp_db.connect_limbo();
 
@@ -1074,9 +1044,7 @@ fn test_mvcc_index_before_checkpoint_delete_after_checkpoint() {
 fn test_mvcc_index_after_checkpoint_delete_after_index() {
     let tmp_db = TempDatabase::new_with_opts(
         "test_mvcc_index_after_checkpoint_delete_after_index.db",
-        turso_core::DatabaseOpts::new()
-            .with_mvcc(true)
-            .with_indexes(true),
+        turso_core::DatabaseOpts::new().with_mvcc(true),
     );
     let conn = tmp_db.connect_limbo();
 
@@ -1096,9 +1064,7 @@ fn test_mvcc_index_after_checkpoint_delete_after_index() {
 
     let tmp_db = TempDatabase::new_with_existent_with_opts(
         &path,
-        turso_core::DatabaseOpts::new()
-            .with_mvcc(true)
-            .with_indexes(true),
+        turso_core::DatabaseOpts::new().with_mvcc(true),
     );
     let conn = tmp_db.connect_limbo();
 
@@ -1109,9 +1075,7 @@ fn test_mvcc_index_after_checkpoint_delete_after_index() {
 fn test_mvcc_multiple_deletes_with_checkpoints() {
     let tmp_db = TempDatabase::new_with_opts(
         "test_mvcc_multiple_deletes_with_checkpoints.db",
-        turso_core::DatabaseOpts::new()
-            .with_mvcc(true)
-            .with_indexes(true),
+        turso_core::DatabaseOpts::new().with_mvcc(true),
     );
     let conn = tmp_db.connect_limbo();
 
@@ -1135,9 +1099,7 @@ fn test_mvcc_multiple_deletes_with_checkpoints() {
 
     let tmp_db = TempDatabase::new_with_existent_with_opts(
         &path,
-        turso_core::DatabaseOpts::new()
-            .with_mvcc(true)
-            .with_indexes(true),
+        turso_core::DatabaseOpts::new().with_mvcc(true),
     );
     let conn = tmp_db.connect_limbo();
 
@@ -1148,9 +1110,7 @@ fn test_mvcc_multiple_deletes_with_checkpoints() {
 fn test_mvcc_no_index_checkpoint_delete_reopen() {
     let tmp_db = TempDatabase::new_with_opts(
         "test_mvcc_no_index_checkpoint_delete_reopen.db",
-        turso_core::DatabaseOpts::new()
-            .with_mvcc(true)
-            .with_indexes(true),
+        turso_core::DatabaseOpts::new().with_mvcc(true),
     );
     let conn = tmp_db.connect_limbo();
 
@@ -1169,9 +1129,7 @@ fn test_mvcc_no_index_checkpoint_delete_reopen() {
 
     let tmp_db = TempDatabase::new_with_existent_with_opts(
         &path,
-        turso_core::DatabaseOpts::new()
-            .with_mvcc(true)
-            .with_indexes(true),
+        turso_core::DatabaseOpts::new().with_mvcc(true),
     );
     let conn = tmp_db.connect_limbo();
 
@@ -1182,9 +1140,7 @@ fn test_mvcc_no_index_checkpoint_delete_reopen() {
 fn test_mvcc_checkpoint_before_insert_delete_after_checkpoint() {
     let tmp_db = TempDatabase::new_with_opts(
         "test_mvcc_checkpoint_before_insert_delete_after_checkpoint.db",
-        turso_core::DatabaseOpts::new()
-            .with_mvcc(true)
-            .with_indexes(true),
+        turso_core::DatabaseOpts::new().with_mvcc(true),
     );
     let conn = tmp_db.connect_limbo();
 
@@ -1212,9 +1168,7 @@ fn test_mvcc_checkpoint_before_insert_delete_after_checkpoint() {
 
     let tmp_db = TempDatabase::new_with_existent_with_opts(
         &path,
-        turso_core::DatabaseOpts::new()
-            .with_mvcc(true)
-            .with_indexes(true),
+        turso_core::DatabaseOpts::new().with_mvcc(true),
     );
     let conn = tmp_db.connect_limbo();
 
@@ -1367,9 +1321,7 @@ fn test_mvcc_dual_seek_interleaved_rows() {
 fn test_mvcc_dual_seek_index_basic() {
     let tmp_db = TempDatabase::new_with_opts(
         "test_mvcc_dual_seek_index_basic.db",
-        turso_core::DatabaseOpts::new()
-            .with_mvcc(true)
-            .with_indexes(true),
+        turso_core::DatabaseOpts::new().with_mvcc(true),
     );
     let conn = tmp_db.connect_limbo();
 
@@ -1392,9 +1344,7 @@ fn test_mvcc_dual_seek_index_basic() {
     // Reopen
     let tmp_db = TempDatabase::new_with_existent_with_opts(
         &path,
-        turso_core::DatabaseOpts::new()
-            .with_mvcc(true)
-            .with_indexes(true),
+        turso_core::DatabaseOpts::new().with_mvcc(true),
     );
     let conn = tmp_db.connect_limbo();
 

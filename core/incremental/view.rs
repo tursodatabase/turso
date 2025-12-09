@@ -1403,7 +1403,7 @@ mod tests {
 
     // Helper function to create a test schema with multiple tables
     fn create_test_schema() -> Schema {
-        let mut schema = Schema::new(false);
+        let mut schema = Schema::new();
 
         // Create customers table
         let customers_table = BTreeTable {

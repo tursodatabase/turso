@@ -45,7 +45,7 @@ use crate::index_method::IndexMethod;
 use crate::schema::Trigger;
 use crate::storage::checksum::CHECKSUM_REQUIRED_RESERVED_BYTES;
 use crate::storage::encryption::AtomicCipherMode;
-use crate::storage::pager::{AutoVacuumMode, HeaderRef};
+use crate::storage::pager::{self, AutoVacuumMode, HeaderRef};
 use crate::translate::display::PlanContext;
 use crate::translate::pragma::TURSO_CDC_DEFAULT_TABLE_NAME;
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
@@ -92,7 +92,6 @@ use storage::database::DatabaseFile;
 pub use storage::database::IOContext;
 pub use storage::encryption::{CipherMode, EncryptionContext, EncryptionKey};
 use storage::page_cache::PageCache;
-use storage::pager::{AtomicDbState, DbState};
 use storage::sqlite3_ondisk::PageSize;
 pub use storage::{
     buffer_pool::BufferPool,
@@ -115,31 +114,15 @@ pub use vdbe::{
 };
 
 /// Configuration for database features
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DatabaseOpts {
     pub enable_mvcc: bool,
-    pub enable_indexes: bool,
     pub enable_views: bool,
     pub enable_strict: bool,
     pub enable_encryption: bool,
     pub enable_index_method: bool,
     pub enable_autovacuum: bool,
     enable_load_extension: bool,
-}
-
-impl Default for DatabaseOpts {
-    fn default() -> Self {
-        Self {
-            enable_mvcc: false,
-            enable_indexes: true,
-            enable_views: false,
-            enable_strict: false,
-            enable_encryption: false,
-            enable_index_method: false,
-            enable_autovacuum: false,
-            enable_load_extension: false,
-        }
-    }
 }
 
 impl DatabaseOpts {
@@ -155,11 +138,6 @@ impl DatabaseOpts {
 
     pub fn with_mvcc(mut self, enable: bool) -> Self {
         self.enable_mvcc = enable;
-        self
-    }
-
-    pub fn with_indexes(mut self, enable: bool) -> Self {
-        self.enable_indexes = enable;
         self
     }
 
@@ -242,12 +220,14 @@ pub struct Database {
     // create DB connections.
     _shared_page_cache: Arc<RwLock<PageCache>>,
     shared_wal: Arc<RwLock<WalFileShared>>,
-    db_state: Arc<AtomicDbState>,
     init_lock: Arc<Mutex<()>>,
     open_flags: Cell<OpenFlags>,
     builtin_syms: RwLock<SymbolTable>,
     opts: DatabaseOpts,
     n_connections: AtomicUsize,
+
+    /// In Memory Page 1 for Empty Dbs
+    init_page_1: Arc<ArcSwapOption<Page>>,
 
     // Encryption
     encryption_key: RwLock<Option<EncryptionKey>>,
@@ -267,10 +247,10 @@ impl fmt::Debug for Database {
             .field("open_flags", &self.open_flags.get());
 
         // Database state information
-        let db_state_value = match self.db_state.get() {
-            DbState::Uninitialized => "uninitialized".to_string(),
-            DbState::Initializing => "initializing".to_string(),
-            DbState::Initialized => "initialized".to_string(),
+        let db_state_value = match &*self.init_page_1.load() {
+            // If init_page1 exists, this means the DB is empty
+            Some(_) => "uninitialized",
+            None => "initialized",
         };
         debug_struct.field("db_state", &db_state_value);
 
@@ -324,11 +304,6 @@ impl Database {
         let mv_store = ArcSwapOption::empty();
 
         let db_size = db_file.size()?;
-        let db_state = if db_size == 0 {
-            DbState::Uninitialized
-        } else {
-            DbState::Initialized
-        };
 
         let shared_page_cache = Arc::new(RwLock::new(PageCache::default()));
         let syms = SymbolTable::new();
@@ -347,23 +322,32 @@ impl Database {
                 (None, None)
             };
 
+        let init_page_1 = if db_size == 0 {
+            let default_page_1 = pager::default_page1(encryption_cipher_mode.as_ref());
+
+            Some(default_page_1)
+        } else {
+            None
+        };
+
         // opts is now passed as parameter
         let db = Database {
             mv_store,
             path: path.into(),
             wal_path: wal_path.into(),
-            schema: Mutex::new(Arc::new(Schema::new(opts.enable_indexes))),
+            schema: Mutex::new(Arc::new(Schema::new())),
             _shared_page_cache: shared_page_cache.clone(),
             shared_wal,
             db_file,
             builtin_syms: syms.into(),
             io: io.clone(),
             open_flags: flags.into(),
-            db_state: Arc::new(AtomicDbState::new(db_state)),
             init_lock: Arc::new(Mutex::new(())),
             opts,
             buffer_pool: BufferPool::begin_init(io, arena_size),
             n_connections: AtomicUsize::new(0),
+
+            init_page_1: Arc::new(ArcSwapOption::new(init_page_1)),
 
             encryption_key: RwLock::new(encryption_key),
             encryption_cipher_mode: AtomicCipherMode::new(
@@ -377,19 +361,12 @@ impl Database {
     }
 
     #[cfg(feature = "fs")]
-    pub fn open_file(
-        io: Arc<dyn IO>,
-        path: &str,
-        enable_mvcc: bool,
-        enable_indexes: bool,
-    ) -> Result<Arc<Database>> {
+    pub fn open_file(io: Arc<dyn IO>, path: &str, enable_mvcc: bool) -> Result<Arc<Database>> {
         Self::open_file_with_flags(
             io,
             path,
             OpenFlags::default(),
-            DatabaseOpts::new()
-                .with_mvcc(enable_mvcc)
-                .with_indexes(enable_indexes),
+            DatabaseOpts::new().with_mvcc(enable_mvcc),
             None,
         )
     }
@@ -413,16 +390,13 @@ impl Database {
         path: &str,
         db_file: Arc<dyn DatabaseStorage>,
         enable_mvcc: bool,
-        enable_indexes: bool,
     ) -> Result<Arc<Database>> {
         Self::open_with_flags(
             io,
             path,
             db_file,
             OpenFlags::default(),
-            DatabaseOpts::new()
-                .with_mvcc(enable_mvcc)
-                .with_indexes(enable_indexes),
+            DatabaseOpts::new().with_mvcc(enable_mvcc),
             None,
         )
     }
@@ -558,35 +532,33 @@ impl Database {
 
         // Check: https://github.com/tursodatabase/turso/pull/1761#discussion_r2154013123
 
-        if db.db_state.get().is_initialized() {
-            // parse schema
-            let conn = db.connect()?;
-            let syms = conn.syms.read();
-            let pager = conn.pager.load().clone();
+        // parse schema
+        let conn = db.connect()?;
+        let syms = conn.syms.read();
+        let pager = conn.pager.load().clone();
 
-            db.with_schema_mut(|schema| {
-                let header_schema_cookie = pager
-                    .io
-                    .block(|| pager.with_header(|header| header.schema_cookie.get()))?;
-                schema.schema_version = header_schema_cookie;
-                let result = schema
-                    .make_from_btree(None, pager.clone(), &syms)
-                    .inspect_err(|_| pager.end_read_tx());
-                match result {
-                    Err(LimboError::ExtensionError(e)) => {
-                        // this means that a vtab exists and we no longer have the module loaded. we print
-                        // a warning to the user to load the module
-                        eprintln!("Warning: {e}");
-                    }
-                    Err(e) => return Err(e),
-                    _ => {}
+        db.with_schema_mut(|schema| {
+            let header_schema_cookie = pager
+                .io
+                .block(|| pager.with_header(|header| header.schema_cookie.get()))?;
+            schema.schema_version = header_schema_cookie;
+            let result = schema
+                .make_from_btree(None, pager.clone(), &syms)
+                .inspect_err(|_| pager.end_read_tx());
+            match result {
+                Err(LimboError::ExtensionError(e)) => {
+                    // this means that a vtab exists and we no longer have the module loaded. we print
+                    // a warning to the user to load the module
+                    eprintln!("Warning: {e}");
                 }
+                Err(e) => return Err(e),
+                _ => {}
+            }
 
-                Ok(())
-            })?;
-        }
+            Ok(())
+        })?;
 
-        if opts.enable_mvcc {
+        if db.mvcc_enabled() {
             let mv_store = db.get_mv_store();
             let mv_store = mv_store.as_ref().unwrap();
             let mvcc_bootstrap_conn = db._connect(true, None)?;
@@ -602,41 +574,39 @@ impl Database {
         pager.enable_encryption(self.opts.enable_encryption);
         let pager = Arc::new(pager);
 
-        if self.db_state.get().is_initialized() {
-            let header_ref = pager.io.block(|| HeaderRef::from_pager(&pager))?;
+        let header_ref = pager.io.block(|| HeaderRef::from_pager(&pager))?;
 
-            let header = header_ref.borrow();
+        let header = header_ref.borrow();
 
-            let mode = if header.vacuum_mode_largest_root_page.get() > 0 {
-                if header.incremental_vacuum_enabled.get() > 0 {
-                    AutoVacuumMode::Incremental
-                } else {
-                    AutoVacuumMode::Full
-                }
+        let mode = if header.vacuum_mode_largest_root_page.get() > 0 {
+            if header.incremental_vacuum_enabled.get() > 0 {
+                AutoVacuumMode::Incremental
             } else {
-                AutoVacuumMode::None
-            };
+                AutoVacuumMode::Full
+            }
+        } else {
+            AutoVacuumMode::None
+        };
 
-            // Force autovacuum to None if the experimental flag is not enabled
-            let final_mode = if !self.opts.enable_autovacuum {
-                if mode != AutoVacuumMode::None {
-                    tracing::warn!(
+        // Force autovacuum to None if the experimental flag is not enabled
+        let final_mode = if !self.opts.enable_autovacuum {
+            if mode != AutoVacuumMode::None {
+                tracing::warn!(
                         "Database has autovacuum enabled but --experimental-autovacuum flag is not set. Forcing autovacuum to None."
                     );
-                }
-                AutoVacuumMode::None
-            } else {
-                mode
-            };
+            }
+            AutoVacuumMode::None
+        } else {
+            mode
+        };
 
-            pager.set_auto_vacuum_mode(final_mode);
+        pager.set_auto_vacuum_mode(final_mode);
 
-            tracing::debug!(
+        tracing::debug!(
                 "Opened existing database. Detected auto_vacuum_mode from header: {:?}, final mode: {:?}",
                 mode,
                 final_mode
             );
-        }
 
         Ok(pager)
     }
@@ -719,8 +689,8 @@ impl Database {
     /// we need to read the page_size from the database header.
     fn read_page_size_from_db_header(&self) -> Result<PageSize> {
         turso_assert!(
-            self.db_state.get().is_initialized(),
-            "read_page_size_from_db_header called on uninitialized database"
+            self.initialized(),
+            "read_reserved_space_bytes_from_db_header called on uninitialized database"
         );
         turso_assert!(
             PageSize::MIN % 512 == 0,
@@ -737,7 +707,7 @@ impl Database {
 
     fn read_reserved_space_bytes_from_db_header(&self) -> Result<u8> {
         turso_assert!(
-            self.db_state.get().is_initialized(),
+            self.initialized(),
             "read_reserved_space_bytes_from_db_header called on uninitialized database"
         );
         turso_assert!(
@@ -773,7 +743,7 @@ impl Database {
                 return Ok(page_size);
             }
         }
-        if self.db_state.get().is_initialized() {
+        if self.initialized() {
             Ok(self.read_page_size_from_db_header()?)
         } else {
             let Some(size) = requested_page_size else {
@@ -789,7 +759,7 @@ impl Database {
     /// if the database is initialized i.e. it exists on disk, return the reserved space bytes from
     /// the header or None
     fn maybe_get_reserved_space_bytes(&self) -> Result<Option<u8>> {
-        if self.db_state.get().is_initialized() {
+        if self.initialized() {
             Ok(Some(self.read_reserved_space_bytes_from_db_header()?))
         } else {
             Ok(None)
@@ -822,11 +792,10 @@ impl Database {
             drop(shared_wal);
 
             let buffer_pool = self.buffer_pool.clone();
-            if self.db_state.get().is_initialized() {
+            if self.initialized() {
                 buffer_pool.finalize_with_page_size(page_size.get() as usize)?;
             }
 
-            let db_state = self.db_state.clone();
             let wal = Rc::new(RefCell::new(WalFile::new(
                 self.io.clone(),
                 self.shared_wal.clone(),
@@ -838,8 +807,8 @@ impl Database {
                 self.io.clone(),
                 Arc::new(RwLock::new(PageCache::default())),
                 buffer_pool.clone(),
-                db_state,
                 self.init_lock.clone(),
+                self.init_page_1.clone(),
             )?;
             pager.set_page_size(page_size);
             if let Some(reserved_bytes) = reserved_bytes {
@@ -860,20 +829,19 @@ impl Database {
 
         let buffer_pool = self.buffer_pool.clone();
 
-        if self.db_state.get().is_initialized() {
+        if self.initialized() {
             buffer_pool.finalize_with_page_size(page_size.get() as usize)?;
         }
 
         // No existing WAL; create one.
-        let db_state = self.db_state.clone();
         let mut pager = Pager::new(
             self.db_file.clone(),
             None,
             self.io.clone(),
             Arc::new(RwLock::new(PageCache::default())),
             buffer_pool.clone(),
-            db_state,
             Arc::new(Mutex::new(())),
+            self.init_page_1.clone(),
         )?;
 
         pager.set_page_size(page_size);
@@ -963,6 +931,11 @@ impl Database {
         Ok((io, db))
     }
 
+    #[inline]
+    pub(crate) fn initialized(&self) -> bool {
+        self.init_page_1.load().is_none()
+    }
+
     pub(crate) fn can_load_extensions(&self) -> bool {
         self.opts.enable_load_extension
     }
@@ -1014,10 +987,6 @@ impl Database {
 
     pub fn mvcc_enabled(&self) -> bool {
         self.opts.enable_mvcc
-    }
-
-    pub fn indexes_enabled(&self) -> bool {
-        self.opts.enable_indexes
     }
 
     #[cfg(feature = "test_helper")]
@@ -1467,7 +1436,7 @@ impl Connection {
             .get();
 
         // create fresh schema as some objects can be deleted
-        let mut fresh = Schema::new(self.schema.read().indexes_enabled);
+        let mut fresh = Schema::new();
         fresh.schema_version = cookie;
 
         // Preserve existing views to avoid expensive repopulation.
@@ -2051,25 +2020,15 @@ impl Connection {
     /// is first created, if it does not already exist when the page_size pragma is issued,
     /// or at the next VACUUM command that is run on the same database connection while not in WAL mode.
     pub fn reset_page_size(&self, size: u32) -> Result<()> {
+        if self.db.initialized() {
+            return Ok(());
+        }
         let Some(size) = PageSize::new(size) else {
             return Ok(());
         };
 
         self.page_size.store(size.get_raw(), Ordering::SeqCst);
-        if self.db.db_state.get() != DbState::Uninitialized {
-            return Ok(());
-        }
-
-        {
-            let mut shared_wal = self.db.shared_wal.write();
-            shared_wal.enabled.store(false, Ordering::SeqCst);
-            shared_wal.file = None;
-        }
-        self.pager.load().clear_page_cache(false);
-        let pager = self.db.init_pager(Some(size.get() as usize))?;
-        pager.enable_encryption(self.db.opts.enable_encryption);
-        self.pager.store(Arc::new(pager));
-        self.pager.load().set_initial_page_size(size);
+        self.pager.load().set_initial_page_size(size)?;
 
         Ok(())
     }
@@ -2226,7 +2185,7 @@ impl Connection {
     }
 
     pub fn is_db_initialized(&self) -> bool {
-        self.db.db_state.get().is_initialized()
+        self.db.initialized()
     }
 
     fn get_pager_from_database_index(&self, index: &usize) -> Arc<Pager> {
@@ -2273,14 +2232,12 @@ impl Connection {
             )));
         }
 
-        let use_indexes = self.db.schema.lock().indexes_enabled();
         let use_mvcc = self.db.get_mv_store().is_some();
         let use_views = self.db.experimental_views_enabled();
         let use_strict = self.db.experimental_strict_enabled();
 
         let db_opts = DatabaseOpts::new()
             .with_mvcc(use_mvcc)
-            .with_indexes(use_indexes)
             .with_views(use_views)
             .with_strict(use_strict);
         let io: Arc<dyn IO> = if path.contains(":memory:") {
@@ -2741,22 +2698,13 @@ impl Statement {
         }
 
         let mut res = if !self.accesses_db {
-            self.program.step(
-                &mut self.state,
-                self.program.connection.mv_store().as_ref(),
-                self.pager.clone(),
-                self.query_mode,
-                waker,
-            )
+            self.program
+                .step(&mut self.state, self.pager.clone(), self.query_mode, waker)
         } else {
             const MAX_SCHEMA_RETRY: usize = 50;
-            let mut res = self.program.step(
-                &mut self.state,
-                self.program.connection.mv_store().as_ref(),
-                self.pager.clone(),
-                self.query_mode,
-                waker,
-            );
+            let mut res =
+                self.program
+                    .step(&mut self.state, self.pager.clone(), self.query_mode, waker);
             for attempt in 0..MAX_SCHEMA_RETRY {
                 // Only reprepare if we still need to update schema
                 if !matches!(res, Err(LimboError::SchemaUpdated)) {
@@ -2764,13 +2712,9 @@ impl Statement {
                 }
                 tracing::debug!("reprepare: attempt={}", attempt);
                 self.reprepare()?;
-                res = self.program.step(
-                    &mut self.state,
-                    self.program.connection.mv_store().as_ref(),
-                    self.pager.clone(),
-                    self.query_mode,
-                    waker,
-                );
+                res =
+                    self.program
+                        .step(&mut self.state, self.pager.clone(), self.query_mode, waker);
             }
             res
         };
@@ -3025,12 +2969,7 @@ impl Statement {
 
     fn reset_internal(&mut self, max_registers: Option<usize>, max_cursors: Option<usize>) {
         // as abort uses auto_txn_cleanup value - it needs to be called before state.reset
-        self.program.abort(
-            self.program.connection.mv_store().as_ref(),
-            &self.pager,
-            None,
-            &mut self.state,
-        );
+        self.program.abort(&self.pager, None, &mut self.state);
         self.state.reset(max_registers, max_cursors);
         self.program.n_change.store(0, Ordering::SeqCst);
         self.busy = false;

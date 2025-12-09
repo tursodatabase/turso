@@ -1050,3 +1050,100 @@ pub fn concurrent_reads_over_single_connection(limbo: TempDatabase) {
         }
     }
 }
+
+#[turso_macros::test]
+pub fn concurrent_commit_and_insert_over_single_connection(limbo: TempDatabase) {
+    let _ = env_logger::try_init();
+    let conn1 = limbo.db.connect().unwrap();
+    conn1.execute("CREATE TABLE t (x);").unwrap();
+
+    conn1.execute("BEGIN").unwrap();
+    let mut stmt1 = conn1
+        .prepare("INSERT INTO t VALUES (1), (2), (3) RETURNING x")
+        .unwrap();
+    loop {
+        match stmt1.step().unwrap() {
+            StepResult::Row => {
+                let mut stmt2 = conn1.prepare("COMMIT").unwrap();
+                let mut busy = false;
+                loop {
+                    match stmt2.step() {
+                        Ok(StepResult::Done) => break,
+                        Ok(StepResult::IO) => stmt2.run_once().unwrap(),
+                        Ok(StepResult::Busy) => {
+                            busy = true;
+                            break;
+                        }
+                        r => panic!("unexpected step result: {r:?}"),
+                    }
+                }
+                assert!(busy);
+            }
+            StepResult::Done => break,
+            StepResult::IO => stmt1.run_once().unwrap(),
+            r => panic!("unexpected step result: {r:?}"),
+        }
+    }
+    assert_eq!(
+        limbo_exec_rows(&limbo, &conn1, "SELECT * FROM t"),
+        vec![
+            vec![rusqlite::types::Value::Integer(1)],
+            vec![rusqlite::types::Value::Integer(2)],
+            vec![rusqlite::types::Value::Integer(3)]
+        ]
+    );
+    conn1.execute("ROLLBACK").unwrap();
+    assert!(limbo_exec_rows(&limbo, &conn1, "SELECT * FROM t").is_empty());
+}
+
+#[turso_macros::test]
+pub fn concurrent_rollback_and_insert_over_single_connection(limbo: TempDatabase) {
+    let _ = env_logger::try_init();
+    let conn1 = limbo.db.connect().unwrap();
+    conn1.execute("CREATE TABLE t (x);").unwrap();
+
+    conn1.execute("BEGIN").unwrap();
+    let mut stmt1 = conn1
+        .prepare("INSERT INTO t VALUES (1), (2), (3) RETURNING x")
+        .unwrap();
+    loop {
+        match stmt1.step().unwrap() {
+            StepResult::Row => {
+                let mut stmt2 = conn1.prepare("ROLLBACK").unwrap();
+                let mut busy = false;
+                loop {
+                    match stmt2.step() {
+                        Ok(StepResult::Done) => break,
+                        Ok(StepResult::IO) => stmt2.run_once().unwrap(),
+                        Ok(StepResult::Busy) => {
+                            busy = true;
+                            break;
+                        }
+                        r => panic!("unexpected step result: {r:?}"),
+                    }
+                }
+                assert!(busy);
+            }
+            StepResult::Done => break,
+            StepResult::IO => stmt1.run_once().unwrap(),
+            r => panic!("unexpected step result: {r:?}"),
+        }
+    }
+    assert_eq!(
+        limbo_exec_rows(&limbo, &conn1, "SELECT * FROM t"),
+        vec![
+            vec![rusqlite::types::Value::Integer(1)],
+            vec![rusqlite::types::Value::Integer(2)],
+            vec![rusqlite::types::Value::Integer(3)]
+        ]
+    );
+    conn1.execute("COMMIT").unwrap();
+    assert_eq!(
+        limbo_exec_rows(&limbo, &conn1, "SELECT * FROM t"),
+        vec![
+            vec![rusqlite::types::Value::Integer(1)],
+            vec![rusqlite::types::Value::Integer(2)],
+            vec![rusqlite::types::Value::Integer(3)]
+        ]
+    );
+}

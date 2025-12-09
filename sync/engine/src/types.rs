@@ -37,9 +37,25 @@ impl From<genawaiter::sync::Co<SyncEngineIoResult, Result<()>>> for Coro<()> {
 
 #[derive(Clone, Debug)]
 pub enum PartialBootstrapStrategy {
-    None,
     Prefix { length: usize },
     Query { query: String },
+}
+
+#[derive(Clone, Debug)]
+pub struct PartialSyncOpts {
+    pub bootstrap_strategy: PartialBootstrapStrategy,
+    pub segment_size: usize,
+    pub speculative_load: bool,
+}
+
+impl PartialSyncOpts {
+    pub fn segment_size(&self) -> usize {
+        if self.segment_size == 0 {
+            128 * 1024
+        } else {
+            self.segment_size
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]

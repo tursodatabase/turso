@@ -132,13 +132,6 @@ pub fn prepare_update_plan(
         bail_parse_error!("table {} may not be modified", table_name);
     }
 
-    if schema.table_has_indexes(&table_name.to_string()) && !schema.indexes_enabled() {
-        // Let's disable altering a table with indices altogether instead of checking column by
-        // column to be extra safe.
-        bail_parse_error!(
-            "UPDATE table disabled for table with indexes is disabled. Omit the `--experimental-indexes=false` flag to enable this feature."
-        );
-    }
     let table = match schema.get_table(table_name.as_str()) {
         Some(table) => table,
         None => bail_parse_error!("Parse error: no such table: {}", table_name),

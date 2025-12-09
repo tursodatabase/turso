@@ -41,6 +41,10 @@ impl Subjournal {
         );
     }
 
+    pub fn in_use(&self) -> bool {
+        self.in_use.load(Ordering::SeqCst)
+    }
+
     pub fn size(&self) -> Result<u64> {
         self.file.size()
     }

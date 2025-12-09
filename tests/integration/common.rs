@@ -75,11 +75,9 @@ impl TempDatabaseBuilder {
     }
 
     pub fn build(self) -> TempDatabase {
-        let opts = self.opts.unwrap_or_else(|| {
-            turso_core::DatabaseOpts::new()
-                .with_indexes(true)
-                .with_encryption(true)
-        });
+        let opts = self
+            .opts
+            .unwrap_or_else(|| turso_core::DatabaseOpts::new().with_encryption(true));
 
         let flags = self.flags.unwrap_or_default();
 
@@ -173,15 +171,9 @@ impl TempDatabase {
         conn
     }
 
-    pub fn limbo_database(&self, enable_indexes: bool) -> Arc<turso_core::Database> {
+    pub fn limbo_database(&self) -> Arc<turso_core::Database> {
         log::debug!("conneting to limbo");
-        Database::open_file(
-            self.io.clone(),
-            self.path.to_str().unwrap(),
-            false,
-            enable_indexes,
-        )
-        .unwrap()
+        Database::open_file(self.io.clone(), self.path.to_str().unwrap(), false).unwrap()
     }
 
     #[allow(dead_code)]
@@ -314,6 +306,52 @@ pub fn limbo_exec_rows(
         rows.push(row);
     }
     rows
+}
+
+/// Like `limbo_exec_rows`, but returns a Result instead of panicking on errors.
+/// Useful for fuzz tests that may generate invalid SQL.
+#[allow(dead_code)]
+pub fn try_limbo_exec_rows(
+    _db: &TempDatabase,
+    conn: &Arc<turso_core::Connection>,
+    query: &str,
+) -> Result<Vec<Vec<rusqlite::types::Value>>, turso_core::LimboError> {
+    let mut stmt = conn.prepare(query)?;
+    let mut rows = Vec::new();
+    'outer: loop {
+        let row = loop {
+            let result = stmt.step()?;
+            match result {
+                turso_core::StepResult::Row => {
+                    let row = stmt.row().unwrap();
+                    break row;
+                }
+                turso_core::StepResult::IO => {
+                    stmt.run_once()?;
+                    continue;
+                }
+
+                turso_core::StepResult::Done => break 'outer,
+                r => {
+                    return Err(turso_core::LimboError::InternalError(format!(
+                        "unexpected result {r:?}: expecting single row"
+                    )))
+                }
+            }
+        };
+        let row = row
+            .get_values()
+            .map(|x| match x {
+                turso_core::Value::Null => rusqlite::types::Value::Null,
+                turso_core::Value::Integer(x) => rusqlite::types::Value::Integer(*x),
+                turso_core::Value::Float(x) => rusqlite::types::Value::Real(*x),
+                turso_core::Value::Text(x) => rusqlite::types::Value::Text(x.as_str().to_string()),
+                turso_core::Value::Blob(x) => rusqlite::types::Value::Blob(x.to_vec()),
+            })
+            .collect();
+        rows.push(row);
+    }
+    Ok(rows)
 }
 
 #[allow(dead_code)]
@@ -771,7 +809,7 @@ mod tests {
         // Open database
         #[allow(clippy::arc_with_non_send_sync)]
         let io: Arc<dyn IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
-        let db = Database::open_file(io, &db_path, false, false)?;
+        let db = Database::open_file(io, &db_path, false)?;
 
         const NUM_CONNECTIONS: usize = 5;
         let mut connections = Vec::new();

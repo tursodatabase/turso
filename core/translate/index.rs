@@ -19,7 +19,6 @@ use crate::translate::insert::format_unique_violation_desc;
 use crate::translate::plan::{
     ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReferences,
 };
-use crate::translate::planner::ROWID_STRS;
 use crate::vdbe::builder::CursorKey;
 use crate::vdbe::insn::{CmpInsFlags, Cookie};
 use crate::vdbe::BranchOffset;
@@ -71,11 +70,6 @@ pub fn translate_create_index(
 
     if tbl_name.eq_ignore_ascii_case("sqlite_sequence") {
         crate::bail_parse_error!("table sqlite_sequence may not be indexed");
-    }
-    if !resolver.schema.indexes_enabled() {
-        crate::bail_parse_error!(
-            "CREATE INDEX is disabled by default. Run with `--experimental-indexes` to enable this feature."
-        );
     }
     if RESERVED_TABLE_PREFIXES
         .iter()
@@ -617,10 +611,9 @@ fn validate_index_expression(expr: &Expr, table: &BTreeTable) -> bool {
         }
         match e {
             Expr::Literal(_) | Expr::RowId { .. } => {}
-            // must be a column of the target table or ROWID
+            // must be a column of the target table
             Expr::Id(n) | Expr::Name(n) => {
-                let n = n.as_str();
-                if !ROWID_STRS.iter().any(|s| s.eq_ignore_ascii_case(n)) && !has_col(n) {
+                if !has_col(n.as_str()) {
                     ok = false;
                 }
             }
@@ -734,11 +727,6 @@ pub fn translate_drop_index(
     if_exists: bool,
     mut program: ProgramBuilder,
 ) -> crate::Result<ProgramBuilder> {
-    if !resolver.schema.indexes_enabled() {
-        crate::bail_parse_error!(
-            "DROP INDEX is disabled by default. Run with `--experimental-indexes` to enable this feature."
-        );
-    }
     let idx_name = normalize_ident(idx_name);
     let opts = crate::vdbe::builder::ProgramBuilderOpts {
         num_cursors: 5,
