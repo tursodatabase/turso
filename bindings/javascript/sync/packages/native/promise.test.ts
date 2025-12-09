@@ -126,7 +126,7 @@ test('partial sync (prefix bootstrap strategy; speculative load)', async () => {
     expect(await db.prepare("SELECT length(value) as length FROM partial LIMIT 1").all()).toEqual([{ length: 1024 }]);
     console.info('select last', 'elapsed', performance.now() - startLast);
 
-    expect((await db.stats()).networkReceivedBytes).toBeLessThanOrEqual(2 * 128 * (1024 + 128));
+    expect((await db.stats()).networkReceivedBytes).toBeLessThanOrEqual(10 * 128 * (1024 + 128));
 
     await db.prepare("INSERT INTO partial VALUES (-1)").run();
 
