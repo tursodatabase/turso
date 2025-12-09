@@ -377,6 +377,14 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
         let last_rowid_in_mvcc_index = self
             .db
             .get_last_table_rowid_without_visibility_check(self.table_id);
+        let incremented_rowid = |rowid: &RowKey| {
+            if rowid.to_int_or_panic() == i64::MAX {
+                return Err(LimboError::InternalError(
+                    "rowid overflow, random rowids not implemented yet".to_string(),
+                ));
+            }
+            Ok(rowid.to_int_or_panic() + 1)
+        };
         match self.current_pos.borrow().clone() {
             CursorPosition::Loaded {
                 row_id,
@@ -392,26 +400,26 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
                 let max_rowid = match last_rowid_in_mvcc_index {
                     Some(k) => {
                         if k.to_int_or_panic() > row_id.row_id.to_int_or_panic() {
-                            k.to_int_or_panic() + 1
+                            incremented_rowid(&k)
                         } else {
-                            row_id.row_id.to_int_or_panic() + 1
+                            incremented_rowid(&row_id.row_id)
                         }
                     }
-                    None => row_id.row_id.to_int_or_panic() + 1,
+                    None => incremented_rowid(&row_id.row_id),
                 };
-                Ok(IOResult::Done(max_rowid))
+                Ok(IOResult::Done(max_rowid?))
             }
             CursorPosition::BeforeFirst => {
                 let res = match last_rowid_in_mvcc_index {
                     None => 1,
-                    Some(k) => k.to_int_or_panic() + 1,
+                    Some(k) => incremented_rowid(&k)?,
                 };
                 Ok(IOResult::Done(res))
             }
             CursorPosition::End => {
                 let res = match last_rowid_in_mvcc_index {
                     None => 1,
-                    Some(k) => k.to_int_or_panic() + 1,
+                    Some(k) => incremented_rowid(&k)?,
                 };
                 Ok(IOResult::Done(res))
             }
