@@ -10,7 +10,7 @@ use crate::{
         assertion::{Bindings, Relation},
         plan::{
             ConnectionState, Interaction, InteractionPlanIterator, InteractionPlanState,
-            InteractionType, ResultSet,
+            InteractionType,
         },
     },
     model::Query,
@@ -175,7 +175,7 @@ pub fn execute_interaction_turso(
         InteractionType::Query(query) => {
             let results = interaction
                 .execute_query(conn)
-                .inspect_err(|err| tracing::error!(?err));
+                .inspect_err(|err| tracing::error!(?interaction, ?err));
 
             if let Err(err) = &results
                 && !interaction.ignore_error

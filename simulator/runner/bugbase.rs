@@ -10,7 +10,7 @@ use anyhow::{Context, anyhow};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{InteractionPlan, Paths};
+use crate::{InteractionPlan, Paths, generation::parser::parse_plan};
 
 use super::cli::SimulatorCLI;
 
@@ -245,23 +245,7 @@ impl BugBase {
                 std::fs::write(&seed_path, seed.to_string())
                     .with_context(|| "should be able to write seed file")?;
 
-                let plan_path = bug_path.join("plan.json");
-                std::fs::write(
-                    &plan_path,
-                    serde_json::to_string_pretty(&bug.plan)
-                        .with_context(|| "should be able to serialize plan")?,
-                )
-                .with_context(|| "should be able to write plan file")?;
-
                 if let Some(shrunk_plan) = &bug.shrunk_plan {
-                    let shrunk_plan_path = bug_path.join("shrunk.json");
-                    std::fs::write(
-                        &shrunk_plan_path,
-                        serde_json::to_string_pretty(shrunk_plan)
-                            .with_context(|| "should be able to serialize shrunk plan")?,
-                    )
-                    .with_context(|| "should be able to write shrunk plan file")?;
-
                     let readable_shrunk_plan_path = bug_path.join("shrunk.sql");
                     std::fs::write(&readable_shrunk_plan_path, shrunk_plan.to_string())
                         .with_context(|| "should be able to write readable shrunk plan file")?;
@@ -291,25 +275,25 @@ impl BugBase {
             None => anyhow::bail!("No bugs found for seed {}", seed),
             Some(Bug::Unloaded { .. }) => {
                 let plan =
-                    std::fs::read_to_string(self.path.join(seed.to_string()).join("test.json"))
+                    std::fs::read_to_string(self.path.join(seed.to_string()).join("test.sql"))
                         .with_context(|| {
                             format!(
                                 "should be able to read plan file at {}",
-                                self.path.join(seed.to_string()).join("test.json").display()
+                                self.path.join(seed.to_string()).join("test.sql").display()
                             )
                         })?;
-                let plan: InteractionPlan = serde_json::from_str(&plan)
-                    .with_context(|| "should be able to deserialize plan")?;
+                let plan: InteractionPlan = parse_plan(plan);
 
-                let shrunk_plan: Option<String> = std::fs::read_to_string(
-                    self.path.join(seed.to_string()).join("shrunk_test.json"),
-                )
-                .with_context(|| "should be able to read shrunk plan file")
-                .and_then(|shrunk| serde_json::from_str(&shrunk).map_err(|e| anyhow!("{}", e)))
-                .ok();
+                let shrunk_plan: Option<String> =
+                    std::fs::read_to_string(self.path.join(seed.to_string()).join("shrunk.sql"))
+                        .with_context(|| "should be able to read shrunk plan file")
+                        .and_then(|shrunk| {
+                            serde_json::from_str(&shrunk).map_err(|e| anyhow!("{}", e))
+                        })
+                        .ok();
 
                 let shrunk_plan: Option<InteractionPlan> =
-                    shrunk_plan.and_then(|shrunk_plan| serde_json::from_str(&shrunk_plan).ok());
+                    shrunk_plan.and_then(|shrunk_plan| Some(parse_plan(shrunk_plan)));
 
                 let runs =
                     std::fs::read_to_string(self.path.join(seed.to_string()).join("runs.json"))

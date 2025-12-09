@@ -15,7 +15,7 @@ use std::any::Any;
 use std::backtrace::Backtrace;
 use std::fs::OpenOptions;
 use std::io::{IsTerminal, Write};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::{Arc, Mutex, mpsc};
 use tracing_subscriber::EnvFilter;
@@ -279,12 +279,7 @@ fn run_simulator(
     let plan = plan.lock().unwrap();
 
     tracing::info!("{}", plan.stats());
-    std::fs::write(env.get_plan_path(), plan.to_string()).unwrap();
-    std::fs::write(
-        env.get_plan_path().with_extension("json"),
-        serde_json::to_string_pretty(&*plan).unwrap(),
-    )
-    .unwrap();
+    std::fs::write(env.get_plan_path(), plan.to_string()).expect("Failed to write plan file");
 
     // No doublecheck, run shrinking if panicking or found a bug.
     match &result {
@@ -494,45 +489,57 @@ fn setup_simulation(
     cli_opts: &SimulatorCLI,
     profile: &Profile,
 ) -> (u64, SimulatorEnv, InteractionPlan) {
-    if let Some(seed) = &cli_opts.load {
-        let seed = seed.parse::<u64>().expect("seed should be a number");
-        let bugbase = bugbase.expect("BugBase must be enabled to load a bug");
-        tracing::info!("seed={}", seed);
-        let bug = bugbase
-            .get_bug(seed)
-            .unwrap_or_else(|| panic!("bug '{seed}' not found in bug base"));
+    if let Some(load) = &cli_opts.load {
+        if let Some(bugbase) = bugbase {
+            let seed = load.parse::<u64>().expect("seed should be a number");
+            tracing::info!("seed={}", seed);
+            let bug = bugbase
+                .get_bug(seed)
+                .unwrap_or_else(|| panic!("bug '{seed}' not found in bug base"));
 
-        let paths = bugbase.paths(seed);
-        if !paths.base.exists() {
-            std::fs::create_dir_all(&paths.base).unwrap();
-        }
-        let env = SimulatorEnv::new(
-            bug.seed(),
-            cli_opts,
-            paths,
-            SimulationType::Default,
-            profile,
-        );
-
-        let plan = match bug {
-            Bug::Loaded(LoadedBug { plan, .. }) => plan.clone(),
-            Bug::Unloaded { seed } => {
-                let seed = *seed;
-                bugbase
-                    .load_bug(seed)
-                    .unwrap_or_else(|_| panic!("could not load bug '{seed}' in bug base"))
-                    .plan
-                    .clone()
+            let paths = bugbase.paths(seed);
+            if !paths.base.exists() {
+                std::fs::create_dir_all(&paths.base).unwrap();
             }
-        };
+            let env = SimulatorEnv::new(
+                bug.seed(),
+                cli_opts,
+                paths,
+                SimulationType::Default,
+                profile,
+            );
 
-        std::fs::write(env.get_plan_path(), plan.to_string()).unwrap();
-        std::fs::write(
-            env.get_plan_path().with_extension("json"),
-            serde_json::to_string_pretty(&plan).unwrap(),
-        )
-        .unwrap();
-        (seed, env, plan)
+            let plan = match bug {
+                Bug::Loaded(LoadedBug { plan, .. }) => plan.clone(),
+                Bug::Unloaded { seed } => {
+                    let seed = *seed;
+                    bugbase
+                        .load_bug(seed)
+                        .unwrap_or_else(|_| panic!("could not load bug '{seed}' in bug base"))
+                        .plan
+                        .clone()
+                }
+            };
+            std::fs::write(env.get_plan_path(), plan.to_string())
+                .expect("Failed to write plan file");
+            (seed, env, plan)
+        } else {
+            let plan = parse_plan_file(&PathBuf::from(load));
+            (
+                0,
+                SimulatorEnv::new(
+                    0,
+                    cli_opts,
+                    Paths {
+                        base: PathBuf::default(),
+                        history: PathBuf::default(),
+                    },
+                    SimulationType::Default,
+                    profile,
+                ),
+                plan,
+            )
+        }
     } else {
         let seed = cli_opts.seed.unwrap_or_else(|| {
             let mut rng = rand::rng();

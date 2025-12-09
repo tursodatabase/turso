@@ -1,3 +1,4 @@
+use core::panic;
 use std::fmt::Display;
 
 pub use ast::Distinctness;
@@ -7,7 +8,7 @@ use serde::{Deserialize, Serialize};
 use turso_parser::ast::{
     self,
     fmt::{BlankContext, ToTokens},
-    SortOrder,
+    OneSelect, SortOrder,
 };
 
 use crate::model::table::{JoinTable, JoinType, JoinedTable, Table};
@@ -39,7 +40,60 @@ impl Display for ResultColumn {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Select {
     pub body: SelectBody,
+    pub order_by: Option<OrderBy>,
     pub limit: Option<usize>,
+}
+
+impl From<turso_parser::ast::Select> for Select {
+    fn from(select: ast::Select) -> Self {
+        Select {
+            body: SelectBody {
+                select: Box::new(SelectInner::from(select.body.select)),
+                compounds: select
+                    .body
+                    .compounds
+                    .into_iter()
+                    .map(|compound| CompoundSelect {
+                        operator: match compound.operator {
+                            ast::CompoundOperator::Union => CompoundOperator::Union,
+                            ast::CompoundOperator::UnionAll => CompoundOperator::UnionAll,
+                            ast::CompoundOperator::Except => todo!(),
+                            ast::CompoundOperator::Intersect => todo!(),
+                        },
+                        select: Box::new(SelectInner::from(compound.select)),
+                    })
+                    .collect(),
+            },
+            order_by: if select.order_by.is_empty() {
+                None
+            } else {
+                Some(OrderBy {
+                    columns: select
+                        .order_by
+                        .into_iter()
+                        .map(|col| {
+                            (
+                                match *col.expr {
+                                    ast::Expr::Id(name) => name,
+                                    _ => panic!("Only column names are supported in ORDER BY"),
+                                }
+                                .to_string(),
+                                match col.order {
+                                    Some(ast::SortOrder::Asc) => SortOrder::Asc,
+                                    Some(ast::SortOrder::Desc) => SortOrder::Desc,
+                                    None => SortOrder::Asc,
+                                },
+                            )
+                        })
+                        .collect(),
+                })
+            },
+            limit: select.limit.map(|l| match *l.expr {
+                ast::Expr::Literal(ast::Literal::Numeric(n)) => n.parse::<usize>().unwrap(),
+                _ => panic!("Only numeric literals are supported in LIMIT"),
+            }),
+        }
+    }
 }
 
 impl Select {
@@ -61,10 +115,10 @@ impl Select {
                     columns: vec![ResultColumn::Expr(expr)],
                     from: None,
                     where_clause: Predicate::true_(),
-                    order_by: None,
                 }),
                 compounds: Vec::new(),
             },
+            order_by: None,
             limit: None,
         }
     }
@@ -86,10 +140,10 @@ impl Select {
                         joins: Vec::new(),
                     }),
                     where_clause,
-                    order_by: None,
                 }),
                 compounds: Vec::new(),
             },
+            order_by: None,
             limit,
         }
     }
@@ -102,6 +156,7 @@ impl Select {
         });
         Select {
             body,
+            order_by: left.order_by.or(right.order_by),
             limit: left.limit.or(right.limit),
         }
     }
@@ -155,8 +210,85 @@ pub struct SelectInner {
     pub from: Option<FromClause>,
     /// `WHERE` clause
     pub where_clause: Predicate,
-    /// `ORDER BY` clause
-    pub order_by: Option<OrderBy>,
+}
+
+fn as_table(select: &ast::SelectTable) -> &ast::QualifiedName {
+    match select {
+        ast::SelectTable::Table(name, _, _) => name,
+        _ => panic!("Expected table in SELECT clause"),
+    }
+}
+
+impl From<OneSelect> for SelectInner {
+    fn from(select: OneSelect) -> Self {
+        match select {
+            OneSelect::Select {
+                distinctness,
+                columns,
+                from,
+                where_clause,
+                group_by: _,
+                window_clause: _,
+            } => SelectInner {
+                distinctness: if distinctness.is_some() {
+                    Distinctness::Distinct
+                } else {
+                    Distinctness::All
+                },
+                columns: columns
+                    .into_iter()
+                    .map(|col| match col {
+                        ast::ResultColumn::Expr(expr, alias) => {
+                            if let Some(alias) = alias {
+                                panic!("Aliases in SELECT columns are not supported: {}", alias);
+                            }
+                            ResultColumn::Expr(Predicate(*expr))
+                        }
+                        ast::ResultColumn::Star => ResultColumn::Star,
+                        ast::ResultColumn::TableStar(name) => {
+                            panic!("Table stars in SELECT columns are not supported: {}", name);
+                        }
+                    })
+                    .collect(),
+                from: from.map(|f| FromClause {
+                    table: as_table(&f.select).to_string(),
+                    joins: f
+                        .joins
+                        .into_iter()
+                        .map(|join| JoinedTable {
+                            table: as_table(&join.table).to_string(),
+                            join_type: match join.operator {
+                                ast::JoinOperator::TypedJoin(Some(ast::JoinType::INNER)) => {
+                                    JoinType::Inner
+                                }
+                                ast::JoinOperator::TypedJoin(Some(ast::JoinType::LEFT)) => {
+                                    JoinType::Left
+                                }
+                                ast::JoinOperator::TypedJoin(Some(ast::JoinType::RIGHT)) => {
+                                    JoinType::Right
+                                }
+                                ast::JoinOperator::TypedJoin(Some(ast::JoinType::OUTER)) => {
+                                    JoinType::Full
+                                }
+                                ast::JoinOperator::TypedJoin(Some(ast::JoinType::CROSS)) => {
+                                    JoinType::Cross
+                                }
+                                _ => panic!("Unsupported join type"),
+                            },
+                            on: Predicate(match join.constraint {
+                                Some(ast::JoinConstraint::On(expr)) => *expr,
+                                _ => panic!("Expected ON constraint in JOIN"),
+                            }),
+                        })
+                        .collect(),
+                }),
+                where_clause: where_clause.map_or(Predicate::true_(), |wc| Predicate(*wc)),
+            },
+            OneSelect::Values(_) => panic!(
+                "Conversion from OneSelect to SelectInner is only valid for OneSelect::Select"
+            ),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -340,8 +472,6 @@ impl Select {
                     .collect(),
             },
             order_by: self
-                .body
-                .select
                 .order_by
                 .as_ref()
                 .map(|o| {

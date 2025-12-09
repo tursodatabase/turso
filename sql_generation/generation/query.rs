@@ -9,7 +9,7 @@ use crate::model::query::select::{
 };
 use crate::model::query::update::Update;
 use crate::model::query::{Create, CreateIndex, Delete, Drop, Insert, Select};
-use crate::model::table::{JoinTable, JoinType, JoinedTable, SimValue, Table, TableContext};
+use crate::model::table::{JoinTable, JoinType, JoinedTable, SimValue, Table, TableContext as _};
 use indexmap::IndexSet;
 use itertools::Itertools;
 use rand::Rng;
@@ -89,45 +89,6 @@ impl Arbitrary for SelectInner {
         let from = FromClause::arbitrary(rng, env);
         let tables = env.tables().clone();
         let join_table = from.into_join_table(&tables);
-        let cuml_col_count = join_table.columns().count();
-
-        let order_by = rng
-            .random_bool(env.opts().query.select.order_by_prob)
-            .then(|| {
-                let order_by_table_candidates = from
-                    .joins
-                    .iter()
-                    .map(|j| &j.table)
-                    .chain(std::iter::once(&from.table))
-                    .collect::<Vec<_>>();
-                let order_by_col_count =
-                    (rng.random::<f64>() * rng.random::<f64>() * (cuml_col_count as f64)) as usize; // skew towards 0
-                if order_by_col_count == 0 {
-                    return None;
-                }
-                let mut col_names = IndexSet::new();
-                let mut order_by_cols = Vec::new();
-                while order_by_cols.len() < order_by_col_count {
-                    let table = pick(&order_by_table_candidates, rng);
-                    let table = tables.iter().find(|t| t.name == table.as_str()).unwrap();
-                    let col = pick(&table.columns, rng);
-                    let col_name = format!("{}.{}", table.name, col.name);
-                    if col_names.insert(col_name.clone()) {
-                        order_by_cols.push((
-                            col_name,
-                            if rng.random_bool(0.5) {
-                                SortOrder::Asc
-                            } else {
-                                SortOrder::Desc
-                            },
-                        ));
-                    }
-                }
-                Some(OrderBy {
-                    columns: order_by_cols,
-                })
-            })
-            .flatten();
 
         SelectInner {
             distinctness: if env.opts().indexes {
@@ -138,7 +99,6 @@ impl Arbitrary for SelectInner {
             columns: vec![ResultColumn::Star],
             from: Some(from),
             where_clause: Predicate::arbitrary_from(rng, env, &join_table),
-            order_by,
         }
     }
 }
@@ -229,19 +189,61 @@ impl Arbitrary for Select {
 
         let num_result_columns = rng.random_range(1..=min_column_count_across_tables);
 
-        let mut first = SelectInner::arbitrary_sized(rng, env, num_result_columns);
+        let first = SelectInner::arbitrary_sized(rng, env, num_result_columns);
 
-        let mut rest: Vec<SelectInner> = (0..num_compound_selects)
+        let rest: Vec<SelectInner> = (0..num_compound_selects)
             .map(|_| SelectInner::arbitrary_sized(rng, env, num_result_columns))
             .collect();
 
-        if !rest.is_empty() {
-            // ORDER BY is not supported in compound selects yet
-            first.order_by = None;
-            for s in &mut rest {
-                s.order_by = None;
-            }
-        }
+        let order_by = if rest.is_empty() {
+            rng.random_bool(env.opts().query.select.order_by_prob)
+                .then(|| {
+                    let from = first
+                        .from
+                        .as_ref()
+                        .expect("All select queries have FROM clauses");
+                    let order_by_table_candidates = from
+                        .joins
+                        .iter()
+                        .map(|j| &j.table)
+                        .chain(std::iter::once(&from.table))
+                        .collect::<Vec<_>>();
+                    let tables = env.tables().clone();
+                    let join_table = from.clone().into_join_table(&tables);
+
+                    let cuml_col_count = join_table.columns().count();
+                    let order_by_col_count =
+                        (rng.random::<f64>() * rng.random::<f64>() * (cuml_col_count as f64))
+                            as usize; // skew towards 0
+                    if order_by_col_count == 0 {
+                        return None;
+                    }
+                    let mut col_names = IndexSet::new();
+                    let mut order_by_cols = Vec::new();
+                    while order_by_cols.len() < order_by_col_count {
+                        let table = pick(&order_by_table_candidates, rng);
+                        let table = tables.iter().find(|t| t.name == table.as_str()).unwrap();
+                        let col = pick(&table.columns, rng);
+                        let col_name = format!("{}.{}", table.name, col.name);
+                        if col_names.insert(col_name.clone()) {
+                            order_by_cols.push((
+                                col_name,
+                                if rng.random_bool(0.5) {
+                                    SortOrder::Asc
+                                } else {
+                                    SortOrder::Desc
+                                },
+                            ));
+                        }
+                    }
+                    Some(OrderBy {
+                        columns: order_by_cols,
+                    })
+                })
+                .flatten()
+        } else {
+            None
+        };
 
         Self {
             body: SelectBody {
@@ -254,6 +256,7 @@ impl Arbitrary for Select {
                     })
                     .collect(),
             },
+            order_by,
             limit: None,
         }
     }

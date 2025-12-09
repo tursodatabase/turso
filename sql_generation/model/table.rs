@@ -1,8 +1,8 @@
 use std::{fmt::Display, hash::Hash, ops::Deref};
 
 use serde::{Deserialize, Serialize};
-use turso_core::{numeric::Numeric, types};
-use turso_parser::ast;
+use turso_core::{numeric::Numeric, types, Value};
+use turso_parser::ast::{self, Expr, UnaryOperator};
 
 use crate::model::query::predicate::Predicate;
 
@@ -198,6 +198,29 @@ impl SimValue {
     }
     pub fn blob(b: Vec<u8>) -> Self {
         Self(types::Value::Blob(b))
+    }
+}
+
+impl From<Expr> for SimValue {
+    fn from(expr: Expr) -> Self {
+        match expr {
+            Expr::Literal(literal) => SimValue::from(literal),
+            Expr::Unary(UnaryOperator::Negative, e) => match *e {
+                Expr::Literal(literal) => match SimValue::from(literal).0 {
+                    Value::Integer(i) => SimValue(Value::Integer(-i)),
+                    Value::Float(f) => SimValue(Value::Float(-f)),
+                    other => {
+                        todo!("Only integer and float literals can be negated in INSERT VALUES, got: {other:?}")
+                    }
+                },
+                other => {
+                    todo!("Only literal values are supported in INSERT VALUES, got expr: {other:?}")
+                }
+            },
+            _ => {
+                todo!("Only literal values are supported in INSERT VALUES, got expr: {expr:?}")
+            }
+        }
     }
 }
 

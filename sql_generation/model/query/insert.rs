@@ -1,6 +1,10 @@
-use std::fmt::Display;
+use std::{fmt::Display, panic};
 
 use serde::{Deserialize, Serialize};
+
+use turso_parser::ast::{
+    InsertBody, Name, QualifiedName, ResolveType, ResultColumn, With,
+};
 
 use crate::model::table::SimValue;
 
@@ -16,6 +20,72 @@ pub enum Insert {
         table: String,
         select: Box<Select>,
     },
+}
+
+impl
+    From<(
+        Option<With>,
+        Option<ResolveType>,
+        QualifiedName,
+        Vec<Name>,
+        InsertBody,
+        Vec<ResultColumn>,
+    )> for Insert
+{
+    fn from(
+        (with, or_conflict, tbl_name, columns, body, returning): (
+            Option<With>,
+            Option<ResolveType>,
+            QualifiedName,
+            Vec<Name>,
+            InsertBody,
+            Vec<ResultColumn>,
+        ),
+    ) -> Self {
+        if with.is_some() {
+            panic!("WITH clause in INSERT not supported");
+        }
+        if or_conflict.is_some() {
+            panic!("OR CONFLICT clause in INSERT not supported");
+        }
+
+        if !returning.is_empty() {
+            panic!("RETURNING clause in INSERT not supported");
+        }
+
+        if columns.len() > 0 {
+            panic!("Specifying column names in INSERT not supported");
+        }
+
+        match body {
+            InsertBody::Select(select, upsert) => {
+                if upsert.is_some() {
+                    panic!("UPSERT in INSERT SELECT not supported");
+                }
+                match &select.body.select {
+                    turso_parser::ast::OneSelect::Select { .. } => Insert::Select {
+                        table: tbl_name.to_string(),
+                        select: Box::new(select.into()),
+                    },
+                    turso_parser::ast::OneSelect::Values(items) => {
+                        let mut values = Vec::new();
+                        for item in items {
+                            let row = item
+                                .into_iter()
+                                .map(|expr| SimValue::from(*expr.clone()))
+                                .collect();
+                            values.push(row);
+                        }
+                        Insert::Values {
+                            table: tbl_name.to_string(),
+                            values,
+                        }
+                    }
+                }
+            }
+            InsertBody::DefaultValues => panic!("DEFAULT VALUES in INSERT not supported"),
+        }
+    }
 }
 
 impl Insert {

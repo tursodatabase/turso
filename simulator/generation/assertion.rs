@@ -1,5 +1,4 @@
 use anyhow::{Result as AnyResult, anyhow};
-use serde::{Deserialize, Serialize};
 use sql_generation::model::table::SimValue;
 use std::collections::{HashMap, HashSet};
 use std::fmt::{self, Display, Formatter};

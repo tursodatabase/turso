@@ -19,6 +19,51 @@ impl Update {
     }
 }
 
+impl From<turso_parser::ast::Update> for Update {
+    fn from(update: turso_parser::ast::Update) -> Self {
+        if update.with.is_some() {
+            todo!("WITH clause in UPDATE not supported");
+        }
+        if update.or_conflict.is_some() {
+            todo!("OR CONFLICT clause in UPDATE not supported");
+        }
+        if update.indexed.is_some() {
+            todo!("INDEXED BY clause in UPDATE not supported");
+        }
+        if !update.returning.is_empty() {
+            todo!("RETURNING clause in UPDATE not supported");
+        }
+        if !update.order_by.is_empty() {
+            todo!("ORDER BY clause in UPDATE not supported");
+        }
+        if update.limit.is_some() {
+            todo!("LIMIT clause in UPDATE not supported");
+        }
+
+        Update {
+            table: update.tbl_name.to_string(),
+            set_values: update
+                .sets
+                .into_iter()
+                .map(|set_clause| {
+                    let value = SimValue::from(*set_clause.expr);
+                    let col_name = set_clause.col_names[0].to_string();
+                    if set_clause.col_names.len() > 1 {
+                        todo!(
+                            "Only single column names are supported in UPDATE SET clauses, got {}",
+                            set_clause.col_names.len()
+                        );
+                    }
+                    (col_name, value)
+                })
+                .collect(),
+            predicate: update
+                .where_clause
+                .map_or(Predicate::true_(), |wc| Predicate(*wc)),
+        }
+    }
+}
+
 impl Display for Update {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "UPDATE {} SET ", self.table)?;

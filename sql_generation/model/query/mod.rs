@@ -5,6 +5,10 @@ pub use drop::Drop;
 pub use drop_index::DropIndex;
 pub use insert::Insert;
 pub use select::Select;
+pub use transaction::Begin;
+pub use transaction::Commit;
+pub use transaction::Rollback;
+pub use update::Update;
 
 pub mod create;
 pub mod create_index;

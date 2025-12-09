@@ -17,7 +17,7 @@ use turso_parser::ast::{self, Distinctness, Expr, Name};
 
 use crate::{
     generation::{
-        assertion::{Assertion, CmpOp, Col, CountExpr, RelExpr, RelVar},
+        assertion::{Assertion, CmpOp, Col, CountExpr, RelExpr},
         plan::{Control, InteractionType},
     },
     model::Query,
@@ -324,8 +324,9 @@ impl Property {
                 row_index,
                 queries,
                 select,
-                interactive,
+                interactive: _,
             } => {
+                // FIXME: Use interactive
                 let (table, values) = if let Insert::Values { table, values } = insert {
                     (table, values)
                 } else {
@@ -685,7 +686,6 @@ impl Property {
                             columns: select.body.select.columns.clone(),
                             from: select.body.select.from.clone(),
                             where_clause: p_true,
-                            order_by: None,
                         }),
                         compounds: vec![
                             CompoundSelect {
@@ -695,7 +695,6 @@ impl Property {
                                     columns: select.body.select.columns.clone(),
                                     from: select.body.select.from.clone(),
                                     where_clause: p_false,
-                                    order_by: None,
                                 }),
                             },
                             CompoundSelect {
@@ -705,11 +704,11 @@ impl Property {
                                     columns: select.body.select.columns.clone(),
                                     from: select.body.select.from.clone(),
                                     where_clause: p_null,
-                                    order_by: None,
                                 }),
                             },
                         ],
                     },
+                    order_by: select.order_by.clone(),
                     limit: None,
                 };
                 let sel_tlp = Query::Select(select_tlp);
