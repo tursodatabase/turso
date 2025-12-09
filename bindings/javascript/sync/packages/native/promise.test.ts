@@ -13,6 +13,40 @@ function cleanup(path) {
     try { unlinkSync(`${path}-wal-revert`) } catch (e) { }
 }
 
+test('partial sync concurrency', async () => {
+    {
+        const db = await connect({
+            path: ':memory:',
+            url: process.env.VITE_TURSO_DB_URL,
+            longPollTimeoutMs: 100,
+        });
+        await db.exec("CREATE TABLE IF NOT EXISTS partial(value BLOB)");
+        await db.exec("DELETE FROM partial");
+        await db.exec("INSERT INTO partial SELECT randomblob(1024) FROM generate_series(1, 2000)");
+        await db.push();
+        await db.close();
+    }
+
+    const dbs = [];
+    for (let i = 0; i < 16; i++) {
+        dbs.push(await connect({
+            path: 'partial-1.db',
+            url: process.env.VITE_TURSO_DB_URL,
+            longPollTimeoutMs: 100,
+            partialSync: {
+                bootstrapStrategy: { kind: 'prefix', length: 128 * 1024 },
+                segmentSize: 128 * 1024,
+            },
+        }));
+    }
+    const qs = [];
+    for (const db of dbs) {
+        qs.push(db.prepare("SELECT COUNT(*) as cnt FROM partial").all());
+    }
+    const values = await Promise.all(qs);
+    expect(values).toEqual(new Array(16).fill([{ cnt: 2000 }]))
+})
+
 test('partial sync (prefix bootstrap strategy)', async () => {
     {
         const db = await connect({
