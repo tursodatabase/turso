@@ -26,28 +26,34 @@ do_execsql_test_on_specific_db {:memory:} analyze-overwrites {
   SELECT * FROM sqlite_stat1;
 } {temp||2}
 
-# Things that don't work:
-
-do_execsql_test_in_memory_error analyze-all-databases-fails {
+do_execsql_test_on_specific_db {:memory:} analyze-all {
+  create table t(a, b);
+  insert into t values(1, 2);
   ANALYZE;
-} {.*ANALYZE.*not supported.*}
+  SELECT * FROM sqlite_stat1;
+} {t||1}
 
-do_execsql_test_in_memory_error analyze-one-database-fails {
-  ANALYZE main;
-} {.*ANALYZE.*not supported.*}
-
-do_execsql_test_in_memory_error analyze-table-with-pk-fails {
+do_execsql_test_on_specific_db {:memory:} analyze-table-with-pk {
   CREATE TABLE temp (a integer primary key);
+  INSERT INTO temp VALUES (1);
   ANALYZE temp;
-} {.*ANALYZE.*not supported.*}
+  SELECT * FROM sqlite_stat1;
+} {temp||1}
 
+do_execsql_test_on_specific_db {:memory:} analyze-one-database {
+  ANALYZE main;
+} {}
+
+do_execsql_test_on_specific_db {:memory:} analyze-index {
+  CREATE TABLE temp (a integer, b integer);
+  CREATE INDEX temp_b ON temp (b);
+  INSERT INTO temp select value, value + 1 from generate_series(1,100);
+  ANALYZE temp_b;
+  SELECT idx, stat FROM sqlite_stat1 where idx = 'temp_b';
+} {{temp_b|100 100}}
+
+# Things that don't work:
 do_execsql_test_in_memory_error analyze-table-without-rowid-fails {
   CREATE TABLE temp (a integer primary key) WITHOUT ROWID;
   ANALYZE temp;
-} {.*ANALYZE.*not supported.*}
-
-do_execsql_test_in_memory_error analyze-index-fails {
-  CREATE TABLE temp (a integer, b integer);
-  CREATE INDEX temp_b ON temp (b);
-  ANALYZE temp_b;
 } {.*ANALYZE.*not supported.*}
