@@ -548,7 +548,7 @@ pub trait CursorTrait: Any {
     fn get_index_info(&self) -> &IndexInfo;
 
     fn seek_end(&mut self) -> Result<IOResult<()>>;
-    fn seek_to_last(&mut self) -> Result<IOResult<()>>;
+    fn seek_to_last(&mut self, always_seek: bool) -> Result<IOResult<()>>;
 
     // --- start: BTreeCursor specific functions ----
     fn invalidate_record(&mut self);
@@ -1410,19 +1410,24 @@ impl BTreeCursor {
 
     /// Move the cursor to the rightmost record in the btree.
     #[instrument(skip(self), level = Level::DEBUG)]
-    fn move_to_rightmost(&mut self) -> Result<IOResult<bool>> {
+    fn move_to_rightmost(&mut self, always_seek: bool) -> Result<IOResult<bool>> {
         loop {
             let (move_to_right_state, rightmost_page_id) = &self.move_to_right_state;
             match *move_to_right_state {
                 MoveToRightState::Start => {
-                    if let Some(rightmost_page_id) = rightmost_page_id {
-                        // If we know the rightmost page and are already on it, we can skip a seek.
-                        let current_page = self.stack.top_ref();
-                        if current_page.get().id == *rightmost_page_id {
-                            let contents = current_page.get_contents();
-                            let cell_count = contents.cell_count();
-                            self.stack.set_cell_index(cell_count as i32 - 1);
-                            return Ok(IOResult::Done(cell_count > 0));
+                    if !always_seek {
+                        if let Some(rightmost_page_id) = rightmost_page_id {
+                            // If we know the rightmost page and are already on it, we can skip a seek.
+                            // This optimization is never performed if always_seek = true. always_seek is used
+                            // in cases where we cannot be sure that the btree wasn't modified from under us
+                            // e.g. by a trigger subprogram.
+                            let current_page = self.stack.top_ref();
+                            if current_page.get().id == *rightmost_page_id {
+                                let contents = current_page.get_contents();
+                                let cell_count = contents.cell_count();
+                                self.stack.set_cell_index(cell_count as i32 - 1);
+                                return Ok(IOResult::Done(cell_count > 0));
+                            }
                         }
                     }
                     let rightmost_page_id = *rightmost_page_id;
@@ -4919,7 +4924,8 @@ impl CursorTrait for BTreeCursor {
 
     #[instrument(skip_all, level = Level::DEBUG)]
     fn last(&mut self) -> Result<IOResult<()>> {
-        let cursor_has_record = return_if_io!(self.move_to_rightmost());
+        let always_seek = false;
+        let cursor_has_record = return_if_io!(self.move_to_rightmost(always_seek));
         self.has_record.replace(cursor_has_record);
         self.invalidate_record();
         Ok(IOResult::Done(()))
@@ -5685,11 +5691,11 @@ impl CursorTrait for BTreeCursor {
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
-    fn seek_to_last(&mut self) -> Result<IOResult<()>> {
+    fn seek_to_last(&mut self, always_seek: bool) -> Result<IOResult<()>> {
         loop {
             match self.seek_to_last_state {
                 SeekToLastState::Start => {
-                    let has_record = return_if_io!(self.move_to_rightmost());
+                    let has_record = return_if_io!(self.move_to_rightmost(always_seek));
                     self.invalidate_record();
                     self.has_record.replace(has_record);
                     if !has_record {

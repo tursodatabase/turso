@@ -1558,7 +1558,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
         }
     }
 
-    fn seek_to_last(&mut self) -> Result<IOResult<()>> {
+    fn seek_to_last(&mut self, _always_seek: bool) -> Result<IOResult<()>> {
         self.invalidate_record();
         let max_rowid = RowID {
             table_id: self.table_id,

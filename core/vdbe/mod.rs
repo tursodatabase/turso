@@ -762,7 +762,10 @@ pub struct Program {
     /// is determined by the parser flags "mayAbort" and "isMultiWrite". Essentially this means that the individual
     /// statement may need to be aborted due to a constraint conflict, etc. instead of the entire transaction.
     pub needs_stmt_subtransactions: bool,
+    /// If this Program is a trigger subprogram, a ref to the trigger is stored here.
     pub trigger: Option<Arc<Trigger>>,
+    /// Whether the program contains any trigger subprograms.
+    pub contains_trigger_subprograms: bool,
     pub resolve_type: ResolveType,
     pub explain_state: RwLock<ExplainState>,
 }

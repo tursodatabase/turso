@@ -872,6 +872,76 @@ fn test_trigger_with_multiple_statements(db: TempDatabase) {
     assert_eq!(audit_results[1], "Balance changed for account 2");
 }
 
+#[turso_macros::test()]
+/// This test input used to cause corruption (https://github.com/tursodatabase/turso/issues/4017)
+fn test_trigger_self_insert_regression(db: TempDatabase) -> anyhow::Result<()> {
+    let conn = db.connect_limbo();
+
+    // Create a table
+    conn.execute(
+        "CREATE TABLE spellbinding_occupation_9 (
+            fearless_reitman_10 REAL,
+            affectionate_lacazeduthiers_11 INTEGER,
+            thoughtful_hunt_12 TEXT,
+            outstanding_gorman_13 BLOB,
+            rousing_mutualistsorg_14 REAL,
+            brilliant_heller_15 INTEGER,
+            sleek_minyi_16 REAL,
+            technological_propos_17 TEXT,
+            fantastic_hewetson_18 BLOB
+        )",
+    )?;
+
+    conn.execute(
+        "CREATE TRIGGER trigger_spellbinding_occupation_9_3199742326
+         BEFORE INSERT ON spellbinding_occupation_9
+         BEGIN
+             INSERT INTO spellbinding_occupation_9
+                 SELECT * FROM spellbinding_occupation_9 WHERE (TRUE);
+         END",
+    )?;
+
+    conn.execute(
+        "INSERT INTO spellbinding_occupation_9 VALUES
+        (4424809535.610264, -578783662584182030, 'diplomatic_heredia', X'706C75636B795F626167696E736B69', -8706666618.225624, 308424772820097370, 8891353023.855804, 'excellent_mccarthy', X'616D617A696E675F6C616E65'),
+        (6256766006.928358, 8443373764808777983, 'rousing_abacus', X'676C696D6D6572696E675F7A6971', -2628193223.9937954, 3459210825691415951, -295951398.30797577, 'kind_sharp', X'6C6F76696E675F656D6D61')"
+    )?;
+
+    conn.execute(
+        "INSERT INTO spellbinding_occupation_9 VALUES
+        (-6800098379.631634, 2482803385035812249, 'flexible_pentecost', X'6D6F76696E675F776F6F64776F726B', -5101433261.720527, -3567788410267959713, -8073502947.6008835, 'glistening_fulano', X'636F75726167656F75735F6B616C65'),
+        (3306794031.008669, 6427602129275079032, 'wondrous_monaghan', X'64696C6967656E745F7363687761727A', 9631408519.53051, -1684447188648680268, 3252650683.341938, 'optimistic_nappalos', X'656C6567616E745F73746F776173736572')"
+    )?;
+
+    conn.execute(
+        "INSERT INTO spellbinding_occupation_9 VALUES
+        (7767161224.622696, -1743571527922740251, 'adaptable_reo', X'6D61676E69666963656E745F70617472697A6961', 4518833159.836601, 7745538090405886344, -5362785860.664702, 'qualified_hakiel', X'656E6761676966755F6E75727365'),
+        (7238299930.889935, -6905021346313814225, 'sincere_aman', X'666162756C6F75735F73616D75647A69', 1746051365.7113361, 8456865750190177515, -9173223276.743935, 'spectacular_mogutin', X'6C696B61626C655F636C61726B'),
+        (2386990685.0495243, 6605207765674540892, 'courageous_knabb', X'696E646570656E64656E745F726462', -1220491985.740755, -7244471264718141981, -4274556067.547324, 'thoughtful_enckell', X'70726F647563746976655F7261736B696E'),
+        (3760241384.9700813, 7633896663664778180, 'spectacular_preti', X'64696C6967656E745F6B657272', 3129288675.6782093, 6385161053648972070, 5783058869.993795, 'resourceful_russo', X'7368696D6D6572696E675F64617669646E65656C'),
+        (9654906624.491634, 5240627906285380382, 'spellbinding_submedia', X'6C6F76656C795F726F6F73', -620764284.3328953, -4506780404010403369, 4642790445.595289, 'shimmering_stirner', X'746563686E6F6C6F676963616C5F68756D616E')"
+    )?;
+
+    // Run integrity check using rusqlite to verify database is not corrupted
+    let rusqlite_conn = rusqlite::Connection::open(db.path.clone())?;
+    let mut stmt = rusqlite_conn.prepare("PRAGMA integrity_check")?;
+    let mut rows = stmt.query([])?;
+
+    let mut results = Vec::new();
+    while let Some(row) = rows.next()? {
+        let result: String = row.get(0)?;
+        results.push(result);
+    }
+
+    assert_eq!(results.len(), 1);
+    assert_eq!(
+        results[0], "ok",
+        "Database integrity check failed: {results:?}",
+    );
+
+    Ok(())
+}
+
 #[turso_macros::test(mvcc)]
 fn test_alter_table_drop_column_fails_when_trigger_references_new_column(db: TempDatabase) {
     let conn = db.connect_limbo();
