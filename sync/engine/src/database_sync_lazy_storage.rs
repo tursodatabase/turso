@@ -15,24 +15,38 @@ use crate::{
     types::{Coro, PartialSyncOpts},
 };
 
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-enum PageState {
-    Loading,
-    Writing,
-}
-
-struct PageInfo {
-    state: PageState,
-    result: Option<Result<Vec<u8>, errors::Error>>,
-    waits: usize,
-}
-
+/// [PageStates] holds information about active operations with pages in the [LazyDatabaseStorage]
 struct PageStates {
+    /// HashMap from page number (zero-based) to the [PageInfo]
     pages: HashMap<usize, PageInfo>,
 }
 
-enum PageLoadAction {
+/// [PageInfo] holds information about page state with some active operation
+///
+/// Page loading process implemented with deduplication logic,
+/// so that if some request want to load page which is already Loading,
+/// then it just "subscribe" to the result and wait for anothe operation to complete.
+struct PageInfo {
+    /// current active operation (operations are mutually exclusive)
+    operation: PageOperation,
+    /// result of the [PageOperation::Load] operation
+    load_result: Option<Result<Vec<u8>, errors::Error>>,
+    /// amount of "subscribers" who waits result of the [PageOperation::Load] operation
+    load_waits: usize,
+}
+
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum PageOperation {
+    /// Load operation triggered during read from the db file
     Load,
+    /// Write operation triggered during write (checkpoint) to the db file
+    Write,
+}
+
+enum PageLoadAction {
+    /// Caller must load the page
+    Load,
+    /// Caller must wait for the load operation result
     Wait,
 }
 
@@ -42,6 +56,8 @@ impl PageStates {
             pages: HashMap::new(),
         }
     }
+    /// try to start Write opreation for the page
+    /// returns Err(...) if another operation already started (Load or Write)
     pub fn write_start(&mut self, page_no: usize) -> Result<(), errors::Error> {
         if self.pages.contains_key(&page_no) {
             return Err(errors::Error::DatabaseSyncEngineError(format!(
@@ -49,32 +65,37 @@ impl PageStates {
             )));
         }
         let info = PageInfo {
-            state: PageState::Writing,
-            result: None,
-            waits: 0,
+            operation: PageOperation::Write,
+            load_result: None,
+            load_waits: 0,
         };
         self.pages.insert(page_no, info);
         Ok(())
     }
+    /// finish Write operation previously started with [Self::write_start]
     pub fn write_end(&mut self, page_no: usize) {
         let Some(info) = self.pages.remove(&page_no) else {
             panic!("page state must be set before write_end");
         };
-        assert_eq!(info.state, PageState::Writing);
-        assert_eq!(info.waits, 0);
-        assert!(info.result.is_none());
+        assert_eq!(info.operation, PageOperation::Write);
+        assert_eq!(info.load_waits, 0);
+        assert!(info.load_result.is_none());
     }
+    /// try to start Load operation for the page
+    /// returns Err(...) if Write operation is on-going
+    /// returns Ok(PageLoadAction::Load) if this page wasn't active before and caller must start load process
+    /// returns Ok(PageLoadAction::Wait) if this page already loading and caller just needs to wait for result
     pub fn load_start(&mut self, page_no: usize) -> Result<PageLoadAction, errors::Error> {
         match self.pages.get_mut(&page_no) {
             Some(PageInfo {
-                state: PageState::Writing,
+                operation: PageOperation::Write,
                 ..
             }) => Err(errors::Error::DatabaseSyncEngineError(format!(
                 "unable to get load lock: page {page_no} already buys"
             ))),
             Some(PageInfo {
-                state: PageState::Loading,
-                waits: ref mut subscribers,
+                operation: PageOperation::Load,
+                load_waits: ref mut subscribers,
                 ..
             }) => {
                 *subscribers += 1;
@@ -82,43 +103,49 @@ impl PageStates {
             }
             None => {
                 let info = PageInfo {
-                    state: PageState::Loading,
-                    result: None,
-                    waits: 0,
+                    operation: PageOperation::Load,
+                    load_result: None,
+                    load_waits: 0,
                 };
                 self.pages.insert(page_no, info);
                 Ok(PageLoadAction::Load)
             }
         }
     }
+    /// finish Load operation with result for the page previously started with [Self::load_start]
+    /// caller must use this method only if [Self::load_start] returned Ok(PageLoadAction::Load)
     pub fn load_end(&mut self, page_no: usize, result: Result<Vec<u8>, errors::Error>) {
         let Some(info) = self.pages.get_mut(&page_no) else {
             panic!("page state must be set before load_end");
         };
-        assert_eq!(info.state, PageState::Loading);
-        if info.waits > 0 {
-            info.result = Some(result);
+        assert_eq!(info.operation, PageOperation::Load);
+        if info.load_waits > 0 {
+            info.load_result = Some(result);
         } else {
             let _ = self.pages.remove(&page_no);
         }
     }
+    /// try to get result from the Load operation
     pub fn load_result(&mut self, page_no: usize) -> Option<Result<Vec<u8>, errors::Error>> {
         let Some(info) = self.pages.get(&page_no) else {
             panic!("page state must be set before load_result");
         };
-        info.result.clone()
+        info.load_result.clone()
     }
+    /// unsubscribe from the result of the Load operation
+    /// caller must use this method only if [Self::load_start] returned Ok(PageLoadAction::Wait)
     pub fn wait_end(&mut self, page_no: usize) {
         let Some(info) = self.pages.get_mut(&page_no) else {
             panic!("page state must be set before load_result");
         };
-        info.waits -= 1;
-        if info.waits == 0 && info.result.is_some() {
+        info.load_waits -= 1;
+        if info.load_waits == 0 && info.load_result.is_some() {
             let _ = self.pages.remove(&page_no);
         }
     }
 }
 
+/// Guard which tracks states of the pages and properly deinit them on Drop
 struct PageStatesGuard {
     page_states: Arc<Mutex<PageStates>>,
     pages_to_load: Vec<u32>,
@@ -219,6 +246,8 @@ impl<IO: SyncEngineIo> LazyDatabaseStorage<IO> {
     }
 }
 
+/// load pages from the list [PageStatesGuard::pages_to_load] from the remote at given revision
+/// returns page data for the completion_page if it is set - otherwise returns None
 async fn lazy_load_pages<IO: SyncEngineIo, Ctx>(
     coro: &Coro<Ctx>,
     sync_engine_io: &SyncEngineIoStats<IO>,
@@ -448,6 +477,8 @@ impl<IO: SyncEngineIo> DatabaseStorage for LazyDatabaseStorage<IO> {
             return Err(LimboError::IntegerOverflow);
         };
 
+        // we can't put this logic in the generator below for now, because otherwise initialization of database will stuck
+        // (the problem is that connection creation use blocking IO in some code pathes, and in this case we will be unable to spin sync engine specific callbacks)
         let is_hole = self
             .clean_file
             .has_hole(page_offset as usize, read_buf_len)?;
