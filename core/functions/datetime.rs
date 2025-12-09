@@ -679,6 +679,8 @@ fn get_date_time_from_time_value_string(value: &str) -> Option<NaiveDateTime> {
 
     for format in &datetime_formats {
         let dt_found = if format.starts_with("%H") {
+            // For time-only formats, assume date 2000-01-01
+            // Ref: https://sqlite.org/lang_datefunc.html#tmval
             parse_datetime_with_optional_tz(
                 &format!("2000-01-01 {value}"),
                 &format!("%Y-%m-%d {format}"),
@@ -2162,5 +2164,201 @@ mod tests {
         let start = Value::build_text("12:00:00");
         let expected = Value::Null;
         assert_eq!(exec_timediff(&[start, end]), expected);
+    }
+
+    #[test]
+    fn test_subsec_fixed_time_expansion() {
+        let result = exec_datetime(
+            &[text("2024-01-01 12:00:00"), text("subsec")],
+            DateTimeOutput::DateTime,
+        );
+        assert_eq!(
+            result,
+            text("2024-01-01 12:00:00.000"),
+            "Failed to expand zero-nanosecond time with subsec"
+        );
+    }
+
+    #[test]
+    fn test_subsec_date_only_expansion() {
+        let result = exec_datetime(
+            &[text("2024-01-01"), text("subsec")],
+            DateTimeOutput::DateTime,
+        );
+        assert_eq!(
+            result,
+            text("2024-01-01 00:00:00.000"),
+            "Failed to expand date-only input to midnight.000"
+        );
+    }
+
+    #[test]
+    fn test_subsec_iso_separator() {
+        let result = exec_datetime(
+            &[text("2024-01-01T15:30:00"), text("subsec")],
+            DateTimeOutput::DateTime,
+        );
+        assert_eq!(
+            result,
+            text("2024-01-01 15:30:00.000"),
+            "Failed to normalize ISO T separator with subsec"
+        );
+    }
+
+    #[test]
+    fn test_subsec_chaining_before_math() {
+        let result = exec_datetime(
+            &[text("2024-01-01 12:00:00"), text("subsec"), text("+1 hour")],
+            DateTimeOutput::DateTime,
+        );
+        assert_eq!(
+            result,
+            text("2024-01-01 13:00:00.000"),
+            "Subsec flag failed to persist through subsequent arithmetic"
+        );
+    }
+
+    #[test]
+    fn test_subsec_chaining_after_math() {
+        let result = exec_datetime(
+            &[text("2024-01-01 12:00:00"), text("+1 hour"), text("subsec")],
+            DateTimeOutput::DateTime,
+        );
+        assert_eq!(
+            result,
+            text("2024-01-01 13:00:00.000"),
+            "Standard chaining failed"
+        );
+    }
+
+    #[test]
+    fn test_subsec_rollover_math() {
+        let result = exec_datetime(
+            &[
+                text("2024-01-01 12:00:00.999"),
+                text("+1 second"),
+                text("subsec"),
+            ],
+            DateTimeOutput::DateTime,
+        );
+        assert_eq!(
+            result,
+            text("2024-01-01 12:00:01.999"),
+            "Rollover math with milliseconds failed"
+        );
+    }
+
+    #[test]
+    fn test_subsec_case_insensitivity() {
+        let result = exec_datetime(
+            &[text("2024-01-01 12:00:00"), text("SuBsEc")],
+            DateTimeOutput::DateTime,
+        );
+        assert_eq!(
+            result,
+            text("2024-01-01 12:00:00.000"),
+            "Case insensitivity check failed"
+        );
+    }
+
+    #[test]
+    fn test_unixepoch_basic_usage() {
+        let result = exec_unixepoch(&[text("1970-01-01 00:00:00")]);
+        assert_eq!(result, Value::Integer(0));
+
+        let result = exec_unixepoch(&[text("2023-01-01 00:00:00")]);
+        assert_eq!(result, Value::Integer(1672531200));
+
+        let result = exec_unixepoch(&[text("1969-12-31 23:59:59")]);
+        assert_eq!(result, Value::Integer(-1));
+
+        let result = exec_unixepoch(&[Value::Float(2440587.5)]);
+        assert_eq!(result, Value::Integer(0));
+    }
+
+    #[test]
+    fn test_unixepoch_numeric_modifiers_unixepoch() {
+        let result = exec_unixepoch(&[Value::Integer(1672531200), text("unixepoch")]);
+        assert_eq!(result, Value::Integer(1672531200));
+
+        let result = exec_unixepoch(&[Value::Integer(0), text("unixepoch")]);
+        assert_eq!(result, Value::Integer(0));
+
+        let result = exec_unixepoch(&[
+            Value::Integer(1672531200),
+            text("unixepoch"),
+            text("start of year"),
+        ]);
+        assert_eq!(result, Value::Integer(1672531200));
+    }
+
+    #[test]
+    fn test_unixepoch_numeric_modifiers_julianday() {
+        let result = exec_unixepoch(&[Value::Float(2440587.5), text("julianday")]);
+        assert_eq!(result, Value::Integer(0));
+
+        let result = exec_unixepoch(&[Value::Float(2460311.5), text("julianday")]);
+        assert_eq!(result, Value::Integer(1704153600));
+
+        let result = exec_unixepoch(&[Value::Float(0.0), text("julianday")]);
+        match result {
+            Value::Integer(i) => assert!(i < -210866700000, "Expected very old timestamp, got {i}"),
+            _ => panic!("Expected Integer result for JD 0"),
+        }
+    }
+
+    #[test]
+    fn test_unixepoch_numeric_modifiers_auto() {
+        let result = exec_unixepoch(&[Value::Float(2440587.5), text("auto")]);
+        assert_eq!(result, Value::Integer(0));
+
+        let result = exec_unixepoch(&[Value::Integer(1672531200), text("auto")]);
+        assert_eq!(result, Value::Integer(1672531200));
+
+        let result = exec_unixepoch(&[Value::Float(0.0), text("auto")]);
+        match result {
+            Value::Integer(i) => assert!(i < 0, "Expected JD interpretation (negative), got {i}"),
+            _ => panic!("Expected Integer result"),
+        }
+    }
+
+    #[test]
+    fn test_unixepoch_invalid_usage() {
+        let result = exec_unixepoch(&[Value::Integer(0), text("start of year"), text("unixepoch")]);
+        assert_eq!(result, Value::Null);
+
+        let result = exec_unixepoch(&[text("2023-01-01"), text("unixepoch")]);
+        assert_eq!(result, Value::Null);
+
+        let result = exec_unixepoch(&[Value::Integer(0), text("unixepoch"), text("julianday")]);
+        assert_eq!(result, Value::Null);
+    }
+
+    #[test]
+    fn test_unixepoch_complex_calculations() {
+        let result = exec_unixepoch(&[Value::Float(2440587.5), text("julianday"), text("+1 day")]);
+        assert_eq!(result, Value::Integer(86400));
+
+        let result = exec_unixepoch(&[
+            Value::Float(2460311.5),
+            text("auto"),
+            text("start of month"),
+            text("+1 month"),
+        ]);
+        assert_eq!(result, Value::Integer(1706745600));
+    }
+
+    #[test]
+    fn test_unixepoch_subsecond_precision() {
+        let result = exec_unixepoch(&[text("1970-01-01 00:00:00.0006"), text("subsec")]);
+        match result {
+            Value::Float(f) => assert!((f - 0.001).abs() < f64::EPSILON),
+            _ => panic!("Expected Float result"),
+        }
+        let result = exec_unixepoch(&[text("1970-01-01 00:00:00.9996"), text("subsec")]);
+        match result {
+            Value::Float(f) => assert!((f - 0.999).abs() < f64::EPSILON),
+            _ => panic!("Expected Float result"),
+        }
     }
 }
