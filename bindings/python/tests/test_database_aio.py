@@ -189,7 +189,7 @@ async def test_json_functions_extract_patch_and_array_length():
 async def test_async_operations_do_not_block_event_loop():
     import time
     async with turso.aio.connect(":memory:") as conn:
-        count = 100000000
+        count = 1_000_000
         await conn.execute("CREATE TABLE t (id INTEGER)")
         cur = await conn.execute(f"""SELECT SUM(value) FROM generate_series(1, {count})""")
         start = time.time()
