@@ -2722,7 +2722,7 @@ impl Index {
             unique_cols.push(IndexColumn {
                 name: normalize_ident(col.name.as_ref().unwrap()),
                 order: *sort_order,
-                pos_in_table: pos_in_table,
+                pos_in_table,
                 collation: col.collation_opt(),
                 default: col.default.clone(),
                 expr: None,
