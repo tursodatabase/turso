@@ -378,12 +378,22 @@ mod fuzz_tests {
                 col_val: i32,
                 rng: &mut ChaCha8Rng,
             ) -> String {
-                if operator != "=" && rng.random_range(0..3) == 1 {
-                    let val2 = rng.random_range(0..=3000);
-                    let op2 = COMPARISONS[rng.random_range(0..COMPARISONS.len())];
-                    format!("{col_name} {operator} {col_val} AND {col_name} {op2} {val2}")
+                // 5% chance of using NULL as the comparison value
+                let val_str = if rng.random_range(0..20) == 0 {
+                    "NULL".to_string()
                 } else {
-                    format!("{col_name} {operator} {col_val}")
+                    col_val.to_string()
+                };
+                if operator != "=" && rng.random_range(0..3) == 1 {
+                    let val2 = if rng.random_range(0..20) == 0 {
+                        "NULL".to_string()
+                    } else {
+                        rng.random_range(0..=3000).to_string()
+                    };
+                    let op2 = COMPARISONS[rng.random_range(0..COMPARISONS.len())];
+                    format!("{col_name} {operator} {val_str} AND {col_name} {op2} {val2}")
+                } else {
+                    format!("{col_name} {operator} {val_str}")
                 }
             }
 
