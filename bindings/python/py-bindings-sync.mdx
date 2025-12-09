@@ -42,11 +42,20 @@ class ConnectionSync(_Connection):
 
 @dataclass
 class PartialSyncPrefixBootstrap:
+    # Bootstraps DB by fetching first N bytes/pages; enables partial sync
     length: int
+
 
 @dataclass
 class PartialSyncQueryBootstrap:
+    # Bootstraps DB by fetching pages touched by given SQL query on server
     query: str
+
+@dataclass
+class PartialSyncOpts:
+    bootstrap_strategy: Union[PartialSyncPrefixBootstrap, PartialSyncQueryBootstrap]
+    segment_size: Optional[int] = None
+    speculative_load: Optional[bool] = None
 
 def connect_sync(
     path: str, # path to the main database file locally
@@ -60,8 +69,7 @@ def connect_sync(
     client_name: Optional[str], # optional unique client name (library MUST use `turso-sync-py` if omitted)
     long_poll_timeout_ms: Optional[number], # long polling timeout
     bootstrap_if_empty: bool = True, # if not set, initial bootstrap phase will be skipped and caller must call .pull(...) explicitly in order to get initial state from remote
-    partial_boostrap_strategy: Optional[PartialSyncPrefixBootstrap, PartialSyncQueryBootstrap], # optional partial bootstrap strategy
-    
+    partial_sync_opts: Optional[PartialSyncOpts] = None, # optional partial sync configuration
     experimental_features: Optional[str] = None, # pass it as-is to the underlying connection
     isolation_level: Optional[str] = "DEFERRED", # pass it as-is to the underlying connection
 ) -> ConnectionSync: ...

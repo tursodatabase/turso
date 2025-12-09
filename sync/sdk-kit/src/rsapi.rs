@@ -22,10 +22,11 @@ pub struct TursoDatabaseSyncConfig {
     pub long_poll_timeout_ms: Option<u32>,
     pub bootstrap_if_empty: bool,
     pub reserved_bytes: Option<usize>,
-    pub partial_bootstrap_strategy: turso_sync_engine::types::PartialBootstrapStrategy,
+    pub partial_sync_opts: Option<turso_sync_engine::types::PartialSyncOpts>,
     pub db_io: Option<Arc<dyn IO>>,
 }
 
+pub type PartialSyncOpts = turso_sync_engine::types::PartialSyncOpts;
 pub type PartialBootstrapStrategy = turso_sync_engine::types::PartialBootstrapStrategy;
 
 impl TursoDatabaseSyncConfig {
@@ -53,17 +54,26 @@ impl TursoDatabaseSyncConfig {
             } else {
                 Some(value.reserved_bytes as usize)
             },
-            partial_bootstrap_strategy: if value.partial_bootstrap_strategy_prefix != 0 {
-                turso_sync_engine::types::PartialBootstrapStrategy::Prefix {
-                    length: value.partial_bootstrap_strategy_prefix as usize,
-                }
+            partial_sync_opts: if value.partial_bootstrap_strategy_prefix != 0 {
+                Some(turso_sync_engine::types::PartialSyncOpts {
+                    bootstrap_strategy:
+                        turso_sync_engine::types::PartialBootstrapStrategy::Prefix {
+                            length: value.partial_bootstrap_strategy_prefix as usize,
+                        },
+                    segment_size: value.partial_boostrap_segment_size,
+                    speculative_load: value.partial_boostrap_speculative_load,
+                })
             } else if !value.partial_bootstrap_strategy_query.is_null() {
                 let query = str_from_c_str(value.partial_bootstrap_strategy_query)?;
-                turso_sync_engine::types::PartialBootstrapStrategy::Query {
-                    query: query.to_string(),
-                }
+                Some(turso_sync_engine::types::PartialSyncOpts {
+                    bootstrap_strategy: turso_sync_engine::types::PartialBootstrapStrategy::Query {
+                        query: query.to_string(),
+                    },
+                    segment_size: value.partial_boostrap_segment_size,
+                    speculative_load: value.partial_boostrap_speculative_load,
+                })
             } else {
-                turso_sync_engine::types::PartialBootstrapStrategy::None
+                None
             },
             db_io: None,
         })
@@ -137,7 +147,7 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
             protocol_version_hint: turso_sync_engine::types::DatabaseSyncEngineProtocolVersion::V1,
             bootstrap_if_empty: sync_config.bootstrap_if_empty,
             reserved_bytes: sync_config.reserved_bytes.unwrap_or(0),
-            partial_bootstrap_strategy: sync_config.partial_bootstrap_strategy.clone(),
+            partial_sync_opts: sync_config.partial_sync_opts.clone(),
         };
         let is_memory = db_config.path == ":memory:";
         let db_io: Arc<dyn IO> = if let Some(io) = sync_config.db_io.as_ref() {
@@ -147,10 +157,7 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
         } else {
             #[cfg(target_os = "linux")]
             {
-                if matches!(
-                    sync_engine_opts.partial_bootstrap_strategy,
-                    PartialBootstrapStrategy::None
-                ) {
+                if sync_engine_opts.partial_sync_opts.is_none() {
                     Arc::new(turso_core::PlatformIO::new().map_err(|e| TursoError {
                         code: TursoStatusCode::Error,
                         message: Some(format!("Failed to create platform IO: {e}")),
