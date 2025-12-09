@@ -14,8 +14,9 @@ use crate::{
     },
     turso_sync::{
         py_turso_sync_new, PyTursoAsyncOperation, PyTursoAsyncOperationResultKind,
-        PyTursoSyncDatabase, PyTursoSyncDatabaseChanges, PyTursoSyncDatabaseConfig,
-        PyTursoSyncDatabaseStats, PyTursoSyncIoItem, PyTursoSyncIoItemRequestKind,
+        PyTursoPartialSyncOpts, PyTursoSyncDatabase, PyTursoSyncDatabaseChanges,
+        PyTursoSyncDatabaseConfig, PyTursoSyncDatabaseStats, PyTursoSyncIoItem,
+        PyTursoSyncIoItemRequestKind,
     },
 };
 
@@ -57,5 +58,6 @@ fn _turso(m: &Bound<PyModule>) -> PyResult<()> {
     m.add_class::<PyTursoSyncIoItemRequestKind>()?;
     m.add_class::<PyTursoAsyncOperation>()?;
     m.add_class::<PyTursoAsyncOperationResultKind>()?;
+    m.add_class::<PyTursoPartialSyncOpts>()?;
     Ok(())
 }

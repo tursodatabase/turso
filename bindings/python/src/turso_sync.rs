@@ -21,7 +21,7 @@ use crate::turso::{
 
 #[pyclass]
 #[derive(Clone)]
-pub struct PyTursoPartialSyncConfig {
+pub struct PyTursoPartialSyncOpts {
     // prefix bootstrap strategy which will enable partial sync which lazily pull necessary pages on demand and bootstrap db with pages from first N bytes of the db
     pub bootstrap_strategy_prefix: Option<usize>,
     // query bootstrap strategy which will enable partial sync which lazily pull necessary pages on demand and bootstrap db with pages touched by the server with given SQL query
@@ -31,7 +31,7 @@ pub struct PyTursoPartialSyncConfig {
 }
 
 #[pymethods]
-impl PyTursoPartialSyncConfig {
+impl PyTursoPartialSyncOpts {
     #[new]
     #[pyo3(signature = (
         bootstrap_strategy_prefix=None,
@@ -66,7 +66,7 @@ pub struct PyTursoSyncDatabaseConfig {
     pub bootstrap_if_empty: bool,
     // reserved bytes which must be set for the database - necessary if remote encryption is set for the db in cloud
     pub reserved_bytes: Option<usize>,
-    pub partial_sync_opts: Option<PyTursoPartialSyncConfig>,
+    pub partial_sync_opts: Option<PyTursoPartialSyncOpts>,
 }
 
 #[pymethods]
@@ -86,7 +86,7 @@ impl PyTursoSyncDatabaseConfig {
         long_poll_timeout_ms: Option<u32>,
         bootstrap_if_empty: bool,
         reserved_bytes: Option<usize>,
-        partial_sync_opts: Option<&PyTursoPartialSyncConfig>,
+        partial_sync_opts: Option<&PyTursoPartialSyncOpts>,
     ) -> Self {
         Self {
             path,
