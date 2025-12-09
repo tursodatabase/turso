@@ -9,8 +9,7 @@ from .lib_sync import (
     ConnectionSync as BlockingConnectionSync,
 )
 from .lib_sync import (
-    PartialSyncPrefixBootstrap,
-    PartialSyncQueryBootstrap,
+    PartialSyncOpts,
     PyTursoSyncDatabaseStats,
 )
 from .lib_sync import (
@@ -72,7 +71,7 @@ def connect_sync(
     client_name: Optional[str] = None,
     long_poll_timeout_ms: Optional[int] = None,
     bootstrap_if_empty: bool = True,
-    partial_boostrap_strategy: Optional[Union[PartialSyncPrefixBootstrap, PartialSyncQueryBootstrap]] = None,
+    partial_sync_opts: Optional[PartialSyncOpts] = None,
     experimental_features: Optional[str] = None,
     isolation_level: Optional[str] = "DEFERRED",
 ) -> ConnectionSync:
@@ -85,7 +84,7 @@ def connect_sync(
             client_name=client_name,
             long_poll_timeout_ms=long_poll_timeout_ms,
             bootstrap_if_empty=bootstrap_if_empty,
-            partial_boostrap_strategy=partial_boostrap_strategy,
+            partial_sync_opts=partial_sync_opts,
             experimental_features=experimental_features,
             isolation_level=isolation_level,
         )

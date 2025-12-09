@@ -1,6 +1,7 @@
 import logging
 import random
 import string
+import time
 
 import pytest
 import requests
@@ -158,20 +159,90 @@ async def test_partial_sync():
     server.create_group(name, name)
     server.create_db(name, name, name)
     server.db_sql(name, name, name, "CREATE TABLE t(x)")
-    server.db_sql(name, name, name, "INSERT INTO t SELECT randomblob(1024) FROM generate_series(1, 1024)")
+    server.db_sql(name, name, name, "INSERT INTO t SELECT randomblob(1024) FROM generate_series(1, 2000)")
 
     conn_full = await turso.aio.sync.connect(":memory:", remote_url=server.db_url(name, name, name))
     assert await (await conn_full.execute("SELECT LENGTH(x) FROM t LIMIT 1")).fetchall() == [(1024,)]
-    assert (await conn_full.stats()).network_received_bytes > 1024 * 1024
-    assert await (await conn_full.execute("SELECT SUM(LENGTH(x)) FROM t")).fetchall() == [(1024 * 1024,)]
+    assert (await conn_full.stats()).network_received_bytes > 2000 * 1024
+    assert await (await conn_full.execute("SELECT SUM(LENGTH(x)) FROM t")).fetchall() == [(2000 * 1024,)]
 
     conn_partial = await turso.aio.sync.connect(
         ":memory:",
         remote_url=server.db_url(name, name, name),
-        partial_boostrap_strategy=turso.aio.sync.PartialSyncPrefixBootstrap(128 * 1024),
+        partial_sync_opts=turso.aio.sync.PartialSyncOpts(
+            bootstrap_strategy=turso.aio.sync.PartialSyncPrefixBootstrap(length=128*1024),
+        ),
     )
     assert await (await conn_partial.execute("SELECT LENGTH(x) FROM t LIMIT 1")).fetchall() == [(1024,)]
     assert (await conn_partial.stats()).network_received_bytes < 256 * 1024 * 1024
 
-    assert await (await conn_partial.execute("SELECT SUM(LENGTH(x)) FROM t")).fetchall() == [(1024 * 1024,)]
-    assert (await conn_partial.stats()).network_received_bytes > 1024 * 1024
+    start = time.time()
+    assert await (await conn_partial.execute("SELECT SUM(LENGTH(x)) FROM t")).fetchall() == [(2000 * 1024,)]
+    print(time.time() - start)
+    assert (await conn_partial.stats()).network_received_bytes > 2000 * 1024
+
+@pytest.mark.asyncio
+async def test_partial_sync_segment_size():
+    # turso.setup_logging(level=logging.DEBUG)
+
+    name = random_str()
+    server.create_tenant(name)
+    server.create_group(name, name)
+    server.create_db(name, name, name)
+    server.db_sql(name, name, name, "CREATE TABLE t(x)")
+    server.db_sql(name, name, name, "INSERT INTO t SELECT randomblob(1024) FROM generate_series(1, 2000)")
+
+    conn_full = await turso.aio.sync.connect(":memory:", remote_url=server.db_url(name, name, name))
+    assert await (await conn_full.execute("SELECT LENGTH(x) FROM t LIMIT 1")).fetchall() == [(1024,)]
+    assert (await conn_full.stats()).network_received_bytes > 1024 * 1024
+    assert await (await conn_full.execute("SELECT SUM(LENGTH(x)) FROM t")).fetchall() == [(2000 * 1024,)]
+
+    conn_partial = await turso.aio.sync.connect(
+        ":memory:",
+        remote_url=server.db_url(name, name, name),
+        partial_sync_opts=turso.aio.sync.PartialSyncOpts(
+            bootstrap_strategy=turso.aio.sync.PartialSyncPrefixBootstrap(length=128*1024),
+            segment_size=4 * 1024,
+        ),
+    )
+    assert await (await conn_partial.execute("SELECT LENGTH(x) FROM t LIMIT 1")).fetchall() == [(1024,)]
+    assert (await conn_partial.stats()).network_received_bytes < 256 * 1024 * 1024
+
+    start = time.time()
+    assert await (await conn_partial.execute("SELECT SUM(LENGTH(x)) FROM t")).fetchall() == [(2000 * 1024,)]
+    print(time.time() - start)
+    assert (await conn_partial.stats()).network_received_bytes > 2000 * 1024
+
+@pytest.mark.asyncio
+async def test_partial_sync_speculative_load():
+    # turso.setup_logging(level=logging.DEBUG)
+
+    name = random_str()
+    server.create_tenant(name)
+    server.create_group(name, name)
+    server.create_db(name, name, name)
+    server.db_sql(name, name, name, "CREATE TABLE t(x)")
+    server.db_sql(name, name, name, "INSERT INTO t SELECT randomblob(1024) FROM generate_series(1, 2000)")
+
+    conn_full = await turso.aio.sync.connect(":memory:", remote_url=server.db_url(name, name, name))
+    assert await (await conn_full.execute("SELECT LENGTH(x) FROM t LIMIT 1")).fetchall() == [(1024,)]
+    assert (await conn_full.stats()).network_received_bytes > 2000 * 1024
+    assert await (await conn_full.execute("SELECT SUM(LENGTH(x)) FROM t")).fetchall() == [(2000 * 1024,)]
+
+    # turso.setup_logging(logging.DEBUG)
+    conn_partial = await turso.aio.sync.connect(
+        ":memory:",
+        remote_url=server.db_url(name, name, name),
+        partial_sync_opts=turso.aio.sync.PartialSyncOpts(
+            bootstrap_strategy=turso.aio.sync.PartialSyncPrefixBootstrap(length=128*1024),
+            segment_size=4 * 1024,
+            speculative_load=True,
+        ),
+    )
+    assert await (await conn_partial.execute("SELECT LENGTH(x) FROM t LIMIT 1")).fetchall() == [(1024,)]
+    assert (await conn_partial.stats()).network_received_bytes < 256 * 1024 * 1024
+
+    start = time.time()
+    assert await (await conn_partial.execute("SELECT SUM(LENGTH(x)) FROM t")).fetchall() == [(2000 * 1024,)]
+    print(time.time() - start)
+    assert (await conn_partial.stats()).network_received_bytes > 2000 * 1024
