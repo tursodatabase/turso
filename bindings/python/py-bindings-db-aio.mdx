@@ -1,0 +1,111 @@
+---
+name: 2025-11-26-py-bindings-async
+---
+
+<Output path="./turso/lib_aio.py">
+
+<Code model="openai/gpt-5" language="python">
+
+Turso - is the SQLite compatible database written in Rust.
+One of the important features of the Turso - is async IO execution which can be used with modern storage backend like IO uring.
+
+Your task is to generate ASYNC Python driver with the API similar aiosqlite (which is similar to DB-API 2 of sqlite module) by REUSING current sync driver imiplementation.
+
+# Rules
+
+General rules for driver implementation you **MUST** follow and never go against these rules:
+- STRUCTURE of the implementation 
+    * Declaration order of elements and semantic blocks MUST be exsactly the same
+    * (details and full enumerations omited in the example for brevity but you must generate full code)
+```py
+# all imports must be at the beginning - no imports in the middle of function
+from typing import ...
+from queue import SimpleQueue
+
+from .worker import Worker
+from .lib import ( 
+    Connection as BlockingConnection,
+    Cursor as BlockingCursor,
+    ...
+)
+
+# Connection goes FIRST
+class Connection:
+    def __init__(connector: Callable[[], BlockingConnection]): ...
+    # internal worker MUST be stopped when connection goes out of context scope
+    # close must wait for worker to be stopped
+    async def close(...): ...
+    # make Connection instance awaitable
+    def __await__(...): ...
+    async def __aenter__(...): ...
+    # just close the connection - do not add any extra logic
+    async def __aexit__(...): ...
+        await self.close()
+    ...
+
+# Cursor goes SECOND
+class Cursor: ...
+
+# connect is not async because it returns awaitable Connection
+# same signature as in the lib.py
+def connect(...): ...
+
+```
+- USE already implemented driver - DO NOT copy it
+- USE primitives from the queue module in order to send work to the separate Thread
+- USE per-connection thread to execute database work
+- FOLLOW the pattern:
+```py
+# create future for completion
+future = asyncio.get_event_loop().create_future()
+# put the work to the unbounded queue
+queue.put_nowait((future, function))
+```
+- NEVER block main event loop (e.g., do not use Queue with block=True - prefer unbounded SimpleQueue instead)
+- REUSE data structures from lib.py if possible (e.g. exceptions)
+- DO NOT accept extra `loop` parameter - ALWAYS use `asyncio.get_event_loop()`
+- CREATE separate thread to execute Turso request and proxy all methods to these thread in order to not block event loop with database work
+- DO NOT reimplement logic of the execution - reuse methods and classes from lib.py
+- AVOID cryptic names - prefer short but concise names (wr is BAD, full_write is GOOD)
+- NEVER put import in the middle of a function - always put all necessary immports at the beginning of the file
+- FOCUS on code readability: if possible extract helper function but make sure that it will be used more than once and that it really contribute to the code readability
+- WATCH OUT for variables scopes and do not use variables which are no longer accessible
+- WATCH OUT for operations atomicity: DO NOT split atomic work in units which may be mixed with other work in async context - breaking atomicity guarantees
+- USE forward reference string in when return method type depends on its class:
+```py
+class T: 
+    def f(self) -> 'T':
+```
+
+# Implementation
+
+- Put compact citations from the official DB-API doc if this is helpful
+- Driver must implement context API for Python to be used like `with ... as conn:` ...
+
+# Blocking driver
+
+For turso db execution you MUST reuse blocking implementation:
+
+<File path="./turso/lib.py" />
+<File path="./turso/worker.py" />
+<File path="./turso/__init__.py" />
+
+# SQLite-like DB API
+
+Make driver API similar to the SQLite DB-API2 for the python.
+
+Pay additional attention to the following aspects:
+* SQLite DB-API2 implementation implicitly opens transaction for DML queries in the execute(...) method:
+    > If autocommit is LEGACY_TRANSACTION_CONTROL, isolation_level is not None, sql is an INSERT, UPDATE, DELETE, or REPLACE statement, and there is no open transaction, a transaction is implicitly opened before executing sql.
+    - MAKE SURE this logic implemented properly
+* Implement .rowcount property correctly, be careful with `executemany(...)` methods as it must return rowcount of all executed statements (not just last statement)
+* Convert exceptions from rust layer to appropriate exceptions documented in the sqlite3 db-api2 docs
+* BE CAREFUL with implementation of transaction control. Make sure that in LEGACY_TRANSACTION_CONTROL mode implicit transaction will be properly commited in case of cursor close
+
+Also, make types and API compatible with aiosqlite (note, that aiosqlite implements some other methods, which can be omitted now, like interrupt)
+
+<Shell cmd="python3 -m pydoc aiosqlite" />
+
+</Code>
+
+</Output>

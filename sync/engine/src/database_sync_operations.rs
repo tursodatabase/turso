@@ -352,6 +352,11 @@ pub async fn pull_pages_v1<IO: SyncEngineIo, Ctx>(
     pages: &[u32],
 ) -> Result<Vec<(u64, Vec<u8>)>> {
     tracing::info!("pull_pages_v1: revision={server_revision}, pages={pages:?}");
+
+    if pages.is_empty() {
+        return Ok(Vec::new());
+    }
+
     let mut bytes = BytesMut::new();
 
     let mut bitmap = RoaringBitmap::new();
