@@ -1134,7 +1134,7 @@ pub async fn bootstrap_db_file<IO: SyncEngineIo, Ctx>(
 ) -> Result<DatabasePullRevision> {
     match protocol {
         DatabaseSyncEngineProtocolVersion::Legacy => {
-            if !partial_sync.is_none() {
+            if partial_sync.is_some() {
                 return Err(Error::DatabaseSyncEngineError(
                     "can't bootstrap prefix of database with legacy protocol".to_string(),
                 ));

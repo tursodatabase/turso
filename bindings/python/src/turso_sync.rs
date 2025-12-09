@@ -123,20 +123,16 @@ pub fn py_turso_sync_new(
                 if let Some(length) = config.bootstrap_strategy_prefix {
                     Some(PartialSyncOpts {
                         bootstrap_strategy: PartialBootstrapStrategy::Prefix { length },
-                        segment_size: config.segment_size.unwrap_or(0) as usize,
+                        segment_size: config.segment_size.unwrap_or(0),
                         speculative_load: config.speculative_load.unwrap_or(false),
                     })
-                } else if let Some(query) = &config.bootstrap_strategy_query {
-                    Some(PartialSyncOpts {
+                } else { config.bootstrap_strategy_query.as_ref().map(|query| PartialSyncOpts {
                         bootstrap_strategy: PartialBootstrapStrategy::Query {
                             query: query.clone(),
                         },
-                        segment_size: config.segment_size.unwrap_or(0) as usize,
+                        segment_size: config.segment_size.unwrap_or(0),
                         speculative_load: config.speculative_load.unwrap_or(false),
-                    })
-                } else {
-                    None
-                }
+                    }) }
             }
             None => None,
         },

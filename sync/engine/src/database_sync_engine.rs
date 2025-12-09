@@ -227,7 +227,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             None => None,
         };
         let partial_sync_opts = opts.partial_sync_opts.clone();
-        let partial = !partial_sync_opts.is_none();
+        let partial = partial_sync_opts.is_some();
 
         let meta = match meta {
             Some(meta) => meta,

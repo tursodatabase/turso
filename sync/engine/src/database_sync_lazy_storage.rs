@@ -43,7 +43,7 @@ impl PageStates {
         }
     }
     pub fn write_start(&mut self, page_no: usize) -> Result<(), errors::Error> {
-        if let Some(_) = self.pages.get(&page_no) {
+        if self.pages.contains_key(&page_no) {
             return Err(errors::Error::DatabaseSyncEngineError(format!(
                 "unable to get write lock: page {page_no} already buys"
             )));
@@ -172,14 +172,15 @@ impl PageStatesGuard {
 }
 
 impl Drop for PageStatesGuard {
+    #[allow(clippy::unnecessary_to_owned)]
     fn drop(&mut self) {
-        for page_no in self.pages_to_write.iter().cloned().collect::<Vec<_>>() {
+        for page_no in self.pages_to_write.to_vec() {
             self.write_end(page_no as usize);
         }
-        for page_no in self.pages_to_wait.iter().cloned().collect::<Vec<_>>() {
+        for page_no in self.pages_to_wait.to_vec() {
             self.wait_end(page_no as usize);
         }
-        for page_no in self.pages_to_load.iter().cloned().collect::<Vec<_>>() {
+        for page_no in self.pages_to_load.to_vec() {
             self.load_end(
                 page_no as usize,
                 Err(errors::Error::DatabaseSyncEngineError(
@@ -233,9 +234,9 @@ async fn lazy_load_pages<IO: SyncEngineIo, Ctx>(
         server_revision
     );
     let loaded = pull_pages_v1(
-        &coro,
-        &sync_engine_io,
-        &server_revision,
+        coro,
+        sync_engine_io,
+        server_revision,
         &page_states_guard.pages_to_load,
     )
     .await?;
@@ -286,6 +287,7 @@ async fn lazy_load_pages<IO: SyncEngineIo, Ctx>(
     Ok(completion_data)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn read_page<Ctx, IO: SyncEngineIo>(
     coro: &Coro<Ctx>,
     sync_engine_io: &SyncEngineIoStats<IO>,
@@ -336,12 +338,12 @@ async fn read_page<Ctx, IO: SyncEngineIo>(
         }
 
         let Some(page_data) = lazy_load_pages(
-            &coro,
-            &sync_engine_io,
+            coro,
+            sync_engine_io,
             clean_file.clone(),
             dirty_file.clone(),
             guard,
-            &server_revision,
+            server_revision,
             Some(page as u32),
         )
         .await?
@@ -394,12 +396,12 @@ async fn read_page<Ctx, IO: SyncEngineIo>(
                 }
             }
             lazy_load_pages(
-                &coro,
-                &sync_engine_io,
+                coro,
+                sync_engine_io,
                 clean_file,
                 dirty_file,
                 guard,
-                &server_revision,
+                server_revision,
                 None,
             )
             .await?;
