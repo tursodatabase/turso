@@ -174,10 +174,26 @@ impl MaterializedViewCursor {
                     let btree_result =
                         return_if_io!(self.btree_cursor.seek(SeekKey::TableRowId(target), op));
 
-                    let changes = if btree_result == SeekResult::Found {
-                        return_if_io!(self.read_btree_delta_entry())
-                    } else {
-                        Vec::new()
+                    let changes = match btree_result {
+                        SeekResult::Found => return_if_io!(self.read_btree_delta_entry()),
+                        SeekResult::TryAdvance => {
+                            // Cursor is positioned at the leaf but current entry doesn't match.
+                            // Advance in the appropriate direction to find the next matching entry.
+                            let advanced = match op {
+                                SeekOp::GT | SeekOp::GE { .. } => {
+                                    return_if_io!(self.btree_cursor.next())
+                                }
+                                SeekOp::LT | SeekOp::LE { .. } => {
+                                    return_if_io!(self.btree_cursor.prev())
+                                }
+                            };
+                            if advanced {
+                                return_if_io!(self.read_btree_delta_entry())
+                            } else {
+                                Vec::new()
+                            }
+                        }
+                        SeekResult::NotFound => Vec::new(),
                     };
 
                     let mut btree_entries = Delta { changes };
@@ -257,6 +273,14 @@ impl MaterializedViewCursor {
     }
 
     pub fn next(&mut self) -> Result<IOResult<bool>> {
+        // If there's a pending seek operation (due to IO), complete it first.
+        // SeekState::Seek means IO was interrupted mid-seek and we need to resume.
+        // SeekState::Init means cursor was never positioned - don't resume, fall through to check current_row.
+        if matches!(self.seek_state, SeekState::Seek { .. }) {
+            let result = return_if_io!(self.do_seek(0, SeekOp::GT)); // target is ignored when resuming
+            return Ok(IOResult::Done(result == SeekResult::Found));
+        }
+
         // If cursor is not positioned (no current_row), return false
         // This matches BTreeCursor behavior when valid_state == Invalid
         let Some((current_rowid, _)) = &self.current_row else {
