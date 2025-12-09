@@ -648,6 +648,7 @@ fn optimize_table_access(
         table_references,
         available_indexes,
         subqueries,
+        schema,
     )?;
     let base_table_rows = table_references
         .joined_tables()
