@@ -1360,11 +1360,8 @@ async fn sql_execute_http<IO: SyncEngineIo, Ctx>(
     client.network_stats.write(body.len());
     let completion = client.http("POST", "/v2/pipeline", Some(body), &[])?;
 
-    let status = wait_status(coro, &completion).await?;
-    if status != http::StatusCode::OK {
-        let error = format!("sql_execute_http: unexpected status code: {status}");
-        return Err(Error::DatabaseSyncEngineError(error));
-    }
+    wait_ok_status(coro, &completion, "sql_execute_http").await?;
+
     let response = wait_all_results(coro, &completion, Some(&client.network_stats)).await?;
     let response: server_proto::PipelineRespBody = serde_json::from_slice(&response)?;
     tracing::debug!("hrana response: {:?}", response);
@@ -1452,14 +1449,8 @@ async fn wal_push_http<IO: SyncEngineIo, Ctx>(
         Some(frames),
         &[],
     )?;
-    let status = wait_status(coro, &completion).await?;
+    wait_ok_status(coro, &completion, "wal_push").await?;
     let status_body = wait_all_results(coro, &completion, Some(&client.network_stats)).await?;
-    if status != http::StatusCode::OK {
-        let error = std::str::from_utf8(&status_body).ok().unwrap_or("");
-        return Err(Error::DatabaseSyncEngineError(format!(
-            "wal_push go unexpected status: {status} (error={error})"
-        )));
-    }
     Ok(serde_json::from_slice(&status_body)?)
 }
 
@@ -1468,13 +1459,8 @@ async fn db_info_http<IO: SyncEngineIo, Ctx>(
     client: &SyncEngineIoStats<IO>,
 ) -> Result<DbSyncInfo> {
     let completion = client.http("GET", "/info", None, &[])?;
-    let status = wait_status(coro, &completion).await?;
+    wait_ok_status(coro, &completion, "db_info").await?;
     let status_body = wait_all_results(coro, &completion, Some(&client.network_stats)).await?;
-    if status != http::StatusCode::OK {
-        return Err(Error::DatabaseSyncEngineError(format!(
-            "db_info go unexpected status: {status}"
-        )));
-    }
     Ok(serde_json::from_slice(&status_body)?)
 }
 
@@ -1484,13 +1470,28 @@ async fn db_bootstrap_http<C: SyncEngineIo, Ctx>(
     generation: u64,
 ) -> Result<C::DataCompletionBytes> {
     let completion = client.http("GET", &format!("/export/{generation}"), None, &[])?;
-    let status = wait_status(coro, &completion).await?;
-    if status != http::StatusCode::OK.as_u16() {
-        return Err(Error::DatabaseSyncEngineError(format!(
-            "db_bootstrap go unexpected status: {status}"
-        )));
-    }
+    wait_ok_status(coro, &completion, "db_bootstrap").await?;
     Ok(completion)
+}
+
+pub async fn wait_ok_status<Ctx>(
+    coro: &Coro<Ctx>,
+    completion: &impl DataCompletion<u8>,
+    operation: &'static str,
+) -> Result<()> {
+    let status = wait_status(coro, completion).await?;
+    if status == http::StatusCode::OK {
+        return Ok(());
+    }
+    let body = wait_all_results(coro, completion, None).await?;
+    match std::str::from_utf8(body.as_slice()) {
+        Ok(body) => Err(Error::DatabaseSyncEngineError(format!(
+            "{operation}: unexpected http response: status={status}, body={body}"
+        ))),
+        Err(_) => Err(Error::DatabaseSyncEngineError(format!(
+            "{operation}: unexpected http response: status={status}"
+        ))),
+    }
 }
 
 pub async fn wait_status<Ctx, T>(
@@ -1530,6 +1531,21 @@ pub async fn wait_proto_message<Ctx, T: prost::Message + Default>(
     bytes: &mut BytesMut,
 ) -> Result<Option<T>> {
     let start_time = std::time::Instant::now();
+    while completion.status()?.is_none() {
+        coro.yield_(SyncEngineIoResult::IO).await?;
+    }
+    let status = completion.status()?.expect("status must be set");
+    if status != 200 {
+        let body = wait_all_results(coro, completion, Some(network_stats)).await?;
+        return match std::str::from_utf8(body.as_slice()) {
+            Ok(body) => Err(Error::DatabaseSyncEngineError(format!(
+                "remote server returned an error: status={status}, body={body}"
+            ))),
+            Err(_) => Err(Error::DatabaseSyncEngineError(format!(
+                "remote server returned an error: status={status}"
+            ))),
+        };
+    }
     loop {
         let length = read_varint(bytes)?;
         let not_enough_bytes = match length {

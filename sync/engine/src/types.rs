@@ -146,8 +146,20 @@ pub enum DatabaseSyncEngineProtocolVersion {
 
 impl DatabaseMetadata {
     pub fn load(data: &[u8]) -> Result<Self> {
-        let meta = serde_json::from_slice::<DatabaseMetadata>(data)?;
-        Ok(meta)
+        let value: serde_json::Value = serde_json::from_slice(data)?;
+
+        match value.get("version").and_then(serde_json::Value::as_str) {
+            Some(version) => {
+                let version = version.to_string();
+                let meta: DatabaseMetadata = serde_json::from_value(value).map_err(|err|
+                    Error::JsonDecode(format!("unable to parse metadata file with version {version}: {err}"))
+                )?;
+                Ok(meta)
+            }
+            None => Err(Error::JsonDecode(
+                "unexpected metadata file format, 'version' field must be present and have string type".to_string(),
+            )),
+        }
     }
     pub fn dump(&self) -> Result<Vec<u8>> {
         let data = serde_json::to_string(self)?;
