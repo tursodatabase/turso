@@ -2043,7 +2043,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
     // concat unqiue_sets collected from column definitions and constraints in correct order
     let mut unique_sets = unique_sets_columns
         .into_iter()
-        .chain(unique_sets_constraints.into_iter())
+        .chain(unique_sets_constraints)
         .collect::<Vec<_>>();
     for col in cols.iter() {
         if col.is_rowid_alias() {
