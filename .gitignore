@@ -50,3 +50,4 @@ bisected.sql
 *.log
 
 *.db-log
+settings.local.json

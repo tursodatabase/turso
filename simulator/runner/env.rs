@@ -11,7 +11,7 @@ use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use sql_generation::generation::GenerationContext;
 use sql_generation::model::query::transaction::Rollback;
-use sql_generation::model::table::Table;
+use sql_generation::model::table::{SimValue, Table};
 use tracing::trace;
 use turso_core::Database;
 
@@ -37,18 +37,61 @@ pub(crate) enum SimulationPhase {
     Shrink,
 }
 
+/// Represents a single operation during a transaction, applied in order.
+/// TODO: encode table/index creations etc. as operations too (although
+/// in both WAL mode and MVCC DDL requires an exclusive transaction)
+#[derive(Debug, Clone)]
+pub enum RowOperation {
+    Insert {
+        table_name: String,
+        row: Vec<SimValue>,
+    },
+    Delete {
+        table_name: String,
+        row: Vec<SimValue>,
+    },
+    DropTable {
+        table_name: String,
+    },
+    RenameTable {
+        old_name: String,
+        new_name: String,
+    },
+}
+
 #[derive(Debug, Clone)]
 pub struct TransactionTables {
+    /// The current state after applying transaction's changes (used for reads within the transaction)
     current_tables: Vec<Table>,
-    pending_changes: Vec<Query>,
+    /// Operations recorded during this transaction, in order
+    operations: Vec<RowOperation>,
 }
 
 impl TransactionTables {
     pub fn new(tables: Vec<Table>) -> Self {
         Self {
             current_tables: tables,
-            pending_changes: Vec::new(),
+            operations: Vec::new(),
         }
+    }
+
+    pub fn record_insert(&mut self, table_name: String, row: Vec<SimValue>) {
+        self.operations
+            .push(RowOperation::Insert { table_name, row });
+    }
+
+    pub fn record_delete(&mut self, table_name: String, row: Vec<SimValue>) {
+        self.operations
+            .push(RowOperation::Delete { table_name, row });
+    }
+
+    pub fn record_drop_table(&mut self, table_name: String) {
+        self.operations.push(RowOperation::DropTable { table_name });
+    }
+
+    pub fn record_rename_table(&mut self, old_name: String, new_name: String) {
+        self.operations
+            .push(RowOperation::RenameTable { old_name, new_name });
     }
 }
 
@@ -97,36 +140,135 @@ where
             .unwrap_or(self.commited_tables)
     }
 
+    /// Record that a row was inserted during the current transaction
+    pub fn record_insert(&mut self, table_name: String, row: Vec<SimValue>) {
+        if let Some(txn) = &mut *self.transaction_tables {
+            txn.record_insert(table_name, row);
+        }
+    }
+
+    /// Record that a row was deleted during the current transaction
+    pub fn record_delete(&mut self, table_name: String, row: Vec<SimValue>) {
+        if let Some(txn) = &mut *self.transaction_tables {
+            txn.record_delete(table_name, row);
+        }
+    }
+
+    /// Record that a table was dropped during the current transaction
+    pub fn record_drop_table(&mut self, table_name: String) {
+        if let Some(txn) = &mut *self.transaction_tables {
+            txn.record_drop_table(table_name);
+        }
+    }
+
+    /// Record that a table was renamed during the current transaction
+    pub fn record_rename_table(&mut self, old_name: String, new_name: String) {
+        if let Some(txn) = &mut *self.transaction_tables {
+            txn.record_rename_table(old_name, new_name);
+        }
+    }
+
     pub fn create_snapshot(&mut self) {
         *self.transaction_tables = Some(TransactionTables::new(self.commited_tables.clone()));
     }
 
     pub fn apply_snapshot(&mut self) {
-        // TODO: as we do not have concurrent tranasactions yet in the simulator
-        // there is no conflict we are ignoring conflict problems right now
-        if let Some(transation_tables) = self.transaction_tables.take() {
-            let mut shadow_table = ShadowTablesMut {
-                commited_tables: self.commited_tables,
-                transaction_tables: &mut None,
-            };
+        if let Some(transaction_tables) = self.transaction_tables.take() {
+            // Apply all operations in recorded order, including renames.
+            // This ensures operations like INSERT foo, RENAME foo->bar, INSERT bar
+            // are applied correctly.
+            for op in &transaction_tables.operations {
+                match op {
+                    RowOperation::Insert { table_name, row } => {
+                        if let Some(committed) = self
+                            .commited_tables
+                            .iter_mut()
+                            .find(|t| &t.name == table_name)
+                        {
+                            committed.rows.push(row.clone());
+                        }
+                    }
+                    RowOperation::Delete { table_name, row } => {
+                        if let Some(committed) = self
+                            .commited_tables
+                            .iter_mut()
+                            .find(|t| &t.name == table_name)
+                        {
+                            if let Some(pos) = committed.rows.iter().position(|r| r == row) {
+                                committed.rows.remove(pos);
+                            }
+                        }
+                    }
+                    RowOperation::DropTable { table_name } => {
+                        self.commited_tables.retain(|t| &t.name != table_name);
+                    }
+                    RowOperation::RenameTable { old_name, new_name } => {
+                        if let Some(committed) = self
+                            .commited_tables
+                            .iter_mut()
+                            .find(|t| &t.name == old_name)
+                        {
+                            committed.name = new_name.clone();
+                        }
+                    }
+                }
+            }
 
-            for query in transation_tables.pending_changes {
-                // TODO: maybe panic on shadow error here
-                let _ = query.shadow(&mut shadow_table);
+            // Sync schema (columns, indexes) and create new tables.
+            // This happens after row operations so table names are in their final state.
+            for current_table in &transaction_tables.current_tables {
+                if let Some(committed) = self
+                    .commited_tables
+                    .iter_mut()
+                    .find(|t| t.name == current_table.name)
+                {
+                    let old_col_count = committed.columns.len();
+                    let new_col_count = current_table.columns.len();
+
+                    if new_col_count > old_col_count {
+                        // ADD COLUMN: fill with NULL
+                        let nulls_to_add = new_col_count - old_col_count;
+                        for row in &mut committed.rows {
+                            for _ in 0..nulls_to_add {
+                                row.push(SimValue::NULL);
+                            }
+                        }
+                    } else if new_col_count < old_col_count {
+                        // DROP COLUMN: find dropped columns by name and remove from rows
+                        let old_col_names: Vec<_> =
+                            committed.columns.iter().map(|c| &c.name).collect();
+                        let new_col_names: Vec<_> =
+                            current_table.columns.iter().map(|c| &c.name).collect();
+
+                        // Process in reverse order to preserve indices during removal
+                        let mut dropped_indices: Vec<usize> = old_col_names
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, name)| !new_col_names.contains(name))
+                            .map(|(idx, _)| idx)
+                            .collect();
+                        dropped_indices.sort_by(|a, b| b.cmp(a));
+
+                        for row in &mut committed.rows {
+                            for &idx in &dropped_indices {
+                                row.remove(idx);
+                            }
+                        }
+                    }
+                    committed.indexes = current_table.indexes.clone();
+                    committed.columns = current_table.columns.clone();
+                } else {
+                    // New table created in transaction
+                    let mut new_table = current_table.clone();
+                    new_table.rows = Vec::new();
+                    self.commited_tables.push(new_table);
+                }
             }
         }
     }
 
     pub fn delete_snapshot(&mut self) {
         *self.transaction_tables = None;
-    }
-
-    /// Append non transaction queries to the shadow tables
-    pub fn add_query(&mut self, query: &Query) {
-        assert!(!query.is_transaction());
-        if let Some(transaction_tables) = self.transaction_tables {
-            transaction_tables.pending_changes.push(query.clone());
-        }
     }
 }
 
