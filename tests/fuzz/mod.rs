@@ -6035,7 +6035,7 @@ mod fuzz_tests {
             }
             let mut part = format!("{} {}", quote_ident(&c.name), c.ty);
             if let Some(coll) = c.collation {
-                part.push_str(&format!(" COLLATE {}", coll));
+                part.push_str(&format!(" COLLATE {coll}"));
             }
             if c.inline_unique {
                 part.push_str(" UNIQUE");
@@ -6048,7 +6048,7 @@ mod fuzz_tests {
                 .map(|&i| quote_ident(&tbl.columns[i].name))
                 .collect::<Vec<_>>()
                 .join(", ");
-            defs.push(format!("UNIQUE ({})", cols));
+            defs.push(format!("UNIQUE ({cols})"));
         }
         format!(
             "CREATE TABLE {} ({})",
@@ -6106,7 +6106,7 @@ mod fuzz_tests {
         for ic in &idx.cols {
             let mut piece = quote_ident(&tbl.columns[ic.col].name);
             if let Some(coll) = ic.collation {
-                piece.push_str(&format!(" COLLATE {}", coll));
+                piece.push_str(&format!(" COLLATE {coll}"));
             }
             piece.push_str(&format!(" {}", ic.sort_order));
             parts.push(piece);
@@ -6195,7 +6195,7 @@ mod fuzz_tests {
             let mut piece = quote_ident(&tbl.columns[ci].name);
             if rng.random_bool(0.5) {
                 if let Some(coll) = random_collation(rng) {
-                    piece.push_str(&format!(" COLLATE {}", coll));
+                    piece.push_str(&format!(" COLLATE {coll}"));
                 }
             }
             piece.push_str(if rng.random_bool(0.5) {
@@ -6226,10 +6226,10 @@ mod fuzz_tests {
         )
     }
 
+    #[allow(dead_code)]
     enum Action {
         CreateTable,
         CreateIndex,
-        #[warn(dead_code)]
         InsertData,
         Select,
     }
@@ -6351,8 +6351,7 @@ mod fuzz_tests {
 
                         assert_eq!(
                             limbo_rows, sqlite_rows,
-                            "Mismatch on query: {}\nseed: {}\nlimbo: {:?}\nsqlite: {:?}",
-                            query, seed, limbo_rows, sqlite_rows
+                            "Mismatch on query: {query}\nseed: {seed}\nlimbo: {limbo_rows:?}\nsqlite: {sqlite_rows:?}"
                         );
                     }
                 }
