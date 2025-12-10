@@ -432,6 +432,20 @@ pub fn constraints_from_where_clause(
                         index.expression_to_index_pos(&normalized)
                     }),
                 } {
+                    assert!(
+                        constraint.usable,
+                        "constraint collation must match table column collation"
+                    );
+                    if let Some(table_col_pos) = constraint.table_col_pos {
+                        let constrained_column = &table_reference.table.columns()[table_col_pos];
+                        let table_collation = constrained_column.collation();
+                        let index_collation = index.columns[position_in_index]
+                            .collation
+                            .unwrap_or_default();
+                        if table_collation != index_collation {
+                            continue;
+                        }
+                    }
                     if let Some(index_candidate) = cs.candidates.iter_mut().find_map(|candidate| {
                         if candidate.index.as_ref().is_some_and(|i| {
                             Arc::ptr_eq(index, i) && can_use_partial_index(index, where_clause)
