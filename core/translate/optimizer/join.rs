@@ -127,14 +127,6 @@ pub fn join_lhs_and_rhs<'a>(
         .map(|c| c.selectivity)
         .product::<f64>();
 
-    // Check if this table has constraints that COULD be usable but aren't yet
-    // (because the tables they reference aren't in our join order yet).
-    // This indicates the table would benefit from being placed later in the join.
-    let has_deferred_constraints = rhs_constraints
-        .constraints
-        .iter()
-        .any(|c| !c.lhs_mask.is_empty() && !lhs_mask.contains_all(&c.lhs_mask));
-
     // If we already have a non-empty LHS (at least one table has been joined),
     // consider a hash-join alternative for the current RHS. We only allow hash
     // joins when:
@@ -344,98 +336,7 @@ pub fn join_lhs_and_rhs<'a>(
         }
     }
 
-    let mut cost = lhs_cost + best_access_method.cost;
-
-    // Penalize placing a table early when it has constraints that could be used
-    // if other tables were joined first. This encourages placing lookup targets
-    // (like dimension tables with FK references to them) later in the join order.
-    //
-    // This is critical for star schema queries where dimension tables
-    // should be looked up by PK after fact tables are joined, not scanned first.
-    // Check if this table has a deferred unique constraint.
-    // This means the table could be efficiently looked up by PK if placed later,
-    // but will be scanned if placed now.
-    //
-    // We detect unique constraints by checking if selectivity ≈ 1/row_count,
-    // which indicates the constraint returns ~1 row per lookup.
-    //
-    // We only penalize if:
-    // 1. There are NO usable constraints (we'd scan the whole table)
-    // 2. There IS a deferred constraint that looks like a unique lookup
-    //
-    // This avoids penalizing fact tables (which should be scanned first) while
-    // penalizing dimension tables (which should be looked up by PK).
-    let unique_selectivity = if rhs_base_rows > 0.0 {
-        1.0 / rhs_base_rows
-    } else {
-        0.0
-    };
-    let has_deferred_unique_constraint = rhs_constraints.constraints.iter().any(|c| {
-        // Constraint is deferred (references tables not yet joined)
-        let is_deferred = !c.lhs_mask.is_empty() && !lhs_mask.contains_all(&c.lhs_mask);
-        // AND the constraint looks like a unique lookup (selectivity ~1/row_count)
-        // The selectivity should be close to 1/row_count, not just any small value.
-        // Use a relative tolerance: selectivity within 10% of unique_selectivity,
-        // or for small tables, an absolute tolerance of 0.001.
-        let relative_tolerance = unique_selectivity * 0.1;
-        let is_unique = (c.selectivity - unique_selectivity).abs() < relative_tolerance.max(0.001);
-        is_deferred && is_unique
-    });
-
-    // Check if there's a usable UNIQUE constraint (one that enables index lookup)
-    // A constraint is "usable unique" if it's currently usable AND has unique selectivity
-    let has_usable_unique_constraint = rhs_constraints.constraints.iter().any(|c| {
-        let is_usable = lhs_mask.contains_all(&c.lhs_mask);
-        let relative_tolerance = unique_selectivity * 0.1;
-        let is_unique = (c.selectivity - unique_selectivity).abs() < relative_tolerance.max(0.001);
-        is_usable && is_unique
-    });
-
-    // Count usable JOIN constraints (constraints that reference tables in lhs_mask)
-    // A join constraint actually connects this table to the already-joined set.
-    // Constant filters (like r_name = 'ASIA') have empty lhs_mask and don't count as join constraints.
-    let usable_join_constraint_count = rhs_constraints
-        .constraints
-        .iter()
-        .filter(|c| !c.lhs_mask.is_empty() && lhs_mask.contains_all(&c.lhs_mask))
-        .count();
-
-    // Penalize cartesian products: if we're not the first table and have NO usable JOIN constraints,
-    // this creates a cartesian product with the previous tables, which is very expensive.
-    // A table might have usable FILTER constraints (like r_name='ASIA') but no JOIN constraints,
-    // which would still result in a cartesian product.
-    if !lhs_mask.is_empty() && usable_join_constraint_count == 0 && has_deferred_constraints {
-        // Cartesian product penalty: proportional to the product of both sides.
-        // This represents the actual row explosion that would occur.
-        // We use a multiplier that makes cartesian joins very unattractive.
-        let cartesian_penalty = rhs_base_rows * input_cardinality as f64 * 0.1;
-
-        cost = cost + Cost(cartesian_penalty);
-    }
-
-    // Penalize if:
-    // 1. There's a deferred unique constraint (we could do better by placing this table later)
-    // 2. AND we don't already have a usable unique constraint (placing later would actually help)
-    let should_penalize = has_deferred_unique_constraint && !has_usable_unique_constraint;
-
-    if should_penalize {
-        // No usable constraints now, but there are deferred ones.
-        // This means we're scanning a table that could be looked up by index.
-        //
-        // The penalty needs to be large enough to outweigh the apparent benefit
-        // of scanning a small table first. We estimate what the join cost would be
-        // if we scanned this table vs if we looked it up later.
-        //
-        // If we scan a small table (N rows) first, and then join with a large table (M rows),
-        // we produce N*M intermediate rows. But if we scan the large table first and look up
-        // the small table, we produce M rows with M lookups.
-        //
-        // Penalty: assume this table would be looked up ~1000 times if placed later.
-        // This is a heuristic that works for typical star schema queries.
-        let estimated_future_lookups = 1000.0_f64.max(rhs_base_rows);
-        let scan_waste = rhs_base_rows * estimated_future_lookups;
-        cost = cost + Cost(scan_waste);
-    }
+    let cost = lhs_cost + best_access_method.cost;
 
     if cost > cost_upper_bound {
         return Ok(None);
