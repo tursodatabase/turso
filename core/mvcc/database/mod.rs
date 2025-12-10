@@ -1233,6 +1233,15 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     /// 4. Promote the bootstrap connection to a regular connection so that it reads from the MV store again
     /// 5. Make sure schema changes reflected from deserialized logical log are captured in the schema
     pub fn bootstrap(&self, bootstrap_conn: Arc<Connection>) -> Result<()> {
+        // Initialize global_header from pager's page 1
+        {
+            let pager = bootstrap_conn.pager.load();
+            let header = pager
+                .io
+                .block(|| pager.with_header(|header| *header))
+                .expect("failed to read database header");
+            self.global_header.write().replace(header);
+        }
         {
             let schema = bootstrap_conn.schema.read();
             let sqlite_schema_root_pages = {
