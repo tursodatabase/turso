@@ -124,6 +124,7 @@ pub fn translate_inner(
     let is_write = matches!(
         stmt,
         ast::Stmt::AlterTable { .. }
+            | ast::Stmt::Analyze { .. }
             | ast::Stmt::CreateIndex { .. }
             | ast::Stmt::CreateTable { .. }
             | ast::Stmt::CreateTrigger { .. }

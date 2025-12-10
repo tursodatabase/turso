@@ -21,6 +21,7 @@ pub mod schema;
 #[cfg(feature = "series")]
 mod series;
 pub mod state_machine;
+mod stats;
 pub mod storage;
 #[allow(dead_code)]
 #[cfg(feature = "time")]
@@ -43,6 +44,7 @@ mod numeric;
 
 use crate::index_method::IndexMethod;
 use crate::schema::Trigger;
+use crate::stats::refresh_analyze_stats;
 use crate::storage::checksum::CHECKSUM_REQUIRED_RESERVED_BYTES;
 use crate::storage::encryption::AtomicCipherMode;
 use crate::storage::pager::{self, AutoVacuumMode, HeaderRef};
@@ -678,6 +680,7 @@ impl Database {
         let builtin_syms = self.builtin_syms.read();
         // add built-in extensions symbols to the connection to prevent having to load each time
         conn.syms.write().extend(&builtin_syms);
+        refresh_analyze_stats(&conn);
         Ok(conn)
     }
 
@@ -1462,6 +1465,8 @@ impl Connection {
         };
         // TODO: This function below is synchronous, make it async
         parse_schema_rows(stmt, &mut fresh, &self.syms.read(), mv_tx, existing_views)?;
+        // Best-effort load stats if sqlite_stat1 is present and DB is initialized.
+        refresh_analyze_stats(self);
 
         tracing::debug!(
             "reparse_schema: schema_version={}, tables={:?}",
@@ -2724,6 +2729,13 @@ impl Statement {
             let mut conn_metrics = self.program.connection.metrics.write();
             conn_metrics.record_statement(self.state.metrics.clone());
             self.busy = false;
+            drop(conn_metrics);
+
+            // After ANALYZE completes, refresh in-memory stats so planners can use them.
+            let sql = self.program.sql.trim_start();
+            if sql.to_ascii_uppercase().starts_with("ANALYZE") {
+                refresh_analyze_stats(&self.program.connection);
+            }
         } else {
             self.busy = true;
         }

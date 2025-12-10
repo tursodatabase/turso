@@ -1,5 +1,5 @@
 use crate::{
-    schema::{Column, Index},
+    schema::{Column, Index, Schema},
     translate::{
         collate::get_collseq_from_expr,
         expr::{as_binary_components, comparison_affinity},
@@ -171,29 +171,95 @@ pub struct TableConstraints {
     pub candidates: Vec<ConstraintUseCandidate>,
 }
 
-/// In lieu of statistics, we estimate that an equality filter will reduce the output set to 1% of its size.
-const SELECTIVITY_EQ: f64 = 0.01;
+/// In lieu of statistics, we estimate that an equality filter on an unindexed column will reduce the output set to 10% of its size.
+const SELECTIVITY_EQ_FALLBACK_UNINDEXED: f64 = 0.1;
+/// In lieu of statistics, we estimate that an equality filter on an indexed column will reduce the output set to 1% of its size (users are likely to create indexes on columns that are very selective).
+const SELECTIVITY_EQ_FALLBACK_INDEXED: f64 = 0.01;
 /// In lieu of statistics, we estimate that a range filter will reduce the output set to 40% of its size.
-const SELECTIVITY_RANGE: f64 = 0.4;
+const SELECTIVITY_RANGE_FALLBACK: f64 = 0.4;
 /// In lieu of statistics, we estimate that other filters will reduce the output set to 90% of its size.
 const SELECTIVITY_OTHER: f64 = 0.9;
 
-const SELECTIVITY_UNIQUE_EQUALITY: f64 = 1.0 / ESTIMATED_HARDCODED_ROWS_PER_TABLE as f64;
+/// Estimate the selectivity of a constraint based on the operator, column type, and ANALYZE stats.
+///
+/// When ANALYZE stats are available, we use:
+/// - For unique/PK columns: 1 / row_count (one row expected per lookup)
+/// - For non-unique indexed columns: uses index stats to find avg rows per distinct value
+///
+/// The sqlite_stat1 format stores: total_rows, avg_rows_per_key_col1, avg_rows_per_key_col1_col2, ...
+/// So selectivity = avg_rows_per_key / total_rows
+///
+/// Falls back to hardcoded estimates when stats are unavailable.
+fn estimate_selectivity(
+    schema: &Schema,
+    table_name: &str,
+    column: Option<&Column>,
+    column_pos: Option<usize>,
+    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    op: ast::Operator,
+) -> f64 {
+    // Get ANALYZE stats for this table if available
+    let table_stats = schema.analyze_stats.table_stats(table_name);
+    let row_count = table_stats.and_then(|s| s.row_count).unwrap_or(0);
 
-/// Estimate the selectivity of a constraint based on the operator and the column type.
-fn estimate_selectivity(column: Option<&Column>, op: ast::Operator) -> f64 {
     match op {
         ast::Operator::Equals => {
-            if column.is_some_and(|c| c.is_rowid_alias() || c.primary_key()) {
-                SELECTIVITY_UNIQUE_EQUALITY
+            let is_pk_or_rowid_alias =
+                column.is_some_and(|c| c.is_rowid_alias() || c.primary_key());
+
+            let selectivity_when_unique = if row_count > 0 {
+                1.0 / row_count as f64
             } else {
-                SELECTIVITY_EQ
+                // Fallback: use hardcoded estimate based on expected table size
+                1.0 / ESTIMATED_HARDCODED_ROWS_PER_TABLE as f64
+            };
+
+            if is_pk_or_rowid_alias {
+                selectivity_when_unique
+            } else if let Some(col_pos) = column_pos {
+                // For non-unique columns, find an index containing this column and use its stats
+                if let Some(indexes) = available_indexes.get(table_name) {
+                    for index in indexes {
+                        // Check if this index has our column as its first column
+                        // (selectivity is most accurate when column is leftmost in index)
+                        if let Some(idx_col_pos) = index.column_table_pos_to_index_pos(col_pos) {
+                            // Only use stats if column is first in index (idx_col_pos == 0)
+                            // because that's when the distinct count is most useful
+                            if idx_col_pos == 0 {
+                                if index.unique {
+                                    return selectivity_when_unique;
+                                }
+                                if let Some(stats) = table_stats {
+                                    if let Some(idx_stat) = stats.index_stats.get(&index.name) {
+                                        // distinct_per_prefix[0] = avg rows per distinct value for first column
+                                        if let (Some(total), Some(&avg_rows)) = (
+                                            idx_stat.total_rows,
+                                            idx_stat.distinct_per_prefix.first(),
+                                        ) {
+                                            if total > 0 && avg_rows > 0 {
+                                                // selectivity = avg_rows_per_key / total_rows
+                                                return avg_rows as f64 / total as f64;
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    return SELECTIVITY_EQ_FALLBACK_INDEXED;
+                                }
+                            }
+                        }
+                    }
+                }
+                // Fallback: use hardcoded selectivity for non-indexed columns
+                // Don't scale by row_count - keep it distinct from PK selectivity
+                SELECTIVITY_EQ_FALLBACK_UNINDEXED
+            } else {
+                SELECTIVITY_EQ_FALLBACK_UNINDEXED
             }
         }
-        ast::Operator::Greater => SELECTIVITY_RANGE,
-        ast::Operator::GreaterEquals => SELECTIVITY_RANGE,
-        ast::Operator::Less => SELECTIVITY_RANGE,
-        ast::Operator::LessEquals => SELECTIVITY_RANGE,
+        ast::Operator::Greater
+        | ast::Operator::GreaterEquals
+        | ast::Operator::Less
+        | ast::Operator::LessEquals => SELECTIVITY_RANGE_FALLBACK,
         _ => SELECTIVITY_OTHER,
     }
 }
@@ -224,6 +290,7 @@ pub fn constraints_from_where_clause(
     table_references: &TableReferences,
     available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
     subqueries: &[NonFromClauseSubquery],
+    schema: &Schema,
 ) -> Result<Vec<TableConstraints>> {
     let mut constraints = Vec::new();
 
@@ -269,6 +336,7 @@ pub fn constraints_from_where_clause(
             }
 
             // If either the LHS or RHS of the constraint is a column from the table, add the constraint.
+            let table_name = table_reference.table.get_name();
             match lhs {
                 ast::Expr::Column { table, column, .. } => {
                     if *table == table_reference.internal_id {
@@ -279,7 +347,14 @@ pub fn constraints_from_where_clause(
                             table_col_pos: Some(*column),
                             expr: None,
                             lhs_mask: table_mask_from_expr(rhs, table_references, subqueries)?,
-                            selectivity: estimate_selectivity(Some(table_column), operator),
+                            selectivity: estimate_selectivity(
+                                schema,
+                                table_name,
+                                Some(table_column),
+                                Some(*column),
+                                available_indexes,
+                                operator,
+                            ),
                             usable: true,
                         });
                     }
@@ -297,7 +372,14 @@ pub fn constraints_from_where_clause(
                             table_col_pos: rowid_alias_column,
                             expr: None,
                             lhs_mask: table_mask_from_expr(rhs, table_references, subqueries)?,
-                            selectivity: estimate_selectivity(Some(table_column), operator),
+                            selectivity: estimate_selectivity(
+                                schema,
+                                table_name,
+                                Some(table_column),
+                                rowid_alias_column,
+                                available_indexes,
+                                operator,
+                            ),
                             usable: true,
                         });
                     }
@@ -331,7 +413,14 @@ pub fn constraints_from_where_clause(
                             table_col_pos: Some(*column),
                             expr: None,
                             lhs_mask: table_mask_from_expr(lhs, table_references, subqueries)?,
-                            selectivity: estimate_selectivity(Some(table_column), operator),
+                            selectivity: estimate_selectivity(
+                                schema,
+                                table_name,
+                                Some(table_column),
+                                Some(*column),
+                                available_indexes,
+                                operator,
+                            ),
                             usable: true,
                         });
                     }
@@ -346,7 +435,14 @@ pub fn constraints_from_where_clause(
                             table_col_pos: rowid_alias_column,
                             expr: None,
                             lhs_mask: table_mask_from_expr(lhs, table_references, subqueries)?,
-                            selectivity: estimate_selectivity(Some(table_column), operator),
+                            selectivity: estimate_selectivity(
+                                schema,
+                                table_name,
+                                Some(table_column),
+                                rowid_alias_column,
+                                available_indexes,
+                                operator,
+                            ),
                             usable: true,
                         });
                     }

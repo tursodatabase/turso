@@ -1,10 +1,9 @@
 use std::sync::Arc;
 
-use turso_parser::ast;
-
 use crate::{
     bail_parse_error,
-    schema::BTreeTable,
+    function::{Func, FuncCtx, ScalarFunc},
+    schema::{BTreeTable, Index, RESERVED_TABLE_PREFIXES},
     storage::pager::CreateBTreeFlags,
     translate::{
         emitter::Resolver,
@@ -12,27 +11,88 @@ use crate::{
     },
     util::normalize_ident,
     vdbe::{
+        affinity::Affinity,
         builder::{CursorType, ProgramBuilder},
-        insn::{Insn, RegisterOrLiteral},
+        insn::{CmpInsFlags, Cookie, Insn, RegisterOrLiteral},
     },
     Result,
 };
+use turso_parser::ast;
 
 pub fn translate_analyze(
     target_opt: Option<ast::QualifiedName>,
     resolver: &Resolver,
     mut program: ProgramBuilder,
 ) -> Result<ProgramBuilder> {
-    let Some(target) = target_opt else {
-        bail_parse_error!("ANALYZE with no target is not supported");
+    // Collect all analyze targets up front so we can create/open sqlite_stat1 just once.
+    let analyze_targets: Vec<(Arc<BTreeTable>, Option<Arc<Index>>)> = match target_opt {
+        Some(target) => {
+            let normalized = normalize_ident(target.name.as_str());
+            let db_normalized = target
+                .db_name
+                .as_ref()
+                .map(|db| normalize_ident(db.as_str()));
+            let target_is_main =
+                normalized.eq_ignore_ascii_case("main") || db_normalized.as_deref() == Some("main");
+            if target_is_main {
+                resolver
+                    .schema
+                    .tables
+                    .iter()
+                    .filter_map(|(name, table)| {
+                        if RESERVED_TABLE_PREFIXES
+                            .iter()
+                            .any(|prefix| name.starts_with(prefix))
+                        {
+                            return None;
+                        }
+                        table.btree().map(|bt| (bt, None))
+                    })
+                    .collect()
+            } else if let Some(table) = resolver.schema.get_btree_table(&normalized) {
+                vec![(
+                    table.clone(),
+                    None, // analyze the whole table and its indexes
+                )]
+            } else {
+                // Try to find an index by this name.
+                let mut found: Option<(Arc<BTreeTable>, Arc<Index>)> = None;
+                for (table_name, indexes) in resolver.schema.indexes.iter() {
+                    if let Some(index) = indexes
+                        .iter()
+                        .find(|idx| idx.name.eq_ignore_ascii_case(&normalized))
+                    {
+                        if let Some(table) = resolver.schema.get_btree_table(table_name) {
+                            found = Some((table, index.clone()));
+                            break;
+                        }
+                    }
+                }
+                let Some((table, index)) = found else {
+                    bail_parse_error!("no such table or index: {}", target.name);
+                };
+                vec![(table.clone(), Some(index))]
+            }
+        }
+        None => resolver
+            .schema
+            .tables
+            .iter()
+            .filter_map(|(name, table)| {
+                if RESERVED_TABLE_PREFIXES
+                    .iter()
+                    .any(|prefix| name.starts_with(prefix))
+                {
+                    return None;
+                }
+                table.btree().map(|bt| (bt, None))
+            })
+            .collect(),
     };
-    let normalized = normalize_ident(target.name.as_str());
-    let Some(target_schema) = resolver.schema.get_table(&normalized) else {
-        bail_parse_error!("ANALYZE <schema_name> is not supported");
-    };
-    let Some(target_btree) = target_schema.btree() else {
-        bail_parse_error!("ANALYZE on index is not supported");
-    };
+
+    if analyze_targets.is_empty() {
+        return Ok(program);
+    }
 
     // This is emitted early because SQLite does, and thus generated VDBE matches a bit closer.
     let null_reg = program.alloc_register();
@@ -50,60 +110,6 @@ pub fn translate_analyze(
     if let Some(sqlite_stat1) = resolver.schema.get_btree_table("sqlite_stat1") {
         sqlite_stat1_btreetable = sqlite_stat1.clone();
         sqlite_stat1_source = RegisterOrLiteral::Literal(sqlite_stat1.root_page);
-        // sqlite_stat1 already exists, so we need to remove the row
-        // corresponding to the stats for the table which we're about to
-        // ANALYZE. SQLite implements this as a full table scan over
-        // sqlite_stat1 deleting any rows where the first column (table_name)
-        // is the targeted table.
-        let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(sqlite_stat1.clone()));
-        program.emit_insn(Insn::OpenWrite {
-            cursor_id,
-            root_page: RegisterOrLiteral::Literal(sqlite_stat1.root_page),
-            db: 0,
-        });
-        let after_loop = program.allocate_label();
-        program.emit_insn(Insn::Rewind {
-            cursor_id,
-            pc_if_empty: after_loop,
-        });
-        let loophead = program.allocate_label();
-        program.preassign_label_to_next_insn(loophead);
-        let column_reg = program.alloc_register();
-        program.emit_insn(Insn::Column {
-            cursor_id,
-            column: 0,
-            dest: column_reg,
-            default: None,
-        });
-        let tablename_reg = program.alloc_register();
-        program.emit_insn(Insn::String8 {
-            value: target_schema.get_name().to_string(),
-            dest: tablename_reg,
-        });
-        program.mark_last_insn_constant();
-        // FIXME: The SQLite instruction says p4=BINARY-8 and p5=81.  Neither are currently supported in Turso.
-        program.emit_insn(Insn::Ne {
-            lhs: column_reg,
-            rhs: tablename_reg,
-            target_pc: after_loop,
-            flags: Default::default(),
-            collation: None,
-        });
-        let rowid_reg = program.alloc_register();
-        program.emit_insn(Insn::RowId {
-            cursor_id,
-            dest: rowid_reg,
-        });
-        program.emit_insn(Insn::Delete {
-            cursor_id,
-            table_name: "sqlite_stat1".to_string(),
-            is_part_of_update: false,
-        });
-        program.emit_insn(Insn::Next {
-            cursor_id,
-            pc_if_next: loophead,
-        });
-        program.preassign_label_to_next_insn(after_loop);
     } else {
         // FIXME: Emit ReadCookie 0 3 2
         // FIXME: Emit If 3 +2 0
@@ -152,23 +158,24 @@ pub fn translate_analyze(
             table_root_reg,
             Some(sql.to_string()),
         )?;
-        //FIXME: Emit SetCookie?
+
         let parse_schema_where_clause =
             "tbl_name = 'sqlite_stat1' AND type != 'trigger'".to_string();
         program.emit_insn(Insn::ParseSchema {
             db: sqlite_schema_cursor_id,
             where_clause: Some(parse_schema_where_clause),
         });
+
+        // Bump schema cookie so subsequent statements reparse schema.
+        program.emit_insn(Insn::SetCookie {
+            db: 0,
+            cookie: Cookie::SchemaVersion,
+            value: resolver.schema.schema_version as i32 + 1,
+            p5: 0,
+        });
     };
 
-    if target_schema.columns().iter().any(|c| c.primary_key()) {
-        bail_parse_error!("ANALYZE on tables with primary key is not supported");
-    }
-    if !target_btree.has_rowid {
-        bail_parse_error!("ANALYZE on tables without rowid is not supported");
-    }
-
-    // Count the number of rows in the target table, and insert it into sqlite_stat1.
+    // Count the number of rows in the target table(s), and insert into sqlite_stat1.
     let sqlite_stat1 = sqlite_stat1_btreetable;
     let stat_cursor = program.alloc_cursor_id(CursorType::BTreeTable(sqlite_stat1.clone()));
     program.emit_insn(Insn::OpenWrite {
@@ -176,59 +183,392 @@ pub fn translate_analyze(
         root_page: sqlite_stat1_source,
         db: 0,
     });
-    let target_cursor = program.alloc_cursor_id(CursorType::BTreeTable(target_btree.clone()));
-    program.emit_insn(Insn::OpenRead {
-        cursor_id: target_cursor,
-        root_page: target_btree.root_page,
-        db: 0,
-    });
-    let rowid_reg = program.alloc_register();
-    let record_reg = program.alloc_register();
-    let tablename_reg = program.alloc_register();
-    let indexname_reg = program.alloc_register();
-    let count_reg = program.alloc_register();
-    program.emit_insn(Insn::String8 {
-        value: target_schema.get_name().to_string(),
-        dest: tablename_reg,
-    });
-    program.emit_insn(Insn::Count {
-        cursor_id: target_cursor,
-        target_reg: count_reg,
-        exact: true,
-    });
-    let after_insert = program.allocate_label();
-    program.emit_insn(Insn::IfNot {
-        reg: count_reg,
-        target_pc: after_insert,
-        jump_if_null: false,
-    });
-    program.emit_insn(Insn::Null {
-        dest: indexname_reg,
-        dest_end: None,
-    });
-    program.emit_insn(Insn::MakeRecord {
-        start_reg: tablename_reg,
-        count: 3,
-        dest_reg: record_reg,
-        index_name: None,
-        affinity_str: None,
-    });
-    program.emit_insn(Insn::NewRowid {
-        cursor: stat_cursor,
-        rowid_reg,
-        prev_largest_reg: 0,
-    });
-    // FIXME: SQLite sets OPFLAG_APPEND on the insert, but that's not supported in turso right now.
-    // SQLite doesn't emit the table name, but like... why not?
-    program.emit_insn(Insn::Insert {
-        cursor: stat_cursor,
-        key_reg: rowid_reg,
-        record_reg,
-        flag: Default::default(),
-        table_name: "sqlite_stat1".to_string(),
-    });
-    program.preassign_label_to_next_insn(after_insert);
+
+    for (target_table, target_index) in analyze_targets {
+        if !target_table.has_rowid {
+            bail_parse_error!("ANALYZE on tables without rowid is not supported");
+        }
+
+        // Remove existing stat rows for this target before inserting fresh ones.
+        let rewind_done = program.allocate_label();
+        program.emit_insn(Insn::Rewind {
+            cursor_id: stat_cursor,
+            pc_if_empty: rewind_done,
+        });
+        let loop_start = program.allocate_label();
+        program.preassign_label_to_next_insn(loop_start);
+
+        let tbl_col_reg = program.alloc_register();
+        program.emit_insn(Insn::Column {
+            cursor_id: stat_cursor,
+            column: 0,
+            dest: tbl_col_reg,
+            default: None,
+        });
+        let target_tbl_reg = program.alloc_register();
+        program.emit_insn(Insn::String8 {
+            value: target_table.name.to_string(),
+            dest: target_tbl_reg,
+        });
+        program.mark_last_insn_constant();
+
+        let skip_label = program.allocate_label();
+        program.emit_insn(Insn::Ne {
+            lhs: tbl_col_reg,
+            rhs: target_tbl_reg,
+            target_pc: skip_label,
+            flags: Default::default(),
+            collation: None,
+        });
+
+        if let Some(idx) = target_index.clone() {
+            let idx_col_reg = program.alloc_register();
+            program.emit_insn(Insn::Column {
+                cursor_id: stat_cursor,
+                column: 1,
+                dest: idx_col_reg,
+                default: None,
+            });
+            let target_idx_reg = program.alloc_register();
+            program.emit_insn(Insn::String8 {
+                value: idx.name.to_string(),
+                dest: target_idx_reg,
+            });
+            program.mark_last_insn_constant();
+            program.emit_insn(Insn::Ne {
+                lhs: idx_col_reg,
+                rhs: target_idx_reg,
+                target_pc: skip_label,
+                flags: Default::default(),
+                collation: None,
+            });
+            let rowid_reg = program.alloc_register();
+            program.emit_insn(Insn::RowId {
+                cursor_id: stat_cursor,
+                dest: rowid_reg,
+            });
+            program.emit_insn(Insn::Delete {
+                cursor_id: stat_cursor,
+                table_name: "sqlite_stat1".to_string(),
+                is_part_of_update: false,
+            });
+            program.emit_insn(Insn::Next {
+                cursor_id: stat_cursor,
+                pc_if_next: loop_start,
+            });
+        } else {
+            let rowid_reg = program.alloc_register();
+            program.emit_insn(Insn::RowId {
+                cursor_id: stat_cursor,
+                dest: rowid_reg,
+            });
+            program.emit_insn(Insn::Delete {
+                cursor_id: stat_cursor,
+                table_name: "sqlite_stat1".to_string(),
+                is_part_of_update: false,
+            });
+            program.emit_insn(Insn::Next {
+                cursor_id: stat_cursor,
+                pc_if_next: loop_start,
+            });
+        }
+
+        program.preassign_label_to_next_insn(skip_label);
+        program.emit_insn(Insn::Next {
+            cursor_id: stat_cursor,
+            pc_if_next: loop_start,
+        });
+        program.preassign_label_to_next_insn(rewind_done);
+
+        let target_cursor = program.alloc_cursor_id(CursorType::BTreeTable(target_table.clone()));
+        program.emit_insn(Insn::OpenRead {
+            cursor_id: target_cursor,
+            root_page: target_table.root_page,
+            db: 0,
+        });
+        let rowid_reg = program.alloc_register();
+        let tablename_reg = program.alloc_register();
+        let indexname_reg = program.alloc_register();
+        let stat_text_reg = program.alloc_register();
+        let record_reg = program.alloc_register();
+        let count_reg = program.alloc_register();
+        program.emit_insn(Insn::String8 {
+            value: target_table.name.to_string(),
+            dest: tablename_reg,
+        });
+        program.mark_last_insn_constant();
+        program.emit_insn(Insn::Count {
+            cursor_id: target_cursor,
+            target_reg: count_reg,
+            exact: true,
+        });
+        let after_insert = program.allocate_label();
+        program.emit_insn(Insn::IfNot {
+            reg: count_reg,
+            target_pc: after_insert,
+            jump_if_null: false,
+        });
+        program.emit_insn(Insn::Null {
+            dest: indexname_reg,
+            dest_end: None,
+        });
+        // stat = CAST(count AS TEXT)
+        program.emit_insn(Insn::Copy {
+            src_reg: count_reg,
+            dst_reg: stat_text_reg,
+            extra_amount: 0,
+        });
+        program.emit_insn(Insn::Cast {
+            reg: stat_text_reg,
+            affinity: Affinity::Text,
+        });
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: tablename_reg,
+            count: 3,
+            dest_reg: record_reg,
+            index_name: None,
+            affinity_str: None,
+        });
+        program.emit_insn(Insn::NewRowid {
+            cursor: stat_cursor,
+            rowid_reg,
+            prev_largest_reg: 0,
+        });
+        // FIXME: SQLite sets OPFLAG_APPEND on the insert, but that's not supported in turso right now.
+        // SQLite doesn't emit the table name, but like... why not?
+        program.emit_insn(Insn::Insert {
+            cursor: stat_cursor,
+            key_reg: rowid_reg,
+            record_reg,
+            flag: Default::default(),
+            table_name: "sqlite_stat1".to_string(),
+        });
+        program.preassign_label_to_next_insn(after_insert);
+        // Emit index stats for this table (or for a single index target).
+        let indexes: Vec<Arc<Index>> = match target_index {
+            Some(idx) => vec![idx],
+            None => resolver
+                .schema
+                .get_indices(&target_table.name)
+                .filter(|idx| idx.index_method.is_none()) // skip custom for now
+                .cloned()
+                .collect(),
+        };
+        for index in indexes {
+            emit_index_stats(&mut program, stat_cursor, &target_table, &index);
+        }
+    }
+
     // FIXME: Emit LoadAnalysis
     // FIXME: Emit Expire
     Ok(program)
+}
+
+/// Emit VDBE code to gather and insert statistics for a single index.
+///
+/// This uses the stat_init/stat_push/stat_get functions to collect statistics.
+/// The bytecode scans the index in sorted order, comparing columns to detect
+/// when prefixes change, and calls stat_push with the change index.
+///
+/// The stat string format is: "total avg1 avg2 avg3"
+/// where avgN = ceil(total / distinctN) = average rows per distinct prefix
+fn emit_index_stats(
+    program: &mut ProgramBuilder,
+    stat_cursor: usize,
+    table: &Arc<BTreeTable>,
+    index: &Arc<Index>,
+) {
+    let n_cols = index.columns.len();
+    if n_cols == 0 {
+        return;
+    }
+
+    // Open the index cursor
+    let idx_cursor = program.alloc_cursor_id(CursorType::BTreeIndex(index.clone()));
+    program.emit_insn(Insn::OpenRead {
+        cursor_id: idx_cursor,
+        root_page: index.root_page,
+        db: 0,
+    });
+
+    // Allocate registers contiguously for stat_push(accum, chng):
+    let reg_accum = program.alloc_register();
+    let reg_chng = program.alloc_register();
+
+    // Registers for previous row values and comparison temp
+    let reg_prev_base = program.alloc_registers(n_cols);
+    let reg_temp = program.alloc_register();
+
+    // Initialize the accumulator with stat_init(n_cols)
+    // Reuse reg_chng temporarily for the n_cols argument
+    program.emit_insn(Insn::Integer {
+        value: n_cols as i64,
+        dest: reg_chng,
+    });
+    program.emit_insn(Insn::Function {
+        constant_mask: 0,
+        start_reg: reg_chng,
+        dest: reg_accum,
+        func: FuncCtx {
+            func: Func::Scalar(ScalarFunc::StatInit),
+            arg_count: 1,
+        },
+    });
+
+    // Labels for control flow
+    let lbl_empty = program.allocate_label();
+    let lbl_loop = program.allocate_label();
+    let lbl_stat_push = program.allocate_label();
+
+    // We need one label per column for the update_prev jump targets
+    let lbl_update_prev: Vec<_> = (0..n_cols).map(|_| program.allocate_label()).collect();
+
+    // Rewind the index cursor; if empty, skip to end
+    program.emit_insn(Insn::Rewind {
+        cursor_id: idx_cursor,
+        pc_if_empty: lbl_empty,
+    });
+
+    // First row: set chng=0 and jump to update all prev columns
+    program.emit_insn(Insn::Integer {
+        value: 0,
+        dest: reg_chng,
+    });
+    program.emit_insn(Insn::Goto {
+        target_pc: lbl_update_prev[0],
+    });
+
+    // Main loop: compare columns to find change point
+    program.preassign_label_to_next_insn(lbl_loop);
+
+    // Set reg_chng = 0, then check each column
+    program.emit_insn(Insn::Integer {
+        value: 0,
+        dest: reg_chng,
+    });
+
+    for (i, lbl) in lbl_update_prev.iter().enumerate().take(n_cols) {
+        program.emit_insn(Insn::Column {
+            cursor_id: idx_cursor,
+            column: i,
+            dest: reg_temp,
+            default: None,
+        });
+        program.emit_insn(Insn::Ne {
+            lhs: reg_temp,
+            rhs: reg_prev_base + i,
+            target_pc: *lbl,
+            flags: CmpInsFlags::default().null_eq(),
+            collation: index.columns[i].collation,
+        });
+        // If columns match, increment chng and continue to next column
+        if i < n_cols - 1 {
+            program.emit_insn(Insn::Integer {
+                value: (i + 1) as i64,
+                dest: reg_chng,
+            });
+        }
+    }
+
+    // All columns equal - chng = n_cols (duplicate row), jump over update section to stat_push
+    program.emit_insn(Insn::Integer {
+        value: n_cols as i64,
+        dest: reg_chng,
+    });
+    program.emit_insn(Insn::Goto {
+        target_pc: lbl_stat_push,
+    });
+
+    // Update prev section: emit n_cols consecutive Column instructions that cascade
+    // When col i differs from prev, jump here to update prev[i], prev[i+1], ..., prev[n_cols-1]
+    for (i, lbl) in lbl_update_prev.iter().enumerate().take(n_cols) {
+        program.preassign_label_to_next_insn(*lbl);
+        program.emit_insn(Insn::Column {
+            cursor_id: idx_cursor,
+            column: i,
+            dest: reg_prev_base + i,
+            default: None,
+        });
+        // Fall through to next column update, then to stat_push
+    }
+
+    program.preassign_label_to_next_insn(lbl_stat_push);
+    program.emit_insn(Insn::Function {
+        constant_mask: 0,
+        start_reg: reg_accum,
+        dest: reg_accum,
+        func: FuncCtx {
+            func: Func::Scalar(ScalarFunc::StatPush),
+            arg_count: 2,
+        },
+    });
+
+    // Next iteration
+    program.emit_insn(Insn::Next {
+        cursor_id: idx_cursor,
+        pc_if_next: lbl_loop,
+    });
+
+    // stat_get(accum) to get the final stat string
+    let reg_stat = program.alloc_register();
+    program.emit_insn(Insn::Function {
+        constant_mask: 0,
+        start_reg: reg_accum,
+        dest: reg_stat,
+        func: FuncCtx {
+            func: Func::Scalar(ScalarFunc::StatGet),
+            arg_count: 1,
+        },
+    });
+
+    // Skip insert if stat is NULL (empty index)
+    program.emit_insn(Insn::IsNull {
+        reg: reg_stat,
+        target_pc: lbl_empty,
+    });
+
+    // Insert record into sqlite_stat1
+    // Allocate contiguous registers for MakeRecord: tablename, indexname, stat
+    let record_start = program.alloc_registers(3);
+    program.emit_insn(Insn::String8 {
+        value: table.name.to_string(),
+        dest: record_start,
+    });
+    program.mark_last_insn_constant();
+    program.emit_insn(Insn::String8 {
+        value: index.name.to_string(),
+        dest: record_start + 1,
+    });
+    program.mark_last_insn_constant();
+    program.emit_insn(Insn::Copy {
+        src_reg: reg_stat,
+        dst_reg: record_start + 2,
+        extra_amount: 0,
+    });
+
+    let idx_record_reg = program.alloc_register();
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: record_start,
+        count: 3,
+        dest_reg: idx_record_reg,
+        index_name: None,
+        affinity_str: None,
+    });
+
+    let idx_rowid_reg = program.alloc_register();
+    program.emit_insn(Insn::NewRowid {
+        cursor: stat_cursor,
+        rowid_reg: idx_rowid_reg,
+        prev_largest_reg: 0,
+    });
+    program.emit_insn(Insn::Insert {
+        cursor: stat_cursor,
+        key_reg: idx_rowid_reg,
+        record_reg: idx_record_reg,
+        flag: Default::default(),
+        table_name: "sqlite_stat1".to_string(),
+    });
+
+    // Label for empty index case, just skip the insert
+    program.preassign_label_to_next_insn(lbl_empty);
 }

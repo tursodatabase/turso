@@ -45,6 +45,7 @@ use crate::{
         },
         printf::exec_printf,
     },
+    stats::StatAccum,
     translate::emitter::TransactionMode,
 };
 use crate::{get_cursor, CheckpointMode, Completion, Connection, DatabaseStorage, MvCursor};
@@ -5459,6 +5460,62 @@ pub fn op_function(
                 panic!(
                     "{scalar_func:?} should be stripped during expression translation and never reach VDBE",
                 );
+            }
+            ScalarFunc::StatInit => {
+                // stat_init(n_col): Initialize a statistics accumulator
+                // Returns a blob containing the serialized StatAccum
+                assert!(arg_count >= 1);
+                let n_col = match state.registers[*start_reg].get_value() {
+                    Value::Integer(n) => *n as usize,
+                    _ => 0,
+                };
+                let accum = StatAccum::new(n_col);
+                state.registers[*dest] = Register::Value(Value::Blob(accum.to_bytes()));
+            }
+            ScalarFunc::StatPush => {
+                // stat_push(accum_blob, i_chng): Push a row into the accumulator
+                // i_chng is the index of the leftmost column that changed from the previous row
+                // Returns the updated accumulator blob
+                assert!(arg_count >= 2);
+                let accum_blob = state.registers[*start_reg].get_value();
+                let i_chng = match state.registers[*start_reg + 1].get_value() {
+                    Value::Integer(n) => *n as usize,
+                    _ => 0,
+                };
+                let result = match accum_blob {
+                    Value::Blob(bytes) => {
+                        if let Some(mut accum) = StatAccum::from_bytes(bytes) {
+                            accum.push(i_chng);
+                            Value::Blob(accum.to_bytes())
+                        } else {
+                            Value::Null
+                        }
+                    }
+                    _ => Value::Null,
+                };
+                state.registers[*dest] = Register::Value(result);
+            }
+            ScalarFunc::StatGet => {
+                // stat_get(accum_blob): Get the stat1 string from the accumulator
+                // Returns the stat string "total avg1 avg2 ..."
+                assert!(arg_count >= 1);
+                let accum_blob = state.registers[*start_reg].get_value();
+                let result = match accum_blob {
+                    Value::Blob(bytes) => {
+                        if let Some(accum) = StatAccum::from_bytes(bytes) {
+                            let stat_str = accum.get_stat1();
+                            if stat_str.is_empty() {
+                                Value::Null
+                            } else {
+                                Value::build_text(stat_str)
+                            }
+                        } else {
+                            Value::Null
+                        }
+                    }
+                    _ => Value::Null,
+                };
+                state.registers[*dest] = Register::Value(result);
             }
         },
         crate::function::Func::Vector(vector_func) => {
