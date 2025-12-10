@@ -14,6 +14,8 @@ pub struct TempDatabase {
     pub db_opts: turso_core::DatabaseOpts,
     #[allow(dead_code)]
     pub db_flags: turso_core::OpenFlags,
+    #[allow(dead_code)]
+    pub init_sql: Option<String>,
 }
 unsafe impl Send for TempDatabase {}
 
@@ -93,12 +95,12 @@ impl TempDatabaseBuilder {
             }
         };
 
-        if let Some(init_sql) = self.init_sql {
+        if let Some(init_sql) = &self.init_sql {
             let connection = rusqlite::Connection::open(&db_path).unwrap();
             connection
                 .pragma_update(None, "journal_mode", "wal")
                 .unwrap();
-            connection.execute(&init_sql, ()).unwrap();
+            connection.execute(init_sql, ()).unwrap();
         }
 
         let io = Arc::new(turso_core::PlatformIO::new().unwrap());
@@ -116,6 +118,7 @@ impl TempDatabaseBuilder {
             db,
             db_opts: opts,
             db_flags: flags,
+            init_sql: self.init_sql,
         }
     }
 }

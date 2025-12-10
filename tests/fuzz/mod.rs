@@ -59,7 +59,11 @@ mod fuzz_tests {
     )]
     pub fn rowid_seek_fuzz(db: TempDatabase) {
         let _ = tracing_subscriber::fmt::try_init();
-        let sqlite_conn = rusqlite::Connection::open(db.path.clone()).unwrap();
+        let sqlite_path = db.path.parent().unwrap().join("sqlite.db");
+        let sqlite_conn = rusqlite::Connection::open(&sqlite_path).unwrap();
+        sqlite_conn
+            .execute(db.init_sql.as_ref().unwrap(), [])
+            .unwrap();
 
         let (mut rng, _seed) = rng_from_time_or_env();
 
@@ -80,7 +84,7 @@ mod fuzz_tests {
         );
         sqlite_conn.execute(&insert, params![]).unwrap();
         sqlite_conn.close().unwrap();
-        let sqlite_conn = rusqlite::Connection::open(db.path.clone()).unwrap();
+        let sqlite_conn = rusqlite::Connection::open(&sqlite_path).unwrap();
         let limbo_conn = db.connect_limbo();
         limbo_exec_rows(&limbo_conn, &insert);
 
@@ -173,7 +177,11 @@ mod fuzz_tests {
 
     #[turso_macros::test(mvcc, init_sql = "CREATE TABLE t (x PRIMARY KEY)")]
     pub fn index_scan_fuzz(db: TempDatabase) {
-        let sqlite_conn = rusqlite::Connection::open(db.path.clone()).unwrap();
+        let sqlite_path = db.path.parent().unwrap().join("sqlite.db");
+        let sqlite_conn = rusqlite::Connection::open(&sqlite_path).unwrap();
+        sqlite_conn
+            .execute(db.init_sql.as_ref().unwrap(), [])
+            .unwrap();
 
         let insert = format!(
             "INSERT INTO t VALUES {}",
@@ -184,7 +192,7 @@ mod fuzz_tests {
         );
         sqlite_conn.execute(&insert, params![]).unwrap();
         sqlite_conn.close().unwrap();
-        let sqlite_conn = rusqlite::Connection::open(db.path.clone()).unwrap();
+        let sqlite_conn = rusqlite::Connection::open(&sqlite_path).unwrap();
         let limbo_conn = db.connect_limbo();
         limbo_exec_rows(&limbo_conn, &insert);
 
