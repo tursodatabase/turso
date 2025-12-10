@@ -88,6 +88,12 @@ enum SeekState {
 }
 
 #[derive(Debug, Clone)]
+enum CountState {
+    Rewind,
+    NextBtree { count: usize },
+    CheckBtreeKey { count: usize },
+}
+#[derive(Debug, Clone)]
 enum MvccLazyCursorState {
     Next(NextState),
     Prev(PrevState),
@@ -253,6 +259,8 @@ pub struct MvccLazyCursor<Clock: LogicalClock> {
     record_cursor: RefCell<RecordCursor>,
     next_rowid_lock: Arc<RwLock<()>>,
     state: RefCell<Option<MvccLazyCursorState>>,
+    // we keep count_state separate to be able to call other public functions like rewind and next
+    count_state: RefCell<Option<CountState>>,
     btree_advance_state: RefCell<Option<AdvanceBtreeState>>,
     /// Dual-cursor peek state for proper iteration
     dual_peek: RefCell<DualCursorPeek>,
@@ -285,6 +293,7 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
             record_cursor: RefCell::new(RecordCursor::new()),
             next_rowid_lock: Arc::new(RwLock::new(())),
             state: RefCell::new(None),
+            count_state: RefCell::new(None),
             btree_advance_state: RefCell::new(None),
             dual_peek: RefCell::new(DualCursorPeek {
                 mvcc_peek: CursorPeek::Uninitialized,
@@ -1448,7 +1457,38 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
     }
 
     fn count(&mut self) -> Result<IOResult<usize>> {
-        todo!()
+        loop {
+            let state = self.count_state.borrow().clone();
+            match state {
+                None => {
+                    self.count_state.replace(Some(CountState::Rewind));
+                }
+                Some(CountState::Rewind) => {
+                    return_if_io!(self.rewind());
+                    self.count_state
+                        .replace(Some(CountState::CheckBtreeKey { count: 0 }));
+                }
+                Some(CountState::CheckBtreeKey { count }) => {
+                    if let CursorPosition::Loaded {
+                        row_id: _,
+                        in_btree: _,
+                    } = self.get_current_pos()
+                    {
+                        self.count_state
+                            .replace(Some(CountState::NextBtree { count: count + 1 }));
+                    } else {
+                        self.count_state.replace(None);
+                        return Ok(IOResult::Done(count));
+                    }
+                }
+                Some(CountState::NextBtree { count }) => {
+                    // advance the btree cursor skips non valid keys
+                    return_if_io!(self.next());
+                    self.count_state
+                        .replace(Some(CountState::CheckBtreeKey { count }));
+                }
+            }
+        }
     }
 
     /// Returns true if the is not pointing to any row.
