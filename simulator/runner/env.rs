@@ -174,21 +174,48 @@ where
 
     pub fn apply_snapshot(&mut self) {
         if let Some(transaction_tables) = self.transaction_tables.take() {
-            // Renames must be applied first so schema sync can match tables by new name
+            // Apply all operations in recorded order, including renames.
+            // This ensures operations like INSERT foo, RENAME foo->bar, INSERT bar
+            // are applied correctly.
             for op in &transaction_tables.operations {
-                if let RowOperation::RenameTable { old_name, new_name } = op {
-                    if let Some(committed) = self
-                        .commited_tables
-                        .iter_mut()
-                        .find(|t| &t.name == old_name)
-                    {
-                        committed.name = new_name.clone();
+                match op {
+                    RowOperation::Insert { table_name, row } => {
+                        if let Some(committed) = self
+                            .commited_tables
+                            .iter_mut()
+                            .find(|t| &t.name == table_name)
+                        {
+                            committed.rows.push(row.clone());
+                        }
+                    }
+                    RowOperation::Delete { table_name, row } => {
+                        if let Some(committed) = self
+                            .commited_tables
+                            .iter_mut()
+                            .find(|t| &t.name == table_name)
+                        {
+                            if let Some(pos) = committed.rows.iter().position(|r| r == row) {
+                                committed.rows.remove(pos);
+                            }
+                        }
+                    }
+                    RowOperation::DropTable { table_name } => {
+                        self.commited_tables.retain(|t| &t.name != table_name);
+                    }
+                    RowOperation::RenameTable { old_name, new_name } => {
+                        if let Some(committed) = self
+                            .commited_tables
+                            .iter_mut()
+                            .find(|t| &t.name == old_name)
+                        {
+                            committed.name = new_name.clone();
+                        }
                     }
                 }
             }
 
             // Sync schema (columns, indexes) and create new tables.
-            // Row data for new tables will be populated by Insert operations below.
+            // This happens after row operations so table names are in their final state.
             for current_table in &transaction_tables.current_tables {
                 if let Some(committed) = self
                     .commited_tables
@@ -235,36 +262,6 @@ where
                     let mut new_table = current_table.clone();
                     new_table.rows = Vec::new();
                     self.commited_tables.push(new_table);
-                }
-            }
-
-            // Apply row operations in recorded order
-            for op in &transaction_tables.operations {
-                match op {
-                    RowOperation::Insert { table_name, row } => {
-                        if let Some(committed) = self
-                            .commited_tables
-                            .iter_mut()
-                            .find(|t| &t.name == table_name)
-                        {
-                            committed.rows.push(row.clone());
-                        }
-                    }
-                    RowOperation::Delete { table_name, row } => {
-                        if let Some(committed) = self
-                            .commited_tables
-                            .iter_mut()
-                            .find(|t| &t.name == table_name)
-                        {
-                            if let Some(pos) = committed.rows.iter().position(|r| r == row) {
-                                committed.rows.remove(pos);
-                            }
-                        }
-                    }
-                    RowOperation::DropTable { table_name } => {
-                        self.commited_tables.retain(|t| &t.name != table_name);
-                    }
-                    RowOperation::RenameTable { .. } => {}
                 }
             }
         }
