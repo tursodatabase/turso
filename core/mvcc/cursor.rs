@@ -942,6 +942,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                     }
                 }
                 CursorPosition::End => {
+                    self.state.replace(None);
                     return Ok(IOResult::Done(false));
                 }
             };
