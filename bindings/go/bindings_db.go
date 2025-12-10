@@ -285,9 +285,9 @@ var (
 )
 
 func init() {
-	loggerCallback = purego.NewCallback(func(p uintptr) {
+	loggerCallback = purego.NewCallback(func(p uintptr) uintptr {
 		if p == 0 || loggerHandler == nil {
-			return
+			return 0
 		}
 		cl := (*turso_log_t)(unsafe.Pointer(p))
 		log := TursoLog{
@@ -300,6 +300,7 @@ func init() {
 		}
 		// SAFETY: strings are copied above; no freeing needed.
 		loggerHandler(log)
+		return 0
 	})
 }
 
