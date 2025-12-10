@@ -6229,6 +6229,8 @@ mod fuzz_tests {
     enum Action {
         CreateTable,
         CreateIndex,
+        #[warn(dead_code)]
+        InsertData,
         Select,
     }
 
@@ -6239,7 +6241,9 @@ mod fuzz_tests {
         match rng.random_range(0..100) {
             0..=14 => Action::CreateTable,  // ~15%
             15..=34 => Action::CreateIndex, // ~20%
-            _ => Action::Select,            // ~65%
+            // temporary disable this action - because right now we still have bug with affinity for insertion to the indices
+            // 35..=55 => Action::InsertData,  // ~20%
+            _ => Action::Select, // leftover
         }
     }
 
@@ -6319,6 +6323,17 @@ mod fuzz_tests {
                         let sqlite_result = sqlite_conn.execute(&query, ());
                         assert_eq!(turso_result.is_ok(), sqlite_result.is_ok());
                         state.indices.push(idx);
+                    }
+                    Action::InsertData => {
+                        let t_idx = rng.random_range(0..state.tables.len());
+                        let table = state.tables[t_idx].clone();
+                        let ins_cnt = rng.random_range(0..=30);
+                        for ins_stmt in insert_random_rows_stmt(&mut rng, &table, ins_cnt) {
+                            tracing::info!("insert: {}", ins_stmt);
+                            let turso_result = turso_conn.execute(&ins_stmt);
+                            let sqlite_result = sqlite_conn.execute(&ins_stmt, ());
+                            assert_eq!(turso_result.is_ok(), sqlite_result.is_ok());
+                        }
                     }
                     Action::Select => {
                         if state.tables.is_empty() {
