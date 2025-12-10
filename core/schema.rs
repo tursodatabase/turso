@@ -668,45 +668,10 @@ impl Schema {
             let table = self.get_btree_table(&automatic_index.0).unwrap();
             let mut automatic_indexes = automatic_index.1;
             automatic_indexes.reverse(); // reverse so we can pop() without shifting array elements, while still processing in left-to-right order
+
+            // we must process unique_sets in this exact order in order to emit automatic indices schema entries in the same order
             let mut pk_index_added = false;
-            for unique_set in table.unique_sets.iter().filter(|us| us.columns.len() == 1) {
-                let col_name = &unique_set.columns.first().unwrap().0;
-                let Some((pos_in_table, column)) = table.get_column(col_name) else {
-                    return Err(LimboError::ParseError(format!(
-                        "Column {col_name} not found in table {}",
-                        table.name
-                    )));
-                };
-                if column.primary_key() && unique_set.is_primary_key {
-                    if column.is_rowid_alias() {
-                        // rowid alias, no index needed
-                        continue;
-                    }
-                    assert!(table.primary_key_columns.first().unwrap().0 == *col_name, "trying to add a primary key index for column that is not the first column in the primary key: {} != {}", table.primary_key_columns.first().unwrap().0, col_name);
-                    // Add single column primary key index
-                    assert!(
-                        !pk_index_added,
-                        "trying to add a second primary key index for table {}",
-                        table.name
-                    );
-                    pk_index_added = true;
-                    self.add_index(Arc::new(Index::automatic_from_primary_key(
-                        table.as_ref(),
-                        automatic_indexes.pop().unwrap(),
-                        1,
-                    )?))?;
-                } else {
-                    // Add single column unique index
-                    if let Some(autoidx) = automatic_indexes.pop() {
-                        self.add_index(Arc::new(Index::automatic_from_unique(
-                            table.as_ref(),
-                            autoidx,
-                            vec![(pos_in_table, unique_set.columns.first().unwrap().1)],
-                        )?))?;
-                    }
-                }
-            }
-            for unique_set in table.unique_sets.iter().filter(|us| us.columns.len() > 1) {
+            for unique_set in &table.unique_sets {
                 if unique_set.is_primary_key {
                     assert!(table.primary_key_columns.len() == unique_set.columns.len(), "trying to add a {}-column primary key index for table {}, but the table has {} primary key columns", unique_set.columns.len(), table.name, table.primary_key_columns.len());
                     // Add composite primary key index
@@ -716,6 +681,21 @@ impl Schema {
                         table.name
                     );
                     pk_index_added = true;
+
+                    if unique_set.columns.len() == 1 {
+                        let col_name = &unique_set.columns.first().unwrap().0;
+                        let Some((_, column)) = table.get_column(col_name) else {
+                            return Err(LimboError::ParseError(format!(
+                                "Column {col_name} not found in table {}",
+                                table.name
+                            )));
+                        };
+                        if column.is_rowid_alias() {
+                            // rowid alias, no index needed
+                            continue;
+                        }
+                    }
+
                     self.add_index(Arc::new(Index::automatic_from_primary_key(
                         table.as_ref(),
                         automatic_indexes.pop().unwrap(),

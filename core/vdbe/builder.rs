@@ -1162,7 +1162,9 @@ impl ProgramBuilder {
 
         self.parameters.list.dedup();
 
-        if !self.table_references.is_empty() && matches!(self.txn_mode, TransactionMode::Write) {
+        // before, we required stmt subtransaction only if !self.table_references.is_empty()
+        // this is wrong in case of CREATE UNIQUE INDEX statements - as they can fail with CONSTRAINT error and we need to properly behave in this case
+        if matches!(self.txn_mode, TransactionMode::Write) {
             self.needs_stmt_subtransactions = true;
         }
 
