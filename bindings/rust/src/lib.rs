@@ -252,6 +252,8 @@ impl Statement {
     }
     /// Query the database with this prepared statement.
     pub async fn query(&mut self, params: impl IntoParams) -> Result<Rows> {
+        self.reset()?;
+
         let mut stmt = self.inner.lock().unwrap();
         let params = params.into_params()?;
         match params {
