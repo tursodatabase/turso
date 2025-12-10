@@ -936,6 +936,35 @@ do_execsql_test json_set_add_array_in_array_in_nested_object_out_of_bounds {
    SELECT json_set('{}', '$.object[123].another', 'value', '$.field', 'value');
 } {{{"field":"value"}}}
 
+# Tests for json_insert() function
+do_execsql_test json_insert_new_key_in_nested_object {
+   SELECT json_insert('{"a": {"b": {"c": 5}}}', '$.a.b.d', 10);
+} {{{"a":{"b":{"c":5,"d":10}}}}}
+
+do_execsql_test json_insert_existing_key_not_replaced {
+   SELECT json_insert('{"a": 1}', '$.a', 2);
+} {{{"a":1}}}
+
+do_execsql_test json_insert_new_key_simple {
+   SELECT json_insert('{"a": 1}', '$.b', 2);
+} {{{"a":1,"b":2}}}
+
+do_execsql_test json_insert_deeply_nested_new_key {
+   SELECT json_insert('{"level1": {"level2": {"level3": {"value": 100}}}}', '$.level1.level2.level3.new_value', 200);
+} {{{"level1":{"level2":{"level3":{"value":100,"new_value":200}}}}}}
+
+do_execsql_test json_insert_array_append {
+   SELECT json_insert('[1, 2, 3]', '$[3]', 4);
+} {{[1,2,3,4]}}
+
+do_execsql_test json_insert_array_existing_not_replaced {
+   SELECT json_insert('[1, 2, 3]', '$[1]', 99);
+} {{[1,2,3]}}
+
+do_execsql_test json_insert_multiple_paths {
+   SELECT json_insert('{"a": 1}', '$.b', 2, '$.c', 3);
+} {{{"a":1,"b":2,"c":3}}}
+
 # The json_quote() function transforms an SQL value into a JSON value.
 # String values are quoted and interior quotes are escaped.  NULL values
 # are rendered as the unquoted string "null".
