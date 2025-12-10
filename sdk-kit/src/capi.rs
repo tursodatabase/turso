@@ -583,30 +583,22 @@ pub fn value_from_c_value(stmt: *mut c::turso_statement_t, index: usize) -> turs
 
 #[cfg(test)]
 mod tests {
-    use std::ffi::CString;
     use std::ffi::{CStr, CString};
 
-    use turso_core::{types::Text, Value};
+    use turso_core::types::Text;
 
-    use crate::{
-        capi::{
-            self,
-            c::{
-                self, turso_connection_deinit, turso_connection_prepare_single,
-                turso_database_connect, turso_database_deinit, turso_database_new,
-                turso_database_open, turso_setup, turso_statement_bind_positional_blob,
-                turso_statement_bind_positional_double, turso_statement_bind_positional_int,
-                turso_statement_bind_positional_null, turso_statement_bind_positional_text,
-                turso_statement_column_count, turso_statement_deinit, turso_statement_execute,
-                turso_statement_named_position, turso_statement_row_value_bytes_count,
-                turso_statement_row_value_bytes_ptr, turso_statement_row_value_double,
-                turso_statement_row_value_int, turso_statement_row_value_kind,
-                turso_statement_run_io, turso_statement_step, turso_status_code_t,
-                turso_str_deinit,
-            },
-            value_from_c_value,
+    use crate::capi::{
+        c::{
+            self, turso_connection_deinit, turso_connection_prepare_single, turso_database_connect,
+            turso_database_deinit, turso_database_new, turso_database_open, turso_setup,
+            turso_statement_bind_positional_blob, turso_statement_bind_positional_double,
+            turso_statement_bind_positional_int, turso_statement_bind_positional_null,
+            turso_statement_bind_positional_text, turso_statement_column_count,
+            turso_statement_deinit, turso_statement_execute, turso_statement_named_position,
+            turso_statement_run_io, turso_statement_step, turso_status_code_t, turso_str_deinit,
+            turso_version,
         },
-        rsapi::{bytes_from_slice, str_from_slice},
+        value_from_c_value,
     };
 
     extern "C" fn logger(log: *const c::turso_log_t) {
@@ -816,11 +808,11 @@ mod tests {
             loop {
                 let status =
                     turso_statement_execute(statement, std::ptr::null_mut(), std::ptr::null_mut());
-                if status == turso_status_code_t::TURSO_OK {
+                if status == turso_status_code_t::TURSO_DONE {
                     break;
                 }
                 let status = turso_statement_run_io(statement, std::ptr::null_mut());
-                assert_eq!(status, turso_status_code_t::TURSO_OK);
+                assert_eq!(status, turso_status_code_t::TURSO_DONE);
             }
             turso_statement_deinit(statement);
 

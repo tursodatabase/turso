@@ -500,7 +500,7 @@ mod tests {
             c::{
                 turso_connection_deinit, turso_connection_prepare_single, turso_database_config_t,
                 turso_statement_column_count, turso_statement_deinit, turso_statement_run_io,
-                turso_statement_step, turso_status_code_t, turso_type_t,
+                turso_statement_step, turso_status_code_t,
             },
             value_from_c_value,
         },

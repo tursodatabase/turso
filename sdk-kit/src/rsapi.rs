@@ -889,7 +889,7 @@ impl TursoStatement {
 mod tests {
     use crate::rsapi::{TursoDatabase, TursoDatabaseConfig, TursoStatusCode};
 
-    // #[test]
+    #[test]
     pub fn test_db_concurrent_use() {
         let db = TursoDatabase::new(TursoDatabaseConfig {
             path: ":memory:".to_string(),
@@ -935,6 +935,6 @@ mod tests {
         let mut stmt = conn
             .prepare_single("SELECT * FROM generate_series(1, 10000)")
             .unwrap();
-        assert_eq!(stmt.execute().unwrap().status, TursoStatusCode::Ok);
+        assert_eq!(stmt.execute().unwrap().status, TursoStatusCode::Done);
     }
 }
