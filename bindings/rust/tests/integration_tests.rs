@@ -470,3 +470,33 @@ async fn test_encryption() {
         assert_eq!(row_count, 1);
     }
 }
+
+// Test Transaction.prepare
+#[tokio::test]
+async fn test_transaction_prepared_statement() {
+    let db = Builder::new_local(":memory:").build().await.unwrap();
+    let mut conn = db.connect().unwrap();
+
+    conn.execute("CREATE TABLE users (id INTEGER, name TEXT)", ())
+        .await
+        .unwrap();
+
+    let tx = conn.transaction().await.unwrap();
+    let mut stmt = tx
+        .prepare("INSERT INTO users VALUES (?1, ?2)")
+        .await
+        .unwrap();
+    stmt.execute(["1", "Frodo"]).await.unwrap();
+    tx.commit().await.unwrap();
+
+    let row = conn
+        .prepare("SELECT id FROM users WHERE name = ?")
+        .await
+        .unwrap()
+        .query_row(&["Frodo"])
+        .await
+        .unwrap();
+
+    let id: i64 = row.get(0).unwrap();
+    assert_eq!(id, 1);
+}
