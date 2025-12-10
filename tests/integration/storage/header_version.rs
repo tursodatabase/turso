@@ -2,6 +2,8 @@ use std::path::Path;
 use tempfile::TempDir;
 use turso_core::{Database, DatabaseOpts, OpenFlags};
 
+use crate::common::ExecRows;
+
 /// Read header version bytes (write_version at offset 18, read_version at offset 19) from database file
 fn read_header_versions(db_path: &Path) -> (u8, u8) {
     let bytes = std::fs::read(db_path).expect("Failed to read database file");
@@ -472,6 +474,17 @@ fn test_pragma_journal_mode_mvcc_to_wal() {
 
     let conn = db.connect().unwrap();
 
+    let result = conn
+        .pragma_query("journal_mode")
+        .expect("PRAGMA journal_mode update should not fail");
+
+    assert!(!result.is_empty(), "PRAGMA should return a result");
+    let mode = result[0][0].to_string();
+    assert_eq!(
+        mode, "experimental_mvcc",
+        "Journal mode should be wal after PRAGMA, got {mode}"
+    );
+
     // Switch to WAL mode via PRAGMA
     let result = conn
         .pragma_update("journal_mode", "'wal'")
@@ -486,29 +499,15 @@ fn test_pragma_journal_mode_mvcc_to_wal() {
     );
 
     // Verify we can still query data (both original and MVCC data)
-    let mut stmt = conn.prepare("SELECT val FROM t ORDER BY val").unwrap();
-    let mut rows = Vec::new();
-    loop {
-        match stmt.step().unwrap() {
-            turso_core::StepResult::Row => {
-                let row = stmt.row().unwrap();
-                let val: String = row.get::<String>(0).unwrap();
-                rows.push(val);
-            }
-            turso_core::StepResult::IO => {
-                stmt.run_once().unwrap();
-                continue;
-            }
-            turso_core::StepResult::Done => break,
-            r => panic!("unexpected result {r:?}"),
-        }
-    }
+    let rows: Vec<(String,)> = conn.exec_rows("SELECT val FROM t ORDER BY val");
+
+    dbg!(&rows);
     assert!(
-        rows.contains(&"test".to_string()),
+        rows.contains(&("test".to_string(),)),
         "Should have original test row"
     );
     assert!(
-        rows.contains(&"mvcc_data".to_string()),
+        rows.contains(&("mvcc_data".to_string(),)),
         "Should have mvcc_data row"
     );
 
