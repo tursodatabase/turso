@@ -112,7 +112,8 @@ pub use types::ValueRef;
 use util::parse_schema_rows;
 pub use util::IOExt;
 pub use vdbe::{
-    builder::QueryMode, explain::EXPLAIN_COLUMNS, explain::EXPLAIN_QUERY_PLAN_COLUMNS, Register,
+    builder::QueryMode, explain::EXPLAIN_COLUMNS, explain::EXPLAIN_QUERY_PLAN_COLUMNS,
+    FromValueRow, Register,
 };
 
 /// Configuration for database features

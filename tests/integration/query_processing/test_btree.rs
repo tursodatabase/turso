@@ -484,7 +484,7 @@ fn test_btree(tmp_db: TempDatabase) {
                 };
                 let limbo_sum = {
                     let conn = db.connect_limbo();
-                    limbo_exec_rows(&db, &conn, &query)
+                    limbo_exec_rows(&conn, &query)
                 };
                 assert_eq!(
                     limbo_sum, sqlite_sum,

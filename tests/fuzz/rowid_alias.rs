@@ -128,15 +128,11 @@ pub fn rowid_alias_differential_fuzz() {
 
                 // Create table with rowid alias in first database
                 let create_with_alias = convert_to_rowid_alias(&create.to_string());
-                let _ = limbo_exec_rows(&db_with_alias, &conn_with_alias, &create_with_alias);
+                let _ = limbo_exec_rows(&conn_with_alias, &create_with_alias);
 
                 // Create table without rowid alias in second database
                 let create_without_alias = convert_to_no_rowid_alias(&create.to_string());
-                let _ = limbo_exec_rows(
-                    &db_without_alias,
-                    &conn_without_alias,
-                    &create_without_alias,
-                );
+                let _ = limbo_exec_rows(&conn_without_alias, &create_without_alias);
 
                 // Add table to context for future query generation
                 context.add_table(table);
@@ -186,9 +182,8 @@ pub fn rowid_alias_differential_fuzz() {
 
         tracing::debug!("Comparing query {}: {}", iteration, query_str);
 
-        let with_alias_results = limbo_exec_rows(&db_with_alias, &conn_with_alias, &query_str);
-        let without_alias_results =
-            limbo_exec_rows(&db_without_alias, &conn_without_alias, &query_str);
+        let with_alias_results = limbo_exec_rows(&conn_with_alias, &query_str);
+        let without_alias_results = limbo_exec_rows(&conn_without_alias, &query_str);
 
         let mut sorted_with_alias = with_alias_results;
         let mut sorted_without_alias = without_alias_results;

@@ -8,17 +8,17 @@ fn sum_errors_on_integer_overflow(tmp_db: TempDatabase) {
     let conn = tmp_db.connect_limbo();
     let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
-    limbo_exec_rows(&tmp_db, &conn, "CREATE TABLE t(a)");
+    limbo_exec_rows(&conn, "CREATE TABLE t(a)");
     sqlite_exec_rows(&sqlite_conn, "CREATE TABLE t(a)");
 
-    limbo_exec_rows(&tmp_db, &conn, "INSERT INTO t VALUES (9223372036854775807)");
+    limbo_exec_rows(&conn, "INSERT INTO t VALUES (9223372036854775807)");
     sqlite_exec_rows(&sqlite_conn, "INSERT INTO t VALUES (9223372036854775807)");
 
-    let limbo_before_overflow = limbo_exec_rows(&tmp_db, &conn, "SELECT sum(a) FROM t");
+    let limbo_before_overflow = limbo_exec_rows(&conn, "SELECT sum(a) FROM t");
     let sqlite_before_overflow = sqlite_exec_rows(&sqlite_conn, "SELECT sum(a) FROM t");
     assert_eq!(limbo_before_overflow, sqlite_before_overflow);
 
-    limbo_exec_rows(&tmp_db, &conn, "INSERT INTO t VALUES (1)");
+    limbo_exec_rows(&conn, "INSERT INTO t VALUES (1)");
     sqlite_exec_rows(&sqlite_conn, "INSERT INTO t VALUES (1)");
 
     let err = limbo_exec_rows_fallible(&tmp_db, &conn, "SELECT sum(a) FROM t")

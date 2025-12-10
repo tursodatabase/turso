@@ -42,7 +42,7 @@ fn test_vector_sparse_ivf_create_destroy(tmp_db: TempDatabase) {
     let conn = tmp_db.connect_limbo();
 
     let schema_rows = || {
-        limbo_exec_rows(&tmp_db, &conn, "SELECT * FROM sqlite_master")
+        limbo_exec_rows(&conn, "SELECT * FROM sqlite_master")
             .into_iter()
             .map(|x| match &x[1] {
                 rusqlite::types::Value::Text(t) => t.clone(),
@@ -138,7 +138,6 @@ fn test_vector_sparse_ivf_insert_query(tmp_db: TempDatabase) {
         ];
         run(&tmp_db, || cursor.insert(&values)).unwrap();
         limbo_exec_rows(
-            &tmp_db,
             &conn,
             &format!("INSERT INTO t VALUES ('{i}', vector32_sparse('{vector_str}'))"),
         );
@@ -234,7 +233,6 @@ fn test_vector_sparse_ivf_update(tmp_db: TempDatabase) {
     ];
     run(&tmp_db, || writer.insert(&insert0_values)).unwrap();
     limbo_exec_rows(
-        &tmp_db,
         &conn,
         &format!("INSERT INTO t VALUES ('test', vector32_sparse('{v0_str}'))"),
     );
@@ -244,7 +242,6 @@ fn test_vector_sparse_ivf_update(tmp_db: TempDatabase) {
     assert!(!run(&tmp_db, || reader.query_start(&query_values)).unwrap());
 
     limbo_exec_rows(
-        &tmp_db,
         &conn,
         &format!("UPDATE t SET embedding = vector32_sparse('{v1_str}') WHERE rowid = 1"),
     );
@@ -345,8 +342,8 @@ fn test_vector_sparse_ivf_fuzz(tmp_db: TempDatabase) {
                 let k = rng.next_u32() % 20 + 1;
                 let sql = format!("SELECT key, vector_distance_jaccard(embedding, vector32_sparse('{v}')) as d FROM t ORDER BY d LIMIT {k}");
                 tracing::info!("({}) {}", operation, sql);
-                let simple_rows = limbo_exec_rows(&simple_db, &simple_conn, &sql);
-                let index_rows = limbo_exec_rows(&index_db, &index_conn, &sql);
+                let simple_rows = limbo_exec_rows(&simple_conn, &sql);
+                let index_rows = limbo_exec_rows(&index_conn, &sql);
                 tracing::info!("simple: {:?}, index_rows: {:?}", simple_rows, index_rows);
                 assert!(index_rows.len() <= simple_rows.len());
                 for (a, b) in index_rows.iter().zip(simple_rows.iter()) {

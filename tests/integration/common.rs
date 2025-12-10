@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tempfile::TempDir;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
-use turso_core::{Connection, Database, Row, StepResult, IO};
+use turso_core::{Connection, Database, FromValueRow, Row, StepResult, IO};
 
 pub struct TempDatabase {
     pub path: PathBuf,
@@ -14,6 +14,8 @@ pub struct TempDatabase {
     pub db_opts: turso_core::DatabaseOpts,
     #[allow(dead_code)]
     pub db_flags: turso_core::OpenFlags,
+    #[allow(dead_code)]
+    pub init_sql: Option<String>,
 }
 unsafe impl Send for TempDatabase {}
 
@@ -93,12 +95,12 @@ impl TempDatabaseBuilder {
             }
         };
 
-        if let Some(init_sql) = self.init_sql {
+        if let Some(init_sql) = &self.init_sql {
             let connection = rusqlite::Connection::open(&db_path).unwrap();
             connection
                 .pragma_update(None, "journal_mode", "wal")
                 .unwrap();
-            connection.execute(&init_sql, ()).unwrap();
+            connection.execute(init_sql, ()).unwrap();
         }
 
         let io = Arc::new(turso_core::PlatformIO::new().unwrap());
@@ -116,6 +118,7 @@ impl TempDatabaseBuilder {
             db,
             db_opts: opts,
             db_flags: flags,
+            init_sql: self.init_sql,
         }
     }
 }
@@ -270,7 +273,6 @@ pub fn sqlite_exec_rows(
 }
 
 pub fn limbo_exec_rows(
-    _db: &TempDatabase,
     conn: &Arc<turso_core::Connection>,
     query: &str,
 ) -> Vec<Vec<rusqlite::types::Value>> {
@@ -515,6 +517,53 @@ pub fn rusqlite_integrity_check(db_path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+pub trait ExecRows<T> {
+    #[allow(dead_code)]
+    fn exec_rows(&self, query: &str) -> Vec<T>;
+}
+
+macro_rules! impl_exec_rows_for_tuple {
+    ($($T:ident : $idx:tt),+) => {
+        impl<$($T),+> ExecRows<($($T,)+)> for Arc<Connection>
+        where
+            $($T: for<'a> FromValueRow<'a> + 'static,)+
+        {
+            fn exec_rows(&self, query: &str) -> Vec<($($T,)+)> {
+                let mut stmt = self.prepare(query).unwrap();
+                let mut rows = Vec::new();
+                'outer: loop {
+                    let row = loop {
+                        let result = stmt.step().unwrap();
+                        match result {
+                            turso_core::StepResult::Row => {
+                                let row = stmt.row().unwrap();
+                                break row;
+                            }
+                            turso_core::StepResult::IO => {
+                                stmt.run_once().unwrap();
+                                continue;
+                            }
+                            turso_core::StepResult::Done => break 'outer,
+                            r => panic!("unexpected result {r:?}"),
+                        }
+                    };
+                    rows.push(($(row.get($idx).unwrap(),)+));
+                }
+                rows
+            }
+        }
+    };
+}
+
+impl_exec_rows_for_tuple!(T0: 0);
+impl_exec_rows_for_tuple!(T0: 0, T1: 1);
+impl_exec_rows_for_tuple!(T0: 0, T1: 1, T2: 2);
+impl_exec_rows_for_tuple!(T0: 0, T1: 1, T2: 2, T3: 3);
+impl_exec_rows_for_tuple!(T0: 0, T1: 1, T2: 2, T3: 3, T4: 4);
+impl_exec_rows_for_tuple!(T0: 0, T1: 1, T2: 2, T3: 3, T4: 4, T5: 5);
+impl_exec_rows_for_tuple!(T0: 0, T1: 1, T2: 2, T3: 3, T4: 4, T5: 5, T6: 6);
+impl_exec_rows_for_tuple!(T0: 0, T1: 1, T2: 2, T3: 3, T4: 4, T5: 5, T6: 6, T7: 7);
+
 #[cfg(test)]
 mod tests {
     use std::{sync::Arc, vec};
@@ -571,9 +620,9 @@ mod tests {
             let db =
                 TempDatabase::new_with_existent_with_flags(&path, turso_core::OpenFlags::default());
             let conn = db.connect_limbo();
-            let ret = limbo_exec_rows(&db, &conn, "CREATE table t (a)");
+            let ret = limbo_exec_rows(&conn, "CREATE table t (a)");
             assert!(ret.is_empty(), "{ret:?}");
-            limbo_exec_rows(&db, &conn, "INSERT INTO t values (1)");
+            limbo_exec_rows(&conn, "INSERT INTO t values (1)");
             conn.close().unwrap()
         }
 
@@ -583,7 +632,7 @@ mod tests {
                 turso_core::OpenFlags::default() | turso_core::OpenFlags::ReadOnly,
             );
             let conn = db.connect_limbo();
-            let ret = limbo_exec_rows(&db, &conn, "SELECT * from t");
+            let ret = limbo_exec_rows(&conn, "SELECT * from t");
             assert_eq!(ret, vec![vec![Value::Integer(1)]]);
 
             let err = limbo_exec_rows_error(&db, &conn, "INSERT INTO t values (1)").unwrap_err();
@@ -599,7 +648,7 @@ mod tests {
         let db = TempDatabase::new_empty();
         let conn = db.connect_limbo();
 
-        let _ = limbo_exec_rows(&db, &conn, "CREATE TABLE t (x INTEGER UNIQUE)");
+        let _ = limbo_exec_rows(&conn, "CREATE TABLE t (x INTEGER UNIQUE)");
 
         // Insert 100 random integers between -1000 and 1000
         let mut expected = Vec::new();
@@ -612,7 +661,7 @@ mod tests {
             }
             i += 1;
             expected.push(val);
-            let ret = limbo_exec_rows(&db, &conn, &format!("INSERT INTO t VALUES ({val})"));
+            let ret = limbo_exec_rows(&conn, &format!("INSERT INTO t VALUES ({val})"));
             assert!(ret.is_empty(), "Insert failed for value {val}: {ret:?}");
         }
 
@@ -620,7 +669,7 @@ mod tests {
         expected.sort();
 
         // Query all values and verify they come back in sorted order
-        let ret = limbo_exec_rows(&db, &conn, "SELECT x FROM t");
+        let ret = limbo_exec_rows(&conn, "SELECT x FROM t");
         let actual: Vec<i64> = ret
             .into_iter()
             .map(|row| match &row[0] {
@@ -640,17 +689,17 @@ mod tests {
         let db = TempDatabase::new_with_existent(&path);
         let conn = db.connect_limbo();
 
-        let _ = limbo_exec_rows(&db, &conn, "CREATE TABLE t (x BLOB UNIQUE)");
+        let _ = limbo_exec_rows(&conn, "CREATE TABLE t (x BLOB UNIQUE)");
 
         // Insert 11 unique 1MB blobs
         for i in 0..11 {
             println!("Inserting blob #{i}");
-            let ret = limbo_exec_rows(&db, &conn, "INSERT INTO t VALUES (randomblob(1024*1024))");
+            let ret = limbo_exec_rows(&conn, "INSERT INTO t VALUES (randomblob(1024*1024))");
             assert!(ret.is_empty(), "Insert #{i} failed: {ret:?}");
         }
 
         // Verify we have 11 rows
-        let ret = limbo_exec_rows(&db, &conn, "SELECT count(*) FROM t");
+        let ret = limbo_exec_rows(&conn, "SELECT count(*) FROM t");
         assert_eq!(
             ret,
             vec![vec![Value::Integer(11)]],
@@ -673,16 +722,16 @@ mod tests {
         let conn1 = db.connect_limbo();
 
         // Create test table
-        let _ = limbo_exec_rows(&db, &conn1, "CREATE TABLE t (x INTEGER)");
+        let _ = limbo_exec_rows(&conn1, "CREATE TABLE t (x INTEGER)");
 
         // Begin transaction on first connection and insert a value
-        let _ = limbo_exec_rows(&db, &conn1, "BEGIN");
-        let _ = limbo_exec_rows(&db, &conn1, "INSERT INTO t VALUES (42)");
+        let _ = limbo_exec_rows(&conn1, "BEGIN");
+        let _ = limbo_exec_rows(&conn1, "INSERT INTO t VALUES (42)");
         do_flush(&conn1, &db)?;
 
         // Second connection should not see uncommitted changes
         let conn2 = db.connect_limbo();
-        let ret = limbo_exec_rows(&db, &conn2, "SELECT x FROM t");
+        let ret = limbo_exec_rows(&conn2, "SELECT x FROM t");
         assert!(
             ret.is_empty(),
             "DIRTY READ: Second connection saw uncommitted changes: {ret:?}"
@@ -704,21 +753,21 @@ mod tests {
         let conn1 = db.connect_limbo();
 
         // Create test table
-        let _ = limbo_exec_rows(&db, &conn1, "CREATE TABLE t (x INTEGER)");
+        let _ = limbo_exec_rows(&conn1, "CREATE TABLE t (x INTEGER)");
 
         // Begin transaction on first connection
-        let _ = limbo_exec_rows(&db, &conn1, "BEGIN");
-        let ret = limbo_exec_rows(&db, &conn1, "SELECT x FROM t");
+        let _ = limbo_exec_rows(&conn1, "BEGIN");
+        let ret = limbo_exec_rows(&conn1, "SELECT x FROM t");
         assert!(ret.is_empty(), "Expected 0 rows but got {ret:?}");
 
         // Commit a value from the second connection
         let conn2 = db.connect_limbo();
-        let _ = limbo_exec_rows(&db, &conn2, "BEGIN");
-        let _ = limbo_exec_rows(&db, &conn2, "INSERT INTO t VALUES (42)");
-        let _ = limbo_exec_rows(&db, &conn2, "COMMIT");
+        let _ = limbo_exec_rows(&conn2, "BEGIN");
+        let _ = limbo_exec_rows(&conn2, "INSERT INTO t VALUES (42)");
+        let _ = limbo_exec_rows(&conn2, "COMMIT");
 
         // First connection should not see the committed value
-        let ret = limbo_exec_rows(&db, &conn1, "SELECT x FROM t");
+        let ret = limbo_exec_rows(&conn1, "SELECT x FROM t");
         assert!(
             ret.is_empty(),
             "SNAPSHOT ISOLATION VIOLATION: Older txn saw committed changes from newer txn: {ret:?}"
@@ -740,25 +789,25 @@ mod tests {
         let conn = db.connect_limbo();
 
         // Create test table
-        let _ = limbo_exec_rows(&db, &conn, "CREATE TABLE t (x INTEGER)");
+        let _ = limbo_exec_rows(&conn, "CREATE TABLE t (x INTEGER)");
 
         // Begin transaction on first connection and insert a value
-        let _ = limbo_exec_rows(&db, &conn, "BEGIN");
-        let _ = limbo_exec_rows(&db, &conn, "INSERT INTO t VALUES (42)");
+        let _ = limbo_exec_rows(&conn, "BEGIN");
+        let _ = limbo_exec_rows(&conn, "INSERT INTO t VALUES (42)");
         do_flush(&conn, &db)?;
 
         // Rollback the transaction
-        let _ = limbo_exec_rows(&db, &conn, "ROLLBACK");
+        let _ = limbo_exec_rows(&conn, "ROLLBACK");
 
         // Now actually commit a row
-        let _ = limbo_exec_rows(&db, &conn, "INSERT INTO t VALUES (69)");
+        let _ = limbo_exec_rows(&conn, "INSERT INTO t VALUES (69)");
 
         // Reopen the database
         let db = TempDatabase::new_with_existent(&path);
         let conn = db.connect_limbo();
 
         // Should only see the last committed value
-        let ret = limbo_exec_rows(&db, &conn, "SELECT x FROM t");
+        let ret = limbo_exec_rows(&conn, "SELECT x FROM t");
         assert_eq!(
             ret,
             vec![vec![Value::Integer(69)]],
@@ -780,11 +829,11 @@ mod tests {
         let conn = db.connect_limbo();
 
         // Create test table
-        let _ = limbo_exec_rows(&db, &conn, "CREATE TABLE t (x INTEGER)");
+        let _ = limbo_exec_rows(&conn, "CREATE TABLE t (x INTEGER)");
 
         // Begin transaction and insert a value
-        let _ = limbo_exec_rows(&db, &conn, "BEGIN");
-        let _ = limbo_exec_rows(&db, &conn, "INSERT INTO t VALUES (42)");
+        let _ = limbo_exec_rows(&conn, "BEGIN");
+        let _ = limbo_exec_rows(&conn, "INSERT INTO t VALUES (42)");
 
         // Flush to WAL but don't commit
         do_flush(&conn, &db)?;
@@ -794,7 +843,7 @@ mod tests {
         let conn = db.connect_limbo();
 
         // Should see no rows since transaction was never committed
-        let ret = limbo_exec_rows(&db, &conn, "SELECT x FROM t");
+        let ret = limbo_exec_rows(&conn, "SELECT x FROM t");
         assert!(ret.is_empty(), "Expected 0 rows but got {ret:?}");
 
         Ok(())

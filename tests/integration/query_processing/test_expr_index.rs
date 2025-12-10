@@ -40,7 +40,7 @@ fn expression_index_used_for_where() -> anyhow::Result<()> {
         "expected query plan to mention idx_expr, got {plans:?}"
     );
 
-    let rows = limbo_exec_rows(&tmp_db, &conn, "SELECT a, b FROM t WHERE a + b = 7");
+    let rows = limbo_exec_rows(&conn, "SELECT a, b FROM t WHERE a + b = 7");
     assert_eq!(rows, vec![vec![3.into(), 4.into()]]);
     Ok(())
 }
@@ -67,7 +67,6 @@ fn expression_index_used_for_order_by() -> anyhow::Result<()> {
     );
 
     let rows = limbo_exec_rows(
-        &tmp_db,
         &conn,
         "SELECT a, b FROM t WHERE a + b > 0 ORDER BY a + b DESC LIMIT 1",
     );
@@ -95,7 +94,7 @@ fn expression_index_covering_scan() -> anyhow::Result<()> {
         "expected covering index usage, got {plans:?}"
     );
 
-    let rows = limbo_exec_rows(&tmp_db, &conn, "SELECT a + b FROM t ORDER BY a + b");
+    let rows = limbo_exec_rows(&conn, "SELECT a + b FROM t ORDER BY a + b");
     assert_eq!(rows, vec![vec![3.into()], vec![7.into()], vec![11.into()]]);
     Ok(())
 }
