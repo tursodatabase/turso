@@ -950,7 +950,7 @@ fn test_multiple_connections_visibility(tmp_db: TempDatabase) -> anyhow::Result<
     drop(stmt);
     conn1.execute("COMMIT")?;
 
-    let rows = limbo_exec_rows(&tmp_db, &conn2, "SELECT COUNT(*) FROM test");
+    let rows = limbo_exec_rows(&conn2, "SELECT COUNT(*) FROM test");
     assert_eq!(rows, vec![vec![rusqlite::types::Value::Integer(2)]]);
     Ok(())
 }
@@ -983,7 +983,7 @@ fn test_stmt_reset(tmp_db: TempDatabase) -> anyhow::Result<()> {
             _ => tmp_db.io.step().unwrap(),
         }
     }
-    let rows = limbo_exec_rows(&tmp_db, &conn1, "SELECT rowid FROM test");
+    let rows = limbo_exec_rows(&conn1, "SELECT rowid FROM test");
     assert_eq!(
         rows,
         vec![

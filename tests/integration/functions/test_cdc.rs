@@ -23,7 +23,7 @@ fn test_cdc_simple_id(db: TempDatabase) {
         .unwrap();
     conn.execute("INSERT INTO t VALUES (10, 10), (5, 1)")
         .unwrap();
-    let rows = limbo_exec_rows(&db, &conn, "SELECT * FROM t");
+    let rows = limbo_exec_rows(&conn, "SELECT * FROM t");
     assert_eq!(
         rows,
         vec![
@@ -31,7 +31,7 @@ fn test_cdc_simple_id(db: TempDatabase) {
             vec![Value::Integer(10), Value::Integer(10)],
         ]
     );
-    let rows = replace_column_with_null(limbo_exec_rows(&db, &conn, "SELECT * FROM turso_cdc"), 1);
+    let rows = replace_column_with_null(limbo_exec_rows(&conn, "SELECT * FROM turso_cdc"), 1);
     assert_eq!(
         rows,
         vec![
@@ -86,7 +86,7 @@ fn test_cdc_simple_before(db: TempDatabase) {
     conn.execute("UPDATE t SET y = 3 WHERE x = 1").unwrap();
     conn.execute("DELETE FROM t WHERE x = 3").unwrap();
     conn.execute("DELETE FROM t WHERE x = 1").unwrap();
-    let rows = replace_column_with_null(limbo_exec_rows(&db, &conn, "SELECT * FROM turso_cdc"), 1);
+    let rows = replace_column_with_null(limbo_exec_rows(&conn, "SELECT * FROM turso_cdc"), 1);
 
     assert_eq!(
         rows,
@@ -156,7 +156,7 @@ fn test_cdc_simple_after(db: TempDatabase) {
     conn.execute("UPDATE t SET y = 3 WHERE x = 1").unwrap();
     conn.execute("DELETE FROM t WHERE x = 3").unwrap();
     conn.execute("DELETE FROM t WHERE x = 1").unwrap();
-    let rows = replace_column_with_null(limbo_exec_rows(&db, &conn, "SELECT * FROM turso_cdc"), 1);
+    let rows = replace_column_with_null(limbo_exec_rows(&conn, "SELECT * FROM turso_cdc"), 1);
 
     assert_eq!(
         rows,
@@ -226,7 +226,7 @@ fn test_cdc_simple_full(db: TempDatabase) {
     conn.execute("UPDATE t SET y = 3 WHERE x = 1").unwrap();
     conn.execute("DELETE FROM t WHERE x = 3").unwrap();
     conn.execute("DELETE FROM t WHERE x = 1").unwrap();
-    let rows = replace_column_with_null(limbo_exec_rows(&db, &conn, "SELECT * FROM turso_cdc"), 1);
+    let rows = replace_column_with_null(limbo_exec_rows(&conn, "SELECT * FROM turso_cdc"), 1);
 
     assert_eq!(
         rows,
@@ -304,7 +304,7 @@ fn test_cdc_crud(db: TempDatabase) {
     conn.execute("INSERT INTO t VALUES (1, 1)").unwrap();
     conn.execute("UPDATE t SET x = 2 WHERE x = 1").unwrap();
 
-    let rows = limbo_exec_rows(&db, &conn, "SELECT * FROM t");
+    let rows = limbo_exec_rows(&conn, "SELECT * FROM t");
     assert_eq!(
         rows,
         vec![
@@ -312,7 +312,7 @@ fn test_cdc_crud(db: TempDatabase) {
             vec![Value::Integer(5), Value::Integer(100)],
         ]
     );
-    let rows = replace_column_with_null(limbo_exec_rows(&db, &conn, "SELECT * FROM turso_cdc"), 1);
+    let rows = replace_column_with_null(limbo_exec_rows(&conn, "SELECT * FROM turso_cdc"), 1);
     assert_eq!(
         rows,
         vec![
@@ -426,7 +426,7 @@ fn test_cdc_failed_op(db: TempDatabase) {
     conn.execute("INSERT INTO t VALUES (6, 60), (7, 70)")
         .unwrap();
 
-    let rows = limbo_exec_rows(&db, &conn, "SELECT * FROM t");
+    let rows = limbo_exec_rows(&conn, "SELECT * FROM t");
     assert_eq!(
         rows,
         vec![
@@ -436,7 +436,7 @@ fn test_cdc_failed_op(db: TempDatabase) {
             vec![Value::Integer(7), Value::Integer(70)],
         ]
     );
-    let rows = replace_column_with_null(limbo_exec_rows(&db, &conn, "SELECT * FROM turso_cdc"), 1);
+    let rows = replace_column_with_null(limbo_exec_rows(&conn, "SELECT * FROM turso_cdc"), 1);
     assert_eq!(
         rows,
         vec![
@@ -513,7 +513,7 @@ fn test_cdc_uncaptured_connection(db: TempDatabase) {
         .unwrap();
     conn1.execute("INSERT INTO t VALUES (7, 70)").unwrap();
 
-    let rows = limbo_exec_rows(&db, &conn1, "SELECT * FROM t");
+    let rows = limbo_exec_rows(&conn1, "SELECT * FROM t");
     assert_eq!(
         rows,
         vec![
@@ -526,7 +526,7 @@ fn test_cdc_uncaptured_connection(db: TempDatabase) {
             vec![Value::Integer(7), Value::Integer(70)],
         ]
     );
-    let rows = replace_column_with_null(limbo_exec_rows(&db, &conn1, "SELECT * FROM turso_cdc"), 1);
+    let rows = replace_column_with_null(limbo_exec_rows(&conn1, "SELECT * FROM turso_cdc"), 1);
     assert_eq!(
         rows,
         vec![
@@ -576,7 +576,7 @@ fn test_cdc_custom_table(db: TempDatabase) {
         .unwrap();
     conn1.execute("INSERT INTO t VALUES (1, 10)").unwrap();
     conn1.execute("INSERT INTO t VALUES (2, 20)").unwrap();
-    let rows = limbo_exec_rows(&db, &conn1, "SELECT * FROM t");
+    let rows = limbo_exec_rows(&conn1, "SELECT * FROM t");
     assert_eq!(
         rows,
         vec![
@@ -584,8 +584,7 @@ fn test_cdc_custom_table(db: TempDatabase) {
             vec![Value::Integer(2), Value::Integer(20)],
         ]
     );
-    let rows =
-        replace_column_with_null(limbo_exec_rows(&db, &conn1, "SELECT * FROM custom_cdc"), 1);
+    let rows = replace_column_with_null(limbo_exec_rows(&conn1, "SELECT * FROM custom_cdc"), 1);
     assert_eq!(
         rows,
         vec![
@@ -625,7 +624,7 @@ fn test_cdc_ignore_changes_in_cdc_table(db: TempDatabase) {
         .unwrap();
     conn1.execute("INSERT INTO t VALUES (1, 10)").unwrap();
     conn1.execute("INSERT INTO t VALUES (2, 20)").unwrap();
-    let rows = limbo_exec_rows(&db, &conn1, "SELECT * FROM t");
+    let rows = limbo_exec_rows(&conn1, "SELECT * FROM t");
     assert_eq!(
         rows,
         vec![
@@ -636,8 +635,7 @@ fn test_cdc_ignore_changes_in_cdc_table(db: TempDatabase) {
     conn1
         .execute("DELETE FROM custom_cdc WHERE change_id < 2")
         .unwrap();
-    let rows =
-        replace_column_with_null(limbo_exec_rows(&db, &conn1, "SELECT * FROM custom_cdc"), 1);
+    let rows = replace_column_with_null(limbo_exec_rows(&conn1, "SELECT * FROM custom_cdc"), 1);
     assert_eq!(
         rows,
         vec![vec![
@@ -673,12 +671,11 @@ fn test_cdc_transaction(db: TempDatabase) {
     conn1.execute("DELETE FROM t WHERE x = 1").unwrap();
     conn1.execute("UPDATE q SET y = 200 WHERE x = 2").unwrap();
     conn1.execute("COMMIT").unwrap();
-    let rows = limbo_exec_rows(&db, &conn1, "SELECT * FROM t");
+    let rows = limbo_exec_rows(&conn1, "SELECT * FROM t");
     assert_eq!(rows, vec![vec![Value::Integer(3), Value::Integer(30)],]);
-    let rows = limbo_exec_rows(&db, &conn1, "SELECT * FROM q");
+    let rows = limbo_exec_rows(&conn1, "SELECT * FROM q");
     assert_eq!(rows, vec![vec![Value::Integer(2), Value::Integer(200)],]);
-    let rows =
-        replace_column_with_null(limbo_exec_rows(&db, &conn1, "SELECT * FROM custom_cdc"), 1);
+    let rows = replace_column_with_null(limbo_exec_rows(&conn1, "SELECT * FROM custom_cdc"), 1);
     assert_eq!(
         rows,
         vec![
@@ -752,7 +749,7 @@ fn test_cdc_independent_connections(db: TempDatabase) {
         .unwrap();
     conn1.execute("INSERT INTO t VALUES (1, 10)").unwrap();
     conn2.execute("INSERT INTO t VALUES (2, 20)").unwrap();
-    let rows = limbo_exec_rows(&db, &conn1, "SELECT * FROM t");
+    let rows = limbo_exec_rows(&conn1, "SELECT * FROM t");
     assert_eq!(
         rows,
         vec![
@@ -760,8 +757,7 @@ fn test_cdc_independent_connections(db: TempDatabase) {
             vec![Value::Integer(2), Value::Integer(20)]
         ]
     );
-    let rows =
-        replace_column_with_null(limbo_exec_rows(&db, &conn1, "SELECT * FROM custom_cdc1"), 1);
+    let rows = replace_column_with_null(limbo_exec_rows(&conn1, "SELECT * FROM custom_cdc1"), 1);
     assert_eq!(
         rows,
         vec![vec![
@@ -775,8 +771,7 @@ fn test_cdc_independent_connections(db: TempDatabase) {
             Value::Null,
         ]]
     );
-    let rows =
-        replace_column_with_null(limbo_exec_rows(&db, &conn1, "SELECT * FROM custom_cdc2"), 1);
+    let rows = replace_column_with_null(limbo_exec_rows(&conn1, "SELECT * FROM custom_cdc2"), 1);
     assert_eq!(
         rows,
         vec![vec![
@@ -816,7 +811,7 @@ fn test_cdc_independent_connections_different_cdc_not_ignore(db: TempDatabase) {
     conn2
         .execute("DELETE FROM custom_cdc1 WHERE change_id < 2")
         .unwrap();
-    let rows = limbo_exec_rows(&db, &conn1, "SELECT * FROM t");
+    let rows = limbo_exec_rows(&conn1, "SELECT * FROM t");
     assert_eq!(
         rows,
         vec![
@@ -826,8 +821,7 @@ fn test_cdc_independent_connections_different_cdc_not_ignore(db: TempDatabase) {
             vec![Value::Integer(4), Value::Integer(40)],
         ]
     );
-    let rows =
-        replace_column_with_null(limbo_exec_rows(&db, &conn1, "SELECT * FROM custom_cdc1"), 1);
+    let rows = replace_column_with_null(limbo_exec_rows(&conn1, "SELECT * FROM custom_cdc1"), 1);
     assert_eq!(
         rows,
         vec![
@@ -853,8 +847,7 @@ fn test_cdc_independent_connections_different_cdc_not_ignore(db: TempDatabase) {
             ]
         ]
     );
-    let rows =
-        replace_column_with_null(limbo_exec_rows(&db, &conn2, "SELECT * FROM custom_cdc2"), 1);
+    let rows = replace_column_with_null(limbo_exec_rows(&conn2, "SELECT * FROM custom_cdc2"), 1);
     assert_eq!(
         rows,
         vec![
@@ -888,13 +881,13 @@ fn test_cdc_table_columns(db: TempDatabase) {
     let conn = db.connect_limbo();
     conn.execute("CREATE TABLE t (a INTEGER PRIMARY KEY, b, c UNIQUE)")
         .unwrap();
-    let rows = limbo_exec_rows(&db, &conn, "SELECT table_columns_json_array('t')");
+    let rows = limbo_exec_rows(&conn, "SELECT table_columns_json_array('t')");
     assert_eq!(
         rows,
         vec![vec![Value::Text(r#"["a","b","c"]"#.to_string())]]
     );
     conn.execute("ALTER TABLE t DROP COLUMN b").unwrap();
-    let rows = limbo_exec_rows(&db, &conn, "SELECT table_columns_json_array('t')");
+    let rows = limbo_exec_rows(&conn, "SELECT table_columns_json_array('t')");
     assert_eq!(rows, vec![vec![Value::Text(r#"["a","c"]"#.to_string())]]);
 }
 
@@ -914,7 +907,6 @@ fn test_cdc_bin_record(db: TempDatabase) {
     }
 
     let rows = limbo_exec_rows(
-        &db,
         &conn,
         &format!(r#"SELECT bin_record_json_object('["a","b","c","d"]', X'{record_hex}')"#),
     );
@@ -939,7 +931,7 @@ fn test_cdc_schema_changes(db: TempDatabase) {
     conn.execute("CREATE INDEX q_abc ON q(a, b, c)").unwrap();
     conn.execute("DROP TABLE t").unwrap();
     conn.execute("DROP INDEX q_abc").unwrap();
-    let rows = replace_column_with_null(limbo_exec_rows(&db, &conn, "SELECT * FROM turso_cdc"), 1);
+    let rows = replace_column_with_null(limbo_exec_rows(&conn, "SELECT * FROM turso_cdc"), 1);
 
     assert_eq!(
         rows,
@@ -1058,7 +1050,7 @@ fn test_cdc_schema_changes_alter_table(db: TempDatabase) {
         .unwrap();
     conn.execute("ALTER TABLE t DROP COLUMN q").unwrap();
     conn.execute("ALTER TABLE t ADD COLUMN t").unwrap();
-    let rows = replace_column_with_null(limbo_exec_rows(&db, &conn, "SELECT * FROM turso_cdc"), 1);
+    let rows = replace_column_with_null(limbo_exec_rows(&conn, "SELECT * FROM turso_cdc"), 1);
 
     assert_eq!(
         rows,
