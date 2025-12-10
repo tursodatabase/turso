@@ -422,8 +422,8 @@ def connect_sync(
     """
     # Resolve client name
     cname = client_name or "turso-sync-py"
-    if remote_url.startswith('libsql://'):
-        remote_url = remote_url.replace('libsql://', 'https://', 1)
+    if remote_url.startswith("libsql://"):
+        remote_url = remote_url.replace("libsql://", "https://", 1)
     http_ctx = _HttpContext(remote_url=remote_url, auth_token=auth_token, client_name=cname)
 
     # Database config: async_io must be True to let Python drive IO
