@@ -171,8 +171,10 @@ pub struct TableConstraints {
     pub candidates: Vec<ConstraintUseCandidate>,
 }
 
-/// In lieu of statistics, we estimate that an equality filter will reduce the output set to 1% of its size.
-const SELECTIVITY_EQ_FALLBACK: f64 = 0.01;
+/// In lieu of statistics, we estimate that an equality filter on an unindexed column will reduce the output set to 10% of its size.
+const SELECTIVITY_EQ_FALLBACK_UNINDEXED: f64 = 0.1;
+/// In lieu of statistics, we estimate that an equality filter on an indexed column will reduce the output set to 1% of its size (users are likely to create indexes on columns that are very selective).
+const SELECTIVITY_EQ_FALLBACK_INDEXED: f64 = 0.01;
 /// In lieu of statistics, we estimate that a range filter will reduce the output set to 40% of its size.
 const SELECTIVITY_RANGE_FALLBACK: f64 = 0.4;
 /// In lieu of statistics, we estimate that other filters will reduce the output set to 90% of its size.
@@ -240,6 +242,8 @@ fn estimate_selectivity(
                                             }
                                         }
                                     }
+                                } else {
+                                    return SELECTIVITY_EQ_FALLBACK_INDEXED;
                                 }
                             }
                         }
@@ -247,9 +251,9 @@ fn estimate_selectivity(
                 }
                 // Fallback: use hardcoded selectivity for non-indexed columns
                 // Don't scale by row_count - keep it distinct from PK selectivity
-                SELECTIVITY_EQ_FALLBACK
+                SELECTIVITY_EQ_FALLBACK_UNINDEXED
             } else {
-                SELECTIVITY_EQ_FALLBACK
+                SELECTIVITY_EQ_FALLBACK_UNINDEXED
             }
         }
         ast::Operator::Greater
