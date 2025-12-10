@@ -148,6 +148,7 @@ impl DatabaseMetadata {
     pub fn load(data: &[u8]) -> Result<Self> {
         let value: serde_json::Value = serde_json::from_slice(data)?;
 
+        // detect version field presence and type separately in order to provide nicer error message when user accidentally tried to run tursodb sync on top of the libsql sync metadata file
         match value.get("version").and_then(serde_json::Value::as_str) {
             Some(version) => {
                 let version = version.to_string();
