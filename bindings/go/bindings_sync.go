@@ -57,6 +57,12 @@ type TursoSyncDatabaseConfig struct {
 	PartialBootstrapStrategyPrefix int
 	// Query bootstrap strategy enabling partial sync - bootstraps db with pages touched by the server with given SQL query
 	PartialBootstrapStrategyQuery string
+	// optional parameter which defines segment size for lazy loading from remote server
+	// one of valid partial_bootstrap_strategy_* values MUST be set in order for this setting to have some effect
+	PartialBootstrapSegmentSize int
+	// optional parameter which defines if speculative pages load must be enabled
+	// one of valid partial_bootstrap_strategy_* values MUST be set in order for this setting to have some effect
+	PartialBootstrapSpeculativeLoad bool
 }
 
 // TursoSyncStats holds sync engine stats.
@@ -99,13 +105,15 @@ type TursoSyncIoFullWriteRequest struct {
 // ------------- Private C-compatible structs -------------
 
 type turso_sync_database_config_t struct {
-	path                              uintptr // const char*
-	client_name                       uintptr // const char*
-	long_poll_timeout_ms              int32
-	bootstrap_if_empty                bool
-	reserved_bytes                    int32
-	partial_bootstrap_strategy_prefix int32
-	partial_bootstrap_strategy_query  uintptr // const char*
+	path                               uintptr // const char*
+	client_name                        uintptr // const char*
+	long_poll_timeout_ms               int32
+	bootstrap_if_empty                 bool
+	reserved_bytes                     int32
+	partial_bootstrap_strategy_prefix  int32
+	partial_bootstrap_strategy_query   uintptr // const char*
+	partial_bootstrap_segment_size     uintptr
+	partial_bootstrap_speculative_load bool
 }
 
 type turso_sync_io_http_request_t struct {
@@ -383,6 +391,8 @@ func turso_sync_database_new(dbConfig TursoDatabaseConfig, syncConfig TursoSyncD
 	csync.bootstrap_if_empty = syncConfig.BootstrapIfEmpty
 	csync.reserved_bytes = int32(syncConfig.ReservedBytes)
 	csync.partial_bootstrap_strategy_prefix = int32(syncConfig.PartialBootstrapStrategyPrefix)
+	csync.partial_bootstrap_segment_size = uintptr(syncConfig.PartialBootstrapSegmentSize)
+	csync.partial_bootstrap_speculative_load = syncConfig.PartialBootstrapSpeculativeLoad
 	if syncConfig.PartialBootstrapStrategyQuery != "" {
 		queryBytes, csync.partial_bootstrap_strategy_query = makeCStringBytes(syncConfig.PartialBootstrapStrategyQuery)
 	}

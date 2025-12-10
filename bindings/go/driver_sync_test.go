@@ -363,10 +363,12 @@ func TestSyncPartial(t *testing.T) {
 	require.Nil(t, err)
 
 	db, err := NewTursoSyncDb(context.Background(), TursoSyncDbConfig{
-		Path:                          ":memory:",
-		ClientName:                    "turso-sync-go",
-		RemoteUrl:                     server.DbUrl(name, name, name),
-		PartialBoostrapStrategyPrefix: 128 * 1024,
+		Path:       ":memory:",
+		ClientName: "turso-sync-go",
+		RemoteUrl:  server.DbUrl(name, name, name),
+		PartialSyncConfig: TursoPartialSyncConfig{
+			BoostrapStrategyPrefix: 128 * 1024,
+		},
 	})
 	require.Nil(t, err)
 	conn, err := db.Connect(context.Background())
