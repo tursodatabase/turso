@@ -8,6 +8,7 @@ mod fuzz_tests {
     use rand_chacha::ChaCha8Rng;
     use rusqlite::{params, types::Value};
     use std::{collections::HashSet, io::Write};
+    use tempfile::NamedTempFile;
 
     use core_tester::common::{
         do_flush, limbo_exec_rows, limbo_exec_rows_fallible, limbo_stmt_get_column_names,
@@ -5838,6 +5839,522 @@ mod fuzz_tests {
                 panic!(
                     "Results mismatch for query: {query}\nLimbo: {limbo_results:?}\nSQLite: {sqlite_results:?}\nSeed: {seed}",
                 );
+            }
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct FuzzTestColumn {
+        name: String,
+        ty: String,
+        collation: Option<&'static str>, // BINARY/NOCASE/RTRIM
+        inline_unique: bool,
+        is_pk_autoinc: bool, // INTEGER PRIMARY KEY AUTOINCREMENT
+    }
+
+    #[derive(Clone, Debug)]
+    struct FuzzTestTable {
+        name: String,
+        columns: Vec<FuzzTestColumn>,
+        unique_table_constraints: Vec<Vec<usize>>, // indices into columns for table-level UNIQUE(...)
+    }
+
+    #[derive(Clone, Debug)]
+    struct FuzzTestIndexCol {
+        col: usize, // index into table.columns
+        collation: Option<&'static str>,
+        sort_order: &'static str, // "ASC" or "DESC"
+    }
+
+    #[derive(Clone, Debug)]
+    struct FuzzTestIndex {
+        name: String,
+        table: String,
+        cols: Vec<FuzzTestIndexCol>,
+        unique: bool,
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct FuzzTestDbState {
+        tables: Vec<FuzzTestTable>,
+        indices: Vec<FuzzTestIndex>,
+        table_counter: usize,
+        index_counter: usize,
+    }
+
+    impl FuzzTestDbState {
+        fn next_table_name(&mut self) -> String {
+            self.table_counter += 1;
+            format!("t{}", self.table_counter)
+        }
+        fn next_index_name(&mut self) -> String {
+            self.index_counter += 1;
+            format!("i{}", self.index_counter)
+        }
+    }
+
+    const COLLATIONS: [&str; 3] = ["BINARY", "NOCASE", "RTRIM"];
+    const TYPES: [&str; 5] = ["INT", "TEXT", "REAL", "BLOB", "NUMERIC"];
+
+    fn random_collation<R: Rng>(rng: &mut R) -> Option<&'static str> {
+        if rng.random_bool(0.65) {
+            Some(COLLATIONS[rng.random_range(0..COLLATIONS.len())])
+        } else {
+            None
+        }
+    }
+
+    fn random_type<R: Rng>(rng: &mut R) -> &'static str {
+        TYPES[rng.random_range(0..TYPES.len())]
+    }
+
+    fn quote_ident(s: &str) -> String {
+        // use simple quoting with double quotes
+        format!("\"{}\"", s.replace('"', "\"\""))
+    }
+
+    fn sql_value_string<R: Rng>(rng: &mut R) -> String {
+        match rng.random_range(0..9) {
+            0 => "NULL".to_string(),
+            1 => rng.random_range(-1000..=1000).to_string(),
+            2 => {
+                let f: f64 = rng.random_range(-10000.0..10000.0);
+                // avoid NaN comparisons
+                if rng.random_bool(0.1) {
+                    "0.0".to_string()
+                } else {
+                    f.to_string()
+                }
+            }
+            3 => format!("'{}'", " ".repeat(rng.random_range(0..=3))), // spaces test RTRIM
+            4 => format!("'{}'", "A".repeat(rng.random_range(0..=3))), // test NOCASE
+            5 => format!("'{}'", "a".repeat(rng.random_range(0..=3))),
+            6 => format!(
+                "X'{:02X}{:02X}{:02X}'",
+                rng.random_range(0..=255),
+                rng.random_range(0..=255),
+                rng.random_range(0..=255)
+            ),
+            7 => format!("'{}'", rng.random_range(0..=1_000_000_000)),
+            _ => format!(
+                "'{}'",
+                ["foo", "Foo", "FOO", "bar ", " Bar", "baz  "][rng.random_range(0..6)]
+                    .replace('\'', "''")
+            ),
+        }
+    }
+
+    fn build_create_table_sql<R: Rng>(rng: &mut R, tname: &str) -> FuzzTestTable {
+        // number of columns
+        let mut num_cols = rng.random_range(1..=6);
+        let mut columns = Vec::<FuzzTestColumn>::new();
+
+        // Sometimes include AUTOINCREMENT pk which also creates sqlite_sequence on first insert
+        let include_autoinc = rng.random_bool(0.25);
+        if include_autoinc {
+            let cname = "id".to_string();
+            columns.push(FuzzTestColumn {
+                name: cname,
+                ty: "INTEGER".to_string(),
+                collation: None,
+                inline_unique: false,
+                is_pk_autoinc: true,
+            });
+            // ensure at least one more column so selects have options
+            num_cols = num_cols.max(2);
+        }
+
+        for i in (columns.len())..num_cols {
+            let cname = format!("c{}", i + 1);
+            let ty = random_type(rng).to_string();
+            let coll = if rng.random_bool(0.7) {
+                random_collation(rng)
+            } else {
+                None
+            };
+            columns.push(FuzzTestColumn {
+                name: cname,
+                ty,
+                collation: coll,
+                inline_unique: false,
+                is_pk_autoinc: false,
+            });
+        }
+
+        // Choose number of unique constraints to place (possibly 0)
+        // We mix inline and table-level placements. Unique indexes will be created in separate "create index" actions.
+        let mut unique_table_constraints: Vec<Vec<usize>> = Vec::new();
+        let mut available_cols: Vec<usize> = (0..columns.len()).collect();
+        // do not use the autoincrement pk for unique constraints (already unique)
+        available_cols.retain(|&i| !columns[i].is_pk_autoinc);
+
+        let uniq_groups = if available_cols.is_empty() {
+            0
+        } else {
+            rng.random_range(0..=3)
+        };
+        for _ in 0..uniq_groups {
+            if available_cols.is_empty() {
+                break;
+            }
+            let width = rng.random_range(1..=available_cols.len().min(3));
+            let mut cols_pick = available_cols.clone();
+            cols_pick.shuffle(rng);
+            cols_pick.truncate(width);
+
+            // randomize ordering of unique constraint columns
+            cols_pick.shuffle(rng);
+
+            // Place either inline UNIQUE (only allowed when width == 1) or a table-level UNIQUE group
+            if width == 1 && rng.random_bool(0.5) {
+                columns[cols_pick[0]].inline_unique = true;
+            } else {
+                unique_table_constraints.push(cols_pick);
+            }
+
+            // Don't remove cols from availability to allow overlapping constraints occasionally
+            // That helps fuzz multi-constraint interactions.
+        }
+
+        FuzzTestTable {
+            name: tname.to_string(),
+            columns,
+            unique_table_constraints,
+        }
+    }
+
+    fn create_table_stmt(tbl: &FuzzTestTable) -> String {
+        let mut defs: Vec<String> = Vec::new();
+        for c in &tbl.columns {
+            if c.is_pk_autoinc {
+                defs.push(format!(
+                    "{} INTEGER PRIMARY KEY AUTOINCREMENT",
+                    quote_ident(&c.name)
+                ));
+                continue;
+            }
+            let mut part = format!("{} {}", quote_ident(&c.name), c.ty);
+            if let Some(coll) = c.collation {
+                part.push_str(&format!(" COLLATE {coll}"));
+            }
+            if c.inline_unique {
+                part.push_str(" UNIQUE");
+            }
+            defs.push(part);
+        }
+        for grp in &tbl.unique_table_constraints {
+            let cols = grp
+                .iter()
+                .map(|&i| quote_ident(&tbl.columns[i].name))
+                .collect::<Vec<_>>()
+                .join(", ");
+            defs.push(format!("UNIQUE ({cols})"));
+        }
+        format!(
+            "CREATE TABLE {} ({})",
+            quote_ident(&tbl.name),
+            defs.join(", ")
+        )
+    }
+
+    fn random_index_for_table<R: Rng>(
+        rng: &mut R,
+        state: &mut FuzzTestDbState,
+        tbl: &FuzzTestTable,
+    ) -> FuzzTestIndex {
+        // choose number of index columns
+        let cols_count = rng.random_range(1..=tbl.columns.len().min(4));
+        let mut idx_cols_indices: Vec<usize> = (0..tbl.columns.len()).collect();
+        // Avoid including autoincrement PK in composite index too often to generate more variety
+        if tbl.columns.iter().any(|c| c.is_pk_autoinc) && rng.random_bool(0.7) {
+            idx_cols_indices.retain(|&i| !tbl.columns[i].is_pk_autoinc);
+            if idx_cols_indices.is_empty() {
+                idx_cols_indices = (0..tbl.columns.len()).collect();
+            }
+        }
+        idx_cols_indices.shuffle(rng);
+        idx_cols_indices.truncate(cols_count);
+        // randomize order again
+        idx_cols_indices.shuffle(rng);
+
+        let mut cols: Vec<FuzzTestIndexCol> = Vec::new();
+        for &ci in &idx_cols_indices {
+            let coll_over = if rng.random_bool(0.5) {
+                random_collation(rng)
+            } else {
+                None
+            };
+            let sort = if rng.random_bool(0.5) { "ASC" } else { "DESC" };
+            cols.push(FuzzTestIndexCol {
+                col: ci,
+                collation: coll_over,
+                sort_order: sort,
+            });
+        }
+
+        let idx_name = state.next_index_name();
+        FuzzTestIndex {
+            name: idx_name,
+            table: tbl.name.clone(),
+            cols,
+            unique: rng.random_bool(0.5),
+        }
+    }
+
+    fn create_index_stmt(tbl: &FuzzTestTable, idx: &FuzzTestIndex) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        for ic in &idx.cols {
+            let mut piece = quote_ident(&tbl.columns[ic.col].name);
+            if let Some(coll) = ic.collation {
+                piece.push_str(&format!(" COLLATE {coll}"));
+            }
+            piece.push_str(&format!(" {}", ic.sort_order));
+            parts.push(piece);
+        }
+        format!(
+            "CREATE {} INDEX {} ON {} ({})",
+            if idx.unique { "UNIQUE" } else { "" },
+            quote_ident(&idx.name),
+            quote_ident(&idx.table),
+            parts.join(", ")
+        )
+        .replace("  ", " ")
+    }
+
+    fn insert_random_rows_stmt<R: Rng>(
+        rng: &mut R,
+        tbl: &FuzzTestTable,
+        rows: usize,
+    ) -> Vec<String> {
+        // Insert rows individually so we can ignore uniqueness violations cleanly.
+        let mut stmts = Vec::new();
+        for _ in 0..rows {
+            let mut vals = Vec::new();
+            for c in &tbl.columns {
+                if c.is_pk_autoinc {
+                    // Let autoincrement assign
+                    vals.push("NULL".to_string());
+                } else {
+                    vals.push(sql_value_string(rng));
+                }
+            }
+            let stmt = format!(
+                "INSERT INTO {} VALUES ({})",
+                quote_ident(&tbl.name),
+                vals.join(", ")
+            );
+            stmts.push(stmt);
+        }
+        stmts
+    }
+
+    fn random_select_stmt<R: Rng>(rng: &mut R, tbl: &FuzzTestTable) -> String {
+        // select random subset of columns
+        let mut col_indices: Vec<usize> = (0..tbl.columns.len()).collect();
+        let select_count = rng.random_range(1..=tbl.columns.len());
+        col_indices.shuffle(rng);
+        col_indices.truncate(select_count);
+        // keep a deterministic order in select list for easier comparison
+        col_indices.sort_unstable();
+
+        let select_cols = col_indices
+            .iter()
+            .map(|&i| quote_ident(&tbl.columns[i].name))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        // Small chance of adding simple WHERE
+        let where_clause = if rng.random_bool(0.4) {
+            // equality or IS NULL on one or two predicates
+            let preds = rng.random_range(1..=2);
+            let mut chosen = (0..tbl.columns.len()).collect::<Vec<_>>();
+            chosen.shuffle(rng);
+            let mut parts = Vec::new();
+            for &ci in chosen.iter().take(preds) {
+                let cn = &tbl.columns[ci].name;
+                let kind = rng.random_range(0..4);
+                let part = match kind {
+                    0 => format!("{} IS NULL", quote_ident(cn)),
+                    1 => format!("{} = {}", quote_ident(cn), sql_value_string(rng)),
+                    2 => format!("{} <> {}", quote_ident(cn), sql_value_string(rng)),
+                    _ => format!("{} IS NOT NULL", quote_ident(cn)),
+                };
+                parts.push(part);
+            }
+            format!(" WHERE {}", parts.join(" AND "))
+        } else {
+            String::new()
+        };
+
+        // ORDER BY some columns with optional explicit collate/sort to exercise index usage
+        let mut order_cols = col_indices.clone();
+        order_cols.shuffle(rng);
+        order_cols.truncate(rng.random_range(1..=order_cols.len()));
+        let mut order_parts = Vec::new();
+        for ci in order_cols {
+            let mut piece = quote_ident(&tbl.columns[ci].name);
+            if rng.random_bool(0.5) {
+                if let Some(coll) = random_collation(rng) {
+                    piece.push_str(&format!(" COLLATE {coll}"));
+                }
+            }
+            piece.push_str(if rng.random_bool(0.5) {
+                " ASC"
+            } else {
+                " DESC"
+            });
+            order_parts.push(piece);
+        }
+        // Append rowid tiebreaker for determinism, most tables will have rowid
+        order_parts.push("rowid ASC".to_string());
+        let order_clause = format!(" ORDER BY {}", order_parts.join(", "));
+
+        // Optional LIMIT
+        let limit_clause = if rng.random_bool(0.6) {
+            format!(" LIMIT {}", rng.random_range(1..=50))
+        } else {
+            String::new()
+        };
+
+        format!(
+            "SELECT {} FROM {}{}{}{}",
+            select_cols,
+            quote_ident(&tbl.name),
+            where_clause,
+            order_clause,
+            limit_clause
+        )
+    }
+
+    #[allow(dead_code)]
+    enum Action {
+        CreateTable,
+        CreateIndex,
+        InsertData,
+        Select,
+    }
+
+    fn pick_action<R: Rng>(rng: &mut R, db_state: &FuzzTestDbState) -> Action {
+        if db_state.tables.is_empty() {
+            return Action::CreateTable;
+        }
+        match rng.random_range(0..100) {
+            0..=14 => Action::CreateTable,  // ~15%
+            15..=34 => Action::CreateIndex, // ~20%
+            // temporary disable this action - because right now we still have bug with affinity for insertion to the indices
+            // 35..=55 => Action::InsertData,  // ~20%
+            _ => Action::Select, // leftover
+        }
+    }
+
+    #[test]
+    pub fn test_data_layout_compatibility() {
+        maybe_setup_tracing();
+        const OUTER: usize = 100;
+        const INNER: usize = 10;
+
+        let (mut rng, seed) = rng_from_time_or_env();
+        let left = NamedTempFile::new().unwrap();
+        let right = NamedTempFile::new().unwrap();
+
+        let (_left, left) = left.keep().unwrap();
+        let (_right, right) = right.keep().unwrap();
+        // let left = left.path();
+        // let right = right.path();
+
+        tracing::info!(
+            "test_data_layout_compatibility seed: {}, left_path={:?}, right_path={:?}",
+            seed,
+            left,
+            right
+        );
+        let mut state = FuzzTestDbState::default();
+
+        for i in 0..OUTER {
+            tracing::info!(
+                "test_data_layout_compatibility: outer iter {}/{}",
+                i + 1,
+                OUTER
+            );
+            let (turso_path, sqlite_path) = if i % 2 == 0 {
+                (&left, &right)
+            } else {
+                (&right, &left)
+            };
+            let turso_db = TempDatabase::builder().with_db_path(turso_path).build();
+            let turso_conn = turso_db.connect_limbo();
+            let sqlite_conn = rusqlite::Connection::open(sqlite_path).unwrap();
+            for _ in 0..INNER {
+                let action = pick_action(&mut rng, &state);
+                match action {
+                    Action::CreateTable => {
+                        // Create a new randomized table
+                        let tname = state.next_table_name();
+                        let table = build_create_table_sql(&mut rng, &tname);
+                        let query = create_table_stmt(&table);
+
+                        tracing::info!("table: {}", query);
+                        let turso_result = turso_conn.execute(&query);
+                        let sqlite_result = sqlite_conn.execute(&query, ());
+                        assert_eq!(turso_result.is_ok(), sqlite_result.is_ok());
+
+                        if turso_result.is_ok() {
+                            let ins_cnt = rng.random_range(0..=30);
+                            for ins_stmt in insert_random_rows_stmt(&mut rng, &table, ins_cnt) {
+                                tracing::info!("insert: {}", ins_stmt);
+                                let turso_result = turso_conn.execute(&ins_stmt);
+                                let sqlite_result = sqlite_conn.execute(&ins_stmt, ());
+                                assert_eq!(turso_result.is_ok(), sqlite_result.is_ok());
+                            }
+                        }
+                        state.tables.push(table);
+                    }
+                    Action::CreateIndex => {
+                        if state.tables.is_empty() {
+                            continue;
+                        }
+                        let t_idx = rng.random_range(0..state.tables.len());
+                        let tbl = state.tables[t_idx].clone();
+                        let idx = random_index_for_table(&mut rng, &mut state, &tbl);
+                        let query = create_index_stmt(&tbl, &idx);
+
+                        tracing::info!("index: {}", query);
+                        let turso_result = turso_conn.execute(&query);
+                        let sqlite_result = sqlite_conn.execute(&query, ());
+                        assert_eq!(turso_result.is_ok(), sqlite_result.is_ok());
+                        state.indices.push(idx);
+                    }
+                    Action::InsertData => {
+                        let t_idx = rng.random_range(0..state.tables.len());
+                        let table = state.tables[t_idx].clone();
+                        let ins_cnt = rng.random_range(0..=30);
+                        for ins_stmt in insert_random_rows_stmt(&mut rng, &table, ins_cnt) {
+                            tracing::info!("insert: {}", ins_stmt);
+                            let turso_result = turso_conn.execute(&ins_stmt);
+                            let sqlite_result = sqlite_conn.execute(&ins_stmt, ());
+                            assert_eq!(turso_result.is_ok(), sqlite_result.is_ok());
+                        }
+                    }
+                    Action::Select => {
+                        if state.tables.is_empty() {
+                            continue;
+                        }
+                        // pick a random table to select from
+                        let t_idx = rng.random_range(0..state.tables.len());
+                        let tbl = &state.tables[t_idx];
+
+                        let query = random_select_stmt(&mut rng, tbl);
+
+                        tracing::info!("query: {}", query);
+                        let limbo_rows = limbo_exec_rows(&turso_db, &turso_conn, &query);
+                        let sqlite_rows = sqlite_exec_rows(&sqlite_conn, &query);
+
+                        assert_eq!(
+                            limbo_rows, sqlite_rows,
+                            "Mismatch on query: {query}\nseed: {seed}\nlimbo: {limbo_rows:?}\nsqlite: {sqlite_rows:?}"
+                        );
+                    }
+                }
             }
         }
     }
