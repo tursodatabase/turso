@@ -1268,9 +1268,15 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         bootstrap_conn.promote_to_regular_connection();
 
         if !self.maybe_recover_logical_log(bootstrap_conn.clone())? {
-            // There was no logical log to recover, so we're done.
-            return Ok(());
-        }
+            // Initialize global_header from pager's page 1
+            // When recovering we already initialize the header in `begin_load_tx`, so only initialize if we did not recover
+            let pager = bootstrap_conn.pager.load();
+            let header = pager
+                .io
+                .block(|| pager.with_header(|header| *header))
+                .expect("failed to read database header");
+            self.global_header.write().replace(header);
+        };
 
         Ok(())
     }
@@ -2034,6 +2040,11 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 .global_header
                 .read()
                 .expect("global_header should be initialized");
+            // The header could be stored, but not persisted yet
+            pager
+                .io
+                .block(|| pager.maybe_allocate_page1())
+                .expect("failed to allocate page1");
             tracing::debug!("get_transaction_database_header read: header={:?}", header);
             header
         }

@@ -8399,6 +8399,11 @@ pub fn op_open_dup(
     // a separate database file).
     let pager = original_cursor.get_pager();
 
+    // Ephemeral tables have their own pager, so we need to check if this is an
+    // ephemeral cursor by comparing pagers. Ephemeral cursors should NOT be wrapped
+    // in MvCursor because the mv_store doesn't have mappings for ephemeral table root pages.
+    let is_ephemeral = pager.wal.is_none();
+
     let (_, cursor_type) = program
         .cursor_ref
         .get(*original_cursor_id)
@@ -8410,7 +8415,7 @@ pub fn op_open_dup(
                 maybe_transform_root_page_to_positive(mv_store.as_ref(), root_page),
                 table.columns.len(),
             ));
-            let cursor: Box<dyn CursorTrait> =
+            let cursor: Box<dyn CursorTrait> = if !is_ephemeral {
                 if let Some(tx_id) = program.connection.get_mv_tx_id() {
                     let mv_store = mv_store
                         .as_ref()
@@ -8425,7 +8430,10 @@ pub fn op_open_dup(
                     )?)
                 } else {
                     cursor
-                };
+                }
+            } else {
+                cursor
+            };
             let cursors = &mut state.cursors;
             cursors
                 .get_mut(*new_cursor_id)
