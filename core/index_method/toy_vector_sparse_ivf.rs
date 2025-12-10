@@ -418,6 +418,9 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
         );
         for sql in [inverted_index_create, stats_index_create] {
             let mut stmt = connection.prepare(&sql)?;
+            // we run nested statement - so we don't need to have stmt subtransaction
+            // this is hacky way to fix situation for toy index for now - we need to implement proper helpers instead later
+            stmt.program.needs_stmt_subtransactions = false;
             connection.start_nested();
             let result = stmt.run_ignore_rows();
             connection.end_nested();
