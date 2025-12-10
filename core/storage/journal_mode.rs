@@ -38,10 +38,7 @@ impl JournalMode {
     /// Modes that are supported
     #[inline]
     pub fn supported(&self) -> bool {
-        match self {
-            JournalMode::Wal | JournalMode::ExperimentalMvcc => true,
-            _ => false,
-        }
+        matches!(self, JournalMode::Wal | JournalMode::ExperimentalMvcc)
     }
 
     /// As the header file version
@@ -86,20 +83,11 @@ pub fn change_mode(
 
     let db_path = db_path.as_ref();
 
-    if matches!(new_mode, JournalMode::ExperimentalMvcc) {
-        if !program.connection.db.mvcc_enabled() {
-            return Err(LimboError::InvalidArgument(
+    if matches!(new_mode, JournalMode::ExperimentalMvcc) && !program.connection.db.mvcc_enabled() {
+        return Err(LimboError::InvalidArgument(
                 "MVCC is not enabled. Enable it with `--experimental-mvcc` flag in the CLI or by setting the MVCC option in `DatabaseOpts`".to_string(),
             ));
-        }
     }
-
-    // if matches!(new_mode, JournalMode::Wal) && logical_log_exists(db_path) {
-    //     return Err(LimboError::InvalidArgument(format!(
-    //                  "MVCC logical log file exists for database {}, but we want to enable WAL mode. This is not supported. Open the database in MVCC mode and run PRAGMA wal_checkpoint(TRUNCATE) to truncate the logical log.",
-    //                 db_path.display()
-    //             )));
-    // }
 
     // Checkpoint the WAL or MVCC
     program.connection.checkpoint(CheckpointMode::Truncate {
@@ -125,7 +113,7 @@ pub fn change_mode(
     }
 
     // Flush it to Disk
-    let completion = begin_write_btree_page(&pager, &page)?;
+    let completion = begin_write_btree_page(pager, &page)?;
     pager.io.wait_for_completion(completion)?;
 
     pager.clear_page_cache(true);
