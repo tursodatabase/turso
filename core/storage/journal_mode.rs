@@ -3,7 +3,6 @@ use std::sync::Arc;
 use crate::storage::sqlite3_ondisk::DatabaseHeader;
 use crate::storage::wal::CheckpointMode;
 use crate::util::IOExt;
-use crate::vdbe::execute::with_header_mut;
 use crate::vdbe::Program;
 use crate::{mvcc, LimboError, MvStore, OpenFlags, Result, IO};
 use crate::{
@@ -95,12 +94,12 @@ pub fn change_mode(
         }
     }
 
-    if matches!(new_mode, JournalMode::Wal) && logical_log_exists(db_path) {
-        return Err(LimboError::InvalidArgument(format!(
-                     "MVCC logical log file exists for database {}, but we want to enable WAL mode. This is not supported. Open the database in MVCC mode and run PRAGMA wal_checkpoint(TRUNCATE) to truncate the logical log.",
-                    db_path.display()
-                )));
-    }
+    // if matches!(new_mode, JournalMode::Wal) && logical_log_exists(db_path) {
+    //     return Err(LimboError::InvalidArgument(format!(
+    //                  "MVCC logical log file exists for database {}, but we want to enable WAL mode. This is not supported. Open the database in MVCC mode and run PRAGMA wal_checkpoint(TRUNCATE) to truncate the logical log.",
+    //                 db_path.display()
+    //             )));
+    // }
 
     // Checkpoint the WAL or MVCC
     program.connection.checkpoint(CheckpointMode::Truncate {
@@ -112,16 +111,12 @@ pub fn change_mode(
         .expect("Should be a supported Journal Mode");
     let raw_version = RawVersion::from(new_version);
 
+    // After checkpoint, pager holds the most up-to-date version of the Header for both MVCC and WAL
     pager.io.block(|| {
-        with_header_mut(
-            pager,
-            program.connection.mv_store().as_ref(),
-            program,
-            |header| {
-                header.read_version = raw_version;
-                header.write_version = raw_version;
-            },
-        )
+        pager.with_header_mut(|header| {
+            header.read_version = raw_version;
+            header.write_version = raw_version;
+        })
     })?;
 
     let (page, c) = pager.read_page(DatabaseHeader::PAGE_ID as i64)?;

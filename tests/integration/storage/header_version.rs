@@ -413,3 +413,373 @@ fn test_pragma_journal_mode_wal_to_mvcc_with_pending_wal() {
         "After PRAGMA journal_mode switch, read_version should be 255 (MVCC), got {read_ver}"
     );
 }
+
+/// Test switching from MVCC to WAL mode via PRAGMA.
+/// This tests the scenario where:
+/// 1. A database is in MVCC mode with data
+/// 2. User runs `PRAGMA journal_mode = "wal"` to switch to WAL
+/// 3. The data should be preserved and mode should switch correctly
+#[test]
+fn test_pragma_journal_mode_mvcc_to_wal() {
+    let tmp_dir = TempDir::new().unwrap();
+    let db_path = tmp_dir.path().join("test.db");
+
+    // Step 1: Create a WAL mode database and convert to MVCC
+    create_wal_db(&db_path);
+
+    // Step 2: Open with MVCC to convert to MVCC mode and add some data
+    {
+        let io = std::sync::Arc::new(turso_core::PlatformIO::new().unwrap());
+        let opts = DatabaseOpts::new().with_mvcc(true);
+
+        let db = Database::open_file_with_flags(
+            io.clone(),
+            db_path.to_str().unwrap(),
+            OpenFlags::default(),
+            opts,
+            None,
+        )
+        .expect("Failed to open database with limbo (MVCC)");
+
+        let conn = db.connect().unwrap();
+
+        // Insert some data in MVCC mode
+        conn.execute("INSERT INTO t (val) VALUES ('mvcc_data')")
+            .expect("INSERT should work in MVCC mode");
+
+        drop(conn);
+        drop(db);
+    }
+
+    // Verify it's now MVCC mode
+    let (write_ver, read_ver) = read_header_versions(&db_path);
+    assert_eq!(write_ver, 255, "Should be MVCC after first open");
+    assert_eq!(read_ver, 255, "Should be MVCC after first open");
+
+    // Step 3: Reopen and switch to WAL mode via PRAGMA
+    let io = std::sync::Arc::new(turso_core::PlatformIO::new().unwrap());
+    // Open with MVCC true since the file is MVCC, but we'll switch to WAL
+    let opts = DatabaseOpts::new().with_mvcc(true);
+
+    let db = Database::open_file_with_flags(
+        io.clone(),
+        db_path.to_str().unwrap(),
+        OpenFlags::default(),
+        opts,
+        None,
+    )
+    .expect("Failed to open MVCC database with limbo");
+
+    let conn = db.connect().unwrap();
+
+    // Switch to WAL mode via PRAGMA
+    let result = conn
+        .pragma_update("journal_mode", "'wal'")
+        .expect("PRAGMA journal_mode update should not fail");
+
+    // Verify the journal mode was set
+    assert!(!result.is_empty(), "PRAGMA should return a result");
+    let mode = result[0][0].to_string();
+    assert_eq!(
+        mode, "wal",
+        "Journal mode should be wal after PRAGMA, got {mode}"
+    );
+
+    // Verify we can still query data (both original and MVCC data)
+    let mut stmt = conn.prepare("SELECT val FROM t ORDER BY val").unwrap();
+    let mut rows = Vec::new();
+    loop {
+        match stmt.step().unwrap() {
+            turso_core::StepResult::Row => {
+                let row = stmt.row().unwrap();
+                let val: String = row.get::<String>(0).unwrap();
+                rows.push(val);
+            }
+            turso_core::StepResult::IO => {
+                stmt.run_once().unwrap();
+                continue;
+            }
+            turso_core::StepResult::Done => break,
+            r => panic!("unexpected result {r:?}"),
+        }
+    }
+    assert!(
+        rows.contains(&"test".to_string()),
+        "Should have original test row"
+    );
+    assert!(
+        rows.contains(&"mvcc_data".to_string()),
+        "Should have mvcc_data row"
+    );
+
+    drop(conn);
+    drop(db);
+
+    // Verify header is now WAL (version 2)
+    let (write_ver, read_ver) = read_header_versions(&db_path);
+    assert_eq!(
+        write_ver, 2,
+        "After PRAGMA journal_mode switch to WAL, write_version should be 2, got {write_ver}"
+    );
+    assert_eq!(
+        read_ver, 2,
+        "After PRAGMA journal_mode switch to WAL, read_version should be 2, got {read_ver}"
+    );
+}
+
+/// Test switching modes multiple times: WAL -> MVCC -> WAL -> MVCC
+/// This ensures mode switching is robust and doesn't corrupt data
+#[test]
+fn test_pragma_journal_mode_multiple_switches() {
+    let tmp_dir = TempDir::new().unwrap();
+    let db_path = tmp_dir.path().join("test.db");
+
+    // Create a WAL mode database
+    create_wal_db(&db_path);
+
+    let io = std::sync::Arc::new(turso_core::PlatformIO::new().unwrap());
+    let opts = DatabaseOpts::new().with_mvcc(true);
+
+    let db = Database::open_file_with_flags(
+        io.clone(),
+        db_path.to_str().unwrap(),
+        OpenFlags::default(),
+        opts,
+        None,
+    )
+    .expect("Failed to open database");
+
+    let conn = db.connect().unwrap();
+
+    // Switch to MVCC
+    let result = conn
+        .pragma_update("journal_mode", "'experimental_mvcc'")
+        .expect("Switch to MVCC should work");
+    assert_eq!(result[0][0].to_string(), "experimental_mvcc");
+
+    // Insert data in MVCC mode
+    conn.execute("INSERT INTO t (val) VALUES ('after_mvcc_switch')")
+        .expect("INSERT should work");
+
+    // Switch back to WAL
+    let result = conn
+        .pragma_update("journal_mode", "'wal'")
+        .expect("Switch to WAL should work");
+    assert_eq!(result[0][0].to_string(), "wal");
+
+    // Insert data in WAL mode
+    conn.execute("INSERT INTO t (val) VALUES ('after_wal_switch')")
+        .expect("INSERT should work");
+
+    // Switch to MVCC again
+    let result = conn
+        .pragma_update("journal_mode", "'experimental_mvcc'")
+        .expect("Switch to MVCC again should work");
+    assert_eq!(result[0][0].to_string(), "experimental_mvcc");
+
+    // Insert data in MVCC mode
+    conn.execute("INSERT INTO t (val) VALUES ('after_second_mvcc_switch')")
+        .expect("INSERT should work");
+
+    // Verify all data is present
+    let mut stmt = conn.prepare("SELECT val FROM t ORDER BY val").unwrap();
+    let mut rows = Vec::new();
+    loop {
+        match stmt.step().unwrap() {
+            turso_core::StepResult::Row => {
+                let row = stmt.row().unwrap();
+                let val: String = row.get::<String>(0).unwrap();
+                rows.push(val);
+            }
+            turso_core::StepResult::IO => {
+                stmt.run_once().unwrap();
+                continue;
+            }
+            turso_core::StepResult::Done => break,
+            r => panic!("unexpected result {r:?}"),
+        }
+    }
+
+    assert!(rows.contains(&"test".to_string()), "Should have original row");
+    assert!(
+        rows.contains(&"after_mvcc_switch".to_string()),
+        "Should have after_mvcc_switch row"
+    );
+    assert!(
+        rows.contains(&"after_wal_switch".to_string()),
+        "Should have after_wal_switch row"
+    );
+    assert!(
+        rows.contains(&"after_second_mvcc_switch".to_string()),
+        "Should have after_second_mvcc_switch row"
+    );
+
+    drop(conn);
+    drop(db);
+
+    // Verify final header is MVCC (version 255)
+    let (write_ver, read_ver) = read_header_versions(&db_path);
+    assert_eq!(write_ver, 255, "Final mode should be MVCC (write_version=255)");
+    assert_eq!(read_ver, 255, "Final mode should be MVCC (read_version=255)");
+}
+
+/// Test that PRAGMA journal_mode query returns the current mode correctly
+#[test]
+fn test_pragma_journal_mode_query() {
+    let tmp_dir = TempDir::new().unwrap();
+    let db_path = tmp_dir.path().join("test.db");
+
+    // Create a WAL mode database
+    create_wal_db(&db_path);
+
+    let io = std::sync::Arc::new(turso_core::PlatformIO::new().unwrap());
+    let opts = DatabaseOpts::new().with_mvcc(false);
+
+    let db = Database::open_file_with_flags(
+        io.clone(),
+        db_path.to_str().unwrap(),
+        OpenFlags::default(),
+        opts,
+        None,
+    )
+    .expect("Failed to open database");
+
+    let conn = db.connect().unwrap();
+
+    // Query current journal mode (should be WAL)
+    if let Some(mut stmt) = conn.query("PRAGMA journal_mode").unwrap() {
+        loop {
+            match stmt.step().unwrap() {
+                turso_core::StepResult::Row => {
+                    let row = stmt.row().unwrap();
+                    let mode: String = row.get::<String>(0).unwrap();
+                    assert_eq!(mode, "wal", "Initial mode should be WAL, got {mode}");
+                }
+                turso_core::StepResult::IO => {
+                    stmt.run_once().unwrap();
+                    continue;
+                }
+                turso_core::StepResult::Done => break,
+                r => panic!("unexpected result {r:?}"),
+            }
+        }
+    }
+
+    drop(conn);
+    drop(db);
+
+    // Now open with MVCC and verify query returns experimental_mvcc
+    let opts = DatabaseOpts::new().with_mvcc(true);
+
+    let db = Database::open_file_with_flags(
+        io.clone(),
+        db_path.to_str().unwrap(),
+        OpenFlags::default(),
+        opts,
+        None,
+    )
+    .expect("Failed to open database with MVCC");
+
+    let conn = db.connect().unwrap();
+
+    // Query current journal mode (should be experimental_mvcc after conversion)
+    if let Some(mut stmt) = conn.query("PRAGMA journal_mode").unwrap() {
+        loop {
+            match stmt.step().unwrap() {
+                turso_core::StepResult::Row => {
+                    let row = stmt.row().unwrap();
+                    let mode: String = row.get::<String>(0).unwrap();
+                    assert_eq!(
+                        mode, "experimental_mvcc",
+                        "Mode should be experimental_mvcc after MVCC open, got {mode}"
+                    );
+                }
+                turso_core::StepResult::IO => {
+                    stmt.run_once().unwrap();
+                    continue;
+                }
+                turso_core::StepResult::Done => break,
+                r => panic!("unexpected result {r:?}"),
+            }
+        }
+    }
+
+    drop(conn);
+    drop(db);
+}
+
+/// Test that data inserted after mode switch persists after reopening
+#[test]
+fn test_pragma_journal_mode_data_persistence_after_switch() {
+    let tmp_dir = TempDir::new().unwrap();
+    let db_path = tmp_dir.path().join("test.db");
+
+    // Create a WAL mode database
+    create_wal_db(&db_path);
+
+    // Open and switch to MVCC, insert data
+    {
+        let io = std::sync::Arc::new(turso_core::PlatformIO::new().unwrap());
+        let opts = DatabaseOpts::new().with_mvcc(true);
+
+        let db = Database::open_file_with_flags(
+            io.clone(),
+            db_path.to_str().unwrap(),
+            OpenFlags::default(),
+            opts,
+            None,
+        )
+        .expect("Failed to open database");
+
+        let conn = db.connect().unwrap();
+
+        // Switch to MVCC
+        conn.pragma_update("journal_mode", "'experimental_mvcc'")
+            .expect("Switch to MVCC should work");
+
+        // Insert data after switch
+        conn.execute("INSERT INTO t (val) VALUES ('persisted_data')")
+            .expect("INSERT should work");
+
+        drop(conn);
+        drop(db);
+    }
+
+    // Reopen and verify data persisted
+    {
+        let io = std::sync::Arc::new(turso_core::PlatformIO::new().unwrap());
+        let opts = DatabaseOpts::new().with_mvcc(true);
+
+        let db = Database::open_file_with_flags(
+            io.clone(),
+            db_path.to_str().unwrap(),
+            OpenFlags::default(),
+            opts,
+            None,
+        )
+        .expect("Failed to reopen database");
+
+        let conn = db.connect().unwrap();
+
+        // Verify data persisted
+        let mut stmt = conn.prepare("SELECT val FROM t WHERE val = 'persisted_data'").unwrap();
+        let mut found = false;
+        loop {
+            match stmt.step().unwrap() {
+                turso_core::StepResult::Row => {
+                    found = true;
+                }
+                turso_core::StepResult::IO => {
+                    stmt.run_once().unwrap();
+                    continue;
+                }
+                turso_core::StepResult::Done => break,
+                r => panic!("unexpected result {r:?}"),
+            }
+        }
+        assert!(found, "Data inserted after mode switch should persist");
+
+        drop(conn);
+        drop(db);
+    }
+}
