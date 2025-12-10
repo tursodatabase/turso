@@ -2017,6 +2017,12 @@ pub fn translate_expr(
 
                             Ok(target_register)
                         }
+                        ScalarFunc::StatInit | ScalarFunc::StatPush | ScalarFunc::StatGet => {
+                            crate::bail_parse_error!(
+                                "{} is an internal function used by ANALYZE",
+                                srf
+                            );
+                        }
                     }
                 }
                 Func::Math(math_func) => match math_func.arity() {
