@@ -1267,17 +1267,16 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         // end up in the in-memory schema object as well.
         bootstrap_conn.promote_to_regular_connection();
 
-        self.maybe_recover_logical_log(bootstrap_conn.clone())?;
-
-        // Initialize global_header from pager's page 1
-        {
+        if !self.maybe_recover_logical_log(bootstrap_conn.clone())? {
+            // Initialize global_header from pager's page 1
+            // When recovering we already initialize the header in `begin_load_tx`, so only initialize if we did not recover
             let pager = bootstrap_conn.pager.load();
             let header = pager
                 .io
                 .block(|| pager.with_header(|header| *header))
                 .expect("failed to read database header");
             self.global_header.write().replace(header);
-        }
+        };
 
         Ok(())
     }
