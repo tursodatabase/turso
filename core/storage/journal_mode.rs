@@ -137,6 +137,10 @@ pub fn change_mode(
         mv_store.bootstrap(program.connection.clone())?;
     }
 
+    if matches!(new_mode, JournalMode::Wal) {
+        program.connection.db.mv_store.store(None);
+    }
+
     Ok(new_mode)
 }
 

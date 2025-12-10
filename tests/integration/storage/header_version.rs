@@ -557,6 +557,11 @@ fn test_pragma_journal_mode_multiple_switches() {
         .expect("Switch to MVCC should work");
     assert_eq!(result[0][0].to_string(), "experimental_mvcc");
 
+    // Verify header is MVCC (version 255)
+    let (write_ver, read_ver) = read_header_versions(&db_path);
+    assert_eq!(write_ver, 255, "mode should be MVCC (write_version=255)");
+    assert_eq!(read_ver, 255, "mode should be MVCC (read_version=255)");
+
     // Insert data in MVCC mode
     conn.execute("INSERT INTO t (val) VALUES ('after_mvcc_switch')")
         .expect("INSERT should work");
@@ -567,6 +572,11 @@ fn test_pragma_journal_mode_multiple_switches() {
         .expect("Switch to WAL should work");
     assert_eq!(result[0][0].to_string(), "wal");
 
+    // Verify header is MVCC (version 255)
+    let (write_ver, read_ver) = read_header_versions(&db_path);
+    assert_eq!(write_ver, 2, "mode should be WAL (write_version=2)");
+    assert_eq!(read_ver, 2, "mode should be WAL (read_version=2)");
+
     // Insert data in WAL mode
     conn.execute("INSERT INTO t (val) VALUES ('after_wal_switch')")
         .expect("INSERT should work");
@@ -576,6 +586,10 @@ fn test_pragma_journal_mode_multiple_switches() {
         .pragma_update("journal_mode", "'experimental_mvcc'")
         .expect("Switch to MVCC again should work");
     assert_eq!(result[0][0].to_string(), "experimental_mvcc");
+
+    let (write_ver, read_ver) = read_header_versions(&db_path);
+    assert_eq!(write_ver, 255, "mode should be MVCC (write_version=255)");
+    assert_eq!(read_ver, 255, "mode should be MVCC (read_version=255)");
 
     // Insert data in MVCC mode
     conn.execute("INSERT INTO t (val) VALUES ('after_second_mvcc_switch')")
@@ -600,7 +614,10 @@ fn test_pragma_journal_mode_multiple_switches() {
         }
     }
 
-    assert!(rows.contains(&"test".to_string()), "Should have original row");
+    assert!(
+        rows.contains(&"test".to_string()),
+        "Should have original row"
+    );
     assert!(
         rows.contains(&"after_mvcc_switch".to_string()),
         "Should have after_mvcc_switch row"
@@ -619,8 +636,14 @@ fn test_pragma_journal_mode_multiple_switches() {
 
     // Verify final header is MVCC (version 255)
     let (write_ver, read_ver) = read_header_versions(&db_path);
-    assert_eq!(write_ver, 255, "Final mode should be MVCC (write_version=255)");
-    assert_eq!(read_ver, 255, "Final mode should be MVCC (read_version=255)");
+    assert_eq!(
+        write_ver, 255,
+        "Final mode should be MVCC (write_version=255)"
+    );
+    assert_eq!(
+        read_ver, 255,
+        "Final mode should be MVCC (read_version=255)"
+    );
 }
 
 /// Test that PRAGMA journal_mode query returns the current mode correctly
@@ -762,7 +785,9 @@ fn test_pragma_journal_mode_data_persistence_after_switch() {
         let conn = db.connect().unwrap();
 
         // Verify data persisted
-        let mut stmt = conn.prepare("SELECT val FROM t WHERE val = 'persisted_data'").unwrap();
+        let mut stmt = conn
+            .prepare("SELECT val FROM t WHERE val = 'persisted_data'")
+            .unwrap();
         let mut found = false;
         loop {
             match stmt.step().unwrap() {
