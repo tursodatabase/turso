@@ -127,6 +127,12 @@ fn find_best_access_method_for_btree(
 
     // Estimate cost for each candidate index (including the rowid index) and replace best_access_method if the cost is lower.
     for candidate in rhs_constraints.candidates.iter() {
+        let usable_constraint_refs = usable_constraints_for_join_order(
+            &rhs_constraints.constraints,
+            &candidate.refs,
+            join_order,
+        );
+
         let index_info = match candidate.index.as_ref() {
             Some(index) => IndexInfo {
                 unique: index.unique,
@@ -134,16 +140,12 @@ fn find_best_access_method_for_btree(
                 column_count: index.columns.len(),
             },
             None => IndexInfo {
-                unique: true,   // rowids are always unique
-                covering: true, // for the purposes of cost, rowid lookup is essentially "covering"/no separate table access needed
+                unique: true, // rowids are always unique
+                // Only treat rowid as covering when there are usable constraints/rowid seek
+                covering: !usable_constraint_refs.is_empty(),
                 column_count: 1,
             },
         };
-        let usable_constraint_refs = usable_constraints_for_join_order(
-            &rhs_constraints.constraints,
-            &candidate.refs,
-            join_order,
-        );
         let cost = estimate_cost_for_scan_or_seek(
             Some(index_info),
             &rhs_constraints.constraints,
