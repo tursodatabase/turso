@@ -2041,6 +2041,11 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 .global_header
                 .read()
                 .expect("global_header should be initialized");
+            // The header could be stored, but not persisted yet
+            pager
+                .io
+                .block(|| pager.maybe_allocate_page1())
+                .expect("failed to allocate page1");
             tracing::debug!("get_transaction_database_header read: header={:?}", header);
             header
         }
