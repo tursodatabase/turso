@@ -337,6 +337,9 @@ pub enum ScalarFunc {
     Attach,
     Detach,
     Unlikely,
+    StatInit,
+    StatPush,
+    StatGet,
 }
 
 impl ScalarFunc {
@@ -401,6 +404,9 @@ impl ScalarFunc {
             ScalarFunc::Attach => false, // changes database state
             ScalarFunc::Detach => false, // changes database state
             ScalarFunc::Unlikely => true,
+            ScalarFunc::StatInit => false, // internal ANALYZE function
+            ScalarFunc::StatPush => false, // internal ANALYZE function
+            ScalarFunc::StatGet => false,  // internal ANALYZE function
         }
     }
 }
@@ -467,6 +473,9 @@ impl Display for ScalarFunc {
             Self::Attach => "attach".to_string(),
             Self::Detach => "detach".to_string(),
             Self::Unlikely => "unlikely".to_string(),
+            Self::StatInit => "stat_init".to_string(),
+            Self::StatPush => "stat_push".to_string(),
+            Self::StatGet => "stat_get".to_string(),
         };
         write!(f, "{str}")
     }

@@ -194,6 +194,98 @@ fn parse_stat_numbers(stat: &str) -> Option<Vec<u64>> {
         .collect()
 }
 
+/// Statistics accumulator for ANALYZE.
+#[derive(Debug, Clone)]
+pub struct StatAccum {
+    /// Number of columns in the index (not including rowid)
+    pub n_col: usize,
+    /// Total number of rows seen
+    pub n_row: u64,
+    /// Distinct counts for each column prefix.
+    /// distinct[i] = number of distinct values for columns 0..=i
+    pub distinct: Vec<u64>,
+}
+
+impl StatAccum {
+    pub fn new(n_col: usize) -> Self {
+        Self {
+            n_col,
+            n_row: 0,
+            distinct: vec![0; n_col],
+        }
+    }
+
+    /// Push a row, indicating which column (0-indexed) is the first to differ
+    /// from the previous row. If this is the first row, pass 0.
+    ///
+    /// i_chng is the index of the leftmost column that changed:
+    /// - 0 means column 0 changed (or first row)
+    /// - 1 means columns 0 was same, column 1 changed
+    /// - n_col means all columns were the same (duplicate row)
+    pub fn push(&mut self, i_chng: usize) {
+        self.n_row += 1;
+        // Increment distinct counts for columns i_chng and onwards
+        // because if column i changed, then prefixes (0..=i), (0..=i+1), etc. all have a new distinct value
+        for i in i_chng..self.n_col {
+            self.distinct[i] += 1;
+        }
+    }
+
+    /// Get the stat1 string: "total avg1 avg2 ..."
+    /// where avgN = ceil(total / distinctN)
+    pub fn get_stat1(&self) -> String {
+        if self.n_row == 0 {
+            return String::new();
+        }
+
+        let mut parts = vec![self.n_row.to_string()];
+        for &d in &self.distinct {
+            let avg = if d > 0 {
+                self.n_row.div_ceil(d)
+            } else {
+                self.n_row
+            };
+            parts.push(avg.to_string());
+        }
+        parts.join(" ")
+    }
+
+    /// Serialize to bytes for storage in a blob register.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut bytes = Vec::with_capacity(8 + 8 + 8 * self.n_col);
+        bytes.extend_from_slice(&(self.n_col as u64).to_le_bytes());
+        bytes.extend_from_slice(&self.n_row.to_le_bytes());
+        for &d in &self.distinct {
+            bytes.extend_from_slice(&d.to_le_bytes());
+        }
+        bytes
+    }
+
+    /// Deserialize from bytes.
+    pub fn from_bytes(bytes: &[u8]) -> Option<Self> {
+        if bytes.len() < 16 {
+            return None;
+        }
+        let n_col = u64::from_le_bytes(bytes[0..8].try_into().ok()?) as usize;
+        let n_row = u64::from_le_bytes(bytes[8..16].try_into().ok()?);
+
+        if bytes.len() < 16 + 8 * n_col {
+            return None;
+        }
+        let mut distinct = Vec::with_capacity(n_col);
+        for i in 0..n_col {
+            let start = 16 + i * 8;
+            let d = u64::from_le_bytes(bytes[start..start + 8].try_into().ok()?);
+            distinct.push(d);
+        }
+        Some(Self {
+            n_col,
+            n_row,
+            distinct,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::parse_stat_numbers;
