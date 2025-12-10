@@ -278,7 +278,7 @@ mod fuzz_tests {
 
         // Insert into limbo databases
         let limbo_conns = dbs.iter().map(|db| db.connect_limbo()).collect::<Vec<_>>();
-        for (i, limbo_conn) in limbo_conns.iter().enumerate() {
+        for limbo_conn in limbo_conns.iter() {
             limbo_exec_rows(limbo_conn, &insert);
         }
 

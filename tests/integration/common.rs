@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tempfile::TempDir;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
-use turso_core::{Connection, Database, Row, StepResult, IO};
+use turso_core::{Connection, Database, FromValueRow, Row, StepResult, IO};
 
 pub struct TempDatabase {
     pub path: PathBuf,
@@ -513,6 +513,53 @@ pub fn rusqlite_integrity_check(db_path: &Path) -> anyhow::Result<()> {
     }
     Ok(())
 }
+
+pub trait ExecRows<T> {
+    #[allow(dead_code)]
+    fn exec_rows(&self, query: &str) -> Vec<T>;
+}
+
+macro_rules! impl_exec_rows_for_tuple {
+    ($($T:ident : $idx:tt),+) => {
+        impl<$($T),+> ExecRows<($($T,)+)> for Arc<Connection>
+        where
+            $($T: for<'a> FromValueRow<'a> + 'static,)+
+        {
+            fn exec_rows(&self, query: &str) -> Vec<($($T,)+)> {
+                let mut stmt = self.prepare(query).unwrap();
+                let mut rows = Vec::new();
+                'outer: loop {
+                    let row = loop {
+                        let result = stmt.step().unwrap();
+                        match result {
+                            turso_core::StepResult::Row => {
+                                let row = stmt.row().unwrap();
+                                break row;
+                            }
+                            turso_core::StepResult::IO => {
+                                stmt.run_once().unwrap();
+                                continue;
+                            }
+                            turso_core::StepResult::Done => break 'outer,
+                            r => panic!("unexpected result {r:?}"),
+                        }
+                    };
+                    rows.push(($(row.get($idx).unwrap(),)+));
+                }
+                rows
+            }
+        }
+    };
+}
+
+impl_exec_rows_for_tuple!(T0: 0);
+impl_exec_rows_for_tuple!(T0: 0, T1: 1);
+impl_exec_rows_for_tuple!(T0: 0, T1: 1, T2: 2);
+impl_exec_rows_for_tuple!(T0: 0, T1: 1, T2: 2, T3: 3);
+impl_exec_rows_for_tuple!(T0: 0, T1: 1, T2: 2, T3: 3, T4: 4);
+impl_exec_rows_for_tuple!(T0: 0, T1: 1, T2: 2, T3: 3, T4: 4, T5: 5);
+impl_exec_rows_for_tuple!(T0: 0, T1: 1, T2: 2, T3: 3, T4: 4, T5: 5, T6: 6);
+impl_exec_rows_for_tuple!(T0: 0, T1: 1, T2: 2, T3: 3, T4: 4, T5: 5, T6: 6, T7: 7);
 
 #[cfg(test)]
 mod tests {
