@@ -418,8 +418,11 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
         );
         for sql in [inverted_index_create, stats_index_create] {
             let mut stmt = connection.prepare(&sql)?;
-            // we run nested statement - so we don't need to have stmt subtransaction
-            // this is hacky way to fix situation for toy index for now - we need to implement proper helpers instead later
+            // by default we set needs_stmt_subtransactions = true to all write transaction
+            // this will lead to Busy error here - because Transaction opcode will be unable to acquire ownership to the subjournal as it already owned by parent statement which is still active
+            //
+            // as we run nested statement - we actually don't need subjournal as it already started before in the parent statement
+            // so, this is hacky way to fix the situation for toy index for now, but we need to implement proper helpers in order to avoid similar errors in other code later
             stmt.program.needs_stmt_subtransactions = false;
             connection.start_nested();
             let result = stmt.run_ignore_rows();
