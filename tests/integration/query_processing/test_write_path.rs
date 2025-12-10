@@ -1147,3 +1147,66 @@ pub fn concurrent_rollback_and_insert_over_single_connection(limbo: TempDatabase
         ]
     );
 }
+
+#[test]
+fn test_unique_complex_key() {
+    let _ = env_logger::try_init();
+    let db_path = tempfile::NamedTempFile::new().unwrap();
+    {
+        let connection = rusqlite::Connection::open(db_path.path()).unwrap();
+        connection
+            .execute("CREATE TABLE t(a, b, c, UNIQUE (b, a));", ())
+            .unwrap();
+        connection
+            .execute("INSERT INTO t VALUES ('1', '2', 'a'), ('3', '4', 'b');", ())
+            .unwrap();
+    }
+
+    let tmp_db = TempDatabase::builder().with_db_path(db_path.path()).build();
+    let conn = tmp_db.connect_limbo();
+
+    assert_eq!(
+        limbo_exec_rows(&tmp_db, &conn, "SELECT * FROM t"),
+        vec![
+            vec![
+                rusqlite::types::Value::Text("1".into()),
+                rusqlite::types::Value::Text("2".into()),
+                rusqlite::types::Value::Text("a".into()),
+            ],
+            vec![
+                rusqlite::types::Value::Text("3".into()),
+                rusqlite::types::Value::Text("4".into()),
+                rusqlite::types::Value::Text("b".into()),
+            ]
+        ]
+    );
+    assert_eq!(
+        limbo_exec_rows(&tmp_db, &conn, "SELECT a, b FROM t"),
+        vec![
+            vec![
+                rusqlite::types::Value::Text("1".into()),
+                rusqlite::types::Value::Text("2".into()),
+            ],
+            vec![
+                rusqlite::types::Value::Text("3".into()),
+                rusqlite::types::Value::Text("4".into()),
+            ]
+        ]
+    );
+
+    assert_eq!(
+        limbo_exec_rows(&tmp_db, &conn, "SELECT a FROM t"),
+        vec![
+            vec![rusqlite::types::Value::Text("1".into()),],
+            vec![rusqlite::types::Value::Text("3".into()),]
+        ]
+    );
+
+    assert_eq!(
+        limbo_exec_rows(&tmp_db, &conn, "SELECT b FROM t"),
+        vec![
+            vec![rusqlite::types::Value::Text("2".into()),],
+            vec![rusqlite::types::Value::Text("4".into()),]
+        ]
+    );
+}
