@@ -115,10 +115,10 @@ typedef struct
     const char *partial_bootstrap_strategy_query;
     // optional parameter which defines segment size for lazy loading from remote server
     // one of valid partial_bootstrap_strategy_* values MUST be set in order for this setting to have some effect
-    size_t partial_boostrap_segment_size;
+    size_t partial_bootstrap_segment_size;
     // optional parameter which defines if speculative pages load must be enabled
     // one of valid partial_bootstrap_strategy_* values MUST be set in order for this setting to have some effect
-    bool partial_boostrap_speculative_load;
+    bool partial_bootstrap_speculative_load;
 } turso_sync_database_config_t;
 
 /// opaque pointer to the TursoDatabaseSync instance

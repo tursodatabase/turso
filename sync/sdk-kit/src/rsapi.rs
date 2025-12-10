@@ -67,8 +67,8 @@ impl TursoDatabaseSyncConfig {
                         turso_sync_engine::types::PartialBootstrapStrategy::Prefix {
                             length: config.partial_bootstrap_strategy_prefix as usize,
                         },
-                    segment_size: config.partial_boostrap_segment_size,
-                    speculative_load: config.partial_boostrap_speculative_load,
+                    segment_size: config.partial_bootstrap_segment_size,
+                    speculative_load: config.partial_bootstrap_speculative_load,
                 })
             } else if !config.partial_bootstrap_strategy_query.is_null() {
                 let query = str_from_c_str(config.partial_bootstrap_strategy_query)?;
@@ -76,8 +76,8 @@ impl TursoDatabaseSyncConfig {
                     bootstrap_strategy: turso_sync_engine::types::PartialBootstrapStrategy::Query {
                         query: query.to_string(),
                     },
-                    segment_size: config.partial_boostrap_segment_size,
-                    speculative_load: config.partial_boostrap_speculative_load,
+                    segment_size: config.partial_bootstrap_segment_size,
+                    speculative_load: config.partial_bootstrap_speculative_load,
                 })
             } else {
                 None

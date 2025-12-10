@@ -183,8 +183,8 @@ pub struct turso_sync_database_config_t {
     pub reserved_bytes: i32,
     pub partial_bootstrap_strategy_prefix: i32,
     pub partial_bootstrap_strategy_query: *const ::std::os::raw::c_char,
-    pub partial_boostrap_segment_size: usize,
-    pub partial_boostrap_speculative_load: bool,
+    pub partial_bootstrap_segment_size: usize,
+    pub partial_bootstrap_speculative_load: bool,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
@@ -212,13 +212,13 @@ const _: () = {
         partial_bootstrap_strategy_query
     )
         - 32usize];
-    ["Offset of field: turso_sync_database_config_t::partial_boostrap_segment_size"][::std::mem::offset_of!(
+    ["Offset of field: turso_sync_database_config_t::partial_bootstrap_segment_size"][::std::mem::offset_of!(
         turso_sync_database_config_t,
-        partial_boostrap_segment_size
+        partial_bootstrap_segment_size
     ) - 40usize];
-    ["Offset of field: turso_sync_database_config_t::partial_boostrap_speculative_load"][::std::mem::offset_of!(
+    ["Offset of field: turso_sync_database_config_t::partial_bootstrap_speculative_load"][::std::mem::offset_of!(
         turso_sync_database_config_t,
-        partial_boostrap_speculative_load
+        partial_bootstrap_speculative_load
     )
         - 48usize];
 };
