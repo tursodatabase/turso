@@ -24,6 +24,66 @@ clear_caches() {
     fi
 }
 
+# Function to run all queries
+run_queries() {
+    local mode=$1
+    echo "Running queries in $mode mode..."
+    
+    local mode_exit_code=0
+    
+    for query_file in $(ls "$QUERIES_DIR"/*.sql | sort -V); do
+        if [ -f "$query_file" ]; then
+            query_name=$(basename "$query_file")
+
+            # If the query file starts with "-- LIMBO_SKIP: ...", skip it and print the reason
+            if head -n1 "$query_file" | grep -q "^-- LIMBO_SKIP: "; then
+                skip_reason=$(head -n1 "$query_file" | sed 's/^-- LIMBO_SKIP: //')
+                echo "Skipping $query_name, reason: $skip_reason"
+                echo "-----------------------------------------------------------"
+                continue
+            fi
+
+            echo "Running $query_name with Limbo..." >&2
+            # Clear caches before Limbo run
+            clear_caches
+            # Run Limbo
+            limbo_output=$( { time -p "$LIMBO_BIN" "$DB_FILE" --quiet --output-mode list "$(cat $query_file)" 2>&1; } 2>&1)
+            limbo_non_time_lines=$(echo "$limbo_output" | grep -v -e "^real" -e "^user" -e "^sys")
+            limbo_real_time=$(echo "$limbo_output" | grep "^real" | awk '{print $2}')
+            echo "Running $query_name with SQLite3..." >&2
+            # Clear caches before SQLite execution
+            clear_caches
+            sqlite_output=$( { time -p "$SQLITE_BIN" "$DB_FILE" "$(cat $query_file)" 2>&1; } 2>&1)
+            sqlite_non_time_lines=$(echo "$sqlite_output" | grep -v -e "^real" -e "^user" -e "^sys")
+            sqlite_real_time=$(echo "$sqlite_output" | grep "^real" | awk '{print $2}')
+            echo "Limbo real time: $limbo_real_time"
+            echo "SQLite3 real time: $sqlite_real_time"
+            echo "Limbo output:"
+            echo "$limbo_non_time_lines"
+            echo "SQLite3 output:"
+            echo "$sqlite_non_time_lines"
+            output_diff=$(diff <(echo "$limbo_non_time_lines") <(echo "$sqlite_non_time_lines"))
+            if [ -n "$output_diff" ]; then
+                echo "Output difference:"
+                echo "$output_diff"
+                # Ignore differences for query 1 due to floating point precision incompatibility
+                if [ "$query_file" = "$QUERIES_DIR/1.sql" ]; then
+                    echo "Ignoring output difference for query 1 (known floating point precision incompatibility)"
+                else
+                    mode_exit_code=1
+                fi
+            else
+                echo "No output difference"
+            fi
+        else
+            echo "Warning: Skipping non-file item $query_file"
+        fi
+        echo "-----------------------------------------------------------"
+    done
+    
+    return $mode_exit_code
+}
+
 # Ensure the Limbo binary exists
 if [ ! -f "$LIMBO_BIN" ]; then
     echo "Error: Limbo binary not found at $LIMBO_BIN"
@@ -52,55 +112,33 @@ clear_caches
 
 exit_code=0
 
-for query_file in $(ls "$QUERIES_DIR"/*.sql | sort -V); do
-    if [ -f "$query_file" ]; then
-        query_name=$(basename "$query_file")
+# Drop statistics tables
+echo "Dropping statistics tables..."
+"$SQLITE_BIN" "$DB_FILE" "DROP TABLE IF EXISTS sqlite_stat1; DROP TABLE IF EXISTS sqlite_stat4;"
 
-        # If the query file starts with "-- LIMBO_SKIP: ...", skip it and print the reason
-        if head -n1 "$query_file" | grep -q "^-- LIMBO_SKIP: "; then
-            skip_reason=$(head -n1 "$query_file" | sed 's/^-- LIMBO_SKIP: //')
-            echo "Skipping $query_name, reason: $skip_reason"
-            echo "-----------------------------------------------------------"
-            continue
-        fi
+# Run queries without ANALYZE
+echo "==========================================================="
+echo "Running queries WITHOUT ANALYZE"
+echo "==========================================================="
+run_queries "WITHOUT ANALYZE"
+if [ $? -ne 0 ]; then
+    exit_code=1
+fi
 
-        echo "Running $query_name with Limbo..." >&2
-        # Clear caches before Limbo run
-        clear_caches
-        # Run Limbo
-        limbo_output=$( { time -p "$LIMBO_BIN" "$DB_FILE" --quiet --output-mode list "$(cat $query_file)" 2>&1; } 2>&1)
-        limbo_non_time_lines=$(echo "$limbo_output" | grep -v -e "^real" -e "^user" -e "^sys")
-        limbo_real_time=$(echo "$limbo_output" | grep "^real" | awk '{print $2}')
-        echo "Running $query_name with SQLite3..." >&2
-        # Clear caches before SQLite execution
-        clear_caches
-        sqlite_output=$( { time -p "$SQLITE_BIN" "$DB_FILE" "$(cat $query_file)" 2>&1; } 2>&1)
-        sqlite_non_time_lines=$(echo "$sqlite_output" | grep -v -e "^real" -e "^user" -e "^sys")
-        sqlite_real_time=$(echo "$sqlite_output" | grep "^real" | awk '{print $2}')
-        echo "Limbo real time: $limbo_real_time"
-        echo "SQLite3 real time: $sqlite_real_time"
-        echo "Limbo output:"
-        echo "$limbo_non_time_lines"
-        echo "SQLite3 output:"
-        echo "$sqlite_non_time_lines"
-        output_diff=$(diff <(echo "$limbo_non_time_lines") <(echo "$sqlite_non_time_lines"))
-        if [ -n "$output_diff" ]; then
-            echo "Output difference:"
-            echo "$output_diff"
-            # Ignore differences for query 1 due to floating point precision incompatibility
-            if [ "$query_file" = "$QUERIES_DIR/1.sql" ]; then
-                echo "Ignoring output difference for query 1 (known floating point precision incompatibility)"
-            else
-                exit_code=1
-            fi
-        else
-            echo "No output difference"
-        fi
-    else
-        echo "Warning: Skipping non-file item $query_file"
-    fi
-    echo "-----------------------------------------------------------"
-done
+# Run ANALYZE
+echo "==========================================================="
+echo "Running ANALYZE..."
+echo "==========================================================="
+"$SQLITE_BIN" "$DB_FILE" "ANALYZE;"
+
+# Run queries with ANALYZE
+echo "==========================================================="
+echo "Running queries WITH ANALYZE"
+echo "==========================================================="
+run_queries "WITH ANALYZE"
+if [ $? -ne 0 ]; then
+    exit_code=1
+fi
 
 echo "-----------------------------------------------------------"
 echo "TPC-H query timing comparison completed." 
