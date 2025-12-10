@@ -1933,6 +1933,7 @@ impl Connection {
 
     pub fn wal_auto_checkpoint_disable(&self) {
         self.wal_auto_checkpoint_disabled
+        
             .store(true, Ordering::SeqCst);
     }
 
