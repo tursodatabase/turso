@@ -61,6 +61,7 @@ def connect_sync(
     path: str, # path to the main database file locally
     # remote url for the sync - can be lambda which will be evaluated on every http request; if lambda returns None - internal http processing must return error which will bubble-up in the sync engine
     # remote_url MUST be used in all sync engine operations: during bootstrap and all further operations
+    # remote_url must accept either http://, https:// or libsql:// protocol, where later must be just replaced with https:// under the hood for now
     remote_url: Union[str, Callable[[], Optional[str]]],
     *,
     # token for remote authentication - can be lambda which will be evaluted on every http request; if lambda returns None - internal http processing must return error which will bubble-up in the sync engine
