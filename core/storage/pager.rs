@@ -2256,7 +2256,7 @@ impl Pager {
     /// of a rollback or in case we want to invalidate page cache after starting a read transaction
     /// right after new writes happened which would invalidate current page cache.
     pub fn clear_page_cache(&self, clear_dirty: bool) {
-        let dirty_pages = self.dirty_pages.read();
+        let dirty_pages = self.dirty_pages.write();
         let mut cache = self.page_cache.write();
         for page_id in dirty_pages.iter() {
             let page_key = PageCacheKey::new(*page_id);
@@ -2267,6 +2267,10 @@ impl Pager {
         cache
             .clear(clear_dirty)
             .expect("Failed to clear page cache");
+        if clear_dirty {
+            drop(dirty_pages);
+            self.dirty_pages.write().clear();
+        }
     }
 
     /// Checkpoint in Truncate mode and delete the WAL file. This method is _only_ to be called
