@@ -1680,11 +1680,6 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
         } => {
             is_strict = options.contains(TableOptions::STRICT);
 
-            // Due to a bug in SQLite, this check is needed to maintain backwards compatibility with rowid alias
-            // SQLite docs: https://sqlite.org/lang_createtable.html#rowids_and_the_integer_primary_key
-            // Issue: https://github.com/tursodatabase/turso/issues/3665
-            let mut primary_key_desc_columns_constraint = false;
-
             // we need to preserve order of unique sets definition
             // but also, we analyze constraints first in order to check PRIMARY KEY constraint and recognize rowid alias properly
             // that's why we maintain 2 unique_set sequences and merge them together in the end
@@ -1821,6 +1816,11 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     foreign_keys.push(Arc::new(fk));
                 }
             }
+
+            // Due to a bug in SQLite, this check is needed to maintain backwards compatibility with rowid alias
+            // SQLite docs: https://sqlite.org/lang_createtable.html#rowids_and_the_integer_primary_key
+            // Issue: https://github.com/tursodatabase/turso/issues/3665
+            let mut primary_key_desc_columns_constraint = false;
 
             for ast::ColumnDefinition {
                 col_name,
