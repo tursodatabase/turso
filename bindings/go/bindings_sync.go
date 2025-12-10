@@ -303,9 +303,9 @@ var (
 
 // ------------- Registration -------------
 
-// register_turso_sync registers Turso Sync C API function pointers from the given library handle.
+// registerTursoSync registers Turso Sync C API function pointers from the given library handle.
 // Do not load library here; it is done externally.
-func register_turso_sync(handle uintptr) error {
+func registerTursoSync(handle uintptr) error {
 	purego.RegisterLibFunc(&c_turso_sync_database_new, handle, "turso_sync_database_new")
 	purego.RegisterLibFunc(&c_turso_sync_database_init, handle, "turso_sync_database_init")
 	purego.RegisterLibFunc(&c_turso_sync_database_open, handle, "turso_sync_database_open")

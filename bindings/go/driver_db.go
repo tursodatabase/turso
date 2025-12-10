@@ -12,14 +12,16 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	turso_libs "github.com/tursodatabase/turso-go-platform-libs"
 )
 
 // define all package level errors here
 var (
-	TursoStmtClosedErr = errors.New("turso: statement closed")
-	TursoConnClosedErr = errors.New("turso: connection closed")
-	TursoRowsClosedErr = errors.New("turso: rows closed")
-	TursoTxDoneErr     = errors.New("turso: transaction done")
+	ErrTursoStmtClosed = errors.New("turso: statement closed")
+	ErrTursoConnClosed = errors.New("turso: connection closed")
+	ErrTursoRowsClosed = errors.New("turso: rows closed")
+	ErrTursoTxDone     = errors.New("turso: transaction done")
 )
 
 // define all package level structs here
@@ -77,20 +79,15 @@ func NewConnection(conn TursoConnection, extraIo func() error) *tursoDbConnectio
 	}
 }
 
-// Optional helper to register a loaded dynamic library handle into bindings.
-// The library must be loaded externally (e.g. via purego.Dlopen).
-func RegisterTursoLib(handle uintptr) error {
-	return register_turso_db(handle)
-}
-
 // Optional helper to run global setup (logger and log level).
 func Setup(config TursoConfig) error {
+	InitLibrary(turso_libs.LoadTursoLibraryConfig{})
 	return turso_setup(config)
 }
 
 // Implement sql.Driver methods
-
 func (d *tursoDbDriver) Open(dsn string) (driver.Conn, error) {
+	InitLibrary(turso_libs.LoadTursoLibraryConfig{})
 	path, experimental, async, err := parseDSN(dsn)
 	if err != nil {
 		return nil, err
@@ -300,7 +297,7 @@ func (c *tursoDbConnection) checkOpen() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.closed || c.conn == nil {
-		return TursoConnClosedErr
+		return ErrTursoConnClosed
 	}
 	return nil
 }
@@ -333,7 +330,7 @@ func (s *tursoDbStatement) Exec(args []driver.Value) (driver.Result, error) {
 
 func (s *tursoDbStatement) ExecContext(ctx context.Context, args []driver.NamedValue) (driver.Result, error) {
 	if s.closed {
-		return nil, TursoStmtClosedErr
+		return nil, ErrTursoStmtClosed
 	}
 	return s.conn.ExecContext(ctx, s.sql, args)
 }
@@ -348,7 +345,7 @@ func (s *tursoDbStatement) Query(args []driver.Value) (driver.Rows, error) {
 
 func (s *tursoDbStatement) QueryContext(ctx context.Context, args []driver.NamedValue) (driver.Rows, error) {
 	if s.closed {
-		return nil, TursoStmtClosedErr
+		return nil, ErrTursoStmtClosed
 	}
 	return s.conn.QueryContext(ctx, s.sql, args)
 }
@@ -435,7 +432,7 @@ func (r *tursoDbRows) Next(dest []driver.Value) error {
 			// Continue stepping
 			continue
 		default:
-			return TursoGenericErr
+			return ErrTursoGeneric
 		}
 	}
 }
@@ -458,7 +455,7 @@ var _ driver.Tx = (*tursoDbTx)(nil)
 
 func (tx *tursoDbTx) Commit() error {
 	if tx.done {
-		return TursoTxDoneErr
+		return ErrTursoTxDone
 	}
 	_, err := tx.conn.ExecContext(context.Background(), "COMMIT", nil)
 	tx.done = true
@@ -467,7 +464,7 @@ func (tx *tursoDbTx) Commit() error {
 
 func (tx *tursoDbTx) Rollback() error {
 	if tx.done {
-		return TursoTxDoneErr
+		return ErrTursoTxDone
 	}
 	_, err := tx.conn.ExecContext(context.Background(), "ROLLBACK", nil)
 	tx.done = true

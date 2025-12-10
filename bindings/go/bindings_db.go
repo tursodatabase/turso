@@ -11,15 +11,15 @@ import (
 
 // package-level errors
 var (
-	TursoBusyErr         = errors.New("turso: database is busy")
-	TursoInterruptErr    = errors.New("turso: interrupted")
-	TursoGenericErr      = errors.New("turso: error")
-	TursoMisuseErr       = errors.New("turso: API misuse")
-	TursoConstraintErr   = errors.New("turso: constraint failed")
-	TursoReadOnlyErr     = errors.New("turso: database is readonly")
-	TursoDatabaseFullErr = errors.New("turso: database is full")
-	TursoNotADbErr       = errors.New("turso: not a database")
-	TursoCorruptErr      = errors.New("turso: database is corrupt")
+	ErrTursoBusy         = errors.New("turso: database is busy")
+	ErrTursoInterrupt    = errors.New("turso: interrupted")
+	ErrTursoGeneric      = errors.New("turso: error")
+	ErrTursoMisuse       = errors.New("turso: API misuse")
+	ErrTursoConstraint   = errors.New("turso: constraint failed")
+	ErrTursoReadOnly     = errors.New("turso: database is readonly")
+	ErrTursoDatabaseFull = errors.New("turso: database is full")
+	ErrTursoNotADb       = errors.New("turso: not a database")
+	ErrTursoCorrupt      = errors.New("turso: database is corrupt")
 )
 
 // define all necessary constants first
@@ -164,7 +164,7 @@ var (
 
 // implement a function to register extern methods from loaded lib
 // DO NOT load lib - as it will be done externally
-func register_turso_db(handle uintptr) error {
+func registerTursoDb(handle uintptr) error {
 	purego.RegisterLibFunc(&c_turso_setup, handle, "turso_setup")
 	purego.RegisterLibFunc(&c_turso_database_new, handle, "turso_database_new")
 	purego.RegisterLibFunc(&c_turso_database_open, handle, "turso_database_open")
@@ -205,26 +205,26 @@ func statusToError(status TursoStatusCode, msg string) error {
 	var base error
 	switch status {
 	case TURSO_BUSY:
-		base = TursoBusyErr
+		base = ErrTursoBusy
 	case TURSO_INTERRUPT:
-		base = TursoInterruptErr
+		base = ErrTursoInterrupt
 	case TURSO_ERROR:
-		base = TursoGenericErr
+		base = ErrTursoGeneric
 	case TURSO_MISUSE:
-		base = TursoMisuseErr
+		base = ErrTursoMisuse
 	case TURSO_CONSTRAINT:
-		base = TursoConstraintErr
+		base = ErrTursoConstraint
 	case TURSO_READONLY:
-		base = TursoReadOnlyErr
+		base = ErrTursoReadOnly
 	case TURSO_DATABASE_FULL:
-		base = TursoDatabaseFullErr
+		base = ErrTursoDatabaseFull
 	case TURSO_NOTADB:
-		base = TursoNotADbErr
+		base = ErrTursoNotADb
 	case TURSO_CORRUPT:
-		base = TursoCorruptErr
+		base = ErrTursoCorrupt
 	default:
 		// for unknown error codes, fallback to generic
-		base = TursoGenericErr
+		base = ErrTursoGeneric
 	}
 	if msg != "" {
 		return fmt.Errorf("%w: %s", base, msg)

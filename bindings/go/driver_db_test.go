@@ -8,6 +8,9 @@ import (
 	"slices"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
+	turso_libs "github.com/tursodatabase/turso-go-platform-libs"
 )
 
 var (
@@ -26,16 +29,17 @@ func openMem(t *testing.T) *sql.DB {
 }
 
 func TestMain(m *testing.M) {
+	InitLibrary(turso_libs.LoadTursoLibraryConfig{LoadStrategy: "mixed"})
 	conn, connErr = sql.Open("turso", ":memory:")
 	if connErr != nil {
 		panic(connErr)
 	}
-	// err := conn.Ping()
-	// if err != nil {
-	// log.Fatalf("Error pinging database: %v", err)
-	// }
+	err := conn.Ping()
+	if err != nil {
+		log.Fatalf("Error pinging database: %v", err)
+	}
 	defer conn.Close()
-	err := createTable(conn)
+	err = createTable(conn)
 	if err != nil {
 		log.Fatalf("Error creating table: %v", err)
 	}
@@ -192,6 +196,7 @@ func TestDuplicateConnection2(t *testing.T) {
 	newConn.Exec(sql)
 	sql = "INSERT INTO test (foo, bar, baz) VALUES (?, ?, uuid4());"
 	stmt, err := newConn.Prepare(sql)
+	require.Nil(t, err)
 	stmt.Exec(242345, 2342434)
 	defer stmt.Close()
 	query := "SELECT * FROM test;"
@@ -586,6 +591,7 @@ func TestParameterOrdering(t *testing.T) {
 	sql = "INSERT INTO test (b, c ,a) VALUES (?, ?, ?);"
 	expectedValues := []int{1, 2, 3}
 	stmt, err := newConn.Prepare(sql)
+	require.Nil(t, err)
 	_, err = stmt.Exec(expectedValues[1], expectedValues[2], expectedValues[0])
 	if err != nil {
 		t.Fatalf("Error preparing statement: %v", err)

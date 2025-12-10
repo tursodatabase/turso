@@ -7,6 +7,7 @@ toolchain go1.24.10
 require (
 	github.com/ebitengine/purego v0.9.1
 	github.com/stretchr/testify v1.11.1
+	github.com/tursodatabase/turso-go-platform-libs v0.0.0-20251210075532-b81eb47907db
 )
 
 require (

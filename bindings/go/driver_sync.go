@@ -13,6 +13,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	turso_libs "github.com/tursodatabase/turso-go-platform-libs"
 )
 
 // Public configuration for a synced database.
@@ -80,13 +82,9 @@ type TursoSyncDb struct {
 	mu sync.Mutex
 }
 
-// RegisterTursoSyncLib registers the sync API symbols from a loaded dynamic library handle.
-func RegisterTursoSyncLib(handle uintptr) error {
-	return register_turso_sync(handle)
-}
-
 // main constructor to create synced database
 func NewTursoSyncDb(ctx context.Context, config TursoSyncDbConfig) (*TursoSyncDb, error) {
+	InitLibrary(turso_libs.LoadTursoLibraryConfig{})
 	if strings.TrimSpace(config.Path) == "" {
 		return nil, errors.New("turso: empty Path in TursoSyncDbConfig")
 	}
