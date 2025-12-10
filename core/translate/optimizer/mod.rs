@@ -22,6 +22,7 @@ use crate::{
         optimizer::{
             access_method::AccessMethodParams,
             constraints::{RangeConstraintRef, SeekRangeConstraint, TableConstraints},
+            cost::RowCountEstimate,
         },
         plan::{
             ColumnUsedMask, HashJoinOp, IndexMethodQuery, NonFromClauseSubquery,
@@ -567,7 +568,7 @@ fn register_expression_index_usages_for_plan(
 }
 
 /// Derive a base row-count estimate for a table, preferring ANALYZE stats.
-fn base_row_estimate(schema: &Schema, table: &JoinedTable) -> f64 {
+fn base_row_estimate(schema: &Schema, table: &JoinedTable) -> RowCountEstimate {
     match &table.table {
         Table::BTree(btree) => {
             if let Some(stats) = schema.analyze_stats.table_stats(&btree.name) {
@@ -577,12 +578,12 @@ fn base_row_estimate(schema: &Schema, table: &JoinedTable) -> f64 {
                         .values()
                         .find_map(|idx_stat| idx_stat.total_rows)
                 }) {
-                    return rows as f64;
+                    return RowCountEstimate::AnalyzeStats(rows as f64);
                 }
             }
-            ESTIMATED_HARDCODED_ROWS_PER_TABLE as f64
+            RowCountEstimate::HardcodedFallback(ESTIMATED_HARDCODED_ROWS_PER_TABLE as f64)
         }
-        _ => ESTIMATED_HARDCODED_ROWS_PER_TABLE as f64,
+        _ => RowCountEstimate::HardcodedFallback(ESTIMATED_HARDCODED_ROWS_PER_TABLE as f64),
     }
 }
 

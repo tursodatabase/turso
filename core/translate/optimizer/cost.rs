@@ -38,17 +38,33 @@ pub fn estimate_page_io_cost(rowcount: f64) -> Cost {
     Cost((rowcount / ESTIMATED_HARDCODED_ROWS_PER_PAGE as f64).ceil())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum RowCountEstimate {
+    HardcodedFallback(f64),
+    AnalyzeStats(f64),
+}
+
+impl std::ops::Deref for RowCountEstimate {
+    type Target = f64;
+
+    fn deref(&self) -> &f64 {
+        match self {
+            RowCountEstimate::HardcodedFallback(val) => val,
+            RowCountEstimate::AnalyzeStats(val) => val,
+        }
+    }
+}
+
 /// Estimate the cost of a scan or seek operation.
 pub fn estimate_cost_for_scan_or_seek(
     index_info: Option<IndexInfo>,
     constraints: &[Constraint],
     usable_constraint_refs: &[RangeConstraintRef],
     input_cardinality: f64,
-    base_row_count: f64,
+    base_row_count: RowCountEstimate,
 ) -> Cost {
-    // Check if this looks like real ANALYZE data (not the hardcoded fallback)
-    // Real tables rarely have exactly 1,000,000 rows
-    let has_real_stats = (base_row_count - ESTIMATED_HARDCODED_ROWS_PER_TABLE as f64).abs() > 1.0;
+    let has_real_stats = matches!(base_row_count, RowCountEstimate::AnalyzeStats(_));
+    let base_row_count = *base_row_count;
 
     let Some(index_info) = index_info else {
         // Full table scan

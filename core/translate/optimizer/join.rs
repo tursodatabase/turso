@@ -6,7 +6,7 @@ use crate::{
     translate::{
         optimizer::{
             access_method::{try_hash_join_access_method, AccessMethodParams},
-            cost::Cost,
+            cost::{Cost, RowCountEstimate},
             order::plan_satisfies_order_target,
         },
         plan::{JoinOrderMember, JoinedTable, NonFromClauseSubquery, WhereTerm},
@@ -53,7 +53,7 @@ pub fn join_lhs_and_rhs<'a>(
     rhs_table_reference: &JoinedTable,
     rhs_constraints: &'a TableConstraints,
     all_constraints: &'a [TableConstraints],
-    base_table_rows: &[f64],
+    base_table_rows: &[RowCountEstimate],
     join_order: &[JoinOrderMember],
     maybe_order_target: Option<&OrderTarget>,
     access_methods_arena: &'a RefCell<Vec<AccessMethod>>,
@@ -68,10 +68,9 @@ pub fn join_lhs_and_rhs<'a>(
     let input_cardinality = lhs.map_or(1, |l| l.output_cardinality);
 
     let rhs_table_number = join_order.last().unwrap().original_idx;
-    let rhs_base_rows = base_table_rows
-        .get(rhs_table_number)
-        .copied()
-        .unwrap_or(ESTIMATED_HARDCODED_ROWS_PER_TABLE as f64);
+    let rhs_base_rows = base_table_rows.get(rhs_table_number).copied().unwrap_or(
+        RowCountEstimate::HardcodedFallback(ESTIMATED_HARDCODED_ROWS_PER_TABLE as f64),
+    );
 
     let Some(mut method) = find_best_access_method_for_join_order(
         rhs_table_reference,
@@ -106,7 +105,7 @@ pub fn join_lhs_and_rhs<'a>(
             if has_usable_constraints && lhs.is_some() {
                 // Add ephemeral index build cost: scan the table once to build the index
                 // This is similar to the build phase of a hash join
-                let ephemeral_build_cost = rhs_base_rows * 0.003;
+                let ephemeral_build_cost = *rhs_base_rows * 0.003;
                 method.cost = method.cost + Cost(ephemeral_build_cost);
             }
         }
@@ -190,7 +189,7 @@ pub fn join_lhs_and_rhs<'a>(
         });
 
         let build_cardinality = lhs.output_cardinality as f64;
-        let probe_cardinality = rhs_base_rows;
+        let probe_cardinality = *rhs_base_rows;
 
         let rhs_has_selective_seek = matches!(
             best_access_method.params,
@@ -352,7 +351,7 @@ pub fn join_lhs_and_rhs<'a>(
     // If this table is the rightmost table in the join order, we multiply by the input cardinality,
     // which is the output cardinality of the previous tables.
     let output_cardinality =
-        (input_cardinality as f64 * rhs_base_rows * output_cardinality_multiplier).ceil() as usize;
+        (input_cardinality as f64 * *rhs_base_rows * output_cardinality_multiplier).ceil() as usize;
 
     Ok(Some(JoinN {
         data: best_access_methods,
@@ -376,7 +375,7 @@ pub fn compute_best_join_order<'a>(
     joined_tables: &[JoinedTable],
     maybe_order_target: Option<&OrderTarget>,
     constraints: &'a [TableConstraints],
-    base_table_rows: &[f64],
+    base_table_rows: &[RowCountEstimate],
     access_methods_arena: &'a RefCell<Vec<AccessMethod>>,
     where_clause: &mut [WhereTerm],
     subqueries: &[NonFromClauseSubquery],
@@ -670,7 +669,7 @@ pub fn compute_best_join_order<'a>(
 pub fn compute_naive_left_deep_plan<'a>(
     joined_tables: &[JoinedTable],
     maybe_order_target: Option<&OrderTarget>,
-    base_table_rows: &[f64],
+    base_table_rows: &[RowCountEstimate],
     access_methods_arena: &'a RefCell<Vec<AccessMethod>>,
     constraints: &'a [TableConstraints],
     where_clause: &mut [WhereTerm],
@@ -801,8 +800,8 @@ mod tests {
         vdbe::builder::TableRefIdCounter,
     };
 
-    fn default_base_rows(n: usize) -> Vec<f64> {
-        vec![ESTIMATED_HARDCODED_ROWS_PER_TABLE as f64; n]
+    fn default_base_rows(n: usize) -> Vec<RowCountEstimate> {
+        vec![RowCountEstimate::HardcodedFallback(ESTIMATED_HARDCODED_ROWS_PER_TABLE as f64); n]
     }
 
     fn empty_schema() -> Schema {

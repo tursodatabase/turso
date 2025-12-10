@@ -7,7 +7,7 @@ use crate::translate::expr::{as_binary_components, walk_expr, WalkControl};
 use crate::translate::optimizer::constraints::{
     convert_to_vtab_constraint, BinaryExprSide, Constraint, RangeConstraintRef,
 };
-use crate::translate::optimizer::cost::ESTIMATED_HARDCODED_ROWS_PER_PAGE;
+use crate::translate::optimizer::cost::{RowCountEstimate, ESTIMATED_HARDCODED_ROWS_PER_PAGE};
 use crate::translate::plan::{HashJoinKey, NonFromClauseSubquery, SubqueryState, WhereTerm};
 use crate::util::exprs_are_equivalent;
 use crate::vdbe::hash_table::DEFAULT_MEM_BUDGET;
@@ -82,7 +82,7 @@ pub fn find_best_access_method_for_join_order(
     join_order: &[JoinOrderMember],
     maybe_order_target: Option<&OrderTarget>,
     input_cardinality: f64,
-    base_row_count: f64,
+    base_row_count: RowCountEstimate,
 ) -> Result<Option<AccessMethod>> {
     match &rhs_table.table {
         Table::BTree(_) => find_best_access_method_for_btree(
@@ -113,7 +113,7 @@ fn find_best_access_method_for_btree(
     join_order: &[JoinOrderMember],
     maybe_order_target: Option<&OrderTarget>,
     input_cardinality: f64,
-    base_row_count: f64,
+    base_row_count: RowCountEstimate,
 ) -> Result<Option<AccessMethod>> {
     let table_no = join_order.last().unwrap().table_id;
     let mut best_cost =
@@ -234,7 +234,7 @@ fn find_best_access_method_for_vtab(
     constraints: &[Constraint],
     join_order: &[JoinOrderMember],
     input_cardinality: f64,
-    base_row_count: f64,
+    base_row_count: RowCountEstimate,
 ) -> Result<Option<AccessMethod>> {
     let vtab_constraints = convert_to_vtab_constraint(constraints, join_order);
 
