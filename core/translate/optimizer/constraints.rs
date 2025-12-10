@@ -202,16 +202,18 @@ fn estimate_selectivity(
 
     match op {
         ast::Operator::Equals => {
-            let is_unique = column.is_some_and(|c| c.is_rowid_alias() || c.primary_key());
+            let is_pk_or_rowid_alias =
+                column.is_some_and(|c| c.is_rowid_alias() || c.primary_key());
 
-            if is_unique {
-                // For unique/PK columns, selectivity is 1/row_count
-                if row_count > 0 {
-                    1.0 / row_count as f64
-                } else {
-                    // Fallback: use hardcoded estimate based on expected table size
-                    1.0 / ESTIMATED_HARDCODED_ROWS_PER_TABLE as f64
-                }
+            let selectivity_when_unique = if row_count > 0 {
+                1.0 / row_count as f64
+            } else {
+                // Fallback: use hardcoded estimate based on expected table size
+                1.0 / ESTIMATED_HARDCODED_ROWS_PER_TABLE as f64
+            };
+
+            if is_pk_or_rowid_alias {
+                selectivity_when_unique
             } else if let Some(col_pos) = column_pos {
                 // For non-unique columns, find an index containing this column and use its stats
                 if let Some(indexes) = available_indexes.get(table_name) {
@@ -222,6 +224,9 @@ fn estimate_selectivity(
                             // Only use stats if column is first in index (idx_col_pos == 0)
                             // because that's when the distinct count is most useful
                             if idx_col_pos == 0 {
+                                if index.unique {
+                                    return selectivity_when_unique;
+                                }
                                 if let Some(stats) = table_stats {
                                     if let Some(idx_stat) = stats.index_stats.get(&index.name) {
                                         // distinct_per_prefix[0] = avg rows per distinct value for first column
