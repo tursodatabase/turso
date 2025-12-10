@@ -8,6 +8,7 @@ import (
 	"io"
 	"math/rand"
 	"net/http"
+	"os"
 	"strings"
 	"testing"
 
@@ -106,7 +107,14 @@ func (s *TursoServer) DbSql(tenant, group, db string, sql string) ([][]any, erro
 	return rows, nil
 }
 
+var (
+	SYNC_TEST_RUN = os.Getenv("SYNC_TEST_RUN") == "true"
+)
+
 func TestSyncBootstrap(t *testing.T) {
+	if !SYNC_TEST_RUN {
+		t.Skipf("sync tests must be run explicitly with SYNC_TEST_RUN env var")
+	}
 	server := TursoServer{AdminUrl: "http://localhost:8081", UserUrl: "http://localhost:8080"}
 	name := randomString()
 	require.Nil(t, server.CreateTenant(name))
@@ -137,6 +145,9 @@ func TestSyncBootstrap(t *testing.T) {
 }
 
 func TestSyncPull(t *testing.T) {
+	if !SYNC_TEST_RUN {
+		t.Skipf("sync tests must be run explicitly with SYNC_TEST_RUN env var")
+	}
 	server := TursoServer{AdminUrl: "http://localhost:8081", UserUrl: "http://localhost:8080"}
 	name := randomString()
 	require.Nil(t, server.CreateTenant(name))
@@ -191,6 +202,9 @@ func TestSyncPull(t *testing.T) {
 }
 
 func TestSyncPullDoNotPush(t *testing.T) {
+	if !SYNC_TEST_RUN {
+		t.Skipf("sync tests must be run explicitly with SYNC_TEST_RUN env var")
+	}
 	server := TursoServer{AdminUrl: "http://localhost:8081", UserUrl: "http://localhost:8080"}
 	name := randomString()
 	require.Nil(t, server.CreateTenant(name))
@@ -252,6 +266,9 @@ func TestSyncPullDoNotPush(t *testing.T) {
 }
 
 func TestSyncPush(t *testing.T) {
+	if !SYNC_TEST_RUN {
+		t.Skipf("sync tests must be run explicitly with SYNC_TEST_RUN env var")
+	}
 	server := TursoServer{AdminUrl: "http://localhost:8081", UserUrl: "http://localhost:8080"}
 	name := randomString()
 	require.Nil(t, server.CreateTenant(name))
@@ -286,6 +303,9 @@ func TestSyncPush(t *testing.T) {
 }
 
 func TestSyncCheckpoint(t *testing.T) {
+	if !SYNC_TEST_RUN {
+		t.Skipf("sync tests must be run explicitly with SYNC_TEST_RUN env var")
+	}
 	server := TursoServer{AdminUrl: "http://localhost:8081", UserUrl: "http://localhost:8080"}
 	name := randomString()
 	require.Nil(t, server.CreateTenant(name))
@@ -329,6 +349,9 @@ func TestSyncCheckpoint(t *testing.T) {
 }
 
 func TestSyncPartial(t *testing.T) {
+	if !SYNC_TEST_RUN {
+		t.Skipf("sync tests must be run explicitly with SYNC_TEST_RUN env var")
+	}
 	server := TursoServer{AdminUrl: "http://localhost:8081", UserUrl: "http://localhost:8080"}
 	name := randomString()
 	require.Nil(t, server.CreateTenant(name))
