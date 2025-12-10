@@ -357,7 +357,6 @@ impl Shadow for Insert {
     fn shadow(&self, tables: &mut ShadowTablesMut) -> Self::Result {
         match self {
             Insert::Values { table, values } => {
-                // Check if table exists first
                 if !tables.iter().any(|t| &t.name == table) {
                     return Err(anyhow::anyhow!(
                         "Table {} does not exist. INSERT statement ignored.",
@@ -370,13 +369,17 @@ impl Shadow for Insert {
                     tables.record_insert(table.clone(), row.clone());
                 }
 
-                // Actually insert the rows
-                if let Some(t) = tables.iter_mut().find(|t| &t.name == table) {
-                    t.rows.extend(values.clone());
-                }
+                // Insert the rows
+                tables
+                    .iter_mut()
+                    .find(|t| &t.name == table)
+                    .expect("We already validated that the table exists")
+                    .rows
+                    .extend(values.clone());
             }
             Insert::Select { table, select } => {
-                // Check if table exists first
+                let rows = select.shadow(tables)?;
+
                 if !tables.iter().any(|t| &t.name == table) {
                     return Err(anyhow::anyhow!(
                         "Table {} does not exist. INSERT statement ignored.",
@@ -384,17 +387,18 @@ impl Shadow for Insert {
                     ));
                 }
 
-                let rows = select.shadow(tables)?;
-
                 // Record each inserted row for transaction tracking
                 for row in &rows {
                     tables.record_insert(table.clone(), row.clone());
                 }
 
-                // Actually insert the rows
-                if let Some(t) = tables.iter_mut().find(|t| &t.name == table) {
-                    t.rows.extend(rows);
-                }
+                // Insert the rows
+                tables
+                    .iter_mut()
+                    .find(|t| &t.name == table)
+                    .expect("We already validated that the table exists")
+                    .rows
+                    .extend(rows);
             }
         }
 
