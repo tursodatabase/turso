@@ -9,6 +9,7 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -129,6 +130,42 @@ func TestSyncBootstrap(t *testing.T) {
 		Path:       ":memory:",
 		ClientName: "turso-sync-go",
 		RemoteUrl:  server.DbUrl(name, name, name),
+	})
+	require.Nil(t, err)
+	conn, err := db.Connect(context.Background())
+	require.Nil(t, err)
+	rows, err := conn.QueryContext(context.Background(), "SELECT * FROM t")
+	require.Nil(t, err)
+	values := make([]string, 0)
+	for rows.Next() {
+		var value string
+		require.Nil(t, rows.Scan(&value))
+		values = append(values, value)
+	}
+	require.Equal(t, values, []string{"hello", "turso", "sync-go"})
+}
+
+func TestSyncBootstrapPersistent(t *testing.T) {
+	if !SYNC_TEST_RUN {
+		t.Skipf("sync tests must be run explicitly with SYNC_TEST_RUN env var")
+	}
+	server := TursoServer{AdminUrl: "http://localhost:8081", UserUrl: "http://localhost:8080"}
+	name := randomString()
+	require.Nil(t, server.CreateTenant(name))
+	require.Nil(t, server.CreateGroup(name, name))
+	require.Nil(t, server.CreateDb(name, name, name))
+	_, err := server.DbSql(name, name, name, "CREATE TABLE t(x)")
+	require.Nil(t, err)
+	_, err = server.DbSql(name, name, name, "INSERT INTO t VALUES ('hello'), ('turso'), ('sync-go')")
+	require.Nil(t, err)
+
+	dir, err := os.MkdirTemp(".", "test-sync-")
+	require.Nil(t, err)
+	t.Cleanup(func() { os.RemoveAll(dir) })
+
+	db, err := NewTursoSyncDb(context.Background(), TursoSyncDbConfig{
+		Path:      filepath.Join(dir, "local.db"),
+		RemoteUrl: server.DbUrl(name, name, name),
 	})
 	require.Nil(t, err)
 	conn, err := db.Connect(context.Background())

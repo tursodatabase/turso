@@ -463,7 +463,10 @@ func (d *TursoSyncDb) handleIoItem(ctx context.Context, item TursoSyncIoItem) er
 			return err
 		}
 		f, ferr := os.Open(r.Path)
-		if ferr != nil {
+		if errors.Is(ferr, os.ErrNotExist) {
+			_ = turso_sync_database_io_done(item)
+			return nil
+		} else if ferr != nil {
 			_ = turso_sync_database_io_poison(item, ferr.Error())
 			_ = turso_sync_database_io_done(item)
 			return ferr
