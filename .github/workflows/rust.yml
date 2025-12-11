@@ -110,7 +110,7 @@ jobs:
         run: make test
         timeout-minutes: 20
       - name: Test mvcc
-        run: make test-compat-mvcc
+        run: SQLITE_EXEC=scripts/turso-mvcc-sqlite3 make test-compat-mvcc
         timeout-minutes: 10
   test-sqlite:
     runs-on: blacksmith-4vcpu-ubuntu-2404
