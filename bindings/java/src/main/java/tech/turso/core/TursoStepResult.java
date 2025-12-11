@@ -21,16 +21,27 @@ public final class TursoStepResult {
 
   @Nullable private final Object[] result;
 
+  @Nullable private final String errorMessage;
+
   @NativeInvocation(invokedFrom = "turso_statement.rs")
   public TursoStepResult(int stepResultId) {
     this.stepResultId = stepResultId;
     this.result = null;
+    this.errorMessage = null;
   }
 
   @NativeInvocation(invokedFrom = "turso_statement.rs")
   public TursoStepResult(int stepResultId, Object[] result) {
     this.stepResultId = stepResultId;
     this.result = result;
+    this.errorMessage = null;
+  }
+
+  @NativeInvocation(invokedFrom = "turso_statement.rs")
+  public TursoStepResult(int stepResultId, String errorMessage) {
+    this.stepResultId = stepResultId;
+    this.result = null;
+    this.errorMessage = errorMessage;
   }
 
   public boolean isRow() {
@@ -52,6 +63,11 @@ public final class TursoStepResult {
   @Nullable
   public Object[] getResult() {
     return result;
+  }
+
+  @Nullable
+  public String getErrorMessage() {
+    return errorMessage;
   }
 
   @Override

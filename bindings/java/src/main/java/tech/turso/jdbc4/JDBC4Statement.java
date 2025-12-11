@@ -97,7 +97,7 @@ public class JDBC4Statement implements Statement {
             });
 
     requireNonNull(statement, "statement should not be null after running execute method");
-    return new JDBC4ResultSet(statement.getResultSet());
+    return new JDBC4ResultSet(statement.getResultSet(), this);
   }
 
   @Override
@@ -218,7 +218,7 @@ public class JDBC4Statement implements Statement {
   public ResultSet getResultSet() throws SQLException {
     requireNonNull(statement, "statement is null");
     ensureOpen();
-    return new JDBC4ResultSet(statement.getResultSet());
+    return new JDBC4ResultSet(statement.getResultSet(), this);
   }
 
   @Override
