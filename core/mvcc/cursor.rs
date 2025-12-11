@@ -1319,6 +1319,17 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
             MvccCursorType::Index(_) => Row::new_index_row(row_id, num_columns),
         };
 
+        // Check if the cursor is currently positioned at a B-tree row that matches
+        // the row we're inserting. This indicates we're updating a B-tree-resident row
+        // that doesn't yet have an MVCC version.
+        let was_btree_resident = match &*self.current_pos.borrow() {
+            CursorPosition::Loaded {
+                row_id: current_row_id,
+                in_btree,
+            } => *in_btree && *current_row_id == row.id,
+            _ => false,
+        };
+
         self.current_pos.replace(CursorPosition::Loaded {
             row_id: row.id.clone(),
             in_btree: false,
@@ -1335,6 +1346,14 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
         {
             self.db
                 .update_to_table_or_index(self.tx_id, row, maybe_index_id)
+                .inspect_err(|_| {
+                    self.current_pos.replace(CursorPosition::BeforeFirst);
+                })?;
+        } else if was_btree_resident {
+            // The row exists in B-tree but not in MvStore - mark it as B-tree resident
+            // so that checkpoint knows to write deletes to the B-tree file.
+            self.db
+                .insert_btree_resident_to_table_or_index(self.tx_id, row, maybe_index_id)
                 .inspect_err(|_| {
                     self.current_pos.replace(CursorPosition::BeforeFirst);
                 })?;
