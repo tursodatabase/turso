@@ -135,11 +135,11 @@ jobs:
             TARGET_TAG=""
             TARGET_BRANCH="go-release-${TURSO_REF}"
           elif [[ "$REF" == refs/tags/* ]]; then
-            TARGET_TAG="bindings/go/${TURSO_REF}"
+            TARGET_TAG="${TURSO_REF}"
             TARGET_BRANCH="go-release-${TURSO_REF}"
           else
             # TARGET_TAG=""
-            TARGET_TAG="bindings/go/v0.0.1-pre.0" # TEMPORARY CHANGE FOR TESTING
+            TARGET_TAG="v0.0.1-pre.0" # TEMPORARY CHANGE FOR TESTING
             TARGET_BRANCH="go-release-${TURSO_REF}"
           fi
 
@@ -350,6 +350,7 @@ jobs:
           echo "Pushed branch: $TARGET_BRANCH"
 
           if [[ "$TARGET_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([\-+][0-9A-Za-z\.-]+)?$ ]]; then
-            git tag "$TARGET_TAG"
+            # module is in the subdirectory - prepend path to the version tag
+            git tag "bindings/go/$TARGET_TAG"
             git push --tags
           fi
