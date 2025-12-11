@@ -1151,3 +1151,48 @@ do_execsql_test_in_memory_error_content upsert-trigger-causes-fk-violation {
     INSERT INTO child_deferred VALUES (1, 1);
     INSERT INTO child_deferred VALUES (1, 999) ON CONFLICT(id) DO UPDATE SET pid=excluded.pid;
 } {FOREIGN KEY constraint failed}
+
+# INSERT OR IGNORE with NOT NULL constraint violation tests
+do_execsql_test_on_specific_db {:memory:} ignore-notnull-single-row {
+    CREATE TABLE t(a INTEGER, b INT NOT NULL, c INTEGER);
+    INSERT OR IGNORE INTO t VALUES (1, NULL, 3);
+    SELECT * FROM t;
+} {}
+
+do_execsql_test_on_specific_db {:memory:} ignore-notnull-multi-row {
+    CREATE TABLE t(a INTEGER, b INT NOT NULL, c INTEGER);
+    INSERT OR IGNORE INTO t VALUES (1, 2, 3), (4, NULL, 6), (7, 8, 9);
+    SELECT * FROM t ORDER BY a;
+} {1|2|3
+7|8|9}
+
+do_execsql_test_on_specific_db {:memory:} ignore-notnull-all-null {
+    CREATE TABLE t(a INTEGER, b INT NOT NULL);
+    INSERT OR IGNORE INTO t VALUES (1, NULL), (2, NULL), (3, NULL);
+    SELECT * FROM t;
+} {}
+
+do_execsql_test_on_specific_db {:memory:} ignore-notnull-multiple-notnull-cols {
+    CREATE TABLE t(a INT NOT NULL, b INT NOT NULL, c INTEGER);
+    INSERT OR IGNORE INTO t VALUES (1, 2, 3), (NULL, 5, 6), (7, NULL, 9), (10, 11, 12);
+    SELECT * FROM t ORDER BY a;
+} {1|2|3
+10|11|12}
+
+do_execsql_test_on_specific_db {:memory:} ignore-notnull-from-select {
+    CREATE TABLE src(x, y, z);
+    INSERT INTO src VALUES (1, 2, 3), (4, NULL, 6), (7, 8, 9);
+    CREATE TABLE dst(a INTEGER, b INT NOT NULL, c INTEGER);
+    INSERT OR IGNORE INTO dst SELECT * FROM src;
+    SELECT * FROM dst ORDER BY a;
+} {1|2|3
+7|8|9}
+
+do_execsql_test_on_specific_db {:memory:} ignore-notnull-with-unique {
+    CREATE TABLE t(a INTEGER UNIQUE, b INT NOT NULL);
+    INSERT INTO t VALUES (1, 10);
+    INSERT OR IGNORE INTO t VALUES (1, 20), (2, NULL), (3, 30);
+    SELECT * FROM t ORDER BY a;
+} {1|10
+3|30}
+
