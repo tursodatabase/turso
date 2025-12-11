@@ -180,7 +180,9 @@ pub fn op_init(
     pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Init { target_pc }, insn);
-    assert!(target_pc.is_offset());
+    if !target_pc.is_offset() {
+        crate::bail_corrupt_error!("Unresolved label: {target_pc:?}");
+    }
     state.pc = target_pc.as_offset_int();
     Ok(InsnFunctionStepResult::Step)
 }
@@ -615,7 +617,9 @@ pub fn op_if_pos(
         },
         insn
     );
-    assert!(target_pc.is_offset());
+    if !target_pc.is_offset() {
+        crate::bail_corrupt_error!("Unresolved label: {target_pc:?}");
+    }
     let reg = *reg;
     let target_pc = *target_pc;
     match state.registers[reg].get_value() {
@@ -642,7 +646,9 @@ pub fn op_not_null(
     pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(NotNull { reg, target_pc }, insn);
-    assert!(target_pc.is_offset());
+    if !target_pc.is_offset() {
+        crate::bail_corrupt_error!("Unresolved label: {target_pc:?}");
+    }
     let reg = *reg;
     let target_pc = *target_pc;
     match &state.registers[reg].get_value() {
@@ -750,7 +756,9 @@ pub fn op_comparison(
         _ => unreachable!("unexpected Insn {:?}", insn),
     };
 
-    assert!(target_pc.is_offset());
+    if !target_pc.is_offset() {
+        crate::bail_corrupt_error!("Unresolved label: {target_pc:?}");
+    }
 
     let null_eq = flags.has_nulleq();
     let jump_if_null = flags.has_jump_if_null();
@@ -840,7 +848,9 @@ pub fn op_if(
         },
         insn
     );
-    assert!(target_pc.is_offset());
+    if !target_pc.is_offset() {
+        crate::bail_corrupt_error!("Unresolved label: {target_pc:?}");
+    }
     if state.registers[*reg]
         .get_value()
         .exec_if(*jump_if_null, false)
@@ -866,7 +876,9 @@ pub fn op_if_not(
         },
         insn
     );
-    assert!(target_pc.is_offset());
+    if !target_pc.is_offset() {
+        crate::bail_corrupt_error!("Unresolved label: {target_pc:?}");
+    }
     if state.registers[*reg]
         .get_value()
         .exec_if(*jump_if_null, true)
@@ -2583,7 +2595,9 @@ pub fn op_goto(
     pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Goto { target_pc }, insn);
-    assert!(target_pc.is_offset());
+    if !target_pc.is_offset() {
+        crate::bail_corrupt_error!("Unresolved label: {target_pc:?}");
+    }
     state.pc = target_pc.as_offset_int();
     Ok(InsnFunctionStepResult::Step)
 }
@@ -2601,7 +2615,9 @@ pub fn op_gosub(
         },
         insn
     );
-    assert!(target_pc.is_offset());
+    if !target_pc.is_offset() {
+        crate::bail_corrupt_error!("Unresolved label: {target_pc:?}");
+    }
     state.registers[*return_reg] = Register::Value(Value::Integer((state.pc + 1) as i64));
     state.pc = target_pc.as_offset_int();
     Ok(InsnFunctionStepResult::Step)
@@ -2996,7 +3012,9 @@ pub fn op_seek_rowid(
         },
         insn
     );
-    assert!(target_pc.is_offset());
+    if !target_pc.is_offset() {
+        crate::bail_corrupt_error!("Unresolved label: {target_pc:?}");
+    }
     let (pc, did_seek) = {
         let cursor = get_cursor!(state, *cursor_id);
 
@@ -3521,7 +3539,9 @@ pub fn op_idx_ge(
         },
         insn
     );
-    assert!(target_pc.is_offset());
+    if !target_pc.is_offset() {
+        crate::bail_corrupt_error!("Unresolved label: {target_pc:?}");
+    }
 
     let pc = {
         let cursor = get_cursor!(state, *cursor_id);
@@ -3588,7 +3608,9 @@ pub fn op_idx_le(
         },
         insn
     );
-    assert!(target_pc.is_offset());
+    if !target_pc.is_offset() {
+        crate::bail_corrupt_error!("Unresolved label: {target_pc:?}");
+    }
 
     let pc = {
         let cursor = get_cursor!(state, *cursor_id);
@@ -3638,7 +3660,9 @@ pub fn op_idx_gt(
         },
         insn
     );
-    assert!(target_pc.is_offset());
+    if !target_pc.is_offset() {
+        crate::bail_corrupt_error!("Unresolved label: {target_pc:?}");
+    }
 
     let pc = {
         let cursor = get_cursor!(state, *cursor_id);
@@ -3688,7 +3712,9 @@ pub fn op_idx_lt(
         },
         insn
     );
-    assert!(target_pc.is_offset());
+    if !target_pc.is_offset() {
+        crate::bail_corrupt_error!("Unresolved label: {target_pc:?}");
+    }
 
     let pc = {
         let cursor = get_cursor!(state, *cursor_id);
@@ -3730,7 +3756,9 @@ pub fn op_decr_jump_zero(
     pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(DecrJumpZero { reg, target_pc }, insn);
-    assert!(target_pc.is_offset());
+    if !target_pc.is_offset() {
+        crate::bail_corrupt_error!("Unresolved label: {target_pc:?}");
+    }
     match state.registers[*reg].get_value() {
         Value::Integer(n) => {
             let n = n - 1;

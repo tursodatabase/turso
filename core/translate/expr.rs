@@ -806,7 +806,7 @@ pub fn translate_expr(
             }
         }
         ast::Expr::Between { .. } => {
-            unreachable!("expression should have been rewritten in optmizer")
+            crate::bail_parse_error!("expression should have been rewritten in optmizer")
         }
         ast::Expr::Binary(e1, op, e2) => {
             binary_expr_shared(

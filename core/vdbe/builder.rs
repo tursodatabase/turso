@@ -670,13 +670,15 @@ impl ProgramBuilder {
     /// This function scans all instructions and resolves any labels to their corresponding offsets.
     /// It ensures that all labels are resolved correctly and updates the target program counter (PC)
     /// of each instruction that references a label.
-    pub fn resolve_labels(&mut self) {
-        let resolve = |pc: &mut BranchOffset, insn_name: &str| {
+    pub fn resolve_labels(&mut self) -> crate::Result<()> {
+        let resolve = |pc: &mut BranchOffset, insn_name: &str| -> crate::Result<()> {
             if let BranchOffset::Label(label) = pc {
                 let Some(Some((to_offset, target))) =
                     self.label_to_resolved_offset.get(*label as usize)
                 else {
-                    panic!("Reference to undefined or unresolved label in {insn_name}: {label}");
+                    crate::bail_corrupt_error!(
+                        "Reference to undefined or unresolved label in {insn_name}: {label}"
+                    );
                 };
                 *pc = BranchOffset::Offset(
                     to_offset
@@ -687,11 +689,12 @@ impl ProgramBuilder {
                         },
                 );
             }
+            Ok(())
         };
         for (insn, _) in self.insns.iter_mut() {
             match insn {
                 Insn::Init { target_pc } => {
-                    resolve(target_pc, "Init");
+                    resolve(target_pc, "Init")?;
                 }
                 Insn::Eq {
                     lhs: _lhs,
@@ -699,7 +702,7 @@ impl ProgramBuilder {
                     target_pc,
                     ..
                 } => {
-                    resolve(target_pc, "Eq");
+                    resolve(target_pc, "Eq")?;
                 }
                 Insn::Ne {
                     lhs: _lhs,
@@ -707,7 +710,7 @@ impl ProgramBuilder {
                     target_pc,
                     ..
                 } => {
-                    resolve(target_pc, "Ne");
+                    resolve(target_pc, "Ne")?;
                 }
                 Insn::Lt {
                     lhs: _lhs,
@@ -715,7 +718,7 @@ impl ProgramBuilder {
                     target_pc,
                     ..
                 } => {
-                    resolve(target_pc, "Lt");
+                    resolve(target_pc, "Lt")?;
                 }
                 Insn::Le {
                     lhs: _lhs,
@@ -723,7 +726,7 @@ impl ProgramBuilder {
                     target_pc,
                     ..
                 } => {
-                    resolve(target_pc, "Le");
+                    resolve(target_pc, "Le")?;
                 }
                 Insn::Gt {
                     lhs: _lhs,
@@ -731,7 +734,7 @@ impl ProgramBuilder {
                     target_pc,
                     ..
                 } => {
-                    resolve(target_pc, "Gt");
+                    resolve(target_pc, "Gt")?;
                 }
                 Insn::Ge {
                     lhs: _lhs,
@@ -739,135 +742,136 @@ impl ProgramBuilder {
                     target_pc,
                     ..
                 } => {
-                    resolve(target_pc, "Ge");
+                    resolve(target_pc, "Ge")?;
                 }
                 Insn::If {
                     reg: _reg,
                     target_pc,
                     jump_if_null: _,
                 } => {
-                    resolve(target_pc, "If");
+                    resolve(target_pc, "If")?;
                 }
                 Insn::IfNot {
                     reg: _reg,
                     target_pc,
                     jump_if_null: _,
                 } => {
-                    resolve(target_pc, "IfNot");
+                    resolve(target_pc, "IfNot")?;
                 }
                 Insn::Rewind { pc_if_empty, .. } => {
-                    resolve(pc_if_empty, "Rewind");
+                    resolve(pc_if_empty, "Rewind")?;
                 }
                 Insn::Last { pc_if_empty, .. } => {
-                    resolve(pc_if_empty, "Last");
+                    resolve(pc_if_empty, "Last")?;
                 }
                 Insn::Goto { target_pc } => {
-                    resolve(target_pc, "Goto");
+                    resolve(target_pc, "Goto")?;
                 }
                 Insn::DecrJumpZero {
                     reg: _reg,
                     target_pc,
                 } => {
-                    resolve(target_pc, "DecrJumpZero");
+                    resolve(target_pc, "DecrJumpZero")?;
                 }
                 Insn::SorterNext {
                     cursor_id: _cursor_id,
                     pc_if_next,
                 } => {
-                    resolve(pc_if_next, "SorterNext");
+                    resolve(pc_if_next, "SorterNext")?;
                 }
                 Insn::SorterSort { pc_if_empty, .. } => {
-                    resolve(pc_if_empty, "SorterSort");
+                    resolve(pc_if_empty, "SorterSort")?;
                 }
                 Insn::SorterCompare {
                     pc_when_nonequal: target_pc,
                     ..
                 } => {
-                    resolve(target_pc, "SorterCompare");
+                    resolve(target_pc, "SorterCompare")?;
                 }
                 Insn::NotNull {
                     reg: _reg,
                     target_pc,
                 } => {
-                    resolve(target_pc, "NotNull");
+                    resolve(target_pc, "NotNull")?;
                 }
                 Insn::IfPos { target_pc, .. } => {
-                    resolve(target_pc, "IfPos");
+                    resolve(target_pc, "IfPos")?;
                 }
                 Insn::Next { pc_if_next, .. } => {
-                    resolve(pc_if_next, "Next");
+                    resolve(pc_if_next, "Next")?;
                 }
                 Insn::Once {
                     target_pc_when_reentered,
                     ..
                 } => {
-                    resolve(target_pc_when_reentered, "Once");
+                    resolve(target_pc_when_reentered, "Once")?;
                 }
                 Insn::Prev { pc_if_prev, .. } => {
-                    resolve(pc_if_prev, "Prev");
+                    resolve(pc_if_prev, "Prev")?;
                 }
                 Insn::InitCoroutine {
                     yield_reg: _,
                     jump_on_definition,
                     start_offset,
                 } => {
-                    resolve(jump_on_definition, "InitCoroutine");
-                    resolve(start_offset, "InitCoroutine");
+                    resolve(jump_on_definition, "InitCoroutine")?;
+                    resolve(start_offset, "InitCoroutine")?;
                 }
                 Insn::NotExists {
                     cursor: _,
                     rowid_reg: _,
                     target_pc,
                 } => {
-                    resolve(target_pc, "NotExists");
+                    resolve(target_pc, "NotExists")?;
                 }
                 Insn::Yield {
                     yield_reg: _,
                     end_offset,
                 } => {
-                    resolve(end_offset, "Yield");
+                    resolve(end_offset, "Yield")?;
                 }
                 Insn::SeekRowid { target_pc, .. } => {
-                    resolve(target_pc, "SeekRowid");
+                    resolve(target_pc, "SeekRowid")?;
                 }
                 Insn::Gosub { target_pc, .. } => {
-                    resolve(target_pc, "Gosub");
+                    resolve(target_pc, "Gosub")?;
                 }
                 Insn::Jump {
                     target_pc_eq,
                     target_pc_lt,
                     target_pc_gt,
                 } => {
-                    resolve(target_pc_eq, "Jump");
-                    resolve(target_pc_lt, "Jump");
-                    resolve(target_pc_gt, "Jump");
+                    resolve(target_pc_eq, "Jump")?;
+                    resolve(target_pc_lt, "Jump")?;
+                    resolve(target_pc_gt, "Jump")?;
                 }
-                Insn::SeekGE { target_pc, .. } => resolve(target_pc, "SeekGE"),
-                Insn::SeekGT { target_pc, .. } => resolve(target_pc, "SeekGT"),
-                Insn::SeekLE { target_pc, .. } => resolve(target_pc, "SeekLE"),
-                Insn::SeekLT { target_pc, .. } => resolve(target_pc, "SeekLT"),
-                Insn::IdxGE { target_pc, .. } => resolve(target_pc, "IdxGE"),
-                Insn::IdxLE { target_pc, .. } => resolve(target_pc, "IdxLE"),
-                Insn::IdxGT { target_pc, .. } => resolve(target_pc, "IdxGT"),
-                Insn::IdxLT { target_pc, .. } => resolve(target_pc, "IdxLT"),
+                Insn::SeekGE { target_pc, .. } => resolve(target_pc, "SeekGE")?,
+                Insn::SeekGT { target_pc, .. } => resolve(target_pc, "SeekGT")?,
+                Insn::SeekLE { target_pc, .. } => resolve(target_pc, "SeekLE")?,
+                Insn::SeekLT { target_pc, .. } => resolve(target_pc, "SeekLT")?,
+                Insn::IdxGE { target_pc, .. } => resolve(target_pc, "IdxGE")?,
+                Insn::IdxLE { target_pc, .. } => resolve(target_pc, "IdxLE")?,
+                Insn::IdxGT { target_pc, .. } => resolve(target_pc, "IdxGT")?,
+                Insn::IdxLT { target_pc, .. } => resolve(target_pc, "IdxLT")?,
                 Insn::IndexMethodQuery { pc_if_empty, .. } => {
-                    resolve(pc_if_empty, "IndexMethodQuery")
+                    resolve(pc_if_empty, "IndexMethodQuery")?;
                 }
-                Insn::IsNull { reg: _, target_pc } => resolve(target_pc, "IsNull"),
-                Insn::VNext { pc_if_next, .. } => resolve(pc_if_next, "VNext"),
-                Insn::VFilter { pc_if_empty, .. } => resolve(pc_if_empty, "VFilter"),
-                Insn::RowSetRead { pc_if_empty, .. } => resolve(pc_if_empty, "RowSetRead"),
-                Insn::NoConflict { target_pc, .. } => resolve(target_pc, "NoConflict"),
-                Insn::Found { target_pc, .. } => resolve(target_pc, "Found"),
-                Insn::NotFound { target_pc, .. } => resolve(target_pc, "NotFound"),
-                Insn::FkIfZero { target_pc, .. } => resolve(target_pc, "FkIfZero"),
-                Insn::Filter { target_pc, .. } => resolve(target_pc, "Filter"),
-                Insn::HashProbe { target_pc, .. } => resolve(target_pc, "HashProbe"),
-                Insn::HashNext { target_pc, .. } => resolve(target_pc, "HashNext"),
+                Insn::IsNull { reg: _, target_pc } => resolve(target_pc, "IsNull")?,
+                Insn::VNext { pc_if_next, .. } => resolve(pc_if_next, "VNext")?,
+                Insn::VFilter { pc_if_empty, .. } => resolve(pc_if_empty, "VFilter")?,
+                Insn::RowSetRead { pc_if_empty, .. } => resolve(pc_if_empty, "RowSetRead")?,
+                Insn::NoConflict { target_pc, .. } => resolve(target_pc, "NoConflict")?,
+                Insn::Found { target_pc, .. } => resolve(target_pc, "Found")?,
+                Insn::NotFound { target_pc, .. } => resolve(target_pc, "NotFound")?,
+                Insn::FkIfZero { target_pc, .. } => resolve(target_pc, "FkIfZero")?,
+                Insn::Filter { target_pc, .. } => resolve(target_pc, "Filter")?,
+                Insn::HashProbe { target_pc, .. } => resolve(target_pc, "HashProbe")?,
+                Insn::HashNext { target_pc, .. } => resolve(target_pc, "HashNext")?,
                 _ => {}
             }
         }
         self.label_to_resolved_offset.clear();
+        Ok(())
     }
 
     /// Set a cursor override for a table. When resolving a table cursor for this table,
@@ -1157,8 +1161,13 @@ impl ProgramBuilder {
         });
     }
 
-    pub fn build(mut self, connection: Arc<Connection>, change_cnt_on: bool, sql: &str) -> Program {
-        self.resolve_labels();
+    pub fn build(
+        mut self,
+        connection: Arc<Connection>,
+        change_cnt_on: bool,
+        sql: &str,
+    ) -> crate::Result<Program> {
+        self.resolve_labels()?;
 
         self.parameters.list.dedup();
 
@@ -1173,7 +1182,7 @@ impl ProgramBuilder {
             .iter()
             .any(|(insn, _)| matches!(insn, Insn::Program { .. }));
 
-        Program {
+        Ok(Program {
             max_registers: self.next_free_register,
             insns: self.insns,
             cursor_ref: self.cursor_ref,
@@ -1191,6 +1200,6 @@ impl ProgramBuilder {
             contains_trigger_subprograms,
             resolve_type: self.resolve_type,
             explain_state: RwLock::new(ExplainState::default()),
-        }
+        })
     }
 }
