@@ -917,7 +917,10 @@ pub fn op_open_read(
         .get(*cursor_id)
         .expect("cursor_id should exist in cursor_ref");
     if program.connection.get_mv_tx_id().is_none() {
-        assert!(*root_page >= 0, "");
+        assert!(
+            *root_page >= 0,
+            "root page should be non negative when we are not in a MVCC transaction"
+        );
     }
     let cursors = &mut state.cursors;
     let num_columns = match cursor_type {
