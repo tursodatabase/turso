@@ -956,7 +956,7 @@ mod tests {
                 ),
                 turso_status_code_t::TURSO_OK
             );
-            let blob = vec![6];
+            let blob = [6];
             assert_eq!(
                 turso_statement_bind_positional_blob(statement, 5, blob.as_ptr(), blob.len()),
                 turso_status_code_t::TURSO_OK
@@ -1064,7 +1064,7 @@ mod tests {
                 ),
                 turso_status_code_t::TURSO_OK
             );
-            let blob = vec![6];
+            let blob = [6];
             assert_eq!(
                 turso_statement_bind_positional_blob(
                     statement,
