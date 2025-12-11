@@ -256,7 +256,6 @@ fn strftime_format(dt: &NaiveDateTime, format_str: &str) -> Option<String> {
     use crate::functions::strftime::CustomStrftimeItems;
     use std::fmt::Write;
 
-    // 1. Validation Loop
     let mut chars = format_str.chars().peekable();
     while let Some(c) = chars.next() {
         if c == '%' {
