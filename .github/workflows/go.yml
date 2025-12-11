@@ -3,10 +3,6 @@ name: Build & Publish Go Driver
 
 on:
   workflow_dispatch:
-    inputs:
-      branch_name:
-        description: 'Branch name to push updates to in turso repo (manual runs). If empty, defaults to go-driver/<current-ref>.'
-        required: false
   push:
     branches: ["main"]
     tags:
@@ -109,7 +105,6 @@ jobs:
 
           EVENT="${{ github.event_name }}"
           REF="${{ github.ref }}"
-          INPUT_BRANCH="${{ github.event.inputs.branch_name || '' }}"
 
           # Determine whether to publish for real:
           # - Manual dispatch: publish
@@ -136,13 +131,16 @@ jobs:
           fi
 
           # Branch to push into this repository
-          if [[ "$EVENT" == "workflow_dispatch" && -n "$INPUT_BRANCH" ]]; then
-            TARGET_BRANCH="$INPUT_BRANCH"
+          if [[ "$EVENT" == "workflow_dispatch" ]]; then
+            TARGET_TAG=""
+            TARGET_BRANCH="go-release-${TURSO_REF}"
           elif [[ "$REF" == refs/tags/* ]]; then
-            TARGET_BRANCH="bindings/go/${TURSO_REF}"
+            TARGET_TAG="bindings/go/${TURSO_REF}"
+            TARGET_BRANCH="go-release-${TURSO_REF}"
           else
-            # TARGET_BRANCH="bindings/go/${TURSO_REF}"
-            TARGET_BRANCH="bindings/go/v0.0.1-pre.0" # TEMPORARY CHANGE FOR TESTING
+            # TARGET_TAG=""
+            TARGET_TAG="bindings/go/v0.0.1-pre.0" # TEMPORARY CHANGE FOR TESTING
+            TARGET_BRANCH="go-release-${TURSO_REF}"
           fi
 
           # Generate a unique nonce
@@ -154,6 +152,7 @@ jobs:
           echo "do_publish=$DO_PUBLISH" >> "$GITHUB_OUTPUT"
           echo "turso_ref=$TURSO_REF" >> "$GITHUB_OUTPUT"
           echo "target_branch=$TARGET_BRANCH" >> "$GITHUB_OUTPUT"
+          echo "target_tag=$TARGET_TAG" >> "$GITHUB_OUTPUT"
           echo "nonce=$NONCE" >> "$GITHUB_OUTPUT"
 
           echo "Event: $EVENT"
@@ -161,6 +160,7 @@ jobs:
           echo "DO_PUBLISH=$DO_PUBLISH"
           echo "TURSO_REF=$TURSO_REF"
           echo "TARGET_BRANCH=$TARGET_BRANCH"
+          echo "TARGET_TAG=$TARGET_TAG"
           echo "NONCE=$NONCE"
 
       - name: Dry-run (PRs and non-tag non-manual runs)
@@ -274,12 +274,7 @@ jobs:
           TURSO_REF: ${{ steps.vars.outputs.turso_ref }}
         run: |
           set -euo pipefail
-          # If turso_ref is a semver tag starting with v, use it; else use turso-branch-<turso_ref>
-          if [[ "$TURSO_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([\-+][0-9A-Za-z\.-]+)?$ ]]; then
-            BRANCH="$TURSO_REF"
-          else
-            BRANCH="turso-branch-$TURSO_REF"
-          fi
+          BRANCH="turso-branch-$TURSO_REF"
           echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
           echo "Resolved libs branch: $BRANCH"
 
@@ -292,6 +287,7 @@ jobs:
       - name: Update dependency to freshly built libs
         if: steps.vars.outputs.do_publish == 'true'
         id: update_dep
+        working-directory: bindings/go
         shell: bash
         env:
           LIBS_BRANCH: ${{ steps.libs_branch.outputs.branch }}
@@ -314,7 +310,9 @@ jobs:
       - name: Create and push branch with updated go.mod
         if: steps.vars.outputs.do_publish == 'true'
         shell: bash
+        working-directory: bindings/go
         env:
+          TARGET_TAG: ${{ steps.vars.outputs.target_tag }}
           TARGET_BRANCH: ${{ steps.vars.outputs.target_branch }}
           NONCE: ${{ steps.vars.outputs.nonce }}
           RESOLVED_VERSION: ${{ steps.update_dep.outputs.resolved_version }}
@@ -350,3 +348,8 @@ jobs:
           git push --set-upstream origin "$TARGET_BRANCH" --force-with-lease || git push --set-upstream origin "$TARGET_BRANCH"
 
           echo "Pushed branch: $TARGET_BRANCH"
+
+          if [[ "$TARGET_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([\-+][0-9A-Za-z\.-]+)?$ ]]; then
+            git tag "$TARGET_TAG"
+            git push --tags
+          fi
