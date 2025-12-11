@@ -25,7 +25,7 @@ use crate::{
         RecordCursor, SeekResult,
     },
     util::IOExt,
-    Completion, Page,
+    Completion,
 };
 
 use crate::{
@@ -209,7 +209,7 @@ pub enum OverwriteCellState {
 }
 
 struct BalanceContext {
-    pages_to_balance_new: [Option<Arc<Page>>; MAX_NEW_SIBLING_PAGES_AFTER_BALANCE],
+    pages_to_balance_new: [Option<PageRef>; MAX_NEW_SIBLING_PAGES_AFTER_BALANCE],
     sibling_count_new: usize,
     cell_array: CellArray,
     old_cell_count_per_page_cumulative: [u16; MAX_NEW_SIBLING_PAGES_AFTER_BALANCE],
@@ -277,7 +277,7 @@ enum WriteState {
     /// we may also need to clear the old cell's overflow pages
     /// and add them to the freelist.
     Overwrite {
-        page: Arc<Page>,
+        page: PageRef,
         cell_idx: usize,
         // This is an Option although it's not optional; we `take` it as owned for [BTreeCursor::overwrite_cell]
         // to work around the borrow checker, and then insert it back if overwriting returns IO.
@@ -285,7 +285,7 @@ enum WriteState {
     },
     /// Insert a new cell. This path is taken when inserting a new row.
     Insert {
-        page: Arc<Page>,
+        page: PageRef,
         cell_idx: usize,
         new_payload: Vec<u8>,
         fill_cell_payload_state: FillCellPayloadState,
@@ -616,7 +616,7 @@ pub struct BTreeCursor {
     /// - The underlying `ImmutableRecord` is modified
     pub record_cursor: RefCell<RecordCursor>,
     /// State machine for [BTreeCursor::is_empty_table]
-    is_empty_table_state: RefCell<EmptyTableState>,
+    is_empty_table_state: EmptyTableState,
     /// State machine for [BTreeCursor::move_to_rightmost] and, optionally, the id of the rightmost page in the btree.
     /// If we know the rightmost page id and are already on that page, we can skip a seek.
     move_to_right_state: (MoveToRightState, Option<usize>),
@@ -695,7 +695,7 @@ impl BTreeCursor {
             seek_state: CursorSeekState::Start,
             read_overflow_state: RefCell::new(None),
             record_cursor: RefCell::new(RecordCursor::with_capacity(num_columns)),
-            is_empty_table_state: RefCell::new(EmptyTableState::Start),
+            is_empty_table_state: EmptyTableState::Start,
             move_to_right_state: (MoveToRightState::Start, None),
             seek_to_last_state: SeekToLastState::Start,
             rewind_state: RewindState::Start,
@@ -740,13 +740,13 @@ impl BTreeCursor {
     /// Check if the table is empty.
     /// This is done by checking if the root page has no cells.
     #[instrument(skip_all, level = Level::DEBUG)]
-    fn is_empty_table(&self) -> Result<IOResult<bool>> {
+    fn is_empty_table(&mut self) -> Result<IOResult<bool>> {
         loop {
-            let state = self.is_empty_table_state.borrow().clone();
+            let state = self.is_empty_table_state.clone();
             match state {
                 EmptyTableState::Start => {
                     let (page, c) = self.pager.read_page(self.root_page)?;
-                    *self.is_empty_table_state.borrow_mut() = EmptyTableState::ReadPage { page };
+                    self.is_empty_table_state = EmptyTableState::ReadPage { page };
                     if let Some(c) = c {
                         io_yield_one!(c);
                     }
@@ -2746,7 +2746,7 @@ impl BTreeCursor {
                         page_to_balance_idx
                     );
                     // Part 1: Find the sibling pages to balance
-                    let mut pages_to_balance: [Option<Arc<Page>>; MAX_SIBLING_PAGES_TO_BALANCE] =
+                    let mut pages_to_balance: [Option<PageRef>; MAX_SIBLING_PAGES_TO_BALANCE] =
                         [const { None }; MAX_SIBLING_PAGES_TO_BALANCE];
                     turso_assert!(
                         page_to_balance_idx <= parent_contents.cell_count(),
@@ -2946,7 +2946,7 @@ impl BTreeCursor {
                     // The count includes: all cells and overflow cells from the sibling pages, and divider cells from the parent page,
                     // excluding the rightmost divider, which will not be dropped from the parent; instead it will be updated at the end.
                     let mut total_cells_to_redistribute = 0;
-                    let pages_to_balance_new: [Option<Arc<Page>>;
+                    let pages_to_balance_new: [Option<PageRef>;
                         MAX_NEW_SIBLING_PAGES_AFTER_BALANCE] =
                         [const { None }; MAX_NEW_SIBLING_PAGES_AFTER_BALANCE];
                     for i in (0..balance_info.sibling_count).rev() {
@@ -3897,7 +3897,7 @@ impl BTreeCursor {
         parent_contents: &mut PageContent,
         divider_cell_insert_idx_in_parent: usize,
         divider_cell_is_overflow_cell: bool,
-        child_page: &std::sync::Arc<crate::Page>,
+        child_page: &PageRef,
         usable_space: usize,
     ) {
         let left_pointer = if divider_cell_is_overflow_cell {
@@ -4410,7 +4410,7 @@ impl BTreeCursor {
         self.stack.clear();
         self.stack.push(root);
         self.stack.set_cell_index(0); // leave parent pointing at the rightmost pointer (in this case 0, as there are no cells), since we will be balancing the rightmost child page.
-        self.stack.push(child.clone());
+        self.stack.push(child);
         Ok(IOResult::Done(()))
     }
 
@@ -4782,8 +4782,7 @@ impl BTreeCursor {
 
                     // if it all fits in local space and old_local_size is enough, do an in-place overwrite
                     if new_payload.len() == *old_local_size {
-                        let _res =
-                            BTreeCursor::overwrite_content(page.clone(), *old_offset, new_payload)?;
+                        Self::overwrite_content(page, *old_offset, new_payload)?;
                         return Ok(IOResult::Done(()));
                     }
 
@@ -4795,16 +4794,11 @@ impl BTreeCursor {
         }
     }
 
-    pub fn overwrite_content(
-        page: PageRef,
-        dest_offset: usize,
-        new_payload: &[u8],
-    ) -> Result<IOResult<()>> {
+    pub fn overwrite_content(page: &PageRef, dest_offset: usize, new_payload: &[u8]) -> Result<()> {
         turso_assert!(page.is_loaded(), "page should be loaded");
         let buf = page.get_contents().as_ptr();
         buf[dest_offset..dest_offset + new_payload.len()].copy_from_slice(new_payload);
-
-        Ok(IOResult::Done(()))
+        Ok(())
     }
 
     fn get_immutable_record_or_create(&self) -> std::cell::RefMut<'_, Option<ImmutableRecord>> {
@@ -6182,10 +6176,7 @@ pub fn integrity_check(
     }
 }
 
-pub fn btree_read_page(
-    pager: &Arc<Pager>,
-    page_idx: i64,
-) -> Result<(Arc<Page>, Option<Completion>)> {
+pub fn btree_read_page(pager: &Arc<Pager>, page_idx: i64) -> Result<(PageRef, Option<Completion>)> {
     pager.read_page(page_idx)
 }
 
@@ -6401,14 +6392,14 @@ impl PageStack {
 
     /// Get the top page on the stack.
     /// This is the page that is currently being traversed.
-    fn top(&self) -> Arc<Page> {
+    fn top(&self) -> PageRef {
         let current = self.current();
         let page = self.stack[current].clone().unwrap();
         turso_assert!(page.is_loaded(), "page should be loaded");
         page
     }
 
-    fn top_ref(&self) -> &Arc<Page> {
+    fn top_ref(&self) -> &PageRef {
         let current = self.current();
         let page = self.stack[current].as_ref().unwrap();
         turso_assert!(page.is_loaded(), "page should be loaded");
@@ -7824,7 +7815,7 @@ mod tests {
     use super::{btree_init_page, defragment_page, drop_cell, insert_into_cell};
 
     #[allow(clippy::arc_with_non_send_sync)]
-    fn get_page(id: usize) -> Arc<Page> {
+    fn get_page(id: usize) -> PageRef {
         let page = Arc::new(Page::new(id as i64));
 
         let inner = PageContent::new(0, Arc::new(Buffer::new_temporary(4096)));
