@@ -70,7 +70,7 @@ test-compat: check-tcl-version
 	RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) ./testing/all.test
 
 test-compat-mvcc: check-tcl-version
-	RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) ./testing/all-mvcc.test
+	RUST_LOG=$(RUST_LOG) SQLITE_EXEC=scripts/turso-mvcc-sqlite3 ./testing/all-mvcc.test
 
 test-single: check-tcl-version
 	@if [ -z "$(TEST)" ]; then \
@@ -220,4 +220,3 @@ endif
 sim-schema: 
 	mkdir -p  simulator/configs/custom
 	cargo run -p limbo_sim -- print-schema > simulator/configs/custom/profile-schema.json
-
