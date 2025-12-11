@@ -170,7 +170,7 @@ def test_partial_sync():
         ),
     )
     assert conn_partial.execute("SELECT LENGTH(x) FROM t LIMIT 1").fetchall() == [(1024,)]
-    assert conn_partial.stats().network_received_bytes < 256 * 1024 * 1024
+    assert conn_partial.stats().network_received_bytes < 256 * (1024 + 10)
 
     start = time.time()
     assert conn_partial.execute("SELECT SUM(LENGTH(x)) FROM t").fetchall() == [(2000 * 1024,)]

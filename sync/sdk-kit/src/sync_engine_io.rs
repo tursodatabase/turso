@@ -1,6 +1,5 @@
 use std::{
     collections::VecDeque,
-    mem::ManuallyDrop,
     sync::{Arc, Mutex, MutexGuard},
 };
 
@@ -23,6 +22,17 @@ pub enum SyncEngineIoRequest {
 }
 
 impl SyncEngineIoRequest {
+    pub fn kind_to_capi(&self) -> c::turso_sync_io_request_type_t {
+        match self {
+            SyncEngineIoRequest::Http { .. } => c::turso_sync_io_request_type_t::TURSO_SYNC_IO_HTTP,
+            SyncEngineIoRequest::FullRead { .. } => {
+                c::turso_sync_io_request_type_t::TURSO_SYNC_IO_FULL_READ
+            }
+            SyncEngineIoRequest::FullWrite { .. } => {
+                c::turso_sync_io_request_type_t::TURSO_SYNC_IO_FULL_WRITE
+            }
+        }
+    }
     /// extract header key-value pair from the HTTP IO request
     pub fn header_to_capi(
         &self,
@@ -47,45 +57,52 @@ impl SyncEngineIoRequest {
             }),
         }
     }
-    pub fn to_capi(&self) -> c::turso_sync_io_request_t {
+    pub fn http_to_capi(&self) -> Result<c::turso_sync_io_http_request_t, TursoError> {
         match self {
             SyncEngineIoRequest::Http {
                 method,
                 path,
                 body,
                 headers,
-            } => c::turso_sync_io_request_t {
-                type_: c::turso_sync_io_request_type_t::TURSO_SYNC_IO_HTTP,
-                request: c::turso_sync_io_request_union_t {
-                    http: ManuallyDrop::new(c::turso_sync_io_http_request_t {
-                        method: turso_slice_from_bytes(method.as_bytes()),
-                        path: turso_slice_from_bytes(path.as_bytes()),
-                        body: if let Some(body) = body {
-                            turso_slice_from_bytes(body.as_ref())
-                        } else {
-                            Default::default()
-                        },
-                        headers: headers.len() as i32,
-                    }),
+            } => Ok(c::turso_sync_io_http_request_t {
+                method: turso_slice_from_bytes(method.as_bytes()),
+                path: turso_slice_from_bytes(path.as_bytes()),
+                body: if let Some(body) = body {
+                    turso_slice_from_bytes(body.as_ref())
+                } else {
+                    Default::default()
                 },
-            },
-            SyncEngineIoRequest::FullRead { path } => c::turso_sync_io_request_t {
-                type_: c::turso_sync_io_request_type_t::TURSO_SYNC_IO_FULL_READ,
-                request: c::turso_sync_io_request_union_t {
-                    full_read: ManuallyDrop::new(c::turso_sync_io_full_read_request_t {
-                        path: turso_slice_from_bytes(path.as_bytes()),
-                    }),
-                },
-            },
-            SyncEngineIoRequest::FullWrite { path, content } => c::turso_sync_io_request_t {
-                type_: c::turso_sync_io_request_type_t::TURSO_SYNC_IO_FULL_WRITE,
-                request: c::turso_sync_io_request_union_t {
-                    full_write: ManuallyDrop::new(c::turso_sync_io_full_write_request_t {
-                        path: turso_slice_from_bytes(path.as_bytes()),
-                        content: turso_slice_from_bytes(content.as_ref()),
-                    }),
-                },
-            },
+                headers: headers.len() as i32,
+            }),
+            _ => Err(TursoError {
+                code: TursoStatusCode::Misuse,
+                message: Some("unexpected io request type".to_string()),
+            }),
+        }
+    }
+    pub fn full_read_to_capi(&self) -> Result<c::turso_sync_io_full_read_request_t, TursoError> {
+        match self {
+            SyncEngineIoRequest::FullRead { path } => Ok(c::turso_sync_io_full_read_request_t {
+                path: turso_slice_from_bytes(path.as_bytes()),
+            }),
+            _ => Err(TursoError {
+                code: TursoStatusCode::Misuse,
+                message: Some("unexpected io request type".to_string()),
+            }),
+        }
+    }
+    pub fn full_write_to_capi(&self) -> Result<c::turso_sync_io_full_write_request_t, TursoError> {
+        match self {
+            SyncEngineIoRequest::FullWrite { path, content } => {
+                Ok(c::turso_sync_io_full_write_request_t {
+                    path: turso_slice_from_bytes(path.as_bytes()),
+                    content: turso_slice_from_bytes(content.as_ref()),
+                })
+            }
+            _ => Err(TursoError {
+                code: TursoStatusCode::Misuse,
+                message: Some("unexpected io request type".to_string()),
+            }),
         }
     }
 }
@@ -223,10 +240,8 @@ impl<TBytes: AsRef<[u8]>> SyncEngineIoQueueItem<TBytes> {
     pub fn get_completion(&self) -> &SyncEngineIoCompletion<TBytes> {
         &self.completion
     }
-    pub fn to_capi(self: Box<Self>) -> c::turso_sync_io_item_t {
-        c::turso_sync_io_item_t {
-            inner: Box::into_raw(self) as *mut std::ffi::c_void,
-        }
+    pub fn to_capi(self: Box<Self>) -> *mut c::turso_sync_io_item_t {
+        Box::into_raw(self) as *mut c::turso_sync_io_item_t
     }
     /// helper method to restore [SyncEngineIoQueueItem] ref from C raw container
     /// this method is used in the capi wrappers
@@ -234,15 +249,15 @@ impl<TBytes: AsRef<[u8]>> SyncEngineIoQueueItem<TBytes> {
     /// # Safety
     /// value must be a pointer returned from [Self::to_capi] method
     pub unsafe fn ref_from_capi<'a>(
-        value: c::turso_sync_io_item_t,
+        value: *const c::turso_sync_io_item_t,
     ) -> Result<&'a Self, TursoError> {
-        if value.inner.is_null() {
+        if value.is_null() {
             Err(TursoError {
                 code: TursoStatusCode::Misuse,
                 message: Some("got null pointer".to_string()),
             })
         } else {
-            Ok(&*(value.inner as *const Self))
+            Ok(&*(value as *const Self))
         }
     }
     /// helper method to restore [SyncEngineIoQueueItem] instance from C raw container
@@ -250,8 +265,8 @@ impl<TBytes: AsRef<[u8]>> SyncEngineIoQueueItem<TBytes> {
     ///
     /// # Safety
     /// value must be a pointer returned from [Self::to_capi] method
-    pub unsafe fn box_from_capi(value: c::turso_sync_io_item_t) -> Box<Self> {
-        Box::from_raw(value.inner as *mut Self)
+    pub unsafe fn box_from_capi(value: *const c::turso_sync_io_item_t) -> Box<Self> {
+        Box::from_raw(value as *mut Self)
     }
 }
 

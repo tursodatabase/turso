@@ -114,58 +114,6 @@ impl Default for turso_sync_io_full_write_request_t {
         }
     }
 }
-#[repr(C)]
-pub union turso_sync_io_request_union_t {
-    pub http: ::std::mem::ManuallyDrop<turso_sync_io_http_request_t>,
-    pub full_read: ::std::mem::ManuallyDrop<turso_sync_io_full_read_request_t>,
-    pub full_write: ::std::mem::ManuallyDrop<turso_sync_io_full_write_request_t>,
-}
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of turso_sync_io_request_union_t"]
-        [::std::mem::size_of::<turso_sync_io_request_union_t>() - 56usize];
-    ["Alignment of turso_sync_io_request_union_t"]
-        [::std::mem::align_of::<turso_sync_io_request_union_t>() - 8usize];
-    ["Offset of field: turso_sync_io_request_union_t::http"]
-        [::std::mem::offset_of!(turso_sync_io_request_union_t, http) - 0usize];
-    ["Offset of field: turso_sync_io_request_union_t::full_read"]
-        [::std::mem::offset_of!(turso_sync_io_request_union_t, full_read) - 0usize];
-    ["Offset of field: turso_sync_io_request_union_t::full_write"]
-        [::std::mem::offset_of!(turso_sync_io_request_union_t, full_write) - 0usize];
-};
-impl Default for turso_sync_io_request_union_t {
-    fn default() -> Self {
-        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
-        unsafe {
-            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
-            s.assume_init()
-        }
-    }
-}
-#[repr(C)]
-pub struct turso_sync_io_request_t {
-    pub type_: turso_sync_io_request_type_t,
-    pub request: turso_sync_io_request_union_t,
-}
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of turso_sync_io_request_t"][::std::mem::size_of::<turso_sync_io_request_t>() - 64usize];
-    ["Alignment of turso_sync_io_request_t"]
-        [::std::mem::align_of::<turso_sync_io_request_t>() - 8usize];
-    ["Offset of field: turso_sync_io_request_t::type_"]
-        [::std::mem::offset_of!(turso_sync_io_request_t, type_) - 0usize];
-    ["Offset of field: turso_sync_io_request_t::request"]
-        [::std::mem::offset_of!(turso_sync_io_request_t, request) - 8usize];
-};
-impl Default for turso_sync_io_request_t {
-    fn default() -> Self {
-        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
-        unsafe {
-            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
-            s.assume_init()
-        }
-    }
-}
 #[repr(u32)]
 #[doc = " TURSO_ASYNC_OPERATION_RESULT"]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]
@@ -175,28 +123,13 @@ pub enum turso_sync_operation_result_type_t {
     TURSO_ASYNC_RESULT_CHANGES = 2,
     TURSO_ASYNC_RESULT_STATS = 3,
 }
-#[doc = " structure holding opaque pointer to the TursoDatabaseSyncChanges instance\n SAFETY: turso_sync_changes_t have independent lifetime and must be explicitly deallocated with turso_sync_changes_deinit method OR passed to the turso_sync_database_apply_changes method which gather ownership to this object"]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
-pub struct turso_sync_changes_t {
-    pub inner: *mut ::std::os::raw::c_void,
+pub struct turso_sync_changes {
+    _unused: [u8; 0],
 }
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of turso_sync_changes_t"][::std::mem::size_of::<turso_sync_changes_t>() - 8usize];
-    ["Alignment of turso_sync_changes_t"][::std::mem::align_of::<turso_sync_changes_t>() - 8usize];
-    ["Offset of field: turso_sync_changes_t::inner"]
-        [::std::mem::offset_of!(turso_sync_changes_t, inner) - 0usize];
-};
-impl Default for turso_sync_changes_t {
-    fn default() -> Self {
-        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
-        unsafe {
-            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
-            s.assume_init()
-        }
-    }
-}
+#[doc = " opaque pointer to the TursoDatabaseSyncChanges instance\n SAFETY: turso_sync_changes_t have independent lifetime and must be explicitly deallocated with turso_sync_changes_deinit method OR passed to the turso_sync_database_apply_changes method which gather ownership to this object"]
+pub type turso_sync_changes_t = turso_sync_changes;
 #[doc = " structure holding opaque pointer to the SyncEngineStats instance\n SAFETY: revision string will be valid only during async operation lifetime (until turso_sync_operation_deinit)\n Most likely, caller will need to copy revision slice to its internal buffer for longer lifetime"]
 #[repr(C)]
 pub struct turso_sync_stats_t {
@@ -239,59 +172,6 @@ impl Default for turso_sync_stats_t {
         }
     }
 }
-#[repr(C)]
-pub union turso_sync_operation_result_union_t {
-    pub connection: ::std::mem::ManuallyDrop<turso_connection_t>,
-    pub changes: ::std::mem::ManuallyDrop<turso_sync_changes_t>,
-    pub stats: ::std::mem::ManuallyDrop<turso_sync_stats_t>,
-}
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of turso_sync_operation_result_union_t"]
-        [::std::mem::size_of::<turso_sync_operation_result_union_t>() - 72usize];
-    ["Alignment of turso_sync_operation_result_union_t"]
-        [::std::mem::align_of::<turso_sync_operation_result_union_t>() - 8usize];
-    ["Offset of field: turso_sync_operation_result_union_t::connection"]
-        [::std::mem::offset_of!(turso_sync_operation_result_union_t, connection) - 0usize];
-    ["Offset of field: turso_sync_operation_result_union_t::changes"]
-        [::std::mem::offset_of!(turso_sync_operation_result_union_t, changes) - 0usize];
-    ["Offset of field: turso_sync_operation_result_union_t::stats"]
-        [::std::mem::offset_of!(turso_sync_operation_result_union_t, stats) - 0usize];
-};
-impl Default for turso_sync_operation_result_union_t {
-    fn default() -> Self {
-        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
-        unsafe {
-            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
-            s.assume_init()
-        }
-    }
-}
-#[repr(C)]
-pub struct turso_sync_operation_result_t {
-    pub type_: turso_sync_operation_result_type_t,
-    pub result: turso_sync_operation_result_union_t,
-}
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of turso_sync_operation_result_t"]
-        [::std::mem::size_of::<turso_sync_operation_result_t>() - 80usize];
-    ["Alignment of turso_sync_operation_result_t"]
-        [::std::mem::align_of::<turso_sync_operation_result_t>() - 8usize];
-    ["Offset of field: turso_sync_operation_result_t::type_"]
-        [::std::mem::offset_of!(turso_sync_operation_result_t, type_) - 0usize];
-    ["Offset of field: turso_sync_operation_result_t::result"]
-        [::std::mem::offset_of!(turso_sync_operation_result_t, result) - 8usize];
-};
-impl Default for turso_sync_operation_result_t {
-    fn default() -> Self {
-        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
-        unsafe {
-            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
-            s.assume_init()
-        }
-    }
-}
 #[doc = " Database sync description."]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -303,8 +183,8 @@ pub struct turso_sync_database_config_t {
     pub reserved_bytes: i32,
     pub partial_bootstrap_strategy_prefix: i32,
     pub partial_bootstrap_strategy_query: *const ::std::os::raw::c_char,
-    pub partial_boostrap_segment_size: usize,
-    pub partial_boostrap_speculative_load: bool,
+    pub partial_bootstrap_segment_size: usize,
+    pub partial_bootstrap_speculative_load: bool,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
@@ -332,13 +212,13 @@ const _: () = {
         partial_bootstrap_strategy_query
     )
         - 32usize];
-    ["Offset of field: turso_sync_database_config_t::partial_boostrap_segment_size"][::std::mem::offset_of!(
+    ["Offset of field: turso_sync_database_config_t::partial_bootstrap_segment_size"][::std::mem::offset_of!(
         turso_sync_database_config_t,
-        partial_boostrap_segment_size
+        partial_bootstrap_segment_size
     ) - 40usize];
-    ["Offset of field: turso_sync_database_config_t::partial_boostrap_speculative_load"][::std::mem::offset_of!(
+    ["Offset of field: turso_sync_database_config_t::partial_bootstrap_speculative_load"][::std::mem::offset_of!(
         turso_sync_database_config_t,
-        partial_boostrap_speculative_load
+        partial_bootstrap_speculative_load
     )
         - 48usize];
 };
@@ -351,380 +231,231 @@ impl Default for turso_sync_database_config_t {
         }
     }
 }
-#[doc = " structure holding opaque pointer to the TursoDatabaseSync instance"]
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
-pub struct turso_sync_database_t {
-    pub inner: *mut ::std::os::raw::c_void,
+pub struct turso_sync_database {
+    _unused: [u8; 0],
 }
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of turso_sync_database_t"][::std::mem::size_of::<turso_sync_database_t>() - 8usize];
-    ["Alignment of turso_sync_database_t"]
-        [::std::mem::align_of::<turso_sync_database_t>() - 8usize];
-    ["Offset of field: turso_sync_database_t::inner"]
-        [::std::mem::offset_of!(turso_sync_database_t, inner) - 0usize];
-};
-impl Default for turso_sync_database_t {
-    fn default() -> Self {
-        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
-        unsafe {
-            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
-            s.assume_init()
-        }
-    }
-}
-#[doc = " structure holding opaque pointer to the TursoAsyncOperation instance\n SAFETY: methods for the turso_sync_operation_t can't be called concurrently"]
+#[doc = " opaque pointer to the TursoDatabaseSync instance"]
+pub type turso_sync_database_t = turso_sync_database;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
-pub struct turso_sync_operation_t {
-    pub inner: *mut ::std::os::raw::c_void,
+pub struct turso_sync_operation {
+    _unused: [u8; 0],
 }
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of turso_sync_operation_t"][::std::mem::size_of::<turso_sync_operation_t>() - 8usize];
-    ["Alignment of turso_sync_operation_t"]
-        [::std::mem::align_of::<turso_sync_operation_t>() - 8usize];
-    ["Offset of field: turso_sync_operation_t::inner"]
-        [::std::mem::offset_of!(turso_sync_operation_t, inner) - 0usize];
-};
-impl Default for turso_sync_operation_t {
-    fn default() -> Self {
-        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
-        unsafe {
-            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
-            s.assume_init()
-        }
-    }
-}
-#[doc = " structure holding opaque pointer to the SyncEngineIoQueueItem instance"]
+#[doc = " opaque pointer to the TursoAsyncOperation instance\n SAFETY: methods for the turso_sync_operation_t can't be called concurrently"]
+pub type turso_sync_operation_t = turso_sync_operation;
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
-pub struct turso_sync_io_item_t {
-    pub inner: *mut ::std::os::raw::c_void,
+pub struct turso_sync_io_item {
+    _unused: [u8; 0],
 }
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of turso_sync_io_item_t"][::std::mem::size_of::<turso_sync_io_item_t>() - 8usize];
-    ["Alignment of turso_sync_io_item_t"][::std::mem::align_of::<turso_sync_io_item_t>() - 8usize];
-    ["Offset of field: turso_sync_io_item_t::inner"]
-        [::std::mem::offset_of!(turso_sync_io_item_t, inner) - 0usize];
-};
-impl Default for turso_sync_io_item_t {
-    fn default() -> Self {
-        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
-        unsafe {
-            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
-            s.assume_init()
-        }
-    }
-}
-#[doc = " METHODS"]
-#[repr(C)]
-pub struct turso_sync_database_new_result_t {
-    pub status: turso_status_t,
-    pub database_sync: turso_sync_database_t,
-}
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of turso_sync_database_new_result_t"]
-        [::std::mem::size_of::<turso_sync_database_new_result_t>() - 24usize];
-    ["Alignment of turso_sync_database_new_result_t"]
-        [::std::mem::align_of::<turso_sync_database_new_result_t>() - 8usize];
-    ["Offset of field: turso_sync_database_new_result_t::status"]
-        [::std::mem::offset_of!(turso_sync_database_new_result_t, status) - 0usize];
-    ["Offset of field: turso_sync_database_new_result_t::database_sync"]
-        [::std::mem::offset_of!(turso_sync_database_new_result_t, database_sync) - 16usize];
-};
-impl Default for turso_sync_database_new_result_t {
-    fn default() -> Self {
-        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
-        unsafe {
-            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
-            s.assume_init()
-        }
-    }
-}
+#[doc = " opaque pointer to the SyncEngineIoQueueItem instance"]
+pub type turso_sync_io_item_t = turso_sync_io_item;
 unsafe extern "C" {
     #[doc = " Create database sync holder but do not open it"]
     pub fn turso_sync_database_new(
-        db_config: turso_database_config_t,
-        sync_config: turso_sync_database_config_t,
-    ) -> turso_sync_database_new_result_t;
-}
-#[repr(C)]
-pub struct turso_sync_operation_return_t {
-    pub status: turso_status_t,
-    pub operation: turso_sync_operation_t,
-}
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of turso_sync_operation_return_t"]
-        [::std::mem::size_of::<turso_sync_operation_return_t>() - 24usize];
-    ["Alignment of turso_sync_operation_return_t"]
-        [::std::mem::align_of::<turso_sync_operation_return_t>() - 8usize];
-    ["Offset of field: turso_sync_operation_return_t::status"]
-        [::std::mem::offset_of!(turso_sync_operation_return_t, status) - 0usize];
-    ["Offset of field: turso_sync_operation_return_t::operation"]
-        [::std::mem::offset_of!(turso_sync_operation_return_t, operation) - 16usize];
-};
-impl Default for turso_sync_operation_return_t {
-    fn default() -> Self {
-        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
-        unsafe {
-            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
-            s.assume_init()
-        }
-    }
+        db_config: *const turso_database_config_t,
+        sync_config: *const turso_sync_database_config_t,
+        database: *mut *const turso_sync_database_t,
+        error_opt_out: *mut *const ::std::os::raw::c_char,
+    ) -> turso_status_code_t;
 }
 unsafe extern "C" {
     #[doc = " Prepare synced database for use (bootstrap if needed, setup necessary database parameters for first access)\n AsyncOperation returns None"]
-    pub fn turso_sync_database_init(self_: turso_sync_database_t) -> turso_sync_operation_return_t;
+    pub fn turso_sync_database_init(
+        self_: *const turso_sync_database_t,
+        operation: *mut *const turso_sync_operation_t,
+        error_opt_out: *mut *const ::std::os::raw::c_char,
+    ) -> turso_status_code_t;
 }
 unsafe extern "C" {
     #[doc = " Open prepared synced database, fail if no properly setup database exists\n AsyncOperation returns None"]
-    pub fn turso_sync_database_open(self_: turso_sync_database_t) -> turso_sync_operation_return_t;
+    pub fn turso_sync_database_open(
+        self_: *const turso_sync_database_t,
+        operation: *mut *const turso_sync_operation_t,
+        error_opt_out: *mut *const ::std::os::raw::c_char,
+    ) -> turso_status_code_t;
 }
 unsafe extern "C" {
     #[doc = " Open or prepared synced database or create it if no properly setup database exists\n AsyncOperation returns None"]
     pub fn turso_sync_database_create(
-        self_: turso_sync_database_t,
-    ) -> turso_sync_operation_return_t;
+        self_: *const turso_sync_database_t,
+        operation: *mut *const turso_sync_operation_t,
+        error_opt_out: *mut *const ::std::os::raw::c_char,
+    ) -> turso_status_code_t;
 }
 unsafe extern "C" {
     #[doc = " Create turso database connection\n SAFETY: synced database must be opened before that operation (with either turso_database_sync_create or turso_database_sync_open)\n AsyncOperation returns Connection"]
     pub fn turso_sync_database_connect(
-        self_: turso_sync_database_t,
-    ) -> turso_sync_operation_return_t;
+        self_: *const turso_sync_database_t,
+        operation: *mut *const turso_sync_operation_t,
+        error_opt_out: *mut *const ::std::os::raw::c_char,
+    ) -> turso_status_code_t;
 }
 unsafe extern "C" {
     #[doc = " Collect stats about synced database\n AsyncOperation returns Stats"]
-    pub fn turso_sync_database_stats(self_: turso_sync_database_t)
-        -> turso_sync_operation_return_t;
+    pub fn turso_sync_database_stats(
+        self_: *const turso_sync_database_t,
+        operation: *mut *const turso_sync_operation_t,
+        error_opt_out: *mut *const ::std::os::raw::c_char,
+    ) -> turso_status_code_t;
 }
 unsafe extern "C" {
     #[doc = " Checkpoint WAL of the synced database\n AsyncOperation returns None"]
     pub fn turso_sync_database_checkpoint(
-        self_: turso_sync_database_t,
-    ) -> turso_sync_operation_return_t;
+        self_: *const turso_sync_database_t,
+        operation: *mut *const turso_sync_operation_t,
+        error_opt_out: *mut *const ::std::os::raw::c_char,
+    ) -> turso_status_code_t;
 }
 unsafe extern "C" {
     #[doc = " Push local changes to remote\n AsyncOperation returns None"]
     pub fn turso_sync_database_push_changes(
-        self_: turso_sync_database_t,
-    ) -> turso_sync_operation_return_t;
+        self_: *const turso_sync_database_t,
+        operation: *mut *const turso_sync_operation_t,
+        error_opt_out: *mut *const ::std::os::raw::c_char,
+    ) -> turso_status_code_t;
 }
 unsafe extern "C" {
     #[doc = " Wait for remote changes\n AsyncOperation returns Changes (which must be properly deinited or used in the [turso_sync_database_apply_changes] method)"]
     pub fn turso_sync_database_wait_changes(
-        self_: turso_sync_database_t,
-    ) -> turso_sync_operation_return_t;
+        self_: *const turso_sync_database_t,
+        operation: *mut *const turso_sync_operation_t,
+        error_opt_out: *mut *const ::std::os::raw::c_char,
+    ) -> turso_status_code_t;
 }
 unsafe extern "C" {
-    #[doc = " Apply remote changes locally\n SAFETY: caller must guarantee that no other methods are executing concurrently (push/wait/checkpoint)\n otherwise, operation will return MISUSE error\n\n AsyncOperation returns None"]
+    #[doc = " Apply remote changes locally\n SAFETY: caller must guarantee that no other methods are executing concurrently (push/wait/checkpoint)\n otherwise, operation will return MISUSE error\n\n the method CONSUMES turso_sync_changes_t instance and caller no longer owns it after the call\n So, the changes MUST NOT be explicitly deallocated after the method call (either successful or not)\n\n AsyncOperation returns None"]
     pub fn turso_sync_database_apply_changes(
-        self_: turso_sync_database_t,
-        changes: turso_sync_changes_t,
-    ) -> turso_sync_operation_return_t;
-}
-#[repr(C)]
-pub struct turso_sync_changes_empty_result_t {
-    pub status: turso_status_t,
-    pub empty: bool,
-}
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of turso_sync_changes_empty_result_t"]
-        [::std::mem::size_of::<turso_sync_changes_empty_result_t>() - 24usize];
-    ["Alignment of turso_sync_changes_empty_result_t"]
-        [::std::mem::align_of::<turso_sync_changes_empty_result_t>() - 8usize];
-    ["Offset of field: turso_sync_changes_empty_result_t::status"]
-        [::std::mem::offset_of!(turso_sync_changes_empty_result_t, status) - 0usize];
-    ["Offset of field: turso_sync_changes_empty_result_t::empty"]
-        [::std::mem::offset_of!(turso_sync_changes_empty_result_t, empty) - 16usize];
-};
-impl Default for turso_sync_changes_empty_result_t {
-    fn default() -> Self {
-        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
-        unsafe {
-            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
-            s.assume_init()
-        }
-    }
-}
-unsafe extern "C" {
-    #[doc = " Return if no changes were fetched from remote"]
-    pub fn turso_sync_changes_empty(
-        changes: turso_sync_changes_t,
-    ) -> turso_sync_changes_empty_result_t;
-}
-#[repr(C)]
-pub struct turso_sync_operation_resume_result_t {
-    pub status: turso_status_t,
-    pub result: turso_sync_operation_result_t,
-}
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of turso_sync_operation_resume_result_t"]
-        [::std::mem::size_of::<turso_sync_operation_resume_result_t>() - 96usize];
-    ["Alignment of turso_sync_operation_resume_result_t"]
-        [::std::mem::align_of::<turso_sync_operation_resume_result_t>() - 8usize];
-    ["Offset of field: turso_sync_operation_resume_result_t::status"]
-        [::std::mem::offset_of!(turso_sync_operation_resume_result_t, status) - 0usize];
-    ["Offset of field: turso_sync_operation_resume_result_t::result"]
-        [::std::mem::offset_of!(turso_sync_operation_resume_result_t, result) - 16usize];
-};
-impl Default for turso_sync_operation_resume_result_t {
-    fn default() -> Self {
-        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
-        unsafe {
-            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
-            s.assume_init()
-        }
-    }
+        self_: *const turso_sync_database_t,
+        changes: *const turso_sync_changes_t,
+        operation: *mut *const turso_sync_operation_t,
+        error_opt_out: *mut *const ::std::os::raw::c_char,
+    ) -> turso_status_code_t;
 }
 unsafe extern "C" {
     #[doc = " Resume async operation\n If return error status - turso_status_t must be properly cleaned up\n If return TURSO_IO - caller must drive IO\n If return TURSO_DONE - caller must inspect result and clean up it or use it accordingly"]
     pub fn turso_sync_operation_resume(
-        self_: turso_sync_operation_t,
-    ) -> turso_sync_operation_resume_result_t;
+        self_: *const turso_sync_operation_t,
+        error_opt_out: *mut *const ::std::os::raw::c_char,
+    ) -> turso_status_code_t;
 }
-#[repr(C)]
-pub struct turso_sync_database_io_take_item_t {
-    pub status: turso_status_t,
-    pub result: turso_sync_io_item_t,
+unsafe extern "C" {
+    #[doc = " Extract operation result kind"]
+    pub fn turso_sync_operation_result_kind(
+        self_: *const turso_sync_operation_t,
+    ) -> turso_sync_operation_result_type_t;
 }
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of turso_sync_database_io_take_item_t"]
-        [::std::mem::size_of::<turso_sync_database_io_take_item_t>() - 24usize];
-    ["Alignment of turso_sync_database_io_take_item_t"]
-        [::std::mem::align_of::<turso_sync_database_io_take_item_t>() - 8usize];
-    ["Offset of field: turso_sync_database_io_take_item_t::status"]
-        [::std::mem::offset_of!(turso_sync_database_io_take_item_t, status) - 0usize];
-    ["Offset of field: turso_sync_database_io_take_item_t::result"]
-        [::std::mem::offset_of!(turso_sync_database_io_take_item_t, result) - 16usize];
-};
-impl Default for turso_sync_database_io_take_item_t {
-    fn default() -> Self {
-        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
-        unsafe {
-            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
-            s.assume_init()
-        }
-    }
+unsafe extern "C" {
+    #[doc = " Extract Connection result from finished async operation"]
+    pub fn turso_sync_operation_result_extract_connection(
+        self_: *const turso_sync_operation_t,
+        connection: *mut *const turso_connection_t,
+    ) -> turso_status_code_t;
+}
+unsafe extern "C" {
+    #[doc = " Extract Changes result from finished async operation\n If no changes were fetched - return TURSO_OK and set changes to null pointer"]
+    pub fn turso_sync_operation_result_extract_changes(
+        self_: *const turso_sync_operation_t,
+        changes: *mut *const turso_sync_changes_t,
+    ) -> turso_status_code_t;
+}
+unsafe extern "C" {
+    #[doc = " Extract Stats result from finished async operation"]
+    pub fn turso_sync_operation_result_extract_stats(
+        self_: *const turso_sync_operation_t,
+        stats: *mut turso_sync_stats_t,
+    ) -> turso_status_code_t;
 }
 unsafe extern "C" {
     #[doc = " Try to take IO request from the sync engine IO queue"]
     pub fn turso_sync_database_io_take_item(
-        self_: turso_sync_database_t,
-    ) -> turso_sync_database_io_take_item_t;
+        self_: *const turso_sync_database_t,
+        item: *mut *const turso_sync_io_item_t,
+        error_opt_out: *mut *const ::std::os::raw::c_char,
+    ) -> turso_status_code_t;
 }
 unsafe extern "C" {
     #[doc = " Run extra database callbacks after IO execution"]
-    pub fn turso_sync_database_io_step_callbacks(self_: turso_sync_database_t) -> turso_status_t;
-}
-#[repr(C)]
-pub struct turso_sync_database_io_request_t {
-    pub status: turso_status_t,
-    pub request: turso_sync_io_request_t,
-}
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of turso_sync_database_io_request_t"]
-        [::std::mem::size_of::<turso_sync_database_io_request_t>() - 80usize];
-    ["Alignment of turso_sync_database_io_request_t"]
-        [::std::mem::align_of::<turso_sync_database_io_request_t>() - 8usize];
-    ["Offset of field: turso_sync_database_io_request_t::status"]
-        [::std::mem::offset_of!(turso_sync_database_io_request_t, status) - 0usize];
-    ["Offset of field: turso_sync_database_io_request_t::request"]
-        [::std::mem::offset_of!(turso_sync_database_io_request_t, request) - 16usize];
-};
-impl Default for turso_sync_database_io_request_t {
-    fn default() -> Self {
-        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
-        unsafe {
-            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
-            s.assume_init()
-        }
-    }
+    pub fn turso_sync_database_io_step_callbacks(
+        self_: *const turso_sync_database_t,
+        error_opt_out: *mut *const ::std::os::raw::c_char,
+    ) -> turso_status_code_t;
 }
 unsafe extern "C" {
-    #[doc = " Get request reference from the IO request"]
-    pub fn turso_sync_database_io_request(
-        self_: turso_sync_io_item_t,
-    ) -> turso_sync_database_io_request_t;
-}
-#[repr(C)]
-pub struct turso_sync_database_io_request_header_t {
-    pub status: turso_status_t,
-    pub header: turso_sync_io_http_header_t,
-}
-#[allow(clippy::unnecessary_operation, clippy::identity_op)]
-const _: () = {
-    ["Size of turso_sync_database_io_request_header_t"]
-        [::std::mem::size_of::<turso_sync_database_io_request_header_t>() - 48usize];
-    ["Alignment of turso_sync_database_io_request_header_t"]
-        [::std::mem::align_of::<turso_sync_database_io_request_header_t>() - 8usize];
-    ["Offset of field: turso_sync_database_io_request_header_t::status"]
-        [::std::mem::offset_of!(turso_sync_database_io_request_header_t, status) - 0usize];
-    ["Offset of field: turso_sync_database_io_request_header_t::header"]
-        [::std::mem::offset_of!(turso_sync_database_io_request_header_t, header) - 16usize];
-};
-impl Default for turso_sync_database_io_request_header_t {
-    fn default() -> Self {
-        let mut s = ::std::mem::MaybeUninit::<Self>::uninit();
-        unsafe {
-            ::std::ptr::write_bytes(s.as_mut_ptr(), 0, 1);
-            s.assume_init()
-        }
-    }
+    #[doc = " Get request IO kind"]
+    pub fn turso_sync_database_io_request_kind(
+        self_: *const turso_sync_io_item_t,
+    ) -> turso_sync_io_request_type_t;
 }
 unsafe extern "C" {
-    #[doc = " Get HTTP request header reference from the IO request"]
-    pub fn turso_sync_database_io_request_header(
-        self_: turso_sync_io_item_t,
-        header_idx: i32,
-    ) -> turso_sync_database_io_request_header_t;
+    #[doc = " Get HTTP request header key-value pair"]
+    pub fn turso_sync_database_io_request_http(
+        self_: *const turso_sync_io_item_t,
+        request: *mut turso_sync_io_http_request_t,
+    ) -> turso_status_code_t;
+}
+unsafe extern "C" {
+    #[doc = " Get HTTP request fields"]
+    pub fn turso_sync_database_io_request_http_header(
+        self_: *const turso_sync_io_item_t,
+        index: usize,
+        header: *mut turso_sync_io_http_header_t,
+    ) -> turso_status_code_t;
+}
+unsafe extern "C" {
+    #[doc = " Get HTTP request fields"]
+    pub fn turso_sync_database_io_request_full_read(
+        self_: *const turso_sync_io_item_t,
+        request: *mut turso_sync_io_full_read_request_t,
+    ) -> turso_status_code_t;
+}
+unsafe extern "C" {
+    #[doc = " Get HTTP request fields"]
+    pub fn turso_sync_database_io_request_full_write(
+        self_: *const turso_sync_io_item_t,
+        request: *mut turso_sync_io_full_write_request_t,
+    ) -> turso_status_code_t;
 }
 unsafe extern "C" {
     #[doc = " Poison IO request completion with error"]
     pub fn turso_sync_database_io_poison(
-        self_: turso_sync_io_item_t,
-        error: turso_slice_ref_t,
-    ) -> turso_status_t;
+        self_: *const turso_sync_io_item_t,
+        error: *mut turso_slice_ref_t,
+    ) -> turso_status_code_t;
 }
 unsafe extern "C" {
     #[doc = " Set IO request completion status"]
     pub fn turso_sync_database_io_status(
-        self_: turso_sync_io_item_t,
+        self_: *const turso_sync_io_item_t,
         status: i32,
-    ) -> turso_status_t;
+    ) -> turso_status_code_t;
 }
 unsafe extern "C" {
     #[doc = " Push bytes to the IO completion buffer"]
     pub fn turso_sync_database_io_push_buffer(
-        self_: turso_sync_io_item_t,
-        buffer: turso_slice_ref_t,
-    ) -> turso_status_t;
+        self_: *const turso_sync_io_item_t,
+        buffer: *mut turso_slice_ref_t,
+    ) -> turso_status_code_t;
 }
 unsafe extern "C" {
     #[doc = " Set IO request completion as done"]
-    pub fn turso_sync_database_io_done(self_: turso_sync_io_item_t) -> turso_status_t;
+    pub fn turso_sync_database_io_done(self_: *const turso_sync_io_item_t) -> turso_status_code_t;
 }
 unsafe extern "C" {
     #[doc = " Deallocate a TursoDatabaseSync"]
-    pub fn turso_sync_database_deinit(self_: turso_sync_database_t);
+    pub fn turso_sync_database_deinit(self_: *const turso_sync_database_t);
 }
 unsafe extern "C" {
     #[doc = " Deallocate a TursoAsyncOperation"]
-    pub fn turso_sync_operation_deinit(self_: turso_sync_operation_t);
+    pub fn turso_sync_operation_deinit(self_: *const turso_sync_operation_t);
 }
 unsafe extern "C" {
     #[doc = " Deallocate a SyncEngineIoQueueItem"]
-    pub fn turso_sync_database_io_item_deinit(self_: turso_sync_io_item_t);
+    pub fn turso_sync_database_io_item_deinit(self_: *const turso_sync_io_item_t);
 }
 unsafe extern "C" {
     #[doc = " Deallocate a TursoDatabaseSyncChanges"]
-    pub fn turso_sync_changes_deinit(self_: turso_sync_changes_t);
+    pub fn turso_sync_changes_deinit(self_: *const turso_sync_changes_t);
 }

@@ -16,7 +16,11 @@ use turso_core::{
     DatabaseStorage, LimboError, OpenFlags, Statement, StepResult, IO,
 };
 
-use crate::{assert_send, assert_sync, capi, ConcurrentGuard};
+use crate::{
+    assert_send, assert_sync,
+    capi::{self, c},
+    ConcurrentGuard,
+};
 
 assert_send!(TursoDatabase, TursoConnection, TursoStatement);
 assert_sync!(TursoDatabase);
@@ -41,7 +45,7 @@ pub struct TursoSetupConfig {
     pub log_level: Option<String>,
 }
 
-fn logger_wrap(log: TursoLog<'_>, logger: unsafe extern "C" fn(capi::c::turso_log_t)) {
+fn logger_wrap(log: TursoLog<'_>, logger: unsafe extern "C" fn(*const c::turso_log_t)) {
     let Ok(message_cstr) = std::ffi::CString::new(log.message) else {
         return;
     };
@@ -52,7 +56,7 @@ fn logger_wrap(log: TursoLog<'_>, logger: unsafe extern "C" fn(capi::c::turso_lo
         return;
     };
     unsafe {
-        logger(capi::c::turso_log_t {
+        logger(&c::turso_log_t {
             message: message_cstr.as_ptr(),
             target: target_cstr.as_ptr(),
             file: file_cstr.as_ptr(),
@@ -74,15 +78,22 @@ impl TursoSetupConfig {
     /// this method is used in the capi wrappers
     ///
     /// # Safety
-    /// [capi::c::turso_config_t::log_level] field must be valid C-string pointer or null
-    pub unsafe fn from_capi(value: capi::c::turso_config_t) -> Result<Self, TursoError> {
+    /// [c::turso_config_t::log_level] field must be valid C-string pointer or null
+    pub unsafe fn from_capi(config: *const c::turso_config_t) -> Result<Self, TursoError> {
+        if config.is_null() {
+            return Err(TursoError {
+                code: TursoStatusCode::Misuse,
+                message: Some("config pointer must be not null".to_string()),
+            });
+        }
+        let config = *config;
         Ok(Self {
-            log_level: if !value.log_level.is_null() {
-                Some(str_from_c_str(value.log_level)?.to_string())
+            log_level: if !config.log_level.is_null() {
+                Some(str_from_c_str(config.log_level)?.to_string())
             } else {
                 None
             },
-            logger: if let Some(logger) = value.logger {
+            logger: if let Some(logger) = config.logger {
                 Some(Box::new(move |log| logger_wrap(log, logger)))
             } else {
                 None
@@ -112,74 +123,11 @@ pub struct TursoDatabaseConfig {
     pub db_file: Option<Arc<dyn DatabaseStorage>>,
 }
 
-pub fn value_from_c_value(value: capi::c::turso_value_t) -> Result<turso_core::Value, TursoError> {
-    match value.type_ {
-        capi::c::turso_type_t::TURSO_TYPE_NULL => Ok(turso_core::Value::Null),
-        capi::c::turso_type_t::TURSO_TYPE_INTEGER => {
-            Ok(turso_core::Value::Integer(unsafe { value.value.integer }))
-        }
-        capi::c::turso_type_t::TURSO_TYPE_REAL => {
-            Ok(turso_core::Value::Float(unsafe { value.value.real }))
-        }
-        capi::c::turso_type_t::TURSO_TYPE_TEXT => {
-            let text = std::str::from_utf8(bytes_from_turso_slice(unsafe { value.value.text })?);
-            let text = match text {
-                Ok(text) => text,
-                Err(err) => {
-                    return Err(TursoError {
-                        code: TursoStatusCode::Misuse,
-                        message: Some(format!("expected utf-8 string: {err}")),
-                    })
-                }
-            };
-            Ok(turso_core::Value::Text(turso_core::types::Text::new(
-                // convert to_string explicitly in order to avoid potential dangling references
-                text.to_string(),
-            )))
-        }
-        capi::c::turso_type_t::TURSO_TYPE_BLOB => {
-            let blob = bytes_from_turso_slice(unsafe { value.value.blob })?;
-            Ok(turso_core::Value::Blob(blob.to_vec()))
-        }
-    }
-}
-
 pub fn turso_slice_from_bytes(bytes: &[u8]) -> capi::c::turso_slice_ref_t {
     capi::c::turso_slice_ref_t {
         ptr: bytes.as_ptr() as *const std::ffi::c_void,
         len: bytes.len(),
     }
-}
-
-/// SAFETY: slice must points to the valid memory
-pub fn str_from_turso_slice<'a>(slice: capi::c::turso_slice_ref_t) -> Result<&'a str, TursoError> {
-    if slice.ptr.is_null() {
-        return Err(TursoError {
-            code: TursoStatusCode::Misuse,
-            message: Some("expected slice representing utf-8 value, got null".to_string()),
-        });
-    }
-    let s = unsafe { std::slice::from_raw_parts(slice.ptr as *const u8, slice.len) };
-    match std::str::from_utf8(s) {
-        Ok(s) => Ok(s),
-        Err(err) => Err(TursoError {
-            code: TursoStatusCode::Misuse,
-            message: Some(format!("expected slice representing utf-8 value: {err}")),
-        }),
-    }
-}
-
-/// SAFETY: slice must points to the valid memory
-pub fn bytes_from_turso_slice<'a>(
-    slice: capi::c::turso_slice_ref_t,
-) -> Result<&'a [u8], TursoError> {
-    if slice.ptr.is_null() {
-        return Err(TursoError {
-            code: TursoStatusCode::Misuse,
-            message: Some("expected slice representing utf-8 value, got null".to_string()),
-        });
-    }
-    Ok(unsafe { std::slice::from_raw_parts(slice.ptr as *const u8, slice.len) })
 }
 
 /// # Safety
@@ -203,22 +151,96 @@ pub unsafe fn str_from_c_str<'a>(ptr: *const std::ffi::c_char) -> Result<&'a str
     }
 }
 
+/// # Safety
+/// memory range [ptr..ptr + len) must be valid
+pub unsafe fn str_from_slice<'a>(
+    ptr: *const std::ffi::c_char,
+    len: usize,
+) -> Result<&'a str, TursoError> {
+    let slice = bytes_from_slice(ptr, len)?;
+    match std::str::from_utf8(slice) {
+        Ok(s) => Ok(s),
+        Err(err) => Err(TursoError {
+            code: TursoStatusCode::Misuse,
+            message: Some(format!(
+                "expected string slice representing utf-8 value: {err}"
+            )),
+        }),
+    }
+}
+
+/// # Safety
+/// memory range [ptr..ptr + len) must be valid
+pub unsafe fn bytes_from_slice<'a>(
+    ptr: *const std::ffi::c_char,
+    len: usize,
+) -> Result<&'a [u8], TursoError> {
+    if len == 0 {
+        return Ok(&[]);
+    }
+    if ptr.is_null() {
+        return Err(TursoError {
+            code: TursoStatusCode::Misuse,
+            message: Some("expected slice, got null pointer".to_string()),
+        });
+    }
+    Ok(std::slice::from_raw_parts(ptr as *const u8, len))
+}
+
+/// SAFETY: slice must points to the valid memory
+pub fn bytes_from_turso_slice<'a>(
+    slice: capi::c::turso_slice_ref_t,
+) -> Result<&'a [u8], TursoError> {
+    if slice.ptr.is_null() {
+        return Err(TursoError {
+            code: TursoStatusCode::Misuse,
+            message: Some("expected slice representing utf-8 value, got null".to_string()),
+        });
+    }
+    Ok(unsafe { std::slice::from_raw_parts(slice.ptr as *const u8, slice.len) })
+}
+
+/// SAFETY: slice must points to the valid memory
+pub fn str_from_turso_slice<'a>(slice: capi::c::turso_slice_ref_t) -> Result<&'a str, TursoError> {
+    if slice.ptr.is_null() {
+        return Err(TursoError {
+            code: TursoStatusCode::Misuse,
+            message: Some("expected slice representing utf-8 value, got null".to_string()),
+        });
+    }
+    let s = unsafe { std::slice::from_raw_parts(slice.ptr as *const u8, slice.len) };
+    match std::str::from_utf8(s) {
+        Ok(s) => Ok(s),
+        Err(err) => Err(TursoError {
+            code: TursoStatusCode::Misuse,
+            message: Some(format!("expected slice representing utf-8 value: {err}")),
+        }),
+    }
+}
+
 impl TursoDatabaseConfig {
     /// helper method to restore [TursoSetupConfig] instance from C representation
     /// this method is used in the capi wrappers
     ///
     /// # Safety
-    /// [capi::c::turso_database_config_t::path] field must be valid C-string pointer
-    /// [capi::c::turso_database_config_t::experimental_features] field must be valid C-string pointer or null
-    pub unsafe fn from_capi(value: capi::c::turso_database_config_t) -> Result<Self, TursoError> {
+    /// [c::turso_database_config_t::path] field must be valid C-string pointer
+    /// [c::turso_database_config_t::experimental_features] field must be valid C-string pointer or null
+    pub unsafe fn from_capi(config: *const c::turso_database_config_t) -> Result<Self, TursoError> {
+        if config.is_null() {
+            return Err(TursoError {
+                code: TursoStatusCode::Misuse,
+                message: Some("config pointer must be not null".to_string()),
+            });
+        }
+        let config = *config;
         Ok(Self {
-            path: str_from_c_str(value.path)?.to_string(),
-            experimental_features: if !value.experimental_features.is_null() {
-                Some(str_from_c_str(value.experimental_features)?.to_string())
+            path: str_from_c_str(config.path)?.to_string(),
+            experimental_features: if !config.experimental_features.is_null() {
+                Some(str_from_c_str(config.experimental_features)?.to_string())
             } else {
                 None
             },
-            async_io: value.async_io,
+            async_io: config.async_io,
             io: None,
             db_file: None,
         })
@@ -249,24 +271,21 @@ pub enum TursoStatusCode {
 }
 
 impl TursoStatusCode {
-    pub fn to_capi(self) -> capi::c::turso_status_t {
-        capi::c::turso_status_t {
-            code: match self {
-                TursoStatusCode::Ok => capi::c::turso_status_code_t::TURSO_OK,
-                TursoStatusCode::Done => capi::c::turso_status_code_t::TURSO_DONE,
-                TursoStatusCode::Row => capi::c::turso_status_code_t::TURSO_ROW,
-                TursoStatusCode::Io => capi::c::turso_status_code_t::TURSO_IO,
-                TursoStatusCode::Busy => capi::c::turso_status_code_t::TURSO_BUSY,
-                TursoStatusCode::Interrupt => capi::c::turso_status_code_t::TURSO_INTERRUPT,
-                TursoStatusCode::Error => capi::c::turso_status_code_t::TURSO_ERROR,
-                TursoStatusCode::Misuse => capi::c::turso_status_code_t::TURSO_MISUSE,
-                TursoStatusCode::Constraint => capi::c::turso_status_code_t::TURSO_CONSTRAINT,
-                TursoStatusCode::Readonly => capi::c::turso_status_code_t::TURSO_READONLY,
-                TursoStatusCode::DatabaseFull => capi::c::turso_status_code_t::TURSO_DATABASE_FULL,
-                TursoStatusCode::NotAdb => capi::c::turso_status_code_t::TURSO_NOTADB,
-                TursoStatusCode::Corrupt => capi::c::turso_status_code_t::TURSO_CORRUPT,
-            },
-            error: std::ptr::null(),
+    pub fn to_capi(self) -> capi::c::turso_status_code_t {
+        match self {
+            TursoStatusCode::Ok => capi::c::turso_status_code_t::TURSO_OK,
+            TursoStatusCode::Done => capi::c::turso_status_code_t::TURSO_DONE,
+            TursoStatusCode::Row => capi::c::turso_status_code_t::TURSO_ROW,
+            TursoStatusCode::Io => capi::c::turso_status_code_t::TURSO_IO,
+            TursoStatusCode::Busy => capi::c::turso_status_code_t::TURSO_BUSY,
+            TursoStatusCode::Interrupt => capi::c::turso_status_code_t::TURSO_INTERRUPT,
+            TursoStatusCode::Error => capi::c::turso_status_code_t::TURSO_ERROR,
+            TursoStatusCode::Misuse => capi::c::turso_status_code_t::TURSO_MISUSE,
+            TursoStatusCode::Constraint => capi::c::turso_status_code_t::TURSO_CONSTRAINT,
+            TursoStatusCode::Readonly => capi::c::turso_status_code_t::TURSO_READONLY,
+            TursoStatusCode::DatabaseFull => capi::c::turso_status_code_t::TURSO_DATABASE_FULL,
+            TursoStatusCode::NotAdb => capi::c::turso_status_code_t::TURSO_NOTADB,
+            TursoStatusCode::Corrupt => capi::c::turso_status_code_t::TURSO_CORRUPT,
         }
     }
 }
@@ -275,6 +294,25 @@ impl TursoStatusCode {
 pub struct TursoError {
     pub code: TursoStatusCode,
     pub message: Option<String>,
+}
+
+impl TursoError {
+    /// # Safety
+    /// error_opt_out must be a valid pointer or null
+    pub unsafe fn to_capi(
+        &self,
+        error_opt_out: *mut *const std::ffi::c_char,
+    ) -> capi::c::turso_status_code_t {
+        if !error_opt_out.is_null() {
+            let message = if let Some(message) = &self.message {
+                str_to_c_string(message)
+            } else {
+                std::ptr::null_mut()
+            };
+            unsafe { *error_opt_out = message };
+        }
+        self.code.to_capi()
+    }
 }
 
 impl Display for TursoError {
@@ -292,18 +330,6 @@ pub fn str_to_c_string(message: &str) -> *const std::ffi::c_char {
 
 pub fn c_string_to_str(ptr: *const std::ffi::c_char) -> std::ffi::CString {
     unsafe { std::ffi::CString::from_raw(ptr as *mut std::ffi::c_char) }
-}
-
-impl TursoError {
-    pub fn to_capi(self) -> capi::c::turso_status_t {
-        capi::c::turso_status_t {
-            code: self.code.to_capi().code,
-            error: match self.message {
-                Some(message) => str_to_c_string(&message),
-                None => std::ptr::null(),
-            },
-        }
-    }
 }
 
 fn turso_error_from_limbo_error(err: LimboError) -> TursoError {
@@ -511,10 +537,8 @@ impl TursoDatabase {
 
     /// helper method to get C raw container with TursoDatabase instance
     /// this method is used in the capi wrappers
-    pub fn to_capi(self: Arc<Self>) -> capi::c::turso_database_t {
-        capi::c::turso_database_t {
-            inner: Arc::into_raw(self) as *mut std::ffi::c_void,
-        }
+    pub fn to_capi(self: Arc<Self>) -> *mut capi::c::turso_database_t {
+        Arc::into_raw(self) as *mut capi::c::turso_database_t
     }
 
     /// helper method to restore TursoDatabase ref from C raw container
@@ -523,15 +547,15 @@ impl TursoDatabase {
     /// # Safety
     /// value must be a pointer returned from [Self::to_capi] method
     pub unsafe fn ref_from_capi<'a>(
-        value: capi::c::turso_database_t,
+        value: *const capi::c::turso_database_t,
     ) -> Result<&'a Self, TursoError> {
-        if value.inner.is_null() {
+        if value.is_null() {
             Err(TursoError {
                 code: TursoStatusCode::Misuse,
                 message: Some("got null pointer".to_string()),
             })
         } else {
-            Ok(&*(value.inner as *const Self))
+            Ok(&*(value as *const Self))
         }
     }
 
@@ -540,8 +564,8 @@ impl TursoDatabase {
     ///
     /// # Safety
     /// value must be a pointer returned from [Self::to_capi] method
-    pub unsafe fn arc_from_capi(value: capi::c::turso_database_t) -> Arc<Self> {
-        Arc::from_raw(value.inner as *const Self)
+    pub unsafe fn arc_from_capi(value: *const capi::c::turso_database_t) -> Arc<Self> {
+        Arc::from_raw(value as *const Self)
     }
 }
 
@@ -561,6 +585,9 @@ impl TursoConnection {
     }
     pub fn get_auto_commit(&self) -> bool {
         self.connection.get_auto_commit()
+    }
+    pub fn last_insert_rowid(&self) -> i64 {
+        self.connection.last_insert_rowid()
     }
     /// prepares single SQL statement
     pub fn prepare_single(&self, sql: impl AsRef<str>) -> Result<Box<TursoStatement>, TursoError> {
@@ -603,10 +630,8 @@ impl TursoConnection {
 
     /// helper method to get C raw container to the TursoConnection instance
     /// this method is used in the capi wrappers
-    pub fn to_capi(self: Arc<Self>) -> capi::c::turso_connection_t {
-        capi::c::turso_connection_t {
-            inner: Arc::into_raw(self) as *mut std::ffi::c_void,
-        }
+    pub fn to_capi(self: Arc<Self>) -> *mut capi::c::turso_connection_t {
+        Arc::into_raw(self) as *mut capi::c::turso_connection_t
     }
 
     /// helper method to restore TursoConnection ref from C raw container
@@ -615,15 +640,15 @@ impl TursoConnection {
     /// # Safety
     /// value must be a pointer returned from [Self::to_capi] method
     pub unsafe fn ref_from_capi<'a>(
-        value: capi::c::turso_connection_t,
+        value: *const capi::c::turso_connection_t,
     ) -> Result<&'a Self, TursoError> {
-        if value.inner.is_null() {
+        if value.is_null() {
             Err(TursoError {
                 code: TursoStatusCode::Misuse,
                 message: Some("got null pointer".to_string()),
             })
         } else {
-            Ok(&*(value.inner as *const Self))
+            Ok(&*(value as *const Self))
         }
     }
 
@@ -632,8 +657,8 @@ impl TursoConnection {
     ///
     /// # Safety
     /// value must be a pointer returned from [Self::to_capi] method
-    pub unsafe fn arc_from_capi(value: capi::c::turso_connection_t) -> Arc<Self> {
-        Arc::from_raw(value.inner as *const Self)
+    pub unsafe fn arc_from_capi(value: *const capi::c::turso_connection_t) -> Arc<Self> {
+        Arc::from_raw(value as *const Self)
     }
 }
 
@@ -650,6 +675,10 @@ pub struct TursoExecutionResult {
 }
 
 impl TursoStatement {
+    /// returns parameters count for the statement
+    pub fn parameters_count(&self) -> usize {
+        self.statement.parameters_count()
+    }
     /// binds positional parameter at the corresponding index (1-based)
     pub fn bind_positional(
         &mut self,
@@ -666,12 +695,8 @@ impl TursoStatement {
         self.statement.bind_at(index, value);
         Ok(())
     }
-    /// binds named parameter (name MUST omit named-parameter control character, e.g. '@', '$' or ':')
-    pub fn bind_named(
-        &mut self,
-        name: impl AsRef<str>,
-        value: turso_core::Value,
-    ) -> Result<(), TursoError> {
+    /// named parameter position (name MUST omit named-parameter control character, e.g. '@', '$' or ':')
+    pub fn named_position(&mut self, name: impl AsRef<str>) -> Result<usize, TursoError> {
         let parameters = self.statement.parameters();
         for i in 1..parameters.next_index().get() {
             // i is positive - so conversion to NonZero<> type will always succeed
@@ -692,8 +717,7 @@ impl TursoStatement {
                 });
             }
             if name.as_ref() == &parameter[1..] {
-                self.statement.bind_at(index, value);
-                return Ok(());
+                return Ok(index.into());
             }
         }
 
@@ -739,7 +763,7 @@ impl TursoStatement {
         }
     }
     /// execute statement to completion
-    /// method returns [TursoStatusCode::Ok] if execution completed
+    /// method returns [TursoStatusCode::Done] if execution completed
     /// method returns [TursoStatusCode::Io] if async_io was set and execution needs IO in order to make progress
     pub fn execute(&mut self) -> Result<TursoExecutionResult, TursoError> {
         let guard = self.concurrent_guard.clone();
@@ -756,7 +780,7 @@ impl TursoStatement {
                 });
             } else if status == TursoStatusCode::Done {
                 return Ok(TursoExecutionResult {
-                    status: TursoStatusCode::Ok,
+                    status: TursoStatusCode::Done,
                     rows_changed: self.statement.n_change() as u64,
                 });
             }
@@ -829,10 +853,8 @@ impl TursoStatement {
 
     /// helper method to get C raw container to the TursoStatement instance
     /// this method is used in the capi wrappers
-    pub fn to_capi(self: Box<Self>) -> capi::c::turso_statement_t {
-        capi::c::turso_statement_t {
-            inner: Box::into_raw(self) as *mut std::ffi::c_void,
-        }
+    pub fn to_capi(self: Box<Self>) -> *mut capi::c::turso_statement_t {
+        Box::into_raw(self) as *mut capi::c::turso_statement_t
     }
 
     /// helper method to restore TursoStatement ref from C raw container
@@ -841,15 +863,15 @@ impl TursoStatement {
     /// # Safety
     /// value must be a pointer returned from [Self::to_capi] method
     pub unsafe fn ref_from_capi<'a>(
-        value: capi::c::turso_statement_t,
+        value: *const capi::c::turso_statement_t,
     ) -> Result<&'a mut Self, TursoError> {
-        if value.inner.is_null() {
+        if value.is_null() {
             Err(TursoError {
                 code: TursoStatusCode::Misuse,
                 message: Some("got null pointer".to_string()),
             })
         } else {
-            Ok(&mut *(value.inner as *mut Self))
+            Ok(&mut *(value as *mut Self))
         }
     }
 
@@ -858,8 +880,8 @@ impl TursoStatement {
     ///
     /// # Safety
     /// value must be a pointer returned from [Self::to_capi] method
-    pub unsafe fn box_from_capi(value: capi::c::turso_statement_t) -> Box<Self> {
-        Box::from_raw(value.inner as *mut Self)
+    pub unsafe fn box_from_capi(value: *const capi::c::turso_statement_t) -> Box<Self> {
+        Box::from_raw(value as *mut Self)
     }
 }
 
@@ -913,6 +935,6 @@ mod tests {
         let mut stmt = conn
             .prepare_single("SELECT * FROM generate_series(1, 10000)")
             .unwrap();
-        assert_eq!(stmt.execute().unwrap().status, TursoStatusCode::Ok);
+        assert_eq!(stmt.execute().unwrap().status, TursoStatusCode::Done);
     }
 }
