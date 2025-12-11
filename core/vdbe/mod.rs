@@ -206,29 +206,6 @@ impl RegexCache {
     }
 }
 
-struct Bitfield<const N: usize>([u64; N]);
-
-impl<const N: usize> Bitfield<N> {
-    fn new() -> Self {
-        Self([0; N])
-    }
-
-    fn set(&mut self, bit: usize) {
-        assert!(bit < N * 64, "bit out of bounds");
-        self.0[bit / 64] |= 1 << (bit % 64);
-    }
-
-    fn unset(&mut self, bit: usize) {
-        assert!(bit < N * 64, "bit out of bounds");
-        self.0[bit / 64] &= !(1 << (bit % 64));
-    }
-
-    fn get(&self, bit: usize) -> bool {
-        assert!(bit < N * 64, "bit out of bounds");
-        (self.0[bit / 64] & (1 << (bit % 64))) != 0
-    }
-}
-
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 /// The commit state of the program.
@@ -348,7 +325,9 @@ pub struct ProgramState {
     pub(crate) result_row: Option<Row>,
     last_compare: Option<std::cmp::Ordering>,
     deferred_seeks: Vec<Option<(CursorID, CursorID)>>,
-    ended_coroutine: Bitfield<4>, // flag to indicate that a coroutine has ended (key is the yield register. currently we assume that the yield register is always between 0-255, YOLO)
+    /// Indicate whether a coroutine has ended for a given yield register.
+    /// If an element is present, it means the coroutine with the given register number has ended.
+    ended_coroutine: Vec<u32>,
     /// Indicate whether an [Insn::Once] instruction at a given program counter position has already been executed, well, once.
     once: SmallVec<u32, 4>,
     regex_cache: RegexCache,
@@ -425,7 +404,7 @@ impl ProgramState {
             result_row: None,
             last_compare: None,
             deferred_seeks: vec![None; max_cursors],
-            ended_coroutine: Bitfield::new(),
+            ended_coroutine: vec![],
             once: SmallVec::<u32, 4>::new(),
             regex_cache: RegexCache::new(),
             execution_state: ProgramExecutionState::Init,
@@ -521,7 +500,7 @@ impl ProgramState {
             .for_each(|r| *r = Register::Value(Value::Null));
         self.last_compare = None;
         self.deferred_seeks.iter_mut().for_each(|s| *s = None);
-        self.ended_coroutine.0 = [0; 4];
+        self.ended_coroutine.clear();
         self.regex_cache.like.clear();
         self.execution_state = ProgramExecutionState::Init;
         self.current_collation = None;
