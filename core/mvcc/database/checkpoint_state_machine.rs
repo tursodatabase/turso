@@ -15,6 +15,7 @@ use crate::{
 };
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
+use std::num::NonZeroU64;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
@@ -75,7 +76,7 @@ pub struct CheckpointStateMachine<Clock: LogicalClock> {
     /// released if the state machine fails.
     lock_states: LockStates,
     /// The highest transaction ID that has been checkpointed in a previous checkpoint.
-    checkpointed_txid_max_old: u64,
+    checkpointed_txid_max_old: Option<NonZeroU64>,
     /// The highest transaction ID that will be checkpointed in the current checkpoint.
     checkpointed_txid_max_new: u64,
     /// Pager used for writing to the B-tree
@@ -160,6 +161,8 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 )
             })
             .collect();
+        let checkpoint_tx_max = mvstore.checkpointed_txid_max.load(Ordering::SeqCst);
+        let checkpointed_txid_max_old = NonZeroU64::new(checkpoint_tx_max);
         Self {
             state: CheckpointState::AcquireLock,
             lock_states: LockStates {
@@ -168,7 +171,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 pager_write_tx: false,
             },
             pager,
-            checkpointed_txid_max_old: mvstore.checkpointed_txid_max.load(Ordering::SeqCst),
+            checkpointed_txid_max_old,
             checkpointed_txid_max_new: mvstore.checkpointed_txid_max.load(Ordering::SeqCst),
             mvstore,
             connection,
@@ -200,14 +203,20 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             let mut begin_ts = None;
             if let Some(TxTimestampOrID::Timestamp(b)) = version.begin {
                 begin_ts = Some(b);
-                if b <= self.checkpointed_txid_max_old {
+                if self
+                    .checkpointed_txid_max_old
+                    .is_some_and(|txid_max_old| b <= txid_max_old.into())
+                {
                     exists_in_db_file = true;
                 }
             }
             let mut end_ts = None;
             if let Some(TxTimestampOrID::Timestamp(e)) = version.end {
                 end_ts = Some(e);
-                if e <= self.checkpointed_txid_max_old {
+                if self
+                    .checkpointed_txid_max_old
+                    .is_some_and(|txid_max_old| e <= txid_max_old.into())
+                {
                     exists_in_db_file = false;
                 }
             }
@@ -215,9 +224,16 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 continue;
             }
             // Should checkpoint the newest version if:
-            // - It is not a delete and it hasn't been checkpointed yet (begin_ts > max_old), OR
-            let is_uncheckpointed_insert =
-                end_ts.is_none() && begin_ts.is_some_and(|b| b > self.checkpointed_txid_max_old);
+            // - It is not a delete and it hasn't been checkpointed yet OR (begin_ts > max_old)
+            // Note: We use >= because rows recovered from the logical log have begin_ts = 0,
+            // We need the `self.checkpointed_txid_max_old.is_none()` check as we may have not checkpointed yet,
+            // and without this check, recovered rows could skipped accidently
+            let is_uncheckpointed_insert = end_ts.is_none()
+                && (self.checkpointed_txid_max_old.is_none()
+                    || begin_ts.is_some_and(|b| {
+                        self.checkpointed_txid_max_old
+                            .is_some_and(|txid_max_old| b > txid_max_old.into())
+                    }));
             // - It is a delete, AND some version of the row exists in the database file.
             let is_delete_and_exists_in_db_file = end_ts.is_some() && exists_in_db_file;
             let should_checkpoint = is_uncheckpointed_insert || is_delete_and_exists_in_db_file;
@@ -258,10 +274,10 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
 
             for version in row_versions.iter() {
                 if let Some(TxTimestampOrID::Timestamp(ts)) = version.begin {
-                    max_timestamp = max_timestamp.max(ts);
+                    max_timestamp = max_timestamp.max(NonZeroU64::new(ts));
                 }
                 if let Some(TxTimestampOrID::Timestamp(ts)) = version.end {
-                    max_timestamp = max_timestamp.max(ts);
+                    max_timestamp = max_timestamp.max(NonZeroU64::new(ts));
                 }
             }
 
@@ -386,7 +402,10 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 version.0.row.id.row_id.clone(),
             )
         });
-        self.checkpointed_txid_max_new = self.checkpointed_txid_max_new.max(max_timestamp);
+        self.checkpointed_txid_max_new = max_timestamp
+            .map_or(self.checkpointed_txid_max_new, |max_timestamp| {
+                self.checkpointed_txid_max_new.max(max_timestamp.into())
+            });
     }
 
     /// Collect all committed index row versions that need to be written to the B-tree.
@@ -412,10 +431,10 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
 
                 for version in versions.iter() {
                     if let Some(TxTimestampOrID::Timestamp(ts)) = version.begin {
-                        max_timestamp = max_timestamp.max(ts);
+                        max_timestamp = max_timestamp.max(NonZeroU64::new(ts));
                     }
                     if let Some(TxTimestampOrID::Timestamp(ts)) = version.end {
-                        max_timestamp = max_timestamp.max(ts);
+                        max_timestamp = max_timestamp.max(NonZeroU64::new(ts));
                     }
                 }
 
@@ -429,7 +448,10 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             }
         }
 
-        self.checkpointed_txid_max_new = self.checkpointed_txid_max_new.max(max_timestamp);
+        self.checkpointed_txid_max_new = max_timestamp
+            .map_or(self.checkpointed_txid_max_new, |max_timestamp| {
+                self.checkpointed_txid_max_new.max(max_timestamp.into())
+            });
     }
 
     /// Get the current row version to write to the B-tree
