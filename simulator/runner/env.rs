@@ -258,10 +258,12 @@ where
                     committed.indexes = current_table.indexes.clone();
                     committed.columns = current_table.columns.clone();
                 } else {
-                    // New table created in transaction
-                    let mut new_table = current_table.clone();
-                    new_table.rows = Vec::new();
-                    self.commited_tables.push(new_table);
+                    // New table created in transaction - copy with rows intact.
+                    // The rows are already correct in current_tables since all insert
+                    // operations were applied there during the transaction.
+                    // We don't need to replay operations for new tables since the
+                    // inserts were skipped above (table didn't exist in committed_tables).
+                    self.commited_tables.push(current_table.clone());
                 }
             }
         }
