@@ -51,3 +51,4 @@ bisected.sql
 
 *.db-log
 settings.local.json
+.build-hash
