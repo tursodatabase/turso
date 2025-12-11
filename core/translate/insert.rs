@@ -972,6 +972,7 @@ fn emit_notnulls(
     resolver: &Resolver,
 ) -> Result<Option<BranchOffset>> {
     let on_replace = matches!(ctx.on_conflict, ResolveType::Replace);
+    let on_ignore = matches!(ctx.on_conflict, ResolveType::Ignore);
     let mut pending_resume_label = None;
     for column_mapping in insertion
         .col_mappings
@@ -1024,32 +1025,41 @@ fn emit_notnulls(
             }
             // OR REPLACE but no DEFAULT, fall through to ABORT behavior
         }
-        program.emit_insn(Insn::HaltIfNull {
-            target_reg: column_mapping.register,
-            err_code: SQLITE_CONSTRAINT_NOTNULL,
-            description: {
-                let mut description = String::with_capacity(
-                    ctx.table.name.as_str().len()
-                        + column_mapping
+
+        // For INSERT OR IGNORE, skip to the next row if NULL
+        if on_ignore {
+            program.emit_insn(Insn::IsNull {
+                reg: column_mapping.register,
+                target_pc: ctx.row_done_label,
+            });
+        } else {
+            program.emit_insn(Insn::HaltIfNull {
+                target_reg: column_mapping.register,
+                err_code: SQLITE_CONSTRAINT_NOTNULL,
+                description: {
+                    let mut description = String::with_capacity(
+                        ctx.table.name.as_str().len()
+                            + column_mapping
+                                .column
+                                .name
+                                .as_ref()
+                                .expect("Column name must be present")
+                                .len()
+                            + 2,
+                    );
+                    description.push_str(ctx.table.name.as_str());
+                    description.push('.');
+                    description.push_str(
+                        column_mapping
                             .column
                             .name
                             .as_ref()
-                            .expect("Column name must be present")
-                            .len()
-                        + 2,
-                );
-                description.push_str(ctx.table.name.as_str());
-                description.push('.');
-                description.push_str(
-                    column_mapping
-                        .column
-                        .name
-                        .as_ref()
-                        .expect("Column name must be present"),
-                );
-                description
-            },
-        });
+                            .expect("Column name must be present"),
+                    );
+                    description
+                },
+            });
+        }
     }
     Ok(pending_resume_label)
 }

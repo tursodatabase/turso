@@ -108,7 +108,7 @@ pub fn translate(
 
     program.epilogue(schema);
 
-    Ok(program.build(connection, change_cnt_on, input))
+    program.build(connection, change_cnt_on, input)
 }
 
 // TODO: for now leaving the return value as a Program. But ideally to support nested parsing of arbitraty

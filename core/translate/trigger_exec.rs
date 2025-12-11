@@ -567,7 +567,8 @@ fn execute_trigger_commands(
         )?;
     }
     subprogram_builder.epilogue(resolver.schema);
-    let built_subprogram = subprogram_builder.build(connection.clone(), true, "trigger subprogram");
+    let built_subprogram =
+        subprogram_builder.build(connection.clone(), true, "trigger subprogram")?;
 
     let mut params = Vec::with_capacity(
         ctx.new_registers.as_ref().map(|r| r.len()).unwrap_or(0)

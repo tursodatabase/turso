@@ -39,7 +39,7 @@ public final class JDBC4PreparedStatement extends JDBC4Statement implements Prep
     super(connection);
     this.sql = sql;
     this.statement = connection.prepare(sql);
-    this.resultSet = new JDBC4ResultSet(this.statement.getResultSet());
+    this.resultSet = new JDBC4ResultSet(this.statement.getResultSet(), this);
     this.paramCount = statement.parameterCount();
     this.currentBatchParams = new Object[paramCount];
   }
