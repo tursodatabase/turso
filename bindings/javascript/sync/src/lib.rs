@@ -388,9 +388,9 @@ impl SyncEngine {
             let sync_engine = try_unwrap(&sync_engine)?;
             let stats = sync_engine.stats(coro).await?;
             Ok(Some(GeneratorResponse::SyncEngineStats {
-                operations: stats.cdc_operations,
-                main_wal: stats.main_wal_size as i64,
-                revert_wal: stats.revert_wal_size as i64,
+                cdc_operations: stats.cdc_operations,
+                main_wal_size: stats.main_wal_size as i64,
+                revert_wal_size: stats.revert_wal_size as i64,
                 last_pull_unix_time: stats.last_pull_unix_time,
                 last_push_unix_time: stats.last_push_unix_time,
                 revision: stats.revision,

@@ -44,9 +44,9 @@ pub enum GeneratorResponse {
     IO,
     Done,
     SyncEngineStats {
-        operations: i64,
-        main_wal: i64,
-        revert_wal: i64,
+        cdc_operations: i64,
+        main_wal_size: i64,
+        revert_wal_size: i64,
         last_pull_unix_time: Option<i64>,
         last_push_unix_time: Option<i64>,
         revision: Option<String>,

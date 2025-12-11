@@ -1,0 +1,107 @@
+---
+name: 2025-11-26-go-bindings-sync
+---
+
+<Output path="./bindings_sync.go">
+
+<Code model="openai/gpt-5" language="go">
+
+Generate Go functions bindings for the sync engine built on top of Turso - SQLite-compatible embedded database written in Rust.
+You must use C API bridge implemented in Rust which expose ABI compatible functions to interact with the database.
+
+The main goal is to translate C code to Go-friendly bindings which will have no additional logic, but more ergonomic API:
+1. Return (err error) when possible
+2. Manipulate with strings accordingly
+
+# Bindings
+
+You must generate bindings for C interface defined in turso_sync.h file.
+
+<File path="../../sync/sdk-kit/turso_sync.h" />
+
+Note, that this header file depends on the turso.h definitions for which Go bindings already exists.
+You MUST just reuse them. DO NOT copy or reimplement these bindings:
+
+<File path="../../sdk-kit/turso.h" />
+<File path="./bindings_db.go" />
+
+# Rules
+
+General rules for driver implementation you **MUST** follow and never go against these rules:
+- DO NOT USE cgo, USE purego instead
+- DO NOT introduce any new public methods - export turso.h content as-is
+- DO NOT register library - this will be done externally
+- AVOID unnecessary FFI calls as their cost is non zero
+- AVOID unnecessary strings transformations - replace them with more efficient alternatives if possible
+- FOCUS on code readability: if possible extract helper function but make sure that it will be used more than once and that it really contribute to the code readability
+- WATCH OUT for variables scopes and do not use variables which are no longer accessible
+- WATCH OUT for string representations: in some cases library expected zero terminated C-string and in some cases library operates with string/byte slices
+- BE AWARE, that purego marshal only explicit parameters of the function calls. If you have C struct passed by reference - you need to do marshalling by yourself (e.g. convert strings to zero-terminated C strings, etc)
+- STRUCTURE of the implementation 
+    * Declaration order of elements and semantic blocks MUST be exsactly the same
+    * (details and full enumerations omited in the example for brevity but you must generate full code)
+```go
+package turso
+
+// define all package level errors here
+
+// define opaque pointers as-is and accept them as exact arguments (e.g. func turso_database_connect(self TursoDatabase) ... - DO NOT add extra indirection)
+type TursoSyncDatabase *turso_sync_database_t
+
+// define all public binding types
+// the public binding types MUST have fields with native safe go types 
+type TursoSyncDatabaseConfig struct { ... }
+
+// define all necessary private C structs
+// private C structs MUST have fields with low level types (e.g. uintptr, numbers)
+type turso_sync_database_config_t struct { ... }
+
+// then, define C extern methods
+var (
+    // always use c_ structs here - never mix them with exported public types
+	c_turso_sync_database_new func(
+		dbConfig *c_turso_database_config_t,
+		syncConfig *c_turso_sync_database_config_t,
+		database unsafe.Pointer,
+		errorOptOut unsafe.Pointer,
+	) c_turso_status_code_t
+    ...
+)
+
+// imiplement a function to register extern methods from loaded lib
+// DO NOT load lib - as it will be done externally
+func register_turso_sync(handle uintptr) error {
+    purego.RegisterLibFunc(&c_turso_sync_database_new, handle, "turso_sync_database_new")
+    ...
+}
+
+// Go wrappers over imported C bindings
+// always use exported public types here - never mix them with c_ structs
+func turso_sync_database_new(...) ... { ... }
+```
+
+
+# Implementation
+
+- The package name is "github.com/tursodatabase/turso/go"
+- Use exactly same names as in turso_sync.h for Go method names and prepend `c_` prefix for C extern functions
+- Separate "public" types from "private" types:
+    * public types MUST be used ONLY in Go bindings methods (`turso_sync_.*`) and have fields with native safe go types (string, slice, etc)
+    * public types MUST NOT use low level types explicitly (e.g. unintptr) - they must be either replaced with wrapper public type or native alternative must be used instead (e.g. int instead of uinptrt if this is size_t)
+    * private types MUST be used ONLY in C wrapper functions (`c_turso_sync_.*`) and have fields with low-level C-compatible go types (uintptr, numbers, etc)
+- Document generated methods with docstrings
+- Replace `turso_status_code_t` and out error parameter with proper native golang `error`
+- Convert C-strings back and forth appropriately
+    * Remember, that Golang strings are not null-terminated - so you will need to convert them to zero-terminated strings by copying data in some cases
+
+
+# Purego
+
+Inspect following docstring from the official purego repository in order to understand how marshalling works:
+
+<Link url="https://raw.githubusercontent.com/ebitengine/purego/refs/heads/main/func.go" selector="RegisterFunc#comment" />
+<Link url="https://raw.githubusercontent.com/ebitengine/purego/refs/heads/main/func.go" selector="RegisterLibFunc#comment" />
+
+</Code>
+
+</Output>

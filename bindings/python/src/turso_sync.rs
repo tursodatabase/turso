@@ -264,13 +264,13 @@ impl PyTursoAsyncOperation {
     /// If returns Ok(None) - operation is not finished yet and must be resumed after one iteration of sync engine IO
     /// If returns Ok(Some(...)) - operation is finished and result must be processed accordingly
     pub fn resume(&self, py: Python) -> PyResult<Option<PyTursoAsyncOperationResult>> {
-        let mut result = self.operation.resume().map_err(turso_error_to_py_err)?;
-        if result.status == TursoStatusCode::Io {
+        let result = self.operation.resume().map_err(turso_error_to_py_err)?;
+        if result == TursoStatusCode::Io {
             Ok(None)
-        } else if result.status == TursoStatusCode::Done {
-            let result = result.result.take();
+        } else if result == TursoStatusCode::Done {
+            let result = self.operation.take_result();
             match result {
-                Some(TursoAsyncOperationResult::Changes { changes }) => {
+                Ok(TursoAsyncOperationResult::Changes { changes }) => {
                     Ok(Some(PyTursoAsyncOperationResult {
                         kind: PyTursoAsyncOperationResultKind::Changes,
                         changes: Some(pyo3::Py::new(
@@ -283,7 +283,7 @@ impl PyTursoAsyncOperation {
                         stats: None,
                     }))
                 }
-                Some(TursoAsyncOperationResult::Connection { connection }) => {
+                Ok(TursoAsyncOperationResult::Connection { connection }) => {
                     Ok(Some(PyTursoAsyncOperationResult {
                         kind: PyTursoAsyncOperationResultKind::Connection,
                         changes: None,
@@ -291,7 +291,7 @@ impl PyTursoAsyncOperation {
                         stats: None,
                     }))
                 }
-                Some(TursoAsyncOperationResult::Stats { stats }) => {
+                Ok(TursoAsyncOperationResult::Stats { stats }) => {
                     Ok(Some(PyTursoAsyncOperationResult {
                         kind: PyTursoAsyncOperationResultKind::Stats,
                         changes: None,
@@ -311,7 +311,7 @@ impl PyTursoAsyncOperation {
                         )?),
                     }))
                 }
-                None => Ok(Some(PyTursoAsyncOperationResult {
+                Err(..) => Ok(Some(PyTursoAsyncOperationResult {
                     kind: PyTursoAsyncOperationResultKind::No,
                     changes: None,
                     connection: None,

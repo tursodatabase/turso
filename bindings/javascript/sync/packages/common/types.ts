@@ -128,15 +128,15 @@ export interface DatabaseStats {
     /**
      * amount of local changes not sent to the remote
      */
-    operations: number;
+    cdcOperations: number;
     /**
      * size of the main WAL file in bytes
      */
-    mainWal: number;
+    mainWalSize: number;
     /**
      * size of the revert WAL file in bytes
      */
-    revertWal: number;
+    revertWalSize: number;
     /**
      * unix timestamp of last successful pull time
      */

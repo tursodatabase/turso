@@ -128,7 +128,10 @@ import turso.sync
 conn = turso.sync.connect(
     "local.db",
     remote_url="https://<db>.<region>.turso.io",
-    partial_boostrap_strategy=turso.sync.PartialSyncPrefixBootstrap(128 * 1024),  # fetch first 128 KiB upfront
+    # fetch first 128 KiB upfront
+    partial_sync_opts=turso.sync.PartialSyncOpts(
+      bootstrap_strategy=turso.sync.PartialSyncPrefixBootstrap(length=128 * 1024),
+    ),
 )
 ```
 

@@ -35,7 +35,7 @@ test('checkpoint-and-actions', async () => {
             await new Promise(resolve => setTimeout(resolve, 10));
             console.info('push', i);
             try {
-                if ((await db1.stats()).operations > 0) {
+                if ((await db1.stats()).cdcOperations > 0) {
                     const start = performance.now();
                     await db1.push();
                     console.info('push', performance.now() - start);
@@ -310,17 +310,17 @@ test('checkpoint', async () => {
     for (let i = 0; i < 1000; i++) {
         await db1.exec(`INSERT INTO q VALUES ('k${i}', 'v${i}')`);
     }
-    expect((await db1.stats()).mainWal).toBeGreaterThan(4096 * 1000);
+    expect((await db1.stats()).mainWalSize).toBeGreaterThan(4096 * 1000);
     await db1.checkpoint();
-    expect((await db1.stats()).mainWal).toBe(0);
-    let revertWal = (await db1.stats()).revertWal;
+    expect((await db1.stats()).mainWalSize).toBe(0);
+    let revertWal = (await db1.stats()).revertWalSize;
     expect(revertWal).toBeLessThan(4096 * 1000 / 100);
 
     for (let i = 0; i < 1000; i++) {
         await db1.exec(`UPDATE q SET y = 'u${i}' WHERE x = 'k${i}'`);
     }
     await db1.checkpoint();
-    expect((await db1.stats()).revertWal).toBe(revertWal);
+    expect((await db1.stats()).revertWalSize).toBe(revertWal);
 })
 
 test('persistence-push', async () => {
@@ -453,7 +453,7 @@ test('pull-push-concurrent', async () => {
     }
     let push = async () => {
         try {
-            if ((await db.stats()).operations > 0) {
+            if ((await db.stats()).cdcOperations > 0) {
                 await db.push();
             }
         } catch (e) {
