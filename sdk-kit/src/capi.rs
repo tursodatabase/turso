@@ -948,7 +948,12 @@ mod tests {
             );
             let text = "5";
             assert_eq!(
-                turso_statement_bind_positional_text(statement, 4, text.as_ptr(), text.len()),
+                turso_statement_bind_positional_text(
+                    statement,
+                    4,
+                    text.as_ptr() as *const std::ffi::c_char,
+                    text.len()
+                ),
                 turso_status_code_t::TURSO_OK
             );
             let blob = vec![6];
@@ -1054,7 +1059,7 @@ mod tests {
                 turso_statement_bind_positional_text(
                     statement,
                     turso_statement_named_position(statement, c"b".as_ptr()) as usize,
-                    text.as_ptr(),
+                    text.as_ptr() as *const std::ffi::c_char,
                     text.len()
                 ),
                 turso_status_code_t::TURSO_OK
