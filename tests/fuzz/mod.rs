@@ -177,6 +177,7 @@ mod fuzz_tests {
 
     #[turso_macros::test(mvcc, init_sql = "CREATE TABLE t (x PRIMARY KEY)")]
     pub fn index_scan_fuzz(db: TempDatabase) {
+        maybe_setup_tracing();
         let sqlite_path = db.path.parent().unwrap().join("sqlite.db");
         let sqlite_conn = rusqlite::Connection::open(&sqlite_path).unwrap();
         sqlite_conn
@@ -229,6 +230,7 @@ mod fuzz_tests {
     /// A test for verifying that index seek+scan works correctly for compound keys
     /// on indexes with various column orderings.
     pub fn index_scan_compound_key_fuzz(db: TempDatabase) {
+        maybe_setup_tracing();
         let (mut rng, seed) = rng_from_time_or_env();
 
         let opts = db.db_opts;
@@ -269,31 +271,19 @@ mod fuzz_tests {
         }
         let insert = format!("INSERT INTO t VALUES {}", tuples.join(", "));
 
-        // Create separate sqlite databases for comparison since MVCC databases have version 255
-        let sqlite_paths: Vec<_> = dbs
+        // Insert all tuples into all databases
+        let sqlite_conns = dbs
             .iter()
-            .enumerate()
-            .map(|(i, db)| db.path.parent().unwrap().join(format!("sqlite_{i}.db")))
-            .collect();
-
-        // Create tables and insert data into sqlite databases
-        for (i, sqlite_path) in sqlite_paths.iter().enumerate() {
-            let sqlite_conn = rusqlite::Connection::open(sqlite_path).unwrap();
-            sqlite_conn.execute(table_defs[i], []).unwrap();
+            .map(|db| rusqlite::Connection::open(db.path.clone()).unwrap())
+            .collect::<Vec<_>>();
+        for sqlite_conn in sqlite_conns.into_iter() {
             sqlite_conn.execute(&insert, params![]).unwrap();
             sqlite_conn.close().unwrap();
         }
-
-        // Insert into limbo databases
-        let limbo_conns = dbs.iter().map(|db| db.connect_limbo()).collect::<Vec<_>>();
-        for limbo_conn in limbo_conns.iter() {
-            limbo_exec_rows(limbo_conn, &insert);
-        }
-
-        let sqlite_conns: Vec<_> = sqlite_paths
+        let sqlite_conns = dbs
             .iter()
-            .map(|path| rusqlite::Connection::open(path).unwrap())
-            .collect();
+            .map(|db| rusqlite::Connection::open(db.path.clone()).unwrap())
+            .collect::<Vec<_>>();
         let limbo_conns = dbs.iter().map(|db| db.connect_limbo()).collect::<Vec<_>>();
 
         const COMPARISONS: [&str; 5] = ["=", "<", "<=", ">", ">="];
