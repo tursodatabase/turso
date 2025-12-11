@@ -109,6 +109,9 @@ jobs:
       - name: Test
         run: make test
         timeout-minutes: 20
+      - name: Test mvcc
+        run: make test-compat-mvcc
+        timeout-minutes: 10
   test-sqlite:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
