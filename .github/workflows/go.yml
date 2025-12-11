@@ -1,11 +1,29 @@
-name: Go Driver Tests
+## path=../../.github/workflows/go-publish.yml
+name: Build & Publish Go Driver
 
 on:
   workflow_dispatch:
+    inputs:
+      branch_name:
+        description: 'Branch name to push updates to in turso repo (manual runs). If empty, defaults to go-driver/<current-ref>.'
+        required: false
   push:
     branches: ["main"]
+    tags:
+      - "v*"
   pull_request:
     branches: ["main"]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+env:
+  # Token with repo access to tursodatabase/turso-go-platform-libs
+  GH_TOKEN: ${{ secrets.TURSO_GO_PLATFORM_LIBS_TOKEN }}
 
 jobs:
   test:
@@ -14,7 +32,7 @@ jobs:
     timeout-minutes: 30
     strategy:
       matrix:
-        os: 
+        os:
           - blacksmith-4vcpu-ubuntu-2404
           - macos-latest
           - windows-latest
@@ -30,7 +48,7 @@ jobs:
       - name: Rust cache
         uses: useblacksmith/rust-cache@v3
         with:
-          prefix-key: "v1-rust" # can be updated if we need to reset caches due to non-trivial change in the dependencies (for example, custom env var were set for single workspace project)
+          prefix-key: "v1-rust"
 
       - name: Setup Go
         uses: actions/setup-go@v5
@@ -66,3 +84,267 @@ jobs:
         run: |
           $env:PATH = "${{ github.workspace }}\target\debug;$env:PATH"
           go test ./... -v
+
+  publish:
+    name: Publish Go driver
+    needs: test
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Ensure tooling (jq, coreutils)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq coreutils
+
+      - name: Compute publish variables
+        id: vars
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          EVENT="${{ github.event_name }}"
+          REF="${{ github.ref }}"
+          REF_NAME="${{ github.ref_name }}"
+          INPUT_BRANCH="${{ github.event.inputs.branch_name || '' }}"
+
+          # Determine whether to publish for real:
+          # - Manual dispatch: publish
+          # - Tag push (refs/tags/v*): publish
+          # - Everything else (including PR): dry-run
+          if [[ "$EVENT" == "workflow_dispatch" ]]; then
+            DO_PUBLISH="true"
+          elif [[ "$REF" == refs/tags/v* ]]; then
+            DO_PUBLISH="true"
+          else
+            DO_PUBLISH="false"
+          fi
+
+          # turso_ref to pass to platform-libs:
+          # - Use tag name when on tag
+          # - Otherwise use current ref name (branch)
+          if [[ "$REF" == refs/tags/* ]]; then
+            TURSO_REF="$REF_NAME"
+          else
+            TURSO_REF="$REF_NAME"
+          fi
+
+          # Branch to push into this repository
+          if [[ "$EVENT" == "workflow_dispatch" && -n "$INPUT_BRANCH" ]]; then
+            TARGET_BRANCH="$INPUT_BRANCH"
+          elif [[ "$REF" == refs/tags/* ]]; then
+            TARGET_BRANCH="go-driver/${REF_NAME}"
+          else
+            TARGET_BRANCH="go-driver/${REF_NAME}"
+          fi
+
+          # Generate a unique nonce
+          NONCE="$(uuidgen 2>/dev/null || true)"
+          if [[ -z "$NONCE" ]]; then
+            NONCE="$(date +%s)-$RANDOM-$RANDOM"
+          fi
+
+          echo "do_publish=$DO_PUBLISH" >> "$GITHUB_OUTPUT"
+          echo "turso_ref=$TURSO_REF" >> "$GITHUB_OUTPUT"
+          echo "target_branch=$TARGET_BRANCH" >> "$GITHUB_OUTPUT"
+          echo "nonce=$NONCE" >> "$GITHUB_OUTPUT"
+
+          echo "Event: $EVENT"
+          echo "Ref: $REF"
+          echo "Ref name: $REF_NAME"
+          echo "DO_PUBLISH=$DO_PUBLISH"
+          echo "TURSO_REF=$TURSO_REF"
+          echo "TARGET_BRANCH=$TARGET_BRANCH"
+          echo "NONCE=$NONCE"
+
+      - name: Dry-run (PRs and non-tag non-manual runs)
+        if: steps.vars.outputs.do_publish != 'true'
+        run: |
+          echo "Dry run: not triggering turso-go-platform-libs and not pushing any commits."
+          echo "Would have used:"
+          echo " - turso_ref=${{ steps.vars.outputs.turso_ref }}"
+          echo " - target_branch=${{ steps.vars.outputs.target_branch }}"
+          echo " - nonce=${{ steps.vars.outputs.nonce }}"
+          echo "Exiting."
+
+      - name: Check token available for external repo
+        if: steps.vars.outputs.do_publish == 'true'
+        shell: bash
+        run: |
+          if [[ -z "${GH_TOKEN:-}" ]]; then
+            echo "TURSO_GO_PLATFORM_LIBS_TOKEN is not set; cannot publish."
+            exit 1
+          fi
+
+      # Trigger turso-go-platform-libs build+publish workflow
+      - name: Trigger external prebuilt-libs workflow
+        if: steps.vars.outputs.do_publish == 'true'
+        shell: bash
+        env:
+          TURSO_REF: ${{ steps.vars.outputs.turso_ref }}
+          NONCE: ${{ steps.vars.outputs.nonce }}
+        run: |
+          set -euo pipefail
+          echo "Triggering tursodatabase/turso-go-platform-libs build.yml with:"
+          echo " - turso_ref=$TURSO_REF"
+          echo " - push_changes=true"
+          echo " - nonce=$NONCE"
+
+          # Use gh to dispatch workflow
+          gh workflow run build.yml \
+            -R tursodatabase/turso-go-platform-libs \
+            -f turso_ref="$TURSO_REF" \
+            -f push_changes=true \
+            -f nonce="$NONCE"
+
+      # Wait for the external workflow to complete by locating the run that has our nonce in job names
+      - name: Wait for external workflow completion
+        if: steps.vars.outputs.do_publish == 'true'
+        id: wait_external
+        shell: bash
+        env:
+          NONCE: ${{ steps.vars.outputs.nonce }}
+        run: |
+          set -euo pipefail
+
+          REPO="tursodatabase/turso-go-platform-libs"
+          WORKFLOW_FILE="build.yml"
+
+          echo "Searching for workflow run in $REPO matching nonce=$NONCE"
+
+          # Try to find the run that includes the nonce in job names.
+          FOUND_RUN_ID=""
+          ATTEMPTS=0
+          MAX_ATTEMPTS=60   # ~15 minutes (with 15s sleep)
+          while [[ -z "$FOUND_RUN_ID" && $ATTEMPTS -lt $MAX_ATTEMPTS ]]; do
+            ATTEMPTS=$((ATTEMPTS+1))
+            # Fetch recent runs of the workflow
+            RUN_IDS=$(gh api -H "Accept: application/vnd.github+json" \
+              repos/$REPO/actions/workflows/$WORKFLOW_FILE/runs \
+              -q '.workflow_runs[0:30][] | .id' || true)
+
+            for RID in $RUN_IDS; do
+              # List jobs and search for nonce in any job name
+              if gh api -H "Accept: application/vnd.github+json" repos/$REPO/actions/runs/$RID/jobs -q '.jobs[].name' | grep -q "nonce=${NONCE}"; then
+                FOUND_RUN_ID="$RID"
+                break
+              fi
+            done
+
+            if [[ -z "$FOUND_RUN_ID" ]]; then
+              echo "Nonce not found yet (attempt $ATTEMPTS/$MAX_ATTEMPTS). Sleeping 15s..."
+              sleep 15
+            fi
+          done
+
+          if [[ -z "$FOUND_RUN_ID" ]]; then
+            echo "Failed to locate external workflow run with nonce=$NONCE"
+            exit 1
+          fi
+
+          echo "Found external run id: $FOUND_RUN_ID"
+          echo "run_id=$FOUND_RUN_ID" >> "$GITHUB_OUTPUT"
+
+          echo "Waiting for external run to complete..."
+          while true; do
+            STATUS=$(gh api repos/$REPO/actions/runs/$FOUND_RUN_ID -q '.status')
+            CONCLUSION=$(gh api repos/$REPO/actions/runs/$FOUND_RUN_ID -q '.conclusion')
+            echo "Status: $STATUS, Conclusion: $CONCLUSION"
+            if [[ "$STATUS" == "completed" ]]; then
+              if [[ "$CONCLUSION" != "success" ]]; then
+                echo "External workflow did not succeed. Conclusion: $CONCLUSION"
+                exit 1
+              fi
+              break
+            fi
+            sleep 15
+          done
+
+      - name: Determine libs branch name from turso_ref
+        if: steps.vars.outputs.do_publish == 'true'
+        id: libs_branch
+        shell: bash
+        env:
+          TURSO_REF: ${{ steps.vars.outputs.turso_ref }}
+        run: |
+          set -euo pipefail
+          # If turso_ref is a semver tag starting with v, use it; else use turso-branch-<turso_ref>
+          if [[ "$TURSO_REF" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([\-+][0-9A-Za-z\.-]+)?$ ]]; then
+            BRANCH="$TURSO_REF"
+          else
+            BRANCH="turso-branch-$TURSO_REF"
+          fi
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          echo "Resolved libs branch: $BRANCH"
+
+      - name: Setup Go (for dependency update)
+        if: steps.vars.outputs.do_publish == 'true'
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.24.10"
+
+      - name: Update dependency to freshly built libs
+        if: steps.vars.outputs.do_publish == 'true'
+        id: update_dep
+        shell: bash
+        env:
+          LIBS_BRANCH: ${{ steps.libs_branch.outputs.branch }}
+        run: |
+          set -euo pipefail
+          echo "Updating github.com/tursodatabase/turso-go-platform-libs to branch: $LIBS_BRANCH"
+
+          # Update dependency and tidy
+          go get "github.com/tursodatabase/turso-go-platform-libs@${LIBS_BRANCH}"
+          go mod tidy
+
+          # Determine the resolved pseudo-version
+          RESOLVED_VERSION="$(go list -m -json github.com/tursodatabase/turso-go-platform-libs | jq -r .Version)"
+          echo "resolved_version=$RESOLVED_VERSION" >> "$GITHUB_OUTPUT"
+          echo "Resolved version: $RESOLVED_VERSION"
+
+          echo "Changed files:"
+          git status --porcelain
+
+      - name: Create and push branch with updated go.mod
+        if: steps.vars.outputs.do_publish == 'true'
+        shell: bash
+        env:
+          TARGET_BRANCH: ${{ steps.vars.outputs.target_branch }}
+          NONCE: ${{ steps.vars.outputs.nonce }}
+          RESOLVED_VERSION: ${{ steps.update_dep.outputs.resolved_version }}
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Create/update branch
+          # If branch exists locally/remote, check it out; otherwise create
+          if git ls-remote --exit-code --heads origin "$TARGET_BRANCH" >/dev/null 2>&1; then
+            echo "Branch $TARGET_BRANCH exists on remote — checking it out."
+            git fetch origin "$TARGET_BRANCH":"$TARGET_BRANCH"
+            git checkout "$TARGET_BRANCH"
+          else
+            echo "Creating new branch $TARGET_BRANCH"
+            git checkout -b "$TARGET_BRANCH"
+          fi
+
+          # Stage changes if any
+          git add go.mod go.sum || true
+
+          if git diff --cached --quiet; then
+            echo "No changes in go.mod/go.sum to commit; skipping push."
+            exit 0
+          fi
+
+          COMMIT_MSG="go: update turso-go-platform-libs to ${RESOLVED_VERSION} (nonce: ${NONCE})"
+          git commit -m "$COMMIT_MSG"
+
+          # Push branch
+          git push --set-upstream origin "$TARGET_BRANCH" --force-with-lease || git push --set-upstream origin "$TARGET_BRANCH"
+
+          echo "Pushed branch: $TARGET_BRANCH"
