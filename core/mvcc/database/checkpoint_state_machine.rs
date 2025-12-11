@@ -1108,10 +1108,10 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 self.connection.db.with_schema_mut(|schema| {
                     for table in schema.tables.values_mut() {
                         let table = Arc::get_mut(table).expect("this should be the only reference");
-                        let Some(mut btree_table) = table.btree() else {
+                        let Some(btree_table) = table.btree_mut() else {
                             continue;
                         };
-                        let btree_table = Arc::make_mut(&mut btree_table);
+                        let btree_table = Arc::make_mut(btree_table);
                         if btree_table.root_page < 0 {
                             btree_table.root_page = btree_table.root_page.abs();
                         }
@@ -1132,7 +1132,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                             self.mvstore.global_header.write().replace(*header);
                             IOResult::Done(())
                         })
-                    });
+                    })?;
                     Ok(())
                 })?;
 

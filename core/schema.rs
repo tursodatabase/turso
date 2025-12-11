@@ -1448,6 +1448,14 @@ impl Table {
         }
     }
 
+    pub fn btree_mut(&mut self) -> Option<&mut Arc<BTreeTable>> {
+        match self {
+            Self::BTree(table) => Some(table),
+            Self::Virtual(_) => None,
+            Self::FromClauseSubquery(_) => None,
+        }
+    }
+
     pub fn virtual_table(&self) -> Option<Arc<VirtualTable>> {
         match self {
             Self::Virtual(table) => Some(table.clone()),
