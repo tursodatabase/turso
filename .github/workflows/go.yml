@@ -115,8 +115,7 @@ jobs:
           elif [[ "$REF" == refs/tags/v* ]]; then
             DO_PUBLISH="true"
           else
-            # DO_PUBLISH="false"
-            DO_PUBLISH="true" # MUST BE FALSE - TEMPORARY CHANGE FOR TESTING
+            DO_PUBLISH="false"
           fi
 
           if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
@@ -138,8 +137,7 @@ jobs:
             TARGET_TAG="${TURSO_REF}"
             TARGET_BRANCH="go-release-${TURSO_REF}"
           else
-            # TARGET_TAG=""
-            TARGET_TAG="v0.0.1-pre.0" # TEMPORARY CHANGE FOR TESTING
+            TARGET_TAG=""
             TARGET_BRANCH="go-release-${TURSO_REF}"
           fi
 
