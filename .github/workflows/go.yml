@@ -120,7 +120,8 @@ jobs:
           elif [[ "$REF" == refs/tags/v* ]]; then
             DO_PUBLISH="true"
           else
-            DO_PUBLISH="false"
+            # DO_PUBLISH="false"
+            DO_PUBLISH="true" # MUST BE FALSE - TEMPORARY CHANGE FOR TESTING
           fi
 
           if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
@@ -140,7 +141,8 @@ jobs:
           elif [[ "$REF" == refs/tags/* ]]; then
             TARGET_BRANCH="bindings/go/${TURSO_REF}"
           else
-            TARGET_BRANCH="bindings/go/${TURSO_REF}"
+            # TARGET_BRANCH="bindings/go/${TURSO_REF}"
+            TARGET_BRANCH="bindings/go/v0.0.1-pre.0" # TEMPORARY CHANGE FOR TESTING
           fi
 
           # Generate a unique nonce
