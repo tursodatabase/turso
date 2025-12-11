@@ -221,7 +221,7 @@ export type DatabaseRowTransformResultJs =
 export type GeneratorResponse =
   | { type: 'IO' }
   | { type: 'Done' }
-  | { type: 'SyncEngineStats', cdc_operations: number, mainWalSize: number, revertWalSize: number, lastPullUnixTime?: number, lastPushUnixTime?: number, revision?: string, networkSentBytes: number, networkReceivedBytes: number }
+  | { type: 'SyncEngineStats', cdcOperations: number, mainWalSize: number, revertWalSize: number, lastPullUnixTime?: number, lastPushUnixTime?: number, revision?: string, networkSentBytes: number, networkReceivedBytes: number }
   | { type: 'SyncEngineChanges', changes: SyncEngineChanges }
 
 export type JsPartialBootstrapStrategy =

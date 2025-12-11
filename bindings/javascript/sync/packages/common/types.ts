@@ -128,7 +128,7 @@ export interface DatabaseStats {
     /**
      * amount of local changes not sent to the remote
      */
-    cdc_operations: number;
+    cdcOperations: number;
     /**
      * size of the main WAL file in bytes
      */
