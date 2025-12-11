@@ -1,5 +1,6 @@
 pub mod grammar_generator;
 pub mod rowid_alias;
+pub mod test_join_optimizer;
 
 #[cfg(test)]
 mod fuzz_tests {
