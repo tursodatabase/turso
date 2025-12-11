@@ -10,6 +10,89 @@ use rusqlite::params;
 use std::sync::Arc;
 use tempfile::TempDir;
 
+/// Minimal reproduction of the journal mode switching bug.
+/// Deletes performed in experimental_mvcc mode are lost when switching to wal mode.
+#[test]
+fn journal_mode_delete_lost_on_switch() {
+    maybe_setup_tracing();
+
+    let tmp_dir = TempDir::new().unwrap();
+    let db_path = tmp_dir.path().join("test.db");
+
+    // Create schema
+    let schema = "CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT);";
+
+    // Open with MVCC enabled
+    let opts = turso_core::DatabaseOpts::new().with_mvcc(true);
+    let limbo_db = TempDatabaseBuilder::new()
+        .with_db_path(&db_path)
+        .with_opts(opts)
+        .build();
+    let conn = limbo_db.connect_limbo();
+
+    // Create table
+    conn.prepare_execute_batch(schema).unwrap();
+
+    // Verify we start in experimental_mvcc mode
+    let mode = get_limbo_journal_mode(&conn);
+    println!("Initial mode: {mode}");
+    assert_eq!(mode, "experimental_mvcc");
+
+    // Insert a row in experimental_mvcc mode
+    conn.execute("INSERT INTO t(id, val) VALUES (1, 'test')")
+        .unwrap();
+
+    // Verify row exists
+    let rows = limbo_exec_rows(&conn, "SELECT * FROM t ORDER BY id");
+    println!("After insert: {rows:?}");
+    assert_eq!(rows.len(), 1);
+
+    // Switch to WAL mode
+    let result = conn
+        .pragma_update("journal_mode", "'wal'")
+        .expect("switch to wal");
+    let mode = result[0][0].to_string();
+    println!("Switched to: {mode}");
+    assert_eq!(mode, "wal");
+
+    // Verify row still exists after switch
+    let rows = limbo_exec_rows(&conn, "SELECT * FROM t ORDER BY id");
+    println!("After switch to WAL: {rows:?}");
+    assert_eq!(rows.len(), 1);
+
+    // Switch back to experimental_mvcc
+    let result = conn
+        .pragma_update("journal_mode", "'experimental_mvcc'")
+        .expect("switch to mvcc");
+    let mode = result[0][0].to_string();
+    println!("Switched to: {mode}");
+    assert_eq!(mode, "experimental_mvcc");
+
+    // Delete the row in experimental_mvcc mode
+    conn.execute("DELETE FROM t WHERE id = 1").unwrap();
+
+    // Verify row is deleted
+    let rows = limbo_exec_rows(&conn, "SELECT * FROM t ORDER BY id");
+    println!("After delete in MVCC: {rows:?}");
+    assert_eq!(rows.len(), 0, "Row should be deleted");
+
+    // Switch back to WAL mode - THIS IS WHERE THE BUG OCCURS
+    let result = conn
+        .pragma_update("journal_mode", "'wal'")
+        .expect("switch to wal");
+    let mode = result[0][0].to_string();
+    println!("Switched to: {mode}");
+
+    // BUG: Row reappears after switching to WAL!
+    let rows = limbo_exec_rows(&conn, "SELECT * FROM t ORDER BY id");
+    println!("After switch to WAL (BUG CHECK): {rows:?}");
+    assert_eq!(
+        rows.len(),
+        0,
+        "BUG: Row was deleted but reappeared after switching from experimental_mvcc to wal!"
+    );
+}
+
 /// Fuzz test that attempts to constantly change the journal mode of the database
 /// between `wal` and `experimental_mvcc`
 ///
@@ -98,12 +181,13 @@ pub fn journal_mode_fuzz(db: TempDatabase) {
 
     for iter in 0..iterations {
         if iter % 50 == 0 {
-            println!(
-                "journal_mode_fuzz iter {iter}/{iterations} (mode: {current_mode})"
-            );
+            println!("journal_mode_fuzz iter {iter}/{iterations} (mode: {current_mode})");
         }
 
         let action = actions[action_dist.sample(&mut rng)].0;
+
+        // Enable verbose logging for debugging
+        let verbose = std::env::var("VERBOSE").is_ok();
 
         match action {
             Action::Insert => {
@@ -125,6 +209,9 @@ pub fn journal_mode_fuzz(db: TempDatabase) {
                     "INSERT INTO {table}(id, {val_col}, {num_col}) VALUES ({id}, '{text_val}', {num_val})"
                 );
 
+                if verbose {
+                    println!("[{iter}] INSERT {table} id={id} (mode: {current_mode})");
+                }
                 execute_on_both(&limbo_conn, &sqlite_conn, &stmt, seed, iter);
             }
             Action::Update => {
@@ -144,6 +231,9 @@ pub fn journal_mode_fuzz(db: TempDatabase) {
                         "UPDATE {table} SET {val_col} = '{new_text}', {num_col} = {new_num} WHERE id = {id}"
                     );
 
+                    if verbose {
+                        println!("[{iter}] UPDATE {table} id={id} (mode: {current_mode})");
+                    }
                     execute_on_both(&limbo_conn, &sqlite_conn, &stmt, seed, iter);
                 }
             }
@@ -159,6 +249,9 @@ pub fn journal_mode_fuzz(db: TempDatabase) {
                     let id = rng.random_range(1..max_id);
                     let stmt = format!("DELETE FROM {table} WHERE id = {id}");
 
+                    if verbose {
+                        println!("[{iter}] DELETE {table} id={id} (mode: {current_mode})");
+                    }
                     execute_on_both(&limbo_conn, &sqlite_conn, &stmt, seed, iter);
                 }
             }
@@ -193,11 +286,8 @@ fn get_limbo_journal_mode(conn: &Arc<turso_core::Connection>) -> String {
     let result = conn
         .pragma_query("journal_mode")
         .expect("PRAGMA journal_mode query should not fail");
-    if result.is_empty() {
-        "unknown".to_string()
-    } else {
-        result[0][0].to_string()
-    }
+    assert!(!result.is_empty(), "jounral mode result cannot be empty");
+    result[0][0].to_string()
 }
 
 fn generate_random_text(rng: &mut ChaCha8Rng) -> String {
