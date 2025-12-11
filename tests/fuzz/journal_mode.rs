@@ -1,6 +1,6 @@
 use core_tester::common::{
-    limbo_exec_rows, maybe_setup_tracing, rng_from_time_or_env, sqlite_exec_rows, TempDatabase,
-    TempDatabaseBuilder,
+    limbo_exec_rows, maybe_setup_tracing, rng_from_time_or_env, sqlite_exec_rows, ExecRows,
+    TempDatabase, TempDatabaseBuilder,
 };
 use rand::distr::weighted::WeightedIndex;
 use rand::distr::Distribution;
@@ -90,6 +90,120 @@ fn journal_mode_delete_lost_on_switch() {
         rows.len(),
         0,
         "BUG: Row was deleted but reappeared after switching from experimental_mvcc to wal!"
+    );
+}
+
+/// Regression test for UPDATE-then-DELETE of B-tree resident rows.
+///
+/// This tests a specific bug where:
+/// 1. A row is inserted in MVCC and checkpointed to B-tree
+/// 2. After switching WAL->MVCC, a new MvStore is created (row only in B-tree)
+/// 3. The row is UPDATED (creating an MVCC version with begin_ts > 0)
+/// 4. The row is DELETED
+/// 5. When switching back to WAL, the delete was not being checkpointed because
+///    the checkpoint logic didn't know the row existed in B-tree
+///
+/// The bug occurs because:
+/// - After WAL->MVCC switch, `checkpointed_txid_max_old` is None (fresh MvStore)
+/// - The UPDATE creates an MVCC version with `begin_ts > 0`
+/// - The checkpoint logic with `is_some_and` requires `begin_ts <= checkpointed_txid_max_old`
+///   to recognize the row as existing in B-tree, but that check fails when
+///   `checkpointed_txid_max_old` is None
+/// - Result: the delete is not checkpointed, and the row "reappears" with its old value
+///
+/// The fix adds a `btree_resident` flag to RowVersion that's set when updating
+/// a row that exists in B-tree but not in MvStore. The checkpoint logic then
+/// checks this flag to properly recognize B-tree resident rows.
+#[test]
+fn journal_mode_update_then_delete_btree_resident() {
+    maybe_setup_tracing();
+
+    let tmp_dir = TempDir::new().unwrap();
+    let db_path = tmp_dir.path().join("test.db");
+
+    let schema = "CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT);";
+
+    // Open with MVCC enabled
+    let opts = turso_core::DatabaseOpts::new().with_mvcc(true);
+    let limbo_db = TempDatabaseBuilder::new()
+        .with_db_path(&db_path)
+        .with_opts(opts)
+        .build();
+    let conn = limbo_db.connect_limbo();
+
+    // Create table
+    conn.prepare_execute_batch(schema).unwrap();
+
+    // Step 1: Insert a row in MVCC mode
+    conn.execute("INSERT INTO t(id, val) VALUES (1, 'original')")
+        .unwrap();
+    println!("Step 1: Inserted row in MVCC");
+
+    // Step 2: Switch to WAL (checkpoints the row to B-tree)
+    let result = conn
+        .pragma_update("journal_mode", "'wal'")
+        .expect("switch to wal");
+    println!("Step 2: Switched to WAL (checkpointed to B-tree)");
+    assert_eq!(result[0][0].to_string(), "wal");
+
+    // Verify row exists in B-tree
+    let rows: Vec<(i64, String)> = conn.exec_rows("SELECT * FROM t ORDER BY id");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].1, "original");
+
+    // Step 3: Switch back to MVCC (creates new MvStore, row only in B-tree)
+    // This is the key step - after this, the row ONLY exists in B-tree,
+    // and checkpointed_txid_max will be 0 (None when converted to NonZeroU64)
+    let result = conn
+        .pragma_update("journal_mode", "'experimental_mvcc'")
+        .expect("switch to mvcc");
+    println!("Step 3: Switched to MVCC (new MvStore, row only in B-tree)");
+    assert_eq!(result[0][0].to_string(), "experimental_mvcc");
+
+    // Verify row still visible (reading from B-tree)
+    let rows: Vec<(i64, String)> = conn.exec_rows("SELECT * FROM t ORDER BY id");
+    assert_eq!(rows.len(), 1);
+
+    // Step 4: UPDATE the row
+    // This creates an MVCC version for a B-tree-resident row.
+    // Without the btree_resident fix, this version has btree_resident=false
+    // and begin_ts > 0, which means checkpoint won't recognize it as a B-tree row.
+    conn.execute("UPDATE t SET val = 'updated' WHERE id = 1")
+        .unwrap();
+    println!("Step 4: Updated row (creates MVCC version for B-tree resident row)");
+
+    // Verify update worked
+    let rows: Vec<(i64, String)> = conn.exec_rows("SELECT * FROM t ORDER BY id");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].1, "updated");
+
+    // Step 5: DELETE the row
+    conn.execute("DELETE FROM t WHERE id = 1").unwrap();
+    println!("Step 5: Deleted row");
+
+    // Verify delete worked in MVCC
+    let rows: Vec<(i64, String)> = conn.exec_rows("SELECT * FROM t ORDER BY id");
+    assert_eq!(rows.len(), 0, "Row should be deleted in MVCC");
+
+    // Step 6: Switch to WAL - this triggers checkpoint
+    // BUG: Without btree_resident fix, the checkpoint doesn't recognize
+    // that the deleted row existed in B-tree, so it doesn't checkpoint the delete.
+    // Result: the old value from B-tree "reappears"
+    let result = conn
+        .pragma_update("journal_mode", "'wal'")
+        .expect("switch to wal");
+    println!("Step 6: Switched to WAL (checkpoint)");
+    assert_eq!(result[0][0].to_string(), "wal");
+
+    // BUG CHECK: Row should remain deleted after checkpoint
+    // Without the fix, the row reappears with value "original" (from B-tree)
+    let rows: Vec<(i64, String)> = conn.exec_rows("SELECT * FROM t ORDER BY id");
+    println!("Final state: {rows:?}");
+    assert_eq!(
+        rows.len(),
+        0,
+        "BUG: Row was updated then deleted, but reappeared after checkpoint! \
+         The btree_resident flag should ensure the delete is checkpointed."
     );
 }
 
