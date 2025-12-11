@@ -387,6 +387,22 @@ pub fn compute_best_join_order<'a>(
 
     let num_tables = joined_tables.len();
 
+    // For large queries, use greedy join ordering instead of exhaustive DP.
+    // The DP algorithm has O(2^n) complexity which becomes prohibitively slow
+    // beyond ~12 tables. The greedy algorithm is O(n²) and produces good
+    // (though not always optimal) plans.
+    if num_tables > GREEDY_JOIN_THRESHOLD {
+        return compute_greedy_join_order(
+            joined_tables,
+            maybe_order_target,
+            constraints,
+            base_table_rows,
+            access_methods_arena,
+            where_clause,
+            subqueries,
+        );
+    }
+
     // Compute naive left-to-right plan to use as pruning threshold
     let naive_plan = compute_naive_left_deep_plan(
         joined_tables,
@@ -661,6 +677,199 @@ pub fn compute_best_join_order<'a>(
             "No valid query plan found".to_string(),
         )),
     }
+}
+
+/// Above this threshold, use greedy O(n²) ordering instead of exhaustive O(2^n) DP.
+pub const GREEDY_JOIN_THRESHOLD: usize = 12;
+
+/// Greedy Operator Ordering (GOO) for join optimization. O(n²) time, O(n) space.
+///
+/// Builds a left-deep join tree by:
+/// 1. Starting with the table that has best hub score (enables most index lookups)
+/// 2. Greedily adding the remaining table with lowest marginal cost
+///
+/// Respects outer join ordering constraints.
+#[allow(clippy::too_many_arguments)]
+pub fn compute_greedy_join_order<'a>(
+    joined_tables: &[JoinedTable],
+    maybe_order_target: Option<&OrderTarget>,
+    constraints: &'a [TableConstraints],
+    base_table_rows: &[RowCountEstimate],
+    access_methods_arena: &'a RefCell<Vec<AccessMethod>>,
+    where_clause: &mut [WhereTerm],
+    subqueries: &[NonFromClauseSubquery],
+) -> Result<Option<BestJoinOrderResult>> {
+    let num_tables = joined_tables.len();
+    if num_tables == 0 {
+        return Ok(None);
+    }
+
+    // Outer join RHS tables require all preceding tables to be joined first.
+    let left_join_deps: HashMap<usize, TableMask> = joined_tables
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| t.join_info.as_ref().is_some_and(|ji| ji.outer))
+        .map(|(j, _)| {
+            let mut required = TableMask::new();
+            for k in 0..j {
+                required.add_table(k);
+            }
+            (j, required)
+        })
+        .collect();
+
+    let mut remaining: Vec<usize> = (0..num_tables).collect();
+    let mut join_order: Vec<JoinOrderMember> = Vec::with_capacity(num_tables);
+
+    // Pick starting table: prefer tables with high "hub score" (referenced by many constraints).
+    let first_idx =
+        find_best_starting_table(num_tables, constraints, base_table_rows, &left_join_deps);
+    let first_table = &joined_tables[first_idx];
+    join_order.push(JoinOrderMember {
+        table_id: first_table.internal_id,
+        original_idx: first_idx,
+        is_outer: false, // First table cannot be outer join RHS
+    });
+    remaining.retain(|&x| x != first_idx);
+
+    let mut current_plan: Option<JoinN> = join_lhs_and_rhs(
+        None,
+        first_table,
+        &constraints[first_idx],
+        constraints,
+        base_table_rows,
+        &join_order,
+        maybe_order_target,
+        access_methods_arena,
+        Cost(f64::MAX),
+        joined_tables,
+        where_clause,
+        subqueries,
+    )?;
+
+    if current_plan.is_none() {
+        return Err(LimboError::PlanningError(
+            "No valid query plan found for first table".to_string(),
+        ));
+    }
+
+    // Greedily add remaining tables, always picking lowest marginal cost.
+    while !remaining.is_empty() {
+        let current_mask =
+            TableMask::from_table_number_iter(join_order.iter().map(|m| m.original_idx));
+
+        // Placeholder for candidate evaluation (avoids cloning)
+        join_order.push(JoinOrderMember::default());
+
+        let mut best: Option<(usize, JoinN)> = None;
+
+        for &idx in &remaining {
+            // Outer join RHS requires all preceding tables joined first
+            if let Some(required) = left_join_deps.get(&idx) {
+                if !current_mask.contains_all(required) {
+                    continue;
+                }
+            }
+
+            let table = &joined_tables[idx];
+            let last = join_order.last_mut().unwrap();
+            last.table_id = table.internal_id;
+            last.original_idx = idx;
+            last.is_outer = table.join_info.as_ref().is_some_and(|ji| ji.outer);
+
+            if let Some(plan) = join_lhs_and_rhs(
+                current_plan.as_ref(),
+                table,
+                &constraints[idx],
+                constraints,
+                base_table_rows,
+                &join_order,
+                maybe_order_target,
+                access_methods_arena,
+                Cost(f64::MAX),
+                joined_tables,
+                where_clause,
+                subqueries,
+            )? {
+                if best.as_ref().is_none_or(|(_, b)| plan.cost < b.cost) {
+                    best = Some((idx, plan));
+                }
+            }
+        }
+
+        join_order.pop();
+
+        let (next_idx, next_plan) = best.ok_or_else(|| {
+            LimboError::PlanningError("Greedy join ordering: no valid next table".to_string())
+        })?;
+
+        let next_table = &joined_tables[next_idx];
+        join_order.push(JoinOrderMember {
+            table_id: next_table.internal_id,
+            original_idx: next_idx,
+            is_outer: next_table.join_info.as_ref().is_some_and(|ji| ji.outer),
+        });
+        remaining.retain(|&x| x != next_idx);
+        current_plan = Some(next_plan);
+    }
+
+    Ok(Some(BestJoinOrderResult {
+        best_plan: current_plan.expect("loop invariant: current_plan always Some"),
+        best_ordered_plan: None, // Greedy doesn't track ordered variants
+    }))
+}
+
+/// Select starting table for greedy join ordering.
+///
+/// Prefers tables with high "hub score": tables referenced by many other tables' usable
+/// constraints. Starting with such tables enables index lookups on subsequent joins.
+/// E.g., in a star schema, the fact table is referenced by all dimension FKs, so
+/// starting there allows all dimensions to use their PK indexes.
+///
+/// Score = (base_rows * filter_selectivity) * 0.1^hub_score
+/// Lower score wins. Outer join RHS tables are excluded (have ordering dependencies).
+fn find_best_starting_table(
+    num_tables: usize,
+    constraints: &[TableConstraints],
+    base_table_rows: &[RowCountEstimate],
+    left_join_deps: &HashMap<usize, TableMask>,
+) -> usize {
+    // hub_score[t] = count of usable constraints on OTHER tables that reference t.
+    // If we join t first, each such constraint becomes usable for an index lookup.
+    let mut hub_score = vec![0usize; num_tables];
+    for (t, tc) in constraints.iter().enumerate() {
+        for c in &tc.constraints {
+            if c.usable && c.table_col_pos.is_some() {
+                for other in (0..num_tables).filter(|&x| x != t && c.lhs_mask.contains_table(x)) {
+                    hub_score[other] += 1;
+                }
+            }
+        }
+    }
+
+    let mut best: Option<(usize, f64)> = None;
+    for t in 0..num_tables {
+        if left_join_deps.contains_key(&t) {
+            continue; // Outer join RHS - cannot be first
+        }
+
+        let base_rows = *base_table_rows[t];
+        let selectivity: f64 = constraints[t]
+            .constraints
+            .iter()
+            .filter(|c| c.lhs_mask.is_empty())
+            .map(|c| c.selectivity)
+            .product();
+
+        let score = base_rows * selectivity * 0.1_f64.powi(hub_score[t] as i32);
+
+        if best.is_none_or(|(_, s)| score < s) {
+            best = Some((t, score));
+        }
+    }
+
+    // Table 0 can never be outer join RHS, so best is always Some.
+    best.expect("no valid starting table").0
 }
 
 /// Specialized version of [compute_best_join_order] that just joins tables in the order they are given
