@@ -46,7 +46,7 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Rust cache
-        uses: useblacksmith/rust-cache@v3
+        uses: Swatinem/rust-cache@v2
         with:
           prefix-key: "v1-rust"
 
@@ -109,7 +109,6 @@ jobs:
 
           EVENT="${{ github.event_name }}"
           REF="${{ github.ref }}"
-          REF_NAME="${{ github.ref_name }}"
           INPUT_BRANCH="${{ github.event.inputs.branch_name || '' }}"
 
           # Determine whether to publish for real:
@@ -124,22 +123,24 @@ jobs:
             DO_PUBLISH="false"
           fi
 
-          # turso_ref to pass to platform-libs:
-          # - Use tag name when on tag
-          # - Otherwise use current ref name (branch)
-          if [[ "$REF" == refs/tags/* ]]; then
-            TURSO_REF="$REF_NAME"
+          if [[ "${GITHUB_REF_TYPE}" == "tag" ]]; then
+            # For tag events, github.ref_name is correct
+            TURSO_REF="${GITHUB_REF_NAME}"
+          elif [[ -n "${GITHUB_HEAD_REF}" ]]; then
+            # For PRs, github.head_ref contains the real source branch
+            TURSO_REF="${GITHUB_HEAD_REF}"
           else
-            TURSO_REF="$REF_NAME"
+            # For push events to branches
+            TURSO_REF="${GITHUB_REF_NAME}"
           fi
 
           # Branch to push into this repository
           if [[ "$EVENT" == "workflow_dispatch" && -n "$INPUT_BRANCH" ]]; then
             TARGET_BRANCH="$INPUT_BRANCH"
           elif [[ "$REF" == refs/tags/* ]]; then
-            TARGET_BRANCH="go-driver/${REF_NAME}"
+            TARGET_BRANCH="bindings/go/${TURSO_REF}"
           else
-            TARGET_BRANCH="go-driver/${REF_NAME}"
+            TARGET_BRANCH="bindings/go/${TURSO_REF}"
           fi
 
           # Generate a unique nonce
@@ -155,7 +156,6 @@ jobs:
 
           echo "Event: $EVENT"
           echo "Ref: $REF"
-          echo "Ref name: $REF_NAME"
           echo "DO_PUBLISH=$DO_PUBLISH"
           echo "TURSO_REF=$TURSO_REF"
           echo "TARGET_BRANCH=$TARGET_BRANCH"
