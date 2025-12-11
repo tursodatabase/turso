@@ -244,6 +244,7 @@ jobs:
         uses: useblacksmith/setup-node@v5
         with:
           node-version: 20
+          registry-url: 'https://registry.npmjs.org'
       - name: Download all DB artifacts
         uses: actions/download-artifact@v4
         with:
@@ -266,22 +267,16 @@ jobs:
       - name: Publish
         if: "startsWith(github.ref, 'refs/tags/v')"
         run: |
-          npm config set provenance true
           if git log -1 --pretty=%B | grep "^Turso [0-9]\+\.[0-9]\+\.[0-9]\+$";
           then
-            echo "//registry.npmjs.org/:_authToken=$NPM_TOKEN" >> ~/.npmrc
-            npm publish --workspaces --access public
+            npm publish --workspaces --access public --provenance
           elif git log -1 --pretty=%B | grep "^Turso [0-9]\+\.[0-9]\+\.[0-9]\+";
           then
-            echo "//registry.npmjs.org/:_authToken=$NPM_TOKEN" >> ~/.npmrc
-            npm publish --workspaces --access public --tag next
+            npm publish --workspaces --access public --provenance --tag next
           else
             echo "git log structure is unexpected, skip publishing"
             npm publish --workspaces --dry-run
           fi
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
       - name: Publish (dry-run)
         if: "!startsWith(github.ref, 'refs/tags/v')"
         run: |
