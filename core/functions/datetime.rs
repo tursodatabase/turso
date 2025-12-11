@@ -669,10 +669,16 @@ fn parse_modifier_time(s: &str) -> Result<NaiveTime> {
 fn parse_modifier(modifier: &str) -> Result<Modifier> {
     // Small helpers to check string suffix/prefix in a case-insensitive way with no allocation
     fn ends_with_ignore_ascii_case(s: &str, suffix: &str) -> bool {
-        s.len() >= suffix.len() && s[s.len() - suffix.len()..].eq_ignore_ascii_case(suffix)
+        // suffix is always ASCII, so suffix.len() is the char count
+        // But s might have multi-byte UTF-8 chars, so we need to check char boundary
+        let start = s.len().saturating_sub(suffix.len());
+        s.is_char_boundary(start) && s[start..].eq_ignore_ascii_case(suffix)
     }
     fn starts_with_ignore_ascii_case(s: &str, prefix: &str) -> bool {
-        s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix)
+        // prefix is always ASCII, so prefix.len() is the char count
+        s.is_char_boundary(prefix.len())
+            && s.len() >= prefix.len()
+            && s[..prefix.len()].eq_ignore_ascii_case(prefix)
     }
 
     let modifier = modifier.trim();
@@ -1997,5 +2003,28 @@ mod tests {
             text("2024-01-01 12:00:00.000"),
             "Case insensitivity check failed"
         );
+    }
+
+    #[test]
+    fn test_parse_modifier_unicode_no_panic() {
+        // Regression test: parse_modifier should not panic on multi-byte UTF-8 strings
+        // that are shorter than expected modifier suffixes when measured in bytes
+        let unicode_inputs = [
+            "!*\u{ea37}", // <-- this produced a crash in SQLancer :]
+            "\u{1F600}",  // Emoji (4 bytes)
+            "日本語",     // Japanese text
+            "中",         // Single Chinese character
+            "\u{0080}",   // 2-byte UTF-8
+            "",           // Empty string
+        ];
+
+        for input in unicode_inputs {
+            // Should not panic - just return an error for invalid modifiers
+            let result = parse_modifier(input);
+            assert!(
+                result.is_err(),
+                "Expected error for invalid modifier: {input}"
+            );
+        }
     }
 }
