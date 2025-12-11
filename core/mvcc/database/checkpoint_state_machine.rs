@@ -205,7 +205,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 begin_ts = Some(b);
                 if self
                     .checkpointed_txid_max_old
-                    .is_none_or(|txid_max_old| b <= txid_max_old.into())
+                    .is_some_and(|txid_max_old| b <= txid_max_old.into())
                 {
                     exists_in_db_file = true;
                 }
