@@ -10,7 +10,7 @@ mod fuzz_tests {
     use rand_chacha::ChaCha8Rng;
     use rusqlite::{params, types::Value};
     use std::{collections::HashSet, io::Write};
-    use tempfile::NamedTempFile;
+    use tempfile::{NamedTempFile, TempDir};
 
     use core_tester::common::{
         do_flush, limbo_exec_rows, limbo_exec_rows_fallible, limbo_stmt_get_column_names,
@@ -238,7 +238,7 @@ mod fuzz_tests {
         let opts = db.db_opts;
         let flags = db.db_flags;
         let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
-        let table_defs: [&str; 8] = [
+        let table_defs = [
             "CREATE TABLE t (x, y, z, nonindexed_col, PRIMARY KEY (x, y, z))",
             "CREATE TABLE t (x, y, z, nonindexed_col, PRIMARY KEY (x desc, y, z))",
             "CREATE TABLE t (x, y, z, nonindexed_col, PRIMARY KEY (x, y desc, z))",
@@ -254,7 +254,8 @@ mod fuzz_tests {
             .map(|init_sql| builder.clone().with_init_sql(init_sql).build())
             .collect::<Vec<_>>();
         let mut pk_tuples = HashSet::new();
-        while pk_tuples.len() < 100000 {
+        let num_tuples = if opts.enable_mvcc { 10000 } else { 100000 };
+        while pk_tuples.len() < num_tuples {
             pk_tuples.insert((
                 rng.random_range(0..3000),
                 rng.random_range(0..3000),
@@ -273,20 +274,43 @@ mod fuzz_tests {
         }
         let insert = format!("INSERT INTO t VALUES {}", tuples.join(", "));
 
-        // Insert all tuples into all databases
-        let sqlite_conns = dbs
+        let tmp_dir = TempDir::new().unwrap();
+        let sqlite_paths: Vec<_> = dbs
             .iter()
-            .map(|db| rusqlite::Connection::open(db.path.clone()).unwrap())
+            .enumerate()
+            .map(|(i, db)| {
+                if opts.enable_mvcc {
+                    tmp_dir
+                        .path()
+                        .join(std::path::PathBuf::from(format!("sqlite_{i}.db")))
+                } else {
+                    db.path.clone()
+                }
+            })
+            .collect();
+        // Insert all tuples into all databases
+        // In mvcc we need to create separate databases as SQLite will not read an MVCC database
+        let sqlite_conns = sqlite_paths
+            .iter()
+            .map(|db| rusqlite::Connection::open(db).unwrap())
             .collect::<Vec<_>>();
-        for sqlite_conn in sqlite_conns.into_iter() {
+        for (i, sqlite_conn) in sqlite_conns.into_iter().enumerate() {
+            if opts.enable_mvcc {
+                sqlite_conn.execute(table_defs[i], []).unwrap();
+            }
             sqlite_conn.execute(&insert, params![]).unwrap();
             sqlite_conn.close().unwrap();
         }
-        let sqlite_conns = dbs
+        let sqlite_conns = sqlite_paths
             .iter()
-            .map(|db| rusqlite::Connection::open(db.path.clone()).unwrap())
+            .map(|db| rusqlite::Connection::open(db).unwrap())
             .collect::<Vec<_>>();
         let limbo_conns = dbs.iter().map(|db| db.connect_limbo()).collect::<Vec<_>>();
+        if opts.enable_mvcc {
+            for limbo_conn in limbo_conns.iter() {
+                limbo_conn.execute(&insert).unwrap();
+            }
+        }
 
         const COMPARISONS: [&str; 5] = ["=", "<", "<=", ">", ">="];
 
