@@ -284,30 +284,7 @@ jobs:
         with:
           go-version: "1.24.10"
 
-      - name: Update dependency to freshly built libs
-        if: steps.vars.outputs.do_publish == 'true'
-        id: update_dep
-        working-directory: bindings/go
-        shell: bash
-        env:
-          LIBS_BRANCH: ${{ steps.libs_branch.outputs.branch }}
-        run: |
-          set -euo pipefail
-          echo "Updating github.com/tursodatabase/turso-go-platform-libs to branch: $LIBS_BRANCH"
-
-          # Update dependency and tidy
-          go get "github.com/tursodatabase/turso-go-platform-libs@${LIBS_BRANCH}"
-          go mod tidy
-
-          # Determine the resolved pseudo-version
-          RESOLVED_VERSION="$(go list -m -json github.com/tursodatabase/turso-go-platform-libs | jq -r .Version)"
-          echo "resolved_version=$RESOLVED_VERSION" >> "$GITHUB_OUTPUT"
-          echo "Resolved version: $RESOLVED_VERSION"
-
-          echo "Changed files:"
-          git status --porcelain
-
-      - name: Create and push branch with updated go.mod
+      - name: Create branch
         if: steps.vars.outputs.do_publish == 'true'
         shell: bash
         working-directory: bindings/go
@@ -332,6 +309,44 @@ jobs:
             echo "Creating new branch $TARGET_BRANCH"
             git checkout -b "$TARGET_BRANCH"
           fi
+
+      - name: Update dependency to freshly built libs
+        if: steps.vars.outputs.do_publish == 'true'
+        id: update_dep
+        working-directory: bindings/go
+        shell: bash
+        env:
+          LIBS_BRANCH: ${{ steps.libs_branch.outputs.branch }}
+        run: |
+          set -euo pipefail
+          echo "Updating github.com/tursodatabase/turso-go-platform-libs to branch: $LIBS_BRANCH"
+
+          # Update dependency and tidy
+          go get "github.com/tursodatabase/turso-go-platform-libs@${LIBS_BRANCH}"
+          go mod tidy
+
+          # Determine the resolved pseudo-version
+          RESOLVED_VERSION="$(go list -m -json github.com/tursodatabase/turso-go-platform-libs | jq -r .Version)"
+          echo "resolved_version=$RESOLVED_VERSION" >> "$GITHUB_OUTPUT"
+          echo "Resolved version: $RESOLVED_VERSION"
+
+          echo "Changed files:"
+          git status --porcelain
+
+      - name: Push branch and tag with updated go.mod
+        if: steps.vars.outputs.do_publish == 'true'
+        shell: bash
+        working-directory: bindings/go
+        env:
+          TARGET_TAG: ${{ steps.vars.outputs.target_tag }}
+          TARGET_BRANCH: ${{ steps.vars.outputs.target_branch }}
+          NONCE: ${{ steps.vars.outputs.nonce }}
+          RESOLVED_VERSION: ${{ steps.update_dep.outputs.resolved_version }}
+        run: |
+          set -euo pipefail
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
 
           # Stage changes if any
           git add go.mod go.sum || true
