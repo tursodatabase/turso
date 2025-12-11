@@ -887,7 +887,7 @@ impl Pager {
             let page = Arc::new(Page::new(page_id as i64));
             let c = subjournal.read_page(
                 current_offset,
-                page_buffer.clone(),
+                page_buffer,
                 page.clone(),
                 page_size as usize,
             )?;
@@ -1592,7 +1592,7 @@ impl Pager {
                 "attempted to read page {page_idx} but got page {}",
                 page.get().id
             );
-            return Ok((page.clone(), None));
+            return Ok((page, None));
         }
         let (page, c) = self.read_page_no_cache(page_idx, None, false)?;
         turso_assert!(
@@ -1628,7 +1628,7 @@ impl Pager {
         page_cache: &mut PageCache,
     ) -> Result<()> {
         let page_key = PageCacheKey::new(page_idx);
-        match page_cache.insert(page_key, page.clone()) {
+        match page_cache.insert(page_key, page) {
             Ok(_) => {}
             Err(CacheError::KeyExists) => {
                 unreachable!("Page should not exist in cache after get() miss")
@@ -1660,7 +1660,7 @@ impl Pager {
                 tracing::debug!(
                     "cache_get_for_checkpoint: page {page_idx} frame {target_frame} is valid",
                 );
-                Some(page.clone())
+                Some(page)
             } else {
                 tracing::trace!(
                     "cache_get_for_checkpoint: page {} has frame/tag {:?}: (dirty={}), need frame {} and seq {seq}",
@@ -2472,7 +2472,7 @@ impl Pager {
                 // After we wrote the header page, we may now set this None, to signify we initialized
                 self.init_page_1.store(None);
                 *self.allocate_page1_state.write() = AllocatePage1State::Done;
-                Ok(IOResult::Done(page.clone()))
+                Ok(IOResult::Done(page))
             }
             AllocatePage1State::Done => unreachable!("cannot try to allocate page 1 again"),
         }
@@ -2531,7 +2531,7 @@ impl Pager {
                             self.add_dirty(&page)?;
                             let page_key = PageCacheKey::new(page.get().id as usize);
                             let mut cache = self.page_cache.write();
-                            cache.insert(page_key, page.clone())?;
+                            cache.insert(page_key, page)?;
                         }
                     }
 
@@ -2692,9 +2692,7 @@ impl Pager {
                         let page_key = PageCacheKey::new(richard_hipp_special_page.get().id);
                         {
                             let mut cache = self.page_cache.write();
-                            cache
-                                .insert(page_key, richard_hipp_special_page.clone())
-                                .unwrap();
+                            cache.insert(page_key, richard_hipp_special_page).unwrap();
                         }
                         // HIPP special page is assumed to zeroed and should never be read or written to by the BTREE
                         new_db_size += 1;
