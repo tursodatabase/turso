@@ -16,8 +16,9 @@ use crate::schema::Type;
 use crate::storage::btree::{BTreeCursor, BTreeKey, CursorTrait};
 // Note: logical module must be made pub(crate) in translate/mod.rs
 use crate::translate::logical::{
-    BinaryOperator, Column, ColumnInfo, JoinType as LogicalJoinType, LogicalExpr, LogicalPlan,
-    LogicalSchema, SchemaRef,
+    Aggregate, BinaryOperator, Column, ColumnInfo, Distinct, Filter, Join,
+    JoinType as LogicalJoinType, Limit, LogicalExpr, LogicalPlan, LogicalSchema, Projection,
+    SchemaRef, Sort, Union,
 };
 use crate::types::{IOResult, ImmutableRecord, SeekKey, SeekOp, SeekResult, Value};
 use crate::Pager;
@@ -838,6 +839,78 @@ impl DbspCircuit {
     }
 }
 
+/// Inline all CTEs in a logical plan, replacing CTERef nodes with their definitions.
+/// This transforms a plan with WithCTE/CTERef nodes into an equivalent plan without them.
+fn inline_ctes(plan: &LogicalPlan, cte_map: &HashMap<String, Arc<LogicalPlan>>) -> LogicalPlan {
+    match plan {
+        LogicalPlan::WithCTE(with_cte) => {
+            // First, inline any CTEs within the CTE definitions themselves (for nested CTEs)
+            let mut expanded_ctes = cte_map.clone();
+            for (name, cte_plan) in &with_cte.ctes {
+                let inlined = inline_ctes(cte_plan, &expanded_ctes);
+                expanded_ctes.insert(name.clone(), Arc::new(inlined));
+            }
+            // Then inline the body with all CTEs available
+            inline_ctes(&with_cte.body, &expanded_ctes)
+        }
+        LogicalPlan::CTERef(cte_ref) => {
+            // Replace CTERef with the actual CTE definition
+            match cte_map.get(&cte_ref.name) {
+                Some(cte_plan) => (**cte_plan).clone(),
+                None => panic!("CTE '{}' not found in scope", cte_ref.name),
+            }
+        }
+        LogicalPlan::Projection(proj) => LogicalPlan::Projection(Projection {
+            input: Arc::new(inline_ctes(&proj.input, cte_map)),
+            exprs: proj.exprs.clone(),
+            schema: proj.schema.clone(),
+        }),
+        LogicalPlan::Filter(filter) => LogicalPlan::Filter(Filter {
+            input: Arc::new(inline_ctes(&filter.input, cte_map)),
+            predicate: filter.predicate.clone(),
+        }),
+        LogicalPlan::Aggregate(agg) => LogicalPlan::Aggregate(Aggregate {
+            input: Arc::new(inline_ctes(&agg.input, cte_map)),
+            group_expr: agg.group_expr.clone(),
+            aggr_expr: agg.aggr_expr.clone(),
+            schema: agg.schema.clone(),
+        }),
+        LogicalPlan::Join(join) => LogicalPlan::Join(Join {
+            left: Arc::new(inline_ctes(&join.left, cte_map)),
+            right: Arc::new(inline_ctes(&join.right, cte_map)),
+            join_type: join.join_type,
+            on: join.on.clone(),
+            filter: join.filter.clone(),
+            schema: join.schema.clone(),
+        }),
+        LogicalPlan::Sort(sort) => LogicalPlan::Sort(Sort {
+            input: Arc::new(inline_ctes(&sort.input, cte_map)),
+            exprs: sort.exprs.clone(),
+        }),
+        LogicalPlan::Limit(limit) => LogicalPlan::Limit(Limit {
+            input: Arc::new(inline_ctes(&limit.input, cte_map)),
+            skip: limit.skip,
+            fetch: limit.fetch,
+        }),
+        LogicalPlan::Union(union) => LogicalPlan::Union(Union {
+            inputs: union
+                .inputs
+                .iter()
+                .map(|input| Arc::new(inline_ctes(input, cte_map)))
+                .collect(),
+            all: union.all,
+            schema: union.schema.clone(),
+        }),
+        LogicalPlan::Distinct(distinct) => LogicalPlan::Distinct(Distinct {
+            input: Arc::new(inline_ctes(&distinct.input, cte_map)),
+        }),
+        // Leaf nodes - no recursion needed
+        LogicalPlan::TableScan(_)
+        | LogicalPlan::EmptyRelation(_)
+        | LogicalPlan::Values(_) => plan.clone(),
+    }
+}
+
 /// Compiler from LogicalPlan to DBSP Circuit
 pub struct DbspCompiler {
     circuit: DbspCircuit,
@@ -925,8 +998,10 @@ impl DbspCompiler {
 
     /// Compile a logical plan to a DBSP circuit
     pub fn compile(mut self, plan: &LogicalPlan) -> Result<DbspCircuit> {
-        let root_id = self.compile_plan(plan)?;
-        let output_schema = plan.schema().clone();
+        // First, inline any CTEs in the plan
+        let inlined_plan = inline_ctes(plan, &HashMap::new());
+        let root_id = self.compile_plan(&inlined_plan)?;
+        let output_schema = inlined_plan.schema().clone();
         self.circuit.set_root(root_id, output_schema);
         Ok(self.circuit)
     }
@@ -6111,5 +6186,45 @@ mod tests {
         assert_eq!(left_idx, 0);
         assert_eq!(actual_right.name, "right_id");
         assert_eq!(right_idx, 0);
+    }
+
+    #[test]
+    fn test_simple_cte() {
+        // Simple CTE: WITH active_users AS (SELECT * FROM users WHERE age > 18) SELECT name FROM active_users
+        let (circuit, _) =
+            compile_sql!("WITH active_users AS (SELECT * FROM users WHERE age > 18) SELECT name FROM active_users");
+
+        // After CTE inlining, this should be equivalent to:
+        // SELECT name FROM (SELECT * FROM users WHERE age > 18)
+        // Which compiles to: Projection (name) -> Projection (*) -> Filter -> Input
+        assert_circuit!(circuit, depth: 4, root: Projection);
+        assert_operator!(circuit, 0, Projection { columns: ["name"] });
+        assert_operator!(circuit, 1, Projection { columns: ["id", "name", "age"] });
+        assert_operator!(circuit, 2, Filter);
+        assert_operator!(circuit, 3, Input { name: "users" });
+    }
+
+    #[test]
+    fn test_cte_with_aggregation() {
+        // CTE with aggregation in the main query
+        let (mut circuit, pager) = compile_sql!(
+            "WITH user_ages AS (SELECT age FROM users) SELECT COUNT(*) FROM user_ages"
+        );
+
+        // After CTE inlining: Aggregate -> Projection -> Input
+        assert_circuit!(circuit, depth: 3, root: Aggregate);
+
+        // Test execution
+        let mut input_delta = Delta::new();
+        input_delta.insert(1, vec![Value::Integer(1), Value::Text("Alice".into()), Value::Integer(25)]);
+        input_delta.insert(2, vec![Value::Integer(2), Value::Text("Bob".into()), Value::Integer(30)]);
+
+        let mut inputs = HashMap::new();
+        inputs.insert("users".to_string(), input_delta);
+
+        let result = test_execute(&mut circuit, inputs, pager).unwrap();
+        assert_eq!(result.changes.len(), 1);
+        // COUNT(*) should be 2
+        assert_eq!(result.changes[0].0.values[0], Value::Integer(2));
     }
 }
