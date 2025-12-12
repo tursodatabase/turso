@@ -137,10 +137,10 @@ fn test_vector_sparse_ivf_insert_query(tmp_db: TempDatabase) {
             Register::Value(Value::Integer((i + 1) as i64)),
         ];
         run(&tmp_db, || cursor.insert(&values)).unwrap();
-        limbo_exec_rows(
-            &conn,
-            &format!("INSERT INTO t VALUES ('{i}', vector32_sparse('{vector_str}'))"),
-        );
+        conn.execute(format!(
+            "INSERT INTO t VALUES ('{i}', vector32_sparse('{vector_str}'))"
+        ))
+        .unwrap();
     }
     for (vector, results) in [
         ("[0, 0, 0, 1]", &[(1, 0.0)][..]),
@@ -232,19 +232,19 @@ fn test_vector_sparse_ivf_update(tmp_db: TempDatabase) {
         Register::Value(Value::Integer(1)),
     ];
     run(&tmp_db, || writer.insert(&insert0_values)).unwrap();
-    limbo_exec_rows(
-        &conn,
-        &format!("INSERT INTO t VALUES ('test', vector32_sparse('{v0_str}'))"),
-    );
+    conn.execute(format!(
+        "INSERT INTO t VALUES ('test', vector32_sparse('{v0_str}'))"
+    ))
+    .unwrap();
 
     let mut reader = attached.init().unwrap();
     run(&tmp_db, || reader.open_read(&conn)).unwrap();
     assert!(!run(&tmp_db, || reader.query_start(&query_values)).unwrap());
 
-    limbo_exec_rows(
-        &conn,
-        &format!("UPDATE t SET embedding = vector32_sparse('{v1_str}') WHERE rowid = 1"),
-    );
+    conn.execute(format!(
+        "UPDATE t SET embedding = vector32_sparse('{v1_str}') WHERE rowid = 1"
+    ))
+    .unwrap();
     run(&tmp_db, || writer.delete(&insert0_values)).unwrap();
     run(&tmp_db, || writer.insert(&insert1_values)).unwrap();
 

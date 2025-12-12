@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use crate::common::{limbo_exec_rows, TempDatabase};
+use crate::common::{ExecRows, TempDatabase};
 use turso_core::StepResult;
 
 fn explain_plans(conn: &Arc<turso_core::Connection>, sql: &str) -> anyhow::Result<Vec<String>> {
@@ -40,8 +40,8 @@ fn expression_index_used_for_where() -> anyhow::Result<()> {
         "expected query plan to mention idx_expr, got {plans:?}"
     );
 
-    let rows = limbo_exec_rows(&conn, "SELECT a, b FROM t WHERE a + b = 7");
-    assert_eq!(rows, vec![vec![3.into(), 4.into()]]);
+    let rows: Vec<(i64, i64)> = conn.exec_rows("SELECT a, b FROM t WHERE a + b = 7");
+    assert_eq!(rows, vec![(3, 4)]);
     Ok(())
 }
 
@@ -66,11 +66,9 @@ fn expression_index_used_for_order_by() -> anyhow::Result<()> {
         "expected query plan to mention idx_expr_order, got {plans:?}"
     );
 
-    let rows = limbo_exec_rows(
-        &conn,
-        "SELECT a, b FROM t WHERE a + b > 0 ORDER BY a + b DESC LIMIT 1",
-    );
-    assert_eq!(rows, vec![vec![0.into(), 5.into()]]);
+    let rows: Vec<(i64, i64)> =
+        conn.exec_rows("SELECT a, b FROM t WHERE a + b > 0 ORDER BY a + b DESC LIMIT 1");
+    assert_eq!(rows, vec![(0, 5)]);
     Ok(())
 }
 
@@ -94,7 +92,7 @@ fn expression_index_covering_scan() -> anyhow::Result<()> {
         "expected covering index usage, got {plans:?}"
     );
 
-    let rows = limbo_exec_rows(&conn, "SELECT a + b FROM t ORDER BY a + b");
-    assert_eq!(rows, vec![vec![3.into()], vec![7.into()], vec![11.into()]]);
+    let rows: Vec<(i64,)> = conn.exec_rows("SELECT a + b FROM t ORDER BY a + b");
+    assert_eq!(rows, vec![(3,), (7,), (11,)]);
     Ok(())
 }

@@ -1,4 +1,6 @@
-use crate::common::{self, limbo_exec_rows, maybe_setup_tracing, rusqlite_integrity_check};
+use crate::common::{
+    self, limbo_exec_rows, maybe_setup_tracing, rusqlite_integrity_check, ExecRows,
+};
 use crate::common::{compare_string, do_flush, TempDatabase};
 use log::debug;
 use std::io::{Read, Seek, Write};
@@ -928,14 +930,8 @@ pub fn upsert_conflict(limbo: TempDatabase) {
     ] {
         conn.execute(sql).unwrap();
     }
-    assert_eq!(
-        vec![vec![
-            rusqlite::types::Value::Integer(1),
-            rusqlite::types::Value::Integer(2),
-            rusqlite::types::Value::Integer(42),
-        ]],
-        limbo_exec_rows(&conn, "SELECT * FROM t")
-    );
+    let rows: Vec<(i64, i64, i64)> = conn.exec_rows("SELECT * FROM t");
+    assert_eq!(rows, vec![(1, 2, 42)]);
 }
 
 #[turso_macros::test]
@@ -1084,16 +1080,11 @@ pub fn concurrent_commit_and_insert_over_single_connection(limbo: TempDatabase) 
             r => panic!("unexpected step result: {r:?}"),
         }
     }
-    assert_eq!(
-        limbo_exec_rows(&conn1, "SELECT * FROM t"),
-        vec![
-            vec![rusqlite::types::Value::Integer(1)],
-            vec![rusqlite::types::Value::Integer(2)],
-            vec![rusqlite::types::Value::Integer(3)]
-        ]
-    );
+    let rows: Vec<(i64,)> = conn1.exec_rows("SELECT * FROM t");
+    assert_eq!(rows, vec![(1,), (2,), (3,)]);
     conn1.execute("ROLLBACK").unwrap();
-    assert!(limbo_exec_rows(&conn1, "SELECT * FROM t").is_empty());
+    let rows: Vec<(i64,)> = conn1.exec_rows("SELECT * FROM t");
+    assert!(rows.is_empty());
 }
 
 #[turso_macros::test]
@@ -1129,23 +1120,11 @@ pub fn concurrent_rollback_and_insert_over_single_connection(limbo: TempDatabase
             r => panic!("unexpected step result: {r:?}"),
         }
     }
-    assert_eq!(
-        limbo_exec_rows(&conn1, "SELECT * FROM t"),
-        vec![
-            vec![rusqlite::types::Value::Integer(1)],
-            vec![rusqlite::types::Value::Integer(2)],
-            vec![rusqlite::types::Value::Integer(3)]
-        ]
-    );
+    let rows: Vec<(i64,)> = conn1.exec_rows("SELECT * FROM t");
+    assert_eq!(rows, vec![(1,), (2,), (3,)]);
     conn1.execute("COMMIT").unwrap();
-    assert_eq!(
-        limbo_exec_rows(&conn1, "SELECT * FROM t"),
-        vec![
-            vec![rusqlite::types::Value::Integer(1)],
-            vec![rusqlite::types::Value::Integer(2)],
-            vec![rusqlite::types::Value::Integer(3)]
-        ]
-    );
+    let rows: Vec<(i64,)> = conn1.exec_rows("SELECT * FROM t");
+    assert_eq!(rows, vec![(1,), (2,), (3,)]);
 }
 
 #[test]
@@ -1165,48 +1144,26 @@ fn test_unique_complex_key() {
     let tmp_db = TempDatabase::builder().with_db_path(db_path.path()).build();
     let conn = tmp_db.connect_limbo();
 
+    let rows: Vec<(String, String, String)> = conn.exec_rows("SELECT * FROM t");
     assert_eq!(
-        limbo_exec_rows(&conn, "SELECT * FROM t"),
+        rows,
         vec![
-            vec![
-                rusqlite::types::Value::Text("1".into()),
-                rusqlite::types::Value::Text("2".into()),
-                rusqlite::types::Value::Text("a".into()),
-            ],
-            vec![
-                rusqlite::types::Value::Text("3".into()),
-                rusqlite::types::Value::Text("4".into()),
-                rusqlite::types::Value::Text("b".into()),
-            ]
+            ("1".to_string(), "2".to_string(), "a".to_string()),
+            ("3".to_string(), "4".to_string(), "b".to_string()),
         ]
     );
+    let rows: Vec<(String, String)> = conn.exec_rows("SELECT a, b FROM t");
     assert_eq!(
-        limbo_exec_rows(&conn, "SELECT a, b FROM t"),
+        rows,
         vec![
-            vec![
-                rusqlite::types::Value::Text("1".into()),
-                rusqlite::types::Value::Text("2".into()),
-            ],
-            vec![
-                rusqlite::types::Value::Text("3".into()),
-                rusqlite::types::Value::Text("4".into()),
-            ]
+            ("1".to_string(), "2".to_string()),
+            ("3".to_string(), "4".to_string()),
         ]
     );
 
-    assert_eq!(
-        limbo_exec_rows(&conn, "SELECT a FROM t"),
-        vec![
-            vec![rusqlite::types::Value::Text("1".into()),],
-            vec![rusqlite::types::Value::Text("3".into()),]
-        ]
-    );
+    let rows: Vec<(String,)> = conn.exec_rows("SELECT a FROM t");
+    assert_eq!(rows, vec![("1".to_string(),), ("3".to_string(),)]);
 
-    assert_eq!(
-        limbo_exec_rows(&conn, "SELECT b FROM t"),
-        vec![
-            vec![rusqlite::types::Value::Text("2".into()),],
-            vec![rusqlite::types::Value::Text("4".into()),]
-        ]
-    );
+    let rows: Vec<(String,)> = conn.exec_rows("SELECT b FROM t");
+    assert_eq!(rows, vec![("2".to_string(),), ("4".to_string(),)]);
 }

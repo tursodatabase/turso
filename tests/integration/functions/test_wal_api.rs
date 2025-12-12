@@ -2,14 +2,13 @@ use std::{collections::HashSet, path::PathBuf, sync::Arc};
 
 use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
-use rusqlite::types::Value;
 use tempfile::TempDir;
 use turso_core::{
     types::{WalFrameInfo, WalState},
     CheckpointMode, LimboError, StepResult,
 };
 
-use crate::common::{limbo_exec_rows, rng_from_time, TempDatabase};
+use crate::common::{rng_from_time, ExecRows, TempDatabase};
 
 // TODO: mvcc
 #[turso_macros::test()]
@@ -60,14 +59,8 @@ fn test_wal_frame_transfer_no_schema_changes(db: TempDatabase) {
 
     conn2.wal_insert_end(false).unwrap();
     assert_eq!(conn2.wal_state().unwrap().max_frame, 15);
-    assert_eq!(
-        limbo_exec_rows(&conn2, "SELECT x, length(y) FROM t"),
-        vec![
-            vec![Value::Integer(5), Value::Integer(1)],
-            vec![Value::Integer(10), Value::Integer(2)],
-            vec![Value::Integer(1024), Value::Integer(40960)],
-        ]
-    );
+    let rows: Vec<(i64, i64)> = conn2.exec_rows("SELECT x, length(y) FROM t");
+    assert_eq!(rows, vec![(5, 1), (10, 2), (1024, 40960)]);
 }
 
 // TODO: mvcc
@@ -99,14 +92,10 @@ fn test_wal_frame_transfer_various_schema_changes(db: TempDatabase) {
     };
 
     sync();
-    assert_eq!(
-        limbo_exec_rows(&conn2, "SELECT * FROM t"),
-        vec![] as Vec<Vec<rusqlite::types::Value>>
-    );
-    assert_eq!(
-        limbo_exec_rows(&conn3, "SELECT * FROM t"),
-        vec![] as Vec<Vec<rusqlite::types::Value>>
-    );
+    let rows: Vec<(i64, i64)> = conn2.exec_rows("SELECT * FROM t");
+    assert!(rows.is_empty());
+    let rows: Vec<(i64, i64)> = conn3.exec_rows("SELECT * FROM t");
+    assert!(rows.is_empty());
 
     conn1.execute("DROP TABLE t").unwrap();
 
@@ -124,14 +113,10 @@ fn test_wal_frame_transfer_various_schema_changes(db: TempDatabase) {
     conn1.execute("CREATE TABLE b(x, y)").unwrap();
 
     sync();
-    assert_eq!(
-        limbo_exec_rows(&conn2, "SELECT 1 FROM a UNION ALL SELECT 1 FROM b"),
-        vec![] as Vec<Vec<rusqlite::types::Value>>
-    );
-    assert_eq!(
-        limbo_exec_rows(&conn3, "SELECT 1 FROM a UNION ALL SELECT 1 FROM b"),
-        vec![] as Vec<Vec<rusqlite::types::Value>>
-    );
+    let rows: Vec<(i64,)> = conn2.exec_rows("SELECT 1 FROM a UNION ALL SELECT 1 FROM b");
+    assert!(rows.is_empty());
+    let rows: Vec<(i64,)> = conn3.exec_rows("SELECT 1 FROM a UNION ALL SELECT 1 FROM b");
+    assert!(rows.is_empty());
 }
 
 // TODO: mvcc
@@ -168,14 +153,8 @@ fn test_wal_frame_transfer_schema_changes(db: TempDatabase) {
     conn2.wal_insert_end(false).unwrap();
     assert_eq!(commits, 3);
     assert_eq!(conn2.wal_state().unwrap().max_frame, 15);
-    assert_eq!(
-        limbo_exec_rows(&conn2, "SELECT x, length(y) FROM t"),
-        vec![
-            vec![Value::Integer(5), Value::Integer(1)],
-            vec![Value::Integer(10), Value::Integer(2)],
-            vec![Value::Integer(1024), Value::Integer(40960)],
-        ]
-    );
+    let rows: Vec<(i64, i64)> = conn2.exec_rows("SELECT x, length(y) FROM t");
+    assert_eq!(rows, vec![(5, 1), (10, 2), (1024, 40960)]);
 }
 
 // TODO: mvcc
@@ -208,18 +187,14 @@ fn test_wal_frame_transfer_no_schema_changes_rollback(db: TempDatabase) {
     }
     conn2.wal_insert_end(false).unwrap();
     assert_eq!(conn2.wal_state().unwrap().max_frame, 2);
-    assert_eq!(
-        limbo_exec_rows(&conn2, "SELECT x, length(y) FROM t"),
-        vec![] as Vec<Vec<rusqlite::types::Value>>
-    );
+    let rows: Vec<(i64, i64)> = conn2.exec_rows("SELECT x, length(y) FROM t");
+    assert!(rows.is_empty());
     conn2.execute("CREATE TABLE q(x)").unwrap();
     conn2
         .execute("INSERT INTO q VALUES (randomblob(4096 * 10))")
         .unwrap();
-    assert_eq!(
-        limbo_exec_rows(&conn2, "SELECT x, LENGTH(y) FROM t"),
-        vec![] as Vec<Vec<rusqlite::types::Value>>
-    );
+    let rows: Vec<(i64, i64)> = conn2.exec_rows("SELECT x, LENGTH(y) FROM t");
+    assert!(rows.is_empty());
 }
 
 // TODO: mvcc
@@ -248,18 +223,14 @@ fn test_wal_frame_transfer_schema_changes_rollback(db: TempDatabase) {
     }
     conn2.wal_insert_end(false).unwrap();
     assert_eq!(conn2.wal_state().unwrap().max_frame, 2);
-    assert_eq!(
-        limbo_exec_rows(&conn2, "SELECT x, length(y) FROM t"),
-        vec![] as Vec<Vec<rusqlite::types::Value>>
-    );
+    let rows: Vec<(i64, i64)> = conn2.exec_rows("SELECT x, length(y) FROM t");
+    assert!(rows.is_empty());
     conn2.execute("CREATE TABLE q(x)").unwrap();
     conn2
         .execute("INSERT INTO q VALUES (randomblob(4096 * 10))")
         .unwrap();
-    assert_eq!(
-        limbo_exec_rows(&conn2, "SELECT x, LENGTH(y) FROM t"),
-        vec![] as Vec<Vec<rusqlite::types::Value>>
-    );
+    let rows: Vec<(i64, i64)> = conn2.exec_rows("SELECT x, LENGTH(y) FROM t");
+    assert!(rows.is_empty());
 }
 
 // TODO: mvcc
@@ -371,10 +342,8 @@ fn test_wal_frame_api_no_schema_changes_fuzz(db: TempDatabase) {
                 if rng.next_u32() % 10 == 0 {
                     synced_frame = rng.next_u32() as u64 % synced_frame;
                 }
-                assert_eq!(
-                    limbo_exec_rows(&conn2, "SELECT COUNT(*) FROM t"),
-                    vec![vec![Value::Integer(size as i64)]]
-                );
+                let rows: Vec<(i64,)> = conn2.exec_rows("SELECT COUNT(*) FROM t");
+                assert_eq!(rows, vec![(size as i64,)]);
             }
         }
     }
@@ -479,28 +448,18 @@ fn test_wal_api_revert_pages(db1: TempDatabase) {
         .execute("INSERT INTO t VALUES (1024, randomblob(4096 * 2))")
         .unwrap();
 
-    assert_eq!(
-        limbo_exec_rows(&conn1, "SELECT x, length(y) FROM t"),
-        vec![
-            vec![Value::Integer(1), Value::Integer(10)],
-            vec![Value::Integer(3), Value::Integer(20)],
-            vec![Value::Integer(1024), Value::Integer(4096 * 2)],
-        ]
-    );
+    let rows: Vec<(i64, i64)> = conn1.exec_rows("SELECT x, length(y) FROM t");
+    assert_eq!(rows, vec![(1, 10), (3, 20), (1024, 4096 * 2)]);
 
     revert_to(&conn1, watermark2).unwrap();
 
-    assert_eq!(
-        limbo_exec_rows(&conn1, "SELECT x, length(y) FROM t"),
-        vec![vec![Value::Integer(1), Value::Integer(10)],]
-    );
+    let rows: Vec<(i64, i64)> = conn1.exec_rows("SELECT x, length(y) FROM t");
+    assert_eq!(rows, vec![(1, 10)]);
 
     revert_to(&conn1, watermark1).unwrap();
 
-    assert_eq!(
-        limbo_exec_rows(&conn1, "SELECT x, length(y) FROM t"),
-        vec![] as Vec<Vec<Value>>,
-    );
+    let rows: Vec<(i64, i64)> = conn1.exec_rows("SELECT x, length(y) FROM t");
+    assert!(rows.is_empty());
 }
 
 // TODO: mvcc
@@ -710,10 +669,8 @@ fn test_wal_revert_change_db_size(db: TempDatabase) {
     writer
         .execute("insert into t values (3, randomblob(30 * 4096))")
         .unwrap();
-    assert_eq!(
-        limbo_exec_rows(&writer, "SELECT x, length(y) FROM t"),
-        vec![vec![Value::Integer(3), Value::Integer(30 * 4096)]]
-    );
+    let rows: Vec<(i64, i64)> = writer.exec_rows("SELECT x, length(y) FROM t");
+    assert_eq!(rows, vec![(3, 30 * 4096)]);
 }
 
 // TODO: mvcc
