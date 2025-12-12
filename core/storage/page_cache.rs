@@ -432,11 +432,6 @@ impl PageCache {
                     pgno: entry.page.get().id,
                 });
             }
-        }
-
-        // Clean all pages
-        for &entry_ptr in self.map.values() {
-            let entry = unsafe { &*entry_ptr };
             entry.page.clear_loaded();
             let _ = entry.page.get().contents.take();
         }
