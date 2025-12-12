@@ -8,6 +8,7 @@ use crate::Statement;
 use std::fmt::Debug;
 use std::sync::atomic::AtomicU8;
 use std::sync::atomic::Ordering;
+use std::sync::MutexGuard;
 use std::sync::{Arc, Mutex};
 #[cfg(feature = "conn_raw_api")]
 use turso_core::types::WalFrameInfo;
@@ -108,12 +109,21 @@ impl Connection {
         stmt.execute(params).await
     }
 
-    #[cfg(feature = "conn_raw_api")]
-    pub fn wal_frame_count(&self) -> Result<u64> {
-        let conn = self
+    /// get the inner connection
+    fn get_inner_connection(&self) -> Result<MutexGuard<'_, Arc<turso_core::Connection>>> {
+        Ok(self
             .inner
             .lock()
-            .map_err(|e| Error::MutexError(e.to_string()))?;
+            .map_err(|e| Error::MutexError(e.to_string()))?)
+    }
+
+    #[cfg(feature = "conn_raw_api")]
+    pub fn wal_frame_count(&self) -> Result<u64> {
+        let conn = self.get_inner_connection()?;
+        //  let conn:  = self
+        //      .inner
+        //      .lock();
+        //     .map_err(|e| Error::MutexError(e.to_string()))?;
         conn.wal_state()
             .map_err(|e| Error::WalOperationError(format!("wal_insert_begin failed: {e}")))
             .map(|state| state.max_frame)
@@ -126,10 +136,7 @@ impl Connection {
         page: &mut [u8],
         frame_watermark: Option<u64>,
     ) -> Result<bool> {
-        let conn = self
-            .inner
-            .lock()
-            .map_err(|e| Error::MutexError(e.to_string()))?;
+        let conn = self.get_inner_connection()?;
         conn.try_wal_watermark_read_page(page_idx, page, frame_watermark)
             .map_err(|e| {
                 Error::WalOperationError(format!("try_wal_watermark_read_page failed: {e}"))
@@ -138,50 +145,35 @@ impl Connection {
 
     #[cfg(feature = "conn_raw_api")]
     pub fn wal_changed_pages_after(&self, frame_watermark: u64) -> Result<Vec<u32>> {
-        let conn = self
-            .inner
-            .lock()
-            .map_err(|e| Error::MutexError(e.to_string()))?;
+        let conn = self.get_inner_connection()?;
         conn.wal_changed_pages_after(frame_watermark)
             .map_err(|e| Error::WalOperationError(format!("wal_changed_pages_after failed: {e}")))
     }
 
     #[cfg(feature = "conn_raw_api")]
     pub fn wal_insert_begin(&self) -> Result<()> {
-        let conn = self
-            .inner
-            .lock()
-            .map_err(|e| Error::MutexError(e.to_string()))?;
+        let conn = self.get_inner_connection()?;
         conn.wal_insert_begin()
             .map_err(|e| Error::WalOperationError(format!("wal_insert_begin failed: {e}")))
     }
 
     #[cfg(feature = "conn_raw_api")]
     pub fn wal_insert_end(&self, force_commit: bool) -> Result<()> {
-        let conn = self
-            .inner
-            .lock()
-            .map_err(|e| Error::MutexError(e.to_string()))?;
+        let conn = self.get_inner_connection()?;
         conn.wal_insert_end(force_commit)
             .map_err(|e| Error::WalOperationError(format!("wal_insert_end failed: {e}")))
     }
 
     #[cfg(feature = "conn_raw_api")]
     pub fn wal_insert_frame(&self, frame_no: u64, frame: &[u8]) -> Result<WalFrameInfo> {
-        let conn = self
-            .inner
-            .lock()
-            .map_err(|e| Error::MutexError(e.to_string()))?;
+        let conn = self.get_inner_connection()?;
         conn.wal_insert_frame(frame_no, frame)
             .map_err(|e| Error::WalOperationError(format!("wal_insert_frame failed: {e}")))
     }
 
     #[cfg(feature = "conn_raw_api")]
     pub fn wal_get_frame(&self, frame_no: u64, frame: &mut [u8]) -> Result<WalFrameInfo> {
-        let conn = self
-            .inner
-            .lock()
-            .map_err(|e| Error::MutexError(e.to_string()))?;
+        let conn = self.get_inner_connection()?;
         conn.wal_get_frame(frame_no, frame)
             .map_err(|e| Error::WalOperationError(format!("wal_insert_frame failed: {e}")))
     }
@@ -195,11 +187,7 @@ impl Connection {
 
     /// Prepare a SQL statement for later execution.
     pub async fn prepare(&self, sql: &str) -> Result<Statement> {
-        let conn = self
-            .inner
-            .lock()
-            .map_err(|e| Error::MutexError(e.to_string()))?;
-
+        let conn = self.get_inner_connection()?;
         let stmt = conn.prepare(sql)?;
 
         #[allow(clippy::arc_with_non_send_sync)]
@@ -211,10 +199,7 @@ impl Connection {
 
     async fn prepare_execute_batch(&self, sql: impl AsRef<str>) -> Result<()> {
         self.maybe_handle_dangling_tx().await?;
-        let conn = self
-            .inner
-            .lock()
-            .map_err(|e| Error::MutexError(e.to_string()))?;
+        let conn = self.get_inner_connection()?;
         conn.prepare_execute_batch(sql)?;
         Ok(())
     }
@@ -224,11 +209,7 @@ impl Connection {
     where
         F: FnMut(&Row) -> turso_core::Result<()>,
     {
-        let conn = self
-            .inner
-            .lock()
-            .map_err(|e| Error::MutexError(e.to_string()))?;
-
+        let conn = self.get_inner_connection()?;
         let rows: Vec<Row> = conn
             .pragma_query(pragma_name)
             .map_err(|e| Error::SqlExecutionFailure(e.to_string()))?
@@ -246,17 +227,15 @@ impl Connection {
 
     /// Returns the rowid of the last row inserted.
     pub fn last_insert_rowid(&self) -> i64 {
-        let conn = self.inner.lock().unwrap();
+        //let conn = self.inner.lock().unwrap();
+        let conn = self.get_inner_connection().unwrap();
         conn.last_insert_rowid()
     }
 
     /// Flush dirty pages to disk.
     /// This will write the dirty pages to the WAL.
     pub fn cacheflush(&self) -> Result<()> {
-        let conn = self
-            .inner
-            .lock()
-            .map_err(|e| Error::MutexError(e.to_string()))?;
+        let conn = self.get_inner_connection()?;
         let completions = conn.cacheflush()?;
         let pager = conn.get_pager();
         for c in completions {
@@ -266,11 +245,7 @@ impl Connection {
     }
 
     pub fn is_autocommit(&self) -> Result<bool> {
-        let conn = self
-            .inner
-            .lock()
-            .map_err(|e| Error::MutexError(e.to_string()))?;
-
+        let conn = self.get_inner_connection()?;
         Ok(conn.get_auto_commit())
     }
 
@@ -289,10 +264,7 @@ impl Connection {
     /// 4. Step through query -> returns Busy -> sleep/yield for 2 ms (totaling 5 ms of sleep)
     /// 5. Step through query -> returns Busy -> return Busy to user
     pub fn busy_timeout(&self, duration: std::time::Duration) -> Result<()> {
-        let conn = self
-            .inner
-            .lock()
-            .map_err(|e| Error::MutexError(e.to_string()))?;
+        let conn = self.get_inner_connection()?;
         conn.set_busy_timeout(duration);
         Ok(())
     }
