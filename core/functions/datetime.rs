@@ -255,51 +255,21 @@ fn format_dt(dt: NaiveDateTime, output_type: DateTimeOutput, subsec: bool) -> Va
 fn strftime_format(dt: &NaiveDateTime, format_str: &str) -> Option<String> {
     use crate::functions::strftime::CustomStrftimeItems;
     use std::fmt::Write;
+    // Necessary to remove %f and %J that are exclusive formatters to sqlite
+    // Chrono does not support them, so it is necessary to replace the modifiers manually
 
-    let mut chars = format_str.chars().peekable();
-    while let Some(c) = chars.next() {
-        if c == '%' {
-            match chars.next() {
-                Some(
-                    'd' | 'e' | 'f' | 'F' | 'G' | 'g' | 'H' | 'I' | 'j' | 'J' | 'k' | 'l' | 'm'
-                    | 'M' | 'p' | 'P' | 'R' | 's' | 'S' | 'T' | 'u' | 'U' | 'V' | 'w' | 'W' | 'Y'
-                    | '%',
-                ) => continue,
-                _ => return None,
-            }
-        }
-    }
-
-    // 2. Handle %J Formatting (Strip trailing zeros)
-    let jd = to_julian_day_exact(dt);
-    let jd_str = format!("{jd:.9}");
-    // Remove trailing zeros/decimal if present, to match typical SQLite CLI output
-    let jd_str_clean = if jd_str.contains('.') {
-        let trimmed = jd_str.trim_end_matches('0');
-        trimmed.strip_suffix('.').unwrap_or(trimmed)
-    } else {
-        &jd_str
-    };
-
-    let mut copy_format = format_str.replace("%J", jd_str_clean);
-
-    // 3. Handle %f Formatting (Rounding)
-    if copy_format.contains("%f") {
-        let nanos = dt.nanosecond();
-        let mut ms = (nanos + 500_000) / 1_000_000;
-        let mut s_dt = *dt;
-
-        if ms >= 1000 {
-            s_dt += TimeDelta::seconds(1);
-            ms = 0;
-        }
-        let replacement = format!("{:02}.{:03}", s_dt.second(), ms);
-        copy_format = copy_format.replace("%f", &replacement);
-    }
-
+    // Sqlite uses 9 decimal places for julianday in strftime
+    let julian = format!("{:.9}", to_julian_day_exact(dt));
+    let julian_trimmed = julian
+        .trim_end_matches('0')
+        .trim_end_matches('.')
+        .to_string();
+    let copy_format = format_str.replace("%J", &julian_trimmed);
     let items = CustomStrftimeItems::new(&copy_format);
-    let mut formatted = String::new();
 
+    // The write! macro is used here as chrono's format can panic if the formatting string contains
+    // unknown specifiers. By using a writer, we can catch the panic and handle the error
+    let mut formatted = String::new();
     match write!(formatted, "{}", dt.format_with_items(items)) {
         Ok(_) => Some(formatted),
         Err(_) => None,
@@ -316,22 +286,12 @@ fn apply_modifier(
     let parsed_modifier = parse_modifier(modifier)?;
 
     match parsed_modifier {
-        Modifier::Days(days) => {
-            let nanos = (days * 86_400_000_000_000.0) as i64;
-            *dt += TimeDelta::nanoseconds(nanos);
-        }
-        Modifier::Hours(hours) => {
-            let nanos = (hours * 3_600_000_000_000.0) as i64;
-            *dt += TimeDelta::nanoseconds(nanos);
-        }
-        Modifier::Minutes(minutes) => {
-            let nanos = (minutes * 60_000_000_000.0) as i64;
-            *dt += TimeDelta::nanoseconds(nanos);
-        }
+        Modifier::Days(days) => *dt += TimeDelta::days(days),
+        Modifier::Hours(hours) => *dt += TimeDelta::hours(hours),
+        Modifier::Minutes(minutes) => *dt += TimeDelta::minutes(minutes),
         Modifier::Seconds(seconds) => {
-            let s = seconds as i64;
-            let ns = ((seconds - s as f64) * 1_000_000_000.0) as i64;
-            *dt += TimeDelta::seconds(s) + TimeDelta::nanoseconds(ns);
+            let ms = (seconds * 1000.0 + 0.5).floor() as i64;
+            *dt += TimeDelta::milliseconds(ms);
         }
         Modifier::Months(m) => {
             let years = m / 12;
@@ -440,7 +400,6 @@ fn apply_modifier(
                 }
             }
         }
-
         Modifier::Localtime => {
             let utc_dt = DateTime::<Utc>::from_naive_utc_and_offset(*dt, Utc);
             *dt = utc_dt.with_timezone(&chrono::Local).naive_local();
@@ -810,9 +769,9 @@ fn get_max_datetime_exclusive() -> NaiveDateTime {
 #[allow(dead_code)]
 #[derive(Debug, PartialEq)]
 enum Modifier {
-    Days(f64),
-    Hours(f64),
-    Minutes(f64),
+    Days(i64),
+    Hours(i64),
+    Minutes(i64),
     Seconds(f64),
     Months(i32),
     Years(i32),
@@ -876,8 +835,23 @@ fn parse_modifier_time(s: &str) -> Result<NaiveTime> {
 }
 
 fn parse_modifier(modifier: &str) -> Result<Modifier> {
+    // Small helpers to check string suffix/prefix in a case-insensitive way with no allocation
+    fn ends_with_ignore_ascii_case(s: &str, suffix: &str) -> bool {
+        // suffix is always ASCII, so suffix.len() is the char count
+        // But s might have multi-byte UTF-8 chars, so we need to check char boundary
+        let start = s.len().saturating_sub(suffix.len());
+        s.is_char_boundary(start) && s[start..].eq_ignore_ascii_case(suffix)
+    }
+    fn starts_with_ignore_ascii_case(s: &str, prefix: &str) -> bool {
+        // prefix is always ASCII, so prefix.len() is the char count
+        s.is_char_boundary(prefix.len())
+            && s.len() >= prefix.len()
+            && s[..prefix.len()].eq_ignore_ascii_case(prefix)
+    }
+
     let modifier = modifier.trim();
 
+    // We intentionally avoid usage of match_ignore_ascii_case! macro here because it lead to enormous amount of LLVM code which signifnicantly increase compilation time (see https://github.com/tursodatabase/turso/pull/3929)
     // Fast path for exact matches
     if modifier.eq_ignore_ascii_case("ceiling") {
         return Ok(Modifier::Ceiling);
@@ -905,75 +879,78 @@ fn parse_modifier(modifier: &str) -> Result<Modifier> {
     }
 
     // Patterns
-    if let Some(rest) = strip_prefix_ignore_case(modifier, "weekday ") {
-        let day = parse_modifier_number(rest)?;
+    if starts_with_ignore_ascii_case(modifier, "weekday ") {
+        let s = &modifier[8..];
+        let day = parse_modifier_number(s)?;
         if !(0..=6).contains(&day) {
-            return Err(InvalidModifier(
+            Err(InvalidModifier(
                 "Weekday must be between 0 and 6".to_string(),
-            ));
+            ))
+        } else {
+            Ok(Modifier::Weekday(day as u32))
         }
-        return Ok(Modifier::Weekday(day as u32));
-    }
-
-    if let Some(rest) = strip_suffix_ignore_case(modifier, " second") {
-        return Ok(Modifier::Seconds(parse_modifier_float(rest)?));
-    }
-    if let Some(rest) = strip_suffix_ignore_case(modifier, " seconds") {
-        return Ok(Modifier::Seconds(parse_modifier_float(rest)?));
-    }
-
-    // Minutes (Float)
-    if let Some(rest) = strip_suffix_ignore_case(modifier, " minute") {
-        return Ok(Modifier::Minutes(parse_modifier_float(rest)?));
-    }
-    if let Some(rest) = strip_suffix_ignore_case(modifier, " minutes") {
-        return Ok(Modifier::Minutes(parse_modifier_float(rest)?));
-    }
-
-    // Hours (Float)
-    if let Some(rest) = strip_suffix_ignore_case(modifier, " hour") {
-        return Ok(Modifier::Hours(parse_modifier_float(rest)?));
-    }
-    if let Some(rest) = strip_suffix_ignore_case(modifier, " hours") {
-        return Ok(Modifier::Hours(parse_modifier_float(rest)?));
-    }
-
-    // Days (Float)
-    if let Some(rest) = strip_suffix_ignore_case(modifier, " day") {
-        return Ok(Modifier::Days(parse_modifier_float(rest)?));
-    }
-    if let Some(rest) = strip_suffix_ignore_case(modifier, " days") {
-        return Ok(Modifier::Days(parse_modifier_float(rest)?));
-    }
-
-    // Months (Int)
-    if let Some(rest) = strip_suffix_ignore_case(modifier, " month") {
-        return Ok(Modifier::Months(parse_modifier_number(rest)? as i32));
-    }
-    if let Some(rest) = strip_suffix_ignore_case(modifier, " months") {
-        return Ok(Modifier::Months(parse_modifier_number(rest)? as i32));
-    }
-
-    // Years (Int)
-    if let Some(rest) = strip_suffix_ignore_case(modifier, " year") {
-        return Ok(Modifier::Years(parse_modifier_number(rest)? as i32));
-    }
-    if let Some(rest) = strip_suffix_ignore_case(modifier, " years") {
-        return Ok(Modifier::Years(parse_modifier_number(rest)? as i32));
-    }
-
-    // --- +/- Modifiers (Time Shifts) ---
-    if modifier.starts_with('+') || modifier.starts_with('-') {
-        let sign = if modifier.starts_with('-') { -1 } else { 1 };
+    } else if ends_with_ignore_ascii_case(modifier, " day") {
+        Ok(create_days_modifier(parse_modifier_float(
+            &modifier[..modifier.len() - 4],
+        )?))
+    } else if ends_with_ignore_ascii_case(modifier, " days") {
+        Ok(create_days_modifier(parse_modifier_float(
+            &modifier[..modifier.len() - 5],
+        )?))
+    } else if ends_with_ignore_ascii_case(modifier, " hour") {
+        Ok(create_hours_modifier(parse_modifier_float(
+            &modifier[..modifier.len() - 5],
+        )?))
+    } else if ends_with_ignore_ascii_case(modifier, " hours") {
+        Ok(create_hours_modifier(parse_modifier_float(
+            &modifier[..modifier.len() - 6],
+        )?))
+    } else if ends_with_ignore_ascii_case(modifier, " minute") {
+        Ok(create_minutes_modifier(parse_modifier_float(
+            &modifier[..modifier.len() - 7],
+        )?))
+    } else if ends_with_ignore_ascii_case(modifier, " minutes") {
+        Ok(create_minutes_modifier(parse_modifier_float(
+            &modifier[..modifier.len() - 8],
+        )?))
+    } else if ends_with_ignore_ascii_case(modifier, " second") {
+        Ok(Modifier::Seconds(parse_modifier_float(
+            &modifier[..modifier.len() - 7],
+        )?))
+    } else if ends_with_ignore_ascii_case(modifier, " seconds") {
+        Ok(Modifier::Seconds(parse_modifier_float(
+            &modifier[..modifier.len() - 8],
+        )?))
+    } else if ends_with_ignore_ascii_case(modifier, " month") {
+        Ok(Modifier::Months(
+            parse_modifier_number(&modifier[..modifier.len() - 6])? as i32,
+        ))
+    } else if ends_with_ignore_ascii_case(modifier, " months") {
+        Ok(Modifier::Months(
+            parse_modifier_number(&modifier[..modifier.len() - 7])? as i32,
+        ))
+    } else if ends_with_ignore_ascii_case(modifier, " year") {
+        Ok(Modifier::Years(
+            parse_modifier_number(&modifier[..modifier.len() - 5])? as i32,
+        ))
+    } else if ends_with_ignore_ascii_case(modifier, " years") {
+        Ok(Modifier::Years(
+            parse_modifier_number(&modifier[..modifier.len() - 6])? as i32,
+        ))
+    } else if starts_with_ignore_ascii_case(modifier, "+")
+        || starts_with_ignore_ascii_case(modifier, "-")
+    {
+        let sign = if starts_with_ignore_ascii_case(modifier, "-") {
+            -1
+        } else {
+            1
+        };
         let rest = &modifier[1..];
-        let parts: Vec<&str> = rest.split_whitespace().collect();
-
+        let parts: Vec<&str> = rest.split(' ').collect();
+        let digits_in_date = 10;
         match parts.len() {
             1 => {
-                // Could be Date Only (YYYY-MM-DD) OR Time Only (HH:MM:SS)
-                // A date modifier in ISO8601 must contain at least 2 hyphens (YYYY-MM-DD)
-                if parts[0].contains('-') {
-                    // Date Only: +/-YYYY-MM-DD
+                if parts[0].len() == digits_in_date {
                     let (y, mo, d) = parse_offset_ymd(parts[0])?;
                     Ok(Modifier::DateOffset {
                         years: sign * y,
@@ -981,31 +958,21 @@ fn parse_modifier(modifier: &str) -> Result<Modifier> {
                         days: sign * d,
                     })
                 } else {
-                    // Time Only: +/-HH:MM:SS.SSS
                     let time = parse_modifier_time(parts[0])?;
-
-                    let time_delta_sec = sign as i64 * time.num_seconds_from_midnight() as i64;
-                    let time_delta_nano = sign as i64 * time.nanosecond() as i64;
-
-                    let delta = TimeDelta::seconds(time_delta_sec)
-                        + TimeDelta::nanoseconds(time_delta_nano);
-                    Ok(Modifier::TimeOffset(delta))
+                    let time_delta = sign * (time.num_seconds_from_midnight() as i32);
+                    Ok(Modifier::TimeOffset(TimeDelta::seconds(time_delta.into())))
                 }
             }
             2 => {
-                // Date AND Time: +/-YYYY-MM-DD HH:MM:SS.SSS
                 let (y, mo, d) = parse_offset_ymd(parts[0])?;
                 let time = parse_modifier_time(parts[1])?;
-
-                let sec = sign * time.num_seconds_from_midnight() as i32;
-                let nano = sign as i64 * time.nanosecond() as i64;
-
+                let time_delta = sign * (time.num_seconds_from_midnight() as i32);
                 Ok(Modifier::DateTimeOffset {
                     years: sign * y,
                     months: sign * mo,
                     days: sign * d,
-                    seconds: sec,
-                    nanos: nano,
+                    seconds: time_delta,
+                    nanos: sign as i64 * time.nanosecond() as i64,
                 })
             }
             _ => Err(InvalidModifier(
@@ -1013,23 +980,35 @@ fn parse_modifier(modifier: &str) -> Result<Modifier> {
             )),
         }
     } else {
-        Err(InvalidModifier("Unknown modifier".to_string()))
+        Err(InvalidModifier(
+            "Invalid date/time offset format".to_string(),
+        ))
+    }
+}
+fn create_days_modifier(val: f64) -> Modifier {
+    if val.fract() == 0.0 {
+        Modifier::Days(val as i64)
+    } else {
+        let ms = (val * 86_400_000.0).round() as i64;
+        Modifier::TimeOffset(TimeDelta::milliseconds(ms))
     }
 }
 
-fn strip_suffix_ignore_case<'a>(s: &'a str, suffix: &str) -> Option<&'a str> {
-    if s.len() >= suffix.len() && s[s.len() - suffix.len()..].eq_ignore_ascii_case(suffix) {
-        Some(&s[..s.len() - suffix.len()])
+fn create_hours_modifier(val: f64) -> Modifier {
+    if val.fract() == 0.0 {
+        Modifier::Hours(val as i64)
     } else {
-        None
+        let ms = (val * 3_600_000.0).round() as i64;
+        Modifier::TimeOffset(TimeDelta::milliseconds(ms))
     }
 }
 
-fn strip_prefix_ignore_case<'a>(s: &'a str, prefix: &str) -> Option<&'a str> {
-    if s.len() >= prefix.len() && s[..prefix.len()].eq_ignore_ascii_case(prefix) {
-        Some(&s[prefix.len()..])
+fn create_minutes_modifier(val: f64) -> Modifier {
+    if val.fract() == 0.0 {
+        Modifier::Minutes(val as i64)
     } else {
-        None
+        let ms = (val * 60_000.0).round() as i64;
+        Modifier::TimeOffset(TimeDelta::milliseconds(ms))
     }
 }
 
@@ -1062,10 +1041,10 @@ where
         return Value::Null;
     }
 
-    let p1 = parse_naive_date_time(values.next().unwrap());
-    let p2 = parse_naive_date_time(values.next().unwrap());
+    let start = parse_naive_date_time(values.next().unwrap());
+    let end = parse_naive_date_time(values.next().unwrap());
 
-    match (p1, p2) {
+    match (start, end) {
         (Some(d1), Some(d2)) => compute_timediff(d1, d2),
         _ => Value::Null,
     }
@@ -1418,34 +1397,31 @@ mod tests {
 
     #[test]
     fn test_parse_days() {
-        assert_eq!(parse_modifier("5 days").unwrap(), Modifier::Days(5.0));
-        assert_eq!(parse_modifier("-3 days").unwrap(), Modifier::Days(-3.0));
-        assert_eq!(parse_modifier("+2 days").unwrap(), Modifier::Days(2.0));
-        assert_eq!(parse_modifier("4  days").unwrap(), Modifier::Days(4.0));
-        assert_eq!(parse_modifier("6   DAYS").unwrap(), Modifier::Days(6.0));
-        assert_eq!(parse_modifier("+5  DAYS").unwrap(), Modifier::Days(5.0));
+        assert_eq!(parse_modifier("5 days").unwrap(), Modifier::Days(5));
+        assert_eq!(parse_modifier("-3 days").unwrap(), Modifier::Days(-3));
+        assert_eq!(parse_modifier("+2 days").unwrap(), Modifier::Days(2));
+        assert_eq!(parse_modifier("4  days").unwrap(), Modifier::Days(4));
+        assert_eq!(parse_modifier("6   DAYS").unwrap(), Modifier::Days(6));
+        assert_eq!(parse_modifier("+5  DAYS").unwrap(), Modifier::Days(5));
     }
 
     #[test]
     fn test_parse_hours() {
-        assert_eq!(parse_modifier("12 hours").unwrap(), Modifier::Hours(12.0));
-        assert_eq!(parse_modifier("-2 hours").unwrap(), Modifier::Hours(-2.0));
-        assert_eq!(parse_modifier("+3  HOURS").unwrap(), Modifier::Hours(3.0));
+        assert_eq!(parse_modifier("12 hours").unwrap(), Modifier::Hours(12));
+        assert_eq!(parse_modifier("-2 hours").unwrap(), Modifier::Hours(-2));
+        assert_eq!(parse_modifier("+3  HOURS").unwrap(), Modifier::Hours(3));
     }
 
     #[test]
     fn test_parse_minutes() {
-        assert_eq!(
-            parse_modifier("30 minutes").unwrap(),
-            Modifier::Minutes(30.0)
-        );
+        assert_eq!(parse_modifier("30 minutes").unwrap(), Modifier::Minutes(30));
         assert_eq!(
             parse_modifier("-15 minutes").unwrap(),
-            Modifier::Minutes(-15.0)
+            Modifier::Minutes(-15)
         );
         assert_eq!(
             parse_modifier("+45  MINUTES").unwrap(),
-            Modifier::Minutes(45.0)
+            Modifier::Minutes(45)
         );
     }
 
@@ -1532,7 +1508,7 @@ mod tests {
                 months: 5,
                 days: 15,
                 seconds: (14 * 60 + 30) * 60,
-                nanos: 0,
+                nanos: 0
             }
         );
         assert_eq!(
@@ -1542,7 +1518,7 @@ mod tests {
                 months: -5,
                 days: -15,
                 seconds: -((14 * 60 + 30) * 60),
-                nanos: 0,
+                nanos: 0
             }
         );
     }
@@ -2258,6 +2234,29 @@ mod tests {
             text("2024-01-01 12:00:00.000"),
             "Case insensitivity check failed"
         );
+    }
+
+    #[test]
+    fn test_parse_modifier_unicode_no_panic() {
+        // Regression test: parse_modifier should not panic on multi-byte UTF-8 strings
+        // that are shorter than expected modifier suffixes when measured in bytes
+        let unicode_inputs = [
+            "!*\u{ea37}", // <-- this produced a crash in SQLancer :]
+            "\u{1F600}",  // Emoji (4 bytes)
+            "日本語",     // Japanese text
+            "中",         // Single Chinese character
+            "\u{0080}",   // 2-byte UTF-8
+            "",           // Empty string
+        ];
+
+        for input in unicode_inputs {
+            // Should not panic - just return an error for invalid modifiers
+            let result = parse_modifier(input);
+            assert!(
+                result.is_err(),
+                "Expected error for invalid modifier: {input}"
+            );
+        }
     }
 
     #[test]
