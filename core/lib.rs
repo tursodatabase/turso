@@ -648,7 +648,7 @@ impl Database {
                     header_mut.write_version = RawVersion::from(Version::Mvcc);
                     true
                 } else {
-                    // tracing::warn!("WAL file exists for database {}, but MVCC is enabled. This is currently not supported. Open the database in non-MVCC mode and run PRAGMA wal_checkpoint(TRUNCATE) to truncate the WAL.", self.path);
+                    tracing::warn!("WAL file exists for database {}, but MVCC is enabled. Run `PRAGMA journal_mode = 'experimental_mvcc;'` to change to MVCC mode", self.path);
                     open_mv_store = false;
                     false
                 }
