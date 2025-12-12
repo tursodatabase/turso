@@ -1240,11 +1240,8 @@ unsafe impl Sync for Connection {}
 
 impl Drop for Connection {
     fn drop(&mut self) {
-        if !self.is_closed() {
-            // if connection wasn't properly closed, decrement the connection counter
-            self.db
-                .n_connections
-                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        if let Err(e) = self.close() {
+            tracing::error!("Error closing connection: {}", e);
         }
     }
 }
