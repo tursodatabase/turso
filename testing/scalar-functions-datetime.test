@@ -109,7 +109,7 @@ do_execsql_test date-with-auto-julianday-bottom {
 
 do_execsql_test date-with-auto-unixepoch-bottom {
 	SELECT date(-1, 'auto');
-} {1970-03-04}
+} {1969-12-31}
 
 do_execsql_test date-with-unixepoch {
 	SELECT date(2460292.5, 'unixepoch');
