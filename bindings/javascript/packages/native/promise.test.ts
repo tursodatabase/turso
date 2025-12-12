@@ -123,6 +123,17 @@ test('avg-bug', async () => {
     expect(await db.prepare(`select avg(distinct "b") from "aggregate_table";`).get()).toEqual({ 'avg (DISTINCT aggregate_table.b)': 42.5 });
 })
 
+test('insert returning test', async () => {
+    const db = await connect(':memory:');
+    await db.prepare(`create table t (x);`).run();
+    const x1 = await db.prepare(`insert into t values (1), (2) returning x`).get();
+    const x2 = await db.prepare(`insert into t values (3), (4) returning x`).get();
+    expect(x1).toEqual({ x: 1 });
+    expect(x2).toEqual({ x: 3 });
+    const all = await db.prepare(`select * from t`).all();
+    expect(all).toEqual([{ x: 1 }, { x: 2 }, { x: 3 }, { x: 4 }])
+})
+
 test('offset-bug', async () => {
     const db = await connect(":memory:");
     await db.exec(`CREATE TABLE users (
