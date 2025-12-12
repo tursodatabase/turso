@@ -5252,21 +5252,11 @@ pub fn op_function(
                 state.registers[*dest] = Register::Value(result);
             }
             ScalarFunc::UnixEpoch => {
-                if *start_reg == 0 {
-                    let result = exec_unixepoch(&Value::build_text("now"))?;
-                    state.registers[*dest] = Register::Value(result);
-                } else {
-                    let datetime_value = &state.registers[*start_reg];
-                    let unixepoch = exec_unixepoch(datetime_value.get_value());
-                    match unixepoch {
-                        Ok(time) => state.registers[*dest] = Register::Value(time),
-                        Err(e) => {
-                            return Err(LimboError::ParseError(format!(
-                                "Error encountered while parsing datetime value: {e}"
-                            )));
-                        }
-                    }
-                }
+                let values =
+                    registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
+
+                let result = exec_unixepoch(values);
+                state.registers[*dest] = Register::Value(result);
             }
             ScalarFunc::TursoVersion => {
                 if !program.connection.is_db_initialized() {
