@@ -109,6 +109,7 @@ test-sqlite3: reset-db
 
 test-json:
 	RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) ./testing/json.test
+	RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) ./testing/json_object_star.test
 .PHONY: test-json
 
 test-memory: build uv-sync-test
