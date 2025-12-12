@@ -574,6 +574,8 @@ impl Future for Execute {
 impl Statement {
     /// Query the database with this prepared statement.
     pub async fn query(&mut self, params: impl IntoParams) -> Result<Rows> {
+        self.reset();
+
         let params = params.into_params()?;
         match params {
             params::Params::None => (),

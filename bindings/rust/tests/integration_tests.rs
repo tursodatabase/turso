@@ -419,6 +419,46 @@ async fn test_concurrent_unique_constraint_regression() {
 }
 
 #[tokio::test]
+async fn test_statement_query_resets_before_execution() {
+    let db = Builder::new_local(":memory:").build().await.unwrap();
+    let conn = db.connect().unwrap();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, value TEXT)", ())
+        .await
+        .unwrap();
+
+    for i in 0..5 {
+        conn.execute(&format!("INSERT INTO t VALUES ({i}, 'value_{i}')"), ())
+            .await
+            .unwrap();
+    }
+
+    let mut stmt = conn
+        .prepare("SELECT id, value FROM t ORDER BY id")
+        .await
+        .unwrap();
+
+    let mut rows = stmt.query(()).await.unwrap();
+    let mut count = 0;
+    while let Some(row) = rows.next().await.unwrap() {
+        let id: i64 = row.get(0).unwrap();
+        assert_eq!(id, count);
+        count += 1;
+    }
+    assert_eq!(count, 5);
+
+    let mut rows = stmt.query(()).await.unwrap();
+    let mut count = 0;
+    while let Some(row) = rows.next().await.unwrap() {
+        let id: i64 = row.get(0).unwrap();
+        assert_eq!(id, count);
+        count += 1;
+    }
+    // this will return 0 rows if query() does not reset the statement
+    assert_eq!(count, 5, "Second query() should return all rows again");
+}
+
+#[tokio::test]
 async fn test_encryption() {
     let temp_dir = tempfile::tempdir().unwrap();
     let db_file = temp_dir.path().join("test-encrypted.db");
