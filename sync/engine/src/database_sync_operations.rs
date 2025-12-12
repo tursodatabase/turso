@@ -29,7 +29,7 @@ use crate::{
     types::{
         Coro, DatabasePullRevision, DatabaseRowTransformResult, DatabaseSyncEngineProtocolVersion,
         DatabaseTapeOperation, DatabaseTapeRowChange, DatabaseTapeRowChangeType, DbSyncInfo,
-        DbSyncStatus, PartialBootstrapStrategy, SyncEngineIoResult,
+        DbSyncStatus, PartialBootstrapStrategy, PartialSyncOpts, SyncEngineIoResult,
     },
     wal_session::WalSession,
     Result,
@@ -350,8 +350,13 @@ pub async fn pull_pages_v1<IO: SyncEngineIo, Ctx>(
     client: &SyncEngineIoStats<IO>,
     server_revision: &str,
     pages: &[u32],
-) -> Result<Vec<u8>> {
+) -> Result<Vec<(u64, Vec<u8>)>> {
     tracing::info!("pull_pages_v1: revision={server_revision}, pages={pages:?}");
+
+    if pages.is_empty() {
+        return Ok(Vec::new());
+    }
+
     let mut bytes = BytesMut::new();
 
     let mut bitmap = RoaringBitmap::new();
@@ -396,7 +401,7 @@ pub async fn pull_pages_v1<IO: SyncEngineIo, Ctx>(
     };
     tracing::info!("pull_pages_v1: got header={:?}", header);
 
-    let mut pages = Vec::with_capacity(PAGE_SIZE * pages.len());
+    let mut pages = Vec::with_capacity(pages.len());
 
     let mut page_data_opt =
         wait_proto_message::<Ctx, PageData>(coro, &completion, &client.network_stats, &mut bytes)
@@ -412,7 +417,7 @@ pub async fn pull_pages_v1<IO: SyncEngineIo, Ctx>(
                 PAGE_SIZE
             )));
         }
-        pages.extend_from_slice(&page);
+        pages.push((page_id, page));
         page_data_opt =
             wait_proto_message(coro, &completion, &client.network_stats, &mut bytes).await?;
         tracing::info!("page_data_opt: {}", page_data_opt.is_some());
@@ -1130,11 +1135,11 @@ pub async fn bootstrap_db_file<IO: SyncEngineIo, Ctx>(
     io: &Arc<dyn turso_core::IO>,
     main_db_path: &str,
     protocol: DatabaseSyncEngineProtocolVersion,
-    partial_bootstrap_strategy: PartialBootstrapStrategy,
+    partial_sync: Option<PartialSyncOpts>,
 ) -> Result<DatabasePullRevision> {
     match protocol {
         DatabaseSyncEngineProtocolVersion::Legacy => {
-            if matches!(partial_bootstrap_strategy, PartialBootstrapStrategy::None) {
+            if partial_sync.is_some() {
                 return Err(Error::DatabaseSyncEngineError(
                     "can't bootstrap prefix of database with legacy protocol".to_string(),
                 ));
@@ -1142,7 +1147,7 @@ pub async fn bootstrap_db_file<IO: SyncEngineIo, Ctx>(
             bootstrap_db_file_legacy(coro, client, io, main_db_path).await
         }
         DatabaseSyncEngineProtocolVersion::V1 => {
-            bootstrap_db_file_v1(coro, client, io, main_db_path, partial_bootstrap_strategy).await
+            bootstrap_db_file_v1(coro, client, io, main_db_path, partial_sync).await
         }
     }
 }
@@ -1152,9 +1157,13 @@ pub async fn bootstrap_db_file_v1<IO: SyncEngineIo, Ctx>(
     client: &SyncEngineIoStats<IO>,
     io: &Arc<dyn turso_core::IO>,
     main_db_path: &str,
-    bootstrap: PartialBootstrapStrategy,
+    partial_sync: Option<PartialSyncOpts>,
 ) -> Result<DatabasePullRevision> {
-    let server_pages_selector = if let PartialBootstrapStrategy::Prefix { length } = &bootstrap {
+    let server_pages_selector = if let Some(PartialSyncOpts {
+        bootstrap_strategy: PartialBootstrapStrategy::Prefix { length },
+        ..
+    }) = &partial_sync
+    {
         let mut bitmap = RoaringBitmap::new();
         bitmap.insert_range(0..(*length / PAGE_SIZE) as u32);
         let mut bitmap_bytes = Vec::with_capacity(bitmap.serialized_size());
@@ -1165,7 +1174,11 @@ pub async fn bootstrap_db_file_v1<IO: SyncEngineIo, Ctx>(
     } else {
         Vec::new()
     };
-    let server_query_selector = if let PartialBootstrapStrategy::Query { query } = bootstrap {
+    let server_query_selector = if let Some(PartialSyncOpts {
+        bootstrap_strategy: PartialBootstrapStrategy::Query { query },
+        ..
+    }) = partial_sync
+    {
         query
     } else {
         String::new()
@@ -1347,11 +1360,8 @@ async fn sql_execute_http<IO: SyncEngineIo, Ctx>(
     client.network_stats.write(body.len());
     let completion = client.http("POST", "/v2/pipeline", Some(body), &[])?;
 
-    let status = wait_status(coro, &completion).await?;
-    if status != http::StatusCode::OK {
-        let error = format!("sql_execute_http: unexpected status code: {status}");
-        return Err(Error::DatabaseSyncEngineError(error));
-    }
+    wait_ok_status(coro, &completion, "sql_execute_http").await?;
+
     let response = wait_all_results(coro, &completion, Some(&client.network_stats)).await?;
     let response: server_proto::PipelineRespBody = serde_json::from_slice(&response)?;
     tracing::debug!("hrana response: {:?}", response);
@@ -1439,14 +1449,8 @@ async fn wal_push_http<IO: SyncEngineIo, Ctx>(
         Some(frames),
         &[],
     )?;
-    let status = wait_status(coro, &completion).await?;
+    wait_ok_status(coro, &completion, "wal_push").await?;
     let status_body = wait_all_results(coro, &completion, Some(&client.network_stats)).await?;
-    if status != http::StatusCode::OK {
-        let error = std::str::from_utf8(&status_body).ok().unwrap_or("");
-        return Err(Error::DatabaseSyncEngineError(format!(
-            "wal_push go unexpected status: {status} (error={error})"
-        )));
-    }
     Ok(serde_json::from_slice(&status_body)?)
 }
 
@@ -1455,13 +1459,8 @@ async fn db_info_http<IO: SyncEngineIo, Ctx>(
     client: &SyncEngineIoStats<IO>,
 ) -> Result<DbSyncInfo> {
     let completion = client.http("GET", "/info", None, &[])?;
-    let status = wait_status(coro, &completion).await?;
+    wait_ok_status(coro, &completion, "db_info").await?;
     let status_body = wait_all_results(coro, &completion, Some(&client.network_stats)).await?;
-    if status != http::StatusCode::OK {
-        return Err(Error::DatabaseSyncEngineError(format!(
-            "db_info go unexpected status: {status}"
-        )));
-    }
     Ok(serde_json::from_slice(&status_body)?)
 }
 
@@ -1471,13 +1470,28 @@ async fn db_bootstrap_http<C: SyncEngineIo, Ctx>(
     generation: u64,
 ) -> Result<C::DataCompletionBytes> {
     let completion = client.http("GET", &format!("/export/{generation}"), None, &[])?;
-    let status = wait_status(coro, &completion).await?;
-    if status != http::StatusCode::OK.as_u16() {
-        return Err(Error::DatabaseSyncEngineError(format!(
-            "db_bootstrap go unexpected status: {status}"
-        )));
-    }
+    wait_ok_status(coro, &completion, "db_bootstrap").await?;
     Ok(completion)
+}
+
+pub async fn wait_ok_status<Ctx>(
+    coro: &Coro<Ctx>,
+    completion: &impl DataCompletion<u8>,
+    operation: &'static str,
+) -> Result<()> {
+    let status = wait_status(coro, completion).await?;
+    if status == http::StatusCode::OK {
+        return Ok(());
+    }
+    let body = wait_all_results(coro, completion, None).await?;
+    match std::str::from_utf8(body.as_slice()) {
+        Ok(body) => Err(Error::DatabaseSyncEngineError(format!(
+            "{operation}: unexpected http response: status={status}, body={body}"
+        ))),
+        Err(_) => Err(Error::DatabaseSyncEngineError(format!(
+            "{operation}: unexpected http response: status={status}"
+        ))),
+    }
 }
 
 pub async fn wait_status<Ctx, T>(
@@ -1517,6 +1531,21 @@ pub async fn wait_proto_message<Ctx, T: prost::Message + Default>(
     bytes: &mut BytesMut,
 ) -> Result<Option<T>> {
     let start_time = std::time::Instant::now();
+    while completion.status()?.is_none() {
+        coro.yield_(SyncEngineIoResult::IO).await?;
+    }
+    let status = completion.status()?.expect("status must be set");
+    if status != 200 {
+        let body = wait_all_results(coro, completion, Some(network_stats)).await?;
+        return match std::str::from_utf8(body.as_slice()) {
+            Ok(body) => Err(Error::DatabaseSyncEngineError(format!(
+                "remote server returned an error: status={status}, body={body}"
+            ))),
+            Err(_) => Err(Error::DatabaseSyncEngineError(format!(
+                "remote server returned an error: status={status}"
+            ))),
+        };
+    }
     loop {
         let length = read_varint(bytes)?;
         let not_enough_bytes = match length {

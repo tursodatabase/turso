@@ -806,7 +806,7 @@ pub fn translate_expr(
             }
         }
         ast::Expr::Between { .. } => {
-            unreachable!("expression should have been rewritten in optmizer")
+            crate::bail_parse_error!("expression should have been rewritten in optmizer")
         }
         ast::Expr::Binary(e1, op, e2) => {
             binary_expr_shared(
@@ -1175,6 +1175,15 @@ pub fn translate_expr(
                         Ok(target_register)
                     }
                     VectorFunc::VectorDistanceJaccard => {
+                        let args = expect_arguments_exact!(args, 2, vector_func);
+                        let regs = program.alloc_registers(2);
+                        translate_expr(program, referenced_tables, &args[0], regs, resolver)?;
+                        translate_expr(program, referenced_tables, &args[1], regs + 1, resolver)?;
+
+                        emit_function_call(program, func_ctx, &[regs, regs + 1], target_register)?;
+                        Ok(target_register)
+                    }
+                    VectorFunc::VectorDistanceDot => {
                         let args = expect_arguments_exact!(args, 2, vector_func);
                         let regs = program.alloc_registers(2);
                         translate_expr(program, referenced_tables, &args[0], regs, resolver)?;
@@ -2003,6 +2012,12 @@ pub fn translate_expr(
                             )?;
 
                             Ok(target_register)
+                        }
+                        ScalarFunc::StatInit | ScalarFunc::StatPush | ScalarFunc::StatGet => {
+                            crate::bail_parse_error!(
+                                "{} is an internal function used by ANALYZE",
+                                srf
+                            );
                         }
                     }
                 }

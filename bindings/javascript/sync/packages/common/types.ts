@@ -110,21 +110,33 @@ export interface DatabaseOpts {
     /**
      * optional parameter to enable partial sync for the database
      */
-    partialBootstrapStrategy?: { kind: 'prefix', length: number } | { kind: 'query', query: string };
+    partialSync?: {
+        /* bootstrap strategy configuration
+            - prefix strategy loads first N bytes locally at the startup
+            - query strategy loads pages touched by the provided SQL statement
+        */
+        bootstrapStrategy: { kind: 'prefix', length: number } | { kind: 'query', query: string },
+        /* optional segment size which makes sync engine to load pages in batches of segment_size bytes
+            (so, if loading page 1 with segment_size=128kb then 32 pages [1..32] will be loaded)
+        */
+        segmentSize?: number,
+        /* optional parameter which makes sync engine to speculatively load pages which probably will be accessed soon */
+        speculativeLoad?: boolean,
+    }
 }
 export interface DatabaseStats {
     /**
      * amount of local changes not sent to the remote
      */
-    operations: number;
+    cdcOperations: number;
     /**
      * size of the main WAL file in bytes
      */
-    mainWal: number;
+    mainWalSize: number;
     /**
      * size of the revert WAL file in bytes
      */
-    revertWal: number;
+    revertWalSize: number;
     /**
      * unix timestamp of last successful pull time
      */

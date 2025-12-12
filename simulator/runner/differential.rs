@@ -110,6 +110,22 @@ pub(crate) fn execute_interactions(
 
         match next {
             ExecutionContinuation::Stay => {}
+            ExecutionContinuation::NextInteractionOutsideThisProperty => {
+                // Skip remaining interactions in this property by advancing until we
+                // find an interaction with a different id (i.e., a different property)
+                let current_property_id = interaction.id();
+                loop {
+                    state.interaction_pointer += 1;
+                    let Some(new_interaction) = plan.next(&mut env) else {
+                        // No more interactions, we're done
+                        return ExecutionResult::new(history, None);
+                    };
+                    if new_interaction.id() != current_property_id {
+                        interaction = new_interaction;
+                        break;
+                    }
+                }
+            }
             ExecutionContinuation::NextInteraction => {
                 state.interaction_pointer += 1;
                 let Some(new_interaction) = plan.next(&mut env) else {

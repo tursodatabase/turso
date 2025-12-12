@@ -53,15 +53,16 @@ pub extern "system" fn Java_tech_turso_core_TursoStatement_step<'local>(
     let stmt = match to_turso_statement(stmt_ptr) {
         Ok(stmt) => stmt,
         Err(e) => {
-            set_err_msg_and_throw_exception(&mut env, obj, TURSO_ETC, e.to_string());
-            return to_turso_step_result(&mut env, STEP_RESULT_ID_ERROR, None);
+            let err_msg = e.to_string();
+            set_err_msg_and_throw_exception(&mut env, obj, TURSO_ETC, err_msg.clone());
+            return to_turso_step_result_error(&mut env, &err_msg);
         }
     };
 
     loop {
         let step_result = match stmt.stmt.step() {
             Ok(result) => result,
-            Err(_) => return to_turso_step_result(&mut env, STEP_RESULT_ID_ERROR, None),
+            Err(e) => return to_turso_step_result_error(&mut env, &e.to_string()),
         };
 
         match step_result {
@@ -70,15 +71,17 @@ pub extern "system" fn Java_tech_turso_core_TursoStatement_step<'local>(
                 return match row_to_obj_array(&mut env, row) {
                     Ok(row) => to_turso_step_result(&mut env, STEP_RESULT_ID_ROW, Some(row)),
                     Err(e) => {
-                        set_err_msg_and_throw_exception(&mut env, obj, TURSO_ETC, e.to_string());
-                        to_turso_step_result(&mut env, STEP_RESULT_ID_ERROR, None)
+                        let err_msg = e.to_string();
+                        set_err_msg_and_throw_exception(&mut env, obj, TURSO_ETC, err_msg.clone());
+                        to_turso_step_result_error(&mut env, &err_msg)
                     }
                 };
             }
             StepResult::IO => {
                 if let Err(e) = stmt.stmt.run_once() {
-                    set_err_msg_and_throw_exception(&mut env, obj, TURSO_ETC, e.to_string());
-                    return to_turso_step_result(&mut env, STEP_RESULT_ID_ERROR, None);
+                    let err_msg = e.to_string();
+                    set_err_msg_and_throw_exception(&mut env, obj, TURSO_ETC, err_msg.clone());
+                    return to_turso_step_result_error(&mut env, &err_msg);
                 }
             }
             StepResult::Done => return to_turso_step_result(&mut env, STEP_RESULT_ID_DONE, None),
@@ -368,5 +371,26 @@ fn to_turso_step_result<'local>(
     } else {
         env.new_object("tech/turso/core/TursoStepResult", "(I)V", &ctor_args)
     }
+    .unwrap_or_else(|_| JObject::null())
+}
+
+/// Creates an error `TursoStepResult` with an error message.
+fn to_turso_step_result_error<'local>(
+    env: &mut JNIEnv<'local>,
+    error_message: &str,
+) -> JObject<'local> {
+    let error_str = env
+        .new_string(error_message)
+        .unwrap_or_else(|_| env.new_string("Unknown error").unwrap());
+    let error_obj: JObject = error_str.into();
+    let ctor_args = vec![
+        JValue::Int(STEP_RESULT_ID_ERROR),
+        JValue::Object(&error_obj),
+    ];
+    env.new_object(
+        "tech/turso/core/TursoStepResult",
+        "(ILjava/lang/String;)V",
+        &ctor_args,
+    )
     .unwrap_or_else(|_| JObject::null())
 }

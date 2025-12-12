@@ -1,9 +1,11 @@
+import logging
 import os
 import sqlite3
 
 import pytest
 import turso
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s", force=True)
 
 def connect(provider, database):
     if provider == "turso":
@@ -1461,3 +1463,18 @@ def test_connection_exception_attributes_present(provider):
     assert issubclass(conn.DatabaseError, Exception)
     assert issubclass(conn.ProgrammingError, Exception)
     conn.close()
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_insert_returning_single_and_multiple_commit_without_consuming(provider):
+    # turso.setup_logging(level=logging.DEBUG)
+    conn = connect(provider, ":memory:")
+    try:
+        cur = conn.cursor()
+        cur.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
+        cur.execute("INSERT INTO t(name) VALUES (?), (?) RETURNING id", ("bob", "alice"),)
+        cur.fetchone()
+        with pytest.raises(Exception):
+            conn.commit()
+    finally:
+        conn.close()
+

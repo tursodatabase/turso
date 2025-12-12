@@ -294,3 +294,7 @@ proc do_execsql_test_in_memory_error {test_name sql_statements expected_error_pa
     set combined_sql [string trim $sql_statements]
     run_test_expecting_error $::sqlite_exec $db_name $combined_sql $expected_error_pattern
 }
+
+proc is_turso_mvcc {} {
+    return [expr {[info exists ::env(SQLITE_EXEC)] && $::env(SQLITE_EXEC) eq "scripts/turso-mvcc-sqlite3"}]
+}

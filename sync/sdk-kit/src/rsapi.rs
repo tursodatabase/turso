@@ -22,10 +22,11 @@ pub struct TursoDatabaseSyncConfig {
     pub long_poll_timeout_ms: Option<u32>,
     pub bootstrap_if_empty: bool,
     pub reserved_bytes: Option<usize>,
-    pub partial_bootstrap_strategy: turso_sync_engine::types::PartialBootstrapStrategy,
+    pub partial_sync_opts: Option<turso_sync_engine::types::PartialSyncOpts>,
     pub db_io: Option<Arc<dyn IO>>,
 }
 
+pub type PartialSyncOpts = turso_sync_engine::types::PartialSyncOpts;
 pub type PartialBootstrapStrategy = turso_sync_engine::types::PartialBootstrapStrategy;
 
 impl TursoDatabaseSyncConfig {
@@ -37,33 +38,49 @@ impl TursoDatabaseSyncConfig {
     /// [capi::c::turso_sync_database_config_t::client_name] field must be valid C-string pointer
     /// [capi::c::turso_sync_database_config_t::partial_bootstrap_strategy_query] field must be valid C-string pointer or null
     pub unsafe fn from_capi(
-        value: capi::c::turso_sync_database_config_t,
+        config: *const capi::c::turso_sync_database_config_t,
     ) -> Result<Self, turso_sdk_kit::rsapi::TursoError> {
+        if config.is_null() {
+            return Err(TursoError {
+                code: TursoStatusCode::Misuse,
+                message: Some("config pointer must be not null".to_string()),
+            });
+        }
+        let config = *config;
         Ok(Self {
-            path: str_from_c_str(value.path)?.to_string(),
-            client_name: str_from_c_str(value.client_name)?.to_string(),
-            long_poll_timeout_ms: if value.long_poll_timeout_ms == 0 {
+            path: str_from_c_str(config.path)?.to_string(),
+            client_name: str_from_c_str(config.client_name)?.to_string(),
+            long_poll_timeout_ms: if config.long_poll_timeout_ms == 0 {
                 None
             } else {
-                Some(value.long_poll_timeout_ms as u32)
+                Some(config.long_poll_timeout_ms as u32)
             },
-            bootstrap_if_empty: value.bootstrap_if_empty,
-            reserved_bytes: if value.reserved_bytes == 0 {
+            bootstrap_if_empty: config.bootstrap_if_empty,
+            reserved_bytes: if config.reserved_bytes == 0 {
                 None
             } else {
-                Some(value.reserved_bytes as usize)
+                Some(config.reserved_bytes as usize)
             },
-            partial_bootstrap_strategy: if value.partial_bootstrap_strategy_prefix != 0 {
-                turso_sync_engine::types::PartialBootstrapStrategy::Prefix {
-                    length: value.partial_bootstrap_strategy_prefix as usize,
-                }
-            } else if !value.partial_bootstrap_strategy_query.is_null() {
-                let query = str_from_c_str(value.partial_bootstrap_strategy_query)?;
-                turso_sync_engine::types::PartialBootstrapStrategy::Query {
-                    query: query.to_string(),
-                }
+            partial_sync_opts: if config.partial_bootstrap_strategy_prefix != 0 {
+                Some(turso_sync_engine::types::PartialSyncOpts {
+                    bootstrap_strategy:
+                        turso_sync_engine::types::PartialBootstrapStrategy::Prefix {
+                            length: config.partial_bootstrap_strategy_prefix as usize,
+                        },
+                    segment_size: config.partial_bootstrap_segment_size,
+                    speculative_load: config.partial_bootstrap_speculative_load,
+                })
+            } else if !config.partial_bootstrap_strategy_query.is_null() {
+                let query = str_from_c_str(config.partial_bootstrap_strategy_query)?;
+                Some(turso_sync_engine::types::PartialSyncOpts {
+                    bootstrap_strategy: turso_sync_engine::types::PartialBootstrapStrategy::Query {
+                        query: query.to_string(),
+                    },
+                    segment_size: config.partial_bootstrap_segment_size,
+                    speculative_load: config.partial_bootstrap_speculative_load,
+                })
             } else {
-                turso_sync_engine::types::PartialBootstrapStrategy::None
+                None
             },
             db_io: None,
         })
@@ -78,10 +95,8 @@ impl TursoDatabaseSyncChanges {
     pub fn empty(&self) -> bool {
         self.changes.file_slot.is_none()
     }
-    pub fn to_capi(self: Box<Self>) -> capi::c::turso_sync_changes_t {
-        capi::c::turso_sync_changes_t {
-            inner: Box::into_raw(self) as *mut std::ffi::c_void,
-        }
+    pub fn to_capi(self: Box<Self>) -> *mut capi::c::turso_sync_changes_t {
+        Box::into_raw(self) as *mut capi::c::turso_sync_changes_t
     }
     /// helper method to restore [TursoDatabaseSyncChanges] ref from C raw container
     /// this method is used in the capi wrappers
@@ -89,15 +104,15 @@ impl TursoDatabaseSyncChanges {
     /// # Safety
     /// value must be a pointer returned from [Self::to_capi] method
     pub unsafe fn ref_from_capi<'a>(
-        value: capi::c::turso_sync_changes_t,
+        value: *mut capi::c::turso_sync_changes_t,
     ) -> Result<&'a Self, TursoError> {
-        if value.inner.is_null() {
+        if value.is_null() {
             Err(TursoError {
                 code: TursoStatusCode::Misuse,
                 message: Some("got null pointer".to_string()),
             })
         } else {
-            Ok(&*(value.inner as *const Self))
+            Ok(&*(value as *const Self))
         }
     }
     /// helper method to restore [TursoDatabaseSyncChanges] instance from C raw container
@@ -105,8 +120,8 @@ impl TursoDatabaseSyncChanges {
     ///
     /// # Safety
     /// value must be a pointer returned from [Self::to_capi] method
-    pub unsafe fn box_from_capi(value: capi::c::turso_sync_changes_t) -> Box<Self> {
-        Box::from_raw(value.inner as *mut Self)
+    pub unsafe fn box_from_capi(value: *const capi::c::turso_sync_changes_t) -> Box<Self> {
+        Box::from_raw(value as *mut Self)
     }
 }
 
@@ -137,7 +152,7 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
             protocol_version_hint: turso_sync_engine::types::DatabaseSyncEngineProtocolVersion::V1,
             bootstrap_if_empty: sync_config.bootstrap_if_empty,
             reserved_bytes: sync_config.reserved_bytes.unwrap_or(0),
-            partial_bootstrap_strategy: sync_config.partial_bootstrap_strategy.clone(),
+            partial_sync_opts: sync_config.partial_sync_opts.clone(),
         };
         let is_memory = db_config.path == ":memory:";
         let db_io: Arc<dyn IO> = if let Some(io) = sync_config.db_io.as_ref() {
@@ -147,10 +162,7 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
         } else {
             #[cfg(target_os = "linux")]
             {
-                if matches!(
-                    sync_engine_opts.partial_bootstrap_strategy,
-                    PartialBootstrapStrategy::None
-                ) {
+                if sync_engine_opts.partial_sync_opts.is_none() {
                     Arc::new(turso_core::PlatformIO::new().map_err(|e| TursoError {
                         code: TursoStatusCode::Error,
                         message: Some(format!("Failed to create platform IO: {e}")),
@@ -440,10 +452,8 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
 
     /// helper method to get C raw container to the TursoDatabaseSync instance
     /// this method is used in the capi wrappers
-    pub fn to_capi(self: Arc<Self>) -> capi::c::turso_sync_database_t {
-        capi::c::turso_sync_database_t {
-            inner: Arc::into_raw(self.clone()) as *mut std::ffi::c_void,
-        }
+    pub fn to_capi(self: Arc<Self>) -> *mut capi::c::turso_sync_database_t {
+        Arc::into_raw(self.clone()) as *mut capi::c::turso_sync_database_t
     }
 
     /// helper method to restore [TursoDatabaseSync] ref from C raw container
@@ -452,15 +462,15 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
     /// # Safety
     /// value must be a pointer returned from [Self::to_capi] method
     pub unsafe fn ref_from_capi<'a>(
-        value: capi::c::turso_sync_database_t,
+        value: *const capi::c::turso_sync_database_t,
     ) -> Result<&'a Self, TursoError> {
-        if value.inner.is_null() {
+        if value.is_null() {
             Err(TursoError {
                 code: TursoStatusCode::Misuse,
                 message: Some("got null pointer".to_string()),
             })
         } else {
-            Ok(&*(value.inner as *const Self))
+            Ok(&*(value as *const Self))
         }
     }
 
@@ -469,7 +479,7 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
     ///
     /// # Safety
     /// value must be a pointer returned from [Self::to_capi] method
-    pub unsafe fn arc_from_capi(value: capi::c::turso_sync_database_t) -> Arc<Self> {
-        Arc::from_raw(value.inner as *const Self)
+    pub unsafe fn arc_from_capi(value: *const capi::c::turso_sync_database_t) -> Arc<Self> {
+        Arc::from_raw(value as *const Self)
     }
 }

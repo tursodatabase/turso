@@ -1,6 +1,7 @@
 use crate::function::Func;
 use crate::incremental::view::IncrementalView;
 use crate::index_method::{IndexMethodAttachment, IndexMethodConfiguration};
+use crate::stats::AnalyzeStats;
 use crate::translate::expr::{bind_and_rewrite_expr, walk_expr, BindingBehavior, WalkControl};
 use crate::translate::index::{resolve_index_method_parameters, resolve_sorted_columns};
 use crate::translate::planner::ROWID_STRS;
@@ -181,8 +182,9 @@ pub struct Schema {
     /// table_name to list of indexes for the table
     pub indexes: HashMap<String, VecDeque<Arc<Index>>>,
     pub has_indexes: std::collections::HashSet<String>,
-    pub indexes_enabled: bool,
     pub schema_version: u32,
+    /// Statistics collected via ANALYZE for regular B-tree tables and indexes.
+    pub analyze_stats: AnalyzeStats,
 
     /// Mapping from table names to the materialized views that depend on them
     pub table_to_materialized_views: HashMap<String, Vec<String>>,
@@ -191,8 +193,14 @@ pub struct Schema {
     pub incompatible_views: HashSet<String>,
 }
 
+impl Default for Schema {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl Schema {
-    pub fn new(indexes_enabled: bool) -> Self {
+    pub fn new() -> Self {
         let mut tables: HashMap<String, Arc<Table>> = HashMap::new();
         let has_indexes = std::collections::HashSet::new();
         let indexes: HashMap<String, VecDeque<Arc<Index>>> = HashMap::new();
@@ -223,8 +231,8 @@ impl Schema {
             triggers,
             indexes,
             has_indexes,
-            indexes_enabled,
             schema_version: 0,
+            analyze_stats: AnalyzeStats::default(),
             table_to_materialized_views,
             incompatible_views,
         }
@@ -457,6 +465,7 @@ impl Schema {
     pub fn remove_table(&mut self, table_name: &str) {
         let name = normalize_ident(table_name);
         self.tables.remove(&name);
+        self.analyze_stats.remove_table(&name);
 
         // If this was a materialized view, also clean up the metadata
         if self.materialized_view_names.remove(&name) {
@@ -509,6 +518,7 @@ impl Schema {
     pub fn remove_indices_for_table(&mut self, table_name: &str) {
         let name = normalize_ident(table_name);
         self.indexes.remove(&name);
+        self.analyze_stats.remove_table(&name);
     }
 
     pub fn remove_index(&mut self, idx: &Index) {
@@ -517,6 +527,7 @@ impl Schema {
             .get_mut(&name)
             .expect("Must have the index")
             .retain_mut(|other_idx| other_idx.name != idx.name);
+        self.analyze_stats.remove_index(&name, &idx.name);
     }
 
     pub fn table_has_indexes(&self, table_name: &str) -> bool {
@@ -526,10 +537,6 @@ impl Schema {
 
     pub fn table_set_has_index(&mut self, table_name: &str) {
         self.has_indexes.insert(table_name.to_string());
-    }
-
-    pub fn indexes_enabled(&self) -> bool {
-        self.indexes_enabled
     }
 
     /// Update [Schema] by scanning the first root page (sqlite_schema)
@@ -637,40 +644,30 @@ impl Schema {
         mvcc_enabled: bool,
     ) -> Result<()> {
         for unparsed_sql_from_index in from_sql_indexes {
-            if !self.indexes_enabled() {
-                self.table_set_has_index(&unparsed_sql_from_index.table_name);
-            } else {
-                let table = self
-                    .get_btree_table(&unparsed_sql_from_index.table_name)
-                    .unwrap();
-                let index = Index::from_sql(
-                    syms,
-                    &unparsed_sql_from_index.sql,
-                    unparsed_sql_from_index.root_page,
-                    table.as_ref(),
-                )?;
-                if mvcc_enabled {
-                    if index.columns.iter().any(|c| c.expr.is_some()) {
-                        crate::bail_parse_error!("Expression indexes are not supported with MVCC");
-                    }
-                    if index.where_clause.is_some() {
-                        crate::bail_parse_error!("Partial indexes are not supported with MVCC");
-                    }
-                    if index.index_method.is_some() {
-                        crate::bail_parse_error!(
-                            "Custom index modules are not supported with MVCC"
-                        );
-                    }
+            let table = self
+                .get_btree_table(&unparsed_sql_from_index.table_name)
+                .unwrap();
+            let index = Index::from_sql(
+                syms,
+                &unparsed_sql_from_index.sql,
+                unparsed_sql_from_index.root_page,
+                table.as_ref(),
+            )?;
+            if mvcc_enabled {
+                if index.columns.iter().any(|c| c.expr.is_some()) {
+                    crate::bail_parse_error!("Expression indexes are not supported with MVCC");
                 }
-                self.add_index(Arc::new(index))?;
+                if index.where_clause.is_some() {
+                    crate::bail_parse_error!("Partial indexes are not supported with MVCC");
+                }
+                if index.index_method.is_some() {
+                    crate::bail_parse_error!("Custom index modules are not supported with MVCC");
+                }
             }
+            self.add_index(Arc::new(index))?;
         }
 
         for automatic_index in automatic_indices {
-            if !self.indexes_enabled() {
-                self.table_set_has_index(&automatic_index.0);
-                continue;
-            }
             // Autoindexes must be parsed in definition order.
             // The SQL statement parser enforces that the column definitions come first, and compounds are defined after that,
             // e.g. CREATE TABLE t (a, b, UNIQUE(a, b)), and you can't do something like CREATE TABLE t (a, b, UNIQUE(a, b), c);
@@ -678,45 +675,10 @@ impl Schema {
             let table = self.get_btree_table(&automatic_index.0).unwrap();
             let mut automatic_indexes = automatic_index.1;
             automatic_indexes.reverse(); // reverse so we can pop() without shifting array elements, while still processing in left-to-right order
+
+            // we must process unique_sets in this exact order in order to emit automatic indices schema entries in the same order
             let mut pk_index_added = false;
-            for unique_set in table.unique_sets.iter().filter(|us| us.columns.len() == 1) {
-                let col_name = &unique_set.columns.first().unwrap().0;
-                let Some((pos_in_table, column)) = table.get_column(col_name) else {
-                    return Err(LimboError::ParseError(format!(
-                        "Column {col_name} not found in table {}",
-                        table.name
-                    )));
-                };
-                if column.primary_key() && unique_set.is_primary_key {
-                    if column.is_rowid_alias() {
-                        // rowid alias, no index needed
-                        continue;
-                    }
-                    assert!(table.primary_key_columns.first().unwrap().0 == *col_name, "trying to add a primary key index for column that is not the first column in the primary key: {} != {}", table.primary_key_columns.first().unwrap().0, col_name);
-                    // Add single column primary key index
-                    assert!(
-                        !pk_index_added,
-                        "trying to add a second primary key index for table {}",
-                        table.name
-                    );
-                    pk_index_added = true;
-                    self.add_index(Arc::new(Index::automatic_from_primary_key(
-                        table.as_ref(),
-                        automatic_indexes.pop().unwrap(),
-                        1,
-                    )?))?;
-                } else {
-                    // Add single column unique index
-                    if let Some(autoidx) = automatic_indexes.pop() {
-                        self.add_index(Arc::new(Index::automatic_from_unique(
-                            table.as_ref(),
-                            autoidx,
-                            vec![(pos_in_table, unique_set.columns.first().unwrap().1)],
-                        )?))?;
-                    }
-                }
-            }
-            for unique_set in table.unique_sets.iter().filter(|us| us.columns.len() > 1) {
+            for unique_set in &table.unique_sets {
                 if unique_set.is_primary_key {
                     assert!(table.primary_key_columns.len() == unique_set.columns.len(), "trying to add a {}-column primary key index for table {}, but the table has {} primary key columns", unique_set.columns.len(), table.name, table.primary_key_columns.len());
                     // Add composite primary key index
@@ -726,6 +688,21 @@ impl Schema {
                         table.name
                     );
                     pk_index_added = true;
+
+                    if unique_set.columns.len() == 1 {
+                        let col_name = &unique_set.columns.first().unwrap().0;
+                        let Some((_, column)) = table.get_column(col_name) else {
+                            return Err(LimboError::ParseError(format!(
+                                "Column {col_name} not found in table {}",
+                                table.name
+                            )));
+                        };
+                        if column.is_rowid_alias() {
+                            // rowid alias, no index needed
+                            continue;
+                        }
+                    }
+
                     self.add_index(Arc::new(Index::automatic_from_primary_key(
                         table.as_ref(),
                         automatic_indexes.pop().unwrap(),
@@ -1395,8 +1372,8 @@ impl Clone for Schema {
             triggers,
             indexes,
             has_indexes: self.has_indexes.clone(),
-            indexes_enabled: self.indexes_enabled,
             schema_version: self.schema_version,
+            analyze_stats: self.analyze_stats.clone(),
             table_to_materialized_views: self.table_to_materialized_views.clone(),
             incompatible_views,
         }
@@ -1466,6 +1443,14 @@ impl Table {
     pub fn btree(&self) -> Option<Arc<BTreeTable>> {
         match self {
             Self::BTree(table) => Some(table.clone()),
+            Self::Virtual(_) => None,
+            Self::FromClauseSubquery(_) => None,
+        }
+    }
+
+    pub fn btree_mut(&mut self) -> Option<&mut Arc<BTreeTable>> {
+        match self {
+            Self::BTree(table) => Some(table),
             Self::Virtual(_) => None,
             Self::FromClauseSubquery(_) => None,
         }
@@ -1701,7 +1686,8 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
     let mut foreign_keys = vec![];
     let mut cols = vec![];
     let is_strict: bool;
-    let mut unique_sets: Vec<UniqueSet> = vec![];
+    let mut unique_sets_columns: Vec<UniqueSet> = vec![];
+    let mut unique_sets_constraints: Vec<UniqueSet> = vec![];
     match body {
         CreateTableBody::ColumnsAndConstraints {
             columns,
@@ -1709,6 +1695,11 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
             options,
         } => {
             is_strict = options.contains(TableOptions::STRICT);
+
+            // we need to preserve order of unique sets definition
+            // but also, we analyze constraints first in order to check PRIMARY KEY constraint and recognize rowid alias properly
+            // that's why we maintain 2 unique_set sequences and merge them together in the end
+
             for c in constraints {
                 if let ast::TableConstraint::PrimaryKey {
                     columns,
@@ -1739,7 +1730,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                         primary_key_columns
                             .push((col_name, column.order.unwrap_or(SortOrder::Asc)));
                     }
-                    unique_sets.push(UniqueSet {
+                    unique_sets_constraints.push(UniqueSet {
                         columns: primary_key_columns.clone(),
                         is_primary_key: true,
                     });
@@ -1771,7 +1762,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                         columns: unique_columns,
                         is_primary_key: false,
                     };
-                    unique_sets.push(unique_set);
+                    unique_sets_constraints.push(unique_set);
                 } else if let ast::TableConstraint::ForeignKey {
                     columns,
                     clause,
@@ -1917,7 +1908,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                             if let Some(o) = o {
                                 order = *o;
                             }
-                            unique_sets.push(UniqueSet {
+                            unique_sets_columns.push(UniqueSet {
                                 columns: vec![(name.clone(), order)],
                                 is_primary_key: true,
                             });
@@ -1947,7 +1938,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                                 );
                             }
                             unique = true;
-                            unique_sets.push(UniqueSet {
+                            unique_sets_columns.push(UniqueSet {
                                 columns: vec![(name.clone(), order)],
                                 is_primary_key: false,
                             });
@@ -2034,6 +2025,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     },
                 ));
             }
+
             if options.contains(TableOptions::WITHOUT_ROWID) {
                 has_rowid = false;
             }
@@ -2064,6 +2056,11 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
         }
     }
 
+    // concat unqiue_sets collected from column definitions and constraints in correct order
+    let mut unique_sets = unique_sets_columns
+        .into_iter()
+        .chain(unique_sets_constraints)
+        .collect::<Vec<_>>();
     for col in cols.iter() {
         if col.is_rowid_alias() {
             // Unique sets are used for creating automatic indexes. An index is not created for a rowid alias PRIMARY KEY.
@@ -2717,24 +2714,28 @@ impl Index {
     ) -> Result<Index> {
         let (index_name, root_page) = auto_index;
 
-        let unique_cols = table
-            .columns
-            .iter()
-            .enumerate()
-            .filter_map(|(pos_in_table, col)| {
-                let (pos_in_table, sort_order) = column_indices_and_sort_orders
-                    .iter()
-                    .find(|(pos, _)| *pos == pos_in_table)?;
-                Some(IndexColumn {
-                    name: normalize_ident(col.name.as_ref().unwrap()),
-                    order: *sort_order,
-                    pos_in_table: *pos_in_table,
-                    collation: col.collation_opt(),
-                    default: col.default.clone(),
-                    expr: None,
-                })
-            })
-            .collect::<Vec<_>>();
+        let mut unique_cols = Vec::with_capacity(column_indices_and_sort_orders.len());
+        for (pos, sort_order) in &column_indices_and_sort_orders {
+            let Some((pos_in_table, col)) = table
+                .columns
+                .iter()
+                .enumerate()
+                .find(|(pos_in_table, _)| pos == pos_in_table)
+            else {
+                return Err(crate::LimboError::ParseError(format!(
+                    "Unique constraint column not found in table {}",
+                    table.name
+                )));
+            };
+            unique_cols.push(IndexColumn {
+                name: normalize_ident(col.name.as_ref().unwrap()),
+                order: *sort_order,
+                pos_in_table,
+                collation: col.collation_opt(),
+                default: col.default.clone(),
+                expr: None,
+            });
+        }
 
         Ok(Index {
             name: normalize_ident(index_name.as_str()),

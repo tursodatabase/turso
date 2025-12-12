@@ -1,5 +1,6 @@
 pub mod grammar_generator;
 pub mod rowid_alias;
+pub mod test_join_optimizer;
 
 #[cfg(test)]
 mod fuzz_tests {
@@ -8,6 +9,7 @@ mod fuzz_tests {
     use rand_chacha::ChaCha8Rng;
     use rusqlite::{params, types::Value};
     use std::{collections::HashSet, io::Write};
+    use tempfile::NamedTempFile;
 
     use core_tester::common::{
         do_flush, limbo_exec_rows, limbo_exec_rows_fallible, limbo_stmt_get_column_names,
@@ -25,7 +27,7 @@ mod fuzz_tests {
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
         let offending_query = "SELECT ((ceil(pow((((2.0))), (-2.0 - -1.0) / log(0.5)))) - -2.0)";
-        let limbo_result = limbo_exec_rows(&db, &limbo_conn, offending_query);
+        let limbo_result = limbo_exec_rows(&limbo_conn, offending_query);
         let sqlite_result = sqlite_exec_rows(&sqlite_conn, offending_query);
         assert_eq!(
             limbo_result, sqlite_result,
@@ -42,7 +44,7 @@ mod fuzz_tests {
             "SELECT ~1 >> 1536",
             "SELECT ~ + 3 << - ~ (~ (8)) - + -1 - 3 >> 3 + -6 * (-7 * 9 >> - 2)",
         ] {
-            let limbo = limbo_exec_rows(&db, &limbo_conn, query);
+            let limbo = limbo_exec_rows(&limbo_conn, query);
             let sqlite = sqlite_exec_rows(&sqlite_conn, query);
             assert_eq!(
                 limbo, sqlite,
@@ -58,7 +60,11 @@ mod fuzz_tests {
     )]
     pub fn rowid_seek_fuzz(db: TempDatabase) {
         let _ = tracing_subscriber::fmt::try_init();
-        let sqlite_conn = rusqlite::Connection::open(db.path.clone()).unwrap();
+        let sqlite_path = db.path.parent().unwrap().join("sqlite.db");
+        let sqlite_conn = rusqlite::Connection::open(&sqlite_path).unwrap();
+        sqlite_conn
+            .execute(db.init_sql.as_ref().unwrap(), [])
+            .unwrap();
 
         let (mut rng, _seed) = rng_from_time_or_env();
 
@@ -79,8 +85,9 @@ mod fuzz_tests {
         );
         sqlite_conn.execute(&insert, params![]).unwrap();
         sqlite_conn.close().unwrap();
-        let sqlite_conn = rusqlite::Connection::open(db.path.clone()).unwrap();
+        let sqlite_conn = rusqlite::Connection::open(&sqlite_path).unwrap();
         let limbo_conn = db.connect_limbo();
+        limbo_exec_rows(&limbo_conn, &insert);
 
         const COMPARISONS: [&str; 4] = ["<", "<=", ">", ">="];
         const ORDER_BY: [Option<&str>; 4] = [
@@ -109,7 +116,7 @@ mod fuzz_tests {
                         );
 
                         tracing::info!("query: {query}");
-                        let limbo_result = limbo_exec_rows(&db, &limbo_conn, &query);
+                        let limbo_result = limbo_exec_rows(&limbo_conn, &query);
                         let sqlite_result = sqlite_exec_rows(&sqlite_conn, &query);
                         assert_eq!(
                             limbo_result, sqlite_result,
@@ -171,7 +178,12 @@ mod fuzz_tests {
 
     #[turso_macros::test(mvcc, init_sql = "CREATE TABLE t (x PRIMARY KEY)")]
     pub fn index_scan_fuzz(db: TempDatabase) {
-        let sqlite_conn = rusqlite::Connection::open(db.path.clone()).unwrap();
+        maybe_setup_tracing();
+        let sqlite_path = db.path.parent().unwrap().join("sqlite.db");
+        let sqlite_conn = rusqlite::Connection::open(&sqlite_path).unwrap();
+        sqlite_conn
+            .execute(db.init_sql.as_ref().unwrap(), [])
+            .unwrap();
 
         let insert = format!(
             "INSERT INTO t VALUES {}",
@@ -182,8 +194,9 @@ mod fuzz_tests {
         );
         sqlite_conn.execute(&insert, params![]).unwrap();
         sqlite_conn.close().unwrap();
-        let sqlite_conn = rusqlite::Connection::open(db.path.clone()).unwrap();
+        let sqlite_conn = rusqlite::Connection::open(&sqlite_path).unwrap();
         let limbo_conn = db.connect_limbo();
+        limbo_exec_rows(&limbo_conn, &insert);
 
         const COMPARISONS: [&str; 5] = ["=", "<", "<=", ">", ">="];
 
@@ -203,7 +216,7 @@ mod fuzz_tests {
                         max,
                         order_by.unwrap_or(""),
                     );
-                    let limbo = limbo_exec_rows(&db, &limbo_conn, &query);
+                    let limbo = limbo_exec_rows(&limbo_conn, &query);
                     let sqlite = sqlite_exec_rows(&sqlite_conn, &query);
                     assert_eq!(
                         limbo, sqlite,
@@ -218,6 +231,7 @@ mod fuzz_tests {
     /// A test for verifying that index seek+scan works correctly for compound keys
     /// on indexes with various column orderings.
     pub fn index_scan_compound_key_fuzz(db: TempDatabase) {
+        maybe_setup_tracing();
         let (mut rng, seed) = rng_from_time_or_env();
 
         let opts = db.db_opts;
@@ -378,12 +392,22 @@ mod fuzz_tests {
                 col_val: i32,
                 rng: &mut ChaCha8Rng,
             ) -> String {
-                if operator != "=" && rng.random_range(0..3) == 1 {
-                    let val2 = rng.random_range(0..=3000);
-                    let op2 = COMPARISONS[rng.random_range(0..COMPARISONS.len())];
-                    format!("{col_name} {operator} {col_val} AND {col_name} {op2} {val2}")
+                // 5% chance of using NULL as the comparison value
+                let val_str = if rng.random_range(0..20) == 0 {
+                    "NULL".to_string()
                 } else {
-                    format!("{col_name} {operator} {col_val}")
+                    col_val.to_string()
+                };
+                if operator != "=" && rng.random_range(0..3) == 1 {
+                    let val2 = if rng.random_range(0..20) == 0 {
+                        "NULL".to_string()
+                    } else {
+                        rng.random_range(0..=3000).to_string()
+                    };
+                    let op2 = COMPARISONS[rng.random_range(0..COMPARISONS.len())];
+                    format!("{col_name} {operator} {val_str} AND {col_name} {op2} {val2}")
+                } else {
+                    format!("{col_name} {operator} {val_str}")
                 }
             }
 
@@ -430,7 +454,7 @@ mod fuzz_tests {
 
             // Execute the query on all databases and compare the results
             for (i, sqlite_conn) in sqlite_conns.iter().enumerate() {
-                let limbo = limbo_exec_rows(&dbs[i], &limbo_conns[i], &query);
+                let limbo = limbo_exec_rows(&limbo_conns[i], &query);
                 let sqlite = sqlite_exec_rows(sqlite_conn, &query);
                 if limbo != sqlite {
                     // if the order by contains exclusively components that are constrained by an equality (=),
@@ -451,7 +475,7 @@ mod fuzz_tests {
 
                     let query_no_limit =
                         format!("SELECT * FROM t {} {} {}", where_clause, order_by, "");
-                    let limbo_no_limit = limbo_exec_rows(&dbs[i], &limbo_conns[i], &query_no_limit);
+                    let limbo_no_limit = limbo_exec_rows(&limbo_conns[i], &query_no_limit);
                     let sqlite_no_limit = sqlite_exec_rows(sqlite_conn, &query_no_limit);
                     let limbo_rev = limbo_no_limit.iter().cloned().rev().collect::<Vec<_>>();
                     if limbo_rev == sqlite_no_limit && order_by_only_equalities {
@@ -501,6 +525,197 @@ mod fuzz_tests {
                 }
             }
         }
+    }
+
+    fn join_fuzz_inner(db: TempDatabase, add_indexes: bool, iterations: usize, rows: i64) {
+        let _ = env_logger::try_init();
+        let (mut rng, seed) = rng_from_time_or_env();
+        println!("join_fuzz_inner (add_indexes={add_indexes}) seed: {seed}",);
+
+        let opts = db.db_opts;
+        let flags = db.db_flags;
+        let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
+        let limbo_db = builder.clone().build();
+        let sqlite_db = builder.clone().build();
+        let limbo_conn = limbo_db.connect_limbo();
+        let sqlite_conn = rusqlite::Connection::open(sqlite_db.path.clone()).unwrap();
+
+        let schema = r#"
+        CREATE TABLE t1(id INTEGER PRIMARY KEY, a INT, b INT, c INT, d INT);
+        CREATE TABLE t2(id INTEGER PRIMARY KEY, a INT, b INT, c INT, d INT);
+        CREATE TABLE t3(id INTEGER PRIMARY KEY, a INT, b INT, c INT, d INT);
+        CREATE TABLE t4(id INTEGER PRIMARY KEY, a INT, b INT, c INT, d INT);"#;
+
+        sqlite_conn.execute_batch(schema).unwrap();
+        limbo_conn.prepare_execute_batch(schema).unwrap();
+
+        if add_indexes {
+            let index_ddl = r#"
+            CREATE INDEX t1_a_idx ON t1(a);
+            CREATE INDEX t1_b_idx ON t1(b);
+            CREATE INDEX t1_c_idx ON t1(c);
+            CREATE INDEX t1_d_idx ON t1(d);
+
+            CREATE INDEX t2_a_idx ON t2(a);
+            CREATE INDEX t2_b_idx ON t2(b);
+            CREATE INDEX t2_c_idx ON t2(c);
+            CREATE INDEX t2_d_idx ON t2(d);
+
+            CREATE INDEX t3_a_idx ON t3(a);
+            CREATE INDEX t3_b_idx ON t3(b);
+            CREATE INDEX t3_c_idx ON t3(c);
+            CREATE INDEX t3_d_idx ON t3(d);
+
+            CREATE INDEX t4_a_idx ON t4(a);
+            CREATE INDEX t4_b_idx ON t4(b);
+            CREATE INDEX t4_c_idx ON t4(c);
+            CREATE INDEX t4_d_idx ON t4(d);
+        "#;
+            sqlite_conn.execute_batch(index_ddl).unwrap();
+            limbo_conn.prepare_execute_batch(index_ddl).unwrap();
+        }
+
+        let tables = ["t1", "t2", "t3", "t4"];
+        for (t_idx, tname) in tables.iter().enumerate() {
+            for i in 0..rows {
+                let id = i + 1 + (t_idx as i64) * 10_000;
+
+                // 25% chance of NULL per column.
+                let gen_val = |rng: &mut ChaCha8Rng| {
+                    if rng.random_range(0..4) == 0 {
+                        None
+                    } else {
+                        Some(rng.random_range(-10..=20))
+                    }
+                };
+                let a = gen_val(&mut rng);
+                let b = gen_val(&mut rng);
+                let c = gen_val(&mut rng);
+                let d = gen_val(&mut rng);
+
+                let fmt_val = |v: Option<i32>| match v {
+                    Some(x) => x.to_string(),
+                    None => "NULL".to_string(),
+                };
+
+                let stmt = format!(
+                    "INSERT INTO {tname}(id,a,b,c,d) VALUES ({id}, {a}, {b}, {c}, {d})",
+                    a = fmt_val(a),
+                    b = fmt_val(b),
+                    c = fmt_val(c),
+                    d = fmt_val(d),
+                );
+
+                sqlite_conn.execute(&stmt, params![]).unwrap();
+                limbo_conn.execute(&stmt).unwrap();
+            }
+        }
+
+        let non_pk_cols = ["a", "b", "c", "d"];
+
+        for iter in 0..iterations {
+            if iter % (iterations / 100).max(1) == 0 {
+                println!(
+                    "join_fuzz_inner(add_indexes={}) iter {}/{}",
+                    add_indexes,
+                    iter + 1,
+                    iterations
+                );
+            }
+
+            let num_tables = rng.random_range(2..=4);
+            let used_tables = &tables[..num_tables];
+
+            let mut select_cols: Vec<String> = Vec::new();
+            for t in used_tables.iter() {
+                select_cols.push(format!("{t}.id"));
+            }
+            let select_clause = select_cols.join(", ");
+            let mut from_clause = format!("FROM {}", used_tables[0]);
+            for i in 1..num_tables {
+                let left = used_tables[i - 1];
+                let right = used_tables[i];
+
+                let join_type = if rng.random_bool(0.5) {
+                    "JOIN"
+                } else {
+                    "LEFT JOIN"
+                };
+
+                let num_preds = rng.random_range(1..=3);
+                let mut preds = Vec::new();
+                for _ in 0..num_preds {
+                    let col = non_pk_cols[rng.random_range(0..non_pk_cols.len())];
+                    preds.push(format!("{left}.{col} = {right}.{col}"));
+                }
+                preds.sort();
+                preds.dedup();
+
+                let on_clause = preds.join(" AND ");
+                from_clause = format!("{from_clause} {join_type} {right} ON {on_clause}");
+            }
+
+            // WHERE clause: 0..2 predicates on non-pk cols
+            let mut where_parts = Vec::new();
+            let num_where = rng.random_range(0..=2);
+            for _ in 0..num_where {
+                let t = used_tables[rng.random_range(0..num_tables)];
+                let col = non_pk_cols[rng.random_range(0..non_pk_cols.len())];
+                let kind = rng.random_range(0..4);
+                let cond = match kind {
+                    0 => {
+                        let val = rng.random_range(-10..=20);
+                        format!("{t}.{col} = {val}")
+                    }
+                    1 => {
+                        let val = rng.random_range(-10..=20);
+                        format!("{t}.{col} <> {val}")
+                    }
+                    2 => format!("{t}.{col} IS NULL"),
+                    3 => format!("{t}.{col} IS NOT NULL"),
+                    _ => unreachable!(),
+                };
+                where_parts.push(cond);
+            }
+            let where_clause = if where_parts.is_empty() {
+                String::new()
+            } else {
+                format!("WHERE {}", where_parts.join(" AND "))
+            };
+            let order_clause = format!("ORDER BY {}", select_cols.join(", "));
+            let limit = 50;
+            let query = format!(
+                "SELECT {select_clause} {from_clause} {where_clause} {order_clause} LIMIT {limit}",
+            );
+            let sqlite_rows = sqlite_exec_rows(&sqlite_conn, &query);
+            let limbo_rows = limbo_exec_rows(&limbo_conn, &query);
+            if sqlite_rows != limbo_rows {
+                panic!(
+                "JOIN FUZZ MISMATCH (add_indexes={})\nseed: {}\niteration: {}\nquery: {}\n\
+                 sqlite ({} rows): {:?}\nlimbo ({} rows): {:?}\nsqlite path: {:?}\nlimbo path: {:?}",
+                add_indexes,
+                seed,
+                iter,
+                query,
+                sqlite_rows.len(),
+                sqlite_rows,
+                limbo_rows.len(),
+                limbo_rows,
+                sqlite_db.path,
+                limbo_db.path,
+            );
+            }
+        }
+    }
+
+    #[turso_macros::test()]
+    pub fn join_fuzz_unindexed_keys(db: TempDatabase) {
+        join_fuzz_inner(db, false, 2000, 200);
+    }
+
+    #[turso_macros::test()]
+    pub fn join_fuzz_indexed_keys(db: TempDatabase) {
+        join_fuzz_inner(db, true, 2000, 200);
     }
 
     // TODO: Mvcc indexes
@@ -641,7 +856,7 @@ mod fuzz_tests {
             let query = format!("SELECT a, b, c FROM t {where_clause} ORDER BY {order_by}");
             for i in 0..sqlite_conns.len() {
                 let sqlite_rows = sqlite_exec_rows(&sqlite_conns[i], &query);
-                let limbo_rows = limbo_exec_rows(&dbs[i], &limbo_conns[i], &query);
+                let limbo_rows = limbo_exec_rows(&limbo_conns[i], &query);
                 assert_eq!(
                     sqlite_rows, limbo_rows,
                     "Different results! limbo: {:?}, sqlite: {:?}, seed: {}, query: {}, table def: {}",
@@ -686,7 +901,7 @@ mod fuzz_tests {
             };
             // Enable FKs
             let s = log_and_exec("PRAGMA foreign_keys=ON");
-            limbo_exec_rows(&limbo_db, &limbo, &s);
+            limbo_exec_rows(&limbo, &s);
             sqlite.execute(&s, params![]).unwrap();
 
             let get_constraint_type = |rng: &mut ChaCha8Rng| match rng.random_range(0..3) {
@@ -701,7 +916,7 @@ mod fuzz_tests {
                 "CREATE TABLE parent(id {}, a INT, b INT)",
                 get_constraint_type(&mut rng)
             ));
-            limbo_exec_rows(&limbo_db, &limbo, &s);
+            limbo_exec_rows(&limbo, &s);
             sqlite.execute(&s, params![]).unwrap();
 
             // Child with DEFERRABLE INITIALLY DEFERRED FK
@@ -710,7 +925,7 @@ mod fuzz_tests {
              FOREIGN KEY(pid) REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED)",
                 get_constraint_type(&mut rng)
             ));
-            limbo_exec_rows(&limbo_db, &limbo, &s);
+            limbo_exec_rows(&limbo, &s);
             sqlite.execute(&s, params![]).unwrap();
 
             // Child with immediate FK (default)
@@ -719,7 +934,7 @@ mod fuzz_tests {
              FOREIGN KEY(pid) REFERENCES parent(id))",
                 get_constraint_type(&mut rng)
             ));
-            limbo_exec_rows(&limbo_db, &limbo, &s);
+            limbo_exec_rows(&limbo, &s);
             sqlite.execute(&s, params![]).unwrap();
 
             let composite_constraint = match rng.random_range(0..2) {
@@ -731,7 +946,7 @@ mod fuzz_tests {
             let s = log_and_exec(
                 &format!("CREATE TABLE parent_comp(a INT NOT NULL, b INT NOT NULL, c INT, {composite_constraint}(a,b))"),
             );
-            limbo_exec_rows(&limbo_db, &limbo, &s);
+            limbo_exec_rows(&limbo, &s);
             sqlite.execute(&s, params![]).unwrap();
 
             // Child with composite deferred FK
@@ -739,7 +954,7 @@ mod fuzz_tests {
                 "CREATE TABLE child_comp_deferred(id INTEGER PRIMARY KEY, ca INT, cb INT, z INT, \
              FOREIGN KEY(ca,cb) REFERENCES parent_comp(a,b) DEFERRABLE INITIALLY DEFERRED)",
             );
-            limbo_exec_rows(&limbo_db, &limbo, &s);
+            limbo_exec_rows(&limbo, &s);
             sqlite.execute(&s, params![]).unwrap();
 
             // Seed initial data
@@ -750,7 +965,7 @@ mod fuzz_tests {
                     let a = rng.random_range(-5..=25);
                     let b = rng.random_range(-5..=25);
                     let stmt = log_and_exec(&format!("INSERT INTO parent VALUES ({id}, {a}, {b})"));
-                    limbo_exec_rows(&limbo_db, &limbo, &stmt);
+                    limbo_exec_rows(&limbo, &stmt);
                     sqlite.execute(&stmt, params![]).unwrap();
                 }
             }
@@ -764,7 +979,7 @@ mod fuzz_tests {
                     let c = rng.random_range(0..=20);
                     let stmt =
                         log_and_exec(&format!("INSERT INTO parent_comp VALUES ({a}, {b}, {c})"));
-                    limbo_exec_rows(&limbo_db, &limbo, &stmt);
+                    limbo_exec_rows(&limbo, &stmt);
                     sqlite.execute(&stmt, params![]).unwrap();
                 }
             }
@@ -774,12 +989,12 @@ mod fuzz_tests {
             let s = log_and_exec(
                 "CREATE TABLE trigger_log(action TEXT, table_name TEXT, id_val INT, extra_val INT)",
             );
-            limbo_exec_rows(&limbo_db, &limbo, &s);
+            limbo_exec_rows(&limbo, &s);
             sqlite.execute(&s, params![]).unwrap();
 
             // Create a stats table for tracking operations
             let s = log_and_exec("CREATE TABLE trigger_stats(op_type TEXT PRIMARY KEY, count INT)");
-            limbo_exec_rows(&limbo_db, &limbo, &s);
+            limbo_exec_rows(&limbo, &s);
             sqlite.execute(&s, params![]).unwrap();
 
             // Define all available trigger types
@@ -858,7 +1073,7 @@ mod fuzz_tests {
             // Create the selected triggers
             for &idx in selected_indices.iter() {
                 let s = log_and_exec(trigger_definitions[idx]);
-                limbo_exec_rows(&limbo_db, &limbo, &s);
+                limbo_exec_rows(&limbo, &s);
                 sqlite.execute(&s, params![]).unwrap();
             }
 
@@ -1125,17 +1340,17 @@ mod fuzz_tests {
 
             // Enable FKs in both engines
             let s = log_and_exec("PRAGMA foreign_keys=ON");
-            limbo_exec_rows(&limbo_db, &limbo, &s);
+            limbo_exec_rows(&limbo, &s);
             sqlite.execute(&s, params![]).unwrap();
 
             let s = log_and_exec("CREATE TABLE p(id INTEGER PRIMARY KEY, a INT, b INT)");
-            limbo_exec_rows(&limbo_db, &limbo, &s);
+            limbo_exec_rows(&limbo, &s);
             sqlite.execute(&s, params![]).unwrap();
 
             let s = log_and_exec(
             "CREATE TABLE c(id INTEGER PRIMARY KEY, x INT, y INT, FOREIGN KEY(x) REFERENCES p(id))",
         );
-            limbo_exec_rows(&limbo_db, &limbo, &s);
+            limbo_exec_rows(&limbo, &s);
             sqlite.execute(&s, params![]).unwrap();
 
             // Seed parent
@@ -1352,10 +1567,8 @@ mod fuzz_tests {
                         }
                         let sp = sqlite_exec_rows(&sqlite, "SELECT id,a,b FROM p ORDER BY id");
                         let sc = sqlite_exec_rows(&sqlite, "SELECT id,x,y FROM c ORDER BY id");
-                        let lp =
-                            limbo_exec_rows(&limbo_db, &limbo, "SELECT id,a,b FROM p ORDER BY id");
-                        let lc =
-                            limbo_exec_rows(&limbo_db, &limbo, "SELECT id,x,y FROM c ORDER BY id");
+                        let lp = limbo_exec_rows(&limbo, "SELECT id,a,b FROM p ORDER BY id");
+                        let lc = limbo_exec_rows(&limbo, "SELECT id,x,y FROM c ORDER BY id");
 
                         if sp != lp || sc != lc {
                             eprintln!("\n=== FK fuzz failure (state mismatch) ===");
@@ -1379,10 +1592,8 @@ mod fuzz_tests {
                         // dump final states to help decide who is right
                         let sp = sqlite_exec_rows(&sqlite, "SELECT id,a,b FROM p ORDER BY id");
                         let sc = sqlite_exec_rows(&sqlite, "SELECT id,x,y FROM c ORDER BY id");
-                        let lp =
-                            limbo_exec_rows(&limbo_db, &limbo, "SELECT id,a,b FROM p ORDER BY id");
-                        let lc =
-                            limbo_exec_rows(&limbo_db, &limbo, "SELECT id,x,y FROM c ORDER BY id");
+                        let lp = limbo_exec_rows(&limbo, "SELECT id,a,b FROM p ORDER BY id");
+                        let lc = limbo_exec_rows(&limbo, "SELECT id,x,y FROM c ORDER BY id");
                         eprintln!("sqlite p: {sp:?}\nsqlite c: {sc:?}");
                         eprintln!("turso p: {lp:?}\nturso c: {lc:?}");
                         eprintln!(
@@ -1523,7 +1734,7 @@ mod fuzz_tests {
                 "CREATE TABLE t(id INTEGER PRIMARY KEY, rid REFERENCES t(id))",
             ] {
                 let s = log(s, &mut stmts);
-                limbo_exec_rows(&limbo_db, &limbo, &s);
+                limbo_exec_rows(&limbo, &s);
                 sqlite.execute(&s, params![]).unwrap();
             }
 
@@ -1582,7 +1793,7 @@ mod fuzz_tests {
             };
 
             let s = log("PRAGMA foreign_keys=ON", &mut stmts);
-            limbo_exec_rows(&limbo_db, &limbo, &s);
+            limbo_exec_rows(&limbo, &s);
             sqlite.execute(&s, params![]).unwrap();
 
             // Variant the schema a bit: TEXT/TEXT, NUMERIC/TEXT, etc.
@@ -1601,7 +1812,7 @@ mod fuzz_tests {
                 ),
                 &mut stmts,
             );
-            limbo_exec_rows(&limbo_db, &limbo, &s);
+            limbo_exec_rows(&limbo, &s);
             sqlite.execute(&s, params![]).unwrap();
 
             // Self-matching composite rows should succeed
@@ -1668,7 +1879,7 @@ mod fuzz_tests {
                                 FOREIGN KEY(cu,cv) REFERENCES parent(u,v))",
             ] {
                 let s = log(s, &mut stmts);
-                limbo_exec_rows(&limbo_db, &limbo, &s);
+                limbo_exec_rows(&limbo, &s);
                 sqlite.execute(&s, params![]).unwrap();
             }
 
@@ -1795,21 +2006,21 @@ mod fuzz_tests {
 
             // Enable FKs in both engines
             let _ = log_and_exec("PRAGMA foreign_keys=ON");
-            limbo_exec_rows(&limbo_db, &limbo, "PRAGMA foreign_keys=ON");
+            limbo_exec_rows(&limbo, "PRAGMA foreign_keys=ON");
             sqlite.execute("PRAGMA foreign_keys=ON", params![]).unwrap();
 
             // Parent PK is composite (a,b). Child references (x,y) -> (a,b).
             let s = log_and_exec(
                 "CREATE TABLE p(a INT NOT NULL, b INT NOT NULL, v INT, PRIMARY KEY(a,b))",
             );
-            limbo_exec_rows(&limbo_db, &limbo, &s);
+            limbo_exec_rows(&limbo, &s);
             sqlite.execute(&s, params![]).unwrap();
 
             let s = log_and_exec(
                 "CREATE TABLE c(id INTEGER PRIMARY KEY, x INT, y INT, w INT, \
              FOREIGN KEY(x,y) REFERENCES p(a,b))",
             );
-            limbo_exec_rows(&limbo_db, &limbo, &s);
+            limbo_exec_rows(&limbo, &s);
             sqlite.execute(&s, params![]).unwrap();
 
             // Seed parent: small grid of (a,b)
@@ -1821,7 +2032,7 @@ mod fuzz_tests {
                     pairs.push((a, b));
                     let v = rng.random_range(0..=20);
                     let stmt = log_and_exec(&format!("INSERT INTO p VALUES({a},{b},{v})"));
-                    limbo_exec_rows(&limbo_db, &limbo, &stmt);
+                    limbo_exec_rows(&limbo, &stmt);
                     sqlite.execute(&stmt, params![]).unwrap();
                 }
             }
@@ -1931,16 +2142,8 @@ mod fuzz_tests {
                         // Compare canonical states
                         let sp = sqlite_exec_rows(&sqlite, "SELECT a,b,v FROM p ORDER BY a,b,v");
                         let sc = sqlite_exec_rows(&sqlite, "SELECT id,x,y,w FROM c ORDER BY id");
-                        let lp = limbo_exec_rows(
-                            &limbo_db,
-                            &limbo,
-                            "SELECT a,b,v FROM p ORDER BY a,b,v",
-                        );
-                        let lc = limbo_exec_rows(
-                            &limbo_db,
-                            &limbo,
-                            "SELECT id,x,y,w FROM c ORDER BY id",
-                        );
+                        let lp = limbo_exec_rows(&limbo, "SELECT a,b,v FROM p ORDER BY a,b,v");
+                        let lc = limbo_exec_rows(&limbo, "SELECT id,x,y,w FROM c ORDER BY id");
                         assert_eq!(sp, lp, "seed {seed}, stmt {stmt}");
                         assert_eq!(sc, lc, "seed {seed}, stmt {stmt}");
                     }
@@ -1951,16 +2154,8 @@ mod fuzz_tests {
                         );
                         let sp = sqlite_exec_rows(&sqlite, "SELECT a,b,v FROM p ORDER BY a,b,v");
                         let sc = sqlite_exec_rows(&sqlite, "SELECT id,x,y,w FROM c ORDER BY id");
-                        let lp = limbo_exec_rows(
-                            &limbo_db,
-                            &limbo,
-                            "SELECT a,b,v FROM p ORDER BY a,b,v",
-                        );
-                        let lc = limbo_exec_rows(
-                            &limbo_db,
-                            &limbo,
-                            "SELECT id,x,y,w FROM c ORDER BY id",
-                        );
+                        let lp = limbo_exec_rows(&limbo, "SELECT a,b,v FROM p ORDER BY a,b,v");
+                        let lc = limbo_exec_rows(&limbo, "SELECT id,x,y,w FROM c ORDER BY id");
                         eprintln!(
                             "sqlite p={sp:?}\nsqlite c={sc:?}\nlimbo p={lp:?}\nlimbo c={lc:?}"
                         );
@@ -2161,9 +2356,9 @@ mod fuzz_tests {
 
             // Create tables and indexes in both databases
             let limbo_conn = limbo_db.connect_limbo();
-            limbo_exec_rows(&limbo_db, &limbo_conn, &table_def);
+            limbo_exec_rows(&limbo_conn, &table_def);
             for t in indexes.iter() {
-                limbo_exec_rows(&limbo_db, &limbo_conn, t);
+                limbo_exec_rows(&limbo_conn, t);
             }
 
             let sqlite_conn = rusqlite::Connection::open(sqlite_db.path.clone()).unwrap();
@@ -2224,7 +2419,7 @@ mod fuzz_tests {
 
             // Insert initial data into both databases
             sqlite_conn.execute(&insert, params![]).unwrap();
-            limbo_exec_rows(&limbo_db, &limbo_conn, &insert);
+            limbo_exec_rows(&limbo_conn, &insert);
 
             // Self-affecting triggers (e.g CREATE TRIGGER t BEFORE DELETE ON t BEGIN UPDATE t ... END) are
             // an easy source of bugs, so create one some of the time.
@@ -2356,7 +2551,7 @@ mod fuzz_tests {
                 );
 
                 sqlite_conn.execute(&create_trigger, params![]).unwrap();
-                limbo_exec_rows(&limbo_db, &limbo_conn, &create_trigger);
+                limbo_exec_rows(&limbo_conn, &create_trigger);
                 Some(create_trigger)
             } else {
                 None
@@ -2442,7 +2637,7 @@ mod fuzz_tests {
                         .join(", ")
                 );
                 let sqlite_rows = sqlite_exec_rows(&sqlite_conn, &verify_query);
-                let limbo_rows = limbo_exec_rows(&limbo_db, &limbo_conn, &verify_query);
+                let limbo_rows = limbo_exec_rows(&limbo_conn, &verify_query);
 
                 if sqlite_rows != limbo_rows {
                     let diff_msg = format_rows_diff(
@@ -2540,7 +2735,7 @@ mod fuzz_tests {
             }
             let create = format!("CREATE TABLE t ({})", cols.join(", "));
             println!("{create};");
-            limbo_exec_rows(&limbo_db, &limbo_conn, &create);
+            limbo_exec_rows(&limbo_conn, &create);
             sqlite.execute(&create, rusqlite::params![]).unwrap();
 
             // Helper to list usable columns for keys/predicates
@@ -2653,7 +2848,7 @@ mod fuzz_tests {
                 idx_ddls.push(ddl.clone());
                 // Create in both engines
                 println!("{ddl};");
-                limbo_exec_rows(&limbo_db, &limbo_conn, &ddl);
+                limbo_exec_rows(&limbo_conn, &ddl);
                 sqlite.execute(&ddl, rusqlite::params![]).unwrap();
             }
 
@@ -2846,7 +3041,7 @@ mod fuzz_tests {
                                 .collect::<String>(),
                         );
                         let s = sqlite_exec_rows(&sqlite, &verify);
-                        let l = limbo_exec_rows(&limbo_db, &limbo_conn, &verify);
+                        let l = limbo_exec_rows(&limbo_conn, &verify);
                         assert_eq!(
                             l, s,
                             "stmt: {stmt}, seed: {seed}, create: {create}, idx: {idx_ddls:?}"
@@ -2873,8 +3068,7 @@ mod fuzz_tests {
         }
     }
 
-    // TODO: mvcc fails
-    #[turso_macros::test()]
+    #[turso_macros::test(mvcc)]
     pub fn compound_select_fuzz(db: TempDatabase) {
         let _ = env_logger::try_init();
         let (mut rng, seed) = rng_from_time_or_env();
@@ -2908,7 +3102,7 @@ mod fuzz_tests {
                     .join(", ")
             );
 
-            limbo_exec_rows(&db, &limbo_conn, &create_table_sql);
+            limbo_exec_rows(&limbo_conn, &create_table_sql);
             sqlite_exec_rows(&sqlite_conn, &create_table_sql);
 
             let num_rows_to_insert = rng.random_range(MIN_ROWS_PER_TABLE..=MAX_ROWS_PER_TABLE);
@@ -2919,7 +3113,7 @@ mod fuzz_tests {
 
                 let insert_sql =
                     format!("INSERT INTO {table_name} VALUES ({c1_val}, {c2_val}, {c3_val})",);
-                limbo_exec_rows(&db, &limbo_conn, &insert_sql);
+                limbo_exec_rows(&limbo_conn, &insert_sql);
                 sqlite_exec_rows(&sqlite_conn, &insert_sql);
             }
             table_names.push(table_name);
@@ -2992,7 +3186,7 @@ mod fuzz_tests {
                 query
             );
 
-            let limbo_results = limbo_exec_rows(&db, &limbo_conn, &query);
+            let limbo_results = limbo_exec_rows(&limbo_conn, &query);
             let sqlite_results = sqlite_exec_rows(&sqlite_conn, &query);
 
             assert_eq!(
@@ -3107,7 +3301,7 @@ mod fuzz_tests {
 
             println!("{create_sql}");
 
-            limbo_exec_rows(&db, &conn, &create_sql);
+            limbo_exec_rows(&conn, &create_sql);
             do_flush(&conn, &db).unwrap();
 
             // Open with rusqlite and verify integrity_check returns OK
@@ -3130,7 +3324,7 @@ mod fuzz_tests {
             let verify_sql = format!(
                 "SELECT sql FROM sqlite_schema WHERE name = '{table_name}' and type = 'table'"
             );
-            let res = limbo_exec_rows(&db, &conn, &verify_sql);
+            let res = limbo_exec_rows(&conn, &verify_sql);
             assert!(res.len() == 1, "Expected 1 row, got {res:?}");
             let Value::Text(s) = &res[0][0] else {
                 panic!("sql should be TEXT");
@@ -3190,7 +3384,7 @@ mod fuzz_tests {
         log::info!("seed: {seed}");
         for _ in 0..1024 {
             let query = g.generate(&mut rng, sql, 50);
-            let limbo = limbo_exec_rows(&db, &limbo_conn, &query);
+            let limbo = limbo_exec_rows(&limbo_conn, &query);
             let sqlite = sqlite_exec_rows(&sqlite_conn, &query);
             assert_eq!(
                 limbo, sqlite,
@@ -3216,7 +3410,7 @@ mod fuzz_tests {
             "SELECT CAST((1 > 0) AS INTEGER);",
             "SELECT substr('ABC', -1)",
         ] {
-            let limbo = limbo_exec_rows(&db, &limbo_conn, query);
+            let limbo = limbo_exec_rows(&limbo_conn, query);
             let sqlite = sqlite_exec_rows(&sqlite_conn, query);
             assert_eq!(
                 limbo, sqlite,
@@ -3308,7 +3502,7 @@ mod fuzz_tests {
         for _ in 0..1024 {
             let query = g.generate(&mut rng, sql, 50);
             log::info!("query: {query}");
-            let limbo = limbo_exec_rows(&db, &limbo_conn, &query);
+            let limbo = limbo_exec_rows(&limbo_conn, &query);
             let sqlite = sqlite_exec_rows(&sqlite_conn, &query);
             match (&limbo[0][0], &sqlite[0][0]) {
                 // compare only finite results because some evaluations are not so stable around infinity
@@ -3467,7 +3661,7 @@ mod fuzz_tests {
         for _ in 0..1024 {
             let query = g.generate(&mut rng, sql, 50);
             log::info!("query: {query}");
-            let limbo = limbo_exec_rows(&db, &limbo_conn, &query);
+            let limbo = limbo_exec_rows(&limbo_conn, &query);
             let sqlite = sqlite_exec_rows(&sqlite_conn, &query);
             assert_eq!(
                 limbo, sqlite,
@@ -3840,7 +4034,7 @@ mod fuzz_tests {
         for _ in 0..1024 {
             let query = g.generate(&mut rng, sql, 50);
             log::info!("query: {query}");
-            let limbo = limbo_exec_rows(&db, &limbo_conn, &query);
+            let limbo = limbo_exec_rows(&limbo_conn, &query);
             let sqlite = sqlite_exec_rows(&sqlite_conn, &query);
             assert_eq!(
                 limbo, sqlite,
@@ -3873,7 +4067,7 @@ mod fuzz_tests {
             let limbo_conn = db.connect_limbo();
             let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
             for query in queries.iter() {
-                let limbo = limbo_exec_rows(&db, &limbo_conn, query);
+                let limbo = limbo_exec_rows(&limbo_conn, query);
                 let sqlite = sqlite_exec_rows(&sqlite_conn, query);
                 assert_eq!(
                     limbo, sqlite,
@@ -3904,7 +4098,7 @@ mod fuzz_tests {
             let limbo_conn = db.connect_limbo();
             let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
-            limbo_exec_rows(&db, &limbo_conn, &create_table);
+            limbo_exec_rows(&limbo_conn, &create_table);
             sqlite_exec_rows(&sqlite_conn, &create_table);
 
             // Insert 5 random values of random types
@@ -3926,13 +4120,13 @@ mod fuzz_tests {
             }
 
             let insert = format!("INSERT INTO t VALUES {}", values.join(","));
-            limbo_exec_rows(&db, &limbo_conn, &insert);
+            limbo_exec_rows(&limbo_conn, &insert);
             sqlite_exec_rows(&sqlite_conn, &insert);
 
             // Test min and max
             for agg in ["min(x)", "max(x)"] {
                 let query = format!("SELECT {agg} FROM t");
-                let limbo = limbo_exec_rows(&db, &limbo_conn, &query);
+                let limbo = limbo_exec_rows(&limbo_conn, &query);
                 let sqlite = sqlite_exec_rows(&sqlite_conn, &query);
 
                 assert_eq!(
@@ -3992,7 +4186,7 @@ mod fuzz_tests {
             let affinity = affinities[rng.random_range(0..affinities.len())];
 
             let create_table = format!("CREATE TABLE t (x {affinity})");
-            limbo_exec_rows(&db, &limbo_conn, &create_table);
+            limbo_exec_rows(&limbo_conn, &create_table);
             sqlite_exec_rows(&sqlite_conn, &create_table);
 
             // Insert various values that test affinity conversion rules
@@ -4022,12 +4216,12 @@ mod fuzz_tests {
             }
 
             let insert = format!("INSERT INTO t VALUES {}", values.join(","));
-            limbo_exec_rows(&db, &limbo_conn, &insert);
+            limbo_exec_rows(&limbo_conn, &insert);
             sqlite_exec_rows(&sqlite_conn, &insert);
 
             // Query values and their types to verify affinity rules are applied correctly
             let query = "SELECT x, typeof(x) FROM t";
-            let limbo_result = limbo_exec_rows(&db, &limbo_conn, query);
+            let limbo_result = limbo_exec_rows(&limbo_conn, query);
             let sqlite_result = sqlite_exec_rows(&sqlite_conn, query);
 
             assert_eq!(
@@ -4037,7 +4231,7 @@ mod fuzz_tests {
 
             // Also test with ORDER BY to ensure affinity affects sorting
             let query_ordered = "SELECT x FROM t ORDER BY x";
-            let limbo_ordered = limbo_exec_rows(&db, &limbo_conn, query_ordered);
+            let limbo_ordered = limbo_exec_rows(&limbo_conn, query_ordered);
             let sqlite_ordered = sqlite_exec_rows(&sqlite_conn, query_ordered);
 
             assert_eq!(
@@ -4064,7 +4258,7 @@ mod fuzz_tests {
             let limbo_conn = db.connect_limbo();
             let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
-            limbo_exec_rows(&db, &limbo_conn, "CREATE TABLE t(x)");
+            limbo_exec_rows(&limbo_conn, "CREATE TABLE t(x)");
             sqlite_exec_rows(&sqlite_conn, "CREATE TABLE t(x)");
 
             // Insert 50-100 mixed values: floats, text, NULL
@@ -4075,11 +4269,11 @@ mod fuzz_tests {
             }
 
             let insert = format!("INSERT INTO t VALUES {}", values.join(","));
-            limbo_exec_rows(&db, &limbo_conn, &insert);
+            limbo_exec_rows(&limbo_conn, &insert);
             sqlite_exec_rows(&sqlite_conn, &insert);
 
             let query = "SELECT sum(x) FROM t ORDER BY x";
-            let limbo_result = limbo_exec_rows(&db, &limbo_conn, query);
+            let limbo_result = limbo_exec_rows(&limbo_conn, query);
             let sqlite_result = sqlite_exec_rows(&sqlite_conn, query);
 
             let limbo_val = match limbo_result.first().and_then(|row| row.first()) {
@@ -4114,7 +4308,7 @@ mod fuzz_tests {
             let limbo_conn = db.connect_limbo();
             let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
-            limbo_exec_rows(&db, &limbo_conn, "CREATE TABLE t(x)");
+            limbo_exec_rows(&limbo_conn, "CREATE TABLE t(x)");
             sqlite_exec_rows(&sqlite_conn, "CREATE TABLE t(x)");
 
             // Insert 3-4 mixed values: integers, text, NULL
@@ -4135,11 +4329,11 @@ mod fuzz_tests {
             }
 
             let insert = format!("INSERT INTO t VALUES {}", values.join(","));
-            limbo_exec_rows(&db, &limbo_conn, &insert);
+            limbo_exec_rows(&limbo_conn, &insert);
             sqlite_exec_rows(&sqlite_conn, &insert);
 
             let query = "SELECT sum(x) FROM t";
-            let limbo = limbo_exec_rows(&db, &limbo_conn, query);
+            let limbo = limbo_exec_rows(&limbo_conn, query);
             let sqlite = sqlite_exec_rows(&sqlite_conn, query);
 
             assert_eq!(limbo, sqlite, "seed: {seed}, values: {values:?}");
@@ -4188,7 +4382,7 @@ mod fuzz_tests {
 
             let query = format!("SELECT concat_ws({}, {})", sep, args.join(", "));
 
-            let limbo = limbo_exec_rows(&db, &limbo_conn, &query);
+            let limbo = limbo_exec_rows(&limbo_conn, &query);
             let sqlite = sqlite_exec_rows(&sqlite_conn, &query);
 
             assert_eq!(limbo, sqlite, "seed: {seed}, sep: {sep}, args: {args:?}");
@@ -4212,7 +4406,7 @@ mod fuzz_tests {
             let limbo_conn = db.connect_limbo();
             let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
-            limbo_exec_rows(&db, &limbo_conn, "CREATE TABLE t(x)");
+            limbo_exec_rows(&limbo_conn, "CREATE TABLE t(x)");
             sqlite_exec_rows(&sqlite_conn, "CREATE TABLE t(x)");
 
             // Insert 3-4 mixed values: integers, text, NULL
@@ -4233,11 +4427,11 @@ mod fuzz_tests {
             }
 
             let insert = format!("INSERT INTO t VALUES {}", values.join(","));
-            limbo_exec_rows(&db, &limbo_conn, &insert);
+            limbo_exec_rows(&limbo_conn, &insert);
             sqlite_exec_rows(&sqlite_conn, &insert);
 
             let query = "SELECT total(x) FROM t";
-            let limbo = limbo_exec_rows(&db, &limbo_conn, query);
+            let limbo = limbo_exec_rows(&limbo_conn, query);
             let sqlite = sqlite_exec_rows(&sqlite_conn, query);
 
             assert_eq!(limbo, sqlite, "seed: {seed}, values: {values:?}");
@@ -4271,7 +4465,7 @@ mod fuzz_tests {
                 table.name, columns_with_first_column_as_pk
             );
             log::info!("schema: {query}");
-            let limbo = limbo_exec_rows(&db, &limbo_conn, &query);
+            let limbo = limbo_exec_rows(&limbo_conn, &query);
             let sqlite = sqlite_exec_rows(&sqlite_conn, &query);
 
             assert_eq!(
@@ -4299,7 +4493,7 @@ mod fuzz_tests {
             log::info!("insert: {query}");
             dbg!(&query);
             assert_eq!(
-                limbo_exec_rows(&db, &limbo_conn, &query),
+                limbo_exec_rows(&limbo_conn, &query),
                 sqlite_exec_rows(&sqlite_conn, &query),
                 "seed: {seed}",
             );
@@ -4307,7 +4501,7 @@ mod fuzz_tests {
         }
         // verify the same number of rows in both tables
         let query = "SELECT COUNT(*) FROM t".to_string();
-        let limbo = limbo_exec_rows(&db, &limbo_conn, &query);
+        let limbo = limbo_exec_rows(&limbo_conn, &query);
         let sqlite = sqlite_exec_rows(&sqlite_conn, &query);
         assert_eq!(limbo, sqlite, "seed: {seed}");
 
@@ -4329,7 +4523,7 @@ mod fuzz_tests {
         for _ in 0..1024 {
             let query = g.generate(&mut rng, sql, 50);
             log::info!("query: {query}");
-            let limbo = limbo_exec_rows(&db, &limbo_conn, &query);
+            let limbo = limbo_exec_rows(&limbo_conn, &query);
             let sqlite = sqlite_exec_rows(&sqlite_conn, &query);
 
             if limbo.len() != sqlite.len() {
@@ -4365,7 +4559,7 @@ mod fuzz_tests {
 
         // Create table with 3 integer columns
         let create_table = format!("CREATE TABLE t ({})", columns.join(", "));
-        limbo_exec_rows(&db, &limbo_conn, &create_table);
+        limbo_exec_rows(&limbo_conn, &create_table);
         sqlite_exec_rows(&sqlite_conn, &create_table);
 
         // Insert some random data
@@ -4381,7 +4575,7 @@ mod fuzz_tests {
                     .collect::<Vec<_>>()
                     .join(",")
             );
-            limbo_exec_rows(&db, &limbo_conn, &query);
+            limbo_exec_rows(&limbo_conn, &query);
             sqlite_exec_rows(&sqlite_conn, &query);
         }
 
@@ -4411,7 +4605,7 @@ mod fuzz_tests {
 
             let query = format!("SELECT DISTINCT {distinct_cols} FROM t ORDER BY {order_cols}");
 
-            let limbo = limbo_exec_rows(&db, &limbo_conn, &query);
+            let limbo = limbo_exec_rows(&limbo_conn, &query);
             let sqlite = sqlite_exec_rows(&sqlite_conn, &query);
 
             assert_eq!(limbo, sqlite, "seed: {seed}, query: {query}");
@@ -4499,7 +4693,7 @@ mod fuzz_tests {
 
                         // Execute the create table statement
                         stmts.push(create_sql.clone());
-                        limbo_exec_rows(&db, &limbo_conn, &create_sql);
+                        limbo_exec_rows(&limbo_conn, &create_sql);
                         let column_names = columns
                             .iter()
                             .map(|c| c.split_whitespace().next().unwrap().to_string())
@@ -4515,7 +4709,7 @@ mod fuzz_tests {
                                 .join(", ")
                         );
                         stmts.push(insert_sql.clone());
-                        limbo_exec_rows(&db, &limbo_conn, &insert_sql);
+                        limbo_exec_rows(&limbo_conn, &insert_sql);
 
                         // Successfully created table, update our tracking
                         current_tables.insert(table_name.clone(), column_names);
@@ -4530,7 +4724,7 @@ mod fuzz_tests {
 
                         let drop_sql = format!("DROP TABLE {table_to_drop}");
                         stmts.push(drop_sql.clone());
-                        limbo_exec_rows(&db, &limbo_conn, &drop_sql);
+                        limbo_exec_rows(&limbo_conn, &drop_sql);
 
                         // Successfully dropped table, update our tracking
                         current_tables.remove(table_to_drop);
@@ -4551,7 +4745,7 @@ mod fuzz_tests {
                         );
 
                         stmts.push(alter_sql.clone());
-                        limbo_exec_rows(&db, &limbo_conn, &alter_sql);
+                        limbo_exec_rows(&limbo_conn, &alter_sql);
 
                         // Successfully added column, update our tracking
                         let table_name = table_to_alter.clone();
@@ -4583,7 +4777,7 @@ mod fuzz_tests {
                                     "ALTER TABLE {table_to_alter} DROP COLUMN {col_to_drop}"
                                 );
                                 stmts.push(alter_sql.clone());
-                                limbo_exec_rows(&db, &limbo_conn, &alter_sql);
+                                limbo_exec_rows(&limbo_conn, &alter_sql);
 
                                 // Successfully dropped column, update our tracking
                                 let columns = current_tables.get_mut(&table_name).unwrap();
@@ -4607,7 +4801,7 @@ mod fuzz_tests {
                     col_names_actual, col_names_expected,
                     "seed: {seed}, mvcc: {mvcc}, table: {table_name}"
                 );
-                let limbo = limbo_exec_rows(&db, &limbo_conn, &select_sql);
+                let limbo = limbo_exec_rows(&limbo_conn, &select_sql);
                 assert_eq!(
                     limbo.len(),
                     1,
@@ -4726,7 +4920,7 @@ mod fuzz_tests {
 
         for schema in &table_schemas {
             debug_ddl_dml_string.push_str(schema);
-            limbo_exec_rows(&db, &limbo_conn, schema);
+            limbo_exec_rows(&limbo_conn, schema);
             sqlite_exec_rows(&sqlite_conn, schema);
         }
 
@@ -4757,7 +4951,7 @@ mod fuzz_tests {
                 };
                 log::debug!("{insert_sql}");
                 debug_ddl_dml_string.push_str(&insert_sql);
-                limbo_exec_rows(&db, &limbo_conn, &insert_sql);
+                limbo_exec_rows(&limbo_conn, &insert_sql);
                 sqlite_exec_rows(&sqlite_conn, &insert_sql);
             }
         }
@@ -5610,7 +5804,7 @@ mod fuzz_tests {
                 iter_num + 1,
             );
 
-            let limbo_results = limbo_exec_rows(&db, &limbo_conn, &query);
+            let limbo_results = limbo_exec_rows(&limbo_conn, &query);
             let sqlite_results = sqlite_exec_rows(&sqlite_conn, &query);
 
             // Check if results match
@@ -5638,6 +5832,522 @@ mod fuzz_tests {
                 panic!(
                     "Results mismatch for query: {query}\nLimbo: {limbo_results:?}\nSQLite: {sqlite_results:?}\nSeed: {seed}",
                 );
+            }
+        }
+    }
+
+    #[derive(Clone, Debug)]
+    struct FuzzTestColumn {
+        name: String,
+        ty: String,
+        collation: Option<&'static str>, // BINARY/NOCASE/RTRIM
+        inline_unique: bool,
+        is_pk_autoinc: bool, // INTEGER PRIMARY KEY AUTOINCREMENT
+    }
+
+    #[derive(Clone, Debug)]
+    struct FuzzTestTable {
+        name: String,
+        columns: Vec<FuzzTestColumn>,
+        unique_table_constraints: Vec<Vec<usize>>, // indices into columns for table-level UNIQUE(...)
+    }
+
+    #[derive(Clone, Debug)]
+    struct FuzzTestIndexCol {
+        col: usize, // index into table.columns
+        collation: Option<&'static str>,
+        sort_order: &'static str, // "ASC" or "DESC"
+    }
+
+    #[derive(Clone, Debug)]
+    struct FuzzTestIndex {
+        name: String,
+        table: String,
+        cols: Vec<FuzzTestIndexCol>,
+        unique: bool,
+    }
+
+    #[derive(Clone, Debug, Default)]
+    struct FuzzTestDbState {
+        tables: Vec<FuzzTestTable>,
+        indices: Vec<FuzzTestIndex>,
+        table_counter: usize,
+        index_counter: usize,
+    }
+
+    impl FuzzTestDbState {
+        fn next_table_name(&mut self) -> String {
+            self.table_counter += 1;
+            format!("t{}", self.table_counter)
+        }
+        fn next_index_name(&mut self) -> String {
+            self.index_counter += 1;
+            format!("i{}", self.index_counter)
+        }
+    }
+
+    const COLLATIONS: [&str; 3] = ["BINARY", "NOCASE", "RTRIM"];
+    const TYPES: [&str; 5] = ["INT", "TEXT", "REAL", "BLOB", "NUMERIC"];
+
+    fn random_collation<R: Rng>(rng: &mut R) -> Option<&'static str> {
+        if rng.random_bool(0.65) {
+            Some(COLLATIONS[rng.random_range(0..COLLATIONS.len())])
+        } else {
+            None
+        }
+    }
+
+    fn random_type<R: Rng>(rng: &mut R) -> &'static str {
+        TYPES[rng.random_range(0..TYPES.len())]
+    }
+
+    fn quote_ident(s: &str) -> String {
+        // use simple quoting with double quotes
+        format!("\"{}\"", s.replace('"', "\"\""))
+    }
+
+    fn sql_value_string<R: Rng>(rng: &mut R) -> String {
+        match rng.random_range(0..9) {
+            0 => "NULL".to_string(),
+            1 => rng.random_range(-1000..=1000).to_string(),
+            2 => {
+                let f: f64 = rng.random_range(-10000.0..10000.0);
+                // avoid NaN comparisons
+                if rng.random_bool(0.1) {
+                    "0.0".to_string()
+                } else {
+                    f.to_string()
+                }
+            }
+            3 => format!("'{}'", " ".repeat(rng.random_range(0..=3))), // spaces test RTRIM
+            4 => format!("'{}'", "A".repeat(rng.random_range(0..=3))), // test NOCASE
+            5 => format!("'{}'", "a".repeat(rng.random_range(0..=3))),
+            6 => format!(
+                "X'{:02X}{:02X}{:02X}'",
+                rng.random_range(0..=255),
+                rng.random_range(0..=255),
+                rng.random_range(0..=255)
+            ),
+            7 => format!("'{}'", rng.random_range(0..=1_000_000_000)),
+            _ => format!(
+                "'{}'",
+                ["foo", "Foo", "FOO", "bar ", " Bar", "baz  "][rng.random_range(0..6)]
+                    .replace('\'', "''")
+            ),
+        }
+    }
+
+    fn build_create_table_sql<R: Rng>(rng: &mut R, tname: &str) -> FuzzTestTable {
+        // number of columns
+        let mut num_cols = rng.random_range(1..=6);
+        let mut columns = Vec::<FuzzTestColumn>::new();
+
+        // Sometimes include AUTOINCREMENT pk which also creates sqlite_sequence on first insert
+        let include_autoinc = rng.random_bool(0.25);
+        if include_autoinc {
+            let cname = "id".to_string();
+            columns.push(FuzzTestColumn {
+                name: cname,
+                ty: "INTEGER".to_string(),
+                collation: None,
+                inline_unique: false,
+                is_pk_autoinc: true,
+            });
+            // ensure at least one more column so selects have options
+            num_cols = num_cols.max(2);
+        }
+
+        for i in (columns.len())..num_cols {
+            let cname = format!("c{}", i + 1);
+            let ty = random_type(rng).to_string();
+            let coll = if rng.random_bool(0.7) {
+                random_collation(rng)
+            } else {
+                None
+            };
+            columns.push(FuzzTestColumn {
+                name: cname,
+                ty,
+                collation: coll,
+                inline_unique: false,
+                is_pk_autoinc: false,
+            });
+        }
+
+        // Choose number of unique constraints to place (possibly 0)
+        // We mix inline and table-level placements. Unique indexes will be created in separate "create index" actions.
+        let mut unique_table_constraints: Vec<Vec<usize>> = Vec::new();
+        let mut available_cols: Vec<usize> = (0..columns.len()).collect();
+        // do not use the autoincrement pk for unique constraints (already unique)
+        available_cols.retain(|&i| !columns[i].is_pk_autoinc);
+
+        let uniq_groups = if available_cols.is_empty() {
+            0
+        } else {
+            rng.random_range(0..=3)
+        };
+        for _ in 0..uniq_groups {
+            if available_cols.is_empty() {
+                break;
+            }
+            let width = rng.random_range(1..=available_cols.len().min(3));
+            let mut cols_pick = available_cols.clone();
+            cols_pick.shuffle(rng);
+            cols_pick.truncate(width);
+
+            // randomize ordering of unique constraint columns
+            cols_pick.shuffle(rng);
+
+            // Place either inline UNIQUE (only allowed when width == 1) or a table-level UNIQUE group
+            if width == 1 && rng.random_bool(0.5) {
+                columns[cols_pick[0]].inline_unique = true;
+            } else {
+                unique_table_constraints.push(cols_pick);
+            }
+
+            // Don't remove cols from availability to allow overlapping constraints occasionally
+            // That helps fuzz multi-constraint interactions.
+        }
+
+        FuzzTestTable {
+            name: tname.to_string(),
+            columns,
+            unique_table_constraints,
+        }
+    }
+
+    fn create_table_stmt(tbl: &FuzzTestTable) -> String {
+        let mut defs: Vec<String> = Vec::new();
+        for c in &tbl.columns {
+            if c.is_pk_autoinc {
+                defs.push(format!(
+                    "{} INTEGER PRIMARY KEY AUTOINCREMENT",
+                    quote_ident(&c.name)
+                ));
+                continue;
+            }
+            let mut part = format!("{} {}", quote_ident(&c.name), c.ty);
+            if let Some(coll) = c.collation {
+                part.push_str(&format!(" COLLATE {coll}"));
+            }
+            if c.inline_unique {
+                part.push_str(" UNIQUE");
+            }
+            defs.push(part);
+        }
+        for grp in &tbl.unique_table_constraints {
+            let cols = grp
+                .iter()
+                .map(|&i| quote_ident(&tbl.columns[i].name))
+                .collect::<Vec<_>>()
+                .join(", ");
+            defs.push(format!("UNIQUE ({cols})"));
+        }
+        format!(
+            "CREATE TABLE {} ({})",
+            quote_ident(&tbl.name),
+            defs.join(", ")
+        )
+    }
+
+    fn random_index_for_table<R: Rng>(
+        rng: &mut R,
+        state: &mut FuzzTestDbState,
+        tbl: &FuzzTestTable,
+    ) -> FuzzTestIndex {
+        // choose number of index columns
+        let cols_count = rng.random_range(1..=tbl.columns.len().min(4));
+        let mut idx_cols_indices: Vec<usize> = (0..tbl.columns.len()).collect();
+        // Avoid including autoincrement PK in composite index too often to generate more variety
+        if tbl.columns.iter().any(|c| c.is_pk_autoinc) && rng.random_bool(0.7) {
+            idx_cols_indices.retain(|&i| !tbl.columns[i].is_pk_autoinc);
+            if idx_cols_indices.is_empty() {
+                idx_cols_indices = (0..tbl.columns.len()).collect();
+            }
+        }
+        idx_cols_indices.shuffle(rng);
+        idx_cols_indices.truncate(cols_count);
+        // randomize order again
+        idx_cols_indices.shuffle(rng);
+
+        let mut cols: Vec<FuzzTestIndexCol> = Vec::new();
+        for &ci in &idx_cols_indices {
+            let coll_over = if rng.random_bool(0.5) {
+                random_collation(rng)
+            } else {
+                None
+            };
+            let sort = if rng.random_bool(0.5) { "ASC" } else { "DESC" };
+            cols.push(FuzzTestIndexCol {
+                col: ci,
+                collation: coll_over,
+                sort_order: sort,
+            });
+        }
+
+        let idx_name = state.next_index_name();
+        FuzzTestIndex {
+            name: idx_name,
+            table: tbl.name.clone(),
+            cols,
+            unique: rng.random_bool(0.5),
+        }
+    }
+
+    fn create_index_stmt(tbl: &FuzzTestTable, idx: &FuzzTestIndex) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        for ic in &idx.cols {
+            let mut piece = quote_ident(&tbl.columns[ic.col].name);
+            if let Some(coll) = ic.collation {
+                piece.push_str(&format!(" COLLATE {coll}"));
+            }
+            piece.push_str(&format!(" {}", ic.sort_order));
+            parts.push(piece);
+        }
+        format!(
+            "CREATE {} INDEX {} ON {} ({})",
+            if idx.unique { "UNIQUE" } else { "" },
+            quote_ident(&idx.name),
+            quote_ident(&idx.table),
+            parts.join(", ")
+        )
+        .replace("  ", " ")
+    }
+
+    fn insert_random_rows_stmt<R: Rng>(
+        rng: &mut R,
+        tbl: &FuzzTestTable,
+        rows: usize,
+    ) -> Vec<String> {
+        // Insert rows individually so we can ignore uniqueness violations cleanly.
+        let mut stmts = Vec::new();
+        for _ in 0..rows {
+            let mut vals = Vec::new();
+            for c in &tbl.columns {
+                if c.is_pk_autoinc {
+                    // Let autoincrement assign
+                    vals.push("NULL".to_string());
+                } else {
+                    vals.push(sql_value_string(rng));
+                }
+            }
+            let stmt = format!(
+                "INSERT INTO {} VALUES ({})",
+                quote_ident(&tbl.name),
+                vals.join(", ")
+            );
+            stmts.push(stmt);
+        }
+        stmts
+    }
+
+    fn random_select_stmt<R: Rng>(rng: &mut R, tbl: &FuzzTestTable) -> String {
+        // select random subset of columns
+        let mut col_indices: Vec<usize> = (0..tbl.columns.len()).collect();
+        let select_count = rng.random_range(1..=tbl.columns.len());
+        col_indices.shuffle(rng);
+        col_indices.truncate(select_count);
+        // keep a deterministic order in select list for easier comparison
+        col_indices.sort_unstable();
+
+        let select_cols = col_indices
+            .iter()
+            .map(|&i| quote_ident(&tbl.columns[i].name))
+            .collect::<Vec<_>>()
+            .join(", ");
+
+        // Small chance of adding simple WHERE
+        let where_clause = if rng.random_bool(0.4) {
+            // equality or IS NULL on one or two predicates
+            let preds = rng.random_range(1..=2);
+            let mut chosen = (0..tbl.columns.len()).collect::<Vec<_>>();
+            chosen.shuffle(rng);
+            let mut parts = Vec::new();
+            for &ci in chosen.iter().take(preds) {
+                let cn = &tbl.columns[ci].name;
+                let kind = rng.random_range(0..4);
+                let part = match kind {
+                    0 => format!("{} IS NULL", quote_ident(cn)),
+                    1 => format!("{} = {}", quote_ident(cn), sql_value_string(rng)),
+                    2 => format!("{} <> {}", quote_ident(cn), sql_value_string(rng)),
+                    _ => format!("{} IS NOT NULL", quote_ident(cn)),
+                };
+                parts.push(part);
+            }
+            format!(" WHERE {}", parts.join(" AND "))
+        } else {
+            String::new()
+        };
+
+        // ORDER BY some columns with optional explicit collate/sort to exercise index usage
+        let mut order_cols = col_indices.clone();
+        order_cols.shuffle(rng);
+        order_cols.truncate(rng.random_range(1..=order_cols.len()));
+        let mut order_parts = Vec::new();
+        for ci in order_cols {
+            let mut piece = quote_ident(&tbl.columns[ci].name);
+            if rng.random_bool(0.5) {
+                if let Some(coll) = random_collation(rng) {
+                    piece.push_str(&format!(" COLLATE {coll}"));
+                }
+            }
+            piece.push_str(if rng.random_bool(0.5) {
+                " ASC"
+            } else {
+                " DESC"
+            });
+            order_parts.push(piece);
+        }
+        // Append rowid tiebreaker for determinism, most tables will have rowid
+        order_parts.push("rowid ASC".to_string());
+        let order_clause = format!(" ORDER BY {}", order_parts.join(", "));
+
+        // Optional LIMIT
+        let limit_clause = if rng.random_bool(0.6) {
+            format!(" LIMIT {}", rng.random_range(1..=50))
+        } else {
+            String::new()
+        };
+
+        format!(
+            "SELECT {} FROM {}{}{}{}",
+            select_cols,
+            quote_ident(&tbl.name),
+            where_clause,
+            order_clause,
+            limit_clause
+        )
+    }
+
+    #[allow(dead_code)]
+    enum Action {
+        CreateTable,
+        CreateIndex,
+        InsertData,
+        Select,
+    }
+
+    fn pick_action<R: Rng>(rng: &mut R, db_state: &FuzzTestDbState) -> Action {
+        if db_state.tables.is_empty() {
+            return Action::CreateTable;
+        }
+        match rng.random_range(0..100) {
+            0..=14 => Action::CreateTable,  // ~15%
+            15..=34 => Action::CreateIndex, // ~20%
+            // temporary disable this action - because right now we still have bug with affinity for insertion to the indices
+            // 35..=55 => Action::InsertData,  // ~20%
+            _ => Action::Select, // leftover
+        }
+    }
+
+    #[test]
+    pub fn test_data_layout_compatibility() {
+        maybe_setup_tracing();
+        const OUTER: usize = 100;
+        const INNER: usize = 10;
+
+        let (mut rng, seed) = rng_from_time_or_env();
+        let left = NamedTempFile::new().unwrap();
+        let right = NamedTempFile::new().unwrap();
+
+        let (_left, left) = left.keep().unwrap();
+        let (_right, right) = right.keep().unwrap();
+        // let left = left.path();
+        // let right = right.path();
+
+        tracing::info!(
+            "test_data_layout_compatibility seed: {}, left_path={:?}, right_path={:?}",
+            seed,
+            left,
+            right
+        );
+        let mut state = FuzzTestDbState::default();
+
+        for i in 0..OUTER {
+            tracing::info!(
+                "test_data_layout_compatibility: outer iter {}/{}",
+                i + 1,
+                OUTER
+            );
+            let (turso_path, sqlite_path) = if i % 2 == 0 {
+                (&left, &right)
+            } else {
+                (&right, &left)
+            };
+            let turso_db = TempDatabase::builder().with_db_path(turso_path).build();
+            let turso_conn = turso_db.connect_limbo();
+            let sqlite_conn = rusqlite::Connection::open(sqlite_path).unwrap();
+            for _ in 0..INNER {
+                let action = pick_action(&mut rng, &state);
+                match action {
+                    Action::CreateTable => {
+                        // Create a new randomized table
+                        let tname = state.next_table_name();
+                        let table = build_create_table_sql(&mut rng, &tname);
+                        let query = create_table_stmt(&table);
+
+                        tracing::info!("table: {}", query);
+                        let turso_result = turso_conn.execute(&query);
+                        let sqlite_result = sqlite_conn.execute(&query, ());
+                        assert_eq!(turso_result.is_ok(), sqlite_result.is_ok());
+
+                        if turso_result.is_ok() {
+                            let ins_cnt = rng.random_range(0..=30);
+                            for ins_stmt in insert_random_rows_stmt(&mut rng, &table, ins_cnt) {
+                                tracing::info!("insert: {}", ins_stmt);
+                                let turso_result = turso_conn.execute(&ins_stmt);
+                                let sqlite_result = sqlite_conn.execute(&ins_stmt, ());
+                                assert_eq!(turso_result.is_ok(), sqlite_result.is_ok());
+                            }
+                        }
+                        state.tables.push(table);
+                    }
+                    Action::CreateIndex => {
+                        if state.tables.is_empty() {
+                            continue;
+                        }
+                        let t_idx = rng.random_range(0..state.tables.len());
+                        let tbl = state.tables[t_idx].clone();
+                        let idx = random_index_for_table(&mut rng, &mut state, &tbl);
+                        let query = create_index_stmt(&tbl, &idx);
+
+                        tracing::info!("index: {}", query);
+                        let turso_result = turso_conn.execute(&query);
+                        let sqlite_result = sqlite_conn.execute(&query, ());
+                        assert_eq!(turso_result.is_ok(), sqlite_result.is_ok());
+                        state.indices.push(idx);
+                    }
+                    Action::InsertData => {
+                        let t_idx = rng.random_range(0..state.tables.len());
+                        let table = state.tables[t_idx].clone();
+                        let ins_cnt = rng.random_range(0..=30);
+                        for ins_stmt in insert_random_rows_stmt(&mut rng, &table, ins_cnt) {
+                            tracing::info!("insert: {}", ins_stmt);
+                            let turso_result = turso_conn.execute(&ins_stmt);
+                            let sqlite_result = sqlite_conn.execute(&ins_stmt, ());
+                            assert_eq!(turso_result.is_ok(), sqlite_result.is_ok());
+                        }
+                    }
+                    Action::Select => {
+                        if state.tables.is_empty() {
+                            continue;
+                        }
+                        // pick a random table to select from
+                        let t_idx = rng.random_range(0..state.tables.len());
+                        let tbl = &state.tables[t_idx];
+
+                        let query = random_select_stmt(&mut rng, tbl);
+
+                        tracing::info!("query: {}", query);
+                        let limbo_rows = limbo_exec_rows(&turso_conn, &query);
+                        let sqlite_rows = sqlite_exec_rows(&sqlite_conn, &query);
+
+                        assert_eq!(
+                            limbo_rows, sqlite_rows,
+                            "Mismatch on query: {query}\nseed: {seed}\nlimbo: {limbo_rows:?}\nsqlite: {sqlite_rows:?}"
+                        );
+                    }
+                }
             }
         }
     }

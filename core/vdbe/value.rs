@@ -453,6 +453,10 @@ impl Value {
         }
 
         if let (Value::Blob(reg), Value::Blob(pattern)) = (self, pattern) {
+            // SQLite returns 1 for empty pattern (found at position 1)
+            if pattern.is_empty() {
+                return Value::Integer(1);
+            }
             let result = reg
                 .windows(pattern.len())
                 .position(|window| window == *pattern)
@@ -2113,6 +2117,11 @@ mod tests {
         let input = Value::build_text("abcde");
         let pattern = Value::Blob(vec![0x63, 0x64]);
         let expected = Value::Integer(3);
+        assert_eq!(input.exec_instr(&pattern), expected);
+
+        let input = Value::build_text("abcde");
+        let pattern = Value::build_text("");
+        let expected = Value::Integer(1);
         assert_eq!(input.exec_instr(&pattern), expected);
     }
 

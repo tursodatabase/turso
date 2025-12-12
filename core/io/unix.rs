@@ -66,17 +66,25 @@ fn try_pwritev_raw(
             iov_len: len,
         });
     }
+    // On Android, off_t is i32. Cast to libc::off_t instead of hardcoding i64 for portability.
     let n = if iov.len().eq(&1) {
         unsafe {
             libc::pwrite(
                 fd,
                 iov[0].iov_base as *const libc::c_void,
                 iov[0].iov_len,
-                off as i64,
+                off as libc::off_t,
             )
         }
     } else {
-        unsafe { libc::pwritev(fd, iov.as_ptr(), iov.len() as i32, off as i64) }
+        unsafe {
+            libc::pwritev(
+                fd,
+                iov.as_ptr(),
+                iov.len() as i32,
+                off as libc::off_t,
+            )
+        }
     };
     if n < 0 {
         Err(std::io::Error::last_os_error())

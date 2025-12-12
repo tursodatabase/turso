@@ -221,12 +221,18 @@ export type DatabaseRowTransformResultJs =
 export type GeneratorResponse =
   | { type: 'IO' }
   | { type: 'Done' }
-  | { type: 'SyncEngineStats', operations: number, mainWal: number, revertWal: number, lastPullUnixTime?: number, lastPushUnixTime?: number, revision?: string, networkSentBytes: number, networkReceivedBytes: number }
+  | { type: 'SyncEngineStats', cdcOperations: number, mainWalSize: number, revertWalSize: number, lastPullUnixTime?: number, lastPushUnixTime?: number, revision?: string, networkSentBytes: number, networkReceivedBytes: number }
   | { type: 'SyncEngineChanges', changes: SyncEngineChanges }
 
 export type JsPartialBootstrapStrategy =
   | { type: 'Prefix', length: number }
   | { type: 'Query', query: string }
+
+export interface JsPartialSyncOpts {
+  bootstrapStrategy: JsPartialBootstrapStrategy
+  segmentSize?: number
+  speculativeLoad?: boolean
+}
 
 export type JsProtocolRequest =
   | { type: 'Http', method: string, path: string, body?: Array<number>, headers: Array<[string, string]> }
@@ -245,7 +251,7 @@ export interface SyncEngineOpts {
   protocolVersion?: SyncEngineProtocolVersion
   bootstrapIfEmpty: boolean
   remoteEncryption?: string
-  partialBoostrapStrategy?: JsPartialBootstrapStrategy
+  partialSyncOpts?: JsPartialSyncOpts
 }
 
 export declare const enum SyncEngineProtocolVersion {

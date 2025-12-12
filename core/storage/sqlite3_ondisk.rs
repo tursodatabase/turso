@@ -1252,6 +1252,12 @@ pub struct SmallVec<T, const N: usize = 64> {
     pub extra_data: Option<Vec<T>>,
 }
 
+impl<T: Default + Copy, const N: usize> Default for SmallVec<T, N> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl<T: Default + Copy, const N: usize> SmallVec<T, N> {
     pub fn new() -> Self {
         Self {

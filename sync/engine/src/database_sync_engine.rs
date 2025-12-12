@@ -27,8 +27,8 @@ use crate::{
     io_operations::IoOperations,
     types::{
         Coro, DatabaseMetadata, DatabasePullRevision, DatabaseRowTransformResult,
-        DatabaseSyncEngineProtocolVersion, DatabaseTapeOperation, DbChangesStatus,
-        PartialBootstrapStrategy, SyncEngineStats, DATABASE_METADATA_VERSION,
+        DatabaseSyncEngineProtocolVersion, DatabaseTapeOperation, DbChangesStatus, PartialSyncOpts,
+        SyncEngineStats, DATABASE_METADATA_VERSION,
     },
     wal_session::WalSession,
     Result,
@@ -44,7 +44,7 @@ pub struct DatabaseSyncEngineOpts {
     pub protocol_version_hint: DatabaseSyncEngineProtocolVersion,
     pub bootstrap_if_empty: bool,
     pub reserved_bytes: usize,
-    pub partial_bootstrap_strategy: PartialBootstrapStrategy,
+    pub partial_sync_opts: Option<PartialSyncOpts>,
 }
 
 pub struct DataStats {
@@ -211,10 +211,9 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         main_db_path: &str,
         opts: &DatabaseSyncEngineOpts,
     ) -> Result<DatabaseMetadata> {
+        tracing::info!("bootstrap_db(path={}): opts={:?}", main_db_path, opts);
+
         let meta_path = create_meta_path(main_db_path);
-
-        tracing::info!("prepare(path={}): opts={:?}", main_db_path, opts);
-
         let meta = full_read(
             coro,
             io.clone(),
@@ -227,8 +226,8 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             Some(meta) => Some(DatabaseMetadata::load(&meta)?),
             None => None,
         };
-        let partial_bootstrap_strategy = opts.partial_bootstrap_strategy.clone();
-        let partial = !matches!(partial_bootstrap_strategy, PartialBootstrapStrategy::None);
+        let partial_sync_opts = opts.partial_sync_opts.clone();
+        let partial = partial_sync_opts.is_some();
 
         let meta = match meta {
             Some(meta) => meta,
@@ -240,7 +239,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     &io,
                     main_db_path,
                     opts.protocol_version_hint,
-                    partial_bootstrap_strategy,
+                    partial_sync_opts,
                 )
                 .await?;
                 let meta = DatabaseMetadata {
@@ -337,8 +336,8 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         main_db_path: &str,
         opts: &DatabaseSyncEngineOpts,
     ) -> Result<Arc<dyn DatabaseStorage>> {
-        let partial_bootstrap_strategy = &opts.partial_bootstrap_strategy;
-        let partial = !matches!(partial_bootstrap_strategy, PartialBootstrapStrategy::None);
+        let partial_bootstrap_opts = &opts.partial_sync_opts;
+        let partial = !partial_bootstrap_opts.is_none();
         let db_file = io.open_file(main_db_path, turso_core::OpenFlags::Create, false)?;
         let db_file: Arc<dyn DatabaseStorage> = if partial {
             let Some(partial_bootstrap_server_revision) = &meta.partial_bootstrap_server_revision
@@ -358,6 +357,9 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 None, // todo(sivukhin): allocate dirty file for FS IO
                 sync_engine_io.clone(),
                 revision.to_string(),
+                partial_bootstrap_opts
+                    .clone()
+                    .expect("partial sync opts are set here"),
             ))
         } else {
             Arc::new(turso_core::storage::database::DatabaseFile::new(db_file))
@@ -374,6 +376,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         opts: DatabaseSyncEngineOpts,
     ) -> Result<Self> {
         let main_db_path = main_db.path.to_string();
+        tracing::info!("open_db(path={}): opts={:?}", main_db_path, opts);
 
         let meta_path = create_meta_path(&main_db_path);
 
@@ -471,7 +474,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             main_db_path,
             main_db_storage,
             OpenFlags::Create,
-            turso_core::DatabaseOpts::new().with_indexes(true),
+            turso_core::DatabaseOpts::new(),
             None,
         )?;
         Self::open_db(coro, io, sync_engine_io, main_db, opts).await
@@ -484,7 +487,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             &self.revert_db_wal_path,
             self.db_file.clone(),
             OpenFlags::Create,
-            turso_core::DatabaseOpts::new().with_indexes(true),
+            turso_core::DatabaseOpts::new(),
             None,
         )?;
         let conn = db.connect()?;

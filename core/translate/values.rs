@@ -63,7 +63,7 @@ fn emit_values_when_single_row(
     for (i, v) in first_row.iter().enumerate() {
         translate_expr_no_constant_opt(
             program,
-            None,
+            Some(&plan.table_references),
             v,
             start_reg + i,
             &t_ctx.resolver,

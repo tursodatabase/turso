@@ -108,7 +108,7 @@ pub fn translate(
 
     program.epilogue(schema);
 
-    Ok(program.build(connection, change_cnt_on, input))
+    program.build(connection, change_cnt_on, input)
 }
 
 // TODO: for now leaving the return value as a Program. But ideally to support nested parsing of arbitraty
@@ -124,6 +124,7 @@ pub fn translate_inner(
     let is_write = matches!(
         stmt,
         ast::Stmt::AlterTable { .. }
+            | ast::Stmt::Analyze { .. }
             | ast::Stmt::CreateIndex { .. }
             | ast::Stmt::CreateTable { .. }
             | ast::Stmt::CreateTrigger { .. }

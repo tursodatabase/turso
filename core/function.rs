@@ -159,6 +159,7 @@ pub enum VectorFunc {
     VectorDistanceCos,
     VectorDistanceL2,
     VectorDistanceJaccard,
+    VectorDistanceDot,
     VectorConcat,
     VectorSlice,
 }
@@ -180,6 +181,7 @@ impl Display for VectorFunc {
             Self::VectorDistanceCos => "vector_distance_cos".to_string(),
             Self::VectorDistanceL2 => "vector_distance_l2".to_string(),
             Self::VectorDistanceJaccard => "vector_distance_jaccard".to_string(),
+            Self::VectorDistanceDot => "vector_distance_dot".to_string(),
             Self::VectorConcat => "vector_concat".to_string(),
             Self::VectorSlice => "vector_slice".to_string(),
         };
@@ -335,6 +337,9 @@ pub enum ScalarFunc {
     Attach,
     Detach,
     Unlikely,
+    StatInit,
+    StatPush,
+    StatGet,
 }
 
 impl ScalarFunc {
@@ -399,6 +404,9 @@ impl ScalarFunc {
             ScalarFunc::Attach => false, // changes database state
             ScalarFunc::Detach => false, // changes database state
             ScalarFunc::Unlikely => true,
+            ScalarFunc::StatInit => false, // internal ANALYZE function
+            ScalarFunc::StatPush => false, // internal ANALYZE function
+            ScalarFunc::StatGet => false,  // internal ANALYZE function
         }
     }
 }
@@ -465,6 +473,9 @@ impl Display for ScalarFunc {
             Self::Attach => "attach".to_string(),
             Self::Detach => "detach".to_string(),
             Self::Unlikely => "unlikely".to_string(),
+            Self::StatInit => "stat_init".to_string(),
+            Self::StatPush => "stat_push".to_string(),
+            Self::StatGet => "stat_get".to_string(),
         };
         write!(f, "{str}")
     }
@@ -879,6 +890,7 @@ impl Func {
             "vector_distance_cos" => Ok(Self::Vector(VectorFunc::VectorDistanceCos)),
             "vector_distance_l2" => Ok(Self::Vector(VectorFunc::VectorDistanceL2)),
             "vector_distance_jaccard" => Ok(Self::Vector(VectorFunc::VectorDistanceJaccard)),
+            "vector_distance_dot" => Ok(Self::Vector(VectorFunc::VectorDistanceDot)),
             "vector_concat" => Ok(Self::Vector(VectorFunc::VectorConcat)),
             "vector_slice" => Ok(Self::Vector(VectorFunc::VectorSlice)),
             _ => crate::bail_parse_error!("no such function: {}", name),

@@ -1526,7 +1526,6 @@ impl PropertyDiscriminants {
         remaining: &Remaining,
         ctx: &impl GenerationContext,
     ) -> u32 {
-        let opts = ctx.opts();
         match self {
             PropertyDiscriminants::InsertValuesSelect => {
                 if !env.opts.disable_insert_values_select && !ctx.tables().is_empty() {
@@ -1583,20 +1582,14 @@ impl PropertyDiscriminants {
                 }
             }
             PropertyDiscriminants::WhereTrueFalseNull => {
-                if opts.indexes
-                    && !env.opts.disable_where_true_false_null
-                    && !ctx.tables().is_empty()
-                {
+                if !env.opts.disable_where_true_false_null && !ctx.tables().is_empty() {
                     remaining.select / 2
                 } else {
                     0
                 }
             }
             PropertyDiscriminants::UnionAllPreservesCardinality => {
-                if opts.indexes
-                    && !env.opts.disable_union_all_preserves_cardinality
-                    && !ctx.tables().is_empty()
-                {
+                if !env.opts.disable_union_all_preserves_cardinality && !ctx.tables().is_empty() {
                     remaining.select / 3
                 } else {
                     0

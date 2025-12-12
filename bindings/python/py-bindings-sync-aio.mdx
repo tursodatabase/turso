@@ -1,0 +1,92 @@
+---
+name: 2025-11-26-py-bindings-async-sync
+---
+
+<Output path="./turso/lib_sync_aio.py">
+
+<Code model="openai/gpt-5" language="python">
+
+Turso - is the SQLite compatible database written in Rust.
+One of the important features of the Turso - is native ability to sync database with the Cloud in both directions (push local changes and pull remote changes).
+
+Your task is to generate ASYNC wrapper for synchronization EXTRA functionality built on top of the existing Python driver which will extend regular embedded with sync capability.
+Do not modify existing driver - its already implemented in the lib.py and lib_sync.py.
+Your task is to write extra code which will use abstractions and provide async API support in the Python on top of it in the lib_sync_aio.py file.
+
+# Rules
+
+General rules for driver implementation you **MUST** follow and never go against these rules:
+- USE already implemented drivers - DO NOT copy it
+- STRUCTURE of the implementation 
+    * Declaration order of elements and semantic blocks MUST be exsactly the same
+    * (details and full enumerations omited in the example for brevity but you must generate full code)
+```py
+# ALL imports MUST be at the beginning - no imports in the middle of function
+from typing import ...
+from queue import SimpleQueue
+
+from .worker import Worker
+from .lib_sync import (
+    ConnectionSync as BlockingConnectionSync
+    ...
+)
+from .lib_aio import (
+    Connection as NonBlockingConnection
+    ...
+)
+
+class ConnectionSync(NonBlockingConnection):
+    def __init__(connector: Callable[[], BlockingConnectionSync]): ...
+    # internal worker MUST be stopped when connection goes out of context scope
+    def close(...): ...
+    # make ConnectionSync instance awaitable
+    # emit proper typings because delegation of __await__ to the base class will change the return type and make extra methods (pull/push/etc) unavailable
+    def __await__(...): ...
+    async def __aenter__(...): ...
+    async def __aexit__(...):
+        await self.close()
+
+    # returns True of new updates were pulled; False if no new updates were fetched; determine changes by inspecting .empty() method of changes
+    async def pull(self) -> bool: ...
+    async def push(self) -> None: ...
+    async def checkpoint(self) -> None: ...
+    async def stats(self) -> None: ...
+
+# connect is not async because it returns awaitable ConnectionSync
+# same signature as in the lib_sync.py
+def connect_sync(...) -> ConnectionSync: ...
+
+```
+- FOLLOW the pattern:
+```py
+# create future for completion
+future = asyncio.get_event_loop().create_future()
+# put the work to the unbounded queue
+queue.put_nowait((future, function))
+```
+- AVOID cryptic names - prefer short but concise names (wr is BAD, full_write is GOOD)
+- NEVER EVER put import in the middle of a function - always put all necessary immports at the beginning of the file
+- FOCUS on code readability: extract helper functions if it will contribute to the code readability (do not overoptimize - it's fine to have some logic inlined especially if it is not repeated anywhere else)
+- WATCH OUT for variables scopes and do not use variables which are no longer accessible
+
+# Implementation
+
+- Annotate public API with types
+- Add comments about public API fields/functions to clarify meaning and usage scenarios
+
+# Blocking sync driver
+
+For turso sync execution you MUST reuse blocking implementation:
+
+<File path="./turso/lib_sync.py" />
+<File path="./turso/__init__.py" />
+
+# Non-blocking db driver
+
+You must integrate with non-blocking async db driver implementation:
+
+<File path="./turso/lib_aio.py" />
+
+</Code>
+
+</Output>

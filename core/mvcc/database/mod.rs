@@ -261,6 +261,7 @@ pub struct RowVersion {
     pub row: Row,
 }
 
+#[derive(Debug)]
 pub enum RowVersionState {
     LiveVersion,
     NotFound,
@@ -1267,9 +1268,15 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         bootstrap_conn.promote_to_regular_connection();
 
         if !self.maybe_recover_logical_log(bootstrap_conn.clone())? {
-            // There was no logical log to recover, so we're done.
-            return Ok(());
-        }
+            // Initialize global_header from pager's page 1
+            // When recovering we already initialize the header in `begin_load_tx`, so only initialize if we did not recover
+            let pager = bootstrap_conn.pager.load();
+            let header = pager
+                .io
+                .block(|| pager.with_header(|header| *header))
+                .expect("failed to read database header");
+            self.global_header.write().replace(header);
+        };
 
         Ok(())
     }
@@ -1680,7 +1687,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             }
 
             // We found a row, let's check if it's visible to the transaction.
-            if let Some(visible_row) = self.find_last_visible_version(tx, row) {
+            if let Some(visible_row) = self.find_last_visible_version(tx, &row) {
                 return Some(visible_row);
             }
             // If this row is not visible, continue to the next row
@@ -1757,7 +1764,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     fn find_last_visible_version(
         &self,
         tx: &Transaction,
-        row: crossbeam_skiplist::map::Entry<
+        row: &crossbeam_skiplist::map::Entry<
             '_,
             RowID,
             parking_lot::lock_api::RwLock<parking_lot::RawRwLock, Vec<RowVersion>>,
@@ -1826,7 +1833,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             if row.key().table_id != table_id {
                 return None;
             }
-            if let Some(visible_row) = self.find_last_visible_version(tx, row) {
+            if let Some(visible_row) = self.find_last_visible_version(tx, &row) {
                 return Some(visible_row);
             }
         }
@@ -2033,6 +2040,11 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 .global_header
                 .read()
                 .expect("global_header should be initialized");
+            // The header could be stored, but not persisted yet
+            pager
+                .io
+                .block(|| pager.maybe_allocate_page1())
+                .expect("failed to allocate page1");
             tracing::debug!("get_transaction_database_header read: header={:?}", header);
             header
         }
@@ -2475,7 +2487,13 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         &self,
         table_id: MVTableId,
         table_iterator: &mut Option<MvccIterator<'static, RowID>>,
+        tx_id: TxID,
     ) -> Option<RowKey> {
+        let tx = self
+            .txs
+            .get(&tx_id)
+            .expect("transaction should exist in txs map");
+        let tx = tx.value();
         let max_rowid = RowID {
             table_id,
             row_id: RowKey::Int(i64::MAX),
@@ -2486,14 +2504,49 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let iter = table_iterator
             .as_mut()
             .expect("table_iterator was assigned above");
-        let entry = iter.next()?;
-        if entry.key().table_id == table_id {
-            return Some(RowKey::Int(match &entry.key().row_id {
-                RowKey::Int(i) => *i,
-                _ => panic!("Expected RowKey::Int for table rowid"),
-            }));
+        loop {
+            let entry = iter.next()?;
+            // Rowid is not part of the table, therefore we already reached the end of the table.
+            // NOTE: Shouldn't range already prevent this?
+            tracing::trace!(
+                "get_last_table_rowid: entry.key().table_id={}, table_id={}, row_id={}",
+                entry.key().table_id,
+                table_id,
+                entry.key().row_id
+            );
+            if entry.key().table_id != table_id {
+                tracing::trace!("get_last_table_rowid: reached end of table");
+                return None;
+            }
+            if let Some(_visible_row) = self.find_last_visible_version(tx, &entry) {
+                tracing::trace!(
+                    "get_last_table_rowid: found visible row: {:?}",
+                    _visible_row
+                );
+                // There is a visible version for this rowid, so we return it
+                return Some(RowKey::Int(match &entry.key().row_id {
+                    RowKey::Int(i) => *i,
+                    _ => panic!("Expected RowKey::Int for table rowid"),
+                }));
+            }
         }
-        None
+    }
+
+    pub fn get_last_table_rowid_without_visibility_check(
+        &self,
+        table_id: MVTableId,
+    ) -> Option<RowKey> {
+        let max_rowid = RowID {
+            table_id,
+            row_id: RowKey::Int(i64::MAX),
+        };
+        let range = create_seek_range(Bound::Included(max_rowid), IterationDirection::Backwards);
+        let mut range = self.rows.range(range).rev();
+        let entry = range.next()?;
+        if entry.key().table_id != table_id {
+            return None;
+        }
+        Some(entry.key().row_id.clone())
     }
 
     pub fn get_last_index_rowid(

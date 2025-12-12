@@ -37,9 +37,25 @@ impl From<genawaiter::sync::Co<SyncEngineIoResult, Result<()>>> for Coro<()> {
 
 #[derive(Clone, Debug)]
 pub enum PartialBootstrapStrategy {
-    None,
     Prefix { length: usize },
     Query { query: String },
+}
+
+#[derive(Clone, Debug)]
+pub struct PartialSyncOpts {
+    pub bootstrap_strategy: PartialBootstrapStrategy,
+    pub segment_size: usize,
+    pub speculative_load: bool,
+}
+
+impl PartialSyncOpts {
+    pub fn segment_size(&self) -> usize {
+        if self.segment_size == 0 {
+            128 * 1024
+        } else {
+            self.segment_size
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -130,8 +146,21 @@ pub enum DatabaseSyncEngineProtocolVersion {
 
 impl DatabaseMetadata {
     pub fn load(data: &[u8]) -> Result<Self> {
-        let meta = serde_json::from_slice::<DatabaseMetadata>(data)?;
-        Ok(meta)
+        let value: serde_json::Value = serde_json::from_slice(data)?;
+
+        // detect version field presence and type separately in order to provide nicer error message when user accidentally tried to run tursodb sync on top of the libsql sync metadata file
+        match value.get("version").and_then(serde_json::Value::as_str) {
+            Some(version) => {
+                let version = version.to_string();
+                let meta: DatabaseMetadata = serde_json::from_value(value).map_err(|err|
+                    Error::JsonDecode(format!("unable to parse metadata file with version {version}: {err}"))
+                )?;
+                Ok(meta)
+            }
+            None => Err(Error::JsonDecode(
+                "unexpected metadata file format, 'version' field must be present and have string type".to_string(),
+            )),
+        }
     }
     pub fn dump(&self) -> Result<Vec<u8>> {
         let data = serde_json::to_string(self)?;

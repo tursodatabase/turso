@@ -4,7 +4,7 @@ This document describes the compatibility of Turso with SQLite.
 
 ## Table of contents
 
-- [Turso compatibility with SQLite](#limbo-compatibility-with-sqlite)
+- [Turso compatibility with SQLite](#turso-compatibility-with-sqlite)
   - [Table of contents](#table-of-contents)
   - [Overview](#overview)
     - [Features](#features)
@@ -59,14 +59,14 @@ Turso aims to be fully compatible with SQLite, with opt-in features not supporte
 | CREATE INDEX              | Partial | Only for columns (not arbitrary expressions)                                      |
 | CREATE TABLE              | Partial |                                                                                   |
 | CREATE TABLE ... STRICT   | Partial | Strict schema mode is experimental.                                               |
-| CREATE TRIGGER            | No      |                                                                                   |
+| CREATE TRIGGER            | Yes     |                                                                                   |
 | CREATE VIEW               | Yes     |                                                                                   |
 | CREATE VIRTUAL TABLE      | Yes     |                                                                                   |
 | DELETE                    | Yes     |                                                                                   |
 | DETACH DATABASE           | Yes     |                                                                                   |
 | DROP INDEX                | Partial | Disabled by default.                                                              |
 | DROP TABLE                | Yes     |                                                                                   |
-| DROP TRIGGER              | No      |                                                                                   |
+| DROP TRIGGER              | Yes     |                                                                                   |
 | DROP VIEW                 | Yes     |                                                                                   |
 | END TRANSACTION           | Partial | Alias for `COMMIT TRANSACTION`                                                    |
 | EXPLAIN                   | Yes     |                                                                                   |
@@ -75,8 +75,8 @@ Turso aims to be fully compatible with SQLite, with opt-in features not supporte
 | ON CONFLICT clause        | Yes     |                                                                                   |
 | REINDEX                   | No      |                                                                                   |
 | RELEASE SAVEPOINT         | No      |                                                                                   |
-| REPLACE                   | No      |                                                                                   |
-| RETURNING clause          | Partial | DELETE is missing                                                                 |
+| REPLACE                   | Yes     |                                                                                   |
+| RETURNING clause          | Yes     |                                                                                   |
 | ROLLBACK TRANSACTION      | Yes     |                                                                                   |
 | SAVEPOINT                 | No      |                                                                                   |
 | SELECT                    | Yes     |                                                                                   |
@@ -375,11 +375,11 @@ Modifiers:
 | json ->> path                      | Yes     |                                                                                                                                              |
 | json_insert(json,path,value,...)   | Yes     |                                                                                                                                              |
 | jsonb_insert(json,path,value,...)  | Yes     |                                                                                                                                              |
-| json_object(label1,value1,...)     | Yes     |                                                              |
+| json_object(label1,value1,...)     | Yes     |                                                                                                                                              |
 | jsonb_object(label1,value1,...)    | Yes     |                                                                                                                                              |
 | json_patch(json1,json2)            | Yes     |                                                                                                                                              |
 | jsonb_patch(json1,json2)           | Yes     |                                                                                                                                              |
-| json_pretty(json)                  | Yes |                                                              |
+| json_pretty(json)                  | Yes     |                                                                                                                                              |
 | json_remove(json,path,...)         | Yes     |                                                                                                                                              |
 | jsonb_remove(json,path,...)        | Yes     |                                                                                                                                              |
 | json_replace(json,path,value,...)  | Yes     |                                                                                                                                              |
@@ -389,7 +389,7 @@ Modifiers:
 | json_type(json)                    | Yes     |                                                                                                                                              |
 | json_type(json,path)               | Yes     |                                                                                                                                              |
 | json_valid(json)                   | Yes     |                                                                                                                                              |
-| json_valid(json,flags)             |         |                                                                                                                                              |
+| json_valid(json,flags)             | Yes     |                                                                                                                                              |
 | json_quote(value)                  | Yes     |                                                                                                                                              |
 | json_group_array(value)            | Yes     |                                                                                                                                              |
 | jsonb_group_array(value)           | Yes     |                                                                                                                                              |

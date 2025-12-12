@@ -567,12 +567,7 @@ impl Shadow for InteractionType {
     type Result = anyhow::Result<Vec<Vec<SimValue>>>;
     fn shadow(&self, env: &mut ShadowTablesMut) -> Self::Result {
         match self {
-            Self::Query(query) => {
-                if !query.is_transaction() {
-                    env.add_query(query);
-                }
-                query.shadow(env)
-            }
+            Self::Query(query) => query.shadow(env),
             Self::Assumption(_)
             | Self::Assertion(_)
             | Self::Fault(_)
@@ -615,8 +610,8 @@ impl InteractionType {
             assert!(rows.is_some());
             let mut rows = rows.unwrap();
             let mut out = Vec::new();
-            while let Ok(row) = rows.step() {
-                match row {
+            loop {
+                match rows.step()? {
                     StepResult::Row => {
                         let row = rows.row().unwrap();
                         let mut r = Vec::new();
@@ -744,8 +739,8 @@ impl InteractionType {
             }
             let mut rows = rows.unwrap().unwrap();
             let mut out = Vec::new();
-            while let Ok(row) = rows.step() {
-                match row {
+            loop {
+                match rows.step()? {
                     StepResult::Row => {
                         let row = rows.row().unwrap();
                         let mut r = Vec::new();
@@ -852,8 +847,16 @@ fn reopen_database(env: &mut SimulatorEnv) {
     // 1. Close all connections without default checkpoint-on-close behavior
     // to expose bugs related to how we handle WAL
     let mvcc = env.profile.experimental_mvcc;
-    let indexes = env.profile.query.gen_opts.indexes;
     let num_conns = env.connections.len();
+
+    // Clear shadow transaction state for all connections since reopening
+    // the database resets all transaction state
+    for conn_index in 0..num_conns {
+        if env.conn_in_transaction(conn_index) {
+            env.rollback_conn(conn_index);
+        }
+    }
+
     env.connections.clear();
 
     // Clear all open files
@@ -878,7 +881,6 @@ fn reopen_database(env: &mut SimulatorEnv) {
                 turso_core::OpenFlags::default(),
                 turso_core::DatabaseOpts::new()
                     .with_mvcc(mvcc)
-                    .with_indexes(indexes)
                     .with_autovacuum(true),
                 None,
             ) {

@@ -22,7 +22,7 @@ fn main() {
     println!("Testing connection performance with database: {}", opts.database);
     
     // Open the database object.
-    let db = Database::open_file(io.clone(), &opts.database, false, false).unwrap();
+    let db = Database::open_file(io.clone(), &opts.database, false).unwrap();
     for i in 0..opts.iterations {
         let start = Instant::now();
         

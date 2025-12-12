@@ -61,7 +61,7 @@ fn test_wal_frame_transfer_no_schema_changes(db: TempDatabase) {
     conn2.wal_insert_end(false).unwrap();
     assert_eq!(conn2.wal_state().unwrap().max_frame, 15);
     assert_eq!(
-        limbo_exec_rows(&db2, &conn2, "SELECT x, length(y) FROM t"),
+        limbo_exec_rows(&conn2, "SELECT x, length(y) FROM t"),
         vec![
             vec![Value::Integer(5), Value::Integer(1)],
             vec![Value::Integer(10), Value::Integer(2)],
@@ -100,11 +100,11 @@ fn test_wal_frame_transfer_various_schema_changes(db: TempDatabase) {
 
     sync();
     assert_eq!(
-        limbo_exec_rows(&db2, &conn2, "SELECT * FROM t"),
+        limbo_exec_rows(&conn2, "SELECT * FROM t"),
         vec![] as Vec<Vec<rusqlite::types::Value>>
     );
     assert_eq!(
-        limbo_exec_rows(&db2, &conn3, "SELECT * FROM t"),
+        limbo_exec_rows(&conn3, "SELECT * FROM t"),
         vec![] as Vec<Vec<rusqlite::types::Value>>
     );
 
@@ -125,11 +125,11 @@ fn test_wal_frame_transfer_various_schema_changes(db: TempDatabase) {
 
     sync();
     assert_eq!(
-        limbo_exec_rows(&db2, &conn2, "SELECT 1 FROM a UNION ALL SELECT 1 FROM b"),
+        limbo_exec_rows(&conn2, "SELECT 1 FROM a UNION ALL SELECT 1 FROM b"),
         vec![] as Vec<Vec<rusqlite::types::Value>>
     );
     assert_eq!(
-        limbo_exec_rows(&db2, &conn3, "SELECT 1 FROM a UNION ALL SELECT 1 FROM b"),
+        limbo_exec_rows(&conn3, "SELECT 1 FROM a UNION ALL SELECT 1 FROM b"),
         vec![] as Vec<Vec<rusqlite::types::Value>>
     );
 }
@@ -169,7 +169,7 @@ fn test_wal_frame_transfer_schema_changes(db: TempDatabase) {
     assert_eq!(commits, 3);
     assert_eq!(conn2.wal_state().unwrap().max_frame, 15);
     assert_eq!(
-        limbo_exec_rows(&db2, &conn2, "SELECT x, length(y) FROM t"),
+        limbo_exec_rows(&conn2, "SELECT x, length(y) FROM t"),
         vec![
             vec![Value::Integer(5), Value::Integer(1)],
             vec![Value::Integer(10), Value::Integer(2)],
@@ -209,7 +209,7 @@ fn test_wal_frame_transfer_no_schema_changes_rollback(db: TempDatabase) {
     conn2.wal_insert_end(false).unwrap();
     assert_eq!(conn2.wal_state().unwrap().max_frame, 2);
     assert_eq!(
-        limbo_exec_rows(&db2, &conn2, "SELECT x, length(y) FROM t"),
+        limbo_exec_rows(&conn2, "SELECT x, length(y) FROM t"),
         vec![] as Vec<Vec<rusqlite::types::Value>>
     );
     conn2.execute("CREATE TABLE q(x)").unwrap();
@@ -217,7 +217,7 @@ fn test_wal_frame_transfer_no_schema_changes_rollback(db: TempDatabase) {
         .execute("INSERT INTO q VALUES (randomblob(4096 * 10))")
         .unwrap();
     assert_eq!(
-        limbo_exec_rows(&db2, &conn2, "SELECT x, LENGTH(y) FROM t"),
+        limbo_exec_rows(&conn2, "SELECT x, LENGTH(y) FROM t"),
         vec![] as Vec<Vec<rusqlite::types::Value>>
     );
 }
@@ -249,7 +249,7 @@ fn test_wal_frame_transfer_schema_changes_rollback(db: TempDatabase) {
     conn2.wal_insert_end(false).unwrap();
     assert_eq!(conn2.wal_state().unwrap().max_frame, 2);
     assert_eq!(
-        limbo_exec_rows(&db2, &conn2, "SELECT x, length(y) FROM t"),
+        limbo_exec_rows(&conn2, "SELECT x, length(y) FROM t"),
         vec![] as Vec<Vec<rusqlite::types::Value>>
     );
     conn2.execute("CREATE TABLE q(x)").unwrap();
@@ -257,7 +257,7 @@ fn test_wal_frame_transfer_schema_changes_rollback(db: TempDatabase) {
         .execute("INSERT INTO q VALUES (randomblob(4096 * 10))")
         .unwrap();
     assert_eq!(
-        limbo_exec_rows(&db2, &conn2, "SELECT x, LENGTH(y) FROM t"),
+        limbo_exec_rows(&conn2, "SELECT x, LENGTH(y) FROM t"),
         vec![] as Vec<Vec<rusqlite::types::Value>>
     );
 }
@@ -372,7 +372,7 @@ fn test_wal_frame_api_no_schema_changes_fuzz(db: TempDatabase) {
                     synced_frame = rng.next_u32() as u64 % synced_frame;
                 }
                 assert_eq!(
-                    limbo_exec_rows(&db2, &conn2, "SELECT COUNT(*) FROM t"),
+                    limbo_exec_rows(&conn2, "SELECT COUNT(*) FROM t"),
                     vec![vec![Value::Integer(size as i64)]]
                 );
             }
@@ -480,7 +480,7 @@ fn test_wal_api_revert_pages(db1: TempDatabase) {
         .unwrap();
 
     assert_eq!(
-        limbo_exec_rows(&db1, &conn1, "SELECT x, length(y) FROM t"),
+        limbo_exec_rows(&conn1, "SELECT x, length(y) FROM t"),
         vec![
             vec![Value::Integer(1), Value::Integer(10)],
             vec![Value::Integer(3), Value::Integer(20)],
@@ -491,14 +491,14 @@ fn test_wal_api_revert_pages(db1: TempDatabase) {
     revert_to(&conn1, watermark2).unwrap();
 
     assert_eq!(
-        limbo_exec_rows(&db1, &conn1, "SELECT x, length(y) FROM t"),
+        limbo_exec_rows(&conn1, "SELECT x, length(y) FROM t"),
         vec![vec![Value::Integer(1), Value::Integer(10)],]
     );
 
     revert_to(&conn1, watermark1).unwrap();
 
     assert_eq!(
-        limbo_exec_rows(&db1, &conn1, "SELECT x, length(y) FROM t"),
+        limbo_exec_rows(&conn1, "SELECT x, length(y) FROM t"),
         vec![] as Vec<Vec<Value>>,
     );
 }
@@ -711,7 +711,7 @@ fn test_wal_revert_change_db_size(db: TempDatabase) {
         .execute("insert into t values (3, randomblob(30 * 4096))")
         .unwrap();
     assert_eq!(
-        limbo_exec_rows(&db, &writer, "SELECT x, length(y) FROM t"),
+        limbo_exec_rows(&writer, "SELECT x, length(y) FROM t"),
         vec![vec![Value::Integer(3), Value::Integer(30 * 4096)]]
     );
 }
@@ -910,7 +910,7 @@ fn test_db_share_same_file() {
         path.to_str().unwrap(),
         db_file.clone(),
         turso_core::OpenFlags::Create,
-        turso_core::DatabaseOpts::new().with_indexes(true),
+        turso_core::DatabaseOpts::new(),
         None,
     )
     .unwrap();
@@ -937,7 +937,7 @@ fn test_db_share_same_file() {
         &format!("{}-wal-copy", path.to_str().unwrap()),
         db_file.clone(),
         turso_core::OpenFlags::empty(),
-        turso_core::DatabaseOpts::new().with_indexes(true),
+        turso_core::DatabaseOpts::new(),
         None,
     )
     .unwrap();

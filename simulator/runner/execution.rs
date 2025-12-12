@@ -4,6 +4,20 @@ use sql_generation::model::table::SimValue;
 use tracing::instrument;
 use turso_core::{Connection, LimboError, Result, StepResult, Value};
 
+/// Checks if an error is a recoverable error should not fail the simulation.
+/// These errors indicate expected transaction-related behavior, not bugs.
+///
+/// - WriteWriteConflict: MVCC conflict, the DB rolled back the transaction
+/// - TxError: Transaction state error (e.g., BEGIN twice, COMMIT with no transaction)
+fn is_recoverable_tx_error(err: &LimboError) -> bool {
+    matches!(err, LimboError::WriteWriteConflict | LimboError::TxError(_))
+}
+
+/// Returns true if the error indicates the transaction was rolled back by the database.
+fn error_causes_rollback(err: &LimboError) -> bool {
+    matches!(err, LimboError::WriteWriteConflict)
+}
+
 use crate::{
     generation::Shadow as _,
     model::{
@@ -96,6 +110,22 @@ pub(crate) fn execute_interactions(
                 };
                 interaction = new_interaction;
             }
+            Ok(ExecutionContinuation::NextInteractionOutsideThisProperty) => {
+                // Skip remaining interactions in this property by advancing until we
+                // find an interaction with a different id (i.e., a different property)
+                let current_property_id = interaction.id();
+                loop {
+                    state.interaction_pointer += 1;
+                    let Some(new_interaction) = plan.next(&mut env) else {
+                        // No more interactions, we're done
+                        return ExecutionResult::new(history, None);
+                    };
+                    if new_interaction.id() != current_property_id {
+                        interaction = new_interaction;
+                        break;
+                    }
+                }
+            }
             Err(err) => {
                 return ExecutionResult::new(history, Some(err));
             }
@@ -143,7 +173,7 @@ pub(crate) enum ExecutionContinuation {
     /// Default continuation, execute the next interaction.
     NextInteraction,
     //  /// Typically used in the case of preconditions failures, skip to the next property.
-    // NextProperty,
+    NextInteractionOutsideThisProperty,
 }
 
 pub fn execute_interaction(
@@ -167,34 +197,65 @@ pub fn execute_interaction_turso(
     interaction: &Interaction,
     stack: &mut Vec<ResultSet>,
 ) -> Result<ExecutionContinuation> {
-    let SimConnection::LimboConnection(conn) = &mut env.connections[interaction.connection_index]
-    else {
-        unreachable!()
-    };
+    let connection_index = interaction.connection_index;
     // Leave this empty info! here to print the span of the execution
     tracing::info!("");
     match &interaction.interaction {
         InteractionType::Query(query) => {
             tracing::debug!(?interaction);
-            let results = interaction
-                .execute_query(conn)
-                .inspect_err(|err| tracing::error!(?err));
 
-            if let Err(err) = &results
+            let results = {
+                let SimConnection::LimboConnection(conn) = &mut env.connections[connection_index]
+                else {
+                    unreachable!()
+                };
+                interaction
+                    .execute_query(conn)
+                    .inspect_err(|err| tracing::error!(?err))
+            };
+
+            // Handle errors: recoverable tx errors continue simulation, others fail it
+            let skip_shadow = if let Err(err) = &results
                 && !interaction.ignore_error
             {
-                return Err(err.clone());
-            }
+                if is_recoverable_tx_error(err) {
+                    // Only rollback shadow state if the DB actually rolled back
+                    if error_causes_rollback(err) && env.conn_in_transaction(connection_index) {
+                        env.rollback_conn(connection_index);
+                    }
+                    true // skip shadowing this failed query
+                } else {
+                    return Err(err.clone());
+                }
+            } else {
+                false // success or ignore_error set, shadow normally
+            };
+
             stack.push(results);
             // TODO: skip integrity check with mvcc
             if !env.profile.experimental_mvcc {
+                let SimConnection::LimboConnection(conn) = &mut env.connections[connection_index]
+                else {
+                    unreachable!()
+                };
                 limbo_integrity_check(conn)?;
             }
-            env.update_conn_last_interaction(interaction.connection_index, Some(query));
+            env.update_conn_last_interaction(connection_index, Some(query));
+
+            if skip_shadow {
+                return Ok(ExecutionContinuation::NextInteractionOutsideThisProperty);
+            }
         }
         InteractionType::FsyncQuery(query) => {
+            let conn = {
+                let SimConnection::LimboConnection(conn) = &mut env.connections[connection_index]
+                else {
+                    unreachable!()
+                };
+                conn.clone()
+            };
             let results = interaction
-                .execute_fsync_query(conn.clone(), env)
+                .execute_fsync_query(conn, env)
                 .inspect_err(|err| tracing::error!(?err));
 
             stack.push(results);
@@ -220,10 +281,16 @@ pub fn execute_interaction_turso(
             }
         }
         InteractionType::Fault(_) => {
-            interaction.execute_fault(env, interaction.connection_index)?;
+            interaction.execute_fault(env, connection_index)?;
         }
         InteractionType::FaultyQuery(_) => {
-            let conn = conn.clone();
+            let conn = {
+                let SimConnection::LimboConnection(conn) = &mut env.connections[connection_index]
+                else {
+                    unreachable!()
+                };
+                conn.clone()
+            };
             let results = interaction
                 .execute_faulty_query(&conn, env)
                 .inspect_err(|err| tracing::error!(?err));
@@ -237,7 +304,7 @@ pub fn execute_interaction_turso(
             }
         }
     }
-    let _ = interaction.shadow(&mut env.get_conn_tables_mut(interaction.connection_index));
+    let _ = interaction.shadow(&mut env.get_conn_tables_mut(connection_index));
     Ok(ExecutionContinuation::NextInteraction)
 }
 
@@ -245,8 +312,8 @@ fn limbo_integrity_check(conn: &Arc<Connection>) -> Result<()> {
     let mut rows = conn.query("PRAGMA integrity_check;")?.unwrap();
     let mut result = Vec::new();
 
-    while let Ok(row) = rows.step() {
-        match row {
+    loop {
+        match rows.step()? {
             StepResult::Row => {
                 let row = rows.row().unwrap();
 

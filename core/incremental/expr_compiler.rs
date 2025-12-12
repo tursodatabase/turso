@@ -404,7 +404,7 @@ impl CompiledExpression {
         });
 
         // Build the program from the compiled expression bytecode
-        let program = Arc::new(builder.build(connection, false, ""));
+        let program = Arc::new(builder.build(connection, false, "")?);
 
         Ok(CompiledExpression {
             executor: ExpressionExecutor::Compiled(program),
@@ -444,7 +444,7 @@ impl CompiledExpression {
                     state.pc = pc as u32;
 
                     // Execute the instruction
-                    match insn_fn(program, &mut state, insn, &pager, None)? {
+                    match insn_fn(program, &mut state, insn, &pager)? {
                         crate::vdbe::execute::InsnFunctionStepResult::IO(_) => {
                             return Err(crate::LimboError::InternalError(
                                 "Expression evaluation encountered unexpected I/O".to_string(),

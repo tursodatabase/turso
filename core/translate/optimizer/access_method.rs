@@ -7,6 +7,7 @@ use crate::translate::expr::{as_binary_components, walk_expr, WalkControl};
 use crate::translate::optimizer::constraints::{
     convert_to_vtab_constraint, BinaryExprSide, Constraint, RangeConstraintRef,
 };
+use crate::translate::optimizer::cost::{RowCountEstimate, ESTIMATED_HARDCODED_ROWS_PER_PAGE};
 use crate::translate::plan::{HashJoinKey, NonFromClauseSubquery, SubqueryState, WhereTerm};
 use crate::util::exprs_are_equivalent;
 use crate::vdbe::hash_table::DEFAULT_MEM_BUDGET;
@@ -81,6 +82,7 @@ pub fn find_best_access_method_for_join_order(
     join_order: &[JoinOrderMember],
     maybe_order_target: Option<&OrderTarget>,
     input_cardinality: f64,
+    base_row_count: RowCountEstimate,
 ) -> Result<Option<AccessMethod>> {
     match &rhs_table.table {
         Table::BTree(_) => find_best_access_method_for_btree(
@@ -89,15 +91,17 @@ pub fn find_best_access_method_for_join_order(
             join_order,
             maybe_order_target,
             input_cardinality,
+            base_row_count,
         ),
         Table::Virtual(vtab) => find_best_access_method_for_vtab(
             vtab,
             &rhs_constraints.constraints,
             join_order,
             input_cardinality,
+            base_row_count,
         ),
         Table::FromClauseSubquery(_) => Ok(Some(AccessMethod {
-            cost: estimate_cost_for_scan_or_seek(None, &[], &[], input_cardinality),
+            cost: estimate_cost_for_scan_or_seek(None, &[], &[], input_cardinality, base_row_count),
             params: AccessMethodParams::Subquery,
         })),
     }
@@ -109,9 +113,11 @@ fn find_best_access_method_for_btree(
     join_order: &[JoinOrderMember],
     maybe_order_target: Option<&OrderTarget>,
     input_cardinality: f64,
+    base_row_count: RowCountEstimate,
 ) -> Result<Option<AccessMethod>> {
     let table_no = join_order.last().unwrap().table_id;
-    let mut best_cost = estimate_cost_for_scan_or_seek(None, &[], &[], input_cardinality);
+    let mut best_cost =
+        estimate_cost_for_scan_or_seek(None, &[], &[], input_cardinality, base_row_count);
     let mut best_params = AccessMethodParams::BTreeTable {
         iter_dir: IterationDirection::Forwards,
         index: None,
@@ -121,6 +127,12 @@ fn find_best_access_method_for_btree(
 
     // Estimate cost for each candidate index (including the rowid index) and replace best_access_method if the cost is lower.
     for candidate in rhs_constraints.candidates.iter() {
+        let usable_constraint_refs = usable_constraints_for_join_order(
+            &rhs_constraints.constraints,
+            &candidate.refs,
+            join_order,
+        );
+
         let index_info = match candidate.index.as_ref() {
             Some(index) => IndexInfo {
                 unique: index.unique,
@@ -129,20 +141,17 @@ fn find_best_access_method_for_btree(
             },
             None => IndexInfo {
                 unique: true, // rowids are always unique
-                covering: false,
+                // Only treat rowid as covering when there are usable constraints/rowid seek
+                covering: !usable_constraint_refs.is_empty(),
                 column_count: 1,
             },
         };
-        let usable_constraint_refs = usable_constraints_for_join_order(
-            &rhs_constraints.constraints,
-            &candidate.refs,
-            join_order,
-        );
         let cost = estimate_cost_for_scan_or_seek(
             Some(index_info),
             &rhs_constraints.constraints,
             &usable_constraint_refs,
             input_cardinality,
+            base_row_count,
         );
 
         // All other things being equal, prefer an access method that satisfies the order target.
@@ -225,6 +234,7 @@ fn find_best_access_method_for_vtab(
     constraints: &[Constraint],
     join_order: &[JoinOrderMember],
     input_cardinality: f64,
+    base_row_count: RowCountEstimate,
 ) -> Result<Option<AccessMethod>> {
     let vtab_constraints = convert_to_vtab_constraint(constraints, join_order);
 
@@ -236,7 +246,13 @@ fn find_best_access_method_for_vtab(
         Ok(index_info) => {
             Ok(Some(AccessMethod {
                 // TODO: Base cost on `IndexInfo::estimated_cost` and output cardinality on `IndexInfo::estimated_rows`
-                cost: estimate_cost_for_scan_or_seek(None, &[], &[], input_cardinality),
+                cost: estimate_cost_for_scan_or_seek(
+                    None,
+                    &[],
+                    &[],
+                    input_cardinality,
+                    base_row_count,
+                ),
                 params: AccessMethodParams::VirtualTable {
                     idx_num: index_info.idx_num,
                     idx_str: index_info.idx_str,
@@ -344,34 +360,48 @@ pub fn find_equijoin_conditions(
 }
 
 /// Estimate the cost of a hash join between two tables.
-/// TODO(preston): improve cost model when we have more metadata/factors to consider like table size.
+///
+/// The cost model accounts for:
+/// - Build phase: Creating the hash table from the build side (one-time cost)
+/// - Probe phase: Looking up each probe row in the hash table (one scan of probe table)
+/// - Memory pressure: Additional IO cost if the hash table spills to disk
 pub fn estimate_hash_join_cost(
     build_cardinality: f64,
     probe_cardinality: f64,
-    input_cardinality: f64,
     mem_budget: usize,
 ) -> Cost {
     const CPU_HASH_COST: f64 = 0.001;
     const CPU_INSERT_COST: f64 = 0.002;
     const CPU_LOOKUP_COST: f64 = 0.003;
-    const IO_COST: f64 = 1.0;
     const BYTES_PER_ROW_ESTIMATE: usize = 100;
 
-    // Estimate if the hash table will fit in memory
+    // Estimate if the hash table will fit in memory based on actual row counts
     let estimated_hash_table_size =
         (build_cardinality as usize).saturating_mul(BYTES_PER_ROW_ESTIMATE);
     let will_spill = estimated_hash_table_size > mem_budget;
 
     // Build phase: hash and insert all rows from build table (one-time cost)
+    // With real ANALYZE stats, this accurately reflects the actual build table size
     let build_cost = build_cardinality * (CPU_HASH_COST + CPU_INSERT_COST);
-    // Probe phase: for each row from prior tables, probe the hash table for each probe table row
-    // This accounts for the nested loop multiplier when there are tables before the hash join
-    let probe_cost = input_cardinality * probe_cardinality * (CPU_HASH_COST + CPU_LOOKUP_COST);
+
+    // Probe phase: scan probe table once, hash each row and lookup in hash table.
+    // Unlike nested loop join, the probe phase is NOT multiplied by input_cardinality
+    // because a hash join executes as a single unit - the probe table is scanned
+    // exactly once regardless of how many rows came from prior tables.
+    let probe_cost = probe_cardinality * (CPU_HASH_COST + CPU_LOOKUP_COST);
+
+    // Spill cost: if hash table exceeds memory budget, we need to write/read partitions to disk.
+    // Grace hash join writes partitions and reads them back, so it's 2x the page IO.
+    // Use page-based IO cost (rows / rows_per_page) rather than per-row IO.
     let spill_cost = if will_spill {
-        (build_cardinality + probe_cardinality) * IO_COST * 2.0
+        let build_pages = (build_cardinality / ESTIMATED_HARDCODED_ROWS_PER_PAGE as f64).ceil();
+        let probe_pages = (probe_cardinality / ESTIMATED_HARDCODED_ROWS_PER_PAGE as f64).ceil();
+        // Write both sides to partitions, then read back: 2 * (build_pages + probe_pages)
+        (build_pages + probe_pages) * 2.0
     } else {
         0.0
     };
+
     Cost(build_cost + probe_cost + spill_cost)
 }
 
@@ -388,7 +418,6 @@ pub fn try_hash_join_access_method(
     where_clause: &mut [WhereTerm],
     build_cardinality: f64,
     probe_cardinality: f64,
-    input_cardinality: f64,
     subqueries: &[NonFromClauseSubquery],
 ) -> Option<AccessMethod> {
     // Only works for B-tree tables
@@ -458,7 +487,7 @@ pub fn try_hash_join_access_method(
         return None;
     }
 
-    // Check if either table has an index on any of the join columns.
+    // Check if either table has an index (or rowid) on any of the join columns.
     // If so, prefer nested-loop with index lookup over hash join,
     // this avoids building a hash table when we can use an existing index.
     // Check both tables because we could potentially use a different
@@ -471,6 +500,13 @@ pub fn try_hash_join_access_method(
             .find(|c| c.where_clause_pos.0 == join_key.where_clause_idx)
         {
             if let Some(col_pos) = constraint.table_col_pos {
+                // Check if the join column is a rowid alias directly from the table schema
+                if let Some(column) = probe_table.columns().get(col_pos) {
+                    if column.is_rowid_alias() {
+                        return None;
+                    }
+                }
+                // Also check regular indexes
                 for candidate in &probe_constraints.candidates {
                     if let Some(index) = &candidate.index {
                         if index.column_table_pos_to_index_pos(col_pos).is_some() {
@@ -488,6 +524,13 @@ pub fn try_hash_join_access_method(
             .find(|c| c.where_clause_pos.0 == join_key.where_clause_idx)
         {
             if let Some(col_pos) = constraint.table_col_pos {
+                // Check if the join column is a rowid alias directly from the table schema
+                if let Some(column) = build_table.columns().get(col_pos) {
+                    if column.is_rowid_alias() {
+                        return None;
+                    }
+                }
+                // Also check regular indexes
                 for candidate in &build_constraints.candidates {
                     if let Some(index) = &candidate.index {
                         if index.column_table_pos_to_index_pos(col_pos).is_some() {
@@ -499,12 +542,7 @@ pub fn try_hash_join_access_method(
         }
     }
 
-    let cost = estimate_hash_join_cost(
-        build_cardinality,
-        probe_cardinality,
-        input_cardinality,
-        DEFAULT_MEM_BUDGET,
-    );
+    let cost = estimate_hash_join_cost(build_cardinality, probe_cardinality, DEFAULT_MEM_BUDGET);
     Some(AccessMethod {
         cost,
         params: AccessMethodParams::HashJoin {

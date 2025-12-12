@@ -1,4 +1,4 @@
-use core_tester::common::{limbo_exec_rows, TempDatabase};
+use core_tester::common::{limbo_exec_rows, try_limbo_exec_rows, TempDatabase};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use sql_generation::{
@@ -128,15 +128,11 @@ pub fn rowid_alias_differential_fuzz() {
 
                 // Create table with rowid alias in first database
                 let create_with_alias = convert_to_rowid_alias(&create.to_string());
-                let _ = limbo_exec_rows(&db_with_alias, &conn_with_alias, &create_with_alias);
+                let _ = limbo_exec_rows(&conn_with_alias, &create_with_alias);
 
                 // Create table without rowid alias in second database
                 let create_without_alias = convert_to_no_rowid_alias(&create.to_string());
-                let _ = limbo_exec_rows(
-                    &db_without_alias,
-                    &conn_without_alias,
-                    &create_without_alias,
-                );
+                let _ = limbo_exec_rows(&conn_without_alias, &create_without_alias);
 
                 // Add table to context for future query generation
                 context.add_table(table);
@@ -149,20 +145,26 @@ pub fn rowid_alias_differential_fuzz() {
                 let insert = Insert::arbitrary(&mut rng, &context);
                 let insert_str = insert.to_string();
 
-                // Execute the insert in both databases
-                let _ = limbo_exec_rows(&db_with_alias, &conn_with_alias, &insert_str);
-                let _ = limbo_exec_rows(&db_without_alias, &conn_without_alias, &insert_str);
+                // Execute the insert in both databases, ignoring constraint violations
+                // (e.g., UNIQUE constraint failures on primary key)
+                let result_with_alias =
+                    try_limbo_exec_rows(&db_with_alias, &conn_with_alias, &insert_str);
+                let result_without_alias =
+                    try_limbo_exec_rows(&db_without_alias, &conn_without_alias, &insert_str);
 
-                // Update the table's rows in the context so predicate generation knows about the data
-                if let Insert::Values {
-                    table: table_name,
-                    values,
-                } = &insert
-                {
-                    for table in &mut context.tables {
-                        if table.name == *table_name {
-                            table.rows.extend(values.clone());
-                            break;
+                // Only update context if both inserts succeeded
+                if result_with_alias.is_ok() && result_without_alias.is_ok() {
+                    // Update the table's rows in the context so predicate generation knows about the data
+                    if let Insert::Values {
+                        table: table_name,
+                        values,
+                    } = &insert
+                    {
+                        for table in &mut context.tables {
+                            if table.name == *table_name {
+                                table.rows.extend(values.clone());
+                                break;
+                            }
                         }
                     }
                 }
@@ -180,9 +182,8 @@ pub fn rowid_alias_differential_fuzz() {
 
         tracing::debug!("Comparing query {}: {}", iteration, query_str);
 
-        let with_alias_results = limbo_exec_rows(&db_with_alias, &conn_with_alias, &query_str);
-        let without_alias_results =
-            limbo_exec_rows(&db_without_alias, &conn_without_alias, &query_str);
+        let with_alias_results = limbo_exec_rows(&conn_with_alias, &query_str);
+        let without_alias_results = limbo_exec_rows(&conn_without_alias, &query_str);
 
         let mut sorted_with_alias = with_alias_results;
         let mut sorted_without_alias = without_alias_results;

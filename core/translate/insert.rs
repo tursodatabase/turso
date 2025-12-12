@@ -74,13 +74,6 @@ fn validate(table_name: &str, resolver: &Resolver, table: &Table) -> Result<()> 
     if resolver.schema.is_materialized_view(table_name) {
         crate::bail_parse_error!("cannot modify materialized view {}", table_name);
     }
-    if resolver.schema.table_has_indexes(table_name) && !resolver.schema.indexes_enabled() {
-        // Let's disable altering a table with indices altogether instead of checking column by
-        // column to be extra safe.
-        crate::bail_parse_error!(
-            "INSERT to table with indexes is disabled. Omit the `--experimental-indexes=false` flag to enable this feature."
-        );
-    }
     if table.btree().is_some_and(|t| !t.has_rowid) {
         crate::bail_parse_error!("INSERT into WITHOUT ROWID table is not supported");
     }
@@ -979,6 +972,7 @@ fn emit_notnulls(
     resolver: &Resolver,
 ) -> Result<Option<BranchOffset>> {
     let on_replace = matches!(ctx.on_conflict, ResolveType::Replace);
+    let on_ignore = matches!(ctx.on_conflict, ResolveType::Ignore);
     let mut pending_resume_label = None;
     for column_mapping in insertion
         .col_mappings
@@ -1031,32 +1025,41 @@ fn emit_notnulls(
             }
             // OR REPLACE but no DEFAULT, fall through to ABORT behavior
         }
-        program.emit_insn(Insn::HaltIfNull {
-            target_reg: column_mapping.register,
-            err_code: SQLITE_CONSTRAINT_NOTNULL,
-            description: {
-                let mut description = String::with_capacity(
-                    ctx.table.name.as_str().len()
-                        + column_mapping
+
+        // For INSERT OR IGNORE, skip to the next row if NULL
+        if on_ignore {
+            program.emit_insn(Insn::IsNull {
+                reg: column_mapping.register,
+                target_pc: ctx.row_done_label,
+            });
+        } else {
+            program.emit_insn(Insn::HaltIfNull {
+                target_reg: column_mapping.register,
+                err_code: SQLITE_CONSTRAINT_NOTNULL,
+                description: {
+                    let mut description = String::with_capacity(
+                        ctx.table.name.as_str().len()
+                            + column_mapping
+                                .column
+                                .name
+                                .as_ref()
+                                .expect("Column name must be present")
+                                .len()
+                            + 2,
+                    );
+                    description.push_str(ctx.table.name.as_str());
+                    description.push('.');
+                    description.push_str(
+                        column_mapping
                             .column
                             .name
                             .as_ref()
-                            .expect("Column name must be present")
-                            .len()
-                        + 2,
-                );
-                description.push_str(ctx.table.name.as_str());
-                description.push('.');
-                description.push_str(
-                    column_mapping
-                        .column
-                        .name
-                        .as_ref()
-                        .expect("Column name must be present"),
-                );
-                description
-            },
-        });
+                            .expect("Column name must be present"),
+                    );
+                    description
+                },
+            });
+        }
     }
     Ok(pending_resume_label)
 }

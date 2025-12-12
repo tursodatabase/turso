@@ -112,28 +112,37 @@ pub fn prepare_select_plan(
             connection,
         )?)),
         false => {
+            // For compound SELECTs, the WITH clause applies to all parts.
+            // We clone the WITH clause for each SELECT in the compound so that
+            // each one can resolve CTE references independently.
+            let with = select.with;
+
             let mut last = prepare_one_select_plan(
                 select.body.select,
                 resolver,
                 program,
                 None,
                 vec![],
-                None,
+                with.clone(),
                 outer_query_refs,
                 query_destination.clone(),
                 connection,
             )?;
 
             let mut left = Vec::with_capacity(compounds.len());
-            for CompoundSelect { select, operator } in compounds {
+            for CompoundSelect {
+                select: compound_select,
+                operator,
+            } in compounds
+            {
                 left.push((last, operator));
                 last = prepare_one_select_plan(
-                    select,
+                    compound_select,
                     resolver,
                     program,
                     None,
                     vec![],
-                    None,
+                    with.clone(),
                     outer_query_refs,
                     query_destination.clone(),
                     connection,
@@ -154,10 +163,6 @@ pub fn prepare_select_plan(
             // FIXME: handle ORDER BY for compound selects
             if !select.order_by.is_empty() {
                 crate::bail_parse_error!("ORDER BY is not supported for compound SELECTs yet");
-            }
-            // FIXME: handle WITH for compound selects
-            if select.with.is_some() {
-                crate::bail_parse_error!("WITH is not supported for compound SELECTs yet");
             }
             Ok(Plan::CompoundSelect {
                 left,
@@ -198,12 +203,6 @@ fn prepare_one_select_plan(
             distinctness,
             window_clause,
         } => {
-            if !resolver.schema.indexes_enabled() && distinctness.is_some() {
-                crate::bail_parse_error!(
-                    "SELECT with DISTINCT is not allowed without indexes enabled"
-                );
-            }
-
             let col_count = columns.len();
             if col_count == 0 {
                 crate::bail_parse_error!("SELECT without columns is not allowed");
@@ -523,22 +522,24 @@ fn prepare_one_select_plan(
                 });
             }
 
+            let mut table_references = TableReferences::new(vec![], outer_query_refs.to_vec());
             for value_row in values.iter_mut() {
                 for value in value_row.iter_mut() {
+                    // Before binding, we check for unquoted literals. Sqlite throws an error in this case
                     bind_and_rewrite_expr(
                         value,
-                        None,
+                        Some(&mut table_references),
                         None,
                         connection,
                         // Allow sqlite quirk of inserting "double-quoted" literals (which our AST maps as identifiers)
-                        BindingBehavior::AllowUnboundIdentifiers,
+                        BindingBehavior::TryResultColumnsFirst,
                     )?;
                 }
             }
 
             let plan = SelectPlan {
                 join_order: vec![],
-                table_references: TableReferences::new(vec![], vec![]),
+                table_references,
                 result_columns,
                 where_clause: vec![],
                 group_by: None,

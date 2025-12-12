@@ -741,6 +741,75 @@ fn test_cte_alias(tmp_db: TempDatabase) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[turso_macros::test(
+    mvcc,
+    init_sql = "CREATE TABLE test (id INTEGER PRIMARY KEY, name TEXT);"
+)]
+fn test_cte_with_union(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+    conn.execute("INSERT INTO test (id, name) VALUES (1, 'Alice');")?;
+    conn.execute("INSERT INTO test (id, name) VALUES (2, 'Bob');")?;
+
+    // Test 1: CTE with UNION ALL - CTE used in first SELECT
+    let mut stmt = conn.prepare(
+        "WITH t AS (SELECT id, name FROM test WHERE id = 1) SELECT * FROM t UNION ALL SELECT 99, 'Extra'",
+    )?;
+    let mut rows = Vec::new();
+    loop {
+        match stmt.step()? {
+            StepResult::Row => {
+                let row = stmt.row().unwrap();
+                rows.push(row.get_values().cloned().collect::<Vec<_>>());
+            }
+            StepResult::Done => break,
+            StepResult::IO => stmt.run_once()?,
+            _ => panic!("Unexpected step result"),
+        }
+    }
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][0], Value::Integer(1));
+    assert_eq!(rows[1][0], Value::Integer(99));
+
+    // Test 2: CTE with UNION (not UNION ALL)
+    let mut stmt = conn.prepare("WITH t AS (SELECT 1 as x) SELECT * FROM t UNION SELECT 2 as x")?;
+    let mut rows = Vec::new();
+    loop {
+        match stmt.step()? {
+            StepResult::Row => {
+                let row = stmt.row().unwrap();
+                rows.push(row.get_values().cloned().collect::<Vec<_>>());
+            }
+            StepResult::Done => break,
+            StepResult::IO => stmt.run_once()?,
+            _ => panic!("Unexpected step result"),
+        }
+    }
+    assert_eq!(rows.len(), 2);
+
+    // Test 3: Multiple CTEs with UNION ALL - both CTEs used in different branches
+    let mut stmt = conn.prepare(
+        "WITH t1 AS (SELECT id FROM test WHERE id = 1), t2 AS (SELECT id FROM test WHERE id = 2) \
+         SELECT * FROM t1 UNION ALL SELECT * FROM t2",
+    )?;
+    let mut rows = Vec::new();
+    loop {
+        match stmt.step()? {
+            StepResult::Row => {
+                let row = stmt.row().unwrap();
+                rows.push(row.get_values().cloned().collect::<Vec<_>>());
+            }
+            StepResult::Done => break,
+            StepResult::IO => stmt.run_once()?,
+            _ => panic!("Unexpected step result"),
+        }
+    }
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][0], Value::Integer(1));
+    assert_eq!(rows[1][0], Value::Integer(2));
+
+    Ok(())
+}
+
 #[turso_macros::test(mvcc, init_sql = "create table t (x, y);")]
 fn test_avg_agg(tmp_db: TempDatabase) -> anyhow::Result<()> {
     let conn = tmp_db.connect_limbo();
@@ -881,7 +950,7 @@ fn test_multiple_connections_visibility(tmp_db: TempDatabase) -> anyhow::Result<
     drop(stmt);
     conn1.execute("COMMIT")?;
 
-    let rows = limbo_exec_rows(&tmp_db, &conn2, "SELECT COUNT(*) FROM test");
+    let rows = limbo_exec_rows(&conn2, "SELECT COUNT(*) FROM test");
     assert_eq!(rows, vec![vec![rusqlite::types::Value::Integer(2)]]);
     Ok(())
 }
@@ -914,7 +983,7 @@ fn test_stmt_reset(tmp_db: TempDatabase) -> anyhow::Result<()> {
             _ => tmp_db.io.step().unwrap(),
         }
     }
-    let rows = limbo_exec_rows(&tmp_db, &conn1, "SELECT rowid FROM test");
+    let rows = limbo_exec_rows(&conn1, "SELECT rowid FROM test");
     assert_eq!(
         rows,
         vec![
