@@ -60,6 +60,10 @@ impl SimIO for SimulatorIO {
 
     fn print_stats(&self) {
         for file in self.files.borrow().iter() {
+            if file.path.contains("ephemeral") {
+                // Files created for ephemeral tables just add noise to the simulator output and aren't by default very interesting to debug
+                continue;
+            }
             tracing::info!(
                 "\n===========================\n\nPath: {}\n{}",
                 file.path,

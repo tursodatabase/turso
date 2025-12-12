@@ -170,6 +170,10 @@ impl SimIO for MemorySimIO {
 
     fn print_stats(&self) {
         for (path, file) in self.files.borrow().iter() {
+            if path.contains("ephemeral") {
+                // Files created for ephemeral tables just add noise to the simulator output and aren't by default very interesting to debug
+                continue;
+            }
             tracing::info!(
                 "\n===========================\n\nPath: {}\n{}",
                 path,
