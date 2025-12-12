@@ -37,7 +37,11 @@ impl AtomicDropBehavior {
 
 // A database connection.
 pub struct Connection {
-    inner: Arc<Mutex<Arc<turso_core::Connection>>>,
+    /// Inner is an Option so that when a Connection is dropped we can take the inner
+    /// (Actual connection) out of it and put it back into the ConnectionPool
+    /// the only time inner will be None is just before the Connection is freed after the
+    /// inner connection has been recyled into the connection pool
+    inner: Option<Arc<Mutex<Arc<turso_core::Connection>>>>,
     pub(crate) transaction_behavior: TransactionBehavior,
     /// If there is a dangling transaction after it was dropped without being finished,
     /// [Connection::dangling_tx] will be set to the [DropBehavior] of the dangling transaction,
@@ -51,8 +55,11 @@ pub struct Connection {
 
 impl Clone for Connection {
     fn clone(&self) -> Self {
+        let i = self.inner.clone();
+
         Self {
-            inner: Arc::clone(&self.inner),
+            inner: i,
+            //inner: Arc::clone(&self.inner),
             transaction_behavior: self.transaction_behavior,
             dangling_tx: AtomicDropBehavior::new(self.dangling_tx.load(Ordering::SeqCst)),
         }
@@ -66,7 +73,7 @@ impl Connection {
     pub fn create(conn: Arc<turso_core::Connection>) -> Self {
         #[allow(clippy::arc_with_non_send_sync)]
         let connection = Connection {
-            inner: Arc::new(Mutex::new(conn)),
+            inner: Some(Arc::new(Mutex::new(conn))),
             transaction_behavior: TransactionBehavior::Deferred,
             dangling_tx: AtomicDropBehavior::new(DropBehavior::Ignore),
         };
@@ -111,10 +118,14 @@ impl Connection {
 
     /// get the inner connection
     fn get_inner_connection(&self) -> Result<MutexGuard<'_, Arc<turso_core::Connection>>> {
-        Ok(self
-            .inner
-            .lock()
-            .map_err(|e| Error::MutexError(e.to_string()))?)
+        match &self.inner {
+            Some(inner) => Ok(inner.lock().map_err(|e| Error::MutexError(e.to_string()))?),
+            None => Err(Error::MutexError(format!("Inner connection can't be none"))),
+        }
+        // Ok(self
+        //     .inner.unwrap()
+        //     .lock()
+        //     .map_err(|e| Error::MutexError(e.to_string()))?)
     }
 
     #[cfg(feature = "conn_raw_api")]
