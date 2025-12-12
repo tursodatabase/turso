@@ -207,6 +207,18 @@ pub fn translate_alter_table(
                 }
             }
 
+            // Check if any trigger holds the removed column, sqlite throws an error in this case
+            for (_, triggers) in resolver.schema.triggers.iter() {
+                for trigger in triggers.iter() {
+                    if trigger_references_column(trigger, &btree, column_name)? {
+                        return Err(LimboError::Constraint(format!(
+                            "error in trigger {} after drop column: no such column: {}",
+                            trigger.name, column_name,
+                        )));
+                    }
+                }
+            }
+
             btree.columns.remove(dropped_index);
 
             let sql = btree.to_sql().replace('\'', "''");
@@ -1274,7 +1286,11 @@ fn trigger_references_column(
                         table,
                         &trigger_table_name,
                         &column_name_norm,
-                    )? {
+                    )? || set
+                        .col_names
+                        .iter()
+                        .any(|col_name| col_name.to_string() == column_name_norm)
+                    {
                         found = true;
                         break;
                     }
