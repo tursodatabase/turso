@@ -269,7 +269,7 @@ fn http_response(
     );
     if let Some(extra) = extra_headers {
         for (k, v) in extra {
-            headers.push_str(&format!("{}: {}\r\n", k, v));
+            headers.push_str(&format!("{k}: {v}\r\n"));
         }
     }
     headers.push_str("\r\n");
@@ -408,7 +408,7 @@ fn execute_stmt(conn: &Arc<Connection>, stmt: &Stmt) -> Result<StmtResult> {
 
     // Positional arguments
     for (i, val) in stmt.args.iter().enumerate() {
-        let idx = NonZero::new((i + 1) as usize).unwrap();
+        let idx = NonZero::new(i + 1).unwrap();
         st.bind_at(idx, map_value_to_db(val)?);
     }
 
@@ -421,19 +421,19 @@ fn execute_stmt(conn: &Arc<Connection>, stmt: &Stmt) -> Result<StmtResult> {
             bound = true;
         } else {
             // Try with leading ':'
-            let candidate = format!(":{}", name);
+            let candidate = format!(":{name}");
             if let Some(idx) = st.parameter_index(&candidate) {
                 st.bind_at(idx, map_value_to_db(value)?);
                 bound = true;
             } else {
                 // Try with '@'
-                let candidate = format!("@{}", name);
+                let candidate = format!("@{name}");
                 if let Some(idx) = st.parameter_index(&candidate) {
                     st.bind_at(idx, map_value_to_db(value)?);
                     bound = true;
                 } else {
                     // Try with '$'
-                    let candidate = format!("${}", name);
+                    let candidate = format!("${name}");
                     if let Some(idx) = st.parameter_index(&candidate) {
                         st.bind_at(idx, map_value_to_db(value)?);
                         bound = true;
@@ -449,9 +449,7 @@ fn execute_stmt(conn: &Arc<Connection>, stmt: &Stmt) -> Result<StmtResult> {
     let want_rows = stmt.want_rows.unwrap_or(true);
     let mut cols: Vec<Col> = Vec::new();
     let mut rows: Vec<Row> = Vec::new();
-    let affected_row_count: u64;
-
-    if want_rows {
+    let affected_row_count = if want_rows {
         let values = st.run_collect_rows()?;
         let ncols = st.num_columns();
         for i in 0..ncols {
@@ -467,11 +465,11 @@ fn execute_stmt(conn: &Arc<Connection>, stmt: &Stmt) -> Result<StmtResult> {
             rows.push(Row { values: mapped });
         }
         // For SELECT, affected rows is 0
-        affected_row_count = 0;
+        0
     } else {
         st.run_ignore_rows()?;
-        affected_row_count = conn.changes() as u64;
-    }
+        conn.changes() as u64
+    };
 
     let last_insert_rowid = if !want_rows {
         Some(conn.last_insert_rowid())
