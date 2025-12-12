@@ -519,7 +519,7 @@ async fn test_connection_clone() {
     stmt.execute(["1", "Frodo"]).await.unwrap();
     tx.commit().await.unwrap();
 
-    let mut conn2 = conn.clone();
+    let conn2 = conn.clone();
     let row = conn2
         .prepare("SELECT id FROM users WHERE name = ?")
         .await
