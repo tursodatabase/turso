@@ -28,7 +28,8 @@ ctrlc = "3.4.4"
 dirs = "5.0.1"
 env_logger = { workspace = true }
 libc = "0.2.172"
-turso_core = { workspace = true , default-features = true, features = ["cli_only"] }
+turso_core = { workspace = true , default-features = true, features = ["cli_only", "conn_raw_api", "fs"] }
+turso_sync_engine = { workspace = true }
 limbo_completion = { workspace = true, features = ["static"] }
 miette = { workspace = true, features = ["fancy"] }
 nu-ansi-term = {version = "0.50.1", features = ["serde", "derive_serde_style"]}
@@ -50,6 +51,9 @@ termimad = "0.30"
 include_dir = "0.7"
 rand = "0.8"
 mimalloc = { workspace = true, optional = true }
+prost = "0.14.1"
+roaring = "0.11.2"
+bytes = "1.11.0"
 
 [features]
 default = ["io_uring", "mimalloc"]
