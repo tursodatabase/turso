@@ -378,7 +378,7 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
     /// transactions are not conflicting.
     /// Therefore, we will always choose the highest rowid in the table, regardless of the visibility of the row to the
     /// transaction.
-    pub fn get_next_rowid(&mut self) -> Result<IOResult<i64>> {
+    pub fn get_next_rowid(&mut self) -> Result<IOResult<(i64, i64)>> {
         // lock so we don't get same two rowids
         let lock = self.next_rowid_lock.clone();
         let _lock = lock.write();
@@ -392,7 +392,11 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
                     "rowid overflow, random rowids not implemented yet".to_string(),
                 ));
             }
-            Ok(rowid.to_int_or_panic() + 1)
+
+            let prev_max_rowid = rowid.to_int_or_panic();
+            let new_row_id = prev_max_rowid + 1;
+            tracing::trace!("new_row_id={new_row_id}");
+            Ok((new_row_id, prev_max_rowid))
         };
         match self.current_pos.borrow().clone() {
             CursorPosition::Loaded {
@@ -420,14 +424,14 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
             }
             CursorPosition::BeforeFirst => {
                 let res = match last_rowid_in_mvcc_index {
-                    None => 1,
+                    None => (1, 0),
                     Some(k) => incremented_rowid(&k)?,
                 };
                 Ok(IOResult::Done(res))
             }
             CursorPosition::End => {
                 let res = match last_rowid_in_mvcc_index {
-                    None => 1,
+                    None => (1, 0),
                     Some(k) => incremented_rowid(&k)?,
                 };
                 Ok(IOResult::Done(res))
@@ -1409,7 +1413,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                 self.tx_id,
                 &mut self.table_iterator,
             );
-            let exists = if let Some(rowid) = rowid {
+            let exists = if let Some(rowid) = &rowid {
                 let RowKey::Int(rowid) = rowid.row_id else {
                     panic!("Rowid is not an integer in mvcc table cursor");
                 };
@@ -1417,6 +1421,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
             } else {
                 false
             };
+            tracing::trace!("Row exists: {exists} find={int_key} got={rowid:?}");
             if exists {
                 self.current_pos.replace(CursorPosition::Loaded {
                     row_id: RowID {

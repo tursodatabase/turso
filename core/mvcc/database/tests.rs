@@ -1935,3 +1935,37 @@ fn test_cursor_with_btree_and_mvcc_delete_after_checkpoint() {
     let rows = get_rows(&conn, "SELECT * FROM t order by x desc");
     assert_eq!(rows.len(), 0);
 }
+
+#[test]
+fn test_skips_updated_rowid() {
+    tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_max_level(tracing_subscriber::filter::LevelFilter::TRACE)
+        .init();
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY AUTOINCREMENT)")
+        .unwrap();
+
+    // we insert with default values
+    conn.execute("INSERT INTO t DEFAULT VALUES").unwrap();
+    let rows = get_rows(&conn, "SELECT * FROM sqlite_sequence");
+    dbg!(&rows);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][1].as_int().unwrap(), 1);
+
+    // we update the rowid to +1
+    conn.execute("UPDATE t SET a = a + 1").unwrap();
+    let rows = get_rows(&conn, "SELECT * FROM sqlite_sequence");
+    dbg!(&rows);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][1].as_int().unwrap(), 1);
+
+    // we insert with default values again
+    conn.execute("INSERT INTO t DEFAULT VALUES").unwrap();
+    let rows = get_rows(&conn, "SELECT * FROM sqlite_sequence");
+    dbg!(&rows);
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][1].as_int().unwrap(), 3);
+}
