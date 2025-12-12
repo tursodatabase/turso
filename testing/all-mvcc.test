@@ -3,7 +3,6 @@
 set testdir [file dirname $argv0]
 
 # failing:
-# source $testdir/autoincr.test
 # source $testdir/join.test
 # source $testdir/insert.test
 # source $testdir/pragma.test
@@ -29,6 +28,7 @@ set testdir [file dirname $argv0]
 
 # works
 source $testdir/glob.test
+source $testdir/autoincr.test
 source $testdir/cmdlineshell.test
 source $testdir/alter_table.test
 source $testdir/coalesce.test

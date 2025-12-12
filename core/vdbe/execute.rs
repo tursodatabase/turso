@@ -7021,12 +7021,13 @@ pub fn op_new_rowid(
         },
         insn
     );
+
     let mv_store = program.connection.mv_store();
     'mvcc_newrowid: {
         if let Some(mv_store) = mv_store.as_ref() {
             // With MVCC we can't simply find last rowid and get rowid + 1 as a result. To not have two conflicting rowids concurrently we need to call `get_next_rowid`
             // which will make sure we don't collide.
-            let rowid = {
+            let (rowid, current_max) = {
                 let cursor = state.get_cursor(*cursor);
                 let cursor = cursor.as_btree_mut() as &mut dyn Any;
                 let Some(mvcc_cursor) = cursor.downcast_mut::<MvCursor>() else {
@@ -7043,6 +7044,9 @@ pub fn op_new_rowid(
                 return_if_io!(mvcc_cursor.get_next_rowid())
             };
             state.registers[*rowid_reg] = Register::Value(Value::Integer(rowid));
+            if *prev_largest_reg > 0 {
+                state.registers[*prev_largest_reg] = Register::Value(Value::Integer(current_max));
+            }
             state.pc += 1;
             return Ok(InsnFunctionStepResult::Step);
         }
