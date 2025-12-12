@@ -2,11 +2,34 @@
 name: sync-server
 ---
 
-<Code model="openai/gpt-5" language="rust" output="sync_server.rs" id="sync-server">
-    <Output ref="prompt"/>
+<Code model="openai/gpt-5" language="rust" output="sync_server.rs" id="code">
+    <Output ref="prompt" />
 </Code>
 
-<>
+<Doc model="openai/gpt-5" output="../../turso-docs/sync/spec.mdx" id="doc">
+    Generate MDX documentation file in Mintlify format for the sync engine open protocol
+
+    You will be provided with a prompt which is used to generate simple implementation of the server.
+    Your task is to extract protocol implementation from this prompt and compose a documentation with PROTOCOL description:
+    - Document endpoint which MUST be implemented to implement sync engine protocol
+    - Document sql over http protocol which is used for `/v2/pipeline` endpoint
+    - Document `/pull-updates` endpoint
+    - The documentation MUST ONLY mention contracts, logic and flow. No code should be mentioned
+
+    Structure documentation well and Use Mintlify rich formatting tools in order to make documentation easy to read and navigatable:
+    * Give high level overview of sync protocol and its main components in the beginning
+        * This is protocol to support bidirectional of sqlite-compatible database between server and client
+    * Describe /v2/pipeline endpoint
+        * List contract spec
+    * Describe /pull-updates endpoint
+    * Use mintlify components if appropriate
+        * ```....``` code blocks to emit contracts like protobuf schemas
+        * Callouts (`<Info>`, `<Warning>`, etc) to extract portion of information into separate block visible to the reader
+    * Use markdown markup features if appropriate
+        * Headers and subheaders for structuring the docs and automatically build table of content by Mintlify
+        * Text emphasis (bold, italic) to highlight important words
+    <Output ref="prompt" />
+</Doc>
 
 <Text id="prompt">
 
@@ -112,6 +135,7 @@ The main database API is in the lib.rs:
 # sql over http
 
 - Implement batch conditions - they are important especiall auto-commit handling
+- Implement only positional arguments - named parameters are not used in the sync protocol at client side
 
 # dependencies
 
