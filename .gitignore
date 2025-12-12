@@ -51,4 +51,5 @@ bisected.sql
 
 *.db-log
 settings.local.json
+.claude/agents/
 .build-hash

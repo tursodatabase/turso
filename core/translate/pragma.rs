@@ -163,6 +163,7 @@ fn update_pragma(
                 dest: result_reg,
                 new_mode: Some(mode_str),
             });
+
             program.emit_result_row(result_reg, 1);
             program.add_pragma_result_column("journal_mode".into());
             Ok((program, TransactionMode::None))

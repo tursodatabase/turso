@@ -203,9 +203,17 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             let mut begin_ts = None;
             if let Some(TxTimestampOrID::Timestamp(b)) = version.begin {
                 begin_ts = Some(b);
-                if self
-                    .checkpointed_txid_max_old
-                    .is_none_or(|txid_max_old| b <= txid_max_old.into())
+                // A row exists in the DB file if:
+                // 1. It was checkpointed in a previous checkpoint (begin_ts <= checkpointed_txid_max_old), OR
+                // 2. The version is marked as btree_resident (the row existed in B-tree when it was
+                //    first modified in MVCC after a WAL->MVCC switch)
+                //
+                // When checkpointed_txid_max_old is None and begin_ts > 0 and not btree_resident,
+                // no MVCC row has been checkpointed yet, so the row does NOT exist in the database file.
+                if version.btree_resident
+                    || self
+                        .checkpointed_txid_max_old
+                        .is_some_and(|txid_max_old| b <= txid_max_old.into())
                 {
                     exists_in_db_file = true;
                 }
