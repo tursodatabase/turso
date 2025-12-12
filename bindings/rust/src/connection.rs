@@ -120,7 +120,9 @@ impl Connection {
     fn get_inner_connection(&self) -> Result<MutexGuard<'_, Arc<turso_core::Connection>>> {
         match &self.inner {
             Some(inner) => Ok(inner.lock().map_err(|e| Error::MutexError(e.to_string()))?),
-            None => Err(Error::MutexError(format!("Inner connection can't be none"))),
+            None => Err(Error::MutexError(
+                "Inner connection can't be none".to_string(),
+            )),
         }
     }
 
