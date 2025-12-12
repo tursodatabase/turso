@@ -122,19 +122,11 @@ impl Connection {
             Some(inner) => Ok(inner.lock().map_err(|e| Error::MutexError(e.to_string()))?),
             None => Err(Error::MutexError(format!("Inner connection can't be none"))),
         }
-        // Ok(self
-        //     .inner.unwrap()
-        //     .lock()
-        //     .map_err(|e| Error::MutexError(e.to_string()))?)
     }
 
     #[cfg(feature = "conn_raw_api")]
     pub fn wal_frame_count(&self) -> Result<u64> {
         let conn = self.get_inner_connection()?;
-        //  let conn:  = self
-        //      .inner
-        //      .lock();
-        //     .map_err(|e| Error::MutexError(e.to_string()))?;
         conn.wal_state()
             .map_err(|e| Error::WalOperationError(format!("wal_insert_begin failed: {e}")))
             .map(|state| state.max_frame)
@@ -238,7 +230,6 @@ impl Connection {
 
     /// Returns the rowid of the last row inserted.
     pub fn last_insert_rowid(&self) -> i64 {
-        //let conn = self.inner.lock().unwrap();
         let conn = self.get_inner_connection().unwrap();
         conn.last_insert_rowid()
     }
