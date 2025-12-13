@@ -1,0 +1,205 @@
+# changes() Function Tests
+# Ported from testing/changes.test
+
+@database :memory:
+
+# Basic insert
+setup changes-on-basic-insert {
+    create table temp (t1 integer, primary key (t1));
+}
+
+@setup changes-on-basic-insert
+test changes-on-basic-insert {
+    insert into temp values (1);
+    select changes();
+}
+expect {
+    1
+}
+
+# Multiple row insert
+setup changes-on-multiple-row-insert {
+    create table temp (t1 integer, primary key (t1));
+}
+
+@setup changes-on-multiple-row-insert
+test changes-on-multiple-row-insert {
+    insert into temp values (1), (2), (3);
+    select changes();
+}
+expect {
+    3
+}
+
+# Most recent operation
+setup changes-shows-most-recent {
+    create table temp (t1 integer, primary key (t1));
+}
+
+@setup changes-shows-most-recent
+test changes-shows-most-recent {
+    insert into temp values (1), (2), (3);
+    insert into temp values (4), (5), (6), (7);
+    select changes();
+}
+expect {
+    4
+}
+
+# Doesn't track indexes
+setup changes-doesnt-track-indexes {
+    create table users (id integer primary key, name text, age integer);
+    create index idx_name on users(name);
+    create unique index idx_name_age on users(name, age);
+}
+
+@setup changes-doesnt-track-indexes
+test changes-doesnt-track-indexes {
+    insert into users (name, age) values ('Alice', 30),('Mike', 33),('Jim', 22),('Sarah', 44),('Rosa', 11),('Cindy', 36),('Bob', 35),('Charlie', 50);
+    UPDATE users SET name = 'young' where age < 40;
+    select changes();
+}
+expect {
+    6
+}
+
+# Changes with update
+setup changes-169 {
+    create table t(id integer primary key, value text);
+}
+
+@setup changes-169
+test changes-169 {
+    insert into t values (1, 'a');
+    select changes();
+    update t set id = id+10 where id = 1;
+    select changes();
+}
+expect {
+    1
+    1
+}
+
+# Delete
+setup changes-on-delete {
+    create table temp (t1 integer, primary key (t1));
+}
+
+@setup changes-on-delete
+test changes-on-delete {
+    insert into temp values (1), (2), (3), (4), (5);
+    delete from temp where t1 > 2;
+    select changes();
+}
+expect {
+    3
+}
+
+# Update
+setup changes-on-update {
+    create table temp (t1 integer, t2 text, primary key (t1));
+}
+
+@setup changes-on-update
+test changes-on-update {
+    insert into temp values (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd');
+    update temp set t2 = 'updated' where t1 <= 3;
+    select changes();
+}
+expect {
+    3
+}
+
+# Update rowid
+setup changes-on-update-rowid {
+    create table temp (t1 integer primary key, t2 text);
+}
+
+@setup changes-on-update-rowid
+test changes-on-update-rowid {
+    insert into temp values (1, 'a'), (2, 'b'), (3, 'c');
+    update temp set t1 = t1 + 10 where t1 = 2;
+    select changes();
+}
+expect {
+    1
+}
+
+# Resets after select
+setup changes-resets-after-select {
+    create table temp (t1 integer, primary key (t1));
+}
+
+@setup changes-resets-after-select
+test changes-resets-after-select {
+    insert into temp values (1), (2), (3);
+    select * from temp;
+    select changes();
+}
+expect {
+    1
+    2
+    3
+    3
+}
+
+# Delete no match
+setup changes-on-delete-no-match {
+    create table temp (t1 integer, primary key (t1));
+}
+
+@setup changes-on-delete-no-match
+test changes-on-delete-no-match {
+    insert into temp values (1), (2), (3);
+    delete from temp where t1 > 100;
+    select changes();
+}
+expect {
+    0
+}
+
+# Update no match
+setup changes-on-update-no-match {
+    create table temp (t1 integer, t2 text, primary key (t1));
+}
+
+@setup changes-on-update-no-match
+test changes-on-update-no-match {
+    insert into temp values (1, 'a'), (2, 'b');
+    update temp set t2 = 'updated' where t1 > 100;
+    select changes();
+}
+expect {
+    0
+}
+
+# Delete all
+setup changes-on-delete-all {
+    create table temp (t1 integer, primary key (t1));
+}
+
+@setup changes-on-delete-all
+test changes-on-delete-all {
+    insert into temp values (1), (2), (3), (4), (5), (6);
+    delete from temp;
+    select changes();
+}
+expect {
+    6
+}
+
+# Mixed operations
+setup changes-mixed-operations {
+    create table temp (t1 integer, t2 text, primary key (t1));
+}
+
+@setup changes-mixed-operations
+test changes-mixed-operations {
+    insert into temp values (1, 'a'), (2, 'b'), (3, 'c');
+    update temp set t2 = 'updated' where t1 <= 2;
+    delete from temp where t1 = 1;
+    select changes();
+}
+expect {
+    1
+}

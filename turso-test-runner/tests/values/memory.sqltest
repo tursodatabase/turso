@@ -1,0 +1,67 @@
+# VALUES Tests (Memory)
+# Ported from testing/values.test
+
+@database :memory:
+
+# Values with BETWEEN
+setup values-between {
+    CREATE TABLE t0 (c0);
+}
+
+@setup values-between
+test values-between {
+    INSERT INTO t0 VALUES ((0 BETWEEN 0 AND 0)), (0);
+    SELECT * FROM t0;
+}
+expect {
+    1
+    0
+}
+
+# Illegal column reference in VALUES
+setup values-illegal-column-ref {
+    CREATE TABLE t0 (c0);
+}
+
+@setup values-illegal-column-ref
+test values-illegal-column-ref {
+    INSERT INTO t0 VALUES (c0);
+}
+expect error {}
+
+# Unquoted identifier in VALUES
+setup values-unquoted-identifier-single {
+    SELECT 1;
+}
+
+@setup values-unquoted-identifier-single
+test values-unquoted-identifier-single {
+    values(asdf);
+}
+expect error {}
+
+# Unquoted identifier mixed
+setup values-unquoted-identifier-mixed {
+    SELECT 1;
+}
+
+@setup values-unquoted-identifier-mixed
+test values-unquoted-identifier-mixed {
+    values(1, asdf);
+}
+expect error {}
+
+# Correlated VALUES in select
+setup values-correlated-values-in-select {
+    CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);
+    INSERT INTO users (name) VALUES ('jack'), ('jill');
+}
+
+@setup values-correlated-values-in-select
+test values-correlated-values-in-select {
+    SELECT id, (VALUES(name)) AS name_again FROM users;
+}
+expect {
+    1|jack
+    2|jill
+}

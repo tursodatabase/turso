@@ -1,0 +1,1647 @@
+# JSON Functions Tests
+# Ported from testing/json.test
+
+@database :memory:
+
+# JSON5 ECMAScript extensions
+test json5-ecma-script-1 {
+    select json('{a:5,b:6}') ;
+}
+expect {
+    {"a":5,"b":6}
+}
+
+test json5-ecma-script-2 {
+    select json('{a:5,a:3}') ;
+}
+expect {
+    {"a":5,"a":3}
+}
+
+test json5-ecma-script-3 {
+   SELECT json('{ MNO_123$xyz : 789 }');
+}
+expect {
+    {"MNO_123$xyz":789}
+}
+
+test json5-with-single-trailing-comma-valid {
+    select json('{"a":5, "b":6, }');
+}
+expect {
+    {"a":5,"b":6}
+}
+
+test json5-single-quoted {
+    SELECT json('{"a": ''abcd''}');
+}
+expect {
+    {"a":"abcd"}
+}
+
+test json5-hexadecimal-1 {
+   SELECT json('{a: 0x0}')
+}
+expect {
+    {"a":0}
+}
+
+test json5-hexadecimal-2 {
+   SELECT json('{a: 0xabcdef}')
+}
+expect {
+    {"a":11259375}
+}
+
+test json5-hexadecimal-3 {
+   SELECT json('{a: -0xabcdef}')
+}
+expect {
+    {"a":-11259375}
+}
+
+test json5-number-1 {
+   SELECT json('{x: 4.}')
+}
+expect {
+    {"x":4.0}
+}
+
+test json5-number-2 {
+   SELECT json('{x: +4.}')
+}
+expect {
+    {"x":4.0}
+}
+
+test json5-number-3 {
+   SELECT json('{x: -4.}')
+}
+expect {
+    {"x":-4.0}
+}
+
+test json5-number-5 {
+   SELECT json('{x: Infinity}')
+}
+expect {
+    {"x":9e999}
+}
+
+test json5-number-6 {
+   SELECT json('{x: -Infinity}')
+}
+expect {
+    {"x":-9e999}
+}
+
+# json_array tests
+test json_array_str {
+   SELECT json_array('a')
+}
+expect {
+    ["a"]
+}
+
+test json_array_numbers {
+   SELECT json_array(1, 1.5)
+}
+expect {
+    [1,1.5]
+}
+
+test json_array_numbers_2 {
+   SELECT json_array(1., +2., -2.)
+}
+expect {
+    [1.0,2.0,-2.0]
+}
+
+test json_array_null {
+   SELECT json_array(null)
+}
+expect {
+    [null]
+}
+
+test json_array_not_json {
+   SELECT json_array('{"a":1}')
+}
+expect {
+    ["{\"a\":1}"]
+}
+
+test json_array_json {
+   SELECT json_array(json('{"a":1}'))
+}
+expect {
+    [{"a":1}]
+}
+
+test json_array_nested {
+   SELECT json_array(json_array(1,2,3), json('[1,2,3]'), '[1,2,3]')
+}
+expect {
+    [[1,2,3],[1,2,3],"[1,2,3]"]
+}
+
+# json_extract tests
+test json_extract_null {
+    SELECT json_extract(null, '$')
+}
+expect {
+}
+
+test json_extract_json_null_type {
+    SELECT typeof(json_extract('null', '$'))
+}
+expect {
+    null
+}
+
+test json_arrow_json_null_type {
+    SELECT typeof('null' -> '$')
+}
+expect {
+    text
+}
+
+test json_arrow_shift_json_null_type {
+    SELECT typeof('null' ->> '$')
+}
+expect {
+    null
+}
+
+test json_extract_empty {
+    SELECT json_extract()
+}
+expect {
+}
+
+test json_extract_single_param {
+    SELECT json_extract(1)
+}
+expect {
+}
+
+test json_extract_null_invalid_path {
+    SELECT json_extract(null, 1)
+}
+expect {
+}
+
+test json_extract_null_invalid_path_2 {
+    SELECT json_extract(null, CAST(1 AS BLOB))
+}
+expect {
+}
+
+test json_extract_multiple_nulls {
+    SELECT json_extract(null, CAST(1 AS BLOB), null, 1, 2, 3)
+}
+expect {
+}
+
+test json_extract_number {
+    SELECT json_extract(1, '$')
+}
+expect {
+    1
+}
+
+test json_extract_number_type {
+    SELECT typeof(json_extract(1, '$'))
+}
+expect {
+    integer
+}
+
+test json_arrow_number {
+    SELECT 1 -> '$'
+}
+expect {
+    1
+}
+
+test json_arrow_number_type {
+    SELECT typeof(1 -> '$')
+}
+expect {
+    text
+}
+
+test json_arrow_shift_number {
+    SELECT 1 -> '$'
+}
+expect {
+    1
+}
+
+test json_arrow_shift_number_type {
+    SELECT typeof(1 ->> '$')
+}
+expect {
+    integer
+}
+
+test json_extract_object_1 {
+    SELECT json_extract('{"a": [1,2,3]}', '$.a')
+}
+expect {
+    [1,2,3]
+}
+
+test json_arrow_object {
+    SELECT '{"a": [1,2,3]}' -> '$.a'
+}
+expect {
+    [1,2,3]
+}
+
+test json_arrow_blob_object {
+    SELECT cast('{"age":30,"name":"John"}' as blob) -> '$.age'
+}
+expect {
+    30
+}
+
+test json_arrow_blob_number {
+    SELECT cast('4' as blob) -> '$'
+}
+expect {
+    4
+}
+
+test json_arrow_blob_number_2 {
+    SELECT cast(33 as blob) -> '$'
+}
+expect {
+    33
+}
+
+test json_arrow_blob_negative_number {
+    SELECT cast('-4' as blob) -> '$'
+}
+expect {
+    -4
+}
+
+test json_arrow_shift_blob {
+    SELECT cast('{"age":30,"name":"John"}' as blob) ->> '$.age'
+}
+expect {
+    30
+}
+
+test json_extract_object_2 {
+    SELECT json_extract('{"a": [1,2,3]}', '$.a', '$.a[0]', '$.a[1]', '$.a[3]')
+}
+expect {
+    [[1,2,3],1,2,null]
+}
+
+test json_extract_object_3 {
+    SELECT json_extract('{"a": [1,2,3]}', '$.a', '$.a[0]', '$.a[1]', null, '$.a[3]')
+}
+expect {
+}
+
+test json_extract_null_path {
+    SELECT json_extract(1, null)
+}
+expect {
+}
+
+test json_arrow_null_path {
+    SELECT 1 -> null
+}
+expect {
+}
+
+test json_arrow_shift_null_path {
+    SELECT 1 ->> null
+}
+expect {
+}
+
+test json_extract_float {
+  SELECT typeof(json_extract(1.0, '$'))
+}
+expect {
+    real
+}
+
+test json_arrow_float {
+  SELECT typeof(1.0 -> '$')
+}
+expect {
+    text
+}
+
+test json_arrow_shift_float {
+  SELECT typeof(1.0 ->> '$')
+}
+expect {
+    real
+}
+
+test json_extract_true {
+  SELECT json_extract('true', '$')
+}
+expect {
+    1
+}
+
+test json_extract_true_type {
+  SELECT typeof(json_extract('true', '$'))
+}
+expect {
+    integer
+}
+
+test json_arrow_true {
+  SELECT 'true' -> '$'
+}
+expect {
+    true
+}
+
+test json_arrow_true_type {
+  SELECT typeof('true' -> '$')
+}
+expect {
+    text
+}
+
+test json_arrow_shift_true {
+  SELECT 'true' ->> '$'
+}
+expect {
+    1
+}
+
+test json_arrow_shift_true_type {
+  SELECT typeof('true' ->> '$')
+}
+expect {
+    integer
+}
+
+test json_extract_false {
+  SELECT json_extract('false', '$')
+}
+expect {
+    0
+}
+
+test json_extract_false_type {
+  SELECT typeof(json_extract('false', '$'))
+}
+expect {
+    integer
+}
+
+test json_arrow_false {
+  SELECT 'false' -> '$'
+}
+expect {
+    false
+}
+
+test json_arrow_false_type {
+  SELECT typeof('false' -> '$')
+}
+expect {
+    text
+}
+
+test json_arrow_shift_false {
+  SELECT 'false' ->> '$'
+}
+expect {
+    0
+}
+
+test json_arrow_shift_false_type {
+  SELECT typeof('false' ->> '$')
+}
+expect {
+    integer
+}
+
+test json_extract_string {
+  SELECT json_extract('"string"', '$')
+}
+expect {
+    string
+}
+
+test json_extract_string_type {
+  SELECT typeof(json_extract('"string"', '$'))
+}
+expect {
+    text
+}
+
+test json_arrow_string {
+  SELECT '"string"' -> '$'
+}
+expect {
+    "string"
+}
+
+test json_arrow_string_type {
+  SELECT typeof('"string"' -> '$')
+}
+expect {
+    text
+}
+
+test json_arrow_shift_string {
+  SELECT '"string"' ->> '$'
+}
+expect {
+    string
+}
+
+test json_arrow_shift_string_type {
+  SELECT typeof('"string"' ->> '$')
+}
+expect {
+    text
+}
+
+test json_arrow_implicit_root_path {
+  SELECT '{"a":1}' -> 'a';
+}
+expect {
+    1
+}
+
+test json_arrow_shift_implicit_root_path {
+  SELECT '{"a":1}' ->> 'a';
+}
+expect {
+    1
+}
+
+test json_arrow_implicit_root_path_undefined_key {
+  SELECT '{"a":1}' -> 'x';
+}
+expect {
+}
+
+test json_arrow_shift_implicit_root_path_undefined_key {
+  SELECT '{"a":1}' ->> 'x';
+}
+expect {
+}
+
+test json_arrow_implicit_root_path_array {
+  SELECT '[1,2,3]' -> 1;
+}
+expect {
+    2
+}
+
+test json_arrow_shift_implicit_root_path_array {
+  SELECT '[1,2,3]' ->> 1;
+}
+expect {
+    2
+}
+
+test json_arrow_implicit_root_path_array_negative_idx {
+  SELECT '[1,2,3]' -> -1;
+}
+expect {
+    3
+}
+
+test json_arrow_shift_implicit_root_path_array_negative_idx {
+  SELECT '[1,2,3]' ->> -1;
+}
+expect {
+    3
+}
+
+test json_arrow_implicit_real_cast {
+  SELECT '{"1.5":"abc"}' -> 1.5;
+}
+expect {
+    "abc"
+}
+
+test json_arrow_implicit_true_cast {
+  SELECT '[1,2,3]' -> true
+}
+expect {
+    2
+}
+
+test json_arrow_shift_implicit_true_cast {
+  SELECT '[1,2,3]' ->> true
+}
+expect {
+    2
+}
+
+test json_arrow_implicit_false_cast {
+  SELECT '[1,2,3]' -> false
+}
+expect {
+    1
+}
+
+test json_arrow_shift_implicit_false_cast {
+  SELECT '[1,2,3]' ->> false
+}
+expect {
+    1
+}
+
+test json_arrow_chained {
+  select '{"a":2,"c":[4,5,{"f":7}]}' -> 'c' -> 2 ->> 'f'
+}
+expect {
+    7
+}
+
+test json_extract_multiple_null_paths {
+    SELECT json_extract(1, null, null, null)
+}
+expect {
+}
+
+test json_extract_array {
+  SELECT json_extract('[1,2,3]', '$')
+}
+expect {
+    [1,2,3]
+}
+
+test json_arrow_array {
+  SELECT '[1,2,3]' -> '$'
+}
+expect {
+    [1,2,3]
+}
+
+test json_arrow_shift_array {
+  SELECT '[1,2,3]' ->> '$'
+}
+expect {
+    [1,2,3]
+}
+
+test json_extract_quote {
+  SELECT json_extract('{"\"":1 }', '$."\""')
+}
+expect {
+    1
+}
+
+test json_extract_overflow_int32_1 {
+  SELECT json_extract('[1,2,3]', '$[4294967296]')
+}
+expect {
+    1
+}
+
+test json_extract_overflow_int32_2 {
+  SELECT json_extract('[1,2,3]', '$[4294967297]')
+}
+expect {
+    2
+}
+
+test json_extract_overflow_int32_3 {
+  SELECT json_extract('[1,2,3]', '$[#-4294967297]')
+}
+expect {
+    3
+}
+
+test json_extract_overflow_int32_4 {
+  SELECT json_extract('[1,2,3]', '$[#-4294967298]')
+}
+expect {
+    2
+}
+
+test json_extract_overflow_int64 {
+  SELECT json_extract('[1,2,3]', '$[9223372036854775808]');
+}
+expect {
+    1
+}
+
+test json_extract_blob {
+  select json_extract(CAST('[1,2,3]' as BLOB), '$[1]')
+}
+expect {
+    2
+}
+
+# json_array_length tests
+test json_array_length {
+   SELECT json_array_length('[1,2,3,4]');
+}
+expect {
+    4
+}
+
+test json_array_length_empty {
+   SELECT json_array_length('[]');
+}
+expect {
+    0
+}
+
+test json_array_length_root {
+  SELECT json_array_length('[1,2,3,4]', '$');
+}
+expect {
+    4
+}
+
+test json_array_length_not_array {
+  SELECT json_array_length('{"one":[1,2,3]}');
+}
+expect {
+    0
+}
+
+test json_array_length_via_prop {
+  SELECT json_array_length('{"one":[1,2,3]}', '$.one');
+}
+expect {
+    3
+}
+
+test json_array_length_via_index {
+  SELECT json_array_length('[[1,2,3,4]]', '$[0]');
+}
+expect {
+    4
+}
+
+test json_array_length_via_index_not_array {
+  SELECT json_array_length('[1,2,3,4]', '$[2]');
+}
+expect {
+    0
+}
+
+test json_array_length_via_bad_prop {
+  SELECT json_array_length('{"one":[1,2,3]}', '$.two');
+}
+expect {
+}
+
+test json_array_length_nested {
+  SELECT json_array_length('{"one":[[1,2,3],2,3]}', '$.one[0]');
+}
+expect {
+    3
+}
+
+# json_type tests
+test json_type_no_path {
+  select json_type('{"a":[2,3.5,true,false,null,"x"]}')
+}
+expect {
+    object
+}
+
+test json_type_root_path {
+  select json_type('{"a":[2,3.5,true,false,null,"x"]}','$')
+}
+expect {
+    object
+}
+
+test json_type_array {
+  select json_type('{"a":[2,3.5,true,false,null,"x"]}','$.a')
+}
+expect {
+    array
+}
+
+test json_type_integer {
+  select json_type('{"a":[2,3.5,true,false,null,"x"]}','$.a[0]')
+}
+expect {
+    integer
+}
+
+test json_type_real {
+  select json_type('{"a":[2,3.5,true,false,null,"x"]}','$.a[1]')
+}
+expect {
+    real
+}
+
+test json_type_true {
+  select json_type('{"a":[2,3.5,true,false,null,"x"]}','$.a[2]')
+}
+expect {
+    true
+}
+
+test json_type_false {
+  select json_type('{"a":[2,3.5,true,false,null,"x"]}','$.a[3]')
+}
+expect {
+    false
+}
+
+test json_type_null {
+  select json_type('{"a":[2,3.5,true,false,null,"x"]}','$.a[4]')
+}
+expect {
+    null
+}
+
+test json_type_text {
+  select json_type('{"a":[2,3.5,true,false,null,"x"]}','$.a[5]')
+}
+expect {
+    text
+}
+
+test json_type_NULL {
+  select json_type('{"a":[2,3.5,true,false,null,"x"]}','$.a[6]')
+}
+expect {
+}
+
+test json_type_cast {
+  select json_type(1)
+}
+expect {
+    integer
+}
+
+test json_type_null_arg {
+  select json_type(null)
+}
+expect {
+}
+
+test json_type_blob_with_trailing_bytes {
+  select json_type(x'7B2261223A317D00FF')
+}
+expect {
+    object
+}
+
+# json_error_position tests
+test json_error_position_valid {
+  SELECT json_error_position('{"a":55,"b":72,}');
+}
+expect {
+    0
+}
+
+test json_error_position_valid_ws {
+  SELECT json_error_position('{"a":55,"b":72 , }');
+}
+expect {
+    0
+}
+
+test json_error_position_object {
+  SELECT json_error_position('{"a":55,"b":72,,}');
+}
+expect {
+    16
+}
+
+test json_error_position_array_valid {
+  SELECT json_error_position('["a",55,"b",72,]');
+}
+expect {
+    0
+}
+
+test json_error_position_array_valid_ws {
+  SELECT json_error_position('["a",55,"b",72 , ]');
+}
+expect {
+    0
+}
+
+test json_error_position_array {
+  SELECT json_error_position('["a",55,"b",72,,]');
+}
+expect {
+    16
+}
+
+test json_error_position_null {
+  SELECT json_error_position(NULL);
+}
+expect {
+}
+
+test json_error_position_complex {
+  SELECT json_error_position('{a:null,{"h":[1,[1,2,3]],"j":"abc"}:true}');
+}
+expect {
+    9
+}
+
+# json_object tests
+test json_object_simple {
+  SELECT json_object('key', 'value');
+}
+expect {
+    {"key":"value"}
+}
+
+test json_object_f64 {
+  SELECT json_object('key', 40.7128);
+}
+expect {
+    {"key":40.7128}
+}
+
+test json_object_nested {
+  SELECT json_object('grandparent',json_object('parent', json_object('child', 'value')));
+}
+expect {
+    {"grandparent":{"parent":{"child":"value"}}}
+}
+
+test json_object_quoted_json {
+  SELECT json_object('parent', '{"child":"value"}');
+}
+expect {
+    {"parent":"{\"child\":\"value\"}"}
+}
+
+test json_object_unquoted_json {
+  SELECT json_object('parent', json('{"child":"value"}'));
+}
+expect {
+    {"parent":{"child":"value"}}
+}
+
+test json_object_multiple_values {
+    SELECT json_object('text', 'value', 'json', json_object('key', 'value'), 'int', 1, 'float', 1.5, 'null', null);
+}
+expect {
+    {"text":"value","json":{"key":"value"},"int":1,"float":1.5,"null":null}
+}
+
+test json_object_empty {
+  SELECT json_object();
+}
+expect {
+    {}
+}
+
+test json_object_json_array {
+    SELECT json_object('ex',json('[52,3]'));
+}
+expect {
+    {"ex":[52,3]}
+}
+
+test json_from_json_object {
+    SELECT json(json_object('key','value'));
+}
+expect {
+    {"key":"value"}
+}
+
+test json_object_duplicated_keys {
+    SELECT json_object('key', 'value', 'key', 'value2');
+}
+expect {
+    {"key":"value","key":"value2"}
+}
+
+# json_valid tests
+test json_valid_1 {
+   SELECT json_valid('{"a":55,"b":72}');
+}
+expect {
+    1
+}
+
+test json_valid_2 {
+   SELECT json_valid('["a",55,"b",72]');
+}
+expect {
+    1
+}
+
+test json_valid_3 {
+   SELECT json_valid( CAST('{"a":"1}' AS BLOB) );
+}
+expect {
+    0
+}
+
+test json_valid_4 {
+  SELECT json_valid(123);
+}
+expect {
+    1
+}
+
+test json_valid_5 {
+  SELECT json_valid(12.3);
+}
+expect {
+    1
+}
+
+test json_valid_6 {
+  SELECT json_valid('not a valid json');
+}
+expect {
+    0
+}
+
+test json_valid_7 {
+   SELECT json_valid('{"a":"55,"b":72}');
+}
+expect {
+    0
+}
+
+test json_valid_8 {
+   SELECT json_valid('{"a":55 "b":72}');
+}
+expect {
+    0
+}
+
+test json_valid_9 {
+    SELECT json_valid(NULL);
+}
+expect {
+}
+
+test json_valid_blob_embedded_null {
+   SELECT json_valid(x'7B226100223A317D');
+}
+expect {
+    0
+}
+
+# json_patch tests
+test json-patch-basic-1 {
+    select json_patch('{"a":1}', '{"b":2}');
+}
+expect {
+    {"a":1,"b":2}
+}
+
+test json-patch-basic-2 {
+    select json_patch('{"x":100,"y":200}', '{"z":300}');
+}
+expect {
+    {"x":100,"y":200,"z":300}
+}
+
+test json-patch-override-1 {
+    select json_patch('{"a":1,"b":2}', '{"b":3}');
+}
+expect {
+    {"a":1,"b":3}
+}
+
+test json-patch-nested-1 {
+    select json_patch('{"user":{"name":"john"}}', '{"user":{"age":30}}');
+}
+expect {
+    {"user":{"name":"john","age":30}}
+}
+
+test json-patch-array-1 {
+    select json_patch('{"arr":[1,2,3]}', '{"arr":[4,5,6]}');
+}
+expect {
+    {"arr":[4,5,6]}
+}
+
+test json-patch-empty-1 {
+    select json_patch('{}', '{"a":1}');
+}
+expect {
+    {"a":1}
+}
+
+test json-patch-empty-2 {
+    select json_patch('{"a":1}', '{}');
+}
+expect {
+    {"a":1}
+}
+
+# json_remove tests
+test json-remove-1 {
+    select json_remove('{"a": 5, "a": [5,4,3,2,1]}','$.a', '$.a[4]', '$.a[5]', '$.a');
+}
+expect {
+    {}
+}
+
+test json-remove-5 {
+    SELECT json_remove('{}', '$.a');
+}
+expect {
+    {}
+}
+
+test json-remove-7 {
+    SELECT json_remove('{"a": 1, "b": [1,2], "c": {"d": 3}}', '$.a', '$.b[0]', '$.c.d');
+}
+expect {
+    {"b":[2],"c":{}}
+}
+
+# json_set tests
+test json_set_field_empty_object {
+   SELECT json_set('{}', '$.field', 'value');
+}
+expect {
+    {"field":"value"}
+}
+
+test json_set_replace_field {
+   SELECT json_set('{"field":"old_value"}', '$.field', 'new_value');
+}
+expect {
+    {"field":"new_value"}
+}
+
+test json_set_set_deeply_nested_key {
+   SELECT json_set('{}', '$.object.doesnt.exist', 'value');
+}
+expect {
+    {"object":{"doesnt":{"exist":"value"}}}
+}
+
+test json_set_add_value_to_empty_array {
+   SELECT json_set('[]', '$[0]', 'value');
+}
+expect {
+    ["value"]
+}
+
+test json_set_add_value_to_nonexistent_array {
+   SELECT json_set('{}', '$.some_array[0]', 123);
+}
+expect {
+    {"some_array":[123]}
+}
+
+test json_set_add_value_to_array {
+   SELECT json_set('[123]', '$[1]', 456);
+}
+expect {
+    [123,456]
+}
+
+test json_set_add_value_to_array_out_of_bounds {
+   SELECT json_set('[123]', '$[200]', 456);
+}
+expect {
+    [123]
+}
+
+test json_set_replace_value_in_array {
+   SELECT json_set('[123]', '$[0]', 456);
+}
+expect {
+    [456]
+}
+
+test json_set_null_path {
+   SELECT json_set('{}', NULL, 456);
+}
+expect {
+    {}
+}
+
+test json_set_multiple_keys {
+   SELECT json_set('[123]', '$[0]', 456, '$[1]', 789);
+}
+expect {
+    [456,789]
+}
+
+# json_insert tests
+test json_insert_new_key_in_nested_object {
+   SELECT json_insert('{"a": {"b": {"c": 5}}}', '$.a.b.d', 10);
+}
+expect {
+    {"a":{"b":{"c":5,"d":10}}}
+}
+
+test json_insert_existing_key_not_replaced {
+   SELECT json_insert('{"a": 1}', '$.a', 2);
+}
+expect {
+    {"a":1}
+}
+
+test json_insert_new_key_simple {
+   SELECT json_insert('{"a": 1}', '$.b', 2);
+}
+expect {
+    {"a":1,"b":2}
+}
+
+test json_insert_array_append {
+   SELECT json_insert('[1, 2, 3]', '$[3]', 4);
+}
+expect {
+    [1,2,3,4]
+}
+
+test json_insert_array_existing_not_replaced {
+   SELECT json_insert('[1, 2, 3]', '$[1]', 99);
+}
+expect {
+    [1,2,3]
+}
+
+test json_insert_multiple_paths {
+   SELECT json_insert('{"a": 1}', '$.b', 2, '$.c', 3);
+}
+expect {
+    {"a":1,"b":2,"c":3}
+}
+
+# json_quote tests
+test json_quote_string_literal {
+  SELECT json_quote('abc"xyz');
+}
+expect {
+    "abc\"xyz"
+}
+
+test json_quote_float {
+  SELECT json_quote(3.14159);
+}
+expect {
+    3.14159
+}
+
+test json_quote_integer {
+  SELECT json_quote(12345);
+}
+expect {
+    12345
+}
+
+test json_quote_null {
+  SELECT json_quote(null);
+}
+expect {
+    "null"
+}
+
+test json_quote_null_caps {
+  SELECT json_quote(NULL);
+}
+expect {
+    null
+}
+
+test json_quote_json_value {
+  SELECT json_quote(json('{a:1, b: "test"}'));
+}
+expect {
+    {"a":1,"b":"test"}
+}
+
+# jsonb tests
+test json_basics {
+  SELECT json(jsonb('{"name":"John", "age":30, "city":"New York"}'));
+}
+expect {
+    {"name":"John","age":30,"city":"New York"}
+}
+
+test json_complex_nested {
+  SELECT json(jsonb('{"complex": {"nested": ["array", "of", "values"], "numbers": [1, 2, 3]}}'));
+}
+expect {
+    {"complex":{"nested":["array","of","values"],"numbers":[1,2,3]}}
+}
+
+test json_array_of_objects {
+  SELECT json(jsonb('[{"id": 1, "data": "value1"}, {"id": 2, "data": "value2"}]'));
+}
+expect {
+    [{"id":1,"data":"value1"},{"id":2,"data":"value2"}]
+}
+
+test json_value_types {
+  SELECT json(jsonb('{"boolean": true, "null_value": null, "number": 42.5}'));
+}
+expect {
+    {"boolean":true,"null_value":null,"number":42.5}
+}
+
+test json_deeply_nested {
+  SELECT json(jsonb('{"deeply": {"nested": {"structure": {"with": "values"}}}}'));
+}
+expect {
+    {"deeply":{"nested":{"structure":{"with":"values"}}}}
+}
+
+test json_trailing_commas {
+  SELECT json(jsonb('{"items": ["one", "two", "three",], "status": "complete",}'));
+}
+expect {
+    {"items":["one","two","three"],"status":"complete"}
+}
+
+test json_unquoted_keys {
+  SELECT json(jsonb('{name: "Alice", age: 25}'));
+}
+expect {
+    {"name":"Alice","age":25}
+}
+
+# json_replace tests
+test json_replace_basic_1 {
+    SELECT json_replace('{"a": 1, "b": 2}', '$.a', 42)
+}
+expect {
+    {"a":42,"b":2}
+}
+
+test json_replace_basic_2 {
+    SELECT json_replace('{"a": 1, "b": 2}', '$.c', 3)
+}
+expect {
+    {"a":1,"b":2}
+}
+
+test json_replace_multiple_paths {
+    SELECT json_replace('{"a": 1, "b": 2, "c": 3}', '$.a', 10, '$.c', 30)
+}
+expect {
+    {"a":10,"b":2,"c":30}
+}
+
+test json_replace_string {
+    SELECT json_replace('{"name": "Alice"}', '$.name', 'Bob')
+}
+expect {
+    {"name":"Bob"}
+}
+
+test json_replace_with_null {
+    SELECT json_replace('{"a": 1, "b": 2}', '$.a', NULL)
+}
+expect {
+    {"a":null,"b":2}
+}
+
+test json_replace_array_element {
+    SELECT json_replace('[1, 2, 3, 4]', '$[1]', 99)
+}
+expect {
+    [1,99,3,4]
+}
+
+test json_replace_array_negative_index {
+    SELECT json_replace('[1, 2, 3, 4]', '$[#-1]', 99)
+}
+expect {
+    [1,2,3,99]
+}
+
+test json_replace_array_out_of_bounds {
+    SELECT json_replace('[1, 2, 3]', '$[5]', 99)
+}
+expect {
+    [1,2,3]
+}
+
+test json_replace_nested_object {
+    SELECT json_replace('{"user": {"name": "Alice", "age": 30}}', '$.user.age', 31)
+}
+expect {
+    {"user":{"name":"Alice","age":31}}
+}
+
+test json_replace_nested_array {
+    SELECT json_replace('{"data": [10, 20, 30]}', '$.data[1]', 99)
+}
+expect {
+    {"data":[10,99,30]}
+}
+
+test json_replace_empty_object {
+    SELECT json_replace('{}', '$.anything', 42)
+}
+expect {
+    {}
+}
+
+test json_replace_empty_array {
+    SELECT json_replace('[]', '$[0]', 42)
+}
+expect {
+    []
+}
+
+# json_remove tests (additional)
+test json_remove_basic_1 {
+    SELECT json_remove('{"a": 1, "b": 2, "c": 3}', '$.b')
+}
+expect {
+    {"a":1,"c":3}
+}
+
+test json_remove_basic_2 {
+    SELECT json_remove('{"a": 1, "b": 2}', '$.c')
+}
+expect {
+    {"a":1,"b":2}
+}
+
+test json_remove_multiple_paths {
+    SELECT json_remove('{"a": 1, "b": 2, "c": 3, "d": 4}', '$.a', '$.c')
+}
+expect {
+    {"b":2,"d":4}
+}
+
+test json_remove_array_element {
+    SELECT json_remove('[1, 2, 3, 4]', '$[1]')
+}
+expect {
+    [1,3,4]
+}
+
+test json_remove_array_negative_index {
+    SELECT json_remove('[1, 2, 3, 4]', '$[#-1]')
+}
+expect {
+    [1,2,3]
+}
+
+test json_remove_empty_object {
+    SELECT json_remove('{}', '$.anything')
+}
+expect {
+    {}
+}
+
+test json_remove_empty_array {
+    SELECT json_remove('[]', '$[0]')
+}
+expect {
+    []
+}
+
+test json_remove_root {
+    SELECT json_remove('{"a": 1}', '$')
+}
+expect {
+}
+
+# json_each tests
+setup json-each-test-setup {
+    SELECT 1;
+}
+
+test json_each_arrays_heterogeneous_primitives {
+  SELECT key, atom, type, fullkey, path, typeof(key) AS ktype
+  FROM json_each('[1, 2.5, "x", true, false, null]')
+  ORDER BY key;
+}
+expect {
+    0|1|integer|$[0]|$|integer
+    1|2.5|real|$[1]|$|integer
+    2|x|text|$[2]|$|integer
+    3|1|true|$[3]|$|integer
+    4|0|false|$[4]|$|integer
+    5||null|$[5]|$|integer
+}
+
+test json_each_arrays_parent_is_always_null {
+  SELECT COUNT(*) FROM json_each('[0,1,2]') WHERE parent IS NOT NULL;
+}
+expect {
+    0
+}
+
+test json_each_arrays_id_uniqueness {
+  SELECT COUNT(*), COUNT(DISTINCT id)
+  FROM json_each('[10,20,30,40]');
+}
+expect {
+    4|4
+}
+
+test json_each_arrays_empty_container_yields_zero_rows {
+  SELECT COUNT(*) FROM json_each('[]');
+}
+expect {
+    0
+}
+
+test json_each_objects_empty_container_yields_zero_rows {
+  SELECT COUNT(*) FROM json_each('{}');
+}
+expect {
+    0
+}
+
+test json_each_top_level_integer_single_row_key_null {
+  SELECT (key IS NULL), fullkey, path, atom, type
+  FROM json_each('42');
+}
+expect {
+    1|$|$|42|integer
+}
+
+test json_each_top_level_true_single_row_key_null {
+  SELECT (key IS NULL), fullkey, path, atom, type
+  FROM json_each('true');
+}
+expect {
+    1|$|$|1|true
+}
+
+test json_each_top_level_null_single_row_key_null {
+  SELECT (key IS NULL), fullkey, path, (atom IS NULL), type
+  FROM json_each('null');
+}
+expect {
+    1|$|$|1|null
+}
+
+test json_each_parent_column_always_null {
+  SELECT COUNT(*) FROM json_each('{"a":[1,2,3],"b":{}}') WHERE parent IS NOT NULL;
+}
+expect {
+    0
+}
+
+test json_each_malformed_json_raises_error {
+  SELECT * FROM json_each('{not json}');
+}
+expect error { malformed JSON }
+
+test json_each_object_member_order_preserved {
+  SELECT key FROM json_each('{"z":0,"a":1,"m":2}');
+}
+expect {
+    z
+    a
+    m
+}
+
+test json-each-2arg-nonexistent-path-returns-no-rows {
+  SELECT count(*) FROM json_each('{"a":1}', '$.missing');
+}
+expect {
+    0
+}
+
+test json-each-2arg-empty-array {
+  SELECT count(*) FROM json_each('{"a":[]}', '$.a');
+}
+expect {
+    0
+}
+
+test json-each-2arg-empty-object {
+  SELECT count(*) FROM json_each('{"o":{}}', '$.o');
+}
+expect {
+    0
+}
+
+test json-each-no-arguments {
+  SELECT * FROM json_each();
+}
+expect {
+}
+
+test json_each_3_arguments {
+  SELECT * FROM json_each(1, 2, 3);
+}
+expect error { }
+
+# json_tree tests
+test json-tree-1arg-primitive-root-null-single-row {
+  SELECT typeof(key), typeof(value), type, fullkey, path
+  FROM json_tree('null');
+}
+expect {
+    null|null|null|$|$
+}
+
+test json-tree-1arg-primitive-root-true-single-row {
+  SELECT typeof(key), value, type, atom, fullkey, path
+  FROM json_tree('true');
+}
+expect {
+    null|1|true|1|$|$
+}
+
+test json-tree-1arg-primitive-root-false-single-row {
+  SELECT typeof(key), value, type, atom, fullkey, path
+  FROM json_tree('false');
+}
+expect {
+    null|0|false|0|$|$
+}
+
+test json-tree-1arg-primitive-root-integer-single-row {
+  SELECT typeof(key), value, type, atom, fullkey, path
+  FROM json_tree('42');
+}
+expect {
+    null|42|integer|42|$|$
+}
+
+test json-tree-1arg-primitive-root-real-single-row {
+  SELECT typeof(key), value, type, atom, fullkey, path
+  FROM json_tree('3.14');
+}
+expect {
+    null|3.14|real|3.14|$|$
+}
+
+test json-tree-1arg-primitive-root-text-single-row {
+  SELECT typeof(key), value, type, atom, fullkey, path
+  FROM json_tree('"hi"');
+}
+expect {
+    null|hi|text|hi|$|$
+}
+
+test json-tree-2arg-nonexistent-path-returns-no-rows {
+  SELECT count(*) FROM json_tree('{"a":1}', '$.missing');
+}
+expect {
+    0
+}
+
+test json-tree-2arg-empty-array {
+  SELECT count(*) FROM json_tree('{"a":[]}', '$.a');
+}
+expect {
+    1
+}
+
+test json-tree-2arg-empty-object {
+  SELECT count(*) FROM json_tree('{"o":{}}', '$.o');
+}
+expect {
+    1
+}
+
+test json-tree-count-includes-containers-and-leaves {
+  SELECT count(*) FROM json_tree('{"a":[1,2,3],"b":{"c":4}}');
+}
+expect {
+    7
+}
+
+test json-tree-id-uniqueness {
+  SELECT count(DISTINCT id)=count(*)
+  FROM json_tree('{"a":[1,2],"b":3}');
+}
+expect {
+    1
+}
+
+test json-tree-non-string-path {
+  SELECT * FROM json_tree('{}', 123);
+}
+expect error {}
+
+test json-tree-invalid-path {
+  SELECT * FROM json_tree('{}', '$$$');
+}
+expect error {}
+
+test json-tree-no-arguments {
+  SELECT * FROM json_tree();
+}
+expect {
+}
+
+test json_tree_3_arguments {
+  SELECT * FROM json_tree(1, 2, 3);
+}
+expect error { }
+

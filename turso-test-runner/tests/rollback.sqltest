@@ -1,0 +1,266 @@
+# Rollback Tests
+# Ported from testing/rollback.test
+
+@database :memory:
+
+# Simple rollback
+setup simple-rollback {
+    create table t (x);
+    insert into t values (1);
+}
+
+@setup simple-rollback
+test simple-rollback {
+    begin;
+    insert into t values (2);
+    rollback;
+    select * from t;
+}
+expect {
+    1
+}
+
+# Simple rollback 2
+setup simple-rollback-2 {
+    create table t (x);
+}
+
+@setup simple-rollback-2
+test simple-rollback-2 {
+    begin;
+    insert into t values (1);
+    insert into t values (2);
+    rollback;
+    select * from t;
+}
+expect {
+}
+
+# Rollback after update
+setup rollback-after-update {
+    create table t (x);
+    insert into t values (1);
+    insert into t values (2);
+}
+
+@setup rollback-after-update
+test rollback-after-update {
+    begin;
+    update t set x = x + 10;
+    rollback;
+    select * from t;
+}
+expect {
+    1
+    2
+}
+
+# Rollback after delete
+setup rollback-after-delete {
+    create table t (x);
+    insert into t values (1);
+    insert into t values (2);
+    insert into t values (3);
+}
+
+@setup rollback-after-delete
+test rollback-after-delete {
+    begin;
+    delete from t where x = 2;
+    rollback;
+    select * from t order by x;
+}
+expect {
+    1
+    2
+    3
+}
+
+# Rollback mixed operations
+setup rollback-mixed-operations {
+    create table t (x);
+    insert into t values (1);
+    insert into t values (2);
+}
+
+@setup rollback-mixed-operations
+test rollback-mixed-operations {
+    begin;
+    insert into t values (3);
+    update t set x = x + 10 where x = 1;
+    delete from t where x = 2;
+    rollback;
+    select * from t order by x;
+}
+expect {
+    1
+    2
+}
+
+# Insert after rollback
+setup insert-after-rollback {
+    create table t (x);
+    create table t2 (x);
+    insert into t values (1);
+    insert into t values (2);
+}
+
+@setup insert-after-rollback
+test insert-after-rollback {
+    begin;
+    insert into t values (3);
+    update t set x = x + 10 where x = 1;
+    delete from t where x = 2;
+    rollback;
+    insert into t2 values (1);
+    select * from t2 order by x;
+}
+expect {
+    1
+}
+
+# Schema change rollback
+setup schema-change-rollback {
+    SELECT 1;
+}
+
+@setup schema-change-rollback
+test schema-change-rollback {
+    begin;
+    create table t (x);
+    insert into t values (1);
+    rollback;
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
+# Schema change rollback version
+setup schema-change-rollback-version {
+    SELECT 1;
+}
+
+@setup schema-change-rollback-version
+test schema-change-rollback-version {
+    begin;
+    create table t (x);
+    insert into t values (1);
+    rollback;
+    PRAGMA schema_version;
+}
+expect {
+    0
+}
+
+# Schema version after update
+setup schema-version-after-update {
+    SELECT 1;
+}
+
+@setup schema-version-after-update
+test schema-version-after-update {
+    create table t (x);
+    PRAGMA schema_version;
+}
+expect {
+    1
+}
+
+# Schema change rollback 2
+setup schema-change-rollback-2 {
+    SELECT 1;
+}
+
+@setup schema-change-rollback-2
+test schema-change-rollback-2 {
+    begin;
+    create table t (x);
+    rollback;
+    select tbl_name from sqlite_schema;
+}
+expect {
+}
+
+# Schema change rollback 3
+setup schema-change-rollback-3 {
+    create table before (x);
+}
+
+@setup schema-change-rollback-3
+test schema-change-rollback-3 {
+    begin;
+    create table t (x);
+    rollback;
+    create table after (x);
+    select tbl_name from sqlite_schema;
+}
+expect {
+    before
+    after
+}
+
+# Schema alter rollback
+setup schema-alter-rollback {
+    create table t (x);
+}
+
+@setup schema-alter-rollback
+test schema-alter-rollback {
+    begin;
+    alter table t add column y;
+    rollback;
+    select sql from sqlite_schema;
+}
+expect {
+    CREATE TABLE t (x)
+}
+
+# Schema alter rollback and repeat
+setup schema-alter-rollback-and-repeat {
+    create table t (x);
+}
+
+@setup schema-alter-rollback-and-repeat
+test schema-alter-rollback-and-repeat {
+    begin;
+    alter table t add column y;
+    rollback;
+    alter table t add column y;
+    select sql from sqlite_schema;
+}
+expect {
+    CREATE TABLE t (x, y)
+}
+
+# Schema create index rollback
+setup schema-create-index-rollback {
+    create table t (x);
+}
+
+@setup schema-create-index-rollback
+test schema-create-index-rollback {
+    begin;
+    create index i on t(x);
+    rollback;
+    select sql from sqlite_schema;
+}
+expect {
+    CREATE TABLE t (x)
+}
+
+# Schema drop table rollback
+setup schema-drop-table-rollback {
+    create table t (x);
+}
+
+@setup schema-drop-table-rollback
+test schema-drop-table-rollback {
+    begin;
+    drop table t;
+    rollback;
+    select sql from sqlite_schema;
+}
+expect {
+    CREATE TABLE t (x)
+}

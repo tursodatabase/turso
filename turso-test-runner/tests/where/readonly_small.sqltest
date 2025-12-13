@@ -1,0 +1,80 @@
+# WHERE Tests (Readonly Small - demo table)
+# Ported from testing/where.test
+
+@database testing/testing_small.db readonly
+
+# NULL comparisons with demo table
+test where-is-null {
+    select count(*) from demo where value is null;
+}
+expect {
+    2
+}
+
+test where-equals-null {
+    select count(*) from demo where value = null;
+}
+expect {
+    0
+}
+
+test where-is-not-null {
+    select count(*) from demo where value is not null;
+}
+expect {
+    3
+}
+
+test where-not-equal-null {
+    select count(*) from demo where value != null;
+}
+expect {
+    0
+}
+
+test where-is-a-with-nulls {
+    select count(*) from demo where value is 'A';
+}
+expect {
+    1
+}
+
+test where-equals-a-with-nulls {
+    select count(*) from demo where value == 'A';
+}
+expect {
+    1
+}
+
+test where-is-not-a-with-nulls {
+    select count(*) from demo where value is not 'A';
+}
+expect {
+    4
+}
+
+test where-not-equals-a-with-nulls {
+    select count(*) from demo where value != 'A';
+}
+expect {
+    2
+}
+
+test where-is-null-combined {
+    select * from demo where value is null or id = 3;
+}
+expect {
+    2|
+    3|B
+    4|
+}
+
+test where-is-not-null-combined {
+    select * from demo where value is not null or id = 2;
+}
+expect {
+    1|A
+    2|
+    3|B
+    5|C
+}

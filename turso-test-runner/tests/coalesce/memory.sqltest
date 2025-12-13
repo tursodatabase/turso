@@ -1,0 +1,48 @@
+# Coalesce Tests (Memory)
+# Ported from testing/coalesce.test
+
+@database :memory:
+
+test coalesce {
+    SELECT coalesce(NULL, 1);
+}
+expect {
+    1
+}
+
+test coalesce-2 {
+    SELECT coalesce(NULL, NULL, 1);
+}
+expect {
+    1
+}
+
+test coalesce-nested {
+    SELECT coalesce(NULL, coalesce(NULL, NULL));
+}
+expect {
+}
+
+test coalesce-nested-2 {
+    SELECT coalesce(NULL, coalesce(NULL, 2));
+    SELECT coalesce(NULL, coalesce(1, 2));
+    SELECT coalesce(0, coalesce(1, 2));
+}
+expect {
+    2
+    1
+    0
+}
+
+test coalesce-null {
+    SELECT coalesce(NULL, NULL, NULL);
+}
+expect {
+}
+
+test coalesce-first {
+    SELECT coalesce(1, 2, 3);
+}
+expect {
+    1
+}

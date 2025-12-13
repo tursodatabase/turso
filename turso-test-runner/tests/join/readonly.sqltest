@@ -1,0 +1,436 @@
+# JOIN Tests (Readonly - uses products/users tables)
+# Ported from testing/join.test
+
+@database testing/testing.db readonly
+
+test cross-join {
+    select * from users, products limit 1;
+}
+expect {
+    1|Jamie|Foster|dylan00@example.com|496-522-9493|62375 Johnson Rest Suite 322|West Lauriestad|IL|35865|94|1|hat|79.0
+}
+
+test cross-join-specific-columns {
+    select first_name, price from users, products limit 1;
+}
+expect {
+    Jamie|79.0
+}
+
+test cross-join-where-right-tbl {
+    select users.first_name, products.name from users join products where products.id = 1 limit 2;
+}
+expect {
+    Jamie|hat
+    Cindy|hat
+}
+
+test cross-join-where-left-tbl {
+    select users.first_name, products.name from users join products where users.id = 1 limit 2;
+}
+expect {
+    Jamie|hat
+    Jamie|cap
+}
+
+test inner-join-pk {
+    select users.first_name as user_name, products.name as product_name from users join products on users.id = products.id;
+}
+expect {
+    Jamie|hat
+    Cindy|cap
+    Tommy|shirt
+    Jennifer|sweater
+    Edward|sweatshirt
+    Nicholas|shorts
+    Aimee|jeans
+    Rachel|sneakers
+    Matthew|boots
+    Daniel|coat
+    Travis|accessories
+}
+
+test inner-join-non-pk-unqualified {
+    select first_name, name from users join products on first_name != name limit 1;
+}
+expect {
+    Jamie|hat
+}
+
+test inner-join-non-pk-qualified {
+    select users.first_name as user_name, products.name as product_name from users join products on users.first_name = products.name;
+}
+expect {
+}
+
+test inner-join-self {
+    select u1.first_name as user_name, u2.first_name as neighbor_name from users u1 join users as u2 on u1.id = u2.id + 1 limit 1;
+}
+expect {
+    Cindy|Jamie
+}
+
+test inner-join-self-with-where {
+    select u1.first_name as user_name, u2.first_name as neighbor_name from users u1 join users as u2 on u1.id = u2.id + 1 where u1.id = 5 limit 1;
+}
+expect {
+    Edward|Jennifer
+}
+
+test inner-join-constant-condition-true {
+    select u.first_name, p.name from users u join products as p where 1 limit 5;
+}
+expect {
+    Jamie|hat
+    Jamie|cap
+    Jamie|shirt
+    Jamie|sweater
+    Jamie|sweatshirt
+}
+
+test inner-join-constant-condition-false {
+    select u.first_name from users u join products as p where 0 limit 5;
+}
+expect {
+}
+
+test left-join-pk {
+    select users.first_name as user_name, products.name as product_name from users left join products on users.id = products.id limit 12;
+}
+expect {
+    Jamie|hat
+    Cindy|cap
+    Tommy|shirt
+    Jennifer|sweater
+    Edward|sweatshirt
+    Nicholas|shorts
+    Aimee|jeans
+    Rachel|sneakers
+    Matthew|boots
+    Daniel|coat
+    Travis|accessories
+    Alan|
+}
+
+test left-join-with-where {
+    select u.first_name, p.name from users u left join products as p on u.id = p.id where u.id >= 10 limit 5;
+}
+expect {
+    Daniel|coat
+    Travis|accessories
+    Alan|
+    Michael|
+    Brianna|
+}
+
+test left-join-with-where-2 {
+    select users.first_name, products.name from users left join products on users.id < 2 where users.id < 3;
+}
+expect {
+    Jamie|hat
+    Jamie|cap
+    Jamie|shirt
+    Jamie|sweater
+    Jamie|sweatshirt
+    Jamie|shorts
+    Jamie|jeans
+    Jamie|sneakers
+    Jamie|boots
+    Jamie|coat
+    Jamie|accessories
+    Cindy|
+}
+
+test left-join-with-where-right-table {
+    select users.id, price
+    from users left join products on users.id = products.id
+    where products.price is not null
+    order by users.id;
+}
+expect {
+    1|79.0
+    2|82.0
+    3|18.0
+    4|25.0
+    5|74.0
+    6|70.0
+    7|78.0
+    8|82.0
+    9|1.0
+    10|33.0
+    11|81.0
+}
+
+test left-join-row-id {
+    select u.rowid, p.rowid from users u left join products as p on u.rowid = p.rowid where u.rowid >= 10 limit 5;
+}
+expect {
+    10|10
+    11|11
+    12|
+    13|
+    14|
+}
+
+test left-join-constant-condition-true {
+    select u.first_name, p.name from users u left join products as p on true limit 1;
+}
+expect {
+    Jamie|hat
+}
+
+test left-join-constant-condition-false {
+    select u.first_name, p.name from users u left join products as p on false limit 1;
+}
+expect {
+    Jamie|
+}
+
+test left-join-constant-condition-where-false {
+    select u.first_name, p.name from users u left join products as p where false limit 1;
+}
+expect {
+}
+
+test left-join-non-pk {
+    select users.first_name as user_name, products.name as product_name from users left join products on users.first_name = products.name limit 3;
+}
+expect {
+    Jamie|
+    Cindy|
+    Tommy|
+}
+
+test left-join-self {
+    select u1.first_name as user_name, u2.first_name as neighbor_name from users u1 left join users as u2 on u1.id = u2.id + 1 limit 2;
+}
+expect {
+    Jamie|
+    Cindy|Jamie
+}
+
+test left-join-self-2 {
+    select u1.first_name as user_name, u2.first_name as neighbor_name from users u1 left join users as u2 on u2.id = u1.id + 1 limit 2;
+}
+expect {
+    Jamie|Cindy
+    Cindy|Tommy
+}
+
+test left-join-self-with-where {
+    select u1.first_name as user_name, u2.first_name as neighbor_name from users u1 left join users as u2 on u1.id = u2.id + 1 where u1.id = 5 limit 2;
+}
+expect {
+    Edward|Jennifer
+}
+
+test left-join-multiple-cond-and {
+    select u.first_name, p.name from users u left join products as p on u.id = p.id and u.first_name = p.name limit 2;
+}
+expect {
+    Jamie|
+    Cindy|
+}
+
+test left-join-multiple-cond-or {
+    select u.first_name, p.name from users u left join products as p on u.id = p.id or u.first_name = p.name limit 2;
+}
+expect {
+    Jamie|hat
+    Cindy|cap
+}
+
+test left-join-no-join-conditions-but-multiple-where {
+    select u.first_name, p.name from users u left join products as p where u.id = p.id or u.first_name = p.name limit 2;
+}
+expect {
+    Jamie|hat
+    Cindy|cap
+}
+
+test left-join-order-by-qualified {
+    select users.first_name, products.name from users left join products on users.id = products.id where users.first_name like 'Jam%' order by null limit 2;
+}
+expect {
+    Jamie|hat
+    James|
+}
+
+test left-join-order-by-qualified-nullable-sorting-col {
+    select users.first_name, products.name from users left join products on users.id = products.id order by products.name limit 1;
+}
+expect {
+    Alan|
+}
+
+test left-join-constant-condition-true-2 {
+    select u.first_name, p.name from users u left join products as p on 1 limit 5;
+}
+expect {
+    Jamie|hat
+    Jamie|cap
+    Jamie|shirt
+    Jamie|sweater
+    Jamie|sweatshirt
+}
+
+test left-join-constant-condition-false-2 {
+    select u.first_name, p.name from users u left join products as p on 0 limit 5;
+}
+expect {
+    Jamie|
+    Cindy|
+    Tommy|
+    Jennifer|
+    Edward|
+}
+
+test four-way-inner-join {
+    select u1.first_name, u2.first_name, u3.first_name, u4.first_name from users u1 join users u2 on u1.id = u2.id join users u3 on u2.id = u3.id + 1 join users u4 on u3.id = u4.id + 1 limit 1;
+}
+expect {
+    Tommy|Tommy|Cindy|Jamie
+}
+
+test three-way-inner-join-with-two-seeks {
+    select * from users u join users u2 on u.id=u2.id join products p on u2.id = p.id limit 3;
+}
+expect {
+    1|Jamie|Foster|dylan00@example.com|496-522-9493|62375 Johnson Rest Suite 322|West Lauriestad|IL|35865|94|1|Jamie|Foster|dylan00@example.com|496-522-9493|62375 Johnson Rest Suite 322|West Lauriestad|IL|35865|94|1|hat|79.0
+    2|Cindy|Salazar|williamsrebecca@example.com|287-934-1135|75615 Stacey Shore|South Stephanie|NC|85181|37|2|Cindy|Salazar|williamsrebecca@example.com|287-934-1135|75615 Stacey Shore|South Stephanie|NC|85181|37|2|cap|82.0
+    3|Tommy|Perry|warechristopher@example.org|001-288-554-8139x0276|2896 Paul Fall Apt. 972|Michaelborough|VA|15691|18|3|Tommy|Perry|warechristopher@example.org|001-288-554-8139x0276|2896 Paul Fall Apt. 972|Michaelborough|VA|15691|18|3|shirt|18.0
+}
+
+test leftjoin-innerjoin-where {
+    select u.first_name, p.name, p2.name from users u left join products p on p.name = u.first_name join products p2 on length(p2.name) > 8 where u.first_name = 'Franklin';
+}
+expect {
+    Franklin||sweatshirt
+    Franklin||accessories
+}
+
+test leftjoin-leftjoin-where {
+    select u.first_name, p.name, p2.name from users u left join products p on p.name = u.first_name join products p2 on length(p2.name) > 8 where u.first_name = 'Franklin';
+}
+expect {
+    Franklin||sweatshirt
+    Franklin||accessories
+}
+
+test innerjoin-leftjoin-where {
+    select u.first_name, u2.first_name, p.name from users u join users u2 on u.id = u2.id + 1 left join products p on p.name = u.first_name where u.first_name = 'Franklin';
+}
+expect {
+    Franklin|Cynthia|
+}
+
+test innerjoin-leftjoin-with-or-terms {
+    select u.first_name, u2.first_name, p.name from users u join users u2 on u.id = u2.id + 1 left join products p on p.name = u.first_name or p.name like 'sweat%' where u.first_name = 'Franklin';
+}
+expect {
+    Franklin|Cynthia|sweater
+    Franklin|Cynthia|sweatshirt
+}
+
+test left-join-constant-condition-false-inner-join-constant-condition-true {
+    select u.first_name, p.name, u2.first_name from users u left join products as p on 0 join users u2 on 1 limit 5;
+}
+expect {
+    Jamie||Jamie
+    Jamie||Cindy
+    Jamie||Tommy
+    Jamie||Jennifer
+    Jamie||Edward
+}
+
+test left-join-constant-condition-true-inner-join-constant-condition-false {
+    select u.first_name, p.name, u2.first_name from users u left join products as p on 1 join users u2 on 0 limit 5;
+}
+expect {
+}
+
+test join-utilizing-both-seekrowid-and-secondary-index {
+    select u.first_name, p.name from users u join products p on u.id = p.id and u.age > 70;
+}
+expect {
+    Matthew|boots
+    Nicholas|shorts
+    Jamie|hat
+}
+
+test join-using {
+    select * from users join products using (id) limit 3;
+}
+expect {
+    1|Jamie|Foster|dylan00@example.com|496-522-9493|62375 Johnson Rest Suite 322|West Lauriestad|IL|35865|94|hat|79.0
+    2|Cindy|Salazar|williamsrebecca@example.com|287-934-1135|75615 Stacey Shore|South Stephanie|NC|85181|37|cap|82.0
+    3|Tommy|Perry|warechristopher@example.org|001-288-554-8139x0276|2896 Paul Fall Apt. 972|Michaelborough|VA|15691|18|shirt|18.0
+}
+
+test join-using-multiple {
+    select u.first_name, u.last_name, p.name from users u join users u2 using(id) join products p using(id) limit 3;
+}
+expect {
+    Jamie|Foster|hat
+    Cindy|Salazar|cap
+    Tommy|Perry|shirt
+}
+
+test join-using-multiple-with-quoting {
+    select u.first_name, u.last_name, p.name from users u join users u2 using(id) join [products] p using(`id`) limit 3;
+}
+expect {
+    Jamie|Foster|hat
+    Cindy|Salazar|cap
+    Tommy|Perry|shirt
+}
+
+test natural-join {
+    select * from users natural join products limit 3;
+}
+expect {
+    1|Jamie|Foster|dylan00@example.com|496-522-9493|62375 Johnson Rest Suite 322|West Lauriestad|IL|35865|94|hat|79.0
+    2|Cindy|Salazar|williamsrebecca@example.com|287-934-1135|75615 Stacey Shore|South Stephanie|NC|85181|37|cap|82.0
+    3|Tommy|Perry|warechristopher@example.org|001-288-554-8139x0276|2896 Paul Fall Apt. 972|Michaelborough|VA|15691|18|shirt|18.0
+}
+
+test natural-join-multiple {
+    select u.first_name, u2.last_name, p.name from users u natural join users u2 natural join products p limit 3;
+}
+expect {
+    Jamie|Foster|hat
+    Cindy|Salazar|cap
+    Tommy|Perry|shirt
+}
+
+test natural-join-and-using-join {
+    select u.id, u2.id, p.id from users u natural join products p join users u2 using (first_name) limit 3;
+}
+expect {
+    1|1|1
+    1|1204|1
+    1|1261|1
+}
+
+test left-join-backwards-iteration {
+    select users.id, users.first_name as user_name, products.name as product_name
+    from users left join products on users.id = products.id
+    where users.id < 13 order by users.id desc limit 3;
+}
+expect {
+    12|Alan|
+    11|Travis|accessories
+    10|Daniel|coat
+}
+
+test hash-join-expr-equality-pred {
+    SELECT p.name, u.email
+    FROM products p
+    JOIN users u ON substr(p.name,1,2) = lower(substr(u.first_name, 1,2))
+    ORDER BY p.name, u.email limit 2;
+}
+expect {
+    boots|agiles@example.net
+    boots|bryantrevino@example.com
+}
+

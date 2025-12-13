@@ -1,0 +1,12 @@
+# Integrity Check Tests
+# Ported from testing/integrity_check.test
+
+@database testing/testing.db readonly
+
+# Basic integrity check
+test integrity-check {
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}

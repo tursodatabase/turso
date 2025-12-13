@@ -1,0 +1,151 @@
+# LIKE Tests (Memory - standalone tests)
+# Ported from testing/like.test
+
+@database :memory:
+
+test like-with-backslash {
+    SELECT like('\%A', '\A');
+}
+expect {
+    1
+}
+
+test like-with-dollar {
+    SELECT like('A$%', 'A$');
+}
+expect {
+    1
+}
+
+test like-with-dot {
+    SELECT like('%a.a', 'aaaa');
+}
+expect {
+    0
+}
+
+test like-fn-esc-1 {
+    SELECT like('abcX%', 'abc%' , 'X');
+}
+expect {
+    1
+}
+
+test like-fn-esc-2 {
+    SELECT like('abcX%', 'abc5' , 'X');
+}
+expect {
+    0
+}
+
+test like-fn-esc-3 {
+    SELECT like('abcX%', 'abc', 'X');
+}
+expect {
+    0
+}
+
+test like-fn-esc-4 {
+    SELECT like('abcX%', 'abcX%', 'X');
+}
+expect {
+    0
+}
+
+test like-fn-esc-5 {
+    SELECT like('abcX%', 'abc%%', 'X');
+}
+expect {
+    0
+}
+
+test like-fn-esc-6 {
+    SELECT like('abcX_', 'abc_' , 'X');
+}
+expect {
+    1
+}
+
+test like-fn-esc-7 {
+    SELECT like('abcX_', 'abc5' , 'X');
+}
+expect {
+    0
+}
+
+test like-fn-esc-8 {
+    SELECT like('abcX_', 'abc'  , 'X');
+}
+expect {
+    0
+}
+
+test like-fn-esc-9 {
+    SELECT like('abcX_', 'abcX_', 'X');
+}
+expect {
+    0
+}
+
+test like-fn-esc-10 {
+    SELECT like('abcX_', 'abc__', 'X');
+}
+expect {
+    0
+}
+
+test like-fn-esc-11 {
+    SELECT like('abcXX', 'abcX' , 'X');
+}
+expect {
+    1
+}
+
+test like-fn-esc-12 {
+    SELECT like('abcXX', 'abc5' , 'X');
+}
+expect {
+    0
+}
+
+test like-fn-esc-13 {
+    SELECT like('abcXX', 'abc'  , 'X');
+}
+expect {
+    0
+}
+
+test like-fn-esc-14 {
+    SELECT like('abcXX', 'abcXX', 'X');
+}
+expect {
+    0
+}
+
+test unicode-like-case-sensitivity-1 {
+    SELECT like('ä', 'Ä');
+}
+expect {
+    0
+}
+
+test unicode-like-case-sensitivity-2 {
+    SELECT like('a', 'A');
+}
+expect {
+    1
+}
+
+test unicode-like-with-escape-1 {
+    SELECT like('ÄX%', 'ä%', 'X');
+}
+expect {
+    0
+}
+
+test unicode-like-with-escape-2 {
+    SELECT like('ÄX%', 'Ä%', 'X');
+}
+expect {
+    1
+}

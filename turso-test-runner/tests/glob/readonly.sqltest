@@ -1,0 +1,96 @@
+# GLOB Tests (Readonly - uses products/users tables)
+# Ported from testing/glob.test
+
+@database testing/testing.db readonly
+
+test glob-fn {
+    SELECT name, glob('sweat*', name) FROM products;
+}
+expect {
+    hat|0
+    cap|0
+    shirt|0
+    sweater|1
+    sweatshirt|1
+    shorts|0
+    jeans|0
+    sneakers|0
+    boots|0
+    coat|0
+    accessories|0
+}
+
+test where-glob {
+    SELECT * FROM products WHERE name GLOB 'sweat*';
+}
+expect {
+    4|sweater|25.0
+    5|sweatshirt|74.0
+}
+
+test where-glob-question-mark {
+    SELECT * FROM products WHERE name GLOB 'sweat?r';
+}
+expect {
+    4|sweater|25.0
+}
+
+test where-glob-fn {
+    SELECT * FROM products WHERE glob('sweat*', name)=1;
+}
+expect {
+    4|sweater|25.0
+    5|sweatshirt|74.0
+}
+
+test where-not-glob-and {
+    SELECT * FROM products WHERE name NOT GLOB 'sweat*' AND price >= 70.0;
+}
+expect {
+    1|hat|79.0
+    2|cap|82.0
+    6|shorts|70.0
+    7|jeans|78.0
+    8|sneakers|82.0
+    11|accessories|81.0
+}
+
+test where-glob-or {
+    SELECT * FROM products WHERE name GLOB 'sweat*' OR price >= 80.0;
+}
+expect {
+    2|cap|82.0
+    4|sweater|25.0
+    5|sweatshirt|74.0
+    8|sneakers|82.0
+    11|accessories|81.0
+}
+
+test where-glob-another-column {
+    SELECT first_name, last_name FROM users WHERE last_name GLOB first_name;
+}
+expect {
+    James|James
+    Daniel|Daniel
+    Taylor|Taylor
+}
+
+test where-glob-another-column-prefix {
+    SELECT first_name, last_name FROM users WHERE last_name GLOB concat(first_name, '*');
+}
+expect {
+    James|James
+    Daniel|Daniel
+    William|Williams
+    John|Johnson
+    Taylor|Taylor
+    John|Johnson
+    Stephen|Stephens
+    Robert|Roberts
+}
+
+test where-glob-impossible {
+    SELECT * FROM products WHERE 'foobar' GLOB 'fooba';
+}
+expect {
+}

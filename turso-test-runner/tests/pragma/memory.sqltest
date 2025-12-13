@@ -1,0 +1,303 @@
+# PRAGMA Tests (Memory)
+# Ported from testing/pragma.test
+
+@database :memory:
+
+# Cache size tests
+setup pragma-cache-size-default {
+    SELECT 1;
+}
+
+@setup pragma-cache-size-default
+test pragma-cache-size-default {
+  PRAGMA cache_size
+}
+expect {
+    -2000
+}
+
+# Page count tests
+setup pragma-page-count-empty {
+    SELECT 1;
+}
+
+@setup pragma-page-count-empty
+test pragma-page-count-empty {
+  PRAGMA page_count
+}
+expect {
+    0
+}
+
+setup pragma-page-count-with-data {
+    PRAGMA user_version=1;
+}
+
+@setup pragma-page-count-with-data
+test pragma-page-count-with-data {
+    PRAGMA page_count
+}
+expect {
+    1
+}
+
+setup pragma-page-count-table {
+    CREATE TABLE foo (bar);
+}
+
+@setup pragma-page-count-table
+test pragma-page-count-table {
+    PRAGMA page_count
+}
+expect {
+    2
+}
+
+# User version tests
+setup pragma-user-version-default {
+    SELECT 1;
+}
+
+@setup pragma-user-version-default
+test pragma-user-version-default {
+  PRAGMA user_version
+}
+expect {
+    0
+}
+
+setup pragma-user-version-update {
+    PRAGMA user_version = 42;
+}
+
+@setup pragma-user-version-update
+test pragma-user-version-update {
+    PRAGMA user_version;
+}
+expect {
+    42
+}
+
+setup pragma-user-version-negative-value {
+    PRAGMA user_version = -10;
+}
+
+@setup pragma-user-version-negative-value
+test pragma-user-version-negative-value {
+    PRAGMA user_version;
+}
+expect {
+    -10
+}
+
+setup pragma-user-version-float-value {
+    PRAGMA user_version = 10.9;
+}
+
+@setup pragma-user-version-float-value
+test pragma-user-version-float-value {
+    PRAGMA user_version;
+}
+expect {
+    10
+}
+
+# Application ID tests
+setup pragma-application-id-default {
+    SELECT 1;
+}
+
+@setup pragma-application-id-default
+test pragma-application-id-default {
+  PRAGMA application_id
+}
+expect {
+    0
+}
+
+setup pragma-application-id-update {
+    PRAGMA application_id = 12345;
+}
+
+@setup pragma-application-id-update
+test pragma-application-id-update {
+    PRAGMA application_id;
+}
+expect {
+    12345
+}
+
+setup pragma-application-id-float-value {
+    PRAGMA application_id = 10.9;
+}
+
+@setup pragma-application-id-float-value
+test pragma-application-id-float-value {
+    PRAGMA application_id;
+}
+expect {
+    10
+}
+
+setup pragma-application-id-large-value {
+    PRAGMA application_id = 2147483647;
+}
+
+@setup pragma-application-id-large-value
+test pragma-application-id-large-value {
+    PRAGMA application_id;
+}
+expect {
+    2147483647
+}
+
+setup pragma-application-id-negative-value {
+    PRAGMA application_id = -23;
+}
+
+@setup pragma-application-id-negative-value
+test pragma-application-id-negative-value {
+    PRAGMA application_id;
+}
+expect {
+    -23
+}
+
+setup pragma-application-id-zero {
+    PRAGMA application_id = 0;
+}
+
+@setup pragma-application-id-zero
+test pragma-application-id-zero {
+    PRAGMA application_id;
+}
+expect {
+    0
+}
+
+# Page size tests
+setup pragma-page-size-default {
+    SELECT 1;
+}
+
+@setup pragma-page-size-default
+test pragma-page-size-default {
+  PRAGMA page_size
+}
+expect {
+    4096
+}
+
+setup pragma-page-size-set {
+    PRAGMA page_size=1024;
+}
+
+@setup pragma-page-size-set
+test pragma-page-size-set {
+    PRAGMA page_size
+}
+expect {
+    1024
+}
+
+setup pragma-page-size-set-initialized-db {
+    CREATE TABLE "foo bar"(c0);
+    PRAGMA page_size=1024;
+}
+
+@setup pragma-page-size-set-initialized-db
+test pragma-page-size-set-initialized-db {
+    PRAGMA page_size
+}
+expect {
+    4096
+}
+
+# Max page count tests
+setup pragma-max-page-count-default {
+    SELECT 1;
+}
+
+@setup pragma-max-page-count-default
+test pragma-max-page-count-default {
+  PRAGMA max_page_count
+}
+expect {
+    4294967294
+}
+
+setup pragma-max-page-count-set-large {
+    PRAGMA max_page_count = 1000;
+}
+
+@setup pragma-max-page-count-set-large
+test pragma-max-page-count-set-large {
+    PRAGMA max_page_count
+}
+expect {
+    1000
+}
+
+setup pragma-max-page-count-set-zero-ignored {
+    PRAGMA max_page_count = 0;
+}
+
+@setup pragma-max-page-count-set-zero-ignored
+test pragma-max-page-count-set-zero-ignored {
+    PRAGMA max_page_count
+}
+expect {
+    4294967294
+}
+
+setup pragma-max-page-count-clamping-with-data {
+    CREATE TABLE test (id INTEGER);
+}
+
+@setup pragma-max-page-count-clamping-with-data
+test pragma-max-page-count-clamping-with-data {
+    PRAGMA page_count;
+    PRAGMA max_page_count = 1;
+}
+expect {
+    2
+    2
+}
+
+# Max page count enforcement error
+setup pragma-max-page-count-enforcement-error {
+    PRAGMA max_page_count = 1;
+}
+
+@setup pragma-max-page-count-enforcement-error
+test pragma-max-page-count-enforcement-error {
+    CREATE TABLE test (id INTEGER)
+}
+expect error {}
+
+# Table info tests with argument containing space
+setup pragma-function-argument-with-space {
+    CREATE TABLE "foo bar"(c0);
+}
+
+@setup pragma-function-argument-with-space
+test pragma-function-argument-with-space {
+    SELECT * FROM pragma_table_info('foo bar')
+}
+expect {
+    0|c0||0||0
+}
+
+# Integrity check
+setup pragma-integrity-check-empty {
+    SELECT 1;
+}
+
+@setup pragma-integrity-check-empty
+test pragma-integrity-check-empty {
+  PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+

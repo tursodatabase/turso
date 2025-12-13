@@ -1,0 +1,913 @@
+# UPDATE Tests
+# Ported from testing/update.test
+
+@database :memory:
+
+setup basic-update {
+    create table temp (t1 integer);
+    insert into temp values (1);
+}
+
+@setup basic-update
+test basic-update {
+    update temp set t1 = 2;
+    select * from temp;
+}
+expect {
+    2
+}
+
+setup update-mul {
+    create table temp (t1 integer);
+    insert into temp values (1),(2.0),('3'),('4.0');
+}
+
+@setup update-mul
+test update-mul {
+    update temp set t1 = 2;
+    select * from temp;
+}
+expect {
+    2
+    2
+    2
+    2
+}
+
+setup update-where {
+    create table temp (a,b,c);
+    insert into temp values (1,2,33);
+    insert into temp values (1,22,33);
+    insert into temp values (1,22,33);
+}
+
+@setup update-where
+test update-where {
+    update temp set a = 6 where b = 2;
+    select * from temp;
+}
+expect {
+    6|2|33
+    1|22|33
+    1|22|33
+}
+
+setup update-where-2 {
+    create table temp (a,b,c);
+    insert into temp values (1,22,33);
+    insert into temp values (1,22,33);
+    insert into temp values (1,22,33);
+    insert into temp values (6,22,33);
+    insert into temp values (1,22,33);
+    insert into temp values (1,22,33);
+}
+
+@setup update-where-2
+test update-where-2 {
+    update temp set b = 100000 where a = 6;
+    select b from temp where a = 6;
+}
+expect {
+    100000
+}
+
+setup update-all-many {
+    create table temp (a,b,c);
+    insert into temp values (1,22,33),(1,22,33),(1,22,33),(1,22,33),(1,22,33),(1,22,33),(1,22,33),(1,22,33);
+}
+
+@setup update-all-many
+test update-all-many {
+    update temp set a = 1234234234234234;
+    select COUNT(*) from temp where a = 1234234234234234;
+}
+expect {
+    8
+}
+
+setup update-large-small {
+    create table temp (a,b,c);
+    insert into temp values (randomblob(1024), 1, 2);
+}
+
+@setup update-large-small
+test update-large-small {
+    update temp set a = 'a';
+    select * from temp;
+}
+expect {
+    a|1|2
+}
+
+setup update-null {
+    create table temp (a,b,c);
+    insert into temp values (NULL, 1, 2);
+    insert into temp values (3, 4, 5);
+}
+
+@setup update-null
+test update-null {
+    update temp set a = 10 where a IS NULL;
+    select * from temp;
+}
+expect {
+    10|1|2
+    3|4|5
+}
+
+setup update-not-null-1 {
+    create table temp (a,b not null,c);
+    insert into temp values (1, 2, 3);
+}
+
+@setup update-not-null-1
+test update-not-null-1 {
+    update temp set b = 999;
+    select * from temp;
+}
+expect {
+    1|999|3
+}
+
+setup update-not-null-2 {
+    create table temp (a,b not null,c);
+    insert into temp values (1, 2, 3);
+}
+
+@setup update-not-null-2
+test update-not-null-2 {
+    update temp set b = NULL;
+}
+expect error {}
+
+setup update-not-null-3 {
+    create table temp (a not null, b not null, c not null);
+}
+
+@setup update-not-null-3
+test update-not-null-3 {
+    update temp set a = null, b = null, c = null;
+    select * from temp;
+}
+expect {
+}
+
+setup update-mixed-types {
+    create table temp (a);
+    insert into temp values (1);
+    insert into temp values ('2');
+    insert into temp values (3.0);
+    insert into temp values (X'01');
+}
+
+@setup update-mixed-types
+test update-mixed-types {
+    update temp set a = 'updated';
+    select * from temp;
+}
+expect {
+    updated
+    updated
+    updated
+    updated
+}
+
+setup update-with-expression {
+    create table temp (a, b);
+    insert into temp values (1, 10);
+    insert into temp values (2, 20);
+    insert into temp values (3, 30);
+}
+
+@setup update-with-expression
+test update-with-expression {
+    update temp set a = b * 3 / 2;
+    select * from temp;
+}
+expect {
+    15|10
+    30|20
+    45|30
+}
+
+setup update-expression-index {
+    CREATE TABLE t(k TEXT, c0 INT);
+    CREATE INDEX idx_expr ON t(length(k), lower(c0)) WHERE c0 IS NOT NULL AND lower(k) = k;
+    INSERT INTO t VALUES ('abc', 1);
+    INSERT INTO t VALUES ('def', 2);
+}
+
+@setup update-expression-index
+test update-expression-index {
+    UPDATE t SET c0 = c0 + 1;
+    SELECT count(*) FROM t;
+}
+expect {
+    2
+}
+
+setup delete-expression-index {
+    CREATE TABLE t(k TEXT, c0 INT);
+    CREATE INDEX idx_expr ON t(length(k), lower(c0)) WHERE c0 IS NOT NULL AND lower(k) = k;
+    INSERT INTO t VALUES ('abc', 1);
+}
+
+@setup delete-expression-index
+test delete-expression-index {
+    DELETE FROM t WHERE k = 'abc';
+    SELECT count(*) FROM t;
+}
+expect {
+    0
+}
+
+setup update-self-reference {
+    create table temp (a, b);
+    insert into temp values (1, 10);
+    insert into temp values (2, 20);
+}
+
+@setup update-self-reference
+test update-self-reference {
+    update temp set a = b where a = 1;
+    select * from temp;
+}
+expect {
+    10|10
+    2|20
+}
+
+setup update-self-ref-all {
+    create table temp (a, b, c);
+    insert into temp values (1, 2, 3);
+    insert into temp values (4, 5, 6);
+}
+
+@setup update-self-ref-all
+test update-self-ref-all {
+    update temp set a = b;
+    select * from temp;
+}
+expect {
+    2|2|3
+    5|5|6
+}
+
+setup update-large-text {
+    create table temp (a);
+    insert into temp values ('short');
+}
+
+@setup update-large-text
+test update-large-text {
+    update temp set a = 'this is a very large text field that exceeds the default cell size and should trigger overflow handling in the btree implementation';
+    select * from temp;
+}
+expect {
+    this is a very large text field that exceeds the default cell size and should trigger overflow handling in the btree implementation
+}
+
+setup update-with-null-condition {
+    create table temp (a, b);
+    insert into temp values (NULL, 1);
+    insert into temp values (2, NULL);
+    insert into temp values (3, 4);
+}
+
+@setup update-with-null-condition
+test update-with-null-condition {
+    update temp set a = 99 where b IS NULL;
+    select * from temp;
+}
+expect {
+    |1
+    99|
+    3|4
+}
+
+setup update-to-null {
+    create table temp (a, b);
+    insert into temp values (1, 10);
+    insert into temp values (2, 20);
+}
+
+@setup update-to-null
+test update-to-null {
+    update temp set a = NULL where b = 10;
+    select * from temp;
+}
+expect {
+    |10
+    2|20
+}
+
+setup update-with-randomblob {
+    create table temp (a, b);
+    insert into temp values (randomblob(100), 1);
+}
+
+@setup update-with-randomblob
+test update-with-randomblob {
+    update temp set a = randomblob(200);
+    select length(a) from temp;
+}
+expect {
+    200
+}
+
+setup update-multiple-columns {
+    create table temp (a, b, c);
+    insert into temp values (1, 2, 3);
+    insert into temp values (4, 5, 6);
+}
+
+@setup update-multiple-columns
+test update-multiple-columns {
+    update temp set a = 10, b = 20, c = 30;
+    select * from temp;
+}
+expect {
+    10|20|30
+    10|20|30
+}
+
+setup update-true-expr {
+    create table temp (a, b, c);
+    insert into temp values (1, 2, 3);
+    insert into temp values (4, 5, 6);
+}
+
+@setup update-true-expr
+test update-true-expr {
+    update temp set a = 10, b = 20, c = 30 where 1;
+    select * from temp;
+}
+expect {
+    10|20|30
+    10|20|30
+}
+
+setup update-cache-full-regression {
+    CREATE TABLE t (x);
+    INSERT INTO t VALUES (randomblob(4096));
+}
+
+@setup update-cache-full-regression
+test update_cache_full_regression_test_1625 {
+    UPDATE t SET x = randomblob(4096) WHERE rowid = 1;
+    SELECT count(*) FROM t;
+}
+expect {
+    1
+}
+
+setup update-index-regression {
+    CREATE TABLE t (x, y);
+    CREATE INDEX tx ON t (x);
+    CREATE UNIQUE INDEX tyu ON t (y);
+    INSERT INTO t VALUES (1, 1);
+}
+
+@setup update-index-regression
+test update_index_regression_test {
+    SELECT x FROM t;
+    SELECT y FROM t;
+    UPDATE t SET x=2, y=2;
+    SELECT x FROM t;
+    SELECT y FROM t;
+}
+expect {
+    1
+    1
+    2
+    2
+}
+
+setup update-rowid-alias-index-regression {
+    CREATE TABLE t (a INTEGER PRIMARY KEY, b);
+    CREATE INDEX idx_b ON t (b);
+    INSERT INTO t VALUES (1, 'foo');
+}
+
+@setup update-rowid-alias-index-regression
+test update_rowid_alias_index_regression_test {
+    SELECT a FROM t WHERE b = 'foo';
+    UPDATE t SET a = 2, b = 'bar';
+    SELECT a FROM t WHERE b = 'bar';
+}
+expect {
+    1
+    2
+}
+
+setup update-where-or-regression {
+    CREATE TABLE t (a INTEGER);
+    INSERT INTO t VALUES (1), ('hi');
+}
+
+@setup update-where-or-regression
+test update_where_or_regression_test {
+    UPDATE t SET a = X'6C6F76656C795F7265766F6C74' WHERE ~ 'gorgeous_thropy' OR NOT -3830873834.233324;
+    SELECT * from t;
+}
+expect {
+    lovely_revolt
+    lovely_revolt
+}
+
+setup update-primary-key-constraint-error {
+    CREATE TABLE eye (study REAL, spring BLOB, save TEXT, thank REAL, election INTEGER, PRIMARY KEY (election));
+    INSERT INTO eye VALUES (183559032.521585, x'6625d092', 'Trial six should.', 2606132742.43174, 2817);
+    INSERT INTO eye VALUES (78255586.9204539, x'651061e8', 'World perhaps.', -5815764.49018679, 1917);
+}
+
+@setup update-primary-key-constraint-error
+test update_primary_key_constraint_error {
+    UPDATE eye SET election = 6150;
+}
+expect error {}
+
+setup update-primary-key-constraint-error-2 {
+    CREATE TABLE eye (study REAL, spring BLOB, save TEXT, thank REAL, election INTEGER, PRIMARY KEY (election));
+    INSERT INTO eye VALUES (183559032.521585,  x'6625d092', 'Trial six should.', 2606132742.43174, 2817);
+    INSERT INTO eye VALUES (78255586.9204539, x'651061e8', 'World perhaps.', -5815764.49018679, 1917);
+    INSERT INTO eye VALUES (53.3274327094467, x'f574c507', 'Senior wish degree.', -423.432750526747, 2650);
+    INSERT INTO eye VALUES (-908148213048.983, x'6d812051', 'Possible able.', 101.171781837336, 4100);
+    INSERT INTO eye VALUES (-572332773760.924, x'd7a4d9fb', 'Money catch expect.', -271065488.756746, 4667);
+}
+
+@setup update-primary-key-constraint-error-2
+test update_primary_key_constraint_error_2 {
+    UPDATE eye SET election = 6150 WHERE election != 1917;
+}
+expect error {}
+
+setup update-primary-key-constraint-error-3 {
+    CREATE TABLE eye (study REAL, spring BLOB, save TEXT, thank REAL, election INTEGER, PRIMARY KEY (election));
+    INSERT INTO eye VALUES (183559032.521585,  x'6625d092', 'Trial six should.', 2606132742.43174, 2817);
+    INSERT INTO eye VALUES (78255586.9204539, x'651061e8', 'World perhaps.', -5815764.49018679, 1917);
+    INSERT INTO eye VALUES (53.3274327094467, x'f574c507', 'Senior wish degree.', -423.432750526747, 2650);
+    INSERT INTO eye VALUES (-908148213048.983, x'6d812051', 'Possible able.', 101.171781837336, 4100);
+    INSERT INTO eye VALUES (-572332773760.924, x'd7a4d9fb', 'Money catch expect.', -271065488.756746, 4667);
+}
+
+@setup update-primary-key-constraint-error-3
+test update_primary_key_constraint_error_3 {
+    UPDATE eye SET election = 6150 WHERE election > 1000 AND study > 1;
+}
+expect error {}
+
+setup update-primary-key-constraint-error-4 {
+    CREATE TABLE t (a PRIMARY KEY INTEGER, b UNIQUE);
+    INSERT INTO t(b) VALUES (100), (200), (300);
+}
+
+@setup update-primary-key-constraint-error-4
+test update_primary_key_constraint_error_4 {
+    UPDATE t SET a = 1;
+}
+expect error {}
+
+setup update-primary-key-unique-constraint-error {
+    CREATE TABLE t (a PRIMARY KEY INTEGER, b UNIQUE);
+    INSERT INTO t(b) VALUES (100), (200), (300);
+}
+
+@setup update-primary-key-unique-constraint-error
+test update_primary_key_unique_constraint_error {
+    UPDATE t SET b = 2;
+}
+expect error {}
+
+setup update-single-rowid {
+    CREATE TABLE t (x INTEGER PRIMARY KEY);
+    INSERT INTO t VALUES (1);
+}
+
+@setup update-single-rowid
+test update-single-rowid {
+    UPDATE t SET x = 2 WHERE x = 1;
+    SELECT * FROM t;
+}
+expect {
+    2
+}
+
+setup update-set-expression-missing-identifier {
+    CREATE TABLE t0 (c0 INT);
+}
+
+@setup update-set-expression-missing-identifier
+test update-set-expression-missing-identifier {
+    UPDATE t0 SET c0 = 1, c0 = c1;
+}
+expect error { no such column: c1 }
+
+# RETURNING clause tests for UPDATE
+setup update-returning-basic-column {
+    CREATE TABLE test (id INTEGER, name TEXT, value REAL);
+    INSERT INTO test (id, name, value) VALUES (1, 'test', 10.5);
+}
+
+@setup update-returning-basic-column
+test update-returning-basic-column {
+    UPDATE test SET value = 20.5 WHERE id = 1 RETURNING id;
+}
+expect {
+    1
+}
+
+setup update-returning-multiple-columns {
+    CREATE TABLE test (id INTEGER, name TEXT, value REAL);
+    INSERT INTO test (id, name, value) VALUES (1, 'test', 10.5);
+}
+
+@setup update-returning-multiple-columns
+test update-returning-multiple-columns {
+    UPDATE test SET value = 20.5 WHERE id = 1 RETURNING id, name, value;
+}
+expect {
+    1|test|20.5
+}
+
+setup update-returning-all-columns {
+    CREATE TABLE test (id INTEGER, name TEXT, value REAL);
+    INSERT INTO test (id, name, value) VALUES (1, 'test', 10.5);
+}
+
+@setup update-returning-all-columns
+test update-returning-all-columns {
+    UPDATE test SET value = 20.5 WHERE id = 1 RETURNING *;
+}
+expect {
+    1|test|20.5
+}
+
+setup update-returning-literal {
+    CREATE TABLE test (id INTEGER, value INTEGER);
+    INSERT INTO test (id, value) VALUES (1, 10);
+}
+
+@setup update-returning-literal
+test update-returning-literal {
+    UPDATE test SET value = 20 WHERE id = 1 RETURNING 42;
+}
+expect {
+    42
+}
+
+setup update-returning-arithmetic {
+    CREATE TABLE test (id INTEGER, value INTEGER);
+    INSERT INTO test (id, value) VALUES (1, 10);
+}
+
+@setup update-returning-arithmetic
+test update-returning-arithmetic {
+    UPDATE test SET value = 20 WHERE id = 1 RETURNING 2 * value;
+}
+expect {
+    40
+}
+
+setup update-returning-complex-expression {
+    CREATE TABLE test (id INTEGER, x INTEGER, y INTEGER);
+    INSERT INTO test (id, x, y) VALUES (1, 5, 3);
+}
+
+@setup update-returning-complex-expression
+test update-returning-complex-expression {
+    UPDATE test SET x = 8 WHERE id = 1 RETURNING x + y * 2;
+}
+expect {
+    14
+}
+
+setup update-returning-function-call {
+    CREATE TABLE test (id INTEGER, name TEXT);
+    INSERT INTO test (id, name) VALUES (1, 'hello');
+}
+
+@setup update-returning-function-call
+test update-returning-function-call {
+    UPDATE test SET name = 'world' WHERE id = 1 RETURNING upper(name);
+}
+expect {
+    WORLD
+}
+
+setup update-returning-mixed-expressions {
+    CREATE TABLE test (id INTEGER, name TEXT, value INTEGER);
+    INSERT INTO test (id, name, value) VALUES (1, 'test', 10);
+}
+
+@setup update-returning-mixed-expressions
+test update-returning-mixed-expressions {
+    UPDATE test SET name = 'updated', value = 30 WHERE id = 1 RETURNING id, upper(name), value * 2;
+}
+expect {
+    1|UPDATED|60
+}
+
+setup update-returning-multiple-rows {
+    CREATE TABLE test (id INTEGER, name TEXT);
+    INSERT INTO test (id, name) VALUES (1, 'first'), (2, 'second');
+}
+
+@setup update-returning-multiple-rows
+test update-returning-multiple-rows {
+    UPDATE test SET name = 'updated' RETURNING id, name;
+}
+expect {
+    1|updated
+    2|updated
+}
+
+setup update-returning-with-where {
+    CREATE TABLE test (id INTEGER, name TEXT, active INTEGER);
+    INSERT INTO test (id, name, active) VALUES (1, 'first', 1), (2, 'second', 0), (3, 'third', 1);
+}
+
+@setup update-returning-with-where
+test update-returning-with-where {
+    UPDATE test SET name = 'updated' WHERE active = 1 RETURNING id, name;
+}
+expect {
+    1|updated
+    3|updated
+}
+
+setup update-returning-old-vs-new-values {
+    CREATE TABLE test (id INTEGER, counter INTEGER);
+    INSERT INTO test (id, counter) VALUES (1, 5);
+}
+
+@setup update-returning-old-vs-new-values
+test update-returning-old-vs-new-values {
+    UPDATE test SET counter = counter + 10 WHERE id = 1 RETURNING id, counter;
+}
+expect {
+    1|15
+}
+
+setup update-returning-null-values {
+    CREATE TABLE test (id INTEGER, name TEXT, value INTEGER);
+    INSERT INTO test (id, name, value) VALUES (1, 'test', 10);
+}
+
+@setup update-returning-null-values
+test update-returning-null-values {
+    UPDATE test SET name = NULL, value = NULL WHERE id = 1 RETURNING id, name, value;
+}
+expect {
+    1||
+}
+
+setup basic-row-values {
+    CREATE TABLE test (id INTEGER, name TEXT);
+    INSERT INTO test (id, name) VALUES (1, 'test');
+}
+
+@setup basic-row-values
+test basic-row-values {
+    UPDATE test SET (id, name) = (2, 'mordor') RETURNING id, name;
+}
+expect {
+    2|mordor
+}
+
+setup parse-error-row-values {
+    CREATE TABLE test (id INTEGER, name TEXT);
+    INSERT INTO test (id, name) VALUES (1, 'test');
+}
+
+@setup parse-error-row-values
+test parse-error-row-values {
+    UPDATE test SET (id, name) = (2);
+}
+expect error {}
+
+setup row-values-repeated-values {
+    CREATE TABLE test (id INTEGER, name TEXT);
+    INSERT INTO test (id, name) VALUES (1, 'test');
+}
+
+@setup row-values-repeated-values
+test row-values-repeated-values-should-take-latter {
+    UPDATE test SET (name, name) = ('mordor', 'shire') RETURNING id, name;
+}
+expect {
+    1|shire
+}
+
+setup rowid-update-updates-all-indexes {
+    CREATE TABLE t (a integer primary key, b unique, c unique);
+    INSERT INTO t VALUES (1,1,1);
+}
+
+@setup rowid-update-updates-all-indexes
+test rowid-update-updates-all-indexes {
+    UPDATE t SET a = 2, b = 3;
+    SELECT * from t;
+    SELECT * from t WHERE b > 0;
+    SELECT * from t WHERE c > 0;
+}
+expect {
+    2|3|1
+    2|3|1
+    2|3|1
+}
+
+setup can-update-rowid-directly {
+    CREATE TABLE test (name TEXT);
+    INSERT INTO test (name) VALUES ('test');
+}
+
+@setup can-update-rowid-directly
+test can-update-rowid-directly {
+    UPDATE test SET rowid = 5;
+    SELECT rowid, name from test;
+}
+expect {
+    5|test
+}
+
+setup update-alias-visibility-in-where-clause {
+    create table t(a);
+    insert into t values (0);
+    insert into t values (5);
+}
+
+@setup update-alias-visibility-in-where-clause
+test update-alias-visibility-in-where-clause {
+    update t as tt set a = 1 where tt.a = 0;
+    select * from t;
+}
+expect {
+    1
+    5
+}
+
+# Basic UPDATE tests with indexes
+setup update-non-indexed-column {
+    CREATE TABLE t (a INTEGER, b INTEGER);
+    CREATE INDEX idx_a ON t(a);
+    INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);
+}
+
+@setup update-non-indexed-column
+test update-non-indexed-column {
+    UPDATE t SET b = 100 WHERE a = 2;
+    SELECT * FROM t ORDER BY a;
+}
+expect {
+    1|10
+    2|100
+    3|30
+}
+
+setup update-indexed-column {
+    CREATE TABLE t (a INTEGER, b INTEGER);
+    CREATE INDEX idx_a ON t(a);
+    INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);
+}
+
+@setup update-indexed-column
+test update-indexed-column {
+    UPDATE t SET a = 5 WHERE a = 2;
+    SELECT * FROM t ORDER BY a;
+}
+expect {
+    1|10
+    3|30
+    5|20
+}
+
+setup update-both-indexed-and-non-indexed {
+    CREATE TABLE t (a INTEGER, b INTEGER, c INTEGER);
+    CREATE INDEX idx_a ON t(a);
+    INSERT INTO t VALUES (1, 10, 100), (2, 20, 200), (3, 30, 300);
+}
+
+@setup update-both-indexed-and-non-indexed
+test update-both-indexed-and-non-indexed {
+    UPDATE t SET a = 5, b = 50, c = 500 WHERE a = 2;
+    SELECT * FROM t ORDER BY a;
+}
+expect {
+    1|10|100
+    3|30|300
+    5|50|500
+}
+
+setup update-multiple-indexes {
+    CREATE TABLE t (a INTEGER, b INTEGER, c INTEGER);
+    CREATE INDEX idx_a ON t(a);
+    CREATE INDEX idx_b ON t(b);
+    INSERT INTO t VALUES (1, 10, 100), (2, 20, 200), (3, 30, 300);
+}
+
+@setup update-multiple-indexes
+test update-multiple-indexes {
+    UPDATE t SET a = 5, b = 50 WHERE c = 200;
+    SELECT * FROM t ORDER BY a;
+}
+expect {
+    1|10|100
+    3|30|300
+    5|50|200
+}
+
+setup update-all-rows-with-index {
+    CREATE TABLE t (a INTEGER, b INTEGER);
+    CREATE INDEX idx_a ON t(a);
+    INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);
+}
+
+@setup update-all-rows-with-index
+test update-all-rows-with-index {
+    UPDATE t SET a = a + 10;
+    SELECT * FROM t ORDER BY a;
+}
+expect {
+    11|10
+    12|20
+    13|30
+}
+
+# Range update tests
+setup update-range-non-indexed {
+    CREATE TABLE t (a INTEGER, b INTEGER);
+    CREATE INDEX idx_a ON t(a);
+    INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50);
+}
+
+@setup update-range-non-indexed
+test update-range-non-indexed {
+    UPDATE t SET b = 999 WHERE a >= 2 AND a <= 4;
+    SELECT * FROM t ORDER BY a;
+}
+expect {
+    1|10
+    2|999
+    3|999
+    4|999
+    5|50
+}
+
+setup update-range-indexed-column {
+    CREATE TABLE t (a INTEGER, b INTEGER);
+    CREATE INDEX idx_a ON t(a);
+    INSERT INTO t VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50);
+}
+
+@setup update-range-indexed-column
+test update-range-indexed-column {
+    UPDATE t SET a = a + 100 WHERE a >= 2 AND a < 4;
+    SELECT * FROM t ORDER BY a;
+}
+expect {
+    1|10
+    4|40
+    5|50
+    102|20
+    103|30
+}
+
+setup update-range-both-columns {
+    CREATE TABLE t (a INTEGER, b INTEGER, c INTEGER);
+    CREATE INDEX idx_a ON t(a);
+    INSERT INTO t VALUES (1, 10, 100), (2, 20, 200), (3, 30, 300), (4, 40, 400), (5, 50, 500);
+}
+
+@setup update-range-both-columns
+test update-range-both-columns {
+    UPDATE t SET a = a * 10, b = b * 2 WHERE a > 1 AND a < 5;
+    SELECT * FROM t ORDER BY a;
+}
+expect {
+    1|10|100
+    5|50|500
+    20|40|200
+    30|60|300
+    40|80|400
+}
+
+setup update-range-multiple-indexes {
+    CREATE TABLE t (a INTEGER, b INTEGER, c INTEGER);
+    CREATE INDEX idx_a ON t(a);
+    CREATE INDEX idx_b ON t(b);
+    INSERT INTO t VALUES (1, 10, 100), (2, 20, 200), (3, 30, 300), (4, 40, 400);
+}
+
+@setup update-range-multiple-indexes
+test update-range-multiple-indexes {
+    UPDATE t SET a = a + 10, b = b + 100 WHERE a BETWEEN 2 AND 3;
+    SELECT * FROM t ORDER BY a;
+}
+expect {
+    1|10|100
+    4|40|400
+    12|120|200
+    13|130|300
+}
+

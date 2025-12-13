@@ -1,0 +1,25 @@
+# Transaction Tests
+# Ported from testing/transactions.test
+
+@database testing/testing.db readonly
+
+# Basic transaction IMMEDIATE
+test basic-tx-1 {
+    BEGIN IMMEDIATE; END
+}
+expect {
+}
+
+# Basic transaction EXCLUSIVE
+test basic-tx-2 {
+    BEGIN EXCLUSIVE; END
+}
+expect {
+}
+
+# Basic transaction DEFERRED
+test basic-tx-3 {
+    BEGIN DEFERRED; END
+}
+expect {
+}

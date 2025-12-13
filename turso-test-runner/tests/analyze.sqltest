@@ -1,0 +1,196 @@
+# ANALYZE Tests
+# Ported from testing/analyze.test
+
+@database :memory:
+
+# Empty table
+setup analyze-empty-table {
+    CREATE TABLE temp (a integer);
+}
+
+@setup analyze-empty-table
+test analyze-empty-table {
+    ANALYZE temp;
+    SELECT * FROM sqlite_stat1;
+}
+expect {
+}
+
+# One row table
+setup analyze-one-row-table {
+    CREATE TABLE temp (a integer);
+    INSERT INTO temp VALUES (1);
+}
+
+@setup analyze-one-row-table
+test analyze-one-row-table {
+    ANALYZE temp;
+    SELECT * FROM sqlite_stat1;
+}
+expect {
+    temp||1
+}
+
+# ANALYZE overwrites
+setup analyze-overwrites {
+    CREATE TABLE temp (a integer);
+    INSERT INTO temp VALUES (1);
+}
+
+@setup analyze-overwrites
+test analyze-overwrites {
+    ANALYZE temp;
+    INSERT INTO temp VALUES (2);
+    ANALYZE temp;
+    SELECT * FROM sqlite_stat1;
+}
+expect {
+    temp||2
+}
+
+# ANALYZE all
+setup analyze-all {
+    create table t(a, b);
+    insert into t values(1, 2);
+}
+
+@setup analyze-all
+test analyze-all {
+    ANALYZE;
+    SELECT * FROM sqlite_stat1;
+}
+expect {
+    t||1
+}
+
+# Table with primary key
+setup analyze-table-with-pk {
+    CREATE TABLE temp (a integer primary key);
+    INSERT INTO temp VALUES (1);
+}
+
+@setup analyze-table-with-pk
+test analyze-table-with-pk {
+    ANALYZE temp;
+    SELECT * FROM sqlite_stat1;
+}
+expect {
+    temp||1
+}
+
+# ANALYZE one database
+setup analyze-one-database {
+    SELECT 1;
+}
+
+@setup analyze-one-database
+test analyze-one-database {
+    ANALYZE main;
+}
+expect {
+}
+
+# ANALYZE index
+setup analyze-index {
+    CREATE TABLE temp (a integer, b integer);
+    CREATE INDEX temp_b ON temp (b);
+    INSERT INTO temp select value, value + 1 from generate_series(1,100);
+}
+
+@setup analyze-index
+test analyze-index {
+    ANALYZE temp_b;
+    SELECT idx, stat FROM sqlite_stat1 where idx = 'temp_b';
+}
+expect {
+    temp_b|100 1
+}
+
+# Multi-column index
+setup analyze-multi-column-index {
+    CREATE TABLE t(a, b, c);
+    CREATE INDEX idx ON t(a, b);
+    INSERT INTO t VALUES (1, 'x', 100);
+    INSERT INTO t VALUES (1, 'x', 101);
+    INSERT INTO t VALUES (1, 'y', 102);
+    INSERT INTO t VALUES (2, 'x', 103);
+}
+
+@setup analyze-multi-column-index
+test analyze-multi-column-index {
+    ANALYZE;
+    SELECT idx, stat FROM sqlite_stat1 where idx = 'idx';
+}
+expect {
+    idx|4 2 2
+}
+
+# Three column index
+setup analyze-three-column-index {
+    CREATE TABLE t(a, b, c, d);
+    CREATE INDEX idx ON t(a, b, c);
+    INSERT INTO t VALUES (1, 1, 1, 1);
+    INSERT INTO t VALUES (1, 1, 1, 2);
+    INSERT INTO t VALUES (1, 1, 2, 3);
+    INSERT INTO t VALUES (1, 2, 1, 4);
+    INSERT INTO t VALUES (2, 1, 1, 5);
+}
+
+@setup analyze-three-column-index
+test analyze-three-column-index {
+    ANALYZE;
+    SELECT idx, stat FROM sqlite_stat1 where idx = 'idx';
+}
+expect {
+    idx|5 3 2 2
+}
+
+# NULL values
+setup analyze-null-values {
+    CREATE TABLE t(a, b);
+    CREATE INDEX idx ON t(a, b);
+    INSERT INTO t VALUES (NULL, 1);
+    INSERT INTO t VALUES (NULL, 1);
+    INSERT INTO t VALUES (NULL, 2);
+    INSERT INTO t VALUES (1, NULL);
+    INSERT INTO t VALUES (1, NULL);
+}
+
+@setup analyze-null-values
+test analyze-null-values {
+    ANALYZE;
+    SELECT idx, stat FROM sqlite_stat1 where idx = 'idx';
+}
+expect {
+    idx|5 3 2
+}
+
+# All identical
+setup analyze-all-identical {
+    CREATE TABLE t(a, b);
+    CREATE INDEX idx ON t(a, b);
+    INSERT INTO t VALUES (1, 1);
+    INSERT INTO t VALUES (1, 1);
+    INSERT INTO t VALUES (1, 1);
+    INSERT INTO t VALUES (1, 1);
+}
+
+@setup analyze-all-identical
+test analyze-all-identical {
+    ANALYZE;
+    SELECT idx, stat FROM sqlite_stat1 where idx = 'idx';
+}
+expect {
+    idx|4 4 4
+}
+
+# WITHOUT ROWID not supported
+setup analyze-table-without-rowid-fails {
+    CREATE TABLE temp (a integer primary key) WITHOUT ROWID;
+}
+
+@setup analyze-table-without-rowid-fails
+test analyze-table-without-rowid-fails {
+    ANALYZE temp;
+}
+expect error { ANALYZE }

@@ -1,0 +1,43 @@
+# Aggregate Functions Tests (Memory - standalone tests)
+# Ported from testing/agg-functions.test
+
+@database :memory:
+
+setup min-null-table {
+    CREATE TABLE t (a);
+    INSERT INTO t VALUES ('abc'), (NULL);
+}
+
+@setup min-null-table
+test min-null-regression-test {
+    SELECT min(a) FROM t;
+}
+expect {
+    abc
+}
+
+setup max-null-table {
+    CREATE TABLE t (a);
+    INSERT INTO t VALUES ('abc'), (NULL);
+}
+
+@setup max-null-table
+test max-null-regression-test {
+    SELECT max(a) FROM t;
+}
+expect {
+    abc
+}
+
+setup group-concat-null-table {
+    CREATE TABLE t (a);
+    INSERT INTO t VALUES ('a'), (''), ('b'), (NULL), ('c');
+}
+
+@setup group-concat-null-table
+test group-concat-null-values-test {
+    SELECT group_concat(a) FROM t;
+}
+expect {
+    a,,b,c
+}

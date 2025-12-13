@@ -1,0 +1,25 @@
+# Coalesce Tests (Readonly - uses existing users table)
+# Ported from testing/coalesce.test
+
+@database testing/testing.db readonly
+
+test coalesce-from-table {
+    SELECT coalesce(NULL, 1) FROM users LIMIT 1;
+}
+expect {
+    1
+}
+
+test coalesce-from-table-column {
+    SELECT coalesce(NULL, age) FROM users WHERE age = 94 LIMIT 1;
+}
+expect {
+    94
+}
+
+test coalesce-from-table-multiple-columns {
+    SELECT coalesce(NULL, age), coalesce(NULL, id) FROM users WHERE age = 94 LIMIT 1;
+}
+expect {
+    94|1
+}

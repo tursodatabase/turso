@@ -1,0 +1,489 @@
+# Trigger Tests
+# Ported from testing/trigger.test
+
+@database :memory:
+
+# Basic CREATE TRIGGER
+setup trigger-create-basic {
+    CREATE TABLE test1 (x INTEGER, y TEXT);
+}
+
+@setup trigger-create-basic
+test trigger-create-basic {
+    CREATE TRIGGER t1 BEFORE INSERT ON test1 BEGIN INSERT INTO test1 VALUES (100, 'triggered'); END;
+    INSERT INTO test1 VALUES (1, 'hello');
+    SELECT * FROM test1 ORDER BY rowid;
+}
+expect {
+    100|triggered
+    1|hello
+}
+
+# CREATE TRIGGER IF NOT EXISTS
+setup trigger-create-if-not-exists {
+    CREATE TABLE test2 (x INTEGER PRIMARY KEY);
+}
+
+@setup trigger-create-if-not-exists
+test trigger-create-if-not-exists {
+    CREATE TRIGGER IF NOT EXISTS t2 BEFORE INSERT ON test2 BEGIN SELECT 1; END;
+    CREATE TRIGGER IF NOT EXISTS t2 BEFORE INSERT ON test2 BEGIN SELECT 1; END;
+    SELECT name FROM sqlite_schema WHERE type='trigger' AND name='t2';
+}
+expect {
+    t2
+}
+
+# DROP TRIGGER
+setup trigger-drop-basic {
+    CREATE TABLE test3 (x INTEGER PRIMARY KEY);
+}
+
+@setup trigger-drop-basic
+test trigger-drop-basic {
+    CREATE TRIGGER t3 BEFORE INSERT ON test3 BEGIN SELECT 1; END;
+    DROP TRIGGER t3;
+    SELECT name FROM sqlite_schema WHERE type='trigger' AND name='t3';
+}
+expect {
+}
+
+# DROP TRIGGER IF EXISTS
+setup trigger-drop-if-exists {
+    CREATE TABLE test4 (x INTEGER PRIMARY KEY);
+}
+
+@setup trigger-drop-if-exists
+test trigger-drop-if-exists {
+    DROP TRIGGER IF EXISTS nonexistent;
+    CREATE TRIGGER t4 BEFORE INSERT ON test4 BEGIN SELECT 1; END;
+    DROP TRIGGER IF EXISTS t4;
+    SELECT name FROM sqlite_schema WHERE type='trigger' AND name='t4';
+}
+expect {
+}
+
+# BEFORE INSERT trigger
+setup trigger-before-insert {
+    CREATE TABLE test5 (x INTEGER PRIMARY KEY, y TEXT);
+}
+
+@setup trigger-before-insert
+test trigger-before-insert {
+    CREATE TRIGGER t5 BEFORE INSERT ON test5 BEGIN UPDATE test5 SET y = 'before_' || y WHERE x = NEW.x; END;
+    INSERT INTO test5 VALUES (1, 'hello');
+    SELECT * FROM test5;
+}
+expect {
+    1|hello
+}
+
+# AFTER INSERT trigger
+setup trigger-after-insert {
+    CREATE TABLE test6 (x INTEGER PRIMARY KEY, y TEXT);
+    CREATE TABLE log6 (x INTEGER, y TEXT);
+}
+
+@setup trigger-after-insert
+test trigger-after-insert {
+    CREATE TRIGGER t6 AFTER INSERT ON test6 BEGIN INSERT INTO log6 VALUES (NEW.x, NEW.y); END;
+    INSERT INTO test6 VALUES (1, 'hello');
+    SELECT * FROM log6;
+}
+expect {
+    1|hello
+}
+
+# BEFORE UPDATE trigger
+setup trigger-before-update {
+    CREATE TABLE test7 (x INTEGER PRIMARY KEY, y TEXT);
+    INSERT INTO test7 VALUES (1, 'hello');
+}
+
+@setup trigger-before-update
+test trigger-before-update {
+    CREATE TRIGGER t7 BEFORE UPDATE ON test7 BEGIN UPDATE test7 SET y = 'before_' || NEW.y WHERE x = OLD.x; END;
+    UPDATE test7 SET y = 'world' WHERE x = 1;
+    SELECT * FROM test7;
+}
+expect {
+    1|world
+}
+
+# AFTER UPDATE trigger
+setup trigger-after-update {
+    CREATE TABLE test8 (x INTEGER PRIMARY KEY, y TEXT);
+    CREATE TABLE log8 (old_x INTEGER, old_y TEXT, new_x INTEGER, new_y TEXT);
+    INSERT INTO test8 VALUES (1, 'hello');
+}
+
+@setup trigger-after-update
+test trigger-after-update {
+    CREATE TRIGGER t8 AFTER UPDATE ON test8 BEGIN INSERT INTO log8 VALUES (OLD.x, OLD.y, NEW.x, NEW.y); END;
+    UPDATE test8 SET y = 'world' WHERE x = 1;
+    SELECT * FROM log8;
+}
+expect {
+    1|hello|1|world
+}
+
+# BEFORE DELETE trigger
+setup trigger-before-delete {
+    CREATE TABLE test9 (x INTEGER PRIMARY KEY, y TEXT);
+    CREATE TABLE log9 (x INTEGER, y TEXT);
+    INSERT INTO test9 VALUES (1, 'hello');
+}
+
+@setup trigger-before-delete
+test trigger-before-delete {
+    CREATE TRIGGER t9 BEFORE DELETE ON test9 BEGIN INSERT INTO log9 VALUES (OLD.x, OLD.y); END;
+    DELETE FROM test9 WHERE x = 1;
+    SELECT * FROM log9;
+}
+expect {
+    1|hello
+}
+
+# AFTER DELETE trigger
+setup trigger-after-delete {
+    CREATE TABLE test10 (x INTEGER PRIMARY KEY, y TEXT);
+    CREATE TABLE log10 (x INTEGER, y TEXT);
+    INSERT INTO test10 VALUES (1, 'hello');
+}
+
+@setup trigger-after-delete
+test trigger-after-delete {
+    CREATE TRIGGER t10 AFTER DELETE ON test10 BEGIN INSERT INTO log10 VALUES (OLD.x, OLD.y); END;
+    DELETE FROM test10 WHERE x = 1;
+    SELECT * FROM log10;
+}
+expect {
+    1|hello
+}
+
+# Trigger with WHEN clause
+setup trigger-when-clause {
+    CREATE TABLE test11 (x INTEGER PRIMARY KEY, y INTEGER);
+    CREATE TABLE log11 (x INTEGER);
+}
+
+@setup trigger-when-clause
+test trigger-when-clause {
+    CREATE TRIGGER t11 AFTER INSERT ON test11 WHEN NEW.y > 10 BEGIN INSERT INTO log11 VALUES (NEW.x); END;
+    INSERT INTO test11 VALUES (1, 5);
+    INSERT INTO test11 VALUES (2, 15);
+    SELECT * FROM log11;
+}
+expect {
+    2
+}
+
+# Multiple triggers on same event
+setup trigger-multiple-same-event {
+    CREATE TABLE test12 (x INTEGER PRIMARY KEY);
+    CREATE TABLE log12 (msg TEXT);
+}
+
+@setup trigger-multiple-same-event
+test trigger-multiple-same-event {
+    CREATE TRIGGER t12a BEFORE INSERT ON test12 BEGIN INSERT INTO log12 VALUES ('trigger1'); END;
+    CREATE TRIGGER t12b BEFORE INSERT ON test12 BEGIN INSERT INTO log12 VALUES ('trigger2'); END;
+    INSERT INTO test12 VALUES (1);
+    SELECT * FROM log12 ORDER BY msg;
+}
+expect {
+    trigger1
+    trigger2
+}
+
+# Triggers dropped when table is dropped
+setup trigger-drop-table-drops-triggers {
+    CREATE TABLE test13 (x INTEGER PRIMARY KEY);
+}
+
+@setup trigger-drop-table-drops-triggers
+test trigger-drop-table-drops-triggers {
+    CREATE TRIGGER t13 BEFORE INSERT ON test13 BEGIN SELECT 1; END;
+    DROP TABLE test13;
+    SELECT name FROM sqlite_schema WHERE type='trigger' AND name='t13';
+}
+expect {
+}
+
+# NEW and OLD references
+setup trigger-new-old-references {
+    CREATE TABLE test14 (x INTEGER PRIMARY KEY, y TEXT);
+    CREATE TABLE log14 (msg TEXT);
+    INSERT INTO test14 VALUES (1, 'hello');
+}
+
+@setup trigger-new-old-references
+test trigger-new-old-references {
+    CREATE TRIGGER t14 AFTER UPDATE ON test14 BEGIN INSERT INTO log14 VALUES ('old=' || OLD.y || ' new=' || NEW.y); END;
+    UPDATE test14 SET y = 'world' WHERE x = 1;
+    SELECT * FROM log14;
+}
+expect {
+    old=hello new=world
+}
+
+# Trigger with UPDATE OF clause
+setup trigger-update-of {
+    CREATE TABLE test15 (x INTEGER PRIMARY KEY, y TEXT, z TEXT);
+    CREATE TABLE log15 (msg TEXT);
+    INSERT INTO test15 VALUES (1, 'hello', 'world');
+}
+
+@setup trigger-update-of
+test trigger-update-of {
+    CREATE TRIGGER t15 AFTER UPDATE OF y ON test15 BEGIN INSERT INTO log15 VALUES ('y changed'); END;
+    UPDATE test15 SET z = 'foo' WHERE x = 1;
+    SELECT * FROM log15;
+    UPDATE test15 SET y = 'bar' WHERE x = 1;
+    SELECT * FROM log15;
+}
+expect {
+    y changed
+}
+
+# Recursive trigger - AFTER INSERT inserting into same table
+setup trigger-recursive-after-insert {
+    CREATE TABLE test16 (x INTEGER PRIMARY KEY);
+}
+
+@setup trigger-recursive-after-insert
+test trigger-recursive-after-insert {
+    CREATE TRIGGER t16 AFTER INSERT ON test16 BEGIN INSERT INTO test16 VALUES (NEW.x + 1); END;
+    INSERT INTO test16 VALUES (1);
+    SELECT * FROM test16 ORDER BY x;
+}
+expect {
+    1
+    2
+}
+
+# Multiple UPDATE OF columns
+setup trigger-update-of-multiple {
+    CREATE TABLE test17 (x INTEGER PRIMARY KEY, y TEXT, z TEXT);
+    CREATE TABLE log17 (msg TEXT);
+    INSERT INTO test17 VALUES (1, 'a', 'b');
+}
+
+@setup trigger-update-of-multiple
+test trigger-update-of-multiple {
+    CREATE TRIGGER t17 AFTER UPDATE OF y, z ON test17 BEGIN INSERT INTO log17 VALUES ('updated'); END;
+    UPDATE test17 SET y = 'c' WHERE x = 1;
+    SELECT COUNT(*) FROM log17;
+    UPDATE test17 SET x = 2 WHERE x = 1;
+    SELECT COUNT(*) FROM log17;
+}
+expect {
+    1
+    1
+}
+
+# Complex WHEN clause with AND
+setup trigger-when-complex {
+    CREATE TABLE test18 (x INTEGER PRIMARY KEY, y INTEGER);
+    CREATE TABLE log18 (x INTEGER);
+}
+
+@setup trigger-when-complex
+test trigger-when-complex {
+    CREATE TRIGGER t18 BEFORE INSERT ON test18 WHEN NEW.y > 5 AND NEW.y < 10 BEGIN INSERT INTO log18 VALUES (NEW.x); END;
+    INSERT INTO test18 VALUES (1, 3);
+    INSERT INTO test18 VALUES (2, 7);
+    INSERT INTO test18 VALUES (3, 12);
+    SELECT * FROM log18;
+}
+expect {
+    2
+}
+
+# Nested triggers - trigger firing another trigger
+setup trigger-nested {
+    CREATE TABLE test19 (x INTEGER PRIMARY KEY);
+    CREATE TABLE test20 (x INTEGER PRIMARY KEY);
+    CREATE TABLE log19 (msg TEXT);
+}
+
+@setup trigger-nested
+test trigger-nested {
+    CREATE TRIGGER t19 AFTER INSERT ON test19 BEGIN INSERT INTO test20 VALUES (NEW.x); END;
+    CREATE TRIGGER t20 AFTER INSERT ON test20 BEGIN INSERT INTO log19 VALUES ('t20 inserted: ' || NEW.x); END;
+    INSERT INTO test19 VALUES (1);
+    SELECT * FROM log19;
+}
+expect {
+    t20 inserted: 1
+}
+
+# BEFORE INSERT inserting into same table (recursive)
+setup trigger-recursive-before-insert {
+    CREATE TABLE test21 (x INTEGER PRIMARY KEY);
+}
+
+@setup trigger-recursive-before-insert
+test trigger-recursive-before-insert {
+    CREATE TRIGGER t21 BEFORE INSERT ON test21 BEGIN INSERT INTO test21 VALUES (NEW.x + 100); END;
+    INSERT INTO test21 VALUES (1);
+    SELECT * FROM test21 ORDER BY x;
+}
+expect {
+    1
+    101
+}
+
+# AFTER UPDATE with WHEN clause and UPDATE OF
+setup trigger-update-of-when {
+    CREATE TABLE test22 (x INTEGER PRIMARY KEY, y TEXT);
+    INSERT INTO test22 VALUES (1, 'hello');
+}
+
+@setup trigger-update-of-when
+test trigger-update-of-when {
+    CREATE TRIGGER t22 AFTER UPDATE OF y ON test22 WHEN OLD.y != NEW.y BEGIN UPDATE test22 SET y = UPPER(NEW.y) WHERE x = NEW.x; END;
+    UPDATE test22 SET y = 'world' WHERE x = 1;
+    SELECT * FROM test22;
+}
+expect {
+    1|WORLD
+}
+
+# Multiple statements in BEFORE INSERT trigger
+setup trigger-multiple-statements-before-insert {
+    CREATE TABLE test23 (x INTEGER PRIMARY KEY, y TEXT);
+    CREATE TABLE log23a (msg TEXT);
+    CREATE TABLE log23b (msg TEXT);
+}
+
+@setup trigger-multiple-statements-before-insert
+test trigger-multiple-statements-before-insert {
+    CREATE TRIGGER t23 BEFORE INSERT ON test23 BEGIN INSERT INTO log23a VALUES ('before1'); INSERT INTO log23b VALUES ('before2'); END;
+    INSERT INTO test23 VALUES (1, 'hello');
+    SELECT * FROM log23a;
+    SELECT * FROM log23b;
+}
+expect {
+    before1
+    before2
+}
+
+# Multiple statements in AFTER INSERT trigger
+setup trigger-multiple-statements-after-insert {
+    CREATE TABLE test24 (x INTEGER PRIMARY KEY, y TEXT);
+    CREATE TABLE log24a (msg TEXT);
+    CREATE TABLE log24b (msg TEXT);
+}
+
+@setup trigger-multiple-statements-after-insert
+test trigger-multiple-statements-after-insert {
+    CREATE TRIGGER t24 AFTER INSERT ON test24 BEGIN INSERT INTO log24a VALUES ('after1'); INSERT INTO log24b VALUES ('after2'); END;
+    INSERT INTO test24 VALUES (1, 'hello');
+    SELECT * FROM log24a;
+    SELECT * FROM log24b;
+}
+expect {
+    after1
+    after2
+}
+
+# Trigger that causes constraint violation in another table
+setup trigger-constraint-violation {
+    CREATE TABLE test37a (x INTEGER PRIMARY KEY);
+    CREATE TABLE test37b (x INTEGER PRIMARY KEY, y INTEGER);
+    INSERT INTO test37b VALUES (1, 100);
+}
+
+@setup trigger-constraint-violation
+test trigger-constraint-violation {
+    CREATE TRIGGER t37 AFTER INSERT ON test37a BEGIN INSERT OR IGNORE INTO test37b VALUES (NEW.x, NEW.x * 10); END;
+    INSERT INTO test37a VALUES (1);
+    SELECT * FROM test37b ORDER BY x;
+}
+expect {
+    1|100
+}
+
+# Trigger that causes cascading updates through multiple tables
+setup trigger-cascading-updates {
+    CREATE TABLE test57a (x INTEGER PRIMARY KEY, y INTEGER);
+    CREATE TABLE test57b (x INTEGER PRIMARY KEY, y INTEGER);
+    CREATE TABLE log57 (msg TEXT);
+    INSERT INTO test57a VALUES (1, 10);
+    INSERT INTO test57b VALUES (1, 100);
+}
+
+@setup trigger-cascading-updates
+test trigger-cascading-updates {
+    CREATE TRIGGER t57a AFTER UPDATE ON test57a BEGIN UPDATE test57b SET y = NEW.y * 10 WHERE x = NEW.x; END;
+    CREATE TRIGGER t57b AFTER UPDATE ON test57b BEGIN INSERT INTO log57 VALUES ('b updated: ' || NEW.y); END;
+    UPDATE test57a SET y = 20 WHERE x = 1;
+    SELECT * FROM test57a;
+    SELECT * FROM test57b;
+    SELECT * FROM log57;
+}
+expect {
+    1|20
+    1|200
+    b updated: 200
+}
+
+# Cannot create trigger on system table
+setup trigger-cannot-create-on-system-table {
+    SELECT 1;
+}
+
+@setup trigger-cannot-create-on-system-table
+test trigger-cannot-create-on-system-table {
+    create trigger t after insert on sqlite_master begin
+      select 1;
+    end;
+}
+expect error {}
+
+# Dropping table should drop triggers
+setup trigger-drop-make-same-table {
+    create table a(id int primary key, x int);
+    create table t(id int primary key, b int, d int, c int);
+    create table t1(id int, y int);
+    create trigger trg after insert on t begin update a set x = x - new.d + new.c where id = new.b; insert into t1(id, y) values (new.id, new.c - new.d); end;
+    insert into a values (1, 5000);
+    insert into a values (2, 3000);
+}
+
+@setup trigger-drop-make-same-table
+test trigger-drop-make-same-table {
+    drop table t;
+    create table t(id int primary key, b int, c int, d int);
+    insert into t values (1, 1, 1000, 50);
+    insert into t values (2, 2, 500, 100);
+    select * from a;
+    select * from t1;
+}
+expect {
+    1|5000
+    2|3000
+}
+
+# Trigger col name in subquery
+setup trigger-col-name-trigger-subquery {
+    CREATE TABLE t ( a INTEGER, b TEXT);
+    CREATE TABLE t1 ( x INTEGER, y TEXT);
+}
+
+@setup trigger-col-name-trigger-subquery
+test trigger-col-name-trigger-subquery {
+    CREATE TRIGGER trg AFTER UPDATE ON t1 BEGIN
+        INSERT INTO t SELECT * FROM t WHERE t.a = 42;
+    END;
+    insert into t VALUES (42, 'abc');
+    INSERT INTO t1 VALUES (0, '');
+    UPDATE t1 SET y = 'z' WHERE TRUE;
+    select * from t union all select * from t1;
+}
+expect {
+    2|abc
+    42|abc
+    0|z
+}

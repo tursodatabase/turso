@@ -1,0 +1,570 @@
+# SELECT Tests (Readonly - uses products/users tables)
+# Ported from testing/select.test
+
+@database testing/testing.db readonly
+
+test select-const-1 {
+    SELECT 1;
+}
+expect {
+    1
+}
+
+test select-const-2 {
+    SELECT 2;
+}
+expect {
+    2
+}
+
+test select-const-3 {
+    SELECT 0xDEAF;
+}
+expect {
+    57007
+}
+
+test select-const-4 {
+    SELECT -0xA;
+}
+expect {
+    -10
+}
+
+test select-true {
+    SELECT true;
+}
+expect {
+    1
+}
+
+test select-false {
+    SELECT false;
+}
+expect {
+    0
+}
+
+test select-text-escape-1 {
+    SELECT '''a';
+}
+expect {
+    'a
+}
+
+test select-blob-empty {
+    SELECT x'';
+}
+expect {
+}
+
+test select-blob-ascii {
+    SELECT x'6C696D626F';
+}
+expect {
+    limbo
+}
+
+test select-blob-emoji {
+    SELECT x'F09FA680';
+}
+expect {
+    🦀
+}
+
+test select-limit-0 {
+    SELECT id FROM users LIMIT 0;
+}
+expect {
+}
+
+test select-doubly-qualified {
+    SELECT main.users.id FROM users LIMIT 0;
+}
+expect {
+}
+
+test select-doubly-qualified-wrong-table {
+    SELECT main.wrong.id FROM users LIMIT 0;
+}
+expect error {}
+
+test select-doubly-qualified-wrong-column {
+    SELECT main.users.wrong FROM users LIMIT 0;
+}
+expect error {}
+
+test select-limit-expression {
+    select price from products limit 2 + 1 - 1;
+}
+expect {
+    79.0
+    82.0
+}
+
+test select-limit-true {
+    SELECT id FROM users ORDER BY id LIMIT true;
+}
+expect {
+    1
+}
+
+test select-limit-false {
+    SELECT id FROM users ORDER BY id LIMIT false;
+}
+expect {
+}
+
+test realify {
+    select price from products limit 1;
+}
+expect {
+    79.0
+}
+
+test select-add {
+    select u.age + 1 from users u where u.age = 91 limit 1;
+}
+expect {
+    92
+}
+
+test select-subtract {
+    select u.age - 1 from users u where u.age = 91 limit 1;
+}
+expect {
+    90
+}
+
+test case-insensitive-columns {
+    select u.aGe + 1 from USERS u where U.AGe = 91 limit 1;
+}
+expect {
+    92
+}
+
+test table-star {
+    select p.*, p.name from products p limit 1;
+}
+expect {
+    1|hat|79.0|hat
+}
+
+test table-star-2 {
+    select p.*, u.first_name from users u join products p on u.id = p.id limit 1;
+}
+expect {
+    1|hat|79.0|Jamie
+}
+
+test select_with_quoting {
+    select `users`.id from [users] where users.[id] = 5;
+}
+expect {
+    5
+}
+
+test select_with_quoting_2 {
+    select "users".`id` from users where `users`.[id] = 5;
+}
+expect {
+    5
+}
+
+test select-rowid {
+    select rowid, first_name from users u where rowid = 5;
+}
+expect {
+    5|Edward
+}
+
+test select-rowid-2 {
+    select u.rowid, first_name from users u where rowid = 5;
+}
+expect {
+    5|Edward
+}
+
+test seekrowid {
+    select * from users u where u.id = 5;
+}
+expect {
+    5|Edward|Miller|christiankramer@example.com|725-281-1033|08522 English Plain|Lake Keith|ID|23283|15
+}
+
+test select_parenthesized {
+    select (price + 100) from products limit 1;
+}
+expect {
+    179.0
+}
+
+test select_case_base_else {
+    select case when 0 then 'false' when 1 then 'true' else 'null' end;
+}
+expect {
+    true
+}
+
+test select_case_noelse_null {
+    select case when 0 then 0 end;
+}
+expect {
+}
+
+test select_base_case_else {
+    select case 1 when 0 then 'zero' when 1 then 'one' else 'two' end;
+}
+expect {
+    one
+}
+
+test select_base_case_null_result {
+    select case NULL when 0 then 'first' else 'second' end;
+    select case NULL when NULL then 'first' else 'second' end;
+    select case 0 when 0 then 'first' else 'second' end;
+}
+expect {
+    second
+    second
+    first
+}
+
+test select_base_case_noelse_null {
+    select case 'null else' when 0 then 0 when 1 then 1 end;
+}
+expect {
+}
+
+test select-is-null {
+    select null is null, (1 / 0) is null, null is (1 / 0), (1 / 0) is (1 / 0);
+    select 4 is null, '4' is null, 0 is null, (1 / 2) is null;
+}
+expect {
+    1|1|1|1
+    0|0|0|0
+}
+
+test select-is-not-null {
+    select null is not null, (1 / 0) is not null, null is not (1 / 0), (1 / 0) is not (1 / 0);
+    select 4 is not null, '4' is not null, 0 is not null, (1 / 2) is not null;
+}
+expect {
+    0|0|0|0
+    1|1|1|1
+}
+
+test select_bin_shr {
+    select 997623670 >> 0, 997623670 >> 1, 997623670 >> 10, 997623670 >> 30;
+    select -997623670 >> 0, -997623670 >> 1, -997623670 >> 10, -997623670 >> 30;
+    select 997623670 << 0, 997623670 << -1, 997623670 << -10, 997623670 << -30;
+    select -997623670 << 0, -997623670 << -1, -997623670 << -10, -997623670 << -30;
+}
+expect {
+    997623670|498811835|974241|0
+    -997623670|-498811835|-974242|-1
+    997623670|498811835|974241|0
+    -997623670|-498811835|-974242|-1
+}
+
+test select_bin_shl {
+    select 997623670 << 0, 997623670 << 1, 997623670 << 10, 997623670 << 30;
+    select -997623670 << 0, -997623670 << 1, -997623670 << 10, -997623670 << 30;
+    select 997623670 >> 0, 997623670 >> -1, 997623670 >> -10, 997623670 >> -30;
+    select -997623670 >> 0, -997623670 >> -1, -997623670 >> -10, -997623670 >> -30;
+}
+expect {
+    997623670|1995247340|1021566638080|1071190259091374080
+    -997623670|-1995247340|-1021566638080|-1071190259091374080
+    997623670|1995247340|1021566638080|1071190259091374080
+    -997623670|-1995247340|-1021566638080|-1071190259091374080
+}
+
+test select-like-expression {
+    select 'bar' like 'bar%';
+}
+expect {
+    1
+}
+
+test select-not-like-expression {
+    select 'bar' not like 'bar%';
+}
+expect {
+    0
+}
+
+test select-modulo-float {
+    select 2 % 0.5;
+}
+expect {
+}
+
+test select_positive_infinite_float {
+    SELECT 1.7976931348623157E+308 + 1e308;
+}
+expect {
+    Inf
+}
+
+test select_negative_infinite_float {
+    SELECT -1.7976931348623157E+308 - 1e308;
+}
+expect {
+    -Inf
+}
+
+test select_shl_large_negative_float {
+    SELECT 1 << -1e19;
+    SELECT 1 << -9223372036854775808;
+    SELECT 1 << 9223372036854775807;
+}
+expect {
+    0
+    0
+    0
+}
+
+test select_shl_basic {
+    SELECT 1 << 0, 1 << 1, 1 << 2, 1 << 3;
+    SELECT 2 << 0, 2 << 1, 2 << 2, 2 << 3;
+}
+expect {
+    1|2|4|8
+    2|4|8|16
+}
+
+test select_shl_negative_numbers {
+    SELECT -1 << 0, -1 << 1, -1 << 2, -1 << 3;
+    SELECT -2 << 0, -2 << 1, -2 << 2, -2 << 3;
+}
+expect {
+    -1|-2|-4|-8
+    -2|-4|-8|-16
+}
+
+test select_shl_negative_shifts {
+    SELECT 8 << -1, 8 << -2, 8 << -3, 8 << -4;
+    SELECT -8 << -1, -8 << -2, -8 << -3, -8 << -4;
+}
+expect {
+    4|2|1|0
+    -4|-2|-1|-1
+}
+
+test select_shl_large_shifts {
+    SELECT 1 << 62, 1 << 63, 1 << 64;
+    SELECT -1 << 62, -1 << 63, -1 << 64;
+}
+expect {
+    4611686018427387904|-9223372036854775808|0
+    -4611686018427387904|-9223372036854775808|0
+}
+
+test select_shl_text_conversion {
+    SELECT '1' << '2';
+    SELECT '8' << '-2';
+    SELECT '-4' << '2';
+}
+expect {
+    4
+    2
+    -16
+}
+
+test select_shl_chained {
+    SELECT (1 << 2) << 3;
+    SELECT (2 << 1) << (1 << 1);
+}
+expect {
+    32
+    16
+}
+
+test select_shl_numeric_types {
+    SELECT CAST(1 AS INTEGER) << 2;
+    SELECT 1.0 << 2;
+    SELECT 1.5 << 2;
+}
+expect {
+    4
+    4
+    4
+}
+
+test select_fuzz_failure_case {
+    SELECT (-9 << ((-6) << (9)) >> ((5)) % -10 - + - (-9));
+}
+expect {
+    -16
+}
+
+test select-invalid-numeric-text-1 {
+    select -'e';
+}
+expect {
+    0
+}
+
+test select-invalid-numeric-text-2 {
+    select -'E';
+}
+expect {
+    0
+}
+
+test select-star-no-from {
+    SELECT *;
+}
+expect error {
+    no tables specified
+}
+
+test select-star-and-constant-no-from {
+    SELECT *, 1;
+}
+expect error {
+    no tables specified
+}
+
+test select-star-subquery {
+    SELECT 1 FROM (SELECT *);
+}
+expect error {
+    no tables specified
+}
+
+test limit-const-1 {
+    SELECT id FROM users ORDER BY id LIMIT 1;
+}
+expect {
+    1
+}
+
+test limit-text-2 {
+    SELECT id FROM users ORDER BY id LIMIT '2';
+}
+expect {
+    1
+    2
+}
+
+test limit-bool-true {
+    SELECT id FROM users ORDER BY id LIMIT true;
+}
+expect {
+    1
+}
+
+test limit-expr-add {
+    SELECT id FROM users ORDER BY id LIMIT 1+2+3;
+}
+expect {
+    1
+    2
+    3
+    4
+    5
+    6
+}
+
+test limit-expr-sub {
+    SELECT id FROM users ORDER BY id LIMIT 5-2-3;
+}
+expect {
+}
+
+test limit-expr-paren {
+    SELECT id FROM users ORDER BY id LIMIT (1+1)*2;
+}
+expect {
+    1
+    2
+    3
+    4
+}
+
+test limit-bool-add {
+    SELECT id FROM users ORDER BY id LIMIT true+2;
+}
+expect {
+    1
+    2
+    3
+}
+
+test limit-text-math {
+    SELECT id FROM users ORDER BY id LIMIT '2'*2+1;
+}
+expect {
+    1
+    2
+    3
+    4
+    5
+}
+
+test limit-bool-false-add {
+    SELECT id FROM users ORDER BY id LIMIT false+4;
+}
+expect {
+    1
+    2
+    3
+    4
+}
+
+test limit-mixed-math {
+    SELECT id FROM users ORDER BY id LIMIT (1+'1')*(1+1)-(5/5);
+}
+expect {
+    1
+    2
+    3
+}
+
+test limit-text-bool {
+    SELECT id FROM users ORDER BY id LIMIT ('false'+2);
+}
+expect {
+    1
+    2
+}
+
+test limit-coalesce {
+    SELECT id FROM users ORDER BY id LIMIT COALESCE(NULL,0+1);
+}
+expect {
+    1
+}
+
+test select-binary-collation {
+    SELECT 'a' = 'A';
+    SELECT 'a' = 'a';
+}
+expect {
+    0
+    1
+}
+
+test select-values-column-name {
+    SELECT column1 FROM (VALUES(123));
+}
+expect {
+    123
+}
+
+test sqlite-version-should-return-valid-output {
+    SELECT sqlite_version();
+}
+expect pattern {
+    \d+\.\d+\.\d+
+}
+
+test explain-64-bit-integer-no-overflow {
+    EXPLAIN SELECT 123123123123;
+}
+expect pattern {
+    \s123123123123\s
+}
+

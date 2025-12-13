@@ -1,0 +1,105 @@
+# ATTACH Tests (Memory)
+# Ported from testing/attach.test
+
+@database :memory:
+
+# Query attached file database
+setup attach-db-query {
+    SELECT 1;
+}
+
+@setup attach-db-query
+test attach-db-query {
+    ATTACH DATABASE "testing/testing_small.db" AS small;
+    SELECT value FROM small.demo where id = 1;
+}
+expect {
+    A
+}
+
+# Detach database
+setup detach-database {
+    SELECT 1;
+}
+
+@setup detach-database
+test detach-database {
+    ATTACH DATABASE "testing/testing_small.db" AS small;
+    DETACH DATABASE small;
+    pragma database_list;
+}
+expect {
+    0|main|
+}
+
+# Detach non-existent database (should fail)
+setup detach-non-existent {
+    SELECT 1;
+}
+
+@setup detach-non-existent
+test detach-non-existent {
+    DETACH DATABASE nonexistent;
+}
+expect error { no such database }
+
+# Attach in-memory database
+setup attach-memory-database {
+    SELECT 1;
+}
+
+@setup attach-memory-database
+test attach-memory-database {
+    ATTACH DATABASE ':memory:' AS mem;
+    pragma database_list;
+}
+expect {
+    0|main|
+    2|mem|
+}
+
+# Cross-database join
+setup attach-cross-database-join {
+    SELECT 1;
+}
+
+@setup attach-cross-database-join
+test attach-cross-database-join {
+    ATTACH DATABASE "testing/testing_small.db" as small;
+    create table joiners (id int, otherid int);
+    insert into joiners (id, otherid) values (1,1);
+    insert into joiners (id, otherid) values (3,3);
+    select s.value from joiners j inner join small.demo s where j.otherid = s.id;
+}
+expect {
+    A
+    B
+}
+
+# Query after detach (should fail)
+setup query-after-detach {
+    SELECT 1;
+}
+
+@setup query-after-detach
+test query-after-detach {
+    ATTACH DATABASE "testing/testing_small.db" as small;
+    DETACH DATABASE small;
+    select * from small.sqlite_schema;
+}
+expect error { no such }
+
+# Attach from memory db
+setup attach-from-memory-db {
+    CREATE TABLE t(a);
+    INSERT INTO t SELECT value from generate_series(1,10);
+}
+
+@setup attach-from-memory-db
+test attach-from-memory-db {
+    ATTACH DATABASE 'testing/testing.db' as a;
+    SELECT * from a.products, t LIMIT 1;
+}
+expect {
+    1|hat|79.0|1
+}

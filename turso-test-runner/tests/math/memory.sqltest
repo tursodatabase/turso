@@ -1,0 +1,2794 @@
+# Math Tests (Memory - standalone tests)
+# Ported from testing/math.test
+
+@database :memory:
+
+# Fuzz test failure case
+test fuzz-test-failure {
+    SELECT mod(atanh(tanh(-1.0)), ((1.0))) / ((asinh(-1.0) / 2.0 * 1.0) + pow(0.0, 1.0) + 0.5);
+}
+expect {
+    -16.8596516555675
+}
+
+# Addition tests
+test add-int-1 {
+    SELECT 10 + 1;
+}
+expect {
+    11
+}
+
+test add-int-2 {
+    SELECT 0xA + 0xFF;
+}
+expect {
+    265
+}
+
+test add-int-3 {
+    SELECT 0xA + 1;
+}
+expect {
+    11
+}
+
+test add-float {
+    SELECT 10.1 + 0.3;
+}
+expect {
+    10.4
+}
+
+test add-int-float-1 {
+    SELECT 10 + 0.1;
+}
+expect {
+    10.1
+}
+
+test add-int-float-2 {
+    SELECT 0xa + 0.1;
+}
+expect {
+    10.1
+}
+
+test add-agg-int-agg-int {
+    SELECT sum(1) + sum(2);
+}
+expect {
+    3
+}
+
+test add-agg-int-agg-float {
+    SELECT sum(1) + sum(2.5);
+}
+expect {
+    3.5
+}
+
+test add-agg-float-agg-int {
+    SELECT sum(1.5) + sum(2);
+}
+expect {
+    3.5
+}
+
+# Text addition tests
+test add-text-1 {
+    SELECT 'a' + 'a';
+}
+expect {
+    0
+}
+
+test add-text-2 {
+    SELECT 'a' + 10;
+}
+expect {
+    10
+}
+
+test add-text-3 {
+    SELECT 10 + 'a';
+}
+expect {
+    10
+}
+
+test add-text-4 {
+    SELECT 'a' + 11.0;
+}
+expect {
+    11.0
+}
+
+test add-text-5 {
+    SELECT 11.0 + 'a';
+}
+expect {
+    11.0
+}
+
+test add-text-7 {
+    SELECT '1' + '2';
+}
+expect {
+    3
+}
+
+test add-text-8 {
+    SELECT '1.0' + '2';
+}
+expect {
+    3.0
+}
+
+test add-text-9 {
+    SELECT '1.0' + '3.0';
+}
+expect {
+    4.0
+}
+
+# Overflow tests
+test add-overflow-1 {
+    SELECT '9223372036854775807' + '0';
+}
+expect {
+    9223372036854775807
+}
+
+test add-overflow-2 {
+    SELECT '9223372036854775807' + '1';
+}
+expect {
+    9.22337203685478e+18
+}
+
+test add-overflow-3 {
+    SELECT 9223372036854775807 + 0;
+}
+expect {
+    9223372036854775807
+}
+
+test add-overflow-4 {
+    SELECT 9223372036854775807 + 1;
+}
+expect {
+    9.22337203685478e+18
+}
+
+test add-overflow-5 {
+    SELECT '-9223372036854775808' + '0';
+}
+expect {
+    -9223372036854775808
+}
+
+test add-overflow-6 {
+    SELECT '-9223372036854775808' + '-1';
+}
+expect {
+    -9.22337203685478e+18
+}
+
+test add-overflow-7 {
+    SELECT -9223372036854775808 + 0;
+}
+expect {
+    -9223372036854775808
+}
+
+test add-overflow-8 {
+    SELECT -9223372036854775808 + -1;
+}
+expect {
+    -9.22337203685478e+18
+}
+
+# Subtraction tests
+test subtract-int {
+    SELECT 10 - 1;
+}
+expect {
+    9
+}
+
+test subtract-float {
+    SELECT 10.2 - 0.1;
+}
+expect {
+    10.1
+}
+
+test subtract-int-float {
+    SELECT 10 - 0.1;
+}
+expect {
+    9.9
+}
+
+test subtract-agg-int-agg-int {
+    SELECT sum(3) - sum(1);
+}
+expect {
+    2
+}
+
+test subtract-agg-int-agg-float {
+    SELECT sum(3) - sum(1.5);
+}
+expect {
+    1.5
+}
+
+test subtract-agg-float-agg-int {
+    SELECT sum(3.5) - sum(1);
+}
+expect {
+    2.5
+}
+
+test subtract-blob {
+    SELECT -x'11';
+}
+expect {
+    0
+}
+
+test subtract-blob-empty {
+    SELECT -x'';
+}
+expect {
+    0
+}
+
+test subtract-blob-character {
+    SELECT -'hi';
+}
+expect {
+    0
+}
+
+# Text subtraction
+test subtract-text-1 {
+    SELECT 'a' - 'a';
+}
+expect {
+    0
+}
+
+test subtract-text-2 {
+    SELECT 'a' - 10;
+}
+expect {
+    -10
+}
+
+test subtract-text-3 {
+    SELECT 10 - 'a';
+}
+expect {
+    10
+}
+
+test subtract-text-4 {
+    SELECT 'a' - 11.0;
+}
+expect {
+    -11.0
+}
+
+test subtract-text-5 {
+    SELECT 11.0 - 'a';
+}
+expect {
+    11.0
+}
+
+test subtract-text-7 {
+    SELECT '1' - '2';
+}
+expect {
+    -1
+}
+
+test subtract-text-8 {
+    SELECT '1.0' - '2';
+}
+expect {
+    -1.0
+}
+
+test subtract-text-9 {
+    SELECT '1.0' - '3.0';
+}
+expect {
+    -2.0
+}
+
+# Subtract overflow
+test subtract-overflow-1 {
+    SELECT '9223372036854775807' - '0';
+}
+expect {
+    9223372036854775807
+}
+
+test subtract-overflow-2 {
+    SELECT '9223372036854775807' - '-1';
+}
+expect {
+    9.22337203685478e+18
+}
+
+test subtract-overflow-3 {
+    SELECT 9223372036854775807 - 0;
+}
+expect {
+    9223372036854775807
+}
+
+test subtract-overflow-4 {
+    SELECT 9223372036854775807 - -1;
+}
+expect {
+    9.22337203685478e+18
+}
+
+test subtract-overflow-5 {
+    SELECT '-9223372036854775808' - '0';
+}
+expect {
+    -9223372036854775808
+}
+
+test subtract-overflow-6 {
+    SELECT '-9223372036854775808' - '1';
+}
+expect {
+    -9.22337203685478e+18
+}
+
+test subtract-overflow-7 {
+    SELECT -9223372036854775808 - 0;
+}
+expect {
+    -9223372036854775808
+}
+
+test subtract-overflow-8 {
+    SELECT -9223372036854775808 - 1;
+}
+expect {
+    -9.22337203685478e+18
+}
+
+# Multiplication tests
+test multiply-int {
+    SELECT 10 * 2;
+}
+expect {
+    20
+}
+
+test multiply-float {
+    SELECT 10.2 * 2.2;
+}
+expect {
+    22.44
+}
+
+test multiply-int-float {
+    SELECT 10 * 1.45;
+}
+expect {
+    14.5
+}
+
+test multiply-float-int {
+    SELECT 1.45 * 10;
+}
+expect {
+    14.5
+}
+
+test multiply-agg-int-agg-int {
+    SELECT sum(2) * sum(3);
+}
+expect {
+    6
+}
+
+test multiply-agg-int-agg-float {
+    SELECT sum(2) * sum(3.5);
+}
+expect {
+    7.0
+}
+
+test multiply-agg-float-agg-int {
+    SELECT sum(2.5) * sum(3);
+}
+expect {
+    7.5
+}
+
+# Text multiply
+test multiply-text-1 {
+    SELECT 'a' * 'a';
+}
+expect {
+    0
+}
+
+test multiply-text-2 {
+    SELECT 'a' * 10;
+}
+expect {
+    0
+}
+
+test multiply-text-3 {
+    SELECT 10 * 'a';
+}
+expect {
+    0
+}
+
+test multiply-text-4 {
+    SELECT 'a' * 11.0;
+}
+expect {
+    0.0
+}
+
+test multiply-text-5 {
+    SELECT 11.0 * 'a';
+}
+expect {
+    0.0
+}
+
+test multiply-text-7 {
+    SELECT '1' * '2';
+}
+expect {
+    2
+}
+
+test multiply-text-8 {
+    SELECT '1.0' * '2';
+}
+expect {
+    2.0
+}
+
+test multiply-text-9 {
+    SELECT '1.0' * '3.0';
+}
+expect {
+    3.0
+}
+
+# Multiply overflow
+test multiply-overflow-1 {
+    SELECT '9223372036854775807' * '1';
+}
+expect {
+    9223372036854775807
+}
+
+test multiply-overflow-2 {
+    SELECT '9223372036854775807' * '2';
+}
+expect {
+    1.84467440737096e+19
+}
+
+test multiply-overflow-3 {
+    SELECT 9223372036854775807 * 1;
+}
+expect {
+    9223372036854775807
+}
+
+test multiply-overflow-4 {
+    SELECT 9223372036854775807 * 2;
+}
+expect {
+    1.84467440737096e+19
+}
+
+test multiply-overflow-5 {
+    SELECT '-9223372036854775808' * '1';
+}
+expect {
+    -9223372036854775808
+}
+
+test multiply-overflow-6 {
+    SELECT '-9223372036854775808' * '2';
+}
+expect {
+    -1.84467440737096e+19
+}
+
+test multiply-overflow-7 {
+    SELECT -9223372036854775808 * 1;
+}
+expect {
+    -9223372036854775808
+}
+
+test multiply-overflow-8 {
+    SELECT -9223372036854775808 * 2;
+}
+expect {
+    -1.84467440737096e+19
+}
+
+# Division tests
+test divide-int {
+    SELECT 10 / 2;
+}
+expect {
+    5
+}
+
+test divide-int-no-fraction {
+    SELECT 10 / 3;
+}
+expect {
+    3
+}
+
+test divide-float {
+    SELECT 10.6 / 2.5;
+}
+expect {
+    4.24
+}
+
+test divide-int-float {
+    SELECT 10 / 4.0;
+}
+expect {
+    2.5
+}
+
+test divide-float-int {
+    SELECT 10.0 / 4;
+}
+expect {
+    2.5
+}
+
+test divide-by-zero {
+    SELECT 10 / 0;
+}
+expect {
+}
+
+test divide-int-null {
+    SELECT 10 / null;
+}
+expect {
+}
+
+test divide-null-int {
+    SELECT null / 10;
+}
+expect {
+}
+
+test divide-null {
+    SELECT null / null;
+}
+expect {
+}
+
+test divide-agg-int-agg-int {
+    SELECT sum(4) / sum(2);
+}
+expect {
+    2
+}
+
+test divide-agg-int-agg-float {
+    SELECT sum(4) / sum(2.0);
+}
+expect {
+    2.0
+}
+
+test divide-agg-float-agg-int {
+    SELECT sum(4.0) / sum(2);
+}
+expect {
+    2.0
+}
+
+# Text division
+test divide-text-1 {
+    SELECT 'a' / 'a';
+}
+expect {
+}
+
+test divide-text-2 {
+    SELECT 'a' / 10;
+}
+expect {
+    0
+}
+
+test divide-text-3 {
+    SELECT 10 / 'a';
+}
+expect {
+}
+
+test divide-text-4 {
+    SELECT 'a' / 11.0;
+}
+expect {
+    0.0
+}
+
+test divide-text-5 {
+    SELECT 11.0 / 'a';
+}
+expect {
+}
+
+test divide-text-7 {
+    SELECT '1' / '2';
+}
+expect {
+    0
+}
+
+test divide-text-8 {
+    SELECT '1.0' / '2';
+}
+expect {
+    0.5
+}
+
+test divide-text-9 {
+    SELECT '1.0' / '4.0';
+}
+expect {
+    0.25
+}
+
+# Division overflow
+test divide-overflow-5 {
+    SELECT '-9223372036854775808' / '0';
+}
+expect {
+}
+
+test divide-overflow-6 {
+    SELECT '-9223372036854775808' / '-1';
+}
+expect {
+    9.22337203685478e+18
+}
+
+test divide-overflow-7 {
+    SELECT -9223372036854775808 / 0;
+}
+expect {
+}
+
+test divide-overflow-8 {
+    SELECT -9223372036854775808 / -1;
+}
+expect {
+    9.22337203685478e+18
+}
+
+# Edge case string operations
+test add-float-text-edgecase {
+    SELECT '-123.22342-24' + '232.3x32';
+}
+expect {
+    109.07658
+}
+
+test add-str-edgecase {
+    SELECT '-1+23.22342-24' + '2-32.3x32';
+}
+expect {
+    1
+}
+
+test subtract-str-float-edgecase {
+    SELECT '-123.22342-24' - '232.3x32';
+}
+expect {
+    -355.52342
+}
+
+test multiply-str-floats-edgecase {
+    SELECT '-123.22341-24' * '232.3x32';
+}
+expect {
+    -28624.798143
+}
+
+# Bitwise AND tests
+test bitwise-and-int-null {
+    SELECT 1234 & NULL;
+}
+expect {
+}
+
+test bitwise-and-int-int {
+    SELECT 1234 & 1234;
+}
+expect {
+    1234
+}
+
+test bitwise-and-int-float {
+    SELECT 660 & 261.8;
+}
+expect {
+    4
+}
+
+test bitwise-and-float-float {
+    SELECT 660.63 & 261.8;
+}
+expect {
+    4
+}
+
+test bitwise-and-float-int-rev {
+    SELECT 261.8 & 660;
+}
+expect {
+    4
+}
+
+# Bitwise AND text tests
+test bitwise-and-text-1 {
+    SELECT 'a' & 'a';
+}
+expect {
+    0
+}
+
+test bitwise-and-text-2 {
+    SELECT 'a' & 10;
+}
+expect {
+    0
+}
+
+test bitwise-and-text-3 {
+    SELECT 10 & 'a';
+}
+expect {
+    0
+}
+
+test bitwise-and-text-4 {
+    SELECT 'a' & 11.0;
+}
+expect {
+    0
+}
+
+test bitwise-and-text-5 {
+    SELECT 11.0 & 'a';
+}
+expect {
+    0
+}
+
+test bitwise-and-text-7 {
+    SELECT '1' & '2';
+}
+expect {
+    0
+}
+
+test bitwise-and-text-8 {
+    SELECT '1.0' & '2';
+}
+expect {
+    0
+}
+
+test bitwise-and-text-9 {
+    SELECT '1.0' & '4.0';
+}
+expect {
+    0
+}
+
+test bitwise-and-text-10 {
+    SELECT '1.0' & '1.0';
+}
+expect {
+    1
+}
+
+test bitwise-and-text-11 {
+    SELECT '1' & '1';
+}
+expect {
+    1
+}
+
+# Bitwise OR tests
+test bitwise-or-int-null {
+    SELECT 1234 | NULL;
+}
+expect {
+}
+
+test bitwise-or-null-int {
+    SELECT NULL | 1234;
+}
+expect {
+}
+
+test bitwise-or-int-int {
+    SELECT 4321 | 1234;
+}
+expect {
+    5363
+}
+
+test bitwise-or-int-float {
+    SELECT 660 | 1234.0;
+}
+expect {
+    1750
+}
+
+test bitwise-or-float-float {
+    SELECT 1234.6 | 5432.2;
+}
+expect {
+    5626
+}
+
+# Bitwise OR text tests
+test bitwise-or-text-1 {
+    SELECT 'a' | 'a';
+}
+expect {
+    0
+}
+
+test bitwise-or-text-2 {
+    SELECT 'a' | 10;
+}
+expect {
+    10
+}
+
+test bitwise-or-text-3 {
+    SELECT 10 | 'a';
+}
+expect {
+    10
+}
+
+test bitwise-or-text-4 {
+    SELECT 'a' | 11.0;
+}
+expect {
+    11
+}
+
+test bitwise-or-text-5 {
+    SELECT 11.0 | 'a';
+}
+expect {
+    11
+}
+
+test bitwise-or-text-7 {
+    SELECT '1' | '2';
+}
+expect {
+    3
+}
+
+test bitwise-or-text-8 {
+    SELECT '1.0' | '2';
+}
+expect {
+    3
+}
+
+test bitwise-or-text-9 {
+    SELECT '1.0' | '4.0';
+}
+expect {
+    5
+}
+
+test bitwise-or-text-10 {
+    SELECT '1.0' | '1.0';
+}
+expect {
+    1
+}
+
+test bitwise-or-text-11 {
+    SELECT '1' | '1';
+}
+expect {
+    1
+}
+
+# Shift left tests
+test shift-left-int-int {
+    SELECT 1 << 2;
+}
+expect {
+    4
+}
+
+test shift-left-int-neg_int {
+    SELECT 8 << -2;
+}
+expect {
+    2
+}
+
+test shift-left-int-float {
+    SELECT 1 << 4.0;
+}
+expect {
+    16
+}
+
+test shift-left-int-text {
+    SELECT 1 << 'a';
+}
+expect {
+    1
+}
+
+test shift-left-int-text_float {
+    SELECT 1 << '3.0';
+}
+expect {
+    8
+}
+
+test shift-left-int-text_int {
+    SELECT 1 << '1';
+}
+expect {
+    2
+}
+
+test shift-left-int-null {
+    SELECT 1 << NULL;
+}
+expect {
+}
+
+test shift-left-int-int-overflow {
+    SELECT 1 << 64;
+}
+expect {
+    0
+}
+
+test shift-left-int-int-underflow {
+    SELECT 1 << -64;
+}
+expect {
+    0
+}
+
+test shift-left-int-float-overflow {
+    SELECT 1 << 64.0;
+}
+expect {
+    0
+}
+
+test shift-left-int-float-underflow {
+    SELECT 1 << -64.0;
+}
+expect {
+    0
+}
+
+# Float shift left
+test shift-left-float-int {
+    SELECT 1.0 << 2;
+}
+expect {
+    4
+}
+
+test shift-left-float-neg_int {
+    SELECT 8.0 << -2;
+}
+expect {
+    2
+}
+
+test shift-left-float-float {
+    SELECT 1.0 << 4.0;
+}
+expect {
+    16
+}
+
+test shift-left-float-text {
+    SELECT 1.0 << 'a';
+}
+expect {
+    1
+}
+
+test shift-left-float-text_float {
+    SELECT 1.0 << '3.0';
+}
+expect {
+    8
+}
+
+test shift-left-float-text_int {
+    SELECT 1.0 << '1';
+}
+expect {
+    2
+}
+
+test shift-left-float-null {
+    SELECT 1.0 << NULL;
+}
+expect {
+}
+
+test shift-left-float-int-overflow {
+    SELECT 1.0 << 64;
+}
+expect {
+    0
+}
+
+test shift-left-float-int-underflow {
+    SELECT 1.0 << -64;
+}
+expect {
+    0
+}
+
+test shift-left-float-float-overflow {
+    SELECT 1.0 << 64.0;
+}
+expect {
+    0
+}
+
+test shift-left-float-float-underflow {
+    SELECT 1.0 << -64.0;
+}
+expect {
+    0
+}
+
+# Text shift left
+test shift-left-text-int {
+    SELECT 'a' << 2;
+}
+expect {
+    0
+}
+
+test shift-left-text-float {
+    SELECT 'a' << 4.0;
+}
+expect {
+    0
+}
+
+test shift-left-text-text {
+    SELECT 'a' << 'a';
+}
+expect {
+    0
+}
+
+test shift-left-text_int-text_int {
+    SELECT '1' << '1';
+}
+expect {
+    2
+}
+
+test shift-left-text_int-text_float {
+    SELECT '1' << '3.0';
+}
+expect {
+    8
+}
+
+test shift-left-text_int-text {
+    SELECT '1' << 'a';
+}
+expect {
+    1
+}
+
+test shift-left-text_float-text_int {
+    SELECT '1.0' << '1';
+}
+expect {
+    2
+}
+
+test shift-left-text_float-text_float {
+    SELECT '1.0' << '3.0';
+}
+expect {
+    8
+}
+
+test shift-left-text_float-text {
+    SELECT '1.0' << 'a';
+}
+expect {
+    1
+}
+
+test shift-left-text-null {
+    SELECT '1' << NULL;
+}
+expect {
+}
+
+# NULL shift left
+test shift-left-null-int {
+    SELECT NULL << 2;
+}
+expect {
+}
+
+test shift-left-null-float {
+    SELECT NULL << 4.0;
+}
+expect {
+}
+
+test shift-left-null-text {
+    SELECT NULL << 'a';
+}
+expect {
+}
+
+test shift-left-null-null {
+    SELECT NULL << NULL;
+}
+expect {
+}
+
+# Shift right tests
+test shift-right-int-int {
+    SELECT 8 >> 2;
+}
+expect {
+    2
+}
+
+test shift-right-int-neg_int {
+    SELECT 8 >> -2;
+}
+expect {
+    32
+}
+
+test shift-right-int-float {
+    SELECT 8 >> 1.0;
+}
+expect {
+    4
+}
+
+test shift-right-int-text {
+    SELECT 8 >> 'a';
+}
+expect {
+    8
+}
+
+test shift-right-int-text_float {
+    SELECT 8 >> '3.0';
+}
+expect {
+    1
+}
+
+test shift-right-int-text_int {
+    SELECT 8 >> '1';
+}
+expect {
+    4
+}
+
+test shift-right-int-null {
+    SELECT 8 >> NULL;
+}
+expect {
+}
+
+test shift-right-int-int-overflow {
+    SELECT 8 >> 64;
+}
+expect {
+    0
+}
+
+test shift-right-int-int-underflow {
+    SELECT 8 >> -64;
+}
+expect {
+    0
+}
+
+test shift-right-int-float-overflow {
+    SELECT 8 >> 64.0;
+}
+expect {
+    0
+}
+
+test shift-right-int-float-underflow {
+    SELECT 8 >> -64.0;
+}
+expect {
+    0
+}
+
+# Float shift right
+test shift-right-float-int {
+    SELECT 8.0 >> 2;
+}
+expect {
+    2
+}
+
+test shift-right-float-neg_int {
+    SELECT 8.0 >> -2;
+}
+expect {
+    32
+}
+
+test shift-right-float-float {
+    SELECT 8.0 >> 1.0;
+}
+expect {
+    4
+}
+
+test shift-right-float-text {
+    SELECT 8.0 >> 'a';
+}
+expect {
+    8
+}
+
+test shift-right-float-text_float {
+    SELECT 8.0 >> '3.0';
+}
+expect {
+    1
+}
+
+test shift-right-float-text_int {
+    SELECT 8.0 >> '1';
+}
+expect {
+    4
+}
+
+test shift-right-float-null {
+    SELECT 8.0 >> NULL;
+}
+expect {
+}
+
+test shift-right-float-int-overflow {
+    SELECT 8.0 >> 64;
+}
+expect {
+    0
+}
+
+test shift-right-float-int-underflow {
+    SELECT 8.0 >> -64;
+}
+expect {
+    0
+}
+
+test shift-right-float-float-overflow {
+    SELECT 8.0 >> 64.0;
+}
+expect {
+    0
+}
+
+test shift-right-float-float-underflow {
+    SELECT 8.0 >> -64.0;
+}
+expect {
+    0
+}
+
+# Text shift right
+test shift-right-text-int {
+    SELECT 'a' >> 2;
+}
+expect {
+    0
+}
+
+test shift-right-text-float {
+    SELECT 'a' >> 4.0;
+}
+expect {
+    0
+}
+
+test shift-right-text-text {
+    SELECT 'a' >> 'a';
+}
+expect {
+    0
+}
+
+test shift-right-text_int-text_int {
+    SELECT '8' >> '1';
+}
+expect {
+    4
+}
+
+test shift-right-text_int-text_float {
+    SELECT '8' >> '3.0';
+}
+expect {
+    1
+}
+
+test shift-right-text_int-text {
+    SELECT '8' >> 'a';
+}
+expect {
+    8
+}
+
+test shift-right-text_float-text_int {
+    SELECT '8.0' >> '1';
+}
+expect {
+    4
+}
+
+test shift-right-text_float-text_float {
+    SELECT '8.0' >> '3.0';
+}
+expect {
+    1
+}
+
+test shift-right-text_float-text {
+    SELECT '8.0' >> 'a';
+}
+expect {
+    8
+}
+
+test shift-right-text-int-text-edge {
+    SELECT '123-23' >> 2;
+}
+expect {
+    30
+}
+
+test shift-right-text-signed-text-edge {
+    SELECT '-123' >> '2xi';
+}
+expect {
+    -31
+}
+
+test shift-right-text-null {
+    SELECT '8' >> NULL;
+}
+expect {
+}
+
+# NULL shift right
+test shift-right-null-int {
+    SELECT NULL >> 2;
+}
+expect {
+}
+
+test shift-right-null-float {
+    SELECT NULL >> 4.0;
+}
+expect {
+}
+
+test shift-right-null-text {
+    SELECT NULL >> 'a';
+}
+expect {
+}
+
+test shift-right-null-null {
+    SELECT NULL >> NULL;
+}
+expect {
+}
+
+# Bitwise NOT tests
+test bitwise-not-null {
+    SELECT ~NULL;
+}
+expect {
+}
+
+test bitwise-not-int {
+    SELECT ~1234;
+}
+expect {
+    -1235
+}
+
+test bitwise-not-float {
+    SELECT ~823.34;
+}
+expect {
+    -824
+}
+
+test bitwise-not-text-float {
+    SELECT ~'823.34';
+}
+expect {
+    -824
+}
+
+test bitwise-not-text-int-1 {
+    SELECT ~'1234';
+}
+expect {
+    -1235
+}
+
+test bitwise-not-text-int-2 {
+    SELECT ~0xA;
+}
+expect {
+    -11
+}
+
+test bitwise-not-scalar-float {
+    SELECT ~abs(693.9);
+}
+expect {
+    -694
+}
+
+test bitwise-not-scalar-int {
+    SELECT ~abs(7566);
+}
+expect {
+    -7567
+}
+
+test bitwise-not-agg-int {
+    SELECT ~sum(693);
+}
+expect {
+    -694
+}
+
+test bitwise-not-agg-and-agg {
+    SELECT ~sum(693) & sum(-302);
+}
+expect {
+    -958
+}
+
+test bitwise-not-zero {
+    SELECT ~0;
+}
+expect {
+    -1
+}
+
+test bitwise-not-empty-blob {
+    SELECT ~x'';
+}
+expect {
+    -1
+}
+
+test bitwise-not-cast-blob {
+    SELECT ~ CAST ('af' AS BLOB);
+}
+expect {
+    -1
+}
+
+test bitwise-not-blob {
+    SELECT ~ x'0000';
+}
+expect {
+    -1
+}
+
+test bitwise-not-blob-2 {
+    SELECT ~ x'0001';
+}
+expect {
+    -1
+}
+
+# Math functions
+test pi {
+    SELECT pi();
+}
+expect {
+    3.14159265358979
+}
+
+test acos-int {
+    SELECT acos(1);
+}
+expect {
+    0.0
+}
+
+test acos-float {
+    SELECT acos(-0.5);
+}
+expect {
+    2.0943951023932
+}
+
+test acos-str {
+    SELECT acos('-0.5');
+}
+expect {
+    2.0943951023932
+}
+
+test acos-null {
+    SELECT acos(null);
+}
+expect {
+}
+
+test acosh-int {
+    SELECT acosh(1);
+}
+expect {
+    0.0
+}
+
+test acosh-float {
+    SELECT acosh(1.5);
+}
+expect {
+    0.962423650119207
+}
+
+test acosh-str {
+    SELECT acosh('1.5');
+}
+expect {
+    0.962423650119207
+}
+
+test acosh-invalid {
+    SELECT acosh(0.99);
+}
+expect {
+}
+
+test acosh-null {
+    SELECT acosh(null);
+}
+expect {
+}
+
+test asin-int {
+    SELECT asin(1);
+}
+expect {
+    1.5707963267949
+}
+
+test asin-float {
+    SELECT asin(-0.5);
+}
+expect {
+    -0.523598775598299
+}
+
+test asin-str {
+    SELECT asin('-0.5');
+}
+expect {
+    -0.523598775598299
+}
+
+test asin-null {
+    SELECT asin(null);
+}
+expect {
+}
+
+test sin-int {
+    SELECT sin(1);
+}
+expect {
+    0.841470984807897
+}
+
+test sin-float {
+    SELECT sin(-0.5);
+}
+expect {
+    -0.479425538604203
+}
+
+test sin-str {
+    SELECT sin('-0.5');
+}
+expect {
+    -0.479425538604203
+}
+
+test sin-null {
+    SELECT sin(null);
+}
+expect {
+}
+
+test asinh-int {
+    SELECT asinh(1);
+}
+expect {
+    0.881373587019543
+}
+
+test asinh-float {
+    SELECT asinh(-0.5);
+}
+expect {
+    -0.481211825059603
+}
+
+test asinh-str {
+    SELECT asinh('-0.5');
+}
+expect {
+    -0.481211825059603
+}
+
+test asinh-null {
+    SELECT asinh(null);
+}
+expect {
+}
+
+test atan-int {
+    SELECT atan(1);
+}
+expect {
+    0.785398163397448
+}
+
+test atan-float {
+    SELECT atan(-0.5);
+}
+expect {
+    -0.463647609000806
+}
+
+test atan-str {
+    SELECT atan('-0.5');
+}
+expect {
+    -0.463647609000806
+}
+
+test atan-null {
+    SELECT atan(null);
+}
+expect {
+}
+
+test tan-int {
+    SELECT tan(1);
+}
+expect {
+    1.5574077246549
+}
+
+test tan-float {
+    SELECT tan(-0.5);
+}
+expect {
+    -0.54630248984379
+}
+
+test tan-str {
+    SELECT tan('-0.5');
+}
+expect {
+    -0.54630248984379
+}
+
+test tan-null {
+    SELECT tan(null);
+}
+expect {
+}
+
+test atanh-int {
+    SELECT atanh(0);
+}
+expect {
+    0.0
+}
+
+test atanh-float {
+    SELECT atanh(-0.5);
+}
+expect {
+    -0.549306144334055
+}
+
+test atanh-str {
+    SELECT atanh('-0.5');
+}
+expect {
+    -0.549306144334055
+}
+
+test atanh-null {
+    SELECT atanh(null);
+}
+expect {
+}
+
+test ceil-int {
+    SELECT ceil(1);
+}
+expect {
+    1
+}
+
+test ceil-float {
+    SELECT ceil(-1.5);
+}
+expect {
+    -1.0
+}
+
+test ceil-str {
+    SELECT ceil('1.5');
+}
+expect {
+    2.0
+}
+
+test ceil-null {
+    SELECT ceil(null);
+}
+expect {
+}
+
+test ceiling-int {
+    SELECT ceiling(1);
+}
+expect {
+    1
+}
+
+test ceiling-float {
+    SELECT ceiling(-1.5);
+}
+expect {
+    -1.0
+}
+
+test ceiling-str {
+    SELECT ceiling('1.5');
+}
+expect {
+    2.0
+}
+
+test ceiling-null {
+    SELECT ceiling(null);
+}
+expect {
+}
+
+test cos-int {
+    SELECT cos(1);
+}
+expect {
+    0.54030230586814
+}
+
+test cos-float {
+    SELECT cos(-0.5);
+}
+expect {
+    0.877582561890373
+}
+
+test cos-str {
+    SELECT cos('-0.5');
+}
+expect {
+    0.877582561890373
+}
+
+test cos-null {
+    SELECT cos(null);
+}
+expect {
+}
+
+test cosh-int {
+    SELECT cosh(1);
+}
+expect {
+    1.54308063481524
+}
+
+test cosh-float {
+    SELECT cosh(-0.5);
+}
+expect {
+    1.12762596520638
+}
+
+test cosh-str {
+    SELECT cosh('-0.5');
+}
+expect {
+    1.12762596520638
+}
+
+test cosh-null {
+    SELECT cosh(null);
+}
+expect {
+}
+
+test degrees-int {
+    SELECT degrees(1);
+}
+expect {
+    57.2957795130823
+}
+
+test degrees-float {
+    SELECT degrees(-0.5);
+}
+expect {
+    -28.6478897565412
+}
+
+test degrees-str {
+    SELECT degrees('-0.5');
+}
+expect {
+    -28.6478897565412
+}
+
+test degrees-null {
+    SELECT degrees(null);
+}
+expect {
+}
+
+test exp-int {
+    SELECT exp(1);
+}
+expect {
+    2.71828182845905
+}
+
+test exp-float {
+    SELECT exp(-0.5);
+}
+expect {
+    0.606530659712633
+}
+
+test exp-str {
+    SELECT exp('-0.5');
+}
+expect {
+    0.606530659712633
+}
+
+test exp-null {
+    SELECT exp(null);
+}
+expect {
+}
+
+test floor-int {
+    SELECT floor(1);
+}
+expect {
+    1
+}
+
+test floor-float {
+    SELECT floor(-1.5);
+}
+expect {
+    -2.0
+}
+
+test floor-str {
+    SELECT floor('1.5');
+}
+expect {
+    1.0
+}
+
+test floor-null {
+    SELECT floor(null);
+}
+expect {
+}
+
+test ln-int {
+    SELECT ln(1);
+}
+expect {
+    0.0
+}
+
+test ln-float {
+    SELECT ln(0.5);
+}
+expect {
+    -0.693147180559945
+}
+
+test ln-str {
+    SELECT ln('0.5');
+}
+expect {
+    -0.693147180559945
+}
+
+test ln-negative {
+    SELECT ln(-0.5);
+}
+expect {
+}
+
+test ln-null {
+    SELECT ln(null);
+}
+expect {
+}
+
+test log10-int {
+    SELECT log10(1);
+}
+expect {
+    0.0
+}
+
+test log10-float {
+    SELECT log10(0.5);
+}
+expect {
+    -0.301029995663981
+}
+
+test log10-str {
+    SELECT log10('0.5');
+}
+expect {
+    -0.301029995663981
+}
+
+test log10-negative {
+    SELECT log10(-0.5);
+}
+expect {
+}
+
+test log10-null {
+    SELECT log10(null);
+}
+expect {
+}
+
+test log2-int {
+    SELECT log2(1);
+}
+expect {
+    0.0
+}
+
+test log2-float {
+    SELECT log2(0.5);
+}
+expect {
+    -1.0
+}
+
+test log2-str {
+    SELECT log2('0.5');
+}
+expect {
+    -1.0
+}
+
+test log2-negative {
+    SELECT log2(-0.5);
+}
+expect {
+}
+
+test log2-null {
+    SELECT log2(null);
+}
+expect {
+}
+
+test radians-int {
+    SELECT radians(1);
+}
+expect {
+    0.0174532925199433
+}
+
+test radians-float {
+    SELECT radians(-0.5);
+}
+expect {
+    -0.00872664625997165
+}
+
+test radians-str {
+    SELECT radians('-0.5');
+}
+expect {
+    -0.00872664625997165
+}
+
+test radians-null {
+    SELECT radians(null);
+}
+expect {
+}
+
+test sinh-int {
+    SELECT sinh(1);
+}
+expect {
+    1.1752011936438
+}
+
+test sinh-float {
+    SELECT sinh(-0.5);
+}
+expect {
+    -0.521095305493747
+}
+
+test sinh-str {
+    SELECT sinh('-0.5');
+}
+expect {
+    -0.521095305493747
+}
+
+test sinh-null {
+    SELECT sinh(null);
+}
+expect {
+}
+
+test sqrt-int {
+    SELECT sqrt(1);
+}
+expect {
+    1.0
+}
+
+test sqrt-float {
+    SELECT sqrt(0.5);
+}
+expect {
+    0.707106781186548
+}
+
+test sqrt-str {
+    SELECT sqrt('0.5');
+}
+expect {
+    0.707106781186548
+}
+
+test sqrt-negative {
+    SELECT sqrt(-0.5);
+}
+expect {
+}
+
+test sqrt-null {
+    SELECT sqrt(null);
+}
+expect {
+}
+
+test tanh-int {
+    SELECT tanh(1);
+}
+expect {
+    0.761594155955765
+}
+
+test tanh-float {
+    SELECT tanh(-0.5);
+}
+expect {
+    -0.46211715726001
+}
+
+test tanh-str {
+    SELECT tanh('-0.5');
+}
+expect {
+    -0.46211715726001
+}
+
+test tanh-null {
+    SELECT tanh(null);
+}
+expect {
+}
+
+test trunc-int {
+    SELECT trunc(1);
+}
+expect {
+    1
+}
+
+test trunc-float {
+    SELECT trunc(2.5);
+}
+expect {
+    2.0
+}
+
+test trunc-float-negative {
+    SELECT trunc(-2.5);
+}
+expect {
+    -2.0
+}
+
+test trunc-str {
+    SELECT trunc('2.5');
+}
+expect {
+    2.0
+}
+
+test trunc-null {
+    SELECT trunc(null);
+}
+expect {
+}
+
+# Two-argument functions
+test atan2-int-int {
+    SELECT atan2(5, -1);
+}
+expect {
+    1.76819188664478
+}
+
+test atan2-int-float {
+    SELECT atan2(5, -1.5);
+}
+expect {
+    1.86225312127276
+}
+
+test atan2-int-str {
+    SELECT atan2(5, '-1.5');
+}
+expect {
+    1.86225312127276
+}
+
+test atan2-float-int {
+    SELECT atan2(5.5, 10);
+}
+expect {
+    0.502843210927861
+}
+
+test atan2-float-float {
+    SELECT atan2(5.5, -1.5);
+}
+expect {
+    1.83704837594582
+}
+
+test atan2-float-str {
+    SELECT atan2(5.5, '-1.5');
+}
+expect {
+    1.83704837594582
+}
+
+test atan2-str-str {
+    SELECT atan2('5.5', '-1.5');
+}
+expect {
+    1.83704837594582
+}
+
+test atan2-null-int {
+    SELECT atan2(null, 5);
+}
+expect {
+}
+
+test atan2-int-null {
+    SELECT atan2(5, null);
+}
+expect {
+}
+
+test mod-int-int {
+    SELECT mod(10, -3);
+}
+expect {
+    1.0
+}
+
+test mod-int-float {
+    SELECT mod(5, -1.5);
+}
+expect {
+    0.5
+}
+
+test mod-int-str {
+    SELECT mod(5, '-1.5');
+}
+expect {
+    0.5
+}
+
+test mod-float-int {
+    SELECT mod(5.5, 2);
+}
+expect {
+    1.5
+}
+
+test mod-float-float {
+    SELECT mod(5.5, -1.5);
+}
+expect {
+    1.0
+}
+
+test mod-float-str {
+    SELECT mod(5.5, '-1.5');
+}
+expect {
+    1.0
+}
+
+test mod-str-str {
+    SELECT mod('5.5', '-1.5');
+}
+expect {
+    1.0
+}
+
+test mod-null-int {
+    SELECT mod(null, 5);
+}
+expect {
+}
+
+test mod-int-null {
+    SELECT mod(5, null);
+}
+expect {
+}
+
+test mod-float-zero {
+    SELECT mod(1.5, 0);
+}
+expect {
+}
+
+test mod-tricky {
+    SELECT mod(atanh(tanh(-1.0)), 1.0);
+}
+expect {
+    -1.0
+}
+
+test pow-int-int {
+    SELECT pow(5, -1);
+}
+expect {
+    0.2
+}
+
+test pow-int-float {
+    SELECT pow(5, -1.5);
+}
+expect {
+    0.0894427190999916
+}
+
+test pow-int-str {
+    SELECT pow(5, '-1.5');
+}
+expect {
+    0.0894427190999916
+}
+
+test pow-float-int {
+    SELECT pow(5.5, 2);
+}
+expect {
+    30.25
+}
+
+test pow-float-float {
+    SELECT pow(5.5, -1.5);
+}
+expect {
+    0.077527533220222
+}
+
+test pow-float-str {
+    SELECT pow(5.5, '-1.5');
+}
+expect {
+    0.077527533220222
+}
+
+test pow-str-str {
+    SELECT pow('5.5', '-1.5');
+}
+expect {
+    0.077527533220222
+}
+
+test pow-null-int {
+    SELECT pow(null, 5);
+}
+expect {
+}
+
+test pow-int-null {
+    SELECT pow(5, null);
+}
+expect {
+}
+
+test power-int-int {
+    SELECT power(5, -1);
+}
+expect {
+    0.2
+}
+
+test power-int-float {
+    SELECT power(5, -1.5);
+}
+expect {
+    0.0894427190999916
+}
+
+test power-int-str {
+    SELECT power(5, '-1.5');
+}
+expect {
+    0.0894427190999916
+}
+
+test power-float-int {
+    SELECT power(5.5, 2);
+}
+expect {
+    30.25
+}
+
+test power-float-float {
+    SELECT power(5.5, -1.5);
+}
+expect {
+    0.077527533220222
+}
+
+test power-float-str {
+    SELECT power(5.5, '-1.5');
+}
+expect {
+    0.077527533220222
+}
+
+test power-str-str {
+    SELECT power('5.5', '-1.5');
+}
+expect {
+    0.077527533220222
+}
+
+test power-null-int {
+    SELECT power(null, 5);
+}
+expect {
+}
+
+test power-int-null {
+    SELECT power(5, null);
+}
+expect {
+}
+
+test log-int {
+    SELECT log(1);
+}
+expect {
+    0.0
+}
+
+test log-float {
+    SELECT log(1.5);
+}
+expect {
+    0.176091259055681
+}
+
+test log-str {
+    SELECT log('1.5');
+}
+expect {
+    0.176091259055681
+}
+
+test log-negative {
+    SELECT log(-1.5);
+}
+expect {
+}
+
+test log-null {
+    SELECT log(null);
+}
+expect {
+}
+
+test log-int-int {
+    SELECT log(5, 1);
+}
+expect {
+    0.0
+}
+
+test log-int-float {
+    SELECT log(5, 1.5);
+}
+expect {
+    0.251929636412592
+}
+
+test log-int-str {
+    SELECT log(5, '1.5');
+}
+expect {
+    0.251929636412592
+}
+
+test log-float-int {
+    SELECT log(5.5, 10);
+}
+expect {
+    1.35068935021985
+}
+
+test log-float-float {
+    SELECT log(5.5, 1.5);
+}
+expect {
+    0.237844588273313
+}
+
+test log-float-str {
+    SELECT log(5.5, '1.5');
+}
+expect {
+    0.237844588273313
+}
+
+test log-str-str {
+    SELECT log('5.5', '1.5');
+}
+expect {
+    0.237844588273313
+}
+
+test log-negative-negative {
+    SELECT log(-1.5, -1.5);
+}
+expect {
+}
+
+test log-float-negative {
+    SELECT log(1.5, -1.5);
+}
+expect {
+}
+
+test log-null-int {
+    SELECT log(null, 5);
+}
+expect {
+}
+
+test log-int-null {
+    SELECT log(5, null);
+}
+expect {
+}
+
+# Remainder tests
+test remainder-int-null {
+    SELECT 183 % null;
+}
+expect {
+}
+
+test remainder-int-0 {
+    SELECT 183 % 0;
+}
+expect {
+}
+
+test remainder-int-int {
+    SELECT 183 % 10;
+}
+expect {
+    3
+}
+
+test remainder-int-float {
+    SELECT 38 % 10.35;
+}
+expect {
+    8.0
+}
+
+test remainder-float-int {
+    SELECT 38.43 % 13;
+}
+expect {
+    12.0
+}
+
+test remainder-0-float {
+    SELECT 0 % 12.0;
+}
+expect {
+    0.0
+}
+
+test remainder-float-0 {
+    SELECT 23.14 % 0;
+}
+expect {
+}
+
+test remainder-float-float {
+    SELECT 23.14 % 12.0;
+}
+expect {
+    11.0
+}
+
+# Text remainder
+test remainder-text-1 {
+    SELECT 'a' % 'a';
+}
+expect {
+}
+
+test remainder-text-2 {
+    SELECT 'a' % 10;
+}
+expect {
+    0
+}
+
+test remainder-text-3 {
+    SELECT 10 % 'a';
+}
+expect {
+}
+
+test remainder-text-4 {
+    SELECT 'a' % 11.0;
+}
+expect {
+    0.0
+}
+
+test remainder-text-5 {
+    SELECT 11.0 % 'a';
+}
+expect {
+}
+
+test remainder-text-7 {
+    SELECT '10' % '3';
+}
+expect {
+    1
+}
+
+test remainder-text-8 {
+    SELECT '10.0' % '3';
+}
+expect {
+    1.0
+}
+
+test remainder-text-9 {
+    SELECT '10.0' % -3;
+}
+expect {
+    1.0
+}
+
+# Remainder overflow
+test remainder-overflow-1 {
+    SELECT '-9223372036854775808' % '-1';
+}
+expect {
+    0
+}
+
+test remainder-overflow-2 {
+    SELECT -9223372036854775808 % -1;
+}
+expect {
+    0
+}
+
+test remainder-overflow-3 {
+    SELECT -9223372036854775809 % -1;
+}
+expect {
+    0.0
+}
+
+# Comparison tests
+test comp-float-float {
+    SELECT 0.0 = 0.0;
+}
+expect {
+    1
+}
+
+test comp-int-float {
+    SELECT 0 = 0.0;
+}
+expect {
+    1
+}
+
+test comp-float-int {
+    SELECT 0.0 = 0;
+}
+expect {
+    1
+}
+
+test comp-int-string {
+    SELECT 0 = '0';
+}
+expect {
+    0
+}
+
+test comp-string-int {
+    SELECT '0' = 0;
+}
+expect {
+    0
+}
+
+test comp-string-blog {
+    SELECT '0' = cast('0' as BLOB);
+}
+expect {
+    0
+}
+
+test comp-blog-string {
+    SELECT cast('0' as BLOB) = '0';
+}
+expect {
+    0
+}
+
+test comp-blog-blog {
+    SELECT cast('0' as BLOB) = cast('0' as BLOB);
+}
+expect {
+    1
+}
+
+test unary-plus-noop-string {
+    SELECT +'000';
+}
+expect {
+    000
+}
+
+test unary-plus-noop-blob {
+    SELECT typeof(+x'00') = 'blob';
+}
+expect {
+    1
+}
+
+setup t-divide-table {
+    CREATE TABLE t (x PRIMARY KEY, y, z);
+    INSERT INTO t VALUES (37, -70, -196792117);
+}
+
+@setup t-divide-table
+test is-nonnull-divide-by-zero {
+    SELECT * FROM t WHERE (1 / 0) >= -3289742039 < t.x;
+}
+expect {
+}

@@ -1,0 +1,136 @@
+# DELETE Tests
+# Ported from testing/delete.test
+
+@database :memory:
+
+setup delete-single {
+    CREATE TABLE t1 (x INTEGER PRIMARY KEY);
+    INSERT INTO t1 VALUES (1);
+    INSERT INTO t1 VALUES (2);
+    INSERT INTO t1 VALUES (3);
+}
+
+@setup delete-single
+test delete-single-1 {
+    DELETE FROM t1 WHERE x = 2;
+    SELECT * FROM t1 ORDER BY x;
+}
+expect {
+    1
+    3
+}
+
+setup delete-insert-alternate {
+    CREATE TABLE t4 (x INTEGER PRIMARY KEY);
+    INSERT INTO t4 VALUES (1);
+    INSERT INTO t4 VALUES (2);
+    INSERT INTO t4 VALUES (3);
+}
+
+@setup delete-insert-alternate
+test delete-insert-alternate-1 {
+    DELETE FROM t4 WHERE x = 2;
+    INSERT INTO t4 VALUES (4);
+    DELETE FROM t4 WHERE x = 1;
+    INSERT INTO t4 VALUES (5);
+    SELECT * FROM t4 ORDER BY x;
+}
+expect {
+    3
+    4
+    5
+}
+
+setup delete-ends {
+    CREATE TABLE t5 (x INTEGER PRIMARY KEY);
+    INSERT INTO t5 VALUES (1);
+    INSERT INTO t5 VALUES (2);
+    INSERT INTO t5 VALUES (3);
+    INSERT INTO t5 VALUES (4);
+    INSERT INTO t5 VALUES (5);
+}
+
+@setup delete-ends
+test delete-ends-1 {
+    DELETE FROM t5 WHERE x = 1;
+    DELETE FROM t5 WHERE x = 5;
+    SELECT * FROM t5 ORDER BY x;
+}
+expect {
+    2
+    3
+    4
+}
+
+setup delete-reuse {
+    CREATE TABLE t6 (x INTEGER PRIMARY KEY);
+    INSERT INTO t6 VALUES (1);
+    INSERT INTO t6 VALUES (2);
+    INSERT INTO t6 VALUES (3);
+}
+
+@setup delete-reuse
+test delete-reuse-1 {
+    DELETE FROM t6 WHERE x = 2;
+    INSERT INTO t6 VALUES (2);
+    SELECT * FROM t6 ORDER BY x;
+}
+expect {
+    1
+    2
+    3
+}
+
+setup delete-with-indexes {
+    CREATE TABLE t (a PRIMARY KEY);
+    CREATE INDEX tasc ON t(a);
+    CREATE INDEX tdesc ON t(a DESC);
+    INSERT INTO t VALUES (randomblob(1000));
+}
+
+@setup delete-with-indexes
+test delete-all-with-indexes-1 {
+    DELETE FROM t;
+    SELECT * FROM t;
+}
+expect {
+}
+
+setup delete-where-falsy {
+    CREATE TABLE resourceful_schurz (diplomatic_kaplan BLOB);
+    INSERT INTO resourceful_schurz VALUES (X'696E646570656E64656E745F6A6165636B6C65'), (X'67656E65726F75735F62617262616E65677261'), (X'73757065725F74616E6E656E6261756D'), (X'6D6F76696E675F6E616F756D6F76'), (X'7374756E6E696E675F6B62');
+    INSERT INTO resourceful_schurz VALUES (X'70617373696F6E6174655F726F62696E'), (X'666169746866756C5F74686F6D6173'), (X'76696272616E745F6D69726F736C6176'), (X'737061726B6C696E675F67726179');
+}
+
+@setup delete-where-falsy
+test delete_where_falsy {
+    DELETE FROM resourceful_schurz WHERE - x'666169746866756c5f74686f6d6173';
+    SELECT * FROM resourceful_schurz;
+}
+expect {
+    independent_jaeckle
+    generous_barbanegra
+    super_tannenbaum
+    moving_naoumov
+    stunning_kb
+    passionate_robin
+    faithful_thomas
+    vibrant_miroslav
+    sparkling_gray
+}
+
+setup doubly-qualified-delete {
+    create table test(col);
+    insert into test(col) values (1);
+    insert into test(col) values (2);
+}
+
+@setup doubly-qualified-delete
+test doubly-qualified-delete {
+    delete from test where main.test.col = 2;
+    select col from test;
+}
+expect {
+    1
+}
+

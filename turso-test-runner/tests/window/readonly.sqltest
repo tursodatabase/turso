@@ -1,0 +1,787 @@
+# Window Function Tests (Readonly)
+# Ported from testing/window.test
+
+@database testing/testing.db readonly
+
+# Basic partition by
+test window-partition-by {
+    SELECT
+        first_name,
+        sum(age) OVER (PARTITION BY zipcode)
+    FROM users u
+    LIMIT 10;
+}
+expect {
+    Misty|96
+    Jessica|56
+    Christopher|62
+    Steven|33
+    Greg|44
+    Thomas|43
+    Jeremy|90
+    Kevin|22
+    Shannon|60
+    Steven|7
+}
+
+# Partition by duplicate column
+test window-partition-by-duplicate-column {
+    SELECT
+        first_name,
+        sum(age) OVER (PARTITION BY zipcode, zipcode)
+    FROM users u
+    LIMIT 10;
+}
+expect {
+    Misty|96
+    Jessica|56
+    Christopher|62
+    Steven|33
+    Greg|44
+    Thomas|43
+    Jeremy|90
+    Kevin|22
+    Shannon|60
+    Steven|7
+}
+
+# Partition by multiple columns
+test window-partition-by-multiple-columns {
+    SELECT
+        first_name,
+        max(age) OVER (PARTITION BY first_name, state),
+        min(age) OVER (PARTITION BY first_name, state),
+        last_name
+    FROM users u
+    LIMIT 10;
+}
+expect {
+    Aaron|43|43|Woods
+    Aaron|58|58|Baker
+    Aaron|69|69|Alvarado
+    Aaron|28|28|Larson
+    Aaron|75|69|Harris
+    Aaron|75|69|Peterson
+    Aaron|56|56|Sims
+    Aaron|55|55|Fry
+    Aaron|83|22|Walker
+    Aaron|83|22|George
+}
+
+# Order by
+test window-order-by {
+    SELECT
+        name,
+        max(price) OVER (ORDER BY id) AS rolling_max
+    FROM products
+    ORDER BY rolling_max, name;
+}
+expect {
+    hat|79.0
+    accessories|82.0
+    boots|82.0
+    cap|82.0
+    coat|82.0
+    jeans|82.0
+    shirt|82.0
+    shorts|82.0
+    sneakers|82.0
+    sweater|82.0
+    sweatshirt|82.0
+}
+
+# Order by duplicate column
+test window-order-by-duplicate-column {
+    SELECT
+        name,
+        max(price) OVER (ORDER BY id, id) AS rolling_max
+    FROM products
+    ORDER BY rolling_max, name;
+}
+expect {
+    hat|79.0
+    accessories|82.0
+    boots|82.0
+    cap|82.0
+    coat|82.0
+    jeans|82.0
+    shirt|82.0
+    shorts|82.0
+    sneakers|82.0
+    sweater|82.0
+    sweatshirt|82.0
+}
+
+# Order by multiple columns
+test window-order-by-multiple-columns {
+    SELECT
+        name,
+        max(price) OVER (ORDER BY name, id) AS rolling_max
+    FROM products
+    ORDER BY rolling_max, name;
+}
+expect {
+    accessories|81.0
+    boots|81.0
+    cap|82.0
+    coat|82.0
+    hat|82.0
+    jeans|82.0
+    shirt|82.0
+    shorts|82.0
+    sneakers|82.0
+    sweater|82.0
+    sweatshirt|82.0
+}
+
+# Partition by and order by
+test window-partition-by-and-order-by {
+    SELECT
+        u.first_name,
+        count(*) OVER (PARTITION BY u.city ORDER BY u.first_name)
+    FROM users u
+    LIMIT 10;
+}
+expect {
+    Elizabeth|1
+    Matthew|1
+    Charles|1
+    Heidi|1
+    Sarah|1
+    Tammy|2
+    Angelica|1
+    Rebecca|2
+    Linda|1
+    John|1
+}
+
+# Without partition by or order by
+test window-without-partition-by-or-order-by {
+    SELECT count() OVER () FROM products;
+}
+expect {
+    11
+    11
+    11
+    11
+    11
+    11
+    11
+    11
+    11
+    11
+    11
+}
+
+# Window in subquery
+test window-in-subquery {
+    SELECT
+        first_name,
+        zmax
+    FROM (
+        SELECT
+            u.first_name,
+            max(age) OVER (PARTITION BY zipcode) AS zmax
+        FROM users u
+    )
+    WHERE zmax > 20
+    LIMIT 5;
+}
+expect {
+    Misty|96
+    Jessica|56
+    Christopher|62
+    Steven|33
+    Greg|44
+}
+
+# Window nested in expression
+test window-nested-in-expression {
+    SELECT
+        first_name,
+        (age + max(age) OVER (PARTITION BY zipcode))
+    FROM users
+    ORDER BY zipcode, first_name
+    LIMIT 5;
+}
+expect {
+    Misty|192
+    Jessica|112
+    Christopher|124
+    Steven|66
+    Greg|88
+}
+
+# Multiple window functions
+test window-multiple-functions {
+    SELECT
+        first_name,
+        last_name,
+        max(age) OVER (PARTITION BY zipcode),
+        max(age) OVER (PARTITION BY city),
+        min(age) OVER (PARTITION BY state, city ORDER BY last_name),
+        count(*) OVER (PARTITION BY state, city ORDER BY last_name),
+        sum(age) OVER (ORDER BY city),
+        min(age) OVER (ORDER BY city),
+        age
+    FROM users
+    ORDER BY first_name
+    LIMIT 10;
+}
+expect {
+    Aaron|Walter|22|22|22|1|246652|1|22
+    Aaron|Owens|47|47|47|1|414251|1|47
+    Aaron|Stephens|34|97|34|1|256145|1|34
+    Aaron|Powers|71|71|71|1|286366|1|71
+    Aaron|Kirby|33|33|33|1|257216|1|33
+    Aaron|Larson|28|88|28|1|417846|1|28
+    Aaron|Fry|55|55|55|1|227116|1|55
+    Aaron|Martinez|67|67|67|1|26572|1|67
+    Aaron|Perez|81|81|81|1|18041|1|81
+    Aaron|Ray|32|96|32|1|388962|1|32
+}
+
+# Window with aggregate
+test window-with-aggregate {
+    SELECT
+        max(age),
+        count(*) OVER ()
+    FROM users;
+}
+expect {
+    100|1
+}
+
+# Window with group by
+test window-with-group-by {
+    SELECT
+        first_name,
+        max(age) OVER (PARTITION BY last_name)
+    FROM users
+    GROUP BY first_name
+    ORDER BY zipcode
+    LIMIT 10;
+}
+expect {
+    Misty|96
+    Carrie|37
+    Nicholas|89
+    Brittany|22
+    Claire|89
+    Trevor|25
+    Diamond|18
+    Alvin|46
+    Vanessa|57
+    Gilbert|50
+}
+
+# Group by with aggregate
+test window-group-by-with-aggregate {
+    SELECT
+        first_name,
+        count(*),
+        max(age) OVER (PARTITION BY first_name)
+    FROM users
+    GROUP BY first_name, age
+    ORDER BY first_name
+    LIMIT 10;
+}
+expect {
+    Aaron|1|98
+    Aaron|1|98
+    Aaron|2|98
+    Aaron|2|98
+    Aaron|1|98
+    Aaron|1|98
+    Aaron|1|98
+    Aaron|1|98
+    Aaron|1|98
+    Aaron|1|98
+}
+
+# Group by having
+test window-group-by-having {
+    SELECT
+        first_name,
+        count(*),
+        max(age) OVER (PARTITION BY first_name)
+    FROM users
+    GROUP BY first_name, age
+    HAVING count(*) > 1
+    ORDER BY first_name
+    LIMIT 10;
+}
+expect {
+    Aaron|2|98
+    Aaron|2|98
+    Aaron|2|98
+    Aaron|2|98
+    Aaron|2|98
+    Aaron|3|98
+    Aaron|2|98
+    Abigail|2|57
+    Adam|3|57
+    Adam|2|57
+}
+
+# Duplicate window name (last one wins)
+test window-duplicate-name {
+    SELECT
+        name,
+        sum(price) OVER win1,
+        max(price) OVER win1
+    FROM products
+    WINDOW win1 AS (PARTITION BY id),
+           win1 AS (PARTITION BY price)
+    ORDER BY name;
+}
+expect {
+    accessories|81.0|81.0
+    boots|1.0|1.0
+    cap|164.0|82.0
+    coat|33.0|33.0
+    hat|79.0|79.0
+    jeans|78.0|78.0
+    shirt|18.0|18.0
+    shorts|70.0|70.0
+    sneakers|164.0|82.0
+    sweater|25.0|25.0
+    sweatshirt|74.0|74.0
+}
+
+# Window name with space
+test window-name-with-space {
+    SELECT
+        name,
+        sum(price) OVER "foo bar"
+    FROM products
+    WINDOW "foo bar" AS (PARTITION BY id)
+    ORDER BY name;
+}
+expect {
+    accessories|81.0
+    boots|1.0
+    cap|82.0
+    coat|33.0
+    hat|79.0
+    jeans|78.0
+    shirt|18.0
+    shorts|70.0
+    sneakers|82.0
+    sweater|25.0
+    sweatshirt|74.0
+}
+
+# Nonexistent window name error
+test window-nonexistent-name {
+    SELECT
+        sum(price) OVER nonexistent
+    FROM products;
+}
+expect error { no such window: nonexistent }
+
+# Window function in having error
+test window-function-in-having {
+    SELECT
+        name
+    FROM products
+    GROUP BY name
+    HAVING sum(price) OVER (PARTITION BY price) > 40;
+}
+expect error { misuse of window function }
+
+# Window function in group by error
+test window-function-in-group-by {
+    SELECT
+        name
+    FROM products
+    GROUP BY sum(price) OVER (PARTITION BY price);
+}
+expect error { misuse of window function }
+
+# Nested window function error
+test window-nested-function {
+    SELECT
+        sum(sum(price) OVER (PARTITION BY name)) OVER (PARTITION BY price)
+    FROM products;
+}
+expect error { misuse of window function }
+
+# Scalar function as window function error
+test window-scalar-function {
+    SELECT
+        lower(name) OVER (PARTITION BY price)
+    FROM products;
+}
+expect error { may not be used as a window function }
+
+# Nonexistent function error
+test window-nonexistent-function {
+    SELECT
+        non_existent_func(name) OVER (PARTITION BY price)
+    FROM products;
+}
+expect error { no such function }
+
+# Scalar function star error
+test window-scalar-function-star {
+    SELECT
+        lower(*) OVER (PARTITION BY price)
+    FROM products;
+}
+expect error { may not be used as a window function }
+
+# Nonexistent function star error
+test window-nonexistent-function-star {
+    SELECT
+        non_existent_func(*) OVER (PARTITION BY price)
+    FROM products;
+}
+expect error { no such function }
+
+# Aggregate in partition by
+test window-aggregate-in-partition-by {
+    SELECT
+        max(price) OVER (PARTITION BY count(*))
+    FROM products;
+}
+expect {
+    79.0
+}
+
+# Aggregate in order by
+test window-aggregate-in-order-by {
+    SELECT
+        max(price) OVER (ORDER BY count(*))
+    FROM products;
+}
+expect {
+    79.0
+}
+
+# Aggregate as argument
+test window-aggregate-as-argument {
+    SELECT
+        max(sum(price)) OVER (ORDER BY name)
+    FROM products;
+}
+expect {
+    623.0
+}
+
+# Aggregate with group by as argument
+test window-aggregate-with-group-by-as-argument {
+    SELECT
+        max(sum(price)) OVER (ORDER BY name)
+    FROM products
+    GROUP BY price;
+}
+expect {
+    81.0
+    81.0
+    164.0
+    164.0
+    164.0
+    164.0
+    164.0
+    164.0
+    164.0
+    164.0
+}
+
+# Window function as aggregate argument error
+test window-function-as-aggregate-argument {
+    SELECT
+        sum(max(price) OVER (ORDER BY name))
+    FROM products
+    GROUP BY price;
+}
+expect error { misuse of window function }
+
+# Window function nested in partition by error
+test window-function-nested-in-partition-by {
+    SELECT
+        max(price) OVER (PARTITION BY count(*) OVER())
+    FROM products;
+}
+expect error { misuse of window function }
+
+# Window function nested in order by error
+test window-function-nested-in-order-by {
+    SELECT
+        max(price) OVER (ORDER BY count(*) OVER())
+    FROM products;
+}
+expect error { misuse of window function }
+
+# Rowid in result
+test window-rowid-in-result {
+    SELECT
+        rowid,
+        max(price) OVER (PARTITION BY price)
+    FROM products
+    ORDER BY name;
+}
+expect {
+    11|81.0
+    9|1.0
+    2|82.0
+    10|33.0
+    1|79.0
+    7|78.0
+    3|18.0
+    6|70.0
+    8|82.0
+    4|25.0
+    5|74.0
+}
+
+# Rowid in order by
+test window-rowid-in-order-by {
+    SELECT
+        name,
+        max(price) OVER (PARTITION BY price)
+    FROM products
+    ORDER BY rowid;
+}
+expect {
+    hat|79.0
+    cap|82.0
+    shirt|18.0
+    sweater|25.0
+    sweatshirt|74.0
+    shorts|70.0
+    jeans|78.0
+    sneakers|82.0
+    boots|1.0
+    coat|33.0
+    accessories|81.0
+}
+
+# Rowid as argument
+test window-rowid-as-argument {
+    SELECT
+        name,
+        max(rowid) OVER (PARTITION BY price)
+    FROM products
+    ORDER BY name;
+}
+expect {
+    accessories|11
+    boots|9
+    cap|8
+    coat|10
+    hat|1
+    jeans|7
+    shirt|3
+    shorts|6
+    sneakers|8
+    sweater|4
+    sweatshirt|5
+}
+
+# Distinct
+test window-distinct {
+    SELECT
+        distinct max(price) OVER (PARTITION BY price)
+    FROM products;
+}
+expect {
+    1.0
+    18.0
+    25.0
+    33.0
+    70.0
+    74.0
+    78.0
+    79.0
+    81.0
+    82.0
+}
+
+# Distinct as argument error
+test window-distinct-as-argument {
+    SELECT
+        first_name,
+        sum(distinct age) OVER (PARTITION BY first_name)
+    FROM users;
+}
+expect error { DISTINCT is not supported for window functions }
+
+# Distinct as argument 2 error
+test window-distinct-as-argument-2 {
+    SELECT
+        first_name,
+        count(distinct) OVER (PARTITION BY first_name)
+    FROM users;
+}
+expect error { DISTINCT is not supported for window functions }
+
+# Limit offset
+test window-limit-offset {
+    SELECT
+        first_name,
+        age,
+        max(age) OVER (PARTITION BY zipcode ORDER BY id)
+    FROM users
+    LIMIT 3
+    OFFSET 2;
+}
+expect {
+    Christopher|62|62
+    Steven|33|33
+    Greg|44|44
+}
+
+# Order by limit offset
+test window-order-by-limit-offset {
+    SELECT
+        first_name,
+        age,
+        max(age) OVER (PARTITION BY zipcode ORDER BY id)
+    FROM users
+    ORDER BY zipcode, id
+    LIMIT 3
+    OFFSET 2;
+}
+expect {
+    Christopher|62|62
+    Steven|33|33
+    Greg|44|44
+}
+
+# Window in CTE
+test window-in-cte {
+    WITH w AS (
+      SELECT
+          u.*,
+          max(age) OVER (PARTITION BY zipcode) AS zmax
+      FROM users u
+    )
+    SELECT
+        first_name,
+        last_name,
+        zmax
+    FROM w
+    ORDER BY first_name, last_name
+    LIMIT 5;
+}
+expect {
+    Aaron|Alvarado|69
+    Aaron|Baker|91
+    Aaron|Brown|98
+    Aaron|Bush|42
+    Aaron|Clark|26
+}
+
+# Named window in CTE
+test window-named-in-cte {
+    WITH w AS (
+      SELECT
+          u.*,
+          max(age) OVER win1 AS zmax
+      FROM users u
+      WINDOW win1 AS (PARTITION BY zipcode)
+    )
+    SELECT
+        first_name,
+        last_name,
+        zmax
+    FROM w
+    ORDER BY first_name, last_name
+    LIMIT 5;
+}
+expect {
+    Aaron|Alvarado|69
+    Aaron|Baker|91
+    Aaron|Brown|98
+    Aaron|Bush|42
+    Aaron|Clark|26
+}
+
+# Empty partition
+test window-empty-partition {
+    SELECT
+        sum(age) OVER (PARTITION by zipcode)
+    FROM users
+    WHERE 0;
+}
+expect {
+}
+
+# Single row partition
+test window-single-row-partition {
+    SELECT
+      first_name,
+      sum(age) OVER (PARTITION BY zipcode)
+    FROM users
+    WHERE zipcode = '00523';
+}
+expect {
+    Misty|96
+}
+
+# Column in order by
+test window-column-in-order-by {
+    SELECT
+        first_name,
+        age,
+        sum(age) OVER (PARTITION BY zipcode) AS total_age
+    FROM users
+    ORDER BY total_age DESC, first_name
+    LIMIT 10;
+}
+expect {
+    Bradley|94|261
+    Chelsey|77|261
+    Sara|90|261
+    Bruce|85|241
+    Daniel|69|241
+    Jesse|75|241
+    Sean|12|241
+    Benjamin|36|218
+    John|97|218
+    Kelly|85|218
+}
+
+# Window function in order by
+test window-function-in-order-by {
+    SELECT
+        first_name,
+        age
+    FROM users
+    ORDER BY sum(age) OVER (PARTITION BY zipcode) DESC, first_name
+    LIMIT 10;
+}
+expect {
+    Bradley|94
+    Chelsey|77
+    Sara|90
+    Bruce|85
+    Daniel|69
+    Jesse|75
+    Sean|12
+    Benjamin|36
+    John|97
+    Kelly|85
+}
+
+# Complex argument
+test window-complex-argument {
+    SELECT
+        sum(price between 1 and 50) OVER ()
+    FROM products;
+}
+expect {
+    4
+    4
+    4
+    4
+    4
+    4
+    4
+    4
+    4
+    4
+    4
+}

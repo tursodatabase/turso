@@ -1,0 +1,33 @@
+# Scalar Functions Tests (Readonly - uses products/users tables)
+# Ported from testing/scalar-functions.test
+
+@database testing/testing.db readonly
+
+test typeof-sum-integer {
+    SELECT typeof(sum(age)) from users;
+}
+expect {
+    integer
+}
+
+test typeof-sum-real {
+    SELECT typeof(sum(price)) from products;
+}
+expect {
+    real
+}
+
+test typeof-group_concat {
+    SELECT typeof(group_concat(name)) from products;
+}
+expect {
+    text
+}
+
+test cast-in-where {
+    select age from users where age = cast('45' as integer) limit 1;
+}
+expect {
+    45
+}
+

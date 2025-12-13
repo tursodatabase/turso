@@ -1,0 +1,48 @@
+# VALUES Tests (Readonly)
+# Ported from testing/values.test
+
+@database testing/testing.db readonly
+
+# Basic values
+test values-1 {
+    values(1, 2);
+}
+expect {
+    1|2
+}
+
+# Multiple rows
+test values-2 {
+    values(1, 2), (3, 4);
+}
+expect {
+    1|2
+    3|4
+}
+
+# Expressions
+test values-3 {
+    values(1+1, 2*3);
+}
+expect {
+    2|6
+}
+
+# Values in FROM clause
+test values-in-from {
+    select * from (values(3, 4, 5), (5, 6, 7), (8, 9, 10));
+}
+expect {
+    3|4|5
+    5|6|7
+    8|9|10
+}
+
+# Values in JOIN
+test values-in-join {
+    select * from (values(1, 2)) join (values(3, 4), (5, 6));
+}
+expect {
+    1|2|3|4
+    1|2|5|6
+}

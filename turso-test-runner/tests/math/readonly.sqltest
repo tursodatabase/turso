@@ -1,0 +1,317 @@
+# Math Tests (Readonly - uses products/users tables)
+# Ported from testing/math.test
+
+@database testing/testing.db readonly
+
+test add-agg-int {
+    SELECT sum(id) + 10 FROM products;
+}
+expect {
+    76
+}
+
+test add-int-agg {
+    SELECT 10 + sum(id) FROM products;
+}
+expect {
+    76
+}
+
+test add-agg-float {
+    SELECT sum(id) + 10.1 FROM products;
+}
+expect {
+    76.1
+}
+
+test add-float-agg {
+    SELECT 10.1 + sum(id) FROM products;
+}
+expect {
+    76.1
+}
+
+test add-agg-int-agg-int {
+    SELECT sum(id) + sum(id) FROM products;
+}
+expect {
+    132
+}
+
+test add-agg-float-agg-float {
+    SELECT sum(price) + sum(price) FROM products;
+}
+expect {
+    1246.0
+}
+
+test add-agg-int-agg-float {
+    SELECT sum(id) + sum(price) FROM products;
+}
+expect {
+    689.0
+}
+
+test subtract-agg-int {
+    SELECT sum(id) - 10 FROM products;
+}
+expect {
+    56
+}
+
+test subtract-int-agg {
+    SELECT 10 - sum(id) FROM products;
+}
+expect {
+    -56
+}
+
+test subtract-agg-float {
+    SELECT sum(id) - 10.1 FROM products;
+}
+expect {
+    55.9
+}
+
+test subtract-float-agg {
+    SELECT 10.1 - sum(id) FROM products;
+}
+expect {
+    -55.9
+}
+
+test subtract-agg-int-agg-int {
+    SELECT sum(id) - sum(id) FROM products;
+}
+expect {
+    0
+}
+
+test subtract-agg-float-agg-float {
+    SELECT sum(price) - sum(price) FROM products;
+}
+expect {
+    0.0
+}
+
+test subtract-agg-int-agg-float {
+    SELECT sum(id) - sum(price) FROM products;
+}
+expect {
+    -557.0
+}
+
+test subtract-agg-float-agg-int {
+    SELECT sum(price) - sum(id) FROM products;
+}
+expect {
+    557.0
+}
+
+test multiply-agg-int {
+    SELECT sum(id) * 10 FROM products;
+}
+expect {
+    660
+}
+
+test multiply-int-agg {
+    SELECT 10 * sum(id) FROM products;
+}
+expect {
+    660
+}
+
+test multiply-agg-float {
+    SELECT sum(id) * 10.1 FROM products;
+}
+expect {
+    666.6
+}
+
+test multiply-float-agg {
+    SELECT 10.1 * sum(id) FROM products;
+}
+expect {
+    666.6
+}
+
+test multiply-agg-int-agg-int {
+    SELECT sum(id) * sum(id) FROM products;
+}
+expect {
+    4356
+}
+
+test multiply-agg-float-agg-float {
+    SELECT sum(price) * sum(price) FROM products;
+}
+expect {
+    388129.0
+}
+
+test multiply-agg-int-agg-float {
+    SELECT sum(id) * sum(price) FROM products;
+}
+expect {
+    41118.0
+}
+
+test multiply-agg-float-agg-int {
+    SELECT sum(price) * sum(id) FROM products;
+}
+expect {
+    41118.0
+}
+
+test divide-agg-int {
+    SELECT sum(id) / 10 FROM products;
+}
+expect {
+    6
+}
+
+test divide-int-agg {
+    SELECT 660 / sum(id) FROM products;
+}
+expect {
+    10
+}
+
+test divide-agg-float {
+    SELECT sum(id) / 1.5 FROM products;
+}
+expect {
+    44.0
+}
+
+test divide-float-agg {
+    SELECT 66.0 / sum(id) FROM products;
+}
+expect {
+    1.0
+}
+
+test divide-agg-int-agg-int {
+    SELECT sum(id) / sum(id) FROM products;
+}
+expect {
+    1
+}
+
+test divide-agg-float-agg-float {
+    SELECT sum(price) / sum(price) FROM products;
+}
+expect {
+    1.0
+}
+
+test divide-agg-int-agg-float {
+    SELECT sum(id) / min(price) FROM products;
+}
+expect {
+    66.0
+}
+
+test divide-agg-float-agg-int {
+    SELECT min(price) / min(id) FROM products;
+}
+expect {
+    1.0
+}
+
+test bitwise-and-int-agg-int {
+    SELECT 8261 & sum(id) FROM products;
+}
+expect {
+    64
+}
+
+test bitwise-and-int-agg-float {
+    SELECT 1036.6 & sum(id) FROM products;
+}
+expect {
+    0
+}
+
+test bitwise-and-int-agg-int-agg {
+    SELECT sum(id) & sum(id) FROM products;
+}
+expect {
+    66
+}
+
+test bitwise-or-int-agg {
+    SELECT 18823 | sum(id) FROM products;
+}
+expect {
+    18887
+}
+
+test bitwise-or-int-agg-int-agg {
+    SELECT sum(id) | sum(id) FROM products;
+}
+expect {
+    66
+}
+
+test sin-products-id {
+    SELECT sin(id) FROM products LIMIT 5;
+}
+expect {
+    0.841470984807897
+    0.909297426825682
+    0.141120008059867
+    -0.756802495307928
+    -0.958924274663138
+}
+
+test mod-products-id {
+    SELECT mod(products.id, 3) FROM products LIMIT 5;
+}
+expect {
+    1.0
+    2.0
+    0.0
+    1.0
+    2.0
+}
+
+test mod-products-price-id {
+    SELECT mod(products.price, products.id) FROM products LIMIT 5;
+}
+expect {
+    0.0
+    0.0
+    0.0
+    1.0
+    4.0
+}
+
+test remainder-float-agg {
+    SELECT 23.14 % sum(id) FROM products;
+}
+expect {
+    23.0
+}
+
+test remainder-int-agg {
+    SELECT 17 % sum(id) FROM users;
+}
+expect {
+    17
+}
+
+test remainder-agg-int {
+    SELECT count(*) % 17 FROM users;
+}
+expect {
+    4
+}
+
+test remainder-agg-float {
+    SELECT count(*) % 2.43 FROM users;
+}
+expect {
+    0.0
+}

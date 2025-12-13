@@ -1,0 +1,76 @@
+# Vector Tests (Memory)
+# Ported from testing/vector.test
+
+@database :memory:
+
+# Vector insert
+setup vector-insert {
+    CREATE TABLE IF NOT EXISTS vector_test (
+        id INTEGER PRIMARY KEY,
+        format TEXT NOT NULL,
+        vec_data F32_BLOB(3)
+    );
+}
+
+@setup vector-insert
+test vector-insert {
+    INSERT INTO vector_test (id, format, vec_data)
+    VALUES (2, 'Bracketed_comma_separated', vector('[4.000000,5.000000,6.000000]'));
+    SELECT id, format, vector_extract(vec_data) from vector_test;
+}
+expect {
+    2|Bracketed_comma_separated|[4,5,6]
+}
+
+# Vector insert no quotes (should fail)
+setup vector-insert-no-quotes {
+    CREATE TABLE IF NOT EXISTS vector_test (
+        id INTEGER PRIMARY KEY,
+        format TEXT NOT NULL,
+        vec_data F32_BLOB(3)
+    );
+}
+
+@setup vector-insert-no-quotes
+test vector-insert-no-quotes {
+    INSERT INTO vector_test (id, format, vec_data)
+    VALUES (2, 'Bracketed_comma_separated', vector([4.000000,5.000000,6.000000]));
+}
+expect error {}
+
+# Vector insert double quotes (should fail)
+setup vector-insert-double-quotes {
+    CREATE TABLE IF NOT EXISTS vector_test (
+        id INTEGER PRIMARY KEY,
+        format TEXT NOT NULL,
+        vec_data F32_BLOB(3)
+    );
+}
+
+@setup vector-insert-double-quotes
+test vector-insert-double-quotes {
+    INSERT INTO vector_test (id, format, vec_data)
+    VALUES (2, 'Bracketed_comma_separated', vector("[4.000000,5.000000,6.000000]"));
+}
+expect error { no such column }
+
+# Vector distance dot from table
+setup vector-distance-dot-table {
+    CREATE TABLE dot_test (
+        id INTEGER PRIMARY KEY,
+        vec F32_BLOB(2)
+    );
+    INSERT INTO dot_test (id, vec) VALUES (1, vector('[1, 1]'));
+    INSERT INTO dot_test (id, vec) VALUES (2, vector('[2, 2]'));
+}
+
+@setup vector-distance-dot-table
+test vector-distance-dot-table {
+    SELECT vector_distance_dot(vec, vector('[1, 1]')) as dist
+    FROM dot_test
+    ORDER BY dist ASC;
+}
+expect {
+    -4.0
+    -2.0
+}

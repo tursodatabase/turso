@@ -1,0 +1,290 @@
+# PRAGMA Tests (Readonly)
+# Ported from testing/pragma.test
+
+@database testing/testing.db readonly
+
+# Set cache size and check in same connection
+test pragma-set-cache-size {
+  PRAGMA cache_size = 100;
+  PRAGMA cache_size
+}
+expect {
+    100
+}
+
+# Cache size defaults back on new connection
+test pragma-cache-size {
+  PRAGMA cache_size
+}
+expect {
+    -2000
+}
+
+# Pragma function for cache size
+test pragma-function-cache-size {
+  SELECT * FROM pragma_cache_size()
+}
+expect {
+    -2000
+}
+
+# Journal mode WAL
+test pragma-update-journal-mode-wal {
+  PRAGMA journal_mode=WAL
+}
+expect {
+    wal
+}
+
+# Pragma function journal mode
+test pragma-function-update-journal-mode {
+  SELECT * FROM pragma_journal_mode()
+}
+expect {
+    wal
+}
+
+# Table info using equal syntax
+test pragma-table-info-equal-syntax {
+  PRAGMA table_info=sqlite_schema
+}
+expect {
+    0|type|TEXT|0||0
+    1|name|TEXT|0||0
+    2|tbl_name|TEXT|0||0
+    3|rootpage|INT|0||0
+    4|sql|TEXT|0||0
+}
+
+# Table info using call syntax
+test pragma-table-info-call-syntax {
+  PRAGMA table_info(sqlite_schema)
+}
+expect {
+    0|type|TEXT|0||0
+    1|name|TEXT|0||0
+    2|tbl_name|TEXT|0||0
+    3|rootpage|INT|0||0
+    4|sql|TEXT|0||0
+}
+
+# Table xinfo using call syntax
+test pragma-table-xinfo-call-syntax {
+  PRAGMA table_xinfo(sqlite_schema)
+}
+expect {
+    0|type|TEXT|0||0|0
+    1|name|TEXT|0||0|0
+    2|tbl_name|TEXT|0||0|0
+    3|rootpage|INT|0||0|0
+    4|sql|TEXT|0||0|0
+}
+
+# Table info for vtable
+test pragma-table-info-vtable {
+  SELECT name FROM pragma_table_info('generate_series')
+}
+expect {
+    value
+}
+
+# Table info using alt name equal syntax
+test pragma-table-info-alt-name-equal-syntax {
+  PRAGMA table_info=sqlite_master
+}
+expect {
+    0|type|TEXT|0||0
+    1|name|TEXT|0||0
+    2|tbl_name|TEXT|0||0
+    3|rootpage|INT|0||0
+    4|sql|TEXT|0||0
+}
+
+# Table info using alt name call syntax
+test pragma-table-info-alt-name-call-syntax {
+  PRAGMA table_info(sqlite_master)
+}
+expect {
+    0|type|TEXT|0||0
+    1|name|TEXT|0||0
+    2|tbl_name|TEXT|0||0
+    3|rootpage|INT|0||0
+    4|sql|TEXT|0||0
+}
+
+# Pragma function table info alt name
+test pragma-function-table-info-alt-name {
+  SELECT * FROM pragma_table_info('sqlite_master')
+}
+expect {
+    0|type|TEXT|0||0
+    1|name|TEXT|0||0
+    2|tbl_name|TEXT|0||0
+    3|rootpage|INT|0||0
+    4|sql|TEXT|0||0
+}
+
+# Pragma function table info
+test pragma-function-table-info {
+  SELECT * FROM pragma_table_info('sqlite_schema')
+}
+expect {
+    0|type|TEXT|0||0
+    1|name|TEXT|0||0
+    2|tbl_name|TEXT|0||0
+    3|rootpage|INT|0||0
+    4|sql|TEXT|0||0
+}
+
+# Pragma vtab table info
+test pragma-vtab-table-info {
+  SELECT * FROM pragma_table_info WHERE arg = 'sqlite_schema'
+}
+expect {
+    0|type|TEXT|0||0
+    1|name|TEXT|0||0
+    2|tbl_name|TEXT|0||0
+    3|rootpage|INT|0||0
+    4|sql|TEXT|0||0
+}
+
+# Table info for invalid table
+test pragma-table-info-invalid-table {
+  PRAGMA table_info=pekka
+}
+expect {
+}
+
+# Pragma function table info invalid table
+test pragma-function-table-info-invalid-table {
+  SELECT * FROM pragma_table_info('pekka')
+}
+expect {
+}
+
+# Pragma vtab table info invalid table
+test pragma-vtab-table-info-invalid-table {
+  SELECT * FROM pragma_table_info WHERE arg = 'pekka'
+}
+expect {
+}
+
+# Legacy file format
+test pragma-legacy-file-format {
+  PRAGMA legacy_file_format
+}
+expect {
+}
+
+# Pragma function legacy file format (error)
+test pragma-function-legacy-file-format {
+  SELECT * FROM pragma_legacy_file_format()
+}
+expect error {}
+
+# Pragma function too many arguments
+test pragma-function-too-many-arguments {
+  SELECT * FROM pragma_table_info('sqlite_schema', 'main', 'arg3')
+}
+expect error { Too many arguments }
+
+# Pragma function wal checkpoint (error - not readable)
+test pragma-function-update {
+  SELECT * FROM pragma_wal_checkpoint()
+}
+expect error {}
+
+# Pragma function with NULL argument
+test pragma-function-nontext-argument {
+  SELECT * FROM pragma_table_info('sqlite_schema', NULL);
+}
+expect {
+    0|type|TEXT|0||0
+    1|name|TEXT|0||0
+    2|tbl_name|TEXT|0||0
+    3|rootpage|INT|0||0
+    4|sql|TEXT|0||0
+}
+
+# Pragma vtab with NULL argument
+test pragma-vtab-nontext-argument {
+  SELECT * FROM pragma_table_info WHERE arg ='sqlite_schema' AND schema IS NULL;
+}
+expect {
+    0|type|TEXT|0||0
+    1|name|TEXT|0||0
+    2|tbl_name|TEXT|0||0
+    3|rootpage|INT|0||0
+    4|sql|TEXT|0||0
+}
+
+# Pragma function no arguments
+test pragma-function-no-arguments {
+  SELECT * FROM pragma_table_info();
+}
+expect {
+}
+
+# Pragma vtab no arguments
+test pragma-vtab-no-arguments {
+  SELECT * FROM pragma_table_info;
+}
+expect {
+}
+
+# SQL injection test (no output = safe)
+test pragma-function-sql-injection {
+  SELECT * FROM pragma_table_info('sqlite_schema'';CREATE TABLE foo (c0);SELECT ''bar');
+  SELECT * FROM pragma_table_info('foo');
+}
+expect {
+}
+
+# Pragma vtab join (uses testing.db with users/products tables)
+test pragma-vtab-join {
+  SELECT s.name, ti.name FROM sqlite_schema AS s, pragma_table_info(s.name) AS ti;
+}
+expect {
+    users|id
+    users|first_name
+    users|last_name
+    users|email
+    users|phone_number
+    users|address
+    users|city
+    users|state
+    users|zipcode
+    users|age
+    products|id
+    products|name
+    products|price
+}
+
+# Pragma vtab reversed join order
+test pragma-vtab-reversed-join-order {
+  SELECT s.name, ti.name FROM pragma_table_info(s.name) AS ti, sqlite_schema AS s;
+}
+expect {
+    users|id
+    users|first_name
+    users|last_name
+    users|email
+    users|phone_number
+    users|address
+    users|city
+    users|state
+    users|zipcode
+    users|age
+    products|id
+    products|name
+    products|price
+}
+
+# Module list
+test pragma-module-list-nonempty {
+  SELECT * FROM pragma_module_list;
+}
+expect pattern {
+    generate_series
+}
+

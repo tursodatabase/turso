@@ -1,0 +1,23 @@
+# Concat Tests (Memory)
+# Ported from testing/concat.test
+
+@database :memory:
+
+test concat {
+    SELECT 'Hello' || ' ' || 'World';
+}
+expect {
+    Hello World
+}
+
+test concat-2 {
+    SELECT 'Hello' || NULL;
+}
+expect {
+}
+
+test concat-3 {
+    SELECT 'Hello' || NULL;
+}
+expect {
+}

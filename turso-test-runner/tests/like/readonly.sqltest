@@ -1,0 +1,118 @@
+# LIKE Tests (Readonly - uses products/users tables)
+# Ported from testing/like.test
+
+@database testing/testing.db readonly
+
+test like-fn {
+    SELECT name, like('sweat%', name) FROM products;
+}
+expect {
+    hat|0
+    cap|0
+    shirt|0
+    sweater|1
+    sweatshirt|1
+    shorts|0
+    jeans|0
+    sneakers|0
+    boots|0
+    coat|0
+    accessories|0
+}
+
+test where-like {
+    SELECT * FROM products WHERE name LIKE 'sweat%';
+}
+expect {
+    4|sweater|25.0
+    5|sweatshirt|74.0
+}
+
+test where-like-case-insensitive {
+    SELECT * FROM products WHERE name LIKE 'SWEAT%';
+}
+expect {
+    4|sweater|25.0
+    5|sweatshirt|74.0
+}
+
+test where-like-underscore {
+    SELECT * FROM products WHERE name LIKE 'sweat_r';
+}
+expect {
+    4|sweater|25.0
+}
+
+test where-like-underscore-case-insensitive {
+    SELECT * FROM products WHERE name LIKE 'SwEaT_R';
+}
+expect {
+    4|sweater|25.0
+}
+
+test where-like-fn {
+    SELECT * FROM products WHERE like('sweat%', name)=1;
+}
+expect {
+    4|sweater|25.0
+    5|sweatshirt|74.0
+}
+
+test where-not-like-and {
+    SELECT * FROM products WHERE name NOT LIKE 'sweat%' AND price >= 70.0;
+}
+expect {
+    1|hat|79.0
+    2|cap|82.0
+    6|shorts|70.0
+    7|jeans|78.0
+    8|sneakers|82.0
+    11|accessories|81.0
+}
+
+test where-like-or {
+    SELECT * FROM products WHERE name LIKE 'sweat%' OR price >= 80.0;
+}
+expect {
+    2|cap|82.0
+    4|sweater|25.0
+    5|sweatshirt|74.0
+    8|sneakers|82.0
+    11|accessories|81.0
+}
+
+test where-like-another-column {
+    SELECT first_name, last_name FROM users WHERE last_name LIKE first_name;
+}
+expect {
+    James|James
+    Daniel|Daniel
+    Taylor|Taylor
+}
+
+test where-like-another-column-prefix {
+    SELECT first_name, last_name FROM users WHERE last_name LIKE concat(first_name, '%');
+}
+expect {
+    James|James
+    Daniel|Daniel
+    William|Williams
+    John|Johnson
+    Taylor|Taylor
+    John|Johnson
+    Stephen|Stephens
+    Robert|Roberts
+}
+
+test where-like-escape {
+    SELECT count(*) FROM users WHERE last_name LIKE 'Pe#rry' ESCAPE '#';
+}
+expect {
+    19
+}
+
+test where-like-impossible {
+    SELECT * FROM products WHERE 'foobar' LIKE 'fooba';
+}
+expect {
+}

@@ -1,0 +1,272 @@
+# Partial Index Tests
+# Ported from testing/partial_idx.test
+
+@database :memory:
+
+# Basic unique partial index
+setup partial-index-unique-basic {
+    CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT, status TEXT);
+    CREATE UNIQUE INDEX idx_active_email ON users(email) WHERE status = 'active';
+}
+
+@setup partial-index-unique-basic
+test partial-index-unique-basic {
+    INSERT INTO users VALUES (1, 'user@test.com', 'active');
+    INSERT INTO users VALUES (2, 'user@test.com', 'inactive');
+    INSERT INTO users VALUES (3, 'user@test.com', 'deleted');
+    SELECT id, email, status FROM users ORDER BY id;
+}
+expect {
+    1|user@test.com|active
+    2|user@test.com|inactive
+    3|user@test.com|deleted
+}
+
+# Unique violation in partial index
+setup partial-index-unique-violation {
+    CREATE TABLE users (id INTEGER PRIMARY KEY, email TEXT, status TEXT);
+    CREATE UNIQUE INDEX idx_active_email ON users(email) WHERE status = 'active';
+}
+
+@setup partial-index-unique-violation
+test partial-index-unique-violation {
+    INSERT INTO users VALUES (1, 'user@test.com', 'active');
+    INSERT INTO users VALUES (2, 'user@test.com', 'inactive');
+    INSERT INTO users VALUES (3, 'user@test.com', 'deleted');
+    INSERT INTO users VALUES (4, 'user@test.com', 'active');
+}
+expect error { UNIQUE constraint failed }
+
+# Partial index with expression in WHERE
+setup partial-index-expression-where {
+    CREATE TABLE products (id INTEGER PRIMARY KEY, sku TEXT, price INTEGER);
+    CREATE UNIQUE INDEX idx_expensive ON products(sku) WHERE price > 100;
+}
+
+@setup partial-index-expression-where
+test partial-index-expression-where {
+    INSERT INTO products VALUES (1, 'ABC123', 50);
+    INSERT INTO products VALUES (2, 'ABC123', 150);
+    INSERT INTO products VALUES (3, 'XYZ789', 200);
+    INSERT INTO products VALUES (4, 'ABC123', 75);
+    SELECT id, sku, price FROM products ORDER BY id;
+}
+expect {
+    1|ABC123|50
+    2|ABC123|150
+    3|XYZ789|200
+    4|ABC123|75
+}
+
+# Expensive product violation
+setup partial-index-expensive-violation {
+    CREATE TABLE products (id INTEGER PRIMARY KEY, sku TEXT, price INTEGER);
+    CREATE UNIQUE INDEX idx_expensive ON products(sku) WHERE price > 100;
+}
+
+@setup partial-index-expensive-violation
+test partial-index-expensive-violation {
+    INSERT INTO products VALUES (1, 'ABC123', 50);
+    INSERT INTO products VALUES (2, 'ABC123', 150);
+    INSERT INTO products VALUES (3, 'XYZ789', 200);
+    INSERT INTO products VALUES (4, 'ABC123', 75);
+    INSERT INTO products VALUES (5, 'ABC123', 250);
+}
+expect error { UNIQUE constraint failed }
+
+# Update triggers violation
+setup partial-index-expensive-violation-update {
+    CREATE TABLE products (id INTEGER PRIMARY KEY, sku TEXT, price INTEGER);
+    CREATE UNIQUE INDEX idx_expensive ON products(sku) WHERE price > 100;
+    INSERT INTO products VALUES (1, 'ABC123', 50);
+    INSERT INTO products VALUES (2, 'ABC123', 150);
+    INSERT INTO products VALUES (3, 'XYZ789', 200);
+    INSERT INTO products VALUES (4, 'ABC123', 75);
+}
+
+@setup partial-index-expensive-violation-update
+test partial-index-expensive-violation-update {
+    UPDATE products SET price = 300 WHERE id = 1;
+}
+expect error { UNIQUE constraint failed }
+
+# NULL in WHERE clause
+setup partial-index-null-where {
+    CREATE TABLE items (id INTEGER PRIMARY KEY, code TEXT, category TEXT);
+    CREATE UNIQUE INDEX idx_categorized ON items(code) WHERE category IS NOT NULL;
+}
+
+@setup partial-index-null-where
+test partial-index-null-where {
+    INSERT INTO items VALUES (1, 'ITEM1', 'electronics');
+    INSERT INTO items VALUES (2, 'ITEM1', NULL);
+    INSERT INTO items VALUES (3, 'ITEM1', NULL);
+    INSERT INTO items VALUES (4, 'ITEM2', 'books');
+    SELECT id, code, category FROM items ORDER BY id;
+}
+expect {
+    1|ITEM1|electronics
+    2|ITEM1|
+    3|ITEM1|
+    4|ITEM2|books
+}
+
+# Function in WHERE clause
+setup partial-index-function-where {
+    CREATE TABLE docs (id INTEGER PRIMARY KEY, title TEXT);
+    CREATE UNIQUE INDEX idx_lower_title ON docs(title) WHERE LOWER(title) = title;
+}
+
+@setup partial-index-function-where
+test partial-index-function-where {
+    INSERT INTO docs VALUES (1, 'lowercase');
+    INSERT INTO docs VALUES (2, 'UPPERCASE');
+    INSERT INTO docs VALUES (3, 'lowercase');
+}
+expect error { UNIQUE constraint failed }
+
+# Multiple partial indexes
+setup partial-index-multiple {
+    CREATE TABLE tasks (id INTEGER PRIMARY KEY, name TEXT, priority INTEGER, status TEXT);
+    CREATE UNIQUE INDEX idx_urgent ON tasks(name) WHERE priority = 1;
+    CREATE UNIQUE INDEX idx_completed ON tasks(name) WHERE status = 'done';
+}
+
+@setup partial-index-multiple
+test partial-index-multiple {
+    INSERT INTO tasks VALUES (1, 'task1', 1, 'open');
+    INSERT INTO tasks VALUES (2, 'task1', 2, 'open');
+    INSERT INTO tasks VALUES (3, 'task1', 3, 'done');
+    INSERT INTO tasks VALUES (4, 'task2', 1, 'done');
+    SELECT id, name, priority, status FROM tasks ORDER BY id;
+}
+expect {
+    1|task1|1|open
+    2|task1|2|open
+    3|task1|3|done
+    4|task2|1|done
+}
+
+# Delete and reinsert
+setup partial-index-delete {
+    CREATE TABLE products (id INTEGER PRIMARY KEY, sku TEXT, price INTEGER);
+    CREATE UNIQUE INDEX idx_expensive ON products(sku) WHERE price > 100;
+    INSERT INTO products VALUES (1, 'ABC123', 50);
+    INSERT INTO products VALUES (2, 'ABC123', 150);
+    INSERT INTO products VALUES (3, 'XYZ789', 200);
+    INSERT INTO products VALUES (4, 'ABC123', 75);
+}
+
+@setup partial-index-delete
+test partial-index-delete {
+    DELETE FROM products WHERE price > 100;
+    INSERT INTO products VALUES (5, 'ABC123', 500);
+    INSERT INTO products VALUES (6, 'XYZ789', 600);
+    SELECT id, sku, price FROM products WHERE price > 100 ORDER BY id;
+}
+expect {
+    5|ABC123|500
+    6|XYZ789|600
+}
+
+# Update entering predicate conflicts
+setup partial-index-update-enter-conflict-1 {
+    CREATE TABLE products (id INTEGER PRIMARY KEY, sku TEXT, price INTEGER);
+    CREATE UNIQUE INDEX idx_expensive ON products(sku) WHERE price > 100;
+    INSERT INTO products VALUES (1, 'ABC123', 50);
+    INSERT INTO products VALUES (2, 'ABC123', 150);
+}
+
+@setup partial-index-update-enter-conflict-1
+test partial-index-update-enter-conflict-1 {
+    UPDATE products SET price = 200 WHERE id = 1;
+}
+expect error { UNIQUE constraint failed }
+
+# Update changing key to conflict
+setup partial-index-update-change-key-conflict {
+    CREATE TABLE products (id INTEGER PRIMARY KEY, sku TEXT, price INTEGER);
+    CREATE UNIQUE INDEX idx_expensive ON products(sku) WHERE price > 100;
+    INSERT INTO products VALUES (1, 'ABC123', 150);
+    INSERT INTO products VALUES (2, 'XYZ789', 200);
+}
+
+@setup partial-index-update-change-key-conflict
+test partial-index-update-change-key-conflict {
+    UPDATE products SET sku = 'XYZ789' WHERE id = 1;
+}
+expect error { UNIQUE constraint failed }
+
+# Rowid change while in predicate (no self-conflict)
+setup partial-index-update-rowid-no-self-conflict {
+    CREATE TABLE rowid_test (id INTEGER PRIMARY KEY, val TEXT, flag INT);
+    CREATE UNIQUE INDEX idx_flagged ON rowid_test(val) WHERE flag = 1;
+    INSERT INTO rowid_test VALUES (1,'v',1);
+}
+
+@setup partial-index-update-rowid-no-self-conflict
+test partial-index-update-rowid-no-self-conflict {
+    UPDATE rowid_test SET id = 9 WHERE id = 1;
+    SELECT id,val,flag FROM rowid_test ORDER BY id;
+}
+expect {
+    9|v|1
+}
+
+# UPSERT with partial index DO UPDATE
+setup upsert-partial-doupdate-basic {
+    CREATE TABLE u2(id INTEGER PRIMARY KEY, email TEXT, status TEXT, note TEXT);
+    CREATE UNIQUE INDEX idx_active_email ON u2(email) WHERE status='active';
+    INSERT INTO u2 VALUES (1,'a@test','active','n1');
+}
+
+@setup upsert-partial-doupdate-basic
+test upsert-partial-doupdate-basic {
+    INSERT INTO u2(email,status,note)
+      VALUES('a@test','active','nNEW')
+      ON CONFLICT DO UPDATE SET note=excluded.note;
+    SELECT id,email,status,note FROM u2;
+}
+expect {
+    1|a@test|active|nNEW
+}
+
+# UPSERT leaving predicate
+setup upsert-partial-doupdate-leave-predicate {
+    CREATE TABLE u3(id INTEGER PRIMARY KEY, email TEXT, status TEXT);
+    CREATE UNIQUE INDEX idx_active_email ON u3(email) WHERE status='active';
+    INSERT INTO u3 VALUES (1,'a@test','active');
+}
+
+@setup upsert-partial-doupdate-leave-predicate
+test upsert-partial-doupdate-leave-predicate {
+    INSERT INTO u3(email,status)
+      VALUES('a@test','active')
+      ON CONFLICT DO UPDATE SET status='inactive';
+    INSERT INTO u3 VALUES (2,'a@test','active');
+    SELECT id,email,status FROM u3 ORDER BY id;
+}
+expect {
+    1|a@test|inactive
+    2|a@test|active
+}
+
+# UPSERT with multi-column partial index
+setup upsert-partial-multicol-leave-predicate {
+    CREATE TABLE m2(id INTEGER PRIMARY KEY, sku TEXT, region TEXT, price INT);
+    CREATE UNIQUE INDEX idx_sr ON m2(sku,region) WHERE price > 100;
+    INSERT INTO m2 VALUES(1,'A','US',150);
+}
+
+@setup upsert-partial-multicol-leave-predicate
+test upsert-partial-multicol-leave-predicate {
+    INSERT INTO m2(sku,region,price)
+      VALUES('A','US',150)
+      ON CONFLICT DO UPDATE SET price=50;
+    INSERT INTO m2 VALUES(2,'A','US',200);
+    SELECT id,sku,region,price FROM m2 ORDER BY id;
+}
+expect {
+    1|A|US|50
+    2|A|US|200
+}

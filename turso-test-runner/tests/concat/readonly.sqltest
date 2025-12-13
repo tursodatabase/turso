@@ -1,0 +1,17 @@
+# Concat Tests (Readonly - uses existing products table)
+# Ported from testing/concat.test
+
+@database testing/testing.db readonly
+
+test concat-from-table {
+    SELECT 'A good ' || name FROM products WHERE name = 'hat';
+}
+expect {
+    A good hat
+}
+
+test concat-from-table-empty {
+    SELECT 'A good ' || name FROM products WHERE name = 'watch';
+}
+expect {
+}

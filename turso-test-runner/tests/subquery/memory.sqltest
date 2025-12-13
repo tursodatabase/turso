@@ -1,0 +1,762 @@
+# SUBQUERY Tests (Memory - standalone tests)
+# Ported from testing/subquery.test
+
+@database :memory:
+
+setup correlated-left-join-exists {
+    create table t(a);
+    create table s(a);
+    insert into t values (1);
+}
+
+@setup correlated-left-join-exists
+test correlated-left-join-exists {
+    select t.a
+      from t
+      left join s
+        on t.a = s.a
+     where exists (select 1 where s.a is null);
+}
+expect {
+    1
+}
+
+setup subquery-cte-depth {
+    -- Nothing needed
+}
+
+test subquery-cte-available-in-arbitrary-depth {
+    with cte as (select 1 as one)
+    select onehundredandeleven+1 as onehundredandtwelve
+    from (
+        with cte2 as (select 10 as ten)
+        select onehundredandone+ten as onehundredandeleven
+        from (
+            with cte3 as (select 100 as hundred)
+            select one+hundred as onehundredandone
+            from cte join cte3
+        ) join cte2
+    );
+}
+expect {
+    112
+}
+
+# EXISTS/NOT EXISTS
+
+setup exists-basic {
+    create table test(a);
+    insert into test values (1);
+}
+
+@setup exists-basic
+test subquery-exists-basic {
+    select * from test where exists (select 0);
+    select * from test where not exists (select 0 where false);
+}
+expect {
+    1
+    1
+}
+
+setup exists-uncorrelated {
+    create table products(id, name, price);
+    create table users(id, name);
+    insert into products values (1, 'hat', 50), (2, 'cap', 75), (3, 'shirt', 100);
+    insert into users values (1, 'Alice'), (2, 'Bob'), (3, 'Charlie');
+}
+
+@setup exists-uncorrelated
+test subquery-exists-uncorrelated {
+    select * from users where exists (select 1 from products);
+}
+expect {
+    1|Alice
+    2|Bob
+    3|Charlie
+}
+
+setup not-exists-uncorrelated {
+    create table products(id, name, price);
+    create table users(id, name);
+    insert into products values (1, 'hat', 50), (2, 'cap', 75);
+}
+
+@setup not-exists-uncorrelated
+test subquery-not-exists-uncorrelated {
+    select * from products where not exists (select 1 from users);
+}
+expect {
+    1|hat|50
+    2|cap|75
+}
+
+setup exists-correlated {
+    create table products(id, name, category_id);
+    create table categories(id, name);
+    insert into products values (1, 'hat', 10), (2, 'cap', 20), (3, 'shirt', 10);
+    insert into categories values (10, 'Clothing'), (30, 'Electronics');
+}
+
+@setup exists-correlated
+test subquery-exists-correlated {
+    select * from products p where exists (
+        select * from categories c where c.id = p.category_id
+    );
+}
+expect {
+    1|hat|10
+    3|shirt|10
+}
+
+setup not-exists-correlated {
+    create table users(id, name, age);
+    create table orders(id, user_id, amount);
+    insert into users values (1, 'Alice', 25), (2, 'Bob', 30), (3, 'Charlie', 35);
+    insert into orders values (1, 1, 100), (2, 3, 200);
+}
+
+@setup not-exists-correlated
+test subquery-not-exists-correlated {
+    select * from users u where not exists (
+        select * from orders o where o.user_id = u.id
+    );
+}
+expect {
+    2|Bob|30
+}
+
+setup exists-with-conditions {
+    create table categories(id, name);
+    create table products(id, name, price, category_id);
+    insert into categories values (1, 'Clothing'), (2, 'Electronics');
+    insert into products values (1, 'hat', 50, 1), (2, 'cap', 25, 1), (3, 'macbook', 75, 2);
+}
+
+@setup exists-with-conditions
+test subquery-exists-with-conditions {
+    select * from products p where exists (
+        select * from categories c
+        where c.id = p.category_id and c.name = 'Clothing'
+    );
+}
+expect {
+    1|hat|50|1
+    2|cap|25|1
+}
+
+setup nested-exists {
+    create table users(id, name);
+    create table products(id, name, user_id);
+    create table reviews(id, product_id, rating);
+    insert into users values (1, 'Alice'), (2, 'Bob');
+    insert into products values (1, 'hat', 1), (2, 'cap', 2);
+    insert into reviews values (1, 1, 5);
+}
+
+@setup nested-exists
+test subquery-nested-exists {
+    select * from users u where exists (
+        select * from products p where p.user_id = u.id and exists (
+            select 1 from reviews r where r.product_id = p.id and r.rating >= 4
+        )
+    );
+}
+expect {
+    1|Alice
+}
+
+setup exists-empty-result {
+    create table products(id, name);
+    create table tags(product_id, tag);
+    insert into products values (1, 'hat'), (2, 'cap');
+}
+
+@setup exists-empty-result
+test subquery-exists-empty-result {
+    select * from products p where exists (
+        select * from tags t where t.product_id = p.id
+    );
+}
+expect {
+}
+
+setup not-exists-all-match {
+    create table users(id, email);
+    create table blocked_emails(email);
+    insert into users values (1, 'alice@test.com'), (2, 'bob@test.com');
+    insert into blocked_emails values ('spam@test.com');
+}
+
+@setup not-exists-all-match
+test subquery-not-exists-all-match {
+    select * from users u where not exists (
+        select * from blocked_emails b where b.email = u.email
+    );
+}
+expect {
+    1|alice@test.com
+    2|bob@test.com
+}
+
+# SCALAR SUBQUERIES
+
+setup scalar-comparison {
+    create table products(id, name, price);
+    insert into products values (1, 'hat', 50), (2, 'cap', 25), (3, 'jacket', 75);
+}
+
+@setup scalar-comparison
+test subquery-scalar-comparison {
+    select * from products where price >= (
+        select avg(price) from products
+    );
+}
+expect {
+    1|hat|50
+    3|jacket|75
+}
+
+setup scalar-max {
+    create table users(id, name, score);
+    insert into users values (1, 'Alice', 85), (2, 'Bob', 92), (3, 'Charlie', 92);
+}
+
+@setup scalar-max
+test subquery-scalar-max {
+    select * from users where score = (
+        select max(score) from users
+    );
+}
+expect {
+    2|Bob|92
+    3|Charlie|92
+}
+
+# IN SUBQUERIES
+
+setup in-single-column {
+    create table products(id, name, category_id);
+    create table categories(id, name);
+    insert into categories values (1, 'Clothing'), (2, 'Electronics'), (3, 'Books');
+    insert into products values (1, 'hat', 1), (2, 'laptop', 2), (3, 'novel', 3), (4, 'cap', 1);
+}
+
+@setup in-single-column
+test subquery-in-single-column {
+    select * from products where category_id in (
+        select id from categories where name in ('Clothing', 'Electronics')
+    );
+}
+expect {
+    1|hat|1
+    2|laptop|2
+    4|cap|1
+}
+
+setup not-in-single-column {
+    create table products(id, name, category_id);
+    create table discontinued_categories(category_id);
+    insert into products values (1, 'hat', 1), (2, 'laptop', 2), (3, 'book', 3);
+    insert into discontinued_categories values (2);
+}
+
+@setup not-in-single-column
+test subquery-not-in-single-column {
+    select * from products where category_id not in (
+        select category_id from discontinued_categories
+    );
+}
+expect {
+    1|hat|1
+    3|book|3
+}
+
+setup in-multiple-columns {
+    create table order_items(order_id, product_id, quantity);
+    create table special_offers(product_id, min_quantity);
+    insert into order_items values (1, 10, 5), (2, 20, 3), (3, 10, 2), (4, 30, 1);
+    insert into special_offers values (10, 5), (20, 3);
+}
+
+@setup in-multiple-columns
+test subquery-in-multiple-columns {
+    select * from order_items where (product_id, quantity) in (
+        select product_id, min_quantity from special_offers
+    );
+}
+expect {
+    1|10|5
+    2|20|3
+}
+
+setup not-in-multiple-columns {
+    create table users(id, name, age);
+    create table restricted_profiles(name, age);
+    insert into users values (1, 'Alice', 25), (2, 'Bob', 30), (3, 'Charlie', 25);
+    insert into restricted_profiles values ('Bob', 30);
+}
+
+@setup not-in-multiple-columns
+test subquery-not-in-multiple-columns {
+    select * from users where (name, age) not in (
+        select name, age from restricted_profiles
+    );
+}
+expect {
+    1|Alice|25
+    3|Charlie|25
+}
+
+# SUBQUERIES IN OTHER POSITIONS
+
+setup uncorrelated-in-result-column {
+    create table employees(id, name, dept_id);
+    create table company_info(total_depts);
+    insert into employees values (1, 'Alice', 10), (2, 'Bob', 20);
+    insert into company_info values (5);
+}
+
+@setup uncorrelated-in-result-column
+test subquery-uncorrelated-in-result-column {
+    select id, name, (select total_depts from company_info) as total_depts from employees;
+}
+expect {
+    1|Alice|5
+    2|Bob|5
+}
+
+setup correlated-in-result-column {
+    create table employees(id, name, dept_id);
+    create table departments(id, name);
+    insert into employees values (1, 'Alice', 10), (2, 'Bob', 20);
+    insert into departments values (10, 'Sales'), (20, 'Engineering');
+}
+
+@setup correlated-in-result-column
+test subquery-correlated-in-result-column {
+    select id, name, (select name from departments where id = dept_id) as dept_name from employees;
+}
+expect {
+    1|Alice|Sales
+    2|Bob|Engineering
+}
+
+setup correlated-in-result-column-with-join {
+    create table employees(id, name, dept_id, manager_id);
+    create table departments(id, name);
+    create table managers(id, name);
+    insert into employees values (1, 'Alice', 10, 100), (2, 'Bob', 20, 200);
+    insert into departments values (10, 'Sales'), (20, 'Engineering');
+    insert into managers values (100, 'Carol'), (200, 'Dave');
+}
+
+@setup correlated-in-result-column-with-join
+test subquery-correlated-in-result-column-with-join {
+    select e.id, e.name, m.name as manager, (select name from departments where id = e.dept_id) as dept_name
+    from employees e join managers m on e.manager_id = m.id;
+}
+expect {
+    1|Alice|Carol|Sales
+    2|Bob|Dave|Engineering
+}
+
+setup uncorrelated-in-result-column-in {
+    create table employees(id, name, dept_id);
+    create table special_depts(dept_id);
+    insert into employees values (1, 'Alice', 10), (2, 'Bob', 20), (3, 'Charlie', 30);
+    insert into special_depts values (10), (20);
+}
+
+@setup uncorrelated-in-result-column-in
+test subquery-uncorrelated-in-result-column-in {
+    select id, name, dept_id in (select dept_id from special_depts) as is_special from employees;
+}
+expect {
+    1|Alice|1
+    2|Bob|1
+    3|Charlie|0
+}
+
+setup correlated-in-result-column-in {
+    create table employees(id, name, dept_id);
+    create table dept_awards(dept_id, employee_id);
+    insert into employees values (1, 'Alice', 10), (2, 'Bob', 20), (3, 'Charlie', 10);
+    insert into dept_awards values (10, 1), (20, 2);
+}
+
+@setup correlated-in-result-column-in
+test subquery-correlated-in-result-column-in {
+    select id, name, id in (select employee_id from dept_awards where dept_id = employees.dept_id) as has_award from employees;
+}
+expect {
+    1|Alice|1
+    2|Bob|1
+    3|Charlie|0
+}
+
+setup uncorrelated-in-group-by {
+    create table sales(id, amount, region_id);
+    create table grouping_config(group_column);
+    insert into sales values (1, 100, 1), (2, 200, 1), (3, 150, 2);
+    insert into grouping_config values ('region_id');
+}
+
+@setup uncorrelated-in-group-by
+test subquery-uncorrelated-in-group-by {
+    select region_id, sum(amount)
+    from sales
+    group by (select case when group_column = 'region_id' then region_id else amount end from grouping_config);
+}
+expect {
+    1|300
+    2|150
+}
+
+setup correlated-in-group-by {
+    create table sales(id, amount, region_id);
+    create table regions(id, name);
+    insert into sales values (1, 100, 1), (2, 200, 1), (3, 150, 2);
+    insert into regions values (1, 'North'), (2, 'South');
+}
+
+@setup correlated-in-group-by
+test subquery-correlated-in-group-by {
+    select (select name from regions where id = region_id) as region, sum(amount)
+    from sales
+    group by (select name from regions where id = region_id);
+}
+expect {
+    North|300
+    South|150
+}
+
+setup correlated-in-group-by-with-join {
+    create table sales(id, amount, region_id, salesperson_id);
+    create table regions(id, name);
+    create table salespeople(id, name);
+    insert into sales values (1, 100, 1, 10), (2, 200, 1, 20), (3, 150, 2, 10);
+    insert into regions values (1, 'North'), (2, 'South');
+    insert into salespeople values (10, 'Alice'), (20, 'Bob');
+}
+
+@setup correlated-in-group-by-with-join
+test subquery-correlated-in-group-by-with-join {
+    select (select name from regions where id = s.region_id) as region, sp.name as salesperson, sum(amount)
+    from sales s join salespeople sp on s.salesperson_id = sp.id
+    group by (select name from regions where id = s.region_id), sp.name;
+}
+expect {
+    North|Alice|100
+    North|Bob|200
+    South|Alice|150
+}
+
+setup uncorrelated-in-order-by-in {
+    create table products(id, name, category_id);
+    create table priority_categories(category_id);
+    insert into products values (1, 'hat', 2), (2, 'laptop', 1), (3, 'book', 3);
+    insert into priority_categories values (1), (3);
+}
+
+@setup uncorrelated-in-order-by-in
+test subquery-uncorrelated-in-order-by-in {
+    select id, name from products
+    order by category_id in (select category_id from priority_categories) desc, id;
+}
+expect {
+    2|laptop
+    3|book
+    1|hat
+}
+
+setup uncorrelated-in-having {
+    create table orders(id, customer_id, amount);
+    create table vip_threshold(min_amount);
+    insert into orders values (1, 100, 50), (2, 100, 150), (3, 200, 30);
+    insert into vip_threshold values (100);
+}
+
+@setup uncorrelated-in-having
+test subquery-uncorrelated-in-having {
+    select customer_id, sum(amount) as total
+    from orders
+    group by customer_id
+    having total > (select min_amount from vip_threshold);
+}
+expect {
+    100|200
+}
+
+setup uncorrelated-in-having-in {
+    create table orders(id, customer_id, amount);
+    create table target_totals(total_amount);
+    insert into orders values (1, 100, 50), (2, 100, 150), (3, 200, 30), (4, 300, 100);
+    insert into target_totals values (200), (100);
+}
+
+@setup uncorrelated-in-having-in
+test subquery-uncorrelated-in-having-in {
+    select customer_id, sum(amount) as total
+    from orders
+    group by customer_id
+    having total in (select total_amount from target_totals);
+}
+expect {
+    100|200
+    300|100
+}
+
+setup in-limit {
+    create table items(id, name);
+    create table config(max_results);
+    insert into items values (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd');
+    insert into config values (2);
+}
+
+@setup in-limit
+test subquery-in-limit {
+    select * from items limit (select max_results from config);
+}
+expect {
+    1|a
+    2|b
+}
+
+setup in-offset {
+    create table items(id, name);
+    create table config(skip_count);
+    insert into items values (1, 'a'), (2, 'b'), (3, 'c');
+    insert into config values (1);
+}
+
+@setup in-offset
+test subquery-in-offset {
+    select * from items limit 2 offset (select skip_count from config);
+}
+expect {
+    2|b
+    3|c
+}
+
+# ERROR TESTS - multiple columns in scalar context
+
+setup vector-error-table {
+    create table t(x, y);
+    insert into t values (1, 2);
+}
+
+@setup vector-error-table
+test subquery-multiple-columns-in-select {
+    select (select x, y from t) as result;
+}
+expect error {}
+
+setup vector-in-where {
+    create table t1(x,y);
+    create table t2(y);
+    insert into t1 values (1,1);
+    insert into t2 values (1);
+}
+
+@setup vector-in-where
+test subquery-vector-in-where {
+    select * from t2 where y = (select x,y from t1);
+}
+expect error {}
+
+setup vector-in-having {
+    create table orders(customer_id, amount);
+    create table thresholds(min_amount, max_amount);
+    insert into orders values (100, 50), (100, 150);
+    insert into thresholds values (100, 200);
+}
+
+@setup vector-in-having
+test subquery-vector-in-having {
+    select customer_id, sum(amount) as total
+    from orders
+    group by customer_id
+    having total > (select min_amount, max_amount from thresholds);
+}
+expect error {}
+
+setup vector-in-limit {
+    create table items(id);
+    create table config(max_results, other_col);
+    insert into items values (1), (2), (3);
+    insert into config values (2, 3);
+}
+
+@setup vector-in-limit
+test subquery-vector-in-limit {
+    select * from items limit (select max_results, other_col from config);
+}
+expect error {}
+
+setup vector-in-offset {
+    create table items(id);
+    create table config(skip_count, other_col);
+    insert into items values (1), (2), (3);
+    insert into config values (1, 2);
+}
+
+@setup vector-in-offset
+test subquery-vector-in-offset {
+    select * from items limit 1 offset (select skip_count, other_col from config);
+}
+expect error {}
+
+setup vector-in-order-by {
+    create table items(id, name);
+    create table sort_order(priority, other_col);
+    insert into items values (1, 'a'), (2, 'b');
+    insert into sort_order values (1, 2);
+}
+
+@setup vector-in-order-by
+test subquery-vector-in-order-by {
+    select * from items order by (select priority, other_col from sort_order);
+}
+expect error {}
+
+setup vector-in-group-by {
+    create table sales(product_id, amount);
+    create table grouping(category, other_col);
+    insert into sales values (1, 100), (2, 200);
+    insert into grouping values (1, 2);
+}
+
+@setup vector-in-group-by
+test subquery-vector-in-group-by {
+    select sum(amount) from sales group by (select category, other_col from grouping);
+}
+expect error {}
+
+setup vector-in-case {
+    create table t1(x);
+    create table t2(y, z);
+    insert into t1 values (1);
+    insert into t2 values (1, 2);
+}
+
+@setup vector-in-case
+test subquery-vector-in-case-when {
+    select case when (select y, z from t2) then 'yes' else 'no' end from t1;
+}
+expect error {}
+
+@setup vector-in-case
+test subquery-vector-in-case-then {
+    select case when x = 1 then (select y, z from t2) else 0 end from t1;
+}
+expect error {}
+
+@setup vector-in-case
+test subquery-vector-in-case-else {
+    select case when x = 2 then 0 else (select y, z from t2) end from t1;
+}
+expect error {}
+
+@setup vector-in-case
+test subquery-vector-in-aggregate-arg {
+    select max((select y, z from t2)) from t1;
+}
+expect error {}
+
+@setup vector-in-case
+test subquery-vector-in-binary-expr {
+    select x + (select y, z from t2) from t1;
+}
+expect error {}
+
+setup vector-in-between {
+    create table t1(x);
+    create table t2(y, z);
+    insert into t1 values (5);
+    insert into t2 values (1, 2);
+}
+
+@setup vector-in-between
+test subquery-vector-in-between {
+    select * from t1 where x between (select y, z from t2) and 10;
+}
+expect error {}
+
+setup vector-in-cast {
+    create table t1(x);
+    create table t2(y, z);
+    insert into t1 values (1);
+    insert into t2 values (1, 2);
+}
+
+@setup vector-in-cast
+test subquery-vector-in-cast {
+    select cast((select y, z from t2) as integer) from t1;
+}
+expect error {}
+
+setup vector-in-collate {
+    create table t1(x);
+    create table t2(y, z);
+    insert into t1 values (1);
+    insert into t2 values ('a', 'b');
+}
+
+@setup vector-in-collate
+test subquery-vector-in-collate {
+    select (select y, z from t2) collate nocase from t1;
+}
+expect error {}
+
+setup vector-in-is-null {
+    create table t1(x);
+    create table t2(y, z);
+    insert into t1 values (1);
+    insert into t2 values (1, 2);
+}
+
+@setup vector-in-is-null
+test subquery-vector-in-is-null {
+    select * from t1 where (select y, z from t2) is null;
+}
+expect error {}
+
+@setup vector-in-is-null
+test subquery-vector-in-not-null {
+    select * from t1 where (select y, z from t2) not null;
+}
+expect error {}
+
+setup vector-in-like {
+    create table t1(x);
+    create table t2(y, z);
+    insert into t1 values (1);
+    insert into t2 values ('a', 'b');
+}
+
+@setup vector-in-like
+test subquery-vector-in-like {
+    select * from t1 where (select y, z from t2) like 'a%';
+}
+expect error {}
+
+setup vector-in-unary {
+    create table t1(x);
+    create table t2(y, z);
+    insert into t1 values (1);
+    insert into t2 values (1, 2);
+}
+
+@setup vector-in-unary
+test subquery-vector-in-unary {
+    select -(select y, z from t2) from t1;
+}
+expect error {}
+
+@setup vector-in-unary
+test subquery-vector-in-function-call {
+    select abs((select y, z from t2)) from t1;
+}
+expect error {}
+

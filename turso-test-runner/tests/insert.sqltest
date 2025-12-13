@@ -1,0 +1,1978 @@
+# INSERT Tests
+# Ported from testing/insert.test
+
+@database :memory:
+
+setup basic-insert {
+    create table temp (t1 integer, primary key (t1));
+}
+
+@setup basic-insert
+test basic-insert {
+    insert into temp values (1);
+    select * from temp;
+}
+expect {
+    1
+}
+
+setup must-be-int-insert {
+    create table temp (t1 integer, primary key (t1));
+}
+
+@setup must-be-int-insert
+test must-be-int-insert {
+    insert into temp values (1),(2.0),('3'),('4.0');
+    select * from temp;
+}
+expect {
+    1
+    2
+    3
+    4
+}
+
+setup strict-basic-creation {
+    CREATE TABLE test1 (id INTEGER, name TEXT, price REAL) STRICT;
+}
+
+@setup strict-basic-creation
+test strict-basic-creation {
+    INSERT INTO test1 VALUES(1, 'item1', 10.5);
+    SELECT * FROM test1;
+}
+expect {
+    1|item1|10.5
+}
+
+setup self-insert-sum-pk {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b INTEGER);
+    INSERT INTO t(b) VALUES(1),(2);
+}
+
+@setup self-insert-sum-pk
+test self-insert-sum-pk {
+    INSERT INTO t(b) SELECT sum(b) FROM t;
+    SELECT a, b FROM t ORDER BY a;
+}
+expect {
+    1|1
+    2|2
+    3|3
+}
+
+setup strict-type-case-insensitivity {
+    CREATE TABLE test1 (id integer, name text, price real) STRICT;
+}
+
+@setup strict-type-case-insensitivity
+test strict-type-case-insensitivity {
+    INSERT INTO test1 VALUES(1, 'item1', 10.5);
+    SELECT * FROM test1;
+}
+expect {
+    1|item1|10.5
+}
+
+test strict-require-datatype {
+    CREATE TABLE test2 (id INTEGER, name) STRICT;
+}
+expect error {}
+
+test strict-valid-datatypes {
+    CREATE TABLE test2 (id INTEGER, value DATETIME) STRICT;
+}
+expect error {}
+
+setup strict-type-enforcement {
+    CREATE TABLE test3 (id INTEGER, name TEXT, price REAL) STRICT;
+}
+
+@setup strict-type-enforcement
+test strict-type-enforcement {
+    INSERT INTO test3 VALUES(1, 'item1', 'not-a-number');
+}
+expect error {}
+
+setup strict-type-coercion {
+    CREATE TABLE test4 (id INTEGER, name TEXT, price REAL) STRICT;
+}
+
+@setup strict-type-coercion
+test strict-type-coercion {
+    INSERT INTO test4 VALUES(1, 'item1', '10.5');
+    SELECT typeof(price), price FROM test4;
+}
+expect {
+    real|10.5
+}
+
+setup strict-any-flexibility {
+    CREATE TABLE test5 (id INTEGER, data ANY) STRICT;
+}
+
+@setup strict-any-flexibility
+test strict-any-flexibility {
+    INSERT INTO test5 VALUES(1, 100);
+    INSERT INTO test5 VALUES(2, 'text');
+    INSERT INTO test5 VALUES(3, 3.14);
+    SELECT id, typeof(data) FROM test5 ORDER BY id;
+}
+expect {
+    1|integer
+    2|text
+    3|real
+}
+
+setup strict-any-preservation {
+    CREATE TABLE test6 (id INTEGER, code ANY) STRICT;
+}
+
+@setup strict-any-preservation
+test strict-any-preservation {
+    INSERT INTO test6 VALUES(1, '000123');
+    SELECT typeof(code), code FROM test6;
+}
+expect {
+    text|000123
+}
+
+test strict-int-vs-integer-pk {
+    CREATE TABLE test8 (id INT PRIMARY KEY, name TEXT) STRICT
+    INSERT INTO test8 VALUES(NULL, 'test');
+}
+expect error {}
+
+setup strict-integer-pk-behavior {
+    CREATE TABLE test9 (id INTEGER PRIMARY KEY, name TEXT) STRICT;
+}
+
+@setup strict-integer-pk-behavior
+test strict-integer-pk-behavior {
+    INSERT INTO test9 VALUES(NULL, 'test');
+    SELECT id, name FROM test9;
+}
+expect {
+    1|test
+}
+
+setup strict-mixed-inserts {
+    CREATE TABLE test11 (
+        id INTEGER PRIMARY KEY,
+        name TEXT,
+        price REAL,
+        quantity INT,
+        tags ANY
+    ) STRICT;
+}
+
+@setup strict-mixed-inserts
+test strict-mixed-inserts {
+    INSERT INTO test11 VALUES(1, 'item1', 10.5, 5, 'tag1');
+    INSERT INTO test11 VALUES(2, 'item2', 20.75, 10, 42);
+    SELECT id, name, price, quantity, typeof(tags) FROM test11 ORDER BY id;
+}
+expect {
+    1|item1|10.5|5|text
+    2|item2|20.75|10|integer
+}
+
+setup strict-update-basic {
+    CREATE TABLE test1 (id INTEGER, name TEXT, price REAL) STRICT;
+    INSERT INTO test1 VALUES(1, 'item1', 10.5);
+}
+
+@setup strict-update-basic
+test strict-update-basic {
+    UPDATE test1 SET price = 15.75 WHERE id = 1;
+    SELECT * FROM test1;
+}
+expect {
+    1|item1|15.75
+}
+
+setup strict-update-type-enforcement {
+    CREATE TABLE test2 (id INTEGER, name TEXT, price REAL) STRICT;
+    INSERT INTO test2 VALUES(1, 'item1', 10.5);
+}
+
+@setup strict-update-type-enforcement
+test strict-update-type-enforcement {
+    UPDATE test2 SET price = 'not-a-number' WHERE id = 1;
+}
+expect error {}
+
+setup strict-update-type-coercion {
+    CREATE TABLE test3 (id INTEGER, name TEXT, price REAL) STRICT;
+    INSERT INTO test3 VALUES(1, 'item1', 10.5);
+}
+
+@setup strict-update-type-coercion
+test strict-update-type-coercion {
+    UPDATE test3 SET price = '15.75' WHERE id = 1;
+    SELECT id, typeof(price), price FROM test3;
+}
+expect {
+    1|real|15.75
+}
+
+setup strict-update-any-flexibility {
+    CREATE TABLE test4 (id INTEGER, data ANY) STRICT;
+    INSERT INTO test4 VALUES(1, 100);
+    INSERT INTO test4 VALUES(2, 'original');
+}
+
+@setup strict-update-any-flexibility
+test strict-update-any-flexibility {
+    UPDATE test4 SET data = 'text' WHERE id = 1;
+    UPDATE test4 SET data = 3.14 WHERE id = 2;
+    SELECT id, typeof(data), data FROM test4 ORDER BY id;
+}
+expect {
+    1|text|text
+    2|real|3.14
+}
+
+setup strict-update-any-preservation {
+    CREATE TABLE test5 (id INTEGER, code ANY) STRICT;
+    INSERT INTO test5 VALUES(1, 'text');
+}
+
+@setup strict-update-any-preservation
+test strict-update-any-preservation {
+    UPDATE test5 SET code = '000123' WHERE id = 1;
+    SELECT typeof(code), code FROM test5;
+}
+expect {
+    text|000123
+}
+
+setup strict-update-not-null-constraint {
+    CREATE TABLE test7 (id INTEGER, name TEXT NOT NULL) STRICT;
+    INSERT INTO test7 VALUES(1, 'name');
+}
+
+@setup strict-update-not-null-constraint
+test strict-update-not-null-constraint {
+    UPDATE test7 SET name = NULL WHERE id = 1;
+}
+expect error {}
+
+setup strict-update-pk-constraint {
+    CREATE TABLE test8 (id INTEGER PRIMARY KEY, name TEXT) STRICT;
+    INSERT INTO test8 VALUES(1, 'name1');
+    INSERT INTO test8 VALUES(2, 'name2');
+}
+
+@setup strict-update-pk-constraint
+test strict-update-pk-constraint {
+    UPDATE test8 SET id = 2 WHERE id = 1;
+}
+expect error {}
+
+setup strict-update-multiple-columns {
+    CREATE TABLE test9 (id INTEGER, name TEXT, price REAL, quantity INT) STRICT;
+    INSERT INTO test9 VALUES(1, 'item1', 10.5, 5);
+}
+
+@setup strict-update-multiple-columns
+test strict-update-multiple-columns {
+    UPDATE test9 SET name = 'updated', price = 20.75, quantity = 10 WHERE id = 1;
+    SELECT * FROM test9;
+}
+expect {
+    1|updated|20.75|10
+}
+
+setup strict-update-where-clause {
+    CREATE TABLE test10 (id INTEGER, category TEXT, price REAL) STRICT;
+    INSERT INTO test10 VALUES(1, 'A', 10);
+    INSERT INTO test10 VALUES(2, 'A', 20);
+    INSERT INTO test10 VALUES(3, 'B', 30);
+}
+
+@setup strict-update-where-clause
+test strict-update-where-clause {
+    UPDATE test10 SET price = price * 2 WHERE category = 'A';
+    SELECT id, price FROM test10 ORDER BY id;
+}
+expect {
+    1|20.0
+    2|40.0
+    3|30.0
+}
+
+setup strict-update-expression {
+    CREATE TABLE test11 (id INTEGER, name TEXT, price REAL, discount REAL) STRICT;
+    INSERT INTO test11 VALUES(1, 'item1', 100, 0.1);
+}
+
+@setup strict-update-expression
+test strict-update-expression {
+    UPDATE test11 SET price = price - (price * discount);
+    SELECT id, price FROM test11;
+}
+expect {
+    1|90.0
+}
+
+setup duplicate-set {
+    CREATE TABLE t (x, y);
+    INSERT INTO t VALUES(1, 'A');
+}
+
+@setup duplicate-set
+test duplicate-set {
+    UPDATE t SET y = 'B', y = 'C', y = 'D' WHERE x = 1;
+    SELECT x, y FROM t;
+}
+expect {
+    1|D
+}
+
+setup named-insert-1 {
+    CREATE TABLE test (id INTEGER PRIMARY KEY AUTOINCREMENT, col_a TEXT, col_b TEXT, col_c TEXT, col_d TEXT);
+}
+
+@setup named-insert-1
+test named-insert-1 {
+    INSERT INTO test (col_b, col_d, col_a, col_c) VALUES ('1', '2', '3', '4');
+    SELECT * FROM test;
+}
+expect {
+    1|3|1|4|2
+}
+
+setup named-insert-2 {
+    CREATE TABLE test (id INTEGER PRIMARY KEY AUTOINCREMENT, col_a TEXT DEFAULT 'Empty', col_b TEXT, col_c TEXT, col_d TEXT);
+}
+
+@setup named-insert-2
+test named-insert-2 {
+    INSERT INTO test (col_b, col_d, col_c) VALUES ('1', '2', '4');
+    SELECT * FROM test;
+}
+expect {
+    1|Empty|1|4|2
+}
+
+setup multi-rows {
+    CREATE TABLE test (id INTEGER PRIMARY KEY AUTOINCREMENT, col);
+}
+
+@setup multi-rows
+test multi-rows {
+    INSERT INTO test (col) VALUES (1),(1);
+    SELECT * FROM test;
+}
+expect {
+    1|1
+    2|1
+}
+
+setup unique_insert_no_pkey {
+    CREATE TABLE t2 (x INTEGER, y INTEGER UNIQUE);
+}
+
+@setup unique_insert_no_pkey
+test unique_insert_no_pkey {
+    INSERT INTO t2 (y) VALUES (1);
+    INSERT INTO t2 (y) VALUES (6);
+    SELECT * FROM t2;
+}
+expect {
+    |1
+    |6
+}
+
+setup unique_insert_with_pkey {
+    CREATE TABLE t2 (x INTEGER PRIMARY KEY, y INTEGER UNIQUE);
+}
+
+@setup unique_insert_with_pkey
+test unique_insert_with_pkey {
+    INSERT INTO t2 (y) VALUES (1);
+    INSERT INTO t2 (y) VALUES (6);
+    SELECT * FROM t2;
+}
+expect {
+    1|1
+    2|6
+}
+
+setup not_null_insert {
+    CREATE TABLE t2 (y INTEGER NOT NULL);
+}
+
+@setup not_null_insert
+test not_null_insert {
+    INSERT INTO t2 (y) VALUES (1);
+    INSERT INTO t2 (y) VALUES (6);
+    SELECT * FROM t2;
+}
+expect {
+    1
+    6
+}
+
+setup not_null_primary_key {
+    CREATE TABLE t2 (y INT PRIMARY KEY NOT NULL);
+    INSERT INTO t2 (y) VALUES (1);
+}
+
+@setup not_null_primary_key
+test not_null_primary_key {
+    INSERT INTO t2 (y) VALUES (NULL);
+}
+expect error {}
+
+setup not_null_insert_select {
+    CREATE TABLE t2 (y INT PRIMARY KEY NOT NULL);
+    CREATE TABLE d (y INT);
+    INSERT INTO d (y) VALUES (1);
+    INSERT INTO d (y) VALUES (NULL);
+}
+
+@setup not_null_insert_select
+test not_null_insert_select {
+    INSERT INTO t2 (y) SELECT y FROM d;
+}
+expect error {}
+
+setup not_null_insert_multiple_values {
+    CREATE TABLE t2 (y INT PRIMARY KEY NOT NULL);
+}
+
+@setup not_null_insert_multiple_values
+test not_null_insert_multiple_values {
+    INSERT INTO t2 (y) VALUES (1), (NULL);
+}
+expect error {}
+
+setup insert_from_select_1 {
+    CREATE TABLE t (a);
+    CREATE TABLE t2 (b, c);
+    INSERT INTO t2 values (1, 2), (10, 20);
+}
+
+@setup insert_from_select_1
+test insert_from_select_1 {
+    INSERT INTO t SELECT b FROM t2;
+    SELECT * FROM t;
+    INSERT INTO t SELECT c FROM t2;
+    SELECT * FROM t;
+}
+expect {
+    1
+    10
+    1
+    10
+    2
+    20
+}
+
+setup insert_from_select_where {
+    CREATE TABLE t (a);
+    CREATE TABLE t2 (b, c);
+    INSERT INTO t2 values (1, 2), (10, 20);
+}
+
+@setup insert_from_select_where
+test insert_from_select_where {
+    INSERT INTO t SELECT b FROM t2 WHERE b < 10;
+    SELECT * FROM t;
+    INSERT INTO t SELECT c FROM t2 WHERE c > 2;
+    SELECT * FROM t;
+}
+expect {
+    1
+    1
+    20
+}
+
+setup insert_from_select_union_all {
+    CREATE TABLE t1 (x INTEGER);
+    CREATE TABLE t2 (x INTEGER);
+    CREATE TABLE t3 (x INTEGER);
+    INSERT INTO t1 VALUES(1),(2),(3);
+    INSERT INTO t2 VALUES(4),(5),(6);
+    INSERT INTO t3 VALUES(7),(8),(9);
+}
+
+@setup insert_from_select_union_all
+test insert_from_select_union_all {
+    INSERT INTO t1 SELECT x FROM t2 UNION ALL SELECT x FROM t3;
+    SELECT * FROM t1;
+}
+expect {
+    1
+    2
+    3
+    4
+    5
+    6
+    7
+    8
+    9
+}
+
+setup insert_from_select_union_all_where {
+    CREATE TABLE t1 (x INTEGER);
+    CREATE TABLE t2 (x INTEGER);
+    CREATE TABLE t3 (x INTEGER);
+    INSERT INTO t1 VALUES(1),(2),(3);
+    INSERT INTO t2 VALUES(4),(5),(6);
+    INSERT INTO t3 VALUES(7),(8),(9);
+}
+
+@setup insert_from_select_union_all_where
+test insert_from_select_union_all_where {
+    INSERT INTO t1 SELECT x FROM t2 WHERE x != 4 UNION ALL SELECT x FROM t3 WHERE x == 8;
+    SELECT * FROM t1;
+}
+expect {
+    1
+    2
+    3
+    5
+    6
+    8
+}
+
+setup insert_from_select_union_all_values {
+    CREATE TABLE t(a, b);
+}
+
+@setup insert_from_select_union_all_values
+test insert_from_select_union_all_values {
+    INSERT INTO t(a, b) SELECT * FROM (VALUES(3, 3)) UNION ALL VALUES(4, 4);
+    SELECT a, b FROM t ORDER BY rowid;
+}
+expect {
+    3|3
+    4|4
+}
+
+setup values-union-all {
+    CREATE TABLE test (a INTEGER NOT NULL, b INTEGER NOT NULL);
+}
+
+@setup values-union-all
+test values-union-all {
+    INSERT INTO test(a, b) VALUES(3, 3) UNION ALL VALUES(4, 4);
+    SELECT a, b FROM test ORDER BY rowid;
+}
+expect {
+    3|3
+    4|4
+}
+
+setup insert_from_select_same_table {
+    CREATE TABLE t (a INTEGER PRIMARY KEY, b);
+    INSERT INTO t(b) VALUES (1),(2),(3);
+}
+
+@setup insert_from_select_same_table
+test insert_from_select_same_table {
+    SELECT * FROM t;
+    INSERT INTO t(b) SELECT b FROM t;
+    SELECT * FROM t;
+}
+expect {
+    1|1
+    2|2
+    3|3
+    1|1
+    2|2
+    3|3
+    4|1
+    5|2
+    6|3
+}
+
+setup insert_from_select_same_table_2 {
+    CREATE TABLE t (a INTEGER PRIMARY KEY, b, c);
+    INSERT INTO t(b, c) VALUES (1, 100),(2, 200),(3, 300);
+}
+
+@setup insert_from_select_same_table_2
+test insert_from_select_same_table_2 {
+    SELECT * FROM t;
+    INSERT INTO t(b, c) SELECT b,c FROM t;
+    SELECT * FROM t;
+}
+expect {
+    1|1|100
+    2|2|200
+    3|3|300
+    1|1|100
+    2|2|200
+    3|3|300
+    4|1|100
+    5|2|200
+    6|3|300
+}
+
+setup insert_from_select_union {
+    CREATE TABLE t (a, b);
+    CREATE TABLE t2 (b, c);
+    INSERT INTO t2 VALUES (1, 100), (2, 200);
+}
+
+@setup insert_from_select_union
+test insert_from_select_union {
+    INSERT INTO t SELECT * FROM t UNION SELECT * FROM t2;
+    SELECT * FROM t;
+}
+expect {
+    1|100
+    2|200
+}
+
+setup insert_from_select_union-2 {
+    CREATE TABLE t (a, b);
+}
+
+@setup insert_from_select_union-2
+test insert_from_select_union-2 {
+    INSERT INTO t SELECT * FROM t UNION values(1, 100), (2, 200);
+    SELECT * FROM t;
+}
+expect {
+    1|100
+    2|200
+}
+
+setup insert_from_select_intersect {
+    CREATE TABLE t (a, b);
+    CREATE TABLE t1 (a, b);
+    CREATE TABLE t2 (a, b);
+    INSERT INTO t1 VALUES (1, 100), (2, 200);
+    INSERT INTO t2 VALUES (2, 200), (3, 300);
+}
+
+@setup insert_from_select_intersect
+test insert_from_select_intersect {
+    INSERT INTO t SELECT * FROM t1 INTERSECT SELECT * FROM t2;
+    SELECT * FROM t;
+}
+expect {
+    2|200
+}
+
+setup insert_from_select_intersect-2 {
+    CREATE TABLE t (a, b);
+    CREATE TABLE t1 (a, b);
+    CREATE TABLE t2 (a, b);
+    CREATE TABLE t3 (a, b);
+    INSERT INTO t1 VALUES (1, 100), (2, 200);
+    INSERT INTO t2 VALUES (2, 200), (3, 300);
+    INSERT INTO t3 VALUES (2, 200), (4, 400);
+}
+
+@setup insert_from_select_intersect-2
+test insert_from_select_intersect-2 {
+    INSERT INTO t SELECT * FROM t1 INTERSECT SELECT * FROM t2 INTERSECT SELECT * FROM t3;
+    SELECT * FROM t;
+}
+expect {
+    2|200
+}
+
+setup insert_from_select_except {
+    CREATE TABLE t (a, b);
+    CREATE TABLE t1 (a, b);
+    CREATE TABLE t2 (a, b);
+    INSERT INTO t1 VALUES (1, 100), (2, 200);
+    INSERT INTO t2 VALUES (2, 200), (3, 300);
+}
+
+@setup insert_from_select_except
+test insert_from_select_except {
+    INSERT INTO t SELECT * FROM t1 EXCEPT SELECT * FROM t2;
+    SELECT * FROM t;
+}
+expect {
+    1|100
+}
+
+setup negative-primary-integer-key {
+    CREATE TABLE t (a INTEGER PRIMARY KEY);
+}
+
+@setup negative-primary-integer-key
+test negative-primary-integer-key {
+    insert into t values (-2),(13);
+    select * from t order by a asc;
+}
+expect {
+    -2
+    13
+}
+
+setup not-null-rowid-alias {
+    CREATE TABLE t (a INTEGER PRIMARY KEY NOT NULL, b);
+}
+
+@setup not-null-rowid-alias
+test not-null-rowid-alias {
+    insert into t values (1, 2);
+    select * from t;
+}
+expect {
+    1|2
+}
+
+setup rowid-overflow-random-generation {
+    CREATE TABLE q (x INTEGER PRIMARY KEY, y);
+    INSERT INTO q VALUES (9223372036854775807, 1);
+}
+
+@setup rowid-overflow-random-generation
+test rowid-overflow-random-generation {
+    INSERT INTO q(y) VALUES (2);
+    INSERT INTO q(y) VALUES (3);
+    SELECT COUNT(*) FROM q;
+}
+expect {
+    3
+}
+
+setup large-text-index-seek {
+    CREATE TABLE t (x TEXT, y);
+    CREATE INDEX t_idx ON t(x);
+    INSERT INTO t VALUES (replace(hex(zeroblob(1000)), '00', 'a') || 'a', 1);
+    INSERT INTO t VALUES (replace(hex(zeroblob(1000)), '00', 'a') || 'b', 2);
+    INSERT INTO t VALUES (replace(hex(zeroblob(1000)), '00', 'a') || 'c', 3);
+    INSERT INTO t VALUES (replace(hex(zeroblob(1000)), '00', 'a') || 'd', 4);
+    INSERT INTO t VALUES (replace(hex(zeroblob(1000)), '00', 'a') || 'e', 5);
+    INSERT INTO t VALUES (replace(hex(zeroblob(1000)), '00', 'a') || 'f', 6);
+    INSERT INTO t VALUES (replace(hex(zeroblob(1000)), '00', 'a') || 'g', 7);
+    INSERT INTO t VALUES (replace(hex(zeroblob(1000)), '00', 'a') || 'h', 8);
+}
+
+@setup large-text-index-seek
+test large-text-index-seek {
+    SELECT COUNT(*) FROM t WHERE x >= replace(hex(zeroblob(100)), '00', 'a');
+}
+expect {
+    8
+}
+
+setup insert-tricky-column-order-values {
+    create table t (x, y, z);
+}
+
+@setup insert-tricky-column-order-values
+test insert-tricky-column-order-values {
+    insert into t(z, x) values (1, 2), (3, 4);
+    insert into t(y, z) values (5, 6), (7, 8);
+    select * from t;
+}
+expect {
+    2||1
+    4||3
+    |5|6
+    |7|8
+}
+
+setup insert-tricky-column-order-table {
+    create table t (x, y, z);
+    create table q (x, y, z);
+    insert into q values (1, 2, 3), (4, 5, 6);
+}
+
+@setup insert-tricky-column-order-table
+test insert-tricky-column-order-table {
+    insert into t(z, x) select y, x from q;
+    insert into t(y, z) select z, y from q;
+    select * from t;
+}
+expect {
+    1||2
+    4||5
+    |3|2
+    |6|5
+}
+
+setup insert-explicit-rowid {
+    create table t (x, y, z);
+}
+
+@setup insert-explicit-rowid
+test insert-explicit-rowid {
+    insert into t(z, x, y, rowid) values (1, 2, 3, 4), (5, 6, 7, 8);
+    insert into t(z, x, y, rowid) values (9, 10, 11, 12);
+    select rowid, x, y, z from t;
+}
+expect {
+    4|2|3|1
+    8|6|7|5
+    12|10|11|9
+}
+
+setup insert-explicit-rowid-with-rowidalias {
+    create table t (x, y INTEGER PRIMARY KEY, z);
+}
+
+@setup insert-explicit-rowid-with-rowidalias
+test insert-explicit-rowid-with-rowidalias {
+    insert into t(z, x, y, rowid) values (1, 2, 3, 4), (5, 6, 7, 8);
+    insert into t(z, x, y, rowid) values (9, 10, 11, 12);
+    insert into t(z, x, rowid, y) values (-1, -2, -3, -4), (-5, -6, -7, -8);
+    insert into t(z, x, rowid, y) values (-9, -10, -11, -12);
+    select rowid, x, y, z from t;
+}
+expect {
+    -12|-10|-12|-9
+    -8|-6|-8|-5
+    -4|-2|-4|-1
+    4|2|4|1
+    8|6|8|5
+    12|10|12|9
+}
+
+setup null-value-insert-null-type-column {
+    CREATE TABLE test (id INTEGER,name NULL);
+}
+
+@setup null-value-insert-null-type-column
+test null-value-insert-null-type-column {
+    INSERT INTO test (id, name) VALUES (1, NULL);
+    SELECT * FROM test;
+}
+expect {
+    1|
+}
+
+setup uniq_constraint {
+    CREATE TABLE test (id INTEGER unique);
+    insert into test values (1);
+}
+
+@setup uniq_constraint
+test uniq_constraint {
+    insert into test values (1);
+}
+expect error { UNIQUE constraint failed: test.id (19) }
+
+setup insert-explicit-rowid-conflict {
+    create table t (x);
+    insert into t(rowid, x) values (1, 1);
+}
+
+@setup insert-explicit-rowid-conflict
+test insert-explicit-rowid-conflict {
+    insert into t(rowid, x) values (1, 2);
+}
+expect error { UNIQUE constraint failed: t.rowid (19) }
+
+# RETURNING clause tests
+setup returning-basic-column {
+    CREATE TABLE test (id INTEGER, name TEXT, value REAL);
+}
+
+@setup returning-basic-column
+test returning-basic-column {
+    INSERT INTO test (id, name, value) VALUES (1, 'test', 10.5) RETURNING id;
+}
+expect {
+    1
+}
+
+setup returning-multiple-columns {
+    CREATE TABLE test (id INTEGER, name TEXT, value REAL);
+}
+
+@setup returning-multiple-columns
+test returning-multiple-columns {
+    INSERT INTO test (id, name, value) VALUES (1, 'test', 10.5) RETURNING id, name;
+}
+expect {
+    1|test
+}
+
+setup returning-all-columns {
+    CREATE TABLE test (id INTEGER, name TEXT, value REAL);
+}
+
+@setup returning-all-columns
+test returning-all-columns {
+    INSERT INTO test (id, name, value) VALUES (1, 'test', 10.5) RETURNING *;
+}
+expect {
+    1|test|10.5
+}
+
+setup returning-literal {
+    CREATE TABLE test (id INTEGER);
+}
+
+@setup returning-literal
+test returning-literal {
+    INSERT INTO test (id) VALUES (1) RETURNING 42;
+}
+expect {
+    42
+}
+
+setup returning-arithmetic {
+    CREATE TABLE test (id INTEGER, value INTEGER);
+}
+
+@setup returning-arithmetic
+test returning-arithmetic {
+    INSERT INTO test (id, value) VALUES (1, 10) RETURNING 2 * value;
+}
+expect {
+    20
+}
+
+setup returning-complex-expression {
+    CREATE TABLE test (id INTEGER, x INTEGER, y INTEGER);
+}
+
+@setup returning-complex-expression
+test returning-complex-expression {
+    INSERT INTO test (id, x, y) VALUES (1, 5, 3) RETURNING x + y * 2;
+}
+expect {
+    11
+}
+
+setup returning-function-call {
+    CREATE TABLE test (id INTEGER, name TEXT);
+}
+
+@setup returning-function-call
+test returning-function-call {
+    INSERT INTO test (id, name) VALUES (1, 'hello') RETURNING upper(name);
+}
+expect {
+    HELLO
+}
+
+setup returning-mixed-expressions {
+    CREATE TABLE test (id INTEGER, name TEXT, value INTEGER);
+}
+
+@setup returning-mixed-expressions
+test returning-mixed-expressions {
+    INSERT INTO test (id, name, value) VALUES (1, 'test', 10) RETURNING id, upper(name), value * 3;
+}
+expect {
+    1|TEST|30
+}
+
+setup returning-multiple-rows {
+    CREATE TABLE test (id INTEGER, name TEXT);
+}
+
+@setup returning-multiple-rows
+test returning-multiple-rows {
+    INSERT INTO test (id, name) VALUES (1, 'first'), (2, 'second') RETURNING id, name;
+}
+expect {
+    1|first
+    2|second
+}
+
+setup returning-with-autoincrement {
+    CREATE TABLE test (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT);
+}
+
+@setup returning-with-autoincrement
+test returning-with-autoincrement {
+    INSERT INTO test (name) VALUES ('test') RETURNING id, name;
+}
+expect {
+    1|test
+}
+
+setup returning-rowid {
+    CREATE TABLE test (name TEXT);
+}
+
+@setup returning-rowid
+test returning-rowid {
+    INSERT INTO test (name) VALUES ('test') RETURNING rowid, name;
+}
+expect {
+    1|test
+}
+
+setup returning-null-values {
+    CREATE TABLE test (id INTEGER, name TEXT, value INTEGER);
+}
+
+@setup returning-null-values
+test returning-null-values {
+    INSERT INTO test (id, name, value) VALUES (1, NULL, NULL) RETURNING id, name, value;
+}
+expect {
+    1||
+}
+
+setup unknown-identifier-in-values-clause {
+    CREATE TABLE tt (x);
+}
+
+@setup unknown-identifier-in-values-clause
+test unknown-identifier-in-values-clause {
+    INSERT INTO tt VALUES(asdf);
+}
+expect error { no such column: asdf }
+
+setup null-insert-in-nulltype-column-notnull-constraint {
+    CREATE TABLE test (id INTEGER,name NULL NOT NULL);
+}
+
+@setup null-insert-in-nulltype-column-notnull-constraint
+test null-insert-in-nulltype-column-notnull-constraint {
+    INSERT INTO test (id, name) VALUES (1, NULL);
+}
+expect error { NOT NULL constraint failed }
+
+setup returning-true-literal {
+    CREATE TABLE test (id INTEGER, value TEXT);
+}
+
+@setup returning-true-literal
+test returning-true-literal {
+    INSERT INTO test (id, value) VALUES (1, true) RETURNING id, value;
+}
+expect {
+    1|1
+}
+
+setup returning-false-literal {
+    CREATE TABLE test (id INTEGER, value TEXT);
+}
+
+@setup returning-false-literal
+test returning-false-literal {
+    INSERT INTO test (id, value) VALUES (1, false) RETURNING id, value;
+}
+expect {
+    1|0
+}
+
+setup boolean-literal-edgecase {
+    CREATE TABLE true (id INTEGER, value TEXT);
+}
+
+@setup boolean-literal-edgecase
+test boolean-literal-edgecase {
+    INSERT INTO true (id, value) VALUES (1, true) RETURNING id, value;
+}
+expect {
+    1|1
+}
+
+setup boolean-literal-edgecase-false {
+    CREATE TABLE false (id INTEGER, true TEXT);
+}
+
+@setup boolean-literal-edgecase-false
+test boolean-literal-edgecase-false {
+    INSERT INTO false (id, true) VALUES (1, false) RETURNING id, false;
+}
+expect {
+    1|0
+}
+
+setup default-values-population {
+    CREATE TABLE t (x INTEGER PRIMARY KEY, y DEFAULT 666, z);
+}
+
+@setup default-values-population
+test default-values-population {
+    INSERT INTO t DEFAULT VALUES;
+    INSERT INTO t DEFAULT VALUES;
+    SELECT * FROM t;
+}
+expect {
+    1|666|
+    2|666|
+}
+
+setup set-explicit-null-default-value {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x DEFAULT 1);
+    INSERT INTO t(id, x) VALUES (1, 2);
+}
+
+@setup set-explicit-null-default-value
+test set-explicit-null-default-value {
+    SELECT * FROM t;
+    UPDATE t SET x = NULL WHERE id = 1;
+    SELECT * FROM t;
+}
+expect {
+    1|2
+    1|
+}
+
+setup insert-select-nested-subquery {
+    CREATE TABLE t (x);
+    INSERT INTO T VALUES (1);
+}
+
+@setup insert-select-nested-subquery
+test insert-select-nested-subquery {
+    INSERT INTO T SELECT * FROM (SELECT * FROM t);
+    SELECT * FROM t;
+}
+expect {
+    1
+    1
+}
+
+setup insert-rowid-select-rowid {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1);
+}
+
+@setup insert-rowid-select-rowid
+test insert-rowid-select-rowid {
+    INSERT INTO t(rowid) SELECT rowid FROM t;
+}
+expect error {}
+
+setup insert-rowidalias-select-rowid {
+    CREATE TABLE t(a INTEGER PRIMARY KEY);
+    INSERT INTO t VALUES (1);
+}
+
+@setup insert-rowidalias-select-rowid
+test insert-rowidalias-select-rowid {
+    INSERT INTO t(a) SELECT rowid FROM t;
+}
+expect error {}
+
+setup insert-rowid-select-rowid-success {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (2);
+}
+
+@setup insert-rowid-select-rowid-success
+test insert-rowid-select-rowid-success {
+    INSERT INTO t(a) SELECT rowid FROM t;
+    SELECT * FROM t;
+}
+expect {
+    2
+    1
+}
+
+setup insert-rowid-backwards-compability {
+    CREATE TABLE t(a INTEGER PRIMARY KEY DESC);
+}
+
+@setup insert-rowid-backwards-compability
+test insert-rowid-backwards-compability {
+    INSERT INTO t(a) VALUES (123);
+    SELECT rowid, * FROM t;
+}
+expect {
+    1|123
+}
+
+setup insert-rowid-backwards-compability-2 {
+    CREATE TABLE t(a INTEGER, PRIMARY KEY (a DESC));
+}
+
+@setup insert-rowid-backwards-compability-2
+test insert-rowid-backwards-compability-2 {
+    INSERT INTO t(a) VALUES (123);
+    SELECT rowid, * FROM t;
+}
+expect {
+    123|123
+}
+
+setup ignore-pk-conflict {
+    CREATE TABLE t(a INTEGER PRIMARY KEY);
+    INSERT INTO t VALUES (1),(2),(3);
+}
+
+@setup ignore-pk-conflict
+test ignore-pk-conflict {
+    INSERT OR IGNORE INTO t VALUES (2);
+    SELECT a FROM t ORDER BY a;
+}
+expect {
+    1
+    2
+    3
+}
+
+setup ignore-unique-conflict {
+    CREATE TABLE t(a INTEGER, b TEXT UNIQUE);
+    INSERT INTO t VALUES (1,'x'),(2,'y');
+}
+
+@setup ignore-unique-conflict
+test ignore-unique-conflict {
+    INSERT OR IGNORE INTO t VALUES (3,'y');
+    SELECT a,b FROM t ORDER BY a;
+}
+expect {
+    1|x
+    2|y
+}
+
+setup ignore-multi-unique-conflict {
+    CREATE TABLE t(a UNIQUE, b UNIQUE, c);
+    INSERT INTO t VALUES (1,10,100),(2,20,200);
+}
+
+@setup ignore-multi-unique-conflict
+test ignore-multi-unique-conflict {
+    INSERT OR IGNORE INTO t VALUES (1,30,300);
+    INSERT OR IGNORE INTO t VALUES (3,20,300);
+    INSERT OR IGNORE INTO t VALUES (1,20,300);
+    SELECT a,b,c FROM t ORDER BY a;
+}
+expect {
+    1|10|100
+    2|20|200
+}
+
+setup ignore-some-conflicts-multirow {
+    CREATE TABLE t(a INTEGER UNIQUE);
+    INSERT INTO t VALUES (2),(4);
+}
+
+@setup ignore-some-conflicts-multirow
+test ignore-some-conflicts-multirow {
+    INSERT OR IGNORE INTO t VALUES (1),(2),(3),(4),(5);
+    SELECT a FROM t ORDER BY a;
+}
+expect {
+    1
+    2
+    3
+    4
+    5
+}
+
+setup ignore-from-select {
+    CREATE TABLE src(x);
+    INSERT INTO src VALUES (1),(2),(2),(3);
+    CREATE TABLE dst(a INTEGER UNIQUE);
+    INSERT INTO dst VALUES (2);
+}
+
+@setup ignore-from-select
+test ignore-from-select {
+    INSERT OR IGNORE INTO dst SELECT x FROM src;
+    SELECT a FROM dst ORDER BY a;
+}
+expect {
+    1
+    2
+    3
+}
+
+setup ignore-null-in-unique {
+    CREATE TABLE t(a INTEGER UNIQUE);
+    INSERT INTO t VALUES (1),(NULL),(NULL);
+}
+
+@setup ignore-null-in-unique
+test ignore-null-in-unique {
+    INSERT OR IGNORE INTO t VALUES (1),(NULL);
+    SELECT COUNT(*) FROM t WHERE a IS NULL;
+}
+expect {
+    3
+}
+
+setup ignore-preserves-rowid {
+    CREATE TABLE t(data TEXT UNIQUE);
+    INSERT INTO t VALUES ('x'),('y'),('z');
+}
+
+@setup ignore-preserves-rowid
+test ignore-preserves-rowid {
+    SELECT rowid, data FROM t WHERE data='y';
+    INSERT OR IGNORE INTO t VALUES ('y');
+    SELECT rowid, data FROM t WHERE data='y';
+}
+expect {
+    2|y
+    2|y
+}
+
+setup ignore-intra-statement-dups {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT);
+}
+
+@setup ignore-intra-statement-dups
+test ignore-intra-statement-dups {
+    INSERT OR IGNORE INTO t VALUES (5,'first'),(6,'x'),(5,'second'),(5,'third');
+    SELECT a,b FROM t ORDER BY a;
+}
+expect {
+    5|first
+    6|x
+}
+
+# Tests for incorrect provided column count
+setup wrong-column-count-values-too-few {
+    CREATE TABLE t(a, b, c);
+}
+
+@setup wrong-column-count-values-too-few
+test wrong-column-count-values-too-few {
+    INSERT INTO t VALUES (1, 2);
+}
+expect error {}
+
+setup wrong-column-count-values-too-many {
+    CREATE TABLE t(a, b);
+}
+
+@setup wrong-column-count-values-too-many
+test wrong-column-count-values-too-many {
+    INSERT INTO t VALUES (1, 2, 3);
+}
+expect error {}
+
+setup wrong-column-count-values-specified-columns-too-few {
+    CREATE TABLE t(a, b, c);
+}
+
+@setup wrong-column-count-values-specified-columns-too-few
+test wrong-column-count-values-specified-columns-too-few {
+    INSERT INTO t(a, b, c) VALUES (1, 2);
+}
+expect error {}
+
+setup wrong-column-count-values-specified-columns-too-many {
+    CREATE TABLE t(a, b);
+}
+
+@setup wrong-column-count-values-specified-columns-too-many
+test wrong-column-count-values-specified-columns-too-many {
+    INSERT INTO t(a, b) VALUES (1, 2, 3);
+}
+expect error {}
+
+setup wrong-column-count-select-named-too-few {
+    CREATE TABLE src(x, y);
+    INSERT INTO src VALUES (1, 2);
+    CREATE TABLE dst(a, b, c);
+}
+
+@setup wrong-column-count-select-named-too-few
+test wrong-column-count-select-named-too-few {
+    INSERT INTO dst SELECT x, y FROM src;
+}
+expect error {}
+
+setup wrong-column-count-select-named-too-many {
+    CREATE TABLE src(x, y, z);
+    INSERT INTO src VALUES (1, 2, 3);
+    CREATE TABLE dst(a, b);
+}
+
+@setup wrong-column-count-select-named-too-many
+test wrong-column-count-select-named-too-many {
+    INSERT INTO dst SELECT x, y, z FROM src;
+}
+expect error {}
+
+setup wrong-column-count-select-star-too-few {
+    CREATE TABLE src(x, y);
+    INSERT INTO src VALUES (1, 2);
+    CREATE TABLE dst(a, b, c);
+}
+
+@setup wrong-column-count-select-star-too-few
+test wrong-column-count-select-star-too-few {
+    INSERT INTO dst SELECT * FROM src;
+}
+expect error {}
+
+setup wrong-column-count-select-star-too-many {
+    CREATE TABLE src(x, y, z);
+    INSERT INTO src VALUES (1, 2, 3);
+    CREATE TABLE dst(a, b);
+}
+
+@setup wrong-column-count-select-star-too-many
+test wrong-column-count-select-star-too-many {
+    INSERT INTO dst SELECT * FROM src;
+}
+expect error {}
+
+setup wrong-column-count-specified-columns-select-mismatch {
+    CREATE TABLE src(x, y, z);
+    INSERT INTO src VALUES (1, 2, 3);
+    CREATE TABLE dst(a, b, c, d);
+}
+
+@setup wrong-column-count-specified-columns-select-mismatch
+test wrong-column-count-specified-columns-select-mismatch {
+    INSERT INTO dst(a, b) SELECT x, y, z FROM src;
+}
+expect error {}
+
+setup wrong-column-count-partial-columns-values-too-few {
+    CREATE TABLE t(a, b, c);
+}
+
+@setup wrong-column-count-partial-columns-values-too-few
+test wrong-column-count-partial-columns-values-too-few {
+    INSERT INTO t(b, c) VALUES (2);
+}
+expect error {}
+
+setup wrong-column-count-partial-columns-values-too-many {
+    CREATE TABLE t(a, b, c);
+}
+
+@setup wrong-column-count-partial-columns-values-too-many
+test wrong-column-count-partial-columns-values-too-many {
+    INSERT INTO t(a) VALUES (1, 2);
+}
+expect error {}
+
+setup insert-duplicate-col-spec {
+    create table t(a);
+}
+
+@setup insert-duplicate-col-spec
+test insert-duplicate-col-spec {
+    insert into t(a, a) values (2, 3);
+    select * from t;
+}
+expect {
+    2
+}
+
+# ON CONFLICT tests
+setup insert-on-conflict-do-nothing-single-row {
+    CREATE TABLE t(a unique, b text);
+    INSERT INTO t VALUES (2, 'foo'),(3, 'bar');
+}
+
+@setup insert-on-conflict-do-nothing-single-row
+test insert-on-conflict-do-nothing-single-row {
+    INSERT OR IGNORE INTO t values (2, 'baz');
+    SELECT * FROM t;
+}
+expect {
+    2|foo
+    3|bar
+}
+
+setup insert-on-conflict-replace-single-row {
+    CREATE TABLE t(a unique, b text);
+    INSERT INTO t VALUES (2, 'foo'),(3, 'bar');
+}
+
+@setup insert-on-conflict-replace-single-row
+test insert-on-conflict-replace-single-row {
+    INSERT OR REPLACE INTO t values (2, 'baz');
+    SELECT * FROM t ORDER BY a;
+}
+expect {
+    2|baz
+    3|bar
+}
+
+setup insert-on-conflict-do-nothing-multiple-rows {
+    CREATE TABLE t(a unique);
+    INSERT INTO t VALUES (2),(3);
+}
+
+@setup insert-on-conflict-do-nothing-multiple-rows
+test insert-on-conflict-do-nothing-multiple-rows {
+    INSERT OR IGNORE INTO t values (1),(2),(3);
+    SELECT * FROM t order by a;
+}
+expect {
+    1
+    2
+    3
+}
+
+setup onconflict-ignore-existing {
+    CREATE TABLE t(a INTEGER UNIQUE, b TEXT);
+    INSERT INTO t VALUES (1,'x'),(2,'y');
+}
+
+@setup onconflict-ignore-existing
+test onconflict-ignore-existing {
+    INSERT OR IGNORE INTO t VALUES (2,'yy'),(3,'z'),(2,'zzz');
+    SELECT a, b FROM t ORDER BY a;
+}
+expect {
+    1|x
+    2|y
+    3|z
+}
+
+setup onconflict-ignore-selfdup-values {
+    CREATE TABLE t(a INTEGER UNIQUE, b TEXT);
+}
+
+@setup onconflict-ignore-selfdup-values
+test onconflict-ignore-selfdup-values {
+    INSERT OR IGNORE INTO t VALUES (1,'one'),(1,'two'),(1,'three');
+    SELECT a, b FROM t ORDER BY a;
+}
+expect {
+    1|one
+}
+
+setup onconflict-ignore-selfdup-values-targeted {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b INTEGER UNIQUE);
+    INSERT INTO t(a,b) VALUES (100,1);
+}
+
+@setup onconflict-ignore-selfdup-values-targeted
+test onconflict-ignore-selfdup-values-targeted {
+    INSERT INTO t(a,b) VALUES (200,1) ON CONFLICT(b) DO NOTHING;
+    SELECT a,b FROM t ORDER BY a;
+}
+expect {
+    100|1
+}
+
+setup onconflict-ignore-selfdup-multirow-targeted {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b INTEGER UNIQUE);
+    INSERT INTO t(a,b) VALUES (1,10),(2,20);
+}
+
+@setup onconflict-ignore-selfdup-multirow-targeted
+test onconflict-ignore-selfdup-multirow-targeted {
+    INSERT INTO t(a,b) VALUES (3,30),(4,30) ON CONFLICT(b) DO NOTHING;
+    SELECT a,b FROM t ORDER BY a;
+}
+expect {
+    1|10
+    2|20
+    3|30
+}
+
+setup onconflict-replace-existing {
+    CREATE TABLE t(a INTEGER UNIQUE, b TEXT);
+    INSERT INTO t VALUES (1,'x'),(2,'y');
+}
+
+@setup onconflict-replace-existing
+test onconflict-replace-existing {
+    INSERT OR REPLACE INTO t VALUES (2,'yy'),(3,'z');
+    SELECT a,b FROM t ORDER BY a;
+}
+expect {
+    1|x
+    2|yy
+    3|z
+}
+
+setup onconflict-replace-selfdup-values-lastwins {
+    CREATE TABLE t(a INTEGER UNIQUE, b TEXT);
+}
+
+@setup onconflict-replace-selfdup-values-lastwins
+test onconflict-replace-selfdup-values-lastwins {
+    INSERT OR REPLACE INTO t VALUES (5,'one'),(5,'two'),(5,'three');
+    SELECT a,b FROM t;
+}
+expect {
+    5|three
+}
+
+setup onconflict-replace-existing-then-selfdup-lastwins {
+    CREATE TABLE t(a INTEGER UNIQUE, b TEXT);
+    INSERT INTO t VALUES (5,'orig');
+}
+
+@setup onconflict-replace-existing-then-selfdup-lastwins
+test onconflict-replace-existing-then-selfdup-lastwins {
+    INSERT OR REPLACE INTO t VALUES (5,'first'),(5,'second');
+    SELECT a,b FROM t;
+}
+expect {
+    5|second
+}
+
+setup onconflict-replace-pk-rowid-alias {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT);
+}
+
+@setup onconflict-replace-pk-rowid-alias
+test onconflict-replace-pk-rowid-alias {
+    INSERT OR REPLACE INTO t(a,b) VALUES (1,'foo'),(1,'bar');
+    SELECT a,b FROM t;
+}
+expect {
+    1|bar
+}
+
+setup onconflict-replace-from-select-selfdup {
+    CREATE TABLE src(x);
+    INSERT INTO src VALUES (1),(1),(2);
+    CREATE TABLE t(a INTEGER UNIQUE);
+}
+
+@setup onconflict-replace-from-select-selfdup
+test onconflict-replace-from-select-selfdup {
+    INSERT OR REPLACE INTO t SELECT x FROM src;
+    SELECT a FROM t ORDER BY a;
+}
+expect {
+    1
+    2
+}
+
+setup onconflict-replace-notnull-default-existing-null {
+    CREATE TABLE t(
+      a INTEGER PRIMARY KEY,
+      b TEXT NOT NULL DEFAULT 'd'
+    );
+    INSERT INTO t VALUES (1,'x');
+}
+
+@setup onconflict-replace-notnull-default-existing-null
+test onconflict-replace-notnull-default-existing-null {
+    INSERT OR REPLACE INTO t(a,b) VALUES (1,NULL);
+    SELECT a,b FROM t;
+}
+expect {
+    1|d
+}
+
+setup onconflict-replace-notnull-default-existing-omit {
+    CREATE TABLE t(
+      a INTEGER PRIMARY KEY,
+      b TEXT NOT NULL DEFAULT 'd'
+    );
+    INSERT INTO t VALUES (1,'x');
+}
+
+@setup onconflict-replace-notnull-default-existing-omit
+test onconflict-replace-notnull-default-existing-omit {
+    INSERT OR REPLACE INTO t(a) VALUES (1);
+    SELECT a,b FROM t;
+}
+expect {
+    1|d
+}
+
+# Test NOT NULL constraint failure with REPLACE when no default
+setup onconflict-replace-notnull-no-default {
+    CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT NOT NULL);
+    INSERT INTO t VALUES (1,'x');
+}
+
+@setup onconflict-replace-notnull-no-default
+test onconflict-replace-notnull-no-default {
+    INSERT OR REPLACE INTO t(a,b) VALUES (1,NULL);
+}
+expect error {}
+
+setup onconflict-replace-composite-unique-existing {
+    CREATE TABLE t(
+      a INTEGER,
+      b INTEGER,
+      c TEXT,
+      UNIQUE(a,b)
+    );
+    INSERT INTO t VALUES (1,1,'x'),(1,2,'y');
+}
+
+@setup onconflict-replace-composite-unique-existing
+test onconflict-replace-composite-unique-existing {
+    INSERT OR REPLACE INTO t VALUES (1,2,'yy');
+    SELECT a,b,c FROM t ORDER BY a,b;
+}
+expect {
+    1|1|x
+    1|2|yy
+}
+
+setup onconflict-replace-composite-unique-selfdup-lastwins {
+    CREATE TABLE t(
+      a INTEGER,
+      b INTEGER,
+      c TEXT,
+      UNIQUE(a,b)
+    );
+}
+
+@setup onconflict-replace-composite-unique-selfdup-lastwins
+test onconflict-replace-composite-unique-selfdup-lastwins {
+    INSERT OR REPLACE INTO t VALUES
+      (1,1,'one'),
+      (1,1,'two'),
+      (1,1,'three');
+    SELECT a,b,c FROM t;
+}
+expect {
+    1|1|three
+}
+
+setup onconflict-replace-unique-index-existing {
+    CREATE TABLE t(a INTEGER, b TEXT);
+    CREATE UNIQUE INDEX t_a_u ON t(a);
+    INSERT INTO t VALUES (1,'x'),(2,'y');
+}
+
+@setup onconflict-replace-unique-index-existing
+test onconflict-replace-unique-index-existing {
+    INSERT OR REPLACE INTO t VALUES (2,'yy'),(3,'z');
+    SELECT a,b FROM t ORDER BY a;
+}
+expect {
+    1|x
+    2|yy
+    3|z
+}
+
+setup onconflict-replace-unique-index-selfdup-lastwins {
+    CREATE TABLE t(a INTEGER, b TEXT);
+    CREATE UNIQUE INDEX t_a_u ON t(a);
+}
+
+@setup onconflict-replace-unique-index-selfdup-lastwins
+test onconflict-replace-unique-index-selfdup-lastwins {
+    INSERT OR REPLACE INTO t VALUES (5,'one'),(5,'two'),(5,'three');
+    SELECT a,b FROM t;
+}
+expect {
+    5|three
+}
+
+setup partial-expr-index-upsert-conflict {
+    CREATE TABLE t(
+        id INTEGER PRIMARY KEY,
+        k TEXT,
+        c0 TEXT,
+        c1 INT
+    );
+    CREATE UNIQUE INDEX idx_expr_partial ON t(UPPER(k), length(c0)) WHERE c1 IS NOT NULL;
+    INSERT INTO t(id, k, c0, c1) VALUES (1, 'foo', 'abcd', 1);
+    INSERT INTO t(id, k, c0, c1) VALUES (2, 'bar', 'wxyz', 1);
+}
+
+@setup partial-expr-index-upsert-conflict
+test partial-expr-index-upsert-conflict {
+    INSERT INTO t(id, k, c0, c1) VALUES (2, 'baz', 'xx', 5)
+        ON CONFLICT(id) DO UPDATE SET k = 'foo', c0 = 'zzzz', c1 = 1;
+}
+expect error {}
+
+setup partial-expr-index-update-removes-entry {
+    CREATE TABLE t(
+        id INTEGER PRIMARY KEY,
+        k TEXT,
+        c0 TEXT,
+        c1 INT
+    );
+    CREATE UNIQUE INDEX idx_expr_partial ON t(UPPER(k), length(c0)) WHERE c1 IS NOT NULL;
+    INSERT INTO t(id, k, c0, c1) VALUES (1, 'foo', 'abcd', 1);
+}
+
+@setup partial-expr-index-update-removes-entry
+test partial-expr-index-update-removes-entry {
+    UPDATE t SET c1 = NULL WHERE id = 1;
+    INSERT INTO t(id, k, c0, c1) VALUES (2, 'FOO', 'zzzz', 5);
+    SELECT k || '|' || c0 || '|' || coalesce(c1, 'NULL') FROM t ORDER BY id;
+}
+expect {
+    foo|abcd|NULL
+    FOO|zzzz|5
+}
+
+setup partial-expr-index-delete-clears-entry {
+    CREATE TABLE t(
+        id INTEGER PRIMARY KEY,
+        k TEXT,
+        c0 TEXT,
+        c1 INT
+    );
+    CREATE UNIQUE INDEX idx_expr_partial ON t(UPPER(k), length(c0)) WHERE c1 IS NOT NULL;
+    INSERT INTO t(id, k, c0, c1) VALUES (1, 'foo', 'abcd', 3);
+}
+
+@setup partial-expr-index-delete-clears-entry
+test partial-expr-index-delete-clears-entry {
+    DELETE FROM t WHERE id = 1;
+    INSERT INTO t(id, k, c0, c1) VALUES (2, 'FOO', 'zzzz', 3);
+    SELECT upper(k) || '|' || length(c0) || '|' || c1 FROM t;
+}
+expect {
+    FOO|4|3
+}
+
+setup collate-unique-index-upsert {
+    CREATE TABLE co (name TEXT, v);
+    CREATE UNIQUE INDEX co_name_nocase ON co(name COLLATE NOCASE);
+    INSERT INTO co VALUES ('Alice', 1);
+}
+
+@setup collate-unique-index-upsert
+test collate-unique-index-upsert {
+    INSERT INTO co VALUES ('aLiCe', 9)
+      ON CONFLICT DO UPDATE SET v = excluded.v;
+    SELECT name, v FROM co;
+}
+expect {
+    Alice|9
+}
+
+setup upsert-fires-after-update-trigger {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, val INT);
+    CREATE TABLE log(msg TEXT);
+    CREATE TRIGGER trg AFTER UPDATE ON t BEGIN INSERT INTO log VALUES ('updated'); END;
+    INSERT INTO t VALUES (1, 100);
+}
+
+@setup upsert-fires-after-update-trigger
+test upsert-fires-after-update-trigger {
+    INSERT INTO t VALUES (1, 200) ON CONFLICT(id) DO UPDATE SET val=excluded.val;
+    SELECT * FROM log;
+}
+expect {
+    updated
+}
+
+setup upsert-fires-before-update-trigger {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, val INT);
+    CREATE TABLE log(msg TEXT);
+    CREATE TRIGGER trg BEFORE UPDATE ON t BEGIN INSERT INTO log VALUES ('before'); END;
+    INSERT INTO t VALUES (1, 100);
+}
+
+@setup upsert-fires-before-update-trigger
+test upsert-fires-before-update-trigger {
+    INSERT INTO t VALUES (1, 200) ON CONFLICT(id) DO UPDATE SET val=excluded.val;
+    SELECT * FROM log;
+}
+expect {
+    before
+}
+
+setup upsert-fires-before-and-after-triggers {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, val INT);
+    CREATE TABLE log(seq INTEGER PRIMARY KEY, msg TEXT);
+    CREATE TRIGGER trg_before BEFORE UPDATE ON t BEGIN INSERT INTO log(msg) VALUES ('before'); END;
+    CREATE TRIGGER trg_after AFTER UPDATE ON t BEGIN INSERT INTO log(msg) VALUES ('after'); END;
+    INSERT INTO t VALUES (1, 100);
+}
+
+@setup upsert-fires-before-and-after-triggers
+test upsert-fires-before-and-after-triggers {
+    INSERT INTO t VALUES (1, 200) ON CONFLICT(id) DO UPDATE SET val=excluded.val;
+    SELECT msg FROM log ORDER BY seq;
+}
+expect {
+    before
+    after
+}
+
+setup upsert-trigger-causes-fk-violation {
+    CREATE TABLE parent(id PRIMARY KEY);
+    CREATE TABLE child_deferred(id INTEGER PRIMARY KEY, pid INT, FOREIGN KEY(pid) REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED);
+    CREATE TABLE child_immediate(id INTEGER PRIMARY KEY, pid INT, FOREIGN KEY(pid) REFERENCES parent(id));
+    CREATE TRIGGER trg AFTER UPDATE OF pid ON child_deferred BEGIN INSERT INTO child_immediate VALUES (NEW.id + 1000, NEW.pid); END;
+    INSERT INTO parent VALUES (1);
+    INSERT INTO child_deferred VALUES (1, 1);
+}
+
+@setup upsert-trigger-causes-fk-violation
+test upsert-trigger-causes-fk-violation {
+    PRAGMA foreign_keys=ON;
+    INSERT INTO child_deferred VALUES (1, 999) ON CONFLICT(id) DO UPDATE SET pid=excluded.pid;
+}
+expect error { FOREIGN KEY constraint failed }
+
+# INSERT OR IGNORE with NOT NULL constraint violation tests
+setup ignore-notnull-single-row {
+    CREATE TABLE t(a INTEGER, b INT NOT NULL, c INTEGER);
+}
+
+@setup ignore-notnull-single-row
+test ignore-notnull-single-row {
+    INSERT OR IGNORE INTO t VALUES (1, NULL, 3);
+    SELECT * FROM t;
+}
+expect {
+}
+
+setup ignore-notnull-multi-row {
+    CREATE TABLE t(a INTEGER, b INT NOT NULL, c INTEGER);
+}
+
+@setup ignore-notnull-multi-row
+test ignore-notnull-multi-row {
+    INSERT OR IGNORE INTO t VALUES (1, 2, 3), (4, NULL, 6), (7, 8, 9);
+    SELECT * FROM t ORDER BY a;
+}
+expect {
+    1|2|3
+    7|8|9
+}
+
+setup ignore-notnull-all-null {
+    CREATE TABLE t(a INTEGER, b INT NOT NULL);
+}
+
+@setup ignore-notnull-all-null
+test ignore-notnull-all-null {
+    INSERT OR IGNORE INTO t VALUES (1, NULL), (2, NULL), (3, NULL);
+    SELECT * FROM t;
+}
+expect {
+}
+
+setup ignore-notnull-multiple-notnull-cols {
+    CREATE TABLE t(a INT NOT NULL, b INT NOT NULL, c INTEGER);
+}
+
+@setup ignore-notnull-multiple-notnull-cols
+test ignore-notnull-multiple-notnull-cols {
+    INSERT OR IGNORE INTO t VALUES (1, 2, 3), (NULL, 5, 6), (7, NULL, 9), (10, 11, 12);
+    SELECT * FROM t ORDER BY a;
+}
+expect {
+    1|2|3
+    10|11|12
+}
+
+setup ignore-notnull-from-select {
+    CREATE TABLE src(x, y, z);
+    INSERT INTO src VALUES (1, 2, 3), (4, NULL, 6), (7, 8, 9);
+    CREATE TABLE dst(a INTEGER, b INT NOT NULL, c INTEGER);
+}
+
+@setup ignore-notnull-from-select
+test ignore-notnull-from-select {
+    INSERT OR IGNORE INTO dst SELECT * FROM src;
+    SELECT * FROM dst ORDER BY a;
+}
+expect {
+    1|2|3
+    7|8|9
+}
+
+setup ignore-notnull-with-unique {
+    CREATE TABLE t(a INTEGER UNIQUE, b INT NOT NULL);
+    INSERT INTO t VALUES (1, 10);
+}
+
+@setup ignore-notnull-with-unique
+test ignore-notnull-with-unique {
+    INSERT OR IGNORE INTO t VALUES (1, 20), (2, NULL), (3, 30);
+    SELECT * FROM t ORDER BY a;
+}
+expect {
+    1|10
+    3|30
+}
+
