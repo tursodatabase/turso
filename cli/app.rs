@@ -200,7 +200,7 @@ impl Limbo {
             )?
         } else {
             let flags = if opts.readonly {
-                OpenFlags::ReadOnly
+                OpenFlags::default().union(OpenFlags::ReadOnly)
             } else {
                 OpenFlags::default()
             };

@@ -2659,8 +2659,9 @@ impl WalFileShared {
     pub fn open_shared_if_exists(
         io: &Arc<dyn IO>,
         path: &str,
+        flags: crate::OpenFlags,
     ) -> Result<Arc<RwLock<WalFileShared>>> {
-        let file = io.open_file(path, crate::io::OpenFlags::Create, false)?;
+        let file = io.open_file(path, flags, false)?;
         if file.size()? == 0 {
             return Ok(WalFileShared::new_noop());
         }
