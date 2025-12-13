@@ -1,7 +1,7 @@
 # Scalar Functions - DateTime Tests
 # Ported from testing/scalar-functions-datetime.test
 
-@database testing/testing.db readonly
+@database database/testing.db readonly
 
 # Date function tests
 

@@ -1,7 +1,7 @@
 # Concat Tests (Readonly - uses existing products table)
 # Ported from testing/concat.test
 
-@database testing/testing.db readonly
+@database database/testing.db readonly
 
 test concat-from-table {
     SELECT 'A good ' || name FROM products WHERE name = 'hat';

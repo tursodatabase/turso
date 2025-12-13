@@ -1,7 +1,7 @@
 # Window Function Tests (Readonly)
 # Ported from testing/window.test
 
-@database testing/testing.db readonly
+@database database/testing.db readonly
 
 # Basic partition by
 test window-partition-by {

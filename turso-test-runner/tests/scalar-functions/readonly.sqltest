@@ -1,7 +1,7 @@
 # Scalar Functions Tests (Readonly - uses products/users tables)
 # Ported from testing/scalar-functions.test
 
-@database testing/testing.db readonly
+@database database/testing.db readonly
 
 test typeof-sum-integer {
     SELECT typeof(sum(age)) from users;

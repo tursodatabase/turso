@@ -1,7 +1,7 @@
 # SUBQUERY Tests (Readonly - uses products/users tables)
 # Ported from testing/subquery.test
 
-@database testing/testing.db readonly
+@database database/testing.db readonly
 
 test subquery-inner-filter {
     select sub.loud_hat from (

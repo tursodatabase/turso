@@ -1,7 +1,7 @@
 # GLOB Tests (Readonly - uses products/users tables)
 # Ported from testing/glob.test
 
-@database testing/testing.db readonly
+@database database/testing.db readonly
 
 test glob-fn {
     SELECT name, glob('sweat*', name) FROM products;

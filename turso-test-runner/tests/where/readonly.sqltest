@@ -1,7 +1,7 @@
 # WHERE Tests (Readonly - users/products tables)
 # Ported from testing/where.test
 
-@database testing/testing.db readonly
+@database database/testing.db readonly
 
 # Basic WHERE comparisons
 test where-clause-eq {

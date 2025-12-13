@@ -10,7 +10,7 @@ setup attach-db-query {
 
 @setup attach-db-query
 test attach-db-query {
-    ATTACH DATABASE "testing/testing_small.db" AS small;
+    ATTACH DATABASE "database/testing_small.db" AS small;
     SELECT value FROM small.demo where id = 1;
 }
 expect {
@@ -24,7 +24,7 @@ setup detach-database {
 
 @setup detach-database
 test detach-database {
-    ATTACH DATABASE "testing/testing_small.db" AS small;
+    ATTACH DATABASE "database/testing_small.db" AS small;
     DETACH DATABASE small;
     pragma database_list;
 }
@@ -65,7 +65,7 @@ setup attach-cross-database-join {
 
 @setup attach-cross-database-join
 test attach-cross-database-join {
-    ATTACH DATABASE "testing/testing_small.db" as small;
+    ATTACH DATABASE "database/testing_small.db" as small;
     create table joiners (id int, otherid int);
     insert into joiners (id, otherid) values (1,1);
     insert into joiners (id, otherid) values (3,3);
@@ -83,7 +83,7 @@ setup query-after-detach {
 
 @setup query-after-detach
 test query-after-detach {
-    ATTACH DATABASE "testing/testing_small.db" as small;
+    ATTACH DATABASE "database/testing_small.db" as small;
     DETACH DATABASE small;
     select * from small.sqlite_schema;
 }
@@ -97,7 +97,7 @@ setup attach-from-memory-db {
 
 @setup attach-from-memory-db
 test attach-from-memory-db {
-    ATTACH DATABASE 'testing/testing.db' as a;
+    ATTACH DATABASE 'database/testing.db' as a;
     SELECT * from a.products, t LIMIT 1;
 }
 expect {

@@ -1,7 +1,7 @@
 # SELECT Tests (Readonly - uses products/users tables)
 # Ported from testing/select.test
 
-@database testing/testing.db readonly
+@database database/testing.db readonly
 
 test select-const-1 {
     SELECT 1;

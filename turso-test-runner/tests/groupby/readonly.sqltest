@@ -1,7 +1,7 @@
 # GROUP BY Tests (Readonly - uses products/users tables)
 # Ported from testing/groupby.test
 
-@database testing/testing.db readonly
+@database database/testing.db readonly
 
 test group_by {
     SELECT u.first_name, sum(u.age) FROM users u GROUP BY u.first_name LIMIT 10;

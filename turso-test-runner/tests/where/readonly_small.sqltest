@@ -1,7 +1,7 @@
 # WHERE Tests (Readonly Small - demo table)
 # Ported from testing/where.test
 
-@database testing/testing_small.db readonly
+@database database/testing_small.db readonly
 
 # NULL comparisons with demo table
 test where-is-null {

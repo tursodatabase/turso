@@ -1,7 +1,7 @@
 # Coalesce Tests (Readonly - uses existing users table)
 # Ported from testing/coalesce.test
 
-@database testing/testing.db readonly
+@database database/testing.db readonly
 
 test coalesce-from-table {
     SELECT coalesce(NULL, 1) FROM users LIMIT 1;

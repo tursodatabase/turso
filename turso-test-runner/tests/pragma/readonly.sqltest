@@ -1,7 +1,7 @@
 # PRAGMA Tests (Readonly)
 # Ported from testing/pragma.test
 
-@database testing/testing.db readonly
+@database database/testing.db readonly
 
 # Set cache size and check in same connection
 test pragma-set-cache-size {

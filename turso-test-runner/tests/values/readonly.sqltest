@@ -1,7 +1,7 @@
 # VALUES Tests (Readonly)
 # Ported from testing/values.test
 
-@database testing/testing.db readonly
+@database database/testing.db readonly
 
 # Basic values
 test values-1 {

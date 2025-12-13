@@ -1,7 +1,7 @@
 # Aggregate Functions Tests (Readonly - uses products/users tables)
 # Ported from testing/agg-functions.test
 
-@database testing/testing.db readonly
+@database database/testing.db readonly
 
 test select-avg {
     SELECT avg(age) FROM users;

@@ -1,7 +1,7 @@
 # ATTACH Tests (Readonly Small)
 # Ported from testing/attach.test
 
-@database testing/testing_small.db readonly
+@database database/testing_small.db readonly
 
 # Qualified table name access to main database
 test attach-main-qualified {
@@ -23,19 +23,19 @@ expect {
 
 # Attach reserved name - main (should fail)
 test attach-reserved-main {
-    ATTACH DATABASE "testing/testing_small.db" AS main
+    ATTACH DATABASE "database/testing_small.db" AS main
 }
 expect error { in use }
 
 # Attach reserved name - temp (should fail)
 test attach-reserved-temp {
-    ATTACH DATABASE "testing/testing_small.db" AS temp
+    ATTACH DATABASE "database/testing_small.db" AS temp
 }
 expect error { in use }
 
 # Attach duplicate database name (should fail)
 test attach-duplicate-name {
-    ATTACH DATABASE "testing/testing_small.db" as small;
-    ATTACH DATABASE "testing/testing_small.db" as small;
+    ATTACH DATABASE "database/testing_small.db" as small;
+    ATTACH DATABASE "database/testing_small.db" as small;
 }
 expect error { in use }

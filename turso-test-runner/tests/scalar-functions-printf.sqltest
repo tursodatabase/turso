@@ -1,7 +1,7 @@
 # Scalar Functions - Printf Tests
 # Ported from testing/scalar-functions-printf.test
 
-@database testing/testing.db readonly
+@database database/testing.db readonly
 
 # Basic string formatting
 

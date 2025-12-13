@@ -1,7 +1,7 @@
 # LIKE Tests (Readonly - uses products/users tables)
 # Ported from testing/like.test
 
-@database testing/testing.db readonly
+@database database/testing.db readonly
 
 test like-fn {
     SELECT name, like('sweat%', name) FROM products;

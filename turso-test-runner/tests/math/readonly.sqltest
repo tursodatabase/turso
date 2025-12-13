@@ -1,7 +1,7 @@
 # Math Tests (Readonly - uses products/users tables)
 # Ported from testing/math.test
 
-@database testing/testing.db readonly
+@database database/testing.db readonly
 
 test add-agg-int {
     SELECT sum(id) + 10 FROM products;
