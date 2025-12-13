@@ -3,12 +3,6 @@
 
 @database :memory:
 
-# Cache size tests
-setup pragma-cache-size-default {
-    SELECT 1;
-}
-
-@setup pragma-cache-size-default
 test pragma-cache-size-default {
   PRAGMA cache_size
 }
@@ -17,11 +11,6 @@ expect {
 }
 
 # Page count tests
-setup pragma-page-count-empty {
-    SELECT 1;
-}
-
-@setup pragma-page-count-empty
 test pragma-page-count-empty {
   PRAGMA page_count
 }
@@ -54,11 +43,7 @@ expect {
 }
 
 # User version tests
-setup pragma-user-version-default {
-    SELECT 1;
-}
 
-@setup pragma-user-version-default
 test pragma-user-version-default {
   PRAGMA user_version
 }
@@ -103,11 +88,6 @@ expect {
 }
 
 # Application ID tests
-setup pragma-application-id-default {
-    SELECT 1;
-}
-
-@setup pragma-application-id-default
 test pragma-application-id-default {
   PRAGMA application_id
 }
@@ -176,11 +156,6 @@ expect {
 }
 
 # Page size tests
-setup pragma-page-size-default {
-    SELECT 1;
-}
-
-@setup pragma-page-size-default
 test pragma-page-size-default {
   PRAGMA page_size
 }
@@ -214,11 +189,6 @@ expect {
 }
 
 # Max page count tests
-setup pragma-max-page-count-default {
-    SELECT 1;
-}
-
-@setup pragma-max-page-count-default
 test pragma-max-page-count-default {
   PRAGMA max_page_count
 }
@@ -226,27 +196,21 @@ expect {
     4294967294
 }
 
-setup pragma-max-page-count-set-large {
-    PRAGMA max_page_count = 1000;
-}
-
-@setup pragma-max-page-count-set-large
 test pragma-max-page-count-set-large {
+    PRAGMA max_page_count = 1000;
     PRAGMA max_page_count
 }
 expect {
     1000
+    1000
 }
 
-setup pragma-max-page-count-set-zero-ignored {
-    PRAGMA max_page_count = 0;
-}
-
-@setup pragma-max-page-count-set-zero-ignored
 test pragma-max-page-count-set-zero-ignored {
+    PRAGMA max_page_count = 0;
     PRAGMA max_page_count
 }
 expect {
+    4294967294
     4294967294
 }
 
@@ -288,12 +252,6 @@ expect {
     0|c0||0||0
 }
 
-# Integrity check
-setup pragma-integrity-check-empty {
-    SELECT 1;
-}
-
-@setup pragma-integrity-check-empty
 test pragma-integrity-check-empty {
   PRAGMA integrity_check;
 }
