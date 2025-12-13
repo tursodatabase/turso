@@ -256,8 +256,8 @@ impl Row {
 /// TODO: we can optimize this by using bitpacking for the begin and end fields.
 #[derive(Clone, Debug, PartialEq)]
 pub struct RowVersion {
-    pub begin: Option<TxTimestampOrID>,
-    pub end: Option<TxTimestampOrID>,
+    pub begin: PackedTxTimestampOrID,
+    pub end: PackedTxTimestampOrID,
     pub row: Row,
 }
 
@@ -291,12 +291,59 @@ impl LogRecord {
 /// phase of the transaction. During the active phase, new versions track the
 /// transaction ID in the `begin` and `end` fields. After a transaction commits,
 /// versions switch to tracking timestamps.
-#[derive(Clone, Debug, PartialEq, PartialOrd)]
-pub enum TxTimestampOrID {
-    /// A committed transaction's timestamp.
-    Timestamp(u64),
-    /// The ID of a non-committed transaction.
-    TxID(TxID),
+/// 2-bit tagged packed value:
+/// 00 = None
+/// 01 = Timestamp(u62)
+/// 10 = TxID(u62)
+/// 11 = reserved
+#[derive(Copy, Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct PackedTxTimestampOrID(u64);
+impl PackedTxTimestampOrID {
+    const TAG_SHIFT: u64 = 62;
+    const VAL_MASK: u64 = (1u64 << Self::TAG_SHIFT) - 1;
+
+    const TAG_NONE: u64 = 0b00;
+    const TAG_TS: u64 = 0b01;
+    const TAG_TX: u64 = 0b10;
+
+    #[inline]
+    pub const fn none() -> Self {
+        Self(0)
+    }
+
+    #[inline]
+    pub fn timestamp(ts: u64) -> Self {
+        debug_assert!(ts <= Self::VAL_MASK);
+        Self((Self::TAG_TS << Self::TAG_SHIFT) | ts)
+    }
+
+    #[inline]
+    pub fn txid(id: u64) -> Self {
+        debug_assert!(id <= Self::VAL_MASK);
+        Self((Self::TAG_TX << Self::TAG_SHIFT) | id)
+    }
+
+    #[inline]
+    fn tag(self) -> u64 {
+        self.0 >> Self::TAG_SHIFT
+    }
+    #[inline]
+    fn val(self) -> u64 {
+        self.0 & Self::VAL_MASK
+    }
+
+    #[inline]
+    pub fn is_none(self) -> bool {
+        self.tag() == Self::TAG_NONE
+    }
+    #[inline]
+    pub fn as_timestamp(self) -> Option<u64> {
+        (self.tag() == Self::TAG_TS).then(|| self.val())
+    }
+    #[inline]
+    pub fn as_txid(self) -> Option<u64> {
+        (self.tag() == Self::TAG_TX).then(|| self.val())
+    }
 }
 
 /// Transaction
@@ -717,11 +764,12 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                     if let Some(row_versions) = mvcc_store.rows.get(id) {
                         let mut row_versions = row_versions.value().write();
                         for row_version in row_versions.iter_mut() {
-                            if let Some(TxTimestampOrID::TxID(id)) = row_version.begin {
+                            if let Some(id) = row_version.begin.as_txid() {
                                 if id == self.tx_id {
                                     // New version is valid STARTING FROM committing transaction's end timestamp
                                     // See diagram on page 299: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf
-                                    row_version.begin = Some(TxTimestampOrID::Timestamp(*end_ts));
+                                    row_version.begin = PackedTxTimestampOrID::timestamp(*end_ts);
+
                                     mvcc_store.insert_version_raw(
                                         &mut log_record.row_versions,
                                         row_version.clone(),
@@ -732,11 +780,13 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                                     }
                                 }
                             }
-                            if let Some(TxTimestampOrID::TxID(id)) = row_version.end {
+
+                            if let Some(id) = row_version.end.as_txid() {
                                 if id == self.tx_id {
                                     // Old version is valid UNTIL committing transaction's end timestamp
                                     // See diagram on page 299: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf
-                                    row_version.end = Some(TxTimestampOrID::Timestamp(*end_ts));
+                                    row_version.end = PackedTxTimestampOrID::timestamp(*end_ts);
+
                                     mvcc_store.insert_version_raw(
                                         &mut log_record.row_versions,
                                         row_version.clone(),
@@ -757,23 +807,25 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                         if let Some(row_versions) = index.get(index_key) {
                             let mut row_versions = row_versions.value().write();
                             for row_version in row_versions.iter_mut() {
-                                if let Some(TxTimestampOrID::TxID(id)) = row_version.begin {
+                                if let Some(id) = row_version.begin.as_txid() {
                                     if id == self.tx_id {
                                         // New version is valid STARTING FROM committing transaction's end timestamp
                                         // See diagram on page 299: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf
                                         row_version.begin =
-                                            Some(TxTimestampOrID::Timestamp(*end_ts));
+                                            PackedTxTimestampOrID::timestamp(*end_ts);
+
                                         mvcc_store.insert_version_raw(
                                             &mut log_record.row_versions,
                                             row_version.clone(),
                                         ); // FIXME: optimize cloning out
                                     }
                                 }
-                                if let Some(TxTimestampOrID::TxID(id)) = row_version.end {
+
+                                if let Some(id) = row_version.end.as_txid() {
                                     if id == self.tx_id {
                                         // Old version is valid UNTIL committing transaction's end timestamp
-                                        // See diagram on page 299: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf
-                                        row_version.end = Some(TxTimestampOrID::Timestamp(*end_ts));
+                                        row_version.end = PackedTxTimestampOrID::timestamp(*end_ts);
+
                                         mvcc_store.insert_version_raw(
                                             &mut log_record.row_versions,
                                             row_version.clone(),
@@ -1326,26 +1378,30 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         match maybe_index_id {
             Some(index_id) => {
                 let row_version = RowVersion {
-                    begin: Some(TxTimestampOrID::TxID(tx.tx_id)),
-                    end: None,
+                    begin: PackedTxTimestampOrID::txid(tx.tx_id),
+                    end: PackedTxTimestampOrID::none(),
                     row: row.clone(),
                 };
+
                 let RowKey::Record(sortable_key) = row.id.row_id else {
                     panic!("Index writes must be to a record");
                 };
+
                 tx.insert_to_write_set(id.clone());
                 self.insert_index_version(index_id, sortable_key, row_version);
             }
             None => {
                 let row_version = RowVersion {
-                    begin: Some(TxTimestampOrID::TxID(tx.tx_id)),
-                    end: None,
+                    begin: PackedTxTimestampOrID::txid(tx.tx_id),
+                    end: PackedTxTimestampOrID::none(),
                     row,
                 };
+
                 tx.insert_to_write_set(id.clone());
                 self.insert_version(id, row_version);
             }
         }
+
         Ok(())
     }
 
@@ -1359,8 +1415,8 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         maybe_index_id: Option<MVTableId>,
     ) -> Result<()> {
         let row_version = RowVersion {
-            begin: Some(TxTimestampOrID::Timestamp(0)),
-            end: Some(TxTimestampOrID::TxID(tx_id)),
+            begin: PackedTxTimestampOrID::timestamp(0),
+            end: PackedTxTimestampOrID::txid(tx_id),
             row: row.clone(),
         };
         let tx = self
@@ -1493,7 +1549,8 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                             return Err(LimboError::WriteWriteConflict);
                         }
 
-                        rv.end = Some(TxTimestampOrID::TxID(tx.tx_id));
+                        rv.end = PackedTxTimestampOrID::txid(tx.tx_id);
+
                         let tx = self
                             .txs
                             .get(&tx_id)
@@ -1527,7 +1584,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                             return Err(LimboError::WriteWriteConflict);
                         }
 
-                        rv.end = Some(TxTimestampOrID::TxID(tx.tx_id));
+                        rv.end = PackedTxTimestampOrID::txid(tx.tx_id);
                         drop(row_versions);
                         drop(row_versions_opt);
                         let tx = self
@@ -2149,23 +2206,24 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 // Hekaton uses oldest-to-newest order for row versions, so we reverse iterate to find the newest one
                 // this transaction changed.
                 for row_version in row_versions.iter_mut().rev() {
-                    if let Some(TxTimestampOrID::TxID(id)) = row_version.begin {
+                    if let Some(id) = row_version.begin.as_txid() {
                         turso_assert!(
                             id == tx_id,
                             "only one tx(0) should exist on loading logical log"
                         );
                         // New version is valid STARTING FROM committing transaction's end timestamp
                         // See diagram on page 299: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf
-                        row_version.begin = Some(TxTimestampOrID::Timestamp(end_ts));
+                        row_version.begin = PackedTxTimestampOrID::timestamp(end_ts);
                     }
-                    if let Some(TxTimestampOrID::TxID(id)) = row_version.end {
+
+                    if let Some(id) = row_version.end.as_txid() {
                         turso_assert!(
                             id == tx_id,
                             "only one tx(0) should exist on loading logical log"
                         );
                         // Old version is valid UNTIL committing transaction's end timestamp
                         // See diagram on page 299: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf
-                        row_version.end = Some(TxTimestampOrID::Timestamp(end_ts));
+                        row_version.end = PackedTxTimestampOrID::timestamp(end_ts);
                     }
                 }
             }
@@ -2180,13 +2238,14 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             if let Some(index_row_versions) = index_row_versions {
                 let mut index_row_versions = index_row_versions.value().write();
                 for index_row_version in index_row_versions.iter_mut() {
-                    if let Some(TxTimestampOrID::TxID(id)) = index_row_version.begin {
+                    if let Some(id) = index_row_version.begin.as_txid() {
                         assert_eq!(id, tx_id);
-                        index_row_version.begin = Some(TxTimestampOrID::Timestamp(end_ts));
+                        index_row_version.begin = PackedTxTimestampOrID::timestamp(end_ts);
                     }
-                    if let Some(TxTimestampOrID::TxID(id)) = index_row_version.end {
+
+                    if let Some(id) = index_row_version.end.as_txid() {
                         assert_eq!(id, tx_id);
-                        index_row_version.end = Some(TxTimestampOrID::Timestamp(end_ts));
+                        index_row_version.end = PackedTxTimestampOrID::timestamp(end_ts);
                     }
                 }
             }
@@ -2224,17 +2283,17 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             if let Some(row_versions) = self.rows.get(rowid) {
                 let mut row_versions = row_versions.value().write();
                 for rv in row_versions.iter_mut() {
-                    if let Some(TxTimestampOrID::TxID(id)) = rv.begin {
+                    if let Some(id) = rv.begin.as_txid() {
                         assert_eq!(id, tx_id);
                         // If the transaction has aborted,
                         // it marks all its new versions as garbage and sets their Begin
                         // and End timestamps to infinity to make them invisible
                         // See section 2.4: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf
-                        rv.begin = None;
-                        rv.end = None;
-                    } else if rv.end == Some(TxTimestampOrID::TxID(tx_id)) {
+                        rv.begin = PackedTxTimestampOrID::none();
+                        rv.end = PackedTxTimestampOrID::none();
+                    } else if rv.end.as_txid() == Some(tx_id) {
                         // undo deletions by this transaction
-                        rv.end = None;
+                        rv.end = PackedTxTimestampOrID::none();
                     }
                 }
             }
@@ -2324,27 +2383,28 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             let mut row_versions = entry.value().write();
             row_versions.retain(|rv| {
                 // FIXME: should take rv.begin into account as well
-                let should_stay = match rv.end {
-                    Some(TxTimestampOrID::Timestamp(version_end_ts)) => {
-                        // a transaction started before this row version ended, ergo row version is needed
-                        // NOTICE: O(row_versions x transactions), but also lock-free, so sounds acceptable
-                        self.txs.iter().any(|tx| {
-                            let tx = tx.value();
-                            // FIXME: verify!
-                            match tx.state.load() {
-                                TransactionState::Active | TransactionState::Preparing => {
-                                    version_end_ts > tx.begin_ts
-                                }
-                                _ => false,
+                let should_stay = if let Some(version_end_ts) = rv.end.as_timestamp() {
+                    // a transaction started before this row version ended, ergo row version is needed
+                    // NOTICE: O(row_versions x transactions), but also lock-free, so sounds acceptable
+                    self.txs.iter().any(|tx| {
+                        let tx = tx.value();
+                        // FIXME: verify!
+                        match tx.state.load() {
+                            TransactionState::Active | TransactionState::Preparing => {
+                                version_end_ts > tx.begin_ts
                             }
-                        })
-                    }
-                    // Let's skip potentially complex logic if the transafction is still
-                    // active/tracked. We will drop the row version when the transaction
-                    // gets garbage-collected itself, it will always happen eventually.
-                    Some(TxTimestampOrID::TxID(tx_id)) => !self.txs.contains_key(&tx_id),
+                            _ => false,
+                        }
+                    })
+                }
+                // Let's skip potentially complex logic if the transafction is still
+                // active/tracked. We will drop the row version when the transaction
+                // gets garbage-collected itself, it will always happen eventually.
+                else if let Some(tx_id) = rv.end.as_txid() {
+                    !self.txs.contains_key(&tx_id)
+                } else {
                     // this row version is current, ergo visible
-                    None => true,
+                    true
                 };
                 if !should_stay {
                     dropped += 1;
@@ -2381,26 +2441,27 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
     // Extracts the begin timestamp from a transaction
     #[inline]
-    fn get_begin_timestamp(&self, ts_or_id: &Option<TxTimestampOrID>) -> u64 {
-        match ts_or_id {
-            Some(TxTimestampOrID::Timestamp(ts)) => *ts,
-            Some(TxTimestampOrID::TxID(tx_id)) => {
-                self.txs
-                    .get(tx_id)
-                    .expect("transaction should exist in txs map")
-                    .value()
-                    .begin_ts
-            }
-            // This function is intended to be used in the ordering of row versions within the row version chain in `insert_version_raw`.
-            //
-            // The row version chain should be append-only (aside from garbage collection),
-            // so the specific ordering handled by this function may not be critical. We might
-            // be able to append directly to the row version chain in the future.
-            //
-            // The value 0 is used here to represent an infinite timestamp value. This is a deliberate
-            // choice for a planned future bitpacking optimization, reserving 0 for this purpose,
-            // while actual timestamps will start from 1.
-            None => 0,
+    fn get_begin_timestamp(&self, ts_or_id: PackedTxTimestampOrID) -> u64 {
+        if let Some(ts) = ts_or_id.as_timestamp() {
+            ts
+        } else if let Some(tx_id) = ts_or_id.as_txid() {
+            self.txs
+                .get(&tx_id)
+                .expect("transaction should exist in txs map")
+                .value()
+                .begin_ts
+        }
+        // This function is intended to be used in the ordering of row versions within the row version chain in `insert_version_raw`.
+        //
+        // The row version chain should be append-only (aside from garbage collection),
+        // so the specific ordering handled by this function may not be critical. We might
+        // be able to append directly to the row version chain in the future.
+        //
+        // The value 0 is used here to represent an infinite timestamp value. This is a deliberate
+        // choice for a planned future bitpacking optimization, reserving 0 for this purpose,
+        // while actual timestamps will start from 1.
+        else {
+            0
         }
     }
 
@@ -2436,8 +2497,8 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         // which performs a binary search for the insertion point.
         let mut position = 0_usize;
         for (i, v) in versions.iter().enumerate().rev() {
-            let existing_begin = self.get_begin_timestamp(&v.begin);
-            let new_begin = self.get_begin_timestamp(&row_version.begin);
+            let existing_begin = self.get_begin_timestamp(v.begin);
+            let new_begin = self.get_begin_timestamp(row_version.begin);
             if existing_begin <= new_begin {
                 if existing_begin == new_begin
                     && existing_begin == LOGICAL_LOG_RECOVERY_COMMIT_TIMESTAMP
@@ -2732,24 +2793,26 @@ pub(crate) fn is_write_write_conflict(
     tx: &Transaction,
     rv: &RowVersion,
 ) -> bool {
-    match rv.end {
-        Some(TxTimestampOrID::TxID(rv_end)) => {
-            let te = txs
-                .get(&rv_end)
-                .expect("transaction should exist in txs map");
-            let te = te.value();
-            if te.tx_id == tx.tx_id {
-                return false;
-            }
-            te.state.load() != TransactionState::Aborted
+    if let Some(rv_end) = rv.end.as_txid() {
+        let te = txs
+            .get(&rv_end)
+            .expect("transaction should exist in txs map");
+        let te = te.value();
+
+        if te.tx_id == tx.tx_id {
+            return false;
         }
-        // A non-"infinity" end timestamp (here modeled by Some(ts)) functions as a write lock
-        // on the row, so it can never be updated by another transaction.
-        // Ref: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf , page 301,
-        // 2.6. Updating a Version.
-        Some(TxTimestampOrID::Timestamp(_)) => true,
-        None => false,
+        return te.state.load() != TransactionState::Aborted;
     }
+    // A non-"infinity" end timestamp (here modeled by Some(ts)) functions as a write lock
+    // on the row, so it can never be updated by another transaction.
+    // Ref: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf , page 301,
+    // 2.6. Updating a Version.
+    if rv.end.as_timestamp().is_some() {
+        return true;
+    }
+
+    false
 }
 
 impl RowVersion {
@@ -2759,32 +2822,37 @@ impl RowVersion {
 }
 
 fn is_begin_visible(txs: &SkipMap<TxID, Transaction>, tx: &Transaction, rv: &RowVersion) -> bool {
-    match rv.begin {
-        Some(TxTimestampOrID::Timestamp(rv_begin_ts)) => tx.begin_ts >= rv_begin_ts,
-        Some(TxTimestampOrID::TxID(rv_begin)) => {
-            let tb = txs
-                .get(&rv_begin)
-                .expect("transaction should exist in txs map");
-            let tb = tb.value();
-            let visible = match tb.state.load() {
-                TransactionState::Active => tx.tx_id == tb.tx_id && rv.end.is_none(),
-                TransactionState::Preparing => false, // NOTICE: makes sense for snapshot isolation, not so much for serializable!
-                TransactionState::Committed(committed_ts) => tx.begin_ts >= committed_ts,
-                TransactionState::Aborted => false,
-                TransactionState::Terminated => {
-                    tracing::debug!("TODO: should reread rv's end field - it should have updated the timestamp in the row version by now");
-                    false
-                }
-            };
-            tracing::trace!(
-                "is_begin_visible: tx={tx}, tb={tb} rv = {:?}-{:?} visible = {visible}",
-                rv.begin,
-                rv.end
-            );
-            visible
-        }
-        None => false,
+    if let Some(rv_begin_ts) = rv.begin.as_timestamp() {
+        return tx.begin_ts >= rv_begin_ts;
     }
+
+    if let Some(rv_begin) = rv.begin.as_txid() {
+        let tb = txs
+            .get(&rv_begin)
+            .expect("transaction should exist in txs map");
+        let tb = tb.value();
+
+        let visible = match tb.state.load() {
+            TransactionState::Active => tx.tx_id == tb.tx_id && rv.end.is_none(),
+            TransactionState::Preparing => false, // NOTICE: makes sense for snapshot isolation, not so much for serializable!
+            TransactionState::Committed(committed_ts) => tx.begin_ts >= committed_ts,
+            TransactionState::Aborted => false,
+            TransactionState::Terminated => {
+                tracing::debug!("TODO: should reread rv's end field - it should have updated the timestamp in the row version by now");
+                false
+            }
+        };
+
+        tracing::trace!(
+            "is_begin_visible: tx={tx}, tb={tb} rv = {:?}-{:?} visible = {visible}",
+            rv.begin,
+            rv.end
+        );
+
+        return visible;
+    }
+
+    false
 }
 
 fn is_end_visible(
@@ -2792,34 +2860,40 @@ fn is_end_visible(
     current_tx: &Transaction,
     row_version: &RowVersion,
 ) -> bool {
-    match row_version.end {
-        Some(TxTimestampOrID::Timestamp(rv_end_ts)) => current_tx.begin_ts < rv_end_ts,
-        Some(TxTimestampOrID::TxID(rv_end)) => {
-            let other_tx = txs
-                .get(&rv_end)
-                .unwrap_or_else(|| panic!("Transaction {rv_end} not found"));
-            let other_tx = other_tx.value();
-            let visible = match other_tx.state.load() {
-                // V's sharp mind discovered an issue with the hekaton paper which basically states that a
-                // transaction can see a row version if the end is a TXId only if it isn't the same transaction.
-                // Source: https://avi.im/blag/2023/hekaton-paper-typo/
-                TransactionState::Active => current_tx.tx_id != other_tx.tx_id,
-                TransactionState::Preparing => false, // NOTICE: makes sense for snapshot isolation, not so much for serializable!
-                TransactionState::Committed(committed_ts) => current_tx.begin_ts < committed_ts,
-                TransactionState::Aborted => false,
-                TransactionState::Terminated => {
-                    tracing::debug!("TODO: should reread rv's end field - it should have updated the timestamp in the row version by now");
-                    false
-                }
-            };
-            tracing::trace!(
-                "is_end_visible: tx={current_tx}, te={other_tx} rv = {:?}-{:?}  visible = {visible}",
-                row_version.begin,
-                row_version.end
-            );
-            visible
-        }
-        None => true,
+    if let Some(rv_end_ts) = row_version.end.as_timestamp() {
+        current_tx.begin_ts < rv_end_ts
+    } else if let Some(rv_end) = row_version.end.as_txid() {
+        let other_tx = txs
+            .get(&rv_end)
+            .unwrap_or_else(|| panic!("Transaction {rv_end} not found"));
+        let other_tx = other_tx.value();
+
+        let visible = match other_tx.state.load() {
+            // V's sharp mind discovered an issue with the hekaton paper which basically states that a
+            // transaction can see a row version if the end is a TXId only if it isn't the same transaction.
+            // Source: https://avi.im/blag/2023/hekaton-paper-typo/
+            TransactionState::Active => current_tx.tx_id != other_tx.tx_id,
+            TransactionState::Preparing => false, // NOTICE: makes sense for snapshot isolation, not so much for serializable!
+            TransactionState::Committed(committed_ts) => current_tx.begin_ts < committed_ts,
+            TransactionState::Aborted => false,
+            TransactionState::Terminated => {
+                tracing::debug!(
+                    "TODO: should reread rv's end field - it should have updated the timestamp in the row version by now"
+                );
+                false
+            }
+        };
+
+        tracing::trace!(
+            "is_end_visible: tx={current_tx}, te={other_tx} rv = {:?}-{:?}  visible = {visible}",
+            row_version.begin,
+            row_version.end
+        );
+
+        visible
+    } else {
+        // end is None => visible
+        true
     }
 }
 
