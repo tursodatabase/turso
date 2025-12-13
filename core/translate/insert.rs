@@ -868,7 +868,7 @@ fn init_autoincrement(
 
     program.emit_insn(Insn::OpenRead {
         cursor_id: seq_cursor_id,
-        root_page: seq_table.root_page.into(),
+        root_page: seq_table.root_page,
         db: 0,
     });
 
