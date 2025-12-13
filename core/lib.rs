@@ -517,10 +517,10 @@ impl Database {
             }
         }
 
-        let shared_wal = WalFileShared::open_shared_if_exists(&io, wal_path)?;
+        let shared_wal = WalFileShared::open_shared_if_exists(&io, wal_path, flags)?;
 
         let mv_store = if db.mvcc_enabled() {
-            let file = io.open_file(&format!("{path}-log"), OpenFlags::default(), false)?;
+            let file = io.open_file(&format!("{path}-log"), flags, false)?;
             let storage = mvcc::persistent_storage::Storage::new(file);
             let mv_store = MvStore::new(mvcc::LocalClock::new(), storage);
             Some(Arc::new(mv_store))
@@ -862,7 +862,7 @@ impl Database {
         }
         let file = self
             .io
-            .open_file(&self.wal_path, OpenFlags::Create, false)?;
+            .open_file(&self.wal_path, self.open_flags.get(), false)?;
 
         // Enable WAL in the existing shared instance
         {
@@ -1680,10 +1680,14 @@ impl Connection {
     fn from_uri_attached(
         uri: &str,
         db_opts: DatabaseOpts,
+        main_db_flags: OpenFlags,
         io: Arc<dyn IO>,
     ) -> Result<Arc<Database>> {
         let opts = OpenOptions::parse(uri)?;
-        let flags = opts.get_flags()?;
+        let mut flags = opts.get_flags()?;
+        if main_db_flags.contains(OpenFlags::ReadOnly) {
+            flags |= OpenFlags::ReadOnly;
+        }
         let io = opts.vfs.map(Database::io_for_vfs).unwrap_or(Ok(io))?;
         let db = Database::open_file_with_flags(io.clone(), &opts.path, flags, db_opts, None)?;
         if let Some(modeof) = opts.modeof {
@@ -1929,6 +1933,7 @@ impl Connection {
             .n_connections
             .fetch_sub(1, std::sync::atomic::Ordering::SeqCst)
             .eq(&1)
+            && !self.db.is_readonly()
         {
             self.pager
                 .load()
@@ -2251,9 +2256,10 @@ impl Connection {
         } else {
             Arc::new(PlatformIO::new()?)
         };
-        let db = Self::from_uri_attached(path, db_opts, io)?;
-        let pager = Arc::new(db.init_pager(None)?);
         // FIXME: for now, only support read only attach
+        let main_db_flags = self.db.open_flags.get() | OpenFlags::ReadOnly;
+        let db = Self::from_uri_attached(path, db_opts, main_db_flags, io)?;
+        let pager = Arc::new(db.init_pager(None)?);
         db.open_flags.set(OpenFlags::ReadOnly);
         self.attached_databases.write().insert(alias, (db, pager));
 

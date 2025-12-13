@@ -104,7 +104,7 @@ impl IO for UnixIO {
             file: Arc::new(Mutex::new(file)),
         });
         if std::env::var(common::ENV_DISABLE_FILE_LOCK).is_err()
-            || !flags.contains(OpenFlags::ReadOnly)
+            && !flags.contains(OpenFlags::ReadOnly)
         {
             unix_file.lock_file(true)?;
         }
