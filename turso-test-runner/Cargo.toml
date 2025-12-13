@@ -28,6 +28,7 @@ tempfile = "3"
 thiserror = "2"
 anyhow = "1"
 similar = "2"
+num_cpus = "1"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
