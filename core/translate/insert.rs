@@ -1,10 +1,10 @@
+use ::turso_parser::ast::ResolveType::Replace;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use turso_parser::ast::{
     self, Expr, InsertBody, OneSelect, QualifiedName, ResolveType, ResultColumn, TriggerEvent,
     TriggerTime, Upsert, UpsertDo,
 };
-use::turso_parser::ast::ResolveType::Replace;
 
 use crate::error::{
     SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE,
@@ -233,8 +233,6 @@ pub fn translate_insert(
         connection,
         on_conflict.unwrap_or(ResolveType::Abort),
     )?;
-
-
 
     let cdc_table = prepare_cdc_if_necessary(&mut program, resolver.schema, table.get_name())?;
 
@@ -614,11 +612,10 @@ fn emit_epilogue(
         program.resolve_label(ctx.row_done_label, program.offset());
         // single-row falls through to epilogue
         program.emit_insn(Insn::Goto {
-        target_pc: ctx.stmt_epilogue,
+            target_pc: ctx.stmt_epilogue,
         });
     }
     program.preassign_label_to_next_insn(ctx.stmt_epilogue);
-
 
     if let Some(AutoincMeta {
         seq_cursor_id,
@@ -796,7 +793,6 @@ fn emit_rowid_generation(
     insertion: &Insertion,
 ) -> Result<()> {
     if let Some(AutoincMeta { r_seq, .. }) = ctx.autoincrement_meta {
-
         program.emit_insn(Insn::NewRowid {
             cursor: ctx.cursor_id,
             rowid_reg: insertion.key_register(),
