@@ -7082,8 +7082,24 @@ pub fn op_new_rowid(
                 };
 
                 if *prev_largest_reg > 0 {
-                    state.registers[*prev_largest_reg] =
-                        Register::Value(Value::Integer(current_max.unwrap_or(0)));
+                    let autoinc_max = match state.registers[*prev_largest_reg].get_value() {
+                        Value::Integer(i) => *i,
+                        _ => 0,
+                    };
+                    
+                    if autoinc_max == MAX_ROWID {
+                        return Err(LimboError::DatabaseFull(
+                            "database or disk is full".to_string(),
+                        ));
+                    }
+                    
+                    let table_max = current_max.unwrap_or(0);
+                    let new_rowid = std::cmp::max(table_max, autoinc_max) + 1;
+                    
+                    state.registers[*rowid_reg] = Register::Value(Value::Integer(new_rowid));
+                    state.registers[*prev_largest_reg] = Register::Value(Value::Integer(new_rowid));
+                    state.op_new_rowid_state = OpNewRowidState::GoNext;
+                    continue;
                 }
 
                 match current_max {
