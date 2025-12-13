@@ -103,8 +103,16 @@ impl CliDatabaseInstance {
 
         // Build command arguments
         cmd.arg(&self.db_path);
-        cmd.arg("-q"); // Quiet mode - suppress banner
-        cmd.arg("-m").arg("list"); // List mode for pipe-separated output
+
+        // Only add -q flag for tursodb/turso (not sqlite3 or other CLIs)
+        if let Some(name) = self.binary_path.file_name().and_then(|n| n.to_str()) {
+            if name.starts_with("tursodb") || name.starts_with("turso") {
+                cmd.arg("-q"); // Quiet mode - suppress banner
+                cmd.arg("-m").arg("list"); // List mode for pipe-separated output
+                cmd.arg("--experimental-views");
+                cmd.arg("--experimental-strict");
+            }
+        }
 
         if self.readonly {
             cmd.arg("--readonly");
