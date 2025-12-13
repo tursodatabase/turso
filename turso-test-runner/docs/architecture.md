@@ -235,6 +235,9 @@ pub trait SqlBackend: Send + Sync {
 
 #[async_trait]
 pub trait DatabaseInstance: Send + Sync {
+    /// Execute setup SQL (may buffer for memory databases)
+    async fn execute_setup(&mut self, sql: &str) -> Result<(), BackendError>;
+    /// Execute SQL and return results (includes buffered setup SQL)
     async fn execute(&mut self, sql: &str) -> Result<QueryResult, BackendError>;
     async fn close(self: Box<Self>) -> Result<(), BackendError>;
 }

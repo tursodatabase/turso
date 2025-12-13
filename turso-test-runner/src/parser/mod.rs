@@ -185,12 +185,22 @@ impl<'a> Parser<'a> {
             Some(Token::Unordered) => {
                 self.advance();
                 let content = self.expect_block_content()?;
-                let rows = content.lines().map(|s| s.to_string()).collect();
+                // Trim each line to handle indentation in expect blocks
+                let rows = content
+                    .lines()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
                 Ok(Expectation::Unordered(rows))
             }
             Some(Token::BlockContent(_)) => {
                 let content = self.expect_block_content()?;
-                let rows = content.lines().map(|s| s.to_string()).collect();
+                // Trim each line to handle indentation in expect blocks
+                let rows = content
+                    .lines()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                    .collect();
                 Ok(Expectation::Exact(rows))
             }
             Some(token) => Err(self.error(format!(

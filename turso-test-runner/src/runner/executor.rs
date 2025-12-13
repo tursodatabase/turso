@@ -24,15 +24,14 @@ impl<B: SqlBackend> TestExecutor<B> {
         // Create database instance
         let mut db = self.backend.create_database(db_config).await?;
 
-        // Run setups in order
+        // Run setups in order (using execute_setup which buffers for memory databases)
         for setup_name in &test.setups {
             if let Some(setup_sql) = setups.get(setup_name) {
-                let result = db.execute(setup_sql).await?;
-                if result.is_error() {
+                if let Err(e) = db.execute_setup(setup_sql).await {
                     let _ = db.close().await;
                     return Ok(ExecutionResult::SetupFailed {
                         setup_name: setup_name.clone(),
-                        error: result.error.unwrap_or_else(|| "unknown error".to_string()),
+                        error: e.to_string(),
                     });
                 }
             } else {

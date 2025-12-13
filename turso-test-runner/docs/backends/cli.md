@@ -150,16 +150,19 @@ pub struct CliDatabaseInstance {
 
 ### Key Implementation Notes
 
-1. **Temp File Lifetime**: The `_temp_file` field keeps the `NamedTempFile` alive for the duration of the database instance. The underscore prefix indicates it's intentionally unused directly - its presence prevents the temp file from being deleted prematurely.
+1. **Setup Buffering for Memory Databases**: For `:memory:` databases, `execute_setup()` buffers SQL instead of executing immediately. This is necessary because each CLI invocation creates a fresh in-memory database. The buffered SQL is combined with the test query in `execute()`.
 
-2. **Stdin/Stdout Communication**: SQL is written to stdin, then stdin is closed to signal end of input. Results are read from stdout after process completion.
+2. **Temp File Lifetime**: The `_temp_file` field keeps the `NamedTempFile` alive for the duration of the database instance. The underscore prefix indicates it's intentionally unused directly - its presence prevents the temp file from being deleted prematurely.
 
-3. **Error Detection Strategy**:
-   - Check stderr for "Error" substring
+3. **Stdin/Stdout Communication**: SQL is written to stdin, then stdin is closed to signal end of input. Results are read from stdout after process completion. The `-q` flag suppresses the banner output.
+
+4. **Error Detection Strategy**:
+   - Check stderr for "Error" or "error" substrings
+   - Check stdout for error markers like "× " (tursodb error format) or "error:"
    - Check process exit status
    - Return errors as `QueryResult::error()` rather than `BackendError` to allow error expectation tests
 
-4. **Output Parsing**: List mode (`-m list`) produces pipe-separated values which are split and collected into `Vec<Vec<String>>`.
+5. **Output Parsing**: List mode (`-m list`) produces pipe-separated values which are split and collected into `Vec<Vec<String>>`.
 
 ### Builder Pattern
 

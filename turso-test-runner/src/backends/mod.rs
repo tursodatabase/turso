@@ -49,7 +49,23 @@ pub trait SqlBackend: Send + Sync {
 /// An isolated database instance
 #[async_trait]
 pub trait DatabaseInstance: Send + Sync {
+    /// Execute setup SQL (DDL, inserts, etc.)
+    /// For in-memory databases, this may buffer SQL for later execution.
+    /// For file-based databases, this executes immediately.
+    async fn execute_setup(&mut self, sql: &str) -> Result<(), BackendError> {
+        // For file-based databases, execute immediately
+        let result = self.execute(sql).await?;
+        if result.is_error() {
+            Err(BackendError::Execute(
+                result.error.unwrap_or_else(|| "unknown error".to_string()),
+            ))
+        } else {
+            Ok(())
+        }
+    }
+
     /// Execute SQL and return results
+    /// For in-memory databases, this will combine any buffered setup SQL with the query.
     async fn execute(&mut self, sql: &str) -> Result<QueryResult, BackendError>;
 
     /// Close and cleanup the database

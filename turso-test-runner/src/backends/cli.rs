@@ -52,15 +52,15 @@ impl SqlBackend for CliBackend {
         &self,
         config: &DatabaseConfig,
     ) -> Result<Box<dyn DatabaseInstance>, BackendError> {
-        let (db_path, temp_file) = match &config.location {
-            DatabaseLocation::Memory => (":memory:".to_string(), None),
+        let (db_path, temp_file, is_memory) = match &config.location {
+            DatabaseLocation::Memory => (":memory:".to_string(), None, true),
             DatabaseLocation::TempFile => {
                 let temp = NamedTempFile::new()
                     .map_err(|e| BackendError::CreateDatabase(e.to_string()))?;
                 let path = temp.path().to_string_lossy().to_string();
-                (path, Some(temp))
+                (path, Some(temp), false)
             }
-            DatabaseLocation::Path(path) => (path.to_string_lossy().to_string(), None),
+            DatabaseLocation::Path(path) => (path.to_string_lossy().to_string(), None, false),
         };
 
         Ok(Box::new(CliDatabaseInstance {
@@ -69,7 +69,9 @@ impl SqlBackend for CliBackend {
             db_path,
             readonly: config.readonly,
             timeout: self.timeout,
-            _temp_file: temp_file, // Keep temp file alive
+            _temp_file: temp_file,
+            is_memory,
+            setup_buffer: Vec::new(),
         }))
     }
 }
@@ -83,11 +85,15 @@ pub struct CliDatabaseInstance {
     timeout: Duration,
     /// Keep temp file alive - it's deleted when this is dropped
     _temp_file: Option<NamedTempFile>,
+    /// Whether this is an in-memory database (needs buffering)
+    is_memory: bool,
+    /// Buffer of setup SQL (for memory databases)
+    setup_buffer: Vec<String>,
 }
 
-#[async_trait]
-impl DatabaseInstance for CliDatabaseInstance {
-    async fn execute(&mut self, sql: &str) -> Result<QueryResult, BackendError> {
+impl CliDatabaseInstance {
+    /// Execute SQL by spawning a CLI process
+    async fn run_sql(&self, sql: &str) -> Result<QueryResult, BackendError> {
         let mut cmd = Command::new(&self.binary_path);
 
         // Set working directory if specified
@@ -97,6 +103,7 @@ impl DatabaseInstance for CliDatabaseInstance {
 
         // Build command arguments
         cmd.arg(&self.db_path);
+        cmd.arg("-q"); // Quiet mode - suppress banner
         cmd.arg("-m").arg("list"); // List mode for pipe-separated output
 
         if self.readonly {
@@ -128,10 +135,18 @@ impl DatabaseInstance for CliDatabaseInstance {
             .map_err(|_| BackendError::Timeout(self.timeout))?
             .map_err(|e| BackendError::Execute(format!("failed to read output: {}", e)))?;
 
-        // Check for errors
+        // Parse stdout
+        let stdout = String::from_utf8_lossy(&output.stdout);
         let stderr = String::from_utf8_lossy(&output.stderr);
-        if !stderr.is_empty() && stderr.contains("Error") {
+
+        // Check for errors in stderr
+        if !stderr.is_empty() && (stderr.contains("Error") || stderr.contains("error")) {
             return Ok(QueryResult::error(stderr.trim().to_string()));
+        }
+
+        // Check for errors in stdout (tursodb outputs errors like "× Parse error: ...")
+        if stdout.contains("× ") || stdout.contains("error:") || stdout.contains("Error:") {
+            return Ok(QueryResult::error(stdout.trim().to_string()));
         }
 
         if !output.status.success() {
@@ -139,17 +154,52 @@ impl DatabaseInstance for CliDatabaseInstance {
             if !stderr.is_empty() {
                 return Ok(QueryResult::error(stderr.to_string()));
             }
+            if !stdout.trim().is_empty() {
+                return Ok(QueryResult::error(stdout.trim().to_string()));
+            }
             return Ok(QueryResult::error(format!(
                 "command exited with status {}",
                 output.status
             )));
         }
 
-        // Parse stdout
-        let stdout = String::from_utf8_lossy(&output.stdout);
         let rows = parse_list_output(&stdout);
 
         Ok(QueryResult::success(rows))
+    }
+}
+
+#[async_trait]
+impl DatabaseInstance for CliDatabaseInstance {
+    async fn execute_setup(&mut self, sql: &str) -> Result<(), BackendError> {
+        if self.is_memory {
+            // For memory databases, buffer the setup SQL for later
+            self.setup_buffer.push(sql.to_string());
+            Ok(())
+        } else {
+            // For file-based databases, execute immediately
+            let result = self.run_sql(sql).await?;
+            if result.is_error() {
+                Err(BackendError::Execute(
+                    result.error.unwrap_or_else(|| "unknown error".to_string()),
+                ))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    async fn execute(&mut self, sql: &str) -> Result<QueryResult, BackendError> {
+        if self.is_memory && !self.setup_buffer.is_empty() {
+            // Combine buffered setup SQL with the query
+            let mut combined = self.setup_buffer.join("\n");
+            combined.push('\n');
+            combined.push_str(sql);
+            self.run_sql(&combined).await
+        } else {
+            // Execute directly
+            self.run_sql(sql).await
+        }
     }
 
     async fn close(self: Box<Self>) -> Result<(), BackendError> {

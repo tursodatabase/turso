@@ -435,10 +435,10 @@ async fn run_single_test<B: SqlBackend>(
         }
     };
 
-    // Run setups
+    // Run setups (using execute_setup which buffers for memory databases)
     for setup_name in &test.setups {
         if let Some(setup_sql) = setups.get(setup_name) {
-            if let Err(e) = db.execute(setup_sql).await {
+            if let Err(e) = db.execute_setup(setup_sql).await {
                 let _ = db.close().await;
                 return TestResult {
                     name: test.name,
