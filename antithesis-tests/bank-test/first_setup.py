@@ -29,10 +29,10 @@ num_accts = get_random() % 100 + 1
 for i in range(num_accts):
     bal = get_random() % 1e9
     total += bal
-    cur.execute(f"""
+    cur.execute("""
         INSERT INTO accounts (balance)
-        VALUES ({bal})
-    """)
+        VALUES (?)
+    """, (bal,))
 
 # drop initial_state table if it exists and create a new table
 cur.execute("""
@@ -46,9 +46,9 @@ cur.execute("""
 """)
 
 # store initial state in the table
-cur.execute(f"""
+cur.execute("""
     INSERT INTO initial_state (num_accts, total)
-    VALUES ({num_accts}, {total})
-""")
+    VALUES (?, ?)
+""", (num_accts, total))
 
 con.commit()
