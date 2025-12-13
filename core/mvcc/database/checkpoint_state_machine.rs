@@ -1,7 +1,7 @@
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{
-    DeleteRowStateMachine, MVTableId, MvStore, RowID, RowKey, RowVersion, TxTimestampOrID,
-    WriteRowStateMachine, SQLITE_SCHEMA_MVCC_TABLE_ID,
+    DeleteRowStateMachine, MVTableId, MvStore, RowID, RowKey, RowVersion, WriteRowStateMachine,
+    SQLITE_SCHEMA_MVCC_TABLE_ID,
 };
 use crate::schema::Index;
 use crate::state_machine::{StateMachine, StateTransition, TransitionResult};
@@ -201,7 +201,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             // There is a version whose begin timestamp is <= than the last checkpoint timestamp, AND
             // There is NO version whose END timestamp is <= than the last checkpoint timestamp.
             let mut begin_ts = None;
-            if let Some(TxTimestampOrID::Timestamp(b)) = version.begin {
+            if let Some(b) = version.begin.as_timestamp() {
                 begin_ts = Some(b);
                 if self
                     .checkpointed_txid_max_old
@@ -211,7 +211,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 }
             }
             let mut end_ts = None;
-            if let Some(TxTimestampOrID::Timestamp(e)) = version.end {
+            if let Some(e) = version.end.as_timestamp() {
                 end_ts = Some(e);
                 if self
                     .checkpointed_txid_max_old
@@ -271,16 +271,16 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             let row_versions = entry.value().read();
 
             for version in row_versions.iter() {
-                if let Some(TxTimestampOrID::Timestamp(ts)) = version.begin {
-                    max_timestamp = max_timestamp.max(NonZeroU64::new(ts));
+                if let Some(b) = version.begin.as_timestamp() {
+                    max_timestamp = max_timestamp.max(NonZeroU64::new(b));
                 }
-                if let Some(TxTimestampOrID::Timestamp(ts)) = version.end {
-                    max_timestamp = max_timestamp.max(NonZeroU64::new(ts));
+                if let Some(e) = version.end.as_timestamp() {
+                    max_timestamp = max_timestamp.max(NonZeroU64::new(e));
                 }
             }
 
             if let Some(version) = self.maybe_get_checkpointable_version(&row_versions) {
-                let is_delete = version.end.is_some();
+                let is_delete = !version.end.is_none();
 
                 let mut special_write = None;
 
@@ -428,16 +428,16 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 let versions = entry.value().read();
 
                 for version in versions.iter() {
-                    if let Some(TxTimestampOrID::Timestamp(ts)) = version.begin {
+                    if let Some(ts) = version.begin.as_timestamp() {
                         max_timestamp = max_timestamp.max(NonZeroU64::new(ts));
                     }
-                    if let Some(TxTimestampOrID::Timestamp(ts)) = version.end {
+                    if let Some(ts) = version.end.as_timestamp() {
                         max_timestamp = max_timestamp.max(NonZeroU64::new(ts));
                     }
                 }
 
                 if let Some(version) = self.maybe_get_checkpointable_version(&versions) {
-                    let is_delete = version.end.is_some();
+                    let is_delete = !version.end.is_none();
 
                     // Only write the row to the B-tree if it is not a delete, or if it is a delete and it exists in
                     // the database file.
@@ -811,7 +811,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 )?;
 
                 // Check if this is an insert or delete
-                if row_version.end.is_some() {
+                if !row_version.end.is_none() {
                     // This is a delete operation.
                     // Don't write the deletion record to the b-tree if the b-tree was just created; we can no-op in this case,
                     // since there is no existing row to delete.

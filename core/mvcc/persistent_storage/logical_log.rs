@@ -74,7 +74,7 @@ enum LogRecordType {
 
 impl LogRecordType {
     fn from_row_version(row_version: &RowVersion) -> Self {
-        if row_version.end.is_some() {
+        if !row_version.end.is_none() {
             Self::DeleteRow
         } else {
             Self::InsertRow

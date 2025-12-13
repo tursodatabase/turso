@@ -1099,7 +1099,7 @@ fn test_snapshot_isolation_tx_visible1() {
 
     let current_tx = new_tx(4, 4, TransactionState::Preparing);
 
-    let rv_visible = |begin: Option<TxTimestampOrID>, end: Option<TxTimestampOrID>| {
+    let rv_visible = |begin: PackedTxTimestampOrID, end: PackedTxTimestampOrID| {
         let row_version = RowVersion {
             begin,
             end,
@@ -1111,61 +1111,84 @@ fn test_snapshot_isolation_tx_visible1() {
 
     // begin visible:   transaction committed with ts < current_tx.begin_ts
     // end visible:     inf
-    assert!(rv_visible(Some(TxTimestampOrID::TxID(1)), None));
+    assert!(rv_visible(
+        PackedTxTimestampOrID::txid(1),
+        PackedTxTimestampOrID::none()
+    ));
 
     // begin invisible: transaction committed with ts > current_tx.begin_ts
-    assert!(!rv_visible(Some(TxTimestampOrID::TxID(2)), None));
+    assert!(!rv_visible(
+        PackedTxTimestampOrID::txid(2),
+        PackedTxTimestampOrID::none()
+    ));
 
     // begin invisible: transaction aborted
-    assert!(!rv_visible(Some(TxTimestampOrID::TxID(3)), None));
-
+    assert!(!rv_visible(
+        PackedTxTimestampOrID::txid(3),
+        PackedTxTimestampOrID::none()
+    ));
     // begin visible:   timestamp < current_tx.begin_ts
     // end invisible:   transaction committed with ts > current_tx.begin_ts
     assert!(!rv_visible(
-        Some(TxTimestampOrID::Timestamp(0)),
-        Some(TxTimestampOrID::TxID(1))
+        PackedTxTimestampOrID::timestamp(0),
+        PackedTxTimestampOrID::txid(1)
     ));
 
     // begin visible:   timestamp < current_tx.begin_ts
     // end visible:     transaction committed with ts < current_tx.begin_ts
     assert!(rv_visible(
-        Some(TxTimestampOrID::Timestamp(0)),
-        Some(TxTimestampOrID::TxID(2))
+        PackedTxTimestampOrID::timestamp(0),
+        PackedTxTimestampOrID::txid(2)
     ));
 
     // begin visible:   timestamp < current_tx.begin_ts
     // end invisible:   transaction aborted
     assert!(!rv_visible(
-        Some(TxTimestampOrID::Timestamp(0)),
-        Some(TxTimestampOrID::TxID(3))
+        PackedTxTimestampOrID::timestamp(0),
+        PackedTxTimestampOrID::txid(3)
     ));
 
     // begin invisible: transaction preparing
-    assert!(!rv_visible(Some(TxTimestampOrID::TxID(5)), None));
+    assert!(!rv_visible(
+        PackedTxTimestampOrID::txid(5),
+        PackedTxTimestampOrID::none()
+    ));
 
     // begin invisible: transaction committed with ts > current_tx.begin_ts
-    assert!(!rv_visible(Some(TxTimestampOrID::TxID(6)), None));
+    assert!(!rv_visible(
+        PackedTxTimestampOrID::txid(6),
+        PackedTxTimestampOrID::none()
+    ));
 
     // begin invisible: transaction active
-    assert!(!rv_visible(Some(TxTimestampOrID::TxID(7)), None));
+    assert!(!rv_visible(
+        PackedTxTimestampOrID::txid(7),
+        PackedTxTimestampOrID::none()
+    ));
 
     // begin invisible: transaction committed with ts > current_tx.begin_ts
-    assert!(!rv_visible(Some(TxTimestampOrID::TxID(6)), None));
+    assert!(!rv_visible(
+        PackedTxTimestampOrID::txid(6),
+        PackedTxTimestampOrID::none()
+    ));
 
     // begin invisible:   transaction active
-    assert!(!rv_visible(Some(TxTimestampOrID::TxID(7)), None));
+    assert!(!rv_visible(
+        PackedTxTimestampOrID::txid(7),
+        PackedTxTimestampOrID::none()
+    ));
 
     // begin visible:   timestamp < current_tx.begin_ts
     // end invisible:     transaction preparing
     assert!(!rv_visible(
-        Some(TxTimestampOrID::Timestamp(0)),
-        Some(TxTimestampOrID::TxID(5))
+        PackedTxTimestampOrID::timestamp(0),
+        PackedTxTimestampOrID::txid(5)
     ));
 
     // begin invisible: timestamp > current_tx.begin_ts
     assert!(!rv_visible(
-        Some(TxTimestampOrID::Timestamp(6)),
-        Some(TxTimestampOrID::TxID(6))
+        PackedTxTimestampOrID::timestamp(6),
+        PackedTxTimestampOrID::txid(6)
     ));
 
     // begin visible:   timestamp < current_tx.begin_ts
@@ -1173,11 +1196,14 @@ fn test_snapshot_isolation_tx_visible1() {
     //                  but that hasn't happened
     //                  (this is the https://avi.im/blag/2023/hekaton-paper-typo/ case, I believe!)
     assert!(rv_visible(
-        Some(TxTimestampOrID::Timestamp(0)),
-        Some(TxTimestampOrID::TxID(7))
+        PackedTxTimestampOrID::timestamp(0),
+        PackedTxTimestampOrID::txid(7)
     ));
 
-    assert!(!rv_visible(None, None));
+    assert!(!rv_visible(
+        PackedTxTimestampOrID::none(),
+        PackedTxTimestampOrID::none()
+    ));
 }
 
 #[test]
