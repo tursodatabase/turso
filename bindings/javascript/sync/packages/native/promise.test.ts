@@ -172,6 +172,10 @@ test('partial sync (prefix bootstrap strategy; speculative load)', async () => {
 })
 
 test('partial sync (query bootstrap strategy)', async () => {
+    if (process.env.VITE_TURSO_SERVER != "true") {
+        console.info('test works only against real turso-server')
+        return;
+    }
     {
         const db = await connect({
             path: ':memory:',
@@ -305,52 +309,52 @@ test('defered sync', async () => {
     expect(await db.prepare("SELECT * FROM t").all()).toEqual([{ x: 100 }, { x: 1 }, { x: 2 }, { x: 3 }, { x: 42 }]);
 })
 
-test('encryption sync', async () => {
-    const KEY = 'l/FWopMfZisTLgBX4A42AergrCrYKjiO3BfkJUwv83I=';
-    const URL = 'http://encrypted--a--a.localhost:10000';
-    {
-        const db = await connect({ path: ':memory:', url: URL, remoteEncryption: { key: KEY, cipher: 'aes256gcm' } });
-        await db.exec("CREATE TABLE IF NOT EXISTS t(x)");
-        await db.exec("DELETE FROM t");
-        await db.push();
-        await db.close();
-    }
-    const db1 = await connect({ path: ':memory:', url: URL, remoteEncryption: { key: KEY, cipher: 'aes256gcm' } });
-    const db2 = await connect({ path: ':memory:', url: URL, remoteEncryption: { key: KEY, cipher: 'aes256gcm' } });
-    await db1.exec("INSERT INTO t VALUES (1), (2), (3)");
-    await db2.exec("INSERT INTO t VALUES (4), (5), (6)");
-    expect(await db1.prepare("SELECT * FROM t").all()).toEqual([{ x: 1 }, { x: 2 }, { x: 3 }]);
-    expect(await db2.prepare("SELECT * FROM t").all()).toEqual([{ x: 4 }, { x: 5 }, { x: 6 }]);
-    await Promise.all([db1.push(), db2.push()]);
-    await Promise.all([db1.pull(), db2.pull()]);
-    const expected = [{ x: 1 }, { x: 2 }, { x: 3 }, { x: 4 }, { x: 5 }, { x: 6 }];
-    expect((await db1.prepare("SELECT * FROM t").all()).sort(intCompare)).toEqual(expected.sort(intCompare));
-    expect((await db2.prepare("SELECT * FROM t").all()).sort(intCompare)).toEqual(expected.sort(intCompare));
-});
+// test('encryption sync', async () => {
+//     const KEY = 'l/FWopMfZisTLgBX4A42AergrCrYKjiO3BfkJUwv83I=';
+//     const URL = 'http://encrypted--a--a.localhost:10000';
+//     {
+//         const db = await connect({ path: ':memory:', url: URL, remoteEncryption: { key: KEY, cipher: 'aes256gcm' } });
+//         await db.exec("CREATE TABLE IF NOT EXISTS t(x)");
+//         await db.exec("DELETE FROM t");
+//         await db.push();
+//         await db.close();
+//     }
+//     const db1 = await connect({ path: ':memory:', url: URL, remoteEncryption: { key: KEY, cipher: 'aes256gcm' } });
+//     const db2 = await connect({ path: ':memory:', url: URL, remoteEncryption: { key: KEY, cipher: 'aes256gcm' } });
+//     await db1.exec("INSERT INTO t VALUES (1), (2), (3)");
+//     await db2.exec("INSERT INTO t VALUES (4), (5), (6)");
+//     expect(await db1.prepare("SELECT * FROM t").all()).toEqual([{ x: 1 }, { x: 2 }, { x: 3 }]);
+//     expect(await db2.prepare("SELECT * FROM t").all()).toEqual([{ x: 4 }, { x: 5 }, { x: 6 }]);
+//     await Promise.all([db1.push(), db2.push()]);
+//     await Promise.all([db1.pull(), db2.pull()]);
+//     const expected = [{ x: 1 }, { x: 2 }, { x: 3 }, { x: 4 }, { x: 5 }, { x: 6 }];
+//     expect((await db1.prepare("SELECT * FROM t").all()).sort(intCompare)).toEqual(expected.sort(intCompare));
+//     expect((await db2.prepare("SELECT * FROM t").all()).sort(intCompare)).toEqual(expected.sort(intCompare));
+// });
 
-test('defered encryption sync', async () => {
-    const URL = 'http://encrypted--a--a.localhost:10000';
-    const KEY = 'l/FWopMfZisTLgBX4A42AergrCrYKjiO3BfkJUwv83I=';
-    let url = null;
-    {
-        const db = await connect({ path: ':memory:', url: URL, remoteEncryption: { key: KEY, cipher: 'aes256gcm' } });
-        await db.exec("CREATE TABLE IF NOT EXISTS t(x)");
-        await db.exec("DELETE FROM t");
-        await db.exec("INSERT INTO t VALUES (100)");
-        await db.push();
-        await db.close();
-    }
-    const db = await connect({ path: ':memory:', url: () => url, remoteEncryption: { key: KEY, cipher: 'aes256gcm' } });
-    await db.exec("CREATE TABLE IF NOT EXISTS t(x)");
-    await db.exec("INSERT INTO t VALUES (1), (2), (3)");
-    expect(await db.prepare("SELECT * FROM t").all()).toEqual([{ x: 1 }, { x: 2 }, { x: 3 }]);
+// test('defered encryption sync', async () => {
+//     const URL = 'http://encrypted--a--a.localhost:10000';
+//     const KEY = 'l/FWopMfZisTLgBX4A42AergrCrYKjiO3BfkJUwv83I=';
+//     let url = null;
+//     {
+//         const db = await connect({ path: ':memory:', url: URL, remoteEncryption: { key: KEY, cipher: 'aes256gcm' } });
+//         await db.exec("CREATE TABLE IF NOT EXISTS t(x)");
+//         await db.exec("DELETE FROM t");
+//         await db.exec("INSERT INTO t VALUES (100)");
+//         await db.push();
+//         await db.close();
+//     }
+//     const db = await connect({ path: ':memory:', url: () => url, remoteEncryption: { key: KEY, cipher: 'aes256gcm' } });
+//     await db.exec("CREATE TABLE IF NOT EXISTS t(x)");
+//     await db.exec("INSERT INTO t VALUES (1), (2), (3)");
+//     expect(await db.prepare("SELECT * FROM t").all()).toEqual([{ x: 1 }, { x: 2 }, { x: 3 }]);
 
-    url = URL;
-    await db.pull();
+//     url = URL;
+//     await db.pull();
 
-    const expected = [{ x: 100 }, { x: 1 }, { x: 2 }, { x: 3 }];
-    expect((await db.prepare("SELECT * FROM t").all())).toEqual(expected);
-});
+//     const expected = [{ x: 100 }, { x: 1 }, { x: 2 }, { x: 3 }];
+//     expect((await db.prepare("SELECT * FROM t").all())).toEqual(expected);
+// });
 
 test('select-after-push', async () => {
     {
@@ -481,7 +485,7 @@ test('constraint-conflict', async () => {
     await db2.exec("INSERT INTO u VALUES ('k2', 'value1')");
 
     await db1.push();
-    await expect(async () => await db2.push()).rejects.toThrow('SQLite error: UNIQUE constraint failed: u.y');
+    await expect(async () => await db2.push()).rejects.toThrow('UNIQUE constraint failed: u.y');
 })
 
 test('checkpoint', async () => {

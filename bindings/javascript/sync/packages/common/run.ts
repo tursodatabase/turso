@@ -45,11 +45,34 @@ async function process(opts: RunOpts, io: ProtocolIo, request: any) {
                     headers[header[0]] = header[1];
                 }
             }
-            const response = await fetch(`${url}${requestType.path}`, {
-                method: requestType.method,
-                headers: headers,
-                body: requestType.body != null ? new Uint8Array(requestType.body) : null,
-            });
+            const nonce = `nonce-${Math.random()}-${Math.random()}`;
+            headers['x-nonce'] = nonce;
+            console.info(url, requestType.method, requestType.path, nonce);
+            let response
+            try {
+                response = await fetch(`${url}${requestType.path}`, {
+                    method: requestType.method,
+                    headers: headers,
+                    body: requestType.body != null ? new Uint8Array(requestType.body) : null,
+                });
+            }
+            catch (err) {
+                console.error('nonce:', nonce);
+                console.error('name:', err.name)
+                console.error('message:', err.message)
+                console.error('stack:', err.stack)
+
+                // 🔴 This is critical
+                console.error('cause:', err.cause)
+
+                if (err.cause instanceof Error) {
+                    console.error('cause name:', err.cause.name)
+                    console.error('cause message:', err.cause.message)
+                    console.error('cause stack:', err.cause.stack)
+                }
+                throw err;
+            }
+            console.info(response.status);
             completion.status(response.status);
             const reader = response.body.getReader();
             while (true) {
