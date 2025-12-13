@@ -1,0 +1,82 @@
+# Join Tests
+# Demonstrates setup composition with multiple tables
+
+@database :memory:
+@database :temp:
+
+# Individual setup blocks
+setup users {
+    CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);
+    INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob');
+}
+
+setup products {
+    CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, price REAL);
+    INSERT INTO products VALUES (1, 'Widget', 9.99), (2, 'Gadget', 19.99);
+}
+
+setup orders {
+    CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, product_id INTEGER);
+    INSERT INTO orders VALUES (1, 1, 1), (2, 1, 2), (3, 2, 1);
+}
+
+# Test with single setup
+@setup users
+test count-users {
+    SELECT COUNT(*) FROM users;
+}
+expect {
+    2
+}
+
+# Test composing multiple setups
+@setup users
+@setup products
+@setup orders
+test join-all-tables {
+    SELECT u.name, p.name, p.price
+    FROM orders o
+    JOIN users u ON o.user_id = u.id
+    JOIN products p ON o.product_id = p.id
+    ORDER BY o.id;
+}
+expect {
+    Alice|Widget|9.99
+    Alice|Gadget|19.99
+    Bob|Widget|9.99
+}
+
+# Aggregation with joins
+@setup users
+@setup products
+@setup orders
+test order-totals-by-user {
+    SELECT u.name, SUM(p.price) as total
+    FROM orders o
+    JOIN users u ON o.user_id = u.id
+    JOIN products p ON o.product_id = p.id
+    GROUP BY u.id
+    ORDER BY total DESC;
+}
+expect {
+    Alice|29.98
+    Bob|9.99
+}
+
+# Left join with null handling
+@setup users
+@setup products
+@setup orders
+test users-without-orders {
+    INSERT INTO users VALUES (3, 'Charlie');
+    SELECT u.name, COUNT(o.id) as order_count
+    FROM users u
+    LEFT JOIN orders o ON u.id = o.user_id
+    GROUP BY u.id
+    ORDER BY u.name;
+}
+expect {
+    Alice|2
+    Bob|1
+    Charlie|0
+}
