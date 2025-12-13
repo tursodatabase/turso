@@ -366,7 +366,7 @@ pub fn translate_insert(
 
     program.preassign_label_to_next_insn(ctx.key_generation_label);
 
-    emit_rowid_generation(&mut program, resolver, &ctx, &insertion)?;
+    emit_rowid_generation(&mut program, &ctx, &insertion)?;
 
     program.preassign_label_to_next_insn(ctx.key_ready_for_uniqueness_check_label);
 
@@ -788,7 +788,6 @@ fn translate_rows_and_open_tables(
 
 fn emit_rowid_generation(
     program: &mut ProgramBuilder,
-    _resolver: &Resolver,
     ctx: &InsertEmitCtx,
     insertion: &Insertion,
 ) -> Result<()> {
