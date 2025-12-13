@@ -81,6 +81,12 @@ impl TursoSyncServer {
 - Implement simple non-chunked http/1.1 server - always respond with full Content-Length 
 - Use `application/protobuf` as content type for protobuf payloads
 - Format HTTP response only in one place - all internal functions must return either raw body (without headers and http preamble) or some Rust structs
+- Server must process one request at the time (`/v2/pipeline` or `/pull-updates`) in order to provide simple and safe concurrency guarantees
+    * Note, that you MUST hold the lock for the whole duration of request execution
+    * If you will drop lock guard soon - you will allow multiple connections to be processed at the same time
+    ```rs
+    let conn = { self.conn.lock().unwrap().clone() }; // this is wrong!
+    ```
 
 # Endpoints
 
