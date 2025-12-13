@@ -62,6 +62,14 @@ pub fn compare(actual: &QueryResult, expectation: &Expectation) -> ComparisonRes
     }
 }
 
+/// Normalize whitespace: collapse all whitespace sequences (spaces, tabs, newlines) into single spaces
+fn normalize_whitespace(s: &str) -> String {
+    s.split_whitespace()
+        .filter(|s| *s != "│")
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 /// Compare when expecting an error
 fn compare_error(actual: &QueryResult, expected_pattern: Option<&str>) -> ComparisonResult {
     match (&actual.error, expected_pattern) {
@@ -71,7 +79,10 @@ fn compare_error(actual: &QueryResult, expected_pattern: Option<&str>) -> Compar
             ComparisonResult::Match
         }
         (Some(err), Some(pattern)) => {
-            if err.contains(pattern) {
+            // Normalize whitespace in both error and pattern for flexible matching
+            let normalized_err = normalize_whitespace(err);
+            let normalized_pattern = normalize_whitespace(pattern);
+            if normalized_err.contains(&normalized_pattern) {
                 ComparisonResult::Match
             } else {
                 ComparisonResult::mismatch(format!(
