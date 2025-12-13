@@ -667,6 +667,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "similar"
+version = "2.7.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbbb5d9659141646ae647b42fe094daf6c6192d1620870b449d9557f748b2daa"
+
+[[package]]
 name = "slab"
 version = "0.4.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -782,6 +788,7 @@ dependencies = [
  "regex",
  "serde",
  "serde_json",
+ "similar",
  "tempfile",
  "thiserror",
  "tokio",
