@@ -1,0 +1,43 @@
+[package]
+name = "turso-test-runner"
+version = "0.1.0"
+edition = "2024"
+description = "SQL test runner for Turso/Limbo with custom DSL"
+license = "MIT"
+repository = "https://github.com/tursodatabase/turso"
+
+[[bin]]
+name = "turso-test-runner"
+path = "src/main.rs"
+
+[dependencies]
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Parsing
+logos = "0.16"
+regex = "1"
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+async-trait = "0.1"
+futures = "0.3"
+
+# Utilities
+tempfile = "3"
+thiserror = "2"
+anyhow = "1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Output formatting
+colored = "2"
+indicatif = "0.17"
+
+# File globbing
+glob = "0.3"
+
+[dev-dependencies]
+pretty_assertions = "1"
