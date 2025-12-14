@@ -114,7 +114,7 @@ impl Parser {
         self.expect_token(Token::Setup)?;
 
         let name = self.expect_identifier()?;
-        let content = self.expect_block_content()?;
+        let content = self.expect_block_content()?.trim().to_string();
 
         Ok((name, content))
     }
@@ -148,7 +148,7 @@ impl Parser {
         // Parse test
         self.expect_token(Token::Test)?;
         let (name, name_span) = self.expect_identifier_with_span()?;
-        let sql = self.expect_block_content()?;
+        let sql = self.expect_block_content()?.trim().to_string();
 
         self.skip_newlines_and_comments();
 
@@ -171,7 +171,7 @@ impl Parser {
         match self.peek() {
             Some(Token::Error) => {
                 self.advance();
-                let content = self.expect_block_content()?;
+                let content = self.expect_block_content()?.trim().to_string();
                 let pattern = if content.is_empty() {
                     None
                 } else {
@@ -181,7 +181,7 @@ impl Parser {
             }
             Some(Token::Pattern) => {
                 self.advance();
-                let content = self.expect_block_content()?;
+                let content = self.expect_block_content()?.trim().to_string();
                 Ok(Expectation::Pattern(content))
             }
             Some(Token::Unordered) => {
@@ -189,16 +189,28 @@ impl Parser {
                 let content = self.expect_block_content()?;
                 // Trim each line to handle indentation in expect blocks
                 let rows = content
+                    .trim()
                     .lines()
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
                     .collect();
                 Ok(Expectation::Unordered(rows))
             }
+            Some(Token::Raw) => {
+                self.advance();
+                let content = self.expect_block_content()?;
+                // Raw mode: preserve whitespace exactly, only split on newlines
+                // We still strip the leading/trailing newlines from the block itself
+                let content = content.strip_prefix('\n').unwrap_or(&content);
+                let content = content.strip_suffix('\n').unwrap_or(content);
+                let rows = content.lines().map(|s| s.to_string()).collect();
+                Ok(Expectation::Exact(rows))
+            }
             Some(Token::BlockContent(_)) => {
                 let content = self.expect_block_content()?;
                 // Trim each line to handle indentation in expect blocks
                 let rows = content
+                    .trim()
                     .lines()
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
@@ -300,9 +312,10 @@ impl Parser {
     }
 
     fn error(&self, message: String) -> ParseError {
-        let span = self.tokens.get(self.pos).map(|token| {
-            SourceSpan::new(token.span.start.into(), token.span.len())
-        });
+        let span = self
+            .tokens
+            .get(self.pos)
+            .map(|token| SourceSpan::new(token.span.start.into(), token.span.len()));
 
         ParseError::SyntaxError {
             message,
@@ -549,6 +562,48 @@ expect {
 
         let file = parse(input).unwrap();
         assert_eq!(file.tests[0].skip, Some("known bug".to_string()));
+    }
+
+    #[test]
+    fn test_parse_expect_raw() {
+        // Using explicit string to control whitespace precisely
+        // The content "  hello  " has 2 leading and 2 trailing spaces
+        let input = "@database :memory:\n\ntest select-spaces {\n    SELECT 1;\n}\nexpect raw {\n  hello  \n}\n";
+
+        let file = parse(input).unwrap();
+        // Raw mode preserves leading/trailing whitespace
+        assert!(matches!(
+            &file.tests[0].expectation,
+            Expectation::Exact(rows) if rows == &vec!["  hello  ".to_string()]
+        ));
+    }
+
+    #[test]
+    fn test_parse_expect_raw_vs_normal() {
+        // Normal mode trims whitespace
+        let input_normal = r#"
+@database :memory:
+
+test select-1 {
+    SELECT 1;
+}
+expect {
+    hello world
+}
+"#;
+        let file_normal = parse(input_normal).unwrap();
+        assert!(matches!(
+            &file_normal.tests[0].expectation,
+            Expectation::Exact(rows) if rows == &vec!["hello world".to_string()]
+        ));
+
+        // Raw mode preserves whitespace (4 leading spaces, 2 trailing)
+        let input_raw = "@database :memory:\n\ntest select-1 {\n    SELECT 1;\n}\nexpect raw {\n    hello world  \n}\n";
+        let file_raw = parse(input_raw).unwrap();
+        assert!(matches!(
+            &file_raw.tests[0].expectation,
+            Expectation::Exact(rows) if rows == &vec!["    hello world  ".to_string()]
+        ));
     }
 
     #[test]
