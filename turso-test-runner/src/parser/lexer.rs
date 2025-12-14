@@ -1,4 +1,5 @@
-use logos::{Logos, Lexer};
+use logos::{Lexer, Logos};
+use miette::{Diagnostic, SourceSpan};
 use std::fmt;
 
 /// Extract block content between braces, handling nested braces
@@ -155,15 +156,31 @@ pub fn tokenize(input: &str) -> Result<Vec<SpannedToken>, LexerError> {
             }
             Err(()) => {
                 let span = lexer.span();
+                let slice = input[span.clone()].to_string();
+                let help = suggest_fix(&slice);
                 return Err(LexerError::InvalidToken {
-                    span,
-                    slice: input[lexer.span()].to_string(),
+                    span: SourceSpan::new(span.start.into(), span.len()),
+                    slice,
+                    help,
                 });
             }
         }
     }
 
     Ok(tokens)
+}
+
+/// Suggest a fix for an invalid token
+fn suggest_fix(slice: &str) -> Option<String> {
+    if slice.starts_with('@') {
+        Some(format!(
+            "Valid directives are: @database, @setup, @skip. Did you mean one of these?"
+        ))
+    } else if slice.starts_with(':') {
+        Some("Database specifiers are :memory: or :temp:".to_string())
+    } else {
+        None
+    }
 }
 
 /// Calculate line and column from a byte offset
@@ -186,12 +203,16 @@ pub fn line_col(input: &str, offset: usize) -> (usize, usize) {
     (line, col)
 }
 
-#[derive(Debug, Clone, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error, Diagnostic)]
 pub enum LexerError {
-    #[error("invalid token at offset {}: '{slice}'", span.start)]
+    #[error("invalid token '{slice}'")]
+    #[diagnostic(code(sqltest::lexer::invalid_token))]
     InvalidToken {
-        span: std::ops::Range<usize>,
+        #[label("unrecognized token")]
+        span: SourceSpan,
         slice: String,
+        #[help]
+        help: Option<String>,
     },
 }
 

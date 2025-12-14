@@ -436,8 +436,8 @@ async fn run_single_test<B: SqlBackend>(
     };
 
     // Run setups (using execute_setup which buffers for memory databases)
-    for setup_name in &test.setups {
-        if let Some(setup_sql) = setups.get(setup_name) {
+    for setup_ref in &test.setups {
+        if let Some(setup_sql) = setups.get(&setup_ref.name) {
             if let Err(e) = db.execute_setup(setup_sql).await {
                 let _ = db.close().await;
                 return TestResult {
@@ -445,7 +445,7 @@ async fn run_single_test<B: SqlBackend>(
                     file: file_path,
                     database: db_config,
                     outcome: TestOutcome::Error {
-                        message: format!("setup '{}' failed: {}", setup_name, e),
+                        message: format!("setup '{}' failed: {}", setup_ref.name, e),
                     },
                     duration: start.elapsed(),
                 };
@@ -457,7 +457,7 @@ async fn run_single_test<B: SqlBackend>(
                 file: file_path,
                 database: db_config,
                 outcome: TestOutcome::Error {
-                    message: format!("setup '{}' not found", setup_name),
+                    message: format!("setup '{}' not found", setup_ref.name),
                 },
                 duration: start.elapsed(),
             };
