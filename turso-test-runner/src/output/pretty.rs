@@ -49,8 +49,7 @@ impl OutputFormat for PrettyOutput {
         }
 
         // Format duration
-        let duration_ms = result.duration.as_millis();
-        let duration_str = format!("({}ms)", duration_ms);
+        let duration_str = format!("({:.2?})", result.duration);
 
         // Print test result line (just status, no details yet)
         match &result.outcome {
@@ -143,7 +142,7 @@ impl OutputFormat for PrettyOutput {
         println!("  {}", parts.join(", "));
         println!(
             "  {}",
-            format!("Total time: {}ms", summary.duration.as_millis()).dimmed()
+            format!("Total time: {:.2?}", summary.duration).dimmed()
         );
 
         // Print overall status

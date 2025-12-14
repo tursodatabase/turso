@@ -1,11 +1,11 @@
 use clap::{Parser, Subcommand};
 use miette::{NamedSource, Report};
-use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
+use std::{path::PathBuf, time::Instant};
 use turso_test_runner::{
-    backends::cli::CliBackend, create_output, summarize, Format, OutputFormat, ParseError,
-    RunnerConfig, TestRunner,
+    Format, OutputFormat, ParseError, RunnerConfig, TestRunner, backends::cli::CliBackend,
+    create_output, summarize,
 };
 
 #[derive(Parser)]
@@ -102,6 +102,8 @@ async fn run_tests(
     // Create output formatter
     let mut output: Box<dyn OutputFormat> = create_output(format);
 
+    let start = Instant::now();
+
     // Run tests with streaming output
     let results = match runner
         .run_paths(&paths, |result| {
@@ -118,7 +120,7 @@ async fn run_tests(
     };
 
     // Write summary
-    let summary = summarize(&results);
+    let summary = summarize(start, &results);
     output.write_summary(&summary);
     output.flush();
 
@@ -204,7 +206,9 @@ fn check_single_file(path: &PathBuf) -> bool {
 
 fn print_parse_error(path: &PathBuf, content: &str, error: ParseError) {
     // Use miette for nice error display with source context
-    let report = Report::from(error)
-        .with_source_code(NamedSource::new(path.display().to_string(), content.to_string()));
+    let report = Report::from(error).with_source_code(NamedSource::new(
+        path.display().to_string(),
+        content.to_string(),
+    ));
     eprintln!("{:?}", report);
 }

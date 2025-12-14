@@ -3,7 +3,7 @@ mod executor;
 pub use executor::TestExecutor;
 
 use crate::backends::{BackendError, SqlBackend};
-use crate::comparison::{compare, ComparisonResult};
+use crate::comparison::{ComparisonResult, compare};
 use crate::parser::ast::{DatabaseConfig, TestCase, TestFile};
 use futures::stream::{FuturesUnordered, StreamExt};
 use std::path::{Path, PathBuf};
@@ -250,47 +250,25 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
                 let pattern = path.join("**/*.sqltest");
                 let pattern_str = pattern.to_string_lossy();
 
-                for entry in glob::glob(&pattern_str).map_err(|e| {
-                    BackendError::Execute(format!("invalid glob pattern: {}", e))
-                })? {
+                for entry in glob::glob(&pattern_str)
+                    .map_err(|e| BackendError::Execute(format!("invalid glob pattern: {}", e)))?
+                {
                     match entry {
-                        Ok(file_path) => {
-                            match std::fs::read_to_string(&file_path) {
-                                Ok(content) => match crate::parse(&content) {
-                                    Ok(test_file) => {
-                                        test_files.push((file_path, test_file));
-                                    }
-                                    Err(e) => {
-                                        let result = TestResult {
-                                            name: "parse".to_string(),
-                                            file: file_path.clone(),
-                                            database: DatabaseConfig {
-                                                location: crate::parser::ast::DatabaseLocation::Memory,
-                                                readonly: false,
-                                            },
-                                            outcome: TestOutcome::Error {
-                                                message: format!("parse error: {}", e),
-                                            },
-                                            duration: Duration::ZERO,
-                                        };
-                                        on_result(&result);
-                                        parse_errors.push(FileResult {
-                                            file: file_path,
-                                            results: vec![result],
-                                            duration: Duration::ZERO,
-                                        });
-                                    }
-                                },
+                        Ok(file_path) => match std::fs::read_to_string(&file_path) {
+                            Ok(content) => match crate::parse(&content) {
+                                Ok(test_file) => {
+                                    test_files.push((file_path, test_file));
+                                }
                                 Err(e) => {
                                     let result = TestResult {
-                                        name: "read".to_string(),
+                                        name: "parse".to_string(),
                                         file: file_path.clone(),
                                         database: DatabaseConfig {
                                             location: crate::parser::ast::DatabaseLocation::Memory,
                                             readonly: false,
                                         },
                                         outcome: TestOutcome::Error {
-                                            message: format!("read error: {}", e),
+                                            message: format!("parse error: {}", e),
                                         },
                                         duration: Duration::ZERO,
                                     };
@@ -301,8 +279,28 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
                                         duration: Duration::ZERO,
                                     });
                                 }
+                            },
+                            Err(e) => {
+                                let result = TestResult {
+                                    name: "read".to_string(),
+                                    file: file_path.clone(),
+                                    database: DatabaseConfig {
+                                        location: crate::parser::ast::DatabaseLocation::Memory,
+                                        readonly: false,
+                                    },
+                                    outcome: TestOutcome::Error {
+                                        message: format!("read error: {}", e),
+                                    },
+                                    duration: Duration::ZERO,
+                                };
+                                on_result(&result);
+                                parse_errors.push(FileResult {
+                                    file: file_path,
+                                    results: vec![result],
+                                    duration: Duration::ZERO,
+                                });
                             }
-                        }
+                        },
                         Err(e) => {
                             return Err(BackendError::Execute(format!("glob error: {}", e)));
                         }
@@ -394,10 +392,7 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
             // Call the callback with each result as it completes
             on_result(&test_result);
 
-            results_by_file
-                .entry(path)
-                .or_default()
-                .push(test_result);
+            results_by_file.entry(path).or_default().push(test_result);
         }
 
         // Convert to FileResults
@@ -532,7 +527,9 @@ fn matches_filter(name: &str, pattern: &str) -> bool {
             name.starts_with(prefix) && name.ends_with(suffix)
         } else {
             // Multiple * - just check contains for now
-            parts.iter().all(|part| part.is_empty() || name.contains(part))
+            parts
+                .iter()
+                .all(|part| part.is_empty() || name.contains(part))
         }
     } else {
         // Exact match
@@ -541,9 +538,8 @@ fn matches_filter(name: &str, pattern: &str) -> bool {
 }
 
 /// Compute summary from file results
-pub fn summarize(results: &[FileResult]) -> RunSummary {
+pub fn summarize(start: Instant, results: &[FileResult]) -> RunSummary {
     let mut summary = RunSummary::default();
-    let total_duration: Duration = results.iter().map(|r| r.duration).sum();
 
     for file_result in results {
         for test_result in &file_result.results {
@@ -551,7 +547,7 @@ pub fn summarize(results: &[FileResult]) -> RunSummary {
         }
     }
 
-    summary.duration = total_duration;
+    summary.duration = start.elapsed();
     summary
 }
 
