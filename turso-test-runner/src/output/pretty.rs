@@ -101,7 +101,7 @@ impl OutputFormat for PrettyOutput {
                 // Print test identifier
                 println!(
                     "{}",
-                    format!("── {} ({})", result.name, result.file.display()).red()
+                    format!("── {} ({}) - {}", result.name, result.file.display(), result.database.location).red()
                 );
 
                 // Print the failure details
