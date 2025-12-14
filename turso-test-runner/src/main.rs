@@ -99,22 +99,23 @@ async fn run_tests(
     // Create runner
     let runner = TestRunner::new(backend).with_config(config);
 
-    // Run tests
-    let results = match runner.run_paths(&paths).await {
+    // Create output formatter
+    let mut output: Box<dyn OutputFormat> = create_output(format);
+
+    // Run tests with streaming output
+    let results = match runner
+        .run_paths(&paths, |result| {
+            output.write_test(result);
+            output.flush();
+        })
+        .await
+    {
         Ok(r) => r,
         Err(e) => {
             eprintln!("Error running tests: {}", e);
             return ExitCode::from(1);
         }
     };
-
-    // Create output formatter
-    let mut output: Box<dyn OutputFormat> = create_output(format);
-
-    // Write results
-    for file_result in &results {
-        output.write_file(file_result);
-    }
 
     // Write summary
     let summary = summarize(&results);
