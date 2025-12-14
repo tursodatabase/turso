@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::ops::Range;
 use std::path::PathBuf;
 
 /// A complete test file parsed from `.sqltest` format
@@ -12,17 +13,28 @@ pub struct TestFile {
     pub tests: Vec<TestCase>,
 }
 
+/// A setup reference with its span in the source
+#[derive(Debug, Clone, PartialEq)]
+pub struct SetupRef {
+    /// Name of the setup
+    pub name: String,
+    /// Span of the @setup directive in the source (includes @setup and the name)
+    pub span: Range<usize>,
+}
+
 /// A single test case
 #[derive(Debug, Clone, PartialEq)]
 pub struct TestCase {
     /// Unique name for this test
     pub name: String,
+    /// Span of the test name in the source
+    pub name_span: Range<usize>,
     /// SQL to execute
     pub sql: String,
     /// Expected result
     pub expectation: Expectation,
-    /// Names of setups to apply before the test (in order)
-    pub setups: Vec<String>,
+    /// Setup references with their spans
+    pub setups: Vec<SetupRef>,
     /// If set, skip this test with the given reason
     pub skip: Option<String>,
 }

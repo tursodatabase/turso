@@ -1,10 +1,11 @@
 use clap::{Parser, Subcommand};
+use miette::{NamedSource, Report};
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 use turso_test_runner::{
-    backends::cli::CliBackend, create_output, summarize, Format, OutputFormat, RunnerConfig,
-    TestRunner,
+    backends::cli::CliBackend, create_output, summarize, Format, OutputFormat, ParseError,
+    RunnerConfig, TestRunner,
 };
 
 #[derive(Parser)]
@@ -189,7 +190,7 @@ fn check_single_file(path: &PathBuf) -> bool {
                 true
             }
             Err(e) => {
-                eprintln!("{} - ERROR: {}", path.display(), e);
+                print_parse_error(path, &content, e);
                 false
             }
         },
@@ -198,4 +199,11 @@ fn check_single_file(path: &PathBuf) -> bool {
             false
         }
     }
+}
+
+fn print_parse_error(path: &PathBuf, content: &str, error: ParseError) {
+    // Use miette for nice error display with source context
+    let report = Report::from(error)
+        .with_source_code(NamedSource::new(path.display().to_string(), content.to_string()));
+    eprintln!("{:?}", report);
 }

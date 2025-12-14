@@ -2,30 +2,27 @@ pub mod ast;
 pub mod lexer;
 
 use ast::*;
-use lexer::{SpannedToken, Token, line_col, tokenize};
+use lexer::{SpannedToken, Token, tokenize};
+use miette::{Diagnostic, SourceSpan};
 use std::collections::HashMap;
+use std::ops::Range;
 use std::path::PathBuf;
 
 /// Parse a `.sqltest` file from source
 pub fn parse(input: &str) -> Result<TestFile, ParseError> {
-    let tokens = tokenize(input).map_err(|e| ParseError::LexerError(e.to_string()))?;
-    let mut parser = Parser::new(input, tokens);
+    let tokens = tokenize(input)?;
+    let mut parser = Parser::new(tokens);
     parser.parse()
 }
 
-struct Parser<'a> {
-    input: &'a str,
+struct Parser {
     tokens: Vec<SpannedToken>,
     pos: usize,
 }
 
-impl<'a> Parser<'a> {
-    fn new(input: &'a str, tokens: Vec<SpannedToken>) -> Self {
-        Self {
-            input,
-            tokens,
-            pos: 0,
-        }
+impl Parser {
+    fn new(tokens: Vec<SpannedToken>) -> Self {
+        Self { tokens, pos: 0 }
     }
 
     fn parse(&mut self) -> Result<TestFile, ParseError> {
@@ -130,9 +127,13 @@ impl<'a> Parser<'a> {
         loop {
             match self.peek() {
                 Some(Token::AtSetup) => {
+                    let at_setup_span_start = self.current_span().start;
                     self.advance();
-                    let setup_name = self.expect_identifier()?;
-                    test_setups.push(setup_name);
+                    let (setup_name, name_span) = self.expect_identifier_with_span()?;
+                    test_setups.push(SetupRef {
+                        name: setup_name,
+                        span: at_setup_span_start..name_span.end,
+                    });
                     self.skip_newlines_and_comments();
                 }
                 Some(Token::AtSkip) => {
@@ -146,7 +147,7 @@ impl<'a> Parser<'a> {
 
         // Parse test
         self.expect_token(Token::Test)?;
-        let name = self.expect_identifier()?;
+        let (name, name_span) = self.expect_identifier_with_span()?;
         let sql = self.expect_block_content()?;
 
         self.skip_newlines_and_comments();
@@ -158,6 +159,7 @@ impl<'a> Parser<'a> {
 
         Ok(TestCase {
             name,
+            name_span,
             sql,
             expectation,
             setups: test_setups,
@@ -203,9 +205,9 @@ impl<'a> Parser<'a> {
                     .collect();
                 Ok(Expectation::Exact(rows))
             }
-            Some(token) => Err(self.error(format!(
-                "expected expect modifier or block, got {token}"
-            ))),
+            Some(token) => {
+                Err(self.error(format!("expected expect modifier or block, got {token}")))
+            }
             None => Err(self.error("expected expect block, got EOF".to_string())),
         }
     }
@@ -245,6 +247,19 @@ impl<'a> Parser<'a> {
         }
     }
 
+    fn expect_identifier_with_span(&mut self) -> Result<(String, Range<usize>), ParseError> {
+        match self.peek() {
+            Some(Token::Identifier(name)) => {
+                let name = name.clone();
+                let span = self.current_span();
+                self.advance();
+                Ok((name, span))
+            }
+            Some(token) => Err(self.error(format!("expected identifier, got {token}"))),
+            None => Err(self.error("expected identifier, got EOF".to_string())),
+        }
+    }
+
     fn expect_string(&mut self) -> Result<String, ParseError> {
         match self.peek() {
             Some(Token::String(s)) => {
@@ -259,6 +274,13 @@ impl<'a> Parser<'a> {
 
     fn peek(&self) -> Option<&Token> {
         self.tokens.get(self.pos).map(|t| &t.token)
+    }
+
+    fn current_span(&self) -> Range<usize> {
+        self.tokens
+            .get(self.pos)
+            .map(|t| t.span.clone())
+            .unwrap_or(0..0)
     }
 
     fn advance(&mut self) {
@@ -278,25 +300,28 @@ impl<'a> Parser<'a> {
     }
 
     fn error(&self, message: String) -> ParseError {
-        let (line, column) = if let Some(token) = self.tokens.get(self.pos) {
-            line_col(self.input, token.span.start)
-        } else {
-            (0, 0)
-        };
+        let span = self.tokens.get(self.pos).map(|token| {
+            SourceSpan::new(token.span.start.into(), token.span.len())
+        });
 
         ParseError::SyntaxError {
             message,
-            line,
-            column,
+            span,
+            help: None,
         }
     }
 
     fn validate(&self, file: &TestFile) -> Result<(), ParseError> {
         // Rule 1: At least one database required
         if file.databases.is_empty() {
-            return Err(ParseError::ValidationError(
-                "at least one @database declaration is required".to_string(),
-            ));
+            return Err(ParseError::ValidationError {
+                message: "at least one @database declaration is required".to_string(),
+                span: None,
+                help: Some(
+                    "Add a @database directive at the top of the file, e.g.: @database :memory:"
+                        .to_string(),
+                ),
+            });
         }
 
         // Rule 2: Cannot mix readonly and writable databases
@@ -304,59 +329,102 @@ impl<'a> Parser<'a> {
         let has_writable = file.databases.iter().any(|db| !db.readonly);
 
         if has_readonly && has_writable {
-            return Err(ParseError::ValidationError(
-                "cannot mix readonly and writable databases in the same file".to_string(),
-            ));
+            return Err(ParseError::ValidationError {
+                message: "cannot mix readonly and writable databases in the same file".to_string(),
+                span: None,
+                help: Some(
+                    "Use either all readonly databases or all writable databases".to_string(),
+                ),
+            });
         }
 
         // Rule 3: Setup blocks not allowed in readonly database files
         if has_readonly && !file.setups.is_empty() {
-            return Err(ParseError::ValidationError(
-                "setup blocks are not allowed in readonly database files".to_string(),
-            ));
+            return Err(ParseError::ValidationError {
+                message: "setup blocks are not allowed in readonly database files".to_string(),
+                span: None,
+                help: Some("Remove setup blocks or use a writable database".to_string()),
+            });
         }
 
         // Rule 4: All referenced setup names must exist
         for test in &file.tests {
-            for setup_name in &test.setups {
-                if !file.setups.contains_key(setup_name) {
-                    return Err(ParseError::ValidationError(format!(
-                        "test '{}' references undefined setup '{}'",
-                        test.name, setup_name
-                    )));
+            for setup_ref in &test.setups {
+                if !file.setups.contains_key(&setup_ref.name) {
+                    let available: Vec<_> = file.setups.keys().collect();
+                    let help = if available.is_empty() {
+                        "No setup blocks are defined in this file".to_string()
+                    } else {
+                        format!(
+                            "Available setups: {}",
+                            available
+                                .iter()
+                                .map(|s| s.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        )
+                    };
+                    return Err(ParseError::ValidationError {
+                        message: format!(
+                            "test '{}' references undefined setup '{}'",
+                            test.name, setup_ref.name
+                        ),
+                        span: Some(SourceSpan::new(
+                            setup_ref.span.start.into(),
+                            setup_ref.span.len(),
+                        )),
+                        help: Some(help),
+                    });
                 }
             }
         }
 
         // Rule 5: Test names must be unique
-        let mut seen_names = std::collections::HashSet::new();
+        let mut seen_names: std::collections::HashMap<&str, Range<usize>> =
+            std::collections::HashMap::new();
         for test in &file.tests {
-            if !seen_names.insert(&test.name) {
-                return Err(ParseError::ValidationError(format!(
-                    "duplicate test name: {}",
-                    test.name
-                )));
+            if let Some(first_span) = seen_names.get(test.name.as_str()) {
+                return Err(ParseError::ValidationError {
+                    message: format!("duplicate test name: {}", test.name),
+                    span: Some(SourceSpan::new(
+                        test.name_span.start.into(),
+                        test.name_span.len().into(),
+                    )),
+                    help: Some(format!("First defined at offset {}", first_span.start)),
+                });
             }
+            seen_names.insert(&test.name, test.name_span.clone());
         }
 
         Ok(())
     }
 }
 
-#[derive(Debug, Clone, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error, Diagnostic)]
 pub enum ParseError {
-    #[error("lexer error: {0}")]
-    LexerError(String),
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    LexerError(#[from] lexer::LexerError),
 
-    #[error("syntax error at line {line}, column {column}: {message}")]
+    #[error("{message}")]
+    #[diagnostic(code(sqltest::syntax))]
     SyntaxError {
         message: String,
-        line: usize,
-        column: usize,
+        #[label("here")]
+        span: Option<SourceSpan>,
+        #[help]
+        help: Option<String>,
     },
 
-    #[error("validation error: {0}")]
-    ValidationError(String),
+    #[error("{message}")]
+    #[diagnostic(code(sqltest::validation))]
+    ValidationError {
+        message: String,
+        #[label("here")]
+        span: Option<SourceSpan>,
+        #[help]
+        help: Option<String>,
+    },
 }
 
 #[cfg(test)]
@@ -403,7 +471,8 @@ expect {
         let file = parse(input).unwrap();
         assert_eq!(file.setups.len(), 1);
         assert!(file.setups.contains_key("users"));
-        assert_eq!(file.tests[0].setups, vec!["users"]);
+        assert_eq!(file.tests[0].setups.len(), 1);
+        assert_eq!(file.tests[0].setups[0].name, "users");
     }
 
     #[test]
@@ -494,7 +563,7 @@ expect {
 "#;
 
         let result = parse(input);
-        assert!(matches!(result, Err(ParseError::ValidationError(_))));
+        assert!(matches!(result, Err(ParseError::ValidationError { .. })));
     }
 
     #[test]
@@ -512,7 +581,7 @@ expect {
 "#;
 
         let result = parse(input);
-        assert!(matches!(result, Err(ParseError::ValidationError(_))));
+        assert!(matches!(result, Err(ParseError::ValidationError { .. })));
     }
 
     #[test]
@@ -533,7 +602,7 @@ expect {
 "#;
 
         let result = parse(input);
-        assert!(matches!(result, Err(ParseError::ValidationError(_))));
+        assert!(matches!(result, Err(ParseError::ValidationError { .. })));
     }
 
     #[test]
@@ -551,6 +620,6 @@ expect {
 "#;
 
         let result = parse(input);
-        assert!(matches!(result, Err(ParseError::ValidationError(_))));
+        assert!(matches!(result, Err(ParseError::ValidationError { .. })));
     }
 }
