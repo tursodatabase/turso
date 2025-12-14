@@ -41,7 +41,7 @@ enum Commands {
         output: String,
 
         /// Timeout per query in seconds
-        #[arg(long, default_value_t = 30)]
+        #[arg(long, default_value_t = 90)]
         timeout: u64,
     },
 

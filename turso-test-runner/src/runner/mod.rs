@@ -1,7 +1,3 @@
-mod executor;
-
-pub use executor::TestExecutor;
-
 use crate::backends::{BackendError, SqlBackend};
 use crate::comparison::{ComparisonResult, compare};
 use crate::parser::ast::{DatabaseConfig, TestCase, TestFile};
