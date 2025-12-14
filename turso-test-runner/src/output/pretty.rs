@@ -1,4 +1,4 @@
-use super::{outcome_symbol, OutputFormat};
+use super::{OutputFormat, outcome_symbol};
 use crate::runner::{FileResult, RunSummary, TestOutcome, TestResult};
 use colored::Colorize;
 use std::io::{self, Write};
@@ -6,11 +6,16 @@ use std::io::{self, Write};
 /// Pretty human-readable output
 pub struct PrettyOutput {
     current_file: Option<String>,
+    /// Store failed/error tests to print details at the end
+    failed_tests: Vec<TestResult>,
 }
 
 impl PrettyOutput {
     pub fn new() -> Self {
-        Self { current_file: None }
+        Self {
+            current_file: None,
+            failed_tests: Vec::new(),
+        }
     }
 
     fn outcome_colored(&self, outcome: &TestOutcome) -> colored::ColoredString {
@@ -47,33 +52,34 @@ impl OutputFormat for PrettyOutput {
         let duration_ms = result.duration.as_millis();
         let duration_str = format!("({}ms)", duration_ms);
 
-        // Print test result
-        print!(
-            "  [{}] {:<40} {}",
-            self.outcome_colored(&result.outcome),
-            result.name,
-            duration_str.dimmed()
-        );
-
-        // Print additional info for non-passing tests
+        // Print test result line (just status, no details yet)
         match &result.outcome {
             TestOutcome::Passed => {
-                println!();
+                println!(
+                    "  [{}] {:<40} {}",
+                    self.outcome_colored(&result.outcome),
+                    result.name,
+                    duration_str.dimmed()
+                );
             }
-            TestOutcome::Failed { reason } => {
-                println!();
-                for line in reason.lines() {
-                    println!("         {}", line.red());
-                }
+            TestOutcome::Failed { .. } | TestOutcome::Error { .. } => {
+                // Print status line, store for later detailed output
+                println!(
+                    "  [{}] {:<40} {}",
+                    self.outcome_colored(&result.outcome),
+                    result.name,
+                    duration_str.dimmed()
+                );
+                self.failed_tests.push(result.clone());
             }
             TestOutcome::Skipped { reason } => {
-                println!(" {}", format!("({})", reason).dimmed());
-            }
-            TestOutcome::Error { message } => {
-                println!();
-                for line in message.lines() {
-                    println!("         {}", line.red());
-                }
+                println!(
+                    "  [{}] {:<40} {} {}",
+                    self.outcome_colored(&result.outcome),
+                    result.name,
+                    duration_str.dimmed(),
+                    format!("({})", reason).dimmed()
+                );
             }
         }
     }
@@ -86,7 +92,37 @@ impl OutputFormat for PrettyOutput {
     }
 
     fn write_summary(&mut self, summary: &RunSummary) {
-        println!();
+        // Print failed test details at the end
+        if !self.failed_tests.is_empty() {
+            println!();
+            println!("{}", "Failures:".red().bold());
+            println!();
+
+            for result in &self.failed_tests {
+                // Print test identifier
+                println!(
+                    "{}",
+                    format!("── {} ({})", result.name, result.file.display()).red()
+                );
+
+                // Print the failure details
+                match &result.outcome {
+                    TestOutcome::Failed { reason } => {
+                        for line in reason.lines() {
+                            println!("   {}", line);
+                        }
+                    }
+                    TestOutcome::Error { message } => {
+                        for line in message.lines() {
+                            println!("   {}", line.red());
+                        }
+                    }
+                    _ => {}
+                }
+                println!();
+            }
+        }
+
         println!("{}", "Summary:".bold());
 
         let mut parts = Vec::new();

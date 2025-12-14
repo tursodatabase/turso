@@ -230,7 +230,15 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
     }
 
     /// Run tests from multiple paths (files or directories) - all in parallel
-    pub async fn run_paths(&self, paths: &[PathBuf]) -> Result<Vec<FileResult>, BackendError> {
+    /// The callback is called for each test result as it completes
+    pub async fn run_paths<F>(
+        &self,
+        paths: &[PathBuf],
+        mut on_result: F,
+    ) -> Result<Vec<FileResult>, BackendError>
+    where
+        F: FnMut(&TestResult),
+    {
         let start = Instant::now();
 
         // Collect all test files first
@@ -253,39 +261,43 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
                                         test_files.push((file_path, test_file));
                                     }
                                     Err(e) => {
-                                        parse_errors.push(FileResult {
+                                        let result = TestResult {
+                                            name: "parse".to_string(),
                                             file: file_path.clone(),
-                                            results: vec![TestResult {
-                                                name: "parse".to_string(),
-                                                file: file_path,
-                                                database: DatabaseConfig {
-                                                    location: crate::parser::ast::DatabaseLocation::Memory,
-                                                    readonly: false,
-                                                },
-                                                outcome: TestOutcome::Error {
-                                                    message: format!("parse error: {}", e),
-                                                },
-                                                duration: Duration::ZERO,
-                                            }],
-                                            duration: Duration::ZERO,
-                                        });
-                                    }
-                                },
-                                Err(e) => {
-                                    parse_errors.push(FileResult {
-                                        file: file_path.clone(),
-                                        results: vec![TestResult {
-                                            name: "read".to_string(),
-                                            file: file_path,
                                             database: DatabaseConfig {
                                                 location: crate::parser::ast::DatabaseLocation::Memory,
                                                 readonly: false,
                                             },
                                             outcome: TestOutcome::Error {
-                                                message: format!("read error: {}", e),
+                                                message: format!("parse error: {}", e),
                                             },
                                             duration: Duration::ZERO,
-                                        }],
+                                        };
+                                        on_result(&result);
+                                        parse_errors.push(FileResult {
+                                            file: file_path,
+                                            results: vec![result],
+                                            duration: Duration::ZERO,
+                                        });
+                                    }
+                                },
+                                Err(e) => {
+                                    let result = TestResult {
+                                        name: "read".to_string(),
+                                        file: file_path.clone(),
+                                        database: DatabaseConfig {
+                                            location: crate::parser::ast::DatabaseLocation::Memory,
+                                            readonly: false,
+                                        },
+                                        outcome: TestOutcome::Error {
+                                            message: format!("read error: {}", e),
+                                        },
+                                        duration: Duration::ZERO,
+                                    };
+                                    on_result(&result);
+                                    parse_errors.push(FileResult {
+                                        file: file_path,
+                                        results: vec![result],
                                         duration: Duration::ZERO,
                                     });
                                 }
@@ -303,39 +315,43 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
                             test_files.push((path.clone(), test_file));
                         }
                         Err(e) => {
-                            parse_errors.push(FileResult {
-                                file: path.clone(),
-                                results: vec![TestResult {
-                                    name: "parse".to_string(),
-                                    file: path.clone(),
-                                    database: DatabaseConfig {
-                                        location: crate::parser::ast::DatabaseLocation::Memory,
-                                        readonly: false,
-                                    },
-                                    outcome: TestOutcome::Error {
-                                        message: format!("parse error: {}", e),
-                                    },
-                                    duration: Duration::ZERO,
-                                }],
-                                duration: Duration::ZERO,
-                            });
-                        }
-                    },
-                    Err(e) => {
-                        parse_errors.push(FileResult {
-                            file: path.clone(),
-                            results: vec![TestResult {
-                                name: "read".to_string(),
+                            let result = TestResult {
+                                name: "parse".to_string(),
                                 file: path.clone(),
                                 database: DatabaseConfig {
                                     location: crate::parser::ast::DatabaseLocation::Memory,
                                     readonly: false,
                                 },
                                 outcome: TestOutcome::Error {
-                                    message: format!("read error: {}", e),
+                                    message: format!("parse error: {}", e),
                                 },
                                 duration: Duration::ZERO,
-                            }],
+                            };
+                            on_result(&result);
+                            parse_errors.push(FileResult {
+                                file: path.clone(),
+                                results: vec![result],
+                                duration: Duration::ZERO,
+                            });
+                        }
+                    },
+                    Err(e) => {
+                        let result = TestResult {
+                            name: "read".to_string(),
+                            file: path.clone(),
+                            database: DatabaseConfig {
+                                location: crate::parser::ast::DatabaseLocation::Memory,
+                                readonly: false,
+                            },
+                            outcome: TestOutcome::Error {
+                                message: format!("read error: {}", e),
+                            },
+                            duration: Duration::ZERO,
+                        };
+                        on_result(&result);
+                        parse_errors.push(FileResult {
+                            file: path.clone(),
+                            results: vec![result],
                             duration: Duration::ZERO,
                         });
                     }
@@ -374,6 +390,10 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
                     duration: Duration::ZERO,
                 },
             };
+
+            // Call the callback with each result as it completes
+            on_result(&test_result);
+
             results_by_file
                 .entry(path)
                 .or_default()
