@@ -2,6 +2,7 @@
 # Ported from testing/scalar-functions.test
 
 @database database/testing.db readonly
+@database database/testing_norowidalias.db readonly
 
 test typeof-sum-integer {
     SELECT typeof(sum(age)) from users;

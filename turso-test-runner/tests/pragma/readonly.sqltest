@@ -2,6 +2,7 @@
 # Ported from testing/pragma.test
 
 @database database/testing.db readonly
+@database database/testing_norowidalias.db readonly
 
 # Set cache size and check in same connection
 test pragma-set-cache-size {

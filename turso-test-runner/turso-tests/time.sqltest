@@ -2,6 +2,7 @@
 # Ported from testing/time.test
 
 @database database/testing.db readonly
+@database database/testing_norowidalias.db readonly
 
 # time_date function tests
 

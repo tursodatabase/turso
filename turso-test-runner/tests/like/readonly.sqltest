@@ -2,6 +2,7 @@
 # Ported from testing/like.test
 
 @database database/testing.db readonly
+@database database/testing_norowidalias.db readonly
 
 test like-fn {
     SELECT name, like('sweat%', name) FROM products;

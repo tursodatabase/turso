@@ -2,6 +2,7 @@
 # Ported from testing/coalesce.test
 
 @database database/testing.db readonly
+@database database/testing_norowidalias.db readonly
 
 test coalesce-from-table {
     SELECT coalesce(NULL, 1) FROM users LIMIT 1;

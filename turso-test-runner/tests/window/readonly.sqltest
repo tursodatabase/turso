@@ -2,6 +2,7 @@
 # Ported from testing/window.test
 
 @database database/testing.db readonly
+@database database/testing_norowidalias.db readonly
 
 # Basic partition by
 test window-partition-by {

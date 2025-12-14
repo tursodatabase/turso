@@ -2,6 +2,7 @@
 # Ported from testing/math.test
 
 @database database/testing.db readonly
+@database database/testing_norowidalias.db readonly
 
 test add-agg-int {
     SELECT sum(id) + 10 FROM products;

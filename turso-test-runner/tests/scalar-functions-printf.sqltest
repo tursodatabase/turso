@@ -2,6 +2,7 @@
 # Ported from testing/scalar-functions-printf.test
 
 @database database/testing.db readonly
+@database database/testing_norowidalias.db readonly
 
 # Basic string formatting
 

@@ -2,6 +2,7 @@
 # Ported from testing/concat.test
 
 @database database/testing.db readonly
+@database database/testing_norowidalias.db readonly
 
 test concat-from-table {
     SELECT 'A good ' || name FROM products WHERE name = 'hat';

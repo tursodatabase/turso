@@ -2,6 +2,7 @@
 # Ported from testing/select.test
 
 @database database/testing.db readonly
+@database database/testing_norowidalias.db readonly
 
 test select-const-1 {
     SELECT 1;

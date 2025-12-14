@@ -2,6 +2,7 @@
 # Ported from testing/glob.test
 
 @database database/testing.db readonly
+@database database/testing_norowidalias.db readonly
 
 test glob-fn {
     SELECT name, glob('sweat*', name) FROM products;

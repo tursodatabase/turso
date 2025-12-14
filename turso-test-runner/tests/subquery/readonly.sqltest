@@ -2,6 +2,7 @@
 # Ported from testing/subquery.test
 
 @database database/testing.db readonly
+@database database/testing_norowidalias.db readonly
 
 test subquery-inner-filter {
     select sub.loud_hat from (

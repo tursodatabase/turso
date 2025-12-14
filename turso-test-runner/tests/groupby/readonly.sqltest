@@ -2,6 +2,7 @@
 # Ported from testing/groupby.test
 
 @database database/testing.db readonly
+@database database/testing_norowidalias.db readonly
 
 test group_by {
     SELECT u.first_name, sum(u.age) FROM users u GROUP BY u.first_name LIMIT 10;

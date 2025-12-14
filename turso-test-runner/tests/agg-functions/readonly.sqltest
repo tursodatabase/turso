@@ -2,6 +2,7 @@
 # Ported from testing/agg-functions.test
 
 @database database/testing.db readonly
+@database database/testing_norowidalias.db readonly
 
 test select-avg {
     SELECT avg(age) FROM users;

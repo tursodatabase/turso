@@ -2,6 +2,7 @@
 # Ported from testing/orderby.test
 
 @database database/testing.db readonly
+@database database/testing_norowidalias.db readonly
 
 test basic-order-by-asc {
     SELECT * FROM products ORDER BY price;

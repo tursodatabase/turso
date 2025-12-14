@@ -2,6 +2,7 @@
 # Ported from testing/offset.test
 
 @database database/testing.db readonly
+@database database/testing_norowidalias.db readonly
 
 test select-offset-0 {
     SELECT id FROM users ORDER BY id LIMIT 1 OFFSET 0;

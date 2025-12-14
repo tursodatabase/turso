@@ -2,6 +2,7 @@
 # Ported from testing/vector.test
 
 @database database/testing.db readonly
+@database database/testing_norowidalias.db readonly
 
 # Vector functions valid
 test vector-functions-valid {

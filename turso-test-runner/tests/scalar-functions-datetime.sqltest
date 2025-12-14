@@ -2,6 +2,7 @@
 # Ported from testing/scalar-functions-datetime.test
 
 @database database/testing.db readonly
+@database database/testing_norowidalias.db readonly
 
 # Date function tests
 

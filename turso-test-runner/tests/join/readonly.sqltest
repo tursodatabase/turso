@@ -2,6 +2,7 @@
 # Ported from testing/join.test
 
 @database database/testing.db readonly
+@database database/testing_norowidalias.db readonly
 
 test cross-join {
     select * from users, products limit 1;
