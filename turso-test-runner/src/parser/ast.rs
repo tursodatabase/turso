@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt::Display;
 use std::ops::Range;
 use std::path::PathBuf;
 
@@ -80,6 +81,16 @@ impl DatabaseConfig {
                 self.location,
                 DatabaseLocation::Memory | DatabaseLocation::TempFile
             )
+    }
+}
+
+impl Display for DatabaseLocation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DatabaseLocation::Memory => f.write_str(":memory:"),
+            DatabaseLocation::TempFile => f.write_str(":temp:"),
+            DatabaseLocation::Path(path_buf) => write!(f, "{}", path_buf.display()),
+        }
     }
 }
 
