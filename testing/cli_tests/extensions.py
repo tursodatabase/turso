@@ -176,6 +176,25 @@ def test_aggregates():
     )
     turso.run_test_fn("SELECT percentile_cont(value, 0.25) from test;", validate_percentile1)
     turso.run_test_fn("SELECT percentile_disc(value, 0.55) from test;", validate_percentile_disc)
+
+    turso.run_test_fn(
+        "SELECT stddev(value) from test;", lambda res: res == "21.6024689946929", "stddev aggregate works on test table"
+    )
+    turso.run_test_fn(
+        "select stddev(value) from numbers;",
+        lambda res: res == "2.44948974278318",
+        "stddev aggregate works on numbers table",
+    )
+    turso.run_test_fn(
+        "select stddev(value) from (select value from test limit 1);",
+        null,
+        "stddev returns null with < 2 rows",
+    )
+    turso.run_test_fn(
+        "select stddev(percent) from (select percent from test limit 2);",
+        lambda res: res == "0.0",
+        "stddev aggregate works on 2 rows",
+    )
     turso.quit()
 
 
@@ -213,6 +232,11 @@ def test_grouped_aggregates():
         "SELECT percentile_disc(value, 0.55) FROM test GROUP BY category;",
         lambda res: "10.0\n30.0\n50.0\n70.0" == res,
         "grouped aggregate percentile_disc function works",
+    )
+    turso.run_test_fn(
+        "SELECT stddev(value) FROM test GROUP BY category HAVING COUNT(*) >= 2 ORDER BY category;",
+        lambda res: res == "7.07106781186548\n10.0",
+        "grouped stddev aggregate function works",
     )
     turso.quit()
 
