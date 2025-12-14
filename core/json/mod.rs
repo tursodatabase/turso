@@ -629,12 +629,10 @@ fn json_path_from_db_value<'a>(
     let path = path.as_value_ref();
     let json_path = if strict {
         match path {
-            ValueRef::Text(t) => {
-                match json_path(t.as_str()) {
-                    Ok(p) => p,
-                    Err(_) => return Ok(None),
-                }
-            }
+            ValueRef::Text(t) => match json_path(t.as_str()) {
+                Ok(p) => p,
+                Err(_) => return Ok(None),
+            },
             ValueRef::Null => return Ok(None),
             _ => crate::bail_constraint_error!("JSON path error near: {:?}", path.to_string()),
         }
