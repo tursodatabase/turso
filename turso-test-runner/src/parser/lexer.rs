@@ -3,6 +3,7 @@ use miette::{Diagnostic, SourceSpan};
 use std::fmt;
 
 /// Extract block content between braces, handling nested braces
+/// Note: Does NOT trim content - trimming is handled by the parser based on context
 fn extract_block_content(lexer: &mut Lexer<'_, Token>) -> Option<String> {
     let remainder = lexer.remainder();
     let mut depth = 1;
@@ -13,7 +14,7 @@ fn extract_block_content(lexer: &mut Lexer<'_, Token>) -> Option<String> {
             '}' => {
                 depth -= 1;
                 if depth == 0 {
-                    let content = remainder[..idx].trim().to_string();
+                    let content = remainder[..idx].to_string();
                     // Bump past the content and the closing brace
                     lexer.bump(idx + 1);
                     return Some(content);
@@ -66,6 +67,10 @@ pub enum Token {
     /// `unordered` modifier
     #[token("unordered")]
     Unordered,
+
+    /// `raw` modifier (preserves whitespace in expect blocks)
+    #[token("raw")]
+    Raw,
 
     /// `readonly` modifier
     #[token("readonly")]
@@ -121,6 +126,7 @@ impl fmt::Display for Token {
             Token::Error => write!(f, "error"),
             Token::Pattern => write!(f, "pattern"),
             Token::Unordered => write!(f, "unordered"),
+            Token::Raw => write!(f, "raw"),
             Token::Readonly => write!(f, "readonly"),
             Token::Memory => write!(f, ":memory:"),
             Token::TempFile => write!(f, ":temp:"),
@@ -259,9 +265,10 @@ mod tests {
         assert_eq!(tokens.len(), 3);
         assert_eq!(tokens[0].token, Token::Setup);
         assert_eq!(tokens[1].token, Token::Identifier("users".to_string()));
+        // Block content is not trimmed by the lexer (parser handles trimming)
         assert_eq!(
             tokens[2].token,
-            Token::BlockContent("CREATE TABLE users (id INTEGER);".to_string())
+            Token::BlockContent(" CREATE TABLE users (id INTEGER); ".to_string())
         );
     }
 
@@ -287,9 +294,10 @@ mod tests {
             non_newline[5].token,
             Token::Identifier("select-1".to_string())
         );
+        // Block content is not trimmed by the lexer (parser handles trimming)
         assert_eq!(
             non_newline[6].token,
-            Token::BlockContent("SELECT 1;".to_string())
+            Token::BlockContent(" SELECT 1; ".to_string())
         );
     }
 
@@ -298,9 +306,10 @@ mod tests {
         let tokens = tokenize("expect error { no such table }").unwrap();
         assert_eq!(tokens[0].token, Token::Expect);
         assert_eq!(tokens[1].token, Token::Error);
+        // Block content is not trimmed by the lexer (parser handles trimming)
         assert_eq!(
             tokens[2].token,
-            Token::BlockContent("no such table".to_string())
+            Token::BlockContent(" no such table ".to_string())
         );
 
         let tokens = tokenize("expect pattern { ^\\d+$ }").unwrap();
@@ -318,9 +327,10 @@ mod tests {
         assert_eq!(tokens[0].token, Token::Test);
         assert_eq!(tokens[1].token, Token::Identifier("nested".to_string()));
         // The json_object call has parens but no braces, should work fine
+        // Block content is not trimmed by the lexer (parser handles trimming)
         assert_eq!(
             tokens[2].token,
-            Token::BlockContent("SELECT json_object('a', 1);".to_string())
+            Token::BlockContent(" SELECT json_object('a', 1); ".to_string())
         );
     }
 
