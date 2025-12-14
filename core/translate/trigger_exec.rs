@@ -178,32 +178,6 @@ fn rewrite_trigger_expr_for_subprogram(
                     }
                 }
 
-                // Handle unqualified column references - they refer to NEW if available, else OLD
-                if let Some((idx, _)) = table.get_column(&col) {
-                    if let Some(new_params) = &ctx.new_param_map {
-                        if idx < new_params.len() {
-                            *e = Expr::Variable(format!(
-                                "{}",
-                                ctx.get_new_param(idx)
-                                    .expect("NEW parameters must be provided")
-                                    .get()
-                            ));
-                            return Ok(WalkControl::Continue);
-                        }
-                    }
-                    if let Some(old_params) = &ctx.old_param_map {
-                        if idx < old_params.len() {
-                            *e = Expr::Variable(format!(
-                                "{}",
-                                ctx.get_old_param(idx)
-                                    .expect("OLD parameters must be provided")
-                                    .get()
-                            ));
-                            return Ok(WalkControl::Continue);
-                        }
-                    }
-                }
-
                 Ok(WalkControl::Continue)
             }
             _ => Ok(WalkControl::Continue),
