@@ -170,8 +170,8 @@ expect {
 test printf-char-empty-string {
     SELECT printf('character: %c', '');
 }
-expect {
-    character:
+expect raw {
+character: 
 }
 
 test printf-char-from-integer {

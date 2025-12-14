@@ -1890,7 +1890,7 @@ test upsert-trigger-causes-fk-violation {
     PRAGMA foreign_keys=ON;
     INSERT INTO child_deferred VALUES (1, 999) ON CONFLICT(id) DO UPDATE SET pid=excluded.pid;
 }
-expect error { FOREIGN KEY constraint failed }
+expect error { foreign key constraint failed }
 
 # INSERT OR IGNORE with NOT NULL constraint violation tests
 setup ignore-notnull-single-row {

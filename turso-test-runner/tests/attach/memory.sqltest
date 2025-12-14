@@ -4,11 +4,6 @@
 @database :memory:
 
 # Query attached file database
-setup attach-db-query {
-    SELECT 1;
-}
-
-@setup attach-db-query
 test attach-db-query {
     ATTACH DATABASE "database/testing_small.db" AS small;
     SELECT value FROM small.demo where id = 1;
@@ -18,11 +13,6 @@ expect {
 }
 
 # Detach database
-setup detach-database {
-    SELECT 1;
-}
-
-@setup detach-database
 test detach-database {
     ATTACH DATABASE "database/testing_small.db" AS small;
     DETACH DATABASE small;
@@ -44,11 +34,6 @@ test detach-non-existent {
 expect error { no such database }
 
 # Attach in-memory database
-setup attach-memory-database {
-    SELECT 1;
-}
-
-@setup attach-memory-database
 test attach-memory-database {
     ATTACH DATABASE ':memory:' AS mem;
     pragma database_list;
@@ -59,11 +44,6 @@ expect {
 }
 
 # Cross-database join
-setup attach-cross-database-join {
-    SELECT 1;
-}
-
-@setup attach-cross-database-join
 test attach-cross-database-join {
     ATTACH DATABASE "database/testing_small.db" as small;
     create table joiners (id int, otherid int);

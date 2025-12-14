@@ -120,11 +120,6 @@ expect {
 }
 
 # Schema change rollback
-setup schema-change-rollback {
-    SELECT 1;
-}
-
-@setup schema-change-rollback
 test schema-change-rollback {
     begin;
     create table t (x);
@@ -137,11 +132,6 @@ expect {
 }
 
 # Schema change rollback version
-setup schema-change-rollback-version {
-    SELECT 1;
-}
-
-@setup schema-change-rollback-version
 test schema-change-rollback-version {
     begin;
     create table t (x);
@@ -154,11 +144,6 @@ expect {
 }
 
 # Schema version after update
-setup schema-version-after-update {
-    SELECT 1;
-}
-
-@setup schema-version-after-update
 test schema-version-after-update {
     create table t (x);
     PRAGMA schema_version;
@@ -167,12 +152,6 @@ expect {
     1
 }
 
-# Schema change rollback 2
-setup schema-change-rollback-2 {
-    SELECT 1;
-}
-
-@setup schema-change-rollback-2
 test schema-change-rollback-2 {
     begin;
     create table t (x);

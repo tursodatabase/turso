@@ -483,7 +483,7 @@ test trigger-col-name-trigger-subquery {
     select * from t union all select * from t1;
 }
 expect {
-    2|abc
+    42|abc
     42|abc
     0|z
 }

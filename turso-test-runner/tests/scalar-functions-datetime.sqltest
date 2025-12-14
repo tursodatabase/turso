@@ -907,8 +907,8 @@ expect {
 test strftime-day-without-leading-zero-2 {
     SELECT strftime('%e', '2025-01-02T13:10:30.567');
 }
-expect {
-     2
+expect raw {
+ 2
 }
 
 test strftime-fractional-seconds {
@@ -977,15 +977,15 @@ expect {
 test strftime-hour-without-leading-zero-2 {
     SELECT strftime('%k', '2025-01-23T02:10:30.567');
 }
-expect {
-     2
+expect raw {
+ 2
 }
 
 test strftime-hour-12-hour-clock-without-leading-zero-2 {
     SELECT strftime('%l', '2025-01-23T13:10:30.567');
 }
-expect {
-     1
+expect raw {
+ 1
 }
 
 test strftime-month {

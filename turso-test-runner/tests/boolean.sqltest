@@ -172,14 +172,14 @@ expect {
     1
 }
 
-test boolean-and-int-0.0 {
+test boolean-and-int-0-float {
     SELECT 20 AND 0.0;
 }
 expect {
     0
 }
 
-test boolean-and-0.0-0.0 {
+test boolean-and-0-float-0-float {
     SELECT 0.0 AND 0.0;
 }
 expect {
@@ -247,7 +247,7 @@ test boolean-and-1-null {
 expect {
 }
 
-test boolean-and-1.0-null {
+test boolean-and-1-float-null {
     SELECT 1.0 AND NULL;
 }
 expect {
@@ -274,14 +274,14 @@ expect {
     0
 }
 
-test boolean-and-0.0-null {
+test boolean-and-0-float-null {
     SELECT 0.0 AND NULL;
 }
 expect {
     0
 }
 
-test boolean-and-text-0.0-null {
+test boolean-and-text-0-float-null {
     SELECT '0.0' AND NULL;
 }
 expect {

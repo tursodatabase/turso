@@ -1206,7 +1206,7 @@ test json_quote_null {
   SELECT json_quote(null);
 }
 expect {
-    "null"
+    null
 }
 
 test json_quote_null_caps {

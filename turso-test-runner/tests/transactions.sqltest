@@ -1,7 +1,7 @@
 # Transaction Tests
 # Ported from testing/transactions.test
 
-@database database/testing.db readonly
+@database :memory:
 
 # Basic transaction IMMEDIATE
 test basic-tx-1 {

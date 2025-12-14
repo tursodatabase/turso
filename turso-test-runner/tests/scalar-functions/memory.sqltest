@@ -603,8 +603,8 @@ expect {
 test ltrim {
     SELECT ltrim('   Limbo    ');
 }
-expect {
-    Limbo
+expect raw {
+Limbo    
 }
 
 test ltrim-number {
@@ -663,8 +663,8 @@ expect {
 test rtrim {
     SELECT rtrim('   Limbo    ');
 }
-expect {
-       Limbo
+expect raw {
+   Limbo
 }
 
 test rtrim-number {

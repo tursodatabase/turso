@@ -79,11 +79,6 @@ expect {
 }
 
 # ANALYZE one database
-setup analyze-one-database {
-    SELECT 1;
-}
-
-@setup analyze-one-database
 test analyze-one-database {
     ANALYZE main;
 }

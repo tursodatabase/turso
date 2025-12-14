@@ -1092,8 +1092,8 @@ test collate-compound-9 {
     INTERSECT
     SELECT 'abc' COLLATE RTRIM;
 }
-expect {
-    abc
+expect raw {
+abc  
 }
 
 setup collate-compound-table-10 {
@@ -1450,11 +1450,6 @@ expect {
     0|0
 }
 
-setup compound-headers-table {
-    CREATE TABLE t(x);
-}
-
-@setup compound-headers-table
 test values-select-empty-db {
     values (1) intersect values (1);
 }
@@ -1462,7 +1457,6 @@ expect {
     1
 }
 
-@setup compound-headers-table
 test select-sqlite-schema-empty-db {
     select group_concat(name) over () from sqlite_schema;
 }
