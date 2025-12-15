@@ -5832,6 +5832,65 @@ pub fn op_function(
                                     Some(new_stmt.to_string())
                                 }
                             }
+                            ast::Stmt::CreateTrigger {
+                                temporary,
+                                if_not_exists,
+                                trigger_name,
+                                time,
+                                event,
+                                mut tbl_name,
+                                for_each_row,
+                                when_clause,
+                                mut commands,
+                            } => {
+                                // when renaming a table,we need to update table names inside trigger too
+                                let mut changed = false;
+
+                                if normalize_ident(tbl_name.name.as_str()) == rename_from {
+                                    tbl_name.name = Name::from_string(format!(
+                                        "\"{}\"",
+                                        original_rename_to
+                                    ));
+                                    changed = true;
+                                }
+
+                                
+                                for cmd in &mut commands {
+                                    match cmd {
+                                        ast::TriggerCmd::Update { tbl_name, .. }
+                                        | ast::TriggerCmd::Insert { tbl_name, .. }
+                                        | ast::TriggerCmd::Delete { tbl_name, .. } => {
+                                            if normalize_ident(tbl_name.as_str()) == rename_from {
+                                                *tbl_name = Name::from_string(format!(
+                                                    "\"{}\"",
+                                                    original_rename_to
+                                                ));
+                                                changed = true;
+                                            }
+                                        }
+                                        ast::TriggerCmd::Select(_) => {}
+                                    }
+                                }
+
+                                if changed {
+                                    Some(
+                                        ast::Stmt::CreateTrigger {
+                                            temporary,
+                                            if_not_exists,
+                                            trigger_name,
+                                            time,
+                                            event,
+                                            tbl_name,
+                                            for_each_row,
+                                            when_clause,
+                                            commands,
+                                        }
+                                        .to_string(),
+                                    )
+                                } else {
+                                    None
+                                }
+                            }
                             _ => None,
                         }
                     };
