@@ -74,6 +74,10 @@ pub struct Opts {
         default_value_t = 5000
     )]
     pub busy_timeout: u64,
+
+    /// Random seed for reproducibility
+    #[clap(long, help = "Random seed for reproducibility")]
+    pub seed: Option<u64>,
 }
 
 const fn normal_or_miri<T: Copy>(normal_val: T, miri_val: T) -> T {
