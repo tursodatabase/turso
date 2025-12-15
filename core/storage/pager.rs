@@ -2311,7 +2311,7 @@ impl Pager {
                         )));
                     }
 
-                    let (page, _c) = match page.take() {
+                    let (page, c) = match page.take() {
                         Some(page) => {
                             assert_eq!(
                                 page.get().id,
@@ -2326,10 +2326,7 @@ impl Pager {
                             }
                             (page, None)
                         }
-                        None => {
-                            let (page, c) = self.read_page(page_id as i64)?;
-                            (page, Some(c))
-                        }
+                        None => self.read_page(page_id as i64)?,
                     };
                     header.freelist_pages = (header.freelist_pages.get() + 1).into();
 
@@ -2339,6 +2336,11 @@ impl Pager {
                         *state = FreePageState::AddToTrunk { page };
                     } else {
                         *state = FreePageState::NewTrunk { page };
+                    }
+                    if let Some(c) = c {
+                        if !c.succeeded() {
+                            io_yield_one!(c);
+                        }
                     }
                 }
                 FreePageState::AddToTrunk { page } => {
