@@ -35,5 +35,6 @@ pub fn translate_integrity_check(
         start_reg: message_register,
         count: 1,
     });
+    program.add_pragma_result_column("integrity_check".into());
     Ok(())
 }
