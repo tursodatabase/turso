@@ -835,3 +835,12 @@ do_execsql_test_on_specific_db {:memory:} trigger-rename-table-qualified-refs {
   ALTER TABLE t1 RENAME TO t1_new;
   SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='trg2';
 } {CREATE TRIGGER trg2 AFTER UPDATE ON "t1_new" WHEN "t1_new".id > 5 BEGIN UPDATE "t1_new" SET val = 'updated' WHERE "t1_new".id = NEW.id; END}
+
+do_execsql_test_on_specific_db {:memory:} trigger-rename-upsert-clause {
+  CREATE TABLE t1 (id INT PRIMARY KEY, val TEXT);
+  CREATE TRIGGER trg3 AFTER INSERT ON t1 BEGIN
+    INSERT INTO t1 VALUES (100, 'x') ON CONFLICT(id) DO UPDATE SET val = t1.val || 'conflict';
+  END;
+  ALTER TABLE t1 RENAME TO t1_new;
+  SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='trg3';
+} {CREATE TRIGGER trg3 AFTER INSERT ON "t1_new" BEGIN INSERT INTO "t1_new" VALUES(100, 'x') ON CONFLICT (id) DO UPDATE SET val = "t1_new".val || 'conflict'; END}

@@ -5905,7 +5905,7 @@ pub fn op_function(
                                             }
                                         }
                                         ast::TriggerCmd::Insert {
-                                            tbl_name, select, ..
+                                            tbl_name, select, upsert, ..
                                         } => {
                                             if normalize_ident(tbl_name.as_str()) == rename_from {
                                                 *tbl_name = Name::from_string(format!(
@@ -5918,6 +5918,33 @@ pub fn op_function(
                                                 changed |= crate::translate::alter::rewrite_expr_table_refs_for_rename(
                                                     &mut sorted.expr, &rename_from, original_rename_to.as_str()
                                                 );
+                                            }
+                                            
+                                            if let Some(ref mut upsert_clause) = upsert {
+                                                fn walk_upsert(
+                                                    u: &mut ast::Upsert,
+                                                    rename_from: &str,
+                                                    new_name: &str,
+                                                ) -> bool {
+                                                    let mut changed = false;
+                                                    if let ast::UpsertDo::Set { sets, where_clause } = &mut u.do_clause {
+                                                        for set in sets {
+                                                            changed |= crate::translate::alter::rewrite_expr_table_refs_for_rename(
+                                                                &mut set.expr, rename_from, new_name
+                                                            );
+                                                        }
+                                                        if let Some(ref mut where_expr) = where_clause {
+                                                            changed |= crate::translate::alter::rewrite_expr_table_refs_for_rename(
+                                                                where_expr, rename_from, new_name
+                                                            );
+                                                        }
+                                                    }
+                                                    if let Some(ref mut next) = u.next {
+                                                        changed |= walk_upsert(next, rename_from, new_name);
+                                                    }
+                                                    changed
+                                                }
+                                                changed |= walk_upsert(upsert_clause, &rename_from, original_rename_to.as_str());
                                             }
                                         }
                                         ast::TriggerCmd::Delete {
