@@ -6968,6 +6968,33 @@ pub fn op_new_rowid(
     insn: &Insn,
     pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    new_rowid_inner(program, state, insn, pager).inspect_err(|_| {
+        // In case of error we need to unlock rowid lock from mvcc cursor
+        load_insn!(
+            NewRowid {
+                cursor,
+                rowid_reg,
+                prev_largest_reg,
+            },
+            insn
+        );
+        let mv_store = program.connection.mv_store();
+        if let Some(mv_store) = mv_store.as_ref() {
+            let cursor = state.get_cursor(*cursor);
+            let cursor = cursor.as_btree_mut() as &mut dyn Any;
+            if let Some(mvcc_cursor) = cursor.downcast_mut::<MvCursor>() {
+                mvcc_cursor.end_new_rowid();
+            }
+        }
+    })
+}
+
+fn new_rowid_inner(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
     load_insn!(
         NewRowid {
             cursor,
@@ -6977,43 +7004,30 @@ pub fn op_new_rowid(
         insn
     );
 
-    let mv_store = program.connection.mv_store();
-    'mvcc_newrowid: {
-        if let Some(mv_store) = mv_store.as_ref() {
-            // With MVCC we can't simply find last rowid and get rowid + 1 as a result. To not have two conflicting rowids concurrently we need to call `get_next_rowid`
-            // which will make sure we don't collide.
-            let (rowid, current_max) = {
-                let cursor = state.get_cursor(*cursor);
-                let cursor = cursor.as_btree_mut() as &mut dyn Any;
-                let Some(mvcc_cursor) = cursor.downcast_mut::<MvCursor>() else {
-                    // Not an MvCursor - must be an ephemeral cursor (indicated by lack of WAL)
-                    let Some(ephemeral_cursor) = cursor.downcast_mut::<BTreeCursor>() else {
-                        panic!("Expected MvCursor or BTreeCursor in op_new_rowid");
-                    };
-                    turso_assert!(
-                        ephemeral_cursor.pager.wal.is_none(),
-                        "MVCC is enabled but got a non-ephemeral BTreeCursor"
-                    );
-                    break 'mvcc_newrowid;
-                };
-                return_if_io!(mvcc_cursor.get_next_rowid())
-            };
-            state.registers[*rowid_reg] = Register::Value(Value::Integer(rowid));
-            if *prev_largest_reg > 0 {
-                state.registers[*prev_largest_reg] = Register::Value(Value::Integer(current_max));
-            }
-            state.pc += 1;
-            return Ok(InsnFunctionStepResult::Step);
-        }
-    }
-
     const MAX_ROWID: i64 = i64::MAX;
     const MAX_ATTEMPTS: u32 = 100;
-
+    let mv_store = program.connection.mv_store();
     loop {
         match state.op_new_rowid_state {
             OpNewRowidState::Start => {
                 state.op_new_rowid_state = OpNewRowidState::SeekingToLast;
+
+                if let Some(mv_store) = mv_store.as_ref() {
+                    let cursor = state.get_cursor(*cursor);
+                    let cursor = cursor.as_btree_mut() as &mut dyn Any;
+                    if let Some(mvcc_cursor) = cursor.downcast_mut::<MvCursor>() {
+                        return_if_io!(mvcc_cursor.start_new_rowid());
+                    } else {
+                        // Not an MvCursor - must be an ephemeral cursor (indicated by lack of WAL)
+                        let Some(ephemeral_cursor) = cursor.downcast_mut::<BTreeCursor>() else {
+                            panic!("Expected MvCursor or BTreeCursor in op_new_rowid");
+                        };
+                        turso_assert!(
+                            ephemeral_cursor.pager.wal.is_none(),
+                            "MVCC is enabled but got a non-ephemeral BTreeCursor"
+                        );
+                    }
+                }
             }
 
             OpNewRowidState::SeekingToLast => {
@@ -7045,6 +7059,7 @@ pub fn op_new_rowid(
                     Some(rowid) if rowid < MAX_ROWID => {
                         // Can use sequential
                         state.registers[*rowid_reg] = Register::Value(Value::Integer(rowid + 1));
+                        tracing::trace!("new_rowid={}", rowid + 1);
                         state.op_new_rowid_state = OpNewRowidState::GoNext;
                         continue;
                     }
@@ -7055,6 +7070,7 @@ pub fn op_new_rowid(
                     }
                     None => {
                         // Empty table
+                        tracing::trace!("new_rowid=1");
                         state.registers[*rowid_reg] = Register::Value(Value::Integer(1));
                         state.op_new_rowid_state = OpNewRowidState::GoNext;
                         continue;
@@ -7098,6 +7114,13 @@ pub fn op_new_rowid(
                     state.registers[*rowid_reg] = Register::Value(Value::Integer(candidate));
                     state.op_new_rowid_state = OpNewRowidState::Start;
                     state.pc += 1;
+                    if let Some(mv_store) = mv_store.as_ref() {
+                        let cursor = state.get_cursor(*cursor);
+                        let cursor = cursor.as_btree_mut() as &mut dyn Any;
+                        if let Some(mvcc_cursor) = cursor.downcast_mut::<MvCursor>() {
+                            mvcc_cursor.end_new_rowid();
+                        }
+                    }
                     return Ok(InsnFunctionStepResult::Step);
                 } else {
                     // Collision, try again
@@ -7114,6 +7137,15 @@ pub fn op_new_rowid(
                 }
                 state.op_new_rowid_state = OpNewRowidState::Start;
                 state.pc += 1;
+
+                if let Some(mv_store) = mv_store.as_ref() {
+                    let cursor = state.get_cursor(*cursor);
+                    let cursor = cursor.as_btree_mut() as &mut dyn Any;
+                    if let Some(mvcc_cursor) = cursor.downcast_mut::<MvCursor>() {
+                        mvcc_cursor.end_new_rowid();
+                    }
+                }
+
                 return Ok(InsnFunctionStepResult::Step);
             }
         }

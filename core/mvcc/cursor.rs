@@ -8,12 +8,13 @@ use crate::mvcc::database::{
     SortableIndexKey,
 };
 use crate::storage::btree::{BTreeCursor, BTreeKey, CursorTrait};
+use crate::storage::wal::TursoRwLock;
 use crate::translate::plan::IterationDirection;
 use crate::types::{
-    compare_immutable, IOResult, ImmutableRecord, IndexInfo, RecordCursor, SeekKey, SeekOp,
-    SeekResult,
+    compare_immutable, IOCompletions, IOResult, ImmutableRecord, IndexInfo, RecordCursor, SeekKey,
+    SeekOp, SeekResult,
 };
-use crate::{return_if_io, LimboError, Result};
+use crate::{return_if_io, Completion, LimboError, Result, IO};
 use crate::{Pager, Value};
 use std::any::Any;
 use std::cell::{Ref, RefCell};
@@ -257,7 +258,8 @@ pub struct MvccLazyCursor<Clock: LogicalClock> {
     btree_cursor: Box<dyn CursorTrait>,
     null_flag: bool,
     record_cursor: RefCell<RecordCursor>,
-    next_rowid_lock: Arc<RwLock<()>>,
+    next_rowid_lock: Arc<TursoRwLock>,
+    creating_new_rowid: bool,
     state: RefCell<Option<MvccLazyCursorState>>,
     // we keep count_state separate to be able to call other public functions like rewind and next
     count_state: RefCell<Option<CountState>>,
@@ -291,7 +293,8 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
             btree_cursor,
             null_flag: false,
             record_cursor: RefCell::new(RecordCursor::new()),
-            next_rowid_lock: Arc::new(RwLock::new(())),
+            next_rowid_lock: Arc::new(TursoRwLock::new()),
+            creating_new_rowid: false,
             state: RefCell::new(None),
             count_state: RefCell::new(None),
             btree_advance_state: RefCell::new(None),
@@ -373,69 +376,26 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
         Ok(())
     }
 
-    /// Get the next rowid in the table.
-    /// Since MVCC requires rowids to be sequential and not collide we need to ensure rowids supplied to concurrrent
-    /// transactions are not conflicting.
-    /// Therefore, we will always choose the highest rowid in the table, regardless of the visibility of the row to the
-    /// transaction.
-    pub fn get_next_rowid(&mut self) -> Result<IOResult<(i64, i64)>> {
-        // lock so we don't get same two rowids
-        let lock = self.next_rowid_lock.clone();
-        let _lock = lock.write();
-        return_if_io!(self.last());
-        let last_rowid_in_mvcc_index = self
-            .db
-            .get_last_table_rowid_without_visibility_check(self.table_id);
-        let incremented_rowid = |rowid: &RowKey| {
-            if rowid.to_int_or_panic() == i64::MAX {
-                return Err(LimboError::InternalError(
-                    "rowid overflow, random rowids not implemented yet".to_string(),
-                ));
-            }
+    pub fn start_new_rowid(&mut self) -> Result<IOResult<()>> {
+        tracing::trace!("start_new_rowid");
+        let locked = self.next_rowid_lock.write();
+        if locked {
+            self.creating_new_rowid = true;
+            return Ok(IOResult::Done(()));
+        } else {
+            // Yield, some other cursor is generating new rowid
+            return Ok(IOResult::IO(IOCompletions::Single(Completion::new_yield())));
+        }
+    }
 
-            let prev_max_rowid = rowid.to_int_or_panic();
-            let new_row_id = prev_max_rowid + 1;
-            tracing::trace!("new_row_id={new_row_id}");
-            Ok((new_row_id, prev_max_rowid))
-        };
-        match self.current_pos.borrow().clone() {
-            CursorPosition::Loaded {
-                row_id,
-                in_btree: _,
-            } => {
-                // Check if there is some other rowid in the MVCC index that is higher than the current rowid.
-                // Doesn't matter if it's not visible.
-                tracing::debug!(
-                    "get_next_rowid: last_rowid_in_mvcc_index={:?}, row_id={:?}",
-                    last_rowid_in_mvcc_index,
-                    row_id
-                );
-                let max_rowid = match last_rowid_in_mvcc_index {
-                    Some(k) => {
-                        if k.to_int_or_panic() > row_id.row_id.to_int_or_panic() {
-                            incremented_rowid(&k)
-                        } else {
-                            incremented_rowid(&row_id.row_id)
-                        }
-                    }
-                    None => incremented_rowid(&row_id.row_id),
-                };
-                Ok(IOResult::Done(max_rowid?))
-            }
-            CursorPosition::BeforeFirst => {
-                let res = match last_rowid_in_mvcc_index {
-                    None => (1, 0),
-                    Some(k) => incremented_rowid(&k)?,
-                };
-                Ok(IOResult::Done(res))
-            }
-            CursorPosition::End => {
-                let res = match last_rowid_in_mvcc_index {
-                    None => (1, 0),
-                    Some(k) => incremented_rowid(&k)?,
-                };
-                Ok(IOResult::Done(res))
-            }
+    pub fn end_new_rowid(&mut self) {
+        tracing::trace!(
+            "end_new_rowid creating_new_rowid={}",
+            self.creating_new_rowid
+        );
+        if self.creating_new_rowid {
+            self.next_rowid_lock.unlock();
+            self.creating_new_rowid = false;
         }
     }
 
@@ -1625,28 +1585,10 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
     }
 
     fn seek_to_last(&mut self, _always_seek: bool) -> Result<IOResult<()>> {
-        self.invalidate_record();
-        let max_rowid = RowID {
-            table_id: self.table_id,
-            row_id: RowKey::Int(i64::MAX),
-        };
-        let inclusive = true;
-        let rowid = self.db.seek_rowid(
-            max_rowid,
-            inclusive,
-            IterationDirection::Forwards,
-            self.tx_id,
-            &mut self.table_iterator,
-        );
-        if let Some(rowid) = rowid {
-            self.current_pos.replace(CursorPosition::Loaded {
-                row_id: rowid,
-                in_btree: false,
-            });
-        } else {
-            self.current_pos.replace(CursorPosition::End);
+        match self.seek(SeekKey::TableRowId(i64::MAX), SeekOp::LE { eq_only: false })? {
+            IOResult::Done(_) => Ok(IOResult::Done(())),
+            IOResult::IO(iocompletions) => Ok(IOResult::IO(iocompletions)),
         }
-        Ok(IOResult::Done(()))
     }
 
     fn invalidate_record(&mut self) {
