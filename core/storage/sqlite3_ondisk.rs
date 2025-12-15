@@ -1719,6 +1719,8 @@ pub(super) struct StreamingWalReader {
 struct StreamingState {
     frame_idx: u64,
     cumulative_checksum: (u32, u32),
+    /// checksum of the last valid commit frame
+    last_valid_checksum: (u32, u32),
     last_valid_frame: u64,
     pending_frames: FxHashMap<u64, Vec<u64>>,
     page_size: usize,
@@ -1744,6 +1746,7 @@ impl StreamingWalReader {
             state: RwLock::new(StreamingState {
                 frame_idx: 1,
                 cumulative_checksum: (0, 0),
+                last_valid_checksum: (0, 0),
                 last_valid_frame: 0,
                 pending_frames: FxHashMap::default(),
                 page_size: 0,
@@ -1909,6 +1912,7 @@ impl StreamingWalReader {
 
             if db_size > 0 {
                 st.last_valid_frame = st.frame_idx;
+                st.last_valid_checksum = calc;
                 self.flush_pending_frames(&mut st);
             }
             st.frame_idx += 1;
@@ -1951,7 +1955,7 @@ impl StreamingWalReader {
         }
 
         wfs.max_frame.store(max_frame, Ordering::SeqCst);
-        wfs.last_checksum = st.cumulative_checksum;
+        wfs.last_checksum = st.last_valid_checksum;
         if st.header_valid {
             wfs.initialized.store(true, Ordering::SeqCst);
         }
