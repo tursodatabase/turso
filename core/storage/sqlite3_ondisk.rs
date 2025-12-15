@@ -1955,6 +1955,7 @@ impl StreamingWalReader {
         }
 
         wfs.max_frame.store(max_frame, Ordering::SeqCst);
+        // use checksum of last valid commit frame, not necessarily the last frame
         wfs.last_checksum = st.last_valid_checksum;
         if st.header_valid {
             wfs.initialized.store(true, Ordering::SeqCst);
@@ -2495,7 +2496,10 @@ mod tests {
         let guard = shared.read();
         assert_eq!(guard.max_frame.load(Ordering::Acquire), 1);
         assert_eq!(guard.last_checksum, commit_checksum);
+
+        // checksum should only include committed frame.
         assert_ne!(guard.last_checksum, after_frame3_checksum);
+
         let frame_cache = guard.frame_cache.lock();
         assert_eq!(frame_cache.get(&1), Some(&vec![1u64]));
         assert!(frame_cache.get(&2).is_none());
