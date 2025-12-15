@@ -570,7 +570,7 @@ mod tests {
     use tempfile::{NamedTempFile, TempDir};
     use turso_core::{Database, StepResult, IO};
 
-    use crate::common::do_flush;
+    use crate::common::{do_flush, ExecRows};
 
     use super::{limbo_exec_rows, limbo_exec_rows_error, TempDatabase};
     use rusqlite::types::Value;
@@ -639,6 +639,50 @@ mod tests {
             assert!(matches!(err, turso_core::LimboError::ReadOnly), "{err:?}");
         }
         Ok(())
+    }
+
+    #[test]
+    fn test_limbo_open_read_only_without_wal() {
+        // Create a database in WAL mode using rusqlite, then delete the WAL file
+        let dir = TempDir::new().unwrap().keep();
+        let path = dir.join("test_no_wal.db");
+        let wal_path = dir.join("test_no_wal.db-wal");
+
+        {
+            let connection = rusqlite::Connection::open(&path).unwrap();
+            connection
+                .pragma_update(None, "journal_mode", "wal")
+                .unwrap();
+            connection
+                .execute("CREATE TABLE t (a INTEGER)", ())
+                .unwrap();
+            connection.execute("INSERT INTO t VALUES (42)", ()).unwrap();
+            // Checkpoint to flush WAL contents to the main database file
+            connection
+                .pragma_update(None, "wal_checkpoint", "TRUNCATE")
+                .unwrap();
+            connection.close().unwrap()
+        }
+
+        // Verify no WAL file exists
+        assert!(!wal_path.exists(), "WAL file should have been deleted");
+        // Verify the main database file exists
+        assert!(path.exists(), "Database file should exist at {path:?}");
+
+        // Now try to open in readonly mode - this should succeed
+        let io = Arc::new(turso_core::PlatformIO::new().unwrap());
+        let db = Database::open_file_with_flags(
+            io,
+            path.to_str().unwrap(),
+            turso_core::OpenFlags::default() | turso_core::OpenFlags::ReadOnly,
+            turso_core::DatabaseOpts::default(),
+            None,
+        )
+        .unwrap();
+        let conn = db.connect().unwrap();
+        let ret: Vec<(i64,)> = conn.exec_rows("SELECT * FROM t");
+        assert_eq!(ret, vec![(42,)]);
+        conn.close().unwrap();
     }
 
     #[test]

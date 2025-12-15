@@ -837,7 +837,7 @@ impl Database {
             buffer_pool.finalize_with_page_size(page_size.get() as usize)?;
         }
 
-        // No existing WAL; create one.
+        // No existing WAL; create one unless we're in readonly mode.
         let mut pager = Pager::new(
             self.db_file.clone(),
             None,
@@ -860,6 +860,12 @@ impl Database {
             pager.enable_encryption(true);
             pager.set_encryption_context(cipher, encryption_key)?;
         }
+
+        // In readonly mode, don't try to create a WAL file if it doesn't exist
+        if self.is_readonly() {
+            return Ok(pager);
+        }
+
         let file = self
             .io
             .open_file(&self.wal_path, self.open_flags.get(), false)?;
