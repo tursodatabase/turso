@@ -1084,13 +1084,13 @@ impl Wal for WalFile {
     ) -> Result<Completion> {
         tracing::debug!(
             "read_frame(page_idx = {}, frame_id = {})",
-            page.get().id,
+            page.id(),
             frame_id
         );
         let offset = self.frame_offset(frame_id);
         page.set_locked();
         let frame = page.clone();
-        let page_idx = page.get().id;
+        let page_idx = page.id();
         let shared_file = self.shared.clone();
         let complete = Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
             let Ok((buf, bytes_read)) = res else {
@@ -1105,7 +1105,7 @@ impl Wal for WalFile {
                 "read({bytes_read}) less than expected({buf_len}): frame_id={frame_id}"
             );
             let cloned = frame.clone();
-            finish_read_page(page.get().id, buf, cloned);
+            finish_read_page(page.id(), buf, cloned);
             let epoch = shared_file.read().epoch.load(Ordering::Acquire);
             frame.set_wal_tag(frame_id, epoch);
         });
@@ -1530,8 +1530,8 @@ impl Wal for WalFile {
         let mut next_frame_id = self.max_frame.load(Ordering::Acquire) + 1;
         // Build every frame in order, updating the rolling checksum
         for (idx, page) in pages.iter().enumerate() {
-            tracing::debug!("append_frames_vectored: page_id={}", page.get().id);
-            let page_id = page.get().id;
+            tracing::debug!("append_frames_vectored: page_id={}", page.id());
+            let page_id = page.id();
             let plain = page.get_contents().as_ptr();
 
             let data_to_write: std::borrow::Cow<[u8]> = {
@@ -1579,7 +1579,7 @@ impl Wal for WalFile {
 
         // pre-advance in-memory WAL state
         for (page, fid, csum) in &page_frame_and_checksum {
-            self.complete_append_frame(page.get().id as u64, *fid, *csum);
+            self.complete_append_frame(page.id() as u64, *fid, *csum);
         }
 
         // single completion for the whole batch

@@ -101,7 +101,7 @@ impl Subjournal {
                     bytes_read == page_size as i32,
                     "bytes_read should be page_size"
                 );
-                finish_read_page(page.get().id, buffer, page.clone());
+                finish_read_page(page.id(), buffer, page.clone());
             },
         );
         let c = self.file.pread(offset, c)?;

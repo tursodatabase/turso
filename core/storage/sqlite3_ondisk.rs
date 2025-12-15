@@ -941,7 +941,7 @@ pub fn finish_read_page(page_idx: usize, buffer_ref: Arc<Buffer>, page: PageRef)
     };
     let inner = PageContent::new(pos, buffer_ref.clone());
     {
-        page.get().contents.replace(inner);
+        page.replace_contents(inner);
         page.clear_locked();
         page.set_loaded();
         // we set the wal tag only when reading page from log, or in allocate_page,
@@ -952,11 +952,11 @@ pub fn finish_read_page(page_idx: usize, buffer_ref: Arc<Buffer>, page: PageRef)
 
 #[instrument(skip_all, level = Level::DEBUG)]
 pub fn begin_write_btree_page(pager: &Pager, page: &PageRef) -> Result<Completion> {
-    tracing::trace!("begin_write_btree_page(page={})", page.get().id);
+    tracing::trace!("begin_write_btree_page(page={})", page.id());
     let page_source = &pager.db_file;
     let page_finish = page.clone();
 
-    let page_id = page.get().id;
+    let page_id = page.id();
     tracing::trace!("begin_write_btree_page(page_id={})", page_id);
     let buffer = {
         let contents = page.get_contents();

@@ -1,6 +1,6 @@
 use intrusive_collections::{intrusive_adapter, LinkedList, LinkedListLink};
 use rustc_hash::FxHashMap;
-use std::sync::{atomic::Ordering, Arc};
+use std::sync::Arc;
 use tracing::trace;
 
 use crate::turso_assert;
@@ -233,24 +233,18 @@ impl PageCache {
         let page = &entry.page;
 
         if page.is_locked() {
-            return Err(CacheError::Locked {
-                pgno: page.get().id,
-            });
+            return Err(CacheError::Locked { pgno: page.id() });
         }
         if page.is_dirty() {
-            return Err(CacheError::Dirty {
-                pgno: page.get().id,
-            });
+            return Err(CacheError::Dirty { pgno: page.id() });
         }
         if page.is_pinned() {
-            return Err(CacheError::Pinned {
-                pgno: page.get().id,
-            });
+            return Err(CacheError::Pinned { pgno: page.id() });
         }
 
         if clean_page {
             page.clear_loaded();
-            let _ = page.get().contents.take();
+            page.clear_contents();
         }
 
         // Remove from map first
@@ -399,7 +393,7 @@ impl PageCache {
 
                 // Clean the page
                 page.clear_loaded();
-                let _ = page.get().contents.take();
+                page.clear_contents();
 
                 // Remove from queue
                 unsafe {
@@ -429,7 +423,7 @@ impl PageCache {
             let entry = unsafe { &*entry_ptr };
             if entry.page.is_dirty() && !clear_dirty {
                 return Err(CacheError::Dirty {
-                    pgno: entry.page.get().id,
+                    pgno: entry.page.id(),
                 });
             }
         }
@@ -438,7 +432,7 @@ impl PageCache {
         for &entry_ptr in self.map.values() {
             let entry = unsafe { &*entry_ptr };
             entry.page.clear_loaded();
-            let _ = entry.page.get().contents.take();
+            entry.page.clear_contents();
         }
 
         self.map.clear();
@@ -472,8 +466,8 @@ impl PageCache {
                 "slot={}, page={:?}, flags={}, pin_count={}, ref_bit={:?}",
                 i,
                 entry.key,
-                page.get().flags.load(Ordering::SeqCst),
-                page.get().pin_count.load(Ordering::SeqCst),
+                page.flags(),
+                page.pin_count(),
                 entry.ref_bit,
             );
             cursor.move_next();
@@ -569,7 +563,7 @@ mod tests {
                 buffer: Arc::new(buffer),
                 overflow_cells: Vec::new(),
             };
-            page.get().contents = Some(page_content);
+            page.replace_contents(page_content);
             page.set_loaded();
         }
         page
@@ -678,14 +672,14 @@ mod tests {
         let key2 = insert_page(&mut cache, 2);
 
         // With capacity=1, inserting key2 should evict key1
-        assert_eq!(cache.get(&key2).unwrap().unwrap().get().id, 2);
+        assert_eq!(cache.get(&key2).unwrap().unwrap().id(), 2);
         assert!(
             cache.get(&key1).unwrap().is_none(),
             "key1 should be evicted"
         );
 
         // key2 should still be accessible
-        assert_eq!(cache.get(&key2).unwrap().unwrap().get().id, 2);
+        assert_eq!(cache.get(&key2).unwrap().unwrap().id(), 2);
         assert!(
             cache.get(&key1).unwrap().is_none(),
             "capacity=1 should have evicted the older page"
@@ -808,8 +802,8 @@ mod tests {
         let key1 = insert_page(&mut cache, 1);
         let key2 = insert_page(&mut cache, 2);
 
-        assert_eq!(cache.get(&key1).unwrap().unwrap().get().id, 1);
-        assert_eq!(cache.get(&key2).unwrap().unwrap().get().id, 2);
+        assert_eq!(cache.get(&key1).unwrap().unwrap().id(), 1);
+        assert_eq!(cache.get(&key2).unwrap().unwrap().id(), 2);
         cache.verify_cache_integrity();
     }
 
@@ -1063,8 +1057,8 @@ mod tests {
             // Verify all pages in reference_map are in cache
             for (key, page) in &reference_map {
                 let cached_page = cache.peek(key, false).expect("Page should be in cache");
-                assert_eq!(cached_page.get().id, key.0);
-                assert_eq!(page.get().id, key.0);
+                assert_eq!(cached_page.id(), key.0);
+                assert_eq!(page.id(), key.0);
             }
         }
     }
