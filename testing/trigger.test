@@ -824,7 +824,9 @@ do_execsql_test_on_specific_db {:memory:} trigger-rename-table-on-clause {
   END;
   ALTER TABLE t1 RENAME TO t1_new;
   SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='trg1';
-} {CREATE TRIGGER trg1 AFTER INSERT ON "t1_new" BEGIN INSERT INTO "t1_new" VALUES(100, 'triggered'); END}
+} {{CREATE TRIGGER trg1 AFTER INSERT ON "t1_new" BEGIN
+INSERT INTO "t1_new" VALUES (100, 'triggered');
+END}}
 
 # table-qualified refs in WHERE clause get rewritten
 do_execsql_test_on_specific_db {:memory:} trigger-rename-table-qualified-refs {
@@ -834,7 +836,9 @@ do_execsql_test_on_specific_db {:memory:} trigger-rename-table-qualified-refs {
   END;
   ALTER TABLE t1 RENAME TO t1_new;
   SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='trg2';
-} {CREATE TRIGGER trg2 AFTER UPDATE ON "t1_new" WHEN "t1_new".id > 5 BEGIN UPDATE "t1_new" SET val = 'updated' WHERE "t1_new".id = NEW.id; END}
+} {{CREATE TRIGGER trg2 AFTER UPDATE ON "t1_new" WHEN "t1_new".id > 5 BEGIN
+UPDATE "t1_new" SET val = 'updated' WHERE "t1_new".id = NEW.id;
+END}}
 
 do_execsql_test_on_specific_db {:memory:} trigger-rename-upsert-clause {
   CREATE TABLE t1 (id INT PRIMARY KEY, val TEXT);
@@ -843,4 +847,29 @@ do_execsql_test_on_specific_db {:memory:} trigger-rename-upsert-clause {
   END;
   ALTER TABLE t1 RENAME TO t1_new;
   SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='trg3';
-} {CREATE TRIGGER trg3 AFTER INSERT ON "t1_new" BEGIN INSERT INTO "t1_new" VALUES(100, 'x') ON CONFLICT (id) DO UPDATE SET val = "t1_new".val || 'conflict'; END}
+} {{CREATE TRIGGER trg3 AFTER INSERT ON "t1_new" BEGIN
+INSERT INTO "t1_new" VALUES (100, 'x') ON CONFLICT (id) DO UPDATE SET val = "t1_new".val || 'conflict';
+END}}
+
+do_execsql_test_on_specific_db {:memory:} trigger-rename-insert-select-body {
+  CREATE TABLE t1 (id INT, val TEXT);
+  CREATE TABLE log (src TEXT, cnt INT);
+  CREATE TRIGGER trg4 AFTER INSERT ON t1 BEGIN
+    INSERT INTO log SELECT 'inserted', count(*) FROM t1;
+  END;
+  ALTER TABLE t1 RENAME TO t1_new;
+  SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='trg4';
+} {{CREATE TRIGGER trg4 AFTER INSERT ON "t1_new" BEGIN
+INSERT INTO log SELECT 'inserted', count (*) FROM "t1_new";
+END}}
+
+do_execsql_test_on_specific_db {:memory:} trigger-rename-select-cmd {
+  CREATE TABLE t1 (id INT);
+  CREATE TRIGGER trg5 AFTER INSERT ON t1 BEGIN
+    SELECT count(*) FROM t1 WHERE t1.id > 0;
+  END;
+  ALTER TABLE t1 RENAME TO t1_new;
+  SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='trg5';
+} {{CREATE TRIGGER trg5 AFTER INSERT ON "t1_new" BEGIN
+SELECT count (*) FROM "t1_new" WHERE "t1_new".id > 0;
+END}}
