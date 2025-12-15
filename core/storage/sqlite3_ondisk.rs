@@ -2387,4 +2387,117 @@ mod tests {
     fn test_read_varint_malformed_inputs(#[case] buf: &[u8]) {
         assert!(read_varint(buf).is_err());
     }
+
+    #[test]
+    fn streaming_reader_ignores_uncommitted_checksums() {
+        let io: Arc<dyn crate::IO> = Arc::new(crate::MemoryIO::new());
+        let file = io
+            .open_file("streaming-reader-wal", crate::OpenFlags::Create, false)
+            .unwrap();
+
+        let page_size: usize = 1024;
+        let buffer_pool = BufferPool::begin_init(&io, BufferPool::TEST_ARENA_SIZE);
+        buffer_pool
+            .finalize_with_page_size(page_size)
+            .expect("initialize buffer pool");
+
+        let mut wal_header = WalHeader {
+            magic: WAL_MAGIC_LE,
+            file_format: 3007000,
+            page_size: page_size as u32,
+            checkpoint_seq: 0,
+            salt_1: 0x1234_5678,
+            salt_2: 0x9abc_def0,
+            checksum_1: 0,
+            checksum_2: 0,
+        };
+        let header_prefix = &wal_header.as_bytes()[..WAL_HEADER_SIZE - 8];
+        let use_native = (wal_header.magic & 1) != 0;
+        let (c1, c2) = checksum_wal(header_prefix, &wal_header, (0, 0), use_native);
+        wal_header.checksum_1 = c1;
+        wal_header.checksum_2 = c2;
+        io.wait_for_completion(begin_write_wal_header(file.as_ref(), &wal_header).unwrap())
+            .unwrap();
+
+        let page = vec![0xAB; page_size];
+        let frame_size = WAL_FRAME_HEADER_SIZE + page_size;
+        let mut offset = WAL_HEADER_SIZE as u64;
+
+        let (commit_checksum, commit_frame) = prepare_wal_frame(
+            &buffer_pool,
+            &wal_header,
+            (wal_header.checksum_1, wal_header.checksum_2),
+            wal_header.page_size,
+            1,
+            1,
+            &page,
+        );
+        let commit_frame_clone = commit_frame.clone();
+        let c = file
+            .pwrite(
+                offset,
+                commit_frame,
+                Completion::new_write(move |res| {
+                    assert_eq!(res.unwrap() as usize, frame_size);
+                    let _keep = commit_frame_clone.clone();
+                }),
+            )
+            .unwrap();
+        io.wait_for_completion(c).unwrap();
+        offset += frame_size as u64;
+
+        let (after_frame2_checksum, frame2) = prepare_wal_frame(
+            &buffer_pool,
+            &wal_header,
+            commit_checksum,
+            wal_header.page_size,
+            2,
+            0,
+            &page,
+        );
+        let frame2_clone = frame2.clone();
+        let c = file
+            .pwrite(
+                offset,
+                frame2,
+                Completion::new_write(move |res| {
+                    assert_eq!(res.unwrap() as usize, frame_size);
+                    let _keep = frame2_clone.clone();
+                }),
+            )
+            .unwrap();
+        io.wait_for_completion(c).unwrap();
+        offset += frame_size as u64;
+
+        let (after_frame3_checksum, frame3) = prepare_wal_frame(
+            &buffer_pool,
+            &wal_header,
+            after_frame2_checksum,
+            wal_header.page_size,
+            3,
+            0,
+            &page,
+        );
+        let frame3_clone = frame3.clone();
+        let c = file
+            .pwrite(
+                offset,
+                frame3,
+                Completion::new_write(move |res| {
+                    assert_eq!(res.unwrap() as usize, frame_size);
+                    let _keep = frame3_clone.clone();
+                }),
+            )
+            .unwrap();
+        io.wait_for_completion(c).unwrap();
+
+        let shared = build_shared_wal(&file, &io).unwrap();
+        let guard = shared.read();
+        assert_eq!(guard.max_frame.load(Ordering::Acquire), 1);
+        assert_eq!(guard.last_checksum, commit_checksum);
+        assert_ne!(guard.last_checksum, after_frame3_checksum);
+        let frame_cache = guard.frame_cache.lock();
+        assert_eq!(frame_cache.get(&1), Some(&vec![1u64]));
+        assert!(frame_cache.get(&2).is_none());
+    }
 }
