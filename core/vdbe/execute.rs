@@ -5848,7 +5848,7 @@ pub fn op_function(
 
                                 if normalize_ident(tbl_name.name.as_str()) == rename_from {
                                     tbl_name.name =
-                                        Name::from_string(format!("\"{}\"", original_rename_to));
+                                        Name::from_string(format!("\"{original_rename_to}\""));
                                     changed = true;
                                 }
 
@@ -5872,8 +5872,7 @@ pub fn op_function(
                                         } => {
                                             if normalize_ident(tbl_name.as_str()) == rename_from {
                                                 *tbl_name = Name::from_string(format!(
-                                                    "\"{}\"",
-                                                    original_rename_to
+                                                    "\"{original_rename_to}\""
                                                 ));
                                                 changed = true;
                                             }
@@ -5885,16 +5884,12 @@ pub fn op_function(
 
                                             if let Some(ref mut from_clause) = from {
                                                 for join in &mut from_clause.joins {
-                                                    if let Some(ref mut constraint) =
-                                                        join.constraint
+                                                    if let Some(ast::JoinConstraint::On(expr)) =
+                                                        &mut join.constraint
                                                     {
-                                                        if let ast::JoinConstraint::On(expr) =
-                                                            constraint
-                                                        {
-                                                            changed |= crate::translate::alter::rewrite_expr_table_refs_for_rename(
-                                                                expr, &rename_from, original_rename_to.as_str()
-                                                            );
-                                                        }
+                                                        changed |= crate::translate::alter::rewrite_expr_table_refs_for_rename(
+                                                            expr, &rename_from, original_rename_to.as_str()
+                                                        );
                                                     }
                                                 }
                                             }
@@ -5905,12 +5900,14 @@ pub fn op_function(
                                             }
                                         }
                                         ast::TriggerCmd::Insert {
-                                            tbl_name, select, upsert, ..
+                                            tbl_name,
+                                            select,
+                                            upsert,
+                                            ..
                                         } => {
                                             if normalize_ident(tbl_name.as_str()) == rename_from {
                                                 *tbl_name = Name::from_string(format!(
-                                                    "\"{}\"",
-                                                    original_rename_to
+                                                    "\"{original_rename_to}\""
                                                 ));
                                                 changed = true;
                                             }
@@ -5919,32 +5916,47 @@ pub fn op_function(
                                                     &mut sorted.expr, &rename_from, original_rename_to.as_str()
                                                 );
                                             }
-                                            
+
                                             if let Some(ref mut upsert_clause) = upsert {
                                                 fn walk_upsert(
                                                     u: &mut ast::Upsert,
                                                     rename_from: &str,
                                                     new_name: &str,
-                                                ) -> bool {
+                                                ) -> bool
+                                                {
                                                     let mut changed = false;
-                                                    if let ast::UpsertDo::Set { sets, where_clause } = &mut u.do_clause {
+                                                    if let ast::UpsertDo::Set {
+                                                        sets,
+                                                        where_clause,
+                                                    } = &mut u.do_clause
+                                                    {
                                                         for set in sets {
                                                             changed |= crate::translate::alter::rewrite_expr_table_refs_for_rename(
                                                                 &mut set.expr, rename_from, new_name
                                                             );
                                                         }
-                                                        if let Some(ref mut where_expr) = where_clause {
+                                                        if let Some(ref mut where_expr) =
+                                                            where_clause
+                                                        {
                                                             changed |= crate::translate::alter::rewrite_expr_table_refs_for_rename(
                                                                 where_expr, rename_from, new_name
                                                             );
                                                         }
                                                     }
                                                     if let Some(ref mut next) = u.next {
-                                                        changed |= walk_upsert(next, rename_from, new_name);
+                                                        changed |= walk_upsert(
+                                                            next,
+                                                            rename_from,
+                                                            new_name,
+                                                        );
                                                     }
                                                     changed
                                                 }
-                                                changed |= walk_upsert(upsert_clause, &rename_from, original_rename_to.as_str());
+                                                changed |= walk_upsert(
+                                                    upsert_clause,
+                                                    &rename_from,
+                                                    original_rename_to.as_str(),
+                                                );
                                             }
                                         }
                                         ast::TriggerCmd::Delete {
@@ -5953,8 +5965,7 @@ pub fn op_function(
                                         } => {
                                             if normalize_ident(tbl_name.as_str()) == rename_from {
                                                 *tbl_name = Name::from_string(format!(
-                                                    "\"{}\"",
-                                                    original_rename_to
+                                                    "\"{original_rename_to}\""
                                                 ));
                                                 changed = true;
                                             }

@@ -2521,14 +2521,14 @@ pub fn rewrite_expr_table_refs_for_rename(
     match expr.as_mut() {
         ast::Expr::Qualified(ref mut tbl_name, _) => {
             if normalize_ident(tbl_name.as_str()) == old_table_norm {
-                *tbl_name = ast::Name::from_string(format!("\"{}\"", new_table_name));
+                *tbl_name = ast::Name::from_string(format!("\"{new_table_name}\""));
                 changed = true;
             }
         }
 
         ast::Expr::DoublyQualified(_, ref mut tbl_name, _) => {
             if normalize_ident(tbl_name.as_str()) == old_table_norm {
-                *tbl_name = ast::Name::from_string(format!("\"{}\"", new_table_name));
+                *tbl_name = ast::Name::from_string(format!("\"{new_table_name}\""));
                 changed = true;
             }
         }
@@ -2599,7 +2599,7 @@ pub fn rewrite_expr_table_refs_for_rename(
         ast::Expr::InTable { lhs, rhs, .. } => {
             changed |= rewrite_expr_table_refs_for_rename(lhs, old_table_norm, new_table_name);
             if normalize_ident(rhs.name.as_str()) == old_table_norm {
-                rhs.name = ast::Name::from_string(format!("\"{}\"", new_table_name));
+                rhs.name = ast::Name::from_string(format!("\"{new_table_name}\""));
                 changed = true;
             }
         }
@@ -2716,7 +2716,7 @@ fn rewrite_one_select_table_refs_for_rename(
                     }
                     ast::ResultColumn::TableStar(ref mut name) => {
                         if normalize_ident(name.as_str()) == old_table_norm {
-                            *name = ast::Name::from_string(format!("\"{}\"", new_table_name));
+                            *name = ast::Name::from_string(format!("\"{new_table_name}\""));
                             changed = true;
                         }
                     }
@@ -2780,10 +2780,8 @@ fn rewrite_from_clause_table_refs_for_rename(
             old_table_norm,
             new_table_name,
         );
-        if let Some(ref mut constraint) = join.constraint {
-            if let ast::JoinConstraint::On(expr) = constraint {
-                changed |= rewrite_expr_table_refs_for_rename(expr, old_table_norm, new_table_name);
-            }
+        if let Some(ast::JoinConstraint::On(expr)) = &mut join.constraint {
+            changed |= rewrite_expr_table_refs_for_rename(expr, old_table_norm, new_table_name);
         }
     }
 
@@ -2800,13 +2798,13 @@ fn rewrite_select_table_entry_refs_for_rename(
     match select_table.as_mut() {
         ast::SelectTable::Table(ref mut qualified_name, _, _) => {
             if normalize_ident(qualified_name.name.as_str()) == old_table_norm {
-                qualified_name.name = ast::Name::from_string(format!("\"{}\"", new_table_name));
+                qualified_name.name = ast::Name::from_string(format!("\"{new_table_name}\""));
                 changed = true;
             }
         }
         ast::SelectTable::TableCall(ref mut qualified_name, args, _) => {
             if normalize_ident(qualified_name.name.as_str()) == old_table_norm {
-                qualified_name.name = ast::Name::from_string(format!("\"{}\"", new_table_name));
+                qualified_name.name = ast::Name::from_string(format!("\"{new_table_name}\""));
                 changed = true;
             }
             for arg in args {
