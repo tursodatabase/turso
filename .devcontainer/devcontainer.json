@@ -1,5 +1,5 @@
 {
-  "name": "Claude Code Sandbox",
+  "name": "tursodb sandbox",
   "build": {
     "dockerfile": "Dockerfile",
     "args": {
