@@ -5847,22 +5847,29 @@ pub fn op_function(
                                 let mut changed = false;
 
                                 if normalize_ident(tbl_name.name.as_str()) == rename_from {
-                                    tbl_name.name = Name::from_string(format!(
-                                        "\"{}\"",
-                                        original_rename_to
-                                    ));
+                                    tbl_name.name =
+                                        Name::from_string(format!("\"{}\"", original_rename_to));
                                     changed = true;
                                 }
 
                                 if let Some(ref mut when_expr) = when_clause {
-                                    changed |= crate::translate::alter::rewrite_expr_table_refs_for_rename(
-                                        when_expr, &rename_from, original_rename_to.as_str()
-                                    );
+                                    changed |=
+                                        crate::translate::alter::rewrite_expr_table_refs_for_rename(
+                                            when_expr,
+                                            &rename_from,
+                                            original_rename_to.as_str(),
+                                        );
                                 }
 
                                 for cmd in &mut commands {
                                     match cmd {
-                                        ast::TriggerCmd::Update { tbl_name, sets, from, where_clause, .. } => {
+                                        ast::TriggerCmd::Update {
+                                            tbl_name,
+                                            sets,
+                                            from,
+                                            where_clause,
+                                            ..
+                                        } => {
                                             if normalize_ident(tbl_name.as_str()) == rename_from {
                                                 *tbl_name = Name::from_string(format!(
                                                     "\"{}\"",
@@ -5875,11 +5882,15 @@ pub fn op_function(
                                                     &mut set.expr, &rename_from, original_rename_to.as_str()
                                                 );
                                             }
-                                            
+
                                             if let Some(ref mut from_clause) = from {
                                                 for join in &mut from_clause.joins {
-                                                    if let Some(ref mut constraint) = join.constraint {
-                                                        if let ast::JoinConstraint::On(expr) = constraint {
+                                                    if let Some(ref mut constraint) =
+                                                        join.constraint
+                                                    {
+                                                        if let ast::JoinConstraint::On(expr) =
+                                                            constraint
+                                                        {
                                                             changed |= crate::translate::alter::rewrite_expr_table_refs_for_rename(
                                                                 expr, &rename_from, original_rename_to.as_str()
                                                             );
@@ -5893,7 +5904,9 @@ pub fn op_function(
                                                 );
                                             }
                                         }
-                                        ast::TriggerCmd::Insert { tbl_name, select, .. } => {
+                                        ast::TriggerCmd::Insert {
+                                            tbl_name, select, ..
+                                        } => {
                                             if normalize_ident(tbl_name.as_str()) == rename_from {
                                                 *tbl_name = Name::from_string(format!(
                                                     "\"{}\"",
@@ -5907,7 +5920,10 @@ pub fn op_function(
                                                 );
                                             }
                                         }
-                                        ast::TriggerCmd::Delete { tbl_name, where_clause } => {
+                                        ast::TriggerCmd::Delete {
+                                            tbl_name,
+                                            where_clause,
+                                        } => {
                                             if normalize_ident(tbl_name.as_str()) == rename_from {
                                                 *tbl_name = Name::from_string(format!(
                                                     "\"{}\"",
