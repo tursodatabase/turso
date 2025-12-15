@@ -263,7 +263,7 @@ impl IO for MemorySimIO {
             if callback.time.is_none() || callback.time.is_some_and(|time| time < now) {
                 if callback.fault {
                     // Inject the fault by aborting the completion
-                    tracing::error!("aborting completion: {callback:?}");
+                    tracing::error!("Fault injection: aborting completion");
                     completion.abort();
                     continue;
                 }

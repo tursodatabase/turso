@@ -305,6 +305,7 @@ pub trait Wal: Debug {
     fn get_max_frame(&self) -> u64;
     fn get_min_frame(&self) -> u64;
     fn rollback(&mut self);
+    fn abort_checkpoint(&mut self);
 
     /// Return unique set of pages changed **after** frame_watermark position and until current WAL session max_frame_no
     fn changed_pages_after(&self, frame_watermark: u64) -> Result<Vec<u32>>;
@@ -1325,7 +1326,8 @@ impl Wal for WalFile {
         pager: &Pager,
         mode: CheckpointMode,
     ) -> Result<IOResult<CheckpointResult>> {
-        self.checkpoint_inner(pager, mode).inspect_err(|_| {
+        self.checkpoint_inner(pager, mode).inspect_err(|e| {
+            tracing::error!("Wal Checkpoint failed: {e}");
             let _ = self.checkpoint_guard.take();
             self.ongoing_checkpoint.state = CheckpointState::Start;
         })
@@ -1385,6 +1387,11 @@ impl Wal for WalFile {
         });
         self.last_checksum = last_checksum;
         self.max_frame.store(max_frame, Ordering::Release);
+        self.reset_internal_states();
+    }
+
+    fn abort_checkpoint(&mut self) {
+        let _ = self.checkpoint_guard.take();
         self.reset_internal_states();
     }
 
