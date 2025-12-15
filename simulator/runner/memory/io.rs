@@ -14,6 +14,7 @@ use crate::runner::memory::file::MemorySimFile;
 /// File descriptor
 pub type Fd = String;
 
+#[derive(Debug)]
 pub enum OperationType {
     Read {
         completion: Completion,
@@ -50,6 +51,7 @@ impl OperationType {
     }
 }
 
+#[derive(Debug)]
 pub struct Operation {
     pub time: Option<turso_core::Instant>,
     pub op: OperationType,
@@ -261,6 +263,7 @@ impl IO for MemorySimIO {
             if callback.time.is_none() || callback.time.is_some_and(|time| time < now) {
                 if callback.fault {
                     // Inject the fault by aborting the completion
+                    tracing::error!("aborting completion: {callback:?}");
                     completion.abort();
                     continue;
                 }
