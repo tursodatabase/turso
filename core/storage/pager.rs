@@ -2654,6 +2654,9 @@ impl Pager {
                         );
                     }
 
+                    // Mark trunk page dirty BEFORE modifying it so subjournal captures original content
+                    self.add_dirty(trunk_page)?;
+
                     // Shift left all the other leaf pages in the trunk page and subtract 1 from the leaf count
                     let remaining_leaves_count = (*number_of_freelist_leaves - 1) as usize;
                     {
@@ -2674,7 +2677,6 @@ impl Pager {
                         FREELIST_TRUNK_OFFSET_LEAF_COUNT,
                         remaining_leaves_count as u32,
                     );
-                    self.add_dirty(trunk_page)?;
 
                     header.freelist_pages = (header.freelist_pages.get() - 1).into();
                     let leaf_page = leaf_page.clone();
