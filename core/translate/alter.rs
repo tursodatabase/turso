@@ -2511,6 +2511,50 @@ fn rewrite_expr_column_ref(
     )
 }
 
+/// Walk an Upsert clause and rewrite table references for table rename.
+/// Handles conflict targets, target WHERE, DO SET expressions, DO WHERE, and chained upserts.
+pub fn walk_upsert_for_table_rename(
+    upsert: &mut ast::Upsert,
+    old_table_norm: &str,
+    new_table_name: &str,
+) -> bool {
+    let mut changed = false;
+
+    // Walk conflict targets (UpsertIndex.targets is Vec<SortedColumn>)
+    if let Some(ref mut index) = upsert.index {
+        for target in &mut index.targets {
+            changed |= rewrite_expr_table_refs_for_rename(
+                &mut target.expr,
+                old_table_norm,
+                new_table_name,
+            );
+        }
+        if let Some(ref mut where_expr) = index.where_clause {
+            changed |=
+                rewrite_expr_table_refs_for_rename(where_expr, old_table_norm, new_table_name);
+        }
+    }
+
+    // Walk DO clause
+    if let ast::UpsertDo::Set { sets, where_clause } = &mut upsert.do_clause {
+        for set in sets {
+            changed |=
+                rewrite_expr_table_refs_for_rename(&mut set.expr, old_table_norm, new_table_name);
+        }
+        if let Some(ref mut where_expr) = where_clause {
+            changed |=
+                rewrite_expr_table_refs_for_rename(where_expr, old_table_norm, new_table_name);
+        }
+    }
+
+    // Recursively walk chained upserts
+    if let Some(ref mut next) = upsert.next {
+        changed |= walk_upsert_for_table_rename(next, old_table_norm, new_table_name);
+    }
+
+    changed
+}
+
 pub fn rewrite_expr_table_refs_for_rename(
     expr: &mut Box<ast::Expr>,
     old_table_norm: &str,
@@ -2640,12 +2684,22 @@ pub fn rewrite_expr_table_refs_for_rename(
     changed
 }
 
-fn rewrite_select_table_refs_for_rename(
+pub fn rewrite_select_table_refs_for_rename(
     select: &mut ast::Select,
     old_table_norm: &str,
     new_table_name: &str,
 ) -> bool {
     let mut changed = false;
+
+    if let Some(ref mut with) = select.with {
+        for cte in &mut with.ctes {
+            changed |= rewrite_select_table_refs_for_rename(
+                &mut cte.select,
+                old_table_norm,
+                new_table_name,
+            );
+        }
+    }
 
     changed |=
         rewrite_select_body_table_refs_for_rename(&mut select.body, old_table_norm, new_table_name);
