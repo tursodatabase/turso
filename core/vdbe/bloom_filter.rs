@@ -72,35 +72,24 @@ impl BloomFilter {
     /// Inserts a Value into the bloom filter.
     /// Safety NOTE: does not accept NULL values.
     pub fn insert_value(&mut self, value: &Value) {
-        match value {
-            Value::Integer(i) => {
-                self.inner.insert(i);
-            }
-            Value::Float(f) => {
-                self.inner.insert(&f.to_bits());
-            }
-            Value::Text(s) => {
-                self.inner.insert(&s.as_str().as_bytes());
-            }
-            Value::Blob(b) => {
-                self.inner.insert(&b.as_slice());
-            }
-            Value::Null => {
-                // we do not insert NULLs into
-            }
+        if !matches!(value, Value::Null) {
+            let mut hasher = rapidhash::fast::RapidHasher::default();
+            hash_value(&mut hasher, &value.as_ref());
+            let hash = hasher.finish();
+            self.inner.insert(&hash);
         }
         self.count += 1;
     }
 
     /// Checks if a Value might be in the bloom filter.
     pub fn contains_value(&self, value: &Value) -> bool {
-        match value {
-            Value::Integer(i) => self.inner.contains(i),
-            Value::Float(f) => self.inner.contains(&f.to_bits()),
-            Value::Text(s) => self.inner.contains(&s.as_str().as_bytes()),
-            Value::Blob(b) => self.inner.contains(&b.as_slice()),
-            Value::Null => false,
+        if matches!(value, Value::Null) {
+            return false;
         }
+        let mut hasher = rapidhash::fast::RapidHasher::default();
+        hash_value(&mut hasher, &value.as_ref());
+        let hash = hasher.finish();
+        self.inner.contains(&hash)
     }
 
     /// Inserts multiple owned Values as a composite key into the bloom filter.
@@ -154,12 +143,19 @@ fn hash_value<H: Hasher>(hasher: &mut H, value: &ValueRef) {
         // do nothing for NULLs as we will always return false for set membership
         ValueRef::Null => {}
         ValueRef::Integer(i) => {
-            1u8.hash(hasher);
-            i.hash(hasher);
+            // Hash integers in the same bucket as numerically equivalent REALs so
+            // bloom-filter membership can never return a false-negative for e.g. 10 vs 10.0.
+            let f = *i as f64;
+            if (f as i64) == *i && f.is_finite() {
+                hash_numeric(hasher, f);
+            } else {
+                // Fallback to the integer domain when the float representation would lose precision.
+                1u8.hash(hasher);
+                i.hash(hasher);
+            }
         }
         ValueRef::Float(f) => {
-            2u8.hash(hasher);
-            f.to_bits().hash(hasher);
+            hash_numeric(hasher, *f);
         }
         ValueRef::Text(s) => {
             3u8.hash(hasher);
@@ -169,6 +165,25 @@ fn hash_value<H: Hasher>(hasher: &mut H, value: &ValueRef) {
             4u8.hash(hasher);
             b.hash(hasher);
         }
+    }
+}
+
+/// Hashes numeric values (both INTEGER and REAL) into the same domain to mirror SQLite's
+/// numeric comparison semantics (e.g. 10 == 10.0, -0.0 == 0.0).
+fn hash_numeric<H: Hasher>(hasher: &mut H, f: f64) {
+    const NUMERIC_TAG: u8 = 2;
+    let bits = normalized_f64_bits(f);
+    NUMERIC_TAG.hash(hasher);
+    bits.hash(hasher);
+}
+
+/// Normalize signed zero so 0.0 and -0.0 hash the same.
+#[inline]
+fn normalized_f64_bits(f: f64) -> u64 {
+    if f == 0.0 {
+        0.0f64.to_bits()
+    } else {
+        f.to_bits()
     }
 }
 
@@ -204,7 +219,8 @@ mod bloomtests {
 
         assert!(bf.contains_value(&int_val));
         assert!(bf.contains_value(&text_val));
-        assert!(bf.contains_value(&null_val));
+        // NULLs are not hashed into the filter, so membership should be false.
+        assert!(!bf.contains_value(&null_val));
     }
 
     #[test]
@@ -229,5 +245,32 @@ mod bloomtests {
         // False positive rate should be around 1% (allow some variance)
         let rate = false_positives as f64 / test_count as f64;
         assert!(rate < 0.05, "False positive rate {rate} is too high");
+    }
+
+    #[test]
+    fn test_bloom_filter_numeric_equivalence() {
+        let mut bf = BloomFilter::new();
+
+        // Zero variants should all be found regardless of sign or int/float representation
+        let zero_float = Value::Float(0.0);
+        let zero_neg_float = Value::Float(-0.0);
+        let zero_int = Value::Integer(0);
+        bf.insert_value(&zero_float);
+        assert!(bf.contains_value(&zero_float));
+        assert!(bf.contains_value(&zero_neg_float));
+        assert!(bf.contains_value(&zero_int));
+
+        // Integer/float representations of the same numeric value should match
+        let ten_int = Value::Integer(10);
+        let ten_float = Value::Float(10.0);
+        bf.insert_value(&ten_int);
+        assert!(bf.contains_value(&ten_int));
+        assert!(bf.contains_value(&ten_float));
+
+        let neg_ten_float = Value::Float(-10.0);
+        let neg_ten_int = Value::Integer(-10);
+        bf.insert_value(&neg_ten_float);
+        assert!(bf.contains_value(&neg_ten_float));
+        assert!(bf.contains_value(&neg_ten_int));
     }
 }
