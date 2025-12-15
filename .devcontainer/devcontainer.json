@@ -17,9 +17,22 @@
     "vscode": {
       "extensions": [
         "anthropic.claude-code",
+        "eamodio.gitlens",
+
+        // Rust
+        "rust-lang.rust-analyzer",
+
+        // Go
+        "golang.Go",
+
+        // Python
+        "ms-python.python",
+        "ms-python.vscode-pylance",
+
+        // JavaScript / TypeScript
         "dbaeumer.vscode-eslint",
         "esbenp.prettier-vscode",
-        "eamodio.gitlens"
+        "ms-vscode.vscode-typescript-next"
       ],
       "settings": {
         "editor.formatOnSave": true,

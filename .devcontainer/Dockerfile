@@ -95,6 +95,10 @@ RUN set -eux; \
     curl -fsSL "https://go.dev/dl/go${GO_VERSION}.${GOOS}-${GOARCH}.tar.gz" \
       | sudo tar -C /usr/local -xz
 
+RUN go install golang.org/x/tools/gopls@latest
+RUN go install honnef.co/go/tools/cmd/staticcheck@latest
+RUN chown -R node:node /home/node/go
+
 # Set up non-root user
 USER node
 
