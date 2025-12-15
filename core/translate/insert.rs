@@ -9,6 +9,7 @@ use turso_parser::ast::{
 use crate::error::{
     SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE,
 };
+use crate::schema::SQLITE_SEQUENCE_TABLE;
 use crate::schema::{self, BTreeTable, ColDef, Index, IndexColumn, ResolvedFkRef, Table};
 use crate::translate::emitter::{
     emit_cdc_full_record, emit_cdc_insns, emit_cdc_patch_record, prepare_cdc_if_necessary,
@@ -634,7 +635,10 @@ fn emit_epilogue(
             collation: None,
         });
 
-        let seq_table = resolver.schema.get_btree_table("sqlite_sequence").unwrap();
+        let seq_table = resolver
+            .schema
+            .get_btree_table(SQLITE_SEQUENCE_TABLE)
+            .expect("sqlite_sequence table to exist");
         program.emit_insn(Insn::OpenWrite {
             cursor_id: seq_cursor_id,
             root_page: seq_table.root_page.into(),

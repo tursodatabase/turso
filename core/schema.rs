@@ -144,6 +144,7 @@ use turso_parser::{
 
 const SCHEMA_TABLE_NAME: &str = "sqlite_schema";
 const SCHEMA_TABLE_NAME_ALT: &str = "sqlite_master";
+pub const SQLITE_SEQUENCE_TABLE: &str = "sqlite_sequence";
 pub const DBSP_TABLE_PREFIX: &str = "__turso_internal_dbsp_state_v";
 
 /// Used to refer to the implicit rowid column in tables without an alias during UPDATE
