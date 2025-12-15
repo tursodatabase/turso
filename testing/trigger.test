@@ -815,3 +815,23 @@ do_execsql_test_on_specific_db {:memory:} trigger-table-qualified-where-clause {
   SELECT b, e FROM t1 ORDER BY a;
 } {should_stay|-5858539611.59103
 new_row|1.0}
+
+# https://github.com/tursodatabase/turso/issues/4007
+do_execsql_test_on_specific_db {:memory:} trigger-rename-table-on-clause {
+  CREATE TABLE t1 (id INT, val TEXT);
+  CREATE TRIGGER trg1 AFTER INSERT ON t1 BEGIN
+    INSERT INTO t1 VALUES (100, 'triggered');
+  END;
+  ALTER TABLE t1 RENAME TO t1_new;
+  SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='trg1';
+} {CREATE TRIGGER trg1 AFTER INSERT ON "t1_new" BEGIN INSERT INTO "t1_new" VALUES(100, 'triggered'); END}
+
+# table-qualified refs in WHERE clause get rewritten
+do_execsql_test_on_specific_db {:memory:} trigger-rename-table-qualified-refs {
+  CREATE TABLE t1 (id INT, val TEXT);
+  CREATE TRIGGER trg2 AFTER UPDATE ON t1 WHEN t1.id > 5 BEGIN
+    UPDATE t1 SET val = 'updated' WHERE t1.id = NEW.id;
+  END;
+  ALTER TABLE t1 RENAME TO t1_new;
+  SELECT sql FROM sqlite_schema WHERE type='trigger' AND name='trg2';
+} {CREATE TRIGGER trg2 AFTER UPDATE ON "t1_new" WHEN "t1_new".id > 5 BEGIN UPDATE "t1_new" SET val = 'updated' WHERE "t1_new".id = NEW.id; END}
