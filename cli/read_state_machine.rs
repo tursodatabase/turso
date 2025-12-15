@@ -376,4 +376,13 @@ mod tests {
         assert!(is_complete("SELECT 'it''s';"));
         assert!(is_complete(r#"SELECT "col""name";"#));
     }
+
+    #[test]
+    fn test_non_terminated_literal() {
+        assert!(!is_complete(
+            "create virtual table t1 using csv(data=\"12');"
+        ));
+    }
 }
+
+// create virtual table t1 using csv(data=\"12');
