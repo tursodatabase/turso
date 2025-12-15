@@ -2661,7 +2661,17 @@ impl WalFileShared {
         path: &str,
         flags: crate::OpenFlags,
     ) -> Result<Arc<RwLock<WalFileShared>>> {
-        let file = io.open_file(path, flags, false)?;
+        let file = match io.open_file(path, flags, false) {
+            Ok(file) => file,
+            Err(LimboError::CompletionError(CompletionError::IOError(
+                std::io::ErrorKind::NotFound,
+            ))) if flags.contains(crate::OpenFlags::ReadOnly) => {
+                // In readonly mode, if the WAL file doesn't exist, we just return a noop WAL
+                // since there's nothing to read from.
+                return Ok(WalFileShared::new_noop());
+            }
+            Err(e) => return Err(e),
+        };
         if file.size()? == 0 {
             return Ok(WalFileShared::new_noop());
         }
