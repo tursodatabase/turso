@@ -3364,6 +3364,385 @@ mod fuzz_tests {
         }
     }
 
+    /// Fuzz test for trigger SQL rewriting during ALTER TABLE RENAME operations.
+    /// Creates triggers with table-qualified column references, renames tables,
+    /// and verifies that Turso rewrites trigger SQL the same way as SQLite.
+    ///
+    /// Coverage scenarios:
+    /// - Scenario A: Trigger ON t0, body targets t0 → tests ON clause + body rewrite
+    /// - Scenario B: Trigger ON t1, body targets t0 → tests body-only rewrite (cross-table)
+    /// - Random: Various combinations for additional coverage
+    ///
+    /// Verification:
+    /// 1. Limbo SQL must match SQLite SQL exactly (whitespace normalized)
+    /// 2. Old table name must NOT appear in rewritten SQL (explicit check)
+    /// 3. New table name must appear when qualified refs existed (explicit check)
+    #[turso_macros::test()]
+    pub fn trigger_rename_fuzz(db: TempDatabase) {
+        let _ = env_logger::try_init();
+        let (mut rng, seed) = rng_from_time_or_env();
+        println!("trigger_rename_fuzz seed: {seed}");
+
+        const ITERATIONS: usize = 200;
+
+        // Track trigger info for verification
+        struct TriggerInfo {
+            name: String,
+            on_table_idx: usize,
+            body_target_idx: usize,
+            has_qualified_ref_on_target: bool,
+        }
+
+        // Helper: Check if SQL contains a table-qualified reference (handles quoted identifiers)
+        fn contains_qualified_ref(sql: &str, table_name: &str) -> bool {
+            sql.contains(&format!("{table_name}.")) || sql.contains(&format!("\"{table_name}\"."))
+        }
+
+        // Helper: Check if SQL contains table name in ON clause (handles quoted identifiers)
+        fn contains_on_clause(sql: &str, table_name: &str) -> bool {
+            sql.contains(&format!("ON {table_name}"))
+                || sql.contains(&format!("ON \"{table_name}\""))
+        }
+
+        for i in 0..ITERATIONS {
+            let limbo_conn = db.connect_limbo();
+            let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+
+            // Forced coverage modes:
+            // - Every 5th iteration is forced
+            // - Alternates between two scenarios
+            let forced_coverage = i % 5 == 0;
+            let forced_scenario = if forced_coverage {
+                (i / 5) % 2
+            } else {
+                usize::MAX
+            };
+            // Scenario 0: Trigger on t0, target t0 (same table - tests ON clause + body)
+            // Scenario 1: Trigger on t1, target t0 (cross-table - tests body-only rewrite)
+
+            // Create 2-3 tables (need at least 2 for cross-table scenario)
+            let num_tables = if forced_coverage {
+                2.max(rng.random_range(2..=3))
+            } else {
+                rng.random_range(2..=3) // Always 2+ for proper coverage
+            };
+            let mut table_names: Vec<String> = Vec::new();
+            let mut table_cols: Vec<usize> = Vec::new();
+
+            for t in 0..num_tables {
+                let table_name = format!("t{t}");
+                let num_cols = rng.random_range(2..=4);
+                let cols: Vec<String> = (0..num_cols).map(|c| format!("c{c} INTEGER")).collect();
+                let create_sql = format!("CREATE TABLE {} ({})", table_name, cols.join(", "));
+
+                limbo_exec_rows(&limbo_conn, &create_sql);
+                sqlite_exec_rows(&sqlite_conn, &create_sql);
+
+                table_names.push(table_name);
+                table_cols.push(num_cols);
+            }
+
+            // Create triggers and track their properties
+            let num_triggers = if forced_coverage {
+                2
+            } else {
+                rng.random_range(1..=2)
+            };
+            let mut triggers: Vec<TriggerInfo> = Vec::new();
+
+            for tr in 0..num_triggers {
+                let trigger_name = format!("trg{tr}");
+
+                // Determine trigger's ON clause table and body target table
+                let (on_clause_table_idx, body_target_idx) = if forced_coverage && tr == 0 {
+                    match forced_scenario {
+                        0 => (0, 0), // Same table: trigger on t0, body targets t0
+                        1 => (1, 0), // Cross-table: trigger on t1, body targets t0
+                        _ => unreachable!(),
+                    }
+                } else {
+                    (
+                        rng.random_range(0..num_tables),
+                        rng.random_range(0..num_tables),
+                    )
+                };
+
+                let on_clause_table = &table_names[on_clause_table_idx];
+                let on_clause_table_cols = table_cols[on_clause_table_idx];
+                let body_target_table = &table_names[body_target_idx];
+                let body_target_cols = table_cols[body_target_idx];
+
+                // Trigger timing and event
+                let timing = if rng.random_bool(0.5) {
+                    "BEFORE"
+                } else {
+                    "AFTER"
+                };
+                // In forced mode, prefer UPDATE/DELETE which can have table-qualified WHERE
+                let event = if forced_coverage && tr == 0 {
+                    if rng.random_bool(0.5) {
+                        "UPDATE"
+                    } else {
+                        "DELETE"
+                    }
+                } else {
+                    match rng.random_range(0..3) {
+                        0 => "INSERT",
+                        1 => "UPDATE",
+                        _ => "DELETE",
+                    }
+                };
+
+                let has_old = event == "UPDATE" || event == "DELETE";
+                let has_new = event == "UPDATE" || event == "INSERT";
+
+                // WHEN clause (OLD/NEW refs only - table-qualified refs invalid per SQLite)
+                let when_clause = if rng.random_bool(0.3) && (has_old || has_new) {
+                    let col_idx = rng.random_range(0..on_clause_table_cols);
+                    let ref_type = if has_new && rng.random_bool(0.5) {
+                        "NEW"
+                    } else if has_old {
+                        "OLD"
+                    } else {
+                        "NEW"
+                    };
+                    format!(
+                        " WHEN {}.c{} > {}",
+                        ref_type,
+                        col_idx,
+                        rng.random_range(0..100)
+                    )
+                } else {
+                    String::new()
+                };
+
+                // Track if this trigger has qualified refs on body target
+                let mut has_qualified_ref = false;
+
+                // Generate trigger command
+                let trigger_cmd = match rng.random_range(0..3) {
+                    0 => {
+                        // INSERT - uses only NEW/OLD refs (table-qualified invalid in VALUES)
+                        let mut values = Vec::new();
+                        for c in 0..body_target_cols {
+                            let on_clause_col_idx = c % on_clause_table_cols;
+                            let value = if has_new && rng.random_bool(0.3) {
+                                format!("NEW.c{on_clause_col_idx}")
+                            } else if has_old && rng.random_bool(0.3) {
+                                format!("OLD.c{on_clause_col_idx}")
+                            } else {
+                                rng.random_range(0..100).to_string()
+                            };
+                            values.push(value);
+                        }
+                        let cols: Vec<String> =
+                            (0..body_target_cols).map(|c| format!("c{c}")).collect();
+                        format!(
+                            "INSERT INTO {} ({}) VALUES ({})",
+                            body_target_table,
+                            cols.join(", "),
+                            values.join(", ")
+                        )
+                    }
+
+                    1 => {
+                        // UPDATE with table-qualified WHERE
+                        let set_col = rng.random_range(0..body_target_cols);
+                        let on_clause_col_idx = rng.random_range(0..on_clause_table_cols);
+                        let set_value = if has_new && rng.random_bool(0.3) {
+                            format!("NEW.c{on_clause_col_idx}")
+                        } else if has_old && rng.random_bool(0.3) {
+                            format!("OLD.c{on_clause_col_idx}")
+                        } else {
+                            rng.random_range(0..100).to_string()
+                        };
+
+                        // Force qualified WHERE in forced mode, 85% otherwise
+                        let use_qualified_where =
+                            (forced_coverage && tr == 0) || rng.random_bool(0.85);
+                        let where_clause = if use_qualified_where {
+                            let where_col = rng.random_range(0..body_target_cols);
+                            has_qualified_ref = true;
+                            format!(
+                                " WHERE {}.c{} > {}",
+                                body_target_table,
+                                where_col,
+                                rng.random_range(0..100)
+                            )
+                        } else {
+                            String::new()
+                        };
+
+                        format!(
+                            "UPDATE {body_target_table} SET c{set_col} = {set_value}{where_clause}"
+                        )
+                    }
+                    _ => {
+                        // DELETE with table-qualified WHERE
+                        let use_qualified_where =
+                            (forced_coverage && tr == 0) || rng.random_bool(0.85);
+                        let where_clause = if use_qualified_where {
+                            let where_col = rng.random_range(0..body_target_cols);
+                            has_qualified_ref = true;
+                            format!(
+                                " WHERE {}.c{} < {}",
+                                body_target_table,
+                                where_col,
+                                rng.random_range(0..100)
+                            )
+                        } else {
+                            String::new()
+                        };
+                        format!("DELETE FROM {body_target_table}{where_clause}")
+                    }
+                };
+
+                let create_trigger = format!(
+                    "CREATE TRIGGER {trigger_name} {timing} {event} ON {on_clause_table}{when_clause} BEGIN {trigger_cmd}; END"
+                );
+
+                let scenario_label = match forced_scenario {
+                    0 => "[SAME-TABLE]",
+                    1 => "[CROSS-TABLE]",
+                    _ => "",
+                };
+                if forced_coverage && tr == 0 {
+                    println!("Iter {i} {scenario_label}: {create_trigger}");
+                } else {
+                    println!("Iter {i}: {create_trigger}");
+                }
+
+                limbo_exec_rows(&limbo_conn, &create_trigger);
+                sqlite_exec_rows(&sqlite_conn, &create_trigger);
+
+                triggers.push(TriggerInfo {
+                    name: trigger_name,
+                    on_table_idx: on_clause_table_idx,
+                    body_target_idx,
+                    has_qualified_ref_on_target: has_qualified_ref,
+                });
+            }
+
+            // Always rename t0 in forced mode, random otherwise
+            let rename_idx = if forced_coverage {
+                0
+            } else {
+                rng.random_range(0..num_tables)
+            };
+            let old_name = table_names[rename_idx].clone();
+            let new_name = format!("renamed_{}", rng.random_range(1000..9999));
+
+            let rename_sql = format!("ALTER TABLE {old_name} RENAME TO {new_name}");
+            let scenario_label = match forced_scenario {
+                0 => "[SAME-TABLE]",
+                1 => "[CROSS-TABLE]",
+                _ => "",
+            };
+            if forced_coverage {
+                println!("Iter {i} {scenario_label}: {rename_sql}");
+            } else {
+                println!("Iter {i}: {rename_sql}");
+            }
+
+            limbo_exec_rows(&limbo_conn, &rename_sql);
+            sqlite_exec_rows(&sqlite_conn, &rename_sql);
+
+            // Verify trigger SQL after rename
+            for trigger in &triggers {
+                let query = format!(
+                    "SELECT sql FROM sqlite_schema WHERE type = 'trigger' AND name = '{}' ORDER BY name",
+                    trigger.name
+                );
+
+                let limbo_result = limbo_exec_rows(&limbo_conn, &query);
+                let sqlite_result = sqlite_exec_rows(&sqlite_conn, &query);
+
+                assert_eq!(
+                    limbo_result.len(),
+                    sqlite_result.len(),
+                    "Different result count for trigger '{}' (seed: {}, iter: {})",
+                    trigger.name,
+                    seed,
+                    i
+                );
+
+                if !limbo_result.is_empty() && !sqlite_result.is_empty() {
+                    let limbo_sql = match &limbo_result[0][0] {
+                        Value::Text(s) => s.clone(),
+                        _ => panic!("Expected text for trigger SQL"),
+                    };
+                    let sqlite_sql = match &sqlite_result[0][0] {
+                        Value::Text(s) => s.clone(),
+                        _ => panic!("Expected text for trigger SQL"),
+                    };
+
+                    // Normalize whitespace only (preserve case for exact matching)
+                    let limbo_norm: String =
+                        limbo_sql.split_whitespace().collect::<Vec<_>>().join(" ");
+                    let sqlite_norm: String =
+                        sqlite_sql.split_whitespace().collect::<Vec<_>>().join(" ");
+
+                    // Primary check: Limbo must match SQLite exactly
+                    assert_eq!(
+                        limbo_norm, sqlite_norm,
+                        "Trigger SQL mismatch for '{}' after rename '{}' -> '{}' (seed: {}, iter: {})\nLimbo:  {}\nSQLite: {}",
+                        trigger.name, old_name, new_name, seed, i, limbo_sql, sqlite_sql
+                    );
+
+                    // Explicit rewrite verification for triggers affected by the rename
+                    let trigger_on_renamed = trigger.on_table_idx == rename_idx;
+                    let body_refs_renamed = trigger.body_target_idx == rename_idx
+                        && trigger.has_qualified_ref_on_target;
+
+                    if trigger_on_renamed || body_refs_renamed {
+                        // Old table name (as table-qualified ref) must NOT be in SQL
+                        assert!(
+                            !contains_qualified_ref(&limbo_sql, &old_name),
+                            "Old table '{old_name}' still has qualified refs in Limbo SQL after rename (seed: {seed}, iter: {i})\nSQL: {limbo_sql}"
+                        );
+                        assert!(
+                            !contains_qualified_ref(&sqlite_sql, &old_name),
+                            "Old table '{old_name}' still has qualified refs in SQLite SQL after rename (seed: {seed}, iter: {i})\nSQL: {sqlite_sql}"
+                        );
+
+                        // New table name must appear if we had qualified refs
+                        if body_refs_renamed {
+                            assert!(
+                                contains_qualified_ref(&limbo_sql, &new_name),
+                                "New table '{new_name}' not found as qualified ref in Limbo SQL (seed: {seed}, iter: {i})\nSQL: {limbo_sql}"
+                            );
+                        }
+
+                        // ON clause must reference new name if trigger was on renamed table
+                        if trigger_on_renamed {
+                            assert!(
+                                contains_on_clause(&limbo_sql, &new_name),
+                                "ON clause doesn't reference new table '{new_name}' in Limbo (seed: {seed}, iter: {i})\nSQL: {limbo_sql}"
+                            );
+                        }
+                    }
+                }
+            }
+
+            // Cleanup with logging
+            for trigger in &triggers {
+                let drop_sql = format!("DROP TRIGGER IF EXISTS {}", trigger.name);
+                if let Err(e) = limbo_exec_rows_fallible(&db, &limbo_conn, &drop_sql) {
+                    eprintln!("Warning: failed to drop trigger {}: {:?}", trigger.name, e);
+                }
+                let _ = sqlite_conn.execute(&drop_sql, params![]);
+            }
+            for (idx, name) in table_names.iter().enumerate() {
+                let actual_name = if idx == rename_idx { &new_name } else { name };
+                let drop_sql = format!("DROP TABLE IF EXISTS {actual_name}");
+                if let Err(e) = limbo_exec_rows_fallible(&db, &limbo_conn, &drop_sql) {
+                    eprintln!("Warning: failed to drop table {actual_name}: {e:?}");
+                }
+                let _ = sqlite_conn.execute(&drop_sql, params![]);
+            }
+        }
+    }
+
     #[turso_macros::test(mvcc)]
     pub fn arithmetic_expression_fuzz(db: TempDatabase) {
         let _ = env_logger::try_init();

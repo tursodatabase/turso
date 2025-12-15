@@ -14,6 +14,10 @@ use crate::storage::journal_mode;
 use crate::storage::page_cache::PageCache;
 use crate::storage::pager::{default_page1, CreateBTreeFlags, PageRef};
 use crate::storage::sqlite3_ondisk::{read_varint_fast, DatabaseHeader, PageSize, RawVersion};
+use crate::translate::alter::{
+    rewrite_expr_table_refs_for_rename, rewrite_select_table_refs_for_rename,
+    walk_upsert_for_table_rename,
+};
 use crate::translate::collate::CollationSeq;
 use crate::types::{
     compare_immutable, compare_records_generic, AsValueRef, Extendable, IOCompletions,
@@ -5853,12 +5857,11 @@ pub fn op_function(
                                 }
 
                                 if let Some(ref mut when_expr) = when_clause {
-                                    changed |=
-                                        crate::translate::alter::rewrite_expr_table_refs_for_rename(
-                                            when_expr,
-                                            &rename_from,
-                                            original_rename_to.as_str(),
-                                        );
+                                    changed |= rewrite_expr_table_refs_for_rename(
+                                        when_expr,
+                                        &rename_from,
+                                        original_rename_to.as_str(),
+                                    );
                                 }
 
                                 for cmd in &mut commands {
@@ -5877,8 +5880,10 @@ pub fn op_function(
                                                 changed = true;
                                             }
                                             for set in sets {
-                                                changed |= crate::translate::alter::rewrite_expr_table_refs_for_rename(
-                                                    &mut set.expr, &rename_from, original_rename_to.as_str()
+                                                changed |= rewrite_expr_table_refs_for_rename(
+                                                    &mut set.expr,
+                                                    &rename_from,
+                                                    original_rename_to.as_str(),
                                                 );
                                             }
 
@@ -5887,15 +5892,20 @@ pub fn op_function(
                                                     if let Some(ast::JoinConstraint::On(expr)) =
                                                         &mut join.constraint
                                                     {
-                                                        changed |= crate::translate::alter::rewrite_expr_table_refs_for_rename(
-                                                            expr, &rename_from, original_rename_to.as_str()
-                                                        );
+                                                        changed |=
+                                                            rewrite_expr_table_refs_for_rename(
+                                                                expr,
+                                                                &rename_from,
+                                                                original_rename_to.as_str(),
+                                                            );
                                                     }
                                                 }
                                             }
                                             if let Some(ref mut where_expr) = where_clause {
-                                                changed |= crate::translate::alter::rewrite_expr_table_refs_for_rename(
-                                                    where_expr, &rename_from, original_rename_to.as_str()
+                                                changed |= rewrite_expr_table_refs_for_rename(
+                                                    where_expr,
+                                                    &rename_from,
+                                                    original_rename_to.as_str(),
                                                 );
                                             }
                                         }
@@ -5912,13 +5922,17 @@ pub fn op_function(
                                                 changed = true;
                                             }
 
-                                            changed |= crate::translate::alter::rewrite_select_table_refs_for_rename(
-                                                select, &rename_from, original_rename_to.as_str()
+                                            changed |= rewrite_select_table_refs_for_rename(
+                                                select,
+                                                &rename_from,
+                                                original_rename_to.as_str(),
                                             );
 
                                             if let Some(ref mut upsert_clause) = upsert {
-                                                changed |= crate::translate::alter::walk_upsert_for_table_rename(
-                                                    upsert_clause, &rename_from, original_rename_to.as_str()
+                                                changed |= walk_upsert_for_table_rename(
+                                                    upsert_clause,
+                                                    &rename_from,
+                                                    original_rename_to.as_str(),
                                                 );
                                             }
                                         }
@@ -5933,14 +5947,18 @@ pub fn op_function(
                                                 changed = true;
                                             }
                                             if let Some(ref mut where_expr) = where_clause {
-                                                changed |= crate::translate::alter::rewrite_expr_table_refs_for_rename(
-                                                    where_expr, &rename_from, original_rename_to.as_str()
+                                                changed |= rewrite_expr_table_refs_for_rename(
+                                                    where_expr,
+                                                    &rename_from,
+                                                    original_rename_to.as_str(),
                                                 );
                                             }
                                         }
                                         ast::TriggerCmd::Select(select) => {
-                                            changed |= crate::translate::alter::rewrite_select_table_refs_for_rename(
-                                                select, &rename_from, original_rename_to.as_str()
+                                            changed |= rewrite_select_table_refs_for_rename(
+                                                select,
+                                                &rename_from,
+                                                original_rename_to.as_str(),
                                             );
                                         }
                                     }
