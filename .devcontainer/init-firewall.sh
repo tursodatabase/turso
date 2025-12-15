@@ -65,6 +65,10 @@ done < <(echo "$gh_ranges" | jq -r '(.web + .api + .git)[]' | aggregate -q)
 
 # Resolve and add other allowed domains
 for domain in \
+    "files.pythonhosted.org" \
+    "static.crates.io" \
+    "index.crates.io" \
+    "proxy.golang.org" \
     "registry.npmjs.org" \
     "api.anthropic.com" \
     "sentry.io" \
