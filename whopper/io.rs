@@ -3,6 +3,7 @@ use rand::{Rng, RngCore};
 use rand_chacha::ChaCha8Rng;
 use std::collections::{HashMap, HashSet};
 use std::fs::{File as StdFile, OpenOptions};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use tracing::debug;
 use turso_core::{Clock, Completion, File, IO, Instant, OpenFlags, Result};
@@ -27,6 +28,8 @@ pub struct SimulatorIO {
     keep_files: bool,
     rng: Mutex<ChaCha8Rng>,
     fault_config: IOFaultConfig,
+    /// Simulated time in microseconds, incremented on each step
+    time: AtomicU64,
 }
 
 impl SimulatorIO {
@@ -38,6 +41,7 @@ impl SimulatorIO {
             keep_files,
             rng: Mutex::new(rng),
             fault_config,
+            time: AtomicU64::new(0),
         }
     }
 
@@ -68,7 +72,11 @@ impl Drop for SimulatorIO {
 
 impl Clock for SimulatorIO {
     fn now(&self) -> Instant {
-        Instant { secs: 0, micros: 0 } // Simple implementation for now
+        let micros = self.time.load(Ordering::Relaxed);
+        Instant {
+            secs: (micros / 1_000_000) as i64,
+            micros: (micros % 1_000_000) as u32,
+        }
     }
 }
 
@@ -94,6 +102,9 @@ impl IO for SimulatorIO {
     }
 
     fn step(&self) -> Result<()> {
+        // Advance simulated time by 1ms per step
+        self.time.fetch_add(1000, Ordering::Relaxed);
+
         // Inject cosmic ray faults with configured probability
         if self.fault_config.cosmic_ray_probability > 0.0 {
             let mut rng = self.rng.lock().unwrap();
