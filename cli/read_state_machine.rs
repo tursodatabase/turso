@@ -1,3 +1,7 @@
+use std::ops::ControlFlow;
+
+use itertools::Itertools;
+
 /// State machine for determining if a SQL statement is complete.
 /// Based on SQLite's `sqlite3_complete()` from src/complete.c
 ///
@@ -39,6 +43,81 @@ enum Token {
     TkEnd,
 }
 
+struct Tokenizer<'a> {
+    chars: std::iter::Peekable<std::str::Chars<'a>>,
+}
+
+impl<'a> Tokenizer<'a> {
+    fn new(chars: std::iter::Peekable<std::str::Chars<'a>>) -> Self {
+        Self { chars }
+    }
+
+    /// Read an identifier/keyword and classify it
+    fn read_keyword(&mut self, first: char) -> Token {
+        let word: String = std::iter::once(first)
+            .chain(
+                self.chars
+                    .peeking_take_while(|c| c.is_ascii_alphanumeric() || *c == '_'),
+            )
+            .collect();
+
+        match word.to_ascii_uppercase().as_str() {
+            "EXPLAIN" => Token::TkExplain,
+            "CREATE" => Token::TkCreate,
+            "TEMP" | "TEMPORARY" => Token::TkTemp,
+            "TRIGGER" => Token::TkTrigger,
+            "END" => Token::TkEnd,
+            _ => Token::TkOther,
+        }
+    }
+}
+
+impl<'a> Iterator for Tokenizer<'a> {
+    type Item = Token;
+
+    fn next(&mut self) -> Option<Token> {
+        loop {
+            let c = self.chars.next()?;
+
+            let token = match c {
+                '\'' | '"' | '`' | '[' => {
+                    let end_char = if c == '[' { ']' } else { c };
+                    // Consumes all tokens between the delimeters
+                    self.chars
+                        .by_ref()
+                        .take_while_inclusive(|&ch| ch != end_char)
+                        .for_each(drop);
+                    continue;
+                }
+                // Handle Comments
+                '-' if self.chars.peek() == Some(&'-') => {
+                    self.chars.next(); // Consume second `-`
+                                       // Consume until you find a new line
+                    self.chars.by_ref().find(|&ch| ch == '\n');
+                    continue;
+                }
+                '/' if self.chars.peek() == Some(&'*') => {
+                    // Consumes until you find a `*/`
+                    let _ = self.chars.by_ref().try_fold(false, |saw_star, c| {
+                        if saw_star && c == '/' {
+                            ControlFlow::Break(())
+                        } else {
+                            ControlFlow::Continue(c == '*')
+                        }
+                    });
+                    continue;
+                }
+                ';' => Token::TkSemi,
+                c if c.is_ascii_whitespace() => Token::TkWhitespace,
+                c if c.is_ascii_alphabetic() || c == '_' => self.read_keyword(c),
+                _ => Token::TkOther,
+            };
+
+            break Some(token);
+        }
+    }
+}
+
 impl ReadState {
     /// Returns true if the state machine is in a "complete" state,
     /// meaning the accumulated SQL forms a complete statement.
@@ -46,6 +125,7 @@ impl ReadState {
         matches!(self, ReadState::Start)
     }
 
+    // Copied form SQLite
     /// Process a single character and return the new state.
     /// This should be called for each character in the input.
     fn transition(&self, token: Token) -> ReadState {
@@ -119,121 +199,9 @@ impl ReadState {
     /// Process a SQL string and update the state.
     /// Returns the new state after processing all input.
     pub fn process(&mut self, sql: &str) {
-        let mut chars = sql.chars().peekable();
+        let chars = sql.chars().peekable();
 
-        while let Some(c) = chars.next() {
-            // Handle string literals - skip until closing quote
-            if c == '\'' {
-                while let Some(ch) = chars.next() {
-                    if ch == '\'' {
-                        // Check for escaped quote ''
-                        if chars.peek() == Some(&'\'') {
-                            chars.next();
-                        } else {
-                            break;
-                        }
-                    }
-                }
-                continue;
-            }
-
-            // Handle double-quoted identifiers
-            if c == '"' {
-                while let Some(ch) = chars.next() {
-                    if ch == '"' {
-                        if chars.peek() == Some(&'"') {
-                            chars.next();
-                        } else {
-                            break;
-                        }
-                    }
-                }
-                continue;
-            }
-
-            // Handle bracketed identifiers [...]
-            if c == '[' {
-                for ch in chars.by_ref() {
-                    if ch == ']' {
-                        break;
-                    }
-                }
-                continue;
-            }
-
-            // Handle backtick identifiers `...`
-            if c == '`' {
-                for ch in chars.by_ref() {
-                    if ch == '`' {
-                        break;
-                    }
-                }
-                continue;
-            }
-
-            // Handle -- line comments
-            if c == '-' && chars.peek() == Some(&'-') {
-                chars.next();
-                for ch in chars.by_ref() {
-                    if ch == '\n' {
-                        break;
-                    }
-                }
-                continue;
-            }
-
-            // Handle /* block comments */
-            if c == '/' && chars.peek() == Some(&'*') {
-                chars.next();
-                while let Some(ch) = chars.next() {
-                    if ch == '*' && chars.peek() == Some(&'/') {
-                        chars.next();
-                        break;
-                    }
-                }
-                continue;
-            }
-
-            // Handle semicolons
-            if c == ';' {
-                *self = self.transition(Token::TkSemi);
-                continue;
-            }
-
-            // Handle whitespace
-            if c.is_ascii_whitespace() {
-                *self = self.transition(Token::TkWhitespace);
-                continue;
-            }
-
-            // Handle identifiers/keywords
-            if c.is_ascii_alphabetic() || c == '_' {
-                let mut word = String::new();
-                word.push(c);
-                while let Some(&ch) = chars.peek() {
-                    if ch.is_ascii_alphanumeric() || ch == '_' {
-                        word.push(ch);
-                        chars.next();
-                    } else {
-                        break;
-                    }
-                }
-
-                let token = match word.to_ascii_uppercase().as_str() {
-                    "EXPLAIN" => Token::TkExplain,
-                    "CREATE" => Token::TkCreate,
-                    "TEMP" | "TEMPORARY" => Token::TkTemp,
-                    "TRIGGER" => Token::TkTrigger,
-                    "END" => Token::TkEnd,
-                    _ => Token::TkOther,
-                };
-                *self = self.transition(token);
-                continue;
-            }
-
-            // Everything else is OTHER
-            *self = self.transition(Token::TkOther);
-        }
+        *self = Tokenizer::new(chars).fold(*self, |state, token| state.transition(token));
     }
 }
 

@@ -50,6 +50,7 @@ termimad = "0.30"
 include_dir = "0.7"
 rand = "0.8"
 mimalloc = { workspace = true, optional = true }
+itertools.workspace = true
 
 [features]
 default = ["io_uring", "mimalloc"]

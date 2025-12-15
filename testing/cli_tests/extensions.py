@@ -801,12 +801,6 @@ def test_csv():
         lambda res: "unrecognized token " in res,
         "Create CSV table with malformed escape sequence",
     )
-    # SQLite does not accept this kind of input, it will just block
-    # turso.run_test_fn(
-    #     "create virtual table t1 using csv(data=\"12');",
-    #     lambda res: "non-terminated literal " in res,
-    #     "Create CSV table with unterminated quoted string",
-    # )
 
     turso.run_debug("create virtual table t1 using csv(data='');")
     turso.run_test_fn(
