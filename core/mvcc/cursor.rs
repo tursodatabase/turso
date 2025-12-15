@@ -14,7 +14,7 @@ use crate::types::{
     compare_immutable, IOCompletions, IOResult, ImmutableRecord, IndexInfo, RecordCursor, SeekKey,
     SeekOp, SeekResult,
 };
-use crate::{return_if_io, Completion, LimboError, Result, IO};
+use crate::{return_if_io, Completion, LimboError, Result};
 use crate::{Pager, Value};
 use std::any::Any;
 use std::cell::{Ref, RefCell};
@@ -309,6 +309,7 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
     pub fn current_row(
         &self,
     ) -> Result<IOResult<Option<std::cell::Ref<'_, crate::types::ImmutableRecord>>>> {
+        tracing::trace!("current_row({:?})", self.current_pos.borrow().clone());
         match *self.current_pos.borrow() {
             CursorPosition::Loaded {
                 row_id: _,
@@ -381,10 +382,10 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
         let locked = self.next_rowid_lock.write();
         if locked {
             self.creating_new_rowid = true;
-            return Ok(IOResult::Done(()));
+            Ok(IOResult::Done(()))
         } else {
             // Yield, some other cursor is generating new rowid
-            return Ok(IOResult::IO(IOCompletions::Single(Completion::new_yield())));
+            Ok(IOResult::IO(IOCompletions::Single(Completion::new_yield())))
         }
     }
 
