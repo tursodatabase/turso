@@ -184,6 +184,15 @@ pub fn translate_inner(
             when_clause,
             commands,
         } => {
+            // SQLite disallows RETURNING clause inside triggers
+            for cmd in &commands {
+                if let ast::TriggerCmd::Insert { returning, .. } = cmd {
+                    if !returning.is_empty() {
+                        bail_parse_error!("can't use RETURNING in a trigger");
+                    }
+                }
+            }
+
             // Reconstruct SQL for storage
             let sql = trigger::create_trigger_to_sql(
                 temporary,

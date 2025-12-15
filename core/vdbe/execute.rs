@@ -5903,7 +5903,6 @@ pub fn op_function(
                                             tbl_name,
                                             select,
                                             upsert,
-                                            returning,
                                             ..
                                         } => {
                                             if normalize_ident(tbl_name.as_str()) == rename_from {
@@ -5916,14 +5915,6 @@ pub fn op_function(
                                             changed |= crate::translate::alter::rewrite_select_table_refs_for_rename(
                                                 select, &rename_from, original_rename_to.as_str()
                                             );
-
-                                            for rc in returning {
-                                                if let ast::ResultColumn::Expr(expr, _) = rc {
-                                                    changed |= crate::translate::alter::rewrite_expr_table_refs_for_rename(
-                                                        expr, &rename_from, original_rename_to.as_str()
-                                                    );
-                                                }
-                                            }
 
                                             if let Some(ref mut upsert_clause) = upsert {
                                                 changed |= crate::translate::alter::walk_upsert_for_table_rename(

@@ -873,3 +873,12 @@ do_execsql_test_on_specific_db {:memory:} trigger-rename-select-cmd {
 } {{CREATE TRIGGER trg5 AFTER INSERT ON "t1_new" BEGIN
 SELECT count (*) FROM "t1_new" WHERE "t1_new".id > 0;
 END}}
+
+# SQLite disallows RETURNING clause inside triggers
+do_execsql_test_in_memory_any_error trigger-returning-not-allowed {
+  CREATE TABLE t1 (id INT, val TEXT);
+  CREATE TABLE t2 (id INT);
+  CREATE TRIGGER trg AFTER INSERT ON t1 BEGIN
+    INSERT INTO t2 VALUES (NEW.id) RETURNING id;
+  END;
+}
