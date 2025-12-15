@@ -5840,7 +5840,7 @@ pub fn op_function(
                                 event,
                                 mut tbl_name,
                                 for_each_row,
-                                when_clause,
+                                mut when_clause,
                                 mut commands,
                             } => {
                                 // when renaming a table,we need to update table names inside trigger too
@@ -5854,18 +5854,71 @@ pub fn op_function(
                                     changed = true;
                                 }
 
-                                
+                                if let Some(ref mut when_expr) = when_clause {
+                                    changed |= crate::translate::alter::rewrite_expr_table_refs_for_rename(
+                                        when_expr, &rename_from, original_rename_to.as_str()
+                                    );
+                                }
+
                                 for cmd in &mut commands {
                                     match cmd {
-                                        ast::TriggerCmd::Update { tbl_name, .. }
-                                        | ast::TriggerCmd::Insert { tbl_name, .. }
-                                        | ast::TriggerCmd::Delete { tbl_name, .. } => {
+                                        ast::TriggerCmd::Update { tbl_name, sets, from, where_clause, .. } => {
                                             if normalize_ident(tbl_name.as_str()) == rename_from {
                                                 *tbl_name = Name::from_string(format!(
                                                     "\"{}\"",
                                                     original_rename_to
                                                 ));
                                                 changed = true;
+                                            }
+                                            for set in sets {
+                                                changed |= crate::translate::alter::rewrite_expr_table_refs_for_rename(
+                                                    &mut set.expr, &rename_from, original_rename_to.as_str()
+                                                );
+                                            }
+                                            
+                                            if let Some(ref mut from_clause) = from {
+                                                for join in &mut from_clause.joins {
+                                                    if let Some(ref mut constraint) = join.constraint {
+                                                        if let ast::JoinConstraint::On(expr) = constraint {
+                                                            changed |= crate::translate::alter::rewrite_expr_table_refs_for_rename(
+                                                                expr, &rename_from, original_rename_to.as_str()
+                                                            );
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            if let Some(ref mut where_expr) = where_clause {
+                                                changed |= crate::translate::alter::rewrite_expr_table_refs_for_rename(
+                                                    where_expr, &rename_from, original_rename_to.as_str()
+                                                );
+                                            }
+                                        }
+                                        ast::TriggerCmd::Insert { tbl_name, select, .. } => {
+                                            if normalize_ident(tbl_name.as_str()) == rename_from {
+                                                *tbl_name = Name::from_string(format!(
+                                                    "\"{}\"",
+                                                    original_rename_to
+                                                ));
+                                                changed = true;
+                                            }
+                                            for sorted in &mut select.order_by {
+                                                changed |= crate::translate::alter::rewrite_expr_table_refs_for_rename(
+                                                    &mut sorted.expr, &rename_from, original_rename_to.as_str()
+                                                );
+                                            }
+                                        }
+                                        ast::TriggerCmd::Delete { tbl_name, where_clause } => {
+                                            if normalize_ident(tbl_name.as_str()) == rename_from {
+                                                *tbl_name = Name::from_string(format!(
+                                                    "\"{}\"",
+                                                    original_rename_to
+                                                ));
+                                                changed = true;
+                                            }
+                                            if let Some(ref mut where_expr) = where_clause {
+                                                changed |= crate::translate::alter::rewrite_expr_table_refs_for_rename(
+                                                    where_expr, &rename_from, original_rename_to.as_str()
+                                                );
                                             }
                                         }
                                         ast::TriggerCmd::Select(_) => {}

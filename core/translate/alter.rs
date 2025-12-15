@@ -2510,3 +2510,270 @@ fn rewrite_expr_column_ref(
         None,
     )
 }
+
+pub fn rewrite_expr_table_refs_for_rename(
+    expr: &mut Box<ast::Expr>,
+    old_table_norm: &str,
+    new_table_name: &str,
+) -> bool {
+    let mut changed = false;
+
+    match expr.as_mut() {
+        
+        ast::Expr::Qualified(ref mut tbl_name, _) => {
+            if normalize_ident(tbl_name.as_str()) == old_table_norm {
+                *tbl_name = ast::Name::from_string(format!("\"{}\"", new_table_name));
+                changed = true;
+            }
+        }
+        
+        ast::Expr::DoublyQualified(_, ref mut tbl_name, _) => {
+            if normalize_ident(tbl_name.as_str()) == old_table_norm {
+                *tbl_name = ast::Name::from_string(format!("\"{}\"", new_table_name));
+                changed = true;
+            }
+        }
+        ast::Expr::Between { lhs, start, end, .. } => {
+            changed |= rewrite_expr_table_refs_for_rename(lhs, old_table_norm, new_table_name);
+            changed |= rewrite_expr_table_refs_for_rename(start, old_table_norm, new_table_name);
+            changed |= rewrite_expr_table_refs_for_rename(end, old_table_norm, new_table_name);
+        }
+        ast::Expr::Binary(lhs, _, rhs) => {
+            changed |= rewrite_expr_table_refs_for_rename(lhs, old_table_norm, new_table_name);
+            changed |= rewrite_expr_table_refs_for_rename(rhs, old_table_norm, new_table_name);
+        }
+        ast::Expr::Case { base, when_then_pairs, else_expr, .. } => {
+            if let Some(b) = base {
+                changed |= rewrite_expr_table_refs_for_rename(b, old_table_norm, new_table_name);
+            }
+            for (when_expr, then_expr) in when_then_pairs {
+                changed |= rewrite_expr_table_refs_for_rename(when_expr, old_table_norm, new_table_name);
+                changed |= rewrite_expr_table_refs_for_rename(then_expr, old_table_norm, new_table_name);
+            }
+            if let Some(else_e) = else_expr {
+                changed |= rewrite_expr_table_refs_for_rename(else_e, old_table_norm, new_table_name);
+            }
+        }
+        ast::Expr::Cast { expr: inner, .. } => {
+            changed |= rewrite_expr_table_refs_for_rename(inner, old_table_norm, new_table_name);
+        }
+        ast::Expr::Collate(inner, _) => {
+            changed |= rewrite_expr_table_refs_for_rename(inner, old_table_norm, new_table_name);
+        }
+        ast::Expr::FunctionCall { args, filter_over, .. } => {
+            for arg in args {
+                changed |= rewrite_expr_table_refs_for_rename(arg, old_table_norm, new_table_name);
+            }
+            if let Some(ref mut filter_expr) = filter_over.filter_clause {
+                changed |= rewrite_expr_table_refs_for_rename(filter_expr, old_table_norm, new_table_name);
+            }
+        }
+        ast::Expr::FunctionCallStar { filter_over, .. } => {
+            if let Some(ref mut filter_expr) = filter_over.filter_clause {
+                changed |= rewrite_expr_table_refs_for_rename(filter_expr, old_table_norm, new_table_name);
+            }
+        }
+        ast::Expr::InList { lhs, rhs, .. } => {
+            changed |= rewrite_expr_table_refs_for_rename(lhs, old_table_norm, new_table_name);
+            for item in rhs {
+                changed |= rewrite_expr_table_refs_for_rename(item, old_table_norm, new_table_name);
+            }
+        }
+        ast::Expr::InSelect { lhs, rhs, .. } => {
+            changed |= rewrite_expr_table_refs_for_rename(lhs, old_table_norm, new_table_name);
+            changed |= rewrite_select_table_refs_for_rename(rhs, old_table_norm, new_table_name);
+        }
+        ast::Expr::InTable { lhs, rhs, .. } => {
+            changed |= rewrite_expr_table_refs_for_rename(lhs, old_table_norm, new_table_name);
+            if normalize_ident(rhs.name.as_str()) == old_table_norm {
+                rhs.name = ast::Name::from_string(format!("\"{}\"", new_table_name));
+                changed = true;
+            }
+        }
+        ast::Expr::IsNull(inner) | ast::Expr::NotNull(inner) => {
+            changed |= rewrite_expr_table_refs_for_rename(inner, old_table_norm, new_table_name);
+        }
+        ast::Expr::Like { lhs, rhs, escape, .. } => {
+            changed |= rewrite_expr_table_refs_for_rename(lhs, old_table_norm, new_table_name);
+            changed |= rewrite_expr_table_refs_for_rename(rhs, old_table_norm, new_table_name);
+            if let Some(ref mut esc) = escape {
+                changed |= rewrite_expr_table_refs_for_rename(esc, old_table_norm, new_table_name);
+            }
+        }
+        ast::Expr::Parenthesized(inner) => {
+            for e in inner {
+                changed |= rewrite_expr_table_refs_for_rename(e, old_table_norm, new_table_name);
+            }
+        }
+        ast::Expr::Subquery(select) | ast::Expr::Exists(select) => {
+            changed |= rewrite_select_table_refs_for_rename(select, old_table_norm, new_table_name);
+        }
+        ast::Expr::Unary(_, inner) => {
+            changed |= rewrite_expr_table_refs_for_rename(inner, old_table_norm, new_table_name);
+        }
+        ast::Expr::Id(_)
+        | ast::Expr::Literal(_)
+        | ast::Expr::Name(_)
+        | ast::Expr::Variable(_)
+        | ast::Expr::Raise(_, _)
+        | ast::Expr::Register(_)
+        | ast::Expr::Column { .. }
+        | ast::Expr::RowId { .. }
+        | ast::Expr::SubqueryResult { .. } => {}
+    }
+
+    changed
+}
+
+fn rewrite_select_table_refs_for_rename(
+    select: &mut ast::Select,
+    old_table_norm: &str,
+    new_table_name: &str,
+) -> bool {
+    let mut changed = false;
+
+    changed |= rewrite_select_body_table_refs_for_rename(&mut select.body, old_table_norm, new_table_name);
+
+    for sorted_col in &mut select.order_by {
+        changed |= rewrite_expr_table_refs_for_rename(&mut sorted_col.expr, old_table_norm, new_table_name);
+    }
+
+    if let Some(ref mut limit) = select.limit {
+        changed |= rewrite_expr_table_refs_for_rename(&mut limit.expr, old_table_norm, new_table_name);
+        if let Some(ref mut offset) = limit.offset {
+            changed |= rewrite_expr_table_refs_for_rename(offset, old_table_norm, new_table_name);
+        }
+    }
+
+    changed
+}
+
+fn rewrite_select_body_table_refs_for_rename(
+    body: &mut ast::SelectBody,
+    old_table_norm: &str,
+    new_table_name: &str,
+) -> bool {
+    let mut changed = false;
+
+    changed |= rewrite_one_select_table_refs_for_rename(&mut body.select, old_table_norm, new_table_name);
+
+    for compound in &mut body.compounds {
+        changed |= rewrite_one_select_table_refs_for_rename(&mut compound.select, old_table_norm, new_table_name);
+    }
+
+    changed
+}
+
+fn rewrite_one_select_table_refs_for_rename(
+    one_select: &mut ast::OneSelect,
+    old_table_norm: &str,
+    new_table_name: &str,
+) -> bool {
+    let mut changed = false;
+
+    match one_select {
+        ast::OneSelect::Select {
+            columns,
+            from,
+            where_clause,
+            group_by,
+            ..
+        } => {
+            for col in columns {
+                match col {
+                    ast::ResultColumn::Expr(expr, _) => {
+                        changed |= rewrite_expr_table_refs_for_rename(expr, old_table_norm, new_table_name);
+                    }
+                    ast::ResultColumn::TableStar(ref mut name) => {
+                        if normalize_ident(name.as_str()) == old_table_norm {
+                            *name = ast::Name::from_string(format!("\"{}\"", new_table_name));
+                            changed = true;
+                        }
+                    }
+                    ast::ResultColumn::Star => {}
+                }
+            }
+
+            if let Some(ref mut from_clause) = from {
+                changed |= rewrite_from_clause_table_refs_for_rename(from_clause, old_table_norm, new_table_name);
+            }
+
+            if let Some(ref mut where_expr) = where_clause {
+                changed |= rewrite_expr_table_refs_for_rename(where_expr, old_table_norm, new_table_name);
+            }
+
+            if let Some(ref mut group) = group_by {
+                for expr in &mut group.exprs {
+                    changed |= rewrite_expr_table_refs_for_rename(expr, old_table_norm, new_table_name);
+                }
+                if let Some(ref mut having) = group.having {
+                    changed |= rewrite_expr_table_refs_for_rename(having, old_table_norm, new_table_name);
+                }
+            }
+        }
+        ast::OneSelect::Values(values) => {
+            for row in values {
+                for expr in row {
+                    changed |= rewrite_expr_table_refs_for_rename(expr, old_table_norm, new_table_name);
+                }
+            }
+        }
+    }
+
+    changed
+}
+
+fn rewrite_from_clause_table_refs_for_rename(
+    from: &mut ast::FromClause,
+    old_table_norm: &str,
+    new_table_name: &str,
+) -> bool {
+    let mut changed = false;
+
+    changed |= rewrite_select_table_entry_refs_for_rename(&mut from.select, old_table_norm, new_table_name);
+
+    for join in &mut from.joins {
+        changed |= rewrite_select_table_entry_refs_for_rename(&mut join.table, old_table_norm, new_table_name);
+        if let Some(ref mut constraint) = join.constraint {
+            if let ast::JoinConstraint::On(expr) = constraint {
+                changed |= rewrite_expr_table_refs_for_rename(expr, old_table_norm, new_table_name);
+            }
+        }
+    }
+
+    changed
+}
+
+fn rewrite_select_table_entry_refs_for_rename(
+    select_table: &mut Box<ast::SelectTable>,
+    old_table_norm: &str,
+    new_table_name: &str,
+) -> bool {
+    let mut changed = false;
+
+    match select_table.as_mut() {
+        ast::SelectTable::Table(ref mut qualified_name, _, _) => {
+            if normalize_ident(qualified_name.name.as_str()) == old_table_norm {
+                qualified_name.name = ast::Name::from_string(format!("\"{}\"", new_table_name));
+                changed = true;
+            }
+        }
+        ast::SelectTable::TableCall(ref mut qualified_name, args, _) => {
+            if normalize_ident(qualified_name.name.as_str()) == old_table_norm {
+                qualified_name.name = ast::Name::from_string(format!("\"{}\"", new_table_name));
+                changed = true;
+            }
+            for arg in args {
+                changed |= rewrite_expr_table_refs_for_rename(arg, old_table_norm, new_table_name);
+            }
+        }
+        ast::SelectTable::Select(select, _) => {
+            changed |= rewrite_select_table_refs_for_rename(select, old_table_norm, new_table_name);
+        }
+        ast::SelectTable::Sub(from, _) => {
+            changed |= rewrite_from_clause_table_refs_for_rename(from, old_table_norm, new_table_name);
+        }
+    }
+
+    changed
+}
