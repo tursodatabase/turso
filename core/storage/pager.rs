@@ -1130,6 +1130,7 @@ impl Pager {
                     offset_in_ptrmap_page,
                 } => {
                     turso_assert!(ptrmap_page.is_loaded(), "page should be loaded");
+                    self.add_dirty(&ptrmap_page)?;
                     let ptrmap_page_inner = ptrmap_page.get();
                     let ptrmap_pg_no = ptrmap_page_inner.id;
 
@@ -1167,7 +1168,6 @@ impl Pager {
                         ptrmap_page.get().id == ptrmap_pg_no,
                         "ptrmap page has unexpected number"
                     );
-                    self.add_dirty(&ptrmap_page)?;
                     self.vacuum_state.write().ptrmap_put_state = PtrMapPutState::Start;
                     break Ok(IOResult::Done(()));
                 }

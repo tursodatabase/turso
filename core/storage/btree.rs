@@ -2602,6 +2602,7 @@ impl BTreeCursor {
             0,
             BtreePageAllocMode::Any
         ));
+        self.pager.add_dirty(&new_rightmost_leaf)?;
 
         let usable_space = self.usable_space();
         let old_rightmost_leaf = self.stack.top_ref();
@@ -2616,6 +2617,7 @@ impl BTreeCursor {
             .stack
             .get_page_at_level(self.stack.current() - 1)
             .expect("parent page should be on the stack");
+        self.pager.add_dirty(parent)?;
         let parent_contents = parent.get_contents();
         let rightmost_pointer = parent_contents
             .rightmost_pointer()
@@ -2658,8 +2660,6 @@ impl BTreeCursor {
             usable_space,
         )?;
         parent_contents.write_rightmost_ptr(new_rightmost_leaf.get().id as u32);
-        self.pager.add_dirty(parent)?;
-        self.pager.add_dirty(&new_rightmost_leaf)?;
 
         // Continue balance from the parent page (inserting the new divider cell may have overflowed the parent)
         self.stack.pop();
