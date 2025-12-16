@@ -52,12 +52,22 @@ fn hash_join_key(key_values: &[ValueRef], collations: &[CollationSeq]) -> u64 {
                 hasher.write_u8(NULL_HASH);
             }
             ValueRef::Integer(i) => {
-                hasher.write_u8(INT_HASH);
-                hasher.write_i64(*i);
+                // Hash integers in the same bucket as numerically equivalent REALs so e.g. 10 and 10.0 have the same hash.
+                let f = *i as f64;
+                if (f as i64) == *i && f.is_finite() {
+                    hasher.write_u8(FLOAT_HASH);
+                    let bits = normalized_f64_bits(f);
+                    hasher.write(&bits.to_le_bytes());
+                } else {
+                    // Fallback to the integer domain when the float representation would lose precision.
+                    hasher.write_u8(INT_HASH);
+                    hasher.write_i64(*i);
+                }
             }
             ValueRef::Float(f) => {
                 hasher.write_u8(FLOAT_HASH);
-                hasher.write(&f.to_le_bytes());
+                let bits = normalized_f64_bits(*f);
+                hasher.write(&bits.to_le_bytes());
             }
             ValueRef::Text(text) => {
                 let collation = collations.get(idx).unwrap_or(&CollationSeq::Binary);
@@ -83,6 +93,16 @@ fn hash_join_key(key_values: &[ValueRef], collations: &[CollationSeq]) -> u64 {
         }
     }
     hasher.finish()
+}
+
+/// Normalize signed zero so 0.0 and -0.0 hash the same.
+#[inline]
+fn normalized_f64_bits(f: f64) -> u64 {
+    if f == 0.0 {
+        0.0f64.to_bits()
+    } else {
+        f.to_bits()
+    }
 }
 
 /// Check if any of the key values is NULL.
@@ -118,6 +138,9 @@ fn values_equal(v1: ValueRef, v2: ValueRef, collation: CollationSeq) -> bool {
         (ValueRef::Null, _) | (_, ValueRef::Null) => false,
         (ValueRef::Integer(i1), ValueRef::Integer(i2)) => i1 == i2,
         (ValueRef::Float(f1), ValueRef::Float(f2)) => f1 == f2,
+        (ValueRef::Integer(i), ValueRef::Float(f)) | (ValueRef::Float(f), ValueRef::Integer(i)) => {
+            ValueRef::Integer(i) == ValueRef::Float(f)
+        }
         (ValueRef::Blob(b1), ValueRef::Blob(b2)) => b1 == b2,
         (ValueRef::Text(t1), ValueRef::Text(t2)) => {
             // Use collation for text comparison
@@ -1669,6 +1692,30 @@ mod hashtests {
 
         assert_eq!(hash1, hash2);
         assert_ne!(hash1, hash3);
+    }
+
+    #[test]
+    fn test_hash_function_numeric_equivalence() {
+        let collations = vec![CollationSeq::Binary];
+
+        // Zero variants should hash identically
+        let h_zero = hash_join_key(&[ValueRef::Float(0.0)], &collations);
+        let h_neg_zero = hash_join_key(&[ValueRef::Float(-0.0)], &collations);
+        let h_int_zero = hash_join_key(&[ValueRef::Integer(0)], &collations);
+        assert_eq!(h_zero, h_neg_zero);
+        assert_eq!(h_zero, h_int_zero);
+
+        // Integer/float representations of the same numeric value should match
+        let h_ten_int = hash_join_key(&[ValueRef::Integer(10)], &collations);
+        let h_ten_float = hash_join_key(&[ValueRef::Float(10.0)], &collations);
+        assert_eq!(h_ten_int, h_ten_float);
+
+        let h_neg_ten_int = hash_join_key(&[ValueRef::Integer(-10)], &collations);
+        let h_neg_ten_float = hash_join_key(&[ValueRef::Float(-10.0)], &collations);
+        assert_eq!(h_neg_ten_int, h_neg_ten_float);
+
+        // Positive/negative values should still differ
+        assert_ne!(h_ten_int, h_neg_ten_int);
     }
 
     #[test]
