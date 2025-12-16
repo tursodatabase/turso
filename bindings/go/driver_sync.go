@@ -19,14 +19,14 @@ import (
 
 type TursoPartialSyncConfig struct {
 	// if positive, prefix partial bootstrap strategy will be used
-	BoostrapStrategyPrefix int
+	BootstrapStrategyPrefix int
 	// if not empty, query partial bootstrap strategy will be used
-	BoostrapStrategyQuery string
+	BootstrapStrategyQuery string
 	// optional parameter which defines segment size for lazy loading from remote server
-	// one of valid BoostrapStrategy* values MUST be set in order for this setting to have some effect
+	// one of valid BootstrapStrategy* values MUST be set in order for this setting to have some effect
 	SegmentSize int
 	// optional parameter which defines if pages prefetch must be enabled
-	// one of valid BoostrapStrategy* values MUST be set in order for this setting to have some effect
+	// one of valid BootstrapStrategy* values MUST be set in order for this setting to have some effect
 	Prefetch bool
 }
 
@@ -123,8 +123,8 @@ func NewTursoSyncDb(ctx context.Context, config TursoSyncDbConfig) (*TursoSyncDb
 		LongPollTimeoutMs:              config.LongPollTimeoutMs,
 		BootstrapIfEmpty:               bootstrap,
 		ReservedBytes:                  0,
-		PartialBootstrapStrategyPrefix: config.PartialSyncConfig.BoostrapStrategyPrefix,
-		PartialBootstrapStrategyQuery:  config.PartialSyncConfig.BoostrapStrategyQuery,
+		PartialBootstrapStrategyPrefix: config.PartialSyncConfig.BootstrapStrategyPrefix,
+		PartialBootstrapStrategyQuery:  config.PartialSyncConfig.BootstrapStrategyQuery,
 		PartialBootstrapSegmentSize:    config.PartialSyncConfig.SegmentSize,
 		PartialBootstrapPrefetch:       config.PartialSyncConfig.Prefetch,
 	}
