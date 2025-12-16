@@ -902,7 +902,7 @@ impl BTreeCursor {
             let contents = page.get_contents();
             // The first four bytes of each overflow page are a big-endian integer which is the page number of the next page in the chain, or zero for the final page in the chain.
             let next = contents.read_u32_no_offset(0);
-            let buf = contents.as_ptr();
+            let buf = contents.as_slice();
             let usable_space = self.pager.usable_space();
             let to_read = (*remaining_to_read).min(usable_space - 4);
             payload.extend_from_slice(&buf[4..4 + to_read]);
@@ -1174,7 +1174,7 @@ impl BTreeCursor {
                         std::cmp::min(remaining_to_read, overflow_size as u32 - page_offset as u32);
 
                     let payload_offset = 4 + page_offset;
-                    let page_payload = contents.as_ptr();
+                    let page_payload = contents.as_slice();
                     if is_write {
                         self.write_payload_to_page(
                             payload_offset as u32,
@@ -2739,8 +2739,8 @@ impl BTreeCursor {
                             overflow_cell.index
                         );
                     }
-                    self.pager.add_dirty(parent_page)?;
-                    let parent_contents = parent_page.get_contents();
+                    let parent_guard = self.pager.add_dirty(parent_page)?;
+                    let parent_contents = parent_guard.contents_mut();
                     let page_to_balance_idx = self.stack.current_cell_index() as usize;
 
                     tracing::debug!(
@@ -2822,7 +2822,7 @@ impl BTreeCursor {
                             - parent_contents.overflow_cells.len();
                         let start_of_cell =
                             parent_contents.cell_get_raw_start_offset(actual_cell_idx);
-                        let buf = parent_contents.as_ptr().as_mut_ptr();
+                        let buf = parent_contents.as_mut_slice().as_mut_ptr();
                         unsafe { buf.add(start_of_cell) }
                     };
 
@@ -2991,7 +2991,7 @@ impl BTreeCursor {
                             let actual_cell_idx = cell_idx - parent_contents.overflow_cells.len();
                             let (cell_start, cell_len) =
                                 parent_contents.cell_get_raw_region(actual_cell_idx, usable_space);
-                            let buf = parent_contents.as_ptr();
+                            let buf = parent_contents.as_slice();
                             &buf[cell_start..cell_start + cell_len]
                         };
 
@@ -3073,7 +3073,7 @@ impl BTreeCursor {
                                     min_local,
                                     page_type,
                                 );
-                            let buf = old_page_contents.as_ptr();
+                            let buf = old_page_contents.as_mut_slice();
                             let cell_buf = &mut buf[cell_start..cell_start + cell_len];
                             // TODO(pere): make this reference and not copy
                             cell_array.cell_payloads.push(to_static_buf(cell_buf));
@@ -3558,8 +3558,12 @@ impl BTreeCursor {
                         let new_last_page = pages_to_balance_new[sibling_count_new - 1]
                             .as_ref()
                             .unwrap();
+                        assert!(
+                            new_last_page.is_dirty(),
+                            "New last page must be set dirty before modifying it"
+                        );
                         new_last_page
-                            .get_contents()
+                            .get_contents_mut_unsafe_dont_use()
                             .write_rightmost_ptr(right_pointer);
                     }
                     turso_assert!(
@@ -3585,7 +3589,11 @@ impl BTreeCursor {
                             // Interior
                             // Make this page's rightmost pointer point to pointer of divider cell before modification
                             let previous_pointer_divider = read_u32(divider_cell, 0);
-                            page.get_contents()
+                            assert!(
+                                page.is_dirty(),
+                                "New sibling page must be set dirty before modifying it"
+                            );
+                            page.get_contents_mut_unsafe_dont_use()
                                 .write_rightmost_ptr(previous_pointer_divider);
                             // divider cell now points to this page
                             new_divider_cell.extend_from_slice(&(page.id() as u32).to_be_bytes());
@@ -3811,11 +3819,20 @@ impl BTreeCursor {
                         // copied into the parent, because if the parent is page 1 then it will
                         // by smaller than the child due to the database header, and so
                         // all the free space needs to be up front.
+                        assert!(
+                            first_child_page.is_dirty(),
+                            "First child page must be set dirty before modifying it"
+                        );
+                        let first_child_contents =
+                            first_child_page.get_contents_mut_unsafe_dont_use();
                         defragment_page_full(first_child_contents, usable_space)?;
 
                         let child_top = first_child_contents.cell_content_area() as usize;
-                        let parent_buf = parent_contents.as_ptr();
-                        let child_buf = first_child_contents.as_ptr();
+                        let header_and_pointer_size = first_child_contents.header_size()
+                            + first_child_contents.cell_pointer_array_size();
+                        let child_offset = first_child_contents.offset;
+                        let child_buf = first_child_contents.as_slice();
+                        let parent_buf = parent_contents.as_mut_slice();
                         let content_size = usable_space - child_top;
 
                         // Copy cell contents
@@ -3825,12 +3842,9 @@ impl BTreeCursor {
                         // Copy header and pointer
                         // NOTE: don't use .cell_pointer_array_offset_and_size() because of different
                         // header size
-                        let header_and_pointer_size = first_child_contents.header_size()
-                            + first_child_contents.cell_pointer_array_size();
                         parent_buf[parent_offset..parent_offset + header_and_pointer_size]
                             .copy_from_slice(
-                                &child_buf[first_child_contents.offset
-                                    ..first_child_contents.offset + header_and_pointer_size],
+                                &child_buf[child_offset..child_offset + header_and_pointer_size],
                             );
 
                         sibling_count_new -= 1; // decrease sibling count for debugging and free at the end
@@ -3920,7 +3934,7 @@ impl BTreeCursor {
             let (cell_start, cell_len) = parent_contents
                 .cell_get_raw_region(divider_cell_insert_idx_in_parent, usable_space);
             read_u32(
-                &parent_contents.as_ptr()[cell_start..cell_start + cell_len],
+                &parent_contents.as_slice()[cell_start..cell_start + cell_len],
                 0,
             )
         } else {
@@ -3996,8 +4010,8 @@ impl BTreeCursor {
             // Cells are distributed in order
             for cell_idx in 0..contents.cell_count() {
                 let (cell_start, cell_len) = contents.cell_get_raw_region(cell_idx, usable_space);
-                let buf = contents.as_ptr();
-                let cell_buf = to_static_buf(&mut buf[cell_start..cell_start + cell_len]);
+                let buf = contents.as_slice();
+                let cell_buf = to_static_buf_ref(&buf[cell_start..cell_start + cell_len]);
                 let cell_buf_in_array = &cells_debug[current_index_cell];
                 if cell_buf != cell_buf_in_array {
                     tracing::error!("balance_non_root(cell_not_found_debug, page_id={}, cell_in_cell_array_idx={})",
@@ -4058,7 +4072,7 @@ impl BTreeCursor {
                 current_index_cell += 1;
             }
             // Now check divider cells and their pointers.
-            let parent_buf = parent_contents.as_ptr();
+            let parent_buf = parent_contents.as_slice();
             let cell_divider_idx = balance_info.first_divider_cell + page_idx;
             if sibling_count_new == 0 {
                 // Balance-shallower case
@@ -4147,10 +4161,10 @@ impl BTreeCursor {
                     let (cell_start, cell_len) =
                         contents.cell_get_raw_region(parent_cell_idx, usable_space);
 
-                    let buf = contents.as_ptr();
-                    let cell_buf = to_static_buf(&mut buf[cell_start..cell_start + cell_len]);
-                    let parent_cell_buf = to_static_buf(
-                        &mut parent_buf[parent_cell_start..parent_cell_start + parent_cell_len],
+                    let buf = contents.as_slice();
+                    let cell_buf = to_static_buf_ref(&buf[cell_start..cell_start + cell_len]);
+                    let parent_cell_buf = to_static_buf_ref(
+                        &parent_buf[parent_cell_start..parent_cell_start + parent_cell_len],
                     );
 
                     if cell_buf != cell_buf_in_array || cell_buf != parent_cell_buf {
@@ -4368,10 +4382,10 @@ impl BTreeCursor {
             "child must be marked dirty as freshly allocated page"
         );
 
-        let root_buf = root_contents.as_ptr();
+        let root_buf = root_contents.as_slice();
         let child_writable = self.pager.add_dirty(&child)?;
         let child_contents = child_writable.contents_mut();
-        let child_buf = child_contents.as_ptr();
+        let child_buf = child_contents.as_mut_slice();
         let (root_pointer_start, root_pointer_len) =
             root_contents.cell_pointer_array_offset_and_size();
         let (child_pointer_start, _) = child.get_contents().cell_pointer_array_offset_and_size();
@@ -4790,7 +4804,7 @@ impl BTreeCursor {
 
                     // if it all fits in local space and old_local_size is enough, do an in-place overwrite
                     if new_payload.len() == *old_local_size {
-                        let buf = contents.as_ptr();
+                        let buf = contents.as_mut_slice();
                         buf[*old_offset..*old_offset + new_payload.len()]
                             .copy_from_slice(new_payload);
                         return Ok(IOResult::Done(()));
@@ -6518,7 +6532,7 @@ impl CellArray {
 /// Used to check if a cell can be inserted into a freeblock to reduce fragmentation.
 /// Returns the absolute byte offset of the freeblock if found.
 fn find_free_slot(
-    page_ref: &PageContent,
+    page_ref: &mut PageContent,
     usable_space: usize,
     amount: usize,
 ) -> Result<Option<usize>> {
@@ -6650,12 +6664,16 @@ pub fn btree_init_page(
             "usable_space must be <= buffer_len"
         );
         // this is no op if usable_space == buffer_len
-        contents.as_ptr()[usable_space..buffer_len].fill(0);
+        contents.as_mut_slice()[usable_space..buffer_len].fill(0);
     }
 }
 
 fn to_static_buf(buf: &mut [u8]) -> &'static mut [u8] {
     unsafe { std::mem::transmute::<&mut [u8], &'static mut [u8]>(buf) }
+}
+
+fn to_static_buf_ref(buf: &[u8]) -> &'static [u8] {
+    unsafe { std::mem::transmute::<&[u8], &'static [u8]>(buf) }
 }
 
 fn edit_page(
@@ -6759,8 +6777,8 @@ fn edit_page(
 /// It shifts the pointers starting from `number_to_shift` to the beginning of the array,
 /// effectively removing the first `number_to_shift` pointers.
 fn shift_cells_left(page: &mut PageContent, count_cells: usize, number_to_shift: usize) {
-    let buf = page.as_ptr();
     let (start, _) = page.cell_pointer_array_offset_and_size();
+    let buf = page.as_mut_slice();
     buf.copy_within(
         start + (number_to_shift * 2)..start + (count_cells * 2),
         start,
@@ -6775,7 +6793,8 @@ fn page_free_array(
     usable_space: usize,
 ) -> Result<usize> {
     tracing::debug!("page_free_array {}..{}", first, first + count);
-    let buf = &mut page.as_ptr()[page.offset..usable_space];
+    let offset = page.offset;
+    let buf = &mut page.as_mut_slice()[offset..usable_space];
     let buf_range = buf.as_ptr_range();
     let mut number_of_cells_removed = 0;
     let mut number_of_cells_buffered = 0;
@@ -7062,7 +7081,7 @@ fn free_cell_range(
 /// in the cell-pointer array than it is to reconstruct the entire page.
 /// Note that this function will leave max_frag_bytes as is, it will not try to reduce it.
 fn defragment_page_fast(
-    page: &PageContent,
+    page: &mut PageContent,
     usable_space: usize,
     freeblock_1st: usize,
     freeblock_2nd: usize,
@@ -7091,7 +7110,7 @@ fn defragment_page_fast(
         if freeblock_2nd + freeblock_2nd_size > usable_space {
             turso_assert!(false, "Second freeblock extends beyond usable space: freeblock_2nd={freeblock_2nd} freeblock_2nd_size={freeblock_2nd_size} usable_space={usable_space}");
         }
-        let buf = page.as_ptr();
+        let buf = page.as_mut_slice();
         // Effectively moves everything in between the two freeblocks rightwards by the length of the 2nd freeblock,
         // so that the first freeblock size becomes `freeblocks_total_size` (merging the two freeblocks)
         // and the second freeblock gets overwritten by non-free cell data.
@@ -7118,7 +7137,7 @@ fn defragment_page_fast(
     turso_assert!(new_cell_content_area + (freeblock_1st - cell_content_area) <= usable_space, "new cell content area offset extends beyond usable space: new_cell_content_area={new_cell_content_area} freeblock_1st={freeblock_1st} cell_content_area={cell_content_area} usable_space={usable_space}");
 
     let copy_amount = freeblock_1st - cell_content_area; // cells to the left of the first freeblock
-    let buf = page.as_ptr();
+    let buf = page.as_mut_slice();
     buf.copy_within(
         cell_content_area..cell_content_area + copy_amount,
         new_cell_content_area,
@@ -7155,12 +7174,16 @@ fn defragment_page_fast(
 }
 
 /// Defragment a page, and never use the fast-path algorithm.
-fn defragment_page_full(page: &PageContent, usable_space: usize) -> Result<()> {
+fn defragment_page_full(page: &mut PageContent, usable_space: usize) -> Result<()> {
     defragment_page(page, usable_space, -1)
 }
 
 /// Defragment a page. This means packing all the cells to the end of the page.
-fn defragment_page(page: &PageContent, usable_space: usize, max_frag_bytes: isize) -> Result<()> {
+fn defragment_page(
+    page: &mut PageContent,
+    usable_space: usize,
+    max_frag_bytes: isize,
+) -> Result<()> {
     debug_validate_cells!(page, usable_space);
     tracing::debug!("defragment_page (optimized in-place)");
 
@@ -7229,10 +7252,12 @@ fn defragment_page(page: &PageContent, usable_space: usize, max_frag_bytes: isiz
         cells_info.sort_unstable_by(|a, b| b.old_offset.cmp(&a.old_offset));
     }
 
-    // Get direct mutable access to the page buffer.
-    let buffer = page.as_ptr();
+    // Capture metadata before taking mutable borrow of buffer
     let cell_pointer_area_offset = page.cell_pointer_array_offset();
     let first_cell_content_byte = page.unallocated_region_start();
+
+    // Get direct mutable access to the page buffer.
+    let buffer = page.as_mut_slice();
 
     // Move data and update pointers.
     let mut cbrk = usable_space;
@@ -7262,7 +7287,9 @@ fn defragment_page(page: &PageContent, usable_space: usize, max_frag_bytes: isiz
             "new_offset={new_offset} PageSize::MAX={}",
             PageSize::MAX
         );
-        page.write_u16_no_offset(pointer_location, new_offset as u16);
+        // Write directly to buffer instead of using page.write_u16_no_offset
+        let bytes = (new_offset as u16).to_be_bytes();
+        buffer[pointer_location..pointer_location + 2].copy_from_slice(&bytes);
     }
 
     page.write_cell_content_area(cbrk);
@@ -7278,7 +7305,7 @@ fn defragment_page(page: &PageContent, usable_space: usize, max_frag_bytes: isiz
 fn debug_validate_cells_core(page: &PageContent, usable_space: usize) {
     for i in 0..page.cell_count() {
         let (offset, size) = page.cell_get_raw_region(i, usable_space);
-        let buf = &page.as_ptr()[offset..offset + size];
+        let buf = &page.as_slice()[offset..offset + size];
         // E.g. the following table btree cell may just have two bytes:
         // Payload size 0 (stored as SerialTypeKind::ConstInt0)
         // Rowid 1 (stored as SerialTypeKind::ConstInt1)
@@ -7287,7 +7314,7 @@ fn debug_validate_cells_core(page: &PageContent, usable_space: usize) {
             "cell size should be at least 2 bytes idx={i}, cell={buf:?}, offset={offset}"
         );
         if page.is_leaf() {
-            assert!(page.as_ptr()[offset] != 0);
+            assert!(page.as_slice()[offset] != 0);
         }
         assert!(
             offset + size <= usable_space,
@@ -7349,18 +7376,20 @@ fn _insert_into_cell(
         payload.len()
     );
     assert!(new_cell_data_pointer as usize + payload.len() <= usable_space);
-    let buf = page.as_ptr();
+
+    // Capture metadata before taking mutable borrow
+    let (cell_pointer_array_start, _) = page.cell_pointer_array_offset_and_size();
+    let cell_pointer_cur_idx = cell_pointer_array_start + (CELL_PTR_SIZE_BYTES * cell_idx);
+    let n_cells_forward = page.cell_count() - cell_idx;
+    let n_bytes_forward = CELL_PTR_SIZE_BYTES * n_cells_forward;
+
+    let buf = page.as_mut_slice();
 
     // copy data
     buf[new_cell_data_pointer as usize..new_cell_data_pointer as usize + payload.len()]
         .copy_from_slice(payload);
-    //  memmove(pIns+2, pIns, 2*(pPage->nCell - i));
-    let (cell_pointer_array_start, _) = page.cell_pointer_array_offset_and_size();
-    let cell_pointer_cur_idx = cell_pointer_array_start + (CELL_PTR_SIZE_BYTES * cell_idx);
 
     // move existing pointers forward by CELL_PTR_SIZE_BYTES...
-    let n_cells_forward = page.cell_count() - cell_idx;
-    let n_bytes_forward = CELL_PTR_SIZE_BYTES * n_cells_forward;
     if n_bytes_forward > 0 {
         buf.copy_within(
             cell_pointer_cur_idx..cell_pointer_cur_idx + n_bytes_forward,
@@ -7368,7 +7397,9 @@ fn _insert_into_cell(
         );
     }
     // ...and insert new cell pointer at the current index
-    page.write_u16_no_offset(cell_pointer_cur_idx, new_cell_data_pointer);
+    // Write directly to buffer instead of using page.write_u16_no_offset
+    let bytes = new_cell_data_pointer.to_be_bytes();
+    buf[cell_pointer_cur_idx..cell_pointer_cur_idx + 2].copy_from_slice(&bytes);
 
     // update cell count
     let new_n_cells = (page.cell_count() + 1) as u16;
@@ -7469,7 +7500,7 @@ fn compute_free_space(page: &PageContent, usable_space: usize) -> usize {
 
 /// Allocate space for a cell on a page.
 fn allocate_cell_space(
-    page_ref: &PageContent,
+    page_ref: &mut PageContent,
     mut amount: usize,
     usable_space: usize,
     free_space: usize,
@@ -7643,8 +7674,12 @@ fn fill_cell_payload(
                                 "current overflow page is not loaded"
                             );
                             turso_assert!(*dst_data_offset == overflow_page_pointer_size, "data must be copied to offset {overflow_page_pointer_size} on overflow pages, instead tried to copy to offset {dst_data_offset}");
-                            let contents = cur_page.get_contents();
-                            let buf = &mut contents.as_ptr()
+                            turso_assert!(
+                                cur_page.is_dirty(),
+                                "Current overflow page must be set dirty before modifying it"
+                            );
+                            let contents = cur_page.get_contents_mut_unsafe_dont_use();
+                            let buf = &mut contents.as_mut_slice()
                                 [*dst_data_offset..*dst_data_offset + amount_to_copy];
                             buf.copy_from_slice(record_offset_slice_to_copy);
                         } else {
@@ -7691,8 +7726,12 @@ fn fill_cell_payload(
                                 prev_page.is_loaded(),
                                 "previous overflow page is not loaded"
                             );
-                            let contents = prev_page.get_contents();
-                            let buf = &mut contents.as_ptr()[..overflow_page_pointer_size];
+                            turso_assert!(
+                                prev_page.is_dirty(),
+                                "Previous overflow page must be set dirty before modifying it"
+                            );
+                            let contents = prev_page.get_contents_mut_unsafe_dont_use();
+                            let buf = &mut contents.as_mut_slice()[..overflow_page_pointer_size];
                             buf.copy_from_slice(&new_overflow_page_id.to_be_bytes());
                         } else {
                             // Update the cell payload's "next overflow page" pointer to point to the new overflow page.
@@ -7772,11 +7811,11 @@ fn drop_cell(page: &mut PageContent, cell_idx: usize, usable_space: usize) -> Re
 /// the empty space that's not needed
 fn shift_pointers_left(page: &mut PageContent, cell_idx: usize) {
     assert!(page.cell_count() > 0);
-    let buf = page.as_ptr();
-    let (start, _) = page.cell_pointer_array_offset_and_size();
-    let start = start + (cell_idx * 2) + 2;
+    let (ptr_start, _) = page.cell_pointer_array_offset_and_size();
+    let start = ptr_start + (cell_idx * 2) + 2;
     let right_cells = page.cell_count() - cell_idx - 1;
     let amount_to_shift = right_cells * 2;
+    let buf = page.as_mut_slice();
     buf.copy_within(start..start + amount_to_shift, start - 2);
 }
 
@@ -7845,7 +7884,7 @@ mod tests {
     fn ensure_cell(page: &mut PageContent, cell_idx: usize, payload: &Vec<u8>) {
         let cell = page.cell_get_raw_region(cell_idx, 4096);
         tracing::trace!("cell idx={} start={} len={}", cell_idx, cell.0, cell.1);
-        let buf = &page.as_ptr()[cell.0..cell.0 + cell.1];
+        let buf = &page.as_slice()[cell.0..cell.0 + cell.1];
         assert_eq!(buf.len(), payload.len());
         assert_eq!(buf, payload);
     }
@@ -7875,7 +7914,7 @@ mod tests {
             &conn.pager.load().clone(),
         )
         .unwrap();
-        insert_into_cell(page.get_contents_mut_for_test(), &payload, pos, 4096).unwrap();
+        insert_into_cell(page.get_contents_mut_unsafe_dont_use(), &payload, pos, 4096).unwrap();
         payload
     }
 
@@ -7919,7 +7958,7 @@ mod tests {
         let regs = &[Register::Value(Value::Integer(1))];
         let record = ImmutableRecord::from_registers(regs, regs.len());
         let payload = add_record(1, 0, page.clone(), record, &conn);
-        let page_contents = page.get_contents_mut_for_test();
+        let page_contents = page.get_contents_mut_unsafe_dont_use();
         assert_eq!(page_contents.cell_count(), 1);
         let free = compute_free_space(page_contents, 4096);
         assert_eq!(free, 4096 - payload.len() - 2 - header_size);
@@ -7940,7 +7979,7 @@ mod tests {
 
         let page = get_page(2);
 
-        let page_contents = page.get_contents_mut_for_test();
+        let page_contents = page.get_contents_mut_unsafe_dont_use();
         let header_size = 8;
 
         let mut total_size = 0;
@@ -8153,7 +8192,7 @@ mod tests {
         let page2 = run_until_done(|| pager.allocate_page(), &pager).unwrap();
         let page2_id = page2.id();
         btree_init_page(
-            page2.get_contents_mut_for_test(),
+            page2.get_contents_mut_unsafe_dont_use(),
             page2_id,
             PageType::TableLeaf,
             0,
@@ -8919,7 +8958,7 @@ mod tests {
 
         let page = get_page(2);
 
-        let page_contents = page.get_contents_mut_for_test();
+        let page_contents = page.get_contents_mut_unsafe_dont_use();
         let header_size = 8;
 
         let mut total_size = 0;
@@ -9150,7 +9189,7 @@ mod tests {
             }
 
             {
-                let contents = page.get_contents();
+                let contents = page.get_contents_mut_unsafe_dont_use();
 
                 let next_page = if current_page < 4 {
                     current_page + 1
@@ -9159,7 +9198,7 @@ mod tests {
                 };
                 contents.write_u32_no_offset(0, next_page as u32); // Write pointer to next overflow page
 
-                let buf = contents.as_ptr();
+                let buf = contents.as_mut_slice();
                 buf[4..].fill(b'A');
             }
 
@@ -9296,7 +9335,7 @@ mod tests {
 
         // Configure the root page to point to the two leaf pages
         {
-            let contents = root_page.get_contents_mut_for_test();
+            let contents = root_page.get_contents_mut_unsafe_dont_use();
 
             // Set rightmost pointer to page4
             contents.write_rightmost_ptr(page4.id() as u32);
@@ -9318,7 +9357,7 @@ mod tests {
 
         // Add a simple record to each leaf page
         for page in [&page3, &page4] {
-            let contents = page.get_contents_mut_for_test();
+            let contents = page.get_contents_mut_unsafe_dont_use();
 
             // Simple record with just a rowid and payload
             let record_bytes = vec![
@@ -9526,7 +9565,7 @@ mod tests {
 
         let page = get_page(2);
 
-        let page_contents = page.get_contents_mut_for_test();
+        let page_contents = page.get_contents_mut_unsafe_dont_use();
         let header_size = 8;
 
         let mut total_size = 0;
@@ -9567,7 +9606,7 @@ mod tests {
 
         let page = get_page(2);
 
-        let page_contents = page.get_contents_mut_for_test();
+        let page_contents = page.get_contents_mut_unsafe_dont_use();
         let header_size = 8;
 
         let mut total_size = 0;
@@ -9614,7 +9653,7 @@ mod tests {
 
         let page = get_page(2);
 
-        let page_contents = page.get_contents_mut_for_test();
+        let page_contents = page.get_contents_mut_unsafe_dont_use();
         let header_size = 8;
 
         let mut total_size = 0;
@@ -9696,7 +9735,7 @@ mod tests {
 
         let page = get_page(2);
 
-        let page_contents = page.get_contents_mut_for_test();
+        let page_contents = page.get_contents_mut_unsafe_dont_use();
         let header_size = 8;
 
         let mut total_size = 0;
@@ -9872,7 +9911,7 @@ mod tests {
         let conn = db.connect().unwrap();
         let page = get_page(2);
 
-        let page_contents = page.get_contents_mut_for_test();
+        let page_contents = page.get_contents_mut_unsafe_dont_use();
         let header_size = 8;
         let usable_space = 4096;
 
@@ -9890,7 +9929,7 @@ mod tests {
 
         let page = get_page(2);
 
-        let page_contents = page.get_contents_mut_for_test();
+        let page_contents = page.get_contents_mut_unsafe_dont_use();
         let usable_space = 4096;
 
         let regs = &[Register::Value(Value::Integer(0))];
@@ -9901,7 +9940,7 @@ mod tests {
         defragment_page(page_contents, usable_space, 4).unwrap();
         assert_eq!(page_contents.cell_count(), 1);
         let (start, len) = page_contents.cell_get_raw_region(0, usable_space);
-        let buf = page_contents.as_ptr();
+        let buf = page_contents.as_slice();
         assert_eq!(&payload, &buf[start..start + len]);
     }
 
@@ -9912,7 +9951,7 @@ mod tests {
 
         let page = get_page(2);
 
-        let page_contents = page.get_contents_mut_for_test();
+        let page_contents = page.get_contents_mut_unsafe_dont_use();
         let usable_space = 4096;
 
         let regs = &[
@@ -9932,7 +9971,7 @@ mod tests {
         assert_eq!(page_contents.cell_count(), 1);
 
         let (start, len) = page_contents.cell_get_raw_region(0, usable_space);
-        let buf = page_contents.as_ptr();
+        let buf = page_contents.as_slice();
         assert_eq!(&payload, &buf[start..start + len]);
     }
 
@@ -9943,7 +9982,7 @@ mod tests {
 
         let page = get_page(2);
 
-        let page_contents = page.get_contents_mut_for_test();
+        let page_contents = page.get_contents_mut_unsafe_dont_use();
         let usable_space = 4096;
 
         let regs = &[
@@ -9964,7 +10003,7 @@ mod tests {
             assert_eq!(page_contents.cell_count(), 1);
 
             let (start, len) = page_contents.cell_get_raw_region(0, usable_space);
-            let buf = page_contents.as_ptr();
+            let buf = page_contents.as_slice();
             assert_eq!(&payload, &buf[start..start + len]);
         }
     }
@@ -9976,7 +10015,7 @@ mod tests {
 
         let page = get_page(2);
 
-        let page_contents = page.get_contents_mut_for_test();
+        let page_contents = page.get_contents_mut_unsafe_dont_use();
         let usable_space = 4096;
 
         let regs = &[Register::Value(Value::Integer(0))];
@@ -10002,7 +10041,7 @@ mod tests {
 
         let page = get_page(2);
 
-        let page_contents = page.get_contents_mut_for_test();
+        let page_contents = page.get_contents_mut_unsafe_dont_use();
         let usable_space = 4096;
 
         let regs = &[Register::Value(Value::Integer(0))];
@@ -10046,25 +10085,25 @@ mod tests {
             defragment_page(page, usable_space, 4).unwrap();
         };
 
-        defragment(page.get_contents_mut_for_test());
-        defragment(page.get_contents_mut_for_test());
+        defragment(page.get_contents_mut_unsafe_dont_use());
+        defragment(page.get_contents_mut_unsafe_dont_use());
         insert(0, page.clone());
-        drop(0, page.get_contents_mut_for_test());
+        drop(0, page.get_contents_mut_unsafe_dont_use());
         insert(0, page.clone());
-        drop(0, page.get_contents_mut_for_test());
+        drop(0, page.get_contents_mut_unsafe_dont_use());
         insert(0, page.clone());
-        defragment(page.get_contents_mut_for_test());
-        defragment(page.get_contents_mut_for_test());
-        drop(0, page.get_contents_mut_for_test());
-        defragment(page.get_contents_mut_for_test());
+        defragment(page.get_contents_mut_unsafe_dont_use());
+        defragment(page.get_contents_mut_unsafe_dont_use());
+        drop(0, page.get_contents_mut_unsafe_dont_use());
+        defragment(page.get_contents_mut_unsafe_dont_use());
         insert(0, page.clone());
-        drop(0, page.get_contents_mut_for_test());
+        drop(0, page.get_contents_mut_unsafe_dont_use());
         insert(0, page.clone());
         insert(1, page.clone());
         insert(1, page.clone());
         insert(0, page.clone());
-        drop(3, page.get_contents_mut_for_test());
-        drop(2, page.get_contents_mut_for_test());
+        drop(3, page.get_contents_mut_unsafe_dont_use());
+        drop(2, page.get_contents_mut_unsafe_dont_use());
         compute_free_space(page.get_contents(), usable_space);
     }
 
@@ -10108,12 +10147,12 @@ mod tests {
         .unwrap();
 
         insert(0, page.clone());
-        defragment(page.get_contents_mut_for_test());
+        defragment(page.get_contents_mut_unsafe_dont_use());
         insert(0, page.clone());
-        defragment(page.get_contents_mut_for_test());
+        defragment(page.get_contents_mut_unsafe_dont_use());
         insert(0, page.clone());
-        drop(2, page.get_contents_mut_for_test());
-        drop(0, page.get_contents_mut_for_test());
+        drop(2, page.get_contents_mut_unsafe_dont_use());
+        drop(0, page.get_contents_mut_unsafe_dont_use());
         let free = compute_free_space(page.get_contents(), usable_space);
         let total_size = payload.len() + 2;
         assert_eq!(
@@ -10192,7 +10231,7 @@ mod tests {
             &conn.pager.load().clone(),
         )
         .unwrap();
-        insert_into_cell(page.get_contents_mut_for_test(), &payload, 0, 4096).unwrap();
+        insert_into_cell(page.get_contents_mut_unsafe_dont_use(), &payload, 0, 4096).unwrap();
         let free = compute_free_space(page.get_contents(), usable_space);
         let total_size = payload.len() + 2;
         assert_eq!(
@@ -10519,7 +10558,7 @@ mod tests {
             let page = run_until_done(|| pager.allocate_page(), &pager).unwrap();
             let page_id = page.id();
             btree_init_page(
-                page.get_contents_mut_for_test(),
+                page.get_contents_mut_unsafe_dont_use(),
                 page_id,
                 page_type,
                 0,
@@ -10538,10 +10577,10 @@ mod tests {
             }
 
             // Create cell array with references to cells inserted
-            let contents = page.get_contents_mut_for_test();
+            let contents = page.get_contents_mut_unsafe_dont_use();
             for cell_idx in 0..contents.cell_count() {
-                let buf = contents.as_ptr();
                 let (start, len) = contents.cell_get_raw_region(cell_idx, pager.usable_space());
+                let buf = contents.as_mut_slice();
                 cell_array
                     .cell_payloads
                     .push(to_static_buf(&mut buf[start..start + len]));
@@ -10573,7 +10612,7 @@ mod tests {
             // check cells are correct
             let mut cell_idx_cloned = if prefix { size } else { 0 };
             for cell_idx in 0..contents.cell_count() {
-                let buf = contents.as_ptr();
+                let buf = contents.as_slice();
                 let (start, len) = contents.cell_get_raw_region(cell_idx, pager.usable_space());
                 let cell_in_page = &buf[start..start + len];
                 let cell_in_array = &cells_cloned[cell_idx_cloned];
@@ -10588,7 +10627,7 @@ mod tests {
         let regs = &[Register::Value(Value::Blob(vec![0; size as usize]))];
         let record = ImmutableRecord::from_registers(regs, regs.len());
         let mut fill_cell_payload_state = FillCellPayloadState::Start;
-        let contents = page.get_contents_mut_for_test();
+        let contents = page.get_contents_mut_unsafe_dont_use();
         run_until_done(
             || {
                 fill_cell_payload(

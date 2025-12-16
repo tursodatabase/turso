@@ -1532,19 +1532,23 @@ impl Wal for WalFile {
         for (idx, page) in pages.iter().enumerate() {
             tracing::debug!("append_frames_vectored: page_id={}", page.id());
             let page_id = page.id();
-            let plain = page.get_contents().as_ptr();
 
             let data_to_write: std::borrow::Cow<[u8]> = {
                 let io_ctx = self.io_ctx.read();
                 match &io_ctx.encryption_or_checksum() {
                     EncryptionOrChecksum::Encryption(ctx) => {
+                        let plain = page.get_contents().as_slice();
                         Cow::Owned(ctx.encrypt_page(plain, page_id)?)
                     }
                     EncryptionOrChecksum::Checksum(ctx) => {
+                        let plain = page.get_contents_mut_unsafe_dont_use().as_mut_slice();
                         ctx.add_checksum_to_page(plain, page_id)?;
                         Cow::Borrowed(plain)
                     }
-                    EncryptionOrChecksum::None => Cow::Borrowed(plain),
+                    EncryptionOrChecksum::None => {
+                        let plain = page.get_contents().as_slice();
+                        Cow::Borrowed(plain)
+                    }
                 }
             };
 

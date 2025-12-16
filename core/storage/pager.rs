@@ -374,11 +374,11 @@ impl Page {
         self.get().contents.as_mut().unwrap()
     }
 
-    /// Test-only: Get mutable access to page contents without requiring a guard.
-    /// This bypasses the dirty-marking enforcement for test convenience.
-    #[cfg(test)]
+    /// Internal: Get mutable access to page contents for operations that don't require
+    /// subjournaling, or if the caller has otherwise checked that Pager::add_dirty() has been called.
+    /// Also used for tests.
     #[allow(clippy::mut_from_ref)]
-    pub fn get_contents_mut_for_test(&self) -> &mut PageContent {
+    pub(crate) fn get_contents_mut_unsafe_dont_use(&self) -> &mut PageContent {
         self.get_contents_mut()
     }
 }
@@ -1364,8 +1364,9 @@ impl Pager {
         tracing::debug!("Pager::allocate_overflow_page(id={})", page.id());
 
         // setup overflow page
-        let contents = page.get().contents.as_mut().unwrap();
-        let buf = contents.as_ptr();
+        let writable = self.add_dirty(&page)?;
+        let contents = writable.contents_mut();
+        let buf = contents.as_mut_slice();
         buf.fill(0);
 
         Ok(IOResult::Done(page))
@@ -2126,8 +2127,8 @@ impl Pager {
                 raw_page,
             )?;
             if let Some(page) = self.cache_get(header.page_number as usize)? {
-                let content = page.get_contents();
-                content.as_ptr().copy_from_slice(raw_page);
+                let content = page.get_contents_mut_unsafe_dont_use();
+                content.as_mut_slice().copy_from_slice(raw_page);
                 turso_assert!(
                     page.id() == header.page_number as usize,
                     "page has unexpected id"
@@ -2488,9 +2489,9 @@ impl Pager {
                     }
                     turso_assert!(trunk_page.is_loaded(), "trunk_page should be loaded");
 
-                    let trunk_page_contents = trunk_page.get_contents();
-                    let number_of_leaf_pages =
-                        trunk_page_contents.read_u32_no_offset(TRUNK_PAGE_LEAF_COUNT_OFFSET);
+                    let number_of_leaf_pages = trunk_page
+                        .get_contents()
+                        .read_u32_no_offset(TRUNK_PAGE_LEAF_COUNT_OFFSET);
 
                     // Reserve 2 slots for the trunk page header which is 8 bytes or 2*LEAF_ENTRY_SIZE
                     let max_free_list_entries =
@@ -2501,7 +2502,8 @@ impl Pager {
                             trunk_page.id() == trunk_page_id as usize,
                             "trunk page has unexpected id"
                         );
-                        self.add_dirty(&trunk_page)?;
+                        let trunk_guard = self.add_dirty(&trunk_page)?;
+                        let trunk_page_contents = trunk_guard.contents_mut();
 
                         trunk_page_contents.write_u32_no_offset(
                             TRUNK_PAGE_LEAF_COUNT_OFFSET,
@@ -2576,20 +2578,18 @@ impl Pager {
 
                 self.buffer_pool
                     .finalize_with_page_size(default_header.page_size.get() as usize)?;
-                let page = allocate_new_page(1, &self.buffer_pool, 0);
+                let page1 = allocate_new_page(1, &self.buffer_pool, 0);
 
-                let contents = page.get_contents();
-                contents.write_database_header(&default_header);
-
-                let page1 = page;
                 // Create the sqlite_schema table, for this we just need to create the btree page
                 // for the first page of the database which is basically like any other btree page
                 // but with a 100 byte offset, so we just init the page so that sqlite understands
                 // this is a correct page.
                 let page1_id = page1.id();
                 let page1_writable = self.add_dirty(&page1)?;
+                let contents = page1_writable.contents_mut();
+                contents.write_database_header(&default_header);
                 btree_init_page(
-                    page1_writable.contents_mut(),
+                    contents,
                     page1_id,
                     PageType::TableLeaf,
                     DatabaseHeader::SIZE,
@@ -2744,14 +2744,14 @@ impl Pager {
                     // and update the database's first freelist trunk page to the next trunk page.
                     header.freelist_trunk_page = next_trunk_page_id.into();
                     header.freelist_pages = (header.freelist_pages.get() - 1).into();
-                    self.add_dirty(trunk_page)?;
+                    let trunk_guard = self.add_dirty(trunk_page)?;
                     // zero out the page
                     turso_assert!(
-                        trunk_page.get_contents().overflow_cells.is_empty(),
+                        trunk_guard.contents_mut().overflow_cells.is_empty(),
                         "Freelist leaf page {} has overflow cells",
                         trunk_page.id()
                     );
-                    trunk_page.get_contents().as_ptr().fill(0);
+                    trunk_guard.contents_mut().as_mut_slice().fill(0);
                     let page_key = PageCacheKey::new(trunk_page.id());
                     {
                         let page_cache = self.page_cache.read();
@@ -2775,15 +2775,14 @@ impl Pager {
                         "Leaf page {} is not loaded",
                         leaf_page.id()
                     );
-                    let page_contents = trunk_page.get_contents();
-                    self.add_dirty(leaf_page)?;
+                    let leaf_guard = self.add_dirty(leaf_page)?;
                     // zero out the page
                     turso_assert!(
-                        leaf_page.get_contents().overflow_cells.is_empty(),
+                        leaf_guard.contents_mut().overflow_cells.is_empty(),
                         "Freelist leaf page {} has overflow cells",
                         leaf_page.id()
                     );
-                    leaf_page.get_contents().as_ptr().fill(0);
+                    leaf_guard.contents_mut().as_mut_slice().fill(0);
                     let page_key = PageCacheKey::new(leaf_page.id());
                     {
                         let page_cache = self.page_cache.read();
@@ -2795,12 +2794,13 @@ impl Pager {
                     }
 
                     // Mark trunk page dirty BEFORE modifying it so subjournal captures original content
-                    self.add_dirty(trunk_page)?;
+                    let trunk_guard = self.add_dirty(trunk_page)?;
+                    let trunk_contents = trunk_guard.contents_mut();
 
                     // Shift left all the other leaf pages in the trunk page and subtract 1 from the leaf count
                     let remaining_leaves_count = (*number_of_freelist_leaves - 1) as usize;
                     {
-                        let buf = page_contents.as_ptr();
+                        let buf = trunk_contents.as_mut_slice();
                         // use copy within the same page
                         const LEAF_PTR_SIZE_BYTES: usize = 4;
                         let offset_remaining_leaves_start =
@@ -2813,7 +2813,7 @@ impl Pager {
                         );
                     }
                     // write the new leaf count
-                    page_contents.write_u32_no_offset(
+                    trunk_contents.write_u32_no_offset(
                         FREELIST_TRUNK_OFFSET_LEAF_COUNT,
                         remaining_leaves_count as u32,
                     );

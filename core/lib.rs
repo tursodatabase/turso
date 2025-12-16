@@ -1795,7 +1795,7 @@ impl Connection {
         if content.buffer.is_empty() {
             return Ok(false);
         }
-        page.copy_from_slice(content.as_ptr());
+        page.copy_from_slice(content.as_slice());
         Ok(true)
     }
 
