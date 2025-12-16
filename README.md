@@ -55,7 +55,7 @@ The database has the following experimental features:
 
 * **`BEGIN CONCURRENT`** for improved write throughput using multi-version concurrency control (MVCC).
 * **Encryption at rest** for protecting the data locally.
-* **Incremental computation** using DBSP for incremental view mainatenance and query subscriptions.
+* **Incremental computation** using DBSP for incremental view maintenance and query subscriptions.
 
 The following features are on our current roadmap:
 
