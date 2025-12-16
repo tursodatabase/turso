@@ -488,8 +488,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
         let Some(wal) = &self.pager.wal else {
             panic!("No WAL to checkpoint");
         };
-        let mut wal_ref = wal.borrow_mut();
-        match wal_ref.checkpoint(
+        match wal.checkpoint(
             &self.pager,
             CheckpointMode::Truncate {
                 upper_bound_inclusive: None,

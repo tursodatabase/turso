@@ -18,9 +18,8 @@ use crate::{io_yield_one, Buffer, CompletionError, IOContext, OpenFlags, IO};
 use arc_swap::ArcSwapOption;
 use parking_lot::{Mutex, RwLock};
 use roaring::RoaringBitmap;
-use std::cell::{RefCell, UnsafeCell};
+use std::cell::UnsafeCell;
 use std::collections::BTreeSet;
-use std::rc::Rc;
 use std::sync::atomic::{
     AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
 };
@@ -498,7 +497,7 @@ pub struct Pager {
     pub db_file: Arc<dyn DatabaseStorage>,
     /// The write-ahead log (WAL) for the database.
     /// in-memory databases, ephemeral tables and ephemeral indexes do not have a WAL.
-    pub(crate) wal: Option<Rc<RefCell<dyn Wal>>>,
+    pub(crate) wal: Option<Arc<dyn Wal>>,
     /// A page cache for the database.
     page_cache: Arc<RwLock<PageCache>>,
     /// Buffer pool for temporary data storage.
@@ -544,11 +543,6 @@ pub struct Pager {
     /// In Memory Page 1 for Empty Dbs
     init_page_1: Arc<ArcSwapOption<Page>>,
 }
-
-// SAFETY: This needs to be audited for thread safety.
-// See: https://github.com/tursodatabase/turso/issues/1552
-unsafe impl Send for Pager {}
-unsafe impl Sync for Pager {}
 
 #[cfg(not(feature = "omit_autovacuum"))]
 pub struct VacuumState {
@@ -611,7 +605,7 @@ enum FreePageState {
 impl Pager {
     pub fn new(
         db_file: Arc<dyn DatabaseStorage>,
-        wal: Option<Rc<RefCell<dyn Wal>>>,
+        wal: Option<Arc<dyn Wal>>,
         io: Arc<dyn crate::io::IO>,
         page_cache: Arc<RwLock<PageCache>>,
         buffer_pool: Arc<BufferPool>,
@@ -966,8 +960,8 @@ impl Pager {
         Ok(IOResult::Done(clamped_max))
     }
 
-    pub fn set_wal(&mut self, wal: Rc<RefCell<dyn Wal>>) {
-        wal.borrow_mut().set_io_context(self.io_ctx.read().clone());
+    pub fn set_wal(&mut self, wal: Arc<dyn Wal>) {
+        wal.set_io_context(self.io_ctx.read().clone());
         self.wal = Some(wal);
     }
 
@@ -1440,7 +1434,7 @@ impl Pager {
         let Some(wal) = self.wal.as_ref() else {
             return Ok(());
         };
-        let changed = wal.borrow_mut().begin_read_tx()?;
+        let changed = wal.begin_read_tx()?;
         if changed {
             // Someone else changed the database -> assume our page cache is invalid (this is default SQLite behavior, we can probably do better with more granular invalidation)
             self.clear_page_cache(false);
@@ -1476,7 +1470,7 @@ impl Pager {
         let Some(wal) = self.wal.as_ref() else {
             return Ok(IOResult::Done(()));
         };
-        Ok(IOResult::Done(wal.borrow_mut().begin_write_tx()?))
+        Ok(IOResult::Done(wal.begin_write_tx()?))
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
@@ -1499,8 +1493,8 @@ impl Pager {
             connection.get_sync_mode(),
             connection.get_data_sync_retry()
         ));
-        wal.borrow().end_write_tx();
-        wal.borrow().end_read_tx();
+        wal.end_write_tx();
+        wal.end_read_tx();
 
         if schema_did_change {
             let schema = connection.schema.read().clone();
@@ -1527,9 +1521,9 @@ impl Pager {
         if is_write {
             self.clear_savepoints()
                 .expect("in practice, clear_savepoints() should never fail as it uses memory IO");
-            wal.borrow().end_write_tx();
+            wal.end_write_tx();
         }
-        wal.borrow().end_read_tx();
+        wal.end_read_tx();
         self.rollback(schema_did_change, connection, is_write);
     }
 
@@ -1538,7 +1532,7 @@ impl Pager {
         let Some(wal) = self.wal.as_ref() else {
             return;
         };
-        wal.borrow().end_read_tx();
+        wal.end_read_tx();
     }
 
     /// Reads a page from disk (either WAL or DB file) bypassing page-cache
@@ -1569,10 +1563,8 @@ impl Pager {
             return Ok((page, c));
         };
 
-        if let Some(frame_id) = wal.borrow().find_frame(page_idx as u64, frame_watermark)? {
-            let c = wal
-                .borrow()
-                .read_frame(frame_id, page.clone(), self.buffer_pool.clone())?;
+        if let Some(frame_id) = wal.find_frame(page_idx as u64, frame_watermark)? {
+            let c = wal.read_frame(frame_id, page.clone(), self.buffer_pool.clone())?;
             // TODO(pere) should probably first insert to page cache, and if successful,
             // read frame or page
             return Ok((page, c));
@@ -1707,8 +1699,8 @@ impl Pager {
             ));
         };
         Ok(WalState {
-            checkpoint_seq_no: wal.borrow().get_checkpoint_seq(),
-            max_frame: wal.borrow().get_max_frame(),
+            checkpoint_seq_no: wal.get_checkpoint_seq(),
+            max_frame: wal.get_max_frame(),
         })
     }
 
@@ -1734,10 +1726,10 @@ impl Pager {
         let mut pages = Vec::with_capacity(len);
         let page_sz = self.get_page_size().unwrap_or_default();
 
-        let prepare = wal.borrow_mut().prepare_wal_start(page_sz)?;
+        let prepare = wal.prepare_wal_start(page_sz)?;
         if let Some(c) = prepare {
             self.io.wait_for_completion(c)?;
-            let c = wal.borrow_mut().prepare_wal_finish()?;
+            let c = wal.prepare_wal_finish()?;
             self.io.wait_for_completion(c)?;
         }
 
@@ -1753,7 +1745,7 @@ impl Pager {
             };
             pages.push(page);
             if pages.len() == IOV_MAX {
-                match wal.borrow_mut().append_frames_vectored(
+                match wal.append_frames_vectored(
                     std::mem::replace(
                         &mut pages,
                         Vec::with_capacity(std::cmp::min(IOV_MAX, dirty_pages.len() - idx)),
@@ -1771,10 +1763,7 @@ impl Pager {
             }
         }
         if !pages.is_empty() {
-            match wal
-                .borrow_mut()
-                .append_frames_vectored(pages, page_sz, commit_frame)
-            {
+            match wal.append_frames_vectored(pages, page_sz, commit_frame) {
                 Ok(c) => completions.push(c),
                 Err(e) => {
                     tracing::error!("cacheflush: error appending frames: {e}");
@@ -1830,7 +1819,7 @@ impl Pager {
             match state {
                 CommitState::PrepareWal => {
                     let page_sz = self.get_page_size_unchecked();
-                    let c = wal.borrow_mut().prepare_wal_start(page_sz)?;
+                    let c = wal.prepare_wal_start(page_sz)?;
                     let Some(c) = c else {
                         self.commit_info.write().state = CommitState::GetDbSize;
                         continue;
@@ -1841,7 +1830,7 @@ impl Pager {
                     }
                 }
                 CommitState::PrepareWalSync => {
-                    let c = wal.borrow_mut().prepare_wal_finish()?;
+                    let c = wal.prepare_wal_finish()?;
                     self.commit_info.write().state = CommitState::GetDbSize;
                     if !c.succeeded() {
                         io_yield_one!(c);
@@ -1894,7 +1883,7 @@ impl Pager {
                             } else {
                                 None
                             };
-                            let r = wal.borrow_mut().append_frames_vectored(
+                            let r = wal.append_frames_vectored(
                                 std::mem::take(&mut pages),
                                 page_sz,
                                 commit_flag,
@@ -1924,7 +1913,7 @@ impl Pager {
                     }
                 }
                 CommitState::SyncWal => {
-                    let sync_result = wal.borrow_mut().sync();
+                    let sync_result = wal.sync();
                     let c = match sync_result {
                         Ok(c) => c,
                         Err(e) if !data_sync_retry => {
@@ -1954,9 +1943,9 @@ impl Pager {
                     // WAL sync is complete - finalize the WAL commit
                     // After this point, the write transaction is durable regardless of checkpoint outcome
                     self.commit_info.write().completions.clear();
-                    wal.borrow_mut().finish_append_frames_commit()?;
+                    wal.finish_append_frames_commit()?;
 
-                    if wal_auto_checkpoint_disabled || !wal.borrow().should_checkpoint() {
+                    if wal_auto_checkpoint_disabled || !wal.should_checkpoint() {
                         return Ok(IOResult::Done(PagerCommitResult::WalWritten));
                     }
                     self.commit_info.write().state = CommitState::Checkpoint;
@@ -2063,7 +2052,7 @@ impl Pager {
 
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn wal_changed_pages_after(&self, frame_watermark: u64) -> Result<Vec<u32>> {
-        let wal = self.wal.as_ref().unwrap().borrow();
+        let wal = self.wal.as_ref().unwrap();
         wal.changed_pages_after(frame_watermark)
     }
 
@@ -2074,7 +2063,6 @@ impl Pager {
                 "wal_get_frame() called on database without WAL".to_string(),
             ));
         };
-        let wal = wal.borrow();
         wal.read_frame_raw(frame_no, frame)
     }
 
@@ -2087,23 +2075,20 @@ impl Pager {
         };
         let (header, raw_page) = parse_wal_frame_header(frame);
 
-        {
-            let mut wal = wal.borrow_mut();
-            wal.write_frame_raw(
-                self.buffer_pool.clone(),
-                frame_no,
-                header.page_number as u64,
-                header.db_size as u64,
-                raw_page,
-            )?;
-            if let Some(page) = self.cache_get(header.page_number as usize)? {
-                let content = page.get_contents();
-                content.as_ptr().copy_from_slice(raw_page);
-                turso_assert!(
-                    page.get().id == header.page_number as usize,
-                    "page has unexpected id"
-                );
-            }
+        wal.write_frame_raw(
+            self.buffer_pool.clone(),
+            frame_no,
+            header.page_number as u64,
+            header.db_size as u64,
+            raw_page,
+        )?;
+        if let Some(page) = self.cache_get(header.page_number as usize)? {
+            let content = page.get_contents();
+            content.as_ptr().copy_from_slice(raw_page);
+            turso_assert!(
+                page.get().id == header.page_number as usize,
+                "page has unexpected id"
+            );
         }
         if header.page_number == 1 {
             let db_size = self
@@ -2147,9 +2132,9 @@ impl Pager {
     pub fn finish_commit_after_checkpoint_failure(&self) {
         self.reset_checkpoint_state();
         if let Some(wal) = self.wal.as_ref() {
-            wal.borrow_mut().abort_checkpoint();
-            wal.borrow().end_write_tx();
-            wal.borrow().end_read_tx();
+            wal.abort_checkpoint();
+            wal.end_write_tx();
+            wal.end_read_tx();
         }
     }
 
@@ -2169,7 +2154,7 @@ impl Pager {
                 }
                 CheckpointState::Checkpoint => {
                     *self.checkpoint_state.write() = CheckpointState::Checkpoint; // must be set back to Checkpoint in case wal.checkpoint() fails since we take() it above.
-                    let res = return_if_io!(wal.borrow_mut().checkpoint(
+                    let res = return_if_io!(wal.checkpoint(
                         self,
                         CheckpointMode::Passive {
                             upper_bound_inclusive: None
@@ -2230,7 +2215,6 @@ impl Pager {
                     "checkpoint_shutdown() called on database without WAL".to_string(),
                 ));
             };
-            let mut wal = wal.borrow_mut();
             // fsync the wal syncronously before beginning checkpoint
             let c = wal.sync()?;
             self.io.wait_for_completion(c)?;
@@ -2262,7 +2246,7 @@ impl Pager {
             ));
         };
 
-        wal.borrow_mut().checkpoint(self, mode)
+        wal.checkpoint(self, mode)
     }
 
     pub fn wal_checkpoint_finish(
@@ -2821,7 +2805,7 @@ impl Pager {
         }
         if is_write {
             if let Some(wal) = self.wal.as_ref() {
-                wal.borrow_mut().rollback();
+                wal.rollback();
             }
         }
     }
@@ -2887,7 +2871,7 @@ impl Pager {
         let Some(wal) = self.wal.as_ref() else {
             return Ok(());
         };
-        wal.borrow_mut().set_io_context(self.io_ctx.read().clone());
+        wal.set_io_context(self.io_ctx.read().clone());
         // whenever we set the encryption context, lets reset the page cache. The page cache
         // might have been loaded with page 1 to initialise the connection. During initialisation,
         // we only read the header which is unencrypted, but the rest of the page is. If so, lets
@@ -2902,7 +2886,7 @@ impl Pager {
             io_ctx.reset_checksum();
         }
         let Some(wal) = self.wal.as_ref() else { return };
-        wal.borrow_mut().set_io_context(self.io_ctx.read().clone())
+        wal.set_io_context(self.io_ctx.read().clone())
     }
 
     pub fn set_reserved_space_bytes(&self, value: u8) {
@@ -3199,8 +3183,6 @@ mod tests {
 #[cfg(test)]
 #[cfg(not(feature = "omit_autovacuum"))]
 mod ptrmap_tests {
-    use std::cell::RefCell;
-    use std::rc::Rc;
     use std::sync::Arc;
 
     use super::ptrmap::*;
@@ -3239,7 +3221,7 @@ mod ptrmap_tests {
         let buffer_pool = BufferPool::begin_init(&io, (sz * page_size) as usize);
         let page_cache = Arc::new(RwLock::new(PageCache::new(sz as usize)));
 
-        let wal = Rc::new(RefCell::new(WalFile::new(
+        let wal: Arc<dyn Wal> = Arc::new(WalFile::new(
             io.clone(),
             WalFileShared::new_shared(
                 io.open_file("test.db-wal", OpenFlags::Create, false)
@@ -3247,7 +3229,7 @@ mod ptrmap_tests {
             )
             .unwrap(),
             buffer_pool.clone(),
-        )));
+        ));
 
         let pager = Pager::new(
             db_file,
