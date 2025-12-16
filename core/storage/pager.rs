@@ -415,7 +415,7 @@ impl Page {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 /// The state of the current pager cache commit.
 enum CommitState {
     /// Prepare WAL header for commit if needed
@@ -2423,8 +2423,18 @@ impl Pager {
         sync_mode: crate::SyncMode,
         data_sync_retry: bool,
     ) -> Result<IOResult<PagerCommitResult>> {
-        let dirty_len = self.dirty_pages.read().len();
-        tracing::warn!("commit_dirty_pages start: {} dirty pages", dirty_len);
+        // Reset commit_info at the start of each commit to ensure clean state.
+        // This is necessary because commit_info is shared across connections,
+        // and a previous connection's commit may have left stale state.
+        {
+            let commit_info = self.commit_info.read();
+            if commit_info.state == CommitState::PrepareWal {
+                // Only reset if we're starting fresh (not resuming from IO yield)
+                drop(commit_info);
+                self.commit_info.write().reset();
+            }
+        }
+
         // Make sure any asynchronous spill writes are finished before we start publishing
         // new frames to readers. Otherwise wal.max_frame may get ahead of what is actually
         // on disk and readers can attempt to read unwritten frames.
