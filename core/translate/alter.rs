@@ -540,6 +540,17 @@ pub fn translate_alter_table(
                 to: new_name.to_owned(),
             });
 
+            for trigger in resolver.schema.get_triggers_for_table(table_name) {
+                program.emit_insn(Insn::DropTrigger {
+                    db: 0,
+                    trigger_name: trigger.name.clone(),
+                });
+                program.emit_insn(Insn::ParseSchema {
+                    db: 0,
+                    where_clause: Some(format!("name = '{}'", trigger.name)),
+                });
+            }
+
             program
         }
         body @ (ast::AlterTableBody::AlterColumn { .. }
@@ -819,7 +830,7 @@ pub fn translate_alter_table(
                     trigger_name: trigger_name.clone(),
                 });
                 program.emit_insn(Insn::ParseSchema {
-                    db: cursor_id,
+                    db: 0,
                     where_clause: Some(format!("name = '{trigger_name}'")),
                 });
             }
