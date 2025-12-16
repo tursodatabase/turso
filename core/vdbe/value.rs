@@ -831,6 +831,7 @@ impl Value {
             return Value::Null;
         }
 
+        #[allow(unused_unsafe)]
         let result = match function {
             MathFunc::Acos => unsafe { cmath::acos(f) },
             MathFunc::Acosh => unsafe { cmath::acosh(f) },
@@ -873,6 +874,7 @@ impl Value {
             return Value::Null;
         };
 
+        #[allow(unused_unsafe)]
         let result = match function {
             MathFunc::Atan2 => unsafe { cmath::atan2(lhs, rhs) },
             MathFunc::Mod => libm::fmod(lhs, rhs),
