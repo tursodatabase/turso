@@ -116,9 +116,9 @@ typedef struct
     // optional parameter which defines segment size for lazy loading from remote server
     // one of valid partial_bootstrap_strategy_* values MUST be set in order for this setting to have some effect
     size_t partial_bootstrap_segment_size;
-    // optional parameter which defines if speculative pages load must be enabled
+    // optional parameter which defines if pages prefetch must be enabled
     // one of valid partial_bootstrap_strategy_* values MUST be set in order for this setting to have some effect
-    bool partial_bootstrap_speculative_load;
+    bool partial_bootstrap_prefetch;
 } turso_sync_database_config_t;
 
 /// opaque pointer to the TursoDatabaseSync instance

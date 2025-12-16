@@ -55,7 +55,7 @@ class PartialSyncQueryBootstrap:
 class PartialSyncOpts:
     bootstrap_strategy: Union[PartialSyncPrefixBootstrap, PartialSyncQueryBootstrap]
     segment_size: Optional[int] = None
-    speculative_load: Optional[bool] = None
+    prefetch: Optional[bool] = None
 
 def connect_sync(
     path: str, # path to the main database file locally

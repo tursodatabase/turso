@@ -123,7 +123,7 @@ pub enum JsPartialBootstrapStrategy {
 pub struct JsPartialSyncOpts {
     pub bootstrap_strategy: JsPartialBootstrapStrategy,
     pub segment_size: Option<i64>,
-    pub speculative_load: Option<bool>,
+    pub prefetch: Option<bool>,
 }
 
 #[napi(object, object_to_js = false)]
@@ -272,12 +272,12 @@ impl SyncEngine {
                             length: length as usize,
                         },
                         segment_size: partial_sync_opts.segment_size.unwrap_or(0) as usize,
-                        speculative_load: partial_sync_opts.speculative_load.unwrap_or(false),
+                        prefetch: partial_sync_opts.prefetch.unwrap_or(false),
                     }),
                     JsPartialBootstrapStrategy::Query { query } => Some(PartialSyncOpts {
                         bootstrap_strategy: PartialBootstrapStrategy::Query { query },
                         segment_size: partial_sync_opts.segment_size.unwrap_or(0) as usize,
-                        speculative_load: partial_sync_opts.speculative_load.unwrap_or(false),
+                        prefetch: partial_sync_opts.prefetch.unwrap_or(false),
                     }),
                 },
                 None => None,
