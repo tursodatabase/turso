@@ -1,5 +1,4 @@
 use std::{
-    cell::RefCell,
     cmp::Ordering,
     collections::{HashMap, HashSet, VecDeque},
     sync::Arc,
@@ -643,7 +642,7 @@ fn optimize_table_access(
         }
     }
 
-    let access_methods_arena = RefCell::new(Vec::new());
+    let mut access_methods_arena = Vec::new();
     let maybe_order_target = compute_order_target(order_by, group_by.as_mut(), table_references);
     let constraints_per_table = constraints_from_where_clause(
         where_clause,
@@ -698,13 +697,15 @@ fn optimize_table_access(
         maybe_order_target.as_ref(),
         &constraints_per_table,
         &base_table_rows,
-        &access_methods_arena,
+        &mut access_methods_arena,
         where_clause,
         subqueries,
     )?
     else {
         return Ok(None);
     };
+
+    dbg!(&access_methods_arena);
 
     let BestJoinOrderResult {
         best_plan,
@@ -734,7 +735,7 @@ fn optimize_table_access(
     if let Some(order_target) = maybe_order_target.as_ref() {
         let satisfies_order_target = plan_satisfies_order_target(
             &best_plan,
-            &access_methods_arena.borrow(),
+            &access_methods_arena,
             table_references.joined_tables_mut(),
             order_target,
         );
@@ -767,7 +768,7 @@ fn optimize_table_access(
     let hash_join_build_tables: Vec<usize> = best_access_methods
         .iter()
         .filter_map(|&am_idx| {
-            let arena = access_methods_arena.borrow();
+            let arena = &access_methods_arena;
             arena.get(am_idx).and_then(|am| {
                 if let AccessMethodParams::HashJoin {
                     build_table_idx, ..
@@ -797,7 +798,6 @@ fn optimize_table_access(
     // Mutate the Operations in `joined_tables` to use the selected access methods.
     // We iterate over ALL tables (including hash join build tables) to set their operations,
     // even though build tables are not in best_join_order.
-    let access_methods_arena = &mut access_methods_arena.borrow_mut();
     for (i, &table_idx) in best_table_numbers.iter().enumerate() {
         let access_method = &mut access_methods_arena[best_access_methods[i]];
         match &mut access_method.params {

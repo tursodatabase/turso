@@ -1,4 +1,4 @@
-use std::{cell::RefCell, collections::HashMap};
+use std::collections::HashMap;
 
 use turso_parser::ast::TableInternalId;
 
@@ -56,7 +56,7 @@ pub fn join_lhs_and_rhs<'a>(
     base_table_rows: &[RowCountEstimate],
     join_order: &[JoinOrderMember],
     maybe_order_target: Option<&OrderTarget>,
-    access_methods_arena: &'a RefCell<Vec<AccessMethod>>,
+    access_methods_arena: &'a mut Vec<AccessMethod>,
     cost_upper_bound: Cost,
     joined_tables: &[JoinedTable],
     where_clause: &mut [WhereTerm],
@@ -148,7 +148,7 @@ pub fn join_lhs_and_rhs<'a>(
             .find(|(table_no, _)| *table_no == lhs_table_idx)
             .map(|(_, am_idx)| *am_idx)
             .map(|am_idx| {
-                let arena = access_methods_arena.borrow();
+                let arena = &access_methods_arena;
                 arena.get(am_idx).is_some_and(|am| {
                     if let AccessMethodParams::BTreeTable {
                         constraint_refs, ..
@@ -167,10 +167,9 @@ pub fn join_lhs_and_rhs<'a>(
         let nested_loop_preserves_order = maybe_order_target.is_some_and(|order_target| {
             // Temporarily add the nested-loop method to the arena to evaluate ordering.
             {
-                let mut arena = access_methods_arena.borrow_mut();
-                arena.push(best_access_method.clone());
+                access_methods_arena.push(best_access_method.clone());
             }
-            let am_idx = access_methods_arena.borrow().len() - 1;
+            let am_idx = access_methods_arena.len() - 1;
             let mut data = lhs.data.clone();
             data.push((rhs_table_number, am_idx));
             let tmp_plan = JoinN {
@@ -180,11 +179,11 @@ pub fn join_lhs_and_rhs<'a>(
             };
             let preserves = plan_satisfies_order_target(
                 &tmp_plan,
-                &access_methods_arena.borrow(),
+                &access_methods_arena,
                 joined_tables,
                 order_target,
             );
-            access_methods_arena.borrow_mut().pop();
+            access_methods_arena.pop();
             preserves
         });
 
@@ -200,7 +199,7 @@ pub fn join_lhs_and_rhs<'a>(
         );
 
         // The probe table must NOT be the build table of any earlier hash join
-        let arena = access_methods_arena.borrow();
+        let arena = &access_methods_arena;
         let probe_table_is_prior_build = lhs.data.iter().any(|(_, am_idx)| {
             arena.get(*am_idx).is_some_and(|am| {
                 if let AccessMethodParams::HashJoin {
@@ -237,7 +236,7 @@ pub fn join_lhs_and_rhs<'a>(
 
             // Get the set of tables that are build tables for hash joins where lhs_table_idx was probe
             let tables_already_hash_joined_as_build: Vec<usize> = {
-                let arena = access_methods_arena.borrow();
+                let arena = &access_methods_arena;
                 lhs.data
                     .iter()
                     .filter_map(|(_, am_idx)| {
@@ -295,7 +294,7 @@ pub fn join_lhs_and_rhs<'a>(
             .iter()
             .find(|(table_no, _)| *table_no == lhs_table_idx)
             .map(|(_, am_idx)| {
-                let arena = access_methods_arena.borrow();
+                let arena = &access_methods_arena;
                 arena.get(*am_idx).is_some_and(|am| {
                     matches!(
                         &am.params,
@@ -340,12 +339,12 @@ pub fn join_lhs_and_rhs<'a>(
     if cost > cost_upper_bound {
         return Ok(None);
     }
-    access_methods_arena.borrow_mut().push(best_access_method);
+    access_methods_arena.push(best_access_method);
 
     let mut best_access_methods = Vec::with_capacity(join_order.len());
     best_access_methods.extend(lhs.map_or(vec![], |l| l.data.clone()));
 
-    best_access_methods.push((rhs_table_number, access_methods_arena.borrow().len() - 1));
+    best_access_methods.push((rhs_table_number, access_methods_arena.len() - 1));
 
     // Produce a number of rows estimated to be returned when this table is filtered by the WHERE clause.
     // If this table is the rightmost table in the join order, we multiply by the input cardinality,
@@ -376,7 +375,7 @@ pub fn compute_best_join_order<'a>(
     maybe_order_target: Option<&OrderTarget>,
     constraints: &'a [TableConstraints],
     base_table_rows: &[RowCountEstimate],
-    access_methods_arena: &'a RefCell<Vec<AccessMethod>>,
+    access_methods_arena: &'a mut Vec<AccessMethod>,
     where_clause: &mut [WhereTerm],
     subqueries: &[NonFromClauseSubquery],
 ) -> Result<Option<BestJoinOrderResult>> {
@@ -419,12 +418,9 @@ pub fn compute_best_join_order<'a>(
     // the one we choose, if the cost reduction from avoiding sorting brings it below the cost of the overall best one.
     let mut best_ordered_plan: Option<JoinN> = None;
     let mut best_plan_is_also_ordered = match (naive_plan.as_ref(), maybe_order_target) {
-        (Some(plan), Some(order_target)) => plan_satisfies_order_target(
-            plan,
-            &access_methods_arena.borrow(),
-            joined_tables,
-            order_target,
-        ),
+        (Some(plan), Some(order_target)) => {
+            plan_satisfies_order_target(plan, access_methods_arena, joined_tables, order_target)
+        }
         _ => false,
     };
 
@@ -617,7 +613,7 @@ pub fn compute_best_join_order<'a>(
                 let satisfies_order_target = if let Some(order_target) = maybe_order_target {
                     plan_satisfies_order_target(
                         &rel,
-                        &access_methods_arena.borrow(),
+                        access_methods_arena,
                         joined_tables,
                         order_target,
                     )
@@ -698,7 +694,7 @@ pub fn compute_greedy_join_order<'a>(
     maybe_order_target: Option<&OrderTarget>,
     constraints: &'a [TableConstraints],
     base_table_rows: &[RowCountEstimate],
-    access_methods_arena: &'a RefCell<Vec<AccessMethod>>,
+    access_methods_arena: &'a mut Vec<AccessMethod>,
     where_clause: &mut [WhereTerm],
     subqueries: &[NonFromClauseSubquery],
 ) -> Result<Option<BestJoinOrderResult>> {
@@ -882,7 +878,7 @@ pub fn compute_naive_left_deep_plan<'a>(
     joined_tables: &[JoinedTable],
     maybe_order_target: Option<&OrderTarget>,
     base_table_rows: &[RowCountEstimate],
-    access_methods_arena: &'a RefCell<Vec<AccessMethod>>,
+    access_methods_arena: &'a mut Vec<AccessMethod>,
     constraints: &'a [TableConstraints],
     where_clause: &mut [WhereTerm],
     subqueries: &[NonFromClauseSubquery],
@@ -1038,7 +1034,7 @@ mod tests {
         let available_indexes = HashMap::new();
         let mut where_clause = vec![];
 
-        let access_methods_arena = RefCell::new(Vec::new());
+        let mut access_methods_arena = Vec::new();
         let table_constraints = constraints_from_where_clause(
             &where_clause,
             &table_references,
@@ -1054,7 +1050,7 @@ mod tests {
             None,
             &table_constraints,
             &base_table_rows,
-            &access_methods_arena,
+            &mut access_methods_arena,
             &mut where_clause,
             &[],
         )
@@ -1076,7 +1072,7 @@ mod tests {
         let available_indexes = HashMap::new();
         let mut where_clause = vec![];
 
-        let access_methods_arena = RefCell::new(Vec::new());
+        let mut access_methods_arena = Vec::new();
         let table_constraints = constraints_from_where_clause(
             &where_clause,
             &table_references,
@@ -1094,14 +1090,14 @@ mod tests {
             None,
             &table_constraints,
             &base_table_rows,
-            &access_methods_arena,
+            &mut access_methods_arena,
             &mut where_clause,
             &[],
         )
         .unwrap()
         .unwrap();
         // Should just be a table scan access method
-        let access_method = &access_methods_arena.borrow()[best_plan.data[0].1];
+        let access_method = &access_methods_arena[best_plan.data[0].1];
         let (iter_dir, _, constraint_refs) = _as_btree(access_method);
         assert!(constraint_refs.is_empty());
         assert!(iter_dir == IterationDirection::Forwards);
@@ -1125,7 +1121,7 @@ mod tests {
         )];
 
         let table_references = TableReferences::new(joined_tables, vec![]);
-        let access_methods_arena = RefCell::new(Vec::new());
+        let mut access_methods_arena = Vec::new();
         let available_indexes = HashMap::new();
         let table_constraints = constraints_from_where_clause(
             &where_clause,
@@ -1144,7 +1140,7 @@ mod tests {
             None,
             &table_constraints,
             &base_table_rows,
-            &access_methods_arena,
+            &mut access_methods_arena,
             &mut where_clause,
             &[],
         )
@@ -1152,7 +1148,7 @@ mod tests {
         assert!(result.is_some());
         let BestJoinOrderResult { best_plan, .. } = result.unwrap();
         assert_eq!(best_plan.table_numbers().collect::<Vec<_>>(), vec![0]);
-        let access_method = &access_methods_arena.borrow()[best_plan.data[0].1];
+        let access_method = &access_methods_arena[best_plan.data[0].1];
         let (iter_dir, _, constraint_refs) = _as_btree(access_method);
         assert!(!constraint_refs.is_empty());
         assert!(iter_dir == IterationDirection::Forwards);
@@ -1184,7 +1180,7 @@ mod tests {
         )];
 
         let table_references = TableReferences::new(joined_tables, vec![]);
-        let access_methods_arena = RefCell::new(Vec::new());
+        let mut access_methods_arena = Vec::new();
         let mut available_indexes = HashMap::new();
         let index = Arc::new(Index {
             name: "sqlite_autoindex_test_table_1".to_string(),
@@ -1222,7 +1218,7 @@ mod tests {
             None,
             &table_constraints,
             &base_table_rows,
-            &access_methods_arena,
+            &mut access_methods_arena,
             &mut where_clause,
             &[],
         )
@@ -1230,7 +1226,7 @@ mod tests {
         assert!(result.is_some());
         let BestJoinOrderResult { best_plan, .. } = result.unwrap();
         assert_eq!(best_plan.table_numbers().collect::<Vec<_>>(), vec![0]);
-        let access_method = &access_methods_arena.borrow()[best_plan.data[0].1];
+        let access_method = &access_methods_arena[best_plan.data[0].1];
         let (iter_dir, index, constraint_refs) = _as_btree(access_method);
         assert!(!constraint_refs.is_empty());
         assert!(iter_dir == IterationDirection::Forwards);
@@ -1295,7 +1291,7 @@ mod tests {
         )];
 
         let table_references = TableReferences::new(joined_tables, vec![]);
-        let access_methods_arena = RefCell::new(Vec::new());
+        let mut access_methods_arena = Vec::new();
         let table_constraints = constraints_from_where_clause(
             &where_clause,
             &table_references,
@@ -1311,7 +1307,7 @@ mod tests {
             None,
             &table_constraints,
             &base_table_rows,
-            &access_methods_arena,
+            &mut access_methods_arena,
             &mut where_clause,
             &[],
         )
@@ -1319,11 +1315,11 @@ mod tests {
         assert!(result.is_some());
         let BestJoinOrderResult { best_plan, .. } = result.unwrap();
         assert_eq!(best_plan.table_numbers().collect::<Vec<_>>(), vec![1, 0]);
-        let access_method = &access_methods_arena.borrow()[best_plan.data[0].1];
+        let access_method = &access_methods_arena[best_plan.data[0].1];
         let (iter_dir, _, constraint_refs) = _as_btree(access_method);
         assert!(constraint_refs.is_empty());
         assert!(iter_dir == IterationDirection::Forwards);
-        let access_method = &access_methods_arena.borrow()[best_plan.data[1].1];
+        let access_method = &access_methods_arena[best_plan.data[1].1];
         let (iter_dir, index, constraint_refs) = _as_btree(access_method);
         assert!(!constraint_refs.is_empty());
         assert!(iter_dir == IterationDirection::Forwards);
@@ -1485,7 +1481,7 @@ mod tests {
         ];
 
         let table_references = TableReferences::new(joined_tables, vec![]);
-        let access_methods_arena = RefCell::new(Vec::new());
+        let mut access_methods_arena = Vec::new();
         let table_constraints = constraints_from_where_clause(
             &where_clause,
             &table_references,
@@ -1501,7 +1497,7 @@ mod tests {
             None,
             &table_constraints,
             &base_table_rows,
-            &access_methods_arena,
+            &mut access_methods_arena,
             &mut where_clause,
             &[],
         )
@@ -1515,7 +1511,7 @@ mod tests {
             vec![TABLE_NO_CUSTOMERS, TABLE_NO_ORDERS, TABLE_NO_ORDER_ITEMS]
         );
 
-        let access_method = &access_methods_arena.borrow()[best_plan.data[0].1];
+        let access_method = &access_methods_arena[best_plan.data[0].1];
         let (iter_dir, index, constraint_refs) = _as_btree(access_method);
         assert!(iter_dir == IterationDirection::Forwards);
         assert!(index.as_ref().unwrap().name == "sqlite_autoindex_customers_1");
@@ -1524,7 +1520,7 @@ mod tests {
             &table_constraints[TABLE_NO_CUSTOMERS].constraints[constraint_refs[0].eq.unwrap()];
         assert!(constraint.lhs_mask.is_empty());
 
-        let access_method = &access_methods_arena.borrow()[best_plan.data[1].1];
+        let access_method = &access_methods_arena[best_plan.data[1].1];
         let (iter_dir, index, constraint_refs) = _as_btree(access_method);
         assert!(iter_dir == IterationDirection::Forwards);
         assert!(index.as_ref().unwrap().name == "orders_customer_id_idx");
@@ -1533,7 +1529,7 @@ mod tests {
             &table_constraints[TABLE_NO_ORDERS].constraints[constraint_refs[0].eq.unwrap()];
         assert!(constraint.lhs_mask.contains_table(TABLE_NO_CUSTOMERS));
 
-        let access_method = &access_methods_arena.borrow()[best_plan.data[2].1];
+        let access_method = &access_methods_arena[best_plan.data[2].1];
         let (iter_dir, index, constraint_refs) = _as_btree(access_method);
         assert!(iter_dir == IterationDirection::Forwards);
         assert!(index.as_ref().unwrap().name == "order_items_order_id_idx");
@@ -1603,7 +1599,7 @@ mod tests {
 
         let table_references = TableReferences::new(joined_tables, vec![]);
         let available_indexes = HashMap::new();
-        let access_methods_arena = RefCell::new(Vec::new());
+        let mut access_methods_arena = Vec::new();
         let table_constraints = constraints_from_where_clause(
             &where_clause,
             &table_references,
@@ -1619,7 +1615,7 @@ mod tests {
             None,
             &table_constraints,
             &base_table_rows,
-            &access_methods_arena,
+            &mut access_methods_arena,
             &mut where_clause,
             &[],
         )
@@ -1629,19 +1625,19 @@ mod tests {
         // Verify that t2 is chosen first due to its equality filter
         assert_eq!(best_plan.table_numbers().next().unwrap(), 1);
         // Verify table scan is used since there are no indexes
-        let access_method = &access_methods_arena.borrow()[best_plan.data[0].1];
+        let access_method = &access_methods_arena[best_plan.data[0].1];
         let (iter_dir, index, constraint_refs) = _as_btree(access_method);
         assert!(constraint_refs.is_empty());
         assert!(iter_dir == IterationDirection::Forwards);
         assert!(index.is_none());
         // Verify that t1 is chosen next due to its inequality filter
-        let access_method = &access_methods_arena.borrow()[best_plan.data[1].1];
+        let access_method = &access_methods_arena[best_plan.data[1].1];
         let (iter_dir, index, constraint_refs) = _as_btree(access_method);
         assert!(constraint_refs.is_empty());
         assert!(iter_dir == IterationDirection::Forwards);
         assert!(index.is_none());
         // Verify that t3 is chosen last due to no filters
-        let access_method = &access_methods_arena.borrow()[best_plan.data[2].1];
+        let access_method = &access_methods_arena[best_plan.data[2].1];
         let (iter_dir, index, constraint_refs) = _as_btree(access_method);
         assert!(constraint_refs.is_empty());
         assert!(iter_dir == IterationDirection::Forwards);
@@ -1717,7 +1713,7 @@ mod tests {
         }
 
         let table_references = TableReferences::new(joined_tables, vec![]);
-        let access_methods_arena = RefCell::new(Vec::new());
+        let mut access_methods_arena = Vec::new();
         let available_indexes = HashMap::new();
         let table_constraints = constraints_from_where_clause(
             &where_clause,
@@ -1734,7 +1730,7 @@ mod tests {
             None,
             &table_constraints,
             &base_table_rows,
-            &access_methods_arena,
+            &mut access_methods_arena,
             &mut where_clause,
             &[],
         )
@@ -1753,14 +1749,14 @@ mod tests {
         );
 
         // Verify access methods
-        let access_method = &access_methods_arena.borrow()[best_plan.data[0].1];
+        let access_method = &access_methods_arena[best_plan.data[0].1];
         let (iter_dir, index, constraint_refs) = _as_btree(access_method);
         assert!(iter_dir == IterationDirection::Forwards);
         assert!(index.is_none());
         assert!(constraint_refs.is_empty());
 
         for (table_number, access_method_index) in best_plan.data.iter().skip(1) {
-            let access_method = &access_methods_arena.borrow()[*access_method_index];
+            let access_method = &access_methods_arena[*access_method_index];
             let (iter_dir, index, constraint_refs) = _as_btree(access_method);
             assert!(iter_dir == IterationDirection::Forwards);
             assert!(index.is_none());
@@ -1811,7 +1807,7 @@ mod tests {
         }
 
         let table_references = TableReferences::new(joined_tables, vec![]);
-        let access_methods_arena = RefCell::new(Vec::new());
+        let mut access_methods_arena = Vec::new();
         let table_constraints = constraints_from_where_clause(
             &where_clause,
             &table_references,
@@ -1828,7 +1824,7 @@ mod tests {
             None,
             &table_constraints,
             &base_table_rows,
-            &access_methods_arena,
+            &mut access_methods_arena,
             &mut where_clause,
             &[],
         )
@@ -1849,7 +1845,7 @@ mod tests {
 
         // Verify access methods:
         // - First table should use Table scan
-        let access_method = &access_methods_arena.borrow()[best_plan.data[0].1];
+        let access_method = &access_methods_arena[best_plan.data[0].1];
         let (iter_dir, index, constraint_refs) = _as_btree(access_method);
         assert!(iter_dir == IterationDirection::Forwards);
         assert!(index.is_none());
@@ -1862,7 +1858,7 @@ mod tests {
             .take(NUM_TABLES)
             .skip(1)
         {
-            let access_method = &access_methods_arena.borrow()[best_plan.data[i].1];
+            let access_method = &access_methods_arena[best_plan.data[i].1];
             let (iter_dir, index, constraint_refs) = _as_btree(access_method);
             assert!(iter_dir == IterationDirection::Forwards);
             assert!(index.is_none());
@@ -1946,7 +1942,7 @@ mod tests {
         }];
 
         let table_references = TableReferences::new(joined_tables, vec![]);
-        let access_methods_arena = RefCell::new(Vec::new());
+        let mut access_methods_arena = Vec::new();
         let table_constraints = constraints_from_where_clause(
             &where_clause,
             &table_references,
@@ -1962,7 +1958,7 @@ mod tests {
             None,
             &table_constraints,
             &base_table_rows,
-            &access_methods_arena,
+            &mut access_methods_arena,
             &mut where_clause,
             &[],
         )
@@ -1970,7 +1966,7 @@ mod tests {
         .unwrap();
 
         // Verify access method is a scan, not a seek, because the index can't be used when only the second column is referenced
-        let access_method = &access_methods_arena.borrow()[best_plan.data[0].1];
+        let access_method = &access_methods_arena[best_plan.data[0].1];
         let (_, _, constraint_refs) = _as_btree(access_method);
         assert!(constraint_refs.is_empty());
     }
@@ -2069,7 +2065,7 @@ mod tests {
         ];
 
         let table_references = TableReferences::new(joined_tables, vec![]);
-        let access_methods_arena = RefCell::new(Vec::new());
+        let mut access_methods_arena = Vec::new();
         let table_constraints = constraints_from_where_clause(
             &where_clause,
             &table_references,
@@ -2085,7 +2081,7 @@ mod tests {
             None,
             &table_constraints,
             &base_table_rows,
-            &access_methods_arena,
+            &mut access_methods_arena,
             &mut where_clause,
             &[],
         )
@@ -2093,7 +2089,7 @@ mod tests {
         .unwrap();
 
         // Verify access method is a seek, and only uses the first column of the index
-        let access_method = &access_methods_arena.borrow()[best_plan.data[0].1];
+        let access_method = &access_methods_arena[best_plan.data[0].1];
         let (_, index, constraint_refs) = _as_btree(access_method);
         assert!(index.as_ref().is_some_and(|i| i.name == "idx1"));
         assert!(constraint_refs.len() == 1);
@@ -2210,7 +2206,7 @@ mod tests {
         ];
 
         let table_references = TableReferences::new(joined_tables, vec![]);
-        let access_methods_arena = RefCell::new(Vec::new());
+        let mut access_methods_arena = Vec::new();
         let table_constraints = constraints_from_where_clause(
             &where_clause,
             &table_references,
@@ -2226,7 +2222,7 @@ mod tests {
             None,
             &table_constraints,
             &base_table_rows,
-            &access_methods_arena,
+            &mut access_methods_arena,
             &mut where_clause,
             &[],
         )
@@ -2235,7 +2231,7 @@ mod tests {
 
         // Verify access method is a seek, and uses the first two columns of the index.
         // The third column can't be used because the second is a range query.
-        let access_method = &access_methods_arena.borrow()[best_plan.data[0].1];
+        let access_method = &access_methods_arena[best_plan.data[0].1];
         let (_, index, constraint_refs) = _as_btree(access_method);
         assert!(index.as_ref().is_some_and(|i| i.name == "idx1"));
         assert!(constraint_refs.len() == 2);
@@ -2421,7 +2417,7 @@ mod tests {
         )];
 
         let table_references = TableReferences::new(joined_tables, vec![]);
-        let access_methods_arena = RefCell::new(Vec::new());
+        let mut access_methods_arena = Vec::new();
         let table_constraints = constraints_from_where_clause(
             &where_clause,
             &table_references,
@@ -2437,7 +2433,7 @@ mod tests {
             None,
             &table_constraints,
             &base_table_rows,
-            &access_methods_arena,
+            &mut access_methods_arena,
             &mut where_clause,
             &[],
         )
@@ -2453,7 +2449,7 @@ mod tests {
         );
 
         // t1 should use table scan (no constraints)
-        let access_method_t1 = &access_methods_arena.borrow()[best_plan.data[0].1];
+        let access_method_t1 = &access_methods_arena[best_plan.data[0].1];
         let (_, _, constraint_refs_t1) = _as_btree(access_method_t1);
         assert!(
             constraint_refs_t1.is_empty(),
@@ -2461,7 +2457,7 @@ mod tests {
         );
 
         // t2 should use index seek, NOT hash join
-        let access_method_t2 = &access_methods_arena.borrow()[best_plan.data[1].1];
+        let access_method_t2 = &access_methods_arena[best_plan.data[1].1];
         match &access_method_t2.params {
             AccessMethodParams::BTreeTable {
                 index,
