@@ -180,7 +180,7 @@ pub fn join_lhs_and_rhs<'a>(
             };
             let preserves = plan_satisfies_order_target(
                 &tmp_plan,
-                access_methods_arena,
+                &access_methods_arena.borrow(),
                 joined_tables,
                 order_target,
             );
@@ -419,9 +419,12 @@ pub fn compute_best_join_order<'a>(
     // the one we choose, if the cost reduction from avoiding sorting brings it below the cost of the overall best one.
     let mut best_ordered_plan: Option<JoinN> = None;
     let mut best_plan_is_also_ordered = match (naive_plan.as_ref(), maybe_order_target) {
-        (Some(plan), Some(order_target)) => {
-            plan_satisfies_order_target(plan, access_methods_arena, joined_tables, order_target)
-        }
+        (Some(plan), Some(order_target)) => plan_satisfies_order_target(
+            plan,
+            &access_methods_arena.borrow(),
+            joined_tables,
+            order_target,
+        ),
         _ => false,
     };
 
@@ -614,7 +617,7 @@ pub fn compute_best_join_order<'a>(
                 let satisfies_order_target = if let Some(order_target) = maybe_order_target {
                     plan_satisfies_order_target(
                         &rel,
-                        access_methods_arena,
+                        &access_methods_arena.borrow(),
                         joined_tables,
                         order_target,
                     )
@@ -1042,7 +1045,6 @@ mod tests {
             &available_indexes,
             &[],
             &empty_schema(),
-            None,
         )
         .unwrap();
 
@@ -1081,7 +1083,6 @@ mod tests {
             &available_indexes,
             &[],
             &empty_schema(),
-            None,
         )
         .unwrap();
 
@@ -1132,7 +1133,6 @@ mod tests {
             &available_indexes,
             &[],
             &empty_schema(),
-            None,
         )
         .unwrap();
 
@@ -1212,7 +1212,6 @@ mod tests {
             &available_indexes,
             &[],
             &empty_schema(),
-            None,
         )
         .unwrap();
         // SELECT * FROM test_table WHERE id = 42
@@ -1303,7 +1302,6 @@ mod tests {
             &available_indexes,
             &[],
             &empty_schema(),
-            None,
         )
         .unwrap();
 
@@ -1494,7 +1492,6 @@ mod tests {
             &available_indexes,
             &[],
             &empty_schema(),
-            None,
         )
         .unwrap();
 
@@ -1613,7 +1610,6 @@ mod tests {
             &available_indexes,
             &[],
             &empty_schema(),
-            None,
         )
         .unwrap();
 
@@ -1729,7 +1725,6 @@ mod tests {
             &available_indexes,
             &[],
             &empty_schema(),
-            None,
         )
         .unwrap();
 
@@ -1823,7 +1818,6 @@ mod tests {
             &available_indexes,
             &[],
             &empty_schema(),
-            None,
         )
         .unwrap();
 
@@ -1959,7 +1953,6 @@ mod tests {
             &available_indexes,
             &[],
             &empty_schema(),
-            None,
         )
         .unwrap();
 
@@ -2083,7 +2076,6 @@ mod tests {
             &available_indexes,
             &[],
             &empty_schema(),
-            None,
         )
         .unwrap();
 
@@ -2225,7 +2217,6 @@ mod tests {
             &available_indexes,
             &[],
             &empty_schema(),
-            None,
         )
         .unwrap();
 
@@ -2437,7 +2428,6 @@ mod tests {
             &available_indexes,
             &[],
             &empty_schema(),
-            None,
         )
         .unwrap();
 

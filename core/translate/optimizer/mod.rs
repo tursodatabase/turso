@@ -23,6 +23,7 @@ use crate::{
             access_method::AccessMethodParams,
             constraints::{RangeConstraintRef, SeekRangeConstraint, TableConstraints},
             cost::RowCountEstimate,
+            order::{ColumnTarget, OrderTarget},
         },
         plan::{
             ColumnUsedMask, HashJoinOp, IndexMethodQuery, NonFromClauseSubquery,
@@ -650,7 +651,6 @@ fn optimize_table_access(
         available_indexes,
         subqueries,
         schema,
-        maybe_order_target.as_ref(),
     )?;
 
     let base_table_rows = table_references
@@ -728,13 +728,15 @@ fn optimize_table_access(
         best_plan
     };
 
+    let mut sort_eliminated = false;
+
     // Eliminate sorting if possible.
-    if let Some(order_target) = maybe_order_target {
+    if let Some(order_target) = maybe_order_target.as_ref() {
         let satisfies_order_target = plan_satisfies_order_target(
             &best_plan,
-            &access_methods_arena,
+            &access_methods_arena.borrow(),
             table_references.joined_tables_mut(),
-            &order_target,
+            order_target,
         );
         if satisfies_order_target {
             match order_target.1 {
@@ -750,6 +752,7 @@ fn optimize_table_access(
                 }
             }
         }
+        sort_eliminated = satisfies_order_target;
     }
 
     let (best_access_methods, best_table_numbers) = (
@@ -794,14 +797,21 @@ fn optimize_table_access(
     // Mutate the Operations in `joined_tables` to use the selected access methods.
     // We iterate over ALL tables (including hash join build tables) to set their operations,
     // even though build tables are not in best_join_order.
+    let access_methods_arena = &mut access_methods_arena.borrow_mut();
     for (i, &table_idx) in best_table_numbers.iter().enumerate() {
-        let access_method = &access_methods_arena.borrow()[best_access_methods[i]];
-        match &access_method.params {
+        let access_method = &mut access_methods_arena[best_access_methods[i]];
+        match &mut access_method.params {
             AccessMethodParams::BTreeTable {
                 iter_dir,
                 index,
                 constraint_refs,
             } => {
+                maybe_remove_index_candidate(
+                    index,
+                    &table_references.joined_tables()[table_idx],
+                    maybe_order_target.as_ref(),
+                    sort_eliminated,
+                );
                 if constraint_refs.is_empty() {
                     let is_leftmost_table = i == 0;
                     let uses_index = index.is_some();
@@ -1138,6 +1148,49 @@ fn eliminate_constant_conditions(
     }
 
     Ok(ConstantConditionEliminationResult::Continue)
+}
+
+/// Check if the order by collation matches the index columns collations.
+/// Only remove the index if sort was eliminated.
+fn maybe_remove_index_candidate(
+    index: &mut Option<Arc<Index>>,
+    table_reference: &JoinedTable,
+    order_target: Option<&OrderTarget>,
+    sort_eliminated: bool,
+) {
+    if !sort_eliminated {
+        return;
+    }
+    if let Some((idx, order_target)) = index.as_mut().zip(order_target) {
+        for col_order in &order_target.0 {
+            // Only check columns from this table
+            if col_order.table_id != table_reference.internal_id {
+                continue;
+            }
+
+            // Find matching index column
+            let matching_idx_col = match &col_order.target {
+                ColumnTarget::Column(col_no) => {
+                    idx.columns.iter().find(|ic| ic.pos_in_table == *col_no)
+                }
+                ColumnTarget::Expr(_expr) => {
+                    continue;
+                }
+            };
+
+            if let Some(idx_col) = matching_idx_col {
+                let idx_collation = idx_col.collation;
+
+                // If ORDER BY collation doesn't match index collation, this index can't satisfy the ordering
+                if idx_collation.is_some_and(|idx_collation| col_order.collation != idx_collation)
+                    && sort_eliminated
+                {
+                    *index = None;
+                    return;
+                }
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
