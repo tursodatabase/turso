@@ -214,7 +214,7 @@ async def test_partial_sync_segment_size():
     assert (await conn_partial.stats()).network_received_bytes > 2000 * 1024
 
 @pytest.mark.asyncio
-async def test_partial_sync_speculative_load():
+async def test_partial_sync_prefetch():
     # turso.setup_logging(level=logging.DEBUG)
 
     name = random_str()
@@ -236,7 +236,7 @@ async def test_partial_sync_speculative_load():
         partial_sync_opts=turso.aio.sync.PartialSyncOpts(
             bootstrap_strategy=turso.aio.sync.PartialSyncPrefixBootstrap(length=128*1024),
             segment_size=4 * 1024,
-            speculative_load=True,
+            prefetch=True,
         ),
     )
     assert await (await conn_partial.execute("SELECT LENGTH(x) FROM t LIMIT 1")).fetchall() == [(1024,)]

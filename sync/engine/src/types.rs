@@ -45,7 +45,7 @@ pub enum PartialBootstrapStrategy {
 pub struct PartialSyncOpts {
     pub bootstrap_strategy: PartialBootstrapStrategy,
     pub segment_size: usize,
-    pub speculative_load: bool,
+    pub prefetch: bool,
 }
 
 impl PartialSyncOpts {
