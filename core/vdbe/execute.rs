@@ -64,6 +64,7 @@ use crate::pseudo::PseudoCursor;
 
 use crate::storage::btree::{BTreeCursor, BTreeKey};
 
+use crate::{info, turso_assert, OpenFlags, Row, TransactionState, ValueRef};
 use crate::{
     storage::wal::CheckpointResult,
     types::{
@@ -76,8 +77,7 @@ use crate::{
         insn::{IdxInsertFlags, Insn},
     },
 };
-
-use crate::{info, turso_assert, OpenFlags, Row, TransactionState, ValueRef};
+use std::cmp::max;
 
 use super::{
     insn::{Cookie, RegisterOrLiteral},
@@ -7043,10 +7043,20 @@ pub fn op_new_rowid(
                 };
                 return_if_io!(mvcc_cursor.get_next_rowid())
             };
-            state.registers[*rowid_reg] = Register::Value(Value::Integer(rowid));
-            if *prev_largest_reg > 0 {
-                state.registers[*prev_largest_reg] = Register::Value(Value::Integer(current_max));
-            }
+
+            let new_rowid = if *prev_largest_reg > 0 {
+                let autoinc_max = match state.registers[*prev_largest_reg].get_value() {
+                    Value::Integer(i) => *i,
+                    _ => 0,
+                };
+                let max_rowid = max(current_max, autoinc_max);
+                let new_rowid = max_rowid + 1;
+                state.registers[*prev_largest_reg] = Register::Value(Value::Integer(new_rowid));
+                new_rowid
+            } else {
+                rowid
+            };
+            state.registers[*rowid_reg] = Register::Value(Value::Integer(new_rowid));
             state.pc += 1;
             return Ok(InsnFunctionStepResult::Step);
         }
