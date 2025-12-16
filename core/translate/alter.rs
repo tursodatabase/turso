@@ -813,6 +813,15 @@ pub fn translate_alter_table(
                     input,
                     |_program| {},
                 )?;
+
+                program.emit_insn(Insn::DropTrigger {
+                    db: 0,
+                    trigger_name: trigger_name.clone(),
+                });
+                program.emit_insn(Insn::ParseSchema {
+                    db: cursor_id,
+                    where_clause: Some(format!("name = '{trigger_name}'")),
+                });
             }
 
             program.emit_insn(Insn::SetCookie {
