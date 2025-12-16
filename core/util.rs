@@ -212,7 +212,10 @@ fn cmp_numeric_strings(num_str: &str, other: &str) -> bool {
     }
 
     match (parse(num_str), parse(other)) {
-        (Some(left), Some(right)) => left == right,
+        (Some(Either::Left(i1)), Some(Either::Left(i2))) => i1 == i2,
+        (Some(Either::Right(f1)), Some(Either::Right(f2))) => f1 == f2,
+        (Some(Either::Left(i)), Some(Either::Right(f)))
+        | (Some(Either::Right(f)), Some(Either::Left(i))) => (i as f64) == f,
         _ => num_str == other,
     }
 }
