@@ -1,5 +1,6 @@
 use crate::{
     translate::{
+        collate::{get_collseq_from_expr, CollationSeq},
         optimizer::access_method::AccessMethodParams,
         plan::{GroupBy, IterationDirection, JoinedTable, TableReferences},
         planner::table_mask_from_expr,
@@ -26,6 +27,7 @@ pub struct ColumnOrder {
     pub table_id: TableInternalId,
     pub target: ColumnTarget,
     pub order: SortOrder,
+    pub collation: CollationSeq,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -261,17 +263,46 @@ fn expr_to_column_order(
     order: SortOrder,
     tables: &TableReferences,
 ) -> Option<ColumnOrder> {
-    if let ast::Expr::Column { table, column, .. } = expr {
-        return Some(ColumnOrder {
-            table_id: *table,
-            target: ColumnTarget::Column(*column),
-            order,
-        });
+    match &*expr {
+        ast::Expr::Column {
+            table: table_id,
+            column,
+            ..
+        } => {
+            let table = tables.find_joined_table_by_internal_id(*table_id)?;
+            let col = table.columns().get(*column)?;
+            return Some(ColumnOrder {
+                table_id: *table_id,
+                target: ColumnTarget::Column(*column),
+                order,
+                collation: col.collation(),
+            });
+        }
+        ast::Expr::Collate(expr, collation) => {
+            if let ast::Expr::Column {
+                table: table_id,
+                column,
+                ..
+            } = expr.as_ref()
+            {
+                let collation = CollationSeq::new(collation.as_str()).unwrap_or_default();
+                return Some(ColumnOrder {
+                    table_id: *table_id,
+                    target: ColumnTarget::Column(*column),
+                    order,
+                    collation,
+                });
+            };
+        }
+        _ => {}
     }
     let mask = table_mask_from_expr(expr, tables, &[]).ok()?;
     if mask.table_count() != 1 {
         return None;
     }
+    let collation = get_collseq_from_expr(expr, tables)
+        .ok()?
+        .unwrap_or_default();
     let table_no = tables
         .joined_tables()
         .iter()
@@ -282,5 +313,6 @@ fn expr_to_column_order(
         table_id,
         target: ColumnTarget::Expr(expr as *const ast::Expr),
         order,
+        collation,
     })
 }

@@ -1042,6 +1042,7 @@ mod tests {
             &available_indexes,
             &[],
             &empty_schema(),
+            None,
         )
         .unwrap();
 
@@ -1080,6 +1081,7 @@ mod tests {
             &available_indexes,
             &[],
             &empty_schema(),
+            None,
         )
         .unwrap();
 
@@ -1130,6 +1132,7 @@ mod tests {
             &available_indexes,
             &[],
             &empty_schema(),
+            None,
         )
         .unwrap();
 
@@ -1209,6 +1212,7 @@ mod tests {
             &available_indexes,
             &[],
             &empty_schema(),
+            None,
         )
         .unwrap();
         // SELECT * FROM test_table WHERE id = 42
@@ -1299,6 +1303,7 @@ mod tests {
             &available_indexes,
             &[],
             &empty_schema(),
+            None,
         )
         .unwrap();
 
@@ -1489,6 +1494,7 @@ mod tests {
             &available_indexes,
             &[],
             &empty_schema(),
+            None,
         )
         .unwrap();
 
@@ -1607,6 +1613,7 @@ mod tests {
             &available_indexes,
             &[],
             &empty_schema(),
+            None,
         )
         .unwrap();
 
@@ -1722,6 +1729,7 @@ mod tests {
             &available_indexes,
             &[],
             &empty_schema(),
+            None,
         )
         .unwrap();
 
@@ -1815,6 +1823,7 @@ mod tests {
             &available_indexes,
             &[],
             &empty_schema(),
+            None,
         )
         .unwrap();
 
@@ -1950,6 +1959,7 @@ mod tests {
             &available_indexes,
             &[],
             &empty_schema(),
+            None,
         )
         .unwrap();
 
@@ -2073,6 +2083,7 @@ mod tests {
             &available_indexes,
             &[],
             &empty_schema(),
+            None,
         )
         .unwrap();
 
@@ -2214,6 +2225,7 @@ mod tests {
             &available_indexes,
             &[],
             &empty_schema(),
+            None,
         )
         .unwrap();
 
@@ -2425,6 +2437,7 @@ mod tests {
             &available_indexes,
             &[],
             &empty_schema(),
+            None,
         )
         .unwrap();
 

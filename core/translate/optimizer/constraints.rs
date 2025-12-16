@@ -4,6 +4,7 @@ use crate::{
         collate::get_collseq_from_expr,
         expr::{as_binary_components, comparison_affinity},
         expression_index::normalize_expr_for_index_matching,
+        optimizer::order::{ColumnTarget, OrderTarget},
         plan::{JoinOrderMember, JoinedTable, NonFromClauseSubquery, TableReferences, WhereTerm},
         planner::{table_mask_from_expr, TableMask},
     },
@@ -291,6 +292,7 @@ pub fn constraints_from_where_clause(
     available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
     subqueries: &[NonFromClauseSubquery],
     schema: &Schema,
+    order_by: Option<&OrderTarget>,
 ) -> Result<Vec<TableConstraints>> {
     let mut constraints = Vec::new();
 
@@ -570,6 +572,48 @@ pub fn constraints_from_where_clause(
                 if idx.where_clause.is_some() && c.refs.is_empty() {
                     // prevent a partial index from even being considered as a scan driver.
                     return false;
+                }
+                if let Some(order_target) = order_by {
+                    for col_order in &order_target.0 {
+                        // Only check columns from this table
+                        if col_order.table_id != table_reference.internal_id {
+                            continue;
+                        }
+
+                        // Find matching index column
+                        let matching_idx_col = match &col_order.target {
+                            ColumnTarget::Column(col_no) => {
+                                idx.columns.iter().find(|ic| ic.pos_in_table == *col_no)
+                            }
+                            ColumnTarget::Expr(_expr) => {
+                                continue;
+                                // TODO: see later how to deal with expression indices
+                                //     idx.columns.iter().find(|ic| {
+                                //     ic.expr.as_ref().is_some_and(|idx_expr| {
+                                //         exprs_are_equivalent(unsafe { &**expr }, idx_expr)
+                                //     })
+                                // })
+                            }
+                        };
+
+                        if let Some(idx_col) = matching_idx_col {
+                            // Get effective index collation (fall back to table column's collation)
+                            let idx_collation = idx_col.collation.unwrap_or_else(|| {
+                                table_reference
+                                    .table
+                                    .columns()
+                                    .get(idx_col.pos_in_table)
+                                    .map(|c| c.collation())
+                                    .unwrap_or_default()
+                            });
+
+                            // If ORDER BY collation doesn't match index collation,
+                            // this index can't satisfy the ordering
+                            if col_order.collation != idx_collation {
+                                return false;
+                            }
+                        }
+                    }
                 }
             }
             true

@@ -650,7 +650,9 @@ fn optimize_table_access(
         available_indexes,
         subqueries,
         schema,
+        maybe_order_target.as_ref(),
     )?;
+
     let base_table_rows = table_references
         .joined_tables()
         .iter()
