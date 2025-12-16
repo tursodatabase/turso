@@ -7176,18 +7176,18 @@ pub fn op_must_be_int(
         Value::Integer(_) => {}
         Value::Float(f) => match cast_real_to_integer(*f) {
             Ok(i) => state.registers[*reg] = Register::Value(Value::Integer(i)),
-            Err(_) => crate::bail_parse_error!("datatype mismatch"),
+            Err(_) => bail_constraint_error!("datatype mismatch"),
         },
         Value::Text(text) => match checked_cast_text_to_numeric(text.as_str(), true) {
             Ok(Value::Integer(i)) => state.registers[*reg] = Register::Value(Value::Integer(i)),
             Ok(Value::Float(f)) => match cast_real_to_integer(f) {
                 Ok(i) => state.registers[*reg] = Register::Value(Value::Integer(i)),
-                Err(_) => crate::bail_parse_error!("datatype mismatch"),
+                Err(_) => bail_constraint_error!("datatype mismatch"),
             },
-            _ => crate::bail_parse_error!("datatype mismatch"),
+            _ => bail_constraint_error!("datatype mismatch"),
         },
         _ => {
-            crate::bail_parse_error!("datatype mismatch");
+            bail_constraint_error!("datatype mismatch");
         }
     };
     state.pc += 1;

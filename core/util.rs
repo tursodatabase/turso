@@ -1119,11 +1119,18 @@ pub fn cast_text_to_numeric(txt: &str) -> Value {
 
 // Check if float can be losslessly converted to 51-bit integer
 pub fn cast_real_to_integer(float: f64) -> std::result::Result<i64, ()> {
-    let i = float as i64;
-    if float == i as f64 && i.abs() < (1i64 << 51) {
-        return Ok(i);
+    if !float.is_finite() || float.trunc() != float {
+        return Err(());
     }
-    Err(())
+
+    let limit = (1i64 << 51) as f64;
+    let truncated = float.trunc();
+
+    if truncated.abs() >= limit {
+        return Err(());
+    }
+
+    Ok(truncated as i64)
 }
 
 // we don't need to verify the numeric literal here, as it is already verified by the parser
@@ -2591,5 +2598,15 @@ pub mod tests {
             checked_cast_text_to_numeric("\t-3.22\n", true),
             Ok(Float(-3.22))
         );
+    }
+
+    #[test]
+    fn test_cast_real_to_integer_limits() {
+        let max_exact = ((1i64 << 51) - 1) as f64;
+        assert_eq!(cast_real_to_integer(max_exact), Ok((1i64 << 51) - 1));
+        assert_eq!(cast_real_to_integer(-max_exact), Ok(-((1i64 << 51) - 1)));
+
+        assert_eq!(cast_real_to_integer((1i64 << 51) as f64), Err(()));
+        assert_eq!(cast_real_to_integer(i64::MIN as f64), Err(()));
     }
 }
