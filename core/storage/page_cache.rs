@@ -10,7 +10,10 @@ use crate::{
 
 use super::pager::PageRef;
 
+#[cfg(not(target_family = "wasm"))]
 const DEFAULT_PAGE_CACHE_SIZE_IN_PAGES: usize = 2000;
+#[cfg(target_family = "wasm")]
+const DEFAULT_PAGE_CACHE_SIZE_IN_PAGES: usize = 100000;
 
 /// Minimum safe cache size in pages.
 /// This accounts for:
@@ -141,8 +144,13 @@ impl PageCacheKey {
 }
 
 impl PageCache {
+    #[cfg(not(target_family = "wasm"))]
     pub fn new(capacity: usize) -> Self {
         Self::new_with_spill(capacity, true)
+    }
+    #[cfg(target_family = "wasm")]
+    pub fn new(capacity: usize) -> Self {
+        Self::new_with_spill(capacity, false)
     }
 
     /// Create a new PageCache with explicit spill control.
