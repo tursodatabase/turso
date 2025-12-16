@@ -2559,6 +2559,10 @@ impl Pager {
 
                     // Nothing to append
                     if self.commit_info.read().completions.is_empty() {
+                        turso_assert!(
+                            self.dirty_pages.read().is_empty(),
+                            "dirty pages must be empty if we didnt collect any completions"
+                        );
                         return Ok(IOResult::Done(PagerCommitResult::WalWritten));
                     } else {
                         // Skip sync if synchronous mode is OFF, go directly to WalCommitDone
