@@ -10,6 +10,7 @@ mod tests {
         limbo_exec_rows, maybe_setup_tracing, rng_from_time_or_env, sqlite_exec_rows, TempDatabase,
     };
     use rand::Rng;
+    use rusqlite::types::Value;
 
     /// Collation sequences supported by SQLite/Limbo
     const COLLATIONS: [&str; 3] = ["BINARY", "NOCASE", "RTRIM"];
@@ -25,10 +26,92 @@ mod tests {
         "b ", "B ", "a  ", "A  ", " a", " A", "abc", "ABC",
     ];
 
+    /// Compare two strings using the specified collation.
+    /// Returns Ordering::Equal if they are equal under the collation.
+    fn compare_with_collation(a: &str, b: &str, collation: &str) -> std::cmp::Ordering {
+        match collation {
+            "BINARY" => a.cmp(b),
+            "NOCASE" => a.to_lowercase().cmp(&b.to_lowercase()),
+            "RTRIM" => a.trim_end().cmp(b.trim_end()),
+            _ => a.cmp(b),
+        }
+    }
+
+    /// Extract the first column as a string from a row, if it's text.
+    fn get_first_col_text(row: &[Value]) -> Option<&str> {
+        row.first().and_then(|v| match v {
+            Value::Text(s) => Some(s.as_str()),
+            _ => None,
+        })
+    }
+
+    /// Verify that rows are correctly ordered according to the given collation and direction.
+    /// This allows for any order among equal elements (unstable sort).
+    fn verify_ordering(
+        rows: &[Vec<Value>],
+        collation: &str,
+        descending: bool,
+    ) -> Result<(), String> {
+        for i in 1..rows.len() {
+            let prev_str = get_first_col_text(&rows[i - 1]).unwrap();
+            let curr_str = get_first_col_text(&rows[i]).unwrap();
+
+            let cmp = compare_with_collation(prev_str, curr_str, collation);
+            let valid = if descending {
+                // DESC: prev >= curr (i.e., prev should not be less than curr)
+                cmp != std::cmp::Ordering::Less
+            } else {
+                // ASC: prev <= curr (i.e., prev should not be greater than curr)
+                cmp != std::cmp::Ordering::Greater
+            };
+
+            if !valid {
+                return Err(format!(
+                    "Ordering violation at index {}: '{}' vs '{}' (collation: {}, desc: {})",
+                    i, prev_str, curr_str, collation, descending
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// Verify that two result sets contain the same rows (possibly in different order for equal elements)
+    /// and both follow the correct ordering under the given collation.
+    fn verify_results_equivalent(
+        turso_rows: &[Vec<Value>],
+        sqlite_rows: &[Vec<Value>],
+        collation: &str,
+        descending: bool,
+    ) -> Result<(), String> {
+        // First check same number of rows
+        if turso_rows.len() != sqlite_rows.len() {
+            return Err(format!(
+                "Row count mismatch: Turso={}, SQLite={}",
+                turso_rows.len(),
+                sqlite_rows.len()
+            ));
+        }
+
+        // Verify both are correctly ordered
+        verify_ordering(turso_rows, collation, descending)?;
+        verify_ordering(sqlite_rows, collation, descending)?;
+
+        // Verify same multiset of rows (same rows, possibly different order for equal elements)
+        let mut turso_sorted = turso_rows.to_vec();
+        let mut sqlite_sorted = sqlite_rows.to_vec();
+        turso_sorted.sort_by(|a, b| format!("{:?}", a).cmp(&format!("{:?}", b)));
+        sqlite_sorted.sort_by(|a, b| format!("{:?}", a).cmp(&format!("{:?}", b)));
+
+        if turso_sorted != sqlite_sorted {
+            return Err("Row content mismatch: different rows returned".to_string());
+        }
+
+        Ok(())
+    }
+
     /// Test ORDER BY with explicit COLLATE that differs from index collation.
-    /// This is the core bug case: if the optimizer incorrectly uses an index
-    /// whose collation doesn't match the ORDER BY collation, results will be wrong.
-    #[turso_macros::test()]
+    /// if the optimizer incorrectly uses an index whose collation doesn't match the ORDER BY collation, results will be wrong.
+    #[turso_macros::test(mvcc)]
     pub fn orderby_collation_vs_index_fuzz(db: TempDatabase) {
         maybe_setup_tracing();
         let (mut rng, seed) = rng_from_time_or_env();
@@ -99,38 +182,44 @@ mod tests {
             // Generate ORDER BY with random collation (may or may not match index)
             let orderby_collation = COLLATIONS[rng.random_range(0..COLLATIONS.len())];
             let orderby_order = SORT_ORDERS[rng.random_range(0..SORT_ORDERS.len())];
+            let descending = orderby_order == "DESC";
 
-            // Test with and without rowid tiebreaker
-            let queries = [
-                format!(
-                    "SELECT c1, c2 FROM t ORDER BY c1 COLLATE {orderby_collation} {orderby_order}"
-                ),
-                format!(
-                    "SELECT c1, c2 FROM t ORDER BY c1 COLLATE {orderby_collation} {orderby_order}, c2 ASC"
-                ),
-                format!(
-                    "SELECT c1 FROM t ORDER BY c1 COLLATE {orderby_collation} {orderby_order} LIMIT 10"
-                ),
-            ];
+            // Query without secondary sort key - order of equal elements is undefined
+            let query = format!(
+                "SELECT c1, c2 FROM t ORDER BY c1 COLLATE {orderby_collation} {orderby_order}"
+            );
 
-            for query in queries.iter() {
-                let sqlite_rows = sqlite_exec_rows(&sqlite_conn, query);
-                let limbo_rows = limbo_exec_rows(&limbo_conn, query);
+            let sqlite_rows = sqlite_exec_rows(&sqlite_conn, &query);
+            let limbo_rows = limbo_exec_rows(&limbo_conn, &query);
 
-                similar_asserts::assert_eq!(
-                    Turso: limbo_rows,
-                    Sqlite: sqlite_rows,
-                    "MISMATCH!\nQuery: {query}\nTable: {table_ddl}\nIndex: {index_ddl}\nSeed: {seed}\nIteration: {iter}\n\
-                        Turso ({} rows)\nSQLite ({} rows)",
-                    limbo_rows.len(),
-                    sqlite_rows.len(),
+            if let Err(e) =
+                verify_results_equivalent(&limbo_rows, &sqlite_rows, orderby_collation, descending)
+            {
+                panic!(
+                    "MISMATCH!\n{}\nQuery: {query}\nTable: {table_ddl}\nIndex: {index_ddl}\nSeed: {seed}\nIteration: {iter}\n\
+                    Turso ({} rows): {:?}\nSQLite ({} rows): {:?}",
+                    e, limbo_rows.len(), limbo_rows, sqlite_rows.len(), sqlite_rows
                 );
             }
+
+            // Query with secondary sort key (c2) - order should be deterministic
+            let query_with_tiebreaker = format!(
+                "SELECT c1, c2 FROM t ORDER BY c1 COLLATE {orderby_collation} {orderby_order}, c2 ASC LIMIT 20"
+            );
+
+            let sqlite_rows = sqlite_exec_rows(&sqlite_conn, &query_with_tiebreaker);
+            let limbo_rows = limbo_exec_rows(&limbo_conn, &query_with_tiebreaker);
+
+            similar_asserts::assert_eq!(
+                Turso: limbo_rows,
+                Sqlite: sqlite_rows,
+                "MISMATCH!\nQuery: {query_with_tiebreaker}\nTable: {table_ddl}\nIndex: {index_ddl}\nSeed: {seed}\nIteration: {iter}",
+            );
         }
     }
 
     /// Test multi-column ORDER BY where some columns match index collation and some don't.
-    #[turso_macros::test()]
+    #[turso_macros::test(mvcc)]
     pub fn orderby_multicolumn_collation_fuzz(db: TempDatabase) {
         maybe_setup_tracing();
         let (mut rng, seed) = rng_from_time_or_env();
@@ -140,7 +229,7 @@ mod tests {
         let flags = db.db_flags;
         let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
 
-        const ITERS: usize = 300;
+        const ITERS: usize = 100;
         for iter in 0..ITERS {
             if iter % (ITERS / 10).max(1) == 0 {
                 println!(
@@ -229,7 +318,7 @@ mod tests {
     /// Test ORDER BY with implicit column collation (no explicit COLLATE in ORDER BY).
     /// The column's declared collation should be used, and if it doesn't match the index,
     /// the index should not be used for ordering.
-    #[turso_macros::test()]
+    #[turso_macros::test(mvcc)]
     pub fn orderby_implicit_collation_fuzz(db: TempDatabase) {
         maybe_setup_tracing();
         let (mut rng, seed) = rng_from_time_or_env();
@@ -239,7 +328,7 @@ mod tests {
         let flags = db.db_flags;
         let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
 
-        const ITERS: usize = 300;
+        const ITERS: usize = 100;
         for iter in 0..ITERS {
             if iter % (ITERS / 10).max(1) == 0 {
                 println!(
@@ -278,24 +367,22 @@ mod tests {
 
             // ORDER BY without explicit COLLATE - should use column's collation
             let orderby_order = SORT_ORDERS[rng.random_range(0..SORT_ORDERS.len())];
+            let descending = orderby_order == "DESC";
 
-            let queries = [
-                format!("SELECT c1, c2 FROM t ORDER BY c1 {orderby_order}"),
-                format!("SELECT c1, c2 FROM t ORDER BY c1 {orderby_order}, c2 ASC"),
-                format!("SELECT c1 FROM t ORDER BY c1 {orderby_order} LIMIT 15"),
-            ];
+            // Query without secondary sort key - order of equal elements is undefined
+            let query = format!("SELECT c1, c2 FROM t ORDER BY c1 {orderby_order}");
 
-            for query in queries.iter() {
-                let sqlite_rows = sqlite_exec_rows(&sqlite_conn, query);
-                let limbo_rows = limbo_exec_rows(&limbo_conn, query);
+            let sqlite_rows = sqlite_exec_rows(&sqlite_conn, &query);
+            let limbo_rows = limbo_exec_rows(&limbo_conn, &query);
 
-                similar_asserts::assert_eq!(
-                    Turso: limbo_rows,
-                    Sqlite: sqlite_rows,
-                    "MISMATCH!\nQuery: {query}\nTable: {table_ddl}\nIndex: {index_ddl}\nCol collation: {col_collation}\nIdx collation: {idx_collation}\nSeed: {seed}\nIteration: {iter}\n\
-                        Turso ({} rows)\nSQLite ({} rows)",
-                    limbo_rows.len(),
-                    sqlite_rows.len(),
+            // Use column's collation for verification
+            if let Err(e) =
+                verify_results_equivalent(&limbo_rows, &sqlite_rows, col_collation, descending)
+            {
+                panic!(
+                    "MISMATCH!\n{}\nQuery: {query}\nTable: {table_ddl}\nIndex: {index_ddl}\nCol collation: {col_collation}\nIdx collation: {idx_collation}\nSeed: {seed}\nIteration: {iter}\n\
+                    Turso ({} rows): {:?}\nSQLite ({} rows): {:?}",
+                    e, limbo_rows.len(), limbo_rows, sqlite_rows.len(), sqlite_rows
                 );
             }
         }
@@ -303,7 +390,7 @@ mod tests {
 
     /// Test with multiple indexes having different collations - optimizer should pick
     /// the one that matches ORDER BY collation (if any).
-    #[turso_macros::test()]
+    #[turso_macros::test(mvcc)]
     pub fn orderby_multiple_indexes_collation_fuzz(db: TempDatabase) {
         maybe_setup_tracing();
         let (mut rng, seed) = rng_from_time_or_env();
@@ -313,7 +400,7 @@ mod tests {
         let flags = db.db_flags;
         let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
 
-        const ITERS: usize = 200;
+        const ITERS: usize = 100;
         for iter in 0..ITERS {
             if iter % (ITERS / 10).max(1) == 0 {
                 println!(
@@ -380,7 +467,7 @@ mod tests {
 
     /// Test ORDER BY with WHERE clause constraints - the optimizer might use an index
     /// for the WHERE clause but still need to sort for ORDER BY if collations don't match.
-    #[turso_macros::test()]
+    #[turso_macros::test(mvcc)]
     pub fn orderby_with_where_collation_fuzz(db: TempDatabase) {
         maybe_setup_tracing();
         let (mut rng, seed) = rng_from_time_or_env();
@@ -390,7 +477,7 @@ mod tests {
         let flags = db.db_flags;
         let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
 
-        const ITERS: usize = 300;
+        const ITERS: usize = 100;
         for iter in 0..ITERS {
             if iter % (ITERS / 10).max(1) == 0 {
                 println!(

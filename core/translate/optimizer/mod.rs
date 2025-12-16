@@ -705,8 +705,6 @@ fn optimize_table_access(
         return Ok(None);
     };
 
-    dbg!(&access_methods_arena);
-
     let BestJoinOrderResult {
         best_plan,
         best_ordered_plan,
