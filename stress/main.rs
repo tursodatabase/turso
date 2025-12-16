@@ -1,21 +1,46 @@
 mod opts;
 
-use anarchist_readable_name_generator_lib::readable_name_custom;
-use antithesis_sdk::random::{get_random, AntithesisRng};
-use antithesis_sdk::*;
 use clap::Parser;
 use core::panic;
 use opts::Opts;
+#[cfg(not(feature = "antithesis"))]
+use rand::rngs::StdRng;
+#[cfg(not(feature = "antithesis"))]
+use rand::{Rng, SeedableRng};
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::sync::Arc;
+#[cfg(not(feature = "antithesis"))]
+use std::sync::Mutex as StdMutex;
 use tokio::sync::Mutex;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 use turso::Builder;
+
+#[cfg(not(feature = "antithesis"))]
+static RNG: std::sync::OnceLock<StdMutex<StdRng>> = std::sync::OnceLock::new();
+
+#[cfg(not(feature = "antithesis"))]
+fn init_rng(seed: u64) {
+    RNG.get_or_init(|| StdMutex::new(StdRng::seed_from_u64(seed)));
+}
+
+#[cfg(not(feature = "antithesis"))]
+fn get_random() -> u64 {
+    RNG.get()
+        .expect("RNG not initialized")
+        .lock()
+        .unwrap()
+        .random()
+}
+
+#[cfg(feature = "antithesis")]
+fn get_random() -> u64 {
+    antithesis_sdk::random::get_random()
+}
 
 pub struct Plan {
     pub ddl_statements: Vec<String>,
@@ -63,9 +88,25 @@ pub struct ArbitrarySchema {
     pub tables: Vec<Table>,
 }
 
+// Word lists for generating readable identifiers
+const ADJECTIVES: &[&str] = &[
+    "red", "blue", "green", "fast", "slow", "big", "small", "old", "new", "hot", "cold", "dark",
+    "light", "soft", "hard", "loud", "quiet", "sweet", "sour", "fresh", "dry", "wet", "clean",
+    "dirty", "empty", "full", "happy", "sad", "angry", "calm", "brave", "shy", "smart", "wild",
+];
+
+const NOUNS: &[&str] = &[
+    "cat", "dog", "bird", "fish", "tree", "rock", "lake", "river", "cloud", "star", "moon", "sun",
+    "book", "desk", "chair", "door", "wall", "roof", "floor", "road", "path", "hill", "cave",
+    "leaf", "root", "seed", "fruit", "flower", "grass", "stone", "sand", "wave", "wind", "rain",
+];
+
 // Helper functions for generating random data
 fn generate_random_identifier() -> String {
-    readable_name_custom("_", AntithesisRng).replace('-', "_")
+    let adj = ADJECTIVES[get_random() as usize % ADJECTIVES.len()];
+    let noun = NOUNS[get_random() as usize % NOUNS.len()];
+    let num = get_random() % 1000;
+    format!("{adj}_{noun}_{num}")
 }
 
 fn generate_random_data_type() -> DataType {
@@ -446,9 +487,24 @@ fn integrity_check(
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let _g = init_tracing()?;
-    antithesis_init();
 
     let opts = Opts::parse();
+
+    // Initialize RNG
+    #[cfg(feature = "antithesis")]
+    {
+        if opts.seed.is_some() {
+            eprintln!("Error: --seed is not supported under Antithesis");
+            std::process::exit(1);
+        }
+        println!("Using randomness from Antithesis");
+    }
+    #[cfg(not(feature = "antithesis"))]
+    {
+        let seed = opts.seed.unwrap_or_else(|| rand::random());
+        init_rng(seed);
+        println!("Using seed: {seed}");
+    }
     if opts.nr_threads > 1 {
         println!("WARNING: Multi-threaded data access is not yet supported: https://github.com/tursodatabase/turso/issues/1552");
     }
