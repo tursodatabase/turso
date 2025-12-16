@@ -1877,6 +1877,11 @@ impl Connection {
 
             if !force_commit {
                 // remove all non-commited changes in case if WAL session left some suffix without commit frame
+                if let Some(mv_store) = self.mv_store().as_ref() {
+                    if let Some(tx_id) = self.get_mv_tx_id() {
+                        mv_store.rollback_tx(tx_id, pager.clone(), self);
+                    }
+                }
                 pager.rollback(false, self, true);
             }
             if let Some(err) = commit_err {

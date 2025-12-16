@@ -1344,6 +1344,9 @@ impl Program {
                 // Instead individual statement subtransactions will roll back and these are handled in op_auto_commit
                 // and op_halt.
                 Some(LimboError::Constraint(_)) => {}
+                // Schema updated errors do not cause a rollback; the statement will be reprepared and retried,
+                // and the caller is expected to handle transaction cleanup explicitly if needed.
+                Some(LimboError::SchemaUpdated) => {}
                 _ => {
                     if state.auto_txn_cleanup != TxnCleanup::None || err.is_some() {
                         if let Some(mv_store) = self.connection.mv_store().as_ref() {
