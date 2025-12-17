@@ -77,12 +77,11 @@ use std::collections::HashSet;
 use std::task::Waker;
 use std::{
     borrow::Cow,
-    cell::{Cell, RefCell},
+    cell::Cell,
     collections::HashMap,
     fmt::{self, Display},
     num::NonZero,
     ops::Deref,
-    rc::Rc,
     sync::{
         atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicUsize, Ordering},
         Arc, LazyLock, Weak,
@@ -812,11 +811,11 @@ impl Database {
                 buffer_pool.finalize_with_page_size(page_size.get() as usize)?;
             }
 
-            let wal = Rc::new(RefCell::new(WalFile::new(
+            let wal: Arc<dyn Wal> = Arc::new(WalFile::new(
                 self.io.clone(),
                 self.shared_wal.clone(),
                 buffer_pool.clone(),
-            )));
+            ));
             let pager = Pager::new(
                 self.db_file.clone(),
                 Some(wal),
@@ -882,11 +881,11 @@ impl Database {
             shared_wal.create(file)?;
         }
 
-        let wal = Rc::new(RefCell::new(WalFile::new(
+        let wal: Arc<dyn Wal> = Arc::new(WalFile::new(
             self.io.clone(),
             self.shared_wal.clone(),
             buffer_pool,
-        )));
+        ));
         pager.set_wal(wal);
 
         Ok(pager)
@@ -1881,11 +1880,8 @@ impl Connection {
 
             self.auto_commit.store(true, Ordering::SeqCst);
             self.set_tx_state(TransactionState::None);
-            {
-                let wal = wal.borrow_mut();
-                wal.end_write_tx();
-                wal.end_read_tx();
-            }
+            wal.end_write_tx();
+            wal.end_read_tx();
 
             if !force_commit {
                 // remove all non-commited changes in case if WAL session left some suffix without commit frame
