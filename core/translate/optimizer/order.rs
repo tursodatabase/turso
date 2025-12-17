@@ -1,12 +1,12 @@
 use crate::{
     translate::{
+        collate::{get_collseq_from_expr, CollationSeq},
         optimizer::access_method::AccessMethodParams,
         plan::{GroupBy, IterationDirection, JoinedTable, TableReferences},
         planner::table_mask_from_expr,
     },
     util::exprs_are_equivalent,
 };
-use std::cell::RefCell;
 use turso_parser::ast::{self, SortOrder, TableInternalId};
 
 use super::{access_method::AccessMethod, join::JoinN};
@@ -26,6 +26,7 @@ pub struct ColumnOrder {
     pub table_id: TableInternalId,
     pub target: ColumnTarget,
     pub order: SortOrder,
+    pub collation: CollationSeq,
 }
 
 #[derive(Debug, PartialEq, Clone)]
@@ -161,21 +162,23 @@ pub fn compute_order_target(
 /// If yes, and this plan is selected, then a sort operation can be eliminated.
 pub fn plan_satisfies_order_target(
     plan: &JoinN,
-    access_methods_arena: &RefCell<Vec<AccessMethod>>,
+    access_methods_arena: &[AccessMethod],
     joined_tables: &[JoinedTable],
     order_target: &OrderTarget,
 ) -> bool {
     let mut target_col_idx = 0;
     let num_cols_in_order_target = order_target.0.len();
     for (table_index, access_method_index) in plan.data.iter() {
-        let access_method = &access_methods_arena.borrow()[*access_method_index];
+        let access_method = &access_methods_arena[*access_method_index];
         let table_ref = &joined_tables[*table_index];
 
         // Check if this table has an access method that provides the right ordering.
         let consumed = match &access_method.params {
             AccessMethodParams::BTreeTable {
-                iter_dir, index, ..
-            } => match index {
+                iter_dir,
+                index: index_opt,
+                ..
+            } => match index_opt {
                 None => {
                     // Only rowid order is available without an index.
                     if target_col_idx >= num_cols_in_order_target {
@@ -229,6 +232,15 @@ pub fn plan_satisfies_order_target(
                         if !column_matches {
                             break;
                         }
+
+                        // If ORDER BY collation doesn't match index collation, this index can't satisfy the ordering
+                        if idx_col
+                            .collation
+                            .is_some_and(|idx_collation| target_col.collation != idx_collation)
+                        {
+                            break;
+                        }
+
                         let correct_order = if *iter_dir == IterationDirection::Forwards {
                             target_col.order == idx_col.order
                         } else {
@@ -261,17 +273,46 @@ fn expr_to_column_order(
     order: SortOrder,
     tables: &TableReferences,
 ) -> Option<ColumnOrder> {
-    if let ast::Expr::Column { table, column, .. } = expr {
-        return Some(ColumnOrder {
-            table_id: *table,
-            target: ColumnTarget::Column(*column),
-            order,
-        });
+    match expr {
+        ast::Expr::Column {
+            table: table_id,
+            column,
+            ..
+        } => {
+            let table = tables.find_joined_table_by_internal_id(*table_id)?;
+            let col = table.columns().get(*column)?;
+            return Some(ColumnOrder {
+                table_id: *table_id,
+                target: ColumnTarget::Column(*column),
+                order,
+                collation: col.collation(),
+            });
+        }
+        ast::Expr::Collate(expr, collation) => {
+            if let ast::Expr::Column {
+                table: table_id,
+                column,
+                ..
+            } = expr.as_ref()
+            {
+                let collation = CollationSeq::new(collation.as_str()).unwrap_or_default();
+                return Some(ColumnOrder {
+                    table_id: *table_id,
+                    target: ColumnTarget::Column(*column),
+                    order,
+                    collation,
+                });
+            };
+        }
+        _ => {}
     }
     let mask = table_mask_from_expr(expr, tables, &[]).ok()?;
     if mask.table_count() != 1 {
         return None;
     }
+    let collation = get_collseq_from_expr(expr, tables)
+        .ok()?
+        .unwrap_or_default();
     let table_no = tables
         .joined_tables()
         .iter()
@@ -282,5 +323,6 @@ fn expr_to_column_order(
         table_id,
         target: ColumnTarget::Expr(expr as *const ast::Expr),
         order,
+        collation,
     })
 }
