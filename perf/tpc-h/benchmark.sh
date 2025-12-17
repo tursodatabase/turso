@@ -6,11 +6,9 @@ RELEASE_BUILD_DIR="$REPO_ROOT/target/release"
 TPCH_DIR="$REPO_ROOT/perf/tpc-h"
 DB_FILE="$TPCH_DIR/TPC-H.db"
 
-# If sqlite3 doesn't exist, bail
-if ! command -v sqlite3 >/dev/null 2>&1; then
-    echo "Error: sqlite3 is not installed"
-    exit 1
-fi
+# Install sqlite3 locally if needed
+"$REPO_ROOT/scripts/install-sqlite3.sh"
+SQLITE3_BIN="$REPO_ROOT/.sqlite3/sqlite3"
 
 # Build Limbo in release mode if it's not already built
 if [ ! -f "$RELEASE_BUILD_DIR/tursodb" ]; then
