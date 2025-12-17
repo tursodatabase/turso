@@ -35,6 +35,7 @@ impl<T> DerefMut for SpinLockGuard<'_, T> {
 }
 
 unsafe impl<T> Sync for SpinLock<T> {}
+crate::assert::assert_sync!(SpinLock<()>);
 
 impl<T> SpinLock<T> {
     pub fn new(value: T) -> Self {

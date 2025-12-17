@@ -159,10 +159,9 @@ impl core::ops::Deref for TempFile {
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub struct OpenFlags(i32);
 
-// SAFETY: This needs to be audited for thread safety.
-// See: https://github.com/tursodatabase/turso/issues/1552
-unsafe impl Send for OpenFlags {}
-unsafe impl Sync for OpenFlags {}
+// OpenFlags is a newtype over i32, which is inherently Send+Sync.
+// The assertion below verifies this at compile time.
+crate::assert::assert_send_sync!(OpenFlags);
 
 bitflags! {
     impl OpenFlags: i32 {

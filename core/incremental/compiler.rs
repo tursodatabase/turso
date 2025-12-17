@@ -336,6 +336,7 @@ pub struct DbspNode {
 // See: https://github.com/tursodatabase/turso/issues/1552
 unsafe impl Send for DbspNode {}
 unsafe impl Sync for DbspNode {}
+crate::assert::assert_send_sync!(DbspNode);
 
 impl std::fmt::Debug for DbspNode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -407,6 +408,7 @@ pub struct DbspCircuit {
 // See: https://github.com/tursodatabase/turso/issues/1552
 unsafe impl Send for DbspCircuit {}
 unsafe impl Sync for DbspCircuit {}
+crate::assert::assert_send_sync!(DbspCircuit);
 
 impl DbspCircuit {
     /// Create a new empty circuit with initial empty schema

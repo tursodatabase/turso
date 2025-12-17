@@ -80,6 +80,7 @@ pub struct MemoryFile {
 }
 
 unsafe impl Sync for MemoryFile {}
+crate::assert::assert_sync!(MemoryFile);
 
 impl File for MemoryFile {
     fn lock_file(&self, _exclusive: bool) -> Result<()> {
