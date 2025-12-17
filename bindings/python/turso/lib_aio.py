@@ -1,3 +1,31 @@
+"""Async database connections using anyio.
+
+This module provides async wrappers for Turso database connections that work
+with both asyncio and Trio backends via anyio.
+
+Timeouts
+--------
+To add timeouts to database operations, use anyio's timeout utilities::
+
+    import anyio
+    import turso.aio
+
+    async with turso.aio.connect(":memory:") as conn:
+        # Raise TimeoutError if operation takes longer than 5 seconds
+        with anyio.fail_after(5.0):
+            await conn.execute("SELECT * FROM large_table")
+
+        # Or silently cancel and continue if timeout is exceeded
+        with anyio.move_on_after(5.0):
+            await conn.execute("SELECT * FROM large_table")
+
+Cancellation
+------------
+All async operations support cancellation via anyio's task cancellation.
+When a task is cancelled, the caller is immediately unblocked even if the
+worker thread is still processing. The worker thread will complete its
+current operation but the result is discarded.
+"""
 from __future__ import annotations
 
 from queue import SimpleQueue
@@ -19,9 +47,6 @@ from .lib import (
     connect as blocking_connect,
 )
 from .worker import STOP_RUNNING_SENTINEL, Worker, WorkItem
-
-# Default timeout for worker operations (5 minutes)
-_DEFAULT_WORKER_TIMEOUT = 300.0
 
 
 # Connection goes FIRST
@@ -80,12 +105,10 @@ class Connection:
 
     def __await__(self):
         async def _await_open() -> "Connection":
-            completed = await to_thread.run_sync(
-                lambda: self._open_item.event.wait(timeout=_DEFAULT_WORKER_TIMEOUT),
+            await to_thread.run_sync(
+                self._open_item.event.wait,
                 abandon_on_cancel=True,
             )
-            if not completed:
-                raise OperationalError("Worker thread did not respond within timeout")
             if self._open_item.exception is not None:
                 raise self._open_item.exception
             return self
@@ -101,16 +124,16 @@ class Connection:
         await self.close()
 
     # Internal helper: schedule a callable to run in the worker thread and await its result.
-    async def _run(self, func: Callable[[], Any]) -> Any:
+    async def _run(self, func: Callable[[], Any], timeout: Optional[float] = None) -> Any:
         if self._closed:
             raise ProgrammingError("Cannot operate on a closed connection")
         item = WorkItem(func)
         self._queue.put_nowait(item)
         completed = await to_thread.run_sync(
-            lambda: item.event.wait(timeout=_DEFAULT_WORKER_TIMEOUT),
+            lambda: item.event.wait(timeout=timeout),
             abandon_on_cancel=True,
         )
-        if not completed:
+        if timeout is not None and not completed:
             raise OperationalError("Worker thread did not respond within timeout")
         if item.exception is not None:
             raise item.exception

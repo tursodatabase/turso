@@ -507,61 +507,27 @@ async def test_operation_can_be_abandoned_on_cancel():
 
 
 @pytest.mark.anyio
-async def test_timeout_constant_is_reasonable():
-    """Verify the timeout constant is set to a reasonable value."""
-    from turso.lib_aio import _DEFAULT_WORKER_TIMEOUT
-
-    # Should be at least 60 seconds for slow operations
-    assert _DEFAULT_WORKER_TIMEOUT >= 60.0
-    # Should not be unreasonably long (more than 1 hour)
-    assert _DEFAULT_WORKER_TIMEOUT <= 3600.0
-
-
-@pytest.mark.anyio
-async def test_worker_timeout_raises_operational_error():
-    """Test that a worker timeout raises OperationalError.
-
-    This test verifies the timeout mechanism works by using a very short
-    timeout on a slow operation. We patch the timeout for this test only.
-    """
+async def test_optional_timeout_raises_operational_error():
+    """Test that the optional timeout parameter raises OperationalError when exceeded."""
     import turso
-    import turso.lib_aio as lib_aio
 
-    # Save original timeout
-    original_timeout = lib_aio._DEFAULT_WORKER_TIMEOUT
-
-    try:
-        # Set a very short timeout (0.001 seconds = 1ms)
-        lib_aio._DEFAULT_WORKER_TIMEOUT = 0.001
-
-        # Create a connection - this should work because connection creation is fast
-        conn = turso.aio.connect(":memory:")
-
-        # Queue a slow operation that will definitely timeout
-        import time
-
-        def slow_operation():
-            time.sleep(1.0)  # Sleep for 1 second, way longer than 1ms timeout
-            return "done"
-
-        from turso.worker import WorkItem
-
-        item = WorkItem(slow_operation)
-        conn._queue.put_nowait(item)
-
-        # This should raise OperationalError due to timeout
+    async with turso.aio.connect(":memory:") as conn:
+        # Use a very short timeout that will be exceeded
         with pytest.raises(turso.OperationalError, match="timeout"):
-            await conn._run(lambda: "quick")
+            # Queue a slow operation then try to run something with a tiny timeout
+            import time
 
-    finally:
-        # Restore original timeout
-        lib_aio._DEFAULT_WORKER_TIMEOUT = original_timeout
+            from turso.worker import WorkItem
 
-        # Clean up - give the worker time to process and close
-        try:
-            await conn.close()
-        except Exception:
-            pass  # Ignore cleanup errors
+            def slow_operation():
+                time.sleep(1.0)
+                return "done"
+
+            item = WorkItem(slow_operation)
+            conn._queue.put_nowait(item)
+
+            # This should timeout because the slow operation is blocking the worker
+            await conn._run(lambda: "quick", timeout=0.001)
 
 
 # =============================================================================

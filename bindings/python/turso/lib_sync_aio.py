@@ -1,13 +1,16 @@
+"""Async connections for synced (remote-enabled) databases using anyio.
+
+This module provides async wrappers for Turso's synchronized database
+connections that work with both asyncio and Trio backends via anyio.
+
+See :mod:`turso.lib_aio` for timeout and cancellation documentation.
+"""
 from __future__ import annotations
 
 from typing import Callable, Optional, Union, cast
 
 from anyio import to_thread
 
-from .lib import OperationalError
-from .lib_aio import (
-    _DEFAULT_WORKER_TIMEOUT,
-)
 from .lib_aio import (
     Connection as NonBlockingConnection,
 )
@@ -40,12 +43,10 @@ class ConnectionSync(NonBlockingConnection):
         """Allow `conn = await turso.aio.sync.connect(...)`."""
 
         async def _await_open() -> "ConnectionSync":
-            completed = await to_thread.run_sync(
-                lambda: self._open_item.event.wait(timeout=_DEFAULT_WORKER_TIMEOUT),
+            await to_thread.run_sync(
+                self._open_item.event.wait,
                 abandon_on_cancel=True,
             )
-            if not completed:
-                raise OperationalError("Worker thread did not respond within timeout")
             if self._open_item.exception is not None:
                 raise self._open_item.exception
             return self
