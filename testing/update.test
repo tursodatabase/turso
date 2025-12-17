@@ -517,3 +517,15 @@ do_execsql_test_on_specific_db {:memory:} update-range-multiple-indexes {
 12|120|200
 13|130|300}
 
+do_execsql_test_in_memory_any_error update-integer-pk-underflow-error {
+    CREATE TABLE t (a INTEGER PRIMARY KEY);
+    INSERT INTO t VALUES (-9223372036854775808);
+    UPDATE t SET a = a - 1;
+}
+
+do_execsql_test_in_memory_any_error update-integer-pk-overflow-error {
+    CREATE TABLE t (a INTEGER PRIMARY KEY);
+    INSERT INTO t VALUES (9223372036854775807);
+    UPDATE t SET a = a + 1;
+}
+
