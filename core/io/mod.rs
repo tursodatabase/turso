@@ -110,6 +110,50 @@ pub trait File: Send + Sync {
     }
 }
 
+pub struct TempFile {
+    /// When temp_dir is dropped the folder is deleted
+    /// set to None if tempfile allocated in memory (for example, in case of WASM target)
+    _temp_dir: Option<tempfile::TempDir>,
+    pub(crate) file: Arc<dyn File>,
+}
+
+impl TempFile {
+    pub fn new(io: &Arc<dyn IO>) -> Result<Self> {
+        #[cfg(not(target_family = "wasm"))]
+        {
+            let temp_dir = tempfile::tempdir()?;
+            let chunk_file_path = temp_dir.as_ref().join("temp_file");
+            let chunk_file_path_str = chunk_file_path.to_str().ok_or_else(|| {
+                crate::LimboError::InternalError("temp file path is not valid UTF-8".to_string())
+            })?;
+            let chunk_file = io.open_file(chunk_file_path_str, OpenFlags::Create, false)?;
+            Ok(TempFile {
+                _temp_dir: Some(temp_dir),
+                file: chunk_file.clone(),
+            })
+        }
+        #[cfg(target_family = "wasm")]
+        {
+            use crate::MemoryIO;
+
+            let memory_io = Arc::new(MemoryIO::new());
+            let memory_file = memory_io.open_file("temp_file", OpenFlags::Create, false)?;
+            Ok(TempFile {
+                _temp_dir: None,
+                file: memory_file,
+            })
+        }
+    }
+}
+
+impl core::ops::Deref for TempFile {
+    type Target = Arc<dyn File>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.file
+    }
+}
+
 #[derive(Debug, Copy, Clone, PartialEq)]
 pub struct OpenFlags(i32);
 

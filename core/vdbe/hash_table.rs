@@ -1,6 +1,6 @@
 use crate::{
     error::LimboError,
-    io::{Buffer, Completion, File, OpenFlags, IO},
+    io::{Buffer, Completion, TempFile, IO},
     io_yield_one,
     storage::sqlite3_ondisk::{read_varint, write_varint},
     translate::collate::CollationSeq,
@@ -17,7 +17,6 @@ use std::{
     cmp::{Eq, Ordering},
     sync::atomic::AtomicUsize,
 };
-use tempfile;
 use turso_macros::AtomicEnum;
 
 const DEFAULT_SEED: u64 = 1337;
@@ -436,20 +435,6 @@ impl HashBucket {
     }
 }
 
-/// Temporary file for spilled partitions.
-struct TempFile {
-    _temp_dir: tempfile::TempDir,
-    file: Arc<dyn File>,
-}
-
-impl core::ops::Deref for TempFile {
-    type Target = Arc<dyn File>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.file
-    }
-}
-
 /// I/O state for spilled partition operations
 #[derive(Debug, AtomicEnum, Clone, Copy, PartialEq, Eq)]
 pub enum SpillIOState {
@@ -641,26 +626,7 @@ impl SpillState {
                 .collect(),
             partitions: Vec::new(),
             next_spill_offset: 0,
-            temp_file: {
-                let temp_dir = tempfile::tempdir()?;
-                let file: Arc<dyn File> = io.open_file(
-                    temp_dir
-                        .as_ref()
-                        .join("hash_join_spill")
-                        .to_str()
-                        .ok_or_else(|| {
-                            LimboError::InternalError(
-                                "temp file path is not valid UTF-8".to_string(),
-                            )
-                        })?,
-                    OpenFlags::Create,
-                    false,
-                )?;
-                TempFile {
-                    _temp_dir: temp_dir,
-                    file,
-                }
-            },
+            temp_file: TempFile::new(io)?,
         })
     }
 
