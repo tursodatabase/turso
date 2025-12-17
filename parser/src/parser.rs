@@ -1412,15 +1412,24 @@ impl<'a> Parser<'a> {
                 let expr = self.parse_expr(11)?; // BITNOT precedence is 11
                 Ok(Box::new(Expr::Unary(UnaryOperator::BitwiseNot, expr)))
             }
-            TK_PLUS => {
-                eat_assert!(self, TK_PLUS);
-                let expr = self.parse_expr(11)?; // PLUS precedence is 11
-                Ok(Box::new(Expr::Unary(UnaryOperator::Positive, expr)))
-            }
-            TK_MINUS => {
-                eat_assert!(self, TK_MINUS);
-                let expr = self.parse_expr(11)?; // MINUS precedence is 11
-                Ok(Box::new(Expr::Unary(UnaryOperator::Negative, expr)))
+            ty @ (TK_PLUS | TK_MINUS) => {
+                eat_assert!(self, TK_PLUS, TK_MINUS);
+                let mut minuses = (ty == TK_MINUS) as u32;
+                while let Some(tok) = self.peek()? {
+                    let ty = tok.token_type.unwrap();
+                    if ty != TK_PLUS && ty != TK_MINUS {
+                        break;
+                    }
+                    minuses += (ty == TK_MINUS) as u32;
+                    eat_assert!(self, TK_PLUS, TK_MINUS);
+                }
+                let expr = self.parse_expr(11)?; // PLUS/MINUS precedence is 11
+                if minuses & 1 != 0 {
+                    Ok(Box::new(Expr::Unary(UnaryOperator::Negative, expr)))
+                } else {
+                    // PLUS is idempotent
+                    Ok(expr)
+                }
             }
             TK_EXISTS => {
                 eat_assert!(self, TK_EXISTS);
