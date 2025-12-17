@@ -92,7 +92,7 @@ class Database extends DatabasePromise {
         const memory = db.memory;
         const io = memory ? memoryIO() : BrowserIO;
         const run = runner(runOpts, io, engine);
-        super(engine.db() as unknown as any, () => run.wait());
+        super(db, () => run.wait());
 
         this.#runner = run;
         this.#engine = engine;
