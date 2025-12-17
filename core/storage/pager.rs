@@ -387,8 +387,6 @@ impl Page {
 ///
 /// This guard ensures that `add_dirty()` is called before any modifications,
 /// which subjournals the page contents for proper statement-level rollback.
-///
-/// The guard is created via `Pager::make_page_writable()`.
 pub struct PageWriteGuard<'a> {
     page: &'a Page,
 }
