@@ -2,6 +2,12 @@ from __future__ import annotations
 
 from typing import Callable, Optional, Union, cast
 
+from anyio import to_thread
+
+from .lib import OperationalError
+from .lib_aio import (
+    _DEFAULT_WORKER_TIMEOUT,
+)
 from .lib_aio import (
     Connection as NonBlockingConnection,
 )
@@ -18,20 +24,31 @@ from .lib_sync import (
 
 
 class ConnectionSync(NonBlockingConnection):
+    """Async wrapper for synchronized (remote-enabled) database connections.
+
+    Extends the base async Connection with sync-specific operations (pull, push, etc.).
+    Uses the same dedicated worker thread pattern as the parent class.
+    """
+
     def __init__(self, connector: Callable[[], BlockingConnectionSync]) -> None:
-        # Use the non-blocking driver base - runs a background worker thread
-        # that owns the underlying blocking connection instance.
         super().__init__(connector)
 
     async def close(self) -> None:
-        # Ensure worker is shut down and underlying blocking connection closed
         await super().close()
 
-    # Make ConnectionSync instance awaitable with correct return typing
     def __await__(self):
+        """Allow `conn = await turso.aio.sync.connect(...)`."""
+
         async def _await_open() -> "ConnectionSync":
-            await self._open_future
-            return self  # the underlying connection is created at this point
+            completed = await to_thread.run_sync(
+                lambda: self._open_item.event.wait(timeout=_DEFAULT_WORKER_TIMEOUT),
+                abandon_on_cancel=True,
+            )
+            if not completed:
+                raise OperationalError("Worker thread did not respond within timeout")
+            if self._open_item.exception is not None:
+                raise self._open_item.exception
+            return self
 
         return _await_open().__await__()
 
@@ -42,27 +59,27 @@ class ConnectionSync(NonBlockingConnection):
     async def __aexit__(self, exc_type, exc, tb) -> None:
         await self.close()
 
-    # Synchronization API (async wrappers scheduling work on the worker thread)
+    # Synchronization API (async wrappers running work in worker thread)
 
     async def pull(self) -> bool:
-        # Pull remote changes and apply locally; returns True if any updates were fetched
-        return await self._run(lambda: cast(BlockingConnectionSync, self._conn).pull())  # type: ignore[union-attr]
+        """Pull remote changes and apply locally; returns True if any updates were fetched."""
+        return await self._run(lambda: cast(BlockingConnectionSync, self._conn).pull())
 
     async def push(self) -> None:
-        # Push local changes to the remote
-        await self._run(lambda: cast(BlockingConnectionSync, self._conn).push())  # type: ignore[union-attr]
+        """Push local changes to the remote."""
+        await self._run(lambda: cast(BlockingConnectionSync, self._conn).push())
 
     async def checkpoint(self) -> None:
-        # Checkpoint the WAL of the synced database
-        await self._run(lambda: cast(BlockingConnectionSync, self._conn).checkpoint())  # type: ignore[union-attr]
+        """Checkpoint the WAL of the synced database."""
+        await self._run(lambda: cast(BlockingConnectionSync, self._conn).checkpoint())
 
     async def stats(self) -> PyTursoSyncDatabaseStats:
-        # Collect stats about the synced database
-        return await self._run(lambda: cast(BlockingConnectionSync, self._conn).stats())  # type: ignore[union-attr]
+        """Collect stats about the synced database."""
+        return await self._run(lambda: cast(BlockingConnectionSync, self._conn).stats())
 
 
-# connect is not async because it returns awaitable ConnectionSync
-# Same signature as in the lib_sync.connect_sync
+# connect_sync is not async because it returns an awaitable ConnectionSync.
+# Use as: `conn = await connect_sync(...)` or `async with connect_sync(...) as conn:`
 def connect_sync(
     path: str,
     remote_url: Union[str, Callable[[], Optional[str]]],
@@ -75,7 +92,11 @@ def connect_sync(
     experimental_features: Optional[str] = None,
     isolation_level: Optional[str] = "DEFERRED",
 ) -> ConnectionSync:
-    # Connector creating the blocking synchronized connection in the worker thread
+    """Connect to a synced database (async version).
+
+    Same signature as lib_sync.connect_sync but returns an async-compatible connection.
+    """
+
     def _connector() -> BlockingConnectionSync:
         return blocking_connect_sync(
             path,
@@ -89,5 +110,4 @@ def connect_sync(
             isolation_level=isolation_level,
         )
 
-    # Return awaitable async wrapper with sync extras
     return ConnectionSync(_connector)

@@ -177,6 +177,7 @@ def test_partial_sync():
     print(time.time() - start)
     assert conn_partial.stats().network_received_bytes > 2000 * 1024
 
+
 def test_partial_sync_segment_size():
     # turso.setup_logging(level=logging.DEBUG)
 
@@ -207,6 +208,7 @@ def test_partial_sync_segment_size():
     assert conn_partial.execute("SELECT SUM(LENGTH(x)) FROM t").fetchall() == [(2000 * 1024,)]
     print(time.time() - start)
     assert conn_partial.stats().network_received_bytes > 2000 * 1024
+
 
 def test_partial_sync_prefetch():
     # turso.setup_logging(level=logging.DEBUG)

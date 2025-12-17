@@ -1,8 +1,9 @@
 from __future__ import annotations
 
-import asyncio
 from queue import SimpleQueue
 from typing import Any, Callable, Iterable, Mapping, Optional, Sequence
+
+from anyio import to_thread
 
 from .lib import (
     Connection as BlockingConnection,
@@ -11,38 +12,33 @@ from .lib import (
     Cursor as BlockingCursor,
 )
 from .lib import (
+    OperationalError,
     ProgrammingError,
 )
 from .lib import (
     connect as blocking_connect,
 )
-from .worker import STOP_RUNNING_SENTINEL, Worker
+from .worker import STOP_RUNNING_SENTINEL, Worker, WorkItem
+
+# Default timeout for worker operations (5 minutes)
+_DEFAULT_WORKER_TIMEOUT = 300.0
 
 
 # Connection goes FIRST
 class Connection:
     def __init__(self, connector: Callable[[], BlockingConnection]) -> None:
-        # Event loop and per-connection worker thread state
-        self._loop = asyncio.get_event_loop()
-        self._queue: SimpleQueue[tuple[asyncio.Future, Callable[[], Any]]] = SimpleQueue()
-        self._worker = Worker(self._queue, self._loop)
         self._connector = connector
+
+        # Per-connection worker thread state (initialized eagerly)
+        self._queue: SimpleQueue[WorkItem] = SimpleQueue()
+        self._worker: Worker = Worker(self._queue)
 
         # Underlying blocking connection created in worker thread
         self._conn: Optional[BlockingConnection] = None
         self._closed: bool = False
 
-        # Schedule connection creation as the very first job in the worker
-        self._open_future: asyncio.Future[Connection] = self._loop.create_future()
-
-        def _open() -> Connection:
-            # Create the blocking connection inside the worker thread once
-            if self._conn is None:
-                self._conn = self._connector()
-            return self
-
-        self._queue.put_nowait((self._open_future, _open))
-        self._worker.start()
+        # For awaiting connection open
+        self._open_item: WorkItem
 
         # Cached properties mirrored to the underlying connection.
         # Setters will enqueue mutation jobs; we keep local cache for getters.
@@ -50,6 +46,17 @@ class Connection:
         self._row_factory_cache: Any = None
         self._text_factory_cache: Any = None
         self._autocommit_cache: object | bool | None = None
+
+        # Schedule connection creation as the very first job in the worker
+        def _open() -> "Connection":
+            # Create the blocking connection inside the worker thread once
+            if self._conn is None:
+                self._conn = self._connector()
+            return self
+
+        self._open_item = WorkItem(_open)
+        self._queue.put_nowait(self._open_item)
+        self._worker.start()
 
     async def close(self) -> None:
         if self._closed:
@@ -60,20 +67,27 @@ class Connection:
             if self._conn is not None:
                 self._conn.close()
 
-        await self._run(lambda: (_do_close(), None)[1])  # schedule and await completion of close
+        await self._run(_do_close)
 
         # Request worker stop; we must not block the event loop while waiting.
         # Note: STOP_RUNNING_SENTINEL item will terminate the worker loop.
-        stop_future = self._loop.create_future()
-        self._queue.put_nowait((stop_future, lambda: STOP_RUNNING_SENTINEL))
+        stop_item = WorkItem(lambda: STOP_RUNNING_SENTINEL)
+        self._queue.put_nowait(stop_item)
 
         # Wait for the worker thread to terminate without blocking the loop
-        await self._loop.run_in_executor(None, self._worker.join)
+        await to_thread.run_sync(self._worker.join)
         self._closed = True
 
     def __await__(self):
         async def _await_open() -> "Connection":
-            await self._open_future
+            completed = await to_thread.run_sync(
+                lambda: self._open_item.event.wait(timeout=_DEFAULT_WORKER_TIMEOUT),
+                abandon_on_cancel=True,
+            )
+            if not completed:
+                raise OperationalError("Worker thread did not respond within timeout")
+            if self._open_item.exception is not None:
+                raise self._open_item.exception
             return self
 
         return _await_open().__await__()
@@ -90,16 +104,24 @@ class Connection:
     async def _run(self, func: Callable[[], Any]) -> Any:
         if self._closed:
             raise ProgrammingError("Cannot operate on a closed connection")
-        fut = self._loop.create_future()
-        self._queue.put_nowait((fut, func))
-        return await fut
+        item = WorkItem(func)
+        self._queue.put_nowait(item)
+        completed = await to_thread.run_sync(
+            lambda: item.event.wait(timeout=_DEFAULT_WORKER_TIMEOUT),
+            abandon_on_cancel=True,
+        )
+        if not completed:
+            raise OperationalError("Worker thread did not respond within timeout")
+        if item.exception is not None:
+            raise item.exception
+        return item.result
 
     # Internal helper: enqueue a callable but do not await completion (used for property setters).
     def _run_nowait(self, func: Callable[[], Any]) -> None:
         if self._closed:
             raise ProgrammingError("Cannot operate on a closed connection")
-        fut = self._loop.create_future()
-        self._queue.put_nowait((fut, func))
+        item = WorkItem(func)
+        self._queue.put_nowait(item)
 
     # Cursor factory returning async Cursor wrapper
     def cursor(self, factory: Optional[Callable[[BlockingConnection], BlockingCursor]] = None) -> "Cursor":
@@ -188,12 +210,9 @@ class Connection:
 # Cursor goes SECOND
 class Cursor:
     def __init__(
-            self,
-            connection: Connection,
-            factory: Optional[Callable[[BlockingConnection], BlockingCursor]] = None
-        ):
+        self, connection: Connection, factory: Optional[Callable[[BlockingConnection], BlockingCursor]] = None
+    ):
         self._connection: Connection = connection
-        self._loop = asyncio.get_event_loop()
 
         # Underlying blocking cursor and its creation job
         self._cursor_created: bool = False
@@ -206,7 +225,7 @@ class Cursor:
         self._rowcount: int = -1
         self._closed: bool = False
 
-        # Enqueue creation of the underlying blocking cursor in the worker thread
+        # Enqueue creation of the underlying blocking cursor in the worker thread (eager)
         def _create() -> None:
             if self._cursor_created:
                 return
