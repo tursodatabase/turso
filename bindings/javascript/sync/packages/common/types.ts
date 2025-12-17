@@ -120,8 +120,8 @@ export interface DatabaseOpts {
             (so, if loading page 1 with segment_size=128kb then 32 pages [1..32] will be loaded)
         */
         segmentSize?: number,
-        /* optional parameter which makes sync engine to speculatively load pages which probably will be accessed soon */
-        speculativeLoad?: boolean,
+        /* optional parameter which makes sync engine to prefetch pages which probably will be accessed soon */
+        prefetch?: boolean,
     }
 }
 export interface DatabaseStats {

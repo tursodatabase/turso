@@ -1478,3 +1478,20 @@ def test_insert_returning_single_and_multiple_commit_without_consuming(provider)
     finally:
         conn.close()
 
+
+@pytest.mark.parametrize("provider", ["sqlite3", "turso"])
+def test_pragma_integrity_check(provider):
+    conn = connect(provider, ":memory:")
+    cursor = conn.cursor()
+    cursor.execute("PRAGMA integrity_check")
+
+    # Verify fetchone returns the expected result, not None
+    # Bug: missing add_pragma_result_column in translate_integrity_check
+    # caused column_count to be 0, making execute() finalize the statement
+    # and leaving fetchone() to return None
+    row = cursor.fetchone()
+    assert row is not None, "PRAGMA integrity_check should return a row"
+    assert row == ("ok",)
+
+    conn.close()
+

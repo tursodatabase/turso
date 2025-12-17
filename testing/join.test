@@ -517,3 +517,62 @@ do_execsql_test_on_specific_db {:memory:} four-way-left-joins-null-keys {
    order by t.a;
 } {1|t1|t1||w1
 2||||}
+
+do_execsql_test_on_specific_db {:memory:} left-join-integer-real {
+  CREATE TABLE IF NOT EXISTS t1 (a INTEGER, b INTEGER);
+  CREATE TABLE IF NOT EXISTS t2 (a INTEGER, c REAL);
+  INSERT INTO t1 (a, b) VALUES (1, NULL), (2, 10);
+  INSERT INTO t2 (a, c) VALUES (1, 10.0), (3, NULL);
+  SELECT * FROM t1 LEFT JOIN t2 ON t1.b = t2.c;
+} {1|||
+2|10|1|10.0}
+
+do_execsql_test_on_specific_db {:memory:} left-join-real-integer {
+  CREATE TABLE IF NOT EXISTS t3 (a INTEGER, b REAL);
+  CREATE TABLE IF NOT EXISTS t4 (a INTEGER, c INTEGER);
+  INSERT INTO t3 (a, b) VALUES (1, NULL), (2, 10.0);
+  INSERT INTO t4 (a, c) VALUES (1, 10), (3, NULL);
+  SELECT * FROM t3 LEFT JOIN t4 ON t3.b = t4.c;
+} {1|||
+2|10.0|1|10}
+
+do_execsql_test_on_specific_db {:memory:} inner-join-integer-real {
+  CREATE TABLE IF NOT EXISTS t5 (a INTEGER, b INTEGER);
+  CREATE TABLE IF NOT EXISTS t6 (a INTEGER, c REAL);
+  INSERT INTO t5 (a, b) VALUES (1, 5), (2, 10), (3, 15);
+  INSERT INTO t6 (a, c) VALUES (1, 10.0), (2, 20.0), (3, 5.0);
+  SELECT t5.a, t5.b, t6.a, t6.c FROM t5 INNER JOIN t6 ON t5.b = t6.c ORDER BY t5.a;
+} {1|5|3|5.0
+2|10|1|10.0}
+
+do_execsql_test_on_specific_db {:memory:} left-join-integer-real-zero {
+  CREATE TABLE IF NOT EXISTS t7 (a INTEGER, b INTEGER);
+  CREATE TABLE IF NOT EXISTS t8 (a INTEGER, c REAL);
+  INSERT INTO t7 (a, b) VALUES (1, 0);
+  INSERT INTO t8 (a, c) VALUES (1, 0.0);
+  SELECT * FROM t7 LEFT JOIN t8 ON t7.b = t8.c;
+} {1|0|1|0.0}
+
+do_execsql_test_on_specific_db {:memory:} left-join-integer-real-negative {
+  CREATE TABLE IF NOT EXISTS t9 (a INTEGER, b INTEGER);
+  CREATE TABLE IF NOT EXISTS t10 (a INTEGER, c REAL);
+  INSERT INTO t9 (a, b) VALUES (1, -10);
+  INSERT INTO t10 (a, c) VALUES (1, -10.0);
+  SELECT * FROM t9 LEFT JOIN t10 ON t9.b = t10.c;
+} {1|-10|1|-10.0}
+
+do_execsql_test_on_specific_db {:memory:} left-join-integer-real-no-match {
+  CREATE TABLE IF NOT EXISTS t11 (a INTEGER, b INTEGER);
+  CREATE TABLE IF NOT EXISTS t12 (a INTEGER, c REAL);
+  INSERT INTO t11 (a, b) VALUES (1, 10);
+  INSERT INTO t12 (a, c) VALUES (1, 10.5);
+  SELECT * FROM t11 LEFT JOIN t12 ON t11.b = t12.c;
+} {1|10||}
+
+do_execsql_test_on_specific_db {:memory:} left-join-integer-real-multi-key {
+  CREATE TABLE IF NOT EXISTS t13 (a INTEGER, b INTEGER, c INTEGER);
+  CREATE TABLE IF NOT EXISTS t14 (a INTEGER, b REAL, c REAL);
+  INSERT INTO t13 (a, b, c) VALUES (1, 10, 20);
+  INSERT INTO t14 (a, b, c) VALUES (1, 10.0, 20.0);
+  SELECT * FROM t13 LEFT JOIN t14 ON t13.b = t14.b AND t13.c = t14.c;
+} {1|10|20|1|10.0|20.0}

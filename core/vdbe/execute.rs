@@ -325,29 +325,7 @@ pub fn op_bit_not(
     Ok(InsnFunctionStepResult::Step)
 }
 
-#[derive(Debug)]
-pub enum OpCheckpointState {
-    StartCheckpoint,
-    FinishCheckpoint { result: Option<CheckpointResult> },
-    CompleteResult { result: Result<CheckpointResult> },
-}
-
 pub fn op_checkpoint(
-    program: &Program,
-    state: &mut ProgramState,
-    insn: &Insn,
-    pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
-    match op_checkpoint_inner(program, state, insn, pager) {
-        Ok(result) => Ok(result),
-        Err(err) => {
-            state.op_checkpoint_state = OpCheckpointState::StartCheckpoint;
-            Err(err)
-        }
-    }
-}
-
-pub fn op_checkpoint_inner(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
@@ -387,83 +365,54 @@ pub fn op_checkpoint_inner(
                 IOResult::IO(io) => {
                     pager.io.step()?;
                 }
-                IOResult::Done(result) => {
-                    state.op_checkpoint_state =
-                        OpCheckpointState::CompleteResult { result: Ok(result) };
-                    break;
+                IOResult::Done(CheckpointResult {
+                    num_attempted,
+                    num_backfilled,
+                    ..
+                }) => {
+                    // https://sqlite.org/pragma.html#pragma_wal_checkpoint
+                    // 1st col: 1 (checkpoint SQLITE_BUSY) or 0 (not busy).
+                    state.registers[*dest] = Register::Value(Value::Integer(0));
+                    // 2nd col: # modified pages written to wal file
+                    state.registers[*dest + 1] =
+                        Register::Value(Value::Integer(num_attempted as i64));
+                    // 3rd col: # pages moved to db after checkpoint
+                    state.registers[*dest + 2] =
+                        Register::Value(Value::Integer(num_backfilled as i64));
+
+                    state.pc += 1;
+                    return Ok(InsnFunctionStepResult::Step);
                 }
             }
         }
     }
-    loop {
-        match &mut state.op_checkpoint_state {
-            OpCheckpointState::StartCheckpoint => {
-                let step_result = program
-                    .connection
-                    .pager
-                    .load()
-                    .wal_checkpoint_start(*checkpoint_mode);
-                match step_result {
-                    Ok(IOResult::Done(result)) => {
-                        state.op_checkpoint_state = OpCheckpointState::FinishCheckpoint {
-                            result: Some(result),
-                        };
-                        continue;
-                    }
-                    Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
-                    Err(err) => {
-                        state.op_checkpoint_state =
-                            OpCheckpointState::CompleteResult { result: Err(err) };
-                        continue;
-                    }
-                }
-            }
-            OpCheckpointState::FinishCheckpoint { result } => {
-                let step_result = program.connection.pager.load().wal_checkpoint_finish(
-                    result
-                        .as_mut()
-                        .expect("checkpoint result should be Some in FinishCheckpoint state"),
-                );
-                match step_result {
-                    Ok(IOResult::Done(())) => {
-                        state.op_checkpoint_state = OpCheckpointState::CompleteResult {
-                            result: Ok(result.take().expect(
-                                "checkpoint result should be Some in FinishCheckpoint state",
-                            )),
-                        };
-                        continue;
-                    }
-                    Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
-                    Err(err) => {
-                        state.op_checkpoint_state =
-                            OpCheckpointState::CompleteResult { result: Err(err) };
-                        continue;
-                    }
-                }
-            }
-            OpCheckpointState::CompleteResult { result } => {
-                match result {
-                    Ok(CheckpointResult {
-                        num_attempted,
-                        num_backfilled,
-                        ..
-                    }) => {
-                        // https://sqlite.org/pragma.html#pragma_wal_checkpoint
-                        // 1st col: 1 (checkpoint SQLITE_BUSY) or 0 (not busy).
-                        state.registers[*dest] = Register::Value(Value::Integer(0));
-                        // 2nd col: # modified pages written to wal file
-                        state.registers[*dest + 1] =
-                            Register::Value(Value::Integer(*num_attempted as i64));
-                        // 3rd col: # pages moved to db after checkpoint
-                        state.registers[*dest + 2] =
-                            Register::Value(Value::Integer(*num_backfilled as i64));
-                    }
-                    Err(_err) => state.registers[*dest] = Register::Value(Value::Integer(1)),
-                }
+    let step_result = program.connection.pager.load().checkpoint(
+        *checkpoint_mode,
+        program.connection.get_sync_mode(),
+        true,
+    );
+    match step_result {
+        Ok(IOResult::Done(CheckpointResult {
+            num_attempted,
+            num_backfilled,
+            ..
+        })) => {
+            // https://sqlite.org/pragma.html#pragma_wal_checkpoint
+            // 1st col: 1 (checkpoint SQLITE_BUSY) or 0 (not busy).
+            state.registers[*dest] = Register::Value(Value::Integer(0));
+            // 2nd col: # modified pages written to wal file
+            state.registers[*dest + 1] = Register::Value(Value::Integer(num_attempted as i64));
+            // 3rd col: # pages moved to db after checkpoint
+            state.registers[*dest + 2] = Register::Value(Value::Integer(num_backfilled as i64));
 
-                state.pc += 1;
-                return Ok(InsnFunctionStepResult::Step);
-            }
+            state.pc += 1;
+            Ok(InsnFunctionStepResult::Step)
+        }
+        Ok(IOResult::IO(io)) => Ok(InsnFunctionStepResult::IO(io)),
+        Err(_err) => {
+            state.registers[*dest] = Register::Value(Value::Integer(1));
+            state.pc += 1;
+            Ok(InsnFunctionStepResult::Step)
         }
     }
 }
@@ -7021,12 +6970,13 @@ pub fn op_new_rowid(
         },
         insn
     );
+
     let mv_store = program.connection.mv_store();
     'mvcc_newrowid: {
         if let Some(mv_store) = mv_store.as_ref() {
             // With MVCC we can't simply find last rowid and get rowid + 1 as a result. To not have two conflicting rowids concurrently we need to call `get_next_rowid`
             // which will make sure we don't collide.
-            let rowid = {
+            let (rowid, current_max) = {
                 let cursor = state.get_cursor(*cursor);
                 let cursor = cursor.as_btree_mut() as &mut dyn Any;
                 let Some(mvcc_cursor) = cursor.downcast_mut::<MvCursor>() else {
@@ -7043,6 +6993,9 @@ pub fn op_new_rowid(
                 return_if_io!(mvcc_cursor.get_next_rowid())
             };
             state.registers[*rowid_reg] = Register::Value(Value::Integer(rowid));
+            if *prev_largest_reg > 0 {
+                state.registers[*prev_largest_reg] = Register::Value(Value::Integer(current_max));
+            }
             state.pc += 1;
             return Ok(InsnFunctionStepResult::Step);
         }
@@ -7172,18 +7125,18 @@ pub fn op_must_be_int(
         Value::Integer(_) => {}
         Value::Float(f) => match cast_real_to_integer(*f) {
             Ok(i) => state.registers[*reg] = Register::Value(Value::Integer(i)),
-            Err(_) => crate::bail_parse_error!("datatype mismatch"),
+            Err(_) => bail_constraint_error!("datatype mismatch"),
         },
         Value::Text(text) => match checked_cast_text_to_numeric(text.as_str(), true) {
             Ok(Value::Integer(i)) => state.registers[*reg] = Register::Value(Value::Integer(i)),
             Ok(Value::Float(f)) => match cast_real_to_integer(f) {
                 Ok(i) => state.registers[*reg] = Register::Value(Value::Integer(i)),
-                Err(_) => crate::bail_parse_error!("datatype mismatch"),
+                Err(_) => bail_constraint_error!("datatype mismatch"),
             },
-            _ => crate::bail_parse_error!("datatype mismatch"),
+            _ => bail_constraint_error!("datatype mismatch"),
         },
         _ => {
-            crate::bail_parse_error!("datatype mismatch");
+            bail_constraint_error!("datatype mismatch");
         }
     };
     state.pc += 1;

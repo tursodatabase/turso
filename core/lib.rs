@@ -77,12 +77,11 @@ use std::collections::HashSet;
 use std::task::Waker;
 use std::{
     borrow::Cow,
-    cell::{Cell, RefCell},
+    cell::Cell,
     collections::HashMap,
     fmt::{self, Display},
     num::NonZero,
     ops::Deref,
-    rc::Rc,
     sync::{
         atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicUsize, Ordering},
         Arc, LazyLock, Weak,
@@ -190,6 +189,18 @@ enum TransactionState {
     Read,
     PendingUpgrade,
     None,
+}
+
+impl TransactionState {
+    /// Whether the transaction is a write transaction that changes the schema
+    pub fn is_ddl_write_tx(&self) -> bool {
+        matches!(
+            self,
+            TransactionState::Write {
+                schema_did_change: true
+            }
+        )
+    }
 }
 
 #[derive(Debug, AtomicEnum, Clone, Copy, PartialEq, Eq)]
@@ -800,11 +811,11 @@ impl Database {
                 buffer_pool.finalize_with_page_size(page_size.get() as usize)?;
             }
 
-            let wal = Rc::new(RefCell::new(WalFile::new(
+            let wal: Arc<dyn Wal> = Arc::new(WalFile::new(
                 self.io.clone(),
                 self.shared_wal.clone(),
                 buffer_pool.clone(),
-            )));
+            ));
             let pager = Pager::new(
                 self.db_file.clone(),
                 Some(wal),
@@ -870,11 +881,11 @@ impl Database {
             shared_wal.create(file)?;
         }
 
-        let wal = Rc::new(RefCell::new(WalFile::new(
+        let wal: Arc<dyn Wal> = Arc::new(WalFile::new(
             self.io.clone(),
             self.shared_wal.clone(),
             buffer_pool,
-        )));
+        ));
         pager.set_wal(wal);
 
         Ok(pager)
@@ -1869,14 +1880,16 @@ impl Connection {
 
             self.auto_commit.store(true, Ordering::SeqCst);
             self.set_tx_state(TransactionState::None);
-            {
-                let wal = wal.borrow_mut();
-                wal.end_write_tx();
-                wal.end_read_tx();
-            }
+            wal.end_write_tx();
+            wal.end_read_tx();
 
             if !force_commit {
                 // remove all non-commited changes in case if WAL session left some suffix without commit frame
+                if let Some(mv_store) = self.mv_store().as_ref() {
+                    if let Some(tx_id) = self.get_mv_tx_id() {
+                        mv_store.rollback_tx(tx_id, pager.clone(), self);
+                    }
+                }
                 pager.rollback(false, self, true);
             }
             if let Some(err) = commit_err {
@@ -1901,7 +1914,9 @@ impl Connection {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
-        self.pager.load().wal_checkpoint(mode)
+        self.pager
+            .load()
+            .blocking_checkpoint(mode, self.get_sync_mode())
     }
 
     /// Close a connection and checkpoint.
@@ -1930,9 +1945,10 @@ impl Connection {
             .fetch_sub(1, std::sync::atomic::Ordering::SeqCst)
             .eq(&1)
         {
-            self.pager
-                .load()
-                .checkpoint_shutdown(self.is_wal_auto_checkpoint_disabled())?;
+            self.pager.load().checkpoint_shutdown(
+                self.is_wal_auto_checkpoint_disabled(),
+                self.get_sync_mode(),
+            )?;
         };
         Ok(())
     }

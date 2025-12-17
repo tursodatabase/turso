@@ -368,7 +368,8 @@ pub fn insn_to_row(
                 *cursor_id as i64,
                 *root_page,
                 *db as i64,
-                Value::build_text(""),
+                Value::build_text(program.cursor_ref[*cursor_id]
+                            .1.get_explain_description()),
                 0,
                 {
                     let cursor_type =

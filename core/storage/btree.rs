@@ -2602,6 +2602,7 @@ impl BTreeCursor {
             0,
             BtreePageAllocMode::Any
         ));
+        self.pager.add_dirty(&new_rightmost_leaf)?;
 
         let usable_space = self.usable_space();
         let old_rightmost_leaf = self.stack.top_ref();
@@ -2616,6 +2617,7 @@ impl BTreeCursor {
             .stack
             .get_page_at_level(self.stack.current() - 1)
             .expect("parent page should be on the stack");
+        self.pager.add_dirty(parent)?;
         let parent_contents = parent.get_contents();
         let rightmost_pointer = parent_contents
             .rightmost_pointer()
@@ -2658,8 +2660,6 @@ impl BTreeCursor {
             usable_space,
         )?;
         parent_contents.write_rightmost_ptr(new_rightmost_leaf.get().id as u32);
-        self.pager.add_dirty(parent)?;
-        self.pager.add_dirty(&new_rightmost_leaf)?;
 
         // Continue balance from the parent page (inserting the new divider cell may have overflowed the parent)
         self.stack.pop();
@@ -7797,9 +7797,9 @@ mod tests {
         storage::{database::DatabaseFile, page_cache::PageCache, sqlite3_ondisk::PageSize},
         types::Text,
         vdbe::Register,
-        BufferPool, Completion, Connection, IOContext, StepResult, WalFile, WalFileShared,
+        BufferPool, Completion, Connection, IOContext, StepResult, Wal, WalFile, WalFileShared,
     };
-    use std::{cell::RefCell, collections::HashSet, mem::transmute, ops::Deref, rc::Rc, sync::Arc};
+    use std::{collections::HashSet, mem::transmute, ops::Deref, sync::Arc};
 
     use tempfile::TempDir;
 
@@ -9063,11 +9063,7 @@ mod tests {
 
         let wal_file = io.open_file("test.wal", OpenFlags::Create, false).unwrap();
         let wal_shared = WalFileShared::new_shared(wal_file).unwrap();
-        let wal = Rc::new(RefCell::new(WalFile::new(
-            io.clone(),
-            wal_shared,
-            buffer_pool.clone(),
-        )));
+        let wal: Arc<dyn Wal> = Arc::new(WalFile::new(io.clone(), wal_shared, buffer_pool.clone()));
 
         let pager = Arc::new(
             Pager::new(

@@ -318,6 +318,7 @@ class Statement {
   get(...bindParameters) {
     this.stmt.reset();
     bindParams(this.stmt, bindParameters);
+    let row = undefined;
     for (; ;) {
       const stepResult = this.stmt.stepSync();
       if (stepResult === STEP_IO) {
@@ -325,12 +326,13 @@ class Statement {
         continue;
       }
       if (stepResult === STEP_DONE) {
-        return undefined;
+        break;
       }
-      if (stepResult === STEP_ROW) {
-        return this.stmt.row();
+      if (stepResult === STEP_ROW && row === undefined) {
+        row = this.stmt.row();
       }
     }
+    return row;
   }
 
   /**

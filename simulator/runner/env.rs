@@ -226,10 +226,11 @@ where
                     let new_col_count = current_table.columns.len();
 
                     if new_col_count > old_col_count {
-                        // ADD COLUMN: fill with NULL
-                        let nulls_to_add = new_col_count - old_col_count;
+                        // ADD COLUMN: fill with NULL only for rows that need it.
+                        // Rows inserted after ADD COLUMN in the same transaction
+                        // already have the correct number of values.
                         for row in &mut committed.rows {
-                            for _ in 0..nulls_to_add {
+                            while row.len() < new_col_count {
                                 row.push(SimValue::NULL);
                             }
                         }
@@ -250,8 +251,13 @@ where
                         dropped_indices.sort_by(|a, b| b.cmp(a));
 
                         for row in &mut committed.rows {
-                            for &idx in &dropped_indices {
-                                row.remove(idx);
+                            // Only remove from rows that have the old column count.
+                            // Rows inserted after DROP COLUMN in the same transaction
+                            // already have the correct (new) number of values.
+                            if row.len() == old_col_count {
+                                for &idx in &dropped_indices {
+                                    row.remove(idx);
+                                }
                             }
                         }
                     }

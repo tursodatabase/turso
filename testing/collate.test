@@ -310,3 +310,158 @@ C
 A
 C
 b}
+
+# =============================================================================
+# ORDER BY COLLATION vs INDEX COLLATION TESTS
+# =============================================================================
+# These tests verify that when ORDER BY uses a different collation than the
+# index, the optimizer correctly falls back to table scan + sort instead of
+# incorrectly using the index (which would produce wrong ordering).
+
+# ORDER BY COLLATE BINARY should not use an index
+# with COLLATE RTRIM, as the orderings are incompatible.
+do_execsql_test_on_specific_db {:memory:} collate_orderby_binary_vs_index_rtrim {
+    CREATE TABLE t1 (c1 TEXT COLLATE RTRIM);
+    INSERT INTO t1 VALUES (' ');
+    CREATE INDEX i1 ON t1 (c1 COLLATE RTRIM DESC);
+    INSERT INTO t1 VALUES ('zzz');
+    SELECT c1, typeof(c1) FROM t1 ORDER BY c1 COLLATE BINARY DESC, rowid ASC;
+} {{zzz|text} { |text}}
+
+# Verify correct ordering with matching collations (index should be usable)
+do_execsql_test_on_specific_db {:memory:} collate_orderby_rtrim_matches_index_rtrim {
+    CREATE TABLE t1 (c1 TEXT COLLATE RTRIM);
+    CREATE INDEX i1 ON t1 (c1 COLLATE RTRIM DESC);
+    INSERT INTO t1 VALUES ('a'), ('b'), ('c'), ('d');
+    SELECT c1 FROM t1 ORDER BY c1 COLLATE RTRIM DESC;
+} {d
+c
+b
+a}
+
+# ORDER BY NOCASE should not use BINARY index
+do_execsql_test_on_specific_db {:memory:} collate_orderby_nocase_vs_index_binary {
+    CREATE TABLE t1 (c1 TEXT COLLATE BINARY);
+    CREATE INDEX i1 ON t1 (c1 COLLATE BINARY);
+    INSERT INTO t1 VALUES ('Apple'), ('banana'), ('CHERRY'), ('date');
+    SELECT c1 FROM t1 ORDER BY c1 COLLATE NOCASE;
+} {Apple
+banana
+CHERRY
+date}
+
+# ORDER BY BINARY should not use NOCASE index
+do_execsql_test_on_specific_db {:memory:} collate_orderby_binary_vs_index_nocase {
+    CREATE TABLE t1 (c1 TEXT COLLATE NOCASE);
+    CREATE INDEX i1 ON t1 (c1 COLLATE NOCASE);
+    INSERT INTO t1 VALUES ('Apple'), ('banana'), ('CHERRY'), ('date');
+    SELECT c1 FROM t1 ORDER BY c1 COLLATE BINARY;
+} {Apple
+CHERRY
+banana
+date}
+
+# Multi-column ORDER BY: first column collation matches, second doesn't
+do_execsql_test_on_specific_db {:memory:} collate_orderby_multi_column_mixed {
+    CREATE TABLE t1 (a TEXT COLLATE BINARY, b TEXT COLLATE NOCASE);
+    CREATE INDEX i1 ON t1 (a COLLATE BINARY, b COLLATE NOCASE);
+    INSERT INTO t1 VALUES ('x', 'Apple'), ('x', 'banana'), ('y', 'CHERRY');
+    -- Second column uses BINARY but index has NOCASE - should not use index for full ordering
+    SELECT a, b FROM t1 ORDER BY a COLLATE BINARY, b COLLATE BINARY;
+} {x|Apple
+x|banana
+y|CHERRY}
+
+# ORDER BY with implicit column collation vs explicit index collation
+do_execsql_test_on_specific_db {:memory:} collate_orderby_implicit_vs_explicit_index {
+    CREATE TABLE t1 (c1 TEXT COLLATE NOCASE);
+    -- Index uses BINARY explicitly, but column defaults to NOCASE
+    CREATE INDEX i1 ON t1 (c1 COLLATE BINARY);
+    INSERT INTO t1 VALUES ('Apple'), ('banana'), ('CHERRY');
+    -- ORDER BY uses column's implicit NOCASE collation
+    SELECT c1 FROM t1 ORDER BY c1;
+} {Apple
+banana
+CHERRY}
+
+# Explicit ORDER BY collation overrides column collation
+do_execsql_test_on_specific_db {:memory:} collate_orderby_explicit_override_column {
+    CREATE TABLE t1 (c1 TEXT COLLATE NOCASE);
+    CREATE INDEX i1 ON t1 (c1 COLLATE NOCASE);
+    INSERT INTO t1 VALUES ('Apple'), ('banana'), ('CHERRY');
+    -- Explicit BINARY in ORDER BY should not use NOCASE index
+    SELECT c1 FROM t1 ORDER BY c1 COLLATE BINARY;
+} {Apple
+CHERRY
+banana}
+
+# Test with rowid tiebreaker - collation mismatch
+do_execsql_test_on_specific_db {:memory:} collate_orderby_with_rowid_tiebreaker {
+    CREATE TABLE t1 (c1 TEXT COLLATE RTRIM);
+    CREATE INDEX i1 ON t1 (c1 COLLATE RTRIM);
+    INSERT INTO t1 VALUES ('a');
+    INSERT INTO t1 VALUES ('b');
+    INSERT INTO t1 VALUES ('c');
+    -- BINARY collation should produce correct order
+    SELECT c1, rowid FROM t1 ORDER BY c1 COLLATE BINARY, rowid;
+} {a|1
+b|2
+c|3}
+
+# DESC ordering with collation mismatch
+do_execsql_test_on_specific_db {:memory:} collate_orderby_desc_collation_mismatch {
+    CREATE TABLE t1 (c1 TEXT);
+    CREATE INDEX i1 ON t1 (c1 COLLATE NOCASE DESC);
+    INSERT INTO t1 VALUES ('a'), ('B'), ('c'), ('D');
+    -- BINARY DESC ordering should not use NOCASE DESC index
+    SELECT c1 FROM t1 ORDER BY c1 COLLATE BINARY DESC;
+} {c
+a
+D
+B}
+
+# Matching collation with DESC - index should be usable
+do_execsql_test_on_specific_db {:memory:} collate_orderby_desc_collation_match {
+    CREATE TABLE t1 (c1 TEXT);
+    CREATE INDEX i1 ON t1 (c1 COLLATE NOCASE DESC);
+    INSERT INTO t1 VALUES ('a'), ('B'), ('c'), ('D');
+    SELECT c1 FROM t1 ORDER BY c1 COLLATE NOCASE DESC;
+} {D
+c
+B
+a}
+
+# Test RTRIM vs BINARY - index with RTRIM shouldn't be used for BINARY ordering
+do_execsql_test_on_specific_db {:memory:} collate_orderby_rtrim_vs_binary_spaces {
+    CREATE TABLE t1 (c1 TEXT);
+    CREATE INDEX i1 ON t1 (c1 COLLATE RTRIM);
+    INSERT INTO t1 VALUES ('a'), ('B'), ('c'), ('D');
+    -- BINARY ordering is case-sensitive (uppercase before lowercase in ASCII)
+    SELECT c1 FROM t1 ORDER BY c1 COLLATE BINARY;
+} {B
+D
+a
+c}
+
+# Test that index with matching collation is preferred
+do_execsql_test_on_specific_db {:memory:} collate_orderby_prefers_matching_index {
+    CREATE TABLE t1 (c1 TEXT);
+    CREATE INDEX i1_nocase ON t1 (c1 COLLATE NOCASE);
+    CREATE INDEX i1_binary ON t1 (c1 COLLATE BINARY);
+    INSERT INTO t1 VALUES ('a'), ('B'), ('c');
+    -- Should use i1_binary for BINARY ordering
+    SELECT c1 FROM t1 ORDER BY c1 COLLATE BINARY;
+} {B
+a
+c}
+
+# Expression in ORDER BY with collation
+do_execsql_test_on_specific_db {:memory:} collate_orderby_expression_collation {
+    CREATE TABLE t1 (c1 TEXT COLLATE BINARY);
+    CREATE INDEX i1 ON t1 (c1 COLLATE BINARY);
+    INSERT INTO t1 VALUES ('Apple'), ('banana'), ('CHERRY');
+    -- LOWER() result compared with NOCASE
+    SELECT c1 FROM t1 ORDER BY LOWER(c1) COLLATE NOCASE;
+} {Apple
+banana
+CHERRY}

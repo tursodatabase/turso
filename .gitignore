@@ -1,6 +1,7 @@
 /target
 /.idea
 /.vscode
+/.sqlite3
 **/target
 
 *.so

@@ -281,4 +281,4 @@ jobs:
       - name: Publish (dry-run)
         if: "!startsWith(github.ref, 'refs/tags/v')"
         run: |
-          npm publish --workspaces --dry-run
+          npm pack --workspaces

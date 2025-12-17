@@ -43,9 +43,9 @@ use crate::{
     types::{IOCompletions, IOResult},
     vdbe::{
         execute::{
-            OpCheckpointState, OpColumnState, OpDeleteState, OpDeleteSubState, OpDestroyState,
-            OpIdxInsertState, OpInsertState, OpInsertSubState, OpNewRowidState, OpNoConflictState,
-            OpProgramState, OpRowIdState, OpSeekState, OpTransactionState,
+            OpColumnState, OpDeleteState, OpDeleteSubState, OpDestroyState, OpIdxInsertState,
+            OpInsertState, OpInsertSubState, OpNewRowidState, OpNoConflictState, OpProgramState,
+            OpRowIdState, OpSeekState, OpTransactionState,
         },
         hash_table::HashTable,
         metrics::StatementMetrics,
@@ -375,7 +375,6 @@ pub struct ProgramState {
     op_column_state: OpColumnState,
     op_row_id_state: OpRowIdState,
     op_transaction_state: OpTransactionState,
-    op_checkpoint_state: OpCheckpointState,
     /// State machine for committing view deltas with I/O handling
     view_delta_state: ViewDeltaCommitState,
     /// Marker which tells about auto transaction cleanup necessary for that connection in case of reset
@@ -457,7 +456,6 @@ impl ProgramState {
             op_column_state: OpColumnState::Start,
             op_row_id_state: OpRowIdState::Start,
             op_transaction_state: OpTransactionState::Start,
-            op_checkpoint_state: OpCheckpointState::StartCheckpoint,
             view_delta_state: ViewDeltaCommitState::NotStarted,
             auto_txn_cleanup: TxnCleanup::None,
             fk_deferred_violations_when_stmt_started: AtomicIsize::new(0),
@@ -1021,6 +1019,17 @@ impl Program {
                     return Ok(StepResult::IO);
                 }
                 if let Some(err) = io.get_error() {
+                    if pager.is_checkpointing() {
+                        // Wrap IO errors that occurred during checkpointing in CheckpointFailed error,
+                        // so that abort() knows not to try to rollback the transaction, because the transaction
+                        // is already durable in the WAL and hence committed.
+                        // This also lets the simulator know that it should shadow the results of the query because
+                        // the write itself succeeded.
+                        let checkpoint_err = LimboError::CheckpointFailed(err.to_string());
+                        tracing::error!("Checkpoint failed: {checkpoint_err}");
+                        self.abort(&pager, Some(&checkpoint_err), state);
+                        return Err(checkpoint_err);
+                    }
                     let err = err.into();
                     self.abort(&pager, Some(&err), state);
                     return Err(err);
@@ -1285,7 +1294,22 @@ impl Program {
         rollback: bool,
     ) -> Result<IOResult<()>> {
         let cacheflush_status = if !rollback {
-            pager.commit_tx(connection)?
+            match pager.commit_tx(connection) {
+                Ok(status) => status,
+                Err(LimboError::CheckpointFailed(msg)) => {
+                    // CheckpointFailed means the WAL commit succeeded but autocheckpoint failed.
+                    // The transaction is durable - clean up transaction state and propagate the error.
+                    tracing::warn!("Commit succeeded but autocheckpoint failed: {}", msg);
+                    if self.change_cnt_on {
+                        self.connection
+                            .set_changes(self.n_change.load(Ordering::SeqCst));
+                    }
+                    connection.set_tx_state(TransactionState::None);
+                    *commit_state = CommitState::Ready;
+                    return Err(LimboError::CheckpointFailed(msg));
+                }
+                Err(e) => return Err(e),
+            }
         } else {
             pager.rollback_tx(connection);
             IOResult::Done(PagerCommitResult::Rollback)
@@ -1325,8 +1349,8 @@ impl Program {
         }
         // Errors from nested statements are handled by the parent statement.
         if !self.connection.is_nested_stmt() && !self.is_trigger_subprogram() {
-            if err.is_some() {
-                // Any error apart from deferred FK volations causes the statement subtransaction to roll back.
+            if err.is_some() && !pager.is_checkpointing() {
+                // Any error apart from deferred FK violations and checkpoint failures causes the statement subtransaction to roll back.
                 let res =
                     state.end_statement(&self.connection, pager, EndStatement::RollbackSavepoint);
                 if let Err(e) = res {
@@ -1344,6 +1368,22 @@ impl Program {
                 // Instead individual statement subtransactions will roll back and these are handled in op_auto_commit
                 // and op_halt.
                 Some(LimboError::Constraint(_)) => {}
+                // Schema updated errors do not cause a rollback; the statement will be reprepared and retried,
+                // and the caller is expected to handle transaction cleanup explicitly if needed.
+                Some(LimboError::SchemaUpdated) => {}
+                // CheckpointFailed means the WAL commit succeeded but autocheckpoint failed.
+                // The transaction is already committed and durable, so no rollback is needed.
+                // Clean up the WAL write/read transactions that would normally be cleaned up in commit_tx().
+                Some(LimboError::CheckpointFailed(_)) => {
+                    pager.finish_commit_after_checkpoint_failure();
+                    // If a checkpoint failed, that doesn't mean the transaction is not committed;
+                    // hence: if there were schema changes, we need to update the global schema.
+                    if self.connection.get_tx_state().is_ddl_write_tx() {
+                        let schema = self.connection.schema.read().clone();
+                        self.connection.db.update_schema_if_newer(schema);
+                    }
+                    self.connection.set_tx_state(TransactionState::None);
+                }
                 _ => {
                     if state.auto_txn_cleanup != TxnCleanup::None || err.is_some() {
                         if let Some(mv_store) = self.connection.mv_store().as_ref() {

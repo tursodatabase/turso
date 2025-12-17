@@ -6,11 +6,9 @@ REPO_ROOT=$(git rev-parse --show-toplevel)
 RELEASE_BUILD_DIR="$REPO_ROOT/target/release"
 CLICKBENCH_DIR="$REPO_ROOT/perf/clickbench"
 
-# If sqlite3 doesn't exist, bail
-if ! command -v sqlite3 >/dev/null 2>&1; then
-    echo "Error: sqlite3 is not installed"
-    exit 1
-fi
+# Install sqlite3 locally if needed
+"$REPO_ROOT/scripts/install-sqlite3.sh"
+SQLITE3_BIN="$REPO_ROOT/.sqlite3/sqlite3"
 
 # Build tursodb in release mode if it's not already built
 if [ ! -f "$RELEASE_BUILD_DIR/tursodb" ]; then
@@ -43,7 +41,7 @@ fi
 
 # Import the dataset into the DB using sqlite (not tursodb, because tursodb doesn't have index insert yet)
 echo "Importing dataset..."
-sqlite3 "$CLICKBENCH_DIR/mydb" ".import --csv $CLICKBENCH_DIR/hits.csv hits"
+"$SQLITE3_BIN" "$CLICKBENCH_DIR/mydb" ".import --csv $CLICKBENCH_DIR/hits.csv hits"
 
 # Run the benchmark
 "$CLICKBENCH_DIR/run.sh"

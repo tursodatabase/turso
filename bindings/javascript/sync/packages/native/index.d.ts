@@ -231,7 +231,7 @@ export type JsPartialBootstrapStrategy =
 export interface JsPartialSyncOpts {
   bootstrapStrategy: JsPartialBootstrapStrategy
   segmentSize?: number
-  speculativeLoad?: boolean
+  prefetch?: boolean
 }
 
 export type JsProtocolRequest =

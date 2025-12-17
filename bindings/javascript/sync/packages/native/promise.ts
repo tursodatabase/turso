@@ -57,14 +57,14 @@ class Database extends DatabasePromise {
                     partialSyncOpts = {
                         bootstrapStrategy: { type: "Prefix", length: opts.partialSync.bootstrapStrategy.length },
                         segmentSize: opts.partialSync.segmentSize,
-                        speculativeLoad: opts.partialSync.speculativeLoad,
+                        prefetch: opts.partialSync.prefetch,
                     };
                     break;
                 case "query":
                     partialSyncOpts = {
                         bootstrapStrategy: { type: "Query", query: opts.partialSync.bootstrapStrategy.query },
                         segmentSize: opts.partialSync.segmentSize,
-                        speculativeLoad: opts.partialSync.speculativeLoad,
+                        prefetch: opts.partialSync.prefetch,
                     };
                     break;
             }

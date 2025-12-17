@@ -39,6 +39,7 @@ tracing-subscriber = { workspace = true, features = ["env-filter"] }
 tracing = { workspace = true }
 
 [dev-dependencies]
+similar-asserts.workspace = true
 test-log = { version = "0.2.17", features = ["trace"] }
 turso_macros.workspace = true
 

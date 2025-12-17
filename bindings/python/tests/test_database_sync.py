@@ -208,7 +208,7 @@ def test_partial_sync_segment_size():
     print(time.time() - start)
     assert conn_partial.stats().network_received_bytes > 2000 * 1024
 
-def test_partial_sync_speculative_load():
+def test_partial_sync_prefetch():
     # turso.setup_logging(level=logging.DEBUG)
 
     name = random_str()
@@ -229,7 +229,7 @@ def test_partial_sync_speculative_load():
         partial_sync_opts=turso.sync.PartialSyncOpts(
             bootstrap_strategy=turso.sync.PartialSyncPrefixBootstrap(length=128 * 1024),
             segment_size=4 * 1024,
-            speculative_load=True,
+            prefetch=True,
         ),
     )
     assert conn_partial.execute("SELECT LENGTH(x) FROM t LIMIT 1").fetchall() == [(1024,)]
