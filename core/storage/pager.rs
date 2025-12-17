@@ -355,8 +355,15 @@ enum CommitState {
     AutoCheckpoint,
 }
 
-#[derive(Clone, Debug, Default)]
-enum CheckpointState {
+#[derive(Debug, Default)]
+struct CheckpointState {
+    phase: CheckpointPhase,
+    /// The checkpoint result, set after WAL checkpoint completes
+    result: Option<CheckpointResult>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+enum CheckpointPhase {
     #[default]
     NotCheckpointing,
     Checkpoint {
@@ -366,20 +373,13 @@ enum CheckpointState {
     },
     /// Truncate the database file if everything was backfilled and file is larger than expected.
     TruncateDbFile {
-        res: CheckpointResult,
         sync_mode: crate::SyncMode,
         clear_page_cache: bool,
     },
     /// Sync the database file after checkpoint (if sync_mode != Off and we backfilled any frames from the WAL).
-    SyncDbFile {
-        res: CheckpointResult,
-        clear_page_cache: bool,
-    },
+    SyncDbFile { clear_page_cache: bool },
     /// Finalize: release guard and optionally clear page cache.
-    Finalize {
-        res: CheckpointResult,
-        clear_page_cache: bool,
-    },
+    Finalize { clear_page_cache: bool },
 }
 
 /// The mode of allocating a btree page.
@@ -641,7 +641,7 @@ impl Pager {
                 time: now,
             }),
             syncing: Arc::new(AtomicBool::new(false)),
-            checkpoint_state: RwLock::new(CheckpointState::NotCheckpointing),
+            checkpoint_state: RwLock::new(CheckpointState::default()),
             buffer_pool,
             auto_vacuum_mode: AtomicU8::new(AutoVacuumMode::None.into()),
             init_lock,
@@ -2071,14 +2071,13 @@ impl Pager {
     }
 
     pub fn is_checkpointing(&self) -> bool {
-        !matches!(
-            *self.checkpoint_state.read(),
-            CheckpointState::NotCheckpointing
-        )
+        self.checkpoint_state.read().phase != CheckpointPhase::NotCheckpointing
     }
 
     fn reset_checkpoint_state(&self) {
-        *self.checkpoint_state.write() = CheckpointState::NotCheckpointing;
+        let mut state = self.checkpoint_state.write();
+        state.phase = CheckpointPhase::NotCheckpointing;
+        state.result = None;
         self.commit_info.write().state = CommitState::PrepareWal;
     }
 
@@ -2111,117 +2110,126 @@ impl Pager {
             ));
         };
         loop {
-            let state = std::mem::take(&mut *self.checkpoint_state.write());
-            trace!(?state);
-            match state {
-                CheckpointState::NotCheckpointing => {
-                    *self.checkpoint_state.write() = CheckpointState::Checkpoint {
+            // Clone the phase to check what state we're in, but keep result in place
+            // This is important because we need to be careful not to e.g. clone and drop the checkpoint result which
+            // causes a drop of CheckpointLocks prematurely and results in a panic.
+            let phase = self.checkpoint_state.read().phase.clone();
+            match phase {
+                CheckpointPhase::NotCheckpointing => {
+                    self.checkpoint_state.write().phase = CheckpointPhase::Checkpoint {
                         mode,
                         sync_mode,
                         clear_page_cache,
                     };
                 }
-                CheckpointState::Checkpoint {
+                CheckpointPhase::Checkpoint {
                     mode,
                     sync_mode,
                     clear_page_cache,
                 } => {
-                    // Must be set back to Checkpoint in case wal.checkpoint() fails since we take() it above.
-                    *self.checkpoint_state.write() = CheckpointState::Checkpoint {
-                        mode,
-                        sync_mode,
-                        clear_page_cache,
-                    };
                     let res = return_if_io!(wal.checkpoint(self, mode));
-                    if res.num_backfilled != 0 {
+                    let mut state = self.checkpoint_state.write();
+                    if res.num_backfilled != 0
+                        && res.everything_backfilled()
+                        && matches!(mode, CheckpointMode::Truncate { .. })
+                    {
                         // If we backfilled anything, check if we need to also truncate the database file
-                        *self.checkpoint_state.write() = CheckpointState::TruncateDbFile {
-                            res,
+                        state.phase = CheckpointPhase::TruncateDbFile {
                             sync_mode,
                             clear_page_cache,
                         };
-                    } else {
+                    } else if res.num_backfilled == 0 || sync_mode == crate::SyncMode::Off {
                         // Nothing was backfilled so no need to truncate or fsync or anything else
-                        *self.checkpoint_state.write() = CheckpointState::Finalize {
-                            res,
-                            clear_page_cache,
-                        };
+                        state.phase = CheckpointPhase::Finalize { clear_page_cache };
+                    } else {
+                        state.phase = CheckpointPhase::SyncDbFile { clear_page_cache };
                     }
+                    state.result = Some(res);
                 }
-                CheckpointState::TruncateDbFile {
-                    mut res,
+                CheckpointPhase::TruncateDbFile {
                     sync_mode,
                     clear_page_cache,
                 } => {
-                    // Check if we need to truncate the database file
-                    if res.everything_backfilled() && !res.db_truncate_sent {
-                        let db_size =
-                            return_if_io!(self.with_header(|header| header.database_size)).get();
-                        let page_size = self.get_page_size().unwrap_or_default();
-                        let expected = (db_size * page_size.get()) as u64;
-                        if expected < self.db_file.size()? {
-                            let c = self.db_file.truncate(
-                                expected as usize,
-                                Completion::new_trunc(move |_| {
-                                    tracing::trace!(
-                                        "Database file truncated to expected size: {} bytes",
-                                        expected
-                                    );
-                                }),
-                            )?;
-                            // Must save updated res before yielding
-                            res.db_truncate_sent = true;
-                            *self.checkpoint_state.write() = CheckpointState::TruncateDbFile {
-                                res,
-                                sync_mode,
-                                clear_page_cache,
-                            };
-                            io_yield_one!(c);
+                    let should_skip_truncate = {
+                        let state = self.checkpoint_state.read();
+                        let result = state.result.as_ref().expect("result should be set");
+                        // Skip if we already sent truncate
+                        result.db_truncate_sent
+                    };
+
+                    if should_skip_truncate {
+                        let mut state = self.checkpoint_state.write();
+                        if sync_mode == crate::SyncMode::Off {
+                            state.phase = CheckpointPhase::Finalize { clear_page_cache };
+                        } else {
+                            state.phase = CheckpointPhase::SyncDbFile { clear_page_cache };
                         }
+                        continue;
                     }
 
-                    if sync_mode == crate::SyncMode::Off {
-                        *self.checkpoint_state.write() = CheckpointState::Finalize {
-                            res,
-                            clear_page_cache,
-                        };
-                    } else {
-                        *self.checkpoint_state.write() = CheckpointState::SyncDbFile {
-                            res,
-                            clear_page_cache,
-                        };
+                    // Truncate the database file unless already at correct size
+                    let db_size =
+                        return_if_io!(self.with_header(|header| header.database_size)).get();
+                    let page_size = self.get_page_size().unwrap_or_default();
+                    let expected = (db_size * page_size.get()) as u64;
+                    if expected >= self.db_file.size()? {
+                        // No truncation needed, move to next phase
+                        let mut state = self.checkpoint_state.write();
+                        if sync_mode == crate::SyncMode::Off {
+                            state.phase = CheckpointPhase::Finalize { clear_page_cache };
+                        } else {
+                            state.phase = CheckpointPhase::SyncDbFile { clear_page_cache };
+                        }
+                        continue;
                     }
+                    let c = self.db_file.truncate(
+                        expected as usize,
+                        Completion::new_trunc(move |_| {
+                            tracing::trace!(
+                                "Database file truncated to expected size: {} bytes",
+                                expected
+                            );
+                        }),
+                    )?;
+                    self.checkpoint_state
+                        .write()
+                        .result
+                        .as_mut()
+                        .expect("result should be set")
+                        .db_truncate_sent = true;
+                    io_yield_one!(c);
                 }
-                CheckpointState::SyncDbFile {
-                    mut res,
-                    clear_page_cache,
-                } => {
-                    if !res.db_sync_sent {
-                        let c = sqlite3_ondisk::begin_sync(
-                            self.db_file.as_ref(),
-                            self.syncing.clone(),
-                        )?;
-                        // Must save updated res before yielding
-                        res.db_sync_sent = true;
-                        *self.checkpoint_state.write() = CheckpointState::SyncDbFile {
-                            res,
-                            clear_page_cache,
-                        };
-                        io_yield_one!(c);
-                    }
-                    turso_assert!(
-                        !self.syncing.load(Ordering::SeqCst),
-                        "syncing should be done"
-                    );
-                    *self.checkpoint_state.write() = CheckpointState::Finalize {
-                        res,
-                        clear_page_cache,
+                CheckpointPhase::SyncDbFile { clear_page_cache } => {
+                    let need_sync_db_file = {
+                        let state = self.checkpoint_state.read();
+                        let result = state.result.as_ref().expect("result should be set");
+                        !result.db_sync_sent
                     };
+
+                    if !need_sync_db_file {
+                        turso_assert!(
+                            !self.syncing.load(Ordering::SeqCst),
+                            "syncing should be done"
+                        );
+                        self.checkpoint_state.write().phase =
+                            CheckpointPhase::Finalize { clear_page_cache };
+                        continue;
+                    }
+
+                    let c =
+                        sqlite3_ondisk::begin_sync(self.db_file.as_ref(), self.syncing.clone())?;
+                    self.checkpoint_state
+                        .write()
+                        .result
+                        .as_mut()
+                        .expect("result should be set")
+                        .db_sync_sent = true;
+                    io_yield_one!(c);
                 }
-                CheckpointState::Finalize {
-                    mut res,
-                    clear_page_cache,
-                } => {
+                CheckpointPhase::Finalize { clear_page_cache } => {
+                    let mut state = self.checkpoint_state.write();
+                    let mut res = state.result.take().expect("result should be set");
+
                     // Release checkpoint guard
                     res.release_guard();
 
@@ -2232,7 +2240,7 @@ impl Pager {
                         })?;
                     }
 
-                    *self.checkpoint_state.write() = CheckpointState::NotCheckpointing;
+                    state.phase = CheckpointPhase::NotCheckpointing;
                     return Ok(IOResult::Done(res));
                 }
             }
@@ -2817,7 +2825,7 @@ impl Pager {
     }
 
     fn reset_internal_states(&self) {
-        *self.checkpoint_state.write() = CheckpointState::NotCheckpointing;
+        *self.checkpoint_state.write() = CheckpointState::default();
         self.syncing.store(false, Ordering::SeqCst);
         self.commit_info.write().state = CommitState::PrepareWal;
         self.commit_info.write().time = self.io.now();
