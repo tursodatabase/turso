@@ -38,6 +38,13 @@ pub(crate) enum SimulationPhase {
     Shrink,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TransactionMode {
+    Read = 0,
+    Concurrent = 1,
+    Write = 2,
+}
+
 /// Represents a single operation during a transaction, applied in order.
 #[derive(Debug, Clone)]
 pub enum RowOperation {
@@ -76,38 +83,93 @@ pub enum RowOperation {
     },
 }
 
+/// Database snapshot
 #[derive(Debug, Clone)]
-pub struct TransactionTables {
+pub struct Snapshot {
     /// The current state after applying transaction's changes (used for reads within the transaction)
     current_tables: Vec<Table>,
     /// Operations recorded during this transaction, in order
     operations: Vec<RowOperation>,
+
+    transaction_mode: TransactionMode,
+}
+
+impl Snapshot {
+    #[inline]
+    fn set_transaction_mode(&mut self, transaction_mode: TransactionMode) {
+        self.transaction_mode = transaction_mode;
+    }
+}
+
+#[derive(Debug, Clone)]
+pub enum TransactionTables {
+    /// Signifies a Deffered transaction
+    Deffered,
+    Snapshot(Snapshot),
 }
 
 impl TransactionTables {
-    pub fn new(tables: Vec<Table>) -> Self {
-        Self {
-            current_tables: tables,
-            operations: Vec::new(),
+    #[inline]
+    fn into_snapshot(self) -> Option<Snapshot> {
+        match self {
+            TransactionTables::Deffered => None,
+            TransactionTables::Snapshot(snapshot) => Some(snapshot),
         }
     }
 
+    #[inline]
+    fn as_snaphot_opt(&self) -> Option<&Snapshot> {
+        match self {
+            TransactionTables::Deffered => None,
+            TransactionTables::Snapshot(snapshot) => Some(snapshot),
+        }
+    }
+
+    #[inline]
+    fn as_snaphot_mut_opt(&mut self) -> Option<&mut Snapshot> {
+        match self {
+            TransactionTables::Deffered => None,
+            TransactionTables::Snapshot(snapshot) => Some(snapshot),
+        }
+    }
+
+    #[inline]
+    fn as_snaphot(&self) -> &Snapshot {
+        self.as_snaphot_opt()
+            .expect("called as_snaphot on deffered transaction")
+    }
+
+    #[inline]
+    fn as_snaphot_mut(&mut self) -> &mut Snapshot {
+        self.as_snaphot_mut_opt()
+            .expect("called as_snaphot_mut on deffered transaction")
+    }
+
+    #[inline]
     pub fn record_insert(&mut self, table_name: String, row: Vec<SimValue>) {
-        self.operations
+        self.as_snaphot_mut()
+            .operations
             .push(RowOperation::Insert { table_name, row });
     }
 
+    #[inline]
     pub fn record_delete(&mut self, table_name: String, row: Vec<SimValue>) {
-        self.operations
+        self.as_snaphot_mut()
+            .operations
             .push(RowOperation::Delete { table_name, row });
     }
 
+    #[inline]
     pub fn record_drop_table(&mut self, table_name: String) {
-        self.operations.push(RowOperation::DropTable { table_name });
+        self.as_snaphot_mut()
+            .operations
+            .push(RowOperation::DropTable { table_name });
     }
 
+    #[inline]
     pub fn record_rename_table(&mut self, old_name: String, new_name: String) {
-        self.operations
+        self.as_snaphot_mut()
+            .operations
             .push(RowOperation::RenameTable { old_name, new_name });
     }
 
@@ -116,23 +178,28 @@ impl TransactionTables {
         table_name: String,
         column: sql_generation::model::table::Column,
     ) {
-        self.operations
+        self.as_snaphot_mut()
+            .operations
             .push(RowOperation::AddColumn { table_name, column });
     }
 
     pub fn record_drop_column(&mut self, table_name: String, column_index: usize) {
-        self.operations.push(RowOperation::DropColumn {
-            table_name,
-            column_index,
-        });
+        self.as_snaphot_mut()
+            .operations
+            .push(RowOperation::DropColumn {
+                table_name,
+                column_index,
+            });
     }
 
     pub fn record_rename_column(&mut self, table_name: String, old_name: String, new_name: String) {
-        self.operations.push(RowOperation::RenameColumn {
-            table_name,
-            old_name,
-            new_name,
-        });
+        self.as_snaphot_mut()
+            .operations
+            .push(RowOperation::RenameColumn {
+                table_name,
+                old_name,
+                new_name,
+            });
     }
 
     pub fn record_alter_column(
@@ -141,11 +208,13 @@ impl TransactionTables {
         old_name: String,
         new_column: sql_generation::model::table::Column,
     ) {
-        self.operations.push(RowOperation::AlterColumn {
-            table_name,
-            old_name,
-            new_column,
-        });
+        self.as_snaphot_mut()
+            .operations
+            .push(RowOperation::AlterColumn {
+                table_name,
+                old_name,
+                new_column,
+            });
     }
 }
 
@@ -164,6 +233,7 @@ pub struct ShadowTablesMut<'a> {
 impl<'a> ShadowTables<'a> {
     fn tables(&self) -> &'a Vec<Table> {
         self.transaction_tables
+            .and_then(|v| v.as_snaphot_opt())
             .map_or(self.commited_tables, |v| &v.current_tables)
     }
 }
@@ -183,15 +253,21 @@ where
     fn tables(&'a self) -> &'a Vec<Table> {
         self.transaction_tables
             .as_ref()
-            .map(|t| &t.current_tables)
-            .unwrap_or(self.commited_tables)
+            .map_or(self.commited_tables, |v| {
+                // Want to panic here with `as_snapshot_mut` because
+                // we don't want to accidently return a the commited tables on deffered transactions
+                &v.as_snaphot().current_tables
+            })
     }
 
     fn tables_mut(&'b mut self) -> &'b mut Vec<Table> {
         self.transaction_tables
             .as_mut()
-            .map(|t| &mut t.current_tables)
-            .unwrap_or(self.commited_tables)
+            .map_or(self.commited_tables, |v| {
+                // Want to panic here with `as_snapshot_mut` because
+                // we don't want to accidently return a the commited tables on deffered transactions
+                &mut v.as_snaphot_mut().current_tables
+            })
     }
 
     /// Record that a row was inserted during the current transaction
@@ -259,12 +335,60 @@ where
         }
     }
 
-    pub fn create_snapshot(&mut self) {
-        *self.transaction_tables = Some(TransactionTables::new(self.commited_tables.clone()));
+    /// Tries to upgrade the Transaction Mode
+    #[inline]
+    pub fn upgrade_transaction(&mut self, query: &Query) {
+        let transaction_mode = if query.is_write() {
+            TransactionMode::Write
+        } else if query.is_select() {
+            TransactionMode::Read
+        } else {
+            return;
+        };
+        if let Some(txn) = self.transaction_tables.as_mut() {
+            match txn {
+                TransactionTables::Deffered => self.create_snapshot(transaction_mode),
+                TransactionTables::Snapshot(snapshot) => {
+                    match (snapshot.transaction_mode, transaction_mode) {
+                        (_, TransactionMode::Concurrent) => {
+                            unreachable!();
+                        }
+                        (TransactionMode::Read, TransactionMode::Write) => {
+                            snapshot.set_transaction_mode(transaction_mode)
+                        }
+                        (TransactionMode::Concurrent, TransactionMode::Write) => {
+                            if query.is_ddl() {
+                                // Only upgrade on DDL for MVCC
+                                snapshot.set_transaction_mode(transaction_mode)
+                            }
+                        }
+                        _ => {}
+                    };
+                }
+            }
+        }
+    }
+
+    #[inline]
+    pub fn create_deffered_snapshot(&mut self) {
+        *self.transaction_tables = Some(TransactionTables::Deffered);
+    }
+
+    #[inline]
+    pub fn create_snapshot(&mut self, transaction_mode: TransactionMode) {
+        *self.transaction_tables = Some(TransactionTables::Snapshot(Snapshot {
+            current_tables: self.commited_tables.clone(),
+            operations: Vec::new(),
+            transaction_mode,
+        }));
     }
 
     pub fn apply_snapshot(&mut self) {
-        if let Some(transaction_tables) = self.transaction_tables.take() {
+        if let Some(transaction_tables) = self
+            .transaction_tables
+            .take()
+            .and_then(|transaction_tables| transaction_tables.into_snapshot())
+        {
             // Apply all operations in recorded order.
             // This ensures operations like ADD COLUMN, DELETE are applied correctly
             // where DELETE sees rows with the same shape as when it was recorded.
