@@ -18,6 +18,7 @@ use sql_generation::model::{
 };
 use turso_parser::ast::Distinctness;
 
+use crate::runner::env::TransactionMode;
 use crate::{generation::Shadow, runner::env::ShadowTablesMut};
 
 pub mod interactions;
@@ -146,6 +147,16 @@ impl Query {
     pub fn is_dml(&self) -> bool {
         matches!(self, Self::Insert(..) | Self::Update(..) | Self::Delete(..))
     }
+
+    #[inline]
+    pub fn is_write(&self) -> bool {
+        self.is_ddl() || self.is_dml()
+    }
+
+    #[inline]
+    pub fn is_select(&self) -> bool {
+        matches!(self, Self::Select(_))
+    }
 }
 
 impl Display for Query {
@@ -173,6 +184,9 @@ impl Shadow for Query {
     type Result = anyhow::Result<Vec<Vec<SimValue>>>;
 
     fn shadow(&self, env: &mut ShadowTablesMut) -> Self::Result {
+        // First check if we are not in a deffered transaction, if we are create a snapshot
+        env.upgrade_transaction(self);
+
         match self {
             Query::Create(create) => create.shadow(env),
             Query::Insert(insert) => insert.shadow(env),
@@ -571,9 +585,18 @@ impl Shadow for Select {
 impl Shadow for Begin {
     type Result = Vec<Vec<SimValue>>;
     fn shadow(&self, tables: &mut ShadowTablesMut) -> Self::Result {
-        // FIXME: currently the snapshot is taken eagerly
-        // this is wrong for Deffered transactions
-        tables.create_snapshot();
+        match self {
+            Begin::Deferred => {
+                tables.create_deffered_snapshot();
+            }
+            Begin::Immediate => {
+                tables.create_snapshot(TransactionMode::Write);
+            }
+            Begin::Concurrent => {
+                tables.create_snapshot(TransactionMode::Concurrent);
+            }
+        };
+
         vec![]
     }
 }
