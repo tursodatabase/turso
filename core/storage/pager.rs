@@ -352,11 +352,7 @@ enum CommitState {
     WalCommitDone,
     /// Checkpoint the WAL to the database file (if needed).
     /// This is decoupled from commit - checkpoint failure does not affect commit durability.
-    Checkpoint,
-    /// Fsync the database file after checkpoint.
-    SyncDbFile,
-    /// Wait for database file sync to complete.
-    WaitSyncDbFile,
+    AutoCheckpoint,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -403,7 +399,6 @@ pub enum BtreePageAllocMode {
 /// This will keep track of the state of current cache commit in order to not repeat work
 struct CommitInfo {
     completions: Vec<Completion>,
-    result: Option<PagerCommitResult>,
     state: CommitState,
     time: crate::io::clock::Instant,
 }
@@ -641,7 +636,6 @@ impl Pager {
             subjournal: RwLock::new(None),
             savepoints: Arc::new(RwLock::new(Vec::new())),
             commit_info: RwLock::new(CommitInfo {
-                result: None,
                 completions: Vec::new(),
                 state: CommitState::PrepareWal,
                 time: now,
@@ -1962,14 +1956,14 @@ impl Pager {
                     if wal_auto_checkpoint_disabled || !wal.should_checkpoint() {
                         return Ok(IOResult::Done(PagerCommitResult::WalWritten));
                     }
-                    self.commit_info.write().state = CommitState::Checkpoint;
+                    self.commit_info.write().state = CommitState::AutoCheckpoint;
                 }
-                CommitState::Checkpoint => {
-                    // Auto-checkpoint uses Passive mode. clear_page_cache=false since auto-checkpoint
-                    // does NOT clear page cache (only explicit checkpoints do).
+                CommitState::AutoCheckpoint => {
+                    // Auto-checkpoint uses Passive mode. Sync is handled by checkpoint() based on sync_mode.
                     let checkpoint_mode = CheckpointMode::Passive {
                         upper_bound_inclusive: None,
                     };
+                    // Auto-checkpoint does NOT clear page cache (only explicit checkpoints do)
                     match self.checkpoint(checkpoint_mode, sync_mode, false) {
                         Err(LimboError::Busy) => {
                             // Auto-checkpoint during commit uses Passive mode, which can return
@@ -1990,80 +1984,22 @@ impl Pager {
                             tracing::error!("Auto-checkpoint failed: {}", e);
                             return Err(LimboError::CheckpointFailed(e.to_string()));
                         }
-                        Ok(IOResult::IO(cmp)) => {
-                            let completion = {
-                                let mut commit_info = self.commit_info.write();
-                                match cmp {
-                                    IOCompletions::Single(c) => {
-                                        commit_info.completions.push(c);
-                                    }
-                                }
-                                let mut group = CompletionGroup::new(|_| {});
-                                for c in commit_info.completions.drain(..) {
-                                    group.add(&c);
-                                }
-                                group.build()
-                            };
-                            // TODO: remove serialization of checkpoint path
-                            io_yield_one!(completion);
+                        Ok(IOResult::IO(IOCompletions::Single(c))) => {
+                            io_yield_one!(c);
                         }
                         Ok(IOResult::Done(res)) => {
-                            let mut commit_info = self.commit_info.write();
-                            commit_info.result = Some(PagerCommitResult::Checkpointed(res));
-                            // Skip sync if synchronous mode is OFF
-                            if sync_mode == crate::SyncMode::Off {
-                                commit_info.state = CommitState::WaitSyncDbFile;
-                            } else {
-                                commit_info.state = CommitState::SyncDbFile;
-                            }
+                            tracing::debug!(
+                                "total time flushing cache: {} ms",
+                                self.io
+                                    .now()
+                                    .to_system_time()
+                                    .duration_since(self.commit_info.read().time.to_system_time())
+                                    .unwrap()
+                                    .as_millis()
+                            );
+                            return Ok(IOResult::Done(PagerCommitResult::Checkpointed(res)));
                         }
                     }
-                }
-                CommitState::SyncDbFile => {
-                    let sync_result =
-                        sqlite3_ondisk::begin_sync(self.db_file.as_ref(), self.syncing.clone());
-                    self.commit_info
-                        .write()
-                        .completions
-                        .push(match sync_result {
-                            Ok(c) => c,
-                            Err(e) if !data_sync_retry => {
-                                panic!("fsync error on database file (data_sync_retry=off): {e:?}");
-                            }
-                            Err(e) => {
-                                return Err(LimboError::CheckpointFailed(e.to_string()));
-                            }
-                        });
-                    self.commit_info.write().state = CommitState::WaitSyncDbFile;
-                }
-                CommitState::WaitSyncDbFile => {
-                    tracing::debug!(
-                        "total time flushing cache: {} ms",
-                        self.io
-                            .now()
-                            .to_system_time()
-                            .duration_since(self.commit_info.read().time.to_system_time())
-                            .unwrap()
-                            .as_millis()
-                    );
-                    let (should_finish, result, completion) = {
-                        let mut commit_info = self.commit_info.write();
-                        if commit_info.completions.iter().all(|c| c.succeeded()) {
-                            commit_info.completions.clear();
-                            commit_info.state = CommitState::PrepareWal;
-                            (true, commit_info.result.take(), Completion::new_yield())
-                        } else {
-                            let mut group = CompletionGroup::new(|_| {});
-                            for c in commit_info.completions.drain(..) {
-                                group.add(&c);
-                            }
-                            (false, None, group.build())
-                        }
-                    };
-                    if should_finish {
-                        return Ok(IOResult::Done(result.expect("commit result should be set")));
-                    }
-                    io_yield_one!(completion);
                 }
             }
         }
