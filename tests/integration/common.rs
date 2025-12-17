@@ -496,7 +496,6 @@ pub fn run_query_core(
     Ok(())
 }
 
-#[allow(dead_code)]
 pub fn rusqlite_integrity_check(db_path: &Path) -> anyhow::Result<()> {
     let conn = rusqlite::Connection::open(db_path)?;
     let mut stmt = conn.prepare("SELECT * FROM pragma_integrity_check;")?;

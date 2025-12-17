@@ -1087,7 +1087,11 @@ impl Limbo {
                     .with_thread_ids(true)
                     .with_ansi(should_emit_ansi),
             )
-            .with(EnvFilter::from_default_env().add_directive("rustyline=off".parse().unwrap()))
+            .with(
+                EnvFilter::from_default_env()
+                    .add_directive(tracing::level_filters::LevelFilter::WARN.into())
+                    .add_directive("rustyline=off".parse().unwrap()),
+            )
             .try_init()
         {
             println!("Unable to setup tracing appender: {e:?}");
