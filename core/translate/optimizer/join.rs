@@ -179,7 +179,7 @@ pub fn join_lhs_and_rhs<'a>(
             };
             let preserves = plan_satisfies_order_target(
                 &tmp_plan,
-                &access_methods_arena,
+                access_methods_arena,
                 joined_tables,
                 order_target,
             );

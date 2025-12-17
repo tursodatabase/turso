@@ -273,7 +273,7 @@ fn expr_to_column_order(
     order: SortOrder,
     tables: &TableReferences,
 ) -> Option<ColumnOrder> {
-    match &*expr {
+    match expr {
         ast::Expr::Column {
             table: table_id,
             column,

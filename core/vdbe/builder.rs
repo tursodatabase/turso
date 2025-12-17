@@ -189,7 +189,7 @@ impl CursorType {
                             if let Some(coll) = col.collation_opt() {
                                 format!("{coll}")
                             } else {
-                                format!("B")
+                                "B".to_string()
                             }
                         })
                         .collect::<Vec<_>>()

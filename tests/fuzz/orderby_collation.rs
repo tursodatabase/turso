@@ -67,8 +67,7 @@ mod tests {
 
             if !valid {
                 return Err(format!(
-                    "Ordering violation at index {}: '{}' vs '{}' (collation: {}, desc: {})",
-                    i, prev_str, curr_str, collation, descending
+                    "Ordering violation at index {i}: '{prev_str}' vs '{curr_str}' (collation: {collation}, desc: {descending})"
                 ));
             }
         }
@@ -99,8 +98,8 @@ mod tests {
         // Verify same multiset of rows (same rows, possibly different order for equal elements)
         let mut turso_sorted = turso_rows.to_vec();
         let mut sqlite_sorted = sqlite_rows.to_vec();
-        turso_sorted.sort_by(|a, b| format!("{:?}", a).cmp(&format!("{:?}", b)));
-        sqlite_sorted.sort_by(|a, b| format!("{:?}", a).cmp(&format!("{:?}", b)));
+        turso_sorted.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
+        sqlite_sorted.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
 
         if turso_sorted != sqlite_sorted {
             return Err("Row content mismatch: different rows returned".to_string());
