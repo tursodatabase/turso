@@ -70,7 +70,7 @@ impl CheckpointResult {
     }
 }
 
-#[derive(Debug, Copy, Clone, EnumString)]
+#[derive(Debug, Copy, Clone, PartialEq, EnumString)]
 #[strum(ascii_case_insensitive)]
 pub enum CheckpointMode {
     /// Checkpoint as many frames as possible without waiting for any database readers or writers to finish, then sync the database file if all frames in the log were checkpointed.
