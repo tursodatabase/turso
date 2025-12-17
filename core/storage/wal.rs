@@ -1577,11 +1577,6 @@ impl Wal for WalFile {
         let first_frame_id = self.max_frame.load(Ordering::Acquire) + 1;
         let start_off = self.frame_offset(first_frame_id);
 
-        // pre-advance in-memory WAL state
-        for (page, fid, csum) in &page_frame_and_checksum {
-            self.complete_append_frame(page.get().id as u64, *fid, *csum);
-        }
-
         // single completion for the whole batch
         let total_len: i32 = iovecs.iter().map(|b| b.len() as i32).sum();
         let page_frame_for_cb = page_frame_and_checksum.clone();
@@ -1607,6 +1602,13 @@ impl Wal for WalFile {
             shared.file.as_ref().unwrap().clone()
         });
         let c = file.pwritev(start_off, iovecs, c)?;
+
+        self.io.drain()?;
+
+        for (page, fid, csum) in &page_frame_and_checksum {
+            self.complete_append_frame(page.get().id as u64, *fid, *csum);
+        }
+
         Ok(c)
     }
 
