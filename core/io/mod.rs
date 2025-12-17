@@ -122,7 +122,7 @@ impl TempFile {
         #[cfg(not(target_family = "wasm"))]
         {
             let temp_dir = tempfile::tempdir()?;
-            let chunk_file_path = temp_dir.as_ref().join("temp_file");
+            let chunk_file_path = temp_dir.as_ref().join("tursodb_temp_file");
             let chunk_file_path_str = chunk_file_path.to_str().ok_or_else(|| {
                 crate::LimboError::InternalError("temp file path is not valid UTF-8".to_string())
             })?;
@@ -132,12 +132,14 @@ impl TempFile {
                 file: chunk_file.clone(),
             })
         }
+        // on WASM in browser we do not support temp files (as we pre-register db files in advance and can't easily create a new one)
+        // so, for now, we use in-memory IO for tempfiles in WASM
         #[cfg(target_family = "wasm")]
         {
             use crate::MemoryIO;
 
             let memory_io = Arc::new(MemoryIO::new());
-            let memory_file = memory_io.open_file("temp_file", OpenFlags::Create, false)?;
+            let memory_file = memory_io.open_file("tursodb_temp_file", OpenFlags::Create, false)?;
             Ok(TempFile {
                 _temp_dir: None,
                 file: memory_file,
