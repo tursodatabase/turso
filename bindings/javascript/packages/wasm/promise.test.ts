@@ -229,3 +229,13 @@ test('example-2', async () => {
         { name: 'Bob', email: 'bob@example.com' }
     ]);
 })
+
+test('sorter-wasm', async () => {
+    const db = await connect(':memory:');
+    await db.exec('CREATE TABLE t (k, v)');
+    for (let i = 0; i < 1024; i++) {
+        await db.exec(`INSERT INTO t VALUES (${i}, randomblob(10 * 1024))`);
+    }
+
+    console.info(await db.prepare("SELECT length(v) FROM (SELECT v FROM t ORDER BY k)").all());
+})
