@@ -8,6 +8,8 @@ pub mod execution;
 #[expect(dead_code)]
 pub mod file;
 pub mod io;
+#[cfg(target_os = "linux")]
+pub mod io_uring;
 pub mod memory;
 
 pub const FAULT_ERROR_MSG: &str = "Injected Fault";

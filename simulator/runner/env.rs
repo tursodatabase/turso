@@ -19,7 +19,10 @@ use crate::generation::Shadow;
 use crate::model::Query;
 use crate::profiles::Profile;
 use crate::runner::SimIO;
+use crate::runner::cli::IoBackend;
 use crate::runner::io::SimulatorIO;
+#[cfg(target_os = "linux")]
+use crate::runner::io_uring::UringSimIO;
 use crate::runner::memory::io::MemorySimIO;
 const DEFAULT_CACHE_SIZE: usize = 2000;
 use super::cli::SimulatorCLI;
@@ -306,7 +309,7 @@ pub(crate) struct SimulatorEnv {
     pub(crate) paths: Paths,
     pub(crate) type_: SimulationType,
     pub(crate) phase: SimulationPhase,
-    pub memory_io: bool,
+    pub io_backend: IoBackend,
 
     /// If connection state is None, means we are not in a transaction
     pub connection_tables: Vec<Option<TransactionTables>>,
@@ -333,7 +336,7 @@ impl SimulatorEnv {
             paths: self.paths.clone(),
             type_: self.type_,
             phase: self.phase,
-            memory_io: self.memory_io,
+            io_backend: self.io_backend,
             profile: self.profile.clone(),
             connections: (0..self.connections.len())
                 .map(|_| SimConnection::Disconnected)
@@ -352,16 +355,15 @@ impl SimulatorEnv {
 
         let latency_prof = &self.profile.io.latency;
 
-        let io: Arc<dyn SimIO> = if self.memory_io {
-            Arc::new(MemorySimIO::new(
+        let io: Arc<dyn SimIO> = match self.io_backend {
+            IoBackend::Memory => Arc::new(MemorySimIO::new(
                 self.opts.seed,
                 self.opts.page_size,
                 latency_prof.latency_probability,
                 latency_prof.min_tick,
                 latency_prof.max_tick,
-            ))
-        } else {
-            Arc::new(
+            )),
+            IoBackend::Default => Arc::new(
                 SimulatorIO::new(
                     self.opts.seed,
                     self.opts.page_size,
@@ -370,7 +372,18 @@ impl SimulatorEnv {
                     latency_prof.max_tick,
                 )
                 .unwrap(),
-            )
+            ),
+            #[cfg(target_os = "linux")]
+            IoBackend::IoUring => Arc::new(
+                UringSimIO::new(
+                    self.opts.seed,
+                    self.opts.page_size,
+                    latency_prof.latency_probability,
+                    latency_prof.min_tick,
+                    latency_prof.max_tick,
+                )
+                .unwrap(),
+            ),
         };
 
         // Remove existing database file
@@ -511,16 +524,16 @@ impl SimulatorEnv {
 
         let latency_prof = &profile.io.latency;
 
-        let io: Arc<dyn SimIO> = if cli_opts.memory_io {
-            Arc::new(MemorySimIO::new(
+        let io_backend = cli_opts.effective_io_backend();
+        let io: Arc<dyn SimIO> = match io_backend {
+            IoBackend::Memory => Arc::new(MemorySimIO::new(
                 seed,
                 opts.page_size,
                 latency_prof.latency_probability,
                 latency_prof.min_tick,
                 latency_prof.max_tick,
-            ))
-        } else {
-            Arc::new(
+            )),
+            IoBackend::Default => Arc::new(
                 SimulatorIO::new(
                     seed,
                     opts.page_size,
@@ -529,7 +542,18 @@ impl SimulatorEnv {
                     latency_prof.max_tick,
                 )
                 .unwrap(),
-            )
+            ),
+            #[cfg(target_os = "linux")]
+            IoBackend::IoUring => Arc::new(
+                UringSimIO::new(
+                    seed,
+                    opts.page_size,
+                    latency_prof.latency_probability,
+                    latency_prof.min_tick,
+                    latency_prof.max_tick,
+                )
+                .unwrap(),
+            ),
         };
 
         let db = match Database::open_file_with_flags(
@@ -561,7 +585,7 @@ impl SimulatorEnv {
             db: Some(db),
             type_: simulation_type,
             phase: SimulationPhase::Test,
-            memory_io: cli_opts.memory_io,
+            io_backend,
             profile: profile.clone(),
             committed_tables: Vec::new(),
             connection_tables: vec![None; profile.max_connections],
