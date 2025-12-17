@@ -237,5 +237,19 @@ test('sorter-wasm', async () => {
         await db.exec(`INSERT INTO t VALUES (${i}, randomblob(10 * 1024))`);
     }
 
-    console.info(await db.prepare("SELECT length(v) FROM (SELECT v FROM t ORDER BY k)").all());
+    expect(await db.prepare("SELECT length(v) as l FROM (SELECT v FROM t ORDER BY k)").all()).toEqual(new Array(1024).fill({ l: 10 * 1024 }));
+})
+
+test('hash-join-wasm', { timeout: 60_000 }, async () => {
+    const db = await connect(':memory:');
+    await db.exec('CREATE TABLE a (k, v)');
+    await db.exec('CREATE TABLE b (k, v)');
+    for (let i = 0; i < 1024; i++) {
+        await db.exec(`INSERT INTO a VALUES (${i}, randomblob(100 * 1024))`);
+    }
+    for (let i = 0; i < 1024; i++) {
+        await db.exec(`INSERT INTO b VALUES (${i}, randomblob(100 * 1024))`);
+    }
+
+    expect(await db.prepare("SELECT length(a) as a, length(b) as b FROM (SELECT a.v as a, b.v as b FROM a INNER JOIN b ON a.k = b.k)").all()).toEqual(new Array(1024).fill({ a: 100 * 1024, b: 100 * 1024 }));
 })
