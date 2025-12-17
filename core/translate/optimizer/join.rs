@@ -2248,6 +2248,7 @@ mod tests {
             Some(c.name.clone()),
             c.ty.to_string(),
             None,
+            None,
             c.ty,
             None,
             ColDef {

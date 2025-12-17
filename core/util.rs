@@ -1399,6 +1399,7 @@ pub fn extract_view_columns(
                                         Some(final_name),
                                         table_column.ty_str.clone(),
                                         None,
+                                        None,
                                         table_column.ty(),
                                         table_column.collation_opt(),
                                         ColDef::default(),
@@ -1444,6 +1445,7 @@ pub fn extract_view_columns(
                                     column: Column::new(
                                         Some(final_name),
                                         table_column.ty_str.clone(),
+                                        None,
                                         None,
                                         table_column.ty(),
                                         table_column.collation_opt(),

@@ -837,6 +837,7 @@ pub fn translate_drop_table(
                 Some("rowid".to_string()),
                 "INTEGER".to_string(),
                 None,
+                None,
                 Type::Integer,
                 None,
                 ColDef::default(),
