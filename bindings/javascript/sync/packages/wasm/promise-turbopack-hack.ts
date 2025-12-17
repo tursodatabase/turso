@@ -51,6 +51,25 @@ class Database extends DatabasePromise {
             return;
         }
 
+        let partialSyncOpts = undefined;
+        if (opts.partialSync != null) {
+            switch (opts.partialSync.bootstrapStrategy.kind) {
+                case "prefix":
+                    partialSyncOpts = {
+                        bootstrapStrategy: { type: "Prefix", length: opts.partialSync.bootstrapStrategy.length },
+                        segmentSize: opts.partialSync.segmentSize,
+                        prefetch: opts.partialSync.prefetch,
+                    };
+                    break;
+                case "query":
+                    partialSyncOpts = {
+                        bootstrapStrategy: { type: "Query", query: opts.partialSync.bootstrapStrategy.query },
+                        segmentSize: opts.partialSync.segmentSize,
+                        prefetch: opts.partialSync.prefetch,
+                    };
+                    break;
+            }
+        }
         const engine = new SyncEngine({
             path: opts.path,
             clientName: opts.clientName,
