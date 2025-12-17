@@ -5218,8 +5218,8 @@ impl CursorTrait for BTreeCursor {
                     };
 
                     let page = self.stack.top_ref();
-                    let writable = self.pager.add_dirty(page)?;
-                    let contents = writable.contents_mut();
+                    turso_assert!(page.is_dirty(), "page must be set to dirty in DeleteState::Start");
+                    let contents = page.get_contents_mut_unsafe_dont_use();
 
                     if !contents.is_leaf() {
                         self.state = CursorState::Delete(DeleteState::InteriorNodeReplacement {
