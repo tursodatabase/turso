@@ -7,7 +7,10 @@ TPCH_DIR="$REPO_ROOT/perf/tpc-h"
 DB_FILE="$TPCH_DIR/TPC-H.db"
 QUERIES_DIR="$TPCH_DIR/queries"
 LIMBO_BIN="$RELEASE_BUILD_DIR/tursodb"
-SQLITE_BIN="sqlite3" # Assuming sqlite3 is in PATH
+
+# Install sqlite3 locally if needed
+"$REPO_ROOT/scripts/install-sqlite3.sh"
+SQLITE_BIN="$REPO_ROOT/.sqlite3/sqlite3"
 
 # Function to clear system caches based on OS
 clear_caches() {
@@ -92,8 +95,9 @@ if [ ! -f "$LIMBO_BIN" ]; then
 fi
 
 # Ensure the SQLite binary exists
-if ! command -v $SQLITE_BIN >/dev/null 2>&1; then
-    echo "Error: sqlite3 command not found. Please install sqlite3."
+if [ ! -x "$SQLITE_BIN" ]; then
+    echo "Error: sqlite3 binary not found at $SQLITE_BIN"
+    echo "Please run scripts/install-sqlite3.sh first."
     exit 1
 fi
 

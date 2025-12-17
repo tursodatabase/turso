@@ -27,7 +27,7 @@ pub struct PyTursoPartialSyncOpts {
     // query bootstrap strategy which will enable partial sync which lazily pull necessary pages on demand and bootstrap db with pages touched by the server with given SQL query
     pub bootstrap_strategy_query: Option<String>,
     pub segment_size: Option<usize>,
-    pub speculative_load: Option<bool>,
+    pub prefetch: Option<bool>,
 }
 
 #[pymethods]
@@ -37,19 +37,19 @@ impl PyTursoPartialSyncOpts {
         bootstrap_strategy_prefix=None,
         bootstrap_strategy_query=None,
         segment_size=None,
-        speculative_load=None,
+        prefetch=None,
     ))]
     fn new(
         bootstrap_strategy_prefix: Option<usize>,
         bootstrap_strategy_query: Option<String>,
         segment_size: Option<usize>,
-        speculative_load: Option<bool>,
+        prefetch: Option<bool>,
     ) -> Self {
         Self {
             bootstrap_strategy_prefix,
             bootstrap_strategy_query,
             segment_size,
-            speculative_load,
+            prefetch,
         }
     }
 }
@@ -124,7 +124,7 @@ pub fn py_turso_sync_new(
                     Some(PartialSyncOpts {
                         bootstrap_strategy: PartialBootstrapStrategy::Prefix { length },
                         segment_size: config.segment_size.unwrap_or(0),
-                        speculative_load: config.speculative_load.unwrap_or(false),
+                        prefetch: config.prefetch.unwrap_or(false),
                     })
                 } else {
                     config
@@ -135,7 +135,7 @@ pub fn py_turso_sync_new(
                                 query: query.clone(),
                             },
                             segment_size: config.segment_size.unwrap_or(0),
-                            speculative_load: config.speculative_load.unwrap_or(false),
+                            prefetch: config.prefetch.unwrap_or(false),
                         })
                 }
             }

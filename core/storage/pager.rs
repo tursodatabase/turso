@@ -344,21 +344,26 @@ enum CommitState {
     /// Get DB size (mostly from page cache - but in rare cases we can read it from disk)
     GetDbSize,
     /// Appends all frames to the WAL.
-    PrepareFrames {
-        db_size: u32,
-    },
+    PrepareFrames { db_size: u32 },
     /// Fsync the on-disk WAL.
     SyncWal,
+    /// Wait for WAL sync to complete and finalize the WAL commit.
+    /// After this state, the write transaction is durable.
+    /// If autocheckpoint is enabled and the autocheckpoint threshold is reached, checkpoint will be attempted.
+    WalCommitDone,
     /// Checkpoint the WAL to the database file (if needed).
+    /// This is decoupled from commit - checkpoint failure does not affect commit durability.
     Checkpoint,
-    /// Fsync the database file.
+    /// Fsync the database file after checkpoint.
     SyncDbFile,
-    Done,
+    /// Wait for database file sync to complete.
+    WaitSyncDbFile,
 }
 
 #[derive(Clone, Debug, Default)]
 enum CheckpointState {
     #[default]
+    NotCheckpointing,
     Checkpoint,
     SyncDbFile {
         res: CheckpointResult,
@@ -634,7 +639,7 @@ impl Pager {
                 time: now,
             }),
             syncing: Arc::new(AtomicBool::new(false)),
-            checkpoint_state: RwLock::new(CheckpointState::Checkpoint),
+            checkpoint_state: RwLock::new(CheckpointState::NotCheckpointing),
             buffer_pool,
             auto_vacuum_mode: AtomicU8::new(AutoVacuumMode::None.into()),
             init_lock,
@@ -1908,23 +1913,12 @@ impl Pager {
                     if completions.is_empty() {
                         return Ok(IOResult::Done(PagerCommitResult::WalWritten));
                     } else {
-                        // Skip sync if synchronous mode is OFF
+                        let mut commit_info = self.commit_info.write();
+                        commit_info.completions = completions;
+                        // Skip sync if synchronous mode is OFF, go directly to WalCommitDone
                         if sync_mode == crate::SyncMode::Off {
-                            if wal_auto_checkpoint_disabled || !wal.borrow().should_checkpoint() {
-                                let mut commit_info = self.commit_info.write();
-                                commit_info.completions = completions;
-                                commit_info.result = Some(PagerCommitResult::WalWritten);
-                                commit_info.state = CommitState::Done;
-                                continue;
-                            }
-                            {
-                                let mut commit_info = self.commit_info.write();
-                                commit_info.completions = completions;
-                                commit_info.state = CommitState::Checkpoint;
-                            }
+                            commit_info.state = CommitState::WalCommitDone;
                         } else {
-                            let mut commit_info = self.commit_info.write();
-                            commit_info.completions = completions;
                             commit_info.state = CommitState::SyncWal;
                         }
                     }
@@ -1939,11 +1933,31 @@ impl Pager {
                         Err(e) => return Err(e),
                     };
                     self.commit_info.write().completions.push(c);
+                    self.commit_info.write().state = CommitState::WalCommitDone;
+                }
+                CommitState::WalCommitDone => {
+                    let pending_io = {
+                        let commit_info = self.commit_info.read();
+                        !commit_info.completions.iter().all(|c| c.succeeded())
+                    };
+                    if pending_io {
+                        let completion = {
+                            let mut commit_info = self.commit_info.write();
+                            let mut group = CompletionGroup::new(|_| {});
+                            for c in commit_info.completions.drain(..) {
+                                group.add(&c);
+                            }
+                            group.build()
+                        };
+                        io_yield_one!(completion);
+                    }
+                    // WAL sync is complete - finalize the WAL commit
+                    // After this point, the write transaction is durable regardless of checkpoint outcome
+                    self.commit_info.write().completions.clear();
+                    wal.borrow_mut().finish_append_frames_commit()?;
+
                     if wal_auto_checkpoint_disabled || !wal.borrow().should_checkpoint() {
-                        let mut commit_info = self.commit_info.write();
-                        commit_info.result = Some(PagerCommitResult::WalWritten);
-                        commit_info.state = CommitState::Done;
-                        continue;
+                        return Ok(IOResult::Done(PagerCommitResult::WalWritten));
                     }
                     self.commit_info.write().state = CommitState::Checkpoint;
                 }
@@ -1958,11 +1972,16 @@ impl Pager {
                             // frames are already written, so the commit succeeds. Checkpoint will
                             // happen later when conditions allow.
                             tracing::debug!("Auto-checkpoint skipped due to busy (lock conflict)");
-                            let mut commit_info = self.commit_info.write();
-                            commit_info.result = Some(PagerCommitResult::WalWritten);
-                            commit_info.state = CommitState::Done;
+                            // WAL commit is already finalized in WalCommitDone, just return success
+                            return Ok(IOResult::Done(PagerCommitResult::WalWritten));
                         }
-                        Err(e) => return Err(e),
+                        Err(e) => {
+                            // Checkpoint failed but WAL commit is already finalized (durable).
+                            // Return CheckpointFailed to inform caller that commit succeeded
+                            // but autocheckpoint failed.
+                            tracing::error!("Auto-checkpoint failed: {}", e);
+                            return Err(LimboError::CheckpointFailed(e.to_string()));
+                        }
                         Ok(IOResult::IO(cmp)) => {
                             let completion = {
                                 let mut commit_info = self.commit_info.write();
@@ -1985,7 +2004,7 @@ impl Pager {
                             commit_info.result = Some(PagerCommitResult::Checkpointed(res));
                             // Skip sync if synchronous mode is OFF
                             if sync_mode == crate::SyncMode::Off {
-                                commit_info.state = CommitState::Done;
+                                commit_info.state = CommitState::WaitSyncDbFile;
                             } else {
                                 commit_info.state = CommitState::SyncDbFile;
                             }
@@ -2003,11 +2022,13 @@ impl Pager {
                             Err(e) if !data_sync_retry => {
                                 panic!("fsync error on database file (data_sync_retry=off): {e:?}");
                             }
-                            Err(e) => return Err(e),
+                            Err(e) => {
+                                return Err(LimboError::CheckpointFailed(e.to_string()));
+                            }
                         });
-                    self.commit_info.write().state = CommitState::Done;
+                    self.commit_info.write().state = CommitState::WaitSyncDbFile;
                 }
-                CommitState::Done => {
+                CommitState::WaitSyncDbFile => {
                     tracing::debug!(
                         "total time flushing cache: {} ms",
                         self.io
@@ -2032,7 +2053,6 @@ impl Pager {
                         }
                     };
                     if should_finish {
-                        wal.borrow_mut().finish_append_frames_commit()?;
                         return Ok(IOResult::Done(result.expect("commit result should be set")));
                     }
                     io_yield_one!(completion);
@@ -2110,6 +2130,29 @@ impl Pager {
         })
     }
 
+    pub fn is_checkpointing(&self) -> bool {
+        !matches!(
+            *self.checkpoint_state.read(),
+            CheckpointState::NotCheckpointing
+        )
+    }
+
+    fn reset_checkpoint_state(&self) {
+        *self.checkpoint_state.write() = CheckpointState::NotCheckpointing;
+        self.commit_info.write().state = CommitState::PrepareWal;
+    }
+
+    /// Clean up after a checkpoint failure. The WAL commit succeeded but checkpoint failed.
+    /// This ends the write and read transactions that would normally be ended in commit_tx().
+    pub fn finish_commit_after_checkpoint_failure(&self) {
+        self.reset_checkpoint_state();
+        if let Some(wal) = self.wal.as_ref() {
+            wal.borrow_mut().abort_checkpoint();
+            wal.borrow().end_write_tx();
+            wal.borrow().end_read_tx();
+        }
+    }
+
     #[instrument(skip_all, level = Level::DEBUG, name = "pager_checkpoint",)]
     pub fn checkpoint(&self) -> Result<IOResult<CheckpointResult>> {
         let Some(wal) = self.wal.as_ref() else {
@@ -2121,7 +2164,11 @@ impl Pager {
             let state = std::mem::take(&mut *self.checkpoint_state.write());
             trace!(?state);
             match state {
+                CheckpointState::NotCheckpointing => {
+                    *self.checkpoint_state.write() = CheckpointState::Checkpoint;
+                }
                 CheckpointState::Checkpoint => {
+                    *self.checkpoint_state.write() = CheckpointState::Checkpoint; // must be set back to Checkpoint in case wal.checkpoint() fails since we take() it above.
                     let res = return_if_io!(wal.borrow_mut().checkpoint(
                         self,
                         CheckpointMode::Passive {
@@ -2141,7 +2188,7 @@ impl Pager {
                         !self.syncing.load(Ordering::SeqCst),
                         "syncing should be done"
                     );
-                    *self.checkpoint_state.write() = CheckpointState::Checkpoint;
+                    *self.checkpoint_state.write() = CheckpointState::NotCheckpointing;
                     return Ok(IOResult::Done(res));
                 }
             }
@@ -2780,7 +2827,7 @@ impl Pager {
     }
 
     fn reset_internal_states(&self) {
-        *self.checkpoint_state.write() = CheckpointState::Checkpoint;
+        *self.checkpoint_state.write() = CheckpointState::NotCheckpointing;
         self.syncing.store(false, Ordering::SeqCst);
         self.commit_info.write().state = CommitState::PrepareWal;
         self.commit_info.write().time = self.io.now();

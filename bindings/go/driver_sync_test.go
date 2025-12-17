@@ -404,7 +404,7 @@ func TestSyncPartial(t *testing.T) {
 		ClientName: "turso-sync-go",
 		RemoteUrl:  server.DbUrl(name, name, name),
 		PartialSyncConfig: TursoPartialSyncConfig{
-			BoostrapStrategyPrefix: 128 * 1024,
+			BootstrapStrategyPrefix: 128 * 1024,
 		},
 	})
 	require.Nil(t, err)

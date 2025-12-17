@@ -127,7 +127,7 @@ test('partial sync (prefix bootstrap strategy; large segment size)', async () =>
     expect((await db.stats()).networkReceivedBytes).toBeGreaterThanOrEqual(2000 * 1024);
 })
 
-test('partial sync (prefix bootstrap strategy; speculative load)', async () => {
+test('partial sync (prefix bootstrap strategy; prefetch)', async () => {
     {
         const db = await connect({
             path: ':memory:',
@@ -148,7 +148,7 @@ test('partial sync (prefix bootstrap strategy; speculative load)', async () => {
         partialSync: {
             bootstrapStrategy: { kind: 'prefix', length: 128 * 1024 },
             segmentSize: 4 * 1024,
-            speculativeLoad: true,
+            prefetch: true,
         },
     });
 
