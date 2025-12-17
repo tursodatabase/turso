@@ -21,8 +21,6 @@ use crate::profiles::Profile;
 use crate::runner::SimIO;
 use crate::runner::cli::IoBackend;
 use crate::runner::io::SimulatorIO;
-#[cfg(target_os = "linux")]
-use crate::runner::io_uring::UringSimIO;
 use crate::runner::memory::io::MemorySimIO;
 const DEFAULT_CACHE_SIZE: usize = 2000;
 use super::cli::SimulatorCLI;
@@ -363,24 +361,14 @@ impl SimulatorEnv {
                 latency_prof.min_tick,
                 latency_prof.max_tick,
             )),
-            IoBackend::Default => Arc::new(
+            _ => Arc::new(
                 SimulatorIO::new(
                     self.opts.seed,
                     self.opts.page_size,
                     latency_prof.latency_probability,
                     latency_prof.min_tick,
                     latency_prof.max_tick,
-                )
-                .unwrap(),
-            ),
-            #[cfg(target_os = "linux")]
-            IoBackend::IoUring => Arc::new(
-                UringSimIO::new(
-                    self.opts.seed,
-                    self.opts.page_size,
-                    latency_prof.latency_probability,
-                    latency_prof.min_tick,
-                    latency_prof.max_tick,
+                    self.io_backend,
                 )
                 .unwrap(),
             ),
@@ -524,33 +512,23 @@ impl SimulatorEnv {
 
         let latency_prof = &profile.io.latency;
 
-        let io_backend = cli_opts.effective_io_backend();
+        let io_backend = cli_opts.io_backend;
         let io: Arc<dyn SimIO> = match io_backend {
             IoBackend::Memory => Arc::new(MemorySimIO::new(
-                seed,
+                opts.seed,
                 opts.page_size,
                 latency_prof.latency_probability,
                 latency_prof.min_tick,
                 latency_prof.max_tick,
             )),
-            IoBackend::Default => Arc::new(
+            _ => Arc::new(
                 SimulatorIO::new(
-                    seed,
+                    opts.seed,
                     opts.page_size,
                     latency_prof.latency_probability,
                     latency_prof.min_tick,
                     latency_prof.max_tick,
-                )
-                .unwrap(),
-            ),
-            #[cfg(target_os = "linux")]
-            IoBackend::IoUring => Arc::new(
-                UringSimIO::new(
-                    seed,
-                    opts.page_size,
-                    latency_prof.latency_probability,
-                    latency_prof.min_tick,
-                    latency_prof.max_tick,
+                    io_backend,
                 )
                 .unwrap(),
             ),

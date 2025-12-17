@@ -168,12 +168,6 @@ pub struct SimulatorCLI {
     )]
     pub disable_integrity_check: bool,
     #[clap(
-        long,
-        help = "Use memory IO for complex simulations (deprecated: use --io-backend=memory instead)",
-        default_value_t = false
-    )]
-    pub memory_io: bool,
-    #[clap(
         long = "io-backend",
         help = "Select the IO backend for the simulator",
         value_enum,
@@ -233,21 +227,7 @@ impl SimulatorCLI {
             );
             self.minimum_tests = self.maximum_tests;
         }
-        // Handle deprecation: if --memory-io is set but --io-backend is default, use memory
-        if self.memory_io && self.io_backend == IoBackend::Default {
-            tracing::warn!("--memory-io is deprecated, use --io-backend=memory instead");
-            self.io_backend = IoBackend::Memory;
-        }
         Ok(())
-    }
-
-    /// Get the effective IO backend, considering the deprecated memory_io flag
-    pub fn effective_io_backend(&self) -> IoBackend {
-        if self.memory_io && self.io_backend == IoBackend::Default {
-            IoBackend::Memory
-        } else {
-            self.io_backend
-        }
     }
 }
 

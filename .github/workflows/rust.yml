@@ -90,6 +90,11 @@ jobs:
           for i in {1..10}; do
             ./scripts/run-sim --maximum-tests 1000 --min-tick 10 --max-tick 50 --profile faultless --memory-io || exit 1
           done
+      - name: Simulator IOUring 
+        run: |
+          for i in {1..10}; do
+            ./scripts/run-sim --io-backend=io-uring --maximum-tests 1000 --differential || exit 1
+          done
       - name: Simulator Differential
         run: |
           for i in {1..10}; do
