@@ -642,15 +642,20 @@ impl Database {
                 true
             }
             Version::Wal => {
-                if open_mv_store && !wal_exists {
-                    // Change Header to MVCC if WAL does not exists and we have MVCC enabled
-                    header_mut.read_version = RawVersion::from(Version::Mvcc);
-                    header_mut.write_version = RawVersion::from(Version::Mvcc);
-                    true
-                } else {
-                    tracing::warn!("WAL file exists for database {}, but MVCC is enabled. Run `PRAGMA journal_mode = 'experimental_mvcc;'` to change to MVCC mode", self.path);
-                    open_mv_store = false;
-                    false
+                match (open_mv_store, wal_exists) {
+                    (true, true) => {
+                        tracing::warn!("WAL file exists for database {}, but MVCC is enabled. Run `PRAGMA journal_mode = 'experimental_mvcc;'` to change to MVCC mode", self.path);
+                        open_mv_store = false;
+                        false
+                    }
+                    (true, false) => {
+                        // Change Header to MVCC if WAL does not exists and we have MVCC enabled
+                        header_mut.read_version = RawVersion::from(Version::Mvcc);
+                        header_mut.write_version = RawVersion::from(Version::Mvcc);
+                        true
+                    }
+                    (false, true) => false,
+                    (false, false) => false,
                 }
             }
             Version::Mvcc => {
@@ -2001,8 +2006,8 @@ impl Connection {
             io.as_ref().block(|| ckpt_sm.step(&()))
         } else {
             self.pager
-            .load()
-            .blocking_checkpoint(mode, self.get_sync_mode())
+                .load()
+                .blocking_checkpoint(mode, self.get_sync_mode())
         }
     }
 
