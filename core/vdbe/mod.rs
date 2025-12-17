@@ -1304,6 +1304,13 @@ impl Program {
                         self.connection
                             .set_changes(self.n_change.load(Ordering::SeqCst));
                     }
+                    // Update global schema if this was a DDL transaction.
+                    // Must be done before clearing TX state, otherwise abort() won't know
+                    // to update the schema.
+                    if connection.get_tx_state().is_ddl_write_tx() {
+                        let schema = connection.schema.read().clone();
+                        connection.db.update_schema_if_newer(schema);
+                    }
                     connection.set_tx_state(TransactionState::None);
                     *commit_state = CommitState::Ready;
                     return Err(LimboError::CheckpointFailed(msg));
