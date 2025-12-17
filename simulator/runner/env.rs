@@ -270,52 +270,57 @@ where
             for op in &transaction_tables.operations {
                 match op {
                     RowOperation::Insert { table_name, row } => {
-                        if let Some(committed) = self
+                        let committed = self
                             .commited_tables
                             .iter_mut()
                             .find(|t| &t.name == table_name)
-                        {
-                            committed.rows.push(row.clone());
-                        }
+                            .expect("Table should exist in committed tables");
+                        committed.rows.push(row.clone());
                     }
                     RowOperation::Delete { table_name, row } => {
-                        if let Some(committed) = self
+                        let committed = self
                             .commited_tables
                             .iter_mut()
                             .find(|t| &t.name == table_name)
-                        {
-                            if let Some(pos) = committed.rows.iter().position(|r| r == row) {
-                                committed.rows.remove(pos);
-                            }
+                            .expect("Table should exist in committed tables");
+                        if let Some(pos) = committed.rows.iter().position(|r| r == row) {
+                            committed.rows.remove(pos);
                         }
                     }
                     RowOperation::DropTable { table_name } => {
                         self.commited_tables.retain(|t| &t.name != table_name);
                     }
                     RowOperation::RenameTable { old_name, new_name } => {
-                        if let Some(committed) = self
+                        let committed = self
                             .commited_tables
                             .iter_mut()
                             .find(|t| &t.name == old_name)
-                        {
-                            committed.name = new_name.clone();
-                        }
+                            .expect("Table should exist in committed tables");
+                        committed.name = new_name.clone();
                     }
                     RowOperation::AddColumn { table_name, column } => {
-                        if let Some(committed) = self
+                        let committed = self
                             .commited_tables
                             .iter_mut()
                             .find(|t| &t.name == table_name)
-                        {
-                            committed.columns.push(column.clone());
-                            let new_col_count = committed.columns.len();
-                            // Add NULL only for rows that need it.
-                            // Rows inserted after ADD COLUMN in the same transaction
-                            // already have the correct number of values.
-                            for row in &mut committed.rows {
-                                while row.len() < new_col_count {
-                                    row.push(SimValue::NULL);
-                                }
+                            .expect("Table should exist in committed tables");
+                        let txn_table = transaction_tables
+                            .current_tables
+                            .iter()
+                            .find(|t| &t.name == table_name)
+                            .expect("Transaction table should exist");
+                        assert!(
+                            txn_table.columns.len() > committed.columns.len(),
+                            "Transaction table should have more columns than committed table"
+                        );
+                        committed.columns.push(column.clone());
+                        let new_col_count = committed.columns.len();
+                        // Add NULL only for rows that need it.
+                        // Rows inserted after ADD COLUMN in the same transaction
+                        // already have the correct number of values.
+                        for row in &mut committed.rows {
+                            while row.len() < new_col_count {
+                                row.push(SimValue::NULL);
                             }
                         }
                     }
@@ -323,20 +328,28 @@ where
                         table_name,
                         column_index,
                     } => {
-                        if let Some(committed) = self
+                        let committed = self
                             .commited_tables
                             .iter_mut()
                             .find(|t| &t.name == table_name)
-                        {
-                            let old_col_count = committed.columns.len();
-                            committed.columns.remove(*column_index);
-                            // Only remove from rows that have the old column count.
-                            // Rows inserted after DROP COLUMN in the same transaction
-                            // already have the correct (new) number of values.
-                            for row in &mut committed.rows {
-                                if row.len() == old_col_count {
-                                    row.remove(*column_index);
-                                }
+                            .expect("Table should exist in committed tables");
+                        let txn_table = transaction_tables
+                            .current_tables
+                            .iter()
+                            .find(|t| &t.name == table_name)
+                            .expect("Transaction table should exist");
+                        assert!(
+                            txn_table.columns.len() < committed.columns.len(),
+                            "Transaction table should have fewer columns than committed table"
+                        );
+                        let old_col_count = committed.columns.len();
+                        committed.columns.remove(*column_index);
+                        // Only remove from rows that have the old column count.
+                        // Rows inserted after DROP COLUMN in the same transaction
+                        // already have the correct (new) number of values.
+                        for row in &mut committed.rows {
+                            if row.len() == old_col_count {
+                                row.remove(*column_index);
                             }
                         }
                     }
@@ -345,22 +358,22 @@ where
                         old_name,
                         new_name,
                     } => {
-                        if let Some(committed) = self
+                        let committed = self
                             .commited_tables
                             .iter_mut()
                             .find(|t| &t.name == table_name)
-                        {
-                            if let Some(col) =
-                                committed.columns.iter_mut().find(|c| &c.name == old_name)
-                            {
-                                col.name = new_name.clone();
-                            }
-                            // Update index column names
-                            for index in &mut committed.indexes {
-                                for (col_name, _) in &mut index.columns {
-                                    if col_name == old_name {
-                                        *col_name = new_name.clone();
-                                    }
+                            .expect("Table should exist in committed tables");
+                        let col = committed
+                            .columns
+                            .iter_mut()
+                            .find(|c| &c.name == old_name)
+                            .expect("Column should exist");
+                        col.name = new_name.clone();
+                        // Update index column names
+                        for index in &mut committed.indexes {
+                            for (col_name, _) in &mut index.columns {
+                                if col_name == old_name {
+                                    *col_name = new_name.clone();
                                 }
                             }
                         }
