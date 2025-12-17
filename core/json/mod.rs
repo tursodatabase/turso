@@ -52,10 +52,15 @@ pub fn get_json(json_value: &Value, indent: Option<&str>) -> crate::Result<Value
 
             Ok(Value::Text(Text::json(json)))
         }
-        Value::Blob(b) => {
-            let jsonbin = Jsonb::new(b.len(), Some(b));
-            jsonbin.element_type()?;
-            Ok(Value::Text(Text::json(jsonbin.to_string())))
+        Value::Blob(_) => {
+            // Blobs can contain either text JSON or binary JSONB
+            // Use convert_dbtype_to_jsonb to properly detect and parse both formats
+            let json_val = convert_dbtype_to_jsonb(json_value, Conv::Strict)?;
+            let json = match indent {
+                Some(indent) => json_val.to_string_pretty(Some(indent))?,
+                None => json_val.to_string(),
+            };
+            Ok(Value::Text(Text::json(json)))
         }
         Value::Null => Ok(Value::Null),
         _ => {
@@ -297,6 +302,10 @@ where
         let second = args.next().ok_or_else(|| {
             crate::LimboError::InternalError("args should have second element in loop".to_string())
         })?;
+        let second_ref = second.as_value_ref();
+        if matches!(second_ref, ValueRef::Blob(_)) {
+            crate::bail_constraint_error!("JSON cannot hold BLOB values")
+        }
         let value = convert_dbtype_to_jsonb(second, Conv::NotStrict)?;
         let mut op = SetOperation::new(value);
         if let Some(path) = path {
@@ -338,6 +347,10 @@ where
         let second = args.next().ok_or_else(|| {
             crate::LimboError::InternalError("args should have second element in loop".to_string())
         })?;
+        let second_ref = second.as_value_ref();
+        if matches!(second_ref, ValueRef::Blob(_)) {
+            crate::bail_constraint_error!("JSON cannot hold BLOB values")
+        }
         let value = convert_dbtype_to_jsonb(second, Conv::NotStrict)?;
         let mut op = SetOperation::new(value);
         if let Some(path) = path {
@@ -724,6 +737,10 @@ where
                 "values should have second element in loop".to_string(),
             )
         })?;
+        let second_ref = second.as_value_ref();
+        if matches!(second_ref, ValueRef::Blob(_)) {
+            crate::bail_constraint_error!("JSON cannot hold BLOB values")
+        }
         let value = convert_dbtype_to_jsonb(second, Conv::NotStrict)?;
         json.append_jsonb_to_end(value.data());
     }
@@ -764,6 +781,10 @@ where
                 "values should have second element in loop".to_string(),
             )
         })?;
+        let second_ref = second.as_value_ref();
+        if matches!(second_ref, ValueRef::Blob(_)) {
+            crate::bail_constraint_error!("JSON cannot hold BLOB values")
+        }
         let value = convert_dbtype_to_jsonb(second, Conv::NotStrict)?;
         json.append_jsonb_to_end(value.data());
     }
@@ -931,6 +952,54 @@ mod tests {
     }
 
     #[test]
+    fn test_get_json_blob_text_json() {
+        let true_blob = Value::Blob(b"true".to_vec());
+        let result = get_json(&true_blob, None).unwrap();
+        if let Value::Text(result_str) = result {
+            assert_eq!(result_str.as_str(), "true");
+            assert_eq!(result_str.subtype, TextSubtype::Json);
+        } else {
+            panic!("Expected Value::Text, got: {result:?}");
+        }
+
+        let false_blob = Value::Blob(b"false".to_vec());
+        let result = get_json(&false_blob, None).unwrap();
+        if let Value::Text(result_str) = result {
+            assert_eq!(result_str.as_str(), "false");
+            assert_eq!(result_str.subtype, TextSubtype::Json);
+        } else {
+            panic!("Expected Value::Text, got: {result:?}");
+        }
+
+        let null_blob = Value::Blob(b"null".to_vec());
+        let result = get_json(&null_blob, None).unwrap();
+        if let Value::Text(result_str) = result {
+            assert_eq!(result_str.as_str(), "null");
+            assert_eq!(result_str.subtype, TextSubtype::Json);
+        } else {
+            panic!("Expected Value::Text, got: {result:?}");
+        }
+
+        let number_blob = Value::Blob(b"123".to_vec());
+        let result = get_json(&number_blob, None).unwrap();
+        if let Value::Text(result_str) = result {
+            assert_eq!(result_str.as_str(), "123");
+            assert_eq!(result_str.subtype, TextSubtype::Json);
+        } else {
+            panic!("Expected Value::Text, got: {result:?}");
+        }
+
+        let string_blob = Value::Blob(b"\"hello\"".to_vec());
+        let result = get_json(&string_blob, None).unwrap();
+        if let Value::Text(result_str) = result {
+            assert_eq!(result_str.as_str(), "\"hello\"");
+            assert_eq!(result_str.subtype, TextSubtype::Json);
+        } else {
+            panic!("Expected Value::Text, got: {result:?}");
+        }
+    }
+
+    #[test]
     fn test_get_json_non_text() {
         let input = Value::Null;
         let result = get_json(&input, None).unwrap();
@@ -1048,6 +1117,36 @@ mod tests {
 
         match result {
             Ok(_) => panic!("Expected error for blob input"),
+            Err(e) => assert!(e.to_string().contains("JSON cannot hold BLOB values")),
+        }
+    }
+
+    #[test]
+    fn test_json_object_blob_invalid() {
+        let key = Value::build_text("a");
+        let blob = Value::Blob("true".as_bytes().to_vec());
+
+        let input = [key, blob];
+
+        let result = json_object(&input);
+
+        match result {
+            Ok(_) => panic!("Expected error for blob value in json_object"),
+            Err(e) => assert!(e.to_string().contains("JSON cannot hold BLOB values")),
+        }
+    }
+
+    #[test]
+    fn test_json_set_blob_invalid() {
+        let json_cache = JsonCacheCell::new();
+        let blob = Value::Blob("test".as_bytes().to_vec());
+        let result = json_set(
+            &[Value::build_text("{}"), Value::build_text("$.field"), blob],
+            &json_cache,
+        );
+
+        match result {
+            Ok(_) => panic!("Expected error for blob value in json_set"),
             Err(e) => assert!(e.to_string().contains("JSON cannot hold BLOB values")),
         }
     }

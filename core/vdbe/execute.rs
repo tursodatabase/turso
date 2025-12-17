@@ -4780,64 +4780,46 @@ pub fn op_function(
                 )?);
             }
             JsonFunc::JsonRemove => {
-                if let Ok(json) = json_remove(
+                let json = json_remove(
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]),
                     &state.json_cache,
-                ) {
-                    state.registers[*dest] = Register::Value(json);
-                } else {
-                    state.registers[*dest] = Register::Value(Value::Null);
-                }
+                )?;
+                state.registers[*dest] = Register::Value(json);
             }
             JsonFunc::JsonbRemove => {
-                if let Ok(json) = jsonb_remove(
+                let json = jsonb_remove(
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]),
                     &state.json_cache,
-                ) {
-                    state.registers[*dest] = Register::Value(json);
-                } else {
-                    state.registers[*dest] = Register::Value(Value::Null);
-                }
+                )?;
+                state.registers[*dest] = Register::Value(json);
             }
             JsonFunc::JsonReplace => {
-                if let Ok(json) = json_replace(
+                let json = json_replace(
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]),
                     &state.json_cache,
-                ) {
-                    state.registers[*dest] = Register::Value(json);
-                } else {
-                    state.registers[*dest] = Register::Value(Value::Null);
-                }
+                )?;
+                state.registers[*dest] = Register::Value(json);
             }
             JsonFunc::JsonbReplace => {
-                if let Ok(json) = jsonb_replace(
+                let json = jsonb_replace(
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]),
                     &state.json_cache,
-                ) {
-                    state.registers[*dest] = Register::Value(json);
-                } else {
-                    state.registers[*dest] = Register::Value(Value::Null);
-                }
+                )?;
+                state.registers[*dest] = Register::Value(json);
             }
             JsonFunc::JsonInsert => {
-                if let Ok(json) = json_insert(
+                let json = json_insert(
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]),
                     &state.json_cache,
-                ) {
-                    state.registers[*dest] = Register::Value(json);
-                } else {
-                    state.registers[*dest] = Register::Value(Value::Null);
-                }
+                )?;
+                state.registers[*dest] = Register::Value(json);
             }
             JsonFunc::JsonbInsert => {
-                if let Ok(json) = jsonb_insert(
+                let json = jsonb_insert(
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]),
                     &state.json_cache,
-                ) {
-                    state.registers[*dest] = Register::Value(json);
-                } else {
-                    state.registers[*dest] = Register::Value(Value::Null);
-                }
+                )?;
+                state.registers[*dest] = Register::Value(json);
             }
             JsonFunc::JsonPretty => {
                 let json_value = &state.registers[*start_reg];

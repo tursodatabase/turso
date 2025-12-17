@@ -148,6 +148,34 @@ do_execsql_test json5-multi-comment-pretty {
     "aaa": 123
 }}}
 
+do_execsql_test json-blob-text-true {
+   SELECT json(x'74727565');
+} {true}
+
+do_execsql_test json-blob-text-false {
+   SELECT json(x'66616c7365');
+} {false}
+
+do_execsql_test json-blob-text-null {
+   SELECT json(x'6e756c6c');
+} {null}
+
+do_execsql_test json-blob-text-number {
+   SELECT json(x'313233');
+} {123}
+
+do_execsql_test json-blob-text-string {
+   SELECT json(x'2268656c6c6f22');
+} {{"hello"}}
+
+do_execsql_test json-blob-text-array {
+   SELECT json(x'5b312c322c335d');
+} {{[1,2,3]}}
+
+do_execsql_test json-blob-text-object {
+   SELECT json(x'7b226b6579223a2276616c7565227d');
+} {{{"key":"value"}}}
+
 do_execsql_test json-pretty-ident-1 {
    SELECT json_pretty('{x: 1}', '');
 } {{{
@@ -713,6 +741,30 @@ do_execsql_test json_object_multiple_values {
 do_execsql_test json_object_empty {
   SELECT json_object();
 } {{{}}}
+
+do_execsql_test_in_memory_error_content json_object_blob_error {
+  CREATE TABLE t(a);
+  INSERT INTO t VALUES (x'74727565'); -- ASCII "true";
+  SELECT json_object('a', a) FROM t;
+} {JSON cannot hold BLOB values}
+
+do_execsql_test_in_memory_error_content json_set_blob_error {
+  CREATE TABLE t(a);
+  INSERT INTO t VALUES (x'74727565'); -- ASCII "true";
+  SELECT json_set('{}', '$.field', a) FROM t;
+} {JSON cannot hold BLOB values}
+
+do_execsql_test_in_memory_error_content json_insert_blob_error {
+  CREATE TABLE t(a);
+  INSERT INTO t VALUES (x'74727565'); -- ASCII "true";
+  SELECT json_insert('{}', '$.field', a) FROM t;
+} {JSON cannot hold BLOB values}
+
+do_execsql_test_in_memory_error_content json_replace_blob_error {
+  CREATE TABLE t(a);
+  INSERT INTO t VALUES (x'74727565'); -- ASCII "true";
+  SELECT json_replace('{"field":1}', '$.field', a) FROM t;
+} {JSON cannot hold BLOB values}
 
 do_execsql_test json_object_json_array {
     SELECT json_object('ex',json('[52,3]'));

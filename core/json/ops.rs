@@ -145,6 +145,10 @@ where
         let second = args.next().ok_or_else(|| {
             crate::LimboError::InternalError("args should have second element in loop".to_string())
         })?;
+        let second_ref = second.as_value_ref();
+        if matches!(second_ref, ValueRef::Blob(_)) {
+            crate::bail_constraint_error!("JSON cannot hold BLOB values")
+        }
         let value = convert_dbtype_to_jsonb(&second, Conv::NotStrict)?;
         if let Some(path) = path {
             let mut op = ReplaceOperation::new(value);
@@ -186,6 +190,10 @@ where
         let second = args.next().ok_or_else(|| {
             crate::LimboError::InternalError("args should have second element in loop".to_string())
         })?;
+        let second_ref = second.as_value_ref();
+        if matches!(second_ref, ValueRef::Blob(_)) {
+            crate::bail_constraint_error!("JSON cannot hold BLOB values")
+        }
         let value = convert_dbtype_to_jsonb(&second, Conv::NotStrict)?;
         if let Some(path) = path {
             let mut op = ReplaceOperation::new(value);
@@ -228,6 +236,10 @@ where
         let second = args.next().ok_or_else(|| {
             crate::LimboError::InternalError("args should have second element in loop".to_string())
         })?;
+        let second_ref = second.as_value_ref();
+        if matches!(second_ref, ValueRef::Blob(_)) {
+            crate::bail_constraint_error!("JSON cannot hold BLOB values")
+        }
         let value = convert_dbtype_to_jsonb(&second, Conv::NotStrict)?;
         if let Some(path) = path {
             let mut op = InsertOperation::new(value);
@@ -270,6 +282,10 @@ where
         let second = args.next().ok_or_else(|| {
             crate::LimboError::InternalError("args should have second element in loop".to_string())
         })?;
+        let second_ref = second.as_value_ref();
+        if matches!(second_ref, ValueRef::Blob(_)) {
+            crate::bail_constraint_error!("JSON cannot hold BLOB values")
+        }
         let value = convert_dbtype_to_jsonb(&second, Conv::NotStrict)?;
         if let Some(path) = path {
             let mut op = InsertOperation::new(value);
@@ -460,6 +476,38 @@ mod tests {
 
         let json_cache = JsonCacheCell::new();
         assert!(json_remove(&args, &json_cache).is_err());
+    }
+
+    #[test]
+    fn test_json_insert_blob_invalid() {
+        let json_cache = JsonCacheCell::new();
+        let blob = Value::Blob("test".as_bytes().to_vec());
+        let args = [create_json("{}"), create_text("$.field"), blob];
+
+        let result = json_insert(&args, &json_cache);
+
+        match result {
+            Ok(_) => panic!("Expected error for blob value in json_insert"),
+            Err(e) => assert!(e.to_string().contains("JSON cannot hold BLOB values")),
+        }
+    }
+
+    #[test]
+    fn test_json_replace_blob_invalid() {
+        let json_cache = JsonCacheCell::new();
+        let blob = Value::Blob("test".as_bytes().to_vec());
+        let args = [
+            create_json(r#"{"field":"value"}"#),
+            create_text("$.field"),
+            blob,
+        ];
+
+        let result = json_replace(&args, &json_cache);
+
+        match result {
+            Ok(_) => panic!("Expected error for blob value in json_replace"),
+            Err(e) => assert!(e.to_string().contains("JSON cannot hold BLOB values")),
+        }
     }
 
     #[test]
