@@ -7271,12 +7271,10 @@ fn defragment_page(
     let cell_pointer_area_offset = page.cell_pointer_array_offset();
     let first_cell_content_byte = page.unallocated_region_start();
 
-    // Get direct mutable access to the page buffer.
-    let buffer = page.as_mut_slice();
-
     // Move data and update pointers.
     let mut cbrk = usable_space;
     for cell in cells_info {
+        let buffer = page.as_mut_slice();
         cbrk -= cell.size as usize;
         let new_offset = cbrk;
         let old_offset = cell.old_offset as usize;
@@ -7302,9 +7300,7 @@ fn defragment_page(
             "new_offset={new_offset} PageSize::MAX={}",
             PageSize::MAX
         );
-        // Write directly to buffer instead of using page.write_u16_no_offset
-        let bytes = (new_offset as u16).to_be_bytes();
-        buffer[pointer_location..pointer_location + 2].copy_from_slice(&bytes);
+        page.write_u16_no_offset(pointer_location, new_offset as u16);
     }
 
     page.write_cell_content_area(cbrk);
@@ -7412,9 +7408,7 @@ fn _insert_into_cell(
         );
     }
     // ...and insert new cell pointer at the current index
-    // Write directly to buffer instead of using page.write_u16_no_offset
-    let bytes = new_cell_data_pointer.to_be_bytes();
-    buf[cell_pointer_cur_idx..cell_pointer_cur_idx + 2].copy_from_slice(&bytes);
+    page.write_u16_no_offset(cell_pointer_cur_idx, new_cell_data_pointer);
 
     // update cell count
     let new_n_cells = (page.cell_count() + 1) as u16;
