@@ -176,6 +176,34 @@ do_execsql_test json-blob-text-object {
    SELECT json(x'7b226b6579223a2276616c7565227d');
 } {{{"key":"value"}}}
 
+do_execsql_test jsonb-blob-text-true {
+   SELECT json(jsonb(x'74727565'));
+} {true}
+
+do_execsql_test jsonb-blob-text-false {
+   SELECT json(jsonb(x'66616c7365'));
+} {false}
+
+do_execsql_test jsonb-blob-text-null {
+   SELECT json(jsonb(x'6e756c6c'));
+} {null}
+
+do_execsql_test jsonb-blob-text-number {
+   SELECT json(jsonb(x'313233'));
+} {123}
+
+do_execsql_test jsonb-blob-text-string {
+   SELECT json(jsonb(x'2268656c6c6f22'));
+} {{"hello"}}
+
+do_execsql_test jsonb-blob-text-array {
+   SELECT json(jsonb(x'5b312c322c335d'));
+} {{[1,2,3]}}
+
+do_execsql_test jsonb-blob-text-object {
+   SELECT json(jsonb(x'7b226b6579223a2276616c7565227d'));
+} {{{"key":"value"}}}
+
 do_execsql_test json-pretty-ident-1 {
    SELECT json_pretty('{x: 1}', '');
 } {{{
@@ -253,7 +281,6 @@ do_execsql_test json_bare_infinity {
 do_execsql_test json_bare_negative_infinity {
    SELECT json(-1e309);
 } {{-9e999}}
-
 
 do_execsql_test json_extract_null {
     SELECT json_extract(null, '$')
@@ -765,6 +792,118 @@ do_execsql_test_in_memory_error_content json_replace_blob_error {
   INSERT INTO t VALUES (x'74727565'); -- ASCII "true";
   SELECT json_replace('{"field":1}', '$.field', a) FROM t;
 } {JSON cannot hold BLOB values}
+
+do_execsql_test_in_memory_error_content json_array_blob_error {
+  CREATE TABLE t(a);
+  INSERT INTO t VALUES (x'74727565'); -- ASCII "true";
+  SELECT json_array(a) FROM t;
+} {JSON cannot hold BLOB values}
+
+do_execsql_test_in_memory_error_content jsonb_object_blob_error {
+  CREATE TABLE t(a);
+  INSERT INTO t VALUES (x'74727565'); -- ASCII "true";
+  SELECT jsonb_object('a', a) FROM t;
+} {JSON cannot hold BLOB values}
+
+do_execsql_test_in_memory_error_content jsonb_set_blob_error {
+  CREATE TABLE t(a);
+  INSERT INTO t VALUES (x'74727565'); -- ASCII "true";
+  SELECT jsonb_set('{}', '$.field', a) FROM t;
+} {JSON cannot hold BLOB values}
+
+do_execsql_test_in_memory_error_content jsonb_insert_blob_error {
+  CREATE TABLE t(a);
+  INSERT INTO t VALUES (x'74727565'); -- ASCII "true";
+  SELECT jsonb_insert('{}', '$.field', a) FROM t;
+} {JSON cannot hold BLOB values}
+
+do_execsql_test_in_memory_error_content jsonb_replace_blob_error {
+  CREATE TABLE t(a);
+  INSERT INTO t VALUES (x'74727565'); -- ASCII "true";
+  SELECT jsonb_replace('{"field":1}', '$.field', a) FROM t;
+} {JSON cannot hold BLOB values}
+
+do_execsql_test_in_memory_error_content jsonb_array_blob_error {
+  CREATE TABLE t(a);
+  INSERT INTO t VALUES (x'74727565'); -- ASCII "true";
+  SELECT jsonb_array(a) FROM t;
+} {JSON cannot hold BLOB values}
+
+do_execsql_test_on_specific_db {:memory:} jsonb_object_with_json_conversion {
+  CREATE TABLE t1(data TEXT);
+  INSERT INTO t1 VALUES ('{"name":"Alice","age":30}');
+  SELECT json(jsonb_object('original', json(data), 'new', 'value')) FROM t1;
+} {{{"original":{"name":"Alice","age":30},"new":"value"}}}
+
+do_execsql_test_on_specific_db {:memory:} json_object_with_jsonb_conversion {
+  CREATE TABLE t1(data BLOB);
+  INSERT INTO t1 VALUES (jsonb('{"name":"Bob","age":25}'));
+  SELECT json_object('original', json(data), 'new', 'value') FROM t1;
+} {{{"original":{"name":"Bob","age":25},"new":"value"}}}
+
+do_execsql_test_on_specific_db {:memory:} jsonb_set_with_json_conversion {
+  CREATE TABLE t1(data TEXT);
+  INSERT INTO t1 VALUES ('{"name":"Alice","age":30}');
+  SELECT json(jsonb_set(json(data), '$.city', '"NY"')) FROM t1;
+} {{{"name":"Alice","age":30,"city":"\"NY\""}}}
+
+
+do_execsql_test_on_specific_db {:memory:} json_set_with_jsonb_conversion {
+  CREATE TABLE t1(data BLOB);
+  INSERT INTO t1 VALUES (jsonb('{"name":"Bob","age":25}'));
+  SELECT json_set(json(data), '$.city', '"NY"') FROM t1;
+} {{{"name":"Bob","age":25,"city":"\"NY\""}}}
+
+
+do_execsql_test_on_specific_db {:memory:} jsonb_insert_with_json_conversion {
+  CREATE TABLE t1(data TEXT);
+  INSERT INTO t1 VALUES ('{"name":"Alice","age":30}');
+  SELECT json(jsonb_insert(json(data), '$.city', '"NY"')) FROM t1;
+} {{{"name":"Alice","age":30,"city":"\"NY\""}}}
+
+
+do_execsql_test_on_specific_db {:memory:} json_insert_with_jsonb_conversion {
+  CREATE TABLE t1(data BLOB);
+  INSERT INTO t1 VALUES (jsonb('{"name":"Bob","age":25}'));
+  SELECT json_insert(json(data), '$.city', '"NY"') FROM t1;
+} {{{"name":"Bob","age":25,"city":"\"NY\""}}}
+
+
+do_execsql_test_on_specific_db {:memory:} jsonb_replace_with_json_conversion {
+  CREATE TABLE t1(data TEXT);
+  INSERT INTO t1 VALUES ('{"name":"Alice","age":30}');
+  SELECT json(jsonb_replace(json(data), '$.age', '31')) FROM t1;
+} {{{"name":"Alice","age":"31"}}}
+
+do_execsql_test_on_specific_db {:memory:} json_replace_with_jsonb_conversion {
+  CREATE TABLE t1(data BLOB);
+  INSERT INTO t1 VALUES (jsonb('{"name":"Bob","age":25}'));
+  SELECT json_replace(json(data), '$.age', '26') FROM t1;
+} {{{"name":"Bob","age":"26"}}}
+
+do_execsql_test_on_specific_db {:memory:} jsonb_array_with_json_conversion {
+  CREATE TABLE t1(data TEXT);
+  INSERT INTO t1 VALUES ('{"name":"Alice"}');
+  SELECT json(jsonb_array(json(data), 'extra')) FROM t1;
+} {{[{"name":"Alice"},"extra"]}}
+
+do_execsql_test_on_specific_db {:memory:} json_array_with_jsonb_conversion {
+  CREATE TABLE t1(data BLOB);
+  INSERT INTO t1 VALUES (jsonb('{"name":"Bob"}'));
+  SELECT json_array(json(data), 'extra') FROM t1;
+} {{[{"name":"Bob"},"extra"]}}
+
+do_execsql_test_on_specific_db {:memory:} mixed_json_jsonb_json_extract {
+  CREATE TABLE t1(data BLOB);
+  INSERT INTO t1 VALUES (jsonb('{"name":"Alice","age":30}'));
+  SELECT json_extract(json(jsonb_set(data, '$.city', '"NY"')), '$.city') FROM t1;
+} {{"NY"}}
+
+do_execsql_test_on_specific_db {:memory:} mixed_json_jsonb_json_object {
+  CREATE TABLE t1(text_data TEXT, blob_data BLOB);
+  INSERT INTO t1 VALUES ('{"a":1}', jsonb('{"b":2}'));
+  SELECT json_object('text', json(text_data), 'blob', json(blob_data)) FROM t1;
+} {{{"text":{"a":1},"blob":{"b":2}}}}
 
 do_execsql_test json_object_json_array {
     SELECT json_object('ex',json('[52,3]'));
