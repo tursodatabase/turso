@@ -1907,7 +1907,8 @@ impl Connection {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
-        self.pager.load().cacheflush()
+        let pager = self.pager.load();
+        pager.io.block(|| pager.cacheflush())
     }
 
     pub fn checkpoint(&self, mode: CheckpointMode) -> Result<CheckpointResult> {

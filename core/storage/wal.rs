@@ -2707,7 +2707,9 @@ pub mod test {
         conn.execute("create table test(id integer primary key, value text)")
             .unwrap();
         bulk_inserts(&conn, 20, 3);
-        let completions = conn.pager.load().cacheflush().unwrap();
+        let IOResult::Done(completions) = conn.pager.load().cacheflush().unwrap() else {
+            panic!()
+        };
         for c in completions {
             db.io.wait_for_completion(c).unwrap();
         }
@@ -2801,7 +2803,9 @@ pub mod test {
             .execute("create table test(id integer primary key, value text)")
             .unwrap();
         bulk_inserts(&conn1.clone(), 15, 2);
-        let completions = conn1.pager.load().cacheflush().unwrap();
+        let IOResult::Done(completions) = conn1.pager.load().cacheflush().unwrap() else {
+            panic!()
+        };
         for c in completions {
             db.io.wait_for_completion(c).unwrap();
         }
@@ -2816,7 +2820,9 @@ pub mod test {
 
         // generate more frames that the reader will not see.
         bulk_inserts(&conn1.clone(), 15, 2);
-        let completions = conn1.pager.load().cacheflush().unwrap();
+        let IOResult::Done(completions) = conn1.pager.load().cacheflush().unwrap() else {
+            panic!()
+        };
         for c in completions {
             db.io.wait_for_completion(c).unwrap();
         }
@@ -3500,7 +3506,9 @@ pub mod test {
         bulk_inserts(&conn, 8, 4);
 
         // Ensure frames are flushed to the WAL
-        let completions = conn.pager.load().cacheflush().unwrap();
+        let IOResult::Done(completions) = conn.pager.load().cacheflush().unwrap() else {
+            panic!()
+        };
         for c in completions {
             db.io.wait_for_completion(c).unwrap();
         }
@@ -3533,7 +3541,9 @@ pub mod test {
 
         // First commit some data and flush (reader will snapshot here)
         bulk_inserts(&writer, 2, 3);
-        let completions = writer.pager.load().cacheflush().unwrap();
+        let IOResult::Done(completions) = writer.pager.load().cacheflush().unwrap() else {
+            panic!()
+        };
         for c in completions {
             db.io.wait_for_completion(c).unwrap();
         }
@@ -3552,7 +3562,9 @@ pub mod test {
 
         // Advance WAL beyond the reader's snapshot
         bulk_inserts(&writer, 3, 4);
-        let completions = writer.pager.load().cacheflush().unwrap();
+        let IOResult::Done(completions) = writer.pager.load().cacheflush().unwrap() else {
+            panic!()
+        };
         for c in completions {
             db.io.wait_for_completion(c).unwrap();
         }

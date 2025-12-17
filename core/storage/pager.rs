@@ -1,12 +1,12 @@
+use crate::storage::btree::PinGuard;
 use crate::storage::subjournal::Subjournal;
-use crate::storage::wal::IOV_MAX;
 use crate::storage::{
     buffer_pool::BufferPool,
     database::DatabaseStorage,
     sqlite3_ondisk::{
         self, parse_wal_frame_header, DatabaseHeader, PageContent, PageSize, PageType,
     },
-    wal::{CheckpointResult, Wal},
+    wal::{CheckpointResult, Wal, IOV_MAX},
 };
 use crate::types::{IOCompletions, WalState};
 use crate::util::IOExt as _;
@@ -27,7 +27,7 @@ use std::sync::Arc;
 use tracing::{instrument, trace, Level};
 
 use super::btree::btree_init_page;
-use super::page_cache::{CacheError, CacheResizeResult, PageCache, PageCacheKey};
+use super::page_cache::{CacheError, CacheResizeResult, PageCache, PageCacheKey, SpillResult};
 use super::sqlite3_ondisk::begin_write_btree_page;
 use super::wal::CheckpointMode;
 use crate::storage::encryption::{CipherMode, EncryptionContext, EncryptionKey};
@@ -152,6 +152,9 @@ pub struct PageInner {
 
 /// WAL tag not set
 pub const TAG_UNSET: u64 = u64::MAX;
+/// WAL write in progress, sentinel value set before starting a WAL write
+/// so we can detect if page was modified during the write
+pub const TAG_WRITE_PENDING: u64 = u64::MAX - 1;
 
 /// Bit layout:
 /// epoch: 20
@@ -194,6 +197,8 @@ const PAGE_LOCKED: usize = 0b010;
 const PAGE_DIRTY: usize = 0b1000;
 /// Page's contents are loaded in memory.
 const PAGE_LOADED: usize = 0b10000;
+/// Page has been spilled to WAL (can be evicted even though dirty).
+const PAGE_SPILLED: usize = 0b100000;
 
 impl Page {
     pub fn new(id: i64) -> Self {
@@ -237,6 +242,8 @@ impl Page {
     pub fn set_dirty(&self) {
         tracing::debug!("set_dirty(page={})", self.get().id);
         self.clear_wal_tag();
+        // Clear spilled flag since page is being modified again
+        self.get().flags.fetch_and(!PAGE_SPILLED, Ordering::Release);
         self.get().flags.fetch_or(PAGE_DIRTY, Ordering::Release);
     }
 
@@ -244,6 +251,29 @@ impl Page {
         tracing::debug!("clear_dirty(page={})", self.get().id);
         self.get().flags.fetch_and(!PAGE_DIRTY, Ordering::Release);
         self.clear_wal_tag();
+    }
+
+    /// Clear the dirty flag without touching wal_tag.
+    /// Used when a WAL frame has been durably written and the tag already encodes it.
+    pub fn clear_dirty_keep_wal_tag(&self) {
+        tracing::debug!("clear_dirty_keep_wal_tag(page={})", self.get().id);
+        self.get().flags.fetch_and(!PAGE_DIRTY, Ordering::Release);
+    }
+
+    /// Returns true if the page has been spilled to WAL and is safe to evict even while dirty.
+    pub fn is_spilled(&self) -> bool {
+        self.get().flags.load(Ordering::Acquire) & PAGE_SPILLED != 0
+    }
+
+    /// Mark the page as spilled to WAL. Spilled pages remain dirty but may be evicted from cache.
+    pub fn set_spilled(&self) {
+        tracing::debug!("set_spilled(page={})", self.get().id);
+        self.get().flags.fetch_or(PAGE_SPILLED, Ordering::Release);
+    }
+
+    /// Clear the spilled flag. This is also done implicitly on set_dirty().
+    pub fn clear_spilled(&self) {
+        self.get().flags.fetch_and(!PAGE_SPILLED, Ordering::Release);
     }
 
     pub fn is_loaded(&self) -> bool {
@@ -327,13 +357,65 @@ impl Page {
     }
 
     #[inline]
+    /// Returns true if the page has a valid WAL tag (i.e., was written to WAL and not modified since).
+    /// Returns false if the wal_tag is TAG_UNSET (page was modified since last WAL write).
+    pub fn has_wal_tag(&self) -> bool {
+        let tag = self.get().wal_tag.load(Ordering::Acquire);
+        let result = tag != TAG_UNSET && tag != TAG_WRITE_PENDING;
+        tracing::debug!(
+            "has_wal_tag(page={}) = {} (tag={:x})",
+            self.get().id,
+            result,
+            tag
+        );
+        result
+    }
+
+    #[inline]
+    /// Mark page as having a WAL write in progress.
+    /// This is set before starting a spill/cacheflush so we can detect
+    /// if the page was modified during the write.
+    pub fn set_write_pending(&self) {
+        tracing::debug!("set_write_pending(page={})", self.get().id);
+        self.get()
+            .wal_tag
+            .store(TAG_WRITE_PENDING, Ordering::Release);
+    }
+
+    #[inline]
+    /// Try to set the WAL tag, but only if the page wasn't modified during the write.
+    /// Returns true if the tag was set, false if the page was modified (wal_tag became TAG_UNSET).
+    pub fn try_set_wal_tag(&self, frame: u64, epoch: u32) -> bool {
+        let new_tag = pack_tag_pair(frame, epoch);
+        let page_id = self.get().id;
+        let current = self.get().wal_tag.load(Ordering::Acquire);
+        // Only set if current tag is not TAG_UNSET (meaning page wasn't modified during write)
+        // TAG_WRITE_PENDING is fine, it means the write was in progress and page wasn't modified
+        if current == TAG_UNSET {
+            tracing::debug!(
+                "try_set_wal_tag(page={}, frame={}) SKIPPED: wal_tag is TAG_UNSET (page was modified)",
+                page_id, frame
+            );
+            return false;
+        }
+        tracing::debug!(
+            "try_set_wal_tag(page={}, frame={}) SUCCESS: current={:x}",
+            page_id,
+            frame,
+            current
+        );
+        self.get().wal_tag.store(new_tag, Ordering::Release);
+        true
+    }
+
+    #[inline]
     pub fn is_valid_for_checkpoint(&self, target_frame: u64, epoch: u32) -> bool {
         let (f, s) = self.wal_tag_pair();
         f == target_frame && s == epoch && !self.is_dirty() && self.is_loaded() && !self.is_locked()
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 /// The state of the current pager cache commit.
 enum CommitState {
     /// Prepare WAL header for commit if needed
@@ -343,7 +425,13 @@ enum CommitState {
     /// Get DB size (mostly from page cache - but in rare cases we can read it from disk)
     GetDbSize,
     /// Appends all frames to the WAL.
-    PrepareFrames { db_size: u32 },
+    PrepareFrames {
+        db_size: u32,
+    },
+    WaitingForPageRead {
+        db_size: u32,
+        page_sz: PageSize,
+    },
     /// Fsync the on-disk WAL.
     SyncWal,
     /// Wait for WAL sync to complete and finalize the WAL commit.
@@ -400,7 +488,25 @@ pub enum BtreePageAllocMode {
 struct CommitInfo {
     completions: Vec<Completion>,
     state: CommitState,
-    time: crate::io::clock::Instant,
+    /// Dirty page IDs to process during PrepareFrames (for async evicted page reads)
+    dirty_ids_to_process: Vec<usize>,
+    /// Current index into dirty_ids_to_process
+    current_dirty_idx: usize,
+    /// Pages collected so far during PrepareFrames
+    collected_pages: Vec<PageRef>,
+    /// Pending read for an evicted page: (page_id, page_ref, read_completion)
+    pending_read: Option<(usize, PageRef, Completion)>,
+}
+
+impl CommitInfo {
+    fn reset(&mut self) {
+        self.completions.clear();
+        self.state = CommitState::PrepareWal;
+        self.dirty_ids_to_process.clear();
+        self.current_dirty_idx = 0;
+        self.collected_pages.clear();
+        self.pending_read = None;
+    }
 }
 
 /// Track the state of the auto-vacuum mode.
@@ -541,6 +647,10 @@ pub struct Pager {
     /// represent case where value is not set.
     schema_cookie: AtomicU64,
     free_page_state: RwLock<FreePageState>,
+    /// State machine for async cache spilling.
+    spill_state: RwLock<SpillState>,
+    /// State machine for async cacheflush operation.
+    cacheflush_state: RwLock<CacheFlushState>,
     /// Maximum number of pages allowed in the database. Default is 1073741823 (SQLite default).
     max_page_count: AtomicU32,
     header_ref_state: RwLock<HeaderRefState>,
@@ -611,6 +721,67 @@ enum FreePageState {
     NewTrunk { page: Arc<Page> },
 }
 
+/// State machine for async cache spilling.
+/// Tracks progress of writing dirty pages to WAL or disk.
+#[derive(Debug, Default, Clone)]
+enum SpillState {
+    #[default]
+    /// No spill operation in progress
+    Idle,
+    /// WAL spill in progress, waiting for write completions
+    WritingToWal {
+        /// Pinned pages being spilled
+        pages: Vec<PinGuard>,
+        /// Completions to wait for
+        completions: Vec<Completion>,
+    },
+    /// Writing ephemeral tables pages directly to disk
+    WritingToDisk {
+        /// Pages being spilled
+        pages: Vec<PinGuard>,
+        /// Completions to wait for
+        completions: Vec<Completion>,
+    },
+}
+
+enum CacheFlushStep {
+    /// Yield to caller with pending I/O, resume with given phase
+    Yield(CacheFlushState, IOCompletions),
+    /// Continue immediately to next phase (no I/O wait)
+    Continue(CacheFlushState),
+    /// Flush complete, return accumulated completions
+    Done(Vec<Completion>),
+}
+
+#[derive(Default)]
+pub enum CacheFlushState {
+    #[default]
+    Init,
+    WalPrepareStart {
+        dirty_ids: Vec<usize>,
+        completion: Completion,
+    },
+    WalPrepareFinish {
+        dirty_ids: Vec<usize>,
+        completion: Completion,
+    },
+    Collecting(CollectingState),
+    WaitingForRead {
+        state: CollectingState,
+        page_id: usize,
+        page: PageRef,
+        completion: Completion,
+    },
+}
+
+#[derive(Default)]
+pub struct CollectingState {
+    pub dirty_ids: Vec<usize>,
+    pub current_idx: usize,
+    pub collected_pages: Vec<PageRef>,
+    pub completions: Vec<Completion>,
+}
+
 impl Pager {
     pub fn new(
         db_file: Arc<dyn DatabaseStorage>,
@@ -626,7 +797,6 @@ impl Pager {
         } else {
             RwLock::new(AllocatePage1State::Done)
         };
-        let now = io.now();
         Ok(Self {
             db_file,
             wal,
@@ -638,7 +808,10 @@ impl Pager {
             commit_info: RwLock::new(CommitInfo {
                 completions: Vec::new(),
                 state: CommitState::PrepareWal,
-                time: now,
+                dirty_ids_to_process: Vec::new(),
+                current_dirty_idx: 0,
+                collected_pages: Vec::new(),
+                pending_read: None,
             }),
             syncing: Arc::new(AtomicBool::new(false)),
             checkpoint_state: RwLock::new(CheckpointState::default()),
@@ -650,6 +823,8 @@ impl Pager {
             reserved_space: AtomicU16::new(RESERVED_SPACE_NOT_SET),
             schema_cookie: AtomicU64::new(Self::SCHEMA_COOKIE_NOT_SET),
             free_page_state: RwLock::new(FreePageState::Start),
+            spill_state: RwLock::new(SpillState::Idle),
+            cacheflush_state: RwLock::new(CacheFlushState::default()),
             allocate_page_state: RwLock::new(AllocatePageState::Start),
             max_page_count: AtomicU32::new(DEFAULT_MAX_PAGE_COUNT),
             header_ref_state: RwLock::new(HeaderRefState::Start),
@@ -1584,29 +1759,44 @@ impl Pager {
     }
 
     /// Reads a page from the database.
-    #[tracing::instrument(skip_all, level = Level::DEBUG)]
+    #[tracing::instrument(skip_all, level = Level::TRACE)]
     pub fn read_page(&self, page_idx: i64) -> Result<(PageRef, Option<Completion>)> {
         assert!(page_idx >= 0, "pages in pager should be positive, negative might indicate unallocated pages from mvcc or any other nasty bug");
         tracing::debug!("read_page(page_idx = {})", page_idx);
-        let mut page_cache = self.page_cache.write();
-        let page_key = PageCacheKey::new(page_idx as usize);
-        if let Some(page) = page_cache.get(&page_key)? {
-            tracing::debug!("read_page(page_idx = {}) = cached", page_idx);
-            turso_assert!(
-                page_idx as usize == page.get().id,
-                "attempted to read page {page_idx} but got page {}",
-                page.get().id
-            );
-            return Ok((page, None));
+
+        // First check if page is in cache
+        {
+            let mut page_cache = self.page_cache.write();
+            let page_key = PageCacheKey::new(page_idx as usize);
+            if let Some(page) = page_cache.get(&page_key)? {
+                turso_assert!(
+                    page_idx as usize == page.get().id,
+                    "attempted to read page {page_idx} but got page {}",
+                    page.get().id
+                );
+                return Ok((page, None));
+            }
         }
+
+        tracing::debug!("read_page(page_idx = {page_idx}) = reading page from disk");
+        // Page not in cache, read from disk
         let (page, c) = self.read_page_no_cache(page_idx, None, false)?;
-        turso_assert!(
-            page_idx as usize == page.get().id,
-            "attempted to read page {page_idx} but got page {}",
-            page.get().id
-        );
-        self.cache_insert(page_idx as usize, page.clone(), &mut page_cache)?;
-        Ok((page, Some(c)))
+        loop {
+            match self.cache_insert(page_idx as usize, page.clone())? {
+                IOResult::Done(()) => {
+                    return Ok((page, Some(c)));
+                }
+                IOResult::IO(IOCompletions::Single(spill_c)) => {
+                    // NOTE: Because `cache_insert` can return completions as *multiple* different states, we cannot
+                    // simply create a new CompletionGroup and return it here without inserting the
+                    // page into the cache. In order to do this, we would need to make read_page
+                    // re-entrant so it continues to call cache_insert and have every caller
+                    // propogate the IOResult. For now, we will wait syncronously for spilling IO
+                    // on cache insertion on read_page.
+                    self.io.wait_for_completion(spill_c)?;
+                }
+            }
+        }
     }
 
     fn begin_read_disk_page(
@@ -1626,21 +1816,37 @@ impl Pager {
         )
     }
 
-    fn cache_insert(
-        &self,
-        page_idx: usize,
-        page: PageRef,
-        page_cache: &mut PageCache,
-    ) -> Result<()> {
-        let page_key = PageCacheKey::new(page_idx);
-        match page_cache.insert(page_key, page) {
-            Ok(_) => {}
-            Err(CacheError::KeyExists) => {
-                unreachable!("Page should not exist in cache after get() miss")
+    /// Insert a page into the cache, with spilling support.
+    /// This handles cache full conditions by spilling dirty pages and retrying.
+    fn cache_insert(&self, page_idx: usize, page: PageRef) -> Result<IOResult<()>> {
+        {
+            let mut page_cache = self.page_cache.write();
+            let page_key = PageCacheKey::new(page_idx);
+            match page_cache.insert(page_key, page.clone()) {
+                Ok(_) => return Ok(IOResult::Done(())),
+                Err(CacheError::KeyExists) => {
+                    unreachable!("Page should not exist in cache after get() miss");
+                }
+                Err(CacheError::Full) => {
+                    // Fall through to spilling
+                }
+                Err(e) => return Err(e.into()),
             }
-            Err(e) => return Err(e.into()),
         }
-        Ok(())
+
+        match self.try_spill_dirty_pages()? {
+            IOResult::Done(true) => {
+                let mut page_cache = self.page_cache.write();
+                let page_key = PageCacheKey::new(page_idx);
+                match page_cache.insert(page_key, page) {
+                    Ok(_) => Ok(IOResult::Done(())),
+                    Err(CacheError::KeyExists) => Ok(IOResult::Done(())),
+                    Err(e) => Err(e.into()),
+                }
+            }
+            IOResult::Done(false) => Err(LimboError::Busy),
+            IOResult::IO(c) => Ok(IOResult::IO(c)),
+        }
     }
 
     // Get a page from the cache, if it exists.
@@ -1712,76 +1918,498 @@ impl Pager {
         })
     }
 
-    /// Flush all dirty pages to disk.
-    /// Unlike commit_dirty_pages, this function does not commit, checkpoint now sync the WAL/Database.
+    /// Flush all dirty pages to disk (async/re-entrant).
+    /// Unlike commit_dirty_pages, this function does not commit, checkpoint nor sync the WAL/Database.
     #[instrument(skip_all, level = Level::INFO)]
-    pub fn cacheflush(&self) -> Result<Vec<Completion>> {
-        let Some(wal) = self.wal.as_ref() else {
-            // TODO: when ephemeral table spills to disk, it should cacheflush pages directly to the temporary database file.
-            // This handling is not yet implemented, but it should be when spilling is implemented.
-            return Err(LimboError::InternalError(
-                "cacheflush() called on database without WAL".to_string(),
-            ));
-        };
-        let dirty_pages = self
-            .dirty_pages
-            .read()
-            .iter()
-            .copied()
-            .collect::<Vec<usize>>();
-        let len = dirty_pages.len().min(IOV_MAX);
-        let mut completions: Vec<Completion> = Vec::new();
-        let mut pages = Vec::with_capacity(len);
+    pub fn cacheflush(&self) -> Result<IOResult<Vec<Completion>>> {
+        let wal = self
+            .wal
+            .as_ref()
+            .ok_or_else(|| LimboError::InternalError("cacheflush() called without WAL".into()))?;
         let page_sz = self.get_page_size().unwrap_or_default();
 
-        let prepare = wal.prepare_wal_start(page_sz)?;
-        if let Some(c) = prepare {
-            self.io.wait_for_completion(c)?;
-            let c = wal.prepare_wal_finish()?;
-            self.io.wait_for_completion(c)?;
-        }
+        loop {
+            let phase = std::mem::take(&mut *self.cacheflush_state.write());
 
-        let commit_frame = None; // cacheflush only so we are not setting a commit frame here
-        for (idx, page_id) in dirty_pages.iter().enumerate() {
-            let page = {
-                let mut cache = self.page_cache.write();
-                let page_key = PageCacheKey::new(*page_id);
-                let page = cache.get(&page_key)?.expect("we somehow added a page to dirty list but we didn't mark it as dirty, causing cache to drop it.");
-                let page_type = page.get_contents().maybe_page_type();
-                trace!("cacheflush(page={}, page_type={:?}", page_id, page_type);
-                page
-            };
-            pages.push(page);
-            if pages.len() == IOV_MAX {
-                match wal.append_frames_vectored(
-                    std::mem::replace(
-                        &mut pages,
-                        Vec::with_capacity(std::cmp::min(IOV_MAX, dirty_pages.len() - idx)),
-                    ),
-                    page_sz,
-                    commit_frame,
-                ) {
-                    Err(e) => {
-                        self.io.cancel(&completions)?;
-                        self.io.drain()?;
-                        return Err(e);
-                    }
-                    Ok(c) => completions.push(c),
+            match self.cacheflush_step(wal, page_sz, phase)? {
+                CacheFlushStep::Yield(next_phase, io) => {
+                    *self.cacheflush_state.write() = next_phase;
+                    return Ok(IOResult::IO(io));
+                }
+                CacheFlushStep::Continue(next_phase) => {
+                    *self.cacheflush_state.write() = next_phase;
+                }
+                CacheFlushStep::Done(completions) => {
+                    *self.cacheflush_state.write() = CacheFlushState::Init;
+                    return Ok(IOResult::Done(completions));
                 }
             }
         }
-        if !pages.is_empty() {
-            match wal.append_frames_vectored(pages, page_sz, commit_frame) {
+    }
+
+    /// Executes one step of the cache flush state machine.
+    #[inline]
+    fn cacheflush_step(
+        &self,
+        wal: &Arc<dyn Wal>,
+        page_sz: PageSize,
+        phase: CacheFlushState,
+    ) -> Result<CacheFlushStep> {
+        match phase {
+            CacheFlushState::Init => self.cacheflush_init(wal, page_sz),
+            CacheFlushState::WalPrepareStart {
+                dirty_ids,
+                completion,
+            } => self.cacheflush_wal_prepare_start(wal, dirty_ids, completion),
+            CacheFlushState::WalPrepareFinish {
+                dirty_ids,
+                completion,
+            } => self.cacheflush_wal_prepare_finish(dirty_ids, completion),
+            CacheFlushState::Collecting(state) => self.cacheflush_collect(wal, page_sz, state),
+            CacheFlushState::WaitingForRead {
+                state,
+                page_id,
+                page,
+                completion,
+            } => self.cacheflush_handle_read(wal, page_sz, state, page_id, page, completion),
+        }
+    }
+
+    /// Init phase: gather dirty page IDs and begin WAL preparation.
+    fn cacheflush_init(&self, wal: &Arc<dyn Wal>, page_sz: PageSize) -> Result<CacheFlushStep> {
+        let dirty_ids: Vec<usize> = self.dirty_pages.read().iter().copied().collect();
+
+        if dirty_ids.is_empty() {
+            return Ok(CacheFlushStep::Done(Vec::new()));
+        }
+
+        // Start WAL preparation
+        match wal.prepare_wal_start(page_sz)? {
+            Some(completion) => Ok(CacheFlushStep::Yield(
+                CacheFlushState::WalPrepareStart {
+                    dirty_ids,
+                    completion: completion.clone(),
+                },
+                IOCompletions::Single(completion),
+            )),
+            None => {
+                // No async prep needed, go straight to finish
+                let completion = wal.prepare_wal_finish()?;
+                Ok(CacheFlushStep::Yield(
+                    CacheFlushState::WalPrepareFinish {
+                        dirty_ids,
+                        completion: completion.clone(),
+                    },
+                    IOCompletions::Single(completion),
+                ))
+            }
+        }
+    }
+
+    #[inline]
+    /// Wait for WAL prepare_start, then call prepare_finish.
+    fn cacheflush_wal_prepare_start(
+        &self,
+        wal: &Arc<dyn Wal>,
+        dirty_ids: Vec<usize>,
+        completion: Completion,
+    ) -> Result<CacheFlushStep> {
+        if !completion.succeeded() {
+            return Ok(CacheFlushStep::Yield(
+                CacheFlushState::WalPrepareStart {
+                    dirty_ids,
+                    completion: completion.clone(),
+                },
+                IOCompletions::Single(completion),
+            ));
+        }
+
+        let finish_completion = wal.prepare_wal_finish()?;
+        Ok(CacheFlushStep::Yield(
+            CacheFlushState::WalPrepareFinish {
+                dirty_ids,
+                completion: finish_completion.clone(),
+            },
+            IOCompletions::Single(finish_completion),
+        ))
+    }
+
+    #[inline]
+    /// Wait for WAL prepare_finish, then start collecting pages.
+    fn cacheflush_wal_prepare_finish(
+        &self,
+        dirty_ids: Vec<usize>,
+        completion: Completion,
+    ) -> Result<CacheFlushStep> {
+        if !completion.succeeded() {
+            return Ok(CacheFlushStep::Yield(
+                CacheFlushState::WalPrepareFinish {
+                    dirty_ids,
+                    completion: completion.clone(),
+                },
+                IOCompletions::Single(completion),
+            ));
+        }
+
+        Ok(CacheFlushStep::Continue(CacheFlushState::Collecting(
+            CollectingState {
+                dirty_ids,
+                current_idx: 0,
+                collected_pages: Vec::new(),
+                completions: Vec::new(),
+            },
+        )))
+    }
+
+    #[inline]
+    /// Main collection loop: fetch pages from cache, handle evictions, write batches.
+    fn cacheflush_collect(
+        &self,
+        wal: &Arc<dyn Wal>,
+        page_sz: PageSize,
+        mut state: CollectingState,
+    ) -> Result<CacheFlushStep> {
+        while state.current_idx < state.dirty_ids.len() {
+            let page_id = state.dirty_ids[state.current_idx];
+            let cache_result = self.page_cache.write().get(&PageCacheKey::new(page_id))?;
+
+            match cache_result {
+                Some(page) => {
+                    trace!(
+                        "cacheflush(page={}, page_type={:?})",
+                        page_id,
+                        page.get_contents().maybe_page_type()
+                    );
+                    state.collected_pages.push(page);
+                    state.current_idx += 1;
+                }
+                None => {
+                    // Page evicted, need async read from WAL
+                    trace!("cacheflush: page {} evicted, reading from WAL", page_id);
+                    let (page, completion) =
+                        self.read_page_no_cache(page_id as i64, None, false)?;
+
+                    if !completion.succeeded() {
+                        return Ok(CacheFlushStep::Yield(
+                            CacheFlushState::WaitingForRead {
+                                state,
+                                page_id,
+                                page,
+                                completion: completion.clone(),
+                            },
+                            IOCompletions::Single(completion),
+                        ));
+                    }
+
+                    // Sync read completed immediately
+                    trace!(
+                        "cacheflush(page={}, page_type={:?}) [re-read sync]",
+                        page_id,
+                        page.get_contents().maybe_page_type()
+                    );
+                    state.collected_pages.push(page);
+                    state.current_idx += 1;
+                }
+            }
+            if Self::should_flush_batch(&state) {
+                self.flush_page_batch(wal, page_sz, &mut state)?;
+            }
+        }
+        // All pages collected and written
+        Ok(CacheFlushStep::Done(state.completions))
+    }
+
+    /// Handle completion of async page read for evicted page.
+    fn cacheflush_handle_read(
+        &self,
+        wal: &Arc<dyn Wal>,
+        page_sz: PageSize,
+        mut state: CollectingState,
+        page_id: usize,
+        page: PageRef,
+        completion: Completion,
+    ) -> Result<CacheFlushStep> {
+        if !completion.succeeded() {
+            return Ok(CacheFlushStep::Yield(
+                CacheFlushState::WaitingForRead {
+                    state,
+                    page_id,
+                    page,
+                    completion: completion.clone(),
+                },
+                IOCompletions::Single(completion),
+            ));
+        }
+        trace!(
+            "cacheflush(page={}, page_type={:?}) [re-read complete]",
+            page_id,
+            page.get_contents().maybe_page_type()
+        );
+        state.collected_pages.push(page);
+        state.current_idx += 1;
+        if Self::should_flush_batch(&state) {
+            self.flush_page_batch(wal, page_sz, &mut state)?;
+        }
+
+        Ok(CacheFlushStep::Continue(CacheFlushState::Collecting(state)))
+    }
+
+    #[inline]
+    fn should_flush_batch(state: &CollectingState) -> bool {
+        let at_capacity = state.collected_pages.len() == IOV_MAX;
+        let at_end = state.current_idx >= state.dirty_ids.len();
+        !state.collected_pages.is_empty() && (at_capacity || at_end)
+    }
+
+    /// Writes accumulated pages to WAL as a single vectored append.
+    #[inline]
+    fn flush_page_batch(
+        &self,
+        wal: &Arc<dyn Wal>,
+        page_sz: PageSize,
+        state: &mut CollectingState,
+    ) -> Result<()> {
+        let pages = std::mem::take(&mut state.collected_pages);
+        // Mark pages as write-pending to detect concurrent modifications
+        for page in &pages {
+            page.set_write_pending();
+        }
+        match wal.append_frames_vectored(pages, page_sz, None) {
+            Ok(completion) => {
+                state.completions.push(completion);
+                Ok(())
+            }
+            Err(e) => {
+                self.io.cancel(&state.completions)?;
+                self.io.drain()?;
+                Err(e)
+            }
+        }
+    }
+
+    /// Attempt to spill dirty pages from the cache to make room for new pages.
+    /// This is called when the cache reaches its spill threshold.
+    ///
+    /// For databases with a WAL: write only spillable dirty pages to WAL,
+    /// then mark them as spilled so they can be evicted even while dirty.
+    /// For ephemeral tables: writes pages directly to the temp database file.
+    #[instrument(skip_all, level = Level::DEBUG)]
+    pub fn try_spill_dirty_pages(&self) -> Result<IOResult<bool>> {
+        let state = self.spill_state.read().clone();
+        match state {
+            SpillState::Idle => {
+                // Check if spilling is needed
+                let spill_result = {
+                    let cache = self.page_cache.read();
+                    cache.check_spill(IOV_MAX)
+                };
+                match spill_result {
+                    SpillResult::NotNeeded | SpillResult::Disabled => {
+                        return Ok(IOResult::Done(false));
+                    }
+                    SpillResult::CacheFull => {
+                        tracing::debug!("try_spill_dirty_pages: cache full, no spillable pages");
+                        return Ok(IOResult::Done(false));
+                    }
+                    SpillResult::PagesToSpill(pages) => {
+                        if pages.is_empty() {
+                            return Ok(IOResult::Done(false));
+                        }
+                        let page_count = pages.len();
+                        tracing::debug!("try_spill_dirty_pages: spilling {} pages", page_count);
+                        if self.wal.is_some() {
+                            let Some(wal) = self.wal.as_ref() else {
+                                unreachable!("wal checked above");
+                            };
+                            let page_sz = self.get_page_size().unwrap_or_default();
+
+                            // Ensure WAL is initialized. Most of the time this is a no-op.
+                            let prepare = wal.prepare_wal_start(page_sz)?;
+                            if let Some(c) = prepare {
+                                self.io.wait_for_completion(c)?;
+                                let c = wal.prepare_wal_finish()?;
+                                self.io.wait_for_completion(c)?;
+                            }
+
+                            let wal_pages: Vec<PageRef> = pages
+                                .iter()
+                                .map(|p| {
+                                    // Set write_pending on all pages before WAL write so callback can
+                                    // detect mid-write modifications.
+                                    p.set_write_pending();
+                                    p.to_page()
+                                })
+                                .collect();
+                            let c = wal.append_frames_vectored(wal_pages, page_sz, None)?;
+
+                            if c.succeeded() {
+                                // Synchronous completion, WAL tags already set by callback.
+                                for page in &pages {
+                                    if page.has_wal_tag() {
+                                        page.set_spilled();
+                                    }
+                                }
+                                *self.spill_state.write() = SpillState::Idle;
+                                return Ok(IOResult::Done(true));
+                            }
+                            *self.spill_state.write() = SpillState::WritingToWal {
+                                pages,
+                                completions: vec![c.clone()],
+                            };
+                            io_yield_one!(c);
+                        } else {
+                            let mut group = CompletionGroup::new(|_| {});
+                            // Ephemeral table case: write directly to temp file
+                            for page in &pages {
+                                page.set_write_pending();
+                            }
+                            let completions = self.spill_pages_to_disk(&pages)?;
+                            if completions.is_empty() {
+                                self.finish_ephemeral_spill(&pages);
+                                return Ok(IOResult::Done(true));
+                            }
+                            for completion in &completions {
+                                group.add(completion);
+                            }
+                            *self.spill_state.write() = SpillState::WritingToDisk {
+                                pages,
+                                completions: completions.clone(),
+                            };
+                            io_yield_one!(group.build());
+                        }
+                    }
+                }
+            }
+            SpillState::WritingToWal { pages, completions } => {
+                for c in &completions {
+                    if !c.succeeded() {
+                        io_yield_one!(c.clone());
+                    }
+                }
+                // All I/O complete, pages are now in WAL.
+                // Mark spilled pages so they can be evicted while dirty.
+                // Only do so if page wasn't modified since write started (each page has valid wal_tag).
+                let mut spilled_count = 0;
+                for page in &pages {
+                    if page.has_wal_tag() {
+                        page.set_spilled();
+                        spilled_count += 1;
+                    } else {
+                        // Page was modified during write, it will need to be re-spilled
+                        tracing::debug!(
+                            "try_spill_dirty_pages: page {} modified during write, not marking as spilled",
+                            page.get().id
+                        );
+                    }
+                }
+                if spilled_count == 0 && !pages.is_empty() {
+                    tracing::warn!(
+                        "try_spill_dirty_pages: no pages marked as spilled out of {}, all were modified during write",
+                        pages.len()
+                    );
+                }
+                *self.spill_state.write() = SpillState::Idle;
+                trace!(
+                    "try_spill_dirty_pages: successfully spilled {} / {} pages to WAL",
+                    spilled_count,
+                    pages.len(),
+                );
+                return Ok(IOResult::Done(true));
+            }
+            SpillState::WritingToDisk { pages, completions } => {
+                let all_done = completions.iter().all(|c| c.succeeded());
+                if !all_done {
+                    for c in &completions {
+                        if !c.succeeded() {
+                            io_yield_one!(c.clone());
+                        }
+                    }
+                }
+                // All I/O complete, finish ephemeral spill
+                self.finish_ephemeral_spill(&pages);
+                *self.spill_state.write() = SpillState::Idle;
+                trace!(
+                    "try_spill_dirty_pages: successfully spilled {} pages to disk",
+                    pages.len()
+                );
+                return Ok(IOResult::Done(true));
+            }
+        }
+    }
+
+    /// Wait for any in-flight spill writes to finish.
+    /// This prevents publishing WAL metadata that references frames that are not yet durable.
+    fn wait_for_spill_completions(&self) -> Result<IOResult<()>> {
+        loop {
+            let state = self.spill_state.read().clone();
+            if matches!(state, SpillState::Idle) {
+                return Ok(IOResult::Done(()));
+            }
+            match self.try_spill_dirty_pages()? {
+                IOResult::Done(_) => continue,
+                IOResult::IO(c) => return Ok(IOResult::IO(c)),
+            }
+        }
+    }
+
+    /// Finish a spill operation for ephemeral tables
+    fn finish_ephemeral_spill(&self, pages: &[PinGuard]) {
+        for page in pages {
+            let tag = page.get().wal_tag.load(Ordering::Acquire);
+            // wal tag is set to TAG_UNSET when adding to dirty_pages, meaning that this
+            // page was dirtied after the spill started, so we don't clear the dirty flag in that case
+            if tag != TAG_UNSET {
+                page.clear_dirty();
+            }
+        }
+    }
+    /// Write a set of pages directly to the database file (for ephemeral tables without WAL).
+    /// This is used by try_spill_dirty_pages for ephemeral tables/indexes.
+    fn spill_pages_to_disk(&self, pages: &[PinGuard]) -> Result<Vec<Completion>> {
+        let mut completions: Vec<Completion> = Vec::with_capacity(pages.len());
+        for page in pages {
+            match begin_write_btree_page(self, &page.to_page()) {
                 Ok(c) => completions.push(c),
                 Err(e) => {
-                    tracing::error!("cacheflush: error appending frames: {e}");
                     self.io.cancel(&completions)?;
                     self.io.drain()?;
                     return Err(e);
                 }
             }
         }
+
         Ok(completions)
+    }
+
+    /// Check if the cache needs spilling and attempt to spill if necessary.
+    /// This should be called before inserting new pages into the cache.
+    pub fn ensure_cache_space(&self) -> Result<IOResult<()>> {
+        let needs_spill = {
+            let cache = self.page_cache.read();
+            cache.needs_spill()
+        };
+
+        if needs_spill {
+            match self.try_spill_dirty_pages()? {
+                IOResult::Done(spilled) => {
+                    if spilled {
+                        // After spilling, try to evict clean pages to make room in the cache
+                        let mut cache = self.page_cache.write();
+                        if let Err(e) = cache.make_room_for(1) {
+                            // Cache is completely full with unevictable pages
+                            tracing::error!(
+                                "ensure_cache_space: {e} cache full, could not make room"
+                            );
+                            return Err(LimboError::CacheError(CacheError::Full));
+                        }
+                    }
+                }
+                IOResult::IO(completion) => {
+                    return Ok(IOResult::IO(completion));
+                }
+            }
+        }
+        Ok(IOResult::Done(()))
     }
 
     /// Flush all dirty pages to disk.
@@ -1795,13 +2423,33 @@ impl Pager {
         sync_mode: crate::SyncMode,
         data_sync_retry: bool,
     ) -> Result<IOResult<PagerCommitResult>> {
+        // Reset commit_info at the start of each commit to ensure clean state.
+        // This is necessary because commit_info is shared across connections,
+        // and a previous connection's commit may have left stale state.
+        {
+            let commit_info = self.commit_info.read();
+            if commit_info.state == CommitState::PrepareWal {
+                // Only reset if we're starting fresh (not resuming from IO yield)
+                drop(commit_info);
+                self.commit_info.write().reset();
+            }
+        }
+
+        // Make sure any asynchronous spill writes are finished before we start publishing
+        // new frames to readers. Otherwise wal.max_frame may get ahead of what is actually
+        // on disk and readers can attempt to read unwritten frames.
+        if let IOResult::IO(c) = self.wait_for_spill_completions()? {
+            return Ok(IOResult::IO(c));
+        }
+
         match self.commit_dirty_pages_inner(
             wal_auto_checkpoint_disabled,
             sync_mode,
             data_sync_retry,
         ) {
             r @ (Ok(IOResult::Done(..)) | Err(..)) => {
-                self.commit_info.write().state = CommitState::PrepareWal;
+                let mut commit_info = self.commit_info.write();
+                commit_info.reset();
                 r
             }
             Ok(IOResult::IO(io)) => Ok(IOResult::IO(io)),
@@ -1821,7 +2469,7 @@ impl Pager {
             ));
         };
 
-        loop {
+        'outer: loop {
             let state = self.commit_info.read().state;
             trace!(?state);
             match state {
@@ -1851,74 +2499,114 @@ impl Pager {
                     };
                 }
                 CommitState::PrepareFrames { db_size } => {
-                    let now = self.io.now();
-                    self.commit_info.write().time = now;
-
-                    let dirty_ids: Vec<usize> = self.dirty_pages.read().iter().copied().collect();
-                    if dirty_ids.is_empty() {
-                        return Ok(IOResult::Done(PagerCommitResult::WalWritten));
-                    }
-
-                    let mut completions = Vec::new();
+                    let page_sz = self.get_page_size_unchecked();
+                    // Initialize dirty_ids on first entry, since this state is re-entrant
+                    // we need to be sure to clear the dirty_ids_to_process on any success or error
+                    // path.
                     {
                         let mut commit_info = self.commit_info.write();
-                        commit_info.completions.clear();
-                    }
-                    let page_sz = self.get_page_size_unchecked();
-                    let mut pages: Vec<PageRef> = Vec::with_capacity(dirty_ids.len().min(IOV_MAX));
-                    let total = dirty_ids.len();
-                    let mut cache = self.page_cache.write();
-                    for (i, page_id) in dirty_ids.into_iter().enumerate() {
-                        let page = {
-                            let page_key = PageCacheKey::new(page_id);
-                            let page = cache.get(&page_key)?.expect(
-                                "dirty list contained a page that cache dropped (page={page_id})",
-                            );
-                            trace!(
-                                "commit_dirty_pages(page={}, page_type={:?})",
-                                page_id,
-                                page.get_contents().maybe_page_type()
-                            );
-                            page
-                        };
-                        pages.push(page);
-
-                        let end_of_chunk = pages.len() == IOV_MAX || i == total - 1;
-                        if end_of_chunk {
-                            let commit_flag = if i == total - 1 {
-                                // Only the commit frame (final) frame carries the db_size
-                                Some(db_size)
-                            } else {
-                                None
-                            };
-                            let r = wal.append_frames_vectored(
-                                std::mem::take(&mut pages),
-                                page_sz,
-                                commit_flag,
-                            );
-                            match r {
-                                Ok(c) => completions.push(c),
-                                Err(e) => {
-                                    self.io.cancel(&completions)?;
-                                    return Err(e);
-                                }
+                        if commit_info.dirty_ids_to_process.is_empty()
+                            && commit_info.current_dirty_idx == 0
+                        {
+                            let dirty_pages = self.dirty_pages.read();
+                            commit_info.dirty_ids_to_process =
+                                dirty_pages.iter().copied().collect();
+                            if commit_info.dirty_ids_to_process.is_empty() {
+                                return Ok(IOResult::Done(PagerCommitResult::WalWritten));
                             }
                         }
                     }
-                    self.dirty_pages.write().clear();
+
+                    // Collect pages until we need to yield or finish
+                    'inner: loop {
+                        let (total, page_id) = {
+                            let commit_info = self.commit_info.read();
+                            let idx = commit_info.current_dirty_idx;
+                            let total = commit_info.dirty_ids_to_process.len();
+                            if idx >= total {
+                                break 'inner;
+                            }
+                            (total, commit_info.dirty_ids_to_process[idx])
+                        };
+
+                        let page_key = PageCacheKey::new(page_id);
+                        let cache_result = self.page_cache.write().get(&page_key)?;
+
+                        match cache_result {
+                            Some(page) => {
+                                let mut commit_info = self.commit_info.write();
+                                commit_info.collected_pages.push(page);
+                                commit_info.current_dirty_idx += 1;
+
+                                let is_last = commit_info.current_dirty_idx >= total;
+                                if commit_info.collected_pages.len() == IOV_MAX || is_last {
+                                    self.flush_collected_to_wal(
+                                        &mut commit_info,
+                                        page_sz,
+                                        db_size,
+                                        is_last,
+                                    )?;
+                                }
+                            }
+                            None => {
+                                // Page evicted, transition to waiting state
+                                let (page, completion) =
+                                    self.read_page_no_cache(page_id as i64, None, false)?;
+
+                                let mut commit_info = self.commit_info.write();
+                                commit_info.pending_read =
+                                    Some((page_id, page, completion.clone()));
+                                commit_info.state =
+                                    CommitState::WaitingForPageRead { db_size, page_sz };
+
+                                if !completion.succeeded() {
+                                    io_yield_one!(completion);
+                                }
+                                continue 'outer;
+                            }
+                        }
+                    }
+
                     // Nothing to append
-                    if completions.is_empty() {
+                    if self.commit_info.read().completions.is_empty() {
+                        turso_assert!(
+                            self.dirty_pages.read().is_empty(),
+                            "dirty pages must be empty if we didnt collect any completions"
+                        );
                         return Ok(IOResult::Done(PagerCommitResult::WalWritten));
                     } else {
-                        let mut commit_info = self.commit_info.write();
-                        commit_info.completions = completions;
                         // Skip sync if synchronous mode is OFF, go directly to WalCommitDone
+                        let mut commit_info = self.commit_info.write();
                         if sync_mode == crate::SyncMode::Off {
                             commit_info.state = CommitState::WalCommitDone;
                         } else {
                             commit_info.state = CommitState::SyncWal;
                         }
                     }
+                }
+                CommitState::WaitingForPageRead { db_size, page_sz } => {
+                    let mut commit_info = self.commit_info.write();
+                    let (page_id, page, completion) = commit_info
+                        .pending_read
+                        .take()
+                        .expect("must have pending_read in WaitingForPageRead state");
+
+                    if !completion.succeeded() {
+                        commit_info.pending_read = Some((page_id, page, completion.clone()));
+                        io_yield_one!(completion);
+                    }
+                    // Read complete, add to collected pages
+                    commit_info.collected_pages.push(page);
+                    commit_info.current_dirty_idx += 1;
+
+                    // Check if batch needed
+                    let total = commit_info.dirty_ids_to_process.len();
+                    let is_last = commit_info.current_dirty_idx >= total;
+                    if commit_info.collected_pages.len() == IOV_MAX || is_last {
+                        self.flush_collected_to_wal(&mut commit_info, page_sz, db_size, is_last)?;
+                    }
+                    // Return to PrepareFrames to continue collecting
+                    commit_info.state = CommitState::PrepareFrames { db_size };
                 }
                 CommitState::SyncWal => {
                     let sync_result = wal.sync();
@@ -1952,6 +2640,7 @@ impl Pager {
                     // After this point, the write transaction is durable regardless of checkpoint outcome
                     self.commit_info.write().completions.clear();
                     wal.finish_append_frames_commit()?;
+                    self.dirty_pages.write().clear();
 
                     if wal_auto_checkpoint_disabled || !wal.should_checkpoint() {
                         return Ok(IOResult::Done(PagerCommitResult::WalWritten));
@@ -1988,19 +2677,42 @@ impl Pager {
                             io_yield_one!(c);
                         }
                         Ok(IOResult::Done(res)) => {
-                            tracing::debug!(
-                                "total time flushing cache: {} ms",
-                                self.io
-                                    .now()
-                                    .to_system_time()
-                                    .duration_since(self.commit_info.read().time.to_system_time())
-                                    .unwrap()
-                                    .as_millis()
-                            );
                             return Ok(IOResult::Done(PagerCommitResult::Checkpointed(res)));
                         }
                     }
                 }
+            }
+        }
+    }
+
+    /// Writes collected pages to WAL as a single batch.
+    /// Clears `collected_pages` and appends completion to `frame_completions`.
+    fn flush_collected_to_wal(
+        &self,
+        commit_info: &mut CommitInfo,
+        page_sz: PageSize,
+        db_size: u32,
+        is_commit_frame: bool,
+    ) -> Result<()> {
+        let pages = std::mem::take(&mut commit_info.collected_pages);
+        if pages.is_empty() {
+            return Ok(());
+        }
+
+        let commit_flag = if is_commit_frame { Some(db_size) } else { None };
+        for page in &pages {
+            page.set_write_pending();
+        }
+
+        let wal = self.wal.as_ref().unwrap();
+        match wal.append_frames_vectored(pages, page_sz, commit_flag) {
+            Ok(c) => {
+                commit_info.completions.push(c);
+                Ok(())
+            }
+            Err(e) => {
+                self.io.cancel(&commit_info.completions)?;
+                Err(e)
             }
         }
     }
@@ -2056,13 +2768,20 @@ impl Pager {
             })?;
         }
         if header.is_commit_frame() {
-            for page_id in self.dirty_pages.read().iter() {
+            let mut dirty_pages = self.dirty_pages.write();
+            tracing::debug!(
+                "wal_callback: commit frame, clearing {} dirty pages",
+                dirty_pages.len()
+            );
+            let mut cache = self.page_cache.write();
+            for page_id in dirty_pages.iter() {
                 let page_key = PageCacheKey::new(*page_id);
-                let mut cache = self.page_cache.write();
-                let page = cache.get(&page_key)?.expect("we somehow added a page to dirty list but we didn't mark it as dirty, causing cache to drop it.");
-                page.clear_dirty();
+                // Page may have been evicted from cache after spilling to WAL
+                if let Some(page) = cache.get(&page_key)? {
+                    page.clear_dirty();
+                }
             }
-            self.dirty_pages.write().clear();
+            dirty_pages.clear();
         }
         Ok(WalFrameInfo {
             page_no: header.page_number,
@@ -2377,6 +3096,9 @@ impl Pager {
 
                     let trunk_page_id = header.freelist_trunk_page.get();
 
+                    // Pin page to prevent eviction while stored in state machine
+                    page.pin();
+
                     if trunk_page_id != 0 {
                         *state = FreePageState::AddToTrunk { page };
                     } else {
@@ -2423,8 +3145,11 @@ impl Pager {
                             page_id as u32,
                         );
 
+                        // Unpin page before finishing - it's added to freelist
+                        page.unpin();
                         break;
                     }
+                    // page remains pinned as it transitions to NewTrunk state
                     *state = FreePageState::NewTrunk { page: page.clone() };
                 }
                 FreePageState::NewTrunk { page } => {
@@ -2442,6 +3167,8 @@ impl Pager {
                     contents.write_u32_no_offset(TRUNK_PAGE_LEAF_COUNT_OFFSET, 0);
                     // Update page 1 to point to new trunk
                     header.freelist_trunk_page = (page_id as u32).into();
+                    // Unpin page before finishing - it's now a trunk page
+                    page.unpin();
                     break;
                 }
             }
@@ -2505,6 +3232,8 @@ impl Pager {
                 );
                 let c = begin_write_btree_page(self, &page1)?;
 
+                // Pin page1 to prevent eviction while stored in state machine
+                page1.pin();
                 *self.allocate_page1_state.write() = AllocatePage1State::Writing { page: page1 };
                 io_yield_one!(c);
             }
@@ -2518,6 +3247,7 @@ impl Pager {
                 })?;
                 // After we wrote the header page, we may now set this None, to signify we initialized
                 self.init_page_1.store(None);
+                page.unpin();
                 *self.allocate_page1_state.write() = AllocatePage1State::Done;
                 Ok(IOResult::Done(page))
             }
@@ -2539,13 +3269,15 @@ impl Pager {
     ///        SQLite's allocate_page() equivalent has a parameter 'nearby' which is a hint about the page number we want to have for the allocated page.
     ///        We should use this parameter to allocate the page in the same way as SQLite does; instead now we just either take the first available freelist page
     ///        or allocate a new page.
-    /// FIXME: handle no room in page cache
     #[allow(clippy::readonly_write_lock)]
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn allocate_page(&self) -> Result<IOResult<PageRef>> {
         const FREELIST_TRUNK_OFFSET_NEXT_TRUNK: usize = 0;
         const FREELIST_TRUNK_OFFSET_LEAF_COUNT: usize = 4;
         const FREELIST_TRUNK_OFFSET_FIRST_LEAF: usize = 8;
+
+        // Ensure cache has room before allocating (we may spill dirty pages first)
+        return_if_io!(self.ensure_cache_space());
 
         let header_ref = self.io.block(|| HeaderRefMut::from_pager(self))?;
         let header = header_ref.borrow_mut();
@@ -2590,6 +3322,8 @@ impl Pager {
                         continue;
                     }
                     let (trunk_page, c) = self.read_page(first_freelist_trunk_page_id as i64)?;
+                    // Pin trunk_page to prevent eviction while stored in state machine
+                    trunk_page.pin();
                     *state = AllocatePageState::SearchAvailableFreeListLeaf {
                         trunk_page,
                         current_db_size: new_db_size,
@@ -2627,6 +3361,10 @@ impl Pager {
                             trunk_page.get().id
                         );
 
+                        // Pin leaf_page to prevent eviction while stored in state machine
+                        // trunk_page is already pinned from previous state
+                        leaf_page.pin();
+
                         *state = AllocatePageState::ReuseFreelistLeaf {
                             trunk_page: trunk_page.clone(),
                             leaf_page,
@@ -2641,6 +3379,8 @@ impl Pager {
                     // No freelist leaves on this trunk page.
                     // If the freelist is completely empty, allocate a new page.
                     if next_trunk_page_id == 0 {
+                        // Unpin trunk_page since we're transitioning away
+                        trunk_page.unpin();
                         *state = AllocatePageState::AllocateNewPage {
                             current_db_size: *current_db_size,
                         };
@@ -2668,6 +3408,8 @@ impl Pager {
                             trunk_page.get().id
                         );
                     }
+                    // Unpin trunk_page before returning - caller takes ownership
+                    trunk_page.unpin();
                     let trunk_page = trunk_page.clone();
                     *state = AllocatePageState::Start;
                     return Ok(IOResult::Done(trunk_page));
@@ -2726,6 +3468,9 @@ impl Pager {
                     );
 
                     header.freelist_pages = (header.freelist_pages.get() - 1).into();
+                    // Unpin both pages before returning - caller takes ownership of leaf_page
+                    trunk_page.unpin();
+                    leaf_page.unpin();
                     let leaf_page = leaf_page.clone();
                     *state = AllocatePageState::Start;
                     return Ok(IOResult::Done(leaf_page));
@@ -2827,10 +3572,10 @@ impl Pager {
     fn reset_internal_states(&self) {
         *self.checkpoint_state.write() = CheckpointState::default();
         self.syncing.store(false, Ordering::SeqCst);
-        self.commit_info.write().state = CommitState::PrepareWal;
-        self.commit_info.write().time = self.io.now();
+        self.commit_info.write().reset();
         *self.allocate_page_state.write() = AllocatePageState::Start;
         *self.free_page_state.write() = FreePageState::Start;
+        *self.spill_state.write() = SpillState::Idle;
         #[cfg(not(feature = "omit_autovacuum"))]
         {
             let mut vacuum_state = self.vacuum_state.write();
