@@ -38,8 +38,6 @@ pub(crate) enum SimulationPhase {
 }
 
 /// Represents a single operation during a transaction, applied in order.
-/// TODO: encode table/index creations etc. as operations too (although
-/// in both WAL mode and MVCC DDL requires an exclusive transaction)
 #[derive(Debug, Clone)]
 pub enum RowOperation {
     Insert {
@@ -56,6 +54,24 @@ pub enum RowOperation {
     RenameTable {
         old_name: String,
         new_name: String,
+    },
+    AddColumn {
+        table_name: String,
+        column: sql_generation::model::table::Column,
+    },
+    DropColumn {
+        table_name: String,
+        column_index: usize,
+    },
+    RenameColumn {
+        table_name: String,
+        old_name: String,
+        new_name: String,
+    },
+    AlterColumn {
+        table_name: String,
+        old_name: String,
+        new_column: sql_generation::model::table::Column,
     },
 }
 
@@ -92,6 +108,43 @@ impl TransactionTables {
     pub fn record_rename_table(&mut self, old_name: String, new_name: String) {
         self.operations
             .push(RowOperation::RenameTable { old_name, new_name });
+    }
+
+    pub fn record_add_column(
+        &mut self,
+        table_name: String,
+        column: sql_generation::model::table::Column,
+    ) {
+        self.operations
+            .push(RowOperation::AddColumn { table_name, column });
+    }
+
+    pub fn record_drop_column(&mut self, table_name: String, column_index: usize) {
+        self.operations.push(RowOperation::DropColumn {
+            table_name,
+            column_index,
+        });
+    }
+
+    pub fn record_rename_column(&mut self, table_name: String, old_name: String, new_name: String) {
+        self.operations.push(RowOperation::RenameColumn {
+            table_name,
+            old_name,
+            new_name,
+        });
+    }
+
+    pub fn record_alter_column(
+        &mut self,
+        table_name: String,
+        old_name: String,
+        new_column: sql_generation::model::table::Column,
+    ) {
+        self.operations.push(RowOperation::AlterColumn {
+            table_name,
+            old_name,
+            new_column,
+        });
     }
 }
 
@@ -168,15 +221,52 @@ where
         }
     }
 
+    /// Record that a column was added during the current transaction
+    pub fn record_add_column(
+        &mut self,
+        table_name: String,
+        column: sql_generation::model::table::Column,
+    ) {
+        if let Some(txn) = &mut *self.transaction_tables {
+            txn.record_add_column(table_name, column);
+        }
+    }
+
+    /// Record that a column was dropped during the current transaction
+    pub fn record_drop_column(&mut self, table_name: String, column_index: usize) {
+        if let Some(txn) = &mut *self.transaction_tables {
+            txn.record_drop_column(table_name, column_index);
+        }
+    }
+
+    /// Record that a column was renamed during the current transaction
+    pub fn record_rename_column(&mut self, table_name: String, old_name: String, new_name: String) {
+        if let Some(txn) = &mut *self.transaction_tables {
+            txn.record_rename_column(table_name, old_name, new_name);
+        }
+    }
+
+    /// Record that a column was altered during the current transaction
+    pub fn record_alter_column(
+        &mut self,
+        table_name: String,
+        old_name: String,
+        new_column: sql_generation::model::table::Column,
+    ) {
+        if let Some(txn) = &mut *self.transaction_tables {
+            txn.record_alter_column(table_name, old_name, new_column);
+        }
+    }
+
     pub fn create_snapshot(&mut self) {
         *self.transaction_tables = Some(TransactionTables::new(self.commited_tables.clone()));
     }
 
     pub fn apply_snapshot(&mut self) {
         if let Some(transaction_tables) = self.transaction_tables.take() {
-            // Apply all operations in recorded order, including renames.
-            // This ensures operations like INSERT foo, RENAME foo->bar, INSERT bar
-            // are applied correctly.
+            // Apply all operations in recorded order.
+            // This ensures operations like ADD COLUMN, DELETE are applied correctly
+            // where DELETE sees rows with the same shape as when it was recorded.
             for op in &transaction_tables.operations {
                 match op {
                     RowOperation::Insert { table_name, row } => {
@@ -211,64 +301,109 @@ where
                             committed.name = new_name.clone();
                         }
                     }
+                    RowOperation::AddColumn { table_name, column } => {
+                        if let Some(committed) = self
+                            .commited_tables
+                            .iter_mut()
+                            .find(|t| &t.name == table_name)
+                        {
+                            committed.columns.push(column.clone());
+                            let new_col_count = committed.columns.len();
+                            // Add NULL only for rows that need it.
+                            // Rows inserted after ADD COLUMN in the same transaction
+                            // already have the correct number of values.
+                            for row in &mut committed.rows {
+                                while row.len() < new_col_count {
+                                    row.push(SimValue::NULL);
+                                }
+                            }
+                        }
+                    }
+                    RowOperation::DropColumn {
+                        table_name,
+                        column_index,
+                    } => {
+                        if let Some(committed) = self
+                            .commited_tables
+                            .iter_mut()
+                            .find(|t| &t.name == table_name)
+                        {
+                            let old_col_count = committed.columns.len();
+                            committed.columns.remove(*column_index);
+                            // Only remove from rows that have the old column count.
+                            // Rows inserted after DROP COLUMN in the same transaction
+                            // already have the correct (new) number of values.
+                            for row in &mut committed.rows {
+                                if row.len() == old_col_count {
+                                    row.remove(*column_index);
+                                }
+                            }
+                        }
+                    }
+                    RowOperation::RenameColumn {
+                        table_name,
+                        old_name,
+                        new_name,
+                    } => {
+                        if let Some(committed) = self
+                            .commited_tables
+                            .iter_mut()
+                            .find(|t| &t.name == table_name)
+                        {
+                            if let Some(col) =
+                                committed.columns.iter_mut().find(|c| &c.name == old_name)
+                            {
+                                col.name = new_name.clone();
+                            }
+                            // Update index column names
+                            for index in &mut committed.indexes {
+                                for (col_name, _) in &mut index.columns {
+                                    if col_name == old_name {
+                                        *col_name = new_name.clone();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    RowOperation::AlterColumn {
+                        table_name,
+                        old_name,
+                        new_column,
+                    } => {
+                        if let Some(committed) = self
+                            .commited_tables
+                            .iter_mut()
+                            .find(|t| &t.name == table_name)
+                        {
+                            if let Some(col) =
+                                committed.columns.iter_mut().find(|c| &c.name == old_name)
+                            {
+                                *col = new_column.clone();
+                            }
+                            // Update index column names if the column was renamed
+                            for index in &mut committed.indexes {
+                                for (col_name, _) in &mut index.columns {
+                                    if col_name == old_name {
+                                        *col_name = new_column.name.clone();
+                                    }
+                                }
+                            }
+                        }
+                    }
                 }
             }
 
-            // Sync schema (columns, indexes) and create new tables.
-            // This happens after row operations so table names are in their final state.
+            // Sync indexes and add new tables created in the transaction.
             for current_table in &transaction_tables.current_tables {
                 if let Some(committed) = self
                     .commited_tables
                     .iter_mut()
                     .find(|t| t.name == current_table.name)
                 {
-                    let old_col_count = committed.columns.len();
-                    let new_col_count = current_table.columns.len();
-
-                    if new_col_count > old_col_count {
-                        // ADD COLUMN: fill with NULL only for rows that need it.
-                        // Rows inserted after ADD COLUMN in the same transaction
-                        // already have the correct number of values.
-                        for row in &mut committed.rows {
-                            while row.len() < new_col_count {
-                                row.push(SimValue::NULL);
-                            }
-                        }
-                    } else if new_col_count < old_col_count {
-                        // DROP COLUMN: find dropped columns by name and remove from rows
-                        let old_col_names: Vec<_> =
-                            committed.columns.iter().map(|c| &c.name).collect();
-                        let new_col_names: Vec<_> =
-                            current_table.columns.iter().map(|c| &c.name).collect();
-
-                        // Process in reverse order to preserve indices during removal
-                        let mut dropped_indices: Vec<usize> = old_col_names
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, name)| !new_col_names.contains(name))
-                            .map(|(idx, _)| idx)
-                            .collect();
-                        dropped_indices.sort_by(|a, b| b.cmp(a));
-
-                        for row in &mut committed.rows {
-                            // Only remove from rows that have the old column count.
-                            // Rows inserted after DROP COLUMN in the same transaction
-                            // already have the correct (new) number of values.
-                            if row.len() == old_col_count {
-                                for &idx in &dropped_indices {
-                                    row.remove(idx);
-                                }
-                            }
-                        }
-                    }
+                    // Sync indexes (CreateIndex/DropIndex don't have RowOperations yet)
                     committed.indexes = current_table.indexes.clone();
-                    committed.columns = current_table.columns.clone();
                 } else {
                     // New table created in transaction - copy with rows intact.
-                    // The rows are already correct in current_tables since all insert
-                    // operations were applied there during the transaction.
-                    // We don't need to replay operations for new tables since the
-                    // inserts were skipped above (table didn't exist in committed_tables).
                     self.commited_tables.push(current_table.clone());
                 }
             }

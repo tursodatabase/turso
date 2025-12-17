@@ -661,11 +661,40 @@ impl Shadow for AlterTable {
     type Result = anyhow::Result<Vec<Vec<SimValue>>>;
 
     fn shadow(&self, tables: &mut ShadowTablesMut<'_>) -> Self::Result {
-        // Record old_name -> new_name before the table is renamed below
-        if let AlterTableType::RenameTo { new_name } = &self.alter_table_type {
-            tables.record_rename_table(self.table_name.clone(), new_name.clone());
+        // Record operations BEFORE applying them to current_tables.
+        // This ensures the operation is recorded with the correct state (e.g., column index
+        // before any changes happen).
+        match &self.alter_table_type {
+            AlterTableType::RenameTo { new_name } => {
+                tables.record_rename_table(self.table_name.clone(), new_name.clone());
+            }
+            AlterTableType::AddColumn { column } => {
+                tables.record_add_column(self.table_name.clone(), column.clone());
+            }
+            AlterTableType::DropColumn { column_name } => {
+                // Find column index before applying the change
+                let col_idx = tables
+                    .iter()
+                    .find(|t| t.name == self.table_name)
+                    .and_then(|t| t.columns.iter().position(|c| c.name == *column_name))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Column {} does not exist in table {}",
+                            column_name,
+                            self.table_name
+                        )
+                    })?;
+                tables.record_drop_column(self.table_name.clone(), col_idx);
+            }
+            AlterTableType::RenameColumn { old, new } => {
+                tables.record_rename_column(self.table_name.clone(), old.clone(), new.clone());
+            }
+            AlterTableType::AlterColumn { old, new } => {
+                tables.record_alter_column(self.table_name.clone(), old.clone(), new.clone());
+            }
         }
 
+        // Now apply the change to current_tables
         let table = tables
             .iter_mut()
             .find(|t| t.name == self.table_name)
