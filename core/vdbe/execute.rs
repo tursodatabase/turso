@@ -386,35 +386,33 @@ pub fn op_checkpoint(
             }
         }
     }
-    loop {
-        let step_result = program.connection.pager.load().checkpoint(
-            *checkpoint_mode,
-            program.connection.get_sync_mode(),
-            true,
-        );
-        match step_result {
-            Ok(IOResult::Done(CheckpointResult {
-                num_attempted,
-                num_backfilled,
-                ..
-            })) => {
-                // https://sqlite.org/pragma.html#pragma_wal_checkpoint
-                // 1st col: 1 (checkpoint SQLITE_BUSY) or 0 (not busy).
-                state.registers[*dest] = Register::Value(Value::Integer(0));
-                // 2nd col: # modified pages written to wal file
-                state.registers[*dest + 1] = Register::Value(Value::Integer(num_attempted as i64));
-                // 3rd col: # pages moved to db after checkpoint
-                state.registers[*dest + 2] = Register::Value(Value::Integer(num_backfilled as i64));
+    let step_result = program.connection.pager.load().checkpoint(
+        *checkpoint_mode,
+        program.connection.get_sync_mode(),
+        true,
+    );
+    match step_result {
+        Ok(IOResult::Done(CheckpointResult {
+            num_attempted,
+            num_backfilled,
+            ..
+        })) => {
+            // https://sqlite.org/pragma.html#pragma_wal_checkpoint
+            // 1st col: 1 (checkpoint SQLITE_BUSY) or 0 (not busy).
+            state.registers[*dest] = Register::Value(Value::Integer(0));
+            // 2nd col: # modified pages written to wal file
+            state.registers[*dest + 1] = Register::Value(Value::Integer(num_attempted as i64));
+            // 3rd col: # pages moved to db after checkpoint
+            state.registers[*dest + 2] = Register::Value(Value::Integer(num_backfilled as i64));
 
-                state.pc += 1;
-                return Ok(InsnFunctionStepResult::Step);
-            }
-            Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
-            Err(_err) => {
-                state.registers[*dest] = Register::Value(Value::Integer(1));
-                state.pc += 1;
-                return Ok(InsnFunctionStepResult::Step);
-            }
+            state.pc += 1;
+            Ok(InsnFunctionStepResult::Step)
+        }
+        Ok(IOResult::IO(io)) => Ok(InsnFunctionStepResult::IO(io)),
+        Err(_err) => {
+            state.registers[*dest] = Register::Value(Value::Integer(1));
+            state.pc += 1;
+            Ok(InsnFunctionStepResult::Step)
         }
     }
 }
