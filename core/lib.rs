@@ -1914,7 +1914,9 @@ impl Connection {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
-        self.pager.load().wal_checkpoint(mode)
+        self.pager
+            .load()
+            .blocking_checkpoint(mode, self.get_sync_mode())
     }
 
     /// Close a connection and checkpoint.
@@ -1943,9 +1945,10 @@ impl Connection {
             .fetch_sub(1, std::sync::atomic::Ordering::SeqCst)
             .eq(&1)
         {
-            self.pager
-                .load()
-                .checkpoint_shutdown(self.is_wal_auto_checkpoint_disabled())?;
+            self.pager.load().checkpoint_shutdown(
+                self.is_wal_auto_checkpoint_disabled(),
+                self.get_sync_mode(),
+            )?;
         };
         Ok(())
     }

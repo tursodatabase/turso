@@ -2266,7 +2266,11 @@ impl Pager {
     /// connection being closed is the last open connection to the database),
     /// then SQLite performs a [checkpoint] before closing the connection and
     /// deletes the WAL file.
-    pub fn checkpoint_shutdown(&self, wal_auto_checkpoint_disabled: bool) -> Result<()> {
+    pub fn checkpoint_shutdown(
+        &self,
+        wal_auto_checkpoint_disabled: bool,
+        sync_mode: crate::SyncMode,
+    ) -> Result<()> {
         let mut attempts = 0;
         {
             let Some(wal) = self.wal.as_ref() else {
@@ -2279,9 +2283,12 @@ impl Pager {
             self.io.wait_for_completion(c)?;
         }
         if !wal_auto_checkpoint_disabled {
-            while let Err(LimboError::Busy) = self.wal_checkpoint(CheckpointMode::Truncate {
-                upper_bound_inclusive: None,
-            }) {
+            while let Err(LimboError::Busy) = self.blocking_checkpoint(
+                CheckpointMode::Truncate {
+                    upper_bound_inclusive: None,
+                },
+                sync_mode,
+            ) {
                 if attempts == 3 {
                     // don't return error on `close` if we are unable to checkpoint, we can silently fail
                     tracing::warn!(
@@ -2297,76 +2304,16 @@ impl Pager {
         Ok(())
     }
 
+    /// Perform a blocking checkpoint with the specified mode.
+    /// This is a convenience wrapper around `checkpoint()` that blocks until completion.
+    /// Explicit checkpoints clear the page cache after completion.
     #[instrument(skip_all, level = Level::DEBUG)]
-    pub fn wal_checkpoint_start(&self, mode: CheckpointMode) -> Result<IOResult<CheckpointResult>> {
-        let Some(wal) = self.wal.as_ref() else {
-            return Err(LimboError::InternalError(
-                "wal_checkpoint() called on database without WAL".to_string(),
-            ));
-        };
-
-        wal.checkpoint(self, mode)
-    }
-
-    pub fn wal_checkpoint_finish(
+    pub fn blocking_checkpoint(
         &self,
-        checkpoint_result: &mut CheckpointResult,
-    ) -> Result<IOResult<()>> {
-        'ensure_sync: {
-            if checkpoint_result.num_backfilled != 0 {
-                if checkpoint_result.everything_backfilled() {
-                    let db_size = self
-                        .io
-                        .block(|| self.with_header(|header| header.database_size))?
-                        .get();
-                    let page_size = self.get_page_size().unwrap_or_default();
-                    let expected = (db_size * page_size.get()) as u64;
-                    if expected < self.db_file.size()? {
-                        if !checkpoint_result.db_truncate_sent {
-                            let c = self.db_file.truncate(
-                                expected as usize,
-                                Completion::new_trunc(move |_| {
-                                    tracing::trace!(
-                                        "Database file truncated to expected size: {} bytes",
-                                        expected
-                                    );
-                                }),
-                            )?;
-                            checkpoint_result.db_truncate_sent = true;
-                            io_yield_one!(c);
-                        }
-                        if !checkpoint_result.db_sync_sent {
-                            let c = self.db_file.sync(Completion::new_sync(move |_| {
-                                tracing::trace!("Database file syncd after truncation");
-                            }))?;
-                            checkpoint_result.db_sync_sent = true;
-                            io_yield_one!(c);
-                        }
-                        break 'ensure_sync;
-                    }
-                }
-                if !checkpoint_result.db_sync_sent {
-                    // if we backfilled at all, we have to sync the db-file here
-                    let c = self.db_file.sync(Completion::new_sync(move |_| {}))?;
-                    checkpoint_result.db_sync_sent = true;
-                    io_yield_one!(c);
-                }
-            }
-        }
-        checkpoint_result.release_guard();
-        // TODO: only clear cache of things that are really invalidated
-        self.page_cache
-            .write()
-            .clear(false)
-            .map_err(|e| LimboError::InternalError(format!("Failed to clear page cache: {e:?}")))?;
-        Ok(IOResult::Done(()))
-    }
-
-    #[instrument(skip_all, level = Level::DEBUG)]
-    pub fn wal_checkpoint(&self, mode: CheckpointMode) -> Result<CheckpointResult> {
-        let mut result = self.io.block(|| self.wal_checkpoint_start(mode))?;
-        self.io.block(|| self.wal_checkpoint_finish(&mut result))?;
-        Ok(result)
+        mode: CheckpointMode,
+        sync_mode: crate::SyncMode,
+    ) -> Result<CheckpointResult> {
+        self.io.block(|| self.checkpoint(mode, sync_mode, true))
     }
 
     pub fn freepage_list(&self) -> u32 {
