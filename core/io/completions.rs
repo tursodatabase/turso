@@ -349,9 +349,9 @@ impl Completion {
             Some(inner) => match &inner.completion_type {
                 CompletionType::Group(g) => {
                     g.inner.outstanding.load(Ordering::SeqCst) == 0
-                        && g.inner.result.get().is_none_or(|e| e.is_none())
+                        && g.inner.result.get().is_some_and(|e| e.is_none())
                 }
-                _ => inner.result.get().is_some(),
+                _ => inner.result.get().is_some_and(|e| e.is_none()),
             },
             None => true,
         }
