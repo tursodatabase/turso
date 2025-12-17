@@ -4797,16 +4797,21 @@ impl BTreeCursor {
                     old_offset,
                     old_local_size,
                 } => {
-                    let writable = self.pager.add_dirty(page)?;
-                    let contents = writable.contents_mut();
+                    turso_assert!(
+                        page.is_dirty(),
+                        "page must be dirty to have its contents be overwritten"
+                    );
+                    turso_assert!(
+                        page.is_loaded(),
+                        "page must be loaded to have its contents be overwritten"
+                    );
+                    let contents = page.get_contents_mut_unsafe_dont_use();
                     let cell = contents.cell_get(cell_idx, self.usable_space())?;
                     return_if_io!(self.clear_overflow_pages(&cell));
 
                     // if it all fits in local space and old_local_size is enough, do an in-place overwrite
                     if new_payload.len() == *old_local_size {
-                        let buf = contents.as_mut_slice();
-                        buf[*old_offset..*old_offset + new_payload.len()]
-                            .copy_from_slice(new_payload);
+                        Self::overwrite_content(contents, *old_offset, new_payload)?;
                         return Ok(IOResult::Done(()));
                     }
 
@@ -4816,6 +4821,16 @@ impl BTreeCursor {
                 }
             }
         }
+    }
+
+    pub fn overwrite_content(
+        contents: &mut PageContent,
+        dest_offset: usize,
+        new_payload: &[u8],
+    ) -> Result<()> {
+        let buf = contents.as_mut_slice();
+        buf[dest_offset..dest_offset + new_payload.len()].copy_from_slice(new_payload);
+        Ok(())
     }
 
     fn get_immutable_record_or_create(&self) -> std::cell::RefMut<'_, Option<ImmutableRecord>> {
