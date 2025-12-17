@@ -14,7 +14,7 @@ const SIZE_MARKER_8BIT: u8 = 12;
 const SIZE_MARKER_16BIT: u8 = 13;
 const SIZE_MARKER_32BIT: u8 = 14;
 const MAX_JSON_DEPTH: usize = 1000;
-const INFINITY_CHAR_COUNT: u8 = 5;
+const INFINITY_CHAR_COUNT: u8 = 8;
 
 const fn make_whitespace_table() -> [u8; 256] {
     let mut table = [0u8; 256];
@@ -1453,7 +1453,7 @@ impl Jsonb {
             bail_parse_error!("Integer is less then 2 chars: {}", float_str);
         }
         match float_str {
-            "9e999" | "-9e999" => {
+            "9.0e+999" | "-9.0e+999" => {
                 string.push_str(float_str);
             }
             val if val.starts_with("-.") => {
@@ -2055,8 +2055,8 @@ impl Jsonb {
 
             pos += infinity.len();
 
-            // Write Infinity as 9e999
-            self.data.extend_from_slice(b"9e999");
+            // Write Infinity as 9.0e+999
+            self.data.extend_from_slice(b"9.0e+999");
             self.write_element_header(
                 num_start,
                 ElementType::FLOAT5,
@@ -3530,11 +3530,11 @@ mod tests {
 
         // Infinity
         let parsed = Jsonb::from_str("Infinity").unwrap();
-        assert_eq!(parsed.to_string(), "9e999");
+        assert_eq!(parsed.to_string(), "9.0e+999");
 
         // Negative Infinity
         let parsed = Jsonb::from_str("-Infinity").unwrap();
-        assert_eq!(parsed.to_string(), "-9e999");
+        assert_eq!(parsed.to_string(), "-9.0e+999");
 
         // Verify correct type
         let header = JsonbHeader::from_slice(0, &parsed.data).unwrap().0;
