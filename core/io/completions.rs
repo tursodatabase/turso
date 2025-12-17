@@ -989,4 +989,249 @@ mod tests {
         assert_eq!(parent_group.get_error(), Some(CompletionError::Aborted));
         assert!(parent_called.load(Ordering::SeqCst));
     }
+
+    // Tests for individual completion success/failure status
+
+    #[test]
+    fn test_write_completion_pending_status() {
+        let c = Completion::new_write(|_| {});
+
+        // Pending completion should not be finished, succeeded, or failed
+        assert!(!c.finished());
+        assert!(!c.succeeded());
+        assert!(!c.failed());
+        assert!(c.get_error().is_none());
+    }
+
+    #[test]
+    fn test_write_completion_success() {
+        let c = Completion::new_write(|_| {});
+
+        c.complete(42);
+
+        assert!(c.finished());
+        assert!(c.succeeded());
+        assert!(!c.failed());
+        assert!(c.get_error().is_none());
+    }
+
+    #[test]
+    fn test_write_completion_failure() {
+        let c = Completion::new_write(|_| {});
+
+        c.error(CompletionError::Aborted);
+
+        assert!(c.finished());
+        assert!(!c.succeeded());
+        assert!(c.failed());
+        assert_eq!(c.get_error(), Some(CompletionError::Aborted));
+    }
+
+    #[test]
+    fn test_read_completion_pending_status() {
+        let buf = Arc::new(crate::Buffer::new_temporary(4096));
+        let c = Completion::new_read(buf, |_| {});
+
+        assert!(!c.finished());
+        assert!(!c.succeeded());
+        assert!(!c.failed());
+        assert!(c.get_error().is_none());
+    }
+
+    #[test]
+    fn test_read_completion_success() {
+        let buf = Arc::new(crate::Buffer::new_temporary(4096));
+        let c = Completion::new_read(buf, |_| {});
+
+        c.complete(1024);
+
+        assert!(c.finished());
+        assert!(c.succeeded());
+        assert!(!c.failed());
+        assert!(c.get_error().is_none());
+    }
+
+    #[test]
+    fn test_read_completion_failure() {
+        let buf = Arc::new(crate::Buffer::new_temporary(4096));
+        let c = Completion::new_read(buf, |_| {});
+
+        c.error(CompletionError::Aborted);
+
+        assert!(c.finished());
+        assert!(!c.succeeded());
+        assert!(c.failed());
+        assert_eq!(c.get_error(), Some(CompletionError::Aborted));
+    }
+
+    #[test]
+    fn test_sync_completion_pending_status() {
+        let c = Completion::new_sync(|_| {});
+
+        assert!(!c.finished());
+        assert!(!c.succeeded());
+        assert!(!c.failed());
+        assert!(c.get_error().is_none());
+    }
+
+    #[test]
+    fn test_sync_completion_success() {
+        let c = Completion::new_sync(|_| {});
+
+        c.complete(0);
+
+        assert!(c.finished());
+        assert!(c.succeeded());
+        assert!(!c.failed());
+        assert!(c.get_error().is_none());
+    }
+
+    #[test]
+    fn test_sync_completion_failure() {
+        let c = Completion::new_sync(|_| {});
+
+        c.error(CompletionError::Aborted);
+
+        assert!(c.finished());
+        assert!(!c.succeeded());
+        assert!(c.failed());
+        assert_eq!(c.get_error(), Some(CompletionError::Aborted));
+    }
+
+    #[test]
+    fn test_truncate_completion_pending_status() {
+        let c = Completion::new_trunc(|_| {});
+
+        assert!(!c.finished());
+        assert!(!c.succeeded());
+        assert!(!c.failed());
+        assert!(c.get_error().is_none());
+    }
+
+    #[test]
+    fn test_truncate_completion_success() {
+        let c = Completion::new_trunc(|_| {});
+
+        c.complete(0);
+
+        assert!(c.finished());
+        assert!(c.succeeded());
+        assert!(!c.failed());
+        assert!(c.get_error().is_none());
+    }
+
+    #[test]
+    fn test_truncate_completion_failure() {
+        let c = Completion::new_trunc(|_| {});
+
+        c.error(CompletionError::Aborted);
+
+        assert!(c.finished());
+        assert!(!c.succeeded());
+        assert!(c.failed());
+        assert_eq!(c.get_error(), Some(CompletionError::Aborted));
+    }
+
+    #[test]
+    fn test_yield_completion_status() {
+        let c = Completion::new_yield();
+
+        // Yield completions are always considered finished and succeeded
+        assert!(c.finished());
+        assert!(c.succeeded());
+        assert!(!c.failed());
+        assert!(c.get_error().is_none());
+    }
+
+    #[test]
+    fn test_completion_abort() {
+        let c = Completion::new_write(|_| {});
+
+        c.abort();
+
+        assert!(c.finished());
+        assert!(!c.succeeded());
+        assert!(c.failed());
+        assert_eq!(c.get_error(), Some(CompletionError::Aborted));
+    }
+
+    #[test]
+    fn test_completion_callback_receives_success_result() {
+        use std::sync::atomic::{AtomicI32, Ordering};
+
+        let result_value = Arc::new(AtomicI32::new(-1));
+        let result_value_clone = result_value.clone();
+
+        let c = Completion::new_write(move |res| {
+            if let Ok(val) = res {
+                result_value_clone.store(val, Ordering::SeqCst);
+            }
+        });
+
+        c.complete(42);
+
+        assert_eq!(result_value.load(Ordering::SeqCst), 42);
+        assert!(c.succeeded());
+    }
+
+    #[test]
+    fn test_completion_callback_receives_error_result() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let got_error = Arc::new(AtomicBool::new(false));
+        let got_error_clone = got_error.clone();
+
+        let c = Completion::new_write(move |res| {
+            if res.is_err() {
+                got_error_clone.store(true, Ordering::SeqCst);
+            }
+        });
+
+        c.error(CompletionError::Aborted);
+
+        assert!(got_error.load(Ordering::SeqCst));
+        assert!(c.failed());
+    }
+
+    #[test]
+    fn test_completion_idempotent_complete() {
+        // Completing a completion multiple times should only trigger the callback once
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+
+        let c = Completion::new_write(move |_| {
+            call_count_clone.fetch_add(1, Ordering::SeqCst);
+        });
+
+        c.complete(1);
+        c.complete(2);
+        c.complete(3);
+
+        // Callback should only be called once
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+        assert!(c.succeeded());
+    }
+
+    #[test]
+    fn test_completion_idempotent_error() {
+        // Erroring a completion multiple times should only trigger the callback once
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let call_count = Arc::new(AtomicUsize::new(0));
+        let call_count_clone = call_count.clone();
+
+        let c = Completion::new_write(move |_| {
+            call_count_clone.fetch_add(1, Ordering::SeqCst);
+        });
+
+        c.error(CompletionError::Aborted);
+        c.error(CompletionError::Aborted);
+        c.complete(0); // Try completing after error
+
+        // Callback should only be called once
+        assert_eq!(call_count.load(Ordering::SeqCst), 1);
+        assert!(c.failed());
+    }
 }
