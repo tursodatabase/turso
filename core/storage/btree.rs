@@ -2404,7 +2404,7 @@ impl BTreeCursor {
                     cell_idx,
                     ref mut state,
                 } => {
-                    turso_assert!(page.is_loaded(), "page {}is not loaded", page.id());
+                    turso_assert!(page.is_loaded(), "page {} is not loaded", page.id());
                     let page = page.clone();
 
                     // Currently it's necessary to .take() here to prevent double-borrow of `self` in `overwrite_cell`.
