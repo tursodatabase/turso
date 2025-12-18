@@ -51,11 +51,5 @@
   },
   "imports": {
     "#index": "./index.js"
-  },
-  "optionalDependencies": {
-    "@tursodatabase/database-linux-x64-gnu": "0.4.0-pre.14",
-    "@tursodatabase/database-win32-x64-msvc": "0.4.0-pre.14",
-    "@tursodatabase/database-darwin-arm64": "0.4.0-pre.14",
-    "@tursodatabase/database-linux-arm64-gnu": "0.4.0-pre.14"
   }
 }
