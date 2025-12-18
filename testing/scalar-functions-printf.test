@@ -275,3 +275,17 @@ do_execsql_test printf-mixed-exponential-integer {
 do_execsql_test printf-mixed-octal-hex {
   SELECT printf('Octal %o is hex %x', 255, 255);
 } {{Octal 377 is hex ff}}
+
+# width formatting for integers
+
+do_execsql_test printf-width-integer-basic {
+  SELECT printf('Number: %5d', 42);
+} {{Number:    42}}
+
+do_execsql_test printf-width-integer-exact {
+  SELECT printf('Number: %3d', 123);
+} {{Number: 123}}
+
+do_execsql_test printf-width-integer-smaller {
+  SELECT printf('Number: %2d', 12345);
+} {{Number: 12345}}
