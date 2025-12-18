@@ -5,11 +5,13 @@ use turso_sdk_kit::rsapi::TursoStatement;
 pub fn bind_value(stmt: &mut TursoStatement, index: usize, value: Value) -> Result<(), Error> {
     use turso_core::Value as CoreValue;
 
+    let ruby = Ruby::get().expect("Ruby not initialized");
+
     let core_value = if value.is_nil() {
         CoreValue::Null
-    } else if value.is_kind_of(magnus::class::true_class()) {
+    } else if value.is_kind_of(ruby.class_true_class()) {
         CoreValue::Integer(1)
-    } else if value.is_kind_of(magnus::class::false_class()) {
+    } else if value.is_kind_of(ruby.class_false_class()) {
         CoreValue::Integer(0)
     } else if let Ok(i) = i64::try_convert(value) {
         CoreValue::Integer(i)
@@ -21,7 +23,7 @@ pub fn bind_value(stmt: &mut TursoStatement, index: usize, value: Value) -> Resu
         CoreValue::Blob(bytes)
     } else {
         return Err(Error::new(
-            magnus::exception::type_error(),
+            ruby.exception_type_error(),
             format!("Cannot convert {:?} to SQL value", unsafe { value.classname() }),
         ));
     };

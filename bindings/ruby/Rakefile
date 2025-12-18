@@ -1,13 +1,17 @@
 # frozen_string_literal: true
 
 require "bundler/gem_tasks"
-require "rb_sys/extensiontask"
+require "rake/extensiontask"
 require "rspec/core/rake_task"
 
 GEMSPEC = Gem::Specification.load("turso.gemspec")
 
-RbSys::ExtensionTask.new("turso", GEMSPEC) do |ext|
+# Use standard Rake::ExtensionTask with cross_compile disabled
+Rake::ExtensionTask.new("turso", GEMSPEC) do |ext|
   ext.lib_dir = "lib/turso"
+  ext.ext_dir = "ext/turso"
+  ext.source_pattern = "*.{rs,toml}"
+  ext.cross_compile = false
 end
 
 RSpec::Core::RakeTask.new(:spec)

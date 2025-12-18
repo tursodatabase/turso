@@ -1,0 +1,86 @@
+name: Ruby
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - 'bindings/ruby/**'
+      - 'core/**'
+      - 'sdk-kit/**'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'bindings/ruby/**'
+      - 'core/**'
+      - 'sdk-kit/**'
+
+env:
+  working-directory: bindings/ruby
+
+jobs:
+  test:
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - blacksmith-4vcpu-ubuntu-2404
+          - macos-latest
+          - windows-latest
+        ruby-version: ['3.1', '3.2', '3.3']
+    runs-on: ${{ matrix.os }}
+
+    defaults:
+      run:
+        working-directory: ${{ env.working-directory }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Ruby ${{ matrix.ruby-version }}
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ${{ matrix.ruby-version }}
+          bundler-cache: false
+
+      - name: Install dependencies
+        run: |
+          gem install bundler
+          bundle config set --local path 'vendor/bundle'
+          bundle install
+
+      - name: Compile native extension
+        run: bundle exec rake compile
+
+      - name: Run example
+        run: bundle exec ruby examples/basic.rb
+
+  lint:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 15
+
+    defaults:
+      run:
+        working-directory: ${{ env.working-directory }}/ext/turso
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cargo fmt check
+        run: cargo fmt --check
+
+      - name: Cargo clippy
+        run: cargo clippy -- -D warnings

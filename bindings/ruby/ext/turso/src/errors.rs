@@ -52,15 +52,6 @@ pub fn statement_closed_error() -> Error {
     })
 }
 
-pub fn turso_error(message: impl Into<String>) -> Error {
-    let msg = message.into();
-    EXCEPTION_CLASSES.with(|cell| {
-        let classes = cell.borrow();
-        let classes = classes.as_ref().expect("Exception classes not initialized");
-        Error::new(classes.error, msg)
-    })
-}
-
 pub fn map_turso_error(err: TursoError) -> Error {
     let message = err.message.unwrap_or_else(|| format!("{:?}", err.code));
 

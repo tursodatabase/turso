@@ -1,4 +1,4 @@
-use magnus::{block::Proc, method, Error, Module, Object, RArray, Ruby, TryConvert, Value};
+use magnus::{block::Proc, method, Error, Module, RArray, Ruby, TryConvert, Value};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use turso_sdk_kit::rsapi::{TursoConnection, TursoStatusCode};
@@ -25,8 +25,9 @@ impl RbConnection {
 
     fn ensure_open(&self) -> Result<(), Error> {
         if self.closed.load(Ordering::Relaxed) {
+            let ruby = Ruby::get().expect("Ruby not initialized");
             Err(Error::new(
-                magnus::exception::runtime_error(),
+                ruby.exception_runtime_error(),
                 "Connection is closed",
             ))
         } else {
@@ -44,8 +45,9 @@ impl RbConnection {
         self.ensure_open()?;
 
         if args.is_empty() {
+            let ruby = Ruby::get().expect("Ruby not initialized");
             return Err(Error::new(
-                magnus::exception::arg_error(),
+                ruby.exception_arg_error(),
                 "execute requires at least a SQL string",
             ));
         }

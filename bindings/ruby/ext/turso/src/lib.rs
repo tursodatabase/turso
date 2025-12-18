@@ -6,7 +6,7 @@ mod errors;
 mod statement;
 mod value;
 
-#[magnus::init]
+#[magnus::init(name = "turso")]
 fn init(ruby: &Ruby) -> Result<(), Error> {
     let module = ruby.define_module("Turso")?;
     errors::define_exceptions(ruby, &module)?;

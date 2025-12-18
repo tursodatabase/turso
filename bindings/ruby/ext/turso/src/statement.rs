@@ -1,4 +1,4 @@
-use magnus::{method, Error, Module, Object, RArray, Ruby, Value};
+use magnus::{method, Error, Module, RArray, Ruby, Value};
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
 use turso_sdk_kit::rsapi::{TursoStatement, TursoStatusCode};

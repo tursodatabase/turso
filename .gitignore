@@ -54,3 +54,11 @@ bisected.sql
 settings.local.json
 .claude/agents/
 .build-hash
+
+# Ruby
+**/vendor/bundle/
+**/.bundle/
+**/Gemfile.lock
+**/tmp/
+**/*.bundle
+**/*.gem
