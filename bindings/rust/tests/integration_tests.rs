@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use tokio::fs;
 use turso::{Builder, EncryptionOpts, Error, Value};
 
@@ -530,4 +532,75 @@ async fn test_connection_clone() {
 
     let id: i64 = row.get(0).unwrap();
     assert_eq!(id, 1);
+}
+
+use tokio::task::JoinSet;
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+/// Sharing a connection across threads is not supported, but we must not crash.
+/// The proper behavior is to return Busy to the caller if another statement is already running a transaction.
+/// This test verifies that we end up inserting at least some of the rows and that integrity check passes.
+async fn concurrent_inserts_on_shared_connection() {
+    let temp_file = tempfile::NamedTempFile::new().expect("create temp file");
+    let db_path = temp_file.path().to_str().expect("path to string");
+
+    let db = Builder::new_local(db_path)
+        .build()
+        .await
+        .expect("temp file db");
+    let conn = db.connect().expect("connect");
+    conn.execute("CREATE TABLE IF NOT EXISTS t (value INTEGER)", ())
+        .await
+        .expect("create table");
+
+    conn.busy_timeout(Duration::from_millis(1000)).unwrap();
+
+    let attempts = 200usize;
+    let mut join_set = JoinSet::new();
+
+    for i in 0..attempts {
+        let conn = conn.clone();
+        join_set.spawn(async move {
+            let res = conn
+                .execute("INSERT INTO t (value) VALUES (?1)", [i as i64])
+                .await;
+            match res {
+                Ok(_) => {}
+                Err(Error::SqlExecutionFailure(e)) if e.contains("database is locked") => {}
+                Err(e) => panic!("unexpected error: {e:?}"),
+            }
+        });
+    }
+
+    while let Some(res) = join_set.join_next().await {
+        res.expect("task panicked");
+    }
+
+    let mut rows = conn
+        .query("SELECT COUNT(*) FROM t", ())
+        .await
+        .expect("count rows");
+    let count_value = rows
+        .next()
+        .await
+        .expect("step result")
+        .expect("row")
+        .get_value(0)
+        .expect("count value");
+    match count_value {
+        Value::Integer(count) => assert!(count > 0),
+        other => panic!("expected integer count, got {other:?}"),
+    }
+    assert!(rows.next().await.expect("consume rows").is_none());
+
+    // Close turso connection before opening with rusqlite
+    drop(conn);
+    drop(db);
+
+    // Verify database integrity with rusqlite
+    let rusqlite_conn = rusqlite::Connection::open(db_path).expect("open with rusqlite");
+    let integrity_result: String = rusqlite_conn
+        .query_row("PRAGMA integrity_check", [], |row| row.get(0))
+        .expect("integrity check");
+    assert_eq!(integrity_result, "ok", "database integrity check failed");
 }

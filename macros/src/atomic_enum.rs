@@ -263,6 +263,23 @@ pub(crate) fn derive_atomic_enum_inner(input: TokenStream) -> TokenStream {
                 let prev = self.0.swap(Self::to_storage(&val), ::std::sync::atomic::Ordering::SeqCst);
                 Self::from_storage(prev)
             }
+
+            #[inline]
+            /// Compare and exchange: if the current value equals `current`, replace it with `new`.
+            /// Returns Ok(current) on success, or Err(actual_value) on failure.
+            pub fn compare_exchange(&self, current: #name, new: #name) -> Result<#name, #name> {
+                let current_storage = Self::to_storage(&current);
+                let new_storage = Self::to_storage(&new);
+                match self.0.compare_exchange(
+                    current_storage,
+                    new_storage,
+                    ::std::sync::atomic::Ordering::SeqCst,
+                    ::std::sync::atomic::Ordering::SeqCst,
+                ) {
+                    Ok(prev) => Ok(Self::from_storage(prev)),
+                    Err(actual) => Err(Self::from_storage(actual)),
+                }
+            }
         }
 
         impl From<#name> for #atomic_name {

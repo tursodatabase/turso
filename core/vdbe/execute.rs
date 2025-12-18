@@ -2234,6 +2234,21 @@ pub fn op_transaction_inner(
 
                 // 1. We try to upgrade current version
                 let current_state = conn.get_tx_state();
+
+                // In autocommit mode, each statement is its own transaction. If we see
+                // a transaction already in progress (state != None), AND we haven't started
+                // any transaction work in this execution yet (auto_txn_cleanup == None),
+                // it means another concurrent execution owns that transaction.
+                // Return Busy to avoid using their transaction.
+                let auto_commit = conn.auto_commit.load(Ordering::SeqCst);
+                if auto_commit
+                    && !conn.is_nested_stmt()
+                    && !matches!(current_state, TransactionState::None)
+                    && matches!(state.auto_txn_cleanup, TxnCleanup::None)
+                {
+                    return Err(LimboError::Busy);
+                }
+
                 let (new_transaction_state, updated) = if conn.is_nested_stmt() {
                     (current_state, false)
                 } else {
@@ -2275,7 +2290,21 @@ pub fn op_transaction_inner(
                     }
                 };
 
-                // 2. Start transaction if needed
+                // 2. Atomically claim the new transaction state BEFORE doing pager operations.
+                // This prevents races where two threads both think they can upgrade the state.
+                // If compare_exchange fails, another thread modified the state concurrently -
+                // return Busy to signal the caller should retry. We can't just retry here because
+                // pager transaction state is per-connection, and another thread's transaction
+                // is not ours to use.
+                if updated
+                    && conn
+                        .atomic_swap_tx_state(current_state, new_transaction_state)
+                        .is_err()
+                {
+                    return Err(LimboError::Busy);
+                }
+
+                // 3. Start transaction on the pager. If this fails, restore the old state.
                 if let Some(mv_store) = mv_store.as_ref() {
                     // In MVCC we don't have write exclusivity, therefore we just need to start a transaction if needed.
                     // Programs can run Transaction twice, first with read flag and then with write flag. So a single txid is enough
@@ -2286,6 +2315,10 @@ pub fn op_transaction_inner(
                     let conn_has_executed_begin_deferred = !has_existing_mv_tx
                         && !program.connection.auto_commit.load(Ordering::SeqCst);
                     if conn_has_executed_begin_deferred && *tx_mode == TransactionMode::Concurrent {
+                        // Restore state before returning error
+                        if updated {
+                            conn.set_tx_state(current_state);
+                        }
                         return Err(LimboError::TxError(
                             "Cannot start CONCURRENT transaction after BEGIN DEFERRED".to_string(),
                         ));
@@ -2318,6 +2351,10 @@ pub fn op_transaction_inner(
                     }
                 } else {
                     if matches!(tx_mode, TransactionMode::Concurrent) {
+                        // Restore state before returning error
+                        if updated {
+                            conn.set_tx_state(current_state);
+                        }
                         return Err(LimboError::TxError(
                             "Concurrent transaction mode is only supported when MVCC is enabled"
                                 .to_string(),
@@ -2344,26 +2381,19 @@ pub fn op_transaction_inner(
                             // start a new one.
                             if matches!(current_state, TransactionState::None) {
                                 pager.end_read_tx();
-                                conn.set_tx_state(TransactionState::None);
                                 state.auto_txn_cleanup = TxnCleanup::None;
                             }
-                            assert_eq!(conn.get_tx_state(), current_state);
+                            // Restore the transaction state since pager ops failed
+                            conn.set_tx_state(current_state);
                             return Err(LimboError::Busy);
                         }
                         if let IOResult::IO(io) = begin_w_tx_res? {
                             // set the transaction state to pending so we don't have to
                             // end the read transaction.
-                            program
-                                .connection
-                                .set_tx_state(TransactionState::PendingUpgrade);
+                            conn.set_tx_state(TransactionState::PendingUpgrade);
                             return Ok(InsnFunctionStepResult::IO(io));
                         }
                     }
-                }
-
-                // 3. Transaction state should be updated before checking for Schema cookie so that the tx is ended properly on error
-                if updated {
-                    conn.set_tx_state(new_transaction_state);
                 }
                 state.op_transaction_state = OpTransactionState::CheckSchemaCookie;
                 continue;

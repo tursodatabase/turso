@@ -2623,6 +2623,16 @@ impl Connection {
         self.transaction_state.get()
     }
 
+    /// Atomically compare and exchange transaction state.
+    /// Returns Ok(current) on success, or Err(actual_value) if the state was modified concurrently.
+    fn atomic_swap_tx_state(
+        &self,
+        current: TransactionState,
+        new: TransactionState,
+    ) -> Result<TransactionState, TransactionState> {
+        self.transaction_state.compare_exchange(current, new)
+    }
+
     pub(crate) fn get_mv_tx_id(&self) -> Option<u64> {
         self.mv_tx.read().map(|(tx_id, _)| tx_id)
     }
