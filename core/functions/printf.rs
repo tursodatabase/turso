@@ -118,7 +118,7 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
                 // Apply width formatting if specified
                 if let Some(w) = width {
                     if w > int_str.len() {
-                        result.push_str(&format!("{:>width$}", int_str, width = w));
+                        result.push_str(&format!("{int_str:>w$}"));
                     } else {
                         result.push_str(&int_str);
                     }
