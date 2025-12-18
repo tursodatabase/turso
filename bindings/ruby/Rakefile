@@ -1,0 +1,25 @@
+# frozen_string_literal: true
+
+require "bundler/gem_tasks"
+require "rb_sys/extensiontask"
+require "rspec/core/rake_task"
+
+GEMSPEC = Gem::Specification.load("turso.gemspec")
+
+RbSys::ExtensionTask.new("turso", GEMSPEC) do |ext|
+  ext.lib_dir = "lib/turso"
+end
+
+RSpec::Core::RakeTask.new(:spec)
+
+task default: [:compile, :spec]
+
+desc "Build and install gem locally"
+task :install_local => :compile do
+  sh "gem build turso.gemspec && gem install turso-*.gem"
+end
+
+desc "Run example"
+task :example => :compile do
+  ruby "examples/basic.rb"
+end
