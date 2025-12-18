@@ -19,15 +19,15 @@ import (
 
 type TursoPartialSyncConfig struct {
 	// if positive, prefix partial bootstrap strategy will be used
-	BoostrapStrategyPrefix int
+	BootstrapStrategyPrefix int
 	// if not empty, query partial bootstrap strategy will be used
-	BoostrapStrategyQuery string
+	BootstrapStrategyQuery string
 	// optional parameter which defines segment size for lazy loading from remote server
-	// one of valid partial_bootstrap_strategy_* values MUST be set in order for this setting to have some effect
+	// one of valid BootstrapStrategy* values MUST be set in order for this setting to have some effect
 	SegmentSize int
-	// optional parameter which defines if speculative pages load must be enabled
-	// one of valid partial_bootstrap_strategy_* values MUST be set in order for this setting to have some effect
-	SpeculativeLoad bool
+	// optional parameter which defines if pages prefetch must be enabled
+	// one of valid BootstrapStrategy* values MUST be set in order for this setting to have some effect
+	Prefetch bool
 }
 
 // Public configuration for a synced database.
@@ -118,15 +118,15 @@ func NewTursoSyncDb(ctx context.Context, config TursoSyncDbConfig) (*TursoSyncDb
 		AsyncIO:              true, // MUST be true for external IO handling
 	}
 	syncCfg := TursoSyncDatabaseConfig{
-		Path:                            config.Path,
-		ClientName:                      clientName,
-		LongPollTimeoutMs:               config.LongPollTimeoutMs,
-		BootstrapIfEmpty:                bootstrap,
-		ReservedBytes:                   0,
-		PartialBootstrapStrategyPrefix:  config.PartialSyncConfig.BoostrapStrategyPrefix,
-		PartialBootstrapStrategyQuery:   config.PartialSyncConfig.BoostrapStrategyQuery,
-		PartialBootstrapSegmentSize:     config.PartialSyncConfig.SegmentSize,
-		PartialBootstrapSpeculativeLoad: config.PartialSyncConfig.SpeculativeLoad,
+		Path:                           config.Path,
+		ClientName:                     clientName,
+		LongPollTimeoutMs:              config.LongPollTimeoutMs,
+		BootstrapIfEmpty:               bootstrap,
+		ReservedBytes:                  0,
+		PartialBootstrapStrategyPrefix: config.PartialSyncConfig.BootstrapStrategyPrefix,
+		PartialBootstrapStrategyQuery:  config.PartialSyncConfig.BootstrapStrategyQuery,
+		PartialBootstrapSegmentSize:    config.PartialSyncConfig.SegmentSize,
+		PartialBootstrapPrefetch:       config.PartialSyncConfig.Prefetch,
 	}
 	sdb, err := turso_sync_database_new(dbCfg, syncCfg)
 	if err != nil {

@@ -51,6 +51,25 @@ class Database extends DatabasePromise {
             return;
         }
 
+        let partialSyncOpts = undefined;
+        if (opts.partialSync != null) {
+            switch (opts.partialSync.bootstrapStrategy.kind) {
+                case "prefix":
+                    partialSyncOpts = {
+                        bootstrapStrategy: { type: "Prefix", length: opts.partialSync.bootstrapStrategy.length },
+                        segmentSize: opts.partialSync.segmentSize,
+                        prefetch: opts.partialSync.prefetch,
+                    };
+                    break;
+                case "query":
+                    partialSyncOpts = {
+                        bootstrapStrategy: { type: "Query", query: opts.partialSync.bootstrapStrategy.query },
+                        segmentSize: opts.partialSync.segmentSize,
+                        prefetch: opts.partialSync.prefetch,
+                    };
+                    break;
+            }
+        }
         const engine = new SyncEngine({
             path: opts.path,
             clientName: opts.clientName,
@@ -60,6 +79,7 @@ class Database extends DatabasePromise {
             tracing: opts.tracing,
             bootstrapIfEmpty: typeof opts.url != "function" || opts.url() != null,
             remoteEncryption: opts.remoteEncryption?.cipher,
+            partialSyncOpts: partialSyncOpts
         });
 
         let headers: { [K: string]: string } | (() => Promise<{ [K: string]: string }>);
@@ -92,7 +112,7 @@ class Database extends DatabasePromise {
         const memory = db.memory;
         const io = memory ? memoryIO() : BrowserIO;
         const run = runner(runOpts, io, engine);
-        super(engine.db() as unknown as any, () => run.wait());
+        super(db, () => run.wait());
 
         this.#runner = run;
         this.#engine = engine;

@@ -11,6 +11,67 @@ use crate::{
     LimboError, Result, Value, ValueRef,
 };
 
+// we use math functions from Rust stdlib in order to be as portable as possible for the production version of the tursodb
+#[cfg(not(test))]
+mod cmath {
+    pub fn exp(x: f64) -> f64 {
+        x.exp()
+    }
+    pub fn log(x: f64) -> f64 {
+        x.ln()
+    }
+    pub fn log10(x: f64) -> f64 {
+        x.log(10.)
+    }
+    pub fn log2(x: f64) -> f64 {
+        x.log(2.)
+    }
+    pub fn pow(x: f64, y: f64) -> f64 {
+        x.powf(y)
+    }
+    pub fn sin(x: f64) -> f64 {
+        x.sin()
+    }
+    pub fn sinh(x: f64) -> f64 {
+        x.sinh()
+    }
+    pub fn asin(x: f64) -> f64 {
+        x.asin()
+    }
+    pub fn asinh(x: f64) -> f64 {
+        x.asinh()
+    }
+    pub fn cos(x: f64) -> f64 {
+        x.cos()
+    }
+    pub fn cosh(x: f64) -> f64 {
+        x.cosh()
+    }
+    pub fn acos(x: f64) -> f64 {
+        x.acos()
+    }
+    pub fn acosh(x: f64) -> f64 {
+        x.acosh()
+    }
+    pub fn tan(x: f64) -> f64 {
+        x.tan()
+    }
+    pub fn tanh(x: f64) -> f64 {
+        x.tanh()
+    }
+    pub fn atan(x: f64) -> f64 {
+        x.atan()
+    }
+    pub fn atanh(x: f64) -> f64 {
+        x.atanh()
+    }
+    pub fn atan2(x: f64, y: f64) -> f64 {
+        x.atan2(y)
+    }
+}
+
+// we use exactly same math function as SQLite in tests in order to avoid mismatch in the differential tests due to floating-point precision issues
+#[cfg(test)]
 mod cmath {
     extern "C" {
         pub fn exp(x: f64) -> f64;
@@ -770,6 +831,7 @@ impl Value {
             return Value::Null;
         }
 
+        #[allow(unused_unsafe)]
         let result = match function {
             MathFunc::Acos => unsafe { cmath::acos(f) },
             MathFunc::Acosh => unsafe { cmath::acosh(f) },
@@ -812,6 +874,7 @@ impl Value {
             return Value::Null;
         };
 
+        #[allow(unused_unsafe)]
         let result = match function {
             MathFunc::Atan2 => unsafe { cmath::atan2(lhs, rhs) },
             MathFunc::Mod => libm::fmod(lhs, rhs),
@@ -1072,7 +1135,7 @@ pub fn construct_like_regex(pattern: &str) -> Regex {
 #[cfg(test)]
 mod tests {
     use crate::types::Value;
-    use crate::vdbe::{Bitfield, Register};
+    use crate::vdbe::Register;
 
     use rand::{Rng, RngCore};
     use std::collections::HashMap;
@@ -2332,24 +2395,5 @@ mod tests {
             Value::exec_replace(&input_str, &pattern_str, &replace_str),
             expected_str
         );
-    }
-
-    #[test]
-    fn test_bitfield() {
-        let mut bitfield = Bitfield::<4>::new();
-        for i in 0..256 {
-            bitfield.set(i);
-            assert!(bitfield.get(i));
-            for j in 0..i {
-                assert!(bitfield.get(j));
-            }
-            for j in i + 1..256 {
-                assert!(!bitfield.get(j));
-            }
-        }
-        for i in 0..256 {
-            bitfield.unset(i);
-            assert!(!bitfield.get(i));
-        }
     }
 }

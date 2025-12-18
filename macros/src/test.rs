@@ -39,7 +39,6 @@ impl<T: ToTokens> ToTokens for SpannedType<T> {
     }
 }
 
-#[derive(Debug)]
 struct Args {
     path: Option<SpannedType<String>>,
     mvcc: Option<SpannedType<()>>,

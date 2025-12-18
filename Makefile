@@ -12,6 +12,10 @@ RUST_LOG := off
 all: check-rust-version build 
 .PHONY: all
 
+install-sqlite:
+	./scripts/install-sqlite3.sh
+.PHONY: install-sqlite
+
 check-rust-version:
 	@echo "Checking Rust version..."
 	@if [ "$(shell printf '%s\n' "$(MINIMUM_RUST_VERSION)" "$(CURRENT_RUST_VERSION)" | sort -V | head -n1)" = "$(CURRENT_RUST_VERSION)" ]; then \

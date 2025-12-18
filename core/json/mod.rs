@@ -42,10 +42,13 @@ pub fn get_json(json_value: &Value, indent: Option<&str>) -> crate::Result<Value
             }
 
             let json_val = convert_dbtype_to_jsonb(json_value, Conv::Strict)?;
-            let json = match indent {
+            let mut json = match indent {
                 Some(indent) => json_val.to_string_pretty(Some(indent))?,
                 None => json_val.to_string(),
             };
+
+            // Simplify infinity format to match SQLite (#4196)
+            json = json.replace("9.0e+999", "9e999");
 
             Ok(Value::Text(Text::json(json)))
         }
@@ -170,9 +173,20 @@ pub fn convert_ref_dbtype_to_jsonb(val: ValueRef<'_>, strict: Conv) -> crate::Re
             JsonbHeader::make_null().into_bytes().as_bytes(),
         )),
         ValueRef::Float(float) => {
-            let mut buff = ryu::Buffer::new();
-            Jsonb::from_str(buff.format(float))
-                .map_err(|_| LimboError::ParseError("malformed JSON".to_string()))
+            // Handle infinity for JSON compatibility with SQLite (#4196)
+            if float.is_infinite() {
+                let json_str = if float.is_sign_negative() {
+                    "-9.0e+999"
+                } else {
+                    "9.0e+999"
+                };
+                Jsonb::from_str(json_str)
+                    .map_err(|_| LimboError::ParseError("malformed JSON".to_string()))
+            } else {
+                let mut buff = ryu::Buffer::new();
+                Jsonb::from_str(buff.format(float))
+                    .map_err(|_| LimboError::ParseError("malformed JSON".to_string()))
+            }
         }
         ValueRef::Integer(int) => Jsonb::from_str(&int.to_string())
             .map_err(|_| LimboError::ParseError("malformed JSON".to_string())),
@@ -542,9 +556,20 @@ pub fn json_string_to_db_type(
                 Ok(Value::Text(Text::new(json_string)))
             }
         }
-        ElementType::FLOAT5 | ElementType::FLOAT => Ok(Value::Float(
-            json_string.parse().expect("Should be valid f64"),
-        )),
+        ElementType::FLOAT5 | ElementType::FLOAT => {
+            let float_val: f64 = json_string.parse().expect("Should be valid f64");
+            if float_val.is_infinite() && matches!(flag, OutputVariant::ElementType) {
+                // For json() function, SQLite returns bare infinity as "9e999" not "9.0e+999"
+                let simplified = if float_val.is_sign_negative() {
+                    "-9e999"
+                } else {
+                    "9e999"
+                };
+                Ok(Value::Text(Text::json(simplified.to_string())))
+            } else {
+                Ok(Value::Float(float_val))
+            }
+        }
         ElementType::INT | ElementType::INT5 => {
             let result = i64::from_str(&json_string);
             if let Ok(int) = result {
@@ -928,6 +953,75 @@ mod tests {
             assert_eq!(res.subtype, TextSubtype::Json);
         } else {
             panic!("Expected Value::Text");
+        }
+    }
+
+    #[test]
+    fn test_json_array_with_infinity() {
+        let infinity = Value::Float(f64::INFINITY);
+        let neg_infinity = Value::Float(f64::NEG_INFINITY);
+        let input = [Value::Integer(1), infinity, neg_infinity];
+
+        let result = json_array(&input).unwrap();
+        if let Value::Text(res) = result {
+            assert_eq!(res.as_str(), "[1,9.0e+999,-9.0e+999]");
+            assert_eq!(res.subtype, TextSubtype::Json);
+        } else {
+            panic!("Expected Value::Text");
+        }
+    }
+
+    #[test]
+    fn test_json_object_with_infinity() {
+        let infinity = Value::Float(f64::INFINITY);
+        let key = Value::build_text("k");
+        let input = [key, infinity];
+
+        let result = json_object(&input).unwrap();
+        if let Value::Text(res) = result {
+            assert_eq!(res.as_str(), r#"{"k":9.0e+999}"#);
+            assert_eq!(res.subtype, TextSubtype::Json);
+        } else {
+            panic!("Expected Value::Text");
+        }
+    }
+
+    #[test]
+    fn test_json_object_with_negative_infinity() {
+        let neg_infinity = Value::Float(f64::NEG_INFINITY);
+        let key = Value::build_text("k");
+        let input = [key, neg_infinity];
+
+        let result = json_object(&input).unwrap();
+        if let Value::Text(res) = result {
+            assert_eq!(res.as_str(), r#"{"k":-9.0e+999}"#);
+            assert_eq!(res.subtype, TextSubtype::Json);
+        } else {
+            panic!("Expected Value::Text");
+        }
+    }
+
+    #[test]
+    fn test_json_with_infinity() {
+        let infinity = Value::Float(f64::INFINITY);
+        let result = get_json(&infinity, None).unwrap();
+        if let Value::Text(res) = result {
+            assert_eq!(res.as_str(), "9e999");
+            assert_eq!(res.subtype, TextSubtype::Json);
+        } else {
+            panic!("Expected Value::Text, got {result:?}");
+        }
+    }
+
+    #[test]
+    fn test_json_with_negative_infinity() {
+        let neg_infinity = Value::Float(f64::NEG_INFINITY);
+        let result = get_json(&neg_infinity, None).unwrap();
+        if let Value::Text(res) = result {
+            assert_eq!(res.as_str(), "-9e999");
+            assert_eq!(res.subtype, TextSubtype::Json);
+        } else {
+            panic!("Expected Value::Text, got {result:?}");
         }
     }
 

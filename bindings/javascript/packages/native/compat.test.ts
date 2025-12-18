@@ -2,6 +2,17 @@ import { unlinkSync } from "node:fs";
 import { expect, test } from 'vitest'
 import { Database } from './compat.js'
 
+test('insert returning test', () => {
+    const db = new Database(':memory:');
+    db.prepare(`create table t (x);`).run();
+    const x1 = db.prepare(`insert into t values (1), (2) returning x`).get();
+    const x2 = db.prepare(`insert into t values (3), (4) returning x`).get();
+    expect(x1).toEqual({ x: 1 });
+    expect(x2).toEqual({ x: 3 });
+    const all = db.prepare(`select * from t`).all();
+    expect(all).toEqual([{ x: 1 }, { x: 2 }, { x: 3 }, { x: 4 }])
+})
+
 test('in-memory db', () => {
     const db = new Database(":memory:");
     db.exec("CREATE TABLE t(x)");

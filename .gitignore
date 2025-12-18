@@ -1,6 +1,7 @@
 /target
 /.idea
 /.vscode
+/.sqlite3
 **/target
 
 *.so
@@ -51,4 +52,5 @@ bisected.sql
 
 *.db-log
 settings.local.json
+.claude/agents/
 .build-hash

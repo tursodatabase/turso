@@ -6,7 +6,7 @@ use std::{
 };
 
 use tracing::{instrument, Level};
-use turso_parser::ast::{self, ResolveType, TableInternalId};
+use turso_parser::ast::{self, ResolveType, SortOrder, TableInternalId};
 
 use crate::{
     index_method::IndexMethodAttachment,
@@ -171,6 +171,62 @@ pub enum CursorType {
 impl CursorType {
     pub fn is_index(&self) -> bool {
         matches!(self, CursorType::BTreeIndex(_))
+    }
+
+    pub fn get_explain_description(&self) -> String {
+        let out = match self {
+            CursorType::BTreeTable(btree_table) => {
+                let mut col_count = btree_table.columns.len();
+                if btree_table.get_rowid_alias_column().is_none() {
+                    col_count += 1;
+                }
+                Some((
+                    col_count,
+                    btree_table
+                        .columns
+                        .iter()
+                        .map(|col| {
+                            if let Some(coll) = col.collation_opt() {
+                                format!("{coll}")
+                            } else {
+                                "B".to_string()
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(","),
+                ))
+            }
+            CursorType::BTreeIndex(index) => {
+                let mut col_count = index.columns.len();
+                if index.has_rowid {
+                    col_count += 1;
+                }
+                Some((
+                    col_count,
+                    index
+                        .columns
+                        .iter()
+                        .map(|col| {
+                            let sign = match col.order {
+                                SortOrder::Asc => "",
+                                SortOrder::Desc => "-",
+                            };
+                            if let Some(coll) = col.collation {
+                                format!("{sign}{coll}")
+                            } else {
+                                format!("{sign}B")
+                            }
+                        })
+                        .collect::<Vec<_>>()
+                        .join(","),
+                ))
+            }
+            _ => None,
+        };
+
+        out.map_or(String::new(), |(col_count, collations)| {
+            format!("k({col_count},{collations})")
+        })
     }
 }
 

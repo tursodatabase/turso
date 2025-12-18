@@ -210,6 +210,22 @@ do_execsql_test json_array_nested {
    SELECT json_array(json_array(1,2,3), json('[1,2,3]'), '[1,2,3]')
 } {{[[1,2,3],[1,2,3],"[1,2,3]"]}}
 
+do_execsql_test json_array_infinity {
+   SELECT json_array(1e309);
+} {{[9.0e+999]}}
+
+do_execsql_test json_array_negative_infinity {
+   SELECT json_array(-1e309);
+} {{[-9.0e+999]}}
+
+do_execsql_test json_bare_infinity {
+   SELECT json(1e309);
+} {{9e999}}
+
+do_execsql_test json_bare_negative_infinity {
+   SELECT json(-1e309);
+} {{-9e999}}
+
 
 do_execsql_test json_extract_null {
     SELECT json_extract(null, '$')
@@ -705,6 +721,14 @@ do_execsql_test json_object_json_array {
 do_execsql_test json_from_json_object {
     SELECT json(json_object('key','value'));
 } {{{"key":"value"}}}
+
+do_execsql_test json_object_infinity {
+    SELECT json_object('a', 2e370, 'b', -3e380);
+} {{{"a":9.0e+999,"b":-9.0e+999}}}
+
+do_execsql_test json_object_single_infinity {
+    SELECT json_object('x', 1e309);
+} {{{"x":9.0e+999}}}
 
 # FIXME: this behaviour differs from sqlite. Although, sqlite docs states
 # that this could change in a "future enhancement" (https://www.sqlite.org/json1.html#jobj)

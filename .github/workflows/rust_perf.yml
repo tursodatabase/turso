@@ -170,6 +170,8 @@ jobs:
     steps:
       - uses: actions/checkout@v3
       - name: TPC-H
+        env: 
+          RUST_LOG: "off"
         run: ./perf/tpc-h/benchmark.sh
 
   vfs-bench-compile:

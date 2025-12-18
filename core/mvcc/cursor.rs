@@ -378,7 +378,7 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
     /// transactions are not conflicting.
     /// Therefore, we will always choose the highest rowid in the table, regardless of the visibility of the row to the
     /// transaction.
-    pub fn get_next_rowid(&mut self) -> Result<IOResult<i64>> {
+    pub fn get_next_rowid(&mut self) -> Result<IOResult<(i64, i64)>> {
         // lock so we don't get same two rowids
         let lock = self.next_rowid_lock.clone();
         let _lock = lock.write();
@@ -392,7 +392,11 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
                     "rowid overflow, random rowids not implemented yet".to_string(),
                 ));
             }
-            Ok(rowid.to_int_or_panic() + 1)
+
+            let prev_max_rowid = rowid.to_int_or_panic();
+            let new_row_id = prev_max_rowid + 1;
+            tracing::trace!("new_row_id={new_row_id}");
+            Ok((new_row_id, prev_max_rowid))
         };
         match self.current_pos.borrow().clone() {
             CursorPosition::Loaded {
@@ -420,14 +424,14 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
             }
             CursorPosition::BeforeFirst => {
                 let res = match last_rowid_in_mvcc_index {
-                    None => 1,
+                    None => (1, 0),
                     Some(k) => incremented_rowid(&k)?,
                 };
                 Ok(IOResult::Done(res))
             }
             CursorPosition::End => {
                 let res = match last_rowid_in_mvcc_index {
-                    None => 1,
+                    None => (1, 0),
                     Some(k) => incremented_rowid(&k)?,
                 };
                 Ok(IOResult::Done(res))
@@ -1315,6 +1319,17 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
             MvccCursorType::Index(_) => Row::new_index_row(row_id, num_columns),
         };
 
+        // Check if the cursor is currently positioned at a B-tree row that matches
+        // the row we're inserting. This indicates we're updating a B-tree-resident row
+        // that doesn't yet have an MVCC version.
+        let was_btree_resident = match &*self.current_pos.borrow() {
+            CursorPosition::Loaded {
+                row_id: current_row_id,
+                in_btree,
+            } => *in_btree && *current_row_id == row.id,
+            _ => false,
+        };
+
         self.current_pos.replace(CursorPosition::Loaded {
             row_id: row.id.clone(),
             in_btree: false,
@@ -1331,6 +1346,14 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
         {
             self.db
                 .update_to_table_or_index(self.tx_id, row, maybe_index_id)
+                .inspect_err(|_| {
+                    self.current_pos.replace(CursorPosition::BeforeFirst);
+                })?;
+        } else if was_btree_resident {
+            // The row exists in B-tree but not in MvStore - mark it as B-tree resident
+            // so that checkpoint knows to write deletes to the B-tree file.
+            self.db
+                .insert_btree_resident_to_table_or_index(self.tx_id, row, maybe_index_id)
                 .inspect_err(|_| {
                     self.current_pos.replace(CursorPosition::BeforeFirst);
                 })?;
@@ -1409,7 +1432,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                 self.tx_id,
                 &mut self.table_iterator,
             );
-            let exists = if let Some(rowid) = rowid {
+            let exists = if let Some(rowid) = &rowid {
                 let RowKey::Int(rowid) = rowid.row_id else {
                     panic!("Rowid is not an integer in mvcc table cursor");
                 };
@@ -1417,6 +1440,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
             } else {
                 false
             };
+            tracing::trace!("Row exists: {exists} find={int_key} got={rowid:?}");
             if exists {
                 self.current_pos.replace(CursorPosition::Loaded {
                     row_id: RowID {

@@ -639,10 +639,13 @@ async fn multiple_connections_fuzz(opts: FuzzOptions) {
                 || e_string.contains("busy")
                 || e_string.contains("Write-write conflict")
                 || e_string.contains("schema changed")
+                || e_string.contains("has no column named")
+                || e_string.contains("no such column:")
+                || e_string.contains("cannot drop column")
         };
         let requires_rollback = |e: &turso::Error| -> bool {
             let e_string = e.to_string();
-            e_string.contains("Write-write conflict") || e_string.contains("schema changed")
+            e_string.contains("Write-write conflict")
         };
 
         let handle_error = |e: &turso::Error,

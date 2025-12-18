@@ -873,6 +873,18 @@ impl Property {
                                 // we don't shadow the results into the simulator env, i.e. we assume whatever the statement did was rolled back.
                                 tracing::error!("Fault injection produced error: {err}");
 
+                                if let LimboError::CheckpointFailed(msg) = err {
+                                    // Checkpoint failure means the transaction is committed because the WAL commit succeeded, so we DON'T rollback,
+                                    // and the results of the query are shadowed into the simulator environment
+                                    query_clone
+                                        .shadow(&mut env.get_conn_tables_mut(connection_index))
+                                        .expect("Failed to shadow tables");
+                                    tracing::error!(
+                                        "Fault injection produced CheckpointFailed error: {msg}"
+                                    );
+                                    return Ok(Ok(()));
+                                }
+
                                 // On error we rollback the transaction if there is any active here
                                 env.rollback_conn(connection_index);
                                 Ok(Ok(()))

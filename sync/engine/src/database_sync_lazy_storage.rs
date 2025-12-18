@@ -326,7 +326,7 @@ async fn read_page<Ctx, IO: SyncEngineIo>(
     server_revision: &str,
     page: usize,
     segment_size: usize,
-    speculative_load: bool,
+    prefetch: bool,
     c: Completion,
 ) -> Result<(), errors::Error> {
     let read_buf = c.as_read().buf().as_mut_slice();
@@ -383,12 +383,12 @@ async fn read_page<Ctx, IO: SyncEngineIo>(
     };
 
     let buffer = Arc::new(Buffer::new(data));
-    if speculative_load {
-        tracing::info!("read_page(page={page}): trying to speculatively load more pages");
+    if prefetch {
+        tracing::info!("read_page(page={page}): trying to prefetch more pages");
         let content = PageContent::new(0, buffer.clone());
         if content.maybe_page_type().is_some() {
             tracing::info!(
-                "read_page(page={page}): detected valid page for speculative load: {:?}",
+                "read_page(page={page}): detected valid page for prefetch load: {:?}",
                 content.maybe_page_type()
             );
             let mut page_refs = Vec::with_capacity(content.cell_count() + 1);
@@ -413,14 +413,14 @@ async fn read_page<Ctx, IO: SyncEngineIo>(
                     sqlite3_ondisk::BTreeCell::IndexLeafCell(..) => {}
                 };
             }
-            let mut speculative_load_pages = Vec::with_capacity(page_refs.len());
+            let mut prefetch_pages = Vec::with_capacity(page_refs.len());
             for page_ref in page_refs {
                 match guard.load_start(page_ref as usize) {
-                    Ok(PageLoadAction::Load) => speculative_load_pages.push(page_ref),
+                    Ok(PageLoadAction::Load) => prefetch_pages.push(page_ref),
                     Ok(PageLoadAction::Wait) => guard.wait_end(page_ref as usize),
                     Err(err) => {
-                        // the speculative load is an optimization; if we can't load the page this is fine
-                        tracing::info!("read_page(page={page}): unable to lock page {page_ref} for speculative load: {err}");
+                        // the prefetch is an optimization; if we can't load the page this is fine
+                        tracing::info!("read_page(page={page}): unable to lock page {page_ref} for prefetch load: {err}");
                     }
                 }
             }
@@ -526,7 +526,7 @@ impl<IO: SyncEngineIo> DatabaseStorage for LazyDatabaseStorage<IO> {
             let dirty_file = self.dirty_file.clone();
             let page_states = self.page_states.clone();
             let segment_size = self.opts.segment_size();
-            let speculative_load = self.opts.speculative_load;
+            let prefetch = self.opts.prefetch;
             let c = c.clone();
             move |coro| async move {
                 let coro = Coro::new((), coro);
@@ -540,7 +540,7 @@ impl<IO: SyncEngineIo> DatabaseStorage for LazyDatabaseStorage<IO> {
                     &server_revision,
                     page_idx - 1,
                     segment_size,
-                    speculative_load,
+                    prefetch,
                     c,
                 )
                 .await?;

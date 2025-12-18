@@ -155,7 +155,7 @@ impl CacheSize {
     pub const DEFAULT: i32 = -2000;
 
     // Minimum number of pages that cache can hold.
-    pub const MIN: i64 = 10;
+    pub const MIN: i64 = super::page_cache::MINIMUM_PAGE_CACHE_SIZE_IN_PAGES as i64;
 
     // SQLite uses this value as threshold for maximum cache size
     pub const MAX_SAFE: i64 = 2147450880;
@@ -181,23 +181,68 @@ impl Default for CacheSize {
     }
 }
 
-#[derive(PartialEq, Eq, Zeroable, Pod, Clone, Copy)]
-#[repr(transparent)]
 /// Read/Write file format version.
-pub struct Version(u8);
-
-impl Version {
-    #![allow(non_upper_case_globals)]
-    const Legacy: Self = Self(1);
-    const Wal: Self = Self(2);
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
+#[repr(u8)]
+pub enum Version {
+    Legacy = 1,
+    Wal = 2,
+    Mvcc = 255,
 }
 
-impl std::fmt::Debug for Version {
+impl Version {
+    #[inline]
+    pub fn wal(&self) -> bool {
+        matches!(self, Self::Wal)
+    }
+
+    #[inline]
+    pub fn mvcc(&self) -> bool {
+        matches!(self, Self::Mvcc)
+    }
+
+    #[inline]
+    pub fn legacy(&self) -> bool {
+        matches!(self, Self::Legacy)
+    }
+}
+
+impl TryFrom<u8> for Version {
+    type Error = u8;
+
+    fn try_from(value: u8) -> std::result::Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Version::Legacy),
+            2 => Ok(Version::Wal),
+            255 => Ok(Version::Mvcc),
+            v => Err(v),
+        }
+    }
+}
+
+/// Raw version byte for use in DatabaseHeader where Pod is required.
+/// Use `Version::try_from(raw.0)` to convert to the validated enum.
+#[derive(PartialEq, Eq, Zeroable, Pod, Clone, Copy)]
+#[repr(transparent)]
+pub struct RawVersion(pub u8);
+
+impl RawVersion {
+    pub fn to_version(self) -> std::result::Result<Version, u8> {
+        Version::try_from(self.0)
+    }
+}
+
+impl From<Version> for RawVersion {
+    fn from(v: Version) -> Self {
+        Self(v as u8)
+    }
+}
+
+impl std::fmt::Debug for RawVersion {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match *self {
-            Self::Legacy => f.write_str("Version::Legacy"),
-            Self::Wal => f.write_str("Version::Wal"),
-            Self(v) => write!(f, "Version::Invalid({v})"),
+        match self.to_version() {
+            Ok(v) => write!(f, "{v:?}"),
+            Err(v) => write!(f, "RawVersion::Invalid({v})"),
         }
     }
 }
@@ -251,9 +296,9 @@ pub struct DatabaseHeader {
     /// Page size in bytes. Must be a power of two between 512 and 32768 inclusive, or the value 1 representing a page size of 65536.
     pub page_size: PageSize,
     /// File format write version. 1 for legacy; 2 for WAL.
-    pub write_version: Version,
+    pub write_version: RawVersion,
     /// File format read version. 1 for legacy; 2 for WAL.
-    pub read_version: Version,
+    pub read_version: RawVersion,
     /// Bytes of unused "reserved" space at the end of each page. Usually 0.
     pub reserved_space: u8,
     /// Maximum embedded payload fraction. Must be 64.
@@ -312,8 +357,8 @@ impl Default for DatabaseHeader {
         Self {
             magic: *b"SQLite format 3\0",
             page_size: Default::default(),
-            write_version: Version::Wal,
-            read_version: Version::Wal,
+            write_version: RawVersion::from(Version::Wal),
+            read_version: RawVersion::from(Version::Wal),
             reserved_space: 0,
             max_embed_frac: 64,
             min_embed_frac: 32,
@@ -1719,6 +1764,8 @@ pub(super) struct StreamingWalReader {
 struct StreamingState {
     frame_idx: u64,
     cumulative_checksum: (u32, u32),
+    /// checksum of the last valid commit frame
+    last_valid_checksum: (u32, u32),
     last_valid_frame: u64,
     pending_frames: FxHashMap<u64, Vec<u64>>,
     page_size: usize,
@@ -1744,6 +1791,7 @@ impl StreamingWalReader {
             state: RwLock::new(StreamingState {
                 frame_idx: 1,
                 cumulative_checksum: (0, 0),
+                last_valid_checksum: (0, 0),
                 last_valid_frame: 0,
                 pending_frames: FxHashMap::default(),
                 page_size: 0,
@@ -1841,6 +1889,7 @@ impl StreamingWalReader {
             st.page_size = page_sz as usize;
             st.use_native_endian = use_native;
             st.cumulative_checksum = (c1, c2);
+            st.last_valid_checksum = (c1, c2);
             st.header_valid = true;
         }
         self.off_atomic
@@ -1909,6 +1958,7 @@ impl StreamingWalReader {
 
             if db_size > 0 {
                 st.last_valid_frame = st.frame_idx;
+                st.last_valid_checksum = calc;
                 self.flush_pending_frames(&mut st);
             }
             st.frame_idx += 1;
@@ -1951,7 +2001,8 @@ impl StreamingWalReader {
         }
 
         wfs.max_frame.store(max_frame, Ordering::SeqCst);
-        wfs.last_checksum = st.cumulative_checksum;
+        // use checksum of last valid commit frame, not necessarily the last frame
+        wfs.last_checksum = st.last_valid_checksum;
         if st.header_valid {
             wfs.initialized.store(true, Ordering::SeqCst);
         }
@@ -2382,5 +2433,121 @@ mod tests {
     #[case(&[0x80; 9])] // bits set without end
     fn test_read_varint_malformed_inputs(#[case] buf: &[u8]) {
         assert!(read_varint(buf).is_err());
+    }
+
+    #[test]
+    fn streaming_reader_ignores_uncommitted_checksums() {
+        let io: Arc<dyn crate::IO> = Arc::new(crate::MemoryIO::new());
+        let file = io
+            .open_file("streaming-reader-wal", crate::OpenFlags::Create, false)
+            .unwrap();
+
+        let page_size: usize = 1024;
+        let buffer_pool = BufferPool::begin_init(&io, BufferPool::TEST_ARENA_SIZE);
+        buffer_pool
+            .finalize_with_page_size(page_size)
+            .expect("initialize buffer pool");
+
+        let mut wal_header = WalHeader {
+            magic: WAL_MAGIC_LE,
+            file_format: 3007000,
+            page_size: page_size as u32,
+            checkpoint_seq: 0,
+            salt_1: 0x1234_5678,
+            salt_2: 0x9abc_def0,
+            checksum_1: 0,
+            checksum_2: 0,
+        };
+        let header_prefix = &wal_header.as_bytes()[..WAL_HEADER_SIZE - 8];
+        let use_native = (wal_header.magic & 1) != 0;
+        let (c1, c2) = checksum_wal(header_prefix, &wal_header, (0, 0), use_native);
+        wal_header.checksum_1 = c1;
+        wal_header.checksum_2 = c2;
+        io.wait_for_completion(begin_write_wal_header(file.as_ref(), &wal_header).unwrap())
+            .unwrap();
+
+        let page = vec![0xAB; page_size];
+        let frame_size = WAL_FRAME_HEADER_SIZE + page_size;
+        let mut offset = WAL_HEADER_SIZE as u64;
+
+        let (commit_checksum, commit_frame) = prepare_wal_frame(
+            &buffer_pool,
+            &wal_header,
+            (wal_header.checksum_1, wal_header.checksum_2),
+            wal_header.page_size,
+            1,
+            1,
+            &page,
+        );
+        let commit_frame_clone = commit_frame.clone();
+        let c = file
+            .pwrite(
+                offset,
+                commit_frame,
+                Completion::new_write(move |res| {
+                    assert_eq!(res.unwrap() as usize, frame_size);
+                    let _keep = commit_frame_clone.clone();
+                }),
+            )
+            .unwrap();
+        io.wait_for_completion(c).unwrap();
+        offset += frame_size as u64;
+
+        let (after_frame2_checksum, frame2) = prepare_wal_frame(
+            &buffer_pool,
+            &wal_header,
+            commit_checksum,
+            wal_header.page_size,
+            2,
+            0,
+            &page,
+        );
+        let frame2_clone = frame2.clone();
+        let c = file
+            .pwrite(
+                offset,
+                frame2,
+                Completion::new_write(move |res| {
+                    assert_eq!(res.unwrap() as usize, frame_size);
+                    let _keep = frame2_clone.clone();
+                }),
+            )
+            .unwrap();
+        io.wait_for_completion(c).unwrap();
+        offset += frame_size as u64;
+
+        let (after_frame3_checksum, frame3) = prepare_wal_frame(
+            &buffer_pool,
+            &wal_header,
+            after_frame2_checksum,
+            wal_header.page_size,
+            3,
+            0,
+            &page,
+        );
+        let frame3_clone = frame3.clone();
+        let c = file
+            .pwrite(
+                offset,
+                frame3,
+                Completion::new_write(move |res| {
+                    assert_eq!(res.unwrap() as usize, frame_size);
+                    let _keep = frame3_clone.clone();
+                }),
+            )
+            .unwrap();
+        io.wait_for_completion(c).unwrap();
+
+        let shared = build_shared_wal(&file, &io).unwrap();
+        let guard = shared.read();
+        assert_eq!(guard.max_frame.load(Ordering::Acquire), 1);
+        assert_eq!(guard.last_checksum, commit_checksum);
+
+        // checksum should only include committed frame.
+        assert_ne!(guard.last_checksum, after_frame3_checksum);
+
+        let frame_cache = guard.frame_cache.lock();
+        assert_eq!(frame_cache.get(&1), Some(&vec![1u64]));
+        assert!(frame_cache.get(&2).is_none());
     }
 }

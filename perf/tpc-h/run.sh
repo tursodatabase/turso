@@ -1,13 +1,17 @@
 #!/bin/bash
 # This script will run the TPC-H queries and compare timings.
 
+export RUST_LOG=off
 REPO_ROOT=$(git rev-parse --show-toplevel)
 RELEASE_BUILD_DIR="$REPO_ROOT/target/release"
 TPCH_DIR="$REPO_ROOT/perf/tpc-h"
 DB_FILE="$TPCH_DIR/TPC-H.db"
 QUERIES_DIR="$TPCH_DIR/queries"
 LIMBO_BIN="$RELEASE_BUILD_DIR/tursodb"
-SQLITE_BIN="sqlite3" # Assuming sqlite3 is in PATH
+
+# Install sqlite3 locally if needed
+"$REPO_ROOT/scripts/install-sqlite3.sh"
+SQLITE_BIN="$REPO_ROOT/.sqlite3/sqlite3"
 
 # Function to clear system caches based on OS
 clear_caches() {
@@ -47,7 +51,7 @@ run_queries() {
             # Clear caches before Limbo run
             clear_caches
             # Run Limbo
-            limbo_output=$( { time -p "$LIMBO_BIN" "$DB_FILE" --quiet --output-mode list "$(cat $query_file)" 2>&1; } 2>&1)
+            limbo_output=$( { time -p RUST_LOG=off "$LIMBO_BIN" "$DB_FILE" --quiet --output-mode list "$(cat $query_file)" 2>&1; } 2>&1)
             limbo_non_time_lines=$(echo "$limbo_output" | grep -v -e "^real" -e "^user" -e "^sys")
             limbo_real_time=$(echo "$limbo_output" | grep "^real" | awk '{print $2}')
             echo "Running $query_name with SQLite3..." >&2
@@ -92,8 +96,9 @@ if [ ! -f "$LIMBO_BIN" ]; then
 fi
 
 # Ensure the SQLite binary exists
-if ! command -v $SQLITE_BIN >/dev/null 2>&1; then
-    echo "Error: sqlite3 command not found. Please install sqlite3."
+if [ ! -x "$SQLITE_BIN" ]; then
+    echo "Error: sqlite3 binary not found at $SQLITE_BIN"
+    echo "Please run scripts/install-sqlite3.sh first."
     exit 1
 fi
 

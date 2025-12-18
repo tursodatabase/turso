@@ -8,6 +8,7 @@ mod manual;
 mod mcp_server;
 mod opcodes_dictionary;
 mod sync_server;
+mod read_state_machine;
 
 use config::CONFIG_DIR;
 use mcp_server::TursoMcpServer;

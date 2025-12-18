@@ -3,15 +3,17 @@ use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::AlterTableFunc;
 use crate::mvcc::cursor::MvccCursorType;
 use crate::mvcc::database::CheckpointStateMachine;
+use crate::mvcc::LocalClock;
 use crate::schema::Table;
 use crate::state_machine::StateMachine;
 use crate::storage::btree::{
     integrity_check, CursorTrait, IntegrityCheckError, IntegrityCheckState, PageCategory,
 };
 use crate::storage::database::DatabaseFile;
+use crate::storage::journal_mode;
 use crate::storage::page_cache::PageCache;
-use crate::storage::pager::{default_page1, CreateBTreeFlags};
-use crate::storage::sqlite3_ondisk::{read_varint_fast, DatabaseHeader, PageSize};
+use crate::storage::pager::{default_page1, CreateBTreeFlags, PageRef};
+use crate::storage::sqlite3_ondisk::{read_varint_fast, DatabaseHeader, PageSize, RawVersion};
 use crate::translate::collate::CollationSeq;
 use crate::types::{
     compare_immutable, compare_records_generic, AsValueRef, Extendable, IOCompletions,
@@ -53,6 +55,7 @@ use either::Either;
 use std::any::Any;
 use std::env::temp_dir;
 use std::ops::DerefMut;
+use std::str::FromStr;
 use std::{
     borrow::BorrowMut,
     num::NonZero,
@@ -325,29 +328,7 @@ pub fn op_bit_not(
     Ok(InsnFunctionStepResult::Step)
 }
 
-#[derive(Debug)]
-pub enum OpCheckpointState {
-    StartCheckpoint,
-    FinishCheckpoint { result: Option<CheckpointResult> },
-    CompleteResult { result: Result<CheckpointResult> },
-}
-
 pub fn op_checkpoint(
-    program: &Program,
-    state: &mut ProgramState,
-    insn: &Insn,
-    pager: &Arc<Pager>,
-) -> Result<InsnFunctionStepResult> {
-    match op_checkpoint_inner(program, state, insn, pager) {
-        Ok(result) => Ok(result),
-        Err(err) => {
-            state.op_checkpoint_state = OpCheckpointState::StartCheckpoint;
-            Err(err)
-        }
-    }
-}
-
-pub fn op_checkpoint_inner(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
@@ -368,6 +349,9 @@ pub fn op_checkpoint_inner(
         // however.
         return Err(LimboError::TableLocked);
     }
+    // Re-fetch mv_store from connection to get the latest value.
+    // This is necessary because the mv_store may have been set by a preceding JournalMode instruction
+    // (e.g., when switching from WAL to MVCC mode via `PRAGMA journal_mode = "experimental_mvcc"`).
     let mv_store = program.connection.mv_store();
     if let Some(mv_store) = mv_store.as_ref() {
         if !matches!(checkpoint_mode, CheckpointMode::Truncate { .. }) {
@@ -387,83 +371,54 @@ pub fn op_checkpoint_inner(
                 IOResult::IO(io) => {
                     pager.io.step()?;
                 }
-                IOResult::Done(result) => {
-                    state.op_checkpoint_state =
-                        OpCheckpointState::CompleteResult { result: Ok(result) };
-                    break;
+                IOResult::Done(CheckpointResult {
+                    num_attempted,
+                    num_backfilled,
+                    ..
+                }) => {
+                    // https://sqlite.org/pragma.html#pragma_wal_checkpoint
+                    // 1st col: 1 (checkpoint SQLITE_BUSY) or 0 (not busy).
+                    state.registers[*dest] = Register::Value(Value::Integer(0));
+                    // 2nd col: # modified pages written to wal file
+                    state.registers[*dest + 1] =
+                        Register::Value(Value::Integer(num_attempted as i64));
+                    // 3rd col: # pages moved to db after checkpoint
+                    state.registers[*dest + 2] =
+                        Register::Value(Value::Integer(num_backfilled as i64));
+
+                    state.pc += 1;
+                    return Ok(InsnFunctionStepResult::Step);
                 }
             }
         }
     }
-    loop {
-        match &mut state.op_checkpoint_state {
-            OpCheckpointState::StartCheckpoint => {
-                let step_result = program
-                    .connection
-                    .pager
-                    .load()
-                    .wal_checkpoint_start(*checkpoint_mode);
-                match step_result {
-                    Ok(IOResult::Done(result)) => {
-                        state.op_checkpoint_state = OpCheckpointState::FinishCheckpoint {
-                            result: Some(result),
-                        };
-                        continue;
-                    }
-                    Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
-                    Err(err) => {
-                        state.op_checkpoint_state =
-                            OpCheckpointState::CompleteResult { result: Err(err) };
-                        continue;
-                    }
-                }
-            }
-            OpCheckpointState::FinishCheckpoint { result } => {
-                let step_result = program.connection.pager.load().wal_checkpoint_finish(
-                    result
-                        .as_mut()
-                        .expect("checkpoint result should be Some in FinishCheckpoint state"),
-                );
-                match step_result {
-                    Ok(IOResult::Done(())) => {
-                        state.op_checkpoint_state = OpCheckpointState::CompleteResult {
-                            result: Ok(result.take().expect(
-                                "checkpoint result should be Some in FinishCheckpoint state",
-                            )),
-                        };
-                        continue;
-                    }
-                    Ok(IOResult::IO(io)) => return Ok(InsnFunctionStepResult::IO(io)),
-                    Err(err) => {
-                        state.op_checkpoint_state =
-                            OpCheckpointState::CompleteResult { result: Err(err) };
-                        continue;
-                    }
-                }
-            }
-            OpCheckpointState::CompleteResult { result } => {
-                match result {
-                    Ok(CheckpointResult {
-                        num_attempted,
-                        num_backfilled,
-                        ..
-                    }) => {
-                        // https://sqlite.org/pragma.html#pragma_wal_checkpoint
-                        // 1st col: 1 (checkpoint SQLITE_BUSY) or 0 (not busy).
-                        state.registers[*dest] = Register::Value(Value::Integer(0));
-                        // 2nd col: # modified pages written to wal file
-                        state.registers[*dest + 1] =
-                            Register::Value(Value::Integer(*num_attempted as i64));
-                        // 3rd col: # pages moved to db after checkpoint
-                        state.registers[*dest + 2] =
-                            Register::Value(Value::Integer(*num_backfilled as i64));
-                    }
-                    Err(_err) => state.registers[*dest] = Register::Value(Value::Integer(1)),
-                }
+    let step_result = program.connection.pager.load().checkpoint(
+        *checkpoint_mode,
+        program.connection.get_sync_mode(),
+        true,
+    );
+    match step_result {
+        Ok(IOResult::Done(CheckpointResult {
+            num_attempted,
+            num_backfilled,
+            ..
+        })) => {
+            // https://sqlite.org/pragma.html#pragma_wal_checkpoint
+            // 1st col: 1 (checkpoint SQLITE_BUSY) or 0 (not busy).
+            state.registers[*dest] = Register::Value(Value::Integer(0));
+            // 2nd col: # modified pages written to wal file
+            state.registers[*dest + 1] = Register::Value(Value::Integer(num_attempted as i64));
+            // 3rd col: # pages moved to db after checkpoint
+            state.registers[*dest + 2] = Register::Value(Value::Integer(num_backfilled as i64));
 
-                state.pc += 1;
-                return Ok(InsnFunctionStepResult::Step);
-            }
+            state.pc += 1;
+            Ok(InsnFunctionStepResult::Step)
+        }
+        Ok(IOResult::IO(io)) => Ok(InsnFunctionStepResult::IO(io)),
+        Err(_err) => {
+            state.registers[*dest] = Register::Value(Value::Integer(1));
+            state.pc += 1;
+            Ok(InsnFunctionStepResult::Step)
         }
     }
 }
@@ -6235,7 +6190,7 @@ pub fn op_init_coroutine(
     assert!(jump_on_definition.is_offset());
     let start_offset = start_offset.as_offset_int();
     state.registers[*yield_reg] = Register::Value(Value::Integer(start_offset as i64));
-    state.ended_coroutine.unset(*yield_reg);
+    state.ended_coroutine.retain(|n| *n != *yield_reg as u32);
     let jump_on_definition = jump_on_definition.as_offset_int();
     state.pc = if jump_on_definition == 0 {
         state.pc + 1
@@ -6254,7 +6209,7 @@ pub fn op_end_coroutine(
     load_insn!(EndCoroutine { yield_reg }, insn);
 
     if let Value::Integer(pc) = state.registers[*yield_reg].get_value() {
-        state.ended_coroutine.set(*yield_reg);
+        state.ended_coroutine.push(*yield_reg as u32);
         let pc: u32 = (*pc)
             .try_into()
             .unwrap_or_else(|_| panic!("EndCoroutine: pc overflow: {pc}"));
@@ -6279,7 +6234,7 @@ pub fn op_yield(
         insn
     );
     if let Value::Integer(pc) = state.registers[*yield_reg].get_value() {
-        if state.ended_coroutine.get(*yield_reg) {
+        if state.ended_coroutine.contains(&(*yield_reg as u32)) {
             state.pc = end_offset.as_offset_int();
         } else {
             let pc: u32 = (*pc)
@@ -7021,12 +6976,13 @@ pub fn op_new_rowid(
         },
         insn
     );
+
     let mv_store = program.connection.mv_store();
     'mvcc_newrowid: {
         if let Some(mv_store) = mv_store.as_ref() {
             // With MVCC we can't simply find last rowid and get rowid + 1 as a result. To not have two conflicting rowids concurrently we need to call `get_next_rowid`
             // which will make sure we don't collide.
-            let rowid = {
+            let (rowid, current_max) = {
                 let cursor = state.get_cursor(*cursor);
                 let cursor = cursor.as_btree_mut() as &mut dyn Any;
                 let Some(mvcc_cursor) = cursor.downcast_mut::<MvCursor>() else {
@@ -7043,6 +6999,9 @@ pub fn op_new_rowid(
                 return_if_io!(mvcc_cursor.get_next_rowid())
             };
             state.registers[*rowid_reg] = Register::Value(Value::Integer(rowid));
+            if *prev_largest_reg > 0 {
+                state.registers[*prev_largest_reg] = Register::Value(Value::Integer(current_max));
+            }
             state.pc += 1;
             return Ok(InsnFunctionStepResult::Step);
         }
@@ -7172,18 +7131,18 @@ pub fn op_must_be_int(
         Value::Integer(_) => {}
         Value::Float(f) => match cast_real_to_integer(*f) {
             Ok(i) => state.registers[*reg] = Register::Value(Value::Integer(i)),
-            Err(_) => crate::bail_parse_error!("datatype mismatch"),
+            Err(_) => bail_constraint_error!("datatype mismatch"),
         },
         Value::Text(text) => match checked_cast_text_to_numeric(text.as_str(), true) {
             Ok(Value::Integer(i)) => state.registers[*reg] = Register::Value(Value::Integer(i)),
             Ok(Value::Float(f)) => match cast_real_to_integer(f) {
                 Ok(i) => state.registers[*reg] = Register::Value(Value::Integer(i)),
-                Err(_) => crate::bail_parse_error!("datatype mismatch"),
+                Err(_) => bail_constraint_error!("datatype mismatch"),
             },
-            _ => crate::bail_parse_error!("datatype mismatch"),
+            _ => bail_constraint_error!("datatype mismatch"),
         },
         _ => {
-            crate::bail_parse_error!("datatype mismatch");
+            bail_constraint_error!("datatype mismatch");
         }
     };
     state.pc += 1;
@@ -8694,7 +8653,6 @@ pub fn op_count(
     Ok(InsnFunctionStepResult::Step)
 }
 
-#[derive(Debug)]
 pub enum OpIntegrityCheckState {
     Start,
     Checking {
@@ -9844,12 +9802,68 @@ pub fn op_max_pgcnt(
     Ok(InsnFunctionStepResult::Step)
 }
 
+/// State machine for PRAGMA journal_mode changes
+#[derive(Debug, Clone, Copy, Default)]
+pub enum OpJournalModeSubState {
+    /// Initial state - read header to get current mode
+    #[default]
+    Start,
+    /// Checkpointing WAL/MVCC before mode change
+    Checkpoint,
+    /// Update the header with new version
+    UpdateHeader,
+    /// Read page 1 for writing
+    ReadPage,
+    /// Write page 1 to disk
+    WritePage,
+    /// Finalize - clear cache and setup new mode
+    Finalize,
+}
+
+/// Holds the state for the journal mode change operation
+#[derive(Default)]
+pub struct OpJournalModeState {
+    pub sub_state: OpJournalModeSubState,
+    /// The previous journal mode (before the change)
+    pub prev_mode: Option<journal_mode::JournalMode>,
+    /// The new journal mode we're changing to
+    pub new_mode: Option<journal_mode::JournalMode>,
+    /// Checkpoint state machine for MVCC mode
+    pub checkpoint_sm: Option<StateMachine<CheckpointStateMachine<LocalClock>>>,
+    /// Page reference for writing header
+    pub page_ref: Option<PageRef>,
+}
+
 pub fn op_journal_mode(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    match op_journal_mode_inner(program, state, insn, pager) {
+        Ok(result) => {
+            if !matches!(result, InsnFunctionStepResult::IO(_)) {
+                // Reset state if we are done with this instruction
+                state.op_journal_mode_state = Default::default();
+            }
+            Ok(result)
+        }
+        Err(err) => {
+            // Reset state on error
+            state.op_journal_mode_state = Default::default();
+            Err(err)
+        }
+    }
+}
+
+fn op_journal_mode_inner(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    use crate::storage::sqlite3_ondisk::begin_write_btree_page;
+
     load_insn!(JournalMode { db, dest, new_mode }, insn);
     if *db > 0 {
         return Err(LimboError::InternalError(
@@ -9857,29 +9871,174 @@ pub fn op_journal_mode(
         ));
     }
 
-    // Currently, Turso only supports WAL mode
-    // If a new mode is specified, we validate it but always return "wal"
-    if let Some(mode) = new_mode {
-        let mode_bytes = mode.as_bytes();
-        // Valid journal modes in SQLite are: delete, truncate, persist, memory, wal, off
-        // We accept any valid mode but always use WAL
-        match_ignore_ascii_case!(match mode_bytes {
-            b"delete" | b"truncate" | b"persist" | b"memory" | b"wal" | b"off" => {
-                // Mode is valid, but we stay in WAL mode
+    loop {
+        match state.op_journal_mode_state.sub_state {
+            OpJournalModeSubState::Start => {
+                // Read header to get current mode
+                let mv_store = program.connection.mv_store();
+                let header_result = with_header(pager, mv_store.as_ref(), program, |header| {
+                    header.read_version
+                });
+
+                let prev_mode_raw = return_if_io!(header_result);
+
+                let prev_mode_version = prev_mode_raw
+                    .to_version()
+                    .map_err(|val| LimboError::Corrupt(format!("Invalid read_version: {val}")))?;
+
+                let prev_mode = journal_mode::JournalMode::from(prev_mode_version);
+                state.op_journal_mode_state.prev_mode = Some(prev_mode);
+
+                // If no new mode specified, just return current mode
+                let Some(mode_str) = new_mode else {
+                    let ret: &'static str = prev_mode.into();
+                    state.registers[*dest] = Register::Value(Value::build_text(ret));
+                    state.pc += 1;
+                    return Ok(InsnFunctionStepResult::Step);
+                };
+
+                // Parse the new mode
+                let new_mode =
+                    journal_mode::JournalMode::from_str(mode_str.as_str()).map_err(|_| {
+                        LimboError::ParseError(format!("Unknown journal mode: {mode_str}"))
+                    })?;
+
+                // Validate the new mode
+                if !new_mode.supported() {
+                    return Err(LimboError::ParseError(format!(
+                        "Journal Mode `{new_mode}` is not supported"
+                    )));
+                }
+
+                // If same mode, just return
+                if prev_mode == new_mode {
+                    let ret: &'static str = new_mode.into();
+                    state.registers[*dest] = Register::Value(Value::build_text(ret));
+                    state.pc += 1;
+                    return Ok(InsnFunctionStepResult::Step);
+                }
+
+                // Check MVCC enabled if switching to MVCC
+                if matches!(new_mode, journal_mode::JournalMode::ExperimentalMvcc)
+                    && !program.connection.db.mvcc_enabled()
+                {
+                    return Err(LimboError::InvalidArgument(
+                        "MVCC is not enabled. Enable it with `--experimental-mvcc` flag in the CLI or by setting the MVCC option in `DatabaseOpts`".to_string(),
+                    ));
+                }
+
+                state.op_journal_mode_state.new_mode = Some(new_mode);
+                state.op_journal_mode_state.sub_state = OpJournalModeSubState::Checkpoint;
             }
-            _ => {
-                // Invalid journal mode
-                return Err(LimboError::ParseError(format!(
-                    "Unknown journal mode: {mode}"
+
+            OpJournalModeSubState::Checkpoint => {
+                // Checkpoint WAL or MVCC before changing mode
+                let mv_store = program.connection.mv_store();
+                if let Some(mv_store) = mv_store.as_ref() {
+                    // MVCC checkpoint using state machine
+                    if state.op_journal_mode_state.checkpoint_sm.is_none() {
+                        state.op_journal_mode_state.checkpoint_sm =
+                            Some(StateMachine::new(CheckpointStateMachine::new(
+                                pager.clone(),
+                                mv_store.clone(),
+                                program.connection.clone(),
+                                true,
+                            )));
+                    }
+
+                    let ckpt_sm = state.op_journal_mode_state.checkpoint_sm.as_mut().unwrap();
+                    return_if_io!(ckpt_sm.step(&()));
+                    state.op_journal_mode_state.checkpoint_sm = None;
+                    state.op_journal_mode_state.sub_state = OpJournalModeSubState::UpdateHeader;
+                } else {
+                    // WAL checkpoint
+                    let checkpoint_result = pager.checkpoint(
+                        CheckpointMode::Truncate {
+                            upper_bound_inclusive: None,
+                        },
+                        program.connection.get_sync_mode(),
+                        false, // Don't clear cache yet, we'll do it in Finalize
+                    );
+                    return_if_io!(checkpoint_result);
+                    state.op_journal_mode_state.sub_state = OpJournalModeSubState::UpdateHeader;
+                }
+            }
+
+            OpJournalModeSubState::UpdateHeader => {
+                let new_mode = state
+                    .op_journal_mode_state
+                    .new_mode
+                    .expect("new_mode should be set");
+                let new_version = new_mode
+                    .as_version()
+                    .expect("Should be a supported Journal Mode");
+                let raw_version = RawVersion::from(new_version);
+
+                // After checkpoint, pager holds the most up-to-date version of the Header
+                let header_result = pager.with_header_mut(|header| {
+                    header.read_version = raw_version;
+                    header.write_version = raw_version;
+                });
+                return_if_io!(header_result);
+                state.op_journal_mode_state.sub_state = OpJournalModeSubState::ReadPage;
+            }
+
+            OpJournalModeSubState::ReadPage => {
+                // Read page 1 for writing
+                let (page, completion) = pager.read_page(DatabaseHeader::PAGE_ID as i64)?;
+                state.op_journal_mode_state.page_ref = Some(page);
+                state.op_journal_mode_state.sub_state = OpJournalModeSubState::WritePage;
+
+                if let Some(c) = completion {
+                    return Ok(InsnFunctionStepResult::IO(IOCompletions::Single(c)));
+                }
+            }
+
+            OpJournalModeSubState::WritePage => {
+                // Write page 1 to disk to flush the header
+                let page = state
+                    .op_journal_mode_state
+                    .page_ref
+                    .as_ref()
+                    .expect("page_ref should be set");
+                let completion = begin_write_btree_page(pager, page)?;
+                state.op_journal_mode_state.sub_state = OpJournalModeSubState::Finalize;
+                return Ok(InsnFunctionStepResult::IO(IOCompletions::Single(
+                    completion,
                 )));
             }
-        })
-    }
 
-    // Always return "wal" as the current journal mode
-    state.registers[*dest] = Register::Value(Value::build_text("wal"));
-    state.pc += 1;
-    Ok(InsnFunctionStepResult::Step)
+            OpJournalModeSubState::Finalize => {
+                let new_mode = state
+                    .op_journal_mode_state
+                    .new_mode
+                    .expect("new_mode should be set");
+
+                // Clear page cache
+                pager.clear_page_cache(true);
+
+                // Setup new mode
+                if matches!(new_mode, journal_mode::JournalMode::ExperimentalMvcc) {
+                    let db_path = program.connection.get_database_canonical_path();
+                    let mv_store = journal_mode::open_mv_store(pager.io.as_ref(), &db_path)?;
+                    program.connection.db.mv_store.store(Some(mv_store.clone()));
+                    program.connection.demote_to_mvcc_connection();
+                    mv_store.bootstrap(program.connection.clone())?;
+                }
+
+                if matches!(new_mode, journal_mode::JournalMode::Wal) {
+                    program.connection.db.mv_store.store(None);
+                }
+
+                // Return result
+                let ret: &'static str = new_mode.into();
+                state.registers[*dest] = Register::Value(Value::build_text(ret));
+                state.pc += 1;
+
+                return Ok(InsnFunctionStepResult::Step);
+            }
+        }
+    }
 }
 
 pub fn op_filter(
@@ -9966,7 +10125,7 @@ pub fn op_filter_add(
 }
 
 fn with_header<T, F>(
-    pager: &Arc<Pager>,
+    pager: &Pager,
     mv_store: Option<&Arc<MvStore>>,
     program: &Program,
     f: F,
@@ -9982,8 +10141,8 @@ where
     }
 }
 
-fn with_header_mut<T, F>(
-    pager: &Arc<Pager>,
+pub fn with_header_mut<T, F>(
+    pager: &Pager,
     mv_store: Option<&Arc<MvStore>>,
     program: &Program,
     f: F,

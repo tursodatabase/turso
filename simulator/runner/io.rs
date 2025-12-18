@@ -7,7 +7,7 @@ use rand::{Rng, RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 use turso_core::{Clock, IO, Instant, OpenFlags, PlatformIO, Result};
 
-use crate::runner::{SimIO, clock::SimulatorClock, file::SimulatorFile};
+use crate::runner::{SimIO, cli::IoBackend, clock::SimulatorClock, file::SimulatorFile};
 
 pub(crate) struct SimulatorIO {
     pub(crate) inner: Box<dyn IO>,
@@ -30,8 +30,16 @@ impl SimulatorIO {
         latency_probability: u8,
         min_tick: u64,
         max_tick: u64,
+        io_backend: IoBackend,
     ) -> Result<Self> {
-        let inner = Box::new(PlatformIO::new()?);
+        let inner: Box<dyn turso_core::IO> = match io_backend {
+            IoBackend::Default => Box::new(PlatformIO::new()?),
+            #[cfg(target_os = "linux")]
+            IoBackend::IoUring => Box::new(turso_core::UringIO::new()?),
+            IoBackend::Memory => {
+                panic!("Memory IO has its own impl, is not supported in SimulatorIO");
+            }
+        };
         let fault = Cell::new(false);
         let files = RefCell::new(Vec::new());
         let rng = RefCell::new(ChaCha8Rng::seed_from_u64(seed));
@@ -60,6 +68,10 @@ impl SimIO for SimulatorIO {
 
     fn print_stats(&self) {
         for file in self.files.borrow().iter() {
+            if file.path.contains("ephemeral") {
+                // Files created for ephemeral tables just add noise to the simulator output and aren't by default very interesting to debug
+                continue;
+            }
             tracing::info!(
                 "\n===========================\n\nPath: {}\n{}",
                 file.path,

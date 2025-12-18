@@ -5,12 +5,12 @@ use std::cmp::{Eq, Ord, Ordering, PartialEq, PartialOrd, Reverse};
 use std::collections::BinaryHeap;
 use std::rc::Rc;
 use std::sync::{atomic, Arc};
-use tempfile;
 
+use crate::io::TempFile;
 use crate::types::IOCompletions;
 use crate::{
     error::LimboError,
-    io::{Buffer, Completion, CompletionGroup, File, OpenFlags, IO},
+    io::{Buffer, Completion, CompletionGroup, File, IO},
     storage::sqlite3_ondisk::{read_varint, varint_len, write_varint},
     translate::collate::CollationSeq,
     turso_assert,
@@ -37,20 +37,6 @@ enum InsertState {
 enum InitChunkHeapState {
     Start,
     PushChunk,
-}
-
-struct TempFile {
-    // When temp_dir is dropped the folder is deleted
-    _temp_dir: tempfile::TempDir,
-    file: Arc<dyn File>,
-}
-
-impl core::ops::Deref for TempFile {
-    type Target = Arc<dyn File>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.file
-    }
 }
 
 pub struct Sorter {
@@ -343,18 +329,9 @@ impl Sorter {
         let chunk_file = match &self.temp_file {
             Some(temp_file) => temp_file.file.clone(),
             None => {
-                let temp_dir = tempfile::tempdir()?;
-                let chunk_file_path = temp_dir.as_ref().join("chunk_file");
-                let chunk_file_path_str = chunk_file_path.to_str().ok_or_else(|| {
-                    LimboError::InternalError("temp file path is not valid UTF-8".to_string())
-                })?;
-                let chunk_file =
-                    self.io
-                        .open_file(chunk_file_path_str, OpenFlags::Create, false)?;
-                self.temp_file = Some(TempFile {
-                    _temp_dir: temp_dir,
-                    file: chunk_file.clone(),
-                });
+                let temp_file = TempFile::new(&self.io)?;
+                let chunk_file = temp_file.file.clone();
+                self.temp_file = Some(temp_file);
                 chunk_file
             }
         };

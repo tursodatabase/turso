@@ -64,13 +64,8 @@ for i in range(updates):
         # Table/column might have been dropped in parallel - this is expected
         con.rollback()
         break
-    except turso.OperationalError as e:
-        if "UNIQUE constraint failed" in str(e):
-            # Ignore UNIQUE constraint violations
-            pass
-        else:
-            con.rollback()
-            # Re-raise other operational errors
-            raise
+    except turso.IntegrityError:
+        # Ignore constraint violations - can happen with random values
+        pass
 
 con.commit()

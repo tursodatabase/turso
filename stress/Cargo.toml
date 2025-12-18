@@ -16,13 +16,13 @@ path = "main.rs"
 
 [features]
 default = []
-antithesis = ["turso/antithesis", "antithesis_sdk/full"]
+antithesis = ["turso/antithesis", "dep:antithesis_sdk", "antithesis_sdk?/full"]
 
 [dependencies]
-anarchist-readable-name-generator-lib = "0.1.0"
-antithesis_sdk = { workspace = true }
+antithesis_sdk = { workspace = true, optional = true }
 clap = { workspace = true, features = ["derive"] }
 hex = { workspace = true }
+rand = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tracing = { workspace = true }

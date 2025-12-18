@@ -390,6 +390,7 @@ class Statement {
     bindParams(stmt, bindParameters);
 
     await this.execLock.acquire();
+    let row = undefined;
     try {
       while (true) {
         const stepResult = await stmt.stepSync();
@@ -398,13 +399,14 @@ class Statement {
           continue;
         }
         if (stepResult === STEP_DONE) {
-          return undefined;
+          break;
         }
-        if (stepResult === STEP_ROW) {
-          const row = stmt.row();
-          return row;
+        if (stepResult === STEP_ROW && row === undefined) {
+          row = stmt.row();
+          continue;
         }
       }
+      return row;
     } finally {
       stmt.reset();
       this.execLock.release();

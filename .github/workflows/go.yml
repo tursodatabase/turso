@@ -365,5 +365,5 @@ jobs:
           if [[ "$TARGET_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([\-+][0-9A-Za-z\.-]+)?$ ]]; then
             # module is in the subdirectory - prepend path to the version tag
             git tag "bindings/go/$TARGET_TAG"
-            git push --tags
+            git push origin tag "bindings/go/$TARGET_TAG"
           fi

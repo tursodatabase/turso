@@ -12,6 +12,7 @@ use crate::{
     },
     manual,
     opcodes_dictionary::OPCODE_DESCRIPTIONS,
+    read_state_machine::ReadState,
     HISTORY_FILE,
 };
 use anyhow::anyhow;
@@ -19,7 +20,7 @@ use clap::Parser;
 use comfy_table::{Attribute, Cell, CellAlignment, ContentArrangement, Row, Table};
 use rustyline::{error::ReadlineError, history::DefaultHistory, Editor};
 use std::{
-    io::{self, BufRead as _, IsTerminal, Write},
+    io::{self, BufRead, IsTerminal, Write},
     mem::{forget, ManuallyDrop},
     path::PathBuf,
     sync::{
@@ -98,6 +99,7 @@ pub struct Limbo {
     pub interrupt_count: Arc<AtomicUsize>,
     input_buff: ManuallyDrop<String>,
     pub(crate) opts: Settings,
+    read_state: ReadState,
     pub rl: Option<Editor<LimboHelper, DefaultHistory>>,
     config: Option<Config>,
 }
@@ -245,7 +247,7 @@ impl Limbo {
         }
         let sql = opts.sql.take();
         let has_sql = sql.is_some();
-        let quiet = opts.quiet;
+        let quiet = opts.quiet || !IsTerminal::is_terminal(&std::io::stdin());
         let config = Config::for_output_mode(opts.output_mode);
         let mut app = Self {
             prompt: PROMPT.to_string(),
@@ -254,6 +256,7 @@ impl Limbo {
             conn,
             interrupt_count,
             input_buff: ManuallyDrop::new(sql.unwrap_or_default()),
+            read_state: ReadState::default(),
             opts: Settings::from(opts),
             rl: None,
             config: Some(config),
@@ -380,6 +383,7 @@ impl Limbo {
     pub fn reset_input(&mut self) {
         self.prompt = PROMPT.to_string();
         self.input_buff.clear();
+        self.read_state = ReadState::default();
     }
 
     pub fn close_conn(&mut self) -> Result<(), LimboError> {
@@ -616,7 +620,10 @@ impl Limbo {
         }
 
         let value = self.input_buff.trim();
-        match (value.starts_with('.'), value.ends_with(';')) {
+        let is_dot_command = value.starts_with('.');
+        let is_complete = self.read_state.is_complete();
+
+        match (is_dot_command, is_complete) {
             (true, _) => {
                 let (owned_value, old_address) = take_usable_part(self);
                 self.handle_dot_command(owned_value.trim().strip_prefix('.').unwrap());
@@ -1089,7 +1096,11 @@ impl Limbo {
                     .with_thread_ids(true)
                     .with_ansi(should_emit_ansi),
             )
-            .with(EnvFilter::from_default_env().add_directive("rustyline=off".parse().unwrap()))
+            .with(
+                EnvFilter::from_default_env()
+                    .add_directive(tracing::level_filters::LevelFilter::WARN.into())
+                    .add_directive("rustyline=off".parse().unwrap()),
+            )
             .try_init()
         {
             println!("Unable to setup tracing appender: {e:?}");
@@ -1500,12 +1511,15 @@ impl Limbo {
 
         if let Some(rl) = &mut self.rl {
             let result = rl.readline(&self.prompt)?;
+            self.read_state.process(&result);
             let _ = self.input_buff.write_str(result.as_str());
         } else {
             let mut reader = std::io::stdin().lock();
+            let prev_len = self.input_buff.len();
             if reader.read_line(&mut self.input_buff)? == 0 {
                 return Err(ReadlineError::Eof);
             }
+            self.read_state.process(&self.input_buff[prev_len..]);
         }
 
         let _ = self.input_buff.write_char(' ');

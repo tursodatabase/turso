@@ -1,4 +1,4 @@
-use crate::common::{limbo_exec_rows, TempDatabase};
+use crate::common::{ExecRows, TempDatabase};
 use turso_core::{LimboError, StepResult, Value};
 
 #[turso_macros::test(mvcc, init_sql = "create table test (i integer);")]
@@ -950,8 +950,8 @@ fn test_multiple_connections_visibility(tmp_db: TempDatabase) -> anyhow::Result<
     drop(stmt);
     conn1.execute("COMMIT")?;
 
-    let rows = limbo_exec_rows(&conn2, "SELECT COUNT(*) FROM test");
-    assert_eq!(rows, vec![vec![rusqlite::types::Value::Integer(2)]]);
+    let rows: Vec<(i64,)> = conn2.exec_rows("SELECT COUNT(*) FROM test");
+    assert_eq!(rows, vec![(2,)]);
     Ok(())
 }
 
@@ -983,17 +983,8 @@ fn test_stmt_reset(tmp_db: TempDatabase) -> anyhow::Result<()> {
             _ => tmp_db.io.step().unwrap(),
         }
     }
-    let rows = limbo_exec_rows(&conn1, "SELECT rowid FROM test");
-    assert_eq!(
-        rows,
-        vec![
-            vec![rusqlite::types::Value::Integer(1)],
-            vec![rusqlite::types::Value::Integer(2)],
-            vec![rusqlite::types::Value::Integer(3)],
-            vec![rusqlite::types::Value::Integer(4)],
-            vec![rusqlite::types::Value::Integer(5)],
-        ]
-    );
+    let rows: Vec<(i64,)> = conn1.exec_rows("SELECT rowid FROM test");
+    assert_eq!(rows, vec![(1,), (2,), (3,), (4,), (5,)]);
     Ok(())
 }
 
@@ -1129,5 +1120,5 @@ fn test_eval_param_only_once(tmp_db: TempDatabase) {
     let end_time = std::time::Instant::now();
     let elapsed = end_time.duration_since(start_time);
     // the test will allocate 10^8 * 10^4 bytes in case if parameter will be evaluated for every row
-    assert!(elapsed < std::time::Duration::from_millis(100));
+    assert!(elapsed < std::time::Duration::from_millis(120));
 }

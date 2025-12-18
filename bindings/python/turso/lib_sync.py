@@ -43,7 +43,7 @@ class PartialSyncQueryBootstrap:
 class PartialSyncOpts:
     bootstrap_strategy: Union[PartialSyncPrefixBootstrap, PartialSyncQueryBootstrap]
     segment_size: Optional[int] = None
-    speculative_load: Optional[bool] = None
+    prefetch: Optional[bool] = None
 
 class _HttpContext:
     """
@@ -451,7 +451,7 @@ def connect_sync(
             bootstrap_strategy_prefix=prefix_len,
             bootstrap_strategy_query=query_str,
             segment_size=partial_sync_opts.segment_size,
-            speculative_load=partial_sync_opts.speculative_load
+            prefetch=partial_sync_opts.prefetch
         ) if partial_sync_opts is not None else None,
     )
 

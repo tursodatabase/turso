@@ -209,7 +209,7 @@ pub enum OverwriteCellState {
 }
 
 struct BalanceContext {
-    pages_to_balance_new: [Option<PageRef>; MAX_NEW_SIBLING_PAGES_AFTER_BALANCE],
+    pages_to_balance_new: [Option<PinGuard>; MAX_NEW_SIBLING_PAGES_AFTER_BALANCE],
     sibling_count_new: usize,
     cell_array: CellArray,
     old_cell_count_per_page_cumulative: [u16; MAX_NEW_SIBLING_PAGES_AFTER_BALANCE],
@@ -303,7 +303,7 @@ struct ReadPayloadOverflow {
 
 enum PayloadOverflowWithOffset {
     SkipOverflowPages {
-        next_page: PageRef,
+        next_page: PinGuard,
         pages_left_to_skip: u32,
         page_offset: u32,
         amount: u32,
@@ -312,11 +312,48 @@ enum PayloadOverflowWithOffset {
     },
     ProcessPage {
         remaining_to_read: u32,
-        page: PageRef,
+        page: PinGuard,
         current_offset: usize,
         buffer_offset: usize,
         is_write: bool,
     },
+}
+
+#[derive(Debug)]
+pub struct PinGuard(PageRef);
+impl PinGuard {
+    pub fn new(p: PageRef) -> Self {
+        p.pin();
+        Self(p)
+    }
+}
+
+// Since every Drop will unpin, every clone
+// needs to add to the pin count
+impl Clone for PinGuard {
+    fn clone(&self) -> Self {
+        self.0.pin();
+        Self(self.0.clone())
+    }
+}
+
+impl PinGuard {
+    pub fn to_page(&self) -> PageRef {
+        self.0.clone()
+    }
+}
+
+impl Drop for PinGuard {
+    fn drop(&mut self) {
+        self.0.try_unpin();
+    }
+}
+
+impl std::ops::Deref for PinGuard {
+    type Target = PageRef;
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -365,7 +402,7 @@ impl BTreeKey<'_> {
 #[derive(Debug, Clone)]
 struct BalanceInfo {
     /// Old pages being balanced. We can have maximum 3 pages being balanced at the same time.
-    pages_to_balance: [Option<PageRef>; MAX_SIBLING_PAGES_TO_BALANCE],
+    pages_to_balance: [Option<PinGuard>; MAX_SIBLING_PAGES_TO_BALANCE],
     /// Bookkeeping of the rightmost pointer so the offset::BTREE_RIGHTMOST_PTR can be updated.
     rightmost_pointer: *mut u8,
     /// Divider cells of old pages. We can have maximum 2 divider cells because of 3 pages.
@@ -909,7 +946,7 @@ impl BTreeCursor {
             *remaining_to_read -= to_read;
 
             if *remaining_to_read != 0 && next != 0 {
-                let (new_page, c) = self.pager.read_page(next as i64)?;
+                let (new_page, c) = self.read_page(next as i64)?;
                 *page = new_page;
                 *next_page = next;
                 if let Some(c) = c {
@@ -1055,7 +1092,7 @@ impl BTreeCursor {
                         local_amount,
                         payload,
                         buffer,
-                        page.clone(),
+                        PinGuard::new(page.clone()),
                     )?;
                 } else {
                     self.read_payload_from_page(offset, local_amount, payload, buffer);
@@ -1079,17 +1116,15 @@ impl BTreeCursor {
                 let page_offset = offset % overflow_size as u32;
                 // Read page
                 let (page, c) = self.read_page(first_overflow_page.unwrap() as i64)?;
-
                 self.state =
                     CursorState::ReadWritePayload(PayloadOverflowWithOffset::SkipOverflowPages {
-                        next_page: page,
+                        next_page: PinGuard::new(page),
                         pages_left_to_skip: pages_to_skip,
                         page_offset,
                         amount,
                         buffer_offset: bytes_processed as usize,
                         is_write,
                     });
-
                 if let Some(c) = c {
                     io_yield_one!(c);
                 }
@@ -1141,10 +1176,9 @@ impl BTreeCursor {
                     pages_left_to_skip -= 1;
 
                     let (next_page, c) = self.read_page(next as i64)?;
-
                     self.state = CursorState::ReadWritePayload(
                         PayloadOverflowWithOffset::SkipOverflowPages {
-                            next_page,
+                            next_page: PinGuard::new(next_page),
                             pages_left_to_skip,
                             page_offset,
                             amount,
@@ -1152,7 +1186,6 @@ impl BTreeCursor {
                             is_write,
                         },
                     );
-
                     if let Some(c) = c {
                         io_yield_one!(c);
                     }
@@ -1208,8 +1241,7 @@ impl BTreeCursor {
                     // Load next page
                     current_offset = 0; // Reset offset for new page
                     let (next_page, c) = self.read_page(next as i64)?;
-                    page = next_page;
-
+                    page = PinGuard::new(next_page);
                     self.state =
                         CursorState::ReadWritePayload(PayloadOverflowWithOffset::ProcessPage {
                             remaining_to_read,
@@ -1218,7 +1250,6 @@ impl BTreeCursor {
                             buffer_offset,
                             is_write,
                         });
-                    // Return IO to allow other operations
                     if let Some(c) = c {
                         io_yield_one!(c);
                     }
@@ -1253,7 +1284,7 @@ impl BTreeCursor {
         num_bytes: u32,
         payload: &[u8],
         buffer: &mut [u8],
-        page: PageRef,
+        page: PinGuard,
     ) -> Result<()> {
         self.pager.add_dirty(&page)?;
         // SAFETY: This is safe as long as the page is not evicted from the cache.
@@ -1459,7 +1490,6 @@ impl BTreeCursor {
                                 io_yield_one!(c);
                             }
                         }
-
                         None => {
                             unreachable!("interior page should have a rightmost pointer");
                         }
@@ -2365,7 +2395,7 @@ impl BTreeCursor {
                     ref mut fill_cell_payload_state,
                 } => {
                     return_if_io!(fill_cell_payload(
-                        page,
+                        &PinGuard::new(page.clone()),
                         bkey.maybe_rowid(),
                         new_payload,
                         *cell_idx,
@@ -2602,6 +2632,7 @@ impl BTreeCursor {
             0,
             BtreePageAllocMode::Any
         ));
+        self.pager.add_dirty(&new_rightmost_leaf)?;
 
         let usable_space = self.usable_space();
         let old_rightmost_leaf = self.stack.top_ref();
@@ -2616,6 +2647,7 @@ impl BTreeCursor {
             .stack
             .get_page_at_level(self.stack.current() - 1)
             .expect("parent page should be on the stack");
+        self.pager.add_dirty(parent)?;
         let parent_contents = parent.get_contents();
         let rightmost_pointer = parent_contents
             .rightmost_pointer()
@@ -2658,9 +2690,6 @@ impl BTreeCursor {
             usable_space,
         )?;
         parent_contents.write_rightmost_ptr(new_rightmost_leaf.get().id as u32);
-        self.pager.add_dirty(parent)?;
-        self.pager.add_dirty(&new_rightmost_leaf)?;
-
         // Continue balance from the parent page (inserting the new divider cell may have overflowed the parent)
         self.stack.pop();
 
@@ -2746,7 +2775,7 @@ impl BTreeCursor {
                         page_to_balance_idx
                     );
                     // Part 1: Find the sibling pages to balance
-                    let mut pages_to_balance: [Option<PageRef>; MAX_SIBLING_PAGES_TO_BALANCE] =
+                    let mut pages_to_balance: [Option<PinGuard>; MAX_SIBLING_PAGES_TO_BALANCE] =
                         [const { None }; MAX_SIBLING_PAGES_TO_BALANCE];
                     turso_assert!(
                         page_to_balance_idx <= parent_contents.cell_count(),
@@ -2838,7 +2867,7 @@ impl BTreeCursor {
                                 return Err(e);
                             }
                             Ok((page, c)) => {
-                                pages_to_balance[i].replace(page);
+                                pages_to_balance[i].replace(PinGuard::new(page));
                                 if let Some(c) = c {
                                     group.add(&c);
                                 }
@@ -2939,14 +2968,14 @@ impl BTreeCursor {
                         }
                     }
                     // Start balancing.
-                    let parent_page = self.stack.top_ref();
+                    let parent_page = PinGuard::new(self.stack.top_ref().clone());
                     let parent_contents = parent_page.get_contents();
 
                     // 1. Collect cell data from divider cells, and count the total number of cells to be distributed.
                     // The count includes: all cells and overflow cells from the sibling pages, and divider cells from the parent page,
                     // excluding the rightmost divider, which will not be dropped from the parent; instead it will be updated at the end.
                     let mut total_cells_to_redistribute = 0;
-                    let pages_to_balance_new: [Option<PageRef>;
+                    let pages_to_balance_new: [Option<PinGuard>;
                         MAX_NEW_SIBLING_PAGES_AFTER_BALANCE] =
                         [const { None }; MAX_NEW_SIBLING_PAGES_AFTER_BALANCE];
                     for i in (0..balance_info.sibling_count).rev() {
@@ -3117,7 +3146,6 @@ impl BTreeCursor {
                         }
                         total_cells_inserted += cells_inserted;
                     }
-
                     turso_assert!(
                         cell_array.cell_payloads.capacity() == cells_capacity_start,
                         "calculation of max cells was wrong"
@@ -3429,13 +3457,12 @@ impl BTreeCursor {
                         turso_assert!(page.is_dirty(), "sibling page must be already marked dirty");
                         pages_to_balance_new[*i].replace(page.clone());
                     } else {
-                        // FIXME: handle page cache is full
                         let page = return_if_io!(pager.do_allocate_page(
                             page_type,
                             0,
                             BtreePageAllocMode::Any
                         ));
-                        pages_to_balance_new[*i].replace(page);
+                        pages_to_balance_new[*i].replace(PinGuard::new(page));
                         // Since this page didn't exist before, we can set it to cells length as it
                         // marks them as empty since it is a prefix sum of cells.
                         old_cell_count_per_page_cumulative[*i] =
@@ -3469,7 +3496,7 @@ impl BTreeCursor {
                         .get_contents()
                         .page_type();
                     let parent_is_root = !self.stack.has_parent();
-                    let parent_page = self.stack.top_ref();
+                    let parent_page = PinGuard::new(self.stack.top_ref().clone());
                     let parent_contents = parent_page.get_contents();
                     let mut sibling_count_new = *sibling_count_new;
                     let is_table_leaf = matches!(page_type, PageType::TableLeaf);
@@ -3495,7 +3522,7 @@ impl BTreeCursor {
                             if *new_id != page.get().id {
                                 page.get().id = *new_id;
                                 self.pager
-                                    .upsert_page_in_cache(*new_id, page.clone(), true)?;
+                                    .upsert_page_in_cache(*new_id, page.0.clone(), true)?;
                             }
                         }
 
@@ -3836,7 +3863,7 @@ impl BTreeCursor {
 
                     #[cfg(debug_assertions)]
                     BTreeCursor::post_balance_non_root_validation(
-                        parent_page,
+                        &parent_page,
                         balance_info,
                         parent_contents,
                         pages_to_balance_new,
@@ -3878,7 +3905,7 @@ impl BTreeCursor {
                         let balance_info = balance_info.borrow();
                         let balance_info = balance_info.as_ref().expect("must be balancing");
                         let page = balance_info.pages_to_balance[*curr_page].as_ref().unwrap();
-                        return_if_io!(self.pager.free_page(Some(page.clone()), page.get().id));
+                        return_if_io!(self.pager.free_page(Some(page.0.clone()), page.get().id));
                         *sub_state = BalanceSubState::FreePages {
                             curr_page: *curr_page + 1,
                             sibling_count_new: *sibling_count_new,
@@ -3945,7 +3972,7 @@ impl BTreeCursor {
         parent_page: &PageRef,
         balance_info: &BalanceInfo,
         parent_contents: &mut PageContent,
-        pages_to_balance_new: &[Option<PageRef>; MAX_NEW_SIBLING_PAGES_AFTER_BALANCE],
+        pages_to_balance_new: &[Option<PinGuard>; MAX_NEW_SIBLING_PAGES_AFTER_BALANCE],
         page_type: PageType,
         is_table_leaf: bool,
         cells_debug: &mut [Vec<u8>],
@@ -4343,7 +4370,6 @@ impl BTreeCursor {
 
         let root = self.stack.top();
         let root_contents = root.get_contents();
-        // FIXME: handle page cache is full
         let child = return_if_io!(self.pager.do_allocate_page(
             root_contents.page_type(),
             0,
@@ -4748,7 +4774,7 @@ impl BTreeCursor {
                 } => {
                     {
                         return_if_io!(fill_cell_payload(
-                            page,
+                            &PinGuard::new(page.clone()),
                             *rowid,
                             new_payload,
                             cell_idx,
@@ -5541,8 +5567,8 @@ impl CursorTrait for BTreeCursor {
                         // should be safe as contents is not a leaf page
                         let right_most_pointer = contents.rightmost_pointer().unwrap();
                         self.stack.advance();
-                        let (mem_page, c) = self.read_page(right_most_pointer as i64)?;
-                        self.stack.push(mem_page);
+                        let (child, c) = self.read_page(right_most_pointer as i64)?;
+                        self.stack.push(child);
                         if let Some(c) = c {
                             io_yield_one!(c);
                         }
@@ -5560,8 +5586,8 @@ impl CursorTrait for BTreeCursor {
                                 ..
                             }) => {
                                 self.stack.advance();
-                                let (mem_page, c) = self.read_page(left_child_page as i64)?;
-                                self.stack.push(mem_page);
+                                let (child, c) = self.read_page(left_child_page as i64)?;
+                                self.stack.push(child);
                                 if let Some(c) = c {
                                     io_yield_one!(c);
                                 }
@@ -7543,7 +7569,7 @@ pub enum FillCellPayloadState {
         /// If this is None, we will copy data into the cell payload on the btree page.
         /// Also: to safely form a chain of overflow pages, the current page must be pinned to the page cache
         /// so that e.g. a spilling operation does not evict it to disk.
-        current_overflow_page: Option<PageRef>,
+        current_overflow_page: Option<PinGuard>,
     },
 }
 
@@ -7561,7 +7587,7 @@ pub enum CopyDataState {
 /// may require I/O.
 #[allow(clippy::too_many_arguments)]
 fn fill_cell_payload(
-    page: &PageRef,
+    page: &PinGuard,
     int_key: Option<i64>,
     cell_payload: &mut Vec<u8>,
     cell_idx: usize,
@@ -7576,7 +7602,6 @@ fn fill_cell_payload(
         let record_buf = record.get_payload();
         match fill_cell_payload_state {
             FillCellPayloadState::Start => {
-                page.pin(); // We need to pin this page because we will be accessing its contents after fill_cell_payload is done.
                 let page_contents = page.get_contents();
 
                 let page_type = page_contents.page_type();
@@ -7654,9 +7679,6 @@ fn fill_cell_payload(
                         }
 
                         if record_offset_slice.len() - amount_to_copy == 0 {
-                            let cur_page = current_overflow_page.as_ref().expect("we must have overflowed if the remaining payload fits on the current page");
-                            cur_page.unpin(); // We can safely unpin the current overflow page now.
-                                              // Everything copied.
                             break Ok(IOResult::Done(()));
                         }
                         *state = CopyDataState::AllocateOverflowPage;
@@ -7664,20 +7686,14 @@ fn fill_cell_payload(
                     }
                     CopyDataState::AllocateOverflowPage => {
                         let new_overflow_page = match pager.allocate_overflow_page() {
-                            Ok(IOResult::Done(new_overflow_page)) => new_overflow_page,
+                            Ok(IOResult::Done(new_overflow_page)) => {
+                                PinGuard::new(new_overflow_page)
+                            }
                             Ok(IOResult::IO(io_result)) => return Ok(IOResult::IO(io_result)),
                             Err(e) => {
-                                if let Some(cur_page) = current_overflow_page {
-                                    cur_page.unpin();
-                                }
                                 break Err(e);
                             }
                         };
-                        new_overflow_page.pin(); // Pin the current overflow page so the cache won't evict it because we need this page to be in memory for the next iteration of FillCellPayloadState::CopyData.
-                        if let Some(prev_page) = current_overflow_page {
-                            prev_page.unpin(); // We can safely unpin the previous overflow page now.
-                        }
-
                         turso_assert!(
                             new_overflow_page.is_loaded(),
                             "new overflow page is not loaded"
@@ -7711,7 +7727,6 @@ fn fill_cell_payload(
             }
         }
     };
-    page.unpin();
     result
 }
 /// Returns the maximum payload size (X) that can be stored directly on a b-tree page without spilling to overflow pages.
@@ -7797,9 +7812,9 @@ mod tests {
         storage::{database::DatabaseFile, page_cache::PageCache, sqlite3_ondisk::PageSize},
         types::Text,
         vdbe::Register,
-        BufferPool, Completion, Connection, IOContext, StepResult, WalFile, WalFileShared,
+        BufferPool, Completion, Connection, IOContext, StepResult, Wal, WalFile, WalFileShared,
     };
-    use std::{cell::RefCell, collections::HashSet, mem::transmute, ops::Deref, rc::Rc, sync::Arc};
+    use std::{collections::HashSet, mem::transmute, ops::Deref, sync::Arc};
 
     use tempfile::TempDir;
 
@@ -7861,7 +7876,7 @@ mod tests {
         run_until_done(
             || {
                 fill_cell_payload(
-                    &page,
+                    &PinGuard::new(page.clone()),
                     Some(id as i64),
                     &mut payload,
                     pos,
@@ -9063,11 +9078,7 @@ mod tests {
 
         let wal_file = io.open_file("test.wal", OpenFlags::Create, false).unwrap();
         let wal_shared = WalFileShared::new_shared(wal_file).unwrap();
-        let wal = Rc::new(RefCell::new(WalFile::new(
-            io.clone(),
-            wal_shared,
-            buffer_pool.clone(),
-        )));
+        let wal: Arc<dyn Wal> = Arc::new(WalFile::new(io.clone(), wal_shared, buffer_pool.clone()));
 
         let pager = Arc::new(
             Pager::new(
@@ -9628,7 +9639,7 @@ mod tests {
                     run_until_done(
                         || {
                             fill_cell_payload(
-                                &page,
+                                &PinGuard::new(page.clone()),
                                 Some(i as i64),
                                 &mut payload,
                                 cell_idx,
@@ -9710,7 +9721,7 @@ mod tests {
                         run_until_done(
                             || {
                                 fill_cell_payload(
-                                    &page,
+                                    &PinGuard::new(page.clone()),
                                     Some(i),
                                     &mut payload,
                                     cell_idx,
@@ -10083,7 +10094,7 @@ mod tests {
         run_until_done(
             || {
                 fill_cell_payload(
-                    &page,
+                    &PinGuard::new(page.clone()),
                     Some(0),
                     &mut payload,
                     0,
@@ -10169,7 +10180,7 @@ mod tests {
         run_until_done(
             || {
                 fill_cell_payload(
-                    &page,
+                    &PinGuard::new(page.clone()),
                     Some(0),
                     &mut payload,
                     0,
@@ -10575,7 +10586,7 @@ mod tests {
         run_until_done(
             || {
                 fill_cell_payload(
-                    &page,
+                    &PinGuard::new(page.clone()),
                     Some(cell_idx as i64),
                     &mut payload,
                     cell_idx as usize,

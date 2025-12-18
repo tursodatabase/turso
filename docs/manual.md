@@ -39,6 +39,7 @@ Welcome to Turso database manual!
       - [`sqlite3_column`](#sqlite3_column)
     - [WAL manipulation](#wal-manipulation)
       - [`libsql_wal_frame_count`](#libsql_wal_frame_count)
+  - [Journal Mode](#journal-mode)
   - [Encryption](#encryption)
   - [Vector search](#vector-search)
   - [CDC](#cdc-early-preview)
@@ -578,6 +579,63 @@ in the `p_frame_count` parameter.
   connection.
 * The `p_frame_count` must be a valid pointer to a `u32` that will store the
 * number of frames in the WAL file.
+
+## Journal Mode
+
+Turso supports switching between different journal modes at runtime using the `PRAGMA journal_mode` statement. Journal modes control how the database handles transaction logging and durability.
+
+### Supported Modes
+
+| Mode | Description |
+|------|-------------|
+| `wal` | Write-Ahead Logging mode. The default mode for new databases. Provides good concurrency for readers and writers. |
+| `experimental_mvcc` | Multi-Version Concurrency Control mode. Enables concurrent transactions with snapshot isolation. Requires the `--experimental-mvcc` flag. |
+
+> **Note:** Legacy SQLite journal modes (`delete`, `truncate`, `persist`, `memory`, `off`) are recognized but not currently supported. Attempting to switch to these modes will return an error.
+
+### Usage
+
+**Query the current journal mode:**
+
+```sql
+PRAGMA journal_mode;
+```
+
+**Switch to WAL mode:**
+
+```sql
+PRAGMA journal_mode = wal;
+```
+
+**Switch to MVCC mode:**
+
+```sql
+PRAGMA journal_mode = experimental_mvcc;
+```
+
+### Example
+
+```console
+turso> PRAGMA journal_mode;
+┌──────────────┐
+│ journal_mode │
+├──────────────┤
+│ wal          │
+└──────────────┘
+turso> PRAGMA journal_mode = experimental_mvcc;
+┌───────────────────┐
+│ journal_mode      │
+├───────────────────┤
+│ experimental_mvcc │
+└───────────────────┘
+```
+
+### Important Notes
+
+- Switching journal modes triggers a checkpoint to ensure all pending changes are persisted before the mode change.
+- To use `experimental_mvcc` mode, you must start the database with the `--experimental-mvcc` flag enabled.
+- When switching from MVCC to WAL mode, the MVCC log file is cleared after checkpointing.
+- Legacy SQLite databases are automatically converted to WAL mode when opened.
 
 ## Encryption
 
