@@ -311,11 +311,20 @@ impl Statement {
     }
 
     /// Blocks execution, advances IO, and stops at any StepResult except IO
-    pub fn run_one_step_blocking(&mut self) -> Result<Option<&Row>> {
+    /// You can optionally pass a handler to run after IO is advanced
+    pub fn run_one_step_blocking(
+        &mut self,
+        mut pre_io_func: impl FnMut() -> Result<()>,
+        mut post_io_func: impl FnMut() -> Result<()>,
+    ) -> Result<Option<&Row>> {
         let result = loop {
             match self.step()? {
                 vdbe::StepResult::Done => break None,
-                vdbe::StepResult::IO => self.pager.io.step()?,
+                vdbe::StepResult::IO => {
+                    pre_io_func()?;
+                    self.pager.io.step()?;
+                    post_io_func()?;
+                }
                 vdbe::StepResult::Row => break Some(self.row().expect("row should be present")),
                 vdbe::StepResult::Interrupt => return Err(LimboError::Interrupt),
                 vdbe::StepResult::Busy => return Err(LimboError::Busy),

@@ -157,7 +157,7 @@ pub unsafe extern "C" fn stmt_step(stmt: *mut Stmt) -> ResultCode {
         return ResultCode::Error;
     }
     let stmt_ctx: &mut Statement = unsafe { &mut *(stmt._ctx as *mut Statement) };
-    let res = stmt_ctx.run_one_step_blocking();
+    let res = stmt_ctx.run_one_step_blocking(|| Ok(()), || Ok(()));
     match res {
         Ok(Some(_)) => ResultCode::Row,
         Ok(None) => {

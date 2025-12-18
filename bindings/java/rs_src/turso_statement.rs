@@ -59,7 +59,7 @@ pub extern "system" fn Java_tech_turso_core_TursoStatement_step<'local>(
         }
     };
 
-    let result = stmt.stmt.run_one_step_blocking();
+    let result = stmt.stmt.run_one_step_blocking(|| Ok(()), || Ok(()));
 
     match result {
         Ok(Some(row)) => match row_to_obj_array(&mut env, row) {

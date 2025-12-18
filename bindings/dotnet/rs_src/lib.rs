@@ -242,7 +242,7 @@ pub unsafe extern "C" fn db_statement_execute_step(
     error_ptr: *mut Error,
 ) -> bool {
     let statement = unsafe { &mut (*statement_ptr) };
-    let result = statement.run_one_step_blocking();
+    let result = statement.run_one_step_blocking(|| Ok(()), || Ok(()));
 
     match result {
         Ok(Some(_)) => true,
