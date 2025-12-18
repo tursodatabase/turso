@@ -241,7 +241,7 @@ impl PyTursoStatement {
     /// The caller must always either use [Self::step] or [Self::execute] methods for single statement - but never mix them together
     pub fn step(&mut self) -> PyResult<PyTursoStatusCode> {
         Ok(turso_status_to_py(
-            self.statement.step().map_err(turso_error_to_py_err)?,
+            self.statement.step(None).map_err(turso_error_to_py_err)?,
         ))
     }
 
@@ -253,7 +253,10 @@ impl PyTursoStatement {
     ///
     /// The caller must always either use [Self::step] or [Self::execute] methods for single statement - but never mix them together
     pub fn execute(&mut self) -> PyResult<PyTursoExecutionResult> {
-        let result = self.statement.execute().map_err(turso_error_to_py_err)?;
+        let result = self
+            .statement
+            .execute(None)
+            .map_err(turso_error_to_py_err)?;
         Ok(PyTursoExecutionResult {
             status: turso_status_to_py(result.status),
             rows_changed: result.rows_changed,
@@ -299,7 +302,9 @@ impl PyTursoStatement {
     /// Note, that if statement wasn't started (no step / execute methods was called) - finalize will not execute the statement
     pub fn finalize(&mut self) -> PyResult<PyTursoStatusCode> {
         Ok(turso_status_to_py(
-            self.statement.finalize().map_err(turso_error_to_py_err)?,
+            self.statement
+                .finalize(None)
+                .map_err(turso_error_to_py_err)?,
         ))
     }
     /// Reset the statement by clearing bindings and reclaiming memory of the program from previous run
