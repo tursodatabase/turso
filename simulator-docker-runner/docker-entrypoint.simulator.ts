@@ -199,9 +199,6 @@ while (new Date().getTime() - startTime.getTime() < TIME_LIMIT_MINUTES * 60 * 10
   }
 
   args.push(...["--minimum-tests", "100", "--maximum-tests", "1000"]);
-  const loop = args.includes("loop") ? [] : ["loop", "-n", "10", "--short-circuit"]
-  args.push(...loop);
-
 
   console.log(`[${timestamp}]: Running "limbo_sim ${args.join(" ")}" - (seed ${seed}, run number ${runNumber})`);
   const issuePosted = await run(seed, "limbo_sim", args);
