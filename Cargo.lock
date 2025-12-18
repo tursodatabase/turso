@@ -5213,7 +5213,6 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
- "turso",
  "turso_core",
  "turso_parser",
  "uuid",
