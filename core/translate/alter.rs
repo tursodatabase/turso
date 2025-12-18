@@ -2644,6 +2644,51 @@ pub fn rewrite_expr_table_refs_for_rename(
     changed
 }
 
+/// Check if a trigger WHEN clause contains table-qualified column refs that would become
+/// invalid after a table rename. SQLite rejects ALTER TABLE RENAME if the WHEN clause
+/// contains refs like `t1.col` (other than NEW.col or OLD.col) where t1 is the table
+/// being renamed.
+pub fn check_when_clause_for_invalid_table_refs(
+    expr: &ast::Expr,
+    table_being_renamed: &str,
+) -> Option<(String, String)> {
+    let mut invalid_ref: Option<(String, String)> = None;
+
+    let _ = walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
+        // If we already found an invalid ref, skip the rest
+        if invalid_ref.is_some() {
+            return Ok(WalkControl::SkipChildren);
+        }
+        match e {
+            ast::Expr::Qualified(tbl_name, col_name) => {
+                let tbl_norm = normalize_ident(tbl_name.as_str());
+                // NEW and OLD are valid pseudo-table references in triggers
+                if !tbl_norm.eq_ignore_ascii_case("new")
+                    && !tbl_norm.eq_ignore_ascii_case("old")
+                    && tbl_norm == table_being_renamed
+                {
+                    invalid_ref = Some((tbl_name.to_string(), col_name.to_string()));
+                    return Ok(WalkControl::SkipChildren);
+                }
+            }
+            ast::Expr::DoublyQualified(_, tbl_name, col_name) => {
+                let tbl_norm = normalize_ident(tbl_name.as_str());
+                if !tbl_norm.eq_ignore_ascii_case("new")
+                    && !tbl_norm.eq_ignore_ascii_case("old")
+                    && tbl_norm == table_being_renamed
+                {
+                    invalid_ref = Some((tbl_name.to_string(), col_name.to_string()));
+                    return Ok(WalkControl::SkipChildren);
+                }
+            }
+            _ => {}
+        }
+        Ok(WalkControl::Continue)
+    });
+
+    invalid_ref
+}
+
 /// Rewrite table references in a SELECT statement for table rename.
 ///
 /// Handles the complete SELECT structure used in trigger commands:

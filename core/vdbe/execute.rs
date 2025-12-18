@@ -15,8 +15,8 @@ use crate::storage::page_cache::PageCache;
 use crate::storage::pager::{default_page1, CreateBTreeFlags, PageRef};
 use crate::storage::sqlite3_ondisk::{read_varint_fast, DatabaseHeader, PageSize, RawVersion};
 use crate::translate::alter::{
-    rewrite_expr_table_refs_for_rename, rewrite_select_table_refs_for_rename,
-    walk_upsert_for_table_rename,
+    check_when_clause_for_invalid_table_refs, rewrite_expr_table_refs_for_rename,
+    rewrite_select_table_refs_for_rename, walk_upsert_for_table_rename,
 };
 use crate::translate::collate::CollationSeq;
 use crate::types::{
@@ -5857,6 +5857,19 @@ pub fn op_function(
                                 }
 
                                 if let Some(ref mut when_expr) = when_clause {
+                                    if let Some((tbl, col)) =
+                                        check_when_clause_for_invalid_table_refs(
+                                            when_expr,
+                                            &rename_from,
+                                        )
+                                    {
+                                        return Err(LimboError::Constraint(format!(
+                                            "error in trigger {}: no such column: {}.{}",
+                                            trigger_name.name.as_str(),
+                                            tbl,
+                                            col
+                                        )));
+                                    }
                                     changed |= rewrite_expr_table_refs_for_rename(
                                         when_expr,
                                         &rename_from,
