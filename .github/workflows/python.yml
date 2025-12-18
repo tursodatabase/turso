@@ -68,6 +68,16 @@ jobs:
       - name: Run Pytest (async driver)
         run: uv run pytest tests/test_database_aio.py
 
+      - name: Run Pytest (sync)
+        env:
+          LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
+        run: uv run pytest tests/test_database_sync.py
+
+      - name: Run Pytest (sync, async driver)
+        env:
+          LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
+        run: uv run pytest tests/test_database_sync_aio.py
+
   lint:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
