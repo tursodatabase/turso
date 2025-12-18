@@ -2386,6 +2386,10 @@ impl Jsonb {
             stack.push(result);
         }
 
+        if let Some(err) = &path.trail_error {
+            return Err(err.clone());
+        }
+
         Ok(stack)
     }
 
@@ -2507,9 +2511,9 @@ impl Jsonb {
                                 ));
                             }
 
-                            bail_parse_error!("Not found!");
+                            return Err(crate::LimboError::PathNotFound);
                         }
-                        Some(idx) if *idx < 0 => {
+                        Some(idx) => {
                             let mut idx_map: HashMap<i32, usize> = HashMap::with_capacity(100);
                             let mut element_idx = 0;
                             let mut arr_pos = pos + root_header_size;
@@ -2530,7 +2534,7 @@ impl Jsonb {
                                     *index,
                                 ));
                             } else {
-                                bail_parse_error!("Element with negative index not found")
+                                return Err(crate::LimboError::PathNotFound);
                             }
                         }
                         None => {
@@ -2550,10 +2554,7 @@ impl Jsonb {
                                     arr_pos,
                                 ));
                             }
-                            bail_parse_error!("Index past end of array")
-                        }
-                        Some(_) => {
-                            unreachable!("i32 is either >= 0 or < 0; both cases handled above")
+                            return Err(crate::LimboError::PathNotFound);
                         }
                     }
                 } else {
@@ -2655,10 +2656,10 @@ impl Jsonb {
                             delta as isize,
                         ));
                     } else {
-                        bail_parse_error!("Mode does not allow insert cannot create new key!")
+                        return Err(crate::LimboError::PathNotFound);
                     }
                 } else {
-                    bail_parse_error!("Looks like this is noop");
+                    return Err(crate::LimboError::PathNotFound);
                 }
             }
             SegmentVariant::KeyWithArrayIndex(
@@ -2707,9 +2708,9 @@ impl Jsonb {
                                 ));
                             }
 
-                            bail_parse_error!("Not found!");
+                            return Err(crate::LimboError::PathNotFound);
                         }
-                        Some(idx) if *idx < 0 => {
+                        Some(idx) => {
                             let mut idx_map: HashMap<i32, usize> = HashMap::with_capacity(100);
                             let mut element_idx = 0;
                             let mut arr_pos = pos + root_header_size;
@@ -2730,7 +2731,7 @@ impl Jsonb {
                                     *index,
                                 ));
                             } else {
-                                bail_parse_error!("Element with negative index not found")
+                                return Err(crate::LimboError::PathNotFound);
                             }
                         }
                         None => {
@@ -2750,10 +2751,7 @@ impl Jsonb {
                                     arr_pos,
                                 ));
                             }
-                            bail_parse_error!("Index past end of array")
-                        }
-                        Some(_) => {
-                            unreachable!("i32 is either >= 0 or < 0; both cases handled above")
+                            return Err(crate::LimboError::PathNotFound);
                         }
                     }
                 } else {
@@ -2900,7 +2898,7 @@ impl Jsonb {
                                 ));
                             }
 
-                            bail_parse_error!("Not found!");
+                            return Err(crate::LimboError::PathNotFound);
                         }
                         Some(idx) if *idx < 0 => {
                             let mut idx_map: HashMap<i32, usize> = HashMap::with_capacity(100);
@@ -2923,10 +2921,7 @@ impl Jsonb {
                                     *index,
                                 ));
                             } else {
-                                bail_parse_error!(
-                                    "ERROR: Element at negative index {} not found",
-                                    idx
-                                );
+                                return Err(crate::LimboError::PathNotFound);
                             }
                         }
                         Some(_) => unreachable!(),
@@ -2990,6 +2985,7 @@ impl Jsonb {
         work_stack.push_back((
             JsonPath {
                 elements: vec![PathElement::Root()],
+                trail_error: None,
             },
             0,
         ));
@@ -4008,7 +4004,10 @@ mod path_operations_tests {
 
     // Helper function to create a simple JsonPath
     fn create_path(elements: Vec<PathElement>) -> JsonPath {
-        JsonPath { elements }
+        JsonPath {
+            elements,
+            trail_error: None,
+        }
     }
 
     #[test]

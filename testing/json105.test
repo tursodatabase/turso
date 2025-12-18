@@ -124,3 +124,11 @@ NULL
 NULL
 NULL
 NULL}
+
+do_execsql_test_on_specific_db {:memory:} json-append-test {
+    SELECT json_set('["a"]', '$[1]', 'b');
+    SELECT json_set('["a"]', '$[5]', 'b');
+} {
+    {["a","b"]}
+    {["a"]}
+}

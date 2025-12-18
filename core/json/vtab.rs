@@ -468,13 +468,11 @@ fn navigate_to_path(jsonb: &mut Jsonb, path: &Value) -> Result<Option<Jsonb>, Li
         LimboError::InvalidArgument(format!("path '{path}' is not a valid json path"))
     })?;
     let mut search_operation = SearchOperation::new(jsonb.len() / 2);
-    if jsonb
-        .operate_on_path(&json_path, &mut search_operation)
-        .is_err()
-    {
-        return Ok(None);
+    match jsonb.operate_on_path(&json_path, &mut search_operation) {
+        Ok(_) => Ok(Some(search_operation.result())),
+        Err(crate::LimboError::PathNotFound) => Ok(None),
+        Err(e) => Err(e),
     }
-    Ok(Some(search_operation.result()))
 }
 
 mod columns {
@@ -709,6 +707,7 @@ impl InPlaceJsonPath {
             (
                 JsonPath {
                     elements: vec![PathElement::Root()],
+                    trail_error: None,
                 },
                 Key::None,
             )
