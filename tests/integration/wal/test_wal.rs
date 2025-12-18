@@ -1,9 +1,7 @@
 use crate::common::{do_flush, maybe_setup_tracing, TempDatabase};
-use std::cell::RefCell;
 use std::ops::Deref;
-use std::rc::Rc;
 use std::sync::{Arc, Mutex};
-use turso_core::{Connection, LimboError, Result, StepResult};
+use turso_core::{Connection, LimboError, Result};
 
 #[allow(clippy::arc_with_non_send_sync)]
 #[turso_macros::test]
@@ -41,17 +39,9 @@ fn test_wal_1_writer_1_reader() -> Result<()> {
     {
         let conn = db.connect().unwrap();
         match conn.query("CREATE TABLE t (id)")? {
-            Some(ref mut rows) => loop {
-                match rows.step().unwrap() {
-                    StepResult::Row => {}
-                    StepResult::IO => {
-                        rows.run_once().unwrap();
-                    }
-                    StepResult::Interrupt => break,
-                    StepResult::Done => break,
-                    StepResult::Busy => unreachable!(),
-                }
-            },
+            Some(ref mut rows) => {
+                rows.run_with_row_callback(|_| Ok(())).unwrap();
+            }
             None => todo!(),
         }
         do_flush(&conn, tmp_db.lock().unwrap().deref()).unwrap();
@@ -76,22 +66,15 @@ fn test_wal_1_writer_1_reader() -> Result<()> {
             let rows = *rows_.lock().unwrap();
             let mut i = 0;
             match conn.query("SELECT * FROM t") {
-                Ok(Some(ref mut rows)) => loop {
-                    match rows.step().unwrap() {
-                        StepResult::Row => {
-                            let row = rows.row().unwrap();
-                            let id = row.get::<i64>(0).unwrap();
-                            assert_eq!(id, i);
-                            i += 1;
-                        }
-                        StepResult::IO => {
-                            rows.run_once().unwrap();
-                        }
-                        StepResult::Interrupt => break,
-                        StepResult::Done => break,
-                        StepResult::Busy => unreachable!(),
-                    }
-                },
+                Ok(Some(ref mut rows)) => {
+                    rows.run_with_row_callback(|row| {
+                        let id = row.get::<i64>(0).unwrap();
+                        assert_eq!(id, i);
+                        i += 1;
+                        Ok(())
+                    })
+                    .unwrap();
+                }
                 Ok(None) => {}
                 Err(err) => {
                     eprintln!("{err}");
@@ -110,56 +93,37 @@ fn test_wal_1_writer_1_reader() -> Result<()> {
 
 /// Execute a statement and get strings result
 pub(crate) fn execute_and_get_strings(conn: &Arc<Connection>, sql: &str) -> Result<Vec<String>> {
-    let statement = conn.prepare(sql)?;
-    let stmt = Rc::new(RefCell::new(statement));
+    let mut stmt = conn.prepare(sql)?;
     let mut result = Vec::new();
 
-    let mut stmt = stmt.borrow_mut();
-    while let Ok(step_result) = stmt.step() {
-        match step_result {
-            StepResult::Row => {
-                let row = stmt.row().unwrap();
-                for el in row.get_values() {
-                    result.push(format!("{el}"));
-                }
-            }
-            StepResult::Done => break,
-            StepResult::Interrupt => break,
-            StepResult::IO => stmt.run_once()?,
-            StepResult::Busy => stmt.run_once()?,
+    stmt.run_with_row_callback(|row| {
+        for el in row.get_values() {
+            result.push(format!("{el}"));
         }
-    }
+        Ok(())
+    })?;
     Ok(result)
 }
 
 /// Execute a statement and get integers
 pub(crate) fn execute_and_get_ints(conn: &Arc<Connection>, sql: &str) -> Result<Vec<i64>> {
-    let statement = conn.prepare(sql)?;
-    let stmt = Rc::new(RefCell::new(statement));
+    let mut stmt = conn.prepare(sql)?;
     let mut result = Vec::new();
 
-    let mut stmt = stmt.borrow_mut();
-    while let Ok(step_result) = stmt.step() {
-        match step_result {
-            StepResult::Row => {
-                let row = stmt.row().unwrap();
-                for value in row.get_values() {
-                    let out = match value {
-                        turso_core::Value::Integer(i) => i,
-                        _ => {
-                            return Err(LimboError::ConversionError(format!(
-                                "cannot convert {value} to int"
-                            )))
-                        }
-                    };
-                    result.push(*out);
+    stmt.run_with_row_callback(|row| {
+        for value in row.get_values() {
+            let out = match value {
+                turso_core::Value::Integer(i) => i,
+                _ => {
+                    return Err(LimboError::ConversionError(format!(
+                        "cannot convert {value} to int"
+                    )))
                 }
-            }
-            StepResult::Done => break,
-            StepResult::Interrupt => break,
-            StepResult::IO => stmt.run_once()?,
-            StepResult::Busy => stmt.run_once()?,
+            };
+            result.push(*out);
         }
-    }
+        Ok(())
+    })?;
+
     Ok(result)
 }

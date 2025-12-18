@@ -1,24 +1,15 @@
 use std::sync::Arc;
 
 use crate::common::{ExecRows, TempDatabase};
-use turso_core::StepResult;
 
 fn explain_plans(conn: &Arc<turso_core::Connection>, sql: &str) -> anyhow::Result<Vec<String>> {
     let mut stmt = conn.prepare(format!("EXPLAIN QUERY PLAN {sql}"))?;
     let mut plans = Vec::new();
-    loop {
-        match stmt.step()? {
-            StepResult::Row => {
-                let row = stmt.row().unwrap();
-                plans.push(row.get::<String>(3)?);
-            }
-            StepResult::IO => {
-                stmt.run_once()?;
-            }
-            StepResult::Done => break,
-            _ => unreachable!(),
-        }
-    }
+    stmt.run_with_row_callback(|row| {
+        plans.push(row.get::<String>(3)?);
+        Ok(())
+    })?;
+
     Ok(plans)
 }
 
