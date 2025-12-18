@@ -24,7 +24,9 @@ pub fn bind_value(stmt: &mut TursoStatement, index: usize, value: Value) -> Resu
     } else {
         return Err(Error::new(
             ruby.exception_type_error(),
-            format!("Cannot convert {:?} to SQL value", unsafe { value.classname() }),
+            format!("Cannot convert {:?} to SQL value", unsafe {
+                value.classname()
+            }),
         ));
     };
 
@@ -38,9 +40,14 @@ pub fn extract_row(stmt: &TursoStatement) -> Result<RHash, Error> {
     let count = stmt.column_count();
 
     for i in 0..count {
-        let name = stmt.column_name(i).map_err(crate::errors::map_turso_error)?;
+        let name = stmt
+            .column_name(i)
+            .map_err(crate::errors::map_turso_error)?;
         let key = ruby.sym_new(name.as_ref());
-        let val = turso_to_ruby(&ruby, stmt.row_value(i).map_err(crate::errors::map_turso_error)?)?;
+        let val = turso_to_ruby(
+            &ruby,
+            stmt.row_value(i).map_err(crate::errors::map_turso_error)?,
+        )?;
         hash.aset(key, val)?;
     }
 

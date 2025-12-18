@@ -92,7 +92,10 @@ impl RbStatement {
         if self.finalized.swap(true, Ordering::Relaxed) {
             return Ok(());
         }
-        self.inner.borrow_mut().finalize().map_err(map_turso_error)?;
+        self.inner
+            .borrow_mut()
+            .finalize()
+            .map_err(map_turso_error)?;
         Ok(())
     }
 }

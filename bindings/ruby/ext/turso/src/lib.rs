@@ -15,4 +15,3 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     statement::define_statement(ruby, &module)?;
     Ok(())
 }
-

@@ -140,7 +140,10 @@ pub fn define_connection(ruby: &Ruby, module: &impl Module) -> Result<(), Error>
     class.define_method("execute", method!(RbConnection::execute, -1))?;
     class.define_method("transaction", method!(RbConnection::transaction, 1))?;
     class.define_method("changes", method!(RbConnection::changes, 0))?;
-    class.define_method("last_insert_row_id", method!(RbConnection::last_insert_row_id, 0))?;
+    class.define_method(
+        "last_insert_row_id",
+        method!(RbConnection::last_insert_row_id, 0),
+    )?;
     class.define_method("in_transaction?", method!(RbConnection::in_transaction, 0))?;
     class.define_method("close", method!(RbConnection::close, 0))?;
     Ok(())

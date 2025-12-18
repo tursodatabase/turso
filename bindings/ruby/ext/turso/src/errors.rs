@@ -1,4 +1,3 @@
-
 use magnus::{exception::ExceptionClass, Error, Module, Ruby};
 use std::cell::RefCell;
 use turso_sdk_kit::rsapi::{TursoError, TursoStatusCode};
