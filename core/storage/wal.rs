@@ -2776,7 +2776,7 @@ pub mod test {
         types::IOResult,
         util::IOExt,
         CheckpointMode, CheckpointResult, Completion, Connection, Database, LimboError, PlatformIO,
-        StepResult, Wal, WalFile, WalFileShared, IO,
+        Wal, WalFile, WalFileShared, IO,
     };
     use parking_lot::{Mutex, RwLock};
     #[cfg(unix)]
@@ -2876,20 +2876,12 @@ pub mod test {
 
     fn count_test_table(conn: &Arc<Connection>) -> i64 {
         let mut stmt = conn.prepare("select count(*) from test").unwrap();
-        loop {
-            match stmt.step() {
-                Ok(StepResult::Row) => {
-                    break;
-                }
-                Ok(StepResult::IO) => {
-                    stmt.run_once().unwrap();
-                }
-                _ => {
-                    panic!("Failed to step through the statement");
-                }
-            }
-        }
-        let count: i64 = stmt.row().unwrap().get(0).unwrap();
+        let mut count: i64 = 0;
+        stmt.run_with_row_callback(|row| {
+            count = row.get(0).unwrap();
+            Ok(())
+        })
+        .unwrap();
         count
     }
 
@@ -3428,17 +3420,9 @@ pub mod test {
         assert_eq!(result1.num_backfilled + result2.num_backfilled, r2_frame);
 
         // verify visible rows
-        let mut stmt = conn_r2.query("SELECT COUNT(*) FROM test").unwrap().unwrap();
-        while !matches!(stmt.step().unwrap(), StepResult::Row) {
-            stmt.run_once().unwrap();
-        }
-        let r2_cnt: i64 = stmt.row().unwrap().get(0).unwrap();
+        let r2_cnt = count_test_table(&conn_r2);
+        let r3_cnt = count_test_table(&conn_r3);
 
-        let mut stmt2 = conn_r3.query("SELECT COUNT(*) FROM test").unwrap().unwrap();
-        while !matches!(stmt2.step().unwrap(), StepResult::Row) {
-            stmt2.run_once().unwrap();
-        }
-        let r3_cnt: i64 = stmt2.row().unwrap().get(0).unwrap();
         assert_eq!(r2_cnt, 30);
         assert_eq!(r3_cnt, 45);
     }

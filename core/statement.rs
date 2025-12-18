@@ -291,7 +291,7 @@ impl Statement {
         }
     }
 
-    /// Blocks execution and advances IO
+    /// Blocks execution, advances IO, and runs to completion of the statement
     pub(crate) fn run_with_row_callback(
         &mut self,
         mut func: impl FnMut(&Row) -> Result<()>,
@@ -308,6 +308,20 @@ impl Statement {
             }
         }
         Ok(())
+    }
+
+    /// Blocks execution, advances IO, and stops at any StepResult except IO
+    pub(crate) fn run_one_step_blocking(&mut self) -> Result<Option<&Row>> {
+        let result = loop {
+            match self.step()? {
+                vdbe::StepResult::Done => break None,
+                vdbe::StepResult::IO => self.pager.io.step()?,
+                vdbe::StepResult::Row => break Some(self.row().expect("row should be present")),
+                vdbe::StepResult::Interrupt => return Err(LimboError::Interrupt),
+                vdbe::StepResult::Busy => return Err(LimboError::Busy),
+            }
+        };
+        Ok(result)
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
