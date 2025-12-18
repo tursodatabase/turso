@@ -292,7 +292,7 @@ impl Statement {
     }
 
     /// Blocks execution, advances IO, and runs to completion of the statement
-    pub(crate) fn run_with_row_callback(
+    pub fn run_with_row_callback(
         &mut self,
         mut func: impl FnMut(&Row) -> Result<()>,
     ) -> Result<()> {
@@ -311,7 +311,7 @@ impl Statement {
     }
 
     /// Blocks execution, advances IO, and stops at any StepResult except IO
-    pub(crate) fn run_one_step_blocking(&mut self) -> Result<Option<&Row>> {
+    pub fn run_one_step_blocking(&mut self) -> Result<Option<&Row>> {
         let result = loop {
             match self.step()? {
                 vdbe::StepResult::Done => break None,
