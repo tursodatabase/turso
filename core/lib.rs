@@ -602,6 +602,7 @@ impl Database {
     fn header_validation(&mut self) -> Result<Arc<Pager>> {
         let wal_exists = journal_mode::wal_exists(std::path::Path::new(&self.wal_path));
         let log_exists = journal_mode::logical_log_exists(std::path::Path::new(&self.path));
+        let is_readonly = self.open_flags.get().contains(OpenFlags::ReadOnly);
 
         let mut pager = self._init()?;
         assert!(pager.wal.is_none(), "Pager should have no WAL yet");
@@ -632,30 +633,43 @@ impl Database {
         // Track if header was modified so we can write it to disk
         let header_modified = match read_version {
             Version::Legacy => {
-                if open_mv_store {
-                    header_mut.read_version = RawVersion::from(Version::Mvcc);
-                    header_mut.write_version = RawVersion::from(Version::Mvcc);
+                if is_readonly {
+                    if open_mv_store {
+                        tracing::warn!("Database {} is opened in readonly mode, cannot convert to MVCC mode. Falling back to WAL mode.", self.path);
+                        open_mv_store = false;
+                    }
+                    tracing::warn!("Database {} is opened in readonly mode, cannot convert Legacy mode to WAL. Running in Legacy mode.", self.path);
+                    false
                 } else {
-                    header_mut.read_version = RawVersion::from(Version::Wal);
-                    header_mut.write_version = RawVersion::from(Version::Wal);
+                    if open_mv_store {
+                        header_mut.read_version = RawVersion::from(Version::Mvcc);
+                        header_mut.write_version = RawVersion::from(Version::Mvcc);
+                    } else {
+                        header_mut.read_version = RawVersion::from(Version::Wal);
+                        header_mut.write_version = RawVersion::from(Version::Wal);
+                    }
+                    true
                 }
-                true
             }
             Version::Wal => {
-                match (open_mv_store, wal_exists) {
-                    (true, true) => {
+                match (open_mv_store, wal_exists, is_readonly) {
+                    (true, _, true) => {
+                        tracing::warn!("Database {} is opened in readonly mode, cannot convert to MVCC mode. Running in WAL mode.", self.path);
+                        open_mv_store = false;
+                        false
+                    }
+                    (true, true, false) => {
                         tracing::warn!("WAL file exists for database {}, but MVCC is enabled. Run `PRAGMA journal_mode = 'experimental_mvcc;'` to change to MVCC mode", self.path);
                         open_mv_store = false;
                         false
                     }
-                    (true, false) => {
+                    (true, false, false) => {
                         // Change Header to MVCC if WAL does not exists and we have MVCC enabled
                         header_mut.read_version = RawVersion::from(Version::Mvcc);
                         header_mut.write_version = RawVersion::from(Version::Mvcc);
                         true
                     }
-                    (false, true) => false,
-                    (false, false) => false,
+                    (false, _, _) => false,
                 }
             }
             Version::Mvcc => {

@@ -9918,6 +9918,11 @@ fn op_journal_mode_inner(
                     return Ok(InsnFunctionStepResult::Step);
                 }
 
+                // Check if database is readonly - cannot change journal mode on readonly databases
+                if program.connection.is_readonly(*db) {
+                    return Err(LimboError::ReadOnly);
+                }
+
                 // Check MVCC enabled if switching to MVCC
                 if matches!(new_mode, journal_mode::JournalMode::ExperimentalMvcc)
                     && !program.connection.db.mvcc_enabled()
