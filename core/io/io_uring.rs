@@ -7,7 +7,6 @@ use crate::{turso_assert, CompletionError, LimboError, Result};
 use parking_lot::Mutex;
 use rustix::fs::{self, FlockOperation, OFlags};
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::{
     collections::{HashMap, VecDeque},
     io::ErrorKind,
@@ -44,10 +43,6 @@ const MAX_WAIT: usize = 4;
 /// One memory arena for DB pages and another for WAL frames
 const ARENA_COUNT: usize = 2;
 
-/// Arbitrary non-zero user_data for barrier operation when handling a partial writev
-/// writing a commit frame.
-const BARRIER_USER_DATA: u64 = 1;
-
 /// user_data tag for cancellation operations
 const CANCEL_TAG: u64 = 1;
 
@@ -64,7 +59,6 @@ struct WrappedIOUring {
     writev_states: HashMap<u64, WritevState>,
     overflow: VecDeque<io_uring::squeue::Entry>,
     iov_pool: IovecPool,
-    pending_link: AtomicBool,
 }
 
 struct InnerUringIO {
@@ -131,7 +125,6 @@ impl UringIO {
                 pending_ops: 0,
                 writev_states: HashMap::new(),
                 iov_pool: IovecPool::new(),
-                pending_link: AtomicBool::new(false),
             },
             free_files: (0..FILES).collect(),
             free_arenas: [const { None }; ARENA_COUNT],
@@ -205,12 +198,10 @@ struct WritevState {
     bufs: Vec<Arc<crate::Buffer>>,
     /// we keep the last iovec allocation alive until final CQE
     last_iov_allocation: Option<Box<[libc::iovec; MAX_IOVEC_ENTRIES]>>,
-    had_partial: bool,
-    linked_op: bool,
 }
 
 impl WritevState {
-    fn new(file: &UringFile, pos: u64, linked: bool, bufs: Vec<Arc<crate::Buffer>>) -> Self {
+    fn new(file: &UringFile, pos: u64, bufs: Vec<Arc<crate::Buffer>>) -> Self {
         let file_id = file
             .id()
             .map(Fd::Fixed)
@@ -225,8 +216,6 @@ impl WritevState {
             bufs,
             last_iov_allocation: None,
             total_len,
-            had_partial: false,
-            linked_op: linked,
         }
     }
 
@@ -320,6 +309,13 @@ impl WrappedIOUring {
         self.ring.submit().expect("submiting when full");
     }
 
+    /// Submit an entry with IO_DRAIN flag set.
+    /// IO_DRAIN ensures all prior submitted operations complete before this one starts.
+    fn submit_entry_drained(&mut self, entry: io_uring::squeue::Entry) {
+        let drained = entry.flags(io_uring::squeue::Flags::IO_DRAIN);
+        self.submit_entry(&drained);
+    }
+
     fn submit_cancel_urgent(&mut self, entry: &io_uring::squeue::Entry) -> Result<()> {
         let pushed = unsafe { self.ring.submission().push(entry).is_ok() };
         if pushed {
@@ -380,10 +376,10 @@ impl WrappedIOUring {
     }
 
     /// Submit or resubmit a writev operation
-    fn submit_writev(&mut self, key: u64, mut st: WritevState, continue_chain: bool) {
+    fn submit_writev(&mut self, key: u64, mut st: WritevState, drain: bool) {
         st.free_last_iov(&mut self.iov_pool);
+
         let mut iov_allocation = self.iov_pool.acquire().unwrap_or_else(|| {
-            // Fallback: allocate a new one if pool is exhausted
             Box::new(
                 [libc::iovec {
                     iov_base: std::ptr::null_mut(),
@@ -391,21 +387,30 @@ impl WrappedIOUring {
                 }; MAX_IOVEC_ENTRIES],
             )
         });
+
         let mut iov_count = 0;
         let mut last_end: Option<(*const u8, usize)> = None;
-        for buffer in st.bufs.iter().skip(st.current_buffer_idx) {
-            let ptr = buffer.as_ptr();
-            let len = buffer.len();
+
+        for (idx, buffer) in st.bufs.iter().enumerate().skip(st.current_buffer_idx) {
+            let mut ptr = buffer.as_ptr();
+            let mut len = buffer.len();
+            // advance intra-buffer offset if resubmitting
+            if idx == st.current_buffer_idx && st.current_buffer_offset != 0 {
+                turso_assert!(
+                    st.current_buffer_offset <= len,
+                    "writev state offset out of bounds"
+                );
+                ptr = unsafe { ptr.add(st.current_buffer_offset) };
+                len -= st.current_buffer_offset;
+            }
             if let Some((last_ptr, last_len)) = last_end {
                 // Check if this buffer is adjacent to the last
                 if unsafe { last_ptr.add(last_len) } == ptr {
-                    // Extend the last iovec instead of adding new
                     iov_allocation[iov_count - 1].iov_len += len;
                     last_end = Some((last_ptr, last_len + len));
                     continue;
                 }
             }
-            // Add new iovec
             iov_allocation[iov_count] = libc::iovec {
                 iov_base: ptr as *mut _,
                 iov_len: len,
@@ -416,69 +421,29 @@ impl WrappedIOUring {
                 break;
             }
         }
-        // If we have coalesced everything into a single iovec, submit as a single`pwrite`
-        if iov_count == 1 {
-            let mut entry = with_fd!(st.file_id, |fd| {
-                if let Some(id) = st.bufs[st.current_buffer_idx].fixed_id() {
-                    io_uring::opcode::WriteFixed::new(
-                        fd,
-                        iov_allocation[0].iov_base as *const u8,
-                        iov_allocation[0].iov_len as u32,
-                        id as u16,
-                    )
-                    .offset(st.file_pos)
-                    .build()
-                    .user_data(key)
-                } else {
-                    io_uring::opcode::Write::new(
-                        fd,
-                        iov_allocation[0].iov_base as *const u8,
-                        iov_allocation[0].iov_len as u32,
-                    )
-                    .offset(st.file_pos)
-                    .build()
-                    .user_data(key)
-                }
-            });
 
-            if st.linked_op && !st.had_partial {
-                // Starting a new link chain
-                entry = entry.flags(io_uring::squeue::Flags::IO_LINK);
-                self.pending_link.store(true, Ordering::Release);
-            } else if continue_chain && !st.had_partial {
-                // Continue existing chain
-                entry = entry.flags(io_uring::squeue::Flags::IO_LINK);
-            }
-
-            self.submit_entry(&entry);
-            return;
-        }
-
-        // Store the pointers and get the pointer to the iovec array that we pass
-        // to the writev operation, and keep the array itself alive
         let ptr = iov_allocation.as_ptr() as *mut libc::iovec;
         st.last_iov_allocation = Some(iov_allocation);
-
-        let mut entry = with_fd!(st.file_id, |fd| {
+        let entry = with_fd!(st.file_id, |fd| {
             io_uring::opcode::Writev::new(fd, ptr, iov_count as u32)
                 .offset(st.file_pos)
                 .build()
                 .user_data(key)
         });
-        if st.linked_op {
-            entry = entry.flags(io_uring::squeue::Flags::IO_LINK);
-        }
-        // track the current state in case we get a partial write
         self.writev_states.insert(key, st);
-        self.submit_entry(&entry);
+        if drain {
+            self.submit_entry_drained(entry);
+        } else {
+            self.submit_entry(&entry);
+        }
     }
 
     fn handle_writev_completion(&mut self, mut state: WritevState, user_data: u64, result: i32) {
         if result < 0 {
-            let err = std::io::Error::from_raw_os_error(result);
+            let err = std::io::Error::from_raw_os_error(-result);
             tracing::error!("writev failed (user_data: {}): {}", user_data, err);
             state.free_last_iov(&mut self.iov_pool);
-            completion_from_key(user_data).complete(result);
+            completion_from_key(user_data).error(err.into());
             return;
         }
 
@@ -500,19 +465,6 @@ impl WrappedIOUring {
                 );
                 // write complete, return iovec to pool
                 state.free_last_iov(&mut self.iov_pool);
-                if state.linked_op && state.had_partial {
-                    // if it was a linked operation, we need to submit a fsync after this writev
-                    // to ensure data is on disk
-                    self.ring.submit().expect("submit after writev");
-                    let file_id = state.file_id;
-                    let sync = with_fd!(file_id, |fd| {
-                        io_uring::opcode::Fsync::new(fd)
-                            .build()
-                            .user_data(BARRIER_USER_DATA)
-                    })
-                    .flags(io_uring::squeue::Flags::IO_DRAIN);
-                    self.submit_entry(&sync);
-                }
                 completion_from_key(user_data).complete(state.total_written as i32);
             }
             remaining => {
@@ -522,10 +474,8 @@ impl WrappedIOUring {
                     written,
                     remaining
                 );
-                // make sure partial write is recorded, because fsync could happen after this
-                // and we are not finished writing to disk
-                state.had_partial = true;
-                self.submit_writev(user_data, state, false);
+                let drain = true; // IO_DRAIN for resubmitted partial writev
+                self.submit_writev(user_data, state, drain);
             }
         }
     }
@@ -651,14 +601,6 @@ impl IO for UringIO {
             if let Some(state) = ring.writev_states.remove(&user_data) {
                 // if we have ongoing writev state, handle it separately and don't call completion
                 ring.handle_writev_completion(state, user_data, result);
-                continue;
-            } else if user_data == BARRIER_USER_DATA {
-                // barrier operation, no completion to call
-                if result < 0 {
-                    let err = std::io::Error::from_raw_os_error(result);
-                    tracing::error!("barrier operation failed: {}", err);
-                    return Err(err.into());
-                }
                 continue;
             }
             if result < 0 {
@@ -814,7 +756,7 @@ impl File for UringFile {
 
     fn pwrite(&self, pos: u64, buffer: Arc<crate::Buffer>, c: Completion) -> Result<Completion> {
         let mut io = self.io.lock();
-        let mut write = {
+        let write = {
             let ptr = buffer.as_ptr();
             let len = buffer.len();
             with_fd!(self, |fd| {
@@ -842,30 +784,19 @@ impl File for UringFile {
                 }
             })
         };
-        if c.needs_link() {
-            // Start a new link chain
-            write = write.flags(io_uring::squeue::Flags::IO_LINK);
-            io.ring.pending_link.store(true, Ordering::Release);
-        } else if io.ring.pending_link.load(Ordering::Acquire) {
-            // Continue existing link chain
-            write = write.flags(io_uring::squeue::Flags::IO_LINK);
-        }
 
         io.ring.submit_entry(&write);
         Ok(c)
     }
 
     fn sync(&self, c: Completion) -> Result<Completion> {
-        let mut io = self.io.lock();
         trace!("sync()");
         let sync = with_fd!(self, |fd| {
             io_uring::opcode::Fsync::new(fd)
                 .build()
                 .user_data(get_key(c.clone()))
         });
-        // sync always ends the chain of linked operations
-        io.ring.pending_link.store(false, Ordering::Release);
-        io.ring.submit_entry(&sync);
+        self.io.lock().ring.submit_entry_drained(sync);
         Ok(c)
     }
 
@@ -875,18 +806,12 @@ impl File for UringFile {
         bufs: Vec<Arc<crate::Buffer>>,
         c: Completion,
     ) -> Result<Completion> {
-        // for a single buffer use pwrite directly
-        if bufs.len().eq(&1) {
-            return self.pwrite(pos, bufs[0].clone(), c.clone());
-        }
-        let linked = c.needs_link();
         tracing::trace!("pwritev(pos = {}, bufs.len() = {})", pos, bufs.len());
-        // create state to track ongoing writev operation
-        let state = WritevState::new(self, pos, linked, bufs);
+
+        let state = WritevState::new(self, pos, bufs);
         let mut io = self.io.lock();
-        let continue_chain = !linked && io.ring.pending_link.load(Ordering::Acquire);
-        io.ring
-            .submit_writev(get_key(c.clone()), state, continue_chain);
+        let drain = false;
+        io.ring.submit_writev(get_key(c.clone()), state, drain);
         Ok(c)
     }
 
@@ -895,15 +820,12 @@ impl File for UringFile {
     }
 
     fn truncate(&self, len: u64, c: Completion) -> Result<Completion> {
-        let mut truncate = with_fd!(self, |fd| {
+        let truncate = with_fd!(self, |fd| {
             io_uring::opcode::Ftruncate::new(fd, len)
                 .build()
                 .user_data(get_key(c.clone()))
         });
         let mut io = self.io.lock();
-        if io.ring.pending_link.load(Ordering::Acquire) {
-            truncate = truncate.flags(io_uring::squeue::Flags::IO_LINK);
-        }
         io.ring.submit_entry(&truncate);
         Ok(c)
     }

@@ -1,6 +1,6 @@
 use crate::storage::buffer_pool::ArenaBuffer;
 use crate::storage::sqlite3_ondisk::WAL_FRAME_HEADER_SIZE;
-use crate::{BufferPool, Result};
+use crate::{turso_assert, BufferPool, Result};
 use bitflags::bitflags;
 use cfg_block::cfg_block;
 use rand::{Rng, RngCore};
@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::{fmt::Debug, pin::Pin};
 
 cfg_block! {
-    #[cfg(all(target_os = "linux", feature = "io_uring", not(miri)))] {
+   #[cfg(all(target_os = "linux", feature = "io_uring", not(miri)))] {
         mod io_uring;
         #[cfg(feature = "fs")]
         pub use io_uring::UringIO;
@@ -226,6 +226,68 @@ pub trait IO: Clock + Send + Sync {
         Err(crate::LimboError::InternalError(
             "unsupported operation".to_string(),
         ))
+    }
+}
+
+/// Batches multiple vectored writes for submission.
+pub struct WriteBatch<'a> {
+    file: Arc<dyn File>,
+    ops: Vec<WriteOp<'a>>,
+}
+
+struct WriteOp<'a> {
+    pos: u64,
+    bufs: &'a [Arc<Buffer>],
+}
+
+impl<'a> WriteBatch<'a> {
+    pub fn new(file: Arc<dyn File>) -> Self {
+        Self {
+            file,
+            ops: Vec::new(),
+        }
+    }
+
+    #[inline]
+    pub fn writev(&mut self, pos: u64, bufs: &'a [Arc<Buffer>]) {
+        if !bufs.is_empty() {
+            self.ops.push(WriteOp { pos, bufs });
+        }
+    }
+
+    /// Total bytes across all operations.
+    #[inline]
+    pub fn total_bytes(&self) -> usize {
+        self.ops
+            .iter()
+            .map(|op| op.bufs.iter().map(|b| b.len()).sum::<usize>())
+            .sum()
+    }
+
+    /// Submit all writes. Returns completions caller must wait on.
+    #[inline]
+    pub fn submit(self) -> Result<Vec<Completion>> {
+        let mut completions = Vec::with_capacity(self.ops.len());
+        for WriteOp { pos, bufs } in self.ops {
+            let total_len = bufs.iter().map(|b| b.len()).sum::<usize>() as i32;
+            let c = Completion::new_write(move |res| {
+                let Ok(bytes_written) = res else {
+                    return;
+                };
+                turso_assert!(
+                    bytes_written == total_len,
+                    "pwritev wrote {bytes_written} bytes, expected {total_len}"
+                );
+            });
+            completions.push(self.file.pwritev(pos, bufs.to_vec(), c)?);
+        }
+        Ok(completions)
+    }
+
+    /// Returns the file for fsync after writes complete.
+    #[inline]
+    pub const fn file(&self) -> &Arc<dyn File> {
+        &self.file
     }
 }
 

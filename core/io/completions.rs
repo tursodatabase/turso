@@ -85,7 +85,6 @@ pub(super) struct CompletionInner {
     /// None means we completed successfully
     // Thread safe with OnceLock
     pub(super) result: std::sync::OnceLock<Option<CompletionError>>,
-    needs_link: bool,
     context: Context,
     /// Optional parent group this completion belongs to
     parent: OnceLock<Arc<GroupCompletionInner>>,
@@ -95,7 +94,6 @@ impl fmt::Debug for CompletionInner {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("CompletionInner")
             .field("completion_type", &self.completion_type)
-            .field("needs_link", &self.needs_link)
             .field("parent", &self.parent.get().is_some())
             .finish()
     }
@@ -247,11 +245,10 @@ pub enum CompletionType {
 }
 
 impl CompletionInner {
-    fn new(completion_type: CompletionType, needs_link: bool) -> Self {
+    fn new(completion_type: CompletionType) -> Self {
         Self {
             completion_type,
             result: OnceLock::new(),
-            needs_link,
             context: Context::new(),
             parent: OnceLock::new(),
         }
@@ -261,13 +258,7 @@ impl CompletionInner {
 impl Completion {
     pub fn new(completion_type: CompletionType) -> Self {
         Self {
-            inner: Some(Arc::new(CompletionInner::new(completion_type, false))),
-        }
-    }
-
-    pub fn new_linked(completion_type: CompletionType) -> Self {
-        Self {
-            inner: Some(Arc::new(CompletionInner::new(completion_type, true))),
+            inner: Some(Arc::new(CompletionInner::new(completion_type))),
         }
     }
 
@@ -275,19 +266,6 @@ impl Completion {
         self.inner
             .as_ref()
             .expect("completion inner should be initialized")
-    }
-
-    pub fn needs_link(&self) -> bool {
-        self.get_inner().needs_link
-    }
-
-    pub fn new_write_linked<F>(complete: F) -> Self
-    where
-        F: Fn(Result<i32, CompletionError>) + Send + Sync + 'static,
-    {
-        Self::new_linked(CompletionType::Write(WriteCompletion::new(Box::new(
-            complete,
-        ))))
     }
 
     pub fn new_write<F>(complete: F) -> Self

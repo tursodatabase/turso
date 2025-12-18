@@ -1087,7 +1087,7 @@ pub fn write_pages_vectored(
             let done_cl = done_flag.clone();
             let total_sz = (page_sz * run_bufs.len()) as i32;
 
-            let cmp = Completion::new_write_linked(move |res| {
+            let cmp = Completion::new_write(move |res| {
                 let Ok(res) = res else { return };
                 turso_assert!(total_sz == res, "failed to write expected size");
                 if runs_left_cl.fetch_sub(1, Ordering::AcqRel) == 1 {

@@ -228,6 +228,23 @@ impl TursoRwLock {
     }
 }
 
+/// Represents a batch of WAL frames which will be appended to the log
+/// with a `pwritev` call and then sync'd to disk.
+pub struct PreparedFrames {
+    /// File offset for the first frame
+    pub offset: u64,
+    /// Serialized frame buffers
+    pub bufs: Vec<Arc<Buffer>>,
+    /// Per-frame metadata: (page_ref, frame_id, cumulative_checksum)
+    pub metadata: Vec<(PageRef, u64, (u32, u32))>,
+    /// Checksum after all frames in this batch
+    pub final_checksum: (u32, u32),
+    /// Max frame ID after this batch
+    pub final_max_frame: u64,
+    /// Epoch at preparation time
+    pub epoch: u32,
+}
+
 /// Write-ahead log (WAL).
 pub trait Wal: Debug + Send + Sync {
     /// Begin a read transaction.
@@ -277,16 +294,30 @@ pub trait Wal: Debug + Send + Sync {
 
     fn prepare_wal_finish(&self) -> Result<Completion>;
 
+    /// Prepare a batch of WAL frames for durable commit/append to the log.
+    fn prepare_frames(
+        &self,
+        pages: &[PageRef],
+        page_sz: PageSize,
+        db_size_on_commit: Option<u32>,
+        prev: Option<&PreparedFrames>,
+    ) -> Result<PreparedFrames>;
+
+    /// For each prepared frame, update in-memory WAL index and rolling checksum
+    /// and advance max_frame to make committed frames visible to readers.
+    fn commit_prepared_frames(&self, prepared: &[PreparedFrames]);
+
+    /// Mark in-memory pages clean and set WAL tags after durable commit.
+    fn finalize_committed_pages(&self, prepared: &[PreparedFrames]);
+
+    /// Return a handle to the underlying File.
+    fn wal_file(&self) -> Result<Arc<dyn File>>;
+
     /// Write a bunch of frames to the WAL.
     /// db_size is the database size in pages after the transaction finishes.
     /// db_size is set  -> last frame written in transaction
     /// db_size is none -> non-last frame written in transaction
-    fn append_frames_vectored(
-        &self,
-        pages: Vec<PageRef>,
-        page_sz: PageSize,
-        db_size_on_commit: Option<u32>,
-    ) -> Result<Completion>;
+    fn append_frames_vectored(&self, pages: Vec<PageRef>, page_sz: PageSize) -> Result<Completion>;
 
     /// Complete append of frames by updating shared wal state. Before this
     /// all changes were stored locally.
@@ -1401,11 +1432,8 @@ impl Wal for WalFile {
                 ?last_checksum
             );
             shared.last_checksum = last_checksum;
-            self.transaction_count.fetch_add(1, Ordering::Release);
-            shared.transaction_count.store(
-                self.transaction_count.load(Ordering::Acquire),
-                Ordering::Release,
-            );
+            let new_count = self.transaction_count.fetch_add(1, Ordering::AcqRel) + 1;
+            shared.transaction_count.store(new_count, Ordering::Release);
             Ok(())
         })
     }
@@ -1490,13 +1518,153 @@ impl Wal for WalFile {
         Ok(c)
     }
 
-    /// Use pwritev to append many frames to the log at once
-    fn append_frames_vectored(
+    /// Prepares a batch of dirty pages as WAL frames without modifying WAL state.
+    ///
+    /// This is the first phase of a three-phase commit protocol:
+    /// 1. prepare (`prepare_frames`) - serialize frames, compute checksums
+    /// 2. write + fsync - caller submits I/O and waits for durability
+    /// 3. commit/finalize (`commit_prepared_frames`) - update WAL index and page metadata
+    ///
+    /// WAL frames form a checksum chain for corruption detection. When writing
+    /// multiple batches in a single transaction, pass the previous batch via `prev`
+    /// to continue the chain. For the first batch, pass `None` to start from
+    /// the committed WAL state.
+    fn prepare_frames(
         &self,
-        pages: Vec<PageRef>,
+        pages: &[PageRef],
         page_sz: PageSize,
         db_size_on_commit: Option<u32>,
-    ) -> Result<Completion> {
+        prev: Option<&PreparedFrames>,
+    ) -> Result<PreparedFrames> {
+        turso_assert!(
+            pages.len() <= IOV_MAX,
+            "supported up to IOV_MAX pages at once"
+        );
+        turso_assert!(
+            self.with_shared(|shared| shared.is_initialized())?,
+            "WAL must be initialized"
+        );
+
+        let (header, epoch) = self.with_shared(|shared| {
+            let hdr = *shared.wal_header.lock();
+            let epoch = shared.epoch.load(Ordering::Acquire);
+            (hdr, epoch)
+        });
+
+        turso_assert!(
+            header.page_size == page_sz.get(),
+            "page size mismatch: header={}, requested={}",
+            header.page_size,
+            page_sz.get()
+        );
+
+        // Either chain from previous batch of PreparedFrames or use committed WAL state
+        let (mut rolling_checksum, mut next_frame_id) = match prev {
+            Some(p) => (p.final_checksum, p.final_max_frame + 1),
+            None => (
+                *self.last_checksum.read(),
+                self.max_frame.load(Ordering::Acquire) + 1,
+            ),
+        };
+
+        let first_frame_id = next_frame_id;
+
+        let mut bufs: Vec<Arc<Buffer>> = Vec::with_capacity(pages.len());
+        let mut metadata = Vec::with_capacity(pages.len());
+
+        for (idx, page) in pages.iter().enumerate() {
+            let page_id = page.get().id;
+            let plain = page.get_contents().as_ptr();
+
+            let data: Cow<[u8]> = {
+                let io_ctx = self.io_ctx.read();
+                match io_ctx.encryption_or_checksum() {
+                    EncryptionOrChecksum::Encryption(ctx) => {
+                        Cow::Owned(ctx.encrypt_page(plain, page_id)?)
+                    }
+                    EncryptionOrChecksum::Checksum(ctx) => {
+                        ctx.add_checksum_to_page(plain, page_id)?;
+                        Cow::Borrowed(plain)
+                    }
+                    EncryptionOrChecksum::None => Cow::Borrowed(plain),
+                }
+            };
+
+            let frame_db_size = if idx + 1 == pages.len() {
+                db_size_on_commit.unwrap_or(0)
+            } else {
+                0
+            };
+            let (checksum, frame_buf) = prepare_wal_frame(
+                &self.buffer_pool,
+                &header,
+                rolling_checksum,
+                header.page_size,
+                page_id as u32,
+                frame_db_size,
+                &data,
+            );
+            bufs.push(frame_buf);
+            metadata.push((page.clone(), next_frame_id, checksum));
+            rolling_checksum = checksum;
+            next_frame_id += 1;
+        }
+        let offset = self.frame_offset(first_frame_id);
+        Ok(PreparedFrames {
+            offset,
+            bufs,
+            metadata,
+            final_checksum: rolling_checksum,
+            final_max_frame: next_frame_id - 1,
+            epoch,
+        })
+    }
+
+    /// For each prepared frame, update in-memory WAL index and rolling checksum.
+    /// and advance max_frame to make frames visible to readers.
+    fn commit_prepared_frames(&self, prepared: &[PreparedFrames]) {
+        for batch in prepared {
+            for (page, frame_id, checksum) in &batch.metadata {
+                // Update WAL index mapping page -> frame
+                self.complete_append_frame(page.get().id as u64, *frame_id, *checksum);
+            }
+            // Update rolling checksum
+            *self.last_checksum.write() = batch.final_checksum;
+            // Advance max_frame and make frames visible to readers
+            self.max_frame
+                .store(batch.final_max_frame, Ordering::Release);
+        }
+    }
+
+    /// Mark pages clean and set WAL tags after durable commit.
+    fn finalize_committed_pages(&self, prepared: &[PreparedFrames]) {
+        for batch in prepared {
+            for (page, frame_id, _) in &batch.metadata {
+                page.clear_dirty();
+                page.set_wal_tag(*frame_id, batch.epoch);
+            }
+        }
+    }
+
+    /// Get WAL file for durable writes.
+    fn wal_file(&self) -> Result<Arc<dyn File>> {
+        self.with_shared(|shared| {
+            turso_assert!(shared.enabled.load(Ordering::SeqCst), "WAL must be enabled");
+            shared
+                .file
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| LimboError::InternalError("WAL file not open".into()))
+        })
+    }
+
+    /// Use pwritev to append many frames to the log at once.
+    ///
+    /// # Safety:
+    /// this method should only be used for cacheflush/spilling,
+    /// the commit path should use prepare_frames + commit_prepared_frames instead,
+    /// as it prevents prematurely modifing WAL state before durability is ensured.
+    fn append_frames_vectored(&self, pages: Vec<PageRef>, page_sz: PageSize) -> Result<Completion> {
         turso_assert!(
             pages.len() <= IOV_MAX,
             "we limit number of iovecs to IOV_MAX"
@@ -1529,7 +1697,7 @@ impl Wal for WalFile {
 
         let mut next_frame_id = self.max_frame.load(Ordering::Acquire) + 1;
         // Build every frame in order, updating the rolling checksum
-        for (idx, page) in pages.iter().enumerate() {
+        for page in pages.iter() {
             tracing::debug!("append_frames_vectored: page_id={}", page.get().id);
             let page_id = page.get().id;
             let plain = page.get_contents().as_ptr();
@@ -1548,13 +1716,7 @@ impl Wal for WalFile {
                 }
             };
 
-            let frame_db_size = if idx + 1 == pages.len() {
-                // if it's the final frame we are appending, and the caller included a db_size for the
-                // commit frame, then we ensure to set it in the header.
-                db_size_on_commit.unwrap_or(0)
-            } else {
-                0
-            };
+            let frame_db_size = 0; // this method is not used for the commit path
             let (new_checksum, frame_bytes) = prepare_wal_frame(
                 &self.buffer_pool,
                 &header,
@@ -1595,7 +1757,7 @@ impl Wal for WalFile {
             }
         };
 
-        let c = Completion::new_write_linked(cmp);
+        let c = Completion::new_write(cmp);
 
         let file = self.with_shared(|shared| {
             assert!(shared.enabled.load(Ordering::SeqCst), "WAL must be enabled");

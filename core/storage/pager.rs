@@ -1,5 +1,7 @@
+use crate::io::WriteBatch;
 use crate::storage::btree::PinGuard;
 use crate::storage::subjournal::Subjournal;
+use crate::storage::wal::PreparedFrames;
 use crate::storage::{
     buffer_pool::BufferPool,
     database::DatabaseStorage,
@@ -14,7 +16,7 @@ use crate::{
     io::CompletionGroup, return_if_io, turso_assert, types::WalFrameInfo, Completion, Connection,
     IOResult, LimboError, Result, TransactionState,
 };
-use crate::{io_yield_one, Buffer, CompletionError, IOContext, OpenFlags, IO};
+use crate::{io_yield_one, Buffer, CompletionError, IOContext, OpenFlags, SyncMode, IO};
 use arc_swap::ArcSwapOption;
 use parking_lot::{Mutex, RwLock};
 use roaring::RoaringBitmap;
@@ -437,8 +439,10 @@ enum CommitState {
         db_size: u32,
         page_sz: PageSize,
     },
-    /// Fsync the on-disk WAL.
-    SyncWal,
+    /// All frames prepared, writes are in flight
+    WaitWrites,
+    /// Writes are complete, wait for WAL sync to complete
+    WaitSync,
     /// Wait for WAL sync to complete and finalize the WAL commit.
     /// After this state, the write transaction is durable.
     /// If autocheckpoint is enabled and the autocheckpoint threshold is reached, checkpoint will be attempted.
@@ -501,6 +505,7 @@ struct CommitInfo {
     collected_pages: Vec<PageRef>,
     /// Pending read for an evicted page: (page_id, page_ref, read_completion)
     pending_read: Option<(usize, PageRef, Completion)>,
+    prepared_frames: Vec<PreparedFrames>,
 }
 
 impl CommitInfo {
@@ -511,6 +516,7 @@ impl CommitInfo {
         self.current_dirty_idx = 0;
         self.collected_pages.clear();
         self.pending_read = None;
+        self.prepared_frames.clear();
     }
 }
 
@@ -817,6 +823,7 @@ impl Pager {
                 current_dirty_idx: 0,
                 collected_pages: Vec::new(),
                 pending_read: None,
+                prepared_frames: Vec::new(),
             }),
             syncing: Arc::new(AtomicBool::new(false)),
             checkpoint_state: RwLock::new(CheckpointState::default()),
@@ -2179,7 +2186,7 @@ impl Pager {
         for page in &pages {
             page.set_write_pending();
         }
-        match wal.append_frames_vectored(pages, page_sz, None) {
+        match wal.append_frames_vectored(pages, page_sz) {
             Ok(completion) => {
                 state.completions.push(completion);
                 Ok(())
@@ -2245,7 +2252,7 @@ impl Pager {
                                     p.to_page()
                                 })
                                 .collect();
-                            let c = wal.append_frames_vectored(wal_pages, page_sz, None)?;
+                            let c = wal.append_frames_vectored(wal_pages, page_sz)?;
 
                             if c.succeeded() {
                                 // Synchronous completion, WAL tags already set by callback.
@@ -2425,24 +2432,17 @@ impl Pager {
     pub fn commit_dirty_pages(
         &self,
         wal_auto_checkpoint_disabled: bool,
-        sync_mode: crate::SyncMode,
+        sync_mode: SyncMode,
         data_sync_retry: bool,
     ) -> Result<IOResult<PagerCommitResult>> {
-        // Reset commit_info at the start of each commit to ensure clean state.
-        // This is necessary because commit_info is shared across connections,
-        // and a previous connection's commit may have left stale state.
         {
-            let commit_info = self.commit_info.read();
+            let mut commit_info = self.commit_info.write();
             if commit_info.state == CommitState::PrepareWal {
-                // Only reset if we're starting fresh (not resuming from IO yield)
-                drop(commit_info);
-                self.commit_info.write().reset();
+                commit_info.reset();
             }
         }
 
-        // Make sure any asynchronous spill writes are finished before we start publishing
-        // new frames to readers. Otherwise wal.max_frame may get ahead of what is actually
-        // on disk and readers can attempt to read unwritten frames.
+        // Wait for spill writes before publishing frames
         if let IOResult::IO(c) = self.wait_for_spill_completions()? {
             return Ok(IOResult::IO(c));
         }
@@ -2453,8 +2453,7 @@ impl Pager {
             data_sync_retry,
         ) {
             r @ (Ok(IOResult::Done(..)) | Err(..)) => {
-                let mut commit_info = self.commit_info.write();
-                commit_info.reset();
+                self.commit_info.write().reset();
                 r
             }
             Ok(IOResult::IO(io)) => Ok(IOResult::IO(io)),
@@ -2465,18 +2464,19 @@ impl Pager {
     fn commit_dirty_pages_inner(
         &self,
         wal_auto_checkpoint_disabled: bool,
-        sync_mode: crate::SyncMode,
+        sync_mode: SyncMode,
         data_sync_retry: bool,
     ) -> Result<IOResult<PagerCommitResult>> {
         let Some(wal) = self.wal.as_ref() else {
             return Err(LimboError::InternalError(
-                "commit_dirty_pages() called on database without WAL".to_string(),
+                "commit_dirty_pages() called without WAL".into(),
             ));
         };
 
         'outer: loop {
             let state = self.commit_info.read().state;
             trace!(?state);
+
             match state {
                 CommitState::PrepareWal => {
                     let page_sz = self.get_page_size_unchecked();
@@ -2498,18 +2498,15 @@ impl Pager {
                     }
                 }
                 CommitState::GetDbSize => {
-                    let db_size = return_if_io!(self.with_header(|header| header.database_size));
+                    let db_size = return_if_io!(self.with_header(|h| h.database_size));
                     self.commit_info.write().state = CommitState::PrepareFrames {
                         db_size: db_size.get(),
                     };
                 }
                 CommitState::PrepareFrames { db_size } => {
                     let page_sz = self.get_page_size_unchecked();
-                    // Initialize dirty_ids on first entry, since this state is re-entrant
-                    // we need to be sure to clear the dirty_ids_to_process on any success or error
-                    // path.
+                    let mut commit_info = self.commit_info.write();
                     {
-                        let mut commit_info = self.commit_info.write();
                         if commit_info.dirty_ids_to_process.is_empty()
                             && commit_info.current_dirty_idx == 0
                         {
@@ -2525,7 +2522,6 @@ impl Pager {
                     // Collect pages until we need to yield or finish
                     'inner: loop {
                         let (total, page_id) = {
-                            let commit_info = self.commit_info.read();
                             let idx = commit_info.current_dirty_idx;
                             let total = commit_info.dirty_ids_to_process.len();
                             if idx >= total {
@@ -2539,14 +2535,14 @@ impl Pager {
 
                         match cache_result {
                             Some(page) => {
-                                let mut commit_info = self.commit_info.write();
                                 commit_info.collected_pages.push(page);
                                 commit_info.current_dirty_idx += 1;
 
                                 let is_last = commit_info.current_dirty_idx >= total;
                                 if commit_info.collected_pages.len() == IOV_MAX || is_last {
-                                    self.flush_collected_to_wal(
+                                    self.prepare_collected_frames(
                                         &mut commit_info,
+                                        wal,
                                         page_sz,
                                         db_size,
                                         is_last,
@@ -2554,16 +2550,12 @@ impl Pager {
                                 }
                             }
                             None => {
-                                // Page evicted, transition to waiting state
                                 let (page, completion) =
                                     self.read_page_no_cache(page_id as i64, None, false)?;
-
-                                let mut commit_info = self.commit_info.write();
                                 commit_info.pending_read =
                                     Some((page_id, page, completion.clone()));
                                 commit_info.state =
                                     CommitState::WaitingForPageRead { db_size, page_sz };
-
                                 if !completion.succeeded() {
                                     io_yield_one!(completion);
                                 }
@@ -2571,110 +2563,144 @@ impl Pager {
                             }
                         }
                     }
-
-                    // Nothing to append
-                    if self.commit_info.read().completions.is_empty() {
+                    if commit_info.prepared_frames.is_empty() {
                         turso_assert!(
                             self.dirty_pages.read().is_empty(),
-                            "dirty pages must be empty if we didnt collect any completions"
+                            "dirty pages must be empty if no frames prepared"
                         );
                         return Ok(IOResult::Done(PagerCommitResult::WalWritten));
-                    } else {
-                        // Skip sync if synchronous mode is OFF, go directly to WalCommitDone
-                        let mut commit_info = self.commit_info.write();
-                        if sync_mode == crate::SyncMode::Off {
-                            commit_info.state = CommitState::WalCommitDone;
-                        } else {
-                            commit_info.state = CommitState::SyncWal;
-                        }
                     }
+                    let wal_file = wal.wal_file()?;
+                    let mut batch = WriteBatch::new(wal_file);
+                    for prepared in &commit_info.prepared_frames {
+                        batch.writev(prepared.offset, &prepared.bufs);
+                    }
+                    commit_info.completions = batch.submit()?;
+                    commit_info.state = CommitState::WaitWrites;
                 }
                 CommitState::WaitingForPageRead { db_size, page_sz } => {
                     let mut commit_info = self.commit_info.write();
                     let (page_id, page, completion) = commit_info
                         .pending_read
                         .take()
-                        .expect("must have pending_read in WaitingForPageRead state");
+                        .expect("must have pending_read");
 
                     if !completion.succeeded() {
                         commit_info.pending_read = Some((page_id, page, completion.clone()));
                         io_yield_one!(completion);
                     }
-                    // Read complete, add to collected pages
+
                     commit_info.collected_pages.push(page);
                     commit_info.current_dirty_idx += 1;
 
-                    // Check if batch needed
                     let total = commit_info.dirty_ids_to_process.len();
                     let is_last = commit_info.current_dirty_idx >= total;
                     if commit_info.collected_pages.len() == IOV_MAX || is_last {
-                        self.flush_collected_to_wal(&mut commit_info, page_sz, db_size, is_last)?;
+                        self.prepare_collected_frames(
+                            &mut commit_info,
+                            wal,
+                            page_sz,
+                            db_size,
+                            is_last,
+                        )?;
                     }
-                    // Return to PrepareFrames to continue collecting
                     commit_info.state = CommitState::PrepareFrames { db_size };
                 }
-                CommitState::SyncWal => {
-                    let sync_result = wal.sync();
-                    let c = match sync_result {
-                        Ok(c) => c,
-                        Err(e) if !data_sync_retry => {
-                            panic!("fsync error (data_sync_retry=off): {e:?}");
+                CommitState::WaitWrites => {
+                    let all_done = self
+                        .commit_info
+                        .read()
+                        .completions
+                        .iter()
+                        .all(|c| c.finished());
+                    if !all_done {
+                        io_yield_one!(self.build_commit_completion_group());
+                    }
+
+                    // Check for any write errors
+                    let failed = self
+                        .commit_info
+                        .read()
+                        .completions
+                        .iter()
+                        .find(|c| !c.succeeded())
+                        .cloned();
+
+                    let mut commit_info = self.commit_info.write();
+                    if let Some(failed) = failed {
+                        commit_info.completions.clear();
+                        commit_info.prepared_frames.clear();
+                        return Err(std::io::Error::other(format!(
+                            "WAL write failed: {:?}",
+                            failed.get_error()
+                        ))
+                        .into());
+                    }
+                    commit_info.completions.clear();
+
+                    // Writes done, submit fsync if needed
+                    if sync_mode == SyncMode::Off {
+                        commit_info.state = CommitState::WalCommitDone;
+                    } else {
+                        let sync_c = wal.sync()?;
+                        commit_info.completions = vec![sync_c];
+                        commit_info.state = CommitState::WaitSync;
+                    }
+                }
+                // To protect against partial writes, we MUST ensure that all write Completions
+                // finish before submitting the fsync. It is possible that a partial write will
+                // cause an IO backend to resubmit the write (particularly with io_uring) and we
+                // cannot have the fsync submitted before all writes are fully done, even if
+                // they are IO_LINK'd together or we submit the fsync with IO_DRAIN, the only way
+                // to ensure durability in the case of partial writes is to ensure the pwritev
+                // completes before the fsync is submitted.
+                CommitState::WaitSync => {
+                    let sync_c = self.commit_info.read().completions[0].clone();
+                    // Wait for fsync to complete
+                    if !sync_c.finished() {
+                        io_yield_one!(sync_c);
+                    }
+                    // Check for fsync error as we might need to panic on data_sync_retry=off
+                    let mut commit_info = self.commit_info.write();
+                    if !sync_c.succeeded() {
+                        commit_info.completions.clear();
+                        commit_info.prepared_frames.clear();
+
+                        if !data_sync_retry {
+                            panic!(
+                                "fsync error (data_sync_retry=off): {:?}",
+                                sync_c.get_error()
+                            );
                         }
-                        Err(e) => return Err(e),
-                    };
-                    self.commit_info.write().completions.push(c);
-                    self.commit_info.write().state = CommitState::WalCommitDone;
+                        return Err(std::io::Error::other("WAL fsync failed").into());
+                    }
+                    commit_info.completions.clear();
+                    commit_info.state = CommitState::WalCommitDone;
                 }
                 CommitState::WalCommitDone => {
-                    let pending_io = {
-                        let commit_info = self.commit_info.read();
-                        !commit_info.completions.iter().all(|c| c.succeeded())
-                    };
-                    if pending_io {
-                        let completion = {
-                            let mut commit_info = self.commit_info.write();
-                            let mut group = CompletionGroup::new(|_| {});
-                            for c in commit_info.completions.drain(..) {
-                                group.add(&c);
-                            }
-                            group.build()
-                        };
-                        io_yield_one!(completion);
-                    }
-                    // WAL sync is complete - finalize the WAL commit
-                    // After this point, the write transaction is durable regardless of checkpoint outcome
-                    self.commit_info.write().completions.clear();
+                    // all I/O complete, NOW it's safe to advance WAL state
+                    let mut commit_info = self.commit_info.write();
+                    wal.commit_prepared_frames(&commit_info.prepared_frames);
+                    wal.finalize_committed_pages(&commit_info.prepared_frames);
                     wal.finish_append_frames_commit()?;
                     self.dirty_pages.write().clear();
+                    commit_info.prepared_frames.clear();
 
                     if wal_auto_checkpoint_disabled || !wal.should_checkpoint() {
                         return Ok(IOResult::Done(PagerCommitResult::WalWritten));
                     }
-                    self.commit_info.write().state = CommitState::AutoCheckpoint;
+                    commit_info.state = CommitState::AutoCheckpoint;
                 }
                 CommitState::AutoCheckpoint => {
-                    // Auto-checkpoint uses Passive mode. Sync is handled by checkpoint() based on sync_mode.
                     let checkpoint_mode = CheckpointMode::Passive {
                         upper_bound_inclusive: None,
                     };
-                    // Auto-checkpoint does NOT clear page cache (only explicit checkpoints do)
                     match self.checkpoint(checkpoint_mode, sync_mode, false) {
                         Err(LimboError::Busy) => {
-                            // Auto-checkpoint during commit uses Passive mode, which can return
-                            // Busy if either:
-                            // 1. Another connection is already checkpointing (checkpoint_lock held)
-                            // 2. A reader is active on read slot 0 (read_locks[0] held)
-                            // In either case, skip the checkpoint and complete the commit. The WAL
-                            // frames are already written, so the commit succeeds. Checkpoint will
-                            // happen later when conditions allow.
-                            tracing::debug!("Auto-checkpoint skipped due to busy (lock conflict)");
-                            // WAL commit is already finalized in WalCommitDone, just return success
+                            tracing::debug!("Auto-checkpoint skipped: busy");
                             return Ok(IOResult::Done(PagerCommitResult::WalWritten));
                         }
                         Err(e) => {
-                            // Checkpoint failed but WAL commit is already finalized (durable).
-                            // Return CheckpointFailed to inform caller that commit succeeded
-                            // but autocheckpoint failed.
                             tracing::error!("Auto-checkpoint failed: {}", e);
                             return Err(LimboError::CheckpointFailed(e.to_string()));
                         }
@@ -2690,11 +2716,11 @@ impl Pager {
         }
     }
 
-    /// Writes collected pages to WAL as a single batch.
-    /// Clears `collected_pages` and appends completion to `frame_completions`.
-    fn flush_collected_to_wal(
+    /// Prepare collected pages as WAL frames without submitting I/O.
+    fn prepare_collected_frames(
         &self,
         commit_info: &mut CommitInfo,
+        wal: &Arc<dyn Wal>,
         page_sz: PageSize,
         db_size: u32,
         is_commit_frame: bool,
@@ -2703,23 +2729,24 @@ impl Pager {
         if pages.is_empty() {
             return Ok(());
         }
-
         let commit_flag = if is_commit_frame { Some(db_size) } else { None };
         for page in &pages {
             page.set_write_pending();
         }
+        // Chain from previous batch if any
+        let prev = commit_info.prepared_frames.last();
+        let prepared = wal.prepare_frames(&pages, page_sz, commit_flag, prev)?;
+        commit_info.prepared_frames.push(prepared);
+        Ok(())
+    }
 
-        let wal = self.wal.as_ref().unwrap();
-        match wal.append_frames_vectored(pages, page_sz, commit_flag) {
-            Ok(c) => {
-                commit_info.completions.push(c);
-                Ok(())
-            }
-            Err(e) => {
-                self.io.cancel(&commit_info.completions)?;
-                Err(e)
-            }
+    fn build_commit_completion_group(&self) -> Completion {
+        let commit_info = self.commit_info.read();
+        let mut group = CompletionGroup::new(|_| {});
+        for c in commit_info.completions.iter() {
+            group.add(c);
         }
+        group.build()
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
