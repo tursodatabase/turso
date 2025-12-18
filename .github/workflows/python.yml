@@ -56,9 +56,6 @@ jobs:
 
       - name: Install uv
         uses: useblacksmith/setup-uv@v4
-        with:
-          enable-cache: true
-          ignore-nothing-to-cache: true
 
       - name: Install the project
         run: uv sync --all-extras --dev --all-packages
@@ -82,9 +79,6 @@ jobs:
 
       - name: Install uv
         uses: useblacksmith/setup-uv@v4
-        with:
-          enable-cache: true
-          ignore-nothing-to-cache: true
 
       - name: Install the project
         run: uv sync --all-extras --dev --all-packages
