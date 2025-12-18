@@ -298,7 +298,7 @@ do_execsql_test printf-width-integer-negative-value {
 
 do_execsql_test printf-width-integer-zero-value {
   SELECT printf('Number: %5d', 0);
-} {{Number:    0}}
+} {{Number:     0}}
 
 do_execsql_test printf-width-integer-zero-width {
   SELECT printf('Number: %0d', 42);
@@ -310,19 +310,19 @@ do_execsql_test printf-width-integer-large-width {
 
 do_execsql_test printf-width-integer-float-input {
   SELECT printf('Number: %5d', 42.7);
-} {{Number:   42}}
+} {{Number:    42}}
 
 do_execsql_test printf-width-integer-negative-float-input {
   SELECT printf('Number: %5d', -42.9);
-} {{Number:  -42}}
+} {{Number:   -42}}
 
 do_execsql_test printf-width-integer-string-input {
   SELECT printf('Number: %5d', 'not a number');
-} {{Number:    0}}
+} {{Number:     0}}
 
 do_execsql_test printf-width-integer-null-input {
   SELECT printf('Number: %5d', NULL);
-} {{Number:    0}}
+} {{Number:     0}}
 
 do_execsql_test printf-width-integer-leading-zero {
   SELECT printf('Number: %01d', 42);
@@ -354,4 +354,4 @@ do_execsql_test printf-width-precision-basic {
 
 do_execsql_test printf-width-precision-negative {
   SELECT printf('Number: %6.3d', -42);
-} {{Number:  -042}}
+} {{Number:   -042}}
