@@ -157,6 +157,13 @@ const run = async (seed: string, bin: string, args: string[]): Promise<boolean> 
   return issuePosted;
 }
 
+const IO_BACKENDS = ["memory", "io-uring", "default"] as const;
+type IoBackend = (typeof IO_BACKENDS)[number];
+
+const getRandomIoBackend = (): IoBackend => {
+  return IO_BACKENDS[Math.floor(Math.random() * IO_BACKENDS.length)];
+}
+
 // Main execution loop
 const startTime = new Date();
 const limboSimArgs = process.argv.slice(2);
@@ -176,9 +183,8 @@ while (new Date().getTime() - startTime.getTime() < TIME_LIMIT_MINUTES * 60 * 10
     args.push("--profile", "faultless");
   }
 
-  // Memory IO is faster
-  if (!args.includes("--memory-io")) {
-    args.push("--memory-io");
+  if (!args.find((arg) => arg.startsWith("--io-backend"))) {
+    args.push(`--io-backend=${getRandomIoBackend()}`);
   }
 
   if (Math.random() < 0.5 && !args.includes("--differential")) {
