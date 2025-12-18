@@ -29,6 +29,8 @@ use crate::{
 };
 use crate::{translate::plan::ResultSetColumn, types::KeyInfo};
 
+use crate::function::AggFunc;
+
 /// Labels needed for various jumps in GROUP BY handling.
 #[derive(Debug)]
 pub struct GroupByLabels {
@@ -72,6 +74,12 @@ pub struct GroupByRegisters {
     /// The comparison result is used to determine if the current row belongs to the same group as the previous row
     /// Each group by expression has a corresponding register
     pub reg_group_exprs_cmp: usize,
+    /// Register holding the current min/max value for comparison (used for MIN/MAX special case)
+    /// Only allocated when there's exactly one MIN or MAX aggregate
+    pub reg_current_min_max: Option<usize>,
+    /// Register holding a flag indicating whether to update bare columns (used for MIN/MAX special case)
+    /// Only allocated when there's exactly one MIN or MAX aggregate
+    pub reg_should_update_bare_cols: Option<usize>,
 }
 
 // Metadata for handling GROUP BY operations
@@ -114,6 +122,21 @@ pub fn init_group_by<'a>(
     let reg_data_in_acc_flag = program.alloc_register();
     let reg_abort_flag = program.alloc_register();
     let reg_group_exprs_cmp = program.alloc_registers(group_by.exprs.len());
+
+    // Check if there's exactly one MIN or MAX aggregate (MIN/MAX special case)
+    let min_max_aggs_count = plan
+        .aggregates
+        .iter()
+        .filter(|agg| matches!(agg.func, AggFunc::Min | AggFunc::Max))
+        .count();
+    let (reg_current_min_max, reg_should_update_bare_cols) = if min_max_aggs_count == 1 {
+        (
+            Some(program.alloc_register()),
+            Some(program.alloc_register()),
+        )
+    } else {
+        (None, None)
+    };
 
     // The following two blocks of registers should always be allocated contiguously,
     // because they are cleared in a contiguous block in the GROUP BYs clear accumulator subroutine.
@@ -216,6 +239,8 @@ pub fn init_group_by<'a>(
             reg_group_exprs_cmp,
             reg_subrtn_acc_clear_return_offset,
             reg_group_by_source_cols_start,
+            reg_current_min_max,
+            reg_should_update_bare_cols,
         },
     });
     Ok(())
@@ -435,6 +460,202 @@ pub fn emit_group_by_sort_loop_end(
     program.preassign_label_to_next_insn(label_sort_loop_end);
 }
 
+/// Finds the single MIN or MAX aggregate if exactly one exists.
+/// Returns (index, aggregate) if found, None otherwise.
+fn find_single_min_max_aggregate(aggregates: &[Aggregate]) -> Option<(usize, &Aggregate)> {
+    let min_max_aggs: Vec<_> = aggregates
+        .iter()
+        .enumerate()
+        .filter(|(_, agg)| matches!(agg.func, AggFunc::Min | AggFunc::Max))
+        .collect();
+
+    if min_max_aggs.len() == 1 {
+        Some((min_max_aggs[0].0, min_max_aggs[0].1))
+    } else {
+        None
+    }
+}
+
+/// Gets the register containing the aggregate argument value.
+/// This handles both Sorter and MainLoop row sources.
+fn get_aggregate_argument_register(
+    program: &mut ProgramBuilder,
+    row_source: &GroupByRowSource,
+    cursor_index: usize,
+    offset: usize,
+    non_aggregate_exprs_len: usize,
+) -> usize {
+    match row_source {
+        GroupByRowSource::Sorter { pseudo_cursor, .. } => {
+            let arg_reg = program.alloc_register();
+            program.emit_column_or_rowid(*pseudo_cursor, cursor_index + offset, arg_reg);
+            arg_reg
+        }
+        GroupByRowSource::MainLoop { start_reg_src, .. } => {
+            let src_reg = start_reg_src + non_aggregate_exprs_len + offset;
+            let arg_reg = program.alloc_register();
+            program.emit_insn(Insn::Copy {
+                src_reg,
+                dst_reg: arg_reg,
+                extra_amount: 0,
+            });
+            arg_reg
+        }
+    }
+}
+
+/// Emits bytecode to compare the aggregate argument with the current min/max value
+/// and set the update flag if this row should update the bare columns.
+fn emit_min_max_comparison(
+    program: &mut ProgramBuilder,
+    agg: &Aggregate,
+    agg_arg_reg: usize,
+    current_min_max_reg: usize,
+    update_flag_reg: usize,
+    plan: &SelectPlan,
+) -> Result<()> {
+    // Initialize update flag to 0 (don't update by default)
+    program.emit_insn(Insn::Integer {
+        value: 0,
+        dest: update_flag_reg,
+    });
+
+    // Skip comparison if aggregate argument is NULL (NULLs are ignored in MIN/MAX)
+    let after_comparison_label = program.allocate_label();
+    let check_first_row_label = program.allocate_label();
+
+    program.emit_insn(Insn::NotNull {
+        reg: agg_arg_reg,
+        target_pc: check_first_row_label,
+    });
+    program.emit_insn(Insn::Goto {
+        target_pc: after_comparison_label,
+    });
+
+    // Aggregate argument is not NULL: proceed with comparison
+    program.preassign_label_to_next_insn(check_first_row_label);
+
+    // Check if this is the first row in the group (current_min_max_reg is NULL)
+    let compare_label = program.allocate_label();
+    program.emit_insn(Insn::NotNull {
+        reg: current_min_max_reg,
+        target_pc: compare_label,
+    });
+    // First row: always update bare columns
+    program.emit_insn(Insn::Integer {
+        value: 1,
+        dest: update_flag_reg,
+    });
+    program.emit_insn(Insn::Goto {
+        target_pc: after_comparison_label,
+    });
+
+    // Not first row: compare aggregate argument with current min/max
+    program.preassign_label_to_next_insn(compare_label);
+
+    // Get collation for comparison
+    let collation = agg
+        .args
+        .first()
+        .and_then(|expr| get_collseq_from_expr(expr, &plan.table_references).ok())
+        .flatten()
+        .unwrap_or_default();
+
+    // Ensure register ordering for Compare instruction (requires start_reg_a < start_reg_b)
+    let (compare_reg_a, compare_reg_b) = if agg_arg_reg < current_min_max_reg {
+        (agg_arg_reg, current_min_max_reg)
+    } else {
+        // Copy to a temp register that's guaranteed to be after agg_arg_reg
+        let temp_reg = program.alloc_register();
+        program.emit_insn(Insn::Copy {
+            src_reg: current_min_max_reg,
+            dst_reg: temp_reg,
+            extra_amount: 0,
+        });
+        (agg_arg_reg, temp_reg)
+    };
+
+    // Compare values
+    program.emit_insn(Insn::Compare {
+        start_reg_a: compare_reg_a,
+        start_reg_b: compare_reg_b,
+        count: 1,
+        key_info: vec![KeyInfo {
+            sort_order: SortOrder::Asc,
+            collation,
+        }],
+    });
+
+    // Set flag based on comparison: MIN updates if new < old, MAX updates if new > old
+    let set_flag_label = program.allocate_label();
+    let skip_flag_label = program.allocate_label();
+
+    match agg.func {
+        AggFunc::Min => {
+            program.emit_insn(Insn::Jump {
+                target_pc_lt: set_flag_label,
+                target_pc_eq: skip_flag_label,
+                target_pc_gt: skip_flag_label,
+            });
+        }
+        AggFunc::Max => {
+            program.emit_insn(Insn::Jump {
+                target_pc_lt: skip_flag_label,
+                target_pc_eq: skip_flag_label,
+                target_pc_gt: set_flag_label,
+            });
+        }
+        _ => unreachable!(),
+    }
+
+    program.preassign_label_to_next_insn(set_flag_label);
+    program.emit_insn(Insn::Integer {
+        value: 1,
+        dest: update_flag_reg,
+    });
+
+    program.preassign_label_to_next_insn(skip_flag_label);
+    program.preassign_label_to_next_insn(after_comparison_label);
+
+    Ok(())
+}
+
+/// Updates the current min/max tracking register with the new value.
+fn update_min_max_tracking_register(
+    program: &mut ProgramBuilder,
+    row_source: &GroupByRowSource,
+    current_min_max_reg: usize,
+    cursor_index: usize,
+    aggregate_offset: usize,
+    non_aggregate_exprs_len: usize,
+) {
+    let agg_arg_reg = match row_source {
+        GroupByRowSource::Sorter { pseudo_cursor, .. } => {
+            let arg_reg = program.alloc_register();
+            program.emit_column_or_rowid(*pseudo_cursor, cursor_index + aggregate_offset, arg_reg);
+            arg_reg
+        }
+        GroupByRowSource::MainLoop { start_reg_src, .. } => {
+            *start_reg_src + non_aggregate_exprs_len + aggregate_offset
+        }
+    };
+
+    program.emit_insn(Insn::Copy {
+        src_reg: agg_arg_reg,
+        dst_reg: current_min_max_reg,
+        extra_amount: 0,
+    });
+}
+
+/// Calculates the offset to the aggregate argument for a given aggregate index.
+fn calculate_aggregate_offset(aggregates: &[Aggregate], target_index: usize) -> usize {
+    aggregates
+        .iter()
+        .take(target_index)
+        .map(|agg| agg.args.len())
+        .sum()
+}
+
 /// Enum representing the source for the rows processed during a GROUP BY.
 /// In case sorting is needed (which is most of the time), the variant
 /// [GroupByRowSource::Sorter] encodes the necessary information about that
@@ -582,15 +803,47 @@ pub fn group_by_process_single_group(
         return_reg: registers.reg_subrtn_acc_clear_return_offset,
     });
 
+    // Check if there's exactly one MIN or MAX aggregate (SQLite special case for bare columns)
+    // When there's exactly one MIN or MAX, bare columns should come from the row with min/max value
+    let min_max_agg_info = find_single_min_max_aggregate(&plan.aggregates);
+
     // Process each aggregate function for the current row
     program.preassign_label_to_next_insn(labels.label_grouping_agg_step);
-    let cursor_index = t_ctx.non_aggregate_expressions.len(); // Skipping all columns in sorter that not an aggregation arguments
+    let cursor_index = t_ctx.non_aggregate_expressions.len();
     let mut offset = 0;
     for (i, agg) in plan.aggregates.iter().enumerate() {
         let start_reg = t_ctx
             .reg_agg_start
             .expect("aggregate registers must be initialized");
         let agg_result_reg = start_reg + i;
+
+        // Special handling for single MIN/MAX aggregate: check if this row updates min/max
+        if min_max_agg_info.map(|(idx, _)| idx == i).unwrap_or(false) {
+            let agg_arg_reg = get_aggregate_argument_register(
+                program,
+                row_source,
+                cursor_index,
+                offset,
+                t_ctx.non_aggregate_expressions.len(),
+            );
+
+            let current_min_max_reg = registers.reg_current_min_max.expect(
+                "reg_current_min_max should be allocated when there's a single MIN/MAX aggregate",
+            );
+            let update_flag_reg = registers.reg_should_update_bare_cols.expect(
+                "reg_should_update_bare_cols should be allocated when there's a single MIN/MAX aggregate",
+            );
+
+            emit_min_max_comparison(
+                program,
+                agg,
+                agg_arg_reg,
+                current_min_max_reg,
+                update_flag_reg,
+                plan,
+            )?;
+        }
+
         let agg_arg_source = match &row_source {
             GroupByRowSource::Sorter { pseudo_cursor, .. } => AggArgumentSource::new_from_cursor(
                 program,
@@ -620,17 +873,56 @@ pub fn group_by_process_single_group(
         offset += agg.args.len();
     }
 
-    // We only need to store non-aggregate columns once per group
-    // Skip if we've already stored them for this group
-    program.add_comment(
-        program.offset(),
-        "don't emit group columns if continuing existing group",
-    );
-    program.emit_insn(Insn::If {
-        target_pc: labels.label_acc_indicator_set_flag_true,
-        reg: registers.reg_data_in_acc_flag,
-        jump_if_null: false,
-    });
+    // Handle bare column storage
+    if let Some((min_max_idx, _)) = min_max_agg_info {
+        // MIN/MAX case: store bare columns only when flag is set (new min/max found)
+        let update_flag_reg = registers
+            .reg_should_update_bare_cols
+            .expect("reg_should_update_bare_cols should be allocated");
+        let store_bare_cols_label = program.allocate_label();
+
+        // Check flag: if > 0, store bare columns
+        program.emit_insn(Insn::IfPos {
+            reg: update_flag_reg,
+            target_pc: store_bare_cols_label,
+            decrement_by: 0,
+        });
+        // Flag is 0, skip storing bare columns
+        program.emit_insn(Insn::Goto {
+            target_pc: labels.label_acc_indicator_set_flag_true,
+        });
+
+        // Flag is 1: update current_min_max and store bare columns
+        program.preassign_label_to_next_insn(store_bare_cols_label);
+
+        // Update the current min/max tracking register
+        let aggregate_offset = calculate_aggregate_offset(&plan.aggregates, min_max_idx);
+        let current_min_max_reg = registers
+            .reg_current_min_max
+            .expect("reg_current_min_max should be allocated");
+
+        update_min_max_tracking_register(
+            program,
+            row_source,
+            current_min_max_reg,
+            cursor_index,
+            aggregate_offset,
+            t_ctx.non_aggregate_expressions.len(),
+        );
+
+        // Now store bare columns from current row (fall through to bare column storage code below)
+    } else {
+        // Normal case: store once per group
+        program.add_comment(
+            program.offset(),
+            "don't emit group columns if continuing existing group",
+        );
+        program.emit_insn(Insn::If {
+            target_pc: labels.label_acc_indicator_set_flag_true,
+            reg: registers.reg_data_in_acc_flag,
+            jump_if_null: false,
+        });
+    }
 
     // Read non-aggregate columns from the current row
     match row_source {
@@ -862,6 +1154,22 @@ pub fn group_by_emit_row_phase<'a>(
             start_reg + t_ctx.non_aggregate_expressions.len() + plan.aggregates.len() - 1,
         ),
     });
+
+    // Reset min/max tracking register to NULL (for bare column special case)
+    if let Some(reg_current_min_max) = registers.reg_current_min_max {
+        program.emit_insn(Insn::Null {
+            dest: reg_current_min_max,
+            dest_end: None,
+        });
+    }
+
+    // Reset update flag to 0 (for bare column special case)
+    if let Some(reg_should_update) = registers.reg_should_update_bare_cols {
+        program.emit_insn(Insn::Integer {
+            value: 0,
+            dest: reg_should_update,
+        });
+    }
 
     // Reopen ephemeral indexes for distinct aggregates (effectively clearing them).
     plan.aggregates

@@ -354,3 +354,82 @@ do_execsql_test_on_specific_db {:memory:} group_by_alias_precedence {
     SELECT x AS y, SUM(y) as x FROM t GROUP BY y ORDER BY x;
 } {2|200
 1|400}
+
+# SQLite special case: MIN/MAX with bare columns
+# When there's exactly one MIN or MAX aggregate, bare columns come from the row with min/max value
+
+do_execsql_test_on_specific_db {:memory:} min_max_bare_columns_basic_max {
+    CREATE TABLE t(a, b, c);
+    INSERT INTO t VALUES (1, 'a', 'a'), (1, 'b', 'b'), (1, 'c', 'c');
+    SELECT a, b, max(c) FROM t GROUP BY a;
+} {1|c|c}
+
+do_execsql_test_on_specific_db {:memory:} min_max_bare_columns_basic_min {
+    CREATE TABLE t(a, b, c);
+    INSERT INTO t VALUES (1, 'a', 'a'), (1, 'b', 'b'), (1, 'c', 'c');
+    SELECT a, b, min(c) FROM t GROUP BY a;
+} {1|a|a}
+
+do_execsql_test_on_specific_db {:memory:} min_max_bare_columns_multiple_groups_max {
+    CREATE TABLE t(a, b, c);
+    INSERT INTO t VALUES (1, 'a', 'a'), (1, 'b', 'b'), (1, 'c', 'c');
+    INSERT INTO t VALUES (2, 'z', 'z'), (2, 'x', 'y');
+    SELECT a, b, max(c) FROM t GROUP BY a ORDER BY a;
+} {1|c|c
+2|z|z}
+
+do_execsql_test_on_specific_db {:memory:} min_max_bare_columns_multiple_groups_min {
+    CREATE TABLE t(a, b, c);
+    INSERT INTO t VALUES (1, 'a', 'a'), (1, 'b', 'b'), (1, 'c', 'c');
+    INSERT INTO t VALUES (2, 'x', 'z'), (2, 'y', 'y');
+    SELECT a, b, min(c) FROM t GROUP BY a ORDER BY a;
+} {1|a|a
+2|y|y}
+
+do_execsql_test_on_specific_db {:memory:} min_max_bare_columns_reverse_order_max {
+    CREATE TABLE t(a, b, c);
+    INSERT INTO t VALUES (1, 'c', 'c'), (1, 'b', 'b'), (1, 'a', 'a');
+    SELECT a, b, max(c) FROM t GROUP BY a;
+} {1|c|c}
+
+do_execsql_test_on_specific_db {:memory:} min_max_bare_columns_reverse_order_min {
+    CREATE TABLE t(a, b, c);
+    INSERT INTO t VALUES (1, 'c', 'c'), (1, 'b', 'b'), (1, 'a', 'a');
+    SELECT a, b, min(c) FROM t GROUP BY a;
+} {1|a|a}
+
+do_execsql_test_on_specific_db {:memory:} min_max_bare_columns_with_nulls {
+    CREATE TABLE t(a, b, c);
+    INSERT INTO t VALUES (1, 'a', 'a'), (1, NULL, 'b'), (1, 'c', NULL), (1, 'd', 'd');
+    SELECT a, b, max(c) FROM t GROUP BY a;
+} {1|d|d}
+
+do_execsql_test_on_specific_db {:memory:} min_max_bare_columns_with_nulls_min {
+    CREATE TABLE t(a, b, c);
+    INSERT INTO t VALUES (1, 'a', 'a'), (1, NULL, 'b'), (1, 'c', NULL), (1, 'd', 'd');
+    SELECT a, b, min(c) FROM t GROUP BY a;
+} {1|a|a}
+
+do_execsql_test_on_specific_db {:memory:} min_max_bare_columns_ties_max {
+    CREATE TABLE t(a, b, c);
+    INSERT INTO t VALUES (1, 'a', 'x'), (1, 'b', 'x'), (1, 'c', 'y');
+    SELECT a, b, max(c) FROM t GROUP BY a;
+} {1|c|y}
+
+do_execsql_test_on_specific_db {:memory:} min_max_bare_columns_ties_min {
+    CREATE TABLE t(a, b, c);
+    INSERT INTO t VALUES (1, 'a', 'x'), (1, 'b', 'x'), (1, 'c', 'y');
+    SELECT a, b, min(c) FROM t GROUP BY a;
+} {1|a|x}
+
+do_execsql_test_on_specific_db {:memory:} min_max_bare_columns_multiple_bare_cols_max {
+    CREATE TABLE t(a, b, c, d);
+    INSERT INTO t VALUES (1, 'a', 'x', 10), (1, 'b', 'y', 20), (1, 'c', 'z', 30);
+    SELECT a, b, c, max(d) FROM t GROUP BY a;
+} {1|c|z|30}
+
+do_execsql_test_on_specific_db {:memory:} min_max_bare_columns_multiple_bare_cols_min {
+    CREATE TABLE t(a, b, c, d);
+    INSERT INTO t VALUES (1, 'a', 'x', 10), (1, 'b', 'y', 20), (1, 'c', 'z', 30);
+    SELECT a, b, c, min(d) FROM t GROUP BY a;
+} {1|a|x|10}
