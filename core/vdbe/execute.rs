@@ -5210,7 +5210,7 @@ pub fn op_function(
                 let value = if *start_reg == 0 {
                     &Value::build_text("now")
                 } else {
-                    &state.registers[*start_reg].get_value()
+                    state.registers[*start_reg].get_value()
                 };
                 state.registers[*dest] = Register::Value(exec_unixepoch(value));
             }
