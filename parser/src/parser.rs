@@ -4804,10 +4804,7 @@ mod tests {
                             distinctness: None,
                             columns: vec![ResultColumn::Expr(
                                 Box::new(Expr::Binary(
-                                    Box::new(Expr::Unary(
-                                        UnaryOperator::Positive,
-                                        Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
-                                    )),
+                                    Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
                                     Operator::Add,
                                     Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
                                 )),
@@ -11630,6 +11627,76 @@ mod tests {
                         options: TableOptions::NONE,
                     },
                 })],
+            ),
+            // issue 4197
+            (
+                b"SELECT +++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++123;".as_slice(),
+                vec![Cmd::Stmt(Stmt::Select(Select {
+                    with: None,
+                    body: SelectBody {
+                        select: OneSelect::Select {
+                            distinctness: None,
+                            columns: vec![ResultColumn::Expr(
+                              Box::new(Expr::Literal(Literal::Numeric("123".to_owned()))),
+                              None,
+                            )],
+                            from: None,
+                            where_clause: None,
+                            group_by: None,
+                            window_clause: vec![],
+                        },
+                        compounds: vec![],
+                    },
+                    order_by: vec![],
+                    limit: None,
+                }))],
+            ),
+            (
+                b"SELECT - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -123;".as_slice(),
+                vec![Cmd::Stmt(Stmt::Select(Select {
+                    with: None,
+                    body: SelectBody {
+                        select: OneSelect::Select {
+                            distinctness: None,
+                            columns: vec![ResultColumn::Expr(
+                              Box::new(Expr::Literal(Literal::Numeric("123".to_owned()))),
+                              None,
+                            )],
+                            from: None,
+                            where_clause: None,
+                            group_by: None,
+                            window_clause: vec![],
+                        },
+                        compounds: vec![],
+                    },
+                    order_by: vec![],
+                    limit: None,
+                }))],
+            ),
+            (
+                b"SELECT +++++++++++++++++++++++++++++++++++++++++++++++++++-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-123;".as_slice(),
+                vec![Cmd::Stmt(Stmt::Select(Select {
+                    with: None,
+                    body: SelectBody {
+                        select: OneSelect::Select {
+                            distinctness: None,
+                            columns: vec![ResultColumn::Expr(
+                              Box::new(Expr::Unary(
+                                  UnaryOperator::Negative,
+                                  Box::new(Expr::Literal(Literal::Numeric("123".to_owned()))),
+                              )),
+                              None,
+                            )],
+                            from: None,
+                            where_clause: None,
+                            group_by: None,
+                            window_clause: vec![],
+                        },
+                        compounds: vec![],
+                    },
+                    order_by: vec![],
+                    limit: None,
+                }))],
             ),
             (
                 b"CREATE INDEX t_idx ON t USING custom_index (x) WITH (a = 1, b = 'test', c = x'deadbeef', d = NULL)".as_slice(),
