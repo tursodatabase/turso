@@ -21,13 +21,13 @@ env:
   working-directory: bindings/ruby
 
 jobs:
-  test-unix:
+  test:
     name: Test (${{ matrix.os }}, Ruby ${{ matrix.ruby-version }})
-    timeout-minutes: 30
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        os: [blacksmith-4vcpu-ubuntu-2404, macos-latest]
+        os: [blacksmith-4vcpu-ubuntu-2404, macos-latest, windows-latest]
         ruby-version: ['3.2', '3.3']
     runs-on: ${{ matrix.os }}
 
@@ -39,58 +39,12 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Install Rust (stable)
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Set up Ruby ${{ matrix.ruby-version }}
-        uses: ruby/setup-ruby@v1
+      - uses: oxidize-rb/actions/setup-ruby-and-rust@v1
         with:
           ruby-version: ${{ matrix.ruby-version }}
           bundler-cache: false
-
-      - name: Install dependencies
-        run: |
-          gem install bundler
-          bundle config set --local path 'vendor/bundle'
-          bundle install
-
-      - name: Compile native extension
-        run: bundle exec rake compile
-
-      - name: Run example
-        run: bundle exec ruby examples/basic.rb
-
-  test-windows:
-    name: Test (Windows, Ruby ${{ matrix.ruby-version }})
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        ruby-version: ['3.2', '3.3']
-    runs-on: windows-latest
-
-    defaults:
-      run:
-        working-directory: bindings/ruby
-
-    steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
-      - name: Set up Ruby ${{ matrix.ruby-version }}
-        uses: ruby/setup-ruby@v1
-        with:
-          ruby-version: ${{ matrix.ruby-version }}
-          bundler-cache: false
-
-      - name: Install Rust (GNU)
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: stable-gnu
-
-      - name: Set BINDGEN_EXTRA_CLANG_ARGS
-        shell: bash
-        run: echo BINDGEN_EXTRA_CLANG_ARGS="--target=x86_64-pc-windows-gnu --sysroot=${RI_DEVKIT//\\//}$MSYSTEM_PREFIX" >> $GITHUB_ENV
+          cargo-cache: true
+          cache-version: v1
 
       - name: Install dependencies
         run: |
