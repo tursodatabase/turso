@@ -164,6 +164,13 @@ const getRandomIoBackend = (): IoBackend => {
   return IO_BACKENDS[Math.floor(Math.random() * IO_BACKENDS.length)];
 }
 
+const SIMULATOR_PROFILES = ["faultless", "write_heavy", "write_heavy_spill"] as const;
+type SimulatorProfile = (typeof SIMULATOR_PROFILES)[number];
+
+const getRandomSimulatorProfile = (): SimulatorProfile => {
+  return SIMULATOR_PROFILES[Math.floor(Math.random() * SIMULATOR_PROFILES.length)];
+}
+
 // Main execution loop
 const startTime = new Date();
 const limboSimArgs = process.argv.slice(2);
@@ -180,7 +187,7 @@ while (new Date().getTime() - startTime.getTime() < TIME_LIMIT_MINUTES * 60 * 10
   args.push("--disable-bugbase");
 
   if (Math.random() < 0.5) {
-    args.push("--profile", "faultless");
+    args.push("--profile", getRandomSimulatorProfile());
   }
 
   if (!args.find((arg) => arg.startsWith("--io-backend"))) {
