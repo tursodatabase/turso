@@ -8,7 +8,7 @@ use std::sync::Arc;
 use turso_core::types::Text;
 use turso_core::{self, Connection, DatabaseOpts, Statement, StepResult, Value, IO};
 
-type Error = *const i8;
+type Error = *const std::ffi::c_char;
 
 #[repr(C)]
 pub struct Database {
@@ -370,7 +370,7 @@ pub unsafe extern "C" fn db_statement_num_columns(statement_ptr: *mut Statement)
 pub unsafe extern "C" fn db_statement_column_name(
     statement_ptr: *mut Statement,
     index: i32,
-) -> *const i8 {
+) -> *const std::ffi::c_char {
     let statement = unsafe { &mut (*statement_ptr) };
     let col_name = statement.get_column_name(index.try_into().unwrap());
     match col_name {
