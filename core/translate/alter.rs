@@ -540,7 +540,9 @@ pub fn translate_alter_table(
                 to: new_name.to_owned(),
             });
 
-            for trigger in resolver.schema.get_triggers_for_table(table_name) {
+            // Reload all triggers and views cuz some of them might have been updated
+            // if they referenced the table being renamed.
+            for trigger in resolver.schema.triggers.values().flatten() {
                 program.emit_insn(Insn::DropTrigger {
                     db: 0,
                     trigger_name: trigger.name.clone(),
@@ -548,6 +550,17 @@ pub fn translate_alter_table(
                 program.emit_insn(Insn::ParseSchema {
                     db: 0,
                     where_clause: Some(format!("name = '{}'", trigger.name)),
+                });
+            }
+
+            for view in resolver.schema.views.values() {
+                program.emit_insn(Insn::DropView {
+                    db: 0,
+                    view_name: view.name.clone(),
+                });
+                program.emit_insn(Insn::ParseSchema {
+                    db: 0,
+                    where_clause: Some(format!("name = '{}'", view.name)),
                 });
             }
 

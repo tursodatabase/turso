@@ -5996,6 +5996,33 @@ pub fn op_function(
                                     None
                                 }
                             }
+                            ast::Stmt::CreateView {
+                                temporary,
+                                if_not_exists,
+                                view_name,
+                                columns,
+                                mut select,
+                            } => {
+                                let changed = rewrite_select_table_refs_for_rename(
+                                    &mut select,
+                                    &rename_from,
+                                    original_rename_to.as_str(),
+                                );
+                                if changed {
+                                    Some(
+                                        ast::Stmt::CreateView {
+                                            temporary,
+                                            if_not_exists,
+                                            view_name,
+                                            columns,
+                                            select,
+                                        }
+                                        .to_string(),
+                                    )
+                                } else {
+                                    None
+                                }
+                            }
                             _ => None,
                         }
                     };

@@ -937,4 +937,28 @@ do_execsql_test_on_specific_db {:memory:} trigger-rename-table-qualified-refs-wh
 } {{CREATE TRIGGER trg2 AFTER UPDATE ON "t1_new" WHEN (SELECT id FROM "t1_new" WHERE "t1_new".id = NEW.id) > 5 BEGIN
     SELECT 1;
   END}}
+do_execsql_test_on_specific_db {:memory:} trigger-rename-dependent-trigger {
+  CREATE TABLE t1(a);
+  CREATE TABLE t2(b);
+  CREATE TRIGGER tr AFTER INSERT ON t2 BEGIN INSERT INTO t1 VALUES(NEW.b); END;
+  ALTER TABLE t1 RENAME TO t1_new;
+  INSERT INTO t2 VALUES(42);
+  SELECT * FROM t1_new;
+} {42}
 
+do_execsql_test_on_specific_db {:memory:} trigger-rename-view-reference {
+  CREATE TABLE t1(a);
+  INSERT INTO t1 VALUES (100);
+  CREATE VIEW v1 AS SELECT * FROM t1;
+  ALTER TABLE t1 RENAME TO t1_new;
+  SELECT * FROM v1;
+} {100}
+
+do_execsql_test_on_specific_db {:memory:} trigger-rename-nested-view-reference {
+  CREATE TABLE t1(a);
+  INSERT INTO t1 VALUES (123);
+  CREATE VIEW v1 AS SELECT * FROM t1;
+  CREATE VIEW v2 AS SELECT * FROM v1;
+  ALTER TABLE t1 RENAME TO t1_new;
+  SELECT * FROM v2;
+} {123}
