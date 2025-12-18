@@ -1,7 +1,7 @@
 #![allow(unused_variables)]
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::AlterTableFunc;
-use crate::mvcc::cursor::MvccCursorType;
+use crate::mvcc::cursor::{MvccCursorType, NextRowidResult};
 use crate::mvcc::database::CheckpointStateMachine;
 use crate::mvcc::LocalClock;
 use crate::schema::Table;
@@ -6947,7 +6947,9 @@ pub fn op_idx_insert(
 #[derive(Debug, Clone, Copy)]
 pub enum OpNewRowidState {
     Start,
-    SeekingToLast,
+    SeekingToLast {
+        mvcc_already_initialized: bool,
+    },
     ReadingMaxRowid,
     GeneratingRandom {
         attempts: u32,
@@ -7010,13 +7012,48 @@ fn new_rowid_inner(
     loop {
         match state.op_new_rowid_state {
             OpNewRowidState::Start => {
-                state.op_new_rowid_state = OpNewRowidState::SeekingToLast;
+                state.op_new_rowid_state = OpNewRowidState::SeekingToLast {
+                    mvcc_already_initialized: false,
+                };
 
                 if let Some(mv_store) = mv_store.as_ref() {
                     let cursor = state.get_cursor(*cursor);
                     let cursor = cursor.as_btree_mut() as &mut dyn Any;
                     if let Some(mvcc_cursor) = cursor.downcast_mut::<MvCursor>() {
-                        return_if_io!(mvcc_cursor.start_new_rowid());
+                        match return_if_io!(mvcc_cursor.start_new_rowid()) {
+                            NextRowidResult::Unitialized => {
+                                // we need to find last to initialize it
+                                state.op_new_rowid_state = OpNewRowidState::SeekingToLast {
+                                    mvcc_already_initialized: false,
+                                };
+                            }
+                            NextRowidResult::Next {
+                                new_rowid,
+                                prev_rowid,
+                            } => {
+                                // we allocated a rowid, so no need to hold lock anymore
+                                mvcc_cursor.end_new_rowid();
+                                // mvcc allocator for table ws initialized, we can set result inmediatly
+                                state.registers[*rowid_reg] =
+                                    Register::Value(Value::Integer(new_rowid));
+                                // FIXME: we probably will need to remove sqlite_sequence from MVCC.
+                                if *prev_largest_reg > 0 {
+                                    state.registers[*prev_largest_reg] =
+                                        Register::Value(Value::Integer(prev_rowid.unwrap_or(0)));
+                                }
+                                // we still need to leave cursor pointing to the end, but we
+                                state.op_new_rowid_state = OpNewRowidState::SeekingToLast {
+                                    mvcc_already_initialized: true,
+                                };
+                            }
+                            NextRowidResult::FindRandom => {
+                                // NOTE(pere): we couldn't allocate a row, let's unlock and let it try to run with a random. This may
+                                // cause write-write conflict but I don't think there is a good way to prevent this right now.
+                                mvcc_cursor.end_new_rowid();
+                                state.op_new_rowid_state =
+                                    OpNewRowidState::GeneratingRandom { attempts: 0 };
+                            }
+                        }
                     } else {
                         // Not an MvCursor - must be an ephemeral cursor (indicated by lack of WAL)
                         let Some(ephemeral_cursor) = cursor.downcast_mut::<BTreeCursor>() else {
@@ -7030,7 +7067,9 @@ fn new_rowid_inner(
                 }
             }
 
-            OpNewRowidState::SeekingToLast => {
+            OpNewRowidState::SeekingToLast {
+                mvcc_already_initialized,
+            } => {
                 {
                     let cursor = state.get_cursor(*cursor);
                     let cursor = cursor.as_btree_mut();
@@ -7040,7 +7079,11 @@ fn new_rowid_inner(
                     let always_seek = program.contains_trigger_subprograms;
                     return_if_io!(cursor.seek_to_last(always_seek));
                 }
-                state.op_new_rowid_state = OpNewRowidState::ReadingMaxRowid;
+                if mvcc_already_initialized {
+                    state.op_new_rowid_state = OpNewRowidState::GoNext;
+                } else {
+                    state.op_new_rowid_state = OpNewRowidState::ReadingMaxRowid;
+                }
             }
 
             OpNewRowidState::ReadingMaxRowid => {
@@ -7049,6 +7092,16 @@ fn new_rowid_inner(
                     let cursor = cursor.as_btree_mut();
                     return_if_io!(cursor.rowid())
                 };
+
+                // Initialize table's max rowid in MVCC if enabled
+                if let Some(mv_store) = mv_store.as_ref() {
+                    let cursor = state.get_cursor(*cursor);
+                    let cursor = cursor.as_btree_mut() as &mut dyn Any;
+                    let Some(mvcc_cursor) = cursor.downcast_mut::<MvCursor>() else {
+                        panic!("unexpected cursor type with MVCC enabled on ReadingMaxRowid");
+                    };
+                    mvcc_cursor.initialize_max_rowid(current_max)?;
+                }
 
                 if *prev_largest_reg > 0 {
                     state.registers[*prev_largest_reg] =
@@ -7114,13 +7167,6 @@ fn new_rowid_inner(
                     state.registers[*rowid_reg] = Register::Value(Value::Integer(candidate));
                     state.op_new_rowid_state = OpNewRowidState::Start;
                     state.pc += 1;
-                    if let Some(mv_store) = mv_store.as_ref() {
-                        let cursor = state.get_cursor(*cursor);
-                        let cursor = cursor.as_btree_mut() as &mut dyn Any;
-                        if let Some(mvcc_cursor) = cursor.downcast_mut::<MvCursor>() {
-                            mvcc_cursor.end_new_rowid();
-                        }
-                    }
                     return Ok(InsnFunctionStepResult::Step);
                 } else {
                     // Collision, try again

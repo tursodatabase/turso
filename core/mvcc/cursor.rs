@@ -8,7 +8,6 @@ use crate::mvcc::database::{
     SortableIndexKey,
 };
 use crate::storage::btree::{BTreeCursor, BTreeKey, CursorTrait};
-use crate::storage::wal::TursoRwLock;
 use crate::translate::plan::IterationDirection;
 use crate::types::{
     compare_immutable, IOCompletions, IOResult, ImmutableRecord, IndexInfo, RecordCursor, SeekKey,
@@ -258,7 +257,6 @@ pub struct MvccLazyCursor<Clock: LogicalClock> {
     btree_cursor: Box<dyn CursorTrait>,
     null_flag: bool,
     record_cursor: RefCell<RecordCursor>,
-    next_rowid_lock: Arc<TursoRwLock>,
     creating_new_rowid: bool,
     state: RefCell<Option<MvccLazyCursorState>>,
     // we keep count_state separate to be able to call other public functions like rewind and next
@@ -266,6 +264,18 @@ pub struct MvccLazyCursor<Clock: LogicalClock> {
     btree_advance_state: RefCell<Option<AdvanceBtreeState>>,
     /// Dual-cursor peek state for proper iteration
     dual_peek: RefCell<DualCursorPeek>,
+}
+
+pub enum NextRowidResult {
+    /// We need to go to the last rowid and intialize allocator
+    Unitialized,
+    /// It was initialized, so we get a new rowid
+    Next {
+        new_rowid: i64,
+        prev_rowid: Option<i64>,
+    },
+    /// We reached end of available rowids (i64::MAX), so we will have to try and find a random rowid.
+    FindRandom,
 }
 
 impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
@@ -293,7 +303,6 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
             btree_cursor,
             null_flag: false,
             record_cursor: RefCell::new(RecordCursor::new()),
-            next_rowid_lock: Arc::new(TursoRwLock::new()),
             creating_new_rowid: false,
             state: RefCell::new(None),
             count_state: RefCell::new(None),
@@ -377,16 +386,37 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
         Ok(())
     }
 
-    pub fn start_new_rowid(&mut self) -> Result<IOResult<()>> {
+    pub fn start_new_rowid(&mut self) -> Result<IOResult<NextRowidResult>> {
         tracing::trace!("start_new_rowid");
-        let locked = self.next_rowid_lock.write();
+        let allocator = self.db.get_rowid_allocator(&self.table_id);
+        let locked = allocator.lock();
         if locked {
             self.creating_new_rowid = true;
-            Ok(IOResult::Done(()))
+            let res = if allocator.is_uninitialized() {
+                NextRowidResult::Unitialized
+            } else {
+                if let Some((next_rowid, prev_max_rowid)) = allocator.get_next_rowid() {
+                    NextRowidResult::Next {
+                        new_rowid: next_rowid,
+                        prev_rowid: prev_max_rowid,
+                    }
+                } else {
+                    NextRowidResult::FindRandom
+                }
+            };
+            Ok(IOResult::Done(res))
         } else {
             // Yield, some other cursor is generating new rowid
             Ok(IOResult::IO(IOCompletions::Single(Completion::new_yield())))
         }
+    }
+
+    pub fn initialize_max_rowid(&mut self, max_rowid: Option<i64>) -> Result<()> {
+        tracing::trace!("start_new_rowid");
+        let allocator = self.db.get_rowid_allocator(&self.table_id);
+        assert!(self.creating_new_rowid);
+        allocator.initialize(max_rowid);
+        Ok(())
     }
 
     pub fn end_new_rowid(&mut self) {
@@ -395,7 +425,8 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
             self.creating_new_rowid
         );
         if self.creating_new_rowid {
-            self.next_rowid_lock.unlock();
+            let allocator = self.db.get_rowid_allocator(&self.table_id);
+            allocator.unlock();
             self.creating_new_rowid = false;
         }
     }
