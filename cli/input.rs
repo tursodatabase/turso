@@ -5,7 +5,7 @@ use std::{
     io::{self, Write},
     sync::Arc,
 };
-use turso_core::{LimboError, StepResult};
+use turso_core::LimboError;
 
 #[derive(Copy, Clone)]
 pub enum DbLocation {
@@ -258,16 +258,9 @@ impl<'a> ApplyWriter<'a> {
 
     fn exec_stmt(&self, sql: &str) -> Result<(), LimboError> {
         match self.target.query(sql) {
-            Ok(Some(mut rows)) => loop {
-                match rows.step()? {
-                    StepResult::Row => {}
-                    StepResult::IO => rows.run_once()?,
-                    StepResult::Done | StepResult::Interrupt => break,
-                    StepResult::Busy => {
-                        return Err(LimboError::InternalError("target database is busy".into()))
-                    }
-                }
-            },
+            Ok(Some(mut rows)) => {
+                rows.run_with_row_callback(|_| Ok(()))?;
+            }
             Ok(None) => {}
             Err(e) => return Err(e),
         }

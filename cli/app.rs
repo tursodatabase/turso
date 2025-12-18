@@ -174,26 +174,6 @@ impl<'a> RowStepper<'a> {
             }
         }
     }
-
-    /// Returns the number of columns in the result set.
-    fn num_columns(&self) -> usize {
-        self.rows.num_columns()
-    }
-
-    /// Returns the name of a column by index.
-    fn get_column_name(&self, idx: usize) -> std::borrow::Cow<'_, str> {
-        self.rows.get_column_name(idx)
-    }
-
-    /// Returns the current row (call after next_row returns Ok(Some(_))).
-    fn row(&self) -> Option<&turso_core::Row> {
-        self.rows.row()
-    }
-
-    /// Returns the query mode of the statement.
-    fn get_query_mode(&self) -> QueryMode {
-        self.rows.get_query_mode()
-    }
 }
 
 impl Limbo {
@@ -492,12 +472,6 @@ impl Limbo {
         self.writer.as_mut().unwrap().write_all(b"\n")
     }
 
-    fn write_null(&mut self) -> io::Result<()> {
-        self.writer
-            .as_mut()
-            .unwrap()
-            .write_all(self.opts.null_value.as_bytes())
-    }
     fn run_query(&mut self, input: &str) {
         let echo = self.opts.echo;
         if echo {
