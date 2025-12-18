@@ -20,9 +20,7 @@ pub struct ArenaBuffer {
     /// The index of the first slot making up the buffer
     slot_idx: u32,
     /// The requested length of the allocation.
-    /// The actual size of what is allocated for the
-    /// buffer is `len` rounded up to the next multiple of
-    /// `[Arena::slot_size]`
+    /// For pooled buffers, `len` is always `<= Arena::slot_size` and occupies exactly one slot.
     len: usize,
 }
 
@@ -59,7 +57,7 @@ impl ArenaBuffer {
     }
 
     /// The requested size of the allocation, the actual size of the underlying buffer is rounded up to
-    /// the next multiple of the arena's slot_size
+    /// the arena's slot_size (and in practice is always `<= slot_size` for pooled buffers).
     pub const fn logical_len(&self) -> usize {
         self.len
     }
@@ -391,22 +389,15 @@ impl Arena {
     }
 
     /// Allocate a `Buffer` large enough for logical length `size`.
-    /// May span multiple slots
     pub fn try_alloc(arena: &Arc<Arena>, size: usize) -> Option<Buffer> {
-        let slots = size.div_ceil(arena.slot_size) as u32;
+        if size > arena.slot_size {
+            // The buffer pool only supports single-slot allocations. Larger requests fall back to
+            // temporary heap buffers via the caller.
+            return None;
+        }
         let mut freemap = arena.free_slots.lock();
-
-        let first_idx = if slots == 1 {
-            // use the optimized method for individual pages which attempts
-            // to leave large contiguous areas free of fragmentation for
-            // larger `runs`.
-            freemap.alloc_one()?
-        } else {
-            freemap.alloc_run(slots)?
-        };
-        arena
-            .allocated_slots
-            .fetch_add(slots as usize, Ordering::SeqCst);
+        let first_idx = freemap.alloc_one()?;
+        arena.allocated_slots.fetch_add(1, Ordering::SeqCst);
         let offset = first_idx as usize * arena.slot_size;
         let ptr = unsafe { NonNull::new_unchecked(arena.base.as_ptr().add(offset)) };
         Some(Buffer::new_pooled(ArenaBuffer::new(
@@ -420,14 +411,14 @@ impl Arena {
 
     /// Mark all relevant slots that include `size` starting at `slot_idx` as free.
     pub fn free(&self, slot_idx: u32, size: usize) {
-        let mut bm = self.free_slots.lock();
-        let count = size.div_ceil(self.slot_size);
         turso_assert!(
-            !bm.check_run_free(slot_idx, count as u32),
-            "must not already be marked free"
+            size <= self.slot_size,
+            "pooled buffers must not exceed one slot"
         );
-        bm.free_run(slot_idx, count as u32);
-        self.allocated_slots.fetch_sub(count, Ordering::SeqCst);
+        let mut bm = self.free_slots.lock();
+        turso_assert!(!bm.is_free(slot_idx), "must not already be marked free");
+        bm.free_one(slot_idx);
+        self.allocated_slots.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
