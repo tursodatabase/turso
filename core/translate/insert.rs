@@ -1,3 +1,4 @@
+use ::turso_parser::ast::ResolveType::Replace;
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use turso_parser::ast::{
@@ -8,6 +9,7 @@ use turso_parser::ast::{
 use crate::error::{
     SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE,
 };
+use crate::schema::SQLITE_SEQUENCE_TABLE;
 use crate::schema::{self, BTreeTable, ColDef, Index, IndexColumn, ResolvedFkRef, Table};
 use crate::translate::emitter::{
     emit_cdc_full_record, emit_cdc_insns, emit_cdc_patch_record, prepare_cdc_if_necessary,
@@ -233,10 +235,6 @@ pub fn translate_insert(
         on_conflict.unwrap_or(ResolveType::Abort),
     )?;
 
-    if inserting_multiple_rows && btree_table.has_autoincrement {
-        ensure_sequence_initialized(&mut program, resolver.schema, &btree_table)?;
-    }
-
     let cdc_table = prepare_cdc_if_necessary(&mut program, resolver.schema, table.get_name())?;
 
     let mut table_references = TableReferences::new(
@@ -277,6 +275,10 @@ pub fn translate_insert(
         None,
     )?;
 
+    if btree_table.has_autoincrement {
+        init_autoincrement(&mut program, &mut ctx, resolver)?;
+    }
+
     program = init_source_emission(
         program,
         &table,
@@ -306,10 +308,6 @@ pub fn translate_insert(
     )?;
 
     let has_user_provided_rowid = insertion.key.is_provided_by_user();
-
-    if ctx.table.has_autoincrement {
-        init_autoincrement(&mut program, &mut ctx, resolver)?;
-    }
 
     // Fire BEFORE INSERT triggers
 
@@ -369,9 +367,16 @@ pub fn translate_insert(
 
     program.preassign_label_to_next_insn(ctx.key_generation_label);
 
-    emit_rowid_generation(&mut program, resolver, &ctx, &insertion)?;
+    emit_rowid_generation(&mut program, &ctx, &insertion)?;
 
     program.preassign_label_to_next_insn(ctx.key_ready_for_uniqueness_check_label);
+
+    if let Some(AutoincMeta { r_seq, .. }) = ctx.autoincrement_meta {
+        program.emit_insn(Insn::MemMax {
+            dest_reg: r_seq,
+            src_reg: insertion.key_register(),
+        });
+    }
 
     if ctx.table.is_strict {
         program.emit_insn(Insn::TypeCheck {
@@ -506,37 +511,6 @@ pub fn translate_insert(
         )?;
     }
 
-    if let Some(AutoincMeta {
-        seq_cursor_id,
-        r_seq,
-        r_seq_rowid,
-        table_name_reg,
-    }) = ctx.autoincrement_meta
-    {
-        let no_update_needed_label = program.allocate_label();
-        program.emit_insn(Insn::Le {
-            lhs: insertion.key_register(),
-            rhs: r_seq,
-            target_pc: no_update_needed_label,
-            flags: Default::default(),
-            collation: None,
-        });
-
-        emit_update_sqlite_sequence(
-            &mut program,
-            resolver.schema,
-            seq_cursor_id,
-            r_seq_rowid,
-            table_name_reg,
-            insertion.key_register(),
-        )?;
-
-        program.preassign_label_to_next_insn(no_update_needed_label);
-        program.emit_insn(Insn::Close {
-            cursor_id: seq_cursor_id,
-        });
-    }
-
     // Emit update in the CDC table if necessary (after the INSERT updated the table)
     if let Some((cdc_cursor_id, _)) = &ctx.cdc_table {
         let cdc_has_after = program.capture_data_changes_mode().has_after();
@@ -592,7 +566,7 @@ pub fn translate_insert(
         )?;
     }
 
-    emit_epilogue(&mut program, &ctx, inserting_multiple_rows);
+    emit_epilogue(&mut program, resolver, &ctx, inserting_multiple_rows)?;
 
     program.set_needs_stmt_subtransactions(true);
     program.result_columns = result_columns;
@@ -600,7 +574,12 @@ pub fn translate_insert(
     Ok(program)
 }
 
-fn emit_epilogue(program: &mut ProgramBuilder, ctx: &InsertEmitCtx, inserting_multiple_rows: bool) {
+fn emit_epilogue(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    ctx: &InsertEmitCtx,
+    inserting_multiple_rows: bool,
+) -> Result<()> {
     if inserting_multiple_rows {
         if let Some(temp_table_ctx) = &ctx.temp_table_ctx {
             program.resolve_label(ctx.row_done_label, program.offset());
@@ -638,7 +617,52 @@ fn emit_epilogue(program: &mut ProgramBuilder, ctx: &InsertEmitCtx, inserting_mu
         });
     }
     program.preassign_label_to_next_insn(ctx.stmt_epilogue);
+
+    if let Some(AutoincMeta {
+        seq_cursor_id,
+        r_seq,
+        r_seq_rowid,
+        table_name_reg,
+        r_orig,
+    }) = ctx.autoincrement_meta
+    {
+        let skip_update_label = program.allocate_label();
+        program.emit_insn(Insn::Le {
+            lhs: r_seq,
+            rhs: r_orig,
+            target_pc: skip_update_label,
+            flags: Default::default(),
+            collation: None,
+        });
+
+        let seq_table = resolver
+            .schema
+            .get_btree_table(SQLITE_SEQUENCE_TABLE)
+            .expect("sqlite_sequence table to exist");
+        program.emit_insn(Insn::OpenWrite {
+            cursor_id: seq_cursor_id,
+            root_page: seq_table.root_page.into(),
+            db: 0,
+        });
+
+        emit_update_sqlite_sequence(
+            program,
+            resolver.schema,
+            seq_cursor_id,
+            r_seq_rowid,
+            table_name_reg,
+            r_seq,
+        )?;
+
+        program.emit_insn(Insn::Close {
+            cursor_id: seq_cursor_id,
+        });
+
+        program.preassign_label_to_next_insn(skip_update_label);
+    }
+
     program.resolve_label(ctx.halt_label, program.offset());
+    Ok(())
 }
 
 // COMMIT PHASE: no preflight jumps happened; emit the actual index writes now
@@ -768,72 +792,15 @@ fn translate_rows_and_open_tables(
 
 fn emit_rowid_generation(
     program: &mut ProgramBuilder,
-    resolver: &Resolver,
     ctx: &InsertEmitCtx,
     insertion: &Insertion,
 ) -> Result<()> {
-    if let Some(AutoincMeta {
-        r_seq,
-        seq_cursor_id,
-        r_seq_rowid,
-        table_name_reg,
-        ..
-    }) = ctx.autoincrement_meta
-    {
-        let r_max = program.alloc_register();
-
-        let dummy_reg = program.alloc_register();
-
+    if let Some(AutoincMeta { r_seq, .. }) = ctx.autoincrement_meta {
         program.emit_insn(Insn::NewRowid {
             cursor: ctx.cursor_id,
-            rowid_reg: dummy_reg,
-            prev_largest_reg: r_max,
+            rowid_reg: insertion.key_register(),
+            prev_largest_reg: r_seq,
         });
-
-        program.emit_insn(Insn::Copy {
-            src_reg: r_seq,
-            dst_reg: insertion.key_register(),
-            extra_amount: 0,
-        });
-        program.emit_insn(Insn::MemMax {
-            dest_reg: insertion.key_register(),
-            src_reg: r_max,
-        });
-
-        let no_overflow_label = program.allocate_label();
-        let max_i64_reg = program.alloc_register();
-        program.emit_insn(Insn::Integer {
-            dest: max_i64_reg,
-            value: i64::MAX,
-        });
-        program.emit_insn(Insn::Ne {
-            lhs: insertion.key_register(),
-            rhs: max_i64_reg,
-            target_pc: no_overflow_label,
-            flags: Default::default(),
-            collation: None,
-        });
-
-        program.emit_insn(Insn::Halt {
-            err_code: crate::error::SQLITE_FULL,
-            description: "database or disk is full".to_string(),
-        });
-
-        program.preassign_label_to_next_insn(no_overflow_label);
-
-        program.emit_insn(Insn::AddImm {
-            register: insertion.key_register(),
-            value: 1,
-        });
-
-        emit_update_sqlite_sequence(
-            program,
-            resolver.schema,
-            seq_cursor_id,
-            r_seq_rowid,
-            table_name_reg,
-            insertion.key_register(),
-        )?;
     } else {
         program.emit_insn(Insn::NewRowid {
             cursor: ctx.cursor_id,
@@ -901,26 +868,33 @@ fn init_autoincrement(
             crate::error::LimboError::InternalError("sqlite_sequence table not found".to_string())
         })?;
     let seq_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(seq_table.clone()));
-    program.emit_insn(Insn::OpenWrite {
+
+    program.emit_insn(Insn::OpenRead {
         cursor_id: seq_cursor_id,
-        root_page: seq_table.root_page.into(),
+        root_page: seq_table.root_page,
         db: 0,
     });
 
     let table_name_reg = program.emit_string8_new_reg(ctx.table.name.clone());
     let r_seq = program.alloc_register();
     let r_seq_rowid = program.alloc_register();
+    let r_orig = program.alloc_register();
 
     ctx.autoincrement_meta = Some(AutoincMeta {
         seq_cursor_id,
         r_seq,
         r_seq_rowid,
         table_name_reg,
+        r_orig,
     });
 
     program.emit_insn(Insn::Integer {
         dest: r_seq,
         value: 0,
+    });
+    program.emit_insn(Insn::Null {
+        dest: r_orig,
+        dest_end: None,
     });
     program.emit_insn(Insn::Null {
         dest: r_seq_rowid,
@@ -952,6 +926,12 @@ fn init_autoincrement(
         cursor_id: seq_cursor_id,
         dest: r_seq_rowid,
     });
+
+    program.emit_insn(Insn::Copy {
+        src_reg: r_seq,
+        dst_reg: r_orig,
+        extra_amount: 0,
+    });
     program.emit_insn(Insn::Goto {
         target_pc: loop_end_label,
     });
@@ -962,6 +942,11 @@ fn init_autoincrement(
         pc_if_next: loop_start_label,
     });
     program.preassign_label_to_next_insn(loop_end_label);
+
+    program.emit_insn(Insn::Close {
+        cursor_id: seq_cursor_id,
+    });
+
     Ok(())
 }
 
@@ -1439,6 +1424,7 @@ pub struct AutoincMeta {
     r_seq: usize,
     r_seq_rowid: usize,
     table_name_reg: usize,
+    r_orig: usize,
 }
 
 pub const ROWID_COLUMN: Column = Column::new(
@@ -2163,112 +2149,6 @@ fn translate_virtual_table_insert(
     Ok(program)
 }
 
-///  makes sure that an AUTOINCREMENT table has a sequence row in `sqlite_sequence`, inserting one with 0 if missing.
-fn ensure_sequence_initialized(
-    program: &mut ProgramBuilder,
-    schema: &Schema,
-    table: &schema::BTreeTable,
-) -> Result<()> {
-    let seq_table = schema.get_btree_table("sqlite_sequence").ok_or_else(|| {
-        crate::error::LimboError::InternalError("sqlite_sequence table not found".to_string())
-    })?;
-
-    let seq_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(seq_table.clone()));
-
-    program.emit_insn(Insn::OpenWrite {
-        cursor_id: seq_cursor_id,
-        root_page: seq_table.root_page.into(),
-        db: 0,
-    });
-
-    let table_name_reg = program.emit_string8_new_reg(table.name.clone());
-
-    let loop_start_label = program.allocate_label();
-    let entry_exists_label = program.allocate_label();
-    let insert_new_label = program.allocate_label();
-
-    program.emit_insn(Insn::Rewind {
-        cursor_id: seq_cursor_id,
-        pc_if_empty: insert_new_label,
-    });
-
-    program.preassign_label_to_next_insn(loop_start_label);
-
-    let name_col_reg = program.alloc_register();
-
-    program.emit_column_or_rowid(seq_cursor_id, 0, name_col_reg);
-
-    program.emit_insn(Insn::Eq {
-        lhs: table_name_reg,
-        rhs: name_col_reg,
-        target_pc: entry_exists_label,
-        flags: Default::default(),
-        collation: None,
-    });
-
-    program.emit_insn(Insn::Next {
-        cursor_id: seq_cursor_id,
-        pc_if_next: loop_start_label,
-    });
-
-    program.preassign_label_to_next_insn(insert_new_label);
-
-    let record_reg = program.alloc_register();
-    let record_start_reg = program.alloc_registers(2);
-    let zero_reg = program.alloc_register();
-
-    program.emit_insn(Insn::Integer {
-        dest: zero_reg,
-        value: 0,
-    });
-
-    program.emit_insn(Insn::Copy {
-        src_reg: table_name_reg,
-        dst_reg: record_start_reg,
-        extra_amount: 0,
-    });
-
-    program.emit_insn(Insn::Copy {
-        src_reg: zero_reg,
-        dst_reg: record_start_reg + 1,
-        extra_amount: 0,
-    });
-
-    let affinity_str = seq_table
-        .columns
-        .iter()
-        .map(|c| c.affinity().aff_mask())
-        .collect();
-
-    program.emit_insn(Insn::MakeRecord {
-        start_reg: record_start_reg,
-        count: 2,
-        dest_reg: record_reg,
-        index_name: None,
-        affinity_str: Some(affinity_str),
-    });
-
-    let new_rowid_reg = program.alloc_register();
-    program.emit_insn(Insn::NewRowid {
-        cursor: seq_cursor_id,
-        rowid_reg: new_rowid_reg,
-        prev_largest_reg: 0,
-    });
-    program.emit_insn(Insn::Insert {
-        cursor: seq_cursor_id,
-        key_reg: new_rowid_reg,
-        record_reg,
-        flag: InsertFlags::new(),
-        table_name: "sqlite_sequence".to_string(),
-    });
-
-    program.preassign_label_to_next_insn(entry_exists_label);
-    program.emit_insn(Insn::Close {
-        cursor_id: seq_cursor_id,
-    });
-
-    Ok(())
-}
 #[inline]
 /// Build the UNIQUE constraint error description to match sqlite
 /// single column: `t.c1`
@@ -2535,7 +2415,7 @@ fn emit_update_sqlite_sequence(
         cursor: seq_cursor_id,
         key_reg: r_seq_rowid,
         record_reg,
-        flag: InsertFlags(turso_parser::ast::ResolveType::Replace.bit_value() as u8),
+        flag: InsertFlags(Replace.bit_value() as u8).require_seek(),
         table_name: "sqlite_sequence".to_string(),
     });
 
