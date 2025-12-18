@@ -35,48 +35,23 @@ fn test_simple_overflow_page(tmp_db: TempDatabase) -> anyhow::Result<()> {
 
     let list_query = "SELECT * FROM test LIMIT 1";
     let insert_query = format!("INSERT INTO test VALUES (1, '{}')", huge_text.as_str());
-
-    match conn.query(insert_query) {
-        Ok(Some(ref mut rows)) => loop {
-            match rows.step()? {
-                StepResult::IO => {
-                    rows.run_once()?;
-                }
-                StepResult::Done => break,
-                _ => unreachable!(),
-            }
-        },
-        Ok(None) => {}
-        Err(err) => {
-            eprintln!("{err}");
-        }
-    };
+    conn.execute(&insert_query).unwrap();
 
     // this flush helped to review hex of test.db
     do_flush(&conn, &tmp_db)?;
 
     match conn.query(list_query) {
-        Ok(Some(ref mut rows)) => loop {
-            match rows.step()? {
-                StepResult::Row => {
-                    let row = rows.row().unwrap();
-                    let id = row.get::<i64>(0).unwrap();
-                    let text = row.get::<&str>(0).unwrap();
-                    assert_eq!(1, id);
-                    compare_string(&huge_text, text);
-                }
-                StepResult::IO => {
-                    rows.run_once()?;
-                }
-                StepResult::Interrupt => break,
-                StepResult::Done => break,
-                StepResult::Busy => unreachable!(),
-            }
-        },
-        Ok(None) => {}
-        Err(err) => {
-            eprintln!("{err}");
+        Ok(Some(ref mut rows)) => {
+            rows.run_with_row_callback(|row| {
+                let id = row.get::<i64>(0).unwrap();
+                let text = row.get::<&str>(0).unwrap();
+                assert_eq!(1, id);
+                compare_string(&huge_text, text);
+                Ok(())
+            })?;
         }
+        Ok(None) => {}
+        Err(err) => return Err(anyhow::anyhow!(err)),
     }
     do_flush(&conn, &tmp_db)?;
     Ok(())
@@ -100,48 +75,26 @@ fn test_sequential_overflow_page(tmp_db: TempDatabase) -> anyhow::Result<()> {
 
     for (i, huge_text) in huge_texts.iter().enumerate().take(iterations) {
         let insert_query = format!("INSERT INTO test VALUES ({}, '{}')", i, huge_text.as_str());
-        match conn.query(insert_query) {
-            Ok(Some(ref mut rows)) => loop {
-                match rows.step()? {
-                    StepResult::IO => {
-                        rows.run_once()?;
-                    }
-                    StepResult::Done => break,
-                    _ => unreachable!(),
-                }
-            },
-            Ok(None) => {}
-            Err(err) => {
-                eprintln!("{err}");
-            }
-        };
+        conn.execute(&insert_query)?;
     }
 
     let list_query = "SELECT * FROM test LIMIT 1";
     let mut current_index = 0;
     match conn.query(list_query) {
-        Ok(Some(ref mut rows)) => loop {
-            match rows.step()? {
-                StepResult::Row => {
-                    let row = rows.row().unwrap();
-                    let id = row.get::<i64>(0).unwrap();
-                    let text = row.get::<String>(1).unwrap();
-                    let huge_text = &huge_texts[current_index];
-                    compare_string(huge_text, text);
-                    assert_eq!(current_index, id as usize);
-                    current_index += 1;
-                }
-                StepResult::IO => {
-                    rows.run_once()?;
-                }
-                StepResult::Interrupt => break,
-                StepResult::Done => break,
-                StepResult::Busy => unreachable!(),
-            }
-        },
+        Ok(Some(ref mut rows)) => {
+            rows.run_with_row_callback(|row| {
+                let id = row.get::<i64>(0).unwrap();
+                let text = row.get::<String>(1).unwrap();
+                let huge_text = &huge_texts[current_index];
+                compare_string(huge_text, text);
+                assert_eq!(current_index, id as usize);
+                current_index += 1;
+                Ok(())
+            })?;
+        }
         Ok(None) => {}
         Err(err) => {
-            eprintln!("{err}");
+            return Err(anyhow::anyhow!(err));
         }
     }
     do_flush(&conn, &tmp_db)?;
@@ -226,7 +179,6 @@ fn test_statement_reset(tmp_db: TempDatabase) -> anyhow::Result<()> {
     conn.execute("insert into test values (2)")?;
 
     let mut stmt = conn.prepare("select * from test")?;
-
     loop {
         match stmt.step()? {
             StepResult::Row => {
@@ -237,7 +189,7 @@ fn test_statement_reset(tmp_db: TempDatabase) -> anyhow::Result<()> {
                 );
                 break;
             }
-            StepResult::IO => stmt.run_once()?,
+            StepResult::IO => stmt._io().step()?,
             _ => break,
         }
     }
@@ -254,7 +206,7 @@ fn test_statement_reset(tmp_db: TempDatabase) -> anyhow::Result<()> {
                 );
                 break;
             }
-            StepResult::IO => stmt.run_once()?,
+            StepResult::IO => stmt._io().step()?,
             _ => break,
         }
     }
@@ -1034,14 +986,14 @@ pub fn concurrent_reads_over_single_connection(limbo: TempDatabase) {
                     match stmt2.step().unwrap() {
                         StepResult::Row => rows += 1,
                         StepResult::Done => break,
-                        StepResult::IO => stmt2.run_once().unwrap(),
+                        StepResult::IO => stmt2._io().step().unwrap(),
                         r => panic!("unexpected step result: {r:?}"),
                     }
                 }
                 assert_eq!(rows, 3);
             }
             StepResult::Done => break,
-            StepResult::IO => stmt1.run_once().unwrap(),
+            StepResult::IO => stmt1._io().step().unwrap(),
             r => panic!("unexpected step result: {r:?}"),
         }
     }
@@ -1065,7 +1017,7 @@ pub fn concurrent_commit_and_insert_over_single_connection(limbo: TempDatabase) 
                 loop {
                     match stmt2.step() {
                         Ok(StepResult::Done) => break,
-                        Ok(StepResult::IO) => stmt2.run_once().unwrap(),
+                        Ok(StepResult::IO) => stmt2._io().step().unwrap(),
                         Ok(StepResult::Busy) => {
                             busy = true;
                             break;
@@ -1076,7 +1028,7 @@ pub fn concurrent_commit_and_insert_over_single_connection(limbo: TempDatabase) 
                 assert!(busy);
             }
             StepResult::Done => break,
-            StepResult::IO => stmt1.run_once().unwrap(),
+            StepResult::IO => stmt1._io().step().unwrap(),
             r => panic!("unexpected step result: {r:?}"),
         }
     }
@@ -1105,7 +1057,7 @@ pub fn concurrent_rollback_and_insert_over_single_connection(limbo: TempDatabase
                 loop {
                     match stmt2.step() {
                         Ok(StepResult::Done) => break,
-                        Ok(StepResult::IO) => stmt2.run_once().unwrap(),
+                        Ok(StepResult::IO) => stmt2._io().step().unwrap(),
                         Ok(StepResult::Busy) => {
                             busy = true;
                             break;
@@ -1116,7 +1068,7 @@ pub fn concurrent_rollback_and_insert_over_single_connection(limbo: TempDatabase
                 assert!(busy);
             }
             StepResult::Done => break,
-            StepResult::IO => stmt1.run_once().unwrap(),
+            StepResult::IO => stmt1._io().step().unwrap(),
             r => panic!("unexpected step result: {r:?}"),
         }
     }

@@ -140,36 +140,22 @@ fn test_transaction_visibility(tmp_db: TempDatabase) {
         .unwrap();
 
     let mut stmt = conn2.query("SELECT COUNT(*) FROM test").unwrap().unwrap();
-    loop {
-        match stmt.step().unwrap() {
-            StepResult::Row => {
-                let row = stmt.row().unwrap();
-                assert_eq!(*row.get::<&Value>(0).unwrap(), Value::Integer(1));
-            }
-            StepResult::IO => stmt.run_once().unwrap(),
-            StepResult::Done => break,
-            StepResult::Busy => panic!("database is busy"),
-            StepResult::Interrupt => panic!("interrupted"),
-        }
-    }
+    stmt.run_with_row_callback(|row| {
+        assert_eq!(*row.get::<&Value>(0).unwrap(), Value::Integer(1));
+        Ok(())
+    })
+    .unwrap();
 
     conn1
         .execute("CREATE TABLE test2 (id INTEGER PRIMARY KEY, value TEXT)")
         .unwrap();
 
     let mut stmt = conn2.query("SELECT COUNT(*) FROM test2").unwrap().unwrap();
-    loop {
-        match stmt.step().unwrap() {
-            StepResult::Row => {
-                let row = stmt.row().unwrap();
-                assert_eq!(*row.get::<&Value>(0).unwrap(), Value::Integer(0));
-            }
-            StepResult::IO => stmt.run_once().unwrap(),
-            StepResult::Done => break,
-            StepResult::Busy => panic!("database is busy"),
-            StepResult::Interrupt => panic!("interrupted"),
-        }
-    }
+    stmt.run_with_row_callback(|row| {
+        assert_eq!(*row.get::<&Value>(0).unwrap(), Value::Integer(0));
+        Ok(())
+    })
+    .unwrap();
 }
 
 #[turso_macros::test]
@@ -707,39 +693,19 @@ fn test_non_mvcc_to_mvcc() {
 
 fn helper_read_all_rows(mut stmt: turso_core::Statement) -> Vec<Vec<Value>> {
     let mut ret = Vec::new();
-    loop {
-        match stmt.step().unwrap() {
-            StepResult::Row => {
-                ret.push(stmt.row().unwrap().get_values().cloned().collect());
-            }
-            StepResult::IO => stmt.run_once().unwrap(),
-            StepResult::Done => break,
-            StepResult::Busy => panic!("database is busy"),
-            StepResult::Interrupt => panic!("interrupted"),
-        }
-    }
+    stmt.run_with_row_callback(|row| {
+        ret.push(row.get_values().cloned().collect());
+        Ok(())
+    })
+    .unwrap();
+
     ret
 }
 
 fn helper_read_single_row(mut stmt: turso_core::Statement) -> Vec<Value> {
-    let mut read_count = 0;
-    let mut ret = None;
-    loop {
-        match stmt.step().unwrap() {
-            StepResult::Row => {
-                assert_eq!(read_count, 0);
-                read_count += 1;
-                let row = stmt.row().unwrap();
-                ret = Some(row.get_values().cloned().collect());
-            }
-            StepResult::IO => stmt.run_once().unwrap(),
-            StepResult::Done => break,
-            StepResult::Busy => panic!("database is busy"),
-            StepResult::Interrupt => panic!("interrupted"),
-        }
-    }
+    let ret = stmt.run_one_step_blocking(|| Ok(()), || Ok(())).unwrap();
 
-    ret.unwrap()
+    ret.map(|row| row.get_values().cloned().collect()).unwrap()
 }
 
 // Helper function to verify table contents

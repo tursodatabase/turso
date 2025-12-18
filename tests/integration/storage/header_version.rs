@@ -789,20 +789,7 @@ fn open_with_limbo_readonly_and_check(db_path: &Path, enable_mvcc: bool) -> (u8,
 
     // Do a simple query to ensure everything is initialized
     if let Some(mut stmt) = conn.query("SELECT 1").unwrap() {
-        loop {
-            let result = stmt.step().unwrap();
-            match result {
-                turso_core::StepResult::Row => {
-                    let _row = stmt.row().unwrap();
-                }
-                turso_core::StepResult::IO => {
-                    stmt.run_once().unwrap();
-                    continue;
-                }
-                turso_core::StepResult::Done => break,
-                r => panic!("unexpected result {r:?}: expecting single row"),
-            }
-        }
+        stmt.run_with_row_callback(|_| Ok(())).unwrap();
     }
 
     // Drop connection and database
@@ -1009,19 +996,11 @@ fn test_readonly_mvcc_db_can_be_read() {
         .prepare("SELECT val FROM t WHERE val = 'mvcc_readonly_test'")
         .unwrap();
     let mut found = false;
-    loop {
-        match stmt.step().unwrap() {
-            turso_core::StepResult::Row => {
-                found = true;
-            }
-            turso_core::StepResult::IO => {
-                stmt.run_once().unwrap();
-                continue;
-            }
-            turso_core::StepResult::Done => break,
-            r => panic!("unexpected result {r:?}"),
-        }
-    }
+    stmt.run_with_row_callback(|_| {
+        found = true;
+        Ok(())
+    })
+    .unwrap();
     assert!(found, "Should be able to read MVCC data in readonly mode");
 
     drop(conn);
