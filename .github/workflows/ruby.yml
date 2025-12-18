@@ -39,6 +39,10 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Install LLVM 19
+        if: runner.os == 'Windows'
+        run: choco install llvm --version=19.1.7 --allow-downgrade -y
+
       - uses: oxidize-rb/actions/setup-ruby-and-rust@v1
         with:
           ruby-version: ${{ matrix.ruby-version }}
