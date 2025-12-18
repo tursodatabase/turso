@@ -44,8 +44,8 @@ use crate::{
     vdbe::{
         execute::{
             OpColumnState, OpDeleteState, OpDeleteSubState, OpDestroyState, OpIdxInsertState,
-            OpInsertState, OpInsertSubState, OpNewRowidState, OpNoConflictState, OpProgramState,
-            OpRowIdState, OpSeekState, OpTransactionState,
+            OpInsertState, OpInsertSubState, OpJournalModeState, OpNewRowidState,
+            OpNoConflictState, OpProgramState, OpRowIdState, OpSeekState, OpTransactionState,
         },
         hash_table::HashTable,
         metrics::StatementMetrics,
@@ -375,6 +375,7 @@ pub struct ProgramState {
     op_column_state: OpColumnState,
     op_row_id_state: OpRowIdState,
     op_transaction_state: OpTransactionState,
+    op_journal_mode_state: OpJournalModeState,
     /// State machine for committing view deltas with I/O handling
     view_delta_state: ViewDeltaCommitState,
     /// Marker which tells about auto transaction cleanup necessary for that connection in case of reset
@@ -456,6 +457,7 @@ impl ProgramState {
             op_column_state: OpColumnState::Start,
             op_row_id_state: OpRowIdState::Start,
             op_transaction_state: OpTransactionState::Start,
+            op_journal_mode_state: OpJournalModeState::default(),
             view_delta_state: ViewDeltaCommitState::NotStarted,
             auto_txn_cleanup: TxnCleanup::None,
             fk_deferred_violations_when_stmt_started: AtomicIsize::new(0),
