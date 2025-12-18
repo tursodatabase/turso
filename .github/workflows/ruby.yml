@@ -27,7 +27,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [blacksmith-4vcpu-ubuntu-2404, macos-latest, windows-latest]
+        os: [blacksmith-4vcpu-ubuntu-2404, macos-latest, windows-2025]
         ruby-version: ['3.2', '3.3']
     runs-on: ${{ matrix.os }}
 
