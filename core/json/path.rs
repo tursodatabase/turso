@@ -286,7 +286,7 @@ fn handle_array_index(
                 *index_buffer as u32,
                 ch.1.to_digit(10).ok_or_else(|| {
                     crate::LimboError::ParseError(format!("failed to parse digit: {ch}", ch = ch.1))
-                })? as u32,
+                })?,
             );
             *index_buffer = new_num as i128;
         }
@@ -295,7 +295,7 @@ fn handle_array_index(
                 *index_buffer as u32,
                 ch.1.to_digit(10).ok_or_else(|| {
                     crate::LimboError::ParseError(format!("failed to parse digit: {ch}", ch = ch.1))
-                })? as u32,
+                })?,
             );
             *index_buffer = new_num as i128;
         }

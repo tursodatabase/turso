@@ -498,7 +498,7 @@ where
                 Err(e) => Err(e),
             }
         } else {
-            return Ok((null, ElementType::NULL));
+            Ok((null, ElementType::NULL))
         }
     } else {
         let mut json = value;
@@ -635,10 +635,7 @@ fn json_path_from_db_value<'a>(
     let path = path.as_value_ref();
     let json_path = if strict {
         match path {
-            ValueRef::Text(t) => match json_path(t.as_str()) {
-                Ok(p) => p,
-                Err(e) => return Err(e),
-            },
+            ValueRef::Text(t) => json_path(t.as_str())?,
             ValueRef::Null => return Ok(None),
             _ => crate::bail_constraint_error!("JSON path error near: {:?}", path.to_string()),
         }
@@ -646,10 +643,7 @@ fn json_path_from_db_value<'a>(
         match path {
             ValueRef::Text(t) => {
                 if t.as_str().starts_with("$") {
-                    match json_path(t.as_str()) {
-                        Ok(p) => p,
-                        Err(e) => return Err(e),
-                    }
+                    json_path(t.as_str())?
                 } else {
                     JsonPath {
                         elements: vec![
