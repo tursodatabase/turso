@@ -9,7 +9,7 @@ import { randomSeed } from "./random";
 // Configuration from environment variables
 const SLEEP_BETWEEN_RUNS_SECONDS = Number.isInteger(Number(process.env.SLEEP_BETWEEN_RUNS_SECONDS)) ? Number(process.env.SLEEP_BETWEEN_RUNS_SECONDS) : 0;
 const TIME_LIMIT_MINUTES = Number.isInteger(Number(process.env.TIME_LIMIT_MINUTES)) ? Number(process.env.TIME_LIMIT_MINUTES) : 24 * 60;
-const PER_RUN_TIMEOUT_SECONDS = Number.isInteger(Number(process.env.PER_RUN_TIMEOUT_SECONDS)) ? Number(process.env.PER_RUN_TIMEOUT_SECONDS) : 10 * 60;
+const PER_RUN_TIMEOUT_SECONDS = Number.isInteger(Number(process.env.PER_RUN_TIMEOUT_SECONDS)) ? Number(process.env.PER_RUN_TIMEOUT_SECONDS) : 20 * 60;
 const LOG_TO_STDOUT = process.env.LOG_TO_STDOUT === "true";
 
 const github = new GithubClient();
