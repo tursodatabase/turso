@@ -510,4 +510,13 @@ impl Statement {
     pub fn is_busy(&self) -> bool {
         self.busy
     }
+
+    /// Internal method to get IO from a statement.
+    /// Used by select internal crate
+    ///
+    /// Avoid using this method for advancing IO while iteration over `step`.
+    /// Prefer to use helper methods instead such as [Self::run_with_row_callback]
+    pub fn _io(&self) -> &dyn crate::IO {
+        self.pager.io.as_ref()
+    }
 }
