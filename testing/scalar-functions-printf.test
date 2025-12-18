@@ -1,0 +1,291 @@
+#!/usr/bin/env tclsh
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+
+# Basic string formatting
+do_execsql_test printf-basic-string {
+  SELECT printf('Hello World!');
+} {{Hello World!}}
+
+do_execsql_test printf-string-replacement {
+  SELECT printf('Hello, %s', 'Alice');
+} {{Hello, Alice}}
+
+do_execsql_test printf-string-substitution {
+  SELECT printf('Hello, %s!', 'World');
+} {{Hello, World!}}
+
+do_execsql_test printf-multiple-strings {
+  SELECT printf('%s %s!', 'Hello', 'World');
+} {{Hello World!}}
+
+do_execsql_test printf-null-string {
+  SELECT printf('Hello, %s!', NULL);
+} {{Hello, !}}
+
+do_execsql_test printf-integer-as-string {
+  SELECT printf('Value: %s', 42);
+} {{Value: 42}}
+
+do_execsql_test printf-percent-escape {
+  SELECT printf('100%% complete');
+} {{100% complete}}
+
+
+# Integer formatting
+
+do_execsql_test printf-integer-replacement {
+  SELECT printf('Number: %d', 42);
+} {{Number: 42}}
+
+do_execsql_test printf-integer-negative {
+  SELECT printf('Number: %d', -42);
+} {{Number: -42}}
+
+do_execsql_test printf-integer-arithmetic-expression {
+  SELECT printf('%d + %d = %d', 2, 3, 5);
+} {{2 + 3 = 5}}
+
+do_execsql_test printf-text-as-integer {
+  SELECT printf('Number: %d', 'not a number');
+} {{Number: 0}}
+
+
+# Unsigned integer formatting
+
+do_execsql_test printf-unsigned-basic {
+  SELECT printf('Number: %u', 42);
+} {{Number: 42}}
+
+do_execsql_test printf-unsigned-arithmetic-expression {
+  SELECT printf('%u + %u = %u', 2, 3, 5);
+} {{2 + 3 = 5}}
+
+do_execsql_test printf-unsigned-negative {
+  SELECT printf('Negative: %u', -1);
+} {{Negative: 18446744073709551615}}
+
+do_execsql_test printf-text-as-unsigned {
+  SELECT printf('NaN: %u', 'not a number');
+} {{NaN: 0}}
+
+
+# Float formatting
+
+do_execsql_test printf-float-basic {
+  SELECT printf('Number: %f', 42.5);
+} {{Number: 42.500000}}
+
+do_execsql_test printf-float-negative {
+  SELECT printf('Number: %f', -42.5);
+} {{Number: -42.500000}}
+
+do_execsql_test printf-integer-as-float {
+  SELECT printf('Number: %f', 42);
+} {{Number: 42.000000}}
+
+do_execsql_test printf-float-arithmetic {
+  SELECT printf('%f + %f = %f', 2.5, 3.5, 6.0);
+} {{2.500000 + 3.500000 = 6.000000}}
+
+do_execsql_test printf-text-as-float {
+  SELECT printf('Number: %f', 'not a number');
+} {{Number: 0.000000}}
+
+
+# Character formatting
+
+do_execsql_test printf-char-single {
+  SELECT printf('character: %c', 'a');
+} {{character: a}}
+
+do_execsql_test printf-char-first-from-string {
+  SELECT printf('character: %c', 'this is a test');
+} {{character: t}}
+
+do_execsql_test printf-char-empty-string {
+  SELECT printf('character: %c', '');
+} {{character: }}
+
+do_execsql_test printf-char-from-integer {
+  SELECT printf('character: %c', 123);
+} {{character: 1}}
+
+do_execsql_test printf-char-from-float {
+  SELECT printf('character: %c', 42.5);
+} {{character: 4}}
+
+
+# Exponential notation formatting
+
+do_execsql_test printf-exp-large-number {
+  SELECT printf('Exp: %e', 23000000.0);
+} {{Exp: 2.300000e+07}}
+
+do_execsql_test printf-exp-negative-large {
+  SELECT printf('Exp: %e', -23000000.0);
+} {{Exp: -2.300000e+07}}
+
+do_execsql_test printf-exp-decimal-float {
+  SELECT printf('Exp: %e', 250.375);
+} {{Exp: 2.503750e+02}}
+
+do_execsql_test printf-exp-small-positive {
+  SELECT printf('Exp: %e', 0.0003235);
+} {{Exp: 3.235000e-04}}
+
+do_execsql_test printf-exp-zero {
+  SELECT printf('Exp: %e', 0.0);
+} {{Exp: 0.000000e+00}}
+
+do_execsql_test printf-exp-small-positive-duplicate {
+  SELECT printf('Exp: %e', 0.0003235);
+} {{Exp: 3.235000e-04}}
+
+do_execsql_test printf-exp-string-integer {
+  SELECT printf('Exp: %e', '123');
+} {{Exp: 1.230000e+02}}
+
+do_execsql_test printf-exp-string-float {
+  SELECT printf('Exp: %e', '123.45');
+} {{Exp: 1.234500e+02}}
+
+do_execsql_test printf-exp-string-leading-zeros {
+  SELECT printf('Exp: %e', '00123');
+} {{Exp: 1.230000e+02}}
+
+do_execsql_test printf-exp-string-text {
+  SELECT printf('Exp: %e', 'test');
+} {{Exp: 0.000000e+00}}
+
+do_execsql_test printf-exp-string-number-suffix {
+  SELECT printf('Exp: %e', '123ab');
+} {{Exp: 1.230000e+02}}
+
+do_execsql_test printf-exp-string-text-prefix {
+  SELECT printf('Exp: %e', 'ab123');
+} {{Exp: 0.000000e+00}}
+
+do_execsql_test printf-exp-string-exponential {
+  SELECT printf('Exp: %e', '1.230000e+02');
+} {{Exp: 1.230000e+02}}
+
+
+# hexadecimal formatting
+
+do_execsql_test printf-hex-simple {
+  SELECT printf('hex: %x', 4);
+} {{hex: 4}}
+
+do_execsql_test printf-hex-large-number {
+  SELECT printf('hex: %x', 15565303546);
+} {{hex: 39fc3aefa}}
+
+do_execsql_test printf-hex-uppercase {
+  SELECT printf('hex: %X', 15565303546);
+} {{hex: 39FC3AEFA}}
+
+do_execsql_test printf-hex-negative {
+  SELECT printf('hex: %x', -15565303546);
+} {{hex: fffffffc603c5106}}
+
+do_execsql_test printf-hex-float {
+  SELECT printf('hex: %x', 42.5);
+} {{hex: 2a}}
+
+do_execsql_test printf-hex-negative-float {
+  SELECT printf('hex: %x', -42.5);
+} {{hex: ffffffffffffffd6}}
+
+do_execsql_test printf-hex-text {
+  SELECT printf('hex: %x', '42');
+} {{hex: 2a}}
+
+do_execsql_test printf-hex-empty-text {
+  SELECT printf('hex: %x', '');
+} {{hex: 0}}
+
+
+# octal formatting
+
+do_execsql_test printf-octal-simple {
+  SELECT printf('octal: %o', 4);
+} {{octal: 4}}
+
+do_execsql_test printf-octal-large-number {
+  SELECT printf('octal: %o', 15565303546);
+} {{octal: 163760727372}}
+
+do_execsql_test printf-octal-negative {
+  SELECT printf('octal: %o', -15565303546);
+} {{octal: 1777777777614017050406}}
+
+do_execsql_test printf-octal-float {
+  SELECT printf('octal: %o', 42.5);
+} {{octal: 52}}
+
+do_execsql_test printf-octal-negative-float {
+  SELECT printf('octal: %o', -42.5);
+} {{octal: 1777777777777777777726}}
+
+do_execsql_test printf-octal-text {
+  SELECT printf('octal: %o', '42');
+} {{octal: 52}}
+
+do_execsql_test printf-octal-empty-text {
+  SELECT printf('octal: %o', '');
+} {{octal: 0}}
+
+
+# mixed formatting
+
+do_execsql_test printf-mixed-string-integer {
+  SELECT printf('%s: %d', 'Count', 42);
+} {{Count: 42}}
+
+do_execsql_test printf-mixed-all-types {
+  SELECT printf('%s: %d (%f%%)', 'Progress', 75, 75.5);
+} {{Progress: 75 (75.500000%)}}
+
+do_execsql_test printf-mixed-complex-format {
+  SELECT printf('Name: %s, ID: %d, Score: %f', 'John', 123, 95.5);
+} {{Name: John, ID: 123, Score: 95.500000}}
+
+do_execsql_test printf-mixed-string-exponential {
+  SELECT printf('Scientific: %s = %e', 'Large number', 123000.0);
+} {{Scientific: Large number = 1.230000e+05}}
+
+do_execsql_test printf-mixed-integer-octal {
+  SELECT printf('Decimal %d is octal %o', 64, 64);
+} {{Decimal 64 is octal 100}}
+
+do_execsql_test printf-mixed-exponential-float {
+  SELECT printf('Scientific %e equals %f', 0.00123, 0.00123);
+} {{Scientific 1.230000e-03 equals 0.001230}}
+
+do_execsql_test printf-mixed-string-octal {
+  SELECT printf('Permission %s: %o', 'rwx', 755);
+} {{Permission rwx: 1363}}
+
+do_execsql_test printf-mixed-exponential-integer {
+  SELECT printf('Value %e as integer %d', 42.7, 42);
+} {{Value 4.270000e+01 as integer 42}}
+
+do_execsql_test printf-mixed-octal-hex {
+  SELECT printf('Octal %o is hex %x', 255, 255);
+} {{Octal 377 is hex ff}}
+
+# width formatting for integers
+
+do_execsql_test printf-width-integer-basic {
+  SELECT printf('Number: %5d', 42);
+} {{Number:    42}}
+
+do_execsql_test printf-width-integer-exact {
+  SELECT printf('Number: %3d', 123);
+} {{Number: 123}}
+
+do_execsql_test printf-width-integer-smaller {
+  SELECT printf('Number: %2d', 12345);
+} {{Number: 12345}}

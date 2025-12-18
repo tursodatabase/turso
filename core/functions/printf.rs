@@ -77,23 +77,50 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
             continue;
         }
 
-        match chars.next() {
-            Some('%') => {
-                result.push('%');
-                continue;
+        // Check for %% escape
+        if let Some(&'%') = chars.peek() {
+            chars.next(); // consume the second %
+            result.push('%');
+            continue;
+        }
+
+        // Parse width (if present)
+        let mut width = None;
+        let mut width_str = String::new();
+        while let Some(&c) = chars.peek() {
+            if c.is_ascii_digit() {
+                width_str.push(c);
+                chars.next();
+            } else {
+                break;
             }
+        }
+        if !width_str.is_empty() {
+            width = width_str.parse().ok();
+        }
+
+        // Get format type and handle
+        match chars.next() {
             Some('d') | Some('i') => {
                 if args_index >= values.len() {
                     return Err(LimboError::InvalidArgument("not enough arguments".into()));
                 }
                 let value = &values[args_index].get_value();
-                match value {
-                    Value::Integer(i) => result.push_str(&i.to_string()),
-                    Value::Float(f) => {
-                        let truncated_val = *f as i64;
-                        result.push_str(&truncated_val.to_string());
+                let int_str = match value {
+                    Value::Integer(i) => i.to_string(),
+                    Value::Float(f) => (*f as i64).to_string(),
+                    _ => "0".to_string(),
+                };
+                
+                // Apply width formatting if specified
+                if let Some(w) = width {
+                    if w > int_str.len() {
+                        result.push_str(&format!("{:>width$}", int_str, width = w));
+                    } else {
+                        result.push_str(&int_str);
                     }
-                    _ => result.push('0'),
+                } else {
+                    result.push_str(&int_str);
                 }
                 args_index += 1;
             }
