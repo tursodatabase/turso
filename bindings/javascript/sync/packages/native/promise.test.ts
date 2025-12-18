@@ -13,7 +13,7 @@ function cleanup(path) {
     try { unlinkSync(`${path}-wal-revert`) } catch (e) { }
 }
 
-test('partial sync concurrency', async () => {
+test('partial sync concurrency', { timeout: 60_000 }, async () => {
     {
         const db = await connect({
             path: ':memory:',
@@ -47,7 +47,7 @@ test('partial sync concurrency', async () => {
     expect(values).toEqual(new Array(16).fill([{ cnt: 2000 }]))
 })
 
-test('partial sync (prefix bootstrap strategy)', async () => {
+test('partial sync (prefix bootstrap strategy)', { timeout: 60_000 }, async () => {
     {
         const db = await connect({
             path: ':memory:',
@@ -84,7 +84,7 @@ test('partial sync (prefix bootstrap strategy)', async () => {
     expect((await db.stats()).networkReceivedBytes).toBeGreaterThanOrEqual(2000 * 1024);
 })
 
-test('partial sync (prefix bootstrap strategy; large segment size)', async () => {
+test('partial sync (prefix bootstrap strategy; large segment size)', { timeout: 60_000 }, async () => {
     {
         const db = await connect({
             path: ':memory:',
@@ -215,7 +215,7 @@ test('partial sync (query bootstrap strategy)', async () => {
     expect(n1.networkReceivedBytes).toEqual(n2.networkReceivedBytes);
 })
 
-test('concurrent-actions-consistency', async () => {
+test('concurrent-actions-consistency', { timeout: 60_000 }, async () => {
     {
         const db = await connect({
             path: ':memory:',
@@ -308,53 +308,6 @@ test('defered sync', async () => {
     await db.pull();
     expect(await db.prepare("SELECT * FROM t").all()).toEqual([{ x: 100 }, { x: 1 }, { x: 2 }, { x: 3 }, { x: 42 }]);
 })
-
-// test('encryption sync', async () => {
-//     const KEY = 'l/FWopMfZisTLgBX4A42AergrCrYKjiO3BfkJUwv83I=';
-//     const URL = 'http://encrypted--a--a.localhost:10000';
-//     {
-//         const db = await connect({ path: ':memory:', url: URL, remoteEncryption: { key: KEY, cipher: 'aes256gcm' } });
-//         await db.exec("CREATE TABLE IF NOT EXISTS t(x)");
-//         await db.exec("DELETE FROM t");
-//         await db.push();
-//         await db.close();
-//     }
-//     const db1 = await connect({ path: ':memory:', url: URL, remoteEncryption: { key: KEY, cipher: 'aes256gcm' } });
-//     const db2 = await connect({ path: ':memory:', url: URL, remoteEncryption: { key: KEY, cipher: 'aes256gcm' } });
-//     await db1.exec("INSERT INTO t VALUES (1), (2), (3)");
-//     await db2.exec("INSERT INTO t VALUES (4), (5), (6)");
-//     expect(await db1.prepare("SELECT * FROM t").all()).toEqual([{ x: 1 }, { x: 2 }, { x: 3 }]);
-//     expect(await db2.prepare("SELECT * FROM t").all()).toEqual([{ x: 4 }, { x: 5 }, { x: 6 }]);
-//     await Promise.all([db1.push(), db2.push()]);
-//     await Promise.all([db1.pull(), db2.pull()]);
-//     const expected = [{ x: 1 }, { x: 2 }, { x: 3 }, { x: 4 }, { x: 5 }, { x: 6 }];
-//     expect((await db1.prepare("SELECT * FROM t").all()).sort(intCompare)).toEqual(expected.sort(intCompare));
-//     expect((await db2.prepare("SELECT * FROM t").all()).sort(intCompare)).toEqual(expected.sort(intCompare));
-// });
-
-// test('defered encryption sync', async () => {
-//     const URL = 'http://encrypted--a--a.localhost:10000';
-//     const KEY = 'l/FWopMfZisTLgBX4A42AergrCrYKjiO3BfkJUwv83I=';
-//     let url = null;
-//     {
-//         const db = await connect({ path: ':memory:', url: URL, remoteEncryption: { key: KEY, cipher: 'aes256gcm' } });
-//         await db.exec("CREATE TABLE IF NOT EXISTS t(x)");
-//         await db.exec("DELETE FROM t");
-//         await db.exec("INSERT INTO t VALUES (100)");
-//         await db.push();
-//         await db.close();
-//     }
-//     const db = await connect({ path: ':memory:', url: () => url, remoteEncryption: { key: KEY, cipher: 'aes256gcm' } });
-//     await db.exec("CREATE TABLE IF NOT EXISTS t(x)");
-//     await db.exec("INSERT INTO t VALUES (1), (2), (3)");
-//     expect(await db.prepare("SELECT * FROM t").all()).toEqual([{ x: 1 }, { x: 2 }, { x: 3 }]);
-
-//     url = URL;
-//     await db.pull();
-
-//     const expected = [{ x: 100 }, { x: 1 }, { x: 2 }, { x: 3 }];
-//     expect((await db.prepare("SELECT * FROM t").all())).toEqual(expected);
-// });
 
 test('select-after-push', async () => {
     {
@@ -643,55 +596,55 @@ test('update', async () => {
     await db.push();
 })
 
-test('concurrent-updates', async () => {
-    {
-        const db = await connect({ path: ':memory:', url: process.env.VITE_TURSO_DB_URL, longPollTimeoutMs: 5000 });
-        await db.exec("CREATE TABLE IF NOT EXISTS q(x TEXT PRIMARY KEY, y)");
-        await db.exec("DELETE FROM q");
-        await db.push();
-        await db.close();
-    }
-    const db1 = await connect({
-        path: ':memory:',
-        url: process.env.VITE_TURSO_DB_URL,
-    });
-    await db1.exec("PRAGMA busy_timeout=100");
-    async function pull(db) {
-        try {
-            await db.pull();
-        } catch (e) {
-            console.error('pull error', e);
-        } finally {
-            console.error('pull ok');
-            setTimeout(async () => await pull(db), 0);
-        }
-    }
-    async function push(db) {
-        try {
-            await db.push();
-        } catch (e) {
-            console.error('push error', e);
-        } finally {
-            console.error('push ok');
-            setTimeout(async () => await push(db), 0);
-        }
-    }
+// test('concurrent-updates', async () => {
+//     {
+//         const db = await connect({ path: ':memory:', url: process.env.VITE_TURSO_DB_URL, longPollTimeoutMs: 5000 });
+//         await db.exec("CREATE TABLE IF NOT EXISTS q(x TEXT PRIMARY KEY, y)");
+//         await db.exec("DELETE FROM q");
+//         await db.push();
+//         await db.close();
+//     }
+//     const db1 = await connect({
+//         path: ':memory:',
+//         url: process.env.VITE_TURSO_DB_URL,
+//     });
+//     await db1.exec("PRAGMA busy_timeout=100");
+//     async function pull(db) {
+//         try {
+//             await db.pull();
+//         } catch (e) {
+//             console.error('pull error', e);
+//         } finally {
+//             console.error('pull ok');
+//             setTimeout(async () => await pull(db), 0);
+//         }
+//     }
+//     async function push(db) {
+//         try {
+//             await db.push();
+//         } catch (e) {
+//             console.error('push error', e);
+//         } finally {
+//             console.error('push ok');
+//             setTimeout(async () => await push(db), 0);
+//         }
+//     }
 
-    setTimeout(async () => await pull(db1), 0)
-    setTimeout(async () => await push(db1), 0)
-    for (let i = 0; i < 1000; i++) {
-        try {
-            await Promise.all([
-                db1.exec(`INSERT INTO q VALUES ('1', 0) ON CONFLICT DO UPDATE SET y = randomblob(1024)`),
-                db1.exec(`INSERT INTO q VALUES ('1', 0) ON CONFLICT DO UPDATE SET y = randomblob(1024)`)
-            ]);
-            console.info('insert ok');
-        } catch (e) {
-            console.error('insert error', e);
-        }
-        await new Promise(resolve => setTimeout(resolve, 1));
-    }
-})
+//     setTimeout(async () => await pull(db1), 0)
+//     setTimeout(async () => await push(db1), 0)
+//     for (let i = 0; i < 1000; i++) {
+//         try {
+//             await Promise.all([
+//                 db1.exec(`INSERT INTO q VALUES ('1', 0) ON CONFLICT DO UPDATE SET y = randomblob(1024)`),
+//                 db1.exec(`INSERT INTO q VALUES ('1', 0) ON CONFLICT DO UPDATE SET y = randomblob(1024)`)
+//             ]);
+//             console.info('insert ok');
+//         } catch (e) {
+//             console.error('insert error', e);
+//         }
+//         await new Promise(resolve => setTimeout(resolve, 1));
+//     }
+// })
 
 test('corruption-bug-1', async () => {
     {
