@@ -111,11 +111,11 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
                     Value::Float(f) => (*f as i64).to_string(),
                     _ => "0".to_string(),
                 };
-                
+
                 // Apply width formatting if specified
                 if let Some(w) = width {
                     if w > int_str.len() {
-                        result.push_str(&format!("{:>width$}", int_str, width = w));
+                        result.push_str(&format!("{int_str:>w$}"));
                     } else {
                         result.push_str(&int_str);
                     }
