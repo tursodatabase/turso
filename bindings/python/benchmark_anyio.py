@@ -44,16 +44,17 @@
 #   - uvloop reduces overhead by ~15% compared to asyncio backend
 #   - Trio compatibility is worth the tradeoff for local-only workloads
 
-import time
-import statistics
 import gc
+import statistics
+import time
 
 
 def detect_backend():
     """Detect if we're running anyio or original asyncio version."""
     try:
-        from turso.lib_aio import Connection
         import inspect
+
+        from turso.lib_aio import Connection
         source = inspect.getsourcefile(Connection)
         with open(source) as f:
             content = f.read()
@@ -229,6 +230,7 @@ def run_with_backend(backend_name):
         return trio.run(run_all_benchmarks)
     elif backend_name == "uvloop":
         import asyncio
+
         import uvloop
         uvloop.install()
         return asyncio.run(run_all_benchmarks())
@@ -272,12 +274,14 @@ def main():
         # anyio version - test all available backends
         backends = ["asyncio"]
         try:
-            import trio
+            import trio  # noqa: F401
+
             backends.append("trio")
         except ImportError:
             print("(trio not installed, skipping)")
         try:
-            import uvloop
+            import uvloop  # noqa: F401
+
             backends.append("uvloop")
         except ImportError:
             print("(uvloop not installed, skipping)")
