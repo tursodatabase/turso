@@ -1,36 +1,30 @@
-use anyhow::{anyhow, bail, Result};
-use bytes::Bytes;
-use prost::Message as _;
-use roaring::RoaringBitmap;
-use serde_json::json;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::HashSet;
 use std::io::{Read, Write};
-use std::net::{Shutdown, TcpListener, TcpStream};
-use std::num::NonZeroUsize;
-use std::str::FromStr;
+use std::net::{TcpListener, TcpStream};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::thread;
+
+use anyhow::{anyhow, Result};
+use bytes::Bytes;
+use prost::Message;
+use roaring::RoaringBitmap;
 use tracing::{debug, error, info};
-use turso_core::types::Value as CoreValue;
-use turso_core::Connection;
+
+use turso_core::{Connection, Value as CoreValue};
 use turso_sync_engine::server_proto::{
-    Batch, BatchCond, BatchCondList, BatchResult, BatchStreamReq, BatchStreamResp, Col,
-    Error as HranaError, ExecuteStreamReq, ExecuteStreamResp, NamedArg, PageData,
-    PageSetRawEncodingProto, PageUpdatesEncodingReq, PipelineReqBody, PipelineRespBody,
-    PullUpdatesReqProtoBody, PullUpdatesRespProtoBody, Row as HranaRow, Stmt as HranaStmt,
-    StmtResult, StreamRequest, StreamResponse, StreamResult, Value as HranaValue,
+    BatchCond, BatchResult, BatchStep, BatchStreamReq, BatchStreamResp, Col, Error,
+    ExecuteStreamReq, ExecuteStreamResp, PageData, PageSetRawEncodingProto, PageUpdatesEncodingReq,
+    PipelineReqBody, PipelineRespBody, PullUpdatesReqProtoBody, PullUpdatesRespProtoBody, Row,
+    StmtResult, StreamRequest, StreamResponse, StreamResult, Value,
 };
 
-const CRLF: &[u8] = b"\r\n";
 const WAL_FRAME_HEADER_SIZE: usize = 24;
 const PAGE_SIZE: usize = 4096;
 
 pub struct TursoSyncServer {
-    // listen address (e.g. 0.0.0.0:8080)
     address: String,
     conn: Arc<Mutex<Arc<Connection>>>,
-    // stop server if interrupt_count > 0 (do this check in the main server event loop)
     interrupt_count: Arc<AtomicUsize>,
 }
 
@@ -44,239 +38,145 @@ impl TursoSyncServer {
     }
 
     pub fn run(&self) -> Result<()> {
-        info!(address = %self.address, "Starting Turso sync server");
-        // Disable automatic checkpointing if possible (best effort)
-        // Note: We keep WAL checkpoints disabled by not invoking checkpoint APIs and attempting a PRAGMA commonly used in SQLite.
-        // If unsupported, it will be ignored.
-        {
-            let guard = self.conn.lock().expect("poisoned lock");
-            if let Err(e) = guard.pragma_update("wal_autocheckpoint", 0) {
-                debug!("PRAGMA wal_autocheckpoint=0 not supported or failed: {e:?}");
-            } else {
-                debug!("Disabled wal_autocheckpoint via PRAGMA");
-            }
-            // keep guard in scope to hold lock briefly here; we drop before starting listener
-        }
+        info!("Starting TursoSyncServer on {}", self.address);
 
         let listener = TcpListener::bind(&self.address)?;
-        listener.set_nonblocking(false)?;
+        listener.set_nonblocking(true)?;
 
-        // Monitor interrupt_count in separate thread and poke the listener to break accept()
-        let addr_clone = self.address.clone();
-        let interrupt_clone = self.interrupt_count.clone();
-        std::thread::spawn(move || {
-            loop {
-                if interrupt_clone.load(Ordering::SeqCst) > 0 {
-                    // poke the listener via a dummy connection
-                    if let Ok(mut s) = TcpStream::connect(&addr_clone) {
-                        let _ = s.write_all(
-                            b"POST /__shutdown HTTP/1.1\r\nHost: localhost\r\nContent-Length: 0\r\n\r\n",
-                        );
-                        let _ = s.shutdown(Shutdown::Both);
-                    }
-                    break;
-                }
-                std::thread::sleep(Duration::from_millis(50));
+        let interrupt_count = self.interrupt_count.clone();
+        let shutdown_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let shutdown_flag_clone = shutdown_flag.clone();
+
+        let monitor_handle = thread::spawn(move || loop {
+            if interrupt_count.load(Ordering::SeqCst) > 0 {
+                debug!("Interrupt detected, signaling shutdown");
+                shutdown_flag_clone.store(true, Ordering::SeqCst);
+                break;
             }
+            thread::sleep(std::time::Duration::from_millis(100));
         });
 
-        // Main accept loop
         loop {
-            if self.interrupt_count.load(Ordering::SeqCst) > 0 {
-                info!("Interrupt requested, shutting down server");
+            if shutdown_flag.load(Ordering::SeqCst) {
+                info!("Shutdown signal received, stopping server");
                 break;
             }
 
             match listener.accept() {
-                Ok((mut stream, peer)) => {
-                    info!(remote=%peer, "Accepted new connection");
-                    if let Err(e) = self.handle_connection(&mut stream) {
-                        error!("Connection handling error: {e:?}");
-                        // Try to send a 500 in case nothing was written yet
-                        let _ = write_http_response(
-                            &mut stream,
-                            500,
-                            "Internal Server Error",
-                            "text/plain",
-                            b"internal error".to_vec(),
-                            &[],
-                        );
+                Ok((stream, addr)) => {
+                    info!("Accepted connection from {}", addr);
+                    if let Err(e) = self.handle_connection(stream) {
+                        error!("Error handling connection: {}", e);
                     }
-                    let _ = stream.shutdown(Shutdown::Both);
+                }
+                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    thread::sleep(std::time::Duration::from_millis(10));
+                    continue;
                 }
                 Err(e) => {
-                    // Likely interrupted by shutdown poke or other transient issue
-                    debug!("Accept error: {e:?}");
-                    if self.interrupt_count.load(Ordering::SeqCst) > 0 {
-                        break;
-                    }
-                    // minor backoff
-                    std::thread::sleep(Duration::from_millis(10));
+                    error!("Error accepting connection: {}", e);
                 }
             }
         }
 
-        info!("Server stopped");
+        let _ = monitor_handle.join();
+        info!("TursoSyncServer stopped");
         Ok(())
     }
 
-    fn handle_connection(&self, stream: &mut TcpStream) -> Result<()> {
-        stream.set_read_timeout(Some(Duration::from_secs(15))).ok();
-        stream.set_write_timeout(Some(Duration::from_secs(15))).ok();
+    fn handle_connection(&self, mut stream: TcpStream) -> Result<()> {
+        stream.set_nonblocking(false)?;
 
-        let (method, path, headers, body) = read_http_request(stream)?;
-        info!(%method, %path, headers=format!("{headers:?}"), content_length = body.len(), "Incoming request");
+        let mut buffer = [0u8; 8192];
+        let mut request_data = Vec::new();
 
-        if path == "/__shutdown" {
-            // Just acknowledge and return quickly
-            write_http_response(stream, 200, "OK", "text/plain", b"bye".to_vec(), &[])?;
-            return Ok(());
+        loop {
+            let n = stream.read(&mut buffer)?;
+            if n == 0 {
+                break;
+            }
+            request_data.extend_from_slice(&buffer[..n]);
+
+            if let Some(header_end) = find_header_end(&request_data) {
+                let headers = String::from_utf8_lossy(&request_data[..header_end]);
+                if let Some(content_length) = parse_content_length(&headers) {
+                    let body_start = header_end + 4;
+                    let total_expected = body_start + content_length;
+                    while request_data.len() < total_expected {
+                        let n = stream.read(&mut buffer)?;
+                        if n == 0 {
+                            break;
+                        }
+                        request_data.extend_from_slice(&buffer[..n]);
+                    }
+                }
+                break;
+            }
         }
 
-        match (method.as_str(), path.as_str()) {
+        let (method, path, body) = parse_http_request(&request_data)?;
+        info!("Request: {} {}", method, path);
+
+        let response = match (method.as_str(), path.as_str()) {
             ("POST", "/v2/pipeline") => {
-                // Acquire the DB lock for the full request processing duration
-                let guard = self.conn.lock().expect("poisoned lock");
-                let start = Instant::now();
-                let res = self.sql_over_http(&guard, &body);
-                debug!("Pipeline handled in {:?}\n", start.elapsed());
-
-                match res {
-                    Ok(resp_body) => {
-                        write_http_response(stream, 200, "OK", "application/json", resp_body, &[])
-                    }
-                    Err(err) => {
-                        error!("SQL over HTTP pipeline failed: {err:?}");
-                        // Return JSON error with message
-                        let err_body = json!({
-                            "error": {"message": format!("{err}"), "code": "SQL_ERROR"}
-                        })
-                        .to_string()
-                        .into_bytes();
-
-                        write_http_response(
-                            stream,
-                            400,
-                            "Bad Request",
-                            "application/json",
-                            err_body,
-                            &[],
-                        )
-                    }
-                }?;
+                debug!("Handling /v2/pipeline request");
+                self.handle_pipeline(&body)
             }
             ("POST", "/pull-updates") => {
-                let content_type = headers
-                    .get("content-type")
-                    .cloned()
-                    .unwrap_or_else(|| "".to_string());
-                if !content_type.contains("application/protobuf") {
-                    info!("Bad content-type for /pull-updates: {}", content_type);
-                    write_http_response(
-                        stream,
-                        415,
-                        "Unsupported Media Type",
-                        "text/plain",
-                        b"expecting application/protobuf".to_vec(),
-                        &[],
-                    )?;
-                    return Ok(());
-                }
-
-                // Acquire lock for full duration
-                let guard = self.conn.lock().expect("poisoned lock");
-                let start = Instant::now();
-                let res = self.pull_updates(&guard, &body);
-                debug!("Pull-updates handled in {:?}", start.elapsed());
-
-                match res {
-                    Ok(resp_body) => write_http_response(
-                        stream,
-                        200,
-                        "OK",
-                        "application/protobuf",
-                        resp_body,
-                        &[],
-                    ),
-                    Err(err) => {
-                        error!("Pull-updates failed: {err:?}");
-                        write_http_response(
-                            stream,
-                            400,
-                            "Bad Request",
-                            "text/plain",
-                            format!("pull-updates error: {err}").into_bytes(),
-                            &[],
-                        )
-                    }
-                }?;
+                debug!("Handling /pull-updates request");
+                self.handle_pull_updates(&body)
             }
             _ => {
-                write_http_response(
-                    stream,
-                    404,
-                    "Not Found",
-                    "text/plain",
-                    b"not found".to_vec(),
-                    &[],
-                )?;
+                info!("Unknown endpoint: {} {}", method, path);
+                Ok(HttpResponse {
+                    status: 404,
+                    content_type: "text/plain".to_string(),
+                    body: b"Not Found".to_vec(),
+                })
             }
-        }
+        };
+
+        let http_response = match response {
+            Ok(resp) => resp,
+            Err(e) => {
+                error!("Request error: {}", e);
+                HttpResponse {
+                    status: 500,
+                    content_type: "text/plain".to_string(),
+                    body: format!("Internal Server Error: {e}").into_bytes(),
+                }
+            }
+        };
+
+        let response_bytes = format_http_response(&http_response);
+        stream.write_all(&response_bytes)?;
+        stream.flush()?;
+
         Ok(())
     }
 
-    fn sql_over_http(&self, conn: &Arc<Connection>, body: &[u8]) -> Result<Vec<u8>> {
-        let req: PipelineReqBody = serde_json::from_slice(body)?;
-        debug!(
-            "Parsed pipeline request: baton={:?}, #requests={}",
-            req.baton,
-            req.requests.len()
-        );
+    fn handle_pipeline(&self, body: &[u8]) -> Result<HttpResponse> {
+        let req: PipelineReqBody = serde_json::from_slice(body)
+            .map_err(|e| anyhow!("Failed to parse pipeline request: {}", e))?;
 
-        let mut results = Vec::with_capacity(req.requests.len());
+        debug!("Pipeline request: {:?}", req);
 
-        for (idx, request) in req.requests.into_iter().enumerate() {
-            match request {
-                StreamRequest::Execute(exec_req) => {
-                    info!(step = idx, "Executing single statement");
-                    match self.execute_stmt(conn, &exec_req.stmt) {
-                        Ok(stmt_result) => {
-                            results.push(StreamResult::Ok {
-                                response: StreamResponse::Execute(ExecuteStreamResp {
-                                    result: stmt_result,
-                                }),
-                            });
-                        }
-                        Err(e) => {
-                            error!("Execute failed: {e:?}");
-                            results.push(StreamResult::Error {
-                                error: HranaError {
-                                    message: format!("{e}"),
-                                    code: "SQL_ERROR".to_string(),
-                                },
-                            });
-                        }
-                    }
-                }
-                StreamRequest::Batch(BatchStreamReq { batch }) => {
-                    info!(step = idx, "Executing batch");
-                    let (batch_res, batch_errs) = self.execute_batch(conn, &batch);
-                    let batch_result = BatchResult {
-                        step_results: batch_res,
-                        step_errors: batch_errs,
-                        replication_index: None,
-                    };
-                    results.push(StreamResult::Ok {
-                        response: StreamResponse::Batch(BatchStreamResp {
-                            result: batch_result,
-                        }),
-                    });
-                }
-                StreamRequest::None => {
-                    debug!("StreamRequest::None received");
-                    results.push(StreamResult::None);
-                }
-            }
+        let conn = self.conn.lock().unwrap();
+
+        let mut results = Vec::new();
+
+        for request in req.requests {
+            let result = match request {
+                StreamRequest::Execute(exec_req) => self.execute_statement(&conn, &exec_req),
+                StreamRequest::Batch(batch_req) => self.execute_batch(&conn, &batch_req),
+                StreamRequest::None => StreamResult::Error {
+                    error: Error {
+                        message: "Unknown request type".to_string(),
+                        code: "UNKNOWN".to_string(),
+                    },
+                },
+            };
+            results.push(result);
         }
 
         let resp = PipelineRespBody {
@@ -284,433 +184,475 @@ impl TursoSyncServer {
             base_url: None,
             results,
         };
-        let json = serde_json::to_vec(&resp)?;
-        Ok(json)
+
+        let body = serde_json::to_vec(&resp)?;
+
+        Ok(HttpResponse {
+            status: 200,
+            content_type: "application/json".to_string(),
+            body,
+        })
     }
 
-    fn execute_batch(
-        &self,
-        conn: &Arc<Connection>,
-        batch: &Batch,
-    ) -> (Vec<Option<StmtResult>>, Vec<Option<HranaError>>) {
-        let mut step_results: Vec<Option<StmtResult>> = Vec::with_capacity(batch.steps.len());
-        let mut step_errors: Vec<Option<HranaError>> = Vec::with_capacity(batch.steps.len());
-
-        for (i, step) in batch.steps.iter().enumerate() {
-            let cond = step.condition.as_ref();
-            if let Some(cond) = cond {
-                if !self.eval_batch_cond(conn, cond, &step_results, &step_errors) {
-                    debug!("Batch step {} skipped due to condition", i);
-                    step_results.push(None);
-                    step_errors.push(None);
-                    continue;
+    fn execute_statement(&self, conn: &Arc<Connection>, req: &ExecuteStreamReq) -> StreamResult {
+        let sql = match &req.stmt.sql {
+            Some(s) => s.clone(),
+            None => {
+                return StreamResult::Error {
+                    error: Error {
+                        message: "No SQL provided".to_string(),
+                        code: "NO_SQL".to_string(),
+                    },
                 }
             }
-            debug!("Executing batch step {}", i);
-            match self.execute_stmt(conn, &step.stmt) {
-                Ok(r) => {
-                    step_results.push(Some(r));
-                    step_errors.push(None);
+        };
+
+        debug!("Executing SQL: {}", sql);
+
+        let mut stmt = match conn.prepare(&sql) {
+            Ok(s) => s,
+            Err(e) => {
+                error!("Failed to prepare statement: {}", e);
+                return StreamResult::Error {
+                    error: Error {
+                        message: e.to_string(),
+                        code: "PREPARE_ERROR".to_string(),
+                    },
+                };
+            }
+        };
+
+        for (i, arg) in req.stmt.args.iter().enumerate() {
+            let core_value = convert_value_to_core(arg);
+            stmt.bind_at(std::num::NonZero::new(i + 1).unwrap(), core_value);
+        }
+
+        let want_rows = req.stmt.want_rows.unwrap_or(true);
+
+        if want_rows {
+            match stmt.run_collect_rows() {
+                Ok(rows) => {
+                    let cols: Vec<Col> = (0..stmt.num_columns())
+                        .map(|i| Col {
+                            name: Some(stmt.get_column_name(i).to_string()),
+                            decltype: stmt.get_column_type(i),
+                        })
+                        .collect();
+
+                    let result_rows: Vec<Row> = rows
+                        .into_iter()
+                        .map(|row| Row {
+                            values: row.into_iter().map(convert_core_to_value).collect(),
+                        })
+                        .collect();
+
+                    StreamResult::Ok {
+                        response: StreamResponse::Execute(ExecuteStreamResp {
+                            result: StmtResult {
+                                cols,
+                                rows: result_rows,
+                                affected_row_count: 0,
+                                last_insert_rowid: None,
+                                replication_index: None,
+                                rows_read: 0,
+                                rows_written: 0,
+                                query_duration_ms: 0.0,
+                            },
+                        }),
+                    }
                 }
                 Err(e) => {
-                    error!("Batch step {} failed: {e:?}", i);
-                    step_results.push(None);
-                    step_errors.push(Some(HranaError {
-                        message: format!("{e}"),
-                        code: "SQL_ERROR".to_string(),
-                    }));
+                    error!("Failed to execute statement: {}", e);
+                    StreamResult::Error {
+                        error: Error {
+                            message: e.to_string(),
+                            code: "EXECUTE_ERROR".to_string(),
+                        },
+                    }
+                }
+            }
+        } else {
+            match stmt.run_ignore_rows() {
+                Ok(()) => StreamResult::Ok {
+                    response: StreamResponse::Execute(ExecuteStreamResp {
+                        result: StmtResult {
+                            cols: vec![],
+                            rows: vec![],
+                            affected_row_count: 0,
+                            last_insert_rowid: None,
+                            replication_index: None,
+                            rows_read: 0,
+                            rows_written: 0,
+                            query_duration_ms: 0.0,
+                        },
+                    }),
+                },
+                Err(e) => {
+                    error!("Failed to execute statement: {}", e);
+                    StreamResult::Error {
+                        error: Error {
+                            message: e.to_string(),
+                            code: "EXECUTE_ERROR".to_string(),
+                        },
+                    }
                 }
             }
         }
-
-        (step_results, step_errors)
     }
 
-    fn eval_batch_cond(
-        &self,
-        conn: &Arc<Connection>,
+    fn execute_batch(&self, conn: &Arc<Connection>, req: &BatchStreamReq) -> StreamResult {
+        let batch = &req.batch;
+        let mut step_results: Vec<Option<StmtResult>> = Vec::with_capacity(batch.steps.len());
+        let mut step_errors: Vec<Option<Error>> = Vec::with_capacity(batch.steps.len());
+
+        for (step_idx, step) in batch.steps.iter().enumerate() {
+            let should_execute = match &step.condition {
+                None => true,
+                Some(cond) => Self::evaluate_condition(cond, &step_results, &step_errors, conn),
+            };
+
+            if should_execute {
+                let result = self.execute_batch_step(conn, step);
+                match result {
+                    Ok(stmt_result) => {
+                        step_results.push(Some(stmt_result));
+                        step_errors.push(None);
+                    }
+                    Err(e) => {
+                        error!("Batch step {} failed: {}", step_idx, e);
+                        step_results.push(None);
+                        step_errors.push(Some(Error {
+                            message: e.to_string(),
+                            code: "BATCH_STEP_ERROR".to_string(),
+                        }));
+                    }
+                }
+            } else {
+                step_results.push(None);
+                step_errors.push(None);
+            }
+        }
+
+        StreamResult::Ok {
+            response: StreamResponse::Batch(BatchStreamResp {
+                result: BatchResult {
+                    step_results,
+                    step_errors,
+                    replication_index: None,
+                },
+            }),
+        }
+    }
+
+    fn evaluate_condition(
         cond: &BatchCond,
-        step_results: &Vec<Option<StmtResult>>,
-        step_errors: &Vec<Option<HranaError>>,
+        step_results: &[Option<StmtResult>],
+        step_errors: &[Option<Error>],
+        conn: &Arc<Connection>,
     ) -> bool {
         match cond {
             BatchCond::None => true,
             BatchCond::Ok { step } => {
                 let idx = *step as usize;
-                step_results.get(idx).map(|o| o.is_some()).unwrap_or(false)
-                    && step_errors.get(idx).map(|o| o.is_none()).unwrap_or(false)
+                idx < step_results.len() && step_results[idx].is_some()
             }
             BatchCond::Error { step } => {
                 let idx = *step as usize;
-                step_errors.get(idx).map(|o| o.is_some()).unwrap_or(false)
+                idx < step_errors.len() && step_errors[idx].is_some()
             }
             BatchCond::Not { cond } => {
-                !self.eval_batch_cond(conn, cond.as_ref(), step_results, step_errors)
+                !Self::evaluate_condition(cond, step_results, step_errors, conn)
             }
-            BatchCond::And(BatchCondList { conds }) => conds
+            BatchCond::And(list) => list
+                .conds
                 .iter()
-                .all(|c| self.eval_batch_cond(conn, c, step_results, step_errors)),
-            BatchCond::Or(BatchCondList { conds }) => conds
+                .all(|c| Self::evaluate_condition(c, step_results, step_errors, conn)),
+            BatchCond::Or(list) => list
+                .conds
                 .iter()
-                .any(|c| self.eval_batch_cond(conn, c, step_results, step_errors)),
+                .any(|c| Self::evaluate_condition(c, step_results, step_errors, conn)),
             BatchCond::IsAutocommit {} => conn.get_auto_commit(),
         }
     }
 
-    fn execute_stmt(&self, conn: &Arc<Connection>, stmt: &HranaStmt) -> Result<StmtResult> {
-        let sql = stmt.sql.clone().unwrap_or_default();
-        info!("Executing SQL: {}", sql);
-        let mut s = conn.prepare(&sql)?;
-        // positional args only
-        for (i, v) in stmt.args.iter().enumerate() {
-            let idx = NonZeroUsize::new(i + 1).unwrap();
-            s.bind_at(idx, hrana_to_core_value(v)?);
-        }
-        // ignore named_args per protocol
-        if !stmt.named_args.is_empty() {
-            debug!("Ignoring named args in statement execution");
-        }
+    fn execute_batch_step(&self, conn: &Arc<Connection>, step: &BatchStep) -> Result<StmtResult> {
+        let sql = step
+            .stmt
+            .sql
+            .as_ref()
+            .ok_or_else(|| anyhow!("No SQL in batch step"))?;
 
-        let start = Instant::now();
-        let want_rows = stmt.want_rows.unwrap_or(true);
+        debug!("Executing batch step SQL: {}", sql);
 
-        let mut cols_meta: Vec<Col> = Vec::new();
-        let num_cols = s.num_columns();
-        for ci in 0..num_cols {
-            let name = Some(s.get_column_name(ci).to_string());
-            let decltype = s.get_column_type(ci);
-            cols_meta.push(Col { name, decltype });
+        let mut stmt = conn.prepare(sql)?;
+
+        for (i, arg) in step.stmt.args.iter().enumerate() {
+            let core_value = convert_value_to_core(arg);
+            stmt.bind_at(std::num::NonZero::new(i + 1).unwrap(), core_value);
         }
 
-        let (rows, affected) = if want_rows {
-            debug!("Collecting rows for SQL");
-            let rows_core = s.run_collect_rows()?;
-            let rows = rows_core
-                .into_iter()
-                .map(|row_vals| HranaRow {
-                    values: row_vals.into_iter().map(core_to_hrana_value).collect(),
+        let want_rows = step.stmt.want_rows.unwrap_or(true);
+
+        if want_rows {
+            let rows = stmt.run_collect_rows()?;
+
+            let cols: Vec<Col> = (0..stmt.num_columns())
+                .map(|i| Col {
+                    name: Some(stmt.get_column_name(i).to_string()),
+                    decltype: stmt.get_column_type(i),
                 })
-                .collect::<Vec<_>>();
-            (rows, conn.changes() as u64)
+                .collect();
+
+            let result_rows: Vec<Row> = rows
+                .into_iter()
+                .map(|row| Row {
+                    values: row.into_iter().map(convert_core_to_value).collect(),
+                })
+                .collect();
+
+            Ok(StmtResult {
+                cols,
+                rows: result_rows,
+                affected_row_count: 0,
+                last_insert_rowid: None,
+                replication_index: None,
+                rows_read: 0,
+                rows_written: 0,
+                query_duration_ms: 0.0,
+            })
         } else {
-            debug!("Ignoring rows for SQL");
-            s.run_ignore_rows()?;
-            (Vec::new(), conn.changes() as u64)
-        };
-
-        let dur_ms = start.elapsed().as_secs_f64() * 1000.0;
-
-        let result = StmtResult {
-            cols: cols_meta,
-            rows,
-            affected_row_count: affected,
-            last_insert_rowid: Some(conn.last_insert_rowid()),
-            replication_index: None,
-            rows_read: 0,
-            rows_written: 0,
-            query_duration_ms: dur_ms,
-        };
-        Ok(result)
+            stmt.run_ignore_rows()?;
+            Ok(StmtResult {
+                cols: vec![],
+                rows: vec![],
+                affected_row_count: 0,
+                last_insert_rowid: None,
+                replication_index: None,
+                rows_read: 0,
+                rows_written: 0,
+                query_duration_ms: 0.0,
+            })
+        }
     }
 
-    fn pull_updates(&self, conn: &Arc<Connection>, body: &[u8]) -> Result<Vec<u8>> {
-        // Note: Use of deprecated from_i32 is disallowed; use TryFrom<i32>.
-        let req = PullUpdatesReqProtoBody::decode(body)?;
-        debug!("Pull-updates request: enc={}, server_rev='{}', client_rev='{}', long_poll={}ms, selector_sz={} bytes",
-            req.encoding, req.server_revision, req.client_revision, req.long_poll_timeout_ms, req.server_pages_selector.len());
+    fn handle_pull_updates(&self, body: &[u8]) -> Result<HttpResponse> {
+        let req = <PullUpdatesReqProtoBody as Message>::decode(body)
+            .map_err(|e| anyhow!("Failed to decode PullUpdatesRequest: {}", e))?;
 
-        let enc: PageUpdatesEncodingReq = PageUpdatesEncodingReq::try_from(req.encoding)
-            .map_err(|_| anyhow!("invalid encoding value"))?;
+        debug!(
+            "Pull updates request: server_revision={}, client_revision={}",
+            req.server_revision, req.client_revision
+        );
 
-        match enc {
-            PageUpdatesEncodingReq::Zstd => {
-                bail!("ZSTD encoding is not supported by server")
-            }
-            PageUpdatesEncodingReq::Raw => {
-                // ok
-            }
+        let encoding =
+            PageUpdatesEncodingReq::try_from(req.encoding).unwrap_or(PageUpdatesEncodingReq::Raw);
+
+        if encoding == PageUpdatesEncodingReq::Zstd {
+            return Err(anyhow!("Zstd encoding is not supported"));
         }
 
-        // Decode optional server pages selector bitmap (zero-based page ids)
-        let selector_bitmap: Option<RoaringBitmap> = if !req.server_pages_selector.is_empty() {
-            let mut cursor = std::io::Cursor::new(req.server_pages_selector.to_vec());
-            match RoaringBitmap::deserialize_from(&mut cursor) {
-                Ok(bm) => Some(bm),
-                Err(e) => {
-                    debug!("Failed to deserialize server pages selector, ignoring: {e:?}");
-                    None
-                }
-            }
+        let conn = self.conn.lock().unwrap();
+
+        let wal_state = conn.wal_state()?;
+        debug!("WAL state: max_frame={}", wal_state.max_frame);
+
+        let server_revision: u64 = if req.server_revision.is_empty() {
+            wal_state.max_frame
+        } else {
+            req.server_revision.parse().unwrap_or(wal_state.max_frame)
+        };
+
+        let client_revision: u64 = if req.client_revision.is_empty() {
+            0
+        } else {
+            req.client_revision.parse().unwrap_or(0)
+        };
+
+        debug!(
+            "Using server_revision={}, client_revision={}",
+            server_revision, client_revision
+        );
+
+        let pages_selector: Option<RoaringBitmap> = if !req.server_pages_selector.is_empty() {
+            Some(
+                RoaringBitmap::deserialize_from(&req.server_pages_selector[..])
+                    .map_err(|e| anyhow!("Failed to parse server_pages_selector: {}", e))?,
+            )
         } else {
             None
         };
 
-        // Determine revisions
-        let mut server_rev = if req.server_revision.trim().is_empty() {
-            // find latest committed frame
-            let state = conn.wal_state()?;
-            let mut rev = state.max_frame;
-            let mut found = false;
-            let mut frame = vec![0u8; WAL_FRAME_HEADER_SIZE + PAGE_SIZE];
-            while rev > 0 {
-                let info = conn.wal_get_frame(rev, &mut frame)?;
-                if info.is_commit_frame() {
-                    found = true;
-                    break;
+        let mut seen_pages: HashSet<u32> = HashSet::new();
+        let mut pages_to_send: Vec<(u32, Vec<u8>)> = Vec::new();
+
+        let frame_size = WAL_FRAME_HEADER_SIZE + PAGE_SIZE;
+        let mut frame_buffer = vec![0u8; frame_size];
+
+        if server_revision > client_revision {
+            for frame_no in (client_revision + 1..=server_revision).rev() {
+                let frame_info = conn.wal_get_frame(frame_no, &mut frame_buffer)?;
+
+                let page_no = frame_info.page_no;
+                // WAL uses 1-based page numbers, sync protocol uses 0-based
+                let page_id = page_no - 1;
+
+                if seen_pages.contains(&page_no) {
+                    continue;
                 }
-                rev -= 1;
-            }
-            if !found {
-                debug!(
-                    "No commit frame found, using max_frame as server_rev={}",
-                    state.max_frame
-                );
-                state.max_frame
-            } else {
-                rev
-            }
-        } else {
-            u64::from_str(req.server_revision.trim())?
-        };
 
-        let client_rev = if req.client_revision.trim().is_empty() {
-            0u64
-        } else {
-            u64::from_str(req.client_revision.trim())?
-        };
-
-        if PAGE_SIZE != 4096 {
-            bail!("Server compiled with unexpected page size");
-        }
-
-        // Collect pages changed in (client_rev..=server_rev], newest first, unique pages only
-        let mut seen_pages_one_based: HashSet<u32> = HashSet::new();
-        let mut page_datas: Vec<PageData> = Vec::new();
-        let mut header_db_size: u64 = 0;
-
-        // If server_rev is 0, nothing to send
-        if server_rev > 0 && server_rev > client_rev {
-            let mut frame_buf = vec![0u8; WAL_FRAME_HEADER_SIZE + PAGE_SIZE];
-
-            let mut f = server_rev;
-            while f > client_rev {
-                let info = conn.wal_get_frame(f, &mut frame_buf)?;
-                if header_db_size == 0 {
-                    header_db_size = info.db_size as u64;
-                }
-                let page_no_one_based = info.page_no;
-                if !seen_pages_one_based.contains(&page_no_one_based) {
-                    let page_id_zero_based = page_no_one_based.saturating_sub(1) as u64;
-                    // filter by selector if set
-                    let include_page = match &selector_bitmap {
-                        Some(bm) => bm.contains(page_id_zero_based as u32),
-                        None => true,
-                    };
-                    if include_page {
-                        let page_bytes =
-                            &frame_buf[WAL_FRAME_HEADER_SIZE..WAL_FRAME_HEADER_SIZE + PAGE_SIZE];
-                        page_datas.push(PageData {
-                            page_id: page_id_zero_based,
-                            encoded_page: Bytes::copy_from_slice(page_bytes),
-                        });
+                if let Some(ref selector) = pages_selector {
+                    if !selector.contains(page_id) {
+                        continue;
                     }
-                    seen_pages_one_based.insert(page_no_one_based);
                 }
-                f -= 1;
+
+                seen_pages.insert(page_no);
+
+                let page_data = frame_buffer[WAL_FRAME_HEADER_SIZE..].to_vec();
+                pages_to_send.push((page_id, page_data));
             }
-        } else {
-            // No changes, use current wal state for db size if possible
-            let state = conn.wal_state()?;
-            header_db_size = state.max_frame as u64; // best effort; exact DB size unknown without reading a frame
         }
 
-        // Prepare header
+        pages_to_send.reverse();
+
+        let db_size = if wal_state.max_frame > 0 {
+            let mut last_frame = vec![0u8; frame_size];
+            let last_info = conn.wal_get_frame(wal_state.max_frame, &mut last_frame)?;
+            last_info.db_size as u64 * PAGE_SIZE as u64
+        } else {
+            0
+        };
+
         let header = PullUpdatesRespProtoBody {
-            server_revision: server_rev.to_string(),
-            db_size: header_db_size,
+            server_revision: server_revision.to_string(),
+            db_size,
             raw_encoding: Some(PageSetRawEncodingProto {}),
             zstd_encoding: None,
         };
 
-        // Encode as length-delimited sequence: first header, then each page
-        let mut resp_body: Vec<u8> = Vec::new();
-        {
-            header.encode_length_delimited(&mut resp_body)?;
-            for p in page_datas.into_iter() {
-                p.encode_length_delimited(&mut resp_body)?;
-            }
+        let mut response_body = Vec::new();
+
+        let header_bytes = header.encode_to_vec();
+        encode_length_delimited(&mut response_body, &header_bytes);
+
+        for (page_id, page_data) in pages_to_send {
+            let page_msg = PageData {
+                page_id: page_id as u64,
+                encoded_page: Bytes::from(page_data),
+            };
+            let page_bytes = page_msg.encode_to_vec();
+            encode_length_delimited(&mut response_body, &page_bytes);
         }
 
-        Ok(resp_body)
-    }
-}
-
-// --- Helpers ---
-
-fn read_http_request(
-    stream: &mut TcpStream,
-) -> Result<(String, String, HashMap<String, String>, Vec<u8>)> {
-    // Read until CRLFCRLF
-    let mut buf = Vec::with_capacity(8192);
-    let mut tmp = [0u8; 1024];
-    let mut header_end = None;
-
-    loop {
-        let n = stream.read(&mut tmp)?;
-        if n == 0 {
-            // client closed
-            info!(
-                header = std::str::from_utf8(&buf).unwrap_or("malformed"),
-                "n == 0"
-            );
-            break;
-        }
-        buf.extend_from_slice(&tmp[..n]);
-        if let Some(pos) = find_header_end(&buf) {
-            header_end = Some(pos);
-            info!(
-                header = std::str::from_utf8(&buf[..pos]).unwrap_or("malformed"),
-                "read header"
-            );
-            break;
-        }
-        if buf.len() > 1024 * 1024 {
-            info!(
-                header = std::str::from_utf8(&buf).unwrap_or("malformed"),
-                "read big header"
-            );
-            bail!("Header too large");
-        }
-    }
-
-    let header_end =
-        header_end.ok_or_else(|| anyhow!("Incomplete HTTP request header: {buf:?}"))?;
-    let header_bytes = &buf[..header_end];
-    let mut body_remaining = buf[header_end + 4..].to_vec();
-
-    // Parse start line and headers
-    let header_str = String::from_utf8_lossy(header_bytes);
-    let mut lines = header_str.split("\r\n");
-    let start_line = lines
-        .next()
-        .ok_or_else(|| anyhow!("Missing request line"))?;
-    let mut parts = start_line.split_whitespace();
-    let method = parts
-        .next()
-        .ok_or_else(|| anyhow!("Missing method"))?
-        .to_string();
-    let path = parts
-        .next()
-        .ok_or_else(|| anyhow!("Missing path"))?
-        .to_string();
-    let _version = parts.next().unwrap_or("HTTP/1.1");
-
-    let mut headers = HashMap::new();
-    for l in lines {
-        if l.trim().is_empty() {
-            continue;
-        }
-        if let Some((k, v)) = l.split_once(':') {
-            headers.insert(k.trim().to_lowercase(), v.trim().to_string());
-        }
-    }
-
-    // Read body by Content-Length
-    let content_len = headers
-        .get("content-length")
-        .and_then(|s| s.parse::<usize>().ok())
-        .unwrap_or(0usize);
-
-    if body_remaining.len() < content_len {
-        let mut to_read = content_len - body_remaining.len();
-        while to_read > 0 {
-            let n = stream.read(&mut tmp)?;
-            if n == 0 {
-                break;
-            }
-            body_remaining.extend_from_slice(&tmp[..n]);
-            if body_remaining.len() > content_len {
-                break;
-            }
-            to_read = content_len - body_remaining.len();
-        }
-    }
-
-    if body_remaining.len() != content_len {
-        bail!(
-            "Unexpected body size: expected {}, got {}",
-            content_len,
-            body_remaining.len()
+        debug!(
+            "Sending {} bytes in pull-updates response",
+            response_body.len()
         );
+
+        Ok(HttpResponse {
+            status: 200,
+            content_type: "application/protobuf".to_string(),
+            body: response_body,
+        })
     }
-
-    info!(%method, %path, content_length = content_len, "Parsed HTTP request");
-    Ok((method, path, headers, body_remaining))
 }
 
-fn find_header_end(buf: &[u8]) -> Option<usize> {
-    buf.windows(4).position(|w| w == b"\r\n\r\n")
-}
-
-fn write_http_response(
-    stream: &mut TcpStream,
+struct HttpResponse {
     status: u16,
-    reason: &str,
-    content_type: &str,
+    content_type: String,
     body: Vec<u8>,
-    extra_headers: &[(&str, &str)],
-) -> Result<()> {
-    let mut headers = Vec::new();
-    headers.push(format!("HTTP/1.1 {} {}", status, reason));
-    headers.push(format!("Content-Length: {}", body.len()));
-    headers.push(format!("Content-Type: {}", content_type));
-    for (k, v) in extra_headers {
-        headers.push(format!("{}: {}", k, v));
+}
+
+fn find_header_end(data: &[u8]) -> Option<usize> {
+    (0..data.len().saturating_sub(3)).find(|&i| &data[i..i + 4] == b"\r\n\r\n")
+}
+
+fn parse_content_length(headers: &str) -> Option<usize> {
+    for line in headers.lines() {
+        let lower = line.to_lowercase();
+        if lower.starts_with("content-length:") {
+            let value = line.split(':').nth(1)?.trim();
+            return value.parse().ok();
+        }
     }
-    headers.push(String::new()); // empty line
-
-    let mut resp = headers.join("\r\n").into_bytes();
-    resp.extend_from_slice(CRLF);
-    resp.extend_from_slice(&body);
-
-    stream.write_all(&resp)?;
-    stream.flush()?;
-    Ok(())
+    None
 }
 
-fn hrana_to_core_value(v: &HranaValue) -> Result<CoreValue> {
-    Ok(match v {
-        HranaValue::None => CoreValue::Null,
-        HranaValue::Null => CoreValue::Null,
-        HranaValue::Integer { value } => CoreValue::Integer(*value),
-        HranaValue::Float { value } => CoreValue::Float(*value),
-        HranaValue::Text { value } => CoreValue::Text(value.clone().into()),
-        HranaValue::Blob { value } => CoreValue::Blob(value.to_vec()),
-    })
+fn parse_http_request(data: &[u8]) -> Result<(String, String, Vec<u8>)> {
+    let header_end = find_header_end(data).ok_or_else(|| anyhow!("Invalid HTTP request"))?;
+    let headers = String::from_utf8_lossy(&data[..header_end]);
+
+    let first_line = headers
+        .lines()
+        .next()
+        .ok_or_else(|| anyhow!("Empty request"))?;
+    let parts: Vec<&str> = first_line.split_whitespace().collect();
+
+    if parts.len() < 2 {
+        return Err(anyhow!("Invalid request line"));
+    }
+
+    let method = parts[0].to_string();
+    let path = parts[1].to_string();
+    let body = data[header_end + 4..].to_vec();
+
+    Ok((method, path, body))
 }
 
-fn core_to_hrana_value(v: CoreValue) -> HranaValue {
-    match v {
-        CoreValue::Null => HranaValue::Null,
-        CoreValue::Integer(i) => HranaValue::Integer { value: i },
-        CoreValue::Float(f) => HranaValue::Float { value: f },
-        CoreValue::Text(t) => HranaValue::Text {
-            value: t.as_str().to_string(),
+fn format_http_response(resp: &HttpResponse) -> Vec<u8> {
+    let status_text = match resp.status {
+        200 => "OK",
+        404 => "Not Found",
+        500 => "Internal Server Error",
+        _ => "Unknown",
+    };
+
+    let header = format!(
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        resp.status,
+        status_text,
+        resp.content_type,
+        resp.body.len()
+    );
+
+    let mut result = header.into_bytes();
+    result.extend_from_slice(&resp.body);
+    result
+}
+
+fn encode_length_delimited(output: &mut Vec<u8>, data: &[u8]) {
+    let mut len = data.len();
+    while len >= 0x80 {
+        output.push((len as u8) | 0x80);
+        len >>= 7;
+    }
+    output.push(len as u8);
+    output.extend_from_slice(data);
+}
+
+fn convert_value_to_core(value: &Value) -> CoreValue {
+    match value {
+        Value::None | Value::Null => CoreValue::Null,
+        Value::Integer { value } => CoreValue::Integer(*value),
+        Value::Float { value } => CoreValue::Float(*value),
+        Value::Text { value } => CoreValue::Text(turso_core::types::Text {
+            value: std::borrow::Cow::Owned(value.clone()),
+            subtype: turso_core::types::TextSubtype::Text,
+        }),
+        Value::Blob { value } => CoreValue::Blob(value.to_vec()),
+    }
+}
+
+fn convert_core_to_value(value: CoreValue) -> Value {
+    match value {
+        CoreValue::Null => Value::Null,
+        CoreValue::Integer(v) => Value::Integer { value: v },
+        CoreValue::Float(v) => Value::Float { value: v },
+        CoreValue::Text(t) => Value::Text {
+            value: t.value.to_string(),
         },
-        CoreValue::Blob(b) => HranaValue::Blob {
+        CoreValue::Blob(b) => Value::Blob {
             value: Bytes::from(b),
         },
-    }
-}
-
-// The following implementations ensure compatibility with turso_core::Statement::bind_at signature
-trait BindAtExt {
-    fn bind_at(&mut self, idx: NonZeroUsize, val: CoreValue) -> Result<()>;
-}
-
-impl BindAtExt for turso_core::Statement {
-    fn bind_at(&mut self, idx: NonZeroUsize, val: CoreValue) -> Result<()> {
-        self.bind_at(idx, val);
-        Ok(())
     }
 }

@@ -1,12 +1,12 @@
 ---
-name: sync-server
+name: local-sync-server
 ---
 
-<Code model="openai/gpt-5" language="rust" output="sync_server.rs" id="code">
+<Code model="anthropic/claude-opus-4-5" language="rust" output="sync_server.rs" id="code">
     <Output ref="prompt" />
 </Code>
 
-<Doc model="openai/gpt-5" output="../../turso-docs/sync/spec.mdx" id="doc">
+<Doc model="anthropic/sonnet-4.5" output="../../turso-docs/sync/spec.mdx" id="doc">
     Generate MDX documentation file in Mintlify format for the sync engine open protocol
 
     You will be provided with a prompt which is used to generate simple implementation of the server.
@@ -87,6 +87,8 @@ impl TursoSyncServer {
     ```rs
     let conn = { self.conn.lock().unwrap().clone() }; // this is wrong!
     ```
+- USE rocket library for http server
+- DO NOT use tokio - use simple threads instead
 
 # Endpoints
 
