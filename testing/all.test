@@ -49,3 +49,4 @@ source $testdir/window.test
 source $testdir/partial_idx.test
 source $testdir/foreign_keys.test
 source $testdir/returning.test
+source $testdir/trigger.test
