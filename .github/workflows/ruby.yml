@@ -30,11 +30,9 @@ jobs:
         os: [blacksmith-4vcpu-ubuntu-2404, macos-latest, windows-2025]
         ruby-version: ['3.2', '3.3']
     runs-on: ${{ matrix.os }}
-
     defaults:
       run:
         working-directory: ${{ env.working-directory }}
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -42,6 +40,22 @@ jobs:
       - name: Install LLVM 19
         if: runner.os == 'Windows'
         run: choco install llvm --version=19.1.7 --allow-downgrade -y
+
+      - name: Set up MSYS2
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: UCRT64
+          update: true
+          install: >-
+            mingw-w64-ucrt-x86_64-gcc
+            make
+
+      - name: Install Rust GNU toolchain
+        if: runner.os == 'Windows'
+        run: |
+          rustup toolchain install stable-x86_64-pc-windows-gnu
+          rustup default stable-x86_64-pc-windows-gnu
 
       - uses: oxidize-rb/actions/setup-ruby-and-rust@v1
         with:
@@ -65,11 +79,9 @@ jobs:
   lint:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 15
-
     defaults:
       run:
         working-directory: ${{ env.working-directory }}/ext/turso
-
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
