@@ -6189,7 +6189,7 @@ pub fn op_init_coroutine(
     assert!(jump_on_definition.is_offset());
     let start_offset = start_offset.as_offset_int();
     state.registers[*yield_reg] = Register::Value(Value::Integer(start_offset as i64));
-    state.ended_coroutine.unset(*yield_reg);
+    state.ended_coroutine.retain(|n| *n != *yield_reg as u32);
     let jump_on_definition = jump_on_definition.as_offset_int();
     state.pc = if jump_on_definition == 0 {
         state.pc + 1
@@ -6208,7 +6208,7 @@ pub fn op_end_coroutine(
     load_insn!(EndCoroutine { yield_reg }, insn);
 
     if let Value::Integer(pc) = state.registers[*yield_reg].get_value() {
-        state.ended_coroutine.set(*yield_reg);
+        state.ended_coroutine.push(*yield_reg as u32);
         let pc: u32 = (*pc)
             .try_into()
             .unwrap_or_else(|_| panic!("EndCoroutine: pc overflow: {pc}"));
@@ -6233,7 +6233,7 @@ pub fn op_yield(
         insn
     );
     if let Value::Integer(pc) = state.registers[*yield_reg].get_value() {
-        if state.ended_coroutine.get(*yield_reg) {
+        if state.ended_coroutine.contains(&(*yield_reg as u32)) {
             state.pc = end_offset.as_offset_int();
         } else {
             let pc: u32 = (*pc)
