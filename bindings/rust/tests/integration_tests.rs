@@ -500,3 +500,34 @@ async fn test_transaction_prepared_statement() {
     let id: i64 = row.get(0).unwrap();
     assert_eq!(id, 1);
 }
+
+// Test Connection clone
+#[tokio::test]
+async fn test_connection_clone() {
+    let db = Builder::new_local(":memory:").build().await.unwrap();
+    let mut conn = db.connect().unwrap();
+
+    conn.execute("CREATE TABLE users (id INTEGER, name TEXT)", ())
+        .await
+        .unwrap();
+
+    let tx = conn.transaction().await.unwrap();
+    let mut stmt = tx
+        .prepare("INSERT INTO users VALUES (?1, ?2)")
+        .await
+        .unwrap();
+    stmt.execute(["1", "Frodo"]).await.unwrap();
+    tx.commit().await.unwrap();
+
+    let conn2 = conn.clone();
+    let row = conn2
+        .prepare("SELECT id FROM users WHERE name = ?")
+        .await
+        .unwrap()
+        .query_row(&["Frodo"])
+        .await
+        .unwrap();
+
+    let id: i64 = row.get(0).unwrap();
+    assert_eq!(id, 1);
+}
