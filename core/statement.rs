@@ -22,8 +22,8 @@ use crate::{
         self,
         explain::{EXPLAIN_COLUMNS_TYPE, EXPLAIN_QUERY_PLAN_COLUMNS_TYPE},
     },
-    Instant, LimboError, MvStore, Pager, QueryMode, Result, TransactionState, Value,
-    EXPLAIN_COLUMNS, EXPLAIN_QUERY_PLAN_COLUMNS,
+    Instant, LimboError, MvStore, Pager, QueryMode, Result, Value, EXPLAIN_COLUMNS,
+    EXPLAIN_QUERY_PLAN_COLUMNS,
 };
 
 type ProgramExecutionState = vdbe::ProgramExecutionState;
@@ -265,7 +265,7 @@ impl Statement {
         loop {
             match self.step()? {
                 vdbe::StepResult::Done => return Ok(()),
-                vdbe::StepResult::IO => self.run_once()?,
+                vdbe::StepResult::IO => self.pager.io.step()?,
                 vdbe::StepResult::Row => continue,
                 vdbe::StepResult::Interrupt | vdbe::StepResult::Busy => {
                     return Err(LimboError::Busy)
@@ -279,7 +279,7 @@ impl Statement {
         loop {
             match self.step()? {
                 vdbe::StepResult::Done => return Ok(values),
-                vdbe::StepResult::IO => self.run_once()?,
+                vdbe::StepResult::IO => self.pager.io.step()?,
                 vdbe::StepResult::Row => {
                     values.push(self.row().unwrap().get_values().cloned().collect());
                     continue;
@@ -289,6 +289,25 @@ impl Statement {
                 }
             }
         }
+    }
+
+    /// Blocks execution and advances IO
+    pub(crate) fn run_with_row_callback(
+        &mut self,
+        mut func: impl FnMut(&Row) -> Result<()>,
+    ) -> Result<()> {
+        loop {
+            match self.step()? {
+                vdbe::StepResult::Done => break,
+                vdbe::StepResult::IO => self.pager.io.step()?,
+                vdbe::StepResult::Row => {
+                    func(self.row().expect("row should be present"))?;
+                }
+                vdbe::StepResult::Interrupt => return Err(LimboError::Interrupt),
+                vdbe::StepResult::Busy => return Err(LimboError::Busy),
+            }
+        }
+        Ok(())
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
@@ -328,24 +347,6 @@ impl Statement {
         // Load the parameters back into the state
         self.state.parameters = parameters;
         Ok(())
-    }
-
-    pub fn run_once(&self) -> Result<()> {
-        let res = self.pager.io.step();
-        if self.program.connection.is_nested_stmt() {
-            return res;
-        }
-        if res.is_err() {
-            if let Some(io) = &self.state.io_completions {
-                io.abort();
-            }
-            let state = self.program.connection.get_tx_state();
-            if let TransactionState::Write { .. } = state {
-                self.pager.rollback_tx(&self.program.connection);
-                self.program.connection.set_tx_state(TransactionState::None);
-            }
-        }
-        res
     }
 
     pub fn num_columns(&self) -> usize {

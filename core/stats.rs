@@ -4,7 +4,7 @@ use std::sync::Arc;
 use crate::schema::Schema;
 use crate::translate::emitter::TransactionMode;
 use crate::util::normalize_ident;
-use crate::{Connection, Result, Statement, StepResult, TransactionState, Value};
+use crate::{Connection, Result, Statement, TransactionState, Value};
 pub const STATS_TABLE: &str = "sqlite_stat1";
 const STATS_QUERY: &str = "SELECT tbl, idx, stat FROM sqlite_stat1";
 
@@ -119,72 +119,61 @@ fn load_sqlite_stat1_from_stmt(
     schema: &Schema,
     stats: &mut AnalyzeStats,
 ) -> Result<()> {
-    loop {
-        match stmt.step()? {
-            StepResult::Row => {
-                let row = stmt.row().expect("row should be present");
-                let table_name = row.get::<&str>(0)?;
-                let idx_value = row.get::<&Value>(1)?;
-                let stat_value = row.get::<&Value>(2)?;
+    stmt.run_with_row_callback(|row| {
+        let table_name = row.get::<&str>(0)?;
+        let idx_value = row.get::<&Value>(1)?;
+        let stat_value = row.get::<&Value>(2)?;
 
-                let idx_name = match idx_value {
-                    Value::Null => None,
-                    Value::Text(s) => Some(s.as_str()),
-                    _ => None,
-                };
-                let stat = match stat_value {
-                    Value::Text(s) => s.as_str(),
-                    _ => continue,
-                };
+        let idx_name = match idx_value {
+            Value::Null => None,
+            Value::Text(s) => Some(s.as_str()),
+            _ => None,
+        };
+        let stat = match stat_value {
+            Value::Text(s) => s.as_str(),
+            _ => return Ok(()),
+        };
 
-                // Skip if table is not a regular B-tree.
-                if schema.get_btree_table(table_name).is_none() {
-                    continue;
-                }
-                let Some(numbers) = parse_stat_numbers(stat) else {
-                    continue;
-                };
-                if numbers.is_empty() {
-                    continue;
-                }
-                if idx_name.is_none() {
-                    if let Some(total_rows) = numbers.first().copied() {
-                        stats.table_stats_mut(table_name).row_count = Some(total_rows);
-                    }
-                    continue;
-                }
-
-                // Index-level entry: only keep if the index exists on this table.
-                let idx_name = normalize_ident(idx_name.unwrap());
-                if schema.get_index(table_name, &idx_name).is_none() {
-                    continue;
-                }
-
-                let total_rows = numbers.first().copied();
-                {
-                    let idx_stats = stats.table_stats_mut(table_name).index_stats_mut(&idx_name);
-                    idx_stats.total_rows = total_rows;
-                    idx_stats.distinct_per_prefix = numbers.iter().skip(1).copied().collect();
-                }
-
-                // If we didn't see a table-level row yet, seed row_count from index stats.
-                if let Some(total_rows) = total_rows {
-                    let table_stats = stats.table_stats_mut(table_name);
-                    if table_stats.row_count.is_none() {
-                        table_stats.row_count = Some(total_rows);
-                    }
-                }
-            }
-            StepResult::Done => break,
-            StepResult::IO => {
-                stmt.run_once()?;
-            }
-            StepResult::Interrupt => {
-                return Err(crate::LimboError::InternalError("interrupted".to_string()))
-            }
-            StepResult::Busy => return Err(crate::LimboError::Busy),
+        // Skip if table is not a regular B-tree.
+        if schema.get_btree_table(table_name).is_none() {
+            return Ok(());
         }
-    }
+        let Some(numbers) = parse_stat_numbers(stat) else {
+            return Ok(());
+        };
+        if numbers.is_empty() {
+            return Ok(());
+        }
+        if idx_name.is_none() {
+            if let Some(total_rows) = numbers.first().copied() {
+                stats.table_stats_mut(table_name).row_count = Some(total_rows);
+            }
+            return Ok(());
+        }
+
+        // Index-level entry: only keep if the index exists on this table.
+        let idx_name = normalize_ident(idx_name.unwrap());
+        if schema.get_index(table_name, &idx_name).is_none() {
+            return Ok(());
+        }
+
+        let total_rows = numbers.first().copied();
+        {
+            let idx_stats = stats.table_stats_mut(table_name).index_stats_mut(&idx_name);
+            idx_stats.total_rows = total_rows;
+            idx_stats.distinct_per_prefix = numbers.iter().skip(1).copied().collect();
+        }
+
+        // If we didn't see a table-level row yet, seed row_count from index stats.
+        if let Some(total_rows) = total_rows {
+            let table_stats = stats.table_stats_mut(table_name);
+            if table_stats.row_count.is_none() {
+                table_stats.row_count = Some(total_rows);
+            }
+        }
+        Ok(())
+    })?;
+
     Ok(())
 }
 
