@@ -1,0 +1,16 @@
+[package]
+name = "turso-ruby"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+publish = false
+
+[lib]
+name = "turso"
+crate-type = ["cdylib"]
+
+[dependencies]
+magnus = { version = "0.8.2", features = ["rb-sys"] }
+
+[build-dependencies]
+rb-sys-env = "0.2.2"
