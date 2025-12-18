@@ -298,7 +298,7 @@ do_execsql_test printf-width-integer-negative-value {
 
 do_execsql_test printf-width-integer-zero-value {
   SELECT printf('Number: %5d', 0);
-} {{Number:    0}}
+} {{Number:     0}}
 
 do_execsql_test printf-width-integer-zero-width {
   SELECT printf('Number: %0d', 42);
