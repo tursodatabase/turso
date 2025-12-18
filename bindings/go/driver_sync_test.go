@@ -12,17 +12,85 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
 
-type TursoServer struct {
-	AdminUrl string
-	UserUrl  string
-}
-
 func randomString() string {
 	return fmt.Sprintf("r-%v", rand.Intn(1000_000_000))
+}
+
+var (
+	AdminUrl = "http://localhost:8081"
+	UserUrl  = "http://localhost:8080"
+)
+
+type TursoServer struct {
+	DbUrl   string
+	userUrl string
+	host    string
+	server  *os.Process
+}
+
+func NewTursoServer() (*TursoServer, error) {
+	if localSyncServer, ok := os.LookupEnv("LOCAL_SYNC_SERVER"); ok {
+		port := 10_000 + rand.Intn(65536-10_000)
+		server, err := os.StartProcess(
+			localSyncServer,
+			[]string{localSyncServer, "--sync-server", fmt.Sprintf("0.0.0.0:%v", port)},
+			&os.ProcAttr{Files: []*os.File{
+				os.Stdin,
+				os.Stdout,
+				os.Stderr,
+			}},
+		)
+		if err != nil {
+			return nil, err
+		}
+		turso := &TursoServer{
+			userUrl: fmt.Sprintf("http://localhost:%v", port),
+			DbUrl:   fmt.Sprintf("http://localhost:%v", port),
+			host:    "",
+			server:  server,
+		}
+		for {
+			_, err := http.Get(turso.userUrl)
+			if err == nil {
+				break
+			}
+			time.Sleep(1 * time.Millisecond)
+		}
+		return turso, nil
+	} else {
+		name := randomString()
+		err := handleResponse(http.Post(fmt.Sprintf("%v/v1/tenants/%v", AdminUrl, name), "application/json", nil))
+		if err != nil {
+			return nil, err
+		}
+		err = handleResponse(http.Post(fmt.Sprintf("%v/v1/tenants/%v/groups/%v", AdminUrl, name, name), "application/json", nil))
+		if err != nil {
+			return nil, err
+		}
+		err = handleResponse(http.Post(fmt.Sprintf("%v/v1/tenants/%v/groups/%v/databases/%v", AdminUrl, name, name, name), "application/json", nil))
+		if err != nil {
+			return nil, err
+		}
+		userUrl := strings.Split(UserUrl, "://")
+		turso := &TursoServer{
+			userUrl: UserUrl,
+			DbUrl:   fmt.Sprintf("%v://%v--%v--%v.%v", userUrl[0], name, name, name, userUrl[1]),
+			host:    fmt.Sprintf("%v--%v--%v.localhost", name, name, name),
+		}
+		return turso, nil
+	}
+}
+
+func (s *TursoServer) Close() {
+	if s.server != nil {
+		s.server.Kill()
+		s.server.Wait()
+	}
 }
 
 func handleResponse(response *http.Response, err error) error {
@@ -41,24 +109,7 @@ func handleResponse(response *http.Response, err error) error {
 	return fmt.Errorf("http failed: %v %v", response.StatusCode, text)
 }
 
-func (s *TursoServer) CreateTenant(tenant string) error {
-	return handleResponse(http.Post(fmt.Sprintf("%v/v1/tenants/%v", s.AdminUrl, tenant), "application/json", nil))
-}
-
-func (s *TursoServer) CreateGroup(tenant, group string) error {
-	return handleResponse(http.Post(fmt.Sprintf("%v/v1/tenants/%v/groups/%v", s.AdminUrl, tenant, group), "application/json", nil))
-}
-
-func (s *TursoServer) CreateDb(tenant, group, db string) error {
-	return handleResponse(http.Post(fmt.Sprintf("%v/v1/tenants/%v/groups/%v/databases/%v", s.AdminUrl, tenant, group, db), "application/json", nil))
-}
-
-func (s *TursoServer) DbUrl(tenant, group, db string) string {
-	tokens := strings.Split(s.UserUrl, "://")
-	return fmt.Sprintf("%v://%v--%v--%v.%v", tokens[0], db, tenant, group, tokens[1])
-}
-
-func (s *TursoServer) DbSql(tenant, group, db string, sql string) ([][]any, error) {
+func (s *TursoServer) DbSql(sql string) ([][]any, error) {
 	data := map[string]any{
 		"requests": []map[string]any{
 			{"type": "execute", "stmt": map[string]any{"sql": sql}},
@@ -68,11 +119,11 @@ func (s *TursoServer) DbSql(tenant, group, db string, sql string) ([][]any, erro
 	if err != nil {
 		return nil, err
 	}
-	r, err := http.NewRequest("POST", fmt.Sprintf("%v/v2/pipeline", s.UserUrl), bytes.NewReader(payload))
+	r, err := http.NewRequest("POST", fmt.Sprintf("%v/v2/pipeline", s.userUrl), bytes.NewReader(payload))
 	if err != nil {
 		return nil, err
 	}
-	r.Host = fmt.Sprintf("%v--%v--%v.localhost", tenant, group, db)
+	r.Host = s.host
 
 	response, err := http.DefaultClient.Do(r)
 	if err != nil {
@@ -113,23 +164,19 @@ var (
 )
 
 func TestSyncBootstrap(t *testing.T) {
-	if !SYNC_TEST_RUN {
-		t.Skipf("sync tests must be run explicitly with SYNC_TEST_RUN env var")
-	}
-	server := TursoServer{AdminUrl: "http://localhost:8081", UserUrl: "http://localhost:8080"}
-	name := randomString()
-	require.Nil(t, server.CreateTenant(name))
-	require.Nil(t, server.CreateGroup(name, name))
-	require.Nil(t, server.CreateDb(name, name, name))
-	_, err := server.DbSql(name, name, name, "CREATE TABLE t(x)")
+	server, err := NewTursoServer()
 	require.Nil(t, err)
-	_, err = server.DbSql(name, name, name, "INSERT INTO t VALUES ('hello'), ('turso'), ('sync-go')")
+	t.Cleanup(func() { server.Close() })
+
+	_, err = server.DbSql("CREATE TABLE t(x)")
+	require.Nil(t, err)
+	_, err = server.DbSql("INSERT INTO t VALUES ('hello'), ('turso'), ('sync-go')")
 	require.Nil(t, err)
 
 	db, err := NewTursoSyncDb(context.Background(), TursoSyncDbConfig{
 		Path:       ":memory:",
 		ClientName: "turso-sync-go",
-		RemoteUrl:  server.DbUrl(name, name, name),
+		RemoteUrl:  server.DbUrl,
 	})
 	require.Nil(t, err)
 	conn, err := db.Connect(context.Background())
@@ -146,17 +193,13 @@ func TestSyncBootstrap(t *testing.T) {
 }
 
 func TestSyncBootstrapPersistent(t *testing.T) {
-	if !SYNC_TEST_RUN {
-		t.Skipf("sync tests must be run explicitly with SYNC_TEST_RUN env var")
-	}
-	server := TursoServer{AdminUrl: "http://localhost:8081", UserUrl: "http://localhost:8080"}
-	name := randomString()
-	require.Nil(t, server.CreateTenant(name))
-	require.Nil(t, server.CreateGroup(name, name))
-	require.Nil(t, server.CreateDb(name, name, name))
-	_, err := server.DbSql(name, name, name, "CREATE TABLE t(x)")
+	server, err := NewTursoServer()
 	require.Nil(t, err)
-	_, err = server.DbSql(name, name, name, "INSERT INTO t VALUES ('hello'), ('turso'), ('sync-go')")
+	t.Cleanup(func() { server.Close() })
+
+	_, err = server.DbSql("CREATE TABLE t(x)")
+	require.Nil(t, err)
+	_, err = server.DbSql("INSERT INTO t VALUES ('hello'), ('turso'), ('sync-go')")
 	require.Nil(t, err)
 
 	dir, err := os.MkdirTemp(".", "test-sync-")
@@ -165,7 +208,7 @@ func TestSyncBootstrapPersistent(t *testing.T) {
 
 	db, err := NewTursoSyncDb(context.Background(), TursoSyncDbConfig{
 		Path:      filepath.Join(dir, "local.db"),
-		RemoteUrl: server.DbUrl(name, name, name),
+		RemoteUrl: server.DbUrl,
 	})
 	require.Nil(t, err)
 	conn, err := db.Connect(context.Background())
@@ -182,29 +225,25 @@ func TestSyncBootstrapPersistent(t *testing.T) {
 }
 
 func TestSyncPull(t *testing.T) {
-	if !SYNC_TEST_RUN {
-		t.Skipf("sync tests must be run explicitly with SYNC_TEST_RUN env var")
-	}
-	server := TursoServer{AdminUrl: "http://localhost:8081", UserUrl: "http://localhost:8080"}
-	name := randomString()
-	require.Nil(t, server.CreateTenant(name))
-	require.Nil(t, server.CreateGroup(name, name))
-	require.Nil(t, server.CreateDb(name, name, name))
-	_, err := server.DbSql(name, name, name, "CREATE TABLE t(x)")
+	server, err := NewTursoServer()
 	require.Nil(t, err)
-	_, err = server.DbSql(name, name, name, "INSERT INTO t VALUES ('hello'), ('turso'), ('sync-go')")
+	t.Cleanup(func() { server.Close() })
+
+	_, err = server.DbSql("CREATE TABLE t(x)")
+	require.Nil(t, err)
+	_, err = server.DbSql("INSERT INTO t VALUES ('hello'), ('turso'), ('sync-go')")
 	require.Nil(t, err)
 
 	db, err := NewTursoSyncDb(context.Background(), TursoSyncDbConfig{
 		Path:       ":memory:",
 		ClientName: "turso-sync-go",
-		RemoteUrl:  server.DbUrl(name, name, name),
+		RemoteUrl:  server.DbUrl,
 	})
 	require.Nil(t, err)
 	conn, err := db.Connect(context.Background())
 	require.Nil(t, err)
 
-	_, err = server.DbSql(name, name, name, "INSERT INTO t VALUES ('pull-works')")
+	_, err = server.DbSql("INSERT INTO t VALUES ('pull-works')")
 	require.Nil(t, err)
 
 	rows, err := conn.QueryContext(context.Background(), "SELECT * FROM t")
@@ -239,29 +278,25 @@ func TestSyncPull(t *testing.T) {
 }
 
 func TestSyncPullDoNotPush(t *testing.T) {
-	if !SYNC_TEST_RUN {
-		t.Skipf("sync tests must be run explicitly with SYNC_TEST_RUN env var")
-	}
-	server := TursoServer{AdminUrl: "http://localhost:8081", UserUrl: "http://localhost:8080"}
-	name := randomString()
-	require.Nil(t, server.CreateTenant(name))
-	require.Nil(t, server.CreateGroup(name, name))
-	require.Nil(t, server.CreateDb(name, name, name))
-	_, err := server.DbSql(name, name, name, "CREATE TABLE t(x)")
+	server, err := NewTursoServer()
 	require.Nil(t, err)
-	_, err = server.DbSql(name, name, name, "INSERT INTO t VALUES ('hello'), ('turso'), ('sync-go')")
+	t.Cleanup(func() { server.Close() })
+
+	_, err = server.DbSql("CREATE TABLE t(x)")
+	require.Nil(t, err)
+	_, err = server.DbSql("INSERT INTO t VALUES ('hello'), ('turso'), ('sync-go')")
 	require.Nil(t, err)
 
 	db, err := NewTursoSyncDb(context.Background(), TursoSyncDbConfig{
 		Path:       ":memory:",
 		ClientName: "turso-sync-go",
-		RemoteUrl:  server.DbUrl(name, name, name),
+		RemoteUrl:  server.DbUrl,
 	})
 	require.Nil(t, err)
 	conn, err := db.Connect(context.Background())
 	require.Nil(t, err)
 
-	_, err = server.DbSql(name, name, name, "INSERT INTO t VALUES ('pull-works')")
+	_, err = server.DbSql("INSERT INTO t VALUES ('pull-works')")
 	require.Nil(t, err)
 
 	rows, err := conn.QueryContext(context.Background(), "SELECT * FROM t")
@@ -297,29 +332,25 @@ func TestSyncPullDoNotPush(t *testing.T) {
 	require.Equal(t, values, []string{"hello", "turso", "sync-go", "pull-works", "push-is-local"})
 	rows.Close()
 
-	remote, err := server.DbSql(name, name, name, "SELECT * FROM t")
+	remote, err := server.DbSql("SELECT * FROM t")
 	require.Nil(t, err)
 	require.Equal(t, remote, [][]any{{"hello"}, {"turso"}, {"sync-go"}, {"pull-works"}})
 }
 
 func TestSyncPush(t *testing.T) {
-	if !SYNC_TEST_RUN {
-		t.Skipf("sync tests must be run explicitly with SYNC_TEST_RUN env var")
-	}
-	server := TursoServer{AdminUrl: "http://localhost:8081", UserUrl: "http://localhost:8080"}
-	name := randomString()
-	require.Nil(t, server.CreateTenant(name))
-	require.Nil(t, server.CreateGroup(name, name))
-	require.Nil(t, server.CreateDb(name, name, name))
-	_, err := server.DbSql(name, name, name, "CREATE TABLE t(x)")
+	server, err := NewTursoServer()
 	require.Nil(t, err)
-	_, err = server.DbSql(name, name, name, "INSERT INTO t VALUES ('hello'), ('turso'), ('sync-go')")
+	t.Cleanup(func() { server.Close() })
+
+	_, err = server.DbSql("CREATE TABLE t(x)")
+	require.Nil(t, err)
+	_, err = server.DbSql("INSERT INTO t VALUES ('hello'), ('turso'), ('sync-go')")
 	require.Nil(t, err)
 
 	db, err := NewTursoSyncDb(context.Background(), TursoSyncDbConfig{
 		Path:       ":memory:",
 		ClientName: "turso-sync-go",
-		RemoteUrl:  server.DbUrl(name, name, name),
+		RemoteUrl:  server.DbUrl,
 	})
 	require.Nil(t, err)
 	conn, err := db.Connect(context.Background())
@@ -328,31 +359,26 @@ func TestSyncPush(t *testing.T) {
 	_, err = conn.Exec("INSERT INTO t VALUES ('push-works')")
 	require.Nil(t, err)
 
-	rows, err := server.DbSql(name, name, name, "SELECT * FROM t")
+	rows, err := server.DbSql("SELECT * FROM t")
 	require.Nil(t, err)
 	require.Equal(t, rows, [][]any{{"hello"}, {"turso"}, {"sync-go"}})
 
 	require.Nil(t, db.Push(context.Background()))
 
-	rows, err = server.DbSql(name, name, name, "SELECT * FROM t")
+	rows, err = server.DbSql("SELECT * FROM t")
 	require.Nil(t, err)
 	require.Equal(t, rows, [][]any{{"hello"}, {"turso"}, {"sync-go"}, {"push-works"}})
 }
 
 func TestSyncCheckpoint(t *testing.T) {
-	if !SYNC_TEST_RUN {
-		t.Skipf("sync tests must be run explicitly with SYNC_TEST_RUN env var")
-	}
-	server := TursoServer{AdminUrl: "http://localhost:8081", UserUrl: "http://localhost:8080"}
-	name := randomString()
-	require.Nil(t, server.CreateTenant(name))
-	require.Nil(t, server.CreateGroup(name, name))
-	require.Nil(t, server.CreateDb(name, name, name))
+	server, err := NewTursoServer()
+	require.Nil(t, err)
+	t.Cleanup(func() { server.Close() })
 
 	db, err := NewTursoSyncDb(context.Background(), TursoSyncDbConfig{
 		Path:       ":memory:",
 		ClientName: "turso-sync-go",
-		RemoteUrl:  server.DbUrl(name, name, name),
+		RemoteUrl:  server.DbUrl,
 	})
 	require.Nil(t, err)
 	conn, err := db.Connect(context.Background())
@@ -380,29 +406,25 @@ func TestSyncCheckpoint(t *testing.T) {
 
 	require.Nil(t, db.Push(context.Background()))
 
-	rows, err := server.DbSql(name, name, name, "SELECT SUM(x) FROM t")
+	rows, err := server.DbSql("SELECT SUM(x) FROM t")
 	require.Nil(t, err)
 	require.Equal(t, rows, [][]any{{fmt.Sprintf("%v", 1024*1023/2)}})
 }
 
 func TestSyncPartial(t *testing.T) {
-	if !SYNC_TEST_RUN {
-		t.Skipf("sync tests must be run explicitly with SYNC_TEST_RUN env var")
-	}
-	server := TursoServer{AdminUrl: "http://localhost:8081", UserUrl: "http://localhost:8080"}
-	name := randomString()
-	require.Nil(t, server.CreateTenant(name))
-	require.Nil(t, server.CreateGroup(name, name))
-	require.Nil(t, server.CreateDb(name, name, name))
-	_, err := server.DbSql(name, name, name, "CREATE TABLE t(x)")
+	server, err := NewTursoServer()
 	require.Nil(t, err)
-	_, err = server.DbSql(name, name, name, "INSERT INTO t SELECT randomblob(1024) FROM generate_series(1, 1024)")
+	t.Cleanup(func() { server.Close() })
+
+	_, err = server.DbSql("CREATE TABLE t(x)")
+	require.Nil(t, err)
+	_, err = server.DbSql("INSERT INTO t SELECT randomblob(1024) FROM generate_series(1, 1024)")
 	require.Nil(t, err)
 
 	db, err := NewTursoSyncDb(context.Background(), TursoSyncDbConfig{
 		Path:       ":memory:",
 		ClientName: "turso-sync-go",
-		RemoteUrl:  server.DbUrl(name, name, name),
+		RemoteUrl:  server.DbUrl,
 		PartialSyncConfig: TursoPartialSyncConfig{
 			BootstrapStrategyPrefix: 128 * 1024,
 		},
