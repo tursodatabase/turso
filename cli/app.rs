@@ -33,8 +33,7 @@ use std::{
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use turso_core::{
-    Connection, Database, DatabaseOpts, LimboError, OpenFlags, QueryMode, Statement, StepResult,
-    Value,
+    Connection, Database, DatabaseOpts, LimboError, OpenFlags, QueryMode, Statement, Value,
 };
 
 #[derive(Parser, Debug)]
@@ -107,79 +106,94 @@ struct QueryStatistics {
     execute_time_elapsed_samples: Vec<Duration>,
 }
 
-macro_rules! row_step_result_query {
-    ($app:expr, $sql:expr, $rows:expr, $stats:expr, $row_handle:expr) => {
-        if $app.interrupt_count.load(Ordering::Acquire) > 0 {
-            println!("Query interrupted.");
-            return Ok(());
+/// A lending iterator over query result rows with optional statistics tracking.
+struct RowStepper<'a> {
+    rows: &'a mut Statement,
+    stats: Option<std::cell::RefCell<&'a mut QueryStatistics>>,
+}
+
+impl<'a> RowStepper<'a> {
+    fn new(rows: &'a mut Statement, stats: Option<&'a mut QueryStatistics>) -> Self {
+        Self {
+            rows,
+            stats: stats.map(std::cell::RefCell::new),
         }
+    }
 
-        let start = if $stats.is_some() {
-            Some(Instant::now())
-        } else {
-            None
-        };
-        match $rows.step() {
-            Ok(StepResult::Row) => {
-                if let Some(ref mut stats) = $stats {
-                    stats
-                        .execute_time_elapsed_samples
-                        .push(start.unwrap().elapsed());
-                }
+    /// Advances to the next row, returning it if available.
+    /// Returns Ok(Some(row)) for each row, Ok(None) when done, or Err on failure.
+    fn next_row(&mut self) -> Result<Option<&turso_core::Row>, LimboError> {
+        let execution_time = std::cell::Cell::new(Instant::now());
+        let io_time = std::cell::Cell::new(Instant::now());
 
-                $row_handle
-            }
-            Ok(StepResult::IO) => {
-                if let Some(ref mut stats) = $stats {
-                    stats.io_time_elapsed_samples.push(start.unwrap().elapsed());
-                }
-                let start = if $stats.is_some() {
-                    Some(Instant::now())
-                } else {
-                    None
-                };
-                $rows.run_once()?;
-                if let Some(ref mut stats) = $stats {
-                    stats.io_time_elapsed_samples.push(start.unwrap().elapsed());
-                }
-            }
-            Ok(StepResult::Interrupt) => {
-                if let Some(ref mut stats) = $stats {
+        let result = self.rows.run_one_step_blocking(
+            || {
+                // Push execution sample to not count IO time in execution
+                if let Some(stats) = self.stats.as_ref() {
                     stats
+                        .borrow_mut()
                         .execute_time_elapsed_samples
-                        .push(start.unwrap().elapsed());
+                        .push(execution_time.get().elapsed());
                 }
-                break;
-            }
-            Ok(StepResult::Done) => {
-                if let Some(ref mut stats) = $stats {
+                // Start io timer
+                io_time.set(Instant::now());
+                Ok(())
+            },
+            || {
+                // Push sample when we end IO
+                if let Some(stats) = self.stats.as_ref() {
                     stats
-                        .execute_time_elapsed_samples
-                        .push(start.unwrap().elapsed());
+                        .borrow_mut()
+                        .io_time_elapsed_samples
+                        .push(io_time.get().elapsed());
                 }
-                break;
-            }
-            Ok(StepResult::Busy) => {
-                if let Some(ref mut stats) = $stats {
+                // Restart Execution timer
+                execution_time.set(Instant::now());
+                Ok(())
+            },
+        );
+
+        match result {
+            Ok(row_opt) => {
+                if let Some(stats) = self.stats.as_ref() {
                     stats
+                        .borrow_mut()
                         .execute_time_elapsed_samples
-                        .push(start.unwrap().elapsed());
+                        .push(execution_time.get().elapsed());
                 }
-                let _ = $app.writeln("database is busy");
-                break;
+                Ok(row_opt)
             }
-            Err(err) => {
-                if let Some(ref mut stats) = $stats {
+            Err(e) => {
+                if let Some(stats) = self.stats.as_ref() {
                     stats
+                        .borrow_mut()
                         .execute_time_elapsed_samples
-                        .push(start.unwrap().elapsed());
+                        .push(execution_time.get().elapsed());
                 }
-                let report = miette::Error::from(err).with_source_code($sql.to_owned());
-                let _ = $app.writeln_fmt(format_args!("{report:?}"));
-                break;
+                Err(e)
             }
         }
-    };
+    }
+
+    /// Returns the number of columns in the result set.
+    fn num_columns(&self) -> usize {
+        self.rows.num_columns()
+    }
+
+    /// Returns the name of a column by index.
+    fn get_column_name(&self, idx: usize) -> std::borrow::Cow<'_, str> {
+        self.rows.get_column_name(idx)
+    }
+
+    /// Returns the current row (call after next_row returns Ok(Some(_))).
+    fn row(&self) -> Option<&turso_core::Row> {
+        self.rows.row()
+    }
+
+    /// Returns the query mode of the statement.
+    fn get_query_mode(&self) -> QueryMode {
+        self.rows.get_query_mode()
+    }
 }
 
 impl Limbo {
@@ -790,280 +804,389 @@ impl Limbo {
         &mut self,
         sql: &str,
         mut output: Result<Option<Statement>, LimboError>,
-        mut statistics: Option<&mut QueryStatistics>,
+        statistics: Option<&mut QueryStatistics>,
     ) -> anyhow::Result<()> {
         match output {
-            Ok(Some(ref mut rows)) => match (self.opts.output_mode, rows.get_query_mode()) {
-                (_, QueryMode::ExplainQueryPlan) => {
-                    struct Entry {
-                        id: usize,
-                        detail: String,
-                        child_prefix: String,
-                        children: Vec<Entry>,
+            Ok(Some(ref mut rows)) => {
+                let query_mode = rows.get_query_mode();
+                let output_mode = self.opts.output_mode;
+
+                match (output_mode, query_mode) {
+                    (_, QueryMode::ExplainQueryPlan) => {
+                        self.print_explain_query_plan(rows, statistics)?;
                     }
-
-                    let mut root = Entry {
-                        id: 0,
-                        detail: "QUERY PLAN".to_owned(),
-                        child_prefix: "".to_owned(),
-                        children: vec![],
-                    };
-
-                    fn add_children(
-                        id: usize,
-                        parent_id: usize,
-                        detail: String,
-                        current: &mut Entry,
-                    ) -> bool {
-                        if current.id == parent_id {
-                            current.children.push(Entry {
-                                id,
-                                detail,
-                                child_prefix: current.child_prefix.clone() + "   ",
-                                children: vec![],
-                            });
-                            if current.children.len() > 1 {
-                                let idx = current.children.len() - 2;
-                                current.children[idx].child_prefix =
-                                    current.child_prefix.clone() + "|  ";
-                            }
-
-                            return false;
-                        }
-
-                        for child in &mut current.children {
-                            if !add_children(id, parent_id, detail.clone(), child) {
-                                return false;
-                            }
-                        }
-
-                        true
+                    (_, QueryMode::Explain) => {
+                        self.print_explain(rows, statistics)?;
                     }
-
-                    fn print_entry(app: &mut Limbo, entry: &Entry, prefix: &str) {
-                        writeln!(app, "{}{}", prefix, entry.detail).unwrap();
-                        for (i, child) in entry.children.iter().enumerate() {
-                            let is_last = i == entry.children.len() - 1;
-                            let child_prefix = format!(
-                                "{}{}",
-                                entry.child_prefix,
-                                if is_last { "`--" } else { "|--" }
-                            );
-                            print_entry(app, child, child_prefix.as_str());
-                        }
+                    (OutputMode::List, _) => {
+                        self.print_list_mode(rows, statistics)?;
                     }
-
-                    loop {
-                        row_step_result_query!(self, sql, rows, statistics, {
-                            let row = rows.row().unwrap();
-                            let id: usize = row.get_value(0).as_uint() as usize;
-                            let parent_id: usize = row.get_value(1).as_uint() as usize;
-                            let detail = row.get_value(3).to_string();
-                            add_children(id, parent_id, detail, &mut root);
-                        });
+                    (OutputMode::Pretty, _) => {
+                        self.print_pretty_mode(rows, statistics)?;
                     }
-
-                    print_entry(self, &root, "");
-                }
-                (_, QueryMode::Explain) => {
-                    fn get_explain_indent(
-                        indent_count: usize,
-                        curr_insn: &str,
-                        prev_insn: &str,
-                        p1: &str,
-                        unclosed_begin_subrtns: &mut Vec<String>,
-                    ) -> usize {
-                        let indent_count = match prev_insn {
-                            "Rewind" | "Last" | "SorterSort" | "SeekGE" | "SeekGT" | "SeekLE"
-                            | "SeekLT" | "BeginSubrtn" | "IndexMethodQuery" => indent_count + 1,
-                            _ => indent_count,
-                        };
-
-                        // The corresponding closing instruction for BeginSubrtn is Return,
-                        // but Return is also used for other purposes, so we need to track pairs of
-                        // BeginSubrtn and Return that share the same 1st parameter (the subroutine register).
-                        if curr_insn == "BeginSubrtn" {
-                            unclosed_begin_subrtns.push(p1.to_string());
-                        }
-
-                        match curr_insn {
-                            "Next" | "SorterNext" | "Prev" => indent_count.saturating_sub(1),
-                            "Return" => {
-                                let matching_begin_subrtn =
-                                    unclosed_begin_subrtns.iter().position(|b| b == p1);
-                                if let Some(matching_begin_subrtn) = matching_begin_subrtn {
-                                    unclosed_begin_subrtns.remove(matching_begin_subrtn);
-                                    indent_count.saturating_sub(1)
-                                } else {
-                                    indent_count
-                                }
-                            }
-                            _ => indent_count,
-                        }
-                    }
-
-                    let _ = self.writeln(
-                        "addr  opcode             p1    p2    p3    p4             p5  comment",
-                    );
-                    let _ = self.writeln(
-                        "----  -----------------  ----  ----  ----  -------------  --  -------",
-                    );
-
-                    let mut prev_insn: String = "".to_string();
-                    let mut indent_count = 0;
-                    let indent = "  ";
-                    let mut unclosed_begin_subrtns = vec![];
-                    loop {
-                        row_step_result_query!(self, sql, rows, statistics, {
-                            let row = rows.row().unwrap();
-                            let insn = row.get_value(1).to_string();
-                            let p1 = row.get_value(2).to_string();
-                            indent_count = get_explain_indent(
-                                indent_count,
-                                &insn,
-                                &prev_insn,
-                                &p1,
-                                &mut unclosed_begin_subrtns,
-                            );
-                            let _ = self.writeln(format!(
-                                "{:<4}  {:<17}  {:<4}  {:<4}  {:<4}  {:<13}  {:<2}  {}",
-                                row.get_value(0).to_string(),
-                                &(indent.repeat(indent_count) + &insn),
-                                p1,
-                                row.get_value(3).to_string(),
-                                row.get_value(4).to_string(),
-                                row.get_value(5).to_string(),
-                                row.get_value(6).to_string(),
-                                row.get_value(7),
-                            ));
-                            prev_insn = insn;
-                        });
+                    (OutputMode::Line, _) => {
+                        self.print_line_mode(rows, statistics)?;
                     }
                 }
-                (OutputMode::List, _) => {
-                    let mut headers_printed = false;
-                    loop {
-                        row_step_result_query!(self, sql, rows, statistics, {
-                            // Print headers if enabled and not already printed
-                            if self.opts.headers && !headers_printed {
-                                for i in 0..rows.num_columns() {
-                                    if i > 0 {
-                                        let _ = self.write(b"|");
-                                    }
-                                    let _ = self.write(rows.get_column_name(i).as_bytes());
-                                }
-                                let _ = self.writeln("");
-                                headers_printed = true;
-                            }
-
-                            let row = rows.row().unwrap();
-                            for (i, value) in row.get_values().enumerate() {
-                                if i > 0 {
-                                    let _ = self.write(b"|");
-                                }
-                                if matches!(value, Value::Null) {
-                                    self.write_null()?;
-                                } else {
-                                    write!(self, "{value}")?;
-                                }
-                            }
-                            let _ = self.writeln("");
-                        });
-                    }
-                }
-                (OutputMode::Pretty, _) => {
-                    let config = self.config.as_ref().unwrap();
-                    let mut table = Table::new();
-                    table
-                        .set_content_arrangement(ContentArrangement::Dynamic)
-                        .set_truncation_indicator("…")
-                        .apply_modifier("││──├─┼┤│─┼├┤┬┴┌┐└┘");
-                    if rows.num_columns() > 0 {
-                        let header = (0..rows.num_columns())
-                            .map(|i| {
-                                let name = rows.get_column_name(i);
-                                Cell::new(name)
-                                    .add_attribute(Attribute::Bold)
-                                    .fg(config.table.header_color.as_comfy_table_color())
-                            })
-                            .collect::<Vec<_>>();
-                        table.set_header(header);
-                    }
-                    loop {
-                        row_step_result_query!(self, sql, rows, statistics, {
-                            let record = rows.row().unwrap();
-                            let mut row = Row::new();
-                            row.max_height(1);
-                            for (idx, value) in record.get_values().enumerate() {
-                                let (content, alignment) = match value {
-                                    Value::Null => {
-                                        (self.opts.null_value.clone(), CellAlignment::Left)
-                                    }
-                                    Value::Integer(_) => (format!("{value}"), CellAlignment::Right),
-                                    Value::Float(_) => (format!("{value}"), CellAlignment::Right),
-                                    Value::Text(_) => (format!("{value}"), CellAlignment::Left),
-                                    Value::Blob(_) => (format!("{value}"), CellAlignment::Left),
-                                };
-                                row.add_cell(
-                                    Cell::new(content)
-                                        .set_alignment(alignment)
-                                        .fg(config.table.column_colors
-                                            [idx % config.table.column_colors.len()]
-                                        .as_comfy_table_color()),
-                                );
-                            }
-                            table.add_row(row);
-                        });
-                    }
-
-                    if !table.is_empty() {
-                        writeln!(self, "{table}")?;
-                    }
-                }
-                (OutputMode::Line, _) => {
-                    let mut first_row_printed = false;
-
-                    let max_width = (0..rows.num_columns())
-                        .map(|i| rows.get_column_name(i).len())
-                        .max()
-                        .unwrap_or(0);
-
-                    let formatted_columns: Vec<String> = (0..rows.num_columns())
-                        .map(|i| format!("{:>width$}", rows.get_column_name(i), width = max_width))
-                        .collect();
-
-                    loop {
-                        row_step_result_query!(self, sql, rows, statistics, {
-                            let record = rows.row().unwrap();
-
-                            if !first_row_printed {
-                                first_row_printed = true;
-                            } else {
-                                self.writeln("")?;
-                            }
-
-                            for (i, value) in record.get_values().enumerate() {
-                                self.write(&formatted_columns[i])?;
-                                self.write(b" = ")?;
-                                if matches!(value, Value::Null) {
-                                    self.write_null()?;
-                                } else {
-                                    write!(self, "{value}")?;
-                                }
-                                self.writeln("")?;
-                            }
-                        });
-                    }
-                }
-            },
+            }
             Ok(None) => {}
+
             Err(err) => {
-                let report = miette::Error::from(err).with_source_code(sql.to_owned());
-                let _ = self.writeln_fmt(format_args!("{report:?}"));
+                match err {
+                    LimboError::Busy => {}
+                    LimboError::Interrupt => {}
+                    _ => {
+                        let report = miette::Error::from(err).with_source_code(sql.to_owned());
+                        let _ = self.writeln_fmt(format_args!("{report:?}"));
+                    }
+                }
                 anyhow::bail!("We have to throw here, even if we printed error");
             }
         }
         Ok(())
+    }
+
+    fn print_explain_query_plan(
+        &mut self,
+        rows: &mut Statement,
+        statistics: Option<&mut QueryStatistics>,
+    ) -> turso_core::Result<()> {
+        struct Entry {
+            id: usize,
+            detail: String,
+            child_prefix: String,
+            children: Vec<Entry>,
+        }
+
+        fn add_children(id: usize, parent_id: usize, detail: String, current: &mut Entry) -> bool {
+            if current.id == parent_id {
+                current.children.push(Entry {
+                    id,
+                    detail,
+                    child_prefix: current.child_prefix.clone() + "   ",
+                    children: vec![],
+                });
+                if current.children.len() > 1 {
+                    let idx = current.children.len() - 2;
+                    current.children[idx].child_prefix = current.child_prefix.clone() + "|  ";
+                }
+                return false;
+            }
+            for child in &mut current.children {
+                if !add_children(id, parent_id, detail.clone(), child) {
+                    return false;
+                }
+            }
+            true
+        }
+
+        fn print_entry(app: &mut Limbo, entry: &Entry, prefix: &str) {
+            writeln!(app, "{}{}", prefix, entry.detail).unwrap();
+            for (i, child) in entry.children.iter().enumerate() {
+                let is_last = i == entry.children.len() - 1;
+                let child_prefix = format!(
+                    "{}{}",
+                    entry.child_prefix,
+                    if is_last { "`--" } else { "|--" }
+                );
+                print_entry(app, child, child_prefix.as_str());
+            }
+        }
+
+        let mut root = Entry {
+            id: 0,
+            detail: "QUERY PLAN".to_owned(),
+            child_prefix: "".to_owned(),
+            children: vec![],
+        };
+
+        let mut stepper = RowStepper::new(rows, statistics);
+        loop {
+            match stepper.next_row() {
+                Ok(Some(row)) => {
+                    let id = row.get_value(0).as_uint() as usize;
+                    let parent_id = row.get_value(1).as_uint() as usize;
+                    let detail = row.get_value(3).to_string();
+                    add_children(id, parent_id, detail, &mut root);
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    self.handle_step_error(e);
+                    break;
+                }
+            }
+        }
+
+        print_entry(self, &root, "");
+        Ok(())
+    }
+
+    fn print_explain(
+        &mut self,
+        rows: &mut Statement,
+        statistics: Option<&mut QueryStatistics>,
+    ) -> turso_core::Result<()> {
+        fn get_explain_indent(
+            indent_count: usize,
+            curr_insn: &str,
+            prev_insn: &str,
+            p1: &str,
+            unclosed_begin_subrtns: &mut Vec<String>,
+        ) -> usize {
+            let indent_count = match prev_insn {
+                "Rewind" | "Last" | "SorterSort" | "SeekGE" | "SeekGT" | "SeekLE" | "SeekLT"
+                | "BeginSubrtn" | "IndexMethodQuery" => indent_count + 1,
+                _ => indent_count,
+            };
+
+            if curr_insn == "BeginSubrtn" {
+                unclosed_begin_subrtns.push(p1.to_string());
+            }
+
+            match curr_insn {
+                "Next" | "SorterNext" | "Prev" => indent_count.saturating_sub(1),
+                "Return" => {
+                    let matching = unclosed_begin_subrtns.iter().position(|b| b == p1);
+                    if let Some(idx) = matching {
+                        unclosed_begin_subrtns.remove(idx);
+                        indent_count.saturating_sub(1)
+                    } else {
+                        indent_count
+                    }
+                }
+                _ => indent_count,
+            }
+        }
+
+        let _ =
+            self.writeln("addr  opcode             p1    p2    p3    p4             p5  comment");
+        let _ =
+            self.writeln("----  -----------------  ----  ----  ----  -------------  --  -------");
+
+        let mut prev_insn = String::new();
+        let mut indent_count = 0;
+        let indent = "  ";
+        let mut unclosed_begin_subrtns = vec![];
+
+        let mut stepper = RowStepper::new(rows, statistics);
+        loop {
+            match stepper.next_row() {
+                Ok(Some(row)) => {
+                    let insn = row.get_value(1).to_string();
+                    let p1 = row.get_value(2).to_string();
+                    indent_count = get_explain_indent(
+                        indent_count,
+                        &insn,
+                        &prev_insn,
+                        &p1,
+                        &mut unclosed_begin_subrtns,
+                    );
+                    let _ = self.writeln(format!(
+                        "{:<4}  {:<17}  {:<4}  {:<4}  {:<4}  {:<13}  {:<2}  {}",
+                        row.get_value(0).to_string(),
+                        &(indent.repeat(indent_count) + &insn),
+                        p1,
+                        row.get_value(3).to_string(),
+                        row.get_value(4).to_string(),
+                        row.get_value(5).to_string(),
+                        row.get_value(6).to_string(),
+                        row.get_value(7),
+                    ));
+                    prev_insn = insn;
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    self.handle_step_error(e);
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn print_list_mode(
+        &mut self,
+        rows: &mut Statement,
+        statistics: Option<&mut QueryStatistics>,
+    ) -> turso_core::Result<()> {
+        let num_columns = rows.num_columns();
+        let column_names: Vec<String> = (0..num_columns)
+            .map(|i| rows.get_column_name(i).to_string())
+            .collect();
+        let print_headers = self.opts.headers;
+        let null_value = self.opts.null_value.clone();
+
+        let mut headers_printed = false;
+        let mut stepper = RowStepper::new(rows, statistics);
+        loop {
+            match stepper.next_row() {
+                Ok(Some(row)) => {
+                    if print_headers && !headers_printed {
+                        for (i, name) in column_names.iter().enumerate() {
+                            if i > 0 {
+                                let _ = self.write(b"|");
+                            }
+                            let _ = self.write(name.as_bytes());
+                        }
+                        let _ = self.writeln("");
+                        headers_printed = true;
+                    }
+
+                    for (i, value) in row.get_values().enumerate() {
+                        if i > 0 {
+                            let _ = self.write(b"|");
+                        }
+                        if matches!(value, Value::Null) {
+                            let _ = self.write(null_value.as_bytes());
+                        } else {
+                            write!(self, "{value}")?;
+                        }
+                    }
+                    let _ = self.writeln("");
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    self.handle_step_error(e);
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn print_pretty_mode(
+        &mut self,
+        rows: &mut Statement,
+        statistics: Option<&mut QueryStatistics>,
+    ) -> turso_core::Result<()> {
+        let config = self.config.as_ref().unwrap();
+        let null_value = self.opts.null_value.clone();
+        let num_columns = rows.num_columns();
+        let column_names: Vec<String> = (0..num_columns)
+            .map(|i| rows.get_column_name(i).to_string())
+            .collect();
+        let header_color = config.table.header_color.as_comfy_table_color();
+        let column_colors: Vec<_> = config
+            .table
+            .column_colors
+            .iter()
+            .map(|c| c.as_comfy_table_color())
+            .collect();
+
+        let mut table = Table::new();
+        table
+            .set_content_arrangement(ContentArrangement::Dynamic)
+            .set_truncation_indicator("…")
+            .apply_modifier("││──├─┼┤│─┼├┤┬┴┌┐└┘");
+
+        if num_columns > 0 {
+            let header = column_names
+                .iter()
+                .map(|name| {
+                    Cell::new(name)
+                        .add_attribute(Attribute::Bold)
+                        .fg(header_color)
+                })
+                .collect::<Vec<_>>();
+            table.set_header(header);
+        }
+
+        let mut stepper = RowStepper::new(rows, statistics);
+        loop {
+            match stepper.next_row() {
+                Ok(Some(row)) => {
+                    let mut table_row = Row::new();
+                    table_row.max_height(1);
+                    for (idx, value) in row.get_values().enumerate() {
+                        let (content, alignment) = match value {
+                            Value::Null => (null_value.clone(), CellAlignment::Left),
+                            Value::Integer(_) => (format!("{value}"), CellAlignment::Right),
+                            Value::Float(_) => (format!("{value}"), CellAlignment::Right),
+                            Value::Text(_) => (format!("{value}"), CellAlignment::Left),
+                            Value::Blob(_) => (format!("{value}"), CellAlignment::Left),
+                        };
+                        table_row.add_cell(
+                            Cell::new(content)
+                                .set_alignment(alignment)
+                                .fg(column_colors[idx % column_colors.len()]),
+                        );
+                    }
+                    table.add_row(table_row);
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    self.handle_step_error(e);
+                    break;
+                }
+            }
+        }
+
+        if !table.is_empty() {
+            writeln!(self, "{table}")?;
+        }
+        Ok(())
+    }
+
+    fn print_line_mode(
+        &mut self,
+        rows: &mut Statement,
+        statistics: Option<&mut QueryStatistics>,
+    ) -> turso_core::Result<()> {
+        let num_columns = rows.num_columns();
+        let column_names: Vec<String> = (0..num_columns)
+            .map(|i| rows.get_column_name(i).to_string())
+            .collect();
+        let max_width = column_names.iter().map(|n| n.len()).max().unwrap_or(0);
+        let formatted_columns: Vec<String> = column_names
+            .iter()
+            .map(|n| format!("{:>width$}", n, width = max_width))
+            .collect();
+        let null_value = self.opts.null_value.clone();
+
+        let mut first_row_printed = false;
+        let mut stepper = RowStepper::new(rows, statistics);
+        loop {
+            match stepper.next_row() {
+                Ok(Some(row)) => {
+                    if first_row_printed {
+                        self.writeln("")?;
+                    } else {
+                        first_row_printed = true;
+                    }
+
+                    for (i, value) in row.get_values().enumerate() {
+                        self.write(&formatted_columns[i])?;
+                        self.write(b" = ")?;
+                        if matches!(value, Value::Null) {
+                            self.write(null_value.as_bytes())?;
+                        } else {
+                            write!(self, "{value}")?;
+                        }
+                        self.writeln("")?;
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    self.handle_step_error(e);
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_step_error(&mut self, err: LimboError) {
+        match err {
+            LimboError::Interrupt => {
+                let _ = self.writeln(LimboError::Interrupt.to_string());
+            }
+            LimboError::Busy => {
+                let _ = self.writeln("database is busy");
+            }
+            _ => {
+                let _ = self.writeln_fmt(format_args!("Error: {err}"));
+            }
+        }
     }
 
     pub fn init_tracing(opts: &Opts) -> Result<WorkerGuard, std::io::Error> {
@@ -1707,7 +1830,6 @@ impl Limbo {
             let _ = rl.save_history(HISTORY_FILE.as_path());
         }
     }
-
 }
 
 fn quote_ident(s: &str) -> String {
