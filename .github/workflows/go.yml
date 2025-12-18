@@ -81,7 +81,7 @@ jobs:
         shell: pwsh
         run: |
           $env:PATH = "${{ github.workspace }}\target\debug;$env:PATH"
-          $env:LOCAL_SYNC_SERVER = "..\..\target\debug\tursodb"
+          $env:LOCAL_SYNC_SERVER = "..\..\target\debug\tursodb.exe"
           go test ./... -v
 
   publish:
