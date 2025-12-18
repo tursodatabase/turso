@@ -25,10 +25,3 @@ impl From<std::io::Error> for Error {
         Error::IoError(e.to_string())
     }
 }
-
-#[cfg(test)]
-impl From<turso::Error> for Error {
-    fn from(value: turso::Error) -> Self {
-        Self::TursoError(turso_core::LimboError::InternalError(value.to_string()))
-    }
-}
