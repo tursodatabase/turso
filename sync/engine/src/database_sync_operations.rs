@@ -22,9 +22,8 @@ use crate::{
     errors::Error,
     io_operations::IoOperations,
     server_proto::{
-        self, Batch, BatchCond, BatchStep, BatchStreamReq, ExecuteStreamReq, PageData,
-        PageUpdatesEncodingReq, PullUpdatesReqProtoBody, PullUpdatesRespProtoBody, Stmt,
-        StmtResult, StreamRequest,
+        self, Batch, BatchCond, BatchStep, BatchStreamReq, PageData, PageUpdatesEncodingReq,
+        PullUpdatesReqProtoBody, PullUpdatesRespProtoBody, Stmt, StmtResult, StreamRequest,
     },
     types::{
         Coro, DatabasePullRevision, DatabaseRowTransformResult, DatabaseSyncEngineProtocolVersion,

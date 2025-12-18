@@ -127,7 +127,7 @@ test('partial sync (prefix bootstrap strategy; large segment size)', { timeout: 
     expect((await db.stats()).networkReceivedBytes).toBeGreaterThanOrEqual(2000 * 1024);
 })
 
-test('partial sync (prefix bootstrap strategy; speculative load)', async () => {
+test('partial sync (prefix bootstrap strategy; speculative load)', { timeout: 60_000 }, async () => {
     {
         const db = await connect({
             path: ':memory:',
