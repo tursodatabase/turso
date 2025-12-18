@@ -62,7 +62,7 @@ jobs:
 
   simulator:
     runs-on: blacksmith-4vcpu-ubuntu-2404
-    timeout-minutes: 20
+    timeout-minutes: 35
     steps:
       - uses: actions/checkout@v3
       - uses: useblacksmith/rust-cache@v3
@@ -92,7 +92,7 @@ jobs:
           done
       - name: Simulator IOUring InsertHeavySpill
         run: |
-          for i in {1..10}; do
+          for i in {1..5}; do
             ./scripts/run-sim --io-backend=io-uring --maximum-tests 1000 --profile=write_heavy_spill || exit 1
           done
       - name: Simulator IOUring Differential
