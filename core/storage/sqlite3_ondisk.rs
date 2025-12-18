@@ -155,7 +155,7 @@ impl CacheSize {
     pub const DEFAULT: i32 = -2000;
 
     // Minimum number of pages that cache can hold.
-    pub const MIN: i64 = 10;
+    pub const MIN: i64 = super::page_cache::MINIMUM_PAGE_CACHE_SIZE_IN_PAGES as i64;
 
     // SQLite uses this value as threshold for maximum cache size
     pub const MAX_SAFE: i64 = 2147450880;
@@ -181,23 +181,68 @@ impl Default for CacheSize {
     }
 }
 
-#[derive(PartialEq, Eq, Zeroable, Pod, Clone, Copy)]
-#[repr(transparent)]
 /// Read/Write file format version.
-pub struct Version(u8);
-
-impl Version {
-    #![allow(non_upper_case_globals)]
-    const Legacy: Self = Self(1);
-    const Wal: Self = Self(2);
+#[derive(PartialEq, Eq, Clone, Copy, Debug)]
+#[repr(u8)]
+pub enum Version {
+    Legacy = 1,
+    Wal = 2,
+    Mvcc = 255,
 }
 
-impl std::fmt::Debug for Version {
+impl Version {
+    #[inline]
+    pub fn wal(&self) -> bool {
+        matches!(self, Self::Wal)
+    }
+
+    #[inline]
+    pub fn mvcc(&self) -> bool {
+        matches!(self, Self::Mvcc)
+    }
+
+    #[inline]
+    pub fn legacy(&self) -> bool {
+        matches!(self, Self::Legacy)
+    }
+}
+
+impl TryFrom<u8> for Version {
+    type Error = u8;
+
+    fn try_from(value: u8) -> std::result::Result<Self, Self::Error> {
+        match value {
+            1 => Ok(Version::Legacy),
+            2 => Ok(Version::Wal),
+            255 => Ok(Version::Mvcc),
+            v => Err(v),
+        }
+    }
+}
+
+/// Raw version byte for use in DatabaseHeader where Pod is required.
+/// Use `Version::try_from(raw.0)` to convert to the validated enum.
+#[derive(PartialEq, Eq, Zeroable, Pod, Clone, Copy)]
+#[repr(transparent)]
+pub struct RawVersion(pub u8);
+
+impl RawVersion {
+    pub fn to_version(self) -> std::result::Result<Version, u8> {
+        Version::try_from(self.0)
+    }
+}
+
+impl From<Version> for RawVersion {
+    fn from(v: Version) -> Self {
+        Self(v as u8)
+    }
+}
+
+impl std::fmt::Debug for RawVersion {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match *self {
-            Self::Legacy => f.write_str("Version::Legacy"),
-            Self::Wal => f.write_str("Version::Wal"),
-            Self(v) => write!(f, "Version::Invalid({v})"),
+        match self.to_version() {
+            Ok(v) => write!(f, "{v:?}"),
+            Err(v) => write!(f, "RawVersion::Invalid({v})"),
         }
     }
 }
@@ -251,9 +296,9 @@ pub struct DatabaseHeader {
     /// Page size in bytes. Must be a power of two between 512 and 32768 inclusive, or the value 1 representing a page size of 65536.
     pub page_size: PageSize,
     /// File format write version. 1 for legacy; 2 for WAL.
-    pub write_version: Version,
+    pub write_version: RawVersion,
     /// File format read version. 1 for legacy; 2 for WAL.
-    pub read_version: Version,
+    pub read_version: RawVersion,
     /// Bytes of unused "reserved" space at the end of each page. Usually 0.
     pub reserved_space: u8,
     /// Maximum embedded payload fraction. Must be 64.
@@ -312,8 +357,8 @@ impl Default for DatabaseHeader {
         Self {
             magic: *b"SQLite format 3\0",
             page_size: Default::default(),
-            write_version: Version::Wal,
-            read_version: Version::Wal,
+            write_version: RawVersion::from(Version::Wal),
+            read_version: RawVersion::from(Version::Wal),
             reserved_space: 0,
             max_embed_frac: 64,
             min_embed_frac: 32,
@@ -1844,6 +1889,7 @@ impl StreamingWalReader {
             st.page_size = page_sz as usize;
             st.use_native_endian = use_native;
             st.cumulative_checksum = (c1, c2);
+            st.last_valid_checksum = (c1, c2);
             st.header_valid = true;
         }
         self.off_atomic

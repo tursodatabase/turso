@@ -1135,7 +1135,7 @@ pub fn construct_like_regex(pattern: &str) -> Regex {
 #[cfg(test)]
 mod tests {
     use crate::types::Value;
-    use crate::vdbe::{Bitfield, Register};
+    use crate::vdbe::Register;
 
     use rand::{Rng, RngCore};
     use std::collections::HashMap;
@@ -2395,24 +2395,5 @@ mod tests {
             Value::exec_replace(&input_str, &pattern_str, &replace_str),
             expected_str
         );
-    }
-
-    #[test]
-    fn test_bitfield() {
-        let mut bitfield = Bitfield::<4>::new();
-        for i in 0..256 {
-            bitfield.set(i);
-            assert!(bitfield.get(i));
-            for j in 0..i {
-                assert!(bitfield.get(j));
-            }
-            for j in i + 1..256 {
-                assert!(!bitfield.get(j));
-            }
-        }
-        for i in 0..256 {
-            bitfield.unset(i);
-            assert!(!bitfield.get(i));
-        }
     }
 }

@@ -761,7 +761,7 @@ do_execsql_test_on_specific_db {:memory:} trigger-multiple-before-insert-lifo {
 5|1|1|1|jussi}
 
 # dropping table should drop triggers
-do_execsql_test_on_specific_db {:memory:} trigger-drop-make-same-table{
+do_execsql_test_on_specific_db {:memory:} trigger-drop-make-same-table {
   create table a(id int primary key, x int);
   create table t(id int primary key, b int, d int, c int);
   create table t1(id int, y int); create trigger trg after insert on t begin update a set x = x - new.d + new.c where id = new.b; insert into t1(id, y) values (new.id, new.c - new.d); end; insert into a values (1, 5000);
@@ -798,6 +798,20 @@ do_execsql_test_on_specific_db {:memory:} trigger-col-name-trigger-subquery {
     INSERT INTO t1 VALUES (0, '');
     UPDATE t1 SET y = 'z' WHERE TRUE; 
     select * from t union all select * from t1;
-} {2|abc
+} {42|abc
 42|abc
 0|z}
+
+# https://github.com/tursodatabase/turso/issues/4142
+do_execsql_test_on_specific_db {:memory:} trigger-table-qualified-where-clause {
+  CREATE TABLE t1 (a REAL, b TEXT, c BLOB, d TEXT, e REAL);
+  INSERT INTO t1 VALUES (-999.0, 'should_stay', X'686f6e6573745f70757269', 'original', -5858539611.591027);
+  CREATE TRIGGER trg BEFORE INSERT ON t1
+  BEGIN
+    UPDATE t1 SET b = 'UPDATED', e = 9999.0
+    WHERE (t1.c != X'686f6e6573745f70757269' OR t1.e > -4109695698.77);
+  END;
+  INSERT INTO t1 VALUES (1.0, 'new_row', X'6E6577', 'new', 1.0);
+  SELECT b, e FROM t1 ORDER BY a;
+} {should_stay|-5858539611.59103
+new_row|1.0}

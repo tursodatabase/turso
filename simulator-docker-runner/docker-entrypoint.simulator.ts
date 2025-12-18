@@ -9,7 +9,7 @@ import { randomSeed } from "./random";
 // Configuration from environment variables
 const SLEEP_BETWEEN_RUNS_SECONDS = Number.isInteger(Number(process.env.SLEEP_BETWEEN_RUNS_SECONDS)) ? Number(process.env.SLEEP_BETWEEN_RUNS_SECONDS) : 0;
 const TIME_LIMIT_MINUTES = Number.isInteger(Number(process.env.TIME_LIMIT_MINUTES)) ? Number(process.env.TIME_LIMIT_MINUTES) : 24 * 60;
-const PER_RUN_TIMEOUT_SECONDS = Number.isInteger(Number(process.env.PER_RUN_TIMEOUT_SECONDS)) ? Number(process.env.PER_RUN_TIMEOUT_SECONDS) : 10 * 60;
+const PER_RUN_TIMEOUT_SECONDS = Number.isInteger(Number(process.env.PER_RUN_TIMEOUT_SECONDS)) ? Number(process.env.PER_RUN_TIMEOUT_SECONDS) : 20 * 60;
 const LOG_TO_STDOUT = process.env.LOG_TO_STDOUT === "true";
 
 const github = new GithubClient();
@@ -157,6 +157,20 @@ const run = async (seed: string, bin: string, args: string[]): Promise<boolean> 
   return issuePosted;
 }
 
+const IO_BACKENDS = ["memory", "io-uring", "default"] as const;
+type IoBackend = (typeof IO_BACKENDS)[number];
+
+const getRandomIoBackend = (): IoBackend => {
+  return IO_BACKENDS[Math.floor(Math.random() * IO_BACKENDS.length)];
+}
+
+const SIMULATOR_PROFILES = ["faultless", "write_heavy", "write_heavy_spill"] as const;
+type SimulatorProfile = (typeof SIMULATOR_PROFILES)[number];
+
+const getRandomSimulatorProfile = (): SimulatorProfile => {
+  return SIMULATOR_PROFILES[Math.floor(Math.random() * SIMULATOR_PROFILES.length)];
+}
+
 // Main execution loop
 const startTime = new Date();
 const limboSimArgs = process.argv.slice(2);
@@ -173,12 +187,11 @@ while (new Date().getTime() - startTime.getTime() < TIME_LIMIT_MINUTES * 60 * 10
   args.push("--disable-bugbase");
 
   if (Math.random() < 0.5) {
-    args.push("--profile", "faultless");
+    args.push("--profile", getRandomSimulatorProfile());
   }
 
-  // Memory IO is faster
-  if (!args.includes("--memory-io")) {
-    args.push("--memory-io");
+  if (!args.find((arg) => arg.startsWith("--io-backend"))) {
+    args.push(`--io-backend=${getRandomIoBackend()}`);
   }
 
   if (Math.random() < 0.5 && !args.includes("--differential")) {
@@ -186,9 +199,6 @@ while (new Date().getTime() - startTime.getTime() < TIME_LIMIT_MINUTES * 60 * 10
   }
 
   args.push(...["--minimum-tests", "100", "--maximum-tests", "1000"]);
-  const loop = args.includes("loop") ? [] : ["loop", "-n", "10", "--short-circuit"]
-  args.push(...loop);
-
 
   console.log(`[${timestamp}]: Running "limbo_sim ${args.join(" ")}" - (seed ${seed}, run number ${runNumber})`);
   const issuePosted = await run(seed, "limbo_sim", args);

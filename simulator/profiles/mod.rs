@@ -34,6 +34,8 @@ pub struct Profile {
     pub io: IOProfile,
     #[garde(dive)]
     pub query: QueryProfile,
+    #[garde(range(min = 200, max = 2000))]
+    pub cache_size_pages: Option<usize>,
 }
 
 impl Default for Profile {
@@ -43,6 +45,7 @@ impl Default for Profile {
             max_connections: 10,
             io: Default::default(),
             query: Default::default(),
+            cache_size_pages: Some(2000),
         }
     }
 }
@@ -84,6 +87,12 @@ impl Profile {
         profile
     }
 
+    pub fn write_heavy_spill() -> Self {
+        let mut profile = Self::write_heavy();
+        profile.cache_size_pages = Some(200);
+        profile
+    }
+
     pub fn faultless() -> Self {
         let profile = Profile {
             io: IOProfile {
@@ -118,6 +127,7 @@ impl Profile {
             },
             experimental_mvcc: true,
             max_connections: 2,
+            cache_size_pages: Some(2000),
         };
         profile.validate().unwrap();
         profile
@@ -127,6 +137,7 @@ impl Profile {
         let profile = match profile_type {
             ProfileType::Default => Self::default(),
             ProfileType::WriteHeavy => Self::write_heavy(),
+            ProfileType::WriteHeavySpill => Self::write_heavy_spill(),
             ProfileType::Faultless => Self::faultless(),
             ProfileType::SimpleMvcc => Self::simple_mvcc(),
             ProfileType::Custom(path) => {
@@ -166,6 +177,7 @@ pub enum ProfileType {
     #[default]
     Default,
     WriteHeavy,
+    WriteHeavySpill,
     Faultless,
     SimpleMvcc,
     #[strum(disabled)]

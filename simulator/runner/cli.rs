@@ -1,5 +1,5 @@
 use clap::{
-    Arg, Command, Error, Parser,
+    Arg, Command, Error, Parser, ValueEnum,
     builder::{PossibleValue, TypedValueParser, ValueParserFactory},
     command,
     error::{ContextKind, ContextValue, ErrorKind},
@@ -7,6 +7,22 @@ use clap::{
 use serde::{Deserialize, Serialize};
 
 use crate::profiles::ProfileType;
+
+/// IO backend selection for the simulator
+#[derive(
+    Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, ValueEnum,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum IoBackend {
+    /// Use the default platform IO (SimulatorIO wrapping PlatformIO)
+    #[default]
+    Default,
+    /// Use in-memory IO backend
+    Memory,
+    /// Use io_uring backend (linux only)
+    #[cfg(target_os = "linux")]
+    IoUring,
+}
 
 #[derive(Parser, Debug, Clone, Serialize, Deserialize, PartialEq, PartialOrd, Eq, Ord)]
 #[command(name = "limbo-simulator")]
@@ -152,11 +168,12 @@ pub struct SimulatorCLI {
     )]
     pub disable_integrity_check: bool,
     #[clap(
-        long,
-        help = "Use memory IO for complex simulations",
-        default_value_t = false
+        long = "io-backend",
+        help = "Select the IO backend for the simulator",
+        value_enum,
+        default_value_t = IoBackend::Default
     )]
-    pub memory_io: bool,
+    pub io_backend: IoBackend,
     #[clap(long, default_value_t = ProfileType::Default)]
     /// Profile selector for Simulation run
     pub profile: ProfileType,
@@ -210,7 +227,6 @@ impl SimulatorCLI {
             );
             self.minimum_tests = self.maximum_tests;
         }
-
         Ok(())
     }
 }

@@ -1,6 +1,7 @@
 #!/bin/bash
 # This script will run the TPC-H queries and compare timings.
 
+export RUST_LOG=off
 REPO_ROOT=$(git rev-parse --show-toplevel)
 RELEASE_BUILD_DIR="$REPO_ROOT/target/release"
 TPCH_DIR="$REPO_ROOT/perf/tpc-h"
@@ -50,7 +51,7 @@ run_queries() {
             # Clear caches before Limbo run
             clear_caches
             # Run Limbo
-            limbo_output=$( { time -p "$LIMBO_BIN" "$DB_FILE" --quiet --output-mode list "$(cat $query_file)" 2>&1; } 2>&1)
+            limbo_output=$( { time -p RUST_LOG=off "$LIMBO_BIN" "$DB_FILE" --quiet --output-mode list "$(cat $query_file)" 2>&1; } 2>&1)
             limbo_non_time_lines=$(echo "$limbo_output" | grep -v -e "^real" -e "^user" -e "^sys")
             limbo_real_time=$(echo "$limbo_output" | grep "^real" | awk '{print $2}')
             echo "Running $query_name with SQLite3..." >&2

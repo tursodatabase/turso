@@ -73,22 +73,37 @@ jobs:
       - name: Simulator default
         run: |
           for i in {1..10}; do
-            ./scripts/run-sim --maximum-tests 1000 --min-tick 10 --max-tick 50 --memory-io || exit 1
+            ./scripts/run-sim --maximum-tests 1000 --min-tick 10 --max-tick 50 --io-backend=memory || exit 1
           done
       - name: Simulator InsertHeavy
         run: |
           for i in {1..5}; do
-            ./scripts/run-sim --maximum-tests 1000 --min-tick 10 --max-tick 50 --profile write_heavy --memory-io || exit 1
+            ./scripts/run-sim --maximum-tests 1000 --min-tick 10 --max-tick 50 --profile write_heavy --io-backend=memory || exit 1
+          done
+      - name: Simulator InsertHeavySpill
+        run: |
+          for i in {1..5}; do
+            ./scripts/run-sim --maximum-tests 1000 --min-tick 10 --max-tick 50 --profile write_heavy_spill --io-backend=memory || exit 1
           done
       - name: Simulator Faultless
         run: |
           for i in {1..10}; do
-            ./scripts/run-sim --maximum-tests 1000 --min-tick 10 --max-tick 50 --profile faultless --memory-io || exit 1
+            ./scripts/run-sim --maximum-tests 1000 --min-tick 10 --max-tick 50 --profile faultless --io-backend=memory || exit 1
+          done
+      - name: Simulator IOUring InsertHeavySpill
+        run: |
+          for i in {1..10}; do
+            ./scripts/run-sim --io-backend=io-uring --maximum-tests 1000 --profile=write_heavy_spill || exit 1
+          done
+      - name: Simulator IOUring Differential
+        run: |
+          for i in {1..10}; do
+            ./scripts/run-sim --io-backend=io-uring --maximum-tests 1000 --differential || exit 1
           done
       - name: Simulator Differential
         run: |
           for i in {1..10}; do
-            ./scripts/run-sim --maximum-tests 1000 --differential --memory-io || exit 1
+            ./scripts/run-sim --maximum-tests 1000 --differential --io-backend=memory || exit 1
           done
 
   test-limbo:

@@ -8,6 +8,7 @@ members = [
     "bindings/javascript",
     "bindings/javascript/sync",
     "bindings/python",
+    "bindings/dotnet",
     "bindings/rust",
     "cli",
     "core",

@@ -1104,6 +1104,7 @@ fn test_snapshot_isolation_tx_visible1() {
             begin,
             end,
             row: generate_simple_string_row((-2).into(), 1, "testme"),
+            btree_resident: false,
         };
         tracing::debug!("Testing visibility of {row_version:?}");
         row_version.is_visible_to(&current_tx, &txs)

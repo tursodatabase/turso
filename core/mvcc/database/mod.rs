@@ -259,6 +259,11 @@ pub struct RowVersion {
     pub begin: Option<TxTimestampOrID>,
     pub end: Option<TxTimestampOrID>,
     pub row: Row,
+    /// Indicates this version was created for a row that existed in B-tree before
+    /// MVCC was enabled (e.g., after switching from WAL to MVCC journal mode).
+    /// This flag helps the checkpoint logic determine if a delete should be
+    /// checkpointed to the B-tree file.
+    pub btree_resident: bool,
 }
 
 #[derive(Debug)]
@@ -1329,6 +1334,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     begin: Some(TxTimestampOrID::TxID(tx.tx_id)),
                     end: None,
                     row: row.clone(),
+                    btree_resident: false,
                 };
                 let RowKey::Record(sortable_key) = row.id.row_id else {
                     panic!("Index writes must be to a record");
@@ -1341,6 +1347,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     begin: Some(TxTimestampOrID::TxID(tx.tx_id)),
                     end: None,
                     row,
+                    btree_resident: false,
                 };
                 tx.insert_to_write_set(id.clone());
                 self.insert_version(id, row_version);
@@ -1362,6 +1369,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             begin: Some(TxTimestampOrID::Timestamp(0)),
             end: Some(TxTimestampOrID::TxID(tx_id)),
             row: row.clone(),
+            btree_resident: true,
         };
         let tx = self
             .txs
@@ -1377,6 +1385,56 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 self.insert_index_version(index_id, sortable_key, row_version);
             }
             None => {
+                self.insert_version(id, row_version);
+            }
+        }
+        Ok(())
+    }
+
+    /// Inserts a row that was read from the B-tree (not in MvStore).
+    /// This is used when updating a row that exists in B-tree but hasn't been
+    /// modified in MVCC yet. The btree_resident flag helps the checkpoint logic
+    /// determine if subsequent deletes should be checkpointed to the B-tree file.
+    pub fn insert_btree_resident_to_table_or_index(
+        &self,
+        tx_id: TxID,
+        row: Row,
+        maybe_index_id: Option<MVTableId>,
+    ) -> Result<()> {
+        tracing::trace!(
+            "insert_btree_resident(tx_id={}, row.id={:?})",
+            tx_id,
+            row.id
+        );
+        let tx = self
+            .txs
+            .get(&tx_id)
+            .ok_or(LimboError::NoSuchTransactionID(tx_id.to_string()))?;
+        let tx = tx.value();
+        assert_eq!(tx.state, TransactionState::Active);
+        let id = row.id.clone();
+        match maybe_index_id {
+            Some(index_id) => {
+                let row_version = RowVersion {
+                    begin: Some(TxTimestampOrID::TxID(tx.tx_id)),
+                    end: None,
+                    row: row.clone(),
+                    btree_resident: true,
+                };
+                let RowKey::Record(sortable_key) = row.id.row_id else {
+                    panic!("Index writes must be to a record");
+                };
+                tx.insert_to_write_set(id.clone());
+                self.insert_index_version(index_id, sortable_key, row_version);
+            }
+            None => {
+                let row_version = RowVersion {
+                    begin: Some(TxTimestampOrID::TxID(tx.tx_id)),
+                    end: None,
+                    row,
+                    btree_resident: true,
+                };
+                tx.insert_to_write_set(id.clone());
                 self.insert_version(id, row_version);
             }
         }
