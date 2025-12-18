@@ -520,28 +520,30 @@ fn emit_min_max_comparison(
         dest: update_flag_reg,
     });
 
-    // Skip comparison if aggregate argument is NULL (NULLs are ignored in MIN/MAX)
     let after_comparison_label = program.allocate_label();
-    let check_first_row_label = program.allocate_label();
+    let handle_non_null_arg_label = program.allocate_label();
+    let set_flag_for_null_label = program.allocate_label();
 
+    // Check if aggregate argument is NULL
     program.emit_insn(Insn::NotNull {
         reg: agg_arg_reg,
-        target_pc: check_first_row_label,
+        target_pc: handle_non_null_arg_label,
     });
+
+    // Aggregate argument is NULL: check if current_min_max is also NULL
+    // If both are NULL, we should update bare columns so last NULL row wins
+    program.emit_insn(Insn::IsNull {
+        reg: current_min_max_reg,
+        target_pc: set_flag_for_null_label,
+    });
+    // If current_min_max is NOT NULL, we've seen a non-NULL value before
+    // Don't update bare columns for this NULL value
     program.emit_insn(Insn::Goto {
         target_pc: after_comparison_label,
     });
 
-    // Aggregate argument is not NULL: proceed with comparison
-    program.preassign_label_to_next_insn(check_first_row_label);
-
-    // Check if this is the first row in the group (current_min_max_reg is NULL)
-    let compare_label = program.allocate_label();
-    program.emit_insn(Insn::NotNull {
-        reg: current_min_max_reg,
-        target_pc: compare_label,
-    });
-    // First row: always update bare columns
+    // Both agg_arg and current_min_max are NULL: update bare columns
+    program.preassign_label_to_next_insn(set_flag_for_null_label);
     program.emit_insn(Insn::Integer {
         value: 1,
         dest: update_flag_reg,
@@ -550,7 +552,25 @@ fn emit_min_max_comparison(
         target_pc: after_comparison_label,
     });
 
-    // Not first row: compare aggregate argument with current min/max
+    // Aggregate argument is not NULL: proceed with comparison
+    program.preassign_label_to_next_insn(handle_non_null_arg_label);
+
+    // Check if this is the first non-NULL value in the group (current_min_max_reg is NULL)
+    let compare_label = program.allocate_label();
+    program.emit_insn(Insn::NotNull {
+        reg: current_min_max_reg,
+        target_pc: compare_label,
+    });
+    // First non-NULL value: always update bare columns
+    program.emit_insn(Insn::Integer {
+        value: 1,
+        dest: update_flag_reg,
+    });
+    program.emit_insn(Insn::Goto {
+        target_pc: after_comparison_label,
+    });
+
+    // Not first non-NULL value: compare aggregate argument with current min/max
     program.preassign_label_to_next_insn(compare_label);
 
     // Get collation for comparison
