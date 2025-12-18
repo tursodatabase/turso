@@ -807,3 +807,268 @@ fn test_pragma_journal_mode_data_persistence_after_switch() {
         drop(db);
     }
 }
+
+/// Open database in readonly mode with limbo and check header versions
+fn open_with_limbo_readonly_and_check(db_path: &Path, enable_mvcc: bool) -> (u8, u8) {
+    let io = std::sync::Arc::new(turso_core::PlatformIO::new().unwrap());
+    let opts = DatabaseOpts::new().with_mvcc(enable_mvcc);
+
+    let db = Database::open_file_with_flags(
+        io.clone(),
+        db_path.to_str().unwrap(),
+        OpenFlags::ReadOnly,
+        opts,
+        None,
+    )
+    .expect("Failed to open database with limbo in readonly mode");
+
+    // Connect to ensure initialization is complete
+    let conn = db.connect().unwrap();
+
+    // Do a simple query to ensure everything is initialized
+    if let Some(mut stmt) = conn.query("SELECT 1").unwrap() {
+        loop {
+            let result = stmt.step().unwrap();
+            match result {
+                turso_core::StepResult::Row => {
+                    let _row = stmt.row().unwrap();
+                }
+                turso_core::StepResult::IO => {
+                    stmt.run_once().unwrap();
+                    continue;
+                }
+                turso_core::StepResult::Done => break,
+                r => panic!("unexpected result {r:?}: expecting single row"),
+            }
+        }
+    }
+
+    // Drop connection and database
+    drop(conn);
+    drop(db);
+
+    // Read header versions after limbo has closed
+    read_header_versions(db_path)
+}
+
+/// Test that readonly database cannot modify header when opening a Legacy mode database
+#[test]
+fn test_readonly_legacy_db_header_not_modified() {
+    let tmp_dir = TempDir::new().unwrap();
+    let db_path = tmp_dir.path().join("test.db");
+
+    // Create a Legacy mode database
+    create_legacy_db(&db_path);
+
+    // Get the original header versions
+    let (orig_write_ver, orig_read_ver) = read_header_versions(&db_path);
+    assert_eq!(orig_write_ver, 1, "Original should be Legacy mode");
+    assert_eq!(orig_read_ver, 1, "Original should be Legacy mode");
+
+    // Open with limbo in readonly mode (without MVCC)
+    let (write_ver, read_ver) = open_with_limbo_readonly_and_check(&db_path, false);
+
+    // Header should NOT be modified - should still be Legacy mode
+    assert_eq!(
+        write_ver, 1,
+        "Readonly DB should NOT convert Legacy to WAL (write_version should stay 1), got {write_ver}"
+    );
+    assert_eq!(
+        read_ver, 1,
+        "Readonly DB should NOT convert Legacy to WAL (read_version should stay 1), got {read_ver}"
+    );
+}
+
+/// Test that readonly database cannot modify header when MVCC is requested
+#[test]
+fn test_readonly_legacy_db_with_mvcc_header_not_modified() {
+    let tmp_dir = TempDir::new().unwrap();
+    let db_path = tmp_dir.path().join("test.db");
+
+    // Create a Legacy mode database
+    create_legacy_db(&db_path);
+
+    // Get the original header versions
+    let (orig_write_ver, orig_read_ver) = read_header_versions(&db_path);
+    assert_eq!(orig_write_ver, 1, "Original should be Legacy mode");
+    assert_eq!(orig_read_ver, 1, "Original should be Legacy mode");
+
+    // Open with limbo in readonly mode with MVCC enabled
+    let (write_ver, read_ver) = open_with_limbo_readonly_and_check(&db_path, true);
+
+    // Header should NOT be modified - should still be Legacy mode
+    // even though MVCC was requested
+    assert_eq!(
+        write_ver, 1,
+        "Readonly DB should NOT convert Legacy to MVCC (write_version should stay 1), got {write_ver}"
+    );
+    assert_eq!(
+        read_ver, 1,
+        "Readonly DB should NOT convert Legacy to MVCC (read_version should stay 1), got {read_ver}"
+    );
+}
+
+/// Test that readonly WAL database cannot be converted to MVCC
+#[test]
+fn test_readonly_wal_db_with_mvcc_header_not_modified() {
+    let tmp_dir = TempDir::new().unwrap();
+    let db_path = tmp_dir.path().join("test.db");
+
+    // Create a WAL mode database
+    create_wal_db(&db_path);
+
+    // Get the original header versions
+    let (orig_write_ver, orig_read_ver) = read_header_versions(&db_path);
+    assert_eq!(orig_write_ver, 2, "Original should be WAL mode");
+    assert_eq!(orig_read_ver, 2, "Original should be WAL mode");
+
+    // Open with limbo in readonly mode with MVCC enabled
+    let (write_ver, read_ver) = open_with_limbo_readonly_and_check(&db_path, true);
+
+    // Header should NOT be modified - should still be WAL mode
+    // even though MVCC was requested
+    assert_eq!(
+        write_ver, 2,
+        "Readonly DB should NOT convert WAL to MVCC (write_version should stay 2), got {write_ver}"
+    );
+    assert_eq!(
+        read_ver, 2,
+        "Readonly DB should NOT convert WAL to MVCC (read_version should stay 2), got {read_ver}"
+    );
+}
+
+/// Test that PRAGMA journal_mode cannot change mode on readonly database
+#[test]
+fn test_readonly_pragma_journal_mode_cannot_change() {
+    let tmp_dir = TempDir::new().unwrap();
+    let db_path = tmp_dir.path().join("test.db");
+
+    // Create a WAL mode database
+    create_wal_db(&db_path);
+
+    let io = std::sync::Arc::new(turso_core::PlatformIO::new().unwrap());
+    let opts = DatabaseOpts::new().with_mvcc(true);
+
+    let db = Database::open_file_with_flags(
+        io.clone(),
+        db_path.to_str().unwrap(),
+        OpenFlags::ReadOnly,
+        opts,
+        None,
+    )
+    .expect("Failed to open database in readonly mode");
+
+    let conn = db.connect().unwrap();
+
+    // Try to switch to MVCC mode via PRAGMA - this should return an error
+    // because we cannot change mode on readonly databases
+    let result = conn.pragma_update("journal_mode", "'experimental_mvcc'");
+
+    // The result should be a ReadOnly error
+    assert!(
+        matches!(result, Err(turso_core::LimboError::ReadOnly)),
+        "PRAGMA journal_mode should return ReadOnly error on readonly database, got: {result:?}"
+    );
+
+    drop(conn);
+    drop(db);
+
+    // Verify header was NOT modified
+    let (write_ver, read_ver) = read_header_versions(&db_path);
+    assert_eq!(
+        write_ver, 2,
+        "Readonly DB header should NOT be modified (write_version should stay 2), got {write_ver}"
+    );
+    assert_eq!(
+        read_ver, 2,
+        "Readonly DB header should NOT be modified (read_version should stay 2), got {read_ver}"
+    );
+}
+
+/// Test that readonly MVCC database can still be opened and read
+#[test]
+fn test_readonly_mvcc_db_can_be_read() {
+    let tmp_dir = TempDir::new().unwrap();
+    let db_path = tmp_dir.path().join("test.db");
+
+    // Create a WAL mode database and convert to MVCC
+    create_wal_db(&db_path);
+
+    // First, convert to MVCC by opening in read-write mode
+    {
+        let io = std::sync::Arc::new(turso_core::PlatformIO::new().unwrap());
+        let opts = DatabaseOpts::new().with_mvcc(true);
+
+        let db = Database::open_file_with_flags(
+            io.clone(),
+            db_path.to_str().unwrap(),
+            OpenFlags::default(),
+            opts,
+            None,
+        )
+        .expect("Failed to open database");
+
+        let conn = db.connect().unwrap();
+
+        // Insert some data in MVCC mode
+        conn.execute("INSERT INTO t (val) VALUES ('mvcc_readonly_test')")
+            .expect("INSERT should work in MVCC mode");
+
+        drop(conn);
+        drop(db);
+    }
+
+    // Verify it's now MVCC mode
+    let (write_ver, read_ver) = read_header_versions(&db_path);
+    assert_eq!(write_ver, 255, "Should be MVCC after first open");
+    assert_eq!(read_ver, 255, "Should be MVCC after first open");
+
+    // Now open in readonly mode - this should work and we should be able to read data
+    let io = std::sync::Arc::new(turso_core::PlatformIO::new().unwrap());
+    let opts = DatabaseOpts::new().with_mvcc(true);
+
+    let db = Database::open_file_with_flags(
+        io.clone(),
+        db_path.to_str().unwrap(),
+        OpenFlags::ReadOnly,
+        opts,
+        None,
+    )
+    .expect("Failed to open MVCC database in readonly mode");
+
+    let conn = db.connect().unwrap();
+
+    // Verify we can read data
+    let mut stmt = conn
+        .prepare("SELECT val FROM t WHERE val = 'mvcc_readonly_test'")
+        .unwrap();
+    let mut found = false;
+    loop {
+        match stmt.step().unwrap() {
+            turso_core::StepResult::Row => {
+                found = true;
+            }
+            turso_core::StepResult::IO => {
+                stmt.run_once().unwrap();
+                continue;
+            }
+            turso_core::StepResult::Done => break,
+            r => panic!("unexpected result {r:?}"),
+        }
+    }
+    assert!(found, "Should be able to read MVCC data in readonly mode");
+
+    drop(conn);
+    drop(db);
+
+    // Verify header was NOT modified
+    let (write_ver, read_ver) = read_header_versions(&db_path);
+    assert_eq!(
+        write_ver, 255,
+        "Readonly MVCC DB header should NOT be modified (write_version should stay 255), got {write_ver}"
+    );
+    assert_eq!(
+        read_ver, 255,
+        "Readonly MVCC DB header should NOT be modified (read_version should stay 255), got {read_ver}"
+    );
+}
