@@ -85,8 +85,16 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
             continue;
         }
 
-        // Parse width (if present)
+        let mut zero_pad = false;
         let mut width = None;
+        let mut precision = None;
+
+        if let Some(&'0') = chars.peek() {
+            chars.next();
+            zero_pad = true;
+        }
+
+        // Parse width
         let mut width_str = String::new();
         while let Some(&c) = chars.peek() {
             if c.is_ascii_digit() {
@@ -100,31 +108,63 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
             width = width_str.parse().ok();
         }
 
-        // Get format type and handle
+        if let Some(&'.') = chars.peek() {
+            chars.next();
+            let mut precision_str = String::new();
+            while let Some(&c) = chars.peek() {
+                if c.is_ascii_digit() {
+                    precision_str.push(c);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            precision = if precision_str.is_empty() {
+                Some(0)
+            } else {
+                precision_str.parse().ok()
+            };
+        }
+
         match chars.next() {
             Some('d') | Some('i') => {
                 if args_index >= values.len() {
                     return Err(LimboError::InvalidArgument("not enough arguments".into()));
                 }
                 let value = &values[args_index].get_value();
-                let int_str = match value {
-                    Value::Numeric(Numeric::Integer(i)) => i.to_string(),
-                    Value::Numeric(Numeric::Float(f)) => {
-                        (f64::from(*f) as i64).to_string()
-                    }
-                    _ => "0".to_string(),
+                let int_value = match value {
+                    Value::Numeric(Numeric::Integer(i)) => *i,
+                    Value::Numeric(Numeric::Float(f)) => f64::from(*f) as i64,
+                    _ => 0,
                 };
 
-                // Apply width formatting if specified
-                if let Some(w) = width {
-                    if w > int_str.len() {
-                        result.push_str(&format!("{int_str:>w$}"));
+                let mut formatted = if let Some(p) = precision {
+                    if int_value < 0 {
+                        format!("-{:0p$}", (-int_value))
                     } else {
-                        result.push_str(&int_str);
+                        format!("{int_value:0p$}")
                     }
                 } else {
-                    result.push_str(&int_str);
+                    int_value.to_string()
+                };
+
+                if let Some(w) = width {
+                    if w > formatted.len() {
+                        if zero_pad && precision.is_none() {
+                            if int_value < 0 {
+                                let neg_value = -int_value;
+                                let pad_width = w - 1;
+                                formatted = format!("-{neg_value:0pad_width$}");
+                            } else {
+                                formatted = format!("{int_value:0w$}");
+                            }
+                        } else {
+                            formatted = format!("{formatted:>w$}");
+                        }
+                    }
                 }
+
+                result.push_str(&formatted);
                 args_index += 1;
             }
             Some('u') => {
