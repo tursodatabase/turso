@@ -53,7 +53,7 @@ jobs:
           cache: true
           cache-dependency-path: bindings/go/go.sum
 
-      - name: Build Rust (debug) shared library
+      - name: Build Rust (debug)
         run: cargo build --verbose
 
       # Linux: use LD_LIBRARY_PATH to point to Rust target dir
@@ -61,6 +61,7 @@ jobs:
         if: runner.os == 'Linux'
         working-directory: bindings/go
         env:
+          LOCAL_SYNC_SERVER: ../../target/debug/tursodb
           LD_LIBRARY_PATH: ${{ github.workspace }}/target/debug
         run: go test ./... -v
 
@@ -69,6 +70,7 @@ jobs:
         if: runner.os == 'macOS'
         working-directory: bindings/go
         env:
+          LOCAL_SYNC_SERVER: ../../target/debug/tursodb
           DYLD_LIBRARY_PATH: ${{ github.workspace }}/target/debug
         run: go test ./... -v
 
@@ -79,6 +81,7 @@ jobs:
         shell: pwsh
         run: |
           $env:PATH = "${{ github.workspace }}\target\debug;$env:PATH"
+          $env:LOCAL_SYNC_SERVER = "..\..\target\debug\tursodb"
           go test ./... -v
 
   publish:
