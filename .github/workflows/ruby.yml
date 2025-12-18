@@ -83,7 +83,7 @@ jobs:
           ruby-version: ${{ matrix.ruby-version }}
           bundler-cache: false
 
-      - name: Install Rust (stable-gnu)
+      - name: Install Rust (GNU)
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: stable-gnu
