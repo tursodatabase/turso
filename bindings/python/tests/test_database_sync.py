@@ -2,6 +2,7 @@ import logging
 import time
 
 import turso.sync
+
 from .utils import TursoServer
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s", force=True)
@@ -65,7 +66,7 @@ def test_push():
 
 def test_checkpoint():
     # turso.setup_logging(level=logging.DEBUG)
-    
+
     with TursoServer() as server:
         conn = turso.sync.connect(":memory:", remote_url=server.db_url())
         conn.execute("CREATE TABLE t(x)")

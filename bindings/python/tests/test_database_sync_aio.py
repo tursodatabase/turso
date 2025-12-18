@@ -1,9 +1,9 @@
 import logging
-import string
 import time
 
 import pytest
 import turso.aio.sync
+
 from .utils import TursoServer
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s", force=True)
