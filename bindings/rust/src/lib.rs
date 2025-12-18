@@ -42,8 +42,6 @@ pub mod transaction;
 pub mod value;
 
 use transaction::TransactionBehavior;
-#[cfg(feature = "conn_raw_api")]
-use turso_core::types::WalFrameInfo;
 pub use value::Value;
 
 pub use params::params_from_iter;
@@ -318,84 +316,6 @@ impl Connection {
         self.maybe_handle_dangling_tx().await?;
         let mut stmt = self.prepare(sql).await?;
         stmt.execute(params).await
-    }
-
-    #[cfg(feature = "conn_raw_api")]
-    pub fn wal_frame_count(&self) -> Result<u64> {
-        let conn = self
-            .inner
-            .lock()
-            .map_err(|e| Error::MutexError(e.to_string()))?;
-        conn.wal_state()
-            .map_err(|e| Error::WalOperationError(format!("wal_insert_begin failed: {e}")))
-            .map(|state| state.max_frame)
-    }
-
-    #[cfg(feature = "conn_raw_api")]
-    pub fn try_wal_watermark_read_page(
-        &self,
-        page_idx: u32,
-        page: &mut [u8],
-        frame_watermark: Option<u64>,
-    ) -> Result<bool> {
-        let conn = self
-            .inner
-            .lock()
-            .map_err(|e| Error::MutexError(e.to_string()))?;
-        conn.try_wal_watermark_read_page(page_idx, page, frame_watermark)
-            .map_err(|e| {
-                Error::WalOperationError(format!("try_wal_watermark_read_page failed: {e}"))
-            })
-    }
-
-    #[cfg(feature = "conn_raw_api")]
-    pub fn wal_changed_pages_after(&self, frame_watermark: u64) -> Result<Vec<u32>> {
-        let conn = self
-            .inner
-            .lock()
-            .map_err(|e| Error::MutexError(e.to_string()))?;
-        conn.wal_changed_pages_after(frame_watermark)
-            .map_err(|e| Error::WalOperationError(format!("wal_changed_pages_after failed: {e}")))
-    }
-
-    #[cfg(feature = "conn_raw_api")]
-    pub fn wal_insert_begin(&self) -> Result<()> {
-        let conn = self
-            .inner
-            .lock()
-            .map_err(|e| Error::MutexError(e.to_string()))?;
-        conn.wal_insert_begin()
-            .map_err(|e| Error::WalOperationError(format!("wal_insert_begin failed: {e}")))
-    }
-
-    #[cfg(feature = "conn_raw_api")]
-    pub fn wal_insert_end(&self, force_commit: bool) -> Result<()> {
-        let conn = self
-            .inner
-            .lock()
-            .map_err(|e| Error::MutexError(e.to_string()))?;
-        conn.wal_insert_end(force_commit)
-            .map_err(|e| Error::WalOperationError(format!("wal_insert_end failed: {e}")))
-    }
-
-    #[cfg(feature = "conn_raw_api")]
-    pub fn wal_insert_frame(&self, frame_no: u64, frame: &[u8]) -> Result<WalFrameInfo> {
-        let conn = self
-            .inner
-            .lock()
-            .map_err(|e| Error::MutexError(e.to_string()))?;
-        conn.wal_insert_frame(frame_no, frame)
-            .map_err(|e| Error::WalOperationError(format!("wal_insert_frame failed: {e}")))
-    }
-
-    #[cfg(feature = "conn_raw_api")]
-    pub fn wal_get_frame(&self, frame_no: u64, frame: &mut [u8]) -> Result<WalFrameInfo> {
-        let conn = self
-            .inner
-            .lock()
-            .map_err(|e| Error::MutexError(e.to_string()))?;
-        conn.wal_get_frame(frame_no, frame)
-            .map_err(|e| Error::WalOperationError(format!("wal_insert_frame failed: {e}")))
     }
 
     /// Execute a batch of SQL statements on the database.
