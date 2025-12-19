@@ -22,9 +22,8 @@ use crate::{
     errors::Error,
     io_operations::IoOperations,
     server_proto::{
-        self, Batch, BatchCond, BatchStep, BatchStreamReq, ExecuteStreamReq, PageData,
-        PageUpdatesEncodingReq, PullUpdatesReqProtoBody, PullUpdatesRespProtoBody, Stmt,
-        StmtResult, StreamRequest,
+        self, Batch, BatchCond, BatchStep, BatchStreamReq, PageData, PageUpdatesEncodingReq,
+        PullUpdatesReqProtoBody, PullUpdatesRespProtoBody, Stmt, StmtResult, StreamRequest,
     },
     types::{
         Coro, DatabasePullRevision, DatabaseRowTransformResult, DatabaseSyncEngineProtocolVersion,
@@ -777,15 +776,22 @@ pub async fn fetch_last_change_id<IO: SyncEngineIo, Ctx>(
         baton: None,
         requests: vec![
             // read pull_gen, change_id values for current client if they were set before
-            StreamRequest::Execute(ExecuteStreamReq {
-                stmt: Stmt {
-                    sql: Some(TURSO_SYNC_SELECT_LAST_CHANGE_ID.to_string()),
-                    sql_id: None,
-                    args: vec![server_proto::Value::Text {
-                        value: client_id.to_string(),
-                    }],
-                    named_args: Vec::new(),
-                    want_rows: Some(true),
+            StreamRequest::Batch(BatchStreamReq {
+                batch: Batch {
+                    steps: vec![BatchStep {
+                        stmt: Stmt {
+                            sql: Some(TURSO_SYNC_SELECT_LAST_CHANGE_ID.to_string()),
+                            sql_id: None,
+                            args: vec![server_proto::Value::Text {
+                                value: client_id.to_string(),
+                            }],
+                            named_args: Vec::new(),
+                            want_rows: Some(true),
+                            replication_index: None,
+                        },
+                        condition: None,
+                    }]
+                    .into(),
                     replication_index: None,
                 },
             }),

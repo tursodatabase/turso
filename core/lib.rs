@@ -2898,7 +2898,7 @@ impl Statement {
         self._step(Some(waker))
     }
 
-    pub(crate) fn run_ignore_rows(&mut self) -> Result<()> {
+    pub fn run_ignore_rows(&mut self) -> Result<()> {
         loop {
             match self.step()? {
                 vdbe::StepResult::Done => return Ok(()),
@@ -2911,7 +2911,7 @@ impl Statement {
         }
     }
 
-    pub(crate) fn run_collect_rows(&mut self) -> Result<Vec<Vec<Value>>> {
+    pub fn run_collect_rows(&mut self) -> Result<Vec<Vec<Value>>> {
         let mut values = Vec::new();
         loop {
             match self.step()? {

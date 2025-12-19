@@ -76,6 +76,11 @@ pub struct Opts {
     pub tracing_output: Option<String>,
     #[clap(long, help = "Start MCP server instead of interactive shell")]
     pub mcp: bool,
+    #[clap(
+        long,
+        help = "Start sync server instead of interactive shell and listen at given address (e.g. 0.0.0.0:8080)"
+    )]
+    pub sync_server: Option<String>,
     #[clap(long, help = "Enable experimental encryption feature")]
     pub experimental_encryption: bool,
     #[clap(long, help = "Enable experimental index method feature")]
@@ -93,8 +98,8 @@ pub struct Limbo {
     conn: Arc<turso_core::Connection>,
     pub interrupt_count: Arc<AtomicUsize>,
     input_buff: ManuallyDrop<String>,
+    pub(crate) opts: Settings,
     read_state: ReadState,
-    opts: Settings,
     pub rl: Option<Editor<LimboHelper, DefaultHistory>>,
     config: Option<Config>,
 }
@@ -276,8 +281,8 @@ impl Limbo {
     }
 
     fn first_run(&mut self, has_sql: bool, quiet: bool) -> Result<(), LimboError> {
-        // Skip startup messages and SQL execution in MCP mode
-        if self.is_mcp_mode() {
+        // Skip startup messages and SQL execution in MCP/SyncServer mode
+        if self.is_mcp_mode() || self.is_sync_server_mode() {
             return Ok(());
         }
 
@@ -391,6 +396,10 @@ impl Limbo {
 
     pub fn is_mcp_mode(&self) -> bool {
         self.opts.mcp
+    }
+
+    pub fn is_sync_server_mode(&self) -> bool {
+        self.opts.sync_server_address.is_some()
     }
 
     pub fn get_interrupt_count(&self) -> Arc<AtomicUsize> {
