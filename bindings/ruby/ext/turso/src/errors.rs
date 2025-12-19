@@ -101,6 +101,28 @@ pub fn not_supported_error(msg: &str) -> Error {
 pub fn map_turso_error(err: TursoError) -> Error {
     let ruby = Ruby::get().expect("Ruby not initialized");
 
+    let code_str = match err.code {
+        TursoStatusCode::Busy => "BUSY",
+        TursoStatusCode::Interrupt => "INTERRUPT",
+        TursoStatusCode::Misuse => "MISUSE",
+        TursoStatusCode::Constraint => "CONSTRAINT",
+        TursoStatusCode::Readonly => "READONLY",
+        TursoStatusCode::DatabaseFull => "FULL",
+        TursoStatusCode::NotAdb => "NOTADB",
+        TursoStatusCode::Corrupt => "CORRUPT",
+        _ => "ERROR",
+    };
+
+    let message = err.message.clone().unwrap_or_default();
+
+    // Log the error before raising it to Ruby
+    tracing::error!(
+        target: "turso::ruby",
+        error_code = code_str,
+        error_message = %message,
+        "Database error"
+    );
+
     let exc_class = match err.code {
         TursoStatusCode::Busy => ruby.get_inner(&BUSY_ERROR),
         TursoStatusCode::Interrupt => ruby.get_inner(&INTERRUPT_ERROR),
@@ -114,5 +136,5 @@ pub fn map_turso_error(err: TursoError) -> Error {
         _ => ruby.get_inner(&ERROR),
     };
 
-    Error::new(exc_class, err.message.unwrap_or_default())
+    Error::new(exc_class, message)
 }

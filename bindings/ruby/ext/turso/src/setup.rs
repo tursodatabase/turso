@@ -60,16 +60,21 @@ pub fn _native_setup(ruby: &Ruby, level: String, callback: Value) -> Result<(), 
 
     rsapi::turso_setup(rsapi::TursoSetupConfig {
         logger: Some(Box::new(move |log| {
-            if let Ok(ruby) = Ruby::get() {
-                let callback_guard = LOGGER_CALLBACK.lock().unwrap();
-                if let Some(opaque_callback) = *callback_guard {
-                    let callback = ruby.get_inner(opaque_callback);
-                    if !callback.is_nil() {
-                        let rb_log = RbTursoLog::new(log);
-                        let _: Result<Value, Error> = callback.funcall("call", (rb_log,));
-                    }
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let Ok(ruby) = Ruby::get() else { return };
+                
+                let Ok(callback_guard) = LOGGER_CALLBACK.try_lock() else { return };
+                let Some(opaque_callback) = *callback_guard else { return };
+                
+                let callback = ruby.get_inner(opaque_callback);
+                if callback.is_nil() {
+                    return;
                 }
-            }
+                
+                let rb_log = RbTursoLog::new(log);
+                let rb_log_obj = ruby.obj_wrap(rb_log);
+                let _: Result<Value, Error> = callback.funcall("call", (rb_log_obj,));
+            }));
         })),
         log_level: Some(level),
     })
@@ -88,6 +93,13 @@ pub fn init(ruby: &Ruby, module: RModule) -> Result<(), Error> {
     log_class.define_method("line", method!(RbTursoLog::line, 0))?;
 
     module.define_module_function("_native_setup", function!(_native_setup, 2))?;
+    module.define_module_function("_clear_logger", function!(_clear_logger, 0))?;
 
     Ok(())
+}
+
+pub fn _clear_logger() {
+    if let Ok(mut guard) = LOGGER_CALLBACK.try_lock() {
+        *guard = None;
+    }
 }

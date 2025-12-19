@@ -25,17 +25,19 @@ module Turso
 
     _native_setup(level.to_s.downcase, @logger_callback)
     @setup_called = true
+
+    at_exit { _clear_logger }
   end
 
   private
 
   def self.map_severity(level_sym)
     case level_sym
-    when :trace, :debug then 0 # Logger::DEBUG
-    when :info  then 1 # Logger::INFO
-    when :warn  then 2 # Logger::WARN
-    when :error then 3 # Logger::ERROR
-    else 4 # Logger::FATAL
+    when :trace, :debug then 0 
+    when :info  then 1 
+    when :warn  then 2 
+    when :error then 3 
+    else 4 
     end
   end
 
