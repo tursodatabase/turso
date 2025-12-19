@@ -394,15 +394,13 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
             self.creating_new_rowid = true;
             let res = if allocator.is_uninitialized() {
                 NextRowidResult::Unitialized
-            } else {
-                if let Some((next_rowid, prev_max_rowid)) = allocator.get_next_rowid() {
-                    NextRowidResult::Next {
-                        new_rowid: next_rowid,
-                        prev_rowid: prev_max_rowid,
-                    }
-                } else {
-                    NextRowidResult::FindRandom
+            } else if let Some((next_rowid, prev_max_rowid)) = allocator.get_next_rowid() {
+                NextRowidResult::Next {
+                    new_rowid: next_rowid,
+                    prev_rowid: prev_max_rowid,
                 }
+            } else {
+                NextRowidResult::FindRandom
             };
             Ok(IOResult::Done(res))
         } else {

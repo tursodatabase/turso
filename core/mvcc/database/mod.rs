@@ -2785,7 +2785,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 last_rowid: RwLock::new(None),
                 intialized: AtomicBool::new(false),
             });
-            map.insert(table_id.clone(), allocator.clone());
+            map.insert(*table_id, allocator.clone());
             allocator
         }
     }
