@@ -8,6 +8,7 @@ use turso_sdk_kit::rsapi;
 
 static LOGGER_CALLBACK: Lazy<Mutex<Option<Opaque<Value>>>> = Lazy::new(|| Mutex::new(None));
 
+#[derive(Clone)]
 pub struct OwnedTursoLog {
     pub level: String,
     pub message: String,
@@ -73,7 +74,7 @@ pub fn _native_setup(ruby: &Ruby, level: String, callback: Value) -> Result<(), 
     let mut logger_guard = LOGGER_CALLBACK.lock().unwrap();
     *logger_guard = Some(Opaque::from(callback));
 
-    let (tx, rx) = mpsc::sync_channel(2048);
+    let (tx, rx) = mpsc::sync_channel(2048);//2048 should be fine.. we can bump if needed anyway.
     let mut channel_guard = LOG_CHANNEL.lock().unwrap();
     *channel_guard = Some((tx, Mutex::new(rx)));
 
@@ -103,7 +104,7 @@ pub fn _native_setup(ruby: &Ruby, level: String, callback: Value) -> Result<(), 
 pub fn _native_poll_logs(ruby: &Ruby) -> Result<(), Error> {
     let Ok(guard) = LOG_CHANNEL.try_lock() else { return Ok(()) };
     let Some((_, rx_mutex)) = &*guard else { return Ok(()) };
-    let Ok(rx) = rx_mutex.try_lock() else { return Ok(()) };
+    let rx = rx_mutex.lock().unwrap();
 
     while let Ok(log) = rx.try_recv() {
         let callback_guard = LOGGER_CALLBACK.lock().unwrap();

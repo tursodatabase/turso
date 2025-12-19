@@ -27,7 +27,7 @@ module Turso
 
     # Start a background thread to consume logs from the native queue
     @log_thread = Thread.new do
-      Thread.current.name = "turso-logger" if Thread.current.respond_to?(:name=)
+      Thread.current.name = "turso-logger"
       loop do
         _native_poll_logs
         sleep 0.05
