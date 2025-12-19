@@ -1862,6 +1862,7 @@ impl Connection {
 
     /// Try to read page with given ID with fixed WAL watermark position
     /// This method return false if page is not found (so, this is probably new page created after watermark position which wasn't checkpointed to the DB file yet)
+
     #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
     pub fn try_wal_watermark_read_page(
         &self,
@@ -1869,6 +1870,17 @@ impl Connection {
         page: &mut [u8],
         frame_watermark: Option<u64>,
     ) -> Result<bool> {
+        let (page_ref, c) = self.try_wal_watermark_read_page_begin(page_idx, frame_watermark)?;
+        self.get_pager().io.wait_for_completion(c)?;
+        self.try_wal_watermark_read_page_end(page, page_ref)
+    }
+
+    #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
+    pub fn try_wal_watermark_read_page_begin(
+        &self,
+        page_idx: u32,
+        frame_watermark: Option<u64>,
+    ) -> Result<(Arc<Page>, Completion)> {
         let pager = self.pager.load();
         let (page_ref, c) = match pager.read_page_no_cache(page_idx as i64, frame_watermark, true) {
             Ok(result) => result,
@@ -1880,8 +1892,15 @@ impl Connection {
             Err(err) => return Err(err),
         };
 
-        pager.io.wait_for_completion(c)?;
+        Ok((page_ref, c))
+    }
 
+    #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
+    pub fn try_wal_watermark_read_page_end(
+        &self,
+        page: &mut [u8],
+        page_ref: Arc<Page>,
+    ) -> Result<bool> {
         let content = page_ref.get_contents();
         // empty read - attempt to read absent page
         if content.buffer.is_empty() {
