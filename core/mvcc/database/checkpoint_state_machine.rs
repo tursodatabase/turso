@@ -213,7 +213,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 if version.btree_resident
                     || self
                         .checkpointed_txid_max_old
-                        .is_some_and(|txid_max_old| b <= txid_max_old.into())
+                        .is_some_and(|txid_max_old| b <= u64::from(txid_max_old))
                 {
                     exists_in_db_file = true;
                 }
@@ -223,7 +223,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 end_ts = Some(e);
                 if self
                     .checkpointed_txid_max_old
-                    .is_some_and(|txid_max_old| e <= txid_max_old.into())
+                    .is_some_and(|txid_max_old| e <= u64::from(txid_max_old))
                 {
                     exists_in_db_file = false;
                 }
@@ -239,7 +239,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             let is_uncheckpointed_insert = end_ts.is_none()
                 && self
                     .checkpointed_txid_max_old
-                    .is_none_or(|txid_max_old| begin_ts.is_some_and(|b| b > txid_max_old.into()));
+                    .is_none_or(|txid_max_old| begin_ts.is_some_and(|b| b > u64::from(txid_max_old)));
             // - It is a delete, AND some version of the row exists in the database file.
             let is_delete_and_exists_in_db_file = end_ts.is_some() && exists_in_db_file;
             let should_checkpoint = is_uncheckpointed_insert || is_delete_and_exists_in_db_file;
