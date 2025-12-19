@@ -2284,6 +2284,7 @@ mod tests {
                         Some("id".to_string()),
                         "INTEGER".to_string(),
                         None,
+                        None,
                         Type::Integer,
                         None,
                         ColDef {
@@ -2327,6 +2328,7 @@ mod tests {
                         Some("product_id".to_string()),
                         "INTEGER".to_string(),
                         None,
+                        None,
                         Type::Integer,
                         None,
                         ColDef {
@@ -2369,6 +2371,7 @@ mod tests {
                     SchemaColumn::new(
                         Some("order_id".to_string()),
                         "INTEGER".to_string(),
+                        None,
                         None,
                         Type::Integer,
                         None,
@@ -2415,6 +2418,7 @@ mod tests {
                         Some("id".to_string()),
                         "INTEGER".to_string(),
                         None,
+                        None,
                         Type::Integer,
                         None,
                         ColDef {
@@ -2449,6 +2453,7 @@ mod tests {
                     SchemaColumn::new(
                         Some("id".to_string()),
                         "INTEGER".to_string(),
+                        None,
                         None,
                         Type::Integer,
                         None,
@@ -2494,6 +2499,7 @@ mod tests {
                     SchemaColumn::new(
                         Some("id".to_string()),
                         "INTEGER".to_string(),
+                        None,
                         None,
                         Type::Integer,
                         None,

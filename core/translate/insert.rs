@@ -1445,6 +1445,7 @@ pub const ROWID_COLUMN: Column = Column::new(
     None,          // name
     String::new(), // type string
     None,          // default
+    None,          // generated
     schema::Type::Integer,
     None,
     ColDef {

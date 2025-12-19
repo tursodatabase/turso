@@ -1589,6 +1589,12 @@ impl BTreeTable {
                 sql.push_str(" DEFAULT ");
                 sql.push_str(&default.to_string());
             }
+
+            if let Some(generated) = &column.generated {
+                sql.push_str(" AS (");
+                sql.push_str(&generated.to_string());
+                sql.push(')');
+            }
         }
 
         let has_table_pk = !self.primary_key_columns.is_empty();
@@ -2030,6 +2036,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     Some(normalize_ident(&name)),
                     ty_str,
                     default,
+                    None,
                     ty,
                     collation,
                     ColDef {
@@ -2272,6 +2279,7 @@ pub struct Column {
     pub name: Option<String>,
     pub ty_str: String,
     pub default: Option<Box<Expr>>,
+    pub generated: Option<Box<Expr>>,
     raw: u16,
 }
 
@@ -2306,7 +2314,15 @@ impl Column {
         ty_str: String,
         default: Option<Box<Expr>>,
     ) -> Self {
-        Self::new(name, ty_str, default, Type::Text, None, ColDef::default())
+        Self::new(
+            name,
+            ty_str,
+            default,
+            None,
+            Type::Text,
+            None,
+            ColDef::default(),
+        )
     }
     pub fn new_default_integer(
         name: Option<String>,
@@ -2317,6 +2333,7 @@ impl Column {
             name,
             ty_str,
             default,
+            None,
             Type::Integer,
             None,
             ColDef::default(),
@@ -2327,6 +2344,7 @@ impl Column {
         name: Option<String>,
         ty_str: String,
         default: Option<Box<Expr>>,
+        generated: Option<Box<Expr>>,
         ty: Type,
         col: Option<CollationSeq>,
         coldef: ColDef,
@@ -2355,6 +2373,7 @@ impl Column {
             name,
             ty_str,
             default,
+            generated,
             raw,
         }
     }
@@ -2455,6 +2474,7 @@ impl From<&ColumnDefinition> for Column {
         let name = value.col_name.as_str();
 
         let mut default = None;
+        let mut generated = None;
         let mut notnull = false;
         let mut primary_key = false;
         let mut unique = false;
@@ -2474,6 +2494,9 @@ impl From<&ColumnDefinition> for Column {
                         CollationSeq::new(collation_name.as_str())
                             .expect("collation should have been set correctly in create table"),
                     );
+                }
+                ast::ColumnConstraint::Generated { expr, .. } => {
+                    generated = Some(expr.clone());
                 }
                 _ => {}
             };
@@ -2496,6 +2519,7 @@ impl From<&ColumnDefinition> for Column {
             Some(normalize_ident(name)),
             ty_str,
             default,
+            generated,
             ty,
             collation,
             ColDef {

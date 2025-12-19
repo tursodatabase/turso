@@ -2395,6 +2395,7 @@ mod tests {
                     Some("id".to_string()),
                     "INTEGER".to_string(),
                     None,
+                    None,
                     Type::Integer,
                     None,
                     ColDef {
@@ -2431,6 +2432,7 @@ mod tests {
                     Some("id".to_string()),
                     "INTEGER".to_string(),
                     None,
+                    None,
                     Type::Integer,
                     None,
                     ColDef {
@@ -2453,6 +2455,7 @@ mod tests {
                 SchemaColumn::new(
                     Some("amount".to_string()),
                     "REAL".to_string(),
+                    None,
                     None,
                     Type::Real,
                     None,
@@ -2479,6 +2482,7 @@ mod tests {
                     Some("id".to_string()),
                     "INTEGER".to_string(),
                     None,
+                    None,
                     Type::Integer,
                     None,
                     ColDef {
@@ -2492,6 +2496,7 @@ mod tests {
                 SchemaColumn::new(
                     Some("price".to_string()),
                     "REAL".to_string(),
+                    None,
                     None,
                     Type::Real,
                     None,
