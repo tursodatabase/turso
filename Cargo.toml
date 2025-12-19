@@ -2,7 +2,6 @@
 
 [workspace]
 resolver = "2"
-default-members = ["cli"]
 members = [
     "bindings/dart/rust",
     "bindings/java",
