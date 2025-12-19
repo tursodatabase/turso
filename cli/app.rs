@@ -66,8 +66,6 @@ pub struct Opts {
     pub vfs: Option<String>,
     #[clap(long, help = "Open the database in read-only mode")]
     pub readonly: bool,
-    #[clap(long, help = "Enable experimental MVCC feature")]
-    pub experimental_mvcc: bool,
     #[clap(long, help = "Enable experimental views feature")]
     pub experimental_views: bool,
     #[clap(long, help = "Enable experimental strict schema mode")]
@@ -193,7 +191,6 @@ impl Limbo {
             Connection::from_uri(
                 &db_file,
                 DatabaseOpts::new()
-                    .with_mvcc(opts.experimental_mvcc)
                     .with_views(opts.experimental_views)
                     .with_strict(opts.experimental_strict)
                     .with_encryption(opts.experimental_encryption)
@@ -210,7 +207,6 @@ impl Limbo {
                 opts.vfs.as_ref(),
                 flags,
                 turso_core::DatabaseOpts::new()
-                    .with_mvcc(opts.experimental_mvcc)
                     .with_views(opts.experimental_views)
                     .with_strict(opts.experimental_strict)
                     .with_encryption(opts.experimental_encryption)
@@ -415,7 +411,7 @@ impl Limbo {
                     _path => get_io(DbLocation::Path, &self.opts.io.to_string())?,
                 }
             };
-            (io.clone(), Database::open_file(io.clone(), path, false)?)
+            (io.clone(), Database::open_file(io.clone(), path)?)
         };
         self.io = io;
         self.conn = db.connect()?;
@@ -1769,7 +1765,7 @@ impl Limbo {
             anyhow::bail!("Refusing to overwrite existing file: {output_file}");
         }
         let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new()?);
-        let db = Database::open_file(io.clone(), output_file, false)?;
+        let db = Database::open_file(io.clone(), output_file)?;
         let target = db.connect()?;
 
         let mut applier = ApplyWriter::new(&target);

@@ -179,7 +179,7 @@ fn connect_sync(db: &DatabaseInner) -> napi::Result<()> {
         io.clone(),
         &db.path,
         flags,
-        turso_core::DatabaseOpts::new().with_mvcc(false),
+        turso_core::DatabaseOpts::new(),
         None,
     )
     .map_err(|e| to_generic_error(&format!("failed to open database {}", db.path), e))?;

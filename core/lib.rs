@@ -120,7 +120,6 @@ pub use vdbe::{
 /// Configuration for database features
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DatabaseOpts {
-    pub enable_mvcc: bool,
     pub enable_views: bool,
     pub enable_strict: bool,
     pub enable_encryption: bool,
@@ -137,11 +136,6 @@ impl DatabaseOpts {
     #[cfg(feature = "cli_only")]
     pub fn turso_cli(mut self) -> Self {
         self.enable_load_extension = true;
-        self
-    }
-
-    pub fn with_mvcc(mut self, enable: bool) -> Self {
-        self.enable_mvcc = enable;
         self
     }
 
@@ -377,14 +371,8 @@ impl Database {
     }
 
     #[cfg(feature = "fs")]
-    pub fn open_file(io: Arc<dyn IO>, path: &str, enable_mvcc: bool) -> Result<Arc<Database>> {
-        Self::open_file_with_flags(
-            io,
-            path,
-            OpenFlags::default(),
-            DatabaseOpts::new().with_mvcc(enable_mvcc),
-            None,
-        )
+    pub fn open_file(io: Arc<dyn IO>, path: &str) -> Result<Arc<Database>> {
+        Self::open_file_with_flags(io, path, OpenFlags::default(), DatabaseOpts::new(), None)
     }
 
     #[cfg(feature = "fs")]
@@ -405,14 +393,13 @@ impl Database {
         io: Arc<dyn IO>,
         path: &str,
         db_file: Arc<dyn DatabaseStorage>,
-        enable_mvcc: bool,
     ) -> Result<Arc<Database>> {
         Self::open_with_flags(
             io,
             path,
             db_file,
             OpenFlags::default(),
-            DatabaseOpts::new().with_mvcc(enable_mvcc),
+            DatabaseOpts::new(),
             None,
         )
     }
@@ -627,62 +614,29 @@ impl Database {
                 .map_err(|val| LimboError::Corrupt(format!("Invalid write_version: {val}")))?,
         );
 
-        let mut open_mv_store = self.mvcc_enabled();
+        // Determine if we should open in MVCC mode based on the database header version
+        // MVCC is controlled only by the database header (set via PRAGMA journal_mode)
+        let open_mv_store = matches!(read_version, Version::Mvcc);
 
         // Now check the Header Version to see which mode the DB file really is on
         // Track if header was modified so we can write it to disk
         let header_modified = match read_version {
             Version::Legacy => {
                 if is_readonly {
-                    if open_mv_store {
-                        tracing::warn!("Database {} is opened in readonly mode, cannot convert to MVCC mode. Falling back to WAL mode.", self.path);
-                        open_mv_store = false;
-                    }
                     tracing::warn!("Database {} is opened in readonly mode, cannot convert Legacy mode to WAL. Running in Legacy mode.", self.path);
                     false
                 } else {
-                    if open_mv_store {
-                        header_mut.read_version = RawVersion::from(Version::Mvcc);
-                        header_mut.write_version = RawVersion::from(Version::Mvcc);
-                    } else {
-                        header_mut.read_version = RawVersion::from(Version::Wal);
-                        header_mut.write_version = RawVersion::from(Version::Wal);
-                    }
+                    // Convert Legacy to WAL mode
+                    header_mut.read_version = RawVersion::from(Version::Wal);
+                    header_mut.write_version = RawVersion::from(Version::Wal);
                     true
                 }
             }
-            Version::Wal => {
-                match (open_mv_store, wal_exists, is_readonly) {
-                    (true, _, true) => {
-                        tracing::warn!("Database {} is opened in readonly mode, cannot convert to MVCC mode. Running in WAL mode.", self.path);
-                        open_mv_store = false;
-                        false
-                    }
-                    (true, true, false) => {
-                        tracing::warn!("WAL file exists for database {}, but MVCC is enabled. Run `PRAGMA journal_mode = 'experimental_mvcc;'` to change to MVCC mode", self.path);
-                        open_mv_store = false;
-                        false
-                    }
-                    (true, false, false) => {
-                        // Change Header to MVCC if WAL does not exists and we have MVCC enabled
-                        header_mut.read_version = RawVersion::from(Version::Mvcc);
-                        header_mut.write_version = RawVersion::from(Version::Mvcc);
-                        true
-                    }
-                    (false, _, _) => false,
-                }
-            }
-            Version::Mvcc => {
-                if !open_mv_store {
-                    tracing::warn!("Database is in MVCC mode, but MVCC options were not passed. Enabling MVCC mode");
-                    self.opts.enable_mvcc = true;
-                    open_mv_store = true;
-                }
-                false
-            }
+            Version::Wal => false,
+            Version::Mvcc => false,
         };
 
-        // Currently we always init shared wal regardless if MVCC enabled
+        // Check for inconsistent state between database header and log files
         match (wal_exists, log_exists) {
             (true, true) => {
                 return Err(LimboError::Corrupt(
@@ -690,21 +644,19 @@ impl Database {
                 ));
             }
             (true, false) => {
-                // Currently, if a non-zero-sized WAL file exists, the database cannot be opened in MVCC mode.
-                // FIXME: this should initiate immediate checkpoint from WAL->DB in MVCC mode.
+                // If a WAL file exists but header says MVCC, that's an inconsistent state
                 if open_mv_store {
-                    return Err(LimboError::InvalidArgument(format!(
-                        "WAL file exists for database {}, but MVCC is enabled. This is currently not supported. Open the database in non-MVCC mode and run PRAGMA wal_checkpoint(TRUNCATE) to truncate the WAL.",
+                    return Err(LimboError::Corrupt(format!(
+                        "WAL file exists for database {}, but database header indicates MVCC mode. Run PRAGMA wal_checkpoint(TRUNCATE) to truncate the WAL.",
                         self.path
                     )));
                 }
             }
             (false, true) => {
-                // If a non-zero-sized logical log file exists, the database cannot be opened in non-MVCC mode,
-                // because the changes in the logical log would not be visible to the non-MVCC connections.
+                // If an MVCC log file exists but header says WAL, that's an inconsistent state
                 if !open_mv_store {
-                    return Err(LimboError::InvalidArgument(format!(
-                        "MVCC logical log file exists for database {}, but MVCC is disabled. This is not supported. Open the database in MVCC mode and run PRAGMA wal_checkpoint(TRUNCATE) to truncate the logical log.",
+                    return Err(LimboError::Corrupt(format!(
+                        "MVCC logical log file exists for database {}, but database header indicates WAL mode. The database may be corrupted.",
                         self.path
                     )));
                 }
@@ -1084,9 +1036,9 @@ impl Database {
         self.opts.enable_strict
     }
 
-    /// check if MVCC database option is enabled
+    /// check if database is currently in MVCC mode
     pub fn mvcc_enabled(&self) -> bool {
-        self.opts.enable_mvcc
+        self.mv_store.load().is_some()
     }
 
     #[cfg(feature = "test_helper")]
@@ -2361,12 +2313,10 @@ impl Connection {
             )));
         }
 
-        let use_mvcc = self.db.get_mv_store().is_some();
         let use_views = self.db.experimental_views_enabled();
         let use_strict = self.db.experimental_strict_enabled();
 
         let db_opts = DatabaseOpts::new()
-            .with_mvcc(use_mvcc)
             .with_views(use_views)
             .with_strict(use_strict);
         let io: Arc<dyn IO> = if path.contains(":memory:") {

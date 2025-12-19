@@ -879,9 +879,7 @@ fn reopen_database(env: &mut SimulatorEnv) {
                 env.io.clone(),
                 env.get_db_path().to_str().expect("path should be 'to_str'"),
                 turso_core::OpenFlags::default(),
-                turso_core::DatabaseOpts::new()
-                    .with_mvcc(mvcc)
-                    .with_autovacuum(true),
+                turso_core::DatabaseOpts::new().with_autovacuum(true),
                 None,
             ) {
                 Ok(db) => db,
@@ -896,6 +894,13 @@ fn reopen_database(env: &mut SimulatorEnv) {
             };
 
             env.db = Some(db);
+
+            // Enable MVCC via PRAGMA if requested
+            if mvcc {
+                let conn = env.db.as_ref().expect("db to be Some").connect().unwrap();
+                conn.pragma_update("journal_mode", "'experimental_mvcc'")
+                    .expect("enable mvcc");
+            }
 
             for _ in 0..num_conns {
                 env.connections.push(SimConnection::LimboConnection(

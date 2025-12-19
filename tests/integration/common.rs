@@ -16,6 +16,8 @@ pub struct TempDatabase {
     pub db_flags: turso_core::OpenFlags,
     #[allow(dead_code)]
     pub init_sql: Option<String>,
+    #[allow(dead_code)]
+    pub enable_mvcc: bool,
 }
 unsafe impl Send for TempDatabase {}
 
@@ -26,6 +28,7 @@ pub struct TempDatabaseBuilder {
     opts: Option<turso_core::DatabaseOpts>,
     flags: Option<turso_core::OpenFlags>,
     init_sql: Option<String>,
+    enable_mvcc: bool,
 }
 
 impl TempDatabaseBuilder {
@@ -36,6 +39,7 @@ impl TempDatabaseBuilder {
             opts: None,
             flags: None,
             init_sql: None,
+            enable_mvcc: false,
         }
     }
 
@@ -76,6 +80,11 @@ impl TempDatabaseBuilder {
         self
     }
 
+    pub fn with_mvcc(mut self, enable: bool) -> Self {
+        self.enable_mvcc = enable;
+        self
+    }
+
     pub fn build(self) -> TempDatabase {
         let opts = self
             .opts
@@ -112,6 +121,14 @@ impl TempDatabaseBuilder {
             None,
         )
         .unwrap();
+
+        // Enable MVCC via turso connection if requested
+        if self.enable_mvcc {
+            let conn = db.connect().unwrap();
+            conn.pragma_update("journal_mode", "'experimental_mvcc'")
+                .expect("enable mvcc");
+        }
+
         TempDatabase {
             path: db_path,
             io,
@@ -119,6 +136,7 @@ impl TempDatabaseBuilder {
             db_opts: opts,
             db_flags: flags,
             init_sql: self.init_sql,
+            enable_mvcc: self.enable_mvcc,
         }
     }
 }
@@ -137,11 +155,13 @@ impl TempDatabase {
         Self::builder().with_db_name(db_name).build()
     }
 
-    pub fn new_with_opts(db_name: &str, opts: turso_core::DatabaseOpts) -> Self {
-        Self::builder()
-            .with_db_name(db_name)
-            .with_opts(opts)
-            .build()
+    /// Creates a new database with MVCC mode enabled.
+    pub fn new_with_mvcc(db_name: &str) -> Self {
+        let db = Self::new(db_name);
+        let conn = db.connect_limbo();
+        conn.pragma_update("journal_mode", "'experimental_mvcc'")
+            .expect("enable mvcc");
+        db
     }
 
     pub fn new_with_existent(db_path: &Path) -> Self {
@@ -176,7 +196,7 @@ impl TempDatabase {
 
     pub fn limbo_database(&self) -> Arc<turso_core::Database> {
         log::debug!("conneting to limbo");
-        Database::open_file(self.io.clone(), self.path.to_str().unwrap(), false).unwrap()
+        Database::open_file(self.io.clone(), self.path.to_str().unwrap()).unwrap()
     }
 
     #[allow(dead_code)]
@@ -842,7 +862,7 @@ mod tests {
         // Open database
         #[allow(clippy::arc_with_non_send_sync)]
         let io: Arc<dyn IO> = Arc::new(turso_core::PlatformIO::new().unwrap());
-        let db = Database::open_file(io, &db_path, false)?;
+        let db = Database::open_file(io, &db_path)?;
 
         const NUM_CONNECTIONS: usize = 5;
         let mut connections = Vec::new();

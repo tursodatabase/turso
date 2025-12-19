@@ -22,7 +22,7 @@ fn bench(criterion: &mut Criterion) {
 
     #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(PlatformIO::new().unwrap());
-    let db = Database::open_file(io.clone(), "../testing/testing.db", false).unwrap();
+    let db = Database::open_file(io.clone(), "../testing/testing.db").unwrap();
     let limbo_conn = db.connect().unwrap();
 
     // Benchmark JSONB with different payload sizes
@@ -490,7 +490,7 @@ fn bench_sequential_jsonb(criterion: &mut Criterion) {
 
     #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(PlatformIO::new().unwrap());
-    let db = Database::open_file(io.clone(), "../testing/testing.db", false).unwrap();
+    let db = Database::open_file(io.clone(), "../testing/testing.db").unwrap();
     let limbo_conn = db.connect().unwrap();
 
     // Select a subset of JSON payloads to use in the sequential test
@@ -646,7 +646,7 @@ fn bench_json_patch(criterion: &mut Criterion) {
 
     #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(PlatformIO::new().unwrap());
-    let db = Database::open_file(io.clone(), "../testing/testing.db", false).unwrap();
+    let db = Database::open_file(io.clone(), "../testing/testing.db").unwrap();
     let limbo_conn = db.connect().unwrap();
 
     let json_patch_cases = [

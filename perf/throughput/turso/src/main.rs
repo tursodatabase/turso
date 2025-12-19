@@ -154,14 +154,16 @@ async fn setup_database(
     } else {
         builder
     };
-    let db = match mode {
-        TransactionMode::Legacy => builder.build().await?,
-        TransactionMode::Mvcc | TransactionMode::Concurrent => {
-            builder.with_mvcc(true).build().await?
-        }
-        TransactionMode::LogicalLog => builder.with_mvcc(true).build().await?,
-    };
+    let db = builder.build().await?;
     let conn = db.connect()?;
+
+    // Enable MVCC for modes that require it
+    if matches!(
+        mode,
+        TransactionMode::Mvcc | TransactionMode::Concurrent | TransactionMode::LogicalLog
+    ) {
+        conn.pragma_update("journal_mode", "'experimental_mvcc'")?;
+    }
 
     conn.execute(
         "CREATE TABLE IF NOT EXISTS test_table (

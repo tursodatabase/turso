@@ -41,6 +41,18 @@ class TursoShell:
         if init_commands and pipe.stdin is not None:
             pipe.stdin.write((init_commands + "\n").encode())
             pipe.stdin.flush()
+            # Consume any output from init_commands using a marker
+            end_marker = "END_OF_INIT"
+            pipe.stdin.write(f"SELECT '{end_marker}';\n".encode())
+            pipe.stdin.flush()
+            output = ""
+            while True:
+                ready, _, _ = select.select([pipe.stdout], [], [], 5.0)
+                if pipe.stdout in ready:
+                    fragment = pipe.stdout.read(PIPE_BUF).decode()
+                    output += fragment
+                    if output.rstrip().endswith(end_marker):
+                        break
         return pipe
 
     def get_test_filepath(self) -> Path:

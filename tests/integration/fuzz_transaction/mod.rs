@@ -589,10 +589,16 @@ async fn multiple_connections_fuzz(opts: FuzzOptions) {
         // Create a fresh database for each iteration
         let tempfile = tempfile::NamedTempFile::new().unwrap();
         let db = Builder::new_local(tempfile.path().to_str().unwrap())
-            .with_mvcc(opts.mvcc_enabled)
             .build()
             .await
             .unwrap();
+
+        // Enable MVCC if requested
+        if opts.mvcc_enabled {
+            let conn = db.connect().unwrap();
+            conn.pragma_update("journal_mode", "'experimental_mvcc'")
+                .unwrap();
+        }
 
         // SHARED shadow database for all connections
         let mut schema = BTreeMap::new();

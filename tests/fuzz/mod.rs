@@ -236,6 +236,7 @@ mod fuzz_tests {
         maybe_setup_tracing();
         let (mut rng, seed) = rng_from_time_or_env();
 
+        let is_mvcc = db.enable_mvcc;
         let opts = db.db_opts;
         let flags = db.db_flags;
         let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
@@ -255,7 +256,7 @@ mod fuzz_tests {
             .map(|init_sql| builder.clone().with_init_sql(init_sql).build())
             .collect::<Vec<_>>();
         let mut pk_tuples = HashSet::new();
-        let num_tuples = if opts.enable_mvcc { 10000 } else { 100000 };
+        let num_tuples = if is_mvcc { 10000 } else { 100000 };
         while pk_tuples.len() < num_tuples {
             pk_tuples.insert((
                 rng.random_range(0..3000),
@@ -280,7 +281,7 @@ mod fuzz_tests {
             .iter()
             .enumerate()
             .map(|(i, db)| {
-                if opts.enable_mvcc {
+                if is_mvcc {
                     tmp_dir
                         .path()
                         .join(std::path::PathBuf::from(format!("sqlite_{i}.db")))
@@ -296,7 +297,7 @@ mod fuzz_tests {
             .map(|db| rusqlite::Connection::open(db).unwrap())
             .collect::<Vec<_>>();
         for (i, sqlite_conn) in sqlite_conns.into_iter().enumerate() {
-            if opts.enable_mvcc {
+            if is_mvcc {
                 sqlite_conn.execute(table_defs[i], []).unwrap();
             }
             sqlite_conn.execute(&insert, params![]).unwrap();
@@ -307,7 +308,7 @@ mod fuzz_tests {
             .map(|db| rusqlite::Connection::open(db).unwrap())
             .collect::<Vec<_>>();
         let limbo_conns = dbs.iter().map(|db| db.connect_limbo()).collect::<Vec<_>>();
-        if opts.enable_mvcc {
+        if is_mvcc {
             for limbo_conn in limbo_conns.iter() {
                 limbo_conn.execute(&insert).unwrap();
             }
@@ -2201,7 +2202,7 @@ mod fuzz_tests {
     /// Create a table with a random number of columns and indexes, and then randomly update or delete rows from the table.
     /// Verify that the results are the same for SQLite and Turso.
     pub fn table_index_mutation_fuzz(db: TempDatabase) {
-        let is_mvcc = db.db_opts.enable_mvcc;
+        let is_mvcc = db.enable_mvcc;
         /// Format a nice diff between two result sets for better error messages
         #[allow(clippy::too_many_arguments)]
         fn format_rows_diff(
@@ -2331,9 +2332,11 @@ mod fuzz_tests {
                 OUTER_ITERATIONS
             );
             let limbo_db = builder.clone().build();
-            // For the sqlite comparison database, disable MVCC since rusqlite can't
-            // read databases with MVCC version (255) in the header
-            let sqlite_db = builder.clone().with_opts(opts.with_mvcc(false)).build();
+            // For the sqlite comparison database, use a separate builder without MVCC init_sql
+            let sqlite_db = TempDatabase::builder()
+                .with_flags(flags)
+                .with_opts(opts)
+                .build();
             let num_cols = rng.random_range(1..=10);
             let mut table_cols = vec!["id INTEGER PRIMARY KEY AUTOINCREMENT".to_string()];
             table_cols.extend(
@@ -4648,11 +4651,8 @@ mod fuzz_tests {
         let limbo_conn = db.connect_limbo();
 
         let (mut rng, seed) = rng_from_time_or_env();
-        let mvcc = db.db_opts.enable_mvcc;
-        tracing::info!(
-            "create_table_drop_table_fuzz seed: {seed}, mvcc: {}",
-            db.db_opts.enable_mvcc
-        );
+        let mvcc = db.enable_mvcc;
+        tracing::info!("create_table_drop_table_fuzz seed: {seed}, mvcc: {mvcc}");
 
         // Keep track of current tables and their columns in memory
         let mut current_tables: std::collections::HashMap<String, Vec<String>> =

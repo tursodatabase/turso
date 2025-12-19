@@ -493,7 +493,6 @@ impl TursoDatabase {
             for features in experimental_features.split(",").map(|s| s.trim()) {
                 opts = match features {
                     "views" => opts.with_views(true),
-                    "mvcc" => opts.with_mvcc(true),
                     "index_method" => opts.with_index_method(true),
                     "strict" => opts.with_strict(true),
                     "autovacuum" => opts.with_autovacuum(true),
