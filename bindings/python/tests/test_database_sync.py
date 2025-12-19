@@ -121,12 +121,12 @@ def test_partial_sync_segment_size():
 
     with TursoServer() as server:
         server.db_sql("CREATE TABLE t(x)")
-        server.db_sql("INSERT INTO t SELECT randomblob(1024) FROM generate_series(1, 2000)")
+        server.db_sql("INSERT INTO t SELECT randomblob(1024) FROM generate_series(1, 256)")
 
         conn_full = turso.sync.connect(":memory:", remote_url=server.db_url())
         assert conn_full.execute("SELECT LENGTH(x) FROM t LIMIT 1").fetchall() == [(1024,)]
-        assert conn_full.stats().network_received_bytes > 2000 * 1024
-        assert conn_full.execute("SELECT SUM(LENGTH(x)) FROM t").fetchall() == [(2000 * 1024,)]
+        assert conn_full.stats().network_received_bytes > 256 * 1024
+        assert conn_full.execute("SELECT SUM(LENGTH(x)) FROM t").fetchall() == [(256 * 1024,)]
 
         conn_partial = turso.sync.connect(
             ":memory:",
@@ -137,12 +137,12 @@ def test_partial_sync_segment_size():
             ),
         )
         assert conn_partial.execute("SELECT LENGTH(x) FROM t LIMIT 1").fetchall() == [(1024,)]
-        assert conn_partial.stats().network_received_bytes < 256 * 1024 * 1024
+        assert conn_partial.stats().network_received_bytes < 128 * 1024 * 1.5
 
         start = time.time()
-        assert conn_partial.execute("SELECT SUM(LENGTH(x)) FROM t").fetchall() == [(2000 * 1024,)]
+        assert conn_partial.execute("SELECT SUM(LENGTH(x)) FROM t").fetchall() == [(256 * 1024,)]
         print(time.time() - start)
-        assert conn_partial.stats().network_received_bytes > 2000 * 1024
+        assert conn_partial.stats().network_received_bytes > 256 * 1024
 
 def test_partial_sync_prefetch():
     # turso.setup_logging(level=logging.DEBUG)
@@ -166,7 +166,7 @@ def test_partial_sync_prefetch():
             ),
         )
         assert conn_partial.execute("SELECT LENGTH(x) FROM t LIMIT 1").fetchall() == [(1024,)]
-        assert conn_partial.stats().network_received_bytes < 256 * 1024 * 1024
+        assert conn_partial.stats().network_received_bytes < 1200 * 1024
 
         start = time.time()
         assert conn_partial.execute("SELECT SUM(LENGTH(x)) FROM t").fetchall() == [(2000 * 1024,)]
