@@ -1,12 +1,11 @@
-use magnus::value::ReprValue;
-use magnus::{block::Proc, method, Error, Module, Ruby, TryConvert, Value};
+use magnus::typed_data::Obj;
+use magnus::{method, Error, Module, Ruby, TryConvert, Value};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use turso_sdk_kit::rsapi::{TursoConnection, TursoStatusCode};
 
-use crate::errors::map_turso_error;
+use crate::errors::{map_turso_error, not_supported_error};
 use crate::statement::{RbResultSet, RbStatement};
-use crate::value;
 
 #[magnus::wrap(class = "Turso::Connection", free_immediately, size)]
 pub struct RbConnection {
@@ -42,11 +41,11 @@ impl RbConnection {
         Ok(RbStatement::new(stmt))
     }
 
-    pub fn execute(&self, args: &[Value]) -> Result<RbResultSet, Error> {
-        self.ensure_open()?;
+    pub fn execute(ruby: &Ruby, rb_self: Obj<Self>, args: &[Value]) -> Result<Obj<RbResultSet>, Error> {
+        let this = &*rb_self;
+        this.ensure_open()?;
 
         if args.is_empty() {
-            let ruby = Ruby::get().expect("Ruby not initialized");
             return Err(Error::new(
                 ruby.exception_arg_error(),
                 "execute requires at least a SQL string",
@@ -54,43 +53,28 @@ impl RbConnection {
         }
 
         let sql: String = String::try_convert(args[0])?;
-        let mut stmt = self.inner.prepare_single(&sql).map_err(map_turso_error)?;
-
-        for (i, arg) in args[1..].iter().enumerate() {
-            value::bind_value(&mut stmt, i + 1, *arg)?;
-        }
-
-        let mut rows: Vec<Value> = Vec::new();
-        loop {
-            match stmt.step().map_err(map_turso_error)? {
-                TursoStatusCode::Row => {
-                    rows.push(value::extract_row(&stmt)?.as_value());
-                }
-                TursoStatusCode::Done => break,
-                TursoStatusCode::Io => {
-                    stmt.run_io().map_err(map_turso_error)?;
-                }
-                _ => break,
-            }
-        }
-
-        let changes = self.inner.changes();
-        stmt.finalize().map_err(map_turso_error)?;
-        self.last_changes.store(changes, Ordering::Relaxed);
-
-        Ok(RbResultSet::new(rows, changes))
+        let stmt = this.prepare(sql)?;
+        let rb_stmt = ruby.obj_wrap(stmt);
+        RbStatement::execute(ruby, rb_stmt, &args[1..])
     }
 
-    pub fn transaction(&self, block: Proc) -> Result<Value, Error> {
-        self.execute_sql("BEGIN")?;
+    pub fn transaction(ruby: &Ruby, rb_self: Obj<Self>) -> Result<Value, Error> {
+        let block = ruby.block_proc()?;
+        if rb_self.in_transaction() {
+            return Err(not_supported_error(
+                "cannot start a transaction within a transaction",
+            ));
+        }
+
+        rb_self.execute_sql("BEGIN")?;
 
         match block.call::<_, Value>(()) {
             Ok(result) => {
-                self.execute_sql("COMMIT")?;
+                rb_self.execute_sql("COMMIT")?;
                 Ok(result)
             }
             Err(e) => {
-                let _ = self.execute_sql("ROLLBACK");
+                let _ = rb_self.execute_sql("ROLLBACK");
                 Err(e)
             }
         }
@@ -133,7 +117,7 @@ pub fn define_connection(ruby: &Ruby, module: &impl Module) -> Result<(), Error>
     let class = module.define_class("Connection", ruby.class_object())?;
     class.define_method("prepare", method!(RbConnection::prepare, 1))?;
     class.define_method("execute", method!(RbConnection::execute, -1))?;
-    class.define_method("transaction", method!(RbConnection::transaction, 1))?;
+    class.define_method("transaction", method!(RbConnection::transaction, 0))?;
     class.define_method("changes", method!(RbConnection::changes, 0))?;
     class.define_method(
         "last_insert_row_id",

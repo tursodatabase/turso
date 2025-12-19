@@ -30,11 +30,17 @@ impl RbDatabase {
         let conn = self.inner.connect().map_err(map_turso_error)?;
         Ok(RbConnection::new(conn))
     }
+
+    pub fn close(&self) -> Result<(), Error> {
+        // Nope,we don't do that here! but just adding for sake of adding
+        Ok(())
+    }
 }
 
 pub fn define_database(ruby: &Ruby, module: &impl Module) -> Result<(), Error> {
     let class = module.define_class("Database", ruby.class_object())?;
     class.define_singleton_method("open", function!(RbDatabase::open, 1))?;
     class.define_method("connect", method!(RbDatabase::connect, 0))?;
+    class.define_method("close", method!(RbDatabase::close, 0))?;
     Ok(())
 }
