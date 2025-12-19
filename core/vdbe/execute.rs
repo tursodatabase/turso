@@ -7097,10 +7097,9 @@ fn new_rowid_inner(
                 if let Some(mv_store) = mv_store.as_ref() {
                     let cursor = state.get_cursor(*cursor);
                     let cursor = cursor.as_btree_mut() as &mut dyn Any;
-                    let Some(mvcc_cursor) = cursor.downcast_mut::<MvCursor>() else {
-                        panic!("unexpected cursor type with MVCC enabled on ReadingMaxRowid");
+                    if let Some(mvcc_cursor) = cursor.downcast_mut::<MvCursor>() {
+                        mvcc_cursor.initialize_max_rowid(current_max)?;
                     };
-                    mvcc_cursor.initialize_max_rowid(current_max)?;
                 }
 
                 if *prev_largest_reg > 0 {
@@ -7167,6 +7166,15 @@ fn new_rowid_inner(
                     state.registers[*rowid_reg] = Register::Value(Value::Integer(candidate));
                     state.op_new_rowid_state = OpNewRowidState::Start;
                     state.pc += 1;
+
+                    if let Some(mv_store) = mv_store.as_ref() {
+                        let cursor = state.get_cursor(*cursor);
+                        let cursor = cursor.as_btree_mut() as &mut dyn Any;
+                        if let Some(mvcc_cursor) = cursor.downcast_mut::<MvCursor>() {
+                            mvcc_cursor.end_new_rowid();
+                        }
+                    }
+
                     return Ok(InsnFunctionStepResult::Step);
                 } else {
                     // Collision, try again
