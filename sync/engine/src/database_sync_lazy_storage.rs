@@ -376,10 +376,14 @@ async fn read_page<Ctx, IO: SyncEngineIo>(
             Some(page as u32),
         )
         .await?
-        else {
-            panic!("page_data must be set for completion");
-        };
-        page_data
+        {
+            Some(page_data) => page_data,
+            None => {
+                tracing::info!("read_page(page={page}): no page was fetched from server");
+                c.complete(0);
+                return Ok(());
+            }
+        }
     };
 
     let buffer = Arc::new(Buffer::new(data));
