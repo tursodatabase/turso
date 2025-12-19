@@ -251,12 +251,18 @@ impl DatabaseWalSession {
 
         let conn = self.wal_session.conn();
         let mut frame = vec![0u8; WAL_FRAME_HEADER + self.page_size];
-        let (page_ref, c) =
+        let begin_read_result =
             conn.try_wal_watermark_read_page_begin(page_no, Some(frame_watermark))?;
-        while !c.succeeded() {
-            let _ = coro.yield_(SyncEngineIoResult::IO).await;
-        }
-        if conn.try_wal_watermark_read_page_end(&mut frame[WAL_FRAME_HEADER..], page_ref)? {
+        let end_read_result = match begin_read_result {
+            Some((page_ref, c)) => {
+                while !c.succeeded() {
+                    let _ = coro.yield_(SyncEngineIoResult::IO).await;
+                }
+                conn.try_wal_watermark_read_page_end(&mut frame[WAL_FRAME_HEADER..], page_ref)?
+            }
+            None => false,
+        };
+        if end_read_result {
             tracing::trace!("rollback page {}", page_no);
             self.prepared_frame = Some((page_no, frame));
         } else {

@@ -652,14 +652,20 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     continue;
                 }
 
-                let (page_ref, c) =
+                let begin_read_result =
                     main_conn.try_wal_watermark_read_page_begin(page_no, Some(watermark))?;
-                while !c.succeeded() {
-                    let _ = coro.yield_(crate::types::SyncEngineIoResult::IO).await;
-                }
-                if !main_conn.try_wal_watermark_read_page_end(&mut page, page_ref)? {
+                let end_read_result = match begin_read_result {
+                    Some((page_ref, c)) => {
+                        while !c.succeeded() {
+                            let _ = coro.yield_(crate::types::SyncEngineIoResult::IO).await;
+                        }
+                        main_conn.try_wal_watermark_read_page_end(&mut page, page_ref)?
+                    }
+                    None => false,
+                };
+                if !end_read_result {
                     tracing::info!(
-                        "checkpoint(path={:?}): skip page {} as it was allocated in the wAL portion for revert",
+                        "checkpoint(path={:?}): skip page {} as it was allocated in the WAL portion for revert",
                         self.main_db_path,
                         page_no
                     );

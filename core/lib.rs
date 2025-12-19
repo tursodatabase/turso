@@ -1869,7 +1869,11 @@ impl Connection {
         page: &mut [u8],
         frame_watermark: Option<u64>,
     ) -> Result<bool> {
-        let (page_ref, c) = self.try_wal_watermark_read_page_begin(page_idx, frame_watermark)?;
+        let Some((page_ref, c)) =
+            self.try_wal_watermark_read_page_begin(page_idx, frame_watermark)?
+        else {
+            return Ok(false);
+        };
         self.get_pager().io.wait_for_completion(c)?;
         self.try_wal_watermark_read_page_end(page, page_ref)
     }
@@ -1879,7 +1883,7 @@ impl Connection {
         &self,
         page_idx: u32,
         frame_watermark: Option<u64>,
-    ) -> Result<(Arc<Page>, Completion)> {
+    ) -> Result<Option<(Arc<Page>, Completion)>> {
         let pager = self.pager.load();
         let (page_ref, c) = match pager.read_page_no_cache(page_idx as i64, frame_watermark, true) {
             Ok(result) => result,
@@ -1887,11 +1891,11 @@ impl Connection {
             #[cfg(target_os = "windows")]
             Err(LimboError::CompletionError(CompletionError::IOError(
                 std::io::ErrorKind::UnexpectedEof,
-            ))) => return Ok(false),
+            ))) => return Ok(None),
             Err(err) => return Err(err),
         };
 
-        Ok((page_ref, c))
+        Ok(Some((page_ref, c)))
     }
 
     #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
