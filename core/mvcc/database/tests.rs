@@ -1272,21 +1272,12 @@ fn test_connection_sees_other_connection_changes() {
         .execute("INSERT INTO test_table (id, text) VALUES (965, 'text_877')")
         .unwrap();
     let mut stmt = conn1.query("SELECT * FROM test_table").unwrap().unwrap();
-    loop {
-        let res = stmt.step().unwrap();
-        match res {
-            StepResult::Row => {
-                let row = stmt.row().unwrap();
-                let text = row.get_value(1).to_text().unwrap();
-                assert_eq!(text, "text_877");
-            }
-            StepResult::Done => break,
-            StepResult::IO => {
-                stmt.run_once().unwrap();
-            }
-            _ => panic!("Expected Row"),
-        }
-    }
+    stmt.run_with_row_callback(|row| {
+        let text = row.get_value(1).to_text().unwrap();
+        assert_eq!(text, "text_877");
+        Ok(())
+    })
+    .unwrap();
 }
 
 #[test]
@@ -1308,22 +1299,13 @@ fn test_delete_with_conn() {
 
     let mut stmt = conn0.prepare("SELECT * FROM test").unwrap();
     let mut pos = 0;
-    loop {
-        let res = stmt.step().unwrap();
-        match res {
-            StepResult::Row => {
-                let row = stmt.row().unwrap();
-                let t = row.get_value(0).as_int().unwrap();
-                assert_eq!(t, inserts[pos]);
-                pos += 1;
-            }
-            StepResult::Done => break,
-            StepResult::IO => {
-                stmt.run_once().unwrap();
-            }
-            _ => panic!("Expected Row"),
-        }
-    }
+    stmt.run_with_row_callback(|row| {
+        let t = row.get_value(0).as_int().unwrap();
+        assert_eq!(t, inserts[pos]);
+        pos += 1;
+        Ok(())
+    })
+    .unwrap();
 }
 
 fn get_record_value(row: &Row) -> ImmutableRecord {
@@ -1369,22 +1351,12 @@ fn test_commit_without_tx() {
 fn get_rows(conn: &Arc<Connection>, query: &str) -> Vec<Vec<Value>> {
     let mut stmt = conn.prepare(query).unwrap();
     let mut rows = Vec::new();
-    loop {
-        match stmt.step().unwrap() {
-            StepResult::Row => {
-                let row = stmt.row().unwrap();
-                let values = row.get_values().cloned().collect::<Vec<_>>();
-                rows.push(values);
-            }
-            StepResult::Done => break,
-            StepResult::IO => {
-                stmt.run_once().unwrap();
-            }
-            StepResult::Interrupt | StepResult::Busy => {
-                panic!("unexpected step result");
-            }
-        }
-    }
+    stmt.run_with_row_callback(|row| {
+        let values = row.get_values().cloned().collect::<Vec<_>>();
+        rows.push(values);
+        Ok(())
+    })
+    .unwrap();
     rows
 }
 

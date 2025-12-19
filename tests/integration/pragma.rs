@@ -145,17 +145,14 @@ fn test_pragma_page_sizes_with_writes_persists(db: TempDatabase) {
                 .query("SELECT value FROM test WHERE id = 1")
                 .unwrap()
                 .unwrap();
-            loop {
-                if let StepResult::Row = rows.step().unwrap() {
-                    let row = rows.row().unwrap();
-                    let Value::Text(value) = row.get_value(0) else {
-                        panic!("expected text value");
-                    };
-                    assert_eq!(value.as_str(), "test data");
-                    break;
-                }
-                rows.run_once().unwrap();
-            }
+            rows.run_with_row_callback(|row| {
+                let Value::Text(value) = row.get_value(0) else {
+                    panic!("expected text value");
+                };
+                assert_eq!(value.as_str(), "test data");
+                Ok(())
+            })
+            .unwrap();
         }
 
         // Drop the db and reopen it, and verify the same

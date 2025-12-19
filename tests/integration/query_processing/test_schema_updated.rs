@@ -1,4 +1,4 @@
-use turso_core::{Result, StepResult, Value};
+use turso_core::{Result, Value};
 
 use crate::common::TempDatabase;
 
@@ -37,21 +37,14 @@ fn test_schema_update_reprepares_statement(tmp_db: TempDatabase) -> Result<()> {
 
     // First, let's verify the statement can execute (it will be automatically reprepared)
     let mut found_row = false;
-    loop {
-        match stmt.step()? {
-            StepResult::Row => {
-                let row = stmt.row().unwrap();
-                let a = row.get::<&Value>(0).unwrap();
-                let b = row.get::<&Value>(1).unwrap();
-                assert_eq!(*a, Value::Integer(1));
-                assert_eq!(*b, Value::build_text("first"));
-                found_row = true;
-            }
-            StepResult::IO => stmt.run_once()?,
-            StepResult::Done => break,
-            r => panic!("Unexpected step result: {r:?}"),
-        }
-    }
+    stmt.run_with_row_callback(|row| {
+        let a = row.get::<&Value>(0).unwrap();
+        let b = row.get::<&Value>(1).unwrap();
+        assert_eq!(*a, Value::Integer(1));
+        assert_eq!(*b, Value::build_text("first"));
+        found_row = true;
+        Ok(())
+    })?;
     assert!(found_row, "Expected to find a row");
 
     // Verify the transaction is still active by executing another statement
@@ -59,36 +52,22 @@ fn test_schema_update_reprepares_statement(tmp_db: TempDatabase) -> Result<()> {
 
     // Verify we can still query within the transaction
     let mut stmt2 = conn1.prepare("SELECT COUNT(*) FROM t")?;
-    loop {
-        match stmt2.step()? {
-            StepResult::Row => {
-                let row = stmt2.row().unwrap();
-                let count = row.get::<&Value>(0).unwrap();
-                assert_eq!(*count, Value::Integer(3));
-            }
-            StepResult::IO => stmt2.run_once()?,
-            StepResult::Done => break,
-            r => panic!("Unexpected step result: {r:?}"),
-        }
-    }
+    stmt2.run_with_row_callback(|row| {
+        let count = row.get::<&Value>(0).unwrap();
+        assert_eq!(*count, Value::Integer(3));
+        Ok(())
+    })?;
 
     // Commit the transaction
     conn1.execute("COMMIT")?;
 
     // Verify all changes are committed
     let mut stmt3 = conn1.prepare("SELECT COUNT(*) FROM t")?;
-    loop {
-        match stmt3.step()? {
-            StepResult::Row => {
-                let row = stmt3.row().unwrap();
-                let count = row.get::<&Value>(0).unwrap();
-                assert_eq!(*count, Value::Integer(3));
-            }
-            StepResult::IO => stmt3.run_once()?,
-            StepResult::Done => break,
-            r => panic!("Unexpected step result: {r:?}"),
-        }
-    }
+    stmt3.run_with_row_callback(|row| {
+        let count = row.get::<&Value>(0).unwrap();
+        assert_eq!(*count, Value::Integer(3));
+        Ok(())
+    })?;
 
     Ok(())
 }

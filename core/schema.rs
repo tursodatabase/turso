@@ -163,6 +163,14 @@ pub fn is_system_table(table_name: &str) -> bool {
         || table_name.starts_with(DBSP_TABLE_PREFIX)
 }
 
+/// Type of schema object for conflict checking
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchemaObjectType {
+    Table,
+    View,
+    Index,
+}
+
 #[derive(Debug)]
 pub struct Schema {
     pub tables: HashMap<String, Arc<Table>>,
@@ -1273,29 +1281,39 @@ impl Schema {
     }
 
     fn check_object_name_conflict(&self, name: &str) -> Result<()> {
+        if let Some(object_type) = self.get_object_type(name) {
+            let type_str = match object_type {
+                SchemaObjectType::Table => "table",
+                SchemaObjectType::View => "view",
+                SchemaObjectType::Index => "index",
+            };
+            return Err(crate::LimboError::ParseError(format!(
+                "{type_str} \"{name}\" already exists"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Returns the type of schema object with the given name, if one exists.
+    /// Checks tables, views, and indexes.
+    pub fn get_object_type(&self, name: &str) -> Option<SchemaObjectType> {
         let normalized_name = normalize_ident(name);
 
         if self.tables.contains_key(&normalized_name) {
-            return Err(crate::LimboError::ParseError(
-                ["table \"", name, "\" already exists"].concat().to_string(),
-            ));
+            return Some(SchemaObjectType::Table);
         }
 
         if self.views.contains_key(&normalized_name) {
-            return Err(crate::LimboError::ParseError(
-                ["view \"", name, "\" already exists"].concat().to_string(),
-            ));
+            return Some(SchemaObjectType::View);
         }
 
         for index_list in self.indexes.values() {
             if index_list.iter().any(|i| i.name.eq_ignore_ascii_case(name)) {
-                return Err(crate::LimboError::ParseError(
-                    ["index \"", name, "\" already exists"].concat().to_string(),
-                ));
+                return Some(SchemaObjectType::Index);
             }
         }
 
-        Ok(())
+        None
     }
 }
 

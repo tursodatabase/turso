@@ -33,8 +33,7 @@ use std::{
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use turso_core::{
-    Connection, Database, DatabaseOpts, LimboError, OpenFlags, QueryMode, Statement, StepResult,
-    Value,
+    Connection, Database, DatabaseOpts, LimboError, OpenFlags, QueryMode, Statement, Value,
 };
 
 #[derive(Parser, Debug)]
@@ -107,79 +106,74 @@ struct QueryStatistics {
     execute_time_elapsed_samples: Vec<Duration>,
 }
 
-macro_rules! row_step_result_query {
-    ($app:expr, $sql:expr, $rows:expr, $stats:expr, $row_handle:expr) => {
-        if $app.interrupt_count.load(Ordering::Acquire) > 0 {
-            println!("Query interrupted.");
-            return Ok(());
+/// A lending iterator over query result rows with optional statistics tracking.
+struct RowStepper<'a> {
+    rows: &'a mut Statement,
+    stats: Option<std::cell::RefCell<&'a mut QueryStatistics>>,
+}
+
+impl<'a> RowStepper<'a> {
+    fn new(rows: &'a mut Statement, stats: Option<&'a mut QueryStatistics>) -> Self {
+        Self {
+            rows,
+            stats: stats.map(std::cell::RefCell::new),
         }
+    }
 
-        let start = if $stats.is_some() {
-            Some(Instant::now())
-        } else {
-            None
-        };
-        match $rows.step() {
-            Ok(StepResult::Row) => {
-                if let Some(ref mut stats) = $stats {
-                    stats
-                        .execute_time_elapsed_samples
-                        .push(start.unwrap().elapsed());
-                }
+    /// Advances to the next row, returning it if available.
+    /// Returns Ok(Some(row)) for each row, Ok(None) when done, or Err on failure.
+    fn next_row(&mut self) -> Result<Option<&turso_core::Row>, LimboError> {
+        let execution_time = std::cell::Cell::new(Instant::now());
+        let io_time = std::cell::Cell::new(Instant::now());
 
-                $row_handle
-            }
-            Ok(StepResult::IO) => {
-                if let Some(ref mut stats) = $stats {
-                    stats.io_time_elapsed_samples.push(start.unwrap().elapsed());
-                }
-                let start = if $stats.is_some() {
-                    Some(Instant::now())
-                } else {
-                    None
-                };
-                $rows.run_once()?;
-                if let Some(ref mut stats) = $stats {
-                    stats.io_time_elapsed_samples.push(start.unwrap().elapsed());
-                }
-            }
-            Ok(StepResult::Interrupt) => {
-                if let Some(ref mut stats) = $stats {
+        let result = self.rows.run_one_step_blocking(
+            || {
+                // Push execution sample to not count IO time in execution
+                if let Some(stats) = self.stats.as_ref() {
                     stats
+                        .borrow_mut()
                         .execute_time_elapsed_samples
-                        .push(start.unwrap().elapsed());
+                        .push(execution_time.get().elapsed());
                 }
-                break;
-            }
-            Ok(StepResult::Done) => {
-                if let Some(ref mut stats) = $stats {
+                // Start io timer
+                io_time.set(Instant::now());
+                Ok(())
+            },
+            || {
+                // Push sample when we end IO
+                if let Some(stats) = self.stats.as_ref() {
                     stats
-                        .execute_time_elapsed_samples
-                        .push(start.unwrap().elapsed());
+                        .borrow_mut()
+                        .io_time_elapsed_samples
+                        .push(io_time.get().elapsed());
                 }
-                break;
-            }
-            Ok(StepResult::Busy) => {
-                if let Some(ref mut stats) = $stats {
+                // Restart Execution timer
+                execution_time.set(Instant::now());
+                Ok(())
+            },
+        );
+
+        match result {
+            Ok(row_opt) => {
+                if let Some(stats) = self.stats.as_ref() {
                     stats
+                        .borrow_mut()
                         .execute_time_elapsed_samples
-                        .push(start.unwrap().elapsed());
+                        .push(execution_time.get().elapsed());
                 }
-                let _ = $app.writeln("database is busy");
-                break;
+                Ok(row_opt)
             }
-            Err(err) => {
-                if let Some(ref mut stats) = $stats {
+            Err(e) => {
+                if let Some(stats) = self.stats.as_ref() {
                     stats
+                        .borrow_mut()
                         .execute_time_elapsed_samples
-                        .push(start.unwrap().elapsed());
+                        .push(execution_time.get().elapsed());
                 }
-                let report = miette::Error::from(err).with_source_code($sql.to_owned());
-                let _ = $app.writeln_fmt(format_args!("{report:?}"));
-                break;
+                Err(e)
             }
         }
-    };
+    }
 }
 
 impl Limbo {
@@ -478,12 +472,6 @@ impl Limbo {
         self.writer.as_mut().unwrap().write_all(b"\n")
     }
 
-    fn write_null(&mut self) -> io::Result<()> {
-        self.writer
-            .as_mut()
-            .unwrap()
-            .write_all(self.opts.null_value.as_bytes())
-    }
     fn run_query(&mut self, input: &str) {
         let echo = self.opts.echo;
         if echo {
@@ -790,280 +778,389 @@ impl Limbo {
         &mut self,
         sql: &str,
         mut output: Result<Option<Statement>, LimboError>,
-        mut statistics: Option<&mut QueryStatistics>,
+        statistics: Option<&mut QueryStatistics>,
     ) -> anyhow::Result<()> {
         match output {
-            Ok(Some(ref mut rows)) => match (self.opts.output_mode, rows.get_query_mode()) {
-                (_, QueryMode::ExplainQueryPlan) => {
-                    struct Entry {
-                        id: usize,
-                        detail: String,
-                        child_prefix: String,
-                        children: Vec<Entry>,
+            Ok(Some(ref mut rows)) => {
+                let query_mode = rows.get_query_mode();
+                let output_mode = self.opts.output_mode;
+
+                match (output_mode, query_mode) {
+                    (_, QueryMode::ExplainQueryPlan) => {
+                        self.print_explain_query_plan(rows, statistics)?;
                     }
-
-                    let mut root = Entry {
-                        id: 0,
-                        detail: "QUERY PLAN".to_owned(),
-                        child_prefix: "".to_owned(),
-                        children: vec![],
-                    };
-
-                    fn add_children(
-                        id: usize,
-                        parent_id: usize,
-                        detail: String,
-                        current: &mut Entry,
-                    ) -> bool {
-                        if current.id == parent_id {
-                            current.children.push(Entry {
-                                id,
-                                detail,
-                                child_prefix: current.child_prefix.clone() + "   ",
-                                children: vec![],
-                            });
-                            if current.children.len() > 1 {
-                                let idx = current.children.len() - 2;
-                                current.children[idx].child_prefix =
-                                    current.child_prefix.clone() + "|  ";
-                            }
-
-                            return false;
-                        }
-
-                        for child in &mut current.children {
-                            if !add_children(id, parent_id, detail.clone(), child) {
-                                return false;
-                            }
-                        }
-
-                        true
+                    (_, QueryMode::Explain) => {
+                        self.print_explain(rows, statistics)?;
                     }
-
-                    fn print_entry(app: &mut Limbo, entry: &Entry, prefix: &str) {
-                        writeln!(app, "{}{}", prefix, entry.detail).unwrap();
-                        for (i, child) in entry.children.iter().enumerate() {
-                            let is_last = i == entry.children.len() - 1;
-                            let child_prefix = format!(
-                                "{}{}",
-                                entry.child_prefix,
-                                if is_last { "`--" } else { "|--" }
-                            );
-                            print_entry(app, child, child_prefix.as_str());
-                        }
+                    (OutputMode::List, _) => {
+                        self.print_list_mode(rows, statistics)?;
                     }
-
-                    loop {
-                        row_step_result_query!(self, sql, rows, statistics, {
-                            let row = rows.row().unwrap();
-                            let id: usize = row.get_value(0).as_uint() as usize;
-                            let parent_id: usize = row.get_value(1).as_uint() as usize;
-                            let detail = row.get_value(3).to_string();
-                            add_children(id, parent_id, detail, &mut root);
-                        });
+                    (OutputMode::Pretty, _) => {
+                        self.print_pretty_mode(rows, statistics)?;
                     }
-
-                    print_entry(self, &root, "");
-                }
-                (_, QueryMode::Explain) => {
-                    fn get_explain_indent(
-                        indent_count: usize,
-                        curr_insn: &str,
-                        prev_insn: &str,
-                        p1: &str,
-                        unclosed_begin_subrtns: &mut Vec<String>,
-                    ) -> usize {
-                        let indent_count = match prev_insn {
-                            "Rewind" | "Last" | "SorterSort" | "SeekGE" | "SeekGT" | "SeekLE"
-                            | "SeekLT" | "BeginSubrtn" | "IndexMethodQuery" => indent_count + 1,
-                            _ => indent_count,
-                        };
-
-                        // The corresponding closing instruction for BeginSubrtn is Return,
-                        // but Return is also used for other purposes, so we need to track pairs of
-                        // BeginSubrtn and Return that share the same 1st parameter (the subroutine register).
-                        if curr_insn == "BeginSubrtn" {
-                            unclosed_begin_subrtns.push(p1.to_string());
-                        }
-
-                        match curr_insn {
-                            "Next" | "SorterNext" | "Prev" => indent_count.saturating_sub(1),
-                            "Return" => {
-                                let matching_begin_subrtn =
-                                    unclosed_begin_subrtns.iter().position(|b| b == p1);
-                                if let Some(matching_begin_subrtn) = matching_begin_subrtn {
-                                    unclosed_begin_subrtns.remove(matching_begin_subrtn);
-                                    indent_count.saturating_sub(1)
-                                } else {
-                                    indent_count
-                                }
-                            }
-                            _ => indent_count,
-                        }
-                    }
-
-                    let _ = self.writeln(
-                        "addr  opcode             p1    p2    p3    p4             p5  comment",
-                    );
-                    let _ = self.writeln(
-                        "----  -----------------  ----  ----  ----  -------------  --  -------",
-                    );
-
-                    let mut prev_insn: String = "".to_string();
-                    let mut indent_count = 0;
-                    let indent = "  ";
-                    let mut unclosed_begin_subrtns = vec![];
-                    loop {
-                        row_step_result_query!(self, sql, rows, statistics, {
-                            let row = rows.row().unwrap();
-                            let insn = row.get_value(1).to_string();
-                            let p1 = row.get_value(2).to_string();
-                            indent_count = get_explain_indent(
-                                indent_count,
-                                &insn,
-                                &prev_insn,
-                                &p1,
-                                &mut unclosed_begin_subrtns,
-                            );
-                            let _ = self.writeln(format!(
-                                "{:<4}  {:<17}  {:<4}  {:<4}  {:<4}  {:<13}  {:<2}  {}",
-                                row.get_value(0).to_string(),
-                                &(indent.repeat(indent_count) + &insn),
-                                p1,
-                                row.get_value(3).to_string(),
-                                row.get_value(4).to_string(),
-                                row.get_value(5).to_string(),
-                                row.get_value(6).to_string(),
-                                row.get_value(7),
-                            ));
-                            prev_insn = insn;
-                        });
+                    (OutputMode::Line, _) => {
+                        self.print_line_mode(rows, statistics)?;
                     }
                 }
-                (OutputMode::List, _) => {
-                    let mut headers_printed = false;
-                    loop {
-                        row_step_result_query!(self, sql, rows, statistics, {
-                            // Print headers if enabled and not already printed
-                            if self.opts.headers && !headers_printed {
-                                for i in 0..rows.num_columns() {
-                                    if i > 0 {
-                                        let _ = self.write(b"|");
-                                    }
-                                    let _ = self.write(rows.get_column_name(i).as_bytes());
-                                }
-                                let _ = self.writeln("");
-                                headers_printed = true;
-                            }
-
-                            let row = rows.row().unwrap();
-                            for (i, value) in row.get_values().enumerate() {
-                                if i > 0 {
-                                    let _ = self.write(b"|");
-                                }
-                                if matches!(value, Value::Null) {
-                                    self.write_null()?;
-                                } else {
-                                    write!(self, "{value}")?;
-                                }
-                            }
-                            let _ = self.writeln("");
-                        });
-                    }
-                }
-                (OutputMode::Pretty, _) => {
-                    let config = self.config.as_ref().unwrap();
-                    let mut table = Table::new();
-                    table
-                        .set_content_arrangement(ContentArrangement::Dynamic)
-                        .set_truncation_indicator("…")
-                        .apply_modifier("││──├─┼┤│─┼├┤┬┴┌┐└┘");
-                    if rows.num_columns() > 0 {
-                        let header = (0..rows.num_columns())
-                            .map(|i| {
-                                let name = rows.get_column_name(i);
-                                Cell::new(name)
-                                    .add_attribute(Attribute::Bold)
-                                    .fg(config.table.header_color.as_comfy_table_color())
-                            })
-                            .collect::<Vec<_>>();
-                        table.set_header(header);
-                    }
-                    loop {
-                        row_step_result_query!(self, sql, rows, statistics, {
-                            let record = rows.row().unwrap();
-                            let mut row = Row::new();
-                            row.max_height(1);
-                            for (idx, value) in record.get_values().enumerate() {
-                                let (content, alignment) = match value {
-                                    Value::Null => {
-                                        (self.opts.null_value.clone(), CellAlignment::Left)
-                                    }
-                                    Value::Integer(_) => (format!("{value}"), CellAlignment::Right),
-                                    Value::Float(_) => (format!("{value}"), CellAlignment::Right),
-                                    Value::Text(_) => (format!("{value}"), CellAlignment::Left),
-                                    Value::Blob(_) => (format!("{value}"), CellAlignment::Left),
-                                };
-                                row.add_cell(
-                                    Cell::new(content)
-                                        .set_alignment(alignment)
-                                        .fg(config.table.column_colors
-                                            [idx % config.table.column_colors.len()]
-                                        .as_comfy_table_color()),
-                                );
-                            }
-                            table.add_row(row);
-                        });
-                    }
-
-                    if !table.is_empty() {
-                        writeln!(self, "{table}")?;
-                    }
-                }
-                (OutputMode::Line, _) => {
-                    let mut first_row_printed = false;
-
-                    let max_width = (0..rows.num_columns())
-                        .map(|i| rows.get_column_name(i).len())
-                        .max()
-                        .unwrap_or(0);
-
-                    let formatted_columns: Vec<String> = (0..rows.num_columns())
-                        .map(|i| format!("{:>width$}", rows.get_column_name(i), width = max_width))
-                        .collect();
-
-                    loop {
-                        row_step_result_query!(self, sql, rows, statistics, {
-                            let record = rows.row().unwrap();
-
-                            if !first_row_printed {
-                                first_row_printed = true;
-                            } else {
-                                self.writeln("")?;
-                            }
-
-                            for (i, value) in record.get_values().enumerate() {
-                                self.write(&formatted_columns[i])?;
-                                self.write(b" = ")?;
-                                if matches!(value, Value::Null) {
-                                    self.write_null()?;
-                                } else {
-                                    write!(self, "{value}")?;
-                                }
-                                self.writeln("")?;
-                            }
-                        });
-                    }
-                }
-            },
+            }
             Ok(None) => {}
+
             Err(err) => {
-                let report = miette::Error::from(err).with_source_code(sql.to_owned());
-                let _ = self.writeln_fmt(format_args!("{report:?}"));
+                match err {
+                    LimboError::Busy => {}
+                    LimboError::Interrupt => {}
+                    _ => {
+                        let report = miette::Error::from(err).with_source_code(sql.to_owned());
+                        let _ = self.writeln_fmt(format_args!("{report:?}"));
+                    }
+                }
                 anyhow::bail!("We have to throw here, even if we printed error");
             }
         }
         Ok(())
+    }
+
+    fn print_explain_query_plan(
+        &mut self,
+        rows: &mut Statement,
+        statistics: Option<&mut QueryStatistics>,
+    ) -> turso_core::Result<()> {
+        struct Entry {
+            id: usize,
+            detail: String,
+            child_prefix: String,
+            children: Vec<Entry>,
+        }
+
+        fn add_children(id: usize, parent_id: usize, detail: String, current: &mut Entry) -> bool {
+            if current.id == parent_id {
+                current.children.push(Entry {
+                    id,
+                    detail,
+                    child_prefix: current.child_prefix.clone() + "   ",
+                    children: vec![],
+                });
+                if current.children.len() > 1 {
+                    let idx = current.children.len() - 2;
+                    current.children[idx].child_prefix = current.child_prefix.clone() + "|  ";
+                }
+                return false;
+            }
+            for child in &mut current.children {
+                if !add_children(id, parent_id, detail.clone(), child) {
+                    return false;
+                }
+            }
+            true
+        }
+
+        fn print_entry(app: &mut Limbo, entry: &Entry, prefix: &str) {
+            writeln!(app, "{}{}", prefix, entry.detail).unwrap();
+            for (i, child) in entry.children.iter().enumerate() {
+                let is_last = i == entry.children.len() - 1;
+                let child_prefix = format!(
+                    "{}{}",
+                    entry.child_prefix,
+                    if is_last { "`--" } else { "|--" }
+                );
+                print_entry(app, child, child_prefix.as_str());
+            }
+        }
+
+        let mut root = Entry {
+            id: 0,
+            detail: "QUERY PLAN".to_owned(),
+            child_prefix: "".to_owned(),
+            children: vec![],
+        };
+
+        let mut stepper = RowStepper::new(rows, statistics);
+        loop {
+            match stepper.next_row() {
+                Ok(Some(row)) => {
+                    let id = row.get_value(0).as_uint() as usize;
+                    let parent_id = row.get_value(1).as_uint() as usize;
+                    let detail = row.get_value(3).to_string();
+                    add_children(id, parent_id, detail, &mut root);
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    self.handle_step_error(e);
+                    break;
+                }
+            }
+        }
+
+        print_entry(self, &root, "");
+        Ok(())
+    }
+
+    fn print_explain(
+        &mut self,
+        rows: &mut Statement,
+        statistics: Option<&mut QueryStatistics>,
+    ) -> turso_core::Result<()> {
+        fn get_explain_indent(
+            indent_count: usize,
+            curr_insn: &str,
+            prev_insn: &str,
+            p1: &str,
+            unclosed_begin_subrtns: &mut Vec<String>,
+        ) -> usize {
+            let indent_count = match prev_insn {
+                "Rewind" | "Last" | "SorterSort" | "SeekGE" | "SeekGT" | "SeekLE" | "SeekLT"
+                | "BeginSubrtn" | "IndexMethodQuery" => indent_count + 1,
+                _ => indent_count,
+            };
+
+            if curr_insn == "BeginSubrtn" {
+                unclosed_begin_subrtns.push(p1.to_string());
+            }
+
+            match curr_insn {
+                "Next" | "SorterNext" | "Prev" => indent_count.saturating_sub(1),
+                "Return" => {
+                    let matching = unclosed_begin_subrtns.iter().position(|b| b == p1);
+                    if let Some(idx) = matching {
+                        unclosed_begin_subrtns.remove(idx);
+                        indent_count.saturating_sub(1)
+                    } else {
+                        indent_count
+                    }
+                }
+                _ => indent_count,
+            }
+        }
+
+        let _ =
+            self.writeln("addr  opcode             p1    p2    p3    p4             p5  comment");
+        let _ =
+            self.writeln("----  -----------------  ----  ----  ----  -------------  --  -------");
+
+        let mut prev_insn = String::new();
+        let mut indent_count = 0;
+        let indent = "  ";
+        let mut unclosed_begin_subrtns = vec![];
+
+        let mut stepper = RowStepper::new(rows, statistics);
+        loop {
+            match stepper.next_row() {
+                Ok(Some(row)) => {
+                    let insn = row.get_value(1).to_string();
+                    let p1 = row.get_value(2).to_string();
+                    indent_count = get_explain_indent(
+                        indent_count,
+                        &insn,
+                        &prev_insn,
+                        &p1,
+                        &mut unclosed_begin_subrtns,
+                    );
+                    let _ = self.writeln(format!(
+                        "{:<4}  {:<17}  {:<4}  {:<4}  {:<4}  {:<13}  {:<2}  {}",
+                        row.get_value(0).to_string(),
+                        &(indent.repeat(indent_count) + &insn),
+                        p1,
+                        row.get_value(3).to_string(),
+                        row.get_value(4).to_string(),
+                        row.get_value(5).to_string(),
+                        row.get_value(6).to_string(),
+                        row.get_value(7),
+                    ));
+                    prev_insn = insn;
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    self.handle_step_error(e);
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn print_list_mode(
+        &mut self,
+        rows: &mut Statement,
+        statistics: Option<&mut QueryStatistics>,
+    ) -> turso_core::Result<()> {
+        let num_columns = rows.num_columns();
+        let column_names: Vec<String> = (0..num_columns)
+            .map(|i| rows.get_column_name(i).to_string())
+            .collect();
+        let print_headers = self.opts.headers;
+        let null_value = self.opts.null_value.clone();
+
+        let mut headers_printed = false;
+        let mut stepper = RowStepper::new(rows, statistics);
+        loop {
+            match stepper.next_row() {
+                Ok(Some(row)) => {
+                    if print_headers && !headers_printed {
+                        for (i, name) in column_names.iter().enumerate() {
+                            if i > 0 {
+                                let _ = self.write(b"|");
+                            }
+                            let _ = self.write(name.as_bytes());
+                        }
+                        let _ = self.writeln("");
+                        headers_printed = true;
+                    }
+
+                    for (i, value) in row.get_values().enumerate() {
+                        if i > 0 {
+                            let _ = self.write(b"|");
+                        }
+                        if matches!(value, Value::Null) {
+                            let _ = self.write(null_value.as_bytes());
+                        } else {
+                            write!(self, "{value}")?;
+                        }
+                    }
+                    let _ = self.writeln("");
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    self.handle_step_error(e);
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn print_pretty_mode(
+        &mut self,
+        rows: &mut Statement,
+        statistics: Option<&mut QueryStatistics>,
+    ) -> turso_core::Result<()> {
+        let config = self.config.as_ref().unwrap();
+        let null_value = self.opts.null_value.clone();
+        let num_columns = rows.num_columns();
+        let column_names: Vec<String> = (0..num_columns)
+            .map(|i| rows.get_column_name(i).to_string())
+            .collect();
+        let header_color = config.table.header_color.as_comfy_table_color();
+        let column_colors: Vec<_> = config
+            .table
+            .column_colors
+            .iter()
+            .map(|c| c.as_comfy_table_color())
+            .collect();
+
+        let mut table = Table::new();
+        table
+            .set_content_arrangement(ContentArrangement::Dynamic)
+            .set_truncation_indicator("…")
+            .apply_modifier("││──├─┼┤│─┼├┤┬┴┌┐└┘");
+
+        if num_columns > 0 {
+            let header = column_names
+                .iter()
+                .map(|name| {
+                    Cell::new(name)
+                        .add_attribute(Attribute::Bold)
+                        .fg(header_color)
+                })
+                .collect::<Vec<_>>();
+            table.set_header(header);
+        }
+
+        let mut stepper = RowStepper::new(rows, statistics);
+        loop {
+            match stepper.next_row() {
+                Ok(Some(row)) => {
+                    let mut table_row = Row::new();
+                    table_row.max_height(1);
+                    for (idx, value) in row.get_values().enumerate() {
+                        let (content, alignment) = match value {
+                            Value::Null => (null_value.clone(), CellAlignment::Left),
+                            Value::Integer(_) => (format!("{value}"), CellAlignment::Right),
+                            Value::Float(_) => (format!("{value}"), CellAlignment::Right),
+                            Value::Text(_) => (format!("{value}"), CellAlignment::Left),
+                            Value::Blob(_) => (format!("{value}"), CellAlignment::Left),
+                        };
+                        table_row.add_cell(
+                            Cell::new(content)
+                                .set_alignment(alignment)
+                                .fg(column_colors[idx % column_colors.len()]),
+                        );
+                    }
+                    table.add_row(table_row);
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    self.handle_step_error(e);
+                    break;
+                }
+            }
+        }
+
+        if !table.is_empty() {
+            writeln!(self, "{table}")?;
+        }
+        Ok(())
+    }
+
+    fn print_line_mode(
+        &mut self,
+        rows: &mut Statement,
+        statistics: Option<&mut QueryStatistics>,
+    ) -> turso_core::Result<()> {
+        let num_columns = rows.num_columns();
+        let column_names: Vec<String> = (0..num_columns)
+            .map(|i| rows.get_column_name(i).to_string())
+            .collect();
+        let max_width = column_names.iter().map(|n| n.len()).max().unwrap_or(0);
+        let formatted_columns: Vec<String> = column_names
+            .iter()
+            .map(|n| format!("{n:>max_width$}"))
+            .collect();
+        let null_value = self.opts.null_value.clone();
+
+        let mut first_row_printed = false;
+        let mut stepper = RowStepper::new(rows, statistics);
+        loop {
+            match stepper.next_row() {
+                Ok(Some(row)) => {
+                    if first_row_printed {
+                        self.writeln("")?;
+                    } else {
+                        first_row_printed = true;
+                    }
+
+                    for (i, value) in row.get_values().enumerate() {
+                        self.write(&formatted_columns[i])?;
+                        self.write(b" = ")?;
+                        if matches!(value, Value::Null) {
+                            self.write(null_value.as_bytes())?;
+                        } else {
+                            write!(self, "{value}")?;
+                        }
+                        self.writeln("")?;
+                    }
+                }
+                Ok(None) => break,
+                Err(e) => {
+                    self.handle_step_error(e);
+                    break;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_step_error(&mut self, err: LimboError) {
+        match err {
+            LimboError::Interrupt => {
+                let _ = self.writeln(LimboError::Interrupt.to_string());
+            }
+            LimboError::Busy => {
+                let _ = self.writeln("database is busy");
+            }
+            _ => {
+                let _ = self.writeln_fmt(format_args!("Error: {err}"));
+            }
+        }
     }
 
     pub fn init_tracing(opts: &Opts) -> Result<WorkerGuard, std::io::Error> {
@@ -1159,7 +1256,7 @@ impl Limbo {
         let pragma_sql = format!("PRAGMA table_info({view_name})");
 
         let mut columns = Vec::new();
-        let handler = |row: &turso_core::Row| -> anyhow::Result<()> {
+        let handler = |row: &turso_core::Row| {
             // Column name is in the second column (index 1) of PRAGMA table_info
             if let Ok(Value::Text(col_name)) = row.get::<&Value>(1) {
                 columns.push(col_name.as_str().to_string());
@@ -1202,23 +1299,22 @@ impl Limbo {
 
         let mut found = false;
         match self.conn.query(&sql) {
-            Ok(Some(ref mut rows)) => loop {
-                match rows.step()? {
-                    StepResult::Row => {
-                        let row = rows.row().unwrap();
-                        found |= self.print_schema_entry(db_display_name, row);
+            Ok(Some(ref mut rows)) => {
+                let res = rows.run_with_row_callback(|row| {
+                    found |= self.print_schema_entry(db_display_name, row);
+                    Ok(())
+                });
+                match res {
+                    Ok(_) => {}
+                    Err(LimboError::Interrupt) => {
+                        let _ = self.writeln(LimboError::Interrupt.to_string());
                     }
-                    StepResult::IO => {
-                        rows.run_once()?;
-                    }
-                    StepResult::Interrupt => break,
-                    StepResult::Done => break,
-                    StepResult::Busy => {
+                    Err(LimboError::Busy) => {
                         let _ = self.writeln("database is busy");
-                        break;
                     }
+                    Err(err) => return Err(anyhow::anyhow!(err)),
                 }
-            },
+            }
             Ok(None) => {}
             Err(_) => {} // Table not found in this database
         }
@@ -1233,23 +1329,22 @@ impl Limbo {
         let sql = format!("SELECT sql, type, name FROM {db_prefix}.sqlite_schema WHERE type IN ('table', 'index', 'view') AND name NOT LIKE 'sqlite_%' AND name NOT LIKE '__turso_internal_%' ORDER BY CASE type WHEN 'table' THEN 1 WHEN 'view' THEN 2 WHEN 'index' THEN 3 END, rowid");
 
         match self.conn.query(&sql) {
-            Ok(Some(ref mut rows)) => loop {
-                match rows.step()? {
-                    StepResult::Row => {
-                        let row = rows.row().unwrap();
-                        self.print_schema_entry(db_display_name, row);
-                    }
-                    StepResult::IO => {
-                        rows.run_once()?;
-                    }
-                    StepResult::Interrupt => break,
-                    StepResult::Done => break,
-                    StepResult::Busy => {
+            Ok(Some(ref mut rows)) => {
+                let res = rows.run_with_row_callback(|row| {
+                    self.print_schema_entry(db_display_name, row);
+                    Ok(())
+                });
+                match res {
+                    Ok(_) => {}
+                    Err(LimboError::Busy) => {
                         let _ = self.writeln("database is busy");
-                        break;
                     }
+                    Err(LimboError::Interrupt) => {
+                        let _ = self.writeln(LimboError::Interrupt.to_string());
+                    }
+                    Err(err) => return Err(anyhow!(err)),
                 }
-            },
+            }
             Ok(None) => {}
             Err(err) => {
                 // If we can't access this database's schema, just skip it
@@ -1315,7 +1410,7 @@ impl Limbo {
                 ),
                 None => format!("SELECT name FROM {name}.sqlite_schema WHERE type='index' ORDER BY 1"),
             };
-            let handler = |row: &turso_core::Row| -> anyhow::Result<()> {
+            let handler = |row: &turso_core::Row| {
                 if let Ok(Value::Text(idx)) = row.get::<&Value>(0) {
                     if let Some(prefix) = prefix {
                         indexes.push_str(prefix);
@@ -1353,7 +1448,7 @@ impl Limbo {
                     "SELECT name FROM {name}.sqlite_schema WHERE type='table' AND name NOT LIKE 'sqlite_%' ORDER BY 1"
                 ),
             };
-            let handler = |row: &turso_core::Row| -> anyhow::Result<()> {
+            let handler = |row: &turso_core::Row| {
                 if let Ok(Value::Text(table)) = row.get::<&Value>(0) {
                     if let Some(prefix) = prefix {
                         tables.push_str(prefix);
@@ -1387,7 +1482,7 @@ impl Limbo {
     fn database_names(&mut self) -> anyhow::Result<Vec<String>> {
         let sql = "PRAGMA database_list";
         let mut db_names: Vec<String> = Vec::new();
-        let handler = |row: &turso_core::Row| -> anyhow::Result<()> {
+        let handler = |row: &turso_core::Row| {
             if let Ok(Value::Text(name)) = row.get::<&Value>(1) {
                 db_names.push(name.to_string());
             }
@@ -1399,28 +1494,24 @@ impl Limbo {
         }
     }
 
-    fn handle_row<F>(&mut self, sql: &str, mut handler: F) -> anyhow::Result<()>
+    fn handle_row<F>(&mut self, sql: &str, handler: F) -> anyhow::Result<()>
     where
-        F: FnMut(&turso_core::Row) -> anyhow::Result<()>,
+        F: FnMut(&turso_core::Row) -> turso_core::Result<()>,
     {
         match self.conn.query(sql) {
-            Ok(Some(ref mut rows)) => loop {
-                match rows.step()? {
-                    StepResult::Row => {
-                        let row = rows.row().unwrap();
-                        handler(row)?;
-                    }
-                    StepResult::IO => {
-                        rows.run_once()?;
-                    }
-                    StepResult::Interrupt => break,
-                    StepResult::Done => break,
-                    StepResult::Busy => {
+            Ok(Some(ref mut rows)) => {
+                let res = rows.run_with_row_callback(handler);
+                match res {
+                    Ok(_) => {}
+                    Err(LimboError::Busy) => {
                         let _ = self.writeln("database is busy");
-                        break;
                     }
+                    Err(LimboError::Interrupt) => {
+                        let _ = self.writeln(LimboError::Interrupt.to_string());
+                    }
+                    Err(err) => return Err(anyhow!(err)),
                 }
-            },
+            }
             Ok(None) => {
                 let _ = self.writeln("No results returned from the query.");
             }
@@ -1433,68 +1524,41 @@ impl Limbo {
 
     fn display_databases(&mut self) -> anyhow::Result<()> {
         let sql = "PRAGMA database_list";
+        let conn = self.conn.clone();
+        let mut databases = Vec::new();
+        self.handle_row(sql, |row| {
+            if let (Ok(Value::Integer(seq)), Ok(Value::Text(name)), Ok(file_value)) = (
+                row.get::<&Value>(0),
+                row.get::<&Value>(1),
+                row.get::<&Value>(2),
+            ) {
+                let file = match file_value {
+                    Value::Text(path) => path.as_str(),
+                    Value::Null => "",
+                    _ => "",
+                };
 
-        match self.conn.query(sql) {
-            Ok(Some(ref mut rows)) => {
-                loop {
-                    match rows.step()? {
-                        StepResult::Row => {
-                            let row = rows.row().unwrap();
-                            if let (
-                                Ok(Value::Integer(seq)),
-                                Ok(Value::Text(name)),
-                                Ok(file_value),
-                            ) = (
-                                row.get::<&Value>(0),
-                                row.get::<&Value>(1),
-                                row.get::<&Value>(2),
-                            ) {
-                                let file = match file_value {
-                                    Value::Text(path) => path.as_str(),
-                                    Value::Null => "",
-                                    _ => "",
-                                };
+                // Format like SQLite: "main: /path/to/file r/w"
+                let file_display = if file.is_empty() {
+                    "\"\"".to_string()
+                } else {
+                    file.to_string()
+                };
 
-                                // Format like SQLite: "main: /path/to/file r/w"
-                                let file_display = if file.is_empty() {
-                                    "\"\"".to_string()
-                                } else {
-                                    file.to_string()
-                                };
+                // Detect readonly mode from connection
+                let mode = if conn.is_readonly(*seq as usize) {
+                    "r/o"
+                } else {
+                    "r/w"
+                };
 
-                                // Detect readonly mode from connection
-                                let mode = if self.conn.is_readonly(*seq as usize) {
-                                    "r/o"
-                                } else {
-                                    "r/w"
-                                };
-
-                                let _ = self.writeln(format!(
-                                    "{}: {} {}",
-                                    name.as_str(),
-                                    file_display,
-                                    mode
-                                ));
-                            }
-                        }
-                        StepResult::IO => {
-                            rows.run_once()?;
-                        }
-                        StepResult::Interrupt => break,
-                        StepResult::Done => break,
-                        StepResult::Busy => {
-                            let _ = self.writeln("database is busy");
-                            break;
-                        }
-                    }
-                }
+                databases.push(format!("{}: {} {}", name.as_str(), file_display, mode));
             }
-            Ok(None) => {
-                let _ = self.writeln("No results returned from the query.");
-            }
-            Err(err) => {
-                return Err(anyhow::anyhow!("Error querying database list: {}", err));
-            }
+            Ok(())
+        })?;
+
+        for db in databases {
+            let _ = self.writeln(db);
         }
 
         Ok(())
@@ -1546,25 +1610,18 @@ impl Limbo {
         ORDER BY tbl_name = 'sqlite_sequence', rowid
     "#;
         if let Some(mut rows) = conn.query(q_tables)? {
-            loop {
-                match rows.step()? {
-                    StepResult::Row => {
-                        let row = rows.row().unwrap();
-                        let name: &str = row.get::<&str>(0)?;
-                        // Skip sqlite_sequence table
-                        if name == "sqlite_sequence" {
-                            continue;
-                        }
-                        let ddl: &str = row.get::<&str>(1)?;
-                        writeln!(out, "{ddl};")?;
-                        Self::dump_table_from_conn(&conn, out, name, &mut progress)?;
-                        progress.on(name);
-                    }
-                    StepResult::IO => rows.run_once()?,
-                    StepResult::Done | StepResult::Interrupt => break,
-                    StepResult::Busy => anyhow::bail!("database is busy"),
+            rows.run_with_row_callback(|row| {
+                let name: &str = row.get::<&str>(0)?;
+                // Skip sqlite_sequence table
+                if name == "sqlite_sequence" {
+                    return Ok(());
                 }
-            }
+                let ddl: &str = row.get::<&str>(1)?;
+                writeln!(out, "{ddl};")?;
+                Self::dump_table_from_conn(&conn, out, name, &mut progress)?;
+                progress.on(name);
+                Ok(())
+            })?;
         }
         Self::dump_sqlite_sequence(&conn, out)?;
         Self::dump_schema_objects(&conn, out, &mut progress)?;
@@ -1573,16 +1630,9 @@ impl Limbo {
         Ok(())
     }
 
-    fn exec_all_conn(conn: &Arc<Connection>, sql: &str) -> anyhow::Result<()> {
+    fn exec_all_conn(conn: &Arc<Connection>, sql: &str) -> turso_core::Result<()> {
         if let Some(mut rows) = conn.query(sql)? {
-            loop {
-                match rows.step()? {
-                    StepResult::IO => rows.run_once()?,
-                    StepResult::Done | StepResult::Interrupt => break,
-                    StepResult::Busy => anyhow::bail!("database is busy"),
-                    StepResult::Row => {}
-                }
-            }
+            rows.run_with_row_callback(|_| Ok(()))?;
         }
         Ok(())
     }
@@ -1592,31 +1642,24 @@ impl Limbo {
         out: &mut W,
         table_name: &str,
         progress: &mut P,
-    ) -> anyhow::Result<()> {
+    ) -> turso_core::Result<()> {
         let pragma = format!("PRAGMA table_info({})", quote_ident(table_name));
         let (mut cols, mut types) = (Vec::new(), Vec::new());
 
         if let Some(mut rows) = conn.query(pragma)? {
-            loop {
-                match rows.step()? {
-                    StepResult::Row => {
-                        let row = rows.row().unwrap();
-                        let ty = row.get::<&str>(2)?.to_string();
-                        let name = row.get::<&str>(1)?.to_string();
-                        match ty.as_str() {
-                            "index" => progress.on(&name),
-                            "view" => progress.on(&name),
-                            "trigger" => progress.on(&name),
-                            _ => {}
-                        }
-                        cols.push(name);
-                        types.push(ty);
-                    }
-                    StepResult::IO => rows.run_once()?,
-                    StepResult::Done | StepResult::Interrupt => break,
-                    StepResult::Busy => anyhow::bail!("database is busy"),
+            rows.run_with_row_callback(|row| {
+                let ty = row.get::<&str>(2)?.to_string();
+                let name = row.get::<&str>(1)?.to_string();
+                match ty.as_str() {
+                    "index" => progress.on(&name),
+                    "view" => progress.on(&name),
+                    "trigger" => progress.on(&name),
+                    _ => {}
                 }
-            }
+                cols.push(name);
+                types.push(ty);
+                Ok(())
+            })?;
         }
         // FIXME: sqlite has logic to check rowid and optionally preserve it, but it requires
         // pragma index_list, and it seems to be relevant only for indexes.
@@ -1627,25 +1670,18 @@ impl Limbo {
             .join(", ");
         let select = format!("SELECT {cols_str} FROM {}", quote_ident(table_name));
         if let Some(mut rows) = conn.query(select)? {
-            loop {
-                match rows.step()? {
-                    StepResult::Row => {
-                        let row = rows.row().unwrap();
-                        write!(out, "INSERT INTO {} VALUES(", quote_ident(table_name))?;
-                        for i in 0..cols.len() {
-                            if i > 0 {
-                                out.write_all(b",")?;
-                            }
-                            let v = row.get::<&Value>(i)?;
-                            Self::write_sql_value_from_value(out, v)?;
-                        }
-                        out.write_all(b");\n")?;
+            rows.run_with_row_callback(|row| {
+                write!(out, "INSERT INTO {} VALUES(", quote_ident(table_name))?;
+                for i in 0..cols.len() {
+                    if i > 0 {
+                        out.write_all(b",")?;
                     }
-                    StepResult::IO => rows.run_once()?,
-                    StepResult::Done | StepResult::Interrupt => break,
-                    StepResult::Busy => anyhow::bail!("database is busy"),
+                    let v = row.get::<&Value>(i)?;
+                    Self::write_sql_value_from_value(out, v)?;
                 }
-            }
+                out.write_all(b");\n")?;
+                Ok(())
+            })?;
         }
         Ok(())
     }
@@ -1655,40 +1691,27 @@ impl Limbo {
         if let Some(mut rows) =
             conn.query("SELECT 1 FROM sqlite_schema WHERE name='sqlite_sequence' AND type='table'")?
         {
-            loop {
-                match rows.step()? {
-                    StepResult::Row => {
-                        has_seq = true;
-                    }
-                    StepResult::IO => rows.run_once()?,
-                    StepResult::Done | StepResult::Interrupt => break,
-                    StepResult::Busy => anyhow::bail!("database is busy"),
-                }
-            }
+            rows.run_with_row_callback(|_| {
+                has_seq = true;
+                Ok(())
+            })?;
         }
         if !has_seq {
             return Ok(());
         }
         writeln!(out, "DELETE FROM sqlite_sequence;")?;
         if let Some(mut rows) = conn.query("SELECT name, seq FROM sqlite_sequence")? {
-            loop {
-                match rows.step()? {
-                    StepResult::Row => {
-                        let r = rows.row().unwrap();
-                        let name = r.get::<&str>(0)?;
-                        let seq = r.get::<i64>(1)?;
-                        writeln!(
-                            out,
-                            "INSERT INTO sqlite_sequence(name,seq) VALUES({},{});",
-                            sql_quote_string(name),
-                            seq
-                        )?;
-                    }
-                    StepResult::IO => rows.run_once()?,
-                    StepResult::Done | StepResult::Interrupt => break,
-                    StepResult::Busy => anyhow::bail!("database is busy"),
-                }
-            }
+            rows.run_with_row_callback(|r| {
+                let name = r.get::<&str>(0)?;
+                let seq = r.get::<i64>(1)?;
+                writeln!(
+                    out,
+                    "INSERT INTO sqlite_sequence(name,seq) VALUES({},{});",
+                    sql_quote_string(name),
+                    seq
+                )?;
+                Ok(())
+            })?;
         }
         Ok(())
     }
@@ -1708,20 +1731,13 @@ impl Limbo {
             ORDER BY CASE type WHEN 'view' THEN 1 WHEN 'index' THEN 2 WHEN 'trigger' THEN 3 END, rowid
         "#;
         if let Some(mut rows) = conn.query(sql)? {
-            loop {
-                match rows.step()? {
-                    StepResult::Row => {
-                        let row = rows.row().unwrap();
-                        let ddl: &str = row.get::<&str>(1)?;
-                        let name: &str = row.get::<&str>(0)?;
-                        progress.on(name);
-                        writeln!(out, "{ddl};")?;
-                    }
-                    StepResult::IO => rows.run_once()?,
-                    StepResult::Done | StepResult::Interrupt => break,
-                    StepResult::Busy => anyhow::bail!("database is busy"),
-                }
-            }
+            rows.run_with_row_callback(|row| {
+                let ddl: &str = row.get::<&str>(1)?;
+                let name: &str = row.get::<&str>(0)?;
+                progress.on(name);
+                writeln!(out, "{ddl};")?;
+                Ok(())
+            })?;
         }
         Ok(())
     }

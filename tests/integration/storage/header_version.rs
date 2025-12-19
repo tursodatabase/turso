@@ -81,20 +81,7 @@ fn open_with_limbo_and_check(db_path: &Path, enable_mvcc: bool) -> (u8, u8) {
 
     // Do a simple query to ensure everything is initialized
     if let Some(mut stmt) = conn.query("SELECT 1").unwrap() {
-        loop {
-            let result = stmt.step().unwrap();
-            match result {
-                turso_core::StepResult::Row => {
-                    let _row = stmt.row().unwrap();
-                }
-                turso_core::StepResult::IO => {
-                    stmt.run_once().unwrap();
-                    continue;
-                }
-                turso_core::StepResult::Done => break,
-                r => panic!("unexpected result {r:?}: expecting single row"),
-            }
-        }
+        stmt.run_with_row_callback(|_| Ok(())).unwrap();
     }
 
     // Drop connection and database
@@ -383,21 +370,12 @@ fn test_pragma_journal_mode_wal_to_mvcc_with_pending_wal() {
     // Verify we can still query data (both original and new data)
     let mut stmt = conn.prepare("SELECT val FROM t ORDER BY val").unwrap();
     let mut rows = Vec::new();
-    loop {
-        match stmt.step().unwrap() {
-            turso_core::StepResult::Row => {
-                let row = stmt.row().unwrap();
-                let val: String = row.get::<String>(0).unwrap();
-                rows.push(val);
-            }
-            turso_core::StepResult::IO => {
-                stmt.run_once().unwrap();
-                continue;
-            }
-            turso_core::StepResult::Done => break,
-            r => panic!("unexpected result {r:?}"),
-        }
-    }
+    stmt.run_with_row_callback(|row| {
+        let val: String = row.get::<String>(0).unwrap();
+        rows.push(val);
+        Ok(())
+    })
+    .unwrap();
     assert!(
         rows.contains(&"test".to_string()),
         "Should have original test row"
@@ -607,21 +585,12 @@ fn test_pragma_journal_mode_multiple_switches() {
     // Verify all data is present
     let mut stmt = conn.prepare("SELECT val FROM t ORDER BY val").unwrap();
     let mut rows = Vec::new();
-    loop {
-        match stmt.step().unwrap() {
-            turso_core::StepResult::Row => {
-                let row = stmt.row().unwrap();
-                let val: String = row.get::<String>(0).unwrap();
-                rows.push(val);
-            }
-            turso_core::StepResult::IO => {
-                stmt.run_once().unwrap();
-                continue;
-            }
-            turso_core::StepResult::Done => break,
-            r => panic!("unexpected result {r:?}"),
-        }
-    }
+    stmt.run_with_row_callback(|row| {
+        let val: String = row.get::<String>(0).unwrap();
+        rows.push(val);
+        Ok(())
+    })
+    .unwrap();
 
     assert!(
         rows.contains(&"test".to_string()),
@@ -680,21 +649,12 @@ fn test_pragma_journal_mode_query() {
 
     // Query current journal mode (should be WAL)
     if let Some(mut stmt) = conn.query("PRAGMA journal_mode").unwrap() {
-        loop {
-            match stmt.step().unwrap() {
-                turso_core::StepResult::Row => {
-                    let row = stmt.row().unwrap();
-                    let mode: String = row.get::<String>(0).unwrap();
-                    assert_eq!(mode, "wal", "Initial mode should be WAL, got {mode}");
-                }
-                turso_core::StepResult::IO => {
-                    stmt.run_once().unwrap();
-                    continue;
-                }
-                turso_core::StepResult::Done => break,
-                r => panic!("unexpected result {r:?}"),
-            }
-        }
+        stmt.run_with_row_callback(|row| {
+            let mode: String = row.get::<String>(0).unwrap();
+            assert_eq!(mode, "wal", "Initial mode should be WAL, got {mode}");
+            Ok(())
+        })
+        .unwrap();
     }
 
     drop(conn);
@@ -720,24 +680,15 @@ fn test_pragma_journal_mode_query() {
 
     // Query current journal mode (should be experimental_mvcc after switching)
     if let Some(mut stmt) = conn.query("PRAGMA journal_mode").unwrap() {
-        loop {
-            match stmt.step().unwrap() {
-                turso_core::StepResult::Row => {
-                    let row = stmt.row().unwrap();
-                    let mode: String = row.get::<String>(0).unwrap();
-                    assert_eq!(
-                        mode, "experimental_mvcc",
-                        "Mode should be experimental_mvcc after PRAGMA switch, got {mode}"
-                    );
-                }
-                turso_core::StepResult::IO => {
-                    stmt.run_once().unwrap();
-                    continue;
-                }
-                turso_core::StepResult::Done => break,
-                r => panic!("unexpected result {r:?}"),
-            }
-        }
+        stmt.run_with_row_callback(|row| {
+            let mode: String = row.get::<String>(0).unwrap();
+            assert_eq!(
+                mode, "experimental_mvcc",
+                "Mode should be experimental_mvcc after PRAGMA switch, got {mode}"
+            );
+            Ok(())
+        })
+        .unwrap();
     }
 
     drop(conn);
@@ -802,19 +753,11 @@ fn test_pragma_journal_mode_data_persistence_after_switch() {
             .prepare("SELECT val FROM t WHERE val = 'persisted_data'")
             .unwrap();
         let mut found = false;
-        loop {
-            match stmt.step().unwrap() {
-                turso_core::StepResult::Row => {
-                    found = true;
-                }
-                turso_core::StepResult::IO => {
-                    stmt.run_once().unwrap();
-                    continue;
-                }
-                turso_core::StepResult::Done => break,
-                r => panic!("unexpected result {r:?}"),
-            }
-        }
+        stmt.run_with_row_callback(|_| {
+            found = true;
+            Ok(())
+        })
+        .unwrap();
         assert!(found, "Data inserted after mode switch should persist");
 
         drop(conn);
@@ -846,20 +789,7 @@ fn open_with_limbo_readonly_and_check(db_path: &Path, enable_mvcc: bool) -> (u8,
 
     // Do a simple query to ensure everything is initialized
     if let Some(mut stmt) = conn.query("SELECT 1").unwrap() {
-        loop {
-            let result = stmt.step().unwrap();
-            match result {
-                turso_core::StepResult::Row => {
-                    let _row = stmt.row().unwrap();
-                }
-                turso_core::StepResult::IO => {
-                    stmt.run_once().unwrap();
-                    continue;
-                }
-                turso_core::StepResult::Done => break,
-                r => panic!("unexpected result {r:?}: expecting single row"),
-            }
-        }
+        stmt.run_with_row_callback(|_| Ok(())).unwrap();
     }
 
     // Drop connection and database
@@ -1066,19 +996,11 @@ fn test_readonly_mvcc_db_can_be_read() {
         .prepare("SELECT val FROM t WHERE val = 'mvcc_readonly_test'")
         .unwrap();
     let mut found = false;
-    loop {
-        match stmt.step().unwrap() {
-            turso_core::StepResult::Row => {
-                found = true;
-            }
-            turso_core::StepResult::IO => {
-                stmt.run_once().unwrap();
-                continue;
-            }
-            turso_core::StepResult::Done => break,
-            r => panic!("unexpected result {r:?}"),
-        }
-    }
+    stmt.run_with_row_callback(|_| {
+        found = true;
+        Ok(())
+    })
+    .unwrap();
     assert!(found, "Should be able to read MVCC data in readonly mode");
 
     drop(conn);

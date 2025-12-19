@@ -6,7 +6,7 @@ use jni::objects::{JByteArray, JObject, JObjectArray, JString, JValue};
 use jni::sys::{jdouble, jint, jlong};
 use jni::JNIEnv;
 use std::num::NonZero;
-use turso_core::{Statement, StepResult, Value};
+use turso_core::{LimboError, Statement, Value};
 
 pub const STEP_RESULT_ID_ROW: i32 = 10;
 #[allow(dead_code)]
@@ -59,36 +59,29 @@ pub extern "system" fn Java_tech_turso_core_TursoStatement_step<'local>(
         }
     };
 
-    loop {
-        let step_result = match stmt.stmt.step() {
-            Ok(result) => result,
-            Err(e) => return to_turso_step_result_error(&mut env, &e.to_string()),
-        };
+    let result = stmt.stmt.run_one_step_blocking(|| Ok(()), || Ok(()));
 
-        match step_result {
-            StepResult::Row => {
-                let row = stmt.stmt.row().unwrap();
-                return match row_to_obj_array(&mut env, row) {
-                    Ok(row) => to_turso_step_result(&mut env, STEP_RESULT_ID_ROW, Some(row)),
-                    Err(e) => {
-                        let err_msg = e.to_string();
-                        set_err_msg_and_throw_exception(&mut env, obj, TURSO_ETC, err_msg.clone());
-                        to_turso_step_result_error(&mut env, &err_msg)
-                    }
-                };
+    match result {
+        Ok(Some(row)) => match row_to_obj_array(&mut env, row) {
+            Ok(row) => to_turso_step_result(&mut env, STEP_RESULT_ID_ROW, Some(row)),
+            Err(e) => {
+                let err_msg = e.to_string();
+                set_err_msg_and_throw_exception(&mut env, obj, TURSO_ETC, err_msg.clone());
+                to_turso_step_result_error(&mut env, &err_msg)
             }
-            StepResult::IO => {
-                if let Err(e) = stmt.stmt.run_once() {
-                    let err_msg = e.to_string();
-                    set_err_msg_and_throw_exception(&mut env, obj, TURSO_ETC, err_msg.clone());
-                    return to_turso_step_result_error(&mut env, &err_msg);
-                }
-            }
-            StepResult::Done => return to_turso_step_result(&mut env, STEP_RESULT_ID_DONE, None),
-            StepResult::Interrupt => {
-                return to_turso_step_result(&mut env, STEP_RESULT_ID_INTERRUPT, None)
-            }
-            StepResult::Busy => return to_turso_step_result(&mut env, STEP_RESULT_ID_BUSY, None),
+        },
+        Ok(None) => {
+            // Done
+            to_turso_step_result(&mut env, STEP_RESULT_ID_DONE, None)
+        }
+        Err(LimboError::Interrupt) => {
+            to_turso_step_result(&mut env, STEP_RESULT_ID_INTERRUPT, None)
+        }
+        Err(LimboError::Busy) => to_turso_step_result(&mut env, STEP_RESULT_ID_BUSY, None),
+        Err(err) => {
+            let err_msg = err.to_string();
+            set_err_msg_and_throw_exception(&mut env, obj, TURSO_ETC, err_msg.clone());
+            to_turso_step_result_error(&mut env, &err_msg)
         }
     }
 }

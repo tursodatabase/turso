@@ -501,7 +501,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     }
     #[cfg(not(feature = "antithesis"))]
     {
-        let seed = opts.seed.unwrap_or_else(|| rand::random());
+        let seed = opts.seed.unwrap_or_else(rand::random);
         init_rng(seed);
         println!("Using seed: {seed}");
     }

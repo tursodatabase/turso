@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tempfile::TempDir;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
-use turso_core::{Connection, Database, FromValueRow, Row, StepResult, IO};
+use turso_core::{Connection, Database, FromValueRow, Row, IO};
 
 pub struct TempDatabase {
     pub path: PathBuf,
@@ -298,23 +298,8 @@ pub fn limbo_exec_rows(
 ) -> Vec<Vec<rusqlite::types::Value>> {
     let mut stmt = conn.prepare(query).unwrap();
     let mut rows = Vec::new();
-    'outer: loop {
-        let row = loop {
-            let result = stmt.step().unwrap();
-            match result {
-                turso_core::StepResult::Row => {
-                    let row = stmt.row().unwrap();
-                    break row;
-                }
-                turso_core::StepResult::IO => {
-                    stmt.run_once().unwrap();
-                    continue;
-                }
 
-                turso_core::StepResult::Done => break 'outer,
-                r => panic!("unexpected result {r:?}: expecting single row"),
-            }
-        };
+    stmt.run_with_row_callback(|row| {
         let row = row
             .get_values()
             .map(|x| match x {
@@ -326,7 +311,9 @@ pub fn limbo_exec_rows(
             })
             .collect();
         rows.push(row);
-    }
+        Ok(())
+    })
+    .unwrap();
     rows
 }
 
@@ -340,27 +327,8 @@ pub fn try_limbo_exec_rows(
 ) -> Result<Vec<Vec<rusqlite::types::Value>>, turso_core::LimboError> {
     let mut stmt = conn.prepare(query)?;
     let mut rows = Vec::new();
-    'outer: loop {
-        let row = loop {
-            let result = stmt.step()?;
-            match result {
-                turso_core::StepResult::Row => {
-                    let row = stmt.row().unwrap();
-                    break row;
-                }
-                turso_core::StepResult::IO => {
-                    stmt.run_once()?;
-                    continue;
-                }
 
-                turso_core::StepResult::Done => break 'outer,
-                r => {
-                    return Err(turso_core::LimboError::InternalError(format!(
-                        "unexpected result {r:?}: expecting single row"
-                    )))
-                }
-            }
-        };
+    stmt.run_with_row_callback(|row| {
         let row = row
             .get_values()
             .map(|x| match x {
@@ -372,7 +340,9 @@ pub fn try_limbo_exec_rows(
             })
             .collect();
         rows.push(row);
-    }
+        Ok(())
+    })?;
+
     Ok(rows)
 }
 
@@ -398,27 +368,7 @@ pub fn limbo_exec_rows_fallible(
 ) -> Result<Vec<Vec<rusqlite::types::Value>>, turso_core::LimboError> {
     let mut stmt = conn.prepare(query)?;
     let mut rows = Vec::new();
-    'outer: loop {
-        let row = loop {
-            let result = stmt.step()?;
-            match result {
-                turso_core::StepResult::Row => {
-                    let row = stmt.row().unwrap();
-                    break row;
-                }
-                turso_core::StepResult::IO => {
-                    stmt.run_once()?;
-                    continue;
-                }
-
-                turso_core::StepResult::Done => break 'outer,
-                r => {
-                    return Err(turso_core::LimboError::InternalError(format!(
-                        "TEST: unexpected result {r:?}: expecting single row"
-                    )))
-                }
-            }
-        };
+    stmt.run_with_row_callback(|row| {
         let row = row
             .get_values()
             .map(|x| match x {
@@ -430,28 +380,9 @@ pub fn limbo_exec_rows_fallible(
             })
             .collect();
         rows.push(row);
-    }
+        Ok(())
+    })?;
     Ok(rows)
-}
-
-#[allow(dead_code)]
-pub fn limbo_exec_rows_error(
-    _db: &TempDatabase,
-    conn: &Arc<turso_core::Connection>,
-    query: &str,
-) -> turso_core::Result<()> {
-    let mut stmt = conn.prepare(query)?;
-    loop {
-        let result = stmt.step()?;
-        match result {
-            turso_core::StepResult::IO => {
-                stmt.run_once()?;
-                continue;
-            }
-            turso_core::StepResult::Done => return Ok(()),
-            r => panic!("unexpected result {r:?}: expecting single row"),
-        }
-    }
 }
 
 pub fn rng_from_time() -> (ChaCha8Rng, u64) {
@@ -498,21 +429,17 @@ pub fn run_query_core(
     mut on_row: Option<impl FnMut(&Row)>,
 ) -> anyhow::Result<()> {
     if let Some(ref mut rows) = conn.query(query)? {
-        loop {
-            match rows.step()? {
-                StepResult::IO => {
-                    rows.run_once()?;
-                }
-                StepResult::Done => break,
-                StepResult::Row => {
-                    if let Some(on_row) = on_row.as_mut() {
-                        let row = rows.row().unwrap();
-                        on_row(row)
-                    }
-                }
-                r => panic!("unexpected step result: {r:?}"),
-            }
-        }
+        #[allow(clippy::type_complexity)]
+        let handler: Box<dyn FnMut(&Row) -> turso_core::Result<()>> =
+            if let Some(on_row) = on_row.as_mut() {
+                Box::new(|row| {
+                    on_row(row);
+                    Ok(())
+                })
+            } else {
+                Box::new(|_| Ok(()))
+            };
+        rows.run_with_row_callback(handler)?;
     };
     Ok(())
 }
@@ -551,24 +478,10 @@ macro_rules! impl_exec_rows_for_tuple {
             fn exec_rows(&self, query: &str) -> Vec<($($T,)+)> {
                 let mut stmt = self.prepare(query).unwrap();
                 let mut rows = Vec::new();
-                'outer: loop {
-                    let row = loop {
-                        let result = stmt.step().unwrap();
-                        match result {
-                            turso_core::StepResult::Row => {
-                                let row = stmt.row().unwrap();
-                                break row;
-                            }
-                            turso_core::StepResult::IO => {
-                                stmt.run_once().unwrap();
-                                continue;
-                            }
-                            turso_core::StepResult::Done => break 'outer,
-                            r => panic!("unexpected result {r:?}"),
-                        }
-                    };
+                stmt.run_with_row_callback(|row| {
                     rows.push(($(row.get($idx).unwrap(),)+));
-                }
+                    Ok(())
+                }).unwrap();
                 rows
             }
         }

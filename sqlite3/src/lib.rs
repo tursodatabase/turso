@@ -384,27 +384,20 @@ pub unsafe extern "C" fn sqlite3_finalize(stmt: *mut sqlite3_stmt) -> ffi::c_int
 pub unsafe extern "C" fn sqlite3_step(stmt: *mut sqlite3_stmt) -> ffi::c_int {
     let stmt = &mut *stmt;
     let db = &mut *stmt.db;
-    loop {
-        let _db = db.inner.lock().unwrap();
-        match stmt.stmt.step() {
-            Ok(result) => match result {
-                turso_core::StepResult::IO => {
-                    stmt.stmt.run_once().unwrap();
-                    continue;
-                }
-                turso_core::StepResult::Done => {
-                    stmt.clear_text_cache();
-                    return SQLITE_DONE;
-                }
-                turso_core::StepResult::Interrupt => return SQLITE_INTERRUPT,
-                turso_core::StepResult::Row => {
-                    stmt.clear_text_cache();
-                    return SQLITE_ROW;
-                }
-                turso_core::StepResult::Busy => return SQLITE_BUSY,
-            },
-            Err(err) => return handle_limbo_err(err, std::ptr::null_mut()),
+    let _db = db.inner.lock().unwrap();
+    let res = stmt.stmt.run_one_step_blocking(|| Ok(()), || Ok(()));
+    match res {
+        Ok(Some(_)) => {
+            stmt.clear_text_cache();
+            SQLITE_ROW
         }
+        Ok(None) => {
+            stmt.clear_text_cache();
+            SQLITE_DONE
+        }
+        Err(LimboError::Busy) => SQLITE_BUSY,
+        Err(LimboError::Interrupt) => SQLITE_INTERRUPT,
+        Err(err) => handle_limbo_err(err, std::ptr::null_mut()),
     }
 }
 

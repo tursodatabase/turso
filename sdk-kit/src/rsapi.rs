@@ -794,7 +794,8 @@ impl TursoStatement {
     /// run iteration of the IO backend
     pub fn run_io(&self) -> Result<(), TursoError> {
         self.statement
-            .run_once()
+            ._io()
+            .step()
             .map_err(turso_error_from_limbo_error)
     }
     /// get row value reference currently pointed by the statement

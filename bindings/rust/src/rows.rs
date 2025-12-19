@@ -54,7 +54,7 @@ impl Rows {
                     }
                     turso_core::StepResult::Done => Poll::Ready(Ok(None)),
                     turso_core::StepResult::IO => {
-                        stmt.run_once()?;
+                        stmt._io().step()?;
                         Poll::Pending
                     }
                     turso_core::StepResult::Busy => Poll::Ready(Err(Error::SqlExecutionFailure(

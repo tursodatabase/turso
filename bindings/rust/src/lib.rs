@@ -253,7 +253,7 @@ impl Future for Execute {
                 Poll::Ready(Ok(changes as u64))
             }
             Ok(turso_core::StepResult::IO) => {
-                stmt.run_once()?;
+                stmt._io().step()?;
                 Poll::Pending
             }
             Ok(turso_core::StepResult::Busy) => Poll::Ready(Err(Error::SqlExecutionFailure(

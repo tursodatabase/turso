@@ -148,42 +148,30 @@ pub fn parse_schema_rows(
     // Store materialized view info (SQL and root page) for later creation
     let mut materialized_view_info: std::collections::HashMap<String, (String, i64)> =
         std::collections::HashMap::new();
-    loop {
-        match rows.step()? {
-            StepResult::Row => {
-                let row = rows.row().unwrap();
-                let ty = row.get::<&str>(0)?;
-                let name = row.get::<&str>(1)?;
-                let table_name = row.get::<&str>(2)?;
-                let root_page = row.get::<i64>(3)?;
-                let sql = row.get::<&str>(4).ok();
-                schema.handle_schema_row(
-                    ty,
-                    name,
-                    table_name,
-                    root_page,
-                    sql,
-                    syms,
-                    &mut from_sql_indexes,
-                    &mut automatic_indices,
-                    &mut dbsp_state_roots,
-                    &mut dbsp_state_index_roots,
-                    &mut materialized_view_info,
-                    mv_store.as_ref(),
-                )?
-            }
-            StepResult::IO => {
-                // TODO: How do we ensure that the I/O we submitted to
-                // read the schema is actually complete?
-                rows.run_once()?;
-            }
-            StepResult::Interrupt => {
-                return Err(LimboError::InternalError("interrupted".to_string()))
-            }
-            StepResult::Done => break,
-            StepResult::Busy => return Err(LimboError::Busy),
-        }
-    }
+
+    // TODO: How do we ensure that the I/O we submitted to
+    // read the schema is actually complete?
+    rows.run_with_row_callback(|row| {
+        let ty = row.get::<&str>(0)?;
+        let name = row.get::<&str>(1)?;
+        let table_name = row.get::<&str>(2)?;
+        let root_page = row.get::<i64>(3)?;
+        let sql = row.get::<&str>(4).ok();
+        schema.handle_schema_row(
+            ty,
+            name,
+            table_name,
+            root_page,
+            sql,
+            syms,
+            &mut from_sql_indexes,
+            &mut automatic_indices,
+            &mut dbsp_state_roots,
+            &mut dbsp_state_index_roots,
+            &mut materialized_view_info,
+            mv_store.as_ref(),
+        )
+    });
 
     schema.populate_indices(
         syms,
