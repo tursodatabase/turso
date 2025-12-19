@@ -1,10 +1,11 @@
+use magnus::value::ReprValue;
 use magnus::{block::Proc, method, Error, Module, Ruby, TryConvert, Value};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use turso_sdk_kit::rsapi::{TursoConnection, TursoStatusCode};
 
 use crate::errors::map_turso_error;
-use crate::statement::{RbExecutionResult, RbStatement};
+use crate::statement::{RbResultSet, RbStatement};
 use crate::value;
 
 #[magnus::wrap(class = "Turso::Connection", free_immediately, size)]
@@ -41,7 +42,7 @@ impl RbConnection {
         Ok(RbStatement::new(stmt))
     }
 
-    pub fn execute(&self, args: &[Value]) -> Result<RbExecutionResult, Error> {
+    pub fn execute(&self, args: &[Value]) -> Result<RbResultSet, Error> {
         self.ensure_open()?;
 
         if args.is_empty() {
@@ -59,8 +60,25 @@ impl RbConnection {
             value::bind_value(&mut stmt, i + 1, *arg)?;
         }
 
-        let result = stmt.execute().map_err(map_turso_error)?;
-        Ok(RbExecutionResult::from_rsapi(result.rows_changed))
+        let mut rows: Vec<Value> = Vec::new();
+        loop {
+            match stmt.step().map_err(map_turso_error)? {
+                TursoStatusCode::Row => {
+                    rows.push(value::extract_row(&stmt)?.as_value());
+                }
+                TursoStatusCode::Done => break,
+                TursoStatusCode::Io => {
+                    stmt.run_io().map_err(map_turso_error)?;
+                }
+                _ => break,
+            }
+        }
+
+        let changes = self.inner.changes();
+        stmt.finalize().map_err(map_turso_error)?;
+        self.last_changes.store(changes, Ordering::Relaxed);
+
+        Ok(RbResultSet::new(rows, changes))
     }
 
     pub fn transaction(&self, block: Proc) -> Result<Value, Error> {

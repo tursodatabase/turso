@@ -590,6 +590,9 @@ impl TursoConnection {
     pub fn last_insert_rowid(&self) -> i64 {
         self.connection.last_insert_rowid()
     }
+    pub fn changes(&self) -> u64 {
+        self.connection.changes() as u64
+    }
     /// prepares single SQL statement
     pub fn prepare_single(&self, sql: impl AsRef<str>) -> Result<Box<TursoStatement>, TursoError> {
         match self.connection.prepare(sql) {
@@ -679,6 +682,10 @@ impl TursoStatement {
     /// returns parameters count for the statement
     pub fn parameters_count(&self) -> usize {
         self.statement.parameters_count()
+    }
+    /// returns number of changes made by the statement
+    pub fn n_change(&self) -> u64 {
+        self.statement.n_change() as u64
     }
     /// binds positional parameter at the corresponding index (1-based)
     pub fn bind_positional(

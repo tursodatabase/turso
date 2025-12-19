@@ -1,9 +1,9 @@
-use magnus::{exception::ExceptionClass, Error, Module, Ruby};
-use std::cell::RefCell;
+use magnus::{exception::ExceptionClass, Class, Error, Module, Ruby};
+
 use turso_sdk_kit::rsapi::{TursoError, TursoStatusCode};
 
 pub fn define_exceptions(ruby: &Ruby, module: &impl Module) -> Result<(), Error> {
-    let error = module.define_class("Error", ruby.exception_standard_error())?;
+    let error = module.define_class("Error", ruby.exception_standard_error().as_r_class())?;
     module.define_class("BusyError", error)?;
     module.define_class("InterruptError", error)?;
     module.define_class("MisuseError", error)?;

@@ -1,5 +1,5 @@
-use magnus::prelude::*;
-use magnus::{method, Error, Module, RArray, Ruby, Value};
+use magnus::value::ReprValue;
+use magnus::{method, DataTypeFunctions, Error, Module, Ruby, TryConvert, TypedData, Value};
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
 use turso_sdk_kit::rsapi::{TursoStatement, TursoStatusCode};
@@ -7,18 +7,52 @@ use turso_sdk_kit::rsapi::{TursoStatement, TursoStatusCode};
 use crate::errors::{map_turso_error, statement_closed_error};
 use crate::value;
 
-#[magnus::wrap(class = "Turso::ExecutionResult", free_immediately, size)]
-pub struct RbExecutionResult {
+/// ResultSet containing query results and execution metadata.
+/// Implements `Enumerable`, so you can use `.each`, `.map`, `.select`, etc.
+#[derive(TypedData)]
+#[magnus(class = "Turso::ResultSet", mark, size)]
+pub struct RbResultSet {
+    rows: Vec<Value>,
     rows_changed: u64,
 }
 
-impl RbExecutionResult {
-    pub(crate) fn from_rsapi(rows_changed: u64) -> Self {
-        Self { rows_changed }
+
+unsafe impl Send for RbResultSet {}
+unsafe impl Sync for RbResultSet {}
+
+impl RbResultSet {
+    pub(crate) fn new(rows: Vec<Value>, rows_changed: u64) -> Self {
+        Self { rows, rows_changed }
     }
 
     pub fn rows_changed(&self) -> u64 {
         self.rows_changed
+    }
+
+    pub fn each(
+        ruby: &Ruby,
+        rb_self: Value,
+    ) -> Result<magnus::block::Yield<impl Iterator<Item = Value>>, Error> {
+        let this: &Self = TryConvert::try_convert(rb_self)?;
+        if ruby.block_given() {
+            Ok(magnus::block::Yield::Iter(this.rows.iter().copied()))
+        } else {
+            Ok(magnus::block::Yield::Enumerator(
+                rb_self.enumeratorize("each", ()),
+            ))
+        }
+    }
+}
+
+impl DataTypeFunctions for RbResultSet {
+    fn mark(&self, marker: &magnus::gc::Marker) {
+        for row in &self.rows {
+            marker.mark(*row);
+        }
+    }
+
+    fn size(&self) -> usize {
+        std::mem::size_of::<Self>() + self.rows.len() * std::mem::size_of::<Value>()
     }
 }
 
@@ -68,17 +102,31 @@ impl RbStatement {
         }
     }
 
-    pub fn execute(&self, args: &[Value]) -> Result<RbExecutionResult, Error> {
+    pub fn execute(&self, args: &[Value]) -> Result<RbResultSet, Error> {
         self.ensure_open()?;
         self.bind(args)?;
 
-        let result = self.inner.borrow_mut().execute().map_err(map_turso_error)?;
-        Ok(RbExecutionResult {
-            rows_changed: result.rows_changed,
-        })
+        let mut stmt = self.inner.borrow_mut();
+        let mut rows: Vec<Value> = Vec::new();
+        loop {
+            match stmt.step().map_err(map_turso_error)? {
+                TursoStatusCode::Row => {
+                    rows.push(value::extract_row(&stmt)?.as_value());
+                }
+                TursoStatusCode::Done => break,
+                TursoStatusCode::Io => {
+                    stmt.run_io().map_err(map_turso_error)?;
+                }
+                _ => break,
+            }
+        }
+        let changes = stmt.n_change();
+        stmt.reset().map_err(map_turso_error)?;
+
+        Ok(RbResultSet::new(rows, changes))
     }
 
-    pub fn columns(&self) -> Result<RArray, Error> {
+    pub fn columns(&self) -> Result<magnus::RArray, Error> {
         self.ensure_open()?;
         let ruby = Ruby::get().expect("Ruby not initialized");
         let stmt = self.inner.borrow();
@@ -124,9 +172,17 @@ impl Drop for RbStatement {
     }
 }
 
+pub fn define_result_set(ruby: &Ruby, module: &impl Module) -> Result<(), Error> {
+    let class = module.define_class("ResultSet", ruby.class_object())?;
+    class.include_module(ruby.module_enumerable())?;
+    class.define_method("rows_changed", method!(RbResultSet::rows_changed, 0))?;
+    class.define_method("each", method!(RbResultSet::each, 0))?;
+    Ok(())
+}
+
+
 pub fn define_statement(ruby: &Ruby, module: &impl Module) -> Result<(), Error> {
-    let result_class = module.define_class("ExecutionResult", ruby.class_object())?;
-    result_class.define_method("rows_changed", method!(RbExecutionResult::rows_changed, 0))?;
+    define_result_set(ruby, module)?;
 
     let class = module.define_class("Statement", ruby.class_object())?;
     class.define_method("bind", method!(RbStatement::bind, -1))?;
