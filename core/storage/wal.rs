@@ -5,6 +5,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use std::array;
 use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::sync::OnceLock;
 use strum::EnumString;
 use tracing::{instrument, Level};
 
@@ -228,6 +229,23 @@ impl TursoRwLock {
     }
 }
 
+/// Represents a batch of WAL frames which will be appended to the log
+/// with a `pwritev` call and then sync'd to disk.
+pub struct PreparedFrames {
+    /// File offset for the first frame
+    pub offset: u64,
+    /// Serialized frame buffers
+    pub bufs: Vec<Arc<Buffer>>,
+    /// Per-frame metadata: (page_ref, frame_id, cumulative_checksum)
+    pub metadata: Vec<(PageRef, u64, (u32, u32))>,
+    /// Checksum after all frames in this batch
+    pub final_checksum: (u32, u32),
+    /// Max frame ID after this batch
+    pub final_max_frame: u64,
+    /// Epoch at preparation time
+    pub epoch: u32,
+}
+
 /// Write-ahead log (WAL).
 pub trait Wal: Debug + Send + Sync {
     /// Begin a read transaction.
@@ -277,16 +295,30 @@ pub trait Wal: Debug + Send + Sync {
 
     fn prepare_wal_finish(&self) -> Result<Completion>;
 
+    /// Prepare a batch of WAL frames for durable commit/append to the log.
+    fn prepare_frames(
+        &self,
+        pages: &[PageRef],
+        page_sz: PageSize,
+        db_size_on_commit: Option<u32>,
+        prev: Option<&PreparedFrames>,
+    ) -> Result<PreparedFrames>;
+
+    /// For each prepared frame, update in-memory WAL index and rolling checksum
+    /// and advance max_frame to make committed frames visible to readers.
+    fn commit_prepared_frames(&self, prepared: &[PreparedFrames]);
+
+    /// Mark in-memory pages clean and set WAL tags after durable commit.
+    fn finalize_committed_pages(&self, prepared: &[PreparedFrames]);
+
+    /// Return a handle to the underlying File.
+    fn wal_file(&self) -> Result<Arc<dyn File>>;
+
     /// Write a bunch of frames to the WAL.
     /// db_size is the database size in pages after the transaction finishes.
     /// db_size is set  -> last frame written in transaction
     /// db_size is none -> non-last frame written in transaction
-    fn append_frames_vectored(
-        &self,
-        pages: Vec<PageRef>,
-        page_sz: PageSize,
-        db_size_on_commit: Option<u32>,
-    ) -> Result<Completion>;
+    fn append_frames_vectored(&self, pages: Vec<PageRef>, page_sz: PageSize) -> Result<Completion>;
 
     /// Complete append of frames by updating shared wal state. Before this
     /// all changes were stored locally.
@@ -461,9 +493,14 @@ struct OngoingCheckpoint {
     /// Read operations currently ongoing.
     inflight_reads: Vec<InflightRead>,
     /// Array of atomic counters representing write operations that are currently in flight.
-    inflight_writes: Vec<Arc<AtomicBool>>,
+    inflight_writes: Vec<InflightWriteBatch>,
     /// List of all page_id + frame_id combinations to be backfilled
     pages_to_checkpoint: Vec<(u64, u64)>,
+}
+
+struct InflightWriteBatch {
+    done: Arc<AtomicBool>,
+    err: Arc<std::sync::OnceLock<CompletionError>>,
 }
 
 impl OngoingCheckpoint {
@@ -512,38 +549,60 @@ impl OngoingCheckpoint {
     fn process_inflight_writes(&mut self) -> bool {
         let before_len = self.inflight_writes.len();
         self.inflight_writes
-            .retain(|done| !done.load(Ordering::Acquire));
+            .retain(|w| !w.done.load(Ordering::Acquire));
         before_len > self.inflight_writes.len()
     }
 
     #[inline]
     /// Remove any completed read operations from `inflight_reads`
     /// returns whether any progress was made.
-    fn process_pending_reads(&mut self) -> bool {
+    fn process_pending_reads(&mut self) -> Result<bool> {
         let mut moved = false;
-        // retain only those still pending
+        let mut err: Option<CompletionError> = None;
+
         self.inflight_reads.retain(|slot| {
+            if !slot.completion.finished() {
+                return true;
+            }
             if slot.completion.succeeded() {
                 if let Some(buf) = slot.buf.lock().take() {
-                    // read is done, take the buffer and add it to the batch to write
                     self.pending_writes.insert(slot.page_id, buf);
                     moved = true;
+                } else {
+                    err = Some(std::io::Error::other("read done but buf missing").into());
                 }
-                false
             } else {
-                true
+                err = Some(
+                    slot.completion
+                        .get_error()
+                        .unwrap_or_else(|| std::io::Error::other("wal read failed").into()),
+                );
             }
+            false
         });
-        moved
+        if let Some(e) = err {
+            return Err(LimboError::CompletionError(e));
+        }
+        Ok(moved)
     }
 
+    fn first_write_error(&self) -> Option<CompletionError>
+    where
+        CompletionError: Clone,
+    {
+        self.inflight_writes
+            .iter()
+            .find_map(|w| w.err.get().cloned())
+    }
+}
+
+impl InflightWriteBatch {
     #[inline]
-    /// Add an `inflight write` and return the Atomic counter used to
-    /// track it's completion.
-    fn add_write(&mut self) -> Arc<AtomicBool> {
-        let new = Arc::new(AtomicBool::new(false));
-        self.inflight_writes.push(new.clone());
-        new
+    fn new() -> InflightWriteBatch {
+        InflightWriteBatch {
+            done: Arc::new(AtomicBool::new(false)),
+            err: Arc::new(OnceLock::new()),
+        }
     }
 }
 
@@ -1401,11 +1460,8 @@ impl Wal for WalFile {
                 ?last_checksum
             );
             shared.last_checksum = last_checksum;
-            self.transaction_count.fetch_add(1, Ordering::Release);
-            shared.transaction_count.store(
-                self.transaction_count.load(Ordering::Acquire),
-                Ordering::Release,
-            );
+            let new_count = self.transaction_count.fetch_add(1, Ordering::AcqRel) + 1;
+            shared.transaction_count.store(new_count, Ordering::Release);
             Ok(())
         })
     }
@@ -1490,13 +1546,155 @@ impl Wal for WalFile {
         Ok(c)
     }
 
-    /// Use pwritev to append many frames to the log at once
-    fn append_frames_vectored(
+    /// Prepares a batch of dirty pages as WAL frames without modifying WAL state.
+    ///
+    /// This is the first phase of a three-phase commit protocol:
+    /// 1. prepare (`prepare_frames`) - serialize frames, compute checksums
+    /// 2. write + fsync - caller submits I/O and waits for durability
+    /// 3. commit/finalize (`commit_prepared_frames`) - update WAL index and page metadata
+    ///
+    /// WAL frames form a checksum chain for corruption detection. When writing
+    /// multiple batches in a single transaction, pass the previous batch via `prev`
+    /// to continue the chain. For the first batch, pass `None` to start from
+    /// the committed WAL state.
+    fn prepare_frames(
         &self,
-        pages: Vec<PageRef>,
+        pages: &[PageRef],
         page_sz: PageSize,
         db_size_on_commit: Option<u32>,
-    ) -> Result<Completion> {
+        prev: Option<&PreparedFrames>,
+    ) -> Result<PreparedFrames> {
+        turso_assert!(
+            pages.len() <= IOV_MAX,
+            "supported up to IOV_MAX pages at once"
+        );
+        turso_assert!(
+            self.with_shared(|shared| shared.is_initialized())?,
+            "WAL must be initialized"
+        );
+
+        let (header, epoch) = self.with_shared(|shared| {
+            let hdr = *shared.wal_header.lock();
+            let epoch = shared.epoch.load(Ordering::Acquire);
+            (hdr, epoch)
+        });
+
+        turso_assert!(
+            header.page_size == page_sz.get(),
+            "page size mismatch: header={}, requested={}",
+            header.page_size,
+            page_sz.get()
+        );
+
+        // Either chain from previous batch of PreparedFrames or use committed WAL state
+        let (mut rolling_checksum, mut next_frame_id) = match prev {
+            Some(p) => (p.final_checksum, p.final_max_frame + 1),
+            None => (
+                *self.last_checksum.read(),
+                self.max_frame.load(Ordering::Acquire) + 1,
+            ),
+        };
+
+        let first_frame_id = next_frame_id;
+
+        let mut bufs: Vec<Arc<Buffer>> = Vec::with_capacity(pages.len());
+        let mut metadata = Vec::with_capacity(pages.len());
+
+        for (idx, page) in pages.iter().enumerate() {
+            let page_id = page.get().id;
+            let plain = page.get_contents().as_ptr();
+
+            let data: Cow<[u8]> = {
+                let io_ctx = self.io_ctx.read();
+                match io_ctx.encryption_or_checksum() {
+                    EncryptionOrChecksum::Encryption(ctx) => {
+                        Cow::Owned(ctx.encrypt_page(plain, page_id)?)
+                    }
+                    EncryptionOrChecksum::Checksum(ctx) => {
+                        ctx.add_checksum_to_page(plain, page_id)?;
+                        Cow::Borrowed(plain)
+                    }
+                    EncryptionOrChecksum::None => Cow::Borrowed(plain),
+                }
+            };
+
+            // if DB size is included for commit frame, it will need to be included only in the last frame of the batch.
+            // however it might not be present in this batch so we cannot assert its presence
+            let frame_db_size = if idx + 1 == pages.len() {
+                db_size_on_commit.unwrap_or(0)
+            } else {
+                0
+            };
+            let (checksum, frame_buf) = prepare_wal_frame(
+                &self.buffer_pool,
+                &header,
+                rolling_checksum,
+                header.page_size,
+                page_id as u32,
+                frame_db_size,
+                &data,
+            );
+            bufs.push(frame_buf);
+            metadata.push((page.clone(), next_frame_id, checksum));
+            rolling_checksum = checksum;
+            next_frame_id += 1;
+        }
+        let offset = self.frame_offset(first_frame_id);
+        Ok(PreparedFrames {
+            offset,
+            bufs,
+            metadata,
+            final_checksum: rolling_checksum,
+            final_max_frame: next_frame_id - 1,
+            epoch,
+        })
+    }
+
+    /// For each prepared frame, update in-memory WAL index and rolling checksum.
+    /// and advance max_frame to make frames visible to readers.
+    fn commit_prepared_frames(&self, batches: &[PreparedFrames]) {
+        for batch in batches {
+            for (page, frame_id, checksum) in &batch.metadata {
+                // Update WAL index mapping page -> frame
+                self.complete_append_frame(page.get().id as u64, *frame_id, *checksum);
+            }
+            // Update rolling checksum
+            *self.last_checksum.write() = batch.final_checksum;
+            // Advance max_frame and make frames visible to readers
+            self.max_frame
+                .store(batch.final_max_frame, Ordering::Release);
+        }
+    }
+
+    /// Mark pages clean and set WAL tags after durable commit.
+    fn finalize_committed_pages(&self, prepared: &[PreparedFrames]) {
+        for batch in prepared {
+            for (page, frame_id, _) in &batch.metadata {
+                page.clear_dirty();
+                page.set_wal_tag(*frame_id, batch.epoch);
+            }
+        }
+    }
+
+    /// Get WAL file for durable writes.
+    fn wal_file(&self) -> Result<Arc<dyn File>> {
+        self.with_shared(|shared| {
+            turso_assert!(shared.enabled.load(Ordering::SeqCst), "WAL must be enabled");
+            shared
+                .file
+                .as_ref()
+                .cloned()
+                .ok_or_else(|| LimboError::InternalError("WAL file not open".into()))
+        })
+    }
+
+    /// Use pwritev to append many frames to the log at once.
+    ///
+    /// # Safety:
+    /// this method should only be used for cacheflush/spilling,
+    /// the commit path should use prepare_frames + commit_prepared_frames instead,
+    /// as it prevents prematurely modifing WAL state before durability is ensured.
+    fn append_frames_vectored(&self, pages: Vec<PageRef>, page_sz: PageSize) -> Result<Completion> {
         turso_assert!(
             pages.len() <= IOV_MAX,
             "we limit number of iovecs to IOV_MAX"
@@ -1529,7 +1727,7 @@ impl Wal for WalFile {
 
         let mut next_frame_id = self.max_frame.load(Ordering::Acquire) + 1;
         // Build every frame in order, updating the rolling checksum
-        for (idx, page) in pages.iter().enumerate() {
+        for page in pages.iter() {
             tracing::debug!("append_frames_vectored: page_id={}", page.get().id);
             let page_id = page.get().id;
             let plain = page.get_contents().as_ptr();
@@ -1548,13 +1746,7 @@ impl Wal for WalFile {
                 }
             };
 
-            let frame_db_size = if idx + 1 == pages.len() {
-                // if it's the final frame we are appending, and the caller included a db_size for the
-                // commit frame, then we ensure to set it in the header.
-                db_size_on_commit.unwrap_or(0)
-            } else {
-                0
-            };
+            let frame_db_size = 0; // this method is not used for the commit path
             let (new_checksum, frame_bytes) = prepare_wal_frame(
                 &self.buffer_pool,
                 &header,
@@ -1595,7 +1787,7 @@ impl Wal for WalFile {
             }
         };
 
-        let c = Completion::new_write_linked(cmp);
+        let c = Completion::new_write(cmp);
 
         let file = self.with_shared(|shared| {
             assert!(shared.enabled.load(Ordering::SeqCst), "WAL must be enabled");
@@ -1879,21 +2071,33 @@ impl WalFile {
                     // Gather I/O completions using a completion group
                     let mut nr_completions = 0;
                     let mut group = CompletionGroup::new(|_| {});
+                    let mut ongoing_chkpt = self.ongoing_checkpoint.write();
 
                     // Check and clean any completed writes from pending flush
-                    if self.ongoing_checkpoint.write().process_inflight_writes() {
+                    if ongoing_chkpt.process_inflight_writes() {
                         tracing::trace!("Completed a write batch");
                     }
                     // Process completed reads into current batch
-                    if self.ongoing_checkpoint.write().process_pending_reads() {
+                    if ongoing_chkpt.process_pending_reads()? {
                         tracing::trace!("Drained reads into batch");
                     }
+                    if let Some(e) = ongoing_chkpt.first_write_error() {
+                        // cancel everything still in-flight to avoid leaks
+                        let to_cancel: Vec<Completion> = ongoing_chkpt
+                            .inflight_reads
+                            .iter()
+                            .map(|r| r.completion.clone())
+                            .collect();
+                        pager.io.cancel(&to_cancel)?;
+                        pager.io.drain()?;
+                        return Err(LimboError::CompletionError(e));
+                    }
+
                     let epoch = self.with_shared(|shared| shared.epoch.load(Ordering::Acquire));
                     // Issue reads until we hit limits
-                    'inner: while self.ongoing_checkpoint.read().should_issue_reads() {
+                    'inner: while ongoing_chkpt.should_issue_reads() {
                         let (page_id, target_frame) = {
-                            let oc = self.ongoing_checkpoint.read();
-                            oc.pages_to_checkpoint[oc.current_page as usize]
+                            ongoing_chkpt.pages_to_checkpoint[ongoing_chkpt.current_page as usize]
                         };
                         'fast_path: {
                             if let Some(cached_page) = pager.cache_get_for_checkpoint(
@@ -1932,12 +2136,14 @@ impl WalFile {
                                     turso_assert!(wal_page == cached, "cached page content differs from WAL read for page_id={page_id}, frame_id={target_frame}");
                                 }
                                 {
-                                    let mut oc = self.ongoing_checkpoint.write();
-                                    oc.pending_writes.insert(page_id as usize, buffer);
+                                    ongoing_chkpt
+                                        .pending_writes
+                                        .insert(page_id as usize, buffer);
                                     // signify that a cached page was used, so it can be unpinned
-                                    let current = oc.current_page as usize;
-                                    oc.pages_to_checkpoint[current] = (page_id, target_frame);
-                                    oc.current_page += 1;
+                                    let current = ongoing_chkpt.current_page as usize;
+                                    ongoing_chkpt.pages_to_checkpoint[current] =
+                                        (page_id, target_frame);
+                                    ongoing_chkpt.current_page += 1;
                                 }
                                 continue 'inner;
                             }
@@ -1948,33 +2154,38 @@ impl WalFile {
                             self.issue_wal_read_into_buffer(page_id as usize, target_frame)?;
                         group.add(&inflight.completion);
                         nr_completions += 1;
-                        {
-                            let mut oc = self.ongoing_checkpoint.write();
-                            oc.inflight_reads.push(inflight);
-                            oc.current_page += 1;
-                        }
+                        ongoing_chkpt.inflight_reads.push(inflight);
+                        ongoing_chkpt.current_page += 1;
                     }
 
                     // Start a write if batch is ready and we're not at write limit
-                    let should_flush = {
-                        let oc = self.ongoing_checkpoint.read();
-                        oc.inflight_writes.len() < MAX_INFLIGHT_WRITES && oc.should_flush_batch()
-                    };
+                    let should_flush = ongoing_chkpt.inflight_writes.len() < MAX_INFLIGHT_WRITES
+                        && ongoing_chkpt.should_flush_batch();
                     if should_flush {
-                        let batch_map = self.ongoing_checkpoint.write().pending_writes.take();
+                        let batch_map = ongoing_chkpt.pending_writes.take();
                         if !batch_map.is_empty() {
-                            let done_flag = self.ongoing_checkpoint.write().add_write();
-                            for c in write_pages_vectored(pager, batch_map, done_flag)? {
+                            let new_write = InflightWriteBatch::new();
+                            for c in write_pages_vectored(
+                                pager,
+                                batch_map,
+                                new_write.done.clone(),
+                                new_write.err.clone(),
+                            )? {
                                 group.add(&c);
                                 nr_completions += 1;
                             }
+                            ongoing_chkpt.inflight_writes.push(new_write);
                         }
                     }
-
                     if nr_completions > 0 {
                         io_yield_one!(group.build());
-                    } else if self.ongoing_checkpoint.read().complete() {
-                        self.ongoing_checkpoint.write().state = CheckpointState::Finalize;
+                    } else if ongoing_chkpt.complete() {
+                        ongoing_chkpt.state = CheckpointState::Finalize;
+                    } else {
+                        // This should be impossible now so we treat it as logic error.
+                        return Err(LimboError::InternalError(
+                            "checkpoint stuck: no inflight completions but not complete".into(),
+                        ));
                     }
                 }
                 // All eligible frames copied to the db file
@@ -1982,14 +2193,11 @@ impl WalFile {
                 // In Restart or Truncate mode, we need to restart the log over and possibly truncate the file
                 // Release all locks and return the current num of wal frames and the amount we backfilled
                 CheckpointState::Finalize => {
+                    let mut ongoing_chkpt = self.ongoing_checkpoint.write();
                     turso_assert!(
-                        self.ongoing_checkpoint.read().complete(),
+                        ongoing_chkpt.complete(),
                         "checkpoint pending flush must have finished"
                     );
-                    let (oc_max_frame, oc_min_frame) = {
-                        let oc = self.ongoing_checkpoint.read();
-                        (oc.max_frame, oc.min_frame)
-                    };
                     let checkpoint_result = self.with_shared(|shared| {
                         let current_mx = shared.max_frame.load(Ordering::Acquire);
                         let nbackfills = shared.nbackfills.load(Ordering::Acquire);
@@ -2000,9 +2208,9 @@ impl WalFile {
                         let frames_possible = current_mx.saturating_sub(nbackfills);
 
                         // the total # of frames we actually backfilled
-                        let checkpoint_max_frame = oc_max_frame;
+                        let checkpoint_max_frame = ongoing_chkpt.max_frame;
                         let frames_checkpointed =
-                            checkpoint_max_frame.saturating_sub(oc_min_frame - 1);
+                            checkpoint_max_frame.saturating_sub(ongoing_chkpt.min_frame - 1);
 
                         if matches!(mode, CheckpointMode::Truncate { .. }) {
                             // sqlite always returns zeros for truncate mode
@@ -2028,16 +2236,17 @@ impl WalFile {
                     // NOTE: we don't have a .shm file yet, so it's safe to update nbackfills here
                     // before we sync, because if we crash and then recover, we will checkpoint the entire db anyway.
                     self.with_shared(|shared| {
-                        shared.nbackfills.store(oc_max_frame, Ordering::Release)
+                        shared
+                            .nbackfills
+                            .store(ongoing_chkpt.max_frame, Ordering::Release)
                     });
-
                     if mode.require_all_backfilled() && !checkpoint_result.everything_backfilled() {
                         return Err(LimboError::Busy);
                     }
                     if mode.should_restart_log() {
                         self.restart_log(mode)?;
                     }
-                    self.ongoing_checkpoint.write().state = CheckpointState::Truncate {
+                    ongoing_chkpt.state = CheckpointState::Truncate {
                         checkpoint_result: Some(checkpoint_result),
                         truncate_sent: false,
                         sync_sent: false,
@@ -2317,6 +2526,12 @@ impl WalFile {
     fn issue_wal_read_into_buffer(&self, page_id: usize, frame_id: u64) -> Result<InflightRead> {
         let offset = self.frame_offset(frame_id);
         let buf_slot = Arc::new(SpinLock::new(None));
+        tracing::debug!(
+            "Issuing WAL read: page_id={}, frame_id={}, offset={}",
+            page_id,
+            frame_id,
+            offset
+        );
 
         let complete = {
             let buf_slot = buf_slot.clone();

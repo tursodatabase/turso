@@ -1045,14 +1045,15 @@ pub fn write_pages_vectored(
     pager: &Pager,
     batch: BTreeMap<usize, Arc<Buffer>>,
     done_flag: Arc<AtomicBool>,
+    err: Arc<std::sync::OnceLock<CompletionError>>,
 ) -> Result<Vec<Completion>> {
     if batch.is_empty() {
-        done_flag.store(true, Ordering::SeqCst);
+        done_flag.store(true, Ordering::Release);
         return Ok(Vec::new());
     }
 
     let page_sz = pager.get_page_size_unchecked().get() as usize;
-    // Count expected number of runs to create the atomic counter we need to track each batch
+
     let mut run_count = 0;
     let mut prev_id = None;
     for &id in batch.keys() {
@@ -1061,18 +1062,17 @@ pub fn write_pages_vectored(
                 run_count += 1;
             }
         } else {
-            run_count = 1; // First run
+            run_count = 1;
         }
         prev_id = Some(id);
     }
 
-    // Create the atomic counters
     let runs_left = Arc::new(AtomicUsize::new(run_count));
 
     const EST_BUFF_CAPACITY: usize = 32;
     let mut run_bufs = Vec::with_capacity(EST_BUFF_CAPACITY);
     let mut run_start_id: Option<usize> = None;
-    let mut completions = Vec::new();
+    let mut completions = Vec::with_capacity(run_count);
 
     let mut iter = batch.iter().peekable();
     while let Some((id, buffer)) = iter.next() {
@@ -1081,43 +1081,57 @@ pub fn write_pages_vectored(
         }
         run_bufs.push(buffer.clone());
 
-        if iter.peek().is_none_or(|(next_id, _)| **next_id != id + 1) {
-            let start_id = run_start_id.expect("should have a start id");
-            let runs_left_cl = runs_left.clone();
-            let done_cl = done_flag.clone();
-            let total_sz = (page_sz * run_bufs.len()) as i32;
+        let is_end_of_run = iter.peek().is_none_or(|(next_id, _)| **next_id != id + 1);
+        if !is_end_of_run {
+            continue;
+        }
 
-            let cmp = Completion::new_write_linked(move |res| {
-                let Ok(res) = res else { return };
-                turso_assert!(total_sz == res, "failed to write expected size");
-                if runs_left_cl.fetch_sub(1, Ordering::AcqRel) == 1 {
-                    done_cl.store(true, Ordering::Release);
-                }
-            });
+        let start_id = run_start_id.take().expect("start id");
+        let runs_left_cl = runs_left.clone();
+        let done_cl = done_flag.clone();
+        let err_cl = err.clone();
 
-            let io_ctx = pager.io_ctx.read();
-            match pager.db_file.write_pages(
-                start_id,
-                page_sz,
-                std::mem::replace(&mut run_bufs, Vec::with_capacity(EST_BUFF_CAPACITY)),
-                &io_ctx,
-                cmp,
-            ) {
-                Ok(c) => completions.push(c),
-                Err(e) => {
-                    if runs_left.fetch_sub(1, Ordering::AcqRel) == 1 {
-                        done_flag.store(true, Ordering::Release);
+        let expected_bytes = (page_sz * run_bufs.len()) as i32;
+
+        let cmp = Completion::new_write(move |res| {
+            // Record error/mismatch, but always resolve the batch progress.
+            match res {
+                Ok(n) => {
+                    if n != expected_bytes {
+                        let _ = err_cl.set(CompletionError::ShortWrite);
+                        tracing::error!(
+                            "write_pages_vectored: short write: wrote({n}) != expected({expected_bytes})"
+                        );
                     }
-                    pager.io.cancel(&completions)?;
-                    pager.io.drain()?;
-                    return Err(e);
+                }
+                Err(e) => {
+                    tracing::error!("write_pages_vectored: write error: {:?}", e);
+                    let _ = err_cl.set(e);
                 }
             }
-            run_start_id = None;
+            // we have to decrement runs_left on both paths
+            if runs_left_cl.fetch_sub(1, Ordering::AcqRel) == 1 {
+                tracing::debug!("write_pages_vectored: run complete");
+                done_cl.store(true, Ordering::Release);
+            }
+        });
+        let io_ctx = pager.io_ctx.read();
+        let bufs = std::mem::replace(&mut run_bufs, Vec::with_capacity(EST_BUFF_CAPACITY));
+        match pager
+            .db_file
+            .write_pages(start_id, page_sz, bufs, &io_ctx, cmp)
+        {
+            Ok(c) => completions.push(c),
+            Err(e) => {
+                // We failed to submit this run at all. Mark batch failed+done and cancel already-submitted.
+                let _ = err.set(CompletionError::Aborted);
+                done_flag.store(true, Ordering::Release);
+                pager.io.cancel(&completions)?;
+                pager.io.drain()?;
+                return Err(e);
+            }
         }
     }
-
-    tracing::debug!("write_pages_vectored: total runs={run_count}");
     Ok(completions)
 }
 
