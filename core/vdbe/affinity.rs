@@ -188,7 +188,12 @@ impl Affinity {
                         .flatten()
                         .map(Either::Right)
                 } else {
-                    None
+                    match val {
+                        ValueRef::Integer(_) | ValueRef::Float(_) => {
+                            stringify_register(val).map(Either::Right)
+                        }
+                        _ => None,
+                    }
                 }
             }
 

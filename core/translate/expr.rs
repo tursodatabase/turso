@@ -238,6 +238,8 @@ fn translate_in_list(
     let mut check_null_reg = 0;
     let label_ok = program.allocate_label();
 
+    let affinity = get_expr_affinity(lhs, referenced_tables);
+
     if condition_metadata.jump_target_when_false != condition_metadata.jump_target_when_null {
         check_null_reg = program.alloc_register();
         program.emit_insn(Insn::BitAnd {
@@ -268,8 +270,7 @@ fn translate_in_list(
                     lhs: lhs_reg,
                     rhs: rhs_reg,
                     target_pc: label_ok,
-                    // Use affinity instead
-                    flags: CmpInsFlags::default(),
+                    flags: CmpInsFlags::default().with_affinity(affinity),
                     collation: program.curr_collation(),
                 });
             } else {
@@ -284,7 +285,7 @@ fn translate_in_list(
                 lhs: lhs_reg,
                 rhs: rhs_reg,
                 target_pc: condition_metadata.jump_target_when_false,
-                flags: CmpInsFlags::default(),
+                flags: CmpInsFlags::default().with_affinity(affinity),
                 collation: program.curr_collation(),
             });
         } else {
