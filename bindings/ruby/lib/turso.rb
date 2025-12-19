@@ -25,8 +25,22 @@ module Turso
     _native_setup(level.to_s.downcase, @logger_callback)
     @setup_called = true
 
-    # Clear the callback before Ruby exits to prevent segfaults during VM teardown
-    at_exit { _clear_logger }
+    # Start a background thread to consume logs from the native queue
+    @log_thread = Thread.new do
+      Thread.current.name = "turso-logger" if Thread.current.respond_to?(:name=)
+      loop do
+        _native_poll_logs
+        sleep 0.05
+      end
+    rescue StandardError => e
+      warn "[Turso] Internal logger thread failed: #{e.message}"
+    end
+
+    # Clear the callback and stop the thread before Ruby exits 
+    at_exit do
+      _clear_logger
+      @log_thread&.kill
+    end
     true
   end
 
