@@ -1,5 +1,5 @@
 use magnus::{
-    function, method, prelude::*, value::Opaque, Error, Module, RModule, Ruby, Symbol, Value,
+    function, gc, method, prelude::*, value::Opaque, Error, Module, RModule, Ruby, Symbol, Value,
 };
 use once_cell::sync::Lazy;
 use std::sync::Mutex;
@@ -55,26 +55,36 @@ impl RbTursoLog {
 }
 
 pub fn _native_setup(ruby: &Ruby, level: String, callback: Value) -> Result<(), Error> {
+  
+    gc::register_mark_object(callback);
+
     let mut logger_guard = LOGGER_CALLBACK.lock().unwrap();
     *logger_guard = Some(Opaque::from(callback));
 
     rsapi::turso_setup(rsapi::TursoSetupConfig {
         logger: Some(Box::new(move |log| {
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                // check if the Ruby VM is available and we are on a Ruby thread
                 let Ok(ruby) = Ruby::get() else { return };
-                
+
                 let Ok(callback_guard) = LOGGER_CALLBACK.try_lock() else { return };
                 let Some(opaque_callback) = *callback_guard else { return };
-                
+
                 let callback = ruby.get_inner(opaque_callback);
                 if callback.is_nil() {
                     return;
                 }
-                
+
                 let rb_log = RbTursoLog::new(log);
                 let rb_log_obj = ruby.obj_wrap(rb_log);
-                let _: Result<Value, Error> = callback.funcall("call", (rb_log_obj,));
-            }));
+
+                if let Err(e) = callback.funcall::<_, _, Value>("call", (rb_log_obj,)) {
+                    eprintln!("[Turso] Logger callback failed: {}", e);
+                }
+            }))
+            .map_err(|e| {
+                eprintln!("[Turso] Logger callback panicked: {:?}", e);
+            });
         })),
         log_level: Some(level),
     })

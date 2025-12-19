@@ -115,8 +115,9 @@ pub fn map_turso_error(err: TursoError) -> Error {
 
     let message = err.message.clone().unwrap_or_default();
 
-    // Log the error before raising it to Ruby
-    tracing::error!(
+    // Log the error before raising it to Ruby. We use WARN here because 
+    // these are mapped to Ruby exceptions which might be handled.
+    tracing::warn!(
         target: "turso::ruby",
         error_code = code_str,
         error_message = %message,
