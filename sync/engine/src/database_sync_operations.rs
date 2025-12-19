@@ -343,18 +343,28 @@ pub async fn wal_pull_to_file_v1<IO: SyncEngineIo, Ctx>(
     })
 }
 
-/// Pull pages from remote
+#[derive(Debug)]
+pub struct PulledPage {
+    pub page_id: u64,
+    pub page: Vec<u8>,
+}
+
+#[derive(Debug)]
+pub struct PulledPages {
+    pub db_pages: u64,
+    pub pages: Vec<PulledPage>,
+}
+
+/// Pull pages from remote, pages slice must be non-empty
 pub async fn pull_pages_v1<IO: SyncEngineIo, Ctx>(
     coro: &Coro<Ctx>,
     client: &SyncEngineIoStats<IO>,
     server_revision: &str,
     pages: &[u32],
-) -> Result<Vec<(u64, Vec<u8>)>> {
+) -> Result<PulledPages> {
     tracing::info!("pull_pages_v1: revision={server_revision}, pages={pages:?}");
 
-    if pages.is_empty() {
-        return Ok(Vec::new());
-    }
+    assert!(!pages.is_empty(), "pages must be non-empty");
 
     let mut bytes = BytesMut::new();
 
@@ -416,13 +426,16 @@ pub async fn pull_pages_v1<IO: SyncEngineIo, Ctx>(
                 PAGE_SIZE
             )));
         }
-        pages.push((page_id, page));
+        pages.push(PulledPage { page_id, page });
         page_data_opt =
             wait_proto_message(coro, &completion, &client.network_stats, &mut bytes).await?;
         tracing::info!("page_data_opt: {}", page_data_opt.is_some());
     }
 
-    Ok(pages)
+    Ok(PulledPages {
+        db_pages: header.db_size,
+        pages,
+    })
 }
 
 /// Pull updates from remote to the separate file

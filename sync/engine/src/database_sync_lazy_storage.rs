@@ -1,6 +1,6 @@
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex},
+    sync::{atomic::AtomicU64, Arc, Mutex},
 };
 
 use turso_core::{
@@ -219,6 +219,7 @@ impl Drop for PageStatesGuard {
 }
 
 pub struct LazyDatabaseStorage<IO: SyncEngineIo> {
+    clean_file_size: Arc<AtomicU64>,
     clean_file: Arc<dyn File>,
     dirty_file: Option<Arc<dyn File>>,
     sync_engine_io: SyncEngineIoStats<IO>,
@@ -234,15 +235,17 @@ impl<IO: SyncEngineIo> LazyDatabaseStorage<IO> {
         sync_engine_io: SyncEngineIoStats<IO>,
         server_revision: String,
         opts: PartialSyncOpts,
-    ) -> Self {
-        Self {
+    ) -> Result<Self, errors::Error> {
+        let clean_file_size = Arc::new(clean_file.size()?.into());
+        Ok(Self {
+            clean_file_size,
             clean_file,
             dirty_file,
             sync_engine_io,
             server_revision,
             opts,
             page_states: Arc::new(Mutex::new(PageStates::new())),
-        }
+        })
     }
 }
 
@@ -262,6 +265,16 @@ async fn lazy_load_pages<IO: SyncEngineIo, Ctx>(
         &page_states_guard.pages_to_load,
         server_revision
     );
+
+    let mut completion_data = None;
+    if page_states_guard.pages_to_load.is_empty() {
+        assert!(
+            completion_page.is_none(),
+            "completion page must be unset if no pages requested"
+        );
+        return Ok(completion_data);
+    }
+
     let loaded = pull_pages_v1(
         coro,
         sync_engine_io,
@@ -270,10 +283,9 @@ async fn lazy_load_pages<IO: SyncEngineIo, Ctx>(
     )
     .await?;
 
-    let mut completion_data = None;
-
     let page_buffer = Arc::new(Buffer::new_temporary(PAGE_SIZE));
-    for (page_id, page) in loaded {
+    for loaded_page in loaded.pages {
+        let (page_id, page) = (loaded_page.page_id, loaded_page.page);
         page_buffer.as_mut_slice().copy_from_slice(&page);
 
         if Some(page_id as u32) == completion_page {
@@ -311,6 +323,13 @@ async fn lazy_load_pages<IO: SyncEngineIo, Ctx>(
             dirty_file.punch_hole(page_offset as usize, page.len())?;
         }
         page_states_guard.load_end(page_id as usize, Ok(page));
+    }
+
+    if let Some(completion_page) = completion_page {
+        assert!(
+            completion_data.is_some() || completion_page as u64 >= loaded.db_pages,
+            "completion_data can be none only if page is outside of remote server db size"
+        );
     }
 
     Ok(completion_data)
@@ -366,7 +385,7 @@ async fn read_page<Ctx, IO: SyncEngineIo>(
             }
         }
 
-        let Some(page_data) = lazy_load_pages(
+        match lazy_load_pages(
             coro,
             sync_engine_io,
             clean_file.clone(),
@@ -376,10 +395,14 @@ async fn read_page<Ctx, IO: SyncEngineIo>(
             Some(page as u32),
         )
         .await?
-        else {
-            panic!("page_data must be set for completion");
-        };
-        page_data
+        {
+            Some(page_data) => page_data,
+            None => {
+                tracing::info!("read_page(page={page}): no page was fetched from server");
+                c.complete(0);
+                return Ok(());
+            }
+        }
     };
 
     let buffer = Arc::new(Buffer::new(data));
@@ -477,6 +500,15 @@ impl<IO: SyncEngineIo> DatabaseStorage for LazyDatabaseStorage<IO> {
             return Err(LimboError::IntegerOverflow);
         };
 
+        if page_offset
+            >= self
+                .clean_file_size
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            c.complete(0);
+            return Ok(c);
+        }
+
         // we can't put this logic in the generator below for now, because otherwise initialization of database will stuck
         // (the problem is that connection creation use blocking IO in some code pathes, and in this case we will be unable to spin sync engine specific callbacks)
         let is_hole = self
@@ -519,6 +551,11 @@ impl<IO: SyncEngineIo> DatabaseStorage for LazyDatabaseStorage<IO> {
             }
         }
 
+        tracing::info!(
+            "read_page(page={}): is_hole={}, creating generator",
+            page,
+            is_hole
+        );
         let mut generator = genawaiter::sync::Gen::new({
             let sync_engine_io = self.sync_engine_io.clone();
             let server_revision = self.server_revision.clone();
@@ -577,7 +614,7 @@ impl<IO: SyncEngineIo> DatabaseStorage for LazyDatabaseStorage<IO> {
         assert!(buffer_size >= 512);
         assert!(buffer_size <= 65536);
         assert_eq!(buffer_size & (buffer_size - 1), 0);
-        let Some(pos) = (page_idx as u64 - 1).checked_mul(buffer_size as u64) else {
+        let Some(start_pos) = (page_idx as u64 - 1).checked_mul(buffer_size as u64) else {
             return Err(LimboError::IntegerOverflow);
         };
 
@@ -588,9 +625,18 @@ impl<IO: SyncEngineIo> DatabaseStorage for LazyDatabaseStorage<IO> {
 
         // we write to the database only during checkpoint - so we need to punch hole in the dirty file in order to mark this region as valid
         if let Some(dirty_file) = &self.dirty_file {
-            dirty_file.punch_hole(pos as usize, buffer_size)?;
+            dirty_file.punch_hole(start_pos as usize, buffer_size)?;
         }
-        self.clean_file.pwrite(pos, buffer, c)
+        let end_pos = start_pos + buffer_size as u64;
+        let clean_file_size = self.clean_file_size.clone();
+        let nc = Completion::new_write(move |result| match result {
+            Ok(code) => {
+                c.complete(code);
+                clean_file_size.fetch_max(end_pos, std::sync::atomic::Ordering::SeqCst);
+            }
+            Err(err) => c.error(err),
+        });
+        self.clean_file.pwrite(start_pos, buffer, nc)
     }
 
     fn write_pages(
@@ -611,16 +657,24 @@ impl<IO: SyncEngineIo> DatabaseStorage for LazyDatabaseStorage<IO> {
         assert!(page_size <= 65536);
         assert_eq!(page_size & (page_size - 1), 0);
 
-        let Some(pos) = (first_page_idx as u64 - 1).checked_mul(page_size as u64) else {
+        let Some(start_pos) = (first_page_idx as u64 - 1).checked_mul(page_size as u64) else {
             return Err(LimboError::IntegerOverflow);
         };
+        let buffers_size = buffers.iter().map(|b| b.len()).sum();
+        let end_pos = start_pos + buffers_size as u64;
         // we write to the database only during checkpoint - so we need to punch hole in the dirty file in order to mark this region as valid
         if let Some(dirty_file) = &self.dirty_file {
-            let buffers_size = buffers.iter().map(|b| b.len()).sum();
-            dirty_file.punch_hole(pos as usize, buffers_size)?;
+            dirty_file.punch_hole(start_pos as usize, buffers_size)?;
         }
-        let c = self.clean_file.pwritev(pos, buffers, c)?;
-        Ok(c)
+        let clean_file_size = self.clean_file_size.clone();
+        let nc = Completion::new_write(move |result| match result {
+            Ok(code) => {
+                c.complete(code);
+                clean_file_size.fetch_max(end_pos, std::sync::atomic::Ordering::SeqCst);
+            }
+            Err(err) => c.error(err),
+        });
+        self.clean_file.pwritev(start_pos, buffers, nc)
     }
 
     fn sync(&self, c: turso_core::Completion) -> turso_core::Result<turso_core::Completion> {
@@ -652,6 +706,14 @@ impl<IO: SyncEngineIo> DatabaseStorage for LazyDatabaseStorage<IO> {
             );
         }
 
-        self.clean_file.truncate(len as u64, c)
+        let clean_file_size = self.clean_file_size.clone();
+        let nc = Completion::new_trunc(move |result| match result {
+            Ok(code) => {
+                clean_file_size.store(len as u64, std::sync::atomic::Ordering::SeqCst);
+                c.complete(code);
+            }
+            Err(err) => c.error(err),
+        });
+        self.clean_file.truncate(len as u64, nc)
     }
 }
