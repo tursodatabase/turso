@@ -1134,6 +1134,10 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                     let _ = self.index_iterator.take();
                     self.reset_dual_peek();
                     self.invalidate_record();
+                    // We need to clear the null flag for the table cursor before seeking,
+                    // because it might have been set to false by an unmatched left-join row during the previous iteration
+                    // on the outer loop.
+                    self.set_null_flag(false);
 
                     let direction = op.iteration_direction();
                     let inclusive = matches!(op, SeekOp::GE { .. } | SeekOp::LE { .. });
