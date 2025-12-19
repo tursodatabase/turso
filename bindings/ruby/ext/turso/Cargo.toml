@@ -13,6 +13,7 @@ crate-type = ["cdylib"]
 magnus = { version = "0.8.2", features = ["rb-sys"] }
 turso_sdk_kit = { path = "../../../../sdk-kit" }
 turso_core = { path = "../../../../core" }
+once_cell = "1.21.3"
 
 [build-dependencies]
 rb-sys-env = "0.2.2"

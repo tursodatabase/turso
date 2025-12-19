@@ -1492,6 +1492,7 @@ name = "turso-ruby"
 version = "0.1.0"
 dependencies = [
  "magnus",
+ "once_cell",
  "rb-sys-env",
  "turso_core",
  "turso_sdk_kit",

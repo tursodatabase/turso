@@ -5,6 +5,7 @@ mod database;
 mod errors;
 mod statement;
 mod value;
+mod setup;
 
 #[magnus::init(name = "turso")]
 fn init(ruby: &Ruby) -> Result<(), Error> {
@@ -13,5 +14,6 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     database::define_database(ruby, &module)?;
     connection::define_connection(ruby, &module)?;
     statement::define_statement(ruby, &module)?;
+    setup::init(ruby, module)?;
     Ok(())
 }
