@@ -389,15 +389,15 @@ pub unsafe extern "C" fn sqlite3_step(stmt: *mut sqlite3_stmt) -> ffi::c_int {
     match res {
         Ok(Some(_)) => {
             stmt.clear_text_cache();
-            return SQLITE_ROW;
+            SQLITE_ROW
         }
         Ok(None) => {
             stmt.clear_text_cache();
-            return SQLITE_DONE;
+            SQLITE_DONE
         }
-        Err(LimboError::Busy) => return SQLITE_BUSY,
-        Err(LimboError::Interrupt) => return SQLITE_INTERRUPT,
-        Err(err) => return handle_limbo_err(err, std::ptr::null_mut()),
+        Err(LimboError::Busy) => SQLITE_BUSY,
+        Err(LimboError::Interrupt) => SQLITE_INTERRUPT,
+        Err(err) => handle_limbo_err(err, std::ptr::null_mut()),
     }
 }
 

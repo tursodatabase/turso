@@ -1,4 +1,4 @@
-use crate::schema::{Schema, DBSP_TABLE_PREFIX};
+use crate::schema::{Schema, SchemaObjectType, DBSP_TABLE_PREFIX};
 use crate::storage::pager::CreateBTreeFlags;
 use crate::translate::emitter::Resolver;
 use crate::translate::schema::{emit_schema_entry, SchemaEntryType, SQLITE_TABLEID};
@@ -244,15 +244,26 @@ pub fn translate_create_view(
 ) -> Result<ProgramBuilder> {
     let normalized_view_name = normalize_ident(view_name.as_str());
 
-    // Check if view already exists
-    if resolver.schema.get_view(&normalized_view_name).is_some()
-        || resolver
-            .schema
-            .get_materialized_view(&normalized_view_name)
-            .is_some()
+    // Check for name conflicts with existing schema objects
+    if let Some(object_type) = resolver.schema.get_object_type(&normalized_view_name) {
+        let type_str = match object_type {
+            SchemaObjectType::Table => "table",
+            SchemaObjectType::View => "view",
+            SchemaObjectType::Index => "index",
+        };
+        return Err(crate::LimboError::ParseError(format!(
+            "{type_str} {normalized_view_name} already exists"
+        )));
+    }
+
+    // Also check materialized views (not in get_object_type since they're stored differently)
+    if resolver
+        .schema
+        .get_materialized_view(&normalized_view_name)
+        .is_some()
     {
         return Err(crate::LimboError::ParseError(format!(
-            "View {normalized_view_name} already exists"
+            "view {normalized_view_name} already exists"
         )));
     }
 
