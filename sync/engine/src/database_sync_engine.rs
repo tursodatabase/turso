@@ -360,7 +360,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 partial_bootstrap_opts
                     .clone()
                     .expect("partial sync opts are set here"),
-            ))
+            )?)
         } else {
             Arc::new(turso_core::storage::database::DatabaseFile::new(db_file))
         };
