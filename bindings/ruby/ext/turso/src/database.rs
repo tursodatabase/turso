@@ -5,7 +5,7 @@ use turso_sdk_kit::rsapi::{TursoDatabase, TursoDatabaseConfig};
 use crate::connection::RbConnection;
 use crate::errors::map_turso_error;
 
-#[magnus::wrap(class = "Turso::Database", free_immediately, size)]
+#[magnus::wrap(class = "Turso::RbDatabase", free_immediately, size)]
 pub struct RbDatabase {
     inner: Arc<TursoDatabase>,
 }
@@ -38,7 +38,7 @@ impl RbDatabase {
 }
 
 pub fn define_database(ruby: &Ruby, module: &impl Module) -> Result<(), Error> {
-    let class = module.define_class("Database", ruby.class_object())?;
+    let class = module.define_class("RbDatabase", ruby.class_object())?;
     class.define_singleton_method("open", function!(RbDatabase::open, 1))?;
     class.define_method("connect", method!(RbDatabase::connect, 0))?;
     class.define_method("close", method!(RbDatabase::close, 0))?;

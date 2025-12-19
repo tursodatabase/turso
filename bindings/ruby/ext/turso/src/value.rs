@@ -54,6 +54,23 @@ pub fn extract_row(stmt: &TursoStatement) -> Result<RHash, Error> {
     Ok(hash)
 }
 
+/// Extract current row as an array of values.
+pub fn extract_row_array(stmt: &TursoStatement) -> Result<magnus::RArray, Error> {
+    let ruby = Ruby::get().expect("Ruby not initialized");
+    let arr = ruby.ary_new();
+    let count = stmt.column_count();
+
+    for i in 0..count {
+        let val = turso_to_ruby(
+            &ruby,
+            stmt.row_value(i).map_err(crate::errors::map_turso_error)?,
+        )?;
+        arr.push(val)?;
+    }
+
+    Ok(arr)
+}
+
 fn turso_to_ruby(ruby: &Ruby, value: turso_core::ValueRef) -> Result<Value, Error> {
     use turso_core::ValueRef;
 
