@@ -1,10 +1,10 @@
-use magnus::{block::Proc, method, Error, Module, RArray, Ruby, TryConvert, Value};
+use magnus::{block::Proc, method, Error, Module, Ruby, TryConvert, Value};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use turso_sdk_kit::rsapi::{TursoConnection, TursoStatusCode};
 
 use crate::errors::map_turso_error;
-use crate::statement::RbStatement;
+use crate::statement::{RbExecutionResult, RbStatement};
 use crate::value;
 
 #[magnus::wrap(class = "Turso::Connection", free_immediately, size)]
@@ -41,7 +41,7 @@ impl RbConnection {
         Ok(RbStatement::new(stmt))
     }
 
-    pub fn execute(&self, args: &[Value]) -> Result<RArray, Error> {
+    pub fn execute(&self, args: &[Value]) -> Result<RbExecutionResult, Error> {
         self.ensure_open()?;
 
         if args.is_empty() {
@@ -52,7 +52,6 @@ impl RbConnection {
             ));
         }
 
-        let ruby = Ruby::get().expect("Ruby not initialized");
         let sql: String = String::try_convert(args[0])?;
         let mut stmt = self.inner.prepare_single(&sql).map_err(map_turso_error)?;
 
@@ -60,30 +59,8 @@ impl RbConnection {
             value::bind_value(&mut stmt, i + 1, *arg)?;
         }
 
-        let results = ruby.ary_new();
-
-        loop {
-            match stmt.step().map_err(map_turso_error)? {
-                TursoStatusCode::Row => {
-                    let row = value::extract_row(&stmt)?;
-                    results.push(row)?;
-                }
-                TursoStatusCode::Done => break,
-                TursoStatusCode::Io => {
-                    stmt.run_io().map_err(map_turso_error)?;
-                }
-                _ => break,
-            }
-        }
-
-        stmt.finalize().map_err(map_turso_error)?;
-
-        // Note: sdk-kit's TursoStatement doesn't expose n_change() after stepping.
-        // For proper DML change count, sdk-kit would need to expose this.
-        // Using 0 for now - users can check last_insert_row_id for INSERT confirmation.
-        self.last_changes.store(0, Ordering::Relaxed);
-
-        Ok(results)
+        let result = stmt.execute().map_err(map_turso_error)?;
+        Ok(RbExecutionResult::from_rsapi(result.rows_changed))
     }
 
     pub fn transaction(&self, block: Proc) -> Result<Value, Error> {

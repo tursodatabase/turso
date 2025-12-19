@@ -1,3 +1,4 @@
+use magnus::prelude::*;
 use magnus::{method, Error, Module, RArray, Ruby, Value};
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -5,6 +6,21 @@ use turso_sdk_kit::rsapi::{TursoStatement, TursoStatusCode};
 
 use crate::errors::{map_turso_error, statement_closed_error};
 use crate::value;
+
+#[magnus::wrap(class = "Turso::ExecutionResult", free_immediately, size)]
+pub struct RbExecutionResult {
+    rows_changed: u64,
+}
+
+impl RbExecutionResult {
+    pub(crate) fn from_rsapi(rows_changed: u64) -> Self {
+        Self { rows_changed }
+    }
+
+    pub fn rows_changed(&self) -> u64 {
+        self.rows_changed
+    }
+}
 
 #[magnus::wrap(class = "Turso::Statement", free_immediately, size)]
 pub struct RbStatement {
@@ -52,20 +68,14 @@ impl RbStatement {
         }
     }
 
-    pub fn execute(&self, args: &[Value]) -> Result<RArray, Error> {
+    pub fn execute(&self, args: &[Value]) -> Result<RbExecutionResult, Error> {
         self.ensure_open()?;
         self.bind(args)?;
 
-        let ruby = Ruby::get().expect("Ruby not initialized");
-        let results = ruby.ary_new();
-        while self.step()? {
-            let stmt = self.inner.borrow();
-            let row = value::extract_row(&stmt)?;
-            results.push(row)?;
-        }
-
-        self.inner.borrow_mut().reset().map_err(map_turso_error)?;
-        Ok(results)
+        let result = self.inner.borrow_mut().execute().map_err(map_turso_error)?;
+        Ok(RbExecutionResult {
+            rows_changed: result.rows_changed,
+        })
     }
 
     pub fn columns(&self) -> Result<RArray, Error> {
@@ -81,6 +91,12 @@ impl RbStatement {
         }
 
         Ok(cols)
+    }
+
+    pub fn row(&self) -> Result<Value, Error> {
+        self.ensure_open()?;
+        let stmt = self.inner.borrow();
+        value::extract_row(&stmt).map(|h| h.as_value())
     }
 
     pub fn reset(&self) -> Result<(), Error> {
@@ -109,10 +125,14 @@ impl Drop for RbStatement {
 }
 
 pub fn define_statement(ruby: &Ruby, module: &impl Module) -> Result<(), Error> {
+    let result_class = module.define_class("ExecutionResult", ruby.class_object())?;
+    result_class.define_method("rows_changed", method!(RbExecutionResult::rows_changed, 0))?;
+
     let class = module.define_class("Statement", ruby.class_object())?;
     class.define_method("bind", method!(RbStatement::bind, -1))?;
     class.define_method("step", method!(RbStatement::step, 0))?;
     class.define_method("execute", method!(RbStatement::execute, -1))?;
+    class.define_method("row", method!(RbStatement::row, 0))?;
     class.define_method("columns", method!(RbStatement::columns, 0))?;
     class.define_method("reset!", method!(RbStatement::reset, 0))?;
     class.define_method("finalize!", method!(RbStatement::finalize, 0))?;
