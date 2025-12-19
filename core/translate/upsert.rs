@@ -479,6 +479,7 @@ pub fn emit_upsert(
                 check_generated: true,
                 table_reference: Arc::clone(&bt),
             });
+        } else {
         }
     }
 

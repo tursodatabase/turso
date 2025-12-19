@@ -380,6 +380,7 @@ pub fn translate_insert(
             check_generated: true,
             table_reference: Arc::clone(ctx.table),
         });
+    } else {
     }
 
     // Build a list of upsert constraints/indexes we need to run preflight

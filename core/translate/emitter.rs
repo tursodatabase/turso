@@ -2167,6 +2167,7 @@ fn emit_update_insns<'a>(
                 check_generated: true,
                 table_reference: Arc::clone(&btree_table),
             });
+        } else {
         }
 
         if has_user_provided_rowid {
