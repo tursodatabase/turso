@@ -484,15 +484,15 @@ pub fn emit_upsert(
             // For non-STRICT tables, apply column affinity to the values.
             // This must happen early so that both index records and the table record
             // use the converted values.
-            let affinity_str: String = bt.columns.iter().map(|c| c.affinity().aff_mask()).collect();
+            let affinity = bt.columns.iter().map(|c| c.affinity());
 
             // Only emit Affinity if there's meaningful affinity to apply
-            if affinity_str.chars().any(|c| c != Affinity::Blob.aff_mask()) {
+            if affinity.clone().any(|a| a != Affinity::Blob) {
                 if let Ok(count) = std::num::NonZeroUsize::try_from(num_cols) {
                     program.emit_insn(Insn::Affinity {
                         start_reg: new_start,
                         count,
-                        affinities: affinity_str,
+                        affinities: affinity.map(|a| a.aff_mask()).collect(),
                     });
                 }
             }

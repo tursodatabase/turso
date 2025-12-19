@@ -737,28 +737,22 @@ pub fn translate_expr(
                     // Compute and apply affinity for the LHS columns before the index probe.
                     // This follows SQLite's approach where OP_Affinity is emitted before
                     // Found/NotFound operations on ephemeral indices for IN subqueries.
-                    let affinity_str: String = lhs_columns
+
+                    let affinity = lhs_columns
                         .iter()
-                        .map(|col| get_expr_affinity(col, referenced_tables).aff_mask())
-                        .collect();
+                        .map(|col| get_expr_affinity(col, referenced_tables));
 
                     // Only emit Affinity instruction if there's meaningful affinity to apply
                     // (i.e., not all BLOB/NONE affinity)
-                    if affinity_str.chars().any(|c| c != Affinity::Blob.aff_mask()) {
+                    if affinity.clone().any(|a| a != Affinity::Blob) {
                         if let Ok(count) = std::num::NonZeroUsize::try_from(lhs_column_count) {
                             program.emit_insn(Insn::Affinity {
                                 start_reg: lhs_column_regs_start,
                                 count,
-                                affinities: affinity_str,
+                                affinities: affinity.clone().map(|a| a.aff_mask()).collect(),
                             });
                         }
                     }
-
-                    // Pre-compute affinities for each LHS column for use in the null-check loop
-                    let lhs_affinities: Vec<Affinity> = lhs_columns
-                        .iter()
-                        .map(|col| get_expr_affinity(col, referenced_tables))
-                        .collect();
 
                     if *not_in {
                         // WHERE ... NOT IN (SELECT ...)
@@ -794,7 +788,7 @@ pub fn translate_expr(
                         });
                         program.preassign_label_to_next_insn(label_null_checks_loop_start);
                         let column_check_reg = program.alloc_register();
-                        for i in 0..lhs_column_count {
+                        for (i, affinity) in affinity.enumerate().take(lhs_column_count) {
                             program.emit_insn(Insn::Column {
                                 cursor_id: *cursor_id,
                                 column: i,
@@ -802,7 +796,6 @@ pub fn translate_expr(
                                 default: None,
                             });
                             // Apply affinity to the comparison for proper type coercion
-                            let affinity = lhs_affinities[i];
                             program.emit_insn(Insn::Ne {
                                 lhs: lhs_column_regs_start + i,
                                 rhs: column_check_reg,

@@ -1763,19 +1763,15 @@ fn emit_update_insns<'a>(
     // use the converted values.
     if let Some(btree_table) = target_table.table.btree() {
         if !btree_table.is_strict {
-            let affinity_str: String = btree_table
-                .columns
-                .iter()
-                .map(|c| c.affinity().aff_mask())
-                .collect();
+            let affinity = btree_table.columns.iter().map(|c| c.affinity());
 
             // Only emit Affinity if there's meaningful affinity to apply
-            if affinity_str.chars().any(|c| c != Affinity::Blob.aff_mask()) {
+            if affinity.clone().any(|a| a != Affinity::Blob) {
                 if let Ok(count) = std::num::NonZeroUsize::try_from(col_len) {
                     program.emit_insn(Insn::Affinity {
                         start_reg: start,
                         count,
-                        affinities: affinity_str,
+                        affinities: affinity.map(|a| a.aff_mask()).collect(),
                     });
                 }
             }
