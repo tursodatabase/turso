@@ -1116,8 +1116,8 @@ pub struct RowidAllocator {
     /// In case of unitialized values, we will look for last rowid first.
     lock: TursoRwLock,
     /// last_rowid is the last rowid that was allocated.
-    last_rowid: RwLock<Option<i64>>,
-    intialized: AtomicBool,
+    max_rowid: RwLock<Option<i64>>,
+    initialized: AtomicBool,
 }
 
 /// A multi-version concurrency control database.
@@ -2782,8 +2782,8 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         } else {
             let allocator = Arc::new(RowidAllocator {
                 lock: TursoRwLock::new(),
-                last_rowid: RwLock::new(None),
-                intialized: AtomicBool::new(false),
+                max_rowid: RwLock::new(None),
+                initialized: AtomicBool::new(false),
             });
             map.insert(*table_id, allocator.clone());
             allocator
@@ -2795,7 +2795,7 @@ impl RowidAllocator {
     /// Returns None if no rowid could be allocated.
     /// Returns Some((new_rowid, prev_last_rowid)) where prev_last_rowid is None if table was empty
     pub fn get_next_rowid(&self) -> Option<(i64, Option<i64>)> {
-        let mut last_rowid_guard = self.last_rowid.write();
+        let mut last_rowid_guard = self.max_rowid.write();
         if last_rowid_guard.is_none() {
             // Case 1. Table is empty
             // Database is empty because there is no last rowid
@@ -2818,7 +2818,7 @@ impl RowidAllocator {
     }
 
     pub fn insert_row_id_maybe_update(&self, rowid: i64) {
-        let mut last_rowid = self.last_rowid.write();
+        let mut last_rowid = self.max_rowid.write();
         if let Some(last_rowid) = last_rowid.as_mut() {
             *last_rowid = (*last_rowid).max(rowid);
         } else {
@@ -2827,14 +2827,14 @@ impl RowidAllocator {
     }
 
     pub fn is_uninitialized(&self) -> bool {
-        !self.intialized.load(Ordering::SeqCst)
+        !self.initialized.load(Ordering::SeqCst)
     }
 
     pub fn initialize(&self, rowid: Option<i64>) {
         tracing::trace!("initialize({rowid:?})");
-        let mut last_rowid = self.last_rowid.write();
+        let mut last_rowid = self.max_rowid.write();
         *last_rowid = rowid;
-        self.intialized.store(true, Ordering::SeqCst);
+        self.initialized.store(true, Ordering::SeqCst);
     }
 
     pub fn lock(&self) -> bool {

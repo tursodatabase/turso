@@ -7021,7 +7021,7 @@ fn new_rowid_inner(
                     let cursor = cursor.as_btree_mut() as &mut dyn Any;
                     if let Some(mvcc_cursor) = cursor.downcast_mut::<MvCursor>() {
                         match return_if_io!(mvcc_cursor.start_new_rowid()) {
-                            NextRowidResult::Unitialized => {
+                            NextRowidResult::Uninitialized => {
                                 // we need to find last to initialize it
                                 state.op_new_rowid_state = OpNewRowidState::SeekingToLast {
                                     mvcc_already_initialized: false,

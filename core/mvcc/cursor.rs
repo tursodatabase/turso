@@ -13,7 +13,7 @@ use crate::types::{
     compare_immutable, IOCompletions, IOResult, ImmutableRecord, IndexInfo, RecordCursor, SeekKey,
     SeekOp, SeekResult,
 };
-use crate::{return_if_io, Completion, LimboError, Result};
+use crate::{return_if_io, turso_assert, Completion, LimboError, Result};
 use crate::{Pager, Value};
 use std::any::Any;
 use std::cell::{Ref, RefCell};
@@ -268,7 +268,7 @@ pub struct MvccLazyCursor<Clock: LogicalClock> {
 
 pub enum NextRowidResult {
     /// We need to go to the last rowid and intialize allocator
-    Unitialized,
+    Uninitialized,
     /// It was initialized, so we get a new rowid
     Next {
         new_rowid: i64,
@@ -390,29 +390,32 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
         tracing::trace!("start_new_rowid");
         let allocator = self.db.get_rowid_allocator(&self.table_id);
         let locked = allocator.lock();
-        if locked {
-            self.creating_new_rowid = true;
-            let res = if allocator.is_uninitialized() {
-                NextRowidResult::Unitialized
-            } else if let Some((next_rowid, prev_max_rowid)) = allocator.get_next_rowid() {
-                NextRowidResult::Next {
-                    new_rowid: next_rowid,
-                    prev_rowid: prev_max_rowid,
-                }
-            } else {
-                NextRowidResult::FindRandom
-            };
-            Ok(IOResult::Done(res))
-        } else {
+        if !locked {
             // Yield, some other cursor is generating new rowid
-            Ok(IOResult::IO(IOCompletions::Single(Completion::new_yield())))
+            return Ok(IOResult::IO(IOCompletions::Single(Completion::new_yield())));
         }
+
+        self.creating_new_rowid = true;
+        let res = if allocator.is_uninitialized() {
+            NextRowidResult::Uninitialized
+        } else if let Some((next_rowid, prev_max_rowid)) = allocator.get_next_rowid() {
+            NextRowidResult::Next {
+                new_rowid: next_rowid,
+                prev_rowid: prev_max_rowid,
+            }
+        } else {
+            NextRowidResult::FindRandom
+        };
+        Ok(IOResult::Done(res))
     }
 
     pub fn initialize_max_rowid(&mut self, max_rowid: Option<i64>) -> Result<()> {
         tracing::trace!("start_new_rowid");
         let allocator = self.db.get_rowid_allocator(&self.table_id);
-        assert!(self.creating_new_rowid);
+        turso_assert!(
+            self.creating_new_rowid,
+            "cursor didn't start creating new rowid"
+        );
         allocator.initialize(max_rowid);
         Ok(())
     }
@@ -422,6 +425,9 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
             "end_new_rowid creating_new_rowid={}",
             self.creating_new_rowid
         );
+        // if we started creating a new rowid, we need to unlock the allocator
+        // this might be false if there was an error during `op_new_rowid` before calling `start_new_rowid` so we can call this function
+        // in any case
         if self.creating_new_rowid {
             let allocator = self.db.get_rowid_allocator(&self.table_id);
             allocator.unlock();
