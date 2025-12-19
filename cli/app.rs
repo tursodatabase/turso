@@ -1113,7 +1113,7 @@ impl Limbo {
         let max_width = column_names.iter().map(|n| n.len()).max().unwrap_or(0);
         let formatted_columns: Vec<String> = column_names
             .iter()
-            .map(|n| format!("{:>width$}", n, width = max_width))
+            .map(|n| format!("{n:>max_width$}"))
             .collect();
         let null_value = self.opts.null_value.clone();
 

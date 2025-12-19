@@ -429,6 +429,7 @@ pub fn run_query_core(
     mut on_row: Option<impl FnMut(&Row)>,
 ) -> anyhow::Result<()> {
     if let Some(ref mut rows) = conn.query(query)? {
+        #[allow(clippy::type_complexity)]
         let handler: Box<dyn FnMut(&Row) -> turso_core::Result<()>> =
             if let Some(on_row) = on_row.as_mut() {
                 Box::new(|row| {
