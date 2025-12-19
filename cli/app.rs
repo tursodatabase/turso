@@ -1083,6 +1083,10 @@ impl Limbo {
                 IsTerminal::is_terminal(&std::io::stderr()),
             )
         };
+        let default_env_filter = EnvFilter::builder()
+            .with_default_directive(tracing::level_filters::LevelFilter::WARN.into())
+            .from_env_lossy();
+
         // Disable rustyline traces
         if let Err(e) = tracing_subscriber::registry()
             .with(
@@ -1092,11 +1096,7 @@ impl Limbo {
                     .with_thread_ids(true)
                     .with_ansi(should_emit_ansi),
             )
-            .with(
-                EnvFilter::from_default_env()
-                    .add_directive(tracing::level_filters::LevelFilter::WARN.into())
-                    .add_directive("rustyline=off".parse().unwrap()),
-            )
+            .with(default_env_filter.add_directive("rustyline=off".parse().unwrap()))
             .try_init()
         {
             println!("Unable to setup tracing appender: {e:?}");
