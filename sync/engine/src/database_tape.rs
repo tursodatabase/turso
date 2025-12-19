@@ -241,16 +241,22 @@ impl DatabaseWalSession {
         Ok(())
     }
 
-    pub fn rollback_page(&mut self, page_no: u32, frame_watermark: u64) -> Result<()> {
+    pub async fn rollback_page<Ctx>(
+        &mut self,
+        coro: &Coro<Ctx>,
+        page_no: u32,
+        frame_watermark: u64,
+    ) -> Result<()> {
         self.flush_prepared_frame(0)?;
 
         let conn = self.wal_session.conn();
         let mut frame = vec![0u8; WAL_FRAME_HEADER + self.page_size];
-        if conn.try_wal_watermark_read_page(
-            page_no,
-            &mut frame[WAL_FRAME_HEADER..],
-            Some(frame_watermark),
-        )? {
+        let (page_ref, c) =
+            conn.try_wal_watermark_read_page_begin(page_no, Some(frame_watermark))?;
+        while !c.succeeded() {
+            let _ = coro.yield_(SyncEngineIoResult::IO).await;
+        }
+        if conn.try_wal_watermark_read_page_end(&mut frame[WAL_FRAME_HEADER..], page_ref)? {
             tracing::trace!("rollback page {}", page_no);
             self.prepared_frame = Some((page_no, frame));
         } else {
@@ -263,13 +269,17 @@ impl DatabaseWalSession {
         Ok(())
     }
 
-    pub fn rollback_changes_after(&mut self, frame_watermark: u64) -> Result<usize> {
+    pub async fn rollback_changes_after<Ctx>(
+        &mut self,
+        coro: &Coro<Ctx>,
+        frame_watermark: u64,
+    ) -> Result<usize> {
         let conn = self.wal_session.conn();
         let pages = conn.wal_changed_pages_after(frame_watermark)?;
         tracing::info!("rolling back {} pages", pages.len());
         let pages_cnt = pages.len();
         for page_no in pages {
-            self.rollback_page(page_no, frame_watermark)?;
+            self.rollback_page(coro, page_no, frame_watermark).await?;
         }
         Ok(pages_cnt)
     }

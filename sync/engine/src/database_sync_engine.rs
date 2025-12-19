@@ -651,7 +651,13 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     );
                     continue;
                 }
-                if !main_conn.try_wal_watermark_read_page(page_no, &mut page, Some(watermark))? {
+
+                let (page_ref, c) =
+                    main_conn.try_wal_watermark_read_page_begin(page_no, Some(watermark))?;
+                while !c.succeeded() {
+                    let _ = coro.yield_(crate::types::SyncEngineIoResult::IO).await;
+                }
+                if !main_conn.try_wal_watermark_read_page_end(&mut page, page_ref)? {
                     tracing::info!(
                         "checkpoint(path={:?}): skip page {} as it was allocated in the wAL portion for revert",
                         self.main_db_path,
@@ -820,7 +826,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             watermark,
             main_conn.wal_state()?.max_frame
         );
-        let local_rollback = main_session.rollback_changes_after(watermark)?;
+        let local_rollback = main_session.rollback_changes_after(coro, watermark).await?;
         let mut frame = [0u8; WAL_FRAME_SIZE];
 
         let remote_rollback = revert_conn.wal_state()?.max_frame;
