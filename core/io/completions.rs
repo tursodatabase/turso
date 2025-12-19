@@ -401,7 +401,13 @@ impl Completion {
                     let _ = group.result.set(Some(err));
                 }
                 let prev = group.outstanding.fetch_sub(1, Ordering::SeqCst);
-
+                if prev > 1 {
+                    // progress wake so the waiter keeps driving io.step,
+                    // If prev > 1, there are still children outstanding after this one.
+                    if let Some(group_completion) = group.self_completion.get() {
+                        group_completion.wake();
+                    }
+                }
                 // If this was the last completion in the group, trigger the group's callback
                 // which will recursively call this same callback() method to notify parents
                 if prev == 1 {
