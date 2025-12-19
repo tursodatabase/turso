@@ -265,6 +265,16 @@ async fn lazy_load_pages<IO: SyncEngineIo, Ctx>(
         &page_states_guard.pages_to_load,
         server_revision
     );
+
+    let mut completion_data = None;
+    if page_states_guard.pages_to_load.is_empty() {
+        assert!(
+            completion_page.is_none(),
+            "completion page must be unset if no pages requested"
+        );
+        return Ok(completion_data);
+    }
+
     let loaded = pull_pages_v1(
         coro,
         sync_engine_io,
@@ -273,10 +283,9 @@ async fn lazy_load_pages<IO: SyncEngineIo, Ctx>(
     )
     .await?;
 
-    let mut completion_data = None;
-
     let page_buffer = Arc::new(Buffer::new_temporary(PAGE_SIZE));
-    for (page_id, page) in loaded {
+    for loaded_page in loaded.pages {
+        let (page_id, page) = (loaded_page.page_id, loaded_page.page);
         page_buffer.as_mut_slice().copy_from_slice(&page);
 
         if Some(page_id as u32) == completion_page {
@@ -314,6 +323,13 @@ async fn lazy_load_pages<IO: SyncEngineIo, Ctx>(
             dirty_file.punch_hole(page_offset as usize, page.len())?;
         }
         page_states_guard.load_end(page_id as usize, Ok(page));
+    }
+
+    if let Some(completion_page) = completion_page {
+        assert!(
+            completion_data.is_some() || completion_page as u64 >= loaded.db_pages,
+            "completion_data can be none only if page is outside of remote server db size"
+        );
     }
 
     Ok(completion_data)
