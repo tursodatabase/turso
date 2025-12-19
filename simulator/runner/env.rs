@@ -538,9 +538,7 @@ impl SimulatorEnv {
             io.clone(),
             db_path.to_str().unwrap(),
             turso_core::OpenFlags::default(),
-            turso_core::DatabaseOpts::new()
-                .with_mvcc(self.profile.experimental_mvcc)
-                .with_autovacuum(true),
+            turso_core::DatabaseOpts::new().with_autovacuum(true),
             None,
         ) {
             Ok(db) => db,
@@ -686,9 +684,7 @@ impl SimulatorEnv {
             io.clone(),
             db_path.to_str().unwrap(),
             turso_core::OpenFlags::default(),
-            turso_core::DatabaseOpts::new()
-                .with_mvcc(profile.experimental_mvcc)
-                .with_autovacuum(true),
+            turso_core::DatabaseOpts::new().with_autovacuum(true),
             None,
         ) {
             Ok(db) => db,
@@ -696,6 +692,15 @@ impl SimulatorEnv {
                 panic!("error opening simulator test file {db_path:?}: {e:?}");
             }
         };
+
+        // Switch to MVCC mode if the profile says to use MVCC
+        if profile.experimental_mvcc {
+            let conn = db
+                .connect()
+                .expect("Failed to create connection for MVCC setup");
+            conn.execute("PRAGMA journal_mode = 'experimental_mvcc'")
+                .expect("Failed to enable MVCC mode");
+        }
 
         let connections = (0..profile.max_connections)
             .map(|_| SimConnection::Disconnected)

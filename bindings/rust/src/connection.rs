@@ -230,6 +230,22 @@ impl Connection {
         Ok(())
     }
 
+    /// Set a pragma value.
+    pub fn pragma_update<V: std::fmt::Display>(
+        &self,
+        pragma_name: &str,
+        pragma_value: V,
+    ) -> Result<Vec<Row>> {
+        let conn = self.get_inner_connection()?;
+        let rows: Vec<Row> = conn
+            .pragma_update(pragma_name, pragma_value)
+            .map_err(|e| Error::SqlExecutionFailure(e.to_string()))?
+            .iter()
+            .map(|row| row.iter().collect::<Row>())
+            .collect();
+        Ok(rows)
+    }
+
     /// Returns the rowid of the last row inserted.
     pub fn last_insert_rowid(&self) -> i64 {
         let conn = self.get_inner_connection().unwrap();

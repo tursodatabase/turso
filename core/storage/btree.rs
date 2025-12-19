@@ -7851,7 +7851,7 @@ mod tests {
                 .unwrap();
         }
         let io: Arc<dyn IO> = Arc::new(PlatformIO::new().unwrap());
-        let db = Database::open_file(io.clone(), path.to_str().unwrap(), false).unwrap();
+        let db = Database::open_file(io.clone(), path.to_str().unwrap()).unwrap();
 
         db
     }
@@ -8153,7 +8153,7 @@ mod tests {
     fn empty_btree() -> (Arc<Pager>, i64, Arc<Database>, Arc<Connection>) {
         #[allow(clippy::arc_with_non_send_sync)]
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io.clone(), ":memory:", false).unwrap();
+        let db = Database::open_file(io.clone(), ":memory:").unwrap();
         let conn = db.connect().unwrap();
         let pager = conn.pager.load().clone();
 
@@ -8173,7 +8173,7 @@ mod tests {
     fn btree_with_virtual_page_1() -> Result<()> {
         #[allow(clippy::arc_with_non_send_sync)]
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io.clone(), ":memory:", false).unwrap();
+        let db = Database::open_file(io.clone(), ":memory:").unwrap();
         let conn = db.connect().unwrap();
         let pager = conn.pager.load().clone();
 

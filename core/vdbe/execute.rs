@@ -9810,10 +9810,8 @@ pub enum OpJournalModeSubState {
     Start,
     /// Checkpointing WAL/MVCC before mode change
     Checkpoint,
-    /// Update the header with new version
+    /// Update the header with new version and get page reference
     UpdateHeader,
-    /// Read page 1 for writing
-    ReadPage,
     /// Write page 1 to disk
     WritePage,
     /// Finalize - clear cache and setup new mode
@@ -9923,15 +9921,6 @@ fn op_journal_mode_inner(
                     return Err(LimboError::ReadOnly);
                 }
 
-                // Check MVCC enabled if switching to MVCC
-                if matches!(new_mode, journal_mode::JournalMode::ExperimentalMvcc)
-                    && !program.connection.db.mvcc_enabled()
-                {
-                    return Err(LimboError::InvalidArgument(
-                        "MVCC is not enabled. Enable it with `--experimental-mvcc` flag in the CLI or by setting the MVCC option in `DatabaseOpts`".to_string(),
-                    ));
-                }
-
                 state.op_journal_mode_state.new_mode = Some(new_mode);
                 state.op_journal_mode_state.sub_state = OpJournalModeSubState::Checkpoint;
             }
@@ -9979,24 +9968,22 @@ fn op_journal_mode_inner(
                     .expect("Should be a supported Journal Mode");
                 let raw_version = RawVersion::from(new_version);
 
-                // After checkpoint, pager holds the most up-to-date version of the Header
-                let header_result = pager.with_header_mut(|header| {
+                // Get the header page reference (handles both initialized and uninitialized databases)
+                // This uses the pager's cache and won't fail for empty database files
+                let header_ref =
+                    return_if_io!(crate::storage::pager::HeaderRefMut::from_pager(pager));
+
+                // Update the header version
+                {
+                    let header = header_ref.borrow_mut();
                     header.read_version = raw_version;
                     header.write_version = raw_version;
-                });
-                return_if_io!(header_result);
-                state.op_journal_mode_state.sub_state = OpJournalModeSubState::ReadPage;
-            }
-
-            OpJournalModeSubState::ReadPage => {
-                // Read page 1 for writing
-                let (page, completion) = pager.read_page(DatabaseHeader::PAGE_ID as i64)?;
-                state.op_journal_mode_state.page_ref = Some(page);
-                state.op_journal_mode_state.sub_state = OpJournalModeSubState::WritePage;
-
-                if let Some(c) = completion {
-                    return Ok(InsnFunctionStepResult::IO(IOCompletions::Single(c)));
                 }
+
+                // Save the page reference for writing
+                state.op_journal_mode_state.page_ref = Some(header_ref.page().clone());
+                // Skip ReadPage and go directly to WritePage
+                state.op_journal_mode_state.sub_state = OpJournalModeSubState::WritePage;
             }
 
             OpJournalModeSubState::WritePage => {

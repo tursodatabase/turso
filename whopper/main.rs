@@ -141,9 +141,7 @@ fn main() -> anyhow::Result<()> {
     };
 
     let db = {
-        let opts = DatabaseOpts::new()
-            .with_mvcc(args.enable_mvcc)
-            .with_encryption(encryption_opts.is_some());
+        let opts = DatabaseOpts::new().with_encryption(encryption_opts.is_some());
 
         match Database::open_file_with_flags(
             io.clone(),
@@ -165,6 +163,11 @@ fn main() -> anyhow::Result<()> {
             return Err(anyhow::anyhow!("Connection failed: {}", e));
         }
     };
+
+    // Enable MVCC if requested
+    if args.enable_mvcc {
+        boostrap_conn.execute("PRAGMA journal_mode = 'experimental_mvcc'")?;
+    }
 
     let schema = create_initial_schema(&mut rng);
     let tables = schema.iter().map(|t| t.table.clone()).collect::<Vec<_>>();

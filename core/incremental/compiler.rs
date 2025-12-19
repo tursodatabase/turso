@@ -1633,7 +1633,7 @@ impl DbspCompiler {
 
         // Create an internal connection for expression compilation
         let io = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io, ":memory:", false)?;
+        let db = Database::open_file(io, ":memory:")?;
         let internal_conn = db.connect()?;
         internal_conn.set_query_only(true);
         internal_conn.auto_commit.store(false, Ordering::SeqCst);
@@ -2557,7 +2557,7 @@ mod tests {
 
     fn setup_btree_for_circuit() -> (Arc<Pager>, i64, i64, i64) {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-        let db = Database::open_file(io.clone(), ":memory:", false).unwrap();
+        let db = Database::open_file(io.clone(), ":memory:").unwrap();
         let conn = db.connect().unwrap();
         let pager = conn.pager.load().clone();
 
