@@ -1862,7 +1862,6 @@ impl Connection {
 
     /// Try to read page with given ID with fixed WAL watermark position
     /// This method return false if page is not found (so, this is probably new page created after watermark position which wasn't checkpointed to the DB file yet)
-
     #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
     pub fn try_wal_watermark_read_page(
         &self,
