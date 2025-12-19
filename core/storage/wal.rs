@@ -5,6 +5,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use std::array;
 use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::sync::OnceLock;
 use strum::EnumString;
 use tracing::{instrument, Level};
 
@@ -492,9 +493,14 @@ struct OngoingCheckpoint {
     /// Read operations currently ongoing.
     inflight_reads: Vec<InflightRead>,
     /// Array of atomic counters representing write operations that are currently in flight.
-    inflight_writes: Vec<Arc<AtomicBool>>,
+    inflight_writes: Vec<InflightWriteBatch>,
     /// List of all page_id + frame_id combinations to be backfilled
     pages_to_checkpoint: Vec<(u64, u64)>,
+}
+
+struct InflightWriteBatch {
+    done: Arc<AtomicBool>,
+    err: Arc<std::sync::OnceLock<CompletionError>>,
 }
 
 impl OngoingCheckpoint {
@@ -543,38 +549,60 @@ impl OngoingCheckpoint {
     fn process_inflight_writes(&mut self) -> bool {
         let before_len = self.inflight_writes.len();
         self.inflight_writes
-            .retain(|done| !done.load(Ordering::Acquire));
+            .retain(|w| !w.done.load(Ordering::Acquire));
         before_len > self.inflight_writes.len()
     }
 
     #[inline]
     /// Remove any completed read operations from `inflight_reads`
     /// returns whether any progress was made.
-    fn process_pending_reads(&mut self) -> bool {
+    fn process_pending_reads(&mut self) -> Result<bool> {
         let mut moved = false;
-        // retain only those still pending
+        let mut err: Option<CompletionError> = None;
+
         self.inflight_reads.retain(|slot| {
+            if !slot.completion.finished() {
+                return true;
+            }
             if slot.completion.succeeded() {
                 if let Some(buf) = slot.buf.lock().take() {
-                    // read is done, take the buffer and add it to the batch to write
                     self.pending_writes.insert(slot.page_id, buf);
                     moved = true;
+                } else {
+                    err = Some(std::io::Error::other("read done but buf missing").into());
                 }
-                false
             } else {
-                true
+                err = Some(
+                    slot.completion
+                        .get_error()
+                        .unwrap_or_else(|| std::io::Error::other("wal read failed").into()),
+                );
             }
+            false
         });
-        moved
+        if let Some(e) = err {
+            return Err(LimboError::CompletionError(e));
+        }
+        Ok(moved)
     }
 
+    fn first_write_error(&self) -> Option<CompletionError>
+    where
+        CompletionError: Clone,
+    {
+        self.inflight_writes
+            .iter()
+            .find_map(|w| w.err.get().cloned())
+    }
+}
+
+impl InflightWriteBatch {
     #[inline]
-    /// Add an `inflight write` and return the Atomic counter used to
-    /// track it's completion.
-    fn add_write(&mut self) -> Arc<AtomicBool> {
-        let new = Arc::new(AtomicBool::new(false));
-        self.inflight_writes.push(new.clone());
-        new
+    fn new() -> InflightWriteBatch {
+        InflightWriteBatch {
+            done: Arc::new(AtomicBool::new(false)),
+            err: Arc::new(OnceLock::new()),
+        }
     }
 }
 
@@ -1590,6 +1618,8 @@ impl Wal for WalFile {
                 }
             };
 
+            // if DB size is included for commit frame, it will need to be included only in the last frame of the batch.
+            // however it might not be present in this batch so we cannot assert its presence
             let frame_db_size = if idx + 1 == pages.len() {
                 db_size_on_commit.unwrap_or(0)
             } else {
@@ -1622,8 +1652,8 @@ impl Wal for WalFile {
 
     /// For each prepared frame, update in-memory WAL index and rolling checksum.
     /// and advance max_frame to make frames visible to readers.
-    fn commit_prepared_frames(&self, prepared: &[PreparedFrames]) {
-        for batch in prepared {
+    fn commit_prepared_frames(&self, batches: &[PreparedFrames]) {
+        for batch in batches {
             for (page, frame_id, checksum) in &batch.metadata {
                 // Update WAL index mapping page -> frame
                 self.complete_append_frame(page.get().id as u64, *frame_id, *checksum);
@@ -2041,21 +2071,33 @@ impl WalFile {
                     // Gather I/O completions using a completion group
                     let mut nr_completions = 0;
                     let mut group = CompletionGroup::new(|_| {});
+                    let mut ongoing_chkpt = self.ongoing_checkpoint.write();
 
                     // Check and clean any completed writes from pending flush
-                    if self.ongoing_checkpoint.write().process_inflight_writes() {
+                    if ongoing_chkpt.process_inflight_writes() {
                         tracing::trace!("Completed a write batch");
                     }
                     // Process completed reads into current batch
-                    if self.ongoing_checkpoint.write().process_pending_reads() {
+                    if ongoing_chkpt.process_pending_reads()? {
                         tracing::trace!("Drained reads into batch");
                     }
+                    if let Some(e) = ongoing_chkpt.first_write_error() {
+                        // cancel everything still in-flight to avoid leaks
+                        let to_cancel: Vec<Completion> = ongoing_chkpt
+                            .inflight_reads
+                            .iter()
+                            .map(|r| r.completion.clone())
+                            .collect();
+                        pager.io.cancel(&to_cancel)?;
+                        pager.io.drain()?;
+                        return Err(LimboError::CompletionError(e));
+                    }
+
                     let epoch = self.with_shared(|shared| shared.epoch.load(Ordering::Acquire));
                     // Issue reads until we hit limits
-                    'inner: while self.ongoing_checkpoint.read().should_issue_reads() {
+                    'inner: while ongoing_chkpt.should_issue_reads() {
                         let (page_id, target_frame) = {
-                            let oc = self.ongoing_checkpoint.read();
-                            oc.pages_to_checkpoint[oc.current_page as usize]
+                            ongoing_chkpt.pages_to_checkpoint[ongoing_chkpt.current_page as usize]
                         };
                         'fast_path: {
                             if let Some(cached_page) = pager.cache_get_for_checkpoint(
@@ -2094,12 +2136,14 @@ impl WalFile {
                                     turso_assert!(wal_page == cached, "cached page content differs from WAL read for page_id={page_id}, frame_id={target_frame}");
                                 }
                                 {
-                                    let mut oc = self.ongoing_checkpoint.write();
-                                    oc.pending_writes.insert(page_id as usize, buffer);
+                                    ongoing_chkpt
+                                        .pending_writes
+                                        .insert(page_id as usize, buffer);
                                     // signify that a cached page was used, so it can be unpinned
-                                    let current = oc.current_page as usize;
-                                    oc.pages_to_checkpoint[current] = (page_id, target_frame);
-                                    oc.current_page += 1;
+                                    let current = ongoing_chkpt.current_page as usize;
+                                    ongoing_chkpt.pages_to_checkpoint[current] =
+                                        (page_id, target_frame);
+                                    ongoing_chkpt.current_page += 1;
                                 }
                                 continue 'inner;
                             }
@@ -2110,33 +2154,38 @@ impl WalFile {
                             self.issue_wal_read_into_buffer(page_id as usize, target_frame)?;
                         group.add(&inflight.completion);
                         nr_completions += 1;
-                        {
-                            let mut oc = self.ongoing_checkpoint.write();
-                            oc.inflight_reads.push(inflight);
-                            oc.current_page += 1;
-                        }
+                        ongoing_chkpt.inflight_reads.push(inflight);
+                        ongoing_chkpt.current_page += 1;
                     }
 
                     // Start a write if batch is ready and we're not at write limit
-                    let should_flush = {
-                        let oc = self.ongoing_checkpoint.read();
-                        oc.inflight_writes.len() < MAX_INFLIGHT_WRITES && oc.should_flush_batch()
-                    };
+                    let should_flush = ongoing_chkpt.inflight_writes.len() < MAX_INFLIGHT_WRITES
+                        && ongoing_chkpt.should_flush_batch();
                     if should_flush {
-                        let batch_map = self.ongoing_checkpoint.write().pending_writes.take();
+                        let batch_map = ongoing_chkpt.pending_writes.take();
                         if !batch_map.is_empty() {
-                            let done_flag = self.ongoing_checkpoint.write().add_write();
-                            for c in write_pages_vectored(pager, batch_map, done_flag)? {
+                            let new_write = InflightWriteBatch::new();
+                            for c in write_pages_vectored(
+                                pager,
+                                batch_map,
+                                new_write.done.clone(),
+                                new_write.err.clone(),
+                            )? {
                                 group.add(&c);
                                 nr_completions += 1;
                             }
+                            ongoing_chkpt.inflight_writes.push(new_write);
                         }
                     }
-
                     if nr_completions > 0 {
                         io_yield_one!(group.build());
-                    } else if self.ongoing_checkpoint.read().complete() {
-                        self.ongoing_checkpoint.write().state = CheckpointState::Finalize;
+                    } else if ongoing_chkpt.complete() {
+                        ongoing_chkpt.state = CheckpointState::Finalize;
+                    } else {
+                        // This should be impossible now so we treat it as logic error.
+                        return Err(LimboError::InternalError(
+                            "checkpoint stuck: no inflight completions but not complete".into(),
+                        ));
                     }
                 }
                 // All eligible frames copied to the db file
@@ -2144,14 +2193,11 @@ impl WalFile {
                 // In Restart or Truncate mode, we need to restart the log over and possibly truncate the file
                 // Release all locks and return the current num of wal frames and the amount we backfilled
                 CheckpointState::Finalize => {
+                    let mut ongoing_chkpt = self.ongoing_checkpoint.write();
                     turso_assert!(
-                        self.ongoing_checkpoint.read().complete(),
+                        ongoing_chkpt.complete(),
                         "checkpoint pending flush must have finished"
                     );
-                    let (oc_max_frame, oc_min_frame) = {
-                        let oc = self.ongoing_checkpoint.read();
-                        (oc.max_frame, oc.min_frame)
-                    };
                     let checkpoint_result = self.with_shared(|shared| {
                         let current_mx = shared.max_frame.load(Ordering::Acquire);
                         let nbackfills = shared.nbackfills.load(Ordering::Acquire);
@@ -2162,9 +2208,9 @@ impl WalFile {
                         let frames_possible = current_mx.saturating_sub(nbackfills);
 
                         // the total # of frames we actually backfilled
-                        let checkpoint_max_frame = oc_max_frame;
+                        let checkpoint_max_frame = ongoing_chkpt.max_frame;
                         let frames_checkpointed =
-                            checkpoint_max_frame.saturating_sub(oc_min_frame - 1);
+                            checkpoint_max_frame.saturating_sub(ongoing_chkpt.min_frame - 1);
 
                         if matches!(mode, CheckpointMode::Truncate { .. }) {
                             // sqlite always returns zeros for truncate mode
@@ -2190,16 +2236,17 @@ impl WalFile {
                     // NOTE: we don't have a .shm file yet, so it's safe to update nbackfills here
                     // before we sync, because if we crash and then recover, we will checkpoint the entire db anyway.
                     self.with_shared(|shared| {
-                        shared.nbackfills.store(oc_max_frame, Ordering::Release)
+                        shared
+                            .nbackfills
+                            .store(ongoing_chkpt.max_frame, Ordering::Release)
                     });
-
                     if mode.require_all_backfilled() && !checkpoint_result.everything_backfilled() {
                         return Err(LimboError::Busy);
                     }
                     if mode.should_restart_log() {
                         self.restart_log(mode)?;
                     }
-                    self.ongoing_checkpoint.write().state = CheckpointState::Truncate {
+                    ongoing_chkpt.state = CheckpointState::Truncate {
                         checkpoint_result: Some(checkpoint_result),
                         truncate_sent: false,
                         sync_sent: false,
@@ -2479,6 +2526,12 @@ impl WalFile {
     fn issue_wal_read_into_buffer(&self, page_id: usize, frame_id: u64) -> Result<InflightRead> {
         let offset = self.frame_offset(frame_id);
         let buf_slot = Arc::new(SpinLock::new(None));
+        tracing::debug!(
+            "Issuing WAL read: page_id={}, frame_id={}, offset={}",
+            page_id,
+            frame_id,
+            offset
+        );
 
         let complete = {
             let buf_slot = buf_slot.clone();

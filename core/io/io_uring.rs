@@ -103,8 +103,6 @@ impl IovecPool {
 impl UringIO {
     pub fn new() -> Result<Self> {
         let ring = match io_uring::IoUring::builder()
-            .setup_single_issuer()
-            .setup_coop_taskrun()
             .setup_sqpoll(SQPOLL_IDLE)
             .build(ENTRIES)
         {
@@ -309,13 +307,6 @@ impl WrappedIOUring {
         self.ring.submit().expect("submiting when full");
     }
 
-    /// Submit an entry with IO_DRAIN flag set.
-    /// IO_DRAIN ensures all prior submitted operations complete before this one starts.
-    fn submit_entry_drained(&mut self, entry: io_uring::squeue::Entry) {
-        let drained = entry.flags(io_uring::squeue::Flags::IO_DRAIN);
-        self.submit_entry(&drained);
-    }
-
     fn submit_cancel_urgent(&mut self, entry: &io_uring::squeue::Entry) -> Result<()> {
         let pushed = unsafe { self.ring.submission().push(entry).is_ok() };
         if pushed {
@@ -376,7 +367,7 @@ impl WrappedIOUring {
     }
 
     /// Submit or resubmit a writev operation
-    fn submit_writev(&mut self, key: u64, mut st: WritevState, drain: bool) {
+    fn submit_writev(&mut self, key: u64, mut st: WritevState) {
         st.free_last_iov(&mut self.iov_pool);
 
         let mut iov_allocation = self.iov_pool.acquire().unwrap_or_else(|| {
@@ -431,11 +422,7 @@ impl WrappedIOUring {
                 .user_data(key)
         });
         self.writev_states.insert(key, st);
-        if drain {
-            self.submit_entry_drained(entry);
-        } else {
-            self.submit_entry(&entry);
-        }
+        self.submit_entry(&entry);
     }
 
     fn handle_writev_completion(&mut self, mut state: WritevState, user_data: u64, result: i32) {
@@ -474,8 +461,7 @@ impl WrappedIOUring {
                     written,
                     remaining
                 );
-                let drain = true; // IO_DRAIN for resubmitted partial writev
-                self.submit_writev(user_data, state, drain);
+                self.submit_writev(user_data, state);
             }
         }
     }
@@ -532,13 +518,14 @@ impl IO for UringIO {
             }
             ring.submit_and_wait()?;
             'inner: loop {
-                let Some(cqe) = ring.ring.completion().next() else {
+                let mut cq = ring.ring.completion();
+                let Some(cqe) = cq.next() else {
                     break 'inner;
                 };
                 ring.pending_ops -= 1;
                 let user_data = cqe.user_data();
                 if user_data == CANCEL_TAG {
-                    // ignore if this is a cancellation CQE
+                    // ignore if this is a cancellation CQE,
                     continue 'inner;
                 }
                 let result = cqe.result();
@@ -548,6 +535,7 @@ impl IO for UringIO {
             );
                 if let Some(state) = ring.writev_states.remove(&user_data) {
                     // if we have ongoing writev state, handle it separately and don't call completion
+                    drop(cq);
                     ring.handle_writev_completion(state, user_data, result);
                     continue 'inner;
                 }
@@ -566,7 +554,8 @@ impl IO for UringIO {
         let mut inner = self.inner.lock();
         for c in completions {
             c.abort();
-            let e = io_uring::opcode::AsyncCancel::new(get_key(c.clone()))
+            // dont want to leak the refcount bump with `get_key`/into_raw here, so we use as_ptr
+            let e = io_uring::opcode::AsyncCancel::new(Arc::as_ptr(c.get_inner()) as u64)
                 .build()
                 .user_data(CANCEL_TAG);
             inner.ring.submit_cancel_urgent(&e)?;
@@ -584,7 +573,8 @@ impl IO for UringIO {
         }
         ring.submit_and_wait()?;
         loop {
-            let Some(cqe) = ring.ring.completion().next() else {
+            let mut cq = ring.ring.completion();
+            let Some(cqe) = cq.next() else {
                 return Ok(());
             };
             ring.pending_ops -= 1;
@@ -599,6 +589,7 @@ impl IO for UringIO {
                 "user_data must not be zero, we dont submit linked timeouts that would cause this"
             );
             if let Some(state) = ring.writev_states.remove(&user_data) {
+                drop(cq);
                 // if we have ongoing writev state, handle it separately and don't call completion
                 ring.handle_writev_completion(state, user_data, result);
                 continue;
@@ -796,7 +787,7 @@ impl File for UringFile {
                 .build()
                 .user_data(get_key(c.clone()))
         });
-        self.io.lock().ring.submit_entry_drained(sync);
+        self.io.lock().ring.submit_entry(&sync);
         Ok(c)
     }
 
@@ -810,8 +801,7 @@ impl File for UringFile {
 
         let state = WritevState::new(self, pos, bufs);
         let mut io = self.io.lock();
-        let drain = false;
-        io.ring.submit_writev(get_key(c.clone()), state, drain);
+        io.ring.submit_writev(get_key(c.clone()), state);
         Ok(c)
     }
 
