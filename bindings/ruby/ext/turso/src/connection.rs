@@ -1,5 +1,6 @@
 use magnus::typed_data::Obj;
-use magnus::{method, Error, Module, Ruby, TryConvert, Value};
+use magnus::value::ReprValue;
+use magnus::{method, Error, IntoValue, Module, Ruby, TryConvert, Value};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use turso_sdk_kit::rsapi::{TursoConnection, TursoStatusCode};
@@ -39,6 +40,21 @@ impl RbConnection {
         self.ensure_open()?;
         let stmt = self.inner.prepare_single(&sql).map_err(map_turso_error)?;
         Ok(RbStatement::new(stmt))
+    }
+
+    pub fn prepare_first(ruby: &Ruby, rb_self: Obj<Self>, sql: String) -> Result<Value, Error> {
+        let this = &*rb_self;
+        this.ensure_open()?;
+        match this.inner.prepare_first(&sql).map_err(map_turso_error)? {
+            Some((stmt, tail_idx)) => {
+                let rb_stmt = RbStatement::new(stmt);
+                let rb_stmt_obj = ruby.obj_wrap(rb_stmt);
+                Ok(ruby
+                    .ary_new_from_values(&[rb_stmt_obj.as_value(), tail_idx.into_value_with(ruby)])
+                    .as_value())
+            }
+            None => Ok(ruby.qnil().as_value()),
+        }
     }
 
     pub fn execute(ruby: &Ruby, rb_self: Obj<Self>, args: &[Value]) -> Result<Obj<RbResultSet>, Error> {
@@ -116,6 +132,7 @@ impl RbConnection {
 pub fn define_connection(ruby: &Ruby, module: &impl Module) -> Result<(), Error> {
     let class = module.define_class("Connection", ruby.class_object())?;
     class.define_method("prepare", method!(RbConnection::prepare, 1))?;
+    class.define_method("prepare_first", method!(RbConnection::prepare_first, 1))?;
     class.define_method("execute", method!(RbConnection::execute, -1))?;
     class.define_method("transaction", method!(RbConnection::transaction, 0))?;
     class.define_method("changes", method!(RbConnection::changes, 0))?;
