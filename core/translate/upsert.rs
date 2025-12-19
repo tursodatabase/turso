@@ -487,10 +487,7 @@ pub fn emit_upsert(
             let affinity_str: String = bt.columns.iter().map(|c| c.affinity().aff_mask()).collect();
 
             // Only emit Affinity if there's meaningful affinity to apply
-            if affinity_str
-                .chars()
-                .any(|c| c != Affinity::Blob.aff_mask())
-            {
+            if affinity_str.chars().any(|c| c != Affinity::Blob.aff_mask()) {
                 if let Ok(count) = std::num::NonZeroUsize::try_from(num_cols) {
                     program.emit_insn(Insn::Affinity {
                         start_reg: new_start,

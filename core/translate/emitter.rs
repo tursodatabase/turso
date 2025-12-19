@@ -1770,10 +1770,7 @@ fn emit_update_insns<'a>(
                 .collect();
 
             // Only emit Affinity if there's meaningful affinity to apply
-            if affinity_str
-                .chars()
-                .any(|c| c != Affinity::Blob.aff_mask())
-            {
+            if affinity_str.chars().any(|c| c != Affinity::Blob.aff_mask()) {
                 if let Ok(count) = std::num::NonZeroUsize::try_from(col_len) {
                     program.emit_insn(Insn::Affinity {
                         start_reg: start,
