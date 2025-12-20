@@ -78,6 +78,34 @@ async fn run_tests(
     output_format: String,
     timeout: u64,
 ) -> ExitCode {
+    // Resolve paths, trying to add .sqltest extension if missing
+    let mut resolved_paths = Vec::new();
+    let mut missing = Vec::new();
+
+    for path in paths {
+        if path.exists() {
+            resolved_paths.push(path);
+        } else {
+            // Try adding .sqltest extension
+            let with_ext = path.with_extension("sqltest");
+            if with_ext.exists() {
+                resolved_paths.push(with_ext);
+            } else {
+                missing.push(path);
+            }
+        }
+    }
+
+    if !missing.is_empty() {
+        eprintln!("Error: the following paths do not exist:");
+        for path in missing {
+            eprintln!("  - {}", path.display());
+        }
+        return ExitCode::from(1);
+    }
+
+    let paths = resolved_paths;
+
     // Parse output format
     let format: Format = match output_format.parse() {
         Ok(f) => f,
