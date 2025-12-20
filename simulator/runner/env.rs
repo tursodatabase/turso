@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt::Display;
 use std::mem;
 use std::ops::{Deref, DerefMut};
@@ -321,6 +322,22 @@ where
 
     pub fn apply_snapshot(&mut self) {
         if let Some(transaction_tables) = self.transaction_tables.take() {
+            // Build a mapping from any table name used during the transaction to its final name.
+            // This is needed because operations store the table name at the time they were recorded,
+            // but transaction_tables.current_tables has tables with their final names.
+            let mut name_to_final: HashMap<String, String> = HashMap::new();
+            for op in &transaction_tables.operations {
+                if let TxOperation::RenameTable { old_name, new_name } = op {
+                    name_to_final.insert(old_name.clone(), new_name.clone());
+                    // Update all existing mappings that pointed to old_name
+                    for v in name_to_final.values_mut() {
+                        if v == old_name {
+                            *v = new_name.clone();
+                        }
+                    }
+                }
+            }
+
             // Apply all operations in recorded order.
             // This ensures operations like CREATE TABLE, ADD COLUMN, DELETE are applied correctly
             // where DELETE sees rows with the same shape as when it was recorded.
@@ -383,10 +400,12 @@ where
                             .iter_mut()
                             .find(|t| &t.name == table_name)
                             .expect("Table should exist in committed tables");
+                        // Use the final name to look up in transaction_tables (which has current state)
+                        let final_name = name_to_final.get(table_name).unwrap_or(table_name);
                         let txn_table = transaction_tables
                             .current_tables
                             .iter()
-                            .find(|t| &t.name == table_name)
+                            .find(|t| &t.name == final_name)
                             .expect("Transaction table should exist");
                         assert!(
                             txn_table.columns.len() > committed.columns.len(),
@@ -412,10 +431,12 @@ where
                             .iter_mut()
                             .find(|t| &t.name == table_name)
                             .expect("Table should exist in committed tables");
+                        // Use the final name to look up in transaction_tables (which has current state)
+                        let final_name = name_to_final.get(table_name).unwrap_or(table_name);
                         let txn_table = transaction_tables
                             .current_tables
                             .iter()
-                            .find(|t| &t.name == table_name)
+                            .find(|t| &t.name == final_name)
                             .expect("Transaction table should exist");
                         assert!(
                             txn_table.columns.len() < committed.columns.len(),
