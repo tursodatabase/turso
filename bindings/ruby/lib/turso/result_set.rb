@@ -75,6 +75,11 @@ module Turso
       end
     end
 
+    # @return [Integer] Number of rows changed by last execution.
+    def rows_changed
+      @statement.rows_changed
+    end
+
     # Close the underlying statement
     def close
       @statement.finalize!

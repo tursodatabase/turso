@@ -36,6 +36,8 @@ impl RbStatement {
     pub fn bind(ruby: &Ruby, rb_self: Obj<Self>, args: &[Value]) -> Result<(), Error> {
         rb_self.ensure_open()?;
         let mut stmt = rb_self.inner.borrow_mut();
+        
+        stmt.reset().map_err(map_turso_error)?;
 
         if args.len() == 1 && args[0].is_kind_of(ruby.class_hash()) {
             let hash = RHash::try_convert(args[0])?;
@@ -116,6 +118,11 @@ impl RbStatement {
     pub fn is_closed(&self) -> bool {
         self.finalized.load(Ordering::Relaxed)
     }
+
+    /// Get number of rows changed by last execution of this statement.
+    pub fn rows_changed(&self) -> u64 {
+        self.inner.borrow().n_change()
+    }
 }
 
 impl Drop for RbStatement {
@@ -135,5 +142,6 @@ pub fn define_statement(ruby: &Ruby, module: &impl Module) -> Result<(), Error> 
     class.define_method("reset!", method!(RbStatement::reset, 0))?;
     class.define_method("finalize!", method!(RbStatement::finalize, 0))?;
     class.define_method("closed?", method!(RbStatement::is_closed, 0))?;
+    class.define_method("rows_changed", method!(RbStatement::rows_changed, 0))?;
     Ok(())
 }

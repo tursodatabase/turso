@@ -1,7 +1,8 @@
 # frozen_string_literal: true
 
 require_relative "turso/version"
-require_relative "turso/turso" # Native extension (exports RbDatabase, RbConnection, RbStatement)
+require_relative "turso/errors"
+require_relative "turso/turso"
 
 require_relative "turso/row"
 require_relative "turso/result_set"

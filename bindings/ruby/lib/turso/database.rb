@@ -147,7 +147,7 @@ module Turso
       return nil if result.nil?
 
       native_stmt, tail_offset = result
-      [Statement.new_from_native(native_stmt), tail_offset]
+      [Statement.new_from_native(@conn, native_stmt), tail_offset]
     end
 
     # Execute SQL and return a live ResultSet cursor (for lazy iteration).
@@ -261,6 +261,7 @@ module Turso
       @native_stmt = connection.prepare(sql)
       @columns = @native_stmt.columns
       @closed = false
+      ObjectSpace.define_finalizer(self, self.class.finalize(@native_stmt))
     end
 
     # Create Statement from an already-prepared native statement.
@@ -268,12 +269,18 @@ module Turso
     #
     # @param native_stmt [Turso::RbStatement] Native prepared statement
     # @return [Statement]
-    def self.new_from_native(native_stmt)
+    def self.new_from_native(connection, native_stmt)
       stmt = allocate
+      stmt.instance_variable_set(:@conn, connection)
       stmt.instance_variable_set(:@native_stmt, native_stmt)
       stmt.instance_variable_set(:@columns, native_stmt.columns)
       stmt.instance_variable_set(:@closed, false)
+      ObjectSpace.define_finalizer(stmt, finalize(native_stmt))
       stmt
+    end
+
+    def self.finalize(native_stmt)
+      proc { native_stmt.finalize! unless native_stmt.closed? }
     end
 
     # Bind parameters to the statement.
@@ -289,7 +296,9 @@ module Turso
     # @param bind_vars [Array] Optional parameters
     # @return [ResultSet]
     def execute(*bind_vars)
-      reset! if @executed
+      if @executed
+        reset!
+      end
       bind_params(*bind_vars) unless bind_vars.empty?
       @executed = true
       ResultSet.new(self, @columns)
@@ -319,6 +328,11 @@ module Turso
     # Reset statement for re-execution.
     def reset!
       @native_stmt.reset!
+    end
+
+    # @return [Integer] Number of rows changed by last execution.
+    def rows_changed
+      @native_stmt.rows_changed
     end
 
     # Finalize (close) the statement.

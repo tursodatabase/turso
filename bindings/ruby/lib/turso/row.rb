@@ -17,7 +17,13 @@ module Turso
     def initialize(columns, values)
       @columns = columns.map(&:to_sym).freeze
       @values = values.freeze
-      @index = @columns.each_with_index.to_h.freeze
+      
+      index = {}
+      @columns.each_with_index do |col, i|
+        index[col] = i
+        index[col.to_s] = i
+      end
+      @index = index.freeze
     end
 
     # Access value by symbol, string, or integer index
@@ -27,14 +33,9 @@ module Turso
       case key
       when Integer
         @values[key]
-      when Symbol
+      else
         idx = @index[key]
         idx ? @values[idx] : nil
-      when String
-        idx = @index[key.to_sym]
-        idx ? @values[idx] : nil
-      else
-        raise TypeError, "no implicit conversion of #{key.class} into Integer or Symbol"
       end
     end
 
@@ -76,8 +77,8 @@ module Turso
     end
 
     def ==(other)
-      return false unless other.is_a?(Row)
-      @columns == other.keys && @values == other.values
+      return false unless other.respond_to?(:to_h)
+      to_h == other.to_h
     end
     alias_method :eql?, :==
 
