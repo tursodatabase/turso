@@ -40,7 +40,7 @@ pub(crate) enum SimulationPhase {
 
 /// Represents a single operation during a transaction, applied in order.
 #[derive(Debug, Clone)]
-pub enum RowOperation {
+pub enum TxOperation {
     Insert {
         table_name: String,
         row: Vec<SimValue>,
@@ -48,6 +48,17 @@ pub enum RowOperation {
     Delete {
         table_name: String,
         row: Vec<SimValue>,
+    },
+    CreateTable {
+        table: Table,
+    },
+    CreateIndex {
+        table_name: String,
+        index: sql_generation::model::table::Index,
+    },
+    DropIndex {
+        table_name: String,
+        index_name: String,
     },
     DropTable {
         table_name: String,
@@ -81,7 +92,7 @@ pub struct TransactionTables {
     /// The current state after applying transaction's changes (used for reads within the transaction)
     current_tables: Vec<Table>,
     /// Operations recorded during this transaction, in order
-    operations: Vec<RowOperation>,
+    operations: Vec<TxOperation>,
 }
 
 impl TransactionTables {
@@ -94,21 +105,41 @@ impl TransactionTables {
 
     pub fn record_insert(&mut self, table_name: String, row: Vec<SimValue>) {
         self.operations
-            .push(RowOperation::Insert { table_name, row });
+            .push(TxOperation::Insert { table_name, row });
     }
 
     pub fn record_delete(&mut self, table_name: String, row: Vec<SimValue>) {
         self.operations
-            .push(RowOperation::Delete { table_name, row });
+            .push(TxOperation::Delete { table_name, row });
+    }
+
+    pub fn record_create_table(&mut self, table: Table) {
+        self.operations.push(TxOperation::CreateTable { table });
+    }
+
+    pub fn record_create_index(
+        &mut self,
+        table_name: String,
+        index: sql_generation::model::table::Index,
+    ) {
+        self.operations
+            .push(TxOperation::CreateIndex { table_name, index });
+    }
+
+    pub fn record_drop_index(&mut self, table_name: String, index_name: String) {
+        self.operations.push(TxOperation::DropIndex {
+            table_name,
+            index_name,
+        });
     }
 
     pub fn record_drop_table(&mut self, table_name: String) {
-        self.operations.push(RowOperation::DropTable { table_name });
+        self.operations.push(TxOperation::DropTable { table_name });
     }
 
     pub fn record_rename_table(&mut self, old_name: String, new_name: String) {
         self.operations
-            .push(RowOperation::RenameTable { old_name, new_name });
+            .push(TxOperation::RenameTable { old_name, new_name });
     }
 
     pub fn record_add_column(
@@ -117,18 +148,18 @@ impl TransactionTables {
         column: sql_generation::model::table::Column,
     ) {
         self.operations
-            .push(RowOperation::AddColumn { table_name, column });
+            .push(TxOperation::AddColumn { table_name, column });
     }
 
     pub fn record_drop_column(&mut self, table_name: String, column_index: usize) {
-        self.operations.push(RowOperation::DropColumn {
+        self.operations.push(TxOperation::DropColumn {
             table_name,
             column_index,
         });
     }
 
     pub fn record_rename_column(&mut self, table_name: String, old_name: String, new_name: String) {
-        self.operations.push(RowOperation::RenameColumn {
+        self.operations.push(TxOperation::RenameColumn {
             table_name,
             old_name,
             new_name,
@@ -141,7 +172,7 @@ impl TransactionTables {
         old_name: String,
         new_column: sql_generation::model::table::Column,
     ) {
-        self.operations.push(RowOperation::AlterColumn {
+        self.operations.push(TxOperation::AlterColumn {
             table_name,
             old_name,
             new_column,
@@ -208,6 +239,31 @@ where
         }
     }
 
+    /// Record that a table was created during the current transaction
+    pub fn record_create_table(&mut self, table: Table) {
+        if let Some(txn) = &mut *self.transaction_tables {
+            txn.record_create_table(table);
+        }
+    }
+
+    /// Record that an index was created during the current transaction
+    pub fn record_create_index(
+        &mut self,
+        table_name: String,
+        index: sql_generation::model::table::Index,
+    ) {
+        if let Some(txn) = &mut *self.transaction_tables {
+            txn.record_create_index(table_name, index);
+        }
+    }
+
+    /// Record that an index was dropped during the current transaction
+    pub fn record_drop_index(&mut self, table_name: String, index_name: String) {
+        if let Some(txn) = &mut *self.transaction_tables {
+            txn.record_drop_index(table_name, index_name);
+        }
+    }
+
     /// Record that a table was dropped during the current transaction
     pub fn record_drop_table(&mut self, table_name: String) {
         if let Some(txn) = &mut *self.transaction_tables {
@@ -266,11 +322,11 @@ where
     pub fn apply_snapshot(&mut self) {
         if let Some(transaction_tables) = self.transaction_tables.take() {
             // Apply all operations in recorded order.
-            // This ensures operations like ADD COLUMN, DELETE are applied correctly
+            // This ensures operations like CREATE TABLE, ADD COLUMN, DELETE are applied correctly
             // where DELETE sees rows with the same shape as when it was recorded.
             for op in &transaction_tables.operations {
                 match op {
-                    RowOperation::Insert { table_name, row } => {
+                    TxOperation::Insert { table_name, row } => {
                         let committed = self
                             .commited_tables
                             .iter_mut()
@@ -278,7 +334,7 @@ where
                             .expect("Table should exist in committed tables");
                         committed.rows.push(row.clone());
                     }
-                    RowOperation::Delete { table_name, row } => {
+                    TxOperation::Delete { table_name, row } => {
                         let committed = self
                             .commited_tables
                             .iter_mut()
@@ -288,10 +344,32 @@ where
                             committed.rows.remove(pos);
                         }
                     }
-                    RowOperation::DropTable { table_name } => {
+                    TxOperation::CreateTable { table } => {
+                        self.commited_tables.push(table.clone());
+                    }
+                    TxOperation::CreateIndex { table_name, index } => {
+                        let committed = self
+                            .commited_tables
+                            .iter_mut()
+                            .find(|t| &t.name == table_name)
+                            .expect("Table should exist in committed tables");
+                        committed.indexes.push(index.clone());
+                    }
+                    TxOperation::DropIndex {
+                        table_name,
+                        index_name,
+                    } => {
+                        let committed = self
+                            .commited_tables
+                            .iter_mut()
+                            .find(|t| &t.name == table_name)
+                            .expect("Table should exist in committed tables");
+                        committed.indexes.retain(|i| &i.index_name != index_name);
+                    }
+                    TxOperation::DropTable { table_name } => {
                         self.commited_tables.retain(|t| &t.name != table_name);
                     }
-                    RowOperation::RenameTable { old_name, new_name } => {
+                    TxOperation::RenameTable { old_name, new_name } => {
                         let committed = self
                             .commited_tables
                             .iter_mut()
@@ -299,7 +377,7 @@ where
                             .expect("Table should exist in committed tables");
                         committed.name = new_name.clone();
                     }
-                    RowOperation::AddColumn { table_name, column } => {
+                    TxOperation::AddColumn { table_name, column } => {
                         let committed = self
                             .commited_tables
                             .iter_mut()
@@ -325,7 +403,7 @@ where
                             }
                         }
                     }
-                    RowOperation::DropColumn {
+                    TxOperation::DropColumn {
                         table_name,
                         column_index,
                     } => {
@@ -354,7 +432,7 @@ where
                             }
                         }
                     }
-                    RowOperation::RenameColumn {
+                    TxOperation::RenameColumn {
                         table_name,
                         old_name,
                         new_name,
@@ -379,46 +457,30 @@ where
                             }
                         }
                     }
-                    RowOperation::AlterColumn {
+                    TxOperation::AlterColumn {
                         table_name,
                         old_name,
                         new_column,
                     } => {
-                        if let Some(committed) = self
+                        let committed = self
                             .commited_tables
                             .iter_mut()
                             .find(|t| &t.name == table_name)
+                            .expect("Table should exist in committed tables");
+                        if let Some(col) =
+                            committed.columns.iter_mut().find(|c| &c.name == old_name)
                         {
-                            if let Some(col) =
-                                committed.columns.iter_mut().find(|c| &c.name == old_name)
-                            {
-                                *col = new_column.clone();
-                            }
-                            // Update index column names if the column was renamed
-                            for index in &mut committed.indexes {
-                                for (col_name, _) in &mut index.columns {
-                                    if col_name == old_name {
-                                        *col_name = new_column.name.clone();
-                                    }
+                            *col = new_column.clone();
+                        }
+                        // Update index column names if the column was renamed
+                        for index in &mut committed.indexes {
+                            for (col_name, _) in &mut index.columns {
+                                if col_name == old_name {
+                                    *col_name = new_column.name.clone();
                                 }
                             }
                         }
                     }
-                }
-            }
-
-            // Sync indexes and add new tables created in the transaction.
-            for current_table in &transaction_tables.current_tables {
-                if let Some(committed) = self
-                    .commited_tables
-                    .iter_mut()
-                    .find(|t| t.name == current_table.name)
-                {
-                    // Sync indexes (CreateIndex/DropIndex don't have RowOperations yet)
-                    committed.indexes = current_table.indexes.clone();
-                } else {
-                    // New table created in transaction - copy with rows intact.
-                    self.commited_tables.push(current_table.clone());
                 }
             }
         }
