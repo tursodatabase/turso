@@ -20,3 +20,9 @@ do_execsql_test_on_specific_db {:memory:} affinity-rowid {
 	select * from t where a = '1';
 } {1
 1}
+
+do_execsql_test_on_specific_db {:memory:} affinity-ascii-whitespace-1.1 {
+  CREATE TABLE nb1(i INTEGER);
+  INSERT INTO nb1 VALUES ('12' || CHAR(160));
+  SELECT TYPEOF(i), LENGTH(i) FROM nb1;
+} {text|3}

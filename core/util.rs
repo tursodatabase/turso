@@ -958,6 +958,24 @@ pub fn decode_percent(uri: &str) -> String {
     String::from_utf8_lossy(&decoded).to_string()
 }
 
+pub fn trim_ascii_whitespace(s: &str) -> &str {
+    let bytes = s.as_bytes();
+    let start = bytes
+        .iter()
+        .position(|&b| !b.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .rposition(|&b| !b.is_ascii_whitespace())
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    if start <= end {
+        &s[start..end]
+    } else {
+        ""
+    }
+}
+
 /// When casting a TEXT value to INTEGER, the longest possible prefix of the value that can be interpreted as an integer number
 /// is extracted from the TEXT value and the remainder ignored. Any leading spaces in the TEXT value when converting from TEXT to INTEGER are ignored.
 /// If there is no prefix that can be interpreted as an integer number, the result of the conversion is 0.
@@ -2590,6 +2608,25 @@ pub mod tests {
         assert_eq!(
             checked_cast_text_to_numeric("\t-3.22\n", true),
             Ok(Float(-3.22))
+        );
+    }
+
+    #[test]
+    fn test_trim_ascii_whitespace_helper() {
+        assert_eq!(trim_ascii_whitespace("  hello  "), "hello");
+        assert_eq!(trim_ascii_whitespace("\t\nhello\r\n"), "hello");
+        assert_eq!(trim_ascii_whitespace("hello"), "hello");
+        assert_eq!(trim_ascii_whitespace("   "), "");
+        assert_eq!(trim_ascii_whitespace(""), "");
+
+        // non-breaking space should NOT be trimmed
+        assert_eq!(
+            trim_ascii_whitespace("\u{00A0}hello\u{00A0}"),
+            "\u{00A0}hello\u{00A0}"
+        );
+        assert_eq!(
+            trim_ascii_whitespace("  \u{00A0}hello\u{00A0}  "),
+            "\u{00A0}hello\u{00A0}"
         );
     }
 
