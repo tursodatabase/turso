@@ -396,3 +396,9 @@ do_execsql_test_on_specific_db {:memory:} having_without_group_by_max_min {
     INSERT INTO t VALUES (5), (10), (15), (20);
     SELECT max(a) as mx, min(a) as mn FROM t HAVING mx = 20 AND mn = 5;
 } {20|5}
+
+do_execsql_test_in_memory_any_error having_without_group_by_non_aggregate_error {
+    CREATE TABLE t(a INTEGER);
+    INSERT INTO t VALUES (1), (2), (3);
+    SELECT a FROM t HAVING a = 1;
+}

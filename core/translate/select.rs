@@ -444,6 +444,16 @@ fn prepare_one_select_plan(
 
             plan.aggregates = aggregate_expressions;
 
+            // HAVING without GROUP BY requires aggregates in the SELECT
+            if let Some(ref group_by) = plan.group_by {
+                if group_by.exprs.is_empty()
+                    && group_by.having.is_some()
+                    && plan.aggregates.is_empty()
+                {
+                    crate::bail_parse_error!("HAVING clause on a non-aggregate query");
+                }
+            }
+
             // Parse the ORDER BY clause
             let mut key = Vec::new();
 
