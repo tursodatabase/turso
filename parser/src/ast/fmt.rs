@@ -1377,9 +1377,11 @@ impl ToTokens for GroupBy {
         s: &mut S,
         context: &C,
     ) -> Result<(), S::Error> {
-        s.append(TK_GROUP, None)?;
-        s.append(TK_BY, None)?;
-        comma(&self.exprs, s, context)?;
+        if !self.exprs.is_empty() {
+            s.append(TK_GROUP, None)?;
+            s.append(TK_BY, None)?;
+            comma(&self.exprs, s, context)?;
+        }
         if let Some(ref having) = self.having {
             s.append(TK_HAVING, None)?;
             having.to_tokens(s, context)?;

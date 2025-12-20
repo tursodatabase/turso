@@ -12,7 +12,7 @@ use crate::{
 
 use super::{
     emitter::{Resolver, TranslateCtx},
-    expr::translate_expr,
+    expr::{translate_condition_expr, translate_expr, ConditionMetadata},
     plan::{Aggregate, Distinctness, SelectPlan, TableReferences},
     result_row::emit_select_result,
 };
@@ -45,46 +45,59 @@ pub fn emit_ungrouped_aggregation<'a>(
     }
     t_ctx.resolver.enable_expr_to_reg_cache();
 
+    // Allocate a label for the end (used by both HAVING and OFFSET to skip row emission)
+    let end_label = program.allocate_label();
+
+    // Handle HAVING clause without GROUP BY for ungrouped aggregation
+    if let Some(group_by) = &plan.group_by {
+        if group_by.exprs.is_empty() {
+            if let Some(having) = &group_by.having {
+                for expr in having.iter() {
+                    let if_true_target = program.allocate_label();
+                    translate_condition_expr(
+                        program,
+                        &plan.table_references,
+                        expr,
+                        ConditionMetadata {
+                            jump_if_condition_is_true: false,
+                            jump_target_when_false: end_label,
+                            jump_target_when_true: if_true_target,
+                            // treat null result as false
+                            jump_target_when_null: end_label,
+                        },
+                        &t_ctx.resolver,
+                    )?;
+                    program.preassign_label_to_next_insn(if_true_target);
+                }
+            }
+        }
+    }
+
     // Handle OFFSET for ungrouped aggregates
     // Since we only have one result row, either skip it (offset > 0) or emit it
     if let Some(offset_reg) = t_ctx.reg_offset {
-        let done_label = program.allocate_label();
-
         // If offset > 0, jump to end (skip the single row)
         program.emit_insn(Insn::IfPos {
             reg: offset_reg,
-            target_pc: done_label,
+            target_pc: end_label,
             decrement_by: 0,
         });
-
-        // Offset is 0, fall through to emit the row
-        emit_select_result(
-            program,
-            &t_ctx.resolver,
-            plan,
-            None,
-            None,
-            t_ctx.reg_nonagg_emit_once_flag,
-            None, // we've already handled offset
-            t_ctx.reg_result_cols_start.unwrap(),
-            t_ctx.limit_ctx,
-        )?;
-
-        program.resolve_label(done_label, program.offset());
-    } else {
-        // No offset specified, just emit the row
-        emit_select_result(
-            program,
-            &t_ctx.resolver,
-            plan,
-            None,
-            None,
-            t_ctx.reg_nonagg_emit_once_flag,
-            t_ctx.reg_offset,
-            t_ctx.reg_result_cols_start.unwrap(),
-            t_ctx.limit_ctx,
-        )?;
     }
+
+    // Emit the result row (if we didn't skip it due to HAVING or OFFSET)
+    emit_select_result(
+        program,
+        &t_ctx.resolver,
+        plan,
+        None,
+        None,
+        t_ctx.reg_nonagg_emit_once_flag,
+        None, // we've already handled offset
+        t_ctx.reg_result_cols_start.unwrap(),
+        t_ctx.limit_ctx,
+    )?;
+
+    program.resolve_label(end_label, program.offset());
 
     Ok(())
 }
