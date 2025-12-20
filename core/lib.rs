@@ -499,7 +499,7 @@ impl Database {
             let wal_enabled = db.shared_wal.read().enabled.load(Ordering::SeqCst);
             let mv_store_enabled = db.get_mv_store().is_some();
             assert!(
-                wal_enabled || mv_store_enabled,
+                db.is_readonly() || wal_enabled || mv_store_enabled,
                 "Either WAL or MVStore must be enabled"
             );
         }
@@ -676,15 +676,11 @@ impl Database {
 
         drop(header);
 
+        let flags = self.open_flags.get();
+
         // Always Open shared wal and set it in the Database and Pager.
         // MVCC currently requires a WAL open to function
-        let shared_wal = WalFileShared::open_shared_if_exists(&self.io, &self.wal_path)?;
-
-        let file = self
-            .io
-            .open_file(&self.wal_path, OpenFlags::Create, false)?;
-        // Enable WAL in the existing shared instance
-        shared_wal.write().create(file)?;
+        let shared_wal = WalFileShared::open_shared_if_exists(&self.io, &self.wal_path, flags)?;
 
         let wal = Arc::new(WalFile::new(
             self.io.clone(),
