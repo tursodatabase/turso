@@ -16,7 +16,7 @@ endif
 TURSODB := $(ROOT_DIR)/target/$(TARGET_DIR)/tursodb
 TEST_RUNNER := ./target/$(TARGET_DIR)/turso-test-runner
 
-.PHONY: all build build-tursodb build-runner check run test test-sqlite clean
+.PHONY: all build build-tursodb build-runner check run test run-examples test-sqlite clean
 
 # Build everything
 all: build
@@ -60,6 +60,10 @@ run-tests: build
 # Run only turso-specific tests
 run-turso-tests: build
 	$(TEST_RUNNER) run turso-tests --binary $(TURSODB)
+
+# Run example tests
+run-examples: build
+	$(TEST_RUNNER) run examples --binary $(TURSODB)
 
 # Run tests against SQLite
 test-sqlite: build-runner
