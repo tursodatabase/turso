@@ -862,14 +862,18 @@ impl Drop for CheckpointLocks {
     }
 }
 
-impl Wal for WalFile {
-    /// Begin a read transaction. The caller must ensure that there is not already
-    /// an ongoing read transaction.
-    /// Returns whether the database state has changed since the last read transaction.
-    /// sqlite/src/wal.c 3023
-    /// assert(pWal->readLock < 0); /* Not currently locked */
-    #[instrument(skip_all, level = Level::DEBUG)]
-    fn begin_read_tx(&self) -> Result<bool> {
+/// Result of try_begin_read_tx - either success or a retriable condition.
+enum TryBeginReadResult {
+    /// Successfully started read transaction, returns whether DB changed
+    Ok(bool),
+    /// Transient condition, caller should retry immediately (like SQLite's WAL_RETRY)
+    Retry,
+}
+
+impl WalFile {
+    /// Try to begin a read transaction. Returns Retry for transient conditions
+    /// that should be retried immediately, Ok for success.
+    fn try_begin_read_tx(&self) -> TryBeginReadResult {
         turso_assert!(
             self.max_frame_read_lock_index
                 .load(Ordering::Acquire)
@@ -905,7 +909,7 @@ impl Wal for WalFile {
                 nbackfills
             );
             if !self.with_shared(|shared| shared.read_locks[0].read()) {
-                return Err(LimboError::Busy);
+                return TryBeginReadResult::Retry;
             }
             // Re-validate: a writer could have appended frames between our snapshot
             // and lock acquisition. If so, we cannot proceed because we'd not be reading
@@ -924,7 +928,7 @@ impl Wal for WalFile {
                 || ckpt_seq2 != checkpoint_seq
             {
                 self.with_shared(|shared| shared.read_locks[0].unlock());
-                return Err(LimboError::Busy);
+                return TryBeginReadResult::Retry;
             }
             self.max_frame.store(shared_max, Ordering::Release);
             self.max_frame_read_lock_index.store(0, Ordering::Release);
@@ -933,7 +937,7 @@ impl Wal for WalFile {
             self.checkpoint_seq.store(checkpoint_seq, Ordering::Release);
             self.transaction_count
                 .store(transaction_count, Ordering::Release);
-            return Ok(db_changed);
+            return TryBeginReadResult::Ok(db_changed);
         }
 
         // If we get this far, it means that the reader will want to use
@@ -974,7 +978,7 @@ impl Wal for WalFile {
         // A stale mark is fine - the reader uses shared_max for reading,
         // and the mark just tells the checkpointer what frames are protected.
         if best_idx == -1 {
-            return Err(LimboError::Busy);
+            return TryBeginReadResult::Retry;
         }
 
         // Now acquire shared read lock on the chosen slot.
@@ -992,7 +996,7 @@ impl Wal for WalFile {
         });
 
         let Some((mx2, nb2, cksm2, ckpt_seq2, current_slot_mark)) = read_result else {
-            return Err(LimboError::Busy);
+            return TryBeginReadResult::Retry;
         };
 
         // Re-validate state after acquiring the lock. Each check prevents a correctness violation:
@@ -1018,7 +1022,7 @@ impl Wal for WalFile {
             || ckpt_seq2 != checkpoint_seq
         {
             self.with_shared(|shared| shared.read_locks[best_idx as usize].unlock());
-            return Err(LimboError::Busy);
+            return TryBeginReadResult::Retry;
         }
         self.min_frame.store(nb2 + 1, Ordering::Release);
         self.max_frame.store(shared_max, Ordering::Release);
@@ -1035,7 +1039,43 @@ impl Wal for WalFile {
             best_idx,
             shared_max
         );
-        Ok(db_changed)
+        TryBeginReadResult::Ok(db_changed)
+    }
+}
+
+impl Wal for WalFile {
+    fn begin_read_tx(&self) -> Result<bool> {
+        // Implement progressive backoff because transient lock contention
+        // should resolve quickly, but under heavy contention busy-spinning wastes
+        // CPU. SQLite uses quadratic backoff after 5 retries, with total delay
+        // up to ~10 seconds before giving up, so we just mirror SQLite's implementation
+        // here.
+        let mut cnt = 0u32;
+        loop {
+            match self.try_begin_read_tx() {
+                TryBeginReadResult::Ok(changed) => return Ok(changed),
+                TryBeginReadResult::Retry => {
+                    cnt += 1;
+                    if cnt > 100 {
+                        return Err(LimboError::Busy);
+                    }
+                    // Progressive backoff: first 5 retries are immediate, then we
+                    // start yielding/sleeping with increasing delays.
+                    if cnt > 5 {
+                        if cnt < 10 {
+                            // Retries 6-9: yield to scheduler (minimal delay)
+                            self.io.yield_now();
+                        } else {
+                            // Retries 10+: quadratic backoff in microseconds
+                            // Formula matches SQLite: (cnt-9)^2 * 39 microseconds
+                            let delay_us = ((cnt - 9) * (cnt - 9) * 39) as u64;
+                            self.io.sleep(std::time::Duration::from_micros(delay_us));
+                        }
+                    }
+                    continue;
+                }
+            }
+        }
     }
 
     /// End a read transaction.
