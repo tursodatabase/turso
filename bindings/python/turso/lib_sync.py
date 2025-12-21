@@ -22,10 +22,8 @@ from ._turso import (
     PyTursoSyncIoItemRequestKind,
     py_turso_sync_new,
 )
-from .lib import (
-    Connection as _Connection,
-    _map_turso_exception
-)
+from .lib import Connection as _Connection
+from .lib import _map_turso_exception
 
 # Constants
 _HTTP_CHUNK_SIZE = 64 * 1024  # 64 KiB

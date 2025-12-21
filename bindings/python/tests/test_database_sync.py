@@ -1,9 +1,8 @@
-import os
 import logging
-import time
 import multiprocessing
-import random
+import os
 import tempfile
+import time
 
 import turso
 import turso.sync
@@ -186,7 +185,7 @@ def test_bootstrap_concurrency():
         server.db_sql("INSERT INTO t SELECT randomblob(1024) FROM generate_series(1, 2000)")
 
         with tempfile.TemporaryDirectory(prefix="pyturso-") as dir:
-            path = os.path.join(dir, 'local.db')
+            path = os.path.join(dir, "local.db")
             print(path)
             barrier = multiprocessing.Barrier(2)
             def run_full(path: str, remote_url: str, barrier: any):
@@ -194,7 +193,7 @@ def test_bootstrap_concurrency():
                 try:
                     print(turso.sync.connect(path, remote_url=remote_url))
                 except Exception as e:
-                    print('valid error', e, type(e), isinstance(e, turso.Error), turso.Error)
+                    print("valid error", e, type(e), isinstance(e, turso.Error), turso.Error)
             t1 = multiprocessing.Process(target=run_full, args=(path, server.db_url(), barrier))
             t2 = multiprocessing.Process(target=run_full, args=(path, server.db_url(), barrier))
 
