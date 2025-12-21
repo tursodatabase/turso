@@ -78,13 +78,16 @@ fn test_deferred_transaction_no_restart(tmp_db: TempDatabase) {
         .unwrap();
 
     let result = conn2.execute("INSERT INTO test (id, value) VALUES (2, 'second')");
-    assert!(matches!(result, Err(LimboError::Busy)));
+    assert!(
+        matches!(result, Err(LimboError::Busy)),
+        "Expected Busy because write lock is taken, got: {result:?}"
+    );
 
     conn1.execute("COMMIT").unwrap();
 
     // T2 still cannot write because its snapshot is stale and it cannot restart
     let result = conn2.execute("INSERT INTO test (id, value) VALUES (2, 'second')");
-    assert!(matches!(result, Err(LimboError::Busy)));
+    assert!(matches!(result, Err(LimboError::BusySnapshot)), "Expected BusySnapshot because while write lock is free, the connection's snapshot is stale, got: {result:?}");
 
     // T2 must rollback and start fresh
     conn2.execute("ROLLBACK").unwrap();

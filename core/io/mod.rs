@@ -227,6 +227,18 @@ pub trait IO: Clock + Send + Sync {
             "unsupported operation".to_string(),
         ))
     }
+
+    /// Yield the current thread to the scheduler.
+    /// Used for backoff in contended lock acquisition.
+    fn yield_now(&self) {
+        std::thread::yield_now();
+    }
+
+    /// Sleep for the specified duration.
+    /// Used for progressive backoff in contended lock acquisition.
+    fn sleep(&self, duration: std::time::Duration) {
+        std::thread::sleep(duration);
+    }
 }
 
 /// Batches multiple vectored writes for submission.

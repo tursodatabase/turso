@@ -57,6 +57,8 @@ pub enum LimboError {
     Busy,
     #[error("interrupt")]
     Interrupt,
+    #[error("Database snapshot is stale. You must rollback and retry the whole transaction.")]
+    BusySnapshot,
     #[error("Conflict: {0}")]
     Conflict(String),
     #[error("Database schema changed")]
