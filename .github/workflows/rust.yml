@@ -7,15 +7,21 @@ on:
   pull_request:
     branches: ["main"]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_RETRY: 10
 
 jobs:
   cargo-fmt-check:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Check formatting
         run: cargo fmt --check
@@ -31,86 +37,148 @@ jobs:
     runs-on: ${{ matrix.os }}
 
     steps:
-      - uses: actions/checkout@v3
-      - uses: useblacksmith/rust-cache@v3
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Setup mold linker
+        if: runner.os == 'Linux'
+        uses: rui314/setup-mold@v1
+      - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: "v1-rust" # can be updated if we need to reset caches due to non-trivial change in the dependencies (for example, custom env var were set for single workspace project)
+          prefix-key: "v1-rust"
+          cache-on-failure: true
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
       - name: Set up Python 3.10
         uses: useblacksmith/setup-python@v6
         with:
           python-version: "3.10"
       - name: Build
-        run: cargo build --verbose
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: "sccache"
+        run: cargo build --verbose --locked
       - name: Test Checksums
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: "sccache"
         run: |
-          cargo test --features checksum --color=always --lib storage::checksum
-          cargo test --features checksum --color=always --test integration_tests storage::checksum
+          cargo test --features checksum --color=always --lib storage::checksum --locked
+          cargo test --features checksum --color=always --test integration_tests storage::checksum --locked
       - name: Test
         env:
           RUST_LOG: ${{ runner.debug && 'turso_core::storage=trace' || '' }}
-        run: cargo test --verbose --features checksum --test integration_tests
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: "sccache"
+        run: cargo test --verbose --features checksum --test integration_tests --locked
         timeout-minutes: 20
+      - name: Show sccache stats
+        run: ${SCCACHE_PATH} --show-stats
 
   clippy:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust"
+          cache-on-failure: true
       - name: Clippy
         run: |
-          cargo clippy --workspace --all-features --all-targets -- --deny=warnings
+          cargo clippy --workspace --all-features --all-targets --locked -- --deny=warnings
 
   simulator:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 35
     steps:
-      - uses: actions/checkout@v3
-      - uses: useblacksmith/rust-cache@v3
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Setup mold linker
+        uses: rui314/setup-mold@v1
+      - uses: Swatinem/rust-cache@v2
         with:
-          prefix-key: "v1-rust" # can be updated if we need to reset caches due to non-trivial change in the dependencies (for example, custom env var were set for single workspace project)
+          prefix-key: "v1-rust"
+          cache-on-failure: true
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
       # Run these with for loops (instead of --loop flag in sim) so that each iteration gets a separate seed -- this produces much easier-to-debug traces when there's a failure since we don't have to potentially
       # run 10 iterations of the same seed to get to the failure
       - name: Simulator default
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: "sccache"
         run: |
           for i in {1..10}; do
             ./scripts/run-sim --maximum-tests 1000 --min-tick 10 --max-tick 50 --io-backend=memory || exit 1
           done
       - name: Simulator InsertHeavy
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: "sccache"
         run: |
           for i in {1..5}; do
             ./scripts/run-sim --maximum-tests 1000 --min-tick 10 --max-tick 50 --profile write_heavy --io-backend=memory || exit 1
           done
       - name: Simulator InsertHeavySpill
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: "sccache"
         run: |
           for i in {1..5}; do
             ./scripts/run-sim --maximum-tests 1000 --min-tick 10 --max-tick 50 --profile write_heavy_spill --io-backend=memory || exit 1
           done
       - name: Simulator Faultless
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: "sccache"
         run: |
           for i in {1..10}; do
             ./scripts/run-sim --maximum-tests 1000 --min-tick 10 --max-tick 50 --profile faultless --io-backend=memory || exit 1
           done
       - name: Simulator IOUring InsertHeavySpill
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: "sccache"
         run: |
           for i in {1..5}; do
             ./scripts/run-sim --io-backend=io-uring --maximum-tests 1000 --profile=write_heavy_spill || exit 1
           done
       - name: Simulator IOUring Differential
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: "sccache"
         run: |
           for i in {1..10}; do
             ./scripts/run-sim --io-backend=io-uring --maximum-tests 1000 --differential || exit 1
           done
       - name: Simulator Differential
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: "sccache"
         run: |
           for i in {1..10}; do
             ./scripts/run-sim --maximum-tests 1000 --differential --io-backend=memory || exit 1
           done
+      - name: Show sccache stats
+        run: ${SCCACHE_PATH} --show-stats
 
   test-limbo:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Setup mold linker
+        uses: rui314/setup-mold@v1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust"
+          cache-on-failure: true
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: Install uv
         uses: useblacksmith/setup-uv@v4
@@ -122,18 +190,26 @@ jobs:
 
       - uses: "./.github/shared/install_sqlite"
       - name: Test
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: "sccache"
         run: make test
         timeout-minutes: 20
       - name: Test mvcc
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: "sccache"
         run: make test-compat-mvcc
         timeout-minutes: 10
+      - name: Show sccache stats
+        run: ${SCCACHE_PATH} --show-stats
   test-sqlite:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
       - uses: "./.github/shared/install_sqlite"
       - name: build SQLite test extensions
-        run: cargo build --package limbo_sqlite_test_ext
+        run: cargo build --package limbo_sqlite_test_ext --locked
       - name: Test
         run: SQLITE_EXEC="sqlite3" make test-compat
