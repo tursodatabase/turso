@@ -1355,7 +1355,21 @@ impl Program {
                 // Constraint errors do not cause a rollback of the transaction by default;
                 // Instead individual statement subtransactions will roll back and these are handled in op_auto_commit
                 // and op_halt.
-                Some(LimboError::Constraint(_)) => {}
+                // However, in autocommit mode, the statement IS the transaction, so if we never
+                // reach op_halt (e.g. IdxInsert returns Constraint error on duplicate key),
+                // we must rollback here to clean up state.
+                Some(LimboError::Constraint(_)) => {
+                    if self.connection.auto_commit.load(Ordering::SeqCst) {
+                        if let Some(mv_store) = self.connection.mv_store().as_ref() {
+                            if let Some(tx_id) = self.connection.get_mv_tx_id() {
+                                mv_store.rollback_tx(tx_id, pager.clone(), &self.connection);
+                            }
+                        } else {
+                            pager.rollback_tx(&self.connection);
+                        }
+                        self.connection.set_tx_state(TransactionState::None);
+                    }
+                }
                 // Schema updated errors do not cause a rollback; the statement will be reprepared and retried,
                 // and the caller is expected to handle transaction cleanup explicitly if needed.
                 Some(LimboError::SchemaUpdated) => {}
