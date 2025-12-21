@@ -2339,7 +2339,10 @@ pub fn op_transaction_inner(
                             "nested stmt should not begin a new write transaction"
                         );
                         let begin_w_tx_res = pager.begin_write_tx();
-                        if let Err(LimboError::Busy) = begin_w_tx_res {
+                        if matches!(
+                            begin_w_tx_res,
+                            Err(LimboError::Busy | LimboError::BusySnapshot)
+                        ) {
                             // We failed to upgrade to write transaction so put the transaction into its original state.
                             // That is, if the transaction had not started, end the read transaction so that next time we
                             // start a new one.
@@ -2349,7 +2352,7 @@ pub fn op_transaction_inner(
                                 state.auto_txn_cleanup = TxnCleanup::None;
                             }
                             assert_eq!(conn.get_tx_state(), current_state);
-                            return Err(LimboError::Busy);
+                            return Err(begin_w_tx_res.unwrap_err());
                         }
                         if let IOResult::IO(io) = begin_w_tx_res? {
                             // set the transaction state to pending so we don't have to

@@ -1352,6 +1352,11 @@ impl Program {
                 Some(LimboError::TableLocked) => {}
                 // Busy errors do not cause a rollback.
                 Some(LimboError::Busy) => {}
+                // BusySnapshot errors do not cause a rollback either - user must rollback explicitly.
+                // BusySnapshot is distinct from Busy in that a busy_timeout or handler should not be
+                // used because it will not help - the snapshot is permanently stale and rollback is
+                // the only way out for this poor transaction.
+                Some(LimboError::BusySnapshot) => {}
                 // Constraint errors do not cause a rollback of the transaction by default;
                 // Instead individual statement subtransactions will roll back and these are handled in op_auto_commit
                 // and op_halt.

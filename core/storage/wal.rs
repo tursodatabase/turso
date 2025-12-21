@@ -1074,10 +1074,13 @@ impl Wal for WalFile {
                 return Ok(());
             }
 
-            // Snapshot is stale, give up and let caller retry from scratch
+            // Snapshot is stale, give up and let caller retry from scratch.
+            // Return BusySnapshot instead of Busy so the caller knows it must
+            // restart the read transaction to get a fresh snapshot.
+            // Retrying with busy_timeout will NEVER HELP.
             tracing::debug!("unable to upgrade transaction from read to write: snapshot is stale, give up and let caller retry from scratch, self.max_frame={}, shared_max={}", self.max_frame.load(Ordering::Acquire), shared.max_frame.load(Ordering::Acquire));
             shared.write_lock.unlock();
-            Err(LimboError::Busy)
+            Err(LimboError::BusySnapshot)
         })
     }
 
