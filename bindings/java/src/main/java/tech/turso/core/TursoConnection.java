@@ -2,6 +2,7 @@ package tech.turso.core;
 
 import static tech.turso.utils.ByteArrayUtils.stringToUtf8ByteArray;
 
+import java.sql.Connection;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.util.Properties;
@@ -18,6 +19,12 @@ public final class TursoConnection {
   private final long connectionPtr;
   private final TursoDB database;
   private boolean closed;
+
+  // Transaction state fields
+  private boolean autoCommit = true;
+  private int transactionIsolation = Connection.TRANSACTION_SERIALIZABLE;
+  private boolean inTransaction = false;
+  private final Object transactionLock = new Object();
 
   public TursoConnection(String url, String filePath) throws SQLException {
     this(url, filePath, new Properties());
