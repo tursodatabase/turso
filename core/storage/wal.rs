@@ -878,33 +878,56 @@ impl Wal for WalFile {
             self.max_frame_read_lock_index.load(Ordering::Acquire),
             NO_LOCK_HELD
         );
+
+        // Snapshot the shared WAL state. We haven't taken a read lock yet, so we need
+        // to validate these values later.
         let (shared_max, nbackfills, last_checksum, checkpoint_seq, transaction_count) = self
             .with_shared(|shared| {
-                let mx = shared.max_frame.load(Ordering::Acquire);
-                let nb = shared.nbackfills.load(Ordering::Acquire);
-                let ck = shared.last_checksum;
-                let checkpoint_seq = shared.wal_header.lock().checkpoint_seq;
-                let transaction_count = shared.transaction_count.load(Ordering::Acquire);
-                (mx, nb, ck, checkpoint_seq, transaction_count)
+                (
+                    shared.max_frame.load(Ordering::Acquire),
+                    shared.nbackfills.load(Ordering::Acquire),
+                    shared.last_checksum,
+                    shared.wal_header.lock().checkpoint_seq,
+                    shared.transaction_count.load(Ordering::Acquire),
+                )
             });
+
+        // Check if database changed since this connection's last read transaction.
+        // If it has, the connection will invalidate its page cache.
         let db_changed = self.with_shared(|shared| self.db_changed(shared));
 
-        // WAL is already fully back‑filled into the main DB image
-        // (mxFrame == nBackfill). Readers can therefore ignore the
-        // WAL and fetch pages directly from the DB file.  We do this
-        // by taking read‑lock 0, and capturing the latest state.
+        // If WAL is fully checkpointed (shared_max == nbackfills), readers can ignore
+        // the WAL and read directly from the DB file by holding read_locks[0].
         if shared_max == nbackfills {
-            tracing::debug!("begin_read_tx: WAL is already fully back‑filled into the main DB image, shared_max={}, nbackfills={}", shared_max, nbackfills);
-            let lock_0_idx = 0;
-            if !self.with_shared(|shared| shared.read_locks[lock_0_idx].read()) {
-                tracing::debug!("begin_read_tx: read lock 0 is already held, returning Busy");
+            tracing::debug!(
+                "begin_read_tx: WAL fully checkpointed, shared_max={}, nbackfills={}",
+                shared_max,
+                nbackfills
+            );
+            if !self.with_shared(|shared| shared.read_locks[0].read()) {
                 return Err(LimboError::Busy);
             }
-            // we need to keep self.max_frame set to the appropriate
-            // max frame in the wal at the time this transaction starts.
+            // Re-validate: a writer could have appended frames between our snapshot
+            // and lock acquisition. If so, we cannot proceed because we'd not be reading
+            // up to date committed content from the WAL.
+            let (mx2, nb2, cksm2, ckpt_seq2) = self.with_shared(|shared| {
+                (
+                    shared.max_frame.load(Ordering::Acquire),
+                    shared.nbackfills.load(Ordering::Acquire),
+                    shared.last_checksum,
+                    shared.wal_header.lock().checkpoint_seq,
+                )
+            });
+            if mx2 != shared_max
+                || nb2 != nbackfills
+                || cksm2 != last_checksum
+                || ckpt_seq2 != checkpoint_seq
+            {
+                self.with_shared(|shared| shared.read_locks[0].unlock());
+                return Err(LimboError::Busy);
+            }
             self.max_frame.store(shared_max, Ordering::Release);
-            self.max_frame_read_lock_index
-                .store(lock_0_idx, Ordering::Release);
+            self.max_frame_read_lock_index.store(0, Ordering::Release);
             self.min_frame.store(nbackfills + 1, Ordering::Release);
             *self.last_checksum.write() = last_checksum;
             self.checkpoint_seq.store(checkpoint_seq, Ordering::Release);
@@ -947,57 +970,58 @@ impl Wal for WalFile {
             })
         }
 
-        if best_idx == -1 || best_mark != shared_max as u32 {
-            // If we cannot find a valid slot or the highest readmark has a stale max frame, we must return busy;
-            // otherwise we would not see some committed changes.
+        // SQLite only requires finding SOME slot (mxI != 0), not that the mark equals mxFrame.
+        // A stale mark is fine - the reader uses shared_max for reading,
+        // and the mark just tells the checkpointer what frames are protected.
+        if best_idx == -1 {
             return Err(LimboError::Busy);
         }
 
-        // Now take a shared read on that slot, and if we are successful,
-        // grab another snapshot of the shared state.
-        let (mx2, nb2, cksm2, ckpt_seq2) = self.with_shared(|shared| {
+        // Now acquire shared read lock on the chosen slot.
+        let read_result = self.with_shared(|shared| {
             if !shared.read_locks[best_idx as usize].read() {
-                // TODO: we should retry here instead of always returning Busy
-                return Err(LimboError::Busy);
+                return None;
             }
-            let checkpoint_seq = shared.wal_header.lock().checkpoint_seq;
-            Ok((
+            Some((
                 shared.max_frame.load(Ordering::Acquire),
                 shared.nbackfills.load(Ordering::Acquire),
                 shared.last_checksum,
-                checkpoint_seq,
+                shared.wal_header.lock().checkpoint_seq,
+                shared.read_locks[best_idx as usize].get_value(),
             ))
-        })?;
+        });
 
-        // sqlite/src/wal.c 3225
-        // Now that the read-lock has been obtained, check that neither the
-        // value in the aReadMark[] array or the contents of the wal-index
-        // header have changed.
+        let Some((mx2, nb2, cksm2, ckpt_seq2, current_slot_mark)) = read_result else {
+            return Err(LimboError::Busy);
+        };
+
+        // Re-validate state after acquiring the lock. Each check prevents a correctness violation:
         //
-        // It is necessary to check that the wal-index header did not change
-        // between the time it was read and when the shared-lock was obtained
-        // on WAL_READ_LOCK(mxI) was obtained to account for the possibility
-        // that the log file may have been wrapped by a writer, or that frames
-        // that occur later in the log than pWal->hdr.mxFrame may have been
-        // copied into the database by a checkpointer. If either of these things
-        // happened, then reading the database with the current value of
-        // pWal->hdr.mxFrame risks reading a corrupted snapshot. So, retry
-        // instead.
+        // - current_slot_mark != best_mark: Between releasing the exclusive lock (after updating
+        //   the slot) and acquiring this shared lock, another thread can exclusively lock and
+        //   modify the slot. The checkpointer uses the slot's value to decide how far it can
+        //   checkpoint. If the slot now says 700 but we recorded 500, the checkpointer may
+        //   overwrite DB pages for frames 501-700 that we expect to read from the WAL.
         //
-        // Before checking that the live wal-index header has not changed
-        // since it was read, set Wal.minFrame to the first frame in the wal
-        // file that has not yet been checkpointed. This client will not need
-        // to read any frames earlier than minFrame from the wal file - they
-        // can be safely read directly from the database file.
-        if mx2 != shared_max
+        // - mx2 != shared_max: A writer appended frames. We must retry to see them.
+        //
+        // - nb2 != nbackfills: A checkpointer advanced. We'd set min_frame wrong, potentially
+        //   trying to read frames from WAL that were already overwritten.
+        //
+        // - cksm2 != last_checksum: WAL content changed (e.g., rollback reused frame slots).
+        //
+        // - ckpt_seq2 != checkpoint_seq: WAL was reset. Frame numbers are now meaningless.
+        if current_slot_mark != best_mark
+            || mx2 != shared_max
             || nb2 != nbackfills
             || cksm2 != last_checksum
             || ckpt_seq2 != checkpoint_seq
         {
+            self.with_shared(|shared| shared.read_locks[best_idx as usize].unlock());
             return Err(LimboError::Busy);
         }
         self.min_frame.store(nb2 + 1, Ordering::Release);
-        self.max_frame.store(best_mark as u64, Ordering::Release);
+        self.max_frame.store(shared_max, Ordering::Release);
         self.max_frame_read_lock_index
             .store(best_idx as usize, Ordering::Release);
         *self.last_checksum.write() = last_checksum;
@@ -2568,6 +2592,7 @@ impl WalFile {
         })
     }
 
+    /// Check if database changed since this connection's last read transaction.
     fn db_changed(&self, shared: &WalFileShared) -> bool {
         let shared_max = shared.max_frame.load(Ordering::Acquire);
         let nbackfills = shared.nbackfills.load(Ordering::Acquire);
