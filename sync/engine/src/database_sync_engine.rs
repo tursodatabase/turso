@@ -360,7 +360,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 partial_bootstrap_opts
                     .clone()
                     .expect("partial sync opts are set here"),
-            ))
+            )?)
         } else {
             Arc::new(turso_core::storage::database::DatabaseFile::new(db_file))
         };
@@ -651,9 +651,21 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     );
                     continue;
                 }
-                if !main_conn.try_wal_watermark_read_page(page_no, &mut page, Some(watermark))? {
+
+                let begin_read_result =
+                    main_conn.try_wal_watermark_read_page_begin(page_no, Some(watermark))?;
+                let end_read_result = match begin_read_result {
+                    Some((page_ref, c)) => {
+                        while !c.succeeded() {
+                            let _ = coro.yield_(crate::types::SyncEngineIoResult::IO).await;
+                        }
+                        main_conn.try_wal_watermark_read_page_end(&mut page, page_ref)?
+                    }
+                    None => false,
+                };
+                if !end_read_result {
                     tracing::info!(
-                        "checkpoint(path={:?}): skip page {} as it was allocated in the wAL portion for revert",
+                        "checkpoint(path={:?}): skip page {} as it was allocated in the WAL portion for revert",
                         self.main_db_path,
                         page_no
                     );
@@ -820,7 +832,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             watermark,
             main_conn.wal_state()?.max_frame
         );
-        let local_rollback = main_session.rollback_changes_after(watermark)?;
+        let local_rollback = main_session.rollback_changes_after(coro, watermark).await?;
         let mut frame = [0u8; WAL_FRAME_SIZE];
 
         let remote_rollback = revert_conn.wal_state()?.max_frame;

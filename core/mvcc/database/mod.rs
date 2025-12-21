@@ -36,7 +36,7 @@ use std::collections::HashMap;
 use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::ops::Bound;
-use std::sync::atomic::AtomicI64;
+use std::sync::atomic::{AtomicBool, AtomicI64};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tracing::instrument;
@@ -1110,6 +1110,16 @@ pub const SQLITE_SCHEMA_MVCC_TABLE_ID: MVTableId = MVTableId(-1);
 pub const LOGICAL_LOG_RECOVERY_TRANSACTION_ID: u64 = 0;
 pub const LOGICAL_LOG_RECOVERY_COMMIT_TIMESTAMP: u64 = 0;
 
+#[derive(Debug)]
+pub struct RowidAllocator {
+    /// Lock to ensure that only one thread can initialize the rowid allocator at a time.
+    /// In case of unitialized values, we will look for last rowid first.
+    lock: TursoRwLock,
+    /// last_rowid is the last rowid that was allocated.
+    max_rowid: RwLock<Option<i64>>,
+    initialized: AtomicBool,
+}
+
 /// A multi-version concurrency control database.
 #[derive(Debug)]
 pub struct MvStore<Clock: LogicalClock> {
@@ -1165,6 +1175,7 @@ pub struct MvStore<Clock: LogicalClock> {
     /// If there are two concurrent BEGIN (non-CONCURRENT) transactions, and one tries to promote
     /// to exclusive, it will abort if another transaction committed after its begin timestamp.
     last_committed_tx_ts: AtomicU64,
+    table_id_to_last_rowid: RwLock<HashMap<MVTableId, Arc<RowidAllocator>>>,
 }
 
 impl<Clock: LogicalClock> MvStore<Clock> {
@@ -1189,6 +1200,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             checkpointed_txid_max: AtomicU64::new(0),
             last_committed_schema_change_ts: AtomicU64::new(0),
             last_committed_tx_ts: AtomicU64::new(0),
+            table_id_to_last_rowid: RwLock::new(HashMap::new()),
         }
     }
 
@@ -1350,6 +1362,8 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     btree_resident: false,
                 };
                 tx.insert_to_write_set(id.clone());
+                let allocator = self.get_rowid_allocator(&id.table_id);
+                allocator.insert_row_id_maybe_update(id.row_id.to_int_or_panic());
                 self.insert_version(id, row_version);
             }
         }
@@ -2759,6 +2773,76 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         } else {
             table_id
         }
+    }
+
+    pub fn get_rowid_allocator(&self, table_id: &MVTableId) -> Arc<RowidAllocator> {
+        let mut map = self.table_id_to_last_rowid.write();
+        if map.contains_key(table_id) {
+            map.get(table_id).unwrap().clone()
+        } else {
+            let allocator = Arc::new(RowidAllocator {
+                lock: TursoRwLock::new(),
+                max_rowid: RwLock::new(None),
+                initialized: AtomicBool::new(false),
+            });
+            map.insert(*table_id, allocator.clone());
+            allocator
+        }
+    }
+}
+
+impl RowidAllocator {
+    /// Returns None if no rowid could be allocated.
+    /// Returns Some((new_rowid, prev_last_rowid)) where prev_last_rowid is None if table was empty
+    pub fn get_next_rowid(&self) -> Option<(i64, Option<i64>)> {
+        let mut last_rowid_guard = self.max_rowid.write();
+        if last_rowid_guard.is_none() {
+            // Case 1. Table is empty
+            // Database is empty because there is no last rowid
+            *last_rowid_guard = Some(1);
+            tracing::trace!("get_next_rowid(empty, 1)");
+            Some((1, None))
+        } else {
+            // Case 2. Table is not empty
+            let last_rowid = last_rowid_guard.unwrap();
+            if last_rowid == i64::MAX {
+                tracing::trace!("get_next_rowid(max)");
+                None
+            } else {
+                let next_rowid = last_rowid + 1;
+                *last_rowid_guard = Some(next_rowid);
+                tracing::trace!("get_next_rowid({next_rowid})");
+                Some((next_rowid, Some(last_rowid)))
+            }
+        }
+    }
+
+    pub fn insert_row_id_maybe_update(&self, rowid: i64) {
+        let mut last_rowid = self.max_rowid.write();
+        if let Some(last_rowid) = last_rowid.as_mut() {
+            *last_rowid = (*last_rowid).max(rowid);
+        } else {
+            *last_rowid = Some(rowid);
+        }
+    }
+
+    pub fn is_uninitialized(&self) -> bool {
+        !self.initialized.load(Ordering::SeqCst)
+    }
+
+    pub fn initialize(&self, rowid: Option<i64>) {
+        tracing::trace!("initialize({rowid:?})");
+        let mut last_rowid = self.max_rowid.write();
+        *last_rowid = rowid;
+        self.initialized.store(true, Ordering::SeqCst);
+    }
+
+    pub fn lock(&self) -> bool {
+        self.lock.write()
+    }
+
+    pub fn unlock(&self) {
+        self.lock.unlock()
     }
 }
 

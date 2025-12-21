@@ -22,13 +22,11 @@ fn journal_mode_delete_lost_on_switch() {
     // Create schema
     let schema = "CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT);";
 
-    // Open with MVCC enabled
-    let opts = turso_core::DatabaseOpts::new().with_mvcc(true);
-    let limbo_db = TempDatabaseBuilder::new()
-        .with_db_path(&db_path)
-        .with_opts(opts)
-        .build();
+    // Open and enable MVCC via PRAGMA
+    let limbo_db = TempDatabaseBuilder::new().with_db_path(&db_path).build();
     let conn = limbo_db.connect_limbo();
+    conn.pragma_update("journal_mode", "'experimental_mvcc'")
+        .expect("enable mvcc");
 
     // Create table
     conn.prepare_execute_batch(schema).unwrap();
@@ -123,13 +121,11 @@ fn journal_mode_update_then_delete_btree_resident() {
 
     let schema = "CREATE TABLE t(id INTEGER PRIMARY KEY, val TEXT);";
 
-    // Open with MVCC enabled
-    let opts = turso_core::DatabaseOpts::new().with_mvcc(true);
-    let limbo_db = TempDatabaseBuilder::new()
-        .with_db_path(&db_path)
-        .with_opts(opts)
-        .build();
+    // Open and enable MVCC via PRAGMA
+    let limbo_db = TempDatabaseBuilder::new().with_db_path(&db_path).build();
     let conn = limbo_db.connect_limbo();
+    conn.pragma_update("journal_mode", "'experimental_mvcc'")
+        .expect("enable mvcc");
 
     // Create table
     conn.prepare_execute_batch(schema).unwrap();
@@ -233,8 +229,10 @@ pub fn journal_mode_fuzz(db: TempDatabase) {
         CREATE TABLE t2(id INTEGER PRIMARY KEY, data TEXT, count INT);
     "#;
 
+    let start_with_mvcc = db.enable_mvcc;
+
     // If the test does not start with MVCC, initially open the DB in sqlite with WAL mode
-    if !db.db_opts.enable_mvcc {
+    if !start_with_mvcc {
         // Step 1: Create a proper WAL database using SQLite first
         // This ensures the database is properly initialized before Limbo opens it
         {
@@ -248,18 +246,22 @@ pub fn journal_mode_fuzz(db: TempDatabase) {
         }
     }
 
-    // Step 2: Open the database with Limbo with MVCC enabled
-    let opts = db.db_opts.with_mvcc(true);
+    // Step 2: Open the database with Limbo
     let builder = TempDatabaseBuilder::new()
         .with_db_path(&db_path)
         .with_flags(db.db_flags)
-        .with_opts(opts);
+        .with_opts(db.db_opts);
 
     let limbo_db = builder.build();
     let limbo_conn = limbo_db.connect_limbo();
 
+    // Enable MVCC via PRAGMA
+    limbo_conn
+        .pragma_update("journal_mode", "'experimental_mvcc'")
+        .expect("enable mvcc");
+
     // If starting with MVCC, create the schema in Limbo
-    if db.db_opts.enable_mvcc {
+    if start_with_mvcc {
         limbo_conn.prepare_execute_batch(schema).unwrap();
     }
 

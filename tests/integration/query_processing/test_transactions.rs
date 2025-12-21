@@ -78,13 +78,16 @@ fn test_deferred_transaction_no_restart(tmp_db: TempDatabase) {
         .unwrap();
 
     let result = conn2.execute("INSERT INTO test (id, value) VALUES (2, 'second')");
-    assert!(matches!(result, Err(LimboError::Busy)));
+    assert!(
+        matches!(result, Err(LimboError::Busy)),
+        "Expected Busy because write lock is taken, got: {result:?}"
+    );
 
     conn1.execute("COMMIT").unwrap();
 
     // T2 still cannot write because its snapshot is stale and it cannot restart
     let result = conn2.execute("INSERT INTO test (id, value) VALUES (2, 'second')");
-    assert!(matches!(result, Err(LimboError::Busy)));
+    assert!(matches!(result, Err(LimboError::BusySnapshot)), "Expected BusySnapshot because while write lock is free, the connection's snapshot is stale, got: {result:?}");
 
     // T2 must rollback and start fresh
     conn2.execute("ROLLBACK").unwrap();
@@ -140,36 +143,22 @@ fn test_transaction_visibility(tmp_db: TempDatabase) {
         .unwrap();
 
     let mut stmt = conn2.query("SELECT COUNT(*) FROM test").unwrap().unwrap();
-    loop {
-        match stmt.step().unwrap() {
-            StepResult::Row => {
-                let row = stmt.row().unwrap();
-                assert_eq!(*row.get::<&Value>(0).unwrap(), Value::Integer(1));
-            }
-            StepResult::IO => stmt.run_once().unwrap(),
-            StepResult::Done => break,
-            StepResult::Busy => panic!("database is busy"),
-            StepResult::Interrupt => panic!("interrupted"),
-        }
-    }
+    stmt.run_with_row_callback(|row| {
+        assert_eq!(*row.get::<&Value>(0).unwrap(), Value::Integer(1));
+        Ok(())
+    })
+    .unwrap();
 
     conn1
         .execute("CREATE TABLE test2 (id INTEGER PRIMARY KEY, value TEXT)")
         .unwrap();
 
     let mut stmt = conn2.query("SELECT COUNT(*) FROM test2").unwrap().unwrap();
-    loop {
-        match stmt.step().unwrap() {
-            StepResult::Row => {
-                let row = stmt.row().unwrap();
-                assert_eq!(*row.get::<&Value>(0).unwrap(), Value::Integer(0));
-            }
-            StepResult::IO => stmt.run_once().unwrap(),
-            StepResult::Done => break,
-            StepResult::Busy => panic!("database is busy"),
-            StepResult::Interrupt => panic!("interrupted"),
-        }
-    }
+    stmt.run_with_row_callback(|row| {
+        assert_eq!(*row.get::<&Value>(0).unwrap(), Value::Integer(0));
+        Ok(())
+    })
+    .unwrap();
 }
 
 #[turso_macros::test]
@@ -353,10 +342,7 @@ fn test_mvcc_update_basic(tmp_db: TempDatabase) {
 
 #[test]
 fn test_mvcc_concurrent_insert_basic() {
-    let tmp_db = TempDatabase::new_with_opts(
-        "test_mvcc_update_basic.db",
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db = TempDatabase::new_with_mvcc("test_mvcc_update_basic.db");
     let conn1 = tmp_db.connect_limbo();
     let conn2 = tmp_db.connect_limbo();
 
@@ -431,10 +417,7 @@ fn test_mvcc_update_same_row_twice(tmp_db: TempDatabase) {
 
 #[test]
 fn test_mvcc_concurrent_conflicting_update() {
-    let tmp_db = TempDatabase::new_with_opts(
-        "test_mvcc_concurrent_conflicting_update.db",
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db = TempDatabase::new_with_mvcc("test_mvcc_concurrent_conflicting_update.db");
     let conn1 = tmp_db.connect_limbo();
     let conn2 = tmp_db.connect_limbo();
 
@@ -460,10 +443,7 @@ fn test_mvcc_concurrent_conflicting_update() {
 
 #[test]
 fn test_mvcc_concurrent_conflicting_update_2() {
-    let tmp_db = TempDatabase::new_with_opts(
-        "test_mvcc_concurrent_conflicting_update.db",
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db = TempDatabase::new_with_mvcc("test_mvcc_concurrent_conflicting_update.db");
     let conn1 = tmp_db.connect_limbo();
     let conn2 = tmp_db.connect_limbo();
 
@@ -489,10 +469,7 @@ fn test_mvcc_concurrent_conflicting_update_2() {
 
 #[test]
 fn test_mvcc_checkpoint_works() {
-    let tmp_db = TempDatabase::new_with_opts(
-        "test_mvcc_checkpoint_works.db",
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db = TempDatabase::new_with_mvcc("test_mvcc_checkpoint_works.db");
 
     // Create table
     let conn = tmp_db.connect_limbo();
@@ -594,9 +571,8 @@ fn query_and_log(conn: &Arc<Connection>, query: &str) -> Result<Option<Statement
 
 #[test]
 fn test_mvcc_recovery_of_both_checkpointed_and_noncheckpointed_tables_works() {
-    let tmp_db = TempDatabase::new_with_opts(
+    let tmp_db = TempDatabase::new_with_mvcc(
         "test_mvcc_recovery_of_both_checkpointed_and_noncheckpointed_tables_works.db",
-        turso_core::DatabaseOpts::new().with_mvcc(true),
     );
     let conn = tmp_db.connect_limbo();
 
@@ -654,10 +630,7 @@ fn test_mvcc_recovery_of_both_checkpointed_and_noncheckpointed_tables_works() {
     drop(tmp_db);
 
     // Close and reopen database
-    let tmp_db = TempDatabase::new_with_existent_with_opts(
-        &path,
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db = TempDatabase::new_with_existent(&path);
     let conn = tmp_db.connect_limbo();
 
     // Verify table1 rows
@@ -709,10 +682,7 @@ fn test_non_mvcc_to_mvcc() {
     drop(tmp_db);
 
     // Reopen in mvcc mode
-    let tmp_db = TempDatabase::new_with_existent_with_opts(
-        &path,
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db = TempDatabase::new_with_existent(&path);
     let conn = tmp_db.connect_limbo();
 
     // Query should work
@@ -726,39 +696,19 @@ fn test_non_mvcc_to_mvcc() {
 
 fn helper_read_all_rows(mut stmt: turso_core::Statement) -> Vec<Vec<Value>> {
     let mut ret = Vec::new();
-    loop {
-        match stmt.step().unwrap() {
-            StepResult::Row => {
-                ret.push(stmt.row().unwrap().get_values().cloned().collect());
-            }
-            StepResult::IO => stmt.run_once().unwrap(),
-            StepResult::Done => break,
-            StepResult::Busy => panic!("database is busy"),
-            StepResult::Interrupt => panic!("interrupted"),
-        }
-    }
+    stmt.run_with_row_callback(|row| {
+        ret.push(row.get_values().cloned().collect());
+        Ok(())
+    })
+    .unwrap();
+
     ret
 }
 
 fn helper_read_single_row(mut stmt: turso_core::Statement) -> Vec<Value> {
-    let mut read_count = 0;
-    let mut ret = None;
-    loop {
-        match stmt.step().unwrap() {
-            StepResult::Row => {
-                assert_eq!(read_count, 0);
-                read_count += 1;
-                let row = stmt.row().unwrap();
-                ret = Some(row.get_values().cloned().collect());
-            }
-            StepResult::IO => stmt.run_once().unwrap(),
-            StepResult::Done => break,
-            StepResult::Busy => panic!("database is busy"),
-            StepResult::Interrupt => panic!("interrupted"),
-        }
-    }
+    let ret = stmt.run_one_step_blocking(|| Ok(()), || Ok(())).unwrap();
 
-    ret.unwrap()
+    ret.map(|row| row.get_values().cloned().collect()).unwrap()
 }
 
 // Helper function to verify table contents
@@ -776,10 +726,7 @@ fn verify_table_contents(conn: &Arc<Connection>, expected: Vec<i64>) {
 
 #[test]
 fn test_mvcc_recovery_with_index_and_deletes() {
-    let tmp_db = TempDatabase::new_with_opts(
-        "test_mvcc_recovery_with_index_and_deletes.db",
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db = TempDatabase::new_with_mvcc("test_mvcc_recovery_with_index_and_deletes.db");
     let conn = tmp_db.connect_limbo();
 
     // Create table with unique constraint (creates an index)
@@ -799,10 +746,7 @@ fn test_mvcc_recovery_with_index_and_deletes() {
     drop(tmp_db);
 
     // Reopen database (triggers logical log recovery)
-    let tmp_db = TempDatabase::new_with_existent_with_opts(
-        &path,
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db = TempDatabase::new_with_existent(&path);
     let conn = tmp_db.connect_limbo();
 
     // Verify only rows 1, 3, 5 exist
@@ -823,9 +767,8 @@ fn test_mvcc_recovery_with_index_and_deletes() {
 
 #[test]
 fn test_mvcc_checkpoint_before_delete_then_verify_same_session() {
-    let tmp_db = TempDatabase::new_with_opts(
+    let tmp_db = TempDatabase::new_with_mvcc(
         "test_mvcc_checkpoint_before_delete_then_verify_same_session.db",
-        turso_core::DatabaseOpts::new().with_mvcc(true),
     );
     let conn = tmp_db.connect_limbo();
 
@@ -844,10 +787,7 @@ fn test_mvcc_checkpoint_before_delete_then_verify_same_session() {
 
 #[test]
 fn test_mvcc_checkpoint_before_delete_then_reopen() {
-    let tmp_db = TempDatabase::new_with_opts(
-        "test_mvcc_checkpoint_before_delete_then_reopen.db",
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db = TempDatabase::new_with_mvcc("test_mvcc_checkpoint_before_delete_then_reopen.db");
     let conn = tmp_db.connect_limbo();
 
     execute_and_log(&conn, "CREATE TABLE t (x)").unwrap();
@@ -864,10 +804,7 @@ fn test_mvcc_checkpoint_before_delete_then_reopen() {
     drop(conn);
     drop(tmp_db);
 
-    let tmp_db = TempDatabase::new_with_existent_with_opts(
-        &path,
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db = TempDatabase::new_with_existent(&path);
     let conn = tmp_db.connect_limbo();
 
     verify_table_contents(&conn, vec![1, 3]);
@@ -875,10 +812,8 @@ fn test_mvcc_checkpoint_before_delete_then_reopen() {
 
 #[test]
 fn test_mvcc_delete_then_checkpoint_then_verify_same_session() {
-    let tmp_db = TempDatabase::new_with_opts(
-        "test_mvcc_delete_then_checkpoint_then_verify_same_session.db",
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db =
+        TempDatabase::new_with_mvcc("test_mvcc_delete_then_checkpoint_then_verify_same_session.db");
     let conn = tmp_db.connect_limbo();
 
     execute_and_log(&conn, "CREATE TABLE t (x)").unwrap();
@@ -896,10 +831,7 @@ fn test_mvcc_delete_then_checkpoint_then_verify_same_session() {
 
 #[test]
 fn test_mvcc_delete_then_checkpoint_then_reopen() {
-    let tmp_db = TempDatabase::new_with_opts(
-        "test_mvcc_delete_then_checkpoint_then_reopen.db",
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db = TempDatabase::new_with_mvcc("test_mvcc_delete_then_checkpoint_then_reopen.db");
     let conn = tmp_db.connect_limbo();
 
     execute_and_log(&conn, "CREATE TABLE t (x)").unwrap();
@@ -916,10 +848,7 @@ fn test_mvcc_delete_then_checkpoint_then_reopen() {
     drop(conn);
     drop(tmp_db);
 
-    let tmp_db = TempDatabase::new_with_existent_with_opts(
-        &path,
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db = TempDatabase::new_with_existent(&path);
     let conn = tmp_db.connect_limbo();
 
     verify_table_contents(&conn, vec![1, 3]);
@@ -927,10 +856,7 @@ fn test_mvcc_delete_then_checkpoint_then_reopen() {
 
 #[test]
 fn test_mvcc_delete_then_reopen_no_checkpoint() {
-    let tmp_db = TempDatabase::new_with_opts(
-        "test_mvcc_delete_then_reopen_no_checkpoint.db",
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db = TempDatabase::new_with_mvcc("test_mvcc_delete_then_reopen_no_checkpoint.db");
     let conn = tmp_db.connect_limbo();
 
     execute_and_log(&conn, "CREATE TABLE t (x)").unwrap();
@@ -946,10 +872,7 @@ fn test_mvcc_delete_then_reopen_no_checkpoint() {
     drop(conn);
     drop(tmp_db);
 
-    let tmp_db = TempDatabase::new_with_existent_with_opts(
-        &path,
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db = TempDatabase::new_with_existent(&path);
     let conn = tmp_db.connect_limbo();
 
     verify_table_contents(&conn, vec![1, 3]);
@@ -957,9 +880,8 @@ fn test_mvcc_delete_then_reopen_no_checkpoint() {
 
 #[test]
 fn test_mvcc_checkpoint_delete_checkpoint_then_verify_same_session() {
-    let tmp_db = TempDatabase::new_with_opts(
+    let tmp_db = TempDatabase::new_with_mvcc(
         "test_mvcc_checkpoint_delete_checkpoint_then_verify_same_session.db",
-        turso_core::DatabaseOpts::new().with_mvcc(true),
     );
     let conn = tmp_db.connect_limbo();
 
@@ -979,10 +901,8 @@ fn test_mvcc_checkpoint_delete_checkpoint_then_verify_same_session() {
 
 #[test]
 fn test_mvcc_checkpoint_delete_checkpoint_then_reopen() {
-    let tmp_db = TempDatabase::new_with_opts(
-        "test_mvcc_checkpoint_delete_checkpoint_then_reopen.db",
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db =
+        TempDatabase::new_with_mvcc("test_mvcc_checkpoint_delete_checkpoint_then_reopen.db");
     let conn = tmp_db.connect_limbo();
 
     execute_and_log(&conn, "CREATE TABLE t (x)").unwrap();
@@ -1000,10 +920,7 @@ fn test_mvcc_checkpoint_delete_checkpoint_then_reopen() {
     drop(conn);
     drop(tmp_db);
 
-    let tmp_db = TempDatabase::new_with_existent_with_opts(
-        &path,
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db = TempDatabase::new_with_existent(&path);
     let conn = tmp_db.connect_limbo();
 
     verify_table_contents(&conn, vec![1, 3]);
@@ -1011,10 +928,8 @@ fn test_mvcc_checkpoint_delete_checkpoint_then_reopen() {
 
 #[test]
 fn test_mvcc_index_before_checkpoint_delete_after_checkpoint() {
-    let tmp_db = TempDatabase::new_with_opts(
-        "test_mvcc_index_before_checkpoint_delete_after_checkpoint.db",
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db =
+        TempDatabase::new_with_mvcc("test_mvcc_index_before_checkpoint_delete_after_checkpoint.db");
     let conn = tmp_db.connect_limbo();
 
     execute_and_log(&conn, "CREATE TABLE t (x)").unwrap();
@@ -1031,10 +946,7 @@ fn test_mvcc_index_before_checkpoint_delete_after_checkpoint() {
     drop(conn);
     drop(tmp_db);
 
-    let tmp_db = TempDatabase::new_with_existent_with_opts(
-        &path,
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db = TempDatabase::new_with_existent(&path);
     let conn = tmp_db.connect_limbo();
 
     verify_table_contents(&conn, vec![1, 3]);
@@ -1042,10 +954,8 @@ fn test_mvcc_index_before_checkpoint_delete_after_checkpoint() {
 
 #[test]
 fn test_mvcc_index_after_checkpoint_delete_after_index() {
-    let tmp_db = TempDatabase::new_with_opts(
-        "test_mvcc_index_after_checkpoint_delete_after_index.db",
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db =
+        TempDatabase::new_with_mvcc("test_mvcc_index_after_checkpoint_delete_after_index.db");
     let conn = tmp_db.connect_limbo();
 
     execute_and_log(&conn, "CREATE TABLE t (x)").unwrap();
@@ -1062,10 +972,7 @@ fn test_mvcc_index_after_checkpoint_delete_after_index() {
     drop(conn);
     drop(tmp_db);
 
-    let tmp_db = TempDatabase::new_with_existent_with_opts(
-        &path,
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db = TempDatabase::new_with_existent(&path);
     let conn = tmp_db.connect_limbo();
 
     verify_table_contents(&conn, vec![1, 3]);
@@ -1073,10 +980,7 @@ fn test_mvcc_index_after_checkpoint_delete_after_index() {
 
 #[test]
 fn test_mvcc_multiple_deletes_with_checkpoints() {
-    let tmp_db = TempDatabase::new_with_opts(
-        "test_mvcc_multiple_deletes_with_checkpoints.db",
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db = TempDatabase::new_with_mvcc("test_mvcc_multiple_deletes_with_checkpoints.db");
     let conn = tmp_db.connect_limbo();
 
     execute_and_log(&conn, "CREATE TABLE t (x)").unwrap();
@@ -1097,10 +1001,7 @@ fn test_mvcc_multiple_deletes_with_checkpoints() {
     drop(conn);
     drop(tmp_db);
 
-    let tmp_db = TempDatabase::new_with_existent_with_opts(
-        &path,
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db = TempDatabase::new_with_existent(&path);
     let conn = tmp_db.connect_limbo();
 
     verify_table_contents(&conn, vec![1, 3, 5]);
@@ -1108,10 +1009,7 @@ fn test_mvcc_multiple_deletes_with_checkpoints() {
 
 #[test]
 fn test_mvcc_no_index_checkpoint_delete_reopen() {
-    let tmp_db = TempDatabase::new_with_opts(
-        "test_mvcc_no_index_checkpoint_delete_reopen.db",
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db = TempDatabase::new_with_mvcc("test_mvcc_no_index_checkpoint_delete_reopen.db");
     let conn = tmp_db.connect_limbo();
 
     execute_and_log(&conn, "CREATE TABLE t (x)").unwrap();
@@ -1127,10 +1025,7 @@ fn test_mvcc_no_index_checkpoint_delete_reopen() {
     drop(conn);
     drop(tmp_db);
 
-    let tmp_db = TempDatabase::new_with_existent_with_opts(
-        &path,
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db = TempDatabase::new_with_existent(&path);
     let conn = tmp_db.connect_limbo();
 
     verify_table_contents(&conn, vec![1, 3]);
@@ -1138,9 +1033,8 @@ fn test_mvcc_no_index_checkpoint_delete_reopen() {
 
 #[test]
 fn test_mvcc_checkpoint_before_insert_delete_after_checkpoint() {
-    let tmp_db = TempDatabase::new_with_opts(
+    let tmp_db = TempDatabase::new_with_mvcc(
         "test_mvcc_checkpoint_before_insert_delete_after_checkpoint.db",
-        turso_core::DatabaseOpts::new().with_mvcc(true),
     );
     let conn = tmp_db.connect_limbo();
 
@@ -1166,10 +1060,7 @@ fn test_mvcc_checkpoint_before_insert_delete_after_checkpoint() {
     drop(conn);
     drop(tmp_db);
 
-    let tmp_db = TempDatabase::new_with_existent_with_opts(
-        &path,
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db = TempDatabase::new_with_existent(&path);
     let conn = tmp_db.connect_limbo();
 
     verify_table_contents(&conn, vec![1, 4]);
@@ -1183,10 +1074,7 @@ fn test_mvcc_checkpoint_before_insert_delete_after_checkpoint() {
 /// Seeking for various rowids should find them in the correct location.
 #[test]
 fn test_mvcc_dual_seek_table_rowid_basic() {
-    let tmp_db = TempDatabase::new_with_opts(
-        "test_mvcc_dual_seek_table_rowid_basic.db",
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db = TempDatabase::new_with_mvcc("test_mvcc_dual_seek_table_rowid_basic.db");
     let conn = tmp_db.connect_limbo();
 
     // Create table and insert initial rows
@@ -1203,10 +1091,7 @@ fn test_mvcc_dual_seek_table_rowid_basic() {
     drop(tmp_db);
 
     // Reopen to ensure btree is populated and MV store is empty
-    let tmp_db = TempDatabase::new_with_existent_with_opts(
-        &path,
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db = TempDatabase::new_with_existent(&path);
     let conn = tmp_db.connect_limbo();
 
     // Insert more rows into MVCC
@@ -1254,10 +1139,7 @@ fn test_mvcc_dual_seek_table_rowid_basic() {
 /// Btree has odd numbers (1,3,5,7,9), MVCC has even numbers (2,4,6,8,10).
 #[test]
 fn test_mvcc_dual_seek_interleaved_rows() {
-    let tmp_db = TempDatabase::new_with_opts(
-        "test_mvcc_dual_seek_interleaved_rows.db",
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db = TempDatabase::new_with_mvcc("test_mvcc_dual_seek_interleaved_rows.db");
     let conn = tmp_db.connect_limbo();
 
     // Create table and insert odd rows
@@ -1274,10 +1156,7 @@ fn test_mvcc_dual_seek_interleaved_rows() {
     drop(tmp_db);
 
     // Reopen
-    let tmp_db = TempDatabase::new_with_existent_with_opts(
-        &path,
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db = TempDatabase::new_with_existent(&path);
     let conn = tmp_db.connect_limbo();
 
     // Insert even rows into MVCC
@@ -1319,10 +1198,7 @@ fn test_mvcc_dual_seek_interleaved_rows() {
 /// Test index seek with rows in both btree and MVCC.
 #[test]
 fn test_mvcc_dual_seek_index_basic() {
-    let tmp_db = TempDatabase::new_with_opts(
-        "test_mvcc_dual_seek_index_basic.db",
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db = TempDatabase::new_with_mvcc("test_mvcc_dual_seek_index_basic.db");
     let conn = tmp_db.connect_limbo();
 
     // Create table with index
@@ -1342,10 +1218,7 @@ fn test_mvcc_dual_seek_index_basic() {
     drop(tmp_db);
 
     // Reopen
-    let tmp_db = TempDatabase::new_with_existent_with_opts(
-        &path,
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db = TempDatabase::new_with_existent(&path);
     let conn = tmp_db.connect_limbo();
 
     // Insert more rows into MVCC
@@ -1387,10 +1260,7 @@ fn test_mvcc_dual_seek_index_basic() {
 /// The seek should find the MVCC version (which shadows btree).
 #[test]
 fn test_mvcc_dual_seek_with_update() {
-    let tmp_db = TempDatabase::new_with_opts(
-        "test_mvcc_dual_seek_with_update.db",
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db = TempDatabase::new_with_mvcc("test_mvcc_dual_seek_with_update.db");
     let conn = tmp_db.connect_limbo();
 
     // Create table and insert rows
@@ -1411,10 +1281,7 @@ fn test_mvcc_dual_seek_with_update() {
     drop(tmp_db);
 
     // Reopen
-    let tmp_db = TempDatabase::new_with_existent_with_opts(
-        &path,
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db = TempDatabase::new_with_existent(&path);
     let conn = tmp_db.connect_limbo();
 
     // Update row 3 (creates MVCC version that shadows btree)
@@ -1455,10 +1322,7 @@ fn test_mvcc_dual_seek_with_update() {
 /// The seek should NOT find the deleted row.
 #[test]
 fn test_mvcc_dual_seek_with_delete() {
-    let tmp_db = TempDatabase::new_with_opts(
-        "test_mvcc_dual_seek_with_delete.db",
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db = TempDatabase::new_with_mvcc("test_mvcc_dual_seek_with_delete.db");
     let conn = tmp_db.connect_limbo();
 
     // Create table and insert rows
@@ -1475,10 +1339,7 @@ fn test_mvcc_dual_seek_with_delete() {
     drop(tmp_db);
 
     // Reopen
-    let tmp_db = TempDatabase::new_with_existent_with_opts(
-        &path,
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db = TempDatabase::new_with_existent(&path);
     let conn = tmp_db.connect_limbo();
 
     // Delete row 3
@@ -1517,10 +1378,7 @@ fn test_mvcc_dual_seek_with_delete() {
 /// Test range seek (GT, LT operations) with dual iteration.
 #[test]
 fn test_mvcc_dual_seek_range_operations() {
-    let tmp_db = TempDatabase::new_with_opts(
-        "test_mvcc_dual_seek_range_operations.db",
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db = TempDatabase::new_with_mvcc("test_mvcc_dual_seek_range_operations.db");
     let conn = tmp_db.connect_limbo();
 
     // Create table and insert rows
@@ -1537,10 +1395,7 @@ fn test_mvcc_dual_seek_range_operations() {
     drop(tmp_db);
 
     // Reopen
-    let tmp_db = TempDatabase::new_with_existent_with_opts(
-        &path,
-        turso_core::DatabaseOpts::new().with_mvcc(true),
-    );
+    let tmp_db = TempDatabase::new_with_existent(&path);
     let conn = tmp_db.connect_limbo();
 
     // Insert more rows into MVCC

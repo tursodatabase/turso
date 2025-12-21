@@ -493,7 +493,6 @@ impl TursoDatabase {
             for features in experimental_features.split(",").map(|s| s.trim()) {
                 opts = match features {
                     "views" => opts.with_views(true),
-                    "mvcc" => opts.with_mvcc(true),
                     "index_method" => opts.with_index_method(true),
                     "strict" => opts.with_strict(true),
                     "autovacuum" => opts.with_autovacuum(true),
@@ -795,7 +794,8 @@ impl TursoStatement {
     /// run iteration of the IO backend
     pub fn run_io(&self) -> Result<(), TursoError> {
         self.statement
-            .run_once()
+            ._io()
+            .step()
             .map_err(turso_error_from_limbo_error)
     }
     /// get row value reference currently pointed by the statement

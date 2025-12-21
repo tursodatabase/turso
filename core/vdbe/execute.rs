@@ -1,7 +1,7 @@
 #![allow(unused_variables)]
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::AlterTableFunc;
-use crate::mvcc::cursor::MvccCursorType;
+use crate::mvcc::cursor::{MvccCursorType, NextRowidResult};
 use crate::mvcc::database::CheckpointStateMachine;
 use crate::mvcc::LocalClock;
 use crate::schema::Table;
@@ -22,6 +22,7 @@ use crate::types::{
 use crate::util::{
     normalize_ident, rewrite_column_references_if_needed, rewrite_fk_parent_cols_if_self_ref,
     rewrite_fk_parent_table_if_needed, rewrite_inline_col_fk_target_if_needed,
+    trim_ascii_whitespace,
 };
 use crate::vdbe::affinity::{apply_numeric_affinity, try_for_float, Affinity, ParsedNumber};
 use crate::vdbe::hash_table::{HashEntry, HashTable, HashTableConfig};
@@ -2338,7 +2339,10 @@ pub fn op_transaction_inner(
                             "nested stmt should not begin a new write transaction"
                         );
                         let begin_w_tx_res = pager.begin_write_tx();
-                        if let Err(LimboError::Busy) = begin_w_tx_res {
+                        if matches!(
+                            begin_w_tx_res,
+                            Err(LimboError::Busy | LimboError::BusySnapshot)
+                        ) {
                             // We failed to upgrade to write transaction so put the transaction into its original state.
                             // That is, if the transaction had not started, end the read transaction so that next time we
                             // start a new one.
@@ -2348,7 +2352,7 @@ pub fn op_transaction_inner(
                                 state.auto_txn_cleanup = TxnCleanup::None;
                             }
                             assert_eq!(conn.get_tx_state(), current_state);
-                            return Err(LimboError::Busy);
+                            return Err(begin_w_tx_res.unwrap_err());
                         }
                         if let IOResult::IO(io) = begin_w_tx_res? {
                             // set the transaction state to pending so we don't have to
@@ -6938,7 +6942,9 @@ pub fn op_idx_insert(
 #[derive(Debug, Clone, Copy)]
 pub enum OpNewRowidState {
     Start,
-    SeekingToLast,
+    SeekingToLast {
+        mvcc_already_initialized: bool,
+    },
     ReadingMaxRowid,
     GeneratingRandom {
         attempts: u32,
@@ -6959,6 +6965,33 @@ pub fn op_new_rowid(
     insn: &Insn,
     pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
+    new_rowid_inner(program, state, insn, pager).inspect_err(|_| {
+        // In case of error we need to unlock rowid lock from mvcc cursor
+        load_insn!(
+            NewRowid {
+                cursor,
+                rowid_reg,
+                prev_largest_reg,
+            },
+            insn
+        );
+        let mv_store = program.connection.mv_store();
+        if let Some(mv_store) = mv_store.as_ref() {
+            let cursor = state.get_cursor(*cursor);
+            let cursor = cursor.as_btree_mut() as &mut dyn Any;
+            if let Some(mvcc_cursor) = cursor.downcast_mut::<MvCursor>() {
+                mvcc_cursor.end_new_rowid();
+            }
+        }
+    })
+}
+
+fn new_rowid_inner(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
     load_insn!(
         NewRowid {
             cursor,
@@ -6968,46 +7001,70 @@ pub fn op_new_rowid(
         insn
     );
 
-    let mv_store = program.connection.mv_store();
-    'mvcc_newrowid: {
-        if let Some(mv_store) = mv_store.as_ref() {
-            // With MVCC we can't simply find last rowid and get rowid + 1 as a result. To not have two conflicting rowids concurrently we need to call `get_next_rowid`
-            // which will make sure we don't collide.
-            let (rowid, current_max) = {
-                let cursor = state.get_cursor(*cursor);
-                let cursor = cursor.as_btree_mut() as &mut dyn Any;
-                let Some(mvcc_cursor) = cursor.downcast_mut::<MvCursor>() else {
-                    // Not an MvCursor - must be an ephemeral cursor (indicated by lack of WAL)
-                    let Some(ephemeral_cursor) = cursor.downcast_mut::<BTreeCursor>() else {
-                        panic!("Expected MvCursor or BTreeCursor in op_new_rowid");
-                    };
-                    turso_assert!(
-                        ephemeral_cursor.pager.wal.is_none(),
-                        "MVCC is enabled but got a non-ephemeral BTreeCursor"
-                    );
-                    break 'mvcc_newrowid;
-                };
-                return_if_io!(mvcc_cursor.get_next_rowid())
-            };
-            state.registers[*rowid_reg] = Register::Value(Value::Integer(rowid));
-            if *prev_largest_reg > 0 {
-                state.registers[*prev_largest_reg] = Register::Value(Value::Integer(current_max));
-            }
-            state.pc += 1;
-            return Ok(InsnFunctionStepResult::Step);
-        }
-    }
-
     const MAX_ROWID: i64 = i64::MAX;
     const MAX_ATTEMPTS: u32 = 100;
-
+    let mv_store = program.connection.mv_store();
     loop {
         match state.op_new_rowid_state {
             OpNewRowidState::Start => {
-                state.op_new_rowid_state = OpNewRowidState::SeekingToLast;
+                state.op_new_rowid_state = OpNewRowidState::SeekingToLast {
+                    mvcc_already_initialized: false,
+                };
+
+                if let Some(mv_store) = mv_store.as_ref() {
+                    let cursor = state.get_cursor(*cursor);
+                    let cursor = cursor.as_btree_mut() as &mut dyn Any;
+                    if let Some(mvcc_cursor) = cursor.downcast_mut::<MvCursor>() {
+                        match return_if_io!(mvcc_cursor.start_new_rowid()) {
+                            NextRowidResult::Uninitialized => {
+                                // we need to find last to initialize it
+                                state.op_new_rowid_state = OpNewRowidState::SeekingToLast {
+                                    mvcc_already_initialized: false,
+                                };
+                            }
+                            NextRowidResult::Next {
+                                new_rowid,
+                                prev_rowid,
+                            } => {
+                                // we allocated a rowid, so no need to hold lock anymore
+                                mvcc_cursor.end_new_rowid();
+                                // mvcc allocator for table ws initialized, we can set result inmediatly
+                                state.registers[*rowid_reg] =
+                                    Register::Value(Value::Integer(new_rowid));
+                                // FIXME: we probably will need to remove sqlite_sequence from MVCC.
+                                if *prev_largest_reg > 0 {
+                                    state.registers[*prev_largest_reg] =
+                                        Register::Value(Value::Integer(prev_rowid.unwrap_or(0)));
+                                }
+                                // we still need to leave cursor pointing to the end, but we
+                                state.op_new_rowid_state = OpNewRowidState::SeekingToLast {
+                                    mvcc_already_initialized: true,
+                                };
+                            }
+                            NextRowidResult::FindRandom => {
+                                // NOTE(pere): we couldn't allocate a row, let's unlock and let it try to run with a random. This may
+                                // cause write-write conflict but I don't think there is a good way to prevent this right now.
+                                mvcc_cursor.end_new_rowid();
+                                state.op_new_rowid_state =
+                                    OpNewRowidState::GeneratingRandom { attempts: 0 };
+                            }
+                        }
+                    } else {
+                        // Not an MvCursor - must be an ephemeral cursor (indicated by lack of WAL)
+                        let Some(ephemeral_cursor) = cursor.downcast_mut::<BTreeCursor>() else {
+                            panic!("Expected MvCursor or BTreeCursor in op_new_rowid");
+                        };
+                        turso_assert!(
+                            ephemeral_cursor.pager.wal.is_none(),
+                            "MVCC is enabled but got a non-ephemeral BTreeCursor"
+                        );
+                    }
+                }
             }
 
-            OpNewRowidState::SeekingToLast => {
+            OpNewRowidState::SeekingToLast {
+                mvcc_already_initialized,
+            } => {
                 {
                     let cursor = state.get_cursor(*cursor);
                     let cursor = cursor.as_btree_mut();
@@ -7017,7 +7074,11 @@ pub fn op_new_rowid(
                     let always_seek = program.contains_trigger_subprograms;
                     return_if_io!(cursor.seek_to_last(always_seek));
                 }
-                state.op_new_rowid_state = OpNewRowidState::ReadingMaxRowid;
+                if mvcc_already_initialized {
+                    state.op_new_rowid_state = OpNewRowidState::GoNext;
+                } else {
+                    state.op_new_rowid_state = OpNewRowidState::ReadingMaxRowid;
+                }
             }
 
             OpNewRowidState::ReadingMaxRowid => {
@@ -7026,6 +7087,15 @@ pub fn op_new_rowid(
                     let cursor = cursor.as_btree_mut();
                     return_if_io!(cursor.rowid())
                 };
+
+                // Initialize table's max rowid in MVCC if enabled
+                if let Some(mv_store) = mv_store.as_ref() {
+                    let cursor = state.get_cursor(*cursor);
+                    let cursor = cursor.as_btree_mut() as &mut dyn Any;
+                    if let Some(mvcc_cursor) = cursor.downcast_mut::<MvCursor>() {
+                        mvcc_cursor.initialize_max_rowid(current_max)?;
+                    };
+                }
 
                 if *prev_largest_reg > 0 {
                     state.registers[*prev_largest_reg] =
@@ -7036,6 +7106,7 @@ pub fn op_new_rowid(
                     Some(rowid) if rowid < MAX_ROWID => {
                         // Can use sequential
                         state.registers[*rowid_reg] = Register::Value(Value::Integer(rowid + 1));
+                        tracing::trace!("new_rowid={}", rowid + 1);
                         state.op_new_rowid_state = OpNewRowidState::GoNext;
                         continue;
                     }
@@ -7046,6 +7117,7 @@ pub fn op_new_rowid(
                     }
                     None => {
                         // Empty table
+                        tracing::trace!("new_rowid=1");
                         state.registers[*rowid_reg] = Register::Value(Value::Integer(1));
                         state.op_new_rowid_state = OpNewRowidState::GoNext;
                         continue;
@@ -7089,6 +7161,15 @@ pub fn op_new_rowid(
                     state.registers[*rowid_reg] = Register::Value(Value::Integer(candidate));
                     state.op_new_rowid_state = OpNewRowidState::Start;
                     state.pc += 1;
+
+                    if let Some(mv_store) = mv_store.as_ref() {
+                        let cursor = state.get_cursor(*cursor);
+                        let cursor = cursor.as_btree_mut() as &mut dyn Any;
+                        if let Some(mvcc_cursor) = cursor.downcast_mut::<MvCursor>() {
+                            mvcc_cursor.end_new_rowid();
+                        }
+                    }
+
                     return Ok(InsnFunctionStepResult::Step);
                 } else {
                     // Collision, try again
@@ -7105,6 +7186,15 @@ pub fn op_new_rowid(
                 }
                 state.op_new_rowid_state = OpNewRowidState::Start;
                 state.pc += 1;
+
+                if let Some(mv_store) = mv_store.as_ref() {
+                    let cursor = state.get_cursor(*cursor);
+                    let cursor = cursor.as_btree_mut() as &mut dyn Any;
+                    if let Some(mvcc_cursor) = cursor.downcast_mut::<MvCursor>() {
+                        mvcc_cursor.end_new_rowid();
+                    }
+                }
+
                 return Ok(InsnFunctionStepResult::Step);
             }
         }
@@ -9641,7 +9731,7 @@ fn apply_affinity_char(target: &mut Register, affinity: Affinity) -> bool {
                 }
 
                 if let Value::Text(t) = value {
-                    let text = t.as_str().trim();
+                    let text = trim_ascii_whitespace(t.as_str());
 
                     // Handle hex numbers - they shouldn't be converted
                     if text.starts_with("0x") {
@@ -9801,10 +9891,8 @@ pub enum OpJournalModeSubState {
     Start,
     /// Checkpointing WAL/MVCC before mode change
     Checkpoint,
-    /// Update the header with new version
+    /// Update the header with new version and get page reference
     UpdateHeader,
-    /// Read page 1 for writing
-    ReadPage,
     /// Write page 1 to disk
     WritePage,
     /// Finalize - clear cache and setup new mode
@@ -9909,13 +9997,9 @@ fn op_journal_mode_inner(
                     return Ok(InsnFunctionStepResult::Step);
                 }
 
-                // Check MVCC enabled if switching to MVCC
-                if matches!(new_mode, journal_mode::JournalMode::ExperimentalMvcc)
-                    && !program.connection.db.mvcc_enabled()
-                {
-                    return Err(LimboError::InvalidArgument(
-                        "MVCC is not enabled. Enable it with `--experimental-mvcc` flag in the CLI or by setting the MVCC option in `DatabaseOpts`".to_string(),
-                    ));
+                // Check if database is readonly - cannot change journal mode on readonly databases
+                if program.connection.is_readonly(*db) {
+                    return Err(LimboError::ReadOnly);
                 }
 
                 state.op_journal_mode_state.new_mode = Some(new_mode);
@@ -9965,24 +10049,22 @@ fn op_journal_mode_inner(
                     .expect("Should be a supported Journal Mode");
                 let raw_version = RawVersion::from(new_version);
 
-                // After checkpoint, pager holds the most up-to-date version of the Header
-                let header_result = pager.with_header_mut(|header| {
+                // Get the header page reference (handles both initialized and uninitialized databases)
+                // This uses the pager's cache and won't fail for empty database files
+                let header_ref =
+                    return_if_io!(crate::storage::pager::HeaderRefMut::from_pager(pager));
+
+                // Update the header version
+                {
+                    let header = header_ref.borrow_mut();
                     header.read_version = raw_version;
                     header.write_version = raw_version;
-                });
-                return_if_io!(header_result);
-                state.op_journal_mode_state.sub_state = OpJournalModeSubState::ReadPage;
-            }
-
-            OpJournalModeSubState::ReadPage => {
-                // Read page 1 for writing
-                let (page, completion) = pager.read_page(DatabaseHeader::PAGE_ID as i64)?;
-                state.op_journal_mode_state.page_ref = Some(page);
-                state.op_journal_mode_state.sub_state = OpJournalModeSubState::WritePage;
-
-                if let Some(c) = completion {
-                    return Ok(InsnFunctionStepResult::IO(IOCompletions::Single(c)));
                 }
+
+                // Save the page reference for writing
+                state.op_journal_mode_state.page_ref = Some(header_ref.page().clone());
+                // Skip ReadPage and go directly to WritePage
+                state.op_journal_mode_state.sub_state = OpJournalModeSubState::WritePage;
             }
 
             OpJournalModeSubState::WritePage => {
@@ -10189,5 +10271,63 @@ mod tests {
         let version_integer = 3046001;
         let expected = "3.46.1";
         assert_eq!(execute_turso_version(version_integer), expected);
+    }
+
+    #[test]
+    fn test_ascii_whitespace_is_trimmed() {
+        // Regular ASCII whitespace SHOULD be trimmed
+        let ascii_whitespace_cases = vec![
+            (" 12", 12i64),            // space
+            ("12 ", 12i64),            // trailing space
+            (" 12 ", 12i64),           // both sides
+            ("\t42\t", 42i64),         // tab
+            ("\n99\n", 99i64),         // newline
+            (" \t\n123\r\n ", 123i64), // mixed ASCII whitespace
+        ];
+
+        for (input, expected_int) in ascii_whitespace_cases {
+            let mut register = Register::Value(Value::Text(input.into()));
+            apply_affinity_char(&mut register, Affinity::Integer);
+
+            match register {
+                Register::Value(Value::Integer(i)) => {
+                    assert_eq!(
+                        i, expected_int,
+                        "String '{input}' should convert to {expected_int}, got {i}"
+                    );
+                }
+                other => {
+                    panic!("String '{input}' should be converted to integer {expected_int}, got {other:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_non_breaking_space_not_trimmed() {
+        let test_strings = vec![
+            ("12\u{00A0}", "text", 3),   // '12' + non-breaking space (3 chars, 4 bytes)
+            ("\u{00A0}12", "text", 3),   // non-breaking space + '12' (3 chars, 4 bytes)
+            ("12\u{00A0}34", "text", 5), // '12' + nbsp + '34' (5 chars, 6 bytes)
+        ];
+
+        for (input, _expected_type, expected_len) in test_strings {
+            let mut register = Register::Value(Value::Text(input.into()));
+            apply_affinity_char(&mut register, Affinity::Integer);
+
+            match register {
+                Register::Value(Value::Text(t)) => {
+                    assert_eq!(
+                        t.as_str().chars().count(),
+                        expected_len,
+                        "String '{input}' should have {expected_len} characters",
+                    );
+                }
+                Register::Value(Value::Integer(_)) => {
+                    panic!("String '{input}' should NOT be converted to integer");
+                }
+                other => panic!("Unexpected value type: {other:?}"),
+            }
+        }
     }
 }

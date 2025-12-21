@@ -88,7 +88,6 @@ pub type Result<T> = std::result::Result<T, Error>;
 /// A builder for `Database`.
 pub struct Builder {
     path: String,
-    enable_mvcc: bool,
     enable_encryption: bool,
     vfs: Option<String>,
     encryption_opts: Option<EncryptionOpts>,
@@ -99,16 +98,10 @@ impl Builder {
     pub fn new_local(path: &str) -> Self {
         Self {
             path: path.to_string(),
-            enable_mvcc: false,
             enable_encryption: false,
             vfs: None,
             encryption_opts: None,
         }
-    }
-
-    pub fn with_mvcc(mut self, mvcc_enabled: bool) -> Self {
-        self.enable_mvcc = mvcc_enabled;
-        self
     }
 
     pub fn experimental_encryption(mut self, encryption_enabled: bool) -> Self {
@@ -130,9 +123,7 @@ impl Builder {
     #[allow(unused_variables, clippy::arc_with_non_send_sync)]
     pub async fn build(self) -> Result<Database> {
         let io = self.get_io()?;
-        let opts = turso_core::DatabaseOpts::default()
-            .with_mvcc(self.enable_mvcc)
-            .with_encryption(self.enable_encryption);
+        let opts = turso_core::DatabaseOpts::default().with_encryption(self.enable_encryption);
         let db = turso_core::Database::open_file_with_flags(
             io,
             self.path.as_str(),
@@ -262,7 +253,7 @@ impl Future for Execute {
                 Poll::Ready(Ok(changes as u64))
             }
             Ok(turso_core::StepResult::IO) => {
-                stmt.run_once()?;
+                stmt._io().step()?;
                 Poll::Pending
             }
             Ok(turso_core::StepResult::Busy) => Poll::Ready(Err(Error::SqlExecutionFailure(

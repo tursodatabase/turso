@@ -67,7 +67,7 @@ impl CollationSeq {
 
     #[inline(always)]
     fn rtrim_cmp(lhs: &str, rhs: &str) -> Ordering {
-        lhs.trim_end().cmp(rhs.trim_end())
+        lhs.trim_end_matches(' ').cmp(rhs.trim_end_matches(' '))
     }
 }
 
@@ -362,6 +362,7 @@ mod tests {
                 Some("foo".to_string()),
                 "text".to_string(),
                 None,
+                None,
                 Type::Text,
                 collation,
                 ColDef::default(),
@@ -416,6 +417,7 @@ mod tests {
                     Some("a".to_string()),
                     "text".to_string(),
                     None,
+                    None,
                     Type::Text,
                     left,
                     ColDef::default(),
@@ -447,6 +449,7 @@ mod tests {
                 columns: vec![Column::new(
                     Some("b".to_string()),
                     "text".to_string(),
+                    None,
                     None,
                     Type::Text,
                     right,
@@ -486,6 +489,7 @@ mod tests {
                 columns: vec![Column::new(
                     Some("id".to_string()),
                     "INTEGER".to_string(),
+                    None,
                     None,
                     Type::Integer,
                     collation,

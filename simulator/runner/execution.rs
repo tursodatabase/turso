@@ -2,7 +2,7 @@ use std::sync::{Arc, Mutex};
 
 use sql_generation::model::table::SimValue;
 use tracing::instrument;
-use turso_core::{Connection, LimboError, Result, StepResult, Value};
+use turso_core::{Connection, LimboError, Result, Value};
 
 /// Checks if an error is a recoverable error should not fail the simulation.
 /// These errors indicate expected transaction-related behavior, not bugs.
@@ -312,29 +312,14 @@ fn limbo_integrity_check(conn: &Arc<Connection>) -> Result<()> {
     let mut rows = conn.query("PRAGMA integrity_check;")?.unwrap();
     let mut result = Vec::new();
 
-    loop {
-        match rows.step()? {
-            StepResult::Row => {
-                let row = rows.row().unwrap();
-
-                let val = match row.get_value(0) {
-                    turso_core::Value::Text(text) => text.as_str().to_string(),
-                    _ => unreachable!(),
-                };
-                result.push(val);
-            }
-            StepResult::IO => {
-                rows.run_once()?;
-            }
-            StepResult::Interrupt => {}
-            StepResult::Done => {
-                break;
-            }
-            StepResult::Busy => {
-                return Err(LimboError::Busy);
-            }
-        }
-    }
+    rows.run_with_row_callback(|row| {
+        let val = match row.get_value(0) {
+            turso_core::Value::Text(text) => text.as_str().to_string(),
+            _ => unreachable!(),
+        };
+        result.push(val);
+        Ok(())
+    })?;
 
     if result.is_empty() {
         return Err(LimboError::InternalError(

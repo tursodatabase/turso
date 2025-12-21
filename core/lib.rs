@@ -21,6 +21,7 @@ pub mod schema;
 #[cfg(feature = "series")]
 mod series;
 pub mod state_machine;
+mod statement;
 mod stats;
 pub mod storage;
 #[allow(dead_code)]
@@ -32,7 +33,6 @@ mod util;
 #[cfg(feature = "uuid")]
 mod uuid;
 mod vdbe;
-pub type ProgramExecutionState = vdbe::ProgramExecutionState;
 pub mod vector;
 mod vtab;
 
@@ -50,13 +50,11 @@ use crate::storage::encryption::AtomicCipherMode;
 use crate::storage::journal_mode;
 use crate::storage::pager::{self, AutoVacuumMode, HeaderRef, HeaderRefMut};
 use crate::storage::sqlite3_ondisk::{RawVersion, Version};
-use crate::translate::display::PlanContext;
 use crate::translate::pragma::TURSO_CDC_DEFAULT_TABLE_NAME;
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
 use crate::types::{WalFrameInfo, WalState};
 #[cfg(feature = "fs")]
 use crate::util::{OpenMode, OpenOptions};
-use crate::vdbe::explain::{EXPLAIN_COLUMNS_TYPE, EXPLAIN_QUERY_PLAN_COLUMNS_TYPE};
 use crate::vdbe::metrics::ConnectionMetrics;
 use crate::vtab::VirtualTable;
 use crate::{incremental::view::AllViewsTxState, translate::emitter::TransactionMode};
@@ -75,14 +73,12 @@ pub use io::{
 use parking_lot::{Mutex, RwLock};
 use rustc_hash::FxHashMap;
 use schema::Schema;
+pub use statement::Statement;
 use std::collections::HashSet;
-use std::task::Waker;
 use std::{
-    borrow::Cow,
     cell::Cell,
     collections::HashMap,
     fmt::{self, Display},
-    num::NonZero,
     ops::Deref,
     sync::{
         atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicUsize, Ordering},
@@ -105,7 +101,6 @@ pub use storage::{
 };
 use tracing::{instrument, Level};
 use turso_macros::{match_ignore_ascii_case, AtomicEnum};
-use turso_parser::ast::fmt::ToTokens;
 use turso_parser::{ast, ast::Cmd, parser::Parser};
 use types::IOResult;
 pub use types::Value;
@@ -120,7 +115,6 @@ pub use vdbe::{
 /// Configuration for database features
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DatabaseOpts {
-    pub enable_mvcc: bool,
     pub enable_views: bool,
     pub enable_strict: bool,
     pub enable_encryption: bool,
@@ -137,11 +131,6 @@ impl DatabaseOpts {
     #[cfg(feature = "cli_only")]
     pub fn turso_cli(mut self) -> Self {
         self.enable_load_extension = true;
-        self
-    }
-
-    pub fn with_mvcc(mut self, enable: bool) -> Self {
-        self.enable_mvcc = enable;
         self
     }
 
@@ -377,14 +366,8 @@ impl Database {
     }
 
     #[cfg(feature = "fs")]
-    pub fn open_file(io: Arc<dyn IO>, path: &str, enable_mvcc: bool) -> Result<Arc<Database>> {
-        Self::open_file_with_flags(
-            io,
-            path,
-            OpenFlags::default(),
-            DatabaseOpts::new().with_mvcc(enable_mvcc),
-            None,
-        )
+    pub fn open_file(io: Arc<dyn IO>, path: &str) -> Result<Arc<Database>> {
+        Self::open_file_with_flags(io, path, OpenFlags::default(), DatabaseOpts::new(), None)
     }
 
     #[cfg(feature = "fs")]
@@ -405,14 +388,13 @@ impl Database {
         io: Arc<dyn IO>,
         path: &str,
         db_file: Arc<dyn DatabaseStorage>,
-        enable_mvcc: bool,
     ) -> Result<Arc<Database>> {
         Self::open_with_flags(
             io,
             path,
             db_file,
             OpenFlags::default(),
-            DatabaseOpts::new().with_mvcc(enable_mvcc),
+            DatabaseOpts::new(),
             None,
         )
     }
@@ -602,6 +584,7 @@ impl Database {
     fn header_validation(&mut self) -> Result<Arc<Pager>> {
         let wal_exists = journal_mode::wal_exists(std::path::Path::new(&self.wal_path));
         let log_exists = journal_mode::logical_log_exists(std::path::Path::new(&self.path));
+        let is_readonly = self.open_flags.get().contains(OpenFlags::ReadOnly);
 
         let mut pager = self._init()?;
         assert!(pager.wal.is_none(), "Pager should have no WAL yet");
@@ -626,49 +609,29 @@ impl Database {
                 .map_err(|val| LimboError::Corrupt(format!("Invalid write_version: {val}")))?,
         );
 
-        let mut open_mv_store = self.mvcc_enabled();
+        // Determine if we should open in MVCC mode based on the database header version
+        // MVCC is controlled only by the database header (set via PRAGMA journal_mode)
+        let open_mv_store = matches!(read_version, Version::Mvcc);
 
         // Now check the Header Version to see which mode the DB file really is on
         // Track if header was modified so we can write it to disk
         let header_modified = match read_version {
             Version::Legacy => {
-                if open_mv_store {
-                    header_mut.read_version = RawVersion::from(Version::Mvcc);
-                    header_mut.write_version = RawVersion::from(Version::Mvcc);
+                if is_readonly {
+                    tracing::warn!("Database {} is opened in readonly mode, cannot convert Legacy mode to WAL. Running in Legacy mode.", self.path);
+                    false
                 } else {
+                    // Convert Legacy to WAL mode
                     header_mut.read_version = RawVersion::from(Version::Wal);
                     header_mut.write_version = RawVersion::from(Version::Wal);
-                }
-                true
-            }
-            Version::Wal => {
-                match (open_mv_store, wal_exists) {
-                    (true, true) => {
-                        tracing::warn!("WAL file exists for database {}, but MVCC is enabled. Run `PRAGMA journal_mode = 'experimental_mvcc;'` to change to MVCC mode", self.path);
-                        open_mv_store = false;
-                        false
-                    }
-                    (true, false) => {
-                        // Change Header to MVCC if WAL does not exists and we have MVCC enabled
-                        header_mut.read_version = RawVersion::from(Version::Mvcc);
-                        header_mut.write_version = RawVersion::from(Version::Mvcc);
-                        true
-                    }
-                    (false, true) => false,
-                    (false, false) => false,
+                    true
                 }
             }
-            Version::Mvcc => {
-                if !open_mv_store {
-                    tracing::warn!("Database is in MVCC mode, but MVCC options were not passed. Enabling MVCC mode");
-                    self.opts.enable_mvcc = true;
-                    open_mv_store = true;
-                }
-                false
-            }
+            Version::Wal => false,
+            Version::Mvcc => false,
         };
 
-        // Currently we always init shared wal regardless if MVCC enabled
+        // Check for inconsistent state between database header and log files
         match (wal_exists, log_exists) {
             (true, true) => {
                 return Err(LimboError::Corrupt(
@@ -676,21 +639,19 @@ impl Database {
                 ));
             }
             (true, false) => {
-                // Currently, if a non-zero-sized WAL file exists, the database cannot be opened in MVCC mode.
-                // FIXME: this should initiate immediate checkpoint from WAL->DB in MVCC mode.
+                // If a WAL file exists but header says MVCC, that's an inconsistent state
                 if open_mv_store {
-                    return Err(LimboError::InvalidArgument(format!(
-                        "WAL file exists for database {}, but MVCC is enabled. This is currently not supported. Open the database in non-MVCC mode and run PRAGMA wal_checkpoint(TRUNCATE) to truncate the WAL.",
+                    return Err(LimboError::Corrupt(format!(
+                        "WAL file exists for database {}, but database header indicates MVCC mode. Run PRAGMA wal_checkpoint(TRUNCATE) to truncate the WAL.",
                         self.path
                     )));
                 }
             }
             (false, true) => {
-                // If a non-zero-sized logical log file exists, the database cannot be opened in non-MVCC mode,
-                // because the changes in the logical log would not be visible to the non-MVCC connections.
+                // If an MVCC log file exists but header says WAL, that's an inconsistent state
                 if !open_mv_store {
-                    return Err(LimboError::InvalidArgument(format!(
-                        "MVCC logical log file exists for database {}, but MVCC is disabled. This is not supported. Open the database in MVCC mode and run PRAGMA wal_checkpoint(TRUNCATE) to truncate the logical log.",
+                    return Err(LimboError::Corrupt(format!(
+                        "MVCC logical log file exists for database {}, but database header indicates WAL mode. The database may be corrupted.",
                         self.path
                     )));
                 }
@@ -1070,9 +1031,9 @@ impl Database {
         self.opts.enable_strict
     }
 
-    /// check if MVCC database option is enabled
+    /// check if database is currently in MVCC mode
     pub fn mvcc_enabled(&self) -> bool {
-        self.opts.enable_mvcc
+        self.mv_store.load().is_some()
     }
 
     #[cfg(feature = "test_helper")]
@@ -1855,6 +1816,21 @@ impl Connection {
         page: &mut [u8],
         frame_watermark: Option<u64>,
     ) -> Result<bool> {
+        let Some((page_ref, c)) =
+            self.try_wal_watermark_read_page_begin(page_idx, frame_watermark)?
+        else {
+            return Ok(false);
+        };
+        self.get_pager().io.wait_for_completion(c)?;
+        self.try_wal_watermark_read_page_end(page, page_ref)
+    }
+
+    #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
+    pub fn try_wal_watermark_read_page_begin(
+        &self,
+        page_idx: u32,
+        frame_watermark: Option<u64>,
+    ) -> Result<Option<(Arc<Page>, Completion)>> {
         let pager = self.pager.load();
         let (page_ref, c) = match pager.read_page_no_cache(page_idx as i64, frame_watermark, true) {
             Ok(result) => result,
@@ -1862,12 +1838,19 @@ impl Connection {
             #[cfg(target_os = "windows")]
             Err(LimboError::CompletionError(CompletionError::IOError(
                 std::io::ErrorKind::UnexpectedEof,
-            ))) => return Ok(false),
+            ))) => return Ok(None),
             Err(err) => return Err(err),
         };
 
-        pager.io.wait_for_completion(c)?;
+        Ok(Some((page_ref, c)))
+    }
 
+    #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
+    pub fn try_wal_watermark_read_page_end(
+        &self,
+        page: &mut [u8],
+        page_ref: Arc<Page>,
+    ) -> Result<bool> {
         let content = page_ref.get_contents();
         // empty read - attempt to read absent page
         if content.buffer.is_empty() {
@@ -2347,12 +2330,10 @@ impl Connection {
             )));
         }
 
-        let use_mvcc = self.db.get_mv_store().is_some();
         let use_views = self.db.experimental_views_enabled();
         let use_strict = self.db.experimental_strict_enabled();
 
         let db_opts = DatabaseOpts::new()
-            .with_mvcc(use_mvcc)
             .with_views(use_views)
             .with_strict(use_strict);
         let io: Arc<dyn IO> = if path.contains(":memory:") {
@@ -2650,464 +2631,6 @@ impl Connection {
             Some(mv_store) => Ok(mv_store.checkpoint_threshold()),
             None => Err(LimboError::InternalError("MVCC not enabled".into())),
         }
-    }
-}
-
-#[derive(Debug)]
-struct BusyTimeout {
-    /// Busy timeout instant
-    timeout: Instant,
-    /// Next iteration index for DELAYS
-    iteration: usize,
-}
-
-impl BusyTimeout {
-    const DELAYS: [std::time::Duration; 12] = [
-        Duration::from_millis(1),
-        Duration::from_millis(2),
-        Duration::from_millis(5),
-        Duration::from_millis(10),
-        Duration::from_millis(15),
-        Duration::from_millis(20),
-        Duration::from_millis(25),
-        Duration::from_millis(25),
-        Duration::from_millis(25),
-        Duration::from_millis(50),
-        Duration::from_millis(50),
-        Duration::from_millis(100),
-    ];
-
-    const TOTALS: [std::time::Duration; 12] = [
-        Duration::from_millis(0),
-        Duration::from_millis(1),
-        Duration::from_millis(3),
-        Duration::from_millis(8),
-        Duration::from_millis(18),
-        Duration::from_millis(33),
-        Duration::from_millis(53),
-        Duration::from_millis(78),
-        Duration::from_millis(103),
-        Duration::from_millis(128),
-        Duration::from_millis(178),
-        Duration::from_millis(228),
-    ];
-
-    pub fn new(now: Instant) -> Self {
-        Self {
-            timeout: now,
-            iteration: 0,
-        }
-    }
-
-    // implementation of sqliteDefaultBusyCallback
-    pub fn busy_callback(&mut self, now: Instant, max_duration: Duration) {
-        let idx = self.iteration.min(11);
-        let mut delay = Self::DELAYS[idx];
-        let mut prior = Self::TOTALS[idx];
-
-        if self.iteration >= 12 {
-            prior += delay * (self.iteration as u32 - 11);
-        }
-
-        if prior + delay > max_duration {
-            delay = max_duration.saturating_sub(prior);
-            // no more waiting after this
-            if delay.is_zero() {
-                return;
-            }
-        }
-
-        self.iteration = self.iteration.saturating_add(1);
-        self.timeout = now + delay;
-    }
-}
-
-pub struct Statement {
-    program: vdbe::Program,
-    state: vdbe::ProgramState,
-    pager: Arc<Pager>,
-    /// Whether the statement accesses the database.
-    /// Used to determine whether we need to check for schema changes when
-    /// starting a transaction.
-    accesses_db: bool,
-    /// indicates if the statement is a NORMAL/EXPLAIN/EXPLAIN QUERY PLAN
-    query_mode: QueryMode,
-    /// Flag to show if the statement was busy
-    busy: bool,
-    /// Busy timeout instant
-    /// We need Option here because `io.now()` is not a cheap call
-    busy_timeout: Option<BusyTimeout>,
-}
-
-impl std::fmt::Debug for Statement {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Statement").finish()
-    }
-}
-
-impl Drop for Statement {
-    fn drop(&mut self) {
-        self.reset();
-    }
-}
-
-impl Statement {
-    pub fn new(program: vdbe::Program, pager: Arc<Pager>, query_mode: QueryMode) -> Self {
-        let accesses_db = program.accesses_db;
-        let (max_registers, cursor_count) = match query_mode {
-            QueryMode::Normal => (program.max_registers, program.cursor_ref.len()),
-            QueryMode::Explain => (EXPLAIN_COLUMNS.len(), 0),
-            QueryMode::ExplainQueryPlan => (EXPLAIN_QUERY_PLAN_COLUMNS.len(), 0),
-        };
-        let state = vdbe::ProgramState::new(max_registers, cursor_count);
-        Self {
-            program,
-            state,
-            pager,
-            accesses_db,
-            query_mode,
-            busy: false,
-            busy_timeout: None,
-        }
-    }
-
-    pub fn get_trigger(&self) -> Option<Arc<Trigger>> {
-        self.program.trigger.clone()
-    }
-
-    pub fn get_query_mode(&self) -> QueryMode {
-        self.query_mode
-    }
-
-    pub fn n_change(&self) -> i64 {
-        self.program
-            .n_change
-            .load(std::sync::atomic::Ordering::SeqCst)
-    }
-
-    pub fn set_mv_tx(&mut self, mv_tx: Option<(u64, TransactionMode)>) {
-        *self.program.connection.mv_tx.write() = mv_tx;
-    }
-
-    pub fn interrupt(&mut self) {
-        self.state.interrupt();
-    }
-
-    pub fn execution_state(&self) -> ProgramExecutionState {
-        self.state.execution_state
-    }
-
-    pub fn mv_store(&self) -> impl Deref<Target = Option<Arc<MvStore>>> {
-        self.program.connection.mv_store()
-    }
-
-    fn _step(&mut self, waker: Option<&Waker>) -> Result<StepResult> {
-        if let Some(busy_timeout) = self.busy_timeout.as_ref() {
-            if self.pager.io.now() < busy_timeout.timeout {
-                // Yield the query as the timeout has not been reached yet
-                if let Some(waker) = waker {
-                    waker.wake_by_ref();
-                }
-                return Ok(StepResult::IO);
-            }
-        }
-
-        let mut res = if !self.accesses_db {
-            self.program
-                .step(&mut self.state, self.pager.clone(), self.query_mode, waker)
-        } else {
-            const MAX_SCHEMA_RETRY: usize = 50;
-            let mut res =
-                self.program
-                    .step(&mut self.state, self.pager.clone(), self.query_mode, waker);
-            for attempt in 0..MAX_SCHEMA_RETRY {
-                // Only reprepare if we still need to update schema
-                if !matches!(res, Err(LimboError::SchemaUpdated)) {
-                    break;
-                }
-                tracing::debug!("reprepare: attempt={}", attempt);
-                self.reprepare()?;
-                res =
-                    self.program
-                        .step(&mut self.state, self.pager.clone(), self.query_mode, waker);
-            }
-            res
-        };
-
-        // Aggregate metrics when statement completes
-        if matches!(res, Ok(StepResult::Done)) {
-            let mut conn_metrics = self.program.connection.metrics.write();
-            conn_metrics.record_statement(self.state.metrics.clone());
-            self.busy = false;
-            drop(conn_metrics);
-
-            // After ANALYZE completes, refresh in-memory stats so planners can use them.
-            let sql = self.program.sql.trim_start();
-            if sql.to_ascii_uppercase().starts_with("ANALYZE") {
-                refresh_analyze_stats(&self.program.connection);
-            }
-        } else {
-            self.busy = true;
-        }
-
-        if matches!(res, Ok(StepResult::Busy)) {
-            let now = self.pager.io.now();
-            let max_duration = *self.program.connection.busy_timeout.read();
-            self.busy_timeout = match self.busy_timeout.take() {
-                None => {
-                    let mut result = BusyTimeout::new(now);
-                    result.busy_callback(now, max_duration);
-                    Some(result)
-                }
-                Some(mut bt) => {
-                    bt.busy_callback(now, max_duration);
-                    Some(bt)
-                }
-            };
-
-            if now < self.busy_timeout.as_ref().unwrap().timeout {
-                if let Some(waker) = waker {
-                    waker.wake_by_ref();
-                }
-                res = Ok(StepResult::IO);
-            }
-        }
-
-        res
-    }
-
-    pub fn step(&mut self) -> Result<StepResult> {
-        self._step(None)
-    }
-
-    pub fn step_with_waker(&mut self, waker: &Waker) -> Result<StepResult> {
-        self._step(Some(waker))
-    }
-
-    pub(crate) fn run_ignore_rows(&mut self) -> Result<()> {
-        loop {
-            match self.step()? {
-                vdbe::StepResult::Done => return Ok(()),
-                vdbe::StepResult::IO => self.run_once()?,
-                vdbe::StepResult::Row => continue,
-                vdbe::StepResult::Interrupt | vdbe::StepResult::Busy => {
-                    return Err(LimboError::Busy)
-                }
-            }
-        }
-    }
-
-    pub(crate) fn run_collect_rows(&mut self) -> Result<Vec<Vec<Value>>> {
-        let mut values = Vec::new();
-        loop {
-            match self.step()? {
-                vdbe::StepResult::Done => return Ok(values),
-                vdbe::StepResult::IO => self.run_once()?,
-                vdbe::StepResult::Row => {
-                    values.push(self.row().unwrap().get_values().cloned().collect());
-                    continue;
-                }
-                vdbe::StepResult::Interrupt | vdbe::StepResult::Busy => {
-                    return Err(LimboError::Busy)
-                }
-            }
-        }
-    }
-
-    #[instrument(skip_all, level = Level::DEBUG)]
-    fn reprepare(&mut self) -> Result<()> {
-        tracing::trace!("repreparing statement");
-        let conn = self.program.connection.clone();
-
-        *conn.schema.write() = conn.db.clone_schema();
-        self.program = {
-            let mut parser = Parser::new(self.program.sql.as_bytes());
-            let cmd = parser.next_cmd()?;
-            let cmd = cmd.expect("Same SQL string should be able to be parsed");
-
-            let syms = conn.syms.read();
-            let mode = self.query_mode;
-            debug_assert_eq!(QueryMode::new(&cmd), mode,);
-            let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
-            translate::translate(
-                conn.schema.read().deref(),
-                stmt,
-                self.pager.clone(),
-                conn.clone(),
-                &syms,
-                mode,
-                &self.program.sql,
-            )?
-        };
-
-        // Save parameters before they are reset
-        let parameters = std::mem::take(&mut self.state.parameters);
-        let (max_registers, cursor_count) = match self.query_mode {
-            QueryMode::Normal => (self.program.max_registers, self.program.cursor_ref.len()),
-            QueryMode::Explain => (EXPLAIN_COLUMNS.len(), 0),
-            QueryMode::ExplainQueryPlan => (EXPLAIN_QUERY_PLAN_COLUMNS.len(), 0),
-        };
-        self.reset_internal(Some(max_registers), Some(cursor_count));
-        // Load the parameters back into the state
-        self.state.parameters = parameters;
-        Ok(())
-    }
-
-    pub fn run_once(&self) -> Result<()> {
-        let res = self.pager.io.step();
-        if self.program.connection.is_nested_stmt() {
-            return res;
-        }
-        if res.is_err() {
-            if let Some(io) = &self.state.io_completions {
-                io.abort();
-            }
-            let state = self.program.connection.get_tx_state();
-            if let TransactionState::Write { .. } = state {
-                self.pager.rollback_tx(&self.program.connection);
-                self.program.connection.set_tx_state(TransactionState::None);
-            }
-        }
-        res
-    }
-
-    pub fn num_columns(&self) -> usize {
-        match self.query_mode {
-            QueryMode::Normal => self.program.result_columns.len(),
-            QueryMode::Explain => EXPLAIN_COLUMNS.len(),
-            QueryMode::ExplainQueryPlan => EXPLAIN_QUERY_PLAN_COLUMNS.len(),
-        }
-    }
-
-    pub fn get_column_name(&self, idx: usize) -> Cow<'_, str> {
-        if self.query_mode == QueryMode::Explain {
-            return Cow::Owned(EXPLAIN_COLUMNS.get(idx).expect("No column").to_string());
-        }
-        if self.query_mode == QueryMode::ExplainQueryPlan {
-            return Cow::Owned(
-                EXPLAIN_QUERY_PLAN_COLUMNS
-                    .get(idx)
-                    .expect("No column")
-                    .to_string(),
-            );
-        }
-        match self.query_mode {
-            QueryMode::Normal => {
-                let column = &self.program.result_columns.get(idx).expect("No column");
-                match column.name(&self.program.table_references) {
-                    Some(name) => Cow::Borrowed(name),
-                    None => {
-                        let tables = [&self.program.table_references];
-                        let ctx = PlanContext(&tables);
-                        Cow::Owned(column.expr.displayer(&ctx).to_string())
-                    }
-                }
-            }
-            QueryMode::Explain => Cow::Borrowed(EXPLAIN_COLUMNS[idx]),
-            QueryMode::ExplainQueryPlan => Cow::Borrowed(EXPLAIN_QUERY_PLAN_COLUMNS[idx]),
-        }
-    }
-
-    pub fn get_column_table_name(&self, idx: usize) -> Option<Cow<'_, str>> {
-        if self.query_mode == QueryMode::Explain || self.query_mode == QueryMode::ExplainQueryPlan {
-            return None;
-        }
-        let column = &self.program.result_columns.get(idx).expect("No column");
-        match &column.expr {
-            turso_parser::ast::Expr::Column { table, .. } => self
-                .program
-                .table_references
-                .find_table_by_internal_id(*table)
-                .map(|(_, table_ref)| Cow::Borrowed(table_ref.get_name())),
-            _ => None,
-        }
-    }
-
-    pub fn get_column_type(&self, idx: usize) -> Option<String> {
-        if self.query_mode == QueryMode::Explain {
-            return Some(
-                EXPLAIN_COLUMNS_TYPE
-                    .get(idx)
-                    .expect("No column")
-                    .to_string(),
-            );
-        }
-        if self.query_mode == QueryMode::ExplainQueryPlan {
-            return Some(
-                EXPLAIN_QUERY_PLAN_COLUMNS_TYPE
-                    .get(idx)
-                    .expect("No column")
-                    .to_string(),
-            );
-        }
-        let column = &self.program.result_columns.get(idx).expect("No column");
-        match &column.expr {
-            turso_parser::ast::Expr::Column {
-                table,
-                column: column_idx,
-                ..
-            } => {
-                let (_, table_ref) = self
-                    .program
-                    .table_references
-                    .find_table_by_internal_id(*table)?;
-                let table_column = table_ref.get_column_at(*column_idx)?;
-                match &table_column.ty() {
-                    crate::schema::Type::Integer => Some("INTEGER".to_string()),
-                    crate::schema::Type::Real => Some("REAL".to_string()),
-                    crate::schema::Type::Text => Some("TEXT".to_string()),
-                    crate::schema::Type::Blob => Some("BLOB".to_string()),
-                    crate::schema::Type::Numeric => Some("NUMERIC".to_string()),
-                    crate::schema::Type::Null => None,
-                }
-            }
-            _ => None,
-        }
-    }
-
-    pub fn parameters(&self) -> &parameters::Parameters {
-        &self.program.parameters
-    }
-
-    pub fn parameters_count(&self) -> usize {
-        self.program.parameters.count()
-    }
-
-    pub fn parameter_index(&self, name: &str) -> Option<NonZero<usize>> {
-        self.program.parameters.index(name)
-    }
-
-    pub fn bind_at(&mut self, index: NonZero<usize>, value: Value) {
-        self.state.bind_at(index, value);
-    }
-
-    pub fn clear_bindings(&mut self) {
-        self.state.clear_bindings();
-    }
-
-    pub fn reset(&mut self) {
-        self.reset_internal(None, None);
-    }
-
-    fn reset_internal(&mut self, max_registers: Option<usize>, max_cursors: Option<usize>) {
-        // as abort uses auto_txn_cleanup value - it needs to be called before state.reset
-        self.program.abort(&self.pager, None, &mut self.state);
-        self.state.reset(max_registers, max_cursors);
-        self.program.n_change.store(0, Ordering::SeqCst);
-        self.busy = false;
-        self.busy_timeout = None;
-    }
-
-    pub fn row(&self) -> Option<&Row> {
-        self.state.result_row.as_ref()
-    }
-
-    pub fn get_sql(&self) -> &str {
-        &self.program.sql
-    }
-
-    pub fn is_busy(&self) -> bool {
-        self.busy
     }
 }
 

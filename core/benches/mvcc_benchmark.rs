@@ -16,8 +16,11 @@ struct BenchDb {
 
 fn bench_db() -> BenchDb {
     let io = Arc::new(MemoryIO::new());
-    let db = Database::open_file(io.clone(), ":memory:", true).unwrap();
+    let db = Database::open_file(io.clone(), ":memory:").unwrap();
     let conn = db.connect().unwrap();
+    // Enable MVCC via PRAGMA
+    conn.execute("PRAGMA journal_mode = 'experimental_mvcc'")
+        .unwrap();
     let mvcc_store = db.get_mv_store().clone().unwrap();
     BenchDb {
         _db: db,

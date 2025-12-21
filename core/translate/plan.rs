@@ -1068,6 +1068,7 @@ impl JoinedTable {
                     rc.name(&plan.table_references).map(String::from),
                     "BLOB".to_string(),
                     None,
+                    None,
                     Type::Blob, // FIXME: infer proper type
                     None,
                     ColDef::default(),

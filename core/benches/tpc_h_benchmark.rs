@@ -30,7 +30,7 @@ fn bench_tpc_h_queries(criterion: &mut Criterion) {
 
     #[allow(clippy::arc_with_non_send_sync)]
     let io = Arc::new(PlatformIO::new().unwrap());
-    let db = Database::open_file(io.clone(), TPC_H_PATH, false).unwrap();
+    let db = Database::open_file(io.clone(), TPC_H_PATH).unwrap();
     let limbo_conn = db.connect().unwrap();
 
     let queries = [
@@ -97,7 +97,7 @@ fn bench_tpc_h_queries(criterion: &mut Criterion) {
                                 black_box(stmt.row());
                             }
                             turso_core::StepResult::IO => {
-                                stmt.run_once().unwrap();
+                                db.io.step().unwrap();
                             }
                             turso_core::StepResult::Done => {
                                 break;

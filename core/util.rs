@@ -148,42 +148,30 @@ pub fn parse_schema_rows(
     // Store materialized view info (SQL and root page) for later creation
     let mut materialized_view_info: std::collections::HashMap<String, (String, i64)> =
         std::collections::HashMap::new();
-    loop {
-        match rows.step()? {
-            StepResult::Row => {
-                let row = rows.row().unwrap();
-                let ty = row.get::<&str>(0)?;
-                let name = row.get::<&str>(1)?;
-                let table_name = row.get::<&str>(2)?;
-                let root_page = row.get::<i64>(3)?;
-                let sql = row.get::<&str>(4).ok();
-                schema.handle_schema_row(
-                    ty,
-                    name,
-                    table_name,
-                    root_page,
-                    sql,
-                    syms,
-                    &mut from_sql_indexes,
-                    &mut automatic_indices,
-                    &mut dbsp_state_roots,
-                    &mut dbsp_state_index_roots,
-                    &mut materialized_view_info,
-                    mv_store.as_ref(),
-                )?
-            }
-            StepResult::IO => {
-                // TODO: How do we ensure that the I/O we submitted to
-                // read the schema is actually complete?
-                rows.run_once()?;
-            }
-            StepResult::Interrupt => {
-                return Err(LimboError::InternalError("interrupted".to_string()))
-            }
-            StepResult::Done => break,
-            StepResult::Busy => return Err(LimboError::Busy),
-        }
-    }
+
+    // TODO: How do we ensure that the I/O we submitted to
+    // read the schema is actually complete?
+    rows.run_with_row_callback(|row| {
+        let ty = row.get::<&str>(0)?;
+        let name = row.get::<&str>(1)?;
+        let table_name = row.get::<&str>(2)?;
+        let root_page = row.get::<i64>(3)?;
+        let sql = row.get::<&str>(4).ok();
+        schema.handle_schema_row(
+            ty,
+            name,
+            table_name,
+            root_page,
+            sql,
+            syms,
+            &mut from_sql_indexes,
+            &mut automatic_indices,
+            &mut dbsp_state_roots,
+            &mut dbsp_state_index_roots,
+            &mut materialized_view_info,
+            mv_store.as_ref(),
+        )
+    });
 
     schema.populate_indices(
         syms,
@@ -970,6 +958,24 @@ pub fn decode_percent(uri: &str) -> String {
     String::from_utf8_lossy(&decoded).to_string()
 }
 
+pub fn trim_ascii_whitespace(s: &str) -> &str {
+    let bytes = s.as_bytes();
+    let start = bytes
+        .iter()
+        .position(|&b| !b.is_ascii_whitespace())
+        .unwrap_or(bytes.len());
+    let end = bytes
+        .iter()
+        .rposition(|&b| !b.is_ascii_whitespace())
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    if start <= end {
+        &s[start..end]
+    } else {
+        ""
+    }
+}
+
 /// When casting a TEXT value to INTEGER, the longest possible prefix of the value that can be interpreted as an integer number
 /// is extracted from the TEXT value and the remainder ignored. Any leading spaces in the TEXT value when converting from TEXT to INTEGER are ignored.
 /// If there is no prefix that can be interpreted as an integer number, the result of the conversion is 0.
@@ -1411,6 +1417,7 @@ pub fn extract_view_columns(
                                         Some(final_name),
                                         table_column.ty_str.clone(),
                                         None,
+                                        None,
                                         table_column.ty(),
                                         table_column.collation_opt(),
                                         ColDef::default(),
@@ -1456,6 +1463,7 @@ pub fn extract_view_columns(
                                     column: Column::new(
                                         Some(final_name),
                                         table_column.ty_str.clone(),
+                                        None,
                                         None,
                                         table_column.ty(),
                                         table_column.collation_opt(),
@@ -2600,6 +2608,25 @@ pub mod tests {
         assert_eq!(
             checked_cast_text_to_numeric("\t-3.22\n", true),
             Ok(Float(-3.22))
+        );
+    }
+
+    #[test]
+    fn test_trim_ascii_whitespace_helper() {
+        assert_eq!(trim_ascii_whitespace("  hello  "), "hello");
+        assert_eq!(trim_ascii_whitespace("\t\nhello\r\n"), "hello");
+        assert_eq!(trim_ascii_whitespace("hello"), "hello");
+        assert_eq!(trim_ascii_whitespace("   "), "");
+        assert_eq!(trim_ascii_whitespace(""), "");
+
+        // non-breaking space should NOT be trimmed
+        assert_eq!(
+            trim_ascii_whitespace("\u{00A0}hello\u{00A0}"),
+            "\u{00A0}hello\u{00A0}"
+        );
+        assert_eq!(
+            trim_ascii_whitespace("  \u{00A0}hello\u{00A0}  "),
+            "\u{00A0}hello\u{00A0}"
         );
     }
 

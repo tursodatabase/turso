@@ -157,7 +157,7 @@ const run = async (seed: string, bin: string, args: string[]): Promise<boolean> 
   return issuePosted;
 }
 
-const IO_BACKENDS = ["memory", "io-uring", "default"] as const;
+const IO_BACKENDS = ["memory", "default"] as const; // ECS fargate blocks io-uring with seccomp so we can't currently use it
 type IoBackend = (typeof IO_BACKENDS)[number];
 
 const getRandomIoBackend = (): IoBackend => {

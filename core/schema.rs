@@ -163,6 +163,14 @@ pub fn is_system_table(table_name: &str) -> bool {
         || table_name.starts_with(DBSP_TABLE_PREFIX)
 }
 
+/// Type of schema object for conflict checking
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SchemaObjectType {
+    Table,
+    View,
+    Index,
+}
+
 #[derive(Debug)]
 pub struct Schema {
     pub tables: HashMap<String, Arc<Table>>,
@@ -1273,29 +1281,39 @@ impl Schema {
     }
 
     fn check_object_name_conflict(&self, name: &str) -> Result<()> {
+        if let Some(object_type) = self.get_object_type(name) {
+            let type_str = match object_type {
+                SchemaObjectType::Table => "table",
+                SchemaObjectType::View => "view",
+                SchemaObjectType::Index => "index",
+            };
+            return Err(crate::LimboError::ParseError(format!(
+                "{type_str} \"{name}\" already exists"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Returns the type of schema object with the given name, if one exists.
+    /// Checks tables, views, and indexes.
+    pub fn get_object_type(&self, name: &str) -> Option<SchemaObjectType> {
         let normalized_name = normalize_ident(name);
 
         if self.tables.contains_key(&normalized_name) {
-            return Err(crate::LimboError::ParseError(
-                ["table \"", name, "\" already exists"].concat().to_string(),
-            ));
+            return Some(SchemaObjectType::Table);
         }
 
         if self.views.contains_key(&normalized_name) {
-            return Err(crate::LimboError::ParseError(
-                ["view \"", name, "\" already exists"].concat().to_string(),
-            ));
+            return Some(SchemaObjectType::View);
         }
 
         for index_list in self.indexes.values() {
             if index_list.iter().any(|i| i.name.eq_ignore_ascii_case(name)) {
-                return Err(crate::LimboError::ParseError(
-                    ["index \"", name, "\" already exists"].concat().to_string(),
-                ));
+                return Some(SchemaObjectType::Index);
             }
         }
 
-        Ok(())
+        None
     }
 }
 
@@ -1570,6 +1588,12 @@ impl BTreeTable {
             if let Some(default) = &column.default {
                 sql.push_str(" DEFAULT ");
                 sql.push_str(&default.to_string());
+            }
+
+            if let Some(generated) = &column.generated {
+                sql.push_str(" AS (");
+                sql.push_str(&generated.to_string());
+                sql.push(')');
             }
         }
 
@@ -2012,6 +2036,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                     Some(normalize_ident(&name)),
                     ty_str,
                     default,
+                    None,
                     ty,
                     collation,
                     ColDef {
@@ -2254,6 +2279,7 @@ pub struct Column {
     pub name: Option<String>,
     pub ty_str: String,
     pub default: Option<Box<Expr>>,
+    pub generated: Option<Box<Expr>>,
     raw: u16,
 }
 
@@ -2288,7 +2314,15 @@ impl Column {
         ty_str: String,
         default: Option<Box<Expr>>,
     ) -> Self {
-        Self::new(name, ty_str, default, Type::Text, None, ColDef::default())
+        Self::new(
+            name,
+            ty_str,
+            default,
+            None,
+            Type::Text,
+            None,
+            ColDef::default(),
+        )
     }
     pub fn new_default_integer(
         name: Option<String>,
@@ -2299,6 +2333,7 @@ impl Column {
             name,
             ty_str,
             default,
+            None,
             Type::Integer,
             None,
             ColDef::default(),
@@ -2309,6 +2344,7 @@ impl Column {
         name: Option<String>,
         ty_str: String,
         default: Option<Box<Expr>>,
+        generated: Option<Box<Expr>>,
         ty: Type,
         col: Option<CollationSeq>,
         coldef: ColDef,
@@ -2337,6 +2373,7 @@ impl Column {
             name,
             ty_str,
             default,
+            generated,
             raw,
         }
     }
@@ -2437,6 +2474,7 @@ impl From<&ColumnDefinition> for Column {
         let name = value.col_name.as_str();
 
         let mut default = None;
+        let mut generated = None;
         let mut notnull = false;
         let mut primary_key = false;
         let mut unique = false;
@@ -2456,6 +2494,9 @@ impl From<&ColumnDefinition> for Column {
                         CollationSeq::new(collation_name.as_str())
                             .expect("collation should have been set correctly in create table"),
                     );
+                }
+                ast::ColumnConstraint::Generated { expr, .. } => {
+                    generated = Some(expr.clone());
                 }
                 _ => {}
             };
@@ -2478,6 +2519,7 @@ impl From<&ColumnDefinition> for Column {
             Some(normalize_ident(name)),
             ty_str,
             default,
+            generated,
             ty,
             collation,
             ColDef {

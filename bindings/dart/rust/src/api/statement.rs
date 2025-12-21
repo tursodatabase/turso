@@ -86,21 +86,13 @@ impl RustStatement {
             }
         }
         let mut rows: Vec<Vec<Value>> = Vec::new();
-        loop {
-            match self.inner.inner.step() {
-                Ok(turso_core::StepResult::Row) => {
-                    let row = self.inner.row().unwrap();
-                    rows.push(row.get_values().cloned().collect());
-                }
-                Ok(turso_core::StepResult::Done) => {
-                    break;
-                }
-                Ok(turso_core::StepResult::IO) => {
-                    self.inner.run_once().unwrap();
-                }
-                _ => break,
-            };
-        }
+        // TODO: this just blocks and has no error handling
+        self.inner
+            .run_with_row_callback(|row| {
+                rows.push(row.get_values().cloned().collect());
+                Ok(())
+            })
+            .unwrap();
         rows
     }
 }

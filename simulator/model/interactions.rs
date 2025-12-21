@@ -610,29 +610,16 @@ impl InteractionType {
             assert!(rows.is_some());
             let mut rows = rows.unwrap();
             let mut out = Vec::new();
-            loop {
-                match rows.step()? {
-                    StepResult::Row => {
-                        let row = rows.row().unwrap();
-                        let mut r = Vec::new();
-                        for v in row.get_values() {
-                            let v = v.into();
-                            r.push(v);
-                        }
-                        out.push(r);
-                    }
-                    StepResult::IO => {
-                        rows.run_once().unwrap();
-                    }
-                    StepResult::Interrupt => {}
-                    StepResult::Done => {
-                        break;
-                    }
-                    StepResult::Busy => {
-                        return Err(turso_core::LimboError::Busy);
-                    }
+
+            rows.run_with_row_callback(|row| {
+                let mut r = Vec::new();
+                for v in row.get_values() {
+                    let v = v.into();
+                    r.push(v);
                 }
-            }
+                out.push(r);
+                Ok(())
+            })?;
 
             Ok(out)
         } else {
@@ -739,6 +726,7 @@ impl InteractionType {
             }
             let mut rows = rows.unwrap().unwrap();
             let mut out = Vec::new();
+
             loop {
                 match rows.step()? {
                     StepResult::Row => {
@@ -755,7 +743,7 @@ impl InteractionType {
                         if syncing {
                             reopen_database(env);
                         } else {
-                            rows.run_once().unwrap();
+                            rows._io().step()?;
                         }
                     }
                     StepResult::Done => {
@@ -807,9 +795,20 @@ impl InteractionType {
                     env.io.inject_fault(true);
                 }
 
-                match rows.step()? {
-                    StepResult::Row => {
-                        let row = rows.row().unwrap();
+                let row = rows.run_one_step_blocking(
+                    || Ok(()),
+                    || {
+                        current_prob += incr;
+                        if current_prob > 1.0 {
+                            current_prob = 1.0;
+                        } else {
+                            incr *= 1.01;
+                        }
+                        Ok(())
+                    },
+                )?;
+                match row {
+                    Some(row) => {
                         let mut r = Vec::new();
                         for v in row.get_values() {
                             let v = v.into();
@@ -817,22 +816,7 @@ impl InteractionType {
                         }
                         out.push(r);
                     }
-                    StepResult::IO => {
-                        rows.run_once()?;
-                        current_prob += incr;
-                        if current_prob > 1.0 {
-                            current_prob = 1.0;
-                        } else {
-                            incr *= 1.01;
-                        }
-                    }
-                    StepResult::Done => {
-                        break;
-                    }
-                    StepResult::Busy => {
-                        return Err(turso_core::LimboError::Busy);
-                    }
-                    StepResult::Interrupt => {}
+                    None => break,
                 }
             }
 
@@ -879,9 +863,7 @@ fn reopen_database(env: &mut SimulatorEnv) {
                 env.io.clone(),
                 env.get_db_path().to_str().expect("path should be 'to_str'"),
                 turso_core::OpenFlags::default(),
-                turso_core::DatabaseOpts::new()
-                    .with_mvcc(mvcc)
-                    .with_autovacuum(true),
+                turso_core::DatabaseOpts::new().with_autovacuum(true),
                 None,
             ) {
                 Ok(db) => db,
@@ -896,6 +878,13 @@ fn reopen_database(env: &mut SimulatorEnv) {
             };
 
             env.db = Some(db);
+
+            // Enable MVCC via PRAGMA if requested
+            if mvcc {
+                let conn = env.db.as_ref().expect("db to be Some").connect().unwrap();
+                conn.pragma_update("journal_mode", "'experimental_mvcc'")
+                    .expect("enable mvcc");
+            }
 
             for _ in 0..num_conns {
                 env.connections.push(SimConnection::LimboConnection(

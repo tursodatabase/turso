@@ -6,9 +6,9 @@ use std::ptr::null;
 use std::slice;
 use std::sync::Arc;
 use turso_core::types::Text;
-use turso_core::{self, Connection, DatabaseOpts, Statement, StepResult, Value, IO};
+use turso_core::{self, Connection, DatabaseOpts, LimboError, Statement, Value, IO};
 
-type Error = *const i8;
+type Error = *const std::ffi::c_char;
 
 #[repr(C)]
 pub struct Database {
@@ -242,36 +242,25 @@ pub unsafe extern "C" fn db_statement_execute_step(
     error_ptr: *mut Error,
 ) -> bool {
     let statement = unsafe { &mut (*statement_ptr) };
+    let result = statement.run_one_step_blocking(|| Ok(()), || Ok(()));
 
-    loop {
-        match statement.step() {
-            Ok(step_result) => match step_result {
-                StepResult::Row => {
-                    return true;
-                }
-                StepResult::Done => {
-                    return false;
-                }
-                StepResult::IO => {
-                    if let Err(err) = statement.run_once() {
-                        unsafe { *error_ptr = allocate_string(err.to_string().as_str()) };
-                        return false;
-                    }
-                    continue;
-                }
-                StepResult::Interrupt => {
-                    unsafe { *error_ptr = allocate_string("Interrupted") };
-                    return false;
-                }
-                StepResult::Busy => {
-                    unsafe { *error_ptr = allocate_string("Database is busy") };
-                    return false;
-                }
-            },
-            Err(err) => {
-                unsafe { *error_ptr = allocate_string(err.to_string().as_str()) };
-                return false;
-            }
+    match result {
+        Ok(Some(_)) => true,
+        Ok(None) => {
+            // Done
+            false
+        }
+        Err(LimboError::Interrupt) => {
+            unsafe { *error_ptr = allocate_string("Interrupted") };
+            false
+        }
+        Err(LimboError::Busy) => {
+            unsafe { *error_ptr = allocate_string("Database is busy") };
+            false
+        }
+        Err(err) => {
+            unsafe { *error_ptr = allocate_string(err.to_string().as_str()) };
+            false
         }
     }
 }
@@ -370,7 +359,7 @@ pub unsafe extern "C" fn db_statement_num_columns(statement_ptr: *mut Statement)
 pub unsafe extern "C" fn db_statement_column_name(
     statement_ptr: *mut Statement,
     index: i32,
-) -> *const i8 {
+) -> *const std::ffi::c_char {
     let statement = unsafe { &mut (*statement_ptr) };
     let col_name = statement.get_column_name(index.try_into().unwrap());
     match col_name {

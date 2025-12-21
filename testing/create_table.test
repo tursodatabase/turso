@@ -115,3 +115,7 @@ do_execsql_test_on_specific_db {:memory:} col-default-false {
   insert into t (id) values (1);
   SELECT a from t;
 } {0}
+
+do_execsql_test_in_memory_any_error create-table-only-generated-column-error {
+    CREATE TABLE t(a AS (123));
+}

@@ -307,6 +307,29 @@ do_execsql_test_in_memory_error_content alter-table-add-generated-column-error {
     "Parse error: Alter table does not support adding generated columns"
 }
 
+do_execsql_test_in_memory_error_content alter-column-only-to-generated-error {
+    CREATE TABLE t(a);
+    ALTER TABLE t ALTER COLUMN a TO b AS (123);
+} {
+    "Parse error: must have at least one non-generated column"
+}
+
+do_execsql_test_in_memory_error_content alter-column-all-to-generated-error {
+    CREATE TABLE t(a, b);
+    ALTER TABLE t ALTER COLUMN a TO c AS (123);
+    ALTER TABLE t ALTER COLUMN b TO d AS (123);
+} {
+    "Parse error: must have at least one non-generated column"
+}
+
+do_execsql_test_on_specific_db {:memory:} alter-column-to-generated-with-other-columns {
+    CREATE TABLE t(a, b);
+    ALTER TABLE t ALTER COLUMN a TO c AS (123);
+    SELECT sql FROM sqlite_schema WHERE name = 't';
+} {
+    "CREATE TABLE t (c AS (123), b)"
+}
+
 # Add column with a foreign key reference and verify schema SQL
 do_execsql_test_on_specific_db {:memory:} alter-table-add-column-with-fk-updates-schema {
     CREATE TABLE t(a);

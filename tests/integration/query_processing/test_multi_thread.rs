@@ -27,21 +27,12 @@ fn test_schema_reprepare(tmp_db: TempDatabase) {
     }
 
     let mut rows = Vec::new();
-    loop {
-        match stmt.step().unwrap() {
-            turso_core::StepResult::Done => {
-                break;
-            }
-            turso_core::StepResult::Row => {
-                let row = stmt.row().unwrap();
-                rows.push((row.get::<i64>(0).unwrap(), row.get::<i64>(1).unwrap()));
-            }
-            turso_core::StepResult::IO => {
-                stmt.run_once().unwrap();
-            }
-            step => panic!("unexpected step result {step:?}"),
-        }
-    }
+    stmt.run_with_row_callback(|row| {
+        rows.push((row.get::<i64>(0).unwrap(), row.get::<i64>(1).unwrap()));
+        Ok(())
+    })
+    .unwrap();
+
     let row = rows[0];
     assert_eq!(row, (2, 3));
     let row = rows[1];
@@ -83,7 +74,7 @@ fn test_create_multiple_connections(tmp_db: TempDatabase) -> anyhow::Result<()> 
                                 panic!("unexpected row result");
                             }
                             StepResult::IO => {
-                                stmt.run_once().unwrap();
+                                stmt._io().step().unwrap();
                             }
                             StepResult::Done => {
                                 tracing::info!("inserted row {}", i);
@@ -109,26 +100,12 @@ fn test_create_multiple_connections(tmp_db: TempDatabase) -> anyhow::Result<()> 
         let conn = tmp_db.connect_limbo();
         let mut stmt = conn.prepare("SELECT * FROM t").unwrap();
         let mut rows = Vec::new();
-        loop {
-            match stmt.step().unwrap() {
-                StepResult::Row => {
-                    let row = stmt.row().unwrap();
-                    rows.push(row.get::<i64>(0).unwrap());
-                }
-                StepResult::IO => {
-                    stmt.run_once().unwrap();
-                }
-                StepResult::Done => {
-                    break;
-                }
-                StepResult::Interrupt => {
-                    panic!("unexpected step result");
-                }
-                StepResult::Busy => {
-                    panic!("unexpected busy result on select");
-                }
-            }
-        }
+        stmt.run_with_row_callback(|row| {
+            rows.push(row.get::<i64>(0).unwrap());
+            Ok(())
+        })
+        .unwrap();
+
         rows.sort();
         assert_eq!(rows, (0..10).collect::<Vec<_>>());
     }
@@ -180,31 +157,18 @@ fn test_reader_writer(tmp_db: TempDatabase) -> anyhow::Result<()> {
                     }
                     let mut stmt = conn.prepare("SELECT * FROM t").unwrap();
                     let mut rows = Vec::new();
-                    loop {
-                        match stmt.step().unwrap() {
-                            StepResult::Row => {
-                                let row = stmt.row().unwrap();
-                                let x = row.get::<i64>(0).unwrap();
-                                rows.push(x);
-                            }
-                            StepResult::IO => {
-                                stmt.run_once().unwrap();
-                            }
-                            StepResult::Done => {
-                                rows.sort();
-                                for i in 0..current_written_rows {
-                                    let i = i as i64;
-                                    assert!(
-                                        rows.contains(&i),
-                                        "row {i} not found in {rows:?}. current_written_rows: {current_written_rows}",
-                                    );
-                                }
-                                break;
-                            }
-                            StepResult::Interrupt | StepResult::Busy => {
-                                panic!("unexpected step result");
-                            }
-                        }
+                    stmt.run_with_row_callback(|row| {
+                        let x = row.get::<i64>(0).unwrap();
+                        rows.push(x);
+                        Ok(())
+                    }).unwrap();
+                    rows.sort();
+                    for i in 0..current_written_rows {
+                        let i = i as i64;
+                        assert!(
+                            rows.contains(&i),
+                            "row {i} not found in {rows:?}. current_written_rows: {current_written_rows}",
+                        );
                     }
                 }
             }));
@@ -227,36 +191,19 @@ fn test_schema_reprepare_write(tmp_db: TempDatabase) {
     conn1.execute("ALTER TABLE t DROP COLUMN x").unwrap();
 
     tracing::info!("Executing Stmt 1");
-    loop {
-        match stmt.step().unwrap() {
-            turso_core::StepResult::Done => {
-                break;
-            }
-            turso_core::StepResult::IO => {
-                stmt.run_once().unwrap();
-            }
-            step => panic!("unexpected step result {step:?}"),
-        }
-    }
+    stmt.run_with_row_callback(|_| panic!("unexpected row"))
+        .unwrap();
 
     tracing::info!("Executing Stmt 2");
-    loop {
-        match stmt2.step().unwrap() {
-            turso_core::StepResult::Done => {
-                break;
-            }
-            turso_core::StepResult::IO => {
-                stmt2.run_once().unwrap();
-            }
-            step => panic!("unexpected step result {step:?}"),
-        }
-    }
+    stmt2
+        .run_with_row_callback(|_| panic!("unexpected row"))
+        .unwrap();
 }
 
 fn advance(stmt: &mut Statement) -> anyhow::Result<()> {
     tracing::info!("Advancing statement: {:?}", stmt.get_sql());
     while matches!(stmt.step()?, StepResult::IO) {
-        stmt.run_once()?;
+        stmt._io().step()?;
     }
     Ok(())
 }

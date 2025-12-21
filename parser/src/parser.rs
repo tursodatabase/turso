@@ -2896,7 +2896,7 @@ impl<'a> Parser<'a> {
 
                 // larger than or equal columns len means we have only generated columns
                 if generated_count >= columns.len() {
-                    return Err(Error::Custom(
+                    return Err(Error::ParseError(
                         "must have at least one non-generated column".to_owned(),
                     ));
                 }

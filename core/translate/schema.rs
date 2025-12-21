@@ -3,7 +3,8 @@ use std::sync::Arc;
 use crate::ast;
 use crate::ext::VTabImpl;
 use crate::schema::{
-    create_table, BTreeTable, ColDef, Column, Table, Type, RESERVED_TABLE_PREFIXES,
+    create_table, BTreeTable, ColDef, Column, SchemaObjectType, Table, Type,
+    RESERVED_TABLE_PREFIXES,
 };
 use crate::storage::pager::CreateBTreeFlags;
 use crate::translate::emitter::{
@@ -101,11 +102,22 @@ pub fn translate_create_table(
         );
     }
 
-    if resolver.schema.get_table(&normalized_tbl_name).is_some() {
-        if if_not_exists {
-            return Ok(program);
+    // Check for name conflicts with existing schema objects
+    if let Some(object_type) = resolver.schema.get_object_type(&normalized_tbl_name) {
+        match object_type {
+            // IF NOT EXISTS suppresses errors for table/view conflicts
+            SchemaObjectType::Table | SchemaObjectType::View if if_not_exists => {
+                return Ok(program);
+            }
+            _ => {
+                let type_str = match object_type {
+                    SchemaObjectType::Table => "table",
+                    SchemaObjectType::View => "view",
+                    SchemaObjectType::Index => "index",
+                };
+                bail_parse_error!("{} {} already exists", type_str, normalized_tbl_name);
+            }
         }
-        bail_parse_error!("Table {} already exists", normalized_tbl_name);
     }
 
     let mut has_autoincrement = false;
@@ -824,6 +836,7 @@ pub fn translate_drop_table(
             columns: vec![Column::new(
                 Some("rowid".to_string()),
                 "INTEGER".to_string(),
+                None,
                 None,
                 Type::Integer,
                 None,

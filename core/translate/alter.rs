@@ -604,6 +604,26 @@ pub fn translate_alter_table(
                 ));
             }
 
+            let is_making_column_generated = definition
+                .constraints
+                .iter()
+                .any(|c| matches!(c.constraint, ast::ColumnConstraint::Generated { .. }));
+
+            if is_making_column_generated {
+                let non_generated_count = btree
+                    .columns
+                    .iter()
+                    .enumerate()
+                    .filter(|(idx, col)| *idx != column_index && col.generated.is_none())
+                    .count();
+
+                if non_generated_count == 0 {
+                    return Err(LimboError::ParseError(
+                        "must have at least one non-generated column".to_string(),
+                    ));
+                }
+            }
+
             // If renaming, rewrite trigger SQL for all triggers that reference this column
             // We'll collect the triggers to rewrite and update them in sqlite_schema
             let mut triggers_to_rewrite: Vec<(String, String)> = Vec::new();

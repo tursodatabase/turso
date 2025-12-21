@@ -59,7 +59,7 @@ fn create_wal_db(db_path: &Path) {
 /// Open database with limbo and close it, then check header versions
 fn open_with_limbo_and_check(db_path: &Path, enable_mvcc: bool) -> (u8, u8) {
     let io = std::sync::Arc::new(turso_core::PlatformIO::new().unwrap());
-    let opts = DatabaseOpts::new().with_mvcc(enable_mvcc);
+    let opts = DatabaseOpts::new();
 
     let db = Database::open_file_with_flags(
         io.clone(),
@@ -73,22 +73,15 @@ fn open_with_limbo_and_check(db_path: &Path, enable_mvcc: bool) -> (u8, u8) {
     // Connect to ensure initialization is complete
     let conn = db.connect().unwrap();
 
+    // Enable MVCC if requested
+    if enable_mvcc {
+        conn.pragma_update("journal_mode", "'experimental_mvcc'")
+            .expect("enable mvcc");
+    }
+
     // Do a simple query to ensure everything is initialized
     if let Some(mut stmt) = conn.query("SELECT 1").unwrap() {
-        loop {
-            let result = stmt.step().unwrap();
-            match result {
-                turso_core::StepResult::Row => {
-                    let _row = stmt.row().unwrap();
-                }
-                turso_core::StepResult::IO => {
-                    stmt.run_once().unwrap();
-                    continue;
-                }
-                turso_core::StepResult::Done => break,
-                r => panic!("unexpected result {r:?}: expecting single row"),
-            }
-        }
+        stmt.run_with_row_callback(|_| Ok(())).unwrap();
     }
 
     // Drop connection and database
@@ -314,7 +307,7 @@ fn test_pragma_journal_mode_wal_to_mvcc_with_pending_wal() {
     // Step 2: Open with limbo WITHOUT MVCC to create WAL data, then close without checkpointing
     {
         let io = std::sync::Arc::new(turso_core::PlatformIO::new().unwrap());
-        let opts = DatabaseOpts::new().with_mvcc(false);
+        let opts = DatabaseOpts::new();
 
         let db = Database::open_file_with_flags(
             io.clone(),
@@ -347,7 +340,7 @@ fn test_pragma_journal_mode_wal_to_mvcc_with_pending_wal() {
 
     // Step 3: Reopen with MVCC enabled and try to switch via PRAGMA
     let io = std::sync::Arc::new(turso_core::PlatformIO::new().unwrap());
-    let opts = DatabaseOpts::new().with_mvcc(true);
+    let opts = DatabaseOpts::new();
 
     let db = Database::open_file_with_flags(
         io.clone(),
@@ -377,21 +370,12 @@ fn test_pragma_journal_mode_wal_to_mvcc_with_pending_wal() {
     // Verify we can still query data (both original and new data)
     let mut stmt = conn.prepare("SELECT val FROM t ORDER BY val").unwrap();
     let mut rows = Vec::new();
-    loop {
-        match stmt.step().unwrap() {
-            turso_core::StepResult::Row => {
-                let row = stmt.row().unwrap();
-                let val: String = row.get::<String>(0).unwrap();
-                rows.push(val);
-            }
-            turso_core::StepResult::IO => {
-                stmt.run_once().unwrap();
-                continue;
-            }
-            turso_core::StepResult::Done => break,
-            r => panic!("unexpected result {r:?}"),
-        }
-    }
+    stmt.run_with_row_callback(|row| {
+        let val: String = row.get::<String>(0).unwrap();
+        rows.push(val);
+        Ok(())
+    })
+    .unwrap();
     assert!(
         rows.contains(&"test".to_string()),
         "Should have original test row"
@@ -429,10 +413,10 @@ fn test_pragma_journal_mode_mvcc_to_wal() {
     // Step 1: Create a WAL mode database and convert to MVCC
     create_wal_db(&db_path);
 
-    // Step 2: Open with MVCC to convert to MVCC mode and add some data
+    // Step 2: Open and switch to MVCC mode via PRAGMA, then add some data
     {
         let io = std::sync::Arc::new(turso_core::PlatformIO::new().unwrap());
-        let opts = DatabaseOpts::new().with_mvcc(true);
+        let opts = DatabaseOpts::new();
 
         let db = Database::open_file_with_flags(
             io.clone(),
@@ -441,9 +425,13 @@ fn test_pragma_journal_mode_mvcc_to_wal() {
             opts,
             None,
         )
-        .expect("Failed to open database with limbo (MVCC)");
+        .expect("Failed to open database with limbo");
 
         let conn = db.connect().unwrap();
+
+        // Switch to MVCC mode via PRAGMA
+        conn.pragma_update("journal_mode", "'experimental_mvcc'")
+            .expect("PRAGMA journal_mode = 'experimental_mvcc' should work");
 
         // Insert some data in MVCC mode
         conn.execute("INSERT INTO t (val) VALUES ('mvcc_data')")
@@ -461,7 +449,7 @@ fn test_pragma_journal_mode_mvcc_to_wal() {
     // Step 3: Reopen and switch to WAL mode via PRAGMA
     let io = std::sync::Arc::new(turso_core::PlatformIO::new().unwrap());
     // Open with MVCC true since the file is MVCC, but we'll switch to WAL
-    let opts = DatabaseOpts::new().with_mvcc(true);
+    let opts = DatabaseOpts::new();
 
     let db = Database::open_file_with_flags(
         io.clone(),
@@ -537,7 +525,7 @@ fn test_pragma_journal_mode_multiple_switches() {
     create_wal_db(&db_path);
 
     let io = std::sync::Arc::new(turso_core::PlatformIO::new().unwrap());
-    let opts = DatabaseOpts::new().with_mvcc(true);
+    let opts = DatabaseOpts::new();
 
     let db = Database::open_file_with_flags(
         io.clone(),
@@ -597,21 +585,12 @@ fn test_pragma_journal_mode_multiple_switches() {
     // Verify all data is present
     let mut stmt = conn.prepare("SELECT val FROM t ORDER BY val").unwrap();
     let mut rows = Vec::new();
-    loop {
-        match stmt.step().unwrap() {
-            turso_core::StepResult::Row => {
-                let row = stmt.row().unwrap();
-                let val: String = row.get::<String>(0).unwrap();
-                rows.push(val);
-            }
-            turso_core::StepResult::IO => {
-                stmt.run_once().unwrap();
-                continue;
-            }
-            turso_core::StepResult::Done => break,
-            r => panic!("unexpected result {r:?}"),
-        }
-    }
+    stmt.run_with_row_callback(|row| {
+        let val: String = row.get::<String>(0).unwrap();
+        rows.push(val);
+        Ok(())
+    })
+    .unwrap();
 
     assert!(
         rows.contains(&"test".to_string()),
@@ -655,7 +634,7 @@ fn test_pragma_journal_mode_query() {
     create_wal_db(&db_path);
 
     let io = std::sync::Arc::new(turso_core::PlatformIO::new().unwrap());
-    let opts = DatabaseOpts::new().with_mvcc(false);
+    let opts = DatabaseOpts::new();
 
     let db = Database::open_file_with_flags(
         io.clone(),
@@ -670,28 +649,19 @@ fn test_pragma_journal_mode_query() {
 
     // Query current journal mode (should be WAL)
     if let Some(mut stmt) = conn.query("PRAGMA journal_mode").unwrap() {
-        loop {
-            match stmt.step().unwrap() {
-                turso_core::StepResult::Row => {
-                    let row = stmt.row().unwrap();
-                    let mode: String = row.get::<String>(0).unwrap();
-                    assert_eq!(mode, "wal", "Initial mode should be WAL, got {mode}");
-                }
-                turso_core::StepResult::IO => {
-                    stmt.run_once().unwrap();
-                    continue;
-                }
-                turso_core::StepResult::Done => break,
-                r => panic!("unexpected result {r:?}"),
-            }
-        }
+        stmt.run_with_row_callback(|row| {
+            let mode: String = row.get::<String>(0).unwrap();
+            assert_eq!(mode, "wal", "Initial mode should be WAL, got {mode}");
+            Ok(())
+        })
+        .unwrap();
     }
 
     drop(conn);
     drop(db);
 
-    // Now open with MVCC and verify query returns experimental_mvcc
-    let opts = DatabaseOpts::new().with_mvcc(true);
+    // Now open and switch to MVCC via PRAGMA, then verify query returns experimental_mvcc
+    let opts = DatabaseOpts::new();
 
     let db = Database::open_file_with_flags(
         io.clone(),
@@ -700,30 +670,25 @@ fn test_pragma_journal_mode_query() {
         opts,
         None,
     )
-    .expect("Failed to open database with MVCC");
+    .expect("Failed to open database");
 
     let conn = db.connect().unwrap();
 
-    // Query current journal mode (should be experimental_mvcc after conversion)
+    // Switch to MVCC mode via PRAGMA
+    conn.pragma_update("journal_mode", "'experimental_mvcc'")
+        .expect("PRAGMA journal_mode = 'experimental_mvcc' should work");
+
+    // Query current journal mode (should be experimental_mvcc after switching)
     if let Some(mut stmt) = conn.query("PRAGMA journal_mode").unwrap() {
-        loop {
-            match stmt.step().unwrap() {
-                turso_core::StepResult::Row => {
-                    let row = stmt.row().unwrap();
-                    let mode: String = row.get::<String>(0).unwrap();
-                    assert_eq!(
-                        mode, "experimental_mvcc",
-                        "Mode should be experimental_mvcc after MVCC open, got {mode}"
-                    );
-                }
-                turso_core::StepResult::IO => {
-                    stmt.run_once().unwrap();
-                    continue;
-                }
-                turso_core::StepResult::Done => break,
-                r => panic!("unexpected result {r:?}"),
-            }
-        }
+        stmt.run_with_row_callback(|row| {
+            let mode: String = row.get::<String>(0).unwrap();
+            assert_eq!(
+                mode, "experimental_mvcc",
+                "Mode should be experimental_mvcc after PRAGMA switch, got {mode}"
+            );
+            Ok(())
+        })
+        .unwrap();
     }
 
     drop(conn);
@@ -742,7 +707,7 @@ fn test_pragma_journal_mode_data_persistence_after_switch() {
     // Open and switch to MVCC, insert data
     {
         let io = std::sync::Arc::new(turso_core::PlatformIO::new().unwrap());
-        let opts = DatabaseOpts::new().with_mvcc(true);
+        let opts = DatabaseOpts::new();
 
         let db = Database::open_file_with_flags(
             io.clone(),
@@ -770,7 +735,7 @@ fn test_pragma_journal_mode_data_persistence_after_switch() {
     // Reopen and verify data persisted
     {
         let io = std::sync::Arc::new(turso_core::PlatformIO::new().unwrap());
-        let opts = DatabaseOpts::new().with_mvcc(true);
+        let opts = DatabaseOpts::new();
 
         let db = Database::open_file_with_flags(
             io.clone(),
@@ -788,22 +753,267 @@ fn test_pragma_journal_mode_data_persistence_after_switch() {
             .prepare("SELECT val FROM t WHERE val = 'persisted_data'")
             .unwrap();
         let mut found = false;
-        loop {
-            match stmt.step().unwrap() {
-                turso_core::StepResult::Row => {
-                    found = true;
-                }
-                turso_core::StepResult::IO => {
-                    stmt.run_once().unwrap();
-                    continue;
-                }
-                turso_core::StepResult::Done => break,
-                r => panic!("unexpected result {r:?}"),
-            }
-        }
+        stmt.run_with_row_callback(|_| {
+            found = true;
+            Ok(())
+        })
+        .unwrap();
         assert!(found, "Data inserted after mode switch should persist");
 
         drop(conn);
         drop(db);
     }
+}
+
+/// Open database in readonly mode with limbo and check header versions
+fn open_with_limbo_readonly_and_check(db_path: &Path, enable_mvcc: bool) -> (u8, u8) {
+    let io = std::sync::Arc::new(turso_core::PlatformIO::new().unwrap());
+    let opts = DatabaseOpts::new();
+
+    let db = Database::open_file_with_flags(
+        io.clone(),
+        db_path.to_str().unwrap(),
+        OpenFlags::ReadOnly,
+        opts,
+        None,
+    )
+    .expect("Failed to open database with limbo in readonly mode");
+
+    // Connect to ensure initialization is complete
+    let conn = db.connect().unwrap();
+
+    // Try to enable MVCC if requested (will fail in readonly mode, which is expected)
+    if enable_mvcc {
+        let _ = conn.pragma_update("journal_mode", "'experimental_mvcc'");
+    }
+
+    // Do a simple query to ensure everything is initialized
+    if let Some(mut stmt) = conn.query("SELECT 1").unwrap() {
+        stmt.run_with_row_callback(|_| Ok(())).unwrap();
+    }
+
+    // Drop connection and database
+    drop(conn);
+    drop(db);
+
+    // Read header versions after limbo has closed
+    read_header_versions(db_path)
+}
+
+/// Test that readonly database cannot modify header when opening a Legacy mode database
+#[test]
+fn test_readonly_legacy_db_header_not_modified() {
+    let tmp_dir = TempDir::new().unwrap();
+    let db_path = tmp_dir.path().join("test.db");
+
+    // Create a Legacy mode database
+    create_legacy_db(&db_path);
+
+    // Get the original header versions
+    let (orig_write_ver, orig_read_ver) = read_header_versions(&db_path);
+    assert_eq!(orig_write_ver, 1, "Original should be Legacy mode");
+    assert_eq!(orig_read_ver, 1, "Original should be Legacy mode");
+
+    // Open with limbo in readonly mode (without MVCC)
+    let (write_ver, read_ver) = open_with_limbo_readonly_and_check(&db_path, false);
+
+    // Header should NOT be modified - should still be Legacy mode
+    assert_eq!(
+        write_ver, 1,
+        "Readonly DB should NOT convert Legacy to WAL (write_version should stay 1), got {write_ver}"
+    );
+    assert_eq!(
+        read_ver, 1,
+        "Readonly DB should NOT convert Legacy to WAL (read_version should stay 1), got {read_ver}"
+    );
+}
+
+/// Test that readonly database cannot modify header when MVCC is requested
+#[test]
+fn test_readonly_legacy_db_with_mvcc_header_not_modified() {
+    let tmp_dir = TempDir::new().unwrap();
+    let db_path = tmp_dir.path().join("test.db");
+
+    // Create a Legacy mode database
+    create_legacy_db(&db_path);
+
+    // Get the original header versions
+    let (orig_write_ver, orig_read_ver) = read_header_versions(&db_path);
+    assert_eq!(orig_write_ver, 1, "Original should be Legacy mode");
+    assert_eq!(orig_read_ver, 1, "Original should be Legacy mode");
+
+    // Open with limbo in readonly mode with MVCC enabled
+    let (write_ver, read_ver) = open_with_limbo_readonly_and_check(&db_path, true);
+
+    // Header should NOT be modified - should still be Legacy mode
+    // even though MVCC was requested
+    assert_eq!(
+        write_ver, 1,
+        "Readonly DB should NOT convert Legacy to MVCC (write_version should stay 1), got {write_ver}"
+    );
+    assert_eq!(
+        read_ver, 1,
+        "Readonly DB should NOT convert Legacy to MVCC (read_version should stay 1), got {read_ver}"
+    );
+}
+
+/// Test that readonly WAL database cannot be converted to MVCC
+#[test]
+fn test_readonly_wal_db_with_mvcc_header_not_modified() {
+    let tmp_dir = TempDir::new().unwrap();
+    let db_path = tmp_dir.path().join("test.db");
+
+    // Create a WAL mode database
+    create_wal_db(&db_path);
+
+    // Get the original header versions
+    let (orig_write_ver, orig_read_ver) = read_header_versions(&db_path);
+    assert_eq!(orig_write_ver, 2, "Original should be WAL mode");
+    assert_eq!(orig_read_ver, 2, "Original should be WAL mode");
+
+    // Open with limbo in readonly mode with MVCC enabled
+    let (write_ver, read_ver) = open_with_limbo_readonly_and_check(&db_path, true);
+
+    // Header should NOT be modified - should still be WAL mode
+    // even though MVCC was requested
+    assert_eq!(
+        write_ver, 2,
+        "Readonly DB should NOT convert WAL to MVCC (write_version should stay 2), got {write_ver}"
+    );
+    assert_eq!(
+        read_ver, 2,
+        "Readonly DB should NOT convert WAL to MVCC (read_version should stay 2), got {read_ver}"
+    );
+}
+
+/// Test that PRAGMA journal_mode cannot change mode on readonly database
+#[test]
+fn test_readonly_pragma_journal_mode_cannot_change() {
+    let tmp_dir = TempDir::new().unwrap();
+    let db_path = tmp_dir.path().join("test.db");
+
+    // Create a WAL mode database
+    create_wal_db(&db_path);
+
+    let io = std::sync::Arc::new(turso_core::PlatformIO::new().unwrap());
+    let opts = DatabaseOpts::new();
+
+    let db = Database::open_file_with_flags(
+        io.clone(),
+        db_path.to_str().unwrap(),
+        OpenFlags::ReadOnly,
+        opts,
+        None,
+    )
+    .expect("Failed to open database in readonly mode");
+
+    let conn = db.connect().unwrap();
+
+    // Try to switch to MVCC mode via PRAGMA - this should return an error
+    // because we cannot change mode on readonly databases
+    let result = conn.pragma_update("journal_mode", "'experimental_mvcc'");
+
+    // The result should be a ReadOnly error
+    assert!(
+        matches!(result, Err(turso_core::LimboError::ReadOnly)),
+        "PRAGMA journal_mode should return ReadOnly error on readonly database, got: {result:?}"
+    );
+
+    drop(conn);
+    drop(db);
+
+    // Verify header was NOT modified
+    let (write_ver, read_ver) = read_header_versions(&db_path);
+    assert_eq!(
+        write_ver, 2,
+        "Readonly DB header should NOT be modified (write_version should stay 2), got {write_ver}"
+    );
+    assert_eq!(
+        read_ver, 2,
+        "Readonly DB header should NOT be modified (read_version should stay 2), got {read_ver}"
+    );
+}
+
+/// Test that readonly MVCC database can still be opened and read
+#[test]
+fn test_readonly_mvcc_db_can_be_read() {
+    let tmp_dir = TempDir::new().unwrap();
+    let db_path = tmp_dir.path().join("test.db");
+
+    // Create a WAL mode database and convert to MVCC
+    create_wal_db(&db_path);
+
+    // First, convert to MVCC by opening in read-write mode and using PRAGMA
+    {
+        let io = std::sync::Arc::new(turso_core::PlatformIO::new().unwrap());
+        let opts = DatabaseOpts::new();
+
+        let db = Database::open_file_with_flags(
+            io.clone(),
+            db_path.to_str().unwrap(),
+            OpenFlags::default(),
+            opts,
+            None,
+        )
+        .expect("Failed to open database");
+
+        let conn = db.connect().unwrap();
+
+        // Switch to MVCC mode via PRAGMA
+        conn.pragma_update("journal_mode", "'experimental_mvcc'")
+            .expect("PRAGMA journal_mode = 'experimental_mvcc' should work");
+
+        // Insert some data in MVCC mode
+        conn.execute("INSERT INTO t (val) VALUES ('mvcc_readonly_test')")
+            .expect("INSERT should work in MVCC mode");
+
+        drop(conn);
+        drop(db);
+    }
+
+    // Verify it's now MVCC mode
+    let (write_ver, read_ver) = read_header_versions(&db_path);
+    assert_eq!(write_ver, 255, "Should be MVCC after first open");
+    assert_eq!(read_ver, 255, "Should be MVCC after first open");
+
+    // Now open in readonly mode - this should work and we should be able to read data
+    let io = std::sync::Arc::new(turso_core::PlatformIO::new().unwrap());
+    let opts = DatabaseOpts::new();
+
+    let db = Database::open_file_with_flags(
+        io.clone(),
+        db_path.to_str().unwrap(),
+        OpenFlags::ReadOnly,
+        opts,
+        None,
+    )
+    .expect("Failed to open MVCC database in readonly mode");
+
+    let conn = db.connect().unwrap();
+
+    // Verify we can read data
+    let mut stmt = conn
+        .prepare("SELECT val FROM t WHERE val = 'mvcc_readonly_test'")
+        .unwrap();
+    let mut found = false;
+    stmt.run_with_row_callback(|_| {
+        found = true;
+        Ok(())
+    })
+    .unwrap();
+    assert!(found, "Should be able to read MVCC data in readonly mode");
+
+    drop(conn);
+    drop(db);
+
+    // Verify header was NOT modified
+    let (write_ver, read_ver) = read_header_versions(&db_path);
+    assert_eq!(
+        write_ver, 255,
+        "Readonly MVCC DB header should NOT be modified (write_version should stay 255), got {write_ver}"
+    );
+    assert_eq!(
+        read_ver, 255,
+        "Readonly MVCC DB header should NOT be modified (read_version should stay 255), got {read_ver}"
+    );
 }

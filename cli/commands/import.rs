@@ -1,7 +1,7 @@
 use clap::Args;
 use clap_complete::{ArgValueCompleter, PathCompleter};
 use std::{fs::File, io::Write, path::PathBuf, sync::Arc};
-use turso_core::Connection;
+use turso_core::{Connection, LimboError};
 
 #[derive(Debug, Clone, Args)]
 pub struct ImportArgs {
@@ -40,57 +40,31 @@ impl<'a> ImportFile<'a> {
             args.table
         );
 
-        let table_exists = 'check: {
-            match self.conn.query(table_check_query) {
-                Ok(rows) => {
-                    if let Some(mut rows) = rows {
-                        loop {
-                            match rows.step() {
-                                Ok(turso_core::StepResult::Row) => {
-                                    break 'check true;
-                                }
-                                Ok(turso_core::StepResult::Done) => break 'check false,
-                                Ok(turso_core::StepResult::IO) => {
-                                    if let Err(e) = rows.run_once() {
-                                        let _ = self.writer.write_all(
-                                            format!("Error checking table existence: {e:?}\n")
-                                                .as_bytes(),
-                                        );
-                                        return;
-                                    }
-                                }
-                                Ok(
-                                    turso_core::StepResult::Interrupt
-                                    | turso_core::StepResult::Busy,
-                                ) => {
-                                    if let Err(e) = rows.run_once() {
-                                        let _ = self.writer.write_all(
-                                            format!("Error checking table existence: {e:?}\n")
-                                                .as_bytes(),
-                                        );
-                                        return;
-                                    }
-                                }
-                                Err(e) => {
-                                    let _ = self.writer.write_all(
-                                        format!("Error checking table existence: {e:?}\n")
-                                            .as_bytes(),
-                                    );
-                                    return;
-                                }
-                            }
-                        }
+        let mut table_exists = false;
+
+        match self.conn.query(table_check_query) {
+            Ok(rows) => {
+                if let Some(mut rows) = rows {
+                    let res = rows.run_with_row_callback(|_| {
+                        table_exists = true;
+                        Ok(())
+                    });
+                    if let Err(e) = res {
+                        let _ = self.writer.write_all(
+                            format!("Error checking table existence: {e:?}\n").as_bytes(),
+                        );
+                        return;
                     }
-                    false
-                }
-                Err(e) => {
-                    let _ = self
-                        .writer
-                        .write_all(format!("Error checking table existence: {e:?}\n").as_bytes());
-                    return;
                 }
             }
-        };
+            Err(e) => {
+                let _ = self
+                    .writer
+                    .write_all(format!("Error checking table existence: {e:?}\n").as_bytes());
+                return;
+            }
+        }
+
         let file = match File::open(args.file) {
             Ok(file) => file,
             Err(e) => {
@@ -132,36 +106,23 @@ impl<'a> ImportFile<'a> {
                     return;
                 };
 
-                loop {
-                    match rows.step() {
-                        Ok(turso_core::StepResult::IO) => {
-                            if let Err(e) = rows.run_once() {
-                                let _ = self
-                                    .writer
-                                    .write_all(format!("Error creating table: {e:?}\n").as_bytes());
-                                return;
-                            }
-                        }
-                        Ok(turso_core::StepResult::Interrupt)
-                        | Ok(turso_core::StepResult::Busy) => {
-                            let _ = self.writer.write_all(
-                                "Error creating table: interrupted / busy\n"
-                                    .to_string()
-                                    .as_bytes(),
-                            );
-                            return;
-                        }
-                        Ok(turso_core::StepResult::Row) => {
-                            // Not expected for CREATE TABLE
-                            panic!("Unexpected row for CREATE TABLE");
-                        }
-                        Ok(turso_core::StepResult::Done) => break,
-                        Err(e) => {
-                            let _ = self
-                                .writer
-                                .write_all(format!("Error creating table: {e:?}\n").as_bytes());
-                            return;
-                        }
+                let res = rows.run_with_row_callback(|_| {
+                    // Not expected for CREATE TABLE
+                    panic!("Unexpected row for CREATE TABLE");
+                });
+                match res {
+                    Ok(_) => {}
+                    Err(LimboError::Busy | LimboError::Interrupt) => {
+                        let _ = self
+                            .writer
+                            .write_all("Error creating table: interrupted / busy\n".as_bytes());
+                        return;
+                    }
+                    Err(e) => {
+                        let _ = self.writer.write_all(
+                            format!("Error checking table existence: {e:?}\n").as_bytes(),
+                        );
+                        return;
                     }
                 }
             } else {
@@ -200,42 +161,28 @@ impl<'a> ImportFile<'a> {
                     match self.conn.query(insert_string) {
                         Ok(rows) => {
                             if let Some(mut rows) = rows {
-                                loop {
-                                    match rows.step() {
-                                        Ok(turso_core::StepResult::IO) => {
-                                            if let Err(e) = rows.run_once() {
-                                                let _ = self.writer.write_all(
-                                                    format!("Error executing query: {e:?}\n")
-                                                        .as_bytes(),
-                                                );
-                                                failed_rows += batch.len() as u64;
-                                                break;
-                                            }
-                                        }
-                                        Ok(turso_core::StepResult::Done) => {
-                                            success_rows += batch.len() as u64;
-                                            break;
-                                        }
-                                        Ok(turso_core::StepResult::Interrupt) => {
-                                            failed_rows += batch.len() as u64;
-                                            break;
-                                        }
-                                        Ok(turso_core::StepResult::Busy) => {
-                                            let _ = self.writer.write_all(b"database is busy\n");
-                                            failed_rows += batch.len() as u64;
-                                            break;
-                                        }
-                                        Ok(turso_core::StepResult::Row) => {
-                                            panic!("Unexpected row for INSERT");
-                                        }
-                                        Err(e) => {
-                                            let _ = self.writer.write_all(
-                                                format!("Error executing query: {e:?}\n")
-                                                    .as_bytes(),
-                                            );
-                                            failed_rows += batch.len() as u64;
-                                            break;
-                                        }
+                                let res = rows.run_with_row_callback(|_| {
+                                    panic!("Unexpected row for INSERT");
+                                });
+                                match res {
+                                    Ok(_) => {
+                                        success_rows += batch.len() as u64;
+                                    }
+                                    Err(LimboError::Interrupt) => {
+                                        let _ = self.writer.write_all(b"interrupt\n");
+
+                                        failed_rows += batch.len() as u64;
+                                    }
+                                    Err(LimboError::Busy) => {
+                                        let _ = self.writer.write_all(b"database is busy\n");
+
+                                        failed_rows += batch.len() as u64;
+                                    }
+                                    Err(e) => {
+                                        let _ = self.writer.write_all(
+                                            format!("Error executing query: {e:?}\n").as_bytes(),
+                                        );
+                                        failed_rows += batch.len() as u64;
                                     }
                                 }
                             } else {
@@ -262,40 +209,28 @@ impl<'a> ImportFile<'a> {
             match self.conn.query(insert_string) {
                 Ok(rows) => {
                     if let Some(mut rows) = rows {
-                        loop {
-                            match rows.step() {
-                                Ok(turso_core::StepResult::IO) => {
-                                    if let Err(e) = rows.run_once() {
-                                        let _ = self.writer.write_all(
-                                            format!("Error executing query: {e:?}\n").as_bytes(),
-                                        );
-                                        failed_rows += batch.len() as u64;
-                                        break;
-                                    }
-                                }
-                                Ok(turso_core::StepResult::Done) => {
-                                    success_rows += batch.len() as u64;
-                                    break;
-                                }
-                                Ok(turso_core::StepResult::Interrupt) => {
-                                    failed_rows += batch.len() as u64;
-                                    break;
-                                }
-                                Ok(turso_core::StepResult::Busy) => {
-                                    let _ = self.writer.write_all(b"database is busy\n");
-                                    failed_rows += batch.len() as u64;
-                                    break;
-                                }
-                                Ok(turso_core::StepResult::Row) => {
-                                    panic!("Unexpected row for INSERT");
-                                }
-                                Err(e) => {
-                                    let _ = self.writer.write_all(
-                                        format!("Error executing query: {e:?}\n").as_bytes(),
-                                    );
-                                    failed_rows += batch.len() as u64;
-                                    break;
-                                }
+                        let res = rows.run_with_row_callback(|_| {
+                            panic!("Unexpected row for INSERT");
+                        });
+                        match res {
+                            Ok(_) => {
+                                success_rows += batch.len() as u64;
+                            }
+                            Err(LimboError::Interrupt) => {
+                                let _ = self.writer.write_all(b"interrupt\n");
+
+                                failed_rows += batch.len() as u64;
+                            }
+                            Err(LimboError::Busy) => {
+                                let _ = self.writer.write_all(b"database is busy\n");
+
+                                failed_rows += batch.len() as u64;
+                            }
+                            Err(e) => {
+                                let _ = self.writer.write_all(
+                                    format!("Error executing query: {e:?}\n").as_bytes(),
+                                );
+                                failed_rows += batch.len() as u64;
                             }
                         }
                     } else {
