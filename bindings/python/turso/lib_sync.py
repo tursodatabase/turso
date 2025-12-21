@@ -317,12 +317,13 @@ def _run_op(
       - Stats: returns PyTursoSyncDatabaseStats
     """
     while True:
-        res = op.resume()
-        if res is None:
+        finished = op.resume()
+        if not finished:
             # Needs IO
             _drain_sync_io(sync, ctx, current_op=op)
             continue
         # Finished
+        res = op.take_result()
         if res.kind == PyTursoAsyncOperationResultKind.No:
             return None
         if res.kind == PyTursoAsyncOperationResultKind.Connection and res.connection is not None:
