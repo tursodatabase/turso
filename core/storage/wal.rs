@@ -959,8 +959,8 @@ impl WalFile {
 
         // If none found or lagging, try to claim/update a slot
         if best_idx == -1 || (best_mark as u64) < shared_max {
-            self.with_shared_mut(|shared| {
-                for (idx, lock) in shared.read_locks.iter_mut().enumerate().skip(1) {
+            self.with_shared(|shared| {
+                for (idx, lock) in shared.read_locks.iter().enumerate().skip(1) {
                     if !lock.write() {
                         continue; // busy slot
                     }
@@ -1084,7 +1084,7 @@ impl Wal for WalFile {
     fn end_read_tx(&self) {
         let slot = self.max_frame_read_lock_index.load(Ordering::Acquire);
         if slot != NO_LOCK_HELD {
-            self.with_shared_mut(|shared| shared.read_locks[slot].unlock());
+            self.with_shared(|shared| shared.read_locks[slot].unlock());
             self.max_frame_read_lock_index
                 .store(NO_LOCK_HELD, Ordering::Release);
             tracing::debug!("end_read_tx(slot={slot})");
@@ -1096,7 +1096,7 @@ impl Wal for WalFile {
     /// Begin a write transaction
     #[instrument(skip_all, level = Level::DEBUG)]
     fn begin_write_tx(&self) -> Result<()> {
-        self.with_shared_mut(|shared| {
+        self.with_shared(|shared| {
             // sqlite/src/wal.c 3702
             // Cannot start a write transaction without first holding a read
             // transaction.
@@ -1981,6 +1981,10 @@ impl WalFile {
     }
 
     #[inline]
+    /// Get a mutable shared lock on the WAL file shared state.
+    /// Be very intentional about when you need this because it can easily cause a deadlock.
+    /// If you're modifying e.g. the WAL locks, all of those operations are atomic and do not
+    /// need shared_mut.
     fn with_shared_mut<F, R>(&self, func: F) -> R
     where
         F: FnOnce(&mut WalFileShared) -> R,
@@ -2410,11 +2414,11 @@ impl WalFile {
     /// We never modify slot values while a reader holds that slot's lock.
     /// TOOD: implement proper BUSY handling behavior
     fn determine_max_safe_checkpoint_frame(&self) -> u64 {
-        self.with_shared_mut(|shared| {
+        self.with_shared(|shared| {
             let shared_max = shared.max_frame.load(Ordering::Acquire);
             let mut max_safe_frame = shared_max;
 
-            for (read_lock_idx, read_lock) in shared.read_locks.iter_mut().enumerate().skip(1) {
+            for (read_lock_idx, read_lock) in shared.read_locks.iter().enumerate().skip(1) {
                 let this_mark = read_lock.get_value();
                 if this_mark < max_safe_frame as u32 {
                     let busy = !read_lock.write();
@@ -2452,10 +2456,10 @@ impl WalFile {
             *self.checkpoint_guard.read()
         );
         tracing::debug!("restart_log(mode={mode:?})");
-        self.with_shared_mut(|shared| {
+        self.with_shared(|shared| {
             // Block all readers
             for idx in 1..shared.read_locks.len() {
-                let lock = &mut shared.read_locks[idx];
+                let lock = &shared.read_locks[idx];
                 if !lock.write() {
                     // release everything we got so far
                     for j in 1..idx {
