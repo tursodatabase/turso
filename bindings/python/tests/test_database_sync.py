@@ -1,9 +1,11 @@
+import os
 import logging
 import time
-import threading
 import multiprocessing
 import random
+import tempfile
 
+import turso
 import turso.sync
 
 from .utils import TursoServer
@@ -183,23 +185,24 @@ def test_bootstrap_concurrency():
         server.db_sql("CREATE TABLE t(x)")
         server.db_sql("INSERT INTO t SELECT randomblob(1024) FROM generate_series(1, 2000)")
 
-        path = f"local-{random.randint(0, 10**9)}.db"
-        barrier = multiprocessing.Barrier(2)
-        def run_full(path: str, remote_url: str, barrier: any):
-            barrier.wait()
-            try:
-                print(turso.sync.connect(path, remote_url=remote_url))
-            except Exception as e:
-                print('valid error', e)
+        with tempfile.TemporaryDirectory(prefix="pyturso-") as dir:
+            path = os.path.join(dir, 'local.db')
+            print(path)
+            barrier = multiprocessing.Barrier(2)
+            def run_full(path: str, remote_url: str, barrier: any):
+                barrier.wait()
+                try:
+                    print(turso.sync.connect(path, remote_url=remote_url))
+                except Exception as e:
+                    print('valid error', e, type(e), isinstance(e, turso.Error), turso.Error)
+            t1 = multiprocessing.Process(target=run_full, args=(path, server.db_url(), barrier))
+            t2 = multiprocessing.Process(target=run_full, args=(path, server.db_url(), barrier))
 
-        t1 = multiprocessing.Process(target=run_full, args=(path, server.db_url(), barrier))
-        t2 = multiprocessing.Process(target=run_full, args=(path, server.db_url(), barrier))
+            t1.start()
+            t2.start()
 
-        t1.start()
-        t2.start()
+            t1.join()
+            t2.join()
 
-        t1.join()
-        t2.join()
-
-        assert t1.exitcode == 0
-        assert t2.exitcode == 0
+            assert t1.exitcode == 0
+            assert t2.exitcode == 0
