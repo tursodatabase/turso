@@ -85,17 +85,17 @@ where
     }
     let mut values = values.peekable();
     let first = values.peek().unwrap();
-    if let Some(mut dt) = parse_naive_date_time(first) {
+    if let Some(dt) = parse_naive_date_time(first) {
         // if successful, treat subsequent entries as modifiers
-        modify_dt(&mut dt, values.skip(1), output_type)
+        modify_dt(dt, values.skip(1), output_type)
     } else {
         // if the first argument is NOT a valid date/time, treat the entire set of values as modifiers.
-        let mut dt = chrono::Local::now().to_utc().naive_utc();
-        modify_dt(&mut dt, values, output_type)
+        let dt = chrono::Local::now().to_utc().naive_utc();
+        modify_dt(dt, values, output_type)
     }
 }
 
-fn modify_dt<I, E, V>(dt: &mut NaiveDateTime, mods: I, output_type: DateTimeOutput) -> Value
+fn modify_dt<I, E, V>(mut dt: NaiveDateTime, mods: I, output_type: DateTimeOutput) -> Value
 where
     V: AsValueRef,
     E: ExactSizeIterator<Item = V>,
@@ -113,7 +113,7 @@ where
                 n_floor = 0;
             }
 
-            match apply_modifier(dt, text_rc.as_str(), &mut n_floor) {
+            match apply_modifier(&mut dt, text_rc.as_str(), &mut n_floor) {
                 Ok(true) => subsec_requested = true,
                 Ok(false) => {}
                 Err(_) => return Value::build_text(""),
@@ -127,11 +127,11 @@ where
         }
     }
 
-    if is_leap_second(dt) || *dt > get_max_datetime_exclusive() {
+    if is_leap_second(&dt) || dt > get_max_datetime_exclusive() {
         return Value::build_text("");
     }
 
-    format_dt(*dt, output_type, subsec_requested)
+    format_dt(dt, output_type, subsec_requested)
 }
 
 fn format_dt(dt: NaiveDateTime, output_type: DateTimeOutput, subsec: bool) -> Value {
