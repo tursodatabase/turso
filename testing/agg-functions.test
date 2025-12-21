@@ -225,3 +225,7 @@ do_execsql_test_error_content select-nested-agg-func-in-expression {
 do_execsql_test printf-19029102 {
    select printf('%d', 3.9);
 } {3}
+# same thing for format
+do_execsql_test format-19029102 {
+   select format('%d', 3.9);
+} {3}
