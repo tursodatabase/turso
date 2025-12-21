@@ -7959,6 +7959,7 @@ pub fn op_parse_schema(
     let previous_auto_commit = conn.auto_commit.load(Ordering::SeqCst);
     conn.auto_commit.store(false, Ordering::SeqCst);
 
+    let enable_triggers = conn.experimental_triggers_enabled();
     let maybe_nested_stmt_err = if let Some(where_clause) = where_clause {
         let stmt = conn.prepare(format!("SELECT * FROM sqlite_schema WHERE {where_clause}"))?;
 
@@ -7972,6 +7973,7 @@ pub fn op_parse_schema(
                 &conn.syms.read(),
                 program.connection.get_mv_tx(),
                 existing_views,
+                enable_triggers,
             )
         })
     } else {
@@ -7987,6 +7989,7 @@ pub fn op_parse_schema(
                 &conn.syms.read(),
                 program.connection.get_mv_tx(),
                 existing_views,
+                enable_triggers,
             )
         })
     };

@@ -317,6 +317,7 @@ mod tests {
                 enable_encryption: false,
                 enable_index_method: false,
                 enable_autovacuum: false,
+                enable_triggers: false,
             },
             None,
         )?;
