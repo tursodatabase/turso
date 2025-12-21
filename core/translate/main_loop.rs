@@ -514,7 +514,7 @@ fn emit_hash_build_phase(
     program.set_cursor_override(build_table.internal_id, hash_build_cursor_id);
 
     program.preassign_label_to_next_insn(build_loop_start);
-    
+
     // Determine comparison affinity for each join key
     let mut key_affinities = String::new();
     for join_key in hash_join_op.join_keys.iter() {
@@ -527,7 +527,7 @@ fn emit_hash_build_phase(
         );
         key_affinities.push(affinity.aff_mask());
     }
-    
+
     for (idx, join_key) in hash_join_op.join_keys.iter().enumerate() {
         let build_expr = join_key.get_build_expr(predicates);
         let target_reg = build_key_start_reg + idx;
@@ -539,7 +539,7 @@ fn emit_hash_build_phase(
             &t_ctx.resolver,
         )?;
     }
-    
+
     // Apply affinity conversion to build keys before hashing
     if let Some(count) = std::num::NonZeroUsize::new(num_keys) {
         program.emit_insn(Insn::Affinity {
@@ -951,7 +951,7 @@ pub fn open_loop(
                         &t_ctx.resolver,
                     )?;
                 }
-                
+
                 // Apply affinity conversion to probe keys before hashing to match build keys
                 if let Some(count) = std::num::NonZeroUsize::new(num_keys) {
                     program.emit_insn(Insn::Affinity {
