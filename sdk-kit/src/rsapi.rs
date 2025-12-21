@@ -290,7 +290,7 @@ impl TursoStatusCode {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TursoError {
     pub code: TursoStatusCode,
     pub message: Option<String>,
