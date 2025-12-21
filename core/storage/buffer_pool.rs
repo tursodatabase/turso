@@ -218,6 +218,7 @@ impl BufferPool {
             });
         }
         if inner.page_arena.is_some() {
+            tracing::trace!("Buffer pool already initialized, skipping finalize");
             return Ok(());
         }
         inner.db_page_size.store(page_size, Ordering::SeqCst);

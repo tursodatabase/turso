@@ -2,6 +2,7 @@
 extern crate core;
 
 mod assert;
+pub mod busy;
 mod error;
 mod ext;
 mod fast_lock;
@@ -42,6 +43,7 @@ pub mod numeric;
 #[cfg(not(feature = "fuzz"))]
 mod numeric;
 
+use crate::busy::{BusyHandler, BusyHandlerCallback};
 use crate::index_method::IndexMethod;
 use crate::schema::Trigger;
 use crate::stats::refresh_analyze_stats;
@@ -75,6 +77,7 @@ use rustc_hash::FxHashMap;
 use schema::Schema;
 pub use statement::Statement;
 use std::collections::HashSet;
+use std::time::Duration;
 use std::{
     cell::Cell,
     collections::HashMap,
@@ -84,7 +87,6 @@ use std::{
         atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicUsize, Ordering},
         Arc, LazyLock, Weak,
     },
-    time::Duration,
 };
 #[cfg(feature = "fs")]
 use storage::database::DatabaseFile;
@@ -761,7 +763,7 @@ impl Database {
             encryption_cipher_mode: AtomicCipherMode::new(encrytion_cipher),
             sync_mode: AtomicSyncMode::new(SyncMode::Full),
             data_sync_retry: AtomicBool::new(false),
-            busy_timeout: RwLock::new(Duration::new(0, 0)),
+            busy_handler: RwLock::new(BusyHandler::None),
             is_mvcc_bootstrap_connection: AtomicBool::new(is_mvcc_bootstrap_connection),
             fk_pragma: AtomicBool::new(false),
             fk_deferred_violations: AtomicIsize::new(0),
@@ -1271,9 +1273,9 @@ pub struct Connection {
     encryption_cipher_mode: AtomicCipherMode,
     sync_mode: AtomicSyncMode,
     data_sync_retry: AtomicBool,
-    /// User defined max accumulated Busy timeout duration
-    /// Default is 0 (no timeout)
-    busy_timeout: RwLock<std::time::Duration>,
+    /// Busy handler for lock contention
+    /// Default is BusyHandler::None (return SQLITE_BUSY immediately)
+    busy_handler: RwLock<BusyHandler>,
     /// Whether this is an internal connection used for MVCC bootstrap
     is_mvcc_bootstrap_connection: AtomicBool,
     /// Whether pragma foreign_keys=ON for this connection
@@ -2033,13 +2035,7 @@ impl Connection {
             }
         }
 
-        if self
-            .db
-            .n_connections
-            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst)
-            .eq(&1)
-            && !self.db.is_readonly()
-        {
+        if self.db.n_connections.fetch_sub(1, Ordering::SeqCst).eq(&1) && !self.db.is_readonly() {
             self.pager.load().checkpoint_shutdown(
                 self.is_wal_auto_checkpoint_disabled(),
                 self.get_sync_mode(),
@@ -2597,28 +2593,34 @@ impl Connection {
         pager.set_encryption_context(cipher_mode, key)
     }
 
-    /// Sets maximum total accumuated timeout. If the duration is None or Zero, we unset the busy handler for this Connection
-    ///
-    /// This api defers slighty from: https://www.sqlite.org/c3ref/busy_timeout.html
-    ///
-    /// Instead of sleeping for linear amount of time specified by the user,
-    /// we will sleep in phases, until the the total amount of time is reached.
-    /// This means we first sleep of 1ms, then if we still return busy, we sleep for 2 ms, and repeat until a maximum of 100 ms per phase.
-    ///
-    /// Example:
-    /// 1. Set duration to 5ms
-    /// 2. Step through query -> returns Busy -> sleep/yield for 1 ms
-    /// 3. Step through query -> returns Busy -> sleep/yield for 2 ms
-    /// 4. Step through query -> returns Busy -> sleep/yield for 2 ms (totaling 5 ms of sleep)
-    /// 5. Step through query -> returns Busy -> return Busy to user
-    ///
-    /// This slight api change demonstrated a better throughtput in `perf/throughput/turso` benchmark
-    pub fn set_busy_timeout(&self, duration: std::time::Duration) {
-        *self.busy_timeout.write() = duration;
+    /// Sets a custom busy handler callback.
+    pub fn set_busy_handler(&self, handler: Option<BusyHandlerCallback>) {
+        *self.busy_handler.write() = match handler {
+            Some(callback) => BusyHandler::Custom { callback },
+            None => BusyHandler::None,
+        };
     }
 
-    pub fn get_busy_timeout(&self) -> std::time::Duration {
-        *self.busy_timeout.read()
+    /// Sets maximum total accumulated timeout. If the duration is Zero, we unset the busy handler.
+    pub fn set_busy_timeout(&self, duration: Duration) {
+        *self.busy_handler.write() = if duration.is_zero() {
+            BusyHandler::None
+        } else {
+            BusyHandler::Timeout(duration)
+        };
+    }
+
+    /// Get the busy timeout duration.
+    pub fn get_busy_timeout(&self) -> Duration {
+        match &*self.busy_handler.read() {
+            BusyHandler::Timeout(d) => *d,
+            _ => Duration::ZERO,
+        }
+    }
+
+    /// Get a reference to the busy handler.
+    pub fn get_busy_handler(&self) -> parking_lot::RwLockReadGuard<'_, BusyHandler> {
+        self.busy_handler.read()
     }
 
     fn set_tx_state(&self, state: TransactionState) {
