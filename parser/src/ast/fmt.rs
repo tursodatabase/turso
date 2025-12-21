@@ -398,9 +398,11 @@ impl ToTokens for Stmt {
                 }
                 s.append(TK_BEGIN, Some("\n"))?;
                 for command in commands {
+                    s.append(TK_ANY, Some("    "))?;
                     command.to_tokens(s, context)?;
                     s.append(TK_SEMI, Some("\n"))?;
                 }
+                s.append(TK_ANY, Some("  "))?;
                 s.append(TK_END, None)
             }
             Self::CreateView {

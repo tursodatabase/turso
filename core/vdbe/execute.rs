@@ -14,6 +14,10 @@ use crate::storage::journal_mode;
 use crate::storage::page_cache::PageCache;
 use crate::storage::pager::{default_page1, CreateBTreeFlags, PageRef};
 use crate::storage::sqlite3_ondisk::{read_varint_fast, DatabaseHeader, PageSize, RawVersion};
+use crate::translate::alter::{
+    check_when_clause_for_invalid_table_refs, rewrite_expr_table_refs_for_rename,
+    rewrite_select_table_refs_for_rename, walk_upsert_for_table_rename,
+};
 use crate::translate::collate::CollationSeq;
 use crate::types::{
     compare_immutable, compare_records_generic, AsValueRef, Extendable, IOCompletions,
@@ -5831,6 +5835,193 @@ pub fn op_function(
                                             args,
                                         });
                                     Some(new_stmt.to_string())
+                                }
+                            }
+                            ast::Stmt::CreateTrigger {
+                                temporary,
+                                if_not_exists,
+                                trigger_name,
+                                time,
+                                event,
+                                mut tbl_name,
+                                for_each_row,
+                                mut when_clause,
+                                mut commands,
+                            } => {
+                                // when renaming a table,we need to update table names inside trigger too
+                                let mut changed = false;
+
+                                if normalize_ident(tbl_name.name.as_str()) == rename_from {
+                                    tbl_name.name =
+                                        Name::from_string(format!("\"{original_rename_to}\""));
+                                    changed = true;
+                                }
+
+                                if let Some(ref mut when_expr) = when_clause {
+                                    if let Some((tbl, col)) =
+                                        check_when_clause_for_invalid_table_refs(
+                                            when_expr,
+                                            &rename_from,
+                                        )
+                                    {
+                                        return Err(LimboError::Constraint(format!(
+                                            "error in trigger {}: no such column: {}.{}",
+                                            trigger_name.name.as_str(),
+                                            tbl,
+                                            col
+                                        )));
+                                    }
+                                    changed |= rewrite_expr_table_refs_for_rename(
+                                        when_expr,
+                                        &rename_from,
+                                        original_rename_to.as_str(),
+                                    );
+                                }
+
+                                for cmd in &mut commands {
+                                    match cmd {
+                                        ast::TriggerCmd::Update {
+                                            tbl_name,
+                                            sets,
+                                            from,
+                                            where_clause,
+                                            ..
+                                        } => {
+                                            if normalize_ident(tbl_name.as_str()) == rename_from {
+                                                *tbl_name = Name::from_string(format!(
+                                                    "\"{original_rename_to}\""
+                                                ));
+                                                changed = true;
+                                            }
+                                            for set in sets {
+                                                changed |= rewrite_expr_table_refs_for_rename(
+                                                    &mut set.expr,
+                                                    &rename_from,
+                                                    original_rename_to.as_str(),
+                                                );
+                                            }
+
+                                            if let Some(ref mut from_clause) = from {
+                                                for join in &mut from_clause.joins {
+                                                    if let Some(ast::JoinConstraint::On(expr)) =
+                                                        &mut join.constraint
+                                                    {
+                                                        changed |=
+                                                            rewrite_expr_table_refs_for_rename(
+                                                                expr,
+                                                                &rename_from,
+                                                                original_rename_to.as_str(),
+                                                            );
+                                                    }
+                                                }
+                                            }
+                                            if let Some(ref mut where_expr) = where_clause {
+                                                changed |= rewrite_expr_table_refs_for_rename(
+                                                    where_expr,
+                                                    &rename_from,
+                                                    original_rename_to.as_str(),
+                                                );
+                                            }
+                                        }
+                                        ast::TriggerCmd::Insert {
+                                            tbl_name,
+                                            select,
+                                            upsert,
+                                            ..
+                                        } => {
+                                            if normalize_ident(tbl_name.as_str()) == rename_from {
+                                                *tbl_name = Name::from_string(format!(
+                                                    "\"{original_rename_to}\""
+                                                ));
+                                                changed = true;
+                                            }
+
+                                            changed |= rewrite_select_table_refs_for_rename(
+                                                select,
+                                                &rename_from,
+                                                original_rename_to.as_str(),
+                                            );
+
+                                            if let Some(ref mut upsert_clause) = upsert {
+                                                changed |= walk_upsert_for_table_rename(
+                                                    upsert_clause,
+                                                    &rename_from,
+                                                    original_rename_to.as_str(),
+                                                );
+                                            }
+                                        }
+                                        ast::TriggerCmd::Delete {
+                                            tbl_name,
+                                            where_clause,
+                                        } => {
+                                            if normalize_ident(tbl_name.as_str()) == rename_from {
+                                                *tbl_name = Name::from_string(format!(
+                                                    "\"{original_rename_to}\""
+                                                ));
+                                                changed = true;
+                                            }
+                                            if let Some(ref mut where_expr) = where_clause {
+                                                changed |= rewrite_expr_table_refs_for_rename(
+                                                    where_expr,
+                                                    &rename_from,
+                                                    original_rename_to.as_str(),
+                                                );
+                                            }
+                                        }
+                                        ast::TriggerCmd::Select(select) => {
+                                            changed |= rewrite_select_table_refs_for_rename(
+                                                select,
+                                                &rename_from,
+                                                original_rename_to.as_str(),
+                                            );
+                                        }
+                                    }
+                                }
+
+                                if changed {
+                                    Some(
+                                        ast::Stmt::CreateTrigger {
+                                            temporary,
+                                            if_not_exists,
+                                            trigger_name,
+                                            time,
+                                            event,
+                                            tbl_name,
+                                            for_each_row,
+                                            when_clause,
+                                            commands,
+                                        }
+                                        .to_string(),
+                                    )
+                                } else {
+                                    None
+                                }
+                            }
+                            ast::Stmt::CreateView {
+                                temporary,
+                                if_not_exists,
+                                view_name,
+                                columns,
+                                mut select,
+                            } => {
+                                let changed = rewrite_select_table_refs_for_rename(
+                                    &mut select,
+                                    &rename_from,
+                                    original_rename_to.as_str(),
+                                );
+                                if changed {
+                                    Some(
+                                        ast::Stmt::CreateView {
+                                            temporary,
+                                            if_not_exists,
+                                            view_name,
+                                            columns,
+                                            select,
+                                        }
+                                        .to_string(),
+                                    )
+                                } else {
+                                    None
                                 }
                             }
                             _ => None,

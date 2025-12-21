@@ -1,3 +1,4 @@
+use crate::translate::expr::{walk_expr, walk_expr_mut, WalkControl};
 use std::sync::Arc;
 use turso_parser::{
     ast::{self, TableInternalId},
@@ -9,7 +10,6 @@ use crate::{
     schema::{Column, ForeignKey, Table, RESERVED_TABLE_PREFIXES},
     translate::{
         emitter::Resolver,
-        expr::{walk_expr, WalkControl},
         plan::{ColumnUsedMask, OuterQueryReference, TableReferences},
     },
     util::normalize_ident,
@@ -540,6 +540,30 @@ pub fn translate_alter_table(
                 to: new_name.to_owned(),
             });
 
+            // Reload all triggers and views cuz some of them might have been updated
+            // if they referenced the table being renamed.
+            for trigger in resolver.schema.triggers.values().flatten() {
+                program.emit_insn(Insn::DropTrigger {
+                    db: 0,
+                    trigger_name: trigger.name.clone(),
+                });
+                program.emit_insn(Insn::ParseSchema {
+                    db: 0,
+                    where_clause: Some(format!("name = '{}'", trigger.name)),
+                });
+            }
+
+            for view in resolver.schema.views.values() {
+                program.emit_insn(Insn::DropView {
+                    db: 0,
+                    view_name: view.name.clone(),
+                });
+                program.emit_insn(Insn::ParseSchema {
+                    db: 0,
+                    where_clause: Some(format!("name = '{}'", view.name)),
+                });
+            }
+
             program
         }
         body @ (ast::AlterTableBody::AlterColumn { .. }
@@ -833,6 +857,15 @@ pub fn translate_alter_table(
                     input,
                     |_program| {},
                 )?;
+
+                program.emit_insn(Insn::DropTrigger {
+                    db: 0,
+                    trigger_name: trigger_name.clone(),
+                });
+                program.emit_insn(Insn::ParseSchema {
+                    db: 0,
+                    where_clause: Some(format!("name = '{trigger_name}'")),
+                });
             }
 
             program.emit_insn(Insn::SetCookie {
@@ -2529,4 +2562,389 @@ fn rewrite_expr_column_ref(
         is_renaming_trigger_table,
         None,
     )
+}
+
+/// Walk an Upsert clause and rewrite qualified table references for table rename.
+///
+/// Handles ON CONFLICT clauses that may contain table-qualified column references:
+/// - Conflict targets: Expressions in `ON CONFLICT(expr, ...)` that may reference the table
+/// - Target WHERE: The optional `WHERE` clause after conflict targets
+/// - DO UPDATE SET: Expressions in `SET col = expr` assignments (e.g., `val = t1.val || 'x'`)
+/// - DO UPDATE WHERE: The optional `WHERE` clause of the DO UPDATE
+/// - Chained upserts: Recursively handles multiple ON CONFLICT clauses
+pub fn walk_upsert_for_table_rename(
+    upsert: &mut ast::Upsert,
+    old_table_norm: &str,
+    new_table_name: &str,
+) -> bool {
+    let mut changed = false;
+
+    // Walk conflict targets (UpsertIndex.targets is Vec<SortedColumn>)
+    if let Some(ref mut index) = upsert.index {
+        for target in &mut index.targets {
+            changed |= rewrite_expr_table_refs_for_rename(
+                &mut target.expr,
+                old_table_norm,
+                new_table_name,
+            );
+        }
+        if let Some(ref mut where_expr) = index.where_clause {
+            changed |=
+                rewrite_expr_table_refs_for_rename(where_expr, old_table_norm, new_table_name);
+        }
+    }
+
+    // Walk DO clause
+    if let ast::UpsertDo::Set { sets, where_clause } = &mut upsert.do_clause {
+        for set in sets {
+            changed |=
+                rewrite_expr_table_refs_for_rename(&mut set.expr, old_table_norm, new_table_name);
+        }
+        if let Some(ref mut where_expr) = where_clause {
+            changed |=
+                rewrite_expr_table_refs_for_rename(where_expr, old_table_norm, new_table_name);
+        }
+    }
+
+    // Recursively walk chained upserts
+    if let Some(ref mut next) = upsert.next {
+        changed |= walk_upsert_for_table_rename(next, old_table_norm, new_table_name);
+    }
+
+    changed
+}
+
+/// Rewrite qualified table references in an expression tree for table rename.
+///
+/// Handles table-qualified column references in trigger expressions:
+/// - Qualified column refs (e.g., `t1.col`): Rewrites to `"t1_new".col`
+/// - Doubly-qualified (e.g., `main.t1.col`): Rewrites to `main."t1_new".col`
+/// - InTable expression (e.g., `x IN t1`): Rewrites to `x IN "t1_new"`
+/// - Subqueries and nested expressions: Recursively walks all child expressions
+///
+/// `old_table_norm`: Normalized (lowercase) name of the table being renamed.
+/// `new_table_name`: New name for the table (will be double-quoted in output).
+///
+/// This function uses `walk_expr_mut` from `expr.rs` to traverse all expression
+/// variants automatically, including WINDOW clauses and frame bounds. Only the
+/// special cases (table-qualified names) are handled in the callback.
+pub fn rewrite_expr_table_refs_for_rename(
+    expr: &mut Box<ast::Expr>,
+    old_table_norm: &str,
+    new_table_name: &str,
+) -> bool {
+    let mut changed = false;
+
+    // Use walk_expr_mut to traverse ALL expression types automatically.
+    // This handles WINDOW clauses, frame bounds, and all other nested expressions.
+    let _ = walk_expr_mut(expr, &mut |e: &mut ast::Expr| -> Result<WalkControl> {
+        match e {
+            // Handle table-qualified column references: tbl.col -> "new_tbl".col
+            ast::Expr::Qualified(ref mut tbl_name, _) => {
+                if normalize_ident(tbl_name.as_str()) == old_table_norm {
+                    *tbl_name = ast::Name::from_string(format!("\"{new_table_name}\""));
+                    changed = true;
+                }
+            }
+            // Handle doubly-qualified references: db.tbl.col -> db."new_tbl".col
+            ast::Expr::DoublyQualified(_, ref mut tbl_name, _) => {
+                if normalize_ident(tbl_name.as_str()) == old_table_norm {
+                    *tbl_name = ast::Name::from_string(format!("\"{new_table_name}\""));
+                    changed = true;
+                }
+            }
+            // Handle `x IN tbl` - the table reference is not a sub-expression
+            ast::Expr::InTable { rhs, .. } => {
+                if normalize_ident(rhs.name.as_str()) == old_table_norm {
+                    rhs.name = ast::Name::from_string(format!("\"{new_table_name}\""));
+                    changed = true;
+                }
+            }
+            // Handle subqueries - walk_expr_mut doesn't descend into SELECT statements
+            ast::Expr::InSelect { rhs, .. } => {
+                changed |=
+                    rewrite_select_table_refs_for_rename(rhs, old_table_norm, new_table_name);
+            }
+            ast::Expr::Subquery(select) | ast::Expr::Exists(select) => {
+                changed |=
+                    rewrite_select_table_refs_for_rename(select, old_table_norm, new_table_name);
+            }
+            _ => {}
+        }
+        Ok(WalkControl::Continue)
+    });
+
+    changed
+}
+
+/// Check if a trigger WHEN clause contains table-qualified column refs that would become
+/// invalid after a table rename. SQLite rejects ALTER TABLE RENAME if the WHEN clause
+/// contains refs like `t1.col` (other than NEW.col or OLD.col) where t1 is the table
+/// being renamed.
+pub fn check_when_clause_for_invalid_table_refs(
+    expr: &ast::Expr,
+    table_being_renamed: &str,
+) -> Option<(String, String)> {
+    let mut invalid_ref: Option<(String, String)> = None;
+
+    let _ = walk_expr(expr, &mut |e: &ast::Expr| -> Result<WalkControl> {
+        // If we already found an invalid ref, skip the rest
+        if invalid_ref.is_some() {
+            return Ok(WalkControl::SkipChildren);
+        }
+        match e {
+            ast::Expr::Qualified(tbl_name, col_name) => {
+                let tbl_norm = normalize_ident(tbl_name.as_str());
+                // NEW and OLD are valid pseudo-table references in triggers
+                if !tbl_norm.eq_ignore_ascii_case("new")
+                    && !tbl_norm.eq_ignore_ascii_case("old")
+                    && tbl_norm == table_being_renamed
+                {
+                    invalid_ref = Some((tbl_name.to_string(), col_name.to_string()));
+                    return Ok(WalkControl::SkipChildren);
+                }
+            }
+            ast::Expr::DoublyQualified(_, tbl_name, col_name) => {
+                let tbl_norm = normalize_ident(tbl_name.as_str());
+                if !tbl_norm.eq_ignore_ascii_case("new")
+                    && !tbl_norm.eq_ignore_ascii_case("old")
+                    && tbl_norm == table_being_renamed
+                {
+                    invalid_ref = Some((tbl_name.to_string(), col_name.to_string()));
+                    return Ok(WalkControl::SkipChildren);
+                }
+            }
+            _ => {}
+        }
+        Ok(WalkControl::Continue)
+    });
+
+    invalid_ref
+}
+
+/// Rewrite table references in a SELECT statement for table rename.
+///
+/// Handles the complete SELECT structure used in trigger commands:
+/// - WITH clause (CTEs): Recursively rewrites CTE subqueries
+/// - SELECT body: Main query and UNION/EXCEPT/INTERSECT compounds
+/// - ORDER BY: Expressions in ORDER BY clause that may contain table refs
+/// - LIMIT/OFFSET: Expressions in LIMIT and OFFSET clauses
+pub fn rewrite_select_table_refs_for_rename(
+    select: &mut ast::Select,
+    old_table_norm: &str,
+    new_table_name: &str,
+) -> bool {
+    let mut changed = false;
+
+    if let Some(ref mut with) = select.with {
+        for cte in &mut with.ctes {
+            changed |= rewrite_select_table_refs_for_rename(
+                &mut cte.select,
+                old_table_norm,
+                new_table_name,
+            );
+        }
+    }
+
+    changed |=
+        rewrite_select_body_table_refs_for_rename(&mut select.body, old_table_norm, new_table_name);
+
+    for sorted_col in &mut select.order_by {
+        changed |= rewrite_expr_table_refs_for_rename(
+            &mut sorted_col.expr,
+            old_table_norm,
+            new_table_name,
+        );
+    }
+
+    if let Some(ref mut limit) = select.limit {
+        changed |=
+            rewrite_expr_table_refs_for_rename(&mut limit.expr, old_table_norm, new_table_name);
+        if let Some(ref mut offset) = limit.offset {
+            changed |= rewrite_expr_table_refs_for_rename(offset, old_table_norm, new_table_name);
+        }
+    }
+
+    changed
+}
+
+/// Rewrite table references in a SelectBody (main SELECT and compound queries).
+///
+/// Handles:
+/// - Main SELECT: The primary `OneSelect` (SELECT or VALUES terms)
+/// - Compound queries: Recursively walks chained UNION, EXCEPT, or INTERSECT SELECTs
+fn rewrite_select_body_table_refs_for_rename(
+    body: &mut ast::SelectBody,
+    old_table_norm: &str,
+    new_table_name: &str,
+) -> bool {
+    let mut changed = false;
+
+    changed |=
+        rewrite_one_select_table_refs_for_rename(&mut body.select, old_table_norm, new_table_name);
+
+    for compound in &mut body.compounds {
+        changed |= rewrite_one_select_table_refs_for_rename(
+            &mut compound.select,
+            old_table_norm,
+            new_table_name,
+        );
+    }
+
+    changed
+}
+
+/// Rewrite table references in a OneSelect (single SELECT or VALUES clause).
+///
+/// Handles:
+/// - Result columns: Including table-qualified stars like `t1.*` → `"t1_new".*`
+/// - FROM clause: Table references and subqueries in the FROM
+/// - WHERE clause: Expressions that may reference the renamed table
+/// - GROUP BY/HAVING: Grouping and filter expressions
+/// - VALUES clause: All value expressions in VALUES(...) rows
+fn rewrite_one_select_table_refs_for_rename(
+    one_select: &mut ast::OneSelect,
+    old_table_norm: &str,
+    new_table_name: &str,
+) -> bool {
+    let mut changed = false;
+
+    match one_select {
+        ast::OneSelect::Select {
+            columns,
+            from,
+            where_clause,
+            group_by,
+            ..
+        } => {
+            for col in columns {
+                match col {
+                    ast::ResultColumn::Expr(expr, _) => {
+                        changed |= rewrite_expr_table_refs_for_rename(
+                            expr,
+                            old_table_norm,
+                            new_table_name,
+                        );
+                    }
+                    ast::ResultColumn::TableStar(ref mut name) => {
+                        // Handle `t1.*` -> `"t1_new".*`
+                        if normalize_ident(name.as_str()) == old_table_norm {
+                            *name = ast::Name::from_string(format!("\"{new_table_name}\""));
+                            changed = true;
+                        }
+                    }
+                    ast::ResultColumn::Star => {} // `*` has no table qualifier
+                }
+            }
+
+            if let Some(ref mut from_clause) = from {
+                changed |= rewrite_from_clause_table_refs_for_rename(
+                    from_clause,
+                    old_table_norm,
+                    new_table_name,
+                );
+            }
+
+            if let Some(ref mut where_expr) = where_clause {
+                changed |=
+                    rewrite_expr_table_refs_for_rename(where_expr, old_table_norm, new_table_name);
+            }
+
+            if let Some(ref mut group) = group_by {
+                for expr in &mut group.exprs {
+                    changed |=
+                        rewrite_expr_table_refs_for_rename(expr, old_table_norm, new_table_name);
+                }
+                if let Some(ref mut having) = group.having {
+                    changed |=
+                        rewrite_expr_table_refs_for_rename(having, old_table_norm, new_table_name);
+                }
+            }
+        }
+        ast::OneSelect::Values(values) => {
+            for row in values {
+                for expr in row {
+                    changed |=
+                        rewrite_expr_table_refs_for_rename(expr, old_table_norm, new_table_name);
+                }
+            }
+        }
+    }
+
+    changed
+}
+
+/// Rewrite table references in a FROM clause including JOINs.
+///
+/// Handles:
+/// - Main table entry: The primary table/subquery in the FROM
+/// - JOIN tables: All joined tables referenced in the clause
+/// - ON conditions: Expressions in JOIN ON clauses that may contain table refs
+fn rewrite_from_clause_table_refs_for_rename(
+    from: &mut ast::FromClause,
+    old_table_norm: &str,
+    new_table_name: &str,
+) -> bool {
+    let mut changed = false;
+
+    changed |= rewrite_select_table_entry_refs_for_rename(
+        &mut from.select,
+        old_table_norm,
+        new_table_name,
+    );
+
+    for join in &mut from.joins {
+        changed |= rewrite_select_table_entry_refs_for_rename(
+            &mut join.table,
+            old_table_norm,
+            new_table_name,
+        );
+        if let Some(ast::JoinConstraint::On(expr)) = &mut join.constraint {
+            changed |= rewrite_expr_table_refs_for_rename(expr, old_table_norm, new_table_name);
+        }
+    }
+
+    changed
+}
+
+/// Rewrite table references in a SelectTable entry.
+///
+/// Handles different table source types:
+/// - Table: Direct table reference `FROM t1` → `FROM "t1_new"`
+/// - TableCall: Table-valued function `FROM func(args)` - walks arguments
+/// - Select: Subquery `FROM (SELECT ...)` - recursively rewrites
+/// - Sub: Subquery with FROM clause (derived table)
+fn rewrite_select_table_entry_refs_for_rename(
+    select_table: &mut Box<ast::SelectTable>,
+    old_table_norm: &str,
+    new_table_name: &str,
+) -> bool {
+    let mut changed = false;
+
+    match select_table.as_mut() {
+        ast::SelectTable::Table(ref mut qualified_name, _, _) => {
+            if normalize_ident(qualified_name.name.as_str()) == old_table_norm {
+                qualified_name.name = ast::Name::from_string(format!("\"{new_table_name}\""));
+                changed = true;
+            }
+        }
+        ast::SelectTable::TableCall(ref mut qualified_name, args, _) => {
+            if normalize_ident(qualified_name.name.as_str()) == old_table_norm {
+                qualified_name.name = ast::Name::from_string(format!("\"{new_table_name}\""));
+                changed = true;
+            }
+            for arg in args {
+                changed |= rewrite_expr_table_refs_for_rename(arg, old_table_norm, new_table_name);
+            }
+        }
+        ast::SelectTable::Select(select, _) => {
+            changed |= rewrite_select_table_refs_for_rename(select, old_table_norm, new_table_name);
+        }
+        ast::SelectTable::Sub(from, _) => {
+            changed |=
+                rewrite_from_clause_table_refs_for_rename(from, old_table_norm, new_table_name);
+        }
+    }
+
+    changed
 }
