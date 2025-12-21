@@ -177,6 +177,13 @@ def test_partial_sync_prefetch():
         print(time.time() - start)
         assert conn_partial.stats().network_received_bytes > 2000 * 1024
 
+def run_full(path: str, remote_url: str, barrier: any):
+    barrier.wait()
+    try:
+        print(turso.sync.connect(path, remote_url=remote_url))
+    except Exception as e:
+        print("valid error", e, type(e), isinstance(e, turso.Error), turso.Error)
+
 def test_bootstrap_concurrency():
     # turso.setup_logging(level=logging.DEBUG)
 
@@ -188,12 +195,6 @@ def test_bootstrap_concurrency():
             path = os.path.join(dir, "local.db")
             print(path)
             barrier = multiprocessing.Barrier(2)
-            def run_full(path: str, remote_url: str, barrier: any):
-                barrier.wait()
-                try:
-                    print(turso.sync.connect(path, remote_url=remote_url))
-                except Exception as e:
-                    print("valid error", e, type(e), isinstance(e, turso.Error), turso.Error)
             t1 = multiprocessing.Process(target=run_full, args=(path, server.db_url(), barrier))
             t2 = multiprocessing.Process(target=run_full, args=(path, server.db_url(), barrier))
 
