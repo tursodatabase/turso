@@ -9850,7 +9850,9 @@ fn execute_sqlite_compileoption_get(n: i32) -> Option<String> {
 }
 
 fn execute_sqlite_compileoption_used(name: &str) -> bool {
-    COMPILE_OPTIONS.iter().any(|opt| opt.eq_ignore_ascii_case(name))
+    COMPILE_OPTIONS
+        .iter()
+        .any(|opt| opt.eq_ignore_ascii_case(name))
 }
 
 // Compat for applications that test for SQLite.

@@ -1815,7 +1815,8 @@ pub fn translate_expr(
                             });
                             Ok(target_register)
                         }
-                        ScalarFunc::SqliteCompileOptionGet | ScalarFunc::SqliteCompileOptionUsed => {
+                        ScalarFunc::SqliteCompileOptionGet
+                        | ScalarFunc::SqliteCompileOptionUsed => {
                             if args.len() != 1 {
                                 crate::bail_parse_error!(
                                     "{} function must have exactly 1 argument",
