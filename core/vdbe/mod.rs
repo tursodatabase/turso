@@ -1474,6 +1474,24 @@ impl<'a> FromValueRow<'a> for &'a Value {
     }
 }
 
+impl<'a> FromValueRow<'a> for Value {
+    fn from_value(value: &'a Value) -> Result<Self> {
+        Ok(value.clone())
+    }
+}
+
+impl<'a, T> FromValueRow<'a> for Option<T>
+where
+    T: FromValueRow<'a> + 'a,
+{
+    fn from_value(value: &'a Value) -> Result<Self> {
+        match value {
+            Value::Null => Ok(None),
+            _ => T::from_value(value).map(Some),
+        }
+    }
+}
+
 impl Row {
     pub fn get<'a, T: FromValueRow<'a> + 'a>(&'a self, idx: usize) -> Result<T> {
         let value = unsafe {

@@ -5248,6 +5248,21 @@ pub fn op_function(
                 );
                 state.registers[*dest] = Register::Value(Value::build_text(src_id));
             }
+            ScalarFunc::SqliteCompileOptionGet => {
+                assert_eq!(arg_count, 1);
+                let n = extract_int_value(state.registers[*start_reg].get_value());
+                let option = execute_sqlite_compileoption_get(n as i32);
+                state.registers[*dest] = match option {
+                    Some(opt) => Register::Value(Value::build_text(opt)),
+                    None => Register::Value(Value::Null),
+                };
+            }
+            ScalarFunc::SqliteCompileOptionUsed => {
+                assert_eq!(arg_count, 1);
+                let name = state.registers[*start_reg].get_value().to_string();
+                let used = execute_sqlite_compileoption_used(&name);
+                state.registers[*dest] = Register::Value(Value::Integer(if used { 1 } else { 0 }));
+            }
             ScalarFunc::Replace => {
                 assert_eq!(arg_count, 3);
                 let source = &state.registers[*start_reg];
@@ -9819,6 +9834,25 @@ fn try_float_to_integer_affinity(value: &mut Value, fl: f64) -> bool {
     false
 }
 
+const COMPILE_OPTIONS: &[&str] = &[
+    #[cfg(feature = "json")]
+    "ENABLE_JSON1",
+    "SYSTEM_MALLOC",
+    "THREADSAFE=1",
+];
+
+fn execute_sqlite_compileoption_get(n: i32) -> Option<String> {
+    if n >= 0 && (n as usize) < COMPILE_OPTIONS.len() {
+        Some(COMPILE_OPTIONS[n as usize].to_string())
+    } else {
+        None
+    }
+}
+
+fn execute_sqlite_compileoption_used(name: &str) -> bool {
+    COMPILE_OPTIONS.iter().any(|opt| opt.eq_ignore_ascii_case(name))
+}
+
 // Compat for applications that test for SQLite.
 fn execute_sqlite_version() -> String {
     "3.50.4".to_string()
@@ -10277,6 +10311,27 @@ mod tests {
         let version_integer = 3046001;
         let expected = "3.46.1";
         assert_eq!(execute_turso_version(version_integer), expected);
+    }
+
+    #[test]
+    fn test_execute_sqlite_compileoption() {
+        // Test used
+        assert!(execute_sqlite_compileoption_used("SYSTEM_MALLOC"));
+        assert!(execute_sqlite_compileoption_used("THREADSAFE=1"));
+        assert!(execute_sqlite_compileoption_used("system_malloc")); // Case insensitive
+        assert!(!execute_sqlite_compileoption_used("NON_EXISTENT_OPTION"));
+
+        // Test get
+        let opt0 = execute_sqlite_compileoption_get(0);
+        assert!(opt0.is_some());
+        let opt0 = opt0.unwrap();
+        assert!(execute_sqlite_compileoption_used(&opt0));
+
+        let opt_last = execute_sqlite_compileoption_get((COMPILE_OPTIONS.len() - 1) as i32);
+        assert!(opt_last.is_some());
+
+        let opt_out_of_bounds = execute_sqlite_compileoption_get(COMPILE_OPTIONS.len() as i32);
+        assert!(opt_out_of_bounds.is_none());
     }
 
     #[test]

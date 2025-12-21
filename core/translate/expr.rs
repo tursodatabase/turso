@@ -1815,6 +1815,22 @@ pub fn translate_expr(
                             });
                             Ok(target_register)
                         }
+                        ScalarFunc::SqliteCompileOptionGet | ScalarFunc::SqliteCompileOptionUsed => {
+                            if args.len() != 1 {
+                                crate::bail_parse_error!(
+                                    "{} function must have exactly 1 argument",
+                                    srf
+                                );
+                            }
+                            translate_function(
+                                program,
+                                args,
+                                referenced_tables,
+                                resolver,
+                                target_register,
+                                func_ctx,
+                            )
+                        }
                         ScalarFunc::Replace => {
                             if !args.len() == 3 {
                                 crate::bail_parse_error!(
