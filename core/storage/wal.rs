@@ -1517,7 +1517,7 @@ impl Wal for WalFile {
 
     #[instrument(skip_all, level = Level::DEBUG)]
     fn finish_append_frames_commit(&self) -> Result<()> {
-        self.with_shared_mut(|shared| {
+        self.with_shared_mut_dangerous(|shared| {
             shared
                 .max_frame
                 .store(self.max_frame.load(Ordering::Acquire), Ordering::Release);
@@ -1561,7 +1561,7 @@ impl Wal for WalFile {
             return Ok(None);
         }
         tracing::debug!("ensure_header_if_needed");
-        *self.last_checksum.write() = self.with_shared_mut(|shared| {
+        *self.last_checksum.write() = self.with_shared_mut_dangerous(|shared| {
             let checksum = {
                 let mut hdr = shared.wal_header.lock();
                 hdr.magic = if cfg!(target_endian = "big") {
@@ -1985,7 +1985,7 @@ impl WalFile {
     /// Be very intentional about when you need this because it can easily cause a deadlock.
     /// If you're modifying e.g. the WAL locks, all of those operations are atomic and do not
     /// need shared_mut.
-    fn with_shared_mut<F, R>(&self, func: F) -> R
+    fn with_shared_mut_dangerous<F, R>(&self, func: F) -> R
     where
         F: FnOnce(&mut WalFileShared) -> R,
     {
@@ -2475,7 +2475,7 @@ impl WalFile {
         })?;
 
         // reinitialize in‑memory state
-        self.with_shared_mut(|shared| shared.restart_wal_header(&self.io, mode));
+        self.with_shared_mut_dangerous(|shared| shared.restart_wal_header(&self.io, mode));
         let cksm = self.with_shared(|shared| shared.last_checksum);
         *self.last_checksum.write() = cksm;
         self.max_frame.store(0, Ordering::Release);
