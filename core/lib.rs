@@ -122,6 +122,7 @@ pub struct DatabaseOpts {
     pub enable_index_method: bool,
     pub enable_autovacuum: bool,
     pub enable_triggers: bool,
+    pub enable_attach: bool,
     enable_load_extension: bool,
 }
 
@@ -163,6 +164,11 @@ impl DatabaseOpts {
 
     pub fn with_triggers(mut self, enable: bool) -> Self {
         self.enable_triggers = enable;
+        self
+    }
+
+    pub fn with_attach(mut self, enable: bool) -> Self {
+        self.enable_attach = enable;
         self
     }
 }
@@ -1036,6 +1042,10 @@ impl Database {
 
     pub fn experimental_triggers_enabled(&self) -> bool {
         self.opts.enable_triggers
+    }
+
+    pub fn experimental_attach_enabled(&self) -> bool {
+        self.opts.enable_attach
     }
 
     /// check if database is currently in MVCC mode
@@ -2234,6 +2244,10 @@ impl Connection {
 
     pub fn experimental_triggers_enabled(&self) -> bool {
         self.db.experimental_triggers_enabled()
+    }
+
+    pub fn experimental_attach_enabled(&self) -> bool {
+        self.db.experimental_attach_enabled()
     }
 
     pub fn mvcc_enabled(&self) -> bool {
