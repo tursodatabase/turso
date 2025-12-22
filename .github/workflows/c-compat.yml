@@ -69,6 +69,3 @@ jobs:
           make clean
           make LIBS="-L../../target/debug -lturso_sqlite3"
           LD_LIBRARY_PATH=../../target/debug ./sqlite3-tests
-
-      - name: Show sccache stats
-        run: ${SCCACHE_PATH} --show-stats

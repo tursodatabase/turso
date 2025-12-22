@@ -35,6 +35,8 @@ jobs:
         cache-on-failure: true
     - name: Setup sccache
       uses: mozilla-actions/sccache-action@v0.0.9
+    - name: Install cargo-nextest
+      uses: taiki-e/install-action@nextest
     - name: Set up Python 3.10
       uses: useblacksmith/setup-python@v6
       with:
@@ -43,15 +45,13 @@ jobs:
       env:
         SCCACHE_GHA_ENABLED: "true"
         RUSTC_WRAPPER: "sccache"
-      run: cargo build --verbose --locked
-    - name: Run ignored long tests
+      run: cargo build --verbose --locked --all-features
+    - name: Run fuzz tests
       env:
         RUST_BACKTRACE: 1
         SCCACHE_GHA_ENABLED: "true"
         RUSTC_WRAPPER: "sccache"
-      run: cargo test --test fuzz_tests --locked
-    - name: Show sccache stats
-      run: ${SCCACHE_PATH} --show-stats
+      run: cargo nextest run --locked --no-fail-fast -E 'test(/^fuzz_tests::/)'
 
   run-long-fuzz-tests:
     runs-on: blacksmith-4vcpu-ubuntu-2404
@@ -68,6 +68,8 @@ jobs:
         cache-on-failure: true
     - name: Setup sccache
       uses: mozilla-actions/sccache-action@v0.0.9
+    - name: Install cargo-nextest
+      uses: taiki-e/install-action@nextest
     - name: Set up Python 3.10
       uses: useblacksmith/setup-python@v6
       with:
@@ -76,15 +78,13 @@ jobs:
       env:
         SCCACHE_GHA_ENABLED: "true"
         RUSTC_WRAPPER: "sccache"
-      run: cargo build --verbose --locked
-    - name: Run ignored long tests
+      run: cargo build --verbose --locked --all-features
+    - name: Run ignored long fuzz tests
       env:
         RUST_BACKTRACE: 1
         SCCACHE_GHA_ENABLED: "true"
         RUSTC_WRAPPER: "sccache"
-      run: cargo test --locked -- --ignored fuzz_long
-    - name: Show sccache stats
-      run: ${SCCACHE_PATH} --show-stats
+      run: cargo nextest run --locked --no-fail-fast --run-ignored ignored-only -E 'test(/fuzz_long/)'
 
   simple-stress-test:
     runs-on: blacksmith-4vcpu-ubuntu-2404
@@ -108,12 +108,10 @@ jobs:
       env:
         SCCACHE_GHA_ENABLED: "true"
         RUSTC_WRAPPER: "sccache"
-      run: cargo build --verbose --locked
+      run: cargo build --verbose --locked --all-features
     - name: Run ignored long tests
       env:
         RUST_BACKTRACE: 1
         SCCACHE_GHA_ENABLED: "true"
         RUSTC_WRAPPER: "sccache"
       run: cargo run -p turso_stress --locked -- -t 2 -i 10000 -s --tables 1
-    - name: Show sccache stats
-      run: ${SCCACHE_PATH} --show-stats

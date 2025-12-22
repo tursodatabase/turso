@@ -48,6 +48,8 @@ jobs:
           cache-on-failure: true
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@nextest
       - name: Set up Python 3.10
         uses: useblacksmith/setup-python@v6
         with:
@@ -56,23 +58,19 @@ jobs:
         env:
           SCCACHE_GHA_ENABLED: "true"
           RUSTC_WRAPPER: "sccache"
-        run: cargo build --verbose --locked
-      - name: Test Checksums
-        env:
-          SCCACHE_GHA_ENABLED: "true"
-          RUSTC_WRAPPER: "sccache"
-        run: |
-          cargo test --features checksum --color=always --lib storage::checksum --locked
-          cargo test --features checksum --color=always --test integration_tests storage::checksum --locked
-      - name: Test
+        run: cargo build --verbose --locked --all-features
+      - name: Test (nextest)
         env:
           RUST_LOG: ${{ runner.debug && 'turso_core::storage=trace' || '' }}
           SCCACHE_GHA_ENABLED: "true"
           RUSTC_WRAPPER: "sccache"
-        run: cargo test --verbose --features checksum --test integration_tests --locked
+        run: cargo nextest run --workspace --all-features --locked --no-fail-fast -E 'not test(/^fuzz_tests::/)'
         timeout-minutes: 20
-      - name: Show sccache stats
-        run: ${SCCACHE_PATH} --show-stats
+      - name: Test doctests
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: "sccache"
+        run: cargo test --workspace --all-features --doc --locked
 
   clippy:
     runs-on: blacksmith-4vcpu-ubuntu-2404
@@ -162,8 +160,6 @@ jobs:
           for i in {1..10}; do
             ./scripts/run-sim --maximum-tests 1000 --differential --io-backend=memory || exit 1
           done
-      - name: Show sccache stats
-        run: ${SCCACHE_PATH} --show-stats
 
   test-limbo:
     runs-on: blacksmith-4vcpu-ubuntu-2404
@@ -201,8 +197,7 @@ jobs:
           RUSTC_WRAPPER: "sccache"
         run: make test-compat-mvcc
         timeout-minutes: 10
-      - name: Show sccache stats
-        run: ${SCCACHE_PATH} --show-stats
+
   test-sqlite:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
