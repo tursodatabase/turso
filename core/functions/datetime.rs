@@ -444,8 +444,8 @@ where
     E: ExactSizeIterator<Item = V>,
     I: IntoIterator<IntoIter = E, Item = V>,
 {
-    let mut values = values.into_iter();
-    match values.next() {
+    let mut values = values.into_iter().peekable();
+    match values.peek() {
         None => {
             let now = parse_naive_date_time(Value::build_text("now")).unwrap();
             Value::Integer(get_unixepoch_from_naive_datetime(now))
