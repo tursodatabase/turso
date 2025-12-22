@@ -7815,7 +7815,7 @@ mod tests {
         },
         types::Text,
         vdbe::Register,
-        BufferPool, Completion, Connection, IOContext, StepResult, Wal, WalFile, WalFileShared,
+        BufferPool, Completion, Connection, IOContext, Wal, WalFile, WalFileShared,
     };
     use arc_swap::ArcSwapOption;
     use std::{collections::HashSet, mem::transmute, ops::Deref, sync::Arc};
@@ -9800,17 +9800,7 @@ mod tests {
 
         for query in queries {
             let mut stmt = conn.query(query).unwrap().unwrap();
-            loop {
-                let row = stmt.step().expect("step");
-                match row {
-                    StepResult::Done => {
-                        break;
-                    }
-                    _ => {
-                        tracing::debug!("row {:?}", row);
-                    }
-                }
-            }
+            stmt.run_ignore_rows().expect("run_ignore_rows");
         }
     }
 
@@ -9859,17 +9849,7 @@ mod tests {
 
         for query in queries {
             let mut stmt = conn.query(query).unwrap().unwrap();
-            loop {
-                let row = stmt.step().expect("step");
-                match row {
-                    StepResult::Done => {
-                        break;
-                    }
-                    _ => {
-                        tracing::debug!("row {:?}", row);
-                    }
-                }
-            }
+            stmt.run_ignore_rows().expect("run_ignore_rows");
         }
     }
 
