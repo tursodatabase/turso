@@ -7809,11 +7809,15 @@ mod tests {
     use crate::{
         io::{Buffer, MemoryIO, OpenFlags, IO},
         schema::IndexColumn,
-        storage::{database::DatabaseFile, page_cache::PageCache, sqlite3_ondisk::PageSize},
+        storage::{
+            database::DatabaseFile, page_cache::PageCache, pager::default_page1,
+            sqlite3_ondisk::PageSize,
+        },
         types::Text,
         vdbe::Register,
         BufferPool, Completion, Connection, IOContext, StepResult, Wal, WalFile, WalFileShared,
     };
+    use arc_swap::ArcSwapOption;
     use std::{collections::HashSet, mem::transmute, ops::Deref, sync::Arc};
 
     use tempfile::TempDir;
@@ -9080,6 +9084,8 @@ mod tests {
         let wal_shared = WalFileShared::new_shared(wal_file).unwrap();
         let wal: Arc<dyn Wal> = Arc::new(WalFile::new(io.clone(), wal_shared, buffer_pool.clone()));
 
+        // For new empty databases, init_page_1 must be Some(page) so allocate_page1() can be called
+        let init_page_1 = Arc::new(ArcSwapOption::new(Some(default_page1(None))));
         let pager = Arc::new(
             Pager::new(
                 db_file,
@@ -9088,7 +9094,7 @@ mod tests {
                 Arc::new(parking_lot::RwLock::new(PageCache::new(10))),
                 buffer_pool,
                 Arc::new(parking_lot::Mutex::new(())),
-                Default::default(),
+                init_page_1,
             )
             .unwrap(),
         );
