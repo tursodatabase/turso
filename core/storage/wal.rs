@@ -3681,8 +3681,8 @@ pub mod test {
             let wal = pager.wal.as_ref().unwrap();
             wal.begin_write_tx()
         };
-        // Should get Busy due to stale snapshot
-        assert!(matches!(result, Err(LimboError::Busy)));
+        // Should get BusySnapShot due to stale snapshot
+        assert!(matches!(result, Err(LimboError::BusySnapshot)));
 
         // End read transaction and start a fresh one
         {
