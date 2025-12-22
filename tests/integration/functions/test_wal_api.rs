@@ -5,7 +5,7 @@ use rand_chacha::ChaCha8Rng;
 use tempfile::TempDir;
 use turso_core::{
     types::{WalFrameInfo, WalState},
-    CheckpointMode, LimboError, StepResult,
+    CheckpointMode, LimboError,
 };
 
 use crate::common::{rng_from_time, ExecRows, TempDatabase};
@@ -501,18 +501,7 @@ fn test_wal_upper_bound_passive(db: TempDatabase) {
         let db_copy = TempDatabase::new_with_existent(&PathBuf::from(db_path_copy));
         let conn = db_copy.connect_limbo();
         let mut stmt = conn.prepare("select * from test").unwrap();
-        let mut rows: Vec<Vec<turso_core::types::Value>> = Vec::new();
-        loop {
-            let result = stmt.step();
-            match result {
-                Ok(StepResult::Row) => {
-                    rows.push(stmt.row().unwrap().get_values().cloned().collect())
-                }
-                Ok(StepResult::IO) => db_copy.io.step().unwrap(),
-                Ok(StepResult::Done) => break,
-                result => panic!("unexpected step result: {result:?}"),
-            }
-        }
+        let rows = stmt.run_collect_rows().unwrap();
         assert_eq!(rows, expected[0..prefix]);
     }
 }
@@ -694,16 +683,7 @@ fn test_wal_api_exec_commit(db: TempDatabase) {
     writer.wal_insert_end(true).unwrap();
 
     let mut stmt = writer.prepare("select * from test").unwrap();
-    let mut rows: Vec<Vec<turso_core::types::Value>> = Vec::new();
-    loop {
-        let result = stmt.step();
-        match result {
-            Ok(StepResult::Row) => rows.push(stmt.row().unwrap().get_values().cloned().collect()),
-            Ok(StepResult::IO) => db.io.step().unwrap(),
-            Ok(StepResult::Done) => break,
-            result => panic!("unexpected step result: {result:?}"),
-        }
-    }
+    let rows = stmt.run_collect_rows().unwrap();
     tracing::info!("rows: {:?}", rows);
     assert_eq!(
         rows,
@@ -740,16 +720,7 @@ fn test_wal_api_exec_rollback(db: TempDatabase) {
     writer.wal_insert_end(false).unwrap();
 
     let mut stmt = writer.prepare("select * from test").unwrap();
-    let mut rows: Vec<Vec<turso_core::types::Value>> = Vec::new();
-    loop {
-        let result = stmt.step();
-        match result {
-            Ok(StepResult::Row) => rows.push(stmt.row().unwrap().get_values().cloned().collect()),
-            Ok(StepResult::IO) => db.io.step().unwrap(),
-            Ok(StepResult::Done) => break,
-            result => panic!("unexpected step result: {result:?}"),
-        }
-    }
+    let rows = stmt.run_collect_rows().unwrap();
     tracing::info!("rows: {:?}", rows);
     assert_eq!(rows, vec![] as Vec<Vec<turso_core::types::Value>>);
 }
@@ -804,16 +775,7 @@ fn test_wal_api_insert_exec_mix(db: TempDatabase) {
     conn.wal_insert_end(true).unwrap();
 
     let mut stmt = conn.prepare("select x, length(y) from a").unwrap();
-    let mut rows: Vec<Vec<turso_core::types::Value>> = Vec::new();
-    loop {
-        let result = stmt.step();
-        match result {
-            Ok(StepResult::Row) => rows.push(stmt.row().unwrap().get_values().cloned().collect()),
-            Ok(StepResult::IO) => db.io.step().unwrap(),
-            Ok(StepResult::Done) => break,
-            result => panic!("unexpected step result: {result:?}"),
-        }
-    }
+    let rows = stmt.run_collect_rows().unwrap();
     tracing::info!("rows: {:?}", rows);
     assert_eq!(
         rows,
@@ -830,16 +792,7 @@ fn test_wal_api_insert_exec_mix(db: TempDatabase) {
     );
 
     let mut stmt = conn.prepare("select x, length(y) from b").unwrap();
-    let mut rows: Vec<Vec<turso_core::types::Value>> = Vec::new();
-    loop {
-        let result = stmt.step();
-        match result {
-            Ok(StepResult::Row) => rows.push(stmt.row().unwrap().get_values().cloned().collect()),
-            Ok(StepResult::IO) => db.io.step().unwrap(),
-            Ok(StepResult::Done) => break,
-            result => panic!("unexpected step result: {result:?}"),
-        }
-    }
+    let rows = stmt.run_collect_rows().unwrap();
     tracing::info!("rows: {:?}", rows);
     assert_eq!(
         rows,
@@ -902,16 +855,7 @@ fn test_db_share_same_file() {
     conn2.wal_auto_checkpoint_disable();
 
     let mut stmt = conn2.prepare("select x, length(y) from a").unwrap();
-    let mut rows: Vec<Vec<turso_core::types::Value>> = Vec::new();
-    loop {
-        let result = stmt.step();
-        match result {
-            Ok(StepResult::Row) => rows.push(stmt.row().unwrap().get_values().cloned().collect()),
-            Ok(StepResult::IO) => db2.io.step().unwrap(),
-            Ok(StepResult::Done) => break,
-            result => panic!("unexpected step result: {result:?}"),
-        }
-    }
+    let rows = stmt.run_collect_rows().unwrap();
     tracing::info!("rows: {:?}", rows);
     assert_eq!(
         rows,

@@ -1,5 +1,5 @@
 use crate::common::{ExecRows, TempDatabase};
-use turso_core::{LimboError, StepResult, Value};
+use turso_core::{LimboError, Value};
 
 #[turso_macros::test(mvcc, init_sql = "create table test (i integer);")]
 fn test_statement_reset_bind(tmp_db: TempDatabase) -> anyhow::Result<()> {
@@ -713,12 +713,7 @@ fn test_stmt_reset(tmp_db: TempDatabase) -> anyhow::Result<()> {
     for _ in 0..3 {
         stmt1.reset();
         stmt1.bind_at(1.try_into().unwrap(), Value::Blob(vec![0u8; 1024]));
-        loop {
-            match stmt1.step().unwrap() {
-                StepResult::Done => break,
-                _ => tmp_db.io.step().unwrap(),
-            }
-        }
+        stmt1.run_ignore_rows().unwrap();
     }
 
     // force btree-page split which will be "unnoticed" by stmt1 if it will cache something in between of calls
@@ -728,12 +723,7 @@ fn test_stmt_reset(tmp_db: TempDatabase) -> anyhow::Result<()> {
 
     stmt1.reset();
     stmt1.bind_at(1.try_into().unwrap(), Value::Blob(vec![0u8; 1024]));
-    loop {
-        match stmt1.step().unwrap() {
-            StepResult::Done => break,
-            _ => tmp_db.io.step().unwrap(),
-        }
-    }
+    stmt1.run_ignore_rows().unwrap();
     let rows: Vec<(i64,)> = conn1.exec_rows("SELECT rowid FROM test");
     assert_eq!(rows, vec![(1,), (2,), (3,), (4,), (5,)]);
     Ok(())

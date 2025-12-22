@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use turso_core::{Connection, LimboError, Result, Statement, StepResult, Value};
+use turso_core::{Connection, LimboError, Result, Statement, Value};
 
 use crate::common::TempDatabase;
 
@@ -39,10 +39,11 @@ fn test_deferred_transaction_restart(tmp_db: TempDatabase) {
     conn2.execute("COMMIT").unwrap();
 
     let mut stmt = conn1.query("SELECT COUNT(*) FROM test").unwrap().unwrap();
-    if let StepResult::Row = stmt.step().unwrap() {
-        let row = stmt.row().unwrap();
+    stmt.run_with_row_callback(|row| {
         assert_eq!(*row.get::<&Value>(0).unwrap(), Value::Integer(2));
-    }
+        Ok(())
+    })
+    .unwrap();
 }
 
 // Test a scenario where a deferred transaction cannot restart due to prior reads:
@@ -68,10 +69,11 @@ fn test_deferred_transaction_no_restart(tmp_db: TempDatabase) {
 
     // T2 performs a read - this establishes a snapshot and prevents restart
     let mut stmt = conn2.query("SELECT COUNT(*) FROM test").unwrap().unwrap();
-    if let StepResult::Row = stmt.step().unwrap() {
-        let row = stmt.row().unwrap();
+    stmt.run_with_row_callback(|row| {
         assert_eq!(*row.get::<&Value>(0).unwrap(), Value::Integer(0));
-    }
+        Ok(())
+    })
+    .unwrap();
 
     conn1
         .execute("INSERT INTO test (id, value) VALUES (1, 'first')")
@@ -99,10 +101,11 @@ fn test_deferred_transaction_no_restart(tmp_db: TempDatabase) {
     drop(stmt);
 
     let mut stmt = conn1.query("SELECT COUNT(*) FROM test").unwrap().unwrap();
-    if let StepResult::Row = stmt.step().unwrap() {
-        let row = stmt.row().unwrap();
+    stmt.run_with_row_callback(|row| {
         assert_eq!(*row.get::<&Value>(0).unwrap(), Value::Integer(2));
-    }
+        Ok(())
+    })
+    .unwrap();
 }
 
 #[turso_macros::test(init_sql = "create table t (x);")]
@@ -119,10 +122,10 @@ fn test_txn_error_doesnt_rollback_txn(tmp_db: TempDatabase) -> Result<()> {
     conn.execute("insert into t values (1)")?;
     conn.execute("commit")?;
     let mut stmt = conn.query("select sum(x) from t")?.unwrap();
-    if let StepResult::Row = stmt.step()? {
-        let row = stmt.row().unwrap();
+    stmt.run_with_row_callback(|row| {
         assert_eq!(*row.get::<&Value>(0).unwrap(), Value::Integer(2));
-    }
+        Ok(())
+    })?;
 
     Ok(())
 }
@@ -283,10 +286,11 @@ fn test_mvcc_transactions_deferred(tmp_db: TempDatabase) {
     conn2.execute("COMMIT").unwrap();
 
     let mut stmt = conn1.query("SELECT COUNT(*) FROM test").unwrap().unwrap();
-    if let StepResult::Row = stmt.step().unwrap() {
-        let row = stmt.row().unwrap();
+    stmt.run_with_row_callback(|row| {
         assert_eq!(*row.get::<&Value>(0).unwrap(), Value::Integer(2));
-    }
+        Ok(())
+    })
+    .unwrap();
 }
 
 #[turso_macros::test(mvcc)]
