@@ -898,6 +898,8 @@ mod tests {
 
     #[test]
     pub fn test_db_concurrent_use() {
+        use std::sync::{Arc, Barrier};
+
         let db = TursoDatabase::new(TursoDatabaseConfig {
             path: ":memory:".to_string(),
             experimental_features: None,
@@ -908,15 +910,21 @@ mod tests {
         db.open().unwrap();
         let conn = db.connect().unwrap();
         let stmt1 = conn
-            .prepare_single("SELECT * FROM generate_series(1, 10000)")
+            .prepare_single("SELECT * FROM generate_series(1, 100000)")
             .unwrap();
         let stmt2 = conn
-            .prepare_single("SELECT * FROM generate_series(1, 10000)")
+            .prepare_single("SELECT * FROM generate_series(1, 100000)")
             .unwrap();
 
+        // Use a barrier to ensure both threads start executing at the same time
+        let barrier = Arc::new(Barrier::new(2));
         let mut threads = Vec::new();
         for mut stmt in [stmt1, stmt2] {
-            let thread = std::thread::spawn(move || stmt.execute(None));
+            let barrier_clone = Arc::clone(&barrier);
+            let thread = std::thread::spawn(move || {
+                barrier_clone.wait();
+                stmt.execute(None)
+            });
             threads.push(thread);
         }
         let mut results = Vec::new();
@@ -924,7 +932,8 @@ mod tests {
             results.push(thread.join().unwrap());
         }
         assert!(
-            results[0].is_err() && results[1].is_ok() || results[0].is_ok() && results[1].is_err()
+            results[0].is_err() && results[1].is_ok() || results[0].is_ok() && results[1].is_err(),
+            "results: {results:?}",
         );
     }
 

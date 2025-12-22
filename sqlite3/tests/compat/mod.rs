@@ -1,5 +1,6 @@
 #![allow(non_camel_case_types)]
 #![allow(dead_code)]
+#![allow(unused_imports)]
 use std::ptr;
 
 #[repr(C)]
@@ -12,6 +13,12 @@ struct sqlite3_stmt {
     _private: [u8; 0],
 }
 
+// Windows: This entire compat test is excluded because Windows has no system SQLite library
+// (unlike Linux which has libsqlite3-dev pre-installed). The sqlite3 feature links against
+// native libsqlite3 for comparison testing, which isn't available on Windows without complex
+// setup (generating .lib from .def using VS tooling). Since SQLite behavior is platform-
+// independent, running these tests on Linux/macOS provides sufficient coverage.
+#[cfg(not(target_os = "windows"))]
 #[cfg_attr(not(feature = "sqlite3"), link(name = "turso_sqlite3"))]
 #[cfg_attr(feature = "sqlite3", link(name = "sqlite3"))]
 extern "C" {
