@@ -1,0 +1,60 @@
+version: "3.9"
+
+services:
+  proxy:
+    build:
+      context: .
+      dockerfile: Dockerfile.squid
+    networks: [sandbox, egress]
+    volumes:
+      - ./squid.conf:/etc/squid/squid.conf:ro
+    healthcheck:
+      test: ["CMD", "nc", "-z", "127.0.0.1", "3128"]
+      interval: 1s
+      timeout: 5s
+      retries: 10
+      start_period: 1s
+  tursodb:
+    depends_on:
+      proxy:
+        condition: service_healthy
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        TZ: ${TZ:-America/Los_Angeles}
+        CLAUDE_CODE_VERSION: "latest"
+        GIT_DELTA_VERSION: "0.18.2"
+        ZSH_IN_DOCKER_VERSION: "1.2.0"
+        GO_VERSION: "1.24.10"
+        RUST_VERSION: "1.88.0"
+        PYTHON_VERSION: "3.11"
+    environment:
+      NODE_OPTIONS: "--max-old-space-size=4096"
+      CLAUDE_CONFIG_DIR: "/home/node/.claude"
+      POWERLEVEL9K_DISABLE_GITSTATUS: "true"
+      HTTP_PROXY: "http://proxy:3128"
+      HTTPS_PROXY: "http://proxy:3128"
+      ALL_PROXY: "http://proxy:3128"
+      NO_PROXY: "localhost,127.0.0.1"
+    networks: [sandbox]
+    volumes:
+      - ..:/workspace:delegated
+      - claude-code-bashhistory:/commandhistory
+      - claude-code-config:/home/node/.claude
+
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+
+    init: true
+    tty: true
+
+volumes:
+  claude-code-bashhistory:
+  claude-code-config:
+networks:
+  sandbox:
+    internal: true
+  egress:
+    driver: bridge
