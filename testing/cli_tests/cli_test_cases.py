@@ -372,7 +372,7 @@ def test_parse_error():
 
 
 def test_tables_with_attached_db():
-    shell = TestTursoShell()
+    shell = TestTursoShell(flags="-q --experimental-attach")
     shell.execute_dot(".open :memory:")
     shell.execute_dot("CREATE TABLE orders(a);")
     shell.execute_dot("ATTACH DATABASE 'testing/testing.db' AS attached;")

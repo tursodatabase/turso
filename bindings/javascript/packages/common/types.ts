@@ -1,8 +1,12 @@
+export type ExperimentalFeature = 'views' | 'strict' | 'encryption' | 'index_method' | 'autovacuum' | 'triggers' | 'attach';
+
 export interface DatabaseOpts {
     readonly?: boolean,
     fileMustExist?: boolean,
     timeout?: number
     tracing?: 'info' | 'debug' | 'trace'
+    /** Experimental features to enable */
+    experimental?: ExperimentalFeature[]
 }
 
 export interface NativeDatabase {
