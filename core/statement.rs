@@ -1,9 +1,10 @@
 use std::{
     borrow::Cow,
+    future::Future,
     num::NonZero,
     ops::Deref,
     sync::{atomic::Ordering, Arc},
-    task::Waker,
+    task::{Context, Poll, Waker},
 };
 
 use tracing::{instrument, Level};
@@ -444,5 +445,202 @@ impl Statement {
     /// Prefer to use helper methods instead such as [Self::run_with_row_callback]
     pub fn _io(&self) -> &dyn crate::IO {
         self.pager.io.as_ref()
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AsyncStepResult {
+    Done,
+    Row,
+    Interrupt,
+    Busy,
+}
+
+impl AsyncStepResult {
+    #[inline]
+    pub fn from_step_result(step: StepResult) -> Poll<Self> {
+        let new_step = match step {
+            vdbe::StepResult::Done => Self::Done,
+            vdbe::StepResult::IO => return Poll::Pending,
+            vdbe::StepResult::Row => Self::Row,
+            vdbe::StepResult::Interrupt => Self::Interrupt,
+            vdbe::StepResult::Busy => Self::Busy,
+        };
+        Poll::Ready(new_step)
+    }
+}
+
+/// A future that represents a single step of statement execution.
+/// This allows fine-grained async control over statement execution.
+pub struct StepFuture<'a> {
+    stmt: &'a mut Statement,
+}
+
+impl<'a> Future for StepFuture<'a> {
+    type Output = Result<AsyncStepResult>;
+
+    fn poll(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Self::Output> {
+        self.stmt
+            .step_with_waker(cx.waker())
+            .map(AsyncStepResult::from_step_result)?
+            .map(Ok)
+    }
+}
+
+impl Statement {
+    /// Returns a future that completes when the next step result is available.
+    /// This allows fine-grained async control over statement execution.
+    #[inline]
+    pub fn step_async(&mut self) -> StepFuture<'_> {
+        StepFuture { stmt: self }
+    }
+}
+
+/// An async wrapper around Statement that implements Future for the entire execution.
+pub struct AsyncStatement {
+    inner: Statement,
+}
+
+impl AsyncStatement {
+    #[inline]
+    pub fn new(statement: Statement) -> Self {
+        Self { inner: statement }
+    }
+
+    /// Returns a future that completes when the next step result is available.
+    #[inline]
+    pub async fn step(&mut self) -> Result<AsyncStepResult> {
+        self.inner.step_async().await
+    }
+
+    /// Get a reference to the inner Statement for advanced use cases.
+    #[inline]
+    pub fn statement(&self) -> &Statement {
+        &self.inner
+    }
+
+    /// Get a mutable reference to the inner Statement for advanced use cases.
+    #[inline]
+    pub fn statement_mut(&mut self) -> &mut Statement {
+        &mut self.inner
+    }
+
+    /// Consume self and return the inner Statement.
+    #[inline]
+    pub fn into_inner(self) -> Statement {
+        self.inner
+    }
+}
+
+/// A blocking wrapper around AsyncStatement that manually polls the future
+/// and advances IO when pending.
+/// Useful for synchronous code that wants automatic IO handling.
+pub struct BlockingStatement {
+    inner: AsyncStatement,
+}
+
+impl BlockingStatement {
+    #[inline]
+    pub fn new(async_stmt: AsyncStatement) -> Self {
+        Self { inner: async_stmt }
+    }
+
+    /// Create a BlockingStatement directly from a Statement.
+    #[inline]
+    pub fn from_statement(statement: Statement) -> Self {
+        Self::new(AsyncStatement::new(statement))
+    }
+
+    /// Step and block on IO until a non-IO result is available.
+    /// This manually polls the async future and advances IO when pending.
+    pub fn step(&mut self) -> Result<StepResult> {
+        let waker = Waker::noop();
+        let mut cx = Context::from_waker(&waker);
+
+        loop {
+            // Create the future in a block so it's dropped before we access IO
+            let poll_result = {
+                let mut fut = std::pin::pin!(self.inner.step());
+                fut.as_mut().poll(&mut cx)
+            };
+
+            match poll_result {
+                Poll::Ready(Ok(async_result)) => {
+                    return Ok(match async_result {
+                        AsyncStepResult::Done => StepResult::Done,
+                        AsyncStepResult::Row => StepResult::Row,
+                        AsyncStepResult::Interrupt => StepResult::Interrupt,
+                        AsyncStepResult::Busy => StepResult::Busy,
+                    });
+                }
+                Poll::Ready(Err(e)) => return Err(e),
+                Poll::Pending => {
+                    // Future is pending - advance IO and retry
+                    self.inner.statement().pager.io.step()?;
+                }
+            }
+        }
+    }
+
+    /// Get a reference to the inner AsyncStatement.
+    #[inline]
+    pub fn async_statement(&self) -> &AsyncStatement {
+        &self.inner
+    }
+
+    /// Get a mutable reference to the inner AsyncStatement.
+    #[inline]
+    pub fn async_statement_mut(&mut self) -> &mut AsyncStatement {
+        &mut self.inner
+    }
+
+    /// Get a reference to the underlying Statement.
+    #[inline]
+    pub fn statement(&self) -> &Statement {
+        self.inner.statement()
+    }
+
+    /// Get a mutable reference to the underlying Statement.
+    #[inline]
+    pub fn statement_mut(&mut self) -> &mut Statement {
+        self.inner.statement_mut()
+    }
+
+    /// Consume self and return the inner AsyncStatement.
+    #[inline]
+    pub fn into_async(self) -> AsyncStatement {
+        self.inner
+    }
+
+    /// Consume self and return the underlying Statement.
+    #[inline]
+    pub fn into_statement(self) -> Statement {
+        self.inner.into_inner()
+    }
+}
+
+impl Statement {
+    /// Convert this statement into an AsyncStatement for async execution.
+    #[inline]
+    pub fn into_async(self) -> AsyncStatement {
+        AsyncStatement::new(self)
+    }
+
+    /// Convert this statement into a BlockingStatement for sync execution
+    /// with automatic IO handling.
+    #[inline]
+    pub fn into_blocking(self) -> BlockingStatement {
+        BlockingStatement::from_statement(self)
+    }
+}
+
+impl AsyncStatement {
+    /// Convert this async statement into a BlockingStatement for sync execution.
+    #[inline]
+    pub fn into_blocking(self) -> BlockingStatement {
+        BlockingStatement::new(self)
     }
 }
