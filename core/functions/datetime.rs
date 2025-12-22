@@ -96,11 +96,19 @@ where
 
     match apply_res {
         None => Value::build_text(""),
-        Some(DtTransform(dt, subsec)) => format_dt(dt, output_type, subsec),
+        Some(DtTransform {
+            dt,
+            subsec_requested,
+        }) => format_dt(dt, output_type, subsec_requested),
     }
 }
 
-struct DtTransform(NaiveDateTime, bool);
+// The result of applying a set of modifiers is both a datetime
+// and whether the subsec format was requested.
+struct DtTransform {
+    dt: NaiveDateTime,
+    subsec_requested: bool,
+}
 
 fn modify_dt<I, E, V>(mut dt: NaiveDateTime, mods: I) -> Option<DtTransform>
 where
@@ -138,7 +146,10 @@ where
         return None;
     }
 
-    Some(DtTransform(dt, subsec_requested))
+    Some(DtTransform {
+        dt,
+        subsec_requested,
+    })
 }
 
 fn format_dt(dt: NaiveDateTime, output_type: DateTimeOutput, subsec: bool) -> Value {
