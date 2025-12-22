@@ -2,6 +2,7 @@
 
 require_relative "turso/version"
 require_relative "turso/errors"
+require_relative "turso/pragmas"
 require_relative "turso/turso"
 
 require_relative "turso/row"

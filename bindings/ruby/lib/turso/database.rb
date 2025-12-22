@@ -2,6 +2,7 @@
 
 require_relative "row"
 require_relative "result_set"
+require_relative "pragmas"
 
 module Turso
   # Database wraps a Turso database connection with a sqlite3-ruby compatible API.
@@ -12,6 +13,8 @@ module Turso
   #   end
   #
   class Database
+    include Pragmas
+
     # @return [Boolean] Whether to return rows as hashes (default: false, returns Row objects)
     attr_accessor :results_as_hash
 
