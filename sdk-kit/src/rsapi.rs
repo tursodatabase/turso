@@ -1,8 +1,9 @@
 use std::{
     borrow::Cow,
     fmt::Display,
+    future::Future,
     sync::{Arc, Mutex, Once, RwLock},
-    task::Waker,
+    task::{Context as TaskContext, Poll, Waker},
 };
 
 use tracing::level_filters::LevelFilter;
@@ -13,8 +14,9 @@ use tracing_subscriber::{
     EnvFilter, Layer,
 };
 use turso_core::{
-    storage::database::DatabaseFile, types::AsValueRef, Connection, Database, DatabaseOpts,
-    DatabaseStorage, LimboError, OpenFlags, Statement, StepResult, IO,
+    storage::database::DatabaseFile, types::AsValueRef, AsyncStatement, AsyncStepResult,
+    BlockingStatement, Connection, Database, DatabaseOpts, DatabaseStorage, LimboError, OpenFlags,
+    Statement, StepResult, IO,
 };
 
 use crate::{
@@ -342,6 +344,7 @@ fn turso_error_from_limbo_error(err: LimboError) -> TursoError {
             LimboError::DatabaseFull(_) => TursoStatusCode::DatabaseFull,
             LimboError::ReadOnly => TursoStatusCode::Readonly,
             LimboError::Busy => TursoStatusCode::Busy,
+            LimboError::Interrupt => TursoStatusCode::Interrupt,
             _ => TursoStatusCode::Error,
         },
         message: Some(format!("{err}")),
@@ -593,11 +596,17 @@ impl TursoConnection {
     /// prepares single SQL statement
     pub fn prepare_single(&self, sql: impl AsRef<str>) -> Result<Box<TursoStatement>, TursoError> {
         match self.connection.prepare(sql) {
-            Ok(statement) => Ok(Box::new(TursoStatement {
-                concurrent_guard: self.concurrent_guard.clone(),
-                async_io: self.async_io,
-                statement,
-            })),
+            Ok(statement) => {
+                let inner = if self.async_io {
+                    InnerStatement::Async(statement.into_async())
+                } else {
+                    InnerStatement::Blocking(statement.into_blocking())
+                };
+                Ok(Box::new(TursoStatement {
+                    concurrent_guard: self.concurrent_guard.clone(),
+                    inner,
+                }))
+            }
             Err(err) => Err(turso_error_from_limbo_error(err)),
         }
     }
@@ -608,14 +617,20 @@ impl TursoConnection {
         sql: impl AsRef<str>,
     ) -> Result<Option<(Box<TursoStatement>, usize)>, TursoError> {
         match self.connection.consume_stmt(sql) {
-            Ok(Some((statement, position))) => Ok(Some((
-                Box::new(TursoStatement {
-                    async_io: self.async_io,
-                    concurrent_guard: Arc::new(ConcurrentGuard::new()),
-                    statement,
-                }),
-                position,
-            ))),
+            Ok(Some((statement, position))) => {
+                let inner = if self.async_io {
+                    InnerStatement::Async(statement.into_async())
+                } else {
+                    InnerStatement::Blocking(statement.into_blocking())
+                };
+                Ok(Some((
+                    Box::new(TursoStatement {
+                        concurrent_guard: Arc::new(ConcurrentGuard::new()),
+                        inner,
+                    }),
+                    position,
+                )))
+            }
             Ok(None) => Ok(None),
             Err(err) => Err(turso_error_from_limbo_error(err)),
         }
@@ -663,10 +678,35 @@ impl TursoConnection {
     }
 }
 
+/// Internal enum to hold either a blocking or async statement
+enum InnerStatement {
+    /// Used when async_io = false - automatically handles IO internally
+    Blocking(BlockingStatement),
+    /// Used when async_io = true - returns IO status for caller to handle
+    Async(AsyncStatement),
+}
+
+impl InnerStatement {
+    /// Get a reference to the underlying Statement
+    fn statement(&self) -> &Statement {
+        match self {
+            InnerStatement::Blocking(blocking) => blocking.statement(),
+            InnerStatement::Async(async_stmt) => async_stmt.statement(),
+        }
+    }
+
+    /// Get a mutable reference to the underlying Statement
+    fn statement_mut(&mut self) -> &mut Statement {
+        match self {
+            InnerStatement::Blocking(blocking) => blocking.statement_mut(),
+            InnerStatement::Async(async_stmt) => async_stmt.statement_mut(),
+        }
+    }
+}
+
 pub struct TursoStatement {
-    async_io: bool,
     concurrent_guard: Arc<ConcurrentGuard>,
-    statement: Statement,
+    inner: InnerStatement,
 }
 
 #[derive(Debug, Clone)]
@@ -678,7 +718,7 @@ pub struct TursoExecutionResult {
 impl TursoStatement {
     /// returns parameters count for the statement
     pub fn parameters_count(&self) -> usize {
-        self.statement.parameters_count()
+        self.inner.statement().parameters_count()
     }
     /// binds positional parameter at the corresponding index (1-based)
     pub fn bind_positional(
@@ -693,12 +733,12 @@ impl TursoStatement {
             });
         };
         // bind_at is safe to call with any index as it will put pair (index, value) into the map
-        self.statement.bind_at(index, value);
+        self.inner.statement_mut().bind_at(index, value);
         Ok(())
     }
     /// named parameter position (name MUST omit named-parameter control character, e.g. '@', '$' or ':')
     pub fn named_position(&mut self, name: impl AsRef<str>) -> Result<usize, TursoError> {
-        let parameters = self.statement.parameters();
+        let parameters = self.inner.statement().parameters();
         for i in 1..parameters.next_index().get() {
             // i is positive - so conversion to NonZero<> type will always succeed
             let index = i.try_into().unwrap();
@@ -734,38 +774,49 @@ impl TursoStatement {
     pub fn step(&mut self, waker: Option<&Waker>) -> Result<TursoStatusCode, TursoError> {
         let guard = self.concurrent_guard.clone();
         let _guard = guard.try_use()?;
-        self.step_no_guard(waker)
+        self.step_no_guard(waker.unwrap_or(Waker::noop()))
     }
 
-    fn step_no_guard(&mut self, waker: Option<&Waker>) -> Result<TursoStatusCode, TursoError> {
-        let async_io = self.async_io;
-        loop {
-            let result = if let Some(waker) = waker {
-                self.statement.step_with_waker(waker)
-            } else {
-                self.statement.step()
-            };
-            return match result {
-                Ok(StepResult::Done) => Ok(TursoStatusCode::Done),
-                Ok(StepResult::Row) => Ok(TursoStatusCode::Row),
-                Ok(StepResult::Busy) => Err(TursoError {
-                    code: TursoStatusCode::Busy,
-                    message: None,
-                }),
-                Ok(StepResult::Interrupt) => Err(TursoError {
-                    code: TursoStatusCode::Interrupt,
-                    message: None,
-                }),
-                Ok(StepResult::IO) => {
-                    if async_io {
-                        Ok(TursoStatusCode::Io)
-                    } else {
-                        self.run_io()?;
-                        continue;
+    fn step_no_guard(&mut self, waker: &Waker) -> Result<TursoStatusCode, TursoError> {
+        match &mut self.inner {
+            InnerStatement::Blocking(blocking) => {
+                // BlockingStatement handles IO internally, never returns IO
+                match blocking.step() {
+                    Ok(StepResult::Done) => Ok(TursoStatusCode::Done),
+                    Ok(StepResult::Row) => Ok(TursoStatusCode::Row),
+                    Ok(StepResult::Busy) => Err(TursoError {
+                        code: TursoStatusCode::Busy,
+                        message: None,
+                    }),
+                    Ok(StepResult::Interrupt) => Err(TursoError {
+                        code: TursoStatusCode::Interrupt,
+                        message: None,
+                    }),
+                    Ok(StepResult::IO) => {
+                        unreachable!("BlockingStatement.step() handles IO internally")
                     }
+                    Err(err) => Err(turso_error_from_limbo_error(err)),
                 }
-                Err(err) => return Err(turso_error_from_limbo_error(err)),
-            };
+            }
+            InnerStatement::Async(async_stmt) => {
+                // Poll the async statement's step future
+                let mut cx = TaskContext::from_waker(waker);
+                let mut fut = std::pin::pin!(async_stmt.step());
+                match fut.as_mut().poll(&mut cx) {
+                    Poll::Ready(Ok(AsyncStepResult::Done)) => Ok(TursoStatusCode::Done),
+                    Poll::Ready(Ok(AsyncStepResult::Row)) => Ok(TursoStatusCode::Row),
+                    Poll::Ready(Ok(AsyncStepResult::Busy)) => Err(TursoError {
+                        code: TursoStatusCode::Busy,
+                        message: None,
+                    }),
+                    Poll::Ready(Ok(AsyncStepResult::Interrupt)) => Err(TursoError {
+                        code: TursoStatusCode::Interrupt,
+                        message: None,
+                    }),
+                    Poll::Ready(Err(err)) => Err(turso_error_from_limbo_error(err)),
+                    Poll::Pending => Ok(TursoStatusCode::Io),
+                }
+            }
         }
     }
     /// execute statement to completion
@@ -775,6 +826,7 @@ impl TursoStatement {
         let guard = self.concurrent_guard.clone();
         let _guard = guard.try_use()?;
 
+        let waker = waker.unwrap_or(Waker::noop());
         loop {
             let status = self.step_no_guard(waker)?;
             if status == TursoStatusCode::Row {
@@ -787,7 +839,7 @@ impl TursoStatement {
             } else if status == TursoStatusCode::Done {
                 return Ok(TursoExecutionResult {
                     status: TursoStatusCode::Done,
-                    rows_changed: self.statement.n_change() as u64,
+                    rows_changed: self.inner.statement().n_change() as u64,
                 });
             }
             return Err(TursoError {
@@ -800,7 +852,8 @@ impl TursoStatement {
     }
     /// run iteration of the IO backend
     pub fn run_io(&self) -> Result<(), TursoError> {
-        self.statement
+        self.inner
+            .statement()
             ._io()
             .step()
             .map_err(turso_error_from_limbo_error)
@@ -808,7 +861,7 @@ impl TursoStatement {
     /// get row value reference currently pointed by the statement
     /// note, that this row will no longer be valid after execution of methods like [Self::step]/[Self::execute]/[Self::finalize]/[Self::reset]
     pub fn row_value(&self, index: usize) -> Result<turso_core::ValueRef, TursoError> {
-        let Some(row) = self.statement.row() else {
+        let Some(row) = self.inner.statement().row() else {
             return Err(TursoError {
                 code: TursoStatusCode::Misuse,
                 message: Some("statement holds no row".to_string()),
@@ -825,7 +878,7 @@ impl TursoStatement {
     }
     /// returns column count
     pub fn column_count(&self) -> usize {
-        self.statement.num_columns()
+        self.inner.statement().num_columns()
     }
     /// returns column name
     pub fn column_name(&self, index: usize) -> Result<Cow<'_, str>, TursoError> {
@@ -835,15 +888,16 @@ impl TursoStatement {
                 message: Some("column index out of bounds".to_string()),
             });
         }
-        Ok(self.statement.get_column_name(index))
+        Ok(self.inner.statement().get_column_name(index))
     }
     /// finalize statement execution
     /// this method must be called in the end of statement execution (either successfull or not)
     pub fn finalize(&mut self, waker: Option<&Waker>) -> Result<TursoStatusCode, TursoError> {
         let guard = self.concurrent_guard.clone();
         let _guard = guard.try_use()?;
+        let waker = waker.unwrap_or(Waker::noop());
 
-        while self.statement.execution_state().is_running() {
+        while self.inner.statement().execution_state().is_running() {
             let status = self.step_no_guard(waker)?;
             if status == TursoStatusCode::Io {
                 return Ok(status);
@@ -853,8 +907,9 @@ impl TursoStatement {
     }
     /// reset internal statement state and bindings
     pub fn reset(&mut self) -> Result<(), TursoError> {
-        self.statement.reset();
-        self.statement.clear_bindings();
+        let stmt = self.inner.statement_mut();
+        stmt.reset();
+        stmt.clear_bindings();
         Ok(())
     }
 
