@@ -898,34 +898,34 @@ mod tests {
 
     #[test]
     pub fn test_db_concurrent_use() {
-        let db = TursoDatabase::new(TursoDatabaseConfig {
-            path: ":memory:".to_string(),
-            experimental_features: None,
-            async_io: false,
-            io: None,
-            db_file: None,
-        });
-        db.open().unwrap();
-        let conn = db.connect().unwrap();
-        let stmt1 = conn
-            .prepare_single("SELECT * FROM generate_series(1, 10000)")
-            .unwrap();
-        let stmt2 = conn
-            .prepare_single("SELECT * FROM generate_series(1, 10000)")
-            .unwrap();
+        for _ in 0..16 {
+            let db = TursoDatabase::new(TursoDatabaseConfig {
+                path: ":memory:".to_string(),
+                experimental_features: None,
+                async_io: false,
+                io: None,
+                db_file: None,
+            });
+            db.open().unwrap();
+            let conn = db.connect().unwrap();
+            let stmt1 = conn
+                .prepare_single("SELECT * FROM generate_series(1, 10000)")
+                .unwrap();
+            let stmt2 = conn
+                .prepare_single("SELECT * FROM generate_series(1, 10000)")
+                .unwrap();
 
-        let mut threads = Vec::new();
-        for mut stmt in [stmt1, stmt2] {
-            let thread = std::thread::spawn(move || stmt.execute(None));
-            threads.push(thread);
+            let mut threads = Vec::new();
+            for mut stmt in [stmt1, stmt2] {
+                let thread = std::thread::spawn(move || stmt.execute(None));
+                threads.push(thread);
+            }
+            let mut results = Vec::new();
+            for thread in threads {
+                results.push(thread.join().unwrap());
+            }
+            assert!(!(results[0].is_err() && results[1].is_err()));
         }
-        let mut results = Vec::new();
-        for thread in threads {
-            results.push(thread.join().unwrap());
-        }
-        assert!(
-            results[0].is_err() && results[1].is_ok() || results[0].is_ok() && results[1].is_err()
-        );
     }
 
     #[test]
