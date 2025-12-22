@@ -182,13 +182,19 @@ impl Affinity {
                 .map(Either::Left),
 
             Affinity::Text => {
-                if is_text {
-                    is_numeric_value(val)
-                        .then(|| stringify_register(val))
-                        .flatten()
-                        .map(Either::Right)
-                } else {
-                    None
+                // TEXT affinity: Convert numeric values to their text representation
+                match val {
+                    ValueRef::Integer(i) => Some(Either::Right(Value::Text(i.to_string().into()))),
+                    ValueRef::Float(f) => Some(Either::Right(Value::Text(f.to_string().into()))),
+                    ValueRef::Text(_) => {
+                        // If it's already text but looks numeric, ensure it's in canonical text form
+                        if is_numeric_value(val) {
+                            stringify_register(val).map(Either::Right)
+                        } else {
+                            None // Already text, no conversion needed
+                        }
+                    }
+                    _ => None, // Blob and Null are not converted
                 }
             }
 
