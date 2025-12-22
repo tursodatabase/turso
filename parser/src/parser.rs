@@ -1013,7 +1013,7 @@ impl<'a> Parser<'a> {
                 TK_ID | TK_STRING => {
                     let tok = eat_assert!(self, TK_ID, TK_STRING);
                     type_name.push(' ');
-                    type_name.push_str(from_bytes_as_str(&tok.value));
+                    type_name.push_str(from_bytes_as_str(tok.value));
                 }
                 _ => break,
             }
@@ -1359,24 +1359,24 @@ impl<'a> Parser<'a> {
             TK_BLOB => {
                 let tok = eat_assert!(self, TK_BLOB);
                 Ok(Box::new(Expr::Literal(Literal::Blob(from_bytes(
-                    &tok.value,
+                    tok.value,
                 )))))
             }
             TK_FLOAT => {
                 let tok = eat_assert!(self, TK_FLOAT);
                 Ok(Box::new(Expr::Literal(Literal::Numeric(from_bytes(
-                    &tok.value,
+                    tok.value,
                 )))))
             }
             TK_INTEGER => {
                 let tok = eat_assert!(self, TK_INTEGER);
                 Ok(Box::new(Expr::Literal(Literal::Numeric(from_bytes(
-                    &tok.value,
+                    tok.value,
                 )))))
             }
             TK_VARIABLE => {
                 let tok = eat_assert!(self, TK_VARIABLE);
-                Ok(Box::new(self.create_variable(&tok.value)?))
+                Ok(Box::new(self.create_variable(tok.value)?))
             }
             TK_CAST => {
                 eat_assert!(self, TK_CAST);
@@ -1526,7 +1526,7 @@ impl<'a> Parser<'a> {
                                 eat_assert!(self, TK_STAR);
                                 eat_expect!(self, TK_RP);
                                 return Ok(Box::new(Expr::FunctionCallStar {
-                                    name: Name::from_bytes(&name),
+                                    name: Name::from_bytes(name),
                                     filter_over: self.parse_filter_over()?,
                                 }));
                             }
@@ -1537,7 +1537,7 @@ impl<'a> Parser<'a> {
                                 eat_expect!(self, TK_RP);
                                 let filter_over = self.parse_filter_over()?;
                                 return Ok(Box::new(Expr::FunctionCall {
-                                    name: Name::from_bytes(&name),
+                                    name: Name::from_bytes(name),
                                     distinctness: distinct,
                                     args: exprs,
                                     order_by,
@@ -1567,18 +1567,18 @@ impl<'a> Parser<'a> {
                 if let Some(second_name) = second_name {
                     if let Some(third_name) = third_name {
                         Ok(Box::new(Expr::DoublyQualified(
-                            Name::from_bytes(&name),
+                            Name::from_bytes(name),
                             second_name,
                             third_name,
                         )))
                     } else {
                         Ok(Box::new(Expr::Qualified(
-                            Name::from_bytes(&name),
+                            Name::from_bytes(name),
                             second_name,
                         )))
                     }
                 } else if can_be_lit_str {
-                    Ok(Box::new(Expr::Literal(Literal::String(from_bytes(&name)))))
+                    Ok(Box::new(Expr::Literal(Literal::String(from_bytes(name)))))
                 } else {
                     match_ignore_ascii_case!(match name {
                         b"true" => {
@@ -1587,7 +1587,7 @@ impl<'a> Parser<'a> {
                         b"false" => {
                             Ok(Box::new(Expr::Literal(Literal::Numeric("0".into()))))
                         }
-                        _ => Ok(Box::new(Expr::Id(Name::from_bytes(&name)))),
+                        _ => Ok(Box::new(Expr::Id(Name::from_bytes(name)))),
                     })
                 }
             }
@@ -2277,7 +2277,7 @@ impl<'a> Parser<'a> {
                             match tok.token_type {
                                 TK_JOIN => JoinOperator::TypedJoin(Some(new_join_type(
                                     jkw.as_bytes(),
-                                    Some(&name_1),
+                                    Some(name_1),
                                     None,
                                 )?)),
                                 _ => {
@@ -2285,8 +2285,8 @@ impl<'a> Parser<'a> {
                                     eat_expect!(self, TK_JOIN);
                                     JoinOperator::TypedJoin(Some(new_join_type(
                                         jkw.as_bytes(),
-                                        Some(&name_1),
-                                        Some(&name_2),
+                                        Some(name_1),
+                                        Some(name_2),
                                     )?))
                                 }
                             }

@@ -179,15 +179,15 @@ pub struct Token<'a> {
 impl<'a> Token<'a> {
     #[inline]
     pub const fn new(value: &'a [u8], token_type: TokenType) -> Self {
-        Token {
-            value: value,
-            token_type,
-        }
+        Token { value, token_type }
     }
     #[inline]
     pub fn to_utf8(&self) -> String {
         String::from_utf8_lossy(self.as_bytes()).to_string()
     }
+    /// # Safety
+    /// Same as `String::from_utf8_unchecked`,
+    /// the caller must ensure that token bytes are valid UTF-8.
     #[inline]
     pub unsafe fn to_utf8_unchecked(&self) -> String {
         String::from_utf8_unchecked(self.as_bytes().to_vec())
@@ -252,7 +252,7 @@ impl<'a> Lexer<'a> {
 
     #[inline(always)]
     pub fn remaining(&self) -> &'a [u8] {
-        &self.input.get(self.offset..).unwrap_or(&[])
+        self.input.get(self.offset..).unwrap_or(&[])
     }
 
     #[inline]
@@ -399,7 +399,7 @@ impl<'a> Lexer<'a> {
     fn eat_one_token(&mut self, typ: TokenType) -> Token<'a> {
         debug_assert!(!self.remaining().is_empty());
 
-        let tok = Token::new(&self.remaining().get(..1).unwrap_or("".as_bytes()), typ);
+        let tok = Token::new(self.remaining().get(..1).unwrap_or("".as_bytes()), typ);
         self.offset += 1;
         tok
     }
@@ -790,7 +790,7 @@ impl<'a> Lexer<'a> {
             }
             _ => {
                 let start_id = self.offset;
-                self.eat_while(|b| is_identifier_continue(b));
+                self.eat_while(is_identifier_continue);
 
                 // empty variable name
                 if start_id == self.offset {
@@ -857,7 +857,7 @@ impl<'a> Lexer<'a> {
                 }
             }
             _ => {
-                self.eat_while(|b| is_identifier_continue(b));
+                self.eat_while(is_identifier_continue);
                 let result = &self.input[start..self.offset];
                 Ok(Token::new(result, keyword_or_id_token(result)))
             }
