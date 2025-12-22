@@ -496,6 +496,7 @@ impl TursoDatabase {
                     "index_method" => opts.with_index_method(true),
                     "strict" => opts.with_strict(true),
                     "autovacuum" => opts.with_autovacuum(true),
+                    "triggers" => opts.with_triggers(true),
                     _ => opts,
                 };
             }

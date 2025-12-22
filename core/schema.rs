@@ -553,6 +553,7 @@ impl Schema {
         mv_cursor: Option<Arc<RwLock<MvCursor>>>,
         pager: Arc<Pager>,
         syms: &SymbolTable,
+        enable_triggers: bool,
     ) -> Result<()> {
         assert!(
             mv_cursor.is_none(),
@@ -616,6 +617,7 @@ impl Schema {
                 &mut dbsp_state_index_roots,
                 &mut materialized_view_info,
                 None,
+                enable_triggers,
             )?;
             drop(record_cursor);
             drop(row);
@@ -821,6 +823,7 @@ impl Schema {
         dbsp_state_index_roots: &mut std::collections::HashMap<String, i64>,
         materialized_view_info: &mut std::collections::HashMap<String, (String, i64)>,
         mv_store: Option<&Arc<MvStore>>,
+        enable_triggers: bool,
     ) -> Result<()> {
         match ty {
             "table" => {
@@ -980,6 +983,13 @@ impl Schema {
                 }
             }
             "trigger" => {
+                // Check if experimental triggers are enabled
+                if !enable_triggers {
+                    return Err(crate::LimboError::ParseError(
+                        "Database contains triggers but --experimental-triggers flag is not set. Enable with --experimental-triggers flag to use this database.".to_string(),
+                    ));
+                }
+
                 use turso_parser::ast::{Cmd, Stmt};
                 use turso_parser::parser::Parser;
 
