@@ -60,6 +60,7 @@ impl Args {
             turso_core::DatabaseOpts::new()
                 .with_index_method(true)
                 .with_encryption(true)
+                .with_triggers(true)
         };
 
         builder = quote! {

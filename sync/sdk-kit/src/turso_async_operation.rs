@@ -63,7 +63,10 @@ impl TursoDatabaseAsyncOperation {
             }
         });
         Self {
-            generator: Arc::new(Mutex::new(generator)),
+            generator: Arc::new(Mutex::new(OperationGen {
+                future: generator,
+                result: None,
+            })),
             response,
         }
     }
@@ -172,31 +175,65 @@ impl TursoDatabaseAsyncOperation {
     }
 }
 
-type OperationGen<F> = genawaiter::sync::Gen<
-    turso_sync_engine::types::SyncEngineIoResult,
-    turso_sync_engine::Result<()>,
-    F,
->;
+struct OperationGen<F: std::future::Future<Output = turso_sync_engine::Result<()>>> {
+    future: genawaiter::sync::Gen<
+        turso_sync_engine::types::SyncEngineIoResult,
+        turso_sync_engine::Result<()>,
+        F,
+    >,
+    result: Option<Result<TursoAsyncOperationStatus, rsapi::TursoError>>,
+}
 
 impl<F: std::future::Future<Output = turso_sync_engine::Result<()>>> TursoAsyncOperation
     for OperationGen<F>
 {
     fn resume(&mut self) -> Result<TursoAsyncOperationStatus, rsapi::TursoError> {
-        match self.resume_with(Ok(())) {
+        // make resume re-entrant even if operation finished
+        if let Some(result) = &self.result {
+            match result {
+                Ok(status) => {
+                    return Ok(TursoAsyncOperationStatus {
+                        status: status.status,
+                        result: None,
+                    })
+                }
+                Err(err) => return Err(err.clone()),
+            }
+        }
+        let result = self.future.resume_with(Ok(()));
+        match result {
             genawaiter::GeneratorState::Yielded(
                 turso_sync_engine::types::SyncEngineIoResult::IO,
-            ) => Ok(TursoAsyncOperationStatus {
-                status: rsapi::TursoStatusCode::Io,
-                result: None,
-            }),
-            genawaiter::GeneratorState::Complete(Ok(())) => Ok(TursoAsyncOperationStatus {
-                status: rsapi::TursoStatusCode::Done,
-                result: None,
-            }),
-            genawaiter::GeneratorState::Complete(Err(err)) => Err(rsapi::TursoError {
-                code: turso_sdk_kit::rsapi::TursoStatusCode::Error,
-                message: Some(format!("sync engine operation failed: {err}")),
-            }),
+            ) => {
+                tracing::debug!("TursoAsyncOperation::resume: result=IO");
+                Ok(TursoAsyncOperationStatus {
+                    status: rsapi::TursoStatusCode::Io,
+                    result: None,
+                })
+            }
+            genawaiter::GeneratorState::Complete(Ok(())) => {
+                tracing::debug!("TursoAsyncOperation::resume: result=Done");
+                self.result = Some(Ok(TursoAsyncOperationStatus {
+                    status: rsapi::TursoStatusCode::Done,
+                    result: None,
+                }));
+                Ok(TursoAsyncOperationStatus {
+                    status: rsapi::TursoStatusCode::Done,
+                    result: None,
+                })
+            }
+            genawaiter::GeneratorState::Complete(Err(err)) => {
+                tracing::debug!("TursoAsyncOperation::resume: result=Err({err})");
+                let message = Some(format!("sync engine operation failed: {err}"));
+                self.result = Some(Err(rsapi::TursoError {
+                    code: turso_sdk_kit::rsapi::TursoStatusCode::Error,
+                    message: message.clone(),
+                }));
+                Err(rsapi::TursoError {
+                    code: turso_sdk_kit::rsapi::TursoStatusCode::Error,
+                    message,
+                })
+            }
         }
     }
 }

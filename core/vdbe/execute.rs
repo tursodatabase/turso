@@ -22,6 +22,7 @@ use crate::types::{
 use crate::util::{
     normalize_ident, rewrite_column_references_if_needed, rewrite_fk_parent_cols_if_self_ref,
     rewrite_fk_parent_table_if_needed, rewrite_inline_col_fk_target_if_needed,
+    trim_ascii_whitespace,
 };
 use crate::vdbe::affinity::{apply_numeric_affinity, try_for_float, Affinity, ParsedNumber};
 use crate::vdbe::hash_table::{HashEntry, HashTable, HashTableConfig};
@@ -1506,6 +1507,7 @@ pub fn op_column(
                             let cursor = cursor_ref.as_btree_mut();
 
                             if cursor.get_null_flag() {
+                                tracing::trace!("op_column(null_flag)");
                                 state.registers[*dest] = Register::Value(Value::Null);
                                 break 'outer;
                             }
@@ -2338,7 +2340,10 @@ pub fn op_transaction_inner(
                             "nested stmt should not begin a new write transaction"
                         );
                         let begin_w_tx_res = pager.begin_write_tx();
-                        if let Err(LimboError::Busy) = begin_w_tx_res {
+                        if matches!(
+                            begin_w_tx_res,
+                            Err(LimboError::Busy | LimboError::BusySnapshot)
+                        ) {
                             // We failed to upgrade to write transaction so put the transaction into its original state.
                             // That is, if the transaction had not started, end the read transaction so that next time we
                             // start a new one.
@@ -2348,7 +2353,7 @@ pub fn op_transaction_inner(
                                 state.auto_txn_cleanup = TxnCleanup::None;
                             }
                             assert_eq!(conn.get_tx_state(), current_state);
-                            return Err(LimboError::Busy);
+                            return Err(begin_w_tx_res.unwrap_err());
                         }
                         if let IOResult::IO(io) = begin_w_tx_res? {
                             // set the transaction state to pending so we don't have to
@@ -7958,6 +7963,7 @@ pub fn op_parse_schema(
     let previous_auto_commit = conn.auto_commit.load(Ordering::SeqCst);
     conn.auto_commit.store(false, Ordering::SeqCst);
 
+    let enable_triggers = conn.experimental_triggers_enabled();
     let maybe_nested_stmt_err = if let Some(where_clause) = where_clause {
         let stmt = conn.prepare(format!("SELECT * FROM sqlite_schema WHERE {where_clause}"))?;
 
@@ -7971,6 +7977,7 @@ pub fn op_parse_schema(
                 &conn.syms.read(),
                 program.connection.get_mv_tx(),
                 existing_views,
+                enable_triggers,
             )
         })
     } else {
@@ -7986,6 +7993,7 @@ pub fn op_parse_schema(
                 &conn.syms.read(),
                 program.connection.get_mv_tx(),
                 existing_views,
+                enable_triggers,
             )
         })
     };
@@ -9736,7 +9744,7 @@ fn apply_affinity_char(target: &mut Register, affinity: Affinity) -> bool {
                 }
 
                 if let Value::Text(t) = value {
-                    let text = t.as_str().trim();
+                    let text = trim_ascii_whitespace(t.as_str());
 
                     // Handle hex numbers - they shouldn't be converted
                     if text.starts_with("0x") {
@@ -10276,5 +10284,63 @@ mod tests {
         let version_integer = 3046001;
         let expected = "3.46.1";
         assert_eq!(execute_turso_version(version_integer), expected);
+    }
+
+    #[test]
+    fn test_ascii_whitespace_is_trimmed() {
+        // Regular ASCII whitespace SHOULD be trimmed
+        let ascii_whitespace_cases = vec![
+            (" 12", 12i64),            // space
+            ("12 ", 12i64),            // trailing space
+            (" 12 ", 12i64),           // both sides
+            ("\t42\t", 42i64),         // tab
+            ("\n99\n", 99i64),         // newline
+            (" \t\n123\r\n ", 123i64), // mixed ASCII whitespace
+        ];
+
+        for (input, expected_int) in ascii_whitespace_cases {
+            let mut register = Register::Value(Value::Text(input.into()));
+            apply_affinity_char(&mut register, Affinity::Integer);
+
+            match register {
+                Register::Value(Value::Integer(i)) => {
+                    assert_eq!(
+                        i, expected_int,
+                        "String '{input}' should convert to {expected_int}, got {i}"
+                    );
+                }
+                other => {
+                    panic!("String '{input}' should be converted to integer {expected_int}, got {other:?}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_non_breaking_space_not_trimmed() {
+        let test_strings = vec![
+            ("12\u{00A0}", "text", 3),   // '12' + non-breaking space (3 chars, 4 bytes)
+            ("\u{00A0}12", "text", 3),   // non-breaking space + '12' (3 chars, 4 bytes)
+            ("12\u{00A0}34", "text", 5), // '12' + nbsp + '34' (5 chars, 6 bytes)
+        ];
+
+        for (input, _expected_type, expected_len) in test_strings {
+            let mut register = Register::Value(Value::Text(input.into()));
+            apply_affinity_char(&mut register, Affinity::Integer);
+
+            match register {
+                Register::Value(Value::Text(t)) => {
+                    assert_eq!(
+                        t.as_str().chars().count(),
+                        expected_len,
+                        "String '{input}' should have {expected_len} characters",
+                    );
+                }
+                Register::Value(Value::Integer(_)) => {
+                    panic!("String '{input}' should NOT be converted to integer");
+                }
+                other => panic!("Unexpected value type: {other:?}"),
+            }
+        }
     }
 }

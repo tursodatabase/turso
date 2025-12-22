@@ -267,6 +267,8 @@ impl Shadow for Create {
 
     fn shadow(&self, tables: &mut ShadowTablesMut) -> Self::Result {
         if !tables.iter().any(|t| t.name == self.table.name) {
+            // Record the operation BEFORE applying it to current_tables
+            tables.record_create_table(self.table.clone());
             tables.push(self.table.clone());
             Ok(vec![])
         } else {
@@ -281,6 +283,8 @@ impl Shadow for Create {
 impl Shadow for CreateIndex {
     type Result = Vec<Vec<SimValue>>;
     fn shadow(&self, env: &mut ShadowTablesMut) -> Vec<Vec<SimValue>> {
+        // Record the operation BEFORE applying it to current_tables
+        env.record_create_index(self.table_name.clone(), self.index.clone());
         env.iter_mut()
             .find(|t| t.name == self.table_name)
             .unwrap()
@@ -752,6 +756,9 @@ impl Shadow for DropIndex {
     type Result = anyhow::Result<Vec<Vec<SimValue>>>;
 
     fn shadow(&self, tables: &mut ShadowTablesMut<'_>) -> Self::Result {
+        // Record the operation BEFORE applying it to current_tables
+        tables.record_drop_index(self.table_name.clone(), self.index_name.clone());
+
         let table = tables
             .iter_mut()
             .find(|t| t.name == self.table_name)

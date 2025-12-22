@@ -3986,9 +3986,10 @@ mod ptrmap_tests {
     use crate::storage::buffer_pool::BufferPool;
     use crate::storage::database::DatabaseFile;
     use crate::storage::page_cache::PageCache;
-    use crate::storage::pager::Pager;
+    use crate::storage::pager::{default_page1, Pager};
     use crate::storage::sqlite3_ondisk::PageSize;
     use crate::storage::wal::{WalFile, WalFileShared};
+    use arc_swap::ArcSwapOption;
 
     pub fn run_until_done<T>(
         mut action: impl FnMut() -> Result<IOResult<T>>,
@@ -4026,6 +4027,8 @@ mod ptrmap_tests {
             buffer_pool.clone(),
         ));
 
+        // For new empty databases, init_page_1 must be Some(page) so allocate_page1() can be called
+        let init_page_1 = Arc::new(ArcSwapOption::new(Some(default_page1(None))));
         let pager = Pager::new(
             db_file,
             Some(wal),
@@ -4033,7 +4036,7 @@ mod ptrmap_tests {
             page_cache,
             buffer_pool,
             Arc::new(Mutex::new(())),
-            Default::default(),
+            init_page_1,
         )
         .unwrap();
         run_until_done(|| pager.allocate_page1(), &pager).unwrap();

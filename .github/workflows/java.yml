@@ -10,8 +10,14 @@ on:
     branches:
       - main
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
 env:
   working-directory: bindings/java
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_RETRY: 10
 
 jobs:
   test:
@@ -29,6 +35,18 @@ jobs:
       - name: Install Rust(stable)
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Setup mold linker
+        uses: rui314/setup-mold@v1
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust"
+          cache-on-failure: true
+
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
       - name: Set up JDK
         uses: useblacksmith/setup-java@v5
         with:
@@ -36,4 +54,7 @@ jobs:
           java-version: '8'
 
       - name: Run Java tests
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: "sccache"
         run: make test

@@ -120,6 +120,7 @@ pub struct DatabaseOpts {
     pub enable_encryption: bool,
     pub enable_index_method: bool,
     pub enable_autovacuum: bool,
+    pub enable_triggers: bool,
     enable_load_extension: bool,
 }
 
@@ -156,6 +157,11 @@ impl DatabaseOpts {
 
     pub fn with_autovacuum(mut self, enable: bool) -> Self {
         self.enable_autovacuum = enable;
+        self
+    }
+
+    pub fn with_triggers(mut self, enable: bool) -> Self {
+        self.enable_triggers = enable;
         self
     }
 }
@@ -507,13 +513,14 @@ impl Database {
         let syms = conn.syms.read();
         let pager = conn.pager.load();
 
+        let enable_triggers = db.opts.enable_triggers;
         db.with_schema_mut(|schema| {
             let header_schema_cookie = pager
                 .io
                 .block(|| pager.with_header(|header| header.schema_cookie.get()))?;
             schema.schema_version = header_schema_cookie;
             let result = schema
-                .make_from_btree(None, pager.clone(), &syms)
+                .make_from_btree(None, pager.clone(), &syms, enable_triggers)
                 .inspect_err(|_| pager.end_read_tx());
             match result {
                 Err(LimboError::ExtensionError(e)) => {
@@ -1031,6 +1038,10 @@ impl Database {
         self.opts.enable_strict
     }
 
+    pub fn experimental_triggers_enabled(&self) -> bool {
+        self.opts.enable_triggers
+    }
+
     /// check if database is currently in MVCC mode
     pub fn mvcc_enabled(&self) -> bool {
         self.mv_store.load().is_some()
@@ -1515,7 +1526,14 @@ impl Connection {
             self.get_mv_tx()
         };
         // TODO: This function below is synchronous, make it async
-        parse_schema_rows(stmt, &mut fresh, &self.syms.read(), mv_tx, existing_views)?;
+        parse_schema_rows(
+            stmt,
+            &mut fresh,
+            &self.syms.read(),
+            mv_tx,
+            existing_views,
+            self.experimental_triggers_enabled(),
+        )?;
         // Best-effort load stats if sqlite_stat1 is present and DB is initialized.
         refresh_analyze_stats(self);
 
@@ -2166,10 +2184,11 @@ impl Connection {
             .query("SELECT * FROM sqlite_schema")?
             .expect("query must be parsed to statement");
         let syms = self.syms.read();
+        let enable_triggers = self.experimental_triggers_enabled();
         self.with_schema_mut(|schema| {
             let existing_views = schema.incremental_views.clone();
             if let Err(LimboError::ExtensionError(e)) =
-                parse_schema_rows(rows, schema, &syms, None, existing_views)
+                parse_schema_rows(rows, schema, &syms, None, existing_views, enable_triggers)
             {
                 // this means that a vtab exists and we no longer have the module loaded. we print
                 // a warning to the user to load the module
@@ -2217,6 +2236,10 @@ impl Connection {
 
     pub fn experimental_strict_enabled(&self) -> bool {
         self.db.experimental_strict_enabled()
+    }
+
+    pub fn experimental_triggers_enabled(&self) -> bool {
+        self.db.experimental_triggers_enabled()
     }
 
     pub fn mvcc_enabled(&self) -> bool {

@@ -816,21 +816,22 @@ mod tests {
 
     #[test]
     fn test_page_cache_evict() {
+        // Note: page 1 is DatabaseHeader and is never evictable, so use page ids >= 2
         let mut cache = PageCache::new_with_spill(1, true);
-        let key1 = insert_page(&mut cache, 1);
         let key2 = insert_page(&mut cache, 2);
+        let key3 = insert_page(&mut cache, 3);
 
-        // With capacity=1, inserting key2 should evict key1
-        assert_eq!(cache.get(&key2).unwrap().unwrap().get().id, 2);
+        // With capacity=1, inserting key3 should evict key2
+        assert_eq!(cache.get(&key3).unwrap().unwrap().get().id, 3);
         assert!(
-            cache.get(&key1).unwrap().is_none(),
-            "key1 should be evicted"
+            cache.get(&key2).unwrap().is_none(),
+            "key2 should be evicted"
         );
 
-        // key2 should still be accessible
-        assert_eq!(cache.get(&key2).unwrap().unwrap().get().id, 2);
+        // key3 should still be accessible
+        assert_eq!(cache.get(&key3).unwrap().unwrap().get().id, 3);
         assert!(
-            cache.get(&key1).unwrap().is_none(),
+            cache.get(&key2).unwrap().is_none(),
             "capacity=1 should have evicted the older page"
         );
         cache.verify_cache_integrity();
@@ -840,31 +841,32 @@ mod tests {
     fn test_sieve_touch_non_tail_does_not_affect_immediate_eviction() {
         // SIEVE algorithm: touching a non-tail page marks it but doesn't move it.
         // The tail (if unmarked) will still be the first eviction candidate.
+        // Note: page 1 is DatabaseHeader and is never evictable, so use page ids >= 2
 
-        // Insert 1,2,3 -> order [3,2,1] with tail=1
+        // Insert 2,3,4 -> order [4,3,2] with tail=2
         let mut cache = PageCache::new_with_spill(3, true);
-        let key1 = insert_page(&mut cache, 1);
         let key2 = insert_page(&mut cache, 2);
         let key3 = insert_page(&mut cache, 3);
-
-        // Touch key2 (middle) to mark it with reference bit
-        assert!(cache.get(&key2).unwrap().is_some());
-
-        // Insert 4: SIEVE examines tail (key1, unmarked) -> evict key1
         let key4 = insert_page(&mut cache, 4);
 
+        // Touch key3 (middle) to mark it with reference bit
+        assert!(cache.get(&key3).unwrap().is_some());
+
+        // Insert 5: SIEVE examines tail (key2, unmarked) -> evict key2
+        let key5 = insert_page(&mut cache, 5);
+
         assert!(
-            cache.get(&key2).unwrap().is_some(),
-            "marked non-tail (key2) should remain"
+            cache.get(&key3).unwrap().is_some(),
+            "marked non-tail (key3) should remain"
         );
-        assert!(cache.get(&key3).unwrap().is_some(), "key3 should remain");
+        assert!(cache.get(&key4).unwrap().is_some(), "key4 should remain");
         assert!(
-            cache.get(&key4).unwrap().is_some(),
-            "key4 was just inserted"
+            cache.get(&key5).unwrap().is_some(),
+            "key5 was just inserted"
         );
         assert!(
-            cache.get(&key1).unwrap().is_none(),
-            "unmarked tail (key1) should be evicted first"
+            cache.get(&key2).unwrap().is_none(),
+            "unmarked tail (key2) should be evicted first"
         );
         cache.verify_cache_integrity();
     }
@@ -959,19 +961,20 @@ mod tests {
     #[test]
     fn test_page_cache_over_capacity() {
         // Test SIEVE eviction when exceeding capacity
+        // Note: page 1 is DatabaseHeader and is never evictable, so use page ids >= 2
         let mut cache = PageCache::new_with_spill(2, true);
-        let key1 = insert_page(&mut cache, 1);
         let key2 = insert_page(&mut cache, 2);
-
-        // Insert 3: tail (key1, unmarked) should be evicted
         let key3 = insert_page(&mut cache, 3);
 
+        // Insert 4: tail (key2, unmarked) should be evicted
+        let key4 = insert_page(&mut cache, 4);
+
         assert_eq!(cache.len(), 2);
-        assert!(cache.get(&key2).unwrap().is_some(), "key2 should remain");
-        assert!(cache.get(&key3).unwrap().is_some(), "key3 just inserted");
+        assert!(cache.get(&key3).unwrap().is_some(), "key3 should remain");
+        assert!(cache.get(&key4).unwrap().is_some(), "key4 just inserted");
         assert!(
-            cache.get(&key1).unwrap().is_none(),
-            "key1 (oldest, unmarked) should be evicted"
+            cache.get(&key2).unwrap().is_none(),
+            "key2 (oldest, unmarked) should be evicted"
         );
         cache.verify_cache_integrity();
     }
@@ -1215,24 +1218,25 @@ mod tests {
     #[test]
     fn test_peek_without_touch() {
         // Test that peek with touch=false doesn't mark pages
+        // Note: page 1 is DatabaseHeader and is never evictable, so use page ids >= 2
         let mut cache = PageCache::new_with_spill(2, true);
-        let key1 = insert_page(&mut cache, 1);
         let key2 = insert_page(&mut cache, 2);
-
-        // Peek key1 without touching (no ref bit set)
-        assert!(cache.peek(&key1, false).is_some());
-
-        // Insert 3: should evict unmarked tail (key1)
         let key3 = insert_page(&mut cache, 3);
 
-        assert!(cache.get(&key2).unwrap().is_some(), "key2 should remain");
+        // Peek key2 without touching (no ref bit set)
+        assert!(cache.peek(&key2, false).is_some());
+
+        // Insert 4: should evict unmarked tail (key2)
+        let key4 = insert_page(&mut cache, 4);
+
+        assert!(cache.get(&key3).unwrap().is_some(), "key3 should remain");
         assert!(
-            cache.get(&key3).unwrap().is_some(),
-            "key3 was just inserted"
+            cache.get(&key4).unwrap().is_some(),
+            "key4 was just inserted"
         );
         assert!(
-            cache.get(&key1).unwrap().is_none(),
-            "key1 should be evicted since peek(false) didn't mark it"
+            cache.get(&key2).unwrap().is_none(),
+            "key2 should be evicted since peek(false) didn't mark it"
         );
         assert_eq!(cache.len(), 2);
         cache.verify_cache_integrity();
@@ -1298,32 +1302,33 @@ mod tests {
 
     #[test]
     fn clock_drains_hot_page_within_single_sweep_when_others_are_unevictable() {
-        // capacity 3: [3(head), 2, 1(tail)]
+        // Note: page 1 is DatabaseHeader and is never evictable, so use page ids >= 2
+        // capacity 3: [4(head), 3, 2(tail)]
         let mut c = PageCache::new_with_spill(3, true);
-        let k1 = insert_page(&mut c, 1);
         let k2 = insert_page(&mut c, 2);
-        let _k3 = insert_page(&mut c, 3);
+        let k3 = insert_page(&mut c, 3);
+        let k4 = insert_page(&mut c, 4);
 
-        // Make k1 hot: bump to Max
+        // Make k2 hot: bump to Max
         for _ in 0..3 {
-            assert!(c.get(&k1).unwrap().is_some());
+            assert!(c.get(&k2).unwrap().is_some());
         }
-        assert!(matches!(c.ref_of(&k1), Some(REF_MAX)));
+        assert!(matches!(c.ref_of(&k2), Some(REF_MAX)));
 
-        // Make other pages unevictable; clock must keep revisiting k1.
-        c.get(&k2).unwrap().unwrap().set_dirty();
-        c.get(&_k3).unwrap().unwrap().set_dirty();
+        // Make other pages unevictable; clock must keep revisiting k2.
+        c.get(&k3).unwrap().unwrap().set_dirty();
+        c.get(&k4).unwrap().unwrap().set_dirty();
 
-        // Insert 4 -> sweep rotates as needed, draining k1 and evicting it.
-        let _k4 = insert_page(&mut c, 4);
+        // Insert 5 -> sweep rotates as needed, draining k2 and evicting it.
+        let k5 = insert_page(&mut c, 5);
 
         assert!(
-            c.get(&k1).unwrap().is_none(),
-            "k1 should be evicted after its credit drains"
+            c.get(&k2).unwrap().is_none(),
+            "k2 should be evicted after its credit drains"
         );
-        assert!(c.get(&k2).unwrap().is_some(), "k2 is dirty (unevictable)");
-        assert!(c.get(&_k3).unwrap().is_some(), "k3 is dirty (unevictable)");
-        assert!(c.get(&_k4).unwrap().is_some(), "k4 just inserted");
+        assert!(c.get(&k3).unwrap().is_some(), "k3 is dirty (unevictable)");
+        assert!(c.get(&k4).unwrap().is_some(), "k4 is dirty (unevictable)");
+        assert!(c.get(&k5).unwrap().is_some(), "k5 just inserted");
         c.verify_cache_integrity();
     }
 
@@ -1488,15 +1493,16 @@ mod tests {
 
     #[test]
     fn test_hand_advances_on_eviction() {
+        // Note: page 1 is DatabaseHeader and is never evictable, so use page ids >= 2
         let mut cache = PageCache::new_with_spill(2, true);
-        let _key1 = insert_page(&mut cache, 1);
         let _key2 = insert_page(&mut cache, 2);
+        let _key3 = insert_page(&mut cache, 3);
 
         // Note initial hand position
         let initial_hand = cache.clock_hand;
 
         // Force eviction
-        let _key3 = insert_page(&mut cache, 3);
+        let _key4 = insert_page(&mut cache, 4);
 
         // Hand should exist (not null)
         let new_hand = cache.clock_hand;

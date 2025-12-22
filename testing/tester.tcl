@@ -42,10 +42,28 @@ proc evaluate_sql {sqlite_exec db_name sql} {
     foreach name [array names extensions] {
         append load_commands ".load $extensions($name)\n"
     }
-    set statements "${load_commands}${sql}"
+
+    set mvcc_journal_mode ""
+    if {[is_turso_mvcc]} {
+        append mvcc_journal_mode "PRAGMA journal_mode=experimental_mvcc;\n"
+    }
+
+    set statements "${mvcc_journal_mode}${load_commands}${sql}"
 
     set command [list $sqlite_exec $db_name]
     set output [exec echo $statements | {*}$command]
+
+    if {[is_turso_mvcc]} {
+        # PRAGMA journal_mode=experimental_mvcc returns a single line result
+        # at the top; drop that first line from the output.
+        set lines [split $output "\n"]
+        if {[llength $lines] > 0} {
+            # Remove the first line and rejoin the rest
+            set lines [lrange $lines 1 end]
+            set output [join $lines "\n"]
+        }
+    }
+
     return $output
 }
 

@@ -3,8 +3,6 @@
 set testdir [file dirname $argv0]
 
 # failing:
-source $testdir/insert.test
-# source $testdir/join.test
 # source $testdir/pragma.test
 # source $testdir/select.test
 # source $testdir/changes.test
@@ -27,6 +25,8 @@ source $testdir/insert.test
 # source $testdir/offset.test
 
 # works
+source $testdir/join.test
+source $testdir/insert.test
 source $testdir/glob.test
 source $testdir/autoincr.test
 source $testdir/cmdlineshell.test

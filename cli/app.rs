@@ -84,6 +84,8 @@ pub struct Opts {
     pub experimental_index_method: bool,
     #[clap(long, help = "Enable experimental autovacuum feature")]
     pub experimental_autovacuum: bool,
+    #[clap(long, help = "Enable experimental triggers feature")]
+    pub experimental_triggers: bool,
 }
 
 const PROMPT: &str = "turso> ";
@@ -193,7 +195,8 @@ impl Limbo {
                     .with_views(opts.experimental_views)
                     .with_strict(opts.experimental_strict)
                     .with_encryption(opts.experimental_encryption)
-                    .with_index_method(opts.experimental_index_method),
+                    .with_index_method(opts.experimental_index_method)
+                    .with_triggers(opts.experimental_triggers),
             )?
         } else {
             let flags = if opts.readonly {
@@ -211,6 +214,7 @@ impl Limbo {
                     .with_encryption(opts.experimental_encryption)
                     .with_index_method(opts.experimental_index_method)
                     .with_autovacuum(opts.experimental_autovacuum)
+                    .with_triggers(opts.experimental_triggers)
                     .turso_cli(),
                 None,
             )?;

@@ -586,9 +586,12 @@ async fn multiple_connections_fuzz(opts: FuzzOptions) {
             rng.random_range(2.min(opts.max_num_connections)..=opts.max_num_connections);
         println!("--- Seed {seed} Iteration {iteration} ---");
         println!("Options: {opts:?}");
-        // Create a fresh database for each iteration
-        let tempfile = tempfile::NamedTempFile::new().unwrap();
-        let db = Builder::new_local(tempfile.path().to_str().unwrap())
+        // Create a fresh database for each iteration. Use TempDir instead of
+        // NamedTempFile because MVCC creates a separate .db-log file that wouldn't
+        // be cleaned up otherwise, causing "MVCC log exists but DB is WAL mode" errors.
+        let tempdir = tempfile::TempDir::new().unwrap();
+        let db_path = tempdir.path().join("test.db");
+        let db = Builder::new_local(db_path.to_str().unwrap())
             .build()
             .await
             .unwrap();
@@ -643,6 +646,7 @@ async fn multiple_connections_fuzz(opts: FuzzOptions) {
             let e_string = e.to_string();
             e_string.contains("is locked")
                 || e_string.contains("busy")
+                || e_string.contains("snapshot is stale")
                 || e_string.contains("Write-write conflict")
                 || e_string.contains("schema changed")
                 || e_string.contains("has no column named")
