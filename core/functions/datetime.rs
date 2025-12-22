@@ -448,7 +448,7 @@ where
     match values.next() {
         None => {
             let now = parse_naive_date_time(Value::build_text("now")).unwrap();
-            return Value::Integer(get_unixepoch_from_naive_datetime(now));
+            Value::Integer(get_unixepoch_from_naive_datetime(now))
         }
         Some(first) => {
             let apply_res = if let Some(dt) = parse_naive_date_time(first) {
