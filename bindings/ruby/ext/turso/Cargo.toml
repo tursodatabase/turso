@@ -1,20 +1,25 @@
 [package]
 name = "turso-ruby"
-version = "0.1.0"
-edition = "2021"
-license = "MIT"
+version.workspace = true
+authors.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
 publish = false
 
 [lib]
 name = "turso"
 crate-type = ["cdylib"]
 
+[features]
+extension-module = ["dep:magnus"]
+
 [dependencies]
-magnus = { version = "0.8.2", features = ["rb-sys"] }
-turso_sdk_kit = { path = "../../../../sdk-kit" }
-turso_core = { path = "../../../../core" }
+magnus = { version = "0.8.2", features = ["rb-sys"], optional = true }
+turso_sdk_kit = { workspace = true }
+turso_core = { workspace = true }
 once_cell = "1.21.3"
-tracing = "0.1.44"
+tracing.workspace = true
 
 [build-dependencies]
 rb-sys-env = "0.2.2"

@@ -10,6 +10,7 @@ members = [
     "bindings/python",
     "bindings/dotnet",
     "bindings/rust",
+    "bindings/ruby/ext/turso",
     "cli",
     "core",
     "extensions/completion",
@@ -38,7 +39,7 @@ members = [
     "sdk-kit",
     "sdk-kit-macros",
 ]
-exclude = ["perf/latency/limbo", "bindings/ruby/ext/turso"]
+exclude = ["perf/latency/limbo"]
 
 [workspace.package]
 version = "0.4.0-pre.18"
