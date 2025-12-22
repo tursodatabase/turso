@@ -108,14 +108,12 @@ impl Statement {
         self.program.connection.mv_store()
     }
 
-    fn _step(&mut self, waker: Option<&Waker>) -> Result<StepResult> {
+    fn _step(&mut self, waker: &Waker) -> Result<StepResult> {
         // If we're waiting for a busy handler timeout, check if we can proceed
         if let Some(busy_state) = self.busy_handler_state.as_ref() {
             if self.pager.io.now() < busy_state.timeout() {
                 // Yield the query as the timeout has not been reached yet
-                if let Some(waker) = waker {
-                    waker.wake_by_ref();
-                }
+                waker.wake_by_ref();
                 return Ok(StepResult::IO);
             }
         }
@@ -172,9 +170,7 @@ impl Statement {
             // Invoke the busy handler to determine if we should retry
             if busy_state.invoke(&handler, now) {
                 // Handler says retry, yield with IO to wait for timeout
-                if let Some(waker) = waker {
-                    waker.wake_by_ref();
-                }
+                waker.wake_by_ref();
                 res = Ok(StepResult::IO);
             }
             // else: Handler says stop, res stays as Busy
@@ -184,11 +180,11 @@ impl Statement {
     }
 
     pub fn step(&mut self) -> Result<StepResult> {
-        self._step(None)
+        self._step(Waker::noop())
     }
 
     pub fn step_with_waker(&mut self, waker: &Waker) -> Result<StepResult> {
-        self._step(Some(waker))
+        self._step(waker)
     }
 
     pub fn run_ignore_rows(&mut self) -> Result<()> {
