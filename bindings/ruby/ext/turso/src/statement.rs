@@ -70,7 +70,7 @@ impl RbStatement {
         rb_self.ensure_open()?;
         let mut stmt = rb_self.inner.borrow_mut();
         loop {
-            match stmt.step().map_err(map_turso_error)? {
+            match stmt.step(None).map_err(map_turso_error)? {
                 TursoStatusCode::Row => return Ok(ruby.sym_new("row").as_value()),
                 TursoStatusCode::Done => return Ok(ruby.sym_new("done").as_value()),
                 TursoStatusCode::Io => {
@@ -111,7 +111,7 @@ impl RbStatement {
         if self.finalized.swap(true, Ordering::Relaxed) {
             return Ok(());
         }
-        self.inner.borrow_mut().finalize().map_err(map_turso_error)?;
+        self.inner.borrow_mut().finalize(None).map_err(map_turso_error)?;
         Ok(())
     }
 
@@ -128,7 +128,7 @@ impl RbStatement {
 impl Drop for RbStatement {
     fn drop(&mut self) {
         if !self.finalized.load(Ordering::Relaxed) {
-            let _ = self.inner.borrow_mut().finalize();
+            let _ = self.inner.borrow_mut().finalize(None);
         }
     }
 }
