@@ -420,13 +420,11 @@ fn to_julian_day_exact(dt: &NaiveDateTime) -> f64 {
     i_jd as f64 / 86400000.0
 }
 
-pub fn exec_unixepoch(time_value: &Value) -> Result<Value> {
+pub fn exec_unixepoch(time_value: &Value) -> Value {
     let dt = parse_naive_date_time(time_value);
     match dt {
-        Some(dt) if !is_leap_second(&dt) => {
-            Ok(Value::Integer(get_unixepoch_from_naive_datetime(dt)))
-        }
-        _ => Ok(Value::Null),
+        Some(dt) if !is_leap_second(&dt) => Value::Integer(get_unixepoch_from_naive_datetime(dt)),
+        _ => Value::Null,
     }
 }
 
