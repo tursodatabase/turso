@@ -8,7 +8,9 @@ use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
 use crate::schema::{IndexColumn, ROWID_SENTINEL};
 use crate::translate::emitter::UpdateRowSource;
 use crate::translate::expr::{walk_expr, WalkControl};
-use crate::translate::fkeys::{emit_fk_child_update_counters, emit_parent_key_change_checks};
+use crate::translate::fkeys::{
+    emit_fk_child_update_counters, emit_parent_key_change_checks, fire_fk_update_actions,
+};
 use crate::translate::insert::{format_unique_violation_desc, InsertEmitCtx};
 use crate::translate::planner::ROWID_STRS;
 use crate::translate::trigger_exec::{
@@ -913,6 +915,25 @@ pub fn emit_upsert(
             flag: InsertFlags::new(),
             table_name: table.get_name().to_string(),
         });
+    }
+
+    // Fire FK actions (CASCADE, SET NULL, SET DEFAULT) for parent-side updates.
+    // This must be done after the update is complete but before AFTER triggers.
+    if let Some(bt) = table.btree() {
+        if connection.foreign_keys_enabled()
+            && resolver.schema.any_resolved_fks_referencing(bt.name.as_str())
+        {
+            fire_fk_update_actions(
+                program,
+                resolver,
+                bt.name.as_str(),
+                ctx.conflict_rowid_reg, // old_rowid_reg
+                current_start,          // old_values_start
+                new_start,              // new_values_start
+                new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg), // new_rowid_reg
+                connection,
+            )?;
+        }
     }
 
     // emit CDC instructions

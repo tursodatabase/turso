@@ -1123,20 +1123,21 @@ impl Schema {
                     parent_pos.push(p);
                 }
 
-                // Determine if parent key is ROWID/alias
-                let parent_uses_rowid = parent_tbl.primary_key_columns.len().eq(&1) && {
-                    if parent_tbl.primary_key_columns.len() == 1 {
-                        let pk_name = &parent_tbl.primary_key_columns[0].0;
-                        // rowid or alias INTEGER PRIMARY KEY; either is ok implicitly
-                        parent_tbl.columns.iter().any(|c| {
+                // Determine if the FK's parent key is the ROWID or a rowid alias.
+                // This checks if the FK's parent_cols refer to the rowid or a rowid alias,
+                // NOT just if the table has a rowid-alias PK.
+                let parent_uses_rowid = if parent_cols.len() == 1 {
+                    let pc = &parent_cols[0];
+                    // Check if the column is the rowid or a rowid alias
+                    ROWID_STRS.iter().any(|&r| r.eq_ignore_ascii_case(pc))
+                        || parent_tbl.columns.iter().any(|c| {
                             c.is_rowid_alias()
                                 && c.name
                                     .as_deref()
-                                    .is_some_and(|n| n.eq_ignore_ascii_case(pk_name))
-                        }) || ROWID_STRS.iter().any(|&r| r.eq_ignore_ascii_case(pk_name))
-                    } else {
-                        false
-                    }
+                                    .is_some_and(|n| n.eq_ignore_ascii_case(pc))
+                        })
+                } else {
+                    false
                 };
 
                 // If not rowid, there must be a non-partial UNIQUE exactly on parent_cols

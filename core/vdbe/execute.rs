@@ -2631,10 +2631,14 @@ pub fn op_integer(
 
 pub enum OpProgramState {
     Start,
-    Step,
+    /// Step state tracks whether we're executing a trigger subprogram (vs FK action subprogram)
+    Step {
+        is_trigger: bool,
+    },
 }
 
-/// Execute a trigger subprogram (Program opcode).
+/// Execute a subprogram (Program opcode).
+/// Used for both triggers and FK actions (CASCADE, SET NULL, etc.)
 pub fn op_program(
     program: &Program,
     state: &mut ProgramState,
@@ -2653,10 +2657,14 @@ pub fn op_program(
             OpProgramState::Start => {
                 let mut statement = subprogram.write();
                 statement.reset();
-                let Some(ref trigger) = statement.get_trigger() else {
-                    crate::bail_parse_error!("trigger subprogram has no trigger");
+
+                // Check if this is a trigger subprogram - if so, track execution
+                let is_trigger = if let Some(ref trigger) = statement.get_trigger() {
+                    program.connection.start_trigger_execution(trigger.clone());
+                    true
+                } else {
+                    false
                 };
-                program.connection.start_trigger_execution(trigger.clone());
 
                 // Extract register values from params (which contain register indices encoded as negative integers)
                 // and bind them to the subprogram's parameters
@@ -2677,15 +2685,16 @@ pub fn op_program(
                         }
                     } else {
                         crate::bail_parse_error!(
-                            "Trigger parameters should be integers, got {:?}",
+                            "Subprogram parameters should be integers, got {:?}",
                             param_value
                         );
                     }
                 }
 
-                state.op_program_state = OpProgramState::Step;
+                state.op_program_state = OpProgramState::Step { is_trigger };
             }
-            OpProgramState::Step => {
+            OpProgramState::Step { is_trigger } => {
+                let is_trigger = *is_trigger;
                 loop {
                     let mut statement = subprogram.write();
                     let res = statement.step();
@@ -2713,7 +2722,11 @@ pub fn op_program(
                         }
                     }
                 }
-                program.connection.end_trigger_execution();
+
+                // Only end trigger execution if this was a trigger subprogram
+                if is_trigger {
+                    program.connection.end_trigger_execution();
+                }
 
                 state.op_program_state = OpProgramState::Start;
                 state.pc += 1;
