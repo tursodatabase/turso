@@ -1238,3 +1238,178 @@ do_execsql_test_on_specific_db {:memory:} fk-no-val-on-parent {
   INSERT INTO t2(a, b) VALUES (5, 10);
   SELECT * FROM t2;
  }
+
+# Basic ON DELETE CASCADE - single child row
+do_execsql_test_on_specific_db {:memory:} fk-cascade-delete-basic {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, pid REFERENCES parent(id) ON DELETE CASCADE);
+    INSERT INTO parent VALUES(1),(2);
+    INSERT INTO child VALUES(10,1),(11,1),(12,2);
+    DELETE FROM parent WHERE id=1;
+    SELECT id, pid FROM child ORDER BY id;
+} {12|2}
+
+# ON DELETE CASCADE - delete parent with no children
+do_execsql_test_on_specific_db {:memory:} fk-cascade-delete-no-children {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, pid REFERENCES parent(id) ON DELETE CASCADE);
+    INSERT INTO parent VALUES(1),(2);
+    INSERT INTO child VALUES(10,1);
+    DELETE FROM parent WHERE id=2;
+    SELECT id, pid FROM child ORDER BY id;
+} {10|1}
+
+# ON DELETE CASCADE - composite key
+do_execsql_test_on_specific_db {:memory:} fk-cascade-delete-composite {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(a INT, b INT, PRIMARY KEY(a,b));
+    CREATE TABLE c(id INTEGER PRIMARY KEY, x INT, y INT,
+                   FOREIGN KEY(x,y) REFERENCES p(a,b) ON DELETE CASCADE);
+    INSERT INTO p VALUES(1,2),(3,4);
+    INSERT INTO c VALUES(1,1,2),(2,3,4);
+    DELETE FROM p WHERE a=1 AND b=2;
+    SELECT id, x, y FROM c ORDER BY id;
+} {2|3|4}
+
+# ON DELETE CASCADE - child with NULL FK value should not be deleted
+do_execsql_test_on_specific_db {:memory:} fk-cascade-delete-null-child {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, pid REFERENCES parent(id) ON DELETE CASCADE);
+    INSERT INTO parent VALUES(1);
+    INSERT INTO child VALUES(10,1),(11,NULL);
+    DELETE FROM parent WHERE id=1;
+    SELECT id, pid FROM child ORDER BY id;
+} {11|}
+
+# ON DELETE CASCADE - recursive cascade (A->B->C)
+do_execsql_test_on_specific_db {:memory:} fk-cascade-delete-recursive {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE a(id INTEGER PRIMARY KEY);
+    CREATE TABLE b(id INTEGER PRIMARY KEY, aid REFERENCES a(id) ON DELETE CASCADE);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, bid REFERENCES b(id) ON DELETE CASCADE);
+    INSERT INTO a VALUES(1);
+    INSERT INTO b VALUES(10,1);
+    INSERT INTO c VALUES(100,10);
+    DELETE FROM a WHERE id=1;
+    SELECT count(*) FROM b;
+} {0}
+
+do_execsql_test_on_specific_db {:memory:} fk-cascade-delete-recursive-check-c {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE a(id INTEGER PRIMARY KEY);
+    CREATE TABLE b(id INTEGER PRIMARY KEY, aid REFERENCES a(id) ON DELETE CASCADE);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, bid REFERENCES b(id) ON DELETE CASCADE);
+    INSERT INTO a VALUES(1);
+    INSERT INTO b VALUES(10,1);
+    INSERT INTO c VALUES(100,10);
+    DELETE FROM a WHERE id=1;
+    SELECT count(*) FROM c;
+} {0}
+
+# Basic ON UPDATE CASCADE - single child row
+do_execsql_test_on_specific_db {:memory:} fk-cascade-update-basic {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, pid REFERENCES parent(id) ON UPDATE CASCADE);
+    INSERT INTO parent VALUES(1);
+    INSERT INTO child VALUES(10,1);
+    UPDATE parent SET id=100 WHERE id=1;
+    SELECT id, pid FROM child ORDER BY id;
+} {10|100}
+
+# ON UPDATE CASCADE - multiple children
+do_execsql_test_on_specific_db {:memory:} fk-cascade-update-multi-children {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid REFERENCES p(id) ON UPDATE CASCADE);
+    INSERT INTO p VALUES(1);
+    INSERT INTO c VALUES(10,1),(11,1),(12,1);
+    UPDATE p SET id=99 WHERE id=1;
+    SELECT id, pid FROM c ORDER BY id;
+} {10|99
+11|99
+12|99}
+
+# ON UPDATE CASCADE - composite key
+do_execsql_test_on_specific_db {:memory:} fk-cascade-update-composite {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(a INT, b INT, PRIMARY KEY(a,b));
+    CREATE TABLE c(id INTEGER PRIMARY KEY, x INT, y INT,
+                   FOREIGN KEY(x,y) REFERENCES p(a,b) ON UPDATE CASCADE);
+    INSERT INTO p VALUES(1,2);
+    INSERT INTO c VALUES(1,1,2);
+    UPDATE p SET a=10, b=20 WHERE a=1 AND b=2;
+    SELECT id, x, y FROM c;
+} {1|10|20}
+
+# Basic ON DELETE SET NULL
+do_execsql_test_on_specific_db {:memory:} fk-setnull-delete-basic {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid REFERENCES p(id) ON DELETE SET NULL);
+    INSERT INTO p VALUES(1);
+    INSERT INTO c VALUES(10,1);
+    DELETE FROM p WHERE id=1;
+    SELECT id, pid FROM c;
+} {10|}
+
+# ON DELETE SET NULL - multiple children
+do_execsql_test_on_specific_db {:memory:} fk-setnull-delete-multi-children {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid REFERENCES p(id) ON DELETE SET NULL);
+    INSERT INTO p VALUES(1),(2);
+    INSERT INTO c VALUES(10,1),(11,1),(12,2);
+    DELETE FROM p WHERE id=1;
+    SELECT id, pid FROM c ORDER BY id;
+} {10|
+11|
+12|2}
+
+# ON DELETE SET NULL - composite key
+do_execsql_test_on_specific_db {:memory:} fk-setnull-delete-composite {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(a INT, b INT, PRIMARY KEY(a,b));
+    CREATE TABLE c(id INTEGER PRIMARY KEY, x INT, y INT,
+                   FOREIGN KEY(x,y) REFERENCES p(a,b) ON DELETE SET NULL);
+    INSERT INTO p VALUES(1,2);
+    INSERT INTO c VALUES(1,1,2);
+    DELETE FROM p WHERE a=1 AND b=2;
+    SELECT id, x, y FROM c;
+} {1||}
+
+# Basic ON UPDATE SET NULL
+do_execsql_test_on_specific_db {:memory:} fk-setnull-update-basic {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid REFERENCES p(id) ON UPDATE SET NULL);
+    INSERT INTO p VALUES(1);
+    INSERT INTO c VALUES(10,1);
+    UPDATE p SET id=100 WHERE id=1;
+    SELECT id, pid FROM c;
+} {10|}
+
+# ON DELETE CASCADE with ON UPDATE NO ACTION
+do_execsql_test_on_specific_db {:memory:} fk-cascade-delete-noaction-update {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid REFERENCES p(id) ON DELETE CASCADE ON UPDATE NO ACTION);
+    INSERT INTO p VALUES(1),(2);
+    INSERT INTO c VALUES(10,1),(11,2);
+    DELETE FROM p WHERE id=1;
+    SELECT id, pid FROM c ORDER BY id;
+} {11|2}
+
+# ON DELETE NO ACTION with ON UPDATE CASCADE
+do_execsql_test_on_specific_db {:memory:} fk-noaction-delete-cascade-update {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid REFERENCES p(id) ON DELETE NO ACTION ON UPDATE CASCADE);
+    INSERT INTO p VALUES(1);
+    INSERT INTO c VALUES(10,1);
+    UPDATE p SET id=100 WHERE id=1;
+    SELECT id, pid FROM c;
+} {10|100}
