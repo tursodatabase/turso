@@ -947,7 +947,7 @@ mod tests {
                 );
             }
         }
-        println!("{:?}", errors);
+        println!("{errors:?}");
         assert!(
             !errors.is_empty(),
             "misuse errors should be very likely with the test setup: {errors:?}"
