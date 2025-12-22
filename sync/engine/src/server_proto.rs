@@ -63,6 +63,7 @@ pub struct PageSetZstdEncodingProto {
 pub struct PullUpdatesRespProtoBody {
     #[prost(string, tag = "1")]
     pub server_revision: String,
+    // db size in pages (e.g. for 4kb db file db_size equals to 1)
     #[prost(uint64, tag = "2")]
     pub db_size: u64,
     #[prost(optional, message, tag = "3")]

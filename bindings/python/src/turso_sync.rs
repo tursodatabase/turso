@@ -261,65 +261,68 @@ pub struct PyTursoAsyncOperationResult {
 #[pymethods]
 impl PyTursoAsyncOperation {
     /// Resume async operation execution
-    /// If returns Ok(None) - operation is not finished yet and must be resumed after one iteration of sync engine IO
-    /// If returns Ok(Some(...)) - operation is finished and result must be processed accordingly
-    pub fn resume(&self, py: Python) -> PyResult<Option<PyTursoAsyncOperationResult>> {
+    /// If returns Ok(false) - operation is not finished yet and must be resumed after one iteration of sync engine IO
+    /// If returns Ok(true) - operation is finished and final result can be inspected with [Self::take_result] method
+    /// It's safe to call resume multiple times even after operation completion (in case of repeat calls after completion - final result always will be returned)
+    pub fn resume(&self) -> PyResult<bool> {
         let result = self.operation.resume().map_err(turso_error_to_py_err)?;
         if result == TursoStatusCode::Io {
-            Ok(None)
+            Ok(false)
         } else if result == TursoStatusCode::Done {
-            let result = self.operation.take_result();
-            match result {
-                Ok(TursoAsyncOperationResult::Changes { changes }) => {
-                    Ok(Some(PyTursoAsyncOperationResult {
-                        kind: PyTursoAsyncOperationResultKind::Changes,
-                        changes: Some(pyo3::Py::new(
-                            py,
-                            PyTursoSyncDatabaseChanges {
-                                changes: Some(changes),
-                            },
-                        )?),
-                        connection: None,
-                        stats: None,
-                    }))
-                }
-                Ok(TursoAsyncOperationResult::Connection { connection }) => {
-                    Ok(Some(PyTursoAsyncOperationResult {
-                        kind: PyTursoAsyncOperationResultKind::Connection,
-                        changes: None,
-                        connection: Some(pyo3::Py::new(py, PyTursoConnection { connection })?),
-                        stats: None,
-                    }))
-                }
-                Ok(TursoAsyncOperationResult::Stats { stats }) => {
-                    Ok(Some(PyTursoAsyncOperationResult {
-                        kind: PyTursoAsyncOperationResultKind::Stats,
-                        changes: None,
-                        connection: None,
-                        stats: Some(pyo3::Py::new(
-                            py,
-                            PyTursoSyncDatabaseStats {
-                                cdc_operations: stats.cdc_operations,
-                                main_wal_size: stats.main_wal_size,
-                                revert_wal_size: stats.revert_wal_size as i64,
-                                last_pull_unix_time: stats.last_pull_unix_time,
-                                last_push_unix_time: stats.last_push_unix_time,
-                                revision: stats.revision,
-                                network_sent_bytes: stats.network_sent_bytes as i64,
-                                network_received_bytes: stats.network_received_bytes as i64,
-                            },
-                        )?),
-                    }))
-                }
-                Err(..) => Ok(Some(PyTursoAsyncOperationResult {
-                    kind: PyTursoAsyncOperationResultKind::No,
-                    changes: None,
-                    connection: None,
-                    stats: None,
-                })),
-            }
+            Ok(true)
         } else {
             Err(Error::new_err("unexpected resume status".to_string()))
+        }
+    }
+    /// Extract final result after operation completion
+    /// This function can be called at most once as final result will be consumed after first call
+    pub fn take_result(&self, py: Python) -> PyResult<PyTursoAsyncOperationResult> {
+        let result = self.operation.take_result();
+        match result {
+            Ok(TursoAsyncOperationResult::Changes { changes }) => Ok(PyTursoAsyncOperationResult {
+                kind: PyTursoAsyncOperationResultKind::Changes,
+                changes: Some(pyo3::Py::new(
+                    py,
+                    PyTursoSyncDatabaseChanges {
+                        changes: Some(changes),
+                    },
+                )?),
+                connection: None,
+                stats: None,
+            }),
+            Ok(TursoAsyncOperationResult::Connection { connection }) => {
+                Ok(PyTursoAsyncOperationResult {
+                    kind: PyTursoAsyncOperationResultKind::Connection,
+                    changes: None,
+                    connection: Some(pyo3::Py::new(py, PyTursoConnection { connection })?),
+                    stats: None,
+                })
+            }
+            Ok(TursoAsyncOperationResult::Stats { stats }) => Ok(PyTursoAsyncOperationResult {
+                kind: PyTursoAsyncOperationResultKind::Stats,
+                changes: None,
+                connection: None,
+                stats: Some(pyo3::Py::new(
+                    py,
+                    PyTursoSyncDatabaseStats {
+                        cdc_operations: stats.cdc_operations,
+                        main_wal_size: stats.main_wal_size,
+                        revert_wal_size: stats.revert_wal_size as i64,
+                        last_pull_unix_time: stats.last_pull_unix_time,
+                        last_push_unix_time: stats.last_push_unix_time,
+                        revision: stats.revision,
+                        network_sent_bytes: stats.network_sent_bytes as i64,
+                        network_received_bytes: stats.network_received_bytes as i64,
+                    },
+                )?),
+            }),
+            // The only possible error is Misuse in case when operation doesn't have any result
+            Err(..) => Ok(PyTursoAsyncOperationResult {
+                kind: PyTursoAsyncOperationResultKind::No,
+                changes: None,
+                connection: None,
+                stats: None,
+            }),
         }
     }
 }

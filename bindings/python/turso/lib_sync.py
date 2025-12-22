@@ -23,6 +23,7 @@ from ._turso import (
     py_turso_sync_new,
 )
 from .lib import Connection as _Connection
+from .lib import _map_turso_exception
 
 # Constants
 _HTTP_CHUNK_SIZE = 64 * 1024  # 64 KiB
@@ -317,12 +318,16 @@ def _run_op(
       - Stats: returns PyTursoSyncDatabaseStats
     """
     while True:
-        res = op.resume()
-        if res is None:
+        try:
+            finished = op.resume()
+        except Exception as exc:  # noqa: BLE001
+            raise _map_turso_exception(exc)
+        if not finished:
             # Needs IO
             _drain_sync_io(sync, ctx, current_op=op)
             continue
         # Finished
+        res = op.take_result()
         if res.kind == PyTursoAsyncOperationResultKind.No:
             return None
         if res.kind == PyTursoAsyncOperationResultKind.Connection and res.connection is not None:
