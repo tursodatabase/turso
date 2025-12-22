@@ -2,6 +2,7 @@ use std::{
     borrow::Cow,
     fmt::Display,
     sync::{Arc, Mutex, Once, RwLock},
+    task::Waker,
 };
 
 use tracing::level_filters::LevelFilter;
@@ -290,7 +291,7 @@ impl TursoStatusCode {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TursoError {
     pub code: TursoStatusCode,
     pub message: Option<String>,
@@ -496,6 +497,7 @@ impl TursoDatabase {
                     "index_method" => opts.with_index_method(true),
                     "strict" => opts.with_strict(true),
                     "autovacuum" => opts.with_autovacuum(true),
+                    "triggers" => opts.with_triggers(true),
                     _ => opts,
                 };
             }
@@ -667,7 +669,7 @@ pub struct TursoStatement {
     statement: Statement,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TursoExecutionResult {
     pub status: TursoStatusCode,
     pub rows_changed: u64,
@@ -729,16 +731,21 @@ impl TursoStatement {
     /// method returns [TursoStatusCode::Done] if execution is finished
     /// method returns [TursoStatusCode::Row] if execution generated a row
     /// method returns [TursoStatusCode::Io] if async_io was set and execution needs IO in order to make progress
-    pub fn step(&mut self) -> Result<TursoStatusCode, TursoError> {
+    pub fn step(&mut self, waker: Option<&Waker>) -> Result<TursoStatusCode, TursoError> {
         let guard = self.concurrent_guard.clone();
         let _guard = guard.try_use()?;
-        self.step_no_guard()
+        self.step_no_guard(waker)
     }
 
-    fn step_no_guard(&mut self) -> Result<TursoStatusCode, TursoError> {
+    fn step_no_guard(&mut self, waker: Option<&Waker>) -> Result<TursoStatusCode, TursoError> {
         let async_io = self.async_io;
         loop {
-            return match self.statement.step() {
+            let result = if let Some(waker) = waker {
+                self.statement.step_with_waker(waker)
+            } else {
+                self.statement.step()
+            };
+            return match result {
                 Ok(StepResult::Done) => Ok(TursoStatusCode::Done),
                 Ok(StepResult::Row) => Ok(TursoStatusCode::Row),
                 Ok(StepResult::Busy) => Err(TursoError {
@@ -764,12 +771,12 @@ impl TursoStatement {
     /// execute statement to completion
     /// method returns [TursoStatusCode::Done] if execution completed
     /// method returns [TursoStatusCode::Io] if async_io was set and execution needs IO in order to make progress
-    pub fn execute(&mut self) -> Result<TursoExecutionResult, TursoError> {
+    pub fn execute(&mut self, waker: Option<&Waker>) -> Result<TursoExecutionResult, TursoError> {
         let guard = self.concurrent_guard.clone();
         let _guard = guard.try_use()?;
 
         loop {
-            let status = self.step_no_guard()?;
+            let status = self.step_no_guard(waker)?;
             if status == TursoStatusCode::Row {
                 continue;
             } else if status == TursoStatusCode::Io {
@@ -832,12 +839,12 @@ impl TursoStatement {
     }
     /// finalize statement execution
     /// this method must be called in the end of statement execution (either successfull or not)
-    pub fn finalize(&mut self) -> Result<TursoStatusCode, TursoError> {
+    pub fn finalize(&mut self, waker: Option<&Waker>) -> Result<TursoStatusCode, TursoError> {
         let guard = self.concurrent_guard.clone();
         let _guard = guard.try_use()?;
 
         while self.statement.execution_state().is_running() {
-            let status = self.step_no_guard()?;
+            let status = self.step_no_guard(waker)?;
             if status == TursoStatusCode::Io {
                 return Ok(status);
             }
@@ -891,33 +898,63 @@ mod tests {
 
     #[test]
     pub fn test_db_concurrent_use() {
-        let db = TursoDatabase::new(TursoDatabaseConfig {
-            path: ":memory:".to_string(),
-            experimental_features: None,
-            async_io: false,
-            io: None,
-            db_file: None,
-        });
-        db.open().unwrap();
-        let conn = db.connect().unwrap();
-        let stmt1 = conn
-            .prepare_single("SELECT * FROM generate_series(1, 10000)")
-            .unwrap();
-        let stmt2 = conn
-            .prepare_single("SELECT * FROM generate_series(1, 10000)")
-            .unwrap();
+        use std::sync::{Arc, Barrier};
 
-        let mut threads = Vec::new();
-        for mut stmt in [stmt1, stmt2] {
-            let thread = std::thread::spawn(move || stmt.execute());
-            threads.push(thread);
+        let mut errors = Vec::new();
+        for _ in 0..16 {
+            let db = TursoDatabase::new(TursoDatabaseConfig {
+                path: ":memory:".to_string(),
+                experimental_features: None,
+                async_io: false,
+                io: None,
+                db_file: None,
+            });
+            db.open().unwrap();
+            let conn = db.connect().unwrap();
+            let stmt1 = conn
+                .prepare_single("SELECT * FROM generate_series(1, 100000)")
+                .unwrap();
+            let stmt2 = conn
+                .prepare_single("SELECT * FROM generate_series(1, 100000)")
+                .unwrap();
+
+            // Use a barrier to ensure both threads start executing at the same time
+            let barrier = Arc::new(Barrier::new(2));
+            let mut threads = Vec::new();
+            for mut stmt in [stmt1, stmt2] {
+                let barrier_clone = Arc::clone(&barrier);
+                let thread = std::thread::spawn(move || {
+                    barrier_clone.wait();
+                    stmt.execute(None)
+                });
+                threads.push(thread);
+            }
+            let mut results = Vec::new();
+            for thread in threads {
+                results.push(thread.join().unwrap());
+            }
+            assert!(
+                !(results[0].is_err() && results[1].is_err()),
+                "results: {results:?}",
+            );
+            if results[0].is_err() || results[1].is_err() {
+                errors.push(
+                    results[0]
+                        .clone()
+                        .err()
+                        .or(results[1].clone().err())
+                        .unwrap(),
+                );
+            }
         }
-        let mut results = Vec::new();
-        for thread in threads {
-            results.push(thread.join().unwrap());
-        }
+        println!("{errors:?}");
         assert!(
-            results[0].is_err() && results[1].is_ok() || results[0].is_ok() && results[1].is_err()
+            !errors.is_empty(),
+            "misuse errors should be very likely with the test setup: {errors:?}"
+        );
+        assert!(
+            errors.iter().all(|e| e.code == TursoStatusCode::Misuse),
+            "all errors must have Misuse code: {errors:?}"
         );
     }
 
@@ -935,6 +972,6 @@ mod tests {
         let mut stmt = conn
             .prepare_single("SELECT * FROM generate_series(1, 10000)")
             .unwrap();
-        assert_eq!(stmt.execute().unwrap().status, TursoStatusCode::Done);
+        assert_eq!(stmt.execute(None).unwrap().status, TursoStatusCode::Done);
     }
 }

@@ -218,7 +218,20 @@ macro_rules! expect_arguments_even {
 ///
 /// A "NOT IN" operator is computed by first computing the equivalent IN
 /// operator, then interchanging the TRUE and FALSE results.
-// todo: Check right affinities
+/// Compute the affinity for an IN expression.
+/// For `x IN (y1, y2, ..., yN)`, the affinity is determined by the LHS expression `x`.
+/// This follows SQLite's `exprINAffinity()` function.
+fn in_expr_affinity(lhs: &ast::Expr, referenced_tables: Option<&TableReferences>) -> Affinity {
+    // For parenthesized expressions (vectors), we take the first element's affinity
+    // since scalar IN comparisons only use the first element
+    match lhs {
+        Expr::Parenthesized(exprs) if !exprs.is_empty() => {
+            get_expr_affinity(&exprs[0], referenced_tables)
+        }
+        _ => get_expr_affinity(lhs, referenced_tables),
+    }
+}
+
 #[instrument(skip(program, referenced_tables, resolver), level = Level::DEBUG)]
 fn translate_in_list(
     program: &mut ProgramBuilder,
@@ -237,6 +250,11 @@ fn translate_in_list(
     let _ = translate_expr(program, referenced_tables, lhs, lhs_reg, resolver)?;
     let mut check_null_reg = 0;
     let label_ok = program.allocate_label();
+
+    // Compute the affinity for the IN comparison based on the LHS expression
+    // This follows SQLite's exprINAffinity() approach
+    let affinity = in_expr_affinity(lhs, referenced_tables);
+    let cmp_flags = CmpInsFlags::default().with_affinity(affinity);
 
     if condition_metadata.jump_target_when_false != condition_metadata.jump_target_when_null {
         check_null_reg = program.alloc_register();
@@ -268,8 +286,7 @@ fn translate_in_list(
                     lhs: lhs_reg,
                     rhs: rhs_reg,
                     target_pc: label_ok,
-                    // Use affinity instead
-                    flags: CmpInsFlags::default(),
+                    flags: cmp_flags,
                     collation: program.curr_collation(),
                 });
             } else {
@@ -278,13 +295,12 @@ fn translate_in_list(
                     target_pc: label_ok,
                 });
             }
-            // sqlite3VdbeChangeP5(v, zAff[0]);
         } else if lhs_reg != rhs_reg {
             program.emit_insn(Insn::Ne {
                 lhs: lhs_reg,
                 rhs: rhs_reg,
                 target_pc: condition_metadata.jump_target_when_false,
-                flags: CmpInsFlags::default(),
+                flags: cmp_flags.jump_if_null(),
                 collation: program.curr_collation(),
             });
         } else {
@@ -717,6 +733,27 @@ pub fn translate_expr(
                             });
                         }
                     }
+
+                    // Compute and apply affinity for the LHS columns before the index probe.
+                    // This follows SQLite's approach where OP_Affinity is emitted before
+                    // Found/NotFound operations on ephemeral indices for IN subqueries.
+
+                    let affinity = lhs_columns
+                        .iter()
+                        .map(|col| get_expr_affinity(col, referenced_tables));
+
+                    // Only emit Affinity instruction if there's meaningful affinity to apply
+                    // (i.e., not all BLOB/NONE affinity)
+                    if affinity.clone().any(|a| a != Affinity::Blob) {
+                        if let Ok(count) = std::num::NonZeroUsize::try_from(lhs_column_count) {
+                            program.emit_insn(Insn::Affinity {
+                                start_reg: lhs_column_regs_start,
+                                count,
+                                affinities: affinity.clone().map(|a| a.aff_mask()).collect(),
+                            });
+                        }
+                    }
+
                     if *not_in {
                         // WHERE ... NOT IN (SELECT ...)
                         // We must skip the row if we find a match.
@@ -751,18 +788,19 @@ pub fn translate_expr(
                         });
                         program.preassign_label_to_next_insn(label_null_checks_loop_start);
                         let column_check_reg = program.alloc_register();
-                        for i in 0..lhs_column_count {
+                        for (i, affinity) in affinity.enumerate().take(lhs_column_count) {
                             program.emit_insn(Insn::Column {
                                 cursor_id: *cursor_id,
                                 column: i,
                                 dest: column_check_reg,
                                 default: None,
                             });
+                            // Apply affinity to the comparison for proper type coercion
                             program.emit_insn(Insn::Ne {
                                 lhs: lhs_column_regs_start + i,
                                 rhs: column_check_reg,
                                 target_pc: label_null_checks_next,
-                                flags: CmpInsFlags::default(),
+                                flags: CmpInsFlags::default().with_affinity(affinity),
                                 collation: program.curr_collation(),
                             });
                         }

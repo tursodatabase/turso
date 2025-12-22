@@ -241,9 +241,9 @@ turso_status_code_t turso_sync_database_apply_changes(
     const char **error_opt_out);
 
 /** Resume async operation
- * If return error status - turso_status_t must be properly cleaned up
  * If return TURSO_IO - caller must drive IO
  * If return TURSO_DONE - caller must inspect result and clean up it or use it accordingly
+ * It's safe to call turso_sync_operation_resume multiple times even after operation completion (in case of repeat calls after completion - final result always will be returned)
  */
 turso_status_code_t turso_sync_operation_resume(
     const turso_sync_operation_t *self,

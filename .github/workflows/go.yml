@@ -20,6 +20,8 @@ permissions:
 env:
   # Token with repo access to tursodatabase/turso-go-platform-libs
   GH_TOKEN: ${{ secrets.TURSO_GO_PLATFORM_LIBS_TOKEN }}
+  CARGO_INCREMENTAL: "0"
+  CARGO_NET_RETRY: 10
 
 jobs:
   test:
@@ -41,10 +43,16 @@ jobs:
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      - name: Setup mold linker
+        if: runner.os == 'Linux'
+        uses: rui314/setup-mold@v1
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
           prefix-key: "v1-rust"
+          cache-on-failure: true
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
 
       - name: Setup Go
         uses: actions/setup-go@v5
@@ -54,7 +62,10 @@ jobs:
           cache-dependency-path: bindings/go/go.sum
 
       - name: Build Rust (debug)
-        run: cargo build --verbose
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: "sccache"
+        run: cargo build --verbose --locked
 
       # Linux: use LD_LIBRARY_PATH to point to Rust target dir
       - name: Run Go tests (Linux)

@@ -165,6 +165,8 @@ impl CompletionGroup {
             _ => unreachable!(),
         };
         if group_inner.outstanding.load(Ordering::SeqCst) == 0 {
+            // Set result to Some(None) on success so succeeded() returns true
+            let _ = group_inner.result.set(None);
             (group_inner.complete)(Ok(0));
         }
         group
@@ -411,6 +413,8 @@ impl Completion {
                 // If this was the last completion in the group, trigger the group's callback
                 // which will recursively call this same callback() method to notify parents
                 if prev == 1 {
+                    // Set result to Some(None) on success so succeeded() returns true
+                    let _ = group.result.set(None);
                     if let Some(group_completion) = group.self_completion.get() {
                         let group_result = group.result.get().and_then(|e| *e);
                         group_completion.callback(group_result.map_or(Ok(0), Err));

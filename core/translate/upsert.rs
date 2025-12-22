@@ -33,6 +33,7 @@ use crate::{
     },
     util::normalize_ident,
     vdbe::{
+        affinity::Affinity,
         builder::ProgramBuilder,
         insn::{IdxInsertFlags, InsertFlags, Insn},
     },
@@ -479,6 +480,22 @@ pub fn emit_upsert(
                 check_generated: true,
                 table_reference: Arc::clone(&bt),
             });
+        } else {
+            // For non-STRICT tables, apply column affinity to the values.
+            // This must happen early so that both index records and the table record
+            // use the converted values.
+            let affinity = bt.columns.iter().map(|c| c.affinity());
+
+            // Only emit Affinity if there's meaningful affinity to apply
+            if affinity.clone().any(|a| a != Affinity::Blob) {
+                if let Ok(count) = std::num::NonZeroUsize::try_from(num_cols) {
+                    program.emit_insn(Insn::Affinity {
+                        start_reg: new_start,
+                        count,
+                        affinities: affinity.map(|a| a.aff_mask()).collect(),
+                    });
+                }
+            }
         }
     }
 

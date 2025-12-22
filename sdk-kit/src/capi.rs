@@ -218,7 +218,7 @@ pub extern "C" fn turso_statement_execute(
         Ok(statement) => statement,
         Err(err) => return unsafe { err.to_capi(error_opt_out) },
     };
-    match statement.execute() {
+    match statement.execute(None) {
         Ok(result) => {
             if !rows_changed.is_null() {
                 unsafe { *rows_changed = result.rows_changed };
@@ -239,7 +239,7 @@ pub extern "C" fn turso_statement_step(
         Ok(statement) => statement,
         Err(err) => return unsafe { err.to_capi(error_opt_out) },
     };
-    match statement.step() {
+    match statement.step(None) {
         Ok(status) => status.to_capi(),
         Err(err) => unsafe { err.to_capi(error_opt_out) },
     }
@@ -271,7 +271,7 @@ pub extern "C" fn turso_statement_finalize(
         Ok(statement) => statement,
         Err(err) => return unsafe { err.to_capi(error_opt_out) },
     };
-    match statement.finalize() {
+    match statement.finalize(None) {
         Ok(status) => status.to_capi(),
         Err(err) => unsafe { err.to_capi(error_opt_out) },
     }
@@ -826,7 +826,7 @@ mod tests {
             assert_eq!(status, turso_status_code_t::TURSO_ERROR);
             assert_eq!(
                 std::ffi::CStr::from_ptr(error).to_str().unwrap(),
-                "Parse error: Table t already exists"
+                "Parse error: table t already exists"
             );
 
             turso_str_deinit(error);
