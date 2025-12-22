@@ -469,6 +469,21 @@ impl VTable for StatsTable {
     }
 }
 
+/// Sanitize table name to prevent SQL injection attacks
+/// Only allows identifiers that match the pattern: [a-zA-Z0-9_]+
+fn sanitize_table_name(tbl: &str) -> Option<String> {
+    // Whitelist approach: only allow alphanumeric characters and underscores
+    // This is the safest approach for table identifiers
+    for ch in tbl.chars() {
+        match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '_' => continue,
+            _ => return None,
+        }
+    }
+    // Safe to use in SQL after validation
+    Some(format!("\"{}\"", tbl))
+}
+
 impl VTabCursor for StatsCursor {
     type Error = String;
 
@@ -511,7 +526,13 @@ impl VTabCursor for StatsCursor {
         master.close();
         for tbl in tables {
             // count rows for each table
-            if let Ok(mut count_stmt) = conn.prepare(&format!("SELECT COUNT(*) FROM {tbl};")) {
+            // Sanitize table name to prevent SQL injection
+            let Some(safe_tbl_name) = sanitize_table_name(&tbl) else {
+                log::warn!("Invalid table name detected: {}", tbl);
+                continue;
+            };
+            let query = format!("SELECT COUNT(*) FROM {};", safe_tbl_name);
+            if let Ok(mut count_stmt) = conn.prepare(&query) {
                 let count = match count_stmt.step() {
                     StepResult::Row => count_stmt.get_row()[0].to_integer().unwrap_or(0),
                     _ => 0,
