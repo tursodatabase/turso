@@ -179,6 +179,8 @@ pub enum TokenType {
     TK_FILTER = 167,
     TK_ILLEGAL = 185,
     TK_CONCURRENT = 186,
+    // None token
+    TK_NONE = 255,
 }
 
 impl TokenType {
@@ -343,6 +345,21 @@ impl TokenType {
             TokenType::TK_STAR => Some("*"),
             _ => None,
         }
+    }
+    #[inline]
+    pub fn unwrap_or(self, default: TokenType) -> TokenType {
+        if self.is_none() {
+            #[cold]
+            pub const fn cold() {}
+            cold();
+            default
+        } else {
+            self
+        }
+    }
+    #[inline]
+    pub fn is_none(&self) -> bool {
+        *self == TokenType::TK_NONE
     }
 }
 
@@ -521,6 +538,8 @@ impl Display for TokenType {
             TK_OVER => "TK_OVER",
             TK_FILTER => "TK_FILTER",
             TK_ILLEGAL => "TK_ILLEGAL",
+            // None
+            TK_NONE => "TK_NONE",
         };
         write!(f, "{s}")
     }
