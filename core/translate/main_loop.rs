@@ -465,6 +465,8 @@ pub fn init_loop(
 pub struct HashBuildPayloadInfo {
     /// Column indices from the build table stored as payload, in order.
     pub payload_columns: Vec<usize>,
+    /// Affinity string for the join keys.
+    pub key_affinities: String,
 }
 
 /// Uses a separate hash build cursor to allow chained hash joins where a table
@@ -512,6 +514,20 @@ fn emit_hash_build_phase(
     program.set_cursor_override(build_table.internal_id, hash_build_cursor_id);
 
     program.preassign_label_to_next_insn(build_loop_start);
+
+    // Determine comparison affinity for each join key
+    let mut key_affinities = String::new();
+    for join_key in hash_join_op.join_keys.iter() {
+        let build_expr = join_key.get_build_expr(predicates);
+        let probe_expr = join_key.get_probe_expr(predicates);
+        let affinity = crate::translate::expr::comparison_affinity(
+            build_expr,
+            probe_expr,
+            Some(table_references),
+        );
+        key_affinities.push(affinity.aff_mask());
+    }
+
     for (idx, join_key) in hash_join_op.join_keys.iter().enumerate() {
         let build_expr = join_key.get_build_expr(predicates);
         let target_reg = build_key_start_reg + idx;
@@ -522,6 +538,15 @@ fn emit_hash_build_phase(
             target_reg,
             &t_ctx.resolver,
         )?;
+    }
+
+    // Apply affinity conversion to build keys before hashing
+    if let Some(count) = std::num::NonZeroUsize::new(num_keys) {
+        program.emit_insn(Insn::Affinity {
+            start_reg: build_key_start_reg,
+            count,
+            affinities: key_affinities.clone(),
+        });
     }
 
     // Collect payload columns, all columns referenced from the build table.
@@ -538,6 +563,7 @@ fn emit_hash_build_phase(
             Some(payload_reg),
             HashBuildPayloadInfo {
                 payload_columns: payload_columns.clone(),
+                key_affinities: key_affinities.clone(),
             },
         )
     } else {
@@ -545,6 +571,7 @@ fn emit_hash_build_phase(
             None,
             HashBuildPayloadInfo {
                 payload_columns: vec![],
+                key_affinities: key_affinities.clone(),
             },
         )
     };
@@ -923,6 +950,15 @@ pub fn open_loop(
                         probe_key_start_reg + idx,
                         &t_ctx.resolver,
                     )?;
+                }
+
+                // Apply affinity conversion to probe keys before hashing to match build keys
+                if let Some(count) = std::num::NonZeroUsize::new(num_keys) {
+                    program.emit_insn(Insn::Affinity {
+                        start_reg: probe_key_start_reg,
+                        count,
+                        affinities: payload_info.key_affinities.clone(),
+                    });
                 }
 
                 // Allocate payload destination registers if we have payload columns

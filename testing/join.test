@@ -576,3 +576,18 @@ do_execsql_test_on_specific_db {:memory:} left-join-integer-real-multi-key {
   INSERT INTO t14 (a, b, c) VALUES (1, 10.0, 20.0);
   SELECT * FROM t13 LEFT JOIN t14 ON t13.b = t14.b AND t13.c = t14.c;
 } {1|10|20|1|10.0|20.0}
+
+do_execsql_test_on_specific_db {:memory:} affinity-hash-join {
+  CREATE TABLE x(a INTEGER);
+  CREATE TABLE y(b TEXT);
+  INSERT INTO x VALUES (2),(3);
+  INSERT INTO y VALUES ('02'),('2'),('2.0'),('3x'),('3.5');
+  
+  SELECT a, b
+  FROM x JOIN y ON a = b
+  ORDER BY a, b;
+} {
+  {2|02}
+  {2|2}
+  {2|2.0}
+}
