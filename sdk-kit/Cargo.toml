@@ -12,7 +12,7 @@ crate-type = ["lib", "cdylib", "staticlib"]
 
 [dependencies]
 env_logger = { workspace = true, default-features = false }
-turso_core = { workspace = true, features = ["conn_raw_api"] }
+turso_core = { workspace = true, features = ["conn_raw_api", "io_uring"] }
 turso_sdk_kit_macros = { workspace = true }
 tracing = { workspace = true }
 tracing-appender = { workspace = true }
