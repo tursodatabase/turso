@@ -2193,14 +2193,6 @@ pub struct ForeignKey {
 }
 impl ForeignKey {
     fn validate(&self) -> Result<()> {
-        // TODO: remove this when actions are implemented
-        if !(matches!(self.on_update, RefAct::NoAction)
-            && matches!(self.on_delete, RefAct::NoAction))
-        {
-            crate::bail_parse_error!(
-                "foreign key actions other than NO ACTION are not implemented"
-            );
-        }
         if self
             .parent_columns
             .iter()
