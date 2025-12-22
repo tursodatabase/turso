@@ -826,7 +826,7 @@ mod tests {
             assert_eq!(status, turso_status_code_t::TURSO_ERROR);
             assert_eq!(
                 std::ffi::CStr::from_ptr(error).to_str().unwrap(),
-                "Parse error: Table t already exists"
+                "Parse error: table t already exists"
             );
 
             turso_str_deinit(error);
