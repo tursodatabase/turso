@@ -137,4 +137,4 @@ jobs:
         run: cargo fmt --check
 
       - name: Cargo clippy
-        run: cargo clippy -- -D warnings
+        run: cargo clippy --features extension-module -- -D warnings

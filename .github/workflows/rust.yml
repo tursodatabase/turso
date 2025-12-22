@@ -58,19 +58,19 @@ jobs:
         env:
           SCCACHE_GHA_ENABLED: "true"
           RUSTC_WRAPPER: "sccache"
-        run: cargo build --verbose --locked --all-features
+        run: cargo build --workspace --verbose --locked --all-features --exclude turso-ruby
       - name: Test (nextest)
         env:
           RUST_LOG: ${{ runner.debug && 'turso_core::storage=trace' || '' }}
           SCCACHE_GHA_ENABLED: "true"
           RUSTC_WRAPPER: "sccache"
-        run: cargo nextest run --workspace --all-features --locked --no-fail-fast -E 'not test(/^fuzz_tests::/)'
+        run: cargo nextest run --workspace --all-features --locked --no-fail-fast --exclude turso-ruby -E 'not test(/^fuzz_tests::/)'
         timeout-minutes: 20
       - name: Test doctests
         env:
           SCCACHE_GHA_ENABLED: "true"
           RUSTC_WRAPPER: "sccache"
-        run: cargo test --workspace --all-features --doc --locked
+        run: cargo test --workspace --all-features --doc --locked --exclude turso-ruby
 
   clippy:
     runs-on: blacksmith-4vcpu-ubuntu-2404
@@ -86,7 +86,7 @@ jobs:
           cache-on-failure: true
       - name: Clippy
         run: |
-          cargo clippy --workspace --all-features --all-targets --locked -- --deny=warnings
+          cargo clippy --workspace --all-features --all-targets --exclude turso-ruby --locked -- --deny=warnings
 
   simulator:
     runs-on: blacksmith-4vcpu-ubuntu-2404
