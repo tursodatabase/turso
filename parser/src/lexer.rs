@@ -219,6 +219,9 @@ impl<'a> Iterator for Lexer<'a> {
     }
 }
 
+#[cold]
+const fn cold() {}
+
 impl<'a> Lexer<'a> {
     #[inline(always)]
     pub fn new(input: &'a [u8]) -> Self {
@@ -227,7 +230,7 @@ impl<'a> Lexer<'a> {
 
     #[inline(always)]
     pub fn remaining(&self) -> &'a [u8] {
-        &self.input[self.offset..]
+        &self.input.get(self.offset..).unwrap_or(&[])
     }
 
     #[inline]
@@ -256,12 +259,12 @@ impl<'a> Lexer<'a> {
     /// Returns the current offset in the input and consumes it.
     #[inline(always)]
     pub fn eat(&mut self) -> Option<u8> {
-        let result = self.peek();
-        if result.is_some() {
+        if let Some(b) = self.peek() {
             self.offset += 1;
+            Some(b)
+        } else {
+            None
         }
-
-        result
     }
 
     #[inline(always)]
@@ -276,10 +279,16 @@ impl<'a> Lexer<'a> {
     #[inline]
     fn eat_while<F>(&mut self, f: F)
     where
-        F: Fn(Option<u8>) -> bool,
+        F: Fn(u8) -> bool,
     {
         loop {
-            if !f(self.peek()) {
+            if let Some(b) = self.peek() {
+                if !f(b) {
+                    cold();
+                    return;
+                }
+            } else {
+                cold();
                 return;
             }
 
@@ -290,7 +299,7 @@ impl<'a> Lexer<'a> {
     fn eat_while_number_digit(&mut self) -> Result<()> {
         loop {
             let start = self.offset;
-            self.eat_while(|b| b.is_some() && b.unwrap().is_ascii_digit());
+            self.eat_while(|b| b.is_ascii_digit());
             match self.peek() {
                 Some(b'_') => {
                     self.eat_and_assert(|b| b == b'_');
@@ -329,7 +338,7 @@ impl<'a> Lexer<'a> {
     fn eat_while_number_hexdigit(&mut self) -> Result<()> {
         loop {
             let start = self.offset;
-            self.eat_while(|b| b.is_some() && b.unwrap().is_ascii_hexdigit());
+            self.eat_while(|b| b.is_ascii_hexdigit());
             match self.peek() {
                 Some(b'_') => {
                     if start == self.offset {
@@ -369,7 +378,7 @@ impl<'a> Lexer<'a> {
         debug_assert!(!self.remaining().is_empty());
 
         let tok = Token {
-            value: &self.remaining()[..1],
+            value: &self.remaining().get(..1).unwrap_or("".as_bytes()),
             token_type: Some(typ),
         };
         self.offset += 1;
@@ -380,7 +389,7 @@ impl<'a> Lexer<'a> {
     fn eat_white_space(&mut self) -> Token<'a> {
         let start = self.offset;
         self.eat_and_assert(|b| b.is_ascii_whitespace());
-        self.eat_while(|b| b.is_some() && b.unwrap().is_ascii_whitespace());
+        self.eat_while(|b| b.is_ascii_whitespace());
         Token {
             value: &self.input[start..self.offset],
             token_type: None, // This is a whitespace
@@ -394,7 +403,7 @@ impl<'a> Lexer<'a> {
         match self.peek() {
             Some(b'-') => {
                 self.eat_and_assert(|b| b == b'-');
-                self.eat_while(|b| b.is_some() && b.unwrap() != b'\n');
+                self.eat_while(|b| b != b'\n');
                 if self.peek() == Some(b'\n') {
                     self.eat_and_assert(|b| b == b'\n');
                 }
@@ -432,7 +441,7 @@ impl<'a> Lexer<'a> {
             Some(b'*') => {
                 self.eat_and_assert(|b| b == b'*');
                 loop {
-                    self.eat_while(|b| b.is_some() && b.unwrap() != b'*');
+                    self.eat_while(|b| b != b'*');
                     match self.peek() {
                         Some(b'*') => {
                             self.eat_and_assert(|b| b == b'*');
@@ -584,7 +593,7 @@ impl<'a> Lexer<'a> {
         };
 
         loop {
-            self.eat_while(|b| b.is_some() && b.unwrap() != quote);
+            self.eat_while(|b| b != quote);
             match self.peek() {
                 Some(b) if b == quote => {
                     self.eat_and_assert(|b| b == quote);
@@ -767,7 +776,7 @@ impl<'a> Lexer<'a> {
     fn eat_bracket(&mut self) -> Result<Token<'a>> {
         let start = self.offset;
         self.eat_and_assert(|b| b == b'[');
-        self.eat_while(|b| b.is_some() && b.unwrap() != b']');
+        self.eat_while(|b| b != b']');
         match self.peek() {
             Some(b']') => {
                 self.eat_and_assert(|b| b == b']');
@@ -796,7 +805,7 @@ impl<'a> Lexer<'a> {
 
         match tok {
             b'?' => {
-                self.eat_while(|b| b.is_some() && b.unwrap().is_ascii_digit());
+                self.eat_while(|b| b.is_ascii_digit());
 
                 Ok(Token {
                     value: &self.input[start + 1..self.offset], // do not include '? in the value
@@ -805,7 +814,7 @@ impl<'a> Lexer<'a> {
             }
             _ => {
                 let start_id = self.offset;
-                self.eat_while(|b| b.is_some() && is_identifier_continue(b.unwrap()));
+                self.eat_while(|b| is_identifier_continue(b));
 
                 // empty variable name
                 if start_id == self.offset {
@@ -836,7 +845,7 @@ impl<'a> Lexer<'a> {
             b'x' | b'X' if self.peek() == Some(b'\'') => {
                 self.eat_and_assert(|b| b == b'\'');
                 let start_hex = self.offset;
-                self.eat_while(|b| b.is_some() && b.unwrap().is_ascii_hexdigit());
+                self.eat_while(|b| b.is_ascii_hexdigit());
 
                 match self.peek() {
                     Some(b'\'') => {
@@ -872,7 +881,7 @@ impl<'a> Lexer<'a> {
                 }
             }
             _ => {
-                self.eat_while(|b| b.is_some() && is_identifier_continue(b.unwrap()));
+                self.eat_while(|b| is_identifier_continue(b));
                 let result = &self.input[start..self.offset];
                 Ok(Token {
                     value: result,
@@ -884,7 +893,7 @@ impl<'a> Lexer<'a> {
 
     fn eat_unrecognized(&mut self) -> Result<Token<'a>> {
         let start = self.offset;
-        self.eat_while(|b| b.is_some() && !b.unwrap().is_ascii_whitespace());
+        self.eat_while(|b| !b.is_ascii_whitespace());
         let token_text = String::from_utf8_lossy(&self.input[start..self.offset]).to_string();
         Err(Error::UnrecognizedToken {
             span: (start, self.offset - start).into(),
