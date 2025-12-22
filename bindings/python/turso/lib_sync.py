@@ -441,9 +441,15 @@ def connect_sync(
     # Sync config with optional partial bootstrap strategy
     prefix_len: Optional[int] = None
     query_str: Optional[str] = None
-    if partial_sync_experimental is not None and isinstance(partial_sync_experimental.bootstrap_strategy, PartialSyncPrefixBootstrap):
+    if (
+        partial_sync_experimental is not None and
+        isinstance(partial_sync_experimental.bootstrap_strategy, PartialSyncPrefixBootstrap)
+    ):
         prefix_len = int(partial_sync_experimental.bootstrap_strategy.length)
-    elif partial_sync_experimental is not None and isinstance(partial_sync_experimental.bootstrap_strategy, PartialSyncQueryBootstrap):
+    elif (
+        partial_sync_experimental is not None and
+        isinstance(partial_sync_experimental.bootstrap_strategy, PartialSyncQueryBootstrap)
+    ):
         query_str = str(partial_sync_experimental.bootstrap_strategy.query)
 
     sync_cfg = PyTursoSyncDatabaseConfig(
