@@ -438,11 +438,44 @@ fn to_julian_day_exact(dt: &NaiveDateTime) -> f64 {
     i_jd as f64 / 86400000.0
 }
 
-pub fn exec_unixepoch(time_value: &Value) -> Value {
-    let dt = parse_naive_date_time(time_value);
-    match dt {
-        Some(dt) if !is_leap_second(&dt) => Value::Integer(get_unixepoch_from_naive_datetime(dt)),
-        _ => Value::Null,
+pub fn exec_unixepoch<I, E, V>(values: I) -> Value
+where
+    V: AsValueRef,
+    E: ExactSizeIterator<Item = V>,
+    I: IntoIterator<IntoIter = E, Item = V>,
+{
+    let mut values = values.into_iter();
+    match values.next() {
+        None => {
+            let now = parse_naive_date_time(Value::build_text("now")).unwrap();
+            return Value::Integer(get_unixepoch_from_naive_datetime(now));
+        }
+        Some(first) => {
+            let apply_res = if let Some(dt) = parse_naive_date_time(first) {
+                // if successful, treat subsequent entries as modifiers
+                modify_dt(dt, values.skip(1))
+            } else {
+                // if the first argument is NOT a valid date/time, treat the entire set of values as modifiers.
+                let dt = chrono::Local::now().to_utc().naive_utc();
+                modify_dt(dt, values)
+            };
+
+            match apply_res {
+                None => Value::Null,
+                Some(DtTransform {
+                    dt,
+                    subsec_requested,
+                }) => {
+                    if subsec_requested {
+                        let secs = get_unixepoch_from_naive_datetime(dt);
+                        let millis = dt.and_utc().timestamp_subsec_millis();
+                        Value::Float(secs as f64 + (millis as f64 / 1000.0f64))
+                    } else {
+                        Value::Integer(get_unixepoch_from_naive_datetime(dt))
+                    }
+                }
+            }
+        }
     }
 }
 
