@@ -1507,6 +1507,7 @@ pub fn op_column(
                             let cursor = cursor_ref.as_btree_mut();
 
                             if cursor.get_null_flag() {
+                                tracing::trace!("op_column(null_flag)");
                                 state.registers[*dest] = Register::Value(Value::Null);
                                 break 'outer;
                             }
