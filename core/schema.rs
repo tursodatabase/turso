@@ -1531,7 +1531,6 @@ impl BTreeTable {
             .iter()
             .enumerate()
             .find(|(_, column)| column.is_rowid_alias())
-            .map(|(idx, column)| (idx, column))
     }
 
     /// Returns the column position and column for a given column name.
