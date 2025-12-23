@@ -1,0 +1,739 @@
+# UPSERT (INSERT ON CONFLICT) Tests
+# Ported from testing/upsert.test
+
+@database :memory:
+
+# Primary key conflict with UPDATE
+setup upsert-pk-update {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, name);
+    INSERT INTO t VALUES (1,'old');
+}
+
+@setup upsert-pk-update
+test upsert-pk-update {
+    INSERT INTO t VALUES (1,'new') ON CONFLICT DO UPDATE SET name = excluded.name;
+    SELECT * FROM t;
+}
+expect {
+    1|new
+}
+
+# Primary key conflict with DO NOTHING
+setup upsert-pk-do-nothing {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, name);
+    INSERT INTO t VALUES (1,'new');
+}
+
+@setup upsert-pk-do-nothing
+test upsert-pk-do-nothing {
+    INSERT INTO t VALUES (1,'ignored') ON CONFLICT DO NOTHING;
+    SELECT * FROM t;
+}
+expect {
+    1|new
+}
+
+# Unique index conflict with UPDATE
+setup upsert-unique-update {
+    CREATE TABLE u (a, b, c);
+    CREATE UNIQUE INDEX u_a ON u(a);
+    INSERT INTO u VALUES (1,10,100);
+}
+
+@setup upsert-unique-update
+test upsert-unique-update {
+    INSERT INTO u VALUES (1,20,200) ON CONFLICT(a) DO UPDATE SET b = excluded.b, c = excluded.c;
+    SELECT * FROM u;
+}
+expect {
+    1|20|200
+}
+
+# Unique index with DO NOTHING (no conflict)
+setup upsert-unique-do-nothing {
+    CREATE TABLE u (a, b, c);
+    CREATE UNIQUE INDEX u_a ON u(a);
+    INSERT INTO u VALUES (1,10,100);
+}
+
+@setup upsert-unique-do-nothing
+test upsert-unique-do-nothing {
+    INSERT INTO u VALUES (2,30,300) ON CONFLICT(a) DO NOTHING;
+    SELECT * FROM u ORDER BY a;
+}
+expect {
+    1|10|100
+    2|30|300
+}
+
+# WHERE guard that prevents update
+setup upsert-where-guard-no-change {
+    CREATE TABLE g (a UNIQUE, b);
+    INSERT INTO g VALUES (1,'x');
+}
+
+@setup upsert-where-guard-no-change
+test upsert-where-guard-no-change {
+    INSERT INTO g VALUES (1,'y') ON CONFLICT(a) DO UPDATE SET b = excluded.b WHERE b IS NULL;
+    SELECT * FROM g;
+}
+expect {
+    1|x
+}
+
+# WHERE guard that allows update
+setup upsert-where-guard-apply {
+    CREATE TABLE g (a UNIQUE, b);
+    INSERT INTO g VALUES (1,NULL);
+}
+
+@setup upsert-where-guard-apply
+test upsert-where-guard-apply {
+    INSERT INTO g VALUES (1,'y') ON CONFLICT(a) DO UPDATE SET b = excluded.b WHERE b IS NULL;
+    SELECT * FROM g;
+}
+expect {
+    1|y
+}
+
+# Self-reference and excluded in update
+setup upsert-selfref-and-excluded {
+    CREATE TABLE s (a UNIQUE, b, c);
+    INSERT INTO s VALUES (1,10,'old');
+}
+
+@setup upsert-selfref-and-excluded
+test upsert-selfref-and-excluded {
+    INSERT INTO s VALUES (1,99,'new')
+      ON CONFLICT(a) DO UPDATE SET b = b + 1, c = excluded.c;
+    SELECT * FROM s;
+}
+expect {
+    1|11|new
+}
+
+# Multiple values with mixed insert/update
+setup upsert-values-mixed-insert-update {
+    CREATE TABLE m (a UNIQUE, b);
+    INSERT INTO m VALUES (1,'one');
+}
+
+@setup upsert-values-mixed-insert-update
+test upsert-values-mixed-insert-update {
+    INSERT INTO m VALUES (1,'uno'), (2,'dos')
+      ON CONFLICT(a) DO UPDATE SET b = excluded.b;
+    SELECT * FROM m ORDER BY a;
+}
+expect {
+    1|uno
+    2|dos
+}
+
+# INSERT SELECT with upsert
+setup upsert-select-single {
+    CREATE TABLE s1 (a UNIQUE, b);
+    INSERT INTO s1 VALUES (1,'old');
+}
+
+@setup upsert-select-single
+test upsert-select-single {
+    INSERT INTO s1 SELECT 1,'NEW' ON CONFLICT(a) DO UPDATE SET b = excluded.b;
+    SELECT * FROM s1;
+}
+expect {
+    1|NEW
+}
+
+# Composite target in different order
+setup upsert-composite-target-orderless {
+    CREATE TABLE c (a, b, val);
+    CREATE UNIQUE INDEX c_ab ON c(a,b);
+    INSERT INTO c VALUES (1,1,'x');
+}
+
+@setup upsert-composite-target-orderless
+test upsert-composite-target-orderless {
+    INSERT INTO c VALUES (1,1,'y') ON CONFLICT(b,a) DO UPDATE SET val = excluded.val;
+    SELECT val FROM c WHERE a=1 AND b=1;
+}
+expect {
+    y
+}
+
+# Collate NOCASE in conflict target
+setup upsert-collate-nocase {
+    CREATE TABLE nc (name TEXT COLLATE NOCASE UNIQUE, v);
+    INSERT INTO nc VALUES ('Alice', 1);
+}
+
+@setup upsert-collate-nocase
+test upsert-collate-nocase {
+    INSERT INTO nc VALUES ('aLiCe', 2)
+      ON CONFLICT(name COLLATE NOCASE) DO UPDATE SET v = excluded.v;
+    SELECT * FROM nc;
+}
+expect {
+    Alice|2
+}
+
+# RETURNING with update path
+setup upsert-returning-update {
+    CREATE TABLE r (id INTEGER PRIMARY KEY, name);
+    INSERT INTO r VALUES (1,'a');
+}
+
+@setup upsert-returning-update
+test upsert-returning-update {
+    INSERT INTO r VALUES (1,'b')
+      ON CONFLICT DO UPDATE SET name = excluded.name
+      RETURNING id, name;
+}
+expect {
+    1|b
+}
+
+# RETURNING with insert path
+setup upsert-returning-insert {
+    CREATE TABLE r2 (id INTEGER PRIMARY KEY, name);
+}
+
+@setup upsert-returning-insert
+test upsert-returning-insert {
+    INSERT INTO r2 VALUES (2,'c')
+      ON CONFLICT DO UPDATE SET name = excluded.name
+      RETURNING id, name;
+}
+expect {
+    2|c
+}
+
+# RETURNING with DO NOTHING (empty result)
+setup upsert-returning-do-nothing-empty {
+    CREATE TABLE r3 (id INTEGER PRIMARY KEY, name);
+    INSERT INTO r3 VALUES (2,'orig');
+}
+
+@setup upsert-returning-do-nothing-empty
+test upsert-returning-do-nothing-empty {
+    INSERT INTO r3 VALUES (2,'ignored')
+      ON CONFLICT DO NOTHING
+      RETURNING id, name;
+}
+expect {
+}
+
+# Rowid in SET clause
+setup upsert-rowid-in-set {
+    CREATE TABLE rid (id INTEGER PRIMARY KEY, name);
+    INSERT INTO rid VALUES (5,'foo');
+}
+
+@setup upsert-rowid-in-set
+test upsert-rowid-in-set {
+    INSERT INTO rid VALUES (5,'bar')
+      ON CONFLICT DO UPDATE SET name = printf('id=%d', rowid);
+    SELECT * FROM rid;
+}
+expect {
+    5|id=5
+}
+
+# NOT NULL violation in DO UPDATE
+setup upsert-notnull-violation {
+    CREATE TABLE nn (a UNIQUE, b NOT NULL);
+    INSERT INTO nn VALUES (1,'x');
+}
+
+@setup upsert-notnull-violation
+test upsert-notnull-violation {
+    INSERT INTO nn VALUES (1,'y') ON CONFLICT(a) DO UPDATE SET b = NULL;
+}
+expect error {}
+
+# Updates other unique key
+setup upsert-updates-other-unique-key {
+    CREATE TABLE idx (a UNIQUE, b UNIQUE);
+    INSERT INTO idx VALUES (1,1);
+}
+
+@setup upsert-updates-other-unique-key
+test upsert-updates-other-unique-key {
+    INSERT INTO idx VALUES (1,2) ON CONFLICT(a) DO UPDATE SET b = excluded.b;
+    SELECT * FROM idx;
+}
+expect {
+    1|2
+}
+
+# Target mismatch errors
+setup upsert-target-mismatch-errors {
+    CREATE TABLE tm (a, b UNIQUE);
+    INSERT INTO tm VALUES (1,1);
+}
+
+@setup upsert-target-mismatch-errors
+test upsert-target-mismatch-errors {
+    INSERT INTO tm VALUES (2,1)
+      ON CONFLICT(a) DO UPDATE SET a = excluded.a;
+}
+expect error {}
+
+# Omitted target matches PK
+setup upsert-omitted-target-matches-pk {
+    CREATE TABLE pkalias (a INTEGER PRIMARY KEY, b);
+    INSERT INTO pkalias VALUES (42,'old');
+}
+
+@setup upsert-omitted-target-matches-pk
+test upsert-omitted-target-matches-pk {
+    INSERT INTO pkalias (a,b) VALUES (42,'new') ON CONFLICT DO UPDATE SET b = excluded.b;
+    SELECT * FROM pkalias;
+}
+expect {
+    42|new
+}
+
+# Row value SET
+setup upsert-rowvalue-set {
+    CREATE TABLE rv (a INTEGER PRIMARY KEY, b, c);
+    INSERT INTO rv VALUES (1,'x','y');
+}
+
+@setup upsert-rowvalue-set
+test upsert-rowvalue-set {
+    INSERT INTO rv VALUES (1,'B','C')
+      ON CONFLICT DO UPDATE SET (b,c) = (excluded.b, excluded.c);
+    SELECT * FROM rv;
+}
+expect {
+    1|B|C
+}
+
+# WHERE comparing excluded vs target
+setup upsert-where-excluded-vs-target {
+    CREATE TABLE wh (a UNIQUE, b);
+    INSERT INTO wh VALUES (1,5);
+}
+
+@setup upsert-where-excluded-vs-target
+test upsert-where-excluded-vs-target {
+    INSERT INTO wh VALUES (1,3)
+      ON CONFLICT(a) DO UPDATE SET b = excluded.b WHERE excluded.b > b;
+    INSERT INTO wh VALUES (1,10)
+      ON CONFLICT(a) DO UPDATE SET b = excluded.b WHERE excluded.b > b;
+    SELECT * FROM wh;
+}
+expect {
+    1|10
+}
+
+# Invalid qualified LHS in SET
+setup upsert-invalid-qualified-lhs {
+    CREATE TABLE bad (a UNIQUE, b);
+    INSERT INTO bad VALUES (1,'x');
+}
+
+@setup upsert-invalid-qualified-lhs
+test upsert-invalid-qualified-lhs {
+    INSERT INTO bad VALUES (1,'y')
+      ON CONFLICT(a) DO UPDATE SET excluded.b = 'z';
+}
+expect error {}
+
+# Multiple values with RETURNING (mixed paths)
+setup upsert-values-returning-mixed {
+    CREATE TABLE mix (k UNIQUE, v);
+    INSERT INTO mix VALUES (1,'one');
+}
+
+@setup upsert-values-returning-mixed
+test upsert-values-returning-mixed {
+    INSERT INTO mix VALUES (1,'uno'), (2,'dos')
+      ON CONFLICT(k) DO UPDATE SET v = excluded.v
+      RETURNING k, v;
+}
+expect {
+    1|uno
+    2|dos
+}
+
+# Collate implicit match
+setup upsert-collate-implicit-match {
+    CREATE TABLE ci (name TEXT COLLATE NOCASE, v);
+    CREATE UNIQUE INDEX ci_name ON ci(name);
+    INSERT INTO ci VALUES ('Alice', 1);
+}
+
+@setup upsert-collate-implicit-match
+test upsert-collate-implicit-match {
+    INSERT INTO ci VALUES ('aLiCe', 2)
+      ON CONFLICT(name COLLATE NOCASE) DO UPDATE SET v = excluded.v;
+    SELECT * FROM ci;
+}
+expect {
+    Alice|2
+}
+
+# Composite target too few columns
+setup upsert-composite-target-too-few {
+    CREATE TABLE ct (a, b, val);
+    CREATE UNIQUE INDEX ct_ab ON ct(a,b);
+    INSERT INTO ct VALUES (1,1,'x');
+}
+
+@setup upsert-composite-target-too-few
+test upsert-composite-target-too-few {
+    INSERT INTO ct VALUES (1,1,'y')
+      ON CONFLICT(a) DO UPDATE SET val = excluded.val;
+}
+expect error {}
+
+# Multiple conflict targets
+setup upsert-multiple-conflict-targets {
+    CREATE TABLE ct (id INTEGER PRIMARY KEY, x UNIQUE, y UNIQUE, z DEFAULT NULL);
+    INSERT INTO ct(id, x, y) VALUES (1, 'x', 'y');
+    INSERT INTO ct(id, x, y) VALUES (2, 'a', 'b');
+    INSERT INTO ct(id, x, y) VALUES (3, '!', '@');
+}
+
+@setup upsert-multiple-conflict-targets
+test upsert-multiple-conflict-targets {
+    INSERT INTO ct(id, x, y) VALUES (4, 'x', 'y1'), (5, 'a1', 'b'), (3, '_', '_')
+      ON CONFLICT(x) DO UPDATE SET x = excluded.x || '-' || x, y = excluded.y || '@' || y, z = 'x'
+      ON CONFLICT(y) DO UPDATE SET x = excluded.x || '+' || x, y = excluded.y || '!' || y, z = 'y'
+      ON CONFLICT DO UPDATE SET x = excluded.x || '#' || x, y = excluded.y || '%' || y, z = 'fallback';
+    SELECT * FROM ct;
+}
+expect {
+    1|x-x|y1@y|x
+    2|a1+a|b!b|y
+    3|_#!|_%@|fallback
+}
+
+# Qualified target
+setup upsert-qualified-target {
+    CREATE TABLE qt (a UNIQUE, b);
+    INSERT INTO qt VALUES (1,'old');
+}
+
+@setup upsert-qualified-target
+test upsert-qualified-target {
+    INSERT INTO qt VALUES (1,'new')
+      ON CONFLICT(qt.a) DO UPDATE SET b = excluded.b;
+    SELECT * FROM qt;
+}
+expect {
+    1|new
+}
+
+# Invalid target expression
+setup upsert-invalid-target-expression {
+    CREATE TABLE it (name, v);
+    CREATE UNIQUE INDEX it_name ON it(name);
+    INSERT INTO it VALUES ('x',1);
+}
+
+@setup upsert-invalid-target-expression
+test upsert-invalid-target-expression {
+    INSERT INTO it VALUES ('x',2)
+      ON CONFLICT(lower(name)) DO UPDATE SET v = excluded.v;
+}
+expect error {}
+
+# WHERE with three-valued logic (NULL comparison)
+setup upsert-where-null-3vl-no-update {
+    CREATE TABLE w3 (a UNIQUE, b);
+    INSERT INTO w3 VALUES (1, NULL);
+}
+
+@setup upsert-where-null-3vl-no-update
+test upsert-where-null-3vl-no-update {
+    INSERT INTO w3 VALUES (1, 5)
+      ON CONFLICT(a) DO UPDATE SET b = excluded.b WHERE b < excluded.b;
+    SELECT * FROM w3;
+}
+expect {
+    1|
+}
+
+# WHERE false on PK conflict
+setup upsert-pk-where-false {
+    CREATE TABLE pw (id INTEGER PRIMARY KEY, name);
+    INSERT INTO pw VALUES (7,'keep');
+}
+
+@setup upsert-pk-where-false
+test upsert-pk-where-false {
+    INSERT INTO pw VALUES (7,'drop')
+      ON CONFLICT DO UPDATE SET name = excluded.name WHERE 0;
+    SELECT * FROM pw;
+}
+expect {
+    7|keep
+}
+
+# WHERE combo with arithmetic
+setup upsert-where-combo {
+    CREATE TABLE wc (a UNIQUE, b);
+    INSERT INTO wc VALUES (1, 10);
+}
+
+@setup upsert-where-combo
+test upsert-where-combo {
+    INSERT INTO wc VALUES (1, 12)
+      ON CONFLICT(a) DO UPDATE SET b = excluded.b
+      WHERE excluded.b >= b + 2;
+    SELECT * FROM wc;
+}
+expect {
+    1|12
+}
+
+# Invalid EXCLUDED column
+setup upsert-invalid-excluded-column {
+    CREATE TABLE xe (a UNIQUE, v);
+    INSERT INTO xe VALUES (1, 'ok');
+}
+
+@setup upsert-invalid-excluded-column
+test upsert-invalid-excluded-column {
+    INSERT INTO xe VALUES (1, 'nope')
+      ON CONFLICT(a) DO UPDATE SET v = excluded.not_a_column;
+}
+expect error { no such column }
+
+# Update changes conflicting key column
+setup upsert-update-conflicting-key {
+    CREATE TABLE uk (a UNIQUE, b);
+    INSERT INTO uk VALUES (1,'old');
+}
+
+@setup upsert-update-conflicting-key
+test upsert-update-conflicting-key {
+    INSERT INTO uk VALUES (1,'new')
+      ON CONFLICT(a) DO UPDATE SET a = 2, b = excluded.b;
+    SELECT * FROM uk;
+}
+expect {
+    2|new
+}
+
+# No-op update succeeds
+setup upsert-noop-update-ok {
+    CREATE TABLE nu (a UNIQUE, b);
+    INSERT INTO nu VALUES (5,'same');
+}
+
+@setup upsert-noop-update-ok
+test upsert-noop-update-ok {
+    INSERT INTO nu VALUES (5,'irrelevant')
+      ON CONFLICT(a) DO UPDATE SET b = b;
+    SELECT * FROM nu;
+}
+expect {
+    5|same
+}
+
+# Update causes second unique violation
+setup upsert-update-causes-second-unique-violation {
+    CREATE TABLE uv (a UNIQUE, b UNIQUE);
+    INSERT INTO uv VALUES (1, 10);
+    INSERT INTO uv VALUES (2, 20);
+}
+
+@setup upsert-update-causes-second-unique-violation
+test upsert-update-causes-second-unique-violation {
+    INSERT INTO uv VALUES (1, 20)
+      ON CONFLICT(a) DO UPDATE SET b = excluded.b;
+}
+expect error {}
+
+# Multi-row mixed where filter
+setup upsert-multirow-mixed-where {
+    CREATE TABLE mm (k UNIQUE, v);
+    INSERT INTO mm VALUES (1,'one');
+}
+
+@setup upsert-multirow-mixed-where
+test upsert-multirow-mixed-where {
+    INSERT INTO mm VALUES (1,'two'), (2,'dos'), (1,'zzz')
+      ON CONFLICT(k) DO UPDATE SET v = excluded.v
+      WHERE excluded.v != 'zzz';
+    SELECT * FROM mm ORDER BY k;
+}
+expect {
+    1|two
+    2|dos
+}
+
+# Omitted target updates unique
+setup upsert-omitted-target-updates-unique {
+    CREATE TABLE ou (a, b);
+    CREATE UNIQUE INDEX ou_a ON ou(a);
+    INSERT INTO ou VALUES (3,'x');
+}
+
+@setup upsert-omitted-target-updates-unique
+test upsert-omitted-target-updates-unique {
+    INSERT INTO ou VALUES (3,'y')
+      ON CONFLICT DO UPDATE SET b = excluded.b;
+    SELECT * FROM ou;
+}
+expect {
+    3|y
+}
+
+# Current table qualified reference
+setup upsert-current-qualified-1 {
+    CREATE TABLE dq (a INTEGER UNIQUE, b TEXT);
+    INSERT INTO dq VALUES (1,'old');
+}
+
+@setup upsert-current-qualified-1
+test upsert-current-qualified-1 {
+    INSERT INTO dq VALUES (1,'new')
+      ON CONFLICT(dq.a) DO UPDATE SET b = dq.b || '-' || excluded.b;
+    SELECT * FROM dq;
+}
+expect {
+    1|old-new
+}
+
+# Multi-column SET with backticks
+setup upsert-multicol-set-1 {
+    CREATE TABLE dq (a INTEGER UNIQUE, b TEXT);
+    INSERT INTO dq VALUES (1,'old');
+}
+
+@setup upsert-multicol-set-1
+test upsert-multicol-set-1 {
+    INSERT INTO dq VALUES (1,'new')
+      ON CONFLICT(a) DO UPDATE SET (`a`,`b`) = (`excluded`.`a`, `excluded`.`b`);
+    SELECT * FROM dq;
+}
+expect {
+    1|new
+}
+
+# WHERE predicate with table reference
+setup upsert-where-predicate-1 {
+    CREATE TABLE dq (a INTEGER UNIQUE, b TEXT);
+    INSERT INTO dq VALUES (1,'old');
+}
+
+@setup upsert-where-predicate-1
+test upsert-where-predicate-1 {
+    INSERT INTO dq VALUES (1,'old')
+      ON CONFLICT(a) DO UPDATE SET b = excluded.b WHERE dq.b != excluded.b;
+    SELECT * FROM dq;
+}
+expect {
+    1|old
+}
+
+# Doubly qualified target
+setup upsert-doubly-qualified-target {
+    CREATE TABLE dq (a UNIQUE, b);
+    INSERT INTO dq VALUES (1,'old');
+}
+
+@setup upsert-doubly-qualified-target
+test upsert-doubly-qualified-target {
+    INSERT INTO dq VALUES (1,'new')
+      ON CONFLICT(main.dq.a) DO UPDATE SET b = excluded.b;
+    SELECT * FROM dq;
+}
+expect {
+    1|new
+}
+
+# Targets chain with multiple indexes
+setup upsert-targets-chain {
+    CREATE TABLE dq (a UNIQUE, b UNIQUE, c UNIQUE, value TEXT);
+    CREATE UNIQUE INDEX dq_ab ON dq(a, b);
+    INSERT INTO dq VALUES ('a1', 'a2', 'a3', 'aaa');
+    INSERT INTO dq VALUES ('b1', 'b2', 'b3', 'bbb');
+    INSERT INTO dq VALUES ('c1', 'c2', 'c3', 'ccc');
+    INSERT INTO dq VALUES ('d1', 'd2', 'd3', 'ddd');
+}
+
+@setup upsert-targets-chain
+test upsert-targets-chain {
+    INSERT INTO dq VALUES
+      ('a1', 'a2', 'a3', 'upd1'), ('b1', 'b1', 'b1', 'upd2'), ('c2', 'c2', 'c2', 'upd3'), ('d3', 'd3', 'd3', 'upd4')
+    ON CONFLICT (a, b) DO UPDATE SET value = excluded.value || '-a'
+    ON CONFLICT (a) DO UPDATE SET value = excluded.value || '-b'
+    ON CONFLICT (b) DO UPDATE SET value = excluded.value || '-c'
+    ON CONFLICT DO UPDATE SET value = excluded.value || '-d';
+    SELECT * FROM dq;
+}
+expect {
+    a1|a2|a3|upd1-a
+    b1|b2|b3|upd2-b
+    c1|c2|c3|upd3-c
+    d1|d2|d3|upd4-d
+}
+
+# Non-rowid PK target (TEXT PRIMARY KEY)
+setup upsert-non-rowid-pk-target {
+    create table phonebook(name text primary key, phonenumber text, validDate date);
+    insert into phonebook values ('Alice','704-545-3333','2018-10-10');
+}
+
+@setup upsert-non-rowid-pk-target
+test upsert-non-rowid-pk-target {
+    insert into phonebook values ('Alice','704-111-1111','2018-10-20') on conflict (name) do update set phonenumber=excluded.phonenumber, validDate=excluded.validDate;
+    SELECT phonenumber, validDate FROM phonebook;
+}
+expect {
+    704-111-1111|2018-10-20
+}
+
+# Collate target mismatch
+setup upsert-collate-target-mismatch {
+    CREATE TABLE cm (name TEXT, v);
+    CREATE UNIQUE INDEX cm_name_nocase ON cm(name COLLATE NOCASE);
+    INSERT INTO cm VALUES ('Alice', 1);
+}
+
+@setup upsert-collate-target-mismatch
+test upsert-collate-target-mismatch {
+    INSERT INTO cm VALUES ('aLiCe', 2)
+      ON CONFLICT(name COLLATE BINARY) DO UPDATE SET v = excluded.v;
+}
+expect error {}
+
+# Collate omitted target matches
+setup upsert-collate-omitted-target-matches {
+    CREATE TABLE co (name TEXT, v);
+    CREATE UNIQUE INDEX co_name_nocase ON co(name COLLATE NOCASE);
+    INSERT INTO co VALUES ('Alice', 1);
+}
+
+@setup upsert-collate-omitted-target-matches
+test upsert-collate-omitted-target-matches {
+    INSERT INTO co VALUES ('aLiCe', 9)
+      ON CONFLICT DO UPDATE SET v = excluded.v;
+    SELECT * FROM co;
+}
+expect {
+    Alice|9
+}
+
+# Composite collate orderless
+setup upsert-composite-collate-orderless {
+    CREATE TABLE cc (name TEXT, city TEXT, val);
+    CREATE UNIQUE INDEX cc_nc ON cc(name COLLATE NOCASE, city);
+    INSERT INTO cc VALUES ('Alice','SF','old');
+}
+
+@setup upsert-composite-collate-orderless
+test upsert-composite-collate-orderless {
+    INSERT INTO cc VALUES ('aLiCe','SF','new')
+      ON CONFLICT(city, name COLLATE NOCASE) DO UPDATE SET val = excluded.val;
+    SELECT * FROM cc;
+}
+expect {
+    Alice|SF|new
+}
+

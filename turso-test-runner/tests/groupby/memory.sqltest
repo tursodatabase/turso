@@ -1,0 +1,61 @@
+# GROUP BY Tests (Memory - standalone tests)
+# Ported from testing/groupby.test
+
+@database :memory:
+
+setup t0-table {
+    CREATE TABLE t0 (a INT, b INT, c INT);
+    CREATE INDEX a_b_idx ON t0 (a, b);
+    INSERT INTO t0 VALUES
+        (1,1,1),
+        (1,1,2),
+        (2,1,3),
+        (2,2,3),
+        (2,2,5);
+}
+
+@setup t0-table
+test group_by_no_sorting_required_reordered_columns {
+    SELECT c, b, a FROM t0 GROUP BY a, b;
+}
+expect {
+    1|1|1
+    3|1|2
+    3|2|2
+}
+
+setup users-having {
+    CREATE TABLE users (first_name TEXT, age INTEGER);
+    INSERT INTO users VALUES
+        ('Michael', 25), ('Michael', 50),
+        ('David', 50),
+        ('Sarah', 65);
+}
+
+@setup users-having
+test having_or {
+    SELECT first_name, count(*) AS cnt, avg(age) AS avg_age
+    FROM users
+    GROUP BY first_name
+    HAVING cnt = 2 OR avg_age = 65
+    ORDER BY cnt DESC;
+}
+expect {
+    Michael|2|37.5
+    Sarah|1|65.0
+}
+
+setup t-xy-table {
+    CREATE TABLE t(x,y);
+    INSERT INTO t VALUES (1,200),(2,100);
+    INSERT INTO t VALUES (1,200),(2,100);
+}
+
+@setup t-xy-table
+test group_by_alias_precedence {
+    SELECT x AS y, SUM(y) AS x FROM t GROUP BY y ORDER BY x;
+}
+expect {
+    2|200
+    1|400
+}

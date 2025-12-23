@@ -54,3 +54,6 @@ bisected.sql
 settings.local.json
 .claude/agents/
 .build-hash
+
+# Track empty wals for read only databases
+!turso-test-runner/database/*

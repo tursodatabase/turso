@@ -1,0 +1,327 @@
+# Views Tests
+# Ported from testing/views.test
+
+@database :memory:
+
+# Basic filtering view
+setup view-basic-filtering {
+    CREATE TABLE products(id INTEGER, name TEXT, price INTEGER, category TEXT);
+    INSERT INTO products VALUES
+        (1, 'Laptop', 1200, 'Electronics'),
+        (2, 'Mouse', 25, 'Electronics'),
+        (3, 'Desk', 350, 'Furniture'),
+        (4, 'Chair', 150, 'Furniture'),
+        (5, 'Monitor', 400, 'Electronics'),
+        (6, 'Keyboard', 75, 'Electronics');
+
+    CREATE VIEW expensive_electronics AS
+        SELECT id, name, price
+        FROM products
+        WHERE category = 'Electronics' AND price > 100;
+}
+
+@setup view-basic-filtering
+test view-basic-filtering {
+    SELECT * FROM expensive_electronics ORDER BY price;
+}
+expect {
+    5|Monitor|400
+    1|Laptop|1200
+}
+
+# Aggregation with GROUP BY view
+setup view-aggregation-groupby {
+    CREATE TABLE sales(product_id INTEGER, quantity INTEGER, day INTEGER);
+    INSERT INTO sales VALUES
+        (1, 2, 1),
+        (2, 5, 1),
+        (1, 1, 2),
+        (3, 1, 2),
+        (2, 3, 3),
+        (1, 1, 3);
+
+    CREATE VIEW daily_sales AS
+        SELECT day,
+               COUNT(*) as transactions,
+               SUM(quantity) as total_items
+        FROM sales
+        GROUP BY day;
+}
+
+@setup view-aggregation-groupby
+test view-aggregation-groupby {
+    SELECT * FROM daily_sales ORDER BY day;
+}
+expect {
+    1|2|7
+    2|2|2
+    3|2|4
+}
+
+# View with JOIN
+setup view-with-join {
+    CREATE TABLE employees(id INTEGER, name TEXT, dept_id INTEGER);
+    CREATE TABLE departments(id INTEGER, name TEXT, budget INTEGER);
+
+    INSERT INTO employees VALUES
+        (1, 'Alice', 1),
+        (2, 'Bob', 2),
+        (3, 'Charlie', 1),
+        (4, 'Diana', 3),
+        (5, 'Eve', 2);
+
+    INSERT INTO departments VALUES
+        (1, 'Engineering', 500000),
+        (2, 'Sales', 300000),
+        (3, 'HR', 150000);
+
+    CREATE VIEW employee_dept AS
+        SELECT e.id,
+               e.name as emp_name,
+               d.name as dept_name,
+               d.budget
+        FROM employees e
+        JOIN departments d ON e.dept_id = d.id;
+}
+
+@setup view-with-join
+test view-with-join {
+    SELECT emp_name, dept_name FROM employee_dept WHERE budget > 200000 ORDER BY emp_name;
+}
+expect {
+    Alice|Engineering
+    Bob|Sales
+    Charlie|Engineering
+    Eve|Sales
+}
+
+# View composition with functions
+setup view-composition-with-functions {
+    CREATE TABLE numbers(value INTEGER);
+    INSERT INTO numbers VALUES (10), (20), (30), (40), (50);
+
+    CREATE VIEW stats AS
+        SELECT
+            SUM(value) as total,
+            COUNT(*) as cnt,
+            AVG(value) as average
+        FROM numbers
+        WHERE value > 15;
+}
+
+@setup view-composition-with-functions
+test view-composition-with-functions {
+    SELECT
+        total,
+        total * 2 as doubled,
+        cnt,
+        LENGTH(CAST(total AS TEXT)) as total_digits
+    FROM stats;
+}
+expect {
+    140|280|4|3
+}
+
+# View referencing another view
+setup view-referencing-view {
+    CREATE TABLE orders(
+        order_id INTEGER,
+        customer_id INTEGER,
+        quantity INTEGER,
+        price INTEGER
+    );
+
+    INSERT INTO orders VALUES
+        (1, 101, 2, 50),
+        (2, 102, 1, 75),
+        (3, 101, 3, 25),
+        (4, 103, 1, 50),
+        (5, 102, 2, 25),
+        (6, 101, 1, 75);
+
+    CREATE VIEW order_totals AS
+        SELECT
+            order_id,
+            customer_id,
+            quantity * price as total_amount
+        FROM orders;
+
+    CREATE VIEW customer_summary AS
+        SELECT
+            customer_id,
+            COUNT(*) as num_orders,
+            SUM(total_amount) as total_spent
+        FROM order_totals
+        GROUP BY customer_id;
+}
+
+@setup view-referencing-view
+test view-referencing-view {
+    SELECT
+        customer_id,
+        num_orders,
+        total_spent
+    FROM customer_summary
+    WHERE total_spent > 100
+    ORDER BY customer_id;
+}
+expect {
+    101|3|250
+    102|2|125
+}
+
+# View with CASE expression
+setup view-case-expression {
+    CREATE TABLE transactions(
+        id INTEGER,
+        account_id INTEGER,
+        type TEXT,
+        amount INTEGER
+    );
+
+    INSERT INTO transactions VALUES
+        (1, 1001, 'D', 1000),
+        (2, 1001, 'W', 200),
+        (3, 1002, 'D', 500),
+        (4, 1001, 'D', 300),
+        (5, 1002, 'W', 100),
+        (6, 1003, 'D', 750),
+        (7, 1002, 'D', 200),
+        (8, 1003, 'W', 250);
+
+    CREATE VIEW account_balance AS
+        SELECT
+            account_id,
+            SUM(CASE WHEN type = 'D' THEN amount ELSE -amount END) as balance,
+            COUNT(CASE WHEN type = 'D' THEN 1 END) as deposits,
+            COUNT(CASE WHEN type = 'W' THEN 1 END) as withdrawals
+        FROM transactions
+        GROUP BY account_id;
+}
+
+@setup view-case-expression
+test view-case-expression {
+    SELECT
+        account_id,
+        balance,
+        deposits + withdrawals as total_txns
+    FROM account_balance
+    WHERE balance > 500
+    ORDER BY account_id;
+}
+expect {
+    1001|1100|3
+    1002|600|3
+}
+
+# Drop and recreate view
+setup view-drop-and-recreate {
+    CREATE TABLE data(x INTEGER, y INTEGER);
+    INSERT INTO data VALUES (1, 10), (2, 20), (3, 30);
+
+    CREATE VIEW simple AS SELECT x, y * 2 as doubled FROM data;
+}
+
+@setup view-drop-and-recreate
+test view-drop-and-recreate {
+    SELECT * FROM simple WHERE x > 1 ORDER BY x;
+}
+expect {
+    2|40
+    3|60
+}
+
+# Recreate view after drop
+setup view-recreate-after-drop {
+    CREATE TABLE data(x INTEGER, y INTEGER);
+    INSERT INTO data VALUES (1, 10), (2, 20), (3, 30);
+
+    CREATE VIEW simple AS SELECT x, y * 2 as doubled FROM data;
+    DROP VIEW simple;
+
+    CREATE VIEW simple AS SELECT x + 1 as modified_x, y FROM data WHERE x > 1;
+}
+
+@setup view-recreate-after-drop
+test view-recreate-after-drop {
+    SELECT * FROM simple ORDER BY modified_x;
+}
+expect {
+    3|20
+    4|30
+}
+
+# View with arithmetic expression
+setup view-arithmetic-expression {
+    CREATE TABLE nums(a INTEGER, b INTEGER);
+    INSERT INTO nums VALUES (10, 5), (20, 8), (30, 12);
+
+    CREATE VIEW sums AS
+        SELECT SUM(a) as sum_a, SUM(b) as sum_b
+        FROM nums;
+}
+
+@setup view-arithmetic-expression
+test view-arithmetic-expression {
+    SELECT
+        sum_a,
+        sum_b,
+        sum_a + sum_b as total,
+        sum_a - sum_b as diff,
+        (sum_a * 100) / (sum_a + sum_b) as percentage_a
+    FROM sums;
+}
+expect {
+    60|25|85|35|70
+}
+
+# View with HAVING
+setup view-with-having {
+    CREATE TABLE product_sales(product TEXT, region TEXT, units INTEGER);
+    INSERT INTO product_sales VALUES
+        ('A', 'North', 100),
+        ('A', 'South', 150),
+        ('B', 'North', 80),
+        ('B', 'South', 60),
+        ('C', 'North', 200),
+        ('C', 'South', 180);
+
+    CREATE VIEW high_volume_products AS
+        SELECT product, SUM(units) as total_units
+        FROM product_sales
+        GROUP BY product
+        HAVING SUM(units) > 200;
+}
+
+@setup view-with-having
+test view-with-having {
+    SELECT * FROM high_volume_products ORDER BY total_units DESC;
+}
+expect {
+    C|380
+    A|250
+}
+
+# Self-referential view detection
+setup view-self-circle-detection {
+    CREATE VIEW v AS SELECT * FROM v;
+}
+
+@setup view-self-circle-detection
+test view-self-circle-detection {
+    SELECT * FROM v;
+}
+expect error { view v is circularly defined }
+
+# Mutual circle detection
+setup view-mutual-circle-detection {
+    CREATE VIEW v AS SELECT * FROM vv;
+    CREATE VIEW vv AS SELECT * FROM v;
+}
+
+@setup view-mutual-circle-detection
+test view-mutual-circle-detection {
+    SELECT * FROM v;
+}
+expect error { view v is circularly defined }
+

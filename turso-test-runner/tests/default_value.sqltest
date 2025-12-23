@@ -1,0 +1,101 @@
+# Default Value Tests
+# Ported from testing/default_value.test
+
+@database :memory:
+
+# Default value text
+setup default-value-text {
+    CREATE TABLE t1 (x INTEGER PRIMARY KEY, y TEXT DEFAULT 'default_value');
+}
+
+@setup default-value-text
+test default-value-text {
+    INSERT INTO t1 (x) VALUES (1);
+    SELECT y FROM t1 WHERE x = 1;
+}
+expect {
+    default_value
+}
+
+# Default value integer
+setup default-value-integer {
+    CREATE TABLE t2 (x INTEGER PRIMARY KEY, y INTEGER DEFAULT 42);
+}
+
+@setup default-value-integer
+test default-value-integer {
+    INSERT INTO t2 (x) VALUES (1);
+    SELECT y FROM t2 WHERE x = 1;
+}
+expect {
+    42
+}
+
+# Default value real
+setup default-value-real {
+    CREATE TABLE t3 (x INTEGER PRIMARY KEY, y REAL DEFAULT 3.14);
+}
+
+@setup default-value-real
+test default-value-real {
+    INSERT INTO t3 (x) VALUES (1);
+    SELECT y FROM t3 WHERE x = 1;
+}
+expect {
+    3.14
+}
+
+# Default value null
+setup default-value-null {
+    CREATE TABLE t5 (x INTEGER PRIMARY KEY, y TEXT DEFAULT NULL);
+}
+
+@setup default-value-null
+test default-value-null {
+    INSERT INTO t5 (x) VALUES (1);
+    SELECT y FROM t5 WHERE x = 1;
+}
+expect {
+}
+
+# Default value boolean
+setup default-value-boolean {
+    CREATE TABLE t6 (x INTEGER PRIMARY KEY, y BOOLEAN DEFAULT 1);
+}
+
+@setup default-value-boolean
+test default-value-boolean {
+    INSERT INTO t6 (x) VALUES (1);
+    SELECT y FROM t6 WHERE x = 1;
+}
+expect {
+    1
+}
+
+# Default value function
+setup default-value-function {
+    CREATE TABLE t7 (x INTEGER PRIMARY KEY, y INTEGER DEFAULT (ABS(-5)));
+}
+
+@setup default-value-function
+test default-value-function {
+    INSERT INTO t7 (x) VALUES (1);
+    SELECT y FROM t7 WHERE x = 1;
+}
+expect {
+    5
+}
+
+# Default value identifier
+setup default-value-identifier {
+    CREATE TABLE t7 (x INTEGER PRIMARY KEY, y DEFAULT asdf);
+}
+
+@setup default-value-identifier
+test default-value-identifier {
+    INSERT INTO t7 (x) VALUES (1);
+    SELECT y FROM t7 WHERE x = 1;
+}
+expect {
+    asdf
+}

@@ -1,0 +1,57 @@
+name: SQL Tests
+
+on:
+  workflow_dispatch:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  sqltest-check:
+    name: Check .sqltest syntax
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v3
+      - uses: useblacksmith/rust-cache@v3
+        with:
+          prefix-key: "v1-rust"
+      - name: Build test runner
+        run: make -C turso-test-runner build-runner
+      - name: Check test syntax
+        run: make -C turso-test-runner check
+
+  sqltest-run:
+    name: Run SQL tests
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v3
+      - uses: useblacksmith/rust-cache@v3
+        with:
+          prefix-key: "v1-rust"
+      - name: Build tursodb
+        run: make -C turso-test-runner build-tursodb
+      - name: Build test runner
+        run: make -C turso-test-runner build-runner
+      - name: Run tests
+        run: make -C turso-test-runner run
+
+  sqltest-sqlite:
+    name: Run SQL tests (SQLite)
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v3
+      - uses: useblacksmith/rust-cache@v3
+        with:
+          prefix-key: "v1-rust"
+      - uses: "./.github/shared/install_sqlite"
+      - name: Build test runner
+        run: make -C turso-test-runner build-runner
+      - name: Run tests against SQLite
+        run: make -C turso-test-runner test-sqlite

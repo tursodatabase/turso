@@ -1,0 +1,13 @@
+# Integrity Check Tests
+# Ported from testing/integrity_check.test
+
+@database database/testing.db readonly
+@database database/testing_norowidalias.db readonly
+
+# Basic integrity check
+test integrity-check {
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}

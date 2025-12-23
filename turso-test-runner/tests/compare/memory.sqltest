@@ -1,0 +1,713 @@
+# Comparison Tests (Memory)
+# Ported from testing/compare.test
+
+@database :memory:
+
+# Equality tests
+test compare-eq-int-int-1 {
+    SELECT 8 = 1;
+}
+expect {
+    0
+}
+
+test compare-eq-int-int-2 {
+    SELECT 8 = 8;
+}
+expect {
+    1
+}
+
+test compare-eq-int-null {
+    SELECT 8 = NULL;
+}
+expect {
+}
+
+test compare-eq-float-float-1 {
+    SELECT 8.0 = 1.0;
+}
+expect {
+    0
+}
+
+test compare-eq-float-float-2 {
+    SELECT 8.0 = 8.0;
+}
+expect {
+    1
+}
+
+test compare-eq-float-null {
+    SELECT 8.0 = NULL;
+}
+expect {
+}
+
+test compare-eq-text-text-1 {
+    SELECT 'a' = 'b';
+}
+expect {
+    0
+}
+
+test compare-eq-text-text-2 {
+    SELECT 'a' = 'a';
+}
+expect {
+    1
+}
+
+test compare-eq-text-null {
+    SELECT 'a' = NULL;
+}
+expect {
+}
+
+test compare-eq-null-int {
+    SELECT NULL = 1;
+}
+expect {
+}
+
+test compare-eq-null-float {
+    SELECT NULL = 1.0;
+}
+expect {
+}
+
+test compare-eq-null-text {
+    SELECT NULL = 'a';
+}
+expect {
+}
+
+test compare-eq-null-null {
+    SELECT NULL = NULL;
+}
+expect {
+}
+
+# Not equal tests
+test compare-neq-int-int-1 {
+    SELECT 8 <> 1;
+}
+expect {
+    1
+}
+
+test compare-neq-int-int-2 {
+    SELECT 8 <> 8;
+}
+expect {
+    0
+}
+
+test compare-neq-int-null {
+    SELECT 8 <> NULL;
+}
+expect {
+}
+
+test compare-neq-float-float-1 {
+    SELECT 8.0 <> 1.0;
+}
+expect {
+    1
+}
+
+test compare-neq-float-float-2 {
+    SELECT 8.0 <> 8.0;
+}
+expect {
+    0
+}
+
+test compare-neq-float-null {
+    SELECT 8.0 <> NULL;
+}
+expect {
+}
+
+test compare-neq-text-text-1 {
+    SELECT 'a' <> 'b';
+}
+expect {
+    1
+}
+
+test compare-neq-text-text-2 {
+    SELECT 'a' <> 'a';
+}
+expect {
+    0
+}
+
+test compare-neq-text-null {
+    SELECT 'a' <> NULL;
+}
+expect {
+}
+
+test compare-neq-null-int {
+    SELECT NULL <> 1;
+}
+expect {
+}
+
+test compare-neq-null-float {
+    SELECT NULL <> 1.0;
+}
+expect {
+}
+
+test compare-neq-null-text {
+    SELECT NULL <> 'a';
+}
+expect {
+}
+
+test compare-neq-null-null {
+    SELECT NULL <> NULL;
+}
+expect {
+}
+
+# Greater than tests
+test compare-gt-int-int-1 {
+    SELECT 1 > 8;
+}
+expect {
+    0
+}
+
+test compare-gt-int-int-2 {
+    SELECT 1 > 1;
+}
+expect {
+    0
+}
+
+test compare-gt-int-int-3 {
+    SELECT 8 > 0;
+}
+expect {
+    1
+}
+
+test compare-gt-int-null {
+    SELECT 8 > NULL;
+}
+expect {
+}
+
+test compare-gt-float-float-1 {
+    SELECT 1.0 > 2.0;
+}
+expect {
+    0
+}
+
+test compare-gt-float-float-2 {
+    SELECT 1.0 > 1.0;
+}
+expect {
+    0
+}
+
+test compare-gt-float-float-3 {
+    SELECT 7.0 > 6.0;
+}
+expect {
+    1
+}
+
+test compare-gt-float-null {
+    SELECT 8.0 > NULL;
+}
+expect {
+}
+
+test compare-gt-text-text-1 {
+    SELECT 'b' > 'c';
+}
+expect {
+    0
+}
+
+test compare-gt-text-text-2 {
+    SELECT 'b' > 'b';
+}
+expect {
+    0
+}
+
+test compare-gt-text-text-3 {
+    SELECT 'b' > 'a';
+}
+expect {
+    1
+}
+
+test compare-gt-text-null {
+    SELECT 'a' > NULL;
+}
+expect {
+}
+
+test compare-gt-null-int {
+    SELECT NULL > 1;
+}
+expect {
+}
+
+test compare-gt-null-float {
+    SELECT NULL > 1.0;
+}
+expect {
+}
+
+test compare-gt-null-text {
+    SELECT NULL > 'a';
+}
+expect {
+}
+
+test compare-gt-null-null {
+    SELECT NULL > NULL;
+}
+expect {
+}
+
+# Greater than or equal tests
+test compare-gte-int-int-1 {
+    SELECT 1 >= 8;
+}
+expect {
+    0
+}
+
+test compare-gte-int-int-2 {
+    SELECT 1 >= 1;
+}
+expect {
+    1
+}
+
+test compare-gte-int-int-3 {
+    SELECT 8 >= 0;
+}
+expect {
+    1
+}
+
+test compare-gte-int-null {
+    SELECT 8 >= NULL;
+}
+expect {
+}
+
+test compare-gte-float-float-1 {
+    SELECT 1.0 >= 2.0;
+}
+expect {
+    0
+}
+
+test compare-gte-float-float-2 {
+    SELECT 1.0 >= 1.0;
+}
+expect {
+    1
+}
+
+test compare-gte-float-float-3 {
+    SELECT 7.0 >= 6.0;
+}
+expect {
+    1
+}
+
+test compare-gte-float-null {
+    SELECT 8.0 >= NULL;
+}
+expect {
+}
+
+test compare-gte-text-text-1 {
+    SELECT 'b' >= 'c';
+}
+expect {
+    0
+}
+
+test compare-gte-text-text-2 {
+    SELECT 'b' >= 'b';
+}
+expect {
+    1
+}
+
+test compare-gte-text-text-3 {
+    SELECT 'b' >= 'a';
+}
+expect {
+    1
+}
+
+test compare-gte-text-null {
+    SELECT 'a' >= NULL;
+}
+expect {
+}
+
+test compare-gte-null-int {
+    SELECT NULL >= 1;
+}
+expect {
+}
+
+test compare-gte-null-float {
+    SELECT NULL >= 1.0;
+}
+expect {
+}
+
+test compare-gte-null-text {
+    SELECT NULL >= 'a';
+}
+expect {
+}
+
+test compare-gte-null-null {
+    SELECT NULL >= NULL;
+}
+expect {
+}
+
+# Less than tests
+test compare-lt-int-int-1 {
+    SELECT 1 < 8;
+}
+expect {
+    1
+}
+
+test compare-lt-int-int-2 {
+    SELECT 1 < 1;
+}
+expect {
+    0
+}
+
+test compare-lt-int-int-3 {
+    SELECT 8 < 0;
+}
+expect {
+    0
+}
+
+test compare-lt-int-null {
+    SELECT 8 < NULL;
+}
+expect {
+}
+
+test compare-lt-float-float-1 {
+    SELECT 1.0 < 2.0;
+}
+expect {
+    1
+}
+
+test compare-lt-float-float-2 {
+    SELECT 1.0 < 1.0;
+}
+expect {
+    0
+}
+
+test compare-lt-float-float-3 {
+    SELECT 7.0 < 6.0;
+}
+expect {
+    0
+}
+
+test compare-lt-float-null {
+    SELECT 8.0 < NULL;
+}
+expect {
+}
+
+test compare-lt-text-text-1 {
+    SELECT 'b' < 'c';
+}
+expect {
+    1
+}
+
+test compare-lt-text-text-2 {
+    SELECT 'b' < 'b';
+}
+expect {
+    0
+}
+
+test compare-lt-text-text-3 {
+    SELECT 'b' < 'a';
+}
+expect {
+    0
+}
+
+test compare-lt-text-null {
+    SELECT 'a' < NULL;
+}
+expect {
+}
+
+test compare-lt-null-int {
+    SELECT NULL < 1;
+}
+expect {
+}
+
+test compare-lt-null-float {
+    SELECT NULL < 1.0;
+}
+expect {
+}
+
+test compare-lt-null-text {
+    SELECT NULL < 'a';
+}
+expect {
+}
+
+test compare-lt-null-null {
+    SELECT NULL < NULL;
+}
+expect {
+}
+
+# Less than or equal tests
+test compare-lte-int-int-1 {
+    SELECT 1 <= 8;
+}
+expect {
+    1
+}
+
+test compare-lte-int-int-2 {
+    SELECT 1 <= 1;
+}
+expect {
+    1
+}
+
+test compare-lte-int-int-3 {
+    SELECT 8 <= 0;
+}
+expect {
+    0
+}
+
+test compare-lte-int-null {
+    SELECT 8 <= NULL;
+}
+expect {
+}
+
+test compare-lte-float-float-1 {
+    SELECT 1.0 <= 2.0;
+}
+expect {
+    1
+}
+
+test compare-lte-float-float-2 {
+    SELECT 1.0 <= 1.0;
+}
+expect {
+    1
+}
+
+test compare-lte-float-float-3 {
+    SELECT 7.0 <= 6.0;
+}
+expect {
+    0
+}
+
+test compare-lte-float-null {
+    SELECT 8.0 <= NULL;
+}
+expect {
+}
+
+test compare-lte-text-text-1 {
+    SELECT 'b' <= 'c';
+}
+expect {
+    1
+}
+
+test compare-lte-text-text-2 {
+    SELECT 'b' <= 'b';
+}
+expect {
+    1
+}
+
+test compare-lte-text-text-3 {
+    SELECT 'b' <= 'a';
+}
+expect {
+    0
+}
+
+test compare-lte-text-null {
+    SELECT 'a' <= NULL;
+}
+expect {
+}
+
+test compare-lte-null-int {
+    SELECT NULL <= 1;
+}
+expect {
+}
+
+test compare-lte-null-float {
+    SELECT NULL <= 1.0;
+}
+expect {
+}
+
+test compare-lte-null-text {
+    SELECT NULL <= 'a';
+}
+expect {
+}
+
+test compare-lte-null-null {
+    SELECT NULL <= NULL;
+}
+expect {
+}
+
+# IS tests
+test compare-is-int-int-1 {
+    SELECT 8 is 1;
+}
+expect {
+    0
+}
+
+test compare-is-int-int-2 {
+    SELECT 8 is 8;
+}
+expect {
+    1
+}
+
+test compare-is-float-float-1 {
+    SELECT 8.0 is 1.0;
+}
+expect {
+    0
+}
+
+test compare-is-float-float-2 {
+    SELECT 8.0 is 8.0;
+}
+expect {
+    1
+}
+
+test compare-is-text-text-1 {
+    SELECT 'a' is 'b';
+}
+expect {
+    0
+}
+
+test compare-is-text-text-2 {
+    SELECT 'a' is 'a';
+}
+expect {
+    1
+}
+
+# IS NOT tests
+test compare-is-not-int-int-1 {
+    SELECT 8 is not 1;
+}
+expect {
+    1
+}
+
+test compare-is-not-int-int-2 {
+    SELECT 8 is not 8;
+}
+expect {
+    0
+}
+
+test compare-is-not-float-float-1 {
+    SELECT 8.0 is not 1.0;
+}
+expect {
+    1
+}
+
+test compare-is-not-float-float-2 {
+    SELECT 8.0 is not 8.0;
+}
+expect {
+    0
+}
+
+test compare-is-not-text-text-1 {
+    SELECT 'a' is not 'b';
+}
+expect {
+    1
+}
+
+test compare-is-not-text-text-2 {
+    SELECT 'a' is not 'a';
+}
+expect {
+    0
+}
+
+# Setup for memory tests with tables
+setup t1-table {
+    CREATE TABLE t1(i INTEGER);
+    INSERT INTO t1 VALUES (0), (-1), (1);
+}
+
+# github-issue: 2957
+@setup t1-table
+test compare-int-float-lte-negative-zero {
+    SELECT i FROM t1 WHERE i <= -0.0 ORDER BY i;
+}
+expect {
+    -1
+    0
+}
+
+setup t1-table-2 {
+    CREATE TABLE t1(i INTEGER);
+    INSERT INTO t1 VALUES (0), (-1), (1);
+}
+
+@setup t1-table-2
+test compare-int-float-lt-negative-zero {
+    SELECT i FROM t1 WHERE i < -0.0 ORDER BY i;
+}
+expect {
+    -1
+}

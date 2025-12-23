@@ -1,0 +1,169 @@
+# CREATE INDEX Tests
+# Ported from testing/create_index.test
+
+@database :memory:
+
+setup create-index-quoted-identifiers {
+    CREATE TABLE "t t" ("a a");
+}
+
+@setup create-index-quoted-identifiers
+test create-index-quoted-identifiers {
+    CREATE INDEX "idx idx" ON "t t" ("a a");
+    CREATE UNIQUE INDEX "unique idx idx" ON "t t" ("a a");
+    SELECT sql FROM sqlite_schema WHERE type='index';
+}
+expect {
+    CREATE INDEX "idx idx" ON "t t" ("a a")
+    CREATE UNIQUE INDEX "unique idx idx" ON "t t" ("a a")
+}
+
+# single-column index key: creating unique index fails with duplicates
+setup create-unique-index-with-duplicates-1 {
+    CREATE TABLE t1(a, b);
+    INSERT INTO t1 VALUES(1, 1);
+    INSERT INTO t1 VALUES(1, 2);
+}
+
+@setup create-unique-index-with-duplicates-1
+test create-unique-index-with-duplicates-1 {
+    CREATE UNIQUE INDEX idx1 ON t1(a);
+}
+expect error {}
+
+# multi-column index key: creating unique index fails with duplicates
+setup create-unique-index-with-duplicates-2 {
+    CREATE TABLE t2(a, b, c);
+    INSERT INTO t2 VALUES(1, 2, 3);
+    INSERT INTO t2 VALUES(1, 2, 4);
+}
+
+@setup create-unique-index-with-duplicates-2
+test create-unique-index-with-duplicates-2 {
+    CREATE UNIQUE INDEX idx2 ON t2(a, b);
+}
+expect error {}
+
+# single-column index key: creating unique index succeeds because NULLs are never equal
+setup create-unique-index-with-duplicates-3 {
+    CREATE TABLE t3(a);
+    INSERT INTO t3 VALUES(NULL);
+    INSERT INTO t3 VALUES(NULL);
+}
+
+@setup create-unique-index-with-duplicates-3
+test create-unique-index-with-duplicates-3 {
+    CREATE UNIQUE INDEX idx3 ON t3(a);
+    SELECT count(*) FROM t3;
+}
+expect {
+    2
+}
+
+# multi-column index key: creating unique index succeeds because NULLs are never equal
+setup create-unique-index-with-duplicates-4 {
+    CREATE TABLE t4(a, b);
+    INSERT INTO t4 VALUES(1, NULL);
+    INSERT INTO t4 VALUES(1, NULL);
+}
+
+@setup create-unique-index-with-duplicates-4
+test create-unique-index-with-duplicates-4 {
+    CREATE UNIQUE INDEX idx4 ON t4(a, b);
+    SELECT count(*) FROM t4;
+}
+expect {
+    2
+}
+
+# multi-column index key: creating unique index succeeds when all NULLs
+setup create-unique-index-with-duplicates-5 {
+    CREATE TABLE t5(a, b);
+    INSERT INTO t5 VALUES(NULL, NULL);
+    INSERT INTO t5 VALUES(NULL, NULL);
+}
+
+@setup create-unique-index-with-duplicates-5
+test create-unique-index-with-duplicates-5 {
+    CREATE UNIQUE INDEX idx5 ON t5(a, b);
+    SELECT count(*) FROM t5;
+}
+expect {
+    2
+}
+
+# creating index on rowid (pseudo-column) should fail
+setup create-index-on-rowid {
+    CREATE TABLE t6(x);
+}
+
+@setup create-index-on-rowid
+test create-index-on-rowid {
+    CREATE INDEX idx6 ON t6(rowid);
+}
+expect error { rowid }
+
+# creating index on _rowid_ (pseudo-column alias) should fail
+setup create-index-on-rowid-alias-1 {
+    CREATE TABLE t7(x);
+}
+
+@setup create-index-on-rowid-alias-1
+test create-index-on-rowid-alias-1 {
+    CREATE INDEX idx7 ON t7(_rowid_);
+}
+expect error { _rowid_ }
+
+# creating index on oid (pseudo-column alias) should fail
+setup create-index-on-rowid-alias-2 {
+    CREATE TABLE t8(x);
+}
+
+@setup create-index-on-rowid-alias-2
+test create-index-on-rowid-alias-2 {
+    CREATE INDEX idx8 ON t8(oid);
+}
+expect error { oid }
+
+# creating index on shadowed rowid column should succeed
+setup create-index-on-shadowed-rowid {
+    CREATE TABLE t9(rowid int, x);
+}
+
+@setup create-index-on-shadowed-rowid
+test create-index-on-shadowed-rowid {
+    CREATE INDEX idx9 ON t9(rowid);
+    SELECT name FROM sqlite_schema WHERE type='index';
+}
+expect {
+    idx9
+}
+
+# creating index on shadowed _rowid_ column should succeed
+setup create-index-on-shadowed-rowid-alias-1 {
+    CREATE TABLE t10(_rowid_ int, x);
+}
+
+@setup create-index-on-shadowed-rowid-alias-1
+test create-index-on-shadowed-rowid-alias-1 {
+    CREATE INDEX idx10 ON t10(_rowid_);
+    SELECT name FROM sqlite_schema WHERE type='index';
+}
+expect {
+    idx10
+}
+
+# creating index on shadowed oid column should succeed
+setup create-index-on-shadowed-rowid-alias-2 {
+    CREATE TABLE t11(oid int, x);
+}
+
+@setup create-index-on-shadowed-rowid-alias-2
+test create-index-on-shadowed-rowid-alias-2 {
+    CREATE INDEX idx11 ON t11(oid);
+    SELECT name FROM sqlite_schema WHERE type='index';
+}
+expect {
+    idx11
+}
+

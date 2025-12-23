@@ -1,0 +1,36 @@
+# Affinity Tests
+# Ported from testing/affinity.test
+
+@database :memory:
+
+setup affinity-table {
+    CREATE TABLE t1 (c INTEGER);
+    INSERT INTO t1 VALUES ('1');
+    INSERT INTO t1 VALUES ('1a');
+}
+
+setup rowid-table {
+    CREATE TABLE t(a integer);
+    INSERT INTO t(rowid, a) VALUES (1, 1);
+}
+
+# Test INTEGER column affinity with string values
+@setup affinity-table
+test affinity {
+    SELECT c, typeof(c) FROM t1;
+}
+expect {
+    1|integer
+    1a|text
+}
+
+# Test rowid vs column affinity when comparing with strings
+@setup rowid-table
+test affinity-rowid {
+    SELECT * FROM t WHERE rowid = '1';
+    SELECT * FROM t WHERE a = '1';
+}
+expect {
+    1
+    1
+}

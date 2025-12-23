@@ -1,0 +1,223 @@
+# ALTER COLUMN Tests
+# Ported from testing/alter_column.test
+
+@database :memory:
+
+# Rename and change type
+setup alter-column-rename-and-type {
+    CREATE TABLE t (a INTEGER);
+    CREATE INDEX i ON t (a);
+}
+
+@setup alter-column-rename-and-type
+test alter-column-rename-and-type {
+    ALTER TABLE t ALTER COLUMN a TO b BLOB;
+    SELECT sql FROM sqlite_schema;
+}
+expect {
+    CREATE TABLE t (b BLOB)
+    CREATE INDEX i ON t (b)
+}
+
+# Fail: alter column to primary key
+setup fail-alter-column-primary-key {
+    CREATE TABLE t (a);
+}
+
+@setup fail-alter-column-primary-key
+test fail-alter-column-primary-key {
+    ALTER TABLE t ALTER COLUMN a TO a PRIMARY KEY;
+}
+expect error {}
+
+# Fail: alter column to unique
+setup fail-alter-column-unique {
+    CREATE TABLE t (a);
+}
+
+@setup fail-alter-column-unique
+test fail-alter-column-unique {
+    ALTER TABLE t ALTER COLUMN a TO a UNIQUE;
+}
+expect error {}
+
+# Rename primary key column
+setup alter-table-rename-pk-column {
+    CREATE TABLE customers (cust_id INTEGER PRIMARY KEY, cust_name TEXT);
+    INSERT INTO customers VALUES (1, 'Alice'), (2, 'Bob');
+}
+
+@setup alter-table-rename-pk-column
+test alter-table-rename-pk-column {
+    ALTER TABLE customers RENAME COLUMN cust_id TO customer_id;
+    SELECT sql FROM sqlite_schema WHERE name = 'customers';
+    SELECT customer_id, cust_name FROM customers ORDER BY customer_id;
+}
+expect {
+    CREATE TABLE customers (customer_id INTEGER PRIMARY KEY, cust_name TEXT)
+    1|Alice
+    2|Bob
+}
+
+# Rename composite primary key
+setup alter-table-rename-composite-pk {
+    CREATE TABLE products (category TEXT, prod_code TEXT, name TEXT, PRIMARY KEY (category, prod_code));
+    INSERT INTO products VALUES ('Electronics', 'E001', 'Laptop');
+}
+
+@setup alter-table-rename-composite-pk
+test alter-table-rename-composite-pk {
+    ALTER TABLE products RENAME COLUMN prod_code TO product_code;
+    SELECT sql FROM sqlite_schema WHERE name = 'products';
+    SELECT category, product_code, name FROM products;
+}
+expect {
+    CREATE TABLE products (category TEXT, product_code TEXT, name TEXT, PRIMARY KEY (category, product_code))
+    Electronics|E001|Laptop
+}
+
+# Foreign key child column rename
+setup alter-table-rename-fk-child {
+    CREATE TABLE parent (id INTEGER PRIMARY KEY);
+    CREATE TABLE child (cid INTEGER PRIMARY KEY, pid INTEGER, FOREIGN KEY (pid) REFERENCES parent(id));
+    INSERT INTO parent VALUES (1);
+    INSERT INTO child VALUES (1, 1);
+}
+
+@setup alter-table-rename-fk-child
+test alter-table-rename-fk-child {
+    ALTER TABLE child RENAME COLUMN pid TO parent_id;
+    SELECT sql FROM sqlite_schema WHERE name = 'child';
+}
+expect {
+    CREATE TABLE child (cid INTEGER PRIMARY KEY, parent_id INTEGER, FOREIGN KEY (parent_id) REFERENCES parent (id))
+}
+
+# Foreign key parent column rename
+setup alter-table-rename-fk-parent {
+    CREATE TABLE orders (order_id INTEGER PRIMARY KEY, date TEXT);
+    CREATE TABLE items (item_id INTEGER PRIMARY KEY, oid INTEGER, FOREIGN KEY (oid) REFERENCES orders(order_id));
+}
+
+@setup alter-table-rename-fk-parent
+test alter-table-rename-fk-parent {
+    ALTER TABLE orders RENAME COLUMN order_id TO ord_id;
+    SELECT sql FROM sqlite_schema WHERE name = 'orders';
+    SELECT sql FROM sqlite_schema WHERE name = 'items';
+}
+expect {
+    CREATE TABLE orders (ord_id INTEGER PRIMARY KEY, date TEXT)
+    CREATE TABLE items (item_id INTEGER PRIMARY KEY, oid INTEGER, FOREIGN KEY (oid) REFERENCES orders (ord_id))
+}
+
+# Multiple foreign keys to same parent
+setup alter-table-rename-multiple-fks {
+    CREATE TABLE users (uid INTEGER PRIMARY KEY);
+    CREATE TABLE messages (mid INTEGER PRIMARY KEY, sender INTEGER, receiver INTEGER,
+                          FOREIGN KEY (sender) REFERENCES users(uid),
+                          FOREIGN KEY (receiver) REFERENCES users(uid));
+}
+
+@setup alter-table-rename-multiple-fks
+test alter-table-rename-multiple-fks {
+    ALTER TABLE users RENAME COLUMN uid TO user_id;
+    SELECT sql FROM sqlite_schema WHERE name = 'messages';
+}
+expect {
+    CREATE TABLE messages (mid INTEGER PRIMARY KEY, sender INTEGER, receiver INTEGER, FOREIGN KEY (sender) REFERENCES users (user_id), FOREIGN KEY (receiver) REFERENCES users (user_id))
+}
+
+# Self-referencing foreign key
+setup alter-table-rename-self-ref-fk {
+    CREATE TABLE employees (emp_id INTEGER PRIMARY KEY, manager_id INTEGER,
+                           FOREIGN KEY (manager_id) REFERENCES employees(emp_id));
+}
+
+@setup alter-table-rename-self-ref-fk
+test alter-table-rename-self-ref-fk {
+    ALTER TABLE employees RENAME COLUMN emp_id TO employee_id;
+    SELECT sql FROM sqlite_schema WHERE name = 'employees';
+}
+expect {
+    CREATE TABLE employees (employee_id INTEGER PRIMARY KEY, manager_id INTEGER, FOREIGN KEY (manager_id) REFERENCES employees (employee_id))
+}
+
+# Self-referencing table rename
+setup rename-self-1 {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE s1(id INTEGER PRIMARY KEY, parent INTEGER,
+      FOREIGN KEY(parent) REFERENCES s1(id));
+    INSERT INTO s1 VALUES (1,NULL);
+    INSERT INTO s1 VALUES (2,1);
+}
+
+@setup rename-self-1
+test rename-self-1 {
+    ALTER TABLE s1 RENAME TO s1_new;
+    SELECT name, tbl_name, sql LIKE '%REFERENCES s1_new%' FROM sqlite_schema WHERE type='table' AND name='s1_new';
+}
+expect {
+    s1_new|s1_new|1
+}
+
+# Rename parent table
+setup rename-parent-1 {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid INTEGER,
+      FOREIGN KEY(pid) REFERENCES p(id));
+    INSERT INTO p VALUES(1);
+    INSERT INTO c VALUES(10,1);
+}
+
+@setup rename-parent-1
+test rename-parent-1 {
+    ALTER TABLE p RENAME TO p_new;
+    INSERT INTO p_new VALUES(2);
+    INSERT INTO c VALUES(20,2);
+    SELECT c.id, c.pid FROM c JOIN p_new ON p_new.id=c.pid ORDER BY c.id;
+}
+expect {
+    10|1
+    20|2
+}
+
+# Adding generated column should error
+setup alter-table-add-generated-column-error {
+    CREATE TABLE t(a);
+}
+
+@setup alter-table-add-generated-column-error
+test alter-table-add-generated-column-error {
+    ALTER TABLE t ADD COLUMN b AS (NULL);
+}
+expect error { generated columns }
+
+# Add column with foreign key reference
+setup alter-table-add-column-with-fk-updates-schema {
+    CREATE TABLE t(a);
+    CREATE TABLE s(a);
+}
+
+@setup alter-table-add-column-with-fk-updates-schema
+test alter-table-add-column-with-fk-updates-schema {
+    ALTER TABLE s ADD COLUMN b REFERENCES t(a);
+    SELECT sql FROM sqlite_schema WHERE name = 's';
+}
+expect {
+    CREATE TABLE s (a, b, FOREIGN KEY (b) REFERENCES t(a))
+}
+
+# Add self-referential foreign key column
+setup alter-table-add-self-ref-fk-updates-schema {
+    CREATE TABLE s(a);
+}
+
+@setup alter-table-add-self-ref-fk-updates-schema
+test alter-table-add-self-ref-fk-updates-schema {
+    ALTER TABLE s ADD COLUMN b REFERENCES s(a);
+    SELECT sql FROM sqlite_schema WHERE name = 's';
+}
+expect {
+    CREATE TABLE s (a, b, FOREIGN KEY (b) REFERENCES s(a))
+}

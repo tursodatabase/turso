@@ -1,0 +1,1707 @@
+# Foreign Keys Tests
+# Ported from testing/foreign_keys.test
+
+@database :memory:
+
+# Basic FK ok
+setup fk-basic-ok {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT);
+    CREATE TABLE t2 (id INTEGER PRIMARY KEY, tid REFERENCES t(id));
+    INSERT INTO t VALUES (1,'x'),(2,'y');
+}
+
+@setup fk-basic-ok
+test fk-basic-ok {
+    PRAGMA foreign_keys=ON;
+    INSERT INTO t2 VALUES (10,1),(11,NULL);
+    SELECT id,tid FROM t2 ORDER BY id;
+}
+expect {
+    10|1
+    11|
+}
+
+# FK insert child missing parent
+setup fk-insert-child-missing-parent {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT);
+    CREATE TABLE t2 (id INTEGER PRIMARY KEY, tid REFERENCES t(id));
+}
+
+@setup fk-insert-child-missing-parent
+test fk-insert-child-missing-parent {
+    PRAGMA foreign_keys=ON;
+    INSERT INTO t2 VALUES (20,99);
+}
+expect error {}
+
+# FK update child to missing parent
+setup fk-update-child-to-missing-parent {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT);
+    CREATE TABLE t2 (id INTEGER PRIMARY KEY, tid REFERENCES t(id));
+    INSERT INTO t VALUES (1,'x');
+    INSERT INTO t2 VALUES (10,1);
+}
+
+@setup fk-update-child-to-missing-parent
+test fk-update-child-to-missing-parent {
+    PRAGMA foreign_keys=ON;
+    UPDATE t2 SET tid = 42 WHERE id = 10;
+}
+expect error {}
+
+# FK update child to NULL is ok
+setup fk-update-child-to-null-ok {
+    CREATE TABLE t (id INTEGER PRIMARY KEY);
+    CREATE TABLE t2 (id INTEGER PRIMARY KEY, tid REFERENCES t(id));
+    INSERT INTO t VALUES (1);
+    INSERT INTO t2 VALUES (7,1);
+}
+
+@setup fk-update-child-to-null-ok
+test fk-update-child-to-null-ok {
+    PRAGMA foreign_keys=ON;
+    UPDATE t2 SET tid = NULL WHERE id = 7;
+    SELECT id, tid FROM t2;
+}
+expect {
+    7|
+}
+
+# FK delete parent blocked
+setup fk-delete-parent-blocked {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT);
+    CREATE TABLE t2 (id INTEGER PRIMARY KEY, tid REFERENCES t(id));
+    INSERT INTO t VALUES (1,'x'),(2,'y');
+    INSERT INTO t2 VALUES (10,2);
+}
+
+@setup fk-delete-parent-blocked
+test fk-delete-parent-blocked {
+    PRAGMA foreign_keys=ON;
+    DELETE FROM t WHERE id=2;
+}
+expect error {}
+
+# FK delete parent ok when no child
+setup fk-delete-parent-ok-when-no-child {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, a TEXT);
+    CREATE TABLE t2 (id INTEGER PRIMARY KEY, tid REFERENCES t(id));
+    INSERT INTO t VALUES (1,'x'),(2,'y');
+    INSERT INTO t2 VALUES (10,1);
+}
+
+@setup fk-delete-parent-ok-when-no-child
+test fk-delete-parent-ok-when-no-child {
+    PRAGMA foreign_keys=ON;
+    DELETE FROM t WHERE id=2;
+    SELECT id FROM t ORDER BY id;
+}
+expect {
+    1
+}
+
+# FK composite PK ok
+setup fk-composite-pk-ok {
+    CREATE TABLE p(a INT NOT NULL, b INT NOT NULL, PRIMARY KEY(a,b));
+    CREATE TABLE c(id INT PRIMARY KEY, x INT, y INT, FOREIGN KEY(x,y) REFERENCES p(a,b));
+    INSERT INTO p VALUES (1,1),(1,2);
+}
+
+@setup fk-composite-pk-ok
+test fk-composite-pk-ok {
+    PRAGMA foreign_keys=ON;
+    INSERT INTO c VALUES (10,1,1),(11,1,2),(12,NULL,2);
+    SELECT id,x,y FROM c ORDER BY id;
+}
+expect {
+    10|1|1
+    11|1|2
+    12||2
+}
+
+# FK composite PK missing
+setup fk-composite-pk-missing {
+    CREATE TABLE p(a INT NOT NULL, b INT NOT NULL, PRIMARY KEY(a,b));
+    CREATE TABLE c(id INT PRIMARY KEY, x INT, y INT, FOREIGN KEY(x,y) REFERENCES p(a,b));
+    INSERT INTO p VALUES (1,1);
+}
+
+@setup fk-composite-pk-missing
+test fk-composite-pk-missing {
+    PRAGMA foreign_keys=ON;
+    INSERT INTO c VALUES (20,1,2);
+}
+expect error {}
+
+# FK composite update child missing
+setup fk-composite-update-child-missing {
+    CREATE TABLE p(a INT NOT NULL, b INT NOT NULL, PRIMARY KEY(a,b));
+    CREATE TABLE c(id INT PRIMARY KEY, x INT, y INT, FOREIGN KEY(x,y) REFERENCES p(a,b));
+    INSERT INTO p VALUES (1,1),(2,2);
+    INSERT INTO c VALUES (5,1,1);
+}
+
+@setup fk-composite-update-child-missing
+test fk-composite-update-child-missing {
+    PRAGMA foreign_keys=ON;
+    UPDATE c SET x=2,y=3 WHERE id=5;
+}
+expect error {}
+
+# FK composite unique ok
+setup fk-composite-unique-ok {
+    CREATE TABLE parent(u TEXT, v TEXT, pad INT, UNIQUE(u,v));
+    CREATE TABLE child(id INT PRIMARY KEY, cu TEXT, cv TEXT, FOREIGN KEY(cu,cv) REFERENCES parent(u,v));
+    INSERT INTO parent VALUES ('A','B',0),('A','C',0);
+}
+
+@setup fk-composite-unique-ok
+test fk-composite-unique-ok {
+    PRAGMA foreign_keys=ON;
+    INSERT INTO child VALUES (1,'A','B');
+    SELECT id, cu, cv FROM child ORDER BY id;
+}
+expect {
+    1|A|B
+}
+
+# FK composite unique missing
+setup fk-composite-unique-missing {
+    CREATE TABLE parent(u TEXT, v TEXT, pad INT, UNIQUE(u,v));
+    CREATE TABLE child(id INT PRIMARY KEY, cu TEXT, cv TEXT, FOREIGN KEY(cu,cv) REFERENCES parent(u,v));
+    INSERT INTO parent VALUES ('A','B',0);
+}
+
+@setup fk-composite-unique-missing
+test fk-composite-unique-missing {
+    PRAGMA foreign_keys=ON;
+    INSERT INTO child VALUES (2,'A','X');
+}
+expect error {}
+
+# FK rowid alias parent
+setup fk-rowid-alias-parent {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT);
+    CREATE TABLE c(cid INTEGER PRIMARY KEY, rid REFERENCES t(rowid));
+    INSERT INTO t VALUES (100,'x');
+}
+
+@setup fk-rowid-alias-parent
+test fk-rowid-alias-parent {
+    PRAGMA foreign_keys=ON;
+    INSERT INTO c VALUES (1, 100);
+}
+expect error {}
+
+# FK rowid alias parent missing
+setup fk-rowid-alias-parent-missing {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT);
+    CREATE TABLE c(cid INTEGER PRIMARY KEY, rid REFERENCES t(rowid));
+}
+
+@setup fk-rowid-alias-parent-missing
+test fk-rowid-alias-parent-missing {
+    PRAGMA foreign_keys=ON;
+    INSERT INTO c VALUES (1, 9999);
+}
+expect error {}
+
+# FK update child noop ok
+setup fk-update-child-noop-ok {
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid REFERENCES p(id));
+    INSERT INTO p VALUES (1);
+    INSERT INTO c VALUES (10,1);
+}
+
+@setup fk-update-child-noop-ok
+test fk-update-child-noop-ok {
+    PRAGMA foreign_keys=ON;
+    UPDATE c SET id = id WHERE id = 10;
+    SELECT id, pid FROM c;
+}
+expect {
+    10|1
+}
+
+# FK delete parent composite scan
+setup fk-delete-parent-composite-scan {
+    CREATE TABLE p(a INT NOT NULL, b INT NOT NULL, PRIMARY KEY(a,b));
+    CREATE TABLE c(id INT PRIMARY KEY, x INT, y INT, FOREIGN KEY(x,y) REFERENCES p(a,b));
+    INSERT INTO p VALUES (1,2),(2,3);
+    INSERT INTO c VALUES (7,2,3);
+}
+
+@setup fk-delete-parent-composite-scan
+test fk-delete-parent-composite-scan {
+    PRAGMA foreign_keys=ON;
+    DELETE FROM p WHERE a=2 AND b=3;
+}
+expect error {}
+
+# FK update child to existing ok
+setup fk-update-child-to-existing-ok {
+    CREATE TABLE t(id INTEGER PRIMARY KEY);
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, tid REFERENCES t(id));
+    INSERT INTO t VALUES (1),(2);
+    INSERT INTO t2 VALUES (9,1);
+}
+
+@setup fk-update-child-to-existing-ok
+test fk-update-child-to-existing-ok {
+    PRAGMA foreign_keys=ON;
+    UPDATE t2 SET tid = 2 WHERE id = 9;
+    SELECT id, tid FROM t2;
+}
+expect {
+    9|2
+}
+
+# FK composite PK delete ok
+setup fk-composite-pk-delete-ok {
+    CREATE TABLE p(a INT NOT NULL, b INT NOT NULL, PRIMARY KEY(a,b));
+    CREATE TABLE c(id INT PRIMARY KEY, x INT, y INT, FOREIGN KEY(x,y) REFERENCES p(a,b));
+    INSERT INTO p VALUES (1,2),(2,3);
+    INSERT INTO c VALUES (7,2,3);
+}
+
+@setup fk-composite-pk-delete-ok
+test fk-composite-pk-delete-ok {
+    PRAGMA foreign_keys=ON;
+    DELETE FROM p WHERE a=1 AND b=2;
+    SELECT a,b FROM p ORDER BY a,b;
+}
+expect {
+    2|3
+}
+
+# FK composite PK delete violate
+setup fk-composite-pk-delete-violate {
+    CREATE TABLE p(a INT NOT NULL, b INT NOT NULL, PRIMARY KEY(a,b));
+    CREATE TABLE c(id INT PRIMARY KEY, x INT, y INT, FOREIGN KEY(x,y) REFERENCES p(a,b));
+    INSERT INTO p VALUES (2,3);
+    INSERT INTO c VALUES (7,2,3);
+}
+
+@setup fk-composite-pk-delete-violate
+test fk-composite-pk-delete-violate {
+    PRAGMA foreign_keys=ON;
+    DELETE FROM p WHERE a=2 AND b=3;
+}
+expect error {}
+
+# FK default parent PK composite ok
+setup fk-default-parent-pk-composite-ok {
+    CREATE TABLE p(a INT NOT NULL, b INT NOT NULL, PRIMARY KEY(a,b));
+    CREATE TABLE c(id INT PRIMARY KEY, x INT, y INT, FOREIGN KEY(x,y) REFERENCES p);
+    INSERT INTO p VALUES (1,1), (1,2);
+}
+
+@setup fk-default-parent-pk-composite-ok
+test fk-default-parent-pk-composite-ok {
+    PRAGMA foreign_keys=ON;
+    INSERT INTO c VALUES (10,1,1), (11,1,2), (12,NULL,2);
+    SELECT id,x,y FROM c ORDER BY id;
+}
+expect {
+    10|1|1
+    11|1|2
+    12||2
+}
+
+# FK default parent PK composite missing
+setup fk-default-parent-pk-composite-missing {
+    CREATE TABLE p(a INT NOT NULL, b INT NOT NULL, PRIMARY KEY(a,b));
+    CREATE TABLE c(id INT PRIMARY KEY, x INT, y INT, FOREIGN KEY(x,y) REFERENCES p);
+    INSERT INTO p VALUES (1,1);
+}
+
+@setup fk-default-parent-pk-composite-missing
+test fk-default-parent-pk-composite-missing {
+    PRAGMA foreign_keys=ON;
+    INSERT INTO c VALUES (20,1,2);
+}
+expect error {}
+
+# FK default parent rowid no parent PK
+setup fk-default-parent-rowid-no-parent-pk {
+    CREATE TABLE p_no_pk(v TEXT);
+    CREATE TABLE c_rowid(id INT PRIMARY KEY, r REFERENCES p_no_pk);
+}
+
+@setup fk-default-parent-rowid-no-parent-pk
+test fk-default-parent-rowid-no-parent-pk {
+    PRAGMA foreign_keys=ON;
+    INSERT INTO p_no_pk(v) VALUES ('a'), ('b');
+    INSERT INTO c_rowid VALUES (1, 1);
+}
+expect error {}
+
+# FK parent omit cols parent has PK
+setup fk-parent-omit-cols-parent-has-pk {
+    CREATE TABLE p_pk(id INTEGER PRIMARY KEY, v TEXT);
+    CREATE TABLE c_ok(id INT PRIMARY KEY, r REFERENCES p_pk);
+    INSERT INTO p_pk VALUES (1,'a'),(2,'b');
+}
+
+@setup fk-parent-omit-cols-parent-has-pk
+test fk-parent-omit-cols-parent-has-pk {
+    PRAGMA foreign_keys=ON;
+    INSERT INTO c_ok VALUES (10,1);
+    INSERT INTO c_ok VALUES (11,2);
+    SELECT id, r FROM c_ok ORDER BY id;
+}
+expect {
+    10|1
+    11|2
+}
+
+# FK self IPK single ok
+setup fk-self-ipk-single-ok {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, rid REFERENCES t(id));
+}
+
+@setup fk-self-ipk-single-ok
+test fk-self-ipk-single-ok {
+    PRAGMA foreign_keys=ON;
+    INSERT INTO t(id,rid) VALUES(5,5);
+    SELECT id, rid FROM t;
+}
+expect {
+    5|5
+}
+
+# FK self IPK single mismatch
+setup fk-self-ipk-single-mismatch {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, rid REFERENCES t(id));
+}
+
+@setup fk-self-ipk-single-mismatch
+test fk-self-ipk-single-mismatch {
+    PRAGMA foreign_keys=ON;
+    INSERT INTO t(id,rid) VALUES(5,4);
+}
+expect error {}
+
+# FK self composite single ok
+setup fk-self-composite-single-ok {
+    CREATE TABLE t(a INT NOT NULL, b INT NOT NULL, x INT, y INT, PRIMARY KEY(a,b), FOREIGN KEY(x,y) REFERENCES t(a,b));
+}
+
+@setup fk-self-composite-single-ok
+test fk-self-composite-single-ok {
+    PRAGMA foreign_keys=ON;
+    INSERT INTO t(a,b,x,y) VALUES(1,2,1,2);
+    SELECT a,b,x,y FROM t;
+}
+expect {
+    1|2|1|2
+}
+
+# FK rowid mustbeint coercion ok
+setup fk-rowid-mustbeint-coercion-ok {
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(cid INTEGER PRIMARY KEY, pid REFERENCES p(id));
+    INSERT INTO p(id) VALUES(10);
+}
+
+@setup fk-rowid-mustbeint-coercion-ok
+test fk-rowid-mustbeint-coercion-ok {
+    PRAGMA foreign_keys=ON;
+    INSERT INTO c VALUES(1, '10');
+    SELECT pid FROM c;
+}
+expect {
+    10
+}
+
+# FK rowid mustbeint coercion fail
+setup fk-rowid-mustbeint-coercion-fail {
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(cid INTEGER PRIMARY KEY, pid REFERENCES p(id));
+    INSERT INTO p(id) VALUES(10);
+}
+
+@setup fk-rowid-mustbeint-coercion-fail
+test fk-rowid-mustbeint-coercion-fail {
+    PRAGMA foreign_keys=ON;
+    INSERT INTO c VALUES(2, 'abc');
+}
+expect error {}
+
+# FK parent unique index ok
+setup fk-parent-unique-index-ok {
+    CREATE TABLE parent(u TEXT, v TEXT, pad INT, UNIQUE(u,v));
+    CREATE TABLE child(id INT PRIMARY KEY, cu TEXT, cv TEXT, FOREIGN KEY(cu,cv) REFERENCES parent(u,v));
+    INSERT INTO parent VALUES ('A','B',0),('A','C',0);
+}
+
+@setup fk-parent-unique-index-ok
+test fk-parent-unique-index-ok {
+    PRAGMA foreign_keys=ON;
+    INSERT INTO child VALUES (1,'A','B');
+    SELECT id, cu, cv FROM child ORDER BY id;
+}
+expect {
+    1|A|B
+}
+
+# FK parent unique index missing
+setup fk-parent-unique-index-missing {
+    CREATE TABLE parent(u TEXT, v TEXT, pad INT, UNIQUE(u,v));
+    CREATE TABLE child(id INT PRIMARY KEY, cu TEXT, cv TEXT, FOREIGN KEY(cu,cv) REFERENCES parent(u,v));
+    INSERT INTO parent VALUES ('A','B',0);
+}
+
+@setup fk-parent-unique-index-missing
+test fk-parent-unique-index-missing {
+    PRAGMA foreign_keys=ON;
+    INSERT INTO child VALUES (2,'A','X');
+}
+expect error {}
+
+# FK child null shortcircuit
+setup fk-child-null-shortcircuit {
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid REFERENCES p(id));
+}
+
+@setup fk-child-null-shortcircuit
+test fk-child-null-shortcircuit {
+    PRAGMA foreign_keys=ON;
+    INSERT INTO c VALUES (1, NULL);
+    SELECT id, pid FROM c;
+}
+expect {
+    1|
+}
+
+# FK self unique ok
+setup fk-self-unique-ok {
+    CREATE TABLE t(u TEXT, v TEXT, cu TEXT, cv TEXT, UNIQUE(u,v), FOREIGN KEY(cu,cv) REFERENCES t(u,v));
+}
+
+@setup fk-self-unique-ok
+test fk-self-unique-ok {
+    PRAGMA foreign_keys=ON;
+    INSERT INTO t(u,v,cu,cv) VALUES('A','B','A','B');
+    SELECT u, v, cu, cv FROM t;
+}
+expect {
+    A|B|A|B
+}
+
+# FK self unique mismatch
+setup fk-self-unique-mismatch {
+    CREATE TABLE t(u TEXT, v TEXT, cu TEXT, cv TEXT, UNIQUE(u,v), FOREIGN KEY(cu,cv) REFERENCES t(u,v));
+}
+
+@setup fk-self-unique-mismatch
+test fk-self-unique-mismatch {
+    PRAGMA foreign_keys=ON;
+    INSERT INTO t(u,v,cu,cv) VALUES('A','B','A','X');
+}
+expect error {}
+
+# FK self unique reference existing ok
+setup fk-self-unique-reference-existing-ok {
+    CREATE TABLE t(u TEXT, v TEXT, cu TEXT, cv TEXT, UNIQUE(u,v), FOREIGN KEY(cu,cv) REFERENCES t(u,v));
+    INSERT INTO t(u,v,cu,cv) VALUES('P','Q',NULL,NULL);
+}
+
+@setup fk-self-unique-reference-existing-ok
+test fk-self-unique-reference-existing-ok {
+    PRAGMA foreign_keys=ON;
+    INSERT INTO t(u,v,cu,cv) VALUES('X','Y','P','Q');
+    SELECT u, v, cu, cv FROM t ORDER BY u, v, cu, cv;
+}
+expect {
+    P|Q||
+    X|Y|P|Q
+}
+
+# FK self unique multirow no fastpath
+setup fk-self-unique-multirow-no-fastpath {
+    CREATE TABLE t(u TEXT, v TEXT, cu TEXT, cv TEXT, UNIQUE(u,v), FOREIGN KEY(cu,cv) REFERENCES t(u,v));
+}
+
+@setup fk-self-unique-multirow-no-fastpath
+test fk-self-unique-multirow-no-fastpath {
+    PRAGMA foreign_keys=ON;
+    INSERT INTO t(u,v,cu,cv) VALUES ('C','D','C','D'), ('E','F','E','F');
+    SELECT 'ok';
+}
+expect {
+    ok
+}
+
+# FK self multirow one bad
+setup fk-self-multirow-one-bad {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, rid INTEGER, FOREIGN KEY(rid) REFERENCES t(id));
+}
+
+@setup fk-self-multirow-one-bad
+test fk-self-multirow-one-bad {
+    PRAGMA foreign_keys=ON;
+    INSERT INTO t(id,rid) VALUES (1,1),(3,99);
+}
+expect error {}
+
+# FK deferred commit doesn't fail early
+setup fk-deferred-commit-doesnt-fail-early {
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+}
+
+@setup fk-deferred-commit-doesnt-fail-early
+test fk-deferred-commit-doesnt-fail-early {
+    PRAGMA foreign_keys=ON;
+    BEGIN;
+    INSERT INTO c VALUES(1, 99);
+    SELECT 'ok';
+}
+expect {
+    ok
+}
+
+# FK deferred commit fails
+setup fk-deferred-commit-fails {
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+}
+
+@setup fk-deferred-commit-fails
+test fk-deferred-commit-fails {
+    PRAGMA foreign_keys=ON;
+    BEGIN;
+    INSERT INTO c VALUES(1, 99);
+    COMMIT;
+}
+expect error {}
+
+# FK deferred fix before commit succeeds
+setup fk-deferred-fix-before-commit-succeeds {
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+}
+
+@setup fk-deferred-fix-before-commit-succeeds
+test fk-deferred-fix-before-commit-succeeds {
+    PRAGMA foreign_keys=ON;
+    BEGIN;
+    INSERT INTO c VALUES(1, 99);
+    INSERT INTO p VALUES(99);
+    COMMIT;
+    SELECT * FROM p ORDER BY 1;
+}
+expect {
+    99
+}
+
+# FK deferred rollback clears
+setup fk-deferred-rollback-clears {
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+}
+
+@setup fk-deferred-rollback-clears
+test fk-deferred-rollback-clears {
+    PRAGMA foreign_keys=ON;
+    BEGIN;
+    INSERT INTO c VALUES(1, 123);
+    ROLLBACK;
+    BEGIN;
+    INSERT INTO p VALUES(123);
+    INSERT INTO c VALUES(1, 123);
+    COMMIT;
+    SELECT * FROM c ORDER BY 1;
+}
+expect {
+    1|123
+}
+
+# FK deferred insert parent fixes before commit
+setup fk-deferred-insert-parent-fixes-before-commit {
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+}
+
+@setup fk-deferred-insert-parent-fixes-before-commit
+test fk-deferred-insert-parent-fixes-before-commit {
+    PRAGMA foreign_keys=ON;
+    BEGIN;
+    INSERT INTO c VALUES(1, 50);
+    INSERT INTO p VALUES(50);
+    COMMIT;
+    SELECT * FROM c ORDER BY 1;
+}
+expect {
+    1|50
+}
+
+# FK deferred update fixes child before commit
+setup fk-deferred-update-fixes-child-before-commit {
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+}
+
+@setup fk-deferred-update-fixes-child-before-commit
+test fk-deferred-update-fixes-child-before-commit {
+    PRAGMA foreign_keys=ON;
+    BEGIN;
+    INSERT INTO c VALUES(1, 50);
+    INSERT INTO p VALUES(32);
+    UPDATE c SET pid=32 WHERE id=1;
+    COMMIT;
+    SELECT * FROM c ORDER BY 1;
+}
+expect {
+    1|32
+}
+
+# FK deferred delete fixes child before commit
+setup fk-deferred-delete-fixes-child-before-commit {
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+}
+
+@setup fk-deferred-delete-fixes-child-before-commit
+test fk-deferred-delete-fixes-child-before-commit {
+    PRAGMA foreign_keys=ON;
+    BEGIN;
+    INSERT INTO c VALUES(1, 50);
+    INSERT INTO p VALUES(32);
+    DELETE FROM c WHERE id=1;
+    COMMIT;
+    SELECT * FROM c ORDER BY 1;
+}
+expect {
+}
+
+# FK deferred update fixes parent before commit
+setup fk-deferred-update-fixes-parent-before-commit {
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+}
+
+@setup fk-deferred-update-fixes-parent-before-commit
+test fk-deferred-update-fixes-parent-before-commit {
+    PRAGMA foreign_keys=ON;
+    BEGIN;
+    INSERT INTO c VALUES(1, 50);
+    INSERT INTO p VALUES(32);
+    UPDATE p SET id=50 WHERE id=32;
+    COMMIT;
+    SELECT * FROM c ORDER BY 1;
+}
+expect {
+    1|50
+}
+
+# FK deferred self ref succeeds
+setup fk-deferred-self-ref-succeeds {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, pid INT REFERENCES t(id) DEFERRABLE INITIALLY DEFERRED);
+}
+
+@setup fk-deferred-self-ref-succeeds
+test fk-deferred-self-ref-succeeds {
+    PRAGMA foreign_keys=ON;
+    BEGIN;
+    INSERT INTO t VALUES(1, 1);
+    COMMIT;
+    SELECT * FROM t ORDER BY 1;
+}
+expect {
+    1|1
+}
+
+# FK deferred self ref late parent
+setup fk-deferred-self-ref-late-parent {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, pid INT REFERENCES t(id) DEFERRABLE INITIALLY DEFERRED);
+}
+
+@setup fk-deferred-self-ref-late-parent
+test fk-deferred-self-ref-late-parent {
+    PRAGMA foreign_keys=ON;
+    BEGIN;
+    INSERT INTO t VALUES(2, 3);
+    INSERT INTO t VALUES(3, 3);
+    COMMIT;
+    SELECT * FROM t ORDER BY 1;
+}
+expect {
+    2|3
+    3|3
+}
+
+# FK deferred neutralize - counter must not be neutralized by later good statements
+setup fk-deferred-neutralize-1 {
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE parent_comp(a INT NOT NULL, b INT NOT NULL, PRIMARY KEY(a,b));
+    CREATE TABLE child_deferred(id INTEGER PRIMARY KEY, pid INT, FOREIGN KEY(pid) REFERENCES parent(id));
+    CREATE TABLE child_comp_deferred(id INTEGER PRIMARY KEY, ca INT, cb INT, FOREIGN KEY(ca,cb) REFERENCES parent_comp(a,b));
+    INSERT INTO parent_comp VALUES (4,-1);
+}
+
+@setup fk-deferred-neutralize-1
+test fk-deferred-neutralize-1 {
+    PRAGMA foreign_keys=ON;
+    BEGIN;
+    INSERT INTO child_deferred VALUES (1, 999);
+    INSERT INTO child_comp_deferred VALUES (2, 4, -1);
+    COMMIT;
+}
+expect error {}
+
+# FK deferred upsert late parent
+setup fk-deferred-upsert-late-parent {
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+}
+
+@setup fk-deferred-upsert-late-parent
+test fk-deferred-upsert-late-parent {
+    PRAGMA foreign_keys=ON;
+    BEGIN;
+    INSERT INTO c VALUES(1, 50);
+    INSERT INTO p VALUES(32);
+    INSERT INTO c(id,pid) VALUES(1,32) ON CONFLICT(id) DO UPDATE SET pid=excluded.pid;
+    COMMIT;
+    SELECT * FROM c ORDER BY id;
+}
+expect {
+    1|32
+}
+
+# FK deferred upsert late child
+setup fk-deferred-upsert-late-child {
+    CREATE TABLE p(id INTEGER PRIMARY KEY, u INT UNIQUE);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+}
+
+@setup fk-deferred-upsert-late-child
+test fk-deferred-upsert-late-child {
+    PRAGMA foreign_keys=ON;
+    BEGIN;
+    INSERT INTO c VALUES(1, 50);
+    INSERT INTO p VALUES(32, 7);
+    INSERT INTO p(id,u) VALUES(999,7) ON CONFLICT(u) DO UPDATE SET id=50;
+    COMMIT;
+    SELECT p.id, c.id FROM p JOIN c ON c.pid = p.id;
+}
+expect {
+    50|1
+}
+
+# FK deferred insert commit fails
+setup fk-deferred-insert-commit-fails {
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+}
+
+@setup fk-deferred-insert-commit-fails
+test fk-deferred-insert-commit-fails {
+    PRAGMA foreign_keys=ON;
+    BEGIN;
+    INSERT INTO c VALUES(1, 99);
+    COMMIT;
+}
+expect error {}
+
+# FK deferred insert parent fix before commit
+setup fk-deferred-insert-parent-fix-before-commit {
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+}
+
+@setup fk-deferred-insert-parent-fix-before-commit
+test fk-deferred-insert-parent-fix-before-commit {
+    PRAGMA foreign_keys=ON;
+    BEGIN;
+    INSERT INTO c VALUES(1, 99);
+    INSERT INTO p VALUES(99);
+    COMMIT;
+    SELECT id, pid FROM c ORDER BY id;
+}
+expect {
+    1|99
+}
+
+# FK deferred insert multi children one parent fix
+setup fk-deferred-insert-multi-children-one-parent-fix {
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+}
+
+@setup fk-deferred-insert-multi-children-one-parent-fix
+test fk-deferred-insert-multi-children-one-parent-fix {
+    PRAGMA foreign_keys=ON;
+    BEGIN;
+    INSERT INTO c VALUES(1, 50);
+    INSERT INTO c VALUES(2, 50);
+    INSERT INTO p VALUES(50);
+    COMMIT;
+    SELECT id, pid FROM c ORDER BY id;
+}
+expect {
+    1|50
+    2|50
+}
+
+# FK deferred insert then delete child fix
+setup fk-deferred-insert-then-delete-child-fix {
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+}
+
+@setup fk-deferred-insert-then-delete-child-fix
+test fk-deferred-insert-then-delete-child-fix {
+    PRAGMA foreign_keys=ON;
+    BEGIN;
+    INSERT INTO c VALUES(1, 77);
+    DELETE FROM c WHERE id=1;
+    COMMIT;
+    SELECT count(*) FROM c;
+}
+expect {
+    0
+}
+
+# FK deferred insert self ref succeeds
+setup fk-deferred-insert-self-ref-succeeds {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, pid INT REFERENCES t(id) DEFERRABLE INITIALLY DEFERRED);
+}
+
+@setup fk-deferred-insert-self-ref-succeeds
+test fk-deferred-insert-self-ref-succeeds {
+    PRAGMA foreign_keys=ON;
+    BEGIN;
+    INSERT INTO t VALUES(1, 1);
+    COMMIT;
+    SELECT id, pid FROM t;
+}
+expect {
+    1|1
+}
+
+# FK deferred update child breaks commit fails
+setup fk-deferred-update-child-breaks-commit-fails {
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO p VALUES(10);
+    INSERT INTO c VALUES(1, 10);
+}
+
+@setup fk-deferred-update-child-breaks-commit-fails
+test fk-deferred-update-child-breaks-commit-fails {
+    PRAGMA foreign_keys=ON;
+    BEGIN;
+    UPDATE c SET pid=99 WHERE id=1;
+    COMMIT;
+}
+expect error {}
+
+# FK deferred update child fix before commit
+setup fk-deferred-update-child-fix-before-commit {
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO p VALUES(10);
+    INSERT INTO c VALUES(1, 10);
+}
+
+@setup fk-deferred-update-child-fix-before-commit
+test fk-deferred-update-child-fix-before-commit {
+    PRAGMA foreign_keys=ON;
+    BEGIN;
+    UPDATE c SET pid=99 WHERE id=1;
+    UPDATE c SET pid=10 WHERE id=1;
+    COMMIT;
+    SELECT id, pid FROM c;
+}
+expect {
+    1|10
+}
+
+# FK deferred update child fix by inserting parent
+setup fk-deferred-update-child-fix-by-inserting-parent {
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO p VALUES(10);
+    INSERT INTO c VALUES(1, 10);
+}
+
+@setup fk-deferred-update-child-fix-by-inserting-parent
+test fk-deferred-update-child-fix-by-inserting-parent {
+    PRAGMA foreign_keys=ON;
+    BEGIN;
+    UPDATE c SET pid=50 WHERE id=1;
+    INSERT INTO p VALUES(50);
+    COMMIT;
+    SELECT id, pid FROM c;
+}
+expect {
+    1|50
+}
+
+# FK deferred update parent breaks commit fails
+setup fk-deferred-update-parent-breaks-commit-fails {
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO p VALUES(32);
+    INSERT INTO c VALUES(1, 32);
+}
+
+@setup fk-deferred-update-parent-breaks-commit-fails
+test fk-deferred-update-parent-breaks-commit-fails {
+    PRAGMA foreign_keys=ON;
+    BEGIN;
+    UPDATE p SET id=50 WHERE id=32;
+    COMMIT;
+}
+expect error {}
+
+# FK deferred update parent fix by updating child
+setup fk-deferred-update-parent-fix-by-updating-child {
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO p VALUES(32);
+    INSERT INTO c VALUES(1, 32);
+}
+
+@setup fk-deferred-update-parent-fix-by-updating-child
+test fk-deferred-update-parent-fix-by-updating-child {
+    PRAGMA foreign_keys=ON;
+    BEGIN;
+    UPDATE p SET id=50 WHERE id=32;
+    UPDATE c SET pid=50 WHERE id=1;
+    COMMIT;
+    SELECT id, pid FROM c;
+}
+expect {
+    1|50
+}
+
+# FK deferred update parent fix by reverting parent
+setup fk-deferred-update-parent-fix-by-reverting-parent {
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO p VALUES(32);
+    INSERT INTO c VALUES(1, 32);
+}
+
+@setup fk-deferred-update-parent-fix-by-reverting-parent
+test fk-deferred-update-parent-fix-by-reverting-parent {
+    PRAGMA foreign_keys=ON;
+    BEGIN;
+    UPDATE p SET id=50 WHERE id=32;
+    UPDATE p SET id=32 WHERE id=50;
+    COMMIT;
+    SELECT id, pid FROM c;
+}
+expect {
+    1|32
+}
+
+# FK deferred update self ref id change and fix
+setup fk-deferred-update-self-ref-id-change-and-fix {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, pid INT REFERENCES t(id) DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO t VALUES(1,1);
+}
+
+@setup fk-deferred-update-self-ref-id-change-and-fix
+test fk-deferred-update-self-ref-id-change-and-fix {
+    PRAGMA foreign_keys=ON;
+    BEGIN;
+    UPDATE t SET id=2 WHERE id=1;
+    UPDATE t SET pid=2 WHERE id=2;
+    COMMIT;
+    SELECT id, pid FROM t;
+}
+expect {
+    2|2
+}
+
+# FK deferred delete parent commit fails
+setup fk-deferred-delete-parent-commit-fails {
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO p VALUES(10);
+    INSERT INTO c VALUES(1, 10);
+}
+
+@setup fk-deferred-delete-parent-commit-fails
+test fk-deferred-delete-parent-commit-fails {
+    PRAGMA foreign_keys=ON;
+    BEGIN;
+    DELETE FROM p WHERE id=10;
+    COMMIT;
+}
+expect error {}
+
+# FK deferred delete parent then delete child fix
+setup fk-deferred-delete-parent-then-delete-child-fix {
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO p VALUES(10);
+    INSERT INTO c VALUES(1, 10);
+}
+
+@setup fk-deferred-delete-parent-then-delete-child-fix
+test fk-deferred-delete-parent-then-delete-child-fix {
+    PRAGMA foreign_keys=ON;
+    BEGIN;
+    DELETE FROM p WHERE id=10;
+    DELETE FROM c WHERE id=1;
+    COMMIT;
+    SELECT count(*) FROM p, c;
+}
+expect {
+    0
+}
+
+# FK deferred delete parent then reinsert parent fix
+setup fk-deferred-delete-parent-then-reinsert-parent-fix {
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO p VALUES(10);
+    INSERT INTO c VALUES(1, 10);
+}
+
+@setup fk-deferred-delete-parent-then-reinsert-parent-fix
+test fk-deferred-delete-parent-then-reinsert-parent-fix {
+    PRAGMA foreign_keys=ON;
+    BEGIN;
+    DELETE FROM p WHERE id=10;
+    INSERT INTO p VALUES(10);
+    COMMIT;
+    SELECT id, pid FROM c;
+}
+expect {
+    1|10
+}
+
+# FK deferred delete self ref row ok
+setup fk-deferred-delete-self-ref-row-ok {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, pid INT REFERENCES t(id) DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO t VALUES(1,1);
+}
+
+@setup fk-deferred-delete-self-ref-row-ok
+test fk-deferred-delete-self-ref-row-ok {
+    PRAGMA foreign_keys=ON;
+    BEGIN;
+    DELETE FROM t WHERE id=1;
+    COMMIT;
+    SELECT count(*) FROM t;
+}
+expect {
+    0
+}
+
+# FK deferred delete parent then update child to null fix
+setup fk-deferred-delete-parent-then-update-child-to-null-fix {
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO p VALUES(5);
+    INSERT INTO c VALUES(1,5);
+}
+
+@setup fk-deferred-delete-parent-then-update-child-to-null-fix
+test fk-deferred-delete-parent-then-update-child-to-null-fix {
+    PRAGMA foreign_keys=ON;
+    BEGIN;
+    DELETE FROM p WHERE id=5;
+    UPDATE c SET pid=NULL WHERE id=1;
+    COMMIT;
+    SELECT id, pid FROM c;
+}
+expect {
+    1|
+}
+
+# FK deferred autocommit insert missing parent
+setup fk-deferred-autocommit-insert-missing-parent {
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, pid INT REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED);
+}
+
+@setup fk-deferred-autocommit-insert-missing-parent
+test fk-deferred-autocommit-insert-missing-parent {
+    PRAGMA foreign_keys=ON;
+    INSERT INTO child VALUES(1, 3);
+}
+expect error {}
+
+# FK deferred autocommit selfref ok
+setup fk-deferred-autocommit-selfref-ok {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, pid INT REFERENCES t(id) DEFERRABLE INITIALLY DEFERRED);
+}
+
+@setup fk-deferred-autocommit-selfref-ok
+test fk-deferred-autocommit-selfref-ok {
+    PRAGMA foreign_keys=ON;
+    INSERT INTO t VALUES(1,1);
+    SELECT * FROM t;
+}
+expect {
+    1|1
+}
+
+# FK deferred autocommit delete parent fails
+setup fk-deferred-autocommit-delete-parent-fails {
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO p VALUES(1);
+    INSERT INTO c VALUES(10,1);
+}
+
+@setup fk-deferred-autocommit-delete-parent-fails
+test fk-deferred-autocommit-delete-parent-fails {
+    PRAGMA foreign_keys=ON;
+    DELETE FROM p WHERE id=1;
+}
+expect error {}
+
+# FK deferred tx delete parent then reinsert ok
+setup fk-deferred-tx-delete-parent-then-reinsert-ok {
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO p VALUES(5);
+    INSERT INTO c VALUES(1,5);
+}
+
+@setup fk-deferred-tx-delete-parent-then-reinsert-ok
+test fk-deferred-tx-delete-parent-then-reinsert-ok {
+    PRAGMA foreign_keys=ON;
+    BEGIN;
+    DELETE FROM p WHERE id=5;
+    INSERT INTO p VALUES(5);
+    COMMIT;
+    SELECT count(*) FROM p WHERE id=5;
+}
+expect {
+    1
+}
+
+# FK deferred tx multi children fixed ok
+setup fk-deferred-tx-multi-children-fixed-ok {
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+}
+
+@setup fk-deferred-tx-multi-children-fixed-ok
+test fk-deferred-tx-multi-children-fixed-ok {
+    PRAGMA foreign_keys=ON;
+    BEGIN;
+    INSERT INTO c VALUES(1,99);
+    INSERT INTO c VALUES(2,99);
+    INSERT INTO p VALUES(99);
+    COMMIT;
+    SELECT id,pid FROM c ORDER BY id;
+}
+expect {
+    1|99
+    2|99
+}
+
+# FK deferred tx multi children one left fails
+setup fk-deferred-tx-multi-children-one-left-fails {
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+}
+
+@setup fk-deferred-tx-multi-children-one-left-fails
+test fk-deferred-tx-multi-children-one-left-fails {
+    PRAGMA foreign_keys=ON;
+    BEGIN;
+    INSERT INTO c VALUES(1,42);
+    INSERT INTO c VALUES(2,42);
+    INSERT INTO p VALUES(42);
+    UPDATE c SET pid=777 WHERE id=2;
+    COMMIT;
+}
+expect error {}
+
+# FK deferred composite parent update fix
+setup fk-deferred-composite-parent-update-fix {
+    CREATE TABLE parent(a INT NOT NULL, b INT NOT NULL, PRIMARY KEY(a,b));
+    CREATE TABLE child(id INT PRIMARY KEY, ca INT, cb INT, FOREIGN KEY(ca,cb) REFERENCES parent(a,b) DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO parent VALUES(1,1);
+}
+
+@setup fk-deferred-composite-parent-update-fix
+test fk-deferred-composite-parent-update-fix {
+    PRAGMA foreign_keys=ON;
+    BEGIN;
+    INSERT INTO child VALUES(10, 7, 7);
+    UPDATE parent SET a=7, b=7 WHERE a=1 AND b=1;
+    COMMIT;
+    SELECT id, ca, cb FROM child;
+}
+expect {
+    10|7|7
+}
+
+# FK deferred null fk never violates
+setup fk-deferred-null-fk-never-violates {
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+}
+
+@setup fk-deferred-null-fk-never-violates
+test fk-deferred-null-fk-never-violates {
+    PRAGMA foreign_keys=ON;
+    BEGIN;
+    INSERT INTO c VALUES(1, NULL);
+    COMMIT;
+    SELECT id, pid FROM c;
+}
+expect {
+    1|
+}
+
+# FK deferred update child null resolves
+setup fk-deferred-update-child-null-resolves {
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+}
+
+@setup fk-deferred-update-child-null-resolves
+test fk-deferred-update-child-null-resolves {
+    PRAGMA foreign_keys=ON;
+    BEGIN;
+    INSERT INTO c VALUES(1, 500);
+    UPDATE c SET pid=NULL WHERE id=1;
+    COMMIT;
+    SELECT * FROM c;
+}
+expect {
+    1|
+}
+
+# FK deferred delete child resolves
+setup fk-deferred-delete-child-resolves {
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+}
+
+@setup fk-deferred-delete-child-resolves
+test fk-deferred-delete-child-resolves {
+    PRAGMA foreign_keys=ON;
+    BEGIN;
+    INSERT INTO c VALUES(1, 777);
+    DELETE FROM c WHERE id=1;
+    COMMIT;
+    SELECT count(*) FROM c;
+}
+expect {
+    0
+}
+
+# FK deferred update parent pk resolves
+setup fk-deferred-update-parent-pk-resolves {
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO p VALUES(10);
+}
+
+@setup fk-deferred-update-parent-pk-resolves
+test fk-deferred-update-parent-pk-resolves {
+    PRAGMA foreign_keys=ON;
+    BEGIN;
+    INSERT INTO c VALUES(1, 20);
+    UPDATE p SET id=20 WHERE id=10;
+    COMMIT;
+    SELECT * FROM c;
+}
+expect {
+    1|20
+}
+
+# FK deferred cycle two tables ok
+setup fk-deferred-cycle-two-tables-ok {
+    CREATE TABLE a(id INT PRIMARY KEY, b_id INT, FOREIGN KEY(b_id) REFERENCES b(id) DEFERRABLE INITIALLY DEFERRED);
+    CREATE TABLE b(id INT PRIMARY KEY, a_id INT, FOREIGN KEY(a_id) REFERENCES a(id) DEFERRABLE INITIALLY DEFERRED);
+}
+
+@setup fk-deferred-cycle-two-tables-ok
+test fk-deferred-cycle-two-tables-ok {
+    PRAGMA foreign_keys=ON;
+    BEGIN;
+    INSERT INTO a VALUES(1, 1);
+    INSERT INTO b VALUES(1, 1);
+    COMMIT;
+    SELECT count(b.id), count(a.id) FROM a, b;
+}
+expect {
+    1|1
+}
+
+# FK deferred selfref delete ok
+setup fk-deferred-selfref-delete-ok {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, pid INT REFERENCES t(id) DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO t VALUES(1,1);
+}
+
+@setup fk-deferred-selfref-delete-ok
+test fk-deferred-selfref-delete-ok {
+    PRAGMA foreign_keys=ON;
+    BEGIN;
+    DELETE FROM t WHERE id=1;
+    COMMIT;
+    SELECT count(*) FROM t;
+}
+expect {
+    0
+}
+
+# FK parentcomp donothing noconflict ok
+setup fk-parentcomp-donothing-noconflict-ok {
+    CREATE TABLE parent (id INTEGER PRIMARY KEY, a INT, b INT);
+    CREATE TABLE child_deferred (id INTEGER PRIMARY KEY, pid INT, x INT, FOREIGN KEY(pid) REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED);
+    CREATE TABLE parent_comp (a INT NOT NULL, b INT NOT NULL, c INT, PRIMARY KEY(a,b));
+    CREATE TABLE child_comp_deferred (id INTEGER PRIMARY KEY, ca INT, cb INT, z INT, FOREIGN KEY (ca,cb) REFERENCES parent_comp(a,b) DEFERRABLE INITIALLY DEFERRED);
+}
+
+@setup fk-parentcomp-donothing-noconflict-ok
+test fk-parentcomp-donothing-noconflict-ok {
+    PRAGMA foreign_keys=ON;
+    INSERT INTO parent_comp VALUES (-1,-1,9) ON CONFLICT DO NOTHING;
+    SELECT a,b,c FROM parent_comp ORDER BY a,b;
+}
+expect {
+    -1|-1|9
+}
+
+# FK parentcomp donothing conflict noop
+setup fk-parentcomp-donothing-conflict-noop {
+    CREATE TABLE parent_comp (a INT NOT NULL, b INT NOT NULL, c INT, PRIMARY KEY(a,b));
+    CREATE TABLE child_comp_deferred (id INTEGER PRIMARY KEY, ca INT, cb INT, z INT, FOREIGN KEY (ca,cb) REFERENCES parent_comp(a,b) DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO parent_comp VALUES (10,20,1);
+}
+
+@setup fk-parentcomp-donothing-conflict-noop
+test fk-parentcomp-donothing-conflict-noop {
+    PRAGMA foreign_keys=ON;
+    INSERT INTO parent_comp VALUES (10,20,999) ON CONFLICT DO NOTHING;
+    SELECT a,b,c FROM parent_comp;
+}
+expect {
+    10|20|1
+}
+
+# FK parentcomp donothing unrelated immediate ok
+setup fk-parentcomp-donothing-unrelated-immediate-ok {
+    CREATE TABLE parent (id INTEGER PRIMARY KEY);
+    CREATE TABLE child_immediate (id INTEGER PRIMARY KEY, pid INT, FOREIGN KEY(pid) REFERENCES parent(id));
+    CREATE TABLE parent_comp (a INT NOT NULL, b INT NOT NULL, c INT, PRIMARY KEY(a,b));
+    CREATE TABLE child_comp_deferred (id INTEGER PRIMARY KEY, ca INT, cb INT, z INT, FOREIGN KEY(ca,cb) REFERENCES parent_comp(a,b) DEFERRABLE INITIALLY DEFERRED);
+}
+
+@setup fk-parentcomp-donothing-unrelated-immediate-ok
+test fk-parentcomp-donothing-unrelated-immediate-ok {
+    PRAGMA foreign_keys=ON;
+    INSERT INTO parent_comp VALUES (-1,-1,9) ON CONFLICT DO NOTHING;
+    SELECT a,b,c FROM parent_comp;
+}
+expect {
+    -1|-1|9
+}
+
+# FK parentcomp deferred fix inside tx ok
+setup fk-parentcomp-deferred-fix-inside-tx-ok {
+    CREATE TABLE parent_comp (a INT NOT NULL, b INT NOT NULL, c INT, PRIMARY KEY(a,b));
+    CREATE TABLE child_comp_deferred (id INTEGER PRIMARY KEY, ca INT, cb INT, FOREIGN KEY(ca,cb) REFERENCES parent_comp(a,b) DEFERRABLE INITIALLY DEFERRED);
+}
+
+@setup fk-parentcomp-deferred-fix-inside-tx-ok
+test fk-parentcomp-deferred-fix-inside-tx-ok {
+    PRAGMA foreign_keys=ON;
+    BEGIN;
+    INSERT INTO child_comp_deferred VALUES (1, -5, -6);
+    INSERT INTO parent_comp VALUES (-5, -6, 9);
+    COMMIT;
+    SELECT id,ca,cb FROM child_comp_deferred;
+}
+expect {
+    1|-5|-6
+}
+
+# FK parentcomp autocommit unrelated children ok
+setup fk-parentcomp-autocommit-unrelated-children-ok {
+    CREATE TABLE parent_comp (a INT NOT NULL, b INT NOT NULL, c INT, PRIMARY KEY(a,b));
+    CREATE TABLE child_comp_deferred (id INTEGER PRIMARY KEY, ca INT, cb INT, FOREIGN KEY(ca,cb) REFERENCES parent_comp(a,b) DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO parent_comp VALUES (1,1,0);
+    INSERT INTO child_comp_deferred VALUES (10,1,1);
+}
+
+@setup fk-parentcomp-autocommit-unrelated-children-ok
+test fk-parentcomp-autocommit-unrelated-children-ok {
+    PRAGMA foreign_keys=ON;
+    INSERT INTO parent_comp VALUES (2,2,0) ON CONFLICT DO NOTHING;
+    SELECT a,b,c FROM parent_comp ORDER BY a,b;
+}
+expect {
+    1|1|0
+    2|2|0
+}
+
+# FK rollback clears then donothing ok
+setup fk-rollback-clears-then-donothing-ok {
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+    CREATE TABLE parent_comp(a INT NOT NULL, b INT NOT NULL, c INT, PRIMARY KEY(a,b));
+}
+
+@setup fk-rollback-clears-then-donothing-ok
+test fk-rollback-clears-then-donothing-ok {
+    PRAGMA foreign_keys=ON;
+    BEGIN;
+    INSERT INTO c VALUES(1, 456);
+    ROLLBACK;
+    INSERT INTO parent_comp VALUES(-2,-2,0) ON CONFLICT DO NOTHING;
+    SELECT a,b,c FROM parent_comp;
+}
+expect {
+    -2|-2|0
+}
+
+# FK parentcomp donothing conflict stays quiet
+setup fk-parentcomp-donothing-conflict-stays-quiet {
+    CREATE TABLE parent_comp(a INT NOT NULL, b INT NOT NULL, c INT, PRIMARY KEY(a,b));
+    CREATE TABLE child_comp_deferred(id INTEGER PRIMARY KEY, ca INT, cb INT, FOREIGN KEY(ca,cb) REFERENCES parent_comp(a,b) DEFERRABLE INITIALLY DEFERRED);
+    INSERT INTO parent_comp VALUES(10,20,1);
+}
+
+@setup fk-parentcomp-donothing-conflict-stays-quiet
+test fk-parentcomp-donothing-conflict-stays-quiet {
+    PRAGMA foreign_keys=ON;
+    INSERT INTO parent_comp VALUES(10,20,999) ON CONFLICT DO NOTHING;
+    INSERT INTO parent_comp VALUES(11,22,3) ON CONFLICT DO NOTHING;
+    SELECT a,b FROM parent_comp ORDER BY a,b;
+}
+expect {
+    10|20
+    11|22
+}
+
+# FK deferred two stmt fix inside tx ok
+setup fk-deferred-two-stmt-fix-inside-tx-ok {
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid INT REFERENCES p(id) DEFERRABLE INITIALLY DEFERRED);
+}
+
+@setup fk-deferred-two-stmt-fix-inside-tx-ok
+test fk-deferred-two-stmt-fix-inside-tx-ok {
+    PRAGMA foreign_keys=ON;
+    BEGIN;
+    INSERT INTO c VALUES(1, 777);
+    INSERT INTO p VALUES(777);
+    COMMIT;
+    SELECT * FROM c;
+}
+expect {
+    1|777
+}
+
+# FK delete composite bounds
+setup fk-delete-composite-bounds {
+    CREATE TABLE p(a INT NOT NULL, b INT NOT NULL, v INT, PRIMARY KEY(a,b));
+    CREATE TABLE c(id INTEGER PRIMARY KEY, x INT, y INT, w INT, FOREIGN KEY(x,y) REFERENCES p(a,b));
+    INSERT INTO p VALUES (5,1,0),(5,2,0),(5,4,0);
+    INSERT INTO c VALUES (1,5,4,0);
+}
+
+@setup fk-delete-composite-bounds
+test fk-delete-composite-bounds {
+    PRAGMA foreign_keys=ON;
+    DELETE FROM p WHERE a=5 AND b=3;
+    SELECT 'ok';
+}
+expect {
+    ok
+}
+
+# FK update parent unique single col
+setup fk-update-parent-unique-single-col {
+    CREATE TABLE parent(id UNIQUE);
+    CREATE TABLE child(pid REFERENCES parent(id));
+    INSERT INTO parent VALUES(1);
+    INSERT INTO child VALUES(1);
+}
+
+@setup fk-update-parent-unique-single-col
+test fk-update-parent-unique-single-col {
+    PRAGMA foreign_keys=ON;
+    UPDATE parent SET id = 2 WHERE id = 1;
+}
+expect error {}
+
+# FK update parent explicit unique single col
+setup fk-update-parent-explicit-unique-single-col {
+    CREATE TABLE parent(id);
+    CREATE UNIQUE INDEX parent_id_idx ON parent(id);
+    CREATE TABLE child(pid REFERENCES parent(id));
+    INSERT INTO parent VALUES(1);
+    INSERT INTO child VALUES(1);
+}
+
+@setup fk-update-parent-explicit-unique-single-col
+test fk-update-parent-explicit-unique-single-col {
+    PRAGMA foreign_keys=ON;
+    UPDATE parent SET id = 2 WHERE id = 1;
+}
+expect error {}
+
+# FK update parent unique multi col
+setup fk-update-parent-unique-multi-col {
+    CREATE TABLE parent(a, b, UNIQUE(a, b));
+    CREATE TABLE child(ca, cb, FOREIGN KEY(ca, cb) REFERENCES parent(a, b));
+    INSERT INTO parent VALUES(1, 2);
+    INSERT INTO child VALUES(1, 2);
+}
+
+@setup fk-update-parent-unique-multi-col
+test fk-update-parent-unique-multi-col {
+    PRAGMA foreign_keys=ON;
+    UPDATE parent SET a = 3 WHERE a = 1 AND b = 2;
+}
+expect error {}
+
+# FK update parent unique multi col 2
+setup fk-update-parent-unique-multi-col-2 {
+    CREATE TABLE parent(a, b, UNIQUE(a, b));
+    CREATE TABLE child(ca, cb, FOREIGN KEY(ca, cb) REFERENCES parent(a, b));
+    INSERT INTO parent VALUES(1, 2);
+    INSERT INTO child VALUES(1, 2);
+}
+
+@setup fk-update-parent-unique-multi-col-2
+test fk-update-parent-unique-multi-col-2 {
+    PRAGMA foreign_keys=ON;
+    UPDATE parent SET b = 3 WHERE a = 1 AND b = 2;
+}
+expect error {}
+
+# FK update parent explicit unique multi col
+setup fk-update-parent-explicit-unique-multi-col {
+    CREATE TABLE parent(a, b);
+    CREATE UNIQUE INDEX parent_ab_idx ON parent(a, b);
+    CREATE TABLE child(ca, cb, FOREIGN KEY(ca, cb) REFERENCES parent(a, b));
+    INSERT INTO parent VALUES(1, 2);
+    INSERT INTO child VALUES(1, 2);
+}
+
+@setup fk-update-parent-explicit-unique-multi-col
+test fk-update-parent-explicit-unique-multi-col {
+    PRAGMA foreign_keys=ON;
+    UPDATE parent SET a = 3 WHERE a = 1 AND b = 2;
+}
+expect error {}
+
+# FK update parent explicit unique multi col 2
+setup fk-update-parent-explicit-unique-multi-col-2 {
+    CREATE TABLE parent(a, b);
+    CREATE UNIQUE INDEX parent_ab_idx ON parent(a, b);
+    CREATE TABLE child(ca, cb, FOREIGN KEY(ca, cb) REFERENCES parent(a, b));
+    INSERT INTO parent VALUES(1, 2);
+    INSERT INTO child VALUES(1, 2);
+}
+
+@setup fk-update-parent-explicit-unique-multi-col-2
+test fk-update-parent-explicit-unique-multi-col-2 {
+    PRAGMA foreign_keys=ON;
+    UPDATE parent SET b = 3 WHERE a = 1 AND b = 2;
+}
+expect error {}
+
+# FK update parent int pk
+setup fk-update-parent-int-pk {
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(pid REFERENCES parent(id));
+    INSERT INTO parent VALUES(1);
+    INSERT INTO child VALUES(1);
+}
+
+@setup fk-update-parent-int-pk
+test fk-update-parent-int-pk {
+    PRAGMA foreign_keys=ON;
+    UPDATE parent SET id = 2 WHERE id = 1;
+}
+expect error {}
+
+# FK update parent text pk
+setup fk-update-parent-text-pk {
+    CREATE TABLE parent(id PRIMARY KEY);
+    CREATE TABLE child(pid REFERENCES parent(id));
+    INSERT INTO parent VALUES('key1');
+    INSERT INTO child VALUES('key1');
+}
+
+@setup fk-update-parent-text-pk
+test fk-update-parent-text-pk {
+    PRAGMA foreign_keys=ON;
+    UPDATE parent SET id = 'key2' WHERE id = 'key1';
+}
+expect error {}
+
+# FK update parent multi col pk
+setup fk-update-parent-multi-col-pk {
+    CREATE TABLE parent(a, b, PRIMARY KEY(a, b));
+    CREATE TABLE child(ca, cb, FOREIGN KEY(ca, cb) REFERENCES parent(a, b));
+    INSERT INTO parent VALUES(1, 2);
+    INSERT INTO child VALUES(1, 2);
+}
+
+@setup fk-update-parent-multi-col-pk
+test fk-update-parent-multi-col-pk {
+    PRAGMA foreign_keys=ON;
+    UPDATE parent SET a = 3 WHERE a = 1 AND b = 2;
+}
+expect error {}
+
+# FK update parent multi col pk 2
+setup fk-update-parent-multi-col-pk-2 {
+    CREATE TABLE parent(a, b, PRIMARY KEY(a, b));
+    CREATE TABLE child(ca, cb, FOREIGN KEY(ca, cb) REFERENCES parent(a, b));
+    INSERT INTO parent VALUES(1, 2);
+    INSERT INTO child VALUES(1, 2);
+}
+
+@setup fk-update-parent-multi-col-pk-2
+test fk-update-parent-multi-col-pk-2 {
+    PRAGMA foreign_keys=ON;
+    UPDATE parent SET b = 3 WHERE a = 1 AND b = 2;
+}
+expect error {}
+
+# FK no val on parent
+setup fk-no-val-on-parent {
+    CREATE TABLE t1(a INT, b INT);
+    CREATE TABLE t2(x INT, y INT, FOREIGN KEY (x, y) REFERENCES t1(a, b));
+}
+
+@setup fk-no-val-on-parent
+test fk-no-val-on-parent {
+    PRAGMA foreign_keys=ON;
+    INSERT INTO t1(a, b) VALUES (5, 10);
+    SELECT * FROM t1;
+}
+expect {
+    5|10
+}
+
+# FK val on parent (error case - wrong column names)
+setup fk-val-on-parent {
+    CREATE TABLE t1(a INT, b INT);
+    CREATE TABLE t2(x INT, y INT, FOREIGN KEY (x, y) REFERENCES t1(a, b));
+}
+
+@setup fk-val-on-parent
+test fk-val-on-parent {
+    PRAGMA foreign_keys=ON;
+    INSERT INTO t2(a, b) VALUES (5, 10);
+    SELECT * FROM t2;
+}
+expect error {}
+

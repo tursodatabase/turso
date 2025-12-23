@@ -1,0 +1,528 @@
+# COLLATE Tests
+# Ported from testing/collate.test
+
+@database :memory:
+
+# Simple smoke tests
+test collate_nocase {
+    SELECT 'hat' == 'hAt' COLLATE NOCASE;
+}
+expect {
+    1
+}
+
+test collate_binary_1 {
+    SELECT 'hat' == 'hAt' COLLATE BINARY;
+}
+expect {
+    0
+}
+
+test collate_binary_2 {
+    SELECT 'hat' == 'hat' COLLATE BINARY;
+}
+expect {
+    1
+}
+
+test collate_rtrim_1 {
+    SELECT 'hat' == 'hAt ' COLLATE RTRIM;
+}
+expect {
+    0
+}
+
+test collate_rtrim_2 {
+    SELECT 'hat' == 'hat ' COLLATE RTRIM;
+}
+expect {
+    1
+}
+
+test collate_rtrim_3 {
+    SELECT 'hat' == ' hAt ' COLLATE RTRIM;
+}
+expect {
+    0
+}
+
+test collate_rtrim_4 {
+    SELECT 'hat' == ' hat ' COLLATE RTRIM;
+}
+expect {
+    0
+}
+
+test collate_left_precedence {
+    SELECT 'hat' COLLATE BINARY == 'hAt' COLLATE NOCASE;
+}
+expect {
+    0
+}
+
+test collate_left_precedence_2 {
+    SELECT 'hat' COLLATE NOCASE == 'hAt' COLLATE BINARY;
+}
+expect {
+    1
+}
+
+setup unique-constraint-table {
+    CREATE TABLE t (a TEXT COLLATE NOCASE PRIMARY KEY);
+    INSERT INTO t VALUES ('lol'), ('LOL'), ('lOl');
+}
+
+@setup unique-constraint-table
+test collate_unique_constraint {
+    SELECT * FROM t;
+}
+expect error {}
+
+setup fruits-binary {
+    CREATE TABLE fruits(name collate binary);
+    INSERT INTO fruits(name) VALUES ('Apple') ,('banana') ,('CHERRY');
+}
+
+@setup fruits-binary
+test collate_aggregation_default_binary {
+    SELECT max(name) FROM fruits;
+}
+expect {
+    banana
+}
+
+setup fruits-nocase {
+    CREATE TABLE fruits(name collate nocase);
+    INSERT INTO fruits(name) VALUES ('Apple') ,('banana') ,('CHERRY');
+}
+
+@setup fruits-nocase
+test collate_aggregation_default_nocase {
+    SELECT max(name) FROM fruits;
+}
+expect {
+    CHERRY
+}
+
+setup fruits-nocase-2 {
+    CREATE TABLE fruits(name collate nocase);
+    INSERT INTO fruits(name) VALUES ('Apple') ,('banana') ,('CHERRY');
+}
+
+@setup fruits-nocase-2
+test collate_aggregation_explicit_binary {
+    SELECT max(name collate binary) FROM fruits;
+}
+expect {
+    banana
+}
+
+setup fruits-binary-2 {
+    CREATE TABLE fruits(name collate binary);
+    INSERT INTO fruits(name) VALUES ('Apple') ,('banana') ,('CHERRY');
+}
+
+@setup fruits-binary-2
+test collate_aggregation_explicit_nocase {
+    SELECT max(name collate nocase) FROM fruits;
+}
+expect {
+    CHERRY
+}
+
+setup fruits-binary-grouped {
+    CREATE TABLE fruits(name collate binary, category text);
+    INSERT INTO fruits(name, category) VALUES ('Apple', 'A'), ('banana', 'A'), ('CHERRY', 'B'), ('blueberry', 'B');
+}
+
+@setup fruits-binary-grouped
+test collate_grouped_aggregation_default_binary {
+    SELECT max(name) FROM fruits GROUP BY category;
+}
+expect {
+    banana
+    blueberry
+}
+
+setup fruits-nocase-grouped {
+    CREATE TABLE fruits(name collate nocase, category text);
+    INSERT INTO fruits(name, category) VALUES ('Apple', 'A'), ('banana', 'A'), ('CHERRY', 'B'), ('blueberry', 'B');
+}
+
+@setup fruits-nocase-grouped
+test collate_grouped_aggregation_default_nocase {
+    SELECT max(name) FROM fruits GROUP BY category;
+}
+expect {
+    banana
+    CHERRY
+}
+
+setup fruits-nocase-grouped-2 {
+    CREATE TABLE fruits(name collate nocase, category text);
+    INSERT INTO fruits(name, category) VALUES ('Apple', 'A'), ('banana', 'A'), ('CHERRY', 'B'), ('blueberry', 'B');
+}
+
+@setup fruits-nocase-grouped-2
+test collate_grouped_aggregation_explicit_binary {
+    SELECT max(name collate binary) FROM fruits GROUP BY category;
+}
+expect {
+    banana
+    blueberry
+}
+
+setup fruits-binary-grouped-2 {
+    CREATE TABLE fruits(name collate binary, category text);
+    INSERT INTO fruits(name, category) VALUES ('Apple', 'A'), ('banana', 'A'), ('CHERRY', 'B'), ('blueberry', 'B');
+}
+
+@setup fruits-binary-grouped-2
+test collate_grouped_aggregation_explicit_nocase {
+    SELECT max(name collate nocase) FROM fruits GROUP BY category;
+}
+expect {
+    banana
+    CHERRY
+}
+
+setup join-nocase {
+    CREATE TABLE a(s TEXT);
+    CREATE TABLE b(s TEXT);
+    INSERT INTO a VALUES ('A');
+    INSERT INTO b VALUES ('a');
+}
+
+@setup join-nocase
+test collate_join_nocase {
+    SELECT a.s, b.s FROM a JOIN b ON a.s COLLATE NOCASE = b.s;
+}
+expect {
+    A|a
+}
+
+setup collate-columns-table {
+    CREATE TABLE t(
+        a TEXT COLLATE NOCASE,
+        b TEXT COLLATE BINARY,
+        c TEXT COLLATE RTRIM
+    );
+    INSERT INTO t(a,b,c) VALUES
+        ('hat','hat','hat '),
+        ('hAt','hAt','hat'),
+        ('HAT','HAT','hat    '),
+        ('other','other','other');
+}
+
+@setup collate-columns-table
+test collate_columns_where_implicit {
+    SELECT count(*) FROM t WHERE a = 'hAt';
+    SELECT count(*) FROM t WHERE b = 'hAt';
+    SELECT count(*) FROM t WHERE c = 'hat';
+}
+expect {
+    3
+    1
+    3
+}
+
+setup collate-columns-table-2 {
+    CREATE TABLE t(
+        a TEXT COLLATE NOCASE,
+        b TEXT COLLATE BINARY,
+        c TEXT COLLATE RTRIM
+    );
+    INSERT INTO t(a,b,c) VALUES
+        ('hat','hat','hat '),
+        ('hAt','hAt','hat'),
+        ('HAT','HAT','hat    '),
+        ('other','other','other');
+}
+
+@setup collate-columns-table-2
+test collate_columns_where_explicit_override {
+    SELECT count(*) FROM t WHERE a COLLATE BINARY = 'hAt';
+    SELECT count(*) FROM t WHERE b COLLATE NOCASE = 'hAt';
+    SELECT count(*) FROM t WHERE c COLLATE BINARY = 'hat';
+}
+expect {
+    1
+    3
+    1
+}
+
+setup words-binary {
+    CREATE TABLE words(w TEXT COLLATE BINARY);
+    INSERT INTO words(w) VALUES ('Apple'), ('banana'), ('CHERRY');
+}
+
+@setup words-binary
+test collate_order_by_binary {
+    SELECT w FROM words ORDER BY w;
+}
+expect {
+    Apple
+    CHERRY
+    banana
+}
+
+setup words-nocase {
+    CREATE TABLE words(w TEXT COLLATE NOCASE);
+    INSERT INTO words(w) VALUES ('Apple'), ('banana'), ('CHERRY');
+}
+
+@setup words-nocase
+test collate_order_by_nocase {
+    SELECT w FROM words ORDER BY w;
+}
+expect {
+    Apple
+    banana
+    CHERRY
+}
+
+setup words-nocase-2 {
+    CREATE TABLE words(w TEXT COLLATE NOCASE);
+    INSERT INTO words(w) VALUES ('Apple'), ('banana'), ('CHERRY');
+}
+
+@setup words-nocase-2
+test collate_order_by_explicit_override {
+    SELECT w FROM words ORDER BY w COLLATE BINARY;
+}
+expect {
+    Apple
+    CHERRY
+    banana
+}
+
+setup distinct-rtrim {
+    CREATE TABLE t(c TEXT COLLATE RTRIM);
+    INSERT INTO t(c) VALUES ('x'), ('x '), ('x  '), ('y'), ('y  ');
+}
+
+@setup distinct-rtrim
+test collate_distinct_rtrim {
+    SELECT count(DISTINCT c) FROM t;
+}
+expect {
+    2
+}
+
+setup unique-nocase {
+    CREATE TABLE u(a TEXT COLLATE NOCASE UNIQUE);
+    INSERT INTO u VALUES ('aa');
+    INSERT INTO u VALUES ('AA');
+}
+
+@setup unique-nocase
+test collate_unique_nocase_conflict {
+    SELECT * FROM u;
+}
+expect error {}
+
+setup unique-rtrim {
+    CREATE TABLE r(a TEXT COLLATE RTRIM UNIQUE);
+    INSERT INTO r VALUES ('bb');
+    INSERT INTO r VALUES ('bb ');
+}
+
+@setup unique-rtrim
+test collate_unique_rtrim_conflict {
+    SELECT * FROM r;
+}
+expect error {}
+
+setup unique-binary {
+    CREATE TABLE ub(a TEXT COLLATE BINARY UNIQUE);
+    INSERT INTO ub VALUES ('aa');
+    INSERT INTO ub VALUES ('AA');
+}
+
+@setup unique-binary
+test collate_unique_binary_allows_case {
+    SELECT count(*) FROM ub;
+}
+expect {
+    2
+}
+
+setup pk-rtrim {
+    CREATE TABLE p(a TEXT COLLATE RTRIM PRIMARY KEY);
+    INSERT INTO p VALUES ('key');
+    INSERT INTO p VALUES ('key   ');
+}
+
+@setup pk-rtrim
+test collate_pk_rtrim_conflict {
+    SELECT * FROM p;
+}
+expect error {}
+
+setup join-nocase-columns {
+    CREATE TABLE a(s TEXT COLLATE NOCASE);
+    CREATE TABLE b(s TEXT COLLATE NOCASE);
+    INSERT INTO a VALUES ('A');
+    INSERT INTO b VALUES ('a');
+}
+
+@setup join-nocase-columns
+test collate_join_implicit_nocase_columns {
+    SELECT a.s, b.s FROM a JOIN b ON a.s = b.s;
+}
+expect {
+    A|a
+}
+
+setup join-mixed-binary-left {
+    CREATE TABLE a(s TEXT COLLATE BINARY);
+    CREATE TABLE b(s TEXT COLLATE NOCASE);
+    INSERT INTO a VALUES ('A');
+    INSERT INTO b VALUES ('a');
+}
+
+@setup join-mixed-binary-left
+test collate_join_mixed_implicit_binary_left {
+    SELECT a.s, b.s FROM a JOIN b ON a.s = b.s;
+}
+expect {
+}
+
+setup join-mixed-explicit {
+    CREATE TABLE a(s TEXT COLLATE BINARY);
+    CREATE TABLE b(s TEXT COLLATE NOCASE);
+    INSERT INTO a VALUES ('A');
+    INSERT INTO b VALUES ('a');
+}
+
+@setup join-mixed-explicit
+test collate_join_mixed_explicit_nocase_left {
+    SELECT a.s, b.s FROM a JOIN b ON a.s COLLATE NOCASE = b.s;
+}
+expect {
+    A|a
+}
+
+setup where-collate-table {
+    CREATE TABLE t(a TEXT COLLATE NOCASE, b TEXT COLLATE BINARY, c TEXT COLLATE RTRIM);
+    INSERT INTO t VALUES ('Foo','Foo','Foo '), ('fOo','fOo','Foo'), ('other','other','other');
+}
+
+@setup where-collate-table
+test collate_where_with_and_without_explicit {
+    SELECT count(*) FROM t WHERE a = 'foo';
+    SELECT count(*) FROM t WHERE b COLLATE NOCASE = 'foo';
+    SELECT count(*) FROM t WHERE c = 'Foo';
+    SELECT count(*) FROM t WHERE c COLLATE BINARY = 'Foo';
+}
+expect {
+    2
+    2
+    2
+    1
+}
+
+setup group-by-nocase {
+    CREATE TABLE t(s TEXT COLLATE NOCASE);
+    INSERT INTO t VALUES ('A'), ('a'), ('B'), ('b');
+}
+
+@setup group-by-nocase
+test collate_group_by_implicit_nocase {
+    SELECT s, count(*) FROM t GROUP BY s ORDER BY s;
+}
+expect {
+    A|2
+    B|2
+}
+
+setup group-by-rtrim {
+    CREATE TABLE t(s TEXT COLLATE RTRIM);
+    INSERT INTO t VALUES ('A'), ('A '), ('B'), ('B  ');
+}
+
+@setup group-by-rtrim
+test collate_group_by_implicit_rtrim {
+    SELECT s, count(*) FROM t GROUP BY s ORDER BY s;
+}
+expect {
+    A|2
+    B|2
+}
+
+setup group-by-binary {
+    CREATE TABLE t(s TEXT COLLATE BINARY);
+    INSERT INTO t VALUES ('A'), ('a'), ('B'), ('b');
+}
+
+@setup group-by-binary
+test collate_group_by_explicit_override {
+    SELECT s, count(*) FROM t GROUP BY s COLLATE NOCASE ORDER BY s;
+}
+expect {
+    A|2
+    B|2
+}
+
+setup group-by-mixed {
+    CREATE TABLE t(a TEXT COLLATE NOCASE, b TEXT COLLATE RTRIM);
+    INSERT INTO t VALUES ('A', 'x'), ('a', 'x '), ('B', 'y'), ('b', 'y  ');
+}
+
+@setup group-by-mixed
+test collate_group_by_mixed_columns {
+    SELECT a, b, count(*) FROM t GROUP BY a, b ORDER BY a, b;
+}
+expect {
+    A|x|2
+    B|y|2
+}
+
+setup subquery-collate {
+    CREATE TABLE t(a TEXT COLLATE NOCASE, b TEXT COLLATE BINARY);
+    INSERT INTO t VALUES ('A', 'A'), ('a', 'a'), ('B', 'B'), ('b', 'b');
+}
+
+@setup subquery-collate
+test collate_subquery_preserves_column_collation {
+    SELECT count(*) FROM (SELECT a FROM t) WHERE a = 'a';
+    SELECT count(*) FROM (SELECT b FROM t) WHERE b = 'a';
+}
+expect {
+    2
+    1
+}
+
+setup subquery-explicit-collate {
+    CREATE TABLE t(a TEXT COLLATE BINARY, b TEXT COLLATE BINARY);
+    INSERT INTO t VALUES ('A', 'A'), ('a', 'a'), ('B', 'B'), ('b', 'b');
+}
+
+@setup subquery-explicit-collate
+test collate_subquery_preserves_explicit_collation {
+    SELECT count(*) FROM (SELECT a COLLATE NOCASE as a FROM t) WHERE a = 'a';
+    SELECT count(*) FROM (SELECT b COLLATE BINARY as b FROM t) WHERE b = 'a';
+}
+expect {
+    2
+    1
+}
+
+setup subquery-orderby-collate {
+    CREATE TABLE t(a TEXT COLLATE NOCASE, b TEXT COLLATE BINARY);
+    INSERT INTO t VALUES ('A', 'A'), ('b', 'b'), ('C', 'C');
+}
+
+@setup subquery-orderby-collate
+test collate_subquery_preserves_collation_in_order_by {
+    SELECT a FROM (SELECT a FROM t ORDER BY a);
+    SELECT b FROM (SELECT b FROM t ORDER BY b);
+}
+expect {
+    A
+    b
+    C
+    A
+    C
+    b
+}

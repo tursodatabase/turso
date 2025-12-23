@@ -1,0 +1,660 @@
+# RETURNING clause Tests
+# Ported from testing/returning.test
+
+@database :memory:
+
+# ============================================================================
+# INSERT RETURNING tests
+# ============================================================================
+
+# Basic column references
+setup insert-returning-single-column {
+    CREATE TABLE t (id INTEGER, name TEXT, value REAL);
+}
+
+@setup insert-returning-single-column
+test insert-returning-single-column {
+    INSERT INTO t VALUES (1, 'test', 10.5) RETURNING id;
+}
+expect {
+    1
+}
+
+setup insert-returning-multiple-columns {
+    CREATE TABLE t (id INTEGER, name TEXT, value REAL);
+}
+
+@setup insert-returning-multiple-columns
+test insert-returning-multiple-columns {
+    INSERT INTO t VALUES (1, 'test', 10.5) RETURNING id, name;
+}
+expect {
+    1|test
+}
+
+setup insert-returning-all-columns {
+    CREATE TABLE t (id INTEGER, name TEXT, value REAL);
+}
+
+@setup insert-returning-all-columns
+test insert-returning-all-columns {
+    INSERT INTO t VALUES (1, 'test', 10.5) RETURNING *;
+}
+expect {
+    1|test|10.5
+}
+
+# Table-qualified column references
+setup insert-returning-table-qualified {
+    CREATE TABLE t (id INTEGER, name TEXT);
+}
+
+@setup insert-returning-table-qualified
+test insert-returning-table-qualified {
+    INSERT INTO t VALUES (1, 'test') RETURNING t.id, t.name;
+}
+expect {
+    1|test
+}
+
+# Arbitrary expressions not referencing columns
+setup insert-returning-literal {
+    CREATE TABLE t (id INTEGER);
+}
+
+@setup insert-returning-literal
+test insert-returning-literal {
+    INSERT INTO t VALUES (1) RETURNING 42;
+}
+expect {
+    42
+}
+
+setup insert-returning-constant-expression {
+    CREATE TABLE t (id INTEGER);
+}
+
+@setup insert-returning-constant-expression
+test insert-returning-constant-expression {
+    INSERT INTO t VALUES (1) RETURNING 2 + 3 * 4;
+}
+expect {
+    14
+}
+
+# Expressions referencing result columns
+setup insert-returning-column-arithmetic {
+    CREATE TABLE t (id INTEGER, value INTEGER);
+}
+
+@setup insert-returning-column-arithmetic
+test insert-returning-column-arithmetic {
+    INSERT INTO t VALUES (1, 10) RETURNING 2 * value;
+}
+expect {
+    20
+}
+
+setup insert-returning-complex-expression {
+    CREATE TABLE t (id INTEGER, x INTEGER, y INTEGER);
+}
+
+@setup insert-returning-complex-expression
+test insert-returning-complex-expression {
+    INSERT INTO t VALUES (1, 5, 3) RETURNING x + y * 2;
+}
+expect {
+    11
+}
+
+# Function calls
+setup insert-returning-function-call {
+    CREATE TABLE t (id INTEGER, name TEXT);
+}
+
+@setup insert-returning-function-call
+test insert-returning-function-call {
+    INSERT INTO t VALUES (1, 'hello') RETURNING upper(name);
+}
+expect {
+    HELLO
+}
+
+# Multiple rows
+setup insert-returning-multiple-rows {
+    CREATE TABLE t (id INTEGER, name TEXT);
+}
+
+@setup insert-returning-multiple-rows
+test insert-returning-multiple-rows {
+    INSERT INTO t VALUES (1, 'first'), (2, 'second'), (3, 'third') RETURNING id, name;
+}
+expect {
+    1|first
+    2|second
+    3|third
+}
+
+# NULL handling
+setup insert-returning-null-values {
+    CREATE TABLE t (id INTEGER, name TEXT, value INTEGER);
+}
+
+@setup insert-returning-null-values
+test insert-returning-null-values {
+    INSERT INTO t VALUES (1, NULL, NULL) RETURNING id, name, value;
+}
+expect {
+    1||
+}
+
+setup insert-returning-null-expression {
+    CREATE TABLE t (id INTEGER, name TEXT);
+}
+
+@setup insert-returning-null-expression
+test insert-returning-null-expression {
+    INSERT INTO t VALUES (1, NULL) RETURNING coalesce(name, 'default');
+}
+expect {
+    default
+}
+
+# Rowid
+setup insert-returning-rowid {
+    CREATE TABLE t (name TEXT);
+}
+
+@setup insert-returning-rowid
+test insert-returning-rowid {
+    INSERT INTO t VALUES ('test') RETURNING rowid, name;
+}
+expect {
+    1|test
+}
+
+# Auto-increment
+setup insert-returning-autoincrement {
+    CREATE TABLE t (id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT);
+}
+
+@setup insert-returning-autoincrement
+test insert-returning-autoincrement {
+    INSERT INTO t (name) VALUES ('test') RETURNING id, name;
+}
+expect {
+    1|test
+}
+
+# CASE expression
+setup insert-returning-case-expression {
+    CREATE TABLE t (id INTEGER, value INTEGER);
+}
+
+@setup insert-returning-case-expression
+test insert-returning-case-expression {
+    INSERT INTO t VALUES (1, 5) RETURNING CASE WHEN value > 10 THEN 'high' WHEN value > 0 THEN 'low' ELSE 'zero' END;
+}
+expect {
+    low
+}
+
+# ============================================================================
+# INSERT ON CONFLICT RETURNING tests
+# ============================================================================
+
+# RETURNING on INSERT path (no conflict)
+setup upsert-returning-insert-path {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);
+}
+
+@setup upsert-returning-insert-path
+test upsert-returning-insert-path {
+    INSERT INTO t VALUES (1, 'new')
+      ON CONFLICT DO UPDATE SET name = excluded.name
+      RETURNING id, name;
+}
+expect {
+    1|new
+}
+
+# RETURNING on UPDATE path (conflict occurs)
+setup upsert-returning-update-path {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);
+    INSERT INTO t VALUES (1, 'old');
+}
+
+@setup upsert-returning-update-path
+test upsert-returning-update-path {
+    INSERT INTO t VALUES (1, 'new')
+      ON CONFLICT DO UPDATE SET name = excluded.name
+      RETURNING id, name;
+}
+expect {
+    1|new
+}
+
+# RETURNING on DO NOTHING (should return empty)
+setup upsert-returning-do-nothing {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);
+    INSERT INTO t VALUES (1, 'old');
+}
+
+@setup upsert-returning-do-nothing
+test upsert-returning-do-nothing {
+    INSERT INTO t VALUES (1, 'ignored')
+      ON CONFLICT DO NOTHING
+      RETURNING id, name;
+}
+expect {
+}
+
+# RETURNING with expressions on UPDATE path
+setup upsert-returning-expression-update {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, value INTEGER);
+    INSERT INTO t VALUES (1, 5);
+}
+
+@setup upsert-returning-expression-update
+test upsert-returning-expression-update {
+    INSERT INTO t VALUES (1, 10)
+      ON CONFLICT DO UPDATE SET value = excluded.value
+      RETURNING id, value * 3;
+}
+expect {
+    1|30
+}
+
+# RETURNING with multiple rows (mixed insert/update)
+setup upsert-returning-multiple-rows {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);
+    INSERT INTO t VALUES (1, 'old1'), (2, 'old2');
+}
+
+@setup upsert-returning-multiple-rows
+test upsert-returning-multiple-rows {
+    INSERT INTO t VALUES (1, 'new1'), (2, 'new2'), (3, 'new3')
+      ON CONFLICT DO UPDATE SET name = excluded.name
+      RETURNING id, name;
+}
+expect {
+    1|new1
+    2|new2
+    3|new3
+}
+
+# ============================================================================
+# INSERT ... SELECT ... RETURNING tests
+# ============================================================================
+
+# Basic INSERT ... SELECT with RETURNING
+setup insert-select-returning-basic {
+    CREATE TABLE u (a INTEGER, b INTEGER PRIMARY KEY, c TEXT);
+    CREATE TABLE t (a TEXT, b INTEGER, c INTEGER PRIMARY KEY);
+    INSERT INTO u VALUES (1, 2, 'test'), (2, 4, 'data'), (3, 6, 'more');
+}
+
+@setup insert-select-returning-basic
+test insert-select-returning-basic {
+    INSERT INTO t SELECT c, b, b * 2 FROM u RETURNING *;
+}
+expect {
+    test|2|4
+    data|4|8
+    more|6|12
+}
+
+# ============================================================================
+# UPDATE RETURNING tests
+# ============================================================================
+
+# Basic column references
+setup update-returning-single-column {
+    CREATE TABLE t (id INTEGER, name TEXT, value REAL);
+    INSERT INTO t VALUES (1, 'test', 10.5);
+}
+
+@setup update-returning-single-column
+test update-returning-single-column {
+    UPDATE t SET value = 20.5 WHERE id = 1 RETURNING id;
+}
+expect {
+    1
+}
+
+setup update-returning-all-columns {
+    CREATE TABLE t (id INTEGER, name TEXT, value REAL);
+    INSERT INTO t VALUES (1, 'test', 10.5);
+}
+
+@setup update-returning-all-columns
+test update-returning-all-columns {
+    UPDATE t SET value = 20.5 WHERE id = 1 RETURNING *;
+}
+expect {
+    1|test|20.5
+}
+
+# Function calls
+setup update-returning-function-call {
+    CREATE TABLE t (id INTEGER, name TEXT);
+    INSERT INTO t VALUES (1, 'hello');
+}
+
+@setup update-returning-function-call
+test update-returning-function-call {
+    UPDATE t SET name = 'world' WHERE id = 1 RETURNING upper(name);
+}
+expect {
+    WORLD
+}
+
+# Multiple rows
+setup update-returning-multiple-rows {
+    CREATE TABLE t (id INTEGER, name TEXT);
+    INSERT INTO t VALUES (1, 'first'), (2, 'second'), (3, 'third');
+}
+
+@setup update-returning-multiple-rows
+test update-returning-multiple-rows {
+    UPDATE t SET name = 'updated' RETURNING id, name;
+}
+expect {
+    1|updated
+    2|updated
+    3|updated
+}
+
+# Row value updates
+setup update-returning-row-values {
+    CREATE TABLE t (id INTEGER, name TEXT);
+    INSERT INTO t VALUES (1, 'test');
+}
+
+@setup update-returning-row-values
+test update-returning-row-values {
+    UPDATE t SET (id, name) = (2, 'mordor') RETURNING id, name;
+}
+expect {
+    2|mordor
+}
+
+# ============================================================================
+# DELETE RETURNING tests
+# ============================================================================
+
+# Basic column references
+setup delete-returning-single-column {
+    CREATE TABLE t (id INTEGER, name TEXT, value REAL);
+    INSERT INTO t VALUES (1, 'test', 10.5);
+}
+
+@setup delete-returning-single-column
+test delete-returning-single-column {
+    DELETE FROM t WHERE id = 1 RETURNING id;
+}
+expect {
+    1
+}
+
+setup delete-returning-all-columns {
+    CREATE TABLE t (id INTEGER, name TEXT, value REAL);
+    INSERT INTO t VALUES (1, 'test', 10.5);
+}
+
+@setup delete-returning-all-columns
+test delete-returning-all-columns {
+    DELETE FROM t WHERE id = 1 RETURNING *;
+}
+expect {
+    1|test|10.5
+}
+
+# Expressions referencing deleted columns
+setup delete-returning-column-arithmetic {
+    CREATE TABLE t (id INTEGER, value INTEGER);
+    INSERT INTO t VALUES (1, 10);
+}
+
+@setup delete-returning-column-arithmetic
+test delete-returning-column-arithmetic {
+    DELETE FROM t WHERE id = 1 RETURNING 2 * value;
+}
+expect {
+    20
+}
+
+setup delete-returning-function-call {
+    CREATE TABLE t (id INTEGER, name TEXT);
+    INSERT INTO t VALUES (1, 'hello');
+}
+
+@setup delete-returning-function-call
+test delete-returning-function-call {
+    DELETE FROM t WHERE id = 1 RETURNING upper(name);
+}
+expect {
+    HELLO
+}
+
+# Multiple rows deleted
+setup delete-returning-multiple-rows {
+    CREATE TABLE t (id INTEGER, name TEXT);
+    INSERT INTO t VALUES (1, 'first'), (2, 'second'), (3, 'third');
+}
+
+@setup delete-returning-multiple-rows
+test delete-returning-multiple-rows {
+    DELETE FROM t RETURNING id, name;
+}
+expect {
+    1|first
+    2|second
+    3|third
+}
+
+# Rowid
+setup delete-returning-rowid {
+    CREATE TABLE t (name TEXT);
+    INSERT INTO t VALUES ('test');
+}
+
+@setup delete-returning-rowid
+test delete-returning-rowid {
+    DELETE FROM t RETURNING rowid, name;
+}
+expect {
+    1|test
+}
+
+# WHERE clause filtering
+setup delete-returning-with-where {
+    CREATE TABLE t (id INTEGER, name TEXT);
+    INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c');
+}
+
+@setup delete-returning-with-where
+test delete-returning-with-where {
+    DELETE FROM t WHERE id > 1 RETURNING id, name;
+}
+expect {
+    2|b
+    3|c
+}
+
+setup delete-returning-no-matches {
+    CREATE TABLE t (id INTEGER, name TEXT);
+    INSERT INTO t VALUES (1, 'test');
+}
+
+@setup delete-returning-no-matches
+test delete-returning-no-matches {
+    DELETE FROM t WHERE id = 999 RETURNING *;
+}
+expect {
+}
+
+# NULL handling
+setup delete-returning-null-coalesce {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER);
+    INSERT INTO t VALUES (1, NULL), (2, 42), (3, NULL);
+}
+
+@setup delete-returning-null-coalesce
+test delete-returning-null-coalesce {
+    DELETE FROM t WHERE val IS NULL RETURNING id, val, coalesce(val, 999);
+}
+expect {
+    1||999
+    3||999
+}
+
+# Complex WHERE with LIKE
+setup delete-returning-where-like {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT);
+    INSERT INTO t VALUES (1, 'Alice'), (2, 'Bob'), (3, 'Charlie');
+}
+
+@setup delete-returning-where-like
+test delete-returning-where-like {
+    DELETE FROM t WHERE name LIKE 'B%' RETURNING *;
+}
+expect {
+    2|Bob
+}
+
+# Complex WHERE with AND/OR
+setup delete-returning-where-complex {
+    CREATE TABLE t (id INTEGER PRIMARY KEY, x INTEGER);
+    INSERT INTO t VALUES (1, 5), (2, 10), (3, 15);
+}
+
+@setup delete-returning-where-complex
+test delete-returning-where-complex {
+    DELETE FROM t WHERE x > 5 AND x < 15 RETURNING id, x, x * x, x + x + x;
+}
+expect {
+    2|10|100|30
+}
+
+# ============================================================================
+# Edge cases and error conditions
+# ============================================================================
+
+# RETURNING with excluded in regular INSERT (should error)
+setup insert-returning-excluded-not-upsert {
+    CREATE TABLE t (id INTEGER, name TEXT);
+}
+
+@setup insert-returning-excluded-not-upsert
+test insert-returning-excluded-not-upsert {
+    INSERT INTO t VALUES (1, 'test') RETURNING excluded.name;
+}
+expect error {}
+
+# RETURNING with expressions that reference columns that don't exist (should error)
+setup insert-returning-nonexistent-column {
+    CREATE TABLE t (id INTEGER);
+}
+
+@setup insert-returning-nonexistent-column
+test insert-returning-nonexistent-column {
+    INSERT INTO t VALUES (1) RETURNING nonexistent;
+}
+expect error {}
+
+setup update-returning-nonexistent-column {
+    CREATE TABLE t (id INTEGER);
+    INSERT INTO t VALUES (1);
+}
+
+@setup update-returning-nonexistent-column
+test update-returning-nonexistent-column {
+    UPDATE t SET id = 2 RETURNING nonexistent;
+}
+expect error {}
+
+# RETURNING with expressions that reference wrong table (should error)
+setup insert-returning-wrong-table {
+    CREATE TABLE t1 (id INTEGER);
+    CREATE TABLE t2 (id INTEGER);
+}
+
+@setup insert-returning-wrong-table
+test insert-returning-wrong-table {
+    INSERT INTO t1 VALUES (1) RETURNING t2.id;
+}
+expect error {}
+
+# RETURNING with aggregate functions (should error)
+setup insert-returning-aggregate {
+    CREATE TABLE t (id INTEGER, value INTEGER);
+}
+
+@setup insert-returning-aggregate
+test insert-returning-aggregate {
+    INSERT INTO t VALUES (1, 42) RETURNING SUM(value);
+}
+expect error {}
+
+setup insert-returning-aggregate-count {
+    CREATE TABLE t (id INTEGER);
+}
+
+@setup insert-returning-aggregate-count
+test insert-returning-aggregate-count {
+    INSERT INTO t VALUES (1) RETURNING COUNT(*);
+}
+expect error {}
+
+# RETURNING with typeof
+setup insert-returning-typeof {
+    CREATE TABLE t (id INTEGER, name TEXT, value REAL);
+}
+
+@setup insert-returning-typeof
+test insert-returning-typeof {
+    INSERT INTO t VALUES (1, 'test', 10.5) RETURNING typeof(id), typeof(name), typeof(value);
+}
+expect {
+    integer|text|real
+}
+
+setup insert-returning-typeof-null {
+    CREATE TABLE t (id INTEGER, value INTEGER);
+}
+
+@setup insert-returning-typeof-null
+test insert-returning-typeof-null {
+    INSERT INTO t VALUES (1, NULL) RETURNING typeof(value);
+}
+expect {
+    null
+}
+
+# RETURNING with IIF
+setup insert-returning-iif {
+    CREATE TABLE t (id INTEGER, value INTEGER);
+}
+
+@setup insert-returning-iif
+test insert-returning-iif {
+    INSERT INTO t VALUES (1, 5) RETURNING IIF(value > 0, 'positive', 'negative');
+}
+expect {
+    positive
+}
+
+# RETURNING with json_array
+setup insert-returning-json-array {
+    CREATE TABLE t (id INTEGER, a INTEGER, b INTEGER);
+}
+
+@setup insert-returning-json-array
+test insert-returning-json-array {
+    INSERT INTO t VALUES (1, 2, 3) RETURNING JSON_ARRAY(a, b);
+}
+expect {
+    [2,3]
+}
+
