@@ -775,25 +775,19 @@ impl<'a> Lexer<'a> {
     fn eat_bracket(&mut self) -> Result<Token<'a>> {
         let start = self.offset;
         self.eat_and_assert(|b| b == b'[');
-        self.eat_while(|b| b != b']');
-        match self.peek() {
-            Some(b']') => {
-                self.eat_and_assert(|b| b == b']');
-                Ok(Token::new(
-                    &self.input[start..self.offset],
-                    TokenType::TK_ID,
-                ))
-            }
-            None => {
-                let token_text =
-                    String::from_utf8_lossy(&self.input[start..self.offset]).to_string();
-                Err(Error::UnterminatedBracket {
-                    span: (start, self.offset - start).into(),
-                    token_text,
-                    offset: start,
-                })
-            }
-            _ => unreachable!(), // We should not reach here
+        if self.eat_past(b']') {
+            Ok(Token::new(
+                &self.input[start..self.offset],
+                TokenType::TK_ID,
+            ))
+        } else {
+            cold();
+            let token_text = String::from_utf8_lossy(&self.input[start..self.offset]).to_string();
+            Err(Error::UnterminatedBracket {
+                span: (start, self.offset - start).into(),
+                token_text,
+                offset: start,
+            })
         }
     }
 
