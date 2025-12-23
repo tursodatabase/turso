@@ -444,8 +444,7 @@ impl<'a> Lexer<'a> {
         match self.peek() {
             Some(b'-') => {
                 self.eat_and_assert(|b| b == b'-');
-                self.eat_while(|b| b != b'\n');
-                if self.peek() == Some(b'\n') {
+                if self.eat_until(b'\n') {
                     self.eat_and_assert(|b| b == b'\n');
                 }
 
