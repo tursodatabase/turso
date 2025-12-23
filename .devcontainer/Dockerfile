@@ -10,32 +10,16 @@ ARG PYTHON_VERSION
 
 ENV TZ="$TZ"
 
-# Install basic development tools and iptables/ipset
+# Install build dependencies needed for further installations
 RUN apt-get update && apt-get install -y --no-install-recommends \
-  sqlite3 \
-  less \
-  git \
-  procps \
-  sudo \
-  fzf \
-  zsh \
-  man-db \
-  unzip \
-  gnupg2 \
-  gh \
-  iptables \
-  ipset \
-  iproute2 \
-  dnsutils \
-  aggregate \
-  jq \
-  nano \
-  vim \
+  wget \
+  curl \
   ca-certificates \
   build-essential \
   pkg-config \
-  curl \
+  gnupg2 \
   python${PYTHON_VERSION}-dev \
+  sudo \
   && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Ensure default node user has access to /usr/local/share
@@ -128,7 +112,6 @@ RUN rustc --version \
  && go version \
  && uv --version
 
-
 # Install global packages
 ENV NPM_CONFIG_PREFIX=/usr/local/share/npm-global
 ENV PATH=$PATH:/usr/local/share/npm-global/bin
@@ -139,6 +122,35 @@ ENV SHELL=/bin/zsh
 # Set the default editor and visual
 ENV EDITOR=vim
 ENV VISUAL=vim
+
+# Switch back to root to install runtime dependencies
+USER root
+
+# Install runtime dependencies for final image
+RUN apt-get update && apt-get install -y --no-install-recommends \
+  traceroute \
+  iputils-ping \
+  sqlite3 \
+  less \
+  git \
+  procps \
+  fzf \
+  zsh \
+  man-db \
+  unzip \
+  gh \
+  iptables \
+  ipset \
+  iproute2 \
+  dnsutils \
+  aggregate \
+  jq \
+  nano \
+  vim \
+  && apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Switch back to node user
+USER node
 
 # Default powerline10k theme
 RUN sh -c "$(wget -O- https://github.com/deluan/zsh-in-docker/releases/download/v${ZSH_IN_DOCKER_VERSION}/zsh-in-docker.sh)" -- \
@@ -151,11 +163,3 @@ RUN sh -c "$(wget -O- https://github.com/deluan/zsh-in-docker/releases/download/
 
 # Install Claude
 RUN npm install -g @anthropic-ai/claude-code@${CLAUDE_CODE_VERSION}
-
-# Copy and set up firewall script
-COPY init-firewall.sh /usr/local/bin/
-USER root
-RUN chmod +x /usr/local/bin/init-firewall.sh && \
-  echo "node ALL=(root) NOPASSWD: /usr/local/bin/init-firewall.sh" > /etc/sudoers.d/node-firewall && \
-  chmod 0440 /etc/sudoers.d/node-firewall
-USER node

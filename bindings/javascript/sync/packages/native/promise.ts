@@ -51,20 +51,20 @@ class Database extends DatabasePromise {
         }
 
         let partialSyncOpts = undefined;
-        if (opts.partialSync != null) {
-            switch (opts.partialSync.bootstrapStrategy.kind) {
+        if (opts.partialSyncExperimental != null) {
+            switch (opts.partialSyncExperimental.bootstrapStrategy.kind) {
                 case "prefix":
                     partialSyncOpts = {
-                        bootstrapStrategy: { type: "Prefix", length: opts.partialSync.bootstrapStrategy.length },
-                        segmentSize: opts.partialSync.segmentSize,
-                        prefetch: opts.partialSync.prefetch,
+                        bootstrapStrategy: { type: "Prefix", length: opts.partialSyncExperimental.bootstrapStrategy.length },
+                        segmentSize: opts.partialSyncExperimental.segmentSize,
+                        prefetch: opts.partialSyncExperimental.prefetch,
                     };
                     break;
                 case "query":
                     partialSyncOpts = {
-                        bootstrapStrategy: { type: "Query", query: opts.partialSync.bootstrapStrategy.query },
-                        segmentSize: opts.partialSync.segmentSize,
-                        prefetch: opts.partialSync.prefetch,
+                        bootstrapStrategy: { type: "Query", query: opts.partialSyncExperimental.bootstrapStrategy.query },
+                        segmentSize: opts.partialSyncExperimental.segmentSize,
+                        prefetch: opts.partialSyncExperimental.prefetch,
                     };
                     break;
             }

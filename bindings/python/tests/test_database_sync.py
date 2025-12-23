@@ -108,7 +108,7 @@ def test_partial_sync():
         conn_partial = turso.sync.connect(
             ":memory:",
             remote_url=server.db_url(),
-            partial_sync_opts=turso.sync.PartialSyncOpts(
+            partial_sync_experimental=turso.sync.PartialSyncOpts(
                 bootstrap_strategy=turso.sync.PartialSyncPrefixBootstrap(length=128 * 1024),
             ),
         )
@@ -135,7 +135,7 @@ def test_partial_sync_segment_size():
         conn_partial = turso.sync.connect(
             ":memory:",
             remote_url=server.db_url(),
-            partial_sync_opts=turso.sync.PartialSyncOpts(
+            partial_sync_experimental=turso.sync.PartialSyncOpts(
                 bootstrap_strategy=turso.sync.PartialSyncPrefixBootstrap(length=128 * 1024),
                 segment_size=4 * 1024,
             ),
@@ -163,7 +163,7 @@ def test_partial_sync_prefetch():
         conn_partial = turso.sync.connect(
             ":memory:",
             remote_url=server.db_url(),
-            partial_sync_opts=turso.sync.PartialSyncOpts(
+            partial_sync_experimental=turso.sync.PartialSyncOpts(
                 bootstrap_strategy=turso.sync.PartialSyncPrefixBootstrap(length=128 * 1024),
                 segment_size=4 * 1024,
                 prefetch=True,
