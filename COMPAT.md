@@ -52,12 +52,12 @@ Turso aims to be fully compatible with SQLite, with opt-in features not supporte
 | Statement                 | Status  | Comment                                                                           |
 |---------------------------|---------|-----------------------------------------------------------------------------------|
 | ALTER TABLE               | Yes     |                                                                                   |
-| ANALYZE                   | No      |                                                                                   |
+| ANALYZE                   | Yes     |                                                                                   |
 | ATTACH DATABASE           | Partial | Only for reads. All modifications will currently fail to find the table           |
 | BEGIN TRANSACTION         | Partial | Transaction names are not supported.                                              |
 | COMMIT TRANSACTION        | Partial | Transaction names are not supported.                                              |
-| CREATE INDEX              | Partial | Only for columns (not arbitrary expressions)                                      |
-| CREATE TABLE              | Partial |                                                                                   |
+| CREATE INDEX              | Yes     |                                                                                   |
+| CREATE TABLE              | Yes     |                                                                                   |
 | CREATE TABLE ... STRICT   | Partial | Strict schema mode is experimental.                                               |
 | CREATE TRIGGER            | Yes     |                                                                                   |
 | CREATE VIEW               | Yes     |                                                                                   |
@@ -109,7 +109,7 @@ Turso aims to be fully compatible with SQLite, with opt-in features not supporte
 | PRAGMA busy_timeout              | No         |                                              |
 | PRAGMA busy_timeout              | No         |                                              |
 | PRAGMA cache_size                | Yes        |                                              |
-| PRAGMA cache_spill               | No         |                                              |
+| PRAGMA cache_spill               | Yes        |                                              |
 | PRAGMA case_sensitive_like       | Not Needed | deprecated in SQLite                         |
 | PRAGMA cell_size_check           | No         |                                              |
 | PRAGMA checkpoint_fullsync       | No         |                                              |
