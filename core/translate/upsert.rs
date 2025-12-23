@@ -14,7 +14,7 @@ use crate::translate::planner::ROWID_STRS;
 use crate::translate::trigger_exec::{
     fire_trigger, get_relevant_triggers_type_and_time, TriggerContext,
 };
-use crate::vdbe::insn::{CmpInsFlags, to_u16};
+use crate::vdbe::insn::{to_u16, CmpInsFlags};
 use crate::Connection;
 use crate::{
     bail_parse_error,

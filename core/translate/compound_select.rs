@@ -4,7 +4,7 @@ use crate::translate::emitter::{emit_query, LimitCtx, Resolver, TranslateCtx};
 use crate::translate::expr::translate_expr;
 use crate::translate::plan::{Plan, QueryDestination, SelectPlan};
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
-use crate::vdbe::insn::{Insn, to_u16};
+use crate::vdbe::insn::{to_u16, Insn};
 use crate::vdbe::BranchOffset;
 use crate::{emit_explain, LimboError, QueryMode, SymbolTable};
 use std::sync::Arc;

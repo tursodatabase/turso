@@ -32,7 +32,9 @@ use crate::translate::upsert::{
 use crate::util::normalize_ident;
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::builder::{CursorKey, ProgramBuilderOpts};
-use crate::vdbe::insn::{{CmpInsFlags, IdxInsertFlags, InsertFlags, RegisterOrLiteral}, to_u16};
+use crate::vdbe::insn::{
+    to_u16, {CmpInsFlags, IdxInsertFlags, InsertFlags, RegisterOrLiteral},
+};
 use crate::vdbe::BranchOffset;
 use crate::{
     schema::{Column, Schema},

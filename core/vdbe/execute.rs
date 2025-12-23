@@ -9370,9 +9370,11 @@ pub fn op_hash_build(
 ) -> Result<InsnFunctionStepResult> {
     let Insn::HashBuild { data } = insn else {
         #[cfg(debug_assertions)]
-        panic!("Expected Insn::HashBuild, got {:?}", insn);
+        panic!("Expected Insn::HashBuild, got {insn:?}");
         #[cfg(not(debug_assertions))]
-        unsafe { std::hint::unreachable_unchecked() };
+        unsafe {
+            std::hint::unreachable_unchecked()
+        };
     };
 
     let mut op_state = state
@@ -9397,16 +9399,18 @@ pub fn op_hash_build(
         });
 
     // Create hash table if it doesn't exist yet
-    if !state.hash_tables.contains_key(&data.hash_table_id) {
-        let config = HashTableConfig {
-            initial_buckets: 1024,
-            mem_budget: data.mem_budget,
-            num_keys: data.num_keys,
-            collations: data.collations.clone(),
-        };
-        let hash_table = HashTable::new(config, pager.io.clone());
-        state.hash_tables.insert(data.hash_table_id, hash_table);
-    }
+    state
+        .hash_tables
+        .entry(data.hash_table_id)
+        .or_insert_with(|| {
+            let config = HashTableConfig {
+                initial_buckets: 1024,
+                mem_budget: data.mem_budget,
+                num_keys: data.num_keys,
+                collations: data.collations.clone(),
+            };
+            HashTable::new(config, pager.io.clone())
+        });
 
     // Read pre-computed key values directly from registers
     while op_state.key_idx < data.num_keys {

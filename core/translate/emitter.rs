@@ -49,7 +49,9 @@ use crate::translate::window::{emit_window_results, init_window, WindowMetadata}
 use crate::util::{exprs_are_equivalent, normalize_ident};
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::builder::{CursorKey, CursorType, ProgramBuilder};
-use crate::vdbe::insn::{{CmpInsFlags, IdxInsertFlags, InsertFlags, RegisterOrLiteral}, to_u16};
+use crate::vdbe::insn::{
+    to_u16, {CmpInsFlags, IdxInsertFlags, InsertFlags, RegisterOrLiteral},
+};
 use crate::vdbe::{insn::Insn, BranchOffset};
 use crate::Connection;
 use crate::{bail_parse_error, Result, SymbolTable};

@@ -13,7 +13,9 @@ use crate::translate::result_row::emit_select_result;
 use crate::types::KeyInfo;
 use crate::util::exprs_are_equivalent;
 use crate::vdbe::builder::{CursorType, ProgramBuilder, TableRefIdCounter};
-use crate::vdbe::insn::{{InsertFlags, Insn}, to_u16};
+use crate::vdbe::insn::{
+    to_u16, {InsertFlags, Insn},
+};
 use crate::vdbe::{BranchOffset, CursorID};
 use crate::Result;
 use std::mem;

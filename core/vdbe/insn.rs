@@ -1317,7 +1317,9 @@ pub enum Insn {
     },
 
     /// Build a hash table from a cursor for hash join.
-    HashBuild { data: Box<HashBuildData> },
+    HashBuild {
+        data: Box<HashBuildData>,
+    },
 
     /// Finalize the hash table build phase. Transitions the hash table from Building to Probing state.
     /// Should be called after the HashBuild loop completes.

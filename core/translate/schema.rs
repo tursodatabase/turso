@@ -14,7 +14,9 @@ use crate::translate::{ProgramBuilder, ProgramBuilderOpts};
 use crate::util::normalize_ident;
 use crate::util::PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX;
 use crate::vdbe::builder::CursorType;
-use crate::vdbe::insn::{{CmpInsFlags, Cookie, InsertFlags, Insn}, to_u16};
+use crate::vdbe::insn::{
+    to_u16, {CmpInsFlags, Cookie, InsertFlags, Insn},
+};
 use crate::Connection;
 use crate::{bail_constraint_error, bail_parse_error, Result};
 
