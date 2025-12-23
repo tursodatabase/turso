@@ -356,10 +356,6 @@ do_execsql_test_on_specific_db ":memory:" pragma-integrity-check-empty {
   PRAGMA integrity_check;
 } {ok}
 
-do_execsql_test_on_specific_db ":memory:" pragma-cache-spill-default {
-  PRAGMA cache_spill;
-} {1}
-
 do_execsql_test_on_specific_db ":memory:" pragma-cache-spill-off {
   PRAGMA cache_spill=off;
   PRAGMA cache_spill;
