@@ -759,7 +759,7 @@ impl Program {
         state: &mut ProgramState,
         pager: Arc<Pager>,
         query_mode: QueryMode,
-        waker: Option<&Waker>,
+        waker: &Waker,
     ) -> Result<StepResult> {
         state.execution_state = ProgramExecutionState::Running;
         let result = match query_mode {
@@ -844,7 +844,7 @@ impl Program {
             // Process the subprogram - it will handle its own explain_step internally
             // The subprogram's explain_step will process all its instructions (including any nested subprograms)
             // and return StepResult::Row for each instruction, then StepResult::Done when finished
-            let result = p.step(state, pager.clone(), QueryMode::Explain, None)?;
+            let result = p.step(state, pager.clone(), QueryMode::Explain, Waker::noop())?;
 
             match result {
                 StepResult::Done => {
@@ -977,7 +977,7 @@ impl Program {
         &self,
         state: &mut ProgramState,
         pager: Arc<Pager>,
-        waker: Option<&Waker>,
+        waker: &Waker,
     ) -> Result<StepResult> {
         let enable_tracing = tracing::enabled!(tracing::Level::TRACE);
         loop {

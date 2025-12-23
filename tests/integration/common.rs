@@ -501,7 +501,7 @@ impl_exec_rows_for_tuple!(T0: 0, T1: 1, T2: 2, T3: 3, T4: 4, T5: 5, T6: 6, T7: 7
 mod tests {
     use std::{sync::Arc, vec};
     use tempfile::{NamedTempFile, TempDir};
-    use turso_core::{Database, StepResult, IO};
+    use turso_core::{Database, IO};
 
     use crate::common::{do_flush, ExecRows};
 
@@ -814,17 +814,11 @@ mod tests {
         let mut stmt = stmt.unwrap();
 
         let mut found_tables = Vec::new();
-        loop {
-            match stmt.step()? {
-                StepResult::Row => {
-                    let row = stmt.row().unwrap();
-                    let table_name = row.get::<String>(0)?;
-                    found_tables.push(table_name);
-                }
-                StepResult::Done => break,
-                _ => {}
-            }
-        }
+        stmt.run_with_row_callback(|row| {
+            let table_name = row.get::<String>(0)?;
+            found_tables.push(table_name);
+            Ok(())
+        })?;
 
         // Verify we found all expected tables
         assert_eq!(found_tables.len(), 0, "Should find no tables in schema");

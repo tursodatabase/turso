@@ -75,7 +75,7 @@ pub use io::{
 use parking_lot::{Mutex, RwLock};
 use rustc_hash::FxHashMap;
 use schema::Schema;
-pub use statement::Statement;
+pub use statement::{AsyncStatement, AsyncStepResult, BlockingStatement, Statement};
 use std::collections::HashSet;
 use std::time::Duration;
 use std::{
@@ -2278,21 +2278,7 @@ impl Connection {
         }
         let pragma = format!("PRAGMA {pragma_name}({pragma_value})");
         let mut stmt = self.prepare(pragma)?;
-        let mut results = Vec::new();
-        loop {
-            match stmt.step()? {
-                vdbe::StepResult::Row => {
-                    let row: Vec<Value> = stmt.row().unwrap().get_values().cloned().collect();
-                    results.push(row);
-                }
-                vdbe::StepResult::Interrupt | vdbe::StepResult::Busy => {
-                    return Err(LimboError::Busy);
-                }
-                _ => break,
-            }
-        }
-
-        Ok(results)
+        stmt.run_collect_rows()
     }
 
     #[inline]
