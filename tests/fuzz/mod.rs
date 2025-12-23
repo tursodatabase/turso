@@ -2150,7 +2150,7 @@ mod fuzz_tests {
 
             // Now fuzz mutations that trigger CASCADE/SET NULL behavior
             for _ in 0..INNER_ITERS {
-                let op = rng.random_range(0..10);
+                let op = rng.random_range(0..14);
                 let stmt = match op {
                     // DELETE parent (triggers ON DELETE action)
                     0 | 1 => {
@@ -2239,9 +2239,63 @@ mod fuzz_tests {
                         }
                     }
                     // DELETE child directly
-                    _ => {
+                    9 => {
                         let id = rng.random_range(1000..=2500);
                         format!("DELETE FROM child_cascade WHERE id={id}")
+                    }
+                    // INSERT OR REPLACE on parent (triggers ON DELETE action)
+                    10 => {
+                        let id = if let Some(p) = parent_ids.iter().choose(&mut rng) {
+                            *p
+                        } else {
+                            rng.random_range(1..=100) as i64
+                        };
+                        let a = rng.random_range(-5..=25);
+                        let b = rng.random_range(-5..=25);
+                        parent_ids.insert(id);
+                        format!("INSERT OR REPLACE INTO parent VALUES({id}, {a}, {b})")
+                    }
+                    // INSERT OR REPLACE on composite parent (triggers ON DELETE action)
+                    11 => {
+                        if let Some((a, b)) = comp_pairs.iter().choose(&mut rng).cloned() {
+                            let c = rng.random_range(0..=20);
+                            format!("INSERT OR REPLACE INTO parent_comp VALUES({a}, {b}, {c})")
+                        } else {
+                            let a = rng.random_range(-3..=10);
+                            let b = rng.random_range(-3..=10);
+                            let c = rng.random_range(0..=20);
+                            comp_pairs.insert((a as i64, b as i64));
+                            format!("INSERT OR REPLACE INTO parent_comp VALUES({a}, {b}, {c})")
+                        }
+                    }
+                    // UPSERT on parent that updates columns (triggers ON UPDATE action)
+                    12 => {
+                        let id = if rng.random_bool(0.8) {
+                            if let Some(p) = parent_ids.iter().choose(&mut rng) {
+                                *p
+                            } else {
+                                rng.random_range(1..=100) as i64
+                            }
+                        } else {
+                            rng.random_range(1..=150) as i64
+                        };
+                        let new_a = rng.random_range(-5..=25);
+                        let new_b = rng.random_range(-5..=25);
+                        parent_ids.insert(id);
+                        format!("INSERT INTO parent VALUES({id}, {new_a}, {new_b}) ON CONFLICT(id) DO UPDATE SET a={new_a}, b={new_b}")
+                    }
+                    // UPSERT on composite parent that updates columns (triggers ON UPDATE action)
+                    _ => {
+                        if let Some((a, b)) = comp_pairs.iter().choose(&mut rng).cloned() {
+                            let new_c = rng.random_range(0..=20);
+                            format!("INSERT INTO parent_comp VALUES({a}, {b}, {new_c}) ON CONFLICT(a,b) DO UPDATE SET c={new_c}")
+                        } else {
+                            let a = rng.random_range(-3..=10);
+                            let b = rng.random_range(-3..=10);
+                            let c = rng.random_range(0..=20);
+                            comp_pairs.insert((a as i64, b as i64));
+                            format!("INSERT INTO parent_comp VALUES({a}, {b}, {c}) ON CONFLICT(a,b) DO UPDATE SET c={c}")
+                        }
                     }
                 };
 
@@ -2430,7 +2484,7 @@ mod fuzz_tests {
 
             // Fuzz mutations on the hierarchy
             for _ in 0..INNER_ITERS {
-                let op = rng.random_range(0..8);
+                let op = rng.random_range(0..12);
                 let stmt = match op {
                     // DELETE grandparent (should cascade to parent and child)
                     0 | 1 => {
@@ -2489,11 +2543,61 @@ mod fuzz_tests {
                         }
                     }
                     // INSERT new child
-                    _ => {
+                    7 => {
                         let id = rng.random_range(1000..=3000);
                         if let Some(p_id) = p_ids.iter().choose(&mut rng) {
                             let v = rng.random_range(0..=100);
                             format!("INSERT OR IGNORE INTO c VALUES({id}, {p_id}, {v})")
+                        } else {
+                            continue;
+                        }
+                    }
+                    // INSERT OR REPLACE on grandparent (triggers recursive cascade)
+                    8 => {
+                        if let Some(id) = gp_ids.iter().choose(&mut rng).cloned() {
+                            let v = rng.random_range(0..=100);
+                            format!("INSERT OR REPLACE INTO gp VALUES({id}, {v})")
+                        } else {
+                            let id = rng.random_range(1..=50);
+                            let v = rng.random_range(0..=100);
+                            gp_ids.insert(id as i64);
+                            format!("INSERT OR REPLACE INTO gp VALUES({id}, {v})")
+                        }
+                    }
+                    // INSERT OR REPLACE on parent (triggers cascade to children)
+                    9 => {
+                        if let Some(id) = p_ids.iter().choose(&mut rng).cloned() {
+                            if let Some(gp_id) = gp_ids.iter().choose(&mut rng) {
+                                let v = rng.random_range(0..=100);
+                                format!("INSERT OR REPLACE INTO p VALUES({id}, {gp_id}, {v})")
+                            } else {
+                                continue;
+                            }
+                        } else {
+                            continue;
+                        }
+                    }
+                    // UPSERT on grandparent that updates value (doesn't change FK key, so no cascade)
+                    10 => {
+                        if let Some(id) = gp_ids.iter().choose(&mut rng).cloned() {
+                            let new_v = rng.random_range(0..=100);
+                            format!("INSERT INTO gp VALUES({id}, {new_v}) ON CONFLICT(id) DO UPDATE SET v={new_v}")
+                        } else {
+                            let id = rng.random_range(1..=50);
+                            let v = rng.random_range(0..=100);
+                            gp_ids.insert(id as i64);
+                            format!("INSERT INTO gp VALUES({id}, {v}) ON CONFLICT(id) DO UPDATE SET v={v}")
+                        }
+                    }
+                    // UPSERT on parent that updates value (doesn't change FK key)
+                    _ => {
+                        if let Some(id) = p_ids.iter().choose(&mut rng).cloned() {
+                            if let Some(gp_id) = gp_ids.iter().choose(&mut rng) {
+                                let new_v = rng.random_range(0..=100);
+                                format!("INSERT INTO p VALUES({id}, {gp_id}, {new_v}) ON CONFLICT(id) DO UPDATE SET v={new_v}")
+                            } else {
+                                continue;
+                            }
                         } else {
                             continue;
                         }
