@@ -368,7 +368,7 @@ fn prepare_one_select_plan(
                             BindingBehavior::ResultColumnsNotAllowed,
                         )?;
                         let contains_aggregates = resolve_window_and_aggregate_functions(
-                            &mut expr,
+                            &expr,
                             resolver,
                             &mut aggregate_expressions,
                             Some(&mut windows),
