@@ -151,33 +151,33 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
             partial_sync_opts: sync_config.partial_sync_opts.clone(),
         };
         let is_memory = db_config.path == ":memory:";
-        let db_io: Arc<dyn IO> = if let Some(io) = sync_config.db_io.as_ref() {
-            io.clone()
-        } else if is_memory {
-            Arc::new(MemoryIO::new())
-        } else {
-            #[cfg(target_os = "linux")]
-            {
-                if sync_engine_opts.partial_sync_opts.is_none() {
+        let db_io: Arc<dyn IO> =
+            if let Some(io) = sync_config.db_io.as_ref() {
+                io.clone()
+            } else if is_memory {
+                Arc::new(MemoryIO::new())
+            } else {
+                #[cfg(target_os = "linux")]
+                {
+                    if sync_engine_opts.partial_sync_opts.is_none() {
+                        Arc::new(turso_core::PlatformIO::new().map_err(|e| {
+                            TursoError::Error(format!("Failed to create platform IO: {e}"))
+                        })?)
+                    } else {
+                        use turso_sync_engine::sparse_io::SparseLinuxIo;
+
+                        Arc::new(SparseLinuxIo::new().map_err(|e| {
+                            TursoError::Error(format!("Failed to create sparse IO: {e}"))
+                        })?)
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
                     Arc::new(turso_core::PlatformIO::new().map_err(|e| {
                         TursoError::Error(format!("Failed to create platform IO: {e}"))
                     })?)
-                } else {
-                    use turso_sync_engine::sparse_io::SparseLinuxIo;
-
-                    Arc::new(SparseLinuxIo::new().map_err(|e| {
-                        TursoError::Error(format!("Failed to create sparse IO: {e}"))
-                    })?)
                 }
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                Arc::new(turso_core::PlatformIO::new().map_err(|e| TursoError {
-                    code: TursoStatusCode::Error,
-                    message: Some(format!("Failed to create platform IO: {e}")),
-                })?)
-            }
-        };
+            };
         let sync_engine_io_queue = SyncEngineIoStats::new(SyncEngineIoQueue::new());
         Ok(Arc::new(Self {
             db_config,
