@@ -217,6 +217,10 @@ unsafe extern "C" {
     ) -> turso_status_code_t;
 }
 unsafe extern "C" {
+    #[doc = " Set busy timeout for the connection"]
+    pub fn turso_connection_set_busy_timeout_ms(self_: *const turso_connection_t, timeout_ms: i64);
+}
+unsafe extern "C" {
     #[doc = " Get autocommit state of the connection"]
     pub fn turso_connection_get_autocommit(self_: *const turso_connection_t) -> bool;
 }
@@ -285,6 +289,10 @@ unsafe extern "C" {
         self_: *const turso_statement_t,
         error_opt_out: *mut *const ::std::os::raw::c_char,
     ) -> turso_status_code_t;
+}
+unsafe extern "C" {
+    #[doc = " return amount of row modifications (insert/delete operations) made by the most recent executed statement"]
+    pub fn turso_statement_n_change(self_: *const turso_statement_t) -> i64;
 }
 unsafe extern "C" {
     #[doc = " Get column count"]

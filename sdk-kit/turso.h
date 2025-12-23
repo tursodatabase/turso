@@ -151,6 +151,9 @@ turso_status_code_t turso_database_connect(
     /** Optional return error parameter (can be null) */
     const char **error_opt_out);
 
+/** Set busy timeout for the connection */
+void turso_connection_set_busy_timeout_ms(const turso_connection_t *self, int64_t timeout_ms);
+
 /** Get autocommit state of the connection */
 bool turso_connection_get_autocommit(const turso_connection_t *self);
 
@@ -222,6 +225,9 @@ turso_status_code_t turso_statement_reset(const turso_statement_t *self, const c
  * This method must be called in the end of statement execution (either successfull or not)
  */
 turso_status_code_t turso_statement_finalize(const turso_statement_t *self, const char **error_opt_out);
+
+/** return amount of row modifications (insert/delete operations) made by the most recent executed statement */
+int64_t turso_statement_n_change(const turso_statement_t *self);
 
 /** Get column count */
 int64_t turso_statement_column_count(const turso_statement_t *self);
