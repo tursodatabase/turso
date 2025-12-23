@@ -1606,7 +1606,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
         todo!()
     }
 
-    fn get_index_info(&self) -> &crate::types::IndexInfo {
+    fn get_index_info(&self) -> &Arc<crate::types::IndexInfo> {
         match &self.mv_cursor_type {
             MvccCursorType::Index(index_info) => index_info,
             MvccCursorType::Table => panic!("get_index_info called on table cursor"),

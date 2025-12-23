@@ -583,7 +583,7 @@ pub trait CursorTrait: Any {
     /// Check if cursor is poiting at a valid entry with a record.
     fn has_record(&self) -> bool;
     fn set_has_record(&mut self, has_record: bool);
-    fn get_index_info(&self) -> &IndexInfo;
+    fn get_index_info(&self) -> &Arc<IndexInfo>;
 
     fn seek_end(&mut self) -> Result<IOResult<()>>;
     fn seek_to_last(&mut self, always_seek: bool) -> Result<IOResult<()>>;
@@ -627,7 +627,7 @@ pub struct BTreeCursor {
     /// Reusable immutable record, used to allow better allocation strategy.
     reusable_immutable_record: RefCell<Option<ImmutableRecord>>,
     /// Information about the index key structure (sort order, collation, etc)
-    pub index_info: Option<IndexInfo>,
+    pub index_info: Option<Arc<IndexInfo>>,
     /// Maintain count of the number of records in the btree. Used for the `Count` opcode
     count: usize,
     /// Stores the cursor context before rebalancing so that a seek can be done later
@@ -748,7 +748,7 @@ impl BTreeCursor {
 
     pub fn new_index(pager: Arc<Pager>, root_page: i64, index: &Index, num_columns: usize) -> Self {
         let mut cursor = Self::new(pager, root_page, num_columns);
-        cursor.index_info = Some(IndexInfo::new_from_index(index));
+        cursor.index_info = Some(Arc::new(IndexInfo::new_from_index(index)));
         cursor
     }
 
@@ -5676,7 +5676,7 @@ impl CursorTrait for BTreeCursor {
     }
 
     #[inline]
-    fn get_index_info(&self) -> &IndexInfo {
+    fn get_index_info(&self) -> &Arc<IndexInfo> {
         self.index_info.as_ref().unwrap()
     }
 
