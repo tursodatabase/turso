@@ -17,6 +17,7 @@ from .lib import (
     paramstyle,
     setup_logging,
     threadsafety,
+    EncryptionOpts,
 )
 
 __all__ = [
@@ -38,4 +39,5 @@ __all__ = [
     "apilevel",
     "paramstyle",
     "threadsafety",
+    "EncryptionOpts",
 ]
