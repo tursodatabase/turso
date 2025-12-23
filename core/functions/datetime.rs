@@ -72,6 +72,13 @@ enum DateTimeOutput {
     JuliaDay,
 }
 
+// The result of applying a set of modifiers is both a datetime
+// and whether the subsec format was requested.
+struct DtTransform {
+    dt: NaiveDateTime,
+    subsec_requested: bool,
+}
+
 fn exec_datetime<I, E, V>(values: I, output_type: DateTimeOutput) -> Value
 where
     V: AsValueRef,
@@ -101,13 +108,6 @@ where
             subsec_requested,
         }) => format_dt(dt, output_type, subsec_requested),
     }
-}
-
-// The result of applying a set of modifiers is both a datetime
-// and whether the subsec format was requested.
-struct DtTransform {
-    dt: NaiveDateTime,
-    subsec_requested: bool,
 }
 
 fn modify_dt<I, E, V>(mut dt: NaiveDateTime, mods: I) -> Option<DtTransform>
