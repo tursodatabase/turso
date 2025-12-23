@@ -594,29 +594,24 @@ impl<'a> Lexer<'a> {
         };
 
         loop {
-            self.eat_while(|b| b != quote);
-            match self.peek() {
-                Some(b) if b == quote => {
-                    self.eat_and_assert(|b| b == quote);
-                    match self.peek() {
-                        Some(b) if b == quote => {
-                            self.eat_and_assert(|b| b == quote);
-                            continue;
-                        }
-                        _ => break,
+            if self.eat_past(quote) {
+                match self.peek() {
+                    Some(b) if b == quote => {
+                        self.eat_and_assert(|b| b == quote);
+                        continue;
                     }
+                    _ => break,
                 }
-                None => {
-                    let token_text =
-                        String::from_utf8_lossy(&self.input[start..self.offset]).to_string();
-                    return Err(Error::UnterminatedLiteral {
-                        span: (start, self.offset - start).into(),
-                        token_text,
-                        offset: start,
-                    });
-                }
-                _ => unreachable!(),
-            };
+            } else {
+                cold();
+                let token_text =
+                    String::from_utf8_lossy(&self.input[start..self.offset]).to_string();
+                return Err(Error::UnterminatedLiteral {
+                    span: (start, self.offset - start).into(),
+                    token_text,
+                    offset: start,
+                });
+            }
         }
 
         Ok(Token::new(&self.input[start..self.offset], tt))
