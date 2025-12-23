@@ -1509,9 +1509,11 @@ def test_encryption_enabled(tmp_path):
     cursor.execute("create table t(x)")
     cursor.execute("insert into t select 'secret' from generate_series(1, 1024)")
     conn.commit()
-    cursor.execute("pragma wal_checkpoint(truncate)")
+    cursor.execute("pragma wal_checkpoint(truncate)").fetchall()
+    conn.commit()
 
     content = open(tmp_path, "rb").read()
+    assert len(content) > 16 * 1024
     assert b"secret" not in content
 
 
@@ -1524,7 +1526,9 @@ def test_encryption_disabled(tmp_path):
     cursor.execute("create table t(x)")
     cursor.execute("insert into t select 'secret' from generate_series(1, 1024)")
     conn.commit()
-    cursor.execute("pragma wal_checkpoint(truncate)")
+    cursor.execute("pragma wal_checkpoint(truncate)").fetchall()
+    conn.commit()
 
     content = open(tmp_path, "rb").read()
+    assert len(content) > 16 * 1024
     assert b"secret" in content
