@@ -257,7 +257,7 @@ impl TursoDatabaseConfig {
             } else {
                 None
             },
-            async_io: config.async_io,
+            async_io: config.async_io != 0,
             encryption: if encryption_cipher.is_some() {
                 Some(EncryptionOpts {
                     cipher: encryption_cipher.unwrap(),

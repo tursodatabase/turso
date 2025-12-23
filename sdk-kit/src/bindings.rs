@@ -146,12 +146,12 @@ impl Default for turso_config_t {
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct turso_database_config_t {
+    #[doc = " Parameter which defines who drives the IO - callee or the caller (non-zero parameter value interpreted as async IO)"]
+    pub async_io: u64,
     #[doc = " Path to the database file or `:memory:`\n zero-terminated C string"]
     pub path: *const ::std::os::raw::c_char,
     #[doc = " Optional comma separated list of experimental features to enable\n zero-terminated C string or null pointer"]
     pub experimental_features: *const ::std::os::raw::c_char,
-    #[doc = " Parameter which defines who drives the IO - callee or the caller"]
-    pub async_io: bool,
     #[doc = " optional VFS parameter explicitly specifying FS backend for the database.\n Available options are:\n - \"memory\": in-memory backend\n - \"syscall\": generic syscall backend\n - \"io_uring\": IO uring (supported only on Linux)"]
     pub vfs: *const ::std::os::raw::c_char,
     #[doc = " optional encryption cipher\n as encryption is experimental - experimental_features must have \"encryption\" in the list"]
@@ -164,12 +164,12 @@ const _: () = {
     ["Size of turso_database_config_t"][::std::mem::size_of::<turso_database_config_t>() - 48usize];
     ["Alignment of turso_database_config_t"]
         [::std::mem::align_of::<turso_database_config_t>() - 8usize];
-    ["Offset of field: turso_database_config_t::path"]
-        [::std::mem::offset_of!(turso_database_config_t, path) - 0usize];
-    ["Offset of field: turso_database_config_t::experimental_features"]
-        [::std::mem::offset_of!(turso_database_config_t, experimental_features) - 8usize];
     ["Offset of field: turso_database_config_t::async_io"]
-        [::std::mem::offset_of!(turso_database_config_t, async_io) - 16usize];
+        [::std::mem::offset_of!(turso_database_config_t, async_io) - 0usize];
+    ["Offset of field: turso_database_config_t::path"]
+        [::std::mem::offset_of!(turso_database_config_t, path) - 8usize];
+    ["Offset of field: turso_database_config_t::experimental_features"]
+        [::std::mem::offset_of!(turso_database_config_t, experimental_features) - 16usize];
     ["Offset of field: turso_database_config_t::vfs"]
         [::std::mem::offset_of!(turso_database_config_t, vfs) - 24usize];
     ["Offset of field: turso_database_config_t::encryption_cipher"]

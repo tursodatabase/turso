@@ -96,6 +96,8 @@ typedef struct
  */
 typedef struct
 {
+    /** Parameter which defines who drives the IO - callee or the caller (non-zero parameter value interpreted as async IO) */
+    uint64_t async_io;
     /** Path to the database file or `:memory:`
      * zero-terminated C string
      */
@@ -104,8 +106,6 @@ typedef struct
      * zero-terminated C string or null pointer
      */
     const char *experimental_features;
-    /** Parameter which defines who drives the IO - callee or the caller */
-    bool async_io;
     /** optional VFS parameter explicitly specifying FS backend for the database.
      * Available options are:
      * - "memory": in-memory backend
