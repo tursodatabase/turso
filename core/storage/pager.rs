@@ -856,6 +856,15 @@ impl Pager {
         self.init_page_1.clone()
     }
 
+    /// Set whether cache spilling is enabled.
+    pub fn set_spill_enabled(&self, enabled: bool) {
+        self.page_cache.write().set_spill_enabled(enabled);
+    }
+    /// Get whether cache spilling is enabled.
+    pub fn get_spill_enabled(&self) -> bool {
+        self.page_cache.read().is_spill_enabled()
+    }
+
     /// Open the subjournal if not yet open.
     /// The subjournal is a file that is used to store the "before images" of pages for the
     /// current savepoint. If the savepoint is rolled back, the pages can be restored from the subjournal.
