@@ -5,12 +5,10 @@ use super::{translate_inner, ProgramBuilder, ProgramBuilderOpts};
 use crate::{
     error::SQLITE_CONSTRAINT_FOREIGNKEY,
     schema::{BTreeTable, ForeignKey, Index, ResolvedFkRef, ROWID_SENTINEL},
-    translate::{
-        collate::CollationSeq, emitter::Resolver, expr::translate_expr, planner::ROWID_STRS,
-    },
+    translate::{collate::CollationSeq, emitter::Resolver, planner::ROWID_STRS},
     vdbe::{
         builder::{CursorType, QueryMode},
-        insn::{CmpInsFlags, IdxInsertFlags, InsertFlags, Insn},
+        insn::{CmpInsFlags, Insn},
         BranchOffset,
     },
     Connection, LimboError, Result, Statement, Value,
@@ -876,30 +874,6 @@ pub fn emit_fk_child_update_counters(
     Ok(())
 }
 
-/// Open a write cursor on a table and return its cursor id.
-#[inline]
-pub fn open_write_table(program: &mut ProgramBuilder, tbl: &Arc<BTreeTable>) -> usize {
-    let tcur = program.alloc_cursor_id(CursorType::BTreeTable(tbl.clone()));
-    program.emit_insn(Insn::OpenWrite {
-        cursor_id: tcur,
-        root_page: tbl.root_page.into(),
-        db: 0,
-    });
-    tcur
-}
-
-/// Open a write cursor on an index and return its cursor id.
-#[inline]
-pub fn open_write_index(program: &mut ProgramBuilder, idx: &Arc<Index>) -> usize {
-    let icur = program.alloc_cursor_id(CursorType::BTreeIndex(idx.clone()));
-    program.emit_insn(Insn::OpenWrite {
-        cursor_id: icur,
-        root_page: idx.root_page.into(),
-        db: 0,
-    });
-    icur
-}
-
 /// Single FK existence check for NO ACTION/RESTRICT on DELETE.
 /// Raises a violation if any child row references the parent key.
 /// For RESTRICT: emits immediate HALT
@@ -1000,248 +974,6 @@ fn emit_fk_delete_parent_existence_check_single(
             },
         )?;
     }
-    Ok(())
-}
-
-/// SET DEFAULT: set all child FK columns to their default values when parent is deleted.
-fn emit_fk_set_default_children_single(
-    program: &mut ProgramBuilder,
-    resolver: &Resolver,
-    fk_ref: &ResolvedFkRef,
-    parent_bt: &Arc<BTreeTable>,
-    parent_cursor_id: usize,
-    parent_rowid_reg: usize,
-) -> Result<()> {
-    // Build parent key
-    let parent_cols: Vec<String> = if fk_ref.fk.parent_columns.is_empty() {
-        parent_bt
-            .primary_key_columns
-            .iter()
-            .map(|(n, _)| n.clone())
-            .collect()
-    } else {
-        fk_ref.fk.parent_columns.clone()
-    };
-    let ncols = parent_cols.len();
-
-    let parent_key_start = program.alloc_registers(ncols);
-    build_parent_key(
-        program,
-        parent_bt,
-        &parent_cols,
-        parent_cursor_id,
-        parent_rowid_reg,
-        parent_key_start,
-    )?;
-
-    let child_tbl = &fk_ref.child_table;
-    let child_cols = &fk_ref.fk.child_columns;
-    let num_child_cols = child_tbl.columns.len();
-
-    // Build a map of FK column positions to their default values
-    let fk_col_defaults: Vec<(usize, Option<&Box<Expr>>)> = child_cols
-        .iter()
-        .filter_map(|cname| {
-            child_tbl
-                .get_column(cname)
-                .map(|(pos, col)| (pos, col.default.as_ref()))
-        })
-        .collect();
-
-    // Open write cursor on child table
-    let child_cursor = open_write_table(program, child_tbl);
-
-    // Open write cursors on all child indexes
-    let child_indexes: Vec<(Arc<Index>, usize)> = resolver
-        .schema
-        .get_indices(&child_tbl.name)
-        .map(|idx| {
-            let cursor = open_write_index(program, idx);
-            (idx.clone(), cursor)
-        })
-        .collect();
-
-    // Scan child table
-    let done = program.allocate_label();
-    program.emit_insn(Insn::Rewind {
-        cursor_id: child_cursor,
-        pc_if_empty: done,
-    });
-
-    let loop_top = program.allocate_label();
-    program.preassign_label_to_next_insn(loop_top);
-    let next_row = program.allocate_label();
-
-    // Compare FK columns to parent key
-    for (i, cname) in child_cols.iter().enumerate() {
-        let (pos, _) = child_tbl
-            .get_column(cname)
-            .ok_or_else(|| LimboError::InternalError(format!("child col {cname} missing")))?;
-        let tmp = program.alloc_register();
-        program.emit_insn(Insn::Column {
-            cursor_id: child_cursor,
-            column: pos,
-            dest: tmp,
-            default: None,
-        });
-        program.emit_insn(Insn::IsNull {
-            reg: tmp,
-            target_pc: next_row,
-        });
-
-        let cont = program.allocate_label();
-        program.emit_insn(Insn::Eq {
-            lhs: tmp,
-            rhs: parent_key_start + i,
-            target_pc: cont,
-            flags: CmpInsFlags::default().jump_if_null(),
-            collation: Some(CollationSeq::Binary),
-        });
-        program.emit_insn(Insn::Goto {
-            target_pc: next_row,
-        });
-        program.preassign_label_to_next_insn(cont);
-    }
-
-    // Get child rowid
-    let child_rowid_reg = program.alloc_register();
-    program.emit_insn(Insn::RowId {
-        cursor_id: child_cursor,
-        dest: child_rowid_reg,
-    });
-
-    // Build new row with FK columns set to their defaults
-    let new_row_start = program.alloc_registers(num_child_cols);
-    let fk_col_positions: HashSet<usize> = fk_col_defaults.iter().map(|(pos, _)| *pos).collect();
-
-    for i in 0..num_child_cols {
-        if let Some((_, default_expr)) = fk_col_defaults.iter().find(|(pos, _)| *pos == i) {
-            match default_expr {
-                Some(expr) => {
-                    translate_expr(program, None, expr, new_row_start + i, resolver)?;
-                }
-                None => {
-                    // No default, set to NULL
-                    program.emit_insn(Insn::Null {
-                        dest: new_row_start + i,
-                        dest_end: None,
-                    });
-                }
-            }
-        } else if !fk_col_positions.contains(&i) {
-            // Copy existing value for non-FK columns
-            program.emit_insn(Insn::Column {
-                cursor_id: child_cursor,
-                column: i,
-                dest: new_row_start + i,
-                default: None,
-            });
-        }
-    }
-
-    // Delete from indexes (old values)
-    for (index, index_cursor) in &child_indexes {
-        let num_regs = index.columns.len() + 1;
-        let start_reg = program.alloc_registers(num_regs);
-
-        for (i, ic) in index.columns.iter().enumerate() {
-            program.emit_insn(Insn::Column {
-                cursor_id: child_cursor,
-                column: ic.pos_in_table,
-                dest: start_reg + i,
-                default: None,
-            });
-        }
-        program.emit_insn(Insn::Copy {
-            src_reg: child_rowid_reg,
-            dst_reg: start_reg + index.columns.len(),
-            extra_amount: 0,
-        });
-
-        program.emit_insn(Insn::IdxDelete {
-            start_reg,
-            num_regs,
-            cursor_id: *index_cursor,
-            raise_error_if_no_matching_entry: index.where_clause.is_none(),
-        });
-    }
-
-    // Build and insert new record
-    let record_reg = program.alloc_register();
-    program.emit_insn(Insn::MakeRecord {
-        start_reg: new_row_start,
-        count: num_child_cols,
-        dest_reg: record_reg,
-        index_name: None,
-        affinity_str: None,
-    });
-
-    // Delete old row and insert new
-    program.emit_insn(Insn::Delete {
-        cursor_id: child_cursor,
-        table_name: child_tbl.name.clone(),
-        is_part_of_update: true,
-    });
-
-    program.emit_insn(Insn::Insert {
-        cursor: child_cursor,
-        key_reg: child_rowid_reg,
-        record_reg,
-        flag: InsertFlags::new(),
-        table_name: child_tbl.name.clone(),
-    });
-
-    // Insert into indexes (new values)
-    for (index, index_cursor) in &child_indexes {
-        let num_cols = index.columns.len();
-        let idx_start_reg = program.alloc_registers(num_cols + 1);
-
-        for (i, ic) in index.columns.iter().enumerate() {
-            program.emit_insn(Insn::Copy {
-                src_reg: new_row_start + ic.pos_in_table,
-                dst_reg: idx_start_reg + i,
-                extra_amount: 0,
-            });
-        }
-        program.emit_insn(Insn::Copy {
-            src_reg: child_rowid_reg,
-            dst_reg: idx_start_reg + num_cols,
-            extra_amount: 0,
-        });
-
-        let idx_record_reg = program.alloc_register();
-        program.emit_insn(Insn::MakeRecord {
-            start_reg: idx_start_reg,
-            count: num_cols + 1,
-            dest_reg: idx_record_reg,
-            index_name: Some(index.name.clone()),
-            affinity_str: None,
-        });
-
-        program.emit_insn(Insn::IdxInsert {
-            cursor_id: *index_cursor,
-            record_reg: idx_record_reg,
-            unpacked_start: Some(idx_start_reg),
-            unpacked_count: Some((num_cols + 1) as u16),
-            flags: IdxInsertFlags::default(),
-        });
-    }
-
-    program.preassign_label_to_next_insn(next_row);
-    program.emit_insn(Insn::Next {
-        cursor_id: child_cursor,
-        pc_if_next: loop_top,
-    });
-
-    program.preassign_label_to_next_insn(done);
-
-    for (_, cursor) in &child_indexes {
-        program.emit_insn(Insn::Close { cursor_id: *cursor });
-    }
-    program.emit_insn(Insn::Close {
-        cursor_id: child_cursor,
-    });
-
     Ok(())
 }
 
@@ -1877,15 +1609,7 @@ pub fn fire_fk_delete_actions(
                 fire_fk_set_null(program, resolver, &fk_ref, connection, &ctx)?;
             }
             RefAct::SetDefault => {
-                // For now, fall back to inline emission for SET DEFAULT
-                emit_fk_set_default_children_single(
-                    program,
-                    resolver,
-                    &fk_ref,
-                    &parent_bt,
-                    parent_cursor_id,
-                    parent_rowid_reg,
-                )?;
+                fire_fk_set_default(program, resolver, &fk_ref, connection, &ctx)?;
             }
         }
     }
