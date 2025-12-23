@@ -231,9 +231,10 @@ impl std::fmt::Debug for BalanceContext {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 /// State machine of a btree rebalancing operation.
 enum BalanceSubState {
+    #[default]
     Start,
     BalanceRoot,
     Decide,
@@ -261,10 +262,10 @@ enum BalanceSubState {
     },
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct BalanceState {
     sub_state: BalanceSubState,
-    balance_info: RefCell<Option<BalanceInfo>>,
+    balance_info: Option<BalanceInfo>,
 }
 
 /// State machine of a write operation.
@@ -714,10 +715,7 @@ impl BTreeCursor {
             null_flag: false,
             going_upwards: false,
             state: CursorState::None,
-            balance_state: BalanceState {
-                sub_state: BalanceSubState::Start,
-                balance_info: RefCell::new(None),
-            },
+            balance_state: BalanceState::default(),
             overflow_state: OverflowState::Start,
             stack: PageStack {
                 current_page: -1,
@@ -2516,7 +2514,7 @@ impl BTreeCursor {
             match sub_state {
                 BalanceSubState::Start => {
                     assert!(
-                        balance_info.borrow().is_none(),
+                        balance_info.is_none(),
                         "BalanceInfo should be empty on start"
                     );
                     let current_page = self.stack.top_ref();
@@ -2929,7 +2927,7 @@ impl BTreeCursor {
                         }
                     }
 
-                    balance_info.borrow_mut().replace(BalanceInfo {
+                    balance_info.replace(BalanceInfo {
                         pages_to_balance,
                         rightmost_pointer: right_pointer,
                         divider_cell_payloads: [const { None }; MAX_SIBLING_PAGES_TO_BALANCE - 1],
@@ -2944,7 +2942,6 @@ impl BTreeCursor {
                 }
                 BalanceSubState::NonRootDoBalancing => {
                     // Ensure all involved pages are in memory.
-                    let mut balance_info = balance_info.borrow_mut();
                     let balance_info = balance_info.as_mut().unwrap();
                     for page in balance_info
                         .pages_to_balance
@@ -3445,7 +3442,6 @@ impl BTreeCursor {
                         ..
                     } = context.as_mut().unwrap();
                     let pager = self.pager.clone();
-                    let mut balance_info = balance_info.borrow_mut();
                     let balance_info = balance_info.as_mut().unwrap();
                     let page_type = balance_info.pages_to_balance[0]
                         .as_ref()
@@ -3489,7 +3485,6 @@ impl BTreeCursor {
                             cells_debug,
                         },
                 } => {
-                    let mut balance_info = balance_info.borrow_mut();
                     let balance_info = balance_info.as_mut().unwrap();
                     let page_type = balance_info.pages_to_balance[0]
                         .as_ref()
@@ -3891,7 +3886,6 @@ impl BTreeCursor {
                     sibling_count_new,
                 } => {
                     let sibling_count = {
-                        let balance_info = balance_info.borrow();
                         balance_info
                             .as_ref()
                             .expect("must be balancing")
@@ -3903,7 +3897,6 @@ impl BTreeCursor {
                         let _ = balance_info.take();
                         return Ok(IOResult::Done(()));
                     } else {
-                        let balance_info = balance_info.borrow();
                         let balance_info = balance_info.as_ref().expect("must be balancing");
                         let page = balance_info.pages_to_balance[*curr_page].as_ref().unwrap();
                         return_if_io!(self.pager.free_page(Some(page.0.clone()), page.get().id));
