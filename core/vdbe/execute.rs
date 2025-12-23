@@ -9364,67 +9364,60 @@ pub fn op_hash_build(
     insn: &Insn,
     pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
-    load_insn!(
-        HashBuild {
-            cursor_id,
-            key_start_reg,
-            num_keys,
-            hash_table_id,
-            mem_budget,
-            collations,
-            payload_start_reg,
-            num_payload,
-        },
-        insn
-    );
+    let Insn::HashBuild { data } = insn else {
+        #[cfg(debug_assertions)]
+        panic!("Expected Insn::HashBuild, got {:?}", insn);
+        #[cfg(not(debug_assertions))]
+        unsafe { std::hint::unreachable_unchecked() };
+    };
 
     let mut op_state = state
         .op_hash_build_state
         .take()
         .filter(|s| {
-            s.hash_table_id == *hash_table_id
-                && s.cursor_id == *cursor_id
-                && s.key_start_reg == *key_start_reg
-                && s.num_keys == *num_keys
+            s.hash_table_id == data.hash_table_id
+                && s.cursor_id == data.cursor_id
+                && s.key_start_reg == data.key_start_reg
+                && s.num_keys == data.num_keys
         })
         .unwrap_or_else(|| OpHashBuildState {
-            key_values: Vec::with_capacity(*num_keys),
+            key_values: Vec::with_capacity(data.num_keys),
             key_idx: 0,
-            payload_values: Vec::with_capacity(*num_payload),
+            payload_values: Vec::with_capacity(data.num_payload),
             payload_idx: 0,
             rowid: None,
-            cursor_id: *cursor_id,
-            hash_table_id: *hash_table_id,
-            key_start_reg: *key_start_reg,
-            num_keys: *num_keys,
+            cursor_id: data.cursor_id,
+            hash_table_id: data.hash_table_id,
+            key_start_reg: data.key_start_reg,
+            num_keys: data.num_keys,
         });
 
     // Create hash table if it doesn't exist yet
-    if !state.hash_tables.contains_key(hash_table_id) {
+    if !state.hash_tables.contains_key(&data.hash_table_id) {
         let config = HashTableConfig {
             initial_buckets: 1024,
-            mem_budget: *mem_budget,
-            num_keys: *num_keys,
-            collations: collations.clone(),
+            mem_budget: data.mem_budget,
+            num_keys: data.num_keys,
+            collations: data.collations.clone(),
         };
         let hash_table = HashTable::new(config, pager.io.clone());
-        state.hash_tables.insert(*hash_table_id, hash_table);
+        state.hash_tables.insert(data.hash_table_id, hash_table);
     }
 
     // Read pre-computed key values directly from registers
-    while op_state.key_idx < *num_keys {
+    while op_state.key_idx < data.num_keys {
         let i = op_state.key_idx;
-        let reg = &state.registers[*key_start_reg + i];
+        let reg = &state.registers[data.key_start_reg + i];
         let value = reg.get_value().clone();
         op_state.key_values.push(value);
         op_state.key_idx += 1;
     }
 
     // Read payload values from registers if provided
-    if let Some(payload_reg) = payload_start_reg {
-        while op_state.payload_idx < *num_payload {
+    if let Some(payload_reg) = data.payload_start_reg {
+        while op_state.payload_idx < data.num_payload {
             let i = op_state.payload_idx;
-            let reg = &state.registers[*payload_reg + i];
+            let reg = &state.registers[payload_reg + i];
             let value = reg.get_value().clone();
             op_state.payload_values.push(value);
             op_state.payload_idx += 1;
@@ -9433,7 +9426,7 @@ pub fn op_hash_build(
 
     // Get the rowid from the cursor
     if op_state.rowid.is_none() {
-        let cursor = state.get_cursor(*cursor_id);
+        let cursor = state.get_cursor(data.cursor_id);
         let rowid_val = match cursor {
             Cursor::BTree(btree_cursor) => {
                 let rowid_opt = match btree_cursor.rowid() {
@@ -9461,7 +9454,7 @@ pub fn op_hash_build(
     }
 
     // Insert the rowid into the hash table
-    if let Some(ht) = state.hash_tables.get_mut(hash_table_id) {
+    if let Some(ht) = state.hash_tables.get_mut(&data.hash_table_id) {
         let rowid = op_state.rowid.expect("rowid set");
         let key_values = std::mem::take(&mut op_state.key_values);
         let payload_values = std::mem::take(&mut op_state.payload_values);

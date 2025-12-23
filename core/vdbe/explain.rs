@@ -1953,18 +1953,18 @@ pub fn insn_to_row(
             0,
             String::new(),
         ),
-        Insn::HashBuild{cursor_id, key_start_reg, num_keys, hash_table_id: hash_table_reg, mem_budget, collations: _, payload_start_reg, num_payload} => {
-            let payload_info = if let Some(p_reg) = payload_start_reg {
-                format!(" payload=r[{}]..r[{}]", p_reg, p_reg + num_payload - 1)
+        Insn::HashBuild { data } => {
+            let payload_info = if let Some(p_reg) = data.payload_start_reg {
+                format!(" payload=r[{}]..r[{}]", p_reg, p_reg + data.num_payload - 1)
             } else {
                 String::new()
             };
             (
                 "HashBuild",
-                *cursor_id as i64,
-                *key_start_reg as i64,
-                *num_keys as i64,
-                Value::build_text(format!("r=[{hash_table_reg}] budget={mem_budget}{payload_info}")),
+                data.cursor_id as i64,
+                data.key_start_reg as i64,
+                data.num_keys as i64,
+                Value::build_text(format!("r=[{}] budget={}{payload_info}", data.hash_table_id, data.mem_budget)),
                 0,
                 String::new(),
             )

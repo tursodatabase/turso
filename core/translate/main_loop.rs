@@ -33,7 +33,7 @@ use crate::{
     vdbe::{
         affinity::{self, Affinity},
         builder::{CursorKey, CursorType, ProgramBuilder},
-        insn::{CmpInsFlags, IdxInsertFlags, Insn},
+        insn::{to_u16, CmpInsFlags, HashBuildData, IdxInsertFlags, Insn},
         BranchOffset, CursorID,
     },
     Result,
@@ -593,14 +593,16 @@ fn emit_hash_build_phase(
 
     // Insert current row into hash table with payload columns.
     program.emit_insn(Insn::HashBuild {
-        cursor_id: hash_build_cursor_id,
-        key_start_reg: build_key_start_reg,
-        num_keys,
-        hash_table_id,
-        mem_budget: hash_join_op.mem_budget,
-        collations,
-        payload_start_reg,
-        num_payload,
+        data: Box::new(HashBuildData {
+            cursor_id: hash_build_cursor_id,
+            key_start_reg: build_key_start_reg,
+            num_keys,
+            hash_table_id,
+            mem_budget: hash_join_op.mem_budget,
+            collations,
+            payload_start_reg,
+            num_payload,
+        }),
     });
 
     program.preassign_label_to_next_insn(skip_to_next);

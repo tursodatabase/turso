@@ -168,6 +168,22 @@ impl<T: Copy + std::fmt::Display> std::fmt::Display for RegisterOrLiteral<T> {
     }
 }
 
+/// Data for HashBuild instruction (boxed to keep Insn small).
+#[derive(Debug)]
+pub struct HashBuildData {
+    pub cursor_id: CursorID,
+    pub key_start_reg: usize,
+    pub num_keys: usize,
+    pub hash_table_id: usize,
+    pub mem_budget: usize,
+    pub collations: Vec<CollationSeq>,
+    /// Starting register for payload columns to store in the hash entry.
+    /// When Some: payload_start_reg..payload_start_reg+num_payload-1 contain values to cache.
+    pub payload_start_reg: Option<usize>,
+    /// Number of payload columns to read
+    pub num_payload: usize,
+}
+
 // There are currently 190 opcodes in sqlite
 #[repr(u8)]
 #[derive(Description, Debug, EnumDiscriminants)]
@@ -1301,23 +1317,7 @@ pub enum Insn {
     },
 
     /// Build a hash table from a cursor for hash join.
-    /// Reads pre-computed key values from registers (key_start_reg..key_start_reg+num_keys-1),
-    /// gets the rowid from cursor_id, and inserts the (key_values, rowid) pair into the hash table.
-    /// Optionally also stores payload values (result columns from the build table) to avoid
-    /// an additional btree seek during probe phase.
-    HashBuild {
-        cursor_id: CursorID,
-        key_start_reg: usize,
-        num_keys: usize,
-        hash_table_id: usize,
-        mem_budget: usize,
-        collations: Vec<CollationSeq>,
-        /// Starting register for payload columns to store in the hash entry.
-        /// When Some: payload_start_reg..payload_start_reg+num_payload-1 contain values to cache.
-        payload_start_reg: Option<usize>,
-        /// Number of payload columns to read
-        num_payload: usize,
-    },
+    HashBuild { data: Box<HashBuildData> },
 
     /// Finalize the hash table build phase. Transitions the hash table from Building to Probing state.
     /// Should be called after the HashBuild loop completes.
