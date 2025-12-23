@@ -23,6 +23,7 @@ strum_macros = {workspace = true }
 serde = { workspace = true , optional = true, features = ["derive"] }
 thiserror = { workspace = true }
 turso_macros = { workspace = true }
+memchr = "2.7.6"
 
 [dev-dependencies]
 fallible-iterator = { workspace = true }
