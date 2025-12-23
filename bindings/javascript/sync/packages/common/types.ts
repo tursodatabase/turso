@@ -109,8 +109,9 @@ export interface DatabaseOpts {
     tracing?: 'error' | 'warn' | 'info' | 'debug' | 'trace',
     /**
      * optional parameter to enable partial sync for the database
+     * WARNING: This feature is EXPERIMENTAL
      */
-    partialSync?: {
+    partialSyncExperimental?: {
         /* bootstrap strategy configuration
             - prefix strategy loads first N bytes locally at the startup
             - query strategy loads pages touched by the provided SQL statement

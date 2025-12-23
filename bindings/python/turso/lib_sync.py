@@ -409,7 +409,7 @@ def connect_sync(
     client_name: Optional[str] = None,
     long_poll_timeout_ms: Optional[int] = None,
     bootstrap_if_empty: bool = True,
-    partial_sync_opts: Optional[PartialSyncOpts] = None,
+    partial_sync_experimental: Optional[PartialSyncOpts] = None,
     experimental_features: Optional[str] = None,
     isolation_level: Optional[str] = "DEFERRED",
 ) -> ConnectionSync:
@@ -422,7 +422,7 @@ def connect_sync(
     - client_name: optional unique client name (defaults to 'turso-sync-py')
     - long_poll_timeout_ms: timeout for long polling during pull
     - bootstrap_if_empty: if True and db empty, bootstrap from remote during create()
-    - partial_sync_opts: optional partial sync configuration
+    - partial_sync_experimental: EXPERIMENTAL partial sync configuration
     - experimental_features, isolation_level: passed to underlying connection
     """
     # Resolve client name
@@ -441,10 +441,16 @@ def connect_sync(
     # Sync config with optional partial bootstrap strategy
     prefix_len: Optional[int] = None
     query_str: Optional[str] = None
-    if partial_sync_opts is not None and isinstance(partial_sync_opts.bootstrap_strategy, PartialSyncPrefixBootstrap):
-        prefix_len = int(partial_sync_opts.bootstrap_strategy.length)
-    elif partial_sync_opts is not None and isinstance(partial_sync_opts.bootstrap_strategy, PartialSyncQueryBootstrap):
-        query_str = str(partial_sync_opts.bootstrap_strategy.query)
+    if (
+        partial_sync_experimental is not None and
+        isinstance(partial_sync_experimental.bootstrap_strategy, PartialSyncPrefixBootstrap)
+    ):
+        prefix_len = int(partial_sync_experimental.bootstrap_strategy.length)
+    elif (
+        partial_sync_experimental is not None and
+        isinstance(partial_sync_experimental.bootstrap_strategy, PartialSyncQueryBootstrap)
+    ):
+        query_str = str(partial_sync_experimental.bootstrap_strategy.query)
 
     sync_cfg = PyTursoSyncDatabaseConfig(
         path=path,
@@ -452,12 +458,12 @@ def connect_sync(
         long_poll_timeout_ms=long_poll_timeout_ms,
         bootstrap_if_empty=bootstrap_if_empty,
         reserved_bytes=None,
-        partial_sync_opts=PyTursoPartialSyncOpts(
+        partial_sync=PyTursoPartialSyncOpts(
             bootstrap_strategy_prefix=prefix_len,
             bootstrap_strategy_query=query_str,
-            segment_size=partial_sync_opts.segment_size,
-            prefetch=partial_sync_opts.prefetch
-        ) if partial_sync_opts is not None else None,
+            segment_size=partial_sync_experimental.segment_size,
+            prefetch=partial_sync_experimental.prefetch
+        ) if partial_sync_experimental is not None else None,
     )
 
     # Create sync database holder

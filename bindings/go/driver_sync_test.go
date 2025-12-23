@@ -425,7 +425,7 @@ func TestSyncPartial(t *testing.T) {
 		Path:       ":memory:",
 		ClientName: "turso-sync-go",
 		RemoteUrl:  server.DbUrl,
-		PartialSyncConfig: TursoPartialSyncConfig{
+		PartialSyncExperimental: TursoPartialSyncConfig{
 			BootstrapStrategyPrefix: 128 * 1024,
 		},
 	})

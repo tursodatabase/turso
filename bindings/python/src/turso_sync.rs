@@ -66,7 +66,7 @@ pub struct PyTursoSyncDatabaseConfig {
     pub bootstrap_if_empty: bool,
     // reserved bytes which must be set for the database - necessary if remote encryption is set for the db in cloud
     pub reserved_bytes: Option<usize>,
-    pub partial_sync_opts: Option<PyTursoPartialSyncOpts>,
+    pub partial_sync: Option<PyTursoPartialSyncOpts>,
 }
 
 #[pymethods]
@@ -78,7 +78,7 @@ impl PyTursoSyncDatabaseConfig {
         long_poll_timeout_ms=None,
         bootstrap_if_empty=true,
         reserved_bytes=None,
-        partial_sync_opts=None,
+        partial_sync=None,
     ))]
     fn new(
         path: String,
@@ -86,7 +86,7 @@ impl PyTursoSyncDatabaseConfig {
         long_poll_timeout_ms: Option<u32>,
         bootstrap_if_empty: bool,
         reserved_bytes: Option<usize>,
-        partial_sync_opts: Option<&PyTursoPartialSyncOpts>,
+        partial_sync: Option<&PyTursoPartialSyncOpts>,
     ) -> Self {
         Self {
             path,
@@ -94,7 +94,7 @@ impl PyTursoSyncDatabaseConfig {
             long_poll_timeout_ms,
             bootstrap_if_empty,
             reserved_bytes,
-            partial_sync_opts: partial_sync_opts.cloned(),
+            partial_sync: partial_sync.cloned(),
         }
     }
 }
@@ -118,7 +118,7 @@ pub fn py_turso_sync_new(
         bootstrap_if_empty: sync_config.bootstrap_if_empty,
         long_poll_timeout_ms: sync_config.long_poll_timeout_ms,
         reserved_bytes: sync_config.reserved_bytes,
-        partial_sync_opts: match &sync_config.partial_sync_opts {
+        partial_sync_opts: match &sync_config.partial_sync {
             Some(config) => {
                 if let Some(length) = config.bootstrap_strategy_prefix {
                     Some(PartialSyncOpts {
