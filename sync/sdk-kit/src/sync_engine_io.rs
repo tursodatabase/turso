@@ -3,7 +3,7 @@ use std::{
     sync::{Arc, Mutex, MutexGuard},
 };
 
-use turso_sdk_kit::rsapi::{turso_slice_from_bytes, TursoError, TursoStatusCode};
+use turso_sdk_kit::rsapi::{turso_slice_from_bytes, TursoError};
 
 use crate::capi::c::{self};
 
@@ -46,15 +46,9 @@ impl SyncEngineIoRequest {
                 })
             }
             SyncEngineIoRequest::Http { headers, .. } if index >= headers.len() => {
-                Err(TursoError {
-                    code: TursoStatusCode::Misuse,
-                    message: Some("header index out of boudns".to_string()),
-                })
+                Err(TursoError::Misuse("header index out of boudns".to_string()))
             }
-            _ => Err(TursoError {
-                code: TursoStatusCode::Misuse,
-                message: Some("unexpected io request type".to_string()),
-            }),
+            _ => Err(TursoError::Misuse("unexpected io request type".to_string())),
         }
     }
     pub fn http_to_capi(&self) -> Result<c::turso_sync_io_http_request_t, TursoError> {
@@ -74,10 +68,7 @@ impl SyncEngineIoRequest {
                 },
                 headers: headers.len() as i32,
             }),
-            _ => Err(TursoError {
-                code: TursoStatusCode::Misuse,
-                message: Some("unexpected io request type".to_string()),
-            }),
+            _ => Err(TursoError::Misuse("unexpected io request type".to_string())),
         }
     }
     pub fn full_read_to_capi(&self) -> Result<c::turso_sync_io_full_read_request_t, TursoError> {
@@ -85,10 +76,7 @@ impl SyncEngineIoRequest {
             SyncEngineIoRequest::FullRead { path } => Ok(c::turso_sync_io_full_read_request_t {
                 path: turso_slice_from_bytes(path.as_bytes()),
             }),
-            _ => Err(TursoError {
-                code: TursoStatusCode::Misuse,
-                message: Some("unexpected io request type".to_string()),
-            }),
+            _ => Err(TursoError::Misuse("unexpected io request type".to_string())),
         }
     }
     pub fn full_write_to_capi(&self) -> Result<c::turso_sync_io_full_write_request_t, TursoError> {
@@ -99,10 +87,7 @@ impl SyncEngineIoRequest {
                     content: turso_slice_from_bytes(content.as_ref()),
                 })
             }
-            _ => Err(TursoError {
-                code: TursoStatusCode::Misuse,
-                message: Some("unexpected io request type".to_string()),
-            }),
+            _ => Err(TursoError::Misuse("unexpected io request type".to_string())),
         }
     }
 }
@@ -252,10 +237,7 @@ impl<TBytes: AsRef<[u8]>> SyncEngineIoQueueItem<TBytes> {
         value: *const c::turso_sync_io_item_t,
     ) -> Result<&'a Self, TursoError> {
         if value.is_null() {
-            Err(TursoError {
-                code: TursoStatusCode::Misuse,
-                message: Some("got null pointer".to_string()),
-            })
+            Err(TursoError::Misuse("got null pointer".to_string()))
         } else {
             Ok(&*(value as *const Self))
         }
