@@ -119,6 +119,7 @@ pub struct TursoDatabaseConfig {
     pub async_io: bool,
 
     /// optional encryption parameters for local data encryption
+    /// as encryption is experimental - [Self::experimental_features] must have "encryption" in the list
     pub encryption: Option<EncryptionOpts>,
 
     /// optional VFS parameter explicitly specifying FS backend for the database.
@@ -234,6 +235,21 @@ impl TursoDatabaseConfig {
             ));
         }
         let config = *config;
+        let encryption_cipher = if !config.encryption_cipher.is_null() {
+            Some(str_from_c_str(config.encryption_cipher)?.to_string())
+        } else {
+            None
+        };
+        let encryption_hexkey = if !config.encryption_hexkey.is_null() {
+            Some(str_from_c_str(config.encryption_hexkey)?.to_string())
+        } else {
+            None
+        };
+        if encryption_cipher.is_some() != encryption_hexkey.is_some() {
+            return Err(TursoError::Misuse(format!(
+                "either both encryption cipher and key must be set or no"
+            )));
+        }
         Ok(Self {
             path: str_from_c_str(config.path)?.to_string(),
             experimental_features: if !config.experimental_features.is_null() {
@@ -242,8 +258,19 @@ impl TursoDatabaseConfig {
                 None
             },
             async_io: config.async_io,
-            encryption: None,
-            vfs: None,
+            encryption: if encryption_cipher.is_some() {
+                Some(EncryptionOpts {
+                    cipher: encryption_cipher.unwrap(),
+                    hexkey: encryption_hexkey.unwrap(),
+                })
+            } else {
+                None
+            },
+            vfs: if !config.vfs.is_null() {
+                Some(str_from_c_str(config.vfs)?.to_string())
+            } else {
+                None
+            },
             io: None,
             db_file: None,
         })
@@ -526,6 +553,7 @@ impl TursoDatabase {
                     "strict" => opts.with_strict(true),
                     "autovacuum" => opts.with_autovacuum(true),
                     "triggers" => opts.with_triggers(true),
+                    "encryption" => opts.with_encryption(true),
                     _ => opts,
                 };
             }

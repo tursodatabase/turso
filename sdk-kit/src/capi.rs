@@ -633,8 +633,7 @@ mod tests {
             let path = CString::new(":memory:").unwrap();
             let config = c::turso_database_config_t {
                 path: path.as_ptr(),
-                experimental_features: std::ptr::null(),
-                async_io: false,
+                ..Default::default()
             };
             let mut db = std::ptr::null();
             let status = turso_database_new(&config, &mut db, std::ptr::null_mut());
@@ -653,8 +652,7 @@ mod tests {
             let path = CString::new("not/existing/path").unwrap();
             let config = c::turso_database_config_t {
                 path: path.as_ptr(),
-                experimental_features: std::ptr::null(),
-                async_io: false,
+                ..Default::default()
             };
             let mut db = std::ptr::null();
             let status = turso_database_new(&config, &mut db, std::ptr::null_mut());
@@ -679,8 +677,7 @@ mod tests {
             let path = CString::new(":memory:").unwrap();
             let config = c::turso_database_config_t {
                 path: path.as_ptr(),
-                experimental_features: std::ptr::null(),
-                async_io: false,
+                ..Default::default()
             };
             let mut db = std::ptr::null();
             let status = turso_database_new(&config, &mut db, std::ptr::null_mut());
@@ -704,8 +701,7 @@ mod tests {
             let path = CString::new(":memory:").unwrap();
             let config = c::turso_database_config_t {
                 path: path.as_ptr(),
-                experimental_features: std::ptr::null(),
-                async_io: false,
+                ..Default::default()
             };
             let mut db = std::ptr::null();
             let status = turso_database_new(&config, &mut db, std::ptr::null_mut());
@@ -740,8 +736,7 @@ mod tests {
             let path = CString::new(":memory:").unwrap();
             let config = c::turso_database_config_t {
                 path: path.as_ptr(),
-                experimental_features: std::ptr::null(),
-                async_io: false,
+                ..Default::default()
             };
             let mut db = std::ptr::null();
             let status = turso_database_new(&config, &mut db, std::ptr::null_mut());
@@ -781,8 +776,7 @@ mod tests {
             let path = CString::new(":memory:").unwrap();
             let config = c::turso_database_config_t {
                 path: path.as_ptr(),
-                experimental_features: std::ptr::null(),
-                async_io: false,
+                ..Default::default()
             };
             let mut db = std::ptr::null();
             let status = turso_database_new(&config, &mut db, std::ptr::null_mut());
@@ -842,8 +836,7 @@ mod tests {
             let path = CString::new(":memory:").unwrap();
             let config = c::turso_database_config_t {
                 path: path.as_ptr(),
-                experimental_features: std::ptr::null(),
-                async_io: false,
+                ..Default::default()
             };
             let mut db = std::ptr::null();
             let status = turso_database_new(&config, &mut db, std::ptr::null_mut());
@@ -910,8 +903,7 @@ mod tests {
             let path = CString::new(":memory:").unwrap();
             let config = c::turso_database_config_t {
                 path: path.as_ptr(),
-                experimental_features: std::ptr::null(),
-                async_io: false,
+                ..Default::default()
             };
             let mut db = std::ptr::null();
             let status = turso_database_new(&config, &mut db, std::ptr::null_mut());
@@ -1007,8 +999,7 @@ mod tests {
             let path = CString::new(":memory:").unwrap();
             let config = c::turso_database_config_t {
                 path: path.as_ptr(),
-                experimental_features: std::ptr::null(),
-                async_io: false,
+                ..Default::default()
             };
             let mut db = std::ptr::null();
             let status = turso_database_new(&config, &mut db, std::ptr::null_mut());
@@ -1034,14 +1025,14 @@ mod tests {
             assert_eq!(
                 turso_statement_bind_positional_null(
                     statement,
-                    turso_statement_named_position(statement, c"e".as_ptr()) as usize
+                    turso_statement_named_position(statement, c":e".as_ptr()) as usize
                 ),
                 turso_status_code_t::TURSO_OK
             );
             assert_eq!(
                 turso_statement_bind_positional_int(
                     statement,
-                    turso_statement_named_position(statement, c"d".as_ptr()) as usize,
+                    turso_statement_named_position(statement, c":d".as_ptr()) as usize,
                     2
                 ),
                 turso_status_code_t::TURSO_OK
@@ -1049,7 +1040,7 @@ mod tests {
             assert_eq!(
                 turso_statement_bind_positional_double(
                     statement,
-                    turso_statement_named_position(statement, c"c".as_ptr()) as usize,
+                    turso_statement_named_position(statement, c":c".as_ptr()) as usize,
                     2.71
                 ),
                 turso_status_code_t::TURSO_OK
@@ -1058,7 +1049,7 @@ mod tests {
             assert_eq!(
                 turso_statement_bind_positional_text(
                     statement,
-                    turso_statement_named_position(statement, c"b".as_ptr()) as usize,
+                    turso_statement_named_position(statement, c":b".as_ptr()) as usize,
                     text.as_ptr() as *const std::ffi::c_char,
                     text.len()
                 ),
@@ -1068,7 +1059,7 @@ mod tests {
             assert_eq!(
                 turso_statement_bind_positional_blob(
                     statement,
-                    turso_statement_named_position(statement, c"a".as_ptr()) as usize,
+                    turso_statement_named_position(statement, c":a".as_ptr()) as usize,
                     blob.as_ptr(),
                     blob.len()
                 ),

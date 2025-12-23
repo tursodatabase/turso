@@ -106,6 +106,21 @@ typedef struct
     const char *experimental_features;
     /** Parameter which defines who drives the IO - callee or the caller */
     bool async_io;
+    /** optional VFS parameter explicitly specifying FS backend for the database.
+     * Available options are:
+     * - "memory": in-memory backend
+     * - "syscall": generic syscall backend
+     * - "io_uring": IO uring (supported only on Linux)
+     */
+    const char *vfs;
+    /** optional encryption cipher
+     * as encryption is experimental - experimental_features must have "encryption" in the list
+     */
+    const char *encryption_cipher;
+    /** optional encryption hexkey
+     * as encryption is experimental - experimental_features must have "encryption" in the list
+     */
+    const char *encryption_hexkey;
 } turso_database_config_t;
 
 /** Setup global database info */
