@@ -1228,12 +1228,12 @@ pub enum Insn {
     },
     AddColumn {
         table: String,
-        column: Column,
+        column: Box<Column>,
     },
     AlterColumn {
         table: String,
         column_index: usize,
-        definition: turso_parser::ast::ColumnDefinition,
+        definition: Box<turso_parser::ast::ColumnDefinition>,
         rename: bool,
     },
     /// Try to set the maximum page count for database P1 to the value in P3.

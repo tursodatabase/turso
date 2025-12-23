@@ -442,7 +442,7 @@ pub fn translate_alter_table(
                     });
                     program.emit_insn(Insn::AddColumn {
                         table: table_name.to_owned(),
-                        column,
+                        column: Box::new(column),
                     });
                 },
             )?
@@ -844,7 +844,7 @@ pub fn translate_alter_table(
             program.emit_insn(Insn::AlterColumn {
                 table: table_name.to_owned(),
                 column_index,
-                definition,
+                definition: Box::new(definition),
                 rename,
             });
 

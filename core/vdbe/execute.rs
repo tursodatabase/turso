@@ -9062,7 +9062,7 @@ pub fn op_add_column(
         };
 
         let btree = Arc::make_mut(btree);
-        btree.columns.push(column.clone())
+        btree.columns.push((**column).clone())
     });
 
     state.pc += 1;
@@ -9102,7 +9102,7 @@ pub fn op_alter_column(
             .expect("column being ALTERed should be named")
             .clone()
     };
-    let new_column = crate::schema::Column::from(definition);
+    let new_column = crate::schema::Column::from(definition.as_ref());
     let new_name = definition.col_name.as_str().to_owned();
 
     conn.with_schema_mut(|schema| {
