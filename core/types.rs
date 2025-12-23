@@ -1089,6 +1089,15 @@ impl ImmutableRecord {
         }
     }
 
+    #[inline]
+    pub fn into_payload(self) -> Vec<u8> {
+        match self.payload {
+            Value::Blob(b) => b,
+            _ => panic!("payload must be a blob"),
+        }
+    }
+
+    #[inline]
     pub fn as_blob(&self) -> &Vec<u8> {
         match &self.payload {
             Value::Blob(b) => b,
@@ -1096,6 +1105,7 @@ impl ImmutableRecord {
         }
     }
 
+    #[inline]
     pub fn as_blob_mut(&mut self) -> &mut Vec<u8> {
         match &mut self.payload {
             Value::Blob(b) => b,
@@ -1103,22 +1113,27 @@ impl ImmutableRecord {
         }
     }
 
+    #[inline]
     pub fn as_blob_value(&self) -> &Value {
         &self.payload
     }
 
+    #[inline]
     pub fn start_serialization(&mut self, payload: &[u8]) {
         self.as_blob_mut().extend_from_slice(payload);
     }
 
+    #[inline]
     pub fn invalidate(&mut self) {
         self.as_blob_mut().clear();
     }
 
+    #[inline]
     pub fn is_invalidated(&self) -> bool {
         self.as_blob().is_empty()
     }
 
+    #[inline]
     pub fn get_payload(&self) -> &[u8] {
         self.as_blob()
     }
@@ -2598,8 +2613,17 @@ pub enum IOResult<T> {
 }
 
 impl<T> IOResult<T> {
+    #[inline]
     pub fn is_io(&self) -> bool {
         matches!(self, IOResult::IO(..))
+    }
+
+    #[inline]
+    pub fn map<U>(self, func: impl FnOnce(T) -> U) -> IOResult<U> {
+        match self {
+            IOResult::Done(t) => IOResult::Done(func(t)),
+            IOResult::IO(io) => IOResult::IO(io),
+        }
     }
 }
 
