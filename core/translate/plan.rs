@@ -910,6 +910,10 @@ impl ColumnUsedMask {
         self.0.is_empty()
     }
 
+    pub fn is_only(&self, index: usize) -> bool {
+        self.0.len() == 1 && self.0.contains(index as u32)
+    }
+
     pub fn subtract(&mut self, other: &Self) {
         for idx in other.0.iter() {
             self.0.remove(idx);
@@ -1154,9 +1158,6 @@ impl JoinedTable {
         index: &Index,
         required_columns: &mut ColumnUsedMask,
     ) {
-        if self.expression_index_usages.is_empty() {
-            return;
-        }
         let mut coverage_counts = vec![0usize; self.column_use_counts.len()];
         let mut any_covered = false;
         for usage in &self.expression_index_usages {
@@ -1302,33 +1303,54 @@ impl JoinedTable {
         if index.index_method.is_some() {
             return false;
         }
-        let mut required_columns = self.col_used_mask.clone();
-        self.apply_expression_index_coverage(index, &mut required_columns);
-        if required_columns.is_empty() {
-            return true;
-        }
-        let mut index_cols_mask = ColumnUsedMask::default();
-        for col in index.columns.iter().filter(|c| c.expr.is_none()) {
-            index_cols_mask.set(col.pos_in_table);
-        }
 
-        // If a table has a rowid (i.e. is not a WITHOUT ROWID table), the index is guaranteed to contain the rowid as well.
-        if btree.has_rowid {
-            if let Some(pos_of_rowid_alias_col) = btree.get_rowid_alias_column().map(|(pos, _)| pos)
-            {
-                let mut rowid_only = ColumnUsedMask::default();
-                rowid_only.set(pos_of_rowid_alias_col);
-                if required_columns == rowid_only {
-                    // However if the index would be ONLY used for the rowid, then let's not bother using it to cover the query.
-                    // Example: if the query is SELECT id FROM t, and id is a rowid alias, then let's rather just scan the table
-                    // instead of an index.
-                    return false;
-                }
-                index_cols_mask.set(pos_of_rowid_alias_col);
+        if self.expression_index_usages.is_empty() {
+            Self::index_covers_columns(index, btree, &self.col_used_mask)
+        } else {
+            let mut required_columns = self.col_used_mask.clone();
+            self.apply_expression_index_coverage(index, &mut required_columns);
+            if required_columns.is_empty() {
+                return true;
+            }
+            Self::index_covers_columns(index, btree, &required_columns)
+        }
+    }
+
+    fn index_covers_columns(
+        index: &Index,
+        btree: &BTreeTable,
+        required_columns: &ColumnUsedMask,
+    ) -> bool {
+        // If a table has a rowid, the index is guaranteed to contain it as well.
+        let rowid_alias_pos = if btree.has_rowid {
+            btree.get_rowid_alias_column().map(|(pos, _)| pos)
+        } else {
+            None
+        };
+
+        if let Some(pos) = rowid_alias_pos {
+            if required_columns.is_only(pos) {
+                // If the index would be ONLY used for the rowid, don't bother.
+                // Example: SELECT id FROM t where id is a rowid alias - just scan the table.
+                return false;
             }
         }
 
-        index_cols_mask.contains_all_set_bits_of(&required_columns)
+        // Check that every required column is covered by the index
+        for required_col in required_columns.iter() {
+            if rowid_alias_pos == Some(required_col) {
+                // rowid is always implicitly covered by the index
+                continue;
+            }
+            let covered_by_index = index
+                .columns
+                .iter()
+                .any(|c| c.expr.is_none() && c.pos_in_table == required_col);
+            if !covered_by_index {
+                return false;
+            }
+        }
+        true
     }
 
     /// Returns true if the index selected for use with this [TableReference] is a covering index,
