@@ -22,7 +22,7 @@ use crate::{
     turso_assert,
     types::{
         find_compare, get_tie_breaker_from_seek_op, IOCompletions, IndexInfo, RecordCompare,
-        RecordCursor, SeekResult,
+        SeekResult,
     },
     util::IOExt,
     Completion,
@@ -42,11 +42,11 @@ use super::{
 };
 use std::{
     any::Any,
-    cell::{Cell, RefCell},
+    cell::Cell,
     cmp::{Ordering, Reverse},
     collections::BinaryHeap,
     fmt::Debug,
-    ops::{ControlFlow, DerefMut},
+    ops::ControlFlow,
     pin::Pin,
     sync::Arc,
 };
@@ -601,7 +601,6 @@ pub trait CursorTrait: Any {
     // --- start: BTreeCursor specific functions ----
     fn invalidate_record(&mut self);
     fn has_rowid(&self) -> bool;
-    fn record_cursor_mut(&self) -> std::cell::RefMut<'_, RecordCursor>;
     fn get_pager(&self) -> Arc<Pager>;
     fn get_skip_advance(&self) -> bool;
     // --- end: BTreeCursor specific functions ----
@@ -648,21 +647,6 @@ pub struct BTreeCursor {
     /// Separate state to read a record with overflow pages. This separation from `state` is necessary as
     /// we can be in a function that relies on `state`, but also needs to process overflow pages
     read_overflow_state: Option<ReadPayloadOverflow>,
-    /// `RecordCursor` is used to parse SQLite record format data retrieved from B-tree
-    /// leaf pages. It provides incremental parsing, only deserializing the columns that are
-    /// actually accessed, which is crucial for performance when dealing with wide tables
-    /// where only a subset of columns are needed.
-    ///
-    /// - Record parsing is logically a read operation from the caller's perspective
-    /// - But internally requires updating the cursor's cached parsing state
-    /// - Multiple methods may need to access different columns from the same record
-    ///
-    /// # Lifecycle
-    ///
-    /// The cursor is invalidated and reset when:
-    /// - Moving to a different record/row
-    /// - The underlying `ImmutableRecord` is modified
-    pub record_cursor: RefCell<RecordCursor>,
     /// State machine for [BTreeCursor::is_empty_table]
     is_empty_table_state: EmptyTableState,
     /// State machine for [BTreeCursor::move_to_rightmost] and, optionally, the id of the rightmost page in the btree.
@@ -710,7 +694,7 @@ impl BTreeNodeState {
 }
 
 impl BTreeCursor {
-    pub fn new(pager: Arc<Pager>, root_page: i64, num_columns: usize) -> Self {
+    pub fn new(pager: Arc<Pager>, root_page: i64, _num_columns: usize) -> Self {
         let valid_state = if root_page == 1 && !pager.db_initialized() {
             CursorValidState::Invalid
         } else {
@@ -739,7 +723,6 @@ impl BTreeCursor {
             valid_state,
             seek_state: CursorSeekState::Start,
             read_overflow_state: None,
-            record_cursor: RefCell::new(RecordCursor::with_capacity(num_columns)),
             is_empty_table_state: EmptyTableState::Start,
             move_to_right_state: (MoveToRightState::Start, None),
             seek_to_last_state: SeekToLastState::Start,
@@ -766,14 +749,7 @@ impl BTreeCursor {
         if !self.has_rowid() {
             return None;
         }
-        let mut record_cursor_ref = self.record_cursor.borrow_mut();
-        let record_cursor = record_cursor_ref.deref_mut();
-        let rowid = match self
-            .get_immutable_record()
-            .as_ref()
-            .unwrap()
-            .last_value(record_cursor)
-        {
+        let rowid = match self.get_immutable_record().as_ref().unwrap().last_value() {
             Some(Ok(ValueRef::Integer(rowid))) => rowid,
             _ => unreachable!(
                 "index where has_rowid() is true should have an integer rowid as the last value"
@@ -979,7 +955,6 @@ impl BTreeCursor {
                 .as_mut()
                 .unwrap()
                 .start_serialization(&payload_swap);
-            self.record_cursor.borrow_mut().invalidate();
 
             let _ = self.read_overflow_state.take();
             break Ok(IOResult::Done(()));
@@ -1880,7 +1855,6 @@ impl BTreeCursor {
                 .as_mut()
                 .unwrap()
                 .start_serialization(payload);
-            self.record_cursor.borrow_mut().invalidate();
         };
         let (target_leaf_page_is_in_left_subtree, is_eq) = {
             let record = self.get_immutable_record();
@@ -2285,8 +2259,6 @@ impl BTreeCursor {
                 .as_mut()
                 .unwrap()
                 .start_serialization(payload);
-
-            self.record_cursor.borrow_mut().invalidate();
         };
         let (cmp, found) = self.compare_with_current_record(
             key_values,
@@ -4873,7 +4845,7 @@ impl BTreeCursor {
             turso_assert!(page.is_loaded(), "page {} is not loaded", page.get().id);
             match state {
                 OverwriteCellState::AllocatePayload => {
-                    let serial_types_len = self.record_cursor.borrow_mut().len(record);
+                    let serial_types_len = record.column_count();
                     let new_payload = Vec::with_capacity(serial_types_len);
                     let rowid = return_if_io!(self.rowid());
                     *state = OverwriteCellState::FillPayload {
@@ -5172,7 +5144,6 @@ impl CursorTrait for BTreeCursor {
                 .as_mut()
                 .unwrap()
                 .start_serialization(payload);
-            self.record_cursor.borrow_mut().invalidate();
         };
 
         Ok(IOResult::Done(self.reusable_immutable_record.as_ref()))
@@ -5763,12 +5734,6 @@ impl CursorTrait for BTreeCursor {
             .as_mut()
             .unwrap()
             .invalidate();
-        self.record_cursor.borrow_mut().invalidate();
-    }
-
-    #[inline]
-    fn record_cursor_mut(&self) -> std::cell::RefMut<'_, RecordCursor> {
-        self.record_cursor.borrow_mut()
     }
 
     #[inline]

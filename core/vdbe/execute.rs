@@ -55,7 +55,6 @@ use crate::{get_cursor, CheckpointMode, Completion, Connection, DatabaseStorage,
 use either::Either;
 use std::any::Any;
 use std::env::temp_dir;
-use std::ops::DerefMut;
 use std::str::FromStr;
 use std::{
     borrow::BorrowMut,
@@ -1513,12 +1512,12 @@ pub fn op_column(
                             }
 
                             let record_result = return_if_io!(cursor.record());
-                            let Some(payload) = record_result.as_ref().map(|r| r.get_payload())
-                            else {
+                            let Some(record) = record_result else {
                                 break 'ifnull;
                             };
+                            let payload = record.get_payload();
 
-                            let mut record_cursor = cursor.record_cursor_mut();
+                            let mut record_cursor = record.cursor();
 
                             if record_cursor.offsets.is_empty() {
                                 let (header_size, header_len_bytes) = read_varint_fast(payload)?;
@@ -1603,7 +1602,6 @@ pub fn op_column(
                                 )
                             };
                             let serial_type = record_cursor.serial_types[target_column];
-                            drop(record_result);
                             drop(record_cursor);
 
                             match serial_type {
@@ -2844,10 +2842,8 @@ pub fn op_row_id(
                             let record = return_if_io!(index_cursor.record());
                             let record =
                                 record.as_ref().expect("index cursor should have a record");
-                            let mut record_cursor_ref = index_cursor.record_cursor_mut();
-                            let record_cursor = record_cursor_ref.deref_mut();
                             let rowid = record
-                                .last_value(record_cursor)
+                                .last_value()
                                 .expect("record should have a last value");
                             match rowid {
                                 Ok(ValueRef::Integer(rowid)) => rowid,
@@ -3509,6 +3505,7 @@ pub fn op_idx_ge(
     let pc = {
         let cursor = get_cursor!(state, *cursor_id);
         let cursor = cursor.as_btree_mut();
+        let index_info = cursor.get_index_info().clone();
 
         let pc = if let Some(idx_record) = return_if_io!(cursor.record()) {
             // Create the comparison record from registers
@@ -3516,9 +3513,9 @@ pub fn op_idx_ge(
                 registers_to_ref_values(&state.registers[*start_reg..*start_reg + *num_regs]);
             let tie_breaker = get_tie_breaker_from_idx_comp_op(insn);
             let ord = compare_records_generic(
-                &idx_record,             // The serialized record from the index
-                values,                  // The record built from registers
-                cursor.get_index_info(), // Sort order flags
+                &idx_record, // The serialized record from the index
+                values,      // The record built from registers
+                &index_info, // Sort order flags
                 0,
                 tie_breaker,
             )?;
@@ -3578,18 +3575,13 @@ pub fn op_idx_le(
     let pc = {
         let cursor = get_cursor!(state, *cursor_id);
         let cursor = cursor.as_btree_mut();
+        let index_info = cursor.get_index_info().clone();
 
         let pc = if let Some(idx_record) = return_if_io!(cursor.record()) {
             let values =
                 registers_to_ref_values(&state.registers[*start_reg..*start_reg + *num_regs]);
             let tie_breaker = get_tie_breaker_from_idx_comp_op(insn);
-            let ord = compare_records_generic(
-                &idx_record,
-                values,
-                cursor.get_index_info(),
-                0,
-                tie_breaker,
-            )?;
+            let ord = compare_records_generic(&idx_record, values, &index_info, 0, tie_breaker)?;
 
             if ord.is_le() {
                 target_pc.as_offset_int()
@@ -3630,18 +3622,13 @@ pub fn op_idx_gt(
     let pc = {
         let cursor = get_cursor!(state, *cursor_id);
         let cursor = cursor.as_btree_mut();
+        let index_info = cursor.get_index_info().clone();
 
         let pc = if let Some(idx_record) = return_if_io!(cursor.record()) {
             let values =
                 registers_to_ref_values(&state.registers[*start_reg..*start_reg + *num_regs]);
             let tie_breaker = get_tie_breaker_from_idx_comp_op(insn);
-            let ord = compare_records_generic(
-                &idx_record,
-                values,
-                cursor.get_index_info(),
-                0,
-                tie_breaker,
-            )?;
+            let ord = compare_records_generic(&idx_record, values, &index_info, 0, tie_breaker)?;
 
             if ord.is_gt() {
                 target_pc.as_offset_int()
@@ -3682,19 +3669,14 @@ pub fn op_idx_lt(
     let pc = {
         let cursor = get_cursor!(state, *cursor_id);
         let cursor = cursor.as_btree_mut();
+        let index_info = cursor.get_index_info().clone();
 
         let pc = if let Some(idx_record) = return_if_io!(cursor.record()) {
             let values =
                 registers_to_ref_values(&state.registers[*start_reg..*start_reg + *num_regs]);
 
             let tie_breaker = get_tie_breaker_from_idx_comp_op(insn);
-            let ord = compare_records_generic(
-                &idx_record,
-                values,
-                cursor.get_index_info(),
-                0,
-                tie_breaker,
-            )?;
+            let ord = compare_records_generic(&idx_record, values, &index_info, 0, tie_breaker)?;
 
             if ord.is_lt() {
                 target_pc.as_offset_int()
@@ -6881,6 +6863,8 @@ pub fn op_idx_insert(
             let ignore_conflict = 'i: {
                 let cursor = get_cursor!(state, cursor_id);
                 let cursor = cursor.as_btree_mut();
+                let has_rowid = cursor.has_rowid();
+                let index_info = cursor.get_index_info().clone();
                 let record_opt = return_if_io!(cursor.record());
                 let Some(record) = record_opt.as_ref() else {
                     // Cursor not pointing at a record — table is empty or past last
@@ -6888,8 +6872,8 @@ pub fn op_idx_insert(
                 };
                 // Cursor is pointing at a record; if the index has a rowid, exclude it from the comparison since it's a pointer to the table row;
                 // UNIQUE indexes disallow duplicates like (a=1,b=2,rowid=1) and (a=1,b=2,rowid=2).
-                let existing_key = if cursor.has_rowid() {
-                    let count = cursor.record_cursor_mut().count(record);
+                let existing_key = if has_rowid {
+                    let count = record.column_count();
                     &record.get_values()[..count.saturating_sub(1)]
                 } else {
                     &record.get_values()[..]
@@ -6899,11 +6883,9 @@ pub fn op_idx_insert(
                     break 'i false;
                 }
 
-                let conflict = compare_immutable(
-                    existing_key,
-                    inserted_key_vals,
-                    &cursor.get_index_info().key_info,
-                ) == std::cmp::Ordering::Equal;
+                let conflict =
+                    compare_immutable(existing_key, inserted_key_vals, &index_info.key_info)
+                        == std::cmp::Ordering::Equal;
                 if conflict {
                     if flags.has(IdxInsertFlags::NO_OP_DUPLICATE) {
                         break 'i true;

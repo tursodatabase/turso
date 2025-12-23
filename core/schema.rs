@@ -625,7 +625,6 @@ impl Schema {
                 None,
                 enable_triggers,
             )?;
-            drop(row);
 
             pager.io.block(|| cursor.next())?;
         }

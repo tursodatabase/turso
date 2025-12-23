@@ -10,8 +10,8 @@ use crate::mvcc::database::{
 use crate::storage::btree::{BTreeCursor, BTreeKey, CursorTrait};
 use crate::translate::plan::IterationDirection;
 use crate::types::{
-    compare_immutable, IOCompletions, IOResult, ImmutableRecord, IndexInfo, RecordCursor, SeekKey,
-    SeekOp, SeekResult,
+    compare_immutable, IOCompletions, IOResult, ImmutableRecord, IndexInfo, SeekKey, SeekOp,
+    SeekResult,
 };
 use crate::{return_if_io, turso_assert, Completion, LimboError, Result};
 use crate::{Pager, Value};
@@ -256,7 +256,6 @@ pub struct MvccLazyCursor<Clock: LogicalClock> {
     reusable_immutable_record: Option<ImmutableRecord>,
     btree_cursor: Box<dyn CursorTrait>,
     null_flag: bool,
-    record_cursor: RefCell<RecordCursor>,
     creating_new_rowid: bool,
     state: RefCell<Option<MvccLazyCursorState>>,
     // we keep count_state separate to be able to call other public functions like rewind and next
@@ -302,7 +301,6 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
             reusable_immutable_record: None,
             btree_cursor,
             null_flag: false,
-            record_cursor: RefCell::new(RecordCursor::new()),
             creating_new_rowid: false,
             state: RefCell::new(None),
             count_state: RefCell::new(None),
@@ -1078,8 +1076,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                         panic!("RowKey::Record requires Index cursor type");
                     };
                     if index_info.has_rowid {
-                        let mut record_cursor = RecordCursor::new();
-                        match sortable_key.key.last_value(&mut record_cursor) {
+                        match sortable_key.key.last_value() {
                             Some(Ok(crate::types::ValueRef::Integer(rowid))) => Some(rowid),
                             _ => {
                                 crate::bail_parse_error!("Failed to parse rowid from index record")
@@ -1616,7 +1613,6 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
             .as_mut()
             .expect("immutable record should be initialized")
             .invalidate();
-        self.record_cursor.borrow_mut().invalidate();
     }
 
     fn has_rowid(&self) -> bool {
@@ -1624,10 +1620,6 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
             MvccCursorType::Index(index_info) => index_info.has_rowid,
             MvccCursorType::Table => true, // currently we don't support WITHOUT ROWID tables
         }
-    }
-
-    fn record_cursor_mut(&self) -> std::cell::RefMut<'_, crate::types::RecordCursor> {
-        self.record_cursor.borrow_mut()
     }
 
     fn get_pager(&self) -> Arc<Pager> {

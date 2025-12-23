@@ -877,7 +877,6 @@ impl<'a> TryFrom<ValueRef<'a>> for &'a str {
 /// A value in a record that has already been serialized can stay serialized and what this struct offsers
 /// is easy acces to each value which point to the payload.
 /// The name might be contradictory as it is immutable in the sense that you cannot modify the values without modifying the payload.
-#[derive(Clone, Eq, Ord, PartialEq, PartialOrd)]
 pub struct ImmutableRecord {
     // We have to be super careful with this buffer since we make values point to the payload we need to take care reallocations
     // happen in a controlled manner. If we realocate with values that should be correct, they will now point to undefined data.
@@ -885,6 +884,37 @@ pub struct ImmutableRecord {
     //
     // payload is the Vec<u8> but in order to use Register which holds ImmutableRecord as a Value - we store Vec<u8> as Value::Blob
     payload: Value,
+    /// Embedded cursor for lazy parsing of the record. Uses interior mutability for Send+Sync.
+    cursor: parking_lot::Mutex<RecordCursor>,
+}
+
+impl Clone for ImmutableRecord {
+    fn clone(&self) -> Self {
+        Self {
+            payload: self.payload.clone(),
+            cursor: parking_lot::Mutex::new(RecordCursor::new()), // Reset cursor state on clone
+        }
+    }
+}
+
+impl PartialEq for ImmutableRecord {
+    fn eq(&self, other: &Self) -> bool {
+        self.payload == other.payload // Only compare payload, ignore cursor state
+    }
+}
+
+impl Eq for ImmutableRecord {}
+
+impl PartialOrd for ImmutableRecord {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for ImmutableRecord {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.payload.cmp(&other.payload) // Only compare payload, ignore cursor state
+    }
 }
 
 impl std::fmt::Debug for ImmutableRecord {
@@ -983,12 +1013,14 @@ impl ImmutableRecord {
     pub fn new(payload_capacity: usize) -> Self {
         Self {
             payload: Value::Blob(Vec::with_capacity(payload_capacity)),
+            cursor: parking_lot::Mutex::new(RecordCursor::new()),
         }
     }
 
     pub fn from_bin_record(payload: Vec<u8>) -> Self {
         Self {
             payload: Value::Blob(payload),
+            cursor: parking_lot::Mutex::new(RecordCursor::new()),
         }
     }
 
@@ -996,8 +1028,8 @@ impl ImmutableRecord {
     // Its probably more efficient.
     // fixme(pedrocarlo): this function is very inneficient and kind of misleading because
     // it always deserializes the columns
-    pub fn get_values<'a>(&'a self) -> Vec<ValueRef<'a>> {
-        let mut cursor = RecordCursor::new();
+    pub fn get_values(&self) -> Vec<ValueRef<'_>> {
+        let mut cursor = self.cursor.lock();
         cursor
             .get_values(self)
             .collect::<Result<Vec<_>>>()
@@ -1086,6 +1118,7 @@ impl ImmutableRecord {
         writer.assert_finish_capacity();
         Self {
             payload: Value::Blob(buf),
+            cursor: parking_lot::Mutex::new(RecordCursor::new()),
         }
     }
 
@@ -1126,6 +1159,7 @@ impl ImmutableRecord {
     #[inline]
     pub fn invalidate(&mut self) {
         self.as_blob_mut().clear();
+        self.cursor.lock().invalidate();
     }
 
     #[inline]
@@ -1139,32 +1173,29 @@ impl ImmutableRecord {
     }
 
     // TODO: its probably better to not instantiate the RecordCurosr. Instead do the deserialization
-    // inside the function.
-    pub fn last_value<'a>(
-        &'a self,
-        record_cursor: &mut RecordCursor,
-    ) -> Option<Result<ValueRef<'a>>> {
+    pub fn last_value(&self) -> Option<Result<ValueRef<'_>>> {
         if self.is_invalidated() {
             return Some(Err(LimboError::InternalError(
                 "Record is invalidated".into(),
             )));
         }
-        record_cursor.parse_full_header(self).unwrap();
-        let last_idx = record_cursor.serial_types.len().checked_sub(1)?;
-        Some(record_cursor.get_value(self, last_idx))
+        let mut cursor = self.cursor.lock();
+        cursor.parse_full_header(self).unwrap();
+        let last_idx = cursor.serial_types.len().checked_sub(1)?;
+        Some(cursor.deserialize_column(self, last_idx))
     }
 
-    pub fn get_value<'a>(&'a self, idx: usize) -> Result<ValueRef<'a>> {
-        let mut cursor = RecordCursor::new();
+    pub fn get_value(&self, idx: usize) -> Result<ValueRef<'_>> {
+        let mut cursor = self.cursor.lock();
         cursor.get_value(self, idx)
     }
 
-    pub fn get_value_opt<'a>(&'a self, idx: usize) -> Option<ValueRef<'a>> {
+    pub fn get_value_opt(&self, idx: usize) -> Option<ValueRef<'_>> {
         if self.is_invalidated() {
             return None;
         }
 
-        let mut cursor = RecordCursor::new();
+        let mut cursor = self.cursor.lock();
 
         match cursor.ensure_parsed_upto(self, idx) {
             Ok(()) => {
@@ -1179,9 +1210,14 @@ impl ImmutableRecord {
     }
 
     pub fn column_count(&self) -> usize {
-        let mut cursor = RecordCursor::new();
+        let mut cursor = self.cursor.lock();
         cursor.parse_full_header(self).unwrap();
         cursor.serial_types.len()
+    }
+
+    /// Get direct access to the embedded cursor. Use with caution.
+    pub fn cursor(&self) -> parking_lot::MutexGuard<'_, RecordCursor> {
+        self.cursor.lock()
     }
 }
 
