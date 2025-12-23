@@ -139,30 +139,25 @@ pub fn init_order_by(
          * then the collating sequence of the column is used to determine sort order.
          * If the expression is not a column and has no COLLATE clause, then the BINARY collating sequence is used.
          */
-        let mut collations = order_by
+        let mut order_and_collations: Vec<(SortOrder, Option<CollationSeq>)> = order_by
             .iter()
-            .map(|(expr, _)| get_collseq_from_expr(expr, referenced_tables))
+            .map(|(expr, dir)| {
+                let collation = get_collseq_from_expr(expr, referenced_tables)?;
+                Ok((*dir, collation))
+            })
             .collect::<Result<Vec<_>>>()?;
 
         if has_sequence {
-            // sequence column uses BINARY collation
-            collations.push(Some(CollationSeq::default()));
+            // sequence column: ascending with BINARY collation
+            order_and_collations.push((SortOrder::Asc, Some(CollationSeq::default())));
         }
 
-        let key_len = order_by.len() + if has_sequence { 1 } else { 0 };
+        let key_len = order_and_collations.len();
 
         program.emit_insn(Insn::SorterOpen {
             cursor_id: sort_cursor,
             columns: key_len,
-            order: {
-                let mut ord: Vec<SortOrder> = order_by.iter().map(|(_, d)| *d).collect();
-                if has_sequence {
-                    // sequence is ascending tiebreaker
-                    ord.push(SortOrder::Asc);
-                }
-                ord
-            },
-            collations,
+            order_and_collations,
         });
     }
     Ok(())

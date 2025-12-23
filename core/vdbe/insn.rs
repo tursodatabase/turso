@@ -777,10 +777,10 @@ pub enum Insn {
 
     /// Open a sorter.
     SorterOpen {
-        cursor_id: CursorID,                   // P1
-        columns: usize,                        // P2
-        order: Vec<SortOrder>,                 // P4.
-        collations: Vec<Option<CollationSeq>>, // The only reason for using Option<CollationSeq> is so the explain message is the same as in SQLite
+        cursor_id: CursorID, // P1
+        columns: usize,      // P2
+        /// Combined order and collation per column (keeps Insn small, and order+collations are always the same length).
+        order_and_collations: Vec<(SortOrder, Option<CollationSeq>)>,
     },
 
     /// Insert a row into the sorter.

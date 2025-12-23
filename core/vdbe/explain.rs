@@ -1006,15 +1006,12 @@ pub fn insn_to_row(
             Insn::SorterOpen {
                 cursor_id,
                 columns,
-                order,
-                collations,
+                order_and_collations,
             } => {
-                let _p4 = String::new();
-                let to_print: Vec<String> = order
+                let to_print: Vec<String> = order_and_collations
                     .iter()
-                    .zip(collations.iter())
-                    .map(|(v, collation)| {
-                        let sign = match v {
+                    .map(|(order, collation)| {
+                        let sign = match order {
                             SortOrder::Asc => "",
                             SortOrder::Desc => "-",
                         };
@@ -1030,7 +1027,7 @@ pub fn insn_to_row(
                     *cursor_id as i64,
                     *columns as i64,
                     0,
-                    Value::build_text(format!("k({},{})", order.len(), to_print.join(","))),
+                    Value::build_text(format!("k({},{})", order_and_collations.len(), to_print.join(","))),
                     0,
                     format!("cursor={cursor_id}"),
                 )

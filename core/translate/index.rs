@@ -321,14 +321,17 @@ pub fn translate_create_index(
         });
         program.preassign_label_to_next_insn(loop_end_label);
     } else if index_method.is_none() {
-        // determine the order of the columns in the index for the sorter
-        let order = idx.columns.iter().map(|c| c.order).collect();
+        // determine the order and collation of the columns in the index for the sorter
+        let order_and_collations = idx
+            .columns
+            .iter()
+            .map(|c| (c.order, c.collation))
+            .collect();
         // open the sorter and the pseudo table
         program.emit_insn(Insn::SorterOpen {
             cursor_id: sorter_cursor_id,
             columns: columns.len(),
-            order,
-            collations: idx.columns.iter().map(|c| c.collation).collect(),
+            order_and_collations,
         });
         let content_reg = program.alloc_register();
         program.emit_insn(Insn::OpenPseudo {
