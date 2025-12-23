@@ -1602,7 +1602,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
         todo!()
     }
 
-    fn set_has_record(&self, _has_record: bool) {
+    fn set_has_record(&mut self, _has_record: bool) {
         todo!()
     }
 

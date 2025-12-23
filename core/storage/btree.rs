@@ -581,7 +581,7 @@ pub trait CursorTrait: Any {
     fn rewind(&mut self) -> Result<IOResult<()>>;
     /// Check if cursor is poiting at a valid entry with a record.
     fn has_record(&self) -> bool;
-    fn set_has_record(&self, has_record: bool);
+    fn set_has_record(&mut self, has_record: bool);
     fn get_index_info(&self) -> &IndexInfo;
 
     fn seek_end(&mut self) -> Result<IOResult<()>>;
@@ -607,7 +607,7 @@ pub struct BTreeCursor {
     /// Page id of the root page used to go back up fast.
     root_page: i64,
     /// Rowid and record are stored before being consumed.
-    pub has_record: Cell<bool>,
+    pub has_record: bool,
     null_flag: bool,
     /// Index internal pages are consumed on the way up, so we store going upwards flag in case
     /// we just moved to a parent page and the parent page is an internal index page which requires
@@ -673,7 +673,7 @@ pub struct BTreeCursor {
     /// This is currently only used after a delete operation causes a rebalancing.
     /// Advancing is only skipped if the cursor is currently pointing to a valid record
     /// when next() is called.
-    pub skip_advance: Cell<bool>,
+    pub skip_advance: bool,
 }
 
 /// We store the cell index and cell count for each page in the stack.
@@ -710,7 +710,7 @@ impl BTreeCursor {
             pager,
             root_page,
             usable_space_cached: usable_space,
-            has_record: Cell::new(false),
+            has_record: false,
             null_flag: false,
             going_upwards: false,
             state: CursorState::None,
@@ -740,7 +740,7 @@ impl BTreeCursor {
             count_state: CountState::Start,
             seek_end_state: SeekEndState::Start,
             move_to_state: MoveToState::Start,
-            skip_advance: Cell::new(false),
+            skip_advance: false,
         }
     }
 
@@ -1948,7 +1948,7 @@ impl BTreeCursor {
             if min > max {
                 if let Some(nearest_matching_cell) = nearest_matching_cell.get() {
                     self.stack.set_cell_index(nearest_matching_cell as i32);
-                    self.has_record.set(true);
+                    self.set_has_record(true);
                     return Ok(IOResult::Done(SeekResult::Found));
                 } else {
                     // if !eq_only - matching entry can exist in neighbour leaf page
@@ -1958,7 +1958,7 @@ impl BTreeCursor {
                     return Ok(IOResult::Done(if seek_op.eq_only() {
                         let has_record = target_cell_when_not_found.get() >= 0
                             && target_cell_when_not_found.get() < contents.cell_count() as i32;
-                        self.has_record.set(has_record);
+                        self.has_record = has_record;
                         self.stack.set_cell_index(target_cell_when_not_found.get());
                         SeekResult::NotFound
                     } else {
@@ -1986,7 +1986,7 @@ impl BTreeCursor {
             // rowids are unique, so we can return the rowid immediately
             if found && seek_op.eq_only() {
                 self.stack.set_cell_index(cur_cell_idx as i32);
-                self.has_record.set(true);
+                self.set_has_record(true);
                 return Ok(IOResult::Done(SeekResult::Found));
             }
 
@@ -2111,7 +2111,8 @@ impl BTreeCursor {
             if min > max {
                 if let Some(nearest_matching_cell) = nearest_matching_cell.get() {
                     self.stack.set_cell_index(nearest_matching_cell as i32);
-                    self.has_record.set(true);
+                    self.set_has_record(true);
+
                     return Ok(IOResult::Done(SeekResult::Found));
                 } else {
                     // set cursor to the position where which would hold the op-boundary if it were present
@@ -2124,7 +2125,7 @@ impl BTreeCursor {
                                 .get_page_contents_at_level(old_top_idx)
                                 .unwrap()
                                 .cell_count() as i32;
-                    self.has_record.set(has_record);
+                    self.has_record = has_record;
 
                     // Similar logic as in tablebtree_seek(), but for indexes.
                     // The difference is that since index keys are not necessarily unique, we need to TryAdvance
@@ -2335,7 +2336,7 @@ impl BTreeCursor {
                             BTreeCell::TableLeafCell(tbl_leaf) => {
                                 if tbl_leaf.rowid == bkey.to_rowid() {
                                     tracing::debug!("TableLeafCell: found exact match with cell_idx={cell_idx}, overwriting");
-                                    self.has_record.set(true);
+                                    self.has_record = true;
                                     *write_state = WriteState::Overwrite {
                                         page,
                                         cell_idx,
@@ -2356,7 +2357,7 @@ impl BTreeCursor {
                                 );
                                 if cmp == Ordering::Equal {
                                     tracing::debug!("IndexLeafCell: found exact match with cell_idx={cell_idx}, overwriting");
-                                    self.has_record.set(true);
+                                    self.set_has_record(true);
                                     let CursorState::Write(write_state) = &mut self.state else {
                                         panic!("expected write state");
                                     };
@@ -4863,7 +4864,7 @@ impl BTreeCursor {
                 IterationDirection::Forwards => self.get_next_record(),
                 IterationDirection::Backwards => self.get_prev_record(),
             });
-            self.has_record.set(has_record);
+            self.set_has_record(has_record);
             self.invalidate_record();
             self.context = None;
             self.valid_state = CursorValidState::Valid;
@@ -4909,16 +4910,16 @@ impl CursorTrait for BTreeCursor {
         if self.valid_state == CursorValidState::Invalid {
             return Ok(IOResult::Done(false));
         }
-        if self.skip_advance.get() {
+        if self.skip_advance {
             // See DeleteState::RestoreContextAfterBalancing
-            self.skip_advance.set(false);
+            self.skip_advance = false;
             let mem_page = self.stack.top_ref();
             let contents = mem_page.get_contents();
             let cell_idx = self.stack.current_cell_index();
             let cell_count = contents.cell_count();
             let has_record = cell_idx >= 0 && cell_idx < cell_count as i32;
             if has_record {
-                self.has_record.set(true);
+                self.set_has_record(has_record);
                 // If we are positioned at a record, we stop here without advancing.
                 return Ok(IOResult::Done(true));
             }
@@ -4934,7 +4935,7 @@ impl CursorTrait for BTreeCursor {
                 }
                 AdvanceState::Advance => {
                     let cursor_has_record = return_if_io!(self.get_next_record());
-                    self.has_record.replace(cursor_has_record);
+                    self.set_has_record(cursor_has_record);
                     self.invalidate_record();
                     return Ok(IOResult::Done(cursor_has_record));
                 }
@@ -4946,7 +4947,7 @@ impl CursorTrait for BTreeCursor {
     fn last(&mut self) -> Result<IOResult<()>> {
         let always_seek = false;
         let cursor_has_record = return_if_io!(self.move_to_rightmost(always_seek));
-        self.has_record.replace(cursor_has_record);
+        self.set_has_record(cursor_has_record);
         self.invalidate_record();
         Ok(IOResult::Done(()))
     }
@@ -4961,7 +4962,7 @@ impl CursorTrait for BTreeCursor {
                 }
                 AdvanceState::Advance => {
                     let cursor_has_record = return_if_io!(self.get_prev_record());
-                    self.has_record.replace(cursor_has_record);
+                    self.set_has_record(cursor_has_record);
                     self.invalidate_record();
                     return Ok(IOResult::Done(cursor_has_record));
                 }
@@ -4974,7 +4975,7 @@ impl CursorTrait for BTreeCursor {
         if self.get_null_flag() {
             return Ok(IOResult::Done(None));
         }
-        if self.has_record.get() {
+        if self.has_record() {
             let page = self.stack.top_ref();
             let contents = page.get_contents();
             let page_type = contents.page_type();
@@ -4993,7 +4994,7 @@ impl CursorTrait for BTreeCursor {
 
     #[instrument(skip(self, key), level = Level::DEBUG)]
     fn seek(&mut self, key: SeekKey<'_>, op: SeekOp) -> Result<IOResult<SeekResult>> {
-        self.skip_advance.set(false);
+        self.skip_advance = false;
         // Empty trace to capture the span information
         tracing::trace!("");
         // We need to clear the null flag for the table cursor before seeking,
@@ -5010,7 +5011,7 @@ impl CursorTrait for BTreeCursor {
 
     #[instrument(skip(self), level = Level::DEBUG)]
     fn record(&self) -> Result<IOResult<Option<Ref<'_, ImmutableRecord>>>> {
-        if !self.has_record.get() {
+        if !self.has_record() {
             return Ok(IOResult::Done(None));
         }
         let invalidated = self
@@ -5073,7 +5074,7 @@ impl CursorTrait for BTreeCursor {
         tracing::debug!(valid_state = ?self.valid_state, cursor_state = ?self.state, is_write_in_progress = self.is_write_in_progress());
         return_if_io!(self.insert_into_page(key));
         if key.maybe_rowid().is_some() {
-            self.has_record.replace(true);
+            self.set_has_record(true);
         }
         Ok(IOResult::Done(()))
     }
@@ -5442,7 +5443,7 @@ impl CursorTrait for BTreeCursor {
                     // This means that the cursor is now pointing to the next key after K.
                     // We need to make the next call to BTreeCursor::next() a no-op so that we don't skip over
                     // a row when deleting rows in a loop.
-                    self.skip_advance.set(true);
+                    self.skip_advance = true;
                     self.state = CursorState::None;
                     return Ok(IOResult::Done(()));
                 }
@@ -5602,10 +5603,13 @@ impl CursorTrait for BTreeCursor {
             }
         }
     }
+
+    #[inline]
     fn is_empty(&self) -> bool {
-        !self.has_record.get()
+        !self.has_record
     }
 
+    #[inline]
     fn root_page(&self) -> i64 {
         self.root_page
     }
@@ -5615,7 +5619,7 @@ impl CursorTrait for BTreeCursor {
         if self.valid_state == CursorValidState::Invalid {
             return Ok(IOResult::Done(()));
         }
-        self.skip_advance.set(false);
+        self.skip_advance = false;
         loop {
             match self.rewind_state {
                 RewindState::Start => {
@@ -5628,7 +5632,7 @@ impl CursorTrait for BTreeCursor {
                 RewindState::NextRecord => {
                     let cursor_has_record = return_if_io!(self.get_next_record());
                     self.invalidate_record();
-                    self.has_record.replace(cursor_has_record);
+                    self.set_has_record(cursor_has_record);
                     self.rewind_state = RewindState::Start;
                     return Ok(IOResult::Done(()));
                 }
@@ -5636,6 +5640,7 @@ impl CursorTrait for BTreeCursor {
         }
     }
 
+    #[inline]
     fn has_rowid(&self) -> bool {
         match &self.index_info {
             Some(index_key_info) => index_key_info.has_rowid,
@@ -5643,6 +5648,7 @@ impl CursorTrait for BTreeCursor {
         }
     }
 
+    #[inline]
     fn invalidate_record(&mut self) {
         self.get_immutable_record_or_create()
             .as_mut()
@@ -5650,26 +5656,33 @@ impl CursorTrait for BTreeCursor {
             .invalidate();
         self.record_cursor.borrow_mut().invalidate();
     }
+
+    #[inline]
     fn record_cursor_mut(&self) -> std::cell::RefMut<'_, RecordCursor> {
         self.record_cursor.borrow_mut()
     }
 
+    #[inline]
     fn get_pager(&self) -> Arc<Pager> {
         self.pager.clone()
     }
 
+    #[inline]
     fn get_skip_advance(&self) -> bool {
-        self.skip_advance.get()
+        self.skip_advance
     }
 
+    #[inline]
     fn has_record(&self) -> bool {
-        self.has_record.get()
+        self.has_record
     }
 
-    fn set_has_record(&self, has_record: bool) {
-        self.has_record.set(has_record)
+    #[inline]
+    fn set_has_record(&mut self, has_record: bool) {
+        self.has_record = has_record
     }
 
+    #[inline]
     fn get_index_info(&self) -> &IndexInfo {
         self.index_info.as_ref().unwrap()
     }
@@ -5717,7 +5730,7 @@ impl CursorTrait for BTreeCursor {
                 SeekToLastState::Start => {
                     let has_record = return_if_io!(self.move_to_rightmost(always_seek));
                     self.invalidate_record();
-                    self.has_record.replace(has_record);
+                    self.set_has_record(has_record);
                     if !has_record {
                         self.seek_to_last_state = SeekToLastState::IsEmpty;
                         continue;
@@ -8881,13 +8894,13 @@ mod tests {
         // Check key count
         let _c = cursor.move_to_root().unwrap();
         run_until_done(|| cursor.rewind(), pager.deref()).unwrap();
-        if !cursor.has_record.get() {
+        if !cursor.has_record() {
             panic!("no keys in tree");
         }
         let mut count = 1;
         loop {
             run_until_done(|| cursor.next(), pager.deref()).unwrap();
-            if !cursor.has_record.get() {
+            if !cursor.has_record() {
                 break;
             }
             count += 1;
@@ -10334,7 +10347,7 @@ mod tests {
         for i in 0..iterations {
             let has_next = run_until_done(|| cursor.next(), pager.deref()).unwrap();
             if !has_next {
-                panic!("expected Some(rowid) but got {:?}", cursor.has_record.get());
+                panic!("expected Some(rowid) but got {:?}", cursor.has_record());
             };
             let rowid = run_until_done(|| cursor.rowid(), pager.deref())
                 .unwrap()
