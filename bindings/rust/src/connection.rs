@@ -168,7 +168,7 @@ impl Connection {
                     continue;
                 }
                 turso_sdk_kit::rsapi::TursoStatusCode::Row => {
-                    assert!(values.len() == 0);
+                    assert!(values.is_empty());
                     for i in 0..stmt.column_count() {
                         values.push(stmt.row_value(i)?.to_owned());
                     }
