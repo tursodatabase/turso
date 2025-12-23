@@ -553,12 +553,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
             if let Err(e) = conn.execute(stmt, ()).await {
                 match e {
-                    turso::Error::SqlExecutionFailure(e) => {
-                        if e.contains("Corrupt database") {
-                            panic!("Error creating table: {}", e);
-                        } else {
-                            println!("Error creating table: {e}");
-                        }
+                    turso::Error::Corrupt(e) => {
+                        panic!("Error creating table: {e}");
+                    }
+                    turso::Error::Error(e) => {
+                        println!("Error creating table: {e}");
                     }
                     _ => {
                         println!("Error creating table: {e}");
@@ -620,14 +619,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
                 if let Err(e) = conn.execute(sql, ()).await {
                     match e {
-                        turso::Error::SqlExecutionFailure(e) => {
-                            if e.contains("Corrupt database") {
-                                panic!("Error executing query: {}", e);
-                            } else if e.contains("UNIQUE constraint failed") {
-                                if opts.verbose {
-                                    println!("Skipping UNIQUE constraint violation: {e}");
-                                }
-                            } else if opts.verbose {
+                        turso::Error::Corrupt(e) => {
+                            panic!("Error executing query: {}", e);
+                        }
+                        turso::Error::Constraint(e) => {
+                            if opts.verbose {
+                                println!("Skipping UNIQUE constraint violation: {e}");
+                            }
+                        }
+                        turso::Error::Error(e) => {
+                            if opts.verbose {
                                 println!("Error executing query: {e}");
                             }
                         }

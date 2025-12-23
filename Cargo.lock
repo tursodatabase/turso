@@ -4959,7 +4959,8 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
- "turso_core",
+ "turso_sdk_kit",
+ "turso_sync_sdk_kit",
 ]
 
 [[package]]

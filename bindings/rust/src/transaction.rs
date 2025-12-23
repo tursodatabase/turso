@@ -448,7 +448,7 @@ mod test {
     }
 
     fn assert_nested_tx_error(e: Error) {
-        if let Error::SqlExecutionFailure(e) = &e {
+        if let Error::Error(e) = &e {
             assert!(e.contains("transaction"));
         } else {
             panic!("Unexpected error type: {e:?}");
