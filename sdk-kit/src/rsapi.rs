@@ -509,9 +509,10 @@ impl TursoDatabase {
                     }
                     #[cfg(any(not(target_family = "unix"), miri))]
                     {
-                        Arc::new(turso_core::PlatformIO::new().map_err(|e| TursoError {
-                            code: TursoStatusCode::Error,
-                            message: Some(format!("unable to create generic syscall backend: {e}")),
+                        Arc::new(turso_core::PlatformIO::new().map_err(|e| {
+                            TursoError::Error(format!(
+                                "unable to create generic syscall backend: {e}"
+                            ))
                         })?)
                     }
                 }
@@ -521,10 +522,9 @@ impl TursoDatabase {
                 })?),
                 #[cfg(any(not(target_os = "linux"), miri))]
                 Some("io_uring") => {
-                    return Err(TursoError {
-                        code: TursoStatusCode::Error,
-                        message: Some("io_uring is only available on Linux targets".to_string()),
-                    })
+                    return Err(TursoError::Error(
+                        "io_uring is only available on Linux targets".to_string(),
+                    ));
                 }
                 Some(vfs) => {
                     return Err(TursoError::Error(format!(
@@ -558,13 +558,16 @@ impl TursoDatabase {
                 };
             }
         }
+        if self.config.encryption.is_some() && !opts.enable_encryption {
+            return Err(TursoError::Error("encryption is experimental and must be explicitly enabled through experimental features list".to_string()));
+        }
         let db = turso_core::Database::open_with_flags(
             io.clone(),
             &self.config.path,
             db_file,
             open_flags,
             opts,
-            None,
+            self.config.encryption.clone(),
         )?;
         *inner_db = Some(db);
         Ok(())
