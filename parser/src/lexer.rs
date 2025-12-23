@@ -306,7 +306,11 @@ impl<'a> Lexer<'a> {
                 self.offset += pos;
                 true
             }
-            None => false,
+            None => {
+                cold();
+                self.offset = self.input.len();
+                false
+            }
         }
     }
 
@@ -318,7 +322,11 @@ impl<'a> Lexer<'a> {
                 self.offset += pos + 1;
                 true
             }
-            None => false,
+            None => {
+                cold();
+                self.offset = self.input.len();
+                false
+            }
         }
     }
 
