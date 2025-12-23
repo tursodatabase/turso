@@ -4,7 +4,6 @@ use std::{
     ops::Deref,
     sync::{atomic::Ordering, Arc},
     task::Waker,
-    time::Duration,
 };
 
 use tracing::{instrument, Level};
@@ -14,6 +13,7 @@ use turso_parser::{
 };
 
 use crate::{
+    busy::BusyHandlerState,
     parameters,
     schema::Trigger,
     stats::refresh_analyze_stats,
@@ -22,82 +22,13 @@ use crate::{
         self,
         explain::{EXPLAIN_COLUMNS_TYPE, EXPLAIN_QUERY_PLAN_COLUMNS_TYPE},
     },
-    Instant, LimboError, MvStore, Pager, QueryMode, Result, Value, EXPLAIN_COLUMNS,
+    LimboError, MvStore, Pager, QueryMode, Result, Value, EXPLAIN_COLUMNS,
     EXPLAIN_QUERY_PLAN_COLUMNS,
 };
 
 type ProgramExecutionState = vdbe::ProgramExecutionState;
 type Row = vdbe::Row;
 type StepResult = vdbe::StepResult;
-
-#[derive(Debug)]
-struct BusyTimeout {
-    /// Busy timeout instant
-    timeout: Instant,
-    /// Next iteration index for DELAYS
-    iteration: usize,
-}
-
-impl BusyTimeout {
-    const DELAYS: [std::time::Duration; 12] = [
-        Duration::from_millis(1),
-        Duration::from_millis(2),
-        Duration::from_millis(5),
-        Duration::from_millis(10),
-        Duration::from_millis(15),
-        Duration::from_millis(20),
-        Duration::from_millis(25),
-        Duration::from_millis(25),
-        Duration::from_millis(25),
-        Duration::from_millis(50),
-        Duration::from_millis(50),
-        Duration::from_millis(100),
-    ];
-
-    const TOTALS: [std::time::Duration; 12] = [
-        Duration::from_millis(0),
-        Duration::from_millis(1),
-        Duration::from_millis(3),
-        Duration::from_millis(8),
-        Duration::from_millis(18),
-        Duration::from_millis(33),
-        Duration::from_millis(53),
-        Duration::from_millis(78),
-        Duration::from_millis(103),
-        Duration::from_millis(128),
-        Duration::from_millis(178),
-        Duration::from_millis(228),
-    ];
-
-    pub fn new(now: Instant) -> Self {
-        Self {
-            timeout: now,
-            iteration: 0,
-        }
-    }
-
-    // implementation of sqliteDefaultBusyCallback
-    pub fn busy_callback(&mut self, now: Instant, max_duration: Duration) {
-        let idx = self.iteration.min(11);
-        let mut delay = Self::DELAYS[idx];
-        let mut prior = Self::TOTALS[idx];
-
-        if self.iteration >= 12 {
-            prior += delay * (self.iteration as u32 - 11);
-        }
-
-        if prior + delay > max_duration {
-            delay = max_duration.saturating_sub(prior);
-            // no more waiting after this
-            if delay.is_zero() {
-                return;
-            }
-        }
-
-        self.iteration = self.iteration.saturating_add(1);
-        self.timeout = now + delay;
-    }
-}
 
 pub struct Statement {
     pub(crate) program: vdbe::Program,
@@ -111,9 +42,8 @@ pub struct Statement {
     query_mode: QueryMode,
     /// Flag to show if the statement was busy
     busy: bool,
-    /// Busy timeout instant
-    /// We need Option here because `io.now()` is not a cheap call
-    busy_timeout: Option<BusyTimeout>,
+    /// Busy handler state for tracking invocations and timeouts
+    busy_handler_state: Option<BusyHandlerState>,
 }
 
 impl std::fmt::Debug for Statement {
@@ -144,7 +74,7 @@ impl Statement {
             accesses_db,
             query_mode,
             busy: false,
-            busy_timeout: None,
+            busy_handler_state: None,
         }
     }
 
@@ -179,8 +109,9 @@ impl Statement {
     }
 
     fn _step(&mut self, waker: Option<&Waker>) -> Result<StepResult> {
-        if let Some(busy_timeout) = self.busy_timeout.as_ref() {
-            if self.pager.io.now() < busy_timeout.timeout {
+        // If we're waiting for a busy handler timeout, check if we can proceed
+        if let Some(busy_state) = self.busy_handler_state.as_ref() {
+            if self.pager.io.now() < busy_state.timeout() {
                 // Yield the query as the timeout has not been reached yet
                 if let Some(waker) = waker {
                     waker.wake_by_ref();
@@ -216,6 +147,7 @@ impl Statement {
             let mut conn_metrics = self.program.connection.metrics.write();
             conn_metrics.record_statement(self.state.metrics.clone());
             self.busy = false;
+            self.busy_handler_state = None; // Reset busy state on completion
             drop(conn_metrics);
 
             // After ANALYZE completes, refresh in-memory stats so planners can use them.
@@ -227,27 +159,25 @@ impl Statement {
             self.busy = true;
         }
 
+        // Handle busy result by invoking the busy handler
         if matches!(res, Ok(StepResult::Busy)) {
             let now = self.pager.io.now();
-            let max_duration = *self.program.connection.busy_timeout.read();
-            self.busy_timeout = match self.busy_timeout.take() {
-                None => {
-                    let mut result = BusyTimeout::new(now);
-                    result.busy_callback(now, max_duration);
-                    Some(result)
-                }
-                Some(mut bt) => {
-                    bt.busy_callback(now, max_duration);
-                    Some(bt)
-                }
-            };
+            let handler = self.program.connection.get_busy_handler();
 
-            if now < self.busy_timeout.as_ref().unwrap().timeout {
+            // Initialize or get existing busy handler state
+            let busy_state = self
+                .busy_handler_state
+                .get_or_insert_with(|| BusyHandlerState::new(now));
+
+            // Invoke the busy handler to determine if we should retry
+            if busy_state.invoke(&handler, now) {
+                // Handler says retry, yield with IO to wait for timeout
                 if let Some(waker) = waker {
                     waker.wake_by_ref();
                 }
                 res = Ok(StepResult::IO);
             }
+            // else: Handler says stop, res stays as Busy
         }
 
         res
@@ -496,7 +426,7 @@ impl Statement {
         self.state.reset(max_registers, max_cursors);
         self.program.n_change.store(0, Ordering::SeqCst);
         self.busy = false;
-        self.busy_timeout = None;
+        self.busy_handler_state = None;
     }
 
     pub fn row(&self) -> Option<&Row> {

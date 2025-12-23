@@ -77,14 +77,7 @@ fn try_pwritev_raw(
             )
         }
     } else {
-        unsafe {
-            libc::pwritev(
-                fd,
-                iov.as_ptr(),
-                iov.len() as i32,
-                off as libc::off_t,
-            )
-        }
+        unsafe { libc::pwritev(fd, iov.as_ptr(), iov.len() as i32, off as libc::off_t) }
     };
     if n < 0 {
         Err(std::io::Error::last_os_error())
@@ -110,8 +103,10 @@ impl IO for UnixIO {
         let unix_file = Arc::new(UnixFile {
             file: Arc::new(Mutex::new(file)),
         });
-        if std::env::var(common::ENV_DISABLE_FILE_LOCK).is_err() {
-            unix_file.lock_file(!flags.contains(OpenFlags::ReadOnly))?;
+        if std::env::var(common::ENV_DISABLE_FILE_LOCK).is_err()
+            && !flags.contains(OpenFlags::ReadOnly)
+        {
+            unix_file.lock_file(true)?;
         }
         Ok(unix_file)
     }

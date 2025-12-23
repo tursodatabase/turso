@@ -1334,17 +1334,18 @@ do_execsql_test_on_specific_db {:memory:} affinity-conversion-10 {
   SELECT * FROM t7 WHERE name = 20.5;
 } {20.5}
 
-# TODO: Program does not emit correct opcodes to handle this IN query yet
 # ============================================
 # TEST 8: TEXT column with IN clause
 # Should emit OP_Affinity for batch conversion
 # ============================================
-# do_execsql_test_on_specific_db {:memory:} affinity-conversion-11 {
-#  CREATE TABLE t8(name TEXT);
-#  INSERT INTO t8 VALUES ('1'), ('2'), ('3'), ('4'), ('abc');
-#  CREATE INDEX idx8 ON t8(name);
-#  SELECT * FROM t8 WHERE name IN (1, 2, 3);
-#} {1 2 3}
+do_execsql_test_on_specific_db {:memory:} affinity-conversion-11 {
+  CREATE TABLE t8(name TEXT);
+  INSERT INTO t8 VALUES ('1'), ('2'), ('3'), ('4'), ('abc');
+  CREATE INDEX idx8 ON t8(name);
+  SELECT * FROM t8 WHERE name IN (1, 2, 3);
+} {1
+2
+3}
 
 # ============================================
 # TEST 9: Compound index with mixed types

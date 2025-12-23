@@ -183,7 +183,7 @@ INSERT INTO t VALUES (zeroblob(1024 - 1), zeroblob(1024 - 2), zeroblob(1024 - 3)
         path = os.path.join("testing", "testing_clone.db")
         if os.path.exists(path):
             os.remove(path)
-        walpath = os.path.join("testing", "testing.db-wal")
+        walpath = os.path.join("testing", "testing_clone.db-wal")
         if os.path.exists(walpath):
             os.remove(walpath)
 

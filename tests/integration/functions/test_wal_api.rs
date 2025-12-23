@@ -893,7 +893,7 @@ fn test_db_share_same_file() {
         path.to_str().unwrap(),
         &format!("{}-wal-copy", path.to_str().unwrap()),
         db_file.clone(),
-        turso_core::OpenFlags::empty(),
+        turso_core::OpenFlags::default(),
         turso_core::DatabaseOpts::new(),
         None,
     )

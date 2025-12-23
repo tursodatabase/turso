@@ -380,6 +380,27 @@ pub fn translate_insert(
             check_generated: true,
             table_reference: Arc::clone(ctx.table),
         });
+    } else {
+        // For non-STRICT tables, apply column affinity to the values.
+        // This must happen early so that both index records and the table record
+        // use the converted values. SQLite does this with OP_Affinity before
+        // any index or constraint checks.
+        let affinity = insertion
+            .col_mappings
+            .iter()
+            .map(|col_mapping| col_mapping.column.affinity());
+
+        // Only emit Affinity if there's meaningful affinity to apply
+        // (i.e., not all BLOB/NONE affinity)
+        if affinity.clone().any(|a| a != Affinity::Blob) {
+            if let Ok(count) = std::num::NonZeroUsize::try_from(insertion.col_mappings.len()) {
+                program.emit_insn(Insn::Affinity {
+                    start_reg: insertion.first_col_register(),
+                    count,
+                    affinities: affinity.map(|a| a.aff_mask()).collect(),
+                });
+            }
+        }
     }
 
     // Build a list of upsert constraints/indexes we need to run preflight

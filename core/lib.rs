@@ -2,6 +2,7 @@
 extern crate core;
 
 mod assert;
+pub mod busy;
 mod error;
 mod ext;
 mod fast_lock;
@@ -42,6 +43,7 @@ pub mod numeric;
 #[cfg(not(feature = "fuzz"))]
 mod numeric;
 
+use crate::busy::{BusyHandler, BusyHandlerCallback};
 use crate::index_method::IndexMethod;
 use crate::schema::Trigger;
 use crate::stats::refresh_analyze_stats;
@@ -75,6 +77,7 @@ use rustc_hash::FxHashMap;
 use schema::Schema;
 pub use statement::Statement;
 use std::collections::HashSet;
+use std::time::Duration;
 use std::{
     cell::Cell,
     collections::HashMap,
@@ -84,7 +87,6 @@ use std::{
         atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicUsize, Ordering},
         Arc, LazyLock, Weak,
     },
-    time::Duration,
 };
 #[cfg(feature = "fs")]
 use storage::database::DatabaseFile;
@@ -499,7 +501,7 @@ impl Database {
             let wal_enabled = db.shared_wal.read().enabled.load(Ordering::SeqCst);
             let mv_store_enabled = db.get_mv_store().is_some();
             assert!(
-                wal_enabled || mv_store_enabled,
+                db.is_readonly() || wal_enabled || mv_store_enabled,
                 "Either WAL or MVStore must be enabled"
             );
         }
@@ -676,15 +678,11 @@ impl Database {
 
         drop(header);
 
+        let flags = self.open_flags.get();
+
         // Always Open shared wal and set it in the Database and Pager.
         // MVCC currently requires a WAL open to function
-        let shared_wal = WalFileShared::open_shared_if_exists(&self.io, &self.wal_path)?;
-
-        let file = self
-            .io
-            .open_file(&self.wal_path, OpenFlags::Create, false)?;
-        // Enable WAL in the existing shared instance
-        shared_wal.write().create(file)?;
+        let shared_wal = WalFileShared::open_shared_if_exists(&self.io, &self.wal_path, flags)?;
 
         let wal = Arc::new(WalFile::new(
             self.io.clone(),
@@ -765,7 +763,7 @@ impl Database {
             encryption_cipher_mode: AtomicCipherMode::new(encrytion_cipher),
             sync_mode: AtomicSyncMode::new(SyncMode::Full),
             data_sync_retry: AtomicBool::new(false),
-            busy_timeout: RwLock::new(Duration::new(0, 0)),
+            busy_handler: RwLock::new(BusyHandler::None),
             is_mvcc_bootstrap_connection: AtomicBool::new(is_mvcc_bootstrap_connection),
             fk_pragma: AtomicBool::new(false),
             fk_deferred_violations: AtomicIsize::new(0),
@@ -1275,9 +1273,9 @@ pub struct Connection {
     encryption_cipher_mode: AtomicCipherMode,
     sync_mode: AtomicSyncMode,
     data_sync_retry: AtomicBool,
-    /// User defined max accumulated Busy timeout duration
-    /// Default is 0 (no timeout)
-    busy_timeout: RwLock<std::time::Duration>,
+    /// Busy handler for lock contention
+    /// Default is BusyHandler::None (return SQLITE_BUSY immediately)
+    busy_handler: RwLock<BusyHandler>,
     /// Whether this is an internal connection used for MVCC bootstrap
     is_mvcc_bootstrap_connection: AtomicBool,
     /// Whether pragma foreign_keys=ON for this connection
@@ -1748,10 +1746,14 @@ impl Connection {
     fn from_uri_attached(
         uri: &str,
         db_opts: DatabaseOpts,
+        main_db_flags: OpenFlags,
         io: Arc<dyn IO>,
     ) -> Result<Arc<Database>> {
         let opts = OpenOptions::parse(uri)?;
-        let flags = opts.get_flags()?;
+        let mut flags = opts.get_flags()?;
+        if main_db_flags.contains(OpenFlags::ReadOnly) {
+            flags |= OpenFlags::ReadOnly;
+        }
         let io = opts.vfs.map(Database::io_for_vfs).unwrap_or(Ok(io))?;
         let db = Database::open_file_with_flags(io.clone(), &opts.path, flags, db_opts, None)?;
         if let Some(modeof) = opts.modeof {
@@ -2033,12 +2035,7 @@ impl Connection {
             }
         }
 
-        if self
-            .db
-            .n_connections
-            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst)
-            .eq(&1)
-        {
+        if self.db.n_connections.fetch_sub(1, Ordering::SeqCst).eq(&1) && !self.db.is_readonly() {
             self.pager.load().checkpoint_shutdown(
                 self.is_wal_auto_checkpoint_disabled(),
                 self.get_sync_mode(),
@@ -2364,9 +2361,10 @@ impl Connection {
         } else {
             Arc::new(PlatformIO::new()?)
         };
-        let db = Self::from_uri_attached(path, db_opts, io)?;
-        let pager = Arc::new(db.init_pager(None)?);
         // FIXME: for now, only support read only attach
+        let main_db_flags = self.db.open_flags.get() | OpenFlags::ReadOnly;
+        let db = Self::from_uri_attached(path, db_opts, main_db_flags, io)?;
+        let pager = Arc::new(db.init_pager(None)?);
         db.open_flags.set(OpenFlags::ReadOnly);
         self.attached_databases.write().insert(alias, (db, pager));
 
@@ -2595,28 +2593,34 @@ impl Connection {
         pager.set_encryption_context(cipher_mode, key)
     }
 
-    /// Sets maximum total accumuated timeout. If the duration is None or Zero, we unset the busy handler for this Connection
-    ///
-    /// This api defers slighty from: https://www.sqlite.org/c3ref/busy_timeout.html
-    ///
-    /// Instead of sleeping for linear amount of time specified by the user,
-    /// we will sleep in phases, until the the total amount of time is reached.
-    /// This means we first sleep of 1ms, then if we still return busy, we sleep for 2 ms, and repeat until a maximum of 100 ms per phase.
-    ///
-    /// Example:
-    /// 1. Set duration to 5ms
-    /// 2. Step through query -> returns Busy -> sleep/yield for 1 ms
-    /// 3. Step through query -> returns Busy -> sleep/yield for 2 ms
-    /// 4. Step through query -> returns Busy -> sleep/yield for 2 ms (totaling 5 ms of sleep)
-    /// 5. Step through query -> returns Busy -> return Busy to user
-    ///
-    /// This slight api change demonstrated a better throughtput in `perf/throughput/turso` benchmark
-    pub fn set_busy_timeout(&self, duration: std::time::Duration) {
-        *self.busy_timeout.write() = duration;
+    /// Sets a custom busy handler callback.
+    pub fn set_busy_handler(&self, handler: Option<BusyHandlerCallback>) {
+        *self.busy_handler.write() = match handler {
+            Some(callback) => BusyHandler::Custom { callback },
+            None => BusyHandler::None,
+        };
     }
 
-    pub fn get_busy_timeout(&self) -> std::time::Duration {
-        *self.busy_timeout.read()
+    /// Sets maximum total accumulated timeout. If the duration is Zero, we unset the busy handler.
+    pub fn set_busy_timeout(&self, duration: Duration) {
+        *self.busy_handler.write() = if duration.is_zero() {
+            BusyHandler::None
+        } else {
+            BusyHandler::Timeout(duration)
+        };
+    }
+
+    /// Get the busy timeout duration.
+    pub fn get_busy_timeout(&self) -> Duration {
+        match &*self.busy_handler.read() {
+            BusyHandler::Timeout(d) => *d,
+            _ => Duration::ZERO,
+        }
+    }
+
+    /// Get a reference to the busy handler.
+    pub fn get_busy_handler(&self) -> parking_lot::RwLockReadGuard<'_, BusyHandler> {
+        self.busy_handler.read()
     }
 
     fn set_tx_state(&self, state: TransactionState) {

@@ -304,7 +304,7 @@ impl WrappedIOUring {
         }
         // if we were unable to push, add to overflow
         self.overflow.push_back(entry.clone());
-        self.ring.submit().expect("submiting when full");
+        self.ring.submit().expect("submitting when full");
     }
 
     fn submit_cancel_urgent(&mut self, entry: &io_uring::squeue::Entry) -> Result<()> {
@@ -321,32 +321,25 @@ impl WrappedIOUring {
 
     /// Flush overflow entries to submission queue when possible
     fn flush_overflow(&mut self) -> Result<()> {
-        while !self.overflow.is_empty() {
-            let sub_len = self.ring.submission().len();
-            // safe subtraction as submission len will always be < ENTRIES
-            let available_space = ENTRIES as usize - sub_len;
-            if available_space == 0 {
-                // No space available, always return error if we dont flush all overflow entries
-                // to prevent out of order I/O operations
-                return Err(crate::error::CompletionError::UringIOError("squeue full").into());
-            }
-            // Push as many as we can
-            let to_push = std::cmp::min(available_space, self.overflow.len());
-            unsafe {
-                let mut sq = self.ring.submission();
-                for _ in 0..to_push {
-                    let entry = self.overflow.pop_front().unwrap();
-                    if sq.push(&entry).is_err() {
-                        // Unexpected failure, put it back
-                        self.overflow.push_front(entry);
-                        // No space available, always return error if we dont flush all overflow entries
-                        // to prevent out of order I/O operations
-                        return Err(
-                            crate::error::CompletionError::UringIOError("squeue full").into()
-                        );
-                    }
-                    self.pending_ops += 1;
+        if self.overflow.is_empty() {
+            return Ok(());
+        }
+        // Best-effort: push as many overflow entries as the submission queue currently has space
+        // for. If the SQ is full, leave the remaining entries in `overflow` to preserve ordering
+        // and let the caller make progress (submit/wait and process CQEs) before retrying.
+        unsafe {
+            let mut sq = self.ring.submission();
+            while !self.overflow.is_empty() {
+                if sq.is_full() {
+                    break;
                 }
+                let entry = self.overflow.pop_front().expect("checked not empty");
+                if sq.push(&entry).is_err() {
+                    // SQ state may have changed; keep the entry and retry later.
+                    self.overflow.push_front(entry);
+                    break;
+                }
+                self.pending_ops += 1;
             }
         }
         Ok(())
@@ -363,7 +356,7 @@ impl WrappedIOUring {
     }
 
     fn empty(&self) -> bool {
-        self.pending_ops == 0
+        self.pending_ops == 0 && self.overflow.is_empty()
     }
 
     /// Submit or resubmit a writev operation
@@ -494,8 +487,10 @@ impl IO for UringIO {
             file,
             id,
         });
-        if std::env::var(common::ENV_DISABLE_FILE_LOCK).is_err() {
-            uring_file.lock_file(!flags.contains(OpenFlags::ReadOnly))?;
+        if std::env::var(common::ENV_DISABLE_FILE_LOCK).is_err()
+            || !flags.contains(OpenFlags::ReadOnly)
+        {
+            uring_file.lock_file(true)?;
         }
         Ok(uring_file)
     }
@@ -564,7 +559,6 @@ impl IO for UringIO {
     }
 
     fn step(&self) -> Result<()> {
-        trace!("step()");
         let mut inner = self.inner.lock();
         let ring = &mut inner.ring;
         ring.flush_overflow()?;

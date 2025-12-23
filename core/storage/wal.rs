@@ -2659,11 +2659,19 @@ impl WalFileShared {
     pub fn open_shared_if_exists(
         io: &Arc<dyn IO>,
         path: &str,
+        flags: crate::OpenFlags,
     ) -> Result<Arc<RwLock<WalFileShared>>> {
-        let file = io.open_file(path, crate::io::OpenFlags::Create, false)?;
-        if file.size()? == 0 {
-            return Ok(WalFileShared::new_noop());
-        }
+        let file = match io.open_file(path, flags, false) {
+            Ok(file) => file,
+            Err(LimboError::CompletionError(CompletionError::IOError(
+                std::io::ErrorKind::NotFound,
+            ))) if flags.contains(crate::OpenFlags::ReadOnly) => {
+                // In readonly mode, if the WAL file doesn't exist, we just return a noop WAL
+                // since there's nothing to read from.
+                return Ok(WalFileShared::new_noop());
+            }
+            Err(e) => return Err(e),
+        };
         let wal_file_shared = sqlite3_ondisk::build_shared_wal(&file, io)?;
         turso_assert!(
             wal_file_shared
@@ -2679,16 +2687,7 @@ impl WalFileShared {
     }
 
     pub fn new_noop() -> Arc<RwLock<WalFileShared>> {
-        let wal_header = WalHeader {
-            magic: 0,
-            file_format: 0,
-            page_size: 0,
-            checkpoint_seq: 0,
-            salt_1: 0,
-            salt_2: 0,
-            checksum_1: 0,
-            checksum_2: 0,
-        };
+        let wal_header = WalHeader::new();
         let read_locks = array::from_fn(|_| TursoRwLock::new());
         for (i, lock) in read_locks.iter().enumerate() {
             lock.write();
@@ -2715,22 +2714,9 @@ impl WalFileShared {
         Arc::new(RwLock::new(shared))
     }
 
-    pub fn new_shared(file: Arc<dyn File>) -> Result<Arc<RwLock<WalFileShared>>> {
-        let magic = if cfg!(target_endian = "big") {
-            WAL_MAGIC_BE
-        } else {
-            WAL_MAGIC_LE
-        };
-        let wal_header = WalHeader {
-            magic,
-            file_format: 3007000,
-            page_size: 0, // Signifies WAL header that is not persistent on disk yet.
-            checkpoint_seq: 0, // TODO implement sequence number
-            salt_1: 0,
-            salt_2: 0,
-            checksum_1: 0,
-            checksum_2: 0,
-        };
+    #[cfg(test)]
+    pub(super) fn new_shared(file: Arc<dyn File>) -> Result<Arc<RwLock<WalFileShared>>> {
+        let wal_header = WalHeader::new();
         let read_locks = array::from_fn(|_| TursoRwLock::new());
         // slot zero is always zero as it signifies that reads can be done from the db file
         // directly, and slot 1 is the default read mark containing the max frame. in this case
@@ -2758,35 +2744,6 @@ impl WalFileShared {
             epoch: AtomicU32::new(0),
         };
         Ok(Arc::new(RwLock::new(shared)))
-    }
-
-    pub fn create(&mut self, file: Arc<dyn File>) -> Result<()> {
-        if self.enabled.load(Ordering::SeqCst) {
-            return Ok(());
-        }
-
-        let magic = if cfg!(target_endian = "big") {
-            WAL_MAGIC_BE
-        } else {
-            WAL_MAGIC_LE
-        };
-
-        *self.wal_header.lock() = WalHeader {
-            magic,
-            file_format: 3007000,
-            page_size: 0, // Signifies WAL header that is not persistent on disk yet.
-            checkpoint_seq: 0,
-            salt_1: 0,
-            salt_2: 0,
-            checksum_1: 0,
-            checksum_2: 0,
-        };
-
-        self.file = Some(file);
-        self.enabled.store(true, Ordering::SeqCst);
-        self.initialized.store(false, Ordering::SeqCst);
-
-        Ok(())
     }
 
     pub fn page_size(&self) -> u32 {

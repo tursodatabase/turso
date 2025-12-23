@@ -669,7 +669,7 @@ pub struct TursoStatement {
     statement: Statement,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct TursoExecutionResult {
     pub status: TursoStatusCode,
     pub rows_changed: u64,
@@ -900,40 +900,61 @@ mod tests {
     pub fn test_db_concurrent_use() {
         use std::sync::{Arc, Barrier};
 
-        let db = TursoDatabase::new(TursoDatabaseConfig {
-            path: ":memory:".to_string(),
-            experimental_features: None,
-            async_io: false,
-            io: None,
-            db_file: None,
-        });
-        db.open().unwrap();
-        let conn = db.connect().unwrap();
-        let stmt1 = conn
-            .prepare_single("SELECT * FROM generate_series(1, 100000)")
-            .unwrap();
-        let stmt2 = conn
-            .prepare_single("SELECT * FROM generate_series(1, 100000)")
-            .unwrap();
-
-        // Use a barrier to ensure both threads start executing at the same time
-        let barrier = Arc::new(Barrier::new(2));
-        let mut threads = Vec::new();
-        for mut stmt in [stmt1, stmt2] {
-            let barrier_clone = Arc::clone(&barrier);
-            let thread = std::thread::spawn(move || {
-                barrier_clone.wait();
-                stmt.execute(None)
+        let mut errors = Vec::new();
+        for _ in 0..16 {
+            let db = TursoDatabase::new(TursoDatabaseConfig {
+                path: ":memory:".to_string(),
+                experimental_features: None,
+                async_io: false,
+                io: None,
+                db_file: None,
             });
-            threads.push(thread);
+            db.open().unwrap();
+            let conn = db.connect().unwrap();
+            let stmt1 = conn
+                .prepare_single("SELECT * FROM generate_series(1, 100000)")
+                .unwrap();
+            let stmt2 = conn
+                .prepare_single("SELECT * FROM generate_series(1, 100000)")
+                .unwrap();
+
+            // Use a barrier to ensure both threads start executing at the same time
+            let barrier = Arc::new(Barrier::new(2));
+            let mut threads = Vec::new();
+            for mut stmt in [stmt1, stmt2] {
+                let barrier_clone = Arc::clone(&barrier);
+                let thread = std::thread::spawn(move || {
+                    barrier_clone.wait();
+                    stmt.execute(None)
+                });
+                threads.push(thread);
+            }
+            let mut results = Vec::new();
+            for thread in threads {
+                results.push(thread.join().unwrap());
+            }
+            assert!(
+                !(results[0].is_err() && results[1].is_err()),
+                "results: {results:?}",
+            );
+            if results[0].is_err() || results[1].is_err() {
+                errors.push(
+                    results[0]
+                        .clone()
+                        .err()
+                        .or(results[1].clone().err())
+                        .unwrap(),
+                );
+            }
         }
-        let mut results = Vec::new();
-        for thread in threads {
-            results.push(thread.join().unwrap());
-        }
+        println!("{errors:?}");
         assert!(
-            results[0].is_err() && results[1].is_ok() || results[0].is_ok() && results[1].is_err(),
-            "results: {results:?}",
+            !errors.is_empty(),
+            "misuse errors should be very likely with the test setup: {errors:?}"
+        );
+        assert!(
+            errors.iter().all(|e| e.code == TursoStatusCode::Misuse),
+            "all errors must have Misuse code: {errors:?}"
         );
     }
 

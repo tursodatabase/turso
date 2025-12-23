@@ -392,7 +392,7 @@ pub const WAL_MAGIC_BE: u32 = 0x377f0683;
 /// The Write-Ahead Log (WAL) header.
 /// The first 32 bytes of a WAL file comprise the WAL header.
 /// The WAL header is divided into the following fields stored in big-endian order.
-#[derive(Debug, Default, Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 #[repr(C)] // This helps with encoding because rust does not respect the order in structs, so in
            // this case we want to keep the order
 pub struct WalHeader {
@@ -422,6 +422,32 @@ pub struct WalHeader {
 
     /// Second checksum value in the wal-header
     pub checksum_2: u32,
+}
+
+impl WalHeader {
+    pub const fn new() -> Self {
+        let magic = if cfg!(target_endian = "big") {
+            WAL_MAGIC_BE
+        } else {
+            WAL_MAGIC_LE
+        };
+        WalHeader {
+            magic,
+            file_format: 3007000,
+            page_size: 0, // Signifies WAL header that is not persistent on disk yet.
+            checkpoint_seq: 0, // TODO implement sequence number
+            salt_1: 0,
+            salt_2: 0,
+            checksum_1: 0,
+            checksum_2: 0,
+        }
+    }
+}
+
+impl Default for WalHeader {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Immediately following the wal-header are zero or more frames.

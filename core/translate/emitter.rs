@@ -1758,6 +1758,26 @@ fn emit_update_insns<'a>(
         skip_set_clauses,
     )?;
 
+    // For non-STRICT tables, apply column affinity to the NEW values early.
+    // This must happen before index operations and triggers so that all operations
+    // use the converted values.
+    if let Some(btree_table) = target_table.table.btree() {
+        if !btree_table.is_strict {
+            let affinity = btree_table.columns.iter().map(|c| c.affinity());
+
+            // Only emit Affinity if there's meaningful affinity to apply
+            if affinity.clone().any(|a| a != Affinity::Blob) {
+                if let Ok(count) = std::num::NonZeroUsize::try_from(col_len) {
+                    program.emit_insn(Insn::Affinity {
+                        start_reg: start,
+                        count,
+                        affinities: affinity.map(|a| a.aff_mask()).collect(),
+                    });
+                }
+            }
+        }
+    }
+
     // Fire BEFORE UPDATE triggers and preserve old_registers for AFTER triggers
     let preserved_old_registers: Option<Vec<usize>> =
         if let Some(btree_table) = target_table.table.btree() {
@@ -2168,6 +2188,8 @@ fn emit_update_insns<'a>(
                 table_reference: Arc::clone(&btree_table),
             });
         }
+        // Note: Affinity for non-STRICT tables is applied earlier,
+        // right after emit_update_column_values, before index operations.
 
         if has_user_provided_rowid {
             let record_label = program.allocate_label();

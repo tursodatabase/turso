@@ -534,18 +534,10 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             CheckpointState::BeginPagerTxn => {
                 tracing::debug!("Beginning pager transaction");
                 // Start a pager transaction to write committed versions to B-tree
-                let result = self.pager.begin_read_tx();
-                if let Err(crate::LimboError::Busy) = result {
-                    return Err(crate::LimboError::Busy);
-                }
-                result?;
+                self.pager.begin_read_tx()?;
                 self.lock_states.pager_read_tx = true;
 
-                let result = self.pager.io.block(|| self.pager.begin_write_tx());
-                if let Err(crate::LimboError::Busy) = result {
-                    return Err(crate::LimboError::Busy);
-                }
-                result?;
+                self.pager.io.block(|| self.pager.begin_write_tx())?;
                 if self.update_transaction_state {
                     self.connection.set_tx_state(TransactionState::Write {
                         schema_did_change: false,
