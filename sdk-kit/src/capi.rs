@@ -103,9 +103,8 @@ pub extern "C" fn turso_connection_set_busy_timeout_ms(
     if timeout_ms < 0 {
         return;
     }
-    match unsafe { TursoConnection::ref_from_capi(connection) } {
-        Ok(connection) => connection.set_busy_timeout(Duration::from_millis(timeout_ms as u64)),
-        Err(_) => {}
+    if let Ok(connection) = unsafe { TursoConnection::ref_from_capi(connection) } {
+        connection.set_busy_timeout(Duration::from_millis(timeout_ms as u64));
     }
 }
 

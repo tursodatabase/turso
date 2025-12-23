@@ -190,14 +190,10 @@ pub fn py_turso_database_open(config: &PyTursoDatabaseConfig) -> PyResult<PyTurs
         path: config.path.clone(),
         experimental_features: config.experimental_features.clone(),
         async_io: config.async_io,
-        encryption: if let Some(encryption) = &config.encryption {
-            Some(EncryptionOpts {
-                cipher: encryption.cipher.clone(),
-                hexkey: encryption.hexkey.clone(),
-            })
-        } else {
-            None
-        },
+        encryption: config.encryption.as_ref().map(|encryption| EncryptionOpts {
+            cipher: encryption.cipher.clone(),
+            hexkey: encryption.hexkey.clone(),
+        }),
         vfs: config.vfs.clone(),
         io: None,
         db_file: None,

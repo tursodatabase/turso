@@ -246,9 +246,9 @@ impl TursoDatabaseConfig {
             None
         };
         if encryption_cipher.is_some() != encryption_hexkey.is_some() {
-            return Err(TursoError::Misuse(format!(
-                "either both encryption cipher and key must be set or no"
-            )));
+            return Err(TursoError::Misuse(
+                "either both encryption cipher and key must be set or no".to_string(),
+            ));
         }
         Ok(Self {
             path: str_from_c_str(config.path)?.to_string(),
@@ -258,14 +258,10 @@ impl TursoDatabaseConfig {
                 None
             },
             async_io: config.async_io != 0,
-            encryption: if encryption_cipher.is_some() {
-                Some(EncryptionOpts {
-                    cipher: encryption_cipher.unwrap(),
-                    hexkey: encryption_hexkey.unwrap(),
-                })
-            } else {
-                None
-            },
+            encryption: encryption_cipher.map(|encryption_cipher| EncryptionOpts {
+                cipher: encryption_cipher,
+                hexkey: encryption_hexkey.unwrap(),
+            }),
             vfs: if !config.vfs.is_null() {
                 Some(str_from_c_str(config.vfs)?.to_string())
             } else {
@@ -772,7 +768,7 @@ impl TursoStatement {
                     "internal error: unexpected internal parameter name: {parameter}"
                 )));
             }
-            if name.as_ref() == &parameter {
+            if name.as_ref() == parameter {
                 return Ok(index.into());
             }
         }
