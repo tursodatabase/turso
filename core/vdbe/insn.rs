@@ -3,6 +3,13 @@ use std::{
     sync::Arc,
 };
 
+/// Convert a usize to u16 for instruction fields (registers, counts).
+/// Panics if the value exceeds u16::MAX.
+#[inline]
+pub fn to_u16(v: usize) -> u16 {
+    v.try_into().expect("value exceeds u16::MAX")
+}
+
 use super::{execute, AggFunc, BranchOffset, CursorID, FuncCtx, InsnFunction, PageIdx};
 use crate::{
     schema::{BTreeTable, Column, Index},
