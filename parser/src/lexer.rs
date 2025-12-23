@@ -299,6 +299,30 @@ impl<'a> Lexer<'a> {
     }
 
     #[inline]
+    // Eats up to but not including the specified byte, returns true if found
+    fn eat_until(&mut self, byte: u8) -> bool {
+        match memchr::memchr(byte, self.remaining()) {
+            Some(pos) => {
+                self.offset += pos;
+                true
+            }
+            None => false,
+        }
+    }
+
+    #[inline]
+    // Eats up to and including the specified byte, returns true if found
+    fn eat_past(&mut self, byte: u8) -> bool {
+        match memchr::memchr(byte, self.remaining()) {
+            Some(pos) => {
+                self.offset += pos + 1;
+                true
+            }
+            None => false,
+        }
+    }
+
+    #[inline]
     fn eat_while<F>(&mut self, f: F)
     where
         F: Fn(u8) -> bool,
