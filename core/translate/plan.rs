@@ -902,7 +902,7 @@ impl ColumnUsedMask {
         } else {
             let overflow_idx = (index - Self::INLINE_BITS) / 64;
             let bit = (index - Self::INLINE_BITS) % 64;
-            let overflow = self.overflow.get_or_insert_with(|| Vec::new());
+            let overflow = self.overflow.get_or_insert_with(Vec::new);
             if overflow_idx >= overflow.len() {
                 overflow.resize(overflow_idx + 1, 0);
             }
@@ -1020,7 +1020,7 @@ impl std::ops::BitOrAssign<&Self> for ColumnUsedMask {
     fn bitor_assign(&mut self, rhs: &Self) {
         self.inline |= rhs.inline;
         if let Some(rhs_ov) = &rhs.overflow {
-            let self_ov = self.overflow.get_or_insert_with(|| Vec::new());
+            let self_ov = self.overflow.get_or_insert_with(Vec::new);
             if self_ov.len() < rhs_ov.len() {
                 self_ov.resize(rhs_ov.len(), 0);
             }
