@@ -14,7 +14,7 @@ use crate::translate::{ProgramBuilder, ProgramBuilderOpts};
 use crate::util::normalize_ident;
 use crate::util::PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX;
 use crate::vdbe::builder::CursorType;
-use crate::vdbe::insn::{CmpInsFlags, Cookie, InsertFlags, Insn};
+use crate::vdbe::insn::{{CmpInsFlags, Cookie, InsertFlags, Insn}, to_u16};
 use crate::Connection;
 use crate::{bail_constraint_error, bail_parse_error, Result};
 
@@ -377,9 +377,9 @@ pub fn emit_schema_entry(
 
     let record_reg = program.alloc_register();
     program.emit_insn(Insn::MakeRecord {
-        start_reg: type_reg,
-        count: 5,
-        dest_reg: record_reg,
+        start_reg: to_u16(type_reg),
+        count: to_u16(5),
+        dest_reg: to_u16(record_reg),
         index_name: None,
         affinity_str: None,
     });
@@ -563,9 +563,9 @@ pub fn translate_create_virtual_table(
 
         // VCreate expects an array of args as a record
         program.emit_insn(Insn::MakeRecord {
-            start_reg: args_start,
-            count: args_vec.len(),
-            dest_reg: args_record_reg,
+            start_reg: to_u16(args_start),
+            count: to_u16(args_vec.len()),
+            dest_reg: to_u16(args_record_reg),
             index_name: None,
             affinity_str: None,
         });
@@ -951,9 +951,9 @@ pub fn translate_drop_table(
         });
         program.emit_column_or_rowid(sqlite_schema_cursor_id_1, 4, schema_column_4_register);
         program.emit_insn(Insn::MakeRecord {
-            start_reg: schema_column_0_register,
-            count: 5,
-            dest_reg: new_record_register,
+            start_reg: to_u16(schema_column_0_register),
+            count: to_u16(5),
+            dest_reg: to_u16(new_record_register),
             index_name: None,
             affinity_str: None,
         });

@@ -5,7 +5,7 @@ use crate::{
     translate::collate::CollationSeq,
     vdbe::{
         builder::ProgramBuilder,
-        insn::{IdxInsertFlags, Insn},
+        insn::{to_u16, IdxInsertFlags, Insn},
     },
     LimboError, Result,
 };
@@ -143,9 +143,9 @@ pub fn handle_distinct(
     });
     let record_reg = program.alloc_register();
     program.emit_insn(Insn::MakeRecord {
-        start_reg: agg_arg_reg,
-        count: num_regs,
-        dest_reg: record_reg,
+        start_reg: to_u16(agg_arg_reg),
+        count: to_u16(num_regs),
+        dest_reg: to_u16(record_reg),
         index_name: Some(distinct_ctx.ephemeral_index_name.to_string()),
         affinity_str: None,
     });

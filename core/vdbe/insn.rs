@@ -508,9 +508,9 @@ pub enum Insn {
 
     // Make a record and write it to destination register.
     MakeRecord {
-        start_reg: usize, // P1
-        count: usize,     // P2
-        dest_reg: usize,  // P3
+        start_reg: u16, // P1
+        count: u16,     // P2
+        dest_reg: u16,  // P3
         index_name: Option<String>,
         affinity_str: Option<String>,
     },

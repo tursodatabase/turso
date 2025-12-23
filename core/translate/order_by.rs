@@ -13,7 +13,7 @@ use crate::{
     util::exprs_are_equivalent,
     vdbe::{
         builder::{CursorType, ProgramBuilder},
-        insn::{IdxInsertFlags, Insn},
+        insn::{to_u16, IdxInsertFlags, Insn},
     },
     QueryMode, Result,
 };
@@ -458,9 +458,9 @@ pub fn order_by_sorter_insert(
 
     if *use_heap_sort {
         program.emit_insn(Insn::MakeRecord {
-            start_reg,
-            count: orderby_sorter_column_count,
-            dest_reg: *reg_sorter_data,
+            start_reg: to_u16(start_reg),
+            count: to_u16(orderby_sorter_column_count),
+            dest_reg: to_u16(*reg_sorter_data),
             index_name: None,
             affinity_str: None,
         });
@@ -494,9 +494,9 @@ pub fn sorter_insert(
     record_reg: usize,
 ) {
     program.emit_insn(Insn::MakeRecord {
-        start_reg,
-        count: column_count,
-        dest_reg: record_reg,
+        start_reg: to_u16(start_reg),
+        count: to_u16(column_count),
+        dest_reg: to_u16(record_reg),
         index_name: None,
         affinity_str: None,
     });

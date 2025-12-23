@@ -17,7 +17,7 @@ use crate::{
     vdbe::{
         affinity::Affinity,
         builder::{CursorKey, CursorType, ProgramBuilder},
-        insn::{IdxInsertFlags, Insn},
+        insn::{to_u16, IdxInsertFlags, Insn},
         BranchOffset, CursorID,
     },
     Result, VirtualTable,
@@ -347,9 +347,9 @@ impl DistinctCtx {
         });
         let record_reg = program.alloc_register();
         program.emit_insn(Insn::MakeRecord {
-            start_reg,
-            count: num_regs,
-            dest_reg: record_reg,
+            start_reg: to_u16(start_reg),
+            count: to_u16(num_regs),
+            dest_reg: to_u16(record_reg),
             index_name: Some(self.ephemeral_index_name.to_string()),
             affinity_str: None,
         });

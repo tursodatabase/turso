@@ -2041,9 +2041,9 @@ fn emit_autoindex(
     }
     let record_reg = program.alloc_register();
     program.emit_insn(Insn::MakeRecord {
-        start_reg: ephemeral_cols_start_reg,
-        count: num_regs_to_reserve,
-        dest_reg: record_reg,
+        start_reg: to_u16(ephemeral_cols_start_reg),
+        count: to_u16(num_regs_to_reserve),
+        dest_reg: to_u16(record_reg),
         index_name: Some(index.name.clone()),
         affinity_str: None,
     });

@@ -20,7 +20,7 @@ use crate::translate::plan::{
     ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReferences,
 };
 use crate::vdbe::builder::CursorKey;
-use crate::vdbe::insn::{CmpInsFlags, Cookie};
+use crate::vdbe::insn::{to_u16, CmpInsFlags, Cookie};
 use crate::vdbe::BranchOffset;
 use crate::{
     schema::{BTreeTable, Index, IndexColumn, PseudoCursorType},
@@ -296,9 +296,9 @@ pub fn translate_create_index(
         });
         let record_reg = program.alloc_register();
         program.emit_insn(Insn::MakeRecord {
-            start_reg,
-            count: columns.len() + 1,
-            dest_reg: record_reg,
+            start_reg: to_u16(start_reg),
+            count: to_u16(columns.len() + 1),
+            dest_reg: to_u16(record_reg),
             index_name: Some(idx_name.clone()),
             affinity_str: None,
         });
@@ -397,9 +397,9 @@ pub fn translate_create_index(
         });
         let record_reg = program.alloc_register();
         program.emit_insn(Insn::MakeRecord {
-            start_reg,
-            count: columns.len() + 1,
-            dest_reg: record_reg,
+            start_reg: to_u16(start_reg),
+            count: to_u16(columns.len() + 1),
+            dest_reg: to_u16(record_reg),
             index_name: Some(idx_name.clone()),
             affinity_str: None,
         });

@@ -14,7 +14,7 @@ use crate::translate::planner::ROWID_STRS;
 use crate::translate::trigger_exec::{
     fire_trigger, get_relevant_triggers_type_and_time, TriggerContext,
 };
-use crate::vdbe::insn::CmpInsFlags;
+use crate::vdbe::insn::{CmpInsFlags, to_u16};
 use crate::Connection;
 use crate::{
     bail_parse_error,
@@ -772,9 +772,9 @@ pub fn emit_upsert(
 
             let rec = program.alloc_register();
             program.emit_insn(Insn::MakeRecord {
-                start_reg: ins,
-                count: k + 1,
-                dest_reg: rec,
+                start_reg: to_u16(ins),
+                count: to_u16(k + 1),
+                dest_reg: to_u16(rec),
                 index_name: Some((*idx_name).clone()),
                 affinity_str: None,
             });
@@ -851,9 +851,9 @@ pub fn emit_upsert(
         .map(|c| c.affinity().aff_mask())
         .collect::<String>();
     program.emit_insn(Insn::MakeRecord {
-        start_reg: new_start,
-        count: num_cols,
-        dest_reg: rec,
+        start_reg: to_u16(new_start),
+        count: to_u16(num_cols),
+        dest_reg: to_u16(rec),
         index_name: None,
         affinity_str: Some(affinity_str),
     });

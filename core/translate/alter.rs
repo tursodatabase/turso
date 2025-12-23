@@ -15,7 +15,7 @@ use crate::{
     util::normalize_ident,
     vdbe::{
         builder::{CursorType, ProgramBuilder},
-        insn::{Cookie, Insn, RegisterOrLiteral},
+        insn::{to_u16, Cookie, Insn, RegisterOrLiteral},
     },
     vtab::VirtualTable,
     LimboError, Result,
@@ -272,9 +272,9 @@ pub fn translate_alter_table(
                             .collect::<String>();
 
                         program.emit_insn(Insn::MakeRecord {
-                            start_reg: first_column,
-                            count: column_count,
-                            dest_reg: record,
+                            start_reg: to_u16(first_column),
+                            count: to_u16(column_count),
+                            dest_reg: to_u16(record),
                             index_name: None,
                             affinity_str: Some(affinity_str),
                         });
@@ -512,9 +512,9 @@ pub fn translate_alter_table(
                 let record = program.alloc_register();
 
                 program.emit_insn(Insn::MakeRecord {
-                    start_reg: out,
-                    count: sqlite_schema_column_len,
-                    dest_reg: record,
+                    start_reg: to_u16(out),
+                    count: to_u16(sqlite_schema_column_len),
+                    dest_reg: to_u16(record),
                     index_name: None,
                     affinity_str: None,
                 });
@@ -786,9 +786,9 @@ pub fn translate_alter_table(
                 let record = program.alloc_register();
 
                 program.emit_insn(Insn::MakeRecord {
-                    start_reg: out,
-                    count: sqlite_schema_column_len,
-                    dest_reg: record,
+                    start_reg: to_u16(out),
+                    count: to_u16(sqlite_schema_column_len),
+                    dest_reg: to_u16(record),
                     index_name: None,
                     affinity_str: None,
                 });
@@ -915,9 +915,9 @@ fn translate_rename_virtual_table(
 
         let rec = program.alloc_register();
         program.emit_insn(Insn::MakeRecord {
-            start_reg: out,
-            count: ncols,
-            dest_reg: rec,
+            start_reg: to_u16(out),
+            count: to_u16(ncols),
+            dest_reg: to_u16(rec),
             index_name: None,
             affinity_str: None,
         });

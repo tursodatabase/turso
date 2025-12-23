@@ -13,7 +13,7 @@ use crate::translate::result_row::emit_select_result;
 use crate::types::KeyInfo;
 use crate::util::exprs_are_equivalent;
 use crate::vdbe::builder::{CursorType, ProgramBuilder, TableRefIdCounter};
-use crate::vdbe::insn::{InsertFlags, Insn};
+use crate::vdbe::insn::{{InsertFlags, Insn}, to_u16};
 use crate::vdbe::{BranchOffset, CursorID};
 use crate::Result;
 use std::mem;
@@ -881,9 +881,9 @@ fn emit_insert_row_into_buffer(
     let reg_record = program.alloc_register();
 
     program.emit_insn(Insn::MakeRecord {
-        start_reg: registers.src_columns_start,
-        count: *input_column_count,
-        dest_reg: reg_record,
+        start_reg: to_u16(registers.src_columns_start),
+        count: to_u16(*input_column_count),
+        dest_reg: to_u16(reg_record),
         index_name: None,
         affinity_str: None,
     });
