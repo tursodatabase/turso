@@ -2765,12 +2765,14 @@ mod tests {
             let rowid = pager.io.block(|| btree_cursor.rowid()).unwrap().unwrap();
 
             // Get the record at this position
-            let record = pager
-                .io
-                .block(|| btree_cursor.record())
-                .unwrap()
-                .unwrap()
-                .to_owned();
+            let record = loop {
+                match btree_cursor.record().unwrap() {
+                    IOResult::Done(r) => break r,
+                    IOResult::IO(io) => io.wait(&*pager.io).unwrap(),
+                }
+            }
+            .unwrap()
+            .to_owned();
 
             let values_ref = record.get_values();
             let num_data_columns = values_ref.len() - 1; // Get length before consuming
