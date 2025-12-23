@@ -400,16 +400,20 @@ pub fn emit_parent_index_key_change_checks(
     table_btree: &BTreeTable,
     index: &Index,
 ) -> Result<()> {
-    // Only process FKs that reference this specific index.
-    // This is critical because the OLD/NEW key vectors are built from this index's columns,
-    // so we can only correctly probe FKs that use the same parent key structure.
+    // Only process FKs that:
+    // 1. Reference this specific index (OLD/NEW key vectors are built from this index's columns)
+    // 2. Have NO ACTION or RESTRICT on_update action (CASCADE/SET NULL/SET DEFAULT are handled
+    //    later by fire_fk_update_actions AFTER the update completes)
     let matching_fks: Vec<_> = incoming
         .iter()
         .filter(|fk_ref| {
-            fk_ref
+            let matches_index = fk_ref
                 .parent_unique_index
                 .as_ref()
-                .is_some_and(|idx| idx.name == index.name)
+                .is_some_and(|idx| idx.name == index.name);
+            let is_noaction_or_restrict =
+                matches!(fk_ref.fk.on_update, RefAct::NoAction | RefAct::Restrict);
+            matches_index && is_noaction_or_restrict
         })
         .cloned()
         .collect();
