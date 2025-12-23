@@ -2712,6 +2712,11 @@ impl Index {
         }
     }
 
+    /// Check if this is an expression index.
+    pub fn is_expression_index(&self) -> bool {
+        self.columns.iter().any(|c| c.expr.is_some())
+    }
+
     /// check if this is special backing_btree index created and managed by custom index_method
     pub fn is_backing_btree_index(&self) -> bool {
         self.index_method
