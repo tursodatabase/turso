@@ -1500,7 +1500,10 @@ def test_encryption_enabled(tmp_path):
     conn = turso.connect(
         str(tmp_path),
         experimental_features="encryption",
-        encryption=turso.EncryptionOpts(cipher='aegis256', hexkey='b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327')
+        encryption=turso.EncryptionOpts(
+            cipher="aegis256",
+            hexkey="b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327"
+        )
     )
     cursor = conn.cursor()
     cursor.execute("create table t(x)")
@@ -1508,8 +1511,8 @@ def test_encryption_enabled(tmp_path):
     conn.commit()
     cursor.execute("pragma wal_checkpoint(truncate)")
 
-    content = open(tmp_path, 'rb').read()
-    assert b'secret' not in content
+    content = open(tmp_path, "rb").read()
+    assert b"secret" not in content
 
 
 def test_encryption_disabled(tmp_path):
@@ -1523,5 +1526,5 @@ def test_encryption_disabled(tmp_path):
     conn.commit()
     cursor.execute("pragma wal_checkpoint(truncate)")
 
-    content = open(tmp_path, 'rb').read()
-    assert b'secret' in content
+    content = open(tmp_path, "rb").read()
+    assert b"secret" in content

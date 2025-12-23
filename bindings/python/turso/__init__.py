@@ -3,6 +3,7 @@ from .lib import (
     Cursor,
     DatabaseError,
     DataError,
+    EncryptionOpts,
     Error,
     IntegrityError,
     InterfaceError,
@@ -17,7 +18,6 @@ from .lib import (
     paramstyle,
     setup_logging,
     threadsafety,
-    EncryptionOpts,
 )
 
 __all__ = [
