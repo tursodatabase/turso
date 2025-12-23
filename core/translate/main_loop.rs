@@ -974,13 +974,13 @@ pub fn open_loop(
                 // Probe hash table with keys, store matched rowid and payload in registers
                 let match_reg = program.alloc_register();
                 program.emit_insn(Insn::HashProbe {
-                    hash_table_id,
-                    key_start_reg: probe_key_start_reg,
-                    num_keys,
-                    dest_reg: match_reg,
+                    hash_table_id: to_u16(hash_table_id),
+                    key_start_reg: to_u16(probe_key_start_reg),
+                    num_keys: to_u16(num_keys),
+                    dest_reg: to_u16(match_reg),
                     target_pc: next,
-                    payload_dest_reg,
-                    num_payload,
+                    payload_dest_reg: payload_dest_reg.map(to_u16),
+                    num_payload: to_u16(num_payload),
                 });
 
                 // Label for match processing, HashNext jumps here to avoid re-probing

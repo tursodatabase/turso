@@ -1333,15 +1333,15 @@ pub enum Insn {
     /// payload_dest_reg..payload_dest_reg+num_payload-1.
     /// If no matches, jump to target_pc.
     HashProbe {
-        hash_table_id: usize,
-        key_start_reg: usize,
-        num_keys: usize,
-        dest_reg: usize,
+        hash_table_id: u16,
+        key_start_reg: u16,
+        num_keys: u16,
+        dest_reg: u16,
         target_pc: BranchOffset,
         /// Starting register to write payload columns from hash entry.
-        payload_dest_reg: Option<usize>,
+        payload_dest_reg: Option<u16>,
         /// Number of payload columns expected
-        num_payload: usize,
+        num_payload: u16,
     },
 
     /// Advance to next matching row in hash table bucket.

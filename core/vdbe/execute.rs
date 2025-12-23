@@ -9540,29 +9540,35 @@ pub fn op_hash_probe(
         },
         insn
     );
+    let hash_table_id = *hash_table_id as usize;
+    let key_start_reg = *key_start_reg as usize;
+    let num_keys = *num_keys as usize;
+    let dest_reg = *dest_reg as usize;
+    let payload_dest_reg = payload_dest_reg.map(|r| r as usize);
+    let num_payload = *num_payload as usize;
     let (probe_keys, partition_idx) = if let Some(op_state) = state.op_hash_probe_state.take() {
-        if op_state.hash_table_id == *hash_table_id {
+        if op_state.hash_table_id == hash_table_id {
             (op_state.probe_keys, Some(op_state.partition_idx))
         } else {
             // Different hash table, read fresh keys
-            let mut keys = Vec::with_capacity(*num_keys);
-            for i in 0..*num_keys {
-                let reg = &state.registers[*key_start_reg + i];
+            let mut keys = Vec::with_capacity(num_keys);
+            for i in 0..num_keys {
+                let reg = &state.registers[key_start_reg + i];
                 keys.push(reg.get_value().clone());
             }
             (keys, None)
         }
     } else {
         // First entry, read probe keys from registers
-        let mut keys = Vec::with_capacity(*num_keys);
-        for i in 0..*num_keys {
-            let reg = &state.registers[*key_start_reg + i];
+        let mut keys = Vec::with_capacity(num_keys);
+        for i in 0..num_keys {
+            let reg = &state.registers[key_start_reg + i];
             keys.push(reg.get_value().clone());
         }
         (keys, None)
     };
 
-    let hash_table = state.hash_tables.get_mut(hash_table_id).ok_or_else(|| {
+    let hash_table = state.hash_tables.get_mut(&hash_table_id).ok_or_else(|| {
         LimboError::InternalError(format!("Hash table not found in register {hash_table_id}"))
     })?;
 
@@ -9580,7 +9586,7 @@ pub fn op_hash_probe(
                 IOResult::IO(io) => {
                     state.op_hash_probe_state = Some(OpHashProbeState {
                         probe_keys,
-                        hash_table_id: *hash_table_id,
+                        hash_table_id,
                         partition_idx,
                     });
                     return Ok(InsnFunctionStepResult::IO(io));
@@ -9591,12 +9597,12 @@ pub fn op_hash_probe(
         // Probe the loaded partition
         match hash_table.probe_partition(partition_idx, &probe_keys) {
             Some(entry) => {
-                state.registers[*dest_reg] = Register::Value(Value::Integer(entry.rowid));
+                state.registers[dest_reg] = Register::Value(Value::Integer(entry.rowid));
                 write_hash_payload_to_registers(
                     &mut state.registers,
                     entry,
-                    *payload_dest_reg,
-                    *num_payload,
+                    payload_dest_reg,
+                    num_payload,
                 );
                 state.pc += 1;
                 Ok(InsnFunctionStepResult::Step)
@@ -9610,12 +9616,12 @@ pub fn op_hash_probe(
         // Non-spilled hash table, use normal probe
         match hash_table.probe(probe_keys) {
             Some(entry) => {
-                state.registers[*dest_reg] = Register::Value(Value::Integer(entry.rowid));
+                state.registers[dest_reg] = Register::Value(Value::Integer(entry.rowid));
                 write_hash_payload_to_registers(
                     &mut state.registers,
                     entry,
-                    *payload_dest_reg,
-                    *num_payload,
+                    payload_dest_reg,
+                    num_payload,
                 );
                 state.pc += 1;
                 Ok(InsnFunctionStepResult::Step)
