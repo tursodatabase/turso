@@ -1527,13 +1527,11 @@ pub struct BTreeTable {
 
 impl BTreeTable {
     pub fn get_rowid_alias_column(&self) -> Option<(usize, &Column)> {
-        if self.primary_key_columns.len() == 1 {
-            let (idx, col) = self.get_column(&self.primary_key_columns[0].0)?;
-            if col.is_rowid_alias() {
-                return Some((idx, col));
-            }
-        }
-        None
+        self.columns
+            .iter()
+            .enumerate()
+            .find(|(_, column)| column.is_rowid_alias())
+            .map(|(idx, column)| (idx, column))
     }
 
     /// Returns the column position and column for a given column name.
