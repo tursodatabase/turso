@@ -280,7 +280,13 @@ impl ProgramBuilder {
         opts: ProgramBuilderOpts,
         trigger: Arc<Trigger>,
     ) -> Self {
-        ProgramBuilder::_new(query_mode, capture_data_changes_mode, opts, Some(trigger), true)
+        ProgramBuilder::_new(
+            query_mode,
+            capture_data_changes_mode,
+            opts,
+            Some(trigger),
+            true,
+        )
     }
     /// Create a ProgramBuilder for a subprogram (FK actions, etc.) that runs within
     /// an existing transaction and doesn't emit Transaction instructions.

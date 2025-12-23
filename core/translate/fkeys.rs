@@ -5,7 +5,9 @@ use super::{translate_inner, ProgramBuilder, ProgramBuilderOpts};
 use crate::{
     error::SQLITE_CONSTRAINT_FOREIGNKEY,
     schema::{BTreeTable, ForeignKey, Index, ResolvedFkRef, ROWID_SENTINEL},
-    translate::{emitter::Resolver, expr::translate_expr, planner::ROWID_STRS},
+    translate::{
+        collate::CollationSeq, emitter::Resolver, expr::translate_expr, planner::ROWID_STRS,
+    },
     vdbe::{
         builder::{CursorType, QueryMode},
         insn::{CmpInsFlags, IdxInsertFlags, InsertFlags, Insn},
@@ -169,7 +171,7 @@ where
             rhs: parent_key_start + i,
             target_pc: cont,
             flags: CmpInsFlags::default().jump_if_null(),
-            collation: Some(super::collate::CollationSeq::Binary),
+            collation: Some(CollationSeq::Binary),
         });
         program.emit_insn(Insn::Goto {
             target_pc: next_row,
@@ -1093,7 +1095,7 @@ fn emit_fk_set_default_children_single(
             rhs: parent_key_start + i,
             target_pc: cont,
             flags: CmpInsFlags::default().jump_if_null(),
-            collation: Some(super::collate::CollationSeq::Binary),
+            collation: Some(CollationSeq::Binary),
         });
         program.emit_insn(Insn::Goto {
             target_pc: next_row,

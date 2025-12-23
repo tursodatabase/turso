@@ -1941,7 +1941,11 @@ fn emit_update_insns<'a>(
             // Parent-side NO ACTION/RESTRICT checks must happen BEFORE the update.
             // This checks that no child rows reference the old parent key values.
             // CASCADE/SET NULL actions are fired AFTER the update (see below after Insert).
-            if t_ctx.resolver.schema.any_resolved_fks_referencing(table_name) {
+            if t_ctx
+                .resolver
+                .schema
+                .any_resolved_fks_referencing(table_name)
+            {
                 emit_fk_update_parent_actions(
                     program,
                     &t_ctx.resolver,
@@ -2314,28 +2318,27 @@ fn emit_update_insns<'a>(
 
         // Fire FK CASCADE/SET NULL actions AFTER the parent row is updated
         // This ensures the new parent key exists when cascade actions update child rows
-        if connection.foreign_keys_enabled() {
-            if t_ctx
+        if connection.foreign_keys_enabled()
+            && t_ctx
                 .resolver
                 .schema
                 .any_resolved_fks_referencing(table_name)
-            {
-                let new_rowid_reg = rowid_set_clause_reg.unwrap_or(beg);
-                // OLD column values are stored in preserved_old_registers (contiguous registers)
-                let old_values_start = preserved_old_registers
-                    .as_ref()
-                    .expect("FK check requires OLD values")[0];
-                fire_fk_update_actions(
-                    program,
-                    &mut t_ctx.resolver,
-                    table_name,
-                    beg, // old_rowid_reg
-                    old_values_start,
-                    start, // new_values_start
-                    new_rowid_reg,
-                    connection,
-                )?;
-            }
+        {
+            let new_rowid_reg = rowid_set_clause_reg.unwrap_or(beg);
+            // OLD column values are stored in preserved_old_registers (contiguous registers)
+            let old_values_start = preserved_old_registers
+                .as_ref()
+                .expect("FK check requires OLD values")[0];
+            fire_fk_update_actions(
+                program,
+                &mut t_ctx.resolver,
+                table_name,
+                beg, // old_rowid_reg
+                old_values_start,
+                start, // new_values_start
+                new_rowid_reg,
+                connection,
+            )?;
         }
 
         // Fire AFTER UPDATE triggers

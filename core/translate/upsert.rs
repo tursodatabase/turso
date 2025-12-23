@@ -921,7 +921,9 @@ pub fn emit_upsert(
     // This must be done after the update is complete but before AFTER triggers.
     if let Some(bt) = table.btree() {
         if connection.foreign_keys_enabled()
-            && resolver.schema.any_resolved_fks_referencing(bt.name.as_str())
+            && resolver
+                .schema
+                .any_resolved_fks_referencing(bt.name.as_str())
         {
             fire_fk_update_actions(
                 program,
