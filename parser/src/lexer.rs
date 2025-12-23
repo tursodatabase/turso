@@ -473,21 +473,18 @@ impl<'a> Lexer<'a> {
             Some(b'*') => {
                 self.eat_and_assert(|b| b == b'*');
                 loop {
-                    self.eat_while(|b| b != b'*');
-                    match self.peek() {
-                        Some(b'*') => {
-                            self.eat_and_assert(|b| b == b'*');
-                            match self.peek() {
-                                Some(b'/') => {
-                                    self.eat_and_assert(|b| b == b'/');
-                                    break; // End of block comment
-                                }
-                                None => break,
-                                _ => {}
+                    if self.eat_past(b'*') {
+                        match self.peek() {
+                            Some(b'/') => {
+                                self.eat_and_assert(|b| b == b'/');
+                                break; // End of block comment
                             }
+                            None => break,
+                            _ => {}
                         }
-                        None => break,
-                        _ => unreachable!(), // We should not reach here
+                    } else {
+                        cold();
+                        break;
                     }
                 }
 
