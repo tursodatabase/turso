@@ -196,7 +196,7 @@ fn prepare_one_select_plan(
     }
     match select {
         ast::OneSelect::Select {
-            mut columns,
+            columns,
             from,
             where_clause,
             group_by,
@@ -311,7 +311,7 @@ fn prepare_one_select_plan(
             }
 
             let mut aggregate_expressions = Vec::new();
-            for column in columns.iter_mut() {
+            for column in columns.into_iter() {
                 match column {
                     ResultColumn::Star => {
                         select_star(
@@ -359,16 +359,16 @@ fn prepare_one_select_plan(
                             table.mark_column_used(idx);
                         }
                     }
-                    ResultColumn::Expr(ref mut expr, maybe_alias) => {
+                    ResultColumn::Expr(mut expr, maybe_alias) => {
                         bind_and_rewrite_expr(
-                            expr,
+                            &mut expr,
                             Some(&mut plan.table_references),
                             None,
                             connection,
                             BindingBehavior::ResultColumnsNotAllowed,
                         )?;
                         let contains_aggregates = resolve_window_and_aggregate_functions(
-                            expr,
+                            &mut expr,
                             resolver,
                             &mut aggregate_expressions,
                             Some(&mut windows),
@@ -378,7 +378,7 @@ fn prepare_one_select_plan(
                                 ast::As::Elided(alias) => alias.as_str().to_string(),
                                 ast::As::As(alias) => alias.as_str().to_string(),
                             }),
-                            expr: expr.as_ref().clone(),
+                            expr: *expr,
                             contains_aggregates,
                         });
                     }
