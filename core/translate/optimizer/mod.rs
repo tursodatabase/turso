@@ -611,6 +611,9 @@ fn optimize_table_access(
     limit: &mut Option<Box<Expr>>,
     offset: &mut Option<Box<Expr>>,
 ) -> Result<Option<Vec<JoinOrderMember>>> {
+    if table_references.joined_tables().len() == 0 {
+        return Ok(None);
+    }
     if table_references.joined_tables().len() > TableReferences::MAX_JOINED_TABLES {
         crate::bail_parse_error!(
             "Only up to {} tables can be joined",
