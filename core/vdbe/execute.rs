@@ -3513,7 +3513,7 @@ pub fn op_idx_ge(
                 registers_to_ref_values(&state.registers[*start_reg..*start_reg + *num_regs]);
             let tie_breaker = get_tie_breaker_from_idx_comp_op(insn);
             let ord = compare_records_generic(
-                &idx_record, // The serialized record from the index
+                idx_record,  // The serialized record from the index
                 values,      // The record built from registers
                 &index_info, // Sort order flags
                 0,
@@ -3581,7 +3581,7 @@ pub fn op_idx_le(
             let values =
                 registers_to_ref_values(&state.registers[*start_reg..*start_reg + *num_regs]);
             let tie_breaker = get_tie_breaker_from_idx_comp_op(insn);
-            let ord = compare_records_generic(&idx_record, values, &index_info, 0, tie_breaker)?;
+            let ord = compare_records_generic(idx_record, values, &index_info, 0, tie_breaker)?;
 
             if ord.is_le() {
                 target_pc.as_offset_int()
@@ -3628,7 +3628,7 @@ pub fn op_idx_gt(
             let values =
                 registers_to_ref_values(&state.registers[*start_reg..*start_reg + *num_regs]);
             let tie_breaker = get_tie_breaker_from_idx_comp_op(insn);
-            let ord = compare_records_generic(&idx_record, values, &index_info, 0, tie_breaker)?;
+            let ord = compare_records_generic(idx_record, values, &index_info, 0, tie_breaker)?;
 
             if ord.is_gt() {
                 target_pc.as_offset_int()
@@ -3676,7 +3676,7 @@ pub fn op_idx_lt(
                 registers_to_ref_values(&state.registers[*start_reg..*start_reg + *num_regs]);
 
             let tie_breaker = get_tie_breaker_from_idx_comp_op(insn);
-            let ord = compare_records_generic(&idx_record, values, &index_info, 0, tie_breaker)?;
+            let ord = compare_records_generic(idx_record, values, &index_info, 0, tie_breaker)?;
 
             if ord.is_lt() {
                 target_pc.as_offset_int()

@@ -322,7 +322,7 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
                 in_btree,
             } => {
                 if *in_btree {
-                    return self.btree_cursor.record();
+                    self.btree_cursor.record()
                 } else {
                     let Some(row) = self.read_mvcc_current_row()? else {
                         return Ok(IOResult::Done(None));

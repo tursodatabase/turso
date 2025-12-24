@@ -2516,8 +2516,8 @@ impl Record {
 pub enum Cursor {
     BTree(Box<dyn CursorTrait>),
     IndexMethod(Box<dyn IndexMethodCursor>),
-    Pseudo(PseudoCursor),
-    Sorter(Sorter),
+    Pseudo(Box<PseudoCursor>),
+    Sorter(Box<Sorter>),
     Virtual(VirtualTableCursor),
     MaterializedView(Box<crate::incremental::cursor::MaterializedViewCursor>),
 }
@@ -2541,11 +2541,11 @@ impl Cursor {
     }
 
     pub fn new_pseudo(cursor: PseudoCursor) -> Self {
-        Self::Pseudo(cursor)
+        Self::Pseudo(Box::new(cursor))
     }
 
     pub fn new_sorter(cursor: Sorter) -> Self {
-        Self::Sorter(cursor)
+        Self::Sorter(Box::new(cursor))
     }
 
     pub fn new_materialized_view(

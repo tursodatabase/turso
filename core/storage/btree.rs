@@ -1743,6 +1743,7 @@ impl BTreeCursor {
         }
     }
 
+    #[expect(clippy::too_many_arguments)]
     fn indexbtree_move_to_inner(
         &mut self,
         cmp: SeekOp,
