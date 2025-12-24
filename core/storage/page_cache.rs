@@ -112,6 +112,7 @@ pub struct PageCache {
 
 unsafe impl Send for PageCache {}
 unsafe impl Sync for PageCache {}
+crate::assert::assert_send_sync!(PageCache);
 
 #[derive(Debug, Clone, PartialEq, thiserror::Error)]
 pub enum CacheError {

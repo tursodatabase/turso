@@ -52,6 +52,7 @@ pub struct UringIO {
 
 unsafe impl Send for UringIO {}
 unsafe impl Sync for UringIO {}
+crate::assert::assert_send_sync!(UringIO);
 
 struct WrappedIOUring {
     ring: io_uring::IoUring,
@@ -664,6 +665,7 @@ impl UringFile {
 }
 unsafe impl Send for UringFile {}
 unsafe impl Sync for UringFile {}
+crate::assert::assert_send_sync!(UringFile);
 
 impl File for UringFile {
     fn lock_file(&self, exclusive: bool) -> Result<()> {

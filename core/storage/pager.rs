@@ -1,3 +1,4 @@
+use crate::assert::assert_send_sync;
 use crate::io::WriteBatch;
 use crate::storage::btree::PinGuard;
 use crate::storage::subjournal::Subjournal;
@@ -193,6 +194,7 @@ pub struct Page {
 // concurrent modifications.
 unsafe impl Send for Page {}
 unsafe impl Sync for Page {}
+crate::assert::assert_send_sync!(Page);
 
 // Concurrency control of pages will be handled by the pager, we won't wrap Page with RwLock
 // because that is bad bad.
@@ -673,6 +675,8 @@ pub struct Pager {
     /// In Memory Page 1 for Empty Dbs
     init_page_1: Arc<ArcSwapOption<Page>>,
 }
+
+assert_send_sync!(Pager);
 
 #[cfg(not(feature = "omit_autovacuum"))]
 pub struct VacuumState {
