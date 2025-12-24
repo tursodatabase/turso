@@ -42,7 +42,7 @@ mod rows;
 pub mod transaction;
 pub mod value;
 
-// #[cfg(feature = "sync")]
+#[cfg(feature = "sync")]
 pub mod sync;
 
 pub use connection::Connection;

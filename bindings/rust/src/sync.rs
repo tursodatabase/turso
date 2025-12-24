@@ -124,7 +124,7 @@ impl Builder {
         // IO worker will process SyncEngine IO queue on a dedicated tokio thread.
         let io_worker = IoWorker::spawn(
             sync.clone(),
-            normalize_base_url(&self.remote_url).map_err(|e| Error::Error(e))?,
+            normalize_base_url(&self.remote_url).map_err(Error::Error)?,
             self.auth_token.clone(),
         );
 
@@ -315,7 +315,7 @@ fn normalize_base_url(input: &str) -> std::result::Result<String, String> {
     };
     // Accept http or https only
     if !(s.starts_with("https://") || s.starts_with("http://")) {
-        return Err(format!("unsupported remote URL scheme: {}", input));
+        return Err(format!("unsupported remote URL scheme: {input}"));
     }
     // Ensure no trailing slash to make join predictable.
     let base = s.trim_end_matches('/').to_string();
@@ -407,7 +407,7 @@ impl IoWorker {
         let client: Client<HttpsConnector<HttpConnector>, Full<Bytes>> =
             Client::builder(TokioExecutor::new()).build::<_, Full<Bytes>>(https);
 
-        while let Some(_) = rx.recv().await {
+        while rx.recv().await.is_some() {
             // Process all pending items in the sync IO queue.
             let mut made_progress = false;
             loop {
@@ -489,7 +489,7 @@ impl IoWorker {
             let p = if path.starts_with('/') {
                 path.to_string()
             } else {
-                format!("/{}", path)
+                format!("/{path}")
             };
             format!("{}{}", this.base_url, p)
         };
@@ -508,7 +508,7 @@ impl IoWorker {
             // Add Authorization header if not already set
             if let Some(token) = &this.auth_token {
                 if !headers_map.contains_key(AUTHORIZATION) {
-                    let value = format!("Bearer {}", token);
+                    let value = format!("Bearer {token}");
                     if let Ok(hv) = hyper::header::HeaderValue::try_from(value.as_str()) {
                         headers_map.insert(AUTHORIZATION, hv);
                     }
@@ -517,7 +517,7 @@ impl IoWorker {
         }
 
         // Body must be Full<Bytes> to match the client type.
-        let req_body = Full::new(body.unwrap_or_else(Bytes::new));
+        let req_body = Full::new(body.unwrap_or_default());
 
         let request = match builder.body(req_body) {
             Ok(r) => r,
@@ -579,7 +579,7 @@ impl IoWorker {
                 completion.done();
             }
             Err(err) => {
-                completion.poison(format!("full read failed for {}: {}", path, err));
+                completion.poison(format!("full read failed for {path}: {err}"));
             }
         }
         // Step callbacks after progress.
@@ -599,7 +599,7 @@ impl IoWorker {
                 completion.done();
             }
             Err(err) => {
-                completion.poison(format!("full write failed for {}: {}", path, err));
+                completion.poison(format!("full write failed for {path}: {err}"));
             }
         }
         // Step callbacks after progress.
@@ -796,17 +796,6 @@ mod tests {
             result.push(row.values.into_iter().map(|x| x.into()).collect());
         }
         Ok(result)
-    }
-
-    #[tokio::test]
-    pub async fn kek() {
-        let _ = tracing_subscriber::fmt::try_init();
-        let db =
-            crate::sync::Builder::new_remote(":memory:", "http://rs2--rs2--rs2.localhost:8080")
-                .build()
-                .await
-                .unwrap();
-        let conn = db.connect().await.unwrap();
     }
 
     #[tokio::test]
