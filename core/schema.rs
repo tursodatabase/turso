@@ -1527,13 +1527,10 @@ pub struct BTreeTable {
 
 impl BTreeTable {
     pub fn get_rowid_alias_column(&self) -> Option<(usize, &Column)> {
-        if self.primary_key_columns.len() == 1 {
-            let (idx, col) = self.get_column(&self.primary_key_columns[0].0)?;
-            if col.is_rowid_alias() {
-                return Some((idx, col));
-            }
-        }
-        None
+        self.columns
+            .iter()
+            .enumerate()
+            .find(|(_, column)| column.is_rowid_alias())
     }
 
     /// Returns the column position and column for a given column name.
@@ -2710,6 +2707,11 @@ impl Index {
             }
             _ => todo!("Expected create index statement"),
         }
+    }
+
+    /// Check if this is an expression index.
+    pub fn is_expression_index(&self) -> bool {
+        self.columns.iter().any(|c| c.expr.is_some())
     }
 
     /// check if this is special backing_btree index created and managed by custom index_method

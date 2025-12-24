@@ -32,7 +32,9 @@ use crate::translate::upsert::{
 use crate::util::normalize_ident;
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::builder::{CursorKey, ProgramBuilderOpts};
-use crate::vdbe::insn::{CmpInsFlags, IdxInsertFlags, InsertFlags, RegisterOrLiteral};
+use crate::vdbe::insn::{
+    to_u16, {CmpInsFlags, IdxInsertFlags, InsertFlags, RegisterOrLiteral},
+};
 use crate::vdbe::BranchOffset;
 use crate::{
     schema::{Column, Schema},
@@ -440,9 +442,9 @@ pub fn translate_insert(
         program.preassign_label_to_next_insn(lbl);
     }
     program.emit_insn(Insn::MakeRecord {
-        start_reg: insertion.first_col_register(),
-        count: insertion.col_mappings.len(),
-        dest_reg: insertion.record_register(),
+        start_reg: to_u16(insertion.first_col_register()),
+        count: to_u16(insertion.col_mappings.len()),
+        dest_reg: to_u16(insertion.record_register()),
         index_name: None,
         affinity_str: Some(affinity_str),
     });
@@ -725,9 +727,9 @@ fn emit_commit_phase(
 
         let record_reg = program.alloc_register();
         program.emit_insn(Insn::MakeRecord {
-            start_reg: idx_start_reg,
-            count: num_cols + 1,
-            dest_reg: record_reg,
+            start_reg: to_u16(idx_start_reg),
+            count: to_u16(num_cols + 1),
+            dest_reg: to_u16(record_reg),
             index_name: Some(index.name.clone()),
             affinity_str: None,
         });
@@ -1380,9 +1382,9 @@ fn init_source_emission<'a>(
                     };
 
                     program.emit_insn(Insn::MakeRecord {
-                        start_reg: program.reg_result_cols_start.unwrap_or(yield_reg + 1),
-                        count: result.num_result_cols,
-                        dest_reg: record_reg,
+                        start_reg: to_u16(program.reg_result_cols_start.unwrap_or(yield_reg + 1)),
+                        count: to_u16(result.num_result_cols),
+                        dest_reg: to_u16(record_reg),
                         index_name: None,
                         affinity_str: Some(affinity_str),
                     });
@@ -2081,9 +2083,9 @@ fn emit_preflight_constraint_checks(
                         // In the non-UPSERT case, we insert the index
                         let record_reg = program.alloc_register();
                         program.emit_insn(Insn::MakeRecord {
-                            start_reg: idx_start_reg,
-                            count: num_cols + 1,
-                            dest_reg: record_reg,
+                            start_reg: to_u16(idx_start_reg),
+                            count: to_u16(num_cols + 1),
+                            dest_reg: to_u16(record_reg),
                             index_name: Some(index.name.clone()),
                             affinity_str: None,
                         });
@@ -2101,9 +2103,9 @@ fn emit_preflight_constraint_checks(
                         // eager insert for non-unique, no UPSERT
                         let record_reg = program.alloc_register();
                         program.emit_insn(Insn::MakeRecord {
-                            start_reg: idx_start_reg,
-                            count: num_cols + 1,
-                            dest_reg: record_reg,
+                            start_reg: to_u16(idx_start_reg),
+                            count: to_u16(num_cols + 1),
+                            dest_reg: to_u16(record_reg),
                             index_name: Some(index.name.clone()),
                             affinity_str: None,
                         });
@@ -2263,9 +2265,9 @@ fn ensure_sequence_initialized(
         .collect();
 
     program.emit_insn(Insn::MakeRecord {
-        start_reg: record_start_reg,
-        count: 2,
-        dest_reg: record_reg,
+        start_reg: to_u16(record_start_reg),
+        count: to_u16(2),
+        dest_reg: to_u16(record_reg),
         index_name: None,
         affinity_str: Some(affinity_str),
     });
@@ -2522,9 +2524,9 @@ fn emit_update_sqlite_sequence(
         .map(|col| col.affinity().aff_mask())
         .collect::<String>();
     program.emit_insn(Insn::MakeRecord {
-        start_reg: record_start_reg,
-        count: 2,
-        dest_reg: record_reg,
+        start_reg: to_u16(record_start_reg),
+        count: to_u16(2),
+        dest_reg: to_u16(record_reg),
         index_name: None,
         affinity_str: Some(affinity_str),
     });

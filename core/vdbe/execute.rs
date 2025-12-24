@@ -1869,23 +1869,27 @@ pub fn op_make_record(
         insn
     );
 
+    let start_reg = *start_reg as usize;
+    let count = *count as usize;
+    let dest_reg = *dest_reg as usize;
+
     if let Some(affinity_str) = affinity_str {
-        if affinity_str.len() != *count {
+        if affinity_str.len() != count {
             return Err(LimboError::InternalError(format!(
                 "MakeRecord: the length of affinity string ({}) does not match the count ({})",
                 affinity_str.len(),
-                *count
+                count
             )));
         }
-        for (i, affinity_ch) in affinity_str.chars().enumerate().take(*count) {
-            let reg_index = *start_reg + i;
+        for (i, affinity_ch) in affinity_str.chars().enumerate().take(count) {
+            let reg_index = start_reg + i;
             let affinity = Affinity::from_char(affinity_ch);
             apply_affinity_char(&mut state.registers[reg_index], affinity);
         }
     }
 
-    let record = make_record(&state.registers, start_reg, count);
-    state.registers[*dest_reg] = Register::Record(record);
+    let record = make_record(&state.registers, &start_reg, &count);
+    state.registers[dest_reg] = Register::Record(record);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -4238,8 +4242,7 @@ pub fn op_sorter_open(
         SorterOpen {
             cursor_id,
             columns: _,
-            order,
-            collations,
+            order_and_collations,
         },
         insn
     );
@@ -4259,12 +4262,13 @@ pub fn op_sorter_open(
     } else {
         (cache_size as usize) * page_size
     };
+    let (order, collations): (Vec<_>, Vec<_>) = order_and_collations
+        .iter()
+        .map(|(ord, coll)| (*ord, coll.unwrap_or_default()))
+        .unzip();
     let cursor = Sorter::new(
-        order,
-        collations
-            .iter()
-            .map(|collation| collation.unwrap_or_default())
-            .collect(),
+        &order,
+        collations,
         max_buffer_size_bytes,
         page_size,
         pager.io.clone(),
@@ -9062,7 +9066,7 @@ pub fn op_add_column(
         };
 
         let btree = Arc::make_mut(btree);
-        btree.columns.push(column.clone())
+        btree.columns.push((**column).clone())
     });
 
     state.pc += 1;
@@ -9102,7 +9106,7 @@ pub fn op_alter_column(
             .expect("column being ALTERed should be named")
             .clone()
     };
-    let new_column = crate::schema::Column::from(definition);
+    let new_column = crate::schema::Column::from(definition.as_ref());
     let new_name = definition.col_name.as_str().to_owned();
 
     conn.with_schema_mut(|schema| {
@@ -9364,67 +9368,57 @@ pub fn op_hash_build(
     insn: &Insn,
     pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
-    load_insn!(
-        HashBuild {
-            cursor_id,
-            key_start_reg,
-            num_keys,
-            hash_table_id,
-            mem_budget,
-            collations,
-            payload_start_reg,
-            num_payload,
-        },
-        insn
-    );
+    load_insn!(HashBuild { data }, insn);
 
     let mut op_state = state
         .op_hash_build_state
         .take()
         .filter(|s| {
-            s.hash_table_id == *hash_table_id
-                && s.cursor_id == *cursor_id
-                && s.key_start_reg == *key_start_reg
-                && s.num_keys == *num_keys
+            s.hash_table_id == data.hash_table_id
+                && s.cursor_id == data.cursor_id
+                && s.key_start_reg == data.key_start_reg
+                && s.num_keys == data.num_keys
         })
         .unwrap_or_else(|| OpHashBuildState {
-            key_values: Vec::with_capacity(*num_keys),
+            key_values: Vec::with_capacity(data.num_keys),
             key_idx: 0,
-            payload_values: Vec::with_capacity(*num_payload),
+            payload_values: Vec::with_capacity(data.num_payload),
             payload_idx: 0,
             rowid: None,
-            cursor_id: *cursor_id,
-            hash_table_id: *hash_table_id,
-            key_start_reg: *key_start_reg,
-            num_keys: *num_keys,
+            cursor_id: data.cursor_id,
+            hash_table_id: data.hash_table_id,
+            key_start_reg: data.key_start_reg,
+            num_keys: data.num_keys,
         });
 
     // Create hash table if it doesn't exist yet
-    if !state.hash_tables.contains_key(hash_table_id) {
-        let config = HashTableConfig {
-            initial_buckets: 1024,
-            mem_budget: *mem_budget,
-            num_keys: *num_keys,
-            collations: collations.clone(),
-        };
-        let hash_table = HashTable::new(config, pager.io.clone());
-        state.hash_tables.insert(*hash_table_id, hash_table);
-    }
+    state
+        .hash_tables
+        .entry(data.hash_table_id)
+        .or_insert_with(|| {
+            let config = HashTableConfig {
+                initial_buckets: 1024,
+                mem_budget: data.mem_budget,
+                num_keys: data.num_keys,
+                collations: data.collations.clone(),
+            };
+            HashTable::new(config, pager.io.clone())
+        });
 
     // Read pre-computed key values directly from registers
-    while op_state.key_idx < *num_keys {
+    while op_state.key_idx < data.num_keys {
         let i = op_state.key_idx;
-        let reg = &state.registers[*key_start_reg + i];
+        let reg = &state.registers[data.key_start_reg + i];
         let value = reg.get_value().clone();
         op_state.key_values.push(value);
         op_state.key_idx += 1;
     }
 
     // Read payload values from registers if provided
-    if let Some(payload_reg) = payload_start_reg {
-        while op_state.payload_idx < *num_payload {
+    if let Some(payload_reg) = data.payload_start_reg {
+        while op_state.payload_idx < data.num_payload {
             let i = op_state.payload_idx;
-            let reg = &state.registers[*payload_reg + i];
+            let reg = &state.registers[payload_reg + i];
             let value = reg.get_value().clone();
             op_state.payload_values.push(value);
             op_state.payload_idx += 1;
@@ -9433,7 +9427,7 @@ pub fn op_hash_build(
 
     // Get the rowid from the cursor
     if op_state.rowid.is_none() {
-        let cursor = state.get_cursor(*cursor_id);
+        let cursor = state.get_cursor(data.cursor_id);
         let rowid_val = match cursor {
             Cursor::BTree(btree_cursor) => {
                 let rowid_opt = match btree_cursor.rowid() {
@@ -9461,7 +9455,7 @@ pub fn op_hash_build(
     }
 
     // Insert the rowid into the hash table
-    if let Some(ht) = state.hash_tables.get_mut(hash_table_id) {
+    if let Some(ht) = state.hash_tables.get_mut(&data.hash_table_id) {
         let rowid = op_state.rowid.expect("rowid set");
         let key_values = std::mem::take(&mut op_state.key_values);
         let payload_values = std::mem::take(&mut op_state.payload_values);
@@ -9543,29 +9537,35 @@ pub fn op_hash_probe(
         },
         insn
     );
+    let hash_table_id = *hash_table_id as usize;
+    let key_start_reg = *key_start_reg as usize;
+    let num_keys = *num_keys as usize;
+    let dest_reg = *dest_reg as usize;
+    let payload_dest_reg = payload_dest_reg.map(|r| r as usize);
+    let num_payload = *num_payload as usize;
     let (probe_keys, partition_idx) = if let Some(op_state) = state.op_hash_probe_state.take() {
-        if op_state.hash_table_id == *hash_table_id {
+        if op_state.hash_table_id == hash_table_id {
             (op_state.probe_keys, Some(op_state.partition_idx))
         } else {
             // Different hash table, read fresh keys
-            let mut keys = Vec::with_capacity(*num_keys);
-            for i in 0..*num_keys {
-                let reg = &state.registers[*key_start_reg + i];
+            let mut keys = Vec::with_capacity(num_keys);
+            for i in 0..num_keys {
+                let reg = &state.registers[key_start_reg + i];
                 keys.push(reg.get_value().clone());
             }
             (keys, None)
         }
     } else {
         // First entry, read probe keys from registers
-        let mut keys = Vec::with_capacity(*num_keys);
-        for i in 0..*num_keys {
-            let reg = &state.registers[*key_start_reg + i];
+        let mut keys = Vec::with_capacity(num_keys);
+        for i in 0..num_keys {
+            let reg = &state.registers[key_start_reg + i];
             keys.push(reg.get_value().clone());
         }
         (keys, None)
     };
 
-    let hash_table = state.hash_tables.get_mut(hash_table_id).ok_or_else(|| {
+    let hash_table = state.hash_tables.get_mut(&hash_table_id).ok_or_else(|| {
         LimboError::InternalError(format!("Hash table not found in register {hash_table_id}"))
     })?;
 
@@ -9583,7 +9583,7 @@ pub fn op_hash_probe(
                 IOResult::IO(io) => {
                     state.op_hash_probe_state = Some(OpHashProbeState {
                         probe_keys,
-                        hash_table_id: *hash_table_id,
+                        hash_table_id,
                         partition_idx,
                     });
                     return Ok(InsnFunctionStepResult::IO(io));
@@ -9594,12 +9594,12 @@ pub fn op_hash_probe(
         // Probe the loaded partition
         match hash_table.probe_partition(partition_idx, &probe_keys) {
             Some(entry) => {
-                state.registers[*dest_reg] = Register::Value(Value::Integer(entry.rowid));
+                state.registers[dest_reg] = Register::Value(Value::Integer(entry.rowid));
                 write_hash_payload_to_registers(
                     &mut state.registers,
                     entry,
-                    *payload_dest_reg,
-                    *num_payload,
+                    payload_dest_reg,
+                    num_payload,
                 );
                 state.pc += 1;
                 Ok(InsnFunctionStepResult::Step)
@@ -9613,12 +9613,12 @@ pub fn op_hash_probe(
         // Non-spilled hash table, use normal probe
         match hash_table.probe(probe_keys) {
             Some(entry) => {
-                state.registers[*dest_reg] = Register::Value(Value::Integer(entry.rowid));
+                state.registers[dest_reg] = Register::Value(Value::Integer(entry.rowid));
                 write_hash_payload_to_registers(
                     &mut state.registers,
                     entry,
-                    *payload_dest_reg,
-                    *num_payload,
+                    payload_dest_reg,
+                    num_payload,
                 );
                 state.pc += 1;
                 Ok(InsnFunctionStepResult::Step)

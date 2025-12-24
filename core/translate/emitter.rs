@@ -49,7 +49,9 @@ use crate::translate::window::{emit_window_results, init_window, WindowMetadata}
 use crate::util::{exprs_are_equivalent, normalize_ident};
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::builder::{CursorKey, CursorType, ProgramBuilder};
-use crate::vdbe::insn::{CmpInsFlags, IdxInsertFlags, InsertFlags, RegisterOrLiteral};
+use crate::vdbe::insn::{
+    to_u16, {CmpInsFlags, IdxInsertFlags, InsertFlags, RegisterOrLiteral},
+};
 use crate::vdbe::{insn::Insn, BranchOffset};
 use crate::Connection;
 use crate::{bail_parse_error, Result, SymbolTable};
@@ -2092,9 +2094,9 @@ fn emit_update_insns<'a>(
         });
 
         program.emit_insn(Insn::MakeRecord {
-            start_reg: idx_start_reg,
-            count: num_cols + 1,
-            dest_reg: *record_reg,
+            start_reg: to_u16(idx_start_reg),
+            count: to_u16(num_cols + 1),
+            dest_reg: to_u16(*record_reg),
             index_name: Some(index.name.clone()),
             affinity_str: None,
         });
@@ -2242,9 +2244,9 @@ fn emit_update_insns<'a>(
             .collect::<String>();
 
         program.emit_insn(Insn::MakeRecord {
-            start_reg: start,
-            count: col_len,
-            dest_reg: record_reg,
+            start_reg: to_u16(start),
+            count: to_u16(col_len),
+            dest_reg: to_u16(record_reg),
             index_name: None,
             affinity_str: Some(affinity_str),
         });
@@ -2383,9 +2385,9 @@ fn emit_update_insns<'a>(
         let cdc_updates_record = if let Some(cdc_updates_register) = cdc_updates_register {
             let record_reg = program.alloc_register();
             program.emit_insn(Insn::MakeRecord {
-                start_reg: cdc_updates_register,
-                count: 2 * col_len,
-                dest_reg: record_reg,
+                start_reg: to_u16(cdc_updates_register),
+                count: to_u16(2 * col_len),
+                dest_reg: to_u16(record_reg),
                 index_name: None,
                 affinity_str: None,
             });
@@ -2518,9 +2520,9 @@ pub fn emit_cdc_patch_record(
             .collect::<String>();
 
         program.emit_insn(Insn::MakeRecord {
-            start_reg: columns_reg,
-            count: table.columns().len(),
-            dest_reg: record_reg,
+            start_reg: to_u16(columns_reg),
+            count: to_u16(table.columns().len()),
+            dest_reg: to_u16(record_reg),
             index_name: None,
             affinity_str: Some(affinity_str),
         });
@@ -2554,9 +2556,9 @@ pub fn emit_cdc_full_record(
         .collect::<String>();
 
     program.emit_insn(Insn::MakeRecord {
-        start_reg: columns_reg + 1,
-        count: columns.len(),
-        dest_reg: columns_reg,
+        start_reg: to_u16(columns_reg + 1),
+        count: to_u16(columns.len()),
+        dest_reg: to_u16(columns_reg),
         index_name: None,
         affinity_str: Some(affinity_str),
     });
@@ -2657,9 +2659,9 @@ pub fn emit_cdc_insns(
 
     let record_reg = program.alloc_register();
     program.emit_insn(Insn::MakeRecord {
-        start_reg: turso_cdc_registers,
-        count: 8,
-        dest_reg: record_reg,
+        start_reg: to_u16(turso_cdc_registers),
+        count: to_u16(8),
+        dest_reg: to_u16(record_reg),
         index_name: None,
         affinity_str: None,
     });

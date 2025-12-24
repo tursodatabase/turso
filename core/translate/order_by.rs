@@ -13,7 +13,7 @@ use crate::{
     util::exprs_are_equivalent,
     vdbe::{
         builder::{CursorType, ProgramBuilder},
-        insn::{IdxInsertFlags, Insn},
+        insn::{to_u16, IdxInsertFlags, Insn},
     },
     QueryMode, Result,
 };
@@ -139,30 +139,25 @@ pub fn init_order_by(
          * then the collating sequence of the column is used to determine sort order.
          * If the expression is not a column and has no COLLATE clause, then the BINARY collating sequence is used.
          */
-        let mut collations = order_by
+        let mut order_and_collations: Vec<(SortOrder, Option<CollationSeq>)> = order_by
             .iter()
-            .map(|(expr, _)| get_collseq_from_expr(expr, referenced_tables))
+            .map(|(expr, dir)| {
+                let collation = get_collseq_from_expr(expr, referenced_tables)?;
+                Ok((*dir, collation))
+            })
             .collect::<Result<Vec<_>>>()?;
 
         if has_sequence {
-            // sequence column uses BINARY collation
-            collations.push(Some(CollationSeq::default()));
+            // sequence column: ascending with BINARY collation
+            order_and_collations.push((SortOrder::Asc, Some(CollationSeq::default())));
         }
 
-        let key_len = order_by.len() + if has_sequence { 1 } else { 0 };
+        let key_len = order_and_collations.len();
 
         program.emit_insn(Insn::SorterOpen {
             cursor_id: sort_cursor,
             columns: key_len,
-            order: {
-                let mut ord: Vec<SortOrder> = order_by.iter().map(|(_, d)| *d).collect();
-                if has_sequence {
-                    // sequence is ascending tiebreaker
-                    ord.push(SortOrder::Asc);
-                }
-                ord
-            },
-            collations,
+            order_and_collations,
         });
     }
     Ok(())
@@ -463,9 +458,9 @@ pub fn order_by_sorter_insert(
 
     if *use_heap_sort {
         program.emit_insn(Insn::MakeRecord {
-            start_reg,
-            count: orderby_sorter_column_count,
-            dest_reg: *reg_sorter_data,
+            start_reg: to_u16(start_reg),
+            count: to_u16(orderby_sorter_column_count),
+            dest_reg: to_u16(*reg_sorter_data),
             index_name: None,
             affinity_str: None,
         });
@@ -499,9 +494,9 @@ pub fn sorter_insert(
     record_reg: usize,
 ) {
     program.emit_insn(Insn::MakeRecord {
-        start_reg,
-        count: column_count,
-        dest_reg: record_reg,
+        start_reg: to_u16(start_reg),
+        count: to_u16(column_count),
+        dest_reg: to_u16(record_reg),
         index_name: None,
         affinity_str: None,
     });
