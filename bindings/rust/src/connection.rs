@@ -10,6 +10,7 @@ use std::sync::atomic::AtomicU8;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::task::Waker;
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Atomic wrapper for [DropBehavior]
@@ -49,7 +50,7 @@ pub struct Connection {
     ///
     /// By default, the value is [DropBehavior::Ignore] which effectively does nothing.
     pub(crate) dangling_tx: AtomicDropBehavior,
-    pub(crate) extra_io: Option<Arc<dyn Fn() -> Result<()>>>,
+    pub(crate) extra_io: Option<Arc<dyn Fn(Waker) -> Result<()>>>,
 }
 
 unsafe impl Send for Connection {}
@@ -69,7 +70,7 @@ impl Clone for Connection {
 impl Connection {
     pub fn create(
         conn: Arc<turso_sdk_kit::rsapi::TursoConnection>,
-        extra_io: Option<Arc<dyn Fn() -> Result<()>>>,
+        extra_io: Option<Arc<dyn Fn(Waker) -> Result<()>>>,
     ) -> Self {
         #[allow(clippy::arc_with_non_send_sync)]
         let connection = Connection {

@@ -1,8 +1,9 @@
 use std::{
+    collections::HashMap,
     future::Future,
     pin::Pin,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicU64, Ordering},
         Arc, Mutex,
     },
     task::{Context, Poll, Waker},
@@ -214,7 +215,8 @@ impl Database {
             ) => {
                 // Provide extra_io callback to kick IO worker when driver needs to make progress.
                 let io = self.io.clone();
-                let extra_io = Arc::new(move || {
+                let extra_io = Arc::new(move |waker| {
+                    io.register(None, waker);
                     io.kick();
                     Ok(())
                 });
@@ -249,8 +251,7 @@ async fn drive_operation_result(
 struct AsyncOpFuture {
     op: Option<Box<turso_sync_sdk_kit::turso_async_operation::TursoDatabaseAsyncOperation>>,
     io: Arc<IoWorker>,
-    // To avoid re-registering the waker too frequently.
-    registered: bool,
+    waker_id: Option<u64>,
 }
 
 impl AsyncOpFuture {
@@ -261,7 +262,7 @@ impl AsyncOpFuture {
         Self {
             op: Some(op),
             io,
-            registered: false,
+            waker_id: None,
         }
     }
 }
@@ -278,11 +279,8 @@ impl Future for AsyncOpFuture {
             )));
         };
 
-        // Ensure we're registered to be woken when IO progress happens.
-        if !this.registered {
-            this.io.register(cx.waker().clone());
-            this.registered = true;
-        }
+        let waker_id = this.io.register(this.waker_id, cx.waker().clone());
+        this.waker_id = Some(waker_id);
 
         // Try to resume the operation.
         match op.resume() {
@@ -298,6 +296,7 @@ impl Future for AsyncOpFuture {
                 })?;
                 // Drop the op and complete.
                 this.op.take();
+                this.io.unregister(waker_id);
                 Poll::Ready(Ok(result))
             }
             Ok(turso_sdk_kit::rsapi::TursoStatusCode::Io) => {
@@ -312,7 +311,10 @@ impl Future for AsyncOpFuture {
                     "unexpected row status in sync operation".to_string(),
                 )))
             }
-            Err(e) => Poll::Ready(Err(Error::from(e))),
+            Err(e) => {
+                this.io.unregister(waker_id);
+                Poll::Ready(Err(Error::from(e)))
+            }
         }
     }
 }
@@ -346,9 +348,9 @@ struct IoWorker {
     // Channel to wake the worker to process IO.
     tx: mpsc::UnboundedSender<()>,
     // Wakers to notify pending futures when IO makes progress.
-    wakers: Arc<Mutex<Vec<Waker>>>,
-    // Whether a kick is scheduled and not yet processed (dedup kiks).
-    scheduled: Arc<AtomicBool>,
+    wakers: Arc<Mutex<HashMap<u64, Waker>>>,
+    // last registered waker id
+    waker_id: AtomicU64,
 }
 
 impl IoWorker {
@@ -358,8 +360,7 @@ impl IoWorker {
         auth_token: Option<String>,
     ) -> Arc<Self> {
         let (tx, rx) = mpsc::unbounded_channel::<()>();
-        let wakers = Arc::new(Mutex::new(Vec::new()));
-        let scheduled = Arc::new(AtomicBool::new(false));
+        let wakers = Arc::new(Mutex::new(HashMap::new()));
 
         let worker = Arc::new(Self {
             sync,
@@ -367,7 +368,7 @@ impl IoWorker {
             auth_token,
             tx,
             wakers: wakers.clone(),
-            scheduled: scheduled.clone(),
+            waker_id: AtomicU64::new(0),
         });
 
         // Spin a separate Tokio runtime on its own thread to process IO queue.
@@ -381,7 +382,7 @@ impl IoWorker {
                     .expect("failed to build IO runtime");
 
                 rt.block_on(async move {
-                    IoWorker::run_loop(worker_clone, rx, wakers, scheduled).await;
+                    IoWorker::run_loop(worker_clone, rx, wakers).await;
                 });
             })
             .expect("failed to spawn IO worker thread");
@@ -390,29 +391,32 @@ impl IoWorker {
     }
 
     // Register a waker to be awakened upon IO progress.
-    fn register(&self, waker: Waker) {
+    fn register(&self, waker_id: Option<u64>, waker: Waker) -> u64 {
         let mut wakers = self.wakers.lock().unwrap();
-        // Replace existing equal waker if present to avoid growth.
-        // If not, push new.
-        // Note: Waker doesn't implement PartialEq; just push, we'll drain later.
-        wakers.push(waker);
+        let waker_id = if let Some(waker_id) = waker_id {
+            waker_id
+        } else {
+            self.waker_id.fetch_add(1, Ordering::SeqCst)
+        };
+        wakers.insert(waker_id, waker);
+        waker_id
+    }
+
+    // Unregister a waker
+    fn unregister(&self, waker_id: u64) {
+        let mut wakers = self.wakers.lock().unwrap();
+        wakers.remove(&waker_id);
     }
 
     // Kick the IO worker to process IO queue.
     fn kick(&self) {
-        if !self.scheduled.swap(true, Ordering::SeqCst) {
-            let _ = self.tx.send(());
-        }
+        let _ = self.tx.send(());
     }
 
     // Called from the IO thread once progress has been made to notify all pending futures.
-    fn notify_progress(wakers: &Arc<Mutex<Vec<Waker>>>) {
-        let mut pending = Vec::new();
-        {
-            let mut guard = wakers.lock().unwrap();
-            pending.append(&mut *guard);
-        }
-        for w in pending {
+    fn notify_progress(wakers: &Arc<Mutex<HashMap<u64, Waker>>>) {
+        let guard = wakers.lock().unwrap().drain().collect::<Vec<_>>();
+        for (_, w) in guard {
             w.wake();
         }
     }
@@ -420,8 +424,7 @@ impl IoWorker {
     async fn run_loop(
         this: Arc<IoWorker>,
         mut rx: mpsc::UnboundedReceiver<()>,
-        wakers: Arc<Mutex<Vec<Waker>>>,
-        scheduled: Arc<AtomicBool>,
+        wakers: Arc<Mutex<HashMap<u64, Waker>>>,
     ) {
         // Create HTTPS-capable Hyper client.
         let mut http_connector = HttpConnector::new();
@@ -431,14 +434,13 @@ impl IoWorker {
             Client::builder(TokioExecutor::new()).build::<_, Full<Bytes>>(https);
 
         while let Some(_) = rx.recv().await {
-            // Reset scheduled flag so next kick can be sent.
-            scheduled.store(false, Ordering::SeqCst);
-
             // Process all pending items in the sync IO queue.
             let mut made_progress = false;
             loop {
                 let item = this.sync.take_io_item();
                 let Some(item) = item else {
+                    this.sync.step_io_callbacks();
+                    IoWorker::notify_progress(&wakers);
                     break;
                 };
 
@@ -628,5 +630,550 @@ impl IoWorker {
         }
         // Step callbacks after progress.
         sync.step_io_callbacks();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use anyhow::{anyhow, Context, Result};
+    use rand::{distr::Alphanumeric, Rng};
+    use reqwest::Client;
+    use serde_json::json;
+    use std::{
+        env,
+        process::{Child, Command, Stdio},
+        thread::sleep,
+        time::Duration,
+    };
+    use turso_sync_sdk_kit::rsapi::PartialBootstrapStrategy;
+
+    use crate::sync::PartialSyncOpts;
+    use crate::{Rows, Value};
+
+    const ADMIN_URL: &str = "http://localhost:8081";
+    const USER_URL: &str = "http://localhost:8080";
+
+    fn random_str() -> String {
+        rand::rng()
+            .sample_iter(&Alphanumeric)
+            .take(8)
+            .map(char::from)
+            .collect()
+    }
+
+    async fn handle_response(resp: reqwest::Response) -> Result<()> {
+        let status = resp.status();
+        let text = resp.text().await.unwrap_or_default();
+
+        if status == 400 && text.contains("already exists") {
+            return Ok(());
+        }
+
+        if !status.is_success() {
+            return Err(anyhow!("request failed: {status} {text}"));
+        }
+
+        Ok(())
+    }
+
+    pub struct TursoServer {
+        user_url: String,
+        db_url: String,
+        host: String,
+        server: Option<Child>,
+        client: Client,
+    }
+
+    impl TursoServer {
+        pub async fn new() -> Result<Self> {
+            let client = Client::new();
+
+            if env::var("LOCAL_SYNC_SERVER").is_err() {
+                let name = random_str();
+                let tokens: Vec<&str> = USER_URL.split("://").collect();
+
+                handle_response(
+                    client
+                        .post(format!("{ADMIN_URL}/v1/tenants/{name}"))
+                        .send()
+                        .await?,
+                )
+                .await?;
+                handle_response(
+                    client
+                        .post(format!("{ADMIN_URL}/v1/tenants/{name}/groups/{name}"))
+                        .send()
+                        .await?,
+                )
+                .await?;
+                handle_response(
+                    client
+                        .post(format!(
+                            "{ADMIN_URL}/v1/tenants/{name}/groups/{name}/databases/{name}"
+                        ))
+                        .send()
+                        .await?,
+                )
+                .await?;
+
+                Ok(Self {
+                    user_url: USER_URL.to_string(),
+                    db_url: format!("{}://{}--{}--{}.{}", tokens[0], name, name, name, tokens[1]),
+                    host: format!("{name}--{name}--{name}.localhost"),
+                    server: None,
+                    client,
+                })
+            } else {
+                let port: u16 = rand::rng().random_range(10_000..=65_535);
+                let server_bin = env::var("LOCAL_SYNC_SERVER").unwrap();
+
+                let child = Command::new(server_bin)
+                    .args(["--sync-server", &format!("0.0.0.0:{port}")])
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .context("failed to spawn local sync server")?;
+
+                let user_url = format!("http://localhost:{port}");
+
+                // wait for server readiness
+                loop {
+                    if client.get(&user_url).send().await.is_ok() {
+                        break;
+                    }
+                    sleep(Duration::from_millis(100));
+                }
+
+                Ok(Self {
+                    user_url: user_url.clone(),
+                    db_url: user_url,
+                    host: String::new(),
+                    server: Some(child),
+                    client,
+                })
+            }
+        }
+
+        pub fn db_url(&self) -> &str {
+            &self.db_url
+        }
+
+        pub async fn db_sql(&self, sql: &str) -> Result<Vec<Vec<Value>>> {
+            let resp = self
+                .client
+                .post(format!("{}/v2/pipeline", self.user_url))
+                .header("Host", &self.host)
+                .json(&json!({
+                    "requests": [{
+                        "type": "execute",
+                        "stmt": { "sql": sql }
+                    }]
+                }))
+                .send()
+                .await?
+                .error_for_status()?;
+
+            let value: serde_json::Value = resp.json().await?;
+
+            let result = &value["results"][0];
+            if result["type"] != "ok" {
+                return Err(anyhow!("remote sql execution failed: {value}"));
+            }
+
+            let rows = result["response"]["result"]["rows"]
+                .as_array()
+                .ok_or_else(|| anyhow!("invalid response shape"))?;
+
+            Ok(rows
+                .iter()
+                .map(|row| {
+                    row.as_array()
+                        .unwrap()
+                        .iter()
+                        .map(|cell| match cell["value"].clone() {
+                            serde_json::Value::Null => Value::Null,
+                            serde_json::Value::Number(number) => {
+                                if number.is_i64() {
+                                    Value::Integer(number.as_i64().unwrap())
+                                } else {
+                                    Value::Real(number.as_f64().unwrap())
+                                }
+                            }
+                            serde_json::Value::String(s) => Value::Text(s),
+                            _ => panic!("unexpected json output"),
+                        })
+                        .collect()
+                })
+                .collect())
+        }
+    }
+
+    impl Drop for TursoServer {
+        fn drop(&mut self) {
+            if let Some(child) = &mut self.server {
+                let _ = child.kill();
+            }
+        }
+    }
+
+    async fn all_rows(mut rows: Rows) -> Result<Vec<Vec<Value>>> {
+        let mut result = Vec::new();
+        while let Some(row) = rows.next().await? {
+            result.push(row.values.into_iter().map(|x| x.into()).collect());
+        }
+        Ok(result)
+    }
+
+    #[tokio::test]
+    pub async fn kek() {
+        let _ = tracing_subscriber::fmt::try_init();
+        let db =
+            crate::sync::Builder::new_remote(":memory:", "http://rs2--rs2--rs2.localhost:8080")
+                .build()
+                .await
+                .unwrap();
+        let conn = db.connect().await.unwrap();
+    }
+
+    #[tokio::test]
+    pub async fn test_sync_bootstrap() {
+        let _ = tracing_subscriber::fmt::try_init();
+        let server = TursoServer::new().await.unwrap();
+        server.db_sql("CREATE TABLE t(x)").await.unwrap();
+        server
+            .db_sql("INSERT INTO t VALUES ('hello'), ('turso'), ('sync')")
+            .await
+            .unwrap();
+        server.db_sql("SELECT * FROM t").await.unwrap();
+        let db = crate::sync::Builder::new_remote(":memory:", server.db_url())
+            .build()
+            .await
+            .unwrap();
+        let conn = db.connect().await.unwrap();
+        let rows = conn.query("SELECT * FROM t", ()).await.unwrap();
+        let all = all_rows(rows).await.unwrap();
+        assert_eq!(
+            all,
+            vec![
+                vec![Value::Text("hello".to_string())],
+                vec![Value::Text("turso".to_string())],
+                vec![Value::Text("sync".to_string())],
+            ]
+        );
+    }
+
+    #[tokio::test]
+    pub async fn test_sync_pull() {
+        let _ = tracing_subscriber::fmt::try_init();
+        let server = TursoServer::new().await.unwrap();
+        server.db_sql("CREATE TABLE t(x)").await.unwrap();
+        server
+            .db_sql("INSERT INTO t VALUES ('hello'), ('turso'), ('sync')")
+            .await
+            .unwrap();
+        server.db_sql("SELECT * FROM t").await.unwrap();
+        let db = crate::sync::Builder::new_remote(":memory:", server.db_url())
+            .build()
+            .await
+            .unwrap();
+        let conn = db.connect().await.unwrap();
+        let rows = conn.query("SELECT * FROM t", ()).await.unwrap();
+        let all = all_rows(rows).await.unwrap();
+        assert_eq!(
+            all,
+            vec![
+                vec![Value::Text("hello".to_string())],
+                vec![Value::Text("turso".to_string())],
+                vec![Value::Text("sync".to_string())],
+            ]
+        );
+
+        server
+            .db_sql("INSERT INTO t VALUES ('pull works')")
+            .await
+            .unwrap();
+
+        let rows = conn.query("SELECT * FROM t", ()).await.unwrap();
+        let all = all_rows(rows).await.unwrap();
+        assert_eq!(
+            all,
+            vec![
+                vec![Value::Text("hello".to_string())],
+                vec![Value::Text("turso".to_string())],
+                vec![Value::Text("sync".to_string())],
+            ]
+        );
+
+        db.pull().await.unwrap();
+
+        let rows = conn.query("SELECT * FROM t", ()).await.unwrap();
+        let all = all_rows(rows).await.unwrap();
+        assert_eq!(
+            all,
+            vec![
+                vec![Value::Text("hello".to_string())],
+                vec![Value::Text("turso".to_string())],
+                vec![Value::Text("sync".to_string())],
+                vec![Value::Text("pull works".to_string())],
+            ]
+        );
+    }
+
+    #[tokio::test]
+    pub async fn test_sync_push() {
+        let _ = tracing_subscriber::fmt::try_init();
+        let server = TursoServer::new().await.unwrap();
+        server.db_sql("CREATE TABLE t(x)").await.unwrap();
+        server
+            .db_sql("INSERT INTO t VALUES ('hello'), ('turso'), ('sync')")
+            .await
+            .unwrap();
+        server.db_sql("SELECT * FROM t").await.unwrap();
+        let db = crate::sync::Builder::new_remote(":memory:", server.db_url())
+            .build()
+            .await
+            .unwrap();
+        let conn = db.connect().await.unwrap();
+        let rows = conn.query("SELECT * FROM t", ()).await.unwrap();
+        let all = all_rows(rows).await.unwrap();
+        assert_eq!(
+            all,
+            vec![
+                vec![Value::Text("hello".to_string())],
+                vec![Value::Text("turso".to_string())],
+                vec![Value::Text("sync".to_string())],
+            ]
+        );
+
+        conn.execute("INSERT INTO t VALUES ('push works')", ())
+            .await
+            .unwrap();
+
+        let all = server.db_sql("SELECT * FROM t").await.unwrap();
+        assert_eq!(
+            all,
+            vec![
+                vec![Value::Text("hello".to_string())],
+                vec![Value::Text("turso".to_string())],
+                vec![Value::Text("sync".to_string())],
+            ]
+        );
+
+        db.push().await.unwrap();
+
+        let rows = conn.query("SELECT * FROM t", ()).await.unwrap();
+        let all = all_rows(rows).await.unwrap();
+        assert_eq!(
+            all,
+            vec![
+                vec![Value::Text("hello".to_string())],
+                vec![Value::Text("turso".to_string())],
+                vec![Value::Text("sync".to_string())],
+                vec![Value::Text("push works".to_string())],
+            ]
+        );
+    }
+
+    #[tokio::test]
+    pub async fn test_sync_checkpoint() {
+        let _ = tracing_subscriber::fmt::try_init();
+        let server = TursoServer::new().await.unwrap();
+        let db = crate::sync::Builder::new_remote(":memory:", server.db_url())
+            .build()
+            .await
+            .unwrap();
+        let conn = db.connect().await.unwrap();
+        conn.execute("CREATE TABLE t(x)", ()).await.unwrap();
+        for i in 0..1024 {
+            conn.execute("INSERT INTO t VALUES (?)", (i,))
+                .await
+                .unwrap();
+        }
+
+        let stats1 = db.stats().await.unwrap();
+        assert!(stats1.main_wal_size > 1024 * 1024);
+        db.checkpoint().await.unwrap();
+        let stats2 = db.stats().await.unwrap();
+        assert!(stats2.main_wal_size < 8 * 1024);
+    }
+
+    #[tokio::test]
+    pub async fn test_sync_partial() {
+        let _ = tracing_subscriber::fmt::try_init();
+        let server = TursoServer::new().await.unwrap();
+        server.db_sql("CREATE TABLE t(x)").await.unwrap();
+        server
+            .db_sql("INSERT INTO t SELECT randomblob(1024) FROM generate_series(1, 2000)")
+            .await
+            .unwrap();
+        {
+            let full_db = crate::sync::Builder::new_remote(":memory:", server.db_url())
+                .build()
+                .await
+                .unwrap();
+            let conn = full_db.connect().await.unwrap();
+            let _ = all_rows(
+                conn.query("SELECT LENGTH(x) FROM t LIMIT 1", ())
+                    .await
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+            assert!(full_db.stats().await.unwrap().network_received_bytes > 2000 * 1024);
+        }
+        {
+            let partial_db = crate::sync::Builder::new_remote(":memory:", server.db_url())
+                .with_partial_sync_opts_experimental(PartialSyncOpts {
+                    bootstrap_strategy: PartialBootstrapStrategy::Prefix { length: 128 * 1024 },
+                    segment_size: 128 * 1024,
+                    prefetch: false,
+                })
+                .build()
+                .await
+                .unwrap();
+            let conn = partial_db.connect().await.unwrap();
+            let _ = all_rows(
+                conn.query("SELECT LENGTH(x) FROM t LIMIT 1", ())
+                    .await
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+            assert!(partial_db.stats().await.unwrap().network_received_bytes < 256 * (1024 + 10));
+            let before = tokio::time::Instant::now();
+            let all = all_rows(
+                conn.query("SELECT SUM(LENGTH(x)) FROM t", ())
+                    .await
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+            println!(
+                "duration: {:?}",
+                tokio::time::Instant::now().duration_since(before)
+            );
+            assert_eq!(all, vec![vec![Value::Integer(2000 * 1024)]]);
+            assert!(partial_db.stats().await.unwrap().network_received_bytes > 2000 * 1024);
+        }
+    }
+
+    #[tokio::test]
+    pub async fn test_sync_partial_segment_size() {
+        let _ = tracing_subscriber::fmt::try_init();
+        let server = TursoServer::new().await.unwrap();
+        server.db_sql("CREATE TABLE t(x)").await.unwrap();
+        server
+            .db_sql("INSERT INTO t SELECT randomblob(1024) FROM generate_series(1, 256)")
+            .await
+            .unwrap();
+        {
+            let full_db = crate::sync::Builder::new_remote(":memory:", server.db_url())
+                .build()
+                .await
+                .unwrap();
+            let conn = full_db.connect().await.unwrap();
+            let _ = all_rows(
+                conn.query("SELECT LENGTH(x) FROM t LIMIT 1", ())
+                    .await
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+            assert!(full_db.stats().await.unwrap().network_received_bytes > 256 * 1024);
+        }
+        {
+            let partial_db = crate::sync::Builder::new_remote(":memory:", server.db_url())
+                .with_partial_sync_opts_experimental(PartialSyncOpts {
+                    bootstrap_strategy: PartialBootstrapStrategy::Prefix { length: 128 * 1024 },
+                    segment_size: 4 * 1024,
+                    prefetch: false,
+                })
+                .build()
+                .await
+                .unwrap();
+            let conn = partial_db.connect().await.unwrap();
+            let _ = all_rows(
+                conn.query("SELECT LENGTH(x) FROM t LIMIT 1", ())
+                    .await
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+            assert!(partial_db.stats().await.unwrap().network_received_bytes < 128 * 1024 * 3 / 2);
+            let before = tokio::time::Instant::now();
+            let all = all_rows(
+                conn.query("SELECT SUM(LENGTH(x)) FROM t", ())
+                    .await
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+            println!(
+                "duration segment size: {:?}",
+                tokio::time::Instant::now().duration_since(before)
+            );
+            assert_eq!(all, vec![vec![Value::Integer(256 * 1024)]]);
+            assert!(partial_db.stats().await.unwrap().network_received_bytes > 256 * 1024);
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    pub async fn test_sync_partial_prefetch() {
+        let _ = tracing_subscriber::fmt::try_init();
+        let server = TursoServer::new().await.unwrap();
+        server.db_sql("CREATE TABLE t(x)").await.unwrap();
+        server
+            .db_sql("INSERT INTO t SELECT randomblob(1024) FROM generate_series(1, 2000)")
+            .await
+            .unwrap();
+        {
+            let full_db = crate::sync::Builder::new_remote(":memory:", server.db_url())
+                .build()
+                .await
+                .unwrap();
+            let conn = full_db.connect().await.unwrap();
+            let _ = all_rows(
+                conn.query("SELECT LENGTH(x) FROM t LIMIT 1", ())
+                    .await
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+            assert!(full_db.stats().await.unwrap().network_received_bytes > 2000 * 1024);
+        }
+        {
+            let partial_db = crate::sync::Builder::new_remote(":memory:", server.db_url())
+                .with_partial_sync_opts_experimental(PartialSyncOpts {
+                    bootstrap_strategy: PartialBootstrapStrategy::Prefix { length: 128 * 1024 },
+                    segment_size: 128 * 1024,
+                    prefetch: true,
+                })
+                .build()
+                .await
+                .unwrap();
+            let conn = partial_db.connect().await.unwrap();
+            let _ = all_rows(
+                conn.query("SELECT LENGTH(x) FROM t LIMIT 1", ())
+                    .await
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+            assert!(partial_db.stats().await.unwrap().network_received_bytes < 1300 * (1024 + 10));
+            let before = tokio::time::Instant::now();
+            let all = all_rows(
+                conn.query("SELECT SUM(LENGTH(x)) FROM t", ())
+                    .await
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+            println!(
+                "duration prefetch: {:?}",
+                tokio::time::Instant::now().duration_since(before)
+            );
+            assert_eq!(all, vec![vec![Value::Integer(2000 * 1024)]]);
+            assert!(partial_db.stats().await.unwrap().network_received_bytes > 2000 * 1024);
+        }
     }
 }

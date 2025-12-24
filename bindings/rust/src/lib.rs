@@ -39,9 +39,11 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 pub mod connection;
 pub mod params;
 mod rows;
-pub mod sync;
 pub mod transaction;
 pub mod value;
+
+// #[cfg(feature = "sync")]
+pub mod sync;
 
 pub use connection::Connection;
 pub use value::Value;
@@ -242,7 +244,7 @@ impl Statement {
             turso_sdk_kit::rsapi::TursoStatusCode::Io => {
                 stmt.run_io()?;
                 if let Some(extra_io) = &self.conn.extra_io {
-                    extra_io()?;
+                    extra_io(cx.waker().clone())?;
                 }
                 Poll::Pending
             }
