@@ -1,5 +1,6 @@
 use std::{
     future::Future,
+    io::ErrorKind,
     pin::Pin,
     sync::{Arc, Mutex},
     task::{Context, Poll, Waker},
@@ -578,6 +579,7 @@ impl IoWorker {
                 completion.push_buffer(Bytes::from(content));
                 completion.done();
             }
+            Err(err) if err.kind() == ErrorKind::NotFound => completion.done(),
             Err(err) => {
                 completion.poison(format!("full read failed for {path}: {err}"));
             }
@@ -619,6 +621,7 @@ mod tests {
         thread::sleep,
         time::Duration,
     };
+    use tempfile::TempDir;
     use turso_sync_sdk_kit::rsapi::PartialBootstrapStrategy;
 
     use crate::sync::PartialSyncOpts;
@@ -812,6 +815,37 @@ mod tests {
             .build()
             .await
             .unwrap();
+        let conn = db.connect().await.unwrap();
+        let rows = conn.query("SELECT * FROM t", ()).await.unwrap();
+        let all = all_rows(rows).await.unwrap();
+        assert_eq!(
+            all,
+            vec![
+                vec![Value::Text("hello".to_string())],
+                vec![Value::Text("turso".to_string())],
+                vec![Value::Text("sync".to_string())],
+            ]
+        );
+    }
+
+    #[tokio::test]
+    pub async fn test_sync_bootstrap_persistence() {
+        let _ = tracing_subscriber::fmt::try_init();
+        let dir = TempDir::new().unwrap();
+        let server = TursoServer::new().await.unwrap();
+        server.db_sql("CREATE TABLE t(x)").await.unwrap();
+        server
+            .db_sql("INSERT INTO t VALUES ('hello'), ('turso'), ('sync')")
+            .await
+            .unwrap();
+        server.db_sql("SELECT * FROM t").await.unwrap();
+        let db = crate::sync::Builder::new_remote(
+            dir.path().join("local.db").to_str().unwrap(),
+            server.db_url(),
+        )
+        .build()
+        .await
+        .unwrap();
         let conn = db.connect().await.unwrap();
         let rows = conn.query("SELECT * FROM t", ()).await.unwrap();
         let all = all_rows(rows).await.unwrap();
