@@ -39,6 +39,7 @@ static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 pub mod connection;
 pub mod params;
 mod rows;
+pub mod sync;
 pub mod transaction;
 pub mod value;
 
