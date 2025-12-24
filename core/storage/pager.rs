@@ -3353,17 +3353,40 @@ impl Pager {
         }
     }
 
+    #[instrument(skip_all, level = Level::DEBUG)]
+    /// checkpoint_keep_lock checkpoints the WAL to the database file (if needed) and keeps the lock
+    pub fn checkpoint_keep_lock(
+        &self,
+        mode: CheckpointMode,
+        sync_mode: crate::SyncMode,
+        clear_page_cache: bool,
+    ) -> Result<IOResult<CheckpointResult>> {
+        self.checkpoint_inner(mode, sync_mode, clear_page_cache, true)
+    }
+
+    #[instrument(skip_all, level = Level::DEBUG)]
+    /// checkpoint checkpoints the WAL to the database file (if needed) and drops the lock
+    pub fn checkpoint(
+        &self,
+        mode: CheckpointMode,
+        sync_mode: crate::SyncMode,
+        clear_page_cache: bool,
+    ) -> Result<IOResult<CheckpointResult>> {
+        self.checkpoint_inner(mode, sync_mode, clear_page_cache, false)
+    }
+
     #[instrument(skip_all, level = Level::DEBUG, name = "pager_checkpoint",)]
     /// Checkpoint the WAL to the database file (if needed).
     /// Args:
     /// - mode: The checkpoint mode to use (PASSIVE, FULL, RESTART, TRUNCATE)
     /// - sync_mode: The fsync mode to use (OFF, NORMAL, FULL)
     /// - clear_page_cache: Whether to clear the page cache after checkpointing
-    pub fn checkpoint(
+    fn checkpoint_inner(
         &self,
         mode: CheckpointMode,
         sync_mode: crate::SyncMode,
         clear_page_cache: bool,
+        keep_lock: bool,
     ) -> Result<IOResult<CheckpointResult>> {
         let Some(wal) = self.wal.as_ref() else {
             return Err(LimboError::InternalError(
@@ -3491,8 +3514,10 @@ impl Pager {
                     let mut state = self.checkpoint_state.write();
                     let mut res = state.result.take().expect("result should be set");
 
-                    // Release checkpoint guard
-                    res.release_guard();
+                    // Release checkpoint guard if lock is not to be kept
+                    if !keep_lock {
+                        res.release_guard();
+                    }
 
                     // Clear page cache only if requested (explicit checkpoints do this, auto-checkpoint does not)
                     if clear_page_cache {
@@ -3587,6 +3612,16 @@ impl Pager {
         sync_mode: crate::SyncMode,
     ) -> Result<CheckpointResult> {
         self.io.block(|| self.checkpoint(mode, sync_mode, true))
+    }
+
+    #[instrument(skip_all, level = Level::DEBUG)]
+    pub fn blocking_checkpoint_keep_lock(
+        &self,
+        mode: CheckpointMode,
+        sync_mode: crate::SyncMode,
+    ) -> Result<CheckpointResult> {
+        self.io
+            .block(|| self.checkpoint_keep_lock(mode, sync_mode, true))
     }
 
     pub fn freepage_list(&self) -> u32 {

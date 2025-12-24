@@ -2012,6 +2012,73 @@ impl Connection {
         }
     }
 
+    /// Create a point-in-time snapshot of the database by copying the database file.
+    #[cfg(feature = "fs")]
+    pub fn snapshot(self: &Arc<Self>, output_path: &str) -> Result<()> {
+        self._snapshot_copy_file(output_path)
+    }
+
+    /// Create a point-in-time snapshot of the database by copying the database file.
+    ///
+    /// It checkpoints and keeps the lock after checkpointing to avoid race window between
+    /// checkpoint completion and file copy operation where concurrent writers could modify
+    /// the database.
+    #[cfg(feature = "fs")]
+    pub fn _snapshot_copy_file(self: &Arc<Self>, output_path: &str) -> Result<()> {
+        use crate::util::MEMORY_PATH;
+        use std::path::Path;
+
+        if self.is_closed() {
+            return Err(LimboError::InternalError("Connection closed".to_string()));
+        }
+
+        // FIXME: enable mvcc
+        if self.mvcc_enabled() {
+            return Err(LimboError::InternalError(
+                "Snapshot not yet supported with MVCC mode".to_string(),
+            ));
+        }
+
+        // Cannot snapshot in-memory databases
+        if self.db.path == MEMORY_PATH {
+            return Err(LimboError::InvalidArgument(
+                "Cannot snapshot in-memory database".to_string(),
+            ));
+        }
+
+        let path = Path::new(output_path);
+        if path.exists() {
+            return Err(LimboError::InvalidArgument(format!(
+                "Output file already exists: {output_path}"
+            )));
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                LimboError::InternalError(format!("Failed to create parent directory: {e}"))
+            })?;
+        }
+
+        let pager = self.pager.load();
+        let result = (|| -> Result<()> {
+            // Checkpoint and keep the lock
+            let _res = pager.blocking_checkpoint_keep_lock(
+                CheckpointMode::Truncate {
+                    upper_bound_inclusive: None,
+                },
+                self.get_sync_mode(),
+            )?;
+
+            let source_path = Path::new(&self.db.path);
+            std::fs::copy(source_path, path).map_err(|e| {
+                LimboError::InternalError(format!("Failed to copy database file: {e}"))
+            })?;
+
+            Ok(()) // lock is dropped here when _res is dropped here
+        })();
+
+        result
+    }
+
     /// Close a connection and checkpoint.
     pub fn close(&self) -> Result<()> {
         if self.is_closed() {
