@@ -64,12 +64,14 @@ jobs:
           RUST_LOG: ${{ runner.debug && 'turso_core::storage=trace' || '' }}
           SCCACHE_GHA_ENABLED: "true"
           RUSTC_WRAPPER: "sccache"
+          LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
         run: cargo nextest run --workspace --all-features --locked --no-fail-fast -E 'not test(/^fuzz_tests::/)'
         timeout-minutes: 20
       - name: Test doctests
         env:
           SCCACHE_GHA_ENABLED: "true"
           RUSTC_WRAPPER: "sccache"
+          LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
         run: cargo test --workspace --all-features --doc --locked
 
   clippy:
