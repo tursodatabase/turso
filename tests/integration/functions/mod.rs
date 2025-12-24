@@ -1,4 +1,5 @@
 mod test_cdc;
 mod test_function_rowid;
+mod test_snapshot;
 mod test_sum;
 mod test_wal_api;
