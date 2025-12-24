@@ -49,7 +49,11 @@ pub struct Connection {
     ///
     /// By default, the value is [DropBehavior::Ignore] which effectively does nothing.
     pub(crate) dangling_tx: AtomicDropBehavior,
+    pub(crate) extra_io: Option<Arc<dyn Fn() -> Result<()>>>,
 }
+
+unsafe impl Send for Connection {}
+unsafe impl Sync for Connection {}
 
 impl Clone for Connection {
     fn clone(&self) -> Self {
@@ -57,17 +61,22 @@ impl Clone for Connection {
             inner: self.inner.clone(),
             transaction_behavior: self.transaction_behavior,
             dangling_tx: AtomicDropBehavior::new(self.dangling_tx.load(Ordering::SeqCst)),
+            extra_io: self.extra_io.clone(),
         }
     }
 }
 
 impl Connection {
-    pub fn create(conn: Arc<turso_sdk_kit::rsapi::TursoConnection>) -> Self {
+    pub fn create(
+        conn: Arc<turso_sdk_kit::rsapi::TursoConnection>,
+        extra_io: Option<Arc<dyn Fn() -> Result<()>>>,
+    ) -> Self {
         #[allow(clippy::arc_with_non_send_sync)]
         let connection = Connection {
             inner: Some(conn),
             transaction_behavior: TransactionBehavior::Deferred,
             dangling_tx: AtomicDropBehavior::new(DropBehavior::Ignore),
+            extra_io,
         };
         connection
     }
@@ -130,6 +139,7 @@ impl Connection {
 
         #[allow(clippy::arc_with_non_send_sync)]
         let statement = Statement {
+            conn: self.clone(),
             inner: Arc::new(Mutex::new(stmt)),
         };
         Ok(statement)
@@ -139,76 +149,45 @@ impl Connection {
         self.maybe_handle_dangling_tx().await?;
         let conn = self.get_inner_connection()?;
         let mut sql = sql.as_ref();
-        while let Some((mut stmt, offset)) = conn.prepare_first(sql)? {
-            loop {
-                match stmt.step(None)? {
-                    turso_sdk_kit::rsapi::TursoStatusCode::Done => break,
-                    turso_sdk_kit::rsapi::TursoStatusCode::Row => continue,
-                    turso_sdk_kit::rsapi::TursoStatusCode::Io => stmt.run_io()?,
-                }
-            }
+        while let Some((stmt, offset)) = conn.prepare_first(sql)? {
+            let mut stmt = Statement {
+                conn: self.clone(),
+                inner: Arc::new(Mutex::new(stmt)),
+            };
+            let _ = stmt.execute(()).await?;
             sql = &sql[offset..];
         }
         Ok(())
     }
 
     /// Query a pragma.
-    pub fn pragma_query<F>(&self, pragma_name: &str, mut f: F) -> Result<()>
+    pub async fn pragma_query<F>(&self, pragma_name: &str, mut f: F) -> Result<()>
     where
         F: FnMut(&Row) -> std::result::Result<(), turso_sdk_kit::rsapi::TursoError>,
     {
-        let conn = self.get_inner_connection()?;
-        let mut stmt = conn.prepare_single(format!("PRAGMA {pragma_name}"))?;
-        let mut values = Vec::with_capacity(stmt.column_count());
-        loop {
-            match stmt.step(None)? {
-                turso_sdk_kit::rsapi::TursoStatusCode::Done => break,
-                turso_sdk_kit::rsapi::TursoStatusCode::Io => {
-                    stmt.run_io()?;
-                    continue;
-                }
-                turso_sdk_kit::rsapi::TursoStatusCode::Row => {
-                    assert!(values.is_empty());
-                    for i in 0..stmt.column_count() {
-                        values.push(stmt.row_value(i)?.to_owned());
-                    }
-                    let row = Row { values };
-                    f(&row)?;
-
-                    values = row.values;
-                    values.clear();
-                }
-            }
+        let sql = format!("PRAGMA {pragma_name}");
+        let mut stmt = self.prepare(&sql).await?;
+        let mut rows = stmt.query(()).await?;
+        while let Some(row) = rows.next().await? {
+            f(&row)?;
         }
         Ok(())
     }
 
     /// Set a pragma value.
-    pub fn pragma_update<V: std::fmt::Display>(
+    pub async fn pragma_update<V: std::fmt::Display>(
         &self,
         pragma_name: &str,
         pragma_value: V,
     ) -> Result<Vec<Row>> {
-        let conn = self.get_inner_connection()?;
-        let mut stmt = conn.prepare_single(format!("PRAGMA {pragma_name} = {pragma_value}"))?;
-        let mut rows = Vec::new();
-        loop {
-            match stmt.step(None)? {
-                turso_sdk_kit::rsapi::TursoStatusCode::Done => break,
-                turso_sdk_kit::rsapi::TursoStatusCode::Io => {
-                    stmt.run_io()?;
-                    continue;
-                }
-                turso_sdk_kit::rsapi::TursoStatusCode::Row => {
-                    let mut values = Vec::with_capacity(stmt.column_count());
-                    for i in 0..stmt.column_count() {
-                        values.push(stmt.row_value(i)?.to_owned());
-                    }
-                    rows.push(Row { values });
-                }
-            }
+        let sql = format!("PRAGMA {pragma_name} = {pragma_value}");
+        let mut stmt = self.prepare(&sql).await?;
+        let mut rows = stmt.query(()).await?;
+        let mut collected = Vec::new();
+        while let Some(row) = rows.next().await? {
+            collected.push(row);
         }
-        Ok(rows)
+        Ok(collected)
     }
 
     /// Returns the rowid of the last row inserted.
