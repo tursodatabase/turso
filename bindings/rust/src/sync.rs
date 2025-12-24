@@ -1,11 +1,7 @@
 use std::{
-    collections::HashMap,
     future::Future,
     pin::Pin,
-    sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc, Mutex,
-    },
+    sync::{Arc, Mutex},
     task::{Context, Poll, Waker},
     time::Duration,
 };
@@ -216,7 +212,7 @@ impl Database {
                 // Provide extra_io callback to kick IO worker when driver needs to make progress.
                 let io = self.io.clone();
                 let extra_io = Arc::new(move |waker| {
-                    io.register(None, waker);
+                    io.register(waker);
                     io.kick();
                     Ok(())
                 });
@@ -251,7 +247,6 @@ async fn drive_operation_result(
 struct AsyncOpFuture {
     op: Option<Box<turso_sync_sdk_kit::turso_async_operation::TursoDatabaseAsyncOperation>>,
     io: Arc<IoWorker>,
-    waker_id: Option<u64>,
 }
 
 impl AsyncOpFuture {
@@ -259,11 +254,7 @@ impl AsyncOpFuture {
         op: Box<turso_sync_sdk_kit::turso_async_operation::TursoDatabaseAsyncOperation>,
         io: Arc<IoWorker>,
     ) -> Self {
-        Self {
-            op: Some(op),
-            io,
-            waker_id: None,
-        }
+        Self { op: Some(op), io }
     }
 }
 
@@ -279,8 +270,7 @@ impl Future for AsyncOpFuture {
             )));
         };
 
-        let waker_id = this.io.register(this.waker_id, cx.waker().clone());
-        this.waker_id = Some(waker_id);
+        this.io.register(cx.waker().clone());
 
         // Try to resume the operation.
         match op.resume() {
@@ -296,7 +286,6 @@ impl Future for AsyncOpFuture {
                 })?;
                 // Drop the op and complete.
                 this.op.take();
-                this.io.unregister(waker_id);
                 Poll::Ready(Ok(result))
             }
             Ok(turso_sdk_kit::rsapi::TursoStatusCode::Io) => {
@@ -311,10 +300,7 @@ impl Future for AsyncOpFuture {
                     "unexpected row status in sync operation".to_string(),
                 )))
             }
-            Err(e) => {
-                this.io.unregister(waker_id);
-                Poll::Ready(Err(Error::from(e)))
-            }
+            Err(e) => Poll::Ready(Err(Error::from(e))),
         }
     }
 }
@@ -348,9 +334,7 @@ struct IoWorker {
     // Channel to wake the worker to process IO.
     tx: mpsc::UnboundedSender<()>,
     // Wakers to notify pending futures when IO makes progress.
-    wakers: Arc<Mutex<HashMap<u64, Waker>>>,
-    // last registered waker id
-    waker_id: AtomicU64,
+    wakers: Arc<Mutex<Vec<Waker>>>,
 }
 
 impl IoWorker {
@@ -360,7 +344,7 @@ impl IoWorker {
         auth_token: Option<String>,
     ) -> Arc<Self> {
         let (tx, rx) = mpsc::unbounded_channel::<()>();
-        let wakers = Arc::new(Mutex::new(HashMap::new()));
+        let wakers = Arc::new(Mutex::new(Vec::new()));
 
         let worker = Arc::new(Self {
             sync,
@@ -368,7 +352,6 @@ impl IoWorker {
             auth_token,
             tx,
             wakers: wakers.clone(),
-            waker_id: AtomicU64::new(0),
         });
 
         // Spin a separate Tokio runtime on its own thread to process IO queue.
@@ -391,21 +374,9 @@ impl IoWorker {
     }
 
     // Register a waker to be awakened upon IO progress.
-    fn register(&self, waker_id: Option<u64>, waker: Waker) -> u64 {
+    fn register(&self, waker: Waker) {
         let mut wakers = self.wakers.lock().unwrap();
-        let waker_id = if let Some(waker_id) = waker_id {
-            waker_id
-        } else {
-            self.waker_id.fetch_add(1, Ordering::SeqCst)
-        };
-        wakers.insert(waker_id, waker);
-        waker_id
-    }
-
-    // Unregister a waker
-    fn unregister(&self, waker_id: u64) {
-        let mut wakers = self.wakers.lock().unwrap();
-        wakers.remove(&waker_id);
+        wakers.push(waker);
     }
 
     // Kick the IO worker to process IO queue.
@@ -414,9 +385,12 @@ impl IoWorker {
     }
 
     // Called from the IO thread once progress has been made to notify all pending futures.
-    fn notify_progress(wakers: &Arc<Mutex<HashMap<u64, Waker>>>) {
-        let guard = wakers.lock().unwrap().drain().collect::<Vec<_>>();
-        for (_, w) in guard {
+    fn notify_progress(wakers: &Arc<Mutex<Vec<Waker>>>) {
+        let wakers = {
+            let mut guard = wakers.lock().unwrap();
+            std::mem::take(&mut *guard)
+        };
+        for w in wakers {
             w.wake();
         }
     }
@@ -424,7 +398,7 @@ impl IoWorker {
     async fn run_loop(
         this: Arc<IoWorker>,
         mut rx: mpsc::UnboundedReceiver<()>,
-        wakers: Arc<Mutex<HashMap<u64, Waker>>>,
+        wakers: Arc<Mutex<Vec<Waker>>>,
     ) {
         // Create HTTPS-capable Hyper client.
         let mut http_connector = HttpConnector::new();
