@@ -180,8 +180,19 @@ impl Sorter {
             match self.records.pop() {
                 Some(ptr) => {
                     // SAFETY: ptr is valid - arena hasn't been reset yet.
-                    let record = unsafe { ptr.as_ref() };
-                    self.current = Some(record.to_immutable_record());
+                    let arena_record = unsafe { ptr.as_ref() };
+                    let payload = arena_record.payload();
+
+                    match &mut self.current {
+                        Some(record) => {
+                            record.invalidate();
+                            record.start_serialization(payload);
+                        }
+                        None => {
+                            self.current = Some(arena_record.to_immutable_record());
+                        }
+                    }
+
                     if self.records.is_empty() {
                         self.arena.reset();
                     }
@@ -195,7 +206,16 @@ impl Sorter {
                     if let Some(ref error) = boxed_record.deserialization_error {
                         return Err(error.clone());
                     }
-                    self.current = Some(boxed_record.record);
+                    let payload = boxed_record.record.get_payload();
+                    match &mut self.current {
+                        Some(record) => {
+                            record.invalidate();
+                            record.start_serialization(payload);
+                        }
+                        None => {
+                            self.current = Some(boxed_record.record);
+                        }
+                    }
                 }
                 None => self.current = None,
             }
