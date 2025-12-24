@@ -3,6 +3,7 @@ use std::{
     fmt::Display,
     sync::{Arc, Mutex, Once, RwLock},
     task::Waker,
+    time::Duration,
 };
 
 use tracing::level_filters::LevelFilter;
@@ -26,6 +27,8 @@ use crate::{
 assert_send!(TursoDatabase, TursoConnection, TursoStatement);
 assert_sync!(TursoDatabase);
 
+pub use turso_core::types::FromValue;
+pub type EncryptionOpts = turso_core::EncryptionOpts;
 pub type Value = turso_core::Value;
 pub type ValueRef<'a> = turso_core::types::ValueRef<'a>;
 pub type Text = turso_core::types::Text;
@@ -82,10 +85,9 @@ impl TursoSetupConfig {
     /// [c::turso_config_t::log_level] field must be valid C-string pointer or null
     pub unsafe fn from_capi(config: *const c::turso_config_t) -> Result<Self, TursoError> {
         if config.is_null() {
-            return Err(TursoError {
-                code: TursoStatusCode::Misuse,
-                message: Some("config pointer must be not null".to_string()),
-            });
+            return Err(TursoError::Misuse(
+                "config pointer must be not null".to_string(),
+            ));
         }
         let config = *config;
         Ok(Self {
@@ -116,6 +118,17 @@ pub struct TursoDatabaseConfig {
     /// if false, library will spin IO itself in case of Io status code and never return it to the caller
     pub async_io: bool,
 
+    /// optional encryption parameters for local data encryption
+    /// as encryption is experimental - [Self::experimental_features] must have "encryption" in the list
+    pub encryption: Option<EncryptionOpts>,
+
+    /// optional VFS parameter explicitly specifying FS backend for the database.
+    /// Available options are:
+    /// - "memory": in-memory backend
+    /// - "syscall": generic syscall backend
+    /// - "io_uring": IO uring (supported only on Linux)
+    pub vfs: Option<String>,
+
     /// optional custom IO provided by the caller
     pub io: Option<Arc<dyn IO>>,
 
@@ -135,20 +148,16 @@ pub fn turso_slice_from_bytes(bytes: &[u8]) -> capi::c::turso_slice_ref_t {
 /// ptr must be valid C-string pointer or null
 pub unsafe fn str_from_c_str<'a>(ptr: *const std::ffi::c_char) -> Result<&'a str, TursoError> {
     if ptr.is_null() {
-        return Err(TursoError {
-            code: TursoStatusCode::Misuse,
-            message: Some("expected zero terminated c string, got null pointer".to_string()),
-        });
+        return Err(TursoError::Misuse(
+            "expected zero terminated c string, got null pointer".to_string(),
+        ));
     }
     let c_str = std::ffi::CStr::from_ptr(ptr);
     match c_str.to_str() {
         Ok(s) => Ok(s),
-        Err(err) => Err(TursoError {
-            code: TursoStatusCode::Misuse,
-            message: Some(format!(
-                "expected zero terminated c-string representing utf-8 value: {err}"
-            )),
-        }),
+        Err(err) => Err(TursoError::Misuse(format!(
+            "expected zero terminated c-string representing utf-8 value: {err}"
+        ))),
     }
 }
 
@@ -161,12 +170,9 @@ pub unsafe fn str_from_slice<'a>(
     let slice = bytes_from_slice(ptr, len)?;
     match std::str::from_utf8(slice) {
         Ok(s) => Ok(s),
-        Err(err) => Err(TursoError {
-            code: TursoStatusCode::Misuse,
-            message: Some(format!(
-                "expected string slice representing utf-8 value: {err}"
-            )),
-        }),
+        Err(err) => Err(TursoError::Misuse(format!(
+            "expected string slice representing utf-8 value: {err}"
+        ))),
     }
 }
 
@@ -180,10 +186,9 @@ pub unsafe fn bytes_from_slice<'a>(
         return Ok(&[]);
     }
     if ptr.is_null() {
-        return Err(TursoError {
-            code: TursoStatusCode::Misuse,
-            message: Some("expected slice, got null pointer".to_string()),
-        });
+        return Err(TursoError::Misuse(
+            "expected slice, got null pointer".to_string(),
+        ));
     }
     Ok(std::slice::from_raw_parts(ptr as *const u8, len))
 }
@@ -193,10 +198,9 @@ pub fn bytes_from_turso_slice<'a>(
     slice: capi::c::turso_slice_ref_t,
 ) -> Result<&'a [u8], TursoError> {
     if slice.ptr.is_null() {
-        return Err(TursoError {
-            code: TursoStatusCode::Misuse,
-            message: Some("expected slice representing utf-8 value, got null".to_string()),
-        });
+        return Err(TursoError::Misuse(
+            "expected slice representing utf-8 value, got null".to_string(),
+        ));
     }
     Ok(unsafe { std::slice::from_raw_parts(slice.ptr as *const u8, slice.len) })
 }
@@ -204,18 +208,16 @@ pub fn bytes_from_turso_slice<'a>(
 /// SAFETY: slice must points to the valid memory
 pub fn str_from_turso_slice<'a>(slice: capi::c::turso_slice_ref_t) -> Result<&'a str, TursoError> {
     if slice.ptr.is_null() {
-        return Err(TursoError {
-            code: TursoStatusCode::Misuse,
-            message: Some("expected slice representing utf-8 value, got null".to_string()),
-        });
+        return Err(TursoError::Misuse(
+            "expected slice representing utf-8 value, got null".to_string(),
+        ));
     }
     let s = unsafe { std::slice::from_raw_parts(slice.ptr as *const u8, slice.len) };
     match std::str::from_utf8(s) {
         Ok(s) => Ok(s),
-        Err(err) => Err(TursoError {
-            code: TursoStatusCode::Misuse,
-            message: Some(format!("expected slice representing utf-8 value: {err}")),
-        }),
+        Err(err) => Err(TursoError::Misuse(format!(
+            "expected slice representing utf-8 value: {err}"
+        ))),
     }
 }
 
@@ -228,12 +230,26 @@ impl TursoDatabaseConfig {
     /// [c::turso_database_config_t::experimental_features] field must be valid C-string pointer or null
     pub unsafe fn from_capi(config: *const c::turso_database_config_t) -> Result<Self, TursoError> {
         if config.is_null() {
-            return Err(TursoError {
-                code: TursoStatusCode::Misuse,
-                message: Some("config pointer must be not null".to_string()),
-            });
+            return Err(TursoError::Misuse(
+                "config pointer must be not null".to_string(),
+            ));
         }
         let config = *config;
+        let encryption_cipher = if !config.encryption_cipher.is_null() {
+            Some(str_from_c_str(config.encryption_cipher)?.to_string())
+        } else {
+            None
+        };
+        let encryption_hexkey = if !config.encryption_hexkey.is_null() {
+            Some(str_from_c_str(config.encryption_hexkey)?.to_string())
+        } else {
+            None
+        };
+        if encryption_cipher.is_some() != encryption_hexkey.is_some() {
+            return Err(TursoError::Misuse(
+                "either both encryption cipher and key must be set or no".to_string(),
+            ));
+        }
         Ok(Self {
             path: str_from_c_str(config.path)?.to_string(),
             experimental_features: if !config.experimental_features.is_null() {
@@ -241,7 +257,16 @@ impl TursoDatabaseConfig {
             } else {
                 None
             },
-            async_io: config.async_io,
+            async_io: config.async_io != 0,
+            encryption: encryption_cipher.map(|encryption_cipher| EncryptionOpts {
+                cipher: encryption_cipher,
+                hexkey: encryption_hexkey.unwrap(),
+            }),
+            vfs: if !config.vfs.is_null() {
+                Some(str_from_c_str(config.vfs)?.to_string())
+            } else {
+                None
+            },
             io: None,
             db_file: None,
         })
@@ -256,45 +281,32 @@ pub struct TursoDatabase {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum TursoStatusCode {
-    Ok = 0,
-    Done = 1,
-    Row = 2,
-    Io = 3,
-    Busy = 4,
-    Interrupt = 5,
-    Error = 127,
-    Misuse = 128,
-    Constraint = 129,
-    Readonly = 130,
-    DatabaseFull = 131,
-    NotAdb = 132,
-    Corrupt = 133,
+    Done,
+    Row,
+    Io,
+}
+
+#[derive(Debug, Clone)]
+pub enum TursoError {
+    Busy(String),
+    Interrupt(String),
+    Error(String),
+    Misuse(String),
+    Constraint(String),
+    Readonly(String),
+    DatabaseFull(String),
+    NotAdb(String),
+    Corrupt(String),
 }
 
 impl TursoStatusCode {
     pub fn to_capi(self) -> capi::c::turso_status_code_t {
         match self {
-            TursoStatusCode::Ok => capi::c::turso_status_code_t::TURSO_OK,
             TursoStatusCode::Done => capi::c::turso_status_code_t::TURSO_DONE,
             TursoStatusCode::Row => capi::c::turso_status_code_t::TURSO_ROW,
             TursoStatusCode::Io => capi::c::turso_status_code_t::TURSO_IO,
-            TursoStatusCode::Busy => capi::c::turso_status_code_t::TURSO_BUSY,
-            TursoStatusCode::Interrupt => capi::c::turso_status_code_t::TURSO_INTERRUPT,
-            TursoStatusCode::Error => capi::c::turso_status_code_t::TURSO_ERROR,
-            TursoStatusCode::Misuse => capi::c::turso_status_code_t::TURSO_MISUSE,
-            TursoStatusCode::Constraint => capi::c::turso_status_code_t::TURSO_CONSTRAINT,
-            TursoStatusCode::Readonly => capi::c::turso_status_code_t::TURSO_READONLY,
-            TursoStatusCode::DatabaseFull => capi::c::turso_status_code_t::TURSO_DATABASE_FULL,
-            TursoStatusCode::NotAdb => capi::c::turso_status_code_t::TURSO_NOTADB,
-            TursoStatusCode::Corrupt => capi::c::turso_status_code_t::TURSO_CORRUPT,
         }
     }
-}
-
-#[derive(Debug, Clone)]
-pub struct TursoError {
-    pub code: TursoStatusCode,
-    pub message: Option<String>,
 }
 
 impl TursoError {
@@ -305,20 +317,39 @@ impl TursoError {
         error_opt_out: *mut *const std::ffi::c_char,
     ) -> capi::c::turso_status_code_t {
         if !error_opt_out.is_null() {
-            let message = if let Some(message) = &self.message {
-                str_to_c_string(message)
-            } else {
-                std::ptr::null_mut()
-            };
+            let message = str_to_c_string(&self.to_string());
             unsafe { *error_opt_out = message };
         }
-        self.code.to_capi()
+        self.to_capi_code()
+    }
+    pub fn to_capi_code(&self) -> capi::c::turso_status_code_t {
+        match self {
+            TursoError::Busy(_) => capi::c::turso_status_code_t::TURSO_BUSY,
+            TursoError::Interrupt(_) => capi::c::turso_status_code_t::TURSO_INTERRUPT,
+            TursoError::Error(_) => capi::c::turso_status_code_t::TURSO_ERROR,
+            TursoError::Misuse(_) => capi::c::turso_status_code_t::TURSO_MISUSE,
+            TursoError::Constraint(_) => capi::c::turso_status_code_t::TURSO_CONSTRAINT,
+            TursoError::Readonly(_) => capi::c::turso_status_code_t::TURSO_READONLY,
+            TursoError::DatabaseFull(_) => capi::c::turso_status_code_t::TURSO_DATABASE_FULL,
+            TursoError::NotAdb(_) => capi::c::turso_status_code_t::TURSO_NOTADB,
+            TursoError::Corrupt(_) => capi::c::turso_status_code_t::TURSO_CORRUPT,
+        }
     }
 }
 
 impl Display for TursoError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_fmt(format_args!("{:?}: {:?}", self.code, self.message))
+        match self {
+            TursoError::Busy(s)
+            | TursoError::Interrupt(s)
+            | TursoError::Error(s)
+            | TursoError::Misuse(s)
+            | TursoError::Constraint(s)
+            | TursoError::Readonly(s)
+            | TursoError::DatabaseFull(s)
+            | TursoError::NotAdb(s)
+            | TursoError::Corrupt(s) => f.write_str(s),
+        }
     }
 }
 
@@ -333,20 +364,20 @@ pub fn c_string_to_str(ptr: *const std::ffi::c_char) -> std::ffi::CString {
     unsafe { std::ffi::CString::from_raw(ptr as *mut std::ffi::c_char) }
 }
 
-fn turso_error_from_limbo_error(err: LimboError) -> TursoError {
-    TursoError {
-        code: match &err {
-            LimboError::Constraint(_) => TursoStatusCode::Constraint,
-            LimboError::Corrupt(..) => TursoStatusCode::Corrupt,
-            LimboError::NotADB => TursoStatusCode::NotAdb,
-            LimboError::DatabaseFull(_) => TursoStatusCode::DatabaseFull,
-            LimboError::ReadOnly => TursoStatusCode::Readonly,
-            LimboError::Busy => TursoStatusCode::Busy,
-            _ => TursoStatusCode::Error,
-        },
-        message: Some(format!("{err}")),
+impl From<LimboError> for TursoError {
+    fn from(value: LimboError) -> Self {
+        match value {
+            LimboError::Constraint(e) => TursoError::Constraint(e),
+            LimboError::Corrupt(e) => TursoError::Corrupt(e),
+            LimboError::NotADB => TursoError::NotAdb("file is not a database".to_string()),
+            LimboError::DatabaseFull(e) => TursoError::DatabaseFull(e),
+            LimboError::ReadOnly => TursoError::Readonly("database is readonly".to_string()),
+            LimboError::Busy => TursoError::Busy("database is busy".to_string()),
+            _ => TursoError::Error(value.to_string()),
+        }
     }
 }
+
 static LOGGER: RwLock<Option<Box<Logger>>> = RwLock::new(None);
 static SETUP: Once = Once::new();
 
@@ -407,12 +438,7 @@ pub fn turso_setup(config: TursoSetupConfig) -> Result<(), TursoError> {
             "info" => Some(LevelFilter::INFO),
             "debug" => Some(LevelFilter::DEBUG),
             "trace" => Some(LevelFilter::TRACE),
-            _ => {
-                return Err(TursoError {
-                    code: TursoStatusCode::Error,
-                    message: Some("unknown log level".to_string()),
-                })
-            }
+            _ => return Err(TursoError::Error("unknown log level".to_string())),
         }
     } else {
         None
@@ -443,10 +469,7 @@ impl TursoDatabase {
         let db = self.db.lock().unwrap();
         match &*db {
             Some(db) => Ok(db.clone()),
-            None => Err(TursoError {
-                code: TursoStatusCode::Misuse,
-                message: Some("database must be opened".to_string()),
-            }),
+            None => Err(TursoError::Misuse("database must be opened".to_string())),
         }
     }
     /// create database holder struct but do not initialize it yet
@@ -462,21 +485,51 @@ impl TursoDatabase {
     pub fn open(&self) -> Result<(), TursoError> {
         let mut inner_db = self.db.lock().unwrap();
         if inner_db.is_some() {
-            return Err(TursoError {
-                code: TursoStatusCode::Misuse,
-                message: Some("database must be opened only once".to_string()),
-            });
+            return Err(TursoError::Misuse(
+                "database must be opened only once".to_string(),
+            ));
         }
         let io: Arc<dyn turso_core::IO> = if let Some(io) = &self.config.io {
             io.clone()
         } else {
-            match self.config.path.as_str() {
-                ":memory:" => Arc::new(turso_core::MemoryIO::new()),
-                _ => match turso_core::PlatformIO::new() {
-                    Ok(io) => Arc::new(io),
-                    Err(err) => {
-                        return Err(turso_error_from_limbo_error(err));
+            match self.config.vfs.as_deref() {
+                Some("memory") => Arc::new(turso_core::MemoryIO::new()),
+                Some("syscall") => {
+                    #[cfg(all(target_family = "unix", not(miri)))]
+                    {
+                        Arc::new(turso_core::UnixIO::new().map_err(|e| {
+                            TursoError::Error(format!(
+                                "unable to create generic syscall backend: {e}"
+                            ))
+                        })?)
                     }
+                    #[cfg(any(not(target_family = "unix"), miri))]
+                    {
+                        Arc::new(turso_core::PlatformIO::new().map_err(|e| {
+                            TursoError::Error(format!(
+                                "unable to create generic syscall backend: {e}"
+                            ))
+                        })?)
+                    }
+                }
+                #[cfg(all(target_os = "linux", not(miri)))]
+                Some("io_uring") => Arc::new(turso_core::UringIO::new().map_err(|e| {
+                    TursoError::Error(format!("unable to create io_uring backend: {e}"))
+                })?),
+                #[cfg(any(not(target_os = "linux"), miri))]
+                Some("io_uring") => {
+                    return Err(TursoError::Error(
+                        "io_uring is only available on Linux targets".to_string(),
+                    ));
+                }
+                Some(vfs) => {
+                    return Err(TursoError::Error(format!(
+                        "unsupported VFS backend: '{vfs}'"
+                    )))
+                }
+                None => match self.config.path.as_str() {
+                    ":memory:" => Arc::new(turso_core::MemoryIO::new()),
+                    _ => Arc::new(turso_core::PlatformIO::new()?),
                 },
             }
         };
@@ -484,9 +537,7 @@ impl TursoDatabase {
         let db_file = if let Some(db_file) = &self.config.db_file {
             db_file.clone()
         } else {
-            let file = io
-                .open_file(&self.config.path, open_flags, true)
-                .map_err(turso_error_from_limbo_error)?;
+            let file = io.open_file(&self.config.path, open_flags, true)?;
             Arc::new(DatabaseFile::new(file))
         };
         let mut opts = DatabaseOpts::new();
@@ -498,24 +549,24 @@ impl TursoDatabase {
                     "strict" => opts.with_strict(true),
                     "autovacuum" => opts.with_autovacuum(true),
                     "triggers" => opts.with_triggers(true),
+                    "encryption" => opts.with_encryption(true),
                     _ => opts,
                 };
             }
         }
-        match turso_core::Database::open_with_flags(
+        if self.config.encryption.is_some() && !opts.enable_encryption {
+            return Err(TursoError::Error("encryption is experimental and must be explicitly enabled through experimental features list".to_string()));
+        }
+        let db = turso_core::Database::open_with_flags(
             io.clone(),
             &self.config.path,
             db_file,
             open_flags,
             opts,
-            None,
-        ) {
-            Ok(db) => {
-                *inner_db = Some(db);
-                Ok(())
-            }
-            Err(err) => Err(turso_error_from_limbo_error(err)),
-        }
+            self.config.encryption.clone(),
+        )?;
+        *inner_db = Some(db);
+        Ok(())
     }
 
     /// creates database connection
@@ -523,17 +574,12 @@ impl TursoDatabase {
     pub fn connect(&self) -> Result<Arc<TursoConnection>, TursoError> {
         let inner_db = self.db.lock().unwrap();
         let Some(db) = inner_db.as_ref() else {
-            return Err(TursoError {
-                code: TursoStatusCode::Misuse,
-                message: Some("database must be opened first".to_string()),
-            });
+            return Err(TursoError::Misuse(
+                "database must be opened first".to_string(),
+            ));
         };
-        let connection = db.connect();
-
-        match connection {
-            Ok(connection) => Ok(TursoConnection::new(&self.config, connection)),
-            Err(err) => Err(turso_error_from_limbo_error(err)),
-        }
+        let connection = db.connect()?;
+        Ok(TursoConnection::new(&self.config, connection))
     }
 
     /// helper method to get C raw container with TursoDatabase instance
@@ -551,10 +597,7 @@ impl TursoDatabase {
         value: *const capi::c::turso_database_t,
     ) -> Result<&'a Self, TursoError> {
         if value.is_null() {
-            Err(TursoError {
-                code: TursoStatusCode::Misuse,
-                message: Some("got null pointer".to_string()),
-            })
+            Err(TursoError::Misuse("got null pointer".to_string()))
         } else {
             Ok(&*(value as *const Self))
         }
@@ -570,6 +613,7 @@ impl TursoDatabase {
     }
 }
 
+#[derive(Clone)]
 pub struct TursoConnection {
     async_io: bool,
     concurrent_guard: Arc<ConcurrentGuard>,
@@ -584,6 +628,10 @@ impl TursoConnection {
             concurrent_guard: Arc::new(ConcurrentGuard::new()),
         })
     }
+    /// Set busy timeout for the connection
+    pub fn set_busy_timeout(&self, duration: Duration) {
+        self.connection.set_busy_timeout(duration);
+    }
     pub fn get_auto_commit(&self) -> bool {
         self.connection.get_auto_commit()
     }
@@ -592,14 +640,12 @@ impl TursoConnection {
     }
     /// prepares single SQL statement
     pub fn prepare_single(&self, sql: impl AsRef<str>) -> Result<Box<TursoStatement>, TursoError> {
-        match self.connection.prepare(sql) {
-            Ok(statement) => Ok(Box::new(TursoStatement {
-                concurrent_guard: self.concurrent_guard.clone(),
-                async_io: self.async_io,
-                statement,
-            })),
-            Err(err) => Err(turso_error_from_limbo_error(err)),
-        }
+        let statement = self.connection.prepare(sql)?;
+        Ok(Box::new(TursoStatement {
+            concurrent_guard: self.concurrent_guard.clone(),
+            async_io: self.async_io,
+            statement,
+        }))
     }
     /// prepares first SQL statement from the string and return prepared statement and position after the end of the parsed statement
     /// this method can be useful if SDK provides an execute(...) method which run all statements from the provided input in sequence
@@ -607,8 +653,8 @@ impl TursoConnection {
         &self,
         sql: impl AsRef<str>,
     ) -> Result<Option<(Box<TursoStatement>, usize)>, TursoError> {
-        match self.connection.consume_stmt(sql) {
-            Ok(Some((statement, position))) => Ok(Some((
+        match self.connection.consume_stmt(sql)? {
+            Some((statement, position)) => Ok(Some((
                 Box::new(TursoStatement {
                     async_io: self.async_io,
                     concurrent_guard: Arc::new(ConcurrentGuard::new()),
@@ -616,17 +662,25 @@ impl TursoConnection {
                 }),
                 position,
             ))),
-            Ok(None) => Ok(None),
-            Err(err) => Err(turso_error_from_limbo_error(err)),
+            None => Ok(None),
         }
     }
 
     /// close the connection preventing any further operations executed over it
     /// SAFETY: caller must guarantee that no ongoing operations are running over connection before calling close(...) method
     pub fn close(&self) -> Result<(), TursoError> {
-        self.connection
-            .close()
-            .map_err(turso_error_from_limbo_error)
+        self.connection.close()?;
+        Ok(())
+    }
+
+    /// low-level method used only by the Rust SDK
+    pub fn cacheflush(&self) -> Result<(), TursoError> {
+        let completions = self.connection.cacheflush()?;
+        let pager = self.connection.get_pager();
+        for c in completions {
+            pager.io.wait_for_completion(c)?;
+        }
+        Ok(())
     }
 
     /// helper method to get C raw container to the TursoConnection instance
@@ -644,10 +698,7 @@ impl TursoConnection {
         value: *const capi::c::turso_connection_t,
     ) -> Result<&'a Self, TursoError> {
         if value.is_null() {
-            Err(TursoError {
-                code: TursoStatusCode::Misuse,
-                message: Some("got null pointer".to_string()),
-            })
+            Err(TursoError::Misuse("got null pointer".to_string()))
         } else {
             Ok(&*(value as *const Self))
         }
@@ -676,6 +727,10 @@ pub struct TursoExecutionResult {
 }
 
 impl TursoStatement {
+    /// return amount of row modifications (insert/delete operations) made by the most recent executed statement
+    pub fn n_change(&self) -> i64 {
+        self.statement.n_change()
+    }
     /// returns parameters count for the statement
     pub fn parameters_count(&self) -> usize {
         self.statement.parameters_count()
@@ -687,10 +742,9 @@ impl TursoStatement {
         value: turso_core::Value,
     ) -> Result<(), TursoError> {
         let Ok(index) = index.try_into() else {
-            return Err(TursoError {
-                code: TursoStatusCode::Misuse,
-                message: Some("bind index must be non-zero".to_string()),
-            });
+            return Err(TursoError::Misuse(
+                "bind index must be non-zero".to_string(),
+            ));
         };
         // bind_at is safe to call with any index as it will put pair (index, value) into the map
         self.statement.bind_at(index, value);
@@ -710,22 +764,19 @@ impl TursoStatement {
                 || parameter.starts_with("$")
                 || parameter.starts_with("?"))
             {
-                return Err(TursoError {
-                    code: TursoStatusCode::Error,
-                    message: Some(format!(
-                        "internal error: unexpected internal parameter name: {parameter}"
-                    )),
-                });
+                return Err(TursoError::Error(format!(
+                    "internal error: unexpected internal parameter name: {parameter}"
+                )));
             }
-            if name.as_ref() == &parameter[1..] {
+            if name.as_ref() == parameter {
                 return Ok(index.into());
             }
         }
 
-        Err(TursoError {
-            code: TursoStatusCode::Error,
-            message: Some(format!("named parameter {} not found", name.as_ref())),
-        })
+        Err(TursoError::Error(format!(
+            "named parameter {} not found",
+            name.as_ref()
+        )))
     }
     /// make one execution step of the statement
     /// method returns [TursoStatusCode::Done] if execution is finished
@@ -745,18 +796,12 @@ impl TursoStatement {
             } else {
                 self.statement.step()
             };
-            return match result {
-                Ok(StepResult::Done) => Ok(TursoStatusCode::Done),
-                Ok(StepResult::Row) => Ok(TursoStatusCode::Row),
-                Ok(StepResult::Busy) => Err(TursoError {
-                    code: TursoStatusCode::Busy,
-                    message: None,
-                }),
-                Ok(StepResult::Interrupt) => Err(TursoError {
-                    code: TursoStatusCode::Interrupt,
-                    message: None,
-                }),
-                Ok(StepResult::IO) => {
+            return match result? {
+                StepResult::Done => Ok(TursoStatusCode::Done),
+                StepResult::Row => Ok(TursoStatusCode::Row),
+                StepResult::Busy => Err(TursoError::Busy("database is busy".to_string())),
+                StepResult::Interrupt => Err(TursoError::Interrupt("interrupted".to_string())),
+                StepResult::IO => {
                     if async_io {
                         Ok(TursoStatusCode::Io)
                     } else {
@@ -764,7 +809,6 @@ impl TursoStatement {
                         continue;
                     }
                 }
-                Err(err) => return Err(turso_error_from_limbo_error(err)),
             };
         }
     }
@@ -790,35 +834,26 @@ impl TursoStatement {
                     rows_changed: self.statement.n_change() as u64,
                 });
             }
-            return Err(TursoError {
-                code: TursoStatusCode::Error,
-                message: Some(format!(
-                    "internal error: unexpected status code: {status:?}",
-                )),
-            });
+            return Err(TursoError::Error(format!(
+                "internal error: unexpected status code: {status:?}",
+            )));
         }
     }
     /// run iteration of the IO backend
     pub fn run_io(&self) -> Result<(), TursoError> {
-        self.statement
-            ._io()
-            .step()
-            .map_err(turso_error_from_limbo_error)
+        self.statement._io().step()?;
+        Ok(())
     }
     /// get row value reference currently pointed by the statement
     /// note, that this row will no longer be valid after execution of methods like [Self::step]/[Self::execute]/[Self::finalize]/[Self::reset]
     pub fn row_value(&self, index: usize) -> Result<turso_core::ValueRef, TursoError> {
         let Some(row) = self.statement.row() else {
-            return Err(TursoError {
-                code: TursoStatusCode::Misuse,
-                message: Some("statement holds no row".to_string()),
-            });
+            return Err(TursoError::Misuse("statement holds no row".to_string()));
         };
         if index >= row.len() {
-            return Err(TursoError {
-                code: TursoStatusCode::Misuse,
-                message: Some("attempt to access row value out of bounds".to_string()),
-            });
+            return Err(TursoError::Misuse(
+                "attempt to access row value out of bounds".to_string(),
+            ));
         }
         let value = row.get_value(index);
         Ok(value.as_value_ref())
@@ -830,10 +865,7 @@ impl TursoStatement {
     /// returns column name
     pub fn column_name(&self, index: usize) -> Result<Cow<'_, str>, TursoError> {
         if index >= self.column_count() {
-            return Err(TursoError {
-                code: TursoStatusCode::Misuse,
-                message: Some("column index out of bounds".to_string()),
-            });
+            return Err(TursoError::Misuse("column index out of bounds".to_string()));
         }
         Ok(self.statement.get_column_name(index))
     }
@@ -849,7 +881,7 @@ impl TursoStatement {
                 return Ok(status);
             }
         }
-        Ok(TursoStatusCode::Ok)
+        Ok(TursoStatusCode::Done)
     }
     /// reset internal statement state and bindings
     pub fn reset(&mut self) -> Result<(), TursoError> {
@@ -873,10 +905,7 @@ impl TursoStatement {
         value: *const capi::c::turso_statement_t,
     ) -> Result<&'a mut Self, TursoError> {
         if value.is_null() {
-            Err(TursoError {
-                code: TursoStatusCode::Misuse,
-                message: Some("got null pointer".to_string()),
-            })
+            Err(TursoError::Misuse("got null pointer".to_string()))
         } else {
             Ok(&mut *(value as *mut Self))
         }
@@ -894,7 +923,7 @@ impl TursoStatement {
 
 #[cfg(test)]
 mod tests {
-    use crate::rsapi::{TursoDatabase, TursoDatabaseConfig, TursoStatusCode};
+    use crate::rsapi::{TursoDatabase, TursoDatabaseConfig, TursoError, TursoStatusCode};
 
     #[test]
     pub fn test_db_concurrent_use() {
@@ -906,6 +935,8 @@ mod tests {
                 path: ":memory:".to_string(),
                 experimental_features: None,
                 async_io: false,
+                encryption: None,
+                vfs: None,
                 io: None,
                 db_file: None,
             });
@@ -953,7 +984,7 @@ mod tests {
             "misuse errors should be very likely with the test setup: {errors:?}"
         );
         assert!(
-            errors.iter().all(|e| e.code == TursoStatusCode::Misuse),
+            errors.iter().all(|e| matches!(e, TursoError::Misuse(_))),
             "all errors must have Misuse code: {errors:?}"
         );
     }
@@ -964,6 +995,8 @@ mod tests {
             path: ":memory:".to_string(),
             experimental_features: None,
             async_io: false,
+            encryption: None,
+            vfs: None,
             io: None,
             db_file: None,
         });

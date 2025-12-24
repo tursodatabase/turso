@@ -82,6 +82,9 @@ pub struct turso_statement {
 }
 #[doc = " opaque pointer to the TursoStatement instance\n SAFETY: the statement must be used exclusive and can't be accessed concurrently"]
 pub type turso_statement_t = turso_statement;
+unsafe extern "C" {
+    pub fn turso_version() -> *const ::std::os::raw::c_char;
+}
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct turso_log_t {
@@ -143,24 +146,36 @@ impl Default for turso_config_t {
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
 pub struct turso_database_config_t {
+    #[doc = " Parameter which defines who drives the IO - callee or the caller (non-zero parameter value interpreted as async IO)"]
+    pub async_io: u64,
     #[doc = " Path to the database file or `:memory:`\n zero-terminated C string"]
     pub path: *const ::std::os::raw::c_char,
     #[doc = " Optional comma separated list of experimental features to enable\n zero-terminated C string or null pointer"]
     pub experimental_features: *const ::std::os::raw::c_char,
-    #[doc = " Parameter which defines who drives the IO - callee or the caller"]
-    pub async_io: bool,
+    #[doc = " optional VFS parameter explicitly specifying FS backend for the database.\n Available options are:\n - \"memory\": in-memory backend\n - \"syscall\": generic syscall backend\n - \"io_uring\": IO uring (supported only on Linux)"]
+    pub vfs: *const ::std::os::raw::c_char,
+    #[doc = " optional encryption cipher\n as encryption is experimental - experimental_features must have \"encryption\" in the list"]
+    pub encryption_cipher: *const ::std::os::raw::c_char,
+    #[doc = " optional encryption hexkey\n as encryption is experimental - experimental_features must have \"encryption\" in the list"]
+    pub encryption_hexkey: *const ::std::os::raw::c_char,
 }
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
-    ["Size of turso_database_config_t"][::std::mem::size_of::<turso_database_config_t>() - 24usize];
+    ["Size of turso_database_config_t"][::std::mem::size_of::<turso_database_config_t>() - 48usize];
     ["Alignment of turso_database_config_t"]
         [::std::mem::align_of::<turso_database_config_t>() - 8usize];
-    ["Offset of field: turso_database_config_t::path"]
-        [::std::mem::offset_of!(turso_database_config_t, path) - 0usize];
-    ["Offset of field: turso_database_config_t::experimental_features"]
-        [::std::mem::offset_of!(turso_database_config_t, experimental_features) - 8usize];
     ["Offset of field: turso_database_config_t::async_io"]
-        [::std::mem::offset_of!(turso_database_config_t, async_io) - 16usize];
+        [::std::mem::offset_of!(turso_database_config_t, async_io) - 0usize];
+    ["Offset of field: turso_database_config_t::path"]
+        [::std::mem::offset_of!(turso_database_config_t, path) - 8usize];
+    ["Offset of field: turso_database_config_t::experimental_features"]
+        [::std::mem::offset_of!(turso_database_config_t, experimental_features) - 16usize];
+    ["Offset of field: turso_database_config_t::vfs"]
+        [::std::mem::offset_of!(turso_database_config_t, vfs) - 24usize];
+    ["Offset of field: turso_database_config_t::encryption_cipher"]
+        [::std::mem::offset_of!(turso_database_config_t, encryption_cipher) - 32usize];
+    ["Offset of field: turso_database_config_t::encryption_hexkey"]
+        [::std::mem::offset_of!(turso_database_config_t, encryption_hexkey) - 40usize];
 };
 impl Default for turso_database_config_t {
     fn default() -> Self {
@@ -170,9 +185,6 @@ impl Default for turso_database_config_t {
             s.assume_init()
         }
     }
-}
-unsafe extern "C" {
-    pub fn turso_version() -> *const ::std::os::raw::c_char;
 }
 unsafe extern "C" {
     #[doc = " Setup global database info"]
@@ -203,6 +215,10 @@ unsafe extern "C" {
         connection: *mut *mut turso_connection_t,
         error_opt_out: *mut *const ::std::os::raw::c_char,
     ) -> turso_status_code_t;
+}
+unsafe extern "C" {
+    #[doc = " Set busy timeout for the connection"]
+    pub fn turso_connection_set_busy_timeout_ms(self_: *const turso_connection_t, timeout_ms: i64);
 }
 unsafe extern "C" {
     #[doc = " Get autocommit state of the connection"]
@@ -273,6 +289,10 @@ unsafe extern "C" {
         self_: *const turso_statement_t,
         error_opt_out: *mut *const ::std::os::raw::c_char,
     ) -> turso_status_code_t;
+}
+unsafe extern "C" {
+    #[doc = " return amount of row modifications (insert/delete operations) made by the most recent executed statement"]
+    pub fn turso_statement_n_change(self_: *const turso_statement_t) -> i64;
 }
 unsafe extern "C" {
     #[doc = " Get column count"]

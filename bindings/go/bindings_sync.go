@@ -380,7 +380,10 @@ func turso_sync_database_new(dbConfig TursoDatabaseConfig, syncConfig TursoSyncD
 	if dbConfig.ExperimentalFeatures != "" {
 		expBytes, cdb.experimental_features = makeCStringBytes(dbConfig.ExperimentalFeatures)
 	}
-	cdb.async_io = dbConfig.AsyncIO
+	cdb.async_io = 0
+	if dbConfig.AsyncIO {
+		cdb.async_io = 1
+	}
 
 	// Build C sync config
 	var csync turso_sync_database_config_t

@@ -3,7 +3,7 @@ use pyo3::{
     types::{PyBytes, PyTuple},
 };
 use std::sync::Arc;
-use turso_sdk_kit::rsapi::{self, TursoError, TursoStatusCode, Value, ValueRef};
+use turso_sdk_kit::rsapi::{self, EncryptionOpts, TursoError, TursoStatusCode, Value, ValueRef};
 
 use pyo3::create_exception;
 use pyo3::exceptions::PyException;
@@ -28,27 +28,24 @@ create_exception!(turso, NotAdb, PyException, "not a database`");
 create_exception!(turso, Corrupt, PyException, "database corrupted");
 
 pub(crate) fn turso_error_to_py_err(err: TursoError) -> PyErr {
-    match err.code {
-        rsapi::TursoStatusCode::Busy => Busy::new_err(err.message),
-        rsapi::TursoStatusCode::Interrupt => Interrupt::new_err(err.message),
-        rsapi::TursoStatusCode::Error => Error::new_err(err.message),
-        rsapi::TursoStatusCode::Misuse => Misuse::new_err(err.message),
-        rsapi::TursoStatusCode::Constraint => Constraint::new_err(err.message),
-        rsapi::TursoStatusCode::Readonly => Readonly::new_err(err.message),
-        rsapi::TursoStatusCode::DatabaseFull => DatabaseFull::new_err(err.message),
-        rsapi::TursoStatusCode::NotAdb => NotAdb::new_err(err.message),
-        rsapi::TursoStatusCode::Corrupt => Corrupt::new_err(err.message),
-        _ => Error::new_err("unexpected status from the sdk-kit".to_string()),
+    match err {
+        rsapi::TursoError::Busy(message) => Busy::new_err(message),
+        rsapi::TursoError::Interrupt(message) => Interrupt::new_err(message),
+        rsapi::TursoError::Error(message) => Error::new_err(message),
+        rsapi::TursoError::Misuse(message) => Misuse::new_err(message),
+        rsapi::TursoError::Constraint(message) => Constraint::new_err(message),
+        rsapi::TursoError::Readonly(message) => Readonly::new_err(message),
+        rsapi::TursoError::DatabaseFull(message) => DatabaseFull::new_err(message),
+        rsapi::TursoError::NotAdb(message) => NotAdb::new_err(message),
+        rsapi::TursoError::Corrupt(message) => Corrupt::new_err(message),
     }
 }
 
 fn turso_status_to_py(status: TursoStatusCode) -> PyTursoStatusCode {
     match status {
-        TursoStatusCode::Ok => PyTursoStatusCode::Ok,
         TursoStatusCode::Done => PyTursoStatusCode::Done,
         TursoStatusCode::Row => PyTursoStatusCode::Row,
         TursoStatusCode::Io => PyTursoStatusCode::Io,
-        _ => panic!("unexpected status code: {status:?}"),
     }
 }
 
@@ -92,6 +89,22 @@ impl PyTursoSetupConfig {
 }
 
 #[pyclass]
+#[derive(Clone)]
+pub struct PyTursoEncryptionConfig {
+    pub cipher: String,
+    pub hexkey: String,
+}
+
+#[pymethods]
+impl PyTursoEncryptionConfig {
+    #[new]
+    #[pyo3(signature = (cipher, hexkey))]
+    fn new(cipher: String, hexkey: String) -> Self {
+        Self { cipher, hexkey }
+    }
+}
+
+#[pyclass]
 pub struct PyTursoDatabaseConfig {
     pub path: String,
 
@@ -102,17 +115,36 @@ pub struct PyTursoDatabaseConfig {
     /// if true, library methods will return Io status code and delegate Io loop to the caller
     /// if false, library will spin IO itself in case of Io status code and never return it to the caller
     pub async_io: bool,
+
+    /// optional VFS parameter explicitly specifying FS backend for the database.
+    /// Available options are:
+    /// - "memory": in-memory backend
+    /// - "syscall": generic syscall backend
+    /// - "io_uring": IO uring (supported only on Linux)
+    pub vfs: Option<String>,
+
+    /// optional encryption parameters
+    /// as encryption is experimental - experimental_features must have "encryption" in the list
+    pub encryption: Option<PyTursoEncryptionConfig>,
 }
 
 #[pymethods]
 impl PyTursoDatabaseConfig {
     #[new]
-    #[pyo3(signature = (path, experimental_features=None, async_io=false))]
-    fn new(path: String, experimental_features: Option<String>, async_io: bool) -> Self {
+    #[pyo3(signature = (path, experimental_features=None, async_io=false, vfs=None, encryption=None))]
+    fn new(
+        path: String,
+        experimental_features: Option<String>,
+        async_io: bool,
+        vfs: Option<String>,
+        encryption: Option<&PyTursoEncryptionConfig>,
+    ) -> Self {
         Self {
             path,
             experimental_features,
             async_io,
+            vfs,
+            encryption: encryption.cloned(),
         }
     }
 }
@@ -158,6 +190,11 @@ pub fn py_turso_database_open(config: &PyTursoDatabaseConfig) -> PyResult<PyTurs
         path: config.path.clone(),
         experimental_features: config.experimental_features.clone(),
         async_io: config.async_io,
+        encryption: config.encryption.as_ref().map(|encryption| EncryptionOpts {
+            cipher: encryption.cipher.clone(),
+            hexkey: encryption.hexkey.clone(),
+        }),
+        vfs: config.vfs.clone(),
         io: None,
         db_file: None,
     });
