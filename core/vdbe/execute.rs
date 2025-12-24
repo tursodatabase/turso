@@ -8311,6 +8311,10 @@ pub fn op_noop(
 pub enum OpOpenEphemeralState {
     #[default]
     Start,
+    // Fast path states for reusing existing ephemeral cursor
+    ClearExisting,
+    RewindExisting,
+    // Slow path states for creating new ephemeral cursor
     StartingTxn {
         pager: Arc<Pager>,
     },
@@ -8341,6 +8345,13 @@ pub fn op_open_ephemeral(
     match &mut state.op_open_ephemeral_state {
         OpOpenEphemeralState::Start => {
             tracing::trace!("Start");
+            // Fast path: if cursor already has an ephemeral btree, just clear it instead of
+            // recreating the entire pager/file/btree. This is important for performance when
+            // OpenEphemeral is called repeatedly during statement execution.
+            if state.cursors[cursor_id].is_some() {
+                state.op_open_ephemeral_state = OpOpenEphemeralState::ClearExisting;
+                return Ok(InsnFunctionStepResult::Step);
+            }
             let page_size =
                 return_if_io!(with_header(pager, mv_store.as_ref(), program, |header| {
                     header.page_size
@@ -8397,6 +8408,25 @@ pub fn op_open_ephemeral(
             pager.set_page_size(page_size);
 
             state.op_open_ephemeral_state = OpOpenEphemeralState::StartingTxn { pager };
+        }
+        OpOpenEphemeralState::ClearExisting => {
+            tracing::trace!("ClearExisting");
+            let cursor = state.cursors[cursor_id]
+                .as_mut()
+                .expect("cursor should exist in ClearExisting state");
+            let btree_cursor = cursor.as_btree_mut();
+            return_if_io!(btree_cursor.clear_btree());
+            state.op_open_ephemeral_state = OpOpenEphemeralState::RewindExisting;
+        }
+        OpOpenEphemeralState::RewindExisting => {
+            tracing::trace!("RewindExisting");
+            let cursor = state.cursors[cursor_id]
+                .as_mut()
+                .expect("cursor should exist in RewindExisting state");
+            let btree_cursor = cursor.as_btree_mut();
+            return_if_io!(btree_cursor.rewind());
+            state.pc += 1;
+            state.op_open_ephemeral_state = OpOpenEphemeralState::Start;
         }
         OpOpenEphemeralState::StartingTxn { pager } => {
             tracing::trace!("StartingTxn");
