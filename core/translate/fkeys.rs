@@ -1140,6 +1140,143 @@ impl FkSubprogramContext {
     }
 }
 
+/// Get the parent column names for an FK reference.
+/// Uses primary key columns if parent_columns is empty.
+#[inline]
+fn get_fk_parent_cols(fk_ref: &ResolvedFkRef, parent_bt: &BTreeTable) -> Vec<String> {
+    if fk_ref.fk.parent_columns.is_empty() {
+        parent_bt
+            .primary_key_columns
+            .iter()
+            .map(|(n, _)| n.clone())
+            .collect()
+    } else {
+        fk_ref.fk.parent_columns.clone()
+    }
+}
+
+/// Copy key values from value registers into destination registers.
+/// Handles rowid aliasing for columns that are rowid aliases.
+fn copy_key_from_values(
+    program: &mut ProgramBuilder,
+    parent_bt: &BTreeTable,
+    parent_cols: &[String],
+    values_start: usize,
+    rowid_reg: usize,
+    dest_start: usize,
+) -> Result<()> {
+    for (i, pcol) in parent_cols.iter().enumerate() {
+        let src = if ROWID_STRS.iter().any(|s| pcol.eq_ignore_ascii_case(s)) {
+            rowid_reg
+        } else {
+            let (pos, col) = parent_bt
+                .get_column(pcol)
+                .ok_or_else(|| LimboError::InternalError(format!("col {pcol} missing")))?;
+            if col.is_rowid_alias() {
+                rowid_reg
+            } else {
+                values_start + pos
+            }
+        };
+        program.emit_insn(Insn::Copy {
+            src_reg: src,
+            dst_reg: dest_start + i,
+            extra_amount: 0,
+        });
+    }
+    Ok(())
+}
+
+/// Emit instructions to detect if key values have changed between old and new registers.
+/// Jumps to `skip_label` if all values are equal, falls through to `changed_label` if any differ.
+fn emit_key_change_check(
+    program: &mut ProgramBuilder,
+    old_key_start: usize,
+    new_key_start: usize,
+    ncols: usize,
+    skip_label: BranchOffset,
+    changed_label: BranchOffset,
+) {
+    for i in 0..ncols {
+        let next = if i + 1 == ncols {
+            None
+        } else {
+            Some(program.allocate_label())
+        };
+        program.emit_insn(Insn::Eq {
+            lhs: old_key_start + i,
+            rhs: new_key_start + i,
+            target_pc: next.unwrap_or(skip_label),
+            flags: CmpInsFlags::default(),
+            collation: None,
+        });
+        program.emit_insn(Insn::Goto {
+            target_pc: changed_label,
+        });
+        if let Some(n) = next {
+            program.preassign_label_to_next_insn(n);
+        }
+    }
+}
+
+/// Common options for FK action subprogram builders.
+const FK_SUBPROGRAM_OPTS: ProgramBuilderOpts = ProgramBuilderOpts {
+    num_cursors: 2,
+    approx_num_insns: 32,
+    approx_num_labels: 4,
+};
+
+/// Compile and emit an FK action as a sub-program.
+/// This is the common implementation for CASCADE DELETE, SET NULL, SET DEFAULT, and CASCADE UPDATE.
+fn emit_fk_action_subprogram(
+    program: &mut ProgramBuilder,
+    resolver: &mut Resolver,
+    connection: &Arc<Connection>,
+    stmt: ast::Stmt,
+    ctx: &FkActionContext,
+    description: &'static str,
+) -> Result<()> {
+    let mut subprogram_builder = ProgramBuilder::new_for_subprogram(
+        QueryMode::Normal,
+        program.capture_data_changes_mode().clone(),
+        FK_SUBPROGRAM_OPTS,
+    );
+    subprogram_builder.prologue();
+    subprogram_builder =
+        translate_inner(stmt, resolver, subprogram_builder, connection, description)?;
+    subprogram_builder.epilogue(resolver.schema);
+    let built_subprogram = subprogram_builder.build(connection.clone(), true, description)?;
+
+    // Build params: OLD key register indices, then optionally NEW key register indices
+    let mut params: Vec<Value> = ctx
+        .old_key_registers
+        .iter()
+        .copied()
+        .map(|reg_idx| Value::Integer(reg_idx as i64))
+        .collect();
+
+    if let Some(new_regs) = &ctx.new_key_registers {
+        params.extend(
+            new_regs
+                .iter()
+                .copied()
+                .map(|reg_idx| Value::Integer(reg_idx as i64)),
+        );
+    }
+
+    let turso_stmt = Statement::new(
+        built_subprogram,
+        connection.pager.load().clone(),
+        QueryMode::Normal,
+    );
+    program.emit_insn(Insn::Program {
+        params,
+        program: Arc::new(RwLock::new(turso_stmt)),
+    });
+
+    Ok(())
+}
+
 /// Generate a DELETE statement AST for CASCADE DELETE:
 /// DELETE FROM child_table WHERE fk_col1 = ?1 AND fk_col2 = ?2 ...
 fn generate_cascade_delete_stmt(
@@ -1313,58 +1450,21 @@ fn fire_fk_cascade_delete(
     ctx: &FkActionContext,
 ) -> Result<()> {
     let child_cols = &fk_ref.fk.child_columns;
-    let num_cols = child_cols.len();
-
-    // Create subprogram context
-    let subprog_ctx = FkSubprogramContext::new(num_cols, false);
-
-    // Generate DELETE statement
+    let subprog_ctx = FkSubprogramContext::new(child_cols.len(), false);
     let stmt = generate_cascade_delete_stmt(&fk_ref.child_table.name, child_cols, &subprog_ctx);
-    let mut subprogram_builder = ProgramBuilder::new_for_subprogram(
-        QueryMode::Normal,
-        program.capture_data_changes_mode().clone(),
-        ProgramBuilderOpts {
-            num_cursors: 2,
-            approx_num_insns: 32,
-            approx_num_labels: 4,
-        },
-    );
-    subprogram_builder.prologue();
-    subprogram_builder = translate_inner(
-        stmt,
+    emit_fk_action_subprogram(
+        program,
         resolver,
-        subprogram_builder,
         connection,
+        stmt,
+        ctx,
         "fk cascade delete",
-    )?;
-    subprogram_builder.epilogue(resolver.schema);
-    let built_subprogram =
-        subprogram_builder.build(connection.clone(), true, "fk cascade delete")?;
-
-    // Build params: OLD key register indices
-    let params: Vec<Value> = ctx
-        .old_key_registers
-        .iter()
-        .copied()
-        .map(|reg_idx| Value::Integer(reg_idx as i64))
-        .collect();
-
-    let turso_stmt = Statement::new(
-        built_subprogram,
-        connection.pager.load().clone(),
-        QueryMode::Normal,
-    );
-    program.emit_insn(Insn::Program {
-        params,
-        program: Arc::new(RwLock::new(turso_stmt)),
-    });
-
-    Ok(())
+    )
 }
 
 /// Compile and emit an FK SET NULL action as a sub-program.
 /// This creates a sub-program that sets FK columns to NULL for all matching child rows.
-pub fn fire_fk_set_null(
+fn fire_fk_set_null(
     program: &mut ProgramBuilder,
     resolver: &mut Resolver,
     fk_ref: &ResolvedFkRef,
@@ -1372,52 +1472,9 @@ pub fn fire_fk_set_null(
     ctx: &FkActionContext,
 ) -> Result<()> {
     let child_cols = &fk_ref.fk.child_columns;
-    let num_cols = child_cols.len();
-
-    // Create subprogram context
-    let subprog_ctx = FkSubprogramContext::new(num_cols, false);
-
-    // Generate UPDATE SET NULL statement
+    let subprog_ctx = FkSubprogramContext::new(child_cols.len(), false);
     let stmt = generate_set_null_stmt(&fk_ref.child_table.name, child_cols, &subprog_ctx);
-    let mut subprogram_builder = ProgramBuilder::new_for_subprogram(
-        QueryMode::Normal,
-        program.capture_data_changes_mode().clone(),
-        ProgramBuilderOpts {
-            num_cursors: 2,
-            approx_num_insns: 32,
-            approx_num_labels: 4,
-        },
-    );
-    subprogram_builder.prologue();
-    subprogram_builder = translate_inner(
-        stmt,
-        resolver,
-        subprogram_builder,
-        connection,
-        "fk set null",
-    )?;
-    subprogram_builder.epilogue(resolver.schema);
-    let built_subprogram = subprogram_builder.build(connection.clone(), true, "fk set null")?;
-
-    // Build params: OLD key register indices
-    let params: Vec<Value> = ctx
-        .old_key_registers
-        .iter()
-        .copied()
-        .map(|reg_idx| Value::Integer(reg_idx as i64))
-        .collect();
-
-    let turso_stmt = Statement::new(
-        built_subprogram,
-        connection.pager.load().clone(),
-        QueryMode::Normal,
-    );
-    program.emit_insn(Insn::Program {
-        params,
-        program: Arc::new(RwLock::new(turso_stmt)),
-    });
-
-    Ok(())
+    emit_fk_action_subprogram(program, resolver, connection, stmt, ctx, "fk set null")
 }
 
 /// Compile and emit an FK SET DEFAULT action as a sub-program.
@@ -1431,48 +1488,8 @@ fn fire_fk_set_default(
 ) -> Result<()> {
     let child_cols = &fk_ref.fk.child_columns;
     let subprog_ctx = FkSubprogramContext::new(child_cols.len(), false);
-
-    // Generate UPDATE SET DEFAULT statement
     let stmt = generate_set_default_stmt(&fk_ref.child_table, child_cols, &subprog_ctx);
-    let mut subprogram_builder = ProgramBuilder::new_for_subprogram(
-        QueryMode::Normal,
-        program.capture_data_changes_mode().clone(),
-        ProgramBuilderOpts {
-            num_cursors: 2,
-            approx_num_insns: 32,
-            approx_num_labels: 4,
-        },
-    );
-    subprogram_builder.prologue();
-    subprogram_builder = translate_inner(
-        stmt,
-        resolver,
-        subprogram_builder,
-        connection,
-        "fk set default",
-    )?;
-    subprogram_builder.epilogue(resolver.schema);
-    let built_subprogram = subprogram_builder.build(connection.clone(), true, "fk set default")?;
-
-    // Build params: OLD key register indices
-    let params: Vec<Value> = ctx
-        .old_key_registers
-        .iter()
-        .copied()
-        .map(|reg_idx| Value::Integer(reg_idx as i64))
-        .collect();
-
-    let turso_stmt = Statement::new(
-        built_subprogram,
-        connection.pager.load().clone(),
-        QueryMode::Normal,
-    );
-    program.emit_insn(Insn::Program {
-        params,
-        program: Arc::new(RwLock::new(turso_stmt)),
-    });
-
-    Ok(())
+    emit_fk_action_subprogram(program, resolver, connection, stmt, ctx, "fk set default")
 }
 
 /// Compile and emit an FK CASCADE UPDATE action as a sub-program.
@@ -1485,64 +1502,17 @@ fn fire_fk_cascade_update(
     ctx: &FkActionContext,
 ) -> Result<()> {
     let child_cols = &fk_ref.fk.child_columns;
-    let num_cols = child_cols.len();
-
-    let new_key_registers = ctx
-        .new_key_registers
-        .as_ref()
-        .expect("new_key_registers required for cascade update");
-
-    // Create subprogram context with new params
-    let subprog_ctx = FkSubprogramContext::new(num_cols, true);
-
+    // CASCADE UPDATE needs new params for the SET clause
+    let subprog_ctx = FkSubprogramContext::new(child_cols.len(), true);
     let stmt = generate_cascade_update_stmt(&fk_ref.child_table.name, child_cols, &subprog_ctx);
-    let mut subprogram_builder = ProgramBuilder::new_for_subprogram(
-        QueryMode::Normal,
-        program.capture_data_changes_mode().clone(),
-        ProgramBuilderOpts {
-            num_cursors: 2,
-            approx_num_insns: 32,
-            approx_num_labels: 4,
-        },
-    );
-    subprogram_builder.prologue();
-    subprogram_builder = translate_inner(
-        stmt,
+    emit_fk_action_subprogram(
+        program,
         resolver,
-        subprogram_builder,
         connection,
+        stmt,
+        ctx,
         "fk cascade update",
-    )?;
-    subprogram_builder.epilogue(resolver.schema);
-    let built_subprogram =
-        subprogram_builder.build(connection.clone(), true, "fk cascade update")?;
-
-    // Build params: OLD key register indices, then NEW key register indices
-    let mut params: Vec<Value> = ctx
-        .old_key_registers
-        .iter()
-        .copied()
-        .map(|reg_idx| Value::Integer(reg_idx as i64))
-        .collect();
-
-    params.extend(
-        new_key_registers
-            .iter()
-            .copied()
-            .map(|reg_idx| Value::Integer(reg_idx as i64)),
-    );
-
-    let turso_stmt = Statement::new(
-        built_subprogram,
-        connection.pager.load().clone(),
-        QueryMode::Normal,
-    );
-    program.emit_insn(Insn::Program {
-        params,
-        program: Arc::new(RwLock::new(turso_stmt)),
-    });
-
-    Ok(())
+    )
 }
 
 /// Fire FK actions for DELETE on parent table using Program opcode.
@@ -1564,16 +1534,7 @@ pub fn fire_fk_delete_actions(
         .schema
         .resolved_fks_referencing(parent_table_name)?
     {
-        // Build parent key values into registers
-        let parent_cols: Vec<String> = if fk_ref.fk.parent_columns.is_empty() {
-            parent_bt
-                .primary_key_columns
-                .iter()
-                .map(|(n, _)| n.clone())
-                .collect()
-        } else {
-            fk_ref.fk.parent_columns.clone()
-        };
+        let parent_cols = get_fk_parent_cols(&fk_ref, &parent_bt);
         let ncols = parent_cols.len();
         let key_regs_start = program.alloc_registers(ncols);
 
@@ -1591,7 +1552,6 @@ pub fn fire_fk_delete_actions(
 
         match fk_ref.fk.on_delete {
             RefAct::NoAction | RefAct::Restrict => {
-                // Check for existence and raise violation - use existing inline code
                 emit_fk_delete_parent_existence_check_single(
                     program,
                     resolver,
@@ -1640,88 +1600,44 @@ pub fn fire_fk_update_actions(
         .schema
         .resolved_fks_referencing(parent_table_name)?
     {
-        // Build OLD parent key values into registers from already-loaded OLD column values
-        let parent_cols: Vec<String> = if fk_ref.fk.parent_columns.is_empty() {
-            parent_bt
-                .primary_key_columns
-                .iter()
-                .map(|(n, _)| n.clone())
-                .collect()
-        } else {
-            fk_ref.fk.parent_columns.clone()
-        };
+        let parent_cols = get_fk_parent_cols(&fk_ref, &parent_bt);
         let ncols = parent_cols.len();
 
-        // Copy OLD parent key values from old_values_start registers
+        // Copy OLD and NEW parent key values using the helper
         let old_key_start = program.alloc_registers(ncols);
-        for (i, pcol) in parent_cols.iter().enumerate() {
-            let src = if ROWID_STRS.iter().any(|s| pcol.eq_ignore_ascii_case(s)) {
-                old_rowid_reg
-            } else {
-                let (pos, col) = parent_bt
-                    .get_column(pcol)
-                    .ok_or_else(|| LimboError::InternalError(format!("col {pcol} missing")))?;
-                if col.is_rowid_alias() {
-                    old_rowid_reg
-                } else {
-                    old_values_start + pos
-                }
-            };
-            program.emit_insn(Insn::Copy {
-                src_reg: src,
-                dst_reg: old_key_start + i,
-                extra_amount: 0,
-            });
-        }
+        copy_key_from_values(
+            program,
+            &parent_bt,
+            &parent_cols,
+            old_values_start,
+            old_rowid_reg,
+            old_key_start,
+        )?;
 
-        // Build NEW parent key values into registers
         let new_key_start = program.alloc_registers(ncols);
-        for (i, pcol) in parent_cols.iter().enumerate() {
-            let src = if ROWID_STRS.iter().any(|s| pcol.eq_ignore_ascii_case(s)) {
-                new_rowid_reg
-            } else {
-                let (pos, col) = parent_bt
-                    .get_column(pcol)
-                    .ok_or_else(|| LimboError::InternalError(format!("col {pcol} missing")))?;
-                if col.is_rowid_alias() {
-                    new_rowid_reg
-                } else {
-                    new_values_start + pos
-                }
-            };
-            program.emit_insn(Insn::Copy {
-                src_reg: src,
-                dst_reg: new_key_start + i,
-                extra_amount: 0,
-            });
-        }
+        copy_key_from_values(
+            program,
+            &parent_bt,
+            &parent_cols,
+            new_values_start,
+            new_rowid_reg,
+            new_key_start,
+        )?;
 
         let old_key_registers: Vec<usize> = (old_key_start..old_key_start + ncols).collect();
         let new_key_registers: Vec<usize> = (new_key_start..new_key_start + ncols).collect();
 
-        // Check if parent key changed
+        // Check if parent key changed - skip action if all values are equal
         let skip_action = program.allocate_label();
         let key_changed = program.allocate_label();
-        for i in 0..ncols {
-            let next = if i + 1 == ncols {
-                None
-            } else {
-                Some(program.allocate_label())
-            };
-            program.emit_insn(Insn::Eq {
-                lhs: old_key_start + i,
-                rhs: new_key_start + i,
-                target_pc: next.unwrap_or(skip_action),
-                flags: CmpInsFlags::default(),
-                collation: None,
-            });
-            program.emit_insn(Insn::Goto {
-                target_pc: key_changed,
-            });
-            if let Some(n) = next {
-                program.preassign_label_to_next_insn(n);
-            }
-        }
+        emit_key_change_check(
+            program,
+            old_key_start,
+            new_key_start,
+            ncols,
+            skip_action,
+            key_changed,
+        );
 
         program.preassign_label_to_next_insn(key_changed);
 
