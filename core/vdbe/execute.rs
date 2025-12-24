@@ -9368,14 +9368,7 @@ pub fn op_hash_build(
     insn: &Insn,
     pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
-    let Insn::HashBuild { data } = insn else {
-        #[cfg(debug_assertions)]
-        panic!("Expected Insn::HashBuild, got {insn:?}");
-        #[cfg(not(debug_assertions))]
-        unsafe {
-            std::hint::unreachable_unchecked()
-        };
-    };
+    load_insn!(HashBuild { data }, insn);
 
     let mut op_state = state
         .op_hash_build_state
