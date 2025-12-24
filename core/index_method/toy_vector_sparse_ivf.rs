@@ -682,7 +682,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                     idx,
                 } => {
                     let record = return_if_io!(stats_cursor.record());
-                    let component = parse_stat_row(record.as_deref())?;
+                    let component = parse_stat_row(record)?;
                     let Some(v) = vector.as_ref() else {
                         return Err(LimboError::InternalError(
                             "vector must be present in ReadStats state".to_string(),
@@ -939,7 +939,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                     idx,
                 } => {
                     let record = return_if_io!(stats_cursor.record());
-                    let component = parse_stat_row(record.as_deref())?;
+                    let component = parse_stat_row(record)?;
                     let Some(v) = vector.as_ref() else {
                         return Err(LimboError::InternalError(
                             "vector must be present in ReadStats state".to_string(),
@@ -1159,7 +1159,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                         ));
                     };
                     let value = v.as_f32_sparse().values[*idx];
-                    let component = parse_stat_row(record.as_deref())?;
+                    let component = parse_stat_row(record)?;
                     let Some(comps) = components.as_mut() else {
                         return Err(LimboError::InternalError(
                             "components must be present in CollectComponentsRead state".to_string(),
@@ -1315,7 +1315,7 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                     current,
                 } => {
                     let record = return_if_io!(inverted.record());
-                    let row = parse_inverted_index_row(record.as_deref())?;
+                    let row = parse_inverted_index_row(record)?;
                     if row.position != *component
                         || (sum_threshold.is_some()
                             && row.sum

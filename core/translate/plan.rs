@@ -17,7 +17,7 @@ use crate::{
     vdbe::{
         affinity::Affinity,
         builder::{CursorKey, CursorType, ProgramBuilder},
-        insn::{IdxInsertFlags, Insn},
+        insn::{to_u16, IdxInsertFlags, Insn},
         BranchOffset, CursorID,
     },
     Result, VirtualTable,
@@ -347,9 +347,9 @@ impl DistinctCtx {
         });
         let record_reg = program.alloc_register();
         program.emit_insn(Insn::MakeRecord {
-            start_reg,
-            count: num_regs,
-            dest_reg: record_reg,
+            start_reg: to_u16(start_reg),
+            count: to_u16(num_regs),
+            dest_reg: to_u16(record_reg),
             index_name: Some(self.ephemeral_index_name.to_string()),
             affinity_str: None,
         });
@@ -885,45 +885,149 @@ impl TableReferences {
     }
 }
 
+/// Tracks which columns are used in a query. Optimized for the common case
+/// of ≤64 columns (single u64), with heap-allocated overflow
 #[derive(Clone, Debug, Default, PartialEq)]
-#[repr(transparent)]
-pub struct ColumnUsedMask(roaring::RoaringBitmap);
+pub struct ColumnUsedMask {
+    inline: u64,
+    overflow: Option<Vec<u64>>,
+}
 
 impl ColumnUsedMask {
+    const INLINE_BITS: usize = 64;
+
     pub fn set(&mut self, index: usize) {
-        self.0.insert(index as u32);
+        if index < Self::INLINE_BITS {
+            self.inline |= 1 << index;
+        } else {
+            let overflow_idx = (index - Self::INLINE_BITS) / 64;
+            let bit = (index - Self::INLINE_BITS) % 64;
+            let overflow = self.overflow.get_or_insert_with(Vec::new);
+            if overflow_idx >= overflow.len() {
+                overflow.resize(overflow_idx + 1, 0);
+            }
+            overflow[overflow_idx] |= 1 << bit;
+        }
     }
 
     pub fn get(&self, index: usize) -> bool {
-        self.0.contains(index as u32)
+        if index < Self::INLINE_BITS {
+            (self.inline >> index) & 1 != 0
+        } else {
+            let Some(overflow) = &self.overflow else {
+                return false;
+            };
+            let overflow_idx = (index - Self::INLINE_BITS) / 64;
+            let bit = (index - Self::INLINE_BITS) % 64;
+            overflow
+                .get(overflow_idx)
+                .is_some_and(|word| (word >> bit) & 1 != 0)
+        }
     }
 
     pub fn clear(&mut self, index: usize) {
-        self.0.remove(index as u32);
+        if index < Self::INLINE_BITS {
+            self.inline &= !(1 << index);
+        } else if let Some(overflow) = &mut self.overflow {
+            let overflow_idx = (index - Self::INLINE_BITS) / 64;
+            let bit = (index - Self::INLINE_BITS) % 64;
+            if let Some(word) = overflow.get_mut(overflow_idx) {
+                *word &= !(1 << bit);
+            }
+        }
     }
 
     pub fn contains_all_set_bits_of(&self, other: &Self) -> bool {
-        other.0.is_subset(&self.0)
+        if (self.inline & other.inline) != other.inline {
+            return false;
+        }
+        match (&self.overflow, &other.overflow) {
+            (None, None) => true,
+            (None, Some(other_ov)) => other_ov.iter().all(|&w| w == 0),
+            (Some(_), None) => true,
+            (Some(self_ov), Some(other_ov)) => other_ov.iter().enumerate().all(|(i, &other_w)| {
+                let self_w = self_ov.get(i).copied().unwrap_or(0);
+                (self_w & other_w) == other_w
+            }),
+        }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.inline == 0
+            && self
+                .overflow
+                .as_ref()
+                .is_none_or(|ov| ov.iter().all(|&w| w == 0))
+    }
+
+    pub fn is_only(&self, index: usize) -> bool {
+        if index < Self::INLINE_BITS {
+            self.inline == (1 << index)
+                && self
+                    .overflow
+                    .as_ref()
+                    .is_none_or(|ov| ov.iter().all(|&w| w == 0))
+        } else {
+            if self.inline != 0 {
+                return false;
+            }
+            let Some(overflow) = &self.overflow else {
+                return false;
+            };
+            let overflow_idx = (index - Self::INLINE_BITS) / 64;
+            let bit = (index - Self::INLINE_BITS) % 64;
+            overflow.iter().enumerate().all(|(i, &w)| {
+                if i == overflow_idx {
+                    w == (1 << bit)
+                } else {
+                    w == 0
+                }
+            })
+        }
     }
 
     pub fn subtract(&mut self, other: &Self) {
-        for idx in other.0.iter() {
-            self.0.remove(idx);
+        self.inline &= !other.inline;
+        if let (Some(self_ov), Some(other_ov)) = (&mut self.overflow, &other.overflow) {
+            for (i, other_w) in other_ov.iter().enumerate() {
+                if let Some(self_w) = self_ov.get_mut(i) {
+                    *self_w &= !other_w;
+                }
+            }
         }
     }
 
     pub fn iter(&self) -> impl Iterator<Item = usize> + '_ {
-        self.0.iter().map(|idx| idx as usize)
+        let inline_iter = (0..Self::INLINE_BITS).filter(|&i| (self.inline >> i) & 1 != 0);
+        let overflow_iter = self
+            .overflow
+            .iter()
+            .flat_map(|ov| ov.iter().enumerate())
+            .flat_map(|(word_idx, &word)| {
+                (0..64).filter_map(move |bit| {
+                    if (word >> bit) & 1 != 0 {
+                        Some(Self::INLINE_BITS + word_idx * 64 + bit)
+                    } else {
+                        None
+                    }
+                })
+            });
+        inline_iter.chain(overflow_iter)
     }
 }
 
 impl std::ops::BitOrAssign<&Self> for ColumnUsedMask {
     fn bitor_assign(&mut self, rhs: &Self) {
-        self.0 |= &rhs.0;
+        self.inline |= rhs.inline;
+        if let Some(rhs_ov) = &rhs.overflow {
+            let self_ov = self.overflow.get_or_insert_with(Vec::new);
+            if self_ov.len() < rhs_ov.len() {
+                self_ov.resize(rhs_ov.len(), 0);
+            }
+            for (i, &rhs_w) in rhs_ov.iter().enumerate() {
+                self_ov[i] |= rhs_w;
+            }
+        }
     }
 }
 
@@ -1154,9 +1258,6 @@ impl JoinedTable {
         index: &Index,
         required_columns: &mut ColumnUsedMask,
     ) {
-        if self.expression_index_usages.is_empty() {
-            return;
-        }
         let mut coverage_counts = vec![0usize; self.column_use_counts.len()];
         let mut any_covered = false;
         for usage in &self.expression_index_usages {
@@ -1302,33 +1403,54 @@ impl JoinedTable {
         if index.index_method.is_some() {
             return false;
         }
-        let mut required_columns = self.col_used_mask.clone();
-        self.apply_expression_index_coverage(index, &mut required_columns);
-        if required_columns.is_empty() {
-            return true;
-        }
-        let mut index_cols_mask = ColumnUsedMask::default();
-        for col in index.columns.iter().filter(|c| c.expr.is_none()) {
-            index_cols_mask.set(col.pos_in_table);
-        }
 
-        // If a table has a rowid (i.e. is not a WITHOUT ROWID table), the index is guaranteed to contain the rowid as well.
-        if btree.has_rowid {
-            if let Some(pos_of_rowid_alias_col) = btree.get_rowid_alias_column().map(|(pos, _)| pos)
-            {
-                let mut rowid_only = ColumnUsedMask::default();
-                rowid_only.set(pos_of_rowid_alias_col);
-                if required_columns == rowid_only {
-                    // However if the index would be ONLY used for the rowid, then let's not bother using it to cover the query.
-                    // Example: if the query is SELECT id FROM t, and id is a rowid alias, then let's rather just scan the table
-                    // instead of an index.
-                    return false;
-                }
-                index_cols_mask.set(pos_of_rowid_alias_col);
+        if self.expression_index_usages.is_empty() {
+            Self::index_covers_columns(index, btree, &self.col_used_mask)
+        } else {
+            let mut required_columns = self.col_used_mask.clone();
+            self.apply_expression_index_coverage(index, &mut required_columns);
+            if required_columns.is_empty() {
+                return true;
+            }
+            Self::index_covers_columns(index, btree, &required_columns)
+        }
+    }
+
+    fn index_covers_columns(
+        index: &Index,
+        btree: &BTreeTable,
+        required_columns: &ColumnUsedMask,
+    ) -> bool {
+        // If a table has a rowid, the index is guaranteed to contain it as well.
+        let rowid_alias_pos = if btree.has_rowid {
+            btree.get_rowid_alias_column().map(|(pos, _)| pos)
+        } else {
+            None
+        };
+
+        if let Some(pos) = rowid_alias_pos {
+            if required_columns.is_only(pos) {
+                // If the index would be ONLY used for the rowid, don't bother.
+                // Example: SELECT id FROM t where id is a rowid alias - just scan the table.
+                return false;
             }
         }
 
-        index_cols_mask.contains_all_set_bits_of(&required_columns)
+        // Check that every required column is covered by the index
+        for required_col in required_columns.iter() {
+            if rowid_alias_pos == Some(required_col) {
+                // rowid is always implicitly covered by the index
+                continue;
+            }
+            let covered_by_index = index
+                .columns
+                .iter()
+                .any(|c| c.expr.is_none() && c.pos_in_table == required_col);
+            if !covered_by_index {
+                return false;
+            }
+        }
+        true
     }
 
     /// Returns true if the index selected for use with this [TableReference] is a covering index,
@@ -1889,5 +2011,307 @@ mod tests {
         }
 
         assert!(!sparse_mask.is_empty());
+    }
+
+    #[test]
+    fn test_column_used_mask_clear() {
+        let mut mask = ColumnUsedMask::default();
+
+        // Test inline clear
+        mask.set(5);
+        mask.set(10);
+        assert!(mask.get(5));
+        mask.clear(5);
+        assert!(!mask.get(5));
+        assert!(mask.get(10));
+
+        // Test overflow clear
+        mask.set(100);
+        mask.set(200);
+        assert!(mask.get(100));
+        mask.clear(100);
+        assert!(!mask.get(100));
+        assert!(mask.get(200));
+
+        // Clear non-existent bit should be no-op
+        mask.clear(999);
+        assert!(!mask.get(999));
+    }
+
+    #[test]
+    fn test_column_used_mask_is_only() {
+        // Test inline is_only
+        let mut mask = ColumnUsedMask::default();
+        mask.set(5);
+        assert!(mask.is_only(5));
+        assert!(!mask.is_only(0));
+        assert!(!mask.is_only(100));
+
+        mask.set(10);
+        assert!(!mask.is_only(5));
+        assert!(!mask.is_only(10));
+
+        // Test overflow is_only
+        let mut mask2 = ColumnUsedMask::default();
+        mask2.set(100);
+        assert!(mask2.is_only(100));
+        assert!(!mask2.is_only(0));
+        assert!(!mask2.is_only(50));
+
+        mask2.set(200);
+        assert!(!mask2.is_only(100));
+
+        // Test empty mask
+        let empty = ColumnUsedMask::default();
+        assert!(!empty.is_only(0));
+        assert!(!empty.is_only(100));
+    }
+
+    #[test]
+    fn test_column_used_mask_subtract() {
+        let mut mask1 = ColumnUsedMask::default();
+        let mut mask2 = ColumnUsedMask::default();
+
+        // Set up mask1 with inline and overflow bits
+        for i in [1, 5, 10, 63, 64, 100, 200] {
+            mask1.set(i);
+        }
+
+        // Set up mask2 with some overlapping bits
+        for i in [5, 10, 100] {
+            mask2.set(i);
+        }
+
+        mask1.subtract(&mask2);
+
+        // Should remain
+        assert!(mask1.get(1));
+        assert!(mask1.get(63));
+        assert!(mask1.get(64));
+        assert!(mask1.get(200));
+
+        // Should be cleared
+        assert!(!mask1.get(5));
+        assert!(!mask1.get(10));
+        assert!(!mask1.get(100));
+    }
+
+    #[test]
+    fn test_column_used_mask_iter() {
+        let mut mask = ColumnUsedMask::default();
+        let indices = vec![0, 5, 63, 64, 65, 127, 128, 200, 1000];
+
+        for &i in &indices {
+            mask.set(i);
+        }
+
+        let collected: Vec<usize> = mask.iter().collect();
+        assert_eq!(collected, indices);
+
+        // Empty mask iter
+        let empty = ColumnUsedMask::default();
+        assert_eq!(empty.iter().count(), 0);
+    }
+
+    #[test]
+    fn test_column_used_mask_bitor_assign() {
+        let mut mask1 = ColumnUsedMask::default();
+        let mut mask2 = ColumnUsedMask::default();
+
+        // Inline bits
+        mask1.set(1);
+        mask1.set(5);
+        mask2.set(5);
+        mask2.set(10);
+
+        // Overflow bits
+        mask1.set(100);
+        mask2.set(200);
+
+        mask1 |= &mask2;
+
+        assert!(mask1.get(1));
+        assert!(mask1.get(5));
+        assert!(mask1.get(10));
+        assert!(mask1.get(100));
+        assert!(mask1.get(200));
+
+        // mask2 should be unchanged
+        assert!(!mask2.get(1));
+        assert!(mask2.get(5));
+        assert!(mask2.get(10));
+        assert!(!mask2.get(100));
+        assert!(mask2.get(200));
+    }
+
+    #[test]
+    fn test_column_used_mask_boundary_conditions() {
+        let mut mask = ColumnUsedMask::default();
+
+        // Test at inline/overflow boundary
+        mask.set(63); // last inline bit
+        mask.set(64); // first overflow bit
+
+        assert!(mask.get(63));
+        assert!(mask.get(64));
+        assert!(!mask.get(62));
+        assert!(!mask.get(65));
+
+        // Test is_only at boundary
+        let mut mask2 = ColumnUsedMask::default();
+        mask2.set(63);
+        assert!(mask2.is_only(63));
+
+        let mut mask3 = ColumnUsedMask::default();
+        mask3.set(64);
+        assert!(mask3.is_only(64));
+    }
+
+    fn rng_from_env_or_time() -> (ChaCha8Rng, u64) {
+        let seed = std::env::var("TEST_SEED")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos() as u64
+            });
+        (ChaCha8Rng::seed_from_u64(seed), seed)
+    }
+
+    /// Reference implementation using BTreeSet for correctness comparison
+    struct ReferenceMask(std::collections::BTreeSet<usize>);
+
+    impl ReferenceMask {
+        fn new() -> Self {
+            Self(std::collections::BTreeSet::new())
+        }
+        fn set(&mut self, index: usize) {
+            self.0.insert(index);
+        }
+        fn get(&self, index: usize) -> bool {
+            self.0.contains(&index)
+        }
+        fn clear(&mut self, index: usize) {
+            self.0.remove(&index);
+        }
+        fn is_empty(&self) -> bool {
+            self.0.is_empty()
+        }
+        fn is_only(&self, index: usize) -> bool {
+            self.0.len() == 1 && self.0.contains(&index)
+        }
+        fn contains_all_set_bits_of(&self, other: &Self) -> bool {
+            other.0.is_subset(&self.0)
+        }
+        fn subtract(&mut self, other: &Self) {
+            for &idx in &other.0 {
+                self.0.remove(&idx);
+            }
+        }
+        fn bitor_assign(&mut self, other: &Self) {
+            for &idx in &other.0 {
+                self.0.insert(idx);
+            }
+        }
+    }
+
+    #[test]
+    fn test_column_used_mask_fuzz() {
+        let (mut rng, seed) = rng_from_env_or_time();
+        eprintln!("test_column_used_mask_random_ops seed: {seed}");
+
+        let mut mask = ColumnUsedMask::default();
+        let mut reference = ReferenceMask::new();
+
+        let num_ops = 100000;
+        let max_index = 4096;
+
+        for _ in 0..num_ops {
+            let op = rng.next_u32() % 10;
+            let idx = (rng.next_u32() % max_index) as usize;
+
+            match op {
+                0..=2 => {
+                    // Set (more frequent)
+                    mask.set(idx);
+                    reference.set(idx);
+                }
+                3 => {
+                    // Get
+                    assert_eq!(
+                        mask.get(idx),
+                        reference.get(idx),
+                        "get({idx}) mismatch, seed={seed}"
+                    );
+                }
+                4 => {
+                    // Clear
+                    mask.clear(idx);
+                    reference.clear(idx);
+                }
+                5 => {
+                    // IsEmpty
+                    assert_eq!(
+                        mask.is_empty(),
+                        reference.is_empty(),
+                        "is_empty mismatch, seed={seed}"
+                    );
+                }
+                6 => {
+                    // IsOnly
+                    assert_eq!(
+                        mask.is_only(idx),
+                        reference.is_only(idx),
+                        "is_only({idx}) mismatch, seed={seed}"
+                    );
+                }
+                7 => {
+                    // ContainsAllSetBitsOf with random other mask
+                    let mut other_mask = ColumnUsedMask::default();
+                    let mut other_ref = ReferenceMask::new();
+                    for _ in 0..(rng.next_u32() % 20) {
+                        let other_idx = (rng.next_u32() % max_index) as usize;
+                        other_mask.set(other_idx);
+                        other_ref.set(other_idx);
+                    }
+                    assert_eq!(
+                        mask.contains_all_set_bits_of(&other_mask),
+                        reference.contains_all_set_bits_of(&other_ref),
+                        "contains_all_set_bits_of mismatch, seed={seed}"
+                    );
+                }
+                8 => {
+                    // BitOrAssign with random other mask
+                    let mut other_mask = ColumnUsedMask::default();
+                    let mut other_ref = ReferenceMask::new();
+                    for _ in 0..(rng.next_u32() % 20) {
+                        let other_idx = (rng.next_u32() % max_index) as usize;
+                        other_mask.set(other_idx);
+                        other_ref.set(other_idx);
+                    }
+                    mask |= &other_mask;
+                    reference.bitor_assign(&other_ref);
+                }
+                9 => {
+                    // Subtract with random other mask
+                    let mut other_mask = ColumnUsedMask::default();
+                    let mut other_ref = ReferenceMask::new();
+                    for _ in 0..(rng.next_u32() % 20) {
+                        let other_idx = (rng.next_u32() % max_index) as usize;
+                        other_mask.set(other_idx);
+                        other_ref.set(other_idx);
+                    }
+                    mask.subtract(&other_mask);
+                    reference.subtract(&other_ref);
+                }
+                _ => unreachable!(),
+            }
+        }
+
+        // Final verification: iter should produce same results
+        let mask_set: std::collections::BTreeSet<usize> = mask.iter().collect();
+        assert_eq!(mask_set, reference.0, "final iter mismatch, seed={seed}");
     }
 }

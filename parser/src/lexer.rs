@@ -299,6 +299,38 @@ impl<'a> Lexer<'a> {
     }
 
     #[inline]
+    // Eats up to but not including the specified byte, returns true if found
+    fn eat_until(&mut self, byte: u8) -> bool {
+        match memchr::memchr(byte, self.remaining()) {
+            Some(pos) => {
+                self.offset += pos;
+                true
+            }
+            None => {
+                cold();
+                self.offset = self.input.len();
+                false
+            }
+        }
+    }
+
+    #[inline]
+    // Eats up to and including the specified byte, returns true if found
+    fn eat_past(&mut self, byte: u8) -> bool {
+        match memchr::memchr(byte, self.remaining()) {
+            Some(pos) => {
+                self.offset += pos + 1;
+                true
+            }
+            None => {
+                cold();
+                self.offset = self.input.len();
+                false
+            }
+        }
+    }
+
+    #[inline]
     fn eat_while<F>(&mut self, f: F)
     where
         F: Fn(u8) -> bool,
@@ -420,8 +452,7 @@ impl<'a> Lexer<'a> {
         match self.peek() {
             Some(b'-') => {
                 self.eat_and_assert(|b| b == b'-');
-                self.eat_while(|b| b != b'\n');
-                if self.peek() == Some(b'\n') {
+                if self.eat_until(b'\n') {
                     self.eat_and_assert(|b| b == b'\n');
                 }
 
@@ -449,21 +480,18 @@ impl<'a> Lexer<'a> {
             Some(b'*') => {
                 self.eat_and_assert(|b| b == b'*');
                 loop {
-                    self.eat_while(|b| b != b'*');
-                    match self.peek() {
-                        Some(b'*') => {
-                            self.eat_and_assert(|b| b == b'*');
-                            match self.peek() {
-                                Some(b'/') => {
-                                    self.eat_and_assert(|b| b == b'/');
-                                    break; // End of block comment
-                                }
-                                None => break,
-                                _ => {}
+                    if self.eat_past(b'*') {
+                        match self.peek() {
+                            Some(b'/') => {
+                                self.eat_and_assert(|b| b == b'/');
+                                break; // End of block comment
                             }
+                            None => break,
+                            _ => {}
                         }
-                        None => break,
-                        _ => unreachable!(), // We should not reach here
+                    } else {
+                        cold();
+                        break;
                     }
                 }
 
@@ -570,29 +598,24 @@ impl<'a> Lexer<'a> {
         };
 
         loop {
-            self.eat_while(|b| b != quote);
-            match self.peek() {
-                Some(b) if b == quote => {
-                    self.eat_and_assert(|b| b == quote);
-                    match self.peek() {
-                        Some(b) if b == quote => {
-                            self.eat_and_assert(|b| b == quote);
-                            continue;
-                        }
-                        _ => break,
+            if self.eat_past(quote) {
+                match self.peek() {
+                    Some(b) if b == quote => {
+                        self.eat_and_assert(|b| b == quote);
+                        continue;
                     }
+                    _ => break,
                 }
-                None => {
-                    let token_text =
-                        String::from_utf8_lossy(&self.input[start..self.offset]).to_string();
-                    return Err(Error::UnterminatedLiteral {
-                        span: (start, self.offset - start).into(),
-                        token_text,
-                        offset: start,
-                    });
-                }
-                _ => unreachable!(),
-            };
+            } else {
+                cold();
+                let token_text =
+                    String::from_utf8_lossy(&self.input[start..self.offset]).to_string();
+                return Err(Error::UnterminatedLiteral {
+                    span: (start, self.offset - start).into(),
+                    token_text,
+                    offset: start,
+                });
+            }
         }
 
         Ok(Token::new(&self.input[start..self.offset], tt))
@@ -751,25 +774,19 @@ impl<'a> Lexer<'a> {
     fn eat_bracket(&mut self) -> Result<Token<'a>> {
         let start = self.offset;
         self.eat_and_assert(|b| b == b'[');
-        self.eat_while(|b| b != b']');
-        match self.peek() {
-            Some(b']') => {
-                self.eat_and_assert(|b| b == b']');
-                Ok(Token::new(
-                    &self.input[start..self.offset],
-                    TokenType::TK_ID,
-                ))
-            }
-            None => {
-                let token_text =
-                    String::from_utf8_lossy(&self.input[start..self.offset]).to_string();
-                Err(Error::UnterminatedBracket {
-                    span: (start, self.offset - start).into(),
-                    token_text,
-                    offset: start,
-                })
-            }
-            _ => unreachable!(), // We should not reach here
+        if self.eat_past(b']') {
+            Ok(Token::new(
+                &self.input[start..self.offset],
+                TokenType::TK_ID,
+            ))
+        } else {
+            cold();
+            let token_text = String::from_utf8_lossy(&self.input[start..self.offset]).to_string();
+            Err(Error::UnterminatedBracket {
+                span: (start, self.offset - start).into(),
+                token_text,
+                offset: start,
+            })
         }
     }
 

@@ -975,7 +975,7 @@ fn test_cursor_with_empty_table() {
     let table_id = -1; // Empty table
 
     // Test LazyScanCursor with empty table
-    let cursor = MvccLazyCursor::new(
+    let mut cursor = MvccLazyCursor::new(
         db.mvcc_store.clone(),
         tx_id,
         table_id,

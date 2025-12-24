@@ -3,6 +3,13 @@ use std::{
     sync::Arc,
 };
 
+/// Convert a usize to u16 for instruction fields (registers, counts).
+/// Panics if the value exceeds u16::MAX.
+#[inline]
+pub fn to_u16(v: usize) -> u16 {
+    v.try_into().expect("value exceeds u16::MAX")
+}
+
 use super::{execute, AggFunc, BranchOffset, CursorID, FuncCtx, InsnFunction, PageIdx};
 use crate::{
     schema::{BTreeTable, Column, Index},
@@ -159,6 +166,22 @@ impl<T: Copy + std::fmt::Display> std::fmt::Display for RegisterOrLiteral<T> {
             Self::Register(reg) => reg.fmt(f),
         }
     }
+}
+
+/// Data for HashBuild instruction (boxed to keep Insn small).
+#[derive(Debug)]
+pub struct HashBuildData {
+    pub cursor_id: CursorID,
+    pub key_start_reg: usize,
+    pub num_keys: usize,
+    pub hash_table_id: usize,
+    pub mem_budget: usize,
+    pub collations: Vec<CollationSeq>,
+    /// Starting register for payload columns to store in the hash entry.
+    /// When Some: payload_start_reg..payload_start_reg+num_payload-1 contain values to cache.
+    pub payload_start_reg: Option<usize>,
+    /// Number of payload columns to read
+    pub num_payload: usize,
 }
 
 // There are currently 190 opcodes in sqlite
@@ -485,9 +508,9 @@ pub enum Insn {
 
     // Make a record and write it to destination register.
     MakeRecord {
-        start_reg: usize, // P1
-        count: usize,     // P2
-        dest_reg: usize,  // P3
+        start_reg: u16, // P1
+        count: u16,     // P2
+        dest_reg: u16,  // P3
         index_name: Option<String>,
         affinity_str: Option<String>,
     },
@@ -754,10 +777,10 @@ pub enum Insn {
 
     /// Open a sorter.
     SorterOpen {
-        cursor_id: CursorID,                   // P1
-        columns: usize,                        // P2
-        order: Vec<SortOrder>,                 // P4.
-        collations: Vec<Option<CollationSeq>>, // The only reason for using Option<CollationSeq> is so the explain message is the same as in SQLite
+        cursor_id: CursorID, // P1
+        columns: usize,      // P2
+        /// Combined order and collation per column (keeps Insn small, and order+collations are always the same length).
+        order_and_collations: Vec<(SortOrder, Option<CollationSeq>)>,
     },
 
     /// Insert a row into the sorter.
@@ -1228,12 +1251,12 @@ pub enum Insn {
     },
     AddColumn {
         table: String,
-        column: Column,
+        column: Box<Column>,
     },
     AlterColumn {
         table: String,
         column_index: usize,
-        definition: turso_parser::ast::ColumnDefinition,
+        definition: Box<turso_parser::ast::ColumnDefinition>,
         rename: bool,
     },
     /// Try to set the maximum page count for database P1 to the value in P3.
@@ -1294,22 +1317,8 @@ pub enum Insn {
     },
 
     /// Build a hash table from a cursor for hash join.
-    /// Reads pre-computed key values from registers (key_start_reg..key_start_reg+num_keys-1),
-    /// gets the rowid from cursor_id, and inserts the (key_values, rowid) pair into the hash table.
-    /// Optionally also stores payload values (result columns from the build table) to avoid
-    /// an additional btree seek during probe phase.
     HashBuild {
-        cursor_id: CursorID,
-        key_start_reg: usize,
-        num_keys: usize,
-        hash_table_id: usize,
-        mem_budget: usize,
-        collations: Vec<CollationSeq>,
-        /// Starting register for payload columns to store in the hash entry.
-        /// When Some: payload_start_reg..payload_start_reg+num_payload-1 contain values to cache.
-        payload_start_reg: Option<usize>,
-        /// Number of payload columns to read
-        num_payload: usize,
+        data: Box<HashBuildData>,
     },
 
     /// Finalize the hash table build phase. Transitions the hash table from Building to Probing state.
@@ -1326,15 +1335,15 @@ pub enum Insn {
     /// payload_dest_reg..payload_dest_reg+num_payload-1.
     /// If no matches, jump to target_pc.
     HashProbe {
-        hash_table_id: usize,
-        key_start_reg: usize,
-        num_keys: usize,
-        dest_reg: usize,
+        hash_table_id: u16,
+        key_start_reg: u16,
+        num_keys: u16,
+        dest_reg: u16,
         target_pc: BranchOffset,
         /// Starting register to write payload columns from hash entry.
-        payload_dest_reg: Option<usize>,
+        payload_dest_reg: Option<u16>,
         /// Number of payload columns expected
-        num_payload: usize,
+        num_payload: u16,
     },
 
     /// Advance to next matching row in hash table bucket.

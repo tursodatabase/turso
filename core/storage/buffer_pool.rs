@@ -27,6 +27,7 @@ pub struct ArenaBuffer {
 // Unsound: write and read from different threads can be dangerous with current ArenaBuffer implementation without some additional explicit synchronization
 unsafe impl Sync for ArenaBuffer {}
 unsafe impl Send for ArenaBuffer {}
+crate::assert::assert_send_sync!(ArenaBuffer);
 
 impl ArenaBuffer {
     const fn new(
@@ -95,8 +96,10 @@ impl std::ops::DerefMut for ArenaBuffer {
 pub struct BufferPool {
     inner: UnsafeCell<PoolInner>,
 }
+
 unsafe impl Sync for BufferPool {}
 unsafe impl Send for BufferPool {}
+crate::assert::assert_send_sync!(BufferPool);
 
 struct PoolInner {
     /// An instance of the program's IO, used for registering
@@ -119,6 +122,7 @@ struct PoolInner {
 
 unsafe impl Sync for PoolInner {}
 unsafe impl Send for PoolInner {}
+crate::assert::assert_send_sync!(PoolInner);
 
 impl Default for BufferPool {
     fn default() -> Self {

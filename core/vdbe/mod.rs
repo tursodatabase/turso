@@ -248,6 +248,7 @@ pub struct Row {
 // See: https://github.com/tursodatabase/turso/issues/1552
 unsafe impl Send for Row {}
 unsafe impl Sync for Row {}
+crate::assert::assert_send_sync!(Row);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TxnCleanup {
@@ -389,6 +390,7 @@ impl std::fmt::Debug for Program {
 // See: https://github.com/tursodatabase/turso/issues/1552
 unsafe impl Send for ProgramState {}
 unsafe impl Sync for ProgramState {}
+crate::assert::assert_send_sync!(ProgramState);
 
 impl ProgramState {
     pub fn new(max_registers: usize, max_cursors: usize) -> Self {

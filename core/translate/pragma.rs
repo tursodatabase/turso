@@ -146,6 +146,11 @@ fn update_pragma(
             update_cache_size(cache_size, pager, connection)?;
             Ok((program, TransactionMode::None))
         }
+        PragmaName::CacheSpill => {
+            let enabled = parse_pragma_enabled(&value);
+            connection.get_pager().set_spill_enabled(enabled);
+            Ok((program, TransactionMode::None))
+        }
         PragmaName::Encoding => {
             let year = chrono::Local::now().year();
             bail_parse_error!("It's {year}. UTF-8 won.");
@@ -443,6 +448,13 @@ fn query_pragma(
         }
         PragmaName::CacheSize => {
             program.emit_int(connection.get_cache_size() as i64, register);
+            program.emit_result_row(register, 1);
+            program.add_pragma_result_column(pragma.to_string());
+            Ok((program, TransactionMode::None))
+        }
+        PragmaName::CacheSpill => {
+            let spill_enabled = connection.get_pager().get_spill_enabled();
+            program.emit_int(spill_enabled as i64, register);
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
             Ok((program, TransactionMode::None))

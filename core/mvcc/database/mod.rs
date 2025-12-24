@@ -30,8 +30,7 @@ use crate::ValueRef;
 use crate::{Connection, Pager};
 use crossbeam_skiplist::map::Entry;
 use crossbeam_skiplist::{SkipMap, SkipSet};
-use parking_lot::RwLock;
-use std::cell::RefCell;
+use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::marker::PhantomData;
@@ -477,7 +476,9 @@ pub enum CommitState<Clock: LogicalClock> {
         end_ts: u64,
     },
     Checkpoint {
-        state_machine: RefCell<StateMachine<CheckpointStateMachine<Clock>>>,
+        // TODO: if and when we transform this code to async we won't be needing this explicit state machine nor
+        // the mutex
+        state_machine: Mutex<StateMachine<CheckpointStateMachine<Clock>>>,
     },
     CommitEnd {
         end_ts: u64,
@@ -894,7 +895,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                         self.connection.clone(),
                         false,
                     ));
-                    let state_machine = RefCell::new(state_machine);
+                    let state_machine = Mutex::new(state_machine);
                     self.state = CommitState::Checkpoint { state_machine };
                     return Ok(TransitionResult::Continue);
                 }
@@ -903,7 +904,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 Ok(TransitionResult::Done(()))
             }
             CommitState::Checkpoint { state_machine } => {
-                match state_machine.borrow_mut().step(&())? {
+                match state_machine.lock().step(&())? {
                     IOResult::Done(_) => {}
                     IOResult::IO(iocompletions) => {
                         return Ok(TransitionResult::Io(iocompletions));

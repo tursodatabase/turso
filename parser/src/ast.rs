@@ -1458,6 +1458,8 @@ pub enum PragmaName {
     BusyTimeout,
     /// `cache_size` pragma
     CacheSize,
+    /// set the cache spill behavior
+    CacheSpill,
     /// encryption cipher algorithm name for encrypted databases
     #[strum(serialize = "cipher")]
     #[cfg_attr(feature = "serde", serde(rename = "cipher"))]

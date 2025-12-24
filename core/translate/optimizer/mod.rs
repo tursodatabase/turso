@@ -611,6 +611,9 @@ fn optimize_table_access(
     limit: &mut Option<Box<Expr>>,
     offset: &mut Option<Box<Expr>>,
 ) -> Result<Option<Vec<JoinOrderMember>>> {
+    if table_references.joined_tables().is_empty() {
+        return Ok(None);
+    }
     if table_references.joined_tables().len() > TableReferences::MAX_JOINED_TABLES {
         crate::bail_parse_error!(
             "Only up to {} tables can be joined",
@@ -618,12 +621,20 @@ fn optimize_table_access(
         );
     }
 
-    register_expression_index_usages_for_plan(
-        table_references,
-        result_columns,
-        order_by.as_slice(),
-        group_by.as_ref(),
-    );
+    let has_expression_index = table_references.joined_tables().iter().any(|t| {
+        matches!(&t.table, Table::BTree(btree) if available_indexes
+            .get(&btree.name)
+            .is_some_and(|indexes| indexes.iter().any(|index| index.is_expression_index())))
+    });
+
+    if has_expression_index {
+        register_expression_index_usages_for_plan(
+            table_references,
+            result_columns,
+            order_by.as_slice(),
+            group_by.as_ref(),
+        );
+    }
 
     if table_references.joined_tables().len() == 1 {
         let optimized = optimize_table_access_with_custom_modules(

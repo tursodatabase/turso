@@ -317,12 +317,14 @@ mod tests {
             }
 
             // Get the record at this position
-            let record = pager
-                .io
-                .block(|| cursors.table_cursor.record())
-                .unwrap()
-                .unwrap()
-                .to_owned();
+            let record = loop {
+                match cursors.table_cursor.record().unwrap() {
+                    IOResult::Done(r) => break r,
+                    IOResult::IO(io) => io.wait(&*pager.io).unwrap(),
+                }
+            }
+            .unwrap()
+            .to_owned();
 
             let values_ref = record.get_values();
             let values: Vec<Value> = values_ref.into_iter().map(|x| x.to_owned()).collect();

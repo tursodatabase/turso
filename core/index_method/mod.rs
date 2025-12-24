@@ -143,11 +143,11 @@ pub(crate) fn open_index_cursor(
         )));
     };
     let mut cursor = BTreeCursor::new(pager, scratch.root_page, keys.len());
-    cursor.index_info = Some(IndexInfo {
+    cursor.index_info = Some(Arc::new(IndexInfo {
         has_rowid: false,
         num_cols: keys.len(),
         key_info: keys,
-    });
+    }));
     Ok(cursor)
 }
 

@@ -20,7 +20,7 @@ use crate::translate::plan::{
     ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReferences,
 };
 use crate::vdbe::builder::CursorKey;
-use crate::vdbe::insn::{CmpInsFlags, Cookie};
+use crate::vdbe::insn::{to_u16, CmpInsFlags, Cookie};
 use crate::vdbe::BranchOffset;
 use crate::{
     schema::{BTreeTable, Index, IndexColumn, PseudoCursorType},
@@ -296,9 +296,9 @@ pub fn translate_create_index(
         });
         let record_reg = program.alloc_register();
         program.emit_insn(Insn::MakeRecord {
-            start_reg,
-            count: columns.len() + 1,
-            dest_reg: record_reg,
+            start_reg: to_u16(start_reg),
+            count: to_u16(columns.len() + 1),
+            dest_reg: to_u16(record_reg),
             index_name: Some(idx_name.clone()),
             affinity_str: None,
         });
@@ -321,14 +321,13 @@ pub fn translate_create_index(
         });
         program.preassign_label_to_next_insn(loop_end_label);
     } else if index_method.is_none() {
-        // determine the order of the columns in the index for the sorter
-        let order = idx.columns.iter().map(|c| c.order).collect();
+        // determine the order and collation of the columns in the index for the sorter
+        let order_and_collations = idx.columns.iter().map(|c| (c.order, c.collation)).collect();
         // open the sorter and the pseudo table
         program.emit_insn(Insn::SorterOpen {
             cursor_id: sorter_cursor_id,
             columns: columns.len(),
-            order,
-            collations: idx.columns.iter().map(|c| c.collation).collect(),
+            order_and_collations,
         });
         let content_reg = program.alloc_register();
         program.emit_insn(Insn::OpenPseudo {
@@ -394,9 +393,9 @@ pub fn translate_create_index(
         });
         let record_reg = program.alloc_register();
         program.emit_insn(Insn::MakeRecord {
-            start_reg,
-            count: columns.len() + 1,
-            dest_reg: record_reg,
+            start_reg: to_u16(start_reg),
+            count: to_u16(columns.len() + 1),
+            dest_reg: to_u16(record_reg),
             index_name: Some(idx_name.clone()),
             affinity_str: None,
         });

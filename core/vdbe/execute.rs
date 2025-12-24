@@ -55,7 +55,6 @@ use crate::{get_cursor, CheckpointMode, Completion, Connection, DatabaseStorage,
 use either::Either;
 use std::any::Any;
 use std::env::temp_dir;
-use std::ops::DerefMut;
 use std::str::FromStr;
 use std::{
     borrow::BorrowMut,
@@ -1513,12 +1512,12 @@ pub fn op_column(
                             }
 
                             let record_result = return_if_io!(cursor.record());
-                            let Some(payload) = record_result.as_ref().map(|r| r.get_payload())
-                            else {
+                            let Some(record) = record_result else {
                                 break 'ifnull;
                             };
+                            let payload = record.get_payload();
 
-                            let mut record_cursor = cursor.record_cursor_mut();
+                            let mut record_cursor = record.cursor();
 
                             if record_cursor.offsets.is_empty() {
                                 let (header_size, header_len_bytes) = read_varint_fast(payload)?;
@@ -1603,7 +1602,6 @@ pub fn op_column(
                                 )
                             };
                             let serial_type = record_cursor.serial_types[target_column];
-                            drop(record_result);
                             drop(record_cursor);
 
                             match serial_type {
@@ -1871,23 +1869,27 @@ pub fn op_make_record(
         insn
     );
 
+    let start_reg = *start_reg as usize;
+    let count = *count as usize;
+    let dest_reg = *dest_reg as usize;
+
     if let Some(affinity_str) = affinity_str {
-        if affinity_str.len() != *count {
+        if affinity_str.len() != count {
             return Err(LimboError::InternalError(format!(
                 "MakeRecord: the length of affinity string ({}) does not match the count ({})",
                 affinity_str.len(),
-                *count
+                count
             )));
         }
-        for (i, affinity_ch) in affinity_str.chars().enumerate().take(*count) {
-            let reg_index = *start_reg + i;
+        for (i, affinity_ch) in affinity_str.chars().enumerate().take(count) {
+            let reg_index = start_reg + i;
             let affinity = Affinity::from_char(affinity_ch);
             apply_affinity_char(&mut state.registers[reg_index], affinity);
         }
     }
 
-    let record = make_record(&state.registers, start_reg, count);
-    state.registers[*dest_reg] = Register::Record(record);
+    let record = make_record(&state.registers, &start_reg, &count);
+    state.registers[dest_reg] = Register::Record(record);
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
@@ -2844,10 +2846,8 @@ pub fn op_row_id(
                             let record = return_if_io!(index_cursor.record());
                             let record =
                                 record.as_ref().expect("index cursor should have a record");
-                            let mut record_cursor_ref = index_cursor.record_cursor_mut();
-                            let record_cursor = record_cursor_ref.deref_mut();
                             let rowid = record
-                                .last_value(record_cursor)
+                                .last_value()
                                 .expect("record should have a last value");
                             match rowid {
                                 Ok(ValueRef::Integer(rowid)) => rowid,
@@ -3509,6 +3509,7 @@ pub fn op_idx_ge(
     let pc = {
         let cursor = get_cursor!(state, *cursor_id);
         let cursor = cursor.as_btree_mut();
+        let index_info = cursor.get_index_info().clone();
 
         let pc = if let Some(idx_record) = return_if_io!(cursor.record()) {
             // Create the comparison record from registers
@@ -3516,9 +3517,9 @@ pub fn op_idx_ge(
                 registers_to_ref_values(&state.registers[*start_reg..*start_reg + *num_regs]);
             let tie_breaker = get_tie_breaker_from_idx_comp_op(insn);
             let ord = compare_records_generic(
-                &idx_record,             // The serialized record from the index
-                values,                  // The record built from registers
-                cursor.get_index_info(), // Sort order flags
+                idx_record,  // The serialized record from the index
+                values,      // The record built from registers
+                &index_info, // Sort order flags
                 0,
                 tie_breaker,
             )?;
@@ -3578,18 +3579,13 @@ pub fn op_idx_le(
     let pc = {
         let cursor = get_cursor!(state, *cursor_id);
         let cursor = cursor.as_btree_mut();
+        let index_info = cursor.get_index_info().clone();
 
         let pc = if let Some(idx_record) = return_if_io!(cursor.record()) {
             let values =
                 registers_to_ref_values(&state.registers[*start_reg..*start_reg + *num_regs]);
             let tie_breaker = get_tie_breaker_from_idx_comp_op(insn);
-            let ord = compare_records_generic(
-                &idx_record,
-                values,
-                cursor.get_index_info(),
-                0,
-                tie_breaker,
-            )?;
+            let ord = compare_records_generic(idx_record, values, &index_info, 0, tie_breaker)?;
 
             if ord.is_le() {
                 target_pc.as_offset_int()
@@ -3630,18 +3626,13 @@ pub fn op_idx_gt(
     let pc = {
         let cursor = get_cursor!(state, *cursor_id);
         let cursor = cursor.as_btree_mut();
+        let index_info = cursor.get_index_info().clone();
 
         let pc = if let Some(idx_record) = return_if_io!(cursor.record()) {
             let values =
                 registers_to_ref_values(&state.registers[*start_reg..*start_reg + *num_regs]);
             let tie_breaker = get_tie_breaker_from_idx_comp_op(insn);
-            let ord = compare_records_generic(
-                &idx_record,
-                values,
-                cursor.get_index_info(),
-                0,
-                tie_breaker,
-            )?;
+            let ord = compare_records_generic(idx_record, values, &index_info, 0, tie_breaker)?;
 
             if ord.is_gt() {
                 target_pc.as_offset_int()
@@ -3682,19 +3673,14 @@ pub fn op_idx_lt(
     let pc = {
         let cursor = get_cursor!(state, *cursor_id);
         let cursor = cursor.as_btree_mut();
+        let index_info = cursor.get_index_info().clone();
 
         let pc = if let Some(idx_record) = return_if_io!(cursor.record()) {
             let values =
                 registers_to_ref_values(&state.registers[*start_reg..*start_reg + *num_regs]);
 
             let tie_breaker = get_tie_breaker_from_idx_comp_op(insn);
-            let ord = compare_records_generic(
-                &idx_record,
-                values,
-                cursor.get_index_info(),
-                0,
-                tie_breaker,
-            )?;
+            let ord = compare_records_generic(idx_record, values, &index_info, 0, tie_breaker)?;
 
             if ord.is_lt() {
                 target_pc.as_offset_int()
@@ -4256,8 +4242,7 @@ pub fn op_sorter_open(
         SorterOpen {
             cursor_id,
             columns: _,
-            order,
-            collations,
+            order_and_collations,
         },
         insn
     );
@@ -4277,12 +4262,13 @@ pub fn op_sorter_open(
     } else {
         (cache_size as usize) * page_size
     };
+    let (order, collations): (Vec<_>, Vec<_>) = order_and_collations
+        .iter()
+        .map(|(ord, coll)| (*ord, coll.unwrap_or_default()))
+        .unzip();
     let cursor = Sorter::new(
-        order,
-        collations
-            .iter()
-            .map(|collation| collation.unwrap_or_default())
-            .collect(),
+        &order,
+        collations,
         max_buffer_size_bytes,
         page_size,
         pager.io.clone(),
@@ -6881,6 +6867,8 @@ pub fn op_idx_insert(
             let ignore_conflict = 'i: {
                 let cursor = get_cursor!(state, cursor_id);
                 let cursor = cursor.as_btree_mut();
+                let has_rowid = cursor.has_rowid();
+                let index_info = cursor.get_index_info().clone();
                 let record_opt = return_if_io!(cursor.record());
                 let Some(record) = record_opt.as_ref() else {
                     // Cursor not pointing at a record — table is empty or past last
@@ -6888,8 +6876,8 @@ pub fn op_idx_insert(
                 };
                 // Cursor is pointing at a record; if the index has a rowid, exclude it from the comparison since it's a pointer to the table row;
                 // UNIQUE indexes disallow duplicates like (a=1,b=2,rowid=1) and (a=1,b=2,rowid=2).
-                let existing_key = if cursor.has_rowid() {
-                    let count = cursor.record_cursor_mut().count(record);
+                let existing_key = if has_rowid {
+                    let count = record.column_count();
                     &record.get_values()[..count.saturating_sub(1)]
                 } else {
                     &record.get_values()[..]
@@ -6899,11 +6887,9 @@ pub fn op_idx_insert(
                     break 'i false;
                 }
 
-                let conflict = compare_immutable(
-                    existing_key,
-                    inserted_key_vals,
-                    &cursor.get_index_info().key_info,
-                ) == std::cmp::Ordering::Equal;
+                let conflict =
+                    compare_immutable(existing_key, inserted_key_vals, &index_info.key_info)
+                        == std::cmp::Ordering::Equal;
                 if conflict {
                     if flags.has(IdxInsertFlags::NO_OP_DUPLICATE) {
                         break 'i true;
@@ -8325,6 +8311,10 @@ pub fn op_noop(
 pub enum OpOpenEphemeralState {
     #[default]
     Start,
+    // Fast path states for reusing existing ephemeral cursor
+    ClearExisting,
+    RewindExisting,
+    // Slow path states for creating new ephemeral cursor
     StartingTxn {
         pager: Arc<Pager>,
     },
@@ -8355,6 +8345,13 @@ pub fn op_open_ephemeral(
     match &mut state.op_open_ephemeral_state {
         OpOpenEphemeralState::Start => {
             tracing::trace!("Start");
+            // Fast path: if cursor already has an ephemeral btree, just clear it instead of
+            // recreating the entire pager/file/btree. This is important for performance when
+            // OpenEphemeral is called repeatedly during statement execution.
+            if state.cursors[cursor_id].is_some() {
+                state.op_open_ephemeral_state = OpOpenEphemeralState::ClearExisting;
+                return Ok(InsnFunctionStepResult::Step);
+            }
             let page_size =
                 return_if_io!(with_header(pager, mv_store.as_ref(), program, |header| {
                     header.page_size
@@ -8411,6 +8408,25 @@ pub fn op_open_ephemeral(
             pager.set_page_size(page_size);
 
             state.op_open_ephemeral_state = OpOpenEphemeralState::StartingTxn { pager };
+        }
+        OpOpenEphemeralState::ClearExisting => {
+            tracing::trace!("ClearExisting");
+            let cursor = state.cursors[cursor_id]
+                .as_mut()
+                .expect("cursor should exist in ClearExisting state");
+            let btree_cursor = cursor.as_btree_mut();
+            return_if_io!(btree_cursor.clear_btree());
+            state.op_open_ephemeral_state = OpOpenEphemeralState::RewindExisting;
+        }
+        OpOpenEphemeralState::RewindExisting => {
+            tracing::trace!("RewindExisting");
+            let cursor = state.cursors[cursor_id]
+                .as_mut()
+                .expect("cursor should exist in RewindExisting state");
+            let btree_cursor = cursor.as_btree_mut();
+            return_if_io!(btree_cursor.rewind());
+            state.pc += 1;
+            state.op_open_ephemeral_state = OpOpenEphemeralState::Start;
         }
         OpOpenEphemeralState::StartingTxn { pager } => {
             tracing::trace!("StartingTxn");
@@ -9080,7 +9096,7 @@ pub fn op_add_column(
         };
 
         let btree = Arc::make_mut(btree);
-        btree.columns.push(column.clone())
+        btree.columns.push((**column).clone())
     });
 
     state.pc += 1;
@@ -9120,7 +9136,7 @@ pub fn op_alter_column(
             .expect("column being ALTERed should be named")
             .clone()
     };
-    let new_column = crate::schema::Column::from(definition);
+    let new_column = crate::schema::Column::from(definition.as_ref());
     let new_name = definition.col_name.as_str().to_owned();
 
     conn.with_schema_mut(|schema| {
@@ -9382,67 +9398,57 @@ pub fn op_hash_build(
     insn: &Insn,
     pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
-    load_insn!(
-        HashBuild {
-            cursor_id,
-            key_start_reg,
-            num_keys,
-            hash_table_id,
-            mem_budget,
-            collations,
-            payload_start_reg,
-            num_payload,
-        },
-        insn
-    );
+    load_insn!(HashBuild { data }, insn);
 
     let mut op_state = state
         .op_hash_build_state
         .take()
         .filter(|s| {
-            s.hash_table_id == *hash_table_id
-                && s.cursor_id == *cursor_id
-                && s.key_start_reg == *key_start_reg
-                && s.num_keys == *num_keys
+            s.hash_table_id == data.hash_table_id
+                && s.cursor_id == data.cursor_id
+                && s.key_start_reg == data.key_start_reg
+                && s.num_keys == data.num_keys
         })
         .unwrap_or_else(|| OpHashBuildState {
-            key_values: Vec::with_capacity(*num_keys),
+            key_values: Vec::with_capacity(data.num_keys),
             key_idx: 0,
-            payload_values: Vec::with_capacity(*num_payload),
+            payload_values: Vec::with_capacity(data.num_payload),
             payload_idx: 0,
             rowid: None,
-            cursor_id: *cursor_id,
-            hash_table_id: *hash_table_id,
-            key_start_reg: *key_start_reg,
-            num_keys: *num_keys,
+            cursor_id: data.cursor_id,
+            hash_table_id: data.hash_table_id,
+            key_start_reg: data.key_start_reg,
+            num_keys: data.num_keys,
         });
 
     // Create hash table if it doesn't exist yet
-    if !state.hash_tables.contains_key(hash_table_id) {
-        let config = HashTableConfig {
-            initial_buckets: 1024,
-            mem_budget: *mem_budget,
-            num_keys: *num_keys,
-            collations: collations.clone(),
-        };
-        let hash_table = HashTable::new(config, pager.io.clone());
-        state.hash_tables.insert(*hash_table_id, hash_table);
-    }
+    state
+        .hash_tables
+        .entry(data.hash_table_id)
+        .or_insert_with(|| {
+            let config = HashTableConfig {
+                initial_buckets: 1024,
+                mem_budget: data.mem_budget,
+                num_keys: data.num_keys,
+                collations: data.collations.clone(),
+            };
+            HashTable::new(config, pager.io.clone())
+        });
 
     // Read pre-computed key values directly from registers
-    while op_state.key_idx < *num_keys {
+    while op_state.key_idx < data.num_keys {
         let i = op_state.key_idx;
-        let reg = &state.registers[*key_start_reg + i];
+        let reg = &state.registers[data.key_start_reg + i];
         let value = reg.get_value().clone();
         op_state.key_values.push(value);
         op_state.key_idx += 1;
     }
 
     // Read payload values from registers if provided
-    if let Some(payload_reg) = payload_start_reg {
-        while op_state.payload_idx < *num_payload {
+    if let Some(payload_reg) = data.payload_start_reg {
+        while op_state.payload_idx < data.num_payload {
             let i = op_state.payload_idx;
-            let reg = &state.registers[*payload_reg + i];
+            let reg = &state.registers[payload_reg + i];
             let value = reg.get_value().clone();
             op_state.payload_values.push(value);
             op_state.payload_idx += 1;
@@ -9451,7 +9457,7 @@ pub fn op_hash_build(
 
     // Get the rowid from the cursor
     if op_state.rowid.is_none() {
-        let cursor = state.get_cursor(*cursor_id);
+        let cursor = state.get_cursor(data.cursor_id);
         let rowid_val = match cursor {
             Cursor::BTree(btree_cursor) => {
                 let rowid_opt = match btree_cursor.rowid() {
@@ -9479,7 +9485,7 @@ pub fn op_hash_build(
     }
 
     // Insert the rowid into the hash table
-    if let Some(ht) = state.hash_tables.get_mut(hash_table_id) {
+    if let Some(ht) = state.hash_tables.get_mut(&data.hash_table_id) {
         let rowid = op_state.rowid.expect("rowid set");
         let key_values = std::mem::take(&mut op_state.key_values);
         let payload_values = std::mem::take(&mut op_state.payload_values);
@@ -9561,29 +9567,35 @@ pub fn op_hash_probe(
         },
         insn
     );
+    let hash_table_id = *hash_table_id as usize;
+    let key_start_reg = *key_start_reg as usize;
+    let num_keys = *num_keys as usize;
+    let dest_reg = *dest_reg as usize;
+    let payload_dest_reg = payload_dest_reg.map(|r| r as usize);
+    let num_payload = *num_payload as usize;
     let (probe_keys, partition_idx) = if let Some(op_state) = state.op_hash_probe_state.take() {
-        if op_state.hash_table_id == *hash_table_id {
+        if op_state.hash_table_id == hash_table_id {
             (op_state.probe_keys, Some(op_state.partition_idx))
         } else {
             // Different hash table, read fresh keys
-            let mut keys = Vec::with_capacity(*num_keys);
-            for i in 0..*num_keys {
-                let reg = &state.registers[*key_start_reg + i];
+            let mut keys = Vec::with_capacity(num_keys);
+            for i in 0..num_keys {
+                let reg = &state.registers[key_start_reg + i];
                 keys.push(reg.get_value().clone());
             }
             (keys, None)
         }
     } else {
         // First entry, read probe keys from registers
-        let mut keys = Vec::with_capacity(*num_keys);
-        for i in 0..*num_keys {
-            let reg = &state.registers[*key_start_reg + i];
+        let mut keys = Vec::with_capacity(num_keys);
+        for i in 0..num_keys {
+            let reg = &state.registers[key_start_reg + i];
             keys.push(reg.get_value().clone());
         }
         (keys, None)
     };
 
-    let hash_table = state.hash_tables.get_mut(hash_table_id).ok_or_else(|| {
+    let hash_table = state.hash_tables.get_mut(&hash_table_id).ok_or_else(|| {
         LimboError::InternalError(format!("Hash table not found in register {hash_table_id}"))
     })?;
 
@@ -9601,7 +9613,7 @@ pub fn op_hash_probe(
                 IOResult::IO(io) => {
                     state.op_hash_probe_state = Some(OpHashProbeState {
                         probe_keys,
-                        hash_table_id: *hash_table_id,
+                        hash_table_id,
                         partition_idx,
                     });
                     return Ok(InsnFunctionStepResult::IO(io));
@@ -9612,12 +9624,12 @@ pub fn op_hash_probe(
         // Probe the loaded partition
         match hash_table.probe_partition(partition_idx, &probe_keys) {
             Some(entry) => {
-                state.registers[*dest_reg] = Register::Value(Value::Integer(entry.rowid));
+                state.registers[dest_reg] = Register::Value(Value::Integer(entry.rowid));
                 write_hash_payload_to_registers(
                     &mut state.registers,
                     entry,
-                    *payload_dest_reg,
-                    *num_payload,
+                    payload_dest_reg,
+                    num_payload,
                 );
                 state.pc += 1;
                 Ok(InsnFunctionStepResult::Step)
@@ -9631,12 +9643,12 @@ pub fn op_hash_probe(
         // Non-spilled hash table, use normal probe
         match hash_table.probe(probe_keys) {
             Some(entry) => {
-                state.registers[*dest_reg] = Register::Value(Value::Integer(entry.rowid));
+                state.registers[dest_reg] = Register::Value(Value::Integer(entry.rowid));
                 write_hash_payload_to_registers(
                     &mut state.registers,
                     entry,
-                    *payload_dest_reg,
-                    *num_payload,
+                    payload_dest_reg,
+                    num_payload,
                 );
                 state.pc += 1;
                 Ok(InsnFunctionStepResult::Step)

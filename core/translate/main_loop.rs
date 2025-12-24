@@ -33,7 +33,7 @@ use crate::{
     vdbe::{
         affinity::{self, Affinity},
         builder::{CursorKey, CursorType, ProgramBuilder},
-        insn::{CmpInsFlags, IdxInsertFlags, Insn},
+        insn::{to_u16, CmpInsFlags, HashBuildData, IdxInsertFlags, Insn},
         BranchOffset, CursorID,
     },
     Result,
@@ -593,14 +593,16 @@ fn emit_hash_build_phase(
 
     // Insert current row into hash table with payload columns.
     program.emit_insn(Insn::HashBuild {
-        cursor_id: hash_build_cursor_id,
-        key_start_reg: build_key_start_reg,
-        num_keys,
-        hash_table_id,
-        mem_budget: hash_join_op.mem_budget,
-        collations,
-        payload_start_reg,
-        num_payload,
+        data: Box::new(HashBuildData {
+            cursor_id: hash_build_cursor_id,
+            key_start_reg: build_key_start_reg,
+            num_keys,
+            hash_table_id,
+            mem_budget: hash_join_op.mem_budget,
+            collations,
+            payload_start_reg,
+            num_payload,
+        }),
     });
 
     program.preassign_label_to_next_insn(skip_to_next);
@@ -972,13 +974,13 @@ pub fn open_loop(
                 // Probe hash table with keys, store matched rowid and payload in registers
                 let match_reg = program.alloc_register();
                 program.emit_insn(Insn::HashProbe {
-                    hash_table_id,
-                    key_start_reg: probe_key_start_reg,
-                    num_keys,
-                    dest_reg: match_reg,
+                    hash_table_id: to_u16(hash_table_id),
+                    key_start_reg: to_u16(probe_key_start_reg),
+                    num_keys: to_u16(num_keys),
+                    dest_reg: to_u16(match_reg),
                     target_pc: next,
-                    payload_dest_reg,
-                    num_payload,
+                    payload_dest_reg: payload_dest_reg.map(to_u16),
+                    num_payload: to_u16(num_payload),
                 });
 
                 // Label for match processing, HashNext jumps here to avoid re-probing
@@ -2039,9 +2041,9 @@ fn emit_autoindex(
     }
     let record_reg = program.alloc_register();
     program.emit_insn(Insn::MakeRecord {
-        start_reg: ephemeral_cols_start_reg,
-        count: num_regs_to_reserve,
-        dest_reg: record_reg,
+        start_reg: to_u16(ephemeral_cols_start_reg),
+        count: to_u16(num_regs_to_reserve),
+        dest_reg: to_u16(record_reg),
         index_name: Some(index.name.clone()),
         affinity_str: None,
     });

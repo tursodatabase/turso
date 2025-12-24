@@ -1,3 +1,4 @@
+use crate::assert::assert_send_sync;
 use crate::io::WriteBatch;
 use crate::storage::btree::PinGuard;
 use crate::storage::subjournal::Subjournal;
@@ -193,6 +194,7 @@ pub struct Page {
 // concurrent modifications.
 unsafe impl Send for Page {}
 unsafe impl Sync for Page {}
+crate::assert::assert_send_sync!(Page);
 
 // Concurrency control of pages will be handled by the pager, we won't wrap Page with RwLock
 // because that is bad bad.
@@ -674,6 +676,8 @@ pub struct Pager {
     init_page_1: Arc<ArcSwapOption<Page>>,
 }
 
+assert_send_sync!(Pager);
+
 #[cfg(not(feature = "omit_autovacuum"))]
 pub struct VacuumState {
     /// State machine for [Pager::ptrmap_get]
@@ -854,6 +858,15 @@ impl Pager {
 
     pub fn init_page_1(&self) -> Arc<ArcSwapOption<Page>> {
         self.init_page_1.clone()
+    }
+
+    /// Set whether cache spilling is enabled.
+    pub fn set_spill_enabled(&self, enabled: bool) {
+        self.page_cache.write().set_spill_enabled(enabled);
+    }
+    /// Get whether cache spilling is enabled.
+    pub fn get_spill_enabled(&self) -> bool {
+        self.page_cache.read().is_spill_enabled()
     }
 
     /// Open the subjournal if not yet open.
