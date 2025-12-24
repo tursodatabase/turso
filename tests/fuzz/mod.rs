@@ -2400,8 +2400,8 @@ mod fuzz_tests {
         let flags = db.db_flags;
         let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
 
-        const OUTER_ITERS: usize = 10;
-        const INNER_ITERS: usize = 50;
+        const OUTER_ITERS: usize = 25;
+        const INNER_ITERS: usize = 200;
 
         for outer in 0..OUTER_ITERS {
             println!("fk_recursive_cascade_fuzz {}/{}", outer + 1, OUTER_ITERS);
