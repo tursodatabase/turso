@@ -91,6 +91,7 @@ rustc-hash = "2.0"
 either = { workspace = true }
 tracing-subscriber.workspace = true
 rapidhash = "4.1.1"
+bumpalo = { version = "3", features = ["collections"] }
 
 # Use pure-rust for Android to avoid C cross-compilation issues
 [target.'cfg(target_os = "android")'.dependencies]
