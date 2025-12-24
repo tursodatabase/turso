@@ -599,6 +599,7 @@ async fn multiple_connections_fuzz(opts: FuzzOptions) {
         if opts.mvcc_enabled {
             let conn = db.connect().unwrap();
             conn.pragma_update("journal_mode", "'experimental_mvcc'")
+                .await
                 .unwrap();
         }
 
