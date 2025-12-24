@@ -162,7 +162,8 @@ async fn setup_database(
         mode,
         TransactionMode::Mvcc | TransactionMode::Concurrent | TransactionMode::LogicalLog
     ) {
-        conn.pragma_update("journal_mode", "'experimental_mvcc'")?;
+        conn.pragma_update("journal_mode", "'experimental_mvcc'")
+            .await?;
     }
 
     conn.execute(
