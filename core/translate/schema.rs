@@ -4,12 +4,13 @@ use crate::ast;
 use crate::ext::VTabImpl;
 use crate::schema::{
     create_table, BTreeTable, ColDef, Column, SchemaObjectType, Table, Type,
-    RESERVED_TABLE_PREFIXES,
+    RESERVED_TABLE_PREFIXES, SQLITE_SEQUENCE_TABLE_NAME,
 };
 use crate::storage::pager::CreateBTreeFlags;
 use crate::translate::emitter::{
     emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary, OperationMode, Resolver,
 };
+use crate::translate::fkeys::emit_fk_drop_table_check;
 use crate::translate::{ProgramBuilder, ProgramBuilderOpts};
 use crate::util::normalize_ident;
 use crate::util::PRIMARY_KEY_AUTOMATIC_INDEX_NAME_PREFIX;
@@ -18,7 +19,7 @@ use crate::vdbe::insn::{
     to_u16, {CmpInsFlags, Cookie, InsertFlags, Insn},
 };
 use crate::Connection;
-use crate::{bail_constraint_error, bail_parse_error, Result};
+use crate::{bail_parse_error, Result};
 
 use turso_ext::VTabKind;
 
@@ -168,31 +169,35 @@ pub fn translate_create_table(
     });
     let cdc_table = prepare_cdc_if_necessary(&mut program, resolver.schema, SQLITE_TABLEID)?;
 
-    let created_sequence_table =
-        if has_autoincrement && resolver.schema.get_table("sqlite_sequence").is_none() {
-            let seq_table_root_reg = program.alloc_register();
-            program.emit_insn(Insn::CreateBtree {
-                db: 0,
-                root: seq_table_root_reg,
-                flags: CreateBTreeFlags::new_table(),
-            });
+    let created_sequence_table = if has_autoincrement
+        && resolver
+            .schema
+            .get_table(SQLITE_SEQUENCE_TABLE_NAME)
+            .is_none()
+    {
+        let seq_table_root_reg = program.alloc_register();
+        program.emit_insn(Insn::CreateBtree {
+            db: 0,
+            root: seq_table_root_reg,
+            flags: CreateBTreeFlags::new_table(),
+        });
 
-            let seq_sql = "CREATE TABLE sqlite_sequence(name,seq)";
-            emit_schema_entry(
-                &mut program,
-                resolver,
-                sqlite_schema_cursor_id,
-                cdc_table.as_ref().map(|x| x.0),
-                SchemaEntryType::Table,
-                "sqlite_sequence",
-                "sqlite_sequence",
-                seq_table_root_reg,
-                Some(seq_sql.to_string()),
-            )?;
-            true
-        } else {
-            false
-        };
+        let seq_sql = "CREATE TABLE sqlite_sequence(name,seq)";
+        emit_schema_entry(
+            &mut program,
+            resolver,
+            sqlite_schema_cursor_id,
+            cdc_table.as_ref().map(|x| x.0),
+            SchemaEntryType::Table,
+            SQLITE_SEQUENCE_TABLE_NAME,
+            SQLITE_SEQUENCE_TABLE_NAME,
+            seq_table_root_reg,
+            Some(seq_sql.to_string()),
+        )?;
+        true
+    } else {
+        false
+    };
 
     let sql = create_table_body_to_str(&tbl_name, &body);
 
@@ -618,6 +623,26 @@ pub fn translate_create_virtual_table(
     Ok(program)
 }
 
+/// Validates whether a DROP TABLE operation is allowed on the given table name.
+fn validate_drop_table(resolver: &Resolver, tbl_name: &str) -> Result<()> {
+    if crate::schema::is_system_table(tbl_name) {
+        bail_parse_error!("Cannot drop system table {}", tbl_name);
+    }
+    if RESERVED_TABLE_PREFIXES
+        .iter()
+        .any(|prefix| tbl_name.starts_with(prefix))
+    {
+        bail_parse_error!("table {tbl_name} may not be dropped");
+    }
+    // Check if this is a materialized view - if so, refuse to drop it with DROP TABLE
+    if resolver.schema.is_materialized_view(tbl_name) {
+        bail_parse_error!(
+            "Cannot DROP TABLE on materialized view {tbl_name}. Use DROP VIEW instead.",
+        );
+    }
+    Ok(())
+}
+
 pub fn translate_drop_table(
     tbl_name: ast::QualifiedName,
     resolver: &Resolver,
@@ -625,52 +650,25 @@ pub fn translate_drop_table(
     mut program: ProgramBuilder,
     connection: &Connection,
 ) -> Result<ProgramBuilder> {
-    if tbl_name
-        .name
-        .as_str()
-        .eq_ignore_ascii_case("sqlite_sequence")
-    {
-        bail_parse_error!("table sqlite_sequence may not be dropped");
-    }
-
+    let name = tbl_name.name.as_str();
     let opts = ProgramBuilderOpts {
         num_cursors: 4,
         approx_num_insns: 40,
         approx_num_labels: 4,
     };
     program.extend(&opts);
-    let table = resolver.schema.get_table(tbl_name.name.as_str());
-    if table.is_none() {
+    let Some(table) = resolver.schema.get_table(name) else {
         if if_exists {
             return Ok(program);
         }
-        bail_parse_error!("No such table: {}", tbl_name.name.as_str());
-    }
-
-    if RESERVED_TABLE_PREFIXES
-        .iter()
-        .any(|prefix| tbl_name.name.as_str().starts_with(prefix))
-    {
-        bail_parse_error!("table {} may not be dropped", tbl_name.name.as_str());
-    }
-
-    let table = table.unwrap(); // safe since we just checked for None
-
-    // Check if this is a materialized view - if so, refuse to drop it with DROP TABLE
-    if resolver.schema.is_materialized_view(tbl_name.name.as_str()) {
-        bail_parse_error!(
-            "Cannot DROP TABLE on materialized view {}. Use DROP VIEW instead.",
-            tbl_name.name.as_str()
-        );
-    }
-
+        bail_parse_error!("No such table: {name}");
+    };
+    validate_drop_table(resolver, name)?;
     // Check if foreign keys are enabled and if this table is referenced by foreign keys
-    if connection.foreign_keys_enabled()
-        && resolver
-            .schema
-            .any_resolved_fks_referencing(table.get_name())
-    {
-        bail_constraint_error!("FOREIGN KEY constraint failed");
+    // We emit runtime checks to scan child tables for non-NULL FK values
+    // SQLite allows DROP TABLE when child FK values are NULL (no actual reference)
+    if connection.foreign_keys_enabled() && resolver.schema.any_resolved_fks_referencing(name) {
+        emit_fk_drop_table_check(&mut program, resolver, name)?;
     }
     let cdc_table = prepare_cdc_if_necessary(&mut program, resolver.schema, SQLITE_TABLEID)?;
 
@@ -984,7 +982,7 @@ pub fn translate_drop_table(
     // if drops table, sequence table should reset.
     if let Some(seq_table) = resolver
         .schema
-        .get_table("sqlite_sequence")
+        .get_table(SQLITE_SEQUENCE_TABLE_NAME)
         .and_then(|t| t.btree())
     {
         let seq_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(seq_table.clone()));
@@ -1022,7 +1020,7 @@ pub fn translate_drop_table(
 
         program.emit_insn(Insn::Delete {
             cursor_id: seq_cursor_id,
-            table_name: "sqlite_sequence".to_string(),
+            table_name: SQLITE_SEQUENCE_TABLE_NAME.to_string(),
             is_part_of_update: false,
         });
 
