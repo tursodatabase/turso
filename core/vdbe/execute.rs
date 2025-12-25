@@ -4,7 +4,7 @@ use crate::function::AlterTableFunc;
 use crate::mvcc::cursor::{MvccCursorType, NextRowidResult};
 use crate::mvcc::database::CheckpointStateMachine;
 use crate::mvcc::LocalClock;
-use crate::schema::Table;
+use crate::schema::{Table, SQLITE_SEQUENCE_TABLE_NAME};
 use crate::state_machine::StateMachine;
 use crate::storage::btree::{
     integrity_check, CursorTrait, IntegrityCheckError, IntegrityCheckState, PageCategory,
@@ -6421,7 +6421,7 @@ pub fn op_insert(
                     cursor.root_page()
                 };
                 if root_page != 1
-                    && table_name != "sqlite_sequence"
+                    && table_name != SQLITE_SEQUENCE_TABLE_NAME
                     && !flag.has(InsertFlags::EPHEMERAL_TABLE_INSERT)
                 {
                     state.op_insert_state.sub_state = OpInsertSubState::UpdateLastRowid;
