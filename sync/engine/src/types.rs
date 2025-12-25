@@ -35,13 +35,14 @@ impl From<genawaiter::sync::Co<SyncEngineIoResult, Result<()>>> for Coro<()> {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum PartialBootstrapStrategy {
     Prefix { length: usize },
     Query { query: String },
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PartialSyncOpts {
     pub bootstrap_strategy: PartialBootstrapStrategy,
     pub segment_size: usize,
