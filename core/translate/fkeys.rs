@@ -229,9 +229,7 @@ pub fn emit_fk_violation(program: &mut ProgramBuilder, fk: &ForeignKey) -> Resul
     Ok(())
 }
 
-/// Emit an immediate HALT for FK RESTRICT violations.
-/// Unlike NO ACTION which uses counters, RESTRICT must fail immediately
-/// when a child row references the parent being deleted/updated.
+/// Emit an immediate HALT for FK violations.
 pub fn emit_fk_restrict_halt(program: &mut ProgramBuilder) -> Result<()> {
     program.emit_insn(Insn::Halt {
         err_code: SQLITE_CONSTRAINT_FOREIGNKEY,
