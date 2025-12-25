@@ -87,6 +87,7 @@ impl std::fmt::Debug for DbChangesStatus {
     }
 }
 
+#[derive(Debug, Serialize)]
 pub struct SyncEngineStats {
     pub cdc_operations: i64,
     pub main_wal_size: u64,
