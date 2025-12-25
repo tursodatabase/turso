@@ -433,14 +433,13 @@ enum CommitState {
     PrepareWalSync,
     /// Get DB size (mostly from page cache - but in rare cases we can read it from disk)
     GetDbSize,
-    /// Appends all frames to the WAL.
-    PrepareFrames {
-        db_size: u32,
-    },
-    WaitingForPageRead {
-        db_size: u32,
-        page_sz: PageSize,
-    },
+    /// Scan all dirty pages and issue concurrent reads for evicted (spilled) pages.
+    /// This allows reading multiple evicted pages in parallel rather than serially.
+    ScanAndIssueReads { db_size: u32 },
+    /// Wait for all batched reads of evicted pages to complete.
+    WaitBatchedReads { db_size: u32 },
+    /// Collect pages (now all available) and prepare WAL frames.
+    PrepareFrames { db_size: u32 },
     /// All frames prepared, writes are in flight
     WaitWrites,
     /// Writes are complete, wait for WAL sync to complete
@@ -499,26 +498,37 @@ pub enum BtreePageAllocMode {
 struct CommitInfo {
     completions: Vec<Completion>,
     state: CommitState,
-    /// Dirty page IDs to process during PrepareFrames (for async evicted page reads)
-    dirty_ids_to_process: Vec<usize>,
-    /// Current index into dirty_ids_to_process
-    current_dirty_idx: usize,
-    /// Pages collected so far during PrepareFrames
     collected_pages: Vec<PageRef>,
-    /// Pending read for an evicted page: (page_id, page_ref, read_completion)
-    pending_read: Option<(usize, PageRef, Completion)>,
+    page_sources: Vec<PageSource>,
+    page_source_cursor: usize,
     prepared_frames: Vec<PreparedFrames>,
+}
+
+enum PageSource {
+    // page_id fetched from cache during PrepareFrames
+    Cached(usize),
+    // pre-read page
+    Evicted(PageRef),
 }
 
 impl CommitInfo {
     fn reset(&mut self) {
         self.completions.clear();
         self.state = CommitState::PrepareWal;
-        self.dirty_ids_to_process.clear();
-        self.current_dirty_idx = 0;
         self.collected_pages.clear();
-        self.pending_read = None;
+        self.page_sources.clear();
         self.prepared_frames.clear();
+    }
+    fn preallocate(&mut self, n: usize) {
+        self.page_sources.clear();
+        self.page_sources.reserve(n.min(IOV_MAX));
+        self.completions.clear();
+        self.completions.reserve(n / 4);
+        self.collected_pages.reserve(n.min(IOV_MAX));
+    }
+    fn clear_read_state(&mut self) {
+        self.page_sources.clear();
+        self.page_source_cursor = 0;
     }
 }
 
@@ -823,11 +833,10 @@ impl Pager {
             commit_info: RwLock::new(CommitInfo {
                 completions: Vec::new(),
                 state: CommitState::PrepareWal,
-                dirty_ids_to_process: Vec::new(),
-                current_dirty_idx: 0,
                 collected_pages: Vec::new(),
-                pending_read: None,
                 prepared_frames: Vec::new(),
+                page_sources: Vec::new(),
+                page_source_cursor: 0,
             }),
             syncing: Arc::new(AtomicBool::new(false)),
             checkpoint_state: RwLock::new(CheckpointState::default()),
@@ -2486,7 +2495,7 @@ impl Pager {
             ));
         };
 
-        'outer: loop {
+        loop {
             let state = self.commit_info.read().state;
             trace!(?state);
 
@@ -2512,70 +2521,107 @@ impl Pager {
                 }
                 CommitState::GetDbSize => {
                     let db_size = return_if_io!(self.with_header(|h| h.database_size));
-                    self.commit_info.write().state = CommitState::PrepareFrames {
+                    self.commit_info.write().state = CommitState::ScanAndIssueReads {
                         db_size: db_size.get(),
                     };
+                }
+                CommitState::ScanAndIssueReads { db_size } => {
+                    let mut commit_info = self.commit_info.write();
+                    let dirty_pages = self.dirty_pages.read();
+
+                    if dirty_pages.is_empty() {
+                        return Ok(IOResult::Done(PagerCommitResult::WalWritten));
+                    }
+                    commit_info.preallocate(dirty_pages.len());
+                    let mut cache = self.page_cache.write();
+
+                    for &page_id in dirty_pages.iter() {
+                        let page_key = PageCacheKey::new(page_id);
+                        if cache.peek(&page_key, false).is_some() {
+                            commit_info.page_sources.push(PageSource::Cached(page_id));
+                        } else {
+                            let (page, completion) =
+                                self.read_page_no_cache(page_id as i64, None, false)?;
+                            commit_info.page_sources.push(PageSource::Evicted(page));
+                            if !completion.finished() {
+                                commit_info.completions.push(completion);
+                            }
+                        }
+                    }
+                    drop(cache);
+                    drop(dirty_pages);
+                    if !commit_info.completions.is_empty() {
+                        commit_info.state = CommitState::WaitBatchedReads { db_size };
+                        drop(commit_info);
+                        io_yield_one!(self.build_commit_completion_group());
+                    }
+                    commit_info.state = CommitState::PrepareFrames { db_size };
+                }
+                CommitState::WaitBatchedReads { db_size } => {
+                    let mut commit_info = self.commit_info.write();
+                    // Wait for all batched reads to complete
+                    let all_done = commit_info.completions.iter().all(|c| c.finished());
+                    if !all_done {
+                        let mut group = CompletionGroup::new(|_| {});
+                        for c in commit_info.completions.iter().filter(|c| !c.finished()) {
+                            group.add(c);
+                        }
+                        io_yield_one!(group.build());
+                    }
+                    // Check for any read errors
+                    let failed = commit_info
+                        .completions
+                        .iter()
+                        .find(|c| !c.succeeded())
+                        .cloned();
+                    if let Some(failed) = failed {
+                        return Err(std::io::Error::other(format!(
+                            "Page read failed during commit: {:?}",
+                            failed.get_error()
+                        ))
+                        .into());
+                    }
+                    // All reads complete and successful, proceed to frame preparation
+                    commit_info.completions.clear();
+                    commit_info.state = CommitState::PrepareFrames { db_size };
                 }
                 CommitState::PrepareFrames { db_size } => {
                     let page_sz = self.get_page_size_unchecked();
                     let mut commit_info = self.commit_info.write();
-                    {
-                        if commit_info.dirty_ids_to_process.is_empty()
-                            && commit_info.current_dirty_idx == 0
-                        {
-                            let dirty_pages = self.dirty_pages.read();
-                            commit_info.dirty_ids_to_process =
-                                dirty_pages.iter().copied().collect();
-                            if commit_info.dirty_ids_to_process.is_empty() {
-                                return Ok(IOResult::Done(PagerCommitResult::WalWritten));
-                            }
-                        }
-                    }
+                    let mut cache = self.page_cache.write();
 
-                    // Collect pages until we need to yield or finish
                     'inner: loop {
-                        let (total, page_id) = {
-                            let idx = commit_info.current_dirty_idx;
-                            let total = commit_info.dirty_ids_to_process.len();
-                            if idx >= total {
-                                break 'inner;
+                        let cursor = commit_info.page_source_cursor;
+                        if cursor >= commit_info.page_sources.len() {
+                            break 'inner;
+                        }
+
+                        let total = commit_info.page_sources.len();
+                        let is_last = cursor + 1 >= total;
+                        // Linear consumption, no lookup required
+                        let page = match &commit_info.page_sources[cursor] {
+                            PageSource::Cached(page_id) => {
+                                let page_key = PageCacheKey::new(*page_id);
+                                cache
+                                    .get(&page_key)?
+                                    .expect("page evicted between scan and prepare")
                             }
-                            (total, commit_info.dirty_ids_to_process[idx])
+                            PageSource::Evicted(page) => page.clone(),
                         };
+                        commit_info.page_source_cursor += 1;
+                        commit_info.collected_pages.push(page);
 
-                        let page_key = PageCacheKey::new(page_id);
-                        let cache_result = self.page_cache.write().get(&page_key)?;
-
-                        match cache_result {
-                            Some(page) => {
-                                commit_info.collected_pages.push(page);
-                                commit_info.current_dirty_idx += 1;
-
-                                let is_last = commit_info.current_dirty_idx >= total;
-                                if commit_info.collected_pages.len() == IOV_MAX || is_last {
-                                    self.prepare_collected_frames(
-                                        &mut commit_info,
-                                        wal,
-                                        page_sz,
-                                        db_size,
-                                        is_last,
-                                    )?;
-                                }
-                            }
-                            None => {
-                                let (page, completion) =
-                                    self.read_page_no_cache(page_id as i64, None, false)?;
-                                commit_info.pending_read =
-                                    Some((page_id, page, completion.clone()));
-                                commit_info.state =
-                                    CommitState::WaitingForPageRead { db_size, page_sz };
-                                if !completion.succeeded() {
-                                    io_yield_one!(completion);
-                                }
-                                continue 'outer;
-                            }
+                        if commit_info.collected_pages.len() == IOV_MAX || is_last {
+                            self.prepare_collected_frames(
+                                &mut commit_info,
+                                wal,
+                                page_sz,
+                                db_size,
+                                is_last,
+                            )?;
                         }
                     }
+                    drop(cache);
                     if commit_info.prepared_frames.is_empty() {
                         turso_assert!(
                             self.dirty_pages.read().is_empty(),
@@ -2583,53 +2629,26 @@ impl Pager {
                         );
                         return Ok(IOResult::Done(PagerCommitResult::WalWritten));
                     }
+                    // Submit all WAL writes
                     let wal_file = wal.wal_file()?;
                     let mut batch = WriteBatch::new(wal_file);
                     for prepared in &commit_info.prepared_frames {
                         batch.writev(prepared.offset, &prepared.bufs);
                     }
                     commit_info.completions = batch.submit()?;
+                    commit_info.clear_read_state();
                     commit_info.state = CommitState::WaitWrites;
                 }
-                CommitState::WaitingForPageRead { db_size, page_sz } => {
-                    let mut commit_info = self.commit_info.write();
-                    let (page_id, page, completion) = commit_info
-                        .pending_read
-                        .take()
-                        .expect("must have pending_read");
-
-                    if !completion.succeeded() {
-                        commit_info.pending_read = Some((page_id, page, completion.clone()));
-                        io_yield_one!(completion);
-                    }
-
-                    commit_info.collected_pages.push(page);
-                    commit_info.current_dirty_idx += 1;
-
-                    let total = commit_info.dirty_ids_to_process.len();
-                    let is_last = commit_info.current_dirty_idx >= total;
-                    if commit_info.collected_pages.len() == IOV_MAX || is_last {
-                        self.prepare_collected_frames(
-                            &mut commit_info,
-                            wal,
-                            page_sz,
-                            db_size,
-                            is_last,
-                        )?;
-                    }
-                    commit_info.state = CommitState::PrepareFrames { db_size };
-                }
                 CommitState::WaitWrites => {
-                    let all_done = self
+                    if !self
                         .commit_info
                         .read()
                         .completions
                         .iter()
-                        .all(|c| c.finished());
-                    if !all_done {
+                        .all(|c| c.finished())
+                    {
                         io_yield_one!(self.build_commit_completion_group());
                     }
-
                     // Check for any write errors
                     let failed = self
                         .commit_info
@@ -2650,7 +2669,6 @@ impl Pager {
                         .into());
                     }
                     commit_info.completions.clear();
-
                     // Writes done, submit fsync if needed
                     if sync_mode == SyncMode::Off {
                         commit_info.state = CommitState::WalCommitDone;
