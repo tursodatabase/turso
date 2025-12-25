@@ -145,6 +145,7 @@ use turso_parser::{
 
 const SCHEMA_TABLE_NAME: &str = "sqlite_schema";
 const SCHEMA_TABLE_NAME_ALT: &str = "sqlite_master";
+pub const SQLITE_SEQUENCE_TABLE_NAME: &str = "sqlite_sequence";
 pub const DBSP_TABLE_PREFIX: &str = "__turso_internal_dbsp_state_v";
 
 /// Used to refer to the implicit rowid column in tables without an alias during UPDATE
@@ -162,6 +163,10 @@ pub fn is_system_table(table_name: &str) -> bool {
     normalized == SCHEMA_TABLE_NAME
         || normalized == SCHEMA_TABLE_NAME_ALT
         || table_name.starts_with(DBSP_TABLE_PREFIX)
+        || normalized == SQLITE_SEQUENCE_TABLE_NAME
+        || RESERVED_TABLE_PREFIXES
+            .iter()
+            .any(|prefix| normalized.starts_with(prefix))
 }
 
 /// Type of schema object for conflict checking
