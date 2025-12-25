@@ -1664,3 +1664,65 @@ pub fn fire_fk_update_actions(
 
     Ok(())
 }
+
+/// Emit FK check for DROP TABLE.
+/// For each child table with an FK referencing the dropped table,
+/// scan to find any row where ALL FK columns are non-NULL.
+/// If found, emit HALT with FK constraint error.
+/// SQLite allows DROP TABLE when child FK values are NULL (no actual reference).
+pub fn emit_fk_drop_table_check(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    parent_table_name: &str,
+) -> Result<()> {
+    for fk_ref in resolver
+        .schema
+        .resolved_fks_referencing(parent_table_name)?
+    {
+        let child_tbl = &fk_ref.child_table;
+        let child_cols = &fk_ref.fk.child_columns;
+
+        // Open child table for reading
+        let ccur = open_read_table(program, child_tbl);
+        let done = program.allocate_label();
+        program.emit_insn(Insn::Rewind {
+            cursor_id: ccur,
+            pc_if_empty: done,
+        });
+
+        let loop_top = program.allocate_label();
+        program.preassign_label_to_next_insn(loop_top);
+        let next_row = program.allocate_label();
+
+        // Check each FK column, if ANY is NULL, skip this row (no reference)
+        // Only if ALL FK columns are non-NULL do we have a violation
+        for cname in child_cols.iter() {
+            let (pos, _) = child_tbl
+                .get_column(cname)
+                .ok_or_else(|| LimboError::InternalError(format!("child col {cname} missing")))?;
+            let tmp = program.alloc_register();
+            program.emit_insn(Insn::Column {
+                cursor_id: ccur,
+                column: pos,
+                dest: tmp,
+                default: None,
+            });
+            // If this column is NULL, skip to next row
+            program.emit_insn(Insn::IsNull {
+                reg: tmp,
+                target_pc: next_row,
+            });
+        }
+
+        // If we reach here, ALL FK columns are non-NULL: this is a violation
+        emit_fk_restrict_halt(program)?;
+        program.preassign_label_to_next_insn(next_row);
+        program.emit_insn(Insn::Next {
+            cursor_id: ccur,
+            pc_if_next: loop_top,
+        });
+        program.preassign_label_to_next_insn(done);
+        program.emit_insn(Insn::Close { cursor_id: ccur });
+    }
+    Ok(())
+}
