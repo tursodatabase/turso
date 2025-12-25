@@ -459,7 +459,7 @@ pub fn init_tracing() -> Result<WorkerGuard, std::io::Error> {
     Ok(guard)
 }
 
-fn integrity_check(
+fn sqlite_integrity_check(
     db_path: &std::path::Path,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     assert!(db_path.exists());
@@ -471,15 +471,11 @@ fn integrity_check(
     while let Some(row) = rows.next()? {
         result.push(row.get(0)?);
     }
-    if result.is_empty() {
-        return Err(
-            "simulation failed: integrity_check should return `ok` or a list of problems".into(),
-        );
-    }
+    assert!(!result.is_empty());
     if !result[0].eq_ignore_ascii_case("ok") {
         // Build a list of problems
         result.iter_mut().for_each(|row| *row = format!("- {row}"));
-        return Err(format!("simulation failed: {}", result.join("\n")).into());
+        return Err(format!("SQLite integrity check failed: {}", result.join("\n")).into());
     }
     Ok(())
 }
@@ -669,7 +665,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     #[cfg(not(miri))]
     {
         println!("Running SQLite Integrity check");
-        integrity_check(std::path::Path::new(&db_file))?;
+        sqlite_integrity_check(std::path::Path::new(&db_file))?;
     }
 
     Ok(())
