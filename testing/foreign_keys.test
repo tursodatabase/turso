@@ -1664,3 +1664,69 @@ do_execsql_test_on_specific_db {:memory:} fk-restrict-null-child-ok {
     DELETE FROM parent WHERE id=1;
     SELECT count(*) FROM parent;
 } {0}
+
+# DROP parent table should fail when child rows reference it
+do_execsql_test_in_memory_any_error fk-drop-parent-with-child-references {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id REFERENCES parent(id));
+    INSERT INTO parent VALUES(1);
+    INSERT INTO child VALUES(10, 1);
+    DROP TABLE parent;
+}
+
+# DROP parent table should succeed when child FK values are all NULL
+do_execsql_test_on_specific_db {:memory:} fk-drop-parent-ok-when-child-fk-null {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id REFERENCES parent(id));
+    INSERT INTO parent VALUES(1);
+    INSERT INTO child VALUES(10, NULL);
+    DROP TABLE parent;
+    SELECT id, parent_id FROM child;
+} {10|}
+
+# DROP parent table should succeed when child table is empty
+do_execsql_test_on_specific_db {:memory:} fk-drop-parent-ok-when-child-empty {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id REFERENCES parent(id));
+    INSERT INTO parent VALUES(1);
+    DROP TABLE parent;
+    SELECT count(*) FROM child;
+} {0}
+
+# DROP parent table should succeed after child FK updated to NULL
+do_execsql_test_on_specific_db {:memory:} fk-drop-parent-ok-after-child-fk-set-null {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id REFERENCES parent(id));
+    INSERT INTO parent VALUES(1);
+    INSERT INTO child VALUES(10, 1);
+    UPDATE child SET parent_id = NULL;
+    DROP TABLE parent;
+    SELECT id, parent_id FROM child;
+} {10|}
+
+# DROP parent table should succeed after child row deleted
+do_execsql_test_on_specific_db {:memory:} fk-drop-parent-ok-after-child-deleted {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id REFERENCES parent(id));
+    INSERT INTO parent VALUES(1);
+    INSERT INTO child VALUES(10, 1);
+    DELETE FROM child WHERE id = 10;
+    DROP TABLE parent;
+    SELECT count(*) FROM child;
+} {0}
+
+# DROP parent with multiple children - some NULL, some not - should fail
+do_execsql_test_in_memory_any_error fk-drop-parent-mixed-null-references {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id REFERENCES parent(id));
+    INSERT INTO parent VALUES(1);
+    INSERT INTO child VALUES(10, NULL);
+    INSERT INTO child VALUES(11, 1);
+    DROP TABLE parent;
+}
