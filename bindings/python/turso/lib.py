@@ -16,6 +16,7 @@ from ._turso import (
     PyTursoConnection,
     PyTursoDatabase,
     PyTursoDatabaseConfig,
+    PyTursoEncryptionConfig,
     PyTursoExecutionResult,
     PyTursoLog,
     PyTursoSetupConfig,
@@ -848,10 +849,17 @@ class Row(Sequence[Any]):
         return (self._keys, self._data) >= (value._keys, value._data)
 
 
+@dataclass
+class EncryptionOpts:
+    cipher: str
+    hexkey: str
+
 def connect(
     database: str,
     *,
     experimental_features: Optional[str] = None,
+    vfs: Optional[str] = None,
+    encryption: Optional[EncryptionOpts] = None,
     isolation_level: Optional[str] = "DEFERRED",
     extra_io: Optional[Callable[[], None]] = None,
 ) -> Connection:
@@ -868,6 +876,11 @@ def connect(
             path=database,
             experimental_features=experimental_features,
             async_io=False,  # Let the Rust layer drive IO internally by default
+            vfs=vfs,
+            encryption=PyTursoEncryptionConfig(
+                cipher=encryption.cipher,
+                hexkey=encryption.hexkey
+            ) if encryption else None
         )
         db: PyTursoDatabase = py_turso_database_open(cfg)
         conn: PyTursoConnection = db.connect()

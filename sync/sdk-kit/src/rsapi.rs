@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 use turso_core::{MemoryIO, IO};
-use turso_sdk_kit::rsapi::{str_from_c_str, TursoError, TursoStatusCode};
+use turso_sdk_kit::rsapi::{str_from_c_str, TursoError};
 use turso_sync_engine::{
     database_sync_engine::{self, DatabaseSyncEngine},
     database_sync_engine_io::SyncEngineIo,
@@ -41,10 +41,9 @@ impl TursoDatabaseSyncConfig {
         config: *const capi::c::turso_sync_database_config_t,
     ) -> Result<Self, turso_sdk_kit::rsapi::TursoError> {
         if config.is_null() {
-            return Err(TursoError {
-                code: TursoStatusCode::Misuse,
-                message: Some("config pointer must be not null".to_string()),
-            });
+            return Err(TursoError::Misuse(
+                "config pointer must be not null".to_string(),
+            ));
         }
         let config = *config;
         Ok(Self {
@@ -107,10 +106,7 @@ impl TursoDatabaseSyncChanges {
         value: *mut capi::c::turso_sync_changes_t,
     ) -> Result<&'a Self, TursoError> {
         if value.is_null() {
-            Err(TursoError {
-                code: TursoStatusCode::Misuse,
-                message: Some("got null pointer".to_string()),
-            })
+            Err(TursoError::Misuse("got null pointer".to_string()))
         } else {
             Ok(&*(value as *const Self))
         }
@@ -155,35 +151,33 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
             partial_sync_opts: sync_config.partial_sync_opts.clone(),
         };
         let is_memory = db_config.path == ":memory:";
-        let db_io: Arc<dyn IO> = if let Some(io) = sync_config.db_io.as_ref() {
-            io.clone()
-        } else if is_memory {
-            Arc::new(MemoryIO::new())
-        } else {
-            #[cfg(target_os = "linux")]
-            {
-                if sync_engine_opts.partial_sync_opts.is_none() {
-                    Arc::new(turso_core::PlatformIO::new().map_err(|e| TursoError {
-                        code: TursoStatusCode::Error,
-                        message: Some(format!("Failed to create platform IO: {e}")),
-                    })?)
-                } else {
-                    use turso_sync_engine::sparse_io::SparseLinuxIo;
+        let db_io: Arc<dyn IO> =
+            if let Some(io) = sync_config.db_io.as_ref() {
+                io.clone()
+            } else if is_memory {
+                Arc::new(MemoryIO::new())
+            } else {
+                #[cfg(target_os = "linux")]
+                {
+                    if sync_engine_opts.partial_sync_opts.is_none() {
+                        Arc::new(turso_core::PlatformIO::new().map_err(|e| {
+                            TursoError::Error(format!("Failed to create platform IO: {e}"))
+                        })?)
+                    } else {
+                        use turso_sync_engine::sparse_io::SparseLinuxIo;
 
-                    Arc::new(SparseLinuxIo::new().map_err(|e| TursoError {
-                        code: TursoStatusCode::Error,
-                        message: Some(format!("Failed to create sparse IO: {e}")),
+                        Arc::new(SparseLinuxIo::new().map_err(|e| {
+                            TursoError::Error(format!("Failed to create sparse IO: {e}"))
+                        })?)
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    Arc::new(turso_core::PlatformIO::new().map_err(|e| {
+                        TursoError::Error(format!("Failed to create platform IO: {e}"))
                     })?)
                 }
-            }
-            #[cfg(not(target_os = "linux"))]
-            {
-                Arc::new(turso_core::PlatformIO::new().map_err(|e| TursoError {
-                    code: TursoStatusCode::Error,
-                    message: Some(format!("Failed to create platform IO: {e}")),
-                })?)
-            }
-        };
+            };
         let sync_engine_io_queue = SyncEngineIoStats::new(SyncEngineIoQueue::new());
         Ok(Arc::new(Self {
             db_config,
@@ -465,10 +459,7 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
         value: *const capi::c::turso_sync_database_t,
     ) -> Result<&'a Self, TursoError> {
         if value.is_null() {
-            Err(TursoError {
-                code: TursoStatusCode::Misuse,
-                message: Some("got null pointer".to_string()),
-            })
+            Err(TursoError::Misuse("got null pointer".to_string()))
         } else {
             Ok(&*(value as *const Self))
         }

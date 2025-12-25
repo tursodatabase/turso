@@ -9,8 +9,8 @@ use crate::{
     turso::{
         py_turso_database_open, py_turso_setup, Busy, Constraint, Corrupt, DatabaseFull, Interrupt,
         Misuse, NotAdb, PyTursoConnection, PyTursoDatabase, PyTursoDatabaseConfig,
-        PyTursoExecutionResult, PyTursoLog, PyTursoSetupConfig, PyTursoStatement,
-        PyTursoStatusCode, Readonly,
+        PyTursoEncryptionConfig, PyTursoExecutionResult, PyTursoLog, PyTursoSetupConfig,
+        PyTursoStatement, PyTursoStatusCode, Readonly,
     },
     turso_sync::{
         py_turso_sync_new, PyTursoAsyncOperation, PyTursoAsyncOperationResultKind,
@@ -37,6 +37,7 @@ fn _turso(m: &Bound<PyModule>) -> PyResult<()> {
     m.add_class::<PyTursoDatabase>()?;
     m.add_class::<PyTursoConnection>()?;
     m.add_class::<PyTursoStatement>()?;
+    m.add_class::<PyTursoEncryptionConfig>()?;
 
     m.add("Busy", m.py().get_type::<Busy>())?;
     m.add("Interrupt", m.py().get_type::<Interrupt>())?;

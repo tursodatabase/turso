@@ -3,6 +3,7 @@ from .lib import (
     Cursor,
     DatabaseError,
     DataError,
+    EncryptionOpts,
     Error,
     IntegrityError,
     InterfaceError,
@@ -38,4 +39,5 @@ __all__ = [
     "apilevel",
     "paramstyle",
     "threadsafety",
+    "EncryptionOpts",
 ]

@@ -96,6 +96,8 @@ typedef struct
  */
 typedef struct
 {
+    /** Parameter which defines who drives the IO - callee or the caller (non-zero parameter value interpreted as async IO) */
+    uint64_t async_io;
     /** Path to the database file or `:memory:`
      * zero-terminated C string
      */
@@ -104,8 +106,21 @@ typedef struct
      * zero-terminated C string or null pointer
      */
     const char *experimental_features;
-    /** Parameter which defines who drives the IO - callee or the caller */
-    bool async_io;
+    /** optional VFS parameter explicitly specifying FS backend for the database.
+     * Available options are:
+     * - "memory": in-memory backend
+     * - "syscall": generic syscall backend
+     * - "io_uring": IO uring (supported only on Linux)
+     */
+    const char *vfs;
+    /** optional encryption cipher
+     * as encryption is experimental - experimental_features must have "encryption" in the list
+     */
+    const char *encryption_cipher;
+    /** optional encryption hexkey
+     * as encryption is experimental - experimental_features must have "encryption" in the list
+     */
+    const char *encryption_hexkey;
 } turso_database_config_t;
 
 /** Setup global database info */
@@ -135,6 +150,9 @@ turso_status_code_t turso_database_connect(
     turso_connection_t **connection,
     /** Optional return error parameter (can be null) */
     const char **error_opt_out);
+
+/** Set busy timeout for the connection */
+void turso_connection_set_busy_timeout_ms(const turso_connection_t *self, int64_t timeout_ms);
 
 /** Get autocommit state of the connection */
 bool turso_connection_get_autocommit(const turso_connection_t *self);
@@ -207,6 +225,9 @@ turso_status_code_t turso_statement_reset(const turso_statement_t *self, const c
  * This method must be called in the end of statement execution (either successfull or not)
  */
 turso_status_code_t turso_statement_finalize(const turso_statement_t *self, const char **error_opt_out);
+
+/** return amount of row modifications (insert/delete operations) made by the most recent executed statement */
+int64_t turso_statement_n_change(const turso_statement_t *self);
 
 /** Get column count */
 int64_t turso_statement_column_count(const turso_statement_t *self);

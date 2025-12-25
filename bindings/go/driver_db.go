@@ -88,15 +88,11 @@ func Setup(config TursoConfig) error {
 // Implement sql.Driver methods
 func (d *tursoDbDriver) Open(dsn string) (driver.Conn, error) {
 	InitLibrary(turso_libs.LoadTursoLibraryConfig{})
-	path, experimental, async, err := parseDSN(dsn)
+	config, err := parseDSN(dsn)
 	if err != nil {
 		return nil, err
 	}
-	db, err := turso_database_new(TursoDatabaseConfig{
-		Path:                 path,
-		ExperimentalFeatures: experimental,
-		AsyncIO:              async,
-	})
+	db, err := turso_database_new(config)
 	if err != nil {
 		return nil, err
 	}
@@ -112,7 +108,7 @@ func (d *tursoDbDriver) Open(dsn string) (driver.Conn, error) {
 	return &tursoDbConnection{
 		db:    db,
 		conn:  c,
-		async: async,
+		async: config.AsyncIO,
 	}, nil
 }
 
@@ -473,32 +469,34 @@ func (tx *tursoDbTx) Rollback() error {
 
 // Helpers
 
-// parseDSN supports format: <path>[?experimental=<string>&async=0|1]
-func parseDSN(dsn string) (path string, experimental string, async bool, err error) {
-	path = dsn
-	async = false
-	experimental = ""
+// parseDSN supports format: <path>[?experimental=<string>&async=0|1&vfs=<string>&encryption_cipher=<string>&encryption_hexkey=<string>]
+func parseDSN(dsn string) (TursoDatabaseConfig, error) {
+	config := TursoDatabaseConfig{Path: dsn}
 	qMark := strings.IndexByte(dsn, '?')
 	if qMark >= 0 {
-		path = dsn[:qMark]
+		config.Path = dsn[:qMark]
 		rawQuery := dsn[qMark+1:]
-		vals, e := url.ParseQuery(rawQuery)
-		if e != nil {
-			return "", "", false, e
+		vals, err := url.ParseQuery(rawQuery)
+		if err != nil {
+			return TursoDatabaseConfig{}, err
 		}
 		if v := vals.Get("experimental"); v != "" {
-			experimental = v
+			config.ExperimentalFeatures = v
 		}
 		if v := vals.Get("async"); v != "" {
-			async = v == "1" || strings.EqualFold(v, "true") || strings.EqualFold(v, "yes")
+			config.AsyncIO = v == "1" || strings.EqualFold(v, "true") || strings.EqualFold(v, "yes")
+		}
+		if v := vals.Get("vfs"); v != "" {
+			config.Vfs = v
+		}
+		if v := vals.Get("encryption_cipher"); v != "" {
+			config.Encryption.Cipher = v
+		}
+		if v := vals.Get("encryption_hexkey"); v != "" {
+			config.Encryption.Hexkey = v
 		}
 	}
-	path, err = url.QueryUnescape(path)
-	if err != nil {
-		// if unescape failed, fall back to raw
-		err = nil
-	}
-	return path, experimental, async, err
+	return config, nil
 }
 
 func (c *tursoDbConnection) executeFully(ctx context.Context, stmt TursoStatement) (uint64, error) {

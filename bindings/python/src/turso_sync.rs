@@ -109,6 +109,8 @@ pub fn py_turso_sync_new(
         path: db_config.path.clone(),
         experimental_features: db_config.experimental_features.clone(),
         async_io: db_config.async_io,
+        encryption: None,
+        vfs: None,
         io: None,
         db_file: None,
     };

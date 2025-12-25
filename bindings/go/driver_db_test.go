@@ -1,10 +1,13 @@
 package turso
 
 import (
+	"bytes"
 	"database/sql"
 	"fmt"
 	"log"
 	"math"
+	"os"
+	"path"
 	"slices"
 	"testing"
 	"time"
@@ -14,8 +17,7 @@ import (
 )
 
 var (
-	conn    *sql.DB
-	connErr error
+	conn *sql.DB
 )
 
 func openMem(t *testing.T) *sql.DB {
@@ -30,11 +32,12 @@ func openMem(t *testing.T) *sql.DB {
 
 func TestMain(m *testing.M) {
 	InitLibrary(turso_libs.LoadTursoLibraryConfig{LoadStrategy: "mixed"})
-	conn, connErr = sql.Open("turso", ":memory:")
-	if connErr != nil {
-		panic(connErr)
+	var err error
+	conn, err = sql.Open("turso", ":memory:")
+	if err != nil {
+		log.Fatalf("Failed to create database: %v", err)
 	}
-	err := conn.Ping()
+	err = conn.Ping()
 	if err != nil {
 		log.Fatalf("Error pinging database: %v", err)
 	}
@@ -44,6 +47,41 @@ func TestMain(m *testing.M) {
 		log.Fatalf("Error creating table: %v", err)
 	}
 	m.Run()
+}
+
+func TestEncryption(t *testing.T) {
+	t.Run("encryption=disabled", func(t *testing.T) {
+		tmp := t.TempDir()
+		dbPath := path.Join(tmp, "local.db")
+		conn, err := sql.Open("turso", dbPath)
+		require.Nil(t, err)
+		require.Nil(t, conn.Ping())
+		_, err = conn.Exec("CREATE TABLE t(x)")
+		require.Nil(t, err)
+		_, err = conn.Exec("INSERT INTO t SELECT 'secret' FROM generate_series(1, 1024)")
+		require.Nil(t, err)
+		_, err = conn.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
+		require.Nil(t, err)
+		content, err := os.ReadFile(dbPath)
+		require.Nil(t, err)
+		require.True(t, bytes.Contains(content, []byte("secret")))
+	})
+	t.Run("encryption=enabled", func(t *testing.T) {
+		tmp := t.TempDir()
+		dbPath := path.Join(tmp, "local.db")
+		conn, err := sql.Open("turso", fmt.Sprintf("%v?experimental=encryption&encryption_cipher=aegis256&encryption_hexkey=b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327", dbPath))
+		require.Nil(t, err)
+		require.Nil(t, conn.Ping())
+		_, err = conn.Exec("CREATE TABLE t(x)")
+		require.Nil(t, err)
+		_, err = conn.Exec("INSERT INTO t SELECT 'secret' FROM generate_series(1, 1024)")
+		require.Nil(t, err)
+		_, err = conn.Exec("PRAGMA wal_checkpoint(TRUNCATE)")
+		require.Nil(t, err)
+		content, err := os.ReadFile(dbPath)
+		require.Nil(t, err)
+		require.False(t, bytes.Contains(content, []byte("secret")))
+	})
 }
 
 func TestInsertData(t *testing.T) {
