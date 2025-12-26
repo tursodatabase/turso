@@ -33,7 +33,7 @@ test('partial sync concurrency', async () => {
             path: 'partial-1.db',
             url: process.env.VITE_TURSO_DB_URL,
             longPollTimeoutMs: 100,
-            partialSync: {
+            partialSyncExperimental: {
                 bootstrapStrategy: { kind: 'prefix', length: 128 * 1024 },
                 segmentSize: 128 * 1024,
             },
@@ -65,7 +65,7 @@ test('partial sync (prefix bootstrap strategy)', async () => {
         path: ':memory:',
         url: process.env.VITE_TURSO_DB_URL,
         longPollTimeoutMs: 100,
-        partialSync: {
+        partialSyncExperimental: {
             bootstrapStrategy: { kind: 'prefix', length: 128 * 1024 },
             segmentSize: 4096,
         },
@@ -102,7 +102,7 @@ test('partial sync (prefix bootstrap strategy; large segment size)', async () =>
         path: ':memory:',
         url: process.env.VITE_TURSO_DB_URL,
         longPollTimeoutMs: 100,
-        partialSync: {
+        partialSyncExperimental: {
             bootstrapStrategy: { kind: 'prefix', length: 128 * 1024 },
             segmentSize: 128 * 1024,
         },
@@ -145,7 +145,7 @@ test('partial sync (prefix bootstrap strategy; prefetch)', async () => {
         path: ':memory:',
         url: process.env.VITE_TURSO_DB_URL,
         longPollTimeoutMs: 100,
-        partialSync: {
+        partialSyncExperimental: {
             bootstrapStrategy: { kind: 'prefix', length: 128 * 1024 },
             segmentSize: 4 * 1024,
             prefetch: true,
@@ -189,7 +189,7 @@ test('partial sync (query bootstrap strategy)', async () => {
         path: ':memory:',
         url: process.env.VITE_TURSO_DB_URL,
         longPollTimeoutMs: 100,
-        partialSync: {
+        partialSyncExperimental: {
             bootstrapStrategy: { kind: 'query', query: 'SELECT * FROM partial_keyed WHERE key = 1000' },
             segmentSize: 4096,
         },

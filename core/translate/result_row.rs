@@ -1,7 +1,7 @@
 use crate::{
     vdbe::{
         builder::ProgramBuilder,
-        insn::{IdxInsertFlags, InsertFlags, Insn},
+        insn::{to_u16, IdxInsertFlags, InsertFlags, Insn},
         BranchOffset,
     },
     Result,
@@ -97,9 +97,9 @@ pub fn emit_result_row_and_limit(
             } else {
                 let record_reg = program.alloc_register();
                 program.emit_insn(Insn::MakeRecord {
-                    start_reg: result_columns_start_reg,
-                    count: plan.result_columns.len(),
-                    dest_reg: record_reg,
+                    start_reg: to_u16(result_columns_start_reg),
+                    count: to_u16(plan.result_columns.len()),
+                    dest_reg: to_u16(record_reg),
                     index_name: Some(dedupe_index.name.clone()),
                     affinity_str: None,
                 });
@@ -119,9 +119,9 @@ pub fn emit_result_row_and_limit(
             let record_reg = program.alloc_register();
             if plan.result_columns.len() > 1 {
                 program.emit_insn(Insn::MakeRecord {
-                    start_reg: result_columns_start_reg,
-                    count: plan.result_columns.len() - 1,
-                    dest_reg: record_reg,
+                    start_reg: to_u16(result_columns_start_reg),
+                    count: to_u16(plan.result_columns.len() - 1),
+                    dest_reg: to_u16(record_reg),
                     index_name: Some(table.name.clone()),
                     affinity_str: None,
                 });

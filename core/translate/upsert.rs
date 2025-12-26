@@ -8,13 +8,15 @@ use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
 use crate::schema::{IndexColumn, ROWID_SENTINEL};
 use crate::translate::emitter::UpdateRowSource;
 use crate::translate::expr::{walk_expr, WalkControl};
-use crate::translate::fkeys::{emit_fk_child_update_counters, emit_parent_key_change_checks};
+use crate::translate::fkeys::{
+    emit_fk_child_update_counters, emit_parent_key_change_checks, fire_fk_update_actions,
+};
 use crate::translate::insert::{format_unique_violation_desc, InsertEmitCtx};
 use crate::translate::planner::ROWID_STRS;
 use crate::translate::trigger_exec::{
     fire_trigger, get_relevant_triggers_type_and_time, TriggerContext,
 };
-use crate::vdbe::insn::CmpInsFlags;
+use crate::vdbe::insn::{to_u16, CmpInsFlags};
 use crate::Connection;
 use crate::{
     bail_parse_error,
@@ -370,7 +372,7 @@ pub fn emit_upsert(
     program.emit_insn(Insn::SeekRowid {
         cursor_id: ctx.cursor_id,
         src_reg: ctx.conflict_rowid_reg,
-        target_pc: ctx.row_done_label,
+        target_pc: ctx.loop_labels.row_done,
     });
     let num_cols = ctx.table.columns.len();
     let current_start = program.alloc_registers(num_cols);
@@ -426,7 +428,7 @@ pub fn emit_upsert(
         translate_expr(program, None, pred, pr, resolver)?;
         program.emit_insn(Insn::IfNot {
             reg: pr,
-            target_pc: ctx.row_done_label,
+            target_pc: ctx.loop_labels.row_done,
             jump_if_null: true,
         });
     }
@@ -540,7 +542,7 @@ pub fn emit_upsert(
             program.emit_insn(Insn::NotExists {
                 cursor: ctx.cursor_id,
                 rowid_reg: ctx.conflict_rowid_reg,
-                target_pc: ctx.row_done_label,
+                target_pc: ctx.loop_labels.row_done,
             });
 
             let has_relevant_after_triggers = get_relevant_triggers_type_and_time(
@@ -772,9 +774,9 @@ pub fn emit_upsert(
 
             let rec = program.alloc_register();
             program.emit_insn(Insn::MakeRecord {
-                start_reg: ins,
-                count: k + 1,
-                dest_reg: rec,
+                start_reg: to_u16(ins),
+                count: to_u16(k + 1),
+                dest_reg: to_u16(rec),
                 index_name: Some((*idx_name).clone()),
                 affinity_str: None,
             });
@@ -851,9 +853,9 @@ pub fn emit_upsert(
         .map(|c| c.affinity().aff_mask())
         .collect::<String>();
     program.emit_insn(Insn::MakeRecord {
-        start_reg: new_start,
-        count: num_cols,
-        dest_reg: rec,
+        start_reg: to_u16(new_start),
+        count: to_u16(num_cols),
+        dest_reg: to_u16(rec),
         index_name: None,
         affinity_str: Some(affinity_str),
     });
@@ -913,6 +915,27 @@ pub fn emit_upsert(
             flag: InsertFlags::new(),
             table_name: table.get_name().to_string(),
         });
+    }
+
+    // Fire FK actions (CASCADE, SET NULL, SET DEFAULT) for parent-side updates.
+    // This must be done after the update is complete but before AFTER triggers.
+    if let Some(bt) = table.btree() {
+        if connection.foreign_keys_enabled()
+            && resolver
+                .schema
+                .any_resolved_fks_referencing(bt.name.as_str())
+        {
+            fire_fk_update_actions(
+                program,
+                resolver,
+                bt.name.as_str(),
+                ctx.conflict_rowid_reg, // old_rowid_reg
+                current_start,          // old_values_start
+                new_start,              // new_values_start
+                new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg), // new_rowid_reg
+                connection,
+            )?;
+        }
     }
 
     // emit CDC instructions
@@ -1041,7 +1064,7 @@ pub fn emit_upsert(
     }
 
     program.emit_insn(Insn::Goto {
-        target_pc: ctx.row_done_label,
+        target_pc: ctx.loop_labels.row_done,
     });
     Ok(())
 }

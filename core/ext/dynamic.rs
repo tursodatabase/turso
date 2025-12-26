@@ -31,6 +31,7 @@ pub struct VfsMod {
 
 unsafe impl Send for VfsMod {}
 unsafe impl Sync for VfsMod {}
+crate::assert::assert_send_sync!(VfsMod);
 
 impl Connection {
     #[cfg(not(target_family = "wasm"))]

@@ -322,7 +322,7 @@ impl StreamingLogicalLogReader {
             header.salt = u64::from_be_bytes([
                 buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7], buf[8],
             ]);
-            header.encrypted = buf[10];
+            header.encrypted = buf[9];
             tracing::trace!("LogicalLog header={:?}", header);
         });
         let c = Completion::new_read(header_buf, completion);
@@ -358,7 +358,7 @@ impl StreamingLogicalLogReader {
                     transaction_read_bytes,
                 } => {
                     if transaction_read_bytes > transaction_size as usize {
-                        return Err(LimboError::Corrupt(format!("streaming log read more bytes than expected from a transaction expected={transaction_size} read={transaction_size}")));
+                        return Err(LimboError::Corrupt(format!("streaming log read more bytes than expected from a transaction expected={transaction_size} read={transaction_read_bytes}")));
                     } else if transaction_size as usize == transaction_read_bytes {
                         // TODO: offset verification
                         let _offset_after = self.consume_u64(io)?;
@@ -804,7 +804,15 @@ mod tests {
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
         let num_transactions = rng.next_u64() % 128;
         let mut txns = vec![];
+        #[expect(
+            clippy::mutable_key_type,
+            reason = "`ImmutableRecord` has interior mutability but its Ord definitions are not influenced by that"
+        )]
         let mut present_rowids = BTreeSet::new();
+        #[expect(
+            clippy::mutable_key_type,
+            reason = "`ImmutableRecord` has interior mutability but its Ord definitions are not influenced by that"
+        )]
         let mut non_present_rowids = BTreeSet::new();
         for _ in 0..num_transactions {
             let num_operations = rng.next_u64() % 8;

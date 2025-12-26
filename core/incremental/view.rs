@@ -45,6 +45,7 @@ pub enum PopulateState {
 // See: https://github.com/tursodatabase/turso/issues/1552
 unsafe impl Send for PopulateState {}
 unsafe impl Sync for PopulateState {}
+crate::assert::assert_send_sync!(PopulateState);
 
 /// State machine for merge_delta to handle I/O operations
 impl fmt::Debug for PopulateState {
@@ -140,6 +141,7 @@ pub struct AllViewsTxState {
 // See: https://github.com/tursodatabase/turso/issues/1552
 unsafe impl Send for AllViewsTxState {}
 unsafe impl Sync for AllViewsTxState {}
+crate::assert::assert_send_sync!(AllViewsTxState);
 
 impl AllViewsTxState {
     /// Create a new container for view transaction states
@@ -225,6 +227,7 @@ pub struct IncrementalView {
 // See: https://github.com/tursodatabase/turso/issues/1552
 unsafe impl Send for IncrementalView {}
 unsafe impl Sync for IncrementalView {}
+crate::assert::assert_send_sync!(IncrementalView);
 
 impl IncrementalView {
     /// Try to compile the SELECT statement into a DBSP circuit

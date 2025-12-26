@@ -17,6 +17,7 @@ import (
 	turso_libs "github.com/tursodatabase/turso-go-platform-libs"
 )
 
+// TursoPartialSyncConfig configures partial sync behavior.
 type TursoPartialSyncConfig struct {
 	// if positive, prefix partial bootstrap strategy will be used
 	BootstrapStrategyPrefix int
@@ -54,7 +55,8 @@ type TursoSyncDbConfig struct {
 	BootstrapIfEmpty *bool
 
 	// configuration for partial sync (disabled by default)
-	PartialSyncConfig TursoPartialSyncConfig
+	// WARNING: This feature is EXPERIMENTAL
+	PartialSyncExperimental TursoPartialSyncConfig
 
 	// pass it as-is to the underlying connection
 	ExperimentalFeatures string
@@ -121,10 +123,10 @@ func NewTursoSyncDb(ctx context.Context, config TursoSyncDbConfig) (*TursoSyncDb
 		LongPollTimeoutMs:              config.LongPollTimeoutMs,
 		BootstrapIfEmpty:               bootstrap,
 		ReservedBytes:                  0,
-		PartialBootstrapStrategyPrefix: config.PartialSyncConfig.BootstrapStrategyPrefix,
-		PartialBootstrapStrategyQuery:  config.PartialSyncConfig.BootstrapStrategyQuery,
-		PartialBootstrapSegmentSize:    config.PartialSyncConfig.SegmentSize,
-		PartialBootstrapPrefetch:       config.PartialSyncConfig.Prefetch,
+		PartialBootstrapStrategyPrefix: config.PartialSyncExperimental.BootstrapStrategyPrefix,
+		PartialBootstrapStrategyQuery:  config.PartialSyncExperimental.BootstrapStrategyQuery,
+		PartialBootstrapSegmentSize:    config.PartialSyncExperimental.SegmentSize,
+		PartialBootstrapPrefetch:       config.PartialSyncExperimental.Prefetch,
 	}
 	sdb, err := turso_sync_database_new(dbCfg, syncCfg)
 	if err != nil {

@@ -1006,15 +1006,12 @@ pub fn insn_to_row(
             Insn::SorterOpen {
                 cursor_id,
                 columns,
-                order,
-                collations,
+                order_and_collations,
             } => {
-                let _p4 = String::new();
-                let to_print: Vec<String> = order
+                let to_print: Vec<String> = order_and_collations
                     .iter()
-                    .zip(collations.iter())
-                    .map(|(v, collation)| {
-                        let sign = match v {
+                    .map(|(order, collation)| {
+                        let sign = match order {
                             SortOrder::Asc => "",
                             SortOrder::Desc => "-",
                         };
@@ -1030,7 +1027,7 @@ pub fn insn_to_row(
                     *cursor_id as i64,
                     *columns as i64,
                     0,
-                    Value::build_text(format!("k({},{})", order.len(), to_print.join(","))),
+                    Value::build_text(format!("k({},{})", order_and_collations.len(), to_print.join(","))),
                     0,
                     format!("cursor={cursor_id}"),
                 )
@@ -1953,18 +1950,18 @@ pub fn insn_to_row(
             0,
             String::new(),
         ),
-        Insn::HashBuild{cursor_id, key_start_reg, num_keys, hash_table_id: hash_table_reg, mem_budget, collations: _, payload_start_reg, num_payload} => {
-            let payload_info = if let Some(p_reg) = payload_start_reg {
-                format!(" payload=r[{}]..r[{}]", p_reg, p_reg + num_payload - 1)
+        Insn::HashBuild { data } => {
+            let payload_info = if let Some(p_reg) = data.payload_start_reg {
+                format!(" payload=r[{}]..r[{}]", p_reg, p_reg + data.num_payload - 1)
             } else {
                 String::new()
             };
             (
                 "HashBuild",
-                *cursor_id as i64,
-                *key_start_reg as i64,
-                *num_keys as i64,
-                Value::build_text(format!("r=[{hash_table_reg}] budget={mem_budget}{payload_info}")),
+                data.cursor_id as i64,
+                data.key_start_reg as i64,
+                data.num_keys as i64,
+                Value::build_text(format!("r=[{}] budget={}{payload_info}", data.hash_table_id, data.mem_budget)),
                 0,
                 String::new(),
             )

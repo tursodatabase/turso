@@ -108,7 +108,7 @@ def test_partial_sync():
         conn_partial = turso.sync.connect(
             ":memory:",
             remote_url=server.db_url(),
-            partial_sync_opts=turso.sync.PartialSyncOpts(
+            partial_sync_experimental=turso.sync.PartialSyncOpts(
                 bootstrap_strategy=turso.sync.PartialSyncPrefixBootstrap(length=128 * 1024),
             ),
         )
@@ -136,7 +136,7 @@ def test_partial_sync_segment_size():
         conn_partial = turso.sync.connect(
             ":memory:",
             remote_url=server.db_url(),
-            partial_sync_opts=turso.sync.PartialSyncOpts(
+            partial_sync_experimental=turso.sync.PartialSyncOpts(
                 bootstrap_strategy=turso.sync.PartialSyncPrefixBootstrap(length=128 * 1024),
                 segment_size=4 * 1024,
             ),
@@ -165,7 +165,7 @@ def test_partial_sync_prefetch():
         conn_partial = turso.sync.connect(
             ":memory:",
             remote_url=server.db_url(),
-            partial_sync_opts=turso.sync.PartialSyncOpts(
+            partial_sync_experimental=turso.sync.PartialSyncOpts(
                 bootstrap_strategy=turso.sync.PartialSyncPrefixBootstrap(length=128 * 1024),
                 segment_size=4 * 1024,
                 prefetch=True,
@@ -211,6 +211,7 @@ def test_bootstrap_concurrency():
             assert t1.exitcode == 0
             assert t2.exitcode == 0
 
+
 def test_configuration_persistence():
     with TursoServer() as server:
         server.db_sql("CREATE TABLE t(x)")
@@ -225,7 +226,7 @@ def test_configuration_persistence():
 
             server.db_sql("INSERT INTO t VALUES (43)")
 
-            assert 'http://localhost' in open(f'{path}-info', 'r').read()
+            assert "http://localhost" in open(f"{path}-info", "r").read()
 
             conn2 = turso.sync.connect(path)
             conn2.pull()

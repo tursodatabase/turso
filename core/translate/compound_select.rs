@@ -4,7 +4,7 @@ use crate::translate::emitter::{emit_query, LimitCtx, Resolver, TranslateCtx};
 use crate::translate::expr::translate_expr;
 use crate::translate::plan::{Plan, QueryDestination, SelectPlan};
 use crate::vdbe::builder::{CursorType, ProgramBuilder};
-use crate::vdbe::insn::Insn;
+use crate::vdbe::insn::{to_u16, Insn};
 use crate::vdbe::BranchOffset;
 use crate::{emit_explain, LimboError, QueryMode, SymbolTable};
 use std::sync::Arc;
@@ -595,9 +595,9 @@ fn read_intersect_rows(
     }
     if let Some(target_cursor_id) = target_cursor {
         program.emit_insn(Insn::MakeRecord {
-            start_reg: cols_start_reg,
-            count: column_count,
-            dest_reg: row_content_reg,
+            start_reg: to_u16(cols_start_reg),
+            count: to_u16(column_count),
+            dest_reg: to_u16(row_content_reg),
             index_name: None,
             affinity_str: None,
         });

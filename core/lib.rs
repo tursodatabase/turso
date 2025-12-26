@@ -251,6 +251,7 @@ pub struct Database {
 // See: https://github.com/tursodatabase/turso/issues/1552
 unsafe impl Send for Database {}
 unsafe impl Sync for Database {}
+crate::assert::assert_send_sync!(Database);
 
 impl fmt::Debug for Database {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -1289,6 +1290,7 @@ pub struct Connection {
 // See: https://github.com/tursodatabase/turso/issues/1552
 unsafe impl Send for Connection {}
 unsafe impl Sync for Connection {}
+crate::assert::assert_send_sync!(Connection);
 
 impl Drop for Connection {
     fn drop(&mut self) {

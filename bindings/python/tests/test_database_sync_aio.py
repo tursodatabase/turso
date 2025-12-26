@@ -110,7 +110,7 @@ async def test_partial_sync():
         conn_partial = await turso.aio.sync.connect(
             ":memory:",
             remote_url=server.db_url(),
-            partial_sync_opts=turso.aio.sync.PartialSyncOpts(
+            partial_sync_experimental=turso.aio.sync.PartialSyncOpts(
                 bootstrap_strategy=turso.aio.sync.PartialSyncPrefixBootstrap(length=128 * 1024),
             ),
         )
@@ -139,7 +139,7 @@ async def test_partial_sync_segment_size():
         conn_partial = await turso.aio.sync.connect(
             ":memory:",
             remote_url=server.db_url(),
-            partial_sync_opts=turso.aio.sync.PartialSyncOpts(
+            partial_sync_experimental=turso.aio.sync.PartialSyncOpts(
                 bootstrap_strategy=turso.aio.sync.PartialSyncPrefixBootstrap(length=128 * 1024),
                 segment_size=4 * 1024,
             ),
@@ -170,7 +170,7 @@ async def test_partial_sync_prefetch():
         conn_partial = await turso.aio.sync.connect(
             ":memory:",
             remote_url=server.db_url(),
-            partial_sync_opts=turso.aio.sync.PartialSyncOpts(
+            partial_sync_experimental=turso.aio.sync.PartialSyncOpts(
                 bootstrap_strategy=turso.aio.sync.PartialSyncPrefixBootstrap(length=128 * 1024),
                 segment_size=4 * 1024,
                 prefetch=True,

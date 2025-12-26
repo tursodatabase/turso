@@ -1,6 +1,5 @@
 use parking_lot::RwLock;
 use std::{
-    cmp::Ordering,
     collections::HashMap,
     sync::{atomic::AtomicI64, Arc},
 };
@@ -148,6 +147,8 @@ pub struct ProgramBuilder {
     needs_stmt_subtransactions: bool,
     /// If this ProgramBuilder is building trigger subprogram, a ref to the trigger is stored here.
     pub trigger: Option<Arc<Trigger>>,
+    /// Whether this is a subprogram (trigger or FK action). Subprograms skip Transaction instructions.
+    pub is_subprogram: bool,
     pub resolve_type: ResolveType,
     /// Temporary cursor overrides maps table internal IDs to cursor IDs that should be used instead of the normal resolution.
     /// This allows for things like hash build to use a separate cursor for iterating the same table.
@@ -271,7 +272,7 @@ impl ProgramBuilder {
         capture_data_changes_mode: CaptureDataChangesMode,
         opts: ProgramBuilderOpts,
     ) -> Self {
-        ProgramBuilder::_new(query_mode, capture_data_changes_mode, opts, None)
+        ProgramBuilder::_new(query_mode, capture_data_changes_mode, opts, None, false)
     }
     pub fn new_for_trigger(
         query_mode: QueryMode,
@@ -279,13 +280,29 @@ impl ProgramBuilder {
         opts: ProgramBuilderOpts,
         trigger: Arc<Trigger>,
     ) -> Self {
-        ProgramBuilder::_new(query_mode, capture_data_changes_mode, opts, Some(trigger))
+        ProgramBuilder::_new(
+            query_mode,
+            capture_data_changes_mode,
+            opts,
+            Some(trigger),
+            true,
+        )
+    }
+    /// Create a ProgramBuilder for a subprogram (FK actions, etc.) that runs within
+    /// an existing transaction and doesn't emit Transaction instructions.
+    pub fn new_for_subprogram(
+        query_mode: QueryMode,
+        capture_data_changes_mode: CaptureDataChangesMode,
+        opts: ProgramBuilderOpts,
+    ) -> Self {
+        ProgramBuilder::_new(query_mode, capture_data_changes_mode, opts, None, true)
     }
     fn _new(
         query_mode: QueryMode,
         capture_data_changes_mode: CaptureDataChangesMode,
         opts: ProgramBuilderOpts,
         trigger: Option<Arc<Trigger>>,
+        is_subprogram: bool,
     ) -> Self {
         Self {
             table_reference_counter: TableRefIdCounter::new(),
@@ -313,6 +330,7 @@ impl ProgramBuilder {
             reg_result_cols_start: None,
             needs_stmt_subtransactions: false,
             trigger,
+            is_subprogram,
             resolve_type: ResolveType::Abort,
             cursor_overrides: HashMap::new(),
         }
@@ -595,73 +613,65 @@ impl ProgramBuilder {
     }
 
     fn emit_constant_insns(&mut self) {
-        // move compile-time constant instructions to the end of the program, where they are executed once after Init jumps to it.
-        // any label_to_resolved_offset that points to an instruction within any moved constant span should be updated to point to the new location.
+        // Move compile-time constant instructions to the end of the program,
+        // where they are executed once after Init jumps to it.
 
-        // the instruction reordering can be done by sorting the insns, so that the ordering is:
-        // 1. if insn not in any constant span, it stays where it is
-        // 2. if insn is in a constant span, it is after other insns, except those that are in a later constant span
-        // 3. within a single constant span the order is preserver
-        self.insns.sort_by(|(_, index_a), (_, index_b)| {
-            let a_span = self
-                .constant_spans
-                .iter()
-                .find(|span| span.0 <= *index_a && span.1 >= *index_a);
-            let b_span = self
-                .constant_spans
-                .iter()
-                .find(|span| span.0 <= *index_b && span.1 >= *index_b);
-            if let (Some(a_span), Some(b_span)) = (a_span, b_span) {
-                a_span.0.cmp(&b_span.0)
-            } else if a_span.is_some() {
-                Ordering::Greater
-            } else if b_span.is_some() {
-                Ordering::Less
-            } else {
-                Ordering::Equal
+        // Stable partition: non-constant instructions first, then constant.
+        // Since spans are sorted and non-overlapping, we track our position
+        // in the span list and never look back - O(n + m) total, where
+        // n = number of instructions, m = number of constant spans.
+        let mut non_constant = Vec::with_capacity(self.insns.len());
+        let mut constant = Vec::new();
+        let mut span_idx = 0;
+
+        for item in self.insns.drain(..) {
+            let idx = item.1;
+
+            // Advance past spans we've completely passed
+            while span_idx < self.constant_spans.len() && self.constant_spans[span_idx].1 < idx {
+                span_idx += 1;
             }
-        });
-        for resolved_offset in self.label_to_resolved_offset.iter_mut() {
-            if let Some((old_offset, target)) = resolved_offset {
-                let new_offset =
-                    self.insns
-                        .iter()
-                        .position(|(_, index)| *old_offset == *index as u32)
-                        .expect("instruction offset must exist") as u32;
-                *resolved_offset = Some((new_offset, *target));
+
+            // Check if current span contains this index
+            let is_constant =
+                span_idx < self.constant_spans.len() && self.constant_spans[span_idx].0 <= idx;
+
+            if is_constant {
+                constant.push(item);
+            } else {
+                non_constant.push(item);
             }
         }
 
-        // Fix comments to refer to new locations
-        for (old_offset, _) in self.comments.iter_mut() {
-            let new_offset = self
-                .insns
-                .iter()
-                .position(|(_, index)| *old_offset == *index as u32)
-                .expect("comment must exist") as u32;
-            *old_offset = new_offset;
+        self.insns = non_constant;
+        self.insns.extend(constant);
+
+        // Build old index -> new position mapping
+        let mut old_to_new = vec![0usize; self.insns.len()];
+        for (new_pos, (_, old_idx)) in self.insns.iter().enumerate() {
+            old_to_new[*old_idx] = new_pos;
+        }
+
+        for resolved_offset in self.label_to_resolved_offset.iter_mut() {
+            if let Some((old_offset, target)) = resolved_offset {
+                *resolved_offset = Some((old_to_new[*old_offset as usize] as u32, *target));
+            }
+        }
+
+        for (offset, _) in self.comments.iter_mut() {
+            *offset = old_to_new[*offset as usize] as u32;
         }
 
         if let QueryMode::ExplainQueryPlan = self.query_mode {
             self.current_parent_explain_idx =
-                if let Some(old_parent) = self.current_parent_explain_idx {
-                    self.insns
-                        .iter()
-                        .position(|(_, index)| old_parent == *index)
-                } else {
-                    None
-                };
+                self.current_parent_explain_idx.map(|old| old_to_new[old]);
 
             for i in 0..self.insns.len() {
                 let (Insn::Explain { p2, .. }, _) = &self.insns[i] else {
                     continue;
                 };
 
-                let new_p2 = if p2.is_some() {
-                    self.insns.iter().position(|(_, index)| *p2 == Some(*index))
-                } else {
-                    None
-                };
+                let new_p2 = p2.map(|old| old_to_new[old]);
 
                 let (Insn::Explain { p1, p2, .. }, _) = &mut self.insns[i] else {
                     unreachable!();
@@ -1036,7 +1046,8 @@ impl ProgramBuilder {
 
     /// Initialize the program with basic setup and return initial metadata and labels
     pub fn prologue(&mut self) {
-        if self.trigger.is_some() {
+        if self.is_subprogram {
+            // Subprograms (triggers, FK actions) don't need Transaction - they run within parent's tx
             self.init_label = self.allocate_label();
             self.emit_insn(Insn::Init {
                 target_pc: self.init_label,
@@ -1083,10 +1094,16 @@ impl ProgramBuilder {
     /// Note that although these are the final instructions, typically an SQLite
     /// query will jump to the Transaction instruction via init_label.
     pub fn epilogue(&mut self, schema: &Schema) {
-        if self.trigger.is_some() {
+        if self.is_subprogram {
+            // Subprograms (triggers, FK actions) just emit Halt without Transaction
+            let description = if self.trigger.is_some() {
+                "trigger"
+            } else {
+                "fk action"
+            };
             self.emit_insn(Insn::Halt {
                 err_code: 0,
-                description: "trigger".to_string(),
+                description: description.to_string(),
             });
             return;
         }
@@ -1103,7 +1120,9 @@ impl ProgramBuilder {
                 });
             }
 
-            self.emit_constant_insns();
+            if !self.constant_spans.is_empty() {
+                self.emit_constant_insns();
+            }
             self.emit_insn(Insn::Goto {
                 target_pc: self.start_offset,
             });
@@ -1253,6 +1272,7 @@ impl ProgramBuilder {
             accesses_db: !matches!(self.txn_mode, TransactionMode::None),
             needs_stmt_subtransactions: self.needs_stmt_subtransactions,
             trigger: self.trigger.take(),
+            is_subprogram: self.is_subprogram,
             contains_trigger_subprograms,
             resolve_type: self.resolve_type,
             explain_state: RwLock::new(ExplainState::default()),

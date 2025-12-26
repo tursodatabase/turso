@@ -5,6 +5,7 @@ use crate::stats::AnalyzeStats;
 use crate::translate::expr::{bind_and_rewrite_expr, walk_expr, BindingBehavior, WalkControl};
 use crate::translate::index::{resolve_index_method_parameters, resolve_sorted_columns};
 use crate::translate::planner::ROWID_STRS;
+use crate::types::IOResult;
 use crate::util::{exprs_are_equivalent, normalize_ident};
 use crate::vdbe::affinity::Affinity;
 use parking_lot::RwLock;
@@ -576,28 +577,33 @@ impl Schema {
         pager.io.block(|| cursor.rewind())?;
 
         loop {
-            let Some(row) = pager.io.block(|| cursor.record())? else {
+            let row = loop {
+                match cursor.record()? {
+                    IOResult::Done(r) => break r,
+                    IOResult::IO(io) => io.wait(&*pager.io)?,
+                }
+            };
+            let Some(row) = row else {
                 break;
             };
 
-            let mut record_cursor = cursor.record_cursor.borrow_mut();
             // sqlite schema table has 5 columns: type, name, tbl_name, rootpage, sql
-            let ty_value = record_cursor.get_value(&row, 0)?;
+            let ty_value = row.get_value(0)?;
             let ValueRef::Text(ty) = ty_value else {
                 return Err(LimboError::ConversionError("Expected text value".into()));
             };
-            let ValueRef::Text(name) = record_cursor.get_value(&row, 1)? else {
+            let ValueRef::Text(name) = row.get_value(1)? else {
                 return Err(LimboError::ConversionError("Expected text value".into()));
             };
-            let table_name_value = record_cursor.get_value(&row, 2)?;
+            let table_name_value = row.get_value(2)?;
             let ValueRef::Text(table_name) = table_name_value else {
                 return Err(LimboError::ConversionError("Expected text value".into()));
             };
-            let root_page_value = record_cursor.get_value(&row, 3)?;
+            let root_page_value = row.get_value(3)?;
             let ValueRef::Integer(root_page) = root_page_value else {
                 return Err(LimboError::ConversionError("Expected integer value".into()));
             };
-            let sql_value = record_cursor.get_value(&row, 4)?;
+            let sql_value = row.get_value(4)?;
             let sql_textref = match sql_value {
                 ValueRef::Text(sql) => Some(sql),
                 _ => None,
@@ -619,8 +625,6 @@ impl Schema {
                 None,
                 enable_triggers,
             )?;
-            drop(record_cursor);
-            drop(row);
 
             pager.io.block(|| cursor.next())?;
         }
@@ -1119,20 +1123,18 @@ impl Schema {
                     parent_pos.push(p);
                 }
 
-                // Determine if parent key is ROWID/alias
-                let parent_uses_rowid = parent_tbl.primary_key_columns.len().eq(&1) && {
-                    if parent_tbl.primary_key_columns.len() == 1 {
-                        let pk_name = &parent_tbl.primary_key_columns[0].0;
-                        // rowid or alias INTEGER PRIMARY KEY; either is ok implicitly
-                        parent_tbl.columns.iter().any(|c| {
+                // Determine if the FK's parent key is the ROWID or a rowid alias.
+                let parent_uses_rowid = if parent_cols.len() == 1 {
+                    let pc = &parent_cols[0];
+                    ROWID_STRS.iter().any(|&r| r.eq_ignore_ascii_case(pc))
+                        || parent_tbl.columns.iter().any(|c| {
                             c.is_rowid_alias()
                                 && c.name
                                     .as_deref()
-                                    .is_some_and(|n| n.eq_ignore_ascii_case(pk_name))
-                        }) || ROWID_STRS.iter().any(|&r| r.eq_ignore_ascii_case(pk_name))
-                    } else {
-                        false
-                    }
+                                    .is_some_and(|n| n.eq_ignore_ascii_case(pc))
+                        })
+                } else {
+                    false
                 };
 
                 // If not rowid, there must be a non-partial UNIQUE exactly on parent_cols
@@ -1523,13 +1525,10 @@ pub struct BTreeTable {
 
 impl BTreeTable {
     pub fn get_rowid_alias_column(&self) -> Option<(usize, &Column)> {
-        if self.primary_key_columns.len() == 1 {
-            let (idx, col) = self.get_column(&self.primary_key_columns[0].0)?;
-            if col.is_rowid_alias() {
-                return Some((idx, col));
-            }
-        }
-        None
+        self.columns
+            .iter()
+            .enumerate()
+            .find(|(_, column)| column.is_rowid_alias())
     }
 
     /// Returns the column position and column for a given column name.
@@ -2192,14 +2191,6 @@ pub struct ForeignKey {
 }
 impl ForeignKey {
     fn validate(&self) -> Result<()> {
-        // TODO: remove this when actions are implemented
-        if !(matches!(self.on_update, RefAct::NoAction)
-            && matches!(self.on_delete, RefAct::NoAction))
-        {
-            crate::bail_parse_error!(
-                "foreign key actions other than NO ACTION are not implemented"
-            );
-        }
         if self
             .parent_columns
             .iter()
@@ -2706,6 +2697,11 @@ impl Index {
             }
             _ => todo!("Expected create index statement"),
         }
+    }
+
+    /// Check if this is an expression index.
+    pub fn is_expression_index(&self) -> bool {
+        self.columns.iter().any(|c| c.expr.is_some())
     }
 
     /// check if this is special backing_btree index created and managed by custom index_method

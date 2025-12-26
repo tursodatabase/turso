@@ -248,6 +248,7 @@ pub struct Row {
 // See: https://github.com/tursodatabase/turso/issues/1552
 unsafe impl Send for Row {}
 unsafe impl Sync for Row {}
+crate::assert::assert_send_sync!(Row);
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TxnCleanup {
@@ -389,6 +390,7 @@ impl std::fmt::Debug for Program {
 // See: https://github.com/tursodatabase/turso/issues/1552
 unsafe impl Send for ProgramState {}
 unsafe impl Sync for ProgramState {}
+crate::assert::assert_send_sync!(ProgramState);
 
 impl ProgramState {
     pub fn new(max_registers: usize, max_cursors: usize) -> Self {
@@ -743,6 +745,8 @@ pub struct Program {
     pub needs_stmt_subtransactions: bool,
     /// If this Program is a trigger subprogram, a ref to the trigger is stored here.
     pub trigger: Option<Arc<Trigger>>,
+    /// Whether this program is a subprogram (trigger or FK action) that runs within a parent statement.
+    pub is_subprogram: bool,
     /// Whether the program contains any trigger subprograms.
     pub contains_trigger_subprograms: bool,
     pub resolve_type: ResolveType,
@@ -1397,7 +1401,7 @@ impl Program {
     }
 
     pub fn is_trigger_subprogram(&self) -> bool {
-        self.trigger.is_some()
+        self.trigger.is_some() || self.is_subprogram
     }
 }
 
