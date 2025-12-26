@@ -17,6 +17,7 @@ use crate::{
 
 #[derive(Clone)]
 pub struct TursoDatabaseSyncConfig {
+    pub remote_url: Option<String>,
     pub path: String,
     pub client_name: String,
     pub long_poll_timeout_ms: Option<u32>,
@@ -48,6 +49,11 @@ impl TursoDatabaseSyncConfig {
         let config = *config;
         Ok(Self {
             path: str_from_c_str(config.path)?.to_string(),
+            remote_url: if config.remote_url.is_null() {
+                None
+            } else {
+                Some(str_from_c_str(config.remote_url)?.to_string())
+            },
             client_name: str_from_c_str(config.client_name)?.to_string(),
             long_poll_timeout_ms: if config.long_poll_timeout_ms == 0 {
                 None
@@ -62,19 +68,22 @@ impl TursoDatabaseSyncConfig {
             },
             partial_sync_opts: if config.partial_bootstrap_strategy_prefix != 0 {
                 Some(turso_sync_engine::types::PartialSyncOpts {
-                    bootstrap_strategy:
+                    bootstrap_strategy: Some(
                         turso_sync_engine::types::PartialBootstrapStrategy::Prefix {
                             length: config.partial_bootstrap_strategy_prefix as usize,
                         },
+                    ),
                     segment_size: config.partial_bootstrap_segment_size,
                     prefetch: config.partial_bootstrap_prefetch,
                 })
             } else if !config.partial_bootstrap_strategy_query.is_null() {
                 let query = str_from_c_str(config.partial_bootstrap_strategy_query)?;
                 Some(turso_sync_engine::types::PartialSyncOpts {
-                    bootstrap_strategy: turso_sync_engine::types::PartialBootstrapStrategy::Query {
-                        query: query.to_string(),
-                    },
+                    bootstrap_strategy: Some(
+                        turso_sync_engine::types::PartialBootstrapStrategy::Query {
+                            query: query.to_string(),
+                        },
+                    ),
                     segment_size: config.partial_bootstrap_segment_size,
                     prefetch: config.partial_bootstrap_prefetch,
                 })
@@ -137,6 +146,7 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
         sync_config: TursoDatabaseSyncConfig,
     ) -> Result<Arc<Self>, turso_sdk_kit::rsapi::TursoError> {
         let sync_engine_opts = turso_sync_engine::database_sync_engine::DatabaseSyncEngineOpts {
+            remote_url: sync_config.remote_url.clone(),
             client_name: sync_config.client_name.clone(),
             tables_ignore: vec![],
             use_transform: false,
@@ -232,7 +242,6 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
                     sync_engine_io.clone(),
                     &metadata,
                     &main_db_path,
-                    &sync_engine_opts,
                 )?;
                 let main_db = turso_sdk_kit::rsapi::TursoDatabase::new(
                     turso_sdk_kit::rsapi::TursoDatabaseConfig {
@@ -287,7 +296,6 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
                     sync_engine_io.clone(),
                     &metadata,
                     &main_db_path,
-                    &sync_engine_opts,
                 )?;
                 let main_db = turso_sdk_kit::rsapi::TursoDatabase::new(
                     turso_sdk_kit::rsapi::TursoDatabaseConfig {

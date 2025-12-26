@@ -25,6 +25,8 @@ typedef enum
 // sync engine IO HTTP request fields
 typedef struct
 {
+    // optional url extracted from the saved configuration of metadata file
+    turso_slice_ref_t url;
     // method name slice (e.g. GET, POST, etc)
     turso_slice_ref_t method;
     // method path slice
@@ -101,6 +103,9 @@ typedef struct
 {
     // path to the main database file (auxilary files like metadata, WAL, revert, changes will derive names from this path)
     const char *path;
+    // optional remote url (libsql://..., https://... or http://...)
+    // this URL will be saved in the database metadata file in order to be able to reuse it if later client will be constructed without explicit remote url
+    const char *remote_url;
     // arbitrary client name which will be used as a prefix for unique client id
     const char *client_name;
     // long poll timeout for pull method (if not zero, server will hold connection for the given timeout until new changes will appear)

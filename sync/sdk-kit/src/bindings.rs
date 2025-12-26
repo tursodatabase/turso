@@ -13,6 +13,7 @@ pub enum turso_sync_io_request_type_t {
 }
 #[repr(C)]
 pub struct turso_sync_io_http_request_t {
+    pub url: turso_slice_ref_t,
     pub method: turso_slice_ref_t,
     pub path: turso_slice_ref_t,
     pub body: turso_slice_ref_t,
@@ -21,17 +22,19 @@ pub struct turso_sync_io_http_request_t {
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
     ["Size of turso_sync_io_http_request_t"]
-        [::std::mem::size_of::<turso_sync_io_http_request_t>() - 56usize];
+        [::std::mem::size_of::<turso_sync_io_http_request_t>() - 72usize];
     ["Alignment of turso_sync_io_http_request_t"]
         [::std::mem::align_of::<turso_sync_io_http_request_t>() - 8usize];
+    ["Offset of field: turso_sync_io_http_request_t::url"]
+        [::std::mem::offset_of!(turso_sync_io_http_request_t, url) - 0usize];
     ["Offset of field: turso_sync_io_http_request_t::method"]
-        [::std::mem::offset_of!(turso_sync_io_http_request_t, method) - 0usize];
+        [::std::mem::offset_of!(turso_sync_io_http_request_t, method) - 16usize];
     ["Offset of field: turso_sync_io_http_request_t::path"]
-        [::std::mem::offset_of!(turso_sync_io_http_request_t, path) - 16usize];
+        [::std::mem::offset_of!(turso_sync_io_http_request_t, path) - 32usize];
     ["Offset of field: turso_sync_io_http_request_t::body"]
-        [::std::mem::offset_of!(turso_sync_io_http_request_t, body) - 32usize];
+        [::std::mem::offset_of!(turso_sync_io_http_request_t, body) - 48usize];
     ["Offset of field: turso_sync_io_http_request_t::headers"]
-        [::std::mem::offset_of!(turso_sync_io_http_request_t, headers) - 48usize];
+        [::std::mem::offset_of!(turso_sync_io_http_request_t, headers) - 64usize];
 };
 impl Default for turso_sync_io_http_request_t {
     fn default() -> Self {
@@ -177,6 +180,7 @@ impl Default for turso_sync_stats_t {
 #[derive(Debug, Copy, Clone)]
 pub struct turso_sync_database_config_t {
     pub path: *const ::std::os::raw::c_char,
+    pub remote_url: *const ::std::os::raw::c_char,
     pub client_name: *const ::std::os::raw::c_char,
     pub long_poll_timeout_ms: i32,
     pub bootstrap_if_empty: bool,
@@ -189,37 +193,39 @@ pub struct turso_sync_database_config_t {
 #[allow(clippy::unnecessary_operation, clippy::identity_op)]
 const _: () = {
     ["Size of turso_sync_database_config_t"]
-        [::std::mem::size_of::<turso_sync_database_config_t>() - 56usize];
+        [::std::mem::size_of::<turso_sync_database_config_t>() - 64usize];
     ["Alignment of turso_sync_database_config_t"]
         [::std::mem::align_of::<turso_sync_database_config_t>() - 8usize];
     ["Offset of field: turso_sync_database_config_t::path"]
         [::std::mem::offset_of!(turso_sync_database_config_t, path) - 0usize];
+    ["Offset of field: turso_sync_database_config_t::remote_url"]
+        [::std::mem::offset_of!(turso_sync_database_config_t, remote_url) - 8usize];
     ["Offset of field: turso_sync_database_config_t::client_name"]
-        [::std::mem::offset_of!(turso_sync_database_config_t, client_name) - 8usize];
+        [::std::mem::offset_of!(turso_sync_database_config_t, client_name) - 16usize];
     ["Offset of field: turso_sync_database_config_t::long_poll_timeout_ms"]
-        [::std::mem::offset_of!(turso_sync_database_config_t, long_poll_timeout_ms) - 16usize];
+        [::std::mem::offset_of!(turso_sync_database_config_t, long_poll_timeout_ms) - 24usize];
     ["Offset of field: turso_sync_database_config_t::bootstrap_if_empty"]
-        [::std::mem::offset_of!(turso_sync_database_config_t, bootstrap_if_empty) - 20usize];
+        [::std::mem::offset_of!(turso_sync_database_config_t, bootstrap_if_empty) - 28usize];
     ["Offset of field: turso_sync_database_config_t::reserved_bytes"]
-        [::std::mem::offset_of!(turso_sync_database_config_t, reserved_bytes) - 24usize];
+        [::std::mem::offset_of!(turso_sync_database_config_t, reserved_bytes) - 32usize];
     ["Offset of field: turso_sync_database_config_t::partial_bootstrap_strategy_prefix"][::std::mem::offset_of!(
         turso_sync_database_config_t,
         partial_bootstrap_strategy_prefix
     )
-        - 28usize];
+        - 36usize];
     ["Offset of field: turso_sync_database_config_t::partial_bootstrap_strategy_query"][::std::mem::offset_of!(
         turso_sync_database_config_t,
         partial_bootstrap_strategy_query
     )
-        - 32usize];
+        - 40usize];
     ["Offset of field: turso_sync_database_config_t::partial_bootstrap_segment_size"][::std::mem::offset_of!(
         turso_sync_database_config_t,
         partial_bootstrap_segment_size
-    ) - 40usize];
+    ) - 48usize];
     ["Offset of field: turso_sync_database_config_t::partial_bootstrap_prefetch"][::std::mem::offset_of!(
         turso_sync_database_config_t,
         partial_bootstrap_prefetch
-    ) - 48usize];
+    ) - 56usize];
 };
 impl Default for turso_sync_database_config_t {
     fn default() -> Self {
@@ -334,7 +340,7 @@ unsafe extern "C" {
     ) -> turso_status_code_t;
 }
 unsafe extern "C" {
-    #[doc = " Resume async operation\n If return error status - turso_status_t must be properly cleaned up\n If return TURSO_IO - caller must drive IO\n If return TURSO_DONE - caller must inspect result and clean up it or use it accordingly"]
+    #[doc = " Resume async operation\n If return TURSO_IO - caller must drive IO\n If return TURSO_DONE - caller must inspect result and clean up it or use it accordingly\n It's safe to call turso_sync_operation_resume multiple times even after operation completion (in case of repeat calls after completion - final result always will be returned)"]
     pub fn turso_sync_operation_resume(
         self_: *const turso_sync_operation_t,
         error_opt_out: *mut *const ::std::os::raw::c_char,
