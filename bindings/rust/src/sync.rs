@@ -31,7 +31,7 @@ pub struct Builder {
     // Absolute or relative path to local database file (":memory:" is supported).
     path: String,
     // Remote URL base. Supports https://, http:// and libsql:// (translated to https://).
-    remote_url: String,
+    remote_url: Option<String>,
     // Optional authorization token (e.g., Bearer token).
     auth_token: Option<String>,
     // Optional custom client identifier used by the sync engine for telemetry/tracing.
@@ -46,16 +46,23 @@ pub struct Builder {
 
 impl Builder {
     // Create a new Builder for a synced database.
-    pub fn new_remote(path: &str, remote_url: &str) -> Self {
+    pub fn new_remote(path: &str) -> Self {
         Self {
             path: path.to_string(),
-            remote_url: remote_url.to_string(),
+            remote_url: None,
             auth_token: None,
             client_name: None,
             long_poll_timeout: None,
             bootstrap_if_empty: true,
             partial_sync_config_experimental: None,
         }
+    }
+
+    // Set remote_url for HTTP requests.
+    // If remote_url omitted in configuration - tursodb will try to load it from the metadata file
+    pub fn with_remote_url(mut self, remote_url: impl Into<String>) -> Self {
+        self.remote_url = Some(remote_url.into());
+        self
     }
 
     // Set optional authorization token for HTTP requests.
@@ -105,6 +112,7 @@ impl Builder {
         // Build sync engine config.
         let sync_config = turso_sync_sdk_kit::rsapi::TursoDatabaseSyncConfig {
             path: self.path.clone(),
+            remote_url: self.remote_url.clone(),
             client_name: self
                 .client_name
                 .clone()
@@ -123,11 +131,12 @@ impl Builder {
                 .map_err(Error::from)?;
 
         // IO worker will process SyncEngine IO queue on a dedicated tokio thread.
-        let io_worker = IoWorker::spawn(
-            sync.clone(),
-            normalize_base_url(&self.remote_url).map_err(Error::Error)?,
-            self.auth_token.clone(),
-        );
+        let url = if let Some(remote_url) = &self.remote_url {
+            Some(normalize_base_url(&remote_url).map_err(Error::Error)?)
+        } else {
+            None
+        };
+        let io_worker = IoWorker::spawn(sync.clone(), url, self.auth_token.clone());
 
         // Create (bootstrap + open) database in one go.
         let op = sync.create();
@@ -329,7 +338,7 @@ struct IoWorker {
     // Reference to the sync database to pull IO items from its queue.
     sync: Arc<turso_sync_sdk_kit::rsapi::TursoDatabaseSync<Bytes>>,
     // Normalized base URL (http/https).
-    base_url: String,
+    base_url: Option<String>,
     // Optional auth token.
     auth_token: Option<String>,
     // Channel to wake the worker to process IO.
@@ -341,7 +350,7 @@ struct IoWorker {
 impl IoWorker {
     fn spawn(
         sync: Arc<turso_sync_sdk_kit::rsapi::TursoDatabaseSync<Bytes>>,
-        base_url: String,
+        base_url: Option<String>,
         auth_token: Option<String>,
     ) -> Arc<Self> {
         let (tx, rx) = mpsc::unbounded_channel::<()>();
@@ -423,6 +432,7 @@ impl IoWorker {
 
                 match item.get_request() {
                     turso_sync_sdk_kit::sync_engine_io::SyncEngineIoRequest::Http {
+                        url,
                         method,
                         path,
                         body,
@@ -431,6 +441,7 @@ impl IoWorker {
                         IoWorker::process_http(
                             &this,
                             &client,
+                            url.as_deref(),
                             method,
                             path,
                             body.as_ref().map(|v| Bytes::from(v.clone())),
@@ -476,6 +487,7 @@ impl IoWorker {
     async fn process_http(
         this: &Arc<IoWorker>,
         client: &Client<HttpsConnector<HttpConnector>, Full<Bytes>>,
+        url: Option<&str>,
         method: &str,
         path: &str,
         body: Option<Bytes>,
@@ -492,7 +504,11 @@ impl IoWorker {
             } else {
                 format!("/{path}")
             };
-            format!("{}{}", this.base_url, p)
+            let Some(url) = this.base_url.as_deref().or_else(|| url.map(|x| x)) else {
+                completion.poison("remote_url is not available".to_string());
+                return;
+            };
+            format!("{}{}", url, p)
         };
 
         let mut builder = Request::builder().method(method).uri(&full_url);
@@ -811,7 +827,8 @@ mod tests {
             .await
             .unwrap();
         server.db_sql("SELECT * FROM t").await.unwrap();
-        let db = crate::sync::Builder::new_remote(":memory:", server.db_url())
+        let db = crate::sync::Builder::new_remote(":memory:")
+            .with_remote_url(server.db_url())
             .build()
             .await
             .unwrap();
@@ -839,13 +856,11 @@ mod tests {
             .await
             .unwrap();
         server.db_sql("SELECT * FROM t").await.unwrap();
-        let db = crate::sync::Builder::new_remote(
-            dir.path().join("local.db").to_str().unwrap(),
-            server.db_url(),
-        )
-        .build()
-        .await
-        .unwrap();
+        let db = crate::sync::Builder::new_remote(dir.path().join("local.db").to_str().unwrap())
+            .with_remote_url(server.db_url())
+            .build()
+            .await
+            .unwrap();
         let conn = db.connect().await.unwrap();
         let rows = conn.query("SELECT * FROM t", ()).await.unwrap();
         let all = all_rows(rows).await.unwrap();
@@ -860,6 +875,43 @@ mod tests {
     }
 
     #[tokio::test]
+    pub async fn test_sync_config_persistence() {
+        let _ = tracing_subscriber::fmt::try_init();
+        let dir = TempDir::new().unwrap();
+        let server = TursoServer::new().await.unwrap();
+        server.db_sql("CREATE TABLE t(x)").await.unwrap();
+        server.db_sql("INSERT INTO t VALUES (42)").await.unwrap();
+        {
+            let db1 =
+                crate::sync::Builder::new_remote(dir.path().join("local.db").to_str().unwrap())
+                    .with_remote_url(server.db_url())
+                    .build()
+                    .await
+                    .unwrap();
+            let conn = db1.connect().await.unwrap();
+            let rows = conn.query("SELECT * FROM t", ()).await.unwrap();
+            let all = all_rows(rows).await.unwrap();
+            assert_eq!(all, vec![vec![Value::Integer(42)],]);
+        }
+        server.db_sql("INSERT INTO t VALUES (41)").await.unwrap();
+        {
+            let db2 =
+                crate::sync::Builder::new_remote(dir.path().join("local.db").to_str().unwrap())
+                    .build()
+                    .await
+                    .unwrap();
+            db2.pull().await.unwrap();
+            let conn = db2.connect().await.unwrap();
+            let rows = conn.query("SELECT * FROM t", ()).await.unwrap();
+            let all = all_rows(rows).await.unwrap();
+            assert_eq!(
+                all,
+                vec![vec![Value::Integer(42)], vec![Value::Integer(41)],]
+            );
+        }
+    }
+
+    #[tokio::test]
     pub async fn test_sync_pull() {
         let _ = tracing_subscriber::fmt::try_init();
         let server = TursoServer::new().await.unwrap();
@@ -869,7 +921,8 @@ mod tests {
             .await
             .unwrap();
         server.db_sql("SELECT * FROM t").await.unwrap();
-        let db = crate::sync::Builder::new_remote(":memory:", server.db_url())
+        let db = crate::sync::Builder::new_remote(":memory:")
+            .with_remote_url(server.db_url())
             .build()
             .await
             .unwrap();
@@ -926,7 +979,8 @@ mod tests {
             .await
             .unwrap();
         server.db_sql("SELECT * FROM t").await.unwrap();
-        let db = crate::sync::Builder::new_remote(":memory:", server.db_url())
+        let db = crate::sync::Builder::new_remote(":memory:")
+            .with_remote_url(server.db_url())
             .build()
             .await
             .unwrap();
@@ -975,7 +1029,8 @@ mod tests {
     pub async fn test_sync_checkpoint() {
         let _ = tracing_subscriber::fmt::try_init();
         let server = TursoServer::new().await.unwrap();
-        let db = crate::sync::Builder::new_remote(":memory:", server.db_url())
+        let db = crate::sync::Builder::new_remote(":memory:")
+            .with_remote_url(server.db_url())
             .build()
             .await
             .unwrap();
@@ -1004,7 +1059,8 @@ mod tests {
             .await
             .unwrap();
         {
-            let full_db = crate::sync::Builder::new_remote(":memory:", server.db_url())
+            let full_db = crate::sync::Builder::new_remote(":memory:")
+                .with_remote_url(server.db_url())
                 .build()
                 .await
                 .unwrap();
@@ -1019,9 +1075,12 @@ mod tests {
             assert!(full_db.stats().await.unwrap().network_received_bytes > 2000 * 1024);
         }
         {
-            let partial_db = crate::sync::Builder::new_remote(":memory:", server.db_url())
+            let partial_db = crate::sync::Builder::new_remote(":memory:")
+                .with_remote_url(server.db_url())
                 .with_partial_sync_opts_experimental(PartialSyncOpts {
-                    bootstrap_strategy: PartialBootstrapStrategy::Prefix { length: 128 * 1024 },
+                    bootstrap_strategy: Some(PartialBootstrapStrategy::Prefix {
+                        length: 128 * 1024,
+                    }),
                     segment_size: 128 * 1024,
                     prefetch: false,
                 })
@@ -1064,7 +1123,8 @@ mod tests {
             .await
             .unwrap();
         {
-            let full_db = crate::sync::Builder::new_remote(":memory:", server.db_url())
+            let full_db = crate::sync::Builder::new_remote(":memory:")
+                .with_remote_url(server.db_url())
                 .build()
                 .await
                 .unwrap();
@@ -1079,9 +1139,12 @@ mod tests {
             assert!(full_db.stats().await.unwrap().network_received_bytes > 256 * 1024);
         }
         {
-            let partial_db = crate::sync::Builder::new_remote(":memory:", server.db_url())
+            let partial_db = crate::sync::Builder::new_remote(":memory:")
+                .with_remote_url(server.db_url())
                 .with_partial_sync_opts_experimental(PartialSyncOpts {
-                    bootstrap_strategy: PartialBootstrapStrategy::Prefix { length: 128 * 1024 },
+                    bootstrap_strategy: Some(PartialBootstrapStrategy::Prefix {
+                        length: 128 * 1024,
+                    }),
                     segment_size: 4 * 1024,
                     prefetch: false,
                 })
@@ -1124,7 +1187,8 @@ mod tests {
             .await
             .unwrap();
         {
-            let full_db = crate::sync::Builder::new_remote(":memory:", server.db_url())
+            let full_db = crate::sync::Builder::new_remote(":memory:")
+                .with_remote_url(server.db_url())
                 .build()
                 .await
                 .unwrap();
@@ -1139,9 +1203,12 @@ mod tests {
             assert!(full_db.stats().await.unwrap().network_received_bytes > 2000 * 1024);
         }
         {
-            let partial_db = crate::sync::Builder::new_remote(":memory:", server.db_url())
+            let partial_db = crate::sync::Builder::new_remote(":memory:")
+                .with_remote_url(server.db_url())
                 .with_partial_sync_opts_experimental(PartialSyncOpts {
-                    bootstrap_strategy: PartialBootstrapStrategy::Prefix { length: 128 * 1024 },
+                    bootstrap_strategy: Some(PartialBootstrapStrategy::Prefix {
+                        length: 128 * 1024,
+                    }),
                     segment_size: 128 * 1024,
                     prefetch: true,
                 })
