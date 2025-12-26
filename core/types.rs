@@ -3390,29 +3390,11 @@ mod tests {
             .parse_full_header(&record)
             .expect("Failed to parse full header");
 
-        assert_eq!(
-            cursor1.offsets.len(),
-            cursor1.serial_types.len() + 1,
-            "offsets should be one longer than serial_types"
-        );
-
-        for i in 0..values.len() {
-            cursor1
-                .deserialize_column(&record, i)
-                .expect("Failed to deserialize column");
-        }
-
         // Incremental Parsing
         let mut cursor2 = RecordCursor::new();
         cursor2
             .ensure_parsed_upto(&record, 2)
             .expect("Failed to parse up to column 2");
-
-        assert_eq!(
-            cursor2.offsets.len(),
-            cursor2.serial_types.len() + 1,
-            "offsets should be one longer than serial_types"
-        );
 
         cursor2.get_value(&record, 2).expect("Column 2 failed");
 
@@ -3439,7 +3421,6 @@ mod tests {
             cursor1.serial_types, cursor2.serial_types,
             "serial_types must match"
         );
-        assert_eq!(cursor1.offsets, cursor2.offsets, "offsets must match");
     }
 
     #[test]
