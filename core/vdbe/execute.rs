@@ -9100,12 +9100,12 @@ pub fn op_add_column(
         let table = schema
             .tables
             .get_mut(table)
-            .expect("table being renamed should be in schema");
+            .expect("table being altered should be in schema");
 
         let table = Arc::make_mut(table);
 
         let Table::BTree(btree) = table else {
-            panic!("only btree tables can be renamed");
+            panic!("only btree tables can have columns added");
         };
 
         let btree = Arc::make_mut(btree);

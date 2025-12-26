@@ -628,12 +628,6 @@ fn validate_drop_table(resolver: &Resolver, tbl_name: &str) -> Result<()> {
     if crate::schema::is_system_table(tbl_name) {
         bail_parse_error!("Cannot drop system table {}", tbl_name);
     }
-    if RESERVED_TABLE_PREFIXES
-        .iter()
-        .any(|prefix| tbl_name.starts_with(prefix))
-    {
-        bail_parse_error!("table {tbl_name} may not be dropped");
-    }
     // Check if this is a materialized view - if so, refuse to drop it with DROP TABLE
     if resolver.schema.is_materialized_view(tbl_name) {
         bail_parse_error!(

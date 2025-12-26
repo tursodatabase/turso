@@ -103,7 +103,7 @@ fn validate_update(
     is_internal_schema_change: bool,
 ) -> crate::Result<()> {
     // Check if this is a system table that should be protected from direct writes
-    if !crate::schema::can_write_to_table(table_name) {
+    if !is_internal_schema_change && !crate::schema::can_write_to_table(table_name) {
         crate::bail_parse_error!("table {} may not be modified", table_name);
     }
     if body.with.is_some() {
@@ -125,11 +125,6 @@ fn validate_update(
 
     if !body.order_by.is_empty() {
         bail_parse_error!("ORDER BY is not supported in UPDATE");
-    }
-    // Check if this is a system table that should be protected from direct writes
-    // Skip this check for internal schema change operations (like ALTER TABLE)
-    if !is_internal_schema_change && !crate::schema::can_write_to_table(table_name) {
-        bail_parse_error!("table {} may not be modified", table_name);
     }
     // Check if this is a materialized view
     if schema.is_materialized_view(table_name) {
