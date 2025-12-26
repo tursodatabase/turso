@@ -564,7 +564,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         }
 
-        let nr_iterations = opts.nr_iterations;
+        let nr_iterations = plan.nr_iterations;
         let db = db.clone();
         let vfs_for_task = vfs_option.clone();
 
