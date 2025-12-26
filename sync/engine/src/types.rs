@@ -157,11 +157,12 @@ pub enum DatabaseSyncEngineProtocolVersion {
 }
 
 impl DatabaseMetadata {
-    pub fn remote_url(&self) -> Option<&str> {
+    pub fn remote_url(&self) -> Option<String> {
         self.saved_configuration
             .as_ref()
             .map(|x| x.remote_url.as_deref())
             .flatten()
+            .map(|x| x.to_string())
     }
     pub fn partial_sync_opts(&self) -> Option<PartialSyncOpts> {
         if self.partial_bootstrap_server_revision.is_none() {

@@ -120,7 +120,7 @@ impl<'a, IO: SyncEngineIo, Ctx> SyncOperationCtx<'a, IO, Ctx> {
     pub fn new(
         coro: &'a Coro<Ctx>,
         io: &'a SyncEngineIoStats<IO>,
-        remote_url: Option<&str>,
+        remote_url: Option<String>,
     ) -> Self {
         Self {
             coro,

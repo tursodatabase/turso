@@ -555,7 +555,7 @@ impl<IO: SyncEngineIo> DatabaseStorage for LazyDatabaseStorage<IO> {
             move |coro| async move {
                 let coro = Coro::new((), coro);
                 let mut guard = PageStatesGuard::new(&page_states);
-                let ctx = &SyncOperationCtx::new(&coro, &sync_engine_io, remote_url.as_deref());
+                let ctx = &SyncOperationCtx::new(&coro, &sync_engine_io, remote_url);
                 read_page(
                     ctx,
                     clean_file,

@@ -254,7 +254,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             None if opts.bootstrap_if_empty => {
                 let client_unique_id = format!("{}-{}", opts.client_name, uuid::Uuid::new_v4());
                 let revision = bootstrap_db_file(
-                    &SyncOperationCtx::new(coro, &sync_engine_io, opts.remote_url.as_deref()),
+                    &SyncOperationCtx::new(coro, &sync_engine_io, opts.remote_url.clone()),
                     &io,
                     main_db_path,
                     opts.protocol_version_hint,
@@ -725,8 +725,9 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
 
         let now = self.io.now();
         let revision = self.meta().synced_revision.clone();
+        let ctx = &SyncOperationCtx::new(coro, &self.sync_engine_io, self.meta().remote_url());
         let next_revision = wal_pull_to_file(
-            &SyncOperationCtx::new(coro, &self.sync_engine_io, self.meta().remote_url()),
+            ctx,
             &file.value,
             &revision,
             self.opts.wal_pull_batch_size,
@@ -974,18 +975,9 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
             };
 
             let mut transformed = if self.opts.use_transform {
-                Some(
-                    apply_transformation(
-                        &SyncOperationCtx::new(
-                            coro,
-                            &self.sync_engine_io,
-                            self.meta().remote_url(),
-                        ),
-                        &local_changes,
-                        &replay.generator,
-                    )
-                    .await?,
-                )
+                let ctx =
+                    &SyncOperationCtx::new(coro, &self.sync_engine_io, self.meta().remote_url());
+                Some(apply_transformation(ctx, &local_changes, &replay.generator).await?)
             } else {
                 None
             };
@@ -1024,13 +1016,9 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
     pub async fn push_changes_to_remote<Ctx>(&self, coro: &Coro<Ctx>) -> Result<()> {
         tracing::info!("push_changes(path={})", self.main_db_path);
 
-        let (_, change_id) = push_logical_changes(
-            &SyncOperationCtx::new(coro, &self.sync_engine_io, self.meta().remote_url()),
-            &self.main_tape,
-            &self.client_unique_id,
-            &self.opts,
-        )
-        .await?;
+        let ctx = &SyncOperationCtx::new(coro, &self.sync_engine_io, self.meta().remote_url());
+        let (_, change_id) =
+            push_logical_changes(ctx, &self.main_tape, &self.client_unique_id, &self.opts).await?;
 
         self.update_meta(coro, |m| {
             m.last_pushed_change_id_hint = change_id;
