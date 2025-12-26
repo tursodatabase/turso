@@ -43,6 +43,7 @@
 
 #![allow(clippy::arc_with_non_send_sync)]
 
+use branches::likely;
 use bytemuck::{Pod, Zeroable};
 use pack1::{I32BE, U16BE, U32BE};
 use tracing::{instrument, Level};
@@ -1580,7 +1581,7 @@ pub fn read_integer(buf: &[u8], serial_type: u8) -> Result<i64> {
     }
 }
 
-/// Fast varint reader optimized for the common cases of 1-byte and 2-byte varints.
+/// Fast varint reader optimized for the common cases of 1-4 bytes varints.
 ///
 /// This function is a performance-optimized version of `read_varint()` that handles
 /// the most common varint cases inline before falling back to the full implementation.
@@ -1588,34 +1589,67 @@ pub fn read_integer(buf: &[u8], serial_type: u8) -> Result<i64> {
 ///
 /// # Optimized Cases
 ///
-/// - **Single-byte case**: Values 0-127 (0x00-0x7F) are returned immediately
-/// - **Two-byte case**: Values 128-16383 (0x80-0x3FFF) are handled inline
-/// - **Multi-byte case**: Larger values fall back to the full `read_varint()` implementation
+/// - **1-4 Byte Varints**: This function can read varints that fit within 1 to 4 bytes directly.
 ///
 /// This function is similar to `sqlite3GetVarint32`
 #[inline(always)]
 pub fn read_varint_fast(buf: &[u8]) -> Result<(u64, usize)> {
-    // Fast path: Single-byte varint
-    if let Some(&first_byte) = buf.first() {
-        if first_byte & 0x80 == 0 {
-            return Ok((first_byte as u64, 1));
+    #[cold]
+    #[inline(never)]
+    // internal slow path for varints longer than 4 bytes
+    pub fn continue_slow(buf: &[u8], mut v: u64) -> Result<(u64, usize)> {
+        for i in 4..8 {
+            match buf.get(i) {
+                Some(c) => {
+                    v = (v << 7) + (c & 0x7f) as u64;
+                    if (c & 0x80) == 0 {
+                        return Ok((v, i + 1));
+                    }
+                }
+                None => {
+                    crate::bail_corrupt_error!("Invalid varint");
+                }
+            }
         }
-    } else {
-        crate::bail_corrupt_error!("Invalid varint");
-    }
-
-    // Fast path: Two-byte varint
-    if let Some(&second_byte) = buf.get(1) {
-        if second_byte & 0x80 == 0 {
-            let v = (((buf[0] & 0x7f) as u64) << 7) + (second_byte as u64);
-            return Ok((v, 2));
+        match buf.get(8) {
+            Some(&c) => {
+                // Values requiring 9 bytes must have non-zero in the top 8 bits (value >= 1<<56).
+                // Since the final value is `(v<<8) + c`, the top 8 bits (v >> 48) must not be 0.
+                // If those are zero, this should be treated as corrupt.
+                // Perf? the comparison + branching happens only in parsing 9-byte varint which is rare.
+                if (v >> 48) == 0 {
+                    bail_corrupt_error!("Invalid varint");
+                }
+                v = (v << 8) + c as u64;
+                Ok((v, 9))
+            }
+            None => {
+                bail_corrupt_error!("Invalid varint");
+            }
         }
-    } else {
-        crate::bail_corrupt_error!("Invalid varint");
     }
-
-    //Fallback: Multi-byte varint
-    read_varint(buf)
+    // Fast path
+    let mut v = 0;
+    let mut register = if likely(buf.len() >= 4) {
+        let slice = buf.get(0..4).unwrap();
+        u32::from_le_bytes([slice[0], slice[1], slice[2], slice[3]])
+    } else {
+        let mut temp = [0u8; 4];
+        for i in 0..buf.len() {
+            temp[i] = buf[i];
+        }
+        u32::from_le_bytes([temp[0], temp[1], temp[2], temp[3]])
+    };
+    for i in 0..4 {
+        let c = (register & 0xff) as u8;
+        v = (v << 7) + (c & 0x7f) as u64;
+        if likely((c & 0x80) == 0) {
+            return Ok((v, i + 1));
+        }
+        register >>= 8;
+    }
+    // Fallback: 4+ byte varint
+    return continue_slow(buf, v);
 }
 
 #[inline(always)]
