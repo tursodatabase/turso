@@ -434,7 +434,6 @@ enum CommitState {
     /// Get DB size (mostly from page cache - but in rare cases we can read it from disk)
     GetDbSize,
     /// Scan all dirty pages and issue concurrent reads for evicted (spilled) pages.
-    /// This allows reading multiple evicted pages in parallel rather than serially.
     ScanAndIssueReads { db_size: u32 },
     /// Wait for all batched reads of evicted pages to complete.
     WaitBatchedReads { db_size: u32 },
@@ -504,10 +503,11 @@ struct CommitInfo {
     prepared_frames: Vec<PreparedFrames>,
 }
 
+/// Represents a dirty page that will be committed to the log.
 enum PageSource {
-    // page_id fetched from cache during PrepareFrames
+    /// Cache resident page
     Cached(usize),
-    // pre-read page
+    /// A page read from disk because it was spilled/evicted from cache
     Evicted(PageRef),
 }
 
@@ -518,17 +518,16 @@ impl CommitInfo {
         self.collected_pages.clear();
         self.page_sources.clear();
         self.prepared_frames.clear();
+        self.page_source_cursor = 0;
     }
-    fn preallocate(&mut self, n: usize) {
+
+    /// Clear and reserve space for n pages in each vector.
+    fn initialize(&mut self, n: usize) {
         self.page_sources.clear();
         self.page_sources.reserve(n.min(IOV_MAX));
         self.completions.clear();
         self.completions.reserve(n / 4);
         self.collected_pages.reserve(n.min(IOV_MAX));
-    }
-    fn clear_read_state(&mut self) {
-        self.page_sources.clear();
-        self.page_source_cursor = 0;
     }
 }
 
@@ -2532,7 +2531,7 @@ impl Pager {
                     if dirty_pages.is_empty() {
                         return Ok(IOResult::Done(PagerCommitResult::WalWritten));
                     }
-                    commit_info.preallocate(dirty_pages.len());
+                    commit_info.initialize(dirty_pages.len());
                     let mut cache = self.page_cache.write();
 
                     for &page_id in dirty_pages.iter() {
@@ -2636,7 +2635,6 @@ impl Pager {
                         batch.writev(prepared.offset, &prepared.bufs);
                     }
                     commit_info.completions = batch.submit()?;
-                    commit_info.clear_read_state();
                     commit_info.state = CommitState::WaitWrites;
                 }
                 CommitState::WaitWrites => {
