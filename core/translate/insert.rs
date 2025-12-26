@@ -55,7 +55,7 @@ use turso_parser::ast::{
 /// Validate anything with this insert statement that should throw an early parse error
 fn validate(table_name: &str, resolver: &Resolver, table: &Table) -> Result<()> {
     // Check if this is a system table that should be protected from direct writes
-    if crate::schema::is_system_table(table_name) {
+    if !crate::schema::can_write_to_table(table_name) {
         crate::bail_parse_error!("table {} may not be modified", table_name);
     }
     // Check if this table has any incompatible dependent views
