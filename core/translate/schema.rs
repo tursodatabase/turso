@@ -639,10 +639,10 @@ fn validate_drop_table(resolver: &Resolver, tbl_name: &str) -> Result<()> {
 
 pub fn translate_drop_table(
     tbl_name: ast::QualifiedName,
-    resolver: &Resolver,
+    resolver: &mut Resolver,
     if_exists: bool,
     mut program: ProgramBuilder,
-    connection: &Connection,
+    connection: &Arc<Connection>,
 ) -> Result<ProgramBuilder> {
     let name = tbl_name.name.as_str();
     let opts = ProgramBuilderOpts {
@@ -659,10 +659,9 @@ pub fn translate_drop_table(
     };
     validate_drop_table(resolver, name)?;
     // Check if foreign keys are enabled and if this table is referenced by foreign keys
-    // We emit runtime checks to scan child tables for non-NULL FK values
-    // SQLite allows DROP TABLE when child FK values are NULL (no actual reference)
+    // Fire FK actions (CASCADE, SET NULL, SET DEFAULT) or check for violations (RESTRICT, NO ACTION)
     if connection.foreign_keys_enabled() && resolver.schema.any_resolved_fks_referencing(name) {
-        emit_fk_drop_table_check(&mut program, resolver, name)?;
+        emit_fk_drop_table_check(&mut program, resolver, name, connection)?;
     }
     let cdc_table = prepare_cdc_if_necessary(&mut program, resolver.schema, SQLITE_TABLEID)?;
 
