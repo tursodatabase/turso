@@ -133,7 +133,7 @@ impl Builder {
 
         // IO worker will process SyncEngine IO queue on a dedicated tokio thread.
         let url = if let Some(remote_url) = &self.remote_url {
-            Some(normalize_base_url(&remote_url).map_err(Error::Error)?)
+            Some(normalize_base_url(remote_url).map_err(Error::Error)?)
         } else {
             None
         };
@@ -505,11 +505,11 @@ impl IoWorker {
             } else {
                 format!("/{path}")
             };
-            let Some(url) = this.base_url.as_deref().or_else(|| url.map(|x| x)) else {
+            let Some(url) = this.base_url.as_deref().or_else(|| url) else {
                 completion.poison("remote_url is not available".to_string());
                 return;
             };
-            format!("{}{}", url, p)
+            format!("{url}{p}")
         };
 
         let mut builder = Request::builder().method(method).uri(&full_url);

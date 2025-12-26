@@ -132,7 +132,7 @@ def _process_http_item(
     # Build full URL
     url = base_url if base_url else req_kind.url
     if not url:
-        io_item.poison(f"remote url unavailable")
+        io_item.poison("remote url unavailable")
         raise RuntimeError("remote_url is not available")
     url = _join_url(url, path)
 
@@ -460,7 +460,7 @@ def connect_sync(
         long_poll_timeout_ms=long_poll_timeout_ms,
         bootstrap_if_empty=bootstrap_if_empty,
         reserved_bytes=None,
-        partial_sync_opts=PyTursoPartialSyncOpts(
+        partial_sync=PyTursoPartialSyncOpts(
             bootstrap_strategy_prefix=prefix_len,
             bootstrap_strategy_query=query_str,
             segment_size=partial_sync_experimental.segment_size,
