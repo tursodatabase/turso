@@ -57,6 +57,7 @@ use std::task::Poll;
 pub use turso_core::EncryptionOpts;
 use turso_core::OpenFlags;
 
+use crate::connection_pool::ConnectionPool;
 // Re-exports rows
 pub use crate::rows::{Row, Rows};
 
@@ -92,6 +93,7 @@ pub struct Builder {
     enable_encryption: bool,
     vfs: Option<String>,
     encryption_opts: Option<EncryptionOpts>,
+    enable_connection_pool: bool,
 }
 
 impl Builder {
@@ -102,6 +104,7 @@ impl Builder {
             enable_encryption: false,
             vfs: None,
             encryption_opts: None,
+            enable_connection_pool: false,
         }
     }
 
@@ -120,6 +123,11 @@ impl Builder {
         self
     }
 
+    pub fn with_connection_pool(mut self, enable_connection_pool: bool) -> Self {
+        self.enable_connection_pool = enable_connection_pool;
+        self
+    }
+
     /// Build the database.
     #[allow(unused_variables, clippy::arc_with_non_send_sync)]
     pub async fn build(self) -> Result<Database> {
@@ -132,7 +140,12 @@ impl Builder {
             opts,
             self.encryption_opts.clone(),
         )?;
-        Ok(Database { inner: db })
+        let cp = ConnectionPool::new(self.enable_connection_pool);
+
+        Ok(Database {
+            inner: db,
+            connection_pool: cp.into(),
+        })
     }
 
     fn get_io(&self) -> Result<Arc<dyn turso_core::IO>> {
@@ -194,6 +207,7 @@ impl Builder {
 #[derive(Clone)]
 pub struct Database {
     inner: Arc<turso_core::Database>,
+    connection_pool: Arc<ConnectionPool>,
 }
 
 unsafe impl Send for Database {}
@@ -208,8 +222,18 @@ impl Debug for Database {
 impl Database {
     /// Connect to the database.
     pub fn connect(&self) -> Result<Connection> {
+        match &self.connection_pool.is_enabled() {
+            true => match self.connection_pool.get() {
+                Some(c) => return Ok(c),
+                None => return self._connect(),
+            },
+            false => return self._connect(),
+        }
+    }
+
+    pub fn _connect(&self) -> Result<Connection> {
         let conn = self.inner.connect()?;
-        Ok(Connection::create(conn))
+        Ok(Connection::create(conn, self.connection_pool.clone()))
     }
 }
 
@@ -571,7 +595,7 @@ mod tests {
             .await
             .expect("Turso Failed to Build memory db");
 
-        let cp = ConnectionPool::new();
+        let cp = ConnectionPool::new(true);
 
         // with a new connection pool we should get a None out
         let no_connection = cp.get();
@@ -613,6 +637,32 @@ mod tests {
         assert!(cp.available_connections() == 1);
         let _conn_r4 = cp.get();
         assert!(cp.available_connections() == 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_no_connection_pool() -> Result<()> {
+        let db = Builder::new_local(":memory:")
+            .build()
+            .await
+            .expect("Turso Failed to Build memory db");
+
+        let cp = ConnectionPool::new(false);
+
+        // with a new connection pool we should get a None out
+        let no_connection = cp.get();
+        assert!(no_connection.is_none());
+        assert!(cp.available_connections() == 0);
+
+        // if we add a conmnection to a non existant pool then the number of connections is 0
+        let conn = db.connect()?;
+        cp.add(conn);
+        assert!(cp.available_connections() == 0);
+
+        // no pool so still can't get a connection out
+        let conn_r = cp.get();
+        assert!(conn_r.is_none());
 
         Ok(())
     }
