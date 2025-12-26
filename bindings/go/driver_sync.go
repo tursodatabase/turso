@@ -99,9 +99,6 @@ func NewTursoSyncDb(ctx context.Context, config TursoSyncDbConfig) (*TursoSyncDb
 	if strings.TrimSpace(config.Path) == "" {
 		return nil, errors.New("turso: empty Path in TursoSyncDbConfig")
 	}
-	if strings.TrimSpace(config.RemoteUrl) == "" {
-		return nil, errors.New("turso: empty RemoteUrl in TursoSyncDbConfig")
-	}
 	clientName := config.ClientName
 	if clientName == "" {
 		clientName = "turso-sync-go"
@@ -119,6 +116,7 @@ func NewTursoSyncDb(ctx context.Context, config TursoSyncDbConfig) (*TursoSyncDb
 	}
 	syncCfg := TursoSyncDatabaseConfig{
 		Path:                           config.Path,
+		RemoteUrl:                      config.RemoteUrl,
 		ClientName:                     clientName,
 		LongPollTimeoutMs:              config.LongPollTimeoutMs,
 		BootstrapIfEmpty:               bootstrap,

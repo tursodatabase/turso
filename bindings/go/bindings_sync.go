@@ -45,6 +45,9 @@ const (
 type TursoSyncDatabaseConfig struct {
 	// Path to the main database file (auxiliary files will derive names from this path)
 	Path string
+	// optional remote url (libsql://..., https://... or http://...)
+	// this URL will be saved in the database metadata file in order to be able to reuse it if later client will be constructed without explicit remote url
+	RemoteUrl string
 	// Arbitrary client name used as a prefix for unique client id
 	ClientName string
 	// Long poll timeout for pull method in milliseconds
@@ -79,6 +82,7 @@ type TursoSyncStats struct {
 
 // HTTP request description used by IO layer.
 type TursoSyncIoHttpRequest struct {
+	Url     string
 	Method  string
 	Path    string
 	Body    []byte
@@ -106,6 +110,7 @@ type TursoSyncIoFullWriteRequest struct {
 
 type turso_sync_database_config_t struct {
 	path                              uintptr // const char*
+	remote_url                        uintptr // const char*
 	client_name                       uintptr // const char*
 	long_poll_timeout_ms              int32
 	bootstrap_if_empty                bool
@@ -117,6 +122,7 @@ type turso_sync_database_config_t struct {
 }
 
 type turso_sync_io_http_request_t struct {
+	url     turso_slice_ref_t
 	method  turso_slice_ref_t
 	path    turso_slice_ref_t
 	body    turso_slice_ref_t
@@ -387,8 +393,9 @@ func turso_sync_database_new(dbConfig TursoDatabaseConfig, syncConfig TursoSyncD
 
 	// Build C sync config
 	var csync turso_sync_database_config_t
-	var syncPathBytes, clientNameBytes, queryBytes []byte
+	var syncPathBytes, remoteUrlBytes, clientNameBytes, queryBytes []byte
 	syncPathBytes, csync.path = makeCStringBytes(syncConfig.Path)
+	remoteUrlBytes, csync.remote_url = makeCStringBytes(syncConfig.RemoteUrl)
 	clientNameBytes, csync.client_name = makeCStringBytes(syncConfig.ClientName)
 	csync.long_poll_timeout_ms = int32(syncConfig.LongPollTimeoutMs)
 	csync.bootstrap_if_empty = syncConfig.BootstrapIfEmpty
@@ -406,6 +413,7 @@ func turso_sync_database_new(dbConfig TursoDatabaseConfig, syncConfig TursoSyncD
 
 	// Keep Go memory alive during C call
 	runtime.KeepAlive(pathBytes)
+	runtime.KeepAlive(remoteUrlBytes)
 	runtime.KeepAlive(expBytes)
 	runtime.KeepAlive(syncPathBytes)
 	runtime.KeepAlive(clientNameBytes)
@@ -637,6 +645,7 @@ func turso_sync_database_io_request_http(self TursoSyncIoItem) (TursoSyncIoHttpR
 		return TursoSyncIoHttpRequest{}, statusToError(TursoStatusCode(status), "")
 	}
 	return TursoSyncIoHttpRequest{
+		Url:     sliceRefToStringCopy(creq.url),
 		Method:  sliceRefToStringCopy(creq.method),
 		Path:    sliceRefToStringCopy(creq.path),
 		Body:    sliceRefToBytesCopy(creq.body),
