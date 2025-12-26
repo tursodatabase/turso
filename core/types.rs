@@ -3399,9 +3399,9 @@ mod tests {
         cursor2.get_value(&record, 2).expect("Column 2 failed");
 
         // Access column 0 (already parsed)
-        let before = cursor2.serial_types.len();
+        let before = cursor2.serials_offsets.len();
         cursor2.get_value(&record, 0).expect("Column 0 failed");
-        let after = cursor2.serial_types.len();
+        let after = cursor2.serials_offsets.len();
         assert_eq!(before, after, "Should not parse more");
 
         // Access column 5 (forces full parse)
@@ -3418,8 +3418,8 @@ mod tests {
         }
 
         assert_eq!(
-            cursor1.serial_types, cursor2.serial_types,
-            "serial_types must match"
+            cursor1.serials_offsets, cursor2.serials_offsets,
+            "entries must match"
         );
     }
 
