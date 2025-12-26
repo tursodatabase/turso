@@ -13,7 +13,7 @@ use crate::storage::database::DatabaseFile;
 use crate::storage::journal_mode;
 use crate::storage::page_cache::PageCache;
 use crate::storage::pager::{default_page1, CreateBTreeFlags, PageRef};
-use crate::storage::sqlite3_ondisk::{read_varint_fast, DatabaseHeader, PageSize, RawVersion};
+use crate::storage::sqlite3_ondisk::{read_varint, DatabaseHeader, PageSize, RawVersion};
 use crate::translate::collate::CollationSeq;
 use crate::types::{
     compare_immutable, compare_records_generic, AsValueRef, Extendable, IOCompletions,
@@ -1533,8 +1533,7 @@ pub fn op_column(
                             while record_cursor.serials_offsets.len() <= target_column
                                 && parse_pos < record_cursor.header_size
                             {
-                                let (serial_type, varint_len) =
-                                    read_varint_fast(&payload[parse_pos..])?;
+                                let (serial_type, varint_len) = read_varint(&payload[parse_pos..])?;
                                 parse_pos += varint_len;
                                 let data_size = match serial_type {
                                     // NULL

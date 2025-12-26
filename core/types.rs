@@ -12,7 +12,7 @@ use crate::numeric::format_float;
 use crate::pseudo::PseudoCursor;
 use crate::schema::Index;
 use crate::storage::btree::CursorTrait;
-use crate::storage::sqlite3_ondisk::{read_integer, read_value, read_varint_fast, write_varint};
+use crate::storage::sqlite3_ondisk::{read_integer, read_value, read_varint, write_varint};
 use crate::translate::collate::CollationSeq;
 use crate::translate::plan::IterationDirection;
 use crate::vdbe::sorter::Sorter;
@@ -1289,7 +1289,7 @@ impl RecordCursor {
 
     #[inline]
     pub fn init_header(&mut self, payload: &[u8]) -> Result<usize> {
-        let (header_size, bytes_read) = read_varint_fast(payload)?;
+        let (header_size, bytes_read) = read_varint(payload)?;
         self.header_size = header_size as usize;
         self.header_offset = bytes_read;
         Ok(header_size as usize)
@@ -1339,7 +1339,7 @@ impl RecordCursor {
             && self.header_offset < self.header_size
             && self.header_offset < payload.len()
         {
-            let (serial_type, read_bytes) = read_varint_fast(&payload[self.header_offset..])?;
+            let (serial_type, read_bytes) = read_varint(&payload[self.header_offset..])?;
             self.header_offset += read_bytes;
 
             let serial_type_obj = SerialType::try_from(serial_type)?;
@@ -1975,7 +1975,7 @@ where
         return compare_records_generic(serialized, unpacked, index_info, 0, tie_breaker);
     }
 
-    let (header_size, offset_1st_serialtype) = read_varint_fast(payload)?;
+    let (header_size, offset_1st_serialtype) = read_varint(payload)?;
     let header_size = header_size as usize;
 
     if payload.len() < header_size {
@@ -1986,7 +1986,7 @@ where
         )));
     }
 
-    let (first_serial_type, _) = read_varint_fast(&payload[offset_1st_serialtype..])?;
+    let (first_serial_type, _) = read_varint(&payload[offset_1st_serialtype..])?;
 
     let serialtype_is_integer = matches!(first_serial_type, 1..=6 | 8 | 9);
     if !serialtype_is_integer {
@@ -2070,7 +2070,7 @@ where
         return compare_records_generic(serialized, unpacked, index_info, 0, tie_breaker);
     }
 
-    let (header_size, offset_1st_serialtype) = read_varint_fast(payload)?;
+    let (header_size, offset_1st_serialtype) = read_varint(payload)?;
     let header_size = header_size as usize;
 
     if payload.len() < header_size {
@@ -2081,7 +2081,7 @@ where
         )));
     }
 
-    let (first_serial_type, _) = read_varint_fast(&payload[offset_1st_serialtype..])?;
+    let (first_serial_type, _) = read_varint(&payload[offset_1st_serialtype..])?;
 
     let serialtype_is_string = first_serial_type >= 13 && (first_serial_type & 1) == 1;
     if !serialtype_is_string {
@@ -2182,7 +2182,7 @@ where
         return Ok(std::cmp::Ordering::Less);
     }
 
-    let (header_size, mut header_pos) = read_varint_fast(payload)?;
+    let (header_size, mut header_pos) = read_varint(payload)?;
     let header_end = header_size as usize;
     debug_assert!(header_end <= payload.len());
 
@@ -2194,7 +2194,7 @@ where
             break;
         }
 
-        let (serial_type_raw, bytes_read) = read_varint_fast(&payload[header_pos..])?;
+        let (serial_type_raw, bytes_read) = read_varint(&payload[header_pos..])?;
         header_pos += bytes_read;
 
         let serial_type = SerialType::try_from(serial_type_raw)?;
@@ -2215,7 +2215,7 @@ where
         if field_idx >= field_limit || header_pos >= header_end {
             break;
         }
-        let (serial_type_raw, bytes_read) = read_varint_fast(&payload[header_pos..])?;
+        let (serial_type_raw, bytes_read) = read_varint(&payload[header_pos..])?;
         header_pos += bytes_read;
 
         let serial_type = SerialType::try_from(serial_type_raw)?;
