@@ -1730,3 +1730,86 @@ do_execsql_test_in_memory_any_error fk-drop-parent-mixed-null-references {
     INSERT INTO child VALUES(11, 1);
     DROP TABLE parent;
 }
+
+# DROP parent should succeed when child has orphaned FK value
+do_execsql_test_on_specific_db {:memory:} fk-drop-parent-ok-with-orphaned-fk {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id REFERENCES parent(id));
+    INSERT INTO parent VALUES(1), (2);
+    PRAGMA foreign_keys=OFF;
+    INSERT INTO child VALUES(10, 999);
+    PRAGMA foreign_keys=ON;
+    DROP TABLE parent;
+    SELECT id, parent_id FROM child;
+} {10|999}
+
+# DROP parent should succeed with multiple orphaned FK values
+do_execsql_test_on_specific_db {:memory:} fk-drop-parent-ok-with-multiple-orphaned-fks {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id REFERENCES parent(id));
+    INSERT INTO parent VALUES(1), (2);
+    PRAGMA foreign_keys=OFF;
+    INSERT INTO child VALUES(10, 100);
+    INSERT INTO child VALUES(11, 200);
+    INSERT INTO child VALUES(12, 300);
+    PRAGMA foreign_keys=ON;
+    DROP TABLE parent;
+    SELECT id, parent_id FROM child ORDER BY id;
+} {10|100
+11|200
+12|300}
+
+# DROP parent should succeed with mixed orphaned and NULL FK values
+do_execsql_test_on_specific_db {:memory:} fk-drop-parent-ok-with-orphaned-and-null {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id REFERENCES parent(id));
+    INSERT INTO parent VALUES(1), (2);
+    INSERT INTO child VALUES(10, NULL);
+    PRAGMA foreign_keys=OFF;
+    INSERT INTO child VALUES(11, 999);
+    PRAGMA foreign_keys=ON;
+    DROP TABLE parent;
+    SELECT id, parent_id FROM child ORDER BY id;
+} {10|
+11|999}
+
+# DROP parent should FAIL with mixed orphaned and valid FK references
+do_execsql_test_in_memory_any_error fk-drop-parent-fail-with-orphaned-and-valid {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id REFERENCES parent(id));
+    INSERT INTO parent VALUES(1), (2);
+    PRAGMA foreign_keys=OFF;
+    INSERT INTO child VALUES(10, 999);
+    PRAGMA foreign_keys=ON;
+    INSERT INTO child VALUES(11, 1);
+    DROP TABLE parent;
+}
+
+# DROP parent should succeed with composite FK orphaned values
+do_execsql_test_on_specific_db {:memory:} fk-drop-parent-ok-composite-orphaned {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(a INTEGER, b INTEGER, PRIMARY KEY(a, b));
+    CREATE TABLE child(id INTEGER PRIMARY KEY, pa INTEGER, pb INTEGER, FOREIGN KEY(pa, pb) REFERENCES parent(a, b));
+    INSERT INTO parent VALUES(1, 2), (3, 4);
+    PRAGMA foreign_keys=OFF;
+    INSERT INTO child VALUES(10, 1, 999);
+    INSERT INTO child VALUES(11, 999, 2);
+    PRAGMA foreign_keys=ON;
+    DROP TABLE parent;
+    SELECT id, pa, pb FROM child ORDER BY id;
+} {10|1|999
+11|999|2}
+
+# DROP parent should FAIL with composite FK that matches
+do_execsql_test_in_memory_any_error fk-drop-parent-fail-composite-valid {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(a INTEGER, b INTEGER, PRIMARY KEY(a, b));
+    CREATE TABLE child(id INTEGER PRIMARY KEY, pa INTEGER, pb INTEGER, FOREIGN KEY(pa, pb) REFERENCES parent(a, b));
+    INSERT INTO parent VALUES(1, 2), (3, 4);
+    INSERT INTO child VALUES(10, 1, 2);
+    DROP TABLE parent;
+}
