@@ -277,9 +277,20 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
         let sync_engine = self.sync_engine.clone();
         Box::new(TursoDatabaseAsyncOperation::new(Box::new(move |coro| {
             Box::pin(async move {
+                let metadata = database_sync_engine::DatabaseSyncEngine::read_db_meta(
+                    &coro,
+                    io.clone(),
+                    sync_engine_io.clone(),
+                    &main_db_path,
+                )
+                .await?;
                 let io = match io {
                     Some(io) => io,
-                    None => persistent_io(sync_engine_opts.partial_sync_opts.is_some())?,
+                    None => persistent_io(if let Some(metadata) = &metadata {
+                        metadata.partial_sync_opts().is_some()
+                    } else {
+                        sync_engine_opts.partial_sync_opts.is_some()
+                    })?,
                 };
                 let metadata = database_sync_engine::DatabaseSyncEngine::bootstrap_db(
                     &coro,
@@ -287,6 +298,7 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
                     sync_engine_io.clone(),
                     &main_db_path,
                     &sync_engine_opts,
+                    metadata,
                 )
                 .await?;
                 let db_file = database_sync_engine::DatabaseSyncEngine::init_db_storage(

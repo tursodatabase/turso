@@ -211,22 +211,10 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         sync_engine_io: SyncEngineIoStats<IO>,
         main_db_path: &str,
         opts: &DatabaseSyncEngineOpts,
+        meta: Option<DatabaseMetadata>,
     ) -> Result<DatabaseMetadata> {
         tracing::info!("bootstrap_db(path={}): opts={:?}", main_db_path, opts);
-
         let meta_path = create_meta_path(main_db_path);
-        let meta = full_read(
-            coro,
-            Some(io.clone()),
-            sync_engine_io.io.clone(),
-            &meta_path,
-            is_memory(main_db_path),
-        )
-        .await?;
-        let meta = match meta {
-            Some(meta) => Some(DatabaseMetadata::load(&meta)?),
-            None => None,
-        };
         let partial_sync_opts = opts.partial_sync_opts.clone();
         let partial = partial_sync_opts.is_some();
 
@@ -475,12 +463,15 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         main_db_path: &str,
         opts: DatabaseSyncEngineOpts,
     ) -> Result<Self> {
+        let meta = Self::read_db_meta(coro, Some(io.clone()), sync_engine_io.clone(), main_db_path)
+            .await?;
         let meta = Self::bootstrap_db(
             coro,
             io.clone(),
             sync_engine_io.clone(),
             main_db_path,
             &opts,
+            meta,
         )
         .await?;
         let main_db_storage =
