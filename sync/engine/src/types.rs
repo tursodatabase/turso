@@ -160,8 +160,7 @@ impl DatabaseMetadata {
     pub fn remote_url(&self) -> Option<String> {
         self.saved_configuration
             .as_ref()
-            .map(|x| x.remote_url.as_deref())
-            .flatten()
+            .and_then(|x| x.remote_url.as_deref())
             .map(|x| x.to_string())
     }
     pub fn partial_sync_opts(&self) -> Option<PartialSyncOpts> {
@@ -173,14 +172,12 @@ impl DatabaseMetadata {
                 segment_size: self
                     .saved_configuration
                     .as_ref()
-                    .map(|x| x.partial_sync_segment_size)
-                    .flatten()
+                    .and_then(|x| x.partial_sync_segment_size)
                     .unwrap_or(128 * 1024),
                 prefetch: self
                     .saved_configuration
                     .as_ref()
-                    .map(|x| x.partial_sync_prefetch)
-                    .flatten()
+                    .and_then(|x| x.partial_sync_prefetch)
                     .unwrap_or_default(),
             };
             Some(partial_sync_opts)

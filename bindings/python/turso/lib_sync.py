@@ -64,7 +64,7 @@ class _HttpContext:
         self.auth_token = auth_token
         self.client_name = client_name
 
-    def _eval(self, v: Union[str, Callable[[], Optional[str]]]) -> Optional[str]:
+    def _eval(self, v: Optional[Union[str, Callable[[], Optional[str]]]]) -> Optional[str]:
         if callable(v):
             return v()
         return v
@@ -132,7 +132,7 @@ def _process_http_item(
     # Build full URL
     url = base_url if base_url else req_kind.url
     if not url:
-        io_item.poison(f"remote url unavailable: {e}")
+        io_item.poison(f"remote url unavailable")
         raise RuntimeError("remote_url is not available")
     url = _join_url(url, path)
 
@@ -430,7 +430,7 @@ def connect_sync(
     """
     # Resolve client name
     cname = client_name or "turso-sync-py"
-    if remote_url and remote_url.startswith("libsql://"):
+    if remote_url and isinstance(remote_url, str) and remote_url.startswith("libsql://"):
         remote_url = remote_url.replace("libsql://", "https://", 1)
     http_ctx = _HttpContext(remote_url=remote_url, auth_token=auth_token, client_name=cname)
 

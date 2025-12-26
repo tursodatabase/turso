@@ -244,7 +244,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                         io.clone(),
                         sync_engine_io.io.clone(),
                         &meta_path,
-                        is_memory(&main_db_path),
+                        is_memory(main_db_path),
                         meta.dump()?,
                     )
                     .await?;
@@ -380,8 +380,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                 partial_sync_opts,
                 meta.saved_configuration
                     .as_ref()
-                    .map(|x| x.remote_url.as_ref())
-                    .flatten()
+                    .and_then(|x| x.remote_url.as_ref())
                     .cloned(),
             )?)
         } else {
