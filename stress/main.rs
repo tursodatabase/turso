@@ -13,8 +13,6 @@ use std::io::{Read, Write};
 use std::sync::Arc;
 #[cfg(not(feature = "antithesis"))]
 use std::sync::Mutex as StdMutex;
-use tokio::runtime;
-use tokio::runtime::UnhandledPanic;
 use tokio::sync::Mutex;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::layer::SubscriberExt;
@@ -533,8 +531,16 @@ fn sqlite_integrity_check(
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .unhandled_panic(tokio::runtime::UnhandledPanic::ShutdownRuntime)
+        .build()?;
+
+    rt.block_on(async_main())
+}
+
+async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let (_guard, reload_handle) = init_tracing()?;
 
     spawn_log_level_watcher(reload_handle);
@@ -583,10 +589,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let vfs_option = opts.vfs.clone();
 
-    let rt = runtime::Builder::new_current_thread()
-        .unhandled_panic(UnhandledPanic::Ignore)
-        .build()?;
-
     for thread in 0..opts.nr_threads {
         let db_file = db_file.clone();
         let mut builder = Builder::new_local(&db_file);
@@ -627,7 +629,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let db = db.clone();
         let vfs_for_task = vfs_option.clone();
 
-        let handle = rt.spawn(async move {
+        let handle = tokio::spawn(async move {
             let mut conn = db.lock().await.connect()?;
 
             conn.busy_timeout(std::time::Duration::from_millis(opts.busy_timeout))?;
@@ -687,7 +689,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                 println!("Error executing query: {e}");
                             }
                         }
-                        //FIXME this should abort the whole program
                         _ => panic!("Error executing query: {}", e),
                     }
                 }
