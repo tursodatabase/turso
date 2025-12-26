@@ -881,7 +881,7 @@ impl Func {
             #[cfg(not(target_family = "wasm"))]
             "load_extension" => Ok(Self::Scalar(ScalarFunc::LoadExtension)),
             "strftime" => Ok(Self::Scalar(ScalarFunc::StrfTime)),
-            "printf" => Ok(Self::Scalar(ScalarFunc::Printf)),
+            "printf" | "format" => Ok(Self::Scalar(ScalarFunc::Printf)),
             "vector" => Ok(Self::Vector(VectorFunc::Vector)),
             "vector32" => Ok(Self::Vector(VectorFunc::Vector32)),
             "vector32_sparse" => Ok(Self::Vector(VectorFunc::Vector32Sparse)),
