@@ -599,14 +599,9 @@ impl Statement {
                 raw_array.coerce_to_object()?.to_unknown()
             }
             PresentationMode::Pluck => {
-                let (_, value) =
-                    row_data
-                        .get_values()
-                        .enumerate()
-                        .next()
-                        .ok_or(create_generic_error(
-                            "pluck mode requires at least one column in the result",
-                        ))?;
+                let (_, value) = row_data.get_values().enumerate().next().ok_or_else(|| {
+                    create_generic_error("pluck mode requires at least one column in the result")
+                })?;
                 to_js_value(env, value, safe_integers)?
             }
             PresentationMode::Expanded => {

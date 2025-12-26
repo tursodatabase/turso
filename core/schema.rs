@@ -1968,7 +1968,8 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                         }
                         ast::ColumnConstraint::Default(ref expr) => {
                             default = Some(
-                                translate_ident_to_string_literal(expr).unwrap_or(expr.clone()),
+                                translate_ident_to_string_literal(expr)
+                                    .unwrap_or_else(|| expr.clone()),
                             );
                         }
                         // TODO: for now we don't check Resolve type of unique
@@ -2495,8 +2496,9 @@ impl From<&ColumnDefinition> for Column {
                 ast::ColumnConstraint::NotNull { .. } => notnull = true,
                 ast::ColumnConstraint::Unique(..) => unique = true,
                 ast::ColumnConstraint::Default(expr) => {
-                    default
-                        .replace(translate_ident_to_string_literal(expr).unwrap_or(expr.clone()));
+                    default.replace(
+                        translate_ident_to_string_literal(expr).unwrap_or_else(|| expr.clone()),
+                    );
                 }
                 ast::ColumnConstraint::Collate { collation_name } => {
                     collation.replace(

@@ -212,14 +212,14 @@ impl PyTursoSyncDatabaseStats {
             self.revert_wal_size,
             self.last_pull_unix_time
                 .map(|x| x.to_string())
-                .unwrap_or("None".to_string()),
+                .unwrap_or_else(|| "None".to_string()),
             self.last_push_unix_time
                 .map(|x| x.to_string())
-                .unwrap_or("None".to_string()),
+                .unwrap_or_else(|| "None".to_string()),
             self.revision
                 .as_ref()
                 .map(|x| format!("\"{x}\""))
-                .unwrap_or("None".to_string()),
+                .unwrap_or_else(|| "None".to_string()),
             self.network_sent_bytes,
             self.network_received_bytes,
         ))

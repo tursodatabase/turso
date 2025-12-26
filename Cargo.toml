@@ -130,3 +130,6 @@ debug = true
 [profile.dist]
 inherits = "release"
 lto = "thin"
+
+[workspace.lints.clippy]
+or_fun_call = "deny"

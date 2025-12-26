@@ -9,6 +9,9 @@ license.workspace = true
 repository.workspace = true
 description = "Turso Rust API"
 
+[lints]
+workspace = true
+
 [features]
 default = ["mimalloc"]
 antithesis = ["turso_sdk_kit/antithesis"]

@@ -585,7 +585,7 @@ pub fn insn_to_row(
                         "r[{}]={}.{}",
                         dest,
                         get_table_or_index_name(*cursor_id),
-                        column_name.unwrap_or(&format!("column {}", *column))
+                        &column_name.map_or_else(|| format!("column {}", *column), |name| name.to_string())
                     ),
                 )
             }
@@ -623,7 +623,7 @@ pub fn insn_to_row(
                         dest_reg,
                         start_reg,
                         start_reg + count - 1,
-                        for_index.unwrap_or("".to_string())
+                        for_index.unwrap_or_else(|| "".to_string())
                     ),
                 )
             }
@@ -814,7 +814,7 @@ pub fn insn_to_row(
                             if k.index.is_some() { "index" } else { "table" },
                             get_table_or_index_name(*cursor_id),
                         ))
-                        .unwrap_or(format!("cursor {cursor_id}"))
+                        .unwrap_or_else(|| format!("cursor {cursor_id}"))
                 ),
             ),
             Insn::SeekRowid {
@@ -840,7 +840,7 @@ pub fn insn_to_row(
                             if k.index.is_some() { "index" } else { "table" },
                             get_table_or_index_name(*cursor_id),
                         ))
-                        .unwrap_or(format!("cursor {cursor_id}")),
+                        .unwrap_or_else(|| format!("cursor {cursor_id}")),
                     target_pc.as_debug_int()
                 ),
             ),
@@ -1484,9 +1484,9 @@ pub fn insn_to_row(
                 *db as i64,
                 0,
                 0,
-                Value::build_text(where_clause.clone().unwrap_or("NULL".to_string())),
+                Value::build_text(where_clause.clone().unwrap_or_else(|| "NULL".to_string())),
                 0,
-                where_clause.clone().unwrap_or("NULL".to_string()),
+                where_clause.clone().unwrap_or_else(|| "NULL".to_string()),
             ),
             Insn::PopulateMaterializedViews { cursors } => (
                 "PopulateMaterializedViews",

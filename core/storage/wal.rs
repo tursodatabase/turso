@@ -1175,9 +1175,9 @@ impl Wal for WalFile {
         }
         self.with_shared(|shared| {
             let frames = shared.frame_cache.lock();
-            let range = frame_watermark.map(|x| 0..=x).unwrap_or(
-                self.min_frame.load(Ordering::Acquire)..=self.max_frame.load(Ordering::Acquire),
-            );
+            let range = frame_watermark.map(|x| 0..=x).unwrap_or_else(|| {
+                self.min_frame.load(Ordering::Acquire)..=self.max_frame.load(Ordering::Acquire)
+            });
             tracing::debug!(
                 "find_frame(page_id={}, frame_watermark={:?}): min_frame={}, max_frame={}",
                 page_id,

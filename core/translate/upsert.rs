@@ -888,8 +888,8 @@ pub fn emit_upsert(
                     .columns()
                     .iter()
                     .find(|c| c.is_rowid_alias())
-                    .and_then(|c| c.name.as_ref())
-                    .unwrap_or(&"rowid".to_string())
+                    .and_then(|c| c.name.as_deref())
+                    .unwrap_or("rowid")
             ),
         });
         program.preassign_label_to_next_insn(ok);

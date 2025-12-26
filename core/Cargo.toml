@@ -9,6 +9,9 @@ license.workspace = true
 repository.workspace = true
 description = "The Turso database library"
 
+[lints]
+workspace = true
+
 [lib]
 name = "turso_core"
 path = "lib.rs"
