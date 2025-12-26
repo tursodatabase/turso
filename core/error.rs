@@ -149,21 +149,21 @@ pub(crate) const fn cold_return<T>(v: T) -> T {
 #[macro_export]
 macro_rules! bail_parse_error {
     ($($arg:tt)*) => {
-        return crate::error::cold_return(Err($crate::error::LimboError::ParseError(format!($($arg)*))))
+        return $crate::error::cold_return(Err($crate::error::LimboError::ParseError(format!($($arg)*))))
     };
 }
 
 #[macro_export]
 macro_rules! bail_corrupt_error {
     ($($arg:tt)*) => {
-        return crate::error::cold_return(Err($crate::error::LimboError::Corrupt(format!($($arg)*))))
+        return $crate::error::cold_return(Err($crate::error::LimboError::Corrupt(format!($($arg)*))))
     };
 }
 
 #[macro_export]
 macro_rules! bail_constraint_error {
     ($($arg:tt)*) => {
-        return crate::error::cold_return(Err($crate::error::LimboError::Constraint(format!($($arg)*))))
+        return $crate::error::cold_return(Err($crate::error::LimboError::Constraint(format!($($arg)*))))
     };
 }
 
