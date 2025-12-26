@@ -110,10 +110,16 @@ impl Builder {
             db_file: None,
         };
 
+        let url = if let Some(remote_url) = &self.remote_url {
+            Some(normalize_base_url(remote_url).map_err(Error::Error)?)
+        } else {
+            None
+        };
+
         // Build sync engine config.
         let sync_config = turso_sync_sdk_kit::rsapi::TursoDatabaseSyncConfig {
             path: self.path.clone(),
-            remote_url: self.remote_url.clone(),
+            remote_url: url.clone(),
             client_name: self
                 .client_name
                 .clone()
@@ -132,11 +138,6 @@ impl Builder {
                 .map_err(Error::from)?;
 
         // IO worker will process SyncEngine IO queue on a dedicated tokio thread.
-        let url = if let Some(remote_url) = &self.remote_url {
-            Some(normalize_base_url(remote_url).map_err(Error::Error)?)
-        } else {
-            None
-        };
         let io_worker = IoWorker::spawn(sync.clone(), url, self.auth_token.clone());
 
         // Create (bootstrap + open) database in one go.
