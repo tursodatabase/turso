@@ -160,13 +160,9 @@ pub const RESERVED_TABLE_PREFIXES: [&str; 2] = ["sqlite_", "__turso_internal_"];
 /// Check if a table name refers to a system table that should be protected from direct writes
 pub fn is_system_table(table_name: &str) -> bool {
     let normalized = table_name.to_lowercase();
-    normalized == SCHEMA_TABLE_NAME
-        || normalized == SCHEMA_TABLE_NAME_ALT
-        || table_name.starts_with(DBSP_TABLE_PREFIX)
-        || normalized == SQLITE_SEQUENCE_TABLE_NAME
-        || RESERVED_TABLE_PREFIXES
-            .iter()
-            .any(|prefix| normalized.starts_with(prefix))
+    RESERVED_TABLE_PREFIXES
+        .iter()
+        .any(|prefix| normalized.starts_with(prefix))
 }
 
 /// Type of schema object for conflict checking
