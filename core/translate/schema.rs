@@ -6,6 +6,7 @@ use crate::schema::{
     create_table, BTreeTable, ColDef, Column, SchemaObjectType, Table, Type,
     RESERVED_TABLE_PREFIXES, SQLITE_SEQUENCE_TABLE_NAME,
 };
+use crate::stats::STATS_TABLE;
 use crate::storage::pager::CreateBTreeFlags;
 use crate::translate::emitter::{
     emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary, OperationMode, Resolver,
@@ -625,7 +626,8 @@ pub fn translate_create_virtual_table(
 
 /// Validates whether a DROP TABLE operation is allowed on the given table name.
 fn validate_drop_table(resolver: &Resolver, tbl_name: &str) -> Result<()> {
-    if crate::schema::is_system_table(tbl_name) {
+    // special case, allow dropping `sqlite_stat1`
+    if crate::schema::is_system_table(tbl_name) && !tbl_name.eq_ignore_ascii_case(STATS_TABLE) {
         bail_parse_error!("Cannot drop system table {}", tbl_name);
     }
     // Check if this is a materialized view - if so, refuse to drop it with DROP TABLE
