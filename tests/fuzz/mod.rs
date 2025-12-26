@@ -1999,6 +1999,664 @@ mod fuzz_tests {
         println!("fk_edgecases_minifuzz complete (seed {seed})");
     }
 
+    // Fuzz test for ON DELETE/UPDATE CASCADE, SET NULL, SET DEFAULT actions
+    #[turso_macros::test()]
+    pub fn fk_cascade_actions_fuzz(db: TempDatabase) {
+        let _ = env_logger::try_init();
+        let (mut rng, seed) = rng_from_time_or_env();
+        println!("fk_cascade_actions_fuzz seed: {seed}");
+
+        let opts = db.db_opts;
+        let flags = db.db_flags;
+        let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
+
+        const OUTER_ITERS: usize = 50;
+        const INNER_ITERS: usize = 200;
+
+        for outer in 0..OUTER_ITERS {
+            println!("fk_cascade_actions_fuzz {}/{}", outer + 1, OUTER_ITERS);
+
+            let limbo_db = builder.clone().build();
+            let sqlite_db = builder.clone().build();
+            let limbo = limbo_db.connect_limbo();
+            let sqlite = rusqlite::Connection::open(sqlite_db.path.clone()).unwrap();
+
+            let mut stmts: Vec<String> = Vec::new();
+            let mut log_and_exec = |sql: &str| {
+                stmts.push(sql.to_string());
+                sql.to_string()
+            };
+
+            // Enable FKs
+            let s = log_and_exec("PRAGMA foreign_keys=ON");
+            limbo_exec_rows(&limbo, &s);
+            sqlite.execute(&s, params![]).unwrap();
+
+            // Randomly pick action types for this iteration
+            let on_delete_actions = ["CASCADE", "SET NULL", "NO ACTION", "RESTRICT"];
+            let on_update_actions = ["CASCADE", "SET NULL", "NO ACTION", "RESTRICT"];
+
+            let del_action = on_delete_actions[rng.random_range(0..on_delete_actions.len())];
+            let upd_action = on_update_actions[rng.random_range(0..on_update_actions.len())];
+
+            // Parent table with INTEGER PRIMARY KEY
+            let s = log_and_exec("CREATE TABLE parent(id INTEGER PRIMARY KEY, a INT, b INT)");
+            limbo_exec_rows(&limbo, &s);
+            sqlite.execute(&s, params![]).unwrap();
+
+            // Child with CASCADE/SET NULL FK
+            let s = log_and_exec(&format!(
+                "CREATE TABLE child_cascade(id INTEGER PRIMARY KEY, pid INT, x INT, \
+                 FOREIGN KEY(pid) REFERENCES parent(id) ON DELETE {del_action} ON UPDATE {upd_action})"
+            ));
+            limbo_exec_rows(&limbo, &s);
+            sqlite.execute(&s, params![]).unwrap();
+
+            // Second child with different action combo
+            let del_action2 = on_delete_actions[rng.random_range(0..on_delete_actions.len())];
+            let upd_action2 = on_update_actions[rng.random_range(0..on_update_actions.len())];
+            let s = log_and_exec(&format!(
+                "CREATE TABLE child_mixed(id INTEGER PRIMARY KEY, pid INT, y INT, \
+                 FOREIGN KEY(pid) REFERENCES parent(id) ON DELETE {del_action2} ON UPDATE {upd_action2})"
+            ));
+            limbo_exec_rows(&limbo, &s);
+            sqlite.execute(&s, params![]).unwrap();
+
+            // Composite key parent for testing composite CASCADE
+            let s = log_and_exec(
+                "CREATE TABLE parent_comp(a INT NOT NULL, b INT NOT NULL, c INT, PRIMARY KEY(a,b))",
+            );
+            limbo_exec_rows(&limbo, &s);
+            sqlite.execute(&s, params![]).unwrap();
+
+            // Child with composite FK and CASCADE
+            let s = log_and_exec(
+                "CREATE TABLE child_comp(id INTEGER PRIMARY KEY, ca INT, cb INT, z INT, \
+                 FOREIGN KEY(ca,cb) REFERENCES parent_comp(a,b) ON DELETE CASCADE ON UPDATE CASCADE)"
+            );
+            limbo_exec_rows(&limbo, &s);
+            sqlite.execute(&s, params![]).unwrap();
+
+            // Seed initial parent data
+            let mut parent_ids = std::collections::HashSet::new();
+            for _ in 0..rng.random_range(10..=30) {
+                let id = rng.random_range(1..=100) as i64;
+                if parent_ids.insert(id) {
+                    let a = rng.random_range(-5..=25);
+                    let b = rng.random_range(-5..=25);
+                    let stmt = log_and_exec(&format!("INSERT INTO parent VALUES ({id}, {a}, {b})"));
+                    limbo_exec_rows(&limbo, &stmt);
+                    sqlite.execute(&stmt, params![]).unwrap();
+                }
+            }
+
+            // Seed composite parent data
+            let mut comp_pairs = std::collections::HashSet::new();
+            for _ in 0..rng.random_range(5..=15) {
+                let a = rng.random_range(-3..=10) as i64;
+                let b = rng.random_range(-3..=10) as i64;
+                if comp_pairs.insert((a, b)) {
+                    let c = rng.random_range(0..=20);
+                    let stmt =
+                        log_and_exec(&format!("INSERT INTO parent_comp VALUES ({a}, {b}, {c})"));
+                    limbo_exec_rows(&limbo, &stmt);
+                    sqlite.execute(&stmt, params![]).unwrap();
+                }
+            }
+
+            // Seed child data
+            for _ in 0..rng.random_range(15..=40) {
+                let id = rng.random_range(1000..=2000);
+                let pid = if let Some(p) = parent_ids.iter().choose(&mut rng) {
+                    *p
+                } else {
+                    continue;
+                };
+                let x = rng.random_range(-10..=10);
+                let stmt = log_and_exec(&format!(
+                    "INSERT OR IGNORE INTO child_cascade VALUES ({id}, {pid}, {x})"
+                ));
+                let _ = limbo_exec_rows_fallible(&limbo_db, &limbo, &stmt);
+                let _ = sqlite.execute(&stmt, params![]);
+            }
+
+            for _ in 0..rng.random_range(10..=30) {
+                let id = rng.random_range(3000..=4000);
+                let pid = if let Some(p) = parent_ids.iter().choose(&mut rng) {
+                    *p
+                } else {
+                    continue;
+                };
+                let y = rng.random_range(-10..=10);
+                let stmt = log_and_exec(&format!(
+                    "INSERT OR IGNORE INTO child_mixed VALUES ({id}, {pid}, {y})"
+                ));
+                let _ = limbo_exec_rows_fallible(&limbo_db, &limbo, &stmt);
+                let _ = sqlite.execute(&stmt, params![]);
+            }
+
+            // Seed composite child data
+            for _ in 0..rng.random_range(8..=20) {
+                let id = rng.random_range(5000..=6000);
+                if let Some((a, b)) = comp_pairs.iter().choose(&mut rng) {
+                    let z = rng.random_range(0..=10);
+                    let stmt = log_and_exec(&format!(
+                        "INSERT OR IGNORE INTO child_comp VALUES ({id}, {a}, {b}, {z})"
+                    ));
+                    let _ = limbo_exec_rows_fallible(&limbo_db, &limbo, &stmt);
+                    let _ = sqlite.execute(&stmt, params![]);
+                }
+            }
+
+            // Now fuzz mutations that trigger CASCADE/SET NULL behavior
+            for _ in 0..INNER_ITERS {
+                let op = rng.random_range(0..14);
+                let stmt = match op {
+                    // DELETE parent (triggers ON DELETE action)
+                    0 | 1 => {
+                        let id = if rng.random_bool(0.7) {
+                            if let Some(p) = parent_ids.iter().choose(&mut rng) {
+                                *p
+                            } else {
+                                rng.random_range(1..=100) as i64
+                            }
+                        } else {
+                            rng.random_range(1..=150) as i64
+                        };
+                        format!("DELETE FROM parent WHERE id={id}")
+                    }
+                    // UPDATE parent PK (triggers ON UPDATE action)
+                    2 | 3 => {
+                        let old_id = if rng.random_bool(0.7) {
+                            if let Some(p) = parent_ids.iter().choose(&mut rng) {
+                                *p
+                            } else {
+                                rng.random_range(1..=100) as i64
+                            }
+                        } else {
+                            rng.random_range(1..=150) as i64
+                        };
+                        let new_id = rng.random_range(1..=200);
+                        parent_ids.remove(&old_id);
+                        parent_ids.insert(new_id as i64);
+                        format!("UPDATE parent SET id={new_id} WHERE id={old_id}")
+                    }
+                    // DELETE composite parent (triggers composite CASCADE)
+                    4 => {
+                        if let Some((a, b)) = comp_pairs.iter().choose(&mut rng).cloned() {
+                            format!("DELETE FROM parent_comp WHERE a={a} AND b={b}")
+                        } else {
+                            let a = rng.random_range(-3..=10);
+                            let b = rng.random_range(-3..=10);
+                            format!("DELETE FROM parent_comp WHERE a={a} AND b={b}")
+                        }
+                    }
+                    // UPDATE composite parent key (triggers composite CASCADE UPDATE)
+                    5 => {
+                        if let Some((old_a, old_b)) = comp_pairs.iter().choose(&mut rng).cloned() {
+                            let new_a = rng.random_range(-5..=15);
+                            let new_b = rng.random_range(-5..=15);
+                            comp_pairs.remove(&(old_a, old_b));
+                            comp_pairs.insert((new_a as i64, new_b as i64));
+                            format!(
+                                "UPDATE parent_comp SET a={new_a}, b={new_b} WHERE a={old_a} AND b={old_b}"
+                            )
+                        } else {
+                            continue;
+                        }
+                    }
+                    // INSERT new parent
+                    6 => {
+                        let id = rng.random_range(1..=150);
+                        let a = rng.random_range(-5..=25);
+                        let b = rng.random_range(-5..=25);
+                        parent_ids.insert(id as i64);
+                        format!("INSERT OR IGNORE INTO parent VALUES({id}, {a}, {b})")
+                    }
+                    // INSERT child_cascade
+                    7 => {
+                        let id = rng.random_range(1000..=2500);
+                        let pid = if rng.random_bool(0.8) {
+                            if let Some(p) = parent_ids.iter().choose(&mut rng) {
+                                *p
+                            } else {
+                                rng.random_range(1..=150) as i64
+                            }
+                        } else {
+                            rng.random_range(1..=150) as i64
+                        };
+                        let x = rng.random_range(-10..=10);
+                        format!("INSERT OR IGNORE INTO child_cascade VALUES({id}, {pid}, {x})")
+                    }
+                    // INSERT composite child
+                    8 => {
+                        let id = rng.random_range(5000..=6500);
+                        if let Some((a, b)) = comp_pairs.iter().choose(&mut rng) {
+                            let z = rng.random_range(0..=10);
+                            format!("INSERT OR IGNORE INTO child_comp VALUES({id}, {a}, {b}, {z})")
+                        } else {
+                            continue;
+                        }
+                    }
+                    // DELETE child directly
+                    9 => {
+                        let id = rng.random_range(1000..=2500);
+                        format!("DELETE FROM child_cascade WHERE id={id}")
+                    }
+                    // INSERT OR REPLACE on parent (triggers ON DELETE action)
+                    10 => {
+                        let id = if let Some(p) = parent_ids.iter().choose(&mut rng) {
+                            *p
+                        } else {
+                            rng.random_range(1..=100) as i64
+                        };
+                        let a = rng.random_range(-5..=25);
+                        let b = rng.random_range(-5..=25);
+                        parent_ids.insert(id);
+                        format!("INSERT OR REPLACE INTO parent VALUES({id}, {a}, {b})")
+                    }
+                    // INSERT OR REPLACE on composite parent (triggers ON DELETE action)
+                    11 => {
+                        if let Some((a, b)) = comp_pairs.iter().choose(&mut rng).cloned() {
+                            let c = rng.random_range(0..=20);
+                            format!("INSERT OR REPLACE INTO parent_comp VALUES({a}, {b}, {c})")
+                        } else {
+                            let a = rng.random_range(-3..=10);
+                            let b = rng.random_range(-3..=10);
+                            let c = rng.random_range(0..=20);
+                            comp_pairs.insert((a as i64, b as i64));
+                            format!("INSERT OR REPLACE INTO parent_comp VALUES({a}, {b}, {c})")
+                        }
+                    }
+                    // UPSERT on parent that updates columns (triggers ON UPDATE action)
+                    12 => {
+                        let id = if rng.random_bool(0.8) {
+                            if let Some(p) = parent_ids.iter().choose(&mut rng) {
+                                *p
+                            } else {
+                                rng.random_range(1..=100) as i64
+                            }
+                        } else {
+                            rng.random_range(1..=150) as i64
+                        };
+                        let new_a = rng.random_range(-5..=25);
+                        let new_b = rng.random_range(-5..=25);
+                        parent_ids.insert(id);
+                        format!("INSERT INTO parent VALUES({id}, {new_a}, {new_b}) ON CONFLICT(id) DO UPDATE SET a={new_a}, b={new_b}")
+                    }
+                    // UPSERT on composite parent that updates columns (triggers ON UPDATE action)
+                    _ => {
+                        if let Some((a, b)) = comp_pairs.iter().choose(&mut rng).cloned() {
+                            let new_c = rng.random_range(0..=20);
+                            format!("INSERT INTO parent_comp VALUES({a}, {b}, {new_c}) ON CONFLICT(a,b) DO UPDATE SET c={new_c}")
+                        } else {
+                            let a = rng.random_range(-3..=10);
+                            let b = rng.random_range(-3..=10);
+                            let c = rng.random_range(0..=20);
+                            comp_pairs.insert((a as i64, b as i64));
+                            format!("INSERT INTO parent_comp VALUES({a}, {b}, {c}) ON CONFLICT(a,b) DO UPDATE SET c={c}")
+                        }
+                    }
+                };
+
+                let stmt = log_and_exec(&stmt);
+                let sres = sqlite.execute(&stmt, params![]);
+                let lres = limbo_exec_rows_fallible(&limbo_db, &limbo, &stmt);
+
+                match (sres, lres) {
+                    (Ok(_), Ok(_)) => {
+                        // Verify state parity after successful operations
+                        let sp = sqlite_exec_rows(&sqlite, "SELECT id,a,b FROM parent ORDER BY id");
+                        let lp = limbo_exec_rows(&limbo, "SELECT id,a,b FROM parent ORDER BY id");
+                        let sc_cascade = sqlite_exec_rows(
+                            &sqlite,
+                            "SELECT id,pid,x FROM child_cascade ORDER BY id",
+                        );
+                        let lc_cascade = limbo_exec_rows(
+                            &limbo,
+                            "SELECT id,pid,x FROM child_cascade ORDER BY id",
+                        );
+                        let sc_mixed = sqlite_exec_rows(
+                            &sqlite,
+                            "SELECT id,pid,y FROM child_mixed ORDER BY id",
+                        );
+                        let lc_mixed =
+                            limbo_exec_rows(&limbo, "SELECT id,pid,y FROM child_mixed ORDER BY id");
+                        let sp_comp =
+                            sqlite_exec_rows(&sqlite, "SELECT a,b,c FROM parent_comp ORDER BY a,b");
+                        let lp_comp =
+                            limbo_exec_rows(&limbo, "SELECT a,b,c FROM parent_comp ORDER BY a,b");
+                        let sc_comp = sqlite_exec_rows(
+                            &sqlite,
+                            "SELECT id,ca,cb,z FROM child_comp ORDER BY id",
+                        );
+                        let lc_comp = limbo_exec_rows(
+                            &limbo,
+                            "SELECT id,ca,cb,z FROM child_comp ORDER BY id",
+                        );
+
+                        if sp != lp
+                            || sc_cascade != lc_cascade
+                            || sc_mixed != lc_mixed
+                            || sp_comp != lp_comp
+                            || sc_comp != lc_comp
+                        {
+                            eprintln!("\n=== CASCADE fuzz failure (state mismatch) ===");
+                            eprintln!("seed: {seed}, outer: {}", outer + 1);
+                            eprintln!("del_action: {del_action}, upd_action: {upd_action}");
+                            eprintln!("del_action2: {del_action2}, upd_action2: {upd_action2}");
+                            eprintln!("last stmt: {stmt}");
+                            eprintln!("sqlite parent: {sp:?}");
+                            eprintln!("limbo  parent: {lp:?}");
+                            eprintln!("sqlite child_cascade: {sc_cascade:?}");
+                            eprintln!("limbo  child_cascade: {lc_cascade:?}");
+                            eprintln!("sqlite child_mixed: {sc_mixed:?}");
+                            eprintln!("limbo  child_mixed: {lc_mixed:?}");
+                            eprintln!("sqlite parent_comp: {sp_comp:?}");
+                            eprintln!("limbo  parent_comp: {lp_comp:?}");
+                            eprintln!("sqlite child_comp: {sc_comp:?}");
+                            eprintln!("limbo  child_comp: {lc_comp:?}");
+                            eprintln!("--- replay statements ({}) ---", stmts.len());
+                            let mut file = std::fs::File::create("fk_cascade_fuzz.sql").unwrap();
+                            for s in stmts.iter() {
+                                let _ = file.write_fmt(format_args!("{s};\n"));
+                            }
+                            file.flush().unwrap();
+                            panic!(
+                                "CASCADE state mismatch, statements written to fk_cascade_fuzz.sql"
+                            );
+                        }
+                    }
+                    (Err(_), Err(_)) => { /* both failed - parity OK */ }
+                    (ok_sqlite, ok_limbo) => {
+                        eprintln!("\n=== CASCADE fuzz failure (outcome mismatch) ===");
+                        eprintln!("seed: {seed}, outer: {}", outer + 1);
+                        eprintln!("del_action: {del_action}, upd_action: {upd_action}");
+                        eprintln!("sqlite: {ok_sqlite:?}, limbo: {ok_limbo:?}");
+                        eprintln!("last stmt: {stmt}");
+                        let mut file = std::fs::File::create("fk_cascade_fuzz.sql").unwrap();
+                        for s in stmts.iter() {
+                            let _ = file.write_fmt(format_args!("{s};\n"));
+                        }
+                        file.flush().unwrap();
+                        panic!(
+                            "CASCADE outcome mismatch, statements written to fk_cascade_fuzz.sql"
+                        );
+                    }
+                }
+            }
+        }
+        println!("fk_cascade_actions_fuzz complete (seed {seed})");
+    }
+
+    // Fuzz test for recursive CASCADE (A->B->C chains)
+    #[turso_macros::test()]
+    pub fn fk_recursive_cascade_fuzz(db: TempDatabase) {
+        let _ = env_logger::try_init();
+        let (mut rng, seed) = rng_from_time_or_env();
+        println!("fk_recursive_cascade_fuzz seed: {seed}");
+
+        let opts = db.db_opts;
+        let flags = db.db_flags;
+        let builder = TempDatabase::builder().with_flags(flags).with_opts(opts);
+
+        const OUTER_ITERS: usize = 25;
+        const INNER_ITERS: usize = 200;
+
+        for outer in 0..OUTER_ITERS {
+            println!("fk_recursive_cascade_fuzz {}/{}", outer + 1, OUTER_ITERS);
+
+            let limbo_db = builder.clone().build();
+            let sqlite_db = builder.clone().build();
+            let limbo = limbo_db.connect_limbo();
+            let sqlite = rusqlite::Connection::open(sqlite_db.path.clone()).unwrap();
+
+            let mut stmts: Vec<String> = Vec::new();
+            let mut log_and_exec = |sql: &str| {
+                stmts.push(sql.to_string());
+                sql.to_string()
+            };
+
+            // Enable FKs
+            let s = log_and_exec("PRAGMA foreign_keys=ON");
+            limbo_exec_rows(&limbo, &s);
+            sqlite.execute(&s, params![]).unwrap();
+
+            // Create a 3-level hierarchy: grandparent -> parent -> child
+            // All with CASCADE to test recursive deletion/update
+            let s = log_and_exec("CREATE TABLE gp(id INTEGER PRIMARY KEY, v INT)");
+            limbo_exec_rows(&limbo, &s);
+            sqlite.execute(&s, params![]).unwrap();
+
+            let s = log_and_exec(
+                "CREATE TABLE p(id INTEGER PRIMARY KEY, gp_id INT, v INT, \
+                 FOREIGN KEY(gp_id) REFERENCES gp(id) ON DELETE CASCADE ON UPDATE CASCADE)",
+            );
+            limbo_exec_rows(&limbo, &s);
+            sqlite.execute(&s, params![]).unwrap();
+
+            let s = log_and_exec(
+                "CREATE TABLE c(id INTEGER PRIMARY KEY, p_id INT, v INT, \
+                 FOREIGN KEY(p_id) REFERENCES p(id) ON DELETE CASCADE ON UPDATE CASCADE)",
+            );
+            limbo_exec_rows(&limbo, &s);
+            sqlite.execute(&s, params![]).unwrap();
+
+            // Seed grandparents
+            let mut gp_ids = std::collections::HashSet::new();
+            for _ in 0..rng.random_range(5..=15) {
+                let id = rng.random_range(1..=50) as i64;
+                if gp_ids.insert(id) {
+                    let v = rng.random_range(0..=100);
+                    let stmt = log_and_exec(&format!("INSERT INTO gp VALUES ({id}, {v})"));
+                    limbo_exec_rows(&limbo, &stmt);
+                    sqlite.execute(&stmt, params![]).unwrap();
+                }
+            }
+
+            // Seed parents
+            let mut p_ids = std::collections::HashSet::new();
+            for _ in 0..rng.random_range(10..=30) {
+                let id = rng.random_range(100..=200) as i64;
+                if let Some(gp_id) = gp_ids.iter().choose(&mut rng) {
+                    if p_ids.insert(id) {
+                        let v = rng.random_range(0..=100);
+                        let stmt =
+                            log_and_exec(&format!("INSERT INTO p VALUES ({id}, {gp_id}, {v})"));
+                        limbo_exec_rows(&limbo, &stmt);
+                        sqlite.execute(&stmt, params![]).unwrap();
+                    }
+                }
+            }
+
+            // Seed children
+            for _ in 0..rng.random_range(20..=50) {
+                let id = rng.random_range(1000..=2000) as i64;
+                if let Some(p_id) = p_ids.iter().choose(&mut rng) {
+                    let v = rng.random_range(0..=100);
+                    let stmt = log_and_exec(&format!(
+                        "INSERT OR IGNORE INTO c VALUES ({id}, {p_id}, {v})"
+                    ));
+                    let _ = limbo_exec_rows_fallible(&limbo_db, &limbo, &stmt);
+                    let _ = sqlite.execute(&stmt, params![]);
+                }
+            }
+
+            // Fuzz mutations on the hierarchy
+            for _ in 0..INNER_ITERS {
+                let op = rng.random_range(0..12);
+                let stmt = match op {
+                    // DELETE grandparent (should cascade to parent and child)
+                    0 | 1 => {
+                        if let Some(id) = gp_ids.iter().choose(&mut rng).cloned() {
+                            format!("DELETE FROM gp WHERE id={id}")
+                        } else {
+                            continue;
+                        }
+                    }
+                    // UPDATE grandparent PK (should cascade update to parent's gp_id)
+                    2 => {
+                        if let Some(old_id) = gp_ids.iter().choose(&mut rng).cloned() {
+                            let new_id = rng.random_range(1..=100);
+                            gp_ids.remove(&old_id);
+                            gp_ids.insert(new_id as i64);
+                            format!("UPDATE gp SET id={new_id} WHERE id={old_id}")
+                        } else {
+                            continue;
+                        }
+                    }
+                    // DELETE parent (should cascade to child only)
+                    3 => {
+                        if let Some(id) = p_ids.iter().choose(&mut rng).cloned() {
+                            format!("DELETE FROM p WHERE id={id}")
+                        } else {
+                            continue;
+                        }
+                    }
+                    // UPDATE parent PK (should cascade to child's p_id)
+                    4 => {
+                        if let Some(old_id) = p_ids.iter().choose(&mut rng).cloned() {
+                            let new_id = rng.random_range(100..=300);
+                            p_ids.remove(&old_id);
+                            p_ids.insert(new_id as i64);
+                            format!("UPDATE p SET id={new_id} WHERE id={old_id}")
+                        } else {
+                            continue;
+                        }
+                    }
+                    // INSERT new grandparent
+                    5 => {
+                        let id = rng.random_range(1..=100);
+                        let v = rng.random_range(0..=100);
+                        gp_ids.insert(id as i64);
+                        format!("INSERT OR IGNORE INTO gp VALUES({id}, {v})")
+                    }
+                    // INSERT new parent
+                    6 => {
+                        let id = rng.random_range(100..=300);
+                        if let Some(gp_id) = gp_ids.iter().choose(&mut rng) {
+                            let v = rng.random_range(0..=100);
+                            p_ids.insert(id as i64);
+                            format!("INSERT OR IGNORE INTO p VALUES({id}, {gp_id}, {v})")
+                        } else {
+                            continue;
+                        }
+                    }
+                    // INSERT new child
+                    7 => {
+                        let id = rng.random_range(1000..=3000);
+                        if let Some(p_id) = p_ids.iter().choose(&mut rng) {
+                            let v = rng.random_range(0..=100);
+                            format!("INSERT OR IGNORE INTO c VALUES({id}, {p_id}, {v})")
+                        } else {
+                            continue;
+                        }
+                    }
+                    // INSERT OR REPLACE on grandparent (triggers recursive cascade)
+                    8 => {
+                        if let Some(id) = gp_ids.iter().choose(&mut rng).cloned() {
+                            let v = rng.random_range(0..=100);
+                            format!("INSERT OR REPLACE INTO gp VALUES({id}, {v})")
+                        } else {
+                            let id = rng.random_range(1..=50);
+                            let v = rng.random_range(0..=100);
+                            gp_ids.insert(id as i64);
+                            format!("INSERT OR REPLACE INTO gp VALUES({id}, {v})")
+                        }
+                    }
+                    // INSERT OR REPLACE on parent (triggers cascade to children)
+                    9 => {
+                        if let Some(id) = p_ids.iter().choose(&mut rng).cloned() {
+                            if let Some(gp_id) = gp_ids.iter().choose(&mut rng) {
+                                let v = rng.random_range(0..=100);
+                                format!("INSERT OR REPLACE INTO p VALUES({id}, {gp_id}, {v})")
+                            } else {
+                                continue;
+                            }
+                        } else {
+                            continue;
+                        }
+                    }
+                    // UPSERT on grandparent that updates value (doesn't change FK key, so no cascade)
+                    10 => {
+                        if let Some(id) = gp_ids.iter().choose(&mut rng).cloned() {
+                            let new_v = rng.random_range(0..=100);
+                            format!("INSERT INTO gp VALUES({id}, {new_v}) ON CONFLICT(id) DO UPDATE SET v={new_v}")
+                        } else {
+                            let id = rng.random_range(1..=50);
+                            let v = rng.random_range(0..=100);
+                            gp_ids.insert(id as i64);
+                            format!("INSERT INTO gp VALUES({id}, {v}) ON CONFLICT(id) DO UPDATE SET v={v}")
+                        }
+                    }
+                    // UPSERT on parent that updates value (doesn't change FK key)
+                    _ => {
+                        if let Some(id) = p_ids.iter().choose(&mut rng).cloned() {
+                            if let Some(gp_id) = gp_ids.iter().choose(&mut rng) {
+                                let new_v = rng.random_range(0..=100);
+                                format!("INSERT INTO p VALUES({id}, {gp_id}, {new_v}) ON CONFLICT(id) DO UPDATE SET v={new_v}")
+                            } else {
+                                continue;
+                            }
+                        } else {
+                            continue;
+                        }
+                    }
+                };
+
+                let stmt = log_and_exec(&stmt);
+                let sres = sqlite.execute(&stmt, params![]);
+                let lres = limbo_exec_rows_fallible(&limbo_db, &limbo, &stmt);
+
+                match (sres, lres) {
+                    (Ok(_), Ok(_)) => {
+                        // Verify state parity
+                        let s_gp = sqlite_exec_rows(&sqlite, "SELECT id,v FROM gp ORDER BY id");
+                        let l_gp = limbo_exec_rows(&limbo, "SELECT id,v FROM gp ORDER BY id");
+                        let s_p = sqlite_exec_rows(&sqlite, "SELECT id,gp_id,v FROM p ORDER BY id");
+                        let l_p = limbo_exec_rows(&limbo, "SELECT id,gp_id,v FROM p ORDER BY id");
+                        let s_c = sqlite_exec_rows(&sqlite, "SELECT id,p_id,v FROM c ORDER BY id");
+                        let l_c = limbo_exec_rows(&limbo, "SELECT id,p_id,v FROM c ORDER BY id");
+
+                        if s_gp != l_gp || s_p != l_p || s_c != l_c {
+                            eprintln!("\n=== Recursive CASCADE fuzz failure ===");
+                            eprintln!("seed: {seed}, outer: {}", outer + 1);
+                            eprintln!("last stmt: {stmt}");
+                            eprintln!("sqlite gp: {s_gp:?}");
+                            eprintln!("limbo  gp: {l_gp:?}");
+                            eprintln!("sqlite p: {s_p:?}");
+                            eprintln!("limbo  p: {l_p:?}");
+                            eprintln!("sqlite c: {s_c:?}");
+                            eprintln!("limbo  c: {l_c:?}");
+                            let mut file =
+                                std::fs::File::create("fk_recursive_cascade_fuzz.sql").unwrap();
+                            for s in stmts.iter() {
+                                let _ = file.write_fmt(format_args!("{s};\n"));
+                            }
+                            file.flush().unwrap();
+                            panic!("Recursive CASCADE mismatch");
+                        }
+                    }
+                    (Err(_), Err(_)) => {}
+                    (ok_sqlite, ok_limbo) => {
+                        eprintln!("\n=== Recursive CASCADE outcome mismatch ===");
+                        eprintln!("seed: {seed}");
+                        eprintln!("sqlite: {ok_sqlite:?}, limbo: {ok_limbo:?}");
+                        eprintln!("stmt: {stmt}");
+                        let mut file =
+                            std::fs::File::create("fk_recursive_cascade_fuzz.sql").unwrap();
+                        for s in stmts.iter() {
+                            let _ = file.write_fmt(format_args!("{s};\n"));
+                        }
+                        file.flush().unwrap();
+                        panic!("Recursive CASCADE outcome mismatch");
+                    }
+                }
+            }
+        }
+        println!("fk_recursive_cascade_fuzz complete (seed {seed})");
+    }
+
     // TODO: mvcc indexes
     #[turso_macros::test()]
     pub fn fk_composite_pk_mutation_fuzz(db: TempDatabase) {

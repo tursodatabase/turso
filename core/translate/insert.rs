@@ -18,8 +18,8 @@ use crate::translate::expr::{
     BindingBehavior, WalkControl,
 };
 use crate::translate::fkeys::{
-    build_index_affinity_string, emit_fk_delete_parent_existence_checks, emit_fk_violation,
-    emit_guarded_fk_decrement, index_probe, open_read_index, open_read_table,
+    build_index_affinity_string, emit_fk_violation, emit_guarded_fk_decrement,
+    fire_fk_delete_actions, index_probe, open_read_index, open_read_table,
 };
 use crate::translate::plan::{
     ColumnUsedMask, JoinedTable, Operation, ResultSetColumn, TableReferences,
@@ -1868,7 +1868,7 @@ fn translate_column(
 fn emit_preflight_constraint_checks(
     program: &mut ProgramBuilder,
     ctx: &mut InsertEmitCtx,
-    resolver: &Resolver,
+    resolver: &mut Resolver,
     insertion: &Insertion,
     upsert_actions: &[(ResolvedUpsertTarget, BranchOffset, Box<Upsert>)],
     constraints: &ConstraintsToCheck,
@@ -2570,7 +2570,7 @@ fn emit_update_sqlite_sequence(
 
 fn emit_replace_delete_conflicting_row(
     program: &mut ProgramBuilder,
-    resolver: &Resolver,
+    resolver: &mut Resolver,
     connection: &Arc<Connection>,
     ctx: &mut InsertEmitCtx,
     table_references: &mut TableReferences,
@@ -2582,15 +2582,16 @@ fn emit_replace_delete_conflicting_row(
     });
 
     // OR REPLACE + foreign keys:
-    // SQLite does not halt on the delete side, it increments FK counters for any referencing
-    // children and lets the subsequent insert repair them (or fail if it doesn't).
+    // Fire FK actions (CASCADE, SET NULL, SET DEFAULT) for the row being deleted.
+    // This handles all FK action types including NO ACTION/RESTRICT.
     if connection.foreign_keys_enabled() {
-        emit_fk_delete_parent_existence_checks(
+        fire_fk_delete_actions(
             program,
             resolver,
             ctx.table.name.as_str(),
             ctx.cursor_id,
             ctx.conflict_rowid_reg,
+            connection,
         )?;
     }
 
