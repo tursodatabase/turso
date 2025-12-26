@@ -133,9 +133,38 @@ pub struct TursoDatabaseSync<TBytes: AsRef<[u8]> + Send + Sync + 'static> {
     db_config: turso_sdk_kit::rsapi::TursoDatabaseConfig,
     sync_config: TursoDatabaseSyncConfig,
     sync_engine_opts: turso_sync_engine::database_sync_engine::DatabaseSyncEngineOpts,
-    db_io: Arc<dyn IO>,
     sync_engine_io_queue: SyncEngineIoStats<SyncEngineIoQueue<TBytes>>,
     sync_engine: Arc<Mutex<Option<DatabaseSyncEngine<SyncEngineIoQueue<TBytes>>>>>,
+    db_io: Option<Arc<dyn IO>>,
+}
+
+fn persistent_io(partial: bool) -> Result<Arc<dyn IO>, turso_sync_engine::errors::Error> {
+    #[cfg(target_os = "linux")]
+    {
+        if !partial {
+            Ok(Arc::new(turso_core::PlatformIO::new().map_err(|e| {
+                turso_sync_engine::errors::Error::DatabaseSyncEngineError(format!(
+                    "Failed to create platform IO: {e}"
+                ))
+            })?))
+        } else {
+            use turso_sync_engine::sparse_io::SparseLinuxIo;
+
+            Ok(Arc::new(SparseLinuxIo::new().map_err(|e| {
+                turso_sync_engine::errors::Error::DatabaseSyncEngineError(format!(
+                    "Failed to create sparse IO: {e}"
+                ))
+            })?))
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(Arc::new(turso_core::PlatformIO::new().map_err(|e| {
+            turso_sync_engine::errors::Error::DatabaseSyncEngineError(format!(
+                "Failed to create platform IO: {e}"
+            ))
+        })?))
+    }
 }
 
 impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
@@ -160,60 +189,21 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
             partial_sync_opts: sync_config.partial_sync_opts.clone(),
         };
         let is_memory = db_config.path == ":memory:";
-        let db_io: Arc<dyn IO> =
-            if is_memory {
-                Arc::new(MemoryIO::new())
-            } else {
-                #[cfg(target_os = "linux")]
-                {
-                    if sync_engine_opts.partial_sync_opts.is_none() {
-                        Arc::new(turso_core::PlatformIO::new().map_err(|e| {
-                            TursoError::Error(format!("Failed to create platform IO: {e}"))
-                        })?)
-                    } else {
-                        use turso_sync_engine::sparse_io::SparseLinuxIo;
-
-                        Arc::new(SparseLinuxIo::new().map_err(|e| {
-                            TursoError::Error(format!("Failed to create sparse IO: {e}"))
-                        })?)
-                    }
-                }
-                #[cfg(not(target_os = "linux"))]
-                {
-                    Arc::new(turso_core::PlatformIO::new().map_err(|e| {
-                        TursoError::Error(format!("Failed to create platform IO: {e}"))
-                    })?)
-                }
-            };
+        let db_io: Option<Arc<dyn IO>> = if is_memory {
+            Some(Arc::new(MemoryIO::new()))
+        } else {
+            // persitent IO initialized later in order to read metadata first and decide if we need partial DB IO
+            None
+        };
         let sync_engine_io_queue = SyncEngineIoStats::new(SyncEngineIoQueue::new());
         Ok(Arc::new(Self {
             db_config,
             sync_config,
             sync_engine_opts,
             sync_engine_io_queue,
-            db_io,
             sync_engine: Arc::new(Mutex::new(None)),
+            db_io,
         }))
-    }
-    /// initialize database on disk and bootstrap if necessary (bootstrap requires network availability)
-    pub fn init(&self) -> Box<TursoDatabaseAsyncOperation> {
-        let io = self.db_io.clone();
-        let sync_engine_io = self.sync_engine_io_queue.clone();
-        let main_db_path = self.sync_config.path.clone();
-        let sync_engine_opts = self.sync_engine_opts.clone();
-        Box::new(TursoDatabaseAsyncOperation::new(Box::new(move |coro| {
-            Box::pin(async move {
-                let _ = database_sync_engine::DatabaseSyncEngine::bootstrap_db(
-                    &coro,
-                    io,
-                    sync_engine_io,
-                    &main_db_path,
-                    &sync_engine_opts,
-                )
-                .await?;
-                Ok(None)
-            })
-        })))
     }
     /// open the database which must be created earlier (e.g. through [Self::init])
     pub fn open(&self) -> Box<TursoDatabaseAsyncOperation> {
@@ -236,6 +226,10 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
                     return Err(turso_sync_engine::errors::Error::DatabaseSyncEngineError(
                         "metadata not found".to_string(),
                     ));
+                };
+                let io = match io {
+                    Some(io) => io,
+                    None => persistent_io(metadata.partial_bootstrap_server_revision.is_some())?,
                 };
                 let db_file = database_sync_engine::DatabaseSyncEngine::init_db_storage(
                     io.clone(),
@@ -283,6 +277,10 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
         let sync_engine = self.sync_engine.clone();
         Box::new(TursoDatabaseAsyncOperation::new(Box::new(move |coro| {
             Box::pin(async move {
+                let io = match io {
+                    Some(io) => io,
+                    None => persistent_io(sync_engine_opts.partial_sync_opts.is_some())?,
+                };
                 let metadata = database_sync_engine::DatabaseSyncEngine::bootstrap_db(
                     &coro,
                     io.clone(),

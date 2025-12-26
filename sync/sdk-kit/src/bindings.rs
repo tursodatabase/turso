@@ -267,14 +267,6 @@ unsafe extern "C" {
     ) -> turso_status_code_t;
 }
 unsafe extern "C" {
-    #[doc = " Prepare synced database for use (bootstrap if needed, setup necessary database parameters for first access)\n AsyncOperation returns None"]
-    pub fn turso_sync_database_init(
-        self_: *const turso_sync_database_t,
-        operation: *mut *const turso_sync_operation_t,
-        error_opt_out: *mut *const ::std::os::raw::c_char,
-    ) -> turso_status_code_t;
-}
-unsafe extern "C" {
     #[doc = " Open prepared synced database, fail if no properly setup database exists\n AsyncOperation returns None"]
     pub fn turso_sync_database_open(
         self_: *const turso_sync_database_t,

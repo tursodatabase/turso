@@ -114,7 +114,7 @@ fn create_changes_path(main_db_path: &str) -> String {
 /// so, I decided to keep a little bit of mess in sync-engine for a little bit longer
 async fn full_read<Ctx, IO: SyncEngineIo>(
     coro: &Coro<Ctx>,
-    io: Arc<dyn turso_core::IO>,
+    io: Option<Arc<dyn turso_core::IO>>,
     sync_engine_io: Arc<IO>,
     path: &str,
     is_memory: bool,
@@ -128,6 +128,11 @@ async fn full_read<Ctx, IO: SyncEngineIo>(
             return Ok(Some(data));
         }
     }
+    let Some(io) = io else {
+        return Err(Error::DatabaseSyncEngineError(
+            "MemoryIO must be set".to_string(),
+        ));
+    };
     let Ok(file) = io.open_file(path, OpenFlags::None, false) else {
         return Ok(None);
     };
@@ -187,19 +192,13 @@ async fn full_write<Ctx, IO: SyncEngineIo>(
 impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
     pub async fn read_db_meta<Ctx>(
         coro: &Coro<Ctx>,
-        io: Arc<dyn turso_core::IO>,
+        io: Option<Arc<dyn turso_core::IO>>,
         sync_engine_io: SyncEngineIoStats<IO>,
         main_db_path: &str,
     ) -> Result<Option<DatabaseMetadata>> {
         let path = create_meta_path(main_db_path);
-        let meta = full_read(
-            coro,
-            io,
-            sync_engine_io.io.clone(),
-            &path,
-            is_memory(main_db_path),
-        )
-        .await?;
+        let is_memory = is_memory(main_db_path);
+        let meta = full_read(coro, io, sync_engine_io.io.clone(), &path, is_memory).await?;
         match meta {
             Some(meta) => Ok(Some(DatabaseMetadata::load(&meta)?)),
             None => Ok(None),
@@ -218,7 +217,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
         let meta_path = create_meta_path(main_db_path);
         let meta = full_read(
             coro,
-            io.clone(),
+            Some(io.clone()),
             sync_engine_io.io.clone(),
             &meta_path,
             is_memory(main_db_path),
@@ -404,7 +403,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
 
         let meta = full_read(
             coro,
-            io.clone(),
+            Some(io.clone()),
             sync_engine_io.io.clone(),
             &meta_path,
             is_memory(&main_db_path),

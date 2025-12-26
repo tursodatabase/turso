@@ -482,13 +482,6 @@ impl PyTursoSyncIoItem {
 
 #[pymethods]
 impl PyTursoSyncDatabase {
-    /// Prepare synced database for use (bootstrap if needed, setup necessary database parameters for first access)
-    /// AsyncOperation returns No
-    pub fn init(&self) -> PyTursoAsyncOperation {
-        PyTursoAsyncOperation {
-            operation: self.database.init(),
-        }
-    }
     /// Open prepared synced database, fail if no properly setup database exists
     /// AsyncOperation returns No
     pub fn open(&self) -> PyTursoAsyncOperation {

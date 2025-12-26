@@ -147,16 +147,6 @@ turso_status_code_t turso_sync_database_new(
     /** Optional return error parameter (can be null) */
     const char **error_opt_out);
 
-/** Prepare synced database for use (bootstrap if needed, setup necessary database parameters for first access)
- * AsyncOperation returns None
- */
-turso_status_code_t turso_sync_database_init(
-    const turso_sync_database_t *self,
-    /** reference to pointer which will be set to async operation instance in case of TURSO_OK result */
-    const turso_sync_operation_t **operation,
-    /** Optional return error parameter (can be null) */
-    const char **error_opt_out);
-
 /** Open prepared synced database, fail if no properly setup database exists
  * AsyncOperation returns None
  */

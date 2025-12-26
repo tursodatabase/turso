@@ -164,12 +164,6 @@ var (
 		errorOptOut **byte,
 	) int32
 
-	c_turso_sync_database_init func(
-		self TursoSyncDatabase,
-		operation **turso_sync_operation_t,
-		errorOptOut **byte,
-	) int32
-
 	c_turso_sync_database_open func(
 		self TursoSyncDatabase,
 		operation **turso_sync_operation_t,
@@ -321,7 +315,6 @@ var (
 // Do not load library here; it is done externally.
 func registerTursoSync(handle uintptr) error {
 	purego.RegisterLibFunc(&c_turso_sync_database_new, handle, "turso_sync_database_new")
-	purego.RegisterLibFunc(&c_turso_sync_database_init, handle, "turso_sync_database_init")
 	purego.RegisterLibFunc(&c_turso_sync_database_open, handle, "turso_sync_database_open")
 	purego.RegisterLibFunc(&c_turso_sync_database_create, handle, "turso_sync_database_create")
 	purego.RegisterLibFunc(&c_turso_sync_database_connect, handle, "turso_sync_database_connect")
@@ -421,19 +414,6 @@ func turso_sync_database_new(dbConfig TursoDatabaseConfig, syncConfig TursoSyncD
 
 	if status == int32(TURSO_OK) {
 		return TursoSyncDatabase(db), nil
-	}
-	msg := decodeAndFreeCString(errPtr)
-	return nil, statusToError(TursoStatusCode(status), msg)
-}
-
-// turso_sync_database_init prepares synced database for use (bootstrap if needed).
-// AsyncOperation returns None.
-func turso_sync_database_init(self TursoSyncDatabase) (TursoSyncOperation, error) {
-	var op *turso_sync_operation_t
-	var errPtr *byte
-	status := c_turso_sync_database_init(self, &op, &errPtr)
-	if status == int32(TURSO_OK) {
-		return TursoSyncOperation(op), nil
 	}
 	msg := decodeAndFreeCString(errPtr)
 	return nil, statusToError(TursoStatusCode(status), msg)
