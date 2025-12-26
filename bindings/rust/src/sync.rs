@@ -21,6 +21,7 @@ use crate::{connection::Connection, Error, Result};
 
 // Public re-exports of sync types for users of this crate.
 pub use turso_sync_sdk_kit::rsapi::DatabaseSyncStats;
+pub use turso_sync_sdk_kit::rsapi::PartialBootstrapStrategy;
 pub use turso_sync_sdk_kit::rsapi::PartialSyncOpts;
 
 // Constants used across the sync module
