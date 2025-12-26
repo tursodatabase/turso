@@ -1,56 +1,56 @@
+use crate::{
+    error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE},
+    schema::{self, BTreeTable, ColDef, Column, Index, IndexColumn, ResolvedFkRef, Schema, Table},
+    translate::{
+        emitter::{
+            emit_cdc_full_record, emit_cdc_insns, emit_cdc_patch_record, prepare_cdc_if_necessary,
+            OperationMode, Resolver,
+        },
+        expr::{
+            bind_and_rewrite_expr, emit_returning_results, process_returning_clause,
+            translate_expr, translate_expr_no_constant_opt, walk_expr_mut, BindingBehavior,
+            NoConstantOptReason, WalkControl,
+        },
+        fkeys::{
+            build_index_affinity_string, emit_fk_violation, emit_guarded_fk_decrement,
+            fire_fk_delete_actions, index_probe, open_read_index, open_read_table,
+        },
+        plan::{
+            ColumnUsedMask, JoinedTable, Operation, QueryDestination, ResultSetColumn,
+            TableReferences,
+        },
+        planner::ROWID_STRS,
+        select::translate_select,
+        trigger_exec::{
+            fire_trigger, get_relevant_triggers_type_and_time, has_relevant_triggers_type_only,
+            TriggerContext,
+        },
+        upsert::{
+            collect_set_clauses_for_upsert, emit_upsert, resolve_upsert_target,
+            ResolvedUpsertTarget,
+        },
+    },
+    util::normalize_ident,
+    vdbe::{
+        affinity::Affinity,
+        builder::{CursorKey, ProgramBuilderOpts},
+        insn::{
+            to_u16, {CmpInsFlags, IdxInsertFlags, InsertFlags, RegisterOrLiteral},
+        },
+        BranchOffset,
+    },
+    vdbe::{
+        builder::{CursorType, ProgramBuilder},
+        insn::Insn,
+    },
+    Connection, LimboError, Result, VirtualTable,
+};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 use turso_parser::ast::{
     self, Expr, InsertBody, OneSelect, QualifiedName, ResolveType, ResultColumn, TriggerEvent,
     TriggerTime, Upsert, UpsertDo,
 };
-
-use crate::error::{
-    SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE,
-};
-use crate::schema::{self, BTreeTable, ColDef, Index, IndexColumn, ResolvedFkRef, Table};
-use crate::translate::emitter::{
-    emit_cdc_full_record, emit_cdc_insns, emit_cdc_patch_record, prepare_cdc_if_necessary,
-    OperationMode,
-};
-use crate::translate::expr::{
-    bind_and_rewrite_expr, emit_returning_results, process_returning_clause, walk_expr_mut,
-    BindingBehavior, WalkControl,
-};
-use crate::translate::fkeys::{
-    build_index_affinity_string, emit_fk_violation, emit_guarded_fk_decrement,
-    fire_fk_delete_actions, index_probe, open_read_index, open_read_table,
-};
-use crate::translate::plan::{
-    ColumnUsedMask, JoinedTable, Operation, ResultSetColumn, TableReferences,
-};
-use crate::translate::planner::ROWID_STRS;
-use crate::translate::trigger_exec::{fire_trigger, get_relevant_triggers_type_and_time};
-use crate::translate::upsert::{
-    collect_set_clauses_for_upsert, emit_upsert, resolve_upsert_target, ResolvedUpsertTarget,
-};
-use crate::util::normalize_ident;
-use crate::vdbe::affinity::Affinity;
-use crate::vdbe::builder::{CursorKey, ProgramBuilderOpts};
-use crate::vdbe::insn::{
-    to_u16, {CmpInsFlags, IdxInsertFlags, InsertFlags, RegisterOrLiteral},
-};
-use crate::vdbe::BranchOffset;
-use crate::{
-    schema::{Column, Schema},
-    vdbe::{
-        builder::{CursorType, ProgramBuilder},
-        insn::Insn,
-    },
-    LimboError,
-};
-use crate::{Connection, Result, VirtualTable};
-
-use super::emitter::Resolver;
-use super::expr::{translate_expr, translate_expr_no_constant_opt, NoConstantOptReason};
-use super::plan::QueryDestination;
-use super::select::translate_select;
-use super::trigger_exec::{has_relevant_triggers_type_only, TriggerContext};
 
 /// Validate anything with this insert statement that should throw an early parse error
 fn validate(table_name: &str, resolver: &Resolver, table: &Table) -> Result<()> {
@@ -89,6 +89,26 @@ pub struct TempTableCtx {
     loop_end_label: BranchOffset,
 }
 
+/// Labels for INSERT loop control flow
+pub struct InsertLoopLabels {
+    /// Beginning of the loop for multiple-row inserts
+    pub loop_start: BranchOffset,
+    /// Label to jump to when a row is done processing (either inserted or upserted)
+    pub row_done: BranchOffset,
+    /// Jump here at the complete end of the statement
+    pub stmt_epilogue: BranchOffset,
+    /// Jump here when the insert value SELECT source has been fully exhausted
+    pub select_exhausted: Option<BranchOffset>,
+}
+
+/// Labels for rowid/key generation flow
+pub struct InsertKeyLabels {
+    /// Label to jump to when a generated key is ready for uniqueness check
+    pub key_ready_for_check: BranchOffset,
+    /// Label to jump to when no key is provided and one must be generated
+    pub key_generation: BranchOffset,
+}
+
 #[allow(dead_code)]
 pub struct InsertEmitCtx<'a> {
     /// Parent table being inserted into
@@ -114,18 +134,11 @@ pub struct InsertEmitCtx<'a> {
 
     /// Label to jump to on HALT
     pub halt_label: BranchOffset,
-    /// Label to jump to when a row is done processing (either inserted or upserted)
-    pub row_done_label: BranchOffset,
-    /// Jump here at the complete end of the statement
-    pub stmt_epilogue: BranchOffset,
-    /// Beginning of the loop for multiple-row inserts
-    pub loop_start_label: BranchOffset,
-    /// Label to jump to when a generated key is ready for uniqueness check
-    pub key_ready_for_uniqueness_check_label: BranchOffset,
-    /// Label to jump to when no key is provided and one must be generated
-    pub key_generation_label: BranchOffset,
-    /// Jump here when the insert value SELECT source has been fully exhausted
-    pub select_exhausted_label: Option<BranchOffset>,
+    /// Labels for loop control flow
+    pub loop_labels: InsertLoopLabels,
+    /// Labels for key generation flow
+    pub key_labels: InsertKeyLabels,
+
     /// CDC table info
     pub cdc_table: Option<(usize, Arc<BTreeTable>)>,
     /// Autoincrement sequence table info
@@ -152,12 +165,16 @@ impl<'a> InsertEmitCtx<'a> {
                 program.alloc_cursor_index(None, idx)?,
             ));
         }
-        let halt_label = program.allocate_label();
-        let loop_start_label = program.allocate_label();
-        let row_done_label = program.allocate_label();
-        let stmt_epilogue = program.allocate_label();
-        let key_ready_for_uniqueness_check_label = program.allocate_label();
-        let key_generation_label = program.allocate_label();
+        let loop_labels = InsertLoopLabels {
+            loop_start: program.allocate_label(),
+            row_done: program.allocate_label(),
+            stmt_epilogue: program.allocate_label(),
+            select_exhausted: None,
+        };
+        let key_labels = InsertKeyLabels {
+            key_ready_for_check: program.allocate_label(),
+            key_generation: program.allocate_label(),
+        };
         Ok(Self {
             table,
             idx_cursors,
@@ -165,16 +182,12 @@ impl<'a> InsertEmitCtx<'a> {
             on_conflict: on_conflict.unwrap_or(ResolveType::Abort),
             yield_reg_opt: None,
             conflict_rowid_reg: program.alloc_register(),
-            select_exhausted_label: None,
             cursor_id: 0, // set later in emit_source_emission
-            halt_label,
-            row_done_label,
-            stmt_epilogue,
-            loop_start_label,
+            halt_label: program.allocate_label(),
+            loop_labels,
+            key_labels,
             cdc_table,
             num_values,
-            key_ready_for_uniqueness_check_label,
-            key_generation_label,
             autoincrement_meta: None,
         })
     }
@@ -356,7 +369,7 @@ pub fn translate_insert(
         });
 
         program.emit_insn(Insn::Goto {
-            target_pc: ctx.key_generation_label,
+            target_pc: ctx.key_labels.key_generation,
         });
 
         program.preassign_label_to_next_insn(must_be_int_label);
@@ -365,15 +378,15 @@ pub fn translate_insert(
         });
 
         program.emit_insn(Insn::Goto {
-            target_pc: ctx.key_ready_for_uniqueness_check_label,
+            target_pc: ctx.key_labels.key_ready_for_check,
         });
     }
 
-    program.preassign_label_to_next_insn(ctx.key_generation_label);
+    program.preassign_label_to_next_insn(ctx.key_labels.key_generation);
 
     emit_rowid_generation(&mut program, resolver, &ctx, &insertion)?;
 
-    program.preassign_label_to_next_insn(ctx.key_ready_for_uniqueness_check_label);
+    program.preassign_label_to_next_insn(ctx.key_labels.key_ready_for_check);
 
     if ctx.table.is_strict {
         program.emit_insn(Insn::TypeCheck {
@@ -418,15 +431,20 @@ pub fn translate_insert(
     // `commit` phase, because in UPSERT mode we might need to skip the actual insertion, as we can
     // have a naked ON CONFLICT DO NOTHING, so if we eagerly insert any indexes, we could insert
     // invalid index entries before we hit a conflict down the line.
+    let on_replace = matches!(ctx.on_conflict, ResolveType::Replace) && upsert_actions.is_empty();
+    let mut preflight_ctx = PreflightCtx {
+        upsert_actions: &upsert_actions,
+        on_replace,
+        connection,
+        table_references: &mut table_references,
+    };
     emit_preflight_constraint_checks(
         &mut program,
         &mut ctx,
         resolver,
         &insertion,
-        &upsert_actions,
         &constraints,
-        connection,
-        &mut table_references,
+        &mut preflight_ctx,
     )?;
 
     let notnull_resume_label = emit_notnulls(&mut program, &ctx, &insertion, resolver)?;
@@ -599,7 +617,7 @@ pub fn translate_insert(
         )?;
     }
     program.emit_insn(Insn::Goto {
-        target_pc: ctx.row_done_label,
+        target_pc: ctx.loop_labels.row_done,
     });
     if !upsert_actions.is_empty() {
         resolve_upserts(
@@ -626,7 +644,7 @@ pub fn translate_insert(
 fn emit_epilogue(program: &mut ProgramBuilder, ctx: &InsertEmitCtx, inserting_multiple_rows: bool) {
     if inserting_multiple_rows {
         if let Some(temp_table_ctx) = &ctx.temp_table_ctx {
-            program.resolve_label(ctx.row_done_label, program.offset());
+            program.resolve_label(ctx.loop_labels.row_done, program.offset());
 
             program.emit_insn(Insn::Next {
                 cursor_id: temp_table_ctx.cursor_id,
@@ -638,30 +656,62 @@ fn emit_epilogue(program: &mut ProgramBuilder, ctx: &InsertEmitCtx, inserting_mu
                 cursor_id: temp_table_ctx.cursor_id,
             });
             program.emit_insn(Insn::Goto {
-                target_pc: ctx.stmt_epilogue,
+                target_pc: ctx.loop_labels.stmt_epilogue,
             });
         } else {
             // For multiple rows which not require a temp table, loop back
-            program.resolve_label(ctx.row_done_label, program.offset());
+            program.resolve_label(ctx.loop_labels.row_done, program.offset());
             program.emit_insn(Insn::Goto {
-                target_pc: ctx.loop_start_label,
+                target_pc: ctx.loop_labels.loop_start,
             });
-            if let Some(sel_eof) = ctx.select_exhausted_label {
+            if let Some(sel_eof) = ctx.loop_labels.select_exhausted {
                 program.preassign_label_to_next_insn(sel_eof);
                 program.emit_insn(Insn::Goto {
-                    target_pc: ctx.stmt_epilogue,
+                    target_pc: ctx.loop_labels.stmt_epilogue,
                 });
             }
         }
     } else {
-        program.resolve_label(ctx.row_done_label, program.offset());
+        program.resolve_label(ctx.loop_labels.row_done, program.offset());
         // single-row falls through to epilogue
         program.emit_insn(Insn::Goto {
-            target_pc: ctx.stmt_epilogue,
+            target_pc: ctx.loop_labels.stmt_epilogue,
         });
     }
-    program.preassign_label_to_next_insn(ctx.stmt_epilogue);
+    program.preassign_label_to_next_insn(ctx.loop_labels.stmt_epilogue);
     program.resolve_label(ctx.halt_label, program.offset());
+}
+
+/// Evaluates a partial index WHERE clause and emits code to skip if the predicate is false.
+/// Returns Some(label) if there was a WHERE clause (label should be resolved after the guarded code),
+/// or None if there was no WHERE clause.
+fn emit_partial_index_check(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    index: &Index,
+    insertion: &Insertion,
+) -> Result<Option<BranchOffset>> {
+    let Some(where_clause) = &index.where_clause else {
+        return Ok(None);
+    };
+    let mut where_for_eval = where_clause.as_ref().clone();
+    rewrite_partial_index_where(&mut where_for_eval, insertion)?;
+    let reg = program.alloc_register();
+    translate_expr_no_constant_opt(
+        program,
+        Some(&TableReferences::new_empty()),
+        &where_for_eval,
+        reg,
+        resolver,
+        NoConstantOptReason::RegisterReuse,
+    )?;
+    let skip_label = program.allocate_label();
+    program.emit_insn(Insn::IfNot {
+        reg,
+        target_pc: skip_label,
+        jump_if_null: true,
+    });
+    Ok(Some(skip_label))
 }
 
 // COMMIT PHASE: no preflight jumps happened; emit the actual index writes now
@@ -683,28 +733,7 @@ fn emit_commit_phase(
             .expect("no cursor found for index");
 
         // Re-evaluate partial predicate on the would-be inserted image
-        let commit_skip_label = if let Some(where_clause) = &index.where_clause {
-            let mut where_for_eval = where_clause.as_ref().clone();
-            rewrite_partial_index_where(&mut where_for_eval, insertion)?;
-            let reg = program.alloc_register();
-            translate_expr_no_constant_opt(
-                program,
-                Some(&TableReferences::new_empty()),
-                &where_for_eval,
-                reg,
-                resolver,
-                NoConstantOptReason::RegisterReuse,
-            )?;
-            let lbl = program.allocate_label();
-            program.emit_insn(Insn::IfNot {
-                reg,
-                target_pc: lbl,
-                jump_if_null: true,
-            });
-            Some(lbl)
-        } else {
-            None
-        };
+        let commit_skip_label = emit_partial_index_check(program, resolver, index, insertion)?;
 
         let num_cols = index.columns.len();
         let idx_start_reg = program.alloc_registers(num_cols + 1);
@@ -905,7 +934,7 @@ fn resolve_upserts(
         } else {
             // UpsertDo::Nothing case
             program.emit_insn(Insn::Goto {
-                target_pc: ctx.row_done_label,
+                target_pc: ctx.loop_labels.row_done,
             });
         }
     }
@@ -1053,7 +1082,7 @@ fn emit_notnulls(
         if on_ignore {
             program.emit_insn(Insn::IsNull {
                 reg: column_mapping.register,
-                target_pc: ctx.row_done_label,
+                target_pc: ctx.loop_labels.row_done,
             });
         } else {
             program.emit_insn(Insn::HaltIfNull {
@@ -1345,7 +1374,7 @@ fn init_source_emission<'a>(
                     });
 
                     // Main loop
-                    program.preassign_label_to_next_insn(ctx.loop_start_label);
+                    program.preassign_label_to_next_insn(ctx.loop_labels.loop_start);
                     let yield_label = program.allocate_label();
                     program.emit_insn(Insn::Yield {
                         yield_reg,
@@ -1405,7 +1434,7 @@ fn init_source_emission<'a>(
                     });
                     // loop back
                     program.emit_insn(Insn::Goto {
-                        target_pc: ctx.loop_start_label,
+                        target_pc: ctx.loop_labels.loop_start,
                     });
                     program.preassign_label_to_next_insn(yield_label);
 
@@ -1421,11 +1450,11 @@ fn init_source_emission<'a>(
                         db: 0,
                     });
 
-                    program.preassign_label_to_next_insn(ctx.loop_start_label);
+                    program.preassign_label_to_next_insn(ctx.loop_labels.loop_start);
 
                     // on EOF, jump to select_exhausted to check FK constraints
                     let select_exhausted = program.allocate_label();
-                    ctx.select_exhausted_label = Some(select_exhausted);
+                    ctx.loop_labels.select_exhausted = Some(select_exhausted);
                     program.emit_insn(Insn::Yield {
                         yield_reg,
                         end_offset: select_exhausted,
@@ -1857,6 +1886,281 @@ fn translate_column(
     Ok(())
 }
 
+/// Emit bytecode to check PRIMARY KEY uniqueness constraint.
+/// Handles ON REPLACE (delete conflicting row) and UPSERT routing.
+fn emit_pk_uniqueness_check(
+    program: &mut ProgramBuilder,
+    ctx: &mut InsertEmitCtx,
+    resolver: &mut Resolver,
+    insertion: &Insertion,
+    position: Option<usize>,
+    upsert_catch_all: Option<usize>,
+    preflight: &mut PreflightCtx,
+) -> Result<()> {
+    let make_record_label = program.allocate_label();
+    program.emit_insn(Insn::NotExists {
+        cursor: ctx.cursor_id,
+        rowid_reg: insertion.key_register(),
+        target_pc: make_record_label,
+    });
+    let rowid_column_name = insertion.key.column_name();
+
+    // Conflict on rowid: attempt to route through UPSERT if it targets the PK, otherwise raise constraint.
+    // emit Halt for every case *except* when upsert handles the conflict
+    'emit_halt: {
+        if preflight.on_replace {
+            // copy the conflicting rowid into the key register and delete the existing row inline
+            program.emit_insn(Insn::Copy {
+                src_reg: insertion.key_register(),
+                dst_reg: ctx.conflict_rowid_reg,
+                extra_amount: 0,
+            });
+            emit_replace_delete_conflicting_row(
+                program,
+                resolver,
+                preflight.connection,
+                ctx,
+                preflight.table_references,
+            )?;
+            program.emit_insn(Insn::Goto {
+                target_pc: make_record_label,
+            });
+            break 'emit_halt;
+        }
+        if let Some(position) = position.or(upsert_catch_all) {
+            // PK conflict: the conflicting rowid is exactly the attempted key
+            program.emit_insn(Insn::Copy {
+                src_reg: insertion.key_register(),
+                dst_reg: ctx.conflict_rowid_reg,
+                extra_amount: 0,
+            });
+            program.emit_insn(Insn::Goto {
+                target_pc: preflight.upsert_actions[position].1,
+            });
+            break 'emit_halt;
+        }
+        let mut description =
+            String::with_capacity(ctx.table.name.len() + rowid_column_name.len() + 2);
+        description.push_str(ctx.table.name.as_str());
+        description.push('.');
+        description.push_str(rowid_column_name);
+        program.emit_insn(Insn::Halt {
+            err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
+            description,
+        });
+    }
+    program.preassign_label_to_next_insn(make_record_label);
+    Ok(())
+}
+
+/// Emit bytecode to check index uniqueness constraint.
+/// Handles partial index predicates, ON REPLACE, UPSERT routing, and non-unique indexes.
+#[allow(clippy::too_many_arguments)]
+fn emit_index_uniqueness_check(
+    program: &mut ProgramBuilder,
+    ctx: &mut InsertEmitCtx,
+    resolver: &mut Resolver,
+    insertion: &Insertion,
+    index: &Index,
+    position: Option<usize>,
+    upsert_catch_all: Option<usize>,
+    preflight: &mut PreflightCtx,
+) -> Result<()> {
+    // find which cursor we opened earlier for this index
+    let idx_cursor_id = ctx
+        .idx_cursors
+        .iter()
+        .find(|(name, _, _)| name == &index.name)
+        .map(|(_, _, c_id)| *c_id)
+        .expect("no cursor found for index");
+
+    // For partial indexes, evaluate the WHERE clause and skip if false
+    let maybe_skip_probe_label = emit_partial_index_check(program, resolver, index, insertion)?;
+
+    let num_cols = index.columns.len();
+    // allocate scratch registers for the index columns plus rowid
+    let idx_start_reg = program.alloc_registers(num_cols + 1);
+
+    // build unpacked key [idx_start_reg .. idx_start_reg+num_cols-1], and rowid in last reg,
+    // copy each index column from the table's column registers into these scratch regs
+    for (i, idx_col) in index.columns.iter().enumerate() {
+        emit_index_column_value_for_insert(
+            program,
+            resolver,
+            insertion,
+            idx_col,
+            idx_start_reg + i,
+        )?;
+    }
+    // last register is the rowid
+    program.emit_insn(Insn::Copy {
+        src_reg: insertion.key_register(),
+        dst_reg: idx_start_reg + num_cols,
+        extra_amount: 0,
+    });
+
+    if index.unique {
+        emit_unique_index_check(
+            program,
+            ctx,
+            resolver,
+            index,
+            idx_cursor_id,
+            idx_start_reg,
+            num_cols,
+            position,
+            upsert_catch_all,
+            preflight,
+        )?;
+    } else {
+        // Non-unique index: in UPSERT mode we postpone writes to commit phase.
+        if preflight.upsert_actions.is_empty() {
+            // eager insert for non-unique, no UPSERT
+            let record_reg = program.alloc_register();
+            program.emit_insn(Insn::MakeRecord {
+                start_reg: to_u16(idx_start_reg),
+                count: to_u16(num_cols + 1),
+                dest_reg: to_u16(record_reg),
+                index_name: Some(index.name.clone()),
+                affinity_str: None,
+            });
+            program.emit_insn(Insn::IdxInsert {
+                cursor_id: idx_cursor_id,
+                record_reg,
+                unpacked_start: Some(idx_start_reg),
+                unpacked_count: Some((num_cols + 1) as u16),
+                flags: IdxInsertFlags::new().nchange(true),
+            });
+        }
+    }
+
+    // Close the partial-index skip (preflight)
+    if let Some(lbl) = maybe_skip_probe_label {
+        program.resolve_label(lbl, program.offset());
+    }
+    Ok(())
+}
+
+/// Emit bytecode for unique index conflict detection and handling.
+#[allow(clippy::too_many_arguments)]
+fn emit_unique_index_check(
+    program: &mut ProgramBuilder,
+    ctx: &mut InsertEmitCtx,
+    resolver: &mut Resolver,
+    index: &Index,
+    idx_cursor_id: usize,
+    idx_start_reg: usize,
+    num_cols: usize,
+    position: Option<usize>,
+    upsert_catch_all: Option<usize>,
+    preflight: &mut PreflightCtx,
+) -> Result<()> {
+    let aff = index
+        .columns
+        .iter()
+        .map(|ic| {
+            if ic.expr.is_some() {
+                Affinity::Blob.aff_mask()
+            } else {
+                ctx.table.columns[ic.pos_in_table].affinity().aff_mask()
+            }
+        })
+        .collect::<String>();
+    program.emit_insn(Insn::Affinity {
+        start_reg: idx_start_reg,
+        count: NonZeroUsize::new(num_cols).expect("nonzero col count"),
+        affinities: aff,
+    });
+
+    if !preflight.upsert_actions.is_empty() {
+        let next_check = program.allocate_label();
+        program.emit_insn(Insn::NoConflict {
+            cursor_id: idx_cursor_id,
+            target_pc: next_check,
+            record_reg: idx_start_reg,
+            num_regs: num_cols,
+        });
+        // Conflict detected, figure out if this UPSERT handles the conflict
+        if let Some(position) = position.or(upsert_catch_all) {
+            match &preflight.upsert_actions[position].2.do_clause {
+                UpsertDo::Nothing => {
+                    // Bail out without writing anything
+                    program.emit_insn(Insn::Goto {
+                        target_pc: ctx.loop_labels.row_done,
+                    });
+                }
+                UpsertDo::Set { .. } => {
+                    // Route to DO UPDATE: capture conflicting rowid then jump
+                    program.emit_insn(Insn::IdxRowId {
+                        cursor_id: idx_cursor_id,
+                        dest: ctx.conflict_rowid_reg,
+                    });
+                    program.emit_insn(Insn::Goto {
+                        target_pc: preflight.upsert_actions[position].1,
+                    });
+                }
+            }
+        }
+        // No matching UPSERT handler so we emit constraint error
+        // (if conflict clause matched - VM will jump to later instructions and skip halt)
+        program.emit_insn(Insn::Halt {
+            err_code: SQLITE_CONSTRAINT_UNIQUE,
+            description: format_unique_violation_desc(ctx.table.name.as_str(), index),
+        });
+
+        // continue preflight with next constraint
+        program.preassign_label_to_next_insn(next_check);
+    } else {
+        // No UPSERT fast-path: probe and immediately insert
+        let ok = program.allocate_label();
+        program.emit_insn(Insn::NoConflict {
+            cursor_id: idx_cursor_id,
+            target_pc: ok,
+            record_reg: idx_start_reg,
+            num_regs: num_cols,
+        });
+        if preflight.on_replace {
+            program.emit_insn(Insn::IdxRowId {
+                cursor_id: idx_cursor_id,
+                dest: ctx.conflict_rowid_reg,
+            });
+            emit_replace_delete_conflicting_row(
+                program,
+                resolver,
+                preflight.connection,
+                ctx,
+                preflight.table_references,
+            )?;
+            program.emit_insn(Insn::Goto { target_pc: ok });
+        } else {
+            // Unique violation without ON CONFLICT clause -> error
+            program.emit_insn(Insn::Halt {
+                err_code: SQLITE_CONSTRAINT_UNIQUE,
+                description: format_unique_violation_desc(ctx.table.name.as_str(), index),
+            });
+        }
+        program.preassign_label_to_next_insn(ok);
+
+        // In the non-UPSERT case, we insert the index
+        let record_reg = program.alloc_register();
+        program.emit_insn(Insn::MakeRecord {
+            start_reg: to_u16(idx_start_reg),
+            count: to_u16(num_cols + 1),
+            dest_reg: to_u16(record_reg),
+            index_name: Some(index.name.clone()),
+            affinity_str: None,
+        });
+        program.emit_insn(Insn::IdxInsert {
+            cursor_id: idx_cursor_id,
+            record_reg,
+            unpacked_start: Some(idx_start_reg),
+            unpacked_count: Some((num_cols + 1) as u16),
+            flags: IdxInsertFlags::new().nchange(true),
+        });
+    }
+    Ok(())
+}
+
 // Preflight phase: evaluate each applicable UNIQUE constraint and probe with NoConflict.
 // If any probe hits:
 // DO NOTHING -> jump to row_done_label.
@@ -1864,265 +2168,38 @@ fn translate_column(
 // DO UPDATE (matching target) -> fetch conflicting rowid and jump to `upsert_entry`.
 //
 // otherwise, raise SQLITE_CONSTRAINT_UNIQUE
-#[allow(clippy::too_many_arguments)]
 fn emit_preflight_constraint_checks(
     program: &mut ProgramBuilder,
     ctx: &mut InsertEmitCtx,
     resolver: &mut Resolver,
     insertion: &Insertion,
-    upsert_actions: &[(ResolvedUpsertTarget, BranchOffset, Box<Upsert>)],
     constraints: &ConstraintsToCheck,
-    connection: &Arc<Connection>,
-    table_references: &mut TableReferences,
+    preflight: &mut PreflightCtx,
 ) -> Result<()> {
-    let on_replace = matches!(ctx.on_conflict, ResolveType::Replace) && upsert_actions.is_empty();
     for (constraint, position) in &constraints.constraints_to_check {
         match constraint {
             ResolvedUpsertTarget::PrimaryKey => {
-                let make_record_label = program.allocate_label();
-                program.emit_insn(Insn::NotExists {
-                    cursor: ctx.cursor_id,
-                    rowid_reg: insertion.key_register(),
-                    target_pc: make_record_label,
-                });
-                let rowid_column_name = insertion.key.column_name();
-
-                // Conflict on rowid: attempt to route through UPSERT if it targets the PK, otherwise raise constraint.
-                // emit Halt for every case *except* when upsert handles the conflict
-                'emit_halt: {
-                    if on_replace {
-                        // copy the conflicting rowid into the key register and delete the existing row inline
-                        program.emit_insn(Insn::Copy {
-                            src_reg: insertion.key_register(),
-                            dst_reg: ctx.conflict_rowid_reg,
-                            extra_amount: 0,
-                        });
-                        emit_replace_delete_conflicting_row(
-                            program,
-                            resolver,
-                            connection,
-                            ctx,
-                            table_references,
-                        )?;
-                        program.emit_insn(Insn::Goto {
-                            target_pc: make_record_label,
-                        });
-                        break 'emit_halt;
-                    }
-                    if let Some(position) = position.or(constraints.upsert_catch_all_position) {
-                        // PK conflict: the conflicting rowid is exactly the attempted key
-                        program.emit_insn(Insn::Copy {
-                            src_reg: insertion.key_register(),
-                            dst_reg: ctx.conflict_rowid_reg,
-                            extra_amount: 0,
-                        });
-                        program.emit_insn(Insn::Goto {
-                            target_pc: upsert_actions[position].1,
-                        });
-                        break 'emit_halt;
-                    }
-                    let mut description =
-                        String::with_capacity(ctx.table.name.len() + rowid_column_name.len() + 2);
-                    description.push_str(ctx.table.name.as_str());
-                    description.push('.');
-                    description.push_str(rowid_column_name);
-                    program.emit_insn(Insn::Halt {
-                        err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
-                        description,
-                    });
-                }
-                program.preassign_label_to_next_insn(make_record_label);
+                emit_pk_uniqueness_check(
+                    program,
+                    ctx,
+                    resolver,
+                    insertion,
+                    *position,
+                    constraints.upsert_catch_all_position,
+                    preflight,
+                )?;
             }
             ResolvedUpsertTarget::Index(index) => {
-                // find which cursor we opened earlier for this index
-                let idx_cursor_id = ctx
-                    .idx_cursors
-                    .iter()
-                    .find(|(name, _, _)| name == &index.name)
-                    .map(|(_, _, c_id)| *c_id)
-                    .expect("no cursor found for index");
-
-                let maybe_skip_probe_label = if let Some(where_clause) = &index.where_clause {
-                    let mut where_for_eval = where_clause.as_ref().clone();
-                    rewrite_partial_index_where(&mut where_for_eval, insertion)?;
-                    let reg = program.alloc_register();
-                    translate_expr_no_constant_opt(
-                        program,
-                        Some(&TableReferences::new_empty()),
-                        &where_for_eval,
-                        reg,
-                        resolver,
-                        NoConstantOptReason::RegisterReuse,
-                    )?;
-                    let lbl = program.allocate_label();
-                    program.emit_insn(Insn::IfNot {
-                        reg,
-                        target_pc: lbl,
-                        jump_if_null: true,
-                    });
-                    Some(lbl)
-                } else {
-                    None
-                };
-
-                let num_cols = index.columns.len();
-                // allocate scratch registers for the index columns plus rowid
-                let idx_start_reg = program.alloc_registers(num_cols + 1);
-
-                // build unpacked key [idx_start_reg .. idx_start_reg+num_cols-1], and rowid in last reg,
-                // copy each index column from the table's column registers into these scratch regs
-                for (i, idx_col) in index.columns.iter().enumerate() {
-                    emit_index_column_value_for_insert(
-                        program,
-                        resolver,
-                        insertion,
-                        idx_col,
-                        idx_start_reg + i,
-                    )?;
-                }
-                // last register is the rowid
-                program.emit_insn(Insn::Copy {
-                    src_reg: insertion.key_register(),
-                    dst_reg: idx_start_reg + num_cols,
-                    extra_amount: 0,
-                });
-
-                if index.unique {
-                    let aff = index
-                        .columns
-                        .iter()
-                        .map(|ic| {
-                            if ic.expr.is_some() {
-                                Affinity::Blob.aff_mask()
-                            } else {
-                                ctx.table.columns[ic.pos_in_table].affinity().aff_mask()
-                            }
-                        })
-                        .collect::<String>();
-                    program.emit_insn(Insn::Affinity {
-                        start_reg: idx_start_reg,
-                        count: NonZeroUsize::new(num_cols).expect("nonzero col count"),
-                        affinities: aff,
-                    });
-
-                    if !upsert_actions.is_empty() {
-                        let next_check = program.allocate_label();
-                        program.emit_insn(Insn::NoConflict {
-                            cursor_id: idx_cursor_id,
-                            target_pc: next_check,
-                            record_reg: idx_start_reg,
-                            num_regs: num_cols,
-                        });
-                        // Conflict detected, figure out if this UPSERT handles the conflict
-                        if let Some(position) = position.or(constraints.upsert_catch_all_position) {
-                            match &upsert_actions[position].2.do_clause {
-                                UpsertDo::Nothing => {
-                                    // Bail out without writing anything
-                                    program.emit_insn(Insn::Goto {
-                                        target_pc: ctx.row_done_label,
-                                    });
-                                }
-                                UpsertDo::Set { .. } => {
-                                    // Route to DO UPDATE: capture conflicting rowid then jump
-                                    program.emit_insn(Insn::IdxRowId {
-                                        cursor_id: idx_cursor_id,
-                                        dest: ctx.conflict_rowid_reg,
-                                    });
-                                    program.emit_insn(Insn::Goto {
-                                        target_pc: upsert_actions[position].1,
-                                    });
-                                }
-                            }
-                        }
-                        // No matching UPSERT handler so we emit constraint error
-                        // (if conflict clause matched - VM will jump to later instructions and skip halt)
-                        program.emit_insn(Insn::Halt {
-                            err_code: SQLITE_CONSTRAINT_UNIQUE,
-                            description: format_unique_violation_desc(
-                                ctx.table.name.as_str(),
-                                index,
-                            ),
-                        });
-
-                        // continue preflight with next constraint
-                        program.preassign_label_to_next_insn(next_check);
-                    } else {
-                        // No UPSERT fast-path: probe and immediately insert
-                        let ok = program.allocate_label();
-                        program.emit_insn(Insn::NoConflict {
-                            cursor_id: idx_cursor_id,
-                            target_pc: ok,
-                            record_reg: idx_start_reg,
-                            num_regs: num_cols,
-                        });
-                        if on_replace {
-                            program.emit_insn(Insn::IdxRowId {
-                                cursor_id: idx_cursor_id,
-                                dest: ctx.conflict_rowid_reg,
-                            });
-                            emit_replace_delete_conflicting_row(
-                                program,
-                                resolver,
-                                connection,
-                                ctx,
-                                table_references,
-                            )?;
-                            program.emit_insn(Insn::Goto { target_pc: ok });
-                        } else {
-                            // Unique violation without ON CONFLICT clause -> error
-                            program.emit_insn(Insn::Halt {
-                                err_code: SQLITE_CONSTRAINT_UNIQUE,
-                                description: format_unique_violation_desc(
-                                    ctx.table.name.as_str(),
-                                    index,
-                                ),
-                            });
-                        }
-                        program.preassign_label_to_next_insn(ok);
-
-                        // In the non-UPSERT case, we insert the index
-                        let record_reg = program.alloc_register();
-                        program.emit_insn(Insn::MakeRecord {
-                            start_reg: to_u16(idx_start_reg),
-                            count: to_u16(num_cols + 1),
-                            dest_reg: to_u16(record_reg),
-                            index_name: Some(index.name.clone()),
-                            affinity_str: None,
-                        });
-                        program.emit_insn(Insn::IdxInsert {
-                            cursor_id: idx_cursor_id,
-                            record_reg,
-                            unpacked_start: Some(idx_start_reg),
-                            unpacked_count: Some((num_cols + 1) as u16),
-                            flags: IdxInsertFlags::new().nchange(true),
-                        });
-                    }
-                } else {
-                    // Non-unique index: in UPSERT mode we postpone writes to commit phase.
-                    if upsert_actions.is_empty() {
-                        // eager insert for non-unique, no UPSERT
-                        let record_reg = program.alloc_register();
-                        program.emit_insn(Insn::MakeRecord {
-                            start_reg: to_u16(idx_start_reg),
-                            count: to_u16(num_cols + 1),
-                            dest_reg: to_u16(record_reg),
-                            index_name: Some(index.name.clone()),
-                            affinity_str: None,
-                        });
-                        program.emit_insn(Insn::IdxInsert {
-                            cursor_id: idx_cursor_id,
-                            record_reg,
-                            unpacked_start: Some(idx_start_reg),
-                            unpacked_count: Some((num_cols + 1) as u16),
-                            flags: IdxInsertFlags::new().nchange(true),
-                        });
-                    }
-                }
-
-                // Close the partial-index skip (preflight)
-                if let Some(lbl) = maybe_skip_probe_label {
-                    program.resolve_label(lbl, program.offset());
-                }
+                emit_index_uniqueness_check(
+                    program,
+                    ctx,
+                    resolver,
+                    insertion,
+                    index,
+                    *position,
+                    constraints.upsert_catch_all_position,
+                    preflight,
+                )?;
             }
             ResolvedUpsertTarget::CatchAll => unreachable!(),
         }
@@ -2453,6 +2530,18 @@ fn emit_index_column_value_for_insert(
 struct ConstraintsToCheck {
     constraints_to_check: Vec<(ResolvedUpsertTarget, Option<usize>)>,
     upsert_catch_all_position: Option<usize>,
+}
+
+/// Context for preflight constraint checks
+struct PreflightCtx<'a, 'b> {
+    /// UPSERT action handlers (target, label, upsert clause)
+    upsert_actions: &'a [(ResolvedUpsertTarget, BranchOffset, Box<Upsert>)],
+    /// Whether ON CONFLICT REPLACE is active (without UPSERT)
+    on_replace: bool,
+    /// Database connection for FK checks
+    connection: &'a Arc<Connection>,
+    /// Table references for expression evaluation
+    table_references: &'b mut TableReferences,
 }
 
 fn build_constraints_to_check(
