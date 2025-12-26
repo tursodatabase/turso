@@ -87,12 +87,12 @@ unsafe impl Send for Row {}
 unsafe impl Sync for Row {}
 
 impl Row {
-    pub fn get_value(&self, index: usize) -> Result<Value> {
-        let value = &self
+    pub fn get_value(&self, idx: usize) -> Result<Value> {
+        let val = &self
             .values
-            .get(index)
+            .get(idx)
             .ok_or(Error::SqlExecutionFailure("invalid row index".to_string()))?;
-        match value {
+        match val {
             turso_core::Value::Integer(i) => Ok(Value::Integer(*i)),
             turso_core::Value::Null => Ok(Value::Null),
             turso_core::Value::Float(f) => Ok(Value::Real(*f)),
