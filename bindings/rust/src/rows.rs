@@ -88,7 +88,10 @@ unsafe impl Sync for Row {}
 
 impl Row {
     pub fn get_value(&self, index: usize) -> Result<Value> {
-        let value = &self.values[index];
+        let value = &self
+            .values
+            .get(index)
+            .ok_or(Error::SqlExecutionFailure("invalid row index".to_string()))?;
         match value {
             turso_core::Value::Integer(i) => Ok(Value::Integer(*i)),
             turso_core::Value::Null => Ok(Value::Null),
@@ -102,7 +105,10 @@ impl Row {
     where
         T: FromValue,
     {
-        let val = &self.values[idx];
+        let val = self
+            .values
+            .get(idx)
+            .ok_or(Error::SqlExecutionFailure("invalid row index".to_string()))?;
         T::from_sql(val.clone()).map_err(|err| Error::ConversionFailure(err.to_string()))
     }
 
