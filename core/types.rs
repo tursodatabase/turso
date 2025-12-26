@@ -1182,7 +1182,7 @@ impl ImmutableRecord {
         }
         let mut cursor = self.cursor.lock();
         cursor.parse_full_header(self).unwrap();
-        let last_idx = cursor.serial_types.len().checked_sub(1)?;
+        let last_idx = cursor.serials_offsets.len().checked_sub(1)?;
         Some(cursor.deserialize_column(self, last_idx))
     }
 
@@ -1200,7 +1200,7 @@ impl ImmutableRecord {
 
         match cursor.ensure_parsed_upto(self, idx) {
             Ok(()) => {
-                if idx >= cursor.serial_types.len() {
+                if idx >= cursor.serials_offsets.len() {
                     return None;
                 }
 
@@ -1213,7 +1213,7 @@ impl ImmutableRecord {
     pub fn column_count(&self) -> usize {
         let mut cursor = self.cursor.lock();
         cursor.parse_full_header(self).unwrap();
-        cursor.serial_types.len()
+        cursor.serials_offsets.len()
     }
 
     /// Get direct access to the embedded cursor. Use with caution.
