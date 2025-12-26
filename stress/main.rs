@@ -16,6 +16,7 @@ use std::sync::Mutex as StdMutex;
 use tokio::sync::Mutex;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::reload;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 use turso::Builder;
@@ -441,9 +442,15 @@ fn read_plan_from_log_file(opts: &Opts) -> Result<Plan, Box<dyn std::error::Erro
     Ok(plan)
 }
 
-pub fn init_tracing() -> Result<WorkerGuard, std::io::Error> {
+pub type LogLevelReloadHandle = reload::Handle<EnvFilter, tracing_subscriber::Registry>;
+
+pub fn init_tracing() -> Result<(WorkerGuard, LogLevelReloadHandle), std::io::Error> {
     let (non_blocking, guard) = tracing_appender::non_blocking(std::io::stderr());
+    let filter = EnvFilter::from_default_env();
+    let (filter_layer, reload_handle) = reload::Layer::new(filter);
+
     if let Err(e) = tracing_subscriber::registry()
+        .with(filter_layer)
         .with(
             tracing_subscriber::fmt::layer()
                 .with_writer(non_blocking)
@@ -451,12 +458,56 @@ pub fn init_tracing() -> Result<WorkerGuard, std::io::Error> {
                 .with_line_number(true)
                 .with_thread_ids(true),
         )
-        .with(EnvFilter::from_default_env())
         .try_init()
     {
         println!("Unable to setup tracing appender: {e:?}");
     }
-    Ok(guard)
+    Ok((guard, reload_handle))
+}
+
+const LOG_LEVEL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+const LOG_LEVEL_FILE: &str = "RUST_LOG";
+
+/// Spawns a background thread that watches for a RUST_LOG file and dynamically
+/// updates the log level when the file contents change.
+///
+/// The file should contain a valid tracing filter string (e.g., "debug", "info",
+/// "limbo_core=trace,warn"). If the file is removed or contains an invalid filter,
+/// the current log level is preserved.
+pub fn spawn_log_level_watcher(reload_handle: LogLevelReloadHandle) {
+    std::thread::spawn(move || {
+        let mut last_content: Option<String> = None;
+
+        loop {
+            std::thread::sleep(LOG_LEVEL_POLL_INTERVAL);
+
+            let content = match std::fs::read_to_string(LOG_LEVEL_FILE) {
+                Ok(content) => content.trim().to_string(),
+                Err(_) => {
+                    continue;
+                }
+            };
+
+            if last_content.as_ref() == Some(&content) {
+                continue;
+            }
+
+            match content.parse::<EnvFilter>() {
+                Ok(new_filter) => {
+                    if let Err(e) = reload_handle.reload(new_filter) {
+                        eprintln!("Failed to reload log filter: {e}");
+                    } else {
+                        last_content = Some(content);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Invalid log filter in {LOG_LEVEL_FILE}: {e}");
+                    last_content = Some(content);
+                }
+            }
+        }
+    });
 }
 
 fn sqlite_integrity_check(
@@ -480,9 +531,19 @@ fn sqlite_integrity_check(
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let _g = init_tracing()?;
+fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .unhandled_panic(tokio::runtime::UnhandledPanic::ShutdownRuntime)
+        .build()?;
+
+    rt.block_on(async_main())
+}
+
+async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let (_guard, reload_handle) = init_tracing()?;
+
+    spawn_log_level_watcher(reload_handle);
 
     let opts = Opts::parse();
 
@@ -564,7 +625,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         }
 
-        let nr_iterations = opts.nr_iterations;
+        let nr_iterations = plan.nr_iterations;
         let db = db.clone();
         let vfs_for_task = vfs_option.clone();
 
