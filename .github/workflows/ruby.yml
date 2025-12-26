@@ -1,0 +1,140 @@
+name: Ruby
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+    paths:
+      - 'bindings/ruby/**'
+      - 'core/**'
+      - 'sdk-kit/**'
+  pull_request:
+    branches:
+      - main
+    paths:
+      - 'bindings/ruby/**'
+      - 'core/**'
+      - 'sdk-kit/**'
+
+env:
+  working-directory: bindings/ruby
+
+jobs:
+  test:
+    name: Test (${{ matrix.os }}, Ruby ${{ matrix.ruby-version }})
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [blacksmith-4vcpu-ubuntu-2404, macos-latest, windows-2025]
+        ruby-version: ['3.2', '3.3']
+    runs-on: ${{ matrix.os }}
+    defaults:
+      run:
+        working-directory: ${{ env.working-directory }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Ruby and Rust (Linux/macOS)
+        if: runner.os != 'Windows'
+        uses: oxidize-rb/actions/setup-ruby-and-rust@v1
+        with:
+          ruby-version: ${{ matrix.ruby-version }}
+          bundler-cache: false
+          cargo-cache: true
+          cache-version: v2
+
+      - name: Setup Ruby (Windows)
+        if: runner.os == 'Windows'
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: ${{ matrix.ruby-version }}
+          bundler-cache: false
+          working-directory: ${{ env.working-directory }}
+          windows-toolchain: UCRT64
+
+      - name: Setup Rust (Windows)
+        if: runner.os == 'Windows'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install MSYS2 toolchain (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ridk exec pacman -S --needed --noconfirm base-devel mingw-w64-ucrt-x86_64-toolchain
+
+      - name: Install Rust GNU toolchain (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: rustup toolchain install stable-gnu --profile minimal --no-self-update
+
+      - name: Configure bindgen sysroot (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          # Configure BINDGEN to use correct sysroot
+          echo "BINDGEN_EXTRA_CLANG_ARGS=--target=x86_64-pc-windows-gnu --sysroot=${RI_DEVKIT//\\//}$MSYSTEM_PREFIX" >> $GITHUB_ENV
+
+      - name: Install dependencies (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          gem install bundler
+          bundle config set --local path 'vendor/bundle'
+          bundle install
+
+      - name: Install dependencies (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        working-directory: ${{ env.working-directory }}
+        run: |
+          $unixPath = ridk exec bash -lc "cygpath -au '$env:GITHUB_WORKSPACE/bindings/ruby'"
+          ridk exec bash -lc "cd $unixPath && export RUSTUP_TOOLCHAIN=stable-gnu CC=x86_64-w64-mingw32-gcc CXX=x86_64-w64-mingw32-g++ && bundle install"
+
+      - name: Compile native extension (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: bundle exec rake compile
+
+      - name: Compile native extension (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        working-directory: ${{ env.working-directory }}
+        env:
+          RB_SYS_CARGO_PROFILE: release
+        run: |
+          $unixPath = ridk exec bash -lc "cygpath -au '$env:GITHUB_WORKSPACE/bindings/ruby'"
+          ridk exec bash -lc "cd $unixPath && export RUSTUP_TOOLCHAIN=stable-gnu CC=x86_64-w64-mingw32-gcc CXX=x86_64-w64-mingw32-g++ && bundle exec rake compile"
+
+      - name: Run example (Unix)
+        if: runner.os != 'Windows'
+        run: bundle exec ruby examples/basic.rb
+
+      - name: Run example (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        working-directory: ${{ env.working-directory }}
+        run: |
+          $unixPath = ridk exec bash -lc "cygpath -au '$env:GITHUB_WORKSPACE/bindings/ruby'"
+          ridk exec bash -lc "cd $unixPath && bundle exec ruby examples/basic.rb"
+
+  lint:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: ${{ env.working-directory }}/ext/turso
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Install Rust (stable)
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cargo fmt check
+        run: cargo fmt --check
+
+      - name: Cargo clippy
+        run: cargo clippy --features extension-module -- -D warnings

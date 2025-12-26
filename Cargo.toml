@@ -10,6 +10,7 @@ members = [
     "bindings/python",
     "bindings/dotnet",
     "bindings/rust",
+    "bindings/ruby/ext/turso",
     "cli",
     "core",
     "extensions/completion",
