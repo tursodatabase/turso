@@ -140,30 +140,36 @@ pub enum CompletionError {
     ChecksumNotEnabled,
 }
 
+#[cold]
+// makes all branches that return errors marked as unlikely
+pub(crate) const fn cold_return<T>(v: T) -> T {
+    v
+}
+
 #[macro_export]
 macro_rules! bail_parse_error {
     ($($arg:tt)*) => {
-        return Err($crate::error::LimboError::ParseError(format!($($arg)*)))
+        return crate::error::cold_return(Err($crate::error::LimboError::ParseError(format!($($arg)*))))
     };
 }
 
 #[macro_export]
 macro_rules! bail_corrupt_error {
     ($($arg:tt)*) => {
-        return Err($crate::error::LimboError::Corrupt(format!($($arg)*)))
+        return crate::error::cold_return(Err($crate::error::LimboError::Corrupt(format!($($arg)*))))
     };
 }
 
 #[macro_export]
 macro_rules! bail_constraint_error {
     ($($arg:tt)*) => {
-        return Err($crate::error::LimboError::Constraint(format!($($arg)*)))
+        return crate::error::cold_return(Err($crate::error::LimboError::Constraint(format!($($arg)*))))
     };
 }
 
 impl From<turso_ext::ResultCode> for LimboError {
     fn from(err: turso_ext::ResultCode) -> Self {
-        LimboError::ExtensionError(err.to_string())
+        cold_return(LimboError::ExtensionError(err.to_string()))
     }
 }
 
