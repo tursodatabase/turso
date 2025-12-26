@@ -8,6 +8,7 @@ from .utils import TursoServer
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s", force=True)
 
+
 @pytest.mark.asyncio
 async def test_bootstrap():
     with TursoServer() as server:
@@ -66,6 +67,7 @@ async def test_push():
         r2 = server.db_sql("SELECT * FROM t")
         assert r2 == [["hello"], ["turso"], ["sync"], ["push works"]]
 
+
 @pytest.mark.asyncio
 async def test_checkpoint():
     # turso.setup_logging(level=logging.DEBUG)
@@ -109,7 +111,7 @@ async def test_partial_sync():
             ":memory:",
             remote_url=server.db_url(),
             partial_sync_opts=turso.aio.sync.PartialSyncOpts(
-                bootstrap_strategy=turso.aio.sync.PartialSyncPrefixBootstrap(length=128*1024),
+                bootstrap_strategy=turso.aio.sync.PartialSyncPrefixBootstrap(length=128 * 1024),
             ),
         )
         assert await (await conn_partial.execute("SELECT LENGTH(x) FROM t LIMIT 1")).fetchall() == [(1024,)]
@@ -119,6 +121,7 @@ async def test_partial_sync():
         assert await (await conn_partial.execute("SELECT SUM(LENGTH(x)) FROM t")).fetchall() == [(2000 * 1024,)]
         print(time.time() - start)
         assert (await conn_partial.stats()).network_received_bytes > 2000 * 1024
+
 
 @pytest.mark.asyncio
 async def test_partial_sync_segment_size():
@@ -137,7 +140,7 @@ async def test_partial_sync_segment_size():
             ":memory:",
             remote_url=server.db_url(),
             partial_sync_opts=turso.aio.sync.PartialSyncOpts(
-                bootstrap_strategy=turso.aio.sync.PartialSyncPrefixBootstrap(length=128*1024),
+                bootstrap_strategy=turso.aio.sync.PartialSyncPrefixBootstrap(length=128 * 1024),
                 segment_size=4 * 1024,
             ),
         )
@@ -148,6 +151,7 @@ async def test_partial_sync_segment_size():
         assert await (await conn_partial.execute("SELECT SUM(LENGTH(x)) FROM t")).fetchall() == [(256 * 1024,)]
         print(time.time() - start)
         assert (await conn_partial.stats()).network_received_bytes > 256 * 1024
+
 
 @pytest.mark.asyncio
 async def test_partial_sync_prefetch():
@@ -167,7 +171,7 @@ async def test_partial_sync_prefetch():
             ":memory:",
             remote_url=server.db_url(),
             partial_sync_opts=turso.aio.sync.PartialSyncOpts(
-                bootstrap_strategy=turso.aio.sync.PartialSyncPrefixBootstrap(length=128*1024),
+                bootstrap_strategy=turso.aio.sync.PartialSyncPrefixBootstrap(length=128 * 1024),
                 segment_size=4 * 1024,
                 prefetch=True,
             ),

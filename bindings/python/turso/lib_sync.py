@@ -40,11 +40,13 @@ class PartialSyncQueryBootstrap:
     # Bootstraps DB by fetching pages touched by given SQL query on server
     query: str
 
+
 @dataclass
 class PartialSyncOpts:
     bootstrap_strategy: Union[PartialSyncPrefixBootstrap, PartialSyncQueryBootstrap]
     segment_size: Optional[int] = None
     prefetch: Optional[bool] = None
+
 
 class _HttpContext:
     """
@@ -54,7 +56,7 @@ class _HttpContext:
 
     def __init__(
         self,
-        remote_url: Union[str, Callable[[], Optional[str]]],
+        remote_url: Optional[Union[str, Callable[[], Optional[str]]]],
         auth_token: Optional[Union[str, Callable[[], Optional[str]]]],
         client_name: str,
     ) -> None:
@@ -67,11 +69,8 @@ class _HttpContext:
             return v()
         return v
 
-    def base_url(self) -> str:
-        url = self._eval(self.remote_url)
-        if not url:
-            raise RuntimeError("remote_url is not available")
-        return url
+    def base_url(self) -> Optional[str]:
+        return self._eval(self.remote_url)
 
     def token(self) -> Optional[str]:
         if self.auth_token is None:
@@ -131,7 +130,11 @@ def _process_http_item(
         return
 
     # Build full URL
-    url = _join_url(base_url, path)
+    url = base_url if base_url else req_kind.url
+    if not url:
+        io_item.poison(f"remote url unavailable: {e}")
+        raise RuntimeError("remote_url is not available")
+    url = _join_url(url, path)
 
     # Build request
     request = urllib.request.Request(url=url, data=body, method=method)
@@ -403,7 +406,7 @@ class ConnectionSync(_Connection):
 
 def connect_sync(
     path: str,
-    remote_url: Union[str, Callable[[], Optional[str]]],
+    remote_url: Optional[Union[str, Callable[[], Optional[str]]]] = None,
     *,
     auth_token: Optional[Union[str, Callable[[], Optional[str]]]] = None,
     client_name: Optional[str] = None,
@@ -427,7 +430,7 @@ def connect_sync(
     """
     # Resolve client name
     cname = client_name or "turso-sync-py"
-    if remote_url.startswith("libsql://"):
+    if remote_url and remote_url.startswith("libsql://"):
         remote_url = remote_url.replace("libsql://", "https://", 1)
     http_ctx = _HttpContext(remote_url=remote_url, auth_token=auth_token, client_name=cname)
 
@@ -448,6 +451,7 @@ def connect_sync(
 
     sync_cfg = PyTursoSyncDatabaseConfig(
         path=path,
+        remote_url=remote_url,
         client_name=cname,
         long_poll_timeout_ms=long_poll_timeout_ms,
         bootstrap_if_empty=bootstrap_if_empty,
@@ -456,8 +460,10 @@ def connect_sync(
             bootstrap_strategy_prefix=prefix_len,
             bootstrap_strategy_query=query_str,
             segment_size=partial_sync_opts.segment_size,
-            prefetch=partial_sync_opts.prefetch
-        ) if partial_sync_opts is not None else None,
+            prefetch=partial_sync_opts.prefetch,
+        )
+        if partial_sync_opts is not None
+        else None,
     )
 
     # Create sync database holder

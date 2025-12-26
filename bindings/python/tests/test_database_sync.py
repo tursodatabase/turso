@@ -120,6 +120,7 @@ def test_partial_sync():
         print(time.time() - start)
         assert conn_partial.stats().network_received_bytes > 2000 * 1024
 
+
 def test_partial_sync_segment_size():
     # turso.setup_logging(level=logging.DEBUG)
 
@@ -147,6 +148,7 @@ def test_partial_sync_segment_size():
         assert conn_partial.execute("SELECT SUM(LENGTH(x)) FROM t").fetchall() == [(256 * 1024,)]
         print(time.time() - start)
         assert conn_partial.stats().network_received_bytes > 256 * 1024
+
 
 def test_partial_sync_prefetch():
     # turso.setup_logging(level=logging.DEBUG)
@@ -177,12 +179,14 @@ def test_partial_sync_prefetch():
         print(time.time() - start)
         assert conn_partial.stats().network_received_bytes > 2000 * 1024
 
+
 def run_full(path: str, remote_url: str, barrier: any):
     barrier.wait()
     try:
         print(turso.sync.connect(path, remote_url=remote_url))
     except Exception as e:
         print("valid error", e, type(e), isinstance(e, turso.Error), turso.Error)
+
 
 def test_bootstrap_concurrency():
     # turso.setup_logging(level=logging.DEBUG)
@@ -206,3 +210,24 @@ def test_bootstrap_concurrency():
 
             assert t1.exitcode == 0
             assert t2.exitcode == 0
+
+def test_configuration_persistence():
+    with TursoServer() as server:
+        server.db_sql("CREATE TABLE t(x)")
+        server.db_sql("INSERT INTO t VALUES (42)")
+
+        with tempfile.TemporaryDirectory(prefix="pyturso-") as dir:
+            path = os.path.join(dir, "local.db")
+            print(path)
+            conn1 = turso.sync.connect(path, remote_url=server.db_url())
+            assert conn1.execute("SELECT * FROM t").fetchall() == [(42,)]
+            conn1.close()
+
+            server.db_sql("INSERT INTO t VALUES (43)")
+
+            assert 'http://localhost' in open(f'{path}-info', 'r').read()
+
+            conn2 = turso.sync.connect(path)
+            conn2.pull()
+            assert conn2.execute("SELECT * FROM t").fetchall() == [(42,), (43,)]
+            conn2.close()
