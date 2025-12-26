@@ -1955,6 +1955,7 @@ fn emit_pk_uniqueness_check(
 
 /// Emit bytecode to check index uniqueness constraint.
 /// Handles partial index predicates, ON REPLACE, UPSERT routing, and non-unique indexes.
+#[allow(clippy::too_many_arguments)]
 fn emit_index_uniqueness_check(
     program: &mut ProgramBuilder,
     ctx: &mut InsertEmitCtx,
@@ -2041,6 +2042,7 @@ fn emit_index_uniqueness_check(
 }
 
 /// Emit bytecode for unique index conflict detection and handling.
+#[allow(clippy::too_many_arguments)]
 fn emit_unique_index_check(
     program: &mut ProgramBuilder,
     ctx: &mut InsertEmitCtx,
