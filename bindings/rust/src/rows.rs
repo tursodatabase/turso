@@ -91,7 +91,7 @@ impl Row {
         let val = &self
             .values
             .get(idx)
-            .ok_or(Error::SqlExecutionFailure("invalid row index".to_string()))?;
+            .ok_or_else(Error::SqlExecutionFailure("invalid row index".to_string()))?;
         match val {
             turso_core::Value::Integer(i) => Ok(Value::Integer(*i)),
             turso_core::Value::Null => Ok(Value::Null),
@@ -108,7 +108,7 @@ impl Row {
         let val = self
             .values
             .get(idx)
-            .ok_or(Error::SqlExecutionFailure("invalid row index".to_string()))?;
+            .ok_or_else(Error::SqlExecutionFailure("invalid row index".to_string()))?;
         T::from_sql(val.clone()).map_err(|err| Error::ConversionFailure(err.to_string()))
     }
 
