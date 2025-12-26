@@ -1663,64 +1663,216 @@ pub fn fire_fk_update_actions(
     Ok(())
 }
 
-/// Emit FK check for DROP TABLE.
-/// For each child table with an FK referencing the dropped table,
-/// scan to find any row where ALL FK columns are non-NULL.
-/// If found, emit HALT with FK constraint error.
-/// SQLite allows DROP TABLE when child FK values are NULL (no actual reference).
+/// Emit pre-DROP FK checks for a table.
+///
+/// SQLite's algorithm:
+/// 1. Collect all parent rowids into a RowSet
+/// 2. For each parent rowid:
+///    - Scan child table looking for rows where FK column matches parent rowid
+///    - Increment FkCounter for each match found
+/// 3. After processing all parent rows, check FkIfZero
+///    - If FkCounter > 0, halt with FK constraint error
+///
+/// Only fails if a child row actually references an existing parent row being deleted,
+/// correctly handles orphaned FK values.
 pub fn emit_fk_drop_table_check(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     parent_table_name: &str,
 ) -> Result<()> {
-    for fk_ref in resolver
+    let parent_tbl = resolver
         .schema
-        .resolved_fks_referencing(parent_table_name)?
-    {
+        .get_btree_table(parent_table_name)
+        .ok_or_else(|| {
+            LimboError::InternalError(format!("parent table {parent_table_name} not found"))
+        })?;
+
+    // Get all FK references to this parent table
+    let fk_refs = resolver
+        .schema
+        .resolved_fks_referencing(parent_table_name)?;
+
+    if fk_refs.is_empty() {
+        return Ok(());
+    }
+
+    // Collect all parent rowids into a RowSet
+    // r[rowset_reg] = NULL (initializes RowSet)
+    let rowset_reg = program.alloc_register();
+    program.emit_null(rowset_reg, None);
+
+    let parent_cur = open_read_table(program, &parent_tbl);
+    let collect_done = program.allocate_label();
+
+    program.emit_insn(Insn::Rewind {
+        cursor_id: parent_cur,
+        pc_if_empty: collect_done,
+    });
+
+    let collect_loop = program.allocate_label();
+    program.preassign_label_to_next_insn(collect_loop);
+
+    // Get parent rowid and add to RowSet
+    let parent_rowid_reg = program.alloc_register();
+    program.emit_insn(Insn::RowId {
+        cursor_id: parent_cur,
+        dest: parent_rowid_reg,
+    });
+    program.emit_insn(Insn::RowSetAdd {
+        rowset_reg,
+        value_reg: parent_rowid_reg,
+    });
+
+    program.emit_insn(Insn::Next {
+        cursor_id: parent_cur,
+        pc_if_next: collect_loop,
+    });
+
+    program.preassign_label_to_next_insn(collect_done);
+    program.emit_insn(Insn::Close {
+        cursor_id: parent_cur,
+    });
+
+    // For each parent rowid, check if any child references it
+    let parent_write_cur = program.alloc_cursor_id(CursorType::BTreeTable(parent_tbl.clone()));
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id: parent_write_cur,
+        root_page: parent_tbl.root_page.into(),
+        db: 0,
+    });
+
+    let rowset_done = program.allocate_label();
+    let rowset_loop = program.allocate_label();
+    program.preassign_label_to_next_insn(rowset_loop);
+    // Read next rowid from RowSet
+    let current_rowid_reg = program.alloc_register();
+    program.emit_insn(Insn::RowSetRead {
+        rowset_reg,
+        pc_if_empty: rowset_done,
+        dest_reg: current_rowid_reg,
+    });
+
+    // Verify row still exists (NotExists jumps if not found)
+    let skip_row = program.allocate_label();
+    program.emit_insn(Insn::NotExists {
+        cursor: parent_write_cur,
+        rowid_reg: current_rowid_reg,
+        target_pc: skip_row,
+    });
+
+    // For each FK reference, scan child table for matching rows
+    for fk_ref in &fk_refs {
         let child_tbl = &fk_ref.child_table;
         let child_cols = &fk_ref.fk.child_columns;
 
-        // Open child table for reading
-        let ccur = open_read_table(program, child_tbl);
-        let done = program.allocate_label();
+        // Determine which parent column(s) are referenced
+        let parent_cols: Vec<String> = if fk_ref.fk.parent_columns.is_empty() {
+            // If no parent columns specified, use primary key
+            parent_tbl
+                .primary_key_columns
+                .iter()
+                .map(|(n, _)| n.clone())
+                .collect()
+        } else {
+            fk_ref.fk.parent_columns.clone()
+        };
+        let ncols = parent_cols.len();
+
+        // Build the parent key vector from the current parent row
+        let parent_key_start = program.alloc_registers(ncols);
+        build_parent_key(
+            program,
+            &parent_tbl,
+            &parent_cols,
+            parent_write_cur,
+            current_rowid_reg,
+            parent_key_start,
+        )?;
+
+        // Scan child table for matching rows
+        let child_cur = open_read_table(program, child_tbl);
+        let child_done = program.allocate_label();
+
         program.emit_insn(Insn::Rewind {
-            cursor_id: ccur,
-            pc_if_empty: done,
+            cursor_id: child_cur,
+            pc_if_empty: child_done,
         });
 
-        let loop_top = program.allocate_label();
-        program.preassign_label_to_next_insn(loop_top);
-        let next_row = program.allocate_label();
+        let child_loop = program.allocate_label();
+        program.preassign_label_to_next_insn(child_loop);
+        let child_next = program.allocate_label();
 
-        // Check each FK column, if ANY is NULL, skip this row (no reference)
-        // Only if ALL FK columns are non-NULL do we have a violation
-        for cname in child_cols.iter() {
+        // Compare each FK column to corresponding parent key column
+        // All columns must match for a violation
+        for (i, cname) in child_cols.iter().enumerate() {
             let (pos, _) = child_tbl
                 .get_column(cname)
                 .ok_or_else(|| LimboError::InternalError(format!("child col {cname} missing")))?;
-            let tmp = program.alloc_register();
+
+            let child_val_reg = program.alloc_register();
             program.emit_insn(Insn::Column {
-                cursor_id: ccur,
+                cursor_id: child_cur,
                 column: pos,
-                dest: tmp,
+                dest: child_val_reg,
                 default: None,
             });
-            // If this column is NULL, skip to next row
+            // If child FK column is NULL, skip (no reference)
             program.emit_insn(Insn::IsNull {
-                reg: tmp,
-                target_pc: next_row,
+                reg: child_val_reg,
+                target_pc: child_next,
+            });
+
+            // Compare child FK column to corresponding parent key column
+            program.emit_insn(Insn::Ne {
+                lhs: child_val_reg,
+                rhs: parent_key_start + i,
+                target_pc: child_next,
+                flags: CmpInsFlags::default().jump_if_null(),
+                collation: Some(CollationSeq::Binary),
             });
         }
 
-        // If we reach here, ALL FK columns are non-NULL: this is a violation
-        emit_fk_restrict_halt(program)?;
-        program.preassign_label_to_next_insn(next_row);
-        program.emit_insn(Insn::Next {
-            cursor_id: ccur,
-            pc_if_next: loop_top,
+        // If we reach here, all FK columns match: increment violation counter
+        program.emit_insn(Insn::FkCounter {
+            increment_value: 1,
+            deferred: false,
         });
-        program.preassign_label_to_next_insn(done);
-        program.emit_insn(Insn::Close { cursor_id: ccur });
+
+        program.preassign_label_to_next_insn(child_next);
+        program.emit_insn(Insn::Next {
+            cursor_id: child_cur,
+            pc_if_next: child_loop,
+        });
+
+        program.preassign_label_to_next_insn(child_done);
+        program.emit_insn(Insn::Close {
+            cursor_id: child_cur,
+        });
     }
+
+    // Note: SQLite deletes the parent row here, but we skip that since
+    // the actual deletion happens later in the DROP TABLE logic
+    program.preassign_label_to_next_insn(skip_row);
+    program.emit_insn(Insn::Goto {
+        target_pc: rowset_loop,
+    });
+
+    // After processing all rows, check if there were any violations
+    program.preassign_label_to_next_insn(rowset_done);
+    program.emit_insn(Insn::Close {
+        cursor_id: parent_write_cur,
+    });
+
+    // FkIfZero: if counter == 0, skip the halt
+    let no_violations = program.allocate_label();
+    program.emit_insn(Insn::FkIfZero {
+        deferred: false,
+        target_pc: no_violations,
+    });
+
+    // There were violations, halt with FK error
+    emit_fk_restrict_halt(program)?;
+    program.preassign_label_to_next_insn(no_violations);
+
     Ok(())
 }
