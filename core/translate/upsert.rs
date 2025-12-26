@@ -372,7 +372,7 @@ pub fn emit_upsert(
     program.emit_insn(Insn::SeekRowid {
         cursor_id: ctx.cursor_id,
         src_reg: ctx.conflict_rowid_reg,
-        target_pc: ctx.row_done_label,
+        target_pc: ctx.loop_labels.row_done,
     });
     let num_cols = ctx.table.columns.len();
     let current_start = program.alloc_registers(num_cols);
@@ -428,7 +428,7 @@ pub fn emit_upsert(
         translate_expr(program, None, pred, pr, resolver)?;
         program.emit_insn(Insn::IfNot {
             reg: pr,
-            target_pc: ctx.row_done_label,
+            target_pc: ctx.loop_labels.row_done,
             jump_if_null: true,
         });
     }
@@ -542,7 +542,7 @@ pub fn emit_upsert(
             program.emit_insn(Insn::NotExists {
                 cursor: ctx.cursor_id,
                 rowid_reg: ctx.conflict_rowid_reg,
-                target_pc: ctx.row_done_label,
+                target_pc: ctx.loop_labels.row_done,
             });
 
             let has_relevant_after_triggers = get_relevant_triggers_type_and_time(
@@ -1064,7 +1064,7 @@ pub fn emit_upsert(
     }
 
     program.emit_insn(Insn::Goto {
-        target_pc: ctx.row_done_label,
+        target_pc: ctx.loop_labels.row_done,
     });
     Ok(())
 }
