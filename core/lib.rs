@@ -2020,11 +2020,13 @@ impl Connection {
 
     /// Create a point-in-time snapshot of the database by copying the database file.
     ///
-    /// It checkpoints and keeps the lock after checkpointing to avoid race window between
-    /// checkpoint completion and file copy operation where concurrent writers could modify
-    /// the database.
+    /// This function:
+    /// 1. Performs a TRUNCATE checkpoint to flush all WAL data to the database file
+    /// 2. Acquires a read lock to prevent other checkpoints during copy
+    /// 3. Copies the database file (new writes go to WAL, not DB file)
+    /// 4. Releases the read lock
     #[cfg(feature = "fs")]
-    pub fn _snapshot_copy_file(self: &Arc<Self>, output_path: &str) -> Result<()> {
+    fn _snapshot_copy_file(self: &Arc<Self>, output_path: &str) -> Result<()> {
         use crate::util::MEMORY_PATH;
         use std::path::Path;
 
@@ -2059,22 +2061,35 @@ impl Connection {
         }
 
         let pager = self.pager.load();
-        let result = (|| -> Result<()> {
-            // Checkpoint and keep the lock
-            let _res = pager.blocking_checkpoint_keep_lock(
-                CheckpointMode::Truncate {
-                    upper_bound_inclusive: None,
-                },
-                self.get_sync_mode(),
-            )?;
+        let Some(wal) = pager.wal.as_ref() else {
+            return Err(LimboError::InternalError(
+                "Cannot snapshot database without WAL".to_string(),
+            ));
+        };
 
+        // TRUNCATE checkpoint - flushes all WAL data to DB file and empties WAL
+        let _ = pager.blocking_checkpoint(
+            CheckpointMode::Truncate {
+                upper_bound_inclusive: None,
+            },
+            self.get_sync_mode(),
+        )?;
+
+        // Acquire read lock - prevents other checkpoints during copy
+        // After TRUNCATE, DB file is complete. New writes go to WAL only, not DB file.
+        pager.begin_read_tx()?;
+
+        // Copy the database file
+        let result = (|| -> Result<()> {
             let source_path = Path::new(&self.db.path);
             std::fs::copy(source_path, path).map_err(|e| {
                 LimboError::InternalError(format!("Failed to copy database file: {e}"))
             })?;
-
-            Ok(()) // lock is dropped here when _res is dropped here
+            Ok(())
         })();
+
+        // Release read lock
+        wal.end_read_tx();
 
         result
     }
