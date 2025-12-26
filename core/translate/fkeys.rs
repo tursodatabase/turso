@@ -1666,12 +1666,11 @@ pub fn fire_fk_update_actions(
 /// Emit pre-DROP FK checks for a table.
 ///
 /// SQLite's algorithm:
-/// 1. Collect all parent rowids into a RowSet
+/// 1. Collect all parent rowids into a RowSet for iteration
 /// 2. For each parent rowid:
-///    - Scan child table looking for rows where FK column matches parent rowid
+///    - Seek to parent row and extract parent key column values
+///    - Scan child table looking for rows where FK columns match parent key values
 ///    - Increment FkCounter for each match found
-/// 3. After processing all parent rows, check FkIfZero
-///    - If FkCounter > 0, halt with FK constraint error
 ///
 /// Only fails if a child row actually references an existing parent row being deleted,
 /// correctly handles orphaned FK values.
