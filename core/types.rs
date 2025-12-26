@@ -1975,7 +1975,7 @@ where
         return compare_records_generic(serialized, unpacked, index_info, 0, tie_breaker);
     }
 
-    let (header_size, offset_1st_serialtype) = read_varint(payload)?;
+    let (header_size, offset_1st_serialtype) = read_varint_fast(payload)?;
     let header_size = header_size as usize;
 
     if payload.len() < header_size {
@@ -1986,7 +1986,7 @@ where
         )));
     }
 
-    let (first_serial_type, _) = read_varint(&payload[offset_1st_serialtype..])?;
+    let (first_serial_type, _) = read_varint_fast(&payload[offset_1st_serialtype..])?;
 
     let serialtype_is_integer = matches!(first_serial_type, 1..=6 | 8 | 9);
     if !serialtype_is_integer {
@@ -2070,7 +2070,7 @@ where
         return compare_records_generic(serialized, unpacked, index_info, 0, tie_breaker);
     }
 
-    let (header_size, offset_1st_serialtype) = read_varint(payload)?;
+    let (header_size, offset_1st_serialtype) = read_varint_fast(payload)?;
     let header_size = header_size as usize;
 
     if payload.len() < header_size {
@@ -2081,7 +2081,7 @@ where
         )));
     }
 
-    let (first_serial_type, _) = read_varint(&payload[offset_1st_serialtype..])?;
+    let (first_serial_type, _) = read_varint_fast(&payload[offset_1st_serialtype..])?;
 
     let serialtype_is_string = first_serial_type >= 13 && (first_serial_type & 1) == 1;
     if !serialtype_is_string {
@@ -2182,7 +2182,7 @@ where
         return Ok(std::cmp::Ordering::Less);
     }
 
-    let (header_size, mut header_pos) = read_varint(payload)?;
+    let (header_size, mut header_pos) = read_varint_fast(payload)?;
     let header_end = header_size as usize;
     debug_assert!(header_end <= payload.len());
 
@@ -2194,7 +2194,7 @@ where
             break;
         }
 
-        let (serial_type_raw, bytes_read) = read_varint(&payload[header_pos..])?;
+        let (serial_type_raw, bytes_read) = read_varint_fast(&payload[header_pos..])?;
         header_pos += bytes_read;
 
         let serial_type = SerialType::try_from(serial_type_raw)?;
@@ -2215,7 +2215,7 @@ where
         if field_idx >= field_limit || header_pos >= header_end {
             break;
         }
-        let (serial_type_raw, bytes_read) = read_varint(&payload[header_pos..])?;
+        let (serial_type_raw, bytes_read) = read_varint_fast(&payload[header_pos..])?;
         header_pos += bytes_read;
 
         let serial_type = SerialType::try_from(serial_type_raw)?;
