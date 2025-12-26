@@ -42,6 +42,9 @@ mod rows;
 pub mod transaction;
 pub mod value;
 
+#[cfg(feature = "sync")]
+pub mod sync;
+
 pub use connection::Connection;
 pub use value::Value;
 
@@ -180,17 +183,19 @@ impl Database {
     /// Connect to the database.
     pub fn connect(&self) -> Result<Connection> {
         let conn = self.inner.connect()?;
-        Ok(Connection::create(conn))
+        Ok(Connection::create(conn, None))
     }
 }
 
 /// A prepared statement.
+#[derive(Clone)]
 pub struct Statement {
+    conn: Connection,
     inner: Arc<Mutex<Box<turso_sdk_kit::rsapi::TursoStatement>>>,
 }
 
 struct Execute {
-    stmt: Arc<Mutex<Box<turso_sdk_kit::rsapi::TursoStatement>>>,
+    stmt: Statement,
 }
 
 unsafe impl Send for Execute {}
@@ -203,26 +208,48 @@ impl Future for Execute {
         self: std::pin::Pin<&mut Self>,
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Self::Output> {
-        let mut stmt = self.stmt.lock().unwrap();
-        match stmt.step(Some(cx.waker())) {
-            Ok(turso_sdk_kit::rsapi::TursoStatusCode::Row) => Poll::Ready(Err(Error::Misuse(
-                "unexpected row during execution".to_string(),
-            ))),
-            Ok(turso_sdk_kit::rsapi::TursoStatusCode::Done) => {
-                let changes = stmt.n_change();
-                assert!(changes >= 0);
-                Poll::Ready(Ok(changes as u64))
+        match self.stmt.step(None, cx)? {
+            Poll::Ready(_) => {
+                let n_change = self.stmt.inner.lock().unwrap().n_change();
+                Poll::Ready(Ok(n_change as u64))
             }
-            Ok(turso_sdk_kit::rsapi::TursoStatusCode::Io) => {
-                stmt.run_io()?;
-                Poll::Pending
-            }
-            Err(err) => Poll::Ready(Err(err.into())),
+            Poll::Pending => Poll::Pending,
         }
     }
 }
 
 impl Statement {
+    fn step(
+        &self,
+        columns: Option<usize>,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Result<Option<Row>>> {
+        let mut stmt = self.inner.lock().unwrap();
+        match stmt.step(Some(cx.waker()))? {
+            turso_sdk_kit::rsapi::TursoStatusCode::Row => {
+                if let Some(columns) = columns {
+                    let mut values = Vec::with_capacity(columns);
+                    for i in 0..columns {
+                        let value = stmt.row_value(i)?;
+                        values.push(value.to_owned());
+                    }
+                    Poll::Ready(Ok(Some(Row { values })))
+                } else {
+                    Poll::Ready(Err(Error::Misuse(
+                        "unexpected row during execution".to_string(),
+                    )))
+                }
+            }
+            turso_sdk_kit::rsapi::TursoStatusCode::Done => Poll::Ready(Ok(None)),
+            turso_sdk_kit::rsapi::TursoStatusCode::Io => {
+                stmt.run_io()?;
+                if let Some(extra_io) = &self.conn.extra_io {
+                    extra_io(cx.waker().clone())?;
+                }
+                Poll::Pending
+            }
+        }
+    }
     /// Query the database with this prepared statement.
     pub async fn query(&mut self, params: impl IntoParams) -> Result<Rows> {
         let mut stmt = self.inner.lock().unwrap();
@@ -241,7 +268,7 @@ impl Statement {
                 }
             }
         }
-        let rows = Rows::new(self.inner.clone());
+        let rows = Rows::new(self.clone());
         Ok(rows)
     }
 
@@ -269,9 +296,7 @@ impl Statement {
             }
         }
 
-        let execute = Execute {
-            stmt: self.inner.clone(),
-        };
+        let execute = Execute { stmt: self.clone() };
         execute.await
     }
 

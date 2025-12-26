@@ -1,34 +1,21 @@
-use crate::{Error, Result, Value};
+use crate::{Error, Result, Statement, Value};
 use std::fmt::Debug;
 use std::future::Future;
-use std::sync::{Arc, Mutex};
-use std::task::Poll;
 
 /// Results of a prepared statement query.
 pub struct Rows {
-    inner: Arc<Mutex<Box<turso_sdk_kit::rsapi::TursoStatement>>>,
+    inner: Statement,
 }
-
-impl Clone for Rows {
-    fn clone(&self) -> Self {
-        Self {
-            inner: Arc::clone(&self.inner),
-        }
-    }
-}
-
-unsafe impl Send for Rows {}
-unsafe impl Sync for Rows {}
 
 impl Rows {
-    pub(crate) fn new(inner: Arc<Mutex<Box<turso_sdk_kit::rsapi::TursoStatement>>>) -> Self {
+    pub(crate) fn new(inner: Statement) -> Self {
         Self { inner }
     }
     /// Fetch the next row of this result set.
     pub async fn next(&mut self) -> Result<Option<Row>> {
         struct Next {
             columns: usize,
-            stmt: Arc<Mutex<Box<turso_sdk_kit::rsapi::TursoStatement>>>,
+            stmt: Statement,
         }
 
         impl Future for Next {
@@ -38,29 +25,14 @@ impl Rows {
                 self: std::pin::Pin<&mut Self>,
                 cx: &mut std::task::Context<'_>,
             ) -> std::task::Poll<Self::Output> {
-                let mut stmt = self.stmt.lock().unwrap();
-                match stmt.step(Some(cx.waker()))? {
-                    turso_sdk_kit::rsapi::TursoStatusCode::Row => {
-                        let mut values = Vec::with_capacity(self.columns);
-                        for i in 0..self.columns {
-                            let value = stmt.row_value(i)?;
-                            values.push(value.to_owned());
-                        }
-                        Poll::Ready(Ok(Some(Row { values })))
-                    }
-                    turso_sdk_kit::rsapi::TursoStatusCode::Done => Poll::Ready(Ok(None)),
-                    turso_sdk_kit::rsapi::TursoStatusCode::Io => {
-                        stmt.run_io()?;
-                        Poll::Pending
-                    }
-                }
+                self.stmt.step(Some(self.columns), cx)
             }
         }
 
         unsafe impl Send for Next {}
 
         let next = Next {
-            columns: self.inner.lock().unwrap().column_count(),
+            columns: self.inner.inner.lock().unwrap().column_count(),
             stmt: self.inner.clone(),
         };
 
@@ -69,13 +41,10 @@ impl Rows {
 }
 
 /// Query result row.
-#[derive(Debug)]
+#[derive(Debug, PartialEq)]
 pub struct Row {
     pub(crate) values: Vec<turso_sdk_kit::rsapi::Value>,
 }
-
-unsafe impl Send for Row {}
-unsafe impl Sync for Row {}
 
 impl Row {
     pub fn get_value(&self, index: usize) -> Result<Value> {

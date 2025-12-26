@@ -23,11 +23,11 @@ pub struct TursoDatabaseSyncConfig {
     pub bootstrap_if_empty: bool,
     pub reserved_bytes: Option<usize>,
     pub partial_sync_opts: Option<turso_sync_engine::types::PartialSyncOpts>,
-    pub db_io: Option<Arc<dyn IO>>,
 }
 
 pub type PartialSyncOpts = turso_sync_engine::types::PartialSyncOpts;
 pub type PartialBootstrapStrategy = turso_sync_engine::types::PartialBootstrapStrategy;
+pub type DatabaseSyncStats = turso_sync_engine::types::SyncEngineStats;
 
 impl TursoDatabaseSyncConfig {
     /// helper method to restore [TursoDatabaseSyncConfig] instance from C representation
@@ -81,7 +81,6 @@ impl TursoDatabaseSyncConfig {
             } else {
                 None
             },
-            db_io: None,
         })
     }
 }
@@ -152,9 +151,7 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static> TursoDatabaseSync<TBytes> {
         };
         let is_memory = db_config.path == ":memory:";
         let db_io: Arc<dyn IO> =
-            if let Some(io) = sync_config.db_io.as_ref() {
-                io.clone()
-            } else if is_memory {
+            if is_memory {
                 Arc::new(MemoryIO::new())
             } else {
                 #[cfg(target_os = "linux")]
