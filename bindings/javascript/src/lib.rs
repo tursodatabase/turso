@@ -134,7 +134,7 @@ fn step_sync(stmt: &Arc<RefCell<turso_core::Statement>>) -> napi::Result<u32> {
         Ok(turso_core::StepResult::Interrupt) => {
             Err(create_generic_error("statement was interrupted"))
         }
-        Ok(turso_core::StepResult::Busy) => Err(create_generic_error("database is busy")),
+        Ok(turso_core::StepResult::Busy) => Err(create_generic_error("database is locked")),
         Err(e) => Err(to_generic_error("step failed", e)),
     }
 }

@@ -529,6 +529,9 @@ fn query_pragma(
                 dest: register,
             });
             program.emit_result_row(register, 3);
+            program.add_pragma_result_column("busy".to_string());
+            program.add_pragma_result_column("log".to_string());
+            program.add_pragma_result_column("checkpointed".to_string());
             Ok((program, TransactionMode::None))
         }
         PragmaName::ModuleList => {

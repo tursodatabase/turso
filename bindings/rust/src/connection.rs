@@ -8,8 +8,8 @@ use crate::Statement;
 use std::fmt::Debug;
 use std::sync::atomic::AtomicU8;
 use std::sync::atomic::Ordering;
-use std::sync::MutexGuard;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use std::sync::Mutex;
 pub type Result<T> = std::result::Result<T, Error>;
 
 /// Atomic wrapper for [DropBehavior]
@@ -39,7 +39,7 @@ pub struct Connection {
     /// (Actual connection) out of it and put it back into the ConnectionPool
     /// the only time inner will be None is just before the Connection is freed after the
     /// inner connection has been recyled into the connection pool
-    inner: Option<Arc<Mutex<Arc<turso_core::Connection>>>>,
+    inner: Option<Arc<turso_sdk_kit::rsapi::TursoConnection>>,
     pub(crate) transaction_behavior: TransactionBehavior,
     /// If there is a dangling transaction after it was dropped without being finished,
     /// [Connection::dangling_tx] will be set to the [DropBehavior] of the dangling transaction,
@@ -53,25 +53,19 @@ pub struct Connection {
 
 impl Clone for Connection {
     fn clone(&self) -> Self {
-        let i = self.inner.clone();
-
         Self {
-            inner: i,
-            //inner: Arc::clone(&self.inner),
+            inner: self.inner.clone(),
             transaction_behavior: self.transaction_behavior,
             dangling_tx: AtomicDropBehavior::new(self.dangling_tx.load(Ordering::SeqCst)),
         }
     }
 }
 
-unsafe impl Send for Connection {}
-unsafe impl Sync for Connection {}
-
 impl Connection {
-    pub fn create(conn: Arc<turso_core::Connection>) -> Self {
+    pub fn create(conn: Arc<turso_sdk_kit::rsapi::TursoConnection>) -> Self {
         #[allow(clippy::arc_with_non_send_sync)]
         let connection = Connection {
-            inner: Some(Arc::new(Mutex::new(conn))),
+            inner: Some(conn),
             transaction_behavior: TransactionBehavior::Deferred,
             dangling_tx: AtomicDropBehavior::new(DropBehavior::Ignore),
         };
@@ -115,12 +109,10 @@ impl Connection {
     }
 
     /// get the inner connection
-    fn get_inner_connection(&self) -> Result<MutexGuard<'_, Arc<turso_core::Connection>>> {
+    fn get_inner_connection(&self) -> Result<Arc<turso_sdk_kit::rsapi::TursoConnection>> {
         match &self.inner {
-            Some(inner) => Ok(inner.lock().map_err(|e| Error::MutexError(e.to_string()))?),
-            None => Err(Error::MutexError(
-                "Inner connection can't be none".to_string(),
-            )),
+            Some(inner) => Ok(inner.clone()),
+            None => Err(Error::Misuse("inner connection must be set".to_string())),
         }
     }
 
@@ -134,7 +126,7 @@ impl Connection {
     /// Prepare a SQL statement for later execution.
     pub async fn prepare(&self, sql: &str) -> Result<Statement> {
         let conn = self.get_inner_connection()?;
-        let stmt = conn.prepare(sql)?;
+        let stmt = conn.prepare_single(sql)?;
 
         #[allow(clippy::arc_with_non_send_sync)]
         let statement = Statement {
@@ -146,28 +138,48 @@ impl Connection {
     async fn prepare_execute_batch(&self, sql: impl AsRef<str>) -> Result<()> {
         self.maybe_handle_dangling_tx().await?;
         let conn = self.get_inner_connection()?;
-        conn.prepare_execute_batch(sql)?;
+        let mut sql = sql.as_ref();
+        while let Some((mut stmt, offset)) = conn.prepare_first(sql)? {
+            loop {
+                match stmt.step(None)? {
+                    turso_sdk_kit::rsapi::TursoStatusCode::Done => break,
+                    turso_sdk_kit::rsapi::TursoStatusCode::Row => continue,
+                    turso_sdk_kit::rsapi::TursoStatusCode::Io => stmt.run_io()?,
+                }
+            }
+            sql = &sql[offset..];
+        }
         Ok(())
     }
 
     /// Query a pragma.
     pub fn pragma_query<F>(&self, pragma_name: &str, mut f: F) -> Result<()>
     where
-        F: FnMut(&Row) -> turso_core::Result<()>,
+        F: FnMut(&Row) -> std::result::Result<(), turso_sdk_kit::rsapi::TursoError>,
     {
         let conn = self.get_inner_connection()?;
-        let rows: Vec<Row> = conn
-            .pragma_query(pragma_name)
-            .map_err(|e| Error::SqlExecutionFailure(e.to_string()))?
-            .iter()
-            .map(|row| row.iter().collect::<Row>())
-            .collect();
+        let mut stmt = conn.prepare_single(format!("PRAGMA {pragma_name}"))?;
+        let mut values = Vec::with_capacity(stmt.column_count());
+        loop {
+            match stmt.step(None)? {
+                turso_sdk_kit::rsapi::TursoStatusCode::Done => break,
+                turso_sdk_kit::rsapi::TursoStatusCode::Io => {
+                    stmt.run_io()?;
+                    continue;
+                }
+                turso_sdk_kit::rsapi::TursoStatusCode::Row => {
+                    assert!(values.is_empty());
+                    for i in 0..stmt.column_count() {
+                        values.push(stmt.row_value(i)?.to_owned());
+                    }
+                    let row = Row { values };
+                    f(&row)?;
 
-        rows.iter().try_for_each(|row| {
-            f(row).map_err(|e| {
-                Error::SqlExecutionFailure(format!("Error executing user defined function: {e}"))
-            })
-        })?;
+                    values = row.values;
+                    values.clear();
+                }
+            }
+        }
         Ok(())
     }
 
@@ -178,12 +190,24 @@ impl Connection {
         pragma_value: V,
     ) -> Result<Vec<Row>> {
         let conn = self.get_inner_connection()?;
-        let rows: Vec<Row> = conn
-            .pragma_update(pragma_name, pragma_value)
-            .map_err(|e| Error::SqlExecutionFailure(e.to_string()))?
-            .iter()
-            .map(|row| row.iter().collect::<Row>())
-            .collect();
+        let mut stmt = conn.prepare_single(format!("PRAGMA {pragma_name} = {pragma_value}"))?;
+        let mut rows = Vec::new();
+        loop {
+            match stmt.step(None)? {
+                turso_sdk_kit::rsapi::TursoStatusCode::Done => break,
+                turso_sdk_kit::rsapi::TursoStatusCode::Io => {
+                    stmt.run_io()?;
+                    continue;
+                }
+                turso_sdk_kit::rsapi::TursoStatusCode::Row => {
+                    let mut values = Vec::with_capacity(stmt.column_count());
+                    for i in 0..stmt.column_count() {
+                        values.push(stmt.row_value(i)?.to_owned());
+                    }
+                    rows.push(Row { values });
+                }
+            }
+        }
         Ok(rows)
     }
 
@@ -197,11 +221,7 @@ impl Connection {
     /// This will write the dirty pages to the WAL.
     pub fn cacheflush(&self) -> Result<()> {
         let conn = self.get_inner_connection()?;
-        let completions = conn.cacheflush()?;
-        let pager = conn.get_pager();
-        for c in completions {
-            pager.io.wait_for_completion(c)?;
-        }
+        conn.cacheflush()?;
         Ok(())
     }
 

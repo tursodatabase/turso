@@ -11,12 +11,12 @@ description = "Turso Rust API"
 
 [features]
 default = ["mimalloc"]
-antithesis = ["turso_core/antithesis"]
-tracing_release = ["turso_core/tracing_release"]
+antithesis = ["turso_sdk_kit/antithesis"]
 mimalloc = ["dep:mimalloc"]
 
 [dependencies]
-turso_core = { workspace = true, features = ["io_uring"] }
+turso_sdk_kit = { workspace = true }
+turso_sync_sdk_kit = { workspace = true }
 thiserror = { workspace = true }
 tracing-subscriber.workspace = true
 tracing.workspace = true
