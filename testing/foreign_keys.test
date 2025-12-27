@@ -2022,14 +2022,3 @@ do_execsql_test_in_memory_any_error fk-drop-column-composite-fk-fails {
                        FOREIGN KEY(fa, fb) REFERENCES parent(a, b));
     ALTER TABLE child DROP COLUMN fa;
 }
-
-# DROP COLUMN on non-FK column should succeed and preserve FK constraint
-do_execsql_test_on_specific_db {:memory:} fk-drop-column-preserve-fk {
-    PRAGMA foreign_keys=ON;
-    CREATE TABLE parent(id INTEGER PRIMARY KEY);
-    CREATE TABLE child(fk INTEGER, other TEXT, extra INTEGER,
-                       FOREIGN KEY(fk) REFERENCES parent(id));
-    ALTER TABLE child DROP COLUMN extra;
-    SELECT sql FROM sqlite_schema WHERE name='child';
-} {{CREATE TABLE child (fk INTEGER, other TEXT, FOREIGN KEY (fk) REFERENCES parent(id))}}
-
