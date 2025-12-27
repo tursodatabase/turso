@@ -788,7 +788,7 @@ fn translate_rows_and_open_tables(
     if inserting_multiple_rows {
         let select_result_start_reg = program
             .reg_result_cols_start
-            .unwrap_or(ctx.yield_reg_opt.unwrap() + 1);
+            .unwrap_or_else(|| ctx.yield_reg_opt.unwrap() + 1);
         translate_rows_multiple(
             program,
             insertion,
@@ -1145,7 +1145,7 @@ fn bind_insert(
                 .map(|c| {
                     c.default
                         .clone()
-                        .unwrap_or(Box::new(ast::Expr::Literal(ast::Literal::Null)))
+                        .unwrap_or_else(|| Box::new(ast::Expr::Literal(ast::Literal::Null)))
                 })
                 .collect();
         }
@@ -1470,7 +1470,7 @@ fn init_source_emission<'a>(
             values.extend(table.columns().iter().map(|c| {
                 c.default
                     .clone()
-                    .unwrap_or(Box::new(ast::Expr::Literal(ast::Literal::Null)))
+                    .unwrap_or_else(|| Box::new(ast::Expr::Literal(ast::Literal::Null)))
             }));
             (
                 num_values,

@@ -346,7 +346,7 @@ fn parse_from_clause_table(
                     ast::As::Elided(id) => id,
                 })
                 .map(|id| normalize_ident(id.as_str()))
-                .unwrap_or(format!("subquery_{cur_table_index}"));
+                .unwrap_or_else(|| format!("subquery_{cur_table_index}"));
             table_references.add_joined_table(JoinedTable::new_subquery(
                 identifier,
                 subplan,
