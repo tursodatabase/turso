@@ -25,7 +25,7 @@ struct InnerConnectionPool {
 }
 
 #[derive(Clone)]
-pub(crate) struct ConnectionPool {
+pub struct ConnectionPool {
     inner_pool: Option<InnerConnectionPool>,
 }
 

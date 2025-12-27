@@ -116,9 +116,8 @@ pub struct Builder {
     path: String,
     enable_encryption: bool,
     vfs: Option<String>,
-    encryption_opts: Option<EncryptionOpts>,
-    enable_connection_pool: bool,
     encryption_opts: Option<turso_sdk_kit::rsapi::EncryptionOpts>,
+    enable_connection_pool: bool,
 }
 
 impl Builder {
@@ -171,7 +170,11 @@ impl Builder {
                 db_file: None,
             });
         db.open()?;
-        Ok(Database { inner: db })
+        let cp = Arc::new(ConnectionPool::new(false));
+        Ok(Database {
+            inner: db,
+            connection_pool: cp,
+        })
     }
 }
 
@@ -180,9 +183,8 @@ impl Builder {
 /// The `Database` object points to a database and allows you to connect to it
 #[derive(Clone)]
 pub struct Database {
-    inner: Arc<turso_core::Database>,
-    connection_pool: Arc<ConnectionPool>,
     inner: Arc<turso_sdk_kit::rsapi::TursoDatabase>,
+    connection_pool: Arc<ConnectionPool>,
 }
 
 impl Debug for Database {
@@ -205,7 +207,7 @@ impl Database {
 
     pub fn _connect(&self) -> Result<Connection> {
         let conn = self.inner.connect()?;
-        Ok(Connection::create(conn, self.connection_pool.clone(), None)))
+        Ok(Connection::create(conn, self.connection_pool.clone(), None))
     }
 }
 

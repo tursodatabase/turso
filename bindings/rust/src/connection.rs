@@ -73,6 +73,7 @@ impl Clone for Connection {
 impl Connection {
     pub fn create(
         conn: Arc<turso_sdk_kit::rsapi::TursoConnection>,
+        cp: Arc<ConnectionPool>,
         extra_io: Option<Arc<dyn Fn(Waker) -> Result<()>>>,
     ) -> Self {
         #[allow(clippy::arc_with_non_send_sync)]
