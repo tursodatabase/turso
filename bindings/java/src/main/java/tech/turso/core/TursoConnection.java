@@ -37,7 +37,7 @@ public final class TursoConnection {
 
   private static TursoDB open(String url, String filePath, Properties properties)
       throws SQLException {
-    return TursoDBFactory.open(url, filePath, properties);
+    return TursoDB.create(url, filePath);
   }
 
   public void checkOpen() throws SQLException {
