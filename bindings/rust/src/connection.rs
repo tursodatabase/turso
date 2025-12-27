@@ -1,5 +1,6 @@
 use crate::transaction::DropBehavior;
 use crate::transaction::TransactionBehavior;
+use crate::ConnectionPool;
 use crate::Error;
 use crate::IntoParams;
 use crate::Row;
@@ -50,6 +51,7 @@ pub struct Connection {
     ///
     /// By default, the value is [DropBehavior::Ignore] which effectively does nothing.
     pub(crate) dangling_tx: AtomicDropBehavior,
+    connection_pool: Arc<ConnectionPool>,
     pub(crate) extra_io: Option<Arc<dyn Fn(Waker) -> Result<()>>>,
 }
 
@@ -62,6 +64,7 @@ impl Clone for Connection {
             inner: self.inner.clone(),
             transaction_behavior: self.transaction_behavior,
             dangling_tx: AtomicDropBehavior::new(self.dangling_tx.load(Ordering::SeqCst)),
+            connection_pool: self.connection_pool.clone(),
             extra_io: self.extra_io.clone(),
         }
     }
@@ -70,6 +73,7 @@ impl Clone for Connection {
 impl Connection {
     pub fn create(
         conn: Arc<turso_sdk_kit::rsapi::TursoConnection>,
+        cp: Arc<ConnectionPool>,
         extra_io: Option<Arc<dyn Fn(Waker) -> Result<()>>>,
     ) -> Self {
         #[allow(clippy::arc_with_non_send_sync)]
@@ -77,6 +81,7 @@ impl Connection {
             inner: Some(conn),
             transaction_behavior: TransactionBehavior::Deferred,
             dangling_tx: AtomicDropBehavior::new(DropBehavior::Ignore),
+            connection_pool: cp,
             extra_io,
         };
         connection
@@ -234,5 +239,14 @@ impl Connection {
 impl Debug for Connection {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Connection").finish()
+    }
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        if self.connection_pool.is_enabled() {
+            self.connection_pool.add(self.clone());
+            self.inner = None;
+        }
     }
 }
