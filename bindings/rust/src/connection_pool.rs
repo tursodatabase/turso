@@ -66,10 +66,6 @@ impl ConnectionPool {
     pub(crate) fn add(&self, obj: Connection) {
         if let Some(p) = &self.inner_pool {
             let mut pool = p.pool.lock().unwrap();
-            //if &self.available_connections() >= &pool.capacity() {
-            //    let _ = &pool.reserve(&self.available_connections() * 10);
-            //}
-
             pool.push(obj);
         }
     }
