@@ -1566,23 +1566,15 @@ impl BTreeCursor {
 
         let cur_cell_idx = (min + max) >> 1; // rustc generates extra insns for (min+max)/2 due to them being isize. we know min&max are >=0 here.
         self.stack.set_cell_index(cur_cell_idx as i32);
-        let cell = self
+        
+        let (payload, payload_size, first_overflow_page) = self
             .stack
             .get_page_contents_at_level(old_top_idx)
             .unwrap()
-            .cell_get(cur_cell_idx as usize, self.usable_space())?;
-        let BTreeCell::IndexInteriorCell(IndexInteriorCell {
-            payload,
-            payload_size,
-            first_overflow_page,
-            ..
-        }) = &cell
-        else {
-            unreachable!("unexpected cell type: {:?}", cell);
-        };
+            .cell_index_read_payload_ptr(cur_cell_idx as usize, self.usable_space())?;
 
         if let Some(next_page) = first_overflow_page {
-            let res = self.process_overflow_read(payload, *next_page, *payload_size)?;
+            let res = self.process_overflow_read(payload, next_page, payload_size)?;
             if res.is_io() {
                 return Ok(ControlFlow::Break(res));
             }
@@ -1596,6 +1588,7 @@ impl BTreeCursor {
                 .unwrap()
                 .start_serialization(payload);
         };
+
         let (target_leaf_page_is_in_left_subtree, is_eq) = {
             let record = self.get_immutable_record();
             let record = record.as_ref().unwrap();
@@ -2030,22 +2023,14 @@ impl BTreeCursor {
         let cur_cell_idx = (min + max) >> 1; // rustc generates extra insns for (min+max)/2 due to them being isize. we know min&max are >=0 here.
         self.stack.set_cell_index(cur_cell_idx as i32);
 
-        let cell = self
+        let (payload, payload_size, first_overflow_page) = self
             .stack
             .get_page_contents_at_level(old_top_idx)
             .unwrap()
-            .cell_get(cur_cell_idx as usize, self.usable_space())?;
-        let BTreeCell::IndexLeafCell(IndexLeafCell {
-            payload,
-            first_overflow_page,
-            payload_size,
-        }) = &cell
-        else {
-            unreachable!("unexpected cell type: {:?}", cell);
-        };
+            .cell_index_read_payload_ptr(cur_cell_idx as usize, self.usable_space())?;
 
         if let Some(next_page) = first_overflow_page {
-            let res = self.process_overflow_read(payload, *next_page, *payload_size)?;
+            let res = self.process_overflow_read(payload, next_page, payload_size)?;
             if let IOResult::IO(io) = res {
                 return Ok(ControlFlow::Break(IOResult::IO(io)));
             }
@@ -2059,6 +2044,7 @@ impl BTreeCursor {
                 .unwrap()
                 .start_serialization(payload);
         };
+
         let (cmp, found) = self.compare_with_current_record(
             key_values,
             seek_op,
