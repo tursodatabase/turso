@@ -361,6 +361,11 @@ pub fn emit_query<'a>(
         program.reg_result_cols_start = t_ctx.reg_result_cols_start
     }
 
+    let has_group_by_exprs = plan
+        .group_by
+        .as_ref()
+        .is_some_and(|gb| !gb.exprs.is_empty());
+
     // Initialize cursors and other resources needed for query execution
     if !plan.order_by.is_empty() {
         init_order_by(
@@ -369,22 +374,25 @@ pub fn emit_query<'a>(
             &plan.result_columns,
             &plan.order_by,
             &plan.table_references,
-            plan.group_by.is_some(),
+            has_group_by_exprs,
             plan.distinctness != Distinctness::NonDistinct,
             &plan.aggregates,
         )?;
     }
 
-    if let Some(ref group_by) = plan.group_by {
-        init_group_by(
-            program,
-            t_ctx,
-            group_by,
-            plan,
-            &plan.result_columns,
-            &plan.order_by,
-        )?;
+    if has_group_by_exprs {
+        if let Some(ref group_by) = plan.group_by {
+            init_group_by(
+                program,
+                t_ctx,
+                group_by,
+                plan,
+                &plan.result_columns,
+                &plan.order_by,
+            )?;
+        }
     } else if !plan.aggregates.is_empty() {
+        // Handle aggregation without GROUP BY (or HAVING without GROUP BY)
         // Aggregate registers need to be NULLed at the start because the same registers might be reused on another invocation of a subquery,
         // and if they are not NULLed, the 2nd invocation of the same subquery will have values left over from the first invocation.
         t_ctx.reg_agg_start = Some(program.alloc_registers_and_init_w_null(plan.aggregates.len()));
@@ -458,7 +466,7 @@ pub fn emit_query<'a>(
     let order_by = &plan.order_by;
 
     // Handle GROUP BY and aggregation processing
-    if plan.group_by.is_some() {
+    if has_group_by_exprs {
         let row_source = &t_ctx
             .meta_group_by
             .as_ref()
@@ -469,7 +477,7 @@ pub fn emit_query<'a>(
         }
         group_by_emit_row_phase(program, t_ctx, plan)?;
     } else if !plan.aggregates.is_empty() {
-        // Handle aggregation without GROUP BY
+        // Handle aggregation without GROUP BY (or HAVING without GROUP BY)
         emit_ungrouped_aggregation(program, t_ctx, plan)?;
         // Single row result for aggregates without GROUP BY, so ORDER BY not needed
         order_by_necessary = false;

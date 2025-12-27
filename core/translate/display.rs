@@ -547,10 +547,12 @@ impl ToTokens for SelectPlan {
             }
 
             if let Some(group_by) = &self.group_by {
-                s.append(TokenType::TK_GROUP, None)?;
-                s.append(TokenType::TK_BY, None)?;
+                if !group_by.exprs.is_empty() {
+                    s.append(TokenType::TK_GROUP, None)?;
+                    s.append(TokenType::TK_BY, None)?;
 
-                s.comma(group_by.exprs.iter(), context)?;
+                    s.comma(group_by.exprs.iter(), context)?;
+                }
 
                 // TODO: not sure where I need to place the group_by.sort_order
                 if let Some(having) = &group_by.having {
