@@ -222,7 +222,7 @@ where
         return Value::Null;
     }
     let final_jd = to_julian_day_exact(dt);
-    if final_jd < 0.0 || final_jd >= 5373485.0 {
+    if !is_julian_day_value(final_jd) {
         return Value::Null;
     }
     format_dt(*dt, output_type, subsec_requested)
@@ -672,41 +672,63 @@ fn strip_timezone_suffix(s: &str) -> &str {
         return &s[..s.len() - 1];
     }
 
-    // 2. Check for numeric offsets
-    // Formats: +HH:MM (6 chars), +HHMM (5 chars), +HH (3 chars)
+    let is_valid_tz = |h_str: &str, m_str: &str| -> bool {
+        if let (Ok(h), Ok(m)) = (h_str.parse::<u32>(), m_str.parse::<u32>()) {
+            h <= 14 && m < 60
+        } else {
+            false
+        }
+    };
 
-    // Check +HH:MM or -HH:MM
+    // 2. Check for numeric offsets
+
+    // Check +HH:MM or -HH:MM (length >= 6)
     if s.len() >= 6 {
         let idx = s.len() - 6;
         let c = s.chars().nth(idx).unwrap();
         if (c == '+' || c == '-') && s[idx + 3..].starts_with(':') {
-            // Basic validity check: Are the rest digits?
-            let digits_part = format!("{}{}", &s[idx + 1..idx + 3], &s[idx + 4..]);
-            if digits_part.chars().all(|x| x.is_ascii_digit()) {
+            let h_part = &s[idx + 1..idx + 3];
+            let m_part = &s[idx + 4..];
+
+            // Check digits AND value range
+            if h_part.chars().all(|x| x.is_ascii_digit())
+                && m_part.chars().all(|x| x.is_ascii_digit())
+                && is_valid_tz(h_part, m_part)
+            {
                 return &s[..idx];
             }
         }
     }
 
-    // Check +HHMM or -HHMM
+    // Check +HHMM or -HHMM (length >= 5)
     if s.len() >= 5 {
         let idx = s.len() - 5;
         let c = s.chars().nth(idx).unwrap();
-        if (c == '+' || c == '-') && s[idx + 1..].chars().all(|x| x.is_ascii_digit()) {
-            return &s[..idx];
+        if c == '+' || c == '-' {
+            let h_part = &s[idx + 1..idx + 3];
+            let m_part = &s[idx + 3..];
+            if h_part.chars().all(|x| x.is_ascii_digit())
+                && m_part.chars().all(|x| x.is_ascii_digit())
+                && is_valid_tz(h_part, m_part)
+            {
+                return &s[..idx];
+            }
         }
     }
 
-    // Check +HH or -HH
+    // Check +HH or -HH (length >= 3)
     if s.len() >= 3 {
         let idx = s.len() - 3;
         let c = s.chars().nth(idx).unwrap();
-        if (c == '+' || c == '-') && s[idx + 1..].chars().all(|x| x.is_ascii_digit()) {
-            return &s[..idx];
+        if c == '+' || c == '-' {
+            let h_part = &s[idx + 1..];
+            if h_part.chars().all(|x| x.is_ascii_digit()) && is_valid_tz(h_part, "00") {
+                return &s[..idx];
+            }
         }
     }
 
-    // No valid timezone found, return original string
+    // The parser will subsequently fail on this string, returning NULL.
     s
 }
 fn to_julian_day_exact(dt: &NaiveDateTime) -> f64 {
@@ -796,9 +818,7 @@ fn parse_permissive_datetime(value: &str) -> Option<(NaiveDateTime, i64)> {
 
     // 3. Parse Day
     // Day string ends at 'T', ' ', or end of string.
-    let d_end_idx = rest_after_m
-        .find(|c| c == 'T' || c == ' ')
-        .unwrap_or(rest_after_m.len());
+    let d_end_idx = rest_after_m.find(['T', ' ']).unwrap_or(rest_after_m.len());
 
     if d_end_idx != 2 {
         return None;
@@ -810,7 +830,7 @@ fn parse_permissive_datetime(value: &str) -> Option<(NaiveDateTime, i64)> {
     }
     let d = d_str.parse::<i32>().ok()?;
 
-    if m < 1 || m > 12 || d < 1 || d > 31 {
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
         return None;
     }
 
@@ -867,7 +887,7 @@ fn parse_permissive_datetime(value: &str) -> Option<(NaiveDateTime, i64)> {
             0.0
         };
 
-        if h < 0 || h > 24 || min < 0 || min > 59 || s < 0.0 || s >= 60.0 {
+        if !(0..=24).contains(&h) || !(0..=59).contains(&min) || !(0.0..60.0).contains(&s) {
             return None;
         }
         (h, min, s)
@@ -1142,11 +1162,7 @@ fn parse_modifier(modifier: &str) -> Result<Modifier> {
                 "Invalid date/time offset format".to_string(),
             )),
         }
-    } else if modifier
-        .chars()
-        .next()
-        .map_or(false, |c| c.is_ascii_digit())
-        && modifier.contains(':')
+    } else if modifier.chars().next().is_some_and(|c| c.is_ascii_digit()) && modifier.contains(':')
     {
         let time = parse_modifier_time(modifier)?;
         let ms =
@@ -1406,10 +1422,7 @@ mod tests {
 
         for case in invalid_cases.iter() {
             let result = exec_date([case]);
-            match result {
-                Value::Text(ref result_str) if result_str.value.is_empty() => (),
-                _ => panic!("Expected empty string for input: {case:?}, but got: {result:?}"),
-            }
+            assert_eq!(result, Value::Null);
         }
     }
 
@@ -1538,10 +1551,7 @@ mod tests {
 
         for case in invalid_cases {
             let result = exec_time(&[case.clone()]);
-            match result {
-                Value::Text(ref result_str) if result_str.value.is_empty() => (),
-                _ => panic!("Expected empty string for input: {case:?}, but got: {result:?}"),
-            }
+            assert_eq!(result, Value::Null);
         }
     }
 
@@ -2127,13 +2137,9 @@ mod tests {
     // leap second
     #[test]
     fn test_leap_second_ignored() {
-        let leap_second = NaiveDate::from_ymd_opt(2024, 6, 30)
-            .unwrap()
-            .and_hms_nano_opt(23, 59, 59, 1_500_000_000)
-            .unwrap();
-        let expected = String::new(); // SQLite ignores leap seconds
-        let result = exec_datetime(&[text(&leap_second.to_string())], DateTimeOutput::DateTime);
-        assert_eq!(result, text(&expected));
+        // SQLite returns NULL for invalid times (like second=60 which parsing fails for ex. SELECT typeof(datetime('2023-05-18 15:30:45+25:00')); )
+        let result = exec_datetime(&[text("2024-06-30 23:59:60")], DateTimeOutput::DateTime);
+        assert_eq!(result, Value::Null);
     }
 
     #[test]
@@ -2441,6 +2447,7 @@ mod tests {
         assert_eq!(exec_timediff(&[start, end.clone()]), expected);
 
         let start = Value::build_text("12:00:00");
+        let end = Value::build_text("not a time");
         let expected = Value::Null;
         assert_eq!(exec_timediff(&[start, end]), expected);
     }
