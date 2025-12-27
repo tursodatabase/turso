@@ -1649,20 +1649,16 @@ pub fn translate_expr(
                             Ok(target_register)
                         }
                         ScalarFunc::UnixEpoch => {
-                            let mut start_reg = 0;
-                            if args.len() > 1 {
-                                crate::bail_parse_error!("epoch function with > 1 arguments. Modifiers are not yet supported.");
-                            }
-                            if args.len() == 1 {
-                                let arg_reg = program.alloc_register();
-                                let _ = translate_expr(
+                            let start_reg = program.alloc_registers(args.len().max(1));
+                            for (i, arg) in args.iter().enumerate() {
+                                // register containing result of each argument expression
+                                translate_expr(
                                     program,
                                     referenced_tables,
-                                    &args[0],
-                                    arg_reg,
+                                    arg,
+                                    start_reg + i,
                                     resolver,
                                 )?;
-                                start_reg = arg_reg;
                             }
                             program.emit_insn(Insn::Function {
                                 constant_mask: 0,

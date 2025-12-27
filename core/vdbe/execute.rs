@@ -5198,12 +5198,10 @@ pub fn op_function(
                 state.registers[*dest] = Register::Value(result);
             }
             ScalarFunc::UnixEpoch => {
-                let value = if *start_reg == 0 {
-                    &Value::build_text("now")
-                } else {
-                    state.registers[*start_reg].get_value()
-                };
-                state.registers[*dest] = Register::Value(exec_unixepoch(value));
+                let values =
+                    registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
+                let result = exec_unixepoch(values);
+                state.registers[*dest] = Register::Value(result);
             }
             ScalarFunc::TursoVersion => {
                 if !program.connection.is_db_initialized() {
