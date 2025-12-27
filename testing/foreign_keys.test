@@ -1988,3 +1988,48 @@ do_execsql_test_on_specific_db {:memory:} fk-drop-parent-cascade-with-orphaned {
     DROP TABLE parent;
     SELECT id, pid FROM child ORDER BY id;
 } {10|999}
+
+# DROP COLUMN on child FK column should fail (FK column cannot be dropped)
+do_execsql_test_in_memory_any_error fk-drop-column-child-fk-fails {
+    PRAGMA foreign_keys=OFF;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(fk INTEGER, other TEXT, FOREIGN KEY(fk) REFERENCES parent(id));
+    ALTER TABLE child DROP COLUMN fk;
+}
+
+# DROP COLUMN on child FK column should also fail when FK is enabled
+do_execsql_test_in_memory_any_error fk-drop-column-child-fk-enabled-fails {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(fk INTEGER, other TEXT, FOREIGN KEY(fk) REFERENCES parent(id));
+    ALTER TABLE child DROP COLUMN fk;
+}
+
+# DROP COLUMN on child FK column should fail even with orphaned FK (parent dropped)
+do_execsql_test_in_memory_any_error fk-drop-column-orphaned-fk-fails {
+    PRAGMA foreign_keys=OFF;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(fk INTEGER, other TEXT, FOREIGN KEY(fk) REFERENCES parent(id));
+    DROP TABLE parent;
+    ALTER TABLE child DROP COLUMN fk;
+}
+
+# DROP COLUMN on composite FK column should fail
+do_execsql_test_in_memory_any_error fk-drop-column-composite-fk-fails {
+    PRAGMA foreign_keys=OFF;
+    CREATE TABLE parent(a INTEGER, b INTEGER, PRIMARY KEY(a, b));
+    CREATE TABLE child(fa INTEGER, fb INTEGER, other TEXT,
+                       FOREIGN KEY(fa, fb) REFERENCES parent(a, b));
+    ALTER TABLE child DROP COLUMN fa;
+}
+
+# DROP COLUMN on non-FK column should succeed and preserve FK constraint
+do_execsql_test_on_specific_db {:memory:} fk-drop-column-preserve-fk {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(fk INTEGER, other TEXT, extra INTEGER,
+                       FOREIGN KEY(fk) REFERENCES parent(id));
+    ALTER TABLE child DROP COLUMN extra;
+    SELECT sql FROM sqlite_schema WHERE name='child';
+} {{CREATE TABLE child (fk INTEGER, other TEXT, FOREIGN KEY (fk) REFERENCES parent(id))}}
+
