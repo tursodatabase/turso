@@ -74,7 +74,7 @@ export interface DatabaseOpts {
      * optional url of the remote database (e.g. libsql://db-org.turso.io)
      * (if omitted - local-only database will be created)
      * 
-     * you can also promide function which will return URL or null
+     * you can also provide function which will return URL or null
      * in this case local database will be created and sync will be "switched-on" whenever the url will return non-empty value
      * note, that all other parameters (like encryption) must be set in advance in order for the "deferred" sync to work properly
      */

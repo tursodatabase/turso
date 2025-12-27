@@ -9,6 +9,7 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
+	"path"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -190,6 +191,64 @@ func TestSyncBootstrap(t *testing.T) {
 		values = append(values, value)
 	}
 	require.Equal(t, values, []string{"hello", "turso", "sync-go"})
+}
+
+func TestSyncConfigPersistence(t *testing.T) {
+	server, err := NewTursoServer()
+	require.Nil(t, err)
+	t.Cleanup(func() { server.Close() })
+
+	_, err = server.DbSql("CREATE TABLE t(x)")
+	require.Nil(t, err)
+	_, err = server.DbSql("INSERT INTO t VALUES (42)")
+	require.Nil(t, err)
+
+	dir := t.TempDir()
+	local := path.Join(dir, "local.db")
+
+	db1, err := NewTursoSyncDb(context.Background(), TursoSyncDbConfig{
+		Path:       local,
+		ClientName: "turso-sync-go",
+		RemoteUrl:  server.DbUrl,
+	})
+	require.Nil(t, err)
+	conn, err := db1.Connect(context.Background())
+	require.Nil(t, err)
+	rows, err := conn.QueryContext(context.Background(), "SELECT * FROM t")
+	require.Nil(t, err)
+	values := make([]int64, 0)
+	for rows.Next() {
+		var value int64
+		require.Nil(t, rows.Scan(&value))
+		values = append(values, value)
+	}
+	require.Equal(t, values, []int64{42})
+	rows.Close()
+	conn.Close()
+
+	_, err = server.DbSql("INSERT INTO t VALUES (41)")
+	require.Nil(t, err)
+
+	db2, err := NewTursoSyncDb(context.Background(), TursoSyncDbConfig{
+		Path:      local,
+		RemoteUrl: server.DbUrl,
+	})
+	require.Nil(t, err)
+
+	_, err = db2.Pull(context.Background())
+	require.Nil(t, err)
+
+	conn, err = db2.Connect(context.Background())
+	require.Nil(t, err)
+	rows, err = conn.QueryContext(context.Background(), "SELECT * FROM t")
+	require.Nil(t, err)
+	values = make([]int64, 0)
+	for rows.Next() {
+		var value int64
+		require.Nil(t, rows.Scan(&value))
+		values = append(values, value)
+	}
+	require.Equal(t, values, []int64{42, 41})
 }
 
 func TestSyncBootstrapPersistent(t *testing.T) {

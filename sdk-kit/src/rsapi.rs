@@ -144,6 +144,13 @@ pub fn turso_slice_from_bytes(bytes: &[u8]) -> capi::c::turso_slice_ref_t {
     }
 }
 
+pub fn turso_slice_null() -> capi::c::turso_slice_ref_t {
+    capi::c::turso_slice_ref_t {
+        ptr: std::ptr::null(),
+        len: 0,
+    }
+}
+
 /// # Safety
 /// ptr must be valid C-string pointer or null
 pub unsafe fn str_from_c_str<'a>(ptr: *const std::ffi::c_char) -> Result<&'a str, TursoError> {

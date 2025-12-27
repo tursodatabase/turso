@@ -854,6 +854,7 @@ class EncryptionOpts:
     cipher: str
     hexkey: str
 
+
 def connect(
     database: str,
     *,
@@ -877,10 +878,9 @@ def connect(
             experimental_features=experimental_features,
             async_io=False,  # Let the Rust layer drive IO internally by default
             vfs=vfs,
-            encryption=PyTursoEncryptionConfig(
-                cipher=encryption.cipher,
-                hexkey=encryption.hexkey
-            ) if encryption else None
+            encryption=PyTursoEncryptionConfig(cipher=encryption.cipher, hexkey=encryption.hexkey)
+            if encryption
+            else None,
         )
         db: PyTursoDatabase = py_turso_database_open(cfg)
         conn: PyTursoConnection = db.connect()

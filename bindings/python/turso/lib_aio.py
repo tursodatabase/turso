@@ -188,10 +188,8 @@ class Connection:
 # Cursor goes SECOND
 class Cursor:
     def __init__(
-            self,
-            connection: Connection,
-            factory: Optional[Callable[[BlockingConnection], BlockingCursor]] = None
-        ):
+        self, connection: Connection, factory: Optional[Callable[[BlockingConnection], BlockingCursor]] = None
+    ):
         self._connection: Connection = connection
         self._loop = asyncio.get_event_loop()
 

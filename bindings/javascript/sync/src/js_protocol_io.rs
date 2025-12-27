@@ -20,6 +20,7 @@ use crate::{
 #[napi]
 pub enum JsProtocolRequest {
     Http {
+        url: Option<String>,
         method: String,
         path: String,
         body: Option<Vec<u8>>,
@@ -189,12 +190,14 @@ impl SyncEngineIo for JsProtocolIo {
 
     fn http(
         &self,
+        url: Option<&str>,
         method: &str,
         path: &str,
         body: Option<Vec<u8>>,
         headers: &[(&str, &str)],
     ) -> turso_sync_engine::Result<JsDataCompletion> {
         Ok(self.add_request(JsProtocolRequest::Http {
+            url: url.map(|x| x.to_string()),
             method: method.to_string(),
             path: path.to_string(),
             body,

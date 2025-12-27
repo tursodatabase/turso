@@ -3,13 +3,14 @@ use std::{
     sync::{Arc, Mutex, MutexGuard},
 };
 
-use turso_sdk_kit::rsapi::{turso_slice_from_bytes, TursoError};
+use turso_sdk_kit::rsapi::{turso_slice_from_bytes, turso_slice_null, TursoError};
 
 use crate::capi::c::{self};
 
 /// sync engine extended IO request
 pub enum SyncEngineIoRequest {
     Http {
+        url: Option<String>,
         method: String,
         path: String,
         body: Option<Vec<u8>>,
@@ -54,11 +55,17 @@ impl SyncEngineIoRequest {
     pub fn http_to_capi(&self) -> Result<c::turso_sync_io_http_request_t, TursoError> {
         match self {
             SyncEngineIoRequest::Http {
+                url,
                 method,
                 path,
                 body,
                 headers,
             } => Ok(c::turso_sync_io_http_request_t {
+                url: if let Some(url) = url {
+                    turso_slice_from_bytes(url.as_bytes())
+                } else {
+                    turso_slice_null()
+                },
                 method: turso_slice_from_bytes(method.as_bytes()),
                 path: turso_slice_from_bytes(path.as_bytes()),
                 body: if let Some(body) = body {
@@ -265,12 +272,14 @@ impl<TBytes: AsRef<[u8]> + Send + Sync + 'static>
 
     fn http(
         &self,
+        url: Option<&str>,
         method: &str,
         path: &str,
         body: Option<Vec<u8>>,
         headers: &[(&str, &str)],
     ) -> turso_sync_engine::Result<Self::DataCompletionBytes> {
         Ok(self.push_back(SyncEngineIoRequest::Http {
+            url: url.map(|x| x.to_string()),
             method: method.to_string(),
             path: path.to_string(),
             body,

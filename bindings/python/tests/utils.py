@@ -16,8 +16,10 @@ def handle_response(r):
         return
     r.raise_for_status()
 
+
 ADMIN_URL = "http://localhost:8081"
 USER_URL = "http://localhost:8080"
+
 
 class TursoServer:
     def __init__(self):
@@ -71,4 +73,3 @@ class TursoServer:
         if result["results"][0]["type"] != "ok":
             raise Exception(f"remote sql execution failed: {result}")
         return [[cell["value"] for cell in row] for row in result["results"][0]["response"]["result"]["rows"]]
-
