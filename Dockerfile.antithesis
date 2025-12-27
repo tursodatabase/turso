@@ -103,7 +103,7 @@ RUN make
 #
 
 FROM debian:bullseye-slim AS runtime
-RUN apt-get update && apt-get install -y bash curl xz-utils python3 procps sqlite3 bc binutils pip && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y bash curl xz-utils python3 procps sqlite3 bc binutils pip rust-gdb && rm -rf /var/lib/apt/lists/*
 RUN pip install antithesis
 
 WORKDIR /app

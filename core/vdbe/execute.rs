@@ -4,7 +4,7 @@ use crate::function::AlterTableFunc;
 use crate::mvcc::cursor::{MvccCursorType, NextRowidResult};
 use crate::mvcc::database::CheckpointStateMachine;
 use crate::mvcc::LocalClock;
-use crate::schema::Table;
+use crate::schema::{Table, SQLITE_SEQUENCE_TABLE_NAME};
 use crate::state_machine::StateMachine;
 use crate::storage::btree::{
     integrity_check, CursorTrait, IntegrityCheckError, IntegrityCheckState, PageCategory,
@@ -2631,10 +2631,14 @@ pub fn op_integer(
 
 pub enum OpProgramState {
     Start,
-    Step,
+    /// Step state tracks whether we're executing a trigger subprogram (vs FK action subprogram)
+    Step {
+        is_trigger: bool,
+    },
 }
 
-/// Execute a trigger subprogram (Program opcode).
+/// Execute a subprogram (Program opcode).
+/// Used for both triggers and FK actions (CASCADE, SET NULL, etc.)
 pub fn op_program(
     program: &Program,
     state: &mut ProgramState,
@@ -2653,10 +2657,14 @@ pub fn op_program(
             OpProgramState::Start => {
                 let mut statement = subprogram.write();
                 statement.reset();
-                let Some(ref trigger) = statement.get_trigger() else {
-                    crate::bail_parse_error!("trigger subprogram has no trigger");
+
+                // Check if this is a trigger subprogram - if so, track execution
+                let is_trigger = if let Some(ref trigger) = statement.get_trigger() {
+                    program.connection.start_trigger_execution(trigger.clone());
+                    true
+                } else {
+                    false
                 };
-                program.connection.start_trigger_execution(trigger.clone());
 
                 // Extract register values from params (which contain register indices encoded as negative integers)
                 // and bind them to the subprogram's parameters
@@ -2677,15 +2685,16 @@ pub fn op_program(
                         }
                     } else {
                         crate::bail_parse_error!(
-                            "Trigger parameters should be integers, got {:?}",
+                            "Subprogram parameters should be integers, got {:?}",
                             param_value
                         );
                     }
                 }
 
-                state.op_program_state = OpProgramState::Step;
+                state.op_program_state = OpProgramState::Step { is_trigger };
             }
-            OpProgramState::Step => {
+            OpProgramState::Step { is_trigger } => {
+                let is_trigger = *is_trigger;
                 loop {
                     let mut statement = subprogram.write();
                     let res = statement.step();
@@ -2713,7 +2722,11 @@ pub fn op_program(
                         }
                     }
                 }
-                program.connection.end_trigger_execution();
+
+                // Only end trigger execution if this was a trigger subprogram
+                if is_trigger {
+                    program.connection.end_trigger_execution();
+                }
 
                 state.op_program_state = OpProgramState::Start;
                 state.pc += 1;
@@ -6408,7 +6421,7 @@ pub fn op_insert(
                     cursor.root_page()
                 };
                 if root_page != 1
-                    && table_name != "sqlite_sequence"
+                    && table_name != SQLITE_SEQUENCE_TABLE_NAME
                     && !flag.has(InsertFlags::EPHEMERAL_TABLE_INSERT)
                 {
                     state.op_insert_state.sub_state = OpInsertSubState::UpdateLastRowid;
@@ -9087,12 +9100,12 @@ pub fn op_add_column(
         let table = schema
             .tables
             .get_mut(table)
-            .expect("table being renamed should be in schema");
+            .expect("table being altered should be in schema");
 
         let table = Arc::make_mut(table);
 
         let Table::BTree(btree) = table else {
-            panic!("only btree tables can be renamed");
+            panic!("only btree tables can have columns added");
         };
 
         let btree = Arc::make_mut(btree);

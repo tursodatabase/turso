@@ -372,7 +372,7 @@ impl From<LimboError> for TursoError {
             LimboError::NotADB => TursoError::NotAdb("file is not a database".to_string()),
             LimboError::DatabaseFull(e) => TursoError::DatabaseFull(e),
             LimboError::ReadOnly => TursoError::Readonly("database is readonly".to_string()),
-            LimboError::Busy => TursoError::Busy("database is busy".to_string()),
+            LimboError::Busy => TursoError::Busy("database is locked".to_string()),
             _ => TursoError::Error(value.to_string()),
         }
     }
@@ -799,7 +799,7 @@ impl TursoStatement {
             return match result? {
                 StepResult::Done => Ok(TursoStatusCode::Done),
                 StepResult::Row => Ok(TursoStatusCode::Row),
-                StepResult::Busy => Err(TursoError::Busy("database is busy".to_string())),
+                StepResult::Busy => Err(TursoError::Busy("database is locked".to_string())),
                 StepResult::Interrupt => Err(TursoError::Interrupt("interrupted".to_string())),
                 StepResult::IO => {
                     if async_io {

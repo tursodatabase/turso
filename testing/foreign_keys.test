@@ -1238,3 +1238,753 @@ do_execsql_test_on_specific_db {:memory:} fk-no-val-on-parent {
   INSERT INTO t2(a, b) VALUES (5, 10);
   SELECT * FROM t2;
  }
+
+# Basic ON DELETE CASCADE - single child row
+do_execsql_test_on_specific_db {:memory:} fk-cascade-delete-basic {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, pid REFERENCES parent(id) ON DELETE CASCADE);
+    INSERT INTO parent VALUES(1),(2);
+    INSERT INTO child VALUES(10,1),(11,1),(12,2);
+    DELETE FROM parent WHERE id=1;
+    SELECT id, pid FROM child ORDER BY id;
+} {12|2}
+
+# ON DELETE CASCADE - delete parent with no children
+do_execsql_test_on_specific_db {:memory:} fk-cascade-delete-no-children {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, pid REFERENCES parent(id) ON DELETE CASCADE);
+    INSERT INTO parent VALUES(1),(2);
+    INSERT INTO child VALUES(10,1);
+    DELETE FROM parent WHERE id=2;
+    SELECT id, pid FROM child ORDER BY id;
+} {10|1}
+
+# ON DELETE CASCADE - composite key
+do_execsql_test_on_specific_db {:memory:} fk-cascade-delete-composite {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(a INT, b INT, PRIMARY KEY(a,b));
+    CREATE TABLE c(id INTEGER PRIMARY KEY, x INT, y INT,
+                   FOREIGN KEY(x,y) REFERENCES p(a,b) ON DELETE CASCADE);
+    INSERT INTO p VALUES(1,2),(3,4);
+    INSERT INTO c VALUES(1,1,2),(2,3,4);
+    DELETE FROM p WHERE a=1 AND b=2;
+    SELECT id, x, y FROM c ORDER BY id;
+} {2|3|4}
+
+# ON DELETE CASCADE - child with NULL FK value should not be deleted
+do_execsql_test_on_specific_db {:memory:} fk-cascade-delete-null-child {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, pid REFERENCES parent(id) ON DELETE CASCADE);
+    INSERT INTO parent VALUES(1);
+    INSERT INTO child VALUES(10,1),(11,NULL);
+    DELETE FROM parent WHERE id=1;
+    SELECT id, pid FROM child ORDER BY id;
+} {11|}
+
+# ON DELETE CASCADE - recursive cascade (A->B->C)
+do_execsql_test_on_specific_db {:memory:} fk-cascade-delete-recursive {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE a(id INTEGER PRIMARY KEY);
+    CREATE TABLE b(id INTEGER PRIMARY KEY, aid REFERENCES a(id) ON DELETE CASCADE);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, bid REFERENCES b(id) ON DELETE CASCADE);
+    INSERT INTO a VALUES(1);
+    INSERT INTO b VALUES(10,1);
+    INSERT INTO c VALUES(100,10);
+    DELETE FROM a WHERE id=1;
+    SELECT count(*) FROM b;
+} {0}
+
+do_execsql_test_on_specific_db {:memory:} fk-cascade-delete-recursive-check-c {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE a(id INTEGER PRIMARY KEY);
+    CREATE TABLE b(id INTEGER PRIMARY KEY, aid REFERENCES a(id) ON DELETE CASCADE);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, bid REFERENCES b(id) ON DELETE CASCADE);
+    INSERT INTO a VALUES(1);
+    INSERT INTO b VALUES(10,1);
+    INSERT INTO c VALUES(100,10);
+    DELETE FROM a WHERE id=1;
+    SELECT count(*) FROM c;
+} {0}
+
+# Basic ON UPDATE CASCADE - single child row
+do_execsql_test_on_specific_db {:memory:} fk-cascade-update-basic {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, pid REFERENCES parent(id) ON UPDATE CASCADE);
+    INSERT INTO parent VALUES(1);
+    INSERT INTO child VALUES(10,1);
+    UPDATE parent SET id=100 WHERE id=1;
+    SELECT id, pid FROM child ORDER BY id;
+} {10|100}
+
+# ON UPDATE CASCADE - multiple children
+do_execsql_test_on_specific_db {:memory:} fk-cascade-update-multi-children {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid REFERENCES p(id) ON UPDATE CASCADE);
+    INSERT INTO p VALUES(1);
+    INSERT INTO c VALUES(10,1),(11,1),(12,1);
+    UPDATE p SET id=99 WHERE id=1;
+    SELECT id, pid FROM c ORDER BY id;
+} {10|99
+11|99
+12|99}
+
+# ON UPDATE CASCADE - composite key
+do_execsql_test_on_specific_db {:memory:} fk-cascade-update-composite {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(a INT, b INT, PRIMARY KEY(a,b));
+    CREATE TABLE c(id INTEGER PRIMARY KEY, x INT, y INT,
+                   FOREIGN KEY(x,y) REFERENCES p(a,b) ON UPDATE CASCADE);
+    INSERT INTO p VALUES(1,2);
+    INSERT INTO c VALUES(1,1,2);
+    UPDATE p SET a=10, b=20 WHERE a=1 AND b=2;
+    SELECT id, x, y FROM c;
+} {1|10|20}
+
+# Basic ON DELETE SET NULL
+do_execsql_test_on_specific_db {:memory:} fk-setnull-delete-basic {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid REFERENCES p(id) ON DELETE SET NULL);
+    INSERT INTO p VALUES(1);
+    INSERT INTO c VALUES(10,1);
+    DELETE FROM p WHERE id=1;
+    SELECT id, pid FROM c;
+} {10|}
+
+# ON DELETE SET NULL - multiple children
+do_execsql_test_on_specific_db {:memory:} fk-setnull-delete-multi-children {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid REFERENCES p(id) ON DELETE SET NULL);
+    INSERT INTO p VALUES(1),(2);
+    INSERT INTO c VALUES(10,1),(11,1),(12,2);
+    DELETE FROM p WHERE id=1;
+    SELECT id, pid FROM c ORDER BY id;
+} {10|
+11|
+12|2}
+
+# ON DELETE SET NULL - composite key
+do_execsql_test_on_specific_db {:memory:} fk-setnull-delete-composite {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(a INT, b INT, PRIMARY KEY(a,b));
+    CREATE TABLE c(id INTEGER PRIMARY KEY, x INT, y INT,
+                   FOREIGN KEY(x,y) REFERENCES p(a,b) ON DELETE SET NULL);
+    INSERT INTO p VALUES(1,2);
+    INSERT INTO c VALUES(1,1,2);
+    DELETE FROM p WHERE a=1 AND b=2;
+    SELECT id, x, y FROM c;
+} {1||}
+
+# Basic ON UPDATE SET NULL
+do_execsql_test_on_specific_db {:memory:} fk-setnull-update-basic {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid REFERENCES p(id) ON UPDATE SET NULL);
+    INSERT INTO p VALUES(1);
+    INSERT INTO c VALUES(10,1);
+    UPDATE p SET id=100 WHERE id=1;
+    SELECT id, pid FROM c;
+} {10|}
+
+# ON DELETE CASCADE with ON UPDATE NO ACTION
+do_execsql_test_on_specific_db {:memory:} fk-cascade-delete-noaction-update {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid REFERENCES p(id) ON DELETE CASCADE ON UPDATE NO ACTION);
+    INSERT INTO p VALUES(1),(2);
+    INSERT INTO c VALUES(10,1),(11,2);
+    DELETE FROM p WHERE id=1;
+    SELECT id, pid FROM c ORDER BY id;
+} {11|2}
+
+# ON DELETE NO ACTION with ON UPDATE CASCADE
+do_execsql_test_on_specific_db {:memory:} fk-noaction-delete-cascade-update {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid REFERENCES p(id) ON DELETE NO ACTION ON UPDATE CASCADE);
+    INSERT INTO p VALUES(1);
+    INSERT INTO c VALUES(10,1);
+    UPDATE p SET id=100 WHERE id=1;
+    SELECT id, pid FROM c;
+} {10|100}
+
+# INSERT OR REPLACE with ON DELETE CASCADE
+do_execsql_test_on_specific_db {:memory:} fk-replace-delete-cascade {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id REFERENCES parent(id) ON DELETE CASCADE);
+    INSERT INTO parent VALUES(1,'Alice'),(2,'Bob');
+    INSERT INTO child VALUES(10,1),(20,1),(30,2);
+    INSERT OR REPLACE INTO parent VALUES(1,'Alice Updated');
+    SELECT id, parent_id FROM child ORDER BY id;
+} {30|2}
+
+# INSERT OR REPLACE with ON DELETE SET NULL
+do_execsql_test_on_specific_db {:memory:} fk-replace-delete-setnull {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id REFERENCES parent(id) ON DELETE SET NULL);
+    INSERT INTO parent VALUES(1,'Alice'),(2,'Bob');
+    INSERT INTO child VALUES(10,1),(20,1),(30,2);
+    INSERT OR REPLACE INTO parent VALUES(1,'Alice Updated');
+    SELECT id, parent_id FROM child ORDER BY id;
+} {10|
+20|
+30|2}
+
+# INSERT OR REPLACE with ON DELETE SET DEFAULT
+do_execsql_test_on_specific_db {:memory:} fk-replace-delete-setdefault {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id INTEGER DEFAULT 999 REFERENCES parent(id) ON DELETE SET DEFAULT);
+    INSERT INTO parent VALUES(1,'Alice'),(2,'Bob'),(999,'Default');
+    INSERT INTO child VALUES(10,1),(20,1),(30,2);
+    INSERT OR REPLACE INTO parent VALUES(1,'Alice Updated');
+    SELECT id, parent_id FROM child ORDER BY id;
+} {10|999
+20|999
+30|2}
+
+# INSERT OR REPLACE with composite FK and ON DELETE CASCADE
+do_execsql_test_on_specific_db {:memory:} fk-replace-delete-cascade-composite {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(a INT, b INT, name TEXT, PRIMARY KEY(a,b));
+    CREATE TABLE c(id INTEGER PRIMARY KEY, x INT, y INT,
+                   FOREIGN KEY(x,y) REFERENCES p(a,b) ON DELETE CASCADE);
+    INSERT INTO p VALUES(1,2,'orig'),(3,4,'other');
+    INSERT INTO c VALUES(10,1,2),(20,3,4);
+    INSERT OR REPLACE INTO p VALUES(1,2,'new');
+    SELECT id, x, y FROM c ORDER BY id;
+} {20|3|4}
+
+# INSERT OR REPLACE with recursive cascade (A->B->C)
+do_execsql_test_on_specific_db {:memory:} fk-replace-delete-cascade-recursive {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE a(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE b(id INTEGER PRIMARY KEY, aid REFERENCES a(id) ON DELETE CASCADE);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, bid REFERENCES b(id) ON DELETE CASCADE);
+    INSERT INTO a VALUES(1,'x');
+    INSERT INTO b VALUES(10,1);
+    INSERT INTO c VALUES(100,10);
+    INSERT OR REPLACE INTO a VALUES(1,'y');
+    SELECT count(*) FROM b;
+} {0}
+
+do_execsql_test_on_specific_db {:memory:} fk-replace-delete-cascade-recursive-check-c {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE a(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE b(id INTEGER PRIMARY KEY, aid REFERENCES a(id) ON DELETE CASCADE);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, bid REFERENCES b(id) ON DELETE CASCADE);
+    INSERT INTO a VALUES(1,'x');
+    INSERT INTO b VALUES(10,1);
+    INSERT INTO c VALUES(100,10);
+    INSERT OR REPLACE INTO a VALUES(1,'y');
+    SELECT count(*) FROM c;
+} {0}
+
+# UPSERT with ON UPDATE CASCADE
+do_execsql_test_on_specific_db {:memory:} fk-upsert-update-cascade {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY, val INTEGER UNIQUE);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_val REFERENCES parent(val) ON UPDATE CASCADE);
+    INSERT INTO parent VALUES(1,100);
+    INSERT INTO child VALUES(10,100);
+    INSERT INTO parent VALUES(1,200) ON CONFLICT(id) DO UPDATE SET val=200;
+    SELECT id, parent_val FROM child;
+} {10|200}
+
+# UPSERT with ON UPDATE SET NULL
+do_execsql_test_on_specific_db {:memory:} fk-upsert-update-setnull {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY, val INTEGER UNIQUE);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_val REFERENCES parent(val) ON UPDATE SET NULL);
+    INSERT INTO parent VALUES(1,100);
+    INSERT INTO child VALUES(10,100);
+    INSERT INTO parent VALUES(1,200) ON CONFLICT(id) DO UPDATE SET val=200;
+    SELECT id, parent_val FROM child;
+} {10|}
+
+# UPSERT with ON UPDATE SET DEFAULT
+do_execsql_test_on_specific_db {:memory:} fk-upsert-update-setdefault {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY, val INTEGER UNIQUE);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_val INTEGER DEFAULT 999 REFERENCES parent(val) ON UPDATE SET DEFAULT);
+    INSERT INTO parent VALUES(1,100),(2,999);
+    INSERT INTO child VALUES(10,100);
+    INSERT INTO parent VALUES(1,200) ON CONFLICT(id) DO UPDATE SET val=200;
+    SELECT id, parent_val FROM child;
+} {10|999}
+
+# UPSERT with multiple children and ON UPDATE CASCADE
+do_execsql_test_on_specific_db {:memory:} fk-upsert-update-cascade-multi-children {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY, val INTEGER UNIQUE);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_val REFERENCES parent(val) ON UPDATE CASCADE);
+    INSERT INTO parent VALUES(1,100);
+    INSERT INTO child VALUES(10,100),(11,100),(12,100);
+    INSERT INTO parent VALUES(1,200) ON CONFLICT(id) DO UPDATE SET val=200;
+    SELECT id, parent_val FROM child ORDER BY id;
+} {10|200
+11|200
+12|200}
+
+# UPSERT with composite FK and ON UPDATE CASCADE
+do_execsql_test_on_specific_db {:memory:} fk-upsert-update-cascade-composite {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY, a INT, b INT, UNIQUE(a,b));
+    CREATE TABLE c(id INTEGER PRIMARY KEY, x INT, y INT,
+                   FOREIGN KEY(x,y) REFERENCES p(a,b) ON UPDATE CASCADE);
+    INSERT INTO p VALUES(1,10,20);
+    INSERT INTO c VALUES(100,10,20);
+    INSERT INTO p VALUES(1,30,40) ON CONFLICT(id) DO UPDATE SET a=30, b=40;
+    SELECT id, x, y FROM c;
+} {100|30|40}
+
+# UPSERT recursive cascade (A->B->C)
+do_execsql_test_on_specific_db {:memory:} fk-upsert-update-cascade-recursive {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE a(id INTEGER PRIMARY KEY, val INTEGER UNIQUE);
+    CREATE TABLE b(id INTEGER PRIMARY KEY, a_val REFERENCES a(val) ON UPDATE CASCADE, b_val INTEGER UNIQUE);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, b_val REFERENCES b(b_val) ON UPDATE CASCADE);
+    INSERT INTO a VALUES(1,100);
+    INSERT INTO b VALUES(10,100,200);
+    INSERT INTO c VALUES(100,200);
+    INSERT INTO a VALUES(1,999) ON CONFLICT(id) DO UPDATE SET val=999;
+    SELECT id, a_val, b_val FROM b;
+} {10|999|200}
+
+# UPSERT that doesn't change the FK column should not trigger cascade
+do_execsql_test_on_specific_db {:memory:} fk-upsert-update-cascade-noop {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY, val INTEGER UNIQUE, other TEXT);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_val REFERENCES parent(val) ON UPDATE CASCADE);
+    INSERT INTO parent VALUES(1,100,'orig');
+    INSERT INTO child VALUES(10,100);
+    INSERT INTO parent VALUES(1,100,'new') ON CONFLICT(id) DO UPDATE SET other='new';
+    SELECT id, parent_val FROM child;
+} {10|100}
+
+# ON DELETE RESTRICT should fail when child references the parent row
+do_execsql_test_in_memory_any_error fk-delete-restrict-fails {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id REFERENCES parent(id) ON DELETE RESTRICT);
+    INSERT INTO parent VALUES(1);
+    INSERT INTO child VALUES(10, 1);
+    DELETE FROM parent WHERE id=1;
+}
+
+# ON DELETE RESTRICT should succeed when no child references the parent row
+do_execsql_test_on_specific_db {:memory:} fk-delete-restrict-ok-no-child {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id REFERENCES parent(id) ON DELETE RESTRICT);
+    INSERT INTO parent VALUES(1),(2);
+    INSERT INTO child VALUES(10, 1);
+    DELETE FROM parent WHERE id=2;
+    SELECT id FROM parent;
+} {1}
+
+# ON UPDATE RESTRICT should fail when child references the parent key being updated
+do_execsql_test_in_memory_any_error fk-update-restrict-fails {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id REFERENCES parent(id) ON UPDATE RESTRICT);
+    INSERT INTO parent VALUES(1);
+    INSERT INTO child VALUES(10, 1);
+    UPDATE parent SET id=2 WHERE id=1;
+}
+
+# ON UPDATE RESTRICT should succeed when no child references the parent key
+do_execsql_test_on_specific_db {:memory:} fk-update-restrict-ok-no-child {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id REFERENCES parent(id) ON UPDATE RESTRICT);
+    INSERT INTO parent VALUES(1),(2);
+    INSERT INTO child VALUES(10, 1);
+    UPDATE parent SET id=3 WHERE id=2;
+    SELECT id FROM parent ORDER BY id;
+} {1
+3}
+
+# INSERT OR REPLACE with ON DELETE RESTRICT should fail
+do_execsql_test_in_memory_any_error fk-replace-restrict-fails {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id REFERENCES parent(id) ON DELETE RESTRICT);
+    INSERT INTO parent VALUES(1, 'Alice');
+    INSERT INTO child VALUES(10, 1);
+    INSERT OR REPLACE INTO parent VALUES(1, 'Alice Updated');
+}
+
+# UPSERT with ON UPDATE RESTRICT on PRIMARY KEY should fail
+do_execsql_test_in_memory_any_error fk-upsert-restrict-pk-fails {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id REFERENCES parent(id) ON UPDATE RESTRICT);
+    INSERT INTO parent VALUES(1);
+    INSERT INTO child VALUES(10, 1);
+    INSERT INTO parent VALUES(1) ON CONFLICT(id) DO UPDATE SET id=2;
+}
+
+# UPSERT with ON UPDATE RESTRICT on UNIQUE column should fail
+do_execsql_test_in_memory_any_error fk-upsert-restrict-unique-fails {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY, val INTEGER UNIQUE);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_val REFERENCES parent(val) ON UPDATE RESTRICT);
+    INSERT INTO parent VALUES(1, 100);
+    INSERT INTO child VALUES(10, 100);
+    INSERT INTO parent VALUES(1, 200) ON CONFLICT(id) DO UPDATE SET val=200;
+}
+
+# UPSERT with ON UPDATE RESTRICT should succeed when FK column is not updated
+do_execsql_test_on_specific_db {:memory:} fk-upsert-restrict-ok-no-change {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY, val INTEGER UNIQUE, other TEXT);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_val REFERENCES parent(val) ON UPDATE RESTRICT);
+    INSERT INTO parent VALUES(1, 100, 'orig');
+    INSERT INTO child VALUES(10, 100);
+    INSERT INTO parent VALUES(1, 100, 'new') ON CONFLICT(id) DO UPDATE SET other='new';
+    SELECT id, parent_val FROM child;
+} {10|100}
+
+# RESTRICT with NULL child value should not block parent operations
+do_execsql_test_on_specific_db {:memory:} fk-restrict-null-child-ok {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id REFERENCES parent(id) ON DELETE RESTRICT);
+    INSERT INTO parent VALUES(1);
+    INSERT INTO child VALUES(10, NULL);
+    DELETE FROM parent WHERE id=1;
+    SELECT count(*) FROM parent;
+} {0}
+
+# DROP parent table should fail when child rows reference it
+do_execsql_test_in_memory_any_error fk-drop-parent-with-child-references {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id REFERENCES parent(id));
+    INSERT INTO parent VALUES(1);
+    INSERT INTO child VALUES(10, 1);
+    DROP TABLE parent;
+}
+
+# DROP parent table should succeed when child FK values are all NULL
+do_execsql_test_on_specific_db {:memory:} fk-drop-parent-ok-when-child-fk-null {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id REFERENCES parent(id));
+    INSERT INTO parent VALUES(1);
+    INSERT INTO child VALUES(10, NULL);
+    DROP TABLE parent;
+    SELECT id, parent_id FROM child;
+} {10|}
+
+# DROP parent table should succeed when child table is empty
+do_execsql_test_on_specific_db {:memory:} fk-drop-parent-ok-when-child-empty {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id REFERENCES parent(id));
+    INSERT INTO parent VALUES(1);
+    DROP TABLE parent;
+    SELECT count(*) FROM child;
+} {0}
+
+# DROP parent table should succeed after child FK updated to NULL
+do_execsql_test_on_specific_db {:memory:} fk-drop-parent-ok-after-child-fk-set-null {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id REFERENCES parent(id));
+    INSERT INTO parent VALUES(1);
+    INSERT INTO child VALUES(10, 1);
+    UPDATE child SET parent_id = NULL;
+    DROP TABLE parent;
+    SELECT id, parent_id FROM child;
+} {10|}
+
+# DROP parent table should succeed after child row deleted
+do_execsql_test_on_specific_db {:memory:} fk-drop-parent-ok-after-child-deleted {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id REFERENCES parent(id));
+    INSERT INTO parent VALUES(1);
+    INSERT INTO child VALUES(10, 1);
+    DELETE FROM child WHERE id = 10;
+    DROP TABLE parent;
+    SELECT count(*) FROM child;
+} {0}
+
+# DROP parent with multiple children - some NULL, some not - should fail
+do_execsql_test_in_memory_any_error fk-drop-parent-mixed-null-references {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id REFERENCES parent(id));
+    INSERT INTO parent VALUES(1);
+    INSERT INTO child VALUES(10, NULL);
+    INSERT INTO child VALUES(11, 1);
+    DROP TABLE parent;
+}
+
+# DROP parent should succeed when child has orphaned FK value
+do_execsql_test_on_specific_db {:memory:} fk-drop-parent-ok-with-orphaned-fk {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id REFERENCES parent(id));
+    INSERT INTO parent VALUES(1), (2);
+    PRAGMA foreign_keys=OFF;
+    INSERT INTO child VALUES(10, 999);
+    PRAGMA foreign_keys=ON;
+    DROP TABLE parent;
+    SELECT id, parent_id FROM child;
+} {10|999}
+
+# DROP parent should succeed with multiple orphaned FK values
+do_execsql_test_on_specific_db {:memory:} fk-drop-parent-ok-with-multiple-orphaned-fks {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id REFERENCES parent(id));
+    INSERT INTO parent VALUES(1), (2);
+    PRAGMA foreign_keys=OFF;
+    INSERT INTO child VALUES(10, 100);
+    INSERT INTO child VALUES(11, 200);
+    INSERT INTO child VALUES(12, 300);
+    PRAGMA foreign_keys=ON;
+    DROP TABLE parent;
+    SELECT id, parent_id FROM child ORDER BY id;
+} {10|100
+11|200
+12|300}
+
+# DROP parent should succeed with mixed orphaned and NULL FK values
+do_execsql_test_on_specific_db {:memory:} fk-drop-parent-ok-with-orphaned-and-null {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id REFERENCES parent(id));
+    INSERT INTO parent VALUES(1), (2);
+    INSERT INTO child VALUES(10, NULL);
+    PRAGMA foreign_keys=OFF;
+    INSERT INTO child VALUES(11, 999);
+    PRAGMA foreign_keys=ON;
+    DROP TABLE parent;
+    SELECT id, parent_id FROM child ORDER BY id;
+} {10|
+11|999}
+
+# DROP parent should FAIL with mixed orphaned and valid FK references
+do_execsql_test_in_memory_any_error fk-drop-parent-fail-with-orphaned-and-valid {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, parent_id REFERENCES parent(id));
+    INSERT INTO parent VALUES(1), (2);
+    PRAGMA foreign_keys=OFF;
+    INSERT INTO child VALUES(10, 999);
+    PRAGMA foreign_keys=ON;
+    INSERT INTO child VALUES(11, 1);
+    DROP TABLE parent;
+}
+
+# DROP parent should succeed with composite FK orphaned values
+do_execsql_test_on_specific_db {:memory:} fk-drop-parent-ok-composite-orphaned {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(a INTEGER, b INTEGER, PRIMARY KEY(a, b));
+    CREATE TABLE child(id INTEGER PRIMARY KEY, pa INTEGER, pb INTEGER, FOREIGN KEY(pa, pb) REFERENCES parent(a, b));
+    INSERT INTO parent VALUES(1, 2), (3, 4);
+    PRAGMA foreign_keys=OFF;
+    INSERT INTO child VALUES(10, 1, 999);
+    INSERT INTO child VALUES(11, 999, 2);
+    PRAGMA foreign_keys=ON;
+    DROP TABLE parent;
+    SELECT id, pa, pb FROM child ORDER BY id;
+} {10|1|999
+11|999|2}
+
+# DROP parent should FAIL with composite FK that matches
+do_execsql_test_in_memory_any_error fk-drop-parent-fail-composite-valid {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(a INTEGER, b INTEGER, PRIMARY KEY(a, b));
+    CREATE TABLE child(id INTEGER PRIMARY KEY, pa INTEGER, pb INTEGER, FOREIGN KEY(pa, pb) REFERENCES parent(a, b));
+    INSERT INTO parent VALUES(1, 2), (3, 4);
+    INSERT INTO child VALUES(10, 1, 2);
+    DROP TABLE parent;
+}
+
+# DROP parent with ON DELETE CASCADE should delete child rows
+do_execsql_test_on_specific_db {:memory:} fk-drop-parent-cascade-deletes-children {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, pid REFERENCES parent(id) ON DELETE CASCADE);
+    INSERT INTO parent VALUES(1),(2),(3);
+    INSERT INTO child VALUES(10,1),(11,2),(12,3);
+    DROP TABLE parent;
+    SELECT * FROM child ORDER BY id;
+} {}
+
+# DROP parent with ON DELETE CASCADE - multiple children per parent
+do_execsql_test_on_specific_db {:memory:} fk-drop-parent-cascade-multi-children {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, pid REFERENCES parent(id) ON DELETE CASCADE);
+    INSERT INTO parent VALUES(1),(2);
+    INSERT INTO child VALUES(10,1),(11,1),(12,1),(20,2),(21,2);
+    DROP TABLE parent;
+    SELECT count(*) FROM child;
+} {0}
+
+# DROP parent with ON DELETE CASCADE - child with NULL FK preserved
+do_execsql_test_on_specific_db {:memory:} fk-drop-parent-cascade-null-preserved {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, pid REFERENCES parent(id) ON DELETE CASCADE);
+    INSERT INTO parent VALUES(1),(2);
+    INSERT INTO child VALUES(10,1),(11,NULL),(12,2);
+    DROP TABLE parent;
+    SELECT id, pid FROM child ORDER BY id;
+} {11|}
+
+# DROP parent with ON DELETE SET NULL should set child FK to NULL
+do_execsql_test_on_specific_db {:memory:} fk-drop-parent-setnull-sets-children {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, pid REFERENCES parent(id) ON DELETE SET NULL);
+    INSERT INTO parent VALUES(1),(2),(3);
+    INSERT INTO child VALUES(10,1),(11,2),(12,3);
+    DROP TABLE parent;
+    SELECT id, pid FROM child ORDER BY id;
+} {10|
+11|
+12|}
+
+# DROP parent with ON DELETE SET NULL - multiple children per parent
+do_execsql_test_on_specific_db {:memory:} fk-drop-parent-setnull-multi-children {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, pid REFERENCES parent(id) ON DELETE SET NULL);
+    INSERT INTO parent VALUES(1);
+    INSERT INTO child VALUES(10,1),(11,1),(12,1);
+    DROP TABLE parent;
+    SELECT id, pid FROM child ORDER BY id;
+} {10|
+11|
+12|}
+
+# DROP parent with ON DELETE SET NULL - already NULL values unchanged
+do_execsql_test_on_specific_db {:memory:} fk-drop-parent-setnull-null-unchanged {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, pid REFERENCES parent(id) ON DELETE SET NULL);
+    INSERT INTO parent VALUES(1);
+    INSERT INTO child VALUES(10,1),(11,NULL);
+    DROP TABLE parent;
+    SELECT id, pid FROM child ORDER BY id;
+} {10|
+11|}
+
+# DROP parent with ON DELETE SET DEFAULT (default is NULL) should work like SET NULL
+do_execsql_test_on_specific_db {:memory:} fk-drop-parent-setdefault-null-default {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, pid INTEGER DEFAULT NULL REFERENCES parent(id) ON DELETE SET DEFAULT);
+    INSERT INTO parent VALUES(1),(2);
+    INSERT INTO child VALUES(10,1),(11,2);
+    DROP TABLE parent;
+    SELECT id, pid FROM child ORDER BY id;
+} {10|
+11|}
+
+# DROP parent with ON DELETE SET DEFAULT (non-null default) should fail if default doesn't exist
+# This matches SQLite behavior - SET DEFAULT sets to default value, which then fails FK check
+do_execsql_test_in_memory_any_error fk-drop-parent-setdefault-nonexistent-default {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, pid INTEGER DEFAULT 999 REFERENCES parent(id) ON DELETE SET DEFAULT);
+    INSERT INTO parent VALUES(1);
+    INSERT INTO child VALUES(10,1);
+    DROP TABLE parent;
+}
+
+# DROP parent with ON DELETE CASCADE - composite FK
+do_execsql_test_on_specific_db {:memory:} fk-drop-parent-cascade-composite-fk {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(a INTEGER, b INTEGER, PRIMARY KEY(a, b));
+    CREATE TABLE child(id INTEGER PRIMARY KEY, pa INTEGER, pb INTEGER,
+                       FOREIGN KEY(pa, pb) REFERENCES parent(a, b) ON DELETE CASCADE);
+    INSERT INTO parent VALUES(1,2),(3,4);
+    INSERT INTO child VALUES(10,1,2),(11,3,4);
+    DROP TABLE parent;
+    SELECT * FROM child;
+} {}
+
+# DROP parent with ON DELETE SET NULL - composite FK
+do_execsql_test_on_specific_db {:memory:} fk-drop-parent-setnull-composite-fk {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(a INTEGER, b INTEGER, PRIMARY KEY(a, b));
+    CREATE TABLE child(id INTEGER PRIMARY KEY, pa INTEGER, pb INTEGER,
+                       FOREIGN KEY(pa, pb) REFERENCES parent(a, b) ON DELETE SET NULL);
+    INSERT INTO parent VALUES(1,2),(3,4);
+    INSERT INTO child VALUES(10,1,2),(11,3,4);
+    DROP TABLE parent;
+    SELECT id, pa, pb FROM child ORDER BY id;
+} {10||
+11||}
+
+# DROP parent with mixed FK actions - CASCADE and SET NULL on different children
+do_execsql_test_on_specific_db {:memory:} fk-drop-parent-mixed-cascade-setnull {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child_cascade(id INTEGER PRIMARY KEY, pid REFERENCES parent(id) ON DELETE CASCADE);
+    CREATE TABLE child_setnull(id INTEGER PRIMARY KEY, pid REFERENCES parent(id) ON DELETE SET NULL);
+    INSERT INTO parent VALUES(1),(2);
+    INSERT INTO child_cascade VALUES(10,1),(11,2);
+    INSERT INTO child_setnull VALUES(20,1),(21,2);
+    DROP TABLE parent;
+    SELECT 'cascade', count(*) FROM child_cascade
+    UNION ALL
+    SELECT 'setnull', count(*) FROM child_setnull;
+} {cascade|0
+setnull|2}
+
+# DROP parent with mixed actions - some RESTRICT (should fail)
+do_execsql_test_in_memory_any_error fk-drop-parent-mixed-with-restrict {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child_cascade(id INTEGER PRIMARY KEY, pid REFERENCES parent(id) ON DELETE CASCADE);
+    CREATE TABLE child_restrict(id INTEGER PRIMARY KEY, pid REFERENCES parent(id) ON DELETE RESTRICT);
+    INSERT INTO parent VALUES(1);
+    INSERT INTO child_cascade VALUES(10,1);
+    INSERT INTO child_restrict VALUES(20,1);
+    DROP TABLE parent;
+}
+
+# DROP parent with recursive CASCADE (A->B->C)
+do_execsql_test_on_specific_db {:memory:} fk-drop-parent-cascade-recursive {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE a(id INTEGER PRIMARY KEY);
+    CREATE TABLE b(id INTEGER PRIMARY KEY, aid REFERENCES a(id) ON DELETE CASCADE);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, bid REFERENCES b(id) ON DELETE CASCADE);
+    INSERT INTO a VALUES(1);
+    INSERT INTO b VALUES(10,1);
+    INSERT INTO c VALUES(100,10);
+    DROP TABLE a;
+    SELECT 'b', count(*) FROM b UNION ALL SELECT 'c', count(*) FROM c;
+} {b|0
+c|0}
+
+# DROP parent with orphaned FK values and CASCADE - orphaned should be ignored
+do_execsql_test_on_specific_db {:memory:} fk-drop-parent-cascade-with-orphaned {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE parent(id INTEGER PRIMARY KEY);
+    CREATE TABLE child(id INTEGER PRIMARY KEY, pid REFERENCES parent(id) ON DELETE CASCADE);
+    INSERT INTO parent VALUES(1),(2);
+    PRAGMA foreign_keys=OFF;
+    INSERT INTO child VALUES(10,999);
+    PRAGMA foreign_keys=ON;
+    INSERT INTO child VALUES(11,1);
+    DROP TABLE parent;
+    SELECT id, pid FROM child ORDER BY id;
+} {10|999}

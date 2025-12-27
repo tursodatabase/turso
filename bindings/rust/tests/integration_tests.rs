@@ -401,9 +401,8 @@ async fn test_concurrent_unique_constraint_regression() {
                     .await;
                 match result {
                     Ok(_) => (),
-                    Err(Error::SqlExecutionFailure(e))
-                        if e.contains("UNIQUE constraint failed")
-                            | e.contains("database is locked") => {}
+                    Err(Error::Constraint(e)) if e.contains("UNIQUE constraint failed") => {}
+                    Err(Error::Busy(e)) if e.contains("database is locked") => {}
                     Err(e) => {
                         panic!("Error executing statement: {e:?}");
                     }

@@ -143,7 +143,6 @@ pub fn py_turso_sync_new(
             }
             None => None,
         },
-        db_io: None,
     };
     let database =
         TursoDatabaseSync::<Vec<u8>>::new(db_config, sync_config).map_err(turso_error_to_py_err)?;

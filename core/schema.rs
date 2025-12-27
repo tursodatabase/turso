@@ -145,7 +145,9 @@ use turso_parser::{
 
 const SCHEMA_TABLE_NAME: &str = "sqlite_schema";
 const SCHEMA_TABLE_NAME_ALT: &str = "sqlite_master";
+pub const SQLITE_SEQUENCE_TABLE_NAME: &str = "sqlite_sequence";
 pub const DBSP_TABLE_PREFIX: &str = "__turso_internal_dbsp_state_v";
+pub const TURSO_INTERNAL_PREFIX: &str = "__turso_internal_";
 
 /// Used to refer to the implicit rowid column in tables without an alias during UPDATE
 pub const ROWID_SENTINEL: usize = usize::MAX;
@@ -158,10 +160,16 @@ pub const RESERVED_TABLE_PREFIXES: [&str; 2] = ["sqlite_", "__turso_internal_"];
 
 /// Check if a table name refers to a system table that should be protected from direct writes
 pub fn is_system_table(table_name: &str) -> bool {
+    RESERVED_TABLE_PREFIXES
+        .iter()
+        .any(|prefix| table_name.to_lowercase().starts_with(prefix))
+}
+
+pub fn can_write_to_table(table_name: &str) -> bool {
     let normalized = table_name.to_lowercase();
-    normalized == SCHEMA_TABLE_NAME
+    !(normalized == SCHEMA_TABLE_NAME
         || normalized == SCHEMA_TABLE_NAME_ALT
-        || table_name.starts_with(DBSP_TABLE_PREFIX)
+        || normalized.starts_with(TURSO_INTERNAL_PREFIX))
 }
 
 /// Type of schema object for conflict checking
@@ -1123,20 +1131,18 @@ impl Schema {
                     parent_pos.push(p);
                 }
 
-                // Determine if parent key is ROWID/alias
-                let parent_uses_rowid = parent_tbl.primary_key_columns.len().eq(&1) && {
-                    if parent_tbl.primary_key_columns.len() == 1 {
-                        let pk_name = &parent_tbl.primary_key_columns[0].0;
-                        // rowid or alias INTEGER PRIMARY KEY; either is ok implicitly
-                        parent_tbl.columns.iter().any(|c| {
+                // Determine if the FK's parent key is the ROWID or a rowid alias.
+                let parent_uses_rowid = if parent_cols.len() == 1 {
+                    let pc = &parent_cols[0];
+                    ROWID_STRS.iter().any(|&r| r.eq_ignore_ascii_case(pc))
+                        || parent_tbl.columns.iter().any(|c| {
                             c.is_rowid_alias()
                                 && c.name
                                     .as_deref()
-                                    .is_some_and(|n| n.eq_ignore_ascii_case(pk_name))
-                        }) || ROWID_STRS.iter().any(|&r| r.eq_ignore_ascii_case(pk_name))
-                    } else {
-                        false
-                    }
+                                    .is_some_and(|n| n.eq_ignore_ascii_case(pc))
+                        })
+                } else {
+                    false
                 };
 
                 // If not rowid, there must be a non-partial UNIQUE exactly on parent_cols
@@ -2193,14 +2199,6 @@ pub struct ForeignKey {
 }
 impl ForeignKey {
     fn validate(&self) -> Result<()> {
-        // TODO: remove this when actions are implemented
-        if !(matches!(self.on_update, RefAct::NoAction)
-            && matches!(self.on_delete, RefAct::NoAction))
-        {
-            crate::bail_parse_error!(
-                "foreign key actions other than NO ACTION are not implemented"
-            );
-        }
         if self
             .parent_columns
             .iter()
