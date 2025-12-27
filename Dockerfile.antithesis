@@ -56,7 +56,7 @@ COPY stress/libvoidstar.so /opt/antithesis/libvoidstar.so
 
 COPY --from=planner /app/recipe.json recipe.json
 RUN cargo chef cook --bin turso_stress --release --recipe-path recipe.json
-COPY --from=planner /app/Cargo.toml ./Cargo.toml
+COPY --from=planner /app/Cargo.toml /app/Cargo.lock ./
 COPY --from=planner /app/bindings/dart ./bindings/dart/
 COPY --from=planner /app/bindings/dotnet ./bindings/dotnet/
 COPY --from=planner /app/bindings/java ./bindings/java/
