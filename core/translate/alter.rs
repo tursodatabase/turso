@@ -193,7 +193,18 @@ pub fn translate_alter_table(
             }
 
             // TODO: check usage in CHECK constraint when implemented
-            // TODO: check usage in foreign key constraint when implemented
+
+            // Check if column is used in a foreign key constraint (child side)
+            // SQLite does not allow dropping a column that is part of a FK constraint
+            let column_name_norm = normalize_ident(column_name);
+            for fk in &btree.foreign_keys {
+                if fk.child_columns.contains(&column_name_norm) {
+                    return Err(LimboError::ParseError(format!(
+                        "error in table {table_name} after drop column: unknown column \"{column_name}\" in foreign key definition"
+                    )));
+                }
+            }
+
             // TODO: check usage in generated column when implemented
 
             // References in VIEWs are checked in the VDBE layer op_drop_column instruction.
