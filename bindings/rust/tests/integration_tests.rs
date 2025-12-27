@@ -418,6 +418,46 @@ async fn test_concurrent_unique_constraint_regression() {
 }
 
 #[tokio::test]
+async fn test_statement_query_resets_before_execution() {
+    let db = Builder::new_local(":memory:").build().await.unwrap();
+    let conn = db.connect().unwrap();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, value TEXT)", ())
+        .await
+        .unwrap();
+
+    for i in 0..5 {
+        conn.execute(&format!("INSERT INTO t VALUES ({i}, 'value_{i}')"), ())
+            .await
+            .unwrap();
+    }
+
+    let mut stmt = conn
+        .prepare("SELECT id, value FROM t ORDER BY id")
+        .await
+        .unwrap();
+
+    let mut rows = stmt.query(()).await.unwrap();
+    let mut count = 0;
+    while let Some(row) = rows.next().await.unwrap() {
+        let id: i64 = row.get(0).unwrap();
+        assert_eq!(id, count);
+        count += 1;
+    }
+    assert_eq!(count, 5);
+
+    let mut rows = stmt.query(()).await.unwrap();
+    let mut count = 0;
+    while let Some(row) = rows.next().await.unwrap() {
+        let id: i64 = row.get(0).unwrap();
+        assert_eq!(id, count);
+        count += 1;
+    }
+    // this will return 0 rows if query() does not reset the statement
+    assert_eq!(count, 5, "Second query() should return all rows again");
+}
+
+#[tokio::test]
 async fn test_encryption() {
     let temp_dir = tempfile::tempdir().unwrap();
     let db_file = temp_dir.path().join("test-encrypted.db");
@@ -467,6 +507,73 @@ async fn test_encryption() {
             row_count += 1;
         }
         assert_eq!(row_count, 1);
+    }
+}
+
+#[tokio::test]
+/// This results in a panic if the query isn't correctly reset
+async fn test_query_without_reset_does_not_panic() {
+    let tempfile = tempfile::NamedTempFile::new().unwrap();
+    let db = Builder::new_local(tempfile.path().to_str().unwrap())
+        .build()
+        .await
+        .unwrap();
+    let conn = db.connect().unwrap();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, value TEXT)", ())
+        .await
+        .unwrap();
+
+    for i in 0..10 {
+        conn.execute(&format!("INSERT INTO t VALUES ({i}, 'val')"), ())
+            .await
+            .unwrap();
+    }
+
+    let mut stmts: Vec<Option<turso::Statement>> = Vec::new();
+
+    for round in 0..4 {
+        for i in 0..30 {
+            let id = 100 + round * 100 + i;
+            let sql = match i % 4 {
+                0 => format!("INSERT INTO t VALUES ({id}, 'new')"),
+                1 => "SELECT * FROM t".to_string(),
+                2 => format!("UPDATE t SET value = 'upd' WHERE id = {}", i % 10),
+                _ => format!("DELETE FROM t WHERE id = {}", 1000 + i),
+            };
+            if let Ok(s) = conn.prepare(&sql).await {
+                stmts.push(Some(s));
+            }
+        }
+
+        for i in (0..stmts.len()).step_by(7) {
+            if let Some(Some(stmt)) = stmts.get_mut(i) {
+                if let Ok(mut rows) = stmt.query(()).await {
+                    let _ = rows.next().await;
+                }
+            }
+        }
+
+        for i in 0..3 {
+            let _ = conn
+                .execute(
+                    &format!("INSERT INTO t VALUES ({}, 'x')", 2000 + round * 10 + i),
+                    (),
+                )
+                .await;
+        }
+
+        for i in (0..stmts.len()).step_by(13) {
+            stmts[i] = None;
+        }
+
+        for i in (0..stmts.len()).step_by(5) {
+            if let Some(Some(stmt)) = stmts.get_mut(i) {
+                if let Ok(mut rows) = stmt.query(()).await {
+                    let _ = rows.next().await;
+                }
+            }
+        }
     }
 }
 
