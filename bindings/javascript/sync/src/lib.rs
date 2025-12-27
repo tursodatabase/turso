@@ -234,6 +234,7 @@ impl SyncEngine {
                 readonly: None,
                 timeout: None,
                 tracing: opts.tracing.clone(),
+                experimental: None,
             }),
         )?));
         let opts_filled = SyncEngineOptsFilled {
