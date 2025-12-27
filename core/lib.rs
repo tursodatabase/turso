@@ -2017,6 +2017,88 @@ impl Connection {
         }
     }
 
+    /// Create a point-in-time snapshot of the database by copying the database file.
+    #[cfg(feature = "fs")]
+    pub fn snapshot(self: &Arc<Self>, output_path: &str) -> Result<()> {
+        self._snapshot_copy_file(output_path)
+    }
+
+    /// Create a point-in-time snapshot of the database by copying the database file.
+    ///
+    /// This function:
+    /// 1. Performs a TRUNCATE checkpoint to flush all WAL data to the database file
+    /// 2. Acquires a read lock to prevent other checkpoints during copy
+    /// 3. Copies the database file (new writes go to WAL, not DB file)
+    /// 4. Releases the read lock
+    #[cfg(feature = "fs")]
+    fn _snapshot_copy_file(self: &Arc<Self>, output_path: &str) -> Result<()> {
+        use crate::util::MEMORY_PATH;
+        use std::path::Path;
+
+        if self.is_closed() {
+            return Err(LimboError::InternalError("Connection closed".to_string()));
+        }
+
+        // FIXME: enable mvcc
+        if self.mvcc_enabled() {
+            return Err(LimboError::InternalError(
+                "Snapshot not yet supported with MVCC mode".to_string(),
+            ));
+        }
+
+        // Cannot snapshot in-memory databases
+        if self.db.path == MEMORY_PATH {
+            return Err(LimboError::InvalidArgument(
+                "Cannot snapshot in-memory database".to_string(),
+            ));
+        }
+
+        let path = Path::new(output_path);
+        if path.exists() {
+            return Err(LimboError::InvalidArgument(format!(
+                "Output file already exists: {output_path}"
+            )));
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                LimboError::InternalError(format!("Failed to create parent directory: {e}"))
+            })?;
+        }
+
+        let pager = self.pager.load();
+        let Some(wal) = pager.wal.as_ref() else {
+            return Err(LimboError::InternalError(
+                "Cannot snapshot database without WAL".to_string(),
+            ));
+        };
+
+        // TRUNCATE checkpoint - flushes all WAL data to DB file and empties WAL
+        let _ = pager.blocking_checkpoint(
+            CheckpointMode::Truncate {
+                upper_bound_inclusive: None,
+            },
+            self.get_sync_mode(),
+        )?;
+
+        // Acquire read lock - prevents other checkpoints during copy
+        // After TRUNCATE, DB file is complete. New writes go to WAL only, not DB file.
+        pager.begin_read_tx()?;
+
+        // Copy the database file
+        let result = (|| -> Result<()> {
+            let source_path = Path::new(&self.db.path);
+            std::fs::copy(source_path, path).map_err(|e| {
+                LimboError::InternalError(format!("Failed to copy database file: {e}"))
+            })?;
+            Ok(())
+        })();
+
+        // Release read lock
+        wal.end_read_tx();
+
+        result
+    }
+
     /// Close a connection and checkpoint.
     pub fn close(&self) -> Result<()> {
         if self.is_closed() {
