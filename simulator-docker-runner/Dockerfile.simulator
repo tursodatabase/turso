@@ -52,6 +52,7 @@ COPY --from=planner /app/perf/throughput/turso ./perf/throughput/turso
 COPY --from=planner /app/simulator ./simulator/
 COPY --from=planner /app/packages ./packages/
 COPY --from=planner /app/sql_generation ./sql_generation/
+COPY --from=planner /app/Cargo.toml /app/Cargo.lock ./
 
 RUN cargo build --bin limbo_sim --release
 
