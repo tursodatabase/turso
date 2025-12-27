@@ -477,6 +477,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "branches"
+version = "0.4.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "21ab2097ac67710acd7d6034dd11b719c086a440ab65b92aa625be166f5995e9"
+dependencies = [
+ "rustc_version",
+]
+
+[[package]]
 name = "bstr"
 version = "1.11.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5367,6 +5376,7 @@ dependencies = [
  "arc-swap",
  "bitflags 2.9.4",
  "bloom",
+ "branches",
  "built",
  "bytemuck",
  "cfg_block",

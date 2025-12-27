@@ -1580,44 +1580,8 @@ pub fn read_integer(buf: &[u8], serial_type: u8) -> Result<i64> {
     }
 }
 
-/// Fast varint reader optimized for the common cases of 1-byte and 2-byte varints.
-///
-/// This function is a performance-optimized version of `read_varint()` that handles
-/// the most common varint cases inline before falling back to the full implementation.
-/// It follows the same varint encoding as SQLite.
-///
-/// # Optimized Cases
-///
-/// - **Single-byte case**: Values 0-127 (0x00-0x7F) are returned immediately
-/// - **Two-byte case**: Values 128-16383 (0x80-0x3FFF) are handled inline
-/// - **Multi-byte case**: Larger values fall back to the full `read_varint()` implementation
-///
+/// Reads varint integer from the buffer.
 /// This function is similar to `sqlite3GetVarint32`
-#[inline(always)]
-pub fn read_varint_fast(buf: &[u8]) -> Result<(u64, usize)> {
-    // Fast path: Single-byte varint
-    if let Some(&first_byte) = buf.first() {
-        if first_byte & 0x80 == 0 {
-            return Ok((first_byte as u64, 1));
-        }
-    } else {
-        crate::bail_corrupt_error!("Invalid varint");
-    }
-
-    // Fast path: Two-byte varint
-    if let Some(&second_byte) = buf.get(1) {
-        if second_byte & 0x80 == 0 {
-            let v = (((buf[0] & 0x7f) as u64) << 7) + (second_byte as u64);
-            return Ok((v, 2));
-        }
-    } else {
-        crate::bail_corrupt_error!("Invalid varint");
-    }
-
-    //Fallback: Multi-byte varint
-    read_varint(buf)
-}
-
 #[inline(always)]
 pub fn read_varint(buf: &[u8]) -> Result<(u64, usize)> {
     let mut v: u64 = 0;
