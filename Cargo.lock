@@ -5368,6 +5368,7 @@ dependencies = [
  "bitflags 2.9.4",
  "bloom",
  "built",
+ "bumpalo",
  "bytemuck",
  "cfg_block",
  "chrono",

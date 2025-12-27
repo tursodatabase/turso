@@ -1311,7 +1311,12 @@ impl RecordCursor {
         record: &ImmutableRecord,
         target_idx: usize,
     ) -> Result<()> {
-        let payload = record.get_payload();
+        self.ensure_parsed_upto_payload(record.get_payload(), target_idx)
+    }
+
+    /// Like `ensure_parsed_upto` but works directly with raw payload bytes.
+    #[inline(always)]
+    pub fn ensure_parsed_upto_payload(&mut self, payload: &[u8], target_idx: usize) -> Result<()> {
         if payload.is_empty() {
             return Ok(());
         }
@@ -1366,6 +1371,15 @@ impl RecordCursor {
         record: &'a ImmutableRecord,
         idx: usize,
     ) -> Result<ValueRef<'a>> {
+        self.deserialize_column_payload(record.get_payload(), idx)
+    }
+
+    /// Like `deserialize_column` but works directly with raw payload bytes.
+    pub fn deserialize_column_payload<'a>(
+        &self,
+        payload: &'a [u8],
+        idx: usize,
+    ) -> Result<ValueRef<'a>> {
         if idx >= self.serial_types.len() {
             return Ok(ValueRef::Null);
         }
@@ -1386,7 +1400,6 @@ impl RecordCursor {
 
         let start = self.offsets[idx];
         let end = self.offsets[idx + 1];
-        let payload = record.get_payload();
 
         let slice = &payload[start..end];
         let (value, _) = crate::storage::sqlite3_ondisk::read_value(slice, serial_type_obj)?;
