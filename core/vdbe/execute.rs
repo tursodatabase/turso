@@ -29,8 +29,8 @@ use crate::vdbe::hash_table::{HashEntry, HashTable, HashTableConfig};
 use crate::vdbe::insn::InsertFlags;
 use crate::vdbe::value::ComparisonOp;
 use crate::vdbe::{
-    registers_to_ref_values, EndStatement, OpHashBuildState, OpHashProbeState, StepResult,
-    TxnCleanup,
+    registers_to_ref_values, DeferredSeekState, EndStatement, OpHashBuildState, OpHashProbeState,
+    StepResult, TxnCleanup,
 };
 use crate::vector::{
     vector32, vector32_sparse, vector64, vector_concat, vector_distance_cos, vector_distance_dot,
@@ -1401,6 +1401,10 @@ pub enum OpColumnState {
         table_cursor_id: usize,
     },
     GetColumn,
+    GetColumnOptimized {
+        cursor_id: usize,
+        column: usize,
+    },
 }
 
 pub fn op_column(
@@ -1421,12 +1425,29 @@ pub fn op_column(
     'outer: loop {
         match state.op_column_state {
             OpColumnState::Start => {
-                if let Some((index_cursor_id, table_cursor_id)) =
-                    state.deferred_seeks[*cursor_id].take()
-                {
+                if let Some(deferred) = &state.deferred_seeks[*cursor_id] {
+                    if let Some(mapping) = &deferred.column_mapping {
+                        if let Some(&idx_p_1) = mapping.get(*column) {
+                            if idx_p_1 > 0 {
+                                let index_cursor_id = deferred.index_cursor_id;
+                                let index_col_idx = (idx_p_1 - 1) as usize;
+                                tracing::trace!(
+                                    "op_column: optimized redirection to index cursor {} col {}",
+                                    index_cursor_id,
+                                    index_col_idx
+                                );
+                                state.op_column_state = OpColumnState::GetColumnOptimized {
+                                    cursor_id: index_cursor_id,
+                                    column: index_col_idx,
+                                };
+                                continue 'outer;
+                            }
+                        }
+                    }
+                    let deferred = state.deferred_seeks[*cursor_id].take().unwrap();
                     state.op_column_state = OpColumnState::Rowid {
-                        index_cursor_id,
-                        table_cursor_id,
+                        index_cursor_id: deferred.index_cursor_id,
+                        table_cursor_id: deferred.table_cursor_id,
                     };
                 } else {
                     state.op_column_state = OpColumnState::GetColumn;
@@ -1476,13 +1497,17 @@ pub fn op_column(
                 }
                 state.op_column_state = OpColumnState::GetColumn;
             }
-            OpColumnState::GetColumn => {
+            OpColumnState::GetColumn | OpColumnState::GetColumnOptimized { .. } => {
+                let (active_cursor_id, active_column) = match state.op_column_state {
+                    OpColumnState::GetColumnOptimized { cursor_id, column } => (cursor_id, column),
+                    _ => (*cursor_id, *column),
+                };
                 // First check if this is a MaterializedViewCursor
                 {
-                    let cursor = state.get_cursor(*cursor_id);
+                    let cursor = state.get_cursor(active_cursor_id);
                     if let Cursor::MaterializedView(mv_cursor) = cursor {
                         // Handle materialized view column access
-                        let value = return_if_io!(mv_cursor.column(*column));
+                        let value = return_if_io!(mv_cursor.column(active_column));
                         state.registers[*dest] = Register::Value(value);
                         break 'outer;
                     }
@@ -1491,7 +1516,7 @@ pub fn op_column(
 
                 let (_, cursor_type) = program
                     .cursor_ref
-                    .get(*cursor_id)
+                    .get(active_cursor_id)
                     .expect("cursor_id should exist in cursor_ref");
                 match cursor_type {
                     CursorType::BTreeTable(_)
@@ -1499,7 +1524,7 @@ pub fn op_column(
                     | CursorType::MaterializedView(_, _) => {
                         'ifnull: {
                             let cursor_ref = must_be_btree_cursor!(
-                                *cursor_id,
+                                active_cursor_id,
                                 program.cursor_ref,
                                 state,
                                 "Column"
@@ -1526,7 +1551,7 @@ pub fn op_column(
                                 record_cursor.last_offset()
                             };
 
-                            let target_column = *column;
+                            let target_column = active_column;
                             let mut parse_pos = record_cursor.header_offset;
 
                             // Parse the header for serial types incrementally until we have the target column
@@ -2832,12 +2857,10 @@ pub fn op_row_id(
     loop {
         match state.op_row_id_state {
             OpRowIdState::Start => {
-                if let Some((index_cursor_id, table_cursor_id)) =
-                    state.deferred_seeks[*cursor_id].take()
-                {
+                if let Some(deferred) = state.deferred_seeks[*cursor_id].take() {
                     state.op_row_id_state = OpRowIdState::Record {
-                        index_cursor_id,
-                        table_cursor_id,
+                        index_cursor_id: deferred.index_cursor_id,
+                        table_cursor_id: deferred.table_cursor_id,
                     };
                 } else {
                     state.op_row_id_state = OpRowIdState::GetRowid;
@@ -3068,10 +3091,15 @@ pub fn op_deferred_seek(
         DeferredSeek {
             index_cursor_id,
             table_cursor_id,
+            column_mapping,
         },
         insn
     );
-    state.deferred_seeks[*table_cursor_id] = Some((*index_cursor_id, *table_cursor_id));
+    state.deferred_seeks[*table_cursor_id] = Some(DeferredSeekState {
+        index_cursor_id: *index_cursor_id,
+        table_cursor_id: *table_cursor_id,
+        column_mapping: column_mapping.clone(),
+    });
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }

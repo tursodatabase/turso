@@ -20,7 +20,7 @@ use super::{
     },
 };
 use crate::{
-    schema::{Index, IndexColumn, Table},
+    schema::{Index, IndexColumn, Table, EXPR_INDEX_SENTINEL},
     translate::{
         collate::{get_collseq_from_expr, CollationSeq},
         emitter::{prepare_cdc_if_necessary, HashCtx},
@@ -618,6 +618,18 @@ fn emit_hash_build_phase(
     Ok(payload_info)
 }
 
+fn build_column_mapping(table: &Table, index: &Index) -> Vec<u16> {
+    let mut mapping = vec![0u16; table.columns().len()];
+    for (i, col) in index.columns.iter().enumerate() {
+        if col.pos_in_table != EXPR_INDEX_SENTINEL {
+            if col.pos_in_table < mapping.len() {
+                mapping[col.pos_in_table] = (i + 1) as u16;
+            }
+        }
+    }
+    mapping
+}
+
 /// Set up the main query execution loop
 /// For example in the case of a nested table scan, this means emitting the Rewind instruction
 /// for all tables involved, outermost first.
@@ -764,9 +776,13 @@ pub fn open_loop(
                 }
                 if let Some(table_cursor_id) = table_cursor_id {
                     if let Some(index_cursor_id) = index_cursor_id {
+                        let column_mapping = table.op.index().map(|index| {
+                            Arc::new(build_column_mapping(&table.table, index))
+                        });
                         program.emit_insn(Insn::DeferredSeek {
                             index_cursor_id,
                             table_cursor_id,
+                            column_mapping,
                         });
                     }
                 }
@@ -863,10 +879,14 @@ pub fn open_loop(
 
                         if let Some(index_cursor_id) = index_cursor_id {
                             if let Some(table_cursor_id) = table_cursor_id {
+                                let column_mapping = index.as_ref().map(|index| {
+                                    Arc::new(build_column_mapping(&table.table, index))
+                                });
                                 // Don't do a btree table seek until it's actually necessary to read from the table.
                                 program.emit_insn(Insn::DeferredSeek {
                                     index_cursor_id,
                                     table_cursor_id,
+                                    column_mapping,
                                 });
                             }
                         }
@@ -895,9 +915,13 @@ pub fn open_loop(
                 program.preassign_label_to_next_insn(loop_start);
                 if let Some(table_cursor_id) = table_cursor_id {
                     if let Some(index_cursor_id) = index_cursor_id {
+                        let column_mapping = table.op.index().map(|index| {
+                            Arc::new(build_column_mapping(&table.table, index))
+                        });
                         program.emit_insn(Insn::DeferredSeek {
                             index_cursor_id,
                             table_cursor_id,
+                            column_mapping,
                         });
                     }
                 }

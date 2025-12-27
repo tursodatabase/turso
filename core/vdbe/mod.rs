@@ -316,6 +316,13 @@ pub struct OpHashProbeState {
     pub partition_idx: usize,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct DeferredSeekState {
+    pub index_cursor_id: CursorID,
+    pub table_cursor_id: CursorID,
+    pub column_mapping: Option<Arc<Vec<u16>>>,
+}
+
 /// The program state describes the environment in which the program executes.
 pub struct ProgramState {
     pub io_completions: Option<IOCompletions>,
@@ -325,7 +332,7 @@ pub struct ProgramState {
     registers: Vec<Register>,
     pub(crate) result_row: Option<Row>,
     last_compare: Option<std::cmp::Ordering>,
-    deferred_seeks: Vec<Option<(CursorID, CursorID)>>,
+    deferred_seeks: Vec<Option<DeferredSeekState>>,
     /// Indicate whether a coroutine has ended for a given yield register.
     /// If an element is present, it means the coroutine with the given register number has ended.
     ended_coroutine: Vec<u32>,
@@ -397,6 +404,7 @@ impl ProgramState {
         let cursors: Vec<Option<Cursor>> = (0..max_cursors).map(|_| None).collect();
         let cursor_seqs = vec![0i64; max_cursors];
         let registers = vec![Register::Value(Value::Null); max_registers];
+        let deferred_seeks = (0..max_cursors).map(|_| None).collect();
         Self {
             io_completions: None,
             pc: 0,
@@ -405,7 +413,7 @@ impl ProgramState {
             registers,
             result_row: None,
             last_compare: None,
-            deferred_seeks: vec![None; max_cursors],
+            deferred_seeks,
             ended_coroutine: vec![],
             once: SmallVec::<u32, 4>::new(),
             regex_cache: RegexCache::new(),
