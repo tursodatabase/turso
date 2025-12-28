@@ -105,14 +105,14 @@ impl Connection {
     }
 
     /// Query the database with SQL.
-    pub async fn query(&self, sql: &str, params: impl IntoParams) -> Result<Rows> {
+    pub async fn query(&self, sql: impl AsRef<str>, params: impl IntoParams) -> Result<Rows> {
         self.maybe_handle_dangling_tx().await?;
         let mut stmt = self.prepare(sql).await?;
         stmt.query(params).await
     }
 
     /// Execute SQL statement on the database.
-    pub async fn execute(&self, sql: &str, params: impl IntoParams) -> Result<u64> {
+    pub async fn execute(&self, sql: impl AsRef<str>, params: impl IntoParams) -> Result<u64> {
         self.maybe_handle_dangling_tx().await?;
         let mut stmt = self.prepare(sql).await?;
         stmt.execute(params).await
@@ -127,14 +127,14 @@ impl Connection {
     }
 
     /// Execute a batch of SQL statements on the database.
-    pub async fn execute_batch(&self, sql: &str) -> Result<()> {
+    pub async fn execute_batch(&self, sql: impl AsRef<str>) -> Result<()> {
         self.maybe_handle_dangling_tx().await?;
         self.prepare_execute_batch(sql).await?;
         Ok(())
     }
 
     /// Prepare a SQL statement for later execution.
-    pub async fn prepare(&self, sql: &str) -> Result<Statement> {
+    pub async fn prepare(&self, sql: impl AsRef<str>) -> Result<Statement> {
         let conn = self.get_inner_connection()?;
         let stmt = conn.prepare_single(sql)?;
 
