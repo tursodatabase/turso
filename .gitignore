@@ -67,3 +67,7 @@ test.sql
 # for elle edn transaction history
 *.edn
 elle-history-results/
+
+CLAUDE.md
+bindings/python/dev.py
+bindings/python/implementation-test/
