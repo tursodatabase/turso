@@ -1,4 +1,5 @@
 use core::f64;
+use std::fmt::Write;
 
 use crate::types::Value;
 use crate::vdbe::Register;
