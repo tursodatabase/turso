@@ -67,7 +67,8 @@ pub fn estimate_cost_for_scan_or_seek(
     let base_row_count = *base_row_count;
 
     let Some(index_info) = index_info else {
-        // Full table scan
+
+
         if has_real_stats {
             // With real stats, account for caching on small tables
             let table_pages = (base_row_count / ESTIMATED_HARDCODED_ROWS_PER_PAGE as f64).max(1.0);
@@ -84,7 +85,7 @@ pub fn estimate_cost_for_scan_or_seek(
             return Cost(io_cost + cpu_cost);
         } else {
             // Without real stats, use simple IO-based model
-            return estimate_page_io_cost(input_cardinality * base_row_count);
+            return Cost(estimate_page_io_cost(input_cardinality * base_row_count).0 * 3.0);
         }
     };
 
