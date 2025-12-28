@@ -1,7 +1,7 @@
 // This module contains code for emitting bytecode instructions for SQL query execution.
 // It handles translating high-level SQL operations into low-level bytecode that can be executed by the virtual machine.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
 use std::sync::Arc;
 
@@ -18,16 +18,13 @@ use super::main_loop::{
 };
 use super::order_by::{emit_order_by, init_order_by, SortMetadata};
 use super::plan::{
-    Distinctness, HashJoinOp, JoinOrderMember, Operation, Scan, SelectPlan, TableReferences,
-    UpdatePlan,
+    Distinctness, JoinOrderMember, Operation, Scan, SelectPlan, TableReferences, UpdatePlan,
 };
 use super::select::emit_simple_count;
 use super::subquery::emit_from_clause_subqueries;
 use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
 use crate::function::Func;
 use crate::schema::{BTreeTable, Column, Index, IndexColumn, Schema, Table, ROWID_SENTINEL};
-use crate::translate::insert::ROWID_COLUMN;
-use crate::translate::planner::{table_mask_from_expr, TableMask};
 use crate::translate::compound_select::emit_program_for_compound_select;
 use crate::translate::expr::{
     bind_and_rewrite_expr, emit_returning_results, translate_expr_no_constant_opt, walk_expr_mut,
@@ -38,10 +35,12 @@ use crate::translate::fkeys::{
     emit_guarded_fk_decrement, fire_fk_delete_actions, fire_fk_update_actions, open_read_index,
     open_read_table, stabilize_new_row_for_fk,
 };
+use crate::translate::insert::ROWID_COLUMN;
 use crate::translate::plan::{
     DeletePlan, EvalAt, JoinedTable, Plan, QueryDestination, ResultSetColumn, Search,
 };
 use crate::translate::planner::ROWID_STRS;
+use crate::translate::planner::{table_mask_from_expr, TableMask};
 use crate::translate::subquery::emit_non_from_clause_subquery;
 use crate::translate::trigger_exec::{
     fire_trigger, get_relevant_triggers_type_and_time, has_relevant_triggers_type_only,
@@ -56,8 +55,8 @@ use crate::vdbe::insn::{
     to_u16, {CmpInsFlags, IdxInsertFlags, InsertFlags, RegisterOrLiteral},
 };
 use crate::vdbe::{insn::Insn, BranchOffset, CursorID};
-use crate::Connection;
-use crate::{bail_parse_error, Result, SymbolTable};
+use crate::{bail_parse_error, emit_explain, Result, SymbolTable};
+use crate::{turso_assert, Connection, QueryMode};
 
 pub struct Resolver<'a> {
     pub schema: &'a Schema,
@@ -177,9 +176,8 @@ pub struct TranslateCtx<'a> {
     pub meta_left_joins: Vec<Option<LeftJoinMetadata>>,
     pub resolver: Resolver<'a>,
     /// Hash table contexts for hash joins, keyed by build table index.
-    /// Supports multiple hash joins in chain patterns.
     pub hash_table_contexts: HashMap<usize, HashCtx>,
-    /// Materialized build input cursors for hash joins, keyed by build table index.
+    /// Materialized build-input rowid cursors for hash joins, keyed by build table index.
     pub materialized_build_inputs: HashMap<usize, CursorID>,
     /// A list of expressions that are not aggregates, along with a flag indicating
     /// whether the expression should be included in the output for each group.
@@ -287,7 +285,15 @@ pub fn emit_program_for_select(
     mut plan: SelectPlan,
 ) -> Result<()> {
     let materialized_build_inputs = emit_materialized_build_inputs(program, resolver, &mut plan)?;
+    emit_program_for_select_with_inputs(program, resolver, plan, materialized_build_inputs)
+}
 
+fn emit_program_for_select_with_inputs(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    mut plan: SelectPlan,
+    materialized_build_inputs: HashMap<usize, CursorID>,
+) -> Result<()> {
     let mut t_ctx = TranslateCtx::new(
         program,
         resolver.schema,
@@ -304,6 +310,9 @@ pub fn emit_program_for_select(
     Ok(())
 }
 
+// Hash joins build a hash table by scanning the build-side table. When the build side
+// depends on prior join constraints (or has self-filters), we materialize the matching
+// build rowids up front so the hash build only sees filtered rows.
 fn emit_materialized_build_inputs(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
@@ -311,19 +320,44 @@ fn emit_materialized_build_inputs(
 ) -> Result<HashMap<usize, CursorID>> {
     let mut build_inputs: HashMap<usize, CursorID> = HashMap::new();
     let mut build_tables: Vec<usize> = Vec::new();
+    let mut hash_tables_to_keep_open: HashSet<usize> = HashSet::new();
+    let mut seen_hash_build_tables: HashSet<usize> = HashSet::new();
 
+    // Keep hash tables open while running materialization subplans so we can reuse them.
     for table in plan.table_references.joined_tables().iter() {
         if let Operation::HashJoin(hash_join_op) = &table.op {
-            if hash_join_op.materialize_build_input {
+            turso_assert!(
+                seen_hash_build_tables.insert(hash_join_op.build_table_idx),
+                "hash join build table appears multiple times in plan"
+            );
+            let build_table = &plan.table_references.joined_tables()[hash_join_op.build_table_idx];
+            hash_tables_to_keep_open.insert(build_table.internal_id.into());
+        }
+    }
+
+    let mut seen_build_tables: HashSet<usize> = HashSet::new();
+    for member in plan.join_order.iter() {
+        let table = &plan.table_references.joined_tables()[member.original_idx];
+        if let Operation::HashJoin(hash_join_op) = &table.op {
+            if hash_join_op.materialize_build_input
+                && seen_build_tables.insert(hash_join_op.build_table_idx)
+            {
                 build_tables.push(hash_join_op.build_table_idx);
             }
         }
     }
 
-    build_tables.sort_unstable();
-    build_tables.dedup();
-
     for build_table_idx in build_tables {
+        let build_table = &plan.table_references.joined_tables()[build_table_idx];
+        let build_table_name = if build_table.table.get_name() == build_table.identifier {
+            build_table.identifier.clone()
+        } else {
+            format!(
+                "{} AS {}",
+                build_table.table.get_name(),
+                build_table.identifier
+            )
+        };
         let internal_id = program.table_reference_counter.next();
         let ephemeral_table = Arc::new(BTreeTable {
             root_page: 0,
@@ -337,16 +371,32 @@ fn emit_materialized_build_inputs(
             foreign_keys: vec![],
         });
         let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(ephemeral_table.clone()));
+        // Build a plan that emits only rowids for the build table using the join prefix
+        // that makes the hash join legal (including any earlier hash joins).
         let materialize_plan =
             build_materialized_build_input_plan(plan, build_table_idx, cursor_id, ephemeral_table)?;
 
+        // Make the materialization plan show up as a subtree in EXPLAIN QUERY PLAN output.
+        emit_explain!(
+            program,
+            true,
+            format!("MATERIALIZE hash build input for {build_table_name}")
+        );
         program.emit_insn(Insn::OpenEphemeral {
             cursor_id,
             is_table: true,
         });
         program.incr_nesting();
-        emit_program_for_select(program, resolver, materialize_plan)?;
+        program.set_hash_tables_to_keep_open(&hash_tables_to_keep_open);
+        emit_program_for_select_with_inputs(
+            program,
+            resolver,
+            materialize_plan,
+            build_inputs.clone(),
+        )?;
+        program.clear_hash_tables_to_keep_open();
         program.decr_nesting();
+        program.pop_current_parent_explain();
 
         build_inputs.insert(build_table_idx, cursor_id);
     }
@@ -354,29 +404,71 @@ fn emit_materialized_build_inputs(
     Ok(build_inputs)
 }
 
+// Construct a SELECT plan that materializes build-side rowids into an ephemeral table.
+// The join order is the original prefix up to (but excluding) the probe table, plus
+// the build table itself. This filters build rows using only prior join constraints.
 fn build_materialized_build_input_plan(
     plan: &SelectPlan,
     build_table_idx: usize,
     cursor_id: CursorID,
     table: Arc<BTreeTable>,
 ) -> Result<SelectPlan> {
-    let Some(build_pos) = plan.join_order.iter().position(|m| {
-        let table_ref = &plan.table_references.joined_tables()[m.original_idx];
-        matches!(
-            table_ref.op,
-            Operation::HashJoin(HashJoinOp {
-                build_table_idx: idx,
-                ..
-            }) if idx == build_table_idx
-        )
-    })
-    else {
-        return Err(crate::LimboError::PlanningError(
-            "materialized hash build input: build table not in join order".to_string(),
-        ));
-    };
+    let probe_table_idx = plan
+        .table_references
+        .joined_tables()
+        .iter()
+        .find_map(|table_ref| {
+            if let Operation::HashJoin(hash_join_op) = &table_ref.op {
+                if hash_join_op.build_table_idx == build_table_idx {
+                    return Some(hash_join_op.probe_table_idx);
+                }
+            }
+            None
+        })
+        .ok_or_else(|| {
+            crate::LimboError::PlanningError(
+                "materialized hash build input: missing probe table".to_string(),
+            )
+        })?;
 
-    let join_order = plan.join_order[..=build_pos].to_vec();
+    let mut join_order = plan.join_order.clone();
+    if join_order
+        .iter()
+        .all(|member| member.original_idx != probe_table_idx)
+    {
+        let probe_table = &plan.table_references.joined_tables()[probe_table_idx];
+        join_order.push(JoinOrderMember {
+            table_id: probe_table.internal_id,
+            original_idx: probe_table_idx,
+            is_outer: probe_table
+                .join_info
+                .as_ref()
+                .is_some_and(|join_info| join_info.outer),
+        });
+    }
+    let build_pos = join_order
+        .iter()
+        .position(|m| m.original_idx == probe_table_idx)
+        .expect("probe table just ensured in join order");
+
+    // Only include tables prior to the probe table. The materialization subplan
+    // should filter the build table using prior join constraints, not scan the probe.
+    let join_order = join_order[..build_pos].to_vec();
+    let mut join_order = join_order;
+    if join_order
+        .iter()
+        .all(|member| member.original_idx != build_table_idx)
+    {
+        let build_table = &plan.table_references.joined_tables()[build_table_idx];
+        join_order.push(JoinOrderMember {
+            table_id: build_table.internal_id,
+            original_idx: build_table_idx,
+            is_outer: build_table
+                .join_info
+                .as_ref()
+                .is_some_and(|join_info| join_info.outer),
+        });
+    }
     let mut included_tables: Vec<usize> = join_order.iter().map(|m| m.original_idx).collect();
     for member in join_order.iter() {
         let table_ref = &plan.table_references.joined_tables()[member.original_idx];
@@ -395,14 +487,22 @@ fn build_materialized_build_input_plan(
             &plan.table_references,
             &plan.non_from_clause_subqueries,
         )?;
-        term.consumed = !included_mask.contains_all(&mask);
+        // Preserve consumed terms that the optimizer already suppressed.
+        term.consumed |= !included_mask.contains_all(&mask);
     }
 
     let mut table_references = plan.table_references.clone();
     for joined_table in table_references.joined_tables_mut().iter_mut() {
         if let Operation::HashJoin(hash_join_op) = &mut joined_table.op {
             if hash_join_op.build_table_idx == build_table_idx {
+                // Avoid recursive materialization and disable the hash join for the build table
+                // so it can be accessed using the join constraints.
                 hash_join_op.materialize_build_input = false;
+                joined_table.op = Operation::default_scan_for(&joined_table.table);
+            } else if hash_join_op.probe_table_idx == probe_table_idx {
+                // The probe table is not part of the materialization prefix, so
+                // disable hash joins anchored on it.
+                joined_table.op = Operation::default_scan_for(&joined_table.table);
             }
         }
     }
@@ -473,7 +573,7 @@ pub fn emit_query<'a>(
     }
 
     // Emit FROM clause subqueries first so the results can be read in the main query loop.
-    emit_from_clause_subqueries(program, t_ctx, &mut plan.table_references)?;
+    emit_from_clause_subqueries(program, t_ctx, &mut plan.table_references, &plan.join_order)?;
 
     // No rows will be read from source table loops if there is a constant false condition eg. WHERE 0
     // however an aggregation might still happen,

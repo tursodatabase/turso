@@ -79,8 +79,9 @@ impl Display for SelectPlan {
         writeln!(f, "QUERY PLAN")?;
 
         // Print each table reference with appropriate indentation based on join depth
-        for (i, reference) in self.table_references.joined_tables().iter().enumerate() {
-            let is_last = i == self.table_references.joined_tables().len() - 1;
+        for (i, member) in self.join_order.iter().enumerate() {
+            let reference = &self.table_references.joined_tables()[member.original_idx];
+            let is_last = i == self.join_order.len() - 1;
             let indent = if i == 0 {
                 if is_last { "`--" } else { "|--" }.to_string()
             } else {

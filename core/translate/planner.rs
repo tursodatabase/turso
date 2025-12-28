@@ -893,6 +893,11 @@ impl TableMask {
     pub fn intersects(&self, other: &TableMask) -> bool {
         self.0 & other.0 != 0
     }
+
+    /// Iterate the table indices present in this mask.
+    pub fn tables_iter(&self) -> impl Iterator<Item = usize> + '_ {
+        (0..127).filter(move |table_no| self.contains_table(*table_no))
+    }
 }
 
 /// Returns a [TableMask] representing the tables referenced in the given expression.
