@@ -222,10 +222,10 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
                 let value = &values[args_index].get_value();
                 match value {
                     Value::Float(f) => write!(result, "{:X}", *f as i64).unwrap(),
-                    Value::Integer(i) => write!(result, "{:X}", i).unwrap(),
+                    Value::Integer(i) => write!(result, "{i:X}").unwrap(),
                     Value::Text(s) => {
                         let i: i64 = s.as_str().parse::<i64>().unwrap_or(0);
-                        write!(result, "{:X}", i).unwrap();
+                        write!(result, "{i:X}").unwrap();
                     }
                     _ => result.push('0'),
                 }
