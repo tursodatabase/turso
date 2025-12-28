@@ -9602,9 +9602,12 @@ pub fn op_hash_probe(
         (keys, None)
     };
 
-    let hash_table = state.hash_tables.get_mut(&hash_table_id).ok_or_else(|| {
-        LimboError::InternalError(format!("Hash table not found in register {hash_table_id}"))
-    })?;
+    let Some(hash_table) = state.hash_tables.get_mut(&hash_table_id) else {
+        // Empty build side: treat as no match and jump to target.
+        state.op_hash_probe_state = None;
+        state.pc = target_pc.as_offset_int();
+        return Ok(InsnFunctionStepResult::Step);
+    };
 
     // For spilled hash tables, load the appropriate partition on demand
     if hash_table.has_spilled() {

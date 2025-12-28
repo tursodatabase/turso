@@ -1,15 +1,18 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use turso_parser::ast::TableInternalId;
+use turso_parser::ast::{Expr, Operator, TableInternalId};
 
 use crate::{
     translate::{
+        expr::{walk_expr, WalkControl},
         optimizer::{
-            access_method::{try_hash_join_access_method, AccessMethodParams},
+            access_method::{
+                estimate_hash_join_cost, try_hash_join_access_method, AccessMethodParams,
+            },
             cost::{Cost, RowCountEstimate},
             order::plan_satisfies_order_target,
         },
-        plan::{JoinOrderMember, JoinedTable, NonFromClauseSubquery, WhereTerm},
+        plan::{HashJoinKey, JoinOrderMember, JoinedTable, NonFromClauseSubquery, WhereTerm},
         planner::TableMask,
     },
     LimboError, Result,
@@ -21,6 +24,13 @@ use super::{
     cost::ESTIMATED_HARDCODED_ROWS_PER_TABLE,
     order::OrderTarget,
 };
+
+// Upper bound on rowids to materialize for a hash build input.
+const MAX_MATERIALIZED_BUILD_ROWS: f64 = 200_000.0;
+// Minimum selectivity to consider materializing build-side filters.
+const MATERIALIZE_SELECTIVITY_THRESHOLD: f64 = 0.5;
+// Stricter selectivity when the hash join probe is nested under outer loops.
+const NESTED_PROBE_SELECTIVITY_THRESHOLD: f64 = 0.15;
 
 /// Represents an n-ary join, anywhere from 1 table to N tables.
 #[derive(Debug, Clone)]
@@ -47,6 +57,14 @@ impl JoinN {
 
 /// Join n-1 tables with the n'th table.
 /// Returns None if the plan is worse than the provided cost upper bound or if no valid access method is found.
+///
+/// Hash-joins:
+/// - We only consider hash join once there is a non-empty LHS.
+/// - The build side is the most recently joined table (left-deep hash join); the RHS is the probe.
+/// - We avoid hash-join shapes that would drop build-side filters unless we can preserve them
+///   via materialized build rowids.
+/// - We do not allow probe->build chaining because rebuilding from the full table would ignore
+///   prior join filters.
 #[allow(clippy::too_many_arguments)]
 pub fn join_lhs_and_rhs<'a>(
     lhs: Option<&JoinN>,
@@ -60,6 +78,7 @@ pub fn join_lhs_and_rhs<'a>(
     cost_upper_bound: Cost,
     joined_tables: &[JoinedTable],
     where_clause: &mut [WhereTerm],
+    where_term_table_ids: &[HashSet<TableInternalId>],
     subqueries: &[NonFromClauseSubquery],
 ) -> Result<Option<JoinN>> {
     // The input cardinality for this join is the output cardinality of the previous join.
@@ -68,9 +87,9 @@ pub fn join_lhs_and_rhs<'a>(
     let input_cardinality = lhs.map_or(1, |l| l.output_cardinality);
 
     let rhs_table_number = join_order.last().unwrap().original_idx;
-    let rhs_base_rows = base_table_rows.get(rhs_table_number).copied().unwrap_or(
-        RowCountEstimate::HardcodedFallback(ESTIMATED_HARDCODED_ROWS_PER_TABLE as f64),
-    );
+    let rhs_base_rows = base_table_rows.get(rhs_table_number).copied().unwrap_or({
+        RowCountEstimate::HardcodedFallback(ESTIMATED_HARDCODED_ROWS_PER_TABLE as f64)
+    });
 
     let Some(mut method) = find_best_access_method_for_join_order(
         rhs_table_reference,
@@ -125,26 +144,47 @@ pub fn join_lhs_and_rhs<'a>(
         .filter(|c| lhs_mask.contains_all(&c.lhs_mask))
         .map(|c| c.selectivity)
         .product::<f64>();
+    let rhs_internal_id = rhs_table_reference.internal_id;
+    let lhs_internal_ids: HashSet<TableInternalId> = lhs
+        .map(|l| {
+            l.table_numbers()
+                .map(|table_no| joined_tables[table_no].internal_id)
+                .collect()
+        })
+        .unwrap_or_default();
+    let has_join_constraint = lhs.is_some()
+        && where_term_table_ids.iter().any(|table_ids| {
+            table_ids.contains(&rhs_internal_id)
+                && table_ids.iter().any(|id| lhs_internal_ids.contains(id))
+        });
+    if lhs.is_some() && !has_join_constraint {
+        // Penalize cross products so we don't introduce a table before it can join.
+        let cross_cost = (input_cardinality as f64) * (*rhs_base_rows);
+        best_access_method.cost = best_access_method.cost + Cost(cross_cost);
+    }
 
     // If we already have a non-empty LHS (at least one table has been joined),
-    // consider a hash-join alternative for the current RHS. We only allow hash
-    // joins when:
+    // consider a hash-join alternative for the current RHS. This is a left-deep
+    // join: the last table in the LHS becomes the build side, and the new RHS
+    // table is the probe side. We only allow hash joins when:
     //
-    // - The would-be build table is accessed via a scan
-    // - Choosing hash join does not destroy a useful ORDER BY the nested-loop plan would satisfy.
+    // - The would-be build table is accessed via a scan, or we can preserve its
+    //   filters by materializing rowids.
+    // - Choosing hash join does not destroy a useful ORDER BY the nested-loop
+    //   plan would satisfy.
     // - The probe table is not using a selective index seek we’d prefer to keep.
-    // - The build table has no remaining constraints from prior tables that
-    //   are not already consumed as hash-join keys in earlier hash joins.
+    // - The build table has no remaining constraints from prior tables that are
+    //   not already consumed as hash-join keys in earlier hash joins.
     if let Some(lhs) = lhs {
+        // For a left-deep plan, the "build" side is the newest table added to the LHS.
         let lhs_table_idx = join_order[join_order.len() - 2].original_idx;
         let rhs_table_idx = join_order.last().unwrap().original_idx;
         let lhs_table = &joined_tables[lhs_table_idx];
-        let build_has_rowid = lhs_table
-            .btree()
-            .is_some_and(|btree| btree.has_rowid);
+        let build_has_rowid = lhs_table.btree().is_some_and(|btree| btree.has_rowid);
 
-        // If the chosen access method for the build table already uses constraints
-        // skip hash join to avoid dropping those filters.
+        // If the chosen access method for the build table already uses constraints,
+        // skip hash join to avoid dropping those filters (unless we later decide
+        // to materialize the filtered rowids).
         let build_access_method_uses_constraints = lhs
             .data
             .iter()
@@ -190,7 +230,13 @@ pub fn join_lhs_and_rhs<'a>(
             preserves
         });
 
-        let build_cardinality = lhs.output_cardinality as f64;
+        let build_constraints = &all_constraints[lhs_table_idx];
+        let build_base_rows = base_table_rows.get(lhs_table_idx).copied().unwrap_or({
+            RowCountEstimate::HardcodedFallback(ESTIMATED_HARDCODED_ROWS_PER_TABLE as f64)
+        });
+        let build_self_selectivity =
+            build_self_constraint_selectivity(build_constraints, lhs_table_idx);
+        let build_cardinality = (*build_base_rows) * build_self_selectivity;
         let probe_cardinality = *rhs_base_rows;
 
         let rhs_has_selective_seek = matches!(
@@ -201,7 +247,9 @@ pub fn join_lhs_and_rhs<'a>(
             } if !constraint_refs.is_empty()
         );
 
-        // The probe table must NOT be the build table of any earlier hash join
+        // The probe table must NOT be the build table of any earlier hash join,
+        // otherwise we would need to re-probe a table that is already being
+        // produced by a hash build.
         let arena = &access_methods_arena;
         let probe_table_is_prior_build = lhs.data.iter().any(|(_, am_idx)| {
             arena.get(*am_idx).is_some_and(|am| {
@@ -216,11 +264,11 @@ pub fn join_lhs_and_rhs<'a>(
             })
         });
 
-        // The build table must NOT have any constraints from prior tables
-        // that won't be consumed as hash join keys. When a table becomes a hash build table,
-        // its cursor is exhausted after building. If there are constraints like `prior.x = build.x`
-        // that aren't part of the build & probe hash join, they can't be evaluated because the
-        // build cursor is no longer positioned.
+        // The build table must NOT have any constraints from prior tables that won't be
+        // consumed as hash-join keys. When a table becomes a hash build table, its
+        // cursor is exhausted after building. If there are constraints like
+        // `prior.x = build.x` that aren't part of the build & probe hash join, they
+        // can't be evaluated because the build cursor is no longer positioned.
         //
         // HOWEVER: If the constraint references only tables that are the BUILD side
         // of earlier hash joins where this proposed build table was the PROBE, then
@@ -234,34 +282,36 @@ pub fn join_lhs_and_rhs<'a>(
         // - When considering: products(build) - order_items(probe)
         // - products has constraint from items, BUT items is build of an earlier hash join where products was probe
         // - So the constraint IS consumed, and products cursor IS positioned via SeekRowid
-        let build_has_prior_constraints = {
-            let build_constraints = &all_constraints[lhs_table_idx];
-
-            // Get the set of tables that are build tables for hash joins where lhs_table_idx was probe
-            let tables_already_hash_joined_as_build: Vec<usize> = {
-                let arena = &access_methods_arena;
-                lhs.data
-                    .iter()
-                    .filter_map(|(_, am_idx)| {
-                        arena.get(*am_idx).and_then(|am| {
-                            if let AccessMethodParams::HashJoin {
-                                build_table_idx,
-                                probe_table_idx,
-                                ..
-                            } = &am.params
-                            {
-                                if *probe_table_idx == lhs_table_idx {
-                                    Some(*build_table_idx)
-                                } else {
-                                    None
-                                }
+        // Get the set of tables that are build tables for hash joins where lhs_table_idx was probe
+        let tables_already_hash_joined_as_build: Vec<usize> = {
+            let arena = &access_methods_arena;
+            lhs.data
+                .iter()
+                .filter_map(|(_, am_idx)| {
+                    arena.get(*am_idx).and_then(|am| {
+                        if let AccessMethodParams::HashJoin {
+                            build_table_idx,
+                            probe_table_idx,
+                            ..
+                        } = &am.params
+                        {
+                            if *probe_table_idx == lhs_table_idx {
+                                Some(*build_table_idx)
                             } else {
                                 None
                             }
-                        })
+                        } else {
+                            None
+                        }
                     })
-                    .collect()
-            };
+                })
+                .collect()
+        };
+        let prior_hash_build_mask =
+            TableMask::from_table_number_iter(tables_already_hash_joined_as_build.iter().copied());
+
+        let build_has_prior_constraints = {
+            let build_constraints = &all_constraints[lhs_table_idx];
 
             build_constraints.constraints.iter().any(|c| {
                 // Check if this constraint references prior tables that are NOT already
@@ -285,12 +335,30 @@ pub fn join_lhs_and_rhs<'a>(
             })
         };
 
-        // Only consider hash join when the build table is using a plain table scan
-        // (no index, no constraint-driven search). Otherwise we'd drop useful filters
-        // or break the access pattern the planner chose.
+        // If this build table was already a probe in a prior hash join, scanning it again
+        // for a hash build would ignore the prior join filters. We currently disallow
+        // probe-to-build chaining, even with materialization.
+        let build_table_is_prior_probe = lhs.data.iter().any(|(_, am_idx)| {
+            let arena = &access_methods_arena;
+            arena.get(*am_idx).is_some_and(|am| {
+                if let AccessMethodParams::HashJoin {
+                    probe_table_idx, ..
+                } = &am.params
+                {
+                    *probe_table_idx == lhs_table_idx
+                } else {
+                    false
+                }
+            })
+        });
+
+        // Hash joins are safe only if we won't drop build-side filters:
+        // - If the build scan is unconstrained, we can build directly.
+        // - If there are prior/self constraints, we need materialization to preserve them.
+        // Full index scans are treated as unconstrained for hash-join eligibility.
         //
         // We intentionally do NOT (yet) allow a table that is already the probe side of
-        // a hash join to become the build side of another hash join, the second hash join
+        // a hash join to become the build side of another hash join; the second hash join
         // would rebuild from ALL rows of the middle table, not just the matching rows from the first.
         let build_am_is_plain_table_scan = lhs
             .data
@@ -302,7 +370,6 @@ pub fn join_lhs_and_rhs<'a>(
                     matches!(
                         &am.params,
                         AccessMethodParams::BTreeTable {
-                            index: None,
                             constraint_refs,
                             ..
                         } if constraint_refs.is_empty()
@@ -310,40 +377,185 @@ pub fn join_lhs_and_rhs<'a>(
                 })
             })
             .unwrap_or(false);
-        let requires_materialized_build_input =
-            build_access_method_uses_constraints || build_has_prior_constraints;
+
+        // Eligibility gate: prefer nested-loop when it preserves ORDER BY or uses
+        // a selective probe seek, and avoid hash join when it would invalidate
+        // prior hash-join semantics.
         let allow_hash_join = !nested_loop_preserves_order
             && !rhs_has_selective_seek
             && !probe_table_is_prior_build
-            && (build_am_is_plain_table_scan || requires_materialized_build_input)
-            && (!requires_materialized_build_input || build_has_rowid);
+            && !build_table_is_prior_probe
+            && (!build_has_prior_constraints || build_has_rowid);
+
+        tracing::debug!(
+            lhs_table = lhs_table.table.get_name(),
+            rhs_table = rhs_table_reference.table.get_name(),
+            allow_hash_join,
+            nested_loop_preserves_order,
+            rhs_has_selective_seek,
+            probe_table_is_prior_build,
+            build_am_is_plain_table_scan,
+            build_has_rowid,
+            "hash-join eligibility check"
+        );
         if allow_hash_join {
-            let lhs_constraints = &all_constraints[lhs_table_idx];
+            let lhs_constraints = build_constraints;
+            let prior_mask = lhs_mask.without_table(lhs_table_idx);
+            let mut allowed_probe_table_ids = Vec::new();
+            for (table_no, _) in lhs.data.iter() {
+                let table_id = joined_tables[*table_no].internal_id;
+                if !allowed_probe_table_ids.contains(&table_id) {
+                    allowed_probe_table_ids.push(table_id);
+                }
+            }
+            let rhs_table_id = rhs_table_reference.internal_id;
+            if !allowed_probe_table_ids.contains(&rhs_table_id) {
+                allowed_probe_table_ids.push(rhs_table_id);
+            }
+            // Probe cost scales with the number of times we execute the probe phase.
+            // If the LHS is exactly the build table, this is a single build/probe pair.
+            let probe_multiplier = if lhs.data.len() == 1 && lhs.data[0].0 == lhs_table_idx {
+                1.0
+            } else {
+                input_cardinality as f64
+            };
             if let Some(hash_join_method) = try_hash_join_access_method(
                 lhs_table,
                 rhs_table_reference,
                 lhs_table_idx,
                 rhs_table_idx,
+                &allowed_probe_table_ids,
                 lhs_constraints,
                 rhs_constraints,
                 where_clause,
                 build_cardinality,
                 probe_cardinality,
+                probe_multiplier,
                 subqueries,
             ) {
                 let mut hash_join_method = hash_join_method;
+                let mut hash_join_allowed = true;
+                let mem_budget = match &hash_join_method.params {
+                    AccessMethodParams::HashJoin { mem_budget, .. } => *mem_budget,
+                    _ => unreachable!("hash join params expected"),
+                };
                 if let AccessMethodParams::HashJoin {
                     materialize_build_input,
+                    use_bloom_filter,
+                    join_keys,
                     ..
                 } = &mut hash_join_method.params
                 {
-                    if requires_materialized_build_input {
-                        *materialize_build_input = true;
-                        let materialize_cost = build_cardinality * 0.003;
-                        hash_join_method.cost = hash_join_method.cost + Cost(materialize_cost);
+                    // Decide if we must materialize build-side rowids to preserve
+                    // constraints that reference prior tables but are not covered
+                    // by the hash-join keys.
+                    let needs_materialization = build_has_uncovered_prior_constraints(
+                        lhs_constraints,
+                        join_keys,
+                        &prior_mask,
+                        &prior_hash_build_mask,
+                    );
+                    let prior_constraint_selectivity =
+                        build_prior_constraint_selectivity(lhs_constraints, &prior_mask);
+                    let estimated_filtered_rows =
+                        (*build_base_rows) * build_self_selectivity * prior_constraint_selectivity;
+
+                    // Hard cap and selectivity gate: avoid materializing huge lists.
+                    let materialization_too_large = needs_materialization
+                        && (estimated_filtered_rows > MAX_MATERIALIZED_BUILD_ROWS
+                            || prior_constraint_selectivity >= MATERIALIZE_SELECTIVITY_THRESHOLD);
+                    let can_materialize =
+                        build_has_indexable_prior_constraints(lhs_constraints, &prior_mask);
+                    let selectivity_threshold = if probe_multiplier > 1.0 {
+                        NESTED_PROBE_SELECTIVITY_THRESHOLD
+                    } else {
+                        MATERIALIZE_SELECTIVITY_THRESHOLD
+                    };
+                    // When probe is nested under prior loops, require stricter selectivity
+                    // to justify materialization.
+                    let wants_materialization = needs_materialization
+                        || (build_access_method_uses_constraints
+                            && prior_constraint_selectivity < selectivity_threshold);
+
+                    let optional_materialization_too_large = !needs_materialization
+                        && wants_materialization
+                        && estimated_filtered_rows > MAX_MATERIALIZED_BUILD_ROWS;
+
+                    // Build eligibility: a plain scan is always safe; otherwise we need
+                    // materialization or existing constraints that make the scan selective.
+                    let build_is_eligible = build_am_is_plain_table_scan
+                        || needs_materialization
+                        || build_access_method_uses_constraints;
+                    hash_join_allowed = build_is_eligible
+                        && (!needs_materialization || (build_has_rowid && can_materialize))
+                        && !materialization_too_large;
+                    if hash_join_allowed {
+                        let should_materialize = wants_materialization
+                            && build_has_rowid
+                            && can_materialize
+                            && !materialization_too_large
+                            && !optional_materialization_too_large;
+                        let effective_build_cardinality = if should_materialize {
+                            estimated_filtered_rows
+                        } else {
+                            build_cardinality
+                        };
+                        // Estimate probe filters that apply only to the probe table itself
+                        // (not join predicates) to inform the bloom filter heuristic.
+                        let probe_self_selectivity = rhs_constraints
+                            .constraints
+                            .iter()
+                            .filter(|c| c.lhs_mask.is_empty())
+                            .map(|c| c.selectivity)
+                            .product::<f64>();
+                        let probe_filtered_rows =
+                            (*rhs_base_rows) * probe_self_selectivity.clamp(0.0, 1.0);
+                        if probe_filtered_rows > 0.0 {
+                            let build_filtered_rows = if build_is_eligible {
+                                effective_build_cardinality
+                            } else {
+                                build_cardinality
+                            };
+                            // Bloom filters help when the probe side is much larger than the build.
+                            *use_bloom_filter = build_filtered_rows > 0.0
+                                && probe_filtered_rows / build_filtered_rows >= 2.0;
+                        } else {
+                            *use_bloom_filter = false;
+                        }
+                        if should_materialize {
+                            hash_join_method.cost = estimate_hash_join_cost(
+                                effective_build_cardinality,
+                                probe_cardinality,
+                                mem_budget,
+                                probe_multiplier,
+                            );
+                        }
+                        if should_materialize {
+                            // Materialize build-side rowids so the hash build only includes rows
+                            // that already match prior join constraints.
+                            *materialize_build_input = true;
+                            let materialize_cost = effective_build_cardinality * 0.003;
+                            hash_join_method.cost = hash_join_method.cost + Cost(materialize_cost);
+                        } else {
+                            *materialize_build_input = false;
+                        }
+                        tracing::debug!(
+                            lhs_table = lhs_table.table.get_name(),
+                            rhs_table = rhs_table_reference.table.get_name(),
+                            materialize_build_input = *materialize_build_input,
+                            needs_materialization,
+                            estimated_filtered_rows,
+                            prior_constraint_selectivity,
+                            materialization_too_large,
+                            can_materialize,
+                            build_cardinality,
+                            effective_build_cardinality,
+                            hash_join_cost = ?hash_join_method.cost,
+                            "hash-join candidate"
+                        );
                     }
                 }
-                if hash_join_method.cost < best_access_method.cost {
+                if hash_join_allowed && hash_join_method.cost < best_access_method.cost {
                     best_access_method = hash_join_method;
                 }
             }
@@ -373,6 +585,96 @@ pub fn join_lhs_and_rhs<'a>(
         output_cardinality,
         cost,
     }))
+}
+
+/// Returns true when build-side constraints reference prior tables in ways that
+/// are not already consumed by hash-join keys.
+fn build_has_uncovered_prior_constraints(
+    build_constraints: &TableConstraints,
+    join_keys: &[HashJoinKey],
+    prior_mask: &TableMask,
+    prior_hash_build_mask: &TableMask,
+) -> bool {
+    let mut join_key_indices = HashSet::new();
+    for join_key in join_keys {
+        join_key_indices.insert(join_key.where_clause_idx);
+    }
+
+    build_constraints.constraints.iter().any(|constraint| {
+        if !constraint.lhs_mask.intersects(prior_mask) {
+            return false;
+        }
+        if join_key_indices.contains(&constraint.where_clause_pos.0) {
+            return false;
+        }
+        if constraint.operator != Operator::Equals {
+            return true;
+        }
+        if !constraint.lhs_mask.intersects(prior_hash_build_mask) {
+            return true;
+        }
+        for table_idx in prior_mask.tables_iter() {
+            if constraint.lhs_mask.contains_table(table_idx)
+                && !prior_hash_build_mask.contains_table(table_idx)
+            {
+                return true;
+            }
+        }
+        false
+    })
+}
+
+/// Estimates selectivity from prior equality constraints on the build side.
+fn build_prior_constraint_selectivity(
+    build_constraints: &TableConstraints,
+    prior_mask: &TableMask,
+) -> f64 {
+    let mut selectivity = 1.0;
+    let mut saw_constraint = false;
+    for constraint in build_constraints.constraints.iter() {
+        if constraint.operator == Operator::Equals && constraint.lhs_mask.intersects(prior_mask) {
+            selectivity *= constraint.selectivity;
+            saw_constraint = true;
+        }
+    }
+    if !saw_constraint {
+        return 1.0;
+    }
+    selectivity.clamp(0.0, 1.0)
+}
+
+/// Estimates selectivity from build-side constraints that reference only the build table.
+fn build_self_constraint_selectivity(
+    build_constraints: &TableConstraints,
+    build_table_idx: usize,
+) -> f64 {
+    let build_only_mask = TableMask::from_table_number_iter([build_table_idx].into_iter());
+    let mut selectivity = 1.0;
+    let mut saw_constraint = false;
+    for constraint in build_constraints.constraints.iter() {
+        if !build_only_mask.contains_all(&constraint.lhs_mask) {
+            continue;
+        }
+        selectivity *= constraint.selectivity;
+        saw_constraint = true;
+    }
+    if !saw_constraint {
+        return 1.0;
+    }
+    selectivity.clamp(0.0, 1.0)
+}
+
+/// Returns true if any prior constraints can be turned into an index lookup.
+fn build_has_indexable_prior_constraints(
+    build_constraints: &TableConstraints,
+    prior_mask: &TableMask,
+) -> bool {
+    build_constraints.candidates.iter().any(|candidate| {
+        candidate.refs.iter().any(|constraint_ref| {
+            let constraint = &build_constraints.constraints[constraint_ref.constraint_vec_pos];
+            constraint.usable && constraint.lhs_mask.intersects(prior_mask)
+        })
+    })
 }
 
 /// The result of [compute_best_join_order].
@@ -406,6 +708,7 @@ pub fn compute_best_join_order<'a>(
     // The DP algorithm has O(2^n) complexity which becomes prohibitively slow
     // beyond ~12 tables. The greedy algorithm is O(n²) and produces good
     // (though not always optimal) plans.
+    let where_term_table_ids = build_where_term_table_ids(where_clause, joined_tables);
     if num_tables > GREEDY_JOIN_THRESHOLD {
         return compute_greedy_join_order(
             joined_tables,
@@ -414,6 +717,7 @@ pub fn compute_best_join_order<'a>(
             base_table_rows,
             access_methods_arena,
             where_clause,
+            &where_term_table_ids,
             subqueries,
         );
     }
@@ -426,6 +730,7 @@ pub fn compute_best_join_order<'a>(
         access_methods_arena,
         constraints,
         where_clause,
+        &where_term_table_ids,
         subqueries,
     )?;
 
@@ -498,6 +803,7 @@ pub fn compute_best_join_order<'a>(
             cost_upper_bound,
             joined_tables,
             where_clause,
+            &where_term_table_ids,
             subqueries,
         )?;
         if let Some(rel) = rel {
@@ -618,6 +924,7 @@ pub fn compute_best_join_order<'a>(
                     cost_upper_bound,
                     joined_tables,
                     where_clause,
+                    &where_term_table_ids,
                     subqueries,
                 )?;
                 join_order.clear();
@@ -712,6 +1019,7 @@ pub fn compute_greedy_join_order<'a>(
     base_table_rows: &[RowCountEstimate],
     access_methods_arena: &'a mut Vec<AccessMethod>,
     where_clause: &mut [WhereTerm],
+    where_term_table_ids: &[HashSet<TableInternalId>],
     subqueries: &[NonFromClauseSubquery],
 ) -> Result<Option<BestJoinOrderResult>> {
     let num_tables = joined_tables.len();
@@ -759,6 +1067,7 @@ pub fn compute_greedy_join_order<'a>(
         Cost(f64::MAX),
         joined_tables,
         where_clause,
+        where_term_table_ids,
         subqueries,
     )?;
 
@@ -778,10 +1087,45 @@ pub fn compute_greedy_join_order<'a>(
 
         let mut best: Option<(usize, JoinN)> = None;
 
+        let mut has_connected_candidate = false;
         for &idx in &remaining {
             // Outer join RHS requires all preceding tables joined first
             if let Some(required) = left_join_deps.get(&idx) {
                 if !current_mask.contains_all(required) {
+                    continue;
+                }
+            }
+            let connected = where_term_table_ids.iter().any(|table_ids| {
+                let table_id = joined_tables[idx].internal_id;
+                table_ids.contains(&table_id)
+                    && current_mask
+                        .tables_iter()
+                        .map(|table_no| joined_tables[table_no].internal_id)
+                        .any(|id| table_ids.contains(&id))
+            });
+            if connected {
+                has_connected_candidate = true;
+                break;
+            }
+        }
+
+        for &idx in &remaining {
+            // Outer join RHS requires all preceding tables joined first
+            if let Some(required) = left_join_deps.get(&idx) {
+                if !current_mask.contains_all(required) {
+                    continue;
+                }
+            }
+            if has_connected_candidate {
+                let connected = where_term_table_ids.iter().any(|table_ids| {
+                    let table_id = joined_tables[idx].internal_id;
+                    table_ids.contains(&table_id)
+                        && current_mask
+                            .tables_iter()
+                            .map(|table_no| joined_tables[table_no].internal_id)
+                            .any(|id| table_ids.contains(&id))
+                });
+                if !connected {
                     continue;
                 }
             }
@@ -804,6 +1148,7 @@ pub fn compute_greedy_join_order<'a>(
                 Cost(f64::MAX),
                 joined_tables,
                 where_clause,
+                where_term_table_ids,
                 subqueries,
             )? {
                 if best.as_ref().is_none_or(|(_, b)| plan.cost < b.cost) {
@@ -841,7 +1186,7 @@ pub fn compute_greedy_join_order<'a>(
 /// E.g., in a star schema, the fact table is referenced by all dimension FKs, so
 /// starting there allows all dimensions to use their PK indexes.
 ///
-/// Score = (base_rows * filter_selectivity) * 0.1^hub_score
+/// Score = (base_rows * filter_selectivity) / (1 + hub_score)
 /// Lower score wins. Outer join RHS tables are excluded (have ordering dependencies).
 fn find_best_starting_table(
     num_tables: usize,
@@ -876,7 +1221,7 @@ fn find_best_starting_table(
             .map(|c| c.selectivity)
             .product();
 
-        let score = base_rows * selectivity * 0.1_f64.powi(hub_score[t] as i32);
+        let score = base_rows * selectivity / (1.0 + hub_score[t] as f64);
 
         if best.is_none_or(|(_, s)| score < s) {
             best = Some((t, score));
@@ -890,6 +1235,7 @@ fn find_best_starting_table(
 /// Specialized version of [compute_best_join_order] that just joins tables in the order they are given
 /// in the SQL query. This is used as an upper bound for any other plans -- we can give up enumerating
 /// permutations if they exceed this cost during enumeration.
+#[allow(clippy::too_many_arguments)]
 pub fn compute_naive_left_deep_plan<'a>(
     joined_tables: &[JoinedTable],
     maybe_order_target: Option<&OrderTarget>,
@@ -897,6 +1243,7 @@ pub fn compute_naive_left_deep_plan<'a>(
     access_methods_arena: &'a mut Vec<AccessMethod>,
     constraints: &'a [TableConstraints],
     where_clause: &mut [WhereTerm],
+    where_term_table_ids: &[HashSet<TableInternalId>],
     subqueries: &[NonFromClauseSubquery],
 ) -> Result<Option<JoinN>> {
     let n = joined_tables.len();
@@ -925,6 +1272,7 @@ pub fn compute_naive_left_deep_plan<'a>(
         Cost(f64::MAX),
         joined_tables,
         where_clause,
+        where_term_table_ids,
         subqueries,
     )?;
     if best_plan.is_none() {
@@ -945,6 +1293,7 @@ pub fn compute_naive_left_deep_plan<'a>(
             Cost(f64::MAX),
             joined_tables,
             where_clause,
+            where_term_table_ids,
             subqueries,
         )?;
         if best_plan.is_none() {
@@ -953,6 +1302,39 @@ pub fn compute_naive_left_deep_plan<'a>(
     }
 
     Ok(best_plan)
+}
+
+/// Precompute table IDs referenced by each WHERE term for join-order decisions.
+fn build_where_term_table_ids(
+    where_clause: &[WhereTerm],
+    joined_tables: &[JoinedTable],
+) -> Vec<HashSet<TableInternalId>> {
+    let joined_ids: HashSet<TableInternalId> =
+        joined_tables.iter().map(|t| t.internal_id).collect();
+    where_clause
+        .iter()
+        .map(|term| expr_table_ids_filtered(&term.expr, &joined_ids))
+        .collect()
+}
+
+/// Collect table IDs from an expression that belong to the joined tables set.
+fn expr_table_ids_filtered(
+    expr: &Expr,
+    joined_ids: &HashSet<TableInternalId>,
+) -> HashSet<TableInternalId> {
+    let mut tables = HashSet::new();
+    let _ = walk_expr(expr, &mut |node| {
+        match node {
+            Expr::Column { table, .. } | Expr::RowId { table, .. } => {
+                if joined_ids.contains(table) {
+                    tables.insert(*table);
+                }
+            }
+            _ => {}
+        }
+        Ok(WalkControl::Continue)
+    });
+    tables
 }
 
 /// Iterator that generates all possible size k bitmasks for a given number of tables.

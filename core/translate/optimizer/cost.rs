@@ -33,6 +33,8 @@ pub struct IndexInfo {
 
 pub const ESTIMATED_HARDCODED_ROWS_PER_TABLE: usize = 1000000;
 pub const ESTIMATED_HARDCODED_ROWS_PER_PAGE: usize = 50; // roughly 80 bytes per 4096 byte page
+                                                         // Fraction of IO cost paid for each additional scan when cache reuse kicks in.
+const SCAN_CACHE_REUSE_FACTOR: f64 = 0.2;
 
 pub fn estimate_page_io_cost(rowcount: f64) -> Cost {
     Cost((rowcount / ESTIMATED_HARDCODED_ROWS_PER_PAGE as f64).ceil())
@@ -42,6 +44,12 @@ pub fn estimate_page_io_cost(rowcount: f64) -> Cost {
 pub enum RowCountEstimate {
     HardcodedFallback(f64),
     AnalyzeStats(f64),
+}
+
+impl Default for RowCountEstimate {
+    fn default() -> Self {
+        RowCountEstimate::HardcodedFallback(ESTIMATED_HARDCODED_ROWS_PER_TABLE as f64)
+    }
 }
 
 impl std::ops::Deref for RowCountEstimate {
@@ -75,8 +83,9 @@ pub fn estimate_cost_for_scan_or_seek(
             // Without caching: input_cardinality * base_row_count rows = many page reads
             let uncached_io = estimate_page_io_cost(input_cardinality * base_row_count);
 
-            // With caching: pages get cached after first scan
-            let cached_io = Cost(table_pages * 2.0);
+            // With caching: pages are reused, but repeated scans still incur IO.
+            let scans = input_cardinality.max(1.0);
+            let cached_io = Cost(table_pages * (2.0 + (scans - 1.0) * SCAN_CACHE_REUSE_FACTOR));
 
             // CPU cost for processing rows: key differentiator for scans
             let cpu_cost = input_cardinality * base_row_count * 0.001;

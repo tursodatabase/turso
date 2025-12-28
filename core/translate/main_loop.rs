@@ -1,6 +1,6 @@
 use turso_parser::ast::{fmt::ToTokens, Expr, SortOrder};
 
-use std::{borrow::Cow, sync::Arc};
+use std::{borrow::Cow, collections::HashSet, sync::Arc};
 
 use super::{
     aggregation::{translate_aggregation_step, AggArgumentSource},
@@ -24,6 +24,7 @@ use crate::{
     translate::{
         collate::{get_collseq_from_expr, CollationSeq},
         emitter::{prepare_cdc_if_necessary, HashCtx},
+        planner::{table_mask_from_expr, TableMask},
         result_row::emit_select_result,
         subquery::emit_non_from_clause_subquery,
         window::emit_window_loop_source,
@@ -32,7 +33,7 @@ use crate::{
     types::SeekOp,
     vdbe::{
         affinity::{self, Affinity},
-        builder::{CursorKey, CursorType, ProgramBuilder},
+        builder::{CursorKey, CursorType, HashBuildSignature, ProgramBuilder},
         insn::{to_u16, CmpInsFlags, HashBuildData, IdxInsertFlags, Insn},
         BranchOffset, CursorID,
     },
@@ -200,7 +201,21 @@ pub fn init_loop(
             }),
         };
     }
+    // Include hash-join build tables so their cursors are opened for hash build.
+    let mut required_tables: HashSet<usize> = join_order
+        .iter()
+        .map(|member| member.original_idx)
+        .collect();
+    for table in tables.joined_tables().iter() {
+        if let Operation::HashJoin(hash_join_op) = &table.op {
+            required_tables.insert(hash_join_op.build_table_idx);
+        }
+    }
+
     for (table_index, table) in tables.joined_tables().iter().enumerate() {
+        if !required_tables.contains(&table_index) {
+            continue;
+        }
         // Initialize bookkeeping for OUTER JOIN
         if let Some(join_info) = table.join_info.as_ref() {
             if join_info.outer {
@@ -467,14 +482,20 @@ pub struct HashBuildPayloadInfo {
     pub payload_columns: Vec<usize>,
     /// Affinity string for the join keys.
     pub key_affinities: String,
+    /// Whether to use a bloom filter for probe-side pruning.
+    pub use_bloom_filter: bool,
+    /// Cursor id used to store the bloom filter.
+    pub bloom_filter_cursor_id: CursorID,
 }
 
-/// Uses a separate hash build cursor to allow chained hash joins where a table
-/// can be both a probe table for one join and a build table for another.
+/// Uses a separate hash build cursor so the build scan does not interfere with
+/// the probe cursor for the same table.
+#[allow(clippy::too_many_arguments)]
 fn emit_hash_build_phase(
     program: &mut ProgramBuilder,
     t_ctx: &mut TranslateCtx,
     table_references: &TableReferences,
+    non_from_clause_subqueries: &[NonFromClauseSubquery],
     predicates: &[WhereTerm],
     hash_join_op: &HashJoinOp,
     hash_build_cursor_id: CursorID,
@@ -484,12 +505,75 @@ fn emit_hash_build_phase(
     let btree = build_table
         .btree()
         .expect("Hash join build table must be a BTree table");
+    // If build input was materialized, we iterate its rowid list and SeekRowid into the
+    // real build table so the hash build respects prior join filters.
     let materialized_cursor_id = t_ctx
         .materialized_build_inputs
         .get(&hash_join_op.build_table_idx)
         .copied();
 
     let num_keys = hash_join_op.join_keys.len();
+    // Determine comparison affinity for each join key
+    let mut key_affinities = String::new();
+    for join_key in hash_join_op.join_keys.iter() {
+        let build_expr = join_key.get_build_expr(predicates);
+        let probe_expr = join_key.get_probe_expr(predicates);
+        let affinity = crate::translate::expr::comparison_affinity(
+            build_expr,
+            probe_expr,
+            Some(table_references),
+        );
+        key_affinities.push(affinity.aff_mask());
+    }
+
+    // Extract collations for each join key expression
+    let collations: Vec<CollationSeq> = hash_join_op
+        .join_keys
+        .iter()
+        .map(|join_key| {
+            let build_expr = join_key.get_build_expr(predicates);
+            get_collseq_from_expr(build_expr, table_references)
+                .ok()
+                .flatten()
+                .unwrap_or(CollationSeq::Binary)
+        })
+        .collect();
+
+    // Bloom filter uses binary hashing; skip if any join key uses non-binary collation.
+    let use_bloom_filter = hash_join_op.use_bloom_filter
+        && collations
+            .iter()
+            .all(|c| matches!(c, CollationSeq::Binary | CollationSeq::Unset));
+
+    // Collect payload columns, all columns referenced from the build table.
+    // These will be stored in the hash entry to avoid SeekRowid during probe.
+    let payload_columns: Vec<usize> = build_table.col_used_mask.iter().collect();
+
+    let join_key_indices = hash_join_op
+        .join_keys
+        .iter()
+        .map(|key| key.where_clause_idx)
+        .collect::<Vec<_>>();
+    let signature = HashBuildSignature {
+        join_key_indices,
+        payload_columns: payload_columns.clone(),
+        key_affinities: key_affinities.clone(),
+        use_bloom_filter,
+        materialized_input_cursor: materialized_cursor_id,
+    };
+    if program.hash_build_signature_matches(hash_table_id, &signature) {
+        return Ok(HashBuildPayloadInfo {
+            payload_columns,
+            key_affinities,
+            use_bloom_filter,
+            bloom_filter_cursor_id: hash_build_cursor_id,
+        });
+    }
+    if program.has_hash_build_signature(hash_table_id) {
+        program.emit_insn(Insn::HashClose { hash_table_id });
+        program.clear_hash_build_signature(hash_table_id);
+    }
+
     let build_key_start_reg = program.alloc_registers(num_keys);
     let build_rowid_reg = materialized_cursor_id.map(|_| program.alloc_register());
     let build_iter_cursor_id = materialized_cursor_id.unwrap_or(hash_build_cursor_id);
@@ -503,8 +587,8 @@ fn emit_hash_build_phase(
         target_pc_when_reentered: label_hash_build_end,
     });
 
-    // This is a separate cursor from the regular table cursor, allowing
-    // the table to be iterated here even if it's the probe table for another hash join.
+    // This is a separate cursor from the regular table cursor so we can iterate
+    // the build side without disturbing the probe cursor.
     program.emit_insn(Insn::OpenRead {
         cursor_id: hash_build_cursor_id,
         root_page: btree.root_page,
@@ -530,17 +614,30 @@ fn emit_hash_build_phase(
         });
     }
 
-    // Determine comparison affinity for each join key
-    let mut key_affinities = String::new();
-    for join_key in hash_join_op.join_keys.iter() {
-        let build_expr = join_key.get_build_expr(predicates);
-        let probe_expr = join_key.get_probe_expr(predicates);
-        let affinity = crate::translate::expr::comparison_affinity(
-            build_expr,
-            probe_expr,
-            Some(table_references),
-        );
-        key_affinities.push(affinity.aff_mask());
+    let build_only_mask =
+        TableMask::from_table_number_iter([hash_join_op.build_table_idx].into_iter());
+    for cond in predicates.iter() {
+        let mask = table_mask_from_expr(&cond.expr, table_references, non_from_clause_subqueries)?;
+        if !mask.contains_table(hash_join_op.build_table_idx)
+            || !build_only_mask.contains_all(&mask)
+        {
+            continue;
+        }
+        let jump_target_when_true = program.allocate_label();
+        let condition_metadata = ConditionMetadata {
+            jump_if_condition_is_true: false,
+            jump_target_when_true,
+            jump_target_when_false: skip_to_next,
+            jump_target_when_null: skip_to_next,
+        };
+        translate_condition_expr(
+            program,
+            table_references,
+            &cond.expr,
+            condition_metadata,
+            &t_ctx.resolver,
+        )?;
+        program.preassign_label_to_next_insn(jump_target_when_true);
     }
 
     for (idx, join_key) in hash_join_op.join_keys.iter().enumerate() {
@@ -564,12 +661,9 @@ fn emit_hash_build_phase(
         });
     }
 
-    // Collect payload columns, all columns referenced from the build table.
-    // These will be stored in the hash entry to avoid SeekRowid during probe.
-    let payload_columns: Vec<usize> = build_table.col_used_mask.iter().collect();
     let num_payload = payload_columns.len();
 
-    let (payload_start_reg, payload_info) = if num_payload > 0 {
+    let (payload_start_reg, mut payload_info) = if num_payload > 0 {
         let payload_reg = program.alloc_registers(num_payload);
         for (i, &col_idx) in payload_columns.iter().enumerate() {
             program.emit_column_or_rowid(hash_build_cursor_id, col_idx, payload_reg + i);
@@ -579,6 +673,8 @@ fn emit_hash_build_phase(
             HashBuildPayloadInfo {
                 payload_columns: payload_columns.clone(),
                 key_affinities: key_affinities.clone(),
+                use_bloom_filter: false,
+                bloom_filter_cursor_id: hash_build_cursor_id,
             },
         )
     } else {
@@ -587,24 +683,13 @@ fn emit_hash_build_phase(
             HashBuildPayloadInfo {
                 payload_columns: vec![],
                 key_affinities: key_affinities.clone(),
+                use_bloom_filter: false,
+                bloom_filter_cursor_id: hash_build_cursor_id,
             },
         )
     };
 
     program.clear_cursor_override(build_table.internal_id);
-
-    // Extract collations for each join key expression
-    let collations: Vec<CollationSeq> = hash_join_op
-        .join_keys
-        .iter()
-        .map(|join_key| {
-            let build_expr = join_key.get_build_expr(predicates);
-            get_collseq_from_expr(build_expr, table_references)
-                .ok()
-                .flatten()
-                .unwrap_or(CollationSeq::Binary)
-        })
-        .collect();
 
     // Insert current row into hash table with payload columns.
     program.emit_insn(Insn::HashBuild {
@@ -619,6 +704,14 @@ fn emit_hash_build_phase(
             num_payload,
         }),
     });
+    if use_bloom_filter {
+        program.emit_insn(Insn::FilterAdd {
+            cursor_id: hash_build_cursor_id,
+            key_reg: build_key_start_reg,
+            num_keys,
+        });
+        payload_info.use_bloom_filter = true;
+    }
 
     program.preassign_label_to_next_insn(skip_to_next);
     program.emit_insn(Insn::Next {
@@ -628,6 +721,7 @@ fn emit_hash_build_phase(
 
     program.preassign_label_to_next_insn(build_loop_end);
     program.emit_insn(Insn::HashBuildFinalize { hash_table_id });
+    program.record_hash_build_signature(hash_table_id, signature);
 
     program.preassign_label_to_next_insn(label_hash_build_end);
     Ok(payload_info)
@@ -921,18 +1015,45 @@ pub fn open_loop(
                 // Get build table info for cursor resolution and hash table reference
                 let build_table = &table_references.joined_tables()[hash_join_op.build_table_idx];
                 let (build_cursor_id, _) = build_table.resolve_cursors(program, mode.clone())?;
-                let build_cursor_id = build_cursor_id.expect("Build table must have a cursor");
+                let build_cursor_id = if let Some(cursor_id) = build_cursor_id {
+                    cursor_id
+                } else {
+                    let btree = build_table
+                        .btree()
+                        .expect("Hash join build table must be a BTree table");
+                    let cursor_id = program.alloc_cursor_id_keyed_if_not_exists(
+                        CursorKey::table(build_table.internal_id),
+                        CursorType::BTreeTable(btree.clone()),
+                    );
+                    program.emit_insn(Insn::OpenRead {
+                        cursor_id,
+                        root_page: btree.root_page,
+                        db: build_table.database_id,
+                    });
+                    cursor_id
+                };
 
                 // Allocate a separate cursor for the hash build phase.
-                // This allows the build table to be iterated during hash build
-                // even if it's also being used as a probe table for another hash join.
+                // This keeps the build scan independent from the probe cursor.
+                let hash_table_id: usize = build_table.internal_id.into();
                 let btree = build_table
                     .btree()
                     .expect("Hash join build table must be a BTree table");
-                let hash_build_cursor_id =
-                    program.alloc_cursor_id(CursorType::BTreeTable(btree.clone()));
+                let hash_build_cursor_id = program.alloc_cursor_id_keyed_if_not_exists(
+                    CursorKey::hash_build(build_table.internal_id),
+                    CursorType::BTreeTable(btree.clone()),
+                );
+                let payload_info = emit_hash_build_phase(
+                    program,
+                    t_ctx,
+                    table_references,
+                    subqueries,
+                    predicates,
+                    hash_join_op,
+                    hash_build_cursor_id,
+                    hash_table_id,
+                )?;
 
-                let hash_table_id: usize = build_table.internal_id.into();
                 let num_keys = hash_join_op.join_keys.len();
 
                 // Hash Table Probe Phase
@@ -942,17 +1063,6 @@ pub fn open_loop(
                     cursor_id: probe_cursor_id,
                     pc_if_empty: loop_end,
                 });
-                // TODO: enable bloom filter for hash joins, probably should wait until we have
-                // more metadata about build table size, etc.
-                let payload_info = emit_hash_build_phase(
-                    program,
-                    t_ctx,
-                    table_references,
-                    predicates,
-                    hash_join_op,
-                    hash_build_cursor_id,
-                    hash_table_id,
-                )?;
 
                 program.preassign_label_to_next_insn(loop_start);
 
@@ -975,6 +1085,15 @@ pub fn open_loop(
                         start_reg: probe_key_start_reg,
                         count,
                         affinities: payload_info.key_affinities.clone(),
+                    });
+                }
+
+                if payload_info.use_bloom_filter {
+                    program.emit_insn(Insn::Filter {
+                        cursor_id: payload_info.bloom_filter_cursor_id,
+                        target_pc: next,
+                        key_reg: probe_key_start_reg,
+                        num_keys,
                     });
                 }
 
@@ -1666,16 +1785,20 @@ pub fn close_loop(
 
     // After ALL loops are closed, emit HashClose for any hash tables that were built.
     // This must happen at the very end because hash join probe loops may be nested
-    // inside outer loops that re-enter them.
+    // inside outer loops that re-enter them. Hash tables used by materialization
+    // subplans can be kept open and are skipped here.
     for join in join_order.iter() {
         let table_index = join.original_idx;
         let table = &tables.joined_tables()[table_index];
         if let Operation::HashJoin(hash_join_op) = &table.op {
             let build_table = &tables.joined_tables()[hash_join_op.build_table_idx];
             let hash_table_reg: usize = build_table.internal_id.into();
-            program.emit_insn(Insn::HashClose {
-                hash_table_id: hash_table_reg,
-            });
+            if !program.should_keep_hash_table_open(hash_table_reg) {
+                program.emit_insn(Insn::HashClose {
+                    hash_table_id: hash_table_reg,
+                });
+                program.clear_hash_build_signature(hash_table_reg);
+            }
         }
     }
 
