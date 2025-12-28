@@ -146,6 +146,32 @@ fn find_best_access_method_for_btree(
                 column_count: 1,
             },
         };
+
+        /// don't choose non-covering index when there are no usable constraints
+        let is_full_scan = usable_constraint_refs.is_empty();
+        let helps_with_order_by = maybe_order_target.is_some_and(|order_target| {
+            order_target.0.iter().enumerate().all(|(i, target)| {
+                if i >= index_info.column_count {
+                    return false;
+                }
+                let correct_table = target.table_id == table_no;
+                let correct_column = match (&target.target, &candidate.index) {
+                    (ColumnTarget::Column(col_no), Some(index)) => {
+                        index.columns[i].expr.is_none() && index.columns[i].pos_in_table == *col_no
+                    }
+                    (ColumnTarget::Column(col_no), None) => {
+                        rowid_column_idx.is_some_and(|idx| idx == *col_no)
+                    }
+                    _ => false,
+                };
+                correct_table && correct_column
+            }) && !order_target.0.is_empty()
+        });
+
+        if is_full_scan && !index_info.covering && !helps_with_order_by {
+            continue;
+        }
+
         let cost = estimate_cost_for_scan_or_seek(
             Some(index_info),
             &rhs_constraints.constraints,
@@ -153,6 +179,7 @@ fn find_best_access_method_for_btree(
             input_cardinality,
             base_row_count,
         );
+
 
         // All other things being equal, prefer an access method that satisfies the order target.
         let (iter_dir, order_satisfiability_bonus) = if let Some(order_target) = maybe_order_target

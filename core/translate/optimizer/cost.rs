@@ -166,9 +166,7 @@ pub fn estimate_cost_for_scan_or_seek(
         })
         .product();
 
-    // little cheeky bonus for covering indexes
-    let covering_multiplier = if index_info.covering { 0.9 } else { 1.0 };
-    estimate_page_io_cost(
-        selectivity_multiplier * base_row_count * input_cardinality * covering_multiplier,
-    )
+    let rows_visited = selectivity_multiplier * base_row_count * input_cardinality;
+    let base_cost = estimate_page_io_cost(rows_visited);
+    base_cost
 }
