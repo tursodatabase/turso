@@ -1517,7 +1517,7 @@ pub fn op_column(
                             };
                             let payload = record.get_payload();
 
-                            let mut record_cursor = record.cursor();
+                            let record_cursor = record.cursor();
 
                             if record_cursor.offsets.is_empty() {
                                 let (header_size, header_len_bytes) = read_varint_fast(payload)?;
@@ -1602,7 +1602,6 @@ pub fn op_column(
                                 )
                             };
                             let serial_type = record_cursor.serial_types[target_column];
-                            drop(record_cursor);
 
                             match serial_type {
                                 // NULL
