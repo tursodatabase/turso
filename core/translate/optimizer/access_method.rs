@@ -72,6 +72,8 @@ pub enum AccessMethodParams {
         join_keys: Vec<HashJoinKey>,
         /// Memory budget for the hash table in bytes.
         mem_budget: usize,
+        /// Whether the build input should be materialized before hash build.
+        materialize_build_input: bool,
     },
 }
 
@@ -550,6 +552,7 @@ pub fn try_hash_join_access_method(
             probe_table_idx,
             join_keys,
             mem_budget: DEFAULT_MEM_BUDGET,
+            materialize_build_input: false,
         },
     })
 }

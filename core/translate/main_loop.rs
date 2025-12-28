@@ -484,9 +484,15 @@ fn emit_hash_build_phase(
     let btree = build_table
         .btree()
         .expect("Hash join build table must be a BTree table");
+    let materialized_cursor_id = t_ctx
+        .materialized_build_inputs
+        .get(&hash_join_op.build_table_idx)
+        .copied();
 
     let num_keys = hash_join_op.join_keys.len();
     let build_key_start_reg = program.alloc_registers(num_keys);
+    let build_rowid_reg = materialized_cursor_id.map(|_| program.alloc_register());
+    let build_iter_cursor_id = materialized_cursor_id.unwrap_or(hash_build_cursor_id);
 
     // Create new loop for hash table build phase
     let build_loop_start = program.allocate_label();
@@ -506,7 +512,7 @@ fn emit_hash_build_phase(
     });
 
     program.emit_insn(Insn::Rewind {
-        cursor_id: hash_build_cursor_id,
+        cursor_id: build_iter_cursor_id,
         pc_if_empty: build_loop_end,
     });
 
@@ -514,6 +520,15 @@ fn emit_hash_build_phase(
     program.set_cursor_override(build_table.internal_id, hash_build_cursor_id);
 
     program.preassign_label_to_next_insn(build_loop_start);
+
+    if let (Some(rowid_reg), Some(input_cursor_id)) = (build_rowid_reg, materialized_cursor_id) {
+        program.emit_column_or_rowid(input_cursor_id, 0, rowid_reg);
+        program.emit_insn(Insn::SeekRowid {
+            cursor_id: hash_build_cursor_id,
+            src_reg: rowid_reg,
+            target_pc: skip_to_next,
+        });
+    }
 
     // Determine comparison affinity for each join key
     let mut key_affinities = String::new();
@@ -607,7 +622,7 @@ fn emit_hash_build_phase(
 
     program.preassign_label_to_next_insn(skip_to_next);
     program.emit_insn(Insn::Next {
-        cursor_id: hash_build_cursor_id,
+        cursor_id: build_iter_cursor_id,
         pc_if_next: build_loop_start,
     });
 
@@ -1004,8 +1019,16 @@ pub fn open_loop(
 
                 // Add payload columns to resolver's cache so translate_expr will
                 // use Copy from payload registers instead of reading from cursor.
+                t_ctx.resolver.enable_expr_to_reg_cache();
+                let rowid_expr = Expr::RowId {
+                    database: None,
+                    table: build_table.internal_id,
+                };
+                t_ctx
+                    .resolver
+                    .expr_to_reg_cache
+                    .push((Cow::Owned(rowid_expr), match_reg));
                 if let Some(payload_reg) = payload_dest_reg {
-                    t_ctx.resolver.enable_expr_to_reg_cache();
                     for (i, &col_idx) in payload_columns.iter().enumerate() {
                         let column = build_table.columns().get(col_idx);
                         let is_rowid_alias = column.is_some_and(|c| c.is_rowid_alias());

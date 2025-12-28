@@ -139,6 +139,9 @@ pub fn join_lhs_and_rhs<'a>(
         let lhs_table_idx = join_order[join_order.len() - 2].original_idx;
         let rhs_table_idx = join_order.last().unwrap().original_idx;
         let lhs_table = &joined_tables[lhs_table_idx];
+        let build_has_rowid = lhs_table
+            .btree()
+            .is_some_and(|btree| btree.has_rowid);
 
         // If the chosen access method for the build table already uses constraints
         // skip hash join to avoid dropping those filters.
@@ -307,13 +310,14 @@ pub fn join_lhs_and_rhs<'a>(
                 })
             })
             .unwrap_or(false);
-        if !build_access_method_uses_constraints
-            && !nested_loop_preserves_order
+        let requires_materialized_build_input =
+            build_access_method_uses_constraints || build_has_prior_constraints;
+        let allow_hash_join = !nested_loop_preserves_order
             && !rhs_has_selective_seek
             && !probe_table_is_prior_build
-            && !build_has_prior_constraints
-            && build_am_is_plain_table_scan
-        {
+            && (build_am_is_plain_table_scan || requires_materialized_build_input)
+            && (!requires_materialized_build_input || build_has_rowid);
+        if allow_hash_join {
             let lhs_constraints = &all_constraints[lhs_table_idx];
             if let Some(hash_join_method) = try_hash_join_access_method(
                 lhs_table,
@@ -327,6 +331,18 @@ pub fn join_lhs_and_rhs<'a>(
                 probe_cardinality,
                 subqueries,
             ) {
+                let mut hash_join_method = hash_join_method;
+                if let AccessMethodParams::HashJoin {
+                    materialize_build_input,
+                    ..
+                } = &mut hash_join_method.params
+                {
+                    if requires_materialized_build_input {
+                        *materialize_build_input = true;
+                        let materialize_cost = build_cardinality * 0.003;
+                        hash_join_method.cost = hash_join_method.cost + Cost(materialize_cost);
+                    }
+                }
                 if hash_join_method.cost < best_access_method.cost {
                     best_access_method = hash_join_method;
                 }
