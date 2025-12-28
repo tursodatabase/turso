@@ -87,7 +87,7 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
                 match value {
                     Value::Integer(_) => {
                         let converted_value = value.as_uint();
-                        result.push_str(&format!("{converted_value}"))
+                        write!(result, "{converted_value}").unwrap();
                     }
                     _ => result.push('0'),
                 }
@@ -100,7 +100,7 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
                 match &values[args_index].get_value() {
                     Value::Text(t) => result.push_str(t.as_str()),
                     Value::Null => (),
-                    v => result.push_str(&format!("{v}")),
+                    v => write!(result, "{v}").unwrap(),
                 }
                 args_index += 1;
             }
@@ -110,8 +110,8 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
                 }
                 let value = &values[args_index].get_value();
                 match value {
-                    Value::Float(f) => result.push_str(&format!("{f:.6}")),
-                    Value::Integer(i) => result.push_str(&format!("{:.6}", *i as f64)),
+                    Value::Float(f) => write!(result, "{:.6}", *f).unwrap(),
+                    Value::Integer(i) => write!(result, "{:.6}", *i as f64).unwrap(),
                     _ => result.push_str("0.000000"),
                 }
                 args_index += 1;
@@ -199,11 +199,11 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
                 }
                 let value = &values[args_index].get_value();
                 match value {
-                    Value::Float(f) => result.push_str(&format!("{:x}", *f as i64)),
-                    Value::Integer(i) => result.push_str(&format!("{i:x}")),
+                    Value::Float(f) => write!(result, "{:x}", *f as i64).unwrap(),
+                    Value::Integer(i) => write!(result, "{i:x}").unwrap(),
                     Value::Text(s) => {
                         let i: i64 = s.as_str().parse::<i64>().unwrap_or(0);
-                        result.push_str(&format!("{i:x}"))
+                        write!(result, "{i:x}").unwrap()
                     }
                     _ => result.push('0'),
                 }
@@ -215,11 +215,11 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
                 }
                 let value = &values[args_index].get_value();
                 match value {
-                    Value::Float(f) => result.push_str(&format!("{:X}", *f as i64)),
-                    Value::Integer(i) => result.push_str(&format!("{i:X}")),
+                    Value::Float(f) => write!(result, "{:X}", *f as i64).unwrap(),
+                    Value::Integer(i) => write!(result, "{:X}", i).unwrap(),
                     Value::Text(s) => {
                         let i: i64 = s.as_str().parse::<i64>().unwrap_or(0);
-                        result.push_str(&format!("{i:X}"))
+                        write!(result, "{:X}", i).unwrap();
                     }
                     _ => result.push('0'),
                 }
@@ -231,11 +231,11 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
                 }
                 let value = &values[args_index].get_value();
                 match value {
-                    Value::Float(f) => result.push_str(&format!("{:o}", *f as i64)),
-                    Value::Integer(i) => result.push_str(&format!("{i:o}")),
+                    Value::Float(f) => write!(result, "{:o}", *f as i64).unwrap(),
+                    Value::Integer(i) => write!(result, "{i:o}").unwrap(),
                     Value::Text(s) => {
                         let i: i64 = s.as_str().parse::<i64>().unwrap_or(0);
-                        result.push_str(&format!("{i:o}"))
+                        write!(result, "{i:o}").unwrap();
                     }
                     _ => result.push('0'),
                 }
