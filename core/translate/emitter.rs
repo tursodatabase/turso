@@ -18,13 +18,16 @@ use super::main_loop::{
 };
 use super::order_by::{emit_order_by, init_order_by, SortMetadata};
 use super::plan::{
-    Distinctness, JoinOrderMember, Operation, Scan, SelectPlan, TableReferences, UpdatePlan,
+    Distinctness, HashJoinOp, JoinOrderMember, Operation, Scan, SelectPlan, TableReferences,
+    UpdatePlan,
 };
 use super::select::emit_simple_count;
 use super::subquery::emit_from_clause_subqueries;
 use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
 use crate::function::Func;
 use crate::schema::{BTreeTable, Column, Index, IndexColumn, Schema, Table, ROWID_SENTINEL};
+use crate::translate::insert::ROWID_COLUMN;
+use crate::translate::planner::{table_mask_from_expr, TableMask};
 use crate::translate::compound_select::emit_program_for_compound_select;
 use crate::translate::expr::{
     bind_and_rewrite_expr, emit_returning_results, translate_expr_no_constant_opt, walk_expr_mut,
@@ -52,7 +55,7 @@ use crate::vdbe::builder::{CursorKey, CursorType, ProgramBuilder};
 use crate::vdbe::insn::{
     to_u16, {CmpInsFlags, IdxInsertFlags, InsertFlags, RegisterOrLiteral},
 };
-use crate::vdbe::{insn::Insn, BranchOffset};
+use crate::vdbe::{insn::Insn, BranchOffset, CursorID};
 use crate::Connection;
 use crate::{bail_parse_error, Result, SymbolTable};
 
@@ -176,6 +179,8 @@ pub struct TranslateCtx<'a> {
     /// Hash table contexts for hash joins, keyed by build table index.
     /// Supports multiple hash joins in chain patterns.
     pub hash_table_contexts: HashMap<usize, HashCtx>,
+    /// Materialized build input cursors for hash joins, keyed by build table index.
+    pub materialized_build_inputs: HashMap<usize, CursorID>,
     /// A list of expressions that are not aggregates, along with a flag indicating
     /// whether the expression should be included in the output for each group.
     ///
@@ -212,6 +217,7 @@ impl<'a> TranslateCtx<'a> {
             meta_left_joins: (0..table_count).map(|_| None).collect(),
             meta_sort: None,
             hash_table_contexts: HashMap::new(),
+            materialized_build_inputs: HashMap::new(),
             resolver: Resolver::new(schema, syms),
             non_aggregate_expressions: Vec::new(),
             cdc_cursor_id: None,
@@ -280,12 +286,15 @@ pub fn emit_program_for_select(
     resolver: &Resolver,
     mut plan: SelectPlan,
 ) -> Result<()> {
+    let materialized_build_inputs = emit_materialized_build_inputs(program, resolver, &mut plan)?;
+
     let mut t_ctx = TranslateCtx::new(
         program,
         resolver.schema,
         resolver.symbol_table,
         plan.table_references.joined_tables().len(),
     );
+    t_ctx.materialized_build_inputs = materialized_build_inputs;
 
     // Emit main parts of query
     emit_query(program, &mut plan, &mut t_ctx)?;
@@ -293,6 +302,138 @@ pub fn emit_program_for_select(
     program.result_columns = plan.result_columns;
     program.table_references.extend(plan.table_references);
     Ok(())
+}
+
+fn emit_materialized_build_inputs(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    plan: &mut SelectPlan,
+) -> Result<HashMap<usize, CursorID>> {
+    let mut build_inputs: HashMap<usize, CursorID> = HashMap::new();
+    let mut build_tables: Vec<usize> = Vec::new();
+
+    for table in plan.table_references.joined_tables().iter() {
+        if let Operation::HashJoin(hash_join_op) = &table.op {
+            if hash_join_op.materialize_build_input {
+                build_tables.push(hash_join_op.build_table_idx);
+            }
+        }
+    }
+
+    build_tables.sort_unstable();
+    build_tables.dedup();
+
+    for build_table_idx in build_tables {
+        let internal_id = program.table_reference_counter.next();
+        let ephemeral_table = Arc::new(BTreeTable {
+            root_page: 0,
+            name: format!("hash_build_input_{internal_id}"),
+            has_rowid: true,
+            has_autoincrement: false,
+            primary_key_columns: vec![],
+            columns: vec![ROWID_COLUMN],
+            is_strict: false,
+            unique_sets: vec![],
+            foreign_keys: vec![],
+        });
+        let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(ephemeral_table.clone()));
+        let materialize_plan =
+            build_materialized_build_input_plan(plan, build_table_idx, cursor_id, ephemeral_table)?;
+
+        program.emit_insn(Insn::OpenEphemeral {
+            cursor_id,
+            is_table: true,
+        });
+        program.incr_nesting();
+        emit_program_for_select(program, resolver, materialize_plan)?;
+        program.decr_nesting();
+
+        build_inputs.insert(build_table_idx, cursor_id);
+    }
+
+    Ok(build_inputs)
+}
+
+fn build_materialized_build_input_plan(
+    plan: &SelectPlan,
+    build_table_idx: usize,
+    cursor_id: CursorID,
+    table: Arc<BTreeTable>,
+) -> Result<SelectPlan> {
+    let Some(build_pos) = plan.join_order.iter().position(|m| {
+        let table_ref = &plan.table_references.joined_tables()[m.original_idx];
+        matches!(
+            table_ref.op,
+            Operation::HashJoin(HashJoinOp {
+                build_table_idx: idx,
+                ..
+            }) if idx == build_table_idx
+        )
+    })
+    else {
+        return Err(crate::LimboError::PlanningError(
+            "materialized hash build input: build table not in join order".to_string(),
+        ));
+    };
+
+    let join_order = plan.join_order[..=build_pos].to_vec();
+    let mut included_tables: Vec<usize> = join_order.iter().map(|m| m.original_idx).collect();
+    for member in join_order.iter() {
+        let table_ref = &plan.table_references.joined_tables()[member.original_idx];
+        if let Operation::HashJoin(hash_join_op) = &table_ref.op {
+            included_tables.push(hash_join_op.build_table_idx);
+        }
+    }
+    included_tables.sort_unstable();
+    included_tables.dedup();
+    let included_mask = TableMask::from_table_number_iter(included_tables.into_iter());
+
+    let mut where_clause = plan.where_clause.clone();
+    for term in where_clause.iter_mut() {
+        let mask = table_mask_from_expr(
+            &term.expr,
+            &plan.table_references,
+            &plan.non_from_clause_subqueries,
+        )?;
+        term.consumed = !included_mask.contains_all(&mask);
+    }
+
+    let mut table_references = plan.table_references.clone();
+    for joined_table in table_references.joined_tables_mut().iter_mut() {
+        if let Operation::HashJoin(hash_join_op) = &mut joined_table.op {
+            if hash_join_op.build_table_idx == build_table_idx {
+                hash_join_op.materialize_build_input = false;
+            }
+        }
+    }
+
+    let build_internal_id = plan.table_references.joined_tables()[build_table_idx].internal_id;
+    let result_columns = vec![ResultSetColumn {
+        expr: Expr::RowId {
+            database: None,
+            table: build_internal_id,
+        },
+        alias: None,
+        contains_aggregates: false,
+    }];
+
+    Ok(SelectPlan {
+        table_references,
+        join_order,
+        result_columns,
+        where_clause,
+        group_by: None,
+        order_by: vec![],
+        aggregates: vec![],
+        limit: None,
+        offset: None,
+        contains_constant_false_condition: false,
+        query_destination: QueryDestination::EphemeralTable { cursor_id, table },
+        distinctness: Distinctness::NonDistinct,
+        values: vec![],
+        window: None,
+        non_from_clause_subqueries: plan.non_from_clause_subqueries.clone(),
+    })
 }
 
 #[instrument(skip_all, level = Level::DEBUG)]

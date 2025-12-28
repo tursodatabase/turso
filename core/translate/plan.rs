@@ -1093,6 +1093,8 @@ pub struct HashJoinOp {
     pub join_keys: Vec<HashJoinKey>,
     /// Memory budget for hash table
     pub mem_budget: usize,
+    /// Whether the build input should be materialized (rowid list) before hash build.
+    pub materialize_build_input: bool,
 }
 
 #[derive(Clone, Debug)]

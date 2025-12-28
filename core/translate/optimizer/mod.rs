@@ -1030,6 +1030,7 @@ fn optimize_table_access(
                 probe_table_idx,
                 join_keys,
                 mem_budget,
+                materialize_build_input,
             } => {
                 // Mark WHERE clause terms as consumed since we're using hash join
                 for join_key in join_keys.iter() {
@@ -1042,6 +1043,7 @@ fn optimize_table_access(
                         probe_table_idx: *probe_table_idx,
                         join_keys: join_keys.clone(),
                         mem_budget: *mem_budget,
+                        materialize_build_input: *materialize_build_input,
                     });
             }
         }
