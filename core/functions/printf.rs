@@ -187,9 +187,15 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
                     return Err(LimboError::InvalidArgument("not enough arguments".into()));
                 }
                 let value = &values[args_index].get_value();
-                let value_str: String = format!("{value}");
-                if !value_str.is_empty() {
-                    result.push_str(&value_str[0..1]);
+                let char: char = match value {
+                    Value::Text(s) => s.value.chars().next().unwrap_or('\0'),
+                    _ => {
+                        let as_str = format!("{value}");
+                        as_str.chars().next().unwrap_or('\0')
+                    }
+                };
+                if char != '\0' {
+                    result.push(char);
                 }
                 args_index += 1;
             }
