@@ -6,22 +6,25 @@ use crate::vdbe::Register;
 use crate::LimboError;
 
 fn get_exponential_formatted_str(number: &f64, uppercase: bool) -> crate::Result<String> {
-    let pre_formatted = format!("{number:.6e}");
-    let mut parts = pre_formatted.split("e");
+    // TODO: Implement ryu or zmij style algorithm somewhere in the library and use it here instead
+    let mut result = String::with_capacity(24);
+    write!(&mut result, "{number:.6e}",).unwrap();
 
-    let maybe_base = parts.next();
-    let maybe_exponent = parts.next();
+    let parts = result.split_once('e');
 
-    let mut result = String::new();
-    match (maybe_base, maybe_exponent) {
-        (Some(base), Some(exponent)) => {
-            result.push_str(base);
-            result.push_str(if uppercase { "E" } else { "e" });
-
+    match parts {
+        Some((mantissa, exponent)) => {
             match exponent.parse::<i32>() {
                 Ok(exponent_number) => {
-                    let exponent_fmt = format!("{exponent_number:+03}");
-                    result.push_str(&exponent_fmt);
+                    // we have mantissa in result[..pos]
+                    if uppercase {
+                        result.truncate(mantissa.len());
+                        result.push_str("E");
+                    } else {
+                        // we already have 'e' after mantissa
+                        result.truncate(mantissa.len() + 1);
+                    }
+                    write!(&mut result, "{exponent_number:+03}").unwrap();
                     Ok(result)
                 }
                 Err(_) => Err(LimboError::InternalError(
@@ -29,7 +32,7 @@ fn get_exponential_formatted_str(number: &f64, uppercase: bool) -> crate::Result
                 )),
             }
         }
-        (_, _) => Err(LimboError::InternalError(
+        None => Err(LimboError::InternalError(
             "unable to parse exponential expression".into(),
         )),
     }
