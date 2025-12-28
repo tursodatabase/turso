@@ -629,6 +629,27 @@ mod tests {
     }
 
     #[test]
+    fn test_get_exponential_formatted_str() {
+        let test_cases = vec![
+            (23000000.0, false, "2.300000e+07"),
+            (-23000000.0, false, "-2.300000e+07"),
+            (250.375, false, "2.503750e+02"),
+            (0.0003235, false, "3.235000e-04"),
+            (0.0, false, "0.000000e+00"),
+            (23000000.0, true, "2.300000E+07"),
+            (-23000000.0, true, "-2.300000E+07"),
+            (250.375, true, "2.503750E+02"),
+            (0.0003235, true, "3.235000E-04"),
+            (0.0, true, "0.000000E+00"),
+        ];
+
+        for (number, uppercase, expected) in test_cases {
+            let result = get_exponential_formatted_str(&number, uppercase).unwrap();
+            assert_eq!(result, expected);
+        }
+    }
+
+    #[test]
     fn test_printf_edge_cases() {
         let test_cases = vec![
             // Empty format string
