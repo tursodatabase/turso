@@ -19,7 +19,7 @@ fn get_exponential_formatted_str(number: &f64, uppercase: bool) -> crate::Result
                     // we have mantissa in result[..pos]
                     if uppercase {
                         result.truncate(mantissa.len());
-                        result.push_str("E");
+                        result.push('E');
                     } else {
                         // we already have 'e' after mantissa
                         result.truncate(mantissa.len() + 1);
