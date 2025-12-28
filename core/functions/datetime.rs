@@ -1393,8 +1393,8 @@ mod tests {
     #[test]
     fn test_invalid_get_date_from_time_value() {
         let invalid_cases = vec![
-            Value::build_text("2024-07-21 25:00"), // Invalid hour
-            // Value::build_text("2024-07-21 24:00:00"), // valid date select date('2024-07-21 24:00:00'); TODO fix output
+            Value::build_text("2024-07-21 25:00"),    // Invalid hour
+            Value::build_text("2024-07-21 25:00:00"), // Invalid hour
             Value::build_text("2024-07-21 23:60:00"), // Invalid minute
             Value::build_text("2024-07-21 22:58:60"), // Invalid second
             Value::build_text("2024-07-32"),          // Invalid day
@@ -1522,8 +1522,8 @@ mod tests {
     #[test]
     fn test_invalid_get_time_from_datetime_value() {
         let invalid_cases = vec![
-            Value::build_text("2024-07-21 25:00"), // Invalid hour
-            // Value::build_text("2024-07-21 24:00:00"), // valid time select time('2024-07-21 24:00:00'); TODO fix output
+            Value::build_text("2024-07-21 25:00"),    // Invalid hour
+            Value::build_text("2024-07-21 25:00:00"), // Invalid hour
             Value::build_text("2024-07-21 23:60:00"), // Invalid minute
             Value::build_text("2024-07-21 22:58:60"), // Invalid second
             Value::build_text("2024-07-32"),          // Invalid day
