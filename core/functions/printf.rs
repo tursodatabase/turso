@@ -151,13 +151,13 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
                 }
                 let value = &values[args_index].get_value();
                 match value {
-                    Value::Float(f) => match get_exponential_formatted_str(f, false) {
+                    Value::Float(f) => match get_exponential_formatted_str(f, true) {
                         Ok(str) => result.push_str(&str),
                         Err(e) => return Err(e),
                     },
                     Value::Integer(i) => {
                         let f = *i as f64;
-                        match get_exponential_formatted_str(&f, false) {
+                        match get_exponential_formatted_str(&f, true) {
                             Ok(str) => result.push_str(&str),
                             Err(e) => return Err(e),
                         }
@@ -169,7 +169,7 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
                             .trim_end_matches(|c: char| !c.is_numeric())
                             .parse()
                             .unwrap_or(0.0);
-                        match get_exponential_formatted_str(&number, false) {
+                        match get_exponential_formatted_str(&number, true) {
                             Ok(str) => result.push_str(&str),
                             Err(e) => return Err(e),
                         };
