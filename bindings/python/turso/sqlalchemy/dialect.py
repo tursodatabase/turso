@@ -7,18 +7,137 @@ This module provides two SQLAlchemy dialects:
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Any, Dict, Optional
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
 
 from sqlalchemy import pool
 from sqlalchemy.dialects.sqlite.pysqlite import SQLiteDialect_pysqlite
 from sqlalchemy.engine import URL
+from sqlalchemy.engine.reflection import ObjectKind
 
 if TYPE_CHECKING:
-    from sqlalchemy.engine.interfaces import ConnectArgsType
+    from sqlalchemy.engine.interfaces import ConnectArgsType, ReflectedForeignKeyConstraint, ReflectedIndex
     from sqlalchemy.pool import Pool
 
 
-class TursoDialect(SQLiteDialect_pysqlite):
+class _TursoDialectMixin:
+    """
+    Mixin providing Turso-specific overrides for SQLAlchemy dialect.
+
+    Turso doesn't support all SQLite PRAGMAs. This mixin overrides methods
+    that would otherwise fail due to unsupported PRAGMAs:
+    - PRAGMA foreign_key_list (not supported)
+    - PRAGMA index_list (not supported)
+    """
+
+    def get_foreign_keys(
+        self,
+        connection,
+        table_name,
+        schema=None,
+        **kw,
+    ) -> List[ReflectedForeignKeyConstraint]:
+        """
+        Return foreign keys for a table.
+
+        Turso doesn't support PRAGMA foreign_key_list, so we return an empty list.
+        Foreign key constraints are still enforced at write time if defined.
+        """
+        return []
+
+    def get_indexes(
+        self,
+        connection,
+        table_name,
+        schema=None,
+        **kw,
+    ) -> List[ReflectedIndex]:
+        """
+        Return indexes for a table.
+
+        Turso doesn't support PRAGMA index_list, so we return an empty list.
+        Indexes still exist and are used for query optimization.
+        """
+        return []
+
+    def get_unique_constraints(
+        self,
+        connection,
+        table_name,
+        schema=None,
+        **kw,
+    ) -> List[Dict[str, Any]]:
+        """
+        Return unique constraints for a table.
+
+        This also relies on PRAGMA index_list which Turso doesn't support.
+        """
+        return []
+
+    def get_check_constraints(
+        self,
+        connection,
+        table_name,
+        schema=None,
+        **kw,
+    ) -> List[Dict[str, Any]]:
+        """
+        Return check constraints for a table.
+
+        SQLite stores these in sqlite_master which Turso may not fully support.
+        Return empty list for safety.
+        """
+        return []
+
+    def get_multi_indexes(
+        self,
+        connection,
+        schema=None,
+        filter_names=None,
+        kind=ObjectKind.TABLE,
+        scope=None,
+        **kw,
+    ) -> Dict[Any, List[ReflectedIndex]]:
+        """Return indexes for multiple tables."""
+        return {}
+
+    def get_multi_unique_constraints(
+        self,
+        connection,
+        schema=None,
+        filter_names=None,
+        kind=ObjectKind.TABLE,
+        scope=None,
+        **kw,
+    ) -> Dict[Any, List[Dict[str, Any]]]:
+        """Return unique constraints for multiple tables."""
+        return {}
+
+    def get_multi_foreign_keys(
+        self,
+        connection,
+        schema=None,
+        filter_names=None,
+        kind=ObjectKind.TABLE,
+        scope=None,
+        **kw,
+    ) -> Dict[Any, List[ReflectedForeignKeyConstraint]]:
+        """Return foreign keys for multiple tables."""
+        return {}
+
+    def get_multi_check_constraints(
+        self,
+        connection,
+        schema=None,
+        filter_names=None,
+        kind=ObjectKind.TABLE,
+        scope=None,
+        **kw,
+    ) -> Dict[Any, List[Dict[str, Any]]]:
+        """Return check constraints for multiple tables."""
+        return {}
+
+
+class TursoDialect(_TursoDialectMixin, SQLiteDialect_pysqlite):
     """
     SQLAlchemy dialect for pyturso local database connections.
 
@@ -135,7 +254,7 @@ class TursoDialect(SQLiteDialect_pysqlite):
         return pool.QueuePool
 
 
-class TursoSyncDialect(SQLiteDialect_pysqlite):
+class TursoSyncDialect(_TursoDialectMixin, SQLiteDialect_pysqlite):
     """
     SQLAlchemy dialect for pyturso sync-enabled connections.
 

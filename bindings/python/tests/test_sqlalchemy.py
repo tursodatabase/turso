@@ -286,6 +286,54 @@ class TestBasicDialectIntegration:
             assert len(items) == 1
             assert items[0].name == "Widget"
 
+    def test_pandas_to_sql(self):
+        """Test Pandas DataFrame.to_sql() with if_exists='replace'."""
+        pd = pytest.importorskip("pandas")
+
+        df = pd.DataFrame({
+            "id": [1, 2, 3],
+            "name": ["Alice", "Bob", "Charlie"],
+        })
+
+        engine = create_engine("sqlite+turso:///:memory:")
+
+        with engine.connect() as conn:
+            # First insert
+            df.to_sql("test_table", conn, if_exists="replace", index=False)
+
+            # Verify
+            result = pd.read_sql("SELECT * FROM test_table", conn)
+            assert len(result) == 3
+
+            # Replace (this tests table reflection which was failing)
+            df.to_sql("test_table", conn, if_exists="replace", index=False)
+
+            # Verify again
+            result = pd.read_sql("SELECT * FROM test_table", conn)
+            assert len(result) == 3
+
+    def test_table_reflection_returns_empty(self):
+        """Test that table reflection methods return empty (not error)."""
+        engine = create_engine("sqlite+turso:///:memory:")
+
+        with engine.connect() as conn:
+            conn.execute(text("CREATE TABLE test (id INTEGER PRIMARY KEY, name TEXT)"))
+            conn.commit()
+
+            # Get inspector
+            from sqlalchemy import inspect
+            inspector = inspect(engine)
+
+            # These should return empty lists, not raise errors
+            fks = inspector.get_foreign_keys("test")
+            assert fks == []
+
+            indexes = inspector.get_indexes("test")
+            assert indexes == []
+
+            ucs = inspector.get_unique_constraints("test")
+            assert ucs == []
+
 
 class TestSyncDialectIntegration:
     """Integration tests for sync dialect with real sync server.

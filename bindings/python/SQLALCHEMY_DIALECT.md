@@ -184,6 +184,27 @@ The dialects override several methods from `SQLiteDialect_pysqlite`:
 - `on_connect()` - Disabled (turso doesn't support `create_function`)
 - `get_isolation_level()` - Return SERIALIZABLE (turso doesn't support PRAGMA read_uncommitted)
 - `set_isolation_level()` - No-op (isolation set at connection time)
+- `get_foreign_keys()` - Returns empty (PRAGMA foreign_key_list not supported)
+- `get_indexes()` - Returns empty (PRAGMA index_list not supported)
+- `get_unique_constraints()` - Returns empty (relies on unsupported PRAGMA)
+
+## Limitations
+
+### Table Reflection
+
+Turso doesn't support some SQLite PRAGMAs used for table reflection:
+- `PRAGMA foreign_key_list` - Foreign key introspection
+- `PRAGMA index_list` - Index introspection
+
+This means:
+- `inspector.get_foreign_keys()` returns empty list
+- `inspector.get_indexes()` returns empty list
+- Foreign keys and indexes still **work** at runtime, just can't be introspected
+
+This doesn't affect normal usage including:
+- Pandas `df.to_sql()` with `if_exists='replace'`
+- SQLAlchemy ORM operations
+- Alembic migrations (when using `--autogenerate`, manually verify FK/index changes)
 
 ## Files
 
