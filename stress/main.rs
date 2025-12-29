@@ -44,6 +44,7 @@ fn get_random() -> u64 {
     antithesis_sdk::random::get_random()
 }
 
+#[derive(Debug)]
 pub struct Plan {
     pub ddl_statements: Vec<String>,
     pub queries_per_thread: Vec<Vec<String>>,
@@ -269,8 +270,8 @@ fn generate_insert(table: &Table) -> String {
         .columns
         .iter()
         .map(|col| {
-            if col.constraints.contains(&Constraint::PrimaryKey)
-                && !table.pk_values.is_empty()
+            if !table.pk_values.is_empty()
+                && col.constraints.contains(&Constraint::PrimaryKey)
                 && get_random() % 100 < 50
             {
                 table.pk_values[get_random() as usize % table.pk_values.len()].clone()
@@ -366,16 +367,11 @@ fn generate_delete(table: &Table) -> String {
 
 /// Generate a random SQL statement for a schema
 fn generate_random_statement(schema: &ArbitrarySchema) -> String {
-    loop {
-        let table = &schema.tables[get_random() as usize % schema.tables.len()];
-        if table.name != "soft_path_819" {
-            continue;
-        }
-        break match get_random() % 3 {
-            0 => generate_insert(table),
-            1 => generate_update(table),
-            _ => generate_delete(table),
-        };
+    let table = &schema.tables[get_random() as usize % schema.tables.len()];
+    match get_random() % 3 {
+        0 => generate_insert(table),
+        1 => generate_update(table),
+        _ => generate_delete(table),
     }
 }
 
