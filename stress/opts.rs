@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use clap::{command, Parser};
 
 #[derive(Parser)]
@@ -78,6 +80,9 @@ pub struct Opts {
     /// Random seed for reproducibility
     #[clap(long, help = "Random seed for reproducibility")]
     pub seed: Option<u64>,
+
+    #[clap(long, help = "Reference DB to take schema and initial state")]
+    pub db_ref: Option<PathBuf>,
 }
 
 const fn normal_or_miri<T: Copy>(normal_val: T, miri_val: T) -> T {
