@@ -793,22 +793,22 @@ fn query_pragma(
         }
         PragmaName::FunctionList => {
             let pragma = pragma_for(&pragma);
-            let base_reg = register;
-            program.alloc_registers(5);
             let syms_guard = connection.syms.read();
             let syms_ref: &SymbolTable = &syms_guard;
             for func in syms_ref.functions.values() {
+                let base_reg = register;
+                program.alloc_registers(5);
                 let f = func.as_ref();
                 let (kind_str, nargs) = match &f.func {
                     ExtFunc::Scalar(_) => ("scalar".to_string(), -1),
                     ExtFunc::Aggregate { argc, .. } => ("aggregate".to_string(), *argc as i64),
                 };
-                program.emit_string8(f.name.clone(), base_reg); //name
-                program.emit_int(1, base_reg + 1); //built-in (assume true)
-                program.emit_string8(kind_str, base_reg + 2); //type/kind
-                program.emit_string8("utf8".to_string(), base_reg + 3); //encoding
-                program.emit_int(nargs, base_reg + 4); //number of args
-                program.emit_result_row(base_reg, 5); //emit the result row
+                program.emit_string8(f.name.clone(), base_reg);
+                program.emit_int(1, base_reg + 1);
+                program.emit_string8(kind_str, base_reg + 2);
+                program.emit_string8("utf8".to_string(), base_reg + 3);
+                program.emit_int(nargs, base_reg + 4);
+                program.emit_result_row(base_reg, 5);
             }
             for col in pragma.columns.iter() {
                 program.add_pragma_result_column(col.to_string());
