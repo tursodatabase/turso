@@ -454,7 +454,7 @@ pub fn load_schema(
                 rusqlite::types::ValueRef::Integer(x) => x.to_string(),
                 rusqlite::types::ValueRef::Real(x) => x.to_string(),
                 rusqlite::types::ValueRef::Text(text) => {
-                    format!("'{}'", std::str::from_utf8(text)?.to_string())
+                    format!("'{}'", std::str::from_utf8(text)?)
                 }
                 rusqlite::types::ValueRef::Blob(blob) => format!("x'{}'", hex::encode(blob)),
             };
