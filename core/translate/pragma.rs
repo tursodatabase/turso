@@ -8,6 +8,7 @@ use turso_parser::ast::{self, ColumnDefinition, Expr, Literal};
 use turso_parser::ast::{PragmaName, QualifiedName};
 
 use super::integrity_check::translate_integrity_check;
+use crate::function::ExtFunc;
 use crate::pragma::pragma_for;
 use crate::schema::Schema;
 use crate::storage::encryption::{CipherMode, EncryptionKey};
@@ -20,7 +21,7 @@ use crate::translate::schema::translate_create_table;
 use crate::util::{normalize_ident, parse_signed_number, parse_string, IOExt as _};
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::vdbe::insn::{Cookie, Insn};
-use crate::{bail_parse_error, CaptureDataChangesMode, LimboError, Value};
+use crate::{bail_parse_error, CaptureDataChangesMode, LimboError, SymbolTable, Value};
 use std::str::FromStr;
 use strum::IntoEnumIterator;
 
@@ -417,6 +418,9 @@ fn update_pragma(
             connection.set_foreign_keys_enabled(enabled);
             Ok((program, TransactionMode::None))
         }
+        PragmaName::FunctionList => {
+            unreachable!("function_list cannot be set");
+        }
     }
 }
 
@@ -786,6 +790,30 @@ fn query_pragma(
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
             Ok((program, TransactionMode::None))
+        }
+        PragmaName::FunctionList => {
+            let pragma = pragma_for(&pragma);
+            let base_reg = register;
+            program.alloc_registers(5);
+            let syms_guard = connection.syms.read();
+            let syms_ref: &SymbolTable = &*syms_guard;
+            for func in syms_ref.functions.values() {
+                let f = func.as_ref();
+                let (kind_str, nargs) = match &f.func {
+                    ExtFunc::Scalar(_) => ("scalar".to_string(), -1),
+                    ExtFunc::Aggregate { argc, .. } => ("aggregate".to_string(), *argc as i64),
+                };
+                program.emit_string8(f.name.clone(), base_reg); //name
+                program.emit_int(1, base_reg + 1); //built-in (assume true)
+                program.emit_string8(kind_str, base_reg + 2); //type/kind
+                program.emit_string8("utf8".to_string(), base_reg + 3); //encoding
+                program.emit_int(nargs, base_reg + 4); //number of args
+                program.emit_result_row(base_reg, 5); //emit the result row
+            }
+            for col in pragma.columns.iter() {
+                program.add_pragma_result_column(col.to_string());
+            }
+            Ok((program, TransactionMode::Read))
         }
     }
 }
