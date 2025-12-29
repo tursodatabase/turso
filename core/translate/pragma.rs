@@ -796,7 +796,7 @@ fn query_pragma(
             let base_reg = register;
             program.alloc_registers(5);
             let syms_guard = connection.syms.read();
-            let syms_ref: &SymbolTable = &*syms_guard;
+            let syms_ref: &SymbolTable = &syms_guard;
             for func in syms_ref.functions.values() {
                 let f = func.as_ref();
                 let (kind_str, nargs) = match &f.func {
