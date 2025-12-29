@@ -184,7 +184,7 @@ impl Shadow for Query {
     type Result = anyhow::Result<Vec<Vec<SimValue>>>;
 
     fn shadow(&self, env: &mut ShadowTablesMut) -> Self::Result {
-        // First check if we are not in a deffered transaction, if we are create a snapshot
+        // First check if we are not in a deferred transaction, if we are create a snapshot
         env.upgrade_transaction(self);
 
         match self {
@@ -587,7 +587,7 @@ impl Shadow for Begin {
     fn shadow(&self, tables: &mut ShadowTablesMut) -> Self::Result {
         match self {
             Begin::Deferred => {
-                tables.create_deffered_snapshot();
+                tables.create_deferred_snapshot();
             }
             Begin::Immediate => {
                 tables.create_snapshot(TransactionMode::Write);
