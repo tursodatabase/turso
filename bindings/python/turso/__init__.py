@@ -17,6 +17,8 @@ from .lib import (
     connect,
     paramstyle,
     setup_logging,
+    sqlite_version,
+    sqlite_version_info,
     threadsafety,
 )
 
@@ -38,6 +40,8 @@ __all__ = [
     "ProgrammingError",
     "apilevel",
     "paramstyle",
+    "sqlite_version",
+    "sqlite_version_info",
     "threadsafety",
     "EncryptionOpts",
 ]
