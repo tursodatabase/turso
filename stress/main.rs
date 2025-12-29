@@ -677,19 +677,22 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 if let Err(e) = conn.execute(sql, ()).await {
                     match e {
                         turso::Error::Corrupt(e) => {
-                            panic!("Error executing query: {}", e);
+                            panic!("Error[FATAL] executing query: {}", e);
                         }
                         turso::Error::Constraint(e) => {
                             if opts.verbose {
-                                println!("Skipping UNIQUE constraint violation: {e}");
+                                println!("Error[WARNING] executing query: {e}");
                             }
+                        }
+                        turso::Error::Busy(e) => {
+                            println!("Error[WARNING] executing query: {e}");
                         }
                         turso::Error::Error(e) => {
                             if opts.verbose {
                                 println!("Error executing query: {e}");
                             }
                         }
-                        _ => panic!("Error executing query: {}", e),
+                        _ => panic!("Error[FATAL] executing query: {}", e),
                     }
                 }
                 const INTEGRITY_CHECK_INTERVAL: usize = 100;
