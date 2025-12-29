@@ -8,7 +8,7 @@ use super::{
     emitter::{OperationMode, TranslateCtx, UpdateRowSource},
     expr::{
         translate_condition_expr, translate_expr, translate_expr_no_constant_opt,
-        ConditionMetadata, NoConstantOptReason,
+        walk_expr, ConditionMetadata, NoConstantOptReason, WalkControl,
     },
     group_by::{group_by_agg_phase, GroupByMetadata, GroupByRowSource},
     optimizer::Optimizable,
@@ -1076,6 +1076,7 @@ pub fn open_loop(
             condition_fail_target,
             true,
             subqueries,
+            SubqueryRefFilter::All,
         )?;
 
         // Set the match flag to true if this is a LEFT JOIN.
@@ -1092,6 +1093,20 @@ pub fn open_loop(
                 });
             }
         }
+
+        // emit conditions that do not reference subquery results
+        emit_conditions(
+            program,
+            &t_ctx,
+            table_references,
+            join_order,
+            predicates,
+            join_index,
+            condition_fail_target,
+            false,
+            subqueries,
+            SubqueryRefFilter::WithoutSubqueryRefs,
+        )?;
 
         for subquery in subqueries.iter_mut().filter(|s| !s.has_been_evaluated()) {
             assert!(subquery.correlated, "subquery must be correlated");
@@ -1112,10 +1127,8 @@ pub fn open_loop(
             )?;
         }
 
-        // Now we can emit conditions from the WHERE clause.
-        // If the right table produces a NULL row, control jumps to the point where the match flag is set.
-        // The WHERE clause conditions may reference columns from that row, so they cannot be emitted
-        // before the flag is set — the row may be filtered out by the WHERE clause.
+        // FINALLY emit conditions that DO reference subquery results.
+        // These depend on the subquery evaluation that just happened above.
         emit_conditions(
             program,
             &t_ctx,
@@ -1126,8 +1139,10 @@ pub fn open_loop(
             condition_fail_target,
             false,
             subqueries,
+            SubqueryRefFilter::WithSubqueryRefs,
         )?;
     }
+
 
     if subqueries.iter().any(|s| !s.has_been_evaluated()) {
         crate::bail_parse_error!(
@@ -1142,6 +1157,31 @@ pub fn open_loop(
     Ok(())
 }
 
+// this is used to determine the order in which WHERE conditions should be emitted
+fn condition_references_subquery(expr: &Expr, subqueries: &[NonFromClauseSubquery]) -> bool {
+    let mut found = false;
+    let _ = walk_expr(expr, &mut |e: &Expr| -> Result<WalkControl> {
+        if let Expr::SubqueryResult { subquery_id, .. } = e {
+            if subqueries.iter().any(|s| s.internal_id == *subquery_id) {
+                found = true;
+                return Ok(WalkControl::SkipChildren);
+            }
+        }
+        Ok(WalkControl::Continue)
+    });
+    found
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SubqueryRefFilter {
+    /// Emit all conditions regardless of subquery references
+    All,
+    /// Only emit conditions that do NOT reference subqueries (for early evaluation)
+    WithoutSubqueryRefs,
+    /// Only emit conditions that DO reference subqueries (for late evaluation)
+    WithSubqueryRefs,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_conditions(
     program: &mut ProgramBuilder,
@@ -1153,12 +1193,22 @@ fn emit_conditions(
     next: BranchOffset,
     from_outer_join: bool,
     subqueries: &[NonFromClauseSubquery],
+    subquery_ref_filter: SubqueryRefFilter,
 ) -> Result<()> {
     for cond in predicates
         .iter()
         .filter(|cond| cond.from_outer_join.is_some() == from_outer_join)
         .filter(|cond| {
             cond.should_eval_at_loop(join_index, join_order, subqueries, Some(table_references))
+        })
+        .filter(|cond| match subquery_ref_filter {
+            SubqueryRefFilter::All => true,
+            SubqueryRefFilter::WithoutSubqueryRefs => {
+                !condition_references_subquery(&cond.expr, subqueries)
+            }
+            SubqueryRefFilter::WithSubqueryRefs => {
+                condition_references_subquery(&cond.expr, subqueries)
+            }
         })
     {
         let jump_target_when_true = program.allocate_label();
