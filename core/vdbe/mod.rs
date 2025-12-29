@@ -1396,10 +1396,6 @@ impl Program {
     }
 
     fn rollback_current_txn(&self, pager: &Arc<Pager>) {
-        assert!(matches!(
-            self.connection.transaction_state.get(),
-            TransactionState::Read | TransactionState::Write { .. }
-        ));
         if let Some(mv_store) = self.connection.mv_store().as_ref() {
             if let Some(tx_id) = self.connection.get_mv_tx_id() {
                 self.connection.auto_commit.store(true, Ordering::SeqCst);
