@@ -532,9 +532,8 @@ fn sqlite_integrity_check(
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let rt = tokio::runtime::Builder::new_current_thread()
+    let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
-        .unhandled_panic(tokio::runtime::UnhandledPanic::ShutdownRuntime)
         .build()?;
 
     rt.block_on(async_main())
