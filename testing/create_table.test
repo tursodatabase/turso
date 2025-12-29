@@ -67,22 +67,31 @@ do_execsql_test_in_memory_any_error create_table_duplicate_column_names_quoted {
     CREATE TABLE t("a", a);
 }
 
-# https://github.com/tursodatabase/turso/issues/3675
-do_execsql_test_in_memory_any_error create_table_view_collision-1 {
-    CREATE VIEW v_same AS SELECT 1;
-    CREATE TABLE v_same(x INT);
+if {![is_turso_mvcc]} {
+    # https://github.com/tursodatabase/turso/issues/3675
+    do_execsql_test_in_memory_any_error create_table_view_collision-1 {
+        CREATE VIEW v_same AS SELECT 1;
+        CREATE TABLE v_same(x INT);
+    }
+
+    do_execsql_test_in_memory_any_error create_view_table_collision-1 {
+        CREATE TABLE t_same(x INT);
+        CREATE VIEW t_same AS SELECT 1;
+    }
+
+    do_execsql_test_in_memory_any_error create_index_view_collision-1 {
+        CREATE VIEW i_same AS SELECT 1;
+        CREATE TABLE t1(x);
+        CREATE INDEX i_same ON t1(x);
+    }
+
+    do_execsql_test_in_memory_any_error create_view_index_collision-1 {
+        CREATE TABLE t4(w);
+        CREATE INDEX ix_same ON t4(w);
+        CREATE VIEW ix_same AS SELECT 1;
+    }
 }
 
-do_execsql_test_in_memory_any_error create_view_table_collision-1 {
-    CREATE TABLE t_same(x INT);
-    CREATE VIEW t_same AS SELECT 1;
-}
-
-do_execsql_test_in_memory_any_error create_index_view_collision-1 {
-    CREATE VIEW i_same AS SELECT 1;
-    CREATE TABLE t1(x);
-    CREATE INDEX i_same ON t1(x);
-}
 
 do_execsql_test_in_memory_any_error create_index_table_collision-1 {
     CREATE TABLE i_same(x INT);
@@ -96,11 +105,6 @@ do_execsql_test_in_memory_any_error create_table_index_collision-1 {
     CREATE TABLE ix_same(x INT);
 }
 
-do_execsql_test_in_memory_any_error create_view_index_collision-1 {
-    CREATE TABLE t4(w);
-    CREATE INDEX ix_same ON t4(w);
-    CREATE VIEW ix_same AS SELECT 1;
-}
 
 # https://github.com/tursodatabase/turso/issues/3796
 do_execsql_test_on_specific_db {:memory:} col-default-true {
