@@ -5378,6 +5378,7 @@ dependencies = [
  "bloom",
  "branches",
  "built",
+ "bumpalo",
  "bytemuck",
  "cfg_block",
  "chrono",
