@@ -134,7 +134,7 @@ fn step_sync(stmt: &Arc<RefCell<turso_core::Statement>>) -> napi::Result<u32> {
         Ok(turso_core::StepResult::Interrupt) => {
             Err(create_generic_error("statement was interrupted"))
         }
-        Ok(turso_core::StepResult::Busy) => Err(create_generic_error("database is busy")),
+        Ok(turso_core::StepResult::Busy) => Err(create_generic_error("database is locked")),
         Err(e) => Err(to_generic_error("step failed", e)),
     }
 }
@@ -599,14 +599,9 @@ impl Statement {
                 raw_array.coerce_to_object()?.to_unknown()
             }
             PresentationMode::Pluck => {
-                let (_, value) =
-                    row_data
-                        .get_values()
-                        .enumerate()
-                        .next()
-                        .ok_or(create_generic_error(
-                            "pluck mode requires at least one column in the result",
-                        ))?;
+                let (_, value) = row_data.get_values().enumerate().next().ok_or_else(|| {
+                    create_generic_error("pluck mode requires at least one column in the result")
+                })?;
                 to_js_value(env, value, safe_integers)?
             }
             PresentationMode::Expanded => {

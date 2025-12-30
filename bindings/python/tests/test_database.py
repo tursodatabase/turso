@@ -7,6 +7,7 @@ import turso
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s", force=True)
 
+
 def connect(provider, database):
     if provider == "turso":
         return turso.connect(database)
@@ -1464,6 +1465,7 @@ def test_connection_exception_attributes_present(provider):
     assert issubclass(conn.ProgrammingError, Exception)
     conn.close()
 
+
 @pytest.mark.parametrize("provider", ["sqlite3", "turso"])
 def test_insert_returning_single_and_multiple_commit_without_consuming(provider):
     # turso.setup_logging(level=logging.DEBUG)
@@ -1471,7 +1473,10 @@ def test_insert_returning_single_and_multiple_commit_without_consuming(provider)
     try:
         cur = conn.cursor()
         cur.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)")
-        cur.execute("INSERT INTO t(name) VALUES (?), (?) RETURNING id", ("bob", "alice"),)
+        cur.execute(
+            "INSERT INTO t(name) VALUES (?), (?) RETURNING id",
+            ("bob", "alice"),
+        )
         cur.fetchone()
         with pytest.raises(Exception):
             conn.commit()
@@ -1495,23 +1500,25 @@ def test_pragma_integrity_check(provider):
 
     conn.close()
 
+
 def test_encryption_enabled(tmp_path):
     tmp_path = tmp_path / "local.db"
     conn = turso.connect(
         str(tmp_path),
         experimental_features="encryption",
         encryption=turso.EncryptionOpts(
-            cipher="aegis256",
-            hexkey="b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327"
-        )
+            cipher="aegis256", hexkey="b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327"
+        ),
     )
     cursor = conn.cursor()
     cursor.execute("create table t(x)")
     cursor.execute("insert into t select 'secret' from generate_series(1, 1024)")
     conn.commit()
-    cursor.execute("pragma wal_checkpoint(truncate)")
+    cursor.execute("pragma wal_checkpoint(truncate)").fetchall()
+    conn.commit()
 
     content = open(tmp_path, "rb").read()
+    assert len(content) > 16 * 1024
     assert b"secret" not in content
 
 
@@ -1524,7 +1531,9 @@ def test_encryption_disabled(tmp_path):
     cursor.execute("create table t(x)")
     cursor.execute("insert into t select 'secret' from generate_series(1, 1024)")
     conn.commit()
-    cursor.execute("pragma wal_checkpoint(truncate)")
+    cursor.execute("pragma wal_checkpoint(truncate)").fetchall()
+    conn.commit()
 
     content = open(tmp_path, "rb").read()
+    assert len(content) > 16 * 1024
     assert b"secret" in content

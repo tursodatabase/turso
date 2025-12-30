@@ -20,7 +20,8 @@ async fn main() -> Result<(), Error> {
     conn.pragma_query("journal_mode", |row| {
         println!("{:?}", row.get_value(0));
         Ok(())
-    })?;
+    })
+    .await?;
 
     let mut stmt = conn
         .prepare("INSERT INTO users (email, age) VALUES (?1, ?2)")

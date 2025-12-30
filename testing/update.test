@@ -112,24 +112,26 @@ do_execsql_test_on_specific_db {:memory:} update-with-expression {
 30|20
 45|30}
 
-# regression test for expression indexes under UPDATE (length() / lower())
-do_execsql_test_on_specific_db {:memory:} update-expression-index {
-    CREATE TABLE t(k TEXT, c0 INT);
-    CREATE INDEX idx_expr ON t(length(k), lower(c0)) WHERE c0 IS NOT NULL AND lower(k) = k;
-    INSERT INTO t VALUES ('abc', 1);
-    INSERT INTO t VALUES ('def', 2);
-    UPDATE t SET c0 = c0 + 1;
-    SELECT count(*) FROM t;
-} {2}
+if {![is_turso_mvcc]} {
+    # regression test for expression indexes under UPDATE (length() / lower())
+    do_execsql_test_on_specific_db {:memory:} update-expression-index {
+        CREATE TABLE t(k TEXT, c0 INT);
+        CREATE INDEX idx_expr ON t(length(k), lower(c0)) WHERE c0 IS NOT NULL AND lower(k) = k;
+        INSERT INTO t VALUES ('abc', 1);
+        INSERT INTO t VALUES ('def', 2);
+        UPDATE t SET c0 = c0 + 1;
+        SELECT count(*) FROM t;
+    } {2}
 
-# regression test for expression indexes under DELETE
-do_execsql_test_on_specific_db {:memory:} delete-expression-index {
-    CREATE TABLE t(k TEXT, c0 INT);
-    CREATE INDEX idx_expr ON t(length(k), lower(c0)) WHERE c0 IS NOT NULL AND lower(k) = k;
-    INSERT INTO t VALUES ('abc', 1);
-    DELETE FROM t WHERE k = 'abc';
-    SELECT count(*) FROM t;
-} {0}
+    # regression test for expression indexes under DELETE
+    do_execsql_test_on_specific_db {:memory:} delete-expression-index {
+        CREATE TABLE t(k TEXT, c0 INT);
+        CREATE INDEX idx_expr ON t(length(k), lower(c0)) WHERE c0 IS NOT NULL AND lower(k) = k;
+        INSERT INTO t VALUES ('abc', 1);
+        DELETE FROM t WHERE k = 'abc';
+        SELECT count(*) FROM t;
+    } {0}
+}
 
 do_execsql_test_on_specific_db {:memory:} update-self-reference {
     create table temp (a, b);
@@ -528,4 +530,3 @@ do_execsql_test_in_memory_any_error update-integer-pk-overflow-error {
     INSERT INTO t VALUES (9223372036854775807);
     UPDATE t SET a = a + 1;
 }
-

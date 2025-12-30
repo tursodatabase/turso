@@ -329,16 +329,18 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
                     };
                     {
                         let mut record = self.get_immutable_record_or_create();
-                        let record = record.as_mut().ok_or(LimboError::InternalError(
-                            "immutable record not initialized".to_string(),
-                        ))?;
+                        let record = record.as_mut().ok_or_else(|| {
+                            LimboError::InternalError(
+                                "immutable record not initialized".to_string(),
+                            )
+                        })?;
                         record.invalidate();
                         record.start_serialization(row.payload());
                     }
 
-                    let record_ref = self.reusable_immutable_record.as_ref().ok_or(
-                        LimboError::InternalError("immutable record not initialized".to_string()),
-                    )?;
+                    let record_ref = self.reusable_immutable_record.as_ref().ok_or_else(|| {
+                        LimboError::InternalError("immutable record not initialized".to_string())
+                    })?;
                     Ok(IOResult::Done(Some(record_ref)))
                 }
             }
@@ -1278,18 +1280,16 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
         };
         let record_buf = key
             .get_record()
-            .ok_or(LimboError::InternalError(
-                "BTreeKey should have a record".to_string(),
-            ))?
+            .ok_or_else(|| LimboError::InternalError("BTreeKey should have a record".to_string()))?
             .get_payload()
             .to_vec();
         let num_columns = match key {
             BTreeKey::IndexKey(record) => record.column_count(),
             BTreeKey::TableRowId((_, record)) => record
                 .as_ref()
-                .ok_or(LimboError::InternalError(
-                    "TableRowId should have a record".to_string(),
-                ))?
+                .ok_or_else(|| {
+                    LimboError::InternalError("TableRowId should have a record".to_string())
+                })?
                 .column_count(),
         };
         let row = match &self.mv_cursor_type {

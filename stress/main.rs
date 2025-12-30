@@ -10,12 +10,14 @@ use rand::{Rng, SeedableRng};
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::{Read, Write};
+use std::path::Path;
 use std::sync::Arc;
 #[cfg(not(feature = "antithesis"))]
 use std::sync::Mutex as StdMutex;
 use tokio::sync::Mutex;
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::reload;
 use tracing_subscriber::util::SubscriberInitExt;
 use tracing_subscriber::EnvFilter;
 use turso::Builder;
@@ -42,6 +44,7 @@ fn get_random() -> u64 {
     antithesis_sdk::random::get_random()
 }
 
+#[derive(Debug)]
 pub struct Plan {
     pub ddl_statements: Vec<String>,
     pub queries_per_thread: Vec<Vec<String>>,
@@ -80,6 +83,7 @@ pub enum Constraint {
 pub struct Table {
     pub name: String,
     pub columns: Vec<Column>,
+    pub pk_values: Vec<String>,
 }
 
 /// Represents a complete SQLite schema
@@ -166,7 +170,11 @@ fn generate_random_table() -> Table {
     // Then, randomly select one column to be the primary key
     let pk_index = (get_random() % column_count as u64) as usize;
     columns[pk_index].constraints.push(Constraint::PrimaryKey);
-    Table { name, columns }
+    Table {
+        name,
+        columns,
+        pk_values: vec![],
+    }
 }
 
 pub fn gen_bool(probability_true: f64) -> bool {
@@ -261,7 +269,16 @@ fn generate_insert(table: &Table) -> String {
     let values = table
         .columns
         .iter()
-        .map(|col| generate_random_value(&col.data_type))
+        .map(|col| {
+            if !table.pk_values.is_empty()
+                && col.constraints.contains(&Constraint::PrimaryKey)
+                && get_random() % 100 < 50
+            {
+                table.pk_values[get_random() as usize % table.pk_values.len()].clone()
+            } else {
+                generate_random_value(&col.data_type)
+            }
+        })
         .collect::<Vec<_>>()
         .join(", ");
 
@@ -302,11 +319,19 @@ fn generate_update(table: &Table) -> String {
             .join(", ")
     };
 
-    let where_clause = format!(
-        "{} = {}",
-        pk_column.name,
-        generate_random_value(&pk_column.data_type)
-    );
+    let where_clause = if !table.pk_values.is_empty() && get_random() % 100 < 50 {
+        format!(
+            "{} = {}",
+            pk_column.name,
+            table.pk_values[get_random() as usize % table.pk_values.len()]
+        )
+    } else {
+        format!(
+            "{} = {}",
+            pk_column.name,
+            generate_random_value(&pk_column.data_type)
+        )
+    };
 
     format!(
         "UPDATE {} SET {} WHERE {};",
@@ -323,11 +348,19 @@ fn generate_delete(table: &Table) -> String {
         .find(|col| col.constraints.contains(&Constraint::PrimaryKey))
         .expect("Table should have a primary key");
 
-    let where_clause = format!(
-        "{} = {}",
-        pk_column.name,
-        generate_random_value(&pk_column.data_type)
-    );
+    let where_clause = if !table.pk_values.is_empty() && get_random() % 100 < 50 {
+        format!(
+            "{} = {}",
+            pk_column.name,
+            table.pk_values[get_random() as usize % table.pk_values.len()]
+        )
+    } else {
+        format!(
+            "{} = {}",
+            pk_column.name,
+            generate_random_value(&pk_column.data_type)
+        )
+    };
 
     format!("DELETE FROM {} WHERE {};", table.name, where_clause)
 }
@@ -342,26 +375,125 @@ fn generate_random_statement(schema: &ArbitrarySchema) -> String {
     }
 }
 
+/// Convert SQLite type string to DataType
+fn map_sqlite_type(type_str: &str) -> DataType {
+    let t = type_str.to_uppercase();
+
+    if t.contains("INT") {
+        DataType::Integer
+    } else if t.contains("CHAR") || t.contains("CLOB") || t.contains("TEXT") {
+        DataType::Text
+    } else if t.contains("BLOB") {
+        DataType::Blob
+    } else if t.contains("REAL") || t.contains("FLOA") || t.contains("DOUB") {
+        DataType::Real
+    } else {
+        DataType::Numeric
+    }
+}
+
+/// Load full schema from SQLite database
+pub fn load_schema(
+    db_path: &Path,
+) -> Result<ArbitrarySchema, Box<dyn std::error::Error + Send + Sync>> {
+    let conn = rusqlite::Connection::open(db_path)?;
+
+    // Fetch user tables (ignore sqlite internal tables)
+    let mut stmt = conn.prepare(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'",
+    )?;
+
+    let table_names: Vec<String> = stmt
+        .query_map([], |row| row.get(0))?
+        .collect::<Result<_, _>>()?;
+
+    let mut tables = Vec::new();
+
+    for table_name in table_names {
+        let pragma = format!("PRAGMA table_info({table_name})");
+        let mut pragma_stmt = conn.prepare(&pragma)?;
+
+        let columns = pragma_stmt
+            .query_map([], |row| {
+                let name: String = row.get(1)?;
+                let type_str: String = row.get(2)?;
+                let not_null: bool = row.get::<_, i32>(3)? != 0;
+                let is_pk: bool = row.get::<_, i32>(5)? != 0;
+
+                let mut constraints = Vec::new();
+
+                if is_pk {
+                    constraints.push(Constraint::PrimaryKey);
+                }
+                if not_null {
+                    constraints.push(Constraint::NotNull);
+                }
+
+                Ok(Column {
+                    name,
+                    data_type: map_sqlite_type(&type_str),
+                    constraints,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        let pk_column = columns
+            .iter()
+            .find(|col| col.constraints.contains(&Constraint::PrimaryKey))
+            .expect("Table should have a primary key");
+        let mut select_stmt =
+            conn.prepare(&format!("SELECT {} FROM {table_name}", pk_column.name))?;
+        let mut rows = select_stmt.query(())?;
+        let mut pk_values = Vec::new();
+        while let Some(row) = rows.next()? {
+            let value = match row.get_ref(0)? {
+                rusqlite::types::ValueRef::Null => "NULL".to_string(),
+                rusqlite::types::ValueRef::Integer(x) => x.to_string(),
+                rusqlite::types::ValueRef::Real(x) => x.to_string(),
+                rusqlite::types::ValueRef::Text(text) => {
+                    format!("'{}'", std::str::from_utf8(text)?)
+                }
+                rusqlite::types::ValueRef::Blob(blob) => format!("x'{}'", hex::encode(blob)),
+            };
+            pk_values.push(value);
+        }
+        tables.push(Table {
+            name: table_name,
+            columns,
+            pk_values,
+        });
+    }
+
+    Ok(ArbitrarySchema { tables })
+}
+
 fn generate_plan(opts: &Opts) -> Result<Plan, Box<dyn std::error::Error + Send + Sync>> {
-    let schema = gen_schema(opts.tables);
-    // Write DDL statements to log file
     let mut log_file = File::create(&opts.log_file)?;
-    let ddl_statements = schema.to_sql();
+    if !opts.skip_log {
+        writeln!(log_file, "{}", opts.nr_threads)?;
+        writeln!(log_file, "{}", opts.nr_iterations)?;
+    }
     let mut plan = Plan {
         ddl_statements: vec![],
         queries_per_thread: vec![],
         nr_iterations: opts.nr_iterations,
         nr_threads: opts.nr_threads,
     };
-    if !opts.skip_log {
-        writeln!(log_file, "{}", opts.nr_threads)?;
-        writeln!(log_file, "{}", opts.nr_iterations)?;
-        writeln!(log_file, "{}", ddl_statements.len())?;
-        for stmt in &ddl_statements {
-            writeln!(log_file, "{stmt}")?;
+    let schema = if let Some(db_ref) = &opts.db_ref {
+        writeln!(log_file, "{}", 0)?;
+        load_schema(db_ref)?
+    } else {
+        let schema = gen_schema(opts.tables);
+        let ddl_statements = schema.to_sql();
+        if !opts.skip_log {
+            writeln!(log_file, "{}", ddl_statements.len())?;
+            for stmt in &ddl_statements {
+                writeln!(log_file, "{stmt}")?;
+            }
         }
-    }
-    plan.ddl_statements = ddl_statements;
+        plan.ddl_statements = ddl_statements;
+        schema
+    };
+    // Write DDL statements to log file
     for id in 0..opts.nr_threads {
         writeln!(log_file, "{id}",)?;
         let mut queries = vec![];
@@ -441,9 +573,15 @@ fn read_plan_from_log_file(opts: &Opts) -> Result<Plan, Box<dyn std::error::Erro
     Ok(plan)
 }
 
-pub fn init_tracing() -> Result<WorkerGuard, std::io::Error> {
+pub type LogLevelReloadHandle = reload::Handle<EnvFilter, tracing_subscriber::Registry>;
+
+pub fn init_tracing() -> Result<(WorkerGuard, LogLevelReloadHandle), std::io::Error> {
     let (non_blocking, guard) = tracing_appender::non_blocking(std::io::stderr());
+    let filter = EnvFilter::from_default_env();
+    let (filter_layer, reload_handle) = reload::Layer::new(filter);
+
     if let Err(e) = tracing_subscriber::registry()
+        .with(filter_layer)
         .with(
             tracing_subscriber::fmt::layer()
                 .with_writer(non_blocking)
@@ -451,12 +589,56 @@ pub fn init_tracing() -> Result<WorkerGuard, std::io::Error> {
                 .with_line_number(true)
                 .with_thread_ids(true),
         )
-        .with(EnvFilter::from_default_env())
         .try_init()
     {
         println!("Unable to setup tracing appender: {e:?}");
     }
-    Ok(guard)
+    Ok((guard, reload_handle))
+}
+
+const LOG_LEVEL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+const LOG_LEVEL_FILE: &str = "RUST_LOG";
+
+/// Spawns a background thread that watches for a RUST_LOG file and dynamically
+/// updates the log level when the file contents change.
+///
+/// The file should contain a valid tracing filter string (e.g., "debug", "info",
+/// "limbo_core=trace,warn"). If the file is removed or contains an invalid filter,
+/// the current log level is preserved.
+pub fn spawn_log_level_watcher(reload_handle: LogLevelReloadHandle) {
+    std::thread::spawn(move || {
+        let mut last_content: Option<String> = None;
+
+        loop {
+            std::thread::sleep(LOG_LEVEL_POLL_INTERVAL);
+
+            let content = match std::fs::read_to_string(LOG_LEVEL_FILE) {
+                Ok(content) => content.trim().to_string(),
+                Err(_) => {
+                    continue;
+                }
+            };
+
+            if last_content.as_ref() == Some(&content) {
+                continue;
+            }
+
+            match content.parse::<EnvFilter>() {
+                Ok(new_filter) => {
+                    if let Err(e) = reload_handle.reload(new_filter) {
+                        eprintln!("Failed to reload log filter: {e}");
+                    } else {
+                        last_content = Some(content);
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Invalid log filter in {LOG_LEVEL_FILE}: {e}");
+                    last_content = Some(content);
+                }
+            }
+        }
+    });
 }
 
 fn sqlite_integrity_check(
@@ -480,9 +662,18 @@ fn sqlite_integrity_check(
     Ok(())
 }
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let _g = init_tracing()?;
+fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+
+    rt.block_on(async_main())
+}
+
+async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let (_guard, reload_handle) = init_tracing()?;
+
+    spawn_log_level_watcher(reload_handle);
 
     let opts = Opts::parse();
 
@@ -521,6 +712,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let db_file = if let Some(db_file) = opts.db_file {
         db_file
     } else {
+        if let Some(db_ref) = opts.db_ref {
+            std::fs::copy(db_ref, &path)?;
+        }
         path.to_string_lossy().to_string()
     };
 
@@ -549,12 +743,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
             if let Err(e) = conn.execute(stmt, ()).await {
                 match e {
-                    turso::Error::SqlExecutionFailure(e) => {
-                        if e.contains("Corrupt database") {
-                            panic!("Error creating table: {}", e);
-                        } else {
-                            println!("Error creating table: {e}");
-                        }
+                    turso::Error::Corrupt(e) => {
+                        panic!("Error creating table: {e}");
+                    }
+                    turso::Error::Error(e) => {
+                        println!("Error creating table: {e}");
                     }
                     _ => {
                         println!("Error creating table: {e}");
@@ -565,7 +758,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         }
 
-        let nr_iterations = opts.nr_iterations;
+        let nr_iterations = plan.nr_iterations;
         let db = db.clone();
         let vfs_for_task = vfs_option.clone();
 
@@ -614,24 +807,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         std::io::stdout().flush().unwrap();
                     }
                 }
+                if opts.verbose {
+                    eprintln!("thread#{thread}(start): {sql}");
+                }
                 if let Err(e) = conn.execute(sql, ()).await {
                     match e {
-                        turso::Error::SqlExecutionFailure(e) => {
-                            if e.contains("Corrupt database") {
-                                panic!("Error executing query: {}", e);
-                            } else if e.contains("UNIQUE constraint failed") {
-                                if opts.verbose {
-                                    println!("Skipping UNIQUE constraint violation: {e}");
-                                }
-                            } else if opts.verbose {
+                        turso::Error::Corrupt(e) => {
+                            panic!("Error[FATAL] executing query: {}", e);
+                        }
+                        turso::Error::Constraint(e) => {
+                            if opts.verbose {
+                                println!("Error[WARNING] executing query: {e}");
+                            }
+                        }
+                        turso::Error::Busy(e) => {
+                            println!("Error[WARNING] executing query: {e}");
+                        }
+                        turso::Error::Error(e) => {
+                            if opts.verbose {
                                 println!("Error executing query: {e}");
                             }
                         }
-                        _ => panic!("Error executing query: {}", e),
+                        _ => panic!("Error[FATAL] executing query: {}", e),
                     }
+                }
+                if opts.verbose {
+                    eprintln!("thread#{thread}(end): {sql}");
                 }
                 const INTEGRITY_CHECK_INTERVAL: usize = 100;
                 if query_index % INTEGRITY_CHECK_INTERVAL == 0 {
+                    if opts.verbose {
+                        eprintln!("thread#{thread}(start): PRAGMA integrity_check");
+                    }
                     let mut res = conn.query("PRAGMA integrity_check", ()).await.unwrap();
                     match res.next().await {
                         Ok(Some(row)) => {
@@ -646,6 +853,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         Err(e) => {
                             println!("Error performing integrity check: {e}");
                         }
+                    }
+                    match res.next().await {
+                        Ok(Some(_)) => panic!("integrity check failed: more than 1 row"),
+                        Err(e) => println!("Error performing integrity check: {e}"),
+                        _ => {}
+                    }
+                    if opts.verbose {
+                        eprintln!("thread#{thread}(end): PRAGMA integrity_check");
                     }
                 }
             }

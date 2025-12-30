@@ -400,55 +400,59 @@ fn prepare_one_select_plan(
             )?;
 
             if let Some(mut group_by) = group_by {
-                for expr in group_by.exprs.iter_mut() {
-                    replace_column_number_with_copy_of_column_expr(expr, &plan.result_columns)?;
-                    bind_and_rewrite_expr(
-                        expr,
-                        Some(&mut plan.table_references),
-                        Some(&plan.result_columns),
+                // Process HAVING clause if present
+                let having_predicates = if let Some(having) = group_by.having {
+                    Some(process_having_clause(
+                        having,
+                        &mut plan.table_references,
+                        &plan.result_columns,
                         connection,
-                        BindingBehavior::TryResultColumnsFirst,
-                    )?;
-                }
+                        resolver,
+                        &mut aggregate_expressions,
+                    )?)
+                } else {
+                    None
+                };
 
-                plan.group_by = Some(GroupBy {
-                    sort_order: None,
-                    exprs: group_by.exprs.iter().map(|expr| *expr.clone()).collect(),
-                    having: if let Some(having) = group_by.having {
-                        let mut predicates = vec![];
-                        break_predicate_at_and_boundaries(&having, &mut predicates);
-                        for expr in predicates.iter_mut() {
-                            bind_and_rewrite_expr(
-                                expr,
-                                Some(&mut plan.table_references),
-                                Some(&plan.result_columns),
-                                connection,
-                                BindingBehavior::TryResultColumnsFirst,
-                            )?;
-                            let contains_aggregates = resolve_window_and_aggregate_functions(
-                                expr,
-                                resolver,
-                                &mut aggregate_expressions,
-                                None,
-                            )?;
-                            if !contains_aggregates {
-                                // TODO: sqlite allows HAVING clauses with non aggregate expressions like
-                                // HAVING id = 5. We should support this too eventually (I guess).
-                                // sqlite3-parser does not support HAVING without group by though, so we'll
-                                // need to either make a PR or add it to our vendored version.
-                                crate::bail_parse_error!(
-                                    "HAVING clause must contain an aggregate function"
-                                );
-                            }
-                        }
-                        Some(predicates)
-                    } else {
-                        None
-                    },
-                });
+                if !group_by.exprs.is_empty() {
+                    // Normal GROUP BY with expressions
+                    for expr in group_by.exprs.iter_mut() {
+                        replace_column_number_with_copy_of_column_expr(expr, &plan.result_columns)?;
+                        bind_and_rewrite_expr(
+                            expr,
+                            Some(&mut plan.table_references),
+                            Some(&plan.result_columns),
+                            connection,
+                            BindingBehavior::TryResultColumnsFirst,
+                        )?;
+                    }
+
+                    plan.group_by = Some(GroupBy {
+                        sort_order: None,
+                        exprs: group_by.exprs.iter().map(|expr| *expr.clone()).collect(),
+                        having: having_predicates,
+                    });
+                } else {
+                    // HAVING without GROUP BY: treat as ungrouped aggregation with filter
+                    plan.group_by = Some(GroupBy {
+                        sort_order: None,
+                        exprs: vec![],
+                        having: having_predicates,
+                    });
+                }
             }
 
             plan.aggregates = aggregate_expressions;
+
+            // HAVING without GROUP BY requires aggregates in the SELECT
+            if let Some(ref group_by) = plan.group_by {
+                if group_by.exprs.is_empty()
+                    && group_by.having.is_some()
+                    && plan.aggregates.is_empty()
+                {
+                    crate::bail_parse_error!("HAVING clause on a non-aggregate query");
+                }
+            }
 
             // Parse the ORDER BY clause
             let mut key = Vec::new();
@@ -712,8 +716,12 @@ fn count_plan_required_cursors(plan: &SelectPlan) -> usize {
             0
         })
         .sum();
-    let num_sorter_cursors = plan.group_by.is_some() as usize + !plan.order_by.is_empty() as usize;
-    let num_pseudo_cursors = plan.group_by.is_some() as usize + !plan.order_by.is_empty() as usize;
+    let has_group_by_with_exprs = plan
+        .group_by
+        .as_ref()
+        .is_some_and(|gb| !gb.exprs.is_empty());
+    let num_sorter_cursors = has_group_by_with_exprs as usize + !plan.order_by.is_empty() as usize;
+    let num_pseudo_cursors = has_group_by_with_exprs as usize + !plan.order_by.is_empty() as usize;
 
     num_table_cursors + num_sorter_cursors + num_pseudo_cursors
 }
@@ -803,4 +811,29 @@ pub fn emit_simple_count(
     });
     program.emit_result_row(output_reg, 1);
     Ok(())
+}
+
+fn process_having_clause(
+    having: Box<ast::Expr>,
+    table_references: &mut TableReferences,
+    result_columns: &[ResultSetColumn],
+    connection: &Arc<Connection>,
+    resolver: &Resolver,
+    aggregate_expressions: &mut Vec<super::plan::Aggregate>,
+) -> Result<Vec<ast::Expr>> {
+    let mut predicates = vec![];
+    break_predicate_at_and_boundaries(&having, &mut predicates);
+
+    for expr in predicates.iter_mut() {
+        bind_and_rewrite_expr(
+            expr,
+            Some(table_references),
+            Some(result_columns),
+            connection,
+            BindingBehavior::TryResultColumnsFirst,
+        )?;
+        resolve_window_and_aggregate_functions(expr, resolver, aggregate_expressions, None)?;
+    }
+
+    Ok(predicates)
 }

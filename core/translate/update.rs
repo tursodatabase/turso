@@ -96,13 +96,16 @@ pub fn translate_update_for_schema_change(
     Ok(program)
 }
 
-pub fn prepare_update_plan(
-    program: &mut ProgramBuilder,
+fn validate_update(
     schema: &Schema,
-    mut body: ast::Update,
-    connection: &Arc<crate::Connection>,
+    body: &ast::Update,
+    table_name: &str,
     is_internal_schema_change: bool,
-) -> crate::Result<Plan> {
+) -> crate::Result<()> {
+    // Check if this is a system table that should be protected from direct writes
+    if !is_internal_schema_change && !crate::schema::can_write_to_table(table_name) {
+        crate::bail_parse_error!("table {} may not be modified", table_name);
+    }
     if body.with.is_some() {
         bail_parse_error!("WITH clause is not supported in UPDATE");
     }
@@ -123,27 +126,13 @@ pub fn prepare_update_plan(
     if !body.order_by.is_empty() {
         bail_parse_error!("ORDER BY is not supported in UPDATE");
     }
-
-    let table_name = &body.tbl_name.name;
-
-    // Check if this is a system table that should be protected from direct writes
-    // Skip this check for internal schema change operations (like ALTER TABLE)
-    if !is_internal_schema_change && crate::schema::is_system_table(table_name.as_str()) {
-        bail_parse_error!("table {} may not be modified", table_name);
-    }
-
-    let table = match schema.get_table(table_name.as_str()) {
-        Some(table) => table,
-        None => bail_parse_error!("Parse error: no such table: {}", table_name),
-    };
-
     // Check if this is a materialized view
-    if schema.is_materialized_view(table_name.as_str()) {
+    if schema.is_materialized_view(table_name) {
         bail_parse_error!("cannot modify materialized view {}", table_name);
     }
 
     // Check if this table has any incompatible dependent views
-    let incompatible_views = schema.has_incompatible_dependent_views(table_name.as_str());
+    let incompatible_views = schema.has_incompatible_dependent_views(table_name);
     if !incompatible_views.is_empty() {
         use crate::incremental::compiler::DBSP_CIRCUIT_VERSION;
         bail_parse_error!(
@@ -155,7 +144,27 @@ pub fn prepare_update_plan(
             DBSP_CIRCUIT_VERSION
         );
     }
+    Ok(())
+}
 
+pub fn prepare_update_plan(
+    program: &mut ProgramBuilder,
+    schema: &Schema,
+    mut body: ast::Update,
+    connection: &Arc<crate::Connection>,
+    is_internal_schema_change: bool,
+) -> crate::Result<Plan> {
+    let table_name = &body.tbl_name.name;
+    let table = match schema.get_table(table_name.as_str()) {
+        Some(table) => table,
+        None => bail_parse_error!("Parse error: no such table: {}", table_name),
+    };
+    validate_update(
+        schema,
+        &body,
+        table_name.as_str(),
+        is_internal_schema_change,
+    )?;
     let table_name = table.get_name();
     let iter_dir = body
         .order_by
