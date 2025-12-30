@@ -403,49 +403,83 @@ fn convert_single_file(
         return (0, warning_count);
     }
 
-    // Generate output
-    let output = tcl_converter::generate_sqltest(&result);
+    // Generate output - may produce multiple files per database type
+    let generated = tcl_converter::generate_sqltest(&result);
 
     if to_stdout {
-        println!("\n{}", "--- Generated .sqltest ---".green().bold());
-        println!("{}", output);
+        for (key, file) in &generated.files {
+            println!(
+                "\n{} ({} tests)",
+                format!("--- {} tests ---", key).green().bold(),
+                file.test_count
+            );
+            println!("{}", file.content);
+        }
         println!("{}", "--- End ---".green().bold());
     } else {
-        // Determine output path
-        let output_path = if let Some(dir) = output_dir {
-            // Create output directory if it doesn't exist
-            if !dir.exists() {
-                if let Err(e) = std::fs::create_dir_all(dir) {
+        let file_stem = path.file_stem().unwrap_or_default().to_string_lossy();
+        let num_files = generated.files.len();
+
+        // Determine base output path
+        let base_dir = output_dir.clone().unwrap_or_else(|| path.parent().unwrap_or(std::path::Path::new(".")).to_path_buf());
+
+        // If multiple files, create a subdirectory
+        let (output_base, use_subdir) = if num_files > 1 {
+            let subdir = base_dir.join(file_stem.as_ref());
+            if !subdir.exists() {
+                if let Err(e) = std::fs::create_dir_all(&subdir) {
                     eprintln!(
                         "  {} Failed to create directory {}: {}",
                         "ERROR".red().bold(),
-                        dir.display(),
+                        subdir.display(),
                         e
                     );
                     return (0, warning_count);
                 }
             }
-            let file_stem = path.file_stem().unwrap_or_default();
-            dir.join(format!("{}.sqltest", file_stem.to_string_lossy()))
+            (subdir, true)
         } else {
-            path.with_extension("sqltest")
+            // Ensure base dir exists
+            if !base_dir.exists() {
+                if let Err(e) = std::fs::create_dir_all(&base_dir) {
+                    eprintln!(
+                        "  {} Failed to create directory {}: {}",
+                        "ERROR".red().bold(),
+                        base_dir.display(),
+                        e
+                    );
+                    return (0, warning_count);
+                }
+            }
+            (base_dir, false)
         };
 
-        match std::fs::write(&output_path, &output) {
-            Ok(_) => {
-                println!(
-                    "  {} Written to {}",
-                    "OK".green().bold(),
-                    output_path.display()
-                );
-            }
-            Err(e) => {
-                eprintln!(
-                    "  {} Failed to write {}: {}",
-                    "ERROR".red().bold(),
-                    output_path.display(),
-                    e
-                );
+        // Write each file
+        for (key, file) in &generated.files {
+            let output_path = if use_subdir {
+                // In subdirectory: use key as filename
+                output_base.join(format!("{}.sqltest", key))
+            } else {
+                // Single file: use original name
+                output_base.join(format!("{}.sqltest", file_stem))
+            };
+
+            match std::fs::write(&output_path, &file.content) {
+                Ok(_) => {
+                    println!(
+                        "  {} Written to {}",
+                        "OK".green().bold(),
+                        output_path.display()
+                    );
+                }
+                Err(e) => {
+                    eprintln!(
+                        "  {} Failed to write {}: {}",
+                        "ERROR".red().bold(),
+                        output_path.display(),
+                        e
+                    );
+                }
             }
         }
     }

@@ -34,6 +34,8 @@ pub struct ConversionWarning {
 pub enum WarningKind {
     /// A foreach loop was skipped (generates multiple tests)
     ForeachSkipped,
+    /// An if block was skipped (conditional tests)
+    IfBlockSkipped,
     /// An unknown test function was encountered
     UnknownFunction,
     /// Failed to parse test arguments
@@ -187,6 +189,18 @@ impl<'a> TclParser<'a> {
                     line: line_num,
                     kind: WarningKind::ForeachSkipped,
                     message: "foreach loop skipped - generates parameterized tests".to_string(),
+                    source: self.get_foreach_preview(),
+                });
+                self.skip_braced_block();
+                continue;
+            }
+
+            // Handle if blocks (conditional tests - skip with warning)
+            if line.starts_with("if ") {
+                warnings.push(ConversionWarning {
+                    line: line_num,
+                    kind: WarningKind::IfBlockSkipped,
+                    message: "if block skipped - conditional tests need manual review".to_string(),
                     source: self.get_foreach_preview(),
                 });
                 self.skip_braced_block();
@@ -832,6 +846,7 @@ impl std::fmt::Display for WarningKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             WarningKind::ForeachSkipped => write!(f, "FOREACH"),
+            WarningKind::IfBlockSkipped => write!(f, "IF_BLOCK"),
             WarningKind::UnknownFunction => write!(f, "UNKNOWN"),
             WarningKind::ParseError => write!(f, "PARSE_ERROR"),
             WarningKind::ProcSkipped => write!(f, "PROC"),
