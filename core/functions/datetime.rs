@@ -80,7 +80,7 @@ where
 {
     let values = values.into_iter();
     if values.len() == 0 {
-        let now = parse_naive_date_time(Value::build_text("now")).unwrap();
+        let now = chrono::Local::now().to_utc().naive_utc();
         return format_dt(now, output_type, false);
     }
     let mut values = values.peekable();
