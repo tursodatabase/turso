@@ -3,6 +3,8 @@
 //! This parser attempts to extract test cases from Tcl test files,
 //! skipping constructs it doesn't understand and reporting warnings.
 
+use chumsky::prelude::*;
+
 /// Result of converting a Tcl test file
 #[derive(Debug, Clone)]
 pub struct ConversionResult {
@@ -569,87 +571,59 @@ impl<'a> TclParser<'a> {
         preview
     }
 
-    /// Parse test arguments from collected content
+    /// Parse test arguments from collected content using chumsky
     fn parse_test_args(content: &str, min_args: usize) -> Result<Vec<String>, ConversionWarning> {
-        let mut args = Vec::new();
-        let mut current = String::new();
-        let mut brace_depth = 0;
-        let mut in_string = false;
-        let mut chars = content.chars().peekable();
+        // Parser for whitespace
+        let ws = any::<&str, extra::Err<Simple<char>>>()
+            .filter(|c: &char| c.is_whitespace())
+            .repeated();
 
-        // Skip leading whitespace first (handles indented tests)
-        while let Some(&ch) = chars.peek() {
-            if !ch.is_whitespace() {
-                break;
-            }
-            chars.next();
-        }
+        // Parser for braced content with nested braces
+        let braced = recursive(|braced| {
+            let not_brace = any().filter(|c: &char| *c != '{' && *c != '}');
+            let inner = choice((
+                braced.map(|s: String| format!("{{{}}}", s)),
+                not_brace.map(|c| c.to_string()),
+            ))
+            .repeated()
+            .collect::<Vec<_>>()
+            .map(|v| v.join(""));
 
-        // Skip the function name
-        while let Some(&ch) = chars.peek() {
-            if ch.is_whitespace() || ch == '{' {
-                break;
-            }
-            chars.next();
-        }
+            just('{').ignore_then(inner).then_ignore(just('}'))
+        });
 
-        // Skip whitespace after function name
-        while let Some(&ch) = chars.peek() {
-            if !ch.is_whitespace() {
-                break;
-            }
-            chars.next();
-        }
+        // Parser for quoted strings
+        let quoted = just('"')
+            .ignore_then(
+                any()
+                    .filter(|c: &char| *c != '"')
+                    .repeated()
+                    .collect::<String>(),
+            )
+            .then_ignore(just('"'));
 
-        while let Some(ch) = chars.next() {
-            match ch {
-                '{' if !in_string => {
-                    if brace_depth > 0 {
-                        current.push(ch);
-                    }
-                    brace_depth += 1;
-                }
-                '}' if !in_string => {
-                    brace_depth -= 1;
-                    if brace_depth > 0 {
-                        current.push(ch);
-                    } else if brace_depth == 0 {
-                        args.push(current.trim().to_string());
-                        current = String::new();
-                    }
-                }
-                '"' => {
-                    in_string = !in_string;
-                    if brace_depth == 0 {
-                        // Quoted argument outside braces
-                        if in_string {
-                            current = String::new();
-                        } else {
-                            args.push(current.clone());
-                            current = String::new();
-                        }
-                    } else {
-                        current.push(ch);
-                    }
-                }
-                _ if brace_depth > 0 => {
-                    current.push(ch);
-                }
-                _ if brace_depth == 0 && !ch.is_whitespace() => {
-                    // Unbraced argument
-                    current.push(ch);
-                }
-                _ if brace_depth == 0 && ch.is_whitespace() && !current.is_empty() => {
-                    args.push(current.clone());
-                    current = String::new();
-                }
-                _ => {}
-            }
-        }
+        // Parser for unbraced words (no whitespace, braces, or quotes)
+        let word = any()
+            .filter(|c: &char| !c.is_whitespace() && *c != '{' && *c != '}' && *c != '"')
+            .repeated()
+            .at_least(1)
+            .collect::<String>();
 
-        if !current.is_empty() {
-            args.push(current);
-        }
+        // Parser for a single argument
+        let arg = choice((braced, quoted, word));
+
+        // Parser for function name (skip it)
+        let func_name = any()
+            .filter(|c: &char| !c.is_whitespace() && *c != '{')
+            .repeated();
+
+        // Full parser: skip whitespace, function name, whitespace, then collect args
+        let parser = ws
+            .ignore_then(func_name)
+            .ignore_then(ws)
+            .ignore_then(arg.padded().repeated().collect::<Vec<_>>());
+
+        let args = parser.parse(content).into_result().unwrap_or_default();
 
         if args.len() < min_args {
             return Err(ConversionWarning {
