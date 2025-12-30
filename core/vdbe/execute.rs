@@ -1597,7 +1597,7 @@ pub fn op_column(
                                     &payload[start_offset..end_offset],
                                 )
                             };
-                            let serial_type = record_cursor.serial_types[target_column];
+                            let serial_type = record_cursor.serials_offsets[target_column].0;
 
                             match serial_type {
                                 // NULL
