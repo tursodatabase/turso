@@ -145,7 +145,9 @@ use turso_parser::{
 
 const SCHEMA_TABLE_NAME: &str = "sqlite_schema";
 const SCHEMA_TABLE_NAME_ALT: &str = "sqlite_master";
+pub const SQLITE_SEQUENCE_TABLE_NAME: &str = "sqlite_sequence";
 pub const DBSP_TABLE_PREFIX: &str = "__turso_internal_dbsp_state_v";
+pub const TURSO_INTERNAL_PREFIX: &str = "__turso_internal_";
 
 /// Used to refer to the implicit rowid column in tables without an alias during UPDATE
 pub const ROWID_SENTINEL: usize = usize::MAX;
@@ -158,10 +160,16 @@ pub const RESERVED_TABLE_PREFIXES: [&str; 2] = ["sqlite_", "__turso_internal_"];
 
 /// Check if a table name refers to a system table that should be protected from direct writes
 pub fn is_system_table(table_name: &str) -> bool {
+    RESERVED_TABLE_PREFIXES
+        .iter()
+        .any(|prefix| table_name.to_lowercase().starts_with(prefix))
+}
+
+pub fn can_write_to_table(table_name: &str) -> bool {
     let normalized = table_name.to_lowercase();
-    normalized == SCHEMA_TABLE_NAME
+    !(normalized == SCHEMA_TABLE_NAME
         || normalized == SCHEMA_TABLE_NAME_ALT
-        || table_name.starts_with(DBSP_TABLE_PREFIX)
+        || normalized.starts_with(TURSO_INTERNAL_PREFIX))
 }
 
 /// Type of schema object for conflict checking
@@ -1960,7 +1968,8 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
                         }
                         ast::ColumnConstraint::Default(ref expr) => {
                             default = Some(
-                                translate_ident_to_string_literal(expr).unwrap_or(expr.clone()),
+                                translate_ident_to_string_literal(expr)
+                                    .unwrap_or_else(|| expr.clone()),
                             );
                         }
                         // TODO: for now we don't check Resolve type of unique
@@ -2487,8 +2496,9 @@ impl From<&ColumnDefinition> for Column {
                 ast::ColumnConstraint::NotNull { .. } => notnull = true,
                 ast::ColumnConstraint::Unique(..) => unique = true,
                 ast::ColumnConstraint::Default(expr) => {
-                    default
-                        .replace(translate_ident_to_string_literal(expr).unwrap_or(expr.clone()));
+                    default.replace(
+                        translate_ident_to_string_literal(expr).unwrap_or_else(|| expr.clone()),
+                    );
                 }
                 ast::ColumnConstraint::Collate { collation_name } => {
                     collation.replace(

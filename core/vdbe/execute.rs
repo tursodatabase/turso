@@ -4,7 +4,7 @@ use crate::function::AlterTableFunc;
 use crate::mvcc::cursor::{MvccCursorType, NextRowidResult};
 use crate::mvcc::database::CheckpointStateMachine;
 use crate::mvcc::LocalClock;
-use crate::schema::Table;
+use crate::schema::{Table, SQLITE_SEQUENCE_TABLE_NAME};
 use crate::state_machine::StateMachine;
 use crate::storage::btree::{
     integrity_check, CursorTrait, IntegrityCheckError, IntegrityCheckState, PageCategory,
@@ -1518,7 +1518,7 @@ pub fn op_column(
                             };
                             let payload = record.get_payload();
 
-                            let mut record_cursor = record.cursor();
+                            let record_cursor = record.cursor();
 
                             let mut data_offset = if unlikely(record_cursor.is_uninitialized()) {
                                 record_cursor.init_header(payload)?
@@ -1597,7 +1597,7 @@ pub fn op_column(
                                     &payload[start_offset..end_offset],
                                 )
                             };
-                            drop(record_cursor);
+                            let serial_type = record_cursor.serial_types[target_column];
 
                             match serial_type {
                                 // NULL
@@ -6416,7 +6416,7 @@ pub fn op_insert(
                     cursor.root_page()
                 };
                 if root_page != 1
-                    && table_name != "sqlite_sequence"
+                    && table_name != SQLITE_SEQUENCE_TABLE_NAME
                     && !flag.has(InsertFlags::EPHEMERAL_TABLE_INSERT)
                 {
                     state.op_insert_state.sub_state = OpInsertSubState::UpdateLastRowid;
@@ -9095,12 +9095,12 @@ pub fn op_add_column(
         let table = schema
             .tables
             .get_mut(table)
-            .expect("table being renamed should be in schema");
+            .expect("table being altered should be in schema");
 
         let table = Arc::make_mut(table);
 
         let Table::BTree(btree) = table else {
-            panic!("only btree tables can be renamed");
+            panic!("only btree tables can have columns added");
         };
 
         let btree = Arc::make_mut(btree);

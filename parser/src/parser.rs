@@ -2140,18 +2140,25 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_group_by(&mut self) -> Result<Option<GroupBy>> {
-        match self.peek()? {
+        let has_group_by = match self.peek()? {
             None => return Ok(None),
             Some(tok) => match tok.token_type {
                 TK_GROUP => {
                     eat_assert!(self, TK_GROUP);
                     eat_expect!(self, TK_BY);
+                    true
                 }
+                TK_HAVING => false,
                 _ => return Ok(None),
             },
-        }
+        };
 
-        let exprs = self.parse_nexpr_list()?;
+        let exprs = if has_group_by {
+            self.parse_nexpr_list()?
+        } else {
+            vec![]
+        };
+
         let having = match self.peek()? {
             Some(tok) if tok.token_type == TK_HAVING => {
                 eat_assert!(self, TK_HAVING);
@@ -2160,7 +2167,11 @@ impl<'a> Parser<'a> {
             _ => None,
         };
 
-        Ok(Some(GroupBy { exprs, having }))
+        if !exprs.is_empty() || having.is_some() {
+            Ok(Some(GroupBy { exprs, having }))
+        } else {
+            Ok(None)
+        }
     }
 
     fn parse_where(&mut self) -> Result<Option<Box<Expr>>> {
@@ -8908,6 +8919,51 @@ mod tests {
                                     Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
                                     Operator::Equals,
                                     Box::new(Expr::Literal(Literal::Numeric("1".to_owned()))),
+                                ))),
+                            }),
+                            window_clause: vec![],
+                        },
+                        compounds: vec![],
+                    },
+                    order_by: vec![],
+                    limit: None,
+                }))],
+            ),
+            (
+                b"SELECT sum(a) s FROM t HAVING s = 15".as_slice(),
+                vec![Cmd::Stmt(Stmt::Select(Select {
+                    with: None,
+                    body: SelectBody {
+                        select: OneSelect::Select {
+                            distinctness: None,
+                            columns: vec![ResultColumn::Expr(
+                                Box::new(Expr::FunctionCall {
+                                    name: Name::exact("sum".to_owned()),
+                                    distinctness: None,
+                                    args: vec![Box::new(Expr::Id(Name::exact("a".to_owned())))],
+                                    order_by: vec![],
+                                    filter_over: FunctionTail {
+                                        filter_clause: None,
+                                        over_clause: None,
+                                    },
+                                }),
+                                Some(As::Elided(Name::exact("s".to_owned()))),
+                            )],
+                            from: Some(FromClause {
+                                select: Box::new(SelectTable::Table(
+                                    QualifiedName { db_name: None, name: Name::exact("t".to_owned()), alias: None },
+                                    None,
+                                    None,
+                                )),
+                                joins: vec![]
+                            }),
+                            where_clause: None,
+                            group_by: Some(GroupBy {
+                                exprs: vec![],
+                                having: Some(Box::new(Expr::Binary(
+                                    Box::new(Expr::Id(Name::exact("s".to_owned()))),
+                                    Operator::Equals,
+                                    Box::new(Expr::Literal(Literal::Numeric("15".to_owned()))),
                                 ))),
                             }),
                             window_clause: vec![],

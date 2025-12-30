@@ -345,9 +345,7 @@ mod tests {
             .schema
             .read()
             .get_materialized_view("test_view")
-            .ok_or(crate::LimboError::InternalError(
-                "View not found".to_string(),
-            ))?;
+            .ok_or_else(|| crate::LimboError::InternalError("View not found".to_string()))?;
 
         // Get the view's root page
         let view = view_mutex.lock();

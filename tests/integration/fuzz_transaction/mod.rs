@@ -471,8 +471,7 @@ impl std::fmt::Display for Operation {
 
 #[tokio::test]
 /// Verify translation isolation semantics with multiple concurrent connections.
-/// This test is ignored because it still fails sometimes; unsure if it fails due to a bug in the test or a bug in the implementation.
-async fn test_multiple_connections_fuzz() {
+async fn test_multiple_connections_fuzz_non_mvcc() {
     multiple_connections_fuzz(FuzzOptions::default()).await
 }
 
@@ -600,6 +599,7 @@ async fn multiple_connections_fuzz(opts: FuzzOptions) {
         if opts.mvcc_enabled {
             let conn = db.connect().unwrap();
             conn.pragma_update("journal_mode", "'experimental_mvcc'")
+                .await
                 .unwrap();
         }
 

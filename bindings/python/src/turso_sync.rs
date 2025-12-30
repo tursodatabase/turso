@@ -143,7 +143,6 @@ pub fn py_turso_sync_new(
             }
             None => None,
         },
-        db_io: None,
     };
     let database =
         TursoDatabaseSync::<Vec<u8>>::new(db_config, sync_config).map_err(turso_error_to_py_err)?;
@@ -213,14 +212,14 @@ impl PyTursoSyncDatabaseStats {
             self.revert_wal_size,
             self.last_pull_unix_time
                 .map(|x| x.to_string())
-                .unwrap_or("None".to_string()),
+                .unwrap_or_else(|| "None".to_string()),
             self.last_push_unix_time
                 .map(|x| x.to_string())
-                .unwrap_or("None".to_string()),
+                .unwrap_or_else(|| "None".to_string()),
             self.revision
                 .as_ref()
                 .map(|x| format!("\"{x}\""))
-                .unwrap_or("None".to_string()),
+                .unwrap_or_else(|| "None".to_string()),
             self.network_sent_bytes,
             self.network_received_bytes,
         ))

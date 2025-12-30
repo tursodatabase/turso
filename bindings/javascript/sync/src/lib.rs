@@ -238,7 +238,9 @@ impl SyncEngine {
         )?));
         let opts_filled = SyncEngineOptsFilled {
             path: opts.path,
-            client_name: opts.client_name.unwrap_or("turso-sync-js".to_string()),
+            client_name: opts
+                .client_name
+                .unwrap_or_else(|| "turso-sync-js".to_string()),
             wal_pull_batch_size: opts.wal_pull_batch_size.unwrap_or(100),
             long_poll_timeout: opts
                 .long_poll_timeout_ms

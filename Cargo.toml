@@ -56,17 +56,9 @@ turso_sync_sdk_kit = { path = "sync/sdk-kit", version = "0.4.0-pre.18" }
 limbo_completion = { path = "extensions/completion", version = "0.4.0-pre.18" }
 turso_core = { path = "core", version = "0.4.0-pre.18" }
 turso_sync_engine = { path = "sync/engine", version = "0.4.0-pre.18" }
-limbo_crypto = { path = "extensions/crypto", version = "0.4.0-pre.18" }
-limbo_csv = { path = "extensions/csv", version = "0.4.0-pre.18" }
 turso_ext = { path = "extensions/core", version = "0.4.0-pre.18" }
-turso_ext_tests = { path = "extensions/tests", version = "0.4.0-pre.18" }
-limbo_ipaddr = { path = "extensions/ipaddr", version = "0.4.0-pre.18" }
 turso_macros = { path = "macros", version = "0.4.0-pre.18" }
-limbo_percentile = { path = "extensions/percentile", version = "0.4.0-pre.18" }
-limbo_regexp = { path = "extensions/regexp", version = "0.4.0-pre.18" }
-limbo_uuid = { path = "extensions/uuid", version = "0.4.0-pre.18" }
 turso_parser = { path = "parser", version = "0.4.0-pre.18" }
-limbo_fuzzy = { path = "extensions/fuzzy", version = "0.4.0-pre.18" }
 sql_generation = { path = "sql_generation" }
 strum = { version = "0.26", features = ["derive"] }
 strum_macros = "0.26"
@@ -138,3 +130,6 @@ debug = true
 [profile.dist]
 inherits = "release"
 lto = "thin"
+
+[workspace.lints.clippy]
+or_fun_call = "deny"

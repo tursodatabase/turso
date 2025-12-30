@@ -1119,3 +1119,151 @@ fn test_unique_complex_key() {
     let rows: Vec<(String,)> = conn.exec_rows("SELECT b FROM t");
     assert_eq!(rows, vec![("2".to_string(),), ("4".to_string(),)]);
 }
+
+#[turso_macros::test]
+pub fn test_conflict_autocommit(limbo: TempDatabase) {
+    let _ = env_logger::try_init();
+    let conn1 = limbo.db.connect().unwrap();
+    let conn2 = limbo.db.connect().unwrap();
+    conn1
+        .execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y);")
+        .unwrap();
+    conn1.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+    assert!(matches!(
+        conn1.execute("INSERT INTO t VALUES (1, 0)").unwrap_err(),
+        LimboError::Constraint(_)
+    ));
+    conn2.execute("INSERT INTO t VALUES (2, 20)").unwrap();
+    assert_eq!(
+        vec![
+            vec![
+                rusqlite::types::Value::Integer(1),
+                rusqlite::types::Value::Integer(10),
+            ],
+            vec![
+                rusqlite::types::Value::Integer(2),
+                rusqlite::types::Value::Integer(20),
+            ],
+        ],
+        limbo_exec_rows(&conn1, "SELECT * FROM t")
+    );
+    assert_eq!(
+        vec![
+            vec![
+                rusqlite::types::Value::Integer(1),
+                rusqlite::types::Value::Integer(10),
+            ],
+            vec![
+                rusqlite::types::Value::Integer(2),
+                rusqlite::types::Value::Integer(20),
+            ],
+        ],
+        limbo_exec_rows(&conn2, "SELECT * FROM t")
+    );
+}
+
+#[turso_macros::test]
+pub fn test_conflict_multi_insert_autocommit(limbo: TempDatabase) {
+    let _ = env_logger::try_init();
+    let conn1 = limbo.db.connect().unwrap();
+    let conn2 = limbo.db.connect().unwrap();
+    conn1
+        .execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y);")
+        .unwrap();
+    conn1.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+    assert!(matches!(
+        conn1
+            .execute("INSERT INTO t VALUES (2, 20), (1, 0), (3, 30)")
+            .unwrap_err(),
+        LimboError::Constraint(_)
+    ));
+    conn2.execute("INSERT INTO t VALUES (4, 40)").unwrap();
+    assert_eq!(
+        vec![
+            vec![
+                rusqlite::types::Value::Integer(1),
+                rusqlite::types::Value::Integer(10),
+            ],
+            vec![
+                rusqlite::types::Value::Integer(4),
+                rusqlite::types::Value::Integer(40),
+            ],
+        ],
+        limbo_exec_rows(&conn1, "SELECT * FROM t")
+    );
+    assert_eq!(
+        vec![
+            vec![
+                rusqlite::types::Value::Integer(1),
+                rusqlite::types::Value::Integer(10),
+            ],
+            vec![
+                rusqlite::types::Value::Integer(4),
+                rusqlite::types::Value::Integer(40),
+            ],
+        ],
+        limbo_exec_rows(&conn2, "SELECT * FROM t")
+    );
+}
+
+#[turso_macros::test]
+pub fn test_conflict_inside_txn(limbo: TempDatabase) {
+    let _ = env_logger::try_init();
+    let conn1 = limbo.db.connect().unwrap();
+    let conn2 = limbo.db.connect().unwrap();
+    conn1
+        .execute("CREATE TABLE t (x INTEGER PRIMARY KEY, y);")
+        .unwrap();
+    conn1.execute("INSERT INTO t VALUES (1, 10)").unwrap();
+    conn1.execute("BEGIN").unwrap();
+    conn1.execute("INSERT INTO t VALUES (2, 20)").unwrap();
+    assert!(matches!(
+        conn1.execute("INSERT INTO t VALUES (1, 0)").unwrap_err(),
+        LimboError::Constraint(_)
+    ));
+    conn1.execute("INSERT INTO t VALUES (3, 30)").unwrap();
+    conn1.execute("COMMIT").unwrap();
+    conn2.execute("INSERT INTO t VALUES (4, 40)").unwrap();
+    assert_eq!(
+        vec![
+            vec![
+                rusqlite::types::Value::Integer(1),
+                rusqlite::types::Value::Integer(10),
+            ],
+            vec![
+                rusqlite::types::Value::Integer(2),
+                rusqlite::types::Value::Integer(20),
+            ],
+            vec![
+                rusqlite::types::Value::Integer(3),
+                rusqlite::types::Value::Integer(30),
+            ],
+            vec![
+                rusqlite::types::Value::Integer(4),
+                rusqlite::types::Value::Integer(40),
+            ]
+        ],
+        limbo_exec_rows(&conn1, "SELECT * FROM t")
+    );
+    assert_eq!(
+        vec![
+            vec![
+                rusqlite::types::Value::Integer(1),
+                rusqlite::types::Value::Integer(10),
+            ],
+            vec![
+                rusqlite::types::Value::Integer(2),
+                rusqlite::types::Value::Integer(20),
+            ],
+            vec![
+                rusqlite::types::Value::Integer(3),
+                rusqlite::types::Value::Integer(30),
+            ],
+            vec![
+                rusqlite::types::Value::Integer(4),
+                rusqlite::types::Value::Integer(40),
+            ]
+        ],
+        limbo_exec_rows(&conn2, "SELECT * FROM t")
+    );
+}

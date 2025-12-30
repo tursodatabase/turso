@@ -844,7 +844,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 let tx = mvcc_store
                     .txs
                     .get(&self.tx_id)
-                    .ok_or(LimboError::NoSuchTransactionID(self.tx_id.to_string()))?;
+                    .ok_or_else(|| LimboError::NoSuchTransactionID(self.tx_id.to_string()))?;
                 let tx_unlocked = tx.value();
                 self.header.write().replace(*tx_unlocked.header.read());
                 tracing::trace!("end_commit_logical_log(tx_id={})", self.tx_id);
@@ -856,7 +856,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                 let tx = mvcc_store
                     .txs
                     .get(&self.tx_id)
-                    .ok_or(LimboError::NoSuchTransactionID(self.tx_id.to_string()))?;
+                    .ok_or_else(|| LimboError::NoSuchTransactionID(self.tx_id.to_string()))?;
                 let tx_unlocked = tx.value();
                 tx_unlocked
                     .state
@@ -1337,7 +1337,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let tx = self
             .txs
             .get(&tx_id)
-            .ok_or(LimboError::NoSuchTransactionID(tx_id.to_string()))?;
+            .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
         let tx = tx.value();
         assert_eq!(tx.state, TransactionState::Active);
         let id = row.id.clone();
@@ -1389,7 +1389,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let tx = self
             .txs
             .get(&tx_id)
-            .ok_or(LimboError::NoSuchTransactionID(tx_id.to_string()))?;
+            .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
         let tx = tx.value();
         tx.insert_to_write_set(id.clone());
         match maybe_index_id {
@@ -1424,7 +1424,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let tx = self
             .txs
             .get(&tx_id)
-            .ok_or(LimboError::NoSuchTransactionID(tx_id.to_string()))?;
+            .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
         let tx = tx.value();
         assert_eq!(tx.state, TransactionState::Active);
         let id = row.id.clone();
@@ -1552,7 +1552,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         let tx = self
                             .txs
                             .get(&tx_id)
-                            .ok_or(LimboError::NoSuchTransactionID(tx_id.to_string()))?;
+                            .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
                         let tx = tx.value();
                         assert_eq!(tx.state, TransactionState::Active);
                         // A transaction cannot delete a version that it cannot see,
@@ -1570,7 +1570,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         let tx = self
                             .txs
                             .get(&tx_id)
-                            .ok_or(LimboError::NoSuchTransactionID(tx_id.to_string()))?;
+                            .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
                         let tx = tx.value();
                         tx.insert_to_write_set(id.clone());
                         return Ok(true);
@@ -1586,7 +1586,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         let tx = self
                             .txs
                             .get(&tx_id)
-                            .ok_or(LimboError::NoSuchTransactionID(tx_id.to_string()))?;
+                            .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
                         let tx = tx.value();
                         assert_eq!(tx.state, TransactionState::Active);
                         // A transaction cannot delete a version that it cannot see,
@@ -1606,7 +1606,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         let tx = self
                             .txs
                             .get(&tx_id)
-                            .ok_or(LimboError::NoSuchTransactionID(tx_id.to_string()))?;
+                            .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
                         let tx = tx.value();
                         tx.insert_to_write_set(id);
                         return Ok(true);
@@ -1654,7 +1654,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let tx = self
             .txs
             .get(&tx_id)
-            .ok_or(LimboError::NoSuchTransactionID(tx_id.to_string()))?;
+            .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
         let tx = tx.value();
         assert_eq!(tx.state, TransactionState::Active);
         match maybe_index_id {
@@ -2005,7 +2005,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let begin_ts = if let Some(tx_id) = maybe_existing_tx_id {
             self.txs
                 .get(&tx_id)
-                .ok_or(LimboError::NoSuchTransactionID(tx_id.to_string()))?
+                .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?
                 .value()
                 .begin_ts
         } else {
@@ -2142,7 +2142,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             let tx = self
                 .txs
                 .get(tx_id)
-                .ok_or(LimboError::NoSuchTransactionID(tx_id.to_string()))?;
+                .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
             let header = tx.value();
             let header = header.header.read();
             tracing::debug!("with_header read: header={:?}", header);
@@ -2150,9 +2150,9 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         } else {
             let header = self.global_header.read();
             tracing::debug!("with_header read: header={:?}", header);
-            Ok(f(header.as_ref().ok_or(LimboError::InternalError(
-                "global_header not initialized".to_string(),
-            ))?))
+            Ok(f(header.as_ref().ok_or_else(|| {
+                LimboError::InternalError("global_header not initialized".to_string())
+            })?))
         }
     }
 
@@ -2164,16 +2164,16 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             let tx = self
                 .txs
                 .get(tx_id)
-                .ok_or(LimboError::NoSuchTransactionID(tx_id.to_string()))?;
+                .ok_or_else(|| LimboError::NoSuchTransactionID(tx_id.to_string()))?;
             let header = tx.value();
             let mut header = header.header.write();
             tracing::debug!("with_header_mut read: header={:?}", header);
             Ok(f(&mut header))
         } else {
             let mut header = self.global_header.write();
-            let header = header.as_mut().ok_or(LimboError::InternalError(
-                "global_header not initialized".to_string(),
-            ))?;
+            let header = header.as_mut().ok_or_else(|| {
+                LimboError::InternalError("global_header not initialized".to_string())
+            })?;
             tracing::debug!("with_header_mut write: header={:?}", header);
             Ok(f(header))
         }
@@ -2670,7 +2670,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     .get(&index_id)
                     .and_then(|entry| *entry.value())
                     .map(|value| value as i64)
-                    .unwrap_or(i64::from(index_id)); // this can be negative for non-checkpointed indexes
+                    .unwrap_or_else(|| i64::from(index_id)); // this can be negative for non-checkpointed indexes
 
                 let index = schema
                     .indexes
@@ -2698,9 +2698,11 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         let record = ImmutableRecord::from_bin_record(row_data);
                         let mut record_cursor = RecordCursor::new();
                         let mut record_values = record_cursor.get_values(&record);
-                        let val = record_values.nth(3).ok_or(LimboError::InternalError(
-                            "Expected at least 4 columns in sqlite_schema".to_string(),
-                        ))??;
+                        let val = record_values.nth(3).ok_or_else(|| {
+                            LimboError::InternalError(
+                                "Expected at least 4 columns in sqlite_schema".to_string(),
+                            )
+                        })??;
                         let ValueRef::Integer(root_page) = val else {
                             panic!("Expected integer value for root page, got {val:?}");
                         };
