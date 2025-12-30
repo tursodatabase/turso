@@ -119,10 +119,21 @@ pub fn join_lhs_and_rhs<'a>(
     let lhs_mask = lhs.map_or_else(TableMask::new, |l| {
         TableMask::from_table_number_iter(l.table_numbers())
     });
+
+    let rhs_self_mask = {
+        let mut m = TableMask::new();
+        m.add_table(rhs_table_number);
+        m
+    };
+
     let output_cardinality_multiplier = rhs_constraints
         .constraints
         .iter()
-        .filter(|c| lhs_mask.contains_all(&c.lhs_mask))
+        .filter(|c| {
+            lhs_mask.contains_all(&c.lhs_mask)
+                || c.lhs_mask == rhs_self_mask
+                || c.lhs_mask.is_empty()
+        })
         .map(|c| c.selectivity)
         .product::<f64>();
 
@@ -853,10 +864,18 @@ fn find_best_starting_table(
         }
 
         let base_rows = *base_table_rows[t];
+
+        let self_mask = {
+            let mut m = TableMask::new();
+            m.add_table(t);
+            m
+        };
+
+        // include both literal constraints and self-constraints
         let selectivity: f64 = constraints[t]
             .constraints
             .iter()
-            .filter(|c| c.lhs_mask.is_empty())
+            .filter(|c| c.lhs_mask.is_empty() || c.lhs_mask == self_mask)
             .map(|c| c.selectivity)
             .product();
 
