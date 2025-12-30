@@ -1446,3 +1446,74 @@ fn test_mvcc_dual_seek_range_operations() {
         ]
     );
 }
+
+#[test]
+fn test_commit_without_mvcc() {
+    let tmp_db = TempDatabase::new("test_commit_without_mvcc.db");
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT)")
+        .unwrap();
+
+    conn.execute("BEGIN IMMEDIATE").unwrap();
+
+    assert!(
+        !conn.get_auto_commit(),
+        "should not be in autocommit mode after BEGIN"
+    );
+
+    conn.execute("INSERT INTO test (id, value) VALUES (1, 'hello')")
+        .unwrap();
+
+    conn.execute("COMMIT")
+        .expect("COMMIT should succeed for non-MVCC transactions");
+
+    assert!(
+        conn.get_auto_commit(),
+        "should be back in autocommit mode after COMMIT"
+    );
+
+    let stmt = conn
+        .query("SELECT value FROM test WHERE id = 1")
+        .unwrap()
+        .unwrap();
+    let row = helper_read_single_row(stmt);
+    assert_eq!(row[0], Value::Text("hello".into()));
+}
+
+#[test]
+fn test_rollback_without_mvcc() {
+    let tmp_db = TempDatabase::new("test_rollback_without_mvcc.db");
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT)")
+        .unwrap();
+
+    conn.execute("INSERT INTO test (id, value) VALUES (1, 'initial')")
+        .unwrap();
+
+    conn.execute("BEGIN IMMEDIATE").unwrap();
+
+    assert!(
+        !conn.get_auto_commit(),
+        "should not be in autocommit mode after BEGIN"
+    );
+
+    conn.execute("UPDATE test SET value = 'modified' WHERE id = 1")
+        .unwrap();
+
+    conn.execute("ROLLBACK")
+        .expect("ROLLBACK should succeed for non-MVCC transactions");
+
+    assert!(
+        conn.get_auto_commit(),
+        "should be back in autocommit mode after ROLLBACK"
+    );
+
+    let stmt = conn
+        .query("SELECT value FROM test WHERE id = 1")
+        .unwrap()
+        .unwrap();
+    let row = helper_read_single_row(stmt);
+    assert_eq!(row[0], Value::Text("initial".into()));
+}
