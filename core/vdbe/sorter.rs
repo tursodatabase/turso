@@ -672,7 +672,7 @@ impl SortableImmutableRecord {
         cursor.ensure_parsed_upto(&record, key_len - 1)?;
         turso_assert!(
             index_key_info.len() >= cursor.serials_offsets.len(),
-            "index_key_info.len() < cursor.serial_types.len()"
+            "index_key_info.len() < cursor.serials_offsets.len()"
         );
 
         // Pre-compute all key values upfront
