@@ -1,6 +1,8 @@
 use clap::{Parser, Subcommand};
 use miette::{NamedSource, Report};
 use std::process::ExitCode;
+use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 use std::{path::PathBuf, time::Instant};
 use turso_test_runner::{
@@ -347,17 +349,19 @@ fn convert_single_file(
     path: &PathBuf,
     output_dir: &Option<PathBuf>,
     to_stdout: bool,
-    verbose: bool,
+    _verbose: bool,
 ) -> (usize, usize) {
     use colored::Colorize;
 
     let content = match std::fs::read_to_string(path) {
-        Ok(c) => c,
+        Ok(c) => Arc::new(c),
         Err(e) => {
             eprintln!("{} - {}: {}", path.display(), "ERROR".red().bold(), e);
             return (0, 0);
         }
     };
+
+    let path_display = Rc::new(path.display().to_string());
 
     let source_name = path.file_name().unwrap_or_default().to_string_lossy();
     let result = tcl_converter::convert(&content, &source_name);
@@ -368,34 +372,16 @@ fn convert_single_file(
     // Print file header
     println!(
         "{} - {} tests, {} warnings",
-        path.display().to_string().cyan(),
+        path_display.cyan(),
         test_count,
         warning_count
     );
 
-    // Print warnings
+    // Print warnings using miette
     for warning in &result.warnings {
-        if verbose {
-            println!(
-                "  {} [{}] line {}: {}",
-                "WARN".yellow().bold(),
-                warning.kind,
-                warning.line,
-                warning.message
-            );
-            // Print a snippet of the source
-            for line in warning.source.lines().take(3) {
-                println!("       {}", line.dimmed());
-            }
-        } else {
-            println!(
-                "  {} line {}: {} - {}",
-                "WARN".yellow(),
-                warning.line,
-                warning.kind,
-                warning.message
-            );
-        }
+        let report = warning.to_report(&path_display, content.clone());
+        // Use debug format {:?} to get full miette diagnostic with source snippets
+        eprintln!("{:?}", report);
     }
 
     if test_count == 0 {
@@ -421,7 +407,11 @@ fn convert_single_file(
         let num_files = generated.files.len();
 
         // Determine base output path
-        let base_dir = output_dir.clone().unwrap_or_else(|| path.parent().unwrap_or(std::path::Path::new(".")).to_path_buf());
+        let base_dir = output_dir.clone().unwrap_or_else(|| {
+            path.parent()
+                .unwrap_or(std::path::Path::new("."))
+                .to_path_buf()
+        });
 
         // If multiple files, create a subdirectory
         let (output_base, use_subdir) = if num_files > 1 {

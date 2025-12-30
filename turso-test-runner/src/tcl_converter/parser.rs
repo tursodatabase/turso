@@ -3,11 +3,12 @@
 //! This parser attempts to extract test cases from Tcl test files,
 //! skipping constructs it doesn't understand and reporting warnings.
 
+use std::sync::Arc;
+
 use chumsky::prelude::*;
 
 use crate::tcl_converter::utils::{
-    arg, braced, check_has_ddl, clean_name, clean_sql, comment, hpad, hspace, skip_block,
-    skip_line,
+    arg, braced, check_has_ddl, clean_name, clean_sql, comment, hpad, hspace, skip_block, skip_line,
 };
 
 #[macro_export]
@@ -33,14 +34,33 @@ pub struct ConversionResult {
 /// A warning generated during conversion
 #[derive(Debug, Clone)]
 pub struct ConversionWarning {
-    /// Line number where the issue was found
-    pub line: usize,
     /// Kind of warning
     pub kind: WarningKind,
     /// Description of what was skipped or problematic
     pub message: String,
-    /// The source line content
-    pub source: String,
+    /// The source span
+    pub span: Option<SimpleSpan>,
+}
+
+impl ConversionWarning {
+    /// Convert this warning into a miette Report for display
+    pub fn to_report(&self, source_name: &str, source_code: Arc<String>) -> miette::Report {
+        use miette::{LabeledSpan, NamedSource, Severity};
+
+        let labels: Vec<LabeledSpan> = self
+            .span
+            .map(|span| vec![LabeledSpan::at(span.start..span.end, self.kind.to_string())])
+            .unwrap_or_default();
+
+        let diag = miette::MietteDiagnostic::new(self.message.clone())
+            .with_code(format!("tcl_converter::{}", self.kind.code()))
+            .with_severity(Severity::Warning)
+            .with_help(self.kind.help().to_string())
+            .with_labels(labels);
+
+        let report: miette::Report = diag.into();
+        report.with_source_code(NamedSource::new(source_name, source_code.clone()))
+    }
 }
 
 /// Types of warnings
@@ -348,7 +368,7 @@ pub enum SkipKind {
 pub enum TclItem {
     Test(TclTest),
     Comment(String),
-    Skip(SkipKind, String), // kind and preview of content
+    Skip(SkipKind, SimpleSpan), // kind and preview of content
 }
 
 impl TclItem {
@@ -361,12 +381,17 @@ impl TclItem {
 /// Full file parser
 pub fn tcl_file_parser<'a>() -> text_parser!('a, Vec<TclItem>) {
     // Skip block parsers that capture the entire block content
-    let foreach_block =
-        skip_block("foreach").map(|preview| TclItem::Skip(SkipKind::Foreach, preview));
+    let foreach_block = skip_block("foreach")
+        .spanned()
+        .map(|preview| TclItem::Skip(SkipKind::Foreach, preview.span));
 
-    let if_block = skip_block("if").map(|preview| TclItem::Skip(SkipKind::If, preview));
+    let if_block = skip_block("if")
+        .spanned()
+        .map(|preview| TclItem::Skip(SkipKind::If, preview.span));
 
-    let proc_block = skip_block("proc").map(|preview| TclItem::Skip(SkipKind::Proc, preview));
+    let proc_block = skip_block("proc")
+        .spanned()
+        .map(|preview| TclItem::Skip(SkipKind::Proc, preview.span));
 
     // Each item can have leading horizontal whitespace
     let item = hspace().ignore_then(choice((
@@ -375,12 +400,15 @@ pub fn tcl_file_parser<'a>() -> text_parser!('a, Vec<TclItem>) {
         foreach_block,
         if_block,
         proc_block,
-        skip_line().to(TclItem::Skip(SkipKind::Line, String::new())),
+        skip_line()
+            .spanned()
+            .map(|line| TclItem::Skip(SkipKind::Line, line.span)),
         // Skip unknown lines (but only non-empty ones after whitespace)
         none_of(" \t\n")
             .then(none_of('\n').repeated())
             .to_slice()
-            .map(|s: &str| TclItem::Skip(SkipKind::Unknown, s.to_string())),
+            .spanned()
+            .map(|s: Spanned<&str>| TclItem::Skip(SkipKind::Unknown, s.span)),
     )));
 
     item.separated_by(just('\n').repeated())
@@ -421,7 +449,7 @@ pub fn parse_tcl_file(content: &str, source_file: &str) -> ConversionResult {
                 TclItem::Comment(c) => {
                     pending_comments.push(c);
                 }
-                TclItem::Skip(kind, preview) => {
+                TclItem::Skip(kind, span) => {
                     // Generate warning for skipped content
                     let (warning_kind, message) = match kind {
                         SkipKind::Foreach => (
@@ -443,10 +471,9 @@ pub fn parse_tcl_file(content: &str, source_file: &str) -> ConversionResult {
                     };
 
                     warnings.push(ConversionWarning {
-                        line: 0,
                         kind: warning_kind,
                         message,
-                        source: preview.chars().take(100).collect(),
+                        span: Some(span),
                     });
                 }
             }
@@ -456,10 +483,9 @@ pub fn parse_tcl_file(content: &str, source_file: &str) -> ConversionResult {
     // Add parse errors as warnings
     for e in errors {
         warnings.push(ConversionWarning {
-            line: 0,
             kind: WarningKind::ParseError,
             message: e.to_string(),
-            source: String::new(),
+            span: None,
         });
     }
 
@@ -558,6 +584,44 @@ impl std::fmt::Display for WarningKind {
     }
 }
 
+impl WarningKind {
+    /// Returns a unique error code for this warning kind
+    pub fn code(&self) -> &'static str {
+        match self {
+            WarningKind::ForeachSkipped => "foreach_skipped",
+            WarningKind::IfBlockSkipped => "if_block_skipped",
+            WarningKind::UnknownFunction => "unknown_function",
+            WarningKind::ParseError => "parse_error",
+            WarningKind::ProcSkipped => "proc_skipped",
+            WarningKind::ExtensionSkipped => "extension_skipped",
+            WarningKind::ToleranceTest => "tolerance_test",
+            WarningKind::SkipLinesTest => "skip_lines_test",
+            WarningKind::SmallDbTest => "small_db_test",
+        }
+    }
+
+    /// Returns a help message for this warning kind
+    pub fn help(&self) -> &'static str {
+        match self {
+            WarningKind::ForeachSkipped => {
+                "foreach loops generate parameterized tests - convert manually"
+            }
+            WarningKind::IfBlockSkipped => "conditional test blocks need manual inspection",
+            WarningKind::UnknownFunction => "this test function is not recognized by the converter",
+            WarningKind::ParseError => "the parser could not understand this construct",
+            WarningKind::ProcSkipped => {
+                "proc definitions define helper functions - may need manual porting"
+            }
+            WarningKind::ExtensionSkipped => {
+                "extension loading is not supported in the test format"
+            }
+            WarningKind::ToleranceTest => "tolerance-based comparisons need manual conversion",
+            WarningKind::SkipLinesTest => "skip_lines tests need manual conversion",
+            WarningKind::SmallDbTest => "uses a different test database",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use crate::tcl_converter::convert;
@@ -583,7 +647,9 @@ mod tests {
         let result = test_parser().parse(input).into_result();
         assert!(result.is_ok());
         let test = result.unwrap();
-        assert!(matches!(test.kind, TclTestKind::Error(Some(ref p)) if p.contains("no such table")));
+        assert!(
+            matches!(test.kind, TclTestKind::Error(Some(ref p)) if p.contains("no such table"))
+        );
     }
 
     #[test]
@@ -672,7 +738,10 @@ do_execsql_test test3 {SELECT 3} {3}"#;
         let result = tcl_file_parser().parse(input).into_result();
         assert!(result.is_ok());
         let items = result.unwrap();
-        let tests: Vec<_> = items.iter().filter(|i| matches!(i, TclItem::Test(_))).collect();
+        let tests: Vec<_> = items
+            .iter()
+            .filter(|i| matches!(i, TclItem::Test(_)))
+            .collect();
         assert_eq!(tests.len(), 3);
     }
 
@@ -684,7 +753,10 @@ do_execsql_test test1 {SELECT 1} {1}
         let result = tcl_file_parser().parse(input).into_result();
         assert!(result.is_ok());
         let items = result.unwrap();
-        let comments: Vec<_> = items.iter().filter(|i| matches!(i, TclItem::Comment(_))).collect();
+        let comments: Vec<_> = items
+            .iter()
+            .filter(|i| matches!(i, TclItem::Comment(_)))
+            .collect();
         assert_eq!(comments.len(), 2);
     }
 
@@ -696,7 +768,10 @@ do_execsql_test test1 {SELECT 1} {1}
         let result = tcl_file_parser().parse(input).into_result();
         assert!(result.is_ok());
         let items = result.unwrap();
-        let skips: Vec<_> = items.iter().filter(|i| matches!(i, TclItem::Skip(SkipKind::Foreach, _))).collect();
+        let skips: Vec<_> = items
+            .iter()
+            .filter(|i| matches!(i, TclItem::Skip(SkipKind::Foreach, _)))
+            .collect();
         assert!(!skips.is_empty());
     }
 
@@ -708,7 +783,10 @@ do_execsql_test test1 {SELECT 1} {1}
         let result = tcl_file_parser().parse(input).into_result();
         assert!(result.is_ok());
         let items = result.unwrap();
-        let skips: Vec<_> = items.iter().filter(|i| matches!(i, TclItem::Skip(SkipKind::If, _))).collect();
+        let skips: Vec<_> = items
+            .iter()
+            .filter(|i| matches!(i, TclItem::Skip(SkipKind::If, _)))
+            .collect();
         assert!(!skips.is_empty());
     }
 
@@ -720,7 +798,10 @@ do_execsql_test test1 {SELECT 1} {1}
         let result = tcl_file_parser().parse(input).into_result();
         assert!(result.is_ok());
         let items = result.unwrap();
-        let skips: Vec<_> = items.iter().filter(|i| matches!(i, TclItem::Skip(SkipKind::Proc, _))).collect();
+        let skips: Vec<_> = items
+            .iter()
+            .filter(|i| matches!(i, TclItem::Skip(SkipKind::Proc, _)))
+            .collect();
         assert!(!skips.is_empty());
     }
 
@@ -730,7 +811,10 @@ do_execsql_test test1 {SELECT 1} {1}
         let result = tcl_file_parser().parse(input).into_result();
         assert!(result.is_ok());
         let items = result.unwrap();
-        let skips: Vec<_> = items.iter().filter(|i| matches!(i, TclItem::Skip(SkipKind::Line, _))).collect();
+        let skips: Vec<_> = items
+            .iter()
+            .filter(|i| matches!(i, TclItem::Skip(SkipKind::Line, _)))
+            .collect();
         assert!(!skips.is_empty());
     }
 
@@ -752,7 +836,11 @@ do_execsql_test select-const-1 {
 "#;
 
         let result = convert(content, "test.test");
-        assert!(result.warnings.is_empty(), "Got warnings: {:?}", result.warnings);
+        assert!(
+            result.warnings.is_empty(),
+            "Got warnings: {:?}",
+            result.warnings
+        );
         assert_eq!(result.tests.len(), 1);
         assert_eq!(result.tests[0].name, "select-const-1");
         assert_eq!(result.tests[0].sql.trim(), "SELECT 1");
@@ -874,7 +962,11 @@ do_execsql_test arith-1 {SELECT 1 + 1} {2}
 
     #[test]
     fn test_build_test_standard() {
-        let args = vec!["test-name".to_string(), "SELECT 1".to_string(), "1".to_string()];
+        let args = vec![
+            "test-name".to_string(),
+            "SELECT 1".to_string(),
+            "1".to_string(),
+        ];
         let result = build_test(args, TestConfig::standard());
         assert!(result.is_ok());
         let test = result.unwrap();
@@ -884,7 +976,12 @@ do_execsql_test arith-1 {SELECT 1 + 1} {2}
 
     #[test]
     fn test_build_test_with_db() {
-        let args = vec!["mydb".to_string(), "test-name".to_string(), "SELECT 1".to_string(), "1".to_string()];
+        let args = vec![
+            "mydb".to_string(),
+            "test-name".to_string(),
+            "SELECT 1".to_string(),
+            "1".to_string(),
+        ];
         let result = build_test(args, TestConfig::standard().db_from_arg());
         assert!(result.is_ok());
         let test = result.unwrap();
@@ -893,7 +990,11 @@ do_execsql_test arith-1 {SELECT 1 + 1} {2}
 
     #[test]
     fn test_build_test_memory() {
-        let args = vec!["test-name".to_string(), "SELECT 1".to_string(), "1".to_string()];
+        let args = vec![
+            "test-name".to_string(),
+            "SELECT 1".to_string(),
+            "1".to_string(),
+        ];
         let result = build_test(args, TestConfig::memory());
         assert!(result.is_ok());
         let test = result.unwrap();
@@ -902,7 +1003,11 @@ do_execsql_test arith-1 {SELECT 1 + 1} {2}
 
     #[test]
     fn test_build_test_error_kind() {
-        let args = vec!["test-name".to_string(), "SELECT * FROM missing".to_string(), ".*error.*".to_string()];
+        let args = vec![
+            "test-name".to_string(),
+            "SELECT * FROM missing".to_string(),
+            ".*error.*".to_string(),
+        ];
         let result = build_test(args, TestConfig::standard().error());
         assert!(result.is_ok());
         let test = result.unwrap();
@@ -1064,78 +1169,5 @@ do_execsql_test_on_specific_db {:memory:} test3 {
         }
         // 172 total - 2 commented - 1 in foreach = 169
         assert!(result.tests.len() > 100, "Should have over 100 tests");
-    }
-
-    #[test]
-    fn test_raw_file_parsing() {
-        let content = std::fs::read_to_string("../testing/select.test").unwrap();
-        let (items, errors) = tcl_file_parser().parse(&content).into_output_errors();
-
-        if let Some(items) = items {
-            let mut tests = 0;
-            let mut comments = 0;
-            let mut skips = 0;
-            let mut skip_foreach = 0;
-            let mut skip_if = 0;
-            let mut skip_proc = 0;
-            let mut skip_line = 0;
-            let mut skip_unknown = 0;
-            let mut unknown_previews = Vec::new();
-
-            for item in &items {
-                match item {
-                    TclItem::Test(_) => tests += 1,
-                    TclItem::Comment(_) => comments += 1,
-                    TclItem::Skip(kind, preview) => {
-                        skips += 1;
-                        match kind {
-                            SkipKind::Foreach => skip_foreach += 1,
-                            SkipKind::If => skip_if += 1,
-                            SkipKind::Proc => skip_proc += 1,
-                            SkipKind::Line => skip_line += 1,
-                            SkipKind::Unknown => {
-                                skip_unknown += 1;
-                                if preview.len() > 50 {
-                                    unknown_previews.push(preview.chars().take(80).collect::<String>());
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            println!("Total items: {}", items.len());
-            println!("Tests: {}", tests);
-            println!("Comments: {}", comments);
-            println!("Skips total: {}", skips);
-            println!("  Foreach: {}", skip_foreach);
-            println!("  If: {}", skip_if);
-            println!("  Proc: {}", skip_proc);
-            println!("  Line: {}", skip_line);
-            println!("  Unknown: {}", skip_unknown);
-
-            println!("\nLarge unknown skips:");
-            for (i, p) in unknown_previews.iter().enumerate() {
-                println!("  {}: {}", i, p);
-            }
-
-            // Print first and last tests
-            println!("\nFirst 10 tests:");
-            let tests_vec: Vec<_> = items.iter().filter_map(|i| {
-                if let TclItem::Test(t) = i { Some(t) } else { None }
-            }).collect();
-            for t in tests_vec.iter().take(10) {
-                println!("  {}", t.name);
-            }
-            println!("\nLast 10 tests:");
-            for t in tests_vec.iter().rev().take(10).rev() {
-                println!("  {}", t.name);
-            }
-        }
-
-        println!("Parse errors: {}", errors.len());
-        for e in errors.iter().take(5) {
-            println!("  Error: {}", e);
-        }
     }
 }
