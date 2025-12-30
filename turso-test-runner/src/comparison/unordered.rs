@@ -1,4 +1,4 @@
-use super::{parse_expected_rows, ComparisonResult};
+use super::{ComparisonResult, parse_expected_rows};
 use std::collections::HashSet;
 
 /// Compare rows as sets (order-independent)

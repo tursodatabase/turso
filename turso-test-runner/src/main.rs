@@ -289,8 +289,12 @@ fn convert_files(
                     for entry in entries {
                         match entry {
                             Ok(file_path) => {
-                                let (tests, warnings) =
-                                    convert_single_file(&file_path, &output_dir, to_stdout, verbose);
+                                let (tests, warnings) = convert_single_file(
+                                    &file_path,
+                                    &output_dir,
+                                    to_stdout,
+                                    verbose,
+                                );
                                 total_tests += tests;
                                 total_warnings += warnings;
                                 files_processed += 1;
@@ -311,7 +315,11 @@ fn convert_files(
             total_warnings += warnings;
             files_processed += 1;
         } else {
-            eprintln!("{}: {} does not exist", "Error".red().bold(), path.display());
+            eprintln!(
+                "{}: {} does not exist",
+                "Error".red().bold(),
+                path.display()
+            );
         }
     }
 

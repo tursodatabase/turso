@@ -21,20 +21,41 @@ pub fn convert(content: &str, source_file: &str) -> ConversionResult {
 pub fn generate_sqltest(result: &ConversionResult) -> String {
     let mut output = String::new();
 
-    // Determine database type based on tests
-    let needs_memory = result.tests.iter().any(|t| t.uses_memory_db());
-    let has_ddl = result.tests.iter().any(|t| t.has_ddl);
-    let uses_test_dbs = result.tests.iter().any(|t| t.uses_test_dbs());
+    // Collect all unique databases used by tests
+    let mut databases: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut needs_memory = false;
+    let mut has_ddl = false;
 
-    // If we have DDL statements or memory db tests, we need a writable database
+    for test in &result.tests {
+        if test.has_ddl {
+            has_ddl = true;
+        }
+        match &test.db {
+            Some(db) if db == ":memory:" => {
+                needs_memory = true;
+            }
+            Some(db) => {
+                // Specific database path
+                databases.insert(db.clone());
+            }
+            None => {
+                // Uses default test_dbs
+            }
+        }
+    }
+
+    // Determine database configuration
     if has_ddl || needs_memory {
+        // Need writable database
         writeln!(output, "@database :memory:").unwrap();
-    } else if uses_test_dbs {
-        // Tests that use test_dbs without DDL need readonly databases
-        writeln!(output, "@database testing/testing.db readonly").unwrap();
+    } else if !databases.is_empty() {
+        // Use specific databases mentioned in tests (readonly)
+        for db in &databases {
+            writeln!(output, "@database {} readonly", db).unwrap();
+        }
     } else {
-        // Default to memory for safety
-        writeln!(output, "@database :memory:").unwrap();
+        // Default: uses test_dbs, output readonly
+        writeln!(output, "@database testing/testing.db readonly").unwrap();
     }
 
     writeln!(output).unwrap();
@@ -91,6 +112,11 @@ pub fn generate_sqltest(result: &ConversionResult) -> String {
         }
 
         writeln!(output).unwrap();
+    }
+
+    // Write remaining comments
+    for comment in &result.pending_comments {
+        writeln!(output, "{}", comment).unwrap();
     }
 
     output

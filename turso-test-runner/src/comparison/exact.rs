@@ -1,4 +1,4 @@
-use super::{format_rows, parse_expected_rows, ComparisonResult};
+use super::{ComparisonResult, format_rows, parse_expected_rows};
 use similar::{ChangeTag, TextDiff};
 
 /// Compare rows exactly (same order, same values)

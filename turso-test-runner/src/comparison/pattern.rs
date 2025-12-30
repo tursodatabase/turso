@@ -1,4 +1,4 @@
-use super::{format_rows, ComparisonResult};
+use super::{ComparisonResult, format_rows};
 use regex::Regex;
 
 /// Compare rows against a regex pattern

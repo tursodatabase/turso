@@ -283,10 +283,7 @@ mod tests {
             .collect();
 
         assert_eq!(non_newline[0].token, Token::AtSetup);
-        assert_eq!(
-            non_newline[1].token,
-            Token::Identifier("users".to_string())
-        );
+        assert_eq!(non_newline[1].token, Token::Identifier("users".to_string()));
         assert_eq!(non_newline[2].token, Token::AtSkip);
         assert_eq!(non_newline[3].token, Token::String("known bug".to_string()));
         assert_eq!(non_newline[4].token, Token::Test);

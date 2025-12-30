@@ -12,6 +12,8 @@ pub struct ConversionResult {
     pub warnings: Vec<ConversionWarning>,
     /// Source file name for reporting
     pub source_file: String,
+    /// Comments that were left at the end of the file
+    pub pending_comments: Vec<String>,
 }
 
 /// A warning generated during conversion
@@ -130,12 +132,8 @@ impl<'a> TclParser<'a> {
             let line = self.lines[self.pos].trim();
             let line_num = self.pos + 1;
 
-            // Skip empty lines
+            // Skip empty lines (but keep pending comments - they might be for the next test)
             if line.is_empty() {
-                // Clear pending comments on empty lines (they were for something else)
-                if !pending_comments.is_empty() {
-                    pending_comments.clear();
-                }
                 self.pos += 1;
                 continue;
             }
@@ -250,6 +248,7 @@ impl<'a> TclParser<'a> {
             tests,
             warnings,
             source_file: self.source_file.to_string(),
+            pending_comments,
         }
     }
 
@@ -333,7 +332,8 @@ impl<'a> TclParser<'a> {
         let content = self.collect_test_content();
         let parts = Self::parse_test_args(&content, 3)?;
 
-        let db = Self::clean_name(&parts[0]);
+        // Don't use clean_name for db path - just trim it
+        let db = parts[0].trim().to_string();
         let name = Self::clean_name(&parts[1]);
         let sql = Self::clean_sql(&parts[2]);
         let expected = if parts.len() > 3 {
