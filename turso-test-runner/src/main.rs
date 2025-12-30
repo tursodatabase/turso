@@ -5,7 +5,7 @@ use std::time::Duration;
 use std::{path::PathBuf, time::Instant};
 use turso_test_runner::{
     Format, OutputFormat, ParseError, RunnerConfig, TestRunner, backends::cli::CliBackend,
-    create_output, summarize,
+    create_output, summarize, tcl_converter,
 };
 
 #[derive(Parser)]
@@ -51,6 +51,25 @@ enum Commands {
         #[arg(required = true)]
         paths: Vec<PathBuf>,
     },
+
+    /// Convert Tcl .test files to .sqltest format
+    Convert {
+        /// Tcl test files to convert
+        #[arg(required = true)]
+        paths: Vec<PathBuf>,
+
+        /// Output directory (default: write next to source files)
+        #[arg(short, long)]
+        output_dir: Option<PathBuf>,
+
+        /// Print to stdout instead of writing files
+        #[arg(long)]
+        stdout: bool,
+
+        /// Show verbose warnings
+        #[arg(short, long)]
+        verbose: bool,
+    },
 }
 
 #[tokio::main]
@@ -67,6 +86,12 @@ async fn main() -> ExitCode {
             timeout,
         } => run_tests(paths, binary, filter, jobs, output, timeout).await,
         Commands::Check { paths } => check_files(paths),
+        Commands::Convert {
+            paths,
+            output_dir,
+            stdout,
+            verbose,
+        } => convert_files(paths, output_dir, stdout, verbose),
     }
 }
 
@@ -239,4 +264,183 @@ fn print_parse_error(path: &PathBuf, content: &str, error: ParseError) {
         content.to_string(),
     ));
     eprintln!("{:?}", report);
+}
+
+fn convert_files(
+    paths: Vec<PathBuf>,
+    output_dir: Option<PathBuf>,
+    to_stdout: bool,
+    verbose: bool,
+) -> ExitCode {
+    use colored::Colorize;
+
+    let mut total_tests = 0;
+    let mut total_warnings = 0;
+    let mut files_processed = 0;
+
+    for path in &paths {
+        if path.is_dir() {
+            // Glob for .test files
+            let pattern = path.join("*.test");
+            let pattern_str = pattern.to_string_lossy();
+
+            match glob::glob(&pattern_str) {
+                Ok(entries) => {
+                    for entry in entries {
+                        match entry {
+                            Ok(file_path) => {
+                                let (tests, warnings) =
+                                    convert_single_file(&file_path, &output_dir, to_stdout, verbose);
+                                total_tests += tests;
+                                total_warnings += warnings;
+                                files_processed += 1;
+                            }
+                            Err(e) => {
+                                eprintln!("{}: {}", "Error".red().bold(), e);
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("{}: invalid glob pattern: {}", "Error".red().bold(), e);
+                }
+            }
+        } else if path.is_file() {
+            let (tests, warnings) = convert_single_file(path, &output_dir, to_stdout, verbose);
+            total_tests += tests;
+            total_warnings += warnings;
+            files_processed += 1;
+        } else {
+            eprintln!("{}: {} does not exist", "Error".red().bold(), path.display());
+        }
+    }
+
+    // Print summary
+    println!();
+    println!(
+        "{}: {} files processed, {} tests converted, {} warnings",
+        "Summary".cyan().bold(),
+        files_processed,
+        total_tests,
+        total_warnings
+    );
+
+    if total_warnings > 0 {
+        println!(
+            "{}",
+            "Some tests require manual conversion. See warnings above.".yellow()
+        );
+    }
+
+    ExitCode::SUCCESS
+}
+
+fn convert_single_file(
+    path: &PathBuf,
+    output_dir: &Option<PathBuf>,
+    to_stdout: bool,
+    verbose: bool,
+) -> (usize, usize) {
+    use colored::Colorize;
+
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("{} - {}: {}", path.display(), "ERROR".red().bold(), e);
+            return (0, 0);
+        }
+    };
+
+    let source_name = path.file_name().unwrap_or_default().to_string_lossy();
+    let result = tcl_converter::convert(&content, &source_name);
+
+    let test_count = result.tests.len();
+    let warning_count = result.warnings.len();
+
+    // Print file header
+    println!(
+        "{} - {} tests, {} warnings",
+        path.display().to_string().cyan(),
+        test_count,
+        warning_count
+    );
+
+    // Print warnings
+    for warning in &result.warnings {
+        if verbose {
+            println!(
+                "  {} [{}] line {}: {}",
+                "WARN".yellow().bold(),
+                warning.kind,
+                warning.line,
+                warning.message
+            );
+            // Print a snippet of the source
+            for line in warning.source.lines().take(3) {
+                println!("       {}", line.dimmed());
+            }
+        } else {
+            println!(
+                "  {} line {}: {} - {}",
+                "WARN".yellow(),
+                warning.line,
+                warning.kind,
+                warning.message
+            );
+        }
+    }
+
+    if test_count == 0 {
+        println!("  {} No tests found to convert", "INFO".blue());
+        return (0, warning_count);
+    }
+
+    // Generate output
+    let output = tcl_converter::generate_sqltest(&result);
+
+    if to_stdout {
+        println!("\n{}", "--- Generated .sqltest ---".green().bold());
+        println!("{}", output);
+        println!("{}", "--- End ---".green().bold());
+    } else {
+        // Determine output path
+        let output_path = if let Some(dir) = output_dir {
+            // Create output directory if it doesn't exist
+            if !dir.exists() {
+                if let Err(e) = std::fs::create_dir_all(dir) {
+                    eprintln!(
+                        "  {} Failed to create directory {}: {}",
+                        "ERROR".red().bold(),
+                        dir.display(),
+                        e
+                    );
+                    return (0, warning_count);
+                }
+            }
+            let file_stem = path.file_stem().unwrap_or_default();
+            dir.join(format!("{}.sqltest", file_stem.to_string_lossy()))
+        } else {
+            path.with_extension("sqltest")
+        };
+
+        match std::fs::write(&output_path, &output) {
+            Ok(_) => {
+                println!(
+                    "  {} Written to {}",
+                    "OK".green().bold(),
+                    output_path.display()
+                );
+            }
+            Err(e) => {
+                eprintln!(
+                    "  {} Failed to write {}: {}",
+                    "ERROR".red().bold(),
+                    output_path.display(),
+                    e
+                );
+            }
+        }
+    }
+
+    (test_count, warning_count)
 }
