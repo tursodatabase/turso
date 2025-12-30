@@ -59,17 +59,18 @@ fn get_db_declaration(db_key: &str, has_ddl: bool) -> String {
         "@database :memory:".to_string()
     } else {
         // Map suffix back to database path
-        let db_path = match db_key {
-            "default" => "database/testing.db\n@database/testing_norowidalias.db",
-            "small" => "database/testing_small.db",
-            "norowidalias" => "database/testing_norowidalias.db",
-            "user_version_10" => "database/testing_user_version_10.db",
+        match db_key {
+            "default" => ["testing", "testing_norowidalias"]
+                .map(|key| format!("@database database/{key}.db readonly"))
+                .join("\n"),
+            "small" | "norowidalias" | "user_version_10" => {
+                format!("@database database/testing_{db_key}.db readonly")
+            }
             other => {
                 // For unknown databases, try to construct a path
                 return format!("@database database/{}.db readonly", other);
             }
-        };
-        format!("@database {} readonly", db_path)
+        }
     }
 }
 
