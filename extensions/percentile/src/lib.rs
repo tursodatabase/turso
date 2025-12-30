@@ -195,7 +195,9 @@ impl AggFunc for PercentileDisc {
 /// Standard Deviation implementation using Welford's algorithm
 /// Formula:
 ///
+/// ```text
 ///     s = sqrt( M2 / (n - 1) )
+/// ```
 ///
 /// Where:
 /// - `n` = number of observations
