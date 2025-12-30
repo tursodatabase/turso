@@ -760,7 +760,7 @@ impl BTreeCursor {
 
     /// Check if the table is empty.
     /// This is done by checking if the root page has no cells.
-    #[instrument(skip_all, level = Level::DEBUG)]
+    #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     fn is_empty_table(&mut self) -> Result<IOResult<bool>> {
         loop {
             let state = self.is_empty_table_state.clone();
@@ -783,7 +783,7 @@ impl BTreeCursor {
 
     /// Move the cursor to the previous record and return it.
     /// Used in backwards iteration.
-    #[instrument(skip(self), level = Level::DEBUG, name = "prev")]
+    #[cfg_attr(debug_assertions, instrument(skip(self), level = Level::DEBUG, name = "prev"))]
     pub fn get_prev_record(&mut self) -> Result<IOResult<bool>> {
         loop {
             let (old_top_idx, page_type, is_index, is_leaf, cell_count) = {
@@ -1292,7 +1292,7 @@ impl BTreeCursor {
 
     /// Move the cursor to the next record and return it.
     /// Used in forwards iteration, which is the default.
-    #[instrument(skip(self), level = Level::DEBUG, name = "next")]
+    #[cfg_attr(debug_assertions, instrument(skip(self), level = Level::DEBUG, name = "next"))]
     pub fn get_next_record(&mut self) -> Result<IOResult<bool>> {
         if self.stack.current_page == -1 {
             // This can happen in nested left joins. See:
@@ -1486,7 +1486,7 @@ impl BTreeCursor {
     }
 
     /// Specialized version of move_to() for table btrees.
-    #[instrument(skip(self), level = Level::DEBUG)]
+    #[cfg_attr(debug_assertions, instrument(skip(self), level = Level::DEBUG))]
     fn tablebtree_move_to(&mut self, rowid: i64, seek_op: SeekOp) -> Result<IOResult<()>> {
         loop {
             let (old_top_idx, is_leaf, cell_count) = {
@@ -1648,7 +1648,7 @@ impl BTreeCursor {
     }
 
     /// Specialized version of move_to() for index btrees.
-    #[instrument(skip(self, index_key), level = Level::DEBUG)]
+    #[cfg_attr(debug_assertions, instrument(skip(self, index_key), level = Level::DEBUG))]
     fn indexbtree_move_to(
         &mut self,
         index_key: &ImmutableRecord,
@@ -1929,7 +1929,7 @@ impl BTreeCursor {
 
     /// Specialized version of do_seek() for table btrees that uses binary search instead
     /// of iterating cells in order.
-    #[instrument(skip_all, level = Level::DEBUG)]
+    #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     fn tablebtree_seek(&mut self, rowid: i64, seek_op: SeekOp) -> Result<IOResult<SeekResult>> {
         if matches!(
             self.seek_state,
@@ -2089,7 +2089,7 @@ impl BTreeCursor {
         Ok(ControlFlow::Continue(()))
     }
 
-    #[instrument(skip_all, level = Level::DEBUG)]
+    #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     fn indexbtree_seek(
         &mut self,
         key: &ImmutableRecord,
@@ -2330,9 +2330,8 @@ impl BTreeCursor {
         (cmp, found)
     }
 
-    #[instrument(skip_all, level = Level::DEBUG)]
+    #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     pub fn move_to(&mut self, key: SeekKey<'_>, cmp: SeekOp) -> Result<IOResult<()>> {
-        tracing::trace!(?key, ?cmp);
         // For a table with N rows, we can find any row by row id in O(log(N)) time by starting at the root page and following the B-tree pointers.
         // B-trees consist of interior pages and leaf pages. Interior pages contain pointers to other pages, while leaf pages contain the actual row data.
         //
@@ -4993,7 +4992,7 @@ impl BTreeCursor {
 }
 
 impl CursorTrait for BTreeCursor {
-    #[instrument(skip_all, level = Level::DEBUG)]
+    #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     fn next(&mut self) -> Result<IOResult<bool>> {
         if self.valid_state == CursorValidState::Invalid {
             return Ok(IOResult::Done(false));
@@ -5031,7 +5030,7 @@ impl CursorTrait for BTreeCursor {
         }
     }
 
-    #[instrument(skip_all, level = Level::DEBUG)]
+    #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     fn last(&mut self) -> Result<IOResult<()>> {
         let always_seek = false;
         let cursor_has_record = return_if_io!(self.move_to_rightmost(always_seek));
@@ -5040,7 +5039,7 @@ impl CursorTrait for BTreeCursor {
         Ok(IOResult::Done(()))
     }
 
-    #[instrument(skip_all, level = Level::DEBUG)]
+    #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     fn prev(&mut self) -> Result<IOResult<bool>> {
         loop {
             match self.advance_state {
@@ -5058,7 +5057,7 @@ impl CursorTrait for BTreeCursor {
         }
     }
 
-    #[instrument(skip(self), level = Level::DEBUG)]
+    #[cfg_attr(debug_assertions, instrument(skip(self), level = Level::DEBUG))]
     fn rowid(&mut self) -> Result<IOResult<Option<i64>>> {
         if self.get_null_flag() {
             return Ok(IOResult::Done(None));
@@ -5080,11 +5079,9 @@ impl CursorTrait for BTreeCursor {
         }
     }
 
-    #[instrument(skip(self, key), level = Level::DEBUG)]
+    #[cfg_attr(debug_assertions, instrument(skip(self, key), level = Level::DEBUG))]
     fn seek(&mut self, key: SeekKey<'_>, op: SeekOp) -> Result<IOResult<SeekResult>> {
         self.skip_advance = false;
-        // Empty trace to capture the span information
-        tracing::trace!("");
         // We need to clear the null flag for the table cursor before seeking,
         // because it might have been set to false by an unmatched left-join row during the previous iteration
         // on the outer loop.
@@ -5097,7 +5094,7 @@ impl CursorTrait for BTreeCursor {
         Ok(IOResult::Done(seek_result))
     }
 
-    #[instrument(skip(self), level = Level::DEBUG)]
+    #[cfg_attr(debug_assertions, instrument(skip(self), level = Level::DEBUG))]
     fn record(&mut self) -> Result<IOResult<Option<&ImmutableRecord>>> {
         if !self.has_record() {
             return Ok(IOResult::Done(None));
@@ -5150,7 +5147,7 @@ impl CursorTrait for BTreeCursor {
         Ok(IOResult::Done(self.reusable_immutable_record.as_ref()))
     }
 
-    #[instrument(skip_all, level = Level::DEBUG)]
+    #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     fn insert(&mut self, key: &BTreeKey) -> Result<IOResult<()>> {
         tracing::debug!(valid_state = ?self.valid_state, cursor_state = ?self.state, is_write_in_progress = self.is_write_in_progress());
         return_if_io!(self.insert_into_page(key));
@@ -5160,7 +5157,7 @@ impl CursorTrait for BTreeCursor {
         Ok(IOResult::Done(()))
     }
 
-    #[instrument(skip(self), level = Level::DEBUG)]
+    #[cfg_attr(debug_assertions, instrument(skip(self), level = Level::DEBUG))]
     /// Delete state machine flow:
     /// 1. Start -> check if the rowid to be delete is present in the page or not. If not we early return
     /// 2. DeterminePostBalancingSeekKey -> determine the key to seek to after balancing.
@@ -5545,7 +5542,7 @@ impl CursorTrait for BTreeCursor {
         self.null_flag
     }
 
-    #[instrument(skip_all, level = Level::DEBUG)]
+    #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     fn exists(&mut self, key: &Value) -> Result<IOResult<bool>> {
         let int_key = match key {
             Value::Integer(i) => i,
@@ -5695,7 +5692,7 @@ impl CursorTrait for BTreeCursor {
         self.root_page
     }
 
-    #[instrument(skip_all, level = Level::DEBUG)]
+    #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     fn rewind(&mut self) -> Result<IOResult<()>> {
         if self.valid_state == CursorValidState::Invalid {
             return Ok(IOResult::Done(()));
@@ -5798,7 +5795,7 @@ impl CursorTrait for BTreeCursor {
         }
     }
 
-    #[instrument(skip_all, level = Level::DEBUG)]
+    #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG))]
     fn seek_to_last(&mut self, always_seek: bool) -> Result<IOResult<()>> {
         loop {
             match self.seek_to_last_state {
@@ -6412,7 +6409,7 @@ struct PageStack {
 impl PageStack {
     /// Push a new page onto the stack.
     /// This effectively means traversing to a child page.
-    #[instrument(skip_all, level = Level::DEBUG, name = "pagestack::push")]
+    #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG, name = "pagestack::push"))]
     fn _push(&mut self, page: PageRef, starting_cell_idx: i32) {
         tracing::trace!(current = self.current_page, new_page_id = page.get().id,);
         'validate: {
@@ -6486,7 +6483,7 @@ impl PageStack {
 
     /// Pop a page off the stack.
     /// This effectively means traversing back up to a parent page.
-    #[instrument(skip_all, level = Level::DEBUG, name = "pagestack::pop")]
+    #[cfg_attr(debug_assertions, instrument(skip_all, level = Level::DEBUG, name = "pagestack::pop"))]
     fn pop(&mut self) {
         let current = self.current_page;
         assert!(current >= 0);
@@ -6523,7 +6520,7 @@ impl PageStack {
     /// Current page pointer being used
     #[inline(always)]
     fn current(&self) -> usize {
-        assert!(self.current_page >= 0);
+        debug_assert!(self.current_page >= 0);
         self.current_page as usize
     }
 
@@ -6548,7 +6545,7 @@ impl PageStack {
         self.node_states[current].cell_idx += 1;
     }
 
-    #[instrument(skip(self), level = Level::DEBUG, name = "pagestack::retreat")]
+    #[cfg_attr(debug_assertions, instrument(skip(self), level = Level::DEBUG, name = "pagestack::retreat"))]
     fn retreat(&mut self) {
         let current = self.current();
         #[cfg(debug_assertions)]
