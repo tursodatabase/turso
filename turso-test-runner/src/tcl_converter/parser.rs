@@ -86,6 +86,12 @@ pub enum TclTestKind {
     AnyError,
 }
 
+macro_rules! text_parser {
+    ($lt:lifetime, $ty:ty) => {
+        impl Parser<$lt, &$lt str, $ty, extra::Err<Simple<'a, char>>>
+    };
+}
+
 impl TclTest {
     /// Check if this test uses :memory: database
     pub fn uses_memory_db(&self) -> bool {
@@ -126,7 +132,7 @@ impl<'a> TclParser<'a> {
     }
 
     /// Parse the entire file
-    pub fn parse(mut self) -> ConversionResult {
+    pub fn parse(&mut self) -> ConversionResult {
         let mut tests = Vec::new();
         let mut warnings = Vec::new();
         let mut used_names: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -495,35 +501,8 @@ impl<'a> TclParser<'a> {
     }
 
     /// Collect all content for a test spanning multiple lines
-    fn collect_test_content(&mut self) -> String {
-        let mut content = String::new();
-        let mut brace_depth = 0;
-        let mut started = false;
-
-        while self.pos < self.lines.len() {
-            let line = self.lines[self.pos];
-            content.push_str(line);
-            content.push('\n');
-
-            // Count braces
-            for ch in line.chars() {
-                if ch == '{' {
-                    brace_depth += 1;
-                    started = true;
-                } else if ch == '}' {
-                    brace_depth -= 1;
-                }
-            }
-
-            self.pos += 1;
-
-            // Stop when braces are balanced (and we've seen at least one)
-            if started && brace_depth == 0 {
-                break;
-            }
-        }
-
-        content
+    fn collect_test_content() -> text_parser!('a, &'a str) {
+        any().delimited_by(just('{'), just('}'))
     }
 
     /// Skip a braced block (foreach, proc, etc.)
@@ -572,7 +551,7 @@ impl<'a> TclParser<'a> {
     }
 
     /// Parse test arguments from collected content using chumsky
-    fn parse_test_args(content: &str, min_args: usize) -> Result<Vec<String>, ConversionWarning> {
+    fn parse_test_args() -> text_parser!('a, Vec<String>) {
         // Parser for whitespace
         let ws = any::<&str, extra::Err<Simple<char>>>()
             .filter(|c: &char| c.is_whitespace())
@@ -623,22 +602,7 @@ impl<'a> TclParser<'a> {
             .ignore_then(ws)
             .ignore_then(arg.padded().repeated().collect::<Vec<_>>());
 
-        let args = parser.parse(content).into_result().unwrap_or_default();
-
-        if args.len() < min_args {
-            return Err(ConversionWarning {
-                line: 0,
-                kind: WarningKind::ParseError,
-                message: format!(
-                    "Expected at least {} arguments, got {}",
-                    min_args,
-                    args.len()
-                ),
-                source: content.chars().take(100).collect(),
-            });
-        }
-
-        Ok(args)
+        parser
     }
 
     /// Clean up a test name (remove quotes, convert invalid chars)
@@ -818,6 +782,66 @@ impl<'a> TclParser<'a> {
 
         elements
     }
+}
+
+/// Parse test arguments from collected content using chumsky
+fn parse_test_args<'a>() -> text_parser!('a, Vec<String>) {
+    // Parser for whitespace
+    let ws = any::<&str, extra::Err<Simple<char>>>()
+        .filter(|c: &char| c.is_whitespace())
+        .repeated();
+
+    // Parser for braced content with nested braces
+    let braced = recursive(|braced| {
+        let not_brace = any().filter(|c: &char| *c != '{' && *c != '}');
+        let inner = choice((
+            braced.map(|s: String| format!("{{{}}}", s)),
+            not_brace.map(|c| c.to_string()),
+        ))
+        .repeated()
+        .collect::<Vec<_>>()
+        .map(|v| v.join(""));
+
+        just('{').ignore_then(inner).then_ignore(just('}'))
+    });
+
+    // Parser for quoted strings
+    let quoted = just('"')
+        .ignore_then(
+            any()
+                .filter(|c: &char| *c != '"')
+                .repeated()
+                .collect::<String>(),
+        )
+        .then_ignore(just('"'));
+
+    // Parser for unbraced words (no whitespace, braces, or quotes)
+    let word = any()
+        .filter(|c: &char| !c.is_whitespace() && *c != '{' && *c != '}' && *c != '"')
+        .repeated()
+        .at_least(1)
+        .collect::<String>();
+
+    // Parser for a single argument
+    let arg = choice((braced, quoted, word));
+
+    // Parser for function name (skip it)
+    let func_name = any()
+        .filter(|c: &char| !c.is_whitespace() && *c != '{')
+        .repeated();
+
+    // Full parser: skip whitespace, function name, whitespace, then collect args
+    let parser = ws
+        .ignore_then(func_name)
+        .ignore_then(ws)
+        .ignore_then(arg.padded().repeated().collect::<Vec<_>>());
+
+    parser
+}
+
+/// Collect all content for a test spanning multiple lines
+fn collect_test_content<'a>() -> text_parser!('a, &'a str) {
+    any().delimited_by(just('{'), just('}')).to_slice()
 }
 
 impl std::fmt::Display for WarningKind {

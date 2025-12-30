@@ -14,7 +14,7 @@ use std::fmt::Write;
 
 /// Convert a Tcl test file content to the .sqltest format
 pub fn convert(content: &str, source_file: &str) -> ConversionResult {
-    let parser = TclParser::new(content, source_file);
+    let mut parser = TclParser::new(content, source_file);
     parser.parse()
 }
 
