@@ -844,6 +844,48 @@ fn collect_test_content<'a>() -> text_parser!('a, &'a str) {
     any().delimited_by(just('{'), just('}')).to_slice()
 }
 
+/// Parse a Tcl list string into its elements
+/// Handles: {element1} {element2}, plain words, multiline braced elements
+fn parse_tcl_list<'a>() -> text_parser!('a, Vec<String>) {
+    // Braced: {content with {nested} braces}
+    let braced = recursive_brace();
+
+    // Line of unbraced text (newline-terminated)
+    let unbraced = none_of("{}\n")
+        .repeated()
+        .at_least(1)
+        .collect::<String>()
+        .map(|s| s.trim().to_string());
+
+    // Horizontal whitespace only
+    let hspace = one_of(" \t").repeated();
+
+    // An element on a line
+    let line_element = hspace.ignore_then(choice((braced, unbraced)));
+
+    // Multiple elements can be on same line or different lines
+    line_element
+        .separated_by(one_of(" \t\n").repeated().at_least(1))
+        .allow_leading()
+        .allow_trailing()
+        .collect::<Vec<_>>()
+        .map(|v| v.into_iter().filter(|s| !s.is_empty()).collect())
+}
+
+/// Parser that parses content that can be recursively delimted by braces
+fn recursive_brace<'a>() -> text_parser!('a, String) {
+    recursive(|braced| {
+        choice((
+            braced.map(|s: String| format!("{{{}}}", s)),
+            none_of("{}").map(|c: char| c.to_string()),
+        ))
+        .repeated()
+        .collect::<Vec<_>>()
+        .map(|v| v.join(""))
+        .delimited_by(just('{'), just('}'))
+    })
+}
+
 impl std::fmt::Display for WarningKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
