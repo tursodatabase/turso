@@ -126,6 +126,8 @@ lto = true
 [profile.bench-profile]
 inherits = "release"
 debug = true
+lto = false               # LTO hides function boundaries
+codegen-units = 16        # Less cross-unit inlining
 
 [profile.dist]
 inherits = "release"

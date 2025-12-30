@@ -140,14 +140,14 @@ cargo tarpaulin -o html
 Run benchmarks:
 
 ```console
-cargo bench
+cargo bench --profile bench-profile --bench benchmark
 ```
 
 Run benchmarks and generate flamegraphs:
 
 ```console
 echo -1 | sudo tee /proc/sys/kernel/perf_event_paranoid
-cargo bench --bench benchmark -- --profile-time=5
+cargo bench --profile bench-profile --bench benchmark -- --profile-time=5
 ```
 
 ## Debugging bugs
