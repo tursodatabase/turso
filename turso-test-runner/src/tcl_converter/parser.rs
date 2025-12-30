@@ -69,8 +69,6 @@ pub struct TclTest {
     pub has_ddl: bool,
     /// Comments that appeared before this test
     pub comments: Vec<String>,
-    /// Line number in source
-    pub line: usize,
 }
 
 /// The type of test expectation
@@ -88,7 +86,7 @@ pub enum TclTestKind {
 
 macro_rules! text_parser {
     ($lt:lifetime, $ty:ty) => {
-        impl Parser<$lt, &$lt str, $ty, extra::Err<Simple<'a, char>>>
+        impl Parser<$lt, &$lt str, $ty, extra::Err<Rich<$lt, char>>>
     };
 }
 
@@ -332,7 +330,6 @@ impl<'a> TclParser<'a> {
             db: None,
             has_ddl,
             comments: Vec::new(),
-            line: line_num,
         })
     }
 
@@ -373,7 +370,6 @@ impl<'a> TclParser<'a> {
             db: Some(db),
             has_ddl,
             comments: Vec::new(),
-            line: line_num,
         })
     }
 
@@ -399,7 +395,6 @@ impl<'a> TclParser<'a> {
             db: None,
             has_ddl,
             comments: Vec::new(),
-            line: line_num,
         })
     }
 
@@ -424,7 +419,6 @@ impl<'a> TclParser<'a> {
             db: None,
             has_ddl,
             comments: Vec::new(),
-            line: line_num,
         })
     }
 
@@ -475,7 +469,6 @@ impl<'a> TclParser<'a> {
             db: None,
             has_ddl,
             comments: Vec::new(),
-            line: line_num,
         })
     }
 
@@ -498,11 +491,6 @@ impl<'a> TclParser<'a> {
             message: "Skip lines tests not supported - needs manual conversion".to_string(),
             source: self.lines.get(self.pos - 1).unwrap_or(&"").to_string(),
         })
-    }
-
-    /// Collect all content for a test spanning multiple lines
-    fn collect_test_content() -> text_parser!('a, &'a str) {
-        any().delimited_by(just('{'), just('}'))
     }
 
     /// Skip a braced block (foreach, proc, etc.)
@@ -548,171 +536,6 @@ impl<'a> TclParser<'a> {
         }
 
         preview
-    }
-
-    /// Parse test arguments from collected content using chumsky
-    fn parse_test_args() -> text_parser!('a, Vec<String>) {
-        // Parser for whitespace
-        let ws = any::<&str, extra::Err<Simple<char>>>()
-            .filter(|c: &char| c.is_whitespace())
-            .repeated();
-
-        // Parser for braced content with nested braces
-        let braced = recursive(|braced| {
-            let not_brace = any().filter(|c: &char| *c != '{' && *c != '}');
-            let inner = choice((
-                braced.map(|s: String| format!("{{{}}}", s)),
-                not_brace.map(|c| c.to_string()),
-            ))
-            .repeated()
-            .collect::<Vec<_>>()
-            .map(|v| v.join(""));
-
-            just('{').ignore_then(inner).then_ignore(just('}'))
-        });
-
-        // Parser for quoted strings
-        let quoted = just('"')
-            .ignore_then(
-                any()
-                    .filter(|c: &char| *c != '"')
-                    .repeated()
-                    .collect::<String>(),
-            )
-            .then_ignore(just('"'));
-
-        // Parser for unbraced words (no whitespace, braces, or quotes)
-        let word = any()
-            .filter(|c: &char| !c.is_whitespace() && *c != '{' && *c != '}' && *c != '"')
-            .repeated()
-            .at_least(1)
-            .collect::<String>();
-
-        // Parser for a single argument
-        let arg = choice((braced, quoted, word));
-
-        // Parser for function name (skip it)
-        let func_name = any()
-            .filter(|c: &char| !c.is_whitespace() && *c != '{')
-            .repeated();
-
-        // Full parser: skip whitespace, function name, whitespace, then collect args
-        let parser = ws
-            .ignore_then(func_name)
-            .ignore_then(ws)
-            .ignore_then(arg.padded().repeated().collect::<Vec<_>>());
-
-        parser
-    }
-
-    /// Clean up a test name (remove quotes, convert invalid chars)
-    fn clean_name(s: &str) -> String {
-        let name = s
-            .trim()
-            .trim_matches('"')
-            .trim_matches('\'')
-            .trim_matches('{')
-            .trim_matches('}');
-
-        // Replace characters not allowed in identifiers
-        let mut result = String::new();
-        for ch in name.chars() {
-            match ch {
-                'a'..='z' | 'A'..='Z' | '0'..='9' | '_' | '-' => result.push(ch),
-                '.' => result.push('_'), // Replace dots with underscore
-                ':' => result.push('_'), // Replace colons with underscore
-                ' ' => result.push('-'), // Replace spaces with hyphen
-                _ => {}                  // Skip other invalid chars
-            }
-        }
-
-        // Ensure name starts with a letter or underscore
-        if result.is_empty() {
-            return "unnamed-test".to_string();
-        }
-
-        if result
-            .chars()
-            .next()
-            .map(|c| c.is_ascii_digit())
-            .unwrap_or(false)
-        {
-            result = format!("test-{}", result);
-        }
-
-        result
-    }
-
-    /// Clean up SQL (normalize whitespace, preserve comments)
-    fn clean_sql(s: &str) -> String {
-        let mut result = String::new();
-        let mut prev_was_empty = false;
-
-        for line in s.lines() {
-            let trimmed = line.trim();
-
-            if trimmed.is_empty() {
-                // Collapse multiple empty lines into one
-                if !prev_was_empty && !result.is_empty() {
-                    result.push('\n');
-                    prev_was_empty = true;
-                }
-            } else {
-                if !result.is_empty() && !prev_was_empty {
-                    result.push('\n');
-                }
-                result.push_str(trimmed);
-                prev_was_empty = false;
-            }
-        }
-
-        result
-    }
-
-    /// Clean up expected output (convert Tcl list format to pipe-separated)
-    fn clean_expected(s: &str) -> String {
-        // First, strip outer quotes if the entire content is wrapped in them
-        // This handles {"content"} where we get "content" after brace extraction
-        let s = s.trim();
-        let was_quoted = s.starts_with('"') && s.ends_with('"') && s.len() >= 2;
-        let s = if was_quoted { &s[1..s.len() - 1] } else { s };
-
-        // Parse the whole content as a Tcl list (handles multiline braced elements)
-        let elements = Self::parse_tcl_list(s);
-
-        let mut result = String::new();
-
-        for element in elements {
-            // Each element may contain newlines - split into rows
-            for line in element.lines() {
-                let trimmed = if was_quoted {
-                    line.trim_start()
-                } else {
-                    line.trim()
-                };
-
-                if trimmed.is_empty() {
-                    continue;
-                }
-
-                if !result.is_empty() {
-                    result.push('\n');
-                }
-
-                // Handle Tcl escapes
-                let unescaped = trimmed
-                    .replace("\\\"", "\"")
-                    .replace("\\{", "{")
-                    .replace("\\}", "}")
-                    .replace("\\[", "[")
-                    .replace("\\]", "]")
-                    .replace("\\$", "$")
-                    .replace("\\\\", "\\");
-                result.push_str(&unescaped);
-            }
-        }
-
-        result
     }
 
     /// Parse a Tcl list string into its elements
@@ -784,26 +607,44 @@ impl<'a> TclParser<'a> {
     }
 }
 
+fn parse_basic_test<'a>() -> text_parser!('a, TclTest) {
+    let args_parser = test_args_parser();
+
+    args_parser.try_map(|args, span| {
+        if args.len() < 2 {
+            return Err(Rich::custom(
+                span,
+                format!("Expected at least 2 args, got {}", args.len()),
+            ));
+        }
+        let name = clean_name(&args[0]);
+        let sql = clean_sql(&args[1]);
+        let expected = if args.len() > 2 {
+            clean_expected(&args[2])
+        } else {
+            String::new()
+        };
+        let has_ddl = TclTest::check_has_ddl(&sql);
+        Ok(TclTest {
+            name,
+            sql,
+            kind: TclTestKind::Exact(expected),
+            db: None,
+            has_ddl,
+            comments: Vec::new(),
+        })
+    })
+}
+
 /// Parse test arguments from collected content using chumsky
-fn parse_test_args<'a>() -> text_parser!('a, Vec<String>) {
+fn test_args_parser<'a>() -> text_parser!('a, Vec<String>) {
     // Parser for whitespace
-    let ws = any::<&str, extra::Err<Simple<char>>>()
+    let ws = any::<&str, _>()
         .filter(|c: &char| c.is_whitespace())
         .repeated();
 
     // Parser for braced content with nested braces
-    let braced = recursive(|braced| {
-        let not_brace = any().filter(|c: &char| *c != '{' && *c != '}');
-        let inner = choice((
-            braced.map(|s: String| format!("{{{}}}", s)),
-            not_brace.map(|c| c.to_string()),
-        ))
-        .repeated()
-        .collect::<Vec<_>>()
-        .map(|v| v.join(""));
-
-        just('{').ignore_then(inner).then_ignore(just('}'))
-    });
+    let braced = recursive_brace();
 
     // Parser for quoted strings
     let quoted = just('"')
@@ -837,11 +678,6 @@ fn parse_test_args<'a>() -> text_parser!('a, Vec<String>) {
         .ignore_then(arg.padded().repeated().collect::<Vec<_>>());
 
     parser
-}
-
-/// Collect all content for a test spanning multiple lines
-fn collect_test_content<'a>() -> text_parser!('a, &'a str) {
-    any().delimited_by(just('{'), just('}')).to_slice()
 }
 
 /// Parse a Tcl list string into its elements
@@ -884,6 +720,116 @@ fn recursive_brace<'a>() -> text_parser!('a, String) {
         .map(|v| v.join(""))
         .delimited_by(just('{'), just('}'))
     })
+}
+
+/// Clean up a test name (remove quotes, convert invalid chars)
+fn clean_name(s: &str) -> String {
+    let name = s
+        .trim()
+        .trim_matches('"')
+        .trim_matches('\'')
+        .trim_matches('{')
+        .trim_matches('}');
+
+    // Replace characters not allowed in identifiers
+    let mut result = String::new();
+    for ch in name.chars() {
+        match ch {
+            'a'..='z' | 'A'..='Z' | '0'..='9' | '_' | '-' => result.push(ch),
+            '.' => result.push('_'), // Replace dots with underscore
+            ':' => result.push('_'), // Replace colons with underscore
+            ' ' => result.push('-'), // Replace spaces with hyphen
+            _ => {}                  // Skip other invalid chars
+        }
+    }
+
+    // Ensure name starts with a letter or underscore
+    if result.is_empty() {
+        return "unnamed-test".to_string();
+    }
+
+    if result
+        .chars()
+        .next()
+        .map(|c| c.is_ascii_digit())
+        .unwrap_or(false)
+    {
+        result = format!("test-{}", result);
+    }
+
+    result
+}
+
+/// Clean up SQL (normalize whitespace, preserve comments)
+fn clean_sql(s: &str) -> String {
+    let mut result = String::new();
+    let mut prev_was_empty = false;
+
+    for line in s.lines() {
+        let trimmed = line.trim();
+
+        if trimmed.is_empty() {
+            // Collapse multiple empty lines into one
+            if !prev_was_empty && !result.is_empty() {
+                result.push('\n');
+                prev_was_empty = true;
+            }
+        } else {
+            if !result.is_empty() && !prev_was_empty {
+                result.push('\n');
+            }
+            result.push_str(trimmed);
+            prev_was_empty = false;
+        }
+    }
+
+    result
+}
+
+/// Clean up expected output (convert Tcl list format to pipe-separated)
+fn clean_expected(s: &str) -> String {
+    // First, strip outer quotes if the entire content is wrapped in them
+    // This handles {"content"} where we get "content" after brace extraction
+    let s = s.trim();
+    let was_quoted = s.starts_with('"') && s.ends_with('"') && s.len() >= 2;
+    let s = if was_quoted { &s[1..s.len() - 1] } else { s };
+
+    // Parse the whole content as a Tcl list (handles multiline braced elements)
+    let elements = parse_tcl_list().parse(s).into_result().unwrap_or_default();
+
+    let mut result = String::new();
+
+    for element in elements {
+        // Each element may contain newlines - split into rows
+        for line in element.lines() {
+            let trimmed = if was_quoted {
+                line.trim_start()
+            } else {
+                line.trim()
+            };
+
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            if !result.is_empty() {
+                result.push('\n');
+            }
+
+            // Handle Tcl escapes
+            let unescaped = trimmed
+                .replace("\\\"", "\"")
+                .replace("\\{", "{")
+                .replace("\\}", "}")
+                .replace("\\[", "[")
+                .replace("\\]", "]")
+                .replace("\\$", "$")
+                .replace("\\\\", "\\");
+            result.push_str(&unescaped);
+        }
+    }
+
+    result
 }
 
 impl std::fmt::Display for WarningKind {
