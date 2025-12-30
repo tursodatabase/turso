@@ -15,7 +15,7 @@ impl WindowsIO {
 }
 
 impl IO for WindowsIO {
-    #[instrument(err, skip_all, level = Level::TRACE)]
+    #[instrument(skip_all, level = Level::TRACE)]
     fn open_file(&self, path: &str, flags: OpenFlags, direct: bool) -> Result<Arc<dyn File>> {
         trace!("open_file(path = {})", path);
         let mut file = std::fs::File::options();
