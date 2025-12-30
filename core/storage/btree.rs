@@ -7526,6 +7526,7 @@ fn insert_into_cell_during_balance(
 /// Free blocks can be zero, meaning the "real free space" that can be used to allocate is expected
 /// to be between first cell byte and end of cell pointer area.
 #[allow(unused_assignments)]
+#[inline]
 fn compute_free_space(page: &PageContent, usable_space: usize) -> usize {
     // TODO(pere): maybe free space is not calculated correctly with offset
 
@@ -7581,6 +7582,7 @@ fn compute_free_space(page: &PageContent, usable_space: usize) -> usize {
 }
 
 /// Allocate space for a cell on a page.
+#[inline]
 fn allocate_cell_space(
     page_ref: &PageContent,
     mut amount: usize,
@@ -7827,6 +7829,7 @@ fn fill_cell_payload(
 /// - Give a minimum fanout of 4 for index b-trees
 /// - Ensure enough payload is on the b-tree page that the record header can usually be accessed
 ///   without consulting an overflow page
+#[inline]
 pub fn payload_overflow_threshold_max(page_type: PageType, usable_space: usize) -> usize {
     match page_type {
         PageType::IndexInterior | PageType::IndexLeaf => {
@@ -7847,6 +7850,7 @@ pub fn payload_overflow_threshold_max(page_type: PageType, usable_space: usize) 
 /// - Otherwise: store M bytes on page
 ///
 /// The remaining bytes are stored on overflow pages in both cases.
+#[inline]
 pub fn payload_overflow_threshold_min(_page_type: PageType, usable_space: usize) -> usize {
     // Same formula for all page types
     ((usable_space - 12) * 32 / 255) - 23
@@ -7854,6 +7858,7 @@ pub fn payload_overflow_threshold_min(_page_type: PageType, usable_space: usize)
 
 /// Drop a cell from a page.
 /// This is done by freeing the range of bytes that the cell occupies.
+#[inline]
 fn drop_cell(page: &mut PageContent, cell_idx: usize, usable_space: usize) -> Result<()> {
     let (cell_start, cell_len) = page.cell_get_raw_region(cell_idx, usable_space);
     free_cell_range(page, cell_start, cell_len, usable_space)?;
@@ -7872,6 +7877,7 @@ fn drop_cell(page: &mut PageContent, cell_idx: usize, usable_space: usize) -> Re
 /// Shift pointers to the left once starting from a cell position
 /// This is useful when we remove a cell and we want to move left the cells from the right to fill
 /// the empty space that's not needed
+#[inline]
 fn shift_pointers_left(page: &mut PageContent, cell_idx: usize) {
     assert!(page.cell_count() > 0);
     let buf = page.as_ptr();

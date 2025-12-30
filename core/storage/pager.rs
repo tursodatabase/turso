@@ -22,7 +22,6 @@ use arc_swap::ArcSwapOption;
 use parking_lot::{Mutex, RwLock};
 use roaring::RoaringBitmap;
 use std::cell::UnsafeCell;
-use std::collections::BTreeSet;
 use std::sync::atomic::{
     AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
 };
@@ -232,22 +231,27 @@ impl Page {
         self.get().contents.as_mut().unwrap()
     }
 
+    #[inline]
     pub fn is_locked(&self) -> bool {
         self.get().flags.load(Ordering::Acquire) & PAGE_LOCKED != 0
     }
 
+    #[inline]
     pub fn set_locked(&self) {
         self.get().flags.fetch_or(PAGE_LOCKED, Ordering::Acquire);
     }
 
+    #[inline]
     pub fn clear_locked(&self) {
         self.get().flags.fetch_and(!PAGE_LOCKED, Ordering::Release);
     }
 
+    #[inline]
     pub fn is_dirty(&self) -> bool {
         self.get().flags.load(Ordering::Acquire) & PAGE_DIRTY != 0
     }
 
+    #[inline]
     pub fn set_dirty(&self) {
         tracing::debug!("set_dirty(page={})", self.get().id);
         self.clear_wal_tag();
@@ -256,6 +260,7 @@ impl Page {
         self.get().flags.fetch_or(PAGE_DIRTY, Ordering::Release);
     }
 
+    #[inline]
     pub fn clear_dirty(&self) {
         tracing::debug!("clear_dirty(page={})", self.get().id);
         self.get().flags.fetch_and(!PAGE_DIRTY, Ordering::Release);
@@ -264,40 +269,48 @@ impl Page {
 
     /// Clear the dirty flag without touching wal_tag.
     /// Used when a WAL frame has been durably written and the tag already encodes it.
+    #[inline]
     pub fn clear_dirty_keep_wal_tag(&self) {
         tracing::debug!("clear_dirty_keep_wal_tag(page={})", self.get().id);
         self.get().flags.fetch_and(!PAGE_DIRTY, Ordering::Release);
     }
 
     /// Returns true if the page has been spilled to WAL and is safe to evict even while dirty.
+    #[inline]
     pub fn is_spilled(&self) -> bool {
         self.get().flags.load(Ordering::Acquire) & PAGE_SPILLED != 0
     }
 
     /// Mark the page as spilled to WAL. Spilled pages remain dirty but may be evicted from cache.
+    #[inline]
     pub fn set_spilled(&self) {
         tracing::debug!("set_spilled(page={})", self.get().id);
         self.get().flags.fetch_or(PAGE_SPILLED, Ordering::Release);
     }
 
     /// Clear the spilled flag. This is also done implicitly on set_dirty().
+    #[inline]
     pub fn clear_spilled(&self) {
         self.get().flags.fetch_and(!PAGE_SPILLED, Ordering::Release);
     }
 
+    #[inline]
     pub fn is_loaded(&self) -> bool {
         self.get().flags.load(Ordering::Acquire) & PAGE_LOADED != 0
     }
 
+    #[inline]
     pub fn set_loaded(&self) {
         self.get().flags.fetch_or(PAGE_LOADED, Ordering::Release);
     }
 
+    #[inline]
     pub fn clear_loaded(&self) {
         tracing::debug!("clear loaded {}", self.get().id);
         self.get().flags.fetch_and(!PAGE_LOADED, Ordering::Release);
     }
 
+    #[inline]
     pub fn is_index(&self) -> bool {
         match self.get_contents().page_type() {
             PageType::IndexLeaf | PageType::IndexInterior => true,
@@ -306,12 +319,14 @@ impl Page {
     }
 
     /// Increment the pin count by 1. A pin count >0 means the page is pinned and not eligible for eviction from the page cache.
+    #[inline]
     pub fn pin(&self) {
         self.get().pin_count.fetch_add(1, Ordering::SeqCst);
     }
 
     /// Decrement the pin count by 1. If the count reaches 0, the page is no longer
     /// pinned and is eligible for eviction from the page cache.
+    #[inline]
     pub fn unpin(&self) {
         let was_pinned = self.try_unpin();
 
@@ -324,6 +339,7 @@ impl Page {
 
     /// Try to decrement the pin count by 1, but do nothing if it was already 0.
     /// Returns true if the pin count was decremented.
+    #[inline]
     pub fn try_unpin(&self) -> bool {
         self.get()
             .pin_count
@@ -338,6 +354,7 @@ impl Page {
     }
 
     /// Returns true if the page is pinned and thus not eligible for eviction from the page cache.
+    #[inline]
     pub fn is_pinned(&self) -> bool {
         self.get().pin_count.load(Ordering::Acquire) > 0
     }
@@ -641,11 +658,8 @@ pub struct Pager {
     pub buffer_pool: Arc<BufferPool>,
     /// I/O interface for input/output operations.
     pub io: Arc<dyn crate::io::IO>,
-    /// Dirty pages sorted by page number.
-    ///
-    /// We need dirty pages in page number order when we flush them out to ensure
-    /// that the WAL we generate is compatible with SQLite.
-    dirty_pages: Arc<RwLock<BTreeSet<usize>>>,
+    /// Dirty pages as a bitmap, naturally sorted by page number.
+    dirty_pages: Arc<RwLock<RoaringBitmap>>,
     subjournal: RwLock<Option<Subjournal>>,
     savepoints: Arc<RwLock<Vec<Savepoint>>>,
     commit_info: RwLock<CommitInfo>,
@@ -826,7 +840,7 @@ impl Pager {
             wal,
             page_cache,
             io,
-            dirty_pages: Arc::new(RwLock::new(BTreeSet::new())),
+            dirty_pages: Arc::new(RwLock::new(RoaringBitmap::new())),
             subjournal: RwLock::new(None),
             savepoints: Arc::new(RwLock::new(Vec::new())),
             commit_info: RwLock::new(CommitInfo {
@@ -1083,7 +1097,7 @@ impl Pager {
             }
             let page_wont_exist_after_rollback = page_id > db_size;
             if page_wont_exist_after_rollback {
-                dirty_pages.remove(&(page_id as usize));
+                dirty_pages.remove(page_id);
                 if let Some(page) = self
                     .page_cache
                     .write()
@@ -1932,9 +1946,8 @@ impl Pager {
             page.get().id
         );
         self.subjournal_page_if_required(page)?;
-        // TODO: check duplicates?
         let mut dirty_pages = self.dirty_pages.write();
-        dirty_pages.insert(page.get().id);
+        dirty_pages.insert(page.get().id as u32);
         page.set_dirty();
         Ok(())
     }
@@ -2010,7 +2023,7 @@ impl Pager {
 
     /// Init phase: gather dirty page IDs and begin WAL preparation.
     fn cacheflush_init(&self, wal: &Arc<dyn Wal>, page_sz: PageSize) -> Result<CacheFlushStep> {
-        let dirty_ids: Vec<usize> = self.dirty_pages.read().iter().copied().collect();
+        let dirty_ids: Vec<usize> = self.dirty_pages.read().iter().map(|x| x as usize).collect();
 
         if dirty_ids.is_empty() {
             return Ok(CacheFlushStep::Done(Vec::new()));
@@ -2531,10 +2544,11 @@ impl Pager {
                     if dirty_pages.is_empty() {
                         return Ok(IOResult::Done(PagerCommitResult::WalWritten));
                     }
-                    commit_info.initialize(dirty_pages.len());
+                    commit_info.initialize(dirty_pages.len() as usize);
                     let mut cache = self.page_cache.write();
 
-                    for &page_id in dirty_pages.iter() {
+                    for page_id in dirty_pages.iter() {
+                        let page_id = page_id as usize;
                         let page_key = PageCacheKey::new(page_id);
                         if cache.peek(&page_key, false).is_some() {
                             commit_info.page_sources.push(PageSource::Cached(page_id));
@@ -2836,7 +2850,7 @@ impl Pager {
             );
             let mut cache = self.page_cache.write();
             for page_id in dirty_pages.iter() {
-                let page_key = PageCacheKey::new(*page_id);
+                let page_key = PageCacheKey::new(page_id as usize);
                 // Page may have been evicted from cache after spilling to WAL
                 if let Some(page) = cache.get(&page_key)? {
                     page.clear_dirty();
@@ -3034,7 +3048,7 @@ impl Pager {
         let dirty_pages = self.dirty_pages.write();
         let mut cache = self.page_cache.write();
         for page_id in dirty_pages.iter() {
-            let page_key = PageCacheKey::new(*page_id);
+            let page_key = PageCacheKey::new(page_id as usize);
             if let Some(page) = cache.get(&page_key).unwrap_or(None) {
                 page.clear_dirty();
             }
