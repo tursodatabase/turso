@@ -101,9 +101,6 @@ func NewTursoSyncDb(ctx context.Context, config TursoSyncDbConfig) (*TursoSyncDb
 	if strings.TrimSpace(config.Path) == "" {
 		return nil, errors.New("turso: empty Path in TursoSyncDbConfig")
 	}
-	if strings.TrimSpace(config.RemoteUrl) == "" {
-		return nil, errors.New("turso: empty RemoteUrl in TursoSyncDbConfig")
-	}
 	clientName := config.ClientName
 	if clientName == "" {
 		clientName = "turso-sync-go"
@@ -113,6 +110,7 @@ func NewTursoSyncDb(ctx context.Context, config TursoSyncDbConfig) (*TursoSyncDb
 		bootstrap = *config.BootstrapIfEmpty
 	}
 
+	remoteUrl := normalizeUrl(config.RemoteUrl)
 	// Create sync database holder
 	dbCfg := TursoDatabaseConfig{
 		Path:                 config.Path,
@@ -121,6 +119,7 @@ func NewTursoSyncDb(ctx context.Context, config TursoSyncDbConfig) (*TursoSyncDb
 	}
 	syncCfg := TursoSyncDatabaseConfig{
 		Path:                           config.Path,
+		RemoteUrl:                      remoteUrl,
 		ClientName:                     clientName,
 		LongPollTimeoutMs:              config.LongPollTimeoutMs,
 		BootstrapIfEmpty:               bootstrap,
@@ -137,7 +136,7 @@ func NewTursoSyncDb(ctx context.Context, config TursoSyncDbConfig) (*TursoSyncDb
 
 	d := &TursoSyncDb{
 		db:        sdb,
-		baseURL:   strings.TrimRight(config.RemoteUrl, "/"),
+		baseURL:   strings.TrimRight(remoteUrl, "/"),
 		authToken: strings.TrimSpace(config.AuthToken),
 		client: &http.Client{
 			// No global timeout to allow long-poll; rely on request context.
@@ -387,7 +386,7 @@ func (d *TursoSyncDb) handleIoItem(ctx context.Context, item TursoSyncIoItem) er
 			return err
 		}
 		// Build URL
-		url := joinURL(d.baseURL, req.Path)
+		url := joinUrl(d.baseURL, req.Path)
 
 		// Build headers
 		hdr := make(http.Header, req.Headers+2)
@@ -528,16 +527,16 @@ func (d *TursoSyncDb) handleIoItem(ctx context.Context, item TursoSyncIoItem) er
 	}
 }
 
-func joinURL(base, p string) string {
-	if p == "" {
-		return base
-	}
-	if strings.HasPrefix(p, "http://") || strings.HasPrefix(p, "https://") {
-		return p
-	}
-	b := strings.TrimRight(base, "/")
+func joinUrl(base, p string) string {
 	if !strings.HasPrefix(p, "/") {
 		p = "/" + p
 	}
-	return b + p
+	return strings.TrimRight(base, "/") + p
+}
+
+func normalizeUrl(base string) string {
+	if cut, ok := strings.CutPrefix(base, "libsql://"); ok {
+		return "https://" + cut
+	}
+	return base
 }

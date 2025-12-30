@@ -25,6 +25,7 @@ pub trait SyncEngineIo: Send + Sync + 'static {
     ) -> Result<Self::DataCompletionTransform>;
     fn http(
         &self,
+        url: Option<&str>,
         method: &str,
         path: &str,
         body: Option<Vec<u8>>,

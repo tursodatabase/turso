@@ -1361,10 +1361,6 @@ impl Program {
                 // used because it will not help - the snapshot is permanently stale and rollback is
                 // the only way out for this poor transaction.
                 Some(LimboError::BusySnapshot) => {}
-                // Constraint errors do not cause a rollback of the transaction by default;
-                // Instead individual statement subtransactions will roll back and these are handled in op_auto_commit
-                // and op_halt.
-                Some(LimboError::Constraint(_)) => {}
                 // Schema updated errors do not cause a rollback; the statement will be reprepared and retried,
                 // and the caller is expected to handle transaction cleanup explicitly if needed.
                 Some(LimboError::SchemaUpdated) => {}
@@ -1381,23 +1377,35 @@ impl Program {
                     }
                     self.connection.set_tx_state(TransactionState::None);
                 }
+                // Constraint errors do not cause a rollback of the transaction for interacative transactions;
+                // Instead individual statement subtransactions will roll back
+                // In the auto-commit mode - we rollback current active transaction
+                Some(LimboError::Constraint(_)) => {
+                    if self.connection.get_auto_commit() {
+                        self.rollback_current_txn(pager);
+                    }
+                }
                 _ => {
                     if state.auto_txn_cleanup != TxnCleanup::None || err.is_some() {
-                        if let Some(mv_store) = self.connection.mv_store().as_ref() {
-                            if let Some(tx_id) = self.connection.get_mv_tx_id() {
-                                self.connection.auto_commit.store(true, Ordering::SeqCst);
-                                mv_store.rollback_tx(tx_id, pager.clone(), &self.connection);
-                            }
-                        } else {
-                            pager.rollback_tx(&self.connection);
-                            self.connection.auto_commit.store(true, Ordering::SeqCst);
-                        }
-                        self.connection.set_tx_state(TransactionState::None);
+                        self.rollback_current_txn(pager);
                     }
                 }
             }
         }
         state.auto_txn_cleanup = TxnCleanup::None;
+    }
+
+    fn rollback_current_txn(&self, pager: &Arc<Pager>) {
+        if let Some(mv_store) = self.connection.mv_store().as_ref() {
+            if let Some(tx_id) = self.connection.get_mv_tx_id() {
+                self.connection.auto_commit.store(true, Ordering::SeqCst);
+                mv_store.rollback_tx(tx_id, pager.clone(), &self.connection);
+            }
+        } else {
+            pager.rollback_tx(&self.connection);
+            self.connection.auto_commit.store(true, Ordering::SeqCst);
+        }
+        self.connection.set_tx_state(TransactionState::None);
     }
 
     pub fn is_trigger_subprogram(&self) -> bool {

@@ -8,6 +8,13 @@ TPCH_DIR="$REPO_ROOT/perf/tpc-h"
 DB_FILE="$TPCH_DIR/TPC-H.db"
 QUERIES_DIR="$TPCH_DIR/queries"
 LIMBO_BIN="$RELEASE_BUILD_DIR/tursodb"
+CURRENT_TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
+RESULTS_FILE="$TPCH_DIR/results_${CURRENT_TIMESTAMP}.txt"
+
+declare -A LIMBO_TIMES_WITHOUT_ANALYZE
+declare -A SQLITE_TIMES_WITHOUT_ANALYZE
+declare -A LIMBO_TIMES_WITH_ANALYZE
+declare -A SQLITE_TIMES_WITH_ANALYZE
 
 # Install sqlite3 locally if needed
 "$REPO_ROOT/scripts/install-sqlite3.sh"
@@ -32,7 +39,9 @@ clear_caches() {
 run_queries() {
     local mode=$1
     echo "Running queries in $mode mode..."
-    
+    echo "MODE: $mode" >> "$RESULTS_FILE"
+    echo "query,limbo_seconds,sqlite_seconds" >> "$RESULTS_FILE"
+
     local mode_exit_code=0
     
     for query_file in $(ls "$QUERIES_DIR"/*.sql | sort -V); do
@@ -62,6 +71,7 @@ run_queries() {
             sqlite_real_time=$(echo "$sqlite_output" | grep "^real" | awk '{print $2}')
             echo "Limbo real time: $limbo_real_time"
             echo "SQLite3 real time: $sqlite_real_time"
+            echo "$query_name,$limbo_real_time,$sqlite_real_time" >> "$RESULTS_FILE"
             echo "Limbo output:"
             echo "$limbo_non_time_lines"
             echo "SQLite3 output:"
@@ -79,12 +89,20 @@ run_queries() {
             else
                 echo "No output difference"
             fi
+
+            if [ "$mode" = "WITHOUT ANALYZE" ]; then
+                LIMBO_TIMES_WITHOUT_ANALYZE["$query_name"]="$limbo_real_time"
+                SQLITE_TIMES_WITHOUT_ANALYZE["$query_name"]="$sqlite_real_time"
+            else
+                LIMBO_TIMES_WITH_ANALYZE["$query_name"]="$limbo_real_time"
+                SQLITE_TIMES_WITH_ANALYZE["$query_name"]="$sqlite_real_time"
+            fi
         else
             echo "Warning: Skipping non-file item $query_file"
         fi
         echo "-----------------------------------------------------------"
     done
-    
+    echo "" >> "$RESULTS_FILE"
     return $mode_exit_code
 }
 
@@ -110,6 +128,9 @@ if [ ! -f "$DB_FILE" ]; then
 fi
 
 echo "Starting TPC-H query timing comparison..."
+echo "Writing timing results to $RESULTS_FILE"
+echo "TPC-H timing results ($CURRENT_TIMESTAMP)" > "$RESULTS_FILE"
+echo "" >> "$RESULTS_FILE"
 
 # Initial cache clear
 echo "The script might ask you to enter the password for sudo, in order to clear system caches."
@@ -144,6 +165,24 @@ run_queries "WITH ANALYZE"
 if [ $? -ne 0 ]; then
     exit_code=1
 fi
+
+echo "DIFF: WITH ANALYZE - WITHOUT ANALYZE" >> "$RESULTS_FILE"
+echo "query,limbo_delta_seconds,sqlite_delta_seconds" >> "$RESULTS_FILE"
+for query_file in $(ls "$QUERIES_DIR"/*.sql | sort -V); do
+    if [ -f "$query_file" ]; then
+        query_name=$(basename "$query_file")
+        if head -n1 "$query_file" | grep -q "^-- LIMBO_SKIP: "; then
+            continue
+        fi
+        limbo_with=${LIMBO_TIMES_WITH_ANALYZE["$query_name"]}
+        limbo_without=${LIMBO_TIMES_WITHOUT_ANALYZE["$query_name"]}
+        sqlite_with=${SQLITE_TIMES_WITH_ANALYZE["$query_name"]}
+        sqlite_without=${SQLITE_TIMES_WITHOUT_ANALYZE["$query_name"]}
+        limbo_delta=$(awk -v w="$limbo_with" -v wo="$limbo_without" 'BEGIN{if(w==""||wo==""){print "NA"} else {printf "%.6f", w-wo}}')
+        sqlite_delta=$(awk -v w="$sqlite_with" -v wo="$sqlite_without" 'BEGIN{if(w==""||wo==""){print "NA"} else {printf "%.6f", w-wo}}')
+        echo "$query_name,$limbo_delta,$sqlite_delta" >> "$RESULTS_FILE"
+    fi
+done
 
 echo "-----------------------------------------------------------"
 echo "TPC-H query timing comparison completed." 

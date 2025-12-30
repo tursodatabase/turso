@@ -58,6 +58,9 @@ impl PyTursoPartialSyncOpts {
 pub struct PyTursoSyncDatabaseConfig {
     // path to the main database file (auxilary files like metadata, WAL, revert, changes will derive names from this path)
     pub path: String,
+    // optional remote url (libsql://..., https://... or http://...)
+    // this URL will be saved in the database metadata file in order to be able to reuse it if later client will be constructed without explicit remote url
+    pub remote_url: Option<String>,
     // arbitrary client name which will be used as a prefix for unique client id
     pub client_name: String,
     // long poll timeout for pull method (if set, server will hold connection for the given timeout until new changes will appear)
@@ -75,6 +78,7 @@ impl PyTursoSyncDatabaseConfig {
     #[pyo3(signature = (
         path,
         client_name,
+        remote_url=None,
         long_poll_timeout_ms=None,
         bootstrap_if_empty=true,
         reserved_bytes=None,
@@ -83,6 +87,7 @@ impl PyTursoSyncDatabaseConfig {
     fn new(
         path: String,
         client_name: String,
+        remote_url: Option<String>,
         long_poll_timeout_ms: Option<u32>,
         bootstrap_if_empty: bool,
         reserved_bytes: Option<usize>,
@@ -90,6 +95,7 @@ impl PyTursoSyncDatabaseConfig {
     ) -> Self {
         Self {
             path,
+            remote_url,
             client_name,
             long_poll_timeout_ms,
             bootstrap_if_empty,
@@ -116,6 +122,7 @@ pub fn py_turso_sync_new(
     };
     let sync_config = rsapi::TursoDatabaseSyncConfig {
         path: sync_config.path.clone(),
+        remote_url: sync_config.remote_url.clone(),
         client_name: sync_config.client_name.clone(),
         bootstrap_if_empty: sync_config.bootstrap_if_empty,
         long_poll_timeout_ms: sync_config.long_poll_timeout_ms,
@@ -124,7 +131,7 @@ pub fn py_turso_sync_new(
             Some(config) => {
                 if let Some(length) = config.bootstrap_strategy_prefix {
                     Some(PartialSyncOpts {
-                        bootstrap_strategy: PartialBootstrapStrategy::Prefix { length },
+                        bootstrap_strategy: Some(PartialBootstrapStrategy::Prefix { length }),
                         segment_size: config.segment_size.unwrap_or(0),
                         prefetch: config.prefetch.unwrap_or(false),
                     })
@@ -133,9 +140,9 @@ pub fn py_turso_sync_new(
                         .bootstrap_strategy_query
                         .as_ref()
                         .map(|query| PartialSyncOpts {
-                            bootstrap_strategy: PartialBootstrapStrategy::Query {
+                            bootstrap_strategy: Some(PartialBootstrapStrategy::Query {
                                 query: query.clone(),
-                            },
+                            }),
                             segment_size: config.segment_size.unwrap_or(0),
                             prefetch: config.prefetch.unwrap_or(false),
                         })
@@ -341,6 +348,9 @@ pub enum PyTursoSyncIoItemRequestKind {
 
 #[pyclass]
 pub struct PyTursoSyncIoItemHttpRequest {
+    /// optional HTTP url
+    #[pyo3(get)]
+    pub url: Option<String>,
     /// HTTP method (e.g. POST / GET)
     #[pyo3(get)]
     pub method: String,
@@ -395,6 +405,7 @@ impl PyTursoSyncIoItem {
     pub fn request(&self, py: pyo3::Python) -> PyResult<PyTursoSyncIoItemRequest> {
         match self.item.get_request() {
             turso_sync_sdk_kit::sync_engine_io::SyncEngineIoRequest::Http {
+                url,
                 method,
                 path,
                 body,
@@ -406,6 +417,7 @@ impl PyTursoSyncIoItem {
                 http: Some(pyo3::Py::new(
                     py,
                     PyTursoSyncIoItemHttpRequest {
+                        url: url.clone(),
                         method: method.clone(),
                         path: path.clone(),
                         body: body
@@ -470,13 +482,6 @@ impl PyTursoSyncIoItem {
 
 #[pymethods]
 impl PyTursoSyncDatabase {
-    /// Prepare synced database for use (bootstrap if needed, setup necessary database parameters for first access)
-    /// AsyncOperation returns No
-    pub fn init(&self) -> PyTursoAsyncOperation {
-        PyTursoAsyncOperation {
-            operation: self.database.init(),
-        }
-    }
     /// Open prepared synced database, fail if no properly setup database exists
     /// AsyncOperation returns No
     pub fn open(&self) -> PyTursoAsyncOperation {
