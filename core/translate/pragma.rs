@@ -648,7 +648,7 @@ fn query_pragma(
                 pager
                     .io
                     .block(|| pager.with_header(|header| header.page_size.get()))
-                    .unwrap_or(connection.get_page_size().get()) as i64,
+                    .unwrap_or_else(|_| connection.get_page_size().get()) as i64,
                 register,
             );
             program.emit_result_row(register, 1);

@@ -861,7 +861,7 @@ fn optimize_table_access(
                     let join_order_pos = best_join_order
                         .iter()
                         .position(|m| m.original_idx == table_idx)
-                        .unwrap_or(best_join_order.len().saturating_sub(1));
+                        .unwrap_or_else(|| best_join_order.len().saturating_sub(1));
 
                     // Build a mapping from table_col_pos to index_col_pos.
                     // Multiple constraints on the same column should share the same index_col_pos.

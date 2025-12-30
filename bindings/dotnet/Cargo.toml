@@ -7,6 +7,9 @@ license.workspace = true
 repository.workspace = true
 publish = false
 
+[lints]
+workspace = true
+
 [lib]
 name = "turso_dotnet"
 crate-type = ["cdylib"]

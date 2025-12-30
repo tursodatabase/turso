@@ -19,6 +19,7 @@ use crate::vdbe::Register;
 use crate::vtab::VirtualTableCursor;
 use crate::{Completion, CompletionError, Result, IO};
 use std::borrow::{Borrow, Cow};
+use std::cell::UnsafeCell;
 use std::fmt::{Debug, Display};
 use std::iter::Peekable;
 use std::ops::Deref;
@@ -884,15 +885,20 @@ pub struct ImmutableRecord {
     //
     // payload is the Vec<u8> but in order to use Register which holds ImmutableRecord as a Value - we store Vec<u8> as Value::Blob
     payload: Value,
-    /// Embedded cursor for lazy parsing of the record. Uses interior mutability for Send+Sync.
-    cursor: parking_lot::Mutex<RecordCursor>,
+    /// Embedded cursor for lazy parsing of the record.
+    cursor: UnsafeCell<RecordCursor>,
 }
+
+// SAFETY: all ImmutableRecord instances are intended to be used in a single thread
+// by a single connection.
+unsafe impl Send for ImmutableRecord {}
+unsafe impl Sync for ImmutableRecord {}
 
 impl Clone for ImmutableRecord {
     fn clone(&self) -> Self {
         Self {
             payload: self.payload.clone(),
-            cursor: parking_lot::Mutex::new(RecordCursor::new()), // Reset cursor state on clone
+            cursor: UnsafeCell::new(RecordCursor::new()), // Reset cursor state on clone
         }
     }
 }
@@ -1013,14 +1019,14 @@ impl ImmutableRecord {
     pub fn new(payload_capacity: usize) -> Self {
         Self {
             payload: Value::Blob(Vec::with_capacity(payload_capacity)),
-            cursor: parking_lot::Mutex::new(RecordCursor::new()),
+            cursor: UnsafeCell::new(RecordCursor::new()),
         }
     }
 
     pub fn from_bin_record(payload: Vec<u8>) -> Self {
         Self {
             payload: Value::Blob(payload),
-            cursor: parking_lot::Mutex::new(RecordCursor::new()),
+            cursor: UnsafeCell::new(RecordCursor::new()),
         }
     }
 
@@ -1029,7 +1035,7 @@ impl ImmutableRecord {
     // fixme(pedrocarlo): this function is very inneficient and kind of misleading because
     // it always deserializes the columns
     pub fn get_values(&self) -> Vec<ValueRef<'_>> {
-        let mut cursor = self.cursor.lock();
+        let cursor = self.cursor();
         cursor
             .get_values(self)
             .collect::<Result<Vec<_>>>()
@@ -1118,7 +1124,7 @@ impl ImmutableRecord {
         writer.assert_finish_capacity();
         Self {
             payload: Value::Blob(buf),
-            cursor: parking_lot::Mutex::new(RecordCursor::new()),
+            cursor: UnsafeCell::new(RecordCursor::new()),
         }
     }
 
@@ -1159,7 +1165,7 @@ impl ImmutableRecord {
     #[inline]
     pub fn invalidate(&mut self) {
         self.as_blob_mut().clear();
-        self.cursor.lock().invalidate();
+        self.cursor().invalidate();
     }
 
     #[inline]
@@ -1179,14 +1185,14 @@ impl ImmutableRecord {
                 "Record is invalidated".into(),
             )));
         }
-        let mut cursor = self.cursor.lock();
+        let cursor = self.cursor();
         cursor.parse_full_header(self).unwrap();
         let last_idx = cursor.serial_types.len().checked_sub(1)?;
         Some(cursor.deserialize_column(self, last_idx))
     }
 
     pub fn get_value(&self, idx: usize) -> Result<ValueRef<'_>> {
-        let mut cursor = self.cursor.lock();
+        let cursor = self.cursor();
         cursor.get_value(self, idx)
     }
 
@@ -1195,7 +1201,7 @@ impl ImmutableRecord {
             return None;
         }
 
-        let mut cursor = self.cursor.lock();
+        let cursor = self.cursor();
 
         match cursor.ensure_parsed_upto(self, idx) {
             Ok(()) => {
@@ -1210,14 +1216,21 @@ impl ImmutableRecord {
     }
 
     pub fn column_count(&self) -> usize {
-        let mut cursor = self.cursor.lock();
+        let cursor = self.cursor();
         cursor.parse_full_header(self).unwrap();
         cursor.serial_types.len()
     }
 
-    /// Get direct access to the embedded cursor. Use with caution.
-    pub fn cursor(&self) -> parking_lot::MutexGuard<'_, RecordCursor> {
-        self.cursor.lock()
+    /// Get direct access to the embedded cursor for lazy parsing.
+    ///
+    /// # Safety
+    /// This is safe as long as no concurrent access to this record occurs,
+    /// and it should not occur.
+    #[inline]
+    #[allow(clippy::mut_from_ref)]
+    pub fn cursor(&self) -> &mut RecordCursor {
+        // SAFETY: See the unsafe impl Send/Sync for ImmutableRecord
+        unsafe { &mut *self.cursor.get() }
     }
 }
 

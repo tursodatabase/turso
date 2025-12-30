@@ -135,9 +135,13 @@ impl VirtualTable {
 
     fn resolve_columns(schema: String) -> crate::Result<Vec<Column>> {
         let mut parser = Parser::new(schema.as_bytes());
-        if let ast::Cmd::Stmt(ast::Stmt::CreateTable { body, .. }) = parser.next_cmd()?.ok_or(
-            LimboError::ParseError("Failed to parse schema from virtual table module".to_string()),
-        )? {
+        if let ast::Cmd::Stmt(ast::Stmt::CreateTable { body, .. }) =
+            parser.next_cmd()?.ok_or_else(|| {
+                LimboError::ParseError(
+                    "Failed to parse schema from virtual table module".to_string(),
+                )
+            })?
+        {
             columns_from_create_table_body(&body)
         } else {
             Err(LimboError::ParseError(
@@ -335,9 +339,9 @@ impl ExtVirtualTable {
         args: Vec<turso_ext::Value>,
         kind: VTabKind,
     ) -> crate::Result<(Self, String)> {
-        let module = module.ok_or(LimboError::ExtensionError(format!(
-            "Virtual table module not found: {module_name}"
-        )))?;
+        let module = module.ok_or_else(|| {
+            LimboError::ExtensionError(format!("Virtual table module not found: {module_name}"))
+        })?;
         if kind != module.module_kind {
             let expected = match kind {
                 VTabKind::VirtualTable => "virtual table",

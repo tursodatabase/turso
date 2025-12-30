@@ -55,7 +55,7 @@ use turso_parser::ast::{
 /// Validate anything with this insert statement that should throw an early parse error
 fn validate(table_name: &str, resolver: &Resolver, table: &Table) -> Result<()> {
     // Check if this is a system table that should be protected from direct writes
-    if crate::schema::is_system_table(table_name) {
+    if !crate::schema::can_write_to_table(table_name) {
         crate::bail_parse_error!("table {} may not be modified", table_name);
     }
     // Check if this table has any incompatible dependent views
@@ -788,7 +788,7 @@ fn translate_rows_and_open_tables(
     if inserting_multiple_rows {
         let select_result_start_reg = program
             .reg_result_cols_start
-            .unwrap_or(ctx.yield_reg_opt.unwrap() + 1);
+            .unwrap_or_else(|| ctx.yield_reg_opt.unwrap() + 1);
         translate_rows_multiple(
             program,
             insertion,
@@ -1145,7 +1145,7 @@ fn bind_insert(
                 .map(|c| {
                     c.default
                         .clone()
-                        .unwrap_or(Box::new(ast::Expr::Literal(ast::Literal::Null)))
+                        .unwrap_or_else(|| Box::new(ast::Expr::Literal(ast::Literal::Null)))
                 })
                 .collect();
         }
@@ -1470,7 +1470,7 @@ fn init_source_emission<'a>(
             values.extend(table.columns().iter().map(|c| {
                 c.default
                     .clone()
-                    .unwrap_or(Box::new(ast::Expr::Literal(ast::Literal::Null)))
+                    .unwrap_or_else(|| Box::new(ast::Expr::Literal(ast::Literal::Null)))
             }));
             (
                 num_values,

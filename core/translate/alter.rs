@@ -10,6 +10,7 @@ use crate::{
     translate::{
         emitter::Resolver,
         expr::{walk_expr, WalkControl},
+        optimizer::Optimizable,
         plan::{ColumnUsedMask, OuterQueryReference, TableReferences},
     },
     util::normalize_ident,
@@ -192,7 +193,18 @@ pub fn translate_alter_table(
             }
 
             // TODO: check usage in CHECK constraint when implemented
-            // TODO: check usage in foreign key constraint when implemented
+
+            // Check if column is used in a foreign key constraint (child side)
+            // SQLite does not allow dropping a column that is part of a FK constraint
+            let column_name_norm = normalize_ident(column_name);
+            for fk in &btree.foreign_keys {
+                if fk.child_columns.contains(&column_name_norm) {
+                    return Err(LimboError::ParseError(format!(
+                        "error in table {table_name} after drop column: unknown column \"{column_name}\" in foreign key definition"
+                    )));
+                }
+            }
+
             // TODO: check usage in generated column when implemented
 
             // References in VIEWs are checked in the VDBE layer op_drop_column instruction.
@@ -315,22 +327,16 @@ pub fn translate_alter_table(
             let constraints = col_def.constraints.clone();
             let column = Column::from(&col_def);
 
-            if let Some(default) = &column.default {
-                if !matches!(
-                    default.as_ref(),
-                    ast::Expr::Literal(
-                        ast::Literal::Null
-                            | ast::Literal::Blob(_)
-                            | ast::Literal::Numeric(_)
-                            | ast::Literal::String(_)
-                    )
-                ) {
-                    // TODO: This is slightly inaccurate since sqlite returns a `Runtime
-                    // error`.
-                    return Err(LimboError::ParseError(
-                        "Cannot add a column with non-constant default".to_string(),
-                    ));
-                }
+            if column
+                .default
+                .as_ref()
+                .is_some_and(|default| !default.is_constant(resolver))
+            {
+                // TODO: This is slightly inaccurate since sqlite returns a `Runtime
+                // error`.
+                return Err(LimboError::ParseError(
+                    "Cannot add a column with non-constant default".to_string(),
+                ));
             }
 
             let new_column_name = column.name.as_ref().ok_or_else(|| {

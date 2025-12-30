@@ -2614,7 +2614,7 @@ impl BTreeCursor {
                     );
                     let current_page = self.stack.top_ref();
                     let next_balance_depth =
-                        balance_ancestor_at_depth.unwrap_or(self.stack.current());
+                        balance_ancestor_at_depth.unwrap_or_else(|| self.stack.current());
                     {
                         // check if we don't need to balance
                         // don't continue if:

@@ -93,7 +93,7 @@ pub fn join_lhs_and_rhs<'a>(
     {
         if constraint_refs.is_empty() {
             // Check if there are usable constraints that will create an ephemeral index
-            let lhs_mask_for_ephemeral = lhs.map_or(TableMask::new(), |l| {
+            let lhs_mask_for_ephemeral = lhs.map_or_else(TableMask::new, |l| {
                 TableMask::from_table_number_iter(l.table_numbers())
             });
             let has_usable_constraints = rhs_constraints.constraints.iter().any(|c| {
@@ -116,7 +116,7 @@ pub fn join_lhs_and_rhs<'a>(
     let mut best_access_method = method;
 
     // Reuse for both hash cost and output cardinality computation
-    let lhs_mask = lhs.map_or(TableMask::new(), |l| {
+    let lhs_mask = lhs.map_or_else(TableMask::new, |l| {
         TableMask::from_table_number_iter(l.table_numbers())
     });
     let output_cardinality_multiplier = rhs_constraints

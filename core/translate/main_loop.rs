@@ -1182,7 +1182,11 @@ pub fn emit_loop(
 ) -> Result<()> {
     // if we have a group by, we emit a record into the group by sorter,
     // or if the rows are already sorted, we do the group by aggregation phase directly.
-    if plan.group_by.is_some() {
+    let has_group_by_exprs = plan
+        .group_by
+        .as_ref()
+        .is_some_and(|gb| !gb.exprs.is_empty());
+    if has_group_by_exprs {
         return emit_loop_source(program, t_ctx, plan, LoopEmitTarget::GroupBy);
     }
     // if we DONT have a group by, but we have aggregates, we emit without ResultRow.

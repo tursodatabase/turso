@@ -229,9 +229,7 @@ pub fn emit_fk_violation(program: &mut ProgramBuilder, fk: &ForeignKey) -> Resul
     Ok(())
 }
 
-/// Emit an immediate HALT for FK RESTRICT violations.
-/// Unlike NO ACTION which uses counters, RESTRICT must fail immediately
-/// when a child row references the parent being deleted/updated.
+/// Emit an immediate HALT for FK violations.
 pub fn emit_fk_restrict_halt(program: &mut ProgramBuilder) -> Result<()> {
     program.emit_insn(Insn::Halt {
         err_code: SQLITE_CONSTRAINT_FOREIGNKEY,
@@ -1660,6 +1658,266 @@ pub fn fire_fk_update_actions(
         }
 
         program.preassign_label_to_next_insn(skip_action);
+    }
+
+    Ok(())
+}
+
+/// Emit pre-DROP FK checks and actions for a table.
+///
+/// SQLite's algorithm:
+/// 1. Collect all parent rowids into a RowSet for iteration
+/// 2. For each parent rowid:
+///    - Seek to parent row and extract parent key column values
+///    - Based on the ON DELETE action:
+///      - RESTRICT/NO ACTION: Scan child table for matching FK values and count violations
+///      - CASCADE/SET NULL/SET DEFAULT: Take appropriate action for child rows that reference the parent
+///
+/// Only fails if a child row actually references an existing parent row being deleted
+/// and the action is RESTRICT/NO ACTION. Correctly handles orphaned FK values.
+pub fn emit_fk_drop_table_check(
+    program: &mut ProgramBuilder,
+    resolver: &mut Resolver,
+    parent_table_name: &str,
+    connection: &Arc<Connection>,
+) -> Result<()> {
+    let parent_tbl = resolver
+        .schema
+        .get_btree_table(parent_table_name)
+        .ok_or_else(|| {
+            LimboError::InternalError(format!("parent table {parent_table_name} not found"))
+        })?;
+
+    // Get all FK references to this parent table
+    let fk_refs = resolver
+        .schema
+        .resolved_fks_referencing(parent_table_name)?;
+
+    if fk_refs.is_empty() {
+        return Ok(());
+    }
+
+    // Separate FK refs by action type:
+    // - action_fk_refs: CASCADE, SET NULL, SET DEFAULT - need to fire action subprograms
+    // - check_fk_refs: RESTRICT, NO ACTION - need violation counting
+    let action_fk_refs: Vec<_> = fk_refs
+        .iter()
+        .filter(|fk| {
+            matches!(
+                fk.fk.on_delete,
+                RefAct::Cascade | RefAct::SetNull | RefAct::SetDefault
+            )
+        })
+        .collect();
+    let check_fk_refs: Vec<_> = fk_refs
+        .iter()
+        .filter(|fk| matches!(fk.fk.on_delete, RefAct::Restrict | RefAct::NoAction))
+        .collect();
+
+    // Collect all parent rowids into a RowSet
+    // r[rowset_reg] = NULL (initializes RowSet)
+    let rowset_reg = program.alloc_register();
+    program.emit_null(rowset_reg, None);
+
+    let parent_cur = open_read_table(program, &parent_tbl);
+    let collect_done = program.allocate_label();
+
+    program.emit_insn(Insn::Rewind {
+        cursor_id: parent_cur,
+        pc_if_empty: collect_done,
+    });
+
+    let collect_loop = program.allocate_label();
+    program.preassign_label_to_next_insn(collect_loop);
+
+    // Get parent rowid and add to RowSet
+    let parent_rowid_reg = program.alloc_register();
+    program.emit_insn(Insn::RowId {
+        cursor_id: parent_cur,
+        dest: parent_rowid_reg,
+    });
+    program.emit_insn(Insn::RowSetAdd {
+        rowset_reg,
+        value_reg: parent_rowid_reg,
+    });
+
+    program.emit_insn(Insn::Next {
+        cursor_id: parent_cur,
+        pc_if_next: collect_loop,
+    });
+
+    program.preassign_label_to_next_insn(collect_done);
+    program.emit_insn(Insn::Close {
+        cursor_id: parent_cur,
+    });
+
+    // For each parent rowid, check/execute FK actions
+    let parent_write_cur = program.alloc_cursor_id(CursorType::BTreeTable(parent_tbl.clone()));
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id: parent_write_cur,
+        root_page: parent_tbl.root_page.into(),
+        db: 0,
+    });
+
+    let rowset_done = program.allocate_label();
+    let rowset_loop = program.allocate_label();
+    program.preassign_label_to_next_insn(rowset_loop);
+    // Read next rowid from RowSet
+    let current_rowid_reg = program.alloc_register();
+    program.emit_insn(Insn::RowSetRead {
+        rowset_reg,
+        pc_if_empty: rowset_done,
+        dest_reg: current_rowid_reg,
+    });
+
+    // Verify row still exists, jumps if not found
+    let skip_row = program.allocate_label();
+    program.emit_insn(Insn::NotExists {
+        cursor: parent_write_cur,
+        rowid_reg: current_rowid_reg,
+        target_pc: skip_row,
+    });
+
+    // Fire FK actions for CASCADE, SET NULL, SET DEFAULT
+    for fk_ref in &action_fk_refs {
+        let parent_cols = get_fk_parent_cols(fk_ref, &parent_tbl);
+        let ncols = parent_cols.len();
+        let key_regs_start = program.alloc_registers(ncols);
+
+        build_parent_key(
+            program,
+            &parent_tbl,
+            &parent_cols,
+            parent_write_cur,
+            current_rowid_reg,
+            key_regs_start,
+        )?;
+
+        let old_key_registers: Vec<usize> = (key_regs_start..key_regs_start + ncols).collect();
+        let ctx = FkActionContext::new_for_delete(old_key_registers);
+
+        match fk_ref.fk.on_delete {
+            RefAct::Cascade => {
+                fire_fk_cascade_delete(program, resolver, fk_ref, connection, &ctx)?;
+            }
+            RefAct::SetNull => {
+                fire_fk_set_null(program, resolver, fk_ref, connection, &ctx)?;
+            }
+            RefAct::SetDefault => {
+                fire_fk_set_default(program, resolver, fk_ref, connection, &ctx)?;
+            }
+            RefAct::NoAction | RefAct::Restrict => {
+                // These are handled below in the check_fk_refs loop
+            }
+        }
+    }
+
+    // For RESTRICT/NO ACTION FKs, scan child table for matching rows and count violations
+    for fk_ref in &check_fk_refs {
+        let child_tbl = &fk_ref.child_table;
+        let child_cols = &fk_ref.fk.child_columns;
+
+        // Determine which parent columns are referenced
+        let parent_cols = get_fk_parent_cols(fk_ref, &parent_tbl);
+        let ncols = parent_cols.len();
+
+        // Build the parent key vector from the current parent row
+        let parent_key_start = program.alloc_registers(ncols);
+        build_parent_key(
+            program,
+            &parent_tbl,
+            &parent_cols,
+            parent_write_cur,
+            current_rowid_reg,
+            parent_key_start,
+        )?;
+
+        // Scan child table for matching rows
+        let child_cur = open_read_table(program, child_tbl);
+        let child_done = program.allocate_label();
+
+        program.emit_insn(Insn::Rewind {
+            cursor_id: child_cur,
+            pc_if_empty: child_done,
+        });
+
+        let child_loop = program.allocate_label();
+        program.preassign_label_to_next_insn(child_loop);
+        let child_next = program.allocate_label();
+
+        // Compare each FK column to corresponding parent key column
+        // All columns must match for a violation
+        for (i, cname) in child_cols.iter().enumerate() {
+            let (pos, _) = child_tbl
+                .get_column(cname)
+                .ok_or_else(|| LimboError::InternalError(format!("child col {cname} missing")))?;
+
+            let child_val_reg = program.alloc_register();
+            program.emit_insn(Insn::Column {
+                cursor_id: child_cur,
+                column: pos,
+                dest: child_val_reg,
+                default: None,
+            });
+            // If child FK column is NULL, skip (no reference)
+            program.emit_insn(Insn::IsNull {
+                reg: child_val_reg,
+                target_pc: child_next,
+            });
+
+            // Compare child FK column to corresponding parent key column
+            program.emit_insn(Insn::Ne {
+                lhs: child_val_reg,
+                rhs: parent_key_start + i,
+                target_pc: child_next,
+                flags: CmpInsFlags::default().jump_if_null(),
+                collation: Some(CollationSeq::Binary),
+            });
+        }
+
+        // If we reach here, all FK columns match: increment violation counter
+        program.emit_insn(Insn::FkCounter {
+            increment_value: 1,
+            deferred: false,
+        });
+
+        program.preassign_label_to_next_insn(child_next);
+        program.emit_insn(Insn::Next {
+            cursor_id: child_cur,
+            pc_if_next: child_loop,
+        });
+
+        program.preassign_label_to_next_insn(child_done);
+        program.emit_insn(Insn::Close {
+            cursor_id: child_cur,
+        });
+    }
+
+    // Note: SQLite deletes the parent row here, but we skip that since
+    // the actual deletion happens later in the DROP TABLE logic
+    program.preassign_label_to_next_insn(skip_row);
+    program.emit_insn(Insn::Goto {
+        target_pc: rowset_loop,
+    });
+
+    // After processing all rows, check if there were any violations
+    program.preassign_label_to_next_insn(rowset_done);
+    program.emit_insn(Insn::Close {
+        cursor_id: parent_write_cur,
+    });
+
+    // Only check for violations if there are RESTRICT/NO ACTION FKs
+    if !check_fk_refs.is_empty() {
+        // FkIfZero: if counter == 0, skip the halt
+        let no_violations = program.allocate_label();
+        program.emit_insn(Insn::FkIfZero {
+            deferred: false,
+            target_pc: no_violations,
+        });
+
+        // There were violations, halt with FK error
+        emit_fk_restrict_halt(program)?;
+        program.preassign_label_to_next_insn(no_violations);
     }
 
     Ok(())

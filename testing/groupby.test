@@ -354,3 +354,51 @@ do_execsql_test_on_specific_db {:memory:} group_by_alias_precedence {
     SELECT x AS y, SUM(y) as x FROM t GROUP BY y ORDER BY x;
 } {2|200
 1|400}
+
+do_execsql_test_on_specific_db {:memory:} having_without_group_by_basic {
+    CREATE TABLE t(a INTEGER);
+    INSERT INTO t VALUES (1), (2), (3), (4), (5);
+    SELECT sum(a) as s FROM t HAVING s = 15;
+} {15}
+
+do_execsql_test_on_specific_db {:memory:} having_without_group_by_no_match {
+    CREATE TABLE t(a INTEGER);
+    INSERT INTO t VALUES (1), (2), (3), (4), (5);
+    SELECT sum(a) as s FROM t HAVING s = 14;
+} {}
+
+do_execsql_test_on_specific_db {:memory:} having_without_group_by_multiple_aggregates {
+    CREATE TABLE t(a INTEGER);
+    INSERT INTO t VALUES (1), (2), (3), (4), (5);
+    SELECT sum(a) as s, count(*) as c FROM t HAVING c = 5;
+} {15|5}
+
+do_execsql_test_on_specific_db {:memory:} having_without_group_by_expression {
+    CREATE TABLE t(a INTEGER);
+    INSERT INTO t VALUES (10), (20), (30);
+    SELECT sum(a) as total FROM t HAVING total > 50;
+} {60}
+
+do_execsql_test_on_specific_db {:memory:} having_without_group_by_complex_condition {
+    CREATE TABLE t(a INTEGER);
+    INSERT INTO t VALUES (1), (2), (3), (4), (5);
+    SELECT sum(a) as s, avg(a) as av FROM t HAVING s = 15 AND av = 3;
+} {15|3.0}
+
+do_execsql_test_on_specific_db {:memory:} having_without_group_by_count {
+    CREATE TABLE t(a INTEGER);
+    INSERT INTO t VALUES (1), (2), (3);
+    SELECT count(*) as cnt FROM t HAVING cnt > 2;
+} {3}
+
+do_execsql_test_on_specific_db {:memory:} having_without_group_by_max_min {
+    CREATE TABLE t(a INTEGER);
+    INSERT INTO t VALUES (5), (10), (15), (20);
+    SELECT max(a) as mx, min(a) as mn FROM t HAVING mx = 20 AND mn = 5;
+} {20|5}
+
+do_execsql_test_in_memory_any_error having_without_group_by_non_aggregate_error {
+    CREATE TABLE t(a INTEGER);
+    INSERT INTO t VALUES (1), (2), (3);
+    SELECT a FROM t HAVING a = 1;
+}

@@ -19,3 +19,6 @@ turso_core = { workspace = true, features = ["fs"] }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(frb_expand)'] }
+
+[lints.clippy]
+or_fun_call = "deny"
