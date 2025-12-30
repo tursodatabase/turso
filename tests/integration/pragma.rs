@@ -167,3 +167,82 @@ fn test_pragma_page_sizes_with_writes_persists(db: TempDatabase) {
         assert_eq!(page_size, test_page_size);
     }
 }
+
+#[turso_macros::test(mvcc)]
+fn test_pragma_function_list_contains_uuid4_row(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    let mut rows = conn
+        .query("PRAGMA function_list;")
+        .unwrap()
+        .expect("expected rows");
+    let mut found = false;
+    while let StepResult::Row = rows.step().unwrap() {
+        let row = rows.row().unwrap();
+        let Value::Text(name) = row.get_value(0) else {
+            panic!("expected text value")
+        };
+        let Value::Integer(builtin) = row.get_value(1) else {
+            panic!("expected integer value")
+        };
+        let Value::Text(function_type) = row.get_value(2) else {
+            panic!("expected text value")
+        };
+        let Value::Text(encoding) = row.get_value(3) else {
+            panic!("expected text value")
+        };
+        let Value::Integer(nargs) = row.get_value(4) else {
+            panic!("expected integer value")
+        };
+        if name.as_str() == "uuid4"
+            && *builtin == 1
+            && function_type.as_str() == "scalar"
+            && encoding.as_str() == "utf8"
+            && *nargs == -1
+        {
+            found = true;
+            break;
+        }
+    }
+    assert!(found, "uuid4 should appear in PRAGMA function_list");
+}
+
+#[turso_macros::test(mvcc)]
+fn test_pragma_function_list_contains_gen_random_uuid(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    let mut rows = conn
+        .query("PRAGMA function_list;")
+        .unwrap()
+        .expect("expected rows");
+    let mut found = false;
+    while let StepResult::Row = rows.step().unwrap() {
+        let row = rows.row().unwrap();
+        let Value::Text(name) = row.get_value(0) else {
+            panic!("expected text value")
+        };
+        let Value::Integer(builtin) = row.get_value(1) else {
+            panic!("expected integer value")
+        };
+        let Value::Text(function_type) = row.get_value(2) else {
+            panic!("expected text value")
+        };
+        let Value::Text(encoding) = row.get_value(3) else {
+            panic!("expected text value")
+        };
+        let Value::Integer(nargs) = row.get_value(4) else {
+            panic!("expected integer value")
+        };
+        if name.as_str() == "gen_random_uuid"
+            && *builtin == 1
+            && function_type.as_str() == "scalar"
+            && encoding.as_str() == "utf8"
+            && *nargs == -1
+        {
+            found = true;
+            break;
+        }
+    }
+    assert!(
+        found,
+        "gen_random_uuid should appear in PRAGMA function_list"
+    );
+}
