@@ -486,6 +486,7 @@ impl IoWorker {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn process_http(
         this: &Arc<IoWorker>,
         client: &Client<HttpsConnector<HttpConnector>, Full<Bytes>>,
@@ -506,7 +507,7 @@ impl IoWorker {
             } else {
                 format!("/{path}")
             };
-            let Some(url) = this.base_url.as_deref().or_else(|| url) else {
+            let Some(url) = this.base_url.as_deref().or(url) else {
                 completion.poison("remote_url is not available".to_string());
                 return;
             };
