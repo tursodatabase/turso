@@ -711,6 +711,15 @@ impl<'a> TclParser<'a> {
 
     /// Clean up expected output (convert Tcl list format to pipe-separated)
     fn clean_expected(s: &str) -> String {
+        // First, strip outer quotes if the entire content is wrapped in them
+        // This handles {"content"} where we get "content" after brace extraction
+        let s = s.trim();
+        let s = if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 {
+            &s[1..s.len() - 1]
+        } else {
+            s
+        };
+
         let mut result = String::new();
 
         for line in s.lines() {
