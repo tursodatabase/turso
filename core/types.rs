@@ -63,11 +63,22 @@ pub enum TextSubtype {
     Json,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Text {
     pub value: Cow<'static, str>,
     pub subtype: TextSubtype,
+}
+
+impl Clone for Text {
+    fn clone(&self) -> Self {
+        Text {
+            // 'value' may reference page payload data, so we always clone it to an owned string.
+            // For example, an agg function like group_concat() will need to own the string.
+            value: Cow::Owned(self.value.as_ref().to_owned()),
+            subtype: self.subtype,
+        }
+    }
 }
 
 impl Display for Text {

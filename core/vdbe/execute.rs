@@ -1693,23 +1693,13 @@ pub fn op_column(
                                 }
                                 // TEXT
                                 n if n >= 13 && n & 1 == 1 => {
-                                    // Try to reuse the registers when allocation is not needed.
-                                    match state.registers[*dest] {
-                                        Register::Value(Value::Text(ref mut existing_text)) => {
-                                            // SAFETY: We know the text is valid UTF-8 because we only accept valid UTF-8 and the serial type is TEXT.
-                                            let text =
-                                                unsafe { std::str::from_utf8_unchecked(buf) };
-                                            existing_text.do_extend(&text);
-                                        }
-                                        _ => {
-                                            // SAFETY: We know the text is valid UTF-8 because we only accept valid UTF-8 and the serial type is TEXT.
-                                            let text =
-                                                unsafe { std::str::from_utf8_unchecked(buf) };
-                                            state.registers[*dest] = Register::Value(Value::Text(
-                                                Text::new(text.to_string()),
-                                            ));
-                                        }
-                                    }
+                                    // SAFETY: We know the text is valid UTF-8 because we only accept valid UTF-8 and the serial type is TEXT.
+                                    let text = unsafe { std::str::from_utf8_unchecked(buf) };
+                                    state.registers[*dest] = Register::Value(Value::Text(
+                                        // We can store a reference here because the payload buffer will be valid until the next row is processed,
+                                        // after which we won't refer to the contents of this register again.
+                                        Text::new(text),
+                                    ));
                                 }
                                 _ => panic!("Invalid serial type: {serial_type}"),
                             }
