@@ -6,7 +6,8 @@
 use chumsky::prelude::*;
 
 use crate::tcl_converter::utils::{
-    arg, braced, check_has_ddl, clean_name, clean_sql, comment, hpad, hspace, skip_line,
+    arg, braced, check_has_ddl, clean_name, clean_sql, comment, hpad, hspace, skip_block,
+    skip_line,
 };
 
 #[macro_export]
@@ -341,33 +342,28 @@ impl TclItem {
 
 /// Full file parser
 pub fn tcl_file_parser<'a>() -> text_parser!('a, Vec<TclItem>) {
-    // Skip block parsers that capture preview text
-    let foreach_block = just("foreach")
-        .ignore_then(braced())
-        .map(|preview| TclItem::Skip(SkipKind::Foreach, format!("foreach{}", preview)));
+    // Skip block parsers that capture the entire block content
+    let foreach_block =
+        skip_block("foreach").map(|preview| TclItem::Skip(SkipKind::Foreach, preview));
 
-    let if_block = just("if")
-        .ignore_then(braced())
-        .map(|preview| TclItem::Skip(SkipKind::If, format!("if{}", preview)));
+    let if_block = skip_block("if").map(|preview| TclItem::Skip(SkipKind::If, preview));
 
-    let proc_block = just("proc")
-        .ignore_then(braced())
-        .map(|preview| TclItem::Skip(SkipKind::Proc, format!("proc{}", preview)));
+    let proc_block = skip_block("proc").map(|preview| TclItem::Skip(SkipKind::Proc, preview));
 
-    let item = choice((
+    // Each item can have leading horizontal whitespace
+    let item = hspace().ignore_then(choice((
         test_parser().map(TclItem::Test),
         comment().map(TclItem::comment),
         foreach_block,
         if_block,
         proc_block,
         skip_line().to(TclItem::Skip(SkipKind::Line, String::new())),
-        // Skip unknown lines
-        none_of('\n')
-            .repeated()
-            .at_least(1)
-            .collect::<String>()
-            .map(|s| TclItem::Skip(SkipKind::Unknown, s)),
-    ));
+        // Skip unknown lines (but only non-empty ones after whitespace)
+        none_of(" \t\n")
+            .then(none_of('\n').repeated())
+            .to_slice()
+            .map(|s: &str| TclItem::Skip(SkipKind::Unknown, s.to_string())),
+    )));
 
     item.separated_by(just('\n').repeated())
         .allow_leading()
@@ -550,8 +546,187 @@ mod tests {
 
     use super::*;
 
+    // ==================== test_parser() tests ====================
+
     #[test]
-    fn test_parse_basic_test() {
+    fn test_parser_do_execsql_test() {
+        let input = "do_execsql_test mytest {SELECT 1} {1}";
+        let result = test_parser().parse(input).into_result();
+        assert!(result.is_ok());
+        let test = result.unwrap();
+        assert_eq!(test.name, "mytest");
+        assert_eq!(test.sql.trim(), "SELECT 1");
+        assert!(matches!(test.kind, TclTestKind::Exact(ref s) if s == "1"));
+    }
+
+    #[test]
+    fn test_parser_do_execsql_test_error() {
+        let input = "do_execsql_test_error mytest {SELECT * FROM missing} {.*no such table.*}";
+        let result = test_parser().parse(input).into_result();
+        assert!(result.is_ok());
+        let test = result.unwrap();
+        assert!(matches!(test.kind, TclTestKind::Error(Some(ref p)) if p.contains("no such table")));
+    }
+
+    #[test]
+    fn test_parser_do_execsql_test_any_error() {
+        let input = "do_execsql_test_any_error mytest {SELECT * FROM missing}";
+        let result = test_parser().parse(input).into_result();
+        assert!(result.is_ok());
+        let test = result.unwrap();
+        assert!(matches!(test.kind, TclTestKind::AnyError));
+    }
+
+    #[test]
+    fn test_parser_do_execsql_test_in_memory() {
+        let input = "do_execsql_test_in_memory_error mytest {CREATE TABLE t(x)} {.*}";
+        let result = test_parser().parse(input).into_result();
+        assert!(result.is_ok());
+        let test = result.unwrap();
+        assert_eq!(test.db, Some(":memory:".to_string()));
+    }
+
+    #[test]
+    fn test_parser_do_execsql_test_regex() {
+        let input = "do_execsql_test_regex mytest {SELECT date('now')} {\\d{4}-\\d{2}-\\d{2}}";
+        let result = test_parser().parse(input).into_result();
+        assert!(result.is_ok());
+        let test = result.unwrap();
+        assert!(matches!(test.kind, TclTestKind::Pattern(_)));
+    }
+
+    #[test]
+    fn test_parser_do_execsql_test_small() {
+        let input = "do_execsql_test_small mytest {SELECT 1} {1}";
+        let result = test_parser().parse(input).into_result();
+        assert!(result.is_ok());
+        let test = result.unwrap();
+        assert!(test.db.as_ref().unwrap().contains("small"));
+    }
+
+    #[test]
+    fn test_parser_do_execsql_test_on_specific_db() {
+        let input = "do_execsql_test_on_specific_db mydb mytest {SELECT 1} {1}";
+        let result = test_parser().parse(input).into_result();
+        assert!(result.is_ok());
+        let test = result.unwrap();
+        assert_eq!(test.db, Some("mydb".to_string()));
+    }
+
+    #[test]
+    fn test_parser_multiline_sql() {
+        let input = r#"do_execsql_test mytest {
+  SELECT *
+  FROM users
+  WHERE id = 1
+} {1 alice}"#;
+        let result = test_parser().parse(input).into_result();
+        assert!(result.is_ok());
+        let test = result.unwrap();
+        assert!(test.sql.contains("SELECT"));
+        assert!(test.sql.contains("FROM users"));
+    }
+
+    #[test]
+    fn test_parser_nested_braces_in_sql() {
+        let input = "do_execsql_test mytest {SELECT json_object('a', 1)} {{\"a\":1}}";
+        let result = test_parser().parse(input).into_result();
+        assert!(result.is_ok());
+    }
+
+    // ==================== tcl_file_parser() tests ====================
+
+    #[test]
+    fn test_file_parser_single_test() {
+        let input = "do_execsql_test test1 {SELECT 1} {1}";
+        let result = tcl_file_parser().parse(input).into_result();
+        assert!(result.is_ok());
+        let items = result.unwrap();
+        assert_eq!(items.len(), 1);
+        assert!(matches!(items[0], TclItem::Test(_)));
+    }
+
+    #[test]
+    fn test_file_parser_multiple_tests() {
+        let input = r#"do_execsql_test test1 {SELECT 1} {1}
+do_execsql_test test2 {SELECT 2} {2}
+do_execsql_test test3 {SELECT 3} {3}"#;
+        let result = tcl_file_parser().parse(input).into_result();
+        assert!(result.is_ok());
+        let items = result.unwrap();
+        let tests: Vec<_> = items.iter().filter(|i| matches!(i, TclItem::Test(_))).collect();
+        assert_eq!(tests.len(), 3);
+    }
+
+    #[test]
+    fn test_file_parser_with_comments() {
+        let input = r#"# This is a comment
+do_execsql_test test1 {SELECT 1} {1}
+# Another comment"#;
+        let result = tcl_file_parser().parse(input).into_result();
+        assert!(result.is_ok());
+        let items = result.unwrap();
+        let comments: Vec<_> = items.iter().filter(|i| matches!(i, TclItem::Comment(_))).collect();
+        assert_eq!(comments.len(), 2);
+    }
+
+    #[test]
+    fn test_file_parser_foreach_skipped() {
+        let input = r#"foreach {a b} {1 2 3 4} {
+  do_execsql_test test-$a {SELECT $b} {$b}
+}"#;
+        let result = tcl_file_parser().parse(input).into_result();
+        assert!(result.is_ok());
+        let items = result.unwrap();
+        let skips: Vec<_> = items.iter().filter(|i| matches!(i, TclItem::Skip(SkipKind::Foreach, _))).collect();
+        assert!(!skips.is_empty());
+    }
+
+    #[test]
+    fn test_file_parser_if_skipped() {
+        let input = r#"if {$condition} {
+  do_execsql_test test1 {SELECT 1} {1}
+}"#;
+        let result = tcl_file_parser().parse(input).into_result();
+        assert!(result.is_ok());
+        let items = result.unwrap();
+        let skips: Vec<_> = items.iter().filter(|i| matches!(i, TclItem::Skip(SkipKind::If, _))).collect();
+        assert!(!skips.is_empty());
+    }
+
+    #[test]
+    fn test_file_parser_proc_skipped() {
+        let input = r#"proc myproc {args} {
+  return $args
+}"#;
+        let result = tcl_file_parser().parse(input).into_result();
+        assert!(result.is_ok());
+        let items = result.unwrap();
+        let skips: Vec<_> = items.iter().filter(|i| matches!(i, TclItem::Skip(SkipKind::Proc, _))).collect();
+        assert!(!skips.is_empty());
+    }
+
+    #[test]
+    fn test_file_parser_set_skipped() {
+        let input = "set testdir [file dirname $argv0]";
+        let result = tcl_file_parser().parse(input).into_result();
+        assert!(result.is_ok());
+        let items = result.unwrap();
+        let skips: Vec<_> = items.iter().filter(|i| matches!(i, TclItem::Skip(SkipKind::Line, _))).collect();
+        assert!(!skips.is_empty());
+    }
+
+    #[test]
+    fn test_file_parser_source_skipped() {
+        let input = "source $testdir/tester.tcl";
+        let result = tcl_file_parser().parse(input).into_result();
+        assert!(result.is_ok());
+    }
+
+    // ==================== parse_tcl_file() integration tests ====================
+
+    #[test]
+    fn test_parse_tcl_file_basic() {
         let content = r#"
 do_execsql_test select-const-1 {
   SELECT 1
@@ -559,14 +734,14 @@ do_execsql_test select-const-1 {
 "#;
 
         let result = convert(content, "test.test");
-        assert!(result.warnings.is_empty());
+        assert!(result.warnings.is_empty(), "Got warnings: {:?}", result.warnings);
         assert_eq!(result.tests.len(), 1);
         assert_eq!(result.tests[0].name, "select-const-1");
         assert_eq!(result.tests[0].sql.trim(), "SELECT 1");
     }
 
     #[test]
-    fn test_parse_error_test() {
+    fn test_parse_tcl_file_error_test() {
         let content = r#"
 do_execsql_test_error select-missing-table {
     SELECT * FROM nonexistent;
@@ -580,7 +755,7 @@ do_execsql_test_error select-missing-table {
     }
 
     #[test]
-    fn test_skip_foreach() {
+    fn test_parse_tcl_file_foreach_warning() {
         let content = r#"
 foreach {testname lhs ans} {
   int-1           1        0
@@ -593,5 +768,167 @@ foreach {testname lhs ans} {
         let result = convert(content, "test.test");
         assert!(!result.warnings.is_empty());
         assert_eq!(result.warnings[0].kind, WarningKind::ForeachSkipped);
+    }
+
+    #[test]
+    fn test_parse_tcl_file_comment_attachment() {
+        let content = r#"# This test checks something
+do_execsql_test test1 {SELECT 1} {1}"#;
+
+        let result = convert(content, "test.test");
+        assert_eq!(result.tests.len(), 1);
+        assert_eq!(result.tests[0].comments.len(), 1);
+        assert!(result.tests[0].comments[0].contains("This test checks"));
+    }
+
+    #[test]
+    fn test_parse_tcl_file_name_deduplication() {
+        let content = r#"do_execsql_test test1 {SELECT 1} {1}
+do_execsql_test test1 {SELECT 2} {2}
+do_execsql_test test1 {SELECT 3} {3}"#;
+
+        let result = convert(content, "test.test");
+        assert_eq!(result.tests.len(), 3);
+        assert_eq!(result.tests[0].name, "test1");
+        assert_eq!(result.tests[1].name, "test1-2");
+        assert_eq!(result.tests[2].name, "test1-3");
+    }
+
+    #[test]
+    fn test_parse_tcl_file_ddl_detection() {
+        let content = r#"do_execsql_test test1 {
+  CREATE TABLE t1(x);
+  INSERT INTO t1 VALUES(1);
+  SELECT * FROM t1;
+} {1}"#;
+
+        let result = convert(content, "test.test");
+        assert_eq!(result.tests.len(), 1);
+        assert!(result.tests[0].has_ddl);
+    }
+
+    #[test]
+    fn test_parse_tcl_file_no_ddl() {
+        let content = r#"do_execsql_test test1 {SELECT 1 + 1} {2}"#;
+
+        let result = convert(content, "test.test");
+        assert_eq!(result.tests.len(), 1);
+        assert!(!result.tests[0].has_ddl);
+    }
+
+    #[test]
+    fn test_parse_tcl_file_mixed_content() {
+        let content = r#"#!/usr/bin/tclsh
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+
+# Test basic select
+do_execsql_test basic-1 {SELECT 1} {1}
+
+# Test arithmetic
+do_execsql_test arith-1 {SELECT 1 + 1} {2}
+"#;
+
+        let result = convert(content, "test.test");
+        assert_eq!(result.tests.len(), 2);
+        assert_eq!(result.tests[0].name, "basic-1");
+        assert_eq!(result.tests[1].name, "arith-1");
+    }
+
+    #[test]
+    fn test_parse_tcl_file_multiline_expected() {
+        let content = r#"do_execsql_test test1 {
+  SELECT * FROM (VALUES (1, 'a'), (2, 'b'))
+} {1 a
+2 b}"#;
+
+        let result = convert(content, "test.test");
+        assert_eq!(result.tests.len(), 1);
+        if let TclTestKind::Exact(expected) = &result.tests[0].kind {
+            assert!(expected.contains("1 a"));
+            assert!(expected.contains("2 b"));
+        } else {
+            panic!("Expected Exact kind");
+        }
+    }
+
+    // ==================== build_test() tests ====================
+
+    #[test]
+    fn test_build_test_standard() {
+        let args = vec!["test-name".to_string(), "SELECT 1".to_string(), "1".to_string()];
+        let result = build_test(args, TestConfig::standard());
+        assert!(result.is_ok());
+        let test = result.unwrap();
+        assert_eq!(test.name, "test-name");
+        assert!(test.db.is_none());
+    }
+
+    #[test]
+    fn test_build_test_with_db() {
+        let args = vec!["mydb".to_string(), "test-name".to_string(), "SELECT 1".to_string(), "1".to_string()];
+        let result = build_test(args, TestConfig::standard().db_from_arg());
+        assert!(result.is_ok());
+        let test = result.unwrap();
+        assert_eq!(test.db, Some("mydb".to_string()));
+    }
+
+    #[test]
+    fn test_build_test_memory() {
+        let args = vec!["test-name".to_string(), "SELECT 1".to_string(), "1".to_string()];
+        let result = build_test(args, TestConfig::memory());
+        assert!(result.is_ok());
+        let test = result.unwrap();
+        assert_eq!(test.db, Some(":memory:".to_string()));
+    }
+
+    #[test]
+    fn test_build_test_error_kind() {
+        let args = vec!["test-name".to_string(), "SELECT * FROM missing".to_string(), ".*error.*".to_string()];
+        let result = build_test(args, TestConfig::standard().error());
+        assert!(result.is_ok());
+        let test = result.unwrap();
+        assert!(matches!(test.kind, TclTestKind::Error(_)));
+    }
+
+    #[test]
+    fn test_build_test_any_error_kind() {
+        let args = vec!["test-name".to_string(), "SELECT * FROM missing".to_string()];
+        let result = build_test(args, TestConfig::standard().any_error());
+        assert!(result.is_ok());
+        let test = result.unwrap();
+        assert!(matches!(test.kind, TclTestKind::AnyError));
+    }
+
+    #[test]
+    fn test_build_test_insufficient_args() {
+        let args = vec!["test-name".to_string()];
+        let result = build_test(args, TestConfig::standard());
+        assert!(result.is_err());
+    }
+
+    // ==================== Edge cases ====================
+
+    #[test]
+    fn test_empty_file() {
+        let result = convert("", "test.test");
+        assert!(result.tests.is_empty());
+    }
+
+    #[test]
+    fn test_only_comments() {
+        let content = "# comment 1\n# comment 2\n# comment 3";
+        let result = convert(content, "test.test");
+        assert!(result.tests.is_empty());
+        // Pending comments should be captured
+        assert!(!result.pending_comments.is_empty());
+    }
+
+    #[test]
+    fn test_whitespace_handling() {
+        // Tests with leading horizontal whitespace (common in indented files)
+        let content = "  do_execsql_test test1 {SELECT 1} {1}";
+        let result = convert(content, "test.test");
+        assert_eq!(result.tests.len(), 1);
     }
 }
