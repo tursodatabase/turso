@@ -142,19 +142,41 @@ pub fn skip_balanced_braces<'a>() -> text_parser!('a, ()) {
     })
 }
 
-/// Parser for foreach/if/proc blocks - consumes keyword + all balanced braces
+/// Parser for foreach/if/proc blocks - consumes keyword + all balanced braces on the same logical unit
 /// Used to skip over control structures that generate multiple tests
+///
+/// Matches patterns like:
+/// - foreach {vars} {values} { body }
+/// - if {cond} { body } else { body }
+/// - proc name {args} { body }
 pub fn skip_block<'a>(keyword: &'a str) -> text_parser!('a, String) {
-    just(keyword)
+    // Content before a brace: spaces, tabs, or non-brace/non-newline chars
+    let pre_brace = choice((
+        one_of(" \t").ignored(),   // horizontal whitespace
+        none_of("{}\n").ignored(), // other chars but NOT newlines
+    ))
+    .repeated();
+
+    // Between braced sections: whitespace, and optionally 'else' or 'elseif'
+    let between_braces = one_of(" \t\n")
+        .repeated()
         .then(
-            choice((
-                skip_balanced_braces(),
-                one_of(" \t\n").ignored(), // whitespace between blocks
-                none_of("{}").ignored(),   // content before first brace
-            ))
-            .repeated()
-            .at_least(1),
+            // Allow 'else', 'elseif' between if blocks
+            choice((just("elseif").ignored(), just("else").ignored())).or_not(),
         )
+        .padded();
+
+    // A braced section, optionally followed by more braced sections
+    let braced_sections = skip_balanced_braces().then(
+        // After a brace, allow whitespace/else/elseif then another brace
+        between_braces
+            .ignore_then(skip_balanced_braces())
+            .repeated(),
+    );
+
+    just(keyword)
+        .then(pre_brace)
+        .then(braced_sections)
         .to_slice()
         .map(|s: &str| s.to_string())
 }
@@ -292,13 +314,17 @@ mod tests {
 
     #[test]
     fn test_skip_line_set() {
-        let result = skip_line().parse("set testdir [file dirname]").into_result();
+        let result = skip_line()
+            .parse("set testdir [file dirname]")
+            .into_result();
         assert!(result.is_ok());
     }
 
     #[test]
     fn test_skip_line_source() {
-        let result = skip_line().parse("source $testdir/tester.tcl").into_result();
+        let result = skip_line()
+            .parse("source $testdir/tester.tcl")
+            .into_result();
         assert!(result.is_ok());
     }
 

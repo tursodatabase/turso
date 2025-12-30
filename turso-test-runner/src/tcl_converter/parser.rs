@@ -139,6 +139,8 @@ enum ArgLayout {
     Standard,
     /// db name {sql} {expected?}
     WithDb,
+    /// skip_lines db name {sql} {expected?}
+    SkipLinesWithDb,
 }
 
 impl TestConfig {
@@ -189,6 +191,13 @@ impl TestConfig {
             ..self
         }
     }
+
+    fn skip_lines_db_from_arg(self) -> Self {
+        Self {
+            layout: ArgLayout::SkipLinesWithDb,
+            ..self
+        }
+    }
 }
 
 /// Parser for Tcl test files
@@ -220,6 +229,14 @@ fn build_test(args: Vec<String>, config: TestConfig) -> Result<TclTest, String> 
                 return Err("Expected db argument".to_string());
             }
             (Some(args[0].trim().to_string()), 1)
+        }
+        ArgLayout::SkipLinesWithDb => {
+            // skip_lines db name {sql} {expected}
+            if args.len() < 2 {
+                return Err("Expected skip_lines and db arguments".to_string());
+            }
+            // args[0] is skip_lines (we ignore it), args[1] is db
+            (Some(args[1].trim().to_string()), 2)
         }
     };
 
@@ -268,11 +285,12 @@ fn test_fn<'a>(keyword: &'a str, config: TestConfig) -> text_parser!('a, TclTest
 /// Order matters - longer/more specific keywords first!
 pub fn test_parser<'a>() -> text_parser!('a, TclTest) {
     choice((
-        // Specific DB tests
+        // Specific DB tests with skip_lines (format: skip_lines db name sql expected)
         test_fn(
             "do_execsql_test_skip_lines_on_specific_db",
-            TestConfig::standard().db_from_arg(),
+            TestConfig::standard().skip_lines_db_from_arg(),
         ),
+        // Specific DB tests (format: db name sql expected)
         test_fn(
             "do_execsql_test_on_specific_db",
             TestConfig::standard().db_from_arg(),
@@ -930,5 +948,194 @@ do_execsql_test arith-1 {SELECT 1 + 1} {2}
         let content = "  do_execsql_test test1 {SELECT 1} {1}";
         let result = convert(content, "test.test");
         assert_eq!(result.tests.len(), 1);
+    }
+
+    #[test]
+    fn test_on_specific_db_parsing() {
+        let content = r#"do_execsql_test_on_specific_db {:memory:} test-name {
+  SELECT 1
+} {1}"#;
+        let result = convert(content, "test.test");
+        println!("Tests: {:?}", result.tests);
+        println!("Warnings: {:?}", result.warnings);
+        assert_eq!(result.tests.len(), 1, "Expected 1 test");
+        assert_eq!(result.tests[0].db, Some(":memory:".to_string()));
+        assert_eq!(result.tests[0].name, "test-name");
+    }
+
+    #[test]
+    fn test_on_specific_db_indented() {
+        let content = r#"  do_execsql_test_on_specific_db {:memory:} select-union-1 {
+  CREATE TABLE t (x TEXT);
+  select * from t;
+  } {x|x
+  y|y}"#;
+        let result = convert(content, "test.test");
+        println!("Tests: {:?}", result.tests);
+        println!("Warnings: {:?}", result.warnings);
+        assert_eq!(result.tests.len(), 1, "Expected 1 test");
+        assert_eq!(result.tests[0].db, Some(":memory:".to_string()));
+    }
+
+    #[test]
+    fn test_multiple_on_specific_db() {
+        let content = r#"do_execsql_test_on_specific_db {:memory:} test1 {
+  SELECT 1
+} {1}
+
+do_execsql_test_on_specific_db {:memory:} test2 {
+  SELECT 2
+} {2}
+
+do_execsql_test_on_specific_db {:memory:} test3 {
+  SELECT 3
+} {3}"#;
+        let result = convert(content, "test.test");
+        println!("Tests: {:?}", result.tests.len());
+        for t in &result.tests {
+            println!("  Test: {} db={:?}", t.name, t.db);
+        }
+        println!("Warnings: {:?}", result.warnings);
+        assert_eq!(result.tests.len(), 3, "Expected 3 tests");
+    }
+
+    #[test]
+    fn test_on_specific_db_extra_whitespace() {
+        // Two spaces after {:memory:}
+        let content = r#"do_execsql_test_on_specific_db {:memory:}  limit-expr-can-be-cast-losslessly-1 {
+  SELECT 1 LIMIT 1.1 + 2.9;
+} {1}"#;
+        let result = convert(content, "test.test");
+        println!("Tests: {:?}", result.tests);
+        println!("Warnings: {:?}", result.warnings);
+        assert_eq!(result.tests.len(), 1, "Expected 1 test");
+        assert_eq!(result.tests[0].name, "limit-expr-can-be-cast-losslessly-1");
+    }
+
+    #[test]
+    fn test_in_memory_error_content() {
+        let content = r#"do_execsql_test_in_memory_error_content  limit-expr-cannot-be-cast-losslessly-1 {
+  SELECT 1 LIMIT '1';
+} {cannot be losslessly converted}"#;
+        let result = convert(content, "test.test");
+        println!("Tests: {:?}", result.tests);
+        println!("Warnings: {:?}", result.warnings);
+        assert_eq!(result.tests.len(), 1, "Expected 1 test");
+    }
+
+    #[test]
+    fn test_multiline_expected_indented() {
+        let content = r#"  do_execsql_test_on_specific_db {:memory:} select-intersect-union-with-limit {
+    CREATE TABLE t (x TEXT, y TEXT);
+    select * from t limit 3;
+  } {a|a
+  b|b
+  z|z}"#;
+        let result = convert(content, "test.test");
+        println!("Tests: {:?}", result.tests);
+        println!("Warnings: {:?}", result.warnings);
+        assert_eq!(result.tests.len(), 1, "Expected 1 test");
+        assert_eq!(result.tests[0].name, "select-intersect-union-with-limit");
+    }
+
+    #[test]
+    fn test_consecutive_indented_tests() {
+        let content = r#"  do_execsql_test_on_specific_db {:memory:} test1 {
+    SELECT 1;
+  } {1}
+
+  do_execsql_test_on_specific_db {:memory:} test2 {
+    SELECT 2;
+  } {2}"#;
+        let result = convert(content, "test.test");
+        println!("Tests: {:?}", result.tests);
+        println!("Warnings: {:?}", result.warnings);
+        assert_eq!(result.tests.len(), 2, "Expected 2 tests");
+    }
+
+    #[test]
+    fn test_full_select_file() {
+        let content = std::fs::read_to_string("../testing/select.test").unwrap();
+        let result = convert(&content, "select.test");
+        println!("Total tests: {}", result.tests.len());
+        println!("Warnings: {}", result.warnings.len());
+        for w in &result.warnings {
+            println!("  {:?}: {}", w.kind, w.message);
+        }
+        // 172 total - 2 commented - 1 in foreach = 169
+        assert!(result.tests.len() > 100, "Should have over 100 tests");
+    }
+
+    #[test]
+    fn test_raw_file_parsing() {
+        let content = std::fs::read_to_string("../testing/select.test").unwrap();
+        let (items, errors) = tcl_file_parser().parse(&content).into_output_errors();
+
+        if let Some(items) = items {
+            let mut tests = 0;
+            let mut comments = 0;
+            let mut skips = 0;
+            let mut skip_foreach = 0;
+            let mut skip_if = 0;
+            let mut skip_proc = 0;
+            let mut skip_line = 0;
+            let mut skip_unknown = 0;
+            let mut unknown_previews = Vec::new();
+
+            for item in &items {
+                match item {
+                    TclItem::Test(_) => tests += 1,
+                    TclItem::Comment(_) => comments += 1,
+                    TclItem::Skip(kind, preview) => {
+                        skips += 1;
+                        match kind {
+                            SkipKind::Foreach => skip_foreach += 1,
+                            SkipKind::If => skip_if += 1,
+                            SkipKind::Proc => skip_proc += 1,
+                            SkipKind::Line => skip_line += 1,
+                            SkipKind::Unknown => {
+                                skip_unknown += 1;
+                                if preview.len() > 50 {
+                                    unknown_previews.push(preview.chars().take(80).collect::<String>());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            println!("Total items: {}", items.len());
+            println!("Tests: {}", tests);
+            println!("Comments: {}", comments);
+            println!("Skips total: {}", skips);
+            println!("  Foreach: {}", skip_foreach);
+            println!("  If: {}", skip_if);
+            println!("  Proc: {}", skip_proc);
+            println!("  Line: {}", skip_line);
+            println!("  Unknown: {}", skip_unknown);
+
+            println!("\nLarge unknown skips:");
+            for (i, p) in unknown_previews.iter().enumerate() {
+                println!("  {}: {}", i, p);
+            }
+
+            // Print first and last tests
+            println!("\nFirst 10 tests:");
+            let tests_vec: Vec<_> = items.iter().filter_map(|i| {
+                if let TclItem::Test(t) = i { Some(t) } else { None }
+            }).collect();
+            for t in tests_vec.iter().take(10) {
+                println!("  {}", t.name);
+            }
+            println!("\nLast 10 tests:");
+            for t in tests_vec.iter().rev().take(10).rev() {
+                println!("  {}", t.name);
+            }
+        }
+
+        println!("Parse errors: {}", errors.len());
+        for e in errors.iter().take(5) {
+            println!("  Error: {}", e);
+        }
     }
 }
