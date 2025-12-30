@@ -8,7 +8,7 @@ use crate::LimboError;
 fn get_exponential_formatted_str(number: &f64, uppercase: bool) -> crate::Result<String> {
     // TODO: Implement ryu or zmij style algorithm somewhere in the library and use it here instead
     let mut result = String::with_capacity(24);
-    write!(&mut result, "{number:.6e}",).unwrap();
+    write!(&mut result, "{number:.6e}",).expect("write! to a String cannot fail; it panics on OOM");
 
     let parts = result.split_once('e');
 
@@ -87,7 +87,8 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
                 match value {
                     Value::Integer(_) => {
                         let converted_value = value.as_uint();
-                        write!(result, "{converted_value}").unwrap();
+                        write!(result, "{converted_value}")
+                            .expect("write! to a String cannot fail; it panics on OOM");
                     }
                     _ => result.push('0'),
                 }
@@ -100,7 +101,8 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
                 match &values[args_index].get_value() {
                     Value::Text(t) => result.push_str(t.as_str()),
                     Value::Null => (),
-                    v => write!(result, "{v}").unwrap(),
+                    v => write!(result, "{v}")
+                        .expect("write! to a String cannot fail; it panics on OOM"),
                 }
                 args_index += 1;
             }
@@ -110,8 +112,10 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
                 }
                 let value = &values[args_index].get_value();
                 match value {
-                    Value::Float(f) => write!(result, "{:.6}", *f).unwrap(),
-                    Value::Integer(i) => write!(result, "{:.6}", *i as f64).unwrap(),
+                    Value::Float(f) => write!(result, "{:.6}", *f)
+                        .expect("write! to a String cannot fail; it panics on OOM"),
+                    Value::Integer(i) => write!(result, "{:.6}", *i as f64)
+                        .expect("write! to a String cannot fail; it panics on OOM"),
                     _ => result.push_str("0.000000"),
                 }
                 args_index += 1;
@@ -205,11 +209,14 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
                 }
                 let value = &values[args_index].get_value();
                 match value {
-                    Value::Float(f) => write!(result, "{:x}", *f as i64).unwrap(),
-                    Value::Integer(i) => write!(result, "{i:x}").unwrap(),
+                    Value::Float(f) => write!(result, "{:x}", *f as i64)
+                        .expect("write! to a String cannot fail; it panics on OOM"),
+                    Value::Integer(i) => write!(result, "{i:x}")
+                        .expect("write! to a String cannot fail; it panics on OOM"),
                     Value::Text(s) => {
                         let i: i64 = s.as_str().parse::<i64>().unwrap_or(0);
-                        write!(result, "{i:x}").unwrap()
+                        write!(result, "{i:x}")
+                            .expect("write! to a String cannot fail; it panics on OOM")
                     }
                     _ => result.push('0'),
                 }
@@ -221,11 +228,14 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
                 }
                 let value = &values[args_index].get_value();
                 match value {
-                    Value::Float(f) => write!(result, "{:X}", *f as i64).unwrap(),
-                    Value::Integer(i) => write!(result, "{i:X}").unwrap(),
+                    Value::Float(f) => write!(result, "{:X}", *f as i64)
+                        .expect("write! to a String cannot fail; it panics on OOM"),
+                    Value::Integer(i) => write!(result, "{i:X}")
+                        .expect("write! to a String cannot fail; it panics on OOM"),
                     Value::Text(s) => {
                         let i: i64 = s.as_str().parse::<i64>().unwrap_or(0);
-                        write!(result, "{i:X}").unwrap();
+                        write!(result, "{i:X}")
+                            .expect("write! to a String cannot fail; it panics on OOM");
                     }
                     _ => result.push('0'),
                 }
@@ -237,11 +247,14 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
                 }
                 let value = &values[args_index].get_value();
                 match value {
-                    Value::Float(f) => write!(result, "{:o}", *f as i64).unwrap(),
-                    Value::Integer(i) => write!(result, "{i:o}").unwrap(),
+                    Value::Float(f) => write!(result, "{:o}", *f as i64)
+                        .expect("write! to a String cannot fail; it panics on OOM"),
+                    Value::Integer(i) => write!(result, "{i:o}")
+                        .expect("write! to a String cannot fail; it panics on OOM"),
                     Value::Text(s) => {
                         let i: i64 = s.as_str().parse::<i64>().unwrap_or(0);
-                        write!(result, "{i:o}").unwrap();
+                        write!(result, "{i:o}")
+                            .expect("write! to a String cannot fail; it panics on OOM");
                     }
                     _ => result.push('0'),
                 }
