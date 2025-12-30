@@ -577,6 +577,14 @@ impl<'a> TclParser<'a> {
         let mut in_string = false;
         let mut chars = content.chars().peekable();
 
+        // Skip leading whitespace first (handles indented tests)
+        while let Some(&ch) = chars.peek() {
+            if !ch.is_whitespace() {
+                break;
+            }
+            chars.next();
+        }
+
         // Skip the function name
         while let Some(&ch) = chars.peek() {
             if ch.is_whitespace() || ch == '{' {
@@ -585,7 +593,7 @@ impl<'a> TclParser<'a> {
             chars.next();
         }
 
-        // Skip whitespace
+        // Skip whitespace after function name
         while let Some(&ch) = chars.peek() {
             if !ch.is_whitespace() {
                 break;
@@ -729,11 +737,7 @@ impl<'a> TclParser<'a> {
         // This handles {"content"} where we get "content" after brace extraction
         let s = s.trim();
         let was_quoted = s.starts_with('"') && s.ends_with('"') && s.len() >= 2;
-        let s = if was_quoted {
-            &s[1..s.len() - 1]
-        } else {
-            s
-        };
+        let s = if was_quoted { &s[1..s.len() - 1] } else { s };
 
         // Parse the whole content as a Tcl list (handles multiline braced elements)
         let elements = Self::parse_tcl_list(s);
