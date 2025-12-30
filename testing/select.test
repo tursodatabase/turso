@@ -676,6 +676,21 @@ do_execsql_test_error select-star-subquery {
   j
   x}
 
+# Test that CTE column resolution in UNION ALL properly rejects columns
+# that exist in one CTE's source table but not in another's.
+# This should produce a "no such column" error, not a panic.
+do_execsql_test_in_memory_error_content select-cte-union-all-column-resolution {
+  CREATE TABLE t1(a, x);
+  CREATE TABLE t2(b);
+  INSERT INTO t1 VALUES(1, 2);
+  INSERT INTO t2 VALUES(3);
+  WITH cte1 AS (SELECT * FROM t1),
+       cte2 AS (SELECT *, x AS extra FROM t2)
+  SELECT * FROM cte1
+  UNION ALL
+  SELECT * FROM cte2;
+} {no such column: x}
+
 do_execsql_test_on_specific_db {:memory:} select-no-match-in-leaf-page {
     CREATE TABLE t (a INTEGER PRIMARY KEY, b);
     insert into t values (1, randomblob(1024));
