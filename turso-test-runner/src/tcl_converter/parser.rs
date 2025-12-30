@@ -5,6 +5,17 @@
 
 use chumsky::prelude::*;
 
+use crate::tcl_converter::utils::{
+    arg, braced, check_has_ddl, clean_name, clean_sql, comment, hpad, hspace, skip_line,
+};
+
+#[macro_export]
+macro_rules! text_parser {
+    ($lt:lifetime, $ty:ty) => {
+        impl Parser<$lt, &$lt str, $ty, extra::Err<Rich<$lt, char>>>
+    };
+}
+
 /// Result of converting a Tcl test file
 #[derive(Debug, Clone)]
 pub struct ConversionResult {
@@ -84,12 +95,6 @@ pub enum TclTestKind {
     AnyError,
 }
 
-macro_rules! text_parser {
-    ($lt:lifetime, $ty:ty) => {
-        impl Parser<$lt, &$lt str, $ty, extra::Err<Rich<$lt, char>>>
-    };
-}
-
 impl TclTest {
     /// Check if this test uses :memory: database
     pub fn uses_memory_db(&self) -> bool {
@@ -100,591 +105,363 @@ impl TclTest {
     pub fn uses_test_dbs(&self) -> bool {
         self.db.is_none()
     }
+}
 
-    /// Check if SQL contains DDL statements
-    fn check_has_ddl(sql: &str) -> bool {
-        let upper = sql.to_uppercase();
-        upper.contains("CREATE ")
-            || upper.contains("DROP ")
-            || upper.contains("ALTER ")
-            || upper.contains("INSERT ")
-            || upper.contains("UPDATE ")
-            || upper.contains("DELETE ")
+/// Configuration for building a test from parsed arguments
+#[derive(Debug, Clone)]
+struct TestConfig {
+    /// Database override (None = use default, Some = specific db)
+    db: Option<String>,
+    /// How to interpret the result argument
+    result_kind: ResultKind,
+    /// Argument layout
+    layout: ArgLayout,
+}
+
+/// How to interpret the result/expected argument
+#[derive(Debug, Clone, Copy)]
+enum ResultKind {
+    /// Exact match expected output
+    Exact,
+    /// Regex pattern match
+    Pattern,
+    /// Error with optional pattern
+    Error,
+    /// Any error (no result arg needed)
+    AnyError,
+}
+
+/// Argument layout for different test functions
+#[derive(Debug, Clone, Copy)]
+enum ArgLayout {
+    /// name {sql} {expected?}
+    Standard,
+    /// db name {sql} {expected?}
+    WithDb,
+}
+
+impl TestConfig {
+    fn standard() -> Self {
+        Self {
+            db: None,
+            result_kind: ResultKind::Exact,
+            layout: ArgLayout::Standard,
+        }
+    }
+
+    fn with_db(db: impl Into<String>) -> Self {
+        Self {
+            db: Some(db.into()),
+            result_kind: ResultKind::Exact,
+            layout: ArgLayout::Standard,
+        }
+    }
+
+    fn memory() -> Self {
+        Self::with_db(":memory:")
+    }
+
+    fn error(self) -> Self {
+        Self {
+            result_kind: ResultKind::Error,
+            ..self
+        }
+    }
+
+    fn any_error(self) -> Self {
+        Self {
+            result_kind: ResultKind::AnyError,
+            ..self
+        }
+    }
+
+    fn pattern(self) -> Self {
+        Self {
+            result_kind: ResultKind::Pattern,
+            ..self
+        }
+    }
+
+    fn db_from_arg(self) -> Self {
+        Self {
+            layout: ArgLayout::WithDb,
+            ..self
+        }
     }
 }
 
 /// Parser for Tcl test files
 pub struct TclParser<'a> {
     source_file: &'a str,
-    lines: Vec<&'a str>,
-    pos: usize,
+    content: &'a str,
 }
 
 impl<'a> TclParser<'a> {
     pub fn new(content: &'a str, source_file: &'a str) -> Self {
         Self {
             source_file,
-            lines: content.lines().collect(),
-            pos: 0,
+            content,
         }
     }
 
-    /// Parse the entire file
-    pub fn parse(&mut self) -> ConversionResult {
-        let mut tests = Vec::new();
-        let mut warnings = Vec::new();
-        let mut used_names: std::collections::HashSet<String> = std::collections::HashSet::new();
-        let mut pending_comments: Vec<String> = Vec::new();
-
-        while self.pos < self.lines.len() {
-            let line = self.lines[self.pos].trim();
-            let line_num = self.pos + 1;
-
-            // Skip empty lines (but keep pending comments - they might be for the next test)
-            if line.is_empty() {
-                self.pos += 1;
-                continue;
-            }
-
-            // Collect comments (except shebang)
-            if line.starts_with('#') && !line.starts_with("#!") {
-                pending_comments.push(line.to_string());
-                self.pos += 1;
-                continue;
-            }
-
-            // Skip shebang
-            if line.starts_with("#!/") {
-                self.pos += 1;
-                continue;
-            }
-
-            // Skip source and set directives
-            if line.starts_with("set ") || line.starts_with("source ") {
-                self.pos += 1;
-                continue;
-            }
-
-            // Skip proc definitions
-            if line.starts_with("proc ") {
-                warnings.push(ConversionWarning {
-                    line: line_num,
-                    kind: WarningKind::ProcSkipped,
-                    message: "Proc definition skipped".to_string(),
-                    source: line.to_string(),
-                });
-                self.skip_braced_block();
-                continue;
-            }
-
-            // Handle load_extension
-            if line.starts_with("load_extension") {
-                warnings.push(ConversionWarning {
-                    line: line_num,
-                    kind: WarningKind::ExtensionSkipped,
-                    message: "Extension loading not supported".to_string(),
-                    source: line.to_string(),
-                });
-                self.pos += 1;
-                continue;
-            }
-
-            // Handle foreach (generates multiple tests - skip with warning)
-            if line.starts_with("foreach ") {
-                warnings.push(ConversionWarning {
-                    line: line_num,
-                    kind: WarningKind::ForeachSkipped,
-                    message: "foreach loop skipped - generates parameterized tests".to_string(),
-                    source: self.get_foreach_preview(),
-                });
-                self.skip_braced_block();
-                continue;
-            }
-
-            // Handle if blocks (conditional tests - skip with warning)
-            if line.starts_with("if ") {
-                warnings.push(ConversionWarning {
-                    line: line_num,
-                    kind: WarningKind::IfBlockSkipped,
-                    message: "if block skipped - conditional tests need manual review".to_string(),
-                    source: self.get_foreach_preview(),
-                });
-                self.skip_braced_block();
-                continue;
-            }
-
-            // Try to parse test functions
-            if let Some(result) = self.try_parse_test(line, line_num) {
-                match result {
-                    Ok(mut test) => {
-                        // Attach pending comments to this test
-                        test.comments = std::mem::take(&mut pending_comments);
-
-                        // Deduplicate test names
-                        let base_name = test.name.clone();
-                        let mut final_name = base_name.clone();
-                        let mut counter = 2;
-
-                        while used_names.contains(&final_name) {
-                            final_name = format!("{}-{}", base_name, counter);
-                            counter += 1;
-                        }
-
-                        if final_name != test.name {
-                            test.name = final_name.clone();
-                        }
-
-                        used_names.insert(final_name);
-                        tests.push(test);
-                    }
-                    Err(warning) => {
-                        warnings.push(warning);
-                    }
-                }
-                continue;
-            }
-
-            // Unknown construct
-            if !line.is_empty()
-                && !line.starts_with("}")
-                && !line.starts_with("{")
-                && !line.starts_with("]")
-            {
-                // Only warn about substantial unknown content
-                if line.len() > 3 {
-                    warnings.push(ConversionWarning {
-                        line: line_num,
-                        kind: WarningKind::UnknownFunction,
-                        message: "Unknown construct".to_string(),
-                        source: line.chars().take(80).collect(),
-                    });
-                }
-            }
-
-            self.pos += 1;
-        }
-
-        ConversionResult {
-            tests,
-            warnings,
-            source_file: self.source_file.to_string(),
-            pending_comments,
-        }
-    }
-
-    /// Try to parse a test function call
-    fn try_parse_test(
-        &mut self,
-        line: &str,
-        line_num: usize,
-    ) -> Option<Result<TclTest, ConversionWarning>> {
-        // Match different test function patterns (order matters - more specific first)
-        if line.starts_with("do_execsql_test_on_specific_db") {
-            Some(self.parse_specific_db_test(line_num))
-        } else if line.starts_with("do_execsql_test_in_memory_error_content") {
-            Some(self.parse_memory_error_content_test(line_num))
-        } else if line.starts_with("do_execsql_test_in_memory_any_error") {
-            Some(self.parse_memory_any_error_test(line_num))
-        } else if line.starts_with("do_execsql_test_in_memory_error") {
-            Some(self.parse_memory_error_test(line_num))
-        } else if line.starts_with("do_execsql_test_error_content") {
-            Some(self.parse_error_content_test(line_num))
-        } else if line.starts_with("do_execsql_test_any_error") {
-            Some(self.parse_any_error_test(line_num))
-        } else if line.starts_with("do_execsql_test_error") {
-            Some(self.parse_error_test(line_num))
-        } else if line.starts_with("do_execsql_test_regex") {
-            Some(self.parse_regex_test(line_num))
-        } else if line.starts_with("do_execsql_test_tolerance") {
-            Some(self.parse_tolerance_test(line_num))
-        } else if line.starts_with("do_execsql_test_small") {
-            Some(self.parse_small_test(line_num))
-        } else if line.starts_with("do_execsql_test_skip_lines_on_specific_db") {
-            Some(self.parse_skip_lines_test(line_num))
-        } else if line.starts_with("do_execsql_test") {
-            Some(self.parse_basic_test(line_num))
-        } else {
-            None
-        }
-    }
-
-    /// Parse: do_execsql_test name { sql } { expected }
-    fn parse_basic_test(&mut self, line_num: usize) -> Result<TclTest, ConversionWarning> {
-        let content = self.collect_test_content();
-        let parts = Self::parse_test_args(&content, 2)?;
-
-        let name = Self::clean_name(&parts[0]);
-        let sql = Self::clean_sql(&parts[1]);
-        let expected = if parts.len() > 2 {
-            Self::clean_expected(&parts[2])
-        } else {
-            String::new()
-        };
-
-        let has_ddl = TclTest::check_has_ddl(&sql);
-
-        Ok(TclTest {
-            name,
-            sql,
-            kind: TclTestKind::Exact(expected),
-            db: None,
-            has_ddl,
-            comments: Vec::new(),
-        })
-    }
-
-    /// Parse: do_execsql_test_small name { sql } { expected }
-    fn parse_small_test(&mut self, line_num: usize) -> Result<TclTest, ConversionWarning> {
-        // Parse same as basic but mark as small db
-        let result = self.parse_basic_test(line_num);
-        match result {
-            Ok(mut test) => {
-                test.db = Some("testing/testing_small.db".to_string());
-                Ok(test)
-            }
-            Err(e) => Err(e),
-        }
-    }
-
-    /// Parse: do_execsql_test_on_specific_db db name { sql } { expected }
-    fn parse_specific_db_test(&mut self, line_num: usize) -> Result<TclTest, ConversionWarning> {
-        let content = self.collect_test_content();
-        let parts = Self::parse_test_args(&content, 3)?;
-
-        // Don't use clean_name for db path - just trim it
-        let db = parts[0].trim().to_string();
-        let name = Self::clean_name(&parts[1]);
-        let sql = Self::clean_sql(&parts[2]);
-        let expected = if parts.len() > 3 {
-            Self::clean_expected(&parts[3])
-        } else {
-            String::new()
-        };
-
-        let has_ddl = TclTest::check_has_ddl(&sql);
-
-        Ok(TclTest {
-            name,
-            sql,
-            kind: TclTestKind::Exact(expected),
-            db: Some(db),
-            has_ddl,
-            comments: Vec::new(),
-        })
-    }
-
-    /// Parse: do_execsql_test_error name { sql } { pattern }
-    fn parse_error_test(&mut self, line_num: usize) -> Result<TclTest, ConversionWarning> {
-        let content = self.collect_test_content();
-        let parts = Self::parse_test_args(&content, 2)?;
-
-        let name = Self::clean_name(&parts[0]);
-        let sql = Self::clean_sql(&parts[1]);
-        let pattern = if parts.len() > 2 {
-            Some(Self::clean_expected(&parts[2]))
-        } else {
-            None
-        };
-
-        let has_ddl = TclTest::check_has_ddl(&sql);
-
-        Ok(TclTest {
-            name,
-            sql,
-            kind: TclTestKind::Error(pattern),
-            db: None,
-            has_ddl,
-            comments: Vec::new(),
-        })
-    }
-
-    /// Parse: do_execsql_test_error_content name { sql } { error_text }
-    fn parse_error_content_test(&mut self, line_num: usize) -> Result<TclTest, ConversionWarning> {
-        self.parse_error_test(line_num)
-    }
-
-    /// Parse: do_execsql_test_any_error name { sql }
-    fn parse_any_error_test(&mut self, line_num: usize) -> Result<TclTest, ConversionWarning> {
-        let content = self.collect_test_content();
-        let parts = Self::parse_test_args(&content, 2)?;
-
-        let name = Self::clean_name(&parts[0]);
-        let sql = Self::clean_sql(&parts[1]);
-        let has_ddl = TclTest::check_has_ddl(&sql);
-
-        Ok(TclTest {
-            name,
-            sql,
-            kind: TclTestKind::AnyError,
-            db: None,
-            has_ddl,
-            comments: Vec::new(),
-        })
-    }
-
-    /// Parse: do_execsql_test_in_memory_error name { sql } { pattern }
-    fn parse_memory_error_test(&mut self, line_num: usize) -> Result<TclTest, ConversionWarning> {
-        let mut result = self.parse_error_test(line_num)?;
-        result.db = Some(":memory:".to_string());
-        Ok(result)
-    }
-
-    /// Parse: do_execsql_test_in_memory_error_content name { sql } { error_text }
-    fn parse_memory_error_content_test(
-        &mut self,
-        line_num: usize,
-    ) -> Result<TclTest, ConversionWarning> {
-        self.parse_memory_error_test(line_num)
-    }
-
-    /// Parse: do_execsql_test_in_memory_any_error name { sql }
-    fn parse_memory_any_error_test(
-        &mut self,
-        line_num: usize,
-    ) -> Result<TclTest, ConversionWarning> {
-        let mut result = self.parse_any_error_test(line_num)?;
-        result.db = Some(":memory:".to_string());
-        Ok(result)
-    }
-
-    /// Parse: do_execsql_test_regex name { sql } { pattern }
-    fn parse_regex_test(&mut self, line_num: usize) -> Result<TclTest, ConversionWarning> {
-        let content = self.collect_test_content();
-        let parts = Self::parse_test_args(&content, 2)?;
-
-        let name = Self::clean_name(&parts[0]);
-        let sql = Self::clean_sql(&parts[1]);
-        let pattern = if parts.len() > 2 {
-            Self::clean_expected(&parts[2])
-        } else {
-            ".*".to_string()
-        };
-
-        let has_ddl = TclTest::check_has_ddl(&sql);
-
-        Ok(TclTest {
-            name,
-            sql,
-            kind: TclTestKind::Pattern(pattern),
-            db: None,
-            has_ddl,
-            comments: Vec::new(),
-        })
-    }
-
-    /// Parse: do_execsql_test_tolerance name { sql } { expected } tolerance
-    fn parse_tolerance_test(&mut self, line_num: usize) -> Result<TclTest, ConversionWarning> {
-        Err(ConversionWarning {
-            line: line_num,
-            kind: WarningKind::ToleranceTest,
-            message: "Tolerance tests not supported - needs manual conversion".to_string(),
-            source: self.lines.get(self.pos - 1).unwrap_or(&"").to_string(),
-        })
-    }
-
-    /// Parse: do_execsql_test_skip_lines_on_specific_db skip db name { sql } { expected }
-    fn parse_skip_lines_test(&mut self, line_num: usize) -> Result<TclTest, ConversionWarning> {
-        let _ = self.collect_test_content();
-        Err(ConversionWarning {
-            line: line_num,
-            kind: WarningKind::SkipLinesTest,
-            message: "Skip lines tests not supported - needs manual conversion".to_string(),
-            source: self.lines.get(self.pos - 1).unwrap_or(&"").to_string(),
-        })
-    }
-
-    /// Skip a braced block (foreach, proc, etc.)
-    fn skip_braced_block(&mut self) {
-        let mut brace_depth = 0;
-        let mut started = false;
-
-        while self.pos < self.lines.len() {
-            let line = self.lines[self.pos];
-
-            for ch in line.chars() {
-                if ch == '{' {
-                    brace_depth += 1;
-                    started = true;
-                } else if ch == '}' {
-                    brace_depth -= 1;
-                }
-            }
-
-            self.pos += 1;
-
-            if started && brace_depth == 0 {
-                break;
-            }
-        }
-    }
-
-    /// Get a preview of a foreach block for the warning
-    fn get_foreach_preview(&self) -> String {
-        let mut preview = String::new();
-        let start = self.pos;
-        let end = (start + 5).min(self.lines.len());
-
-        for i in start..end {
-            if !preview.is_empty() {
-                preview.push('\n');
-            }
-            preview.push_str(self.lines[i]);
-        }
-
-        if end < self.lines.len() {
-            preview.push_str("\n...");
-        }
-
-        preview
-    }
-
-    /// Parse a Tcl list string into its elements
-    /// Handles: {element1} {element2}, plain words, multiline braced elements
-    fn parse_tcl_list(s: &str) -> Vec<String> {
-        let mut elements = Vec::new();
-        let mut chars = s.chars().peekable();
-        let mut current = String::new();
-
-        while let Some(ch) = chars.next() {
-            match ch {
-                '{' => {
-                    // Start of braced element - find matching close brace
-                    let mut depth = 1;
-                    let mut content = String::new();
-                    while let Some(inner) = chars.next() {
-                        if inner == '{' {
-                            depth += 1;
-                            content.push(inner);
-                        } else if inner == '}' {
-                            depth -= 1;
-                            if depth == 0 {
-                                break;
-                            }
-                            content.push(inner);
-                        } else {
-                            content.push(inner);
-                        }
-                    }
-                    // Push any accumulated non-braced content first
-                    if !current.trim().is_empty() {
-                        elements.push(current.trim().to_string());
-                        current = String::new();
-                    }
-                    elements.push(content);
-                }
-                ' ' | '\t' if current.is_empty() => {
-                    // Skip leading whitespace between elements
-                }
-                ' ' | '\t' => {
-                    // End of unbraced word - but only if not inside a line
-                    // For simple values, treat the whole line as one element
-                    current.push(ch);
-                }
-                '\n' => {
-                    // Newline separates elements in unbraced content
-                    if !current.trim().is_empty() {
-                        elements.push(current.trim().to_string());
-                    }
-                    current = String::new();
-                }
-                _ => {
-                    current.push(ch);
-                }
-            }
-        }
-
-        // Don't forget remaining content
-        if !current.trim().is_empty() {
-            elements.push(current.trim().to_string());
-        }
-
-        // If no elements were found, return the whole string as one element
-        if elements.is_empty() && !s.trim().is_empty() {
-            elements.push(s.trim().to_string());
-        }
-
-        elements
+    /// Parse the entire file using the chumsky-based parser
+    pub fn parse(self) -> ConversionResult {
+        parse_tcl_file(self.content, self.source_file)
     }
 }
 
-fn parse_basic_test<'a>() -> text_parser!('a, TclTest) {
-    let args_parser = test_args_parser();
-
-    args_parser.try_map(|args, span| {
-        if args.len() < 2 {
-            return Err(Rich::custom(
-                span,
-                format!("Expected at least 2 args, got {}", args.len()),
-            ));
+/// Build a TclTest from parsed arguments using the given config
+fn build_test(args: Vec<String>, config: TestConfig) -> Result<TclTest, String> {
+    let (db, name_idx) = match config.layout {
+        ArgLayout::Standard => (config.db, 0),
+        ArgLayout::WithDb => {
+            if args.is_empty() {
+                return Err("Expected db argument".to_string());
+            }
+            (Some(args[0].trim().to_string()), 1)
         }
-        let name = clean_name(&args[0]);
-        let sql = clean_sql(&args[1]);
-        let expected = if args.len() > 2 {
-            clean_expected(&args[2])
-        } else {
-            String::new()
-        };
-        let has_ddl = TclTest::check_has_ddl(&sql);
-        Ok(TclTest {
-            name,
-            sql,
-            kind: TclTestKind::Exact(expected),
-            db: None,
-            has_ddl,
-            comments: Vec::new(),
-        })
+    };
+
+    let min_args = name_idx + 2; // name + sql minimum
+    if args.len() < min_args {
+        return Err(format!(
+            "Expected at least {} arguments, got {}",
+            min_args,
+            args.len()
+        ));
+    }
+
+    let name = clean_name(&args[name_idx]);
+    let sql = clean_sql(&args[name_idx + 1]);
+    let result_arg = args.get(name_idx + 2).map(|s| clean_expected(s));
+    let has_ddl = check_has_ddl(&sql);
+
+    let kind = match config.result_kind {
+        ResultKind::Exact => TclTestKind::Exact(result_arg.unwrap_or_default()),
+        ResultKind::Pattern => TclTestKind::Pattern(result_arg.unwrap_or_else(|| ".*".to_string())),
+        ResultKind::Error => TclTestKind::Error(result_arg),
+        ResultKind::AnyError => TclTestKind::AnyError,
+    };
+
+    Ok(TclTest {
+        name,
+        sql,
+        kind,
+        db,
+        has_ddl,
+        comments: Vec::new(),
     })
 }
 
-/// Parse test arguments from collected content using chumsky
-fn test_args_parser<'a>() -> text_parser!('a, Vec<String>) {
-    // Parser for whitespace
-    let ws = any::<&str, _>()
-        .filter(|c: &char| c.is_whitespace())
-        .repeated();
+/// Create a parser for a specific test function
+fn test_fn<'a>(keyword: &'a str, config: TestConfig) -> text_parser!('a, TclTest) {
+    just(keyword)
+        .then_ignore(hspace())
+        .ignore_then(hpad(arg()).repeated().collect::<Vec<String>>())
+        .try_map(move |args, span| {
+            build_test(args, config.clone()).map_err(|msg| Rich::custom(span, msg))
+        })
+}
 
-    // Parser for braced content with nested braces
-    let braced = recursive_brace();
+/// Parser for all test function types
+/// Order matters - longer/more specific keywords first!
+pub fn test_parser<'a>() -> text_parser!('a, TclTest) {
+    choice((
+        // Specific DB tests
+        test_fn(
+            "do_execsql_test_skip_lines_on_specific_db",
+            TestConfig::standard().db_from_arg(),
+        ),
+        test_fn(
+            "do_execsql_test_on_specific_db",
+            TestConfig::standard().db_from_arg(),
+        ),
+        // In-memory error tests
+        test_fn(
+            "do_execsql_test_in_memory_error_content",
+            TestConfig::memory().error(),
+        ),
+        test_fn(
+            "do_execsql_test_in_memory_any_error",
+            TestConfig::memory().any_error(),
+        ),
+        test_fn(
+            "do_execsql_test_in_memory_error",
+            TestConfig::memory().error(),
+        ),
+        // Error tests
+        test_fn(
+            "do_execsql_test_error_content",
+            TestConfig::standard().error(),
+        ),
+        test_fn(
+            "do_execsql_test_any_error",
+            TestConfig::standard().any_error(),
+        ),
+        test_fn("do_execsql_test_error", TestConfig::standard().error()),
+        // Special tests
+        test_fn("do_execsql_test_regex", TestConfig::standard().pattern()),
+        test_fn(
+            "do_execsql_test_tolerance",
+            TestConfig::standard(), // Will need special handling
+        ),
+        test_fn(
+            "do_execsql_test_small",
+            TestConfig::with_db("testing/testing_small.db"),
+        ),
+        // Basic test (must be last - shortest keyword)
+        test_fn("do_execsql_test", TestConfig::standard()),
+    ))
+}
 
-    // Parser for quoted strings
-    let quoted = just('"')
-        .ignore_then(
-            any()
-                .filter(|c: &char| *c != '"')
-                .repeated()
-                .collect::<String>(),
-        )
-        .then_ignore(just('"'));
+/// Type of skipped content
+#[derive(Debug, Clone)]
+pub enum SkipKind {
+    Foreach,
+    If,
+    Proc,
+    Line, // set, source, etc.
+    Unknown,
+}
 
-    // Parser for unbraced words (no whitespace, braces, or quotes)
-    let word = any()
-        .filter(|c: &char| !c.is_whitespace() && *c != '{' && *c != '}' && *c != '"')
-        .repeated()
-        .at_least(1)
-        .collect::<String>();
+/// Item parsed from Tcl file
+#[derive(Debug, Clone)]
+pub enum TclItem {
+    Test(TclTest),
+    Comment(String),
+    Skip(SkipKind, String), // kind and preview of content
+}
 
-    // Parser for a single argument
-    let arg = choice((braced, quoted, word));
+impl TclItem {
+    #[inline]
+    fn comment(s: impl Into<String>) -> Self {
+        Self::Comment(s.into())
+    }
+}
 
-    // Parser for function name (skip it)
-    let func_name = any()
-        .filter(|c: &char| !c.is_whitespace() && *c != '{')
-        .repeated();
+/// Full file parser
+pub fn tcl_file_parser<'a>() -> text_parser!('a, Vec<TclItem>) {
+    // Skip block parsers that capture preview text
+    let foreach_block = just("foreach")
+        .ignore_then(braced())
+        .map(|preview| TclItem::Skip(SkipKind::Foreach, format!("foreach{}", preview)));
 
-    // Full parser: skip whitespace, function name, whitespace, then collect args
-    let parser = ws
-        .ignore_then(func_name)
-        .ignore_then(ws)
-        .ignore_then(arg.padded().repeated().collect::<Vec<_>>());
+    let if_block = just("if")
+        .ignore_then(braced())
+        .map(|preview| TclItem::Skip(SkipKind::If, format!("if{}", preview)));
 
-    parser
+    let proc_block = just("proc")
+        .ignore_then(braced())
+        .map(|preview| TclItem::Skip(SkipKind::Proc, format!("proc{}", preview)));
+
+    let item = choice((
+        test_parser().map(TclItem::Test),
+        comment().map(TclItem::comment),
+        foreach_block,
+        if_block,
+        proc_block,
+        skip_line().to(TclItem::Skip(SkipKind::Line, String::new())),
+        // Skip unknown lines
+        none_of('\n')
+            .repeated()
+            .at_least(1)
+            .collect::<String>()
+            .map(|s| TclItem::Skip(SkipKind::Unknown, s)),
+    ));
+
+    item.separated_by(just('\n').repeated())
+        .allow_leading()
+        .allow_trailing()
+        .collect()
+}
+
+/// Parse a Tcl file and extract tests with comments
+pub fn parse_tcl_file(content: &str, source_file: &str) -> ConversionResult {
+    let (items, errors) = tcl_file_parser().parse(content).into_output_errors();
+
+    let mut tests = Vec::new();
+    let mut warnings = Vec::new();
+    let mut pending_comments = Vec::new();
+    let mut used_names = std::collections::HashSet::new();
+
+    if let Some(items) = items {
+        for item in items {
+            match item {
+                TclItem::Test(mut test) => {
+                    // Attach pending comments
+                    test.comments = std::mem::take(&mut pending_comments);
+
+                    // Deduplicate names
+                    let base_name = test.name.clone();
+                    let mut final_name = base_name.clone();
+                    let mut counter = 2;
+                    while used_names.contains(&final_name) {
+                        final_name = format!("{}-{}", base_name, counter);
+                        counter += 1;
+                    }
+                    test.name = final_name.clone();
+                    used_names.insert(final_name);
+
+                    tests.push(test);
+                }
+                TclItem::Comment(c) => {
+                    pending_comments.push(c);
+                }
+                TclItem::Skip(kind, preview) => {
+                    // Generate warning for skipped content
+                    let (warning_kind, message) = match kind {
+                        SkipKind::Foreach => (
+                            WarningKind::ForeachSkipped,
+                            "foreach loop skipped - generates parameterized tests".to_string(),
+                        ),
+                        SkipKind::If => (
+                            WarningKind::IfBlockSkipped,
+                            "if block skipped - conditional tests need manual review".to_string(),
+                        ),
+                        SkipKind::Proc => (
+                            WarningKind::ProcSkipped,
+                            "Proc definition skipped".to_string(),
+                        ),
+                        SkipKind::Line | SkipKind::Unknown => {
+                            // Don't generate warnings for simple skips
+                            continue;
+                        }
+                    };
+
+                    warnings.push(ConversionWarning {
+                        line: 0,
+                        kind: warning_kind,
+                        message,
+                        source: preview.chars().take(100).collect(),
+                    });
+                }
+            }
+        }
+    }
+
+    // Add parse errors as warnings
+    for e in errors {
+        warnings.push(ConversionWarning {
+            line: 0,
+            kind: WarningKind::ParseError,
+            message: e.to_string(),
+            source: String::new(),
+        });
+    }
+
+    ConversionResult {
+        tests,
+        warnings,
+        source_file: source_file.to_string(),
+        pending_comments,
+    }
 }
 
 /// Parse a Tcl list string into its elements
 /// Handles: {element1} {element2}, plain words, multiline braced elements
 fn parse_tcl_list<'a>() -> text_parser!('a, Vec<String>) {
     // Braced: {content with {nested} braces}
-    let braced = recursive_brace();
+    let braced = braced();
 
     // Line of unbraced text (newline-terminated)
     let unbraced = none_of("{}\n")
@@ -693,11 +470,8 @@ fn parse_tcl_list<'a>() -> text_parser!('a, Vec<String>) {
         .collect::<String>()
         .map(|s| s.trim().to_string());
 
-    // Horizontal whitespace only
-    let hspace = one_of(" \t").repeated();
-
     // An element on a line
-    let line_element = hspace.ignore_then(choice((braced, unbraced)));
+    let line_element = hspace().ignore_then(choice((braced, unbraced)));
 
     // Multiple elements can be on same line or different lines
     line_element
@@ -706,84 +480,6 @@ fn parse_tcl_list<'a>() -> text_parser!('a, Vec<String>) {
         .allow_trailing()
         .collect::<Vec<_>>()
         .map(|v| v.into_iter().filter(|s| !s.is_empty()).collect())
-}
-
-/// Parser that parses content that can be recursively delimted by braces
-fn recursive_brace<'a>() -> text_parser!('a, String) {
-    recursive(|braced| {
-        choice((
-            braced.map(|s: String| format!("{{{}}}", s)),
-            none_of("{}").map(|c: char| c.to_string()),
-        ))
-        .repeated()
-        .collect::<Vec<_>>()
-        .map(|v| v.join(""))
-        .delimited_by(just('{'), just('}'))
-    })
-}
-
-/// Clean up a test name (remove quotes, convert invalid chars)
-fn clean_name(s: &str) -> String {
-    let name = s
-        .trim()
-        .trim_matches('"')
-        .trim_matches('\'')
-        .trim_matches('{')
-        .trim_matches('}');
-
-    // Replace characters not allowed in identifiers
-    let mut result = String::new();
-    for ch in name.chars() {
-        match ch {
-            'a'..='z' | 'A'..='Z' | '0'..='9' | '_' | '-' => result.push(ch),
-            '.' => result.push('_'), // Replace dots with underscore
-            ':' => result.push('_'), // Replace colons with underscore
-            ' ' => result.push('-'), // Replace spaces with hyphen
-            _ => {}                  // Skip other invalid chars
-        }
-    }
-
-    // Ensure name starts with a letter or underscore
-    if result.is_empty() {
-        return "unnamed-test".to_string();
-    }
-
-    if result
-        .chars()
-        .next()
-        .map(|c| c.is_ascii_digit())
-        .unwrap_or(false)
-    {
-        result = format!("test-{}", result);
-    }
-
-    result
-}
-
-/// Clean up SQL (normalize whitespace, preserve comments)
-fn clean_sql(s: &str) -> String {
-    let mut result = String::new();
-    let mut prev_was_empty = false;
-
-    for line in s.lines() {
-        let trimmed = line.trim();
-
-        if trimmed.is_empty() {
-            // Collapse multiple empty lines into one
-            if !prev_was_empty && !result.is_empty() {
-                result.push('\n');
-                prev_was_empty = true;
-            }
-        } else {
-            if !result.is_empty() && !prev_was_empty {
-                result.push('\n');
-            }
-            result.push_str(trimmed);
-            prev_was_empty = false;
-        }
-    }
-
-    result
 }
 
 /// Clean up expected output (convert Tcl list format to pipe-separated)

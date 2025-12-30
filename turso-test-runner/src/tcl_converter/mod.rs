@@ -4,6 +4,7 @@
 //! Tcl-based test format to the new `.sqltest` DSL format.
 
 mod parser;
+mod utils;
 
 pub use parser::{
     ConversionResult, ConversionWarning, TclParser, TclTest, TclTestKind, WarningKind,
@@ -14,7 +15,7 @@ use std::fmt::Write;
 
 /// Convert a Tcl test file content to the .sqltest format
 pub fn convert(content: &str, source_file: &str) -> ConversionResult {
-    let mut parser = TclParser::new(content, source_file);
+    let parser = TclParser::new(content, source_file);
     parser.parse()
 }
 
