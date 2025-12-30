@@ -714,20 +714,35 @@ impl<'a> TclParser<'a> {
         // First, strip outer quotes if the entire content is wrapped in them
         // This handles {"content"} where we get "content" after brace extraction
         let s = s.trim();
-        let s = if s.starts_with('"') && s.ends_with('"') && s.len() >= 2 {
+        let was_quoted = s.starts_with('"') && s.ends_with('"') && s.len() >= 2;
+        let s = if was_quoted {
             &s[1..s.len() - 1]
         } else {
             s
         };
 
+        // Parse the whole content as a Tcl list (handles multiline braced elements)
+        let elements = Self::parse_tcl_list(s);
+
         let mut result = String::new();
 
-        for line in s.lines() {
-            let trimmed = line.trim();
-            if !trimmed.is_empty() {
+        for element in elements {
+            // Each element may contain newlines - split into rows
+            for line in element.lines() {
+                let trimmed = if was_quoted {
+                    line.trim_start()
+                } else {
+                    line.trim()
+                };
+
+                if trimmed.is_empty() {
+                    continue;
+                }
+
                 if !result.is_empty() {
                     result.push('\n');
                 }
+
                 // Handle Tcl escapes
                 let unescaped = trimmed
                     .replace("\\\"", "\"")
@@ -742,6 +757,74 @@ impl<'a> TclParser<'a> {
         }
 
         result
+    }
+
+    /// Parse a Tcl list string into its elements
+    /// Handles: {element1} {element2}, plain words, multiline braced elements
+    fn parse_tcl_list(s: &str) -> Vec<String> {
+        let mut elements = Vec::new();
+        let mut chars = s.chars().peekable();
+        let mut current = String::new();
+
+        while let Some(ch) = chars.next() {
+            match ch {
+                '{' => {
+                    // Start of braced element - find matching close brace
+                    let mut depth = 1;
+                    let mut content = String::new();
+                    while let Some(inner) = chars.next() {
+                        if inner == '{' {
+                            depth += 1;
+                            content.push(inner);
+                        } else if inner == '}' {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                            content.push(inner);
+                        } else {
+                            content.push(inner);
+                        }
+                    }
+                    // Push any accumulated non-braced content first
+                    if !current.trim().is_empty() {
+                        elements.push(current.trim().to_string());
+                        current = String::new();
+                    }
+                    elements.push(content);
+                }
+                ' ' | '\t' if current.is_empty() => {
+                    // Skip leading whitespace between elements
+                }
+                ' ' | '\t' => {
+                    // End of unbraced word - but only if not inside a line
+                    // For simple values, treat the whole line as one element
+                    current.push(ch);
+                }
+                '\n' => {
+                    // Newline separates elements in unbraced content
+                    if !current.trim().is_empty() {
+                        elements.push(current.trim().to_string());
+                    }
+                    current = String::new();
+                }
+                _ => {
+                    current.push(ch);
+                }
+            }
+        }
+
+        // Don't forget remaining content
+        if !current.trim().is_empty() {
+            elements.push(current.trim().to_string());
+        }
+
+        // If no elements were found, return the whole string as one element
+        if elements.is_empty() && !s.trim().is_empty() {
+            elements.push(s.trim().to_string());
+        }
+
+        elements
     }
 }
 

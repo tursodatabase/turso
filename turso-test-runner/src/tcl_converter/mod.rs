@@ -84,11 +84,26 @@ pub fn generate_sqltest(result: &ConversionResult) -> String {
         // Write expectation
         match &test.kind {
             TclTestKind::Exact(expected) => {
-                writeln!(output, "expect {{").unwrap();
-                for line in expected.lines() {
-                    let trimmed = line.trim();
-                    if !trimmed.is_empty() {
-                        writeln!(output, "    {}", trimmed).unwrap();
+                // Check if any line has significant trailing whitespace
+                let needs_raw = expected.lines().any(|line| {
+                    let trimmed = line.trim_end();
+                    trimmed != line && !trimmed.is_empty()
+                });
+
+                if needs_raw {
+                    // Raw mode: no indentation, preserves whitespace exactly
+                    writeln!(output, "expect raw {{").unwrap();
+                    for line in expected.lines() {
+                        if !line.is_empty() {
+                            writeln!(output, "{}", line).unwrap();
+                        }
+                    }
+                } else {
+                    writeln!(output, "expect {{").unwrap();
+                    for line in expected.lines() {
+                        if !line.is_empty() {
+                            writeln!(output, "    {}", line).unwrap();
+                        }
                     }
                 }
                 writeln!(output, "}}").unwrap();
