@@ -13,7 +13,7 @@ use crate::storage::database::DatabaseFile;
 use crate::storage::journal_mode;
 use crate::storage::page_cache::PageCache;
 use crate::storage::pager::{default_page1, CreateBTreeFlags, PageRef};
-use crate::storage::sqlite3_ondisk::{read_varint_fast, DatabaseHeader, PageSize, RawVersion};
+use crate::storage::sqlite3_ondisk::{read_varint, DatabaseHeader, PageSize, RawVersion};
 use crate::translate::collate::CollationSeq;
 use crate::types::{
     compare_immutable, compare_records_generic, AsValueRef, Extendable, IOCompletions,
@@ -52,6 +52,7 @@ use crate::{
     translate::emitter::TransactionMode,
 };
 use crate::{get_cursor, CheckpointMode, Completion, Connection, DatabaseStorage, MvCursor};
+use branches::unlikely;
 use either::Either;
 use std::any::Any;
 use std::env::temp_dir;
@@ -1519,32 +1520,20 @@ pub fn op_column(
 
                             let record_cursor = record.cursor();
 
-                            if record_cursor.offsets.is_empty() {
-                                let (header_size, header_len_bytes) = read_varint_fast(payload)?;
-                                let header_size = header_size as usize;
-
-                                debug_assert!(header_size <= payload.len() && header_size <= 98307, "header_size: {header_size}, header_len_bytes: {header_len_bytes}, payload.len(): {}", payload.len());
-
-                                record_cursor.header_size = header_size;
-                                record_cursor.header_offset = header_len_bytes;
-                                record_cursor.offsets.push(header_size);
-                            }
+                            let mut data_offset = if unlikely(record_cursor.is_uninitialized()) {
+                                record_cursor.init_header(payload)?
+                            } else {
+                                record_cursor.last_offset()
+                            };
 
                             let target_column = *column;
                             let mut parse_pos = record_cursor.header_offset;
-                            let mut data_offset = record_cursor
-                                .offsets
-                                .last()
-                                .copied()
-                                .expect("header_offset must be set");
 
                             // Parse the header for serial types incrementally until we have the target column
-                            while record_cursor.serial_types.len() <= target_column
+                            while record_cursor.serials_offsets.len() <= target_column
                                 && parse_pos < record_cursor.header_size
                             {
-                                let (serial_type, varint_len) =
-                                    read_varint_fast(&payload[parse_pos..])?;
-                                record_cursor.serial_types.push(serial_type);
+                                let (serial_type, varint_len) = read_varint(&payload[parse_pos..])?;
                                 parse_pos += varint_len;
                                 let data_size = match serial_type {
                                     // NULL
@@ -1580,7 +1569,9 @@ pub fn op_column(
                                     _ => unreachable!("Invalid serial type: {serial_type}"),
                                 } as usize;
                                 data_offset += data_size;
-                                record_cursor.offsets.push(data_offset);
+                                record_cursor
+                                    .serials_offsets
+                                    .push((serial_type, data_offset));
                             }
 
                             debug_assert!(
@@ -1589,19 +1580,24 @@ pub fn op_column(
                                 record_cursor.header_size
                             );
                             record_cursor.header_offset = parse_pos;
-                            if target_column >= record_cursor.serial_types.len() {
+                            if target_column >= record_cursor.serials_offsets.len() {
                                 break 'ifnull;
                             }
 
-                            let start_offset = record_cursor.offsets[target_column];
-                            let end_offset = record_cursor.offsets[target_column + 1];
+                            let (serial_type, end_offset) =
+                                record_cursor.serials_offsets[target_column];
+                            let start_offset = if target_column == 0 {
+                                record_cursor.header_size
+                            } else {
+                                record_cursor.serials_offsets[target_column - 1].1
+                            };
                             // SAFETY: We know that the payload is valid until the next row is processed.
                             let buf = unsafe {
                                 std::mem::transmute::<&[u8], &'static [u8]>(
                                     &payload[start_offset..end_offset],
                                 )
                             };
-                            let serial_type = record_cursor.serial_types[target_column];
+                            let serial_type = record_cursor.serials_offsets[target_column].0;
 
                             match serial_type {
                                 // NULL

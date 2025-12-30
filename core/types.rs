@@ -1,3 +1,4 @@
+use branches::unlikely;
 use either::Either;
 #[cfg(feature = "serde")]
 use serde::Deserialize;
@@ -1187,7 +1188,7 @@ impl ImmutableRecord {
         }
         let cursor = self.cursor();
         cursor.parse_full_header(self).unwrap();
-        let last_idx = cursor.serial_types.len().checked_sub(1)?;
+        let last_idx = cursor.serials_offsets.len().checked_sub(1)?;
         Some(cursor.deserialize_column(self, last_idx))
     }
 
@@ -1205,7 +1206,7 @@ impl ImmutableRecord {
 
         match cursor.ensure_parsed_upto(self, idx) {
             Ok(()) => {
-                if idx >= cursor.serial_types.len() {
+                if idx >= cursor.serials_offsets.len() {
                     return None;
                 }
 
@@ -1218,7 +1219,7 @@ impl ImmutableRecord {
     pub fn column_count(&self) -> usize {
         let cursor = self.cursor();
         cursor.parse_full_header(self).unwrap();
-        cursor.serial_types.len()
+        cursor.serials_offsets.len()
     }
 
     /// Get direct access to the embedded cursor for lazy parsing.
@@ -1249,14 +1250,12 @@ impl ImmutableRecord {
 /// - **Data section**: The actual field data in the same order as serial types
 #[derive(Debug, Default)]
 pub struct RecordCursor {
-    /// Parsed serial type values for each column.
-    /// Serial types encode both the data type and size information.
-    pub serial_types: Vec<u64>,
-    /// Byte offsets where each column's data begins in the record payload.
-    /// Always has one more entry than `serial_types` (the final offset marks the end).
-    pub offsets: Vec<usize>,
     /// Total size of the record header in bytes.
     pub header_size: usize,
+    /// Tuple of parsed serial type values for each column and byte offsets where each
+    /// column's data begins in the record payload.
+    /// Serial types encode both the data type and size information.
+    pub serials_offsets: Vec<(u64, usize)>,
     /// Current parsing position within the header section.
     pub header_offset: usize,
 }
@@ -1264,8 +1263,7 @@ pub struct RecordCursor {
 impl RecordCursor {
     pub fn new() -> Self {
         Self {
-            serial_types: Vec::new(),
-            offsets: Vec::new(),
+            serials_offsets: Vec::new(),
             header_size: 0,
             header_offset: 0,
         }
@@ -1273,26 +1271,41 @@ impl RecordCursor {
 
     pub fn with_capacity(num_columns: usize) -> Self {
         Self {
-            serial_types: Vec::with_capacity(num_columns),
-            offsets: Vec::with_capacity(num_columns + 1),
+            serials_offsets: Vec::with_capacity(num_columns),
             header_size: 0,
             header_offset: 0,
         }
     }
 
     pub fn invalidate(&mut self) {
-        self.serial_types.clear();
-        self.offsets.clear();
+        self.serials_offsets.clear();
         self.header_size = 0;
         self.header_offset = 0;
     }
 
-    pub fn is_invalidated(&self) -> bool {
-        self.serial_types.is_empty() && self.offsets.is_empty()
+    pub fn is_uninitialized(&self) -> bool {
+        self.header_size == 0
     }
 
     pub fn parse_full_header(&mut self, record: &ImmutableRecord) -> Result<()> {
         self.ensure_parsed_upto(record, MAX_COLUMN)
+    }
+
+    #[inline(always)]
+    pub fn last_offset(&self) -> usize {
+        if let Some((_, offset)) = self.serials_offsets.last() {
+            *offset
+        } else {
+            self.header_size
+        }
+    }
+
+    #[inline]
+    pub fn init_header(&mut self, payload: &[u8]) -> Result<usize> {
+        let (header_size, bytes_read) = read_varint(payload)?;
+        self.header_size = header_size as usize;
+        self.header_offset = bytes_read;
+        Ok(header_size as usize)
     }
 
     /// Ensures the header is parsed up to (and including) the target column index.
@@ -1329,27 +1342,23 @@ impl RecordCursor {
             return Ok(());
         }
 
-        // Parse header size and initialize parsing
-        if self.serial_types.is_empty() && self.offsets.is_empty() {
-            let (header_size, bytes_read) = read_varint(payload)?;
-            self.header_size = header_size as usize;
-            self.header_offset = bytes_read;
-            self.offsets.push(self.header_size); // First column starts after header
-        }
-
+        let mut prev_offset = if unlikely(self.is_uninitialized()) {
+            self.init_header(payload)?
+        } else {
+            self.last_offset()
+        };
         // Parse serial types incrementally
-        while self.serial_types.len() <= target_idx
+        while self.serials_offsets.len() <= target_idx
             && self.header_offset < self.header_size
             && self.header_offset < payload.len()
         {
             let (serial_type, read_bytes) = read_varint(&payload[self.header_offset..])?;
-            self.serial_types.push(serial_type);
             self.header_offset += read_bytes;
 
             let serial_type_obj = SerialType::try_from(serial_type)?;
             let data_size = serial_type_obj.size();
-            let prev_offset = *self.offsets.last().unwrap();
-            self.offsets.push(prev_offset + data_size);
+            prev_offset += data_size;
+            self.serials_offsets.push((serial_type, prev_offset));
         }
 
         Ok(())
@@ -1379,11 +1388,11 @@ impl RecordCursor {
         record: &'a ImmutableRecord,
         idx: usize,
     ) -> Result<ValueRef<'a>> {
-        if idx >= self.serial_types.len() {
+        if idx >= self.serials_offsets.len() {
             return Ok(ValueRef::Null);
         }
 
-        let serial_type = self.serial_types[idx];
+        let (serial_type, end) = self.serials_offsets[idx];
         let serial_type_obj = SerialType::try_from(serial_type)?;
 
         match serial_type_obj.kind() {
@@ -1393,13 +1402,12 @@ impl RecordCursor {
             _ => {} // continue
         }
 
-        if idx + 1 >= self.offsets.len() {
-            return Ok(ValueRef::Null);
-        }
-
-        let start = self.offsets[idx];
-        let end = self.offsets[idx + 1];
         let payload = record.get_payload();
+        let start = if unlikely(idx == 0) {
+            self.header_size
+        } else {
+            self.serials_offsets[idx - 1].1
+        };
 
         let slice = &payload[start..end];
         let (value, _) = crate::storage::sqlite3_ondisk::read_value(slice, serial_type_obj)?;
@@ -1481,7 +1489,7 @@ impl RecordCursor {
         }
 
         let _ = self.parse_full_header(record);
-        self.serial_types.len()
+        self.serials_offsets.len()
     }
 
     /// Alias for `count()`. Returns the number of columns in the record.
@@ -1531,7 +1539,7 @@ impl RecordCursor {
                         return Some(Err(err));
                     }
                 }
-                if !self.record.is_invalidated() && self.idx < self.cursor.serial_types.len() {
+                if !self.record.is_invalidated() && self.idx < self.cursor.serials_offsets.len() {
                     let res = self.cursor.deserialize_column(self.record, self.idx);
                     self.idx += 1;
                     Some(res)
@@ -1543,7 +1551,7 @@ impl RecordCursor {
 
         impl<'a, 'b> ExactSizeIterator for GetValues<'a, 'b> {
             fn len(&self) -> usize {
-                self.cursor.serial_types.len() - self.idx
+                self.cursor.serials_offsets.len() - self.idx
             }
         }
 
@@ -3395,36 +3403,18 @@ mod tests {
             .parse_full_header(&record)
             .expect("Failed to parse full header");
 
-        assert_eq!(
-            cursor1.offsets.len(),
-            cursor1.serial_types.len() + 1,
-            "offsets should be one longer than serial_types"
-        );
-
-        for i in 0..values.len() {
-            cursor1
-                .deserialize_column(&record, i)
-                .expect("Failed to deserialize column");
-        }
-
         // Incremental Parsing
         let mut cursor2 = RecordCursor::new();
         cursor2
             .ensure_parsed_upto(&record, 2)
             .expect("Failed to parse up to column 2");
 
-        assert_eq!(
-            cursor2.offsets.len(),
-            cursor2.serial_types.len() + 1,
-            "offsets should be one longer than serial_types"
-        );
-
         cursor2.get_value(&record, 2).expect("Column 2 failed");
 
         // Access column 0 (already parsed)
-        let before = cursor2.serial_types.len();
+        let before = cursor2.serials_offsets.len();
         cursor2.get_value(&record, 0).expect("Column 0 failed");
-        let after = cursor2.serial_types.len();
+        let after = cursor2.serials_offsets.len();
         assert_eq!(before, after, "Should not parse more");
 
         // Access column 5 (forces full parse)
@@ -3441,10 +3431,9 @@ mod tests {
         }
 
         assert_eq!(
-            cursor1.serial_types, cursor2.serial_types,
-            "serial_types must match"
+            cursor1.serials_offsets, cursor2.serials_offsets,
+            "entries must match"
         );
-        assert_eq!(cursor1.offsets, cursor2.offsets, "offsets must match");
     }
 
     #[test]

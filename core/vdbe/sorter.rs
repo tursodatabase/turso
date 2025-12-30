@@ -671,8 +671,8 @@ impl SortableImmutableRecord {
         let mut cursor = RecordCursor::with_capacity(key_len);
         cursor.ensure_parsed_upto(&record, key_len - 1)?;
         turso_assert!(
-            index_key_info.len() >= cursor.serial_types.len(),
-            "index_key_info.len() < cursor.serial_types.len()"
+            index_key_info.len() >= cursor.serials_offsets.len(),
+            "index_key_info.len() < cursor.serials_offsets.len()"
         );
 
         // Pre-compute all key values upfront
@@ -712,8 +712,8 @@ impl Ord for SortableImmutableRecord {
             return Ordering::Equal;
         }
         assert_eq!(
-            self.cursor.serial_types.len(),
-            other.cursor.serial_types.len()
+            self.cursor.serials_offsets.len(),
+            other.cursor.serials_offsets.len()
         );
 
         for i in 0..self.key_len {
