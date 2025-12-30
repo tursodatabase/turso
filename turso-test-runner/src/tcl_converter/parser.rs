@@ -53,16 +53,16 @@ pub enum WarningKind {
 pub struct TclTest {
     /// Test name
     pub name: String,
-    /// SQL to execute
+    /// SQL to execute (including any DDL statements)
     pub sql: String,
     /// Type of test and expected output
     pub kind: TclTestKind,
     /// Database specifier if specific
     pub db: Option<String>,
-    /// Setup SQL to run before the test (extracted from sql)
-    pub setup_sql: Option<String>,
-    /// Setup name if extracted
-    pub setup_name: Option<String>,
+    /// Whether the test contains DDL statements (CREATE, DROP, etc.)
+    pub has_ddl: bool,
+    /// Comments that appeared before this test
+    pub comments: Vec<String>,
     /// Line number in source
     pub line: usize,
 }
@@ -90,6 +90,17 @@ impl TclTest {
     pub fn uses_test_dbs(&self) -> bool {
         self.db.is_none()
     }
+
+    /// Check if SQL contains DDL statements
+    fn check_has_ddl(sql: &str) -> bool {
+        let upper = sql.to_uppercase();
+        upper.contains("CREATE ")
+            || upper.contains("DROP ")
+            || upper.contains("ALTER ")
+            || upper.contains("INSERT ")
+            || upper.contains("UPDATE ")
+            || upper.contains("DELETE ")
+    }
 }
 
 /// Parser for Tcl test files
@@ -113,13 +124,25 @@ impl<'a> TclParser<'a> {
         let mut tests = Vec::new();
         let mut warnings = Vec::new();
         let mut used_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut pending_comments: Vec<String> = Vec::new();
 
         while self.pos < self.lines.len() {
             let line = self.lines[self.pos].trim();
             let line_num = self.pos + 1;
 
-            // Skip empty lines and comments
-            if line.is_empty() || line.starts_with('#') {
+            // Skip empty lines
+            if line.is_empty() {
+                // Clear pending comments on empty lines (they were for something else)
+                if !pending_comments.is_empty() {
+                    pending_comments.clear();
+                }
+                self.pos += 1;
+                continue;
+            }
+
+            // Collect comments (except shebang)
+            if line.starts_with('#') && !line.starts_with("#!") {
+                pending_comments.push(line.to_string());
                 self.pos += 1;
                 continue;
             }
@@ -176,6 +199,9 @@ impl<'a> TclParser<'a> {
             if let Some(result) = self.try_parse_test(line, line_num) {
                 match result {
                     Ok(mut test) => {
+                        // Attach pending comments to this test
+                        test.comments = std::mem::take(&mut pending_comments);
+
                         // Deduplicate test names
                         let base_name = test.name.clone();
                         let mut final_name = base_name.clone();
@@ -187,23 +213,15 @@ impl<'a> TclParser<'a> {
                         }
 
                         if final_name != test.name {
-                            // Also update setup name if present
-                            if let Some(ref mut setup_name) = test.setup_name {
-                                let base_setup = setup_name.clone();
-                                *setup_name = format!(
-                                    "{}-{}",
-                                    base_setup.trim_end_matches("-setup"),
-                                    counter - 1
-                                );
-                                setup_name.push_str("-setup");
-                            }
                             test.name = final_name.clone();
                         }
 
                         used_names.insert(final_name);
                         tests.push(test);
                     }
-                    Err(warning) => warnings.push(warning),
+                    Err(warning) => {
+                        warnings.push(warning);
+                    }
                 }
                 continue;
             }
@@ -284,13 +302,15 @@ impl<'a> TclParser<'a> {
             String::new()
         };
 
+        let has_ddl = TclTest::check_has_ddl(&sql);
+
         Ok(TclTest {
             name,
             sql,
             kind: TclTestKind::Exact(expected),
             db: None,
-            setup_sql: None,
-            setup_name: None,
+            has_ddl,
+            comments: Vec::new(),
             line: line_num,
         })
     }
@@ -322,16 +342,15 @@ impl<'a> TclParser<'a> {
             String::new()
         };
 
-        // Extract setup SQL from tests that create tables
-        let (setup_sql, test_sql, setup_name) = Self::extract_setup(&sql, &name);
+        let has_ddl = TclTest::check_has_ddl(&sql);
 
         Ok(TclTest {
             name,
-            sql: test_sql,
+            sql,
             kind: TclTestKind::Exact(expected),
             db: Some(db),
-            setup_sql,
-            setup_name,
+            has_ddl,
+            comments: Vec::new(),
             line: line_num,
         })
     }
@@ -349,13 +368,15 @@ impl<'a> TclParser<'a> {
             None
         };
 
+        let has_ddl = TclTest::check_has_ddl(&sql);
+
         Ok(TclTest {
             name,
             sql,
             kind: TclTestKind::Error(pattern),
             db: None,
-            setup_sql: None,
-            setup_name: None,
+            has_ddl,
+            comments: Vec::new(),
             line: line_num,
         })
     }
@@ -372,14 +393,15 @@ impl<'a> TclParser<'a> {
 
         let name = Self::clean_name(&parts[0]);
         let sql = Self::clean_sql(&parts[1]);
+        let has_ddl = TclTest::check_has_ddl(&sql);
 
         Ok(TclTest {
             name,
             sql,
             kind: TclTestKind::AnyError,
             db: None,
-            setup_sql: None,
-            setup_name: None,
+            has_ddl,
+            comments: Vec::new(),
             line: line_num,
         })
     }
@@ -422,13 +444,15 @@ impl<'a> TclParser<'a> {
             ".*".to_string()
         };
 
+        let has_ddl = TclTest::check_has_ddl(&sql);
+
         Ok(TclTest {
             name,
             sql,
             kind: TclTestKind::Pattern(pattern),
             db: None,
-            setup_sql: None,
-            setup_name: None,
+            has_ddl,
+            comments: Vec::new(),
             line: line_num,
         })
     }
@@ -532,10 +556,7 @@ impl<'a> TclParser<'a> {
     }
 
     /// Parse test arguments from collected content
-    fn parse_test_args(
-        content: &str,
-        min_args: usize,
-    ) -> Result<Vec<String>, ConversionWarning> {
+    fn parse_test_args(content: &str, min_args: usize) -> Result<Vec<String>, ConversionWarning> {
         let mut args = Vec::new();
         let mut current = String::new();
         let mut brace_depth = 0;
@@ -641,7 +662,7 @@ impl<'a> TclParser<'a> {
                 '.' => result.push('_'), // Replace dots with underscore
                 ':' => result.push('_'), // Replace colons with underscore
                 ' ' => result.push('-'), // Replace spaces with hyphen
-                _ => {} // Skip other invalid chars
+                _ => {}                  // Skip other invalid chars
             }
         }
 
@@ -650,25 +671,41 @@ impl<'a> TclParser<'a> {
             return "unnamed-test".to_string();
         }
 
-        if result.chars().next().map(|c| c.is_ascii_digit()).unwrap_or(false) {
+        if result
+            .chars()
+            .next()
+            .map(|c| c.is_ascii_digit())
+            .unwrap_or(false)
+        {
             result = format!("test-{}", result);
         }
 
         result
     }
 
-    /// Clean up SQL (normalize whitespace)
+    /// Clean up SQL (normalize whitespace, preserve comments)
     fn clean_sql(s: &str) -> String {
         let mut result = String::new();
+        let mut prev_was_empty = false;
+
         for line in s.lines() {
             let trimmed = line.trim();
-            if !trimmed.is_empty() {
-                if !result.is_empty() {
+
+            if trimmed.is_empty() {
+                // Collapse multiple empty lines into one
+                if !prev_was_empty && !result.is_empty() {
+                    result.push('\n');
+                    prev_was_empty = true;
+                }
+            } else {
+                if !result.is_empty() && !prev_was_empty {
                     result.push('\n');
                 }
                 result.push_str(trimmed);
+                prev_was_empty = false;
             }
         }
+
         result
     }
 
@@ -697,42 +734,6 @@ impl<'a> TclParser<'a> {
 
         result
     }
-
-    /// Extract setup SQL from test SQL that contains CREATE TABLE etc.
-    fn extract_setup(sql: &str, test_name: &str) -> (Option<String>, String, Option<String>) {
-        let mut setup_lines = Vec::new();
-        let mut test_lines = Vec::new();
-        let mut in_setup = true;
-
-        for line in sql.lines() {
-            let upper = line.to_uppercase();
-            let trimmed = upper.trim();
-
-            // Setup statements
-            if in_setup
-                && (trimmed.starts_with("CREATE ")
-                    || trimmed.starts_with("INSERT ")
-                    || trimmed.starts_with("DROP "))
-            {
-                setup_lines.push(line);
-            } else {
-                in_setup = false;
-                test_lines.push(line);
-            }
-        }
-
-        if setup_lines.is_empty() {
-            (None, sql.to_string(), None)
-        } else {
-            // Generate a setup name from test name
-            let setup_name = format!("{}-setup", test_name.replace(' ', "-"));
-            (
-                Some(setup_lines.join("\n")),
-                test_lines.join("\n"),
-                Some(setup_name),
-            )
-        }
-    }
 }
 
 impl std::fmt::Display for WarningKind {
@@ -752,6 +753,8 @@ impl std::fmt::Display for WarningKind {
 
 #[cfg(test)]
 mod tests {
+    use crate::tcl_converter::convert;
+
     use super::*;
 
     #[test]
