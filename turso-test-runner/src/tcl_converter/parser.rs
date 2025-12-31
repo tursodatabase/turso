@@ -82,8 +82,6 @@ pub enum WarningKind {
     ToleranceTest,
     /// Test uses skip_lines (not supported)
     SkipLinesTest,
-    /// Small database test (different db)
-    SmallDbTest,
 }
 
 /// A parsed test case from Tcl
@@ -159,8 +157,6 @@ enum ArgLayout {
     Standard,
     /// db name {sql} {expected?}
     WithDb,
-    /// skip_lines db name {sql} {expected?}
-    SkipLinesWithDb,
 }
 
 impl TestConfig {
@@ -211,13 +207,6 @@ impl TestConfig {
             ..self
         }
     }
-
-    fn skip_lines_db_from_arg(self) -> Self {
-        Self {
-            layout: ArgLayout::SkipLinesWithDb,
-            ..self
-        }
-    }
 }
 
 /// Parser for Tcl test files
@@ -249,14 +238,6 @@ fn build_test(args: Vec<String>, config: TestConfig) -> Result<TclTest, String> 
                 return Err("Expected db argument".to_string());
             }
             (Some(args[0].trim().to_string()), 1)
-        }
-        ArgLayout::SkipLinesWithDb => {
-            // skip_lines db name {sql} {expected}
-            if args.len() < 2 {
-                return Err("Expected skip_lines and db arguments".to_string());
-            }
-            // args[0] is skip_lines (we ignore it), args[1] is db
-            (Some(args[1].trim().to_string()), 2)
         }
     };
 
@@ -303,13 +284,9 @@ fn test_fn<'a>(keyword: &'a str, config: TestConfig) -> text_parser!('a, TclTest
 
 /// Parser for all test function types
 /// Order matters - longer/more specific keywords first!
+/// Note: tolerance and skip_lines tests are handled as skips in tcl_file_parser()
 pub fn test_parser<'a>() -> text_parser!('a, TclTest) {
     choice((
-        // Specific DB tests with skip_lines (format: skip_lines db name sql expected)
-        test_fn(
-            "do_execsql_test_skip_lines_on_specific_db",
-            TestConfig::standard().skip_lines_db_from_arg(),
-        ),
         // Specific DB tests (format: db name sql expected)
         test_fn(
             "do_execsql_test_on_specific_db",
@@ -341,10 +318,6 @@ pub fn test_parser<'a>() -> text_parser!('a, TclTest) {
         // Special tests
         test_fn("do_execsql_test_regex", TestConfig::standard().pattern()),
         test_fn(
-            "do_execsql_test_tolerance",
-            TestConfig::standard(), // Will need special handling
-        ),
-        test_fn(
             "do_execsql_test_small",
             TestConfig::with_db("testing/testing_small.db"),
         ),
@@ -359,7 +332,10 @@ pub enum SkipKind {
     Foreach,
     If,
     Proc,
-    Line, // set, source, etc.
+    Extension,     // load_extension calls
+    Tolerance,     // do_execsql_test_tolerance
+    SkipLinesTest, // do_execsql_test_skip_lines_on_specific_db
+    Line,          // set, source, etc. (no warning)
     Unknown,
 }
 
@@ -393,8 +369,34 @@ pub fn tcl_file_parser<'a>() -> text_parser!('a, Vec<TclItem>) {
         .spanned()
         .map(|preview| TclItem::Skip(SkipKind::Proc, preview.span));
 
+    // Extension loading - skip with warning
+    let extension_skip = just("load_static_extension")
+        .or(just("load_extension"))
+        .then(none_of('\n').repeated())
+        .to_slice()
+        .spanned()
+        .map(|s: Spanned<&str>| TclItem::Skip(SkipKind::Extension, s.span));
+
+    // Tolerance tests - skip with warning (these need manual conversion)
+    let tolerance_skip = just("do_execsql_test_tolerance")
+        .then(none_of('\n').repeated())
+        .to_slice()
+        .spanned()
+        .map(|s: Spanned<&str>| TclItem::Skip(SkipKind::Tolerance, s.span));
+
+    // Skip lines tests - skip with warning
+    let skip_lines_skip = just("do_execsql_test_skip_lines")
+        .then(none_of('\n').repeated())
+        .to_slice()
+        .spanned()
+        .map(|s: Spanned<&str>| TclItem::Skip(SkipKind::SkipLinesTest, s.span));
+
     // Each item can have leading horizontal whitespace
+    // Order matters: more specific patterns before general ones
     let item = hspace().ignore_then(choice((
+        extension_skip,
+        tolerance_skip,
+        skip_lines_skip,
         test_parser().map(TclItem::Test),
         comment().map(TclItem::comment),
         foreach_block,
@@ -462,7 +464,19 @@ pub fn parse_tcl_file(content: &str, source_file: &str) -> ConversionResult {
                         ),
                         SkipKind::Proc => (
                             WarningKind::ProcSkipped,
-                            "Proc definition skipped".to_string(),
+                            "proc definition skipped".to_string(),
+                        ),
+                        SkipKind::Extension => (
+                            WarningKind::ExtensionSkipped,
+                            "extension loading skipped - not supported".to_string(),
+                        ),
+                        SkipKind::Tolerance => (
+                            WarningKind::ToleranceTest,
+                            "tolerance test skipped - needs manual conversion".to_string(),
+                        ),
+                        SkipKind::SkipLinesTest => (
+                            WarningKind::SkipLinesTest,
+                            "skip_lines test skipped - needs manual conversion".to_string(),
                         ),
                         SkipKind::Line | SkipKind::Unknown => {
                             // Don't generate warnings for simple skips
@@ -485,7 +499,7 @@ pub fn parse_tcl_file(content: &str, source_file: &str) -> ConversionResult {
         warnings.push(ConversionWarning {
             kind: WarningKind::ParseError,
             message: e.to_string(),
-            span: None,
+            span: Some(*e.span()),
         });
     }
 
@@ -579,7 +593,6 @@ impl std::fmt::Display for WarningKind {
             WarningKind::ExtensionSkipped => write!(f, "EXTENSION"),
             WarningKind::ToleranceTest => write!(f, "TOLERANCE"),
             WarningKind::SkipLinesTest => write!(f, "SKIP_LINES"),
-            WarningKind::SmallDbTest => write!(f, "SMALL_DB"),
         }
     }
 }
@@ -596,7 +609,6 @@ impl WarningKind {
             WarningKind::ExtensionSkipped => "extension_skipped",
             WarningKind::ToleranceTest => "tolerance_test",
             WarningKind::SkipLinesTest => "skip_lines_test",
-            WarningKind::SmallDbTest => "small_db_test",
         }
     }
 
@@ -617,7 +629,6 @@ impl WarningKind {
             }
             WarningKind::ToleranceTest => "tolerance-based comparisons need manual conversion",
             WarningKind::SkipLinesTest => "skip_lines tests need manual conversion",
-            WarningKind::SmallDbTest => "uses a different test database",
         }
     }
 }
