@@ -835,7 +835,9 @@ fn test_lazy_scan_cursor_basic() {
     .unwrap();
 
     // Check first row
-    assert!(matches!(cursor.next().unwrap(), IOResult::Done(true)));
+    let res = cursor.next().unwrap();
+    assert!(matches!(res, IOResult::Done(())));
+    assert!(cursor.has_record());
     assert!(!cursor.is_empty());
     let row = cursor.read_mvcc_current_row().unwrap().unwrap();
     assert_eq!(row.id.row_id.to_int_or_panic(), 1);
@@ -844,10 +846,10 @@ fn test_lazy_scan_cursor_basic() {
     let mut count = 1;
     loop {
         let res = cursor.next().unwrap();
-        let IOResult::Done(res) = res else {
+        let IOResult::Done(()) = res else {
             panic!("unexpected next result {res:?}");
         };
-        if !res {
+        if !cursor.has_record() {
             break;
         }
         count += 1;
@@ -859,7 +861,9 @@ fn test_lazy_scan_cursor_basic() {
     assert_eq!(count, 5);
 
     // After the last row, is_empty should return true
-    assert!(!matches!(cursor.next().unwrap(), IOResult::Done(true)));
+    let res = cursor.next().unwrap();
+    assert!(matches!(res, IOResult::Done(())));
+    assert!(!cursor.has_record());
     assert!(cursor.is_empty());
 }
 
@@ -878,7 +882,9 @@ fn test_lazy_scan_cursor_with_gaps() {
     .unwrap();
 
     // Check first row
-    assert!(matches!(cursor.next().unwrap(), IOResult::Done(true)));
+    let res = cursor.next().unwrap();
+    assert!(matches!(res, IOResult::Done(())));
+    assert!(cursor.has_record());
     assert!(!cursor.is_empty());
     let row = cursor.read_mvcc_current_row().unwrap().unwrap();
     assert_eq!(row.id.row_id.to_int_or_panic(), 5);
@@ -895,10 +901,10 @@ fn test_lazy_scan_cursor_with_gaps() {
 
     loop {
         let res = cursor.next().unwrap();
-        let IOResult::Done(res) = res else {
+        let IOResult::Done(()) = res else {
             panic!("unexpected next result {res:?}");
         };
-        if !res {
+        if !cursor.has_record() {
             break;
         }
         index += 1;
@@ -940,10 +946,10 @@ fn test_cursor_basic() {
     let mut count = 1;
     loop {
         let res = cursor.next().unwrap();
-        let IOResult::Done(res) = res else {
+        let IOResult::Done(()) = res else {
             panic!("unexpected next result {res:?}");
         };
-        if !res {
+        if !cursor.has_record() {
             break;
         }
         count += 1;
@@ -955,7 +961,9 @@ fn test_cursor_basic() {
     assert_eq!(count, 5);
 
     // After the last row, is_empty should return true
-    assert!(!matches!(cursor.next().unwrap(), IOResult::Done(true)));
+    let res = cursor.next().unwrap();
+    assert!(matches!(res, IOResult::Done(())));
+    assert!(!cursor.has_record());
     assert!(cursor.is_empty());
 }
 
@@ -1004,7 +1012,9 @@ fn test_cursor_modification_during_scan() {
     .unwrap();
 
     // Read first row
-    assert!(matches!(cursor.next().unwrap(), IOResult::Done(true)));
+    let res = cursor.next().unwrap();
+    assert!(matches!(res, IOResult::Done(())));
+    assert!(cursor.has_record());
     let first_row = cursor.read_mvcc_current_row().unwrap().unwrap();
     assert_eq!(first_row.id.row_id.to_int_or_panic(), 1);
 
@@ -1022,10 +1032,10 @@ fn test_cursor_modification_during_scan() {
     let mut read_rowids = vec![];
     loop {
         let res = cursor.next().unwrap();
-        let IOResult::Done(res) = res else {
+        let IOResult::Done(()) = res else {
             panic!("unexpected next result {res:?}");
         };
-        if !res {
+        if !cursor.has_record() {
             break;
         }
         read_rowids.push(
@@ -1039,7 +1049,9 @@ fn test_cursor_modification_during_scan() {
         );
     }
     assert_eq!(read_rowids, vec![2, 3, 4, 5]);
-    assert!(!matches!(cursor.next().unwrap(), IOResult::Done(true)));
+    let res = cursor.next().unwrap();
+    assert!(matches!(res, IOResult::Done(())));
+    assert!(!cursor.has_record());
     assert!(cursor.is_empty());
 }
 
