@@ -225,6 +225,14 @@ pub enum Plan {
 /// However, there are some cases where the results are not returned to the caller,
 /// but rather are yielded to a parent query via coroutine, or stored in a temp table,
 /// later used by the parent query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EphemeralRowidMode {
+    /// The last result column is used as the rowid key.
+    FromResultColumns,
+    /// Generate a fresh rowid for each inserted row.
+    Auto,
+}
+
 #[derive(Debug, Clone)]
 pub enum QueryDestination {
     /// The results of the query are returned to the caller.
@@ -253,6 +261,8 @@ pub enum QueryDestination {
         cursor_id: CursorID,
         /// The table that will be used to store the results.
         table: Arc<BTreeTable>,
+        /// How to determine the rowid key for inserts.
+        rowid_mode: EphemeralRowidMode,
     },
     /// The result of an EXISTS subquery are stored in a single register.
     ExistsSubqueryResult {

@@ -63,8 +63,8 @@ impl JoinN {
 /// - The build side is the most recently joined table (left-deep hash join); the RHS is the probe.
 /// - We avoid hash-join shapes that would drop build-side filters unless we can preserve them
 ///   via materialized build rowids.
-/// - We do not allow probe->build chaining because rebuilding from the full table would ignore
-///   prior join filters.
+/// - Probe->build chaining is only allowed when the build input is materialized from the
+///   join prefix; rebuilding from the full table would ignore prior join filters.
 #[allow(clippy::too_many_arguments)]
 pub fn join_lhs_and_rhs<'a>(
     lhs: Option<&JoinN>,
@@ -238,6 +238,16 @@ pub fn join_lhs_and_rhs<'a>(
             build_self_constraint_selectivity(build_constraints, lhs_table_idx);
         let build_cardinality = (*build_base_rows) * build_self_selectivity;
         let probe_cardinality = *rhs_base_rows;
+        let prior_mask = lhs_mask.without_table(lhs_table_idx);
+        let prior_constraint_selectivity =
+            build_prior_constraint_selectivity(build_constraints, &prior_mask);
+        let probe_multiplier = if lhs.data.len() == 1 && lhs.data[0].0 == lhs_table_idx {
+            1.0
+        } else {
+            let join_selectivity = prior_constraint_selectivity.clamp(0.0, 1.0);
+            let denom = (build_cardinality * join_selectivity).max(1.0);
+            (input_cardinality as f64 / denom).max(1.0)
+        };
 
         let rhs_has_selective_seek = matches!(
             best_access_method.params,
@@ -351,6 +361,12 @@ pub fn join_lhs_and_rhs<'a>(
                 }
             })
         });
+        // Avoid probe->build chaining across outer-join boundaries.
+        let prefix_has_outer = join_order
+            .iter()
+            .take(join_order.len().saturating_sub(1))
+            .any(|member| member.is_outer);
+        let chaining_across_outer = build_table_is_prior_probe && prefix_has_outer;
 
         // Hash joins are safe only if we won't drop build-side filters:
         // - If the build scan is unconstrained, we can build directly.
@@ -379,13 +395,13 @@ pub fn join_lhs_and_rhs<'a>(
             .unwrap_or(false);
 
         // Eligibility gate: prefer nested-loop when it preserves ORDER BY or uses
-        // a selective probe seek, and avoid hash join when it would invalidate
-        // prior hash-join semantics.
+        // a selective probe seek. Probe->build chaining is only allowed when the
+        // build input is materialized from the join prefix.
         let allow_hash_join = !nested_loop_preserves_order
             && !rhs_has_selective_seek
             && !probe_table_is_prior_build
-            && !build_table_is_prior_probe
-            && (!build_has_prior_constraints || build_has_rowid);
+            && (!build_has_prior_constraints || build_has_rowid)
+            && !chaining_across_outer;
 
         tracing::debug!(
             lhs_table = lhs_table.table.get_name(),
@@ -394,13 +410,14 @@ pub fn join_lhs_and_rhs<'a>(
             nested_loop_preserves_order,
             rhs_has_selective_seek,
             probe_table_is_prior_build,
+            build_table_is_prior_probe,
+            chaining_across_outer,
             build_am_is_plain_table_scan,
             build_has_rowid,
             "hash-join eligibility check"
         );
         if allow_hash_join {
             let lhs_constraints = build_constraints;
-            let prior_mask = lhs_mask.without_table(lhs_table_idx);
             let mut allowed_probe_table_ids = Vec::new();
             for (table_no, _) in lhs.data.iter() {
                 let table_id = joined_tables[*table_no].internal_id;
@@ -412,13 +429,6 @@ pub fn join_lhs_and_rhs<'a>(
             if !allowed_probe_table_ids.contains(&rhs_table_id) {
                 allowed_probe_table_ids.push(rhs_table_id);
             }
-            // Probe cost scales with the number of times we execute the probe phase.
-            // If the LHS is exactly the build table, this is a single build/probe pair.
-            let probe_multiplier = if lhs.data.len() == 1 && lhs.data[0].0 == lhs_table_idx {
-                1.0
-            } else {
-                input_cardinality as f64
-            };
             if let Some(hash_join_method) = try_hash_join_access_method(
                 lhs_table,
                 rhs_table_reference,
@@ -454,16 +464,13 @@ pub fn join_lhs_and_rhs<'a>(
                         join_keys,
                         &prior_mask,
                         &prior_hash_build_mask,
-                    );
-                    let prior_constraint_selectivity =
-                        build_prior_constraint_selectivity(lhs_constraints, &prior_mask);
+                    ) || build_table_is_prior_probe;
                     let estimated_filtered_rows =
                         (*build_base_rows) * build_self_selectivity * prior_constraint_selectivity;
 
-                    // Hard cap and selectivity gate: avoid materializing huge lists.
-                    let materialization_too_large = needs_materialization
-                        && (estimated_filtered_rows > MAX_MATERIALIZED_BUILD_ROWS
-                            || prior_constraint_selectivity >= MATERIALIZE_SELECTIVITY_THRESHOLD);
+                    // Hard cap: avoid materializing huge lists when materialization is required.
+                    let materialization_too_large =
+                        needs_materialization && estimated_filtered_rows > MAX_MATERIALIZED_BUILD_ROWS;
                     let can_materialize =
                         build_has_indexable_prior_constraints(lhs_constraints, &prior_mask);
                     let selectivity_threshold = if probe_multiplier > 1.0 {
@@ -487,14 +494,17 @@ pub fn join_lhs_and_rhs<'a>(
                         || needs_materialization
                         || build_access_method_uses_constraints;
                     hash_join_allowed = build_is_eligible
-                        && (!needs_materialization || (build_has_rowid && can_materialize))
+                        && (!needs_materialization || build_has_rowid)
                         && !materialization_too_large;
                     if hash_join_allowed {
-                        let should_materialize = wants_materialization
-                            && build_has_rowid
-                            && can_materialize
-                            && !materialization_too_large
-                            && !optional_materialization_too_large;
+                        let should_materialize = if needs_materialization {
+                            build_has_rowid
+                        } else {
+                            wants_materialization
+                                && build_has_rowid
+                                && can_materialize
+                                && !optional_materialization_too_large
+                        };
                         let effective_build_cardinality = if should_materialize {
                             estimated_filtered_rows
                         } else {
