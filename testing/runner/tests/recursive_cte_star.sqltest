@@ -1,0 +1,113 @@
+@database :memory:
+
+# =============================================================================
+# Recursive CTE: SELECT * column resolution and indirect references
+# =============================================================================
+
+setup nodes_schema {
+    CREATE TABLE nodes(id TEXT PRIMARY KEY, parent_id TEXT, label TEXT);
+    INSERT INTO nodes VALUES('a', NULL, 'root');
+    INSERT INTO nodes VALUES('b', 'a', 'child1');
+    INSERT INTO nodes VALUES('c', 'a', 'child2');
+    INSERT INTO nodes VALUES('d', 'b', 'grandchild1');
+    INSERT INTO nodes VALUES('e', 'c', 'grandchild2');
+}
+
+# Bug 1: SELECT * in base case should resolve column names from schema
+@setup nodes_schema
+test rcte-star-base-case {
+    WITH RECURSIVE r AS (
+        SELECT * FROM nodes WHERE parent_id IS NULL
+        UNION ALL
+        SELECT n.* FROM nodes n JOIN r ON n.parent_id = r.id
+    ) SELECT * FROM r;
+}
+expect {
+    a||root
+    b|a|child1
+    c|a|child2
+    d|b|grandchild1
+    e|c|grandchild2
+}
+
+# SELECT t.* (TableStar) in base case
+@setup nodes_schema
+test rcte-tablestar-base-case {
+    WITH RECURSIVE r AS (
+        SELECT nodes.* FROM nodes WHERE parent_id IS NULL
+        UNION ALL
+        SELECT n.* FROM nodes n JOIN r ON n.parent_id = r.id
+    ) SELECT * FROM r;
+}
+expect {
+    a||root
+    b|a|child1
+    c|a|child2
+    d|b|grandchild1
+    e|c|grandchild2
+}
+
+# Explicit column names (regression: should still work)
+@setup nodes_schema
+test rcte-explicit-columns {
+    WITH RECURSIVE r(id, parent_id, label) AS (
+        SELECT id, parent_id, label FROM nodes WHERE parent_id IS NULL
+        UNION ALL
+        SELECT n.id, n.parent_id, n.label FROM nodes n JOIN r ON n.parent_id = r.id
+    ) SELECT * FROM r;
+}
+expect {
+    a||root
+    b|a|child1
+    c|a|child2
+    d|b|grandchild1
+    e|c|grandchild2
+}
+
+# Bug 2: Indirect CTE reference via IN subquery
+@setup nodes_schema
+test rcte-indirect-in-subquery {
+    WITH RECURSIVE r AS (
+        SELECT id FROM nodes WHERE parent_id IS NULL
+        UNION ALL
+        SELECT n.id FROM nodes n JOIN r ON n.parent_id = r.id
+    ) SELECT id, label FROM nodes WHERE id IN (SELECT id FROM r) ORDER BY id;
+}
+expect {
+    a|root
+    b|child1
+    c|child2
+    d|grandchild1
+    e|grandchild2
+}
+
+# Multi-level recursion: only descendants of 'b'
+@setup nodes_schema
+test rcte-subtree {
+    WITH RECURSIVE r AS (
+        SELECT * FROM nodes WHERE id = 'b'
+        UNION ALL
+        SELECT n.* FROM nodes n JOIN r ON n.parent_id = r.id
+    ) SELECT * FROM r;
+}
+expect {
+    b|a|child1
+    d|b|grandchild1
+}
+
+# SELECT specific columns from direct CTE reference
+@setup nodes_schema
+test rcte-specific-columns {
+    WITH RECURSIVE r AS (
+        SELECT * FROM nodes WHERE parent_id IS NULL
+        UNION ALL
+        SELECT n.* FROM nodes n JOIN r ON n.parent_id = r.id
+    ) SELECT id, label FROM r;
+}
+expect {
+    a|root
+    b|child1
+    c|child2
+    d|grandchild1
+    e|grandchild2
+}

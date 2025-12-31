@@ -121,10 +121,18 @@ impl WriteRow {
                     ));
 
                     if !matches!(res, SeekResult::Found) {
-                        // Row doesn't exist, we'll insert a new one
-                        *self = WriteRow::ComputeNewRowId {
-                            final_weight: weight,
-                        };
+                        // Row doesn't exist
+                        if weight <= 0 {
+                            // Can't delete/subtract from a non-existent row - this is a no-op.
+                            // This can happen in recursive CTEs where intermediate results
+                            // are computed and then retracted before being persisted.
+                            *self = WriteRow::Done;
+                        } else {
+                            // Insert a new row with positive weight
+                            *self = WriteRow::ComputeNewRowId {
+                                final_weight: weight,
+                            };
+                        }
                     } else {
                         // Found in index, get the rowid it points to
                         let rowid = return_if_io!(cursors.index_cursor.rowid());
@@ -194,9 +202,23 @@ impl WriteRow {
                     return_if_io!(cursors.table_cursor.delete());
                 }
                 WriteRow::DeleteIndex => {
+                    // Re-seek the index cursor to ensure it's positioned correctly.
+                    // The cursor position may have been invalidated after I/O yields.
+                    let index_values = index_key.clone();
+                    let index_record =
+                        ImmutableRecord::from_values(&index_values, index_values.len());
+                    let res = return_if_io!(cursors.index_cursor.seek(
+                        SeekKey::IndexKey(&index_record),
+                        SeekOp::GE { eq_only: true }
+                    ));
+
                     // Mark as Done before delete to avoid retry on I/O
                     *self = WriteRow::Done;
-                    return_if_io!(cursors.index_cursor.delete());
+
+                    // Only delete if we found the entry (it might have been deleted already)
+                    if matches!(res, SeekResult::Found) {
+                        return_if_io!(cursors.index_cursor.delete());
+                    }
                 }
                 WriteRow::ComputeNewRowId { final_weight } => {
                     // Find the last rowid to compute the next one
@@ -286,5 +308,143 @@ impl WriteRow {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::io::MemoryIO;
+    use crate::pager::CreateBTreeFlags;
+    use crate::util::IOExt;
+    use crate::{Database, Pager, IO};
+    use std::sync::Arc;
+
+    use crate::incremental::operator::{create_dbsp_state_index, DbspStateCursors};
+
+    fn create_test_pager() -> (Arc<Pager>, i64, i64) {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let db = Database::open_file(io.clone(), ":memory:").unwrap();
+        let conn = db.connect().unwrap();
+        let pager = conn.pager.load().clone();
+        let _ = pager.io.block(|| pager.allocate_page1());
+        let table_root_page_id = pager
+            .io
+            .block(|| pager.btree_create(&CreateBTreeFlags::new_table()))
+            .expect("Failed to create table BTree") as i64;
+        let index_root_page_id = pager
+            .io
+            .block(|| pager.btree_create(&CreateBTreeFlags::new_index()))
+            .expect("Failed to create index BTree") as i64;
+        (pager, table_root_page_id, index_root_page_id)
+    }
+
+    /// Test that calling write_row with a negative weight for a key that
+    /// doesn't exist in the btree is a no-op (WriteRow::Done) rather than
+    /// inserting a row with negative weight.
+    ///
+    /// This can happen in recursive CTEs where intermediate results are
+    /// computed and then retracted before being persisted.
+    #[test]
+    fn test_write_row_negative_weight_nonexistent_key_is_noop() {
+        let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
+        let index_def = create_dbsp_state_index(index_root_page_id);
+        let table_cursor = BTreeCursor::new_table(pager.clone(), table_root_page_id, 5);
+        let index_cursor = BTreeCursor::new_index(pager.clone(), index_root_page_id, &index_def, 4);
+        let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
+
+        let index_key = vec![Value::from_i64(1), Value::from_i64(100), Value::from_i64(0)];
+        let record_values = vec![
+            Value::from_i64(1),
+            Value::from_i64(100),
+            Value::from_i64(0),
+            Value::Null,
+        ];
+
+        let mut write_row = WriteRow::new();
+        pager
+            .io
+            .block(|| {
+                write_row.write_row(&mut cursors, index_key.clone(), record_values.clone(), -1)
+            })
+            .unwrap();
+
+        // Verify the btree is still empty - no row with negative weight was inserted.
+        // We check via the index cursor: seek for the key and verify it's not found.
+        let index_record = ImmutableRecord::from_values(&index_key, index_key.len());
+        let res = pager.io.block(|| {
+            cursors.index_cursor.seek(
+                SeekKey::IndexKey(&index_record),
+                SeekOp::GE { eq_only: true },
+            )
+        });
+        assert!(
+            !matches!(res, Ok(SeekResult::Found)),
+            "Expected no index entry after negative weight write for non-existent key, \
+             but found one. This means a row with negative weight was incorrectly inserted."
+        );
+    }
+
+    /// Test that writing a positive weight for a new key works, and then
+    /// writing a negative weight that brings it to zero removes the row.
+    #[test]
+    fn test_write_row_positive_then_negative_removes_row() {
+        let (pager, table_root_page_id, index_root_page_id) = create_test_pager();
+        let index_def = create_dbsp_state_index(index_root_page_id);
+        let table_cursor = BTreeCursor::new_table(pager.clone(), table_root_page_id, 5);
+        let index_cursor = BTreeCursor::new_index(pager.clone(), index_root_page_id, &index_def, 4);
+        let mut cursors = DbspStateCursors::new(table_cursor, index_cursor);
+
+        let index_key = vec![Value::from_i64(1), Value::from_i64(200), Value::from_i64(0)];
+        let record_values = vec![
+            Value::from_i64(1),
+            Value::from_i64(200),
+            Value::from_i64(0),
+            Value::Null,
+        ];
+
+        let index_record = ImmutableRecord::from_values(&index_key, index_key.len());
+
+        // Insert with positive weight
+        let mut write_row = WriteRow::new();
+        pager
+            .io
+            .block(|| {
+                write_row.write_row(&mut cursors, index_key.clone(), record_values.clone(), 1)
+            })
+            .unwrap();
+
+        // Verify the row exists via index seek
+        let res = pager.io.block(|| {
+            cursors.index_cursor.seek(
+                SeekKey::IndexKey(&index_record),
+                SeekOp::GE { eq_only: true },
+            )
+        });
+        assert!(
+            matches!(res, Ok(SeekResult::Found)),
+            "Row should exist after positive weight insert"
+        );
+
+        // Now apply negative weight to remove it
+        let mut write_row2 = WriteRow::new();
+        pager
+            .io
+            .block(|| {
+                write_row2.write_row(&mut cursors, index_key.clone(), record_values.clone(), -1)
+            })
+            .unwrap();
+
+        // Verify the row is gone
+        let res2 = pager.io.block(|| {
+            cursors.index_cursor.seek(
+                SeekKey::IndexKey(&index_record),
+                SeekOp::GE { eq_only: true },
+            )
+        });
+        assert!(
+            !matches!(res2, Ok(SeekResult::Found)),
+            "Row should be removed after net-zero weight"
+        );
     }
 }

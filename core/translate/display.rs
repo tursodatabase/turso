@@ -61,7 +61,7 @@ pub(crate) fn format_eqp_detail(table: &JoinedTable) -> String {
                         format!("SCAN {table_name}")
                     }
                 }
-                Scan::VirtualTable { .. } | Scan::Subquery { .. } => {
+                Scan::VirtualTable { .. } | Scan::Subquery { .. } | Scan::RecursiveCte { .. } => {
                     format!("SCAN {table_name}")
                 }
             }
@@ -280,7 +280,7 @@ impl Display for SelectPlan {
                                 writeln!(f, "{indent}SCAN {table_name}")?;
                             }
                         }
-                        Scan::VirtualTable { .. } | Scan::Subquery { .. } => {
+                        Scan::VirtualTable { .. } | Scan::Subquery { .. } | Scan::RecursiveCte { .. } => {
                             writeln!(f, "{indent}SCAN {table_name}")?;
                         }
                     }
@@ -403,7 +403,7 @@ impl Display for DeletePlan {
                                 writeln!(f, "{indent}DELETE FROM {table_name}")?;
                             }
                         }
-                        Scan::VirtualTable { .. } | Scan::Subquery { .. } => {
+                        Scan::VirtualTable { .. } | Scan::Subquery { .. } | Scan::RecursiveCte { .. } => {
                             writeln!(f, "{indent}DELETE FROM {table_name}")?;
                         }
                     }
@@ -527,7 +527,7 @@ impl fmt::Display for UpdatePlan {
                                 writeln!(f, "{indent}{action} {table_name}")?;
                             }
                         }
-                        Scan::VirtualTable { .. } | Scan::Subquery { .. } => {
+                        Scan::VirtualTable { .. } | Scan::Subquery { .. } | Scan::RecursiveCte { .. } => {
                             if i == 0 {
                                 writeln!(f, "{indent}UPDATE {table_name}")?;
                             } else {
@@ -733,6 +733,14 @@ impl ToTokens for JoinedTable {
 
                 s.append(TokenType::TK_AS, None)?;
                 s.append(TokenType::TK_ID, Some(&self.identifier))?;
+            }
+            Table::RecursiveCte(recursive_cte) => {
+                // Print the CTE name and alias
+                s.append(TokenType::TK_ID, Some(&recursive_cte.name))?;
+                if self.identifier != recursive_cte.name {
+                    s.append(TokenType::TK_AS, None)?;
+                    s.append(TokenType::TK_ID, Some(&self.identifier))?;
+                }
             }
         };
 
