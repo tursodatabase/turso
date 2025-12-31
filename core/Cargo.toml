@@ -35,6 +35,7 @@ encryption = []
 checksum = []
 cli_only = []
 test_helper = []
+wheretrace = []
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = { version = "0.7.5", optional = true }
