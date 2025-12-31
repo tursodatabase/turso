@@ -42,7 +42,6 @@ use super::{
 };
 use std::{
     any::Any,
-    cell::Cell,
     cmp::{Ordering, Reverse},
     collections::BinaryHeap,
     fmt::Debug,
@@ -407,6 +406,7 @@ struct BalanceInfo {
 // SAFETY: Need to guarantee during balancing that we do not modify the rightmost pointer on the pointee `PageContent`
 // safe as long as the Balance Algorithm does not modify the pointer
 unsafe impl Send for BalanceInfo {}
+unsafe impl Sync for BalanceInfo {}
 
 /// Holds the state machine for the operation that was in flight when the cursor
 /// was suspended due to IO.
@@ -538,13 +538,13 @@ pub struct LeafPageBinarySearchState {
 pub enum CursorSeekState {
     Start,
     MovingBetweenPages {
-        eq_seen: Cell<bool>,
+        eq_seen: bool,
     },
     InteriorPageBinarySearch {
         state: InteriorPageBinarySearchState,
     },
     FoundLeaf {
-        eq_seen: Cell<bool>,
+        eq_seen: bool,
     },
     LeafPageBinarySearch {
         state: LeafPageBinarySearchState,
@@ -667,6 +667,7 @@ pub struct BTreeCursor {
 }
 
 crate::assert::assert_send!(BTreeCursor);
+crate::assert::assert_sync!(BTreeCursor);
 
 /// We store the cell index and cell count for each page in the stack.
 /// The reason we store the cell count is because we need to know when we are at the end of the page,
@@ -1177,9 +1178,7 @@ impl BTreeCursor {
             };
 
             if is_leaf {
-                self.seek_state = CursorSeekState::FoundLeaf {
-                    eq_seen: Cell::new(false),
-                };
+                self.seek_state = CursorSeekState::FoundLeaf { eq_seen: false };
                 return Ok(IOResult::Done(()));
             }
 
@@ -1188,7 +1187,7 @@ impl BTreeCursor {
                 CursorSeekState::Start | CursorSeekState::MovingBetweenPages { .. }
             ) {
                 let eq_seen = match &self.seek_state {
-                    CursorSeekState::MovingBetweenPages { eq_seen } => eq_seen.get(),
+                    CursorSeekState::MovingBetweenPages { eq_seen } => *eq_seen,
                     _ => false,
                 };
                 let min_cell_idx = 0;
@@ -1250,7 +1249,7 @@ impl BTreeCursor {
                 let (mem_page, c) = self.read_page(left_child_page as i64)?;
                 self.stack.push(mem_page);
                 self.seek_state = CursorSeekState::MovingBetweenPages {
-                    eq_seen: Cell::new(state.eq_seen),
+                    eq_seen: state.eq_seen,
                 };
                 if let Some(c) = c {
                     return Ok(ControlFlow::Break(IOResult::IO(IOCompletions::Single(c))));
@@ -1268,7 +1267,7 @@ impl BTreeCursor {
                     let (mem_page, c) = self.read_page(right_most_pointer as i64)?;
                     self.stack.push(mem_page);
                     self.seek_state = CursorSeekState::MovingBetweenPages {
-                        eq_seen: Cell::new(state.eq_seen),
+                        eq_seen: state.eq_seen,
                     };
                     if let Some(c) = c {
                         return Ok(ControlFlow::Break(IOResult::IO(IOCompletions::Single(c))));
@@ -1355,12 +1354,10 @@ impl BTreeCursor {
 
             if is_leaf {
                 let eq_seen = match &self.seek_state {
-                    CursorSeekState::MovingBetweenPages { eq_seen } => eq_seen.get(),
+                    CursorSeekState::MovingBetweenPages { eq_seen } => *eq_seen,
                     _ => false,
                 };
-                self.seek_state = CursorSeekState::FoundLeaf {
-                    eq_seen: Cell::new(eq_seen),
-                };
+                self.seek_state = CursorSeekState::FoundLeaf { eq_seen };
                 return Ok(IOResult::Done(()));
             }
 
@@ -1369,7 +1366,7 @@ impl BTreeCursor {
                 CursorSeekState::Start | CursorSeekState::MovingBetweenPages { .. }
             ) {
                 let eq_seen = match &self.seek_state {
-                    CursorSeekState::MovingBetweenPages { eq_seen } => eq_seen.get(),
+                    CursorSeekState::MovingBetweenPages { eq_seen } => *eq_seen,
                     _ => false,
                 };
                 let min_cell_idx = 0;
@@ -1447,7 +1444,7 @@ impl BTreeCursor {
                         let (mem_page, c) = self.read_page(right_most_pointer as i64)?;
                         self.stack.push(mem_page);
                         self.seek_state = CursorSeekState::MovingBetweenPages {
-                            eq_seen: Cell::new(state.eq_seen),
+                            eq_seen: state.eq_seen,
                         };
                         if let Some(c) = c {
                             return Ok(ControlFlow::Break(IOResult::IO(IOCompletions::Single(c))));
@@ -1494,7 +1491,7 @@ impl BTreeCursor {
             let (mem_page, c) = self.read_page(*left_child_page as i64)?;
             self.stack.push(mem_page);
             self.seek_state = CursorSeekState::MovingBetweenPages {
-                eq_seen: Cell::new(state.eq_seen),
+                eq_seen: state.eq_seen,
             };
             if let Some(c) = c {
                 return Ok(ControlFlow::Break(IOResult::IO(IOCompletions::Single(c))));
@@ -1800,7 +1797,7 @@ impl BTreeCursor {
                     self.seek_state
                 );
             };
-            let eq_seen = eq_seen.get();
+            let eq_seen = *eq_seen;
             let page = self.stack.top_ref();
 
             let contents = page.get_contents();
