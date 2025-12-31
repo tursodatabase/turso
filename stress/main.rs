@@ -512,7 +512,7 @@ fn generate_plan(opts: &Opts) -> Result<Plan, Box<dyn std::error::Error + Send +
                 std::io::stdout().flush().unwrap();
             }
             let tx = if get_random() % 2 == 0 {
-                Some("BEGIN")
+                Some("BEGIN;")
             } else {
                 None
             };
@@ -523,9 +523,9 @@ fn generate_plan(opts: &Opts) -> Result<Plan, Box<dyn std::error::Error + Send +
             push(&sql);
             if tx.is_some() {
                 if get_random() % 2 == 0 {
-                    push("COMMIT");
+                    push("COMMIT;");
                 } else {
-                    push("ROLLBACK");
+                    push("ROLLBACK;");
                 }
             }
         }
