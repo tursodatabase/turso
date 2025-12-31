@@ -266,6 +266,10 @@ enum BalanceSubState {
 struct BalanceState {
     sub_state: BalanceSubState,
     balance_info: Option<BalanceInfo>,
+    /// Reusable buffers for divider cell payloads.
+    /// These persist across balance operations to avoid repeated allocations.
+    /// We use Vec<u8> with clear/resize instead of allocating new each time.
+    reusable_divider_buffers: [Vec<u8>; MAX_SIBLING_PAGES_TO_BALANCE - 1],
 }
 
 /// State machine of a write operation.
@@ -406,12 +410,13 @@ struct BalanceInfo {
     pages_to_balance: [Option<PinGuard>; MAX_SIBLING_PAGES_TO_BALANCE],
     /// Bookkeeping of the rightmost pointer so the offset::BTREE_RIGHTMOST_PTR can be updated.
     rightmost_pointer: *mut u8,
-    /// Divider cells of old pages. We can have maximum 2 divider cells because of 3 pages.
-    divider_cell_payloads: [Option<Vec<u8>>; MAX_SIBLING_PAGES_TO_BALANCE - 1],
     /// Number of siblings being used to balance
     sibling_count: usize,
     /// First divider cell to remove that marks the first sibling
     first_divider_cell: usize,
+    /// Reusable buffer for constructing new divider cells during balance.
+    /// Avoids allocating a new Vec for each sibling during balance_non_root.
+    reusable_divider_cell: Vec<u8>,
 }
 
 /// Holds the state machine for the operation that was in flight when the cursor
@@ -669,6 +674,9 @@ pub struct BTreeCursor {
     /// Advancing is only skipped if the cursor is currently pointing to a valid record
     /// when next() is called.
     pub skip_advance: bool,
+    /// Reusable buffer for cell payloads during insert/update operations.
+    /// This avoids allocating a new Vec for each write operation.
+    reusable_cell_payload: Vec<u8>,
 }
 
 /// We store the cell index and cell count for each page in the stack.
@@ -732,6 +740,7 @@ impl BTreeCursor {
             seek_end_state: SeekEndState::Start,
             move_to_state: MoveToState::Start,
             skip_advance: false,
+            reusable_cell_payload: Vec::new(),
         }
     }
 
@@ -2474,10 +2483,18 @@ impl BTreeCursor {
                     let CursorState::Write(write_state) = &mut self.state else {
                         panic!("expected write state");
                     };
+                    // Reuse the cell payload buffer to avoid allocations
+                    let mut payload = std::mem::take(&mut self.reusable_cell_payload);
+                    payload.clear();
+                    // Reserve capacity if needed (typical cell is small)
+                    let needed_capacity = record_values.len() + 4;
+                    if payload.capacity() < needed_capacity {
+                        payload.reserve(needed_capacity - payload.capacity());
+                    }
                     *write_state = WriteState::Insert {
                         page,
                         cell_idx,
-                        new_payload: Vec::with_capacity(record_values.len() + 4),
+                        new_payload: payload,
                         fill_cell_payload_state: FillCellPayloadState::Start,
                     };
                     continue;
@@ -2512,6 +2529,11 @@ impl BTreeCursor {
                     };
                     self.stack.set_cell_index(*cell_idx as i32);
                     let overflows = !page.get_contents().overflow_cells.is_empty();
+
+                    // Recover the reusable buffer before transitioning state
+                    let recovered_payload = std::mem::take(new_payload);
+                    self.reusable_cell_payload = recovered_payload;
+
                     if overflows {
                         *write_state = WriteState::Balancing;
                         assert!(matches!(self.balance_state.sub_state, BalanceSubState::Start), "There should be no balancing operation in progress when insert state is {:?}, got: {:?}", self.state, self.balance_state.sub_state);
@@ -2605,6 +2627,7 @@ impl BTreeCursor {
             let BalanceState {
                 sub_state,
                 balance_info,
+                ..
             } = &mut self.balance_state;
             match sub_state {
                 BalanceSubState::Start => {
@@ -2800,6 +2823,7 @@ impl BTreeCursor {
             let BalanceState {
                 sub_state,
                 balance_info,
+                reusable_divider_buffers,
             } = &mut self.balance_state;
             tracing::debug!(?sub_state);
 
@@ -3025,9 +3049,9 @@ impl BTreeCursor {
                     balance_info.replace(BalanceInfo {
                         pages_to_balance,
                         rightmost_pointer: right_pointer,
-                        divider_cell_payloads: [const { None }; MAX_SIBLING_PAGES_TO_BALANCE - 1],
                         sibling_count,
                         first_divider_cell: first_cell_divider,
+                        reusable_divider_cell: Vec::new(),
                     });
                     *sub_state = BalanceSubState::NonRootDoBalancing;
                     let completion = group.build();
@@ -3123,8 +3147,10 @@ impl BTreeCursor {
                             read_u32(cell_buf, 0)
                         );
 
-                        // TODO(pere): make this reference and not copy
-                        balance_info.divider_cell_payloads[i].replace(cell_buf.to_vec());
+                        // Reuse the divider buffer to avoid allocation per balance operation.
+                        // The buffer is cleared and filled with the new cell data.
+                        reusable_divider_buffers[i].clear();
+                        reusable_divider_buffers[i].extend_from_slice(cell_buf);
                         if divider_is_overflow_cell {
                             tracing::debug!(
                                 "clearing overflow cells from parent cell_idx={}",
@@ -3214,10 +3240,7 @@ impl BTreeCursor {
                         if !is_last_sibling && !is_table_leaf {
                             // If we are a index page or a interior table page we need to take the divider cell too.
                             // But we don't need the last divider as it will remain the same.
-                            let mut divider_cell = balance_info.divider_cell_payloads[i]
-                                .as_mut()
-                                .unwrap()
-                                .as_mut_slice();
+                            let mut divider_cell = reusable_divider_buffers[i].as_mut_slice();
                             // TODO(pere): in case of old pages are leaf pages, so index leaf page, we need to strip page pointers
                             // from divider cells in index interior pages (parent) because those should not be included.
                             cells_inserted += 1;
@@ -3681,6 +3704,8 @@ impl BTreeCursor {
                     );
                     // TODO: pointer map update (vacuum support)
                     // Update divider cells in parent
+                    // Cache first_divider_cell to allow mutable access to reusable_divider_cell
+                    let first_divider_cell_cached = balance_info.first_divider_cell;
                     for (sibling_page_idx, page) in pages_to_balance_new
                         .iter()
                         .enumerate()
@@ -3692,8 +3717,8 @@ impl BTreeCursor {
                         // then the divider cell idx is 3 in the flat cell array.
                         let divider_cell_idx = cell_array.cell_count_up_to_page(sibling_page_idx);
                         let mut divider_cell = &mut cell_array.cell_payloads[divider_cell_idx];
-                        // FIXME: dont use auxiliary space, could be done without allocations
-                        let mut new_divider_cell = Vec::new();
+                        // Reuse the buffer for constructing new divider cell to avoid allocation per iteration
+                        balance_info.reusable_divider_cell.clear();
                         if !is_leaf_page {
                             // Interior
                             // Make this page's rightmost pointer point to pointer of divider cell before modification
@@ -3701,7 +3726,8 @@ impl BTreeCursor {
                             page.get_contents()
                                 .write_rightmost_ptr(previous_pointer_divider);
                             // divider cell now points to this page
-                            new_divider_cell
+                            balance_info
+                                .reusable_divider_cell
                                 .extend_from_slice(&(page.get().id as u32).to_be_bytes());
                             // now copy the rest of the divider cell:
                             // Table Interior page:
@@ -3710,7 +3736,9 @@ impl BTreeCursor {
                             //   * varint payload size
                             //   * payload
                             //   * first overflow page (u32 optional)
-                            new_divider_cell.extend_from_slice(&divider_cell[4..]);
+                            balance_info
+                                .reusable_divider_cell
+                                .extend_from_slice(&divider_cell[4..]);
                         } else if is_table_leaf {
                             // For table leaves, divider_cell_idx effectively points to the last cell of the old left page.
                             // The new divider cell's rowid becomes the second-to-last cell's rowid.
@@ -3721,18 +3749,24 @@ impl BTreeCursor {
                             divider_cell = &mut cell_array.cell_payloads[divider_cell_idx - 1];
                             let (_, n_bytes_payload) = read_varint(divider_cell)?;
                             let (rowid, _) = read_varint(&divider_cell[n_bytes_payload..])?;
-                            new_divider_cell
+                            balance_info
+                                .reusable_divider_cell
                                 .extend_from_slice(&(page.get().id as u32).to_be_bytes());
-                            write_varint_to_vec(rowid, &mut new_divider_cell);
+                            write_varint_to_vec(rowid, &mut balance_info.reusable_divider_cell);
                         } else {
                             // Leaf index
-                            new_divider_cell
+                            balance_info
+                                .reusable_divider_cell
                                 .extend_from_slice(&(page.get().id as u32).to_be_bytes());
-                            new_divider_cell.extend_from_slice(divider_cell);
+                            balance_info
+                                .reusable_divider_cell
+                                .extend_from_slice(divider_cell);
                         }
 
-                        let left_pointer =
-                            read_u32(&new_divider_cell[..LEFT_CHILD_PTR_SIZE_BYTES], 0);
+                        let left_pointer = read_u32(
+                            &balance_info.reusable_divider_cell[..LEFT_CHILD_PTR_SIZE_BYTES],
+                            0,
+                        );
                         turso_assert!(
                             left_pointer != parent_page.get().id as u32,
                             "left pointer is the same as parent page id"
@@ -3742,7 +3776,7 @@ impl BTreeCursor {
                             pages_pointed_to.insert(left_pointer);
                             tracing::debug!(
                                 "balance_non_root(insert_divider_cell, first_divider_cell={}, divider_cell={}, left_pointer={})",
-                                balance_info.first_divider_cell,
+                                first_divider_cell_cached,
                                 sibling_page_idx,
                                 left_pointer
                             );
@@ -3764,12 +3798,12 @@ impl BTreeCursor {
                             database_size
                         );
                         let divider_cell_insert_idx_in_parent =
-                            balance_info.first_divider_cell + sibling_page_idx;
+                            first_divider_cell_cached + sibling_page_idx;
                         #[cfg(debug_assertions)]
                         let overflow_cell_count_before = parent_contents.overflow_cells.len();
                         insert_into_cell(
                             parent_contents,
-                            &new_divider_cell,
+                            &balance_info.reusable_divider_cell,
                             divider_cell_insert_idx_in_parent,
                             usable_space,
                         )?;
@@ -4847,7 +4881,12 @@ impl BTreeCursor {
             match state {
                 OverwriteCellState::AllocatePayload => {
                     let serial_types_len = record.column_count();
-                    let new_payload = Vec::with_capacity(serial_types_len);
+                    // Reuse the cell payload buffer to avoid allocations
+                    let mut new_payload = std::mem::take(&mut self.reusable_cell_payload);
+                    new_payload.clear();
+                    if new_payload.capacity() < serial_types_len {
+                        new_payload.reserve(serial_types_len - new_payload.capacity());
+                    }
                     let rowid = return_if_io!(self.rowid());
                     *state = OverwriteCellState::FillPayload {
                         new_payload,
@@ -4880,7 +4919,7 @@ impl BTreeCursor {
                     };
 
                     *state = OverwriteCellState::ClearOverflowPagesAndOverwrite {
-                        new_payload: new_payload.clone(),
+                        new_payload: std::mem::take(new_payload),
                         old_offset,
                         old_local_size,
                     };
@@ -4898,11 +4937,15 @@ impl BTreeCursor {
                     // if it all fits in local space and old_local_size is enough, do an in-place overwrite
                     if new_payload.len() == *old_local_size {
                         Self::overwrite_content(page, *old_offset, new_payload)?;
+                        // Recover the reusable buffer
+                        self.reusable_cell_payload = std::mem::take(new_payload);
                         return Ok(IOResult::Done(()));
                     }
 
                     drop_cell(contents, cell_idx, self.usable_space())?;
                     insert_into_cell(contents, new_payload, cell_idx, self.usable_space())?;
+                    // Recover the reusable buffer
+                    self.reusable_cell_payload = std::mem::take(new_payload);
                     return Ok(IOResult::Done(()));
                 }
             }
@@ -7304,84 +7347,132 @@ fn defragment_page(page: &PageContent, usable_space: usize, max_frag_bytes: isiz
     }
 
     // A small struct to hold cell metadata for sorting.
+    // Size: 2 + 2 + 8 = 12 bytes, with alignment likely 16 bytes.
+    #[derive(Clone, Copy)]
     struct CellInfo {
         old_offset: u16,
         size: u16,
         pointer_index: usize,
     }
 
+    // Use stack allocation for the common case (most pages have <256 cells).
+    // This avoids heap allocation in the hot path.
+    // MAX_STACK_CELLS * 16 bytes = 4KB of stack space.
+    const MAX_STACK_CELLS: usize = 256;
+
+    // Helper function to process cells and defragment the page.
+    // This is generic over the slice type to work with both stack and heap storage.
+    #[inline]
+    fn process_cells(
+        page: &PageContent,
+        usable_space: usize,
+        cells_info: &mut [CellInfo],
+        cell_count: usize,
+        is_physically_sorted: bool,
+    ) -> Result<()> {
+        let cells = &mut cells_info[..cell_count];
+
+        if !is_physically_sorted {
+            // Sort cells by old physical offset in descending order.
+            // Using unstable sort is fine as the original order doesn't matter.
+            cells.sort_unstable_by(|a, b| b.old_offset.cmp(&a.old_offset));
+        }
+
+        // Get direct mutable access to the page buffer.
+        let buffer = page.as_ptr();
+        let cell_pointer_area_offset = page.cell_pointer_array_offset();
+        let first_cell_content_byte = page.unallocated_region_start();
+
+        // Move data and update pointers.
+        let mut cbrk = usable_space;
+        for cell in cells.iter() {
+            cbrk -= cell.size as usize;
+            let new_offset = cbrk;
+            let old_offset = cell.old_offset as usize;
+
+            // Basic corruption check
+            turso_assert!(
+                new_offset >= first_cell_content_byte && old_offset + cell.size as usize <= usable_space,
+                "corrupt page detected during defragmentation: new_offset={new_offset} first_cell_content_byte={first_cell_content_byte} old_offset={old_offset} cell.size={} usable_space={usable_space}",
+                cell.size
+            );
+
+            // Move the cell data. `copy_within` is the idiomatic and safe
+            // way to perform a `memmove` operation on a slice.
+            if new_offset != old_offset {
+                let src_range = old_offset..(old_offset + cell.size as usize);
+                buffer.copy_within(src_range, new_offset);
+            }
+
+            // Update the pointer in the cell pointer array to the new offset.
+            let pointer_location = cell_pointer_area_offset + (cell.pointer_index * 2);
+            turso_assert!(
+                new_offset < PageSize::MAX as usize,
+                "new_offset={new_offset} PageSize::MAX={}",
+                PageSize::MAX
+            );
+            page.write_u16_no_offset(pointer_location, new_offset as u16);
+        }
+
+        page.write_cell_content_area(cbrk);
+        page.write_first_freeblock(0);
+        page.write_fragmented_bytes_count(0);
+        Ok(())
+    }
+
     // Gather cell metadata.
     let cell_offset = page.cell_pointer_array_offset();
-    let mut cells_info = Vec::with_capacity(cell_count);
     let mut is_physically_sorted = true;
     let mut last_offset = u16::MAX;
 
+    if cell_count <= MAX_STACK_CELLS {
+        // Use stack allocation for small cell counts (common case).
+        let mut stack_cells: [CellInfo; MAX_STACK_CELLS] = [CellInfo {
+            old_offset: 0,
+            size: 0,
+            pointer_index: 0,
+        }; MAX_STACK_CELLS];
+
+        for i in 0..cell_count {
+            let pc = page.read_u16_no_offset(cell_offset + (i * 2));
+            let (_, size) = page.cell_get_raw_region(i, usable_space);
+
+            if pc > last_offset {
+                is_physically_sorted = false;
+            }
+            last_offset = pc;
+
+            stack_cells[i] = CellInfo {
+                old_offset: pc,
+                size: size as u16,
+                pointer_index: i,
+            };
+        }
+
+        process_cells(page, usable_space, &mut stack_cells, cell_count, is_physically_sorted)?;
+        debug_validate_cells!(page, usable_space);
+        return Ok(());
+    }
+
+    // Fall back to heap allocation for large cell counts (rare case).
+    let mut heap_cells = Vec::with_capacity(cell_count);
     for i in 0..cell_count {
         let pc = page.read_u16_no_offset(cell_offset + (i * 2));
         let (_, size) = page.cell_get_raw_region(i, usable_space);
 
         if pc > last_offset {
-            // Enable a fast path preventing the sort operation
-            // for cells that are already in a sorted order, since
-            // cell grows from right to left we check if pc is
-            // greater than the last offset
             is_physically_sorted = false;
         }
-
         last_offset = pc;
-        cells_info.push(CellInfo {
+
+        heap_cells.push(CellInfo {
             old_offset: pc,
             size: size as u16,
             pointer_index: i,
         });
     }
 
-    if !is_physically_sorted {
-        // Sort cells by old physical offset in descending order.
-        // Using unstable sort is fine as the original order doesn't matter.
-        cells_info.sort_unstable_by(|a, b| b.old_offset.cmp(&a.old_offset));
-    }
-
-    // Get direct mutable access to the page buffer.
-    let buffer = page.as_ptr();
-    let cell_pointer_area_offset = page.cell_pointer_array_offset();
-    let first_cell_content_byte = page.unallocated_region_start();
-
-    // Move data and update pointers.
-    let mut cbrk = usable_space;
-    for cell in cells_info {
-        cbrk -= cell.size as usize;
-        let new_offset = cbrk;
-        let old_offset = cell.old_offset as usize;
-
-        // Basic corruption check
-        turso_assert!(
-            new_offset >= first_cell_content_byte && old_offset + cell.size as usize <= usable_space,
-            "corrupt page detected during defragmentation: new_offset={new_offset} first_cell_content_byte={first_cell_content_byte} old_offset={old_offset} cell.size={} usable_space={usable_space}",
-            cell.size
-        );
-
-        // Move the cell data. `copy_within` is the idiomatic and safe
-        // way to perform a `memmove` operation on a slice.
-        if new_offset != old_offset {
-            let src_range = old_offset..(old_offset + cell.size as usize);
-            buffer.copy_within(src_range, new_offset);
-        }
-
-        // Update the pointer in the cell pointer array to the new offset.
-        let pointer_location = cell_pointer_area_offset + (cell.pointer_index * 2);
-        turso_assert!(
-            new_offset < PageSize::MAX as usize,
-            "new_offset={new_offset} PageSize::MAX={}",
-            PageSize::MAX
-        );
-        page.write_u16_no_offset(pointer_location, new_offset as u16);
-    }
-
-    page.write_cell_content_area(cbrk);
-    page.write_first_freeblock(0);
-    page.write_fragmented_bytes_count(0);
-
+    process_cells(page, usable_space, &mut heap_cells, cell_count, is_physically_sorted)?;
     debug_validate_cells!(page, usable_space);
     Ok(())
 }
