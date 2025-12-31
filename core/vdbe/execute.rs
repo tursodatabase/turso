@@ -2965,10 +2965,6 @@ pub fn op_seek(
         target_pc.is_offset(),
         "op_seek: target_pc should be an offset, is: {target_pc:?}"
     );
-    let eq_only = match insn {
-        Insn::SeekGE { eq_only, .. } | Insn::SeekLE { eq_only, .. } => *eq_only,
-        _ => false,
-    };
     let op = match insn {
         Insn::SeekGE { eq_only, .. } => SeekOp::GE { eq_only: *eq_only },
         Insn::SeekGT { .. } => SeekOp::GT,
@@ -4021,7 +4017,7 @@ pub fn op_agg_final(
                 state.registers[dest_reg] = Register::Value(json_from_raw_bytes_agg(data, true)?);
             }
             AggFunc::External(_) => {
-                let AggContext::External(agg_state) = agg else {
+                let AggContext::External(_) = agg else {
                     unreachable!();
                 };
                 let value = agg.compute_external()?;
@@ -5661,7 +5657,7 @@ pub fn op_function(
                     let column_def =
                         Parser::new(column_def.as_bytes()).parse_column_definition(true)?;
 
-                    let rename_to = normalize_ident(column_def.col_name.as_str());
+                    let _rename_to = normalize_ident(column_def.col_name.as_str());
 
                     let new_sql = 'sql: {
                         let Value::Text(sql) = sql else {
@@ -5858,7 +5854,7 @@ pub fn op_function(
                                         }
                                     }
                                     for col in &mut columns {
-                                        let before = fk_updated;
+                                        let _before = fk_updated;
                                         let mut local_col = col.clone();
                                         rewrite_column_references_if_needed(
                                             &mut local_col,
@@ -6194,10 +6190,8 @@ pub fn op_insert(
                 let record = match &state.registers[*record_reg] {
                     Register::Record(r) => std::borrow::Cow::Borrowed(r),
                     Register::Value(value) => {
-                        let x = 1;
-                        let regs = &state.registers[*record_reg..*record_reg + 1];
-                        let new_regs = [&state.registers[*record_reg]];
-                        let record = ImmutableRecord::from_registers(new_regs, new_regs.len());
+                        let values = [value];
+                        let record = ImmutableRecord::from_values(values, values.len());
                         std::borrow::Cow::Owned(record)
                     }
                     Register::Aggregate(..) => unreachable!("Cannot insert an aggregate value."),
@@ -6259,9 +6253,6 @@ pub fn op_insert(
                 assert!(!dependent_views.is_empty());
 
                 let (key, values) = {
-                    let cursor = state.get_cursor(*cursor_id);
-                    let cursor = cursor.as_btree_mut();
-
                     let key = match &state.registers[*key_reg].get_value() {
                         Value::Integer(i) => *i,
                         _ => unreachable!("expected integer key"),
@@ -6270,10 +6261,8 @@ pub fn op_insert(
                     let record = match &state.registers[*record_reg] {
                         Register::Record(r) => std::borrow::Cow::Borrowed(r),
                         Register::Value(value) => {
-                            let x = 1;
-                            let regs = &state.registers[*record_reg..*record_reg + 1];
-                            let new_regs = [&state.registers[*record_reg]];
-                            let record = ImmutableRecord::from_registers(new_regs, new_regs.len());
+                            let values = [value];
+                            let record = ImmutableRecord::from_values(values, values.len());
                             std::borrow::Cow::Owned(record)
                         }
                         Register::Aggregate(..) => {
@@ -7059,9 +7048,6 @@ pub fn op_no_conflict(
     loop {
         match state.op_no_conflict_state {
             OpNoConflictState::Start => {
-                let cursor_ref = state.get_cursor(*cursor_id);
-                let cursor = cursor_ref.as_btree_mut();
-
                 let record_source = if *num_regs == 0 {
                     RecordSource::Packed {
                         record_reg: *record_reg,
@@ -7303,12 +7289,6 @@ pub fn op_open_write(
             }
         };
         if let Some(index) = maybe_index {
-            let conn = program.connection.clone();
-            let schema = conn.schema.read();
-            let table = schema
-                .get_table(&index.table_name)
-                .and_then(|table| table.btree());
-
             let num_columns = index.columns.len();
             let btree_cursor = Box::new(BTreeCursor::new_index(
                 pager.clone(),
@@ -7568,7 +7548,7 @@ pub fn op_reset_sorter(
     let cursor = state.get_cursor(*cursor_id);
 
     match cursor_type {
-        CursorType::BTreeTable(table) => {
+        CursorType::BTreeTable(_) => {
             let cursor = cursor.as_btree_mut();
             return_if_io!(cursor.clear_btree());
         }
@@ -7629,7 +7609,13 @@ pub fn op_drop_trigger(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
-    load_insn!(DropTrigger { db, trigger_name }, insn);
+    load_insn!(
+        DropTrigger {
+            db: _,
+            trigger_name
+        },
+        insn
+    );
 
     let conn = program.connection.clone();
     conn.with_schema_mut(|schema| {
@@ -8885,7 +8871,7 @@ pub fn op_drop_column(
             let view_select_sql = format!("SELECT * FROM {view_name}");
             let _ = conn.prepare(view_select_sql.as_str()).map_err(|e| {
                 LimboError::ParseError(format!(
-                    "cannot drop column \"{}\": referenced in VIEW {view_name}: {}",
+                    "cannot drop column \"{}\": referenced in VIEW {view_name}: {}. {e}",
                     column_name, view.sql,
                 ))
             })?;
@@ -9057,7 +9043,7 @@ pub fn op_alter_column(
             .tables
             .get(&normalized_table_name)
             .expect("table being ALTERed should be in schema");
-        let column = table
+        let _column = table
             .get_column_at(*column_index)
             .expect("column being ALTERed should be in schema");
         for (view_name, view) in schema.views.iter() {
@@ -9065,7 +9051,7 @@ pub fn op_alter_column(
             // FIXME: this should rewrite the view to reference the new column name
             let _ = conn.prepare(view_select_sql.as_str()).map_err(|e| {
                 LimboError::ParseError(format!(
-                    "cannot rename column \"{}\": referenced in VIEW {view_name}: {}",
+                    "cannot rename column \"{}\": referenced in VIEW {view_name}: {}. {e}",
                     old_column_name, view.sql,
                 ))
             })?;
