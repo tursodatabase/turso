@@ -832,6 +832,12 @@ impl std::ops::BitOrAssign for TableMask {
     }
 }
 
+impl Default for TableMask {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TableMask {
     /// Creates a new empty table mask.
     ///

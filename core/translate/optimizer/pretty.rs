@@ -1674,7 +1674,7 @@ pub fn format_join_evaluation(eval: &JoinEvaluation) -> String {
         eval.inner_access,
     );
     if let Some(idx) = &eval.index_name {
-        result.push_str(&format!("│   Index: {:<38} │\n", idx));
+        result.push_str(&format!("│   Index: {idx:<38} │\n"));
     }
     result.push_str(&format!(
         "│   Seeks: {:>6} × {:.1} cost/seek              │\n\
@@ -1711,9 +1711,8 @@ pub struct IndexCandidate {
 pub fn format_index_selection(table_name: &str, candidates: &[IndexCandidate]) -> String {
     let mut result = format!(
         "\n╔═══════════════════════════════════════════════╗\n\
-         ║  Index Selection: {:<27} ║\n\
-         ╚═══════════════════════════════════════════════╝\n\n",
-        table_name
+         ║  Index Selection: {table_name:<27} ║\n\
+         ╚═══════════════════════════════════════════════╝\n\n"
     );
 
     for (i, c) in candidates.iter().enumerate() {
@@ -1722,7 +1721,7 @@ pub fn format_index_selection(table_name: &str, candidates: &[IndexCandidate]) -
         if !c.usable_constraints.is_empty() {
             result.push_str("  ├─ Constraints:\n");
             for cstr in &c.usable_constraints {
-                result.push_str(&format!("  │   • {}\n", cstr));
+                result.push_str(&format!("  │   • {cstr}\n"));
             }
         }
         result.push_str(&format!(

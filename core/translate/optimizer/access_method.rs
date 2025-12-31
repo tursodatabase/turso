@@ -659,6 +659,7 @@ pub fn try_hash_join_access_method(
             .find(|c| c.where_clause_pos.0 == join_key.where_clause_idx)
         {
             if let Some(col_pos) = constraint.table_col_pos {
+                // Check if the join column is a rowid alias directly from the table schema
                 if let Some(column) = build_table.columns().get(col_pos) {
                     if column.is_rowid_alias() {
                         #[cfg(feature = "wheretrace")]
@@ -670,6 +671,7 @@ pub fn try_hash_join_access_method(
                         return None;
                     }
                 }
+                // Also check regular indexes
                 for candidate in &build_constraints.candidates {
                     if let Some(index) = &candidate.index {
                         if index.column_table_pos_to_index_pos(col_pos).is_some() {

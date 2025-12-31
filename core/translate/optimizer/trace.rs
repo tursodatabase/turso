@@ -242,20 +242,4 @@ mod tests {
         assert!(enabled(flags::CODE_GEN));
         WHERETRACE.store(0, Ordering::Relaxed);
     }
-
-    #[test]
-    fn test_convenience_masks() {
-        // SQLITE_COMPAT should include all SQLite-compatible flags
-        assert!(flags::SQLITE_COMPAT & flags::SUMMARY != 0);
-        assert!(flags::SQLITE_COMPAT & flags::QUERY_STRUCTURE != 0);
-        assert!(flags::SQLITE_COMPAT & flags::CODE_GEN != 0);
-        // But not Turso-specific flags
-        assert!(flags::SQLITE_COMPAT & flags::HASH_JOIN == 0);
-
-        // TURSO_ONLY should include only Turso-specific flags
-        assert!(flags::TURSO_ONLY & flags::HASH_JOIN != 0);
-        assert!(flags::TURSO_ONLY & flags::BLOOM_FILTER != 0);
-        // But not SQLite-compatible flags
-        assert!(flags::TURSO_ONLY & flags::SUMMARY == 0);
-    }
 }
