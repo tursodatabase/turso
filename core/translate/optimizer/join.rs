@@ -327,7 +327,18 @@ pub fn join_lhs_and_rhs<'a>(
                 probe_cardinality,
                 subqueries,
             ) {
+                #[cfg(feature = "wheretrace")]
+                crate::wheretrace!(crate::translate::optimizer::trace::flags::HASH_JOIN,
+                    "hash_join: build={} probe={} cost={} vs nested={}",
+                    crate::translate::optimizer::pretty::table(&format!("t{}", lhs_table_idx)),
+                    crate::translate::optimizer::pretty::table(&format!("t{}", rhs_table_idx)),
+                    crate::translate::optimizer::pretty::cost(*hash_join_method.cost),
+                    crate::translate::optimizer::pretty::cost(*best_access_method.cost));
                 if hash_join_method.cost < best_access_method.cost {
+                    #[cfg(feature = "wheretrace")]
+                    crate::wheretrace!(crate::translate::optimizer::trace::flags::HASH_JOIN,
+                        "  -> {}",
+                        crate::translate::optimizer::pretty::good("choosing hash join"));
                     best_access_method = hash_join_method;
                 }
             }
@@ -337,8 +348,84 @@ pub fn join_lhs_and_rhs<'a>(
     let cost = lhs_cost + best_access_method.cost;
 
     if cost > cost_upper_bound {
+        #[cfg(feature = "wheretrace")]
+        {
+            use crate::translate::optimizer::{pretty, trace::{flags, output_format, OutputFormat}};
+            let msg = match output_format() {
+                OutputFormat::Json => pretty::format_rejected_json(
+                    "join_rejected", &rhs_table_reference.identifier, *cost, *cost_upper_bound, 
+                    pretty::RejectionReason::CostExceedsBound),
+                OutputFormat::Badges => pretty::format_rejected_join(
+                    &rhs_table_reference.identifier, *cost, *cost_upper_bound,
+                    pretty::RejectionReason::CostExceedsBound),
+            };
+            crate::wheretrace!(flags::REJECTED, "{}", msg);
+        }
         return Ok(None);
     }
+    
+    #[cfg(feature = "wheretrace")]
+    {
+        use crate::translate::optimizer::{pretty, trace::{flags, output_format, OutputFormat},
+            access_method::AccessMethodParams};
+        let rows = (input_cardinality as f64 * *rhs_base_rows * output_cardinality_multiplier).ceil() as usize;
+        
+        let msg = match output_format() {
+            OutputFormat::Json => format!(
+                r#"{{"event":"join_added","table":"{}","cost":{:.0},"rows":{}}}"#,
+                &rhs_table_reference.identifier, *cost, rows),
+            OutputFormat::Badges => {
+                // Build detailed join evaluation
+                let (inner_access, index_name) = match &best_access_method.params {
+                    AccessMethodParams::BTreeTable { index, constraint_refs, .. } => {
+                        if let Some(idx) = index {
+                            if constraint_refs.is_empty() {
+                                ("Index Scan".to_string(), Some(idx.name.clone()))
+                            } else {
+                                ("Index Seek".to_string(), Some(idx.name.clone()))
+                            }
+                        } else if constraint_refs.is_empty() {
+                            ("Full Scan".to_string(), None)
+                        } else {
+                            ("Rowid Seek".to_string(), None)
+                        }
+                    },
+                    AccessMethodParams::HashJoin { .. } => ("Hash Join".to_string(), None),
+                    AccessMethodParams::VirtualTable { .. } => ("VTab Scan".to_string(), None),
+                    AccessMethodParams::Subquery => ("Subquery".to_string(), None),
+                };
+                
+                // Get outer table info if available
+                let (outer_table, outer_cost, outer_rows) = if let Some(l) = lhs {
+                    let outer_name = l.data.iter()
+                        .map(|(t, _)| joined_tables[*t].identifier.chars().take(8).collect::<String>())
+                        .collect::<Vec<_>>()
+                        .join("→");
+                    (outer_name, *l.cost, l.output_cardinality as f64)
+                } else {
+                    ("(start)".to_string(), 0.0, 1.0)
+                };
+                
+                let eval = pretty::JoinEvaluation {
+                    outer_table,
+                    outer_access: "Scan".to_string(),
+                    outer_cost,
+                    outer_rows,
+                    inner_table: rhs_table_reference.identifier.chars().take(15).collect(),
+                    inner_access,
+                    index_name,
+                    seeks: outer_rows,
+                    cost_per_seek: if outer_rows > 0.0 { *best_access_method.cost / outer_rows } else { 0.0 },
+                    output_rows: rows as f64,
+                    total_cost: *cost,
+                    is_new_best: true,
+                };
+                pretty::format_join_evaluation(&eval)
+            }
+        };
+        crate::wheretrace!(flags::LOOP_INSERT, "{}", msg);
+    }
+    
     access_methods_arena.push(best_access_method);
 
     let mut best_access_methods = Vec::with_capacity(join_order.len());
@@ -385,6 +472,11 @@ pub fn compute_best_join_order<'a>(
     }
 
     let num_tables = joined_tables.len();
+    
+    #[cfg(feature = "wheretrace")]
+    crate::wheretrace!(crate::translate::optimizer::trace::flags::SUMMARY,
+        "{}",
+        crate::translate::optimizer::pretty::format_optimizer_start(num_tables, 0x0, maybe_order_target.is_some()));
 
     // For large queries, use greedy join ordering instead of exhaustive DP.
     // The DP algorithm has O(2^n) complexity which becomes prohibitively slow
@@ -426,6 +518,10 @@ pub fn compute_best_join_order<'a>(
 
     // If we have one table, then the "naive left-to-right plan" is always the best.
     if joined_tables.len() == 1 {
+        #[cfg(feature = "wheretrace")]
+        crate::wheretrace!(crate::translate::optimizer::trace::flags::SUMMARY,
+            "*** Optimizer Finished *** (single-table fast path)");
+        
         return match naive_plan {
             Some(plan) => Ok(Some(BestJoinOrderResult {
                 best_plan: plan,
@@ -489,6 +585,40 @@ pub fn compute_best_join_order<'a>(
         }
     }
     join_order.clear();
+
+    // Trace the initial solver state (base cases)
+    #[cfg(feature = "wheretrace")]
+    {
+        use crate::translate::optimizer::{pretty, trace::flags};
+        let total_rows: f64 = base_table_rows.iter().map(|r| **r).sum();
+        crate::wheretrace!(flags::SOLVER, "{}", pretty::format_solver_begin(total_rows, 0));
+        
+        // Show round 0 with readable table
+        crate::wheretrace!(flags::SOLVER, "{}", pretty::format_round_header(0, 1));
+        let entries: Vec<pretty::ReadableRoundEntry> = best_plan_memo.iter()
+            .map(|(mask, plan)| {
+                // Build name from all set bits in the mask (bit i+1 = table i)
+                let name: String = (0..num_tables)
+                    .filter(|i| (mask.0 >> (i + 1)) & 1 != 0)
+                    .map(|i| joined_tables.get(i)
+                        .map(|t| t.identifier.chars().take(8).collect::<String>())
+                        .unwrap_or_else(|| format!("t{}", i)))
+                    .collect::<Vec<_>>()
+                    .join("→");
+                pretty::ReadableRoundEntry {
+                    id: mask.0,
+                    join_order: name,
+                    cost: *plan.cost,
+                    rows: plan.output_cardinality as f64,
+                    is_best: false,
+                    is_skipped: false,
+                }
+            })
+            .collect();
+        if !entries.is_empty() {
+            crate::wheretrace!(flags::SOLVER, "{}", pretty::format_readable_round_table(&entries));
+        }
+    }
 
     // As mentioned, inner joins are commutative. Outer joins are NOT.
     // Example:
@@ -558,6 +688,10 @@ pub fn compute_best_join_order<'a>(
                 {
                     let legal = !lhs_mask.intersects(illegal_lhs);
                     if !legal {
+                        #[cfg(feature = "wheretrace")]
+                        crate::wheretrace!(crate::translate::optimizer::trace::flags::REJECTED,
+                            "  [SKIP] mask={:b}  reason=left_join_ordering rhs={} conflicts_with={:b}",
+                            mask.0, rhs_idx, illegal_lhs.0);
                         continue; // Don't allow RHS before its LEFT in LEFT JOIN
                     }
                 }
@@ -565,6 +699,10 @@ pub fn compute_best_join_order<'a>(
                 // If the already cached plan for this subset was too crappy to consider,
                 // then joining it with RHS won't help. Skip.
                 let Some(lhs) = best_plan_memo.get(&lhs_mask) else {
+                    #[cfg(feature = "wheretrace")]
+                    crate::wheretrace!(crate::translate::optimizer::trace::flags::REJECTED,
+                        "  [SKIP] mask={:b}  reason=no_viable_lhs lhs_mask={:b}",
+                        mask.0, lhs_mask.0);
                     continue;
                 };
 
@@ -620,6 +758,14 @@ pub fn compute_best_join_order<'a>(
                 } else {
                     false
                 };
+                
+                #[cfg(feature = "wheretrace")]
+                {
+                    use crate::translate::optimizer::{pretty, trace::flags};
+                    crate::wheretrace!(flags::SOLVER, "{}",
+                        pretty::format_solver_new(
+                            mask.0, *rel.cost, rel.output_cardinality, *rel.cost, satisfies_order_target));
+                }
 
                 // If this plan is worse than our overall best, it might still be the best ordered plan.
                 if rel.cost >= cost_upper_bound {
@@ -661,8 +807,117 @@ pub fn compute_best_join_order<'a>(
                 }
             }
         }
+
+        // Trace after each round of DP with readable table
+        #[cfg(feature = "wheretrace")]
+        {
+            use crate::translate::optimizer::{pretty, trace::flags};
+            // Emit round header
+            crate::wheretrace!(flags::SOLVER, "{}", pretty::format_round_header(subset_size - 1, subset_size));
+            
+            // Collect entries for this round's memo
+            let entries: Vec<pretty::ReadableRoundEntry> = best_plan_memo.iter()
+                .filter(|(m, _)| m.table_count() == subset_size)
+                .map(|(mask, plan)| {
+                    // Build join order string from mask (bit i+1 = table i)
+                    let join_order: String = (0..num_tables)
+                        .filter(|i| (mask.0 >> (i + 1)) & 1 != 0)
+                        .map(|i| {
+                            let name = &joined_tables[i].identifier;
+                            // Use first 3 chars for readability
+                            name.chars().take(3).collect::<String>()
+                        })
+                        .collect::<Vec<_>>()
+                        .join("→");
+                    
+                    pretty::ReadableRoundEntry {
+                        id: mask.0,
+                        join_order,
+                        cost: *plan.cost,
+                        rows: plan.output_cardinality as f64,
+                        is_best: false,
+                        is_skipped: false,
+                    }
+                })
+                .collect();
+            
+            if !entries.is_empty() {
+                crate::wheretrace!(flags::SOLVER, "{}", pretty::format_readable_round_table(&entries));
+            }
+        }
     }
 
+    #[cfg(feature = "wheretrace")]
+    if let Some(ref plan) = best_plan {
+        use crate::translate::optimizer::{pretty, trace::flags};
+        // Solution summary
+        let order_satisfied = best_plan_is_also_ordered || best_ordered_plan.is_some();
+        crate::wheretrace!(flags::SOLVER, "{}",
+            pretty::format_solver_solution(*plan.cost, plan.output_cardinality, order_satisfied));
+        // Optimizer finish
+        let table_order: Vec<usize> = plan.table_numbers().collect();
+        crate::wheretrace!(flags::SUMMARY,
+            "{}",
+            pretty::format_optimizer_finish(*plan.cost, plan.output_cardinality, &table_order));
+        
+        // Enhanced final plan visualization
+        use crate::translate::optimizer::access_method::AccessMethodParams;
+        let mut cumulative_rows = 1.0f64; // Running estimate of rows produced
+        let steps: Vec<pretty::PlanStep> = plan.data.iter().enumerate().map(|(i, (table_num, am_idx))| {
+            let am = &access_methods_arena[*am_idx];
+            let table = &joined_tables[*table_num];
+            let base_rows = *base_table_rows.get(*table_num).copied().unwrap_or(
+                RowCountEstimate::HardcodedFallback(1_000_000.0));
+            
+            let (operation, index_name, is_seek) = match &am.params {
+                AccessMethodParams::BTreeTable { index, constraint_refs, .. } => {
+                    if let Some(idx) = index {
+                        if constraint_refs.is_empty() {
+                            ("INDEX SCAN".to_string(), Some(idx.name.clone()), false)
+                        } else {
+                            ("INDEX SEEK".to_string(), Some(idx.name.clone()), true)
+                        }
+                    } else if constraint_refs.is_empty() {
+                        ("SCAN".to_string(), None, false)
+                    } else {
+                        ("ROWID SEEK".to_string(), None, true)
+                    }
+                },
+                AccessMethodParams::HashJoin { .. } => ("HASH JOIN".to_string(), None, false),
+                AccessMethodParams::VirtualTable { .. } => ("VTAB SCAN".to_string(), None, false),
+                AccessMethodParams::Subquery => ("SUBQUERY".to_string(), None, false),
+            };
+            // Row estimation for display:
+            // - First table (i==0): input = base_rows, output = base_rows (or filtered)
+            // - Seeks (i>0): input = previous_output, output = selectivity * input (typically 1:1 for PK)
+            // - Scans as inner: input = base, output = base * selectivity
+            let (input_rows, output_rows) = if i == 0 {
+                (base_rows, base_rows * 0.1) // Assume ~10% filter selectivity for first table
+            } else if is_seek {
+                // Nested loop: we seek once per outer row, each seek returns ~1 row (for PK)
+                (cumulative_rows, cumulative_rows * 0.4) // Assume ~40% pass post-seek filters
+            } else {
+                // Scan as inner (rare) - full cross product
+                (base_rows, cumulative_rows * base_rows)
+            };
+            cumulative_rows = output_rows;
+            
+            pretty::PlanStep {
+                step_num: i + 1,
+                operation,
+                table_name: table.identifier.clone(),
+                index_name,
+                cost: *am.cost,
+                input_rows,
+                output_rows,
+                filters: vec![],
+            }
+        }).collect();
+        
+        crate::wheretrace!(flags::SUMMARY, "{}",
+            pretty::format_final_plan(&steps, *plan.cost, plan.output_cardinality as f64));
+    }
+    
     match best_plan {
         Some(best_plan) => Ok(Some(BestJoinOrderResult {
             best_plan,
