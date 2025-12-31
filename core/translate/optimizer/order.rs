@@ -166,6 +166,19 @@ pub fn plan_satisfies_order_target(
     joined_tables: &[JoinedTable],
     order_target: &OrderTarget,
 ) -> bool {
+    #[cfg(feature = "wheretrace")]
+    {
+        use crate::translate::optimizer::trace::flags;
+        crate::wheretrace!(flags::ORDER_TARGET, 
+            "ORDER BY target ({} columns): {:?}",
+            order_target.0.len(),
+            order_target.0.iter().map(|c| {
+                match &c.target {
+                    ColumnTarget::Column(col) => format!("t{}:c{} {:?}", Into::<usize>::into(c.table_id), col, c.order),
+                    ColumnTarget::Expr(_) => format!("t{}:expr {:?}", Into::<usize>::into(c.table_id), c.order),
+                }
+            }).collect::<Vec<_>>());
+    }
     let mut target_col_idx = 0;
     let num_cols_in_order_target = order_target.0.len();
     for (table_index, access_method_index) in plan.data.iter() {
@@ -262,9 +275,27 @@ pub fn plan_satisfies_order_target(
 
         target_col_idx += consumed;
         if target_col_idx == num_cols_in_order_target {
+            #[cfg(feature = "wheretrace")]
+            {
+                use crate::translate::optimizer::trace::flags;
+                crate::wheretrace!(flags::ORDER_TARGET,
+                    "ORDER BY satisfied: plan provides {} of {} required columns",
+                    target_col_idx, num_cols_in_order_target);
+            }
             return true;
         }
     }
+    
+    #[cfg(feature = "wheretrace")]
+    {
+        use crate::translate::optimizer::trace::flags;
+        let satisfied = target_col_idx == num_cols_in_order_target;
+        crate::wheretrace!(flags::ORDER_TARGET,
+            "ORDER BY {}: matched {} of {} required columns",
+            if satisfied { "satisfied" } else { "NOT satisfied" },
+            target_col_idx, num_cols_in_order_target);
+    }
+    
     target_col_idx == num_cols_in_order_target
 }
 
