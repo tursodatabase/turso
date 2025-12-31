@@ -632,7 +632,72 @@ pub fn open_loop(
     mode: OperationMode,
     subqueries: &mut [NonFromClauseSubquery],
 ) -> Result<()> {
+    let num_tables = join_order.len();
+    
+    // Trace the WHERE clause being coded (before loop generation)
+    #[cfg(feature = "wheretrace")]
+    {
+        use crate::translate::optimizer::{pretty, trace::flags};
+        use crate::translate::planner::table_mask_from_expr;
+        // Print "WHERE clause being coded:" header
+        crate::wheretrace!(flags::CODE_GEN, "{}", pretty::format_where_clause_being_coded());
+        // Print unconsumed predicates that will be evaluated in the loop
+        for (i, pred) in predicates.iter().enumerate() {
+            if !pred.consumed {
+                crate::wheretrace!(flags::CODE_GEN, "{}",
+                    pretty::format_expr_tree(&pred.expr, "", i == predicates.len() - 1));
+            }
+        }
+
+        // All WHERE-clause terms before coding
+        crate::wheretrace!(flags::CODE_GEN, "All WHERE-clause terms before coding:");
+        for (i, pred) in predicates.iter().enumerate() {
+            let prereq_mask = table_mask_from_expr(&pred.expr, table_references, subqueries)
+                .map(|m| m.0)
+                .unwrap_or_default();
+            
+            crate::wheretrace!(flags::CODE_GEN, "{}", pretty::format_where_term(
+                i, 
+                None, 
+                0, 
+                if pred.consumed { 0x0004 } else { 0 },
+                1.0, 
+                prereq_mask, 
+                Some(&pred.expr),
+                false, 
+                pred.consumed, 
+                false
+            ));
+        }
+    }
+    
     for (join_index, join) in join_order.iter().enumerate() {
+        // Trace code generation for each loop level
+        #[cfg(feature = "wheretrace")]
+        {
+            use crate::translate::optimizer::{pretty, trace::flags};
+            let table = &table_references.joined_tables()[join.original_idx];
+            // notReady bitmask: tables not yet in loop (all tables minus already-processed)
+            let not_ready: u64 = {
+                let all_tables = (1u64 << num_tables) - 1; // all bits set for num_tables
+                let processed = (1u64 << join_index) - 1;  // bits for already-processed tables
+                all_tables & !processed
+            };
+            
+            // Match SQLite spacing: Coding level {level} of {total}:  notReady=0x{mask:016x}  iFrom={idx}
+            crate::wheretrace!(flags::CODE_GEN, 
+                "{} (table={}, op={:?})",
+                pretty::format_coding_level(join_index, num_tables, not_ready, join.original_idx),
+                table.identifier,
+                match &table.op {
+                    crate::translate::plan::Operation::Scan(_) => "Scan",
+                    crate::translate::plan::Operation::Search(_) => "Search",
+                    crate::translate::plan::Operation::HashJoin(_) => "HashJoin",
+                    crate::translate::plan::Operation::IndexMethodQuery(_) => "IndexMethodQuery",
+                }
+            );
+        }
+        
         let joined_table_index = join.original_idx;
         let table = &table_references.joined_tables()[joined_table_index];
         let LoopLabels {
@@ -1103,6 +1168,40 @@ pub fn open_loop(
             false,
             subqueries,
         )?;
+        
+        // Trace End Coding level
+        #[cfg(feature = "wheretrace")]
+        {
+            use crate::translate::optimizer::trace::flags;
+            // Update notReady: clear the bit for the table we just coded
+            let not_ready_after: u64 = {
+                let all_tables = (1u64 << num_tables) - 1;
+                let processed = (1u64 << (join_index + 1)) - 1;
+                all_tables & !processed
+            };
+            crate::wheretrace!(flags::CODE_GEN,
+                "End Coding level {}: notReady={:016x}",
+                join_index, not_ready_after);
+            
+            // All WHERE-clause terms after coding level N
+            crate::wheretrace!(flags::CODE_GEN, "All WHERE-clause terms after coding level {}:", join_index);
+            for (i, pred) in predicates.iter().enumerate() {
+                use crate::translate::optimizer::pretty;
+                crate::wheretrace!(flags::CODE_GEN, "TERM-{} status={}", i, if pred.consumed { "CONSUMED" } else { "READY" });
+                crate::wheretrace!(flags::CODE_GEN, "{}", pretty::format_where_term(
+                    i, 
+                    None, 
+                    0, 
+                    if pred.consumed { 0x0004 } else { 0 }, 
+                    1.0, 
+                    0, 
+                    Some(&pred.expr),
+                    false,
+                    pred.consumed,
+                    false
+                ));
+            }
+        }
     }
 
     if subqueries.iter().any(|s| !s.has_been_evaluated()) {
@@ -1130,13 +1229,23 @@ fn emit_conditions(
     from_outer_join: bool,
     subqueries: &[NonFromClauseSubquery],
 ) -> Result<()> {
-    for cond in predicates
+    for (i, cond) in predicates
         .iter()
-        .filter(|cond| cond.from_outer_join.is_some() == from_outer_join)
-        .filter(|cond| {
+        .enumerate()
+        .filter(|(_, cond)| cond.from_outer_join.is_some() == from_outer_join)
+        .filter(|(_, cond)| {
             cond.should_eval_at_loop(join_index, join_order, subqueries, Some(table_references))
         })
     {
+        #[cfg(feature = "wheretrace")]
+        {
+            use crate::translate::optimizer::trace::flags;
+            crate::wheretrace!(flags::CODE_GEN, "Coding auxiliary constraint:");
+            crate::wheretrace!(flags::CODE_GEN, "{}", crate::translate::optimizer::pretty::format_where_term(
+                i, None, 0, 0x0004, 1.0, 0, Some(&cond.expr), false, true, false
+            ));
+        }
+
         let jump_target_when_true = program.allocate_label();
         let condition_metadata = ConditionMetadata {
             jump_if_condition_is_true: false,
