@@ -13,6 +13,7 @@ pub fn translate_create_materialized_view(
     view_name: &ast::Name,
     resolver: &Resolver,
     select_stmt: &ast::Select,
+    if_not_exists: bool,
     connection: Arc<Connection>,
     mut program: ProgramBuilder,
 ) -> Result<ProgramBuilder> {
@@ -32,6 +33,10 @@ pub fn translate_create_materialized_view(
         .get_materialized_view(&normalized_view_name)
         .is_some()
     {
+        if if_not_exists {
+            program.epilogue(resolver.schema);
+            return Ok(program);
+        }
         return Err(crate::LimboError::ParseError(format!(
             "View {normalized_view_name} already exists"
         )));
