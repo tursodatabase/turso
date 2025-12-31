@@ -38,6 +38,7 @@ pub fn emit_values(
         QueryDestination::RowSet { .. } => {
             unreachable!("RowSet query destination should not be used in values emission")
         }
+        QueryDestination::RecursiveCte { .. } => emit_toplevel_values(program, plan, t_ctx)?,
         QueryDestination::Unset => unreachable!("Unset query destination should not be reached"),
     };
     Ok(reg_result_cols_start)
@@ -224,6 +225,63 @@ fn emit_values_to_destination(
         }
         QueryDestination::RowSet { .. } => {
             unreachable!("RowSet query destination should not be used in values emission")
+        }
+        QueryDestination::RecursiveCte {
+            result_cursor,
+            queue_cursor,
+            num_cols,
+            is_union_all,
+        } => {
+            let record_reg = program.alloc_register();
+            program.emit_insn(Insn::MakeRecord {
+                start_reg: to_u16(start_reg),
+                count: to_u16(*num_cols),
+                dest_reg: to_u16(record_reg),
+                index_name: None,
+                affinity_str: None,
+            });
+
+            if !*is_union_all {
+                let label_skip = program.allocate_label();
+                program.emit_insn(Insn::Found {
+                    cursor_id: *result_cursor,
+                    target_pc: label_skip,
+                    record_reg: start_reg,
+                    num_regs: *num_cols,
+                });
+
+                program.emit_insn(Insn::IdxInsert {
+                    cursor_id: *result_cursor,
+                    record_reg,
+                    unpacked_start: None,
+                    unpacked_count: None,
+                    flags: IdxInsertFlags::new(),
+                });
+                program.emit_insn(Insn::IdxInsert {
+                    cursor_id: *queue_cursor,
+                    record_reg,
+                    unpacked_start: None,
+                    unpacked_count: None,
+                    flags: IdxInsertFlags::new(),
+                });
+
+                program.preassign_label_to_next_insn(label_skip);
+            } else {
+                program.emit_insn(Insn::IdxInsert {
+                    cursor_id: *result_cursor,
+                    record_reg,
+                    unpacked_start: None,
+                    unpacked_count: None,
+                    flags: IdxInsertFlags::new(),
+                });
+                program.emit_insn(Insn::IdxInsert {
+                    cursor_id: *queue_cursor,
+                    record_reg,
+                    unpacked_start: None,
+                    unpacked_count: None,
+                    flags: IdxInsertFlags::new(),
+                });
+            }
         }
         QueryDestination::Unset => unreachable!("Unset query destination should not be reached"),
     }
