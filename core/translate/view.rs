@@ -16,21 +16,21 @@ use crate::vdbe::insn::{CmpInsFlags, Cookie, Insn, RegisterOrLiteral};
 use crate::{bail_parse_error, Connection, Result, MAIN_DB_ID};
 use turso_parser::ast;
 
+/// Returns Ok(true) if the view already exists and IF NOT EXISTS was specified — the caller
+/// should emit only the program epilogue and skip building the view.
 fn validate_materialized(
     connection: &Arc<crate::Connection>,
     database_id: usize,
     resolver: &Resolver,
     normalized_view_name: &str,
-) -> Result<()> {
-    // Check if experimental views are enabled
+    if_not_exists: bool,
+) -> Result<bool> {
     if !connection.experimental_views_enabled() {
         return Err(crate::LimboError::ParseError(
             "CREATE MATERIALIZED VIEW is an experimental feature. Enable with --experimental-views flag"
                 .to_string(),
         ));
     }
-    // The DBSP incremental maintenance runtime (populate_from_table, etc.) assumes
-    // the main database pager/schema. Block attached databases until that is fixed.
     if database_id != crate::MAIN_DB_ID {
         crate::bail_parse_error!("materialized views are not supported on attached databases");
     }
@@ -41,21 +41,24 @@ fn validate_materialized(
         bail_parse_error!("Object name reserved for internal use: {normalized_view_name}",);
     }
 
-    // Check if view already exists
     if resolver.with_schema(database_id, |s| {
         s.get_materialized_view(normalized_view_name).is_some()
     }) {
+        if if_not_exists {
+            return Ok(true);
+        }
         return Err(crate::LimboError::ParseError(format!(
             "View {normalized_view_name} already exists"
         )));
     }
-    Ok(())
+    Ok(false)
 }
 
 pub fn translate_create_materialized_view(
     view_name: &ast::QualifiedName,
     resolver: &Resolver,
     select_stmt: &ast::Select,
+    if_not_exists: bool,
     connection: Arc<Connection>,
     program: &mut ProgramBuilder,
 ) -> Result<()> {
@@ -67,7 +70,16 @@ pub fn translate_create_materialized_view(
     // Validate the view can be created and extract its columns
     // This validation happens before updating sqlite_master to prevent
     // storing invalid view definitions
-    validate_materialized(&connection, database_id, resolver, &normalized_view_name)?;
+    if validate_materialized(
+        &connection,
+        database_id,
+        resolver,
+        &normalized_view_name,
+        if_not_exists,
+    )? {
+        program.epilogue(resolver.schema());
+        return Ok(());
+    }
 
     // Check for cross-database table references first
     crate::util::validate_select_for_views(select_stmt, view_name.db_name.as_ref())?;

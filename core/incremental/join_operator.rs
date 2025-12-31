@@ -29,6 +29,12 @@ fn read_next_join_row(
     last_element_hash: Option<Hash128>,
     cursors: &mut DbspStateCursors,
 ) -> Result<IOResult<Option<(Hash128, HashableRow, isize)>>> {
+    // For one-shot queries without persistent storage, the btree root page is 0
+    // In this case, there's no stored state to join against - return None
+    if cursors.index_cursor.root_page() == 0 {
+        return Ok(IOResult::Done(None));
+    }
+
     // Build the index key: (storage_id, zset_id, element_id)
     // zset_id is the hash of the join key
     let zset_hash = join_key.cached_hash();
@@ -730,5 +736,13 @@ impl IncrementalOperator for JoinOperator {
 
     fn set_tracker(&mut self, tracker: Arc<Mutex<ComputationTracker>>) {
         self.tracker = Some(tracker);
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
     }
 }
