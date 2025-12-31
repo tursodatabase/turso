@@ -6958,7 +6958,7 @@ pub fn op_new_rowid(
             insn
         );
         let mv_store = program.connection.mv_store();
-        if let Some(mv_store) = mv_store.as_ref() {
+        if mv_store.is_some() {
             let cursor = state.get_cursor(*cursor);
             let cursor = cursor.as_btree_mut() as &mut dyn Any;
             if let Some(mvcc_cursor) = cursor.downcast_mut::<MvCursor>() {
@@ -6993,7 +6993,7 @@ fn new_rowid_inner(
                     mvcc_already_initialized: false,
                 };
 
-                if let Some(mv_store) = mv_store.as_ref() {
+                if mv_store.is_some() {
                     let cursor = state.get_cursor(*cursor);
                     let cursor = cursor.as_btree_mut() as &mut dyn Any;
                     if let Some(mvcc_cursor) = cursor.downcast_mut::<MvCursor>() {
@@ -7071,7 +7071,7 @@ fn new_rowid_inner(
                 };
 
                 // Initialize table's max rowid in MVCC if enabled
-                if let Some(mv_store) = mv_store.as_ref() {
+                if mv_store.is_some() {
                     let cursor = state.get_cursor(*cursor);
                     let cursor = cursor.as_btree_mut() as &mut dyn Any;
                     if let Some(mvcc_cursor) = cursor.downcast_mut::<MvCursor>() {
@@ -7144,7 +7144,7 @@ fn new_rowid_inner(
                     state.op_new_rowid_state = OpNewRowidState::Start;
                     state.pc += 1;
 
-                    if let Some(mv_store) = mv_store.as_ref() {
+                    if mv_store.is_some() {
                         let cursor = state.get_cursor(*cursor);
                         let cursor = cursor.as_btree_mut() as &mut dyn Any;
                         if let Some(mvcc_cursor) = cursor.downcast_mut::<MvCursor>() {
@@ -7169,7 +7169,7 @@ fn new_rowid_inner(
                 state.op_new_rowid_state = OpNewRowidState::Start;
                 state.pc += 1;
 
-                if let Some(mv_store) = mv_store.as_ref() {
+                if mv_store.is_some() {
                     let cursor = state.get_cursor(*cursor);
                     let cursor = cursor.as_btree_mut() as &mut dyn Any;
                     if let Some(mvcc_cursor) = cursor.downcast_mut::<MvCursor>() {
