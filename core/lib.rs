@@ -28,7 +28,10 @@ pub mod storage;
 #[allow(dead_code)]
 #[cfg(feature = "time")]
 mod time;
+#[cfg(not(feature = "wheretrace"))]
 mod translate;
+#[cfg(feature = "wheretrace")]
+pub mod translate;
 pub mod types;
 mod util;
 #[cfg(feature = "uuid")]

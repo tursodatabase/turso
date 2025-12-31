@@ -55,6 +55,10 @@ pub(crate) mod cost;
 pub(crate) mod join;
 pub(crate) mod lift_common_subexpressions;
 pub(crate) mod order;
+#[cfg(feature = "wheretrace")]
+pub mod pretty;
+#[cfg(feature = "wheretrace")]
+pub mod trace;
 
 #[tracing::instrument(skip_all, level = tracing::Level::DEBUG)]
 pub fn optimize_plan(program: &mut ProgramBuilder, plan: &mut Plan, schema: &Schema) -> Result<()> {
@@ -721,6 +725,37 @@ fn optimize_table_access(
         best_ordered_plan,
     } = best_join_order_result;
 
+    // Trace the state of the WHERE clause at the end of analysis
+    #[cfg(feature = "wheretrace")]
+    {
+        use crate::translate::optimizer::{pretty, trace::flags};
+        crate::wheretrace!(flags::CONSTRAINT,
+            "{}",
+            pretty::format_where_clause_end_of_analysis());
+        for tc in constraints_per_table.iter() {
+            let table_idx: usize = tc.table_id.into();
+            for (i, c) in tc.constraints.iter().enumerate() {
+                let term = &where_clause[c.where_clause_pos.0];
+                crate::wheretrace!(flags::CONSTRAINT,
+                    "{}",
+                    pretty::format_constraint_sqlite(
+                        i,
+                        table_idx,
+                        c.table_col_pos,
+                        &c.operator,
+                        c.selectivity,
+                        c.usable,
+                        term.consumed,
+                        c.lhs_mask.0,
+                        false, // is_virtual
+                        false, // is_equiv
+                    ));
+                crate::wheretrace!(flags::CONSTRAINT, "{}",
+                    pretty::format_expr_tree(&term.expr, "", true));
+            }
+        }
+    }
+
     // See if best_ordered_plan is better than the overall best_plan if we add a sorting penalty
     // to the unordered plan's cost.
     let best_plan = if let Some(best_ordered_plan) = best_ordered_plan {
@@ -962,6 +997,10 @@ fn optimize_table_access(
                                 // but that optimization should not be done here - it should be done before the join order optimization happens.
                                 continue;
                             }
+                            #[cfg(feature = "wheretrace")]
+                            crate::wheretrace!(crate::translate::optimizer::trace::flags::CODE_GEN,
+                                "DISABLE-TERM-{}: consumed by index seek",
+                                constraint.where_clause_pos.0);
                             where_term.consumed = true;
                         }
                     }
@@ -1092,6 +1131,10 @@ fn build_vtab_scan_op(
 
         let constraint = &table_constraints.constraints[vtab_constraint.index];
         if usage.omit {
+            #[cfg(feature = "wheretrace")]
+            crate::wheretrace!(crate::translate::optimizer::trace::flags::CODE_GEN,
+                "DISABLE-TERM-{}: virtual table omits constraint",
+                constraint.where_clause_pos.0);
             where_clause[constraint.where_clause_pos.0].consumed = true;
         }
         let (_, expr, _) = constraint.get_constraining_expr(where_clause, referenced_tables);

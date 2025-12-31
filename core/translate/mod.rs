@@ -25,7 +25,10 @@ pub(crate) mod insert;
 pub(crate) mod integrity_check;
 pub(crate) mod logical;
 pub(crate) mod main_loop;
+#[cfg(not(feature = "wheretrace"))]
 pub(crate) mod optimizer;
+#[cfg(feature = "wheretrace")]
+pub mod optimizer;
 pub(crate) mod order_by;
 pub(crate) mod plan;
 pub(crate) mod planner;
