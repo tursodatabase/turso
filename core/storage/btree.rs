@@ -270,6 +270,9 @@ struct BalanceState {
     /// These persist across balance operations to avoid repeated allocations.
     /// We use Vec<u8> with clear/resize instead of allocating new each time.
     reusable_divider_buffers: [Vec<u8>; MAX_SIBLING_PAGES_TO_BALANCE - 1],
+    /// Reusable Vec for CellArray cell_payloads to avoid per-balance allocation.
+    /// Cleared before each use; grows as needed and retains capacity across operations.
+    reusable_cell_payloads: Vec<&'static mut [u8]>,
 }
 
 /// State machine of a write operation.
@@ -2824,6 +2827,7 @@ impl BTreeCursor {
                 sub_state,
                 balance_info,
                 reusable_divider_buffers,
+                reusable_cell_payloads,
             } = &mut self.balance_state;
             tracing::debug!(?sub_state);
 
@@ -3088,6 +3092,14 @@ impl BTreeCursor {
                     let parent_page = PinGuard::new(self.stack.top_ref().clone());
                     let parent_contents = parent_page.get_contents();
 
+                    // Pre-compute parent page parameters for faster cell region lookups.
+                    // Note: cell_count cannot be pre-computed as it changes during the loop via drop_cell.
+                    let parent_page_type = parent_contents.page_type();
+                    let parent_max_local =
+                        payload_overflow_threshold_max(parent_page_type, usable_space);
+                    let parent_min_local =
+                        payload_overflow_threshold_min(parent_page_type, usable_space);
+
                     // 1. Collect cell data from divider cells, and count the total number of cells to be distributed.
                     // The count includes: all cells and overflow cells from the sibling pages, and divider cells from the parent page,
                     // excluding the rightmost divider, which will not be dropped from the parent; instead it will be updated at the end.
@@ -3131,8 +3143,17 @@ impl BTreeCursor {
                             // here we can subtract overflow_cells.len() every time, because we are iterating right-to-left,
                             // so if we are to the left of the overflow cell, it has already been cleared from the parent and overflow_cells.len() is 0.
                             let actual_cell_idx = cell_idx - parent_contents.overflow_cells.len();
-                            let (cell_start, cell_len) =
-                                parent_contents.cell_get_raw_region(actual_cell_idx, usable_space);
+                            // Use pre-computed page parameters for faster lookup.
+                            // Note: cell_count must be fresh as it changes during the loop.
+                            let (cell_start, cell_len) = parent_contents
+                                ._cell_get_raw_region_faster(
+                                    actual_cell_idx,
+                                    usable_space,
+                                    parent_contents.cell_count(),
+                                    parent_max_local,
+                                    parent_min_local,
+                                    parent_page_type,
+                                );
                             let buf = parent_contents.as_ptr();
                             &buf[cell_start..cell_start + cell_len]
                         };
@@ -3172,8 +3193,14 @@ impl BTreeCursor {
                     }
 
                     /* 2. Initialize CellArray with all the cells used for distribution, this includes divider cells if !leaf. */
+                    // Reuse the cell_payloads Vec from previous balance operations to avoid allocation.
+                    let mut cell_payloads_vec = std::mem::take(reusable_cell_payloads);
+                    cell_payloads_vec.clear();
+                    // Ensure we have at least total_cells_to_redistribute capacity.
+                    // Since len=0 after clear, reserve(n) ensures capacity >= n.
+                    cell_payloads_vec.reserve(total_cells_to_redistribute);
                     let mut cell_array = CellArray {
-                        cell_payloads: Vec::with_capacity(total_cells_to_redistribute),
+                        cell_payloads: cell_payloads_vec,
                         cell_count_per_page_cumulative: [0; MAX_NEW_SIBLING_PAGES_AFTER_BALANCE],
                     };
                     let cells_capacity_start = cell_array.cell_payloads.capacity();
@@ -4004,6 +4031,12 @@ impl BTreeCursor {
                     if sibling_count_new == 0 {
                         self.stack.set_cell_index(0); // reset cell index, top is already parent
                     }
+
+                    // Restore the cell_payloads Vec to BalanceState for reuse in future operations.
+                    // This avoids allocation on subsequent balance operations.
+                    let mut recovered_vec = std::mem::take(&mut cell_array.cell_payloads);
+                    recovered_vec.clear();
+                    *reusable_cell_payloads = recovered_vec;
 
                     *sub_state = BalanceSubState::FreePages {
                         curr_page: sibling_count_new,
@@ -7425,6 +7458,13 @@ fn defragment_page(page: &PageContent, usable_space: usize, max_frag_bytes: isiz
     let mut is_physically_sorted = true;
     let mut last_offset = u16::MAX;
 
+    // Pre-compute page-level constants for cell_get_raw_region_faster.
+    // These are the same for all cells on the page, so computing them once
+    // avoids redundant work in the loop.
+    let page_type = page.page_type();
+    let max_local = payload_overflow_threshold_max(page_type, usable_space);
+    let min_local = payload_overflow_threshold_min(page_type, usable_space);
+
     if cell_count <= MAX_STACK_CELLS {
         // Use stack allocation for small cell counts (common case).
         let mut stack_cells: [CellInfo; MAX_STACK_CELLS] = [CellInfo {
@@ -7433,23 +7473,36 @@ fn defragment_page(page: &PageContent, usable_space: usize, max_frag_bytes: isiz
             pointer_index: 0,
         }; MAX_STACK_CELLS];
 
-        for i in 0..cell_count {
+        for (i, item) in stack_cells.iter_mut().enumerate().take(cell_count) {
             let pc = page.read_u16_no_offset(cell_offset + (i * 2));
-            let (_, size) = page.cell_get_raw_region(i, usable_space);
+            let (_, size) = page._cell_get_raw_region_faster(
+                i,
+                usable_space,
+                cell_count,
+                max_local,
+                min_local,
+                page_type,
+            );
 
             if pc > last_offset {
                 is_physically_sorted = false;
             }
             last_offset = pc;
 
-            stack_cells[i] = CellInfo {
+            *item = CellInfo {
                 old_offset: pc,
                 size: size as u16,
                 pointer_index: i,
             };
         }
 
-        process_cells(page, usable_space, &mut stack_cells, cell_count, is_physically_sorted)?;
+        process_cells(
+            page,
+            usable_space,
+            &mut stack_cells,
+            cell_count,
+            is_physically_sorted,
+        )?;
         debug_validate_cells!(page, usable_space);
         return Ok(());
     }
@@ -7458,7 +7511,14 @@ fn defragment_page(page: &PageContent, usable_space: usize, max_frag_bytes: isiz
     let mut heap_cells = Vec::with_capacity(cell_count);
     for i in 0..cell_count {
         let pc = page.read_u16_no_offset(cell_offset + (i * 2));
-        let (_, size) = page.cell_get_raw_region(i, usable_space);
+        let (_, size) = page._cell_get_raw_region_faster(
+            i,
+            usable_space,
+            cell_count,
+            max_local,
+            min_local,
+            page_type,
+        );
 
         if pc > last_offset {
             is_physically_sorted = false;
@@ -7472,7 +7532,13 @@ fn defragment_page(page: &PageContent, usable_space: usize, max_frag_bytes: isiz
         });
     }
 
-    process_cells(page, usable_space, &mut heap_cells, cell_count, is_physically_sorted)?;
+    process_cells(
+        page,
+        usable_space,
+        &mut heap_cells,
+        cell_count,
+        is_physically_sorted,
+    )?;
     debug_validate_cells!(page, usable_space);
     Ok(())
 }
