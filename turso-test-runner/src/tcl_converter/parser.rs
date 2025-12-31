@@ -110,8 +110,6 @@ pub enum TclTestKind {
     Pattern(String),
     /// Error with optional pattern
     Error(Option<String>),
-    /// Any error
-    AnyError,
 }
 
 impl TclTest {
@@ -146,8 +144,6 @@ enum ResultKind {
     Pattern,
     /// Error with optional pattern
     Error,
-    /// Any error (no result arg needed)
-    AnyError,
 }
 
 /// Argument layout for different test functions
@@ -189,7 +185,7 @@ impl TestConfig {
 
     fn any_error(self) -> Self {
         Self {
-            result_kind: ResultKind::AnyError,
+            result_kind: ResultKind::Error,
             ..self
         }
     }
@@ -259,7 +255,6 @@ fn build_test(args: Vec<String>, config: TestConfig) -> Result<TclTest, String> 
         ResultKind::Exact => TclTestKind::Exact(result_arg.unwrap_or_default()),
         ResultKind::Pattern => TclTestKind::Pattern(result_arg.unwrap_or_else(|| ".*".to_string())),
         ResultKind::Error => TclTestKind::Error(result_arg),
-        ResultKind::AnyError => TclTestKind::AnyError,
     };
 
     Ok(TclTest {
@@ -669,7 +664,7 @@ mod tests {
         let result = test_parser().parse(input).into_result();
         assert!(result.is_ok());
         let test = result.unwrap();
-        assert!(matches!(test.kind, TclTestKind::AnyError));
+        assert!(matches!(test.kind, TclTestKind::Error(None)));
     }
 
     #[test]
@@ -1031,7 +1026,7 @@ do_execsql_test arith-1 {SELECT 1 + 1} {2}
         let result = build_test(args, TestConfig::standard().any_error());
         assert!(result.is_ok());
         let test = result.unwrap();
-        assert!(matches!(test.kind, TclTestKind::AnyError));
+        assert!(matches!(test.kind, TclTestKind::Error(None)));
     }
 
     #[test]

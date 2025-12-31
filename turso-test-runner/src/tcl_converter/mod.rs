@@ -190,10 +190,6 @@ fn write_test(output: &mut String, test: &TclTest) {
             }
             writeln!(output, "}}").unwrap();
         }
-        TclTestKind::AnyError => {
-            writeln!(output, "expect error {{").unwrap();
-            writeln!(output, "}}").unwrap();
-        }
     }
 
     writeln!(output).unwrap();
