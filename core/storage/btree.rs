@@ -404,6 +404,10 @@ struct BalanceInfo {
     reusable_divider_cell: Vec<u8>,
 }
 
+// SAFETY: Need to guarantee during balancing that we do not modify the rightmost pointer on the pointee `PageContent`
+// safe as long as the Balance Algorithm does not modify the pointer
+unsafe impl Send for BalanceInfo {}
+
 /// Holds the state machine for the operation that was in flight when the cursor
 /// was suspended due to IO.
 enum CursorState {
@@ -661,6 +665,8 @@ pub struct BTreeCursor {
     /// This avoids allocating a new Vec for each write operation.
     reusable_cell_payload: Vec<u8>,
 }
+
+crate::assert::assert_send!(BTreeCursor);
 
 /// We store the cell index and cell count for each page in the stack.
 /// The reason we store the cell count is because we need to know when we are at the end of the page,
