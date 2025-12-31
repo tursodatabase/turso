@@ -1647,6 +1647,60 @@ pub fn extract_view_columns(
     let mut tables = Vec::new();
     let mut columns = Vec::new();
     let mut column_name_counts: HashMap<String, usize> = HashMap::default();
+    // Store CTE column definitions for SELECT * expansion
+    let mut cte_columns: HashMap<String, Vec<String>> = HashMap::default();
+    // Track seen table names for O(1) duplicate checking
+    let mut seen_tables: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+    // Handle WITH clause (CTEs) - add CTE names as valid table references
+    if let Some(with) = &select_stmt.with {
+        for cte in &with.ctes {
+            let cte_name = normalize_ident(cte.tbl_name.as_str());
+            // Extract column names from CTE definition if present
+            if !cte.columns.is_empty() {
+                let col_names: Vec<String> = cte
+                    .columns
+                    .iter()
+                    .map(|ic| normalize_ident(ic.col_name.as_str()))
+                    .collect();
+                cte_columns.insert(cte_name.clone(), col_names);
+            } else {
+                // No explicit column names - extract from the CTE's SELECT statement (base case)
+                // For recursive CTEs, this is the first SELECT before UNION/UNION ALL
+                if let ast::OneSelect::Select {
+                    columns: cte_select_columns,
+                    ..
+                } = &cte.select.body.select
+                {
+                    let col_names: Vec<String> = cte_select_columns
+                        .iter()
+                        .filter_map(|rc| match rc {
+                            ast::ResultColumn::Expr(expr, alias) => {
+                                // Use alias if present, otherwise extract name from expression
+                                alias
+                                    .as_ref()
+                                    .map(|a| match a {
+                                        ast::As::Elided(name) => normalize_ident(name.as_str()),
+                                        ast::As::As(name) => normalize_ident(name.as_str()),
+                                    })
+                                    .or_else(|| extract_column_name_from_expr(expr))
+                            }
+                            ast::ResultColumn::Star => None, // Can't extract specific names from *
+                            ast::ResultColumn::TableStar(_) => None,
+                        })
+                        .collect();
+                    if !col_names.is_empty() {
+                        cte_columns.insert(cte_name.clone(), col_names);
+                    }
+                }
+            }
+            seen_tables.insert(cte_name.clone());
+            tables.push(ViewTable {
+                name: cte_name,
+                alias: None,
+            });
+        }
+    }
 
     // Navigate to the first SELECT in the statement
     if let ast::OneSelect::Select {
@@ -1656,8 +1710,9 @@ pub fn extract_view_columns(
     } = &select_stmt.body.select
     {
         // First, extract all tables (from FROM clause and JOINs)
+        // Skip tables that are already defined as CTEs to avoid duplicates
         if let Some(from) = from {
-            // Add the main table from FROM clause
+            // Add the main table from FROM clause (only if not a CTE)
             match from.select.as_ref() {
                 ast::SelectTable::Table(qualified_name, alias, _) => {
                     let table_name = if qualified_name.db_name.is_some() {
@@ -1666,20 +1721,24 @@ pub fn extract_view_columns(
                     } else {
                         normalize_ident(qualified_name.name.as_str())
                     };
-                    tables.push(ViewTable {
-                        name: table_name,
-                        alias: alias.as_ref().map(|a| match a {
-                            ast::As::As(name) => normalize_ident(name.as_str()),
-                            ast::As::Elided(name) => normalize_ident(name.as_str()),
-                        }),
-                    });
+                    // Skip if this table has already been added
+                    if !seen_tables.contains(&table_name) {
+                        seen_tables.insert(table_name.clone());
+                        tables.push(ViewTable {
+                            name: table_name,
+                            alias: alias.as_ref().map(|a| match a {
+                                ast::As::As(name) => normalize_ident(name.as_str()),
+                                ast::As::Elided(name) => normalize_ident(name.as_str()),
+                            }),
+                        });
+                    }
                 }
                 _ => {
                     // Handle other types like subqueries if needed
                 }
             }
 
-            // Add tables from JOINs
+            // Add tables from JOINs (only if not CTEs)
             for join in &from.joins {
                 match join.table.as_ref() {
                     ast::SelectTable::Table(qualified_name, alias, _) => {
@@ -1689,13 +1748,17 @@ pub fn extract_view_columns(
                         } else {
                             normalize_ident(qualified_name.name.as_str())
                         };
-                        tables.push(ViewTable {
-                            name: table_name.clone(),
-                            alias: alias.as_ref().map(|a| match a {
-                                ast::As::As(name) => normalize_ident(name.as_str()),
-                                ast::As::Elided(name) => normalize_ident(name.as_str()),
-                            }),
-                        });
+                        // Skip if this table has already been added
+                        if !seen_tables.contains(&table_name) {
+                            seen_tables.insert(table_name.clone());
+                            tables.push(ViewTable {
+                                name: table_name.clone(),
+                                alias: alias.as_ref().map(|a| match a {
+                                    ast::As::As(name) => normalize_ident(name.as_str()),
+                                    ast::As::Elided(name) => normalize_ident(name.as_str()),
+                                }),
+                            });
+                        }
                     }
                     _ => {
                         // Handle other types like subqueries if needed
@@ -1778,6 +1841,31 @@ pub fn extract_view_columns(
                                         table_column.ty(),
                                         table_column.collation_opt(),
                                         ColDef::default(),
+                                    ),
+                                });
+                            }
+                        } else if let Some(cte_col_names) = cte_columns.get(&table.name) {
+                            // CTE with explicit column names.
+                            // Note: We default CTE columns to TEXT type because the actual types
+                            // would require evaluating the CTE's SELECT statement. This is safe
+                            // because SQLite uses dynamic typing, and the actual values will
+                            // have their proper types at runtime.
+                            for col_name in cte_col_names {
+                                let final_name =
+                                    if let Some(count) = column_name_counts.get_mut(col_name) {
+                                        *count += 1;
+                                        format!("{}:{}", col_name, *count - 1)
+                                    } else {
+                                        column_name_counts.insert(col_name.clone(), 1);
+                                        col_name.clone()
+                                    };
+
+                                columns.push(ViewColumn {
+                                    table_index: table_idx,
+                                    column: Column::new_default_text(
+                                        Some(final_name),
+                                        "TEXT".to_string(),
+                                        None,
                                     ),
                                 });
                             }

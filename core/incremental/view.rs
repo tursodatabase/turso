@@ -10,10 +10,10 @@ use crate::translate::logical::LogicalPlanBuilder;
 use crate::types::{IOResult, Value};
 use crate::util::{extract_view_columns, ViewColumnSchema};
 use crate::{return_if_io, LimboError, Pager, Result, Statement};
+use parking_lot::Mutex as ParkingLotMutex;
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
-use std::cell::RefCell;
 use std::fmt;
-use std::rc::Rc;
+use std::sync::Arc as StdArc;
 use turso_parser::ast;
 use turso_parser::{
     ast::{Cmd, Stmt},
@@ -37,6 +37,22 @@ pub enum PopulateState {
         rows_processed: usize,
         /// If we're in the middle of processing a row (merge_delta returned I/O)
         pending_row: Option<(i64, Vec<Value>)>, // (rowid, values)
+    },
+    /// Collecting data from source tables for recursive CTE (must batch all data first)
+    CollectingRecursiveCteData {
+        /// Names of tables still to be processed
+        remaining_tables: Vec<String>,
+        /// Current statement if we're in the middle of reading a table
+        current_stmt: Option<(String, Box<Statement>)>, // (table_name, stmt)
+        /// Accumulated deltas from tables already processed
+        accumulated_deltas: DeltaSet,
+    },
+    /// Executing the recursive circuit after all data has been collected.
+    /// On first entry, input_map contains the data to pass to the circuit.
+    /// On resume (after I/O yield), input_map is None and the circuit uses its internal state.
+    ExecutingRecursiveCircuit {
+        /// Input data for the circuit (Some on first entry, None on resume)
+        input_map: Option<HashMap<String, Delta>>,
     },
     /// Population complete
     Done,
@@ -74,115 +90,132 @@ impl fmt::Debug for PopulateState {
                 .field("has_pending", &pending_row.is_some())
                 .field("total_queries", &queries.len())
                 .finish(),
+            PopulateState::CollectingRecursiveCteData {
+                remaining_tables,
+                current_stmt,
+                ..
+            } => f
+                .debug_struct("CollectingRecursiveCteData")
+                .field("remaining_tables", &remaining_tables.len())
+                .field("has_current_stmt", &current_stmt.is_some())
+                .finish(),
+            PopulateState::ExecutingRecursiveCircuit { input_map } => f
+                .debug_struct("ExecutingRecursiveCircuit")
+                .field("has_input", &input_map.is_some())
+                .finish(),
             PopulateState::Done => write!(f, "Done"),
         }
     }
 }
 
-/// Per-connection transaction state for incremental views
-#[derive(Debug, Clone, Default)]
+/// Per-connection transaction state for incremental views.
+/// Uses Mutex instead of RefCell for thread safety.
+#[derive(Debug, Default)]
 pub struct ViewTransactionState {
-    // Per-table deltas for uncommitted changes
-    // Maps table_name -> Delta for that table
-    // Using RefCell for interior mutability
-    table_deltas: RefCell<HashMap<String, Delta>>,
+    table_deltas: ParkingLotMutex<HashMap<String, Delta>>,
+}
+
+impl Clone for ViewTransactionState {
+    fn clone(&self) -> Self {
+        Self {
+            table_deltas: ParkingLotMutex::new(self.table_deltas.lock().clone()),
+        }
+    }
 }
 
 impl ViewTransactionState {
     /// Create a new transaction state
     pub fn new() -> Self {
         Self {
-            table_deltas: RefCell::new(HashMap::default()),
+            table_deltas: ParkingLotMutex::new(HashMap::default()),
         }
     }
 
     /// Insert a row into the delta for a specific table
     pub fn insert(&self, table_name: &str, key: i64, values: Vec<Value>) {
-        let mut deltas = self.table_deltas.borrow_mut();
+        let mut deltas = self.table_deltas.lock();
         let delta = deltas.entry(table_name.to_string()).or_default();
         delta.insert(key, values);
     }
 
     /// Delete a row from the delta for a specific table
     pub fn delete(&self, table_name: &str, key: i64, values: Vec<Value>) {
-        let mut deltas = self.table_deltas.borrow_mut();
+        let mut deltas = self.table_deltas.lock();
         let delta = deltas.entry(table_name.to_string()).or_default();
         delta.delete(key, values);
     }
 
     /// Clear all changes in the delta
     pub fn clear(&self) {
-        self.table_deltas.borrow_mut().clear();
+        self.table_deltas.lock().clear();
     }
 
     /// Get deltas organized by table
     pub fn get_table_deltas(&self) -> HashMap<String, Delta> {
-        self.table_deltas.borrow().clone()
+        self.table_deltas.lock().clone()
     }
 
     /// Check if the delta is empty
     pub fn is_empty(&self) -> bool {
-        self.table_deltas.borrow().values().all(|d| d.is_empty())
+        self.table_deltas.lock().values().all(|d| d.is_empty())
     }
 
     /// Returns how many elements exist in the delta.
     pub fn len(&self) -> usize {
-        self.table_deltas.borrow().values().map(|d| d.len()).sum()
+        self.table_deltas.lock().values().map(|d| d.len()).sum()
     }
 }
 
-/// Container for all view transaction states within a connection
-/// Provides interior mutability for the map of view states
-#[derive(Debug, Clone, Default)]
+/// Container for all view transaction states within a connection.
+/// Thread-safe implementation using parking_lot::Mutex.
+#[derive(Debug, Default)]
 pub struct AllViewsTxState {
-    states: Rc<RefCell<HashMap<String, Arc<ViewTransactionState>>>>,
+    states: StdArc<ParkingLotMutex<HashMap<String, StdArc<ViewTransactionState>>>>,
 }
 
-// SAFETY: This needs to be audited for thread safety.
-// See: https://github.com/tursodatabase/turso/issues/1552
-unsafe impl Send for AllViewsTxState {}
-unsafe impl Sync for AllViewsTxState {}
-crate::assert::assert_send_sync!(AllViewsTxState);
+impl Clone for AllViewsTxState {
+    fn clone(&self) -> Self {
+        Self {
+            states: self.states.clone(),
+        }
+    }
+}
 
 impl AllViewsTxState {
     /// Create a new container for view transaction states
     pub fn new() -> Self {
         Self {
-            states: Rc::new(RefCell::new(HashMap::default())),
+            states: StdArc::new(ParkingLotMutex::new(HashMap::default())),
         }
     }
 
     /// Get or create a transaction state for a view
-    #[allow(clippy::arc_with_non_send_sync)]
-    pub fn get_or_create(&self, view_name: &str) -> Arc<ViewTransactionState> {
-        let mut states = self.states.borrow_mut();
-        // ViewTransactionState uses RefCell (not Sync), but AllViewsTxState is
-        // single-threaded (Rc-based). Arc is used for shared ownership, not
-        // cross-thread sharing.
+    pub fn get_or_create(&self, view_name: &str) -> StdArc<ViewTransactionState> {
+        let mut states = self.states.lock();
         states
             .entry(view_name.to_string())
-            .or_insert_with(|| Arc::new(ViewTransactionState::new()))
+            .or_insert_with(|| StdArc::new(ViewTransactionState::new()))
             .clone()
     }
 
     /// Get a transaction state for a view if it exists
-    pub fn get(&self, view_name: &str) -> Option<Arc<ViewTransactionState>> {
-        self.states.borrow().get(view_name).cloned()
+    pub fn get(&self, view_name: &str) -> Option<StdArc<ViewTransactionState>> {
+        self.states.lock().get(view_name).cloned()
     }
 
     /// Clear all transaction states
     pub fn clear(&self) {
-        self.states.borrow_mut().clear();
+        self.states.lock().clear();
     }
 
     /// Check if there are no transaction states
     pub fn is_empty(&self) -> bool {
-        self.states.borrow().is_empty()
+        self.states.lock().is_empty()
     }
 
     /// Get all view names that have transaction states
     pub fn get_view_names(&self) -> Vec<String> {
-        self.states.borrow().keys().cloned().collect()
+        self.states.lock().keys().cloned().collect()
     }
 }
 
@@ -226,6 +259,8 @@ pub struct IncrementalView {
     pub tracker: Arc<Mutex<ComputationTracker>>,
     // Root page of the btree storing the materialized state (0 for unmaterialized)
     root_page: i64,
+    // Whether this view contains a WITH RECURSIVE clause
+    has_recursive_cte: bool,
 }
 
 // SAFETY: This needs to be audited for thread safety.
@@ -385,6 +420,9 @@ impl IncrementalView {
         // Create the tracker that will be shared by all operators
         let tracker = Arc::new(Mutex::new(ComputationTracker::new()));
 
+        // Check if the SELECT statement has a WITH RECURSIVE clause
+        let has_recursive_cte = select_stmt.with.as_ref().is_some_and(|w| w.recursive);
+
         // Compile the SELECT statement into a DBSP circuit
         let circuit = Self::try_compile_circuit(
             &select_stmt,
@@ -406,6 +444,7 @@ impl IncrementalView {
             populate_state: PopulateState::Start,
             tracker,
             root_page: main_data_root,
+            has_recursive_cte,
         })
     }
 
@@ -422,7 +461,7 @@ impl IncrementalView {
     ) -> crate::Result<crate::types::IOResult<Delta>> {
         // Initialize execute_state with the input data
         *execute_state = crate::incremental::compiler::ExecuteState::Init {
-            input_data: uncommitted,
+            input_data: crate::incremental::compiler::InputDeltas::from_delta_set(uncommitted),
         };
         self.circuit.execute(pager, execute_state)
     }
@@ -1172,6 +1211,24 @@ impl IncrementalView {
         'outer: loop {
             match std::mem::replace(&mut self.populate_state, PopulateState::Done) {
                 PopulateState::Start => {
+                    // For recursive CTEs, we must gather all source table data first,
+                    // then run through the circuit in one batch, because fixed-point iteration
+                    // requires all base case rows to be available together.
+                    if self.has_recursive_cte {
+                        // Transition to the collecting state
+                        let remaining_tables: Vec<String> = self
+                            .referenced_tables
+                            .iter()
+                            .map(|t| t.name.clone())
+                            .collect();
+                        self.populate_state = PopulateState::CollectingRecursiveCteData {
+                            remaining_tables,
+                            current_stmt: None,
+                            accumulated_deltas: DeltaSet::new(),
+                        };
+                        continue 'outer;
+                    }
+
                     // Generate the SQL query for populating the view
                     // It is best to use a standard query than a cursor for two reasons:
                     // 1) Using a sql query will allow us to be much more efficient in cases where we only want
@@ -1340,6 +1397,117 @@ impl IncrementalView {
                                     completion,
                                 )));
                             }
+                        }
+                    }
+                }
+
+                PopulateState::CollectingRecursiveCteData {
+                    mut remaining_tables,
+                    current_stmt,
+                    mut accumulated_deltas,
+                } => {
+                    // If we have an active statement, continue reading from it
+                    if let Some((table_name, mut stmt)) = current_stmt {
+                        let mut table_delta = accumulated_deltas.get(&table_name);
+
+                        loop {
+                            match stmt.step()? {
+                                crate::vdbe::StepResult::Row => {
+                                    let row = stmt.row().ok_or_else(|| {
+                                        LimboError::InternalError(
+                                            "row should exist after StepResult::Row".to_string(),
+                                        )
+                                    })?;
+                                    let all_values: Vec<crate::types::Value> =
+                                        row.get_values().cloned().collect();
+
+                                    // Last value is rowid
+                                    let rowid = match all_values.last() {
+                                        Some(crate::types::Value::Numeric(
+                                            crate::numeric::Numeric::Integer(id),
+                                        )) => *id,
+                                        _ => continue,
+                                    };
+                                    let values = all_values[..all_values.len() - 1].to_vec();
+                                    table_delta.insert(rowid, values);
+                                }
+                                crate::vdbe::StepResult::Done => {
+                                    // Finished this table, save delta and continue to next
+                                    accumulated_deltas.insert(table_name.clone(), table_delta);
+                                    self.populate_state =
+                                        PopulateState::CollectingRecursiveCteData {
+                                            remaining_tables,
+                                            current_stmt: None,
+                                            accumulated_deltas,
+                                        };
+                                    continue 'outer;
+                                }
+                                crate::vdbe::StepResult::Interrupt
+                                | crate::vdbe::StepResult::Busy => {
+                                    // Save state and retry
+                                    accumulated_deltas.insert(table_name.clone(), table_delta);
+                                    self.populate_state =
+                                        PopulateState::CollectingRecursiveCteData {
+                                            remaining_tables,
+                                            current_stmt: Some((table_name, stmt)),
+                                            accumulated_deltas,
+                                        };
+                                    return Err(LimboError::Busy);
+                                }
+                                crate::vdbe::StepResult::IO => {
+                                    // Save state and return I/O
+                                    accumulated_deltas.insert(table_name.clone(), table_delta);
+                                    self.populate_state =
+                                        PopulateState::CollectingRecursiveCteData {
+                                            remaining_tables,
+                                            current_stmt: Some((table_name, stmt)),
+                                            accumulated_deltas,
+                                        };
+                                    let completion = crate::io::Completion::new_yield();
+                                    return Ok(IOResult::IO(crate::types::IOCompletions::Single(
+                                        completion,
+                                    )));
+                                }
+                            }
+                        }
+                    }
+
+                    // No active statement - start reading next table or finish
+                    if let Some(table_name) = remaining_tables.pop() {
+                        let read_conn = conn.db.connect()?;
+                        let quoted = table_name.replace('"', "\"\"");
+                        let query = format!("SELECT *, rowid FROM \"{quoted}\" ORDER BY rowid");
+                        let stmt = read_conn.prepare(&query)?;
+
+                        self.populate_state = PopulateState::CollectingRecursiveCteData {
+                            remaining_tables,
+                            current_stmt: Some((table_name, Box::new(stmt))),
+                            accumulated_deltas,
+                        };
+                        continue 'outer;
+                    }
+
+                    // All tables collected, transition to circuit execution
+                    let input_map = accumulated_deltas.into_map();
+                    self.populate_state = PopulateState::ExecutingRecursiveCircuit {
+                        input_map: Some(input_map),
+                    };
+                    continue 'outer;
+                }
+
+                PopulateState::ExecutingRecursiveCircuit { input_map } => {
+                    // Run circuit with input data (first call) or empty map (resume after I/O)
+                    let data = input_map.unwrap_or_default();
+                    match self.circuit.commit(data, pager.clone())? {
+                        IOResult::Done(_) => {
+                            self.populate_state = PopulateState::Done;
+                            return Ok(IOResult::Done(()));
+                        }
+                        IOResult::IO(io) => {
+                            // Save state for resume - circuit stores input internally
+                            self.populate_state =
+                                PopulateState::ExecutingRecursiveCircuit { input_map: None };
+                            return Ok(IOResult::IO(io));
                         }
                     }
                 }

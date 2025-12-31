@@ -918,7 +918,7 @@ pub fn emit_from_clause_subqueries(
                                 format!("SCAN {table_name}")
                             }
                         }
-                        Scan::VirtualTable { .. } | Scan::Subquery => {
+                        Scan::VirtualTable { .. } | Scan::Subquery | Scan::RecursiveCte { .. } => {
                             format!("SCAN {table_name}")
                         }
                     }

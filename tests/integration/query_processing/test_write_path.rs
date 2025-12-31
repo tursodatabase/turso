@@ -1761,3 +1761,145 @@ fn test_attached_read_lock_released_after_main_write(tmp_db: TempDatabase) -> an
 
     Ok(())
 }
+
+/// Bug reproducer: IVM btree assertion failure with recursive CTE + INNER JOIN + CDC
+///
+/// This test reproduces a bug where inserting child blocks into a table with a
+/// materialized view using recursive CTE and INNER JOIN causes:
+///   assertion failed: self.current_page >= 0 in btree.rs
+///
+/// The bug is triggered when:
+/// - A recursive CTE materialized view with INNER JOIN exists
+/// - CDC is enabled via PRAGMA unstable_capture_data_changes_conn('full')
+/// - Multiple connections perform INSERT+COMMIT operations
+///
+/// Key conditions:
+/// - Recursive CTE with INNER JOIN on parent_id
+/// - CDC enabled on the connection doing inserts
+/// - Multiple inserts in separate transactions
+#[turso_macros::test(views)]
+fn test_matview_recursive_cte_ivm_with_cdc(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let conn = tmp_db.connect_limbo();
+
+    // Create blocks table with parent-child relationship
+    common::run_query(
+        &tmp_db,
+        &conn,
+        "CREATE TABLE blocks (
+            id TEXT PRIMARY KEY,
+            parent_id TEXT NOT NULL,
+            content TEXT
+        )",
+    )?;
+
+    // Create recursive CTE materialized view with INNER JOIN
+    // This is the view structure that triggers the bug during IVM updates
+    common::run_query(
+        &tmp_db,
+        &conn,
+        "CREATE MATERIALIZED VIEW blocks_with_paths AS
+        WITH RECURSIVE paths AS (
+            SELECT id, parent_id, content, '/' || id as path
+            FROM blocks
+            WHERE parent_id LIKE 'doc://%'
+
+            UNION ALL
+
+            SELECT b.id, b.parent_id, b.content, p.path || '/' || b.id as path
+            FROM blocks b
+            INNER JOIN paths p ON b.parent_id = p.id
+        )
+        SELECT * FROM paths",
+    )?;
+
+    // Enable CDC - this is required to trigger the bug
+    common::run_query(
+        &tmp_db,
+        &conn,
+        "PRAGMA unstable_capture_data_changes_conn('full')",
+    )?;
+
+    // Insert root block
+    common::run_query(
+        &tmp_db,
+        &conn,
+        "INSERT INTO blocks VALUES ('root1', 'doc://test', 'root block')",
+    )?;
+
+    // Insert multiple children using separate connections with transactions
+    // This pattern triggers the IVM bug when CDC is enabled
+    // Using BEGIN IMMEDIATE to match the original bug trigger pattern
+    for i in 1..=20 {
+        let insert_conn = tmp_db.connect_limbo();
+        common::run_query(
+            &tmp_db,
+            &insert_conn,
+            "PRAGMA unstable_capture_data_changes_conn('full')",
+        )?;
+        common::run_query(&tmp_db, &insert_conn, "BEGIN IMMEDIATE")?;
+        let insert_sql =
+            format!("INSERT INTO blocks VALUES ('child{i}', 'root1', 'child block {i}')");
+        common::run_query(&tmp_db, &insert_conn, &insert_sql)?;
+        common::run_query(&tmp_db, &insert_conn, "COMMIT")?;
+    }
+
+    // Insert grandchildren to test deeper recursion
+    for i in 1..=10 {
+        let insert_conn = tmp_db.connect_limbo();
+        common::run_query(
+            &tmp_db,
+            &insert_conn,
+            "PRAGMA unstable_capture_data_changes_conn('full')",
+        )?;
+        common::run_query(&tmp_db, &insert_conn, "BEGIN IMMEDIATE")?;
+        let insert_sql = format!(
+            "INSERT INTO blocks VALUES ('grandchild{i}', 'child1', 'grandchild block {i}')"
+        );
+        common::run_query(&tmp_db, &insert_conn, &insert_sql)?;
+        common::run_query(&tmp_db, &insert_conn, "COMMIT")?;
+    }
+
+    // Insert great-grandchildren for more recursion depth
+    for i in 1..=5 {
+        let insert_conn = tmp_db.connect_limbo();
+        common::run_query(
+            &tmp_db,
+            &insert_conn,
+            "PRAGMA unstable_capture_data_changes_conn('full')",
+        )?;
+        common::run_query(&tmp_db, &insert_conn, "BEGIN IMMEDIATE")?;
+        let insert_sql = format!(
+            "INSERT INTO blocks VALUES ('ggchild{i}', 'grandchild1', 'great-grandchild block {i}')"
+        );
+        common::run_query(&tmp_db, &insert_conn, &insert_sql)?;
+        common::run_query(&tmp_db, &insert_conn, "COMMIT")?;
+    }
+
+    // Verify all rows are in the materialized view
+    let check_conn = tmp_db.connect_limbo();
+    let mut view_count = 0i64;
+    match check_conn.query("SELECT COUNT(*) FROM blocks_with_paths") {
+        Ok(Some(ref mut rows)) => loop {
+            match rows.step()? {
+                StepResult::Row => {
+                    view_count = rows.row().unwrap().get::<i64>(0).unwrap();
+                }
+                StepResult::IO => rows._io().step()?,
+                StepResult::Done => break,
+                _ => {}
+            }
+        },
+        Ok(None) => {}
+        Err(e) => return Err(e.into()),
+    }
+
+    // Expected: 1 root + 20 children + 10 grandchildren + 5 great-grandchildren = 36
+    assert_eq!(
+        view_count, 36,
+        "Materialized view should contain all 36 blocks \
+         (1 root + 20 children + 10 grandchildren + 5 great-grandchildren), \
+         but found {view_count}. IVM update may have failed.",
+    );
+
+    Ok(())
+}
