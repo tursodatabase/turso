@@ -1,4 +1,3 @@
-#![allow(unused_variables)]
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::AlterTableFunc;
 use crate::mvcc::cursor::{MvccCursorType, NextRowidResult};
@@ -180,7 +179,7 @@ pub fn op_init(
     _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Init { target_pc }, insn);
     if !target_pc.is_offset() {
@@ -191,10 +190,10 @@ pub fn op_init(
 }
 
 pub fn op_add(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Add { lhs, rhs, dest }, insn);
     state.registers[*dest] = Register::Value(
@@ -207,10 +206,10 @@ pub fn op_add(
 }
 
 pub fn op_subtract(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Subtract { lhs, rhs, dest }, insn);
     state.registers[*dest] = Register::Value(
@@ -223,10 +222,10 @@ pub fn op_subtract(
 }
 
 pub fn op_multiply(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Multiply { lhs, rhs, dest }, insn);
     state.registers[*dest] = Register::Value(
@@ -239,10 +238,10 @@ pub fn op_multiply(
 }
 
 pub fn op_divide(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Divide { lhs, rhs, dest }, insn);
     state.registers[*dest] = Register::Value(
@@ -258,7 +257,7 @@ pub fn op_drop_index(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(DropIndex { index, db: _ }, insn);
     program
@@ -269,10 +268,10 @@ pub fn op_drop_index(
 }
 
 pub fn op_remainder(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Remainder { lhs, rhs, dest }, insn);
     state.registers[*dest] = Register::Value(
@@ -285,10 +284,10 @@ pub fn op_remainder(
 }
 
 pub fn op_bit_and(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(BitAnd { lhs, rhs, dest }, insn);
     state.registers[*dest] = Register::Value(
@@ -301,10 +300,10 @@ pub fn op_bit_and(
 }
 
 pub fn op_bit_or(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(BitOr { lhs, rhs, dest }, insn);
     state.registers[*dest] = Register::Value(
@@ -317,10 +316,10 @@ pub fn op_bit_or(
 }
 
 pub fn op_bit_not(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(BitNot { reg, dest }, insn);
     state.registers[*dest] = Register::Value(state.registers[*reg].get_value().exec_bit_not());
@@ -426,10 +425,10 @@ pub fn op_checkpoint(
 }
 
 pub fn op_null(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     match insn {
         Insn::Null { dest, dest_end } | Insn::BeginSubrtn { dest, dest_end } => {
@@ -451,7 +450,7 @@ pub fn op_null_row(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(NullRow { cursor_id }, insn);
     {
@@ -464,10 +463,10 @@ pub fn op_null_row(
 }
 
 pub fn op_compare(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         Compare {
@@ -502,10 +501,10 @@ pub fn op_compare(
 }
 
 pub fn op_jump(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         Jump {
@@ -534,10 +533,10 @@ pub fn op_jump(
 }
 
 pub fn op_move(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         Move {
@@ -561,10 +560,10 @@ pub fn op_move(
 }
 
 pub fn op_if_pos(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         IfPos {
@@ -597,10 +596,10 @@ pub fn op_if_pos(
 }
 
 pub fn op_not_null(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(NotNull { reg, target_pc }, insn);
     if !target_pc.is_offset() {
@@ -620,10 +619,10 @@ pub fn op_not_null(
 }
 
 pub fn op_comparison(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     let (lhs, rhs, target_pc, flags, collation, op) = match insn {
         Insn::Eq {
@@ -792,10 +791,10 @@ pub fn op_comparison(
 }
 
 pub fn op_if(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         If {
@@ -820,10 +819,10 @@ pub fn op_if(
 }
 
 pub fn op_if_not(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         IfNot {
@@ -1000,7 +999,7 @@ pub fn op_vopen(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(VOpen { cursor_id }, insn);
     let (_, cursor_type) = program
@@ -1024,7 +1023,7 @@ pub fn op_vcreate(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         VCreate {
@@ -1060,10 +1059,10 @@ pub fn op_vcreate(
 }
 
 pub fn op_vfilter(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         VFilter {
@@ -1103,10 +1102,10 @@ pub fn op_vfilter(
 }
 
 pub fn op_vcolumn(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         VColumn {
@@ -1130,7 +1129,7 @@ pub fn op_vupdate(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         VUpdate {
@@ -1193,10 +1192,10 @@ pub fn op_vupdate(
 }
 
 pub fn op_vnext(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         VNext {
@@ -1224,7 +1223,7 @@ pub fn op_vdestroy(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(VDestroy { db, table_name }, insn);
     let conn = program.connection.clone();
@@ -1245,7 +1244,7 @@ pub fn op_vbegin(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(VBegin { cursor_id }, insn);
     let cursor = state.get_cursor(*cursor_id);
@@ -1271,7 +1270,7 @@ pub fn op_vrename(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         VRename {
@@ -1299,10 +1298,10 @@ pub fn op_vrename(
 }
 
 pub fn op_open_pseudo(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         OpenPseudo {
@@ -1325,10 +1324,10 @@ pub fn op_open_pseudo(
 }
 
 pub fn op_rewind(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         Rewind {
@@ -1366,7 +1365,7 @@ pub fn op_last(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         Last {
@@ -1410,7 +1409,7 @@ pub fn op_column(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         Column {
@@ -1613,10 +1612,10 @@ pub fn op_column(
 }
 
 pub fn op_type_check(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         TypeCheck {
@@ -1673,10 +1672,10 @@ pub fn op_type_check(
 }
 
 pub fn op_make_record(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         MakeRecord {
@@ -1715,10 +1714,10 @@ pub fn op_make_record(
 }
 
 pub fn op_mem_max(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(MemMax { dest_reg, src_reg }, insn);
 
@@ -1737,10 +1736,10 @@ pub fn op_mem_max(
 }
 
 pub fn op_result_row(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(ResultRow { start_reg, count }, insn);
     let row = Row {
@@ -1756,7 +1755,7 @@ pub fn op_next(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         Next {
@@ -1809,7 +1808,7 @@ pub fn op_prev(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         Prev {
@@ -2374,10 +2373,10 @@ fn check_deferred_fk_on_commit(conn: &Connection) -> Result<()> {
 }
 
 pub fn op_goto(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Goto { target_pc }, insn);
     if !target_pc.is_offset() {
@@ -2388,10 +2387,10 @@ pub fn op_goto(
 }
 
 pub fn op_gosub(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         Gosub {
@@ -2409,10 +2408,10 @@ pub fn op_gosub(
 }
 
 pub fn op_return(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         Return {
@@ -2438,10 +2437,10 @@ pub fn op_return(
 }
 
 pub fn op_integer(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Integer { value, dest }, insn);
     state.registers[*dest] = Register::Value(Value::Integer(*value));
@@ -2463,7 +2462,7 @@ pub fn op_program(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         Program {
@@ -2557,10 +2556,10 @@ pub fn op_program(
 }
 
 pub fn op_real(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Real { value, dest }, insn);
     state.registers[*dest] = Register::Value(Value::Float(*value));
@@ -2569,10 +2568,10 @@ pub fn op_real(
 }
 
 pub fn op_real_affinity(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(RealAffinity { register }, insn);
     if let Value::Integer(i) = &state.registers[*register].get_value() {
@@ -2583,10 +2582,10 @@ pub fn op_real_affinity(
 }
 
 pub fn op_string8(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(String8 { value, dest }, insn);
     state.registers[*dest] = Register::Value(Value::build_text(value.clone()));
@@ -2595,10 +2594,10 @@ pub fn op_string8(
 }
 
 pub fn op_blob(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Blob { value, dest }, insn);
     state.registers[*dest] = Register::Value(Value::Blob(value.clone()));
@@ -2610,7 +2609,7 @@ pub fn op_row_data(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(RowData { cursor_id, dest }, insn);
 
@@ -2648,10 +2647,10 @@ pub enum OpRowIdState {
 }
 
 pub fn op_row_id(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(RowId { cursor_id, dest }, insn);
     loop {
@@ -2768,10 +2767,10 @@ pub fn op_row_id(
 }
 
 pub fn op_idx_row_id(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(IdxRowId { cursor_id, dest }, insn);
     let cursors = &mut state.cursors;
@@ -2795,10 +2794,10 @@ pub fn op_idx_row_id(
 }
 
 pub fn op_seek_rowid(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         SeekRowid {
@@ -2884,10 +2883,10 @@ pub fn op_seek_rowid(
 }
 
 pub fn op_deferred_seek(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         DeferredSeek {
@@ -3043,10 +3042,10 @@ pub fn seek_internal(
     let mv_store = program.connection.mv_store();
     /// wrapper so we can use the ? operator and handle errors correctly in this outer function
     fn inner(
-        program: &Program,
+        _program: &Program,
         state: &mut ProgramState,
-        pager: &Arc<Pager>,
-        mv_store: Option<&Arc<MvStore>>,
+        _pager: &Arc<Pager>,
+        _mv_store: Option<&Arc<MvStore>>,
         record_source: RecordSource,
         cursor_id: usize,
         is_index: bool,
@@ -3317,10 +3316,10 @@ fn get_tie_breaker_from_idx_comp_op(insn: &Insn) -> std::cmp::Ordering {
 
 #[allow(clippy::let_and_return)]
 pub fn op_idx_ge(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         IdxGE {
@@ -3370,10 +3369,10 @@ pub fn op_idx_ge(
 }
 
 pub fn op_seek_end(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(SeekEnd { cursor_id }, *insn);
     {
@@ -3387,10 +3386,10 @@ pub fn op_seek_end(
 
 #[allow(clippy::let_and_return)]
 pub fn op_idx_le(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         IdxLE {
@@ -3434,10 +3433,10 @@ pub fn op_idx_le(
 
 #[allow(clippy::let_and_return)]
 pub fn op_idx_gt(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         IdxGT {
@@ -3481,10 +3480,10 @@ pub fn op_idx_gt(
 
 #[allow(clippy::let_and_return)]
 pub fn op_idx_lt(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         IdxLT {
@@ -3528,10 +3527,10 @@ pub fn op_idx_lt(
 }
 
 pub fn op_decr_jump_zero(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(DecrJumpZero { reg, target_pc }, insn);
     if !target_pc.is_offset() {
@@ -3580,10 +3579,10 @@ fn apply_kbn_step_int(acc: &mut Value, i: i64, state: &mut SumAggState) {
 }
 
 pub fn op_agg_step(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         AggStep {
@@ -3916,10 +3915,10 @@ pub fn op_agg_step(
 }
 
 pub fn op_agg_final(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     let (acc_reg, dest_reg, func) = match insn {
         Insn::AggFinal { register, func } => (*register, *register, func),
@@ -4112,10 +4111,10 @@ pub fn op_sorter_open(
 }
 
 pub fn op_sorter_data(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         SorterData {
@@ -4147,10 +4146,10 @@ pub fn op_sorter_data(
 }
 
 pub fn op_sorter_insert(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         SorterInsert {
@@ -4173,10 +4172,10 @@ pub fn op_sorter_insert(
 }
 
 pub fn op_sorter_sort(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         SorterSort {
@@ -4207,10 +4206,10 @@ pub fn op_sorter_sort(
 }
 
 pub fn op_sorter_next(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         SorterNext {
@@ -4235,10 +4234,10 @@ pub fn op_sorter_next(
 }
 
 pub fn op_sorter_compare(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         SorterCompare {
@@ -5932,10 +5931,10 @@ pub fn op_function(
 }
 
 pub fn op_sequence(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         Sequence {
@@ -5956,10 +5955,10 @@ pub fn op_sequence(
 }
 
 pub fn op_sequence_test(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         SequenceTest {
@@ -5984,10 +5983,10 @@ pub fn op_sequence_test(
 }
 
 pub fn op_init_coroutine(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         InitCoroutine {
@@ -6011,10 +6010,10 @@ pub fn op_init_coroutine(
 }
 
 pub fn op_end_coroutine(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(EndCoroutine { yield_reg }, insn);
 
@@ -6031,10 +6030,10 @@ pub fn op_end_coroutine(
 }
 
 pub fn op_yield(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         Yield {
@@ -6339,10 +6338,10 @@ pub fn op_insert(
 }
 
 pub fn op_int_64(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         Int64 {
@@ -6376,7 +6375,7 @@ pub fn op_delete(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         Delete {
@@ -7005,10 +7004,10 @@ fn new_rowid_inner(
 }
 
 pub fn op_must_be_int(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(MustBeInt { reg }, insn);
     match &state.registers[*reg].get_value() {
@@ -7034,10 +7033,10 @@ pub fn op_must_be_int(
 }
 
 pub fn op_soft_null(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(SoftNull { reg }, insn);
     state.registers[*reg] = Register::Value(Value::Null);
@@ -7146,7 +7145,7 @@ pub fn op_not_exists(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         NotExists {
@@ -7169,10 +7168,10 @@ pub fn op_not_exists(
 }
 
 pub fn op_offset_limit(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         OffsetLimit {
@@ -7362,10 +7361,10 @@ pub fn op_open_write(
 }
 
 pub fn op_copy(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         Copy {
@@ -7418,7 +7417,7 @@ pub fn op_index_method_create(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(IndexMethodCreate { db, cursor_id }, insn);
     assert_eq!(*db, 0);
@@ -7450,7 +7449,7 @@ pub fn op_index_method_destroy(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(IndexMethodDestroy { db, cursor_id }, insn);
     assert_eq!(*db, 0);
@@ -7482,7 +7481,7 @@ pub fn op_index_method_query(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         IndexMethodQuery {
@@ -7570,7 +7569,7 @@ pub fn op_reset_sorter(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(ResetSorter { cursor_id }, insn);
 
@@ -7640,7 +7639,7 @@ pub fn op_drop_trigger(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(DropTrigger { db, trigger_name }, insn);
 
@@ -7654,10 +7653,10 @@ pub fn op_drop_trigger(
 }
 
 pub fn op_close(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Close { cursor_id }, insn);
     let cursors = &mut state.cursors;
@@ -7673,10 +7672,10 @@ pub fn op_close(
 }
 
 pub fn op_is_null(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(IsNull { reg, target_pc }, insn);
     if matches!(state.registers[*reg], Register::Value(Value::Null)) {
@@ -7737,7 +7736,7 @@ pub fn op_parse_schema(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         ParseSchema {
@@ -7961,10 +7960,10 @@ pub fn op_set_cookie(
 }
 
 pub fn op_shift_right(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(ShiftRight { lhs, rhs, dest }, insn);
     state.registers[*dest] = Register::Value(
@@ -7977,10 +7976,10 @@ pub fn op_shift_right(
 }
 
 pub fn op_shift_left(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(ShiftLeft { lhs, rhs, dest }, insn);
     state.registers[*dest] = Register::Value(
@@ -7993,10 +7992,10 @@ pub fn op_shift_left(
 }
 
 pub fn op_add_imm(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(AddImm { register, value }, insn);
 
@@ -8021,10 +8020,10 @@ pub fn op_add_imm(
 }
 
 pub fn op_variable(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Variable { index, dest }, insn);
     state.registers[*dest] = Register::Value(state.get_parameter(*index));
@@ -8033,10 +8032,10 @@ pub fn op_variable(
 }
 
 pub fn op_zero_or_null(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(ZeroOrNull { rg1, rg2, dest }, insn);
     if state.registers[*rg1].is_null() || state.registers[*rg2].is_null() {
@@ -8049,10 +8048,10 @@ pub fn op_zero_or_null(
 }
 
 pub fn op_not(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Not { reg, dest }, insn);
     state.registers[*dest] = Register::Value(state.registers[*reg].get_value().exec_boolean_not());
@@ -8061,10 +8060,10 @@ pub fn op_not(
 }
 
 pub fn op_concat(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Concat { lhs, rhs, dest }, insn);
     state.registers[*dest] = Register::Value(
@@ -8077,10 +8076,10 @@ pub fn op_concat(
 }
 
 pub fn op_and(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(And { lhs, rhs, dest }, insn);
     state.registers[*dest] = Register::Value(
@@ -8093,10 +8092,10 @@ pub fn op_and(
 }
 
 pub fn op_or(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Or { lhs, rhs, dest }, insn);
     state.registers[*dest] = Register::Value(
@@ -8109,10 +8108,10 @@ pub fn op_or(
 }
 
 pub fn op_noop(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
-    insn: &Insn,
-    pager: &Arc<Pager>,
+    _insn: &Insn,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     // Do nothing
     // Advance the program counter for the next opcode
@@ -8429,10 +8428,10 @@ pub fn op_open_dup(
 /// This instruction is used to execute a block of code only once.
 /// If the instruction is executed again, it will jump to the target program counter.
 pub fn op_once(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         Once {
@@ -8512,10 +8511,10 @@ pub fn op_found(
 }
 
 pub fn op_affinity(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         Affinity {
@@ -8548,7 +8547,7 @@ pub fn op_count(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         Count {
@@ -8746,7 +8745,7 @@ pub fn op_rename_table(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(RenameTable { from, to }, insn);
 
@@ -8815,7 +8814,7 @@ pub fn op_drop_column(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         DropColumn {
@@ -8913,7 +8912,7 @@ pub fn op_add_column(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(AddColumn { table, column }, insn);
 
@@ -8943,7 +8942,7 @@ pub fn op_alter_column(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         AlterColumn {
@@ -9090,10 +9089,10 @@ pub fn op_alter_column(
 }
 
 pub fn op_if_neg(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(IfNeg { reg, target_pc }, insn);
 
@@ -9164,7 +9163,7 @@ pub fn op_fk_counter(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         FkCounter {
@@ -9229,7 +9228,7 @@ pub fn op_fk_if_zero(
 }
 
 pub fn op_hash_build(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     pager: &Arc<Pager>,
@@ -9386,10 +9385,10 @@ fn write_hash_payload_to_registers(
 }
 
 pub fn op_hash_probe(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         HashProbe {
@@ -9501,10 +9500,10 @@ pub fn op_hash_probe(
 }
 
 pub fn op_hash_next(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         HashNext {
@@ -9540,10 +9539,10 @@ pub fn op_hash_next(
 }
 
 pub fn op_hash_close(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(HashClose { hash_table_id }, insn);
     if let Some(mut hash_table) = state.hash_tables.remove(hash_table_id) {
@@ -9712,7 +9711,7 @@ pub fn extract_int_value<V: AsValueRef>(value: V) -> i64 {
 }
 
 pub fn op_max_pgcnt(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
     pager: &Arc<Pager>,
@@ -9970,10 +9969,10 @@ fn op_journal_mode_inner(
 }
 
 pub fn op_filter(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         Filter {
@@ -10020,10 +10019,10 @@ pub fn op_filter(
 }
 
 pub fn op_filter_add(
-    program: &Program,
+    _program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         FilterAdd {
