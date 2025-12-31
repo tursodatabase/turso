@@ -50,7 +50,7 @@ use crate::{
     stats::StatAccum,
     translate::emitter::TransactionMode,
 };
-use crate::{get_cursor, CheckpointMode, Completion, Connection, DatabaseStorage, MvCursor};
+use crate::{get_cursor, CheckpointMode, Completion, Connection, DatabaseStorage, IOExt, MvCursor};
 use either::Either;
 use std::any::Any;
 use std::env::temp_dir;
@@ -364,32 +364,21 @@ pub fn op_checkpoint(
             program.connection.clone(),
             true,
         ));
-        loop {
-            let result = ckpt_sm.step(&())?;
-            match result {
-                IOResult::IO(io) => {
-                    pager.io.step()?;
-                }
-                IOResult::Done(CheckpointResult {
-                    num_attempted,
-                    num_backfilled,
-                    ..
-                }) => {
-                    // https://sqlite.org/pragma.html#pragma_wal_checkpoint
-                    // 1st col: 1 (checkpoint SQLITE_BUSY) or 0 (not busy).
-                    state.registers[*dest] = Register::Value(Value::Integer(0));
-                    // 2nd col: # modified pages written to wal file
-                    state.registers[*dest + 1] =
-                        Register::Value(Value::Integer(num_attempted as i64));
-                    // 3rd col: # pages moved to db after checkpoint
-                    state.registers[*dest + 2] =
-                        Register::Value(Value::Integer(num_backfilled as i64));
+        let CheckpointResult {
+            num_attempted,
+            num_backfilled,
+            ..
+        } = pager.io.block(|| ckpt_sm.step(&()))?;
+        // https://sqlite.org/pragma.html#pragma_wal_checkpoint
+        // 1st col: 1 (checkpoint SQLITE_BUSY) or 0 (not busy).
+        state.registers[*dest] = Register::Value(Value::Integer(0));
+        // 2nd col: # modified pages written to wal file
+        state.registers[*dest + 1] = Register::Value(Value::Integer(num_attempted as i64));
+        // 3rd col: # pages moved to db after checkpoint
+        state.registers[*dest + 2] = Register::Value(Value::Integer(num_backfilled as i64));
 
-                    state.pc += 1;
-                    return Ok(InsnFunctionStepResult::Step);
-                }
-            }
-        }
+        state.pc += 1;
+        return Ok(InsnFunctionStepResult::Step);
     }
     let step_result = program.connection.pager.load().checkpoint(
         *checkpoint_mode,
