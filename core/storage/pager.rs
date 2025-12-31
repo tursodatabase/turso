@@ -2686,7 +2686,8 @@ impl Pager {
                         commit_info.state = CommitState::WalCommitDone;
                     } else {
                         let sync_c = wal.sync()?;
-                        commit_info.completions = vec![sync_c];
+                        // Reuse the existing Vec instead of allocating a new one
+                        commit_info.completions.push(sync_c);
                         commit_info.state = CommitState::WaitSync;
                     }
                 }

@@ -279,6 +279,14 @@ impl<'a> WriteBatch<'a> {
     #[inline]
     pub fn submit(self) -> Result<Vec<Completion>> {
         let mut completions = Vec::with_capacity(self.ops.len());
+        self.submit_into(&mut completions)?;
+        Ok(completions)
+    }
+
+    /// Submit all writes into an existing Vec, avoiding allocation if Vec has capacity.
+    #[inline]
+    pub fn submit_into(self, completions: &mut Vec<Completion>) -> Result<()> {
+        completions.reserve(self.ops.len());
         for WriteOp { pos, bufs } in self.ops {
             let total_len = bufs.iter().map(|b| b.len()).sum::<usize>() as i32;
             let c = Completion::new_write(move |res| {
@@ -292,7 +300,7 @@ impl<'a> WriteBatch<'a> {
             });
             completions.push(self.file.pwritev(pos, bufs.to_vec(), c)?);
         }
-        Ok(completions)
+        Ok(())
     }
 
     /// Returns the file for fsync after writes complete.
