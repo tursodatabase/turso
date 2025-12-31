@@ -3,11 +3,14 @@ use super::plan::{
     select_star, Distinctness, JoinOrderMember, Operation, OuterQueryReference, QueryDestination,
     Search, TableReferences, WhereTerm, Window,
 };
-use crate::schema::Table;
+use crate::schema::{ColDef, Column, Index, IndexColumn, RecursiveCteTable, Table};
 use crate::sync::Arc;
 use crate::translate::emitter::{OperationMode, Resolver};
-use crate::translate::expr::{bind_and_rewrite_expr, expr_vector_size, BindingBehavior};
+use crate::translate::expr::{
+    bind_and_rewrite_expr, expr_vector_size, translate_expr, BindingBehavior,
+};
 use crate::translate::group_by::compute_group_by_sort_order;
+use crate::translate::logical::DEFAULT_RECURSIVE_MAX_ITERATIONS;
 use crate::translate::optimizer::optimize_plan;
 use crate::translate::plan::{GroupBy, Plan, ResultSetColumn, SelectPlan, SubqueryState};
 use crate::translate::planner::{
@@ -17,11 +20,11 @@ use crate::translate::planner::{
 use crate::translate::subquery::{plan_subqueries_from_select_plan, plan_subqueries_from_values};
 use crate::translate::window::plan_windows;
 use crate::util::{exprs_are_equivalent, normalize_ident};
-use crate::vdbe::builder::ProgramBuilderOpts;
-use crate::vdbe::insn::Insn;
+use crate::vdbe::builder::{CursorType, ProgramBuilderOpts};
+use crate::vdbe::insn::{CmpInsFlags, IdxInsertFlags, Insn};
+use crate::vdbe::BranchOffset;
 use crate::{vdbe::builder::ProgramBuilder, Result};
-use turso_parser::ast::ResultColumn;
-use turso_parser::ast::{self, CompoundSelect, Expr};
+use turso_parser::ast::{self, CompoundOperator, CompoundSelect, Expr, ResultColumn, SortOrder};
 
 /// Maximum number of columns in a result set.
 /// SQLite's default SQLITE_MAX_COLUMN is 2000, with a hard upper limit of 32767.
@@ -34,6 +37,11 @@ pub fn translate_select(
     query_destination: QueryDestination,
     connection: &Arc<crate::Connection>,
 ) -> Result<usize> {
+    // Check if this is a recursive CTE - if so, use the DBSP execution path
+    if has_recursive_cte(&select) {
+        return translate_recursive_cte(select, resolver, program, query_destination, connection);
+    }
+
     let mut select_plan = prepare_select_plan(
         select,
         resolver,
@@ -123,6 +131,1074 @@ fn select_plan_first_virtual_table_name(select_plan: &SelectPlan) -> Option<Stri
         }
     }
     None
+}
+
+/// Check if a SELECT statement contains a recursive CTE
+fn has_recursive_cte(select: &ast::Select) -> bool {
+    select.with.as_ref().is_some_and(|w| w.recursive)
+}
+
+/// Translate a recursive CTE query using native VDBE instructions.
+///
+/// This implements the two-queue algorithm for recursive CTEs:
+/// 1. Execute base case, store in result table and queue_a
+/// 2. Loop: read from queue_a, execute recursive step, insert new rows to queue_b
+/// 3. Clear queue_a, swap queue roles (a becomes b, b becomes a)
+/// 4. Repeat until queue is empty
+/// 5. Read from result table and emit rows
+///
+/// ## Current Limitations
+///
+/// This is a simplified implementation that handles common simple cases:
+/// - Base case must be literals or VALUES (no FROM clause)
+/// - Recursive step must reference only the CTE itself (no JOINs with other tables)
+/// - Expressions in recursive step are limited to basic arithmetic and column refs
+///
+/// ## Path to Full Implementation
+///
+/// To support the full recursive CTE feature set (JOINs, complex expressions, etc.):
+///
+/// 1. Register the CTE as a pseudo-table in the Resolver, backed by the queue cursor
+/// 2. Use `prepare_select_plan()` to plan base case and recursive step as normal queries
+/// 3. The CTE reference resolves to the queue cursor during planning
+/// 4. Use `emit_program()` with a custom destination that inserts into result/queue
+/// 5. The existing JOIN/WHERE/expression infrastructure handles everything else
+///
+/// This mirrors SQLite's approach where recursive CTEs are virtual tables during planning.
+fn translate_recursive_cte(
+    select: ast::Select,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    _query_destination: QueryDestination,
+    connection: &Arc<crate::Connection>,
+) -> Result<usize> {
+    let with = select.with.as_ref().ok_or_else(|| {
+        crate::LimboError::ParseError("Expected WITH clause for recursive CTE".into())
+    })?;
+
+    if with.ctes.len() != 1 {
+        crate::bail_parse_error!("Only single recursive CTE is currently supported");
+    }
+
+    let cte = &with.ctes[0];
+    let cte_name = normalize_ident(cte.tbl_name.as_str());
+
+    // Parse the CTE's SELECT to extract base case and recursive step
+    let cte_select = &cte.select;
+    let base_case = &cte_select.body.select;
+
+    if cte_select.body.compounds.is_empty() {
+        crate::bail_parse_error!("Recursive CTE must have UNION or UNION ALL");
+    }
+
+    let compound = &cte_select.body.compounds[0];
+    let is_union_all = matches!(compound.operator, CompoundOperator::UnionAll);
+    let recursive_step = &compound.select;
+
+    // Get column names from CTE definition or base case
+    let column_names: Vec<String> = if !cte.columns.is_empty() {
+        cte.columns
+            .iter()
+            .map(|c| c.col_name.as_str().to_string())
+            .collect()
+    } else {
+        // Infer from base case result columns
+        match base_case {
+            ast::OneSelect::Select { columns, from, .. } => columns
+                .iter()
+                .enumerate()
+                .flat_map(|(i, col)| match col {
+                    ResultColumn::Expr(_, Some(ast::As::As(name) | ast::As::Elided(name))) => {
+                        vec![name.as_str().to_string()]
+                    }
+                    ResultColumn::Expr(expr, None) => {
+                        if let Expr::Id(id) = expr.as_ref() {
+                            vec![id.as_str().to_string()]
+                        } else if let Expr::Qualified(_, col) = expr.as_ref() {
+                            vec![col.as_str().to_string()]
+                        } else {
+                            vec![format!("column{i}")]
+                        }
+                    }
+                    ResultColumn::Star => resolve_star_columns(from.as_ref(), None, resolver),
+                    ResultColumn::TableStar(name) => {
+                        resolve_star_columns(from.as_ref(), Some(name.as_str()), resolver)
+                    }
+                })
+                .collect(),
+            _ => crate::bail_parse_error!("Unsupported base case in recursive CTE"),
+        }
+    };
+
+    let num_cols = column_names.len();
+
+    // Determine if outer query directly references the CTE in FROM (direct mode)
+    // or references it indirectly, e.g. in a subquery (indirect mode)
+    let direct_cte_ref = match &select.body.select {
+        ast::OneSelect::Select {
+            from: Some(from_clause),
+            ..
+        } => matches!(
+            from_clause.select.as_ref(),
+            ast::SelectTable::Table(qn, _, _)
+                if normalize_ident(qn.name.as_str()) == cte_name
+        ),
+        _ => false,
+    };
+
+    let output_column_indices: Vec<usize> = if direct_cte_ref {
+        let outer_columns: Vec<usize> = match &select.body.select {
+            ast::OneSelect::Select { columns, .. } => columns
+                .iter()
+                .map(|col| match col {
+                    ResultColumn::Star | ResultColumn::TableStar(_) => usize::MAX,
+                    ResultColumn::Expr(expr, _) => match expr.as_ref() {
+                        Expr::Id(id) => {
+                            let col_name = normalize_ident(id.as_str());
+                            column_names
+                                .iter()
+                                .position(|n| normalize_ident(n) == col_name)
+                                .unwrap_or(0)
+                        }
+                        Expr::Qualified(table, col) => {
+                            let table_name = normalize_ident(table.as_str());
+                            if table_name == cte_name {
+                                let col_name = normalize_ident(col.as_str());
+                                column_names
+                                    .iter()
+                                    .position(|n| normalize_ident(n) == col_name)
+                                    .unwrap_or(0)
+                            } else {
+                                0
+                            }
+                        }
+                        _ => 0,
+                    },
+                })
+                .collect(),
+            _ => (0..num_cols).collect(),
+        };
+        if outer_columns.contains(&usize::MAX) {
+            (0..num_cols).collect()
+        } else {
+            outer_columns
+        }
+    } else {
+        (0..num_cols).collect()
+    };
+
+    // Estimate program size
+    program.extend(&ProgramBuilderOpts {
+        num_cursors: 4, // result table, queue_a, queue_b
+        approx_num_insns: 300,
+        approx_num_labels: 30,
+    });
+
+    // Create ephemeral index for result table (for deduplication with UNION)
+    let result_index = Arc::new(Index {
+        columns: column_names
+            .iter()
+            .enumerate()
+            .map(|(i, name)| IndexColumn {
+                name: name.clone(),
+                order: SortOrder::Asc,
+                pos_in_table: i,
+                collation: None,
+                default: None,
+                expr: None,
+            })
+            .collect(),
+        name: "rcte_result".to_string(),
+        root_page: 0,
+        ephemeral: true,
+        table_name: String::new(),
+        unique: false,
+        has_rowid: false,
+        where_clause: None,
+        index_method: None,
+    });
+
+    // Allocate cursors: result table and two queues for ping-pong
+    let result_cursor = program.alloc_cursor_id(CursorType::BTreeIndex(result_index.clone()));
+    let queue_a_cursor = program.alloc_cursor_id(CursorType::BTreeIndex(result_index.clone()));
+    let queue_b_cursor = program.alloc_cursor_id(CursorType::BTreeIndex(result_index));
+
+    // Allocate registers
+    let reg_row_data = program.alloc_registers(num_cols);
+    let reg_record = program.alloc_register();
+    let reg_iteration = program.alloc_register();
+    let reg_flag = program.alloc_register(); // 0 = read from A, write to B; 1 = read from B, write to A
+
+    // Allocate labels
+    let label_init = program.allocate_label();
+    let label_loop_start = program.allocate_label();
+    // Labels for queue_a -> queue_b path
+    let label_inner_loop_a = program.allocate_label();
+    let label_loop_next_a = program.allocate_label();
+    let label_skip_insert_a = program.allocate_label();
+    // Labels for queue_b -> queue_a path
+    let label_read_from_b = program.allocate_label();
+    let label_inner_loop_b = program.allocate_label();
+    let label_loop_next_b = program.allocate_label();
+    let label_skip_insert_b = program.allocate_label();
+    // Common labels
+    let label_next_iteration = program.allocate_label();
+    let label_output_start = program.allocate_label();
+    let label_output_next = program.allocate_label();
+    let label_done = program.allocate_label();
+
+    // Init
+    program.emit_insn(Insn::Init {
+        target_pc: label_init,
+    });
+
+    // Open ephemeral tables
+    program.preassign_label_to_next_insn(label_init);
+    program.emit_insn(Insn::OpenEphemeral {
+        cursor_id: result_cursor,
+        is_table: false,
+    });
+    program.emit_insn(Insn::OpenEphemeral {
+        cursor_id: queue_a_cursor,
+        is_table: false,
+    });
+    program.emit_insn(Insn::OpenEphemeral {
+        cursor_id: queue_b_cursor,
+        is_table: false,
+    });
+
+    // Initialize iteration counter and flag
+    program.emit_insn(Insn::Integer {
+        value: 0,
+        dest: reg_iteration,
+    });
+    program.emit_insn(Insn::Integer {
+        value: 0,
+        dest: reg_flag,
+    }); // start reading from A
+
+    // === Execute base case ===
+    // For each base case row, insert into result and queue_a
+    emit_base_case_rows(
+        program,
+        resolver,
+        base_case,
+        result_cursor,
+        queue_a_cursor,
+        reg_row_data,
+        reg_record,
+        num_cols,
+        is_union_all,
+        label_loop_start, // jump here on skip (no-op since we go there anyway)
+        connection,
+    )?;
+
+    // === Main recursion loop ===
+    program.preassign_label_to_next_insn(label_loop_start);
+
+    program.emit_insn(Insn::Integer {
+        value: DEFAULT_RECURSIVE_MAX_ITERATIONS as i64,
+        dest: reg_record,
+    });
+    program.emit_insn(Insn::Ge {
+        lhs: reg_iteration,
+        rhs: reg_record,
+        target_pc: label_output_start,
+        flags: CmpInsFlags::default(),
+        collation: None,
+    });
+
+    // Branch based on flag: if flag != 0, go to read_from_b
+    program.emit_insn(Insn::If {
+        reg: reg_flag,
+        target_pc: label_read_from_b,
+        jump_if_null: false, // flag is never null
+    });
+
+    // === Path A: Read from queue_a, write to queue_b ===
+    // Rewind queue_a
+    program.emit_insn(Insn::Rewind {
+        cursor_id: queue_a_cursor,
+        pc_if_empty: label_output_start, // if queue_a empty, we're done
+    });
+
+    // Inner loop A
+    program.preassign_label_to_next_insn(label_inner_loop_a);
+    emit_recursive_step_rows(
+        program,
+        resolver,
+        recursive_step,
+        &cte_name,
+        result_cursor,
+        queue_a_cursor, // read from
+        queue_b_cursor, // write to
+        reg_row_data,
+        reg_record,
+        &column_names,
+        is_union_all,
+        label_loop_next_a,
+        label_skip_insert_a,
+        connection,
+    )?;
+
+    program.preassign_label_to_next_insn(label_loop_next_a);
+    program.emit_insn(Insn::Next {
+        cursor_id: queue_a_cursor,
+        pc_if_next: label_inner_loop_a,
+    });
+
+    // After processing queue_a: clear it (OpenEphemeral clears if cursor exists) and read from B next
+    program.emit_insn(Insn::OpenEphemeral {
+        cursor_id: queue_a_cursor,
+        is_table: false,
+    });
+    program.emit_insn(Insn::Integer {
+        value: 1,
+        dest: reg_flag,
+    }); // next iteration reads from B
+    program.emit_insn(Insn::Goto {
+        target_pc: label_next_iteration,
+    });
+
+    // Skip insert A
+    program.preassign_label_to_next_insn(label_skip_insert_a);
+    program.emit_insn(Insn::Goto {
+        target_pc: label_loop_next_a,
+    });
+
+    // === Path B: Read from queue_b, write to queue_a ===
+    program.preassign_label_to_next_insn(label_read_from_b);
+    program.emit_insn(Insn::Rewind {
+        cursor_id: queue_b_cursor,
+        pc_if_empty: label_output_start,
+    });
+
+    // Inner loop B
+    program.preassign_label_to_next_insn(label_inner_loop_b);
+    emit_recursive_step_rows(
+        program,
+        resolver,
+        recursive_step,
+        &cte_name,
+        result_cursor,
+        queue_b_cursor, // read from
+        queue_a_cursor, // write to
+        reg_row_data,
+        reg_record,
+        &column_names,
+        is_union_all,
+        label_loop_next_b,
+        label_skip_insert_b,
+        connection,
+    )?;
+
+    program.preassign_label_to_next_insn(label_loop_next_b);
+    program.emit_insn(Insn::Next {
+        cursor_id: queue_b_cursor,
+        pc_if_next: label_inner_loop_b,
+    });
+
+    // After processing queue_b: clear it and read from A next
+    program.emit_insn(Insn::OpenEphemeral {
+        cursor_id: queue_b_cursor,
+        is_table: false,
+    });
+    program.emit_insn(Insn::Integer {
+        value: 0,
+        dest: reg_flag,
+    }); // next iteration reads from A
+    program.emit_insn(Insn::Goto {
+        target_pc: label_next_iteration,
+    });
+
+    // Skip insert B
+    program.preassign_label_to_next_insn(label_skip_insert_b);
+    program.emit_insn(Insn::Goto {
+        target_pc: label_loop_next_b,
+    });
+
+    // === Next iteration ===
+    program.preassign_label_to_next_insn(label_next_iteration);
+    program.emit_insn(Insn::Integer {
+        value: 1,
+        dest: reg_record,
+    });
+    program.emit_insn(Insn::Add {
+        lhs: reg_iteration,
+        rhs: reg_record,
+        dest: reg_iteration,
+    });
+    program.emit_insn(Insn::Goto {
+        target_pc: label_loop_start,
+    });
+
+    // === Output phase: read from result table ===
+    program.preassign_label_to_next_insn(label_output_start);
+
+    if direct_cte_ref {
+        // Set result column names now (after emit_program calls which overwrite result_columns)
+        program.result_columns.clear();
+        for &idx in &output_column_indices {
+            if idx < column_names.len() {
+                program.add_pragma_result_column(column_names[idx].clone());
+            }
+        }
+
+        program.emit_insn(Insn::Rewind {
+            cursor_id: result_cursor,
+            pc_if_empty: label_done,
+        });
+
+        let num_output_cols = output_column_indices.len();
+        let reg_output = program.alloc_registers(num_output_cols);
+
+        program.preassign_label_to_next_insn(label_output_next);
+        for (out_idx, &col_idx) in output_column_indices.iter().enumerate() {
+            program.emit_insn(Insn::Column {
+                cursor_id: result_cursor,
+                column: col_idx,
+                dest: reg_output + out_idx,
+                default: None,
+            });
+        }
+
+        program.emit_insn(Insn::ResultRow {
+            start_reg: reg_output,
+            count: num_output_cols,
+        });
+
+        program.emit_insn(Insn::Next {
+            cursor_id: result_cursor,
+            pc_if_next: label_output_next,
+        });
+
+        program.preassign_label_to_next_insn(label_done);
+        program.emit_insn(Insn::Halt {
+            err_code: 0,
+            description: String::new(),
+            on_error: None,
+        });
+
+        Ok(num_output_cols)
+    } else {
+        // Indirect mode: register CTE as a pseudo-table backed by the result cursor,
+        // then plan and emit the outer query via the standard planner
+        let cte_columns: Vec<Column> = column_names
+            .iter()
+            .map(|name| {
+                Column::new(
+                    Some(name.clone()),
+                    String::new(),
+                    None,
+                    None,
+                    crate::schema::Type::Null,
+                    None,
+                    ColDef::default(),
+                )
+            })
+            .collect();
+
+        let cte_table = RecursiveCteTable {
+            name: cte_name.clone(),
+            columns: cte_columns,
+            cursor_id: result_cursor,
+        };
+
+        let cte_outer_ref = OuterQueryReference {
+            identifier: cte_name.clone(),
+            internal_id: program.table_reference_counter.next(),
+            table: Table::RecursiveCte(cte_table),
+            col_used_mask: crate::translate::plan::ColumnUsedMask::default(),
+            cte_select: None,
+            cte_explicit_columns: Vec::new(),
+            cte_id: None,
+            cte_definition_only: false,
+            rowid_referenced: false,
+        };
+
+        let outer_select = ast::Select {
+            with: None,
+            body: select.body,
+            order_by: select.order_by,
+            limit: select.limit,
+        };
+
+        let outer_plan = prepare_select_plan(
+            outer_select,
+            resolver,
+            program,
+            &[cte_outer_ref],
+            _query_destination,
+            connection,
+        )?;
+
+        let num_output_cols = outer_plan
+            .select_result_columns()
+            .map(|cols| cols.len())
+            .unwrap_or(num_cols);
+        emit_program(connection, resolver, program, outer_plan, |_| {})?;
+
+        program.preassign_label_to_next_insn(label_done);
+        program.emit_insn(Insn::Halt {
+            err_code: 0,
+            description: String::new(),
+            on_error: None,
+        });
+
+        Ok(num_output_cols)
+    }
+}
+
+/// Emit VDBE instructions for base case rows
+#[allow(clippy::too_many_arguments)]
+fn emit_base_case_rows(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    base_case: &ast::OneSelect,
+    result_cursor: usize,
+    queue_cursor: usize,
+    reg_row_data: usize,
+    reg_record: usize,
+    num_cols: usize,
+    is_union_all: bool,
+    label_skip_insert: BranchOffset,
+    _connection: &Arc<crate::Connection>,
+) -> Result<()> {
+    match base_case {
+        ast::OneSelect::Select {
+            columns,
+            from,
+            where_clause,
+            ..
+        } => {
+            // For simple base cases like "SELECT 1" or "SELECT 1, 0, 1"
+            if from.is_none() && where_clause.is_none() {
+                // Evaluate each column expression
+                let t_ctx = TranslateCtx::new(program, resolver.fork(), 0);
+                for (i, col) in columns.iter().enumerate() {
+                    match col {
+                        ResultColumn::Expr(expr, _) => {
+                            translate_expr(program, None, expr, reg_row_data + i, &t_ctx.resolver)?;
+                        }
+                        _ => crate::bail_parse_error!(
+                            "Unsupported result column in recursive CTE base case"
+                        ),
+                    }
+                }
+
+                // Make record and insert into result
+                program.emit_insn(Insn::MakeRecord {
+                    start_reg: reg_row_data as u16,
+                    count: num_cols as u16,
+                    dest_reg: reg_record as u16,
+                    index_name: None,
+                    affinity_str: None,
+                });
+
+                // For UNION, check if row exists before inserting
+                if !is_union_all {
+                    program.emit_insn(Insn::Found {
+                        cursor_id: result_cursor,
+                        target_pc: label_skip_insert,
+                        record_reg: reg_record,
+                        num_regs: 0,
+                    });
+                }
+
+                // Insert into result and queue
+                program.emit_insn(Insn::IdxInsert {
+                    cursor_id: result_cursor,
+                    record_reg: reg_record,
+                    flags: IdxInsertFlags::new(),
+                    unpacked_start: None,
+                    unpacked_count: None,
+                });
+                program.emit_insn(Insn::IdxInsert {
+                    cursor_id: queue_cursor,
+                    record_reg: reg_record,
+                    flags: IdxInsertFlags::new(),
+                    unpacked_start: None,
+                    unpacked_count: None,
+                });
+            } else {
+                // Complex base case with FROM clause - use the planning infrastructure
+                // Construct an ast::Select from the ast::OneSelect
+                let base_select = ast::Select {
+                    with: None,
+                    body: ast::SelectBody {
+                        select: base_case.clone(),
+                        compounds: vec![],
+                    },
+                    order_by: vec![],
+                    limit: None,
+                };
+
+                // Create the destination for the base case
+                let base_destination = QueryDestination::RecursiveCte {
+                    result_cursor,
+                    queue_cursor,
+                    num_cols,
+                    is_union_all,
+                };
+
+                // Prepare and emit the base case plan
+                let base_plan = prepare_select_plan(
+                    base_select,
+                    resolver,
+                    program,
+                    &[],
+                    base_destination,
+                    _connection,
+                )?;
+
+                emit_program(_connection, resolver, program, base_plan, |_| {})?;
+            }
+        }
+        ast::OneSelect::Values(values_list) => {
+            // Handle VALUES clause base case
+            for values in values_list {
+                let t_ctx = TranslateCtx::new(program, resolver.fork(), 0);
+                for (i, expr) in values.iter().enumerate() {
+                    translate_expr(program, None, expr, reg_row_data + i, &t_ctx.resolver)?;
+                }
+
+                program.emit_insn(Insn::MakeRecord {
+                    start_reg: reg_row_data as u16,
+                    count: num_cols as u16,
+                    dest_reg: reg_record as u16,
+                    index_name: None,
+                    affinity_str: None,
+                });
+
+                if !is_union_all {
+                    program.emit_insn(Insn::Found {
+                        cursor_id: result_cursor,
+                        target_pc: label_skip_insert,
+                        record_reg: reg_record,
+                        num_regs: 0,
+                    });
+                }
+
+                program.emit_insn(Insn::IdxInsert {
+                    cursor_id: result_cursor,
+                    record_reg: reg_record,
+                    flags: IdxInsertFlags::new(),
+                    unpacked_start: None,
+                    unpacked_count: None,
+                });
+                program.emit_insn(Insn::IdxInsert {
+                    cursor_id: queue_cursor,
+                    record_reg: reg_record,
+                    flags: IdxInsertFlags::new(),
+                    unpacked_start: None,
+                    unpacked_count: None,
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Emit VDBE instructions for recursive step
+#[allow(clippy::too_many_arguments)]
+fn emit_recursive_step_rows(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    recursive_step: &ast::OneSelect,
+    cte_name: &str,
+    result_cursor: usize,
+    queue_read_cursor: usize,
+    queue_write_cursor: usize,
+    reg_row_data: usize,
+    reg_record: usize,
+    column_names: &[String],
+    is_union_all: bool,
+    label_next_row: BranchOffset,
+    label_skip_insert: BranchOffset,
+    _connection: &Arc<crate::Connection>,
+) -> Result<()> {
+    let num_cols = column_names.len();
+    match recursive_step {
+        ast::OneSelect::Select {
+            columns,
+            from,
+            where_clause,
+            ..
+        } => {
+            // Check that FROM clause references only the CTE (simple self-reference)
+            if let Some(from_clause) = from {
+                let is_simple_cte_ref = match from_clause.select.as_ref() {
+                    ast::SelectTable::Table(qn, _, _) => {
+                        normalize_ident(qn.name.as_str()) == cte_name
+                    }
+                    _ => false,
+                };
+
+                if !is_simple_cte_ref || !from_clause.joins.is_empty() {
+                    // Complex recursive step with joins - use the planning infrastructure
+                    // Create a RecursiveCteTable backed by the queue_read_cursor
+                    let cte_columns: Vec<Column> = column_names
+                        .iter()
+                        .map(|name| {
+                            Column::new(
+                                Some(name.clone()),
+                                String::new(),
+                                None,
+                                None,
+                                crate::schema::Type::Null,
+                                None,
+                                ColDef::default(),
+                            )
+                        })
+                        .collect();
+
+                    let cte_table = RecursiveCteTable {
+                        name: cte_name.to_string(),
+                        columns: cte_columns,
+                        cursor_id: queue_read_cursor,
+                    };
+
+                    // Create an OuterQueryReference for the CTE
+                    let cte_outer_ref = OuterQueryReference {
+                        identifier: cte_name.to_string(),
+                        internal_id: program.table_reference_counter.next(),
+                        table: Table::RecursiveCte(cte_table),
+                        col_used_mask: crate::translate::plan::ColumnUsedMask::default(),
+                        cte_select: None,
+                        cte_explicit_columns: Vec::new(),
+                        cte_id: None,
+                        cte_definition_only: false,
+                        rowid_referenced: false,
+                    };
+
+                    // Construct an ast::Select from the recursive step
+                    let recursive_select = ast::Select {
+                        with: None,
+                        body: ast::SelectBody {
+                            select: recursive_step.clone(),
+                            compounds: vec![],
+                        },
+                        order_by: vec![],
+                        limit: None,
+                    };
+
+                    // Create the destination for the recursive step
+                    let recursive_destination = QueryDestination::RecursiveCte {
+                        result_cursor,
+                        queue_cursor: queue_write_cursor,
+                        num_cols,
+                        is_union_all,
+                    };
+
+                    // Prepare the recursive step plan with the CTE as an outer query reference
+                    let recursive_plan = prepare_select_plan(
+                        recursive_select,
+                        resolver,
+                        program,
+                        &[cte_outer_ref],
+                        recursive_destination,
+                        _connection,
+                    )?;
+
+                    // Emit the recursive step program
+                    emit_program(_connection, resolver, program, recursive_plan, |_| {})?;
+
+                    return Ok(());
+                }
+            }
+
+            // Simple self-referencing case (no JOINs) - use existing manual emission
+            // Read current queue row values into a temporary area
+            let reg_cte_row = program.alloc_registers(num_cols);
+            for i in 0..num_cols {
+                program.emit_insn(Insn::Column {
+                    cursor_id: queue_read_cursor,
+                    column: i,
+                    dest: reg_cte_row + i,
+                    default: None,
+                });
+            }
+
+            // Now evaluate the recursive step expressions
+            // We need to resolve column references to the CTE to point to reg_cte_row
+            // For now, we'll use a simplified approach for expressions like "x+1"
+
+            // Create a context that knows about the CTE columns
+            let t_ctx = TranslateCtx::new(program, resolver.fork(), 0);
+
+            for (i, col) in columns.iter().enumerate() {
+                match col {
+                    ResultColumn::Expr(expr, _) => {
+                        // Translate expression, substituting CTE column references
+                        translate_cte_expr(
+                            program,
+                            expr,
+                            reg_row_data + i,
+                            &t_ctx.resolver,
+                            cte_name,
+                            reg_cte_row,
+                            column_names,
+                        )?;
+                    }
+                    _ => crate::bail_parse_error!("Unsupported result column in recursive step"),
+                }
+            }
+
+            // Check WHERE clause if present
+            if let Some(where_expr) = where_clause {
+                let reg_cond = program.alloc_register();
+                translate_cte_expr(
+                    program,
+                    where_expr,
+                    reg_cond,
+                    &t_ctx.resolver,
+                    cte_name,
+                    reg_cte_row,
+                    column_names,
+                )?;
+                // If condition is false/null, skip this row
+                program.emit_insn(Insn::IfNot {
+                    reg: reg_cond,
+                    target_pc: label_next_row,
+                    jump_if_null: true,
+                });
+            }
+
+            // Make record and insert
+            program.emit_insn(Insn::MakeRecord {
+                start_reg: reg_row_data as u16,
+                count: num_cols as u16,
+                dest_reg: reg_record as u16,
+                index_name: None,
+                affinity_str: None,
+            });
+
+            // For UNION, check if row exists
+            if !is_union_all {
+                program.emit_insn(Insn::Found {
+                    cursor_id: result_cursor,
+                    target_pc: label_skip_insert,
+                    record_reg: reg_record,
+                    num_regs: 0,
+                });
+            }
+
+            // Insert into result and write queue
+            program.emit_insn(Insn::IdxInsert {
+                cursor_id: result_cursor,
+                record_reg: reg_record,
+                flags: IdxInsertFlags::new(),
+                unpacked_start: None,
+                unpacked_count: None,
+            });
+            program.emit_insn(Insn::IdxInsert {
+                cursor_id: queue_write_cursor,
+                record_reg: reg_record,
+                flags: IdxInsertFlags::new(),
+                unpacked_start: None,
+                unpacked_count: None,
+            });
+        }
+        _ => crate::bail_parse_error!("Unsupported recursive step type"),
+    }
+    Ok(())
+}
+
+/// Resolve column names for SELECT * or SELECT table.* in a recursive CTE base case.
+fn resolve_star_columns(
+    from: Option<&ast::FromClause>,
+    table_filter: Option<&str>,
+    resolver: &Resolver,
+) -> Vec<String> {
+    let Some(from_clause) = from else {
+        return vec![];
+    };
+
+    let mut names = Vec::new();
+    let collect_table_columns = |table_name: &str, alias: Option<&str>, names: &mut Vec<String>| {
+        if let Some(filter) = table_filter {
+            let filter_norm = normalize_ident(filter);
+            let alias_norm = alias.map(normalize_ident);
+            let table_norm = normalize_ident(table_name);
+            if alias_norm.as_deref() != Some(&filter_norm) && table_norm != filter_norm {
+                return;
+            }
+        }
+        if let Some(table) = resolver.schema().get_table(table_name) {
+            for col in table.columns() {
+                if !col.hidden() {
+                    if let Some(name) = &col.name {
+                        names.push(name.clone());
+                    }
+                }
+            }
+        }
+    };
+
+    if let ast::SelectTable::Table(qn, alias, _) = from_clause.select.as_ref() {
+        let alias_str = alias.as_ref().map(|a| match a {
+            ast::As::As(name) | ast::As::Elided(name) => name.as_str(),
+        });
+        collect_table_columns(qn.name.as_str(), alias_str, &mut names);
+    }
+
+    for join in &from_clause.joins {
+        if let ast::SelectTable::Table(qn, alias, _) = join.table.as_ref() {
+            let alias_str = alias.as_ref().map(|a| match a {
+                ast::As::As(name) | ast::As::Elided(name) => name.as_str(),
+            });
+            collect_table_columns(qn.name.as_str(), alias_str, &mut names);
+        }
+    }
+
+    names
+}
+
+/// Translate an expression, substituting CTE column references
+fn translate_cte_expr(
+    program: &mut ProgramBuilder,
+    expr: &Expr,
+    dest: usize,
+    resolver: &Resolver,
+    cte_name: &str,
+    reg_cte_row: usize,
+    column_names: &[String],
+) -> Result<()> {
+    match expr {
+        Expr::Id(id) => {
+            let col_name = normalize_ident(id.as_str());
+            // Find column index by name
+            if let Some(col_idx) = column_names
+                .iter()
+                .position(|n| normalize_ident(n) == col_name)
+            {
+                program.emit_insn(Insn::Copy {
+                    src_reg: reg_cte_row + col_idx,
+                    dst_reg: dest,
+                    extra_amount: 0,
+                });
+            } else {
+                crate::bail_parse_error!("Unknown column '{}' in recursive CTE", col_name);
+            }
+            Ok(())
+        }
+        Expr::Qualified(table, col) => {
+            let table_name = normalize_ident(table.as_str());
+            if table_name == cte_name {
+                let col_name = normalize_ident(col.as_str());
+                if let Some(col_idx) = column_names
+                    .iter()
+                    .position(|n| normalize_ident(n) == col_name)
+                {
+                    program.emit_insn(Insn::Copy {
+                        src_reg: reg_cte_row + col_idx,
+                        dst_reg: dest,
+                        extra_amount: 0,
+                    });
+                } else {
+                    crate::bail_parse_error!("Unknown column '{}' in recursive CTE", col_name);
+                }
+            }
+            Ok(())
+        }
+        Expr::Binary(left, op, right) => {
+            let reg_left = program.alloc_register();
+            let reg_right = program.alloc_register();
+            translate_cte_expr(
+                program,
+                left,
+                reg_left,
+                resolver,
+                cte_name,
+                reg_cte_row,
+                column_names,
+            )?;
+            translate_cte_expr(
+                program,
+                right,
+                reg_right,
+                resolver,
+                cte_name,
+                reg_cte_row,
+                column_names,
+            )?;
+
+            match op {
+                ast::Operator::Add => {
+                    program.emit_insn(Insn::Add {
+                        lhs: reg_left,
+                        rhs: reg_right,
+                        dest,
+                    });
+                }
+                ast::Operator::Subtract => {
+                    program.emit_insn(Insn::Subtract {
+                        lhs: reg_left,
+                        rhs: reg_right,
+                        dest,
+                    });
+                }
+                ast::Operator::Multiply => {
+                    program.emit_insn(Insn::Multiply {
+                        lhs: reg_left,
+                        rhs: reg_right,
+                        dest,
+                    });
+                }
+                ast::Operator::Less => {
+                    // Comparison - result is 0 or 1
+                    program.emit_insn(Insn::Integer { value: 0, dest });
+                    let label_false = program.allocate_label();
+                    program.emit_insn(Insn::Ge {
+                        lhs: reg_left,
+                        rhs: reg_right,
+                        target_pc: label_false,
+                        flags: CmpInsFlags::default(),
+                        collation: None,
+                    });
+                    program.emit_insn(Insn::Integer { value: 1, dest });
+                    program.preassign_label_to_next_insn(label_false);
+                }
+                _ => {
+                    // Fallback to regular expression translation
+                    translate_expr(program, None, expr, dest, resolver)?;
+                }
+            }
+            Ok(())
+        }
+        Expr::Literal(lit) => {
+            match lit {
+                ast::Literal::Numeric(n) => {
+                    if let Ok(v) = n.parse::<i64>() {
+                        program.emit_insn(Insn::Integer { value: v, dest });
+                    } else if let Ok(v) = n.parse::<f64>() {
+                        program.emit_insn(Insn::Real { value: v, dest });
+                    }
+                }
+                ast::Literal::String(s) => {
+                    program.emit_insn(Insn::String8 {
+                        value: s.clone(),
+                        dest,
+                    });
+                }
+                ast::Literal::Null => {
+                    program.emit_insn(Insn::Null {
+                        dest,
+                        dest_end: None,
+                    });
+                }
+                _ => {
+                    translate_expr(program, None, expr, dest, resolver)?;
+                }
+            }
+            Ok(())
+        }
+        _ => {
+            // Fallback to regular expression translation for other cases
+            translate_expr(program, None, expr, dest, resolver)?;
+            Ok(())
+        }
+    }
 }
 
 pub fn prepare_select_plan(
