@@ -9,7 +9,7 @@ MINIMUM_TCL_VERSION := 8.6
 SQLITE_EXEC ?= scripts/limbo-sqlite3
 RUST_LOG := off
 
-all: check-rust-version build 
+all: check-rust-version build
 .PHONY: all
 
 install-sqlite:
@@ -223,7 +223,7 @@ endif
 
 .PHONY: merge-pr
 
-sim-schema: 
+sim-schema:
 	mkdir -p  simulator/configs/custom
 	cargo run -p limbo_sim -- print-schema > simulator/configs/custom/profile-schema.json
 

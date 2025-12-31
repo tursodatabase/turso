@@ -13,11 +13,12 @@ pub use crate::incremental::project_operator::{ProjectColumn, ProjectOperator};
 use crate::incremental::dbsp::{Delta, DeltaPair};
 use crate::schema::{Index, IndexColumn};
 use crate::storage::btree::BTreeCursor;
-use crate::sync::Arc;
-use crate::sync::Mutex;
 use crate::types::IOResult;
 use crate::Result;
+use parking_lot::Mutex;
+use std::any::Any;
 use std::fmt::Debug;
+use std::sync::Arc;
 
 /// Struct to hold both table and index cursors for DBSP state operations
 pub struct DbspStateCursors {
@@ -225,7 +226,7 @@ pub enum QueryOperator {
 /// Base trait for incremental operators
 // SAFETY: This needs to be audited for thread safety.
 // See: https://github.com/tursodatabase/turso/issues/1552
-pub trait IncrementalOperator: Debug + Send {
+pub trait IncrementalOperator: Debug + Send + Any {
     /// Evaluate the operator with a state, without modifying internal state
     /// This is used during query execution to compute results
     /// May need to read from storage to get current state (e.g., for aggregates)
@@ -254,6 +255,12 @@ pub trait IncrementalOperator: Debug + Send {
 
     /// Set computation tracker
     fn set_tracker(&mut self, tracker: Arc<Mutex<ComputationTracker>>);
+
+    /// Downcast to Any
+    fn as_any(&self) -> &dyn Any;
+
+    /// Downcast to Any (mutable)
+    fn as_any_mut(&mut self) -> &mut dyn Any;
 }
 
 #[cfg(test)]
@@ -269,6 +276,8 @@ mod tests {
     use crate::util::IOExt;
     use crate::Value;
     use crate::{Database, MemoryIO, IO};
+    use parking_lot::Mutex;
+    use std::sync::Arc;
 
     /// Create a test pager for operator tests with both table and index
     fn create_test_pager() -> (crate::sync::Arc<crate::Pager>, i64, i64) {

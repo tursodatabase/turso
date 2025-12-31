@@ -208,6 +208,10 @@ pub struct Schema {
     /// Mapping from table names to the materialized views that depend on them
     pub table_to_materialized_views: HashMap<String, Vec<String>>,
 
+    /// Mapping from materialized view names to other materialized views that depend on them
+    /// This enables cascading updates when a view that depends on another view needs to update
+    pub view_to_dependent_views: HashMap<String, Vec<String>>,
+
     /// Track views that exist but have incompatible versions
     pub incompatible_views: HashSet<String>,
 }
@@ -240,6 +244,7 @@ impl Schema {
         let views: ViewsMap = HashMap::new();
         let triggers = HashMap::new();
         let table_to_materialized_views: HashMap<String, Vec<String>> = HashMap::new();
+        let view_to_dependent_views: HashMap<String, Vec<String>> = HashMap::new();
         let incompatible_views = HashSet::new();
         Self {
             tables,
@@ -253,6 +258,7 @@ impl Schema {
             schema_version: 0,
             analyze_stats: AnalyzeStats::default(),
             table_to_materialized_views,
+            view_to_dependent_views,
             incompatible_views,
         }
     }
@@ -342,6 +348,12 @@ impl Schema {
                 views.retain(|v| v != &name);
             }
 
+            // Remove from view_to_dependent_views dependencies
+            self.view_to_dependent_views.remove(&name);
+            for views in self.view_to_dependent_views.values_mut() {
+                views.retain(|v| v != &name);
+            }
+
             Ok(())
         } else {
             Err(crate::LimboError::ParseError(format!(
@@ -371,6 +383,61 @@ impl Schema {
             .get(&table_name)
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// Register that a materialized view depends on another materialized view
+    pub fn add_view_to_view_dependency(&mut self, parent_view: &str, child_view: &str) {
+        let parent_view = normalize_ident(parent_view);
+        let child_view = normalize_ident(child_view);
+
+        self.view_to_dependent_views
+            .entry(parent_view)
+            .or_default()
+            .push(child_view);
+    }
+
+    /// Get all materialized views that depend on a given materialized view
+    pub fn get_dependent_views(&self, view_name: &str) -> Vec<String> {
+        if self.view_to_dependent_views.is_empty() {
+            return Vec::new();
+        }
+        let view_name = normalize_ident(view_name);
+        self.view_to_dependent_views
+            .get(&view_name)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Get all materialized views that need updating when a table changes,
+    /// including transitively dependent views, in topological order.
+    /// Parent views come before their dependents.
+    pub fn get_cascading_views_sorted(&self, table_name: &str) -> Vec<String> {
+        use std::collections::VecDeque;
+
+        let mut all_views = Vec::new();
+        let mut visited = HashSet::new();
+
+        // Start with directly dependent views
+        let direct = self.get_dependent_materialized_views(table_name);
+        let mut queue: VecDeque<String> = direct.into_iter().collect();
+
+        while let Some(view_name) = queue.pop_front() {
+            if visited.contains(&view_name) {
+                continue;
+            }
+            visited.insert(view_name.clone());
+            all_views.push(view_name.clone());
+
+            // Find views that depend on this view
+            let dependents = self.get_dependent_views(&view_name);
+            for dep in dependents {
+                if !visited.contains(&dep) {
+                    queue.push_back(dep);
+                }
+            }
+        }
+
+        all_views
     }
 
     /// Add a regular (non-materialized) view
@@ -817,6 +884,11 @@ impl Schema {
             // Register dependencies regardless of compatibility
             for table_name in referenced_tables {
                 self.add_materialized_view_dependency(&table_name, &view_name);
+                // If this "table" is actually a materialized view, also register
+                // the view-to-view dependency for cascading updates
+                if self.is_materialized_view(&table_name) {
+                    self.add_view_to_view_dependency(&table_name, &view_name);
+                }
             }
         }
         Ok(())
@@ -1367,6 +1439,9 @@ impl Clone for Schema {
                     name.clone(),
                     Arc::new(Table::FromClauseSubquery(from_clause_subquery.clone())),
                 ),
+                Table::RecursiveCte(_) => {
+                    unreachable!("RecursiveCte should not be stored in schema")
+                }
             })
             .collect();
         let indexes = self
@@ -1415,6 +1490,7 @@ impl Clone for Schema {
             schema_version: self.schema_version,
             analyze_stats: self.analyze_stats.clone(),
             table_to_materialized_views: self.table_to_materialized_views.clone(),
+            view_to_dependent_views: self.view_to_dependent_views.clone(),
             incompatible_views,
         }
     }
@@ -1425,6 +1501,8 @@ pub enum Table {
     BTree(Arc<BTreeTable>),
     Virtual(Arc<VirtualTable>),
     FromClauseSubquery(FromClauseSubquery),
+    /// A recursive CTE table, backed by an ephemeral queue cursor.
+    RecursiveCte(RecursiveCteTable),
 }
 
 impl Table {
@@ -1433,6 +1511,7 @@ impl Table {
             Table::BTree(table) => table.root_page,
             Table::Virtual(_) => unimplemented!(),
             Table::FromClauseSubquery(_) => unimplemented!(),
+            Table::RecursiveCte(_) => 0, // Ephemeral table, no root page
         }
     }
 
@@ -1441,6 +1520,7 @@ impl Table {
             Self::BTree(table) => &table.name,
             Self::Virtual(table) => &table.name,
             Self::FromClauseSubquery(from_clause_subquery) => &from_clause_subquery.name,
+            Self::RecursiveCte(recursive_cte) => &recursive_cte.name,
         }
     }
 
@@ -1451,6 +1531,7 @@ impl Table {
             Self::FromClauseSubquery(from_clause_subquery) => {
                 from_clause_subquery.columns.get(index)
             }
+            Self::RecursiveCte(recursive_cte) => recursive_cte.columns.get(index),
         }
     }
 
@@ -1469,6 +1550,11 @@ impl Table {
                 .iter()
                 .enumerate()
                 .find(|(_, col)| col.name.as_ref() == Some(&name)),
+            Self::RecursiveCte(recursive_cte) => recursive_cte
+                .columns
+                .iter()
+                .enumerate()
+                .find(|(_, col)| col.name.as_ref() == Some(&name)),
         }
     }
 
@@ -1477,6 +1563,7 @@ impl Table {
             Self::BTree(table) => &table.columns,
             Self::Virtual(table) => &table.columns,
             Self::FromClauseSubquery(from_clause_subquery) => &from_clause_subquery.columns,
+            Self::RecursiveCte(recursive_cte) => &recursive_cte.columns,
         }
     }
 
@@ -1485,6 +1572,7 @@ impl Table {
             Self::BTree(table) => Some(table.clone()),
             Self::Virtual(_) => None,
             Self::FromClauseSubquery(_) => None,
+            Self::RecursiveCte(_) => None,
         }
     }
 
@@ -1493,6 +1581,7 @@ impl Table {
             Self::BTree(table) => Some(table),
             Self::Virtual(_) => None,
             Self::FromClauseSubquery(_) => None,
+            Self::RecursiveCte(_) => None,
         }
     }
 
@@ -1718,6 +1807,18 @@ pub struct FromClauseSubquery {
     /// The start register for the result columns of the derived table;
     /// must be set before data is read from it.
     pub result_columns_start_reg: Option<usize>,
+}
+
+/// A recursive CTE table used during recursive CTE execution.
+/// This represents the CTE as a pseudo-table backed by an ephemeral queue cursor.
+#[derive(Clone, Debug)]
+pub struct RecursiveCteTable {
+    /// The name of the CTE.
+    pub name: String,
+    /// The columns of the CTE.
+    pub columns: Vec<Column>,
+    /// The cursor ID for the queue being read from during the recursive step.
+    pub cursor_id: usize,
 }
 
 pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> Result<BTreeTable> {

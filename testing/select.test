@@ -1531,3 +1531,52 @@ do_execsql_test_on_specific_db {:memory:} values-select-empty-db {
 do_execsql_test_on_specific_db {:memory:} select-sqlite-schema-empty-db {
   select group_concat(name) over () from sqlite_schema;
 } {}
+
+# Recursive CTE tests
+
+do_execsql_test_on_specific_db {:memory:} recursive-cte-count-sequence {
+  WITH RECURSIVE cnt(x) AS (
+    SELECT 1
+    UNION ALL
+    SELECT x+1 FROM cnt WHERE x < 5
+  )
+  SELECT x FROM cnt;
+} {1
+2
+3
+4
+5}
+
+do_execsql_test_on_specific_db {:memory:} recursive-cte-transitive-closure {
+  CREATE TABLE edges(source INTEGER, target INTEGER);
+  INSERT INTO edges VALUES (1, 2), (2, 3), (3, 4);
+  WITH RECURSIVE reach(source, target) AS (
+    SELECT source, target FROM edges
+    UNION
+    SELECT r.source, e.target FROM reach r JOIN edges e ON r.target = e.source
+  )
+  SELECT * FROM reach ORDER BY source, target;
+} {1|2
+1|3
+1|4
+2|3
+2|4
+3|4}
+
+do_execsql_test_on_specific_db {:memory:} recursive-cte-fibonacci {
+  WITH RECURSIVE fib(n, a, b) AS (
+    SELECT 1, 0, 1
+    UNION ALL
+    SELECT n+1, b, a+b FROM fib WHERE n < 10
+  )
+  SELECT a FROM fib;
+} {0
+1
+1
+2
+3
+5
+8
+13
+21
+34}

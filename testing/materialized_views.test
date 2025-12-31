@@ -2532,30 +2532,793 @@ do_execsql_test_on_specific_db {:memory:} matview-drop-cleans-up-dbsp-table {
 0
 0}
 
-# Test that a materialized view can be recreated after dropping
+# Test that a materialized view can be recreated after dropping, and that DBSP table cleanup works correctly
+# This test combines two scenarios:
+# 1. Verifying that materialized views can be recreated with different definitions
+# 2. Testing the cleanup code path in translate_create_materialized_view that handles orphaned DBSP tables
+#
+# The fix ensures cleanup code is always emitted during CREATE MATERIALIZED VIEW, which prevents
+# "table already exists" errors when orphaned DBSP tables exist from failed previous creations.
 do_execsql_test_on_specific_db {:memory:} matview-recreate-after-drop {
     CREATE TABLE data(x INTEGER, y INTEGER);
     INSERT INTO data VALUES (1, 10), (2, 20), (3, 30);
 
+    -- Create a materialized view (this creates the DBSP state table)
     CREATE MATERIALIZED VIEW mv AS
         SELECT x, SUM(y) as total
         FROM data
         GROUP BY x;
 
+    -- Verify both view and DBSP table exist
+    SELECT COUNT(*) FROM sqlite_schema WHERE type='view' AND name='mv';
+    SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name LIKE '__turso_internal_dbsp_state_v%_mv';
+
+    -- Verify the view works
     SELECT * FROM mv ORDER BY x;
 
-    -- Drop the view
+    -- Drop the view (this should clean up the DBSP table)
     DROP VIEW mv;
 
-    -- Verify it can be recreated with a different definition
+    -- Verify the view is gone and DBSP table is cleaned up
+    SELECT COUNT(*) FROM sqlite_schema WHERE type='view' AND name='mv';
+    SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name LIKE '__turso_internal_dbsp_state_v%_mv';
+
+    -- Recreate the view with a different definition
+    -- This exercises the cleanup code path in translate_create_materialized_view
+    -- Even though there's nothing to clean up, the cleanup code runs and ensures no conflicts
     CREATE MATERIALIZED VIEW mv AS
         SELECT x + 1 as modified_x, y * 2 as doubled_y
         FROM data
         WHERE x > 1;
 
+    -- Verify the view was created successfully
+    SELECT COUNT(*) FROM sqlite_schema WHERE type='view' AND name='mv';
+
+    -- Verify the DBSP table exists (should be recreated)
+    SELECT COUNT(*) FROM sqlite_schema WHERE type='table' AND name LIKE '__turso_internal_dbsp_state_v%_mv';
+
+    -- Verify the view works correctly with the new definition
     SELECT * FROM mv ORDER BY modified_x;
-} {1|10.0
+} {1
+1
+1|10.0
 2|20.0
 3|30.0
+0
+0
+1
+1
 3|40
 4|60}
+
+do_execsql_test_on_specific_db {:memory:} matview-cte-simple {
+    CREATE TABLE t(a);
+    CREATE MATERIALIZED VIEW mv AS
+        WITH cte AS (SELECT * FROM t)
+        SELECT * FROM cte;
+
+    INSERT INTO t VALUES (1), (2);
+    SELECT * FROM mv ORDER BY a;
+} {1
+2}
+
+do_execsql_test_on_specific_db {:memory:} matview-cte-with-filter {
+    CREATE TABLE users(id INTEGER, name TEXT, age INTEGER);
+    INSERT INTO users VALUES
+        (1, 'Alice', 25),
+        (2, 'Bob', 30),
+        (3, 'Charlie', 17),
+        (4, 'David', 22);
+
+    CREATE MATERIALIZED VIEW adult_users AS
+        WITH adults AS (SELECT * FROM users WHERE age >= 18)
+        SELECT id, name FROM adults;
+
+    SELECT * FROM adult_users ORDER BY name;
+} {1|Alice
+2|Bob
+4|David}
+
+do_execsql_test_on_specific_db {:memory:} matview-cte-with-aggregation {
+    CREATE TABLE sales(product_id INTEGER, amount INTEGER);
+    INSERT INTO sales VALUES
+        (1, 100),
+        (2, 200),
+        (1, 150),
+        (3, 300),
+        (2, 250);
+
+    CREATE MATERIALIZED VIEW product_totals AS
+        WITH product_sales AS (SELECT product_id, amount FROM sales)
+        SELECT product_id, SUM(amount) as total
+        FROM product_sales
+        GROUP BY product_id;
+
+    SELECT * FROM product_totals ORDER BY product_id;
+} {1|250.0
+2|450.0
+3|300.0}
+
+do_execsql_test_on_specific_db {:memory:} matview-cte-chained {
+    CREATE TABLE t(a INTEGER);
+    INSERT INTO t VALUES (1), (2), (3), (4), (5);
+
+    CREATE MATERIALIZED VIEW mv AS
+        WITH cte1 AS (SELECT * FROM t),
+             cte2 AS (SELECT * FROM cte1 WHERE a > 2)
+        SELECT * FROM cte2;
+
+    SELECT * FROM mv ORDER BY a;
+} {3
+4
+5}
+
+# =============================================================================
+# Recursive CTE tests
+# =============================================================================
+
+# Test recursive CTE: transitive closure on a graph with computed path column
+# Uses implicit column names (no column list after CTE name) which triggered a bug
+# where column resolution failed with "no such column" errors
+do_execsql_test_on_specific_db {:memory:} matview-recursive-cte-transitive-closure {
+    CREATE TABLE edges(source INTEGER, target INTEGER);
+    INSERT INTO edges VALUES (1, 2), (2, 3), (3, 4);
+
+    CREATE MATERIALIZED VIEW reachable AS
+    WITH RECURSIVE reach AS (
+        SELECT source, target, source || '->' || target as path FROM edges
+        UNION
+        SELECT r.source, e.target, r.path || '->' || e.target as path
+        FROM reach r
+        JOIN edges e ON r.target = e.source
+    )
+    SELECT * FROM reach;
+
+    -- Test SELECT * to ensure all columns are resolved
+    SELECT * FROM reachable ORDER BY source, target;
+
+    -- Test SELECT specific columns to ensure column resolution works
+    SELECT source FROM reachable ORDER BY source;
+    SELECT path FROM reachable ORDER BY path;
+} {1|2|1->2
+1|3|1->2->3
+1|4|1->2->3->4
+2|3|2->3
+2|4|2->3->4
+3|4|3->4
+1
+1
+1
+2
+2
+3
+1->2
+1->2->3
+1->2->3->4
+2->3
+2->3->4
+3->4}
+
+# Test recursive CTE with incremental INSERT
+do_execsql_test_on_specific_db {:memory:} matview-recursive-cte-incremental-insert {
+    CREATE TABLE edges(source INTEGER, target INTEGER);
+    INSERT INTO edges VALUES (1, 2), (2, 3);
+
+    CREATE MATERIALIZED VIEW reachable AS
+    WITH RECURSIVE reach(source, target) AS (
+        SELECT source, target FROM edges
+        UNION
+        SELECT r.source, e.target
+        FROM reach r
+        JOIN edges e ON r.target = e.source
+    )
+    SELECT * FROM reach;
+
+    SELECT COUNT(*) FROM reachable;
+
+    -- Add new edge: 3->4, which creates new transitive paths
+    INSERT INTO edges VALUES (3, 4);
+
+    SELECT COUNT(*) FROM reachable;
+    SELECT * FROM reachable ORDER BY source, target;
+} {3
+6
+1|2
+1|3
+1|4
+2|3
+2|4
+3|4}
+
+# Test recursive CTE with DELETE from base table
+do_execsql_test_on_specific_db {:memory:} matview-recursive-cte-incremental-delete {
+    CREATE TABLE edges(source INTEGER, target INTEGER);
+    INSERT INTO edges VALUES (1, 2), (2, 3), (3, 4);
+
+    CREATE MATERIALIZED VIEW reachable AS
+    WITH RECURSIVE reach(source, target) AS (
+        SELECT source, target FROM edges
+        UNION
+        SELECT r.source, e.target
+        FROM reach r
+        JOIN edges e ON r.target = e.source
+    )
+    SELECT * FROM reach;
+
+    SELECT COUNT(*) FROM reachable;
+
+    -- Delete middle edge: should break transitive paths from 1
+    DELETE FROM edges WHERE source = 2 AND target = 3;
+
+    SELECT COUNT(*) FROM reachable;
+    SELECT * FROM reachable ORDER BY source, target;
+} {6
+2
+1|2
+3|4}
+
+# Test recursive CTE: ancestor-descendant relationship
+do_execsql_test_on_specific_db {:memory:} matview-recursive-cte-ancestors {
+    CREATE TABLE family(parent TEXT, child TEXT);
+    INSERT INTO family VALUES
+        ('Alice', 'Bob'),
+        ('Alice', 'Carol'),
+        ('Bob', 'David'),
+        ('Carol', 'Eve');
+
+    CREATE MATERIALIZED VIEW all_ancestors AS
+    WITH RECURSIVE ancestors(ancestor, descendant) AS (
+        SELECT parent, child FROM family
+        UNION
+        SELECT a.ancestor, f.child
+        FROM ancestors a
+        JOIN family f ON a.descendant = f.parent
+    )
+    SELECT * FROM ancestors;
+
+    SELECT * FROM all_ancestors ORDER BY ancestor, descendant;
+} {Alice|Bob
+Alice|Carol
+Alice|David
+Alice|Eve
+Bob|David
+Carol|Eve}
+
+# Test recursive CTE in transaction with rollback
+do_execsql_test_on_specific_db {:memory:} matview-recursive-cte-rollback {
+    CREATE TABLE edges(source INTEGER, target INTEGER);
+    INSERT INTO edges VALUES (1, 2), (2, 3);
+
+    CREATE MATERIALIZED VIEW reachable AS
+    WITH RECURSIVE reach(source, target) AS (
+        SELECT source, target FROM edges
+        UNION
+        SELECT r.source, e.target
+        FROM reach r
+        JOIN edges e ON r.target = e.source
+    )
+    SELECT * FROM reach;
+
+    SELECT COUNT(*) FROM reachable;
+
+    BEGIN;
+    INSERT INTO edges VALUES (3, 4);
+    SELECT COUNT(*) FROM reachable;
+    ROLLBACK;
+
+    SELECT COUNT(*) FROM reachable;
+    SELECT * FROM reachable ORDER BY source, target;
+} {3
+6
+3
+1|2
+1|3
+2|3}
+
+# ===== CHAINED MATERIALIZED VIEW REACTIVITY TESTS =====
+# These tests verify that when MatView B depends on MatView A,
+# changes to base tables propagate through the entire chain.
+
+# Simple two-level chain: base table -> MatView A -> MatView B
+do_execsql_test_on_specific_db {:memory:} matview-chained-simple {
+    CREATE TABLE items(id INTEGER PRIMARY KEY, category TEXT, value INTEGER);
+    INSERT INTO items VALUES (1, 'A', 100), (2, 'B', 200), (3, 'A', 150);
+
+    -- First matview: filter items by category
+    CREATE MATERIALIZED VIEW items_a AS
+        SELECT id, value FROM items WHERE category = 'A';
+
+    -- Second matview: aggregate over the first matview
+    CREATE MATERIALIZED VIEW items_a_summary AS
+        SELECT SUM(value) as total, COUNT(*) as cnt FROM items_a;
+
+    -- Initial state
+    SELECT * FROM items_a ORDER BY id;
+    SELECT * FROM items_a_summary;
+
+    -- Add a new item to category A - should propagate to both views
+    INSERT INTO items VALUES (4, 'A', 50);
+    SELECT * FROM items_a ORDER BY id;
+    SELECT * FROM items_a_summary;
+} {1|100
+3|150
+250.0|2
+1|100
+3|150
+4|50
+300.0|3}
+
+# Chain with JOIN: base tables -> MatView A (join) -> MatView B (filter on A)
+do_execsql_test_on_specific_db {:memory:} matview-chained-join {
+    CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT, active INTEGER);
+    CREATE TABLE orders(id INTEGER PRIMARY KEY, user_id INTEGER, amount INTEGER);
+
+    INSERT INTO users VALUES (1, 'Alice', 1), (2, 'Bob', 0), (3, 'Charlie', 1);
+    INSERT INTO orders VALUES (1, 1, 100), (2, 2, 200), (3, 3, 150);
+
+    -- First matview: join users and orders
+    CREATE MATERIALIZED VIEW user_orders AS
+        SELECT u.name, o.amount, u.active
+        FROM users u
+        JOIN orders o ON u.id = o.user_id;
+
+    -- Second matview: filter the first matview for active users only
+    CREATE MATERIALIZED VIEW active_user_orders AS
+        SELECT name, amount FROM user_orders WHERE active = 1;
+
+    -- Initial state
+    SELECT * FROM user_orders ORDER BY name;
+    SELECT * FROM active_user_orders ORDER BY name;
+
+    -- Update Bob to active - should now appear in active_user_orders
+    UPDATE users SET active = 1 WHERE name = 'Bob';
+    SELECT * FROM active_user_orders ORDER BY name;
+
+    -- Add new order for Alice - should appear in both views
+    INSERT INTO orders VALUES (4, 1, 75);
+    SELECT * FROM active_user_orders ORDER BY name, amount;
+} {Alice|100|1
+Bob|200|0
+Charlie|150|1
+Alice|100
+Charlie|150
+Alice|100
+Bob|200
+Charlie|150
+Alice|75
+Alice|100
+Bob|200
+Charlie|150}
+
+# PKM navigation use case from HANDOFF document
+do_execsql_test_on_specific_db {:memory:} matview-chained-navigation-pkm {
+    -- Base tables
+    CREATE TABLE navigation_cursor(region TEXT PRIMARY KEY, history_id INTEGER);
+    CREATE TABLE navigation_history(id INTEGER PRIMARY KEY, region TEXT, block_id TEXT);
+    CREATE TABLE blocks(id TEXT PRIMARY KEY, parent_id TEXT, content TEXT);
+
+    -- First MatView: joins cursor and history to get current focus
+    CREATE MATERIALIZED VIEW nav_focus AS
+        SELECT nc.region, nh.block_id
+        FROM navigation_cursor nc
+        JOIN navigation_history nh ON nc.history_id = nh.id;
+
+    -- Second MatView: shows blocks for the currently focused document
+    CREATE MATERIALIZED VIEW main_blocks AS
+        SELECT b.id, b.content
+        FROM blocks b
+        JOIN nav_focus nf ON b.parent_id = nf.block_id
+        WHERE nf.region = 'main';
+
+    -- Setup initial navigation state
+    INSERT INTO navigation_cursor VALUES ('main', NULL);
+    INSERT INTO navigation_history VALUES (1, 'main', 'doc-A');
+    INSERT INTO blocks VALUES ('block-1', 'doc-A', 'ContentA1');
+    INSERT INTO blocks VALUES ('block-2', 'doc-A', 'ContentA2');
+    INSERT INTO blocks VALUES ('block-3', 'doc-B', 'ContentB1');
+    INSERT INTO blocks VALUES ('block-4', 'doc-B', 'ContentB2');
+
+    -- Point cursor to history entry 1 (doc-A)
+    UPDATE navigation_cursor SET history_id = 1 WHERE region = 'main';
+
+    -- Verify nav_focus shows doc-A
+    SELECT * FROM nav_focus WHERE region = 'main';
+
+    -- Verify main_blocks shows doc-A's blocks
+    SELECT * FROM main_blocks ORDER BY id;
+
+    -- Navigate to doc-B
+    INSERT INTO navigation_history VALUES (2, 'main', 'doc-B');
+    UPDATE navigation_cursor SET history_id = 2 WHERE region = 'main';
+
+    -- Verify nav_focus now shows doc-B
+    SELECT * FROM nav_focus WHERE region = 'main';
+
+    -- Verify main_blocks now shows doc-B's blocks (THIS IS THE KEY TEST)
+    SELECT * FROM main_blocks ORDER BY id;
+} {main|doc-A
+block-1|ContentA1
+block-2|ContentA2
+main|doc-B
+block-3|ContentB1
+block-4|ContentB2}
+
+# Three-level chain: base -> A -> B -> C
+do_execsql_test_on_specific_db {:memory:} matview-chained-three-levels {
+    CREATE TABLE data(id INTEGER PRIMARY KEY, val INTEGER);
+    INSERT INTO data VALUES (1, 10), (2, 20), (3, 30), (4, 40);
+
+    -- Level 1: filter even values
+    CREATE MATERIALIZED VIEW level1 AS
+        SELECT id, val FROM data WHERE val >= 20;
+
+    -- Level 2: double the values from level1
+    CREATE MATERIALIZED VIEW level2 AS
+        SELECT id, val * 2 as doubled FROM level1;
+
+    -- Level 3: sum from level2
+    CREATE MATERIALIZED VIEW level3 AS
+        SELECT SUM(doubled) as total FROM level2;
+
+    -- Initial state
+    SELECT * FROM level1 ORDER BY id;
+    SELECT * FROM level2 ORDER BY id;
+    SELECT * FROM level3;
+
+    -- Add new data that passes through all levels
+    INSERT INTO data VALUES (5, 50);
+    SELECT * FROM level1 ORDER BY id;
+    SELECT * FROM level2 ORDER BY id;
+    SELECT * FROM level3;
+
+    -- Update existing data
+    UPDATE data SET val = 15 WHERE id = 2;
+    SELECT * FROM level1 ORDER BY id;
+    SELECT * FROM level2 ORDER BY id;
+    SELECT * FROM level3;
+} {2|20
+3|30
+4|40
+2|40
+3|60
+4|80
+180.0
+2|20
+3|30
+4|40
+5|50
+2|40
+3|60
+4|80
+5|100
+280.0
+3|30
+4|40
+5|50
+3|60
+4|80
+5|100
+240.0}
+
+# Chain with aggregation in first view
+do_execsql_test_on_specific_db {:memory:} matview-chained-agg-then-filter {
+    CREATE TABLE sales(region TEXT, product TEXT, amount INTEGER);
+    INSERT INTO sales VALUES
+        ('North', 'A', 100),
+        ('North', 'B', 200),
+        ('South', 'A', 150),
+        ('South', 'B', 50);
+
+    -- First matview: aggregate sales by region
+    CREATE MATERIALIZED VIEW region_totals AS
+        SELECT region, SUM(amount) as total
+        FROM sales
+        GROUP BY region;
+
+    -- Second matview: filter for high-performing regions
+    CREATE MATERIALIZED VIEW high_regions AS
+        SELECT region, total FROM region_totals WHERE total > 200;
+
+    -- Initial state
+    SELECT * FROM region_totals ORDER BY region;
+    SELECT * FROM high_regions ORDER BY region;
+
+    -- Add sale that pushes South above threshold
+    INSERT INTO sales VALUES ('South', 'C', 100);
+    SELECT * FROM region_totals ORDER BY region;
+    SELECT * FROM high_regions ORDER BY region;
+
+    -- Remove sale from North, dropping it below threshold
+    DELETE FROM sales WHERE region = 'North' AND product = 'B';
+    SELECT * FROM region_totals ORDER BY region;
+    SELECT * FROM high_regions ORDER BY region;
+} {North|300.0
+South|200.0
+North|300.0
+North|300.0
+South|300.0
+North|300.0
+South|300.0
+North|100.0
+South|300.0
+South|300.0}
+
+# ===== INDEX TESTS FOR MATERIALIZED VIEWS =====
+# These tests verify that secondary indexes can be created on materialized views
+# and are maintained incrementally as the underlying data changes.
+
+# Basic index creation on materialized view
+do_execsql_test_on_specific_db {:memory:} matview-create-index-basic {
+    CREATE TABLE products(id INTEGER PRIMARY KEY, name TEXT, price INTEGER, category TEXT);
+    INSERT INTO products VALUES
+        (1, 'Laptop', 1200, 'Electronics'),
+        (2, 'Mouse', 25, 'Electronics'),
+        (3, 'Desk', 350, 'Furniture');
+
+    CREATE MATERIALIZED VIEW expensive_items AS
+        SELECT id, name, price, category FROM products WHERE price > 100;
+
+    -- Create an index on the materialized view
+    CREATE INDEX idx_expensive_category ON expensive_items(category);
+
+    -- Query should use the index
+    SELECT name FROM expensive_items WHERE category = 'Electronics' ORDER BY name;
+} {Laptop}
+
+# Index maintenance on INSERT
+do_execsql_test_on_specific_db {:memory:} matview-index-insert-maintenance {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT, b INTEGER);
+    CREATE MATERIALIZED VIEW v AS SELECT id, a, b FROM t WHERE b > 10;
+    CREATE INDEX idx_v_a ON v(a);
+
+    INSERT INTO t VALUES (1, 'alpha', 20), (2, 'beta', 5), (3, 'alpha', 30);
+    SELECT id FROM v WHERE a = 'alpha' ORDER BY id;
+} {1
+3}
+
+# Index maintenance on DELETE
+do_execsql_test_on_specific_db {:memory:} matview-index-delete-maintenance {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT, b INTEGER);
+    INSERT INTO t VALUES (1, 'x', 20), (2, 'x', 30), (3, 'y', 40);
+    CREATE MATERIALIZED VIEW v AS SELECT id, a, b FROM t WHERE b > 10;
+    CREATE INDEX idx_v_a ON v(a);
+
+    SELECT COUNT(*) FROM v WHERE a = 'x';
+    DELETE FROM t WHERE id = 1;
+    SELECT COUNT(*) FROM v WHERE a = 'x';
+} {2
+1}
+
+# Index maintenance on UPDATE
+do_execsql_test_on_specific_db {:memory:} matview-index-update-maintenance {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT, b INTEGER);
+    INSERT INTO t VALUES (1, 'old', 20), (2, 'old', 30);
+    CREATE MATERIALIZED VIEW v AS SELECT id, a, b FROM t WHERE b > 10;
+    CREATE INDEX idx_v_a ON v(a);
+
+    SELECT COUNT(*) FROM v WHERE a = 'old';
+    UPDATE t SET a = 'new' WHERE id = 1;
+    SELECT COUNT(*) FROM v WHERE a = 'old';
+    SELECT COUNT(*) FROM v WHERE a = 'new';
+} {2
+1
+1}
+
+# Multiple indexes on same materialized view
+do_execsql_test_on_specific_db {:memory:} matview-multiple-indexes {
+    CREATE TABLE orders(id INTEGER PRIMARY KEY, customer TEXT, amount INTEGER, status TEXT);
+    INSERT INTO orders VALUES
+        (1, 'Alice', 100, 'shipped'),
+        (2, 'Bob', 200, 'pending'),
+        (3, 'Alice', 150, 'shipped');
+
+    CREATE MATERIALIZED VIEW shipped_orders AS
+        SELECT id, customer, amount FROM orders WHERE status = 'shipped';
+
+    CREATE INDEX idx_shipped_customer ON shipped_orders(customer);
+    CREATE INDEX idx_shipped_amount ON shipped_orders(amount);
+
+    SELECT id FROM shipped_orders WHERE customer = 'Alice' ORDER BY id;
+    SELECT id FROM shipped_orders WHERE amount > 120 ORDER BY id;
+} {1
+3
+3}
+
+# Unique index on materialized view
+do_execsql_test_on_specific_db {:memory:} matview-unique-index {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, code TEXT, value INTEGER);
+    INSERT INTO t VALUES (1, 'A001', 100), (2, 'A002', 200);
+
+    CREATE MATERIALIZED VIEW v AS SELECT id, code, value FROM t WHERE value > 50;
+    CREATE UNIQUE INDEX idx_v_code ON v(code);
+
+    SELECT code FROM v ORDER BY code;
+} {A001
+A002}
+
+# Index with aggregation view
+do_execsql_test_on_specific_db {:memory:} matview-index-on-aggregation {
+    CREATE TABLE sales(id INTEGER, product TEXT, region TEXT, amount INTEGER);
+    INSERT INTO sales VALUES
+        (1, 'Widget', 'North', 100),
+        (2, 'Widget', 'South', 150),
+        (3, 'Gadget', 'North', 200),
+        (4, 'Gadget', 'South', 250);
+
+    CREATE MATERIALIZED VIEW regional_sales AS
+        SELECT region, SUM(amount) as total, COUNT(*) as cnt
+        FROM sales
+        GROUP BY region;
+
+    CREATE INDEX idx_regional_total ON regional_sales(total);
+
+    SELECT region FROM regional_sales WHERE total > 200 ORDER BY region;
+} {North
+South}
+
+# Index maintenance with rollback
+do_execsql_test_on_specific_db {:memory:} matview-index-rollback {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT, b INTEGER);
+    INSERT INTO t VALUES (1, 'x', 20);
+    CREATE MATERIALIZED VIEW v AS SELECT id, a, b FROM t WHERE b > 10;
+    CREATE INDEX idx_v_a ON v(a);
+
+    SELECT COUNT(*) FROM v WHERE a = 'x';
+
+    BEGIN;
+    INSERT INTO t VALUES (2, 'x', 30);
+    SELECT COUNT(*) FROM v WHERE a = 'x';
+    ROLLBACK;
+
+    SELECT COUNT(*) FROM v WHERE a = 'x';
+} {1
+2
+1}
+
+# Drop index on materialized view
+do_execsql_test_on_specific_db {:memory:} matview-drop-index {
+    CREATE TABLE t(id INTEGER PRIMARY KEY, a TEXT);
+    INSERT INTO t VALUES (1, 'test');
+    CREATE MATERIALIZED VIEW v AS SELECT * FROM t;
+    CREATE INDEX idx_v_a ON v(a);
+
+    -- Verify index exists
+    SELECT COUNT(*) FROM sqlite_schema WHERE type = 'index' AND name = 'idx_v_a';
+
+    DROP INDEX idx_v_a;
+
+    -- Verify index is gone
+    SELECT COUNT(*) FROM sqlite_schema WHERE type = 'index' AND name = 'idx_v_a';
+} {1
+0}
+
+# Index on join materialized view
+do_execsql_test_on_specific_db {:memory:} matview-index-on-join {
+    CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE orders(id INTEGER PRIMARY KEY, user_id INTEGER, amount INTEGER);
+
+    INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob');
+    INSERT INTO orders VALUES (1, 1, 100), (2, 1, 200), (3, 2, 150);
+
+    CREATE MATERIALIZED VIEW user_orders AS
+        SELECT u.name, o.amount
+        FROM users u
+        JOIN orders o ON u.id = o.user_id;
+
+    CREATE INDEX idx_uo_name ON user_orders(name);
+
+    SELECT amount FROM user_orders WHERE name = 'Alice' ORDER BY amount;
+} {100
+200}
+
+# Composite index on materialized view
+do_execsql_test_on_specific_db {:memory:} matview-composite-index {
+    CREATE TABLE events(id INTEGER PRIMARY KEY, category TEXT, status TEXT, priority INTEGER);
+    INSERT INTO events VALUES
+        (1, 'A', 'open', 1),
+        (2, 'A', 'closed', 2),
+        (3, 'B', 'open', 3),
+        (4, 'A', 'open', 4);
+
+    CREATE MATERIALIZED VIEW active_events AS
+        SELECT id, category, status, priority FROM events WHERE status = 'open';
+
+    CREATE INDEX idx_active_cat_pri ON active_events(category, priority);
+
+    SELECT id FROM active_events WHERE category = 'A' ORDER BY priority;
+} {1
+4}
+
+# Error: Cannot create index on non-existent materialized view
+do_execsql_test_in_memory_any_error matview-index-error-no-view {
+    CREATE INDEX idx_foo ON nonexistent_view(col);
+}
+
+# Index incremental maintenance with complex delta
+do_execsql_test_on_specific_db {:memory:} matview-index-complex-delta {
+    CREATE TABLE inventory(id INTEGER PRIMARY KEY, sku TEXT, warehouse TEXT, qty INTEGER);
+    INSERT INTO inventory VALUES
+        (1, 'SKU001', 'WH-A', 100),
+        (2, 'SKU002', 'WH-A', 50),
+        (3, 'SKU001', 'WH-B', 75);
+
+    CREATE MATERIALIZED VIEW low_stock AS
+        SELECT id, sku, warehouse, qty FROM inventory WHERE qty < 80;
+
+    CREATE INDEX idx_lowstock_sku ON low_stock(sku);
+    CREATE INDEX idx_lowstock_wh ON low_stock(warehouse);
+
+    -- Initial state: SKU002 and SKU001@WH-B are low stock
+    SELECT sku FROM low_stock WHERE warehouse = 'WH-A';
+    SELECT sku FROM low_stock WHERE warehouse = 'WH-B';
+
+    -- Update moves SKU001@WH-A into low stock
+    UPDATE inventory SET qty = 30 WHERE id = 1;
+    SELECT sku FROM low_stock WHERE warehouse = 'WH-A' ORDER BY sku;
+
+    -- Delete removes SKU002 from low stock
+    DELETE FROM inventory WHERE id = 2;
+    SELECT sku FROM low_stock WHERE warehouse = 'WH-A';
+} {SKU002
+SKU001
+SKU001
+SKU002
+SKU001}
+
+# Index on UNION materialized view
+do_execsql_test_on_specific_db {:memory:} matview-index-on-union {
+    CREATE TABLE online_sales(id INTEGER, product TEXT, amount INTEGER);
+    CREATE TABLE store_sales(id INTEGER, product TEXT, amount INTEGER);
+
+    INSERT INTO online_sales VALUES (1, 'Widget', 100), (2, 'Gadget', 200);
+    INSERT INTO store_sales VALUES (3, 'Widget', 150), (4, 'Tool', 300);
+
+    CREATE MATERIALIZED VIEW all_sales AS
+        SELECT id, product, amount FROM online_sales
+        UNION ALL
+        SELECT id, product, amount FROM store_sales;
+
+    CREATE INDEX idx_allsales_product ON all_sales(product);
+
+    SELECT SUM(amount) FROM all_sales WHERE product = 'Widget';
+} {250.0}
+
+# Index with DESC order
+do_execsql_test_on_specific_db {:memory:} matview-index-desc-order {
+    CREATE TABLE scores(id INTEGER PRIMARY KEY, player TEXT, score INTEGER);
+    INSERT INTO scores VALUES (1, 'Alice', 100), (2, 'Bob', 200), (3, 'Charlie', 150);
+
+    CREATE MATERIALIZED VIEW high_scores AS
+        SELECT id, player, score FROM scores WHERE score >= 100;
+
+    CREATE INDEX idx_scores_desc ON high_scores(score DESC);
+
+    SELECT player FROM high_scores ORDER BY score DESC;
+} {Bob
+Charlie
+Alice}
+
+# Test IF NOT EXISTS clause
+do_execsql_test_on_specific_db {:memory:} matview-if-not-exists {
+    CREATE TABLE t(x INTEGER, y INTEGER);
+    INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);
+
+    CREATE MATERIALIZED VIEW mv AS SELECT * FROM t WHERE y > 15;
+    SELECT * FROM mv ORDER BY x;
+
+    -- This should succeed silently without error
+    CREATE MATERIALIZED VIEW IF NOT EXISTS mv AS SELECT * FROM t WHERE y > 25;
+
+    -- View should still have original data (y > 15, not y > 25)
+    SELECT * FROM mv ORDER BY x;
+
+    -- Verify the view still works with incremental updates
+    INSERT INTO t VALUES (4, 40);
+    SELECT * FROM mv ORDER BY x;
+} {2|20
+3|30
+2|20
+3|30
+2|20
+3|30
+4|40}
