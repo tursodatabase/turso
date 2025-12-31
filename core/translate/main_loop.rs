@@ -5,7 +5,10 @@ use std::{borrow::Cow, collections::HashSet, sync::Arc};
 use super::{
     aggregation::{translate_aggregation_step, AggArgumentSource},
     display::PlanContext,
-    emitter::{OperationMode, TranslateCtx, UpdateRowSource},
+    emitter::{
+        MaterializedBuildInputMode, MaterializedColumnRef, OperationMode, TranslateCtx,
+        UpdateRowSource,
+    },
     expr::{
         translate_condition_expr, translate_expr, translate_expr_no_constant_opt,
         ConditionMetadata, NoConstantOptReason,
@@ -472,22 +475,32 @@ pub fn init_loop(
     Ok(())
 }
 
-/// Emit the hash table build phase for a hash join operation.
-/// This scans the build table and populates the hash table with matching rows.
-/// Information about payload columns stored in the hash table during build phase.
-/// Returned by emit_hash_build_phase to be used during probe phase emission.
+/// Information captured during hash table build for use in probe emission.
+///
+/// This describes the payload layout, key affinities, bloom filter settings,
+/// and whether the probe phase may seek into the build table for missing data.
 #[derive(Debug, Clone)]
 pub struct HashBuildPayloadInfo {
-    /// Column indices from the build table stored as payload, in order.
-    pub payload_columns: Vec<usize>,
+    /// Column references stored as payload, in order.
+    /// These may reference multiple tables when using a materialized join prefix.
+    pub payload_columns: Vec<MaterializedColumnRef>,
     /// Affinity string for the join keys.
     pub key_affinities: String,
     /// Whether to use a bloom filter for probe-side pruning.
     pub use_bloom_filter: bool,
     /// Cursor id used to store the bloom filter.
     pub bloom_filter_cursor_id: CursorID,
+    /// Whether it's safe to SeekRowid into the build table when payload is missing.
+    /// This is false when keys/payload are sourced from a materialized input.
+    pub allow_seek: bool,
 }
 
+/// Emit the hash table build phase for a hash join operation.
+///
+/// This scans the build input (either the base table or a materialized input)
+/// and populates the hash table with matching rows and payload. The returned
+/// metadata drives probe-side emission, including bloom filter use and whether
+/// build-table seeks are permitted.
 /// Uses a separate hash build cursor so the build scan does not interfere with
 /// the probe cursor for the same table.
 #[allow(clippy::too_many_arguments)]
@@ -505,12 +518,12 @@ fn emit_hash_build_phase(
     let btree = build_table
         .btree()
         .expect("Hash join build table must be a BTree table");
-    // If build input was materialized, we iterate its rowid list and SeekRowid into the
-    // real build table so the hash build respects prior join filters.
-    let materialized_cursor_id = t_ctx
+    // If build input was materialized, we may use either rowids (SeekRowid) or
+    // precomputed keys/payload depending on the materialization mode.
+    let materialized_input = t_ctx
         .materialized_build_inputs
-        .get(&hash_join_op.build_table_idx)
-        .copied();
+        .get(&hash_join_op.build_table_idx);
+    let materialized_cursor_id = materialized_input.map(|input| input.cursor_id);
 
     let num_keys = hash_join_op.join_keys.len();
     // Determine comparison affinity for each join key
@@ -545,9 +558,51 @@ fn emit_hash_build_phase(
             .iter()
             .all(|c| matches!(c, CollationSeq::Binary | CollationSeq::Unset));
 
-    // Collect payload columns, all columns referenced from the build table.
-    // These will be stored in the hash entry to avoid SeekRowid during probe.
-    let payload_columns: Vec<usize> = build_table.col_used_mask.iter().collect();
+    let (payload_columns, payload_signature_columns, use_materialized_keys, allow_seek) =
+        match materialized_input.map(|input| &input.mode) {
+            Some(MaterializedBuildInputMode::KeyPayload {
+                num_keys: payload_num_keys,
+                payload_columns,
+            }) => {
+                turso_assert!(
+                    *payload_num_keys == num_keys,
+                    "materialized hash build input key count mismatch"
+                );
+                let payload_signature_columns =
+                    (0..payload_columns.len()).map(|i| *payload_num_keys + i).collect();
+                (
+                    payload_columns.clone(),
+                    payload_signature_columns,
+                    true,
+                    false,
+                )
+            }
+            _ => {
+                // Collect payload columns from the build table for normal hash builds.
+                let payload_signature_columns: Vec<usize> =
+                    build_table.col_used_mask.iter().collect();
+                let payload_columns: Vec<MaterializedColumnRef> = payload_signature_columns
+                    .iter()
+                    .map(|col_idx| {
+                        let column = build_table
+                            .columns()
+                            .get(*col_idx)
+                            .expect("build table column missing");
+                        MaterializedColumnRef::Column {
+                            table_id: build_table.internal_id,
+                            column_idx: *col_idx,
+                            is_rowid_alias: column.is_rowid_alias(),
+                        }
+                    })
+                    .collect();
+                (payload_columns, payload_signature_columns, false, true)
+            }
+        };
+    let bloom_filter_cursor_id = if use_materialized_keys {
+        materialized_cursor_id.expect("materialized input cursor is required")
+    } else {
+        hash_build_cursor_id
+    };
 
     let join_key_indices = hash_join_op
         .join_keys
@@ -556,7 +611,7 @@ fn emit_hash_build_phase(
         .collect::<Vec<_>>();
     let signature = HashBuildSignature {
         join_key_indices,
-        payload_columns: payload_columns.clone(),
+        payload_columns: payload_signature_columns.clone(),
         key_affinities: key_affinities.clone(),
         use_bloom_filter,
         materialized_input_cursor: materialized_cursor_id,
@@ -566,7 +621,8 @@ fn emit_hash_build_phase(
             payload_columns,
             key_affinities,
             use_bloom_filter,
-            bloom_filter_cursor_id: hash_build_cursor_id,
+            bloom_filter_cursor_id,
+            allow_seek,
         });
     }
     if program.has_hash_build_signature(hash_table_id) {
@@ -575,9 +631,34 @@ fn emit_hash_build_phase(
     }
 
     let build_key_start_reg = program.alloc_registers(num_keys);
-    let build_rowid_reg = materialized_cursor_id.map(|_| program.alloc_register());
-    let build_iter_cursor_id = materialized_cursor_id.unwrap_or(hash_build_cursor_id);
-
+    let mut build_rowid_reg = None;
+    let mut build_iter_cursor_id = hash_build_cursor_id;
+    if let Some(input) = materialized_input {
+        match &input.mode {
+            MaterializedBuildInputMode::RowidOnly => {
+                build_rowid_reg = Some(program.alloc_register());
+                build_iter_cursor_id = input.cursor_id;
+            }
+            MaterializedBuildInputMode::KeyPayload { .. } => {
+                build_iter_cursor_id = input.cursor_id;
+            }
+        }
+    }
+    let key_source_cursor_id = if use_materialized_keys {
+        build_iter_cursor_id
+    } else {
+        hash_build_cursor_id
+    };
+    let payload_source_cursor_id = if use_materialized_keys {
+        build_iter_cursor_id
+    } else {
+        hash_build_cursor_id
+    };
+    let hash_build_rowid_cursor_id = if use_materialized_keys {
+        build_iter_cursor_id
+    } else {
+        hash_build_cursor_id
+    };
     // Create new loop for hash table build phase
     let build_loop_start = program.allocate_label();
     let build_loop_end = program.allocate_label();
@@ -589,11 +670,13 @@ fn emit_hash_build_phase(
 
     // This is a separate cursor from the regular table cursor so we can iterate
     // the build side without disturbing the probe cursor.
-    program.emit_insn(Insn::OpenRead {
-        cursor_id: hash_build_cursor_id,
-        root_page: btree.root_page,
-        db: build_table.database_id,
-    });
+    if !use_materialized_keys {
+        program.emit_insn(Insn::OpenRead {
+            cursor_id: hash_build_cursor_id,
+            root_page: btree.root_page,
+            db: build_table.database_id,
+        });
+    }
 
     program.emit_insn(Insn::Rewind {
         cursor_id: build_iter_cursor_id,
@@ -601,7 +684,9 @@ fn emit_hash_build_phase(
     });
 
     // Set cursor override so translate_expr uses the hash build cursor for this table
-    program.set_cursor_override(build_table.internal_id, hash_build_cursor_id);
+    if !use_materialized_keys {
+        program.set_cursor_override(build_table.internal_id, hash_build_cursor_id);
+    }
 
     program.preassign_label_to_next_insn(build_loop_start);
 
@@ -614,42 +699,55 @@ fn emit_hash_build_phase(
         });
     }
 
-    let build_only_mask =
-        TableMask::from_table_number_iter([hash_join_op.build_table_idx].into_iter());
-    for cond in predicates.iter() {
-        let mask = table_mask_from_expr(&cond.expr, table_references, non_from_clause_subqueries)?;
-        if !mask.contains_table(hash_join_op.build_table_idx)
-            || !build_only_mask.contains_all(&mask)
-        {
-            continue;
+    if !use_materialized_keys {
+        let build_only_mask =
+            TableMask::from_table_number_iter([hash_join_op.build_table_idx].into_iter());
+        for cond in predicates.iter() {
+            let mask =
+                table_mask_from_expr(&cond.expr, table_references, non_from_clause_subqueries)?;
+            if !mask.contains_table(hash_join_op.build_table_idx)
+                || !build_only_mask.contains_all(&mask)
+            {
+                continue;
+            }
+            let jump_target_when_true = program.allocate_label();
+            let condition_metadata = ConditionMetadata {
+                jump_if_condition_is_true: false,
+                jump_target_when_true,
+                jump_target_when_false: skip_to_next,
+                jump_target_when_null: skip_to_next,
+            };
+            translate_condition_expr(
+                program,
+                table_references,
+                &cond.expr,
+                condition_metadata,
+                &t_ctx.resolver,
+            )?;
+            program.preassign_label_to_next_insn(jump_target_when_true);
         }
-        let jump_target_when_true = program.allocate_label();
-        let condition_metadata = ConditionMetadata {
-            jump_if_condition_is_true: false,
-            jump_target_when_true,
-            jump_target_when_false: skip_to_next,
-            jump_target_when_null: skip_to_next,
-        };
-        translate_condition_expr(
-            program,
-            table_references,
-            &cond.expr,
-            condition_metadata,
-            &t_ctx.resolver,
-        )?;
-        program.preassign_label_to_next_insn(jump_target_when_true);
     }
 
-    for (idx, join_key) in hash_join_op.join_keys.iter().enumerate() {
-        let build_expr = join_key.get_build_expr(predicates);
-        let target_reg = build_key_start_reg + idx;
-        translate_expr(
-            program,
-            Some(table_references),
-            build_expr,
-            target_reg,
-            &t_ctx.resolver,
-        )?;
+    if use_materialized_keys {
+        for idx in 0..num_keys {
+            program.emit_column_or_rowid(
+                key_source_cursor_id,
+                idx,
+                build_key_start_reg + idx,
+            );
+        }
+    } else {
+        for (idx, join_key) in hash_join_op.join_keys.iter().enumerate() {
+            let build_expr = join_key.get_build_expr(predicates);
+            let target_reg = build_key_start_reg + idx;
+            translate_expr(
+                program,
+                Some(table_references),
+                build_expr,
+                target_reg,
+                &t_ctx.resolver,
+            )?;
+        }
     }
 
     // Apply affinity conversion to build keys before hashing
@@ -665,8 +763,8 @@ fn emit_hash_build_phase(
 
     let (payload_start_reg, mut payload_info) = if num_payload > 0 {
         let payload_reg = program.alloc_registers(num_payload);
-        for (i, &col_idx) in payload_columns.iter().enumerate() {
-            program.emit_column_or_rowid(hash_build_cursor_id, col_idx, payload_reg + i);
+        for (i, &col_idx) in payload_signature_columns.iter().enumerate() {
+            program.emit_column_or_rowid(payload_source_cursor_id, col_idx, payload_reg + i);
         }
         (
             Some(payload_reg),
@@ -674,7 +772,8 @@ fn emit_hash_build_phase(
                 payload_columns: payload_columns.clone(),
                 key_affinities: key_affinities.clone(),
                 use_bloom_filter: false,
-                bloom_filter_cursor_id: hash_build_cursor_id,
+                bloom_filter_cursor_id,
+                allow_seek,
             },
         )
     } else {
@@ -684,17 +783,20 @@ fn emit_hash_build_phase(
                 payload_columns: vec![],
                 key_affinities: key_affinities.clone(),
                 use_bloom_filter: false,
-                bloom_filter_cursor_id: hash_build_cursor_id,
+                bloom_filter_cursor_id,
+                allow_seek,
             },
         )
     };
 
-    program.clear_cursor_override(build_table.internal_id);
+    if !use_materialized_keys {
+        program.clear_cursor_override(build_table.internal_id);
+    }
 
     // Insert current row into hash table with payload columns.
     program.emit_insn(Insn::HashBuild {
         data: Box::new(HashBuildData {
-            cursor_id: hash_build_cursor_id,
+            cursor_id: hash_build_rowid_cursor_id,
             key_start_reg: build_key_start_reg,
             num_keys,
             hash_table_id,
@@ -706,7 +808,7 @@ fn emit_hash_build_phase(
     });
     if use_bloom_filter {
         program.emit_insn(Insn::FilterAdd {
-            cursor_id: hash_build_cursor_id,
+            cursor_id: bloom_filter_cursor_id,
             key_reg: build_key_start_reg,
             num_keys,
         });
@@ -741,6 +843,7 @@ pub fn open_loop(
     mode: OperationMode,
     subqueries: &mut [NonFromClauseSubquery],
 ) -> Result<()> {
+    let live_table_ids: HashSet<_> = join_order.iter().map(|member| member.table_id).collect();
     for (join_index, join) in join_order.iter().enumerate() {
         let joined_table_index = join.original_idx;
         let table = &table_references.joined_tables()[joined_table_index];
@@ -1143,27 +1246,52 @@ pub fn open_loop(
                     database: None,
                     table: build_table.internal_id,
                 };
-                t_ctx
-                    .resolver
-                    .expr_to_reg_cache
-                    .push((Cow::Owned(rowid_expr), match_reg));
+                let payload_has_build_rowid = payload_columns.iter().any(|payload| {
+                    matches!(
+                        payload,
+                        MaterializedColumnRef::RowId { table_id } if *table_id == build_table.internal_id
+                    )
+                });
+                let build_table_is_live = live_table_ids.contains(&build_table.internal_id);
+                if payload_info.allow_seek && !payload_has_build_rowid && !build_table_is_live {
+                    t_ctx
+                        .resolver
+                        .expr_to_reg_cache
+                        .push((Cow::Owned(rowid_expr), match_reg));
+                }
                 if let Some(payload_reg) = payload_dest_reg {
-                    for (i, &col_idx) in payload_columns.iter().enumerate() {
-                        let column = build_table.columns().get(col_idx);
-                        let is_rowid_alias = column.is_some_and(|c| c.is_rowid_alias());
-                        let expr = Expr::Column {
-                            database: None,
-                            table: build_table.internal_id,
-                            column: col_idx,
-                            is_rowid_alias,
+                    for (i, payload) in payload_columns.iter().enumerate() {
+                        let (payload_table_id, expr) = match payload {
+                            MaterializedColumnRef::Column {
+                                table_id,
+                                column_idx,
+                                is_rowid_alias,
+                            } => (
+                                *table_id,
+                                Expr::Column {
+                                    database: None,
+                                    table: *table_id,
+                                    column: *column_idx,
+                                    is_rowid_alias: *is_rowid_alias,
+                                },
+                            ),
+                            MaterializedColumnRef::RowId { table_id } => {
+                                (*table_id, Expr::RowId {
+                                    database: None,
+                                    table: *table_id,
+                                })
+                            }
                         };
+                        if live_table_ids.contains(&payload_table_id) {
+                            continue;
+                        }
                         t_ctx
                             .resolver
                             .expr_to_reg_cache
                             .push((Cow::Owned(expr), payload_reg + i));
                     }
-                } else {
-                    // When payload doesnt contain all needed columns, we still need to SeekRowid
+                } else if payload_info.allow_seek && !build_table_is_live {
+                    // When payload doesn't contain all needed columns, SeekRowid to the build table.
                     program.emit_insn(Insn::SeekRowid {
                         cursor_id: build_cursor_id,
                         src_reg: match_reg,

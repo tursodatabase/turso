@@ -264,6 +264,173 @@ fn estimate_selectivity(
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+enum SimpleColumnRef {
+    Column { table_id: TableInternalId, column_pos: usize },
+    RowId { table_id: TableInternalId },
+}
+
+fn simple_column_ref(expr: &ast::Expr) -> Option<SimpleColumnRef> {
+    match expr {
+        ast::Expr::Column { table, column, .. } => Some(SimpleColumnRef::Column {
+            table_id: *table,
+            column_pos: *column,
+        }),
+        ast::Expr::RowId { table, .. } => Some(SimpleColumnRef::RowId { table_id: *table }),
+        _ => None,
+    }
+}
+
+fn estimate_column_ndv(
+    schema: &Schema,
+    table_reference: &JoinedTable,
+    column_pos: Option<usize>,
+    is_rowid_expr: bool,
+    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+) -> Option<f64> {
+    let table_name = table_reference.table.get_name();
+    let table_stats = schema.analyze_stats.table_stats(table_name);
+    let row_count = table_stats
+        .and_then(|s| s.row_count)
+        .unwrap_or(ESTIMATED_HARDCODED_ROWS_PER_TABLE as u64) as f64;
+
+    if is_rowid_expr {
+        return Some(row_count.max(1.0));
+    }
+
+    let column_pos = column_pos?;
+    let column = table_reference.table.columns().get(column_pos)?;
+    if column.is_rowid_alias() || column.primary_key() {
+        return Some(row_count.max(1.0));
+    }
+
+    if let Some(indexes) = available_indexes.get(table_name) {
+        for index in indexes {
+            if let Some(idx_pos) = index.column_table_pos_to_index_pos(column_pos) {
+                if idx_pos != 0 {
+                    continue;
+                }
+                if index.unique {
+                    return Some(row_count.max(1.0));
+                }
+                if let Some(stats) = table_stats {
+                    if let Some(idx_stat) = stats.index_stats.get(&index.name) {
+                        if let (Some(total), Some(&avg_rows)) = (
+                            idx_stat.total_rows,
+                            idx_stat.distinct_per_prefix.first(),
+                        ) {
+                            if total > 0 && avg_rows > 0 {
+                                let ndv = total as f64 / avg_rows as f64;
+                                if ndv > 0.0 {
+                                    return Some(ndv);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let has_index = available_indexes
+        .get(table_name)
+        .is_some_and(|indexes| {
+            indexes
+                .iter()
+                .any(|index| index.column_table_pos_to_index_pos(column_pos).is_some())
+        });
+    let fallback_selectivity = if has_index {
+        SELECTIVITY_EQ_FALLBACK_INDEXED
+    } else {
+        SELECTIVITY_EQ_FALLBACK_UNINDEXED
+    };
+    let mut ndv = (1.0 / fallback_selectivity).max(1.0);
+    if row_count > 0.0 {
+        ndv = ndv.min(row_count);
+    }
+    Some(ndv)
+}
+
+fn estimate_join_eq_selectivity(
+    schema: &Schema,
+    table_reference: &JoinedTable,
+    column_pos: Option<usize>,
+    other_ref: SimpleColumnRef,
+    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    table_references: &TableReferences,
+) -> Option<f64> {
+    if column_pos.is_none() {
+        return None;
+    }
+    let other_table = table_references
+        .joined_tables()
+        .iter()
+        .find(|t| t.internal_id == match other_ref {
+            SimpleColumnRef::Column { table_id, .. } => table_id,
+            SimpleColumnRef::RowId { table_id } => table_id,
+        })?;
+    let (other_col_pos, other_is_rowid) = match other_ref {
+        SimpleColumnRef::Column { column_pos, .. } => (Some(column_pos), false),
+        SimpleColumnRef::RowId { .. } => (None, true),
+    };
+
+    let left_ndv =
+        estimate_column_ndv(schema, table_reference, column_pos, false, available_indexes);
+    let right_ndv =
+        estimate_column_ndv(schema, other_table, other_col_pos, other_is_rowid, available_indexes);
+
+    let max_ndv = match (left_ndv, right_ndv) {
+        (Some(left), Some(right)) => left.max(right),
+        (Some(left), None) | (None, Some(left)) => left,
+        (None, None) => return None,
+    };
+    if max_ndv <= 0.0 {
+        return None;
+    }
+    Some((1.0 / max_ndv).clamp(0.0, 1.0))
+}
+
+fn estimate_constraint_selectivity(
+    schema: &Schema,
+    table_reference: &JoinedTable,
+    column: Option<&Column>,
+    column_pos: Option<usize>,
+    operator: ast::Operator,
+    constraining_expr: &ast::Expr,
+    available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
+    table_references: &TableReferences,
+) -> f64 {
+    if operator == ast::Operator::Equals {
+        if let Some(other_ref) = simple_column_ref(constraining_expr) {
+            let other_table_id = match other_ref {
+                SimpleColumnRef::Column { table_id, .. } => table_id,
+                SimpleColumnRef::RowId { table_id } => table_id,
+            };
+            if other_table_id != table_reference.internal_id {
+                if let Some(selectivity) = estimate_join_eq_selectivity(
+                    schema,
+                    table_reference,
+                    column_pos,
+                    other_ref,
+                    available_indexes,
+                    table_references,
+                ) {
+                    return selectivity;
+                }
+            }
+        }
+    }
+
+    estimate_selectivity(
+        schema,
+        table_reference.table.get_name(),
+        column,
+        column_pos,
+        available_indexes,
+        operator,
+    )
+}
+
 fn expression_matches_table(
     expr: &ast::Expr,
     table_reference: &JoinedTable,
@@ -336,7 +503,6 @@ pub fn constraints_from_where_clause(
             }
 
             // If either the LHS or RHS of the constraint is a column from the table, add the constraint.
-            let table_name = table_reference.table.get_name();
             match lhs {
                 ast::Expr::Column { table, column, .. } => {
                     if *table == table_reference.internal_id {
@@ -347,13 +513,15 @@ pub fn constraints_from_where_clause(
                             table_col_pos: Some(*column),
                             expr: None,
                             lhs_mask: table_mask_from_expr(rhs, table_references, subqueries)?,
-                            selectivity: estimate_selectivity(
+                            selectivity: estimate_constraint_selectivity(
                                 schema,
-                                table_name,
+                                table_reference,
                                 Some(table_column),
                                 Some(*column),
-                                available_indexes,
                                 operator,
+                                rhs,
+                                available_indexes,
+                                table_references,
                             ),
                             usable: true,
                         });
@@ -372,13 +540,15 @@ pub fn constraints_from_where_clause(
                             table_col_pos: rowid_alias_column,
                             expr: None,
                             lhs_mask: table_mask_from_expr(rhs, table_references, subqueries)?,
-                            selectivity: estimate_selectivity(
+                            selectivity: estimate_constraint_selectivity(
                                 schema,
-                                table_name,
+                                table_reference,
                                 Some(table_column),
                                 rowid_alias_column,
-                                available_indexes,
                                 operator,
+                                rhs,
+                                available_indexes,
+                                table_references,
                             ),
                             usable: true,
                         });
@@ -413,13 +583,15 @@ pub fn constraints_from_where_clause(
                             table_col_pos: Some(*column),
                             expr: None,
                             lhs_mask: table_mask_from_expr(lhs, table_references, subqueries)?,
-                            selectivity: estimate_selectivity(
+                            selectivity: estimate_constraint_selectivity(
                                 schema,
-                                table_name,
+                                table_reference,
                                 Some(table_column),
                                 Some(*column),
-                                available_indexes,
                                 operator,
+                                lhs,
+                                available_indexes,
+                                table_references,
                             ),
                             usable: true,
                         });
@@ -435,13 +607,15 @@ pub fn constraints_from_where_clause(
                             table_col_pos: rowid_alias_column,
                             expr: None,
                             lhs_mask: table_mask_from_expr(lhs, table_references, subqueries)?,
-                            selectivity: estimate_selectivity(
+                            selectivity: estimate_constraint_selectivity(
                                 schema,
-                                table_name,
+                                table_reference,
                                 Some(table_column),
                                 rowid_alias_column,
-                                available_indexes,
                                 operator,
+                                lhs,
+                                available_indexes,
+                                table_references,
                             ),
                             usable: true,
                         });

@@ -6,7 +6,7 @@ use std::num::NonZeroUsize;
 use std::sync::Arc;
 
 use tracing::{instrument, Level};
-use turso_parser::ast::{self, Expr, Literal, TriggerEvent, TriggerTime};
+use turso_parser::ast::{self, Expr, Literal, TableInternalId, TriggerEvent, TriggerTime};
 
 use super::aggregation::emit_ungrouped_aggregation;
 use super::expr::translate_expr;
@@ -27,17 +27,17 @@ use crate::function::Func;
 use crate::schema::{BTreeTable, Column, Index, IndexColumn, Schema, Table, ROWID_SENTINEL};
 use crate::translate::compound_select::emit_program_for_compound_select;
 use crate::translate::expr::{
-    bind_and_rewrite_expr, emit_returning_results, translate_expr_no_constant_opt, walk_expr_mut,
-    BindingBehavior, NoConstantOptReason, WalkControl,
+    bind_and_rewrite_expr, emit_returning_results, translate_expr_no_constant_opt, walk_expr,
+    walk_expr_mut, BindingBehavior, NoConstantOptReason, WalkControl,
 };
 use crate::translate::fkeys::{
     build_index_affinity_string, emit_fk_child_update_counters, emit_fk_update_parent_actions,
     emit_guarded_fk_decrement, fire_fk_delete_actions, fire_fk_update_actions, open_read_index,
     open_read_table, stabilize_new_row_for_fk,
 };
-use crate::translate::insert::ROWID_COLUMN;
 use crate::translate::plan::{
-    DeletePlan, EvalAt, JoinedTable, Plan, QueryDestination, ResultSetColumn, Search,
+    DeletePlan, EphemeralRowidMode, EvalAt, JoinedTable, Plan, QueryDestination, ResultSetColumn,
+    Search,
 };
 use crate::translate::planner::ROWID_STRS;
 use crate::translate::planner::{table_mask_from_expr, TableMask};
@@ -111,6 +111,60 @@ pub struct LimitCtx {
     pub initialize_counter: bool,
 }
 
+/// Identifies a value stored in a materialized hash-build input.
+///
+/// These references are used to map payload registers back to the original
+/// table expressions during hash-probe evaluation. They are deliberately
+/// table-qualified so payloads can span multiple tables when the build input
+/// is derived from a join prefix.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum MaterializedColumnRef {
+    /// A concrete column from a specific table, including rowid alias metadata.
+    Column {
+        table_id: TableInternalId,
+        column_idx: usize,
+        is_rowid_alias: bool,
+    },
+    /// The implicit rowid (or integer primary key) of a specific table.
+    RowId {
+        table_id: TableInternalId,
+    },
+}
+
+/// Describes how a hash-join build input was materialized.
+///
+/// Rowid-only materialization preserves prior join constraints while keeping
+/// the hash table payload small, but requires `SeekRowid` into the build table
+/// during probing. Key+payload materialization stores the join keys and needed
+/// payload columns directly so the hash build can operate without seeking.
+#[derive(Debug, Clone)]
+pub enum MaterializedBuildInputMode {
+    /// Ephemeral table contains only build-side rowids.
+    RowidOnly,
+    /// Ephemeral table contains join keys followed by payload columns.
+    KeyPayload {
+        /// Number of join keys stored at the start of each row.
+        num_keys: usize,
+        /// Payload columns (after the keys) in ephemeral-table order.
+        payload_columns: Vec<MaterializedColumnRef>,
+    },
+}
+
+/// Metadata for a materialized build input keyed by build table index.
+///
+/// The cursor refers to the ephemeral table containing the materialized rows.
+/// `prefix_tables` tracks which join-prefix tables were captured so we can
+/// prune redundant scans from downstream join orders.
+#[derive(Debug, Clone)]
+pub struct MaterializedBuildInput {
+    /// Cursor id for the ephemeral table holding the materialized rows.
+    pub cursor_id: CursorID,
+    /// Encoding mode for the materialized rows.
+    pub mode: MaterializedBuildInputMode,
+    /// Join-prefix table indices folded into this materialization.
+    pub prefix_tables: Vec<usize>,
+}
+
 impl LimitCtx {
     pub fn new(program: &mut ProgramBuilder) -> Self {
         Self {
@@ -140,9 +194,11 @@ pub struct HashCtx {
     /// Starting register where payload columns are stored after HashProbe/HashNext.
     /// None if payload optimization is not used for this hash join.
     pub payload_start_reg: Option<usize>,
-    /// Column indices from the build table that are stored in payload, in order.
-    /// payload_start_reg + i contains the value for column payload_columns[i].
-    pub payload_columns: Vec<usize>,
+    /// Column references stored in payload, in order.
+    /// `payload_start_reg + i` contains the value for `payload_columns[i]`.
+    /// These references may point at multiple tables when a build input was
+    /// materialized from a join prefix.
+    pub payload_columns: Vec<MaterializedColumnRef>,
 }
 
 /// The TranslateCtx struct holds various information and labels used during bytecode generation.
@@ -177,8 +233,10 @@ pub struct TranslateCtx<'a> {
     pub resolver: Resolver<'a>,
     /// Hash table contexts for hash joins, keyed by build table index.
     pub hash_table_contexts: HashMap<usize, HashCtx>,
-    /// Materialized build-input rowid cursors for hash joins, keyed by build table index.
-    pub materialized_build_inputs: HashMap<usize, CursorID>,
+    /// Materialized build inputs for hash joins, keyed by build table index.
+    /// These entries are reused during nested materialization so we avoid
+    /// re-scanning prefix tables and preserve prior join constraints.
+    pub materialized_build_inputs: HashMap<usize, MaterializedBuildInput>,
     /// A list of expressions that are not aggregates, along with a flag indicating
     /// whether the expression should be included in the output for each group.
     ///
@@ -288,11 +346,16 @@ pub fn emit_program_for_select(
     emit_program_for_select_with_inputs(program, resolver, plan, materialized_build_inputs)
 }
 
+/// Returns the single-column schema used by rowid-only hash build inputs.
+fn build_rowid_column() -> Column {
+    Column::new_default_integer(Some("build_rowid".to_string()), "INTEGER".to_string(), None)
+}
+
 fn emit_program_for_select_with_inputs(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     mut plan: SelectPlan,
-    materialized_build_inputs: HashMap<usize, CursorID>,
+    materialized_build_inputs: HashMap<usize, MaterializedBuildInput>,
 ) -> Result<()> {
     let mut t_ctx = TranslateCtx::new(
         program,
@@ -310,16 +373,29 @@ fn emit_program_for_select_with_inputs(
     Ok(())
 }
 
-// Hash joins build a hash table by scanning the build-side table. When the build side
-// depends on prior join constraints (or has self-filters), we materialize the matching
-// build rowids up front so the hash build only sees filtered rows.
+#[derive(Debug, Clone)]
+/// Captures the parameters needed to materialize one hash-build input.
+struct MaterializationSpec {
+    build_table_idx: usize,
+    probe_table_idx: usize,
+    mode: MaterializedBuildInputMode,
+    prefix_tables: Vec<usize>,
+    key_exprs: Vec<Expr>,
+    payload_columns: Vec<MaterializedColumnRef>,
+}
+
+/// Build materialized hash-build inputs for hash joins that depend on prior joins.
+///
+/// This precomputes filtered build rows into ephemeral tables so hash joins
+/// can safely respect earlier join constraints. When probe->build chaining is
+/// required, we store join keys and payload columns to avoid `SeekRowid`.
 fn emit_materialized_build_inputs(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     plan: &mut SelectPlan,
-) -> Result<HashMap<usize, CursorID>> {
-    let mut build_inputs: HashMap<usize, CursorID> = HashMap::new();
-    let mut build_tables: Vec<usize> = Vec::new();
+) -> Result<HashMap<usize, MaterializedBuildInput>> {
+    let mut build_inputs: HashMap<usize, MaterializedBuildInput> = HashMap::new();
+    let mut materializations: Vec<MaterializationSpec> = Vec::new();
     let mut hash_tables_to_keep_open: HashSet<usize> = HashSet::new();
     let mut seen_hash_build_tables: HashSet<usize> = HashSet::new();
 
@@ -339,16 +415,62 @@ fn emit_materialized_build_inputs(
     for member in plan.join_order.iter() {
         let table = &plan.table_references.joined_tables()[member.original_idx];
         if let Operation::HashJoin(hash_join_op) = &table.op {
-            if hash_join_op.materialize_build_input
-                && seen_build_tables.insert(hash_join_op.build_table_idx)
+            if !hash_join_op.materialize_build_input
+                || !seen_build_tables.insert(hash_join_op.build_table_idx)
             {
-                build_tables.push(hash_join_op.build_table_idx);
+                continue;
+            }
+
+            let probe_table_idx = hash_join_op.probe_table_idx;
+            let probe_pos = plan
+                .join_order
+                .iter()
+                .position(|member| member.original_idx == probe_table_idx)
+                .unwrap_or(plan.join_order.len());
+            let build_table_was_prior_probe = plan.join_order[..probe_pos].iter().any(|member| {
+                let table_ref = &plan.table_references.joined_tables()[member.original_idx];
+                matches!(
+                    table_ref.op,
+                    Operation::HashJoin(ref hj) if hj.probe_table_idx == hash_join_op.build_table_idx
+                )
+            });
+
+            if build_table_was_prior_probe {
+                let (_, included_tables) =
+                    materialization_prefix(plan, hash_join_op.build_table_idx, probe_table_idx)?;
+                let payload_columns = collect_materialized_payload_columns(plan, &included_tables)?;
+                let key_exprs: Vec<Expr> = hash_join_op
+                    .join_keys
+                    .iter()
+                    .map(|key| key.get_build_expr(&plan.where_clause).clone())
+                    .collect();
+                let mode = MaterializedBuildInputMode::KeyPayload {
+                    num_keys: key_exprs.len(),
+                    payload_columns: payload_columns.clone(),
+                };
+                materializations.push(MaterializationSpec {
+                    build_table_idx: hash_join_op.build_table_idx,
+                    probe_table_idx,
+                    mode,
+                    prefix_tables: included_tables,
+                    key_exprs,
+                    payload_columns,
+                });
+            } else {
+                materializations.push(MaterializationSpec {
+                    build_table_idx: hash_join_op.build_table_idx,
+                    probe_table_idx,
+                    mode: MaterializedBuildInputMode::RowidOnly,
+                    prefix_tables: Vec::new(),
+                    key_exprs: Vec::new(),
+                    payload_columns: Vec::new(),
+                });
             }
         }
     }
 
-    for build_table_idx in build_tables {
-        let build_table = &plan.table_references.joined_tables()[build_table_idx];
+    for spec in materializations.iter() {
+        let build_table = &plan.table_references.joined_tables()[spec.build_table_idx];
         let build_table_name = if build_table.table.get_name() == build_table.identifier {
             build_table.identifier.clone()
         } else {
@@ -359,13 +481,20 @@ fn emit_materialized_build_inputs(
             )
         };
         let internal_id = program.table_reference_counter.next();
+        let columns = match &spec.mode {
+            MaterializedBuildInputMode::RowidOnly => vec![build_rowid_column()],
+            MaterializedBuildInputMode::KeyPayload {
+                num_keys,
+                payload_columns,
+            } => build_materialized_input_columns(*num_keys, payload_columns),
+        };
         let ephemeral_table = Arc::new(BTreeTable {
             root_page: 0,
             name: format!("hash_build_input_{internal_id}"),
             has_rowid: true,
             has_autoincrement: false,
             primary_key_columns: vec![],
-            columns: vec![ROWID_COLUMN],
+            columns,
             is_strict: false,
             unique_sets: vec![],
             foreign_keys: vec![],
@@ -373,8 +502,17 @@ fn emit_materialized_build_inputs(
         let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(ephemeral_table.clone()));
         // Build a plan that emits only rowids for the build table using the join prefix
         // that makes the hash join legal (including any earlier hash joins).
-        let materialize_plan =
-            build_materialized_build_input_plan(plan, build_table_idx, cursor_id, ephemeral_table)?;
+        let materialize_plan = build_materialized_build_input_plan(
+            plan,
+            spec.build_table_idx,
+            spec.probe_table_idx,
+            cursor_id,
+            ephemeral_table,
+            &spec.mode,
+            &spec.key_exprs,
+            &spec.payload_columns,
+            &build_inputs,
+        )?;
 
         // Make the materialization plan show up as a subtree in EXPLAIN QUERY PLAN output.
         emit_explain!(
@@ -398,39 +536,122 @@ fn emit_materialized_build_inputs(
         program.decr_nesting();
         program.pop_current_parent_explain();
 
-        build_inputs.insert(build_table_idx, cursor_id);
+        build_inputs.insert(
+            spec.build_table_idx,
+            MaterializedBuildInput {
+                cursor_id,
+                mode: spec.mode.clone(),
+                prefix_tables: spec.prefix_tables.clone(),
+            },
+        );
     }
+
+    prune_join_order_for_materialized_inputs(plan, &build_inputs)?;
+
+    debug_assert!(
+        {
+            let join_order_tables: HashSet<_> = plan
+                .join_order
+                .iter()
+                .map(|member| member.original_idx)
+                .collect();
+            let build_tables_in_plan: HashSet<_> = plan
+                .join_order
+                .iter()
+                .filter_map(|member| {
+                    let table = &plan.table_references.joined_tables()[member.original_idx];
+                    if let Operation::HashJoin(hash_join_op) = &table.op {
+                        Some(hash_join_op.build_table_idx)
+                    } else {
+                        None
+                    }
+                })
+                .collect();
+            build_inputs.iter().all(|(build_table_idx, input)| {
+                if !build_tables_in_plan.contains(build_table_idx) {
+                    return true;
+                }
+                if !matches!(input.mode, MaterializedBuildInputMode::KeyPayload { .. }) {
+                    return true;
+                }
+                input
+                    .prefix_tables
+                    .iter()
+                    .all(|table_idx| !join_order_tables.contains(table_idx))
+            })
+        },
+        "materialized build input prefix table still present in join order"
+    );
 
     Ok(build_inputs)
 }
 
-// Construct a SELECT plan that materializes build-side rowids into an ephemeral table.
-// The join order is the original prefix up to (but excluding) the probe table, plus
-// the build table itself. This filters build rows using only prior join constraints.
-fn build_materialized_build_input_plan(
+/// Remove join-order entries already satisfied by key+payload materializations.
+///
+/// This prevents redundant scans (and cross products) when a hash-build input
+/// already captures a join prefix. It also marks fully covered WHERE terms as
+/// consumed so they are not re-applied later in the main plan.
+fn prune_join_order_for_materialized_inputs(
+    plan: &mut SelectPlan,
+    build_inputs: &HashMap<usize, MaterializedBuildInput>,
+) -> Result<()> {
+    if build_inputs.is_empty() {
+        return Ok(());
+    }
+
+    let mut build_tables_in_plan = HashSet::new();
+    for member in plan.join_order.iter() {
+        let table = &plan.table_references.joined_tables()[member.original_idx];
+        if let Operation::HashJoin(hash_join_op) = &table.op {
+            build_tables_in_plan.insert(hash_join_op.build_table_idx);
+        }
+    }
+
+    let mut tables_to_remove: HashSet<usize> = HashSet::new();
+    for (build_table_idx, input) in build_inputs.iter() {
+        if !build_tables_in_plan.contains(build_table_idx) {
+            continue;
+        }
+        if matches!(input.mode, MaterializedBuildInputMode::KeyPayload { .. }) {
+            tables_to_remove.extend(input.prefix_tables.iter().copied());
+        }
+    }
+
+    if tables_to_remove.is_empty() {
+        return Ok(());
+    }
+
+    let prefix_mask = TableMask::from_table_number_iter(tables_to_remove.iter().copied());
+    for term in plan.where_clause.iter_mut() {
+        if term.consumed {
+            continue;
+        }
+        let mask = table_mask_from_expr(
+            &term.expr,
+            &plan.table_references,
+            &plan.non_from_clause_subqueries,
+        )?;
+        if prefix_mask.contains_all(&mask) {
+            term.consumed = true;
+        }
+    }
+    plan.join_order
+        .retain(|member| !tables_to_remove.contains(&member.original_idx));
+
+    Ok(())
+}
+
+/// Compute the join-prefix used to materialize a hash-build input.
+///
+/// The prefix consists of all tables before the probe table plus the build
+/// table itself (if not already present). The returned `included_tables`
+/// list also includes build tables of earlier hash joins so payload collection
+/// can capture all referenced columns.
+fn materialization_prefix(
     plan: &SelectPlan,
     build_table_idx: usize,
-    cursor_id: CursorID,
-    table: Arc<BTreeTable>,
-) -> Result<SelectPlan> {
-    let probe_table_idx = plan
-        .table_references
-        .joined_tables()
-        .iter()
-        .find_map(|table_ref| {
-            if let Operation::HashJoin(hash_join_op) = &table_ref.op {
-                if hash_join_op.build_table_idx == build_table_idx {
-                    return Some(hash_join_op.probe_table_idx);
-                }
-            }
-            None
-        })
-        .ok_or_else(|| {
-            crate::LimboError::PlanningError(
-                "materialized hash build input: missing probe table".to_string(),
-            )
-        })?;
-
+    probe_table_idx: usize,
+) -> Result<(Vec<JoinOrderMember>, Vec<usize>)> {
     let mut join_order = plan.join_order.clone();
     if join_order
         .iter()
@@ -446,21 +667,20 @@ fn build_materialized_build_input_plan(
                 .is_some_and(|join_info| join_info.outer),
         });
     }
-    let build_pos = join_order
+    let probe_pos = join_order
         .iter()
         .position(|m| m.original_idx == probe_table_idx)
         .expect("probe table just ensured in join order");
 
     // Only include tables prior to the probe table. The materialization subplan
     // should filter the build table using prior join constraints, not scan the probe.
-    let join_order = join_order[..build_pos].to_vec();
-    let mut join_order = join_order;
-    if join_order
+    let mut prefix_join_order = join_order[..probe_pos].to_vec();
+    if prefix_join_order
         .iter()
         .all(|member| member.original_idx != build_table_idx)
     {
         let build_table = &plan.table_references.joined_tables()[build_table_idx];
-        join_order.push(JoinOrderMember {
+        prefix_join_order.push(JoinOrderMember {
             table_id: build_table.internal_id,
             original_idx: build_table_idx,
             is_outer: build_table
@@ -469,8 +689,10 @@ fn build_materialized_build_input_plan(
                 .is_some_and(|join_info| join_info.outer),
         });
     }
-    let mut included_tables: Vec<usize> = join_order.iter().map(|m| m.original_idx).collect();
-    for member in join_order.iter() {
+
+    let mut included_tables: Vec<usize> =
+        prefix_join_order.iter().map(|m| m.original_idx).collect();
+    for member in prefix_join_order.iter() {
         let table_ref = &plan.table_references.joined_tables()[member.original_idx];
         if let Operation::HashJoin(hash_join_op) = &table_ref.op {
             included_tables.push(hash_join_op.build_table_idx);
@@ -478,6 +700,188 @@ fn build_materialized_build_input_plan(
     }
     included_tables.sort_unstable();
     included_tables.dedup();
+
+    Ok((prefix_join_order, included_tables))
+}
+
+/// Collect the payload columns needed for a materialized build input.
+///
+/// This gathers referenced columns (and rowids when required) from the
+/// included tables so probe-side expression evaluation can be satisfied
+/// from payload registers without seeking into base tables.
+fn collect_materialized_payload_columns(
+    plan: &SelectPlan,
+    included_tables: &[usize],
+) -> Result<Vec<MaterializedColumnRef>> {
+    let mut payload_columns: Vec<MaterializedColumnRef> = Vec::new();
+    let mut seen: HashSet<MaterializedColumnRef> = HashSet::new();
+    for table_idx in included_tables.iter().copied() {
+        let table = &plan.table_references.joined_tables()[table_idx];
+        for col_idx in table.col_used_mask.iter() {
+            let is_rowid_alias = table
+                .columns()
+                .get(col_idx)
+                .is_some_and(|col| col.is_rowid_alias());
+            let col_ref = MaterializedColumnRef::Column {
+                table_id: table.internal_id,
+                column_idx: col_idx,
+                is_rowid_alias,
+            };
+            if seen.insert(col_ref.clone()) {
+                payload_columns.push(col_ref);
+            }
+        }
+        if table_rowid_used(plan, table.internal_id)? {
+            let rowid_ref = MaterializedColumnRef::RowId {
+                table_id: table.internal_id,
+            };
+            if seen.insert(rowid_ref.clone()) {
+                payload_columns.push(rowid_ref);
+            }
+        }
+    }
+    Ok(payload_columns)
+}
+
+/// Returns true if `expr` references the rowid of `table_id`.
+fn expr_uses_rowid(expr: &Expr, table_id: TableInternalId) -> Result<bool> {
+    let mut used = false;
+    let mut check_expr = |expr: &Expr| -> Result<WalkControl> {
+        if used {
+            return Ok(WalkControl::SkipChildren);
+        }
+        if let Expr::RowId { table, .. } = expr {
+            if *table == table_id {
+                used = true;
+                return Ok(WalkControl::SkipChildren);
+            }
+        }
+        Ok(WalkControl::Continue)
+    };
+    walk_expr(expr, &mut check_expr)?;
+    Ok(used)
+}
+
+/// Returns true if any part of the plan references the rowid of `table_id`.
+///
+/// This scans result columns, predicates, ordering, grouping, aggregates,
+/// window clauses, and limit/offset expressions.
+fn table_rowid_used(plan: &SelectPlan, table_id: TableInternalId) -> Result<bool> {
+    for rc in plan.result_columns.iter() {
+        if expr_uses_rowid(&rc.expr, table_id)? {
+            return Ok(true);
+        }
+    }
+    for term in plan.where_clause.iter() {
+        if expr_uses_rowid(&term.expr, table_id)? {
+            return Ok(true);
+        }
+    }
+    for (expr, _) in plan.order_by.iter() {
+        if expr_uses_rowid(expr, table_id)? {
+            return Ok(true);
+        }
+    }
+    if let Some(group_by) = &plan.group_by {
+        for expr in group_by.exprs.iter() {
+            if expr_uses_rowid(expr, table_id)? {
+                return Ok(true);
+            }
+        }
+        if let Some(having) = group_by.having.as_ref() {
+            for expr in having.iter() {
+                if expr_uses_rowid(expr, table_id)? {
+                    return Ok(true);
+                }
+            }
+        }
+    }
+    for agg in plan.aggregates.iter() {
+        if expr_uses_rowid(&agg.original_expr, table_id)? {
+            return Ok(true);
+        }
+    }
+    if let Some(window) = &plan.window {
+        for expr in window.partition_by.iter() {
+            if expr_uses_rowid(expr, table_id)? {
+                return Ok(true);
+            }
+        }
+        for (expr, _) in window.order_by.iter() {
+            if expr_uses_rowid(expr, table_id)? {
+                return Ok(true);
+            }
+        }
+        for func in window.functions.iter() {
+            if expr_uses_rowid(&func.original_expr, table_id)? {
+                return Ok(true);
+            }
+        }
+    }
+    if let Some(limit) = plan.limit.as_ref() {
+        if expr_uses_rowid(limit, table_id)? {
+            return Ok(true);
+        }
+    }
+    if let Some(offset) = plan.offset.as_ref() {
+        if expr_uses_rowid(offset, table_id)? {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
+}
+
+/// Build the ephemeral-table schema for key+payload materializations.
+///
+/// Keys are stored first (typed as BLOB for join-key affinity handling),
+/// followed by payload columns with integer or blob affinity.
+fn build_materialized_input_columns(
+    num_keys: usize,
+    payload_columns: &[MaterializedColumnRef],
+) -> Vec<Column> {
+    let mut columns = Vec::with_capacity(num_keys + payload_columns.len());
+    for i in 0..num_keys {
+        columns.push(Column::new_default_text(
+            Some(format!("key_{i}")),
+            "BLOB".to_string(),
+            None,
+        ));
+    }
+    for (i, payload) in payload_columns.iter().enumerate() {
+        let name = Some(format!("payload_{i}"));
+        let column = match payload {
+            MaterializedColumnRef::RowId { .. } => {
+                Column::new_default_integer(name, "INTEGER".to_string(), None)
+            }
+            MaterializedColumnRef::Column { .. } => {
+                Column::new_default_text(name, "BLOB".to_string(), None)
+            }
+        };
+        columns.push(column);
+    }
+    columns
+}
+
+/// Construct a SELECT plan that materializes build-side inputs into an ephemeral table.
+///
+/// The join order is the original prefix up to (but excluding) the probe table, plus
+/// the build table itself. This filters build rows using only prior join constraints
+/// and then prunes any tables already captured by earlier key+payload materializations.
+#[allow(clippy::too_many_arguments)]
+fn build_materialized_build_input_plan(
+    plan: &SelectPlan,
+    build_table_idx: usize,
+    probe_table_idx: usize,
+    cursor_id: CursorID,
+    table: Arc<BTreeTable>,
+    mode: &MaterializedBuildInputMode,
+    key_exprs: &[Expr],
+    payload_columns: &[MaterializedColumnRef],
+    materialized_build_inputs: &HashMap<usize, MaterializedBuildInput>,
+) -> Result<SelectPlan> {
+    let (join_order, included_tables) =
+        materialization_prefix(plan, build_table_idx, probe_table_idx)?;
     let included_mask = TableMask::from_table_number_iter(included_tables.into_iter());
 
     let mut where_clause = plan.where_clause.clone();
@@ -508,16 +912,56 @@ fn build_materialized_build_input_plan(
     }
 
     let build_internal_id = plan.table_references.joined_tables()[build_table_idx].internal_id;
-    let result_columns = vec![ResultSetColumn {
-        expr: Expr::RowId {
-            database: None,
-            table: build_internal_id,
-        },
-        alias: None,
-        contains_aggregates: false,
-    }];
+    let result_columns = match mode {
+        MaterializedBuildInputMode::RowidOnly => vec![ResultSetColumn {
+            expr: Expr::RowId {
+                database: None,
+                table: build_internal_id,
+            },
+            alias: None,
+            contains_aggregates: false,
+        }],
+        MaterializedBuildInputMode::KeyPayload { num_keys, .. } => {
+            turso_assert!(
+                *num_keys == key_exprs.len(),
+                "materialized hash build input key count mismatch"
+            );
+            let mut result_columns: Vec<ResultSetColumn> = Vec::new();
+            for expr in key_exprs.iter() {
+                result_columns.push(ResultSetColumn {
+                    expr: expr.clone(),
+                    alias: None,
+                    contains_aggregates: false,
+                });
+            }
+            for payload in payload_columns.iter() {
+                let expr = match payload {
+                    MaterializedColumnRef::Column {
+                        table_id,
+                        column_idx,
+                        is_rowid_alias,
+                    } => Expr::Column {
+                        database: None,
+                        table: *table_id,
+                        column: *column_idx,
+                        is_rowid_alias: *is_rowid_alias,
+                    },
+                    MaterializedColumnRef::RowId { table_id } => Expr::RowId {
+                        database: None,
+                        table: *table_id,
+                    },
+                };
+                result_columns.push(ResultSetColumn {
+                    expr,
+                    alias: None,
+                    contains_aggregates: false,
+                });
+            }
+            result_columns
+        }
+    };
 
-    Ok(SelectPlan {
+    let mut materialize_plan = SelectPlan {
         table_references,
         join_order,
         result_columns,
@@ -528,12 +972,20 @@ fn build_materialized_build_input_plan(
         limit: None,
         offset: None,
         contains_constant_false_condition: false,
-        query_destination: QueryDestination::EphemeralTable { cursor_id, table },
+        query_destination: QueryDestination::EphemeralTable {
+            cursor_id,
+            table,
+            rowid_mode: EphemeralRowidMode::Auto,
+        },
         distinctness: Distinctness::NonDistinct,
         values: vec![],
         window: None,
         non_from_clause_subqueries: plan.non_from_clause_subqueries.clone(),
-    })
+    };
+
+    prune_join_order_for_materialized_inputs(&mut materialize_plan, materialized_build_inputs)?;
+
+    Ok(materialize_plan)
 }
 
 #[instrument(skip_all, level = Level::DEBUG)]
