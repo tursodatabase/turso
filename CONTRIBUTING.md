@@ -178,6 +178,33 @@ and then run the same command in Turso's shell.
 If the bytecode is different, that's the bug -- work towards fixing code generation.
 If the bytecode is the same, but query results are different, then the bug is somewhere in the virtual machine interpreter or storage layer.
 
+### Query optimizer debugging (WHERETRACE)
+
+When debugging query optimizer issues (wrong join order, missing index usage, incorrect cost estimates), use WHERETRACE:
+
+```console
+# Build with wheretrace feature
+cargo build --features wheretrace
+
+# Run with trace enabled (all categories)
+TURSO_WHERETRACE=0xFFFF ./target/debug/tursodb database.db < query.sql
+
+# Common trace masks:
+# 0x0001 - Optimizer start/finish summary
+# 0x0002 - DP solver join order exploration  
+# 0x0004 - Cost calculations
+# 0x0010 - Index/access method selection
+# 0x0100 - Hash join decisions
+# 0x8000 - Code generation phase
+```
+
+Compare output with SQLite's WHERETRACE for the same query:
+```console
+sqlite3 -cmd ".wheretrace 0xFFFF" database.db < query.sql
+```
+
+See [docs/internals/wheretrace.md](docs/internals/wheretrace.md) for the full flag reference and how to add new traces.
+
 ### Stress testing with sanitizers
 
 If you suspect a multi-threading issue, you can run the stress test with ThreadSanitizer enabled as follows:
