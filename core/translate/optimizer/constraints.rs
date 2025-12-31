@@ -581,38 +581,51 @@ pub fn constraints_from_where_clause(
     #[cfg(feature = "wheretrace")]
     {
         use crate::translate::optimizer::{pretty, trace::flags};
-        
+
         // Trace the query structure (FROM/WHERE trees) with function name
         if !where_clause.is_empty() {
-            crate::wheretrace_fn!("constraints_from_where_clause", flags::QUERY_STRUCTURE, 
-                "{}", pretty::tree("|-- FROM"));
+            crate::wheretrace_fn!(
+                "constraints_from_where_clause",
+                flags::QUERY_STRUCTURE,
+                "{}",
+                pretty::tree("|-- FROM")
+            );
             // Trace FROM clause tables
             for (i, table_ref) in table_references.joined_tables().iter().enumerate() {
-                crate::wheretrace!(flags::QUERY_STRUCTURE, "{}",
+                crate::wheretrace!(
+                    flags::QUERY_STRUCTURE,
+                    "{}",
                     pretty::format_from_table(
-                        i, 
-                        &table_ref.identifier, 
+                        i,
+                        &table_ref.identifier,
                         table_ref.columns().len(),
                         i == table_references.joined_tables().len() - 1
-                    ));
+                    )
+                );
             }
             // Trace WHERE clause expression trees
             crate::wheretrace!(flags::QUERY_STRUCTURE, "{}", pretty::format_where_section());
             for (i, term) in where_clause.iter().enumerate() {
-                crate::wheretrace!(flags::QUERY_STRUCTURE, "{}",
-                    pretty::format_expr_tree(&term.expr, "    ", i == where_clause.len() - 1));
+                crate::wheretrace!(
+                    flags::QUERY_STRUCTURE,
+                    "{}",
+                    pretty::format_expr_tree(&term.expr, "    ", i == where_clause.len() - 1)
+                );
             }
         }
-        
+
         // Now trace the extracted constraints (SQLite-compatible format)
-        crate::wheretrace!(flags::CONSTRAINT, 
+        crate::wheretrace!(
+            flags::CONSTRAINT,
             "{}",
-            pretty::header("---- WHERE clause at start of analysis:"));
+            pretty::header("---- WHERE clause at start of analysis:")
+        );
         for tc in constraints.iter() {
             let table_idx: usize = tc.table_id.into();
             for (i, c) in tc.constraints.iter().enumerate() {
                 let where_term = &where_clause[c.where_clause_pos.0];
-                crate::wheretrace!(flags::CONSTRAINT,
+                crate::wheretrace!(
+                    flags::CONSTRAINT,
                     "{}",
                     pretty::format_constraint_sqlite(
                         i,
@@ -625,10 +638,14 @@ pub fn constraints_from_where_clause(
                         c.lhs_mask.0,
                         false, // is_virtual
                         false, // is_equiv
-                    ));
+                    )
+                );
                 // Print expression tree after TERM line (like SQLite)
-                crate::wheretrace!(flags::CONSTRAINT, "{}",
-                    pretty::format_expr_tree(&where_term.expr, "", true));
+                crate::wheretrace!(
+                    flags::CONSTRAINT,
+                    "{}",
+                    pretty::format_expr_tree(&where_term.expr, "", true)
+                );
             }
         }
     }

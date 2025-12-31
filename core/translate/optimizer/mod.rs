@@ -729,14 +729,17 @@ fn optimize_table_access(
     #[cfg(feature = "wheretrace")]
     {
         use crate::translate::optimizer::{pretty, trace::flags};
-        crate::wheretrace!(flags::CONSTRAINT,
+        crate::wheretrace!(
+            flags::CONSTRAINT,
             "{}",
-            pretty::format_where_clause_end_of_analysis());
+            pretty::format_where_clause_end_of_analysis()
+        );
         for tc in constraints_per_table.iter() {
             let table_idx: usize = tc.table_id.into();
             for (i, c) in tc.constraints.iter().enumerate() {
                 let term = &where_clause[c.where_clause_pos.0];
-                crate::wheretrace!(flags::CONSTRAINT,
+                crate::wheretrace!(
+                    flags::CONSTRAINT,
                     "{}",
                     pretty::format_constraint_sqlite(
                         i,
@@ -749,9 +752,13 @@ fn optimize_table_access(
                         c.lhs_mask.0,
                         false, // is_virtual
                         false, // is_equiv
-                    ));
-                crate::wheretrace!(flags::CONSTRAINT, "{}",
-                    pretty::format_expr_tree(&term.expr, "", true));
+                    )
+                );
+                crate::wheretrace!(
+                    flags::CONSTRAINT,
+                    "{}",
+                    pretty::format_expr_tree(&term.expr, "", true)
+                );
             }
         }
     }
@@ -998,9 +1005,11 @@ fn optimize_table_access(
                                 continue;
                             }
                             #[cfg(feature = "wheretrace")]
-                            crate::wheretrace!(crate::translate::optimizer::trace::flags::CODE_GEN,
+                            crate::wheretrace!(
+                                crate::translate::optimizer::trace::flags::CODE_GEN,
                                 "DISABLE-TERM-{}: consumed by index seek",
-                                constraint.where_clause_pos.0);
+                                constraint.where_clause_pos.0
+                            );
                             where_term.consumed = true;
                         }
                     }
@@ -1132,9 +1141,11 @@ fn build_vtab_scan_op(
         let constraint = &table_constraints.constraints[vtab_constraint.index];
         if usage.omit {
             #[cfg(feature = "wheretrace")]
-            crate::wheretrace!(crate::translate::optimizer::trace::flags::CODE_GEN,
+            crate::wheretrace!(
+                crate::translate::optimizer::trace::flags::CODE_GEN,
                 "DISABLE-TERM-{}: virtual table omits constraint",
-                constraint.where_clause_pos.0);
+                constraint.where_clause_pos.0
+            );
             where_clause[constraint.where_clause_pos.0].consumed = true;
         }
         let (_, expr, _) = constraint.get_constraining_expr(where_clause, referenced_tables);

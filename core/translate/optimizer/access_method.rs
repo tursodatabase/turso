@@ -116,17 +116,23 @@ fn find_best_access_method_for_btree(
     base_row_count: RowCountEstimate,
 ) -> Result<Option<AccessMethod>> {
     let table_no = join_order.last().unwrap().table_id;
-    
+
     // Trace BEGIN of index evaluation (badge-style)
     #[cfg(feature = "wheretrace")]
     {
         use crate::translate::optimizer::pretty;
         let constraint_count = rhs_constraints.constraints.len();
-        crate::wheretrace!(crate::translate::optimizer::trace::flags::ACCESS_METHOD,
+        crate::wheretrace!(
+            crate::translate::optimizer::trace::flags::ACCESS_METHOD,
             "{}",
-            pretty::format_btree_idx_begin(&rhs_table.identifier, constraint_count, rhs_constraints.candidates.len()));
+            pretty::format_btree_idx_begin(
+                &rhs_table.identifier,
+                constraint_count,
+                rhs_constraints.candidates.len()
+            )
+        );
     }
-    
+
     let mut best_cost =
         estimate_cost_for_scan_or_seek(None, &[], &[], input_cardinality, base_row_count);
     let mut best_params = AccessMethodParams::BTreeTable {
@@ -168,10 +174,17 @@ fn find_best_access_method_for_btree(
         #[cfg(feature = "wheretrace")]
         {
             use crate::translate::optimizer::pretty;
-            let flags = if candidate.index.is_some() { 0x800201 } else { 0x800100 };
+            let flags = if candidate.index.is_some() {
+                0x800201
+            } else {
+                0x800100
+            };
             let table_no_trace = join_order.len() - 1;
-            let usable_constraints = usable_constraint_refs.iter().take_while(|r| r.eq.is_some()).count();
-            
+            let usable_constraints = usable_constraint_refs
+                .iter()
+                .take_while(|r| r.eq.is_some())
+                .count();
+
             // Replicate cardinality estimation for trace
             let selectivity_multiplier: f64 = usable_constraint_refs
                 .iter()
@@ -195,21 +208,34 @@ fn find_best_access_method_for_btree(
             for cref in &usable_constraint_refs {
                 if let Some(eq) = cref.eq {
                     let constraint = &rhs_constraints.constraints[eq];
-                    crate::wheretrace!(crate::translate::optimizer::trace::flags::ACCESS_METHOD,
+                    crate::wheretrace!(
+                        crate::translate::optimizer::trace::flags::ACCESS_METHOD,
                         "{}",
                         pretty::format_scan_term(
                             "0x0", // dummy address
                             false,
                             table_no.into(),
                             constraint.table_col_pos.map(|c| c as i32).unwrap_or(-1)
-                        ));
+                        )
+                    );
                 }
             }
 
-            crate::wheretrace!(crate::translate::optimizer::trace::flags::ACCESS_METHOD,
+            crate::wheretrace!(
+                crate::translate::optimizer::trace::flags::ACCESS_METHOD,
                 "{}",
-                pretty::format_add_candidate(table_no_trace, rhs_table.internal_id.into(), cand_idx, 
-                    &rhs_table.identifier, flags, usable_constraints, 0.0, *cost, n_out));
+                pretty::format_add_candidate(
+                    table_no_trace,
+                    rhs_table.internal_id.into(),
+                    cand_idx,
+                    &rhs_table.identifier,
+                    flags,
+                    usable_constraints,
+                    0.0,
+                    *cost,
+                    n_out
+                )
+            );
         }
 
         // All other things being equal, prefer an access method that satisfies the order target.
@@ -285,12 +311,16 @@ fn find_best_access_method_for_btree(
     {
         use crate::translate::optimizer::pretty;
         let usable_constraints = match &best_params {
-            AccessMethodParams::BTreeTable { constraint_refs, .. } => constraint_refs.len(),
+            AccessMethodParams::BTreeTable {
+                constraint_refs, ..
+            } => constraint_refs.len(),
             _ => 0,
         };
-        crate::wheretrace!(crate::translate::optimizer::trace::flags::ACCESS_METHOD,
+        crate::wheretrace!(
+            crate::translate::optimizer::trace::flags::ACCESS_METHOD,
             "{}",
-            pretty::format_btree_idx_end(&rhs_table.identifier, usable_constraints, *best_cost));
+            pretty::format_btree_idx_end(&rhs_table.identifier, usable_constraints, *best_cost)
+        );
     }
 
     Ok(Some(AccessMethod {
@@ -503,20 +533,32 @@ pub fn try_hash_join_access_method(
     let build_root_page = build_table.table.btree().expect("table is BTree").root_page;
     if build_root_page == probe_root_page {
         #[cfg(feature = "wheretrace")]
-        crate::wheretrace!(crate::translate::optimizer::trace::flags::REJECTED, "{}",
+        crate::wheretrace!(
+            crate::translate::optimizer::trace::flags::REJECTED,
+            "{}",
             crate::translate::optimizer::pretty::format_rejected_hash_join(
-                &build_table.identifier, &probe_table.identifier,
-                crate::translate::optimizer::pretty::RejectionReason::HashJoinSelfJoin, None));
+                &build_table.identifier,
+                &probe_table.identifier,
+                crate::translate::optimizer::pretty::RejectionReason::HashJoinSelfJoin,
+                None
+            )
+        );
         return None;
     }
     if build_table.join_info.as_ref().is_some_and(|ji| ji.outer)
         || probe_table.join_info.as_ref().is_some_and(|ji| ji.outer)
     {
         #[cfg(feature = "wheretrace")]
-        crate::wheretrace!(crate::translate::optimizer::trace::flags::REJECTED, "{}",
+        crate::wheretrace!(
+            crate::translate::optimizer::trace::flags::REJECTED,
+            "{}",
             crate::translate::optimizer::pretty::format_rejected_hash_join(
-                &build_table.identifier, &probe_table.identifier,
-                crate::translate::optimizer::pretty::RejectionReason::HashJoinOuterJoin, None));
+                &build_table.identifier,
+                &probe_table.identifier,
+                crate::translate::optimizer::pretty::RejectionReason::HashJoinOuterJoin,
+                None
+            )
+        );
         return None;
     }
 

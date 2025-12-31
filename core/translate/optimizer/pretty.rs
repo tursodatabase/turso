@@ -219,8 +219,7 @@ pub fn format_constraint_sqlite(
     };
 
     // wtFlags bitmap (consumed = 0x0004)
-    let wt_flags = if consumed { 0x0004 } else { 0x0000 }
-                 | if !usable { 0x0002 } else { 0 };
+    let wt_flags = if consumed { 0x0004 } else { 0x0000 } | if !usable { 0x0002 } else { 0 };
 
     // SQLite uses "1" for prob=1.0, otherwise .2float
     let prob_str = if selectivity >= 0.9999 {
@@ -236,11 +235,21 @@ pub fn format_constraint_sqlite(
             prereqs.push(i.to_string());
         }
     }
-    let prereq_str = if prereqs.is_empty() { "0".to_string() } else { prereqs.join(",") };
+    let prereq_str = if prereqs.is_empty() {
+        "0".to_string()
+    } else {
+        prereqs.join(",")
+    };
 
     format!(
         "TERM-{}   {} {}  op={} wtFlags={:04x} prob={} prereq={}",
-        idx, flags, column(&left_str), op_code, wt_flags, prob_str, prereq_str
+        idx,
+        flags,
+        column(&left_str),
+        op_code,
+        wt_flags,
+        prob_str,
+        prereq_str
     )
 }
 
@@ -345,7 +354,11 @@ pub fn format_solver_solution(total_cost: f64, total_rows: usize, order_satisfie
 }
 
 /// Format optimizer start message.
-pub fn format_optimizer_start(num_tables: usize, wctrl_flags: u32, has_order_target: bool) -> String {
+pub fn format_optimizer_start(
+    num_tables: usize,
+    wctrl_flags: u32,
+    has_order_target: bool,
+) -> String {
     format!(
         "{} tables={} wctrlFlags=0x{:x} order_target={}",
         header("*** Optimizer Start ***"),
@@ -356,7 +369,11 @@ pub fn format_optimizer_start(num_tables: usize, wctrl_flags: u32, has_order_tar
 }
 
 /// Format optimizer finish message.
-pub fn format_optimizer_finish(total_cost: f64, total_rows: usize, table_order: &[usize]) -> String {
+pub fn format_optimizer_finish(
+    total_cost: f64,
+    total_rows: usize,
+    table_order: &[usize],
+) -> String {
     format!(
         "{} cost={} rows={} tables={:?}",
         header("*** Optimizer Finished ***"),
@@ -368,7 +385,13 @@ pub fn format_optimizer_finish(total_cost: f64, total_rows: usize, table_order: 
 
 /// Format a new best plan discovered during DP solver.
 /// Output: `New    {mask} cost={cost},{rows},{total} order={order}`
-pub fn format_solver_new(mask_bits: u128, run_cost: f64, row_count: usize, total_cost: f64, order_flag: bool) -> String {
+pub fn format_solver_new(
+    mask_bits: u128,
+    run_cost: f64,
+    row_count: usize,
+    total_cost: f64,
+    order_flag: bool,
+) -> String {
     format!(
         "{}    {:0b} cost={},{},{} order={}",
         good("New"),
@@ -382,7 +405,12 @@ pub fn format_solver_new(mask_bits: u128, run_cost: f64, row_count: usize, total
 
 /// Format a memo entry in the DP solver state.
 /// Output: ` {mask} cost={cost} nrow={rows} order={order}`
-pub fn format_solver_memo_entry(mask_bits: u128, plan_cost: f64, row_count: usize, order_flag: bool) -> String {
+pub fn format_solver_memo_entry(
+    mask_bits: u128,
+    plan_cost: f64,
+    row_count: usize,
+    order_flag: bool,
+) -> String {
     format!(
         " {:0b} cost={} nrow={} order={}",
         mask_bits,
@@ -394,7 +422,8 @@ pub fn format_solver_memo_entry(mask_bits: u128, plan_cost: f64, row_count: usiz
 
 /// Format query structure begin message (shows the Turso function responsible).
 pub fn format_where_begin() -> String {
-    format!("{}\n{}",
+    format!(
+        "{}\n{}",
         header("'-- compute_best_join_order()"),
         tree("    |-- FROM")
     )
@@ -441,17 +470,23 @@ pub fn format_expr_tree(expr: &turso_parser::ast::Expr, prefix: &str, is_last: b
             result.push_str(&format_expr_tree(rhs, &child_prefix, true));
             result
         }
-        Expr::Column { table, column: col, .. } => {
-            format!("{}{}{}\n",
+        Expr::Column {
+            table, column: col, ..
+        } => {
+            format!(
+                "{}{}{}\n",
                 tree(prefix),
                 tree(connector),
-                column(&format!("{{{}:{}}}", table, col)))
+                column(&format!("{{{}:{}}}", table, col))
+            )
         }
         Expr::RowId { table, .. } => {
-            format!("{}{}{}\n",
+            format!(
+                "{}{}{}\n",
                 tree(prefix),
                 tree(connector),
-                column(&format!("{{{}:-1}}", table)))
+                column(&format!("{{{}:-1}}", table))
+            )
         }
         Expr::Literal(lit) => {
             let lit_str = match lit {
@@ -478,16 +513,31 @@ pub fn format_expr_tree(expr: &turso_parser::ast::Expr, prefix: &str, is_last: b
             result
         }
         Expr::IsNull(inner) => {
-            let mut result = format!("{}{}{}\n", tree(prefix), tree(connector), operator("ISNULL"));
+            let mut result = format!(
+                "{}{}{}\n",
+                tree(prefix),
+                tree(connector),
+                operator("ISNULL")
+            );
             result.push_str(&format_expr_tree(inner, &child_prefix, true));
             result
         }
         Expr::NotNull(inner) => {
-            let mut result = format!("{}{}{}\n", tree(prefix), tree(connector), operator("NOTNULL"));
+            let mut result = format!(
+                "{}{}{}\n",
+                tree(prefix),
+                tree(connector),
+                operator("NOTNULL")
+            );
             result.push_str(&format_expr_tree(inner, &child_prefix, true));
             result
         }
-        Expr::Between { lhs, not, start, end } => {
+        Expr::Between {
+            lhs,
+            not,
+            start,
+            end,
+        } => {
             let op_str = if *not { "NOT BETWEEN" } else { "BETWEEN" };
             let mut result = format!("{}{}{}\n", tree(prefix), tree(connector), operator(op_str));
             result.push_str(&format_expr_tree(lhs, &child_prefix, false));
@@ -497,7 +547,12 @@ pub fn format_expr_tree(expr: &turso_parser::ast::Expr, prefix: &str, is_last: b
         }
         Expr::InList { lhs, not, rhs } => {
             let op_str = if *not { "NOT IN" } else { "IN" };
-            let mut result = format!("{}{}{} (LIST)\n", tree(prefix), tree(connector), operator(op_str));
+            let mut result = format!(
+                "{}{}{} (LIST)\n",
+                tree(prefix),
+                tree(connector),
+                operator(op_str)
+            );
             result.push_str(&format_expr_tree(lhs, &child_prefix, rhs.is_empty()));
             for (i, item) in rhs.iter().enumerate() {
                 result.push_str(&format_expr_tree(item, &child_prefix, i == rhs.len() - 1));
@@ -506,42 +561,97 @@ pub fn format_expr_tree(expr: &turso_parser::ast::Expr, prefix: &str, is_last: b
         }
         Expr::InSelect { lhs, not, .. } => {
             let op_str = if *not { "NOT IN" } else { "IN" };
-            let mut result = format!("{}{}{} (SELECT)\n", tree(prefix), tree(connector), operator(op_str));
+            let mut result = format!(
+                "{}{}{} (SELECT)\n",
+                tree(prefix),
+                tree(connector),
+                operator(op_str)
+            );
             result.push_str(&format_expr_tree(lhs, &child_prefix, true));
             result
         }
-        Expr::Like { lhs, not, op, rhs, .. } => {
+        Expr::Like {
+            lhs, not, op, rhs, ..
+        } => {
             let op_str = match op {
-                turso_parser::ast::LikeOperator::Like => if *not { "NOT LIKE" } else { "LIKE" },
-                turso_parser::ast::LikeOperator::Glob => if *not { "NOT GLOB" } else { "GLOB" },
-                turso_parser::ast::LikeOperator::Match => if *not { "NOT MATCH" } else { "MATCH" },
-                turso_parser::ast::LikeOperator::Regexp => if *not { "NOT REGEXP" } else { "REGEXP" },
+                turso_parser::ast::LikeOperator::Like => {
+                    if *not {
+                        "NOT LIKE"
+                    } else {
+                        "LIKE"
+                    }
+                }
+                turso_parser::ast::LikeOperator::Glob => {
+                    if *not {
+                        "NOT GLOB"
+                    } else {
+                        "GLOB"
+                    }
+                }
+                turso_parser::ast::LikeOperator::Match => {
+                    if *not {
+                        "NOT MATCH"
+                    } else {
+                        "MATCH"
+                    }
+                }
+                turso_parser::ast::LikeOperator::Regexp => {
+                    if *not {
+                        "NOT REGEXP"
+                    } else {
+                        "REGEXP"
+                    }
+                }
             };
             let mut result = format!("{}{}{}\n", tree(prefix), tree(connector), operator(op_str));
             result.push_str(&format_expr_tree(lhs, &child_prefix, false));
             result.push_str(&format_expr_tree(rhs, &child_prefix, true));
             result
         }
-        Expr::Case { base, when_then_pairs, else_expr } => {
+        Expr::Case {
+            base,
+            when_then_pairs,
+            else_expr,
+        } => {
             let mut result = format!("{}{}{}\n", tree(prefix), tree(connector), operator("CASE"));
             if let Some(base_expr) = base {
                 result.push_str(&format_expr_tree(base_expr, &child_prefix, false));
             }
             for (cond, then_expr) in when_then_pairs {
                 result.push_str(&format!("{}{}WHEN\n", tree(&child_prefix), tree("|-- ")));
-                result.push_str(&format_expr_tree(cond, &format!("{}{}", child_prefix, "|   "), true));
+                result.push_str(&format_expr_tree(
+                    cond,
+                    &format!("{}{}", child_prefix, "|   "),
+                    true,
+                ));
                 result.push_str(&format!("{}{}THEN\n", tree(&child_prefix), tree("|-- ")));
-                result.push_str(&format_expr_tree(then_expr, &format!("{}{}", child_prefix, "|   "), true));
+                result.push_str(&format_expr_tree(
+                    then_expr,
+                    &format!("{}{}", child_prefix, "|   "),
+                    true,
+                ));
             }
             if let Some(else_e) = else_expr {
                 result.push_str(&format!("{}{}ELSE\n", tree(&child_prefix), tree("'-- ")));
-                result.push_str(&format_expr_tree(else_e, &format!("{}{}", child_prefix, "    "), true));
+                result.push_str(&format_expr_tree(
+                    else_e,
+                    &format!("{}{}", child_prefix, "    "),
+                    true,
+                ));
             }
             result
         }
         Expr::Cast { expr, type_name } => {
-            let type_str = type_name.as_ref().map_or("?".to_string(), |t| format!("{:?}", t));
-            let mut result = format!("{}{}{} AS {}\n", tree(prefix), tree(connector), operator("CAST"), type_str);
+            let type_str = type_name
+                .as_ref()
+                .map_or("?".to_string(), |t| format!("{:?}", t));
+            let mut result = format!(
+                "{}{}{} AS {}\n",
+                tree(prefix),
+                tree(connector),
+                operator("CAST"),
+                type_str
+            );
             result.push_str(&format_expr_tree(expr, &child_prefix, true));
             result
         }
@@ -574,13 +684,18 @@ pub fn format_expr_tree(expr: &turso_parser::ast::Expr, prefix: &str, is_last: b
             format!("{}{}{}\n", tree(prefix), tree(connector), name.as_str())
         }
         Expr::Qualified(table_name, col_name) => {
-            format!("{}{}{}.{}\n",
+            format!(
+                "{}{}{}.{}\n",
                 tree(prefix),
                 tree(connector),
                 table_name.as_str(),
-                column(col_name.as_str()))
+                column(col_name.as_str())
+            )
         }
-        Expr::SubqueryResult { query_type: _query_type, .. } => {
+        Expr::SubqueryResult {
+            query_type: _query_type,
+            ..
+        } => {
             format!("{}{}{}\n", tree(prefix), tree(connector), "(SUBQUERY)")
         }
         _ => {
@@ -632,11 +747,21 @@ pub fn format_where_term(
             prereqs.push(i.to_string());
         }
     }
-    let prereq_str = if prereqs.is_empty() { "0".to_string() } else { prereqs.join(",") };
+    let prereq_str = if prereqs.is_empty() {
+        "0".to_string()
+    } else {
+        prereqs.join(",")
+    };
 
     let mut result = format!(
         "TERM-{}   {} {}  op={:03} wtFlags={:04x} prob={} prereq={}\n",
-        idx, flags, column(&left_str), op_code, wt_flags, prob_str, prereq_str
+        idx,
+        flags,
+        column(&left_str),
+        op_code,
+        wt_flags,
+        prob_str,
+        prereq_str
     );
 
     if let Some(e) = expr {
@@ -675,7 +800,7 @@ pub fn format_where_loop(
 
 /// Format individual index candidate evaluation with badge-style.
 /// Output:
-/// ```
+/// ```text
 ///   [CANDIDATE 0] rowid
 ///     ├─ flags: UNIQUE
 ///     ├─ eq: 0 constraints
@@ -696,26 +821,35 @@ pub fn format_add_candidate(
     let is_unique = (flags & 0x000001) != 0;
     let is_covering = (flags & 0x000100) != 0;
     let is_rowid = (flags & 0x800000) != 0;
-    
+
     let scan_type = if is_rowid { "rowid" } else { "index" };
-    
+
     // Build flags list
     let mut flag_list = Vec::new();
-    if is_unique { flag_list.push("UNIQUE"); }
-    if is_covering { flag_list.push("covering"); }
-    let flags_str = if flag_list.is_empty() { 
-        "none".to_string() 
-    } else { 
-        flag_list.join(", ") 
+    if is_unique {
+        flag_list.push("UNIQUE");
+    }
+    if is_covering {
+        flag_list.push("covering");
+    }
+    let flags_str = if flag_list.is_empty() {
+        "none".to_string()
+    } else {
+        flag_list.join(", ")
     };
-    
+
     // Badge-style output
     let candidate_badge = if use_colors() {
-        format!("{}[CANDIDATE {}]{}", colors::OPERATOR, sub_idx, colors::RESET)
+        format!(
+            "{}[CANDIDATE {}]{}",
+            colors::OPERATOR,
+            sub_idx,
+            colors::RESET
+        )
     } else {
         format!("[CANDIDATE {}]", sub_idx)
     };
-    
+
     format!(
         "  {} {} {}\n    ├─ flags: {}\n    ├─ eq: {} constraints\n    └─ cost: setup={} | run={} | rows={}",
         candidate_badge,
@@ -747,7 +881,11 @@ pub fn format_scan_term(addr: &str, is_equiv: bool, table_idx: usize, col_idx: i
 }
 
 /// Format addBtreeIdx BEGIN header with badge-style.
-pub fn format_btree_idx_begin(table_name: &str, constraint_count: usize, candidate_count: usize) -> String {
+pub fn format_btree_idx_begin(
+    table_name: &str,
+    constraint_count: usize,
+    candidate_count: usize,
+) -> String {
     let table_badge = if use_colors() {
         format!("{}[TABLE]{}", colors::TABLE, colors::RESET)
     } else {
@@ -778,7 +916,6 @@ pub fn format_btree_idx_end(table_name: &str, usable_constraints: usize, best_co
     )
 }
 
-
 fn pretty_cost(c: f64) -> String {
     if c >= 1000000.0 {
         format!("{:.1e}", c)
@@ -791,7 +928,12 @@ fn pretty_cost(c: f64) -> String {
 
 /// Format coding level message.
 /// Output: `Coding level {level} of {total}:  notReady={mask:016x}  iFrom={from_idx}`
-pub fn format_coding_level(level: usize, total: usize, not_ready_mask: u64, from_idx: usize) -> String {
+pub fn format_coding_level(
+    level: usize,
+    total: usize,
+    not_ready_mask: u64,
+    from_idx: usize,
+) -> String {
     format!(
         "{} level {} of {}:  notReady=0x{:016x}  iFrom={}",
         header("Coding"),
@@ -827,11 +969,11 @@ pub fn format_where_clause_being_coded() -> String {
 /// Badge types for trace output
 #[derive(Clone, Copy, Debug)]
 pub enum Badge {
-    Add,      // Green [ADD]
-    Skip,     // Red [SKIP]  
-    Hash,     // Cyan [HASH]
-    Solver,   // Blue [SOLVER]
-    Winner,   // Bold Green [WINNER]
+    Add,    // Green [ADD]
+    Skip,   // Red [SKIP]
+    Hash,   // Cyan [HASH]
+    Solver, // Blue [SOLVER]
+    Winner, // Bold Green [WINNER]
 }
 
 /// Format a colored badge
@@ -944,11 +1086,7 @@ pub fn format_rejected_hash_join(
 
 /// Format an accepted candidate (for consistency)
 /// Output: `  [ADD]  lineitem           cost=40K  rows=6,000`
-pub fn format_accepted_join(
-    table_name: &str,
-    plan_cost: f64,
-    rows: usize,
-) -> String {
+pub fn format_accepted_join(table_name: &str, plan_cost: f64, rows: usize) -> String {
     format!(
         "  {} {:<20} cost={}  rows={}",
         badge(Badge::Add),
@@ -972,19 +1110,22 @@ pub fn format_rejected_json(
 ) -> String {
     format!(
         r#"{{"event":"{}","table":"{}","cost":{:.0},"bound":{:.0},"reason":"{}","ratio":{:.2}}}"#,
-        event_type, table_name, plan_cost, bound, reason.as_str(), plan_cost / bound
+        event_type,
+        table_name,
+        plan_cost,
+        bound,
+        reason.as_str(),
+        plan_cost / bound
     )
 }
 
 /// JSON rejection event for hash join
-pub fn format_rejected_hash_json(
-    build: &str,
-    probe: &str,
-    reason: RejectionReason,
-) -> String {
+pub fn format_rejected_hash_json(build: &str, probe: &str, reason: RejectionReason) -> String {
     format!(
         r#"{{"event":"hash_join_rejected","build":"{}","probe":"{}","reason":"{}"}}"#,
-        build, probe, reason.as_str()
+        build,
+        probe,
+        reason.as_str()
     )
 }
 
@@ -995,14 +1136,16 @@ pub fn format_rejected_hash_json(
 /// Format cost with color based on magnitude (green=cheap, yellow=moderate, red=expensive)
 pub fn format_cost_colored(cost_val: f64) -> String {
     let formatted = format_cost_human(cost_val);
-    if !use_colors() { return formatted; }
-    
+    if !use_colors() {
+        return formatted;
+    }
+
     if cost_val < 10_000.0 {
-        color(&formatted, colors::GOOD)      // Green - cheap
+        color(&formatted, colors::GOOD) // Green - cheap
     } else if cost_val < 1_000_000.0 {
-        color(&formatted, colors::LITERAL)   // Yellow - moderate  
+        color(&formatted, colors::LITERAL) // Yellow - moderate
     } else {
-        color(&formatted, colors::BAD)       // Red - expensive
+        color(&formatted, colors::BAD) // Red - expensive
     }
 }
 
@@ -1044,14 +1187,14 @@ pub mod box_chars {
 
 /// Format structured add line with tree visualization
 /// Output:
-/// ```
+/// ```text
 /// [EVAL] Scan lineitem (table 0, idx 1)
 ///        ├─ scan_cost: 20K (1M rows)
 ///        └─ output: 100K rows
 /// ```
 pub fn format_add_structured(
     table_name: &str,
-    scan_type: &str,  // "Scan", "IndexSeek", "HashJoin"
+    scan_type: &str, // "Scan", "IndexSeek", "HashJoin"
     base_cost: f64,
     run_cost: f64,
     base_rows: f64,
@@ -1062,7 +1205,7 @@ pub fn format_add_structured(
     } else {
         "[EVAL]".to_string()
     };
-    
+
     format!(
         "{} {} {}\n\
          {}├─ cost: {} (base: {})\n\
@@ -1109,7 +1252,7 @@ impl CandidateStatus {
             Self::Skipped => "✗",
         }
     }
-    
+
     fn label(&self) -> &'static str {
         match self {
             Self::Base => "BASE",
@@ -1123,20 +1266,23 @@ impl CandidateStatus {
 /// Format round summary as ASCII table
 pub fn format_round_summary_table(round: usize, candidates: &[RoundCandidate]) -> String {
     let mut result = String::new();
-    
+
     // Header
-    result.push_str(&format!("\n{}\n", header(&format!("Round {} Summary:", round))));
+    result.push_str(&format!(
+        "\n{}\n",
+        header(&format!("Round {} Summary:", round))
+    ));
     result.push_str("  ┌──────┬────────────────┬────────────┬───────────┬────────┐\n");
     result.push_str("  │ Mask │ Tables         │ Cost       │ Rows      │ Status │\n");
     result.push_str("  ├──────┼────────────────┼────────────┼───────────┼────────┤\n");
-    
+
     for c in candidates {
         let status_str = match c.status {
             CandidateStatus::Best => good(&format!("{} {}", c.status.symbol(), c.status.label())),
             CandidateStatus::Skipped => bad(&format!("{} {}", c.status.symbol(), c.status.label())),
             _ => format!("{} {}", c.status.symbol(), c.status.label()),
         };
-        
+
         result.push_str(&format!(
             "  │ {:>4} │ {:<14} │ {:>10} │ {:>9} │ {:>6} │\n",
             c.mask_str,
@@ -1146,7 +1292,7 @@ pub fn format_round_summary_table(round: usize, candidates: &[RoundCandidate]) -
             status_str
         ));
     }
-    
+
     result.push_str("  └──────┴────────────────┴────────────┴───────────┴────────┘\n");
     result
 }
@@ -1172,7 +1318,7 @@ pub fn format_rejected_extended(
     breakdown: Option<&CostBreakdown>,
 ) -> String {
     let ratio = total_cost / bound;
-    
+
     let mut result = format!(
         "  {} {}\n\
          {}├─ Reason: {}\n\
@@ -1180,27 +1326,32 @@ pub fn format_rejected_extended(
          {}├─ Current best: {}\n",
         badge(Badge::Skip),
         table_chain,
-        "  ", bad("cost_exceeds_bound"),
-        "  ", format_cost_colored(total_cost),
-        "  ", format_cost_colored(bound),
+        "  ",
+        bad("cost_exceeds_bound"),
+        "  ",
+        format_cost_colored(total_cost),
+        "  ",
+        format_cost_colored(bound),
     );
-    
+
     if let Some(b) = breakdown {
         result.push_str(&format!(
             "{}├─ Cost breakdown:\n\
              {}│   ├─ Outer scan: {} ({} rows)\n\
              {}│   └─ Inner seeks: {} ({:.0} × {:.1})\n",
             "  ",
-            "  ", format_cost_human(b.outer_scan_cost), format_rows_human(b.outer_rows),
-            "  ", format_cost_human(b.inner_seek_cost), b.seeks_count, b.cost_per_seek,
+            "  ",
+            format_cost_human(b.outer_scan_cost),
+            format_rows_human(b.outer_rows),
+            "  ",
+            format_cost_human(b.inner_seek_cost),
+            b.seeks_count,
+            b.cost_per_seek,
         ));
     }
-    
-    result.push_str(&format!(
-        "{}└─ Factor: {:.1}× more expensive",
-        "  ", ratio
-    ));
-    
+
+    result.push_str(&format!("{}└─ Factor: {:.1}× more expensive", "  ", ratio));
+
     result
 }
 
@@ -1224,25 +1375,31 @@ pub fn format_selectivity_analysis(
     let mut result = format!(
         "\n{}Selectivity analysis for {}:{}\n\
          {}Base rows: {}\n",
-        colors::HEADER, table(table_name), colors::RESET,
-        "  ", format_rows_human(base_rows)
+        colors::HEADER,
+        table(table_name),
+        colors::RESET,
+        "  ",
+        format_rows_human(base_rows)
     );
-    
+
     if filters.is_empty() {
         result.push_str("  └─ No filters applied\n");
         return result;
     }
-    
+
     for (i, f) in filters.iter().enumerate() {
         let is_last = i == filters.len() - 1;
         let prefix = if is_last { "└─" } else { "├─" };
-        
+
         result.push_str(&format!(
             "  {} {} (sel={:.2}) → {} rows\n",
-            prefix, f.description, f.selectivity, format_rows_human(f.output_rows)
+            prefix,
+            f.description,
+            f.selectivity,
+            format_rows_human(f.output_rows)
         ));
     }
-    
+
     result
 }
 
@@ -1253,7 +1410,7 @@ pub fn format_selectivity_analysis(
 /// Plan step for visualization
 pub struct PlanStep {
     pub step_num: usize,
-    pub operation: String,      // "SCAN", "INDEX SEEK", "HASH JOIN"
+    pub operation: String, // "SCAN", "INDEX SEEK", "HASH JOIN"
     pub table_name: String,
     pub index_name: Option<String>,
     pub cost: f64,
@@ -1265,12 +1422,12 @@ pub struct PlanStep {
 /// Format final execution plan visualization
 pub fn format_final_plan(steps: &[PlanStep], total_cost: f64, total_rows: f64) -> String {
     let mut result = String::new();
-    
+
     // Header
     result.push_str("\n╔═══════════════════════════════════════╗\n");
     result.push_str("║         FINAL EXECUTION PLAN          ║\n");
     result.push_str("╚═══════════════════════════════════════╝\n\n");
-    
+
     for (i, step) in steps.iter().enumerate() {
         // Step header
         result.push_str(&format!(
@@ -1279,12 +1436,12 @@ pub fn format_final_plan(steps: &[PlanStep], total_cost: f64, total_rows: f64) -
             header(&step.operation),
             table(&step.table_name)
         ));
-        
+
         // Index info if present
         if let Some(idx) = &step.index_name {
             result.push_str(&format!("   ├─ Index: {}\n", index(idx)));
         }
-        
+
         // Cost and rows
         result.push_str(&format!(
             "   ├─ Cost: {} | Rows: {} → {}\n",
@@ -1292,37 +1449,41 @@ pub fn format_final_plan(steps: &[PlanStep], total_cost: f64, total_rows: f64) -
             format_rows_human(step.input_rows),
             format_rows_human(step.output_rows)
         ));
-        
+
         // Filters
         if !step.filters.is_empty() {
             result.push_str("   └─ Filters:\n");
             for (j, filter) in step.filters.iter().enumerate() {
                 let is_last = j == step.filters.len() - 1;
-                let prefix = if is_last { "      └─" } else { "      ├─" };
+                let prefix = if is_last {
+                    "      └─"
+                } else {
+                    "      ├─"
+                };
                 result.push_str(&format!("{} {}\n", prefix, filter));
             }
         } else {
             result.push_str("   └─ (no filters)\n");
         }
-        
+
         // Arrow to next step
         if i < steps.len() - 1 {
             result.push_str(&format!("       {}\n", box_chars::ARROW_DOWN));
         }
     }
-    
+
     // Footer
     result.push_str(&format!(
         "\nTotal Cost: {} | Output Rows: {}\n",
         format_cost_colored(total_cost),
         format_rows_human(total_rows)
     ));
-    
+
     result
 }
 
 // ============================================================================
-// Optimizer Statistics Summary  
+// Optimizer Statistics Summary
 // ============================================================================
 
 /// Optimizer statistics for summary
@@ -1347,11 +1508,16 @@ pub fn format_optimizer_stats(stats: &OptimizerStats) -> String {
          {}Plans skipped: {} (cost pruning)\n\n\
          Timing:\n\
          {}Optimization time: {:.2}ms\n",
-        "  • ", stats.tables,
-        "  • ", stats.join_orders_evaluated,
-        "  • ", stats.plans_considered,
-        "  • ", stats.plans_skipped,
-        "  • ", stats.optimization_time_ms
+        "  • ",
+        stats.tables,
+        "  • ",
+        stats.join_orders_evaluated,
+        "  • ",
+        stats.plans_considered,
+        "  • ",
+        stats.plans_skipped,
+        "  • ",
+        stats.optimization_time_ms
     )
 }
 
@@ -1361,36 +1527,55 @@ pub fn format_optimizer_stats(stats: &OptimizerStats) -> String {
 
 /// Warning types for optimization suggestions
 pub enum OptimizationWarning {
-    LargeOrClause(usize),           // Number of OR branches
-    FullTableScan(String),          // Table name
-    MissingIndex(String, String),   // Table, column
-    HighCostRatio(f64),             // Ratio vs optimal
+    LargeOrClause(usize),         // Number of OR branches
+    FullTableScan(String),        // Table name
+    MissingIndex(String, String), // Table, column
+    HighCostRatio(f64),           // Ratio vs optimal
 }
 
 /// Format optimization warnings
 pub fn format_warnings(warnings: &[OptimizationWarning]) -> String {
-    if warnings.is_empty() { return String::new(); }
-    
-    let mut result = format!("\n{}⚠  Optimization Warnings:{}\n", colors::LITERAL, colors::RESET);
-    
+    if warnings.is_empty() {
+        return String::new();
+    }
+
+    let mut result = format!(
+        "\n{}⚠  Optimization Warnings:{}\n",
+        colors::LITERAL,
+        colors::RESET
+    );
+
     for w in warnings {
         result.push_str(&format!("  {} ", box_chars::BULLET));
         match w {
             OptimizationWarning::LargeOrClause(n) => {
-                result.push_str(&format!("Large OR clause ({} branches) - consider UNION ALL\n", n));
+                result.push_str(&format!(
+                    "Large OR clause ({} branches) - consider UNION ALL\n",
+                    n
+                ));
             }
             OptimizationWarning::FullTableScan(tbl) => {
-                result.push_str(&format!("Full table scan on {} - consider adding index\n", table(tbl)));
+                result.push_str(&format!(
+                    "Full table scan on {} - consider adding index\n",
+                    table(tbl)
+                ));
             }
             OptimizationWarning::MissingIndex(tbl, col) => {
-                result.push_str(&format!("Missing index on {}.{}\n", table(tbl), column(col)));
+                result.push_str(&format!(
+                    "Missing index on {}.{}\n",
+                    table(tbl),
+                    column(col)
+                ));
             }
             OptimizationWarning::HighCostRatio(r) => {
-                result.push_str(&format!("Cost {:.1}× higher than optimal - review query structure\n", r));
+                result.push_str(&format!(
+                    "Cost {:.1}× higher than optimal - review query structure\n",
+                    r
+                ));
             }
         }
     }
-    
+
     result
 }
 
@@ -1404,7 +1589,9 @@ pub fn format_round_header(round: usize, tables_joined: usize) -> String {
         "\n╔══════════════════════════════════════╗\n\
          ║  Round {}: {} table{} joined            ║\n\
          ╚══════════════════════════════════════╝\n",
-        round, tables_joined, if tables_joined == 1 { "" } else { "s" }
+        round,
+        tables_joined,
+        if tables_joined == 1 { "" } else { "s" }
     )
 }
 
@@ -1424,15 +1611,25 @@ pub fn format_readable_round_table(entries: &[ReadableRoundEntry]) -> String {
     result.push_str("  ┌─────┬─────────────────┬───────────┬──────────┬─────────┐\n");
     result.push_str("  │ ID  │ Join Order      │ Cost      │ Rows     │ Status  │\n");
     result.push_str("  ├─────┼─────────────────┼───────────┼──────────┼─────────┤\n");
-    
+
     for e in entries {
-        let status = if e.is_best { good("★") } else if e.is_skipped { bad("✗") } else { "○".to_string() };
+        let status = if e.is_best {
+            good("★")
+        } else if e.is_skipped {
+            bad("✗")
+        } else {
+            "○".to_string()
+        };
         result.push_str(&format!(
             "  │{:>4} │ {:<15} │ {:>9} │ {:>8} │    {}    │\n",
-            e.id, e.join_order, format_cost_human(e.cost), format_rows_human(e.rows), status
+            e.id,
+            e.join_order,
+            format_cost_human(e.cost),
+            format_rows_human(e.rows),
+            status
         ));
     }
-    
+
     result.push_str("  └─────┴─────────────────┴───────────┴──────────┴─────────┘\n");
     result
 }
@@ -1467,10 +1664,14 @@ pub fn format_join_evaluation(eval: &JoinEvaluation) -> String {
          │   Cost: {:>9}    Rows: {:>15} │\n\
          │ Inner: {:<40} │\n\
          │   Access: {:<37} │\n",
-        eval.outer_table, eval.inner_table,
-        eval.outer_table, eval.outer_access,
-        format_cost_human(eval.outer_cost), format_rows_human(eval.outer_rows),
-        eval.inner_table, eval.inner_access,
+        eval.outer_table,
+        eval.inner_table,
+        eval.outer_table,
+        eval.outer_access,
+        format_cost_human(eval.outer_cost),
+        format_rows_human(eval.outer_rows),
+        eval.inner_table,
+        eval.inner_access,
     );
     if let Some(idx) = &eval.index_name {
         result.push_str(&format!("│   Index: {:<38} │\n", idx));
@@ -1480,11 +1681,14 @@ pub fn format_join_evaluation(eval: &JoinEvaluation) -> String {
          │   Output: {:>38}│\n\
          │ Total: {:>42}│\n\
          └─────────────────────────────────────────────────┘\n",
-        format_rows_human(eval.seeks), eval.cost_per_seek,
+        format_rows_human(eval.seeks),
+        eval.cost_per_seek,
         format_rows_human(eval.output_rows),
         format_cost_colored(eval.total_cost)
     ));
-    if eval.is_new_best { result.push_str(&format!("  {} NEW BEST\n", good("✓"))); }
+    if eval.is_new_best {
+        result.push_str(&format!("  {} NEW BEST\n", good("✓")));
+    }
     result
 }
 
@@ -1511,16 +1715,24 @@ pub fn format_index_selection(table_name: &str, candidates: &[IndexCandidate]) -
          ╚═══════════════════════════════════════════════╝\n\n",
         table_name
     );
-    
+
     for (i, c) in candidates.iter().enumerate() {
         result.push_str(&format!("  Option {}: {}\n", i + 1, c.name));
         result.push_str(&format!("  ├─ Type: {}\n", c.access_type));
         if !c.usable_constraints.is_empty() {
             result.push_str("  ├─ Constraints:\n");
-            for cstr in &c.usable_constraints { result.push_str(&format!("  │   • {}\n", cstr)); }
+            for cstr in &c.usable_constraints {
+                result.push_str(&format!("  │   • {}\n", cstr));
+            }
         }
-        result.push_str(&format!("  ├─ Cost: {}\n", format_cost_colored(c.total_cost)));
-        result.push_str(&format!("  ├─ Output: {} rows\n", format_rows_human(c.output_rows)));
+        result.push_str(&format!(
+            "  ├─ Cost: {}\n",
+            format_cost_colored(c.total_cost)
+        ));
+        result.push_str(&format!(
+            "  ├─ Output: {} rows\n",
+            format_rows_human(c.output_rows)
+        ));
         if c.selected {
             result.push_str(&format!("  └─ {} SELECTED\n\n", good("✓")));
         } else {

@@ -170,15 +170,17 @@ pub fn estimate_cost_for_scan_or_seek(
     let result = estimate_page_io_cost(
         selectivity_multiplier * base_row_count * input_cardinality * covering_multiplier,
     );
-    
+
     #[cfg(feature = "wheretrace")]
-    crate::wheretrace!(crate::translate::optimizer::trace::flags::COST,
+    crate::wheretrace!(
+        crate::translate::optimizer::trace::flags::COST,
         "cost: {} selectivity={:.4} covering={} rows={:.0} total={:.1}",
         if index_info.unique { "UNIQUE" } else { "IDX" },
         selectivity_multiplier,
         index_info.covering,
         base_row_count * selectivity_multiplier,
-        *result);
-    
+        *result
+    );
+
     result
 }

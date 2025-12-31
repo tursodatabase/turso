@@ -57,7 +57,7 @@ fn main() -> anyhow::Result<()> {
     // Initialize WHERETRACE from environment if enabled
     #[cfg(feature = "wheretrace")]
     turso_core::translate::optimizer::trace::init_from_env();
-    
+
     let (mut app, _guard) = app::Limbo::new()?;
 
     if app.is_mcp_mode() {

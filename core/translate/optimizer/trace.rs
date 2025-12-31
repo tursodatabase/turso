@@ -103,8 +103,14 @@ pub mod flags {
     pub const ALL: u32 = 0xFFFF;
 
     /// Only SQLite-compatible flags (for comparing with SQLite output)
-    pub const SQLITE_COMPAT: u32 = SUMMARY | SOLVER | COST | LOOP_INSERT 
-        | ACCESS_METHOD | CONSTRAINT | QUERY_STRUCTURE | CODE_GEN;
+    pub const SQLITE_COMPAT: u32 = SUMMARY
+        | SOLVER
+        | COST
+        | LOOP_INSERT
+        | ACCESS_METHOD
+        | CONSTRAINT
+        | QUERY_STRUCTURE
+        | CODE_GEN;
 
     /// Just Turso-specific flags
     pub const TURSO_ONLY: u32 = HASH_JOIN | BLOOM_FILTER | EPHEMERAL_IDX | ORDER_TARGET;
@@ -148,14 +154,17 @@ pub fn output_format() -> OutputFormat {
 pub fn init_from_env() {
     if let Ok(val) = std::env::var("TURSO_WHERETRACE") {
         let trimmed = val.trim();
-        let mask = if let Some(hex) = trimmed.strip_prefix("0x").or_else(|| trimmed.strip_prefix("0X")) {
+        let mask = if let Some(hex) = trimmed
+            .strip_prefix("0x")
+            .or_else(|| trimmed.strip_prefix("0X"))
+        {
             u32::from_str_radix(hex, 16).unwrap_or(0)
         } else {
             trimmed.parse::<u32>().unwrap_or(0)
         };
         WHERETRACE.store(mask, Ordering::Relaxed);
     }
-    
+
     // Check for output format override
     if let Ok(fmt) = std::env::var("TURSO_WHERETRACE_FORMAT") {
         if fmt.eq_ignore_ascii_case("json") {
