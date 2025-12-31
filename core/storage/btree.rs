@@ -5025,6 +5025,7 @@ impl CursorTrait for BTreeCursor {
                     let cursor_has_record = return_if_io!(self.get_next_record());
                     self.set_has_record(cursor_has_record);
                     self.invalidate_record();
+                    self.advance_state = AdvanceState::Start;
                     return Ok(IOResult::Done(cursor_has_record));
                 }
             }
@@ -5052,6 +5053,7 @@ impl CursorTrait for BTreeCursor {
                     let cursor_has_record = return_if_io!(self.get_prev_record());
                     self.set_has_record(cursor_has_record);
                     self.invalidate_record();
+                    self.advance_state = AdvanceState::Start;
                     return Ok(IOResult::Done(cursor_has_record));
                 }
             }
