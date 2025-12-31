@@ -1214,7 +1214,7 @@ pub fn op_vdestroy(
     insn: &Insn,
     _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
-    load_insn!(VDestroy { db, table_name }, insn);
+    load_insn!(VDestroy { db: _, table_name }, insn);
     let conn = program.connection.clone();
     {
         let Some(vtab) = conn.syms.write().vtabs.remove(table_name) else {
@@ -1269,7 +1269,6 @@ pub fn op_vrename(
         insn
     );
     let name = state.registers[*new_name_reg].get_value().to_string();
-    let conn = program.connection.clone();
     let cursor = state.get_cursor(*cursor_id);
     let cursor = cursor.as_virtual_mut();
     let vtabs = &program.connection.syms.read().vtabs;
@@ -1610,7 +1609,7 @@ pub fn op_type_check(
         TypeCheck {
             start_reg,
             count,
-            check_generated,
+            check_generated: _,
             table_reference,
         },
         insn
@@ -1636,7 +1635,7 @@ pub fn op_type_check(
             let col_affinity = col.affinity();
             let ty_str = &col.ty_str;
             let ty_bytes = ty_str.as_bytes();
-            let applied = apply_affinity_char(reg, col_affinity);
+            let _applied = apply_affinity_char(reg, col_affinity);
             let value_type = reg.get_value().value_type();
             match_ignore_ascii_case!(match ty_bytes {
                 b"INTEGER" | b"INT" if value_type == ValueType::Integer => {}
@@ -1843,7 +1842,7 @@ pub fn halt(
 ) -> Result<InsnFunctionStepResult> {
     let mv_store = program.connection.mv_store();
     if err_code > 0 {
-        vtab_rollback_all(&program.connection, state)?;
+        vtab_rollback_all(&program.connection)?;
     }
     match err_code {
         0 => {}
@@ -1898,7 +1897,7 @@ pub fn halt(
                 .fk_deferred_violations
                 .swap(0, Ordering::AcqRel);
             if deferred_violations > 0 {
-                vtab_rollback_all(&program.connection, state)?;
+                vtab_rollback_all(&program.connection)?;
                 pager.rollback_tx(&program.connection);
                 program.connection.set_tx_state(TransactionState::None);
                 program.connection.auto_commit.store(true, Ordering::SeqCst);
@@ -1908,7 +1907,7 @@ pub fn halt(
             }
         }
         state.end_statement(&program.connection, pager, EndStatement::ReleaseSavepoint)?;
-        vtab_commit_all(&program.connection, state)?;
+        vtab_commit_all(&program.connection)?;
         program
             .commit_txn(pager.clone(), state, mv_store.as_ref(), false)
             .map(Into::into)
@@ -1921,7 +1920,7 @@ pub fn halt(
 }
 
 /// Call xCommit on all virtual tables that participated in the current transaction.
-fn vtab_commit_all(conn: &Connection, state: &mut ProgramState) -> crate::Result<()> {
+fn vtab_commit_all(conn: &Connection) -> crate::Result<()> {
     let mut set = conn.vtab_txn_states.write();
     if set.is_empty() {
         return Ok(());
@@ -1938,7 +1937,7 @@ fn vtab_commit_all(conn: &Connection, state: &mut ProgramState) -> crate::Result
 }
 
 /// Rollback all virtual tables that are part of the current transaction.
-fn vtab_rollback_all(conn: &Connection, state: &mut ProgramState) -> crate::Result<()> {
+fn vtab_rollback_all(conn: &Connection) -> crate::Result<()> {
     let mut set = conn.vtab_txn_states.write();
     if set.is_empty() {
         return Ok(());
@@ -5953,7 +5952,7 @@ pub fn op_sequence_test(
         SequenceTest {
             cursor_id,
             target_pc,
-            value_reg
+            value_reg: _
         },
         insn
     );
@@ -6761,8 +6760,8 @@ pub fn op_new_rowid(
         load_insn!(
             NewRowid {
                 cursor,
-                rowid_reg,
-                prev_largest_reg,
+                rowid_reg: _,
+                prev_largest_reg: _,
             },
             insn
         );
@@ -7587,7 +7586,7 @@ pub fn op_drop_table(
     program: &Program,
     state: &mut ProgramState,
     insn: &Insn,
-    pager: &Arc<Pager>,
+    _pager: &Arc<Pager>,
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(DropTable { db, table_name, .. }, insn);
     if *db > 0 {
@@ -7901,7 +7900,7 @@ pub fn op_set_cookie(
             db,
             cookie,
             value,
-            p5,
+            p5: _,
         },
         insn
     );
@@ -7927,7 +7926,7 @@ pub fn op_set_cookie(
                 Cookie::SchemaVersion => {
                     // we update transaction state to indicate that the schema has changed
                     match program.connection.get_tx_state() {
-                    TransactionState::Write { schema_did_change } => {
+                    TransactionState::Write { .. } => {
                         program.connection.set_tx_state(TransactionState::Write { schema_did_change: true });
                     },
                     TransactionState::Read => unreachable!("invalid transaction state for SetCookie: TransactionState::Read, should be write"),
@@ -8399,7 +8398,7 @@ pub fn op_open_dup(
                 .expect("cursor_id should be valid")
                 .replace(Cursor::new_btree(cursor));
         }
-        CursorType::BTreeIndex(table) => {
+        CursorType::BTreeIndex(_) => {
             // In principle, we could implement OpenDup for BTreeIndex,
             // but doing so now would create dead code since we have no use case,
             // and it wouldn't be possible to test it.
@@ -8581,7 +8580,7 @@ pub fn op_integrity_check(
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         IntegrityCk {
-            max_errors,
+            max_errors: _,
             roots,
             message_register,
         },
