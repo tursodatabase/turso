@@ -766,6 +766,7 @@ impl PageContent {
         self.read_u8(BTREE_FRAGMENTED_BYTES_COUNT)
     }
 
+    #[inline]
     pub fn rightmost_pointer(&self) -> Option<u32> {
         match self.page_type() {
             PageType::IndexInterior => Some(self.read_u32(BTREE_RIGHTMOST_PTR)),
@@ -775,6 +776,7 @@ impl PageContent {
         }
     }
 
+    #[inline]
     pub fn rightmost_pointer_raw(&self) -> Option<*mut u8> {
         match self.page_type() {
             PageType::IndexInterior | PageType::TableInterior => Some(unsafe {
@@ -787,6 +789,7 @@ impl PageContent {
         }
     }
 
+    #[inline]
     pub fn cell_get(&self, idx: usize, usable_size: usize) -> Result<BTreeCell> {
         tracing::trace!("cell_get(idx={})", idx);
         let buf = self.as_ptr();
@@ -884,6 +887,7 @@ impl PageContent {
     /// FIXME: make all usages of [cell_get_raw_region] to use the _faster version in cases where the method is called
     /// repeatedly, since page_type, max_local, min_local are the same for all cells on the page. Also consider whether
     /// max_local and min_local should be static properties of the page.
+    #[inline]
     pub fn cell_get_raw_region(&self, idx: usize, usable_size: usize) -> (usize, usize) {
         let page_type = self.page_type();
         let max_local = payload_overflow_threshold_max(page_type, usable_size);

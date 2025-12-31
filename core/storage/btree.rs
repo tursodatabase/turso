@@ -957,8 +957,7 @@ impl BTreeCursor {
                 *remaining_to_read == 0 && next == 0,
                 "we can't have more pages to read while also have read everything"
             );
-            let mut payload_swap = Vec::new();
-            std::mem::swap(payload, &mut payload_swap);
+            let payload_swap = std::mem::take(payload);
 
             let mut reuse_immutable = self.get_immutable_record_or_create();
             reuse_immutable.as_mut().unwrap().invalidate();
