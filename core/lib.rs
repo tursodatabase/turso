@@ -248,8 +248,6 @@ pub struct Database {
 
 // SAFETY: This needs to be audited for thread safety.
 // See: https://github.com/tursodatabase/turso/issues/1552
-unsafe impl Send for Database {}
-unsafe impl Sync for Database {}
 crate::assert::assert_send_sync!(Database);
 
 impl fmt::Debug for Database {
