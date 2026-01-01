@@ -8868,9 +8868,17 @@ pub fn op_integrity_check(
                         .page_reference
                         .contains_key(&(page_number as i64))
                     {
-                        errors.push(IntegrityCheckError::PageNeverUsed {
+                        // Pending byte page is always never used
+                        if pager.pending_byte_page_id() != Some(page_number as u32) {
+                            errors.push(IntegrityCheckError::PageNeverUsed {
+                                page_id: page_number as i64,
+                            });
+                        }
+                    } else if pager.pending_byte_page_id() == Some(page_number as u32) {
+                        // Pending byte page is somehow being used
+                        errors.push(IntegrityCheckError::PendingBytePageUsed {
                             page_id: page_number as i64,
-                        });
+                        })
                     }
                 }
                 let message = if errors.is_empty() {

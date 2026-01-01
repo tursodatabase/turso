@@ -5628,6 +5628,8 @@ pub enum IntegrityCheckError {
     },
     #[error("Page {page_id}: never used")]
     PageNeverUsed { page_id: i64 },
+    #[error("Pending byte page {page_id} is being used")]
+    PendingBytePageUsed { page_id: i64 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
