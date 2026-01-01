@@ -158,8 +158,11 @@ pub fn join_lhs_and_rhs<'a>(
                 && table_ids.iter().any(|id| lhs_internal_ids.contains(id))
         });
     if lhs.is_some() && !has_join_constraint {
+        let rhs_self_constraint_selectivity =
+            build_self_constraint_selectivity(rhs_constraints, rhs_table_number);
         // Penalize cross products so we don't introduce a table before it can join.
-        let cross_cost = (input_cardinality as f64) * (*rhs_base_rows);
+        let effective_rhs_rows = (*rhs_base_rows) * rhs_self_constraint_selectivity;
+        let cross_cost = (input_cardinality as f64) * effective_rhs_rows;
         best_access_method.cost = best_access_method.cost + Cost(cross_cost);
     }
 
@@ -418,23 +421,11 @@ pub fn join_lhs_and_rhs<'a>(
         );
         if allow_hash_join {
             let lhs_constraints = build_constraints;
-            let mut allowed_probe_table_ids = Vec::new();
-            for (table_no, _) in lhs.data.iter() {
-                let table_id = joined_tables[*table_no].internal_id;
-                if !allowed_probe_table_ids.contains(&table_id) {
-                    allowed_probe_table_ids.push(table_id);
-                }
-            }
-            let rhs_table_id = rhs_table_reference.internal_id;
-            if !allowed_probe_table_ids.contains(&rhs_table_id) {
-                allowed_probe_table_ids.push(rhs_table_id);
-            }
             if let Some(hash_join_method) = try_hash_join_access_method(
                 lhs_table,
                 rhs_table_reference,
                 lhs_table_idx,
                 rhs_table_idx,
-                &allowed_probe_table_ids,
                 lhs_constraints,
                 rhs_constraints,
                 where_clause,
@@ -493,9 +484,11 @@ pub fn join_lhs_and_rhs<'a>(
                     let build_is_eligible = build_am_is_plain_table_scan
                         || needs_materialization
                         || build_access_method_uses_constraints;
+
                     hash_join_allowed = build_is_eligible
                         && (!needs_materialization || build_has_rowid)
                         && !materialization_too_large;
+
                     if hash_join_allowed {
                         let should_materialize = if needs_materialization {
                             build_has_rowid

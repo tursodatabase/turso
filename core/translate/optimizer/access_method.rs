@@ -287,37 +287,29 @@ fn collect_table_refs(expr: &ast::Expr) -> Option<Vec<TableInternalId>> {
     result.ok().map(|_| tables)
 }
 
-/// Detect equi-join conditions between two tables that could be used for a hash join.
-/// Returns a list of `HashJoinKey` entries pointing to equality conditions in the WHERE clause.
+/// Detect equi-join conditions between exactly two tables for hash join.
 ///
-/// This function analyzes the WHERE clause constraints to find equality conditions
-/// where one side references only the build table and the other side references only
-/// tables on the probe side (limited by `allowed_probe_table_ids`).
-/// Callers may further restrict the probe side (e.g., to the immediate probe table).
-/// This supports expression-based join keys like `lower(t.a) = substr(t2.b, 1, 3)`.
-/// The caller is responsible for marking WHERE terms as consumed if hash join is selected.
+/// Returns `HashJoinKey` entries pointing at `WHERE` terms of the form:
+///   <build-only expr> = <probe-only expr>
+/// or
+///   <probe-only expr> = <build-only expr>
+///
+/// Both sides may be arbitrary expressions (e.g. `lower(t1.a) = substr(t2.b,1,3)`),
+/// but each side must reference columns from exactly one table:
+/// - the build side must reference only `build_table_id`
+/// - the probe side must reference only `probe_table_id`
+///
+/// This function does *not* mark any terms as consumed; the caller is responsible
+/// for doing so if a hash join is selected.
 pub fn find_equijoin_conditions(
     build_table_id: TableInternalId,
-    allowed_probe_table_ids: &[TableInternalId],
+    probe_table_id: TableInternalId,
     where_clause: &[WhereTerm],
 ) -> Vec<HashJoinKey> {
     let mut join_keys = Vec::new();
-    // Track which WHERE clause indices we've already processed to avoid duplicates
-    let mut seen_where_indices = Vec::new();
-    let mut allowed_probe_tables = Vec::new();
-    for table_id in allowed_probe_table_ids {
-        if *table_id != build_table_id && !allowed_probe_tables.contains(table_id) {
-            allowed_probe_tables.push(*table_id);
-        }
-    }
 
     for (where_idx, where_term) in where_clause.iter().enumerate() {
-        // Skip already consumed terms
         if where_term.consumed {
-            continue;
-        }
-        // Skip already processed indices
-        if seen_where_indices.contains(&where_idx) {
             continue;
         }
 
@@ -328,7 +320,6 @@ pub fn find_equijoin_conditions(
             continue;
         }
 
-        // Collect table references from each side of the equality
         let Some(lhs_tables) = collect_table_refs(lhs) else {
             continue;
         };
@@ -336,29 +327,25 @@ pub fn find_equijoin_conditions(
             continue;
         };
 
-        // Build side must reference only the build table.
-        let lhs_is_build_only = lhs_tables.len() == 1 && lhs_tables[0] == build_table_id;
-        let rhs_is_build_only = rhs_tables.len() == 1 && rhs_tables[0] == build_table_id;
-        let lhs_probe_ok = !lhs_tables.is_empty()
-            && lhs_tables
-                .iter()
-                .all(|table_id| allowed_probe_tables.contains(table_id));
-        let rhs_probe_ok = !rhs_tables.is_empty()
-            && rhs_tables
-                .iter()
-                .all(|table_id| allowed_probe_tables.contains(table_id));
+        // Require each side to reference exactly one table. This prevents
+        // constants or multi-table expressions from being considered join keys.
+        if lhs_tables.len() != 1 || rhs_tables.len() != 1 {
+            continue;
+        }
 
-        // Check if one side references build table only and the other references allowed probe tables.
-        let build_side = if lhs_is_build_only && rhs_probe_ok {
+        let lhs_tid = lhs_tables[0];
+        let rhs_tid = rhs_tables[0];
+
+        // Accept either orientation: build=probe or probe=build.
+        let build_side = if lhs_tid == build_table_id && rhs_tid == probe_table_id {
             Some(BinaryExprSide::Lhs)
-        } else if rhs_is_build_only && lhs_probe_ok {
+        } else if rhs_tid == build_table_id && lhs_tid == probe_table_id {
             Some(BinaryExprSide::Rhs)
         } else {
             None
         };
 
         if let Some(build_side) = build_side {
-            seen_where_indices.push(where_idx);
             join_keys.push(HashJoinKey {
                 where_clause_idx: where_idx,
                 build_side,
@@ -416,14 +403,12 @@ pub fn estimate_hash_join_cost(
 }
 
 /// Try to create a hash join access method for joining two tables.
-/// NOTE: we are intentionally strict in choosing hash joins for the MVP, can be expanded on later on.
 #[allow(clippy::too_many_arguments)]
 pub fn try_hash_join_access_method(
     build_table: &JoinedTable,
     probe_table: &JoinedTable,
     build_table_idx: usize,
     probe_table_idx: usize,
-    allowed_probe_table_ids: &[TableInternalId],
     build_constraints: &TableConstraints,
     probe_constraints: &TableConstraints,
     where_clause: &mut [WhereTerm],
@@ -489,7 +474,7 @@ pub fn try_hash_join_access_method(
 
     let join_keys = find_equijoin_conditions(
         build_table.internal_id,
-        allowed_probe_table_ids,
+        probe_table.internal_id,
         where_clause,
     )
     .into_iter()
