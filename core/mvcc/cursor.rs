@@ -259,7 +259,7 @@ pub struct MvccLazyCursor<Clock: LogicalClock> {
     creating_new_rowid: bool,
     state: RefCell<Option<MvccLazyCursorState>>,
     // we keep count_state separate to be able to call other public functions like rewind and next
-    count_state: RefCell<Option<CountState>>,
+    count_state: Option<CountState>,
     btree_advance_state: Option<AdvanceBtreeState>,
     /// Dual-cursor peek state for proper iteration
     dual_peek: RefCell<DualCursorPeek>,
@@ -303,7 +303,7 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
             null_flag: false,
             creating_new_rowid: false,
             state: RefCell::new(None),
-            count_state: RefCell::new(None),
+            count_state: None,
             btree_advance_state: None,
             dual_peek: RefCell::new(DualCursorPeek {
                 mvcc_peek: CursorPeek::Uninitialized,
@@ -1461,15 +1461,15 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
 
     fn count(&mut self) -> Result<IOResult<usize>> {
         loop {
-            let state = self.count_state.borrow().clone();
+            let state = self.count_state.clone();
             match state {
                 None => {
-                    self.count_state.replace(Some(CountState::Rewind));
+                    self.count_state.replace(CountState::Rewind);
                 }
                 Some(CountState::Rewind) => {
                     return_if_io!(self.rewind());
                     self.count_state
-                        .replace(Some(CountState::CheckBtreeKey { count: 0 }));
+                        .replace(CountState::CheckBtreeKey { count: 0 });
                 }
                 Some(CountState::CheckBtreeKey { count }) => {
                     if let CursorPosition::Loaded {
@@ -1478,9 +1478,9 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                     } = self.get_current_pos()
                     {
                         self.count_state
-                            .replace(Some(CountState::NextBtree { count: count + 1 }));
+                            .replace(CountState::NextBtree { count: count + 1 });
                     } else {
-                        self.count_state.replace(None);
+                        self.count_state = None;
                         return Ok(IOResult::Done(count));
                     }
                 }
@@ -1488,7 +1488,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                     // advance the btree cursor skips non valid keys
                     return_if_io!(self.next());
                     self.count_state
-                        .replace(Some(CountState::CheckBtreeKey { count }));
+                        .replace(CountState::CheckBtreeKey { count });
                 }
             }
         }
@@ -1576,7 +1576,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
     }
 
     fn has_record(&self) -> bool {
-        todo!()
+        matches!(self.get_current_pos(), CursorPosition::Loaded { .. })
     }
 
     fn set_has_record(&mut self, _has_record: bool) {
