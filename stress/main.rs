@@ -596,7 +596,7 @@ pub fn init_tracing() -> Result<(WorkerGuard, LogLevelReloadHandle), std::io::Er
     Ok((guard, reload_handle))
 }
 
-const LOG_LEVEL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+const LOG_LEVEL_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(100);
 
 const LOG_LEVEL_FILE: &str = "RUST_LOG";
 
