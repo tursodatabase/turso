@@ -551,7 +551,7 @@ pub enum CursorSeekState {
     },
 }
 
-pub trait CursorTrait: Any {
+pub trait CursorTrait: Any + Send + Sync {
     /// Move cursor to last entry.
     fn last(&mut self) -> Result<IOResult<()>>;
     /// Move cursor to next entry.

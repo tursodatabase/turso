@@ -206,7 +206,7 @@ pub enum MvccCursorType {
 }
 
 pub(crate) type MvccIterator<'l, T> =
-    Box<dyn Iterator<Item = Entry<'l, T, RwLock<Vec<RowVersion>>>>>;
+    Box<dyn Iterator<Item = Entry<'l, T, RwLock<Vec<RowVersion>>>> + Send + Sync>;
 
 /// Extends the lifetime of a SkipMap iterator to `'static`.
 ///
@@ -233,8 +233,16 @@ macro_rules! static_iterator_hack {
         // SAFETY: See macro documentation above.
         unsafe {
             std::mem::transmute::<
-                Box<dyn Iterator<Item = Entry<'_, $key_type, RwLock<Vec<RowVersion>>>>>,
-                Box<dyn Iterator<Item = Entry<'static, $key_type, RwLock<Vec<RowVersion>>>>>,
+                Box<
+                    dyn Iterator<Item = Entry<'_, $key_type, RwLock<Vec<RowVersion>>>>
+                        + Send
+                        + Sync,
+                >,
+                Box<
+                    dyn Iterator<Item = Entry<'static, $key_type, RwLock<Vec<RowVersion>>>>
+                        + Send
+                        + Sync,
+                >,
             >($iter)
         }
     };
