@@ -79,7 +79,6 @@ pub use statement::Statement;
 use std::collections::HashSet;
 use std::time::Duration;
 use std::{
-    cell::Cell,
     collections::HashMap,
     fmt::{self, Display},
     ops::Deref,
@@ -234,7 +233,7 @@ pub struct Database {
     _shared_page_cache: Arc<RwLock<PageCache>>,
     shared_wal: Arc<RwLock<WalFileShared>>,
     init_lock: Arc<Mutex<()>>,
-    open_flags: Cell<OpenFlags>,
+    open_flags: OpenFlags,
     builtin_syms: RwLock<SymbolTable>,
     opts: DatabaseOpts,
     n_connections: AtomicUsize,
@@ -258,7 +257,7 @@ impl fmt::Debug for Database {
         let mut debug_struct = f.debug_struct("Database");
         debug_struct
             .field("path", &self.path)
-            .field("open_flags", &self.open_flags.get());
+            .field("open_flags", &self.open_flags);
 
         // Database state information
         let db_state_value = match &*self.init_page_1.load() {
@@ -355,7 +354,7 @@ impl Database {
             db_file,
             builtin_syms: syms.into(),
             io: io.clone(),
-            open_flags: flags.into(),
+            open_flags: flags,
             init_lock: Arc::new(Mutex::new(())),
             opts,
             buffer_pool: BufferPool::begin_init(io, arena_size),
@@ -594,7 +593,7 @@ impl Database {
     fn header_validation(&mut self) -> Result<Arc<Pager>> {
         let wal_exists = journal_mode::wal_exists(std::path::Path::new(&self.wal_path));
         let log_exists = journal_mode::logical_log_exists(std::path::Path::new(&self.path));
-        let is_readonly = self.open_flags.get().contains(OpenFlags::ReadOnly);
+        let is_readonly = self.open_flags.contains(OpenFlags::ReadOnly);
 
         let mut pager = self._init()?;
         assert!(pager.wal.is_none(), "Pager should have no WAL yet");
@@ -679,7 +678,7 @@ impl Database {
 
         drop(header);
 
-        let flags = self.open_flags.get();
+        let flags = self.open_flags;
 
         // Always Open shared wal and set it in the Database and Pager.
         // MVCC currently requires a WAL open to function
@@ -780,7 +779,7 @@ impl Database {
     }
 
     pub fn is_readonly(&self) -> bool {
-        self.open_flags.get().contains(OpenFlags::ReadOnly)
+        self.open_flags.contains(OpenFlags::ReadOnly)
     }
 
     /// If we do not have a physical WAL file, but we know the database file is initialized on disk,
@@ -2364,10 +2363,9 @@ impl Connection {
             Arc::new(PlatformIO::new()?)
         };
         // FIXME: for now, only support read only attach
-        let main_db_flags = self.db.open_flags.get() | OpenFlags::ReadOnly;
+        let main_db_flags = self.db.open_flags | OpenFlags::ReadOnly;
         let db = Self::from_uri_attached(path, db_opts, main_db_flags, io)?;
         let pager = Arc::new(db.init_pager(None)?);
-        db.open_flags.set(OpenFlags::ReadOnly);
         self.attached_databases.write().insert(alias, (db, pager));
 
         Ok(())
