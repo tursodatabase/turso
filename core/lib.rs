@@ -1285,8 +1285,6 @@ pub struct Connection {
 
 // SAFETY: This needs to be audited for thread safety.
 // See: https://github.com/tursodatabase/turso/issues/1552
-unsafe impl Send for Connection {}
-unsafe impl Sync for Connection {}
 crate::assert::assert_send_sync!(Connection);
 
 impl Drop for Connection {
