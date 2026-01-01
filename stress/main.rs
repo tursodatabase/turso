@@ -587,7 +587,8 @@ pub fn init_tracing() -> Result<(WorkerGuard, LogLevelReloadHandle), std::io::Er
                 .with_writer(non_blocking)
                 .with_ansi(false)
                 .with_line_number(true)
-                .with_thread_ids(true),
+                .with_thread_ids(true)
+                .json(),
         )
         .try_init()
     {
