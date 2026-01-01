@@ -1,4 +1,4 @@
-use crate::{Error, Result, Statement, Value};
+use crate::{assert_send_sync, Error, Result, Statement, Value};
 use std::fmt::Debug;
 use std::future::Future;
 
@@ -29,7 +29,7 @@ impl Rows {
             }
         }
 
-        unsafe impl Send for Next {}
+        assert_send_sync!(Next);
 
         let next = Next {
             columns: self.inner.inner.lock().unwrap().column_count(),
