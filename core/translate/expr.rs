@@ -2372,18 +2372,20 @@ pub fn translate_expr(
             database: _,
             table: table_ref_id,
         } => {
-            let (index, use_covering_index) = {
-                if let Some(table_reference) = referenced_tables
-                    .unwrap()
-                    .find_joined_table_by_internal_id(*table_ref_id)
-                {
-                    (
-                        table_reference.op.index(),
-                        table_reference.utilizes_covering_index(),
-                    )
-                } else {
-                    (None, false)
-                }
+            // When a cursor override is active, always read rowid from the override cursor.
+            let has_cursor_override = program.has_cursor_override(*table_ref_id);
+            let (index, use_covering_index) = if has_cursor_override {
+                (None, false)
+            } else if let Some(table_reference) = referenced_tables
+                .unwrap()
+                .find_joined_table_by_internal_id(*table_ref_id)
+            {
+                (
+                    table_reference.op.index(),
+                    table_reference.utilizes_covering_index(),
+                )
+            } else {
+                (None, false)
             };
 
             if use_covering_index {

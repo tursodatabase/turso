@@ -27,8 +27,8 @@ use crate::function::Func;
 use crate::schema::{BTreeTable, Column, Index, IndexColumn, Schema, Table, ROWID_SENTINEL};
 use crate::translate::compound_select::emit_program_for_compound_select;
 use crate::translate::expr::{
-    bind_and_rewrite_expr, emit_returning_results, translate_expr_no_constant_opt, walk_expr,
-    walk_expr_mut, BindingBehavior, NoConstantOptReason, WalkControl,
+    bind_and_rewrite_expr, emit_returning_results, translate_expr_no_constant_opt, walk_expr_mut,
+    BindingBehavior, NoConstantOptReason, WalkControl,
 };
 use crate::translate::fkeys::{
     build_index_affinity_string, emit_fk_child_update_counters, emit_fk_update_parent_actions,
@@ -126,9 +126,7 @@ pub enum MaterializedColumnRef {
         is_rowid_alias: bool,
     },
     /// The implicit rowid (or integer primary key) of a specific table.
-    RowId {
-        table_id: TableInternalId,
-    },
+    RowId { table_id: TableInternalId },
 }
 
 /// Describes how a hash-join build input was materialized.
@@ -386,9 +384,17 @@ struct MaterializationSpec {
 
 /// Build materialized hash-build inputs for hash joins that depend on prior joins.
 ///
-/// This precomputes filtered build rows into ephemeral tables so hash joins
-/// can safely respect earlier join constraints. When probe->build chaining is
-/// required, we store join keys and payload columns to avoid `SeekRowid`.
+/// A materialized build input is an ephemeral table that captures the rows
+/// a hash join is allowed to build from after earlier joins and filters have
+/// been applied. This prevents the build side from being re-scanned in its
+/// full, unfiltered form when prior join constraints must be respected.
+///
+/// The materialization uses a join-prefix: all tables that appear before the
+/// probe table in the join order, plus the build table itself. This prefix
+/// represents the minimal context needed to evaluate build-side constraints.
+/// For probe->build chaining we store join keys and payload columns directly
+/// in the ephemeral table; otherwise we only store rowids and `SeekRowid`
+/// during probing when needed.
 fn emit_materialized_build_inputs(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
@@ -412,6 +418,8 @@ fn emit_materialized_build_inputs(
     }
 
     let mut seen_build_tables: HashSet<usize> = HashSet::new();
+
+    // decide per-hash-join materialization mode (rowid-only vs key+payload).
     for member in plan.join_order.iter() {
         let table = &plan.table_references.joined_tables()[member.original_idx];
         if let Operation::HashJoin(hash_join_op) = &table.op {
@@ -436,6 +444,7 @@ fn emit_materialized_build_inputs(
             });
 
             if build_table_was_prior_probe {
+                // Prior probe -> build chaining requires keys+payload so we don't SeekRowid.
                 let (_, included_tables) =
                     materialization_prefix(plan, hash_join_op.build_table_idx, probe_table_idx)?;
                 let payload_columns = collect_materialized_payload_columns(plan, &included_tables)?;
@@ -457,6 +466,7 @@ fn emit_materialized_build_inputs(
                     payload_columns,
                 });
             } else {
+                // Otherwise a rowid list is enough to preserve build-side filters.
                 materializations.push(MaterializationSpec {
                     build_table_idx: hash_join_op.build_table_idx,
                     probe_table_idx,
@@ -469,6 +479,7 @@ fn emit_materialized_build_inputs(
         }
     }
 
+    // Now we emit each of the materialization subplans into an ephemeral table.
     for spec in materializations.iter() {
         let build_table = &plan.table_references.joined_tables()[spec.build_table_idx];
         let build_table_name = if build_table.table.get_name() == build_table.identifier {
@@ -500,6 +511,7 @@ fn emit_materialized_build_inputs(
             foreign_keys: vec![],
         });
         let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(ephemeral_table.clone()));
+
         // Build a plan that emits only rowids for the build table using the join prefix
         // that makes the hash join legal (including any earlier hash joins).
         let materialize_plan = build_materialized_build_input_plan(
@@ -546,9 +558,11 @@ fn emit_materialized_build_inputs(
         );
     }
 
+    // Drop any join-prefix tables already captured by key+payload materializations.
     prune_join_order_for_materialized_inputs(plan, &build_inputs)?;
 
-    debug_assert!(
+    #[cfg(debug_assertions)]
+    turso_assert!(
         {
             let join_order_tables: HashSet<_> = plan
                 .join_order
@@ -582,7 +596,6 @@ fn emit_materialized_build_inputs(
         },
         "materialized build input prefix table still present in join order"
     );
-
     Ok(build_inputs)
 }
 
@@ -637,7 +650,6 @@ fn prune_join_order_for_materialized_inputs(
     }
     plan.join_order
         .retain(|member| !tables_to_remove.contains(&member.original_idx));
-
     Ok(())
 }
 
@@ -706,9 +718,9 @@ fn materialization_prefix(
 
 /// Collect the payload columns needed for a materialized build input.
 ///
-/// This gathers referenced columns (and rowids when required) from the
-/// included tables so probe-side expression evaluation can be satisfied
-/// from payload registers without seeking into base tables.
+/// This gathers referenced columns from the included tables and always adds
+/// rowids for tables that have them so probe-side expressions can be satisfied
+/// without seeking back into base tables.
 fn collect_materialized_payload_columns(
     plan: &SelectPlan,
     included_tables: &[usize],
@@ -731,7 +743,7 @@ fn collect_materialized_payload_columns(
                 payload_columns.push(col_ref);
             }
         }
-        if table_rowid_used(plan, table.internal_id)? {
+        if table.btree().is_some_and(|btree| btree.has_rowid) {
             let rowid_ref = MaterializedColumnRef::RowId {
                 table_id: table.internal_id,
             };
@@ -741,95 +753,6 @@ fn collect_materialized_payload_columns(
         }
     }
     Ok(payload_columns)
-}
-
-/// Returns true if `expr` references the rowid of `table_id`.
-fn expr_uses_rowid(expr: &Expr, table_id: TableInternalId) -> Result<bool> {
-    let mut used = false;
-    let mut check_expr = |expr: &Expr| -> Result<WalkControl> {
-        if used {
-            return Ok(WalkControl::SkipChildren);
-        }
-        if let Expr::RowId { table, .. } = expr {
-            if *table == table_id {
-                used = true;
-                return Ok(WalkControl::SkipChildren);
-            }
-        }
-        Ok(WalkControl::Continue)
-    };
-    walk_expr(expr, &mut check_expr)?;
-    Ok(used)
-}
-
-/// Returns true if any part of the plan references the rowid of `table_id`.
-///
-/// This scans result columns, predicates, ordering, grouping, aggregates,
-/// window clauses, and limit/offset expressions.
-fn table_rowid_used(plan: &SelectPlan, table_id: TableInternalId) -> Result<bool> {
-    for rc in plan.result_columns.iter() {
-        if expr_uses_rowid(&rc.expr, table_id)? {
-            return Ok(true);
-        }
-    }
-    for term in plan.where_clause.iter() {
-        if expr_uses_rowid(&term.expr, table_id)? {
-            return Ok(true);
-        }
-    }
-    for (expr, _) in plan.order_by.iter() {
-        if expr_uses_rowid(expr, table_id)? {
-            return Ok(true);
-        }
-    }
-    if let Some(group_by) = &plan.group_by {
-        for expr in group_by.exprs.iter() {
-            if expr_uses_rowid(expr, table_id)? {
-                return Ok(true);
-            }
-        }
-        if let Some(having) = group_by.having.as_ref() {
-            for expr in having.iter() {
-                if expr_uses_rowid(expr, table_id)? {
-                    return Ok(true);
-                }
-            }
-        }
-    }
-    for agg in plan.aggregates.iter() {
-        if expr_uses_rowid(&agg.original_expr, table_id)? {
-            return Ok(true);
-        }
-    }
-    if let Some(window) = &plan.window {
-        for expr in window.partition_by.iter() {
-            if expr_uses_rowid(expr, table_id)? {
-                return Ok(true);
-            }
-        }
-        for (expr, _) in window.order_by.iter() {
-            if expr_uses_rowid(expr, table_id)? {
-                return Ok(true);
-            }
-        }
-        for func in window.functions.iter() {
-            if expr_uses_rowid(&func.original_expr, table_id)? {
-                return Ok(true);
-            }
-        }
-    }
-    if let Some(limit) = plan.limit.as_ref() {
-        if expr_uses_rowid(limit, table_id)? {
-            return Ok(true);
-        }
-    }
-    if let Some(offset) = plan.offset.as_ref() {
-        if expr_uses_rowid(offset, table_id)? {
-            return Ok(true);
-        }
-    }
-
-    Ok(false)
 }
 
 /// Build the ephemeral-table schema for key+payload materializations.

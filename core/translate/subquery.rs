@@ -553,7 +553,19 @@ pub fn emit_from_clause_subqueries(
                         index_method.definition().method_name
                     )
                 }
-                Operation::HashJoin(_) => "HASH JOIN".to_string(),
+                Operation::HashJoin(_) => {
+                    let table_name =
+                        if table_reference.table.get_name() == table_reference.identifier {
+                            table_reference.identifier.clone()
+                        } else {
+                            format!(
+                                "{} AS {}",
+                                table_reference.table.get_name(),
+                                table_reference.identifier
+                            )
+                        };
+                    format!("HASH JOIN {table_name}")
+                }
             }
         );
 
