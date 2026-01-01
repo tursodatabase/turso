@@ -758,7 +758,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         }
 
-        let nr_iterations = plan.nr_iterations;
+        let nr_queries = plan.queries_per_thread[thread].len();
         let db = db.clone();
         let vfs_for_task = vfs_option.clone();
 
@@ -770,7 +770,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             conn.execute("PRAGMA data_sync_retry = 1", ()).await?;
 
             println!("\rExecuting queries...");
-            for query_index in 0..nr_iterations {
+            for query_index in 0..nr_queries {
                 if gen_bool(0.0) {
                     // disabled
                     if opts.verbose {
@@ -802,7 +802,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     } else if query_index % 100 == 0 {
                         print!(
                             "\r{:.2} %",
-                            (query_index as f64 / nr_iterations as f64 * 100.0)
+                            (query_index as f64 / nr_queries as f64 * 100.0)
                         );
                         std::io::stdout().flush().unwrap();
                     }
