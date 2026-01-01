@@ -801,6 +801,8 @@ pub struct HashTable {
     loaded_partitions_mem: usize,
 }
 
+crate::assert::assert_send!(HashTable);
+
 enum SpillAction {
     AlreadyLoaded,
     NeedsParsing,
