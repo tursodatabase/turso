@@ -722,7 +722,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let vfs_option = opts.vfs.clone();
 
-    for thread in 0..opts.nr_threads {
+    for thread in 0..plan.nr_threads {
         let db_file = db_file.clone();
         let mut builder = Builder::new_local(&db_file);
         if let Some(ref vfs) = vfs_option {
