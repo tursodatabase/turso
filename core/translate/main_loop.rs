@@ -36,7 +36,10 @@ use crate::{
     types::SeekOp,
     vdbe::{
         affinity::{self, Affinity},
-        builder::{CursorKey, CursorType, HashBuildSignature, ProgramBuilder},
+        builder::{
+            CursorKey, CursorType, HashBuildSignature, MaterializedBuildInputModeTag,
+            ProgramBuilder,
+        },
         insn::{to_u16, CmpInsFlags, HashBuildData, IdxInsertFlags, Insn},
         BranchOffset, CursorID,
     },
@@ -612,10 +615,14 @@ fn emit_hash_build_phase(
         .collect::<Vec<_>>();
     let signature = HashBuildSignature {
         join_key_indices,
-        payload_columns: payload_signature_columns.clone(),
+        payload_refs: payload_columns.clone(),
         key_affinities: key_affinities.clone(),
         use_bloom_filter,
         materialized_input_cursor: materialized_cursor_id,
+        materialized_mode: materialized_input.as_ref().map(|input| match input.mode {
+            MaterializedBuildInputMode::RowidOnly => MaterializedBuildInputModeTag::RowidOnly,
+            MaterializedBuildInputMode::KeyPayload { .. } => MaterializedBuildInputModeTag::Payload,
+        }),
     };
     if program.hash_build_signature_matches(hash_table_id, &signature) {
         return Ok(HashBuildPayloadInfo {
