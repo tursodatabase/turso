@@ -568,8 +568,9 @@ fn emit_hash_build_phase(
                     *payload_num_keys == num_keys,
                     "materialized hash build input key count mismatch"
                 );
-                let payload_signature_columns =
-                    (0..payload_columns.len()).map(|i| *payload_num_keys + i).collect();
+                let payload_signature_columns = (0..payload_columns.len())
+                    .map(|i| *payload_num_keys + i)
+                    .collect();
                 (
                     payload_columns.clone(),
                     payload_signature_columns,
@@ -730,11 +731,7 @@ fn emit_hash_build_phase(
 
     if use_materialized_keys {
         for idx in 0..num_keys {
-            program.emit_column_or_rowid(
-                key_source_cursor_id,
-                idx,
-                build_key_start_reg + idx,
-            );
+            program.emit_column_or_rowid(key_source_cursor_id, idx, build_key_start_reg + idx);
         }
     } else {
         for (idx, join_key) in hash_join_op.join_keys.iter().enumerate() {
@@ -1275,12 +1272,13 @@ pub fn open_loop(
                                     is_rowid_alias: *is_rowid_alias,
                                 },
                             ),
-                            MaterializedColumnRef::RowId { table_id } => {
-                                (*table_id, Expr::RowId {
+                            MaterializedColumnRef::RowId { table_id } => (
+                                *table_id,
+                                Expr::RowId {
                                     database: None,
                                     table: *table_id,
-                                })
-                            }
+                                },
+                            ),
                         };
                         if live_table_ids.contains(&payload_table_id) {
                             continue;
@@ -1341,7 +1339,7 @@ pub fn open_loop(
 
         for subquery in subqueries.iter_mut().filter(|s| !s.has_been_evaluated()) {
             assert!(subquery.correlated, "subquery must be correlated");
-            let eval_at = subquery.get_eval_at(join_order)?;
+            let eval_at = subquery.get_eval_at(join_order, Some(table_references))?;
 
             if eval_at != EvalAt::Loop(join_index) {
                 continue;
@@ -1389,6 +1387,10 @@ pub fn open_loop(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Emits WHERE/ON predicates that must be evaluated at the current join loop.
+///
+/// This centralizes the "should this predicate run now?" logic and supports
+/// optional skipping when predicates are pre-applied (e.g., probe-side filters).
 fn emit_conditions(
     program: &mut ProgramBuilder,
     t_ctx: &&mut TranslateCtx,

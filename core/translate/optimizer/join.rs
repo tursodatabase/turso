@@ -469,8 +469,8 @@ pub fn join_lhs_and_rhs<'a>(
                         (*build_base_rows) * build_self_selectivity * prior_constraint_selectivity;
 
                     // Hard cap: avoid materializing huge lists when materialization is required.
-                    let materialization_too_large =
-                        needs_materialization && estimated_filtered_rows > MAX_MATERIALIZED_BUILD_ROWS;
+                    let materialization_too_large = needs_materialization
+                        && estimated_filtered_rows > MAX_MATERIALIZED_BUILD_ROWS;
                     let can_materialize =
                         build_has_indexable_prior_constraints(lhs_constraints, &prior_mask);
                     let selectivity_threshold = if probe_multiplier > 1.0 {

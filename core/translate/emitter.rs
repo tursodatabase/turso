@@ -89,10 +89,15 @@ impl<'a> Resolver<'a> {
         self.expr_to_reg_cache_enabled = true;
     }
 
+    /// Returns the register for a previously translated expression, if caching is enabled.
+    ///
+    /// We scan from newest to oldest so later translations win when equivalent
+    /// expressions are seen multiple times in the same translation pass.
     pub fn resolve_cached_expr_reg(&self, expr: &ast::Expr) -> Option<usize> {
         if self.expr_to_reg_cache_enabled {
             self.expr_to_reg_cache
                 .iter()
+                .rev()
                 .find(|(e, _)| exprs_are_equivalent(expr, e))
                 .map(|(_, reg)| *reg)
         } else {
@@ -932,7 +937,7 @@ pub fn emit_query<'a>(
         .iter_mut()
         .filter(|s| !s.has_been_evaluated())
     {
-        let eval_at = subquery.get_eval_at(&plan.join_order)?;
+        let eval_at = subquery.get_eval_at(&plan.join_order, Some(&plan.table_references))?;
         if eval_at != EvalAt::BeforeLoop {
             continue;
         }
