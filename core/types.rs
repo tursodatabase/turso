@@ -2836,6 +2836,100 @@ mod tests {
     use super::*;
     use crate::translate::collate::CollationSeq;
 
+    #[test]
+    fn test_value_iterator_simple() {
+        let mut buf = Vec::new();
+        let record = Record::new(vec![Value::Integer(42), Value::Text(Text::new("hello"))]);
+        record.serialize(&mut buf);
+
+        let iter = ValueIterator::new(&buf).unwrap();
+        assert!(!iter.is_empty());
+        assert_eq!(iter.clone().count(), 2);
+
+        let mut iter = ValueIterator::new(&buf).unwrap();
+
+        let val = iter.next().unwrap().unwrap();
+        assert_eq!(val, ValueRef::Integer(42));
+
+        let val = iter.next().unwrap().unwrap();
+        assert_eq!(
+            val,
+            ValueRef::Text(TextRef::new("hello", TextSubtype::Text))
+        );
+
+        assert!(iter.next().is_none());
+    }
+
+    #[test]
+    fn test_value_iterator_nulls() {
+        let mut buf = Vec::new();
+        let record = Record::new(vec![Value::Null, Value::Null, Value::Null]);
+        record.serialize(&mut buf);
+
+        let iter = ValueIterator::new(&buf).unwrap();
+
+        for val in iter {
+            assert_eq!(val.unwrap(), ValueRef::Null);
+        }
+    }
+
+    #[test]
+    fn test_value_iterator_mixed_types() {
+        let mut buf = Vec::new();
+        let record = Record::new(vec![
+            Value::Null,
+            Value::Integer(100),
+            Value::Float(3.14),
+            Value::Text(Text::new("test")),
+            Value::Blob(vec![1, 2, 3]),
+            Value::Integer(0),
+            Value::Integer(1),
+        ]);
+        record.serialize(&mut buf);
+
+        let iter = ValueIterator::new(&buf).unwrap();
+        let values: Vec<_> = iter.collect::<Result<Vec<_>>>().unwrap();
+
+        assert_eq!(values[0], ValueRef::Null);
+        assert_eq!(values[1], ValueRef::Integer(100));
+        assert_eq!(values[2], ValueRef::Float(3.14));
+        assert_eq!(
+            values[3],
+            ValueRef::Text(TextRef::new("test", TextSubtype::Text))
+        );
+        assert_eq!(values[4], ValueRef::Blob(&[1, 2, 3]));
+        assert_eq!(values[5], ValueRef::Integer(0));
+        assert_eq!(values[6], ValueRef::Integer(1));
+    }
+
+    #[test]
+    fn test_value_iterator_large_record() {
+        let mut buf = Vec::new();
+        let values: Vec<Value> = (0..20).map(|i| Value::Integer(i as i64)).collect();
+        let record = Record::new(values);
+        record.serialize(&mut buf);
+
+        let iter = ValueIterator::new(&buf).unwrap();
+        assert_eq!(iter.count(), 20);
+
+        let iter = ValueIterator::new(&buf).unwrap();
+        for (i, val) in iter.enumerate() {
+            assert_eq!(val.unwrap(), ValueRef::Integer(i as i64));
+        }
+    }
+
+    #[test]
+    fn test_value_iterator_zero_allocation() {
+        let mut buf = Vec::new();
+        let values: Vec<Value> = (0..5).map(|i| Value::Integer(i as i64)).collect();
+        let record = Record::new(values);
+        record.serialize(&mut buf);
+
+        let mut iter = ValueIterator::new(&buf).unwrap();
+        let _ = iter.next();
+        let _ = iter.next();
+    }
+
     pub fn compare_immutable_for_testing(
         l: &[ValueRef],
         r: &[ValueRef],
