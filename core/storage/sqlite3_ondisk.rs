@@ -1643,24 +1643,18 @@ pub fn read_varint(buf: &[u8]) -> Result<(u64, usize)> {
     }
 }
 
+// This is a branchless function to compute the length of a varint encoding for a given u64 value.
+#[inline(always)]
 pub fn varint_len(value: u64) -> usize {
-    if value <= 0x7f {
-        return 1;
-    }
-    if value <= 0x3fff {
-        return 2;
-    }
-    if (value & ((0xff000000_u64) << 32)) > 0 {
-        return 9;
-    }
+    // Number of bits required to represent value.
+    // leading_zeros returns the count of leading zero bits; subtract from 64.
+    let bits = 64 - value.leading_zeros() as usize;
 
-    let mut bytes = value;
-    let mut n = 0;
-    while bytes != 0 {
-        bytes >>= 7;
-        n += 1;
-    }
-    n
+    // Each varint byte stores 7 bits of payload.
+    // (bits + 6) / 7 is the ceiling of bits / 7.
+    let len = bits.div_ceil(7);
+
+    len.max(1)
 }
 
 pub fn write_varint(buf: &mut [u8], value: u64) -> usize {
