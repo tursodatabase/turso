@@ -1,3 +1,4 @@
+use branches::mark_unlikely;
 use turso_parser::ast::SortOrder;
 
 use bumpalo::Bump;
@@ -9,14 +10,14 @@ use std::rc::Rc;
 use std::sync::{atomic, Arc};
 
 use crate::io::TempFile;
-use crate::types::IOCompletions;
+use crate::types::{IOCompletions, ValueIterator};
 use crate::{
     error::LimboError,
     io::{Buffer, Completion, CompletionGroup, File, IO},
     storage::sqlite3_ondisk::{read_varint, varint_len, write_varint},
     translate::collate::CollationSeq,
     turso_assert,
-    types::{IOResult, ImmutableRecord, KeyInfo, RecordCursor, ValueRef},
+    types::{IOResult, ImmutableRecord, KeyInfo, ValueRef},
     Result,
 };
 use crate::{io_yield_one, return_if_io, CompletionError};
@@ -722,16 +723,16 @@ impl ArenaSortableRecord {
     ) -> Result<Self> {
         let payload = arena.alloc_slice_copy(record.get_payload());
 
-        let mut cursor = RecordCursor::with_capacity(key_len);
-        cursor.ensure_parsed_upto_payload(payload, key_len - 1)?;
-        turso_assert!(
-            index_key_info.len() >= cursor.serials_offsets.len(),
-            "index_key_info.len() < cursor.serials_offsets.len()"
-        );
+        let mut payload_iter = ValueIterator::new(payload)?;
 
-        let mut key_values = bumpalo::collections::Vec::with_capacity_in(key_len, arena);
-        for i in 0..key_len {
-            let value = cursor.deserialize_column_payload(payload, i)?;
+        let mut key_values =
+            bumpalo::collections::Vec::with_capacity_in(payload_iter.clone().count(), arena);
+        for _ in 0..key_len {
+            let value = match payload_iter.next() {
+                Some(Ok(v)) => v,
+                Some(Err(e)) => return Err(e),
+                None => crate::bail_corrupt_error!("Not enough columns in record"),
+            };
             // SAFETY: value borrows from payload which is in the arena and outlives this struct.
             let value: ValueRef<'static> = unsafe { std::mem::transmute(value) };
             key_values.push(value);
@@ -824,25 +825,27 @@ impl BoxedSortableRecord {
         key_len: usize,
         index_key_info: Rc<Vec<KeyInfo>>,
     ) -> Result<Self> {
-        let mut cursor = RecordCursor::with_capacity(key_len);
-        cursor.ensure_parsed_upto(&record, key_len - 1)?;
-        turso_assert!(
-            index_key_info.len() >= cursor.serials_offsets.len(),
-            "index_key_info.len() < cursor.serials_offsets.len()"
-        );
-
+        let mut value_iterator = record.iter()?;
         let mut key_values = Vec::with_capacity(key_len);
         let mut deserialization_error = None;
 
-        for i in 0..key_len {
-            match cursor.deserialize_column(&record, i) {
-                Ok(value) => {
+        for _ in 0..key_len {
+            match value_iterator.next() {
+                Some(Ok(value)) => {
                     // SAFETY: value points into record which lives as long as this struct
                     let value: ValueRef<'static> = unsafe { std::mem::transmute(value) };
                     key_values.push(value);
                 }
-                Err(err) => {
+                Some(Err(err)) => {
+                    mark_unlikely();
                     deserialization_error = Some(err);
+                    break;
+                }
+                None => {
+                    mark_unlikely();
+                    deserialization_error = Some(LimboError::Corrupt(
+                        "Not enough columns in record".to_string(),
+                    ));
                     break;
                 }
             }
@@ -979,7 +982,7 @@ mod tests {
             for i in 0..num_records {
                 assert!(sorter.has_more());
                 let record = sorter.record().unwrap();
-                assert_eq!(record.get_values()[0], ValueRef::Integer(i));
+                assert_eq!(record.get_values().unwrap()[0], ValueRef::Integer(i));
                 // Check that the record remained unchanged after sorting.
                 assert_eq!(record, &initial_records[(num_records - i - 1) as usize]);
 
