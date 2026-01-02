@@ -988,10 +988,18 @@ pub fn begin_read_page(
             return;
         };
         let buf_len = buf.len();
-        turso_assert!(
-            (allow_empty_read && bytes_read == 0) || bytes_read == buf_len as i32,
-            "read({bytes_read}) != expected({buf_len})"
-        );
+        // Handle truncated database files: if we read fewer bytes than expected
+        // (and it's not an intentional empty read), the database is corrupt.
+        if bytes_read == 0 {
+            if !allow_empty_read {
+                turso_assert!(false, "read returned 0 bytes but empty reads are not allowed");
+            }
+        } else if bytes_read != buf_len as i32 {
+            panic!(
+                "database disk image is malformed: read {} bytes but expected {}",
+                bytes_read, buf_len
+            );
+        }
         let page = page.clone();
         if bytes_read == 0 {
             buf = Arc::new(Buffer::new_temporary(0));
