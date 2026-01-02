@@ -35,7 +35,6 @@ pub fn emit_select_result(
 
     let start_reg = reg_result_cols_start;
 
-
     let skip_column_eval = matches!(
         plan.query_destination,
         QueryDestination::ExistsSubqueryResult { .. }
@@ -62,7 +61,6 @@ pub fn emit_select_result(
             )?;
         }
     }
-
 
     // Handle SELECT DISTINCT deduplication
     if let Distinctness::Distinct { ctx } = &plan.distinctness {

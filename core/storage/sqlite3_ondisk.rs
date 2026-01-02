@@ -904,13 +904,17 @@ impl PageContent {
             ]);
             // SAFETY: valid as long as page is alive
             let slice = unsafe {
-                std::mem::transmute::<&[u8], &'static [u8]>(&buf[payload_start..payload_start + local_size - 4])
+                std::mem::transmute::<&[u8], &'static [u8]>(
+                    &buf[payload_start..payload_start + local_size - 4],
+                )
             };
             (slice, Some(first_overflow_page))
         } else {
             // SAFETY: valid as long as page is alive
             let slice = unsafe {
-                std::mem::transmute::<&[u8], &'static [u8]>(&buf[payload_start..payload_start + payload_size as usize])
+                std::mem::transmute::<&[u8], &'static [u8]>(
+                    &buf[payload_start..payload_start + payload_size as usize],
+                )
             };
             (slice, None)
         };

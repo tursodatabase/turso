@@ -155,7 +155,6 @@ fn find_best_access_method_for_btree(
             base_row_count,
         );
 
-
         // All other things being equal, prefer an access method that satisfies the order target.
         let (iter_dir, order_satisfiability_bonus) = if let Some(order_target) = maybe_order_target
         {

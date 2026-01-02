@@ -67,8 +67,6 @@ pub fn estimate_cost_for_scan_or_seek(
     let base_row_count = *base_row_count;
 
     let Some(index_info) = index_info else {
-
-
         if has_real_stats {
             // With real stats, account for caching on small tables
             let table_pages = (base_row_count / ESTIMATED_HARDCODED_ROWS_PER_PAGE as f64).max(1.0);

@@ -3396,7 +3396,8 @@ pub fn seek_internal(
                             let start_reg = *start_reg;
                             let num_regs = *num_regs;
                             #[cfg(debug_assertions)]
-                            let snapshot: Vec<crate::Value> = state.registers[start_reg..start_reg + num_regs]
+                            let snapshot: Vec<crate::Value> = state.registers
+                                [start_reg..start_reg + num_regs]
                                 .iter()
                                 .map(|r| r.get_value().to_owned())
                                 .collect();
@@ -3408,7 +3409,8 @@ pub fn seek_internal(
 
                             #[cfg(debug_assertions)] // better todo and should this be in prod?
                             {
-                                for (i, (current, original)) in state.registers[start_reg..start_reg + num_regs]
+                                for (i, (current, original)) in state.registers
+                                    [start_reg..start_reg + num_regs]
                                     .iter()
                                     .zip(snapshot.iter())
                                     .enumerate()

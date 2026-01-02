@@ -7,8 +7,8 @@ use super::{
     display::PlanContext,
     emitter::{OperationMode, TranslateCtx, UpdateRowSource},
     expr::{
-        translate_condition_expr, translate_expr, translate_expr_no_constant_opt,
-        walk_expr, ConditionMetadata, NoConstantOptReason, WalkControl,
+        translate_condition_expr, translate_expr, translate_expr_no_constant_opt, walk_expr,
+        ConditionMetadata, NoConstantOptReason, WalkControl,
     },
     group_by::{group_by_agg_phase, GroupByMetadata, GroupByRowSource},
     optimizer::Optimizable,
@@ -618,8 +618,6 @@ fn emit_hash_build_phase(
     Ok(payload_info)
 }
 
-
-
 /// Set up the main query execution loop
 /// For example in the case of a nested table scan, this means emitting the Rewind instruction
 /// for all tables involved, outermost first.
@@ -1120,7 +1118,6 @@ pub fn open_loop(
             SubqueryRefFilter::WithSubqueryRefs,
         )?;
     }
-
 
     if subqueries.iter().any(|s| !s.has_been_evaluated()) {
         crate::bail_parse_error!(

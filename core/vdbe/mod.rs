@@ -1420,7 +1420,11 @@ impl Program {
     }
 }
 
-pub(crate) fn make_record(registers: &[Register], start_reg: &usize, count: &usize) -> ImmutableRecord {
+pub(crate) fn make_record(
+    registers: &[Register],
+    start_reg: &usize,
+    count: &usize,
+) -> ImmutableRecord {
     let regs = &registers[*start_reg..*start_reg + *count];
     ImmutableRecord::from_registers(regs, regs.len())
 }
