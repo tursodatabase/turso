@@ -847,7 +847,6 @@ pub fn insn_to_row(
             Insn::DeferredSeek {
                 index_cursor_id,
                 table_cursor_id,
-                column_mapping: _,
             } => (
                 "DeferredSeek",
                 *index_cursor_id as i64,

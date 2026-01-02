@@ -650,7 +650,6 @@ pub enum Insn {
     DeferredSeek {
         index_cursor_id: CursorID,
         table_cursor_id: CursorID,
-        column_mapping: Option<Arc<Vec<u16>>>,
     },
 
     /// If cursor_id refers to an SQL table (B-Tree that uses integer keys), use the value in start_reg as the key.

@@ -1401,10 +1401,6 @@ pub enum OpColumnState {
         table_cursor_id: usize,
     },
     GetColumn,
-    GetColumnOptimized {
-        cursor_id: usize,
-        column: usize,
-    },
 }
 
 pub fn op_column(
@@ -1425,26 +1421,11 @@ pub fn op_column(
     'outer: loop {
         match state.op_column_state {
             OpColumnState::Start => {
-                if let Some(deferred) = &state.deferred_seeks[*cursor_id] {
-                    if let Some(mapping) = &deferred.column_mapping {
-                        if let Some(&idx_p_1) = mapping.get(*column) {
-                            if idx_p_1 > 0 {
-                                let index_cursor_id = deferred.index_cursor_id;
-                                let index_col_idx = (idx_p_1 - 1) as usize;
-                                tracing::trace!(
-                                    "op_column: optimized redirection to index cursor {} col {}",
-                                    index_cursor_id,
-                                    index_col_idx
-                                );
-                                state.op_column_state = OpColumnState::GetColumnOptimized {
-                                    cursor_id: index_cursor_id,
-                                    column: index_col_idx,
-                                };
-                                continue 'outer;
-                            }
-                        }
-                    }
-                    let deferred = state.deferred_seeks[*cursor_id].take().unwrap();
+                // Column_mapping redirection is no longer needed - the planner now emits
+                // Column instructions directly on the correct cursor (index or table).
+                // DeferredSeek is only used when we need to read a column NOT in the index,
+                // which requires seeking the table cursor first.
+                if let Some(deferred) = state.deferred_seeks[*cursor_id].take() {
                     state.op_column_state = OpColumnState::Rowid {
                         index_cursor_id: deferred.index_cursor_id,
                         table_cursor_id: deferred.table_cursor_id,
@@ -1497,11 +1478,8 @@ pub fn op_column(
                 }
                 state.op_column_state = OpColumnState::GetColumn;
             }
-            OpColumnState::GetColumn | OpColumnState::GetColumnOptimized { .. } => {
-                let (active_cursor_id, active_column) = match state.op_column_state {
-                    OpColumnState::GetColumnOptimized { cursor_id, column } => (cursor_id, column),
-                    _ => (*cursor_id, *column),
-                };
+            OpColumnState::GetColumn => {
+                let (active_cursor_id, active_column) = (*cursor_id, *column);
                 // First check if this is a MaterializedViewCursor
                 {
                     let cursor = state.get_cursor(active_cursor_id);
@@ -3091,14 +3069,12 @@ pub fn op_deferred_seek(
         DeferredSeek {
             index_cursor_id,
             table_cursor_id,
-            column_mapping,
         },
         insn
     );
     state.deferred_seeks[*table_cursor_id] = Some(DeferredSeekState {
         index_cursor_id: *index_cursor_id,
         table_cursor_id: *table_cursor_id,
-        column_mapping: column_mapping.clone(),
     });
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)

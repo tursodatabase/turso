@@ -2311,8 +2311,11 @@ pub fn translate_expr(
                         } else {
                             let read_from_index = if is_from_outer_query_scope {
                                 index_cursor_id.is_some()
+                            } else if let Some(idx) = &index {
+                                // Read from index if this specific column is present,
+                                idx.column_table_pos_to_index_pos(*column).is_some()
                             } else {
-                                use_covering_index
+                                false
                             };
                             let read_cursor = if read_from_index {
                                 index_cursor_id.expect("index cursor should be opened")

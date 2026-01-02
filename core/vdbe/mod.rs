@@ -320,7 +320,6 @@ pub struct OpHashProbeState {
 pub(crate) struct DeferredSeekState {
     pub index_cursor_id: CursorID,
     pub table_cursor_id: CursorID,
-    pub column_mapping: Option<Arc<Vec<u16>>>,
 }
 
 /// The program state describes the environment in which the program executes.
