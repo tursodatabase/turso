@@ -180,7 +180,7 @@ fn test_pragma_collation_list_returns_rows(db: TempDatabase) {
     while let StepResult::Row = rows.step().unwrap() {
         count += 1;
     }
-    assert_eq!(count,3);
+    assert_eq!(count, 3);
 }
 
 #[turso_macros::test(mvcc)]
@@ -199,9 +199,9 @@ fn test_pragma_collation_list_contains_default_collations(db: TempDatabase) {
         let row = rows.row().unwrap();
         if let Value::Text(name) = row.get_value(1) {
             if *default_collations.get(name.as_str()).unwrap() {
-                counter+=1;
+                counter += 1;
             }
         }
     }
-    assert_eq!(counter,3);
+    assert_eq!(counter, 3);
 }
