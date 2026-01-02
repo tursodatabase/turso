@@ -119,7 +119,6 @@ lto = false
 [profile.antithesis]
 inherits = "release"
 debug = true
-debug-assertions = true
 codegen-units = 1
 panic = "abort"
 lto = true
