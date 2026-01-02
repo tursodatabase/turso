@@ -154,37 +154,8 @@ fn find_best_access_method_for_btree(
             },
         };
 
-        // Check if this index delivers rows in ORDER BY order.
-        let is_index_ordered = maybe_order_target.is_some_and(|order_target| {
-            order_target.0.iter().enumerate().all(|(i, target)| {
-                if i >= index_info.column_count {
-                    return false;
-                }
-                let table_matches = target.table_id == table_no;
-                let column_matches = match (&target.target, &candidate.index) {
-                    (ColumnTarget::Column(col_no), Some(index)) => {
-                        index.columns[i].expr.is_none() && index.columns[i].pos_in_table == *col_no
-                    }
-                    (ColumnTarget::Column(col_no), None) => {
-                        rowid_column_idx.is_some_and(|idx| idx == *col_no)
-                    }
-                    _ => false,
-                };
-                table_matches && column_matches
-            }) && !order_target.0.is_empty()
-        });
-
-        let cost = estimate_cost_for_scan_or_seek(
-            Some(index_info),
-            &rhs_constraints.constraints,
-            &usable_constraint_refs,
-            input_cardinality,
-            base_row_count,
-            is_index_ordered,
-        );
-
-        // All other things being equal, prefer an access method that satisfies the order target.
-        let (iter_dir, order_satisfiability_bonus) = if let Some(order_target) = maybe_order_target
+        let (iter_dir, is_index_ordered, order_satisfiability_bonus) = if let Some(order_target) =
+            maybe_order_target
         {
             // If the index delivers rows in the same direction (or the exact reverse direction) as the order target, then it
             // satisfies the order target.
@@ -227,21 +198,34 @@ fn find_best_access_method_for_btree(
                     all_same_direction = false;
                 }
             }
-            if all_same_direction || all_opposite_direction {
+
+            let satisfies_order =
+                (all_same_direction || all_opposite_direction) && !order_target.0.is_empty();
+            if satisfies_order {
                 (
                     if all_same_direction {
                         IterationDirection::Forwards
                     } else {
                         IterationDirection::Backwards
                     },
+                    true,
                     Cost(1.0),
                 )
             } else {
-                (IterationDirection::Forwards, Cost(0.0))
+                (IterationDirection::Forwards, false, Cost(0.0))
             }
         } else {
-            (IterationDirection::Forwards, Cost(0.0))
+            (IterationDirection::Forwards, false, Cost(0.0))
         };
+
+        let cost = estimate_cost_for_scan_or_seek(
+            Some(index_info),
+            &rhs_constraints.constraints,
+            &usable_constraint_refs,
+            input_cardinality,
+            base_row_count,
+            is_index_ordered,
+        );
         if cost < best_cost + order_satisfiability_bonus {
             best_cost = cost;
             best_params = AccessMethodParams::BTreeTable {

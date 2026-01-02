@@ -1421,10 +1421,6 @@ pub fn op_column(
     'outer: loop {
         match state.op_column_state {
             OpColumnState::Start => {
-                // Column_mapping redirection is no longer needed - the planner now emits
-                // Column instructions directly on the correct cursor (index or table).
-                // DeferredSeek is only used when we need to read a column NOT in the index,
-                // which requires seeking the table cursor first.
                 if let Some(deferred) = state.deferred_seeks[*cursor_id].take() {
                     state.op_column_state = OpColumnState::Rowid {
                         index_cursor_id: deferred.index_cursor_id,
