@@ -7,7 +7,9 @@ use crate::storage::{
     buffer_pool::BufferPool,
     database::DatabaseStorage,
     sqlite3_ondisk::{
-        self, parse_wal_frame_header, DatabaseHeader, PageContent, PageSize, PageType,
+        self, parse_wal_frame_header, DatabaseHeader, OverflowCell, PageSize, PageType,
+        CELL_PTR_SIZE_BYTES, INTERIOR_PAGE_HEADER_SIZE_BYTES, LEAF_PAGE_HEADER_SIZE_BYTES,
+        MINIMUM_CELL_SIZE,
     },
     wal::{CheckpointResult, Wal, IOV_MAX},
 };
@@ -28,9 +30,16 @@ use std::sync::atomic::{
 use std::sync::Arc;
 use tracing::{instrument, trace, Level};
 
-use super::btree::btree_init_page;
+use super::btree::offset::{
+    BTREE_CELL_CONTENT_AREA, BTREE_CELL_COUNT, BTREE_FIRST_FREEBLOCK, BTREE_FRAGMENTED_BYTES_COUNT,
+    BTREE_PAGE_TYPE, BTREE_RIGHTMOST_PTR,
+};
+use super::btree::{
+    btree_init_page, payload_overflow_threshold_max, payload_overflow_threshold_min,
+};
 use super::page_cache::{CacheError, CacheResizeResult, PageCache, PageCacheKey, SpillResult};
-use super::sqlite3_ondisk::begin_write_btree_page;
+use super::sqlite3_ondisk::read_varint;
+use super::sqlite3_ondisk::{begin_write_btree_page, read_btree_cell, read_u32, BTreeCell};
 use super::wal::CheckpointMode;
 use crate::storage::encryption::{CipherMode, EncryptionContext, EncryptionKey};
 
@@ -85,8 +94,8 @@ impl HeaderRef {
 
     pub fn borrow(&self) -> &DatabaseHeader {
         // TODO: Instead of erasing mutability, implement `get_mut_contents` and return a shared reference.
-        let content: &PageContent = self.0.get_contents();
-        bytemuck::from_bytes::<DatabaseHeader>(&content.buffer.as_slice()[0..DatabaseHeader::SIZE])
+        let content = self.0.get_contents();
+        bytemuck::from_bytes::<DatabaseHeader>(&content.as_ptr()[0..DatabaseHeader::SIZE])
     }
 }
 
@@ -128,9 +137,7 @@ impl HeaderRefMut {
 
     pub fn borrow_mut(&self) -> &mut DatabaseHeader {
         let content = self.0.get_contents();
-        bytemuck::from_bytes_mut::<DatabaseHeader>(
-            &mut content.buffer.as_mut_slice()[0..DatabaseHeader::SIZE],
-        )
+        bytemuck::from_bytes_mut::<DatabaseHeader>(&mut content.as_ptr()[0..DatabaseHeader::SIZE])
     }
 
     /// Get a reference to the underlying page
@@ -141,7 +148,6 @@ impl HeaderRefMut {
 
 pub struct PageInner {
     pub flags: AtomicUsize,
-    pub contents: Option<PageContent>,
     pub id: usize,
     /// If >0, the page is pinned and not eligible for eviction from the page cache.
     /// The reason this is a counter is that multiple nested code paths may signal that
@@ -155,7 +161,460 @@ pub struct PageInner {
     /// The WAL frame number this page was loaded from (0 if loaded from main DB file)
     /// This tracks which version of the page we have in memory
     pub wal_tag: AtomicU64,
+    /// The position where page content starts. It's 100 for page 1 (database file header is 100 bytes),
+    /// 0 for all other pages.
+    pub offset: usize,
+    /// The actual page data buffer. None if not loaded.
+    pub buffer: Option<Buffer>,
+    /// Overflow cells during btree operations
+    pub overflow_cells: Vec<OverflowCell>,
 }
+
+// Methods moved from PageContent - these provide btree page access
+impl PageInner {
+    /// Creates a new PageInner from an Arc<Buffer> (for backward compatibility).
+    /// The Arc is unwrapped to get ownership of the Buffer, or copied if needed.
+    pub fn new(offset: usize, buffer: Arc<Buffer>) -> Self {
+        // Try to unwrap the Arc, or copy the data if we can't
+        let owned_buffer = Arc::try_unwrap(buffer).unwrap_or_else(|arc| {
+            let new_buf = Buffer::new_temporary(arc.len());
+            new_buf.as_mut_slice().copy_from_slice(arc.as_slice());
+            new_buf
+        });
+        Self {
+            flags: AtomicUsize::new(0),
+            id: 0,
+            pin_count: AtomicUsize::new(0),
+            wal_tag: AtomicU64::new(TAG_UNSET),
+            offset,
+            buffer: Some(owned_buffer),
+            overflow_cells: Vec::new(),
+        }
+    }
+
+    /// Creates a new PageInner with an owned buffer.
+    pub fn from_buffer(offset: usize, buffer: Buffer) -> Self {
+        Self {
+            flags: AtomicUsize::new(0),
+            id: 0,
+            pin_count: AtomicUsize::new(0),
+            wal_tag: AtomicU64::new(TAG_UNSET),
+            offset,
+            buffer: Some(buffer),
+            overflow_cells: Vec::new(),
+        }
+    }
+    /// Get the page buffer as a mutable slice. Panics if buffer not loaded.
+    #[inline]
+    #[allow(clippy::mut_from_ref)]
+    pub fn as_ptr(&self) -> &mut [u8] {
+        self.buffer
+            .as_ref()
+            .expect("buffer not loaded")
+            .as_mut_slice()
+    }
+
+    /// Read a u8 from the page content at the given offset, taking account the possible db header on page 1.
+    #[inline]
+    fn read_u8(&self, pos: usize) -> u8 {
+        let buf = self.as_ptr();
+        buf[self.offset + pos]
+    }
+
+    /// Read a u16 from the page content at the given offset, taking account the possible db header on page 1.
+    #[inline]
+    fn read_u16(&self, pos: usize) -> u16 {
+        let buf = self.as_ptr();
+        u16::from_be_bytes([buf[self.offset + pos], buf[self.offset + pos + 1]])
+    }
+
+    /// Read a u32 from the page content at the given offset, taking account the possible db header on page 1.
+    #[inline]
+    fn read_u32(&self, pos: usize) -> u32 {
+        let buf = self.as_ptr();
+        read_u32(buf, self.offset + pos)
+    }
+
+    /// Write a u8 to the page content at the given offset, taking account the possible db header on page 1.
+    #[inline]
+    fn write_u8(&self, pos: usize, value: u8) {
+        tracing::trace!("write_u8(pos={}, value={})", pos, value);
+        let buf = self.as_ptr();
+        buf[self.offset + pos] = value;
+    }
+
+    /// Write a u16 to the page content at the given offset, taking account the possible db header on page 1.
+    #[inline]
+    fn write_u16(&self, pos: usize, value: u16) {
+        tracing::trace!("write_u16(pos={}, value={})", pos, value);
+        let buf = self.as_ptr();
+        buf[self.offset + pos..self.offset + pos + 2].copy_from_slice(&value.to_be_bytes());
+    }
+
+    /// Write a u32 to the page content at the given offset, taking account the possible db header on page 1.
+    #[inline]
+    fn write_u32(&self, pos: usize, value: u32) {
+        tracing::trace!("write_u32(pos={}, value={})", pos, value);
+        let buf = self.as_ptr();
+        buf[self.offset + pos..self.offset + pos + 4].copy_from_slice(&value.to_be_bytes());
+    }
+
+    #[inline]
+    pub fn page_type(&self) -> PageType {
+        self.read_u8(BTREE_PAGE_TYPE).try_into().unwrap()
+    }
+
+    #[inline]
+    pub fn maybe_page_type(&self) -> Option<PageType> {
+        self.read_u8(0).try_into().ok()
+    }
+
+    /// Read a u16 from the page content at the given absolute offset (no db header offset).
+    #[inline]
+    pub fn read_u16_no_offset(&self, pos: usize) -> u16 {
+        let buf = self.as_ptr();
+        u16::from_be_bytes([buf[pos], buf[pos + 1]])
+    }
+
+    /// Read a u32 from the page content at the given absolute offset (no db header offset).
+    #[inline]
+    pub fn read_u32_no_offset(&self, pos: usize) -> u32 {
+        let buf = self.as_ptr();
+        u32::from_be_bytes([buf[pos], buf[pos + 1], buf[pos + 2], buf[pos + 3]])
+    }
+
+    /// Write a u16 at the given absolute offset (no db header offset).
+    pub fn write_u16_no_offset(&self, pos: usize, value: u16) {
+        tracing::trace!("write_u16_no_offset(pos={}, value={})", pos, value);
+        let buf = self.as_ptr();
+        buf[pos..pos + 2].copy_from_slice(&value.to_be_bytes());
+    }
+
+    /// Write a u32 at the given absolute offset (no db header offset).
+    pub fn write_u32_no_offset(&self, pos: usize, value: u32) {
+        tracing::trace!("write_u32_no_offset(pos={}, value={})", pos, value);
+        let buf = self.as_ptr();
+        buf[pos..pos + 4].copy_from_slice(&value.to_be_bytes());
+    }
+
+    pub fn write_page_type(&self, value: u8) {
+        self.write_u8(BTREE_PAGE_TYPE, value);
+    }
+
+    pub fn write_rightmost_ptr(&self, value: u32) {
+        self.write_u32(BTREE_RIGHTMOST_PTR, value);
+    }
+
+    pub fn write_first_freeblock(&self, value: u16) {
+        self.write_u16(BTREE_FIRST_FREEBLOCK, value);
+    }
+
+    pub fn write_freeblock(&self, offset: u16, size: u16, next_block: Option<u16>) {
+        self.write_freeblock_next_ptr(offset, next_block.unwrap_or(0));
+        self.write_freeblock_size(offset, size);
+    }
+
+    pub fn write_freeblock_size(&self, offset: u16, size: u16) {
+        self.write_u16_no_offset(offset as usize + 2, size);
+    }
+
+    pub fn write_freeblock_next_ptr(&self, offset: u16, next_block: u16) {
+        self.write_u16_no_offset(offset as usize, next_block);
+    }
+
+    pub fn read_freeblock(&self, offset: u16) -> (u16, u16) {
+        (
+            self.read_u16_no_offset(offset as usize),
+            self.read_u16_no_offset(offset as usize + 2),
+        )
+    }
+
+    pub fn write_cell_count(&self, value: u16) {
+        self.write_u16(BTREE_CELL_COUNT, value);
+    }
+
+    pub fn write_cell_content_area(&self, value: usize) {
+        debug_assert!(value <= PageSize::MAX as usize);
+        let value = value as u16;
+        self.write_u16(BTREE_CELL_CONTENT_AREA, value);
+    }
+
+    pub fn write_fragmented_bytes_count(&self, value: u8) {
+        self.write_u8(BTREE_FRAGMENTED_BYTES_COUNT, value);
+    }
+
+    #[inline]
+    pub fn first_freeblock(&self) -> u16 {
+        self.read_u16(BTREE_FIRST_FREEBLOCK)
+    }
+
+    #[inline]
+    pub fn cell_count(&self) -> usize {
+        self.read_u16(BTREE_CELL_COUNT) as usize
+    }
+
+    #[inline]
+    pub fn cell_pointer_array_size(&self) -> usize {
+        self.cell_count() * CELL_PTR_SIZE_BYTES
+    }
+
+    #[inline]
+    pub fn unallocated_region_start(&self) -> usize {
+        let (cell_ptr_array_start, cell_ptr_array_size) = self.cell_pointer_array_offset_and_size();
+        cell_ptr_array_start + cell_ptr_array_size
+    }
+
+    #[inline]
+    pub fn unallocated_region_size(&self) -> usize {
+        self.cell_content_area() as usize - self.unallocated_region_start()
+    }
+
+    #[inline]
+    pub fn cell_content_area(&self) -> u32 {
+        let offset = self.read_u16(BTREE_CELL_CONTENT_AREA);
+        if offset == 0 {
+            PageSize::MAX
+        } else {
+            offset as u32
+        }
+    }
+
+    #[inline]
+    pub fn header_size(&self) -> usize {
+        let is_interior = self.read_u8(BTREE_PAGE_TYPE) <= PageType::TableInterior as u8;
+        (!is_interior as usize) * LEAF_PAGE_HEADER_SIZE_BYTES
+            + (is_interior as usize) * INTERIOR_PAGE_HEADER_SIZE_BYTES
+    }
+
+    #[inline]
+    pub fn num_frag_free_bytes(&self) -> u8 {
+        self.read_u8(BTREE_FRAGMENTED_BYTES_COUNT)
+    }
+
+    #[inline]
+    pub fn rightmost_pointer(&self) -> Option<u32> {
+        match self.page_type() {
+            PageType::IndexInterior | PageType::TableInterior => {
+                Some(self.read_u32(BTREE_RIGHTMOST_PTR))
+            }
+            PageType::IndexLeaf | PageType::TableLeaf => None,
+        }
+    }
+
+    #[inline]
+    pub fn rightmost_pointer_raw(&self) -> Option<*mut u8> {
+        match self.page_type() {
+            PageType::IndexInterior | PageType::TableInterior => Some(unsafe {
+                self.as_ptr()
+                    .as_mut_ptr()
+                    .add(self.offset + BTREE_RIGHTMOST_PTR)
+            }),
+            PageType::IndexLeaf | PageType::TableLeaf => None,
+        }
+    }
+
+    #[inline]
+    pub fn cell_get(&self, idx: usize, usable_size: usize) -> crate::Result<BTreeCell> {
+        tracing::trace!("cell_get(idx={})", idx);
+        let buf = self.as_ptr();
+
+        let ncells = self.cell_count();
+        assert!(
+            idx < ncells,
+            "cell_get: idx out of bounds: idx={idx}, ncells={ncells}"
+        );
+        let cell_pointer_array_start = self.header_size();
+        let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
+        let cell_pointer = self.read_u16(cell_pointer) as usize;
+
+        let static_buf: &'static [u8] = unsafe { std::mem::transmute::<&[u8], &'static [u8]>(buf) };
+        read_btree_cell(static_buf, self, cell_pointer, usable_size)
+    }
+
+    #[inline(always)]
+    pub fn cell_table_interior_read_rowid(&self, idx: usize) -> crate::Result<i64> {
+        debug_assert!(self.page_type() == PageType::TableInterior);
+        let buf = self.as_ptr();
+        let cell_pointer_array_start = self.header_size();
+        let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
+        let cell_pointer = self.read_u16(cell_pointer) as usize;
+        const LEFT_CHILD_PAGE_SIZE_BYTES: usize = 4;
+        let (rowid, _) = read_varint(&buf[cell_pointer + LEFT_CHILD_PAGE_SIZE_BYTES..])?;
+        Ok(rowid as i64)
+    }
+
+    #[inline(always)]
+    pub fn cell_interior_read_left_child_page(&self, idx: usize) -> u32 {
+        debug_assert!(
+            self.page_type() == PageType::TableInterior
+                || self.page_type() == PageType::IndexInterior
+        );
+        let buf = self.as_ptr();
+        let cell_pointer_array_start = self.header_size();
+        let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
+        let cell_pointer = self.read_u16(cell_pointer) as usize;
+        u32::from_be_bytes([
+            buf[cell_pointer],
+            buf[cell_pointer + 1],
+            buf[cell_pointer + 2],
+            buf[cell_pointer + 3],
+        ])
+    }
+
+    #[inline(always)]
+    pub fn cell_table_leaf_read_rowid(&self, idx: usize) -> crate::Result<i64> {
+        debug_assert!(self.page_type() == PageType::TableLeaf);
+        let buf = self.as_ptr();
+        let cell_pointer_array_start = self.header_size();
+        let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
+        let cell_pointer = self.read_u16(cell_pointer) as usize;
+        let mut pos = cell_pointer;
+        let (_, nr) = read_varint(&buf[pos..])?;
+        pos += nr;
+        let (rowid, _) = read_varint(&buf[pos..])?;
+        Ok(rowid as i64)
+    }
+
+    #[inline]
+    pub fn cell_pointer_array_offset_and_size(&self) -> (usize, usize) {
+        (
+            self.cell_pointer_array_offset(),
+            self.cell_pointer_array_size(),
+        )
+    }
+
+    #[inline]
+    pub fn cell_pointer_array_offset(&self) -> usize {
+        self.offset + self.header_size()
+    }
+
+    #[inline]
+    pub fn cell_get_raw_start_offset(&self, idx: usize) -> usize {
+        let cell_pointer_array_start = self.cell_pointer_array_offset();
+        let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
+        self.read_u16_no_offset(cell_pointer) as usize
+    }
+
+    #[inline]
+    pub fn cell_get_raw_region(&self, idx: usize, usable_size: usize) -> (usize, usize) {
+        let page_type = self.page_type();
+        let max_local = payload_overflow_threshold_max(page_type, usable_size);
+        let min_local = payload_overflow_threshold_min(page_type, usable_size);
+        let cell_count = self.cell_count();
+        self._cell_get_raw_region_faster(
+            idx,
+            usable_size,
+            cell_count,
+            max_local,
+            min_local,
+            page_type,
+        )
+    }
+
+    #[inline]
+    pub fn _cell_get_raw_region_faster(
+        &self,
+        idx: usize,
+        usable_size: usize,
+        cell_count: usize,
+        max_local: usize,
+        min_local: usize,
+        page_type: PageType,
+    ) -> (usize, usize) {
+        let buf = self.as_ptr();
+        assert!(idx < cell_count, "cell_get: idx out of bounds");
+        let start = self.cell_get_raw_start_offset(idx);
+        let len = match page_type {
+            PageType::IndexInterior => {
+                let (len_payload, n_payload) = read_varint(&buf[start + 4..]).unwrap();
+                let (overflows, to_read) = sqlite3_ondisk::payload_overflows(
+                    len_payload as usize,
+                    max_local,
+                    min_local,
+                    usable_size,
+                );
+                if overflows {
+                    4 + to_read + n_payload
+                } else {
+                    4 + len_payload as usize + n_payload
+                }
+            }
+            PageType::TableInterior => {
+                let (_, n_rowid) = read_varint(&buf[start + 4..]).unwrap();
+                4 + n_rowid
+            }
+            PageType::IndexLeaf => {
+                let (len_payload, n_payload) = read_varint(&buf[start..]).unwrap();
+                let (overflows, to_read) = sqlite3_ondisk::payload_overflows(
+                    len_payload as usize,
+                    max_local,
+                    min_local,
+                    usable_size,
+                );
+                if overflows {
+                    to_read + n_payload
+                } else {
+                    let mut size = len_payload as usize + n_payload;
+                    if size < MINIMUM_CELL_SIZE {
+                        size = MINIMUM_CELL_SIZE;
+                    }
+                    size
+                }
+            }
+            PageType::TableLeaf => {
+                let (len_payload, n_payload) = read_varint(&buf[start..]).unwrap();
+                let (_, n_rowid) = read_varint(&buf[start + n_payload..]).unwrap();
+                let (overflows, to_read) = sqlite3_ondisk::payload_overflows(
+                    len_payload as usize,
+                    max_local,
+                    min_local,
+                    usable_size,
+                );
+                if overflows {
+                    to_read + n_payload + n_rowid
+                } else {
+                    let mut size = len_payload as usize + n_payload + n_rowid;
+                    if size < MINIMUM_CELL_SIZE {
+                        size = MINIMUM_CELL_SIZE;
+                    }
+                    size
+                }
+            }
+        };
+        (start, len)
+    }
+
+    pub fn is_leaf(&self) -> bool {
+        self.read_u8(BTREE_PAGE_TYPE) > PageType::TableInterior as u8
+    }
+
+    pub fn write_database_header(&self, header: &DatabaseHeader) {
+        let buf = self.as_ptr();
+        buf[0..DatabaseHeader::SIZE].copy_from_slice(bytemuck::bytes_of(header));
+    }
+
+    pub fn debug_print_freelist(&self, usable_space: usize) {
+        let mut pc = self.first_freeblock() as usize;
+        let mut block_num = 0;
+        println!("---- Free List Blocks ----");
+        println!("first freeblock pointer: {pc}");
+        println!("cell content area: {}", self.cell_content_area());
+        println!("fragmented bytes: {}", self.num_frag_free_bytes());
+
+        while pc != 0 && pc <= usable_space {
+            let next = self.read_u16_no_offset(pc);
+            let size = self.read_u16_no_offset(pc + 2);
+
+            println!("block {block_num}: position={pc}, size={size}, next={next}");
+            pc = next as usize;
+            block_num += 1;
+        }
+        println!("--------------");
+    }
+}
+
+/// Type alias for backward compatibility - PageContent is now PageInner
+pub type PageContent = PageInner;
 
 /// WAL tag not set
 pub const TAG_UNSET: u64 = u64::MAX;
@@ -214,10 +673,12 @@ impl Page {
         Self {
             inner: UnsafeCell::new(PageInner {
                 flags: AtomicUsize::new(0),
-                contents: None,
                 id: id as usize,
                 pin_count: AtomicUsize::new(0),
                 wal_tag: AtomicU64::new(TAG_UNSET),
+                offset: 0,
+                buffer: None,
+                overflow_cells: Vec::new(),
             }),
         }
     }
@@ -227,8 +688,16 @@ impl Page {
         unsafe { &mut *self.inner.get() }
     }
 
-    pub fn get_contents(&self) -> &mut PageContent {
-        self.get().contents.as_mut().unwrap()
+    /// Returns a mutable reference to PageInner for accessing page contents.
+    /// Panics if the page buffer is not loaded.
+    pub fn get_contents(&self) -> &mut PageInner {
+        let inner = self.get();
+        debug_assert!(
+            inner.buffer.is_some(),
+            "page {} buffer not loaded",
+            inner.id
+        );
+        inner
     }
 
     #[inline]
@@ -935,7 +1404,7 @@ impl Pager {
             let page_id = page.get().id as u32;
             let contents = page.get_contents();
             let buffer = self.buffer_pool.allocate(page_size + 4);
-            let contents_buffer = contents.buffer.as_slice();
+            let contents_buffer = contents.as_ptr();
             turso_assert!(
                 contents_buffer.len() == page_size,
                 "contents buffer length should be equal to page size"
@@ -1252,19 +1721,10 @@ impl Pager {
                     offset_in_ptrmap_page,
                 } => {
                     turso_assert!(ptrmap_page.is_loaded(), "ptrmap_page should be loaded");
-                    let ptrmap_page_inner = ptrmap_page.get();
-                    let ptrmap_pg_no = ptrmap_page_inner.id;
+                    let page_content = ptrmap_page.get_contents();
+                    let ptrmap_pg_no = page_content.id;
 
-                    let page_content: &PageContent = match ptrmap_page_inner.contents.as_ref() {
-                        Some(content) => content,
-                        None => {
-                            return Err(LimboError::InternalError(format!(
-                                "Ptrmap page {ptrmap_pg_no} content not loaded"
-                            )));
-                        }
-                    };
-
-                    let full_buffer_slice: &[u8] = page_content.buffer.as_slice();
+                    let full_buffer_slice: &[u8] = page_content.as_ptr();
 
                     // Ptrmap pages are not page 1, so their internal offset within their buffer should be 0.
                     // The actual page data starts at page_content.offset within the full_buffer_slice.
@@ -1360,19 +1820,10 @@ impl Pager {
                 } => {
                     turso_assert!(ptrmap_page.is_loaded(), "page should be loaded");
                     self.add_dirty(&ptrmap_page)?;
-                    let ptrmap_page_inner = ptrmap_page.get();
-                    let ptrmap_pg_no = ptrmap_page_inner.id;
+                    let page_content = ptrmap_page.get_contents();
+                    let ptrmap_pg_no = page_content.id;
 
-                    let page_content = match ptrmap_page_inner.contents.as_ref() {
-                        Some(content) => content,
-                        None => {
-                            return Err(LimboError::InternalError(format!(
-                                "Ptrmap page {ptrmap_pg_no} content not loaded"
-                            )))
-                        }
-                    };
-
-                    let full_buffer_slice = page_content.buffer.as_mut_slice();
+                    let full_buffer_slice = page_content.as_ptr();
 
                     if offset_in_ptrmap_page + PTRMAP_ENTRY_SIZE > full_buffer_slice.len() {
                         return Err(LimboError::InternalError(format!(
@@ -1517,7 +1968,7 @@ impl Pager {
         tracing::debug!("Pager::allocate_overflow_page(id={})", page.get().id);
 
         // setup overflow page
-        let contents = page.get().contents.as_mut().unwrap();
+        let contents = page.get_contents();
         let buf = contents.as_ptr();
         buf.fill(0);
 
@@ -3240,7 +3691,7 @@ impl Pager {
 
                     let trunk_page_id = header.freelist_trunk_page.get();
 
-                    let contents = page.get().contents.as_mut().unwrap();
+                    let contents = page.get_contents();
                     // Point to previous trunk
                     contents.write_u32_no_offset(TRUNK_PAGE_NEXT_PAGE_OFFSET, trunk_page_id);
                     // Zero leaf count
@@ -3743,10 +4194,11 @@ pub fn allocate_new_page(page_id: i64, buffer_pool: &Arc<BufferPool>, offset: us
     let page = Arc::new(Page::new(page_id));
     {
         let buffer = buffer_pool.get_page();
-        let buffer = Arc::new(buffer);
+        let inner = page.get();
+        inner.offset = offset;
+        inner.buffer = Some(buffer);
         page.set_loaded();
         page.clear_wal_tag();
-        page.get().contents = Some(PageContent::new(offset, buffer));
     }
     page
 }
@@ -3763,17 +4215,17 @@ pub fn default_page1(cipher: Option<&CipherMode>) -> PageRef {
 
     let page = Arc::new(Page::new(DatabaseHeader::PAGE_ID as i64));
 
-    let contents = PageContent::new(
-        0,
-        Arc::new(Buffer::new_temporary(
+    {
+        let inner = page.get();
+        inner.offset = 0;
+        inner.buffer = Some(Buffer::new_temporary(
             default_header.page_size.get() as usize
-        )),
-    );
+        ));
+    }
 
-    contents.write_database_header(&default_header);
+    page.get_contents().write_database_header(&default_header);
     page.set_loaded();
     page.clear_wal_tag();
-    page.get().contents.replace(contents);
 
     btree_init_page(
         &page,

@@ -4551,8 +4551,7 @@ impl BTreeCursor {
     }
 
     fn clear_root(&mut self, root_page: &PageRef) -> Result<()> {
-        let page_ref = root_page.get();
-        let contents = page_ref.contents.as_ref().unwrap();
+        let contents = root_page.get_contents();
 
         let page_type = match contents.page_type() {
             PageType::TableLeaf | PageType::TableInterior => PageType::TableLeaf,
@@ -6495,13 +6494,14 @@ pub fn btree_init_page(page: &PageRef, page_type: PageType, offset: usize, usabl
         // we might get already used page from the pool. generally this is not a problem because
         // b tree access is very controlled. However, for encrypted pages (and also checksums) we want
         // to ensure that there are no reserved bytes that contain old data.
-        let buffer_len = contents.buffer.len();
+        let buf = contents.as_ptr();
+        let buffer_len = buf.len();
         turso_assert!(
             usable_space <= buffer_len,
             "usable_space must be <= buffer_len"
         );
         // this is no op if usable_space == buffer_len
-        contents.as_ptr()[usable_space..buffer_len].fill(0);
+        buf[usable_space..buffer_len].fill(0);
     }
 }
 
@@ -7750,8 +7750,12 @@ mod tests {
     fn get_page(id: usize) -> PageRef {
         let page = Arc::new(Page::new(id as i64));
 
-        let inner = PageContent::new(0, Arc::new(Buffer::new_temporary(4096)));
-        page.get().contents.replace(inner);
+        {
+            let inner = page.get();
+            inner.offset = 0;
+            inner.buffer = Some(Buffer::new_temporary(4096));
+        }
+        page.set_loaded();
 
         btree_init_page(&page, PageType::TableLeaf, 0, 4096);
         page
