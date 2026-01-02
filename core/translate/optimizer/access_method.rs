@@ -101,7 +101,14 @@ pub fn find_best_access_method_for_join_order(
             base_row_count,
         ),
         Table::FromClauseSubquery(_) => Ok(Some(AccessMethod {
-            cost: estimate_cost_for_scan_or_seek(None, &[], &[], input_cardinality, base_row_count),
+            cost: estimate_cost_for_scan_or_seek(
+                None,
+                &[],
+                &[],
+                input_cardinality,
+                base_row_count,
+                false,
+            ),
             params: AccessMethodParams::Subquery,
         })),
     }
@@ -117,7 +124,7 @@ fn find_best_access_method_for_btree(
 ) -> Result<Option<AccessMethod>> {
     let table_no = join_order.last().unwrap().table_id;
     let mut best_cost =
-        estimate_cost_for_scan_or_seek(None, &[], &[], input_cardinality, base_row_count);
+        estimate_cost_for_scan_or_seek(None, &[], &[], input_cardinality, base_row_count, false);
     let mut best_params = AccessMethodParams::BTreeTable {
         iter_dir: IterationDirection::Forwards,
         index: None,
@@ -147,12 +154,33 @@ fn find_best_access_method_for_btree(
             },
         };
 
+        // Check if this index delivers rows in ORDER BY order.
+        let is_index_ordered = maybe_order_target.is_some_and(|order_target| {
+            order_target.0.iter().enumerate().all(|(i, target)| {
+                if i >= index_info.column_count {
+                    return false;
+                }
+                let table_matches = target.table_id == table_no;
+                let column_matches = match (&target.target, &candidate.index) {
+                    (ColumnTarget::Column(col_no), Some(index)) => {
+                        index.columns[i].expr.is_none() && index.columns[i].pos_in_table == *col_no
+                    }
+                    (ColumnTarget::Column(col_no), None) => {
+                        rowid_column_idx.is_some_and(|idx| idx == *col_no)
+                    }
+                    _ => false,
+                };
+                table_matches && column_matches
+            }) && !order_target.0.is_empty()
+        });
+
         let cost = estimate_cost_for_scan_or_seek(
             Some(index_info),
             &rhs_constraints.constraints,
             &usable_constraint_refs,
             input_cardinality,
             base_row_count,
+            is_index_ordered,
         );
 
         // All other things being equal, prefer an access method that satisfies the order target.
@@ -253,6 +281,7 @@ fn find_best_access_method_for_vtab(
                     &[],
                     input_cardinality,
                     base_row_count,
+                    false,
                 ),
                 params: AccessMethodParams::VirtualTable {
                     idx_num: index_info.idx_num,
