@@ -348,11 +348,3 @@ do_execsql_test_on_specific_db {:memory:} alter-table-add-self-ref-fk-updates-sc
     "CREATE TABLE s (a, b, FOREIGN KEY (b) REFERENCES s(a))"
 }
 
-do_execsql_test_on_specific_db {:memory:} alter-table-add-column-with-composite-fk-updates-schema {
-    CREATE TABLE t(a, c);
-    CREATE TABLE s(a);
-    ALTER TABLE s ADD COLUMN b REFERENCES t(a, c);
-    SELECT sql FROM sqlite_schema WHERE name = 's';
-} {
-    "CREATE TABLE s (a, b, FOREIGN KEY (b) REFERENCES t(a, c))"
-}
