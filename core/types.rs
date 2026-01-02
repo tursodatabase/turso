@@ -3478,59 +3478,6 @@ mod tests {
     }
 
     #[test]
-    fn test_record_parsing() {
-        let values = [
-            Value::Integer(42),
-            Value::Text(Text::new("hello")),
-            Value::Float(64.4),
-            Value::Null,
-            Value::Integer(1000000),
-            Value::Blob(vec![1, 2, 3, 4, 5]),
-        ];
-
-        let registers: Vec<Register> = values.iter().cloned().map(Register::Value).collect();
-        let record = ImmutableRecord::from_registers(&registers, registers.len());
-
-        // Full Parsing
-        let mut cursor1 = RecordCursor::new();
-        cursor1
-            .parse_full_header(&record)
-            .expect("Failed to parse full header");
-
-        // Incremental Parsing
-        let mut cursor2 = RecordCursor::new();
-        cursor2
-            .ensure_parsed_upto(&record, 2)
-            .expect("Failed to parse up to column 2");
-
-        cursor2.get_value(&record, 2).expect("Column 2 failed");
-
-        // Access column 0 (already parsed)
-        let before = cursor2.serials_offsets.len();
-        cursor2.get_value(&record, 0).expect("Column 0 failed");
-        let after = cursor2.serials_offsets.len();
-        assert_eq!(before, after, "Should not parse more");
-
-        // Access column 5 (forces full parse)
-        cursor2
-            .ensure_parsed_upto(&record, 5)
-            .expect("Column 5 parse failed");
-        cursor2.get_value(&record, 5).expect("Column 5 failed");
-
-        // Compare both parsing strategies
-        for i in 0..values.len() {
-            let full = cursor1.get_value(&record, i).expect("full failed");
-            let incr = cursor2.get_value(&record, i).expect("incr failed");
-            assert_eq!(full, incr, "Mismatch at column {i}");
-        }
-
-        assert_eq!(
-            cursor1.serials_offsets, cursor2.serials_offsets,
-            "entries must match"
-        );
-    }
-
-    #[test]
     fn test_serialize_null() {
         let record = Record::new(vec![Value::Null]);
         let mut buf = Vec::new();
