@@ -403,7 +403,7 @@ async fn read_page<Ctx, IO: SyncEngineIo>(
     let buffer = Arc::new(Buffer::new(data));
     if prefetch {
         tracing::info!("read_page(page={page}): trying to prefetch more pages");
-        let content = PageContent::new(0, buffer.clone());
+        let content = PageContent::new(buffer.clone());
         if content.maybe_page_type().is_some() {
             tracing::info!(
                 "read_page(page={page}): detected valid page for prefetch load: {:?}",

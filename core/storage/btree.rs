@@ -3661,7 +3661,7 @@ impl BTreeCursor {
                     if parent_is_root
                         && parent_contents.cell_count() == 0
                         // this check to make sure we are not having negative free space
-                        && parent_contents.offset
+                        && parent_contents.offset()
                             <= compute_free_space(first_child_contents, usable_space)
                     {
                         // From SQLite:
@@ -3676,6 +3676,7 @@ impl BTreeCursor {
                         } else {
                             0
                         };
+                        debug_assert_eq!(parent_offset, parent_contents.offset());
 
                         // From SQLite:
                         // It is critical that the child page be defragmented before being
@@ -3698,10 +3699,11 @@ impl BTreeCursor {
                         // header size
                         let header_and_pointer_size = first_child_contents.header_size()
                             + first_child_contents.cell_pointer_array_size();
+                        let first_child_offset = first_child_contents.offset();
                         parent_buf[parent_offset..parent_offset + header_and_pointer_size]
                             .copy_from_slice(
-                                &child_buf[first_child_contents.offset
-                                    ..first_child_contents.offset + header_and_pointer_size],
+                                &child_buf[first_child_offset
+                                    ..first_child_offset + header_and_pointer_size],
                             );
 
                         sibling_count_new -= 1; // decrease sibling count for debugging and free at the end
@@ -4241,6 +4243,7 @@ impl BTreeCursor {
 
         let is_page_1 = root.get().id == 1;
         let offset = if is_page_1 { DatabaseHeader::SIZE } else { 0 };
+        debug_assert_eq!(offset, root_contents.offset());
 
         tracing::debug!(
             "balance_root(root={}, rightmost={}, page_type={:?})",
@@ -4596,8 +4599,7 @@ impl BTreeCursor {
     }
 
     fn clear_root(&mut self, root_page: &PageRef) -> Result<()> {
-        let page_ref = root_page.get();
-        let contents = page_ref.contents.as_ref().unwrap();
+        let contents = root_page.get_contents();
 
         let page_type = match contents.page_type() {
             PageType::TableLeaf | PageType::TableInterior => PageType::TableLeaf,
@@ -6526,7 +6528,14 @@ pub fn btree_init_page(page: &PageRef, page_type: PageType, offset: usize, usabl
         offset,
         usable_space
     );
-    contents.offset = offset;
+    debug_assert_eq!(
+        offset,
+        contents.offset(),
+        "offset parameter {} doesn't match computed offset {} for page {}",
+        offset,
+        contents.offset(),
+        page.get().id
+    );
     let id = page_type as u8;
     contents.write_page_type(id);
     contents.write_first_freeblock(0);
@@ -6542,13 +6551,14 @@ pub fn btree_init_page(page: &PageRef, page_type: PageType, offset: usize, usabl
         // we might get already used page from the pool. generally this is not a problem because
         // b tree access is very controlled. However, for encrypted pages (and also checksums) we want
         // to ensure that there are no reserved bytes that contain old data.
-        let buffer_len = contents.buffer.len();
+        let buf = contents.as_ptr();
+        let buffer_len = buf.len();
         turso_assert!(
             usable_space <= buffer_len,
             "usable_space must be <= buffer_len"
         );
         // this is no op if usable_space == buffer_len
-        contents.as_ptr()[usable_space..buffer_len].fill(0);
+        buf[usable_space..buffer_len].fill(0);
     }
 }
 
@@ -6673,7 +6683,7 @@ fn page_free_array(
     usable_space: usize,
 ) -> Result<usize> {
     tracing::debug!("page_free_array {}..{}", first, first + count);
-    let buf = &mut page.as_ptr()[page.offset..usable_space];
+    let buf = &mut page.as_ptr()[page.offset()..usable_space];
     let buf_range = buf.as_ptr_range();
     let mut number_of_cells_removed = 0;
     let mut number_of_cells_buffered = 0;
@@ -7399,7 +7409,7 @@ fn compute_free_space(page: &PageContent, usable_space: usize) -> usize {
     // Usable space, not the same as free space, simply means:
     // space that is not reserved for extensions by sqlite. Usually reserved_space is 0.
 
-    let first_cell = page.offset + page.header_size() + (2 * page.cell_count());
+    let first_cell = page.offset() + page.header_size() + (2 * page.cell_count());
     let cell_content_area_start = page.cell_content_area() as usize;
     let mut free_space_bytes = cell_content_area_start + page.num_frag_free_bytes() as usize;
 
@@ -7797,8 +7807,11 @@ mod tests {
     fn get_page(id: usize) -> PageRef {
         let page = Arc::new(Page::new(id as i64));
 
-        let inner = PageContent::new(0, Arc::new(Buffer::new_temporary(4096)));
-        page.get().contents.replace(inner);
+        {
+            let inner = page.get();
+            inner.buffer = Some(Buffer::new_temporary(4096));
+        }
+        page.set_loaded();
 
         btree_init_page(&page, PageType::TableLeaf, 0, 4096);
         page

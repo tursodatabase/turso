@@ -294,7 +294,7 @@ impl PageCache {
 
         if clean_page {
             page.clear_loaded();
-            let _ = page.get().contents.take();
+            let _ = page.get().buffer.take();
         }
 
         // Remove from map first
@@ -413,11 +413,7 @@ impl PageCache {
             && !page.is_pinned()
             && Arc::strong_count(page) == 1
             && page.get().id.ne(&DatabaseHeader::PAGE_ID)
-            && page
-                .get()
-                .contents
-                .as_ref()
-                .is_some_and(|c| c.overflow_cells.is_empty())
+            && page.get().overflow_cells.is_empty()
     }
 
     /// Collect dirty pages that can be spilled to make room in the cache.
@@ -545,7 +541,7 @@ impl PageCache {
                 self.map.remove(&key);
                 // Clean the page
                 page.clear_loaded();
-                let _ = page.get().contents.take();
+                let _ = page.get().buffer.take();
 
                 // Remove from queue
                 unsafe {
@@ -584,7 +580,7 @@ impl PageCache {
         for &entry_ptr in self.map.values() {
             let entry = unsafe { &*entry_ptr };
             entry.page.clear_loaded();
-            let _ = entry.page.get().contents.take();
+            let _ = entry.page.get().buffer.take();
         }
 
         self.map.clear();
@@ -693,7 +689,6 @@ mod tests {
     use super::*;
     use crate::storage::page_cache::CacheError;
     use crate::storage::pager::{Page, PageRef};
-    use crate::storage::sqlite3_ondisk::PageContent;
     use rand_chacha::{
         rand_core::{RngCore, SeedableRng},
         ChaCha8Rng,
@@ -707,15 +702,10 @@ mod tests {
     pub fn page_with_content(page_id: usize) -> PageRef {
         let page = Arc::new(Page::new(page_id as i64));
         {
-            let buffer = crate::Buffer::new_temporary(4096);
-            let page_content = PageContent {
-                offset: 0,
-                buffer: Arc::new(buffer),
-                overflow_cells: Vec::new(),
-            };
-            page.get().contents = Some(page_content);
-            page.set_loaded();
+            let inner = page.get();
+            inner.buffer = Some(crate::Buffer::new_temporary(4096));
         }
+        page.set_loaded();
         page
     }
 
