@@ -762,111 +762,113 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let db = db.clone();
         let vfs_for_task = vfs_option.clone();
 
-        let handle = tokio::spawn(async move {
-            let mut conn = db.lock().await.connect()?;
+        let handle = tokio::task::spawn_blocking(move || {
+            tokio::runtime::Handle::current().block_on(async move {
+                let mut conn = db.lock().await.connect()?;
 
-            conn.busy_timeout(std::time::Duration::from_millis(opts.busy_timeout))?;
+                conn.busy_timeout(std::time::Duration::from_millis(opts.busy_timeout))?;
 
-            conn.execute("PRAGMA data_sync_retry = 1", ()).await?;
+                conn.execute("PRAGMA data_sync_retry = 1", ()).await?;
 
-            println!("\rExecuting queries...");
-            for query_index in 0..nr_iterations {
-                if gen_bool(0.0) {
-                    // disabled
-                    if opts.verbose {
-                        println!("Reopening database");
-                    }
-                    // Reopen the database
-                    let mut db_guard = db.lock().await;
-                    let mut builder = Builder::new_local(&db_file);
-                    if let Some(ref vfs) = vfs_for_task {
-                        builder = builder.with_io(vfs.clone());
-                    }
-                    *db_guard = builder.build().await?;
-                    conn = db_guard.connect()?;
-                    conn.busy_timeout(std::time::Duration::from_millis(opts.busy_timeout))?;
-                } else if gen_bool(0.0) {
-                    // disabled
-                    // Reconnect to the database
-                    if opts.verbose {
-                        println!("Reconnecting to database");
-                    }
-                    let db_guard = db.lock().await;
-                    conn = db_guard.connect()?;
-                    conn.busy_timeout(std::time::Duration::from_millis(opts.busy_timeout))?;
-                }
-                let sql = &plan.queries_per_thread[thread][query_index];
-                if !opts.silent {
-                    if opts.verbose {
-                        println!("executing query {sql}");
-                    } else if query_index % 100 == 0 {
-                        print!(
-                            "\r{:.2} %",
-                            (query_index as f64 / nr_iterations as f64 * 100.0)
-                        );
-                        std::io::stdout().flush().unwrap();
-                    }
-                }
-                if opts.verbose {
-                    eprintln!("thread#{thread}(start): {sql}");
-                }
-                if let Err(e) = conn.execute(sql, ()).await {
-                    match e {
-                        turso::Error::Corrupt(e) => {
-                            panic!("Error[FATAL] executing query: {}", e);
+                println!("\rExecuting queries...");
+                for query_index in 0..nr_iterations {
+                    if gen_bool(0.0) {
+                        // disabled
+                        if opts.verbose {
+                            println!("Reopening database");
                         }
-                        turso::Error::Constraint(e) => {
-                            if opts.verbose {
+                        // Reopen the database
+                        let mut db_guard = db.lock().await;
+                        let mut builder = Builder::new_local(&db_file);
+                        if let Some(ref vfs) = vfs_for_task {
+                            builder = builder.with_io(vfs.clone());
+                        }
+                        *db_guard = builder.build().await?;
+                        conn = db_guard.connect()?;
+                        conn.busy_timeout(std::time::Duration::from_millis(opts.busy_timeout))?;
+                    } else if gen_bool(0.0) {
+                        // disabled
+                        // Reconnect to the database
+                        if opts.verbose {
+                            println!("Reconnecting to database");
+                        }
+                        let db_guard = db.lock().await;
+                        conn = db_guard.connect()?;
+                        conn.busy_timeout(std::time::Duration::from_millis(opts.busy_timeout))?;
+                    }
+                    let sql = &plan.queries_per_thread[thread][query_index];
+                    if !opts.silent {
+                        if opts.verbose {
+                            println!("executing query {sql}");
+                        } else if query_index % 100 == 0 {
+                            print!(
+                                "\r{:.2} %",
+                                (query_index as f64 / nr_iterations as f64 * 100.0)
+                            );
+                            std::io::stdout().flush().unwrap();
+                        }
+                    }
+                    if opts.verbose {
+                        eprintln!("thread#{thread}(start): {sql}");
+                    }
+                    if let Err(e) = conn.execute(sql, ()).await {
+                        match e {
+                            turso::Error::Corrupt(e) => {
+                                panic!("Error[FATAL] executing query: {}", e);
+                            }
+                            turso::Error::Constraint(e) => {
+                                if opts.verbose {
+                                    println!("Error[WARNING] executing query: {e}");
+                                }
+                            }
+                            turso::Error::Busy(e) => {
                                 println!("Error[WARNING] executing query: {e}");
                             }
-                        }
-                        turso::Error::Busy(e) => {
-                            println!("Error[WARNING] executing query: {e}");
-                        }
-                        turso::Error::Error(e) => {
-                            if opts.verbose {
-                                println!("Error executing query: {e}");
+                            turso::Error::Error(e) => {
+                                if opts.verbose {
+                                    println!("Error executing query: {e}");
+                                }
                             }
+                            _ => panic!("Error[FATAL] executing query: {}", e),
                         }
-                        _ => panic!("Error[FATAL] executing query: {}", e),
-                    }
-                }
-                if opts.verbose {
-                    eprintln!("thread#{thread}(end): {sql}");
-                }
-                const INTEGRITY_CHECK_INTERVAL: usize = 100;
-                if query_index % INTEGRITY_CHECK_INTERVAL == 0 {
-                    if opts.verbose {
-                        eprintln!("thread#{thread}(start): PRAGMA integrity_check");
-                    }
-                    let mut res = conn.query("PRAGMA integrity_check", ()).await.unwrap();
-                    match res.next().await {
-                        Ok(Some(row)) => {
-                            let value = row.get_value(0).unwrap();
-                            if value != "ok".into() {
-                                panic!("integrity check failed: {:?}", value);
-                            }
-                        }
-                        Ok(None) => {
-                            panic!("integrity check failed: no rows");
-                        }
-                        Err(e) => {
-                            println!("Error performing integrity check: {e}");
-                        }
-                    }
-                    match res.next().await {
-                        Ok(Some(_)) => panic!("integrity check failed: more than 1 row"),
-                        Err(e) => println!("Error performing integrity check: {e}"),
-                        _ => {}
                     }
                     if opts.verbose {
-                        eprintln!("thread#{thread}(end): PRAGMA integrity_check");
+                        eprintln!("thread#{thread}(end): {sql}");
+                    }
+                    const INTEGRITY_CHECK_INTERVAL: usize = 100;
+                    if query_index % INTEGRITY_CHECK_INTERVAL == 0 {
+                        if opts.verbose {
+                            eprintln!("thread#{thread}(start): PRAGMA integrity_check");
+                        }
+                        let mut res = conn.query("PRAGMA integrity_check", ()).await.unwrap();
+                        match res.next().await {
+                            Ok(Some(row)) => {
+                                let value = row.get_value(0).unwrap();
+                                if value != "ok".into() {
+                                    panic!("integrity check failed: {:?}", value);
+                                }
+                            }
+                            Ok(None) => {
+                                panic!("integrity check failed: no rows");
+                            }
+                            Err(e) => {
+                                println!("Error performing integrity check: {e}");
+                            }
+                        }
+                        match res.next().await {
+                            Ok(Some(_)) => panic!("integrity check failed: more than 1 row"),
+                            Err(e) => println!("Error performing integrity check: {e}"),
+                            _ => {}
+                        }
+                        if opts.verbose {
+                            eprintln!("thread#{thread}(end): PRAGMA integrity_check");
+                        }
                     }
                 }
-            }
-            // In case this thread is running an exclusive transaction, commit it so that it doesn't block other threads.
-            let _ = conn.execute("COMMIT", ()).await;
-            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+                // In case this thread is running an exclusive transaction, commit it so that it doesn't block other threads.
+                let _ = conn.execute("COMMIT", ()).await;
+                Ok::<_, Box<dyn std::error::Error + Send + Sync>>(())
+            })
         });
         handles.push(handle);
     }
