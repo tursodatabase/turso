@@ -2407,8 +2407,9 @@ impl From<SerialType> for u64 {
 impl TryFrom<u64> for SerialType {
     type Error = LimboError;
 
+    #[inline(always)]
     fn try_from(uint: u64) -> Result<Self> {
-        if uint == 10 || uint == 11 {
+        if unlikely(uint == 10 || uint == 11) {
             return Err(LimboError::Corrupt(format!("Invalid serial type: {uint}")));
         }
         Ok(SerialType(uint))
