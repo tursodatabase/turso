@@ -2219,10 +2219,15 @@ impl Pager {
         if is_write {
             self.clear_savepoints()
                 .expect("in practice, clear_savepoints() should never fail as it uses memory IO");
+            // IMPORTANT: rollback() must be called BEFORE end_write_tx() releases the write_lock.
+            // Otherwise, another thread could commit new frames to frame_cache between
+            // end_write_tx() and rollback(), and rollback() would incorrectly remove them.
+            self.rollback(schema_did_change, connection, is_write);
             wal.end_write_tx();
+        } else {
+            self.rollback(schema_did_change, connection, is_write);
         }
         wal.end_read_tx();
-        self.rollback(schema_did_change, connection, is_write);
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
