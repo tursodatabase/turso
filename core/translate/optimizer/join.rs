@@ -119,12 +119,58 @@ pub fn join_lhs_and_rhs<'a>(
     let lhs_mask = lhs.map_or_else(TableMask::new, |l| {
         TableMask::from_table_number_iter(l.table_numbers())
     });
-    let output_cardinality_multiplier = rhs_constraints
+
+    // Collect applicable constraints and compute selectivity multiplier
+    let applicable_constraints: Vec<_> = rhs_constraints
         .constraints
         .iter()
         .filter(|c| lhs_mask.contains_all(&c.lhs_mask))
+        .collect();
+
+    let output_cardinality_multiplier: f64 = applicable_constraints
+        .iter()
         .map(|c| c.selectivity)
-        .product::<f64>();
+        .product();
+
+    // Trace selectivity breakdown (uses same applicable_constraints)
+    #[cfg(feature = "wheretrace")]
+    {
+        use crate::translate::optimizer::{
+            pretty::{self, SelectivityEntry},
+            trace::flags,
+        };
+
+        let entries: Vec<SelectivityEntry> = rhs_constraints
+            .constraints
+            .iter()
+            .map(|c| {
+                let applied = applicable_constraints.iter().any(|ac| std::ptr::eq(*ac, c));
+                SelectivityEntry {
+                    display_name: format!(
+                        "col:{} {:?}",
+                        c.table_col_pos.map_or(-1, |p| p as i32),
+                        c.operator
+                    ),
+                    selectivity: c.selectivity,
+                    applied,
+                    constraint_type: c.constraint_type(rhs_table_number),
+                }
+            })
+            .collect();
+
+        if !entries.is_empty() {
+            crate::wheretrace!(
+                flags::SELECTIVITY,
+                "{}",
+                pretty::format_selectivity_breakdown(
+                    &rhs_table_reference.identifier,
+                    *rhs_base_rows,
+                    &entries,
+                    output_cardinality_multiplier,
+                )
+            );
+        }
+    }
 
     // If we already have a non-empty LHS (at least one table has been joined),
     // consider a hash-join alternative for the current RHS. We only allow hash
@@ -1204,6 +1250,8 @@ fn find_best_starting_table(
         }
 
         let base_rows = *base_table_rows[t];
+
+   
         let selectivity: f64 = constraints[t]
             .constraints
             .iter()

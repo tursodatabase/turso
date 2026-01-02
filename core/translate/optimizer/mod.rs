@@ -734,7 +734,7 @@ fn optimize_table_access(
             "{}",
             pretty::format_where_clause_end_of_analysis()
         );
-        for tc in constraints_per_table.iter() {
+        for (table_pos, tc) in constraints_per_table.iter().enumerate() {
             let table_idx: usize = tc.table_id.into();
             for (i, c) in tc.constraints.iter().enumerate() {
                 let term = &where_clause[c.where_clause_pos.0];
@@ -752,6 +752,7 @@ fn optimize_table_access(
                         c.lhs_mask.0,
                         false, // is_virtual
                         false, // is_equiv
+                        Some(c.constraint_type(table_pos)),
                     )
                 );
                 crate::wheretrace!(

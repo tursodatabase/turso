@@ -67,6 +67,10 @@ pub mod flags {
     /// Shows: `[SKIP] {table} cost={cost} > bound={bound} reason={reason}`
     pub const REJECTED: u32 = 0x0040;
 
+    /// Detailed selectivity breakdown.
+    /// Shows: applied/skipped constraints, multiplication formula, row estimates
+    pub const SELECTIVITY: u32 = 0x0080;
+
     /// Query structure (FROM, WHERE tree, ORDERBY).
     /// Shows: table references, WHERE clause as expression tree
     pub const QUERY_STRUCTURE: u32 = 0x4000;

@@ -21,6 +21,18 @@ use turso_parser::ast::{self, SortOrder, TableInternalId};
 
 use super::cost::ESTIMATED_HARDCODED_ROWS_PER_TABLE;
 
+/// Type of constraint based on its prerequisites (wheretrace only).
+#[cfg(feature = "wheretrace")]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ConstraintType {
+    /// Constraint has no prerequisites
+    Literal,
+    /// Constraint references only the same table
+    SelfConstraint,
+    /// Constraint references other tables
+    JoinConstraint,
+}
+
 /// Represents a single condition derived from a `WHERE` clause term
 /// that constrains a specific column of a table.
 ///
@@ -110,6 +122,18 @@ impl Constraint {
             lhs
         } else {
             rhs
+        }
+    }
+
+    /// Determine the type of this constraint based on its prerequisites (wheretrace only).
+    #[cfg(feature = "wheretrace")]
+    pub fn constraint_type(&self, table_idx: usize) -> ConstraintType {
+        if self.lhs_mask.is_empty() {
+            ConstraintType::Literal
+        } else if self.lhs_mask.table_count() == 1 && self.lhs_mask.contains_table(table_idx) {
+            ConstraintType::SelfConstraint
+        } else {
+            ConstraintType::JoinConstraint
         }
     }
 }
@@ -620,7 +644,7 @@ pub fn constraints_from_where_clause(
             "{}",
             pretty::header("---- WHERE clause at start of analysis:")
         );
-        for tc in constraints.iter() {
+        for (table_pos, tc) in constraints.iter().enumerate() {
             let table_idx: usize = tc.table_id.into();
             for (i, c) in tc.constraints.iter().enumerate() {
                 let where_term = &where_clause[c.where_clause_pos.0];
@@ -638,6 +662,7 @@ pub fn constraints_from_where_clause(
                         c.lhs_mask.0,
                         false, // is_virtual
                         false, // is_equiv
+                        Some(c.constraint_type(table_pos)),
                     )
                 );
                 // Print expression tree after TERM line (like SQLite)

@@ -173,9 +173,9 @@ pub fn format_operator(op: &turso_parser::ast::Operator) -> &'static str {
 }
 
 /// Format a constraint for trace output (SQLite-compatible).
-/// Output: `TERM-{idx} {addr} {flags} left={table:col} op={opcode} wtFlags={flags} prob={sel} prereq={mask}`
+/// Output: `TERM-{idx} [TYPE] {flags} left={table:col} op={opcode} wtFlags={flags} prob={sel} prereq={mask}`
 ///
-/// This matches SQLite's format: `TERM-0   59C3F65CB1C8 .... left={0:2}   op=002 wtFlags=0000 prob=1   prereq=1,0`
+/// This matches SQLite's format with added constraint type badge.
 pub fn format_constraint_sqlite(
     idx: usize,
     table_id: usize,
@@ -187,7 +187,16 @@ pub fn format_constraint_sqlite(
     lhs_mask: u128,
     is_virtual: bool,
     is_equiv: bool,
+    constraint_type: Option<super::constraints::ConstraintType>,
 ) -> String {
+    // Type badge
+    let type_badge = match constraint_type {
+        Some(super::constraints::ConstraintType::Literal) => "[LIT] ",
+        Some(super::constraints::ConstraintType::SelfConstraint) => "[SELF]",
+        Some(super::constraints::ConstraintType::JoinConstraint) => "[JOIN]",
+        None => "      ",
+    };
+
     // Flags format: {V}.{E}{C}
     let flags = format!(
         "{}{}{}{}",
@@ -242,8 +251,9 @@ pub fn format_constraint_sqlite(
     };
 
     format!(
-        "TERM-{}   {} {}  op={} wtFlags={:04x} prob={} prereq={}",
+        "TERM-{} {} {} {}  op={} wtFlags={:04x} prob={} prereq={}",
         idx,
+        type_badge,
         flags,
         column(&left_str),
         op_code,
@@ -923,6 +933,17 @@ fn pretty_cost(c: f64) -> String {
         format!("{:.0}", c)
     } else {
         format!("{:.1}", c)
+    }
+}
+
+/// Format row count with human-readable suffixes (K, M).
+fn format_rows(rows: f64) -> String {
+    if rows >= 1_000_000.0 {
+        format!("{:.1}M", rows / 1_000_000.0)
+    } else if rows >= 1_000.0 {
+        format!("{:.1}K", rows / 1_000.0)
+    } else {
+        format!("{:.0}", rows)
     }
 }
 
@@ -1739,6 +1760,108 @@ pub fn format_index_selection(table_name: &str, candidates: &[IndexCandidate]) -
             result.push_str(&format!("  └─ {} {}\n\n", bad("✗"), reason));
         }
     }
+    result
+}
+
+/// Represents a constraint entry for selectivity breakdown display.
+pub struct SelectivityEntry {
+    pub display_name: String,
+    pub selectivity: f64,
+    pub applied: bool,
+    pub constraint_type: super::constraints::ConstraintType,
+}
+
+/// Format a selectivity breakdown table showing applied and skipped constraints.
+/// Output:
+/// ```text
+/// ┌─ Selectivity Breakdown (lineitem) ──────────────────────┐
+/// │ Base rows: 1,000,000                                    │
+/// ├─────────────────────────────────────────────────────────┤
+/// │ ✓ [SELF] l_commitdate < l_receiptdate           × 0.40  │
+/// │ ✓ [LIT]  l_receiptdate >= '1994-01-01'          × 0.40  │
+/// │ ✗ [JOIN] o_orderkey = l_orderkey (prereq: orders)       │
+/// ├─────────────────────────────────────────────────────────┤
+/// │ Combined: 0.40 × 0.40 = 0.16                            │
+/// │ Estimated rows: 1,000,000 × 0.16 = 160,000              │
+/// └─────────────────────────────────────────────────────────┘
+/// ```
+pub fn format_selectivity_breakdown(
+    table_name: &str,
+    base_rows: f64,
+    entries: &[SelectivityEntry],
+    combined_selectivity: f64,
+) -> String {
+    let mut result = String::new();
+    
+    // Header
+    result.push_str(&format!(
+        "┌─ Selectivity Breakdown ({}) {}\n",
+        table(table_name),
+        "─".repeat(40_usize.saturating_sub(table_name.len()))
+    ));
+    
+    // Base rows
+    result.push_str(&format!("│ Base rows: {}\n", format_rows(base_rows)));
+    result.push_str("├─────────────────────────────────────────────────────────┐\n");
+    
+    // Applied constraints
+    let applied: Vec<_> = entries.iter().filter(|e| e.applied).collect();
+    let skipped: Vec<_> = entries.iter().filter(|e| !e.applied).collect();
+    
+    for entry in &applied {
+        let type_badge = match entry.constraint_type {
+            super::constraints::ConstraintType::Literal => "[LIT] ",
+            super::constraints::ConstraintType::SelfConstraint => "[SELF]",
+            super::constraints::ConstraintType::JoinConstraint => "[JOIN]",
+        };
+        result.push_str(&format!(
+            "│ {} {} {:40} × {:.2}\n",
+            good("✓"),
+            type_badge,
+            entry.display_name,
+            entry.selectivity
+        ));
+    }
+    
+    // Skipped constraints
+    for entry in &skipped {
+        let type_badge = match entry.constraint_type {
+            super::constraints::ConstraintType::Literal => "[LIT] ",
+            super::constraints::ConstraintType::SelfConstraint => "[SELF]",
+            super::constraints::ConstraintType::JoinConstraint => "[JOIN]",
+        };
+        result.push_str(&format!(
+            "│ {} {} {} (skipped - prereqs not ready)\n",
+            bad("✗"),
+            type_badge,
+            entry.display_name
+        ));
+    }
+    
+    result.push_str("├─────────────────────────────────────────────────────────┤\n");
+    
+    // Combined selectivity formula
+    if !applied.is_empty() {
+        let formula: Vec<String> = applied.iter().map(|e| format!("{:.2}", e.selectivity)).collect();
+        result.push_str(&format!(
+            "│ Combined: {} = {:.4}\n",
+            formula.join(" × "),
+            combined_selectivity
+        ));
+    } else {
+        result.push_str(&format!("│ Combined: 1.0 (no constraints applied)\n"));
+    }
+    
+    // Estimated rows
+    let estimated_rows = base_rows * combined_selectivity;
+    result.push_str(&format!(
+        "│ Estimated rows: {} × {:.4} = {}\n",
+        format_rows(base_rows),
+        combined_selectivity,
+        format_rows(estimated_rows)
+    ));
+    result.push_str("└─────────────────────────────────────────────────────────┘\n");
+    
     result
 }
 
