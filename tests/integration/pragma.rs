@@ -180,7 +180,7 @@ fn test_pragma_collation_list_returns_rows(db: TempDatabase) {
     while let StepResult::Row = rows.step().unwrap() {
         count += 1;
     }
-    assert!(count >= 3);
+    assert_eq!(count,3);
 }
 
 #[turso_macros::test(mvcc)]
@@ -188,9 +188,9 @@ fn test_pragma_collation_list_contains_default_collations(db: TempDatabase) {
     let conn = db.connect_limbo();
     let mut default_collations: HashMap<String, bool> = HashMap::new();
     default_collations.insert("BINARY".to_string(), true);
-    let mut counter = 0;
     default_collations.insert("RTRIM".to_string(), true);
     default_collations.insert("NOCASE".to_string(), true);
+    let mut counter = 0;
     let mut rows = conn
         .query("PRAGMA collation_list;")
         .unwrap()
@@ -199,9 +199,9 @@ fn test_pragma_collation_list_contains_default_collations(db: TempDatabase) {
         let row = rows.row().unwrap();
         if let Value::Text(name) = row.get_value(1) {
             if *default_collations.get(name.as_str()).unwrap() {
-                counter += 1;
+                counter+=1;
             }
         }
     }
-    assert!(counter >= 3);
+    assert_eq!(counter,3);
 }
