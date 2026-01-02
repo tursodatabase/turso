@@ -68,7 +68,7 @@ fn read_next_join_row(
 
     // Extract all needed values from the record before dropping it
     let (found_storage_id, found_zset_hash, element_hash) = if let Some(rec) = current_record {
-        let values = rec.get_values();
+        let values = rec.get_values()?;
 
         // Index has 4 values: storage_id, zset_id, element_id, rowid (appended by WriteRow)
         if values.len() >= 3 {
@@ -113,7 +113,7 @@ fn read_next_join_row(
 
         let table_record = return_if_io!(cursors.table_cursor.record());
         if let Some(rec) = table_record {
-            let table_values = rec.get_values();
+            let table_values = rec.get_values()?;
             // Table format: [storage_id, zset_id, element_id, value_blob, weight]
             if table_values.len() >= 5 {
                 // Deserialize the row from the blob
@@ -547,7 +547,7 @@ fn deserialize_hashable_row(blob: &[u8]) -> Result<HashableRow> {
     use crate::types::ImmutableRecord;
 
     let record = ImmutableRecord::from_bin_record(blob.to_vec());
-    let ref_values = record.get_values();
+    let ref_values = record.get_values()?;
     let all_values: Vec<Value> = ref_values.into_iter().map(|rv| rv.to_owned()).collect();
 
     if all_values.is_empty() {
