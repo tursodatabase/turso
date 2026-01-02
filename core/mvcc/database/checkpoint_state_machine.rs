@@ -8,7 +8,7 @@ use crate::state_machine::{StateMachine, StateTransition, TransitionResult};
 use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::storage::pager::CreateBTreeFlags;
 use crate::storage::wal::{CheckpointMode, TursoRwLock};
-use crate::types::{IOCompletions, IOResult, ImmutableRecord, RecordCursor};
+use crate::types::{IOCompletions, IOResult, ImmutableRecord};
 use crate::{
     CheckpointResult, Completion, Connection, IOExt, LimboError, Pager, Result, TransactionState,
     Value, ValueRef,
@@ -294,24 +294,45 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
 
                 if version.row.id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
                     let row_data = ImmutableRecord::from_bin_record(version.row.payload().to_vec());
-                    let mut record_cursor = RecordCursor::new();
-                    record_cursor
-                        .parse_full_header(&row_data)
-                        .expect("failed to parse record header");
+                    let mut values = row_data.iter().expect("failed to parse record header");
+
+                    fn read_iterator_next<'a, I>(iter: &mut I, expect: &str) -> ValueRef<'a>
+                    where
+                        I: Iterator<Item = Result<ValueRef<'a>, LimboError>>,
+                    {
+                        iter.next()
+                            .ok_or_else(|| {
+                                LimboError::InternalError(
+                                    "Failed to read expected column from sqlite_schema".to_string(),
+                                )
+                            })
+                            .expect(expect)
+                            .expect(expect)
+                    }
 
                     // sqlite_schema has 5 columns: type, name, tbl_name, rootpage, sql
                     // Column 0: type (TEXT) - "table", "index", "view", "trigger"
-                    let type_value = record_cursor
-                        .get_value(&row_data, 0)
-                        .expect("failed to get column 0 (type) from sqlite_schema");
+                    let type_value = read_iterator_next(
+                        &mut values,
+                        "failed to get column 0 (type) from sqlite_schema",
+                    );
                     let ValueRef::Text(type_str) = type_value else {
                         panic!("sqlite_schema.type column must be TEXT, got {type_value:?}");
                     };
 
-                    if let ValueRef::Integer(root_page) = record_cursor
-                        .get_value(&row_data, 3)
-                        .expect("failed to get column 3 (rootpage) from sqlite_schema")
-                    {
+                    let _ignored_col1 = read_iterator_next(
+                        &mut values,
+                        "failed to get column 1 (name) from sqlite_schema",
+                    );
+                    let _ignored_col2 = read_iterator_next(
+                        &mut values,
+                        "failed to get column 2 (tbl_name) from sqlite_schema",
+                    );
+
+                    if let ValueRef::Integer(root_page) = read_iterator_next(
+                        &mut values,
+                        "failed to get column 3 (rootpage) from sqlite_schema",
+                    ) {
                         if type_str.as_str() == "index" {
                             // This is an index schema change
                             let index_id = MVTableId::from(root_page);
@@ -739,15 +760,8 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                             })?;
                         let record =
                             ImmutableRecord::from_bin_record(row_version.row.payload().to_vec());
-                        let mut record_cursor = RecordCursor::new();
-                        record_cursor
-                            .parse_full_header(&record)
-                            .map_err(|e| LimboError::InternalError(e.to_string()))?;
-                        let values = record_cursor.get_values(&record);
-                        let mut values = values
-                            .into_iter()
-                            .map(|value| value.map(|v| v.to_owned()))
-                            .collect::<Result<Vec<_>>>()?;
+
+                        let mut values = record.get_values_owned()?;
                         values[3] = Value::Integer(root_page as i64);
                         let record = ImmutableRecord::from_values(&values, values.len());
                         row_version.row.data = Some(record.get_payload().to_owned());
@@ -781,15 +795,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                             })?;
                         let record =
                             ImmutableRecord::from_bin_record(row_version.row.payload().to_vec());
-                        let mut record_cursor = RecordCursor::new();
-                        record_cursor
-                            .parse_full_header(&record)
-                            .map_err(|e| LimboError::InternalError(e.to_string()))?;
-                        let values = record_cursor.get_values(&record);
-                        let mut values = values
-                            .into_iter()
-                            .map(|value| value.map(|v| v.to_owned()))
-                            .collect::<Result<Vec<_>>>()?;
+                        let mut values = record.get_values_owned()?;
                         values[3] = Value::Integer(root_page as i64);
                         let record = ImmutableRecord::from_values(&values, values.len());
                         row_version.row.data = Some(record.get_payload().to_owned());
