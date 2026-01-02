@@ -2956,6 +2956,39 @@ impl BTreeCursor {
                         "calculation of max cells was wrong"
                     );
 
+                    // Verify that all cells were collected correctly.
+                    // Note: For table leaf pages, dividers are counted in total_cells_to_redistribute
+                    // but are NOT included in cell_array (they stay in parent as bookkeeping).
+                    // For index/interior pages, dividers ARE included in cell_array.
+                    let dividers_in_parent_only = if is_table_leaf {
+                        // Table leaf: dividers are NOT added to cell_array
+                        balance_info.sibling_count.saturating_sub(1)
+                    } else {
+                        // Index/interior: dividers ARE added to cell_array
+                        0
+                    };
+                    let expected_cells_in_array =
+                        total_cells_to_redistribute - dividers_in_parent_only;
+                    turso_assert!(
+                        cell_array.cell_payloads.len() == expected_cells_in_array,
+                        "cell count mismatch after collection: collected {} cells but expected {} \
+                        (total_cells_to_redistribute={}, dividers_in_parent_only={}, is_table_leaf={})",
+                        cell_array.cell_payloads.len(),
+                        expected_cells_in_array,
+                        total_cells_to_redistribute,
+                        dividers_in_parent_only,
+                        is_table_leaf
+                    );
+                    turso_assert!(
+                        total_cells_inserted == expected_cells_in_array,
+                        "cell count mismatch: total_cells_inserted={} but expected_cells_in_array={} \
+                        (total_cells_to_redistribute={}, dividers_in_parent_only={})",
+                        total_cells_inserted,
+                        expected_cells_in_array,
+                        total_cells_to_redistribute,
+                        dividers_in_parent_only
+                    );
+
                     // Let's copy all cells for later checks
                     #[cfg(debug_assertions)]
                     let mut cells_debug = Vec::new();
@@ -4170,6 +4203,18 @@ impl BTreeCursor {
                 }
             }
         }
+
+        // Verify all cells were accounted for (non-shallower case)
+        if sibling_count_new > 0 && current_index_cell != cells_debug.len() {
+            tracing::error!(
+                "balance_non_root(cell_count_mismatch, current_index_cell={}, cells_debug_len={}, sibling_count_new={})",
+                current_index_cell,
+                cells_debug.len(),
+                sibling_count_new
+            );
+            valid = false;
+        }
+
         assert!(
             valid,
             "corrupted database, cells were not balanced properly"
