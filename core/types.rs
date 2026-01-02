@@ -2336,6 +2336,7 @@ impl SerialType {
         Self(13 + size * 2)
     }
 
+    #[inline(always)]
     pub fn kind(&self) -> SerialTypeKind {
         match self.0 {
             0 => SerialTypeKind::Null,
