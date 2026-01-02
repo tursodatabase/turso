@@ -4,7 +4,9 @@ use crate::translate::expr::{sanitize_string, translate_expr};
 use crate::translate::{ProgramBuilder, ProgramBuilderOpts};
 use crate::util::normalize_ident;
 use crate::vdbe::insn::Insn;
+use crate::Connection;
 use crate::Result;
+use std::sync::Arc;
 use turso_parser::ast::{Expr, Literal};
 
 /// Translate ATTACH statement
@@ -15,7 +17,13 @@ pub fn translate_attach(
     db_name: &Expr,
     key: &Option<Box<Expr>>,
     mut program: ProgramBuilder,
+    connection: Arc<Connection>,
 ) -> Result<ProgramBuilder> {
+    if !connection.experimental_attach_enabled() {
+        return Err(crate::LimboError::ParseError(
+            "ATTACH is an experimental feature. Enable with --experimental-attach flag".to_string(),
+        ));
+    }
     // SQLite treats ATTACH as a function call to sqlite_attach(filename, dbname, key)
     // We'll allocate registers for the arguments and call the function
 
@@ -119,7 +127,13 @@ pub fn translate_detach(
     expr: &Expr,
     resolver: &Resolver,
     mut program: ProgramBuilder,
+    connection: Arc<Connection>,
 ) -> Result<ProgramBuilder> {
+    if !connection.experimental_attach_enabled() {
+        return Err(crate::LimboError::ParseError(
+            "DETACH is an experimental feature. Enable with --experimental-attach flag".to_string(),
+        ));
+    }
     // SQLite treats DETACH as a function call to sqlite_detach(dbname)
 
     program.extend(&ProgramBuilderOpts {

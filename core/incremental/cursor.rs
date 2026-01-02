@@ -318,6 +318,7 @@ mod tests {
                 enable_index_method: false,
                 enable_autovacuum: false,
                 enable_triggers: false,
+                enable_attach: false,
             },
             None,
         )?;
