@@ -2054,7 +2054,7 @@ pub fn op_transaction_inner(
             OpTransactionState::Start => {
                 let conn = program.connection.clone();
                 let write = matches!(tx_mode, TransactionMode::Write);
-                if write && conn.db.open_flags.get().contains(OpenFlags::ReadOnly) {
+                if write && conn.db.open_flags.contains(OpenFlags::ReadOnly) {
                     return Err(LimboError::ReadOnly);
                 }
 

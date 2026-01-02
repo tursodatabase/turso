@@ -1,3 +1,4 @@
+use crate::assert_send_sync;
 use crate::transaction::DropBehavior;
 use crate::transaction::TransactionBehavior;
 use crate::Error;
@@ -50,11 +51,10 @@ pub struct Connection {
     ///
     /// By default, the value is [DropBehavior::Ignore] which effectively does nothing.
     pub(crate) dangling_tx: AtomicDropBehavior,
-    pub(crate) extra_io: Option<Arc<dyn Fn(Waker) -> Result<()>>>,
+    pub(crate) extra_io: Option<Arc<dyn Fn(Waker) -> Result<()> + Send + Sync>>,
 }
 
-unsafe impl Send for Connection {}
-unsafe impl Sync for Connection {}
+assert_send_sync!(Connection);
 
 impl Clone for Connection {
     fn clone(&self) -> Self {
@@ -70,7 +70,7 @@ impl Clone for Connection {
 impl Connection {
     pub fn create(
         conn: Arc<turso_sdk_kit::rsapi::TursoConnection>,
-        extra_io: Option<Arc<dyn Fn(Waker) -> Result<()>>>,
+        extra_io: Option<Arc<dyn Fn(Waker) -> Result<()> + Send + Sync>>,
     ) -> Self {
         #[allow(clippy::arc_with_non_send_sync)]
         let connection = Connection {

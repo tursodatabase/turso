@@ -42,7 +42,6 @@ use super::{
 };
 use std::{
     any::Any,
-    cell::Cell,
     cmp::{Ordering, Reverse},
     collections::BinaryHeap,
     fmt::Debug,
@@ -404,6 +403,11 @@ struct BalanceInfo {
     reusable_divider_cell: Vec<u8>,
 }
 
+// SAFETY: Need to guarantee during balancing that we do not modify the rightmost pointer on the pointee `PageContent`
+// safe as long as the Balance Algorithm does not modify the pointer
+unsafe impl Send for BalanceInfo {}
+unsafe impl Sync for BalanceInfo {}
+
 /// Holds the state machine for the operation that was in flight when the cursor
 /// was suspended due to IO.
 enum CursorState {
@@ -534,20 +538,20 @@ pub struct LeafPageBinarySearchState {
 pub enum CursorSeekState {
     Start,
     MovingBetweenPages {
-        eq_seen: Cell<bool>,
+        eq_seen: bool,
     },
     InteriorPageBinarySearch {
         state: InteriorPageBinarySearchState,
     },
     FoundLeaf {
-        eq_seen: Cell<bool>,
+        eq_seen: bool,
     },
     LeafPageBinarySearch {
         state: LeafPageBinarySearchState,
     },
 }
 
-pub trait CursorTrait: Any {
+pub trait CursorTrait: Any + Send + Sync {
     /// Move cursor to last entry.
     fn last(&mut self) -> Result<IOResult<()>>;
     /// Move cursor to next entry.
@@ -661,6 +665,9 @@ pub struct BTreeCursor {
     /// This avoids allocating a new Vec for each write operation.
     reusable_cell_payload: Vec<u8>,
 }
+
+crate::assert::assert_send!(BTreeCursor);
+crate::assert::assert_sync!(BTreeCursor);
 
 /// We store the cell index and cell count for each page in the stack.
 /// The reason we store the cell count is because we need to know when we are at the end of the page,
@@ -1171,9 +1178,7 @@ impl BTreeCursor {
             };
 
             if is_leaf {
-                self.seek_state = CursorSeekState::FoundLeaf {
-                    eq_seen: Cell::new(false),
-                };
+                self.seek_state = CursorSeekState::FoundLeaf { eq_seen: false };
                 return Ok(IOResult::Done(()));
             }
 
@@ -1182,7 +1187,7 @@ impl BTreeCursor {
                 CursorSeekState::Start | CursorSeekState::MovingBetweenPages { .. }
             ) {
                 let eq_seen = match &self.seek_state {
-                    CursorSeekState::MovingBetweenPages { eq_seen } => eq_seen.get(),
+                    CursorSeekState::MovingBetweenPages { eq_seen } => *eq_seen,
                     _ => false,
                 };
                 let min_cell_idx = 0;
@@ -1244,7 +1249,7 @@ impl BTreeCursor {
                 let (mem_page, c) = self.read_page(left_child_page as i64)?;
                 self.stack.push(mem_page);
                 self.seek_state = CursorSeekState::MovingBetweenPages {
-                    eq_seen: Cell::new(state.eq_seen),
+                    eq_seen: state.eq_seen,
                 };
                 if let Some(c) = c {
                     return Ok(ControlFlow::Break(IOResult::IO(IOCompletions::Single(c))));
@@ -1262,7 +1267,7 @@ impl BTreeCursor {
                     let (mem_page, c) = self.read_page(right_most_pointer as i64)?;
                     self.stack.push(mem_page);
                     self.seek_state = CursorSeekState::MovingBetweenPages {
-                        eq_seen: Cell::new(state.eq_seen),
+                        eq_seen: state.eq_seen,
                     };
                     if let Some(c) = c {
                         return Ok(ControlFlow::Break(IOResult::IO(IOCompletions::Single(c))));
@@ -1349,12 +1354,10 @@ impl BTreeCursor {
 
             if is_leaf {
                 let eq_seen = match &self.seek_state {
-                    CursorSeekState::MovingBetweenPages { eq_seen } => eq_seen.get(),
+                    CursorSeekState::MovingBetweenPages { eq_seen } => *eq_seen,
                     _ => false,
                 };
-                self.seek_state = CursorSeekState::FoundLeaf {
-                    eq_seen: Cell::new(eq_seen),
-                };
+                self.seek_state = CursorSeekState::FoundLeaf { eq_seen };
                 return Ok(IOResult::Done(()));
             }
 
@@ -1363,7 +1366,7 @@ impl BTreeCursor {
                 CursorSeekState::Start | CursorSeekState::MovingBetweenPages { .. }
             ) {
                 let eq_seen = match &self.seek_state {
-                    CursorSeekState::MovingBetweenPages { eq_seen } => eq_seen.get(),
+                    CursorSeekState::MovingBetweenPages { eq_seen } => *eq_seen,
                     _ => false,
                 };
                 let min_cell_idx = 0;
@@ -1441,7 +1444,7 @@ impl BTreeCursor {
                         let (mem_page, c) = self.read_page(right_most_pointer as i64)?;
                         self.stack.push(mem_page);
                         self.seek_state = CursorSeekState::MovingBetweenPages {
-                            eq_seen: Cell::new(state.eq_seen),
+                            eq_seen: state.eq_seen,
                         };
                         if let Some(c) = c {
                             return Ok(ControlFlow::Break(IOResult::IO(IOCompletions::Single(c))));
@@ -1488,7 +1491,7 @@ impl BTreeCursor {
             let (mem_page, c) = self.read_page(*left_child_page as i64)?;
             self.stack.push(mem_page);
             self.seek_state = CursorSeekState::MovingBetweenPages {
-                eq_seen: Cell::new(state.eq_seen),
+                eq_seen: state.eq_seen,
             };
             if let Some(c) = c {
                 return Ok(ControlFlow::Break(IOResult::IO(IOCompletions::Single(c))));
@@ -1794,7 +1797,7 @@ impl BTreeCursor {
                     self.seek_state
                 );
             };
-            let eq_seen = eq_seen.get();
+            let eq_seen = *eq_seen;
             let page = self.stack.top_ref();
 
             let contents = page.get_contents();
@@ -2951,6 +2954,39 @@ impl BTreeCursor {
                     turso_assert!(
                         cell_array.cell_payloads.capacity() == cells_capacity_start,
                         "calculation of max cells was wrong"
+                    );
+
+                    // Verify that all cells were collected correctly.
+                    // Note: For table leaf pages, dividers are counted in total_cells_to_redistribute
+                    // but are NOT included in cell_array (they stay in parent as bookkeeping).
+                    // For index/interior pages, dividers ARE included in cell_array.
+                    let dividers_in_parent_only = if is_table_leaf {
+                        // Table leaf: dividers are NOT added to cell_array
+                        balance_info.sibling_count.saturating_sub(1)
+                    } else {
+                        // Index/interior: dividers ARE added to cell_array
+                        0
+                    };
+                    let expected_cells_in_array =
+                        total_cells_to_redistribute - dividers_in_parent_only;
+                    turso_assert!(
+                        cell_array.cell_payloads.len() == expected_cells_in_array,
+                        "cell count mismatch after collection: collected {} cells but expected {} \
+                        (total_cells_to_redistribute={}, dividers_in_parent_only={}, is_table_leaf={})",
+                        cell_array.cell_payloads.len(),
+                        expected_cells_in_array,
+                        total_cells_to_redistribute,
+                        dividers_in_parent_only,
+                        is_table_leaf
+                    );
+                    turso_assert!(
+                        total_cells_inserted == expected_cells_in_array,
+                        "cell count mismatch: total_cells_inserted={} but expected_cells_in_array={} \
+                        (total_cells_to_redistribute={}, dividers_in_parent_only={})",
+                        total_cells_inserted,
+                        expected_cells_in_array,
+                        total_cells_to_redistribute,
+                        dividers_in_parent_only
                     );
 
                     // Let's copy all cells for later checks
@@ -4167,6 +4203,18 @@ impl BTreeCursor {
                 }
             }
         }
+
+        // Verify all cells were accounted for (non-shallower case)
+        if sibling_count_new > 0 && current_index_cell != cells_debug.len() {
+            tracing::error!(
+                "balance_non_root(cell_count_mismatch, current_index_cell={}, cells_debug_len={}, sibling_count_new={})",
+                current_index_cell,
+                cells_debug.len(),
+                sibling_count_new
+            );
+            valid = false;
+        }
+
         assert!(
             valid,
             "corrupted database, cells were not balanced properly"
@@ -4760,6 +4808,7 @@ impl CursorTrait for BTreeCursor {
                     let cursor_has_record = return_if_io!(self.get_next_record());
                     self.set_has_record(cursor_has_record);
                     self.invalidate_record();
+                    self.advance_state = AdvanceState::Start;
                     return Ok(IOResult::Done(cursor_has_record));
                 }
             }
@@ -4787,6 +4836,7 @@ impl CursorTrait for BTreeCursor {
                     let cursor_has_record = return_if_io!(self.get_prev_record());
                     self.set_has_record(cursor_has_record);
                     self.invalidate_record();
+                    self.advance_state = AdvanceState::Start;
                     return Ok(IOResult::Done(cursor_has_record));
                 }
             }

@@ -1,7 +1,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Logical clock.
-pub trait LogicalClock {
+pub trait LogicalClock: Send + Sync {
     fn get_timestamp(&self) -> u64;
     fn reset(&self, ts: u64);
 }

@@ -27,7 +27,6 @@ macro_rules! turso_assert {
 /// Assert that a type implements Send at compile time.
 /// Usage: assert_send!(MyType);
 /// Usage: assert_send!(Type1, Type2, Type3);
-#[expect(unused_macros)]
 macro_rules! assert_send {
     ($($t:ty),+ $(,)?) => {
         #[cfg(test)]
@@ -37,7 +36,7 @@ macro_rules! assert_send {
         };)+
     };
 }
-#[expect(unused_imports)]
+
 pub(crate) use assert_send;
 
 /// Assert that a type implements Sync at compile time.
