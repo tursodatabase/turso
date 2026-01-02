@@ -992,12 +992,14 @@ pub fn begin_read_page(
         // (and it's not an intentional empty read), the database is corrupt.
         if bytes_read == 0 {
             if !allow_empty_read {
-                turso_assert!(false, "read returned 0 bytes but empty reads are not allowed");
+                turso_assert!(
+                    false,
+                    "read returned 0 bytes but empty reads are not allowed"
+                );
             }
         } else if bytes_read != buf_len as i32 {
             panic!(
-                "database disk image is malformed: read {} bytes but expected {}",
-                bytes_read, buf_len
+                "database disk image is malformed: read {bytes_read} bytes but expected {buf_len}",
             );
         }
         let page = page.clone();
