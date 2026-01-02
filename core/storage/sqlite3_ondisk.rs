@@ -563,14 +563,8 @@ pub fn begin_read_page(
 #[instrument(skip_all, level = Level::DEBUG)]
 pub fn finish_read_page(page_idx: usize, buffer: Buffer, page: PageRef) {
     tracing::trace!("finish_read_page(page_idx = {page_idx})");
-    let offset = if page_idx == DatabaseHeader::PAGE_ID {
-        DatabaseHeader::SIZE
-    } else {
-        0
-    };
     {
         let inner = page.get();
-        inner.offset = offset;
         inner.buffer = Some(buffer);
         page.clear_locked();
         page.set_loaded();

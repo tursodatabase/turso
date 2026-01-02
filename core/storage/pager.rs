@@ -161,9 +161,6 @@ pub struct PageInner {
     /// The WAL frame number this page was loaded from (0 if loaded from main DB file)
     /// This tracks which version of the page we have in memory
     pub wal_tag: AtomicU64,
-    /// The position where page content starts. It's 100 for page 1 (database file header is 100 bytes),
-    /// 0 for all other pages.
-    pub offset: usize,
     /// The actual page data buffer. None if not loaded.
     pub buffer: Option<Buffer>,
     /// Overflow cells during btree operations
@@ -174,7 +171,7 @@ pub struct PageInner {
 impl PageInner {
     /// Creates a new PageInner from an Arc<Buffer> (for backward compatibility).
     /// The Arc is unwrapped to get ownership of the Buffer, or copied if needed.
-    pub fn new(offset: usize, buffer: Arc<Buffer>) -> Self {
+    pub fn new(buffer: Arc<Buffer>) -> Self {
         // Try to unwrap the Arc, or copy the data if we can't
         let owned_buffer = Arc::try_unwrap(buffer).unwrap_or_else(|arc| {
             let new_buf = Buffer::new_temporary(arc.len());
@@ -186,20 +183,18 @@ impl PageInner {
             id: 0,
             pin_count: AtomicUsize::new(0),
             wal_tag: AtomicU64::new(TAG_UNSET),
-            offset,
             buffer: Some(owned_buffer),
             overflow_cells: Vec::new(),
         }
     }
 
     /// Creates a new PageInner with an owned buffer.
-    pub fn from_buffer(offset: usize, buffer: Buffer) -> Self {
+    pub fn from_buffer(buffer: Buffer) -> Self {
         Self {
             flags: AtomicUsize::new(0),
             id: 0,
             pin_count: AtomicUsize::new(0),
             wal_tag: AtomicU64::new(TAG_UNSET),
-            offset,
             buffer: Some(buffer),
             overflow_cells: Vec::new(),
         }
@@ -214,25 +209,37 @@ impl PageInner {
             .as_mut_slice()
     }
 
+    /// The position where page content starts. It's 100 for page 1 (database file header is 100 bytes),
+    /// 0 for all other pages.
+    #[inline]
+    pub fn offset(&self) -> usize {
+        if self.id == 1 {
+            DatabaseHeader::SIZE
+        } else {
+            0
+        }
+    }
+
     /// Read a u8 from the page content at the given offset, taking account the possible db header on page 1.
     #[inline]
     fn read_u8(&self, pos: usize) -> u8 {
         let buf = self.as_ptr();
-        buf[self.offset + pos]
+        buf[self.offset() + pos]
     }
 
     /// Read a u16 from the page content at the given offset, taking account the possible db header on page 1.
     #[inline]
     fn read_u16(&self, pos: usize) -> u16 {
         let buf = self.as_ptr();
-        u16::from_be_bytes([buf[self.offset + pos], buf[self.offset + pos + 1]])
+        let offset = self.offset();
+        u16::from_be_bytes([buf[offset + pos], buf[offset + pos + 1]])
     }
 
     /// Read a u32 from the page content at the given offset, taking account the possible db header on page 1.
     #[inline]
     fn read_u32(&self, pos: usize) -> u32 {
         let buf = self.as_ptr();
-        read_u32(buf, self.offset + pos)
+        read_u32(buf, self.offset() + pos)
     }
 
     /// Write a u8 to the page content at the given offset, taking account the possible db header on page 1.
@@ -240,7 +247,7 @@ impl PageInner {
     fn write_u8(&self, pos: usize, value: u8) {
         tracing::trace!("write_u8(pos={}, value={})", pos, value);
         let buf = self.as_ptr();
-        buf[self.offset + pos] = value;
+        buf[self.offset() + pos] = value;
     }
 
     /// Write a u16 to the page content at the given offset, taking account the possible db header on page 1.
@@ -248,7 +255,8 @@ impl PageInner {
     fn write_u16(&self, pos: usize, value: u16) {
         tracing::trace!("write_u16(pos={}, value={})", pos, value);
         let buf = self.as_ptr();
-        buf[self.offset + pos..self.offset + pos + 2].copy_from_slice(&value.to_be_bytes());
+        let offset = self.offset();
+        buf[offset + pos..offset + pos + 2].copy_from_slice(&value.to_be_bytes());
     }
 
     /// Write a u32 to the page content at the given offset, taking account the possible db header on page 1.
@@ -256,7 +264,8 @@ impl PageInner {
     fn write_u32(&self, pos: usize, value: u32) {
         tracing::trace!("write_u32(pos={}, value={})", pos, value);
         let buf = self.as_ptr();
-        buf[self.offset + pos..self.offset + pos + 4].copy_from_slice(&value.to_be_bytes());
+        let offset = self.offset();
+        buf[offset + pos..offset + pos + 4].copy_from_slice(&value.to_be_bytes());
     }
 
     #[inline]
@@ -407,7 +416,7 @@ impl PageInner {
             PageType::IndexInterior | PageType::TableInterior => Some(unsafe {
                 self.as_ptr()
                     .as_mut_ptr()
-                    .add(self.offset + BTREE_RIGHTMOST_PTR)
+                    .add(self.offset() + BTREE_RIGHTMOST_PTR)
             }),
             PageType::IndexLeaf | PageType::TableLeaf => None,
         }
@@ -485,7 +494,7 @@ impl PageInner {
 
     #[inline]
     pub fn cell_pointer_array_offset(&self) -> usize {
-        self.offset + self.header_size()
+        self.offset() + self.header_size()
     }
 
     #[inline]
@@ -676,7 +685,6 @@ impl Page {
                 id: id as usize,
                 pin_count: AtomicUsize::new(0),
                 wal_tag: AtomicU64::new(TAG_UNSET),
-                offset: 0,
                 buffer: None,
                 overflow_cells: Vec::new(),
             }),
@@ -1727,14 +1735,15 @@ impl Pager {
                     let full_buffer_slice: &[u8] = page_content.as_ptr();
 
                     // Ptrmap pages are not page 1, so their internal offset within their buffer should be 0.
-                    // The actual page data starts at page_content.offset within the full_buffer_slice.
-                    if ptrmap_pg_no != 1 && page_content.offset != 0 {
+                    // The actual page data starts at page_content.offset() within the full_buffer_slice.
+                    if ptrmap_pg_no != 1 && page_content.offset() != 0 {
                         return Err(LimboError::Corrupt(format!(
                             "Ptrmap page {} has unexpected internal offset {}",
-                            ptrmap_pg_no, page_content.offset
+                            ptrmap_pg_no,
+                            page_content.offset()
                         )));
                     }
-                    let ptrmap_page_data_slice: &[u8] = &full_buffer_slice[page_content.offset..];
+                    let ptrmap_page_data_slice: &[u8] = &full_buffer_slice[page_content.offset()..];
                     let actual_data_length = ptrmap_page_data_slice.len();
 
                     // Check if the calculated offset for the entry is within the bounds of the actual page data length.
@@ -1985,6 +1994,14 @@ impl Pager {
         _alloc_mode: BtreePageAllocMode,
     ) -> Result<IOResult<PageRef>> {
         let page = return_if_io!(self.allocate_page());
+        debug_assert_eq!(
+            offset,
+            page.get_contents().offset(),
+            "offset parameter {} doesn't match computed offset {} for page {}",
+            offset,
+            page.get_contents().offset(),
+            page.get().id
+        );
         btree_init_page(&page, page_type, offset, self.usable_space());
         tracing::debug!(
             "do_allocate_page(id={}, page_type={:?})",
@@ -3744,7 +3761,7 @@ impl Pager {
 
                 self.buffer_pool
                     .finalize_with_page_size(default_header.page_size.get() as usize)?;
-                let page = allocate_new_page(1, &self.buffer_pool, 0);
+                let page = allocate_new_page(1, &self.buffer_pool);
 
                 let contents = page.get_contents();
                 contents.write_database_header(&default_header);
@@ -3837,7 +3854,7 @@ impl Pager {
                         {
                             // we will allocate a ptrmap page, so increment size
                             new_db_size += 1;
-                            let page = allocate_new_page(new_db_size as i64, &self.buffer_pool, 0);
+                            let page = allocate_new_page(new_db_size as i64, &self.buffer_pool);
                             self.add_dirty(&page)?;
                             let page_key = PageCacheKey::new(page.get().id as usize);
                             let mut cache = self.page_cache.write();
@@ -4012,7 +4029,7 @@ impl Pager {
                     // if new_db_size reaches the pending page, we need to allocate a new one
                     if Some(new_db_size) == self.pending_byte_page_id() {
                         let richard_hipp_special_page =
-                            allocate_new_page(new_db_size as i64, &self.buffer_pool, 0);
+                            allocate_new_page(new_db_size as i64, &self.buffer_pool);
                         self.add_dirty(&richard_hipp_special_page)?;
                         let page_key = PageCacheKey::new(richard_hipp_special_page.get().id);
                         {
@@ -4032,7 +4049,7 @@ impl Pager {
                     }
 
                     // FIXME: should reserve page cache entry before modifying the database
-                    let page = allocate_new_page(new_db_size as i64, &self.buffer_pool, 0);
+                    let page = allocate_new_page(new_db_size as i64, &self.buffer_pool);
                     {
                         // setup page and add to cache
                         self.add_dirty(&page)?;
@@ -4190,12 +4207,11 @@ impl Pager {
     }
 }
 
-pub fn allocate_new_page(page_id: i64, buffer_pool: &Arc<BufferPool>, offset: usize) -> PageRef {
+pub fn allocate_new_page(page_id: i64, buffer_pool: &Arc<BufferPool>) -> PageRef {
     let page = Arc::new(Page::new(page_id));
     {
         let buffer = buffer_pool.get_page();
         let inner = page.get();
-        inner.offset = offset;
         inner.buffer = Some(buffer);
         page.set_loaded();
         page.clear_wal_tag();
@@ -4217,7 +4233,6 @@ pub fn default_page1(cipher: Option<&CipherMode>) -> PageRef {
 
     {
         let inner = page.get();
-        inner.offset = 0;
         inner.buffer = Some(Buffer::new_temporary(
             default_header.page_size.get() as usize
         ));
