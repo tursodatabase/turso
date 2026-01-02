@@ -19,7 +19,6 @@ use crate::types::IOCompletions;
 use crate::types::IOResult;
 use crate::types::ImmutableRecord;
 use crate::types::IndexInfo;
-use crate::types::RecordCursor;
 use crate::types::SeekResult;
 use crate::Completion;
 use crate::File;
@@ -117,19 +116,16 @@ impl SortableIndexKey {
     }
 
     fn compare(&self, other: &Self) -> Result<std::cmp::Ordering> {
-        let mut lhs_cursor = RecordCursor::new();
-        let mut rhs_cursor = RecordCursor::new();
-
         // We sometimes need to compare a shorter key to a longer one,
         // for example when seeking with an index key that is a prefix of the full key.
         let num_cols = self.metadata.num_cols.min(other.metadata.num_cols);
 
-        lhs_cursor.ensure_parsed_upto(&self.key, num_cols - 1)?;
-        rhs_cursor.ensure_parsed_upto(&other.key, num_cols - 1)?;
+        let mut lhs = self.key.iter()?;
+        let mut rhs = other.key.iter()?;
 
         for i in 0..num_cols {
-            let lhs_value = lhs_cursor.deserialize_column(&self.key, i)?;
-            let rhs_value = rhs_cursor.deserialize_column(&other.key, i)?;
+            let lhs_value = lhs.next().expect("we already checked length")?;
+            let rhs_value = rhs.next().expect("we already checked length")?;
 
             let cmp = compare_immutable(
                 std::iter::once(&lhs_value),
@@ -2696,13 +2692,14 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         // Sqlite schema row version inserts
                         let row_data = row.payload().to_vec();
                         let record = ImmutableRecord::from_bin_record(row_data);
-                        let mut record_cursor = RecordCursor::new();
-                        let mut record_values = record_cursor.get_values(&record);
-                        let val = record_values.nth(3).ok_or_else(|| {
-                            LimboError::InternalError(
-                                "Expected at least 4 columns in sqlite_schema".to_string(),
-                            )
-                        })??;
+                        let val = match record.get_value_opt(3) {
+                            Some(v) => v,
+                            None => {
+                                return Err(LimboError::InternalError(
+                                    "Expected at least 4 columns in sqlite_schema".to_string(),
+                                ));
+                            }
+                        };
                         let ValueRef::Integer(root_page) = val else {
                             panic!("Expected integer value for root page, got {val:?}");
                         };
