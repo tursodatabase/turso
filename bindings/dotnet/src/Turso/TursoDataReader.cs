@@ -167,7 +167,8 @@ public class TursoDataReader : DbDataReader
 
     public override bool IsDBNull(int ordinal)
     {
-        throw new NotImplementedException();
+        var valueType = TursoBindings.GetValue(_statement, ordinal).ValueType;
+        return valueType == TursoValueType.Null;
     }
 
     public override int FieldCount => TursoBindings.GetFieldCount(_statement);
