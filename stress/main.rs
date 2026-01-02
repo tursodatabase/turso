@@ -742,20 +742,21 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             if opts.verbose {
                 println!("executing ddl {stmt}");
             }
-            if let Err(e) = conn.execute(stmt, ()).await {
-                match e {
-                    turso::Error::Corrupt(e) => {
+            let mut retry_counter = 0;
+            while retry_counter < 10 {
+                match conn.execute(stmt, ()).await {
+                    Ok(_) => break,
+                    Err(turso::Error::Busy(e)) => {
+                        println!("Error (busy) creating table: {e}");
+                        retry_counter += 1;
+                    }
+                    Err(e) => {
                         panic!("Error creating table: {e}");
                     }
-                    turso::Error::Error(e) => {
-                        println!("Error creating table: {e}");
-                    }
-                    _ => {
-                        println!("Error creating table: {e}");
-                        // Exit on any other error during table creation
-                        std::process::exit(1);
-                    }
                 }
+            }
+            if retry_counter == 10 {
+                panic!("Could not execute statement [{stmt}] after {retry_counter} attempts.");
             }
         }
 
