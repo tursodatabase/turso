@@ -11,14 +11,15 @@ use crate::storage::btree::{BTreeCursor, BTreeKey, CursorTrait};
 use crate::translate::plan::IterationDirection;
 use crate::types::{
     compare_immutable, IOCompletions, IOResult, ImmutableRecord, IndexInfo, SeekKey, SeekOp,
-    SeekResult,
+    SeekResult, Value,
 };
-use crate::{return_if_io, turso_assert, Completion, LimboError, Result};
-use crate::{Pager, Value};
+use crate::vdbe::Register;
+use crate::{return_if_io, turso_assert, Completion, LimboError, Result, Pager};
 use std::any::Any;
 use std::fmt::Debug;
 use std::ops::Bound;
 use std::sync::Arc;
+use crate::vdbe::make_record;
 
 #[derive(Debug, Clone)]
 enum CursorPosition {
@@ -1055,6 +1056,11 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
 
     fn record(&mut self) -> Result<IOResult<Option<&crate::types::ImmutableRecord>>> {
         self.current_row()
+    }
+
+    fn seek_unpacked(&mut self, registers: &[Register], op: SeekOp) -> Result<IOResult<SeekResult>> {
+        let record = make_record(registers, &0, &registers.len());
+        self.seek(SeekKey::IndexKey(&record), op)
     }
 
     fn seek(&mut self, seek_key: SeekKey<'_>, op: SeekOp) -> Result<IOResult<SeekResult>> {

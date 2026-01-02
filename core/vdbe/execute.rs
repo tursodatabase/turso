@@ -3085,6 +3085,11 @@ pub enum OpSeekKey {
     TableRowId(i64),
     IndexKeyOwned(ImmutableRecord),
     IndexKeyFromRegister(usize),
+    IndexKeyUnpacked {
+        cursor_id: usize,
+        start_reg: usize,
+        num_regs: usize,
+    },
 }
 
 #[derive(Debug)]
@@ -3238,10 +3243,12 @@ pub fn seek_internal(
                                 start_reg,
                                 num_regs,
                             } => {
-                                let record_from_regs =
-                                    make_record(&state.registers, &start_reg, &num_regs);
                                 state.seek_state = OpSeekState::Seek {
-                                    key: OpSeekKey::IndexKeyOwned(record_from_regs),
+                                    key: OpSeekKey::IndexKeyUnpacked {
+                                        cursor_id,
+                                        start_reg: start_reg,
+                                        num_regs: num_regs,
+                                    },
                                     op,
                                 };
                             }
@@ -3343,20 +3350,78 @@ pub fn seek_internal(
                     continue;
                 }
                 OpSeekState::Seek { key, op } => {
-                    let seek_result = {
-                        let cursor = get_cursor!(state, cursor_id);
-                        let cursor = cursor.as_btree_mut();
-                        let seek_key = match key {
-                        OpSeekKey::TableRowId(rowid) => SeekKey::TableRowId(*rowid),
-                        OpSeekKey::IndexKeyOwned(record) => SeekKey::IndexKey(record),
-                        OpSeekKey::IndexKeyFromRegister(record_reg) => match &state.registers[*record_reg] {
-                            Register::Record(ref record) => SeekKey::IndexKey(record),
-                            _ => unreachable!("op_seek: record_reg should be a Record register when OpSeekKey::IndexKeyFromRegister is used"),
+                    let seek_result = match key {
+                        OpSeekKey::TableRowId(rowid) => {
+                            let cursor = get_cursor!(state, cursor_id).as_btree_mut();
+                            match cursor.seek(SeekKey::TableRowId(*rowid), *op)? {
+                                IOResult::Done(seek_result) => seek_result,
+                                IOResult::IO(io) => return Ok(SeekInternalResult::IO(io)),
+                            }
                         }
-                    };
-                        match cursor.seek(seek_key, *op)? {
-                            IOResult::Done(seek_result) => seek_result,
-                            IOResult::IO(io) => return Ok(SeekInternalResult::IO(io)),
+                        OpSeekKey::IndexKeyOwned(record) => {
+                            let cursor = get_cursor!(state, cursor_id).as_btree_mut();
+                            match cursor.seek(SeekKey::IndexKey(record), *op)? {
+                                IOResult::Done(seek_result) => seek_result,
+                                IOResult::IO(io) => return Ok(SeekInternalResult::IO(io)),
+                            }
+                        }
+                        OpSeekKey::IndexKeyFromRegister(record_reg) => {
+                            let (cursor, record) = {
+                                let (cursors, registers) = (&mut state.cursors, &state.registers);
+                                let cursor = cursors
+                                    .get_mut(cursor_id)
+                                    .and_then(|c| c.as_mut())
+                                    .expect("op_seek: cursor should be allocated")
+                                    .as_btree_mut();
+                                let record = match &registers[*record_reg] {
+                                    Register::Record(ref record) => record,
+                                    _ => unreachable!("op_seek: record_reg should be a Record register when OpSeekKey::IndexKeyFromRegister is used"),
+                                };
+                                (cursor, record)
+                            };
+                            match cursor.seek(SeekKey::IndexKey(record), *op)? {
+                                IOResult::Done(seek_result) => seek_result,
+                                IOResult::IO(io) => return Ok(SeekInternalResult::IO(io)),
+                            }
+                        }
+                        OpSeekKey::IndexKeyUnpacked {
+                            cursor_id: _,
+                            start_reg,
+                            num_regs,
+                        } => {
+                            let start_reg = *start_reg;
+                            let num_regs = *num_regs;
+                            #[cfg(debug_assertions)]
+                            let snapshot: Vec<crate::Value> = state.registers[start_reg..start_reg + num_regs]
+                                .iter()
+                                .map(|r| r.get_value().to_owned())
+                                .collect();
+
+                            let cursor = get_cursor!(state, cursor_id).as_btree_mut();
+                            let registers = &state.registers[start_reg..start_reg + num_regs];
+
+                            let res = cursor.seek_unpacked(registers, *op);
+
+                            #[cfg(debug_assertions)] // better todo and should this be in prod?
+                            {
+                                for (i, (current, original)) in state.registers[start_reg..start_reg + num_regs]
+                                    .iter()
+                                    .zip(snapshot.iter())
+                                    .enumerate()
+                                {
+                                    debug_assert_eq!(
+                                        &current.get_value().to_owned(),
+                                        original,
+                                        "No shouldn'tt happen {}",
+                                        start_reg + i
+                                    );
+                                }
+                            }
+
+                            match res? {
+                                IOResult::Done(seek_result) => seek_result,
+                                IOResult::IO(io) => return Ok(SeekInternalResult::IO(io)),
+                            }
                         }
                     };
                     // Increment btree_seeks metric after seek operation and cursor is dropped

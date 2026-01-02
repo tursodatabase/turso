@@ -24,14 +24,16 @@ use crate::{
         find_compare, get_tie_breaker_from_seek_op, IOCompletions, IndexInfo, RecordCompare,
         SeekResult,
     },
+    vdbe::Register,
     util::IOExt,
     Completion,
 };
 
 use crate::{
     return_corrupt, return_if_io,
-    types::{compare_immutable, IOResult, ImmutableRecord, SeekKey, SeekOp, Value, ValueRef},
-    LimboError, Result,
+    types::{
+        compare_immutable, IOResult, ImmutableRecord, SeekKey, SeekOp, Value, ValueRef, AsValueRef,
+    },LimboError, Result,
 };
 
 use super::{
@@ -564,6 +566,7 @@ pub trait CursorTrait: Any + Send + Sync {
     fn record(&mut self) -> Result<IOResult<Option<&ImmutableRecord>>>;
     /// Move the cursor based on the key and the type of operation (op).
     fn seek(&mut self, key: SeekKey<'_>, op: SeekOp) -> Result<IOResult<SeekResult>>;
+    fn seek_unpacked(&mut self, registers: &[Register], op: SeekOp) -> Result<IOResult<SeekResult>>;
     /// Insert a record in the position the cursor is at.
     fn insert(&mut self, key: &BTreeKey) -> Result<IOResult<()>>;
     /// Delete a record in the position the cursor is at.
@@ -1091,6 +1094,12 @@ impl BTreeCursor {
         Ok(IOResult::Done(ret))
     }
 
+    fn do_seek_unpacked(&mut self, registers: &[Register], op: SeekOp) -> Result<IOResult<SeekResult>> {
+        let ret = return_if_io!(self.indexbtree_seek_unpacked(registers, op));
+        self.valid_state = CursorValidState::Valid;
+        Ok(IOResult::Done(ret))
+    }
+
     /// Move the cursor to the root page of the btree.
     #[instrument(skip_all, level = Level::DEBUG)]
     fn move_to_root(&mut self) -> Result<Option<Completion>> {
@@ -1338,6 +1347,62 @@ impl BTreeCursor {
                 .expect("indexbtree_move_to without index_info");
             find_compare(key_values.iter().peekable(), index_info)
         };
+        self.indexbtree_move_to_internal(cmp, record_comparer, &key_values)
+    }
+
+    #[instrument(skip(self, registers), level = Level::DEBUG)]
+    fn indexbtree_move_to_unpacked(
+        &mut self,
+        registers: &[Register],
+        cmp: SeekOp,
+    ) -> Result<IOResult<()>> {
+        if matches!(
+            self.seek_state,
+            CursorSeekState::LeafPageBinarySearch { .. } | CursorSeekState::FoundLeaf { .. }
+        ) {
+            self.seek_state = CursorSeekState::Start;
+        }
+
+        if matches!(self.seek_state, CursorSeekState::Start) {
+            if let Some(c) = self.move_to_root()? {
+                return Ok(IOResult::IO(IOCompletions::Single(c)));
+            }
+        }
+
+        if registers.len() <= 16 {
+            let mut kv_buf = [ValueRef::Null; 16];
+            for (i, r) in registers.iter().enumerate() {
+                kv_buf[i] = r.get_value().as_value_ref();
+            }
+            let key_values = &kv_buf[..registers.len()];
+            let record_comparer = {
+                let index_info = self
+                    .index_info
+                    .as_ref()
+                    .expect("indexbtree_move_to_unpacked without index_info");
+                find_compare(key_values.iter().peekable(), index_info)
+            };
+            self.indexbtree_move_to_internal(cmp, record_comparer, key_values)
+        } else {
+            let key_values: Vec<ValueRef<'_>> =
+                registers.iter().map(|r| r.get_value().as_value_ref()).collect();
+            let record_comparer = {
+                let index_info = self
+                    .index_info
+                    .as_ref()
+                    .expect("indexbtree_move_to_unpacked without index_info");
+                find_compare(key_values.iter().peekable(), index_info)
+            };
+            self.indexbtree_move_to_internal(cmp, record_comparer, &key_values)
+        }
+    }
+
+    fn indexbtree_move_to_internal(
+        &mut self,
+        cmp: SeekOp,
+        record_comparer: RecordCompare,
+        key_values: &[ValueRef<'_>],
+    ) -> Result<IOResult<()>> {
         tracing::debug!("Using record comparison strategy: {:?}", record_comparer);
         let tie_breaker = get_tie_breaker_from_seek_op(cmp);
 
@@ -1783,17 +1848,76 @@ impl BTreeCursor {
             record_comparer
         );
 
+        self.indexbtree_seek_internal(seek_op, record_comparer, &key_values)
+    }
+
+    #[instrument(skip_all, level = Level::DEBUG)]
+    fn indexbtree_seek_unpacked(
+        &mut self,
+        registers: &[Register],
+        seek_op: SeekOp,
+    ) -> Result<IOResult<SeekResult>> {
+        if registers.len() <= 16 {
+            let mut kv_buf = [ValueRef::Null; 16];
+            for (i, r) in registers.iter().enumerate() {
+                kv_buf[i] = r.get_value().as_value_ref();
+            }
+            let key_values = &kv_buf[..registers.len()];
+            let record_comparer = {
+                let index_info = self
+                    .index_info
+                    .as_ref()
+                    .expect("indexbtree_seek_unpacked without index_info");
+                find_compare(key_values.iter().peekable(), index_info)
+            };
+
+            tracing::debug!(
+                "Using record comparison strategy for seek: {:?}",
+                record_comparer
+            );
+
+            self.indexbtree_seek_internal(seek_op, record_comparer, key_values)
+        } else {
+            let key_values: Vec<ValueRef<'_>> =
+                registers.iter().map(|r| r.get_value().as_value_ref()).collect();
+            let record_comparer = {
+                let index_info = self
+                    .index_info
+                    .as_ref()
+                    .expect("indexbtree_seek_unpacked without index_info");
+                find_compare(key_values.iter().peekable(), index_info)
+            };
+
+            tracing::debug!(
+                "Using record comparison strategy for seek: {:?}",
+                record_comparer
+            );
+
+            self.indexbtree_seek_internal(seek_op, record_comparer, &key_values)
+        }
+    }
+
+    fn indexbtree_seek_internal(
+        &mut self,
+        seek_op: SeekOp,
+        record_comparer: RecordCompare,
+        key_values: &[ValueRef<'_>],
+    ) -> Result<IOResult<SeekResult>> {
         if matches!(
             self.seek_state,
             CursorSeekState::Start
                 | CursorSeekState::MovingBetweenPages { .. }
                 | CursorSeekState::InteriorPageBinarySearch { .. }
         ) {
-            // No need for another move_to_root. Move_to already moves to root
-            return_if_io!(self.move_to(SeekKey::IndexKey(key), seek_op));
+            if matches!(self.seek_state, CursorSeekState::Start) {
+                if let Some(c) = self.move_to_root()? {
+                    return Ok(IOResult::IO(IOCompletions::Single(c)));
+                }
+            }
+            return_if_io!(self.indexbtree_move_to_internal(seek_op, record_comparer, key_values));
             let CursorSeekState::FoundLeaf { eq_seen } = &self.seek_state else {
                 unreachable!(
-                    "We must still be in FoundLeaf state after move_to, got: {:?}",
+                    "We must still be in FoundLeaf state after indexbtree_move_to_internal, got: {:?}",
                     self.seek_state
                 );
             };
@@ -1842,7 +1966,7 @@ impl BTreeCursor {
             let control = self.indexbtree_seek_inner(
                 seek_op,
                 old_top_idx,
-                &key_values,
+                key_values,
                 record_comparer,
                 &mut state,
             )?;
@@ -4882,6 +5006,23 @@ impl CursorTrait for BTreeCursor {
         Ok(IOResult::Done(seek_result))
     }
 
+    #[instrument(skip(self, registers), level = Level::DEBUG)]
+    fn seek_unpacked(&mut self, registers: &[Register], op: SeekOp) -> Result<IOResult<SeekResult>> {
+        self.skip_advance = false;
+            // Empty trace to capture the span information
+        tracing::trace!("");
+        // We need to clear the null flag for the table cursor before seeking,
+        // because it might have been set to false by an unmatched left-join row during the previous iteration
+        // on the outer loop.
+        self.set_null_flag(false);
+        let seek_result = return_if_io!(self.do_seek_unpacked(registers, op));
+        self.invalidate_record();
+        // Reset seek state
+        self.seek_state = CursorSeekState::Start;
+        self.valid_state = CursorValidState::Valid;
+        Ok(IOResult::Done(seek_result))
+    }
+
     #[instrument(skip(self), level = Level::DEBUG)]
     fn record(&mut self) -> Result<IOResult<Option<&ImmutableRecord>>> {
         if !self.has_record() {
@@ -7773,7 +7914,8 @@ mod tests {
             database::DatabaseFile, page_cache::PageCache, pager::default_page1,
             sqlite3_ondisk::PageSize,
         },
-        types::Text,
+        translate::collate::CollationSeq,
+        types::{AsValueRef, IndexInfo, KeyInfo, Text},
         vdbe::Register,
         BufferPool, Completion, Connection, IOContext, StepResult, Wal, WalFile, WalFileShared,
     };
