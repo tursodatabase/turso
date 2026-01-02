@@ -1780,6 +1780,38 @@ where
     std::cmp::Ordering::Equal
 }
 
+pub fn compare_immutable_iter<V, E1, E2>(
+    mut l: E1,
+    mut r: E2,
+    column_info: &[KeyInfo],
+) -> Result<std::cmp::Ordering>
+where
+    V: AsValueRef,
+    E1: Iterator<Item = Result<V>>,
+    E2: Iterator<Item = Result<V>>,
+{
+    for col_info in column_info.iter() {
+        let l = match l.next() {
+            Some(v) => v,
+            None => break,
+        };
+        let r = match r.next() {
+            Some(v) => v,
+            None => break,
+        };
+        let column_order = col_info.sort_order;
+        let collation = col_info.collation;
+        let cmp = compare_immutable_single(l?, r?, collation);
+        if !cmp.is_eq() {
+            return match column_order {
+                SortOrder::Asc => Ok(cmp),
+                SortOrder::Desc => Ok(cmp.reverse()),
+            };
+        }
+    }
+    Ok(std::cmp::Ordering::Equal)
+}
+
 pub fn compare_immutable_single<V1, V2>(l: V1, r: V2, collation: CollationSeq) -> std::cmp::Ordering
 where
     V1: AsValueRef,
