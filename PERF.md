@@ -54,6 +54,8 @@ The naive script will build and run limbo in release mode and execute the given 
 
 ## TPC-H
 
+on linux if you are using `tlp` to manage power settings, you may want to disable it while running the TPC-H benchmark as it can affect performance. consider changing swap to `swapoff -a`
+
 Run the benchmark script:
 
 ```shell

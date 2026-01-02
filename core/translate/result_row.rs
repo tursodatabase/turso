@@ -34,24 +34,32 @@ pub fn emit_select_result(
     }
 
     let start_reg = reg_result_cols_start;
-    for (i, rc) in plan.result_columns.iter().enumerate().filter(|(_, rc)| {
-        // For aggregate queries, we handle columns differently; example: select id, first_name, sum(age) from users limit 1;
-        // 1. Columns with aggregates (e.g., sum(age)) are computed in each iteration of aggregation
-        // 2. Non-aggregate columns (e.g., id, first_name) are only computed once in the first iteration
-        // This filter ensures we only emit expressions for non aggregate columns once,
-        // preserving previously calculated values while updating aggregate results
-        // For all other queries where reg_nonagg_emit_once_flag is none we do nothing.
-        reg_nonagg_emit_once_flag.is_some() && rc.contains_aggregates
-            || reg_nonagg_emit_once_flag.is_none()
-    }) {
-        let reg = start_reg + i;
-        translate_expr(
-            program,
-            Some(&plan.table_references),
-            &rc.expr,
-            reg,
-            resolver,
-        )?;
+
+    let skip_column_eval = matches!(
+        plan.query_destination,
+        QueryDestination::ExistsSubqueryResult { .. }
+    );
+
+    if !skip_column_eval {
+        for (i, rc) in plan.result_columns.iter().enumerate().filter(|(_, rc)| {
+            // For aggregate queries, we handle columns differently; example: select id, first_name, sum(age) from users limit 1;
+            // 1. Columns with aggregates (e.g., sum(age)) are computed in each iteration of aggregation
+            // 2. Non-aggregate columns (e.g., id, first_name) are only computed once in the first iteration
+            // This filter ensures we only emit expressions for non aggregate columns once,
+            // preserving previously calculated values while updating aggregate results
+            // For all other queries where reg_nonagg_emit_once_flag is none we do nothing.
+            reg_nonagg_emit_once_flag.is_some() && rc.contains_aggregates
+                || reg_nonagg_emit_once_flag.is_none()
+        }) {
+            let reg = start_reg + i;
+            translate_expr(
+                program,
+                Some(&plan.table_references),
+                &rc.expr,
+                reg,
+                resolver,
+            )?;
+        }
     }
 
     // Handle SELECT DISTINCT deduplication
