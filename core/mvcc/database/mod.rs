@@ -1930,9 +1930,17 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             let range = create_seek_range(start, direction);
             match direction {
                 IterationDirection::Forwards => Box::new(self.rows.range(range))
-                    as Box<dyn Iterator<Item = Entry<'_, RowID, RwLock<Vec<RowVersion>>>>>,
+                    as Box<
+                        dyn Iterator<Item = Entry<'_, RowID, RwLock<Vec<RowVersion>>>>
+                            + Send
+                            + Sync,
+                    >,
                 IterationDirection::Backwards => Box::new(self.rows.range(range).rev())
-                    as Box<dyn Iterator<Item = Entry<'_, RowID, RwLock<Vec<RowVersion>>>>>,
+                    as Box<
+                        dyn Iterator<Item = Entry<'_, RowID, RwLock<Vec<RowVersion>>>>
+                            + Send
+                            + Sync,
+                    >,
             }
         };
         *table_iterator = Some(static_iterator_hack!(iter_box, RowID));
@@ -1969,9 +1977,17 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let range = create_seek_range(start, direction);
         let iter_box = match direction {
             IterationDirection::Forwards => Box::new(index_rows.range(range))
-                as Box<dyn Iterator<Item = Entry<'_, SortableIndexKey, RwLock<Vec<RowVersion>>>>>,
+                as Box<
+                    dyn Iterator<Item = Entry<'_, SortableIndexKey, RwLock<Vec<RowVersion>>>>
+                        + Send
+                        + Sync,
+                >,
             IterationDirection::Backwards => Box::new(index_rows.range(range).rev())
-                as Box<dyn Iterator<Item = Entry<'_, SortableIndexKey, RwLock<Vec<RowVersion>>>>>,
+                as Box<
+                    dyn Iterator<Item = Entry<'_, SortableIndexKey, RwLock<Vec<RowVersion>>>>
+                        + Send
+                        + Sync,
+                >,
         };
         *index_iterator = Some(static_iterator_hack!(iter_box, SortableIndexKey));
         let mv_store_iterator = index_iterator
