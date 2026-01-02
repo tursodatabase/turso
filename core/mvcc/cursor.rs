@@ -1231,8 +1231,8 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                                         .cloned()
                                         .collect();
                                     let cmp = compare_immutable(
-                                        index_key.get_values(),
-                                        found_key.key.get_values(),
+                                        index_key.get_values()?,
+                                        found_key.key.get_values()?,
                                         &key_info,
                                     );
                                     cmp.is_eq()
