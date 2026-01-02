@@ -37,6 +37,7 @@
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 pub mod connection;
+mod connection_pool;
 pub mod params;
 mod rows;
 pub mod transaction;
@@ -57,6 +58,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::task::Poll;
 
+use crate::connection_pool::ConnectionPool;
 // Re-exports rows
 pub use crate::rows::{Row, Rows};
 
@@ -115,6 +117,7 @@ pub struct Builder {
     enable_encryption: bool,
     vfs: Option<String>,
     encryption_opts: Option<turso_sdk_kit::rsapi::EncryptionOpts>,
+    enable_connection_pool: bool,
 }
 
 impl Builder {
@@ -125,6 +128,7 @@ impl Builder {
             enable_encryption: false,
             vfs: None,
             encryption_opts: None,
+            enable_connection_pool: false,
         }
     }
 
@@ -140,6 +144,11 @@ impl Builder {
 
     pub fn with_io(mut self, vfs: String) -> Self {
         self.vfs = Some(vfs);
+        self
+    }
+
+    pub fn with_connection_pool(mut self, enable_connection_pool: bool) -> Self {
+        self.enable_connection_pool = enable_connection_pool;
         self
     }
 
@@ -161,7 +170,11 @@ impl Builder {
                 db_file: None,
             });
         db.open()?;
-        Ok(Database { inner: db })
+        let cp = Arc::new(ConnectionPool::new(false));
+        Ok(Database {
+            inner: db,
+            connection_pool: cp,
+        })
     }
 }
 
@@ -171,6 +184,7 @@ impl Builder {
 #[derive(Clone)]
 pub struct Database {
     inner: Arc<turso_sdk_kit::rsapi::TursoDatabase>,
+    connection_pool: Arc<ConnectionPool>,
 }
 
 impl Debug for Database {
@@ -182,8 +196,18 @@ impl Debug for Database {
 impl Database {
     /// Connect to the database.
     pub fn connect(&self) -> Result<Connection> {
+        match &self.connection_pool.is_enabled() {
+            true => match self.connection_pool.get() {
+                Some(c) => return Ok(c),
+                None => return self._connect(),
+            },
+            false => return self._connect(),
+        }
+    }
+
+    pub fn _connect(&self) -> Result<Connection> {
         let conn = self.inner.connect()?;
-        Ok(Connection::create(conn, None))
+        Ok(Connection::create(conn, self.connection_pool.clone(), None))
     }
 }
 
@@ -381,6 +405,7 @@ pub struct Transaction {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use connection_pool::ConnectionPool;
     use tempfile::NamedTempFile;
 
     #[tokio::test]
@@ -540,6 +565,85 @@ mod tests {
                 assert!(rows_iter.next().await?.is_none());
             }
         }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_connection_pool() -> Result<()> {
+        let db = Builder::new_local(":memory:")
+            .build()
+            .await
+            .expect("Turso Failed to Build memory db");
+
+        let cp = ConnectionPool::new(true);
+
+        // with a new connection pool we should get a None out
+        let no_connection = cp.get();
+        assert!(no_connection.is_none());
+        assert!(cp.available_connections() == 0);
+
+        let conn = db.connect()?;
+        cp.add(conn);
+        assert!(cp.available_connections() == 1);
+
+        let conn_r = cp.get();
+        assert!(conn_r.is_some());
+        match conn_r {
+            Some(c) => {
+                assert!(cp.available_connections() == 0);
+                cp.add(c);
+                assert!(cp.available_connections() == 1);
+            }
+            None => assert!(false),
+        }
+
+        let conn2 = db.connect()?;
+        cp.add(conn2);
+        assert!(cp.available_connections() == 2);
+
+        let conn3 = db.connect()?;
+        cp.add(conn3);
+        assert!(cp.available_connections() == 3);
+
+        let conn4 = db.connect()?;
+        cp.add(conn4);
+        assert!(cp.available_connections() == 4);
+
+        let _conn_r1 = cp.get();
+        assert!(cp.available_connections() == 3);
+        let _conn_r2 = cp.get();
+        assert!(cp.available_connections() == 2);
+        let _conn_r3 = cp.get();
+        assert!(cp.available_connections() == 1);
+        let _conn_r4 = cp.get();
+        assert!(cp.available_connections() == 0);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_no_connection_pool() -> Result<()> {
+        let db = Builder::new_local(":memory:")
+            .build()
+            .await
+            .expect("Turso Failed to Build memory db");
+
+        let cp = ConnectionPool::new(false);
+
+        // with a new connection pool we should get a None out
+        let no_connection = cp.get();
+        assert!(no_connection.is_none());
+        assert!(cp.available_connections() == 0);
+
+        // if we add a conmnection to a non existant pool then the number of connections is 0
+        let conn = db.connect()?;
+        cp.add(conn);
+        assert!(cp.available_connections() == 0);
+
+        // no pool so still can't get a connection out
+        let conn_r = cp.get();
+        assert!(conn_r.is_none());
 
         Ok(())
     }
