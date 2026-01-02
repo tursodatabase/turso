@@ -13,7 +13,7 @@ use crate::storage::database::DatabaseFile;
 use crate::storage::journal_mode;
 use crate::storage::page_cache::PageCache;
 use crate::storage::pager::{default_page1, CreateBTreeFlags, PageRef};
-use crate::storage::sqlite3_ondisk::{read_varint, DatabaseHeader, PageSize, RawVersion};
+use crate::storage::sqlite3_ondisk::{DatabaseHeader, PageSize, RawVersion};
 use crate::translate::collate::CollationSeq;
 use crate::types::{
     compare_immutable, compare_records_generic, AsValueRef, Extendable, IOCompletions,
@@ -52,7 +52,6 @@ use crate::{
     translate::emitter::TransactionMode,
 };
 use crate::{get_cursor, CheckpointMode, Completion, Connection, DatabaseStorage, MvCursor};
-use branches::unlikely;
 use either::Either;
 use std::any::Any;
 use std::env::temp_dir;
@@ -1037,7 +1036,9 @@ pub fn op_vcreate(
     let table_name = state.registers[*table_name].get_value().to_string();
     let args = if let Some(args_reg) = args_reg {
         if let Register::Record(rec) = &state.registers[*args_reg] {
-            rec.get_values().iter().map(|v| v.to_ffi()).collect()
+            rec.iter()?
+                .map(|v| v.map(|v| v.to_ffi()))
+                .collect::<Result<_, _>>()?
         } else {
             return Err(LimboError::InternalError(
                 "VCreate: args_reg is not a record".to_string(),
@@ -1518,193 +1519,29 @@ pub fn op_column(
                             };
                             let payload = record.get_payload();
 
-                            let record_cursor = record.cursor();
+                            let mut payload_iterator = record.iter()?;
 
-                            let mut data_offset = if unlikely(record_cursor.is_uninitialized()) {
-                                record_cursor.init_header(payload)?
-                            } else {
-                                record_cursor.last_offset()
-                            };
-
+                            let mut current_column = 0;
                             let target_column = *column;
-                            let mut parse_pos = record_cursor.header_offset;
 
                             // Parse the header for serial types incrementally until we have the target column
-                            while record_cursor.serials_offsets.len() <= target_column
-                                && parse_pos < record_cursor.header_size
-                            {
-                                let (serial_type, varint_len) = read_varint(&payload[parse_pos..])?;
-                                parse_pos += varint_len;
-                                let data_size = match serial_type {
-                                    // NULL
-                                    0 => 0,
-                                    // I8
-                                    1 => 1,
-                                    // I16
-                                    2 => 2,
-                                    // I24
-                                    3 => 3,
-                                    // I32
-                                    4 => 4,
-                                    // I48
-                                    5 => 6,
-                                    // I64
-                                    6 => 8,
-                                    // F64
-                                    7 => 8,
-                                    // CONST_INT0
-                                    8 => 0,
-                                    // CONST_INT1
-                                    9 => 0,
-                                    // BLOB
-                                    n if n >= 12 && n & 1 == 0 => (n - 12) >> 1,
-                                    // TEXT
-                                    n if n >= 13 && n & 1 == 1 => (n - 13) >> 1,
-                                    // Reserved
-                                    10 | 11 => {
-                                        return Err(LimboError::Corrupt(format!(
-                                            "Reserved serial type: {serial_type}"
-                                        )))
+                            while current_column <= target_column {
+                                match payload_iterator.next() {
+                                    Some(d) => {
+                                        if current_column == target_column {
+                                            state.registers[*dest] = Register::Value(d?.to_owned());
+                                            break 'outer;
+                                        }
                                     }
-                                    _ => unreachable!("Invalid serial type: {serial_type}"),
-                                } as usize;
-                                data_offset += data_size;
-                                record_cursor
-                                    .serials_offsets
-                                    .push((serial_type, data_offset));
+                                    None => {
+                                        branches::mark_unlikely();
+                                        // record has fewer columns than expected
+                                        break;
+                                    }
+                                };
+                                current_column += 1;
                             }
-
-                            debug_assert!(
-                                parse_pos <= record_cursor.header_size,
-                                "parse_pos: {parse_pos}, header_size: {}",
-                                record_cursor.header_size
-                            );
-                            record_cursor.header_offset = parse_pos;
-                            if target_column >= record_cursor.serials_offsets.len() {
-                                break 'ifnull;
-                            }
-
-                            let (serial_type, end_offset) =
-                                record_cursor.serials_offsets[target_column];
-                            let start_offset = if target_column == 0 {
-                                record_cursor.header_size
-                            } else {
-                                record_cursor.serials_offsets[target_column - 1].1
-                            };
-                            // SAFETY: We know that the payload is valid until the next row is processed.
-                            let buf = unsafe {
-                                std::mem::transmute::<&[u8], &'static [u8]>(
-                                    &payload[start_offset..end_offset],
-                                )
-                            };
-                            let serial_type = record_cursor.serials_offsets[target_column].0;
-
-                            match serial_type {
-                                // NULL
-                                0 => {
-                                    state.registers[*dest] = Register::Value(Value::Null);
-                                }
-                                // I8
-                                1 => state.registers[*dest].set_int(buf[0] as i8 as i64),
-                                // I16
-                                2 => state.registers[*dest]
-                                    .set_int(i16::from_be_bytes([buf[0], buf[1]]) as i64),
-                                // I24
-                                3 => {
-                                    let sign_extension = (buf[0] > 0x7F) as u8 * 0xFF;
-                                    state.registers[*dest].set_int(i32::from_be_bytes([
-                                        sign_extension,
-                                        buf[0],
-                                        buf[1],
-                                        buf[2],
-                                    ])
-                                        as i64);
-                                }
-                                // I32
-                                4 => state.registers[*dest]
-                                    .set_int(
-                                        i32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as i64
-                                    ),
-                                // I48
-                                5 => {
-                                    let sign_extension = (buf[0] > 0x7F) as u8 * 0xFF;
-                                    state.registers[*dest].set_int(i64::from_be_bytes([
-                                        sign_extension,
-                                        sign_extension,
-                                        buf[0],
-                                        buf[1],
-                                        buf[2],
-                                        buf[3],
-                                        buf[4],
-                                        buf[5],
-                                    ]));
-                                }
-                                // I64
-                                6 => state.registers[*dest].set_int(i64::from_be_bytes(
-                                    buf[..8]
-                                        .try_into()
-                                        .expect("slice should be exactly 8 bytes"),
-                                )),
-                                // F64
-                                7 => {
-                                    let val = f64::from_be_bytes(
-                                        buf[..8]
-                                            .try_into()
-                                            .expect("slice should be exactly 8 bytes"),
-                                    );
-                                    match &mut state.registers[*dest] {
-                                        Register::Value(Value::Float(existing)) => {
-                                            *existing = val;
-                                        }
-                                        _ => {
-                                            state.registers[*dest] =
-                                                Register::Value(Value::Float(val));
-                                        }
-                                    }
-                                }
-                                // CONST_INT0
-                                8 => state.registers[*dest].set_int(0),
-                                // CONST_INT1
-                                9 => state.registers[*dest].set_int(1),
-                                // BLOB
-                                n if n >= 12 && n & 1 == 0 => match state.registers[*dest] {
-                                    Register::Value(Value::Blob(ref mut existing_blob)) => {
-                                        existing_blob.do_extend(&buf);
-                                    }
-                                    _ => {
-                                        state.registers[*dest] =
-                                            Register::Value(Value::Blob(buf.to_vec()));
-                                    }
-                                },
-                                // TEXT
-                                n if n >= 13 && n & 1 == 1 => {
-                                    // SAFETY: serial type is TEXT, which guarantees valid UTF-8
-                                    let text = if cfg!(debug_assertions) {
-                                        std::str::from_utf8(buf).map_err(|e| {
-                                            LimboError::InternalError(format!(
-                                                "Invalid UTF-8 in TEXT serial type: {e}",
-                                            ))
-                                        })?
-                                    } else {
-                                        // SAFETY: TEXT serial type contains valid UTF-8 unless we opened a sqlite DB
-                                        // with corrupted data in the text column.
-                                        unsafe { std::str::from_utf8_unchecked(buf) }
-                                    };
-                                    match state.registers[*dest] {
-                                        Register::Value(Value::Text(ref mut existing_text)) => {
-                                            existing_text.do_extend(&text);
-                                        }
-                                        _ => {
-                                            state.registers[*dest] = Register::Value(Value::Text(
-                                                Text::new(text.to_string()),
-                                            ));
-                                        }
-                                    }
-                                }
-                                _ => panic!("Invalid serial type: {serial_type}"),
-                            }
-
-                            break 'outer;
+                            //break;
                         };
 
                         // DEFAULT handling
@@ -4421,7 +4258,7 @@ pub fn op_sorter_compare(
                 "Sorted record must be a record".to_string(),
             ));
         };
-        &record.get_values()[..*num_regs]
+        &record.get_values_range(0..*num_regs)?
     };
 
     // Inlined `state.get_cursor` to prevent borrowing conflit with `state.registers`
@@ -4439,7 +4276,7 @@ pub fn op_sorter_compare(
         ));
     };
 
-    let current_sorter_values = &current_sorter_record.get_values()[..*num_regs];
+    let current_sorter_values = &current_sorter_record.get_values_range(0..*num_regs)?;
     // If the current sorter record has a NULL in any of the significant fields, the comparison is not equal.
     let is_equal = current_sorter_values
         .iter()
@@ -5316,7 +5153,7 @@ pub fn op_function(
                 }
                 #[cfg(feature = "json")]
                 'outer: {
-                    use crate::types::RecordCursor;
+                    use crate::types::ValueIterator;
                     use std::str::FromStr;
 
                     let columns_str = state.registers[*start_reg].get_value();
@@ -5341,9 +5178,7 @@ pub fn op_function(
                         json::jsonb::Jsonb::from_str(columns_str.as_str())?;
                     let columns_len = columns_json_array.array_len()?;
 
-                    let mut record = ImmutableRecord::new(bin_record.len());
-                    record.start_serialization(bin_record);
-                    let mut record_cursor = RecordCursor::new();
+                    let mut payload_iterator = ValueIterator::new(bin_record.as_slice())?;
 
                     let mut json = json::jsonb::Jsonb::make_empty_obj(columns_len);
                     for i in 0..columns_len {
@@ -5359,7 +5194,16 @@ pub fn op_function(
                         let column_name = op.result();
                         json.append_jsonb_to_end(column_name.data());
 
-                        let val = record_cursor.get_value(&record, i)?;
+                        let val = match payload_iterator.next() {
+                            Some(Ok(v)) => v,
+                            Some(Err(e)) => return Err(e),
+                            None => {
+                                return Err(LimboError::InvalidArgument(
+                                    "bin_record_json_object: binary record has fewer columns than specified in the columns argument".to_string()
+                                ));
+                            }
+                        };
+
                         if let ValueRef::Blob(..) = val {
                             return Err(LimboError::InvalidArgument(
                                 "bin_record_json_object: formatting of BLOB values stored in binary record is not supported".to_string()
@@ -6316,11 +6160,7 @@ pub fn op_insert(
                             // Get the current record before deletion and extract values
                             let maybe_record = return_if_io!(cursor.record());
                             if let Some(record) = maybe_record {
-                                let mut values = record
-                                    .get_values()
-                                    .into_iter()
-                                    .map(|v| v.to_owned())
-                                    .collect::<Vec<_>>();
+                                let mut values = record.get_values_owned()?;
 
                                 // Fix rowid alias columns: replace Null with actual rowid value
                                 if let Some(table) = schema.get_table(table_name) {
@@ -6465,11 +6305,7 @@ pub fn op_insert(
                     };
 
                     // Add insertion of new row to view deltas
-                    let mut new_values = record
-                        .get_values()
-                        .into_iter()
-                        .map(|v| v.to_owned())
-                        .collect::<Vec<_>>();
+                    let mut new_values = record.get_values_owned()?;
 
                     // Fix rowid alias columns: replace Null with actual rowid value
                     let schema = program.connection.schema.read();
@@ -6582,11 +6418,7 @@ pub fn op_delete(
                     // Get the current record before deletion and extract values
                     let maybe_record = return_if_io!(cursor.record());
                     if let Some(record) = maybe_record {
-                        let mut values = record
-                            .get_values()
-                            .into_iter()
-                            .map(|v| v.to_owned())
-                            .collect::<Vec<_>>();
+                        let mut values = record.get_values_owned()?;
 
                         // Fix rowid alias columns: replace Null with actual rowid value
                         if let Some(table) = schema.get_table(table_name) {
@@ -6872,11 +6704,11 @@ pub fn op_idx_insert(
                 // UNIQUE indexes disallow duplicates like (a=1,b=2,rowid=1) and (a=1,b=2,rowid=2).
                 let existing_key = if has_rowid {
                     let count = record.column_count();
-                    &record.get_values()[..count.saturating_sub(1)]
+                    &record.get_values_range(0..count.saturating_sub(1))?
                 } else {
-                    &record.get_values()[..]
+                    &record.get_values()?[..]
                 };
-                let inserted_key_vals = &record_to_insert.get_values();
+                let inserted_key_vals = &record_to_insert.get_values()?;
                 if existing_key.len() != inserted_key_vals.len() {
                     break 'i false;
                 }
@@ -7272,10 +7104,7 @@ pub fn op_no_conflict(
                                 "NoConflict: expected a record in the register".into(),
                             ));
                         };
-                        record
-                            .get_values()
-                            .iter()
-                            .any(|val| matches!(val, ValueRef::Null))
+                        record.iter()?.any(|val| matches!(val, Ok(ValueRef::Null)))
                     }
                     RecordSource::Unpacked {
                         start_reg,
