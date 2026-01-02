@@ -1251,7 +1251,6 @@ fn find_best_starting_table(
 
         let base_rows = *base_table_rows[t];
 
-   
         let selectivity: f64 = constraints[t]
             .constraints
             .iter()

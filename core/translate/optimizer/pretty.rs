@@ -1792,22 +1792,22 @@ pub fn format_selectivity_breakdown(
     combined_selectivity: f64,
 ) -> String {
     let mut result = String::new();
-    
+
     // Header
     result.push_str(&format!(
         "┌─ Selectivity Breakdown ({}) {}\n",
         table(table_name),
         "─".repeat(40_usize.saturating_sub(table_name.len()))
     ));
-    
+
     // Base rows
     result.push_str(&format!("│ Base rows: {}\n", format_rows(base_rows)));
     result.push_str("├─────────────────────────────────────────────────────────┐\n");
-    
+
     // Applied constraints
     let applied: Vec<_> = entries.iter().filter(|e| e.applied).collect();
     let skipped: Vec<_> = entries.iter().filter(|e| !e.applied).collect();
-    
+
     for entry in &applied {
         let type_badge = match entry.constraint_type {
             super::constraints::ConstraintType::Literal => "[LIT] ",
@@ -1822,7 +1822,7 @@ pub fn format_selectivity_breakdown(
             entry.selectivity
         ));
     }
-    
+
     // Skipped constraints
     for entry in &skipped {
         let type_badge = match entry.constraint_type {
@@ -1837,12 +1837,15 @@ pub fn format_selectivity_breakdown(
             entry.display_name
         ));
     }
-    
+
     result.push_str("├─────────────────────────────────────────────────────────┤\n");
-    
+
     // Combined selectivity formula
     if !applied.is_empty() {
-        let formula: Vec<String> = applied.iter().map(|e| format!("{:.2}", e.selectivity)).collect();
+        let formula: Vec<String> = applied
+            .iter()
+            .map(|e| format!("{:.2}", e.selectivity))
+            .collect();
         result.push_str(&format!(
             "│ Combined: {} = {:.4}\n",
             formula.join(" × "),
@@ -1851,7 +1854,7 @@ pub fn format_selectivity_breakdown(
     } else {
         result.push_str(&format!("│ Combined: 1.0 (no constraints applied)\n"));
     }
-    
+
     // Estimated rows
     let estimated_rows = base_rows * combined_selectivity;
     result.push_str(&format!(
@@ -1861,7 +1864,7 @@ pub fn format_selectivity_breakdown(
         format_rows(estimated_rows)
     ));
     result.push_str("└─────────────────────────────────────────────────────────┘\n");
-    
+
     result
 }
 
