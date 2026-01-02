@@ -168,5 +168,14 @@ pub fn estimate_cost_for_scan_or_seek(
 
     let rows_visited = selectivity_multiplier * base_row_count * input_cardinality;
     let base_cost = estimate_page_io_cost(rows_visited);
-    base_cost
+
+    // This prevents choosing a non-covering index when there are no usable constraints.
+    let is_full_scan = usable_constraint_refs.is_empty();
+    let table_seek_penalty = if !index_info.covering && is_full_scan {
+        estimate_page_io_cost(rows_visited * 3.0)
+    } else {
+        Cost(0.0)
+    };
+
+    base_cost + table_seek_penalty
 }
