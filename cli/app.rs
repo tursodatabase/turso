@@ -33,8 +33,7 @@ use std::{
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use turso_core::{
-    Connection, Database, DatabaseOpts, LimboError, OpenFlags, QueryMode, Statement,
-    Value,StepResult,
+    Connection, Database, DatabaseOpts, LimboError, OpenFlags, QueryMode, Statement, Value,
 };
 
 #[derive(Parser, Debug)]
@@ -1931,21 +1930,23 @@ impl Limbo {
             "SELECT pgno, data FROM sqlite_dbpage ORDER BY pgno".to_string()
         };
 
+        let mut pages: Vec<(i64, Vec<u8>)> = Vec::new();
         if let Some(mut rows) = self.conn.query(&dump_sql)? {
-            step_rows::<_, ()>(&mut rows, |rows| {
-                let row = rows.row().unwrap();
+            rows.run_with_row_callback(|row| {
                 let pgno: i64 = row.get(0)?;
                 let value: &Value = row.get(1)?;
-                let data: &[u8] = match value {
-                    Value::Blob(bytes) => bytes,
-                    _ => &[],
+                let data: Vec<u8> = match value {
+                    Value::Blob(bytes) => bytes.clone(),
+                    _ => vec![],
                 };
-
-                let page = DbPage { pgno, data };
-                self.write_page_hexdump(&page, metadata.page_size)?;
-
-                Ok(StepControl::Continue)
+                pages.push((pgno, data));
+                Ok(())
             })?;
+        }
+
+        for (pgno, data) in &pages {
+            let page = DbPage { pgno: *pgno, data };
+            self.write_page_hexdump(&page, metadata.page_size)?;
         }
 
         writeln!(self, "| end {}", &metadata.filename)?;
@@ -1988,35 +1989,12 @@ impl Drop for Limbo {
     }
 }
 
-enum StepControl<T> {
-    Continue,
-    Break(T),
-}
-
-fn step_rows<F, T>(rows: &mut turso_core::Statement, mut callback: F) -> anyhow::Result<Option<T>>
-where
-    F: FnMut(&turso_core::Statement) -> anyhow::Result<StepControl<T>>,
-{
-    loop {
-        match rows.step()? {
-            StepResult::Row => {
-                if let StepControl::Break(val) = callback(rows)? {
-                    return Ok(Some(val));
-                }
-            }
-            StepResult::IO => rows._io().step()?,
-            StepResult::Done | StepResult::Interrupt => break,
-            StepResult::Busy => anyhow::bail!("database is busy"),
-        }
-    }
-    Ok(None)
-}
 
 fn fetch_single_i64(rows: &mut turso_core::Statement) -> anyhow::Result<i64> {
-    let result = step_rows(rows, |rows| {
-        let row_val: i64 = rows.row().unwrap().get(0)?;
-        Ok(StepControl::Break(row_val))
+    let mut result: Option<i64> = None;
+    rows.run_with_row_callback(|row| {
+        result = Some(row.get(0)?);
+        Ok(())
     })?;
-
     result.ok_or_else(|| anyhow!("query did not return a row"))
 }
