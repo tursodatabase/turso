@@ -37,9 +37,8 @@ impl ReadRecord {
                                 "Found key {key:?} in aggregate storage but could not read record"
                             ))
                         })?;
-                        let values = r.get_values()?;
                         // The blob is in column 3: operator_id, zset_id, element_id, value, weight
-                        let blob = values[3].to_owned();
+                        let blob = r.get_value(3)?.to_owned();
 
                         let (state, _group_key) = match blob {
                             Value::Blob(blob) => AggregateState::from_blob(&blob),
