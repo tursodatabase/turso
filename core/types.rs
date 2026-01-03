@@ -1057,6 +1057,53 @@ impl ImmutableRecord {
         Ok(values)
     }
 
+    // Idx values must be sorted ascending
+    pub fn get_two_values(&self, idx1: usize, idx2: usize) -> Result<(ValueRef<'_>, ValueRef<'_>)> {
+        let mut iter = self.iter()?;
+        let val1 = iter.nth(idx1);
+        let val2 = iter.nth(idx2 - idx1 - 1); // idx2 - idx1 - 1 because we already advanced to idx1
+        match (val1, val2) {
+            (Some(v1), Some(v2)) => Ok((v1?, v2?)),
+            _ => Err(LimboError::InternalError("index out of bound".to_string())),
+        }
+    }
+
+    // Idx values must be sorted ascending
+    pub fn get_three_values(
+        &self,
+        idx1: usize,
+        idx2: usize,
+        idx3: usize,
+    ) -> Result<(ValueRef<'_>, ValueRef<'_>, ValueRef<'_>)> {
+        let mut iter = self.iter()?;
+        let val1 = iter.nth(idx1);
+        let val2 = iter.nth(idx2 - idx1 - 1); // idx2 - idx1 - 1 because we already advanced to idx1
+        let val3 = iter.nth(idx3 - idx2 - 1); // idx3 - idx2 - 1 because we already advanced to idx2
+        match (val1, val2, val3) {
+            (Some(v1), Some(v2), Some(v3)) => Ok((v1?, v2?, v3?)),
+            _ => Err(LimboError::InternalError("index out of bound".to_string())),
+        }
+    }
+
+    // Idx values must be sorted ascending
+    pub fn get_four_values(
+        &self,
+        idx1: usize,
+        idx2: usize,
+        idx3: usize,
+        idx4: usize,
+    ) -> Result<(ValueRef<'_>, ValueRef<'_>, ValueRef<'_>, ValueRef<'_>)> {
+        let mut iter = self.iter()?;
+        let val1 = iter.nth(idx1);
+        let val2 = iter.nth(idx2 - idx1 - 1); // idx2 - idx1 - 1 because we already advanced to idx1
+        let val3 = iter.nth(idx3 - idx2 - 1); // idx3 - idx2 - 1 because we already advanced to idx2
+        let val4 = iter.nth(idx4 - idx3 - 1); // idx4 - idx3 - 1 because we already advanced to idx3
+        match (val1, val2, val3, val4) {
+            (Some(v1), Some(v2), Some(v3), Some(v4)) => Ok((v1?, v2?, v3?, v4?)),
+            _ => Err(LimboError::InternalError("index out of bound".to_string())),
+        }
+    }
+
     // Don't use this in performance critical paths, prefer using `iter()` instead
     pub fn get_values_owned(&self) -> Result<Vec<Value>> {
         let iter = self.iter().expect("Failed to create payload iterator");
