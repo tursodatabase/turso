@@ -1483,25 +1483,29 @@ impl<'a> Iterator for ValueIterator<'a> {
 
         let mut data_sum = 0;
         for _ in 0..n {
-            if header.is_empty() {
+            if unlikely(header.is_empty()) {
                 return None;
             }
 
             let (serial_type, bytes_read) = match read_varint(header) {
                 Ok(v) => v,
-                Err(e) => return Some(Err(e)),
+                Err(e) => {
+                    mark_unlikely();
+                    return Some(Err(e));
+                }
             };
             header = &header[bytes_read..];
 
-            let serial_type_obj = match SerialType::try_from(serial_type) {
-                Ok(v) => v,
-                Err(e) => return Some(Err(e)),
+            data_sum += match get_serial_type_size(serial_type) {
+                Ok(size) => size,
+                Err(e) => {
+                    mark_unlikely();
+                    return Some(Err(e));
+                }
             };
-
-            data_sum += serial_type_obj.size();
         }
 
-        if data_sum > data.len() {
+        if unlikely(data_sum > data.len()) {
             return Some(Err(LimboError::Corrupt(
                 "Data section too small for indicated serial type size".into(),
             )));
@@ -1535,24 +1539,9 @@ impl<'a> Iterator for ValueIterator<'a> {
         // Update header section to remove the consumed serial type
         self.header_section.set(&header[bytes_read..]);
 
-        let serial_type_obj = match SerialType::try_from(serial_type) {
-            Ok(v) => v,
-            Err(e) => {
-                mark_unlikely();
-                return Some(Err(e));
-            }
-        };
-
         let data_section = self.data_section.get();
-        let data_size = serial_type_obj.size();
 
-        if unlikely(data_size > data_section.len()) {
-            return Some(Err(LimboError::Corrupt(
-                "Data section too small for indicated serial type size".into(),
-            )));
-        }
-
-        match crate::storage::sqlite3_ondisk::read_value(data_section, serial_type_obj) {
+        match crate::storage::sqlite3_ondisk::read_value_serial_type(data_section, serial_type) {
             Ok((value, n)) => {
                 self.data_section.set(&data_section[n..]);
                 Some(Ok(value))
