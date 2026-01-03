@@ -33,7 +33,8 @@ use std::{
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 use turso_core::{
-    Connection, Database, DatabaseOpts, LimboError, OpenFlags, QueryMode, Statement, Value,
+    Connection, Database, DatabaseOpts, LimboError, OpenFlags, QueryMode, Statement,
+    Value,StepResult,
 };
 
 #[derive(Parser, Debug)]
@@ -2003,7 +2004,7 @@ where
                     return Ok(Some(val));
                 }
             }
-            StepResult::IO => rows.run_once()?,
+            StepResult::IO => rows._io().step()?,
             StepResult::Done | StepResult::Interrupt => break,
             StepResult::Busy => anyhow::bail!("database is busy"),
         }
