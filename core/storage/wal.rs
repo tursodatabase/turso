@@ -2805,7 +2805,7 @@ pub mod test {
         types::IOResult,
         util::IOExt,
         CheckpointMode, CheckpointResult, Completion, Connection, Database, LimboError, PlatformIO,
-        Wal, WalFile, WalFileShared, IO,
+        Wal, WalFileShared, IO,
     };
     use parking_lot::{Mutex, RwLock};
     #[cfg(unix)]
@@ -3369,14 +3369,15 @@ pub mod test {
         let _ = wal.begin_write_tx();
     }
 
-    fn check_read_lock_slot(conn: &Arc<Connection>, expected_slot: usize) -> bool {
+    fn check_read_lock_slot(conn: &Arc<Connection>, _expected_slot: usize) -> bool {
         let pager = conn.pager.load();
-        let wal = pager.wal.as_ref().unwrap();
+        let _wal = pager.wal.as_ref().unwrap();
         #[cfg(debug_assertions)]
         {
-            let wal_any = wal.as_any();
-            if let Some(wal_file) = wal_any.downcast_ref::<WalFile>() {
-                return wal_file.max_frame_read_lock_index.load(Ordering::Acquire) == expected_slot;
+            let wal_any = _wal.as_any();
+            if let Some(wal_file) = wal_any.downcast_ref::<crate::WalFile>() {
+                return wal_file.max_frame_read_lock_index.load(Ordering::Acquire)
+                    == _expected_slot;
             }
         }
 
