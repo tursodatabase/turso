@@ -26,7 +26,9 @@ use turso_ext::VTabKind;
 
 fn validate(body: &ast::CreateTableBody, connection: &Connection) -> Result<()> {
     if let ast::CreateTableBody::ColumnsAndConstraints {
-        options, columns, ..
+        options,
+        columns,
+        constraints,
     } = &body
     {
         if options.contains(ast::TableOptions::STRICT) && !connection.experimental_strict_enabled()
@@ -67,6 +69,12 @@ fn validate(body: &ast::CreateTableBody, connection: &Connection) -> Result<()> 
                 {
                     bail_parse_error!("duplicate column name: {}", j.col_name.as_str());
                 }
+            }
+        }
+        // Also validate table-level constraints
+        for constraint in constraints {
+            if matches!(constraint.constraint, ast::TableConstraint::Check(_)) {
+                bail_parse_error!("CHECK constraints are not supported yet");
             }
         }
     }
