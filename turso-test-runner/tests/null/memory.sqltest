@@ -1,0 +1,106 @@
+@database :memory:
+
+# https://github.com/tursodatabase/turso/issues/3966
+test not-null-just-cuz-unique {
+    create table t (a int, x int unique);
+    insert into t(a) values(1);
+    select * from t;
+}
+expect {
+    1|
+}
+
+# Regression tests for NULL comparison with index scans
+# Any comparison with NULL should return 0 rows because NULL comparisons
+# always return NULL (unknown), which is falsy.
+
+# Ascending index: x > NULL should return 0 rows
+test null-comparison-asc-gt {
+    CREATE TABLE t1(x);
+    CREATE INDEX t1_idx ON t1(x ASC);
+    INSERT INTO t1 VALUES (1), (2), (3);
+    SELECT * FROM t1 WHERE x > NULL;
+}
+expect {
+}
+
+# Descending index: x > NULL should return 0 rows
+test null-comparison-desc-gt {
+    CREATE TABLE t2(x);
+    CREATE INDEX t2_idx ON t2(x DESC);
+    INSERT INTO t2 VALUES (1), (2), (3);
+    SELECT * FROM t2 WHERE x > NULL;
+}
+expect {
+}
+
+# Ascending index: x < NULL should return 0 rows
+test null-comparison-asc-lt {
+    CREATE TABLE t3(x);
+    CREATE INDEX t3_idx ON t3(x ASC);
+    INSERT INTO t3 VALUES (1), (2), (3);
+    SELECT * FROM t3 WHERE x < NULL;
+}
+expect {
+}
+
+# Descending index: x < NULL should return 0 rows
+test null-comparison-desc-lt {
+    CREATE TABLE t4(x);
+    CREATE INDEX t4_idx ON t4(x DESC);
+    INSERT INTO t4 VALUES (1), (2), (3);
+    SELECT * FROM t4 WHERE x < NULL;
+}
+expect {
+}
+
+# Ascending index: x >= NULL should return 0 rows
+test null-comparison-asc-ge {
+    CREATE TABLE t5(x);
+    CREATE INDEX t5_idx ON t5(x ASC);
+    INSERT INTO t5 VALUES (1), (2), (3);
+    SELECT * FROM t5 WHERE x >= NULL;
+}
+expect {
+}
+
+# Descending index: x >= NULL should return 0 rows
+test null-comparison-desc-ge {
+    CREATE TABLE t6(x);
+    CREATE INDEX t6_idx ON t6(x DESC);
+    INSERT INTO t6 VALUES (1), (2), (3);
+    SELECT * FROM t6 WHERE x >= NULL;
+}
+expect {
+}
+
+# Ascending index: x <= NULL should return 0 rows
+test null-comparison-asc-le {
+    CREATE TABLE t7(x);
+    CREATE INDEX t7_idx ON t7(x ASC);
+    INSERT INTO t7 VALUES (1), (2), (3);
+    SELECT * FROM t7 WHERE x <= NULL;
+}
+expect {
+}
+
+# Descending index: x <= NULL should return 0 rows
+test null-comparison-desc-le {
+    CREATE TABLE t8(x);
+    CREATE INDEX t8_idx ON t8(x DESC);
+    INSERT INTO t8 VALUES (1), (2), (3);
+    SELECT * FROM t8 WHERE x <= NULL;
+}
+expect {
+}
+
+# Descending index with ORDER BY: x > NULL should return 0 rows
+test null-comparison-desc-order-by {
+    CREATE TABLE t9(x);
+    CREATE INDEX t9_idx ON t9(x DESC);
+    INSERT INTO t9 VALUES (1), (2), (3);
+    SELECT * FROM t9 WHERE x > NULL ORDER BY x DESC;
+}
+expect {
+}
+
