@@ -687,7 +687,7 @@ mod tests {
             let mut error = std::ptr::null();
             let status = turso_database_open(db, &mut error);
 
-            assert_eq!(status, turso_status_code_t::TURSO_ERROR);
+            assert_eq!(status, turso_status_code_t::TURSO_IOERR);
             assert_eq!(
                 std::ffi::CStr::from_ptr(error).to_str().unwrap(),
                 "I/O error: entity not found"

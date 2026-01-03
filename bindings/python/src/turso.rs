@@ -26,6 +26,7 @@ create_exception!(turso, Readonly, PyException, "database is readonly");
 create_exception!(turso, DatabaseFull, PyException, "database is full");
 create_exception!(turso, NotAdb, PyException, "not a database`");
 create_exception!(turso, Corrupt, PyException, "database corrupted");
+create_exception!(turso, IoError, PyException, "I/O error");
 
 pub(crate) fn turso_error_to_py_err(err: TursoError) -> PyErr {
     match err {
@@ -38,6 +39,7 @@ pub(crate) fn turso_error_to_py_err(err: TursoError) -> PyErr {
         rsapi::TursoError::DatabaseFull(message) => DatabaseFull::new_err(message),
         rsapi::TursoError::NotAdb(message) => NotAdb::new_err(message),
         rsapi::TursoError::Corrupt(message) => Corrupt::new_err(message),
+        rsapi::TursoError::IoError(kind) => IoError::new_err(format!("{kind:?}")),
     }
 }
 
