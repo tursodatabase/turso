@@ -294,45 +294,16 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
 
                 if version.row.id.table_id == SQLITE_SCHEMA_MVCC_TABLE_ID {
                     let row_data = ImmutableRecord::from_bin_record(version.row.payload().to_vec());
-                    let mut values = row_data.iter().expect("failed to parse record header");
 
-                    fn read_iterator_next<'a, I>(iter: &mut I, expect: &str) -> ValueRef<'a>
-                    where
-                        I: Iterator<Item = Result<ValueRef<'a>, LimboError>>,
-                    {
-                        iter.next()
-                            .ok_or_else(|| {
-                                LimboError::InternalError(
-                                    "Failed to read expected column from sqlite_schema".to_string(),
-                                )
-                            })
-                            .expect(expect)
-                            .expect(expect)
-                    }
-
-                    // sqlite_schema has 5 columns: type, name, tbl_name, rootpage, sql
-                    // Column 0: type (TEXT) - "table", "index", "view", "trigger"
-                    let type_value = read_iterator_next(
-                        &mut values,
-                        "failed to get column 0 (type) from sqlite_schema",
+                    let (col0, col3) = row_data.get_two_values(0, 3).expect(
+                        "failed to get columns 0 and 3 (type, rootpage) from sqlite_schema",
                     );
-                    let ValueRef::Text(type_str) = type_value else {
-                        panic!("sqlite_schema.type column must be TEXT, got {type_value:?}");
+
+                    let ValueRef::Text(type_str) = col0 else {
+                        panic!("sqlite_schema.type column must be TEXT, got {col0:?}");
                     };
 
-                    let _ignored_col1 = read_iterator_next(
-                        &mut values,
-                        "failed to get column 1 (name) from sqlite_schema",
-                    );
-                    let _ignored_col2 = read_iterator_next(
-                        &mut values,
-                        "failed to get column 2 (tbl_name) from sqlite_schema",
-                    );
-
-                    if let ValueRef::Integer(root_page) = read_iterator_next(
-                        &mut values,
-                        "failed to get column 3 (rootpage) from sqlite_schema",
-                    ) {
+                    if let ValueRef::Integer(root_page) = col3 {
                         if type_str.as_str() == "index" {
                             // This is an index schema change
                             let index_id = MVTableId::from(root_page);
