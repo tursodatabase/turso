@@ -417,6 +417,7 @@ fn update_pragma(
             connection.set_foreign_keys_enabled(enabled);
             Ok((program, TransactionMode::None))
         }
+        PragmaName::CollationList => unreachable!("collation_list cannot be set"),
     }
 }
 
@@ -786,6 +787,17 @@ fn query_pragma(
             program.emit_result_row(register, 1);
             program.add_pragma_result_column(pragma.to_string());
             Ok((program, TransactionMode::None))
+        }
+        PragmaName::CollationList => {
+            let base_register = register;
+            program.alloc_registers(2);
+            let collations = ["BINARY", "NOCASE", "RTRIM"];
+            for (i, name) in collations.iter().enumerate() {
+                program.emit_int(i as i64, base_register);
+                program.emit_string8(name.to_string(), base_register + 1);
+                program.emit_result_row(base_register, 2);
+            }
+            Ok((program, TransactionMode::Read))
         }
     }
 }

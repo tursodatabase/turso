@@ -1,4 +1,5 @@
 use crate::common::TempDatabase;
+use std::collections::HashMap;
 use turso_core::{StepResult, Value};
 
 #[turso_macros::test(mvcc)]
@@ -166,4 +167,41 @@ fn test_pragma_page_sizes_with_writes_persists(db: TempDatabase) {
         };
         assert_eq!(page_size, test_page_size);
     }
+}
+
+#[turso_macros::test(mvcc)]
+fn test_pragma_collation_list_returns_rows(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    let mut rows = conn
+        .query("PRAGMA collation_list;")
+        .unwrap()
+        .expect("expected  rows");
+    let mut count = 0;
+    while let StepResult::Row = rows.step().unwrap() {
+        count += 1;
+    }
+    assert_eq!(count, 3);
+}
+
+#[turso_macros::test(mvcc)]
+fn test_pragma_collation_list_contains_default_collations(db: TempDatabase) {
+    let conn = db.connect_limbo();
+    let mut default_collations: HashMap<String, bool> = HashMap::new();
+    default_collations.insert("BINARY".to_string(), true);
+    default_collations.insert("RTRIM".to_string(), true);
+    default_collations.insert("NOCASE".to_string(), true);
+    let mut counter = 0;
+    let mut rows = conn
+        .query("PRAGMA collation_list;")
+        .unwrap()
+        .expect("expected rows");
+    while let StepResult::Row = rows.step().unwrap() {
+        let row = rows.row().unwrap();
+        if let Value::Text(name) = row.get_value(1) {
+            if *default_collations.get(name.as_str()).unwrap() {
+                counter += 1;
+            }
+        }
+    }
+    assert_eq!(counter, 3);
 }
