@@ -1,0 +1,42 @@
+@database database/testing.db readonly
+@database database/testing_norowidalias.db readonly
+
+#!/usr/bin/env tclsh
+test concat {
+    SELECT 'Hello' || ' ' || 'World';
+}
+expect {
+    Hello World
+}
+
+test concat-2 {
+    SELECT 'Hello' || NULL;
+}
+expect {
+}
+
+test concat-3 {
+    SELECT 'Hello' || NULL;
+}
+expect {
+}
+
+test concat-4 {
+    SELECT 'A good ' || name FROM products WHERE name = 'hat';
+}
+expect {
+    A good hat
+}
+
+test concat-4-2 {
+    SELECT 'A good ' || name FROM products WHERE name = 'watch';
+}
+expect {
+}
+
+test concat-blob {
+    SELECT hex(x'01' || x'02');
+}
+expect {
+    0102
+}
