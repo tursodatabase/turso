@@ -554,15 +554,9 @@ pub fn begin_read_page(
         }
         let page = page.clone();
         let buffer = if bytes_read == 0 {
-            Buffer::new_temporary(0)
+            Arc::new(Buffer::new_temporary(0))
         } else {
-            // Unwrap the Arc to get ownership of the Buffer
-            Arc::try_unwrap(buf).unwrap_or_else(|arc| {
-                // If we can't unwrap (someone else has a reference), copy the data
-                let new_buf = Buffer::new_temporary(arc.len());
-                new_buf.as_mut_slice().copy_from_slice(arc.as_slice());
-                new_buf
-            })
+            buf
         };
         finish_read_page(page_idx, buffer, page.clone());
     });
@@ -571,7 +565,7 @@ pub fn begin_read_page(
 }
 
 #[instrument(skip_all, level = Level::DEBUG)]
-pub fn finish_read_page(page_idx: usize, buffer: Buffer, page: PageRef) {
+pub fn finish_read_page(page_idx: usize, buffer: Arc<Buffer>, page: PageRef) {
     tracing::trace!("finish_read_page(page_idx = {page_idx})");
     {
         let inner = page.get();

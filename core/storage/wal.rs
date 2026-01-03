@@ -1230,14 +1230,8 @@ impl Wal for WalFile {
                 bytes_read == buf_len as i32,
                 "read({bytes_read}) less than expected({buf_len}): frame_id={frame_id}"
             );
-            // Unwrap the Arc to get ownership of the Buffer
-            let buffer = Arc::try_unwrap(buf).unwrap_or_else(|arc| {
-                let new_buf = Buffer::new_temporary(arc.len());
-                new_buf.as_mut_slice().copy_from_slice(arc.as_slice());
-                new_buf
-            });
             let cloned = frame.clone();
-            finish_read_page(page.get().id, buffer, cloned);
+            finish_read_page(page.get().id, buf, cloned);
             let epoch = shared_file.read().epoch.load(Ordering::Acquire);
             frame.set_wal_tag(frame_id, epoch);
         });

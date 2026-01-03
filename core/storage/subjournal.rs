@@ -101,13 +101,7 @@ impl Subjournal {
                     bytes_read == page_size as i32,
                     "bytes_read should be page_size"
                 );
-                // Unwrap the Arc to get ownership of the Buffer
-                let buffer = Arc::try_unwrap(buf).unwrap_or_else(|arc| {
-                    let new_buf = Buffer::new_temporary(arc.len());
-                    new_buf.as_mut_slice().copy_from_slice(arc.as_slice());
-                    new_buf
-                });
-                finish_read_page(page.get().id, buffer, page.clone());
+                finish_read_page(page.get().id, buf, page.clone());
             },
         );
         let c = self.file.pread(offset, c)?;
