@@ -47,6 +47,7 @@ impl VirtualTable {
                 .expect("sqlite_dbpage schema resolution should not fail"),
             kind: VTabKind::TableValuedFunction,
             vtab_type: VirtualTableType::Internal(Arc::new(RwLock::new(dbpage_table))),
+            vtab_id: 0,
         };
         vec![Arc::new(dbpage_vtab)]
     }
