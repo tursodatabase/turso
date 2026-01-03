@@ -1599,48 +1599,47 @@ pub fn op_column(
                             };
                             let serial_type = record_cursor.serials_offsets[target_column].0;
 
+                            macro_rules! set_int {
+                                ($val:expr) => {
+                                    match &mut state.registers[*dest] {
+                                        Register::Value(Value::Integer(existing)) => {
+                                            *existing = $val;
+                                        }
+                                        _ => {
+                                            state.registers[*dest] =
+                                                Register::Value(Value::Integer($val));
+                                        }
+                                    }
+                                };
+                            }
+
                             match serial_type {
                                 // NULL
                                 0 => {
                                     state.registers[*dest] = Register::Value(Value::Null);
                                 }
                                 // I8
-                                1 => {
-                                    state.registers[*dest] =
-                                        Register::Value(Value::Integer(buf[0] as i8 as i64));
-                                }
+                                1 => set_int!(buf[0] as i8 as i64),
                                 // I16
-                                2 => {
-                                    state.registers[*dest] =
-                                        Register::Value(Value::Integer(i16::from_be_bytes([
-                                            buf[0], buf[1],
-                                        ])
-                                            as i64));
-                                }
+                                2 => set_int!(i16::from_be_bytes([buf[0], buf[1]]) as i64),
                                 // I24
                                 3 => {
                                     let sign_extension = (buf[0] > 0x7F) as u8 * 0xFF;
-                                    let value = Value::Integer(i32::from_be_bytes([
+                                    set_int!(i32::from_be_bytes([
                                         sign_extension,
                                         buf[0],
                                         buf[1],
                                         buf[2],
-                                    ])
-                                        as i64);
-                                    state.registers[*dest] = Register::Value(value);
+                                    ]) as i64);
                                 }
                                 // I32
-                                4 => {
-                                    let value = Value::Integer(i32::from_be_bytes([
-                                        buf[0], buf[1], buf[2], buf[3],
-                                    ])
-                                        as i64);
-                                    state.registers[*dest] = Register::Value(value);
-                                }
+                                4 => set_int!(
+                                    i32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as i64
+                                ),
                                 // I48
                                 5 => {
                                     let sign_extension = (buf[0] > 0x7F) as u8 * 0xFF;
-                                    let value = Value::Integer(i64::from_be_bytes([
+                                    set_int!(i64::from_be_bytes([
                                         sign_extension,
                                         sign_extension,
                                         buf[0],
@@ -1650,61 +1649,53 @@ pub fn op_column(
                                         buf[4],
                                         buf[5],
                                     ]));
-                                    state.registers[*dest] = Register::Value(value);
                                 }
                                 // I64
-                                6 => {
-                                    let value = Value::Integer(i64::from_be_bytes(
-                                        buf[..8]
-                                            .try_into()
-                                            .expect("slice should be exactly 8 bytes"),
-                                    ));
-                                    state.registers[*dest] = Register::Value(value);
-                                }
+                                6 => set_int!(i64::from_be_bytes(
+                                    buf[..8]
+                                        .try_into()
+                                        .expect("slice should be exactly 8 bytes")
+                                )),
                                 // F64
                                 7 => {
-                                    let value = Value::Float(f64::from_be_bytes(
+                                    let val = f64::from_be_bytes(
                                         buf[..8]
                                             .try_into()
                                             .expect("slice should be exactly 8 bytes"),
-                                    ));
-                                    state.registers[*dest] = Register::Value(value);
-                                }
-                                // CONST_INT0
-                                8 => {
-                                    state.registers[*dest] = Register::Value(Value::Integer(0));
-                                }
-                                // CONST_INT1
-                                9 => {
-                                    state.registers[*dest] = Register::Value(Value::Integer(1));
-                                }
-                                // BLOB
-                                n if n >= 12 && n & 1 == 0 => {
-                                    // Try to reuse the registers when allocation is not needed.
-                                    match state.registers[*dest] {
-                                        Register::Value(Value::Blob(ref mut existing_blob)) => {
-                                            existing_blob.do_extend(&buf);
+                                    );
+                                    match &mut state.registers[*dest] {
+                                        Register::Value(Value::Float(existing)) => {
+                                            *existing = val;
                                         }
                                         _ => {
                                             state.registers[*dest] =
-                                                Register::Value(Value::Blob(buf.to_vec()));
+                                                Register::Value(Value::Float(val));
                                         }
                                     }
                                 }
+                                // CONST_INT0
+                                8 => set_int!(0),
+                                // CONST_INT1
+                                9 => set_int!(1),
+                                // BLOB
+                                n if n >= 12 && n & 1 == 0 => match state.registers[*dest] {
+                                    Register::Value(Value::Blob(ref mut existing_blob)) => {
+                                        existing_blob.do_extend(&buf);
+                                    }
+                                    _ => {
+                                        state.registers[*dest] =
+                                            Register::Value(Value::Blob(buf.to_vec()));
+                                    }
+                                },
                                 // TEXT
                                 n if n >= 13 && n & 1 == 1 => {
-                                    // Try to reuse the registers when allocation is not needed.
+                                    // SAFETY: serial type is TEXT, which guarantees valid UTF-8
+                                    let text = unsafe { std::str::from_utf8_unchecked(buf) };
                                     match state.registers[*dest] {
                                         Register::Value(Value::Text(ref mut existing_text)) => {
-                                            // SAFETY: We know the text is valid UTF-8 because we only accept valid UTF-8 and the serial type is TEXT.
-                                            let text =
-                                                unsafe { std::str::from_utf8_unchecked(buf) };
                                             existing_text.do_extend(&text);
                                         }
                                         _ => {
-                                            // SAFETY: We know the text is valid UTF-8 because we only accept valid UTF-8 and the serial type is TEXT.
-                                            let text =
-                                                unsafe { std::str::from_utf8_unchecked(buf) };
                                             state.registers[*dest] = Register::Value(Value::Text(
                                                 Text::new(text.to_string()),
                                             ));
@@ -1717,7 +1708,7 @@ pub fn op_column(
                             break 'outer;
                         };
 
-                        // DEFAULT handling. Try to reuse the registers when allocation is not needed.
+                        // DEFAULT handling
                         let Some(ref default) = default else {
                             state.registers[*dest] = Register::Value(Value::Null);
                             break;
