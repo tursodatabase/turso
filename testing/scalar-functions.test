@@ -884,6 +884,10 @@ do_execsql_test cast-small-float-to-integer {
   SELECT CAST(-9223372036854775809.0 AS INTEGER);
 } {-9223372036854775808}
 
+do_execsql_test cast-large-text-to-integer {
+  SELECT CAST('9223372036854775808' AS INTEGER);
+} {9223372036854775807}
+
 do_execsql_test cast-text-exp-to-integer {
   SELECT CAST('123e+5' AS INTEGER);
 } {123}
@@ -961,10 +965,17 @@ do_execsql_test_regex sqlite-version-should-return-valid-output {
   SELECT sqlite_version();
 } {\d+\.\d+\.\d+}
 
-# TODO COMPAT: sqlite returns 9.22337203685478e+18, do we care...?
-# do_execsql_test cast-large-text-to-numeric {
-#   SELECT typeof(CAST('9223372036854775808' AS NUMERIC)), CAST('9223372036854775808' AS NUMERIC);
-# } {real|9.223372036854776e18}
+do_execsql_test cast-large-text-to-numeric {
+  SELECT typeof(CAST('9223372036854775808' AS NUMERIC)), CAST('9223372036854775808' AS NUMERIC);
+} {real|9.22337203685478e+18}
+
+do_execsql_test cast-max-i64-text-to-numeric {
+  SELECT CAST('9223372036854775807' AS NUMERIC);
+} {9223372036854775807}
+
+do_execsql_test cast-negative-large-text-to-numeric {
+  SELECT CAST('-9223372036854775809' AS NUMERIC);
+} {-9.22337203685478e+18}
 
 do_execsql_test cast-null-to-any {
   SELECT CAST(NULL AS INTEGER), CAST(NULL AS TEXT), CAST(NULL AS BLOB), CAST(NULL AS REAL), CAST(NULL AS NUMERIC);
