@@ -1,0 +1,140 @@
+@database database/testing.db readonly
+@database database/testing_norowidalias.db readonly
+
+#!/usr/bin/env tclsh
+test numberic-literal-1 {
+    SELECT 45;
+}
+expect {
+    45
+}
+
+test numberic-literal-2 {
+    SELECT 0x7FFFFFFFFFFFFFFF;
+}
+expect {
+    9223372036854775807
+}
+
+test numberic-literal-3 {
+    SELECT -0x7FFFFFFFFFFFFFFF;
+}
+expect {
+    -9223372036854775807
+}
+
+test numberic-literal-4 {
+    SELECT +0x7FFFFFFFFFFFFFFF;
+}
+expect {
+    9223372036854775807
+}
+
+test numberic-literal-5 {
+    SELECT 9_223_372_036_854_775_807;
+}
+expect {
+    9223372036854775807
+}
+
+test numberic-literal-6 {
+    SELECT -9_223_372_036_854_775_808;
+}
+expect {
+    -9223372036854775808
+}
+
+test numberic-literal-7 {
+    SELECT 1_000;
+}
+expect {
+    1000
+}
+
+test numberic-literal-8 {
+    SELECT 1.1_1;
+}
+expect {
+    1.11
+}
+
+test numberic-literal-9 {
+    SELECT 1e12;
+}
+expect {
+    1000000000000.0
+}
+
+test numberic-literal-10 {
+    SELECT 1.0;
+}
+expect {
+    1.0
+}
+
+test numberic-literal-11 {
+    SELECT 1e1000;
+}
+expect {
+    Inf
+}
+
+test numberic-literal-12 {
+    SELECT -1e1000;
+}
+expect {
+    -Inf
+}
+
+test numberic-literal-13 {
+    SELECT 1e1_000;
+}
+expect {
+    Inf
+}
+
+test numberic-literal-14 {
+    SELECT 12_3_456.7_8_9;
+}
+expect {
+    123456.789
+}
+
+test numberic-literal-exceed-max-i64 {
+    SELECT 9_223_372_036_854_775_808;
+}
+expect {
+    9.22337203685478e+18
+}
+
+test numberic-literal-exceed-min-i64 {
+    SELECT -9_223_372_036_854_775_809;
+}
+expect {
+    -9.22337203685478e+18
+}
+
+test invalid-numberic-literal-1 {
+    SELECT 0xFF__FF;
+}
+expect error {
+}
+
+test invalid-numberic-literal-2 {
+    SELECT 12a3;
+}
+expect error {
+}
+
+test invalid-numberic-literal-3 {
+    SELECT e12;
+}
+expect error {
+}
+
+test invalid-numberic-literal-4 {
+    SELECT 1e;
+}
+expect error {
+}
+
