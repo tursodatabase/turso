@@ -221,6 +221,8 @@ pub struct IncrementalView {
     pub tracker: Arc<Mutex<ComputationTracker>>,
     // Root page of the btree storing the materialized state (0 for unmaterialized)
     root_page: i64,
+    // Whether this view contains a WITH RECURSIVE clause
+    has_recursive_cte: bool,
 }
 
 // SAFETY: This needs to be audited for thread safety.
@@ -379,6 +381,9 @@ impl IncrementalView {
         // Create the tracker that will be shared by all operators
         let tracker = Arc::new(Mutex::new(ComputationTracker::new()));
 
+        // Check if the SELECT statement has a WITH RECURSIVE clause
+        let has_recursive_cte = select_stmt.with.as_ref().is_some_and(|w| w.recursive);
+
         // Compile the SELECT statement into a DBSP circuit
         let circuit = Self::try_compile_circuit(
             &select_stmt,
@@ -400,6 +405,7 @@ impl IncrementalView {
             populate_state: PopulateState::Start,
             tracker,
             root_page: main_data_root,
+            has_recursive_cte,
         })
     }
 
@@ -416,7 +422,7 @@ impl IncrementalView {
     ) -> crate::Result<crate::types::IOResult<Delta>> {
         // Initialize execute_state with the input data
         *execute_state = crate::incremental::compiler::ExecuteState::Init {
-            input_data: uncommitted,
+            input_data: crate::incremental::compiler::InputDeltas::from_delta_set(uncommitted),
         };
         self.circuit.execute(pager, execute_state)
     }
@@ -1150,6 +1156,58 @@ impl IncrementalView {
         'outer: loop {
             match std::mem::replace(&mut self.populate_state, PopulateState::Done) {
                 PopulateState::Start => {
+                    // For recursive CTEs, we must gather all source table data first,
+                    // then run through the circuit in one batch, because fixed-point iteration
+                    // requires all base case rows to be available together.
+                    if self.has_recursive_cte {
+                        // Collect all data from all source tables first
+                        let mut all_deltas = DeltaSet::new();
+                        // Create a single connection for all table reads
+                        let read_conn = conn.db.connect()?;
+
+                        for table in &self.referenced_tables {
+                            let query =
+                                format!("SELECT *, rowid FROM {} ORDER BY rowid", table.name);
+                            let mut stmt = read_conn.prepare(&query)?;
+                            let mut table_delta = Delta::new();
+
+                            loop {
+                                match stmt.step()? {
+                                    crate::vdbe::StepResult::Row => {
+                                        let row = stmt.row().ok_or_else(|| {
+                                            LimboError::InternalError(
+                                                "row should exist after StepResult::Row"
+                                                    .to_string(),
+                                            )
+                                        })?;
+                                        let all_values: Vec<crate::types::Value> =
+                                            row.get_values().cloned().collect();
+
+                                        // Last value is rowid
+                                        let rowid = match all_values.last() {
+                                            Some(crate::types::Value::Integer(id)) => *id,
+                                            _ => continue,
+                                        };
+                                        let values = all_values[..all_values.len() - 1].to_vec();
+                                        table_delta.insert(rowid, values);
+                                    }
+                                    crate::vdbe::StepResult::Done => break,
+                                    _ => continue,
+                                }
+                            }
+
+                            all_deltas.insert(table.name.clone(), table_delta);
+                        }
+
+                        // Run through the circuit and commit results to btree
+                        // commit() handles both execution and writing to btree
+                        let input_map = all_deltas.into_map();
+                        return_if_io!(self.circuit.commit(input_map, pager.clone()));
+
+                        self.populate_state = PopulateState::Done;
+                        return Ok(IOResult::Done(()));
+                    }
+
                     // Generate the SQL query for populating the view
                     // It is best to use a standard query than a cursor for two reasons:
                     // 1) Using a sql query will allow us to be much more efficient in cases where we only want

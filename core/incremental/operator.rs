@@ -16,6 +16,7 @@ use crate::storage::btree::BTreeCursor;
 use crate::types::IOResult;
 use crate::Result;
 use parking_lot::Mutex;
+use std::any::Any;
 use std::fmt::Debug;
 use std::sync::Arc;
 
@@ -225,7 +226,7 @@ pub enum QueryOperator {
 /// Base trait for incremental operators
 // SAFETY: This needs to be audited for thread safety.
 // See: https://github.com/tursodatabase/turso/issues/1552
-pub trait IncrementalOperator: Debug + Send {
+pub trait IncrementalOperator: Debug + Send + Any {
     /// Evaluate the operator with a state, without modifying internal state
     /// This is used during query execution to compute results
     /// May need to read from storage to get current state (e.g., for aggregates)
@@ -254,6 +255,12 @@ pub trait IncrementalOperator: Debug + Send {
 
     /// Set computation tracker
     fn set_tracker(&mut self, tracker: Arc<Mutex<ComputationTracker>>);
+
+    /// Downcast to Any
+    fn as_any(&self) -> &dyn Any;
+
+    /// Downcast to Any (mutable)
+    fn as_any_mut(&mut self) -> &mut dyn Any;
 }
 
 #[cfg(test)]

@@ -10,4 +10,5 @@ pub mod merge_operator;
 pub mod operator;
 pub mod persistence;
 pub mod project_operator;
+pub mod recursive_operator;
 pub mod view;

@@ -2559,3 +2559,165 @@ do_execsql_test_on_specific_db {:memory:} matview-recreate-after-drop {
 3|30.0
 3|40
 4|60}
+
+# =============================================================================
+# Recursive CTE tests
+# =============================================================================
+
+# Test recursive CTE: transitive closure on a graph with computed path column
+# Uses implicit column names (no column list after CTE name) which triggered a bug
+# where column resolution failed with "no such column" errors
+do_execsql_test_on_specific_db {:memory:} matview-recursive-cte-transitive-closure {
+    CREATE TABLE edges(source INTEGER, target INTEGER);
+    INSERT INTO edges VALUES (1, 2), (2, 3), (3, 4);
+
+    CREATE MATERIALIZED VIEW reachable AS
+    WITH RECURSIVE reach AS (
+        SELECT source, target, source || '->' || target as path FROM edges
+        UNION
+        SELECT r.source, e.target, r.path || '->' || e.target as path
+        FROM reach r
+        JOIN edges e ON r.target = e.source
+    )
+    SELECT * FROM reach;
+
+    -- Test SELECT * to ensure all columns are resolved
+    SELECT * FROM reachable ORDER BY source, target;
+
+    -- Test SELECT specific columns to ensure column resolution works
+    SELECT source FROM reachable ORDER BY source;
+    SELECT path FROM reachable ORDER BY path;
+} {1|2|1->2
+1|3|1->2->3
+1|4|1->2->3->4
+2|3|2->3
+2|4|2->3->4
+3|4|3->4
+1
+1
+1
+2
+2
+3
+1->2
+1->2->3
+1->2->3->4
+2->3
+2->3->4
+3->4}
+
+# Test recursive CTE with incremental INSERT
+do_execsql_test_on_specific_db {:memory:} matview-recursive-cte-incremental-insert {
+    CREATE TABLE edges(source INTEGER, target INTEGER);
+    INSERT INTO edges VALUES (1, 2), (2, 3);
+
+    CREATE MATERIALIZED VIEW reachable AS
+    WITH RECURSIVE reach(source, target) AS (
+        SELECT source, target FROM edges
+        UNION
+        SELECT r.source, e.target
+        FROM reach r
+        JOIN edges e ON r.target = e.source
+    )
+    SELECT * FROM reach;
+
+    SELECT COUNT(*) FROM reachable;
+
+    -- Add new edge: 3->4, which creates new transitive paths
+    INSERT INTO edges VALUES (3, 4);
+
+    SELECT COUNT(*) FROM reachable;
+    SELECT * FROM reachable ORDER BY source, target;
+} {3
+6
+1|2
+1|3
+1|4
+2|3
+2|4
+3|4}
+
+# Test recursive CTE with DELETE from base table
+do_execsql_test_on_specific_db {:memory:} matview-recursive-cte-incremental-delete {
+    CREATE TABLE edges(source INTEGER, target INTEGER);
+    INSERT INTO edges VALUES (1, 2), (2, 3), (3, 4);
+
+    CREATE MATERIALIZED VIEW reachable AS
+    WITH RECURSIVE reach(source, target) AS (
+        SELECT source, target FROM edges
+        UNION
+        SELECT r.source, e.target
+        FROM reach r
+        JOIN edges e ON r.target = e.source
+    )
+    SELECT * FROM reach;
+
+    SELECT COUNT(*) FROM reachable;
+
+    -- Delete middle edge: should break transitive paths from 1
+    DELETE FROM edges WHERE source = 2 AND target = 3;
+
+    SELECT COUNT(*) FROM reachable;
+    SELECT * FROM reachable ORDER BY source, target;
+} {6
+2
+1|2
+3|4}
+
+# Test recursive CTE: ancestor-descendant relationship
+do_execsql_test_on_specific_db {:memory:} matview-recursive-cte-ancestors {
+    CREATE TABLE family(parent TEXT, child TEXT);
+    INSERT INTO family VALUES
+        ('Alice', 'Bob'),
+        ('Alice', 'Carol'),
+        ('Bob', 'David'),
+        ('Carol', 'Eve');
+
+    CREATE MATERIALIZED VIEW all_ancestors AS
+    WITH RECURSIVE ancestors(ancestor, descendant) AS (
+        SELECT parent, child FROM family
+        UNION
+        SELECT a.ancestor, f.child
+        FROM ancestors a
+        JOIN family f ON a.descendant = f.parent
+    )
+    SELECT * FROM ancestors;
+
+    SELECT * FROM all_ancestors ORDER BY ancestor, descendant;
+} {Alice|Bob
+Alice|Carol
+Alice|David
+Alice|Eve
+Bob|David
+Carol|Eve}
+
+# Test recursive CTE in transaction with rollback
+do_execsql_test_on_specific_db {:memory:} matview-recursive-cte-rollback {
+    CREATE TABLE edges(source INTEGER, target INTEGER);
+    INSERT INTO edges VALUES (1, 2), (2, 3);
+
+    CREATE MATERIALIZED VIEW reachable AS
+    WITH RECURSIVE reach(source, target) AS (
+        SELECT source, target FROM edges
+        UNION
+        SELECT r.source, e.target
+        FROM reach r
+        JOIN edges e ON r.target = e.source
+    )
+    SELECT * FROM reach;
+
+    SELECT COUNT(*) FROM reachable;
+
+    BEGIN;
+    INSERT INTO edges VALUES (3, 4);
+    SELECT COUNT(*) FROM reachable;
+    ROLLBACK;
+
+    SELECT COUNT(*) FROM reachable;
+    SELECT * FROM reachable ORDER BY source, target;
+} {3
+6
+3
+1|2
+1|3
+2|3}
