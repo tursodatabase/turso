@@ -1,0 +1,21 @@
+@database :memory:
+
+#!/usr/bin/env tclsh
+test basic-tx-1 {
+    BEGIN IMMEDIATE; END
+}
+expect {
+}
+
+test basic-tx-2 {
+    BEGIN EXCLUSIVE; END
+}
+expect {
+}
+
+test basic-tx-3 {
+    BEGIN DEFERRED; END
+}
+expect {
+}
+
