@@ -714,8 +714,7 @@ mod tests {
             .unwrap()
             .unwrap();
         let record = ImmutableRecord::from_bin_record(row.payload().to_vec());
-        let values = record.get_values();
-        let foo = values.first().unwrap();
+        let foo = record.iter().unwrap().next().unwrap().unwrap();
         let ValueRef::Text(foo) = foo else {
             unreachable!()
         };
@@ -789,8 +788,7 @@ mod tests {
             let tx = mvcc_store.begin_tx(pager.clone()).unwrap();
             let row = mvcc_store.read(tx, rowid.clone()).unwrap().unwrap();
             let record = ImmutableRecord::from_bin_record(row.payload().to_vec());
-            let values = record.get_values();
-            let foo = values.first().unwrap();
+            let foo = record.iter().unwrap().next().unwrap().unwrap();
             let ValueRef::Text(foo) = foo else {
                 unreachable!()
             };
@@ -804,15 +802,7 @@ mod tests {
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
         let num_transactions = rng.next_u64() % 128;
         let mut txns = vec![];
-        #[expect(
-            clippy::mutable_key_type,
-            reason = "`ImmutableRecord` has interior mutability but its Ord definitions are not influenced by that"
-        )]
         let mut present_rowids = BTreeSet::new();
-        #[expect(
-            clippy::mutable_key_type,
-            reason = "`ImmutableRecord` has interior mutability but its Ord definitions are not influenced by that"
-        )]
         let mut non_present_rowids = BTreeSet::new();
         for _ in 0..num_transactions {
             let num_operations = rng.next_u64() % 8;
@@ -916,8 +906,7 @@ mod tests {
         for present_rowid in present_rowids {
             let row = mvcc_store.read(tx, present_rowid.clone()).unwrap().unwrap();
             let record = ImmutableRecord::from_bin_record(row.payload().to_vec());
-            let values = record.get_values();
-            let foo = values.first().unwrap();
+            let foo = record.iter().unwrap().next().unwrap().unwrap();
             let ValueRef::Text(foo) = foo else {
                 unreachable!()
             };
@@ -989,7 +978,7 @@ mod tests {
                 .unwrap()
                 .expect("Table row should exist");
             let record = ImmutableRecord::from_bin_record(row.payload().to_vec());
-            let values = record.get_values();
+            let values = record.get_values().unwrap();
             let data_value = values.get(1).expect("Should have data column");
             let ValueRef::Text(data_text) = data_value else {
                 panic!("Data column should be text");
@@ -1030,7 +1019,7 @@ mod tests {
                 panic!("Index row should have a record row_id");
             };
             let record = sortable_key.key.clone();
-            let values = record.get_values();
+            let values = record.get_values().unwrap();
             assert_eq!(
                 values.len(),
                 2,

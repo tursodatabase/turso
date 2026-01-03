@@ -76,11 +76,11 @@ impl WriteRowView {
                                 "Found key {key:?} in storage but could not read record"
                             ))
                         })?;
-                        let values = r.get_values();
+                        let last = r.iter()?.last();
 
                         // Weight is always the last value
-                        let existing_weight = match values.last() {
-                            Some(val) => match val.to_owned() {
+                        let existing_weight = match last {
+                            Some(val) => match val?.to_owned() {
                                 Value::Integer(w) => w as isize,
                                 _ => {
                                     return Err(LimboError::InternalError(format!(
@@ -2774,13 +2774,16 @@ mod tests {
             .unwrap()
             .to_owned();
 
-            let values_ref = record.get_values();
-            let num_data_columns = values_ref.len() - 1; // Get length before consuming
-            let values: Vec<Value> = values_ref
-                .into_iter()
-                .take(num_data_columns) // Skip the weight column
-                .map(|x| x.to_owned())
-                .collect();
+            let num_data_columns = record.column_count() - 1;
+
+            let mut values = Vec::with_capacity(num_data_columns);
+            let mut values_iter = record.iter()?;
+
+            for _ in 0..num_data_columns {
+                let value = values_iter.next().expect("we already checked bounds")?;
+                values.push(value.to_owned());
+            }
+
             delta.insert(rowid, values);
             pager.io.block(|| btree_cursor.next()).unwrap();
         }

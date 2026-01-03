@@ -995,8 +995,7 @@ impl AggregateState {
 
     pub fn from_blob(blob: &[u8]) -> Result<(Self, Vec<Value>)> {
         let record = ImmutableRecord::from_bin_record(blob.to_vec());
-        let ref_values = record.get_values();
-        let mut all_values: Vec<Value> = ref_values.into_iter().map(|rv| rv.to_owned()).collect();
+        let mut all_values: Vec<Value> = record.get_values_owned()?;
 
         if all_values.is_empty() {
             return Err(LimboError::InternalError(
@@ -2291,21 +2290,19 @@ impl ScanState {
             )
         })?;
 
-        let values = record.get_values();
-        if values.len() < 3 {
-            return Ok(IOResult::Done(None));
-        }
+        let mut values = record.iter()?;
 
-        let Some(rec_storage_id) = values.first() else {
+        let Some(rec_storage_id) = values.next() else {
             return Ok(IOResult::Done(None));
         };
-        let Some(rec_zset_hash) = values.get(1) else {
+
+        let Some(rec_zset_hash) = values.next() else {
             return Ok(IOResult::Done(None));
         };
 
         // Check if we're still in the same group
-        if let ValueRef::Integer(rec_sid) = rec_storage_id {
-            if *rec_sid != storage_id {
+        if let ValueRef::Integer(rec_sid) = rec_storage_id? {
+            if rec_sid != storage_id {
                 return Ok(IOResult::Done(None));
             }
         } else {
@@ -2313,7 +2310,7 @@ impl ScanState {
         }
 
         // Compare zset_hash as blob
-        if let ValueRef::Blob(rec_zset_blob) = rec_zset_hash {
+        if let ValueRef::Blob(rec_zset_blob) = rec_zset_hash? {
             if let Some(rec_hash) = Hash128::from_blob(rec_zset_blob) {
                 if rec_hash != zset_hash {
                     return Ok(IOResult::Done(None));
@@ -2325,8 +2322,13 @@ impl ScanState {
             return Ok(IOResult::Done(None));
         }
 
+        let third = values.next();
+        let Some(third) = third else {
+            return Ok(IOResult::Done(None));
+        };
+
         // Get the value (3rd element)
-        Ok(IOResult::Done(values.get(2).map(|v| v.to_owned())))
+        Ok(IOResult::Done(Some(third?.to_owned())))
     }
 
     pub fn new_for_max(
@@ -2766,13 +2768,11 @@ impl FetchDistinctState {
                     let record = return_if_io!(cursors.table_cursor.record());
 
                     if let Some(r) = record {
-                        let values = r.get_values();
-
                         // The table has 5 columns: storage_id, zset_hash, element_id, blob, weight
                         // The weight is at index 4
-                        if values.len() >= 5 {
-                            // Get the weight directly from column 4
-                            let weight = match values[4].to_owned() {
+                        if let Some(weight) = r.get_value_opt(4) {
+                            // Get the weight directly from column 5(index 4)
+                            let weight = match weight.to_owned() {
                                 Value::Integer(w) => w,
                                 _ => 0,
                             };
