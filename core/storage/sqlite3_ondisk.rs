@@ -969,26 +969,126 @@ pub fn read_value<'a>(buf: &'a [u8], serial_type: SerialType) -> Result<(ValueRe
     match serial_type.kind() {
         SerialTypeKind::Null => Ok((ValueRef::Null, 0)),
         SerialTypeKind::I8 => {
-            if buf.is_empty() {
-                crate::bail_corrupt_error!("Invalid UInt8 value");
-            }
-            let val = buf[0] as i8;
-            Ok((ValueRef::Integer(val as i64), 1))
+            let val = *buf
+                .first()
+                .ok_or_else(|| LimboError::Corrupt("Invalid UInt8 value".into()))?;
+            Ok((ValueRef::Integer(val as i8 as i64), 1))
         }
         SerialTypeKind::I16 => {
+            let bytes: &[u8; 2] = buf
+                .get(..2)
+                .and_then(|s| s.try_into().ok())
+                .ok_or_else(|| LimboError::Corrupt("Invalid BEInt16 value".into()))?;
+            Ok((ValueRef::Integer(i16::from_be_bytes(*bytes) as i64), 2))
+        }
+        SerialTypeKind::I24 => {
+            let bytes: &[u8; 3] = buf
+                .get(..3)
+                .and_then(|s| s.try_into().ok())
+                .ok_or_else(|| LimboError::Corrupt("Invalid BEInt24 value".into()))?;
+            let sign_extension = (bytes[0] as i8 >> 7) as u8;
+            Ok((
+                ValueRef::Integer(
+                    i32::from_be_bytes([sign_extension, bytes[0], bytes[1], bytes[2]]) as i64,
+                ),
+                3,
+            ))
+        }
+        SerialTypeKind::I32 => {
+            let bytes: &[u8; 4] = buf
+                .get(..4)
+                .and_then(|s| s.try_into().ok())
+                .ok_or_else(|| LimboError::Corrupt("Invalid BEInt32 value".into()))?;
+            Ok((ValueRef::Integer(i32::from_be_bytes(*bytes) as i64), 4))
+        }
+        SerialTypeKind::I48 => {
+            let bytes: &[u8; 6] = buf
+                .get(..6)
+                .and_then(|s| s.try_into().ok())
+                .ok_or_else(|| LimboError::Corrupt("Invalid BEInt48 value".into()))?;
+            let sign_extension = (bytes[0] as i8 >> 7) as u8;
+            Ok((
+                ValueRef::Integer(i64::from_be_bytes([
+                    sign_extension,
+                    sign_extension,
+                    bytes[0],
+                    bytes[1],
+                    bytes[2],
+                    bytes[3],
+                    bytes[4],
+                    bytes[5],
+                ])),
+                6,
+            ))
+        }
+        SerialTypeKind::I64 => {
+            let bytes: &[u8; 8] = buf
+                .get(..8)
+                .and_then(|s| s.try_into().ok())
+                .ok_or_else(|| LimboError::Corrupt("Invalid BEInt64 value".into()))?;
+            Ok((ValueRef::Integer(i64::from_be_bytes(*bytes)), 8))
+        }
+        SerialTypeKind::F64 => {
+            let bytes: &[u8; 8] = buf
+                .get(..8)
+                .and_then(|s| s.try_into().ok())
+                .ok_or_else(|| LimboError::Corrupt("Invalid BEFloat64 value".into()))?;
+            Ok((ValueRef::Float(f64::from_be_bytes(*bytes)), 8))
+        }
+        SerialTypeKind::ConstInt0 => Ok((ValueRef::Integer(0), 0)),
+        SerialTypeKind::ConstInt1 => Ok((ValueRef::Integer(1), 0)),
+        SerialTypeKind::Blob => {
+            let content_size = serial_type.size();
+            let data = buf
+                .get(..content_size)
+                .ok_or_else(|| LimboError::Corrupt("Invalid Blob value".into()))?;
+            Ok((ValueRef::Blob(data), content_size))
+        }
+        SerialTypeKind::Text => {
+            let content_size = serial_type.size();
+            let data = buf.get(..content_size).ok_or_else(|| {
+                LimboError::Corrupt(format!(
+                    "Invalid String value, length {} < expected length {}",
+                    buf.len(),
+                    content_size
+                ))
+            })?;
+            // SAFETY: SerialTypeKind is Text so this buffer is a valid string
+            let val = unsafe { std::str::from_utf8_unchecked(data) };
+            Ok((
+                ValueRef::Text(TextRef::new(val, TextSubtype::Text)),
+                content_size,
+            ))
+        }
+    }
+}
+
+pub fn read_value_serial_type<'a>(
+    buf: &'a [u8],
+    serial_type: u64,
+) -> Result<(ValueRef<'a>, usize)> {
+    match serial_type {
+        0 => Ok((ValueRef::Null, 0)),
+        1 => {
+            if buf.is_empty() {
+                crate::bail_corrupt_error!("Invalid 1-byte int");
+            }
+            Ok((ValueRef::Integer(buf[0] as i8 as i64), 1))
+        }
+        2 => {
             if buf.len() < 2 {
-                crate::bail_corrupt_error!("Invalid BEInt16 value");
+                crate::bail_corrupt_error!("Invalid 2-byte int");
             }
             Ok((
                 ValueRef::Integer(i16::from_be_bytes([buf[0], buf[1]]) as i64),
                 2,
             ))
         }
-        SerialTypeKind::I24 => {
+        3 => {
             if buf.len() < 3 {
-                crate::bail_corrupt_error!("Invalid BEInt24 value");
+                crate::bail_corrupt_error!("Invalid 3-byte int");
             }
-            let sign_extension = if buf[0] <= 127 { 0 } else { 255 };
+            let sign_extension = if buf[0] <= 0x7F { 0 } else { 0xFF };
             Ok((
                 ValueRef::Integer(
                     i32::from_be_bytes([sign_extension, buf[0], buf[1], buf[2]]) as i64
@@ -996,20 +1096,20 @@ pub fn read_value<'a>(buf: &'a [u8], serial_type: SerialType) -> Result<(ValueRe
                 3,
             ))
         }
-        SerialTypeKind::I32 => {
+        4 => {
             if buf.len() < 4 {
-                crate::bail_corrupt_error!("Invalid BEInt32 value");
+                crate::bail_corrupt_error!("Invalid 4-byte int");
             }
             Ok((
                 ValueRef::Integer(i32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as i64),
                 4,
             ))
         }
-        SerialTypeKind::I48 => {
+        5 => {
             if buf.len() < 6 {
-                crate::bail_corrupt_error!("Invalid BEInt48 value");
+                crate::bail_corrupt_error!("Invalid 6-byte int");
             }
-            let sign_extension = if buf[0] <= 127 { 0 } else { 255 };
+            let sign_extension = if buf[0] <= 0x7F { 0 } else { 0xFF };
             Ok((
                 ValueRef::Integer(i64::from_be_bytes([
                     sign_extension,
@@ -1024,9 +1124,9 @@ pub fn read_value<'a>(buf: &'a [u8], serial_type: SerialType) -> Result<(ValueRe
                 6,
             ))
         }
-        SerialTypeKind::I64 => {
+        6 => {
             if buf.len() < 8 {
-                crate::bail_corrupt_error!("Invalid BEInt64 value");
+                crate::bail_corrupt_error!("Invalid 8-byte int");
             }
             Ok((
                 ValueRef::Integer(i64::from_be_bytes([
@@ -1035,9 +1135,9 @@ pub fn read_value<'a>(buf: &'a [u8], serial_type: SerialType) -> Result<(ValueRe
                 8,
             ))
         }
-        SerialTypeKind::F64 => {
+        7 => {
             if buf.len() < 8 {
-                crate::bail_corrupt_error!("Invalid BEFloat64 value");
+                crate::bail_corrupt_error!("Invalid 8-byte float");
             }
             Ok((
                 ValueRef::Float(f64::from_be_bytes([
@@ -1046,32 +1146,37 @@ pub fn read_value<'a>(buf: &'a [u8], serial_type: SerialType) -> Result<(ValueRe
                 8,
             ))
         }
-        SerialTypeKind::ConstInt0 => Ok((ValueRef::Integer(0), 0)),
-        SerialTypeKind::ConstInt1 => Ok((ValueRef::Integer(1), 0)),
-        SerialTypeKind::Blob => {
-            let content_size = serial_type.size();
-            if buf.len() < content_size {
-                crate::bail_corrupt_error!("Invalid Blob value");
+        8 => Ok((ValueRef::Integer(0), 0)),
+        9 => Ok((ValueRef::Integer(1), 0)),
+        n if n >= 12 => match n % 2 {
+            0 => {
+                // Blob
+                let content_size = ((n - 12) / 2) as usize;
+                let data = buf
+                    .get(..content_size)
+                    .ok_or_else(|| LimboError::Corrupt("Invalid Blob value".into()))?;
+                Ok((ValueRef::Blob(data), content_size))
             }
-            Ok((ValueRef::Blob(&buf[..content_size]), content_size))
-        }
-        SerialTypeKind::Text => {
-            let content_size = serial_type.size();
-            if buf.len() < content_size {
-                crate::bail_corrupt_error!(
-                    "Invalid String value, length {} < expected length {}",
-                    buf.len(),
-                    content_size
-                );
+            1 => {
+                // Text
+                let content_size = ((n - 13) / 2) as usize;
+                let data = buf.get(..content_size).ok_or_else(|| {
+                    LimboError::Corrupt(format!(
+                        "Invalid String value, length {} < expected length {}",
+                        buf.len(),
+                        content_size
+                    ))
+                })?;
+                // SAFETY: SerialTypeKind is Text so this buffer is a valid string
+                let val = unsafe { std::str::from_utf8_unchecked(data) };
+                Ok((
+                    ValueRef::Text(TextRef::new(val, TextSubtype::Text)),
+                    content_size,
+                ))
             }
-
-            // SAFETY: SerialTypeKind is Text so this buffer is a valid string
-            let val = unsafe { str::from_utf8_unchecked(&buf[..content_size]) };
-            Ok((
-                ValueRef::Text(TextRef::new(val, TextSubtype::Text)),
-                content_size,
-            ))
-        }
+            _ => unreachable!(),
+        },
+        _ => crate::bail_corrupt_error!("Invalid serial type for integer"),
     }
 }
 
