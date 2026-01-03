@@ -2894,7 +2894,14 @@ pub fn op_row_id(
                     .expect("cursor_id should be valid")
                 {
                     if let Some(ref rowid) = return_if_io!(btree_cursor.rowid()) {
-                        state.registers[*dest] = Register::Value(Value::Integer(*rowid));
+                        match &mut state.registers[*dest] {
+                            Register::Value(Value::Integer(existing_rowid)) => {
+                                *existing_rowid = *rowid;
+                            }
+                            _ => {
+                                state.registers[*dest] = Register::Value(Value::Integer(*rowid));
+                            }
+                        }
                     } else {
                         state.registers[*dest] = Register::Value(Value::Null);
                     }
