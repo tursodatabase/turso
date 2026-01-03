@@ -68,21 +68,21 @@ fn read_next_join_row(
 
     // Extract all needed values from the record before dropping it
     let (found_storage_id, found_zset_hash, element_hash) = if let Some(rec) = current_record {
-        let values = rec.get_values()?;
+        let values = rec.get_three_values(0, 1, 2);
 
         // Index has 4 values: storage_id, zset_id, element_id, rowid (appended by WriteRow)
-        if values.len() >= 3 {
-            let found_storage_id = match &values[0].to_owned() {
+        if let Ok((v0, v1, v2)) = values {
+            let found_storage_id = match &v0.to_owned() {
                 Value::Integer(id) => *id,
                 _ => return Ok(IOResult::Done(None)),
             };
-            let found_zset_hash = match &values[1].to_owned() {
+            let found_zset_hash = match &v1.to_owned() {
                 Value::Blob(blob) => Hash128::from_blob(blob).ok_or_else(|| {
                     crate::LimboError::InternalError("Invalid zset_hash blob".to_string())
                 })?,
                 _ => return Ok(IOResult::Done(None)),
             };
-            let element_hash = match &values[2].to_owned() {
+            let element_hash = match &v2.to_owned() {
                 Value::Blob(blob) => Hash128::from_blob(blob).ok_or_else(|| {
                     crate::LimboError::InternalError("Invalid element_hash blob".to_string())
                 })?,
@@ -113,11 +113,11 @@ fn read_next_join_row(
 
         let table_record = return_if_io!(cursors.table_cursor.record());
         if let Some(rec) = table_record {
-            let table_values = rec.get_values()?;
+            let table_values = rec.get_two_values(3, 4);
             // Table format: [storage_id, zset_id, element_id, value_blob, weight]
-            if table_values.len() >= 5 {
+            if let Ok((value_at_3, value_at_4)) = table_values {
                 // Deserialize the row from the blob
-                let value_at_3 = table_values[3].to_owned();
+                let value_at_3 = value_at_3.to_owned();
                 let blob = match value_at_3 {
                     Value::Blob(ref b) => b,
                     _ => return Ok(IOResult::Done(None)),
@@ -127,7 +127,7 @@ fn read_next_join_row(
                 // For now, let's deserialize it simply
                 let row = deserialize_hashable_row(blob)?;
 
-                let weight = match &table_values[4].to_owned() {
+                let weight = match &value_at_4.to_owned() {
                     Value::Integer(w) => *w as isize,
                     _ => return Ok(IOResult::Done(None)),
                 };
@@ -547,8 +547,7 @@ fn deserialize_hashable_row(blob: &[u8]) -> Result<HashableRow> {
     use crate::types::ImmutableRecord;
 
     let record = ImmutableRecord::from_bin_record(blob.to_vec());
-    let ref_values = record.get_values()?;
-    let all_values: Vec<Value> = ref_values.into_iter().map(|rv| rv.to_owned()).collect();
+    let all_values: Vec<Value> = record.get_values_owned()?;
 
     if all_values.is_empty() {
         return Err(crate::LimboError::InternalError(
