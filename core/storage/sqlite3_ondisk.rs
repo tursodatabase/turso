@@ -592,7 +592,9 @@ pub fn begin_write_btree_page(pager: &Pager, page: &PageRef) -> Result<Completio
         let contents = page.get_contents();
         let src = contents.as_ptr();
         let write_buf = pager.buffer_pool.get_page();
-        write_buf.as_mut_slice()[..src.len()].copy_from_slice(src);
+        let dst = write_buf.as_mut_slice();
+        dst[..src.len()].copy_from_slice(src);
+        dst[src.len()..].fill(0);
         Arc::new(write_buf)
     };
     let buf_len = buffer.len();
