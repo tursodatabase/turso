@@ -68,6 +68,7 @@ default = ["io_uring", "mimalloc"]
 io_uring = ["turso_core/io_uring"]
 tracing_release = ["turso_core/tracing_release"]
 mimalloc = ["dep:mimalloc"]
+wheretrace = ["turso_core/wheretrace"]
 
 [build-dependencies]
 syntect = { git = "https://github.com/trishume/syntect.git", rev = "64644ffe064457265cbcee12a0c1baf9485ba6ee" }

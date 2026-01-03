@@ -21,6 +21,18 @@ use turso_parser::ast::{self, SortOrder, TableInternalId};
 
 use super::cost::ESTIMATED_HARDCODED_ROWS_PER_TABLE;
 
+/// Type of constraint based on its prerequisites (wheretrace only).
+#[cfg(feature = "wheretrace")]
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ConstraintType {
+    /// Constraint has no prerequisites
+    Literal,
+    /// Constraint references only the same table
+    SelfConstraint,
+    /// Constraint references other tables
+    JoinConstraint,
+}
+
 /// Represents a single condition derived from a `WHERE` clause term
 /// that constrains a specific column of a table.
 ///
@@ -110,6 +122,18 @@ impl Constraint {
             lhs
         } else {
             rhs
+        }
+    }
+
+    /// Determine the type of this constraint based on its prerequisites (wheretrace only).
+    #[cfg(feature = "wheretrace")]
+    pub fn constraint_type(&self, table_idx: usize) -> ConstraintType {
+        if self.lhs_mask.is_empty() {
+            ConstraintType::Literal
+        } else if self.lhs_mask.table_count() == 1 && self.lhs_mask.contains_table(table_idx) {
+            ConstraintType::SelfConstraint
+        } else {
+            ConstraintType::JoinConstraint
         }
     }
 }
@@ -575,6 +599,80 @@ pub fn constraints_from_where_clause(
             true
         });
         constraints.push(cs);
+    }
+
+    // Trace all extracted constraints
+    #[cfg(feature = "wheretrace")]
+    {
+        use crate::translate::optimizer::{pretty, trace::flags};
+
+        // Trace the query structure (FROM/WHERE trees) with function name
+        if !where_clause.is_empty() {
+            crate::wheretrace_fn!(
+                "constraints_from_where_clause",
+                flags::QUERY_STRUCTURE,
+                "{}",
+                pretty::tree("|-- FROM")
+            );
+            // Trace FROM clause tables
+            for (i, table_ref) in table_references.joined_tables().iter().enumerate() {
+                crate::wheretrace!(
+                    flags::QUERY_STRUCTURE,
+                    "{}",
+                    pretty::format_from_table(
+                        i,
+                        &table_ref.identifier,
+                        table_ref.columns().len(),
+                        i == table_references.joined_tables().len() - 1
+                    )
+                );
+            }
+            // Trace WHERE clause expression trees
+            crate::wheretrace!(flags::QUERY_STRUCTURE, "{}", pretty::format_where_section());
+            for (i, term) in where_clause.iter().enumerate() {
+                crate::wheretrace!(
+                    flags::QUERY_STRUCTURE,
+                    "{}",
+                    pretty::format_expr_tree(&term.expr, "    ", i == where_clause.len() - 1)
+                );
+            }
+        }
+
+        // Now trace the extracted constraints (SQLite-compatible format)
+        crate::wheretrace!(
+            flags::CONSTRAINT,
+            "{}",
+            pretty::header("---- WHERE clause at start of analysis:")
+        );
+        for (table_pos, tc) in constraints.iter().enumerate() {
+            let table_idx: usize = tc.table_id.into();
+            for (i, c) in tc.constraints.iter().enumerate() {
+                let where_term = &where_clause[c.where_clause_pos.0];
+                crate::wheretrace!(
+                    flags::CONSTRAINT,
+                    "{}",
+                    pretty::format_constraint_sqlite(
+                        i,
+                        table_idx,
+                        c.table_col_pos,
+                        &c.operator,
+                        c.selectivity,
+                        c.usable,
+                        where_term.consumed,
+                        c.lhs_mask.0,
+                        false, // is_virtual
+                        false, // is_equiv
+                        Some(c.constraint_type(table_pos)),
+                    )
+                );
+                // Print expression tree after TERM line (like SQLite)
+                crate::wheretrace!(
+                    flags::CONSTRAINT,
+                    "{}",
+                    pretty::format_expr_tree(&where_term.expr, "", true)
+                );
+            }
+        }
     }
 
     Ok(constraints)
