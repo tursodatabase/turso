@@ -187,8 +187,8 @@ impl TursoRwLock {
             return false;
         }
         let desired = cur | Self::WRITER;
-        self.0
-            .compare_exchange(cur, desired, Ordering::Acquire, Ordering::SeqCst)
+        self.0 // Safety: Failure here can be Relaxed as we will read again on next iteration.
+            .compare_exchange(cur, desired, Ordering::Acquire, Ordering::Relaxed)
             .is_ok()
     }
 
@@ -222,10 +222,10 @@ impl TursoRwLock {
     /// Set the embedded value while holding the write lock.
     pub fn set_value_exclusive(&self, v: u32) {
         // Must be called only while WRITER bit is set
-        let cur = self.0.load(Ordering::SeqCst);
+        let cur = self.0.load(Ordering::Acquire);
         turso_assert!(Self::has_writer(cur), "must hold exclusive lock");
         let desired = (cur & !Self::VALUE_MASK) | ((v as u64) << Self::VALUE_SHIFT);
-        self.0.store(desired, Ordering::SeqCst);
+        self.0.store(desired, Ordering::Release);
     }
 }
 
@@ -402,29 +402,28 @@ impl WriteBatch {
     #[inline]
     /// Add a pageId + Buffer to the batch of Writes to be submitted.
     fn insert(&mut self, page_id: PageId, buf: Arc<Buffer>) {
-        if let std::collections::btree_map::Entry::Occupied(mut entry) = self.items.entry(page_id) {
-            entry.insert(buf);
+        if let std::collections::btree_map::Entry::Occupied(mut e) = self.items.entry(page_id) {
+            e.insert(buf);
             return;
         }
-        let left = page_id
-            .checked_sub(1)
-            .is_some_and(|p| self.items.contains_key(&p));
-        let right = page_id
-            .checked_add(1)
-            .is_some_and(|p| self.items.contains_key(&p));
-        match (left, right) {
-            (false, false) => {
-                // new singleton run
-                self.run_count += 1;
+        // Single range query to check neighbors
+        let start = page_id.saturating_sub(1);
+        let end = page_id.saturating_add(1);
+        let mut has_left = false;
+        let mut has_right = false;
+
+        for (k, _) in self.items.range(start..=end) {
+            if *k == page_id.wrapping_sub(1) {
+                has_left = true;
             }
-            (true, false) | (false, true) => {
-                // extends an existing run, run_count unchanged
+            if *k == page_id.wrapping_add(1) {
+                has_right = true;
             }
-            (true, true) => {
-                // merges two runs into one
-                turso_assert!(self.run_count >= 2, "should have at least two runs here");
-                self.run_count -= 1;
-            }
+        }
+        match (has_left, has_right) {
+            (false, false) => self.run_count += 1,
+            (true, true) => self.run_count = self.run_count.saturating_sub(1),
+            _ => {}
         }
         self.items.insert(page_id, buf);
     }
@@ -651,7 +650,7 @@ pub struct WalFile {
 impl fmt::Debug for WalFile {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("WalFile")
-            .field("syncing", &self.syncing.load(Ordering::SeqCst))
+            .field("syncing", &self.syncing.load(Ordering::Relaxed))
             .field("page_size", &self.page_size())
             .field("shared", &self.shared)
             .field("ongoing_checkpoint", &*self.ongoing_checkpoint.read())
@@ -761,7 +760,7 @@ pub struct WalFileShared {
 impl fmt::Debug for WalFileShared {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("WalFileShared")
-            .field("enabled", &self.enabled.load(Ordering::SeqCst))
+            .field("enabled", &self.enabled.load(Ordering::Relaxed))
             .field("wal_header", &self.wal_header)
             .field("min_frame", &self.min_frame)
             .field("max_frame", &self.max_frame)
@@ -1236,7 +1235,10 @@ impl Wal for WalFile {
             frame.set_wal_tag(frame_id, epoch);
         });
         let file = self.with_shared(|shared| {
-            assert!(shared.enabled.load(Ordering::SeqCst), "WAL must be enabled");
+            turso_assert!(
+                shared.enabled.load(Ordering::Relaxed),
+                "WAL must be enabled"
+            );
             // important not to hold shared lock beyond this point to avoid deadlock scenario where:
             // thread 1: takes readlock here, passes reference to shared.file to begin_read_wal_frame
             // thread 2: tries to acquire write lock elsewhere
@@ -1315,7 +1317,10 @@ impl Wal for WalFile {
             }
         });
         let file = self.with_shared(|shared| {
-            assert!(shared.enabled.load(Ordering::SeqCst), "WAL must be enabled");
+            turso_assert!(
+                shared.enabled.load(Ordering::Relaxed),
+                "WAL must be enabled"
+            );
             shared.file.as_ref().unwrap().clone()
         });
         let c = begin_read_wal_frame_raw(&self.buffer_pool, file.as_ref(), offset, complete)?;
@@ -1381,7 +1386,10 @@ impl Wal for WalFile {
                 }
             });
             let file = self.with_shared(|shared| {
-                assert!(shared.enabled.load(Ordering::SeqCst), "WAL must be enabled");
+                turso_assert!(
+                    shared.enabled.load(Ordering::Relaxed),
+                    "WAL must be enabled"
+                );
                 shared.file.as_ref().unwrap().clone()
             });
             let c = begin_read_wal_frame(
@@ -1406,7 +1414,10 @@ impl Wal for WalFile {
         let offset = self.frame_offset(frame_id);
         let (header, file) = self.with_shared(|shared| {
             let header = shared.wal_header.clone();
-            assert!(shared.enabled.load(Ordering::SeqCst), "WAL must be enabled");
+            turso_assert!(
+                shared.enabled.load(Ordering::Relaxed),
+                "WAL must be enabled"
+            );
             let file = shared.file.as_ref().unwrap().clone();
             (header, file)
         });
@@ -1459,20 +1470,23 @@ impl Wal for WalFile {
         let syncing = self.syncing.clone();
         let completion = Completion::new_sync(move |_| {
             tracing::debug!("wal_sync finish");
-            syncing.store(false, Ordering::SeqCst);
+            syncing.store(false, Ordering::Release);
         });
         let file = self.with_shared(|shared| {
-            assert!(shared.enabled.load(Ordering::SeqCst), "WAL must be enabled");
+            turso_assert!(
+                shared.enabled.load(Ordering::Relaxed),
+                "WAL must be enabled"
+            );
             shared.file.as_ref().unwrap().clone()
         });
-        self.syncing.store(true, Ordering::SeqCst);
+        self.syncing.store(true, Ordering::Release);
         let c = file.sync(completion)?;
         Ok(c)
     }
 
     // Currently used for assertion purposes
     fn is_syncing(&self) -> bool {
-        self.syncing.load(Ordering::SeqCst)
+        self.syncing.load(Ordering::Acquire)
     }
 
     fn get_max_frame_in_wal(&self) -> u64 {
@@ -1591,7 +1605,10 @@ impl Wal for WalFile {
 
         self.max_frame.store(0, Ordering::Release);
         let (header, file) = self.with_shared(|shared| {
-            assert!(shared.enabled.load(Ordering::SeqCst), "WAL must be enabled");
+            turso_assert!(
+                shared.enabled.load(Ordering::Relaxed),
+                "WAL must be enabled"
+            );
             (
                 *shared.wal_header.lock(),
                 shared.file.as_ref().unwrap().clone(),
@@ -1603,7 +1620,10 @@ impl Wal for WalFile {
 
     fn prepare_wal_finish(&self) -> Result<Completion> {
         let file = self.with_shared(|shared| {
-            assert!(shared.enabled.load(Ordering::SeqCst), "WAL must be enabled");
+            turso_assert!(
+                shared.enabled.load(Ordering::Relaxed),
+                "WAL must be enabled"
+            );
             shared.file.as_ref().unwrap().clone()
         });
         let shared = self.shared.clone();
@@ -1746,7 +1766,10 @@ impl Wal for WalFile {
     /// Get WAL file for durable writes.
     fn wal_file(&self) -> Result<Arc<dyn File>> {
         self.with_shared(|shared| {
-            turso_assert!(shared.enabled.load(Ordering::SeqCst), "WAL must be enabled");
+            turso_assert!(
+                shared.enabled.load(Ordering::Relaxed),
+                "WAL must be enabled"
+            );
             shared
                 .file
                 .as_ref()
@@ -1857,7 +1880,10 @@ impl Wal for WalFile {
         let c = Completion::new_write(cmp);
 
         let file = self.with_shared(|shared| {
-            assert!(shared.enabled.load(Ordering::SeqCst), "WAL must be enabled");
+            turso_assert!(
+                shared.enabled.load(Ordering::Relaxed),
+                "WAL must be enabled"
+            );
             shared.file.as_ref().unwrap().clone()
         });
         let c = file.pwritev(start_off, iovecs, c)?;
@@ -2022,7 +2048,7 @@ impl WalFile {
         self.max_frame_read_lock_index
             .store(NO_LOCK_HELD, Ordering::Release);
         self.ongoing_checkpoint.write().reset();
-        self.syncing.store(false, Ordering::SeqCst);
+        self.syncing.store(false, Ordering::Release);
     }
 
     /// the WAL file has been truncated and we are writing the first
@@ -2470,7 +2496,10 @@ impl WalFile {
 
     fn truncate_log(&self) -> Result<IOResult<()>> {
         let file = self.with_shared(|shared| {
-            assert!(shared.enabled.load(Ordering::SeqCst), "WAL must be enabled");
+            turso_assert!(
+                shared.enabled.load(Ordering::Relaxed),
+                "WAL must be enabled"
+            );
             shared.initialized.store(false, Ordering::Release);
             shared.file.as_ref().unwrap().clone()
         });
@@ -2604,7 +2633,10 @@ impl WalFile {
         };
         // schedule read of the page payload
         let file = self.with_shared(|shared| {
-            assert!(shared.enabled.load(Ordering::SeqCst), "WAL must be enabled");
+            turso_assert!(
+                shared.enabled.load(Ordering::Relaxed),
+                "WAL must be enabled"
+            );
             shared.file.as_ref().unwrap().clone()
         });
         let c = begin_read_wal_frame(
