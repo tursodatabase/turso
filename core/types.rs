@@ -1340,9 +1340,9 @@ impl ImmutableRecord {
             return Err(LimboError::InternalError("Record is invalidated".into()));
         }
         let mut iter = self.iter()?;
-        iter.nth(idx).transpose()?.ok_or(LimboError::InternalError(
-            "Column index out of bounds".into(),
-        ))
+        iter.nth(idx)
+            .transpose()?
+            .ok_or_else(|| LimboError::InternalError("Index out of bounds".into()))
     }
 
     #[inline]
