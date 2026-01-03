@@ -136,9 +136,24 @@ pub trait Extendable<T> {
 impl<T: AnyText> Extendable<T> for Text {
     #[inline(always)]
     fn do_extend(&mut self, other: &T) {
-        let value = self.value.to_mut();
-        value.clear();
-        value.push_str(other.as_ref());
+        let other_str = other.as_ref();
+        match &mut self.value {
+            Cow::Owned(s) => {
+                let needed = other_str.len();
+                if s.capacity() >= needed {
+                    // SAFETY: capacity >= needed, source is valid UTF-8
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(other_str.as_ptr(), s.as_mut_ptr(), needed);
+                        s.as_mut_vec().set_len(needed);
+                    }
+                } else {
+                    *s = other_str.to_owned();
+                }
+            }
+            Cow::Borrowed(_) => {
+                self.value = Cow::Owned(other_str.to_owned());
+            }
+        }
         self.subtype = other.subtype();
     }
 }
@@ -146,8 +161,18 @@ impl<T: AnyText> Extendable<T> for Text {
 impl<T: AnyBlob> Extendable<T> for Vec<u8> {
     #[inline(always)]
     fn do_extend(&mut self, other: &T) {
-        self.clear();
-        self.extend_from_slice(other.as_slice());
+        let other_slice = other.as_slice();
+        let needed = other_slice.len();
+        if self.capacity() >= needed {
+            // SAFETY: capacity >= needed
+            unsafe {
+                std::ptr::copy_nonoverlapping(other_slice.as_ptr(), self.as_mut_ptr(), needed);
+                self.set_len(needed);
+            }
+        } else {
+            self.clear();
+            self.extend_from_slice(other_slice);
+        }
     }
 }
 
