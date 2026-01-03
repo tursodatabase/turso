@@ -44,14 +44,15 @@ Examples of contributing
 * [How to contribute a SQL function implementation](docs/contributing/contributing_functions.md)
 * [Rickrolling Turso DB](https://avi.im/blag/2025/rickrolling-turso)
 
-To build and run `tursodb` CLI: 
+To build and run `tursodb` CLI:
 
-```shell 
+```shell
 cargo run --package turso_cli --bin tursodb database.db
 ```
 
 Run tests:
 ```console
+cargo build -p turso_sqlite3 --features capi
 cargo test
 ```
 
@@ -113,7 +114,7 @@ sudo apt install python3.12 python3.12-dev
 ```console
 export PYO3_PYTHON=$(which python3)
 ```
-4. Build Cargo 
+4. Build Cargo
 ```console
 cargo build -p turso_sqlite3 --features capi
 ```
@@ -200,7 +201,7 @@ Fork the repository and open a pull request to submit your work.
 The CI checks for formatting, Clippy warnings, and test failures so remember to run the following before submitting your pull request:
 
 * `cargo fmt` and `cargo clippy --workspace --all-features --all-targets -- --deny=warnings` to keep the code formatting in check.
-* `make` to run the test suite.
+* `make test` to run the test suite.
 
 **Keep your pull requests focused and as small as possible, but not smaller.** IOW, when preparing a pull request, ensure it focuses on a single thing and that your commits align with that. For example, a good pull request might fix a specific bug or a group of related bugs. Or a good pull request might add a new feature and test for it. Conversely, a bad pull request might fix a bug, add a new feature, and refactor some code.
 
@@ -382,7 +383,7 @@ export ANTITHESIS_EMAIL=
 ```
 
 You can then publish a new Antithesis workflow with:
- 
+
 ```bash
 scripts/antithesis/publish-workload.sh
 ```
