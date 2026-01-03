@@ -869,7 +869,8 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                     rowid,
                     idx,
                 } => {
-                    if !return_if_io!(cursor.next()) {
+                    return_if_io!(cursor.next());
+                    if !cursor.has_record() {
                         return Err(LimboError::Corrupt("inverted index corrupted".to_string()));
                     }
                     self.delete_state = VectorSparseInvertedIndexDeleteState::DeleteInverted {
@@ -1378,8 +1379,8 @@ impl IndexMethodCursor for VectorSparseInvertedIndexMethodCursor {
                     component,
                     current,
                 } => {
-                    let result = return_if_io!(inverted.next());
-                    if !result {
+                    return_if_io!(inverted.next());
+                    if !inverted.has_record() {
                         let Some(mut current) = current.take() else {
                             return Err(LimboError::InternalError(
                                 "current must be present in Next state".to_string(),
