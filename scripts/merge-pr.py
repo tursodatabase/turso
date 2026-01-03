@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+from collections import Counter
 
 
 def run_command(command, capture_output=True):
@@ -81,6 +82,68 @@ def get_pr_info(pr_number):
         "reviewed_by": reviewed_by,
     }
 
+
+def load_pr_template(template_path=".github/pull_request_template.md") -> str:
+    try:
+        with open(template_path, "r", encoding="utf-8") as f:
+            # Normalize newlines
+            return f.read().replace("\r\n", "\n").replace("\r", "\n")
+    except FileNotFoundError:
+        return ""
+
+def truncate_body_at_marker(body: str) -> str:
+    """
+    Truncate PR body at the given markdown header marker (inclusive).
+    Everything at or below the marker is removed.
+    """
+    if not body:
+        return ""
+
+    lines = body.split("\n")
+    for i, line in enumerate(lines):
+        if line.strip() == "### Description of AI":
+            return "\n".join(lines[:i]).rstrip()
+
+    return body.strip()
+
+def strip_pr_template_from_body(body: str, template_path=".github/pull_request_template.md") -> str:
+    """
+    Remove unchanged PR template lines from the PR body.
+    Strategy: line-level subtraction of template lines (multiset) outside of fenced
+    code blocks. Lines that the author edited will not match and will be retained.
+    """
+    template = load_pr_template(template_path)
+    if not template or not body:
+        return (body or "").strip()
+
+    # Normalize newlines and compare lines ignoring trailing whitespace
+    template_lines = [ln.rstrip() for ln in template.split("\n")]
+    body_lines = body.replace("\r\n", "\n").replace("\r", "\n").split("\n")
+    # Use a multiset so repeated lines (e.g., blank lines, repeated headings) are handled correctly
+    tmpl_counts = Counter([ln for ln in template_lines if ln != ""])
+    out_lines = []
+    in_code_block = False
+
+    for raw in body_lines:
+        line = raw.rstrip()
+        # Preserve code blocks verbatim
+        if line.strip().startswith("```"):
+            in_code_block = not in_code_block
+            out_lines.append(raw)
+            continue
+
+        if in_code_block:
+            out_lines.append(raw)
+            continue
+
+        # Drop lines that exactly match a template line (outside code blocks)
+        if line != "" and tmpl_counts.get(line, 0) > 0:
+            tmpl_counts[line] -= 1
+            continue
+        out_lines.append(raw)
+    cleaned = "\n".join(out_lines).strip()
+    cleaned = re.sub(r"\n{3,}", "\n\n", cleaned)
+    return cleaned
 
 def wrap_text(text, width=72):
     lines = text.split("\n")
@@ -228,9 +291,12 @@ def merge_pr(pr_number, use_api=True):
     pr_info = get_pr_info(pr_number)
     print(f"PR found: '{pr_info['title']}' by {pr_info['author']}")
 
-    # Format commit message
     commit_title = f"Merge '{pr_info['title']}' from {pr_info['author_name']}"
-    commit_body = wrap_text(pr_info["body"])
+    body = pr_info["body"]
+    body = truncate_body_at_marker(body)
+    body = strip_pr_template_from_body(body, ".github/pull_request_template.md")
+
+    commit_body = wrap_text(body)
 
     commit_message_parts = [commit_title]
     if commit_body:
