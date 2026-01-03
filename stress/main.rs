@@ -587,7 +587,8 @@ pub fn init_tracing() -> Result<(WorkerGuard, LogLevelReloadHandle), std::io::Er
                 .with_writer(non_blocking)
                 .with_ansi(false)
                 .with_line_number(true)
-                .with_thread_ids(true),
+                .with_thread_ids(true)
+                .json(),
         )
         .try_init()
     {
@@ -722,7 +723,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let vfs_option = opts.vfs.clone();
 
-    for thread in 0..opts.nr_threads {
+    for thread in 0..plan.nr_threads {
         let db_file = db_file.clone();
         let mut builder = Builder::new_local(&db_file);
         if let Some(ref vfs) = vfs_option {
@@ -741,24 +742,25 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             if opts.verbose {
                 println!("executing ddl {stmt}");
             }
-            if let Err(e) = conn.execute(stmt, ()).await {
-                match e {
-                    turso::Error::Corrupt(e) => {
+            let mut retry_counter = 0;
+            while retry_counter < 10 {
+                match conn.execute(stmt, ()).await {
+                    Ok(_) => break,
+                    Err(turso::Error::Busy(e)) => {
+                        println!("Error (busy) creating table: {e}");
+                        retry_counter += 1;
+                    }
+                    Err(e) => {
                         panic!("Error creating table: {e}");
-                    }
-                    turso::Error::Error(e) => {
-                        println!("Error creating table: {e}");
-                    }
-                    _ => {
-                        println!("Error creating table: {e}");
-                        // Exit on any other error during table creation
-                        std::process::exit(1);
                     }
                 }
             }
+            if retry_counter == 10 {
+                panic!("Could not execute statement [{stmt}] after {retry_counter} attempts.");
+            }
         }
 
-        let nr_iterations = plan.nr_iterations;
+        let nr_queries = plan.queries_per_thread[thread].len();
         let db = db.clone();
         let vfs_for_task = vfs_option.clone();
 
@@ -770,7 +772,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             conn.execute("PRAGMA data_sync_retry = 1", ()).await?;
 
             println!("\rExecuting queries...");
-            for query_index in 0..nr_iterations {
+            for query_index in 0..nr_queries {
                 if gen_bool(0.0) {
                     // disabled
                     if opts.verbose {
@@ -802,7 +804,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     } else if query_index % 100 == 0 {
                         print!(
                             "\r{:.2} %",
-                            (query_index as f64 / nr_iterations as f64 * 100.0)
+                            (query_index as f64 / nr_queries as f64 * 100.0)
                         );
                         std::io::stdout().flush().unwrap();
                     }
