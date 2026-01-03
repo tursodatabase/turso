@@ -265,6 +265,8 @@ fn estimate_selectivity(
 }
 
 #[derive(Clone, Copy, Debug)]
+/// A simplified reference to a single column-like value in an expression.
+/// Used for estimating join selectivity, cheaper than ast::Expr
 enum SimpleColumnRef {
     Column {
         table_id: TableInternalId,
@@ -275,6 +277,7 @@ enum SimpleColumnRef {
     },
 }
 
+/// Extract a `SimpleColumnRef` from an expression, if it is a direct column-like reference.
 fn simple_column_ref(expr: &ast::Expr) -> Option<SimpleColumnRef> {
     match expr {
         ast::Expr::Column { table, column, .. } => Some(SimpleColumnRef::Column {
@@ -286,6 +289,16 @@ fn simple_column_ref(expr: &ast::Expr) -> Option<SimpleColumnRef> {
     }
 }
 
+/// Estimate the "number of distinct values" (NDV) for a column-like value.
+/// This is used as a building block for selectivity estimation, especially for
+/// equality predicates and equi-joins.
+///
+/// Important limitations / assumptions:
+/// - This assumes the leading column of an index provides the most reliable stats.
+///   Non-leading columns are ignored for stats-derived NDV because prefix
+///   cardinalities do not directly represent NDV of later columns.
+/// - When stats are missing or unusable, heuristics are used; these constants
+///   are intentionally conservative.
 fn estimate_column_ndv(
     schema: &Schema,
     table_reference: &JoinedTable,
@@ -336,6 +349,7 @@ fn estimate_column_ndv(
         }
     }
 
+    // If we have *any* index involvement for this column, assume better selectivity than unindexed.
     let has_index = available_indexes.get(table_name).is_some_and(|indexes| {
         indexes
             .iter()
@@ -401,6 +415,18 @@ fn estimate_join_eq_selectivity(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Estimate selectivity for a single WHERE/ON constraint applied to `table_reference`.
+///
+/// This function attempts to recognize join-equality constraints and use a
+/// join-aware selectivity estimate; otherwise it falls back to the generic
+/// per-column selectivity estimator.
+///
+/// Specifically:
+/// - If `operator == Equals` and `constraining_expr` is a simple column reference
+///   from a *different* table, treat this as a join predicate and estimate:
+///     selectivity ~= 1 / max(NDV(left), NDV(right)).
+/// - Otherwise defer to `estimate_selectivity(...)`, which handles constants,
+///   non-equality operators, and general column constraints (possibly using index stats).
 fn estimate_constraint_selectivity(
     schema: &Schema,
     table_reference: &JoinedTable,
@@ -411,6 +437,7 @@ fn estimate_constraint_selectivity(
     available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
     table_references: &TableReferences,
 ) -> f64 {
+    // Special-case: equality to another table's column is likely an equi-join.
     if operator == ast::Operator::Equals {
         if let Some(other_ref) = simple_column_ref(constraining_expr) {
             let other_table_id = match other_ref {
@@ -418,6 +445,7 @@ fn estimate_constraint_selectivity(
                 SimpleColumnRef::RowId { table_id } => table_id,
             };
             if other_table_id != table_reference.internal_id {
+                // Only treat as a join if it references a different table than the constrained one.
                 if let Some(selectivity) = estimate_join_eq_selectivity(
                     schema,
                     table_reference,
@@ -432,6 +460,7 @@ fn estimate_constraint_selectivity(
         }
     }
 
+    // Generic constraint selectivity (constants, non-equality, same-table refs, etc).
     estimate_selectivity(
         schema,
         table_reference.table.get_name(),
