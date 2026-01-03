@@ -120,7 +120,20 @@ pub fn emit_result_row_and_limit(
             let record_reg = program.alloc_register();
             match rowid_mode {
                 super::plan::EphemeralRowidMode::FromResultColumns => {
-                    if plan.result_columns.len() > 1 {
+                    // For single-column case (RowidOnly materialization), we still need to
+                    // create a record containing the rowid so it can be read back later.
+                    // The rowid is used as both the key (for deduplication) and stored
+                    // in the record (for read-back via Column instruction).
+                    if plan.result_columns.len() == 1 {
+                        // Single column case: create a record with just the rowid value
+                        program.emit_insn(Insn::MakeRecord {
+                            start_reg: to_u16(result_columns_start_reg),
+                            count: to_u16(1),
+                            dest_reg: to_u16(record_reg),
+                            index_name: Some(table.name.clone()),
+                            affinity_str: None,
+                        });
+                    } else if plan.result_columns.len() > 1 {
                         program.emit_insn(Insn::MakeRecord {
                             start_reg: to_u16(result_columns_start_reg),
                             count: to_u16(plan.result_columns.len() - 1),

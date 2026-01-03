@@ -208,31 +208,6 @@ pub fn join_lhs_and_rhs<'a>(
             })
             .unwrap_or(false);
 
-        // If the query needs a specific ordering, only allow hash join when the nested-loop
-        // alternative would NOT satisfy the order target.
-        let nested_loop_preserves_order = maybe_order_target.is_some_and(|order_target| {
-            // Temporarily add the nested-loop method to the arena to evaluate ordering.
-            {
-                access_methods_arena.push(best_access_method.clone());
-            }
-            let am_idx = access_methods_arena.len() - 1;
-            let mut data = lhs.data.clone();
-            data.push((rhs_table_number, am_idx));
-            let tmp_plan = JoinN {
-                data,
-                output_cardinality: 0,
-                cost: Cost(0.0),
-            };
-            let preserves = plan_satisfies_order_target(
-                &tmp_plan,
-                access_methods_arena,
-                joined_tables,
-                order_target,
-            );
-            access_methods_arena.pop();
-            preserves
-        });
-
         let build_constraints = &all_constraints[lhs_table_idx];
         let build_base_rows = base_table_rows.get(lhs_table_idx).copied().unwrap_or({
             RowCountEstimate::HardcodedFallback(ESTIMATED_HARDCODED_ROWS_PER_TABLE as f64)
@@ -397,11 +372,10 @@ pub fn join_lhs_and_rhs<'a>(
             })
             .unwrap_or(false);
 
-        // Eligibility gate: prefer nested-loop when it preserves ORDER BY or uses
-        // a selective probe seek. Probe->build chaining is only allowed when the
+        // Eligibility gate: prefer nested-loop when uses a selective probe seek.
+        // Probe->build chaining is only allowed when the
         // build input is materialized from the join prefix.
-        let allow_hash_join = !nested_loop_preserves_order
-            && !rhs_has_selective_seek
+        let allow_hash_join = !rhs_has_selective_seek
             && !probe_table_is_prior_build
             && (!build_has_prior_constraints || build_has_rowid)
             && !chaining_across_outer;
@@ -410,7 +384,6 @@ pub fn join_lhs_and_rhs<'a>(
             lhs_table = lhs_table.table.get_name(),
             rhs_table = rhs_table_reference.table.get_name(),
             allow_hash_join,
-            nested_loop_preserves_order,
             rhs_has_selective_seek,
             probe_table_is_prior_build,
             build_table_is_prior_probe,

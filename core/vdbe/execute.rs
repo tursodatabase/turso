@@ -8409,7 +8409,17 @@ pub fn op_open_ephemeral(
                 .as_mut()
                 .expect("cursor should exist in ClearExisting state");
             let btree_cursor = cursor.as_btree_mut();
+            btree_cursor.set_null_flag(false);
             return_if_io!(btree_cursor.clear_btree());
+            // iterate over existing deferred seeks and clear them as well,
+            // as any deferred seek on this cursor is now invalid.
+            for state in &mut state.deferred_seeks {
+                if let Some((id, other)) = state {
+                    if *id == cursor_id || *other == cursor_id {
+                        *state = None;
+                    }
+                }
+            }
             state.op_open_ephemeral_state = OpOpenEphemeralState::RewindExisting;
         }
         OpOpenEphemeralState::RewindExisting => {
