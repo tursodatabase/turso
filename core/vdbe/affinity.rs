@@ -1,7 +1,7 @@
 use either::Either;
 use turso_parser::ast::{Expr, Literal};
 
-use crate::{types::AsValueRef, Value, ValueRef};
+use crate::{numeric::format_float, types::AsValueRef, Value, ValueRef};
 
 /// # SQLite Column Type Affinities
 ///
@@ -185,7 +185,7 @@ impl Affinity {
                 // TEXT affinity: Convert numeric values to their text representation
                 match val {
                     ValueRef::Integer(i) => Some(Either::Right(Value::Text(i.to_string().into()))),
-                    ValueRef::Float(f) => Some(Either::Right(Value::Text(f.to_string().into()))),
+                    ValueRef::Float(f) => Some(Either::Right(Value::Text(format_float(f).into()))),
                     ValueRef::Text(_) => {
                         // If it's already text but looks numeric, ensure it's in canonical text form
                         if is_numeric_value(val) {
@@ -199,15 +199,13 @@ impl Affinity {
             }
 
             Affinity::Real => {
-                let mut left = is_text
+                // REAL affinity only converts TEXT to numeric for comparisons.
+                // Integer values are NOT converted to Float, this preserves precision
+                // for large integers that can't be exactly represented as f64.
+                is_text
                     .then(|| apply_numeric_affinity(val, false))
-                    .flatten();
-
-                if let ValueRef::Integer(i) = left.unwrap_or(val) {
-                    left = Some(ValueRef::Float(i as f64));
-                }
-
-                left.map(Either::Left)
+                    .flatten()
+                    .map(Either::Left)
             }
 
             Affinity::Blob => None, // Do nothing for blob affinity.
