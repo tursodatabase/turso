@@ -147,7 +147,7 @@ impl InternalVirtualTableCursor for DbPageCursor {
                 }
 
                 let page_contents = page_ref.get_contents();
-                let data_slice = page_contents.buffer.as_slice();
+                let data_slice = page_contents.as_ptr();
                 Ok(Value::from_blob(data_slice.to_vec()))
             }
             2 => Ok(Value::from_text("main")),
