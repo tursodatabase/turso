@@ -31,6 +31,7 @@ typedef enum
     TURSO_DATABASE_FULL = 131,
     TURSO_NOTADB = 132,
     TURSO_CORRUPT = 133,
+    TURSO_IOERR = 134,
 } turso_status_code_t;
 
 // enumeration of value types supported by the database

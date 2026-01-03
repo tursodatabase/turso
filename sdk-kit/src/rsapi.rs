@@ -304,6 +304,7 @@ pub enum TursoError {
     DatabaseFull(String),
     NotAdb(String),
     Corrupt(String),
+    IoError(std::io::ErrorKind),
 }
 
 impl TursoStatusCode {
@@ -340,6 +341,7 @@ impl TursoError {
             TursoError::DatabaseFull(_) => capi::c::turso_status_code_t::TURSO_DATABASE_FULL,
             TursoError::NotAdb(_) => capi::c::turso_status_code_t::TURSO_NOTADB,
             TursoError::Corrupt(_) => capi::c::turso_status_code_t::TURSO_CORRUPT,
+            TursoError::IoError(_) => capi::c::turso_status_code_t::TURSO_IOERR,
         }
     }
 }
@@ -356,6 +358,7 @@ impl Display for TursoError {
             | TursoError::DatabaseFull(s)
             | TursoError::NotAdb(s)
             | TursoError::Corrupt(s) => f.write_str(s),
+            TursoError::IoError(kind) => write!(f, "I/O error: {kind}"),
         }
     }
 }
@@ -380,6 +383,9 @@ impl From<LimboError> for TursoError {
             LimboError::DatabaseFull(e) => TursoError::DatabaseFull(e),
             LimboError::ReadOnly => TursoError::Readonly("database is readonly".to_string()),
             LimboError::Busy => TursoError::Busy("database is locked".to_string()),
+            LimboError::CompletionError(turso_core::CompletionError::IOError(kind)) => {
+                TursoError::IoError(kind)
+            }
             _ => TursoError::Error(value.to_string()),
         }
     }

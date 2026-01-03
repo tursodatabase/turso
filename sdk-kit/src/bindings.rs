@@ -41,6 +41,7 @@ pub enum turso_status_code_t {
     TURSO_DATABASE_FULL = 131,
     TURSO_NOTADB = 132,
     TURSO_CORRUPT = 133,
+    TURSO_IOERR = 134,
 }
 #[repr(u32)]
 #[derive(Debug, Copy, Clone, Hash, PartialEq, Eq)]

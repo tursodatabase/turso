@@ -707,6 +707,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
     let mut handles = Vec::with_capacity(opts.nr_threads);
     let plan = Arc::new(plan);
+    let mut stop = false;
 
     let tempfile = tempfile::NamedTempFile::new()?;
     let (_, path) = tempfile.keep().unwrap();
@@ -724,6 +725,9 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let vfs_option = opts.vfs.clone();
 
     for thread in 0..plan.nr_threads {
+        if stop {
+            break;
+        }
         let db_file = db_file.clone();
         let mut builder = Builder::new_local(&db_file);
         if let Some(ref vfs) = vfs_option {
@@ -750,10 +754,23 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         println!("Error (busy) creating table: {e}");
                         retry_counter += 1;
                     }
+                    Err(turso::Error::DatabaseFull(e)) => {
+                        eprintln!("Database full, stopping: {e}");
+                        stop = true;
+                        break;
+                    }
+                    Err(turso::Error::IoError(std::io::ErrorKind::StorageFull)) => {
+                        eprintln!("No storage space, stopping");
+                        stop = true;
+                        break;
+                    }
                     Err(e) => {
                         panic!("Error creating table: {e}");
                     }
                 }
+            }
+            if stop {
+                break;
             }
             if retry_counter == 10 {
                 panic!("Could not execute statement [{stmt}] after {retry_counter} attempts.");
@@ -829,6 +846,14 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             if opts.verbose {
                                 println!("Error executing query: {e}");
                             }
+                        }
+                        turso::Error::DatabaseFull(e) => {
+                            eprintln!("Database full, stopping thread: {e}");
+                            break;
+                        }
+                        turso::Error::IoError(std::io::ErrorKind::StorageFull) => {
+                            eprintln!("No storage space, stopping thread");
+                            break;
                         }
                         _ => panic!("Error[FATAL] executing query: {}", e),
                     }
