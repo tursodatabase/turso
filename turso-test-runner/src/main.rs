@@ -1,5 +1,6 @@
 use clap::{Parser, Subcommand};
 use miette::{NamedSource, Report};
+use owo_colors::OwoColorize;
 use std::process::ExitCode;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -274,8 +275,6 @@ fn convert_files(
     to_stdout: bool,
     verbose: bool,
 ) -> ExitCode {
-    use colored::Colorize;
-
     let mut total_tests = 0;
     let mut total_warnings = 0;
     let mut files_processed = 0;
@@ -351,8 +350,6 @@ fn convert_single_file(
     to_stdout: bool,
     _verbose: bool,
 ) -> (usize, usize) {
-    use colored::Colorize;
-
     let content = match std::fs::read_to_string(path) {
         Ok(c) => Arc::new(c),
         Err(e) => {
