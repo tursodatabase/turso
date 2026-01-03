@@ -1,0 +1,29 @@
+@database :memory:
+
+test min-null-regression-test {
+    CREATE TABLE t (a);
+    INSERT INTO t VALUES ('abc'), (NULL);
+    SELECT min(a) FROM t;
+}
+expect {
+    abc
+}
+
+test max-null-regression-test {
+    CREATE TABLE t (a);
+    INSERT INTO t VALUES ('abc'), (NULL);
+    SELECT max(a) FROM t;
+}
+expect {
+    abc
+}
+
+test group-concat-null-values-test {
+    CREATE TABLE t (a);
+    INSERT INTO t VALUES ('a'), (''), ('b'), (NULL), ('c');
+    SELECT group_concat(a) FROM t;
+}
+expect {
+    a,,b,c
+}
+
