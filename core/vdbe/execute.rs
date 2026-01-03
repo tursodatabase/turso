@@ -1517,30 +1517,21 @@ pub fn op_column(
                             let Some(record) = record_result else {
                                 break 'ifnull;
                             };
-                            let payload = record.get_payload();
 
                             let mut payload_iterator = record.iter()?;
 
-                            let mut current_column = 0;
-                            let target_column = *column;
-
                             // Parse the header for serial types incrementally until we have the target column
-                            while current_column <= target_column {
-                                match payload_iterator.next() {
-                                    Some(d) => {
-                                        if current_column == target_column {
-                                            state.registers[*dest] = Register::Value(d?.to_owned());
-                                            break 'outer;
-                                        }
-                                    }
-                                    None => {
-                                        branches::mark_unlikely();
-                                        // record has fewer columns than expected
-                                        break;
-                                    }
-                                };
-                                current_column += 1;
-                            }
+                            match payload_iterator.nth(*column) {
+                                Some(d) => {
+                                    state.registers[*dest] = Register::Value(d?.to_owned());
+                                    break 'outer;
+                                }
+                                None => {
+                                    branches::mark_unlikely();
+                                    // record has fewer columns than expected
+                                }
+                            };
+
                             //break;
                         };
 
