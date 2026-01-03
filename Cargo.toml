@@ -38,7 +38,7 @@ members = [
     "sdk-kit",
     "sdk-kit-macros",
 ]
-exclude = ["perf/latency/limbo"]
+exclude = ["perf/latency/limbo", "turso-test-runner"]
 
 [workspace.package]
 version = "0.4.0-pre.20"

@@ -1,0 +1,100 @@
+# Basic SQL Tests
+# Demonstrates the DSL syntax with simple examples
+
+@database :memory:
+
+# Setup block for creating test data
+setup users {
+    CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER);
+    INSERT INTO users VALUES (1, 'Alice', 30), (2, 'Bob', 25), (3, 'Charlie', 35);
+}
+
+# Simple constant selection
+test select-constant {
+    SELECT 1;
+}
+expect {
+    1
+}
+
+# Select with expression
+test select-expression {
+    SELECT 1 + 2;
+}
+expect {
+    3
+}
+
+# String constant
+test select-string {
+    SELECT 'hello';
+}
+expect {
+    hello
+}
+
+# Using a setup
+@setup users
+test select-all-users {
+    SELECT id, name FROM users ORDER BY id;
+}
+expect {
+    1|Alice
+    2|Bob
+    3|Charlie
+}
+
+# Filtering
+@setup users
+test select-filtered {
+    SELECT name FROM users WHERE age > 28 ORDER BY name;
+}
+expect {
+    Alice
+    Charlie
+}
+
+# Aggregation
+@setup users
+test select-count {
+    SELECT COUNT(*) FROM users;
+}
+expect {
+    3
+}
+
+# Pattern matching with regex
+test select-random-pattern {
+    SELECT ABS(RANDOM()) % 100;
+}
+expect pattern {
+    \d+
+}
+
+# Unordered comparison (order doesn't matter)
+@setup users
+test select-unordered {
+    SELECT name FROM users;
+}
+expect unordered {
+    Charlie
+    Alice
+    Bob
+}
+
+# Error expectation
+test select-nonexistent-table {
+    SELECT * FROM nonexistent_table;
+}
+expect error {
+    no such table
+}
+
+# Skip example
+@skip "demonstrates skip functionality"
+test skipped-test {
+    SELECT 'this will not run';
+}
+expect {
+    this will not run
+}

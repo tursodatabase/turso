@@ -202,6 +202,8 @@ impl Database {
         crate::uuid::register_extension(&mut ext_api);
         #[cfg(feature = "series")]
         crate::series::register_extension(&mut ext_api);
+        #[cfg(feature = "time")]
+        crate::time::register_extension(&mut ext_api);
         #[cfg(feature = "fs")]
         {
             let vfslist = add_builtin_vfs_extensions(Some(ext_api)).map_err(|e| e.to_string())?;
