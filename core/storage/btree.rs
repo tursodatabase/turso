@@ -7809,7 +7809,7 @@ mod tests {
 
         {
             let inner = page.get();
-            inner.buffer = Some(Buffer::new_temporary(4096));
+            inner.buffer = Some(Arc::new(Buffer::new_temporary(4096)));
         }
         page.set_loaded();
 

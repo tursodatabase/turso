@@ -703,7 +703,7 @@ mod tests {
         let page = Arc::new(Page::new(page_id as i64));
         {
             let inner = page.get();
-            inner.buffer = Some(crate::Buffer::new_temporary(4096));
+            inner.buffer = Some(Arc::new(crate::Buffer::new_temporary(4096)));
         }
         page.set_loaded();
         page

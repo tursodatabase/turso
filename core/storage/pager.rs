@@ -162,28 +162,21 @@ pub struct PageInner {
     /// This tracks which version of the page we have in memory
     pub wal_tag: AtomicU64,
     /// The actual page data buffer. None if not loaded.
-    pub buffer: Option<Buffer>,
+    pub buffer: Option<Arc<Buffer>>,
     /// Overflow cells during btree operations
     pub overflow_cells: Vec<OverflowCell>,
 }
 
 // Methods moved from PageContent - these provide btree page access
 impl PageInner {
-    /// Creates a new PageInner from an Arc<Buffer> (for backward compatibility).
-    /// The Arc is unwrapped to get ownership of the Buffer, or copied if needed.
+    /// Creates a new PageInner from an Arc<Buffer>.
     pub fn new(buffer: Arc<Buffer>) -> Self {
-        // Try to unwrap the Arc, or copy the data if we can't
-        let owned_buffer = Arc::try_unwrap(buffer).unwrap_or_else(|arc| {
-            let new_buf = Buffer::new_temporary(arc.len());
-            new_buf.as_mut_slice().copy_from_slice(arc.as_slice());
-            new_buf
-        });
         Self {
             flags: AtomicUsize::new(0),
             id: 0,
             pin_count: AtomicUsize::new(0),
             wal_tag: AtomicU64::new(TAG_UNSET),
-            buffer: Some(owned_buffer),
+            buffer: Some(buffer),
             overflow_cells: Vec::new(),
         }
     }
@@ -195,7 +188,7 @@ impl PageInner {
             id: 0,
             pin_count: AtomicUsize::new(0),
             wal_tag: AtomicU64::new(TAG_UNSET),
-            buffer: Some(buffer),
+            buffer: Some(Arc::new(buffer)),
             overflow_cells: Vec::new(),
         }
     }
@@ -4217,7 +4210,7 @@ pub fn allocate_new_page(page_id: i64, buffer_pool: &Arc<BufferPool>) -> PageRef
     {
         let buffer = buffer_pool.get_page();
         let inner = page.get();
-        inner.buffer = Some(buffer);
+        inner.buffer = Some(Arc::new(buffer));
         page.set_loaded();
         page.clear_wal_tag();
     }
@@ -4238,9 +4231,9 @@ pub fn default_page1(cipher: Option<&CipherMode>) -> PageRef {
 
     {
         let inner = page.get();
-        inner.buffer = Some(Buffer::new_temporary(
-            default_header.page_size.get() as usize
-        ));
+        inner.buffer = Some(Arc::new(Buffer::new_temporary(
+            default_header.page_size.get() as usize,
+        )));
     }
 
     page.get_contents().write_database_header(&default_header);
