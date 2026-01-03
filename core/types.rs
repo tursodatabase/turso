@@ -1028,7 +1028,7 @@ impl ImmutableRecord {
 
     // Don't use this in performance critical paths, prefer using `iter()` instead
     pub fn get_values(&self) -> Result<Vec<ValueRef<'_>>> {
-        let iter = self.iter().expect("Failed to create payload iterator");
+        let iter = self.iter()?;
         let mut values = Vec::with_capacity(iter.size_hint().0);
         for value in iter {
             values.push(value?);
@@ -1038,7 +1038,7 @@ impl ImmutableRecord {
 
     // Don't use this in performance critical paths, prefer using `iter()` instead
     pub fn get_values_range(&self, range: std::ops::Range<usize>) -> Result<Vec<ValueRef<'_>>> {
-        let mut iter = self.iter().expect("Failed to create payload iterator");
+        let mut iter = self.iter()?;
         let mut values = Vec::with_capacity(range.end - range.start);
         // advance to start
         if let Some(value) = iter.nth(range.start) {
