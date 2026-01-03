@@ -69,7 +69,7 @@ where
     E: ExactSizeIterator<Item = V>,
     I: IntoIterator<IntoIter = E, Item = V>,
 {
-    exec_datetime(values, DateTimeOutput::JuliaDay)
+    exec_datetime(values, DateTimeOutput::JulianDay)
 }
 
 pub fn exec_unixepoch<I, E, V>(values: I) -> Value
@@ -87,7 +87,7 @@ enum DateTimeOutput {
     DateTime,
     // Holds the format string
     StrfTime(String),
-    JuliaDay,
+    JulianDay,
     UnixEpoch,
 }
 
@@ -99,58 +99,54 @@ where
 {
     let values = values.into_iter();
     if values.len() == 0 {
-        let (now, _is_utc, _ov) = parse_naive_date_time(Value::build_text("now")).unwrap();
+        let now = chrono::Local::now().to_utc().naive_utc();
         return format_dt(now, output_type, false);
     }
 
     let mut values = values.peekable();
-    let (initial_numeric_value, is_implicit_now, parsed_result) = {
-        let first = values.peek().unwrap();
-        let initial_numeric = match first.as_value_ref() {
-            ValueRef::Integer(i) => Some(i as f64),
-            ValueRef::Float(f) => Some(f),
-            ValueRef::Text(s) => s.as_str().parse::<f64>().ok(),
-            _ => None,
-        };
-
-        let parsed = parse_naive_date_time(first);
-
-        let is_mod = if let ValueRef::Text(s) = first.as_value_ref() {
-            let s = s.as_str();
-            s.eq_ignore_ascii_case("subsec") || s.eq_ignore_ascii_case("subsecond")
-        } else {
-            false
-        };
-
-        (initial_numeric, is_mod, parsed)
+    let first = values.peek().unwrap();
+    let initial_numeric = match first.as_value_ref() {
+        ValueRef::Integer(i) => Some(i as f64),
+        ValueRef::Float(f) => Some(f),
+        ValueRef::Text(s) => s.as_str().parse::<f64>().ok(),
+        _ => None,
     };
 
-    if let Some((mut dt, is_utc, overflow)) = parsed_result {
-        modify_dt(
+    if let Some((mut dt, is_utc, overflow)) = parse_naive_date_time(first) {
+        return modify_dt(
             &mut dt,
             values.skip(1),
             output_type,
-            initial_numeric_value,
+            initial_numeric,
             true,
             is_utc,
-            overflow, // Pass initial overflow!
-        )
-    } else if is_implicit_now {
-        let mut dt = chrono::Local::now().to_utc().naive_utc();
-        modify_dt(&mut dt, values, output_type, None, true, true, 0)
-    } else {
-        let mut dt = DateTime::from_timestamp(0, 0).unwrap().naive_utc();
-        let is_valid = false;
-        modify_dt(
-            &mut dt,
-            values.skip(1),
-            output_type,
-            initial_numeric_value,
-            is_valid,
-            true,
-            0,
-        )
+            overflow,
+        );
     }
+
+    let first_arg_is_modifier = if let ValueRef::Text(s) = first.as_value_ref() {
+        let s = s.as_str();
+        s.eq_ignore_ascii_case("subsec") || s.eq_ignore_ascii_case("subsecond")
+    } else {
+        false
+    };
+
+    if first_arg_is_modifier {
+        let mut dt = chrono::Local::now().to_utc().naive_utc();
+        return modify_dt(&mut dt, values, output_type, None, true, true, 0);
+    }
+
+    let mut dt = DateTime::from_timestamp(0, 0).unwrap().naive_utc();
+    let is_valid = false;
+    modify_dt(
+        &mut dt,
+        values.skip(1),
+        output_type,
+        initial_numeric,
+        is_valid,
+        true,
+        0,
+    )
 }
 
 fn modify_dt<I, E, V>(
@@ -251,7 +247,7 @@ fn format_dt(dt: NaiveDateTime, output_type: DateTimeOutput, subsec: bool) -> Va
             Some(s) => Value::from_text(s),
             None => Value::Null,
         },
-        DateTimeOutput::JuliaDay => Value::Float(to_julian_day_exact(&dt)),
+        DateTimeOutput::JulianDay => Value::Float(to_julian_day_exact(&dt)),
         DateTimeOutput::UnixEpoch => {
             if subsec {
                 let seconds = dt.and_utc().timestamp() as f64;
@@ -400,23 +396,16 @@ fn apply_modifier(
                 ));
             }
             *is_utc = true;
-            if let Some(val) = initial_numeric {
-                // SQLite logic: Round to nearest millisecond to prevent precision issues
-                // and handle negative numbers correctly using TimeDelta
-                let total_ms = (val * 1000.0).round() as i64;
+            let val = initial_numeric
+                .ok_or_else(|| InvalidModifier("unixepoch requires numeric input".into()))?;
+            let total_ms = (val * 1000.0).round() as i64;
+            let base = DateTime::from_timestamp(0, 0)
+                .ok_or_else(|| InvalidModifier("Internal error".into()))?;
 
-                if let Some(base) = DateTime::from_timestamp(0, 0) {
-                    // TimeDelta handles the negative math (e.g. -500ms correctly goes back 1 second)
-                    match base.checked_add_signed(TimeDelta::milliseconds(total_ms)) {
-                        Some(new_dt) => *dt = new_dt.naive_utc(),
-                        None => return Err(InvalidModifier("Date overflow".into())),
-                    }
-                } else {
-                    return Err(InvalidModifier("Internal error".into()));
-                }
-            } else {
-                return Err(InvalidModifier("unixepoch requires numeric input".into()));
-            }
+            *dt = base
+                .checked_add_signed(TimeDelta::milliseconds(total_ms))
+                .ok_or_else(|| InvalidModifier("Date overflow".into()))?
+                .naive_utc();
         }
         Modifier::JulianDay => {
             if !is_first_modifier {
@@ -436,20 +425,15 @@ fn apply_modifier(
                 *is_utc = true;
                 if let Some(val) = initial_numeric {
                     if is_julian_day_value(val) {
-                        if let Ok(new_dt) = julian_day_to_datetime(val) {
-                            *dt = new_dt;
-                        }
+                        *dt = julian_day_to_datetime(val)?;
                     } else {
                         let total_ms = (val * 1000.0).round() as i64;
-
-                        if let Some(base) = DateTime::from_timestamp(0, 0) {
-                            match base.checked_add_signed(TimeDelta::milliseconds(total_ms)) {
-                                Some(new_dt) => *dt = new_dt.naive_utc(),
-                                None => return Err(InvalidModifier("Date overflow".into())),
-                            }
-                        } else {
-                            return Err(InvalidModifier("Auto value out of range".into()));
-                        }
+                        let base = DateTime::from_timestamp(0, 0)
+                            .ok_or_else(|| InvalidModifier("Internal error".into()))?;
+                        *dt = base
+                            .checked_add_signed(TimeDelta::milliseconds(total_ms))
+                            .ok_or_else(|| InvalidModifier("Date overflow".into()))?
+                            .naive_utc();
                     }
                 }
             }
@@ -611,6 +595,24 @@ fn get_date_time_from_time_value_string(value: &str) -> Option<(NaiveDateTime, b
 }
 
 fn parse_datetime_with_optional_tz(value: &str, format: &str) -> Option<(NaiveDateTime, bool)> {
+    let is_invalid_suffix = |s: &str| -> bool {
+        let b = s.as_bytes();
+        let len = b.len();
+
+        // Reject +HHMM or -HHMM
+        if len >= 5 {
+            let c = b[len - 5];
+            if (c == b'+' || c == b'-') && b[len - 4..].iter().all(|x| x.is_ascii_digit()) {
+                return true;
+            }
+        }
+        false
+    };
+
+    if is_invalid_suffix(value) {
+        return None;
+    }
+
     // Case 1: Format includes timezone specifier (e.g. %:z)
     let with_tz_format = format.to_owned() + "%:z";
     if let Ok(dt) = DateTime::parse_from_str(value, &with_tz_format) {
@@ -631,6 +633,7 @@ fn parse_datetime_with_optional_tz(value: &str, format: &str) -> Option<(NaiveDa
     }
     None
 }
+
 fn get_date_time_from_time_value_integer(value: i64) -> Option<(NaiveDateTime, bool, i64)> {
     i32::try_from(value).map_or_else(
         |_| None,
@@ -700,37 +703,10 @@ fn strip_timezone_suffix(s: &str) -> &str {
         }
     }
 
-    // Check +HHMM or -HHMM (length >= 5)
-    if s.len() >= 5 {
-        let idx = s.len() - 5;
-        let c = s.chars().nth(idx).unwrap();
-        if c == '+' || c == '-' {
-            let h_part = &s[idx + 1..idx + 3];
-            let m_part = &s[idx + 3..];
-            if h_part.chars().all(|x| x.is_ascii_digit())
-                && m_part.chars().all(|x| x.is_ascii_digit())
-                && is_valid_tz(h_part, m_part)
-            {
-                return &s[..idx];
-            }
-        }
-    }
-
-    // Check +HH or -HH (length >= 3)
-    if s.len() >= 3 {
-        let idx = s.len() - 3;
-        let c = s.chars().nth(idx).unwrap();
-        if c == '+' || c == '-' {
-            let h_part = &s[idx + 1..];
-            if h_part.chars().all(|x| x.is_ascii_digit()) && is_valid_tz(h_part, "00") {
-                return &s[..idx];
-            }
-        }
-    }
-
     // The parser will subsequently fail on this string, returning NULL.
     s
 }
+
 fn to_julian_day_exact(dt: &NaiveDateTime) -> f64 {
     let s = dt.second() as f64 + (dt.nanosecond() as f64 / 1_000_000_000.0);
     compute_julian_day(
@@ -743,8 +719,7 @@ fn to_julian_day_exact(dt: &NaiveDateTime) -> f64 {
     )
 }
 // Helper to compute JD from raw components (allows invalid dates like 2023-02-31)
-// Helper to compute JD from raw components
-// 's' is now a double that includes subseconds (e.g., 12.345)
+// 's' is a double that includes subseconds (e.g., 12.345)
 fn compute_julian_day(y: i32, mut m: i32, d: i32, h: i32, min: i32, s: f64) -> f64 {
     let mut y = y;
     if m <= 2 {
@@ -926,7 +901,7 @@ fn julian_day_to_datetime(jd: f64) -> Result<NaiveDateTime> {
 
     // Compute the time (Hour, Minute, Second) from iJD
     // day_ms = (int)((iJD + 43200000) % 86400000)
-    let day_ms = ((i_jd + 43200000) % 86400000) as i32;
+    let day_ms = (i_jd + 43200000).rem_euclid(86400000) as i32;
 
     // s = (day_ms % 60000) / 1000.0
     let s_millis = day_ms % 60000;
@@ -2447,7 +2422,7 @@ mod tests {
         assert_eq!(exec_timediff(&[start, end.clone()]), expected);
 
         let start = Value::build_text("12:00:00");
-        let end = Value::build_text("not a time");
+        let end = Value::build_text("+0000-00-00 00:00:00.000");
         let expected = Value::Null;
         assert_eq!(exec_timediff(&[start, end]), expected);
     }
@@ -2611,7 +2586,7 @@ mod tests {
 
         let result = exec_unixepoch(&[Value::Float(0.0), text("julianday")]);
         match result {
-            Value::Integer(i) => assert!(i < -210866700000, "Expected very old timestamp, got {i}"),
+            Value::Integer(i) => assert_eq!(i, -210866760000),
             _ => panic!("Expected Integer result for JD 0"),
         }
     }
