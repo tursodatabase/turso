@@ -225,6 +225,14 @@ pub enum Plan {
 /// However, there are some cases where the results are not returned to the caller,
 /// but rather are yielded to a parent query via coroutine, or stored in a temp table,
 /// later used by the parent query.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EphemeralRowidMode {
+    /// The last result column is used as the rowid key.
+    FromResultColumns,
+    /// Generate a fresh rowid for each inserted row.
+    Auto,
+}
+
 #[derive(Debug, Clone)]
 pub enum QueryDestination {
     /// The results of the query are returned to the caller.
@@ -253,6 +261,8 @@ pub enum QueryDestination {
         cursor_id: CursorID,
         /// The table that will be used to store the results.
         table: Arc<BTreeTable>,
+        /// How to determine the rowid key for inserts.
+        rowid_mode: EphemeralRowidMode,
     },
     /// The result of an EXISTS subquery are stored in a single register.
     ExistsSubqueryResult {
@@ -1093,6 +1103,10 @@ pub struct HashJoinOp {
     pub join_keys: Vec<HashJoinKey>,
     /// Memory budget for hash table
     pub mem_budget: usize,
+    /// Whether the build input should be materialized as a rowid list before hash build.
+    pub materialize_build_input: bool,
+    /// Whether to use a bloom filter on the probe side.
+    pub use_bloom_filter: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -1787,8 +1801,16 @@ pub enum SubqueryState {
     /// The subquery has been evaluated.
     /// The [evaluated_at] field contains the loop index where the subquery was evaluated.
     /// The query plan struct no longer exists because translating the plan currently
-    /// requires an ownership transfer.
-    Evaluated { evaluated_at: EvalAt },
+    /// requires an ownership transfer. We retain the outer table references so
+    /// later masking/evaluation logic can still reason about dependencies.
+    Evaluated {
+        /// Join-loop position where the subquery was emitted into bytecode.
+        evaluated_at: EvalAt,
+        /// Outer table ids referenced by the subquery when it was planned.
+        /// We keep these so later analysis can still understand dependencies
+        /// even after the plan is consumed.
+        outer_ref_ids: Vec<TableInternalId>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1842,45 +1864,66 @@ impl NonFromClauseSubquery {
         matches!(self.state, SubqueryState::Evaluated { .. })
     }
 
-    /// Returns the loop index where the subquery should be evaluated in this particular join order.
-    /// If the subquery references tables from the parent query, it will be evaluated at the right-most
-    /// nested loop whose table it references.
-    pub fn get_eval_at(&self, join_order: &[JoinOrderMember]) -> Result<EvalAt> {
+    /// Returns the loop index where the subquery should be evaluated in this join order.
+    ///
+    /// If the subquery references tables from the parent query, it is evaluated at
+    /// the right-most loop that makes those tables available. For hash joins, this
+    /// may map a build-table reference to the probe loop where its rows are produced.
+    pub fn get_eval_at(
+        &self,
+        join_order: &[JoinOrderMember],
+        table_references: Option<&TableReferences>,
+    ) -> Result<EvalAt> {
         let mut eval_at = EvalAt::BeforeLoop;
-        let SubqueryState::Unevaluated { plan } = &self.state else {
-            crate::bail_parse_error!("subquery has already been evaluated");
+        let plan = match &self.state {
+            SubqueryState::Unevaluated { plan } => plan.as_ref().unwrap(),
+            SubqueryState::Evaluated { evaluated_at, .. } => {
+                return Ok(*evaluated_at);
+            }
         };
         let used_outer_refs = plan
-            .as_ref()
-            .unwrap()
             .table_references
             .outer_query_refs()
             .iter()
             .filter(|t| t.is_used());
 
         for outer_ref in used_outer_refs {
-            let Some(loop_idx) = join_order
-                .iter()
-                .position(|t| t.table_id == outer_ref.internal_id)
-            else {
-                continue;
-            };
-            eval_at = eval_at.max(EvalAt::Loop(loop_idx));
+            if let Some(loop_idx) =
+                resolve_outer_ref_loop(outer_ref.internal_id, join_order, table_references)
+            {
+                eval_at = eval_at.max(EvalAt::Loop(loop_idx));
+            }
         }
-        for subquery in plan.as_ref().unwrap().non_from_clause_subqueries.iter() {
-            let eval_at_inner = subquery.get_eval_at(join_order)?;
+        for subquery in plan.non_from_clause_subqueries.iter() {
+            let eval_at_inner = subquery.get_eval_at(join_order, table_references)?;
             eval_at = eval_at.max(eval_at_inner);
         }
         Ok(eval_at)
     }
 
     /// Consumes the plan and returns it, and sets the subquery to the evaluated state.
-    /// This is used when the subquery is translated into bytecode.
+    ///
+    /// This captures any outer references before the plan is moved so later
+    /// phases can still reason about dependencies.
     pub fn consume_plan(&mut self, evaluated_at: EvalAt) -> Box<SelectPlan> {
         match &mut self.state {
             SubqueryState::Unevaluated { plan } => {
+                let outer_ref_ids = plan
+                    .as_ref()
+                    .map(|plan| {
+                        plan.table_references
+                            .outer_query_refs()
+                            .iter()
+                            .filter(|t| t.is_used())
+                            .map(|t| t.internal_id)
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
                 let plan = plan.take().unwrap();
-                self.state = SubqueryState::Evaluated { evaluated_at };
+                self.state = SubqueryState::Evaluated {
+                    evaluated_at,
+                    outer_ref_ids,
+                };
                 plan
             }
             SubqueryState::Evaluated { .. } => {
@@ -1888,6 +1931,31 @@ impl NonFromClauseSubquery {
             }
         }
     }
+}
+
+/// Resolves the loop index for an outer-table reference.
+///
+/// If the table is not present in the join order, we look for a hash join
+/// where that table is the build side and map it to the probe loop.
+fn resolve_outer_ref_loop(
+    table_id: TableInternalId,
+    join_order: &[JoinOrderMember],
+    table_references: Option<&TableReferences>,
+) -> Option<usize> {
+    if let Some(loop_idx) = join_order.iter().position(|t| t.table_id == table_id) {
+        return Some(loop_idx);
+    }
+    let tables = table_references?;
+    for (probe_idx, member) in join_order.iter().enumerate() {
+        let probe_table = &tables.joined_tables()[member.original_idx];
+        if let Operation::HashJoin(ref hj) = probe_table.op {
+            let build_table = &tables.joined_tables()[hj.build_table_idx];
+            if build_table.internal_id == table_id {
+                return Some(probe_idx);
+            }
+        }
+    }
+    None
 }
 
 #[cfg(test)]

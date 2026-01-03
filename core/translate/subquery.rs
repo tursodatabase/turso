@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{collections::HashSet, sync::Arc};
 
 use turso_parser::ast::{self, SortOrder, SubqueryType};
 
@@ -11,8 +11,8 @@ use crate::{
         expr::{unwrap_parens, walk_expr_mut, WalkControl},
         optimizer::optimize_select_plan,
         plan::{
-            ColumnUsedMask, NonFromClauseSubquery, OuterQueryReference, Plan, SubqueryPosition,
-            SubqueryState,
+            ColumnUsedMask, JoinOrderMember, NonFromClauseSubquery, OuterQueryReference, Plan,
+            SubqueryPosition, SubqueryState,
         },
         select::prepare_select_plan,
     },
@@ -476,12 +476,27 @@ pub fn emit_from_clause_subqueries(
     program: &mut ProgramBuilder,
     t_ctx: &mut TranslateCtx,
     tables: &mut TableReferences,
+    join_order: &[JoinOrderMember],
 ) -> Result<()> {
     if tables.joined_tables().is_empty() {
         emit_explain!(program, false, "SCAN CONSTANT ROW".to_owned());
     }
 
-    for table_reference in tables.joined_tables_mut() {
+    // Include hash-join build tables so EXPLAIN reflects all tables that feed the loop.
+    let mut required_tables: HashSet<usize> = join_order
+        .iter()
+        .map(|member| member.original_idx)
+        .collect();
+    for table in tables.joined_tables().iter() {
+        if let Operation::HashJoin(hash_join_op) = &table.op {
+            required_tables.insert(hash_join_op.build_table_idx);
+        }
+    }
+
+    for (table_index, table_reference) in tables.joined_tables_mut().iter_mut().enumerate() {
+        if !required_tables.contains(&table_index) {
+            continue;
+        }
         emit_explain!(
             program,
             true,
@@ -538,7 +553,19 @@ pub fn emit_from_clause_subqueries(
                         index_method.definition().method_name
                     )
                 }
-                Operation::HashJoin(_) => "HASH JOIN".to_string(),
+                Operation::HashJoin(_) => {
+                    let table_name =
+                        if table_reference.table.get_name() == table_reference.identifier {
+                            table_reference.identifier.clone()
+                        } else {
+                            format!(
+                                "{} AS {}",
+                                table_reference.table.get_name(),
+                                table_reference.identifier
+                            )
+                        };
+                    format!("HASH JOIN {table_name}")
+                }
             }
         );
 
@@ -608,6 +635,7 @@ pub fn emit_from_clause_subquery(
         non_aggregate_expressions: Vec::new(),
         cdc_cursor_id: None,
         meta_window: None,
+        materialized_build_inputs: std::collections::HashMap::new(),
         hash_table_contexts: std::collections::HashMap::new(),
     };
     let subquery_body_end_label = program.allocate_label();

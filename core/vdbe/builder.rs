@@ -1,6 +1,6 @@
 use parking_lot::RwLock;
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{atomic::AtomicI64, Arc},
 };
 
@@ -14,7 +14,7 @@ use crate::{
     schema::{BTreeTable, Index, PseudoCursorType, Schema, Table, Trigger},
     translate::{
         collate::CollationSeq,
-        emitter::TransactionMode,
+        emitter::{MaterializedColumnRef, TransactionMode},
         plan::{ResultSetColumn, TableReferences},
     },
     CaptureDataChangesMode, Connection, Value, VirtualTable,
@@ -153,6 +153,34 @@ pub struct ProgramBuilder {
     /// Temporary cursor overrides maps table internal IDs to cursor IDs that should be used instead of the normal resolution.
     /// This allows for things like hash build to use a separate cursor for iterating the same table.
     cursor_overrides: HashMap<usize, CursorID>,
+    /// Hash join build signatures keyed by hash table id.
+    hash_build_signatures: HashMap<usize, HashBuildSignature>,
+    /// Hash tables to keep open across subplans (e.g. materialization).
+    hash_tables_to_keep_open: HashSet<usize>,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+pub enum MaterializedBuildInputModeTag {
+    RowidOnly,
+    Payload,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+/// Signature of a hash build to allow reuse when inputs are unchanged.
+/// TODO: this is very heavy... we might consider hashing instead of storing full data.
+pub struct HashBuildSignature {
+    /// WHERE term indices used as hash join keys.
+    pub join_key_indices: Vec<usize>,
+    /// Build-table columns stored as payload.
+    pub payload_refs: Vec<MaterializedColumnRef>,
+    /// Affinity string applied to join keys.
+    pub key_affinities: String,
+    /// Whether a bloom filter is enabled for this build.
+    pub use_bloom_filter: bool,
+    /// Rowid input cursor when the build side is materialized.
+    pub materialized_input_cursor: Option<CursorID>,
+    /// RowidOnly vs KeyPayload
+    pub materialized_mode: Option<MaterializedBuildInputModeTag>,
 }
 
 #[derive(Debug, Clone)]
@@ -333,11 +361,58 @@ impl ProgramBuilder {
             is_subprogram,
             resolve_type: ResolveType::Abort,
             cursor_overrides: HashMap::new(),
+            hash_build_signatures: HashMap::new(),
+            hash_tables_to_keep_open: HashSet::new(),
         }
     }
 
     pub fn set_resolve_type(&mut self, resolve_type: ResolveType) {
         self.resolve_type = resolve_type;
+    }
+
+    /// Returns true if the given hash table id should be kept open across subplans.
+    pub fn should_keep_hash_table_open(&self, hash_table_id: usize) -> bool {
+        self.hash_tables_to_keep_open.contains(&hash_table_id)
+    }
+
+    /// Set the set of hash tables to keep open across subplans.
+    pub fn set_hash_tables_to_keep_open(&mut self, tables: &HashSet<usize>) {
+        self.hash_tables_to_keep_open = tables.clone();
+    }
+
+    /// Reset the set of hash tables to keep open.
+    pub fn clear_hash_tables_to_keep_open(&mut self) {
+        self.hash_tables_to_keep_open.clear();
+    }
+
+    /// Returns true if the given hash build signature matches the recorded one for the given hash table id.
+    pub fn hash_build_signature_matches(
+        &self,
+        hash_table_id: usize,
+        signature: &HashBuildSignature,
+    ) -> bool {
+        self.hash_build_signatures
+            .get(&hash_table_id)
+            .is_some_and(|existing| existing == signature)
+    }
+
+    /// Returns true if there is a recorded hash build signature for the given hash table id.
+    pub fn has_hash_build_signature(&self, hash_table_id: usize) -> bool {
+        self.hash_build_signatures.contains_key(&hash_table_id)
+    }
+
+    /// Insert or update the hash build signature for the given hash table id.
+    pub fn record_hash_build_signature(
+        &mut self,
+        hash_table_id: usize,
+        signature: HashBuildSignature,
+    ) {
+        self.hash_build_signatures.insert(hash_table_id, signature);
+    }
+
+    /// Clear the hash build signature for the given hash table id.
+    pub fn clear_hash_build_signature(&mut self, hash_table_id: usize) {
+        self.hash_build_signatures.remove(&hash_table_id);
     }
 
     pub fn set_needs_stmt_subtransactions(&mut self, needs_stmt_subtransactions: bool) {
