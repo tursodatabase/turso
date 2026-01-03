@@ -123,9 +123,7 @@ impl MaterializedViewCursor {
                 "Invalid data in materialized view: found a rowid, but not the row!".to_string(),
             )
         })?;
-
-        // Convert RefValues to Values (copying for now - can optimize later)
-        let mut btree_values: Vec<Value> = btree_record.get_values_owned()?;
+        let mut btree_values = btree_record.get_values_owned()?;
 
         // The last column should be the weight
         let weight_value = btree_values.pop().ok_or_else(|| {
