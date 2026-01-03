@@ -2447,6 +2447,27 @@ impl SerialType {
     }
 }
 
+#[inline(always)]
+pub fn get_serial_type_size(serial: u64) -> Result<usize> {
+    match serial {
+        0 | 8 | 9 => Ok(0),
+        1 => Ok(1),
+        2 => Ok(2),
+        3 => Ok(3),
+        4 => Ok(4),
+        5 => Ok(6),
+        6 | 7 => Ok(8),
+        n if n >= 12 => match n % 2 {
+            0 => Ok(((n - 12) / 2) as usize), // Blob
+            1 => Ok(((n - 13) / 2) as usize), // Text
+            _ => unreachable!(),
+        },
+        _ => Err(LimboError::Corrupt(format!(
+            "Invalid serial type: {serial}"
+        ))),
+    }
+}
+
 impl<T: AsValueRef> From<T> for SerialType {
     fn from(value: T) -> Self {
         let value = value.as_value_ref();
