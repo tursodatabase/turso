@@ -2163,61 +2163,45 @@ impl WalFile {
                         pager.io.drain()?;
                         return Err(LimboError::CompletionError(e));
                     }
-
                     let epoch = self.with_shared(|shared| shared.epoch.load(Ordering::Acquire));
                     // Issue reads until we hit limits
                     'inner: while ongoing_chkpt.should_issue_reads() {
                         let (page_id, target_frame) = {
                             ongoing_chkpt.pages_to_checkpoint[ongoing_chkpt.current_page as usize]
                         };
-                        'fast_path: {
-                            if let Some(cached_page) = pager.cache_get_for_checkpoint(
-                                page_id as usize,
-                                target_frame,
-                                epoch,
-                            )? {
-                                let page_contents = cached_page.get_contents();
-                                let src = page_contents.as_ptr();
-                                // to avoid TOCTOU issues with using cached pages, we snapshot the contents and pay the memcpy
-                                // instead of risking the page changing out from under us.
-                                let buffer = Arc::new(self.buffer_pool.get_page());
-                                buffer.as_mut_slice()[..src.len()].copy_from_slice(src);
-                                if !cached_page.is_valid_for_checkpoint(target_frame, epoch) {
-                                    // check again, atomically, if the page is still valid after we
-                                    // copied a snapshot of it, if not: fallthrough to reading
-                                    // from disk
-                                    break 'fast_path;
-                                }
-                                // TODO: remove this eventually to actually benefit from the
-                                // performance.. for now we assert that the cached page has the
-                                // exact contents as one read from the WAL.
-                                #[cfg(debug_assertions)]
-                                {
-                                    let mut raw = vec![
-                                        0u8;
-                                        self.page_size() as usize
-                                            + WAL_FRAME_HEADER_SIZE
-                                    ];
-                                    self.io.wait_for_completion(
-                                        self.read_frame_raw(target_frame, &mut raw)?,
-                                    )?;
-                                    let (_, wal_page) =
-                                        sqlite3_ondisk::parse_wal_frame_header(&raw);
-                                    let cached = buffer.as_slice();
-                                    turso_assert!(wal_page == cached, "cached page content differs from WAL read for page_id={page_id}, frame_id={target_frame}");
-                                }
-                                {
-                                    ongoing_chkpt
-                                        .pending_writes
-                                        .insert(page_id as usize, buffer);
-                                    // signify that a cached page was used, so it can be unpinned
-                                    let current = ongoing_chkpt.current_page as usize;
-                                    ongoing_chkpt.pages_to_checkpoint[current] =
-                                        (page_id, target_frame);
-                                    ongoing_chkpt.current_page += 1;
-                                }
-                                continue 'inner;
+                        if let Some(cached_page) =
+                            pager.cache_get_for_checkpoint(page_id as usize, target_frame, epoch)?
+                        {
+                            let buffer = cached_page
+                                .get_contents()
+                                .buffer
+                                .as_ref()
+                                .expect("buffer missing")
+                                .clone();
+                            // We debug assert that the cached page has the
+                            // exact contents as one read from the WAL.
+                            #[cfg(debug_assertions)]
+                            {
+                                let mut raw =
+                                    vec![0u8; self.page_size() as usize + WAL_FRAME_HEADER_SIZE];
+                                self.io.wait_for_completion(
+                                    self.read_frame_raw(target_frame, &mut raw)?,
+                                )?;
+                                let (_, wal_page) = sqlite3_ondisk::parse_wal_frame_header(&raw);
+                                let cached = buffer.as_slice();
+                                turso_assert!(wal_page == cached, "cached page content differs from WAL read for page_id={page_id}, frame_id={target_frame}");
                             }
+                            {
+                                ongoing_chkpt
+                                    .pending_writes
+                                    .insert(page_id as usize, buffer);
+                                // signify that a cached page was used, so it can be unpinned
+                                let current = ongoing_chkpt.current_page as usize;
+                                ongoing_chkpt.pages_to_checkpoint[current] =
+                                    (page_id, target_frame);
+                                ongoing_chkpt.current_page += 1;
+                            }
+                            continue 'inner;
                         }
                         // Issue read if page wasn't found in the page cache or doesnt meet
                         // the frame requirements
