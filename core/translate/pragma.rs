@@ -529,6 +529,9 @@ fn query_pragma(
                 dest: register,
             });
             program.emit_result_row(register, 3);
+            program.add_pragma_result_column("busy".to_string());
+            program.add_pragma_result_column("log".to_string());
+            program.add_pragma_result_column("checkpointed".to_string());
             Ok((program, TransactionMode::None))
         }
         PragmaName::ModuleList => {
@@ -645,7 +648,7 @@ fn query_pragma(
                 pager
                     .io
                     .block(|| pager.with_header(|header| header.page_size.get()))
-                    .unwrap_or(connection.get_page_size().get()) as i64,
+                    .unwrap_or_else(|_| connection.get_page_size().get()) as i64,
                 register,
             );
             program.emit_result_row(register, 1);

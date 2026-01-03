@@ -576,9 +576,11 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 let (num_columns, table_id, special_write) = {
                     let (row_version, special_write) = self
                         .get_current_row_version(write_set_index)
-                        .ok_or(LimboError::InternalError(
-                            "row version not found in write set".to_string(),
-                        ))?;
+                        .ok_or_else(|| {
+                            LimboError::InternalError(
+                                "row version not found in write set".to_string(),
+                            )
+                        })?;
                     (
                         row_version.row.column_count,
                         row_version.row.id.table_id,
@@ -730,9 +732,11 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     let row_version = {
                         let (row_version, _) = self
                             .get_current_row_version_mut(write_set_index)
-                            .ok_or(LimboError::InternalError(
-                                "row version not found in write set".to_string(),
-                            ))?;
+                            .ok_or_else(|| {
+                                LimboError::InternalError(
+                                    "row version not found in write set".to_string(),
+                                )
+                            })?;
                         let record =
                             ImmutableRecord::from_bin_record(row_version.row.payload().to_vec());
                         let mut record_cursor = RecordCursor::new();
@@ -770,9 +774,11 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     let row_version = {
                         let (row_version, _) = self
                             .get_current_row_version_mut(write_set_index)
-                            .ok_or(LimboError::InternalError(
-                                "row version not found in write set".to_string(),
-                            ))?;
+                            .ok_or_else(|| {
+                                LimboError::InternalError(
+                                    "row version not found in write set".to_string(),
+                                )
+                            })?;
                         let record =
                             ImmutableRecord::from_bin_record(row_version.row.payload().to_vec());
                         let mut record_cursor = RecordCursor::new();
@@ -805,9 +811,13 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                     cursor
                 };
 
-                let (row_version, _) = self.get_current_row_version(write_set_index).ok_or(
-                    LimboError::InternalError("row version not found in write set".to_string()),
-                )?;
+                let (row_version, _) =
+                    self.get_current_row_version(write_set_index)
+                        .ok_or_else(|| {
+                            LimboError::InternalError(
+                                "row version not found in write set".to_string(),
+                            )
+                        })?;
 
                 // Check if this is an insert or delete
                 if row_version.end.is_some() {
@@ -845,11 +855,11 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             CheckpointState::WriteRowStateMachine { write_set_index } => {
                 let write_set_index = *write_set_index;
                 let write_row_state_machine =
-                    self.write_row_state_machine
-                        .as_mut()
-                        .ok_or(LimboError::InternalError(
+                    self.write_row_state_machine.as_mut().ok_or_else(|| {
+                        LimboError::InternalError(
                             "write_row_state_machine not initialized".to_string(),
-                        ))?;
+                        )
+                    })?;
 
                 match write_row_state_machine.step(&())? {
                     IOResult::IO(io) => Ok(TransitionResult::Io(io)),
@@ -866,11 +876,11 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             CheckpointState::DeleteRowStateMachine { write_set_index } => {
                 let write_set_index = *write_set_index;
                 let delete_row_state_machine =
-                    self.delete_row_state_machine
-                        .as_mut()
-                        .ok_or(LimboError::InternalError(
+                    self.delete_row_state_machine.as_mut().ok_or_else(|| {
+                        LimboError::InternalError(
                             "delete_row_state_machine not initialized".to_string(),
-                        ))?;
+                        )
+                    })?;
 
                 match delete_row_state_machine.step(&())? {
                     IOResult::IO(io) => Ok(TransitionResult::Io(io)),
@@ -982,11 +992,11 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             } => {
                 let index_write_set_index = *index_write_set_index;
                 let write_row_state_machine =
-                    self.write_row_state_machine
-                        .as_mut()
-                        .ok_or(LimboError::InternalError(
+                    self.write_row_state_machine.as_mut().ok_or_else(|| {
+                        LimboError::InternalError(
                             "write_row_state_machine not initialized".to_string(),
-                        ))?;
+                        )
+                    })?;
 
                 match write_row_state_machine.step(&())? {
                     IOResult::IO(io) => Ok(TransitionResult::Io(io)),
@@ -1005,11 +1015,11 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             } => {
                 let index_write_set_index = *index_write_set_index;
                 let delete_row_state_machine =
-                    self.delete_row_state_machine
-                        .as_mut()
-                        .ok_or(LimboError::InternalError(
+                    self.delete_row_state_machine.as_mut().ok_or_else(|| {
+                        LimboError::InternalError(
                             "delete_row_state_machine not initialized".to_string(),
-                        ))?;
+                        )
+                    })?;
 
                 match delete_row_state_machine.step(&())? {
                     IOResult::IO(io) => Ok(TransitionResult::Io(io)),
@@ -1141,11 +1151,9 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 self.checkpoint_lock.unlock();
                 self.finalize(&())?;
                 Ok(TransitionResult::Done(
-                    self.checkpoint_result
-                        .take()
-                        .ok_or(LimboError::InternalError(
-                            "checkpoint_result not set".to_string(),
-                        ))?,
+                    self.checkpoint_result.take().ok_or_else(|| {
+                        LimboError::InternalError("checkpoint_result not set".to_string())
+                    })?,
                 ))
             }
         }

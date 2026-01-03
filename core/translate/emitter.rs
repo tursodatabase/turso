@@ -31,9 +31,9 @@ use crate::translate::expr::{
     BindingBehavior, NoConstantOptReason, WalkControl,
 };
 use crate::translate::fkeys::{
-    build_index_affinity_string, emit_fk_child_update_counters,
-    emit_fk_delete_parent_existence_checks, emit_guarded_fk_decrement,
-    emit_parent_key_change_checks, open_read_index, open_read_table, stabilize_new_row_for_fk,
+    build_index_affinity_string, emit_fk_child_update_counters, emit_fk_update_parent_actions,
+    emit_guarded_fk_decrement, fire_fk_delete_actions, fire_fk_update_actions, open_read_index,
+    open_read_table, stabilize_new_row_for_fk,
 };
 use crate::translate::plan::{
     DeletePlan, EvalAt, JoinedTable, Plan, QueryDestination, ResultSetColumn, Search,
@@ -361,6 +361,11 @@ pub fn emit_query<'a>(
         program.reg_result_cols_start = t_ctx.reg_result_cols_start
     }
 
+    let has_group_by_exprs = plan
+        .group_by
+        .as_ref()
+        .is_some_and(|gb| !gb.exprs.is_empty());
+
     // Initialize cursors and other resources needed for query execution
     if !plan.order_by.is_empty() {
         init_order_by(
@@ -369,22 +374,25 @@ pub fn emit_query<'a>(
             &plan.result_columns,
             &plan.order_by,
             &plan.table_references,
-            plan.group_by.is_some(),
+            has_group_by_exprs,
             plan.distinctness != Distinctness::NonDistinct,
             &plan.aggregates,
         )?;
     }
 
-    if let Some(ref group_by) = plan.group_by {
-        init_group_by(
-            program,
-            t_ctx,
-            group_by,
-            plan,
-            &plan.result_columns,
-            &plan.order_by,
-        )?;
+    if has_group_by_exprs {
+        if let Some(ref group_by) = plan.group_by {
+            init_group_by(
+                program,
+                t_ctx,
+                group_by,
+                plan,
+                &plan.result_columns,
+                &plan.order_by,
+            )?;
+        }
     } else if !plan.aggregates.is_empty() {
+        // Handle aggregation without GROUP BY (or HAVING without GROUP BY)
         // Aggregate registers need to be NULLed at the start because the same registers might be reused on another invocation of a subquery,
         // and if they are not NULLed, the 2nd invocation of the same subquery will have values left over from the first invocation.
         t_ctx.reg_agg_start = Some(program.alloc_registers_and_init_w_null(plan.aggregates.len()));
@@ -458,7 +466,7 @@ pub fn emit_query<'a>(
     let order_by = &plan.order_by;
 
     // Handle GROUP BY and aggregation processing
-    if plan.group_by.is_some() {
+    if has_group_by_exprs {
         let row_source = &t_ctx
             .meta_group_by
             .as_ref()
@@ -469,7 +477,7 @@ pub fn emit_query<'a>(
         }
         group_by_emit_row_phase(program, t_ctx, plan)?;
     } else if !plan.aggregates.is_empty() {
-        // Handle aggregation without GROUP BY
+        // Handle aggregation without GROUP BY (or HAVING without GROUP BY)
         emit_ungrouped_aggregation(program, t_ctx, plan)?;
         // Single row result for aggregates without GROUP BY, so ORDER BY not needed
         order_by_necessary = false;
@@ -949,12 +957,14 @@ fn emit_delete_row_common(
                 .schema
                 .any_resolved_fks_referencing(table_name)
             {
-                emit_fk_delete_parent_existence_checks(
+                // Use sub-program based FK actions (CASCADE, SET NULL, SET DEFAULT, and NO ACTION)
+                fire_fk_delete_actions(
                     program,
-                    &t_ctx.resolver,
+                    &mut t_ctx.resolver,
                     table_name,
                     main_table_cursor_id,
                     rowid_reg,
+                    connection,
                 )?;
             }
             if t_ctx.resolver.schema.has_child_fks(table_name) {
@@ -1936,16 +1946,15 @@ fn emit_update_insns<'a>(
                         .collect::<std::collections::HashSet<_>>(),
                 )?;
             }
-            // Parent-side checks:
-            // We only need to do work if the referenced key (the parent key) might change.
-            // we detect that by comparing OLD vs NEW primary key representation
-            // then run parent FK checks only when it actually changes.
+            // Parent-side NO ACTION/RESTRICT checks must happen BEFORE the update.
+            // This checks that no child rows reference the old parent key values.
+            // CASCADE/SET NULL actions are fired AFTER the update (see below after Insert).
             if t_ctx
                 .resolver
                 .schema
                 .any_resolved_fks_referencing(table_name)
             {
-                emit_parent_key_change_checks(
+                emit_fk_update_parent_actions(
                     program,
                     &t_ctx.resolver,
                     &table_btree,
@@ -2314,6 +2323,31 @@ fn emit_update_insns<'a>(
             },
             table_name: target_table.identifier.clone(),
         });
+
+        // Fire FK CASCADE/SET NULL actions AFTER the parent row is updated
+        // This ensures the new parent key exists when cascade actions update child rows
+        if connection.foreign_keys_enabled()
+            && t_ctx
+                .resolver
+                .schema
+                .any_resolved_fks_referencing(table_name)
+        {
+            let new_rowid_reg = rowid_set_clause_reg.unwrap_or(beg);
+            // OLD column values are stored in preserved_old_registers (contiguous registers)
+            let old_values_start = preserved_old_registers
+                .as_ref()
+                .expect("FK check requires OLD values")[0];
+            fire_fk_update_actions(
+                program,
+                &mut t_ctx.resolver,
+                table_name,
+                beg, // old_rowid_reg
+                old_values_start,
+                start, // new_values_start
+                new_rowid_reg,
+                connection,
+            )?;
+        }
 
         // Fire AFTER UPDATE triggers
         if let Some(btree_table) = target_table.table.btree() {

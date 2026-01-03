@@ -191,7 +191,7 @@ async fn test_rows_returned() {
        SELECT b.id, a.name
        FROM   books b
        JOIN   authors a ON a.id = b.author_id
-       WHERE  a.id = 1;       -- Alice’s five books
+       WHERE  a.id = 1;       -- Alice's five books
        ",
             (),
         )
@@ -401,9 +401,8 @@ async fn test_concurrent_unique_constraint_regression() {
                     .await;
                 match result {
                     Ok(_) => (),
-                    Err(Error::SqlExecutionFailure(e))
-                        if e.contains("UNIQUE constraint failed")
-                            | e.contains("database is locked") => {}
+                    Err(Error::Constraint(e)) if e.contains("UNIQUE constraint failed") => {}
+                    Err(Error::Busy(e)) if e.contains("database is locked") => {}
                     Err(e) => {
                         panic!("Error executing statement: {e:?}");
                     }
@@ -416,6 +415,46 @@ async fn test_concurrent_unique_constraint_regression() {
     for handle in handles {
         handle.await.unwrap();
     }
+}
+
+#[tokio::test]
+async fn test_statement_query_resets_before_execution() {
+    let db = Builder::new_local(":memory:").build().await.unwrap();
+    let conn = db.connect().unwrap();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, value TEXT)", ())
+        .await
+        .unwrap();
+
+    for i in 0..5 {
+        conn.execute(&format!("INSERT INTO t VALUES ({i}, 'value_{i}')"), ())
+            .await
+            .unwrap();
+    }
+
+    let mut stmt = conn
+        .prepare("SELECT id, value FROM t ORDER BY id")
+        .await
+        .unwrap();
+
+    let mut rows = stmt.query(()).await.unwrap();
+    let mut count = 0;
+    while let Some(row) = rows.next().await.unwrap() {
+        let id: i64 = row.get(0).unwrap();
+        assert_eq!(id, count);
+        count += 1;
+    }
+    assert_eq!(count, 5);
+
+    let mut rows = stmt.query(()).await.unwrap();
+    let mut count = 0;
+    while let Some(row) = rows.next().await.unwrap() {
+        let id: i64 = row.get(0).unwrap();
+        assert_eq!(id, count);
+        count += 1;
+    }
+    // this will return 0 rows if query() does not reset the statement
+    assert_eq!(count, 5, "Second query() should return all rows again");
 }
 
 #[tokio::test]
@@ -468,6 +507,73 @@ async fn test_encryption() {
             row_count += 1;
         }
         assert_eq!(row_count, 1);
+    }
+}
+
+#[tokio::test]
+/// This results in a panic if the query isn't correctly reset
+async fn test_query_without_reset_does_not_panic() {
+    let tempfile = tempfile::NamedTempFile::new().unwrap();
+    let db = Builder::new_local(tempfile.path().to_str().unwrap())
+        .build()
+        .await
+        .unwrap();
+    let conn = db.connect().unwrap();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, value TEXT)", ())
+        .await
+        .unwrap();
+
+    for i in 0..10 {
+        conn.execute(&format!("INSERT INTO t VALUES ({i}, 'val')"), ())
+            .await
+            .unwrap();
+    }
+
+    let mut stmts: Vec<Option<turso::Statement>> = Vec::new();
+
+    for round in 0..4 {
+        for i in 0..30 {
+            let id = 100 + round * 100 + i;
+            let sql = match i % 4 {
+                0 => format!("INSERT INTO t VALUES ({id}, 'new')"),
+                1 => "SELECT * FROM t".to_string(),
+                2 => format!("UPDATE t SET value = 'upd' WHERE id = {}", i % 10),
+                _ => format!("DELETE FROM t WHERE id = {}", 1000 + i),
+            };
+            if let Ok(s) = conn.prepare(&sql).await {
+                stmts.push(Some(s));
+            }
+        }
+
+        for i in (0..stmts.len()).step_by(7) {
+            if let Some(Some(stmt)) = stmts.get_mut(i) {
+                if let Ok(mut rows) = stmt.query(()).await {
+                    let _ = rows.next().await;
+                }
+            }
+        }
+
+        for i in 0..3 {
+            let _ = conn
+                .execute(
+                    &format!("INSERT INTO t VALUES ({}, 'x')", 2000 + round * 10 + i),
+                    (),
+                )
+                .await;
+        }
+
+        for i in (0..stmts.len()).step_by(13) {
+            stmts[i] = None;
+        }
+
+        for i in (0..stmts.len()).step_by(5) {
+            if let Some(Some(stmt)) = stmts.get_mut(i) {
+                if let Ok(mut rows) = stmt.query(()).await {
+                    let _ = rows.next().await;
+                }
+            }
+        }
     }
 }
 
@@ -530,4 +636,114 @@ async fn test_connection_clone() {
 
     let id: i64 = row.get(0).unwrap();
     assert_eq!(id, 1);
+}
+
+#[tokio::test]
+async fn test_insert_returning_partial_consume() {
+    // Regression test for: INSERT...RETURNING should insert all rows even if
+    // only some RETURNING values are consumed before the statement is dropped/reset.
+    // This matches the sqlite3 bindings fix in commit e39e60ef1.
+    let db = Builder::new_local(":memory:").build().await.unwrap();
+    let conn = db.connect().unwrap();
+
+    conn.execute("CREATE TABLE t (x INTEGER)", ())
+        .await
+        .unwrap();
+
+    // Use query() to get RETURNING values, but only consume first row
+    let mut stmt = conn
+        .prepare("INSERT INTO t (x) VALUES (1), (2), (3) RETURNING x")
+        .await
+        .unwrap();
+    let mut rows = stmt.query(()).await.unwrap();
+
+    // Only consume first row
+    let first_row = rows.next().await.unwrap().unwrap();
+    assert_eq!(first_row.get::<i64>(0).unwrap(), 1);
+
+    // Drop the rows iterator without consuming remaining rows
+    drop(rows);
+    drop(stmt);
+
+    // All 3 rows should have been inserted despite only consuming 1 RETURNING value
+    let mut count_rows = conn.query("SELECT COUNT(*) FROM t", ()).await.unwrap();
+    let count: i64 = count_rows.next().await.unwrap().unwrap().get(0).unwrap();
+    assert_eq!(
+        count, 3,
+        "All 3 rows should be inserted even if RETURNING was partially consumed"
+    );
+}
+
+#[tokio::test]
+async fn test_transaction_commit_without_mvcc() {
+    // Regression test: COMMIT should work for non-MVCC transactions.
+    // The op_auto_commit function must check TransactionState, not just MVCC tx.
+    let db = Builder::new_local(":memory:").build().await.unwrap();
+    let conn = db.connect().unwrap();
+
+    conn.execute("CREATE TABLE test (id INTEGER PRIMARY KEY, value TEXT)", ())
+        .await
+        .unwrap();
+
+    // Begin explicit transaction
+    conn.execute("BEGIN IMMEDIATE TRANSACTION", ())
+        .await
+        .unwrap();
+
+    // Insert data within transaction
+    conn.execute("INSERT INTO test (id, value) VALUES (1, 'hello')", ())
+        .await
+        .unwrap();
+
+    // Commit should succeed
+    conn.execute("COMMIT", ())
+        .await
+        .expect("COMMIT should succeed for non-MVCC transactions");
+
+    // Verify data was committed
+    let mut rows = conn
+        .query("SELECT value FROM test WHERE id = 1", ())
+        .await
+        .unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    let value: String = row.get(0).unwrap();
+    assert_eq!(value, "hello", "Data should be committed");
+}
+
+#[tokio::test]
+async fn test_transaction_with_insert_returning_then_commit() {
+    // Regression test: Combining INSERT...RETURNING (partial consume) with explicit transaction.
+    // This tests the interaction between the reset-to-completion fix and transaction commit.
+    let db = Builder::new_local(":memory:").build().await.unwrap();
+    let conn = db.connect().unwrap();
+
+    conn.execute("CREATE TABLE t (x INTEGER)", ())
+        .await
+        .unwrap();
+
+    // Begin transaction
+    conn.execute("BEGIN IMMEDIATE TRANSACTION", ())
+        .await
+        .unwrap();
+
+    // INSERT...RETURNING, only consume first row
+    let mut stmt = conn
+        .prepare("INSERT INTO t (x) VALUES (1), (2), (3) RETURNING x")
+        .await
+        .unwrap();
+    let mut rows = stmt.query(()).await.unwrap();
+    let first = rows.next().await.unwrap().unwrap();
+    assert_eq!(first.get::<i64>(0).unwrap(), 1);
+    drop(rows);
+    drop(stmt);
+
+    // Commit should succeed even after partial RETURNING consumption
+    conn.execute("COMMIT", ())
+        .await
+        .expect("COMMIT should succeed after INSERT...RETURNING");
+
+    // Verify all 3 rows were inserted
+    let mut count_rows = conn.query("SELECT COUNT(*) FROM t", ()).await.unwrap();
+    let count: i64 = count_rows.next().await.unwrap().unwrap().get(0).unwrap();
+    assert_eq!(count, 3, "All rows should be committed");
 }

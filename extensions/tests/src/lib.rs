@@ -550,7 +550,7 @@ impl VTabCursor for StatsCursor {
     fn column(&self, idx: u32) -> Result<Value, Self::Error> {
         self.rows
             .get(self.pos)
-            .ok_or("row out of range".to_string())
+            .ok_or_else(|| "row out of range".to_string())
             .and_then(|(name, cnt)| match idx {
                 0 => Ok(Value::from_text(name.clone())),
                 1 => Ok(Value::from_integer(*cnt)),

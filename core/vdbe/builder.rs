@@ -147,6 +147,8 @@ pub struct ProgramBuilder {
     needs_stmt_subtransactions: bool,
     /// If this ProgramBuilder is building trigger subprogram, a ref to the trigger is stored here.
     pub trigger: Option<Arc<Trigger>>,
+    /// Whether this is a subprogram (trigger or FK action). Subprograms skip Transaction instructions.
+    pub is_subprogram: bool,
     pub resolve_type: ResolveType,
     /// Temporary cursor overrides maps table internal IDs to cursor IDs that should be used instead of the normal resolution.
     /// This allows for things like hash build to use a separate cursor for iterating the same table.
@@ -270,7 +272,7 @@ impl ProgramBuilder {
         capture_data_changes_mode: CaptureDataChangesMode,
         opts: ProgramBuilderOpts,
     ) -> Self {
-        ProgramBuilder::_new(query_mode, capture_data_changes_mode, opts, None)
+        ProgramBuilder::_new(query_mode, capture_data_changes_mode, opts, None, false)
     }
     pub fn new_for_trigger(
         query_mode: QueryMode,
@@ -278,13 +280,29 @@ impl ProgramBuilder {
         opts: ProgramBuilderOpts,
         trigger: Arc<Trigger>,
     ) -> Self {
-        ProgramBuilder::_new(query_mode, capture_data_changes_mode, opts, Some(trigger))
+        ProgramBuilder::_new(
+            query_mode,
+            capture_data_changes_mode,
+            opts,
+            Some(trigger),
+            true,
+        )
+    }
+    /// Create a ProgramBuilder for a subprogram (FK actions, etc.) that runs within
+    /// an existing transaction and doesn't emit Transaction instructions.
+    pub fn new_for_subprogram(
+        query_mode: QueryMode,
+        capture_data_changes_mode: CaptureDataChangesMode,
+        opts: ProgramBuilderOpts,
+    ) -> Self {
+        ProgramBuilder::_new(query_mode, capture_data_changes_mode, opts, None, true)
     }
     fn _new(
         query_mode: QueryMode,
         capture_data_changes_mode: CaptureDataChangesMode,
         opts: ProgramBuilderOpts,
         trigger: Option<Arc<Trigger>>,
+        is_subprogram: bool,
     ) -> Self {
         Self {
             table_reference_counter: TableRefIdCounter::new(),
@@ -312,6 +330,7 @@ impl ProgramBuilder {
             reg_result_cols_start: None,
             needs_stmt_subtransactions: false,
             trigger,
+            is_subprogram,
             resolve_type: ResolveType::Abort,
             cursor_overrides: HashMap::new(),
         }
@@ -1027,7 +1046,8 @@ impl ProgramBuilder {
 
     /// Initialize the program with basic setup and return initial metadata and labels
     pub fn prologue(&mut self) {
-        if self.trigger.is_some() {
+        if self.is_subprogram {
+            // Subprograms (triggers, FK actions) don't need Transaction - they run within parent's tx
             self.init_label = self.allocate_label();
             self.emit_insn(Insn::Init {
                 target_pc: self.init_label,
@@ -1074,10 +1094,16 @@ impl ProgramBuilder {
     /// Note that although these are the final instructions, typically an SQLite
     /// query will jump to the Transaction instruction via init_label.
     pub fn epilogue(&mut self, schema: &Schema) {
-        if self.trigger.is_some() {
+        if self.is_subprogram {
+            // Subprograms (triggers, FK actions) just emit Halt without Transaction
+            let description = if self.trigger.is_some() {
+                "trigger"
+            } else {
+                "fk action"
+            };
             self.emit_insn(Insn::Halt {
                 err_code: 0,
-                description: "trigger".to_string(),
+                description: description.to_string(),
             });
             return;
         }
@@ -1246,6 +1272,7 @@ impl ProgramBuilder {
             accesses_db: !matches!(self.txn_mode, TransactionMode::None),
             needs_stmt_subtransactions: self.needs_stmt_subtransactions,
             trigger: self.trigger.take(),
+            is_subprogram: self.is_subprogram,
             contains_trigger_subprograms,
             resolve_type: self.resolve_type,
             explain_state: RwLock::new(ExplainState::default()),

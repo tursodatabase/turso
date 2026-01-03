@@ -2697,12 +2697,9 @@ pub fn resolve_ext_path(extpath: &str) -> Result<std::path::PathBuf> {
             )));
         };
         let maybe = path.with_extension(std::env::consts::DLL_EXTENSION);
-        maybe
-            .exists()
-            .then_some(maybe)
-            .ok_or(LimboError::ExtensionError(format!(
-                "Extension file not found: {extpath}"
-            )))
+        maybe.exists().then_some(maybe).ok_or_else(|| {
+            LimboError::ExtensionError(format!("Extension file not found: {extpath}"))
+        })
     } else {
         Ok(path.to_path_buf())
     }

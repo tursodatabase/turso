@@ -129,6 +129,7 @@ pub struct JsPartialSyncOpts {
 #[napi(object, object_to_js = false)]
 pub struct SyncEngineOpts {
     pub path: String,
+    pub remote_url: Option<String>,
     pub client_name: Option<String>,
     pub wal_pull_batch_size: Option<u32>,
     pub long_poll_timeout_ms: Option<u32>,
@@ -143,6 +144,7 @@ pub struct SyncEngineOpts {
 
 struct SyncEngineOptsFilled {
     pub path: String,
+    pub remote_url: Option<String>,
     pub client_name: String,
     pub wal_pull_batch_size: u32,
     pub long_poll_timeout: Option<std::time::Duration>,
@@ -238,7 +240,10 @@ impl SyncEngine {
         )?));
         let opts_filled = SyncEngineOptsFilled {
             path: opts.path,
-            client_name: opts.client_name.unwrap_or("turso-sync-js".to_string()),
+            remote_url: opts.remote_url,
+            client_name: opts
+                .client_name
+                .unwrap_or_else(|| "turso-sync-js".to_string()),
             wal_pull_batch_size: opts.wal_pull_batch_size.unwrap_or(100),
             long_poll_timeout: opts
                 .long_poll_timeout_ms
@@ -268,14 +273,14 @@ impl SyncEngine {
             partial_sync_opts: match opts.partial_sync_opts {
                 Some(partial_sync_opts) => match partial_sync_opts.bootstrap_strategy {
                     JsPartialBootstrapStrategy::Prefix { length } => Some(PartialSyncOpts {
-                        bootstrap_strategy: PartialBootstrapStrategy::Prefix {
+                        bootstrap_strategy: Some(PartialBootstrapStrategy::Prefix {
                             length: length as usize,
-                        },
+                        }),
                         segment_size: partial_sync_opts.segment_size.unwrap_or(0) as usize,
                         prefetch: partial_sync_opts.prefetch.unwrap_or(false),
                     }),
                     JsPartialBootstrapStrategy::Query { query } => Some(PartialSyncOpts {
-                        bootstrap_strategy: PartialBootstrapStrategy::Query { query },
+                        bootstrap_strategy: Some(PartialBootstrapStrategy::Query { query }),
                         segment_size: partial_sync_opts.segment_size.unwrap_or(0) as usize,
                         prefetch: partial_sync_opts.prefetch.unwrap_or(false),
                     }),
@@ -298,6 +303,7 @@ impl SyncEngine {
     pub fn connect(&mut self) -> napi::Result<GeneratorHolder> {
         let opts = DatabaseSyncEngineOpts {
             client_name: self.opts.client_name.clone(),
+            remote_url: self.opts.remote_url.clone(),
             wal_pull_batch_size: self.opts.wal_pull_batch_size as u64,
             long_poll_timeout: self.opts.long_poll_timeout,
             tables_ignore: self.opts.tables_ignore.clone(),

@@ -4,7 +4,7 @@ use crate::function::AlterTableFunc;
 use crate::mvcc::cursor::{MvccCursorType, NextRowidResult};
 use crate::mvcc::database::CheckpointStateMachine;
 use crate::mvcc::LocalClock;
-use crate::schema::Table;
+use crate::schema::{Table, SQLITE_SEQUENCE_TABLE_NAME};
 use crate::state_machine::StateMachine;
 use crate::storage::btree::{
     integrity_check, CursorTrait, IntegrityCheckError, IntegrityCheckState, PageCategory,
@@ -13,7 +13,7 @@ use crate::storage::database::DatabaseFile;
 use crate::storage::journal_mode;
 use crate::storage::page_cache::PageCache;
 use crate::storage::pager::{default_page1, CreateBTreeFlags, PageRef};
-use crate::storage::sqlite3_ondisk::{read_varint_fast, DatabaseHeader, PageSize, RawVersion};
+use crate::storage::sqlite3_ondisk::{read_varint, DatabaseHeader, PageSize, RawVersion};
 use crate::translate::collate::CollationSeq;
 use crate::types::{
     compare_immutable, compare_records_generic, AsValueRef, Extendable, IOCompletions,
@@ -52,6 +52,7 @@ use crate::{
     translate::emitter::TransactionMode,
 };
 use crate::{get_cursor, CheckpointMode, Completion, Connection, DatabaseStorage, MvCursor};
+use branches::unlikely;
 use either::Either;
 use std::any::Any;
 use std::env::temp_dir;
@@ -1517,34 +1518,22 @@ pub fn op_column(
                             };
                             let payload = record.get_payload();
 
-                            let mut record_cursor = record.cursor();
+                            let record_cursor = record.cursor();
 
-                            if record_cursor.offsets.is_empty() {
-                                let (header_size, header_len_bytes) = read_varint_fast(payload)?;
-                                let header_size = header_size as usize;
-
-                                debug_assert!(header_size <= payload.len() && header_size <= 98307, "header_size: {header_size}, header_len_bytes: {header_len_bytes}, payload.len(): {}", payload.len());
-
-                                record_cursor.header_size = header_size;
-                                record_cursor.header_offset = header_len_bytes;
-                                record_cursor.offsets.push(header_size);
-                            }
+                            let mut data_offset = if unlikely(record_cursor.is_uninitialized()) {
+                                record_cursor.init_header(payload)?
+                            } else {
+                                record_cursor.last_offset()
+                            };
 
                             let target_column = *column;
                             let mut parse_pos = record_cursor.header_offset;
-                            let mut data_offset = record_cursor
-                                .offsets
-                                .last()
-                                .copied()
-                                .expect("header_offset must be set");
 
                             // Parse the header for serial types incrementally until we have the target column
-                            while record_cursor.serial_types.len() <= target_column
+                            while record_cursor.serials_offsets.len() <= target_column
                                 && parse_pos < record_cursor.header_size
                             {
-                                let (serial_type, varint_len) =
-                                    read_varint_fast(&payload[parse_pos..])?;
-                                record_cursor.serial_types.push(serial_type);
+                                let (serial_type, varint_len) = read_varint(&payload[parse_pos..])?;
                                 parse_pos += varint_len;
                                 let data_size = match serial_type {
                                     // NULL
@@ -1580,7 +1569,9 @@ pub fn op_column(
                                     _ => unreachable!("Invalid serial type: {serial_type}"),
                                 } as usize;
                                 data_offset += data_size;
-                                record_cursor.offsets.push(data_offset);
+                                record_cursor
+                                    .serials_offsets
+                                    .push((serial_type, data_offset));
                             }
 
                             debug_assert!(
@@ -1589,20 +1580,24 @@ pub fn op_column(
                                 record_cursor.header_size
                             );
                             record_cursor.header_offset = parse_pos;
-                            if target_column >= record_cursor.serial_types.len() {
+                            if target_column >= record_cursor.serials_offsets.len() {
                                 break 'ifnull;
                             }
 
-                            let start_offset = record_cursor.offsets[target_column];
-                            let end_offset = record_cursor.offsets[target_column + 1];
+                            let (serial_type, end_offset) =
+                                record_cursor.serials_offsets[target_column];
+                            let start_offset = if target_column == 0 {
+                                record_cursor.header_size
+                            } else {
+                                record_cursor.serials_offsets[target_column - 1].1
+                            };
                             // SAFETY: We know that the payload is valid until the next row is processed.
                             let buf = unsafe {
                                 std::mem::transmute::<&[u8], &'static [u8]>(
                                     &payload[start_offset..end_offset],
                                 )
                             };
-                            let serial_type = record_cursor.serial_types[target_column];
-                            drop(record_cursor);
+                            let serial_type = record_cursor.serials_offsets[target_column].0;
 
                             match serial_type {
                                 // NULL
@@ -2631,10 +2626,14 @@ pub fn op_integer(
 
 pub enum OpProgramState {
     Start,
-    Step,
+    /// Step state tracks whether we're executing a trigger subprogram (vs FK action subprogram)
+    Step {
+        is_trigger: bool,
+    },
 }
 
-/// Execute a trigger subprogram (Program opcode).
+/// Execute a subprogram (Program opcode).
+/// Used for both triggers and FK actions (CASCADE, SET NULL, etc.)
 pub fn op_program(
     program: &Program,
     state: &mut ProgramState,
@@ -2653,10 +2652,14 @@ pub fn op_program(
             OpProgramState::Start => {
                 let mut statement = subprogram.write();
                 statement.reset();
-                let Some(ref trigger) = statement.get_trigger() else {
-                    crate::bail_parse_error!("trigger subprogram has no trigger");
+
+                // Check if this is a trigger subprogram - if so, track execution
+                let is_trigger = if let Some(ref trigger) = statement.get_trigger() {
+                    program.connection.start_trigger_execution(trigger.clone());
+                    true
+                } else {
+                    false
                 };
-                program.connection.start_trigger_execution(trigger.clone());
 
                 // Extract register values from params (which contain register indices encoded as negative integers)
                 // and bind them to the subprogram's parameters
@@ -2677,15 +2680,16 @@ pub fn op_program(
                         }
                     } else {
                         crate::bail_parse_error!(
-                            "Trigger parameters should be integers, got {:?}",
+                            "Subprogram parameters should be integers, got {:?}",
                             param_value
                         );
                     }
                 }
 
-                state.op_program_state = OpProgramState::Step;
+                state.op_program_state = OpProgramState::Step { is_trigger };
             }
-            OpProgramState::Step => {
+            OpProgramState::Step { is_trigger } => {
+                let is_trigger = *is_trigger;
                 loop {
                     let mut statement = subprogram.write();
                     let res = statement.step();
@@ -2713,7 +2717,11 @@ pub fn op_program(
                         }
                     }
                 }
-                program.connection.end_trigger_execution();
+
+                // Only end trigger execution if this was a trigger subprogram
+                if is_trigger {
+                    program.connection.end_trigger_execution();
+                }
 
                 state.op_program_state = OpProgramState::Start;
                 state.pc += 1;
@@ -6406,7 +6414,7 @@ pub fn op_insert(
                     cursor.root_page()
                 };
                 if root_page != 1
-                    && table_name != "sqlite_sequence"
+                    && table_name != SQLITE_SEQUENCE_TABLE_NAME
                     && !flag.has(InsertFlags::EPHEMERAL_TABLE_INSERT)
                 {
                     state.op_insert_state.sub_state = OpInsertSubState::UpdateLastRowid;
@@ -9085,12 +9093,12 @@ pub fn op_add_column(
         let table = schema
             .tables
             .get_mut(table)
-            .expect("table being renamed should be in schema");
+            .expect("table being altered should be in schema");
 
         let table = Arc::make_mut(table);
 
         let Table::BTree(btree) = table else {
-            panic!("only btree tables can be renamed");
+            panic!("only btree tables can have columns added");
         };
 
         let btree = Arc::make_mut(btree);

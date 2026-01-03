@@ -17,7 +17,7 @@ pub enum PyTursoStatusCode {
     Row = 2,
     Io = 3,
 }
-create_exception!(turso, Busy, PyException, "database is busy");
+create_exception!(turso, Busy, PyException, "database is locked");
 create_exception!(turso, Interrupt, PyException, "interrupted");
 create_exception!(turso, Error, PyException, "generic error");
 create_exception!(turso, Misuse, PyException, "API misuse");

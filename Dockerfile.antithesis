@@ -56,7 +56,7 @@ COPY stress/libvoidstar.so /opt/antithesis/libvoidstar.so
 
 COPY --from=planner /app/recipe.json recipe.json
 RUN cargo chef cook --bin turso_stress --release --recipe-path recipe.json
-COPY --from=planner /app/Cargo.toml ./Cargo.toml
+COPY --from=planner /app/Cargo.toml /app/Cargo.lock ./
 COPY --from=planner /app/bindings/dart ./bindings/dart/
 COPY --from=planner /app/bindings/dotnet ./bindings/dotnet/
 COPY --from=planner /app/bindings/java ./bindings/java/
@@ -86,7 +86,7 @@ COPY --from=planner /app/sdk-kit-macros ./sdk-kit-macros/
 
 RUN if [ "$antithesis" = "true" ]; then \
         cp /opt/antithesis/libvoidstar.so /usr/lib/libvoidstar.so && \
-        export RUSTFLAGS="-Ccodegen-units=1 -Cpasses=sancov-module -Cllvm-args=-sanitizer-coverage-level=3 -Cllvm-args=-sanitizer-coverage-trace-pc-guard -Clink-args=-Wl,--build-id -L/usr/lib/ -lvoidstar" && \
+        export RUSTFLAGS="--cfg=tokio_unstable -Ccodegen-units=1 -Cpasses=sancov-module -Cllvm-args=-sanitizer-coverage-level=3 -Cllvm-args=-sanitizer-coverage-trace-pc-guard -Clink-args=-Wl,--build-id -L/usr/lib/ -lvoidstar" && \
         cargo build --bin turso_stress --features antithesis --profile antithesis; \
     else \
         cargo build --bin turso_stress --release; \
@@ -103,7 +103,7 @@ RUN make
 #
 
 FROM debian:bullseye-slim AS runtime
-RUN apt-get update && apt-get install -y bash curl xz-utils python3 procps sqlite3 bc binutils pip && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y bash curl xz-utils python3 procps sqlite3 bc binutils pip rust-gdb && rm -rf /var/lib/apt/lists/*
 RUN pip install antithesis
 
 WORKDIR /app

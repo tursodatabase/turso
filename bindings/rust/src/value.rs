@@ -110,26 +110,26 @@ impl Value {
     }
 }
 
-impl From<turso_core::Value> for Value {
-    fn from(val: turso_core::Value) -> Self {
+impl From<turso_sdk_kit::rsapi::Value> for Value {
+    fn from(val: turso_sdk_kit::rsapi::Value) -> Self {
         match val {
-            turso_core::Value::Null => Value::Null,
-            turso_core::Value::Integer(n) => Value::Integer(n),
-            turso_core::Value::Float(n) => Value::Real(n),
-            turso_core::Value::Text(t) => Value::Text(t.into()),
-            turso_core::Value::Blob(items) => Value::Blob(items),
+            turso_sdk_kit::rsapi::Value::Null => Value::Null,
+            turso_sdk_kit::rsapi::Value::Integer(n) => Value::Integer(n),
+            turso_sdk_kit::rsapi::Value::Float(n) => Value::Real(n),
+            turso_sdk_kit::rsapi::Value::Text(t) => Value::Text(t.into()),
+            turso_sdk_kit::rsapi::Value::Blob(items) => Value::Blob(items),
         }
     }
 }
 
-impl From<Value> for turso_core::Value {
+impl From<Value> for turso_sdk_kit::rsapi::Value {
     fn from(val: Value) -> Self {
         match val {
-            Value::Null => turso_core::Value::Null,
-            Value::Integer(n) => turso_core::Value::Integer(n),
-            Value::Real(n) => turso_core::Value::Float(n),
-            Value::Text(t) => turso_core::Value::from_text(t),
-            Value::Blob(items) => turso_core::Value::from_blob(items),
+            Value::Null => turso_sdk_kit::rsapi::Value::Null,
+            Value::Integer(n) => turso_sdk_kit::rsapi::Value::Integer(n),
+            Value::Real(n) => turso_sdk_kit::rsapi::Value::Float(n),
+            Value::Text(t) => turso_sdk_kit::rsapi::Value::from_text(t),
+            Value::Blob(items) => turso_sdk_kit::rsapi::Value::from_blob(items),
         }
     }
 }

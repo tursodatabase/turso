@@ -35,15 +35,16 @@ impl From<genawaiter::sync::Co<SyncEngineIoResult, Result<()>>> for Coro<()> {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
 pub enum PartialBootstrapStrategy {
     Prefix { length: usize },
     Query { query: String },
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PartialSyncOpts {
-    pub bootstrap_strategy: PartialBootstrapStrategy,
+    pub bootstrap_strategy: Option<PartialBootstrapStrategy>,
     pub segment_size: usize,
     pub prefetch: bool,
 }
@@ -87,6 +88,7 @@ impl std::fmt::Debug for DbChangesStatus {
     }
 }
 
+#[derive(Debug, Serialize)]
 pub struct SyncEngineStats {
     pub cdc_operations: i64,
     pub main_wal_size: u64,
@@ -124,6 +126,16 @@ pub struct DatabaseMetadata {
     pub last_pushed_pull_gen_hint: i64,
     pub last_pushed_change_id_hint: i64,
     pub partial_bootstrap_server_revision: Option<DatabasePullRevision>,
+    /// optional saved configuration
+    /// this will be used by sync engine if some parameters were omitted
+    pub saved_configuration: Option<DatabaseSavedConfiguration>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct DatabaseSavedConfiguration {
+    pub remote_url: Option<String>,
+    pub partial_sync_prefetch: Option<bool>,
+    pub partial_sync_segment_size: Option<usize>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
@@ -145,6 +157,52 @@ pub enum DatabaseSyncEngineProtocolVersion {
 }
 
 impl DatabaseMetadata {
+    pub fn remote_url(&self) -> Option<String> {
+        self.saved_configuration
+            .as_ref()
+            .and_then(|x| x.remote_url.as_deref())
+            .map(|x| x.to_string())
+    }
+    pub fn partial_sync_opts(&self) -> Option<PartialSyncOpts> {
+        if self.partial_bootstrap_server_revision.is_none() {
+            None
+        } else {
+            let partial_sync_opts = PartialSyncOpts {
+                bootstrap_strategy: None,
+                segment_size: self
+                    .saved_configuration
+                    .as_ref()
+                    .and_then(|x| x.partial_sync_segment_size)
+                    .unwrap_or(128 * 1024),
+                prefetch: self
+                    .saved_configuration
+                    .as_ref()
+                    .and_then(|x| x.partial_sync_prefetch)
+                    .unwrap_or_default(),
+            };
+            Some(partial_sync_opts)
+        }
+    }
+    pub fn update_configuration(&mut self, configuration: DatabaseSavedConfiguration) -> bool {
+        let Some(saved_configuration) = &mut self.saved_configuration else {
+            self.saved_configuration = Some(configuration);
+            return true;
+        };
+        let mut changed = false;
+        if let Some(remote_url) = configuration.remote_url {
+            saved_configuration.remote_url = Some(remote_url);
+            changed |= true;
+        }
+        if let Some(partial_sync_prefetch) = configuration.partial_sync_prefetch {
+            saved_configuration.partial_sync_prefetch = Some(partial_sync_prefetch);
+            changed |= true;
+        }
+        if let Some(partial_sync_segment_size) = configuration.partial_sync_segment_size {
+            saved_configuration.partial_sync_segment_size = Some(partial_sync_segment_size);
+            changed |= true;
+        }
+        changed
+    }
     pub fn load(data: &[u8]) -> Result<Self> {
         let value: serde_json::Value = serde_json::from_slice(data)?;
 

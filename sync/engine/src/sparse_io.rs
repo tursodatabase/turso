@@ -17,7 +17,7 @@ impl SparseLinuxIo {
 }
 
 impl IO for SparseLinuxIo {
-    #[instrument(err, skip_all, level = Level::TRACE)]
+    #[instrument(skip_all, level = Level::TRACE)]
     fn open_file(&self, path: &str, flags: OpenFlags, _direct: bool) -> Result<Arc<dyn File>> {
         let mut file = std::fs::File::options();
         file.read(true);
