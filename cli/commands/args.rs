@@ -177,3 +177,9 @@ pub enum HeadersMode {
     On,
     Off,
 }
+
+#[derive(Debug, Clone, clap::Parser)]
+pub struct DbtotxtArgs {
+    #[clap(long = "page")]
+    pub page_no: Option<i64>,
+}
