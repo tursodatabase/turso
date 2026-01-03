@@ -3,6 +3,7 @@ pub mod comparison;
 pub mod output;
 pub mod parser;
 pub mod runner;
+pub mod tcl_converter;
 
 pub use backends::{BackendError, DatabaseInstance, QueryResult, SqlBackend};
 pub use comparison::{ComparisonResult, compare};
