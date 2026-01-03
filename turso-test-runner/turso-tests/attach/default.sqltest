@@ -1,0 +1,46 @@
+@database database/testing.db readonly
+@database database/testing_norowidalias.db readonly
+
+# Test attach reserved name - main (should fail)
+test attach-reserved-main {
+    ATTACH DATABASE "database/testing_small.db" AS main
+}
+expect error {
+    in use
+}
+
+# Test attach reserved name - temp (should fail)
+test attach-reserved-temp {
+    ATTACH DATABASE "database/testing_small.db" AS temp
+}
+expect error {
+    in use
+}
+
+# Test attach duplicate database name - arbitrary (should fail)
+test attach-duplicate-name {
+    ATTACH DATABASE "database/testing_small.db" as small;
+    ATTACH DATABASE "database/testing_small.db" as small;
+}
+expect error {
+    in use
+}
+
+# Test detach non-existent database (should fail)
+test detach-non-existent {
+    DETACH DATABASE nonexistent;
+}
+expect error {
+    no such database
+}
+
+# Test queries after detach (should fail for detached database)
+test query-after-detach {
+    ATTACH DATABASE "database/testing_small.db" as small;
+    DETACH DATABASE small;
+    select * from small.sqlite_schema;
+}
+expect error {
+    no such
+}
+

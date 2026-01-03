@@ -1,0 +1,55 @@
+@database :memory:
+
+# Test querying attached file database
+test attach-db-query {
+    ATTACH DATABASE "database/testing_small.db" AS small;
+    SELECT value FROM small.demo where id = 1;
+}
+expect {
+    A
+}
+
+# Test detach database
+test detach-database {
+    ATTACH DATABASE "database/testing_small.db" AS small;
+    DETACH DATABASE small;
+    pragma database_list;
+}
+expect {
+    0|main|
+}
+
+# Test attach in-memory database
+test attach-memory-database {
+    ATTACH DATABASE ':memory:' AS mem;
+    pragma database_list;
+}
+expect {
+    0|main|
+    2|mem|
+}
+
+# Test join between main and attached database
+test attach-cross-database-join {
+    ATTACH DATABASE "database/testing_small.db" as small;
+    create table joiners (id int, otherid int);
+    insert into joiners (id, otherid) values (1,1);
+    insert into joiners (id, otherid) values (3,3);
+    select s.value from joiners j inner join small.demo s where j.otherid = s.id;
+}
+expect {
+    A
+    B
+}
+
+@skip-if mvcc "attach not supported in MVCC mode"
+# regression test for https://github.com/tursodatabase/turso/issues/3540
+test attach-from-memory-db {
+    CREATE TABLE t(a);
+    INSERT INTO t SELECT value from generate_series(1,10);
+    ATTACH DATABASE 'database/testing.db' as a;
+    SELECT * from a.products, t LIMIT 1;
+}
+expect {
+    1|hat|79.0|1
+}
