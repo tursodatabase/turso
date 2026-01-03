@@ -14,7 +14,7 @@ import tech.turso.utils.TursoExceptionUtils;
  * objects. All execution method in the <code>TursoStatement</code> implicitly close the current
  * <code>resultSet</code> object of the statement if an open one exists.
  */
-public final class TursoStatement {
+public final class TursoStatement implements AutoCloseable {
 
   private static final Logger log = LoggerFactory.getLogger(TursoStatement.class);
 
