@@ -315,6 +315,34 @@ do_execsql_test date-with-subsec {
   SELECT date('2023-05-18 15:30:45.123', 'subsec');
 } {2023-05-18}
 
+do_execsql_test unixepoch-with-modifier-add-days {
+  SELECT unixepoch('2025-12-23 21:03:55', '+1 days');
+} {1766610235}
+
+do_execsql_test unixepoch-with-modifier-substract-days {
+  SELECT unixepoch('2025-12-23 21:03:55', '-1 days');
+} {1766437435}
+
+do_execsql_test unixepoch-with-modifier-add-hours {
+  SELECT unixepoch('2025-12-23 21:03:55', '+6 hours');
+} {1766545435}
+
+do_execsql_test unixepoch-with-modifier-subtract-hours {
+  SELECT unixepoch('2025-12-23 21:03:55', '-6 hours');
+} {1766502235}
+
+do_execsql_test unixepoch-with-modifier-subtract-hours {
+  SELECT unixepoch('2025-12-23 21:03:55', 'start of month');
+} {1764547200}
+
+do_execsql_test unixepoch-with-modifier-subtract-hours {
+  SELECT unixepoch('2025-12-23 21:03:55', 'start of year');
+} {1735689600}
+
+do_execsql_test unixepoch-with-modifier-weekday {
+  SELECT unixepoch('2023-12-13 21:03:55', 'weekday 0');
+} {1702847035}
+
 do_execsql_test time-with-modifier-add-hours {
   SELECT time('2023-05-18 15:30:45', '+5 hours');
 } {20:30:45}
@@ -528,8 +556,8 @@ do_execsql_test strftime-day-without-leading-zero-1 {
 
 do_execsql_test strftime-day-without-leading-zero-2 {
     SELECT strftime('%e', '2025-01-02T13:10:30.567');
-} {" 2"} 
-# TODO not a typo in sqlite there is also a space 
+} {" 2"}
+# TODO not a typo in sqlite there is also a space
 
 do_execsql_test strftime-fractional-seconds {
     SELECT strftime('%f', '2025-01-02T13:10:30.567');

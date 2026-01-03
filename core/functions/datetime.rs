@@ -38,6 +38,16 @@ where
 }
 
 #[inline(always)]
+pub fn exec_unixepoch<I, E, V>(values: I) -> Value
+where
+    V: AsValueRef,
+    E: ExactSizeIterator<Item = V>,
+    I: IntoIterator<IntoIter = E, Item = V>,
+{
+    exec_datetime(values, DateTimeOutput::UnixEpoch)
+}
+
+#[inline(always)]
 pub fn exec_strftime<I, E, V>(values: I) -> Value
 where
     V: AsValueRef,
@@ -70,6 +80,14 @@ enum DateTimeOutput {
     // Holds the format string
     StrfTime(String),
     JuliaDay,
+    UnixEpoch,
+}
+
+// The result of applying a set of modifiers is both a datetime
+// and whether the subsec format was requested.
+struct DtTransform {
+    dt: NaiveDateTime,
+    subsec_requested: bool,
 }
 
 fn exec_datetime<I, E, V>(values: I, output_type: DateTimeOutput) -> Value
@@ -85,17 +103,25 @@ where
     }
     let mut values = values.peekable();
     let first = values.peek().unwrap();
-    if let Some(mut dt) = parse_naive_date_time(first) {
+    let apply_res = if let Some(dt) = parse_naive_date_time(first) {
         // if successful, treat subsequent entries as modifiers
-        modify_dt(&mut dt, values.skip(1), output_type)
+        modify_dt(dt, values.skip(1))
     } else {
         // if the first argument is NOT a valid date/time, treat the entire set of values as modifiers.
-        let mut dt = chrono::Local::now().to_utc().naive_utc();
-        modify_dt(&mut dt, values, output_type)
+        let dt = chrono::Local::now().to_utc().naive_utc();
+        modify_dt(dt, values)
+    };
+
+    match apply_res {
+        None => Value::build_text(""),
+        Some(DtTransform {
+            dt,
+            subsec_requested,
+        }) => format_dt(dt, output_type, subsec_requested),
     }
 }
 
-fn modify_dt<I, E, V>(dt: &mut NaiveDateTime, mods: I, output_type: DateTimeOutput) -> Value
+fn modify_dt<I, E, V>(mut dt: NaiveDateTime, mods: I) -> Option<DtTransform>
 where
     V: AsValueRef,
     E: ExactSizeIterator<Item = V>,
@@ -113,25 +139,28 @@ where
                 n_floor = 0;
             }
 
-            match apply_modifier(dt, text_rc.as_str(), &mut n_floor) {
+            match apply_modifier(&mut dt, text_rc.as_str(), &mut n_floor) {
                 Ok(true) => subsec_requested = true,
                 Ok(false) => {}
-                Err(_) => return Value::build_text(""),
+                Err(_) => return None,
             }
 
             if matches!(parsed, Ok(Modifier::Floor) | Ok(Modifier::Ceiling)) {
                 n_floor = 0;
             }
         } else {
-            return Value::build_text("");
+            return None;
         }
     }
 
-    if is_leap_second(dt) || *dt > get_max_datetime_exclusive() {
-        return Value::build_text("");
+    if is_leap_second(&dt) || dt > get_max_datetime_exclusive() {
+        return None;
     }
 
-    format_dt(*dt, output_type, subsec_requested)
+    Some(DtTransform {
+        dt,
+        subsec_requested,
+    })
 }
 
 fn format_dt(dt: NaiveDateTime, output_type: DateTimeOutput, subsec: bool) -> Value {
@@ -155,6 +184,16 @@ fn format_dt(dt: NaiveDateTime, output_type: DateTimeOutput, subsec: bool) -> Va
         }
         DateTimeOutput::StrfTime(format_str) => Value::from_text(strftime_format(&dt, &format_str)),
         DateTimeOutput::JuliaDay => Value::Float(to_julian_day_exact(&dt)),
+        DateTimeOutput::UnixEpoch => {
+            if subsec {
+                let dt_utc = dt.and_utc();
+                let secs = dt_utc.timestamp();
+                let millis = dt_utc.timestamp_subsec_millis();
+                Value::Float(secs as f64 + (millis as f64 / 1000.0f64))
+            } else {
+                Value::Integer(dt.and_utc().timestamp())
+            }
+        }
     }
 }
 
@@ -418,21 +457,6 @@ fn to_julian_day_exact(dt: &NaiveDateTime) -> f64 {
 
     // Convert back to floating point JD
     i_jd as f64 / 86400000.0
-}
-
-pub fn exec_unixepoch(time_value: &Value) -> Value {
-    let dt = parse_naive_date_time(time_value);
-    match dt {
-        Some(dt) if !is_leap_second(&dt) => Value::Integer(get_unixepoch_from_naive_datetime(dt)),
-        _ => Value::Null,
-    }
-}
-
-fn get_unixepoch_from_naive_datetime(value: NaiveDateTime) -> i64 {
-    if is_leap_second(&value) {
-        return 0;
-    }
-    value.and_utc().timestamp()
 }
 
 fn parse_naive_date_time(time_value: impl AsValueRef) -> Option<NaiveDateTime> {
