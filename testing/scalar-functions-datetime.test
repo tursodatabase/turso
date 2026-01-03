@@ -197,6 +197,10 @@ do_execsql_test date-with-+12-offset {
   SELECT date('2023-05-18 23:30:45+12');
 } {{}}
 
+do_execsql_test datetime-huge-number  {
+  SELECT datetime(9466848000000.0, 'unixepoch');
+} {{}}
+
 do_execsql_test datetime-negative-date-offset {
   SELECT datetime('2023-05-18 12:30:00', '-0001-01-01');
 } {{2022-04-17 12:30:00}}

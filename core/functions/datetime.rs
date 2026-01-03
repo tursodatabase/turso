@@ -91,6 +91,23 @@ enum DateTimeOutput {
     UnixEpoch,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ParsedDateTime {
+    val: NaiveDateTime,
+    is_utc: bool,
+    overflow: i64,
+}
+
+impl ParsedDateTime {
+    fn new(val: NaiveDateTime, is_utc: bool) -> Self {
+        Self {
+            val,
+            is_utc,
+            overflow: 0,
+        }
+    }
+}
+
 fn exec_datetime<I, E, V>(values: I, output_type: DateTimeOutput) -> Value
 where
     V: AsValueRef,
@@ -112,15 +129,16 @@ where
         _ => None,
     };
 
-    if let Some((mut dt, is_utc, overflow)) = parse_naive_date_time(first) {
+    if let Some(parsed) = parse_naive_date_time(first) {
+        let mut dt = parsed.val;
         return modify_dt(
             &mut dt,
             values.skip(1),
             output_type,
             initial_numeric,
             true,
-            is_utc,
-            overflow,
+            parsed.is_utc,
+            parsed.overflow,
         );
     }
 
@@ -534,11 +552,14 @@ fn last_day_in_month(year: i32, month: u32) -> u32 {
     28
 }
 
-fn get_date_time_from_time_value_string(value: &str) -> Option<(NaiveDateTime, bool, i64)> {
+fn get_date_time_from_time_value_string(value: &str) -> Option<ParsedDateTime> {
     let value = value.trim();
 
     if value.eq_ignore_ascii_case("now") {
-        return Some((chrono::Local::now().to_utc().naive_utc(), true, 0));
+        return Some(ParsedDateTime::new(
+            chrono::Local::now().to_utc().naive_utc(),
+            true,
+        ));
     }
 
     if let Ok(julian_day) = value.parse::<f64>() {
@@ -574,7 +595,8 @@ fn get_date_time_from_time_value_string(value: &str) -> Option<(NaiveDateTime, b
             parse_datetime_with_optional_tz(value, format)
         };
 
-        if let Some((dt, is_utc)) = result {
+        if let Some(mut parsed) = result {
+            let dt = parsed.val;
             let nanos = dt.nanosecond();
             let ms = (nanos + 500_000) / 1_000_000;
             let rounded_dt = if ms >= 1000 {
@@ -582,19 +604,19 @@ fn get_date_time_from_time_value_string(value: &str) -> Option<(NaiveDateTime, b
             } else {
                 dt.with_nanosecond(ms * 1_000_000).unwrap()
             };
-            return Some((rounded_dt, is_utc, 0));
+            parsed.val = rounded_dt;
+            return Some(parsed);
         }
     }
 
-    // 4. Permissive Parsing (Fallback)
-    if let Some((dt, overflow)) = parse_permissive_datetime(value) {
-        return Some((dt, false, overflow));
+    if let Some(parsed) = parse_permissive_datetime(value) {
+        return Some(parsed);
     }
 
     None
 }
 
-fn parse_datetime_with_optional_tz(value: &str, format: &str) -> Option<(NaiveDateTime, bool)> {
+fn parse_datetime_with_optional_tz(value: &str, format: &str) -> Option<ParsedDateTime> {
     let is_invalid_suffix = |s: &str| -> bool {
         let b = s.as_bytes();
         let len = b.len();
@@ -613,49 +635,52 @@ fn parse_datetime_with_optional_tz(value: &str, format: &str) -> Option<(NaiveDa
         return None;
     }
 
-    // Case 1: Format includes timezone specifier (e.g. %:z)
+    // Case A: Format includes timezone specifier (e.g. %:z) -> Return UTC
     let with_tz_format = format.to_owned() + "%:z";
     if let Ok(dt) = DateTime::parse_from_str(value, &with_tz_format) {
-        return Some((dt.with_timezone(&Utc).naive_utc(), true));
+        return Some(ParsedDateTime::new(
+            dt.with_timezone(&Utc).naive_utc(),
+            true,
+        ));
     }
 
-    // Case 2: String manually ends in 'Z' (UTC)
+    // Case B: String manually ends in 'Z' (UTC) -> Return UTC
     if value.ends_with('Z') {
         let value_without_tz = &value[0..value.len() - 1];
         if let Ok(dt) = NaiveDateTime::parse_from_str(value_without_tz, format) {
-            return Some((dt, true));
+            return Some(ParsedDateTime::new(dt, true));
         }
     }
 
-    // Case 3: No timezone info -> Assumed Local (Timezone Abstract)
+    // Case C: No timezone info -> Assumed Local (Timezone Abstract, is_utc=false)
     if let Ok(dt) = NaiveDateTime::parse_from_str(value, format) {
-        return Some((dt, false));
+        return Some(ParsedDateTime::new(dt, false));
     }
     None
 }
 
-fn get_date_time_from_time_value_integer(value: i64) -> Option<(NaiveDateTime, bool, i64)> {
+fn get_date_time_from_time_value_integer(value: i64) -> Option<ParsedDateTime> {
     i32::try_from(value).map_or_else(
         |_| None,
         |value| {
             if value.is_negative() || !is_julian_day_value(value as f64) {
                 return None;
             }
-            // 0 Overflow
             get_date_time_from_time_value_float(value as f64)
         },
     )
 }
 
-fn get_date_time_from_time_value_float(value: f64) -> Option<(NaiveDateTime, bool, i64)> {
+fn get_date_time_from_time_value_float(value: f64) -> Option<ParsedDateTime> {
     if value.is_infinite() || value.is_nan() || !is_julian_day_value(value) {
         return None;
     }
-    // 0 Overflow
-    julian_day_to_datetime(value).ok().map(|dt| (dt, true, 0))
+    julian_day_to_datetime(value)
+        .ok()
+        .map(|dt| ParsedDateTime::new(dt, true))
 }
 
-fn parse_naive_date_time(time_value: impl AsValueRef) -> Option<(NaiveDateTime, bool, i64)> {
+fn parse_naive_date_time(time_value: impl AsValueRef) -> Option<ParsedDateTime> {
     let time_value = time_value.as_value_ref();
     match time_value {
         ValueRef::Text(s) => get_date_time_from_time_value_string(s.as_str()),
@@ -750,7 +775,7 @@ fn compute_julian_day(y: i32, mut m: i32, d: i32, h: i32, min: i32, s: f64) -> f
 /// format lengths (YYYY-MM-DD). Malformed lengths (e.g., 200-1-1) must return NULL.
 /// It consumes any combination of 'T' or whitespace between Date and Time.
 /// Whitespace preceding the timezone suffix is strictly trimmed.
-fn parse_permissive_datetime(value: &str) -> Option<(NaiveDateTime, i64)> {
+fn parse_permissive_datetime(value: &str) -> Option<ParsedDateTime> {
     let value = value.trim();
 
     // 1. Parse Year
@@ -871,7 +896,11 @@ fn parse_permissive_datetime(value: &str) -> Option<(NaiveDateTime, i64)> {
     };
 
     let jd = compute_julian_day(y, m, d, h, min, s);
-    julian_day_to_datetime(jd).ok().map(|dt| (dt, overflow))
+    julian_day_to_datetime(jd).ok().map(|dt| ParsedDateTime {
+        val: dt,
+        is_utc: false,
+        overflow,
+    })
 }
 
 /// Convert a Julian Day number (as f64) to a NaiveDateTime
@@ -1185,8 +1214,7 @@ where
     let end = parse_naive_date_time(values.next().unwrap());
 
     match (start, end) {
-        // Ignore bool (is_utc) and i64 (overflow)
-        (Some((d1, _, _)), Some((d2, _, _))) => compute_timediff(d1, d2),
+        (Some(p1), Some(p2)) => compute_timediff(p1.val, p2.val),
         _ => Value::Null,
     }
 }
@@ -2421,9 +2449,10 @@ mod tests {
         let expected = Value::Null;
         assert_eq!(exec_timediff(&[start, end.clone()]), expected);
 
+        // Test identical times - should return zero duration, not Null
         let start = Value::build_text("12:00:00");
-        let end = Value::build_text("+0000-00-00 00:00:00.000");
-        let expected = Value::Null;
+        let end = Value::build_text("12:00:00");
+        let expected = Value::build_text("+0000-00-00 00:00:00.000");
         assert_eq!(exec_timediff(&[start, end]), expected);
     }
 
