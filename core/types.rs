@@ -2936,7 +2936,7 @@ mod tests {
         let record = Record::new(vec![
             Value::Null,
             Value::Integer(100),
-            Value::Float(3.14),
+            Value::Float(std::f64::consts::PI),
             Value::Text(Text::new("test")),
             Value::Blob(vec![1, 2, 3]),
             Value::Integer(0),
@@ -2949,7 +2949,7 @@ mod tests {
 
         assert_eq!(values[0], ValueRef::Null);
         assert_eq!(values[1], ValueRef::Integer(100));
-        assert_eq!(values[2], ValueRef::Float(3.14));
+        assert_eq!(values[2], ValueRef::Float(std::f64::consts::PI));
         assert_eq!(
             values[3],
             ValueRef::Text(TextRef::new("test", TextSubtype::Text))
