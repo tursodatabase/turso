@@ -1,6 +1,5 @@
 @database database/testing.db readonly
 
-#!/usr/bin/env tclsh
 test schema {
     .schema
 }
