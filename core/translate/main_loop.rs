@@ -27,6 +27,7 @@ use crate::{
     translate::{
         collate::{get_collseq_from_expr, CollationSeq},
         emitter::{prepare_cdc_if_necessary, HashCtx},
+        expr::comparison_affinity,
         planner::{table_mask_from_expr, TableMask},
         result_row::emit_select_result,
         subquery::emit_non_from_clause_subquery,
@@ -534,11 +535,7 @@ fn emit_hash_build_phase(
     for join_key in hash_join_op.join_keys.iter() {
         let build_expr = join_key.get_build_expr(predicates);
         let probe_expr = join_key.get_probe_expr(predicates);
-        let affinity = crate::translate::expr::comparison_affinity(
-            build_expr,
-            probe_expr,
-            Some(table_references),
-        );
+        let affinity = comparison_affinity(build_expr, probe_expr, Some(table_references));
         key_affinities.push(affinity.aff_mask());
     }
 
@@ -652,21 +649,22 @@ fn emit_hash_build_phase(
             }
         }
     }
-    let key_source_cursor_id = if use_materialized_keys {
-        build_iter_cursor_id
-    } else {
-        hash_build_cursor_id
-    };
-    let payload_source_cursor_id = if use_materialized_keys {
-        build_iter_cursor_id
-    } else {
-        hash_build_cursor_id
-    };
-    let hash_build_rowid_cursor_id = if use_materialized_keys {
-        build_iter_cursor_id
-    } else {
-        hash_build_cursor_id
-    };
+
+    let (key_source_cursor_id, payload_source_cursor_id, hash_build_rowid_cursor_id) =
+        if use_materialized_keys {
+            (
+                build_iter_cursor_id,
+                build_iter_cursor_id,
+                build_iter_cursor_id,
+            )
+        } else {
+            (
+                hash_build_cursor_id,
+                hash_build_cursor_id,
+                hash_build_cursor_id,
+            )
+        };
+
     // Create new loop for hash table build phase
     let build_loop_start = program.allocate_label();
     let build_loop_end = program.allocate_label();
@@ -1395,9 +1393,6 @@ pub fn open_loop(
 
 #[allow(clippy::too_many_arguments)]
 /// Emits WHERE/ON predicates that must be evaluated at the current join loop.
-///
-/// This centralizes the "should this predicate run now?" logic and supports
-/// optional skipping when predicates are pre-applied (e.g., probe-side filters).
 fn emit_conditions(
     program: &mut ProgramBuilder,
     t_ctx: &&mut TranslateCtx,

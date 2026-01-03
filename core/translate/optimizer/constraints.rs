@@ -424,7 +424,7 @@ fn estimate_join_eq_selectivity(
 /// Specifically:
 /// - If `operator == Equals` and `constraining_expr` is a simple column reference
 ///   from a *different* table, treat this as a join predicate and estimate:
-///     selectivity ~= 1 / max(NDV(left), NDV(right)).
+///   selectivity ~= 1 / max(NDV(left), NDV(right)).
 /// - Otherwise defer to `estimate_selectivity(...)`, which handles constants,
 ///   non-equality operators, and general column constraints (possibly using index stats).
 fn estimate_constraint_selectivity(
