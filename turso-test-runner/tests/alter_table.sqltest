@@ -1,0 +1,263 @@
+@database :memory:
+
+test alter-table-rename-table {
+    CREATE TABLE t1 (x INTEGER PRIMARY KEY, u);
+    ALTER TABLE t1 RENAME TO t2;
+    SELECT name FROM sqlite_schema WHERE type = 'table';
+}
+expect {
+    t2
+}
+
+test alter-table-rename-column {
+    CREATE TABLE t (a INTEGER);
+    CREATE INDEX i ON t (a);
+    ALTER TABLE t RENAME a TO b;
+    SELECT sql FROM sqlite_schema;
+}
+expect {
+    CREATE TABLE t (b INTEGER)
+    CREATE INDEX i ON t (b)
+}
+
+test alter-table-rename-quoted-column {
+    CREATE TABLE t (a INTEGER);
+    ALTER TABLE t RENAME a TO "ab cd";
+    SELECT sql FROM sqlite_schema;
+}
+expect {
+    CREATE TABLE t ("ab cd" INTEGER)
+}
+
+test alter-table-add-column {
+    CREATE TABLE t (a);
+    INSERT INTO t VALUES (1);
+    SELECT * FROM t;
+
+    ALTER TABLE t ADD b;
+    SELECT sql FROM sqlite_schema;
+    SELECT * FROM t;
+}
+expect {
+    1
+    CREATE TABLE t (a, b)
+    1|
+}
+
+test alter-table-add-column-typed {
+    CREATE TABLE t (a);
+    ALTER TABLE t ADD b DEFAULT 0;
+    SELECT sql FROM sqlite_schema;
+    INSERT INTO t (a) VALUES (1);
+    SELECT * FROM t;
+}
+expect {
+    CREATE TABLE t (a, b DEFAULT 0)
+    1|0
+}
+
+test alter-table-add-column-default {
+    CREATE TABLE test (a);
+    INSERT INTO test VALUES (1), (2), (3);
+
+    ALTER TABLE test ADD b DEFAULT 0.1;
+    ALTER TABLE test ADD c DEFAULT 'hello';
+    SELECT * FROM test;
+
+    CREATE INDEX idx ON test (b);
+    SELECT b, c FROM test WHERE b = 0.1;
+
+    ALTER TABLE test DROP a;
+    SELECT * FROM test;
+}
+expect {
+    1|0.1|hello
+    2|0.1|hello
+    3|0.1|hello
+    0.1|hello
+    0.1|hello
+    0.1|hello
+    0.1|hello
+    0.1|hello
+    0.1|hello
+}
+
+test alter-table-add-quoted-column {
+    CREATE TABLE test (a);
+    ALTER TABLE test ADD COLUMN [b c];
+    SELECT sql FROM sqlite_schema;
+}
+expect {
+    CREATE TABLE test (a, [b c])
+}
+
+test alter-table-drop-column {
+    CREATE TABLE t (a, b);
+    INSERT INTO t VALUES (1, 1), (2, 2), (3, 3);
+    SELECT * FROM t;
+
+    ALTER TABLE t DROP b;
+    SELECT sql FROM sqlite_schema;
+
+    SELECT * FROM t;
+}
+expect {
+    1|1
+    2|2
+    3|3
+    CREATE TABLE t (a)
+    1
+    2
+    3
+}
+
+test alter-table-drop-column-special-name {
+    CREATE TABLE t (a, b, [c c]);
+    INSERT INTO t VALUES (1, 2, 3);
+    ALTER TABLE t DROP COLUMN b;
+
+    SELECT "c c" FROM t;
+    SELECT sql FROM sqlite_schema;
+}
+expect {
+    3
+    CREATE TABLE t (a, [c c])
+}
+
+test fail-alter-table-drop-unique-column {
+    CREATE TABLE t (a, b UNIQUE);
+    ALTER TABLE t DROP b;
+}
+expect error {
+}
+
+test fail-alter-table-drop-unique-column-constraint {
+    CREATE TABLE t (a, b, UNIQUE (b));
+    ALTER TABLE t DROP b;
+}
+expect error {
+}
+
+# refer https://github.com/tursodatabase/turso/issues/3231
+test fail-alter-table-add-duplicate-column {
+    CREATE TABLE t1 (a);
+    ALTER TABLE t1 ADD COLUMN a;
+}
+expect error {
+}
+
+test fail-alter-table-add-duplicate-column-case-insensitive {
+    CREATE TABLE t1 (a);
+    ALTER TABLE t1 ADD COLUMN A;
+}
+expect error {
+}
+
+test fail-alter-table-drop-primary-key-column {
+    CREATE TABLE t (a PRIMARY KEY, b);
+    ALTER TABLE t DROP a;
+}
+expect error {
+}
+
+test fail-alter-table-drop-primary-key-column-constrait {
+    CREATE TABLE t (a, b, PRIMARY KEY (a));
+    ALTER TABLE t DROP a;
+}
+expect error {
+}
+
+test fail-alter-table-rename-to-existing-index {
+    CREATE TABLE x (a);
+    CREATE INDEX y ON x (a);
+    ALTER TABLE x RENAME TO y;
+}
+expect error {
+}
+
+test fail-alter-table-rename-to-existing-table {
+    CREATE TABLE x (a);
+    CREATE TABLE y (a);
+    ALTER TABLE x RENAME TO y;
+}
+expect error {
+}
+
+test alter-table-rename-to-quoted-identifier {
+    CREATE TABLE t (a);
+    CREATE INDEX idx ON t (a);
+    INSERT INTO t VALUES (1);
+
+    ALTER TABLE t RENAME TO "t t";
+    SELECT sql FROM sqlite_schema;
+
+    INSERT INTO "t t" VALUES (2);
+    SELECT a FROM "t t";
+
+    DELETE FROM "t t" WHERE a = 1;
+    SELECT a FROM "t t";
+
+    ALTER TABLE "t t" RENAME COLUMN a TO "a a";
+    SELECT sql FROM sqlite_schema;
+    SELECT "a a" FROM "t t";
+    
+    ALTER TABLE "t t" RENAME COLUMN "a a" TO "b b";
+    SELECT sql FROM sqlite_schema;
+    SELECT "b b" FROM "t t";
+}
+expect {
+    CREATE TABLE "t t" (a)
+    CREATE INDEX idx ON "t t" (a)
+    1
+    2
+    2
+    CREATE TABLE "t t" ("a a")
+    CREATE INDEX idx ON "t t" ("a a")
+    2
+    CREATE TABLE "t t" ("b b")
+    CREATE INDEX idx ON "t t" ("b b")
+    2
+}
+
+# https://github.com/tursodatabase/turso/issues/3391
+test alter-table-add-notnull-col {
+    CREATE TABLE t (a);
+    ALTER TABLE t ADD b NOT NULL;
+    SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 't';
+}
+expect {
+    CREATE TABLE t (a, b NOT NULL)
+}
+
+# https://github.com/tursodatabase/turso/issues/3448
+test drop-column-regression {
+    CREATE TABLE t (id, col1 BLOB, col2 UNIQUE);
+    INSERT INTO t VALUES ('id', 'col1', 'col2');
+    ALTER TABLE t ADD COLUMN col3 BLOB;
+    ALTER TABLE t DROP COLUMN col1;
+    SELECT col3 FROM t;
+}
+expect {
+}
+
+# https://github.com/tursodatabase/turso/issues/3886
+test alter-tbl-rregression {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE p_ren1(id INTEGER PRIMARY KEY);
+    CREATE TABLE c_ren1(id INTEGER PRIMARY KEY, pid INTEGER,
+    FOREIGN KEY(pid) REFERENCES p_ren1(id)
+    );
+    INSERT INTO p_ren1 VALUES (1);
+    INSERT INTO c_ren1 VALUES (10,1);
+    ALTER TABLE p_ren1 RENAME TO p_ren1_new;
+    INSERT INTO p_ren1_new VALUES (2);
+    INSERT INTO c_ren1 VALUES (20,2);
+    SELECT c_ren1.id, c_ren1.pid
+    FROM c_ren1 JOIN p_ren1_new ON p_ren1_new.id = c_ren1.pid
+    ORDER BY c_ren1.id;
+}
+expect {
+    10|1
+    20|2
+}
+
