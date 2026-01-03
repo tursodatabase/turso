@@ -587,16 +587,7 @@ pub fn begin_write_btree_page(pager: &Pager, page: &PageRef) -> Result<Completio
     let page_id = page.get().id;
     tracing::trace!("begin_write_btree_page(page_id={})", page_id);
 
-    // Copy the page data to a new buffer for the async write
-    let buffer = {
-        let contents = page.get_contents();
-        let src = contents.as_ptr();
-        let write_buf = pager.buffer_pool.get_page();
-        let dst = write_buf.as_mut_slice();
-        dst[..src.len()].copy_from_slice(src);
-        dst[src.len()..].fill(0);
-        Arc::new(write_buf)
-    };
+    let buffer = page.get().buffer.clone().expect("buffer not loaded");
     let buf_len = buffer.len();
 
     let write_complete = {
