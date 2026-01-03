@@ -903,7 +903,10 @@ fn build_materialized_build_input_plan(
         query_destination: QueryDestination::EphemeralTable {
             cursor_id,
             table,
-            rowid_mode: EphemeralRowidMode::Auto,
+            rowid_mode: match mode {
+                MaterializedBuildInputMode::RowidOnly => EphemeralRowidMode::FromResultColumns,
+                MaterializedBuildInputMode::KeyPayload { .. } => EphemeralRowidMode::Auto,
+            },
         },
         distinctness: Distinctness::NonDistinct,
         values: vec![],
