@@ -755,25 +755,13 @@ impl Value {
                 Value::Float(v) => Self::Float(*v),
                 _ => {
                     let s = match self {
-                        Value::Text(text) => text.to_string(),
-                        Value::Blob(blob) => String::from_utf8_lossy(blob.as_slice()).to_string(),
+                        Value::Text(text) => text.as_str().into(),
+                        Value::Blob(blob) => String::from_utf8_lossy(blob.as_slice()),
                         _ => unreachable!(),
                     };
-
-                    match crate::numeric::str_to_f64(&s) {
-                        Some(parsed) => {
-                            let Some(int) = crate::numeric::str_to_i64(&s) else {
-                                return Value::Integer(0);
-                            };
-
-                            if f64::from(parsed) == int as f64 {
-                                return Value::Integer(int);
-                            }
-
-                            Value::Float(parsed.into())
-                        }
-                        None => Value::Integer(0),
-                    }
+                    crate::util::checked_cast_text_to_numeric(&s, false)
+                        .ok()
+                        .unwrap_or(Value::Integer(0))
                 }
             },
         }
