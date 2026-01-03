@@ -2,7 +2,7 @@
 
 # Paths
 ROOT_DIR := $(shell cd .. && pwd)
-SQLITE := sqlite3
+SQLITE := $(ROOT_DIR)/.sqlite3/sqlite3
 
 # Use release mode in CI, debug mode locally
 ifdef CI
@@ -16,7 +16,7 @@ endif
 TURSODB := $(ROOT_DIR)/target/$(TARGET_DIR)/tursodb
 TEST_RUNNER := ./target/$(TARGET_DIR)/turso-test-runner
 
-.PHONY: all build build-tursodb build-runner check run test run-examples test-sqlite convert clean
+.PHONY: all build build-tursodb build-runner check run test run-examples install-sqlite test-sqlite convert clean
 
 # Build everything
 all: build
@@ -65,8 +65,12 @@ run-turso-tests: build
 run-examples: build
 	$(TEST_RUNNER) run examples --binary $(TURSODB)
 
+# Install SQLite binary
+install-sqlite:
+	$(ROOT_DIR)/scripts/install-sqlite3.sh
+
 # Run tests against SQLite
-test-sqlite: build-runner
+test-sqlite: build-runner install-sqlite
 	$(TEST_RUNNER) run tests --binary $(SQLITE)
 
 # Convert Tcl .test files to .sqltest format
