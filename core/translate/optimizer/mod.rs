@@ -424,46 +424,60 @@ fn optimize_table_access_with_custom_modules(
             if name.name.as_str() != table.table.get_name() {
                 continue;
             }
-            if order_by.len() != pattern.order_by.len() {
+
+            // Track whether the pattern handles ORDER BY/LIMIT
+            let pattern_has_order_by = !pattern.order_by.is_empty();
+            let pattern_has_limit = pattern.limit.is_some();
+
+            // If pattern has ORDER BY, it must match exactly
+            // If pattern has no ORDER BY, we allow the query to have ORDER BY (handled separately)
+            if pattern_has_order_by && order_by.len() != pattern.order_by.len() {
                 continue;
             }
 
             let mut where_query_covered = None;
             let mut parameters = HashMap::new();
 
-            for (pattern_column, (query_column, query_order)) in
-                pattern.order_by.iter().zip(order_by.iter())
-            {
-                if *query_order != pattern_column.order.unwrap_or(SortOrder::Asc) {
-                    continue 'pattern;
+            // Only match ORDER BY if pattern has it
+            if pattern_has_order_by {
+                for (pattern_column, (query_column, query_order)) in
+                    pattern.order_by.iter().zip(order_by.iter())
+                {
+                    if *query_order != pattern_column.order.unwrap_or(SortOrder::Asc) {
+                        continue 'pattern;
+                    }
+                    let Some(captured) = try_capture_parameters(&pattern_column.expr, query_column)
+                    else {
+                        continue 'pattern;
+                    };
+                    parameters.extend(captured);
                 }
-                let Some(captured) = try_capture_parameters(&pattern_column.expr, query_column)
-                else {
-                    continue 'pattern;
-                };
-                parameters.extend(captured);
             }
+
+            // If pattern has LIMIT, it must match; if not, allow query to have LIMIT (handled separately)
             match (pattern.limit.as_ref().map(|x| &x.expr), &limit) {
-                (None, Some(_)) | (Some(_), None) => continue,
+                (Some(_), None) => continue, // pattern expects LIMIT but query has none
                 (Some(pattern_limit), Some(query_limit)) => {
                     let Some(captured) = try_capture_parameters(pattern_limit, query_limit) else {
                         continue 'pattern;
                     };
                     parameters.extend(captured);
                 }
+                (None, Some(_)) => {} // pattern has no LIMIT, query does - allow it, handled separately
                 (None, None) => {}
             }
             match (
                 pattern.limit.as_ref().and_then(|x| x.offset.as_ref()),
                 &offset,
             ) {
-                (None, Some(_)) | (Some(_), None) => continue,
+                (Some(_), None) => continue, // pattern expects OFFSET but query has none
                 (Some(pattern_off), Some(query_off)) => {
                     let Some(captured) = try_capture_parameters(pattern_off, query_off) else {
                         continue 'pattern;
                     };
                     parameters.extend(captured);
                 }
+                (None, Some(_)) => {} // pattern has no OFFSET, query does - allow it
                 (None, None) => {}
             }
             if let Some(pattern_where) = where_clause {
@@ -485,10 +499,14 @@ fn optimize_table_access_with_custom_modules(
             let where_covered_completely =
                 where_query.is_empty() || where_query_covered.is_some() && where_query.len() == 1;
 
-            if !where_covered_completely
-                && (!order_by.is_empty() || limit.is_some() || offset.is_some())
-            {
-                continue;
+            // When WHERE is not completely covered (partial coverage), we need post-filtering.
+            // In this case, skip patterns that have ORDER BY or LIMIT because:
+            // - Pattern's ORDER BY may be disrupted by post-filtering
+            // - Pattern's LIMIT would limit results BEFORE post-filtering (wrong!)
+            // Instead, fall through to patterns without ORDER BY/LIMIT so post-filtering
+            // happens first, then the regular query executor handles ORDER BY/LIMIT.
+            if !where_covered_completely && (pattern_has_order_by || pattern_has_limit) {
+                continue 'pattern;
             }
 
             if let Some(where_covered) = where_query_covered {
@@ -519,9 +537,18 @@ fn optimize_table_access_with_custom_modules(
                     covered_column_id += 1;
                 }
             }
-            let _ = order_by.drain(..);
-            let _ = limit.take();
-            let _ = offset.take();
+
+            // Only clear ORDER BY/LIMIT/OFFSET if:
+            // 1. The pattern explicitly handles them (has ORDER BY/LIMIT), AND
+            // 2. WHERE is completely covered (no post-filtering needed)
+            // Otherwise, keep them so they're applied after post-filtering
+            if pattern_has_order_by && where_covered_completely {
+                let _ = order_by.drain(..);
+            }
+            if pattern_has_limit && where_covered_completely {
+                let _ = limit.take();
+                let _ = offset.take();
+            }
             let mut arguments = parameters.iter().collect::<Vec<_>>();
             arguments.sort_by_key(|(&i, _)| i);
 
