@@ -848,12 +848,10 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             }
                         }
                         turso::Error::DatabaseFull(e) => {
-                            eprintln!("Database full, stopping thread: {e}");
-                            break;
+                            eprintln!("Database full: {e}");
                         }
-                        turso::Error::IoError(std::io::ErrorKind::StorageFull) => {
-                            eprintln!("No storage space, stopping thread");
-                            break;
+                        turso::Error::IoError(kind) => {
+                            eprintln!("I/O error ({kind:?}), continuing...");
                         }
                         _ => panic!("Error[FATAL] executing query: {}", e),
                     }
