@@ -211,6 +211,28 @@ impl Connection {
         Ok(Statement::new(program, pager, mode))
     }
 
+    /// Prepare a statement from an AST node directly, skipping SQL parsing.
+    /// This is more efficient when AST is already available or constructed programmatically.
+    pub fn prepare_stmt(self: &Arc<Connection>, stmt: ast::Stmt) -> Result<Statement> {
+        if self.is_closed() {
+            return Err(LimboError::InternalError("Connection closed".to_string()));
+        }
+        self.maybe_update_schema();
+        let syms = self.syms.read();
+        let pager = self.pager.load().clone();
+        let mode = QueryMode::Normal;
+        let program = translate::translate(
+            self.schema.read().deref(),
+            stmt,
+            pager.clone(),
+            self.clone(),
+            &syms,
+            mode,
+            "<ast>", // No SQL input string available
+        )?;
+        Ok(Statement::new(program, pager, mode))
+    }
+
     /// Whether this is an internal connection used for MVCC bootstrap
     pub fn is_mvcc_bootstrap_connection(&self) -> bool {
         self.is_mvcc_bootstrap_connection.load(Ordering::SeqCst)
