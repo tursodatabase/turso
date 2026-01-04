@@ -99,6 +99,7 @@ pub fn translate_create_table(
         && RESERVED_TABLE_PREFIXES
             .iter()
             .any(|prefix| normalized_tbl_name.starts_with(prefix))
+        && !connection.is_nested_stmt()
     {
         bail_parse_error!(
             "Object name reserved for internal use: {}",
