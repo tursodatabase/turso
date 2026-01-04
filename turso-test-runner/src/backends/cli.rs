@@ -96,23 +96,33 @@ impl CliDatabaseInstance {
     async fn run_sql(&self, sql: &str) -> Result<QueryResult, BackendError> {
         let mut cmd = Command::new(&self.binary_path);
 
+        let file_name = self
+            .binary_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| {
+                BackendError::Execute(format!("binary path does not contain a file name"))
+            })?;
+        let is_sqlite = file_name.starts_with("sqlite");
+        let is_turso_cli = file_name.starts_with("tursodb") || file_name.starts_with("turso");
+
         // Set working directory if specified
         if let Some(dir) = &self.working_dir {
             cmd.current_dir(dir);
         }
 
-        // Build command arguments
-        cmd.arg(&self.db_path);
+        if is_sqlite {
+            cmd.arg(format!("file:{}?immutable=1", self.db_path));
+        }
 
         // Only add -q flag for tursodb/turso (not sqlite3 or other CLIs)
-        if let Some(name) = self.binary_path.file_name().and_then(|n| n.to_str()) {
-            if name.starts_with("tursodb") || name.starts_with("turso") {
-                cmd.arg("-q"); // Quiet mode - suppress banner
-                cmd.arg("-m").arg("list"); // List mode for pipe-separated output
-                cmd.arg("--experimental-views");
-                cmd.arg("--experimental-strict");
-                cmd.arg("--experimental-triggers");
-            }
+        if is_turso_cli {
+            cmd.arg(&self.db_path);
+            cmd.arg("-q"); // Quiet mode - suppress banner
+            cmd.arg("-m").arg("list"); // List mode for pipe-separated output
+            cmd.arg("--experimental-views");
+            cmd.arg("--experimental-strict");
+            cmd.arg("--experimental-triggers");
         }
 
         if self.readonly {
