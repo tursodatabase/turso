@@ -48,7 +48,7 @@ impl Parser {
                     }
                     setups.insert(name, sql);
                 }
-                Some(Token::AtSetup | Token::AtSkip | Token::Test) => {
+                Some(Token::AtSetup | Token::AtSkip | Token::AtBackend | Token::Test) => {
                     tests.push(self.parse_test()?);
                 }
                 Some(token) => {
@@ -136,6 +136,7 @@ impl Parser {
     fn parse_test(&mut self) -> Result<TestCase, ParseError> {
         let mut test_setups = Vec::new();
         let mut skip = None;
+        let mut backend = None;
 
         // Parse decorators
         loop {
@@ -153,6 +154,11 @@ impl Parser {
                 Some(Token::AtSkip) => {
                     self.advance();
                     skip = Some(self.expect_string()?);
+                    self.skip_newlines_and_comments();
+                }
+                Some(Token::AtBackend) => {
+                    self.advance();
+                    backend = Some(self.expect_identifier()?);
                     self.skip_newlines_and_comments();
                 }
                 _ => break,
@@ -178,6 +184,7 @@ impl Parser {
             expectation,
             setups: test_setups,
             skip,
+            backend,
         })
     }
 

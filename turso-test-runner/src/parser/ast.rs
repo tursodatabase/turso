@@ -38,6 +38,9 @@ pub struct TestCase {
     pub setups: Vec<SetupRef>,
     /// If set, skip this test with the given reason
     pub skip: Option<String>,
+    /// If set, only run this test on the specified backend(s)
+    /// Valid values: "rust", "cli"
+    pub backend: Option<String>,
 }
 
 /// What we expect from executing the SQL
