@@ -1,0 +1,398 @@
+@database :memory:
+
+test alter-column-rename-and-type {
+    CREATE TABLE t (a INTEGER);
+    CREATE INDEX i ON t (a);
+    ALTER TABLE t ALTER COLUMN a TO b BLOB;
+    SELECT sql FROM sqlite_schema;
+}
+expect {
+    CREATE TABLE t (b BLOB)
+    CREATE INDEX i ON t (b)
+}
+
+test fail-alter-column-primary-key {
+    CREATE TABLE t (a);
+    ALTER TABLE t ALTER COLUMN a TO a PRIMARY KEY;
+}
+expect error {
+}
+
+test fail-alter-column-unique {
+    CREATE TABLE t (a);
+    ALTER TABLE t ALTER COLUMN a TO a UNIQUE;
+}
+expect error {
+}
+
+test alter-table-rename-pk-column {
+    CREATE TABLE customers (cust_id INTEGER PRIMARY KEY, cust_name TEXT);
+    INSERT INTO customers VALUES (1, 'Alice'), (2, 'Bob');
+
+    ALTER TABLE customers RENAME COLUMN cust_id TO customer_id;
+
+    SELECT sql FROM sqlite_schema WHERE name = 'customers';
+    SELECT customer_id, cust_name FROM customers ORDER BY customer_id;
+}
+expect {
+    CREATE TABLE customers (customer_id INTEGER PRIMARY KEY, cust_name TEXT)
+    1|Alice
+    2|Bob
+}
+
+test alter-table-rename-composite-pk {
+    CREATE TABLE products (category TEXT, prod_code TEXT, name TEXT, PRIMARY KEY (category, prod_code));
+    INSERT INTO products VALUES ('Electronics', 'E001', 'Laptop');
+
+    ALTER TABLE products RENAME COLUMN prod_code TO product_code;
+
+    SELECT sql FROM sqlite_schema WHERE name = 'products';
+    SELECT category, product_code, name FROM products;
+}
+expect {
+    CREATE TABLE products (category TEXT, product_code TEXT, name TEXT, PRIMARY KEY (category, product_code))
+    Electronics|E001|Laptop
+}
+
+# Foreign key child column rename
+test alter-table-rename-fk-child {
+    CREATE TABLE parent (id INTEGER PRIMARY KEY);
+    CREATE TABLE child (cid INTEGER PRIMARY KEY, pid INTEGER, FOREIGN KEY (pid) REFERENCES parent(id));
+    INSERT INTO parent VALUES (1);
+    INSERT INTO child VALUES (1, 1);
+
+    ALTER TABLE child RENAME COLUMN pid TO parent_id;
+
+    SELECT sql FROM sqlite_schema WHERE name = 'child';
+}
+expect {
+    CREATE TABLE child (cid INTEGER PRIMARY KEY, parent_id INTEGER, FOREIGN KEY (parent_id) REFERENCES parent (id))
+}
+
+# Foreign key parent column rename - critical test
+test alter-table-rename-fk-parent {
+    CREATE TABLE orders (order_id INTEGER PRIMARY KEY, date TEXT);
+    CREATE TABLE items (item_id INTEGER PRIMARY KEY, oid INTEGER, FOREIGN KEY (oid) REFERENCES orders(order_id));
+
+    ALTER TABLE orders RENAME COLUMN order_id TO ord_id;
+
+    SELECT sql FROM sqlite_schema WHERE name = 'orders';
+    SELECT sql FROM sqlite_schema WHERE name = 'items';
+}
+expect {
+    CREATE TABLE orders (ord_id INTEGER PRIMARY KEY, date TEXT)
+    CREATE TABLE items (item_id INTEGER PRIMARY KEY, oid INTEGER, FOREIGN KEY (oid) REFERENCES orders (ord_id))
+}
+
+# Composite foreign key parent rename
+test alter-table-rename-composite-fk-parent {
+    CREATE TABLE products (cat TEXT, code TEXT, PRIMARY KEY (cat, code));
+    CREATE TABLE inventory (id INTEGER PRIMARY KEY, cat TEXT, code TEXT, FOREIGN KEY (cat, code) REFERENCES products(cat, code));
+
+    ALTER TABLE products RENAME COLUMN code TO sku;
+
+    SELECT sql FROM sqlite_schema WHERE name = 'products';
+    SELECT sql FROM sqlite_schema WHERE name = 'inventory';
+}
+expect {
+    CREATE TABLE products (cat TEXT, sku TEXT, PRIMARY KEY (cat, sku))
+    CREATE TABLE inventory (id INTEGER PRIMARY KEY, cat TEXT, code TEXT, FOREIGN KEY (cat, code) REFERENCES products (cat, sku))
+}
+
+# Multiple foreign keys to same parent
+test alter-table-rename-multiple-fks {
+    CREATE TABLE users (uid INTEGER PRIMARY KEY);
+    CREATE TABLE messages (mid INTEGER PRIMARY KEY, sender INTEGER, receiver INTEGER,
+                            FOREIGN KEY (sender) REFERENCES users(uid),
+                            FOREIGN KEY (receiver) REFERENCES users(uid));
+
+    ALTER TABLE users RENAME COLUMN uid TO user_id;
+
+    SELECT sql FROM sqlite_schema WHERE name = 'messages';
+}
+expect {
+    CREATE TABLE messages (mid INTEGER PRIMARY KEY, sender INTEGER, receiver INTEGER, FOREIGN KEY (sender) REFERENCES users (user_id), FOREIGN KEY (receiver) REFERENCES users (user_id))
+}
+
+# Self-referencing foreign key
+test alter-table-rename-self-ref-fk {
+    CREATE TABLE employees (emp_id INTEGER PRIMARY KEY, manager_id INTEGER,
+                            FOREIGN KEY (manager_id) REFERENCES employees(emp_id));
+
+    ALTER TABLE employees RENAME COLUMN emp_id TO employee_id;
+
+    SELECT sql FROM sqlite_schema WHERE name = 'employees';
+}
+expect {
+    CREATE TABLE employees (employee_id INTEGER PRIMARY KEY, manager_id INTEGER, FOREIGN KEY (manager_id) REFERENCES employees (employee_id))
+}
+
+# Chain of FK renames - parent is both PK and referenced
+test alter-table-rename-fk-chain {
+    CREATE TABLE t1 (a INTEGER PRIMARY KEY);
+    CREATE TABLE t2 (b INTEGER PRIMARY KEY, a_ref INTEGER, FOREIGN KEY (a_ref) REFERENCES t1(a));
+    CREATE TABLE t3 (c INTEGER PRIMARY KEY, b_ref INTEGER, FOREIGN KEY (b_ref) REFERENCES t2(b));
+
+    ALTER TABLE t1 RENAME COLUMN a TO a_new;
+    ALTER TABLE t2 RENAME COLUMN b TO b_new;
+
+    SELECT sql FROM sqlite_schema WHERE name = 't2';
+    SELECT sql FROM sqlite_schema WHERE name = 't3';
+}
+expect {
+    CREATE TABLE t2 (b_new INTEGER PRIMARY KEY, a_ref INTEGER, FOREIGN KEY (a_ref) REFERENCES t1 (a_new))
+    CREATE TABLE t3 (c INTEGER PRIMARY KEY, b_ref INTEGER, FOREIGN KEY (b_ref) REFERENCES t2 (b_new))
+}
+
+# FK with ON DELETE/UPDATE actions
+test alter-table-rename-fk-actions {
+    CREATE TABLE parent (pid INTEGER PRIMARY KEY);
+    CREATE TABLE child (cid INTEGER PRIMARY KEY, pid INTEGER,
+                        FOREIGN KEY (pid) REFERENCES parent(pid) ON DELETE CASCADE ON UPDATE RESTRICT);
+
+    ALTER TABLE parent RENAME COLUMN pid TO parent_id;
+
+    SELECT sql FROM sqlite_schema WHERE name = 'child';
+}
+expect {
+    CREATE TABLE child (cid INTEGER PRIMARY KEY, pid INTEGER, FOREIGN KEY (pid) REFERENCES parent (parent_id) ON DELETE CASCADE ON UPDATE RESTRICT)
+}
+
+# FK with DEFERRABLE
+test alter-table-rename-fk-deferrable {
+    CREATE TABLE parent (id INTEGER PRIMARY KEY);
+    CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER,
+                        FOREIGN KEY (pid) REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED);
+
+    ALTER TABLE parent RENAME COLUMN id TO parent_id;
+
+    SELECT sql FROM sqlite_schema WHERE name = 'child';
+}
+expect {
+    CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER, FOREIGN KEY (pid) REFERENCES parent (parent_id) DEFERRABLE INITIALLY DEFERRED)
+}
+
+# Rename with quoted identifiers in FK
+test alter-table-rename-fk-quoted {
+    CREATE TABLE "parent table" ("parent id" INTEGER PRIMARY KEY);
+    CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER,
+                        FOREIGN KEY (pid) REFERENCES "parent table"("parent id"));
+
+    ALTER TABLE "parent table" RENAME COLUMN "parent id" TO "new id";
+
+    SELECT sql FROM sqlite_schema WHERE name = 'child';
+}
+expect {
+    CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER, FOREIGN KEY (pid) REFERENCES "parent table" ("new id"))
+}
+
+# Verify FK constraint still works after rename
+test alter-table-fk-constraint-after-rename {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE parent (id INTEGER PRIMARY KEY);
+    CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER, FOREIGN KEY (pid) REFERENCES parent(id));
+    INSERT INTO parent VALUES (1);
+    INSERT INTO child VALUES (1, 1);
+
+    ALTER TABLE parent RENAME COLUMN id TO parent_id;
+
+    -- This should work
+    INSERT INTO child VALUES (2, 1);
+    SELECT COUNT(*) FROM child;
+}
+expect {
+    2
+}
+
+# FK constraint violation after rename should still fail
+test alter-table-fk-violation-after-rename {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE parent (id INTEGER PRIMARY KEY);
+    CREATE TABLE child (id INTEGER PRIMARY KEY, pid INTEGER, FOREIGN KEY (pid) REFERENCES parent(id));
+    INSERT INTO parent VALUES (1);
+
+    ALTER TABLE parent RENAME COLUMN id TO parent_id;
+
+    -- This should fail with FK violation
+    INSERT INTO child VALUES (1, 999);
+}
+expect error {
+}
+
+# Complex scenario with multiple table constraints
+test alter-table-rename-complex-constraints {
+    CREATE TABLE t (
+        a INTEGER,
+        b TEXT,
+        c REAL,
+        PRIMARY KEY (a, b),
+        UNIQUE (b, c),
+        FOREIGN KEY (a) REFERENCES t(a)
+    );
+
+    ALTER TABLE t RENAME COLUMN a TO x;
+    ALTER TABLE t RENAME COLUMN b TO y;
+
+    SELECT sql FROM sqlite_schema WHERE name = 't';
+}
+expect {
+    CREATE TABLE t (x INTEGER, y TEXT, c REAL, PRIMARY KEY (x, y), UNIQUE (y, c), FOREIGN KEY (x) REFERENCES t (x))
+}
+
+# Rename column that appears in both PK and FK
+test alter-table-rename-pk-and-fk {
+    CREATE TABLE parent (id INTEGER PRIMARY KEY);
+    CREATE TABLE child (
+        id INTEGER PRIMARY KEY,
+        parent_ref INTEGER,
+        FOREIGN KEY (id) REFERENCES parent(id),
+        FOREIGN KEY (parent_ref) REFERENCES parent(id)
+        );
+
+    ALTER TABLE parent RENAME COLUMN id TO pid;
+
+    SELECT sql FROM sqlite_schema WHERE name = 'child';
+}
+expect {
+    CREATE TABLE child (id INTEGER PRIMARY KEY, parent_ref INTEGER, FOREIGN KEY (id) REFERENCES parent (pid), FOREIGN KEY (parent_ref) REFERENCES parent (pid))
+}
+
+test rename-self-1 {
+    PRAGMA foreign_keys = ON;
+    CREATE TABLE s1(id INTEGER PRIMARY KEY, parent INTEGER,
+        FOREIGN KEY(parent) REFERENCES s1(id));
+    INSERT INTO s1 VALUES (1,NULL);
+    INSERT INTO s1 VALUES (2,1);
+    ALTER TABLE s1 RENAME TO s1_new;
+    SELECT name, tbl_name, sql LIKE '%REFERENCES s1_new%' FROM sqlite_schema WHERE type='table' AND name='s1_new';
+}
+expect {
+    s1_new|s1_new|1
+}
+
+test rename-self-2-composite {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE sc(id INTEGER, vr INTEGER, parent_id INTEGER, parent_vr INTEGER,
+        PRIMARY KEY(id,vr),
+        FOREIGN KEY(parent_id, parent_vr) REFERENCES sc(id,vr));
+    INSERT INTO sc VALUES(1,1,NULL,NULL);
+    INSERT INTO sc VALUES(2,1,1,1);
+    
+    ALTER TABLE sc RENAME TO sc_new;
+    
+    SELECT sql FROM sqlite_schema WHERE type='table' AND name='sc_new';
+}
+expect {
+    CREATE TABLE sc_new (id INTEGER, vr INTEGER, parent_id INTEGER, parent_vr INTEGER, PRIMARY KEY (id, vr), FOREIGN KEY (parent_id, parent_vr) REFERENCES sc_new (id, vr))
+}
+
+test rename-parent-1 {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p(id INTEGER PRIMARY KEY);
+    CREATE TABLE c(id INTEGER PRIMARY KEY, pid INTEGER,
+        FOREIGN KEY(pid) REFERENCES p(id));
+    INSERT INTO p VALUES(1);
+    INSERT INTO c VALUES(10,1);
+    
+    ALTER TABLE p RENAME TO p_new;
+    INSERT INTO p_new VALUES(2);
+    INSERT INTO c VALUES(20,2);
+    SELECT c.id, c.pid FROM c JOIN p_new ON p_new.id=c.pid ORDER BY c.id;
+}
+expect {
+    10|1
+    20|2
+}
+
+test rename-parent-2-inline {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p2(id INTEGER PRIMARY KEY);
+    CREATE TABLE c2(id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p2(id));
+    ALTER TABLE p2 RENAME TO p2_new;
+    -- child create SQL must have p2_new
+    SELECT sql FROM sqlite_schema WHERE type='table' AND name='c2';
+}
+expect {
+    CREATE TABLE c2 (id INTEGER PRIMARY KEY, pid INTEGER REFERENCES p2_new (id))
+}
+
+test rename-parent-3-composite {
+    PRAGMA foreign_keys=ON;
+    CREATE TABLE p3(a INTEGER, b INTEGER, PRIMARY KEY(a,b));
+    CREATE TABLE c3(x INTEGER PRIMARY KEY, fa INTEGER, fb INTEGER,
+        FOREIGN KEY(fa,fb) REFERENCES p3(a,b));
+    INSERT INTO p3 VALUES(1,1);
+    INSERT INTO c3 VALUES(1,1,1);
+    
+    ALTER TABLE p3 RENAME TO p3_new;
+    SELECT sql  FROM sqlite_schema WHERE type='table' AND name='c3';
+}
+expect {
+    CREATE TABLE c3 (x INTEGER PRIMARY KEY, fa INTEGER, fb INTEGER, FOREIGN KEY (fa, fb) REFERENCES p3_new (a, b))
+}
+
+# Adding a generated column via ALTER TABLE should error
+test alter-table-add-generated-column-error {
+    CREATE TABLE t(a);
+    ALTER TABLE t ADD COLUMN b AS (NULL);
+}
+expect error {
+    Parse error: Alter table does not support adding generated columns
+}
+
+test alter-column-only-to-generated-error {
+    CREATE TABLE t(a);
+    ALTER TABLE t ALTER COLUMN a TO b AS (123);
+}
+expect error {
+    Parse error: must have at least one non-generated column
+}
+
+test alter-column-all-to-generated-error {
+    CREATE TABLE t(a, b);
+    ALTER TABLE t ALTER COLUMN a TO c AS (123);
+    ALTER TABLE t ALTER COLUMN b TO d AS (123);
+}
+expect error {
+    Parse error: must have at least one non-generated column
+}
+
+test alter-column-to-generated-with-other-columns {
+    CREATE TABLE t(a, b);
+    ALTER TABLE t ALTER COLUMN a TO c AS (123);
+    SELECT sql FROM sqlite_schema WHERE name = 't';
+}
+expect {
+    CREATE TABLE t (c AS (123), b)
+}
+
+# Add column with a foreign key reference and verify schema SQL
+test alter-table-add-column-with-fk-updates-schema {
+    CREATE TABLE t(a);
+    CREATE TABLE s(a);
+    ALTER TABLE s ADD COLUMN b REFERENCES t(a);
+    SELECT sql FROM sqlite_schema WHERE name = 's';
+}
+expect {
+    CREATE TABLE s (a, b, FOREIGN KEY (b) REFERENCES t(a))
+}
+
+test alter-table-add-self-ref-fk-updates-schema {
+    CREATE TABLE s(a);
+    ALTER TABLE s ADD COLUMN b REFERENCES s(a);
+    SELECT sql FROM sqlite_schema WHERE name = 's';
+}
+expect {
+    CREATE TABLE s (a, b, FOREIGN KEY (b) REFERENCES s(a))
+}
+
+test alter-table-add-column-with-composite-fk-updates-schema {
+    CREATE TABLE t(a, c);
+    CREATE TABLE s(a);
+    ALTER TABLE s ADD COLUMN b REFERENCES t(a, c);
+    SELECT sql FROM sqlite_schema WHERE name = 's';
+}
+expect {
+    CREATE TABLE s (a, b, FOREIGN KEY (b) REFERENCES t(a, c))
+}
+

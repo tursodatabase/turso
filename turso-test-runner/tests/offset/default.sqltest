@@ -1,0 +1,65 @@
+@database database/testing.db readonly
+@database database/testing_norowidalias.db readonly
+
+#!/usr/bin/env tclsh
+test select-offset-0 {
+    SELECT id FROM users ORDER BY id LIMIT 1 OFFSET 0;
+}
+expect {
+    1
+}
+
+test select-offset-1 {
+    SELECT id FROM users ORDER BY id LIMIT 1 OFFSET 1;
+}
+expect {
+    2
+}
+
+test select-offset-negative {
+    SELECT id FROM users ORDER BY id LIMIT 1 OFFSET -1;
+}
+expect {
+    1
+}
+
+test select-offset-0-groupby {
+    SELECT COUNT(*) FROM users GROUP BY STATE ORDER BY STATE LIMIT 5 OFFSET 0;
+}
+expect {
+    168
+    166
+    162
+    153
+    166
+}
+
+test select-offset-1-groupby {
+    SELECT COUNT(*) FROM users GROUP BY STATE ORDER BY STATE LIMIT 5 OFFSET 1;
+}
+expect {
+    166
+    162
+    153
+    166
+    170
+}
+
+test select-offset-subquery {
+    SELECT id, first_name, age
+    FROM (
+    SELECT id, first_name, age
+    FROM users
+    ORDER BY id ASC
+    LIMIT 5 OFFSET 2
+    )
+    ORDER BY id DESC;
+}
+expect {
+    7|Aimee|24
+    6|Nicholas|89
+    5|Edward|15
+    4|Jennifer|33
+    3|Tommy|18
+}
+

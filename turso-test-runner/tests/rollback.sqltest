@@ -1,0 +1,192 @@
+@database :memory:
+
+#!/usr/bin/env tclsh
+test simple-rollback {
+    create table t (x);
+    insert into t values (1);
+    begin;
+    insert into t values (2);
+    rollback;
+    select * from t;
+}
+expect {
+    1
+}
+
+test simple-rollback-2 {
+    create table t (x);
+    begin;
+    insert into t values (1);
+    insert into t values (2);
+    rollback;
+    select * from t;
+}
+expect {
+}
+
+test rollback-after-update {
+    create table t (x);
+    insert into t values (1);
+    insert into t values (2);
+    begin;
+    update t set x = x + 10;
+    rollback;
+    select * from t;
+}
+expect {
+    1
+    2
+}
+
+test rollback-after-delete {
+    create table t (x);
+    insert into t values (1);
+    insert into t values (2);
+    insert into t values (3);
+    begin;
+    delete from t where x = 2;
+    rollback;
+    select * from t order by x;
+}
+expect {
+    1
+    2
+    3
+}
+
+test rollback-mixed-operations {
+    create table t (x);
+    insert into t values (1);
+    insert into t values (2);
+    begin;
+    insert into t values (3);
+    update t set x = x + 10 where x = 1;
+    delete from t where x = 2;
+    rollback;
+    select * from t order by x;
+}
+expect {
+    1
+    2
+}
+
+# The point of this test was to test we drop dirty pages after rollback by inserting into another table so that
+# pages used are different.
+test insert-after-rollback {
+    create table t (x);
+    create table t2 (x);
+    insert into t values (1);
+    insert into t values (2);
+    begin;
+    insert into t values (3);
+    update t set x = x + 10 where x = 1;
+    delete from t where x = 2;
+    rollback;
+    insert into t2 values (1);
+    select * from t2 order by x;
+}
+expect {
+    1
+}
+
+test schema-change-rollback {
+    begin;
+    create table t (x);
+    insert into t values (1);
+    rollback;
+    PRAGMA integrity_check;
+}
+expect {
+    ok
+}
+
+test schema-change-rollback-version {
+    begin;
+    create table t (x);
+    insert into t values (1);
+    rollback;
+    PRAGMA schema_version;
+}
+expect {
+    0
+}
+
+test schema-version-after-update {
+    create table t (x);
+    PRAGMA schema_version;
+}
+expect {
+    1
+}
+
+test schema-change-rollback-2 {
+    begin;
+    create table t (x);
+    rollback;
+    select tbl_name from sqlite_schema;
+}
+expect {
+}
+
+test schema-change-rollback-2-2 {
+    create table before (x);
+    begin;
+    create table t (x);
+    rollback;
+    create table after (x);
+    select tbl_name from sqlite_schema;
+}
+expect {
+    before
+    after
+}
+
+test schema-alter-rollback {
+    create table t (x);
+    begin;
+    alter table t add column y;
+    rollback;
+    select sql from sqlite_schema;
+}
+expect {
+    CREATE TABLE t (x)
+}
+
+test schema-alter-rollback-and-repeat {
+    create table t (x);
+    begin;
+    alter table t add column y;
+    rollback;
+    alter table t add column y;
+    select sql from sqlite_schema;
+}
+expect {
+    CREATE TABLE t (x, y)
+}
+
+test schema-create-index-rollback {
+    create table t (x);
+    begin;
+    create index i on t(x);
+    rollback;
+    select sql from sqlite_schema;
+}
+expect {
+    CREATE TABLE t (x)
+}
+
+test schema-drop-table-rollback {
+    create table t (x);
+    begin;
+    drop table t;
+    rollback;
+    select sql from sqlite_schema;
+}
+expect {
+    CREATE TABLE t (x)
+}
+
+# TODO: add tests for:
+# * create virtual table
+# * drop index
+# * views...

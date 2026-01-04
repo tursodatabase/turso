@@ -1,0 +1,140 @@
+@database :memory:
+
+test changes-on-basic-insert {
+    create table temp (t1 integer, primary key (t1));
+    insert into temp values (1);
+    select changes();
+}
+expect {
+    1
+}
+
+test changes-on-multiple-row-insert {
+    create table temp (t1 integer, primary key (t1));
+    insert into temp values (1), (2), (3);
+    select changes();
+}
+expect {
+    3
+}
+
+test changes-shows-most-recent {
+    create table temp (t1 integer, primary key (t1));
+    insert into temp values (1), (2), (3);
+    insert into temp values (4), (5), (6), (7);
+    select changes();
+}
+expect {
+    4
+}
+
+# github.com/tursodatabase/turso/issues/3259
+test changes-doesnt-track-indexes {
+    create table users (id integer primary key, name text, age integer);
+    create index idx_name on users(name);
+    create unique index idx_name_age on users(name, age);
+    insert into users (name, age) values ('Alice', 30),('Mike', 33),('Jim', 22),('Sarah', 44),('Rosa', 11),('Cindy', 36),('Bob', 35),('Charlie', 50);
+    UPDATE users SET name = 'young' where age < 40;
+    select changes();
+}
+expect {
+    6
+}
+
+# https://github.com/tursodatabase/turso/issues/3688
+test changes-1_69 {
+    create table t(id integer primary key, value text);
+    insert into t values (1, 'a');
+    select changes();
+    update t set id = id+10 where id = 1;
+    select changes();
+}
+expect {
+    1
+    1
+}
+
+test changes-on-delete {
+    create table temp (t1 integer, primary key (t1));
+    insert into temp values (1), (2), (3), (4), (5);
+    delete from temp where t1 > 2;
+    select changes();
+}
+expect {
+    3
+}
+
+test changes-on-update {
+    create table temp (t1 integer, t2 text, primary key (t1));
+    insert into temp values (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd');
+    update temp set t2 = 'updated' where t1 <= 3;
+    select changes();
+}
+expect {
+    3
+}
+
+test changes-on-update-rowid {
+    create table temp (t1 integer primary key, t2 text);
+    insert into temp values (1, 'a'), (2, 'b'), (3, 'c');
+    update temp set t1 = t1 + 10 where t1 = 2;
+    select changes();
+}
+expect {
+    1
+}
+
+test changes-resets-after-select {
+    create table temp (t1 integer, primary key (t1));
+    insert into temp values (1), (2), (3);
+    select * from temp;
+    select changes();
+}
+expect {
+    1
+    2
+    3
+    3
+}
+
+test changes-on-delete-no-match {
+    create table temp (t1 integer, primary key (t1));
+    insert into temp values (1), (2), (3);
+    delete from temp where t1 > 100;
+    select changes();
+}
+expect {
+    0
+}
+
+test changes-on-update-no-match {
+    create table temp (t1 integer, t2 text, primary key (t1));
+    insert into temp values (1, 'a'), (2, 'b');
+    update temp set t2 = 'updated' where t1 > 100;
+    select changes();
+}
+expect {
+    0
+}
+
+test changes-on-delete-all {
+    create table temp (t1 integer, primary key (t1));
+    insert into temp values (1), (2), (3), (4), (5), (6);
+    delete from temp;
+    select changes();
+}
+expect {
+    6
+}
+
+test changes-mixed-operations {
+    create table temp (t1 integer, t2 text, primary key (t1));
+    insert into temp values (1, 'a'), (2, 'b'), (3, 'c');
+    update temp set t2 = 'updated' where t1 <= 2;
+    delete from temp where t1 = 1;
+    select changes();
+}
+expect {
+    1
+}
+

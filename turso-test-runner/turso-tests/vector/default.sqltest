@@ -1,0 +1,28 @@
+@database database/testing.db readonly
+@database database/testing_norowidalias.db readonly
+
+#!/usr/bin/env tclsh
+test vector-functions-valid {
+    SELECT vector_extract(vector('[]'));
+    SELECT vector_extract(vector('  [  1  ,  2  ,  3  ]  '));
+    SELECT vector_extract(vector('[-1000000000000000000]'));
+}
+expect {
+    []
+    [1,2,3]
+    [-1000000000000000000]
+}
+
+test vector-distance-dot {
+    SELECT vector_distance_dot(vector('[1, 2]'), vector('[3, 4]'));
+    SELECT vector_distance_dot(vector('[1, 0]'), vector('[0, 1]'));
+    SELECT vector_distance_dot(vector('[1, 1]'), vector('[-1, -1]'));
+    SELECT vector_distance_dot(vector('[0.5, 0.5]'), vector('[4.0, 4.0]'));
+}
+expect {
+    -11.0
+    0.0
+    2.0
+    -4.0
+}
+

@@ -1,6 +1,6 @@
 use super::{OutputFormat, outcome_symbol};
 use crate::runner::{FileResult, RunSummary, TestOutcome, TestResult};
-use colored::Colorize;
+use owo_colors::{OwoColorize, Style, Styled};
 use std::io::{self, Write};
 
 /// Pretty human-readable output
@@ -18,14 +18,16 @@ impl PrettyOutput {
         }
     }
 
-    fn outcome_colored(&self, outcome: &TestOutcome) -> colored::ColoredString {
+    fn outcome_colored(&self, outcome: &TestOutcome) -> Styled<&'static str> {
         let symbol = outcome_symbol(outcome);
-        match outcome {
-            TestOutcome::Passed => symbol.green(),
-            TestOutcome::Failed { .. } => symbol.red(),
-            TestOutcome::Skipped { .. } => symbol.yellow(),
-            TestOutcome::Error { .. } => symbol.red().bold(),
-        }
+        let style = Style::new();
+        let style = match outcome {
+            TestOutcome::Passed => style.green(),
+            TestOutcome::Failed { .. } => style.red(),
+            TestOutcome::Skipped { .. } => style.yellow(),
+            TestOutcome::Error { .. } => style.red().bold(),
+        };
+        style.style(symbol)
     }
 }
 
