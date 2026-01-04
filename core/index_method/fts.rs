@@ -153,18 +153,14 @@ impl BTreeDirectory {
 
     /// Get total length of file by summing all chunk sizes
     fn fetch_file_len(&self, path: &str) -> std::result::Result<usize, OpenReadError> {
-        let sql = format!(
-            "SELECT SUM(LENGTH(bytes)) FROM {} WHERE path = '{}'",
-            self.table_name,
-            path.replace('\'', "''")
-        );
-        let mut stmt = self
-            .connection
-            .prepare(&sql)
-            .map_err(|e| OpenReadError::IoError {
-                io_error: std::io::Error::other(e.to_string()).into(),
-                filepath: path.into(),
-            })?;
+        let stmt_ast = ast_builder::select_total_length_by_path(&self.table_name, path);
+        let mut stmt =
+            self.connection
+                .prepare_stmt(stmt_ast)
+                .map_err(|e| OpenReadError::IoError {
+                    io_error: std::io::Error::other(e.to_string()).into(),
+                    filepath: path.into(),
+                })?;
 
         stmt.program.needs_stmt_subtransactions = false;
         self.connection.start_nested();
@@ -211,18 +207,14 @@ impl BTreeDirectory {
 
     /// Check if any row exists for path
     fn exists_row_for_path(&self, path: &str) -> std::result::Result<bool, OpenReadError> {
-        let sql = format!(
-            "SELECT 1 FROM {} WHERE path = '{}' LIMIT 1",
-            self.table_name,
-            path.replace('\'', "''")
-        );
-        let mut stmt = self
-            .connection
-            .prepare(&sql)
-            .map_err(|e| OpenReadError::IoError {
-                io_error: std::io::Error::other(e.to_string()).into(),
-                filepath: path.into(),
-            })?;
+        let stmt_ast = ast_builder::select_exists_by_path(&self.table_name, path);
+        let mut stmt =
+            self.connection
+                .prepare_stmt(stmt_ast)
+                .map_err(|e| OpenReadError::IoError {
+                    io_error: std::io::Error::other(e.to_string()).into(),
+                    filepath: path.into(),
+                })?;
 
         stmt.program.needs_stmt_subtransactions = false;
         self.connection.start_nested();
@@ -257,18 +249,14 @@ impl BTreeDirectory {
 
     /// Delete all chunks for a path
     fn delete_all_chunks_for_path(&self, path: &str) -> std::result::Result<(), DeleteError> {
-        let sql = format!(
-            "DELETE FROM {} WHERE path = '{}'",
-            self.table_name,
-            path.replace('\'', "''")
-        );
-        let mut stmt = self
-            .connection
-            .prepare(&sql)
-            .map_err(|e| DeleteError::IoError {
-                io_error: std::io::Error::other(e.to_string()).into(),
-                filepath: path.into(),
-            })?;
+        let stmt_ast = ast_builder::delete_by_path(&self.table_name, path);
+        let mut stmt =
+            self.connection
+                .prepare_stmt(stmt_ast)
+                .map_err(|e| DeleteError::IoError {
+                    io_error: std::io::Error::other(e.to_string()).into(),
+                    filepath: path.into(),
+                })?;
 
         stmt.program.needs_stmt_subtransactions = false;
         self.connection.start_nested();
@@ -283,18 +271,14 @@ impl BTreeDirectory {
 
     /// Read all bytes for a path (concatenating chunks in order)
     fn read_all_bytes_for_path(&self, path: &str) -> std::result::Result<Vec<u8>, OpenReadError> {
-        let sql = format!(
-            "SELECT bytes FROM {} WHERE path = '{}' ORDER BY chunk_no ASC",
-            self.table_name,
-            path.replace('\'', "''")
-        );
-        let mut stmt = self
-            .connection
-            .prepare(&sql)
-            .map_err(|e| OpenReadError::IoError {
-                io_error: std::io::Error::other(e.to_string()).into(),
-                filepath: path.into(),
-            })?;
+        let stmt_ast = ast_builder::select_bytes_by_path(&self.table_name, path);
+        let mut stmt =
+            self.connection
+                .prepare_stmt(stmt_ast)
+                .map_err(|e| OpenReadError::IoError {
+                    io_error: std::io::Error::other(e.to_string()).into(),
+                    filepath: path.into(),
+                })?;
 
         stmt.program.needs_stmt_subtransactions = false;
         self.connection.start_nested();
@@ -342,15 +326,10 @@ impl BTreeDirectory {
 
         // Insert new - use hex encoding for blob data
         let hex_data: String = data.iter().map(|b| format!("{:02x}", b)).collect();
-        let insert_sql = format!(
-            "INSERT INTO {} (path, chunk_no, bytes) VALUES ('{}', 0, X'{}')",
-            self.table_name,
-            path.replace('\'', "''"),
-            hex_data
-        );
+        let stmt_ast = ast_builder::insert_chunk(&self.table_name, path, 0, &hex_data);
         let mut insert_stmt = self
             .connection
-            .prepare(&insert_sql)
+            .prepare_stmt(stmt_ast)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
 
         insert_stmt.program.needs_stmt_subtransactions = false;
@@ -531,8 +510,6 @@ struct BTreeWrite {
     buffer: Vec<u8>,
     /// Current chunk number (based on byte position)
     current_chunk: i64,
-    /// Byte offset within current chunk
-    offset_in_chunk: usize,
 }
 
 impl BTreeWrite {
@@ -544,7 +521,6 @@ impl BTreeWrite {
             chunk_size,
             buffer: Vec::with_capacity(chunk_size),
             current_chunk: 0,
-            offset_in_chunk: 0,
         }
     }
 
@@ -553,18 +529,13 @@ impl BTreeWrite {
             return Ok(());
         }
 
-        // Use hex encoding for blob data in SQL
+        // Use hex encoding for blob data
         let hex_data = bytes_to_hex(data);
-        let sql = format!(
-            "INSERT OR REPLACE INTO {} (path, chunk_no, bytes) VALUES ('{}', {}, X'{}')",
-            self.table_name,
-            self.path.replace('\'', "''"),
-            chunk_no,
-            hex_data
-        );
+        let stmt_ast =
+            ast_builder::insert_or_replace_chunk(&self.table_name, &self.path, chunk_no, &hex_data);
         let mut stmt = self
             .conn
-            .prepare(&sql)
+            .prepare_stmt(stmt_ast)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
 
         // Execute within nested context to avoid transaction conflicts
@@ -994,5 +965,208 @@ impl IndexMethodCursor for FtsCursor {
         }
         let (_, _, rowid) = self.current_hits[self.hit_pos];
         Ok(IOResult::Done(Some(rowid)))
+    }
+}
+
+/// AST builder module for FTS storage operations.
+/// These helpers construct AST nodes directly so we an avoid the SQL string parsing overhead.
+mod ast_builder {
+    use turso_parser::ast::{
+        Expr, FromClause, FunctionTail, InsertBody, Limit, Literal, Name, OneSelect, Operator,
+        QualifiedName, ResultColumn, Select, SelectBody, SelectTable, SortOrder, SortedColumn,
+        Stmt,
+    };
+
+    /// Build a Name from a string
+    fn name(s: &str) -> Name {
+        Name::exact(s.to_string())
+    }
+
+    /// Build a QualifiedName from a table name
+    fn table_name(table: &str) -> QualifiedName {
+        QualifiedName::single(name(table))
+    }
+
+    /// Build a column identifier expression
+    fn col(column: &str) -> Box<Expr> {
+        Box::new(Expr::Id(name(column)))
+    }
+
+    /// Build a string literal expression
+    fn str_lit(s: &str) -> Box<Expr> {
+        Box::new(Expr::Literal(Literal::String(s.to_string())))
+    }
+
+    /// Build an integer literal expression
+    fn int_lit(n: i64) -> Box<Expr> {
+        Box::new(Expr::Literal(Literal::Numeric(n.to_string())))
+    }
+
+    /// Build a blob literal from hex string (already encoded)
+    fn blob_lit(hex: &str) -> Box<Expr> {
+        Box::new(Expr::Literal(Literal::Blob(hex.to_string())))
+    }
+
+    /// Build a binary equals expression: lhs = rhs
+    fn eq(lhs: Box<Expr>, rhs: Box<Expr>) -> Box<Expr> {
+        Box::new(Expr::Binary(lhs, Operator::Equals, rhs))
+    }
+
+    /// Build FROM clause for a single table
+    fn from_table(table: &str) -> Option<FromClause> {
+        Some(FromClause {
+            select: Box::new(SelectTable::Table(table_name(table), None, None)),
+            joins: vec![],
+        })
+    }
+
+    /// Build ORDER BY clause for a column
+    fn order_by_asc(column: &str) -> Vec<SortedColumn> {
+        vec![SortedColumn {
+            expr: col(column),
+            order: Some(SortOrder::Asc),
+            nulls: None,
+        }]
+    }
+
+    /// Build: SELECT {columns} FROM {table} WHERE path = '{path}' ORDER BY chunk_no ASC
+    pub fn select_bytes_by_path(table: &str, path: &str) -> Stmt {
+        Stmt::Select(Select {
+            with: None,
+            body: SelectBody {
+                select: OneSelect::Select {
+                    distinctness: None,
+                    columns: vec![ResultColumn::Expr(col("bytes"), None)],
+                    from: from_table(table),
+                    where_clause: Some(eq(col("path"), str_lit(path))),
+                    group_by: None,
+                    window_clause: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: order_by_asc("chunk_no"),
+            limit: None,
+        })
+    }
+
+    /// Build: SELECT 1 FROM {table} WHERE path = '{path}' LIMIT 1
+    pub fn select_exists_by_path(table: &str, path: &str) -> Stmt {
+        Stmt::Select(Select {
+            with: None,
+            body: SelectBody {
+                select: OneSelect::Select {
+                    distinctness: None,
+                    columns: vec![ResultColumn::Expr(int_lit(1), None)],
+                    from: from_table(table),
+                    where_clause: Some(eq(col("path"), str_lit(path))),
+                    group_by: None,
+                    window_clause: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: Some(Limit {
+                expr: int_lit(1),
+                offset: None,
+            }),
+        })
+    }
+
+    /// Build: SELECT SUM(LENGTH(bytes)) FROM {table} WHERE path = '{path}'
+    pub fn select_total_length_by_path(table: &str, path: &str) -> Stmt {
+        // SUM(LENGTH(bytes))
+        let length_call = Box::new(Expr::FunctionCall {
+            name: name("LENGTH"),
+            distinctness: None,
+            args: vec![col("bytes")],
+            order_by: vec![],
+            filter_over: FunctionTail {
+                filter_clause: None,
+                over_clause: None,
+            },
+        });
+        let sum_call = Box::new(Expr::FunctionCall {
+            name: name("SUM"),
+            distinctness: None,
+            args: vec![length_call],
+            order_by: vec![],
+            filter_over: FunctionTail {
+                filter_clause: None,
+                over_clause: None,
+            },
+        });
+
+        Stmt::Select(Select {
+            with: None,
+            body: SelectBody {
+                select: OneSelect::Select {
+                    distinctness: None,
+                    columns: vec![ResultColumn::Expr(sum_call, None)],
+                    from: from_table(table),
+                    where_clause: Some(eq(col("path"), str_lit(path))),
+                    group_by: None,
+                    window_clause: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        })
+    }
+
+    /// Build: DELETE FROM {table} WHERE path = '{path}'
+    pub fn delete_by_path(table: &str, path: &str) -> Stmt {
+        Stmt::Delete {
+            with: None,
+            tbl_name: table_name(table),
+            indexed: None,
+            where_clause: Some(eq(col("path"), str_lit(path))),
+            returning: vec![],
+            order_by: vec![],
+            limit: None,
+        }
+    }
+
+    /// Build: INSERT INTO {table} (path, chunk_no, bytes) VALUES ('{path}', {chunk_no}, X'{hex_data}')
+    pub fn insert_chunk(table: &str, path: &str, chunk_no: i64, hex_data: &str) -> Stmt {
+        insert_chunk_internal(table, path, chunk_no, hex_data, None)
+    }
+
+    /// Build: INSERT OR REPLACE INTO {table} (path, chunk_no, bytes) VALUES ('{path}', {chunk_no}, X'{hex_data}')
+    pub fn insert_or_replace_chunk(table: &str, path: &str, chunk_no: i64, hex_data: &str) -> Stmt {
+        use turso_parser::ast::ResolveType;
+        insert_chunk_internal(table, path, chunk_no, hex_data, Some(ResolveType::Replace))
+    }
+
+    fn insert_chunk_internal(
+        table: &str,
+        path: &str,
+        chunk_no: i64,
+        hex_data: &str,
+        or_conflict: Option<turso_parser::ast::ResolveType>,
+    ) -> Stmt {
+        // VALUES clause as a Select with OneSelect::Values
+        let values_select = Select {
+            with: None,
+            body: SelectBody {
+                select: OneSelect::Values(vec![vec![
+                    str_lit(path),
+                    int_lit(chunk_no),
+                    blob_lit(hex_data),
+                ]]),
+                compounds: vec![],
+            },
+            order_by: vec![],
+            limit: None,
+        };
+
+        Stmt::Insert {
+            with: None,
+            or_conflict,
+            tbl_name: table_name(table),
+            columns: vec![name("path"), name("chunk_no"), name("bytes")],
+            body: InsertBody::Select(values_select, None),
+            returning: vec![],
+        }
     }
 }
