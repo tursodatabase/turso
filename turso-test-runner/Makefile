@@ -37,10 +37,23 @@ check: build-runner
 	$(TEST_RUNNER) check tests
 	$(TEST_RUNNER) check turso-tests
 
-# Run all tests
+# Backend selection (cli or rust)
+BACKEND ?= cli
+
+# Run all tests with selected backend
 run: build
-	$(TEST_RUNNER) run tests --binary $(TURSODB)
-	$(TEST_RUNNER) run turso-tests --binary $(TURSODB)
+	$(TEST_RUNNER) run tests --backend $(BACKEND) --binary $(TURSODB)
+	$(TEST_RUNNER) run turso-tests --backend $(BACKEND) --binary $(TURSODB)
+
+# Run tests with CLI backend (spawns tursodb subprocess)
+run-cli: build
+	$(TEST_RUNNER) run tests --backend cli --binary $(TURSODB)
+	$(TEST_RUNNER) run turso-tests --backend cli --binary $(TURSODB)
+
+# Run tests with Rust backend (native turso bindings)
+run-rust: build-runner
+	$(TEST_RUNNER) run tests --backend rust
+	$(TEST_RUNNER) run turso-tests --backend rust
 
 # Alias for run
 test: run
@@ -71,7 +84,7 @@ install-sqlite:
 
 # Run tests against SQLite
 test-sqlite: build-runner install-sqlite
-	$(TEST_RUNNER) run tests --binary $(SQLITE)
+	$(TEST_RUNNER) run tests --backend cli --binary $(SQLITE)
 
 # Convert Tcl .test files to .sqltest format
 # Usage: make convert                    - convert all .test files in ../testing to ./converted
