@@ -101,9 +101,13 @@ fn validate_update(
     body: &ast::Update,
     table_name: &str,
     is_internal_schema_change: bool,
+    conn: &Arc<Connection>,
 ) -> crate::Result<()> {
     // Check if this is a system table that should be protected from direct writes
-    if !is_internal_schema_change && !crate::schema::can_write_to_table(table_name) {
+    if !is_internal_schema_change
+        && !conn.is_nested_stmt()
+        && !crate::schema::can_write_to_table(table_name)
+    {
         crate::bail_parse_error!("table {} may not be modified", table_name);
     }
     if body.with.is_some() {
@@ -164,6 +168,7 @@ pub fn prepare_update_plan(
         &body,
         table_name.as_str(),
         is_internal_schema_change,
+        connection,
     )?;
     let table_name = table.get_name();
     let iter_dir = body

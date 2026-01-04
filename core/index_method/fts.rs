@@ -21,7 +21,7 @@ use tantivy::{
     Index, IndexSettings,
 };
 use tantivy::{DocAddress, HasLen, IndexReader, IndexWriter, Searcher, TantivyDocument};
-use turso_parser::ast::Select;
+use turso_parser::ast::{self, Select};
 
 pub const FTS_INDEX_METHOD_NAME: &str = "fts";
 pub const DEFAULT_MEMORY_BUDGET_BYTES: usize = 64 * 1024 * 1024;
@@ -61,7 +61,7 @@ impl FtsIndexAttachment {
         let rowid_field = schema_builder
             .add_i64_field("rowid", tantivy::schema::INDEXED | tantivy::schema::STORED);
 
-        let mut text_fields = Vec::new();
+        let mut text_fields = Vec::with_capacity(cfg.columns.len());
         for col in &cfg.columns {
             let opts = tantivy::schema::TextOptions::default()
                 .set_indexing_options(
@@ -79,23 +79,64 @@ impl FtsIndexAttachment {
         let schema = schema_builder.build();
 
         // Build query patterns for FTS
-        // Pattern 0: SELECT fts_score(col1, col2, ..., 'search query') as score FROM table ORDER BY score DESC LIMIT ?
-        // Pattern 1: SELECT * FROM table WHERE fts_match(col1, col2, ..., 'search query')
+        // Order matters: more specific patterns should come first
+        // Pattern 0: SELECT fts_score(col1, col2, ..., 'query') as score FROM table ORDER BY score DESC LIMIT ?
+        // Pattern 1: SELECT fts_score(col1, col2, ..., 'query') as score FROM table WHERE fts_match(col1, col2, ..., 'query')
+        //            (combined: both score and match with same query - must come before pattern 2)
+        // Pattern 2: SELECT * FROM table WHERE fts_match(col1, col2, ..., 'query')
         let cols = cfg
             .columns
             .iter()
             .map(|c| c.name.as_str())
             .collect::<Vec<_>>()
             .join(", ");
+        // Build all FTS patterns - more specific patterns first
+        // Use explicit ?1 for shared parameters between fts_score and fts_match
+
+        // Pattern 0: score with ORDER BY DESC LIMIT
         let score_pattern = format!(
             "SELECT fts_score({}, ?) as score FROM {} ORDER BY score DESC LIMIT ?",
             cols, cfg.table_name
         );
+        // Pattern 1: combined + ORDER BY DESC + LIMIT (most specific)
+        let combined_ordered_limit = format!(
+            "SELECT fts_score({}, ?1) as score FROM {} WHERE fts_match({}, ?1) ORDER BY score DESC LIMIT ?",
+            cols, cfg.table_name, cols
+        );
+        // Pattern 2: combined + ORDER BY DESC (no LIMIT)
+        let combined_ordered = format!(
+            "SELECT fts_score({}, ?1) as score FROM {} WHERE fts_match({}, ?1) ORDER BY score DESC",
+            cols, cfg.table_name, cols
+        );
+        // Pattern 3: combined + LIMIT (no ORDER BY)
+        let combined_limit = format!(
+            "SELECT fts_score({}, ?1) as score FROM {} WHERE fts_match({}, ?1) LIMIT ?",
+            cols, cfg.table_name, cols
+        );
+        // Pattern 4: combined (no ORDER BY, no LIMIT)
+        let combined = format!(
+            "SELECT fts_score({}, ?1) as score FROM {} WHERE fts_match({}, ?1)",
+            cols, cfg.table_name, cols
+        );
+        // Pattern 5: match + LIMIT
+        let match_limit = format!(
+            "SELECT * FROM {} WHERE fts_match({}, ?) LIMIT ?",
+            cfg.table_name, cols
+        );
+        // Pattern 6: match (no LIMIT)
         let match_pattern = format!(
             "SELECT * FROM {} WHERE fts_match({}, ?)",
             cfg.table_name, cols
         );
-        let patterns = parse_patterns(&[&score_pattern, &match_pattern])?;
+        let patterns = parse_patterns(&[
+            &score_pattern,          // 0
+            &combined_ordered_limit, // 1
+            &combined_ordered,       // 2
+            &combined_limit,         // 3
+            &combined,               // 4
+            &match_limit,            // 5
+            &match_pattern,          // 6
+        ])?;
         Ok(Self {
             cfg,
             schema,
@@ -159,6 +200,7 @@ impl BTreeDirectory {
     /// Get total length of file by summing all chunk sizes
     fn fetch_file_len(&self, path: &str) -> std::result::Result<usize, OpenReadError> {
         let stmt_ast = ast_builder::select_total_length_by_path(&self.table_name, path);
+        self.connection.start_nested();
         let mut stmt =
             self.connection
                 .prepare_stmt(stmt_ast)
@@ -168,7 +210,6 @@ impl BTreeDirectory {
                 })?;
 
         stmt.program.needs_stmt_subtransactions = false;
-        self.connection.start_nested();
 
         let result = loop {
             match stmt.step() {
@@ -213,6 +254,7 @@ impl BTreeDirectory {
     /// Check if any row exists for path
     fn exists_row_for_path(&self, path: &str) -> std::result::Result<bool, OpenReadError> {
         let stmt_ast = ast_builder::select_exists_by_path(&self.table_name, path);
+        self.connection.start_nested();
         let mut stmt =
             self.connection
                 .prepare_stmt(stmt_ast)
@@ -222,7 +264,6 @@ impl BTreeDirectory {
                 })?;
 
         stmt.program.needs_stmt_subtransactions = false;
-        self.connection.start_nested();
 
         let result = loop {
             match stmt.step() {
@@ -255,6 +296,7 @@ impl BTreeDirectory {
     /// Delete all chunks for a path
     fn delete_all_chunks_for_path(&self, path: &str) -> std::result::Result<(), DeleteError> {
         let stmt_ast = ast_builder::delete_by_path(&self.table_name, path);
+        self.connection.start_nested();
         let mut stmt =
             self.connection
                 .prepare_stmt(stmt_ast)
@@ -264,7 +306,6 @@ impl BTreeDirectory {
                 })?;
 
         stmt.program.needs_stmt_subtransactions = false;
-        self.connection.start_nested();
         let res = stmt.run_ignore_rows();
         self.connection.end_nested();
 
@@ -277,6 +318,7 @@ impl BTreeDirectory {
     /// Read all bytes for a path (concatenating chunks in order)
     fn read_all_bytes_for_path(&self, path: &str) -> std::result::Result<Vec<u8>, OpenReadError> {
         let stmt_ast = ast_builder::select_bytes_by_path(&self.table_name, path);
+        self.connection.start_nested();
         let mut stmt =
             self.connection
                 .prepare_stmt(stmt_ast)
@@ -286,7 +328,6 @@ impl BTreeDirectory {
                 })?;
 
         stmt.program.needs_stmt_subtransactions = false;
-        self.connection.start_nested();
 
         let mut data = Vec::new();
         let result = loop {
@@ -332,13 +373,13 @@ impl BTreeDirectory {
         // Insert new - use hex encoding for blob data
         let hex_data: String = data.iter().map(|b| format!("{b:02x}")).collect();
         let stmt_ast = ast_builder::insert_chunk(&self.table_name, path, 0, &hex_data);
+        self.connection.start_nested();
         let mut insert_stmt = self
             .connection
             .prepare_stmt(stmt_ast)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
 
         insert_stmt.program.needs_stmt_subtransactions = false;
-        self.connection.start_nested();
         let res = insert_stmt.run_ignore_rows();
         self.connection.end_nested();
 
@@ -346,33 +387,79 @@ impl BTreeDirectory {
     }
 }
 
-fn initialize_btree_storage_table(conn: &Arc<Connection>, table_name: &str) -> Result<()> {
-    let create_table_sql = format!(
-        "CREATE TABLE IF NOT EXISTS {table_name} (
-            path TEXT NOT NULL,
-            chunk_no INTEGER NOT NULL,
-            bytes BLOB NOT NULL
-        )",
-    );
-    let create_index_sql = format!(
-        "CREATE UNIQUE INDEX IF NOT EXISTS {table_name}_key
-         ON {table_name}(path, chunk_no ASC)",
-    );
+const NOTNULL_CONSTRAINT: ast::NamedColumnConstraint = ast::NamedColumnConstraint {
+    name: None,
+    constraint: ast::ColumnConstraint::NotNull {
+        nullable: false,
+        conflict_clause: None,
+    },
+};
 
+fn initialize_btree_storage_table(conn: &Arc<Connection>, table_name: &str) -> Result<()> {
+    // inline ast to reduce parsing overhead
+    // CREATE TABLE table_name (path TEXT NOT NULL, chunk_no INTEGER NOT NULL, bytes BLOB NOT NULL);
+    let create_table_stmt = ast::Stmt::CreateTable {
+        body: ast::CreateTableBody::ColumnsAndConstraints {
+            columns: vec![
+                ast::ColumnDefinition {
+                    col_name: ast_builder::name("path"),
+                    col_type: Some(ast_builder::text_type()),
+                    constraints: vec![NOTNULL_CONSTRAINT],
+                },
+                ast::ColumnDefinition {
+                    col_name: ast_builder::name("chunk_no"),
+                    col_type: Some(ast_builder::integer_type()),
+                    constraints: vec![NOTNULL_CONSTRAINT],
+                },
+                ast::ColumnDefinition {
+                    col_name: ast_builder::name("bytes"),
+                    col_type: Some(ast_builder::blob_type()),
+                    constraints: vec![NOTNULL_CONSTRAINT],
+                },
+            ],
+            constraints: vec![],
+            options: ast::TableOptions::empty(),
+        },
+        temporary: false,
+        if_not_exists: false,
+        tbl_name: ast_builder::table_name(table_name),
+    };
+    // "CREATE UNIQUE INDEX idx_name ON table_name (path, chunk_no);"
+    let create_index_stmt = ast::Stmt::CreateIndex {
+        unique: true,
+        if_not_exists: false,
+        idx_name: ast_builder::table_name(&format!("{table_name}_key")),
+        tbl_name: ast_builder::name(table_name),
+        using: None,
+        columns: vec![
+            ast::SortedColumn {
+                expr: Box::new(ast::Expr::Name(ast_builder::name("path"))),
+                order: None,
+                nulls: None,
+            },
+            ast::SortedColumn {
+                expr: Box::new(ast::Expr::Name(ast_builder::name("chunk_no"))),
+                order: None,
+                nulls: None,
+            },
+        ],
+        where_clause: None,
+        with_clause: vec![],
+    };
     // Execute nested statements without subtransactions to avoid DatabaseBusy
     // (we're already inside a transaction from the parent CREATE INDEX statement)
     {
-        let mut stmt = conn.prepare(&create_table_sql)?;
-        stmt.program.needs_stmt_subtransactions = false;
         conn.start_nested();
+        let mut stmt = conn.prepare_stmt(create_table_stmt)?;
+        stmt.program.needs_stmt_subtransactions = false;
         let res = stmt.run_ignore_rows();
         conn.end_nested();
         res?;
     }
     {
-        let mut stmt = conn.prepare(&create_index_sql)?;
-        stmt.program.needs_stmt_subtransactions = false;
         conn.start_nested();
+        let mut stmt = conn.prepare_stmt(create_index_stmt)?;
+        stmt.program.needs_stmt_subtransactions = false;
         let res = stmt.run_ignore_rows();
         conn.end_nested();
         res?;
@@ -435,13 +522,13 @@ impl FileHandle for BTreeFileHandle {
             first_chunk,
             last_chunk,
         );
+        self.conn.start_nested();
         let mut stmt = self
             .conn
             .prepare_stmt(stmt)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
 
         stmt.program.needs_stmt_subtransactions = false;
-        self.conn.start_nested();
 
         let mut chunks: Vec<(i64, Vec<u8>)> = Vec::new();
         let loop_result: std::io::Result<()> = loop {
@@ -537,6 +624,7 @@ impl BTreeWrite {
         let hex_data = bytes_to_hex(data);
         let stmt_ast =
             ast_builder::insert_or_replace_chunk(&self.table_name, &self.path, chunk_no, &hex_data);
+        self.conn.start_nested();
         let mut stmt = self
             .conn
             .prepare_stmt(stmt_ast)
@@ -544,7 +632,6 @@ impl BTreeWrite {
 
         // Execute within nested context to avoid transaction conflicts
         stmt.program.needs_stmt_subtransactions = false;
-        self.conn.start_nested();
         let res = stmt.run_ignore_rows();
         self.conn.end_nested();
         res.map_err(|e| std::io::Error::other(e.to_string()))?;
@@ -682,7 +769,13 @@ impl Directory for BTreeDirectory {
 
 /// Pattern indices for FTS queries
 const FTS_PATTERN_SCORE: i64 = 0;
-const FTS_PATTERN_MATCH: i64 = 1;
+const FTS_PATTERN_COMBINED_ORDERED_LIMIT: i64 = 1;
+const FTS_PATTERN_COMBINED_ORDERED: i64 = 2;
+const FTS_PATTERN_COMBINED_LIMIT: i64 = 3;
+const FTS_PATTERN_COMBINED: i64 = 4;
+const FTS_PATTERN_MATCH_LIMIT: i64 = 5;
+const FTS_PATTERN_MATCH: i64 = 6;
+const TANTIVY_META_FILE: &str = "meta.json";
 
 /// Cursor for executing FTS queries
 pub struct FtsCursor {
@@ -733,10 +826,14 @@ impl FtsCursor {
             return Ok(());
         }
 
-        let dir_table_name = format!("fts_dir_{}", self.cfg.index_name);
+        let dir_table_name = format!(
+            "{}fts_dir_{}",
+            crate::schema::TURSO_INTERNAL_PREFIX,
+            self.cfg.index_name
+        );
         let dir = BTreeDirectory::new(conn.clone(), dir_table_name, DEFAULT_CHUNK_SIZE)?;
 
-        let index_exists = dir.exists(Path::new("meta.json")).unwrap_or(false);
+        let index_exists = dir.exists(Path::new(TANTIVY_META_FILE)).unwrap_or(false);
 
         // Clone for storage, original for Index
         let dir_for_storage = Arc::new(dir.clone());
@@ -907,12 +1004,16 @@ impl IndexMethodCursor for FtsCursor {
         };
 
         // Determine limit based on pattern:
-        // - fts_score (pattern 0): uses provided limit or default 10
-        // - fts_match (pattern 1): high limit to get all matching documents
+        // - Patterns WITHOUT LIMIT in pattern: fetch all matches (high limit)
+        // - Patterns WITH LIMIT: use the captured limit value from values[2]
         let limit = match pattern_idx {
-            FTS_PATTERN_MATCH => 10_000_000, // Large limit for filtering (Tantivy can't handle usize::MAX)
-            _ => {
-                // fts_score pattern with explicit limit
+            // Patterns without LIMIT - fetch all matches
+            FTS_PATTERN_MATCH | FTS_PATTERN_COMBINED | FTS_PATTERN_COMBINED_ORDERED => 10_000_000,
+            // Patterns with LIMIT - use captured limit value
+            FTS_PATTERN_SCORE
+            | FTS_PATTERN_MATCH_LIMIT
+            | FTS_PATTERN_COMBINED_LIMIT
+            | FTS_PATTERN_COMBINED_ORDERED_LIMIT => {
                 if values.len() > 2 {
                     match &values[2] {
                         Register::Value(Value::Integer(i)) => *i as usize,
@@ -922,6 +1023,7 @@ impl IndexMethodCursor for FtsCursor {
                     10
                 }
             }
+            _ => 10,
         };
 
         // Build query over all text fields
@@ -982,12 +1084,21 @@ impl IndexMethodCursor for FtsCursor {
         }
 
         match self.current_pattern {
-            FTS_PATTERN_MATCH => {
-                // For fts_match, return 1 (true) - indicates this row matches
+            FTS_PATTERN_MATCH | FTS_PATTERN_MATCH_LIMIT => {
+                // For fts_match patterns, return 1 (true) - indicates this row matches
                 Ok(IOResult::Done(Value::Integer(1)))
             }
+            FTS_PATTERN_SCORE
+            | FTS_PATTERN_COMBINED
+            | FTS_PATTERN_COMBINED_LIMIT
+            | FTS_PATTERN_COMBINED_ORDERED
+            | FTS_PATTERN_COMBINED_ORDERED_LIMIT => {
+                // For fts_score and combined patterns, return the actual score
+                let (score, _, _) = self.current_hits[self.hit_pos];
+                Ok(IOResult::Done(Value::Float(score as f64)))
+            }
             _ => {
-                // For fts_score, return the actual score
+                // Unknown pattern - return score as default
                 let (score, _, _) = self.current_hits[self.hit_pos];
                 Ok(IOResult::Done(Value::Float(score as f64)))
             }
@@ -1007,18 +1118,18 @@ impl IndexMethodCursor for FtsCursor {
 /// These helpers construct AST nodes directly so we an avoid the SQL string parsing overhead.
 mod ast_builder {
     use turso_parser::ast::{
-        Expr, FromClause, FunctionTail, InsertBody, Limit, Literal, Name, OneSelect, Operator,
-        QualifiedName, ResultColumn, Select, SelectBody, SelectTable, SortOrder, SortedColumn,
-        Stmt,
+        self, Expr, FromClause, FunctionTail, InsertBody, Limit, Literal, Name, OneSelect,
+        Operator, QualifiedName, ResultColumn, Select, SelectBody, SelectTable, SortOrder,
+        SortedColumn, Stmt,
     };
 
     /// Build a Name from a string
-    fn name(s: &str) -> Name {
+    pub fn name(s: &str) -> Name {
         Name::exact(s.to_string())
     }
 
     /// Build a QualifiedName from a table name
-    fn table_name(table: &str) -> QualifiedName {
+    pub fn table_name(table: &str) -> QualifiedName {
         QualifiedName::single(name(table))
     }
 
@@ -1031,7 +1142,30 @@ mod ast_builder {
     fn str_lit(s: &str) -> Box<Expr> {
         // The translator's sanitize_string() expects quotes around the string,
         // so we need to include them when building AST programmatically
-        Box::new(Expr::Literal(Literal::String(format!("'{}'", s.replace('\'', "''")))))
+        Box::new(Expr::Literal(Literal::String(format!(
+            "'{}'",
+            s.replace('\'', "''")
+        ))))
+    }
+
+    pub fn integer_type() -> ast::Type {
+        ast::Type {
+            name: "INTEGER".to_string(),
+            size: None,
+        }
+    }
+
+    pub fn text_type() -> ast::Type {
+        ast::Type {
+            name: "TEXT".to_string(),
+            size: None,
+        }
+    }
+    pub fn blob_type() -> ast::Type {
+        ast::Type {
+            name: "BLOB".to_string(),
+            size: None,
+        }
     }
 
     /// Build an integer literal expression
