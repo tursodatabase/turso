@@ -44,10 +44,23 @@ else
     MVCC_FLAG :=
 endif
 
-# Run all tests
+# Backend selection (cli or rust)
+BACKEND ?= cli
+
+# Run all tests with selected backend
 run: build
-	$(TEST_RUNNER) run tests --binary $(TURSODB) $(MVCC_FLAG)
-	$(TEST_RUNNER) run turso-tests --binary $(TURSODB) $(MVCC_FLAG)
+	$(TEST_RUNNER) run tests --backend $(BACKEND) --binary $(TURSODB) $(MVCC_FLAG)
+	$(TEST_RUNNER) run turso-tests --backend $(BACKEND) --binary $(TURSODB) $(MVCC_FLAG)
+
+# Run tests with CLI backend (spawns tursodb subprocess)
+run-cli: build
+	$(TEST_RUNNER) run tests --backend cli --binary $(TURSODB) $(MVCC_FLAG)
+	$(TEST_RUNNER) run turso-tests --backend cli --binary $(TURSODB) $(MVCC_FLAG)
+
+# Run tests with Rust backend (native turso bindings)
+run-rust: build-runner
+	$(TEST_RUNNER) run tests --backend rust $(MVCC_FLAG)
+	$(TEST_RUNNER) run turso-tests --backend rust $(MVCC_FLAG)
 
 # Alias for run
 test: run
@@ -78,7 +91,7 @@ install-sqlite:
 
 # Run tests against SQLite
 test-sqlite: build-runner install-sqlite
-	$(TEST_RUNNER) run tests --binary $(SQLITE)
+	$(TEST_RUNNER) run tests --backend cli --binary $(SQLITE)
 
 # Convert Tcl .test files to .sqltest format
 # Usage: make convert                    - convert all .test files in ../testing to ./converted
