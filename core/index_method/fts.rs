@@ -325,7 +325,7 @@ impl BTreeDirectory {
         let _ = self.delete_all_chunks_for_path(path);
 
         // Insert new - use hex encoding for blob data
-        let hex_data: String = data.iter().map(|b| format!("{:02x}", b)).collect();
+        let hex_data: String = data.iter().map(|b| format!("{b:02x}")).collect();
         let stmt_ast = ast_builder::insert_chunk(&self.table_name, path, 0, &hex_data);
         let mut insert_stmt = self
             .connection
@@ -424,16 +424,15 @@ impl FileHandle for BTreeFileHandle {
         let first_chunk = (range.start / self.chunk_size) as i64;
         let last_chunk = ((range.end - 1) / self.chunk_size) as i64;
 
-        let sql = format!(
-            "SELECT chunk_no, bytes FROM {} WHERE path = '{}' AND chunk_no >= {} AND chunk_no <= {} ORDER BY chunk_no ASC",
-            self.table_name,
-            self.path.replace('\'', "''"),
+        let stmt = ast_builder::select_chunk_by_path_and_no(
+            self.table_name.as_str(),
+            self.path.as_str(),
             first_chunk,
-            last_chunk
+            last_chunk,
         );
         let mut stmt = self
             .conn
-            .prepare(&sql)
+            .prepare_stmt(stmt)
             .map_err(|e| std::io::Error::other(e.to_string()))?;
 
         stmt.program.needs_stmt_subtransactions = false;
@@ -1136,6 +1135,47 @@ mod ast_builder {
     pub fn insert_or_replace_chunk(table: &str, path: &str, chunk_no: i64, hex_data: &str) -> Stmt {
         use turso_parser::ast::ResolveType;
         insert_chunk_internal(table, path, chunk_no, hex_data, Some(ResolveType::Replace))
+    }
+
+    /// Build: SELECT chunk_no, bytes FROM {} WHERE path = '{}' AND chunk_no >= {} AND chunk_no <= {} ORDER BY chunk_no ASC
+    pub fn select_chunk_by_path_and_no(
+        table: &str,
+        path: &str,
+        chunk_min: i64,
+        chunk_max: i64,
+    ) -> Stmt {
+        Stmt::Select(Select {
+            with: None,
+            body: SelectBody {
+                select: OneSelect::Select {
+                    distinctness: None,
+                    columns: vec![ResultColumn::Expr(col("bytes"), None)],
+                    from: from_table(table),
+                    where_clause: Some(Box::new(Expr::Binary(
+                        eq(col("path"), str_lit(path)),
+                        Operator::And,
+                        Box::new(Expr::Binary(
+                            Box::new(Expr::Binary(
+                                col("chunk_no"),
+                                Operator::GreaterEquals,
+                                int_lit(chunk_min),
+                            )),
+                            Operator::And,
+                            Box::new(Expr::Binary(
+                                col("chunk_no"),
+                                Operator::LessEquals,
+                                int_lit(chunk_max),
+                            )),
+                        )),
+                    ))),
+                    group_by: None,
+                    window_clause: vec![],
+                },
+                compounds: vec![],
+            },
+            order_by: order_by_asc("chunk_no"),
+            limit: None,
+        })
     }
 
     fn insert_chunk_internal(
