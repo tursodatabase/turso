@@ -7476,9 +7476,6 @@ pub fn op_index_method_query(
         insn
     );
     assert_eq!(*db, 0);
-    if program.connection.is_readonly(*db) {
-        return Err(LimboError::ReadOnly);
-    }
     let mv_store = program.connection.mv_store();
     if let Some(_mv_store) = mv_store.as_ref() {
         todo!("MVCC is not supported yet");
