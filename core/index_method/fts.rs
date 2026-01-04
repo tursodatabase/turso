@@ -993,7 +993,9 @@ mod ast_builder {
 
     /// Build a string literal expression
     fn str_lit(s: &str) -> Box<Expr> {
-        Box::new(Expr::Literal(Literal::String(s.to_string())))
+        // The translator's sanitize_string() expects quotes around the string,
+        // so we need to include them when building AST programmatically
+        Box::new(Expr::Literal(Literal::String(format!("'{}'", s.replace('\'', "''")))))
     }
 
     /// Build an integer literal expression
@@ -1149,7 +1151,10 @@ mod ast_builder {
             body: SelectBody {
                 select: OneSelect::Select {
                     distinctness: None,
-                    columns: vec![ResultColumn::Expr(col("bytes"), None)],
+                    columns: vec![
+                        ResultColumn::Expr(col("chunk_no"), None),
+                        ResultColumn::Expr(col("bytes"), None),
+                    ],
                     from: from_table(table),
                     where_clause: Some(Box::new(Expr::Binary(
                         eq(col("path"), str_lit(path)),

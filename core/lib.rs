@@ -1415,7 +1415,7 @@ impl Connection {
 
     /// Prepare a statement from an AST node directly, skipping SQL parsing.
     /// This is more efficient when AST is already available or constructed programmatically.
-    pub fn prepare_stmt(self: &Arc<Connection>, stmt: ast::Stmt) -> Result<Statement> {
+    pub(crate) fn prepare_stmt(self: &Arc<Connection>, stmt: ast::Stmt) -> Result<Statement> {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));
         }
