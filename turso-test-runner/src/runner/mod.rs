@@ -266,6 +266,7 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
         test_file: &TestFile,
     ) -> FuturesUnordered<tokio::task::JoinHandle<TestResult>> {
         let futures = FuturesUnordered::new();
+        let backend_name = self.backend.name();
 
         // For each database configuration
         for db_config in &test_file.databases {
@@ -274,6 +275,13 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
                 // Apply filter if present
                 if let Some(ref filter) = self.config.filter {
                     if !matches_filter(&test.name, filter) {
+                        continue;
+                    }
+                }
+
+                // Skip tests that don't match the current backend
+                if let Some(ref required_backend) = test.backend {
+                    if required_backend != backend_name {
                         continue;
                     }
                 }
