@@ -1463,6 +1463,12 @@ impl Connection {
         self.transaction_state.get()
     }
 
+    /// Returns true if the connection is currently in a write transaction.
+    /// Used by index methods to determine if it's safe to flush writes.
+    pub fn is_in_write_tx(&self) -> bool {
+        matches!(self.get_tx_state(), TransactionState::Write { .. })
+    }
+
     pub(crate) fn get_mv_tx_id(&self) -> Option<u64> {
         self.mv_tx.read().map(|(tx_id, _)| tx_id)
     }
