@@ -38,6 +38,7 @@ impl InternalVirtualTable for DbPageTable {
         Ok(Arc::new(RwLock::new(cursor)))
     }
 
+    /// TODO: sqlite does where_onerow optimization using idx_flag, we should do that eventually.. probably not needed for now.
     fn best_index(
         &self,
         constraints: &[ConstraintInfo],
@@ -158,7 +159,7 @@ impl InternalVirtualTableCursor for DbPageCursor {
                 let data_slice = page_contents.as_ptr();
                 Ok(Value::from_blob(data_slice.to_vec()))
             }
-            2 => Ok(Value::from_text("main")),
+            2 => Ok(Value::from_text("main")), // we don't support multiple databases - todo when we do
             _ => Ok(Value::Null),
         }
     }
