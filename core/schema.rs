@@ -1,9 +1,11 @@
-use crate::function::Func;
+use crate::function::{Deterministic, Func};
 use crate::incremental::view::IncrementalView;
 use crate::index_method::{IndexMethodAttachment, IndexMethodConfiguration};
 use crate::stats::AnalyzeStats;
+use crate::translate::emitter::Resolver;
 use crate::translate::expr::{bind_and_rewrite_expr, walk_expr, BindingBehavior, WalkControl};
 use crate::translate::index::{resolve_index_method_parameters, resolve_sorted_columns};
+use crate::translate::optimizer::Optimizable;
 use crate::translate::planner::ROWID_STRS;
 use crate::types::IOResult;
 use crate::util::{exprs_are_equivalent, normalize_ident};
@@ -2833,20 +2835,20 @@ impl Index {
 
     /// Walk the where_clause Expr of a partial index and validate that it doesn't reference any other
     /// tables or use any disallowed constructs.
-    pub fn validate_where_expr(&self, table: &Table) -> bool {
+    pub fn validate_where_expr(&self, table: &Table, resolver: &Resolver) -> bool {
         let Some(where_clause) = &self.where_clause else {
             return true;
         };
 
-        let tbl_norm = normalize_ident(self.table_name.as_str());
+        let tbl_norm = self.table_name.as_str();
         let has_col = |name: &str| {
             let n = normalize_ident(name);
             table
                 .columns()
                 .iter()
-                .any(|c| c.name.as_ref().is_some_and(|cn| normalize_ident(cn) == n))
+                .any(|c| c.name.as_ref().is_some_and(|cn| *cn == n))
         };
-        let is_tbl = |ns: &str| normalize_ident(ns).eq_ignore_ascii_case(&tbl_norm);
+        let is_tbl = |ns: &str| normalize_ident(ns) == tbl_norm;
         let is_deterministic_fn = |name: &str, argc: usize| {
             let n = normalize_ident(name);
             Func::resolve_function(&n, argc).is_ok_and(|f| f.is_deterministic())
@@ -2885,7 +2887,12 @@ impl Index {
                         ok = false;
                     } else {
                         let argc = match e {
-                            Expr::FunctionCall { args, .. } => args.len(),
+                            Expr::FunctionCall { args, .. } => {
+                                if !args.iter().all(|a| a.is_constant(resolver)) {
+                                    ok = false;
+                                }
+                                args.len()
+                            }
                             Expr::FunctionCallStar { .. } => 0,
                             _ => unreachable!(),
                         };

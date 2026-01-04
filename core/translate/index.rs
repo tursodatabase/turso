@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use crate::bail_parse_error;
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
-use crate::function::Func;
+use crate::function::{Deterministic, Func};
 use crate::index_method::IndexMethodConfiguration;
 use crate::numeric::Numeric;
 use crate::schema::{Column, Table, EXPR_INDEX_SENTINEL, RESERVED_TABLE_PREFIXES};
@@ -141,7 +141,7 @@ pub fn translate_create_index(
         index_method: index_method.clone(),
     });
 
-    if !idx.validate_where_expr(table) {
+    if !idx.validate_where_expr(table, resolver) {
         crate::bail_parse_error!(
             "Error: cannot use aggregate, window functions or reference other tables in WHERE clause of CREATE INDEX:\n {}",
             where_clause
