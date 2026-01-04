@@ -421,13 +421,13 @@ fn initialize_btree_storage_table(conn: &Arc<Connection>, table_name: &str) -> R
             options: ast::TableOptions::empty(),
         },
         temporary: false,
-        if_not_exists: false,
+        if_not_exists: true,
         tbl_name: ast_builder::table_name(table_name),
     };
-    // "CREATE UNIQUE INDEX idx_name ON table_name (path, chunk_no);"
+    // "CREATE UNIQUE INDEX IF NOT EXISTS idx_name ON table_name (path, chunk_no);"
     let create_index_stmt = ast::Stmt::CreateIndex {
         unique: true,
-        if_not_exists: false,
+        if_not_exists: true,
         idx_name: ast_builder::table_name(&format!("{table_name}_key")),
         tbl_name: ast_builder::name(table_name),
         using: None,
