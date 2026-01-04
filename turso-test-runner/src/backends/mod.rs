@@ -1,4 +1,5 @@
 pub mod cli;
+pub mod rust;
 
 use crate::parser::ast::DatabaseConfig;
 use async_trait::async_trait;

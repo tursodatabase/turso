@@ -2425,6 +2425,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "turso",
+ "turso_parser",
 ]
 
 [[package]]
