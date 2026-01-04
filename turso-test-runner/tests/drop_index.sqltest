@@ -38,7 +38,7 @@ test drop-index-no-index {
     DROP INDEX t_idx;
 }
 expect error {
-    No such index: t_idx
+    no such index: t_idx
 }
 
 # Test dropping index after multiple inserts and deletes
