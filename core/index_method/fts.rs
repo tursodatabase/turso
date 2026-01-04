@@ -78,19 +78,24 @@ impl FtsIndexAttachment {
 
         let schema = schema_builder.build();
 
-        // Build query pattern for FTS
-        // Pattern: SELECT fts_score(col1, col2, ..., 'search query') as score FROM table ORDER BY score DESC LIMIT ?
+        // Build query patterns for FTS
+        // Pattern 0: SELECT fts_score(col1, col2, ..., 'search query') as score FROM table ORDER BY score DESC LIMIT ?
+        // Pattern 1: SELECT * FROM table WHERE fts_match(col1, col2, ..., 'search query')
         let cols = cfg
             .columns
             .iter()
             .map(|c| c.name.as_str())
             .collect::<Vec<_>>()
             .join(", ");
-        let query_pattern = format!(
+        let score_pattern = format!(
             "SELECT fts_score({}, ?) as score FROM {} ORDER BY score DESC LIMIT ?",
             cols, cfg.table_name
         );
-        let patterns = parse_patterns(&[&query_pattern])?;
+        let match_pattern = format!(
+            "SELECT * FROM {} WHERE fts_match({}, ?)",
+            cfg.table_name, cols
+        );
+        let patterns = parse_patterns(&[&score_pattern, &match_pattern])?;
         Ok(Self {
             cfg,
             schema,
@@ -675,6 +680,10 @@ impl Directory for BTreeDirectory {
     }
 }
 
+/// Pattern indices for FTS queries
+const FTS_PATTERN_SCORE: i64 = 0;
+const FTS_PATTERN_MATCH: i64 = 1;
+
 /// Cursor for executing FTS queries
 pub struct FtsCursor {
     cfg: IndexMethodConfiguration,
@@ -692,6 +701,8 @@ pub struct FtsCursor {
     // Query state
     current_hits: Vec<(f32, DocAddress, i64)>,
     hit_pos: usize,
+    /// Which pattern is being used (0=fts_score, 1=fts_match)
+    current_pattern: i64,
 }
 
 impl FtsCursor {
@@ -713,6 +724,7 @@ impl FtsCursor {
             searcher: None,
             current_hits: Vec::new(),
             hit_pos: 0,
+            current_pattern: FTS_PATTERN_SCORE,
         }
     }
 
@@ -880,21 +892,36 @@ impl IndexMethodCursor for FtsCursor {
                 "FTS query_start: missing pattern id".into(),
             ));
         }
+
         // values[0] = pattern index
+        let pattern_idx = match &values[0] {
+            Register::Value(Value::Integer(i)) => *i,
+            _ => FTS_PATTERN_SCORE,
+        };
+        self.current_pattern = pattern_idx;
+
         // values[1] = query string
-        // values[2] = limit (optional)
         let query_str = match &values[1] {
             Register::Value(Value::Text(t)) => t.as_str().to_string(),
             _ => return Err(LimboError::InternalError("FTS query must be text".into())),
         };
 
-        let limit = if values.len() > 2 {
-            match &values[2] {
-                Register::Value(Value::Integer(i)) => *i as usize,
-                _ => 10,
+        // Determine limit based on pattern:
+        // - fts_score (pattern 0): uses provided limit or default 10
+        // - fts_match (pattern 1): high limit to get all matching documents
+        let limit = match pattern_idx {
+            FTS_PATTERN_MATCH => 10_000_000, // Large limit for filtering (Tantivy can't handle usize::MAX)
+            _ => {
+                // fts_score pattern with explicit limit
+                if values.len() > 2 {
+                    match &values[2] {
+                        Register::Value(Value::Integer(i)) => *i as usize,
+                        _ => 10,
+                    }
+                } else {
+                    10
+                }
             }
-        } else {
-            10
         };
 
         // Build query over all text fields
@@ -941,10 +968,10 @@ impl IndexMethodCursor for FtsCursor {
     }
 
     fn query_column(&mut self, idx: usize) -> Result<IOResult<Value>> {
-        // Column 0 = score
+        // Column 0 = score for fts_score, or 1 (true) for fts_match
         if idx != 0 {
             return Err(LimboError::InternalError(
-                "FTS: only column 0 (score) supported".into(),
+                "FTS: only column 0 supported".into(),
             ));
         }
 
@@ -954,8 +981,17 @@ impl IndexMethodCursor for FtsCursor {
             ));
         }
 
-        let (score, _, _) = self.current_hits[self.hit_pos];
-        Ok(IOResult::Done(Value::Float(score as f64)))
+        match self.current_pattern {
+            FTS_PATTERN_MATCH => {
+                // For fts_match, return 1 (true) - indicates this row matches
+                Ok(IOResult::Done(Value::Integer(1)))
+            }
+            _ => {
+                // For fts_score, return the actual score
+                let (score, _, _) = self.current_hits[self.hit_pos];
+                Ok(IOResult::Done(Value::Float(score as f64)))
+            }
+        }
     }
 
     fn query_rowid(&mut self) -> Result<IOResult<Option<i64>>> {

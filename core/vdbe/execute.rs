@@ -5909,12 +5909,16 @@ pub fn op_function(
         #[cfg(feature = "fts")]
         crate::function::Func::Fts(fts_func) => {
             // FTS functions are typically handled via index method pattern matching.
-            // If we reach here, just return NULL as a fallback since no FTS index matched.
+            // If we reach here, just return a fallback since no FTS index matched.
             use crate::function::FtsFunc;
             match fts_func {
                 FtsFunc::FtsScore => {
                     // Without an FTS index match, return 0.0 as a default score
                     state.registers[*dest] = Register::Value(Value::Float(0.0));
+                }
+                FtsFunc::FtsMatch => {
+                    // Without an FTS index match, return 0 (false) as default
+                    state.registers[*dest] = Register::Value(Value::Integer(0));
                 }
             }
         }
