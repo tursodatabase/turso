@@ -141,6 +141,14 @@ impl InternalVirtualTableCursor for DbPageCursor {
         match column {
             0 => Ok(Value::Integer(self.pgno)),
             1 => {
+                // check for the pending byte page  - this only needs when db is more than 1 gb.
+                if let Some(pending_page) = self.pager.pending_byte_page_id() {
+                    if self.pgno == pending_page as i64 {
+                        let page_size = self.pager.usable_space() + self.pager.get_reserved_space().unwrap_or(0) as usize;
+                        return Ok(Value::from_blob(vec![0u8; page_size]));
+                    }
+                }
+
                 let (page_ref, completion) = self.pager.read_page(self.pgno)?;
                 if let Some(c) = completion {
                     self.pager.io.wait_for_completion(c)?;
