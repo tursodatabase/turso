@@ -799,3 +799,253 @@ fn test_fts_order_by_and_limit(tmp_db: TempDatabase) {
         );
     }
 }
+
+/// Test FTS function recognition mode - queries that don't match predefined patterns
+/// but are optimized via fts_match/fts_score function detection.
+#[cfg(feature = "fts")]
+#[turso_macros::test]
+fn test_fts_function_recognition(tmp_db: TempDatabase) {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+
+    // Create table with extra columns to ensure queries don't match simple patterns
+    conn.execute(
+        "CREATE TABLE articles(id INTEGER PRIMARY KEY, author TEXT, category TEXT, title TEXT, body TEXT, views INTEGER)",
+    )
+    .unwrap();
+    conn.execute("CREATE INDEX fts_articles ON articles USING fts (title, body)")
+        .unwrap();
+
+    // Insert test data
+    conn.execute(
+        "INSERT INTO articles VALUES (1, 'Alice', 'tech', 'Rust Programming Guide', 'Learn Rust from scratch', 100)",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO articles VALUES (2, 'Bob', 'tech', 'Python Basics', 'Introduction to Python', 200)",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO articles VALUES (3, 'Alice', 'science', 'Rust in Nature', 'Oxidation and rust formation', 50)",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO articles VALUES (4, 'Charlie', 'tech', 'Advanced Rust Patterns', 'Rust ownership and lifetimes', 300)",
+    )
+    .unwrap();
+
+    // Test 1: Query with many extra SELECT columns (doesn't match patterns)
+    // This exercises function recognition: pattern expects only fts_score() as score
+    // but we SELECT multiple additional columns
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT id, author, title, category, views, fts_score(title, body, 'Rust') as score FROM articles WHERE fts_match(title, body, 'Rust')",
+    );
+    assert_eq!(rows.len(), 3); // Posts 1, 3, 4 contain "Rust"
+    let ids: Vec<i64> = rows
+        .iter()
+        .filter_map(|r| match &r[0] {
+            rusqlite::types::Value::Integer(i) => Some(*i),
+            _ => None,
+        })
+        .collect();
+    assert!(ids.contains(&1));
+    assert!(ids.contains(&3));
+    assert!(ids.contains(&4));
+
+    // Test 2: Query with extra WHERE and multiple columns
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT id, title, views FROM articles WHERE fts_match(title, body, 'Rust') AND author = 'Alice'",
+    );
+    assert_eq!(rows.len(), 2); // Posts 1 and 3 by Alice containing Rust
+    let ids: Vec<i64> = rows
+        .iter()
+        .filter_map(|r| match &r[0] {
+            rusqlite::types::Value::Integer(i) => Some(*i),
+            _ => None,
+        })
+        .collect();
+    assert!(ids.contains(&1));
+    assert!(ids.contains(&3));
+
+    // Test 3: Complex query with score, extra columns, WHERE, and ORDER BY
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT fts_score(title, body, 'Rust') as score, id, title, author FROM articles WHERE fts_match(title, body, 'Rust') AND category = 'tech' ORDER BY score DESC",
+    );
+    assert_eq!(rows.len(), 2); // Posts 1 and 4 are tech posts about Rust
+                               // Verify scores are in descending order
+    let scores: Vec<f64> = rows
+        .iter()
+        .filter_map(|r| match &r[0] {
+            rusqlite::types::Value::Real(r) => Some(*r),
+            _ => None,
+        })
+        .collect();
+    assert!(scores.len() == 2);
+    assert!(scores[0] >= scores[1]);
+
+    // Test 4: Query with only fts_match (no fts_score) and extra columns
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT id, author, views FROM articles WHERE fts_match(title, body, 'Python')",
+    );
+    assert_eq!(rows.len(), 1);
+    match &rows[0][0] {
+        rusqlite::types::Value::Integer(i) => assert_eq!(*i, 2),
+        _ => panic!("Expected integer id"),
+    }
+}
+
+/// Test query patterns that wouldn't work with pattern-based matching
+/// but should work with function recognition.
+#[cfg(feature = "fts")]
+#[turso_macros::test]
+fn test_fts_flexible_query_patterns(tmp_db: TempDatabase) {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute(
+        "CREATE TABLE docs(id INTEGER PRIMARY KEY, author TEXT, category TEXT, title TEXT, body TEXT, created_at INTEGER)",
+    )
+    .unwrap();
+    conn.execute("CREATE INDEX fts_docs ON docs USING fts (title, body)")
+        .unwrap();
+
+    // Insert test data
+    conn.execute("INSERT INTO docs VALUES (1, 'Alice', 'tech', 'Rust Guide', 'Learn Rust programming', 1000)")
+        .unwrap();
+    conn.execute(
+        "INSERT INTO docs VALUES (2, 'Bob', 'tech', 'Python Guide', 'Learn Python basics', 2000)",
+    )
+    .unwrap();
+    conn.execute("INSERT INTO docs VALUES (3, 'Alice', 'science', 'Rust Chemistry', 'Rust and oxidation', 3000)")
+        .unwrap();
+    conn.execute("INSERT INTO docs VALUES (4, 'Charlie', 'tech', 'Advanced Rust', 'Rust patterns and idioms', 4000)")
+        .unwrap();
+    conn.execute(
+        "INSERT INTO docs VALUES (5, 'Alice', 'tech', 'More Rust', 'Even more Rust content', 5000)",
+    )
+    .unwrap();
+
+    // Test 1: SELECT specific columns (not * or just score) - wouldn't match patterns
+    // Patterns expect SELECT * or SELECT fts_score(...) as score
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT id, title FROM docs WHERE fts_match(title, body, 'Rust')",
+    );
+    assert_eq!(rows.len(), 4); // Posts 1, 3, 4, 5
+
+    // Test 2: ORDER BY non-score column ASC - patterns only support ORDER BY score DESC
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT id, title FROM docs WHERE fts_match(title, body, 'Rust') ORDER BY id ASC",
+    );
+    assert_eq!(rows.len(), 4);
+    // Verify order by id
+    let ids: Vec<i64> = rows
+        .iter()
+        .filter_map(|r| match &r[0] {
+            rusqlite::types::Value::Integer(i) => Some(*i),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(ids, vec![1, 3, 4, 5]);
+
+    // Test 3: ORDER BY non-score column DESC - wouldn't match patterns
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT id, created_at FROM docs WHERE fts_match(title, body, 'Rust') ORDER BY created_at DESC",
+    );
+    assert_eq!(rows.len(), 4);
+    // Verify order by created_at DESC
+    let created_ats: Vec<i64> = rows
+        .iter()
+        .filter_map(|r| match &r[1] {
+            rusqlite::types::Value::Integer(i) => Some(*i),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(created_ats, vec![5000, 4000, 3000, 1000]);
+
+    // Test 4: Multiple WHERE conditions with different operators
+    // Patterns don't have additional WHERE conditions
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT id FROM docs WHERE fts_match(title, body, 'Rust') AND created_at >= 3000 AND author = 'Alice'",
+    );
+    assert_eq!(rows.len(), 2); // Posts 3 and 5 (Alice, Rust, created_at >= 3000)
+    let ids: Vec<i64> = rows
+        .iter()
+        .filter_map(|r| match &r[0] {
+            rusqlite::types::Value::Integer(i) => Some(*i),
+            _ => None,
+        })
+        .collect();
+    assert!(ids.contains(&3));
+    assert!(ids.contains(&5));
+
+    // Test 5: LIMIT with non-pattern SELECT columns
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT id, author FROM docs WHERE fts_match(title, body, 'Rust') LIMIT 2",
+    );
+    assert_eq!(rows.len(), 2); // Should return exactly 2 rows
+
+    // Test 6: Computed expressions in SELECT - patterns don't handle expressions
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT id, author || ' wrote ' || title as description FROM docs WHERE fts_match(title, body, 'Python')",
+    );
+    assert_eq!(rows.len(), 1);
+    match &rows[0][1] {
+        rusqlite::types::Value::Text(t) => assert_eq!(t, "Bob wrote Python Guide"),
+        _ => panic!("Expected text"),
+    }
+
+    // Test 7: fts_score with extra columns and WHERE - wouldn't match combined patterns
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT fts_score(title, body, 'Rust') as score, id, author, category FROM docs WHERE fts_match(title, body, 'Rust') AND category = 'tech'",
+    );
+    // Should return tech posts about Rust: 1, 4, 5
+    assert_eq!(rows.len(), 3);
+    let ids: Vec<i64> = rows
+        .iter()
+        .filter_map(|r| match &r[1] {
+            rusqlite::types::Value::Integer(i) => Some(*i),
+            _ => None,
+        })
+        .collect();
+    assert!(ids.contains(&1));
+    assert!(ids.contains(&4));
+    assert!(ids.contains(&5));
+    // Verify scores are returned
+    for row in &rows {
+        match &row[0] {
+            rusqlite::types::Value::Real(score) => assert!(*score > 0.0),
+            _ => panic!("Expected real score"),
+        }
+    }
+
+    // Test 8: Multiple SELECT expressions with score
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT id * 10 as id_times_ten, fts_score(title, body, 'Rust') as score FROM docs WHERE fts_match(title, body, 'Rust')",
+    );
+    assert_eq!(rows.len(), 4);
+    // Verify id * 10 calculation works
+    let id_times_tens: Vec<i64> = rows
+        .iter()
+        .filter_map(|r| match &r[0] {
+            rusqlite::types::Value::Integer(i) => Some(*i),
+            _ => None,
+        })
+        .collect();
+    // Should contain 10, 30, 40, 50 (ids 1,3,4,5 * 10)
+    assert!(id_times_tens.contains(&10));
+    assert!(id_times_tens.contains(&30));
+    assert!(id_times_tens.contains(&40));
+    assert!(id_times_tens.contains(&50));
+}
