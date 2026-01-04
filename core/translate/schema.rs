@@ -629,9 +629,16 @@ pub fn translate_create_virtual_table(
 }
 
 /// Validates whether a DROP TABLE operation is allowed on the given table name.
-fn validate_drop_table(resolver: &Resolver, tbl_name: &str) -> Result<()> {
-    // special case, allow dropping `sqlite_stat1`
-    if crate::schema::is_system_table(tbl_name) && !tbl_name.eq_ignore_ascii_case(STATS_TABLE) {
+fn validate_drop_table(
+    resolver: &Resolver,
+    tbl_name: &str,
+    connection: &Arc<Connection>,
+) -> Result<()> {
+    if !connection.is_nested_stmt()
+        && crate::schema::is_system_table(tbl_name)
+        // special case, allow dropping `sqlite_stat1`
+        && !tbl_name.eq_ignore_ascii_case(STATS_TABLE)
+    {
         bail_parse_error!("Cannot drop system table {}", tbl_name);
     }
     // Check if this is a materialized view - if so, refuse to drop it with DROP TABLE
@@ -663,7 +670,7 @@ pub fn translate_drop_table(
         }
         bail_parse_error!("No such table: {name}");
     };
-    validate_drop_table(resolver, name)?;
+    validate_drop_table(resolver, name, connection)?;
     // Check if foreign keys are enabled and if this table is referenced by foreign keys
     // Fire FK actions (CASCADE, SET NULL, SET DEFAULT) or check for violations (RESTRICT, NO ACTION)
     if connection.foreign_keys_enabled() && resolver.schema.any_resolved_fks_referencing(name) {
