@@ -198,9 +198,12 @@ impl Display for VectorFunc {
 #[cfg(feature = "fts")]
 #[derive(Debug, Clone, PartialEq)]
 pub enum FtsFunc {
-    /// fts_score(col1, col2, ..., query) - computes FTS relevance score
+    /// fts_score(col1, col2, ..., query): computes FTS relevance score
     /// When used with an FTS index, the optimizer routes through the index method
     FtsScore,
+    /// fts_match(col1, col2, ..., query): returns true if document matches query
+    /// Used in WHERE clause for filtering rows by FTS match
+    FtsMatch,
 }
 
 #[cfg(feature = "fts")]
@@ -215,6 +218,7 @@ impl Display for FtsFunc {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let str = match self {
             Self::FtsScore => "fts_score",
+            Self::FtsMatch => "fts_match",
         };
         write!(f, "{str}")
     }
@@ -966,6 +970,8 @@ impl Func {
             // FTS functions
             #[cfg(feature = "fts")]
             "fts_score" => Ok(Self::Fts(FtsFunc::FtsScore)),
+            #[cfg(feature = "fts")]
+            "fts_match" => Ok(Self::Fts(FtsFunc::FtsMatch)),
             _ => crate::bail_parse_error!("no such function: {}", name),
         }
     }
