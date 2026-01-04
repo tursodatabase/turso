@@ -74,6 +74,7 @@ pub fn translate_create_index(
     if RESERVED_TABLE_PREFIXES
         .iter()
         .any(|prefix| idx_name.starts_with(prefix) || tbl_name.starts_with(prefix))
+        && !connection.is_nested_stmt()
     {
         bail_parse_error!(
             "Object name reserved for internal use: {}",
