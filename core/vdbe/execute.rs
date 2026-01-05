@@ -6776,6 +6776,8 @@ pub struct OpInsertState {
 #[derive(Debug, PartialEq)]
 pub enum OpInsertSubState {
     /// If this insert overwrites a record, capture the old record for incremental view maintenance.
+    /// If cursor is already positioned (no REQUIRE_SEEK), capture directly.
+    /// If REQUIRE_SEEK is set, transition to Seek first.
     MaybeCaptureRecord,
     /// Seek to the correct position if needed.
     /// In a table insert, if the caller does not pass InsertFlags::REQUIRE_SEEK, they must ensure that a seek has already happened to the correct location.
@@ -6783,6 +6785,9 @@ pub enum OpInsertSubState {
     /// 1. op_new_rowid() seeks to the end of the table, which is the correct insertion position.
     /// 2. op_not_exists() seeks to the position in the table where the target rowid would be inserted.
     Seek,
+    /// Capture the old record at the current cursor position for IVM.
+    /// The cursor must already be positioned (by a prior seek or by NotExists/NewRowid).
+    CaptureRecord,
     /// Insert the row into the table.
     Insert,
     /// Updating last_insert_rowid may return IO, so we need a separate state for it so that we don't
@@ -6812,78 +6817,23 @@ pub fn op_insert(
     loop {
         match &state.op_insert_state.sub_state {
             OpInsertSubState::MaybeCaptureRecord => {
-                let schema = program.connection.schema.read();
-                let dependent_views = schema.get_dependent_materialized_views(table_name);
+                let has_dependent_views = {
+                    let schema = program.connection.schema.read();
+                    !schema
+                        .get_dependent_materialized_views(table_name)
+                        .is_empty()
+                };
                 // If there are no dependent views, we don't need to capture the old record.
-                // We also don't need to do it if the rowid of the UPDATEd row was changed, because that means
-                // we deleted it earlier and `op_delete` already captured the change.
-                if dependent_views.is_empty() || flag.has(InsertFlags::UPDATE_ROWID_CHANGE) {
-                    if flag.has(InsertFlags::REQUIRE_SEEK) {
-                        state.op_insert_state.sub_state = OpInsertSubState::Seek;
-                    } else {
-                        state.op_insert_state.sub_state = OpInsertSubState::Insert;
-                    }
-                    continue;
-                }
+                // We also don't need to do it if the rowid of the UPDATEd row was changed, because
+                // op_delete already captured the deletion for IVM, and this insert only needs to
+                // record the new row (which ApplyViewChange handles without old_record).
+                let needs_capture =
+                    has_dependent_views && !flag.has(InsertFlags::UPDATE_ROWID_CHANGE);
 
-                turso_assert!(
-                    !flag.has(InsertFlags::REQUIRE_SEEK),
-                    "to capture old record accurately, we must be located at the correct position in the table"
-                );
-
-                // Get the key we're going to insert
-                let insert_key = match &state.registers[*key_reg].get_value() {
-                    Value::Numeric(Numeric::Integer(i)) => *i,
-                    _ => {
-                        // If key is not an integer, we can't check - assume no old record
-                        state.op_insert_state.old_record = None;
-                        state.op_insert_state.sub_state = if flag.has(InsertFlags::REQUIRE_SEEK) {
-                            OpInsertSubState::Seek
-                        } else {
-                            OpInsertSubState::Insert
-                        };
-                        continue;
-                    }
-                };
-
-                let old_record = {
-                    let cursor = state.get_cursor(*cursor_id);
-                    let cursor = cursor.as_btree_mut();
-                    // Get the current key - for INSERT operations, there may not be a current row
-                    let maybe_key = return_if_io!(cursor.rowid());
-                    if let Some(key) = maybe_key {
-                        // Only capture as old record if the cursor is at the position we're inserting to
-                        if key == insert_key {
-                            // Get the current record before deletion and extract values
-                            let maybe_record = return_if_io!(cursor.record());
-                            if let Some(record) = maybe_record {
-                                let mut values = record.get_values_owned()?;
-
-                                // Fix rowid alias columns: replace Null with actual rowid value
-                                if let Some(table) = schema.get_table(table_name) {
-                                    for (i, col) in table.columns().iter().enumerate() {
-                                        if col.is_rowid_alias() && i < values.len() {
-                                            values[i] = Value::from_i64(key);
-                                        }
-                                    }
-                                }
-                                Some((key, values))
-                            } else {
-                                None
-                            }
-                        } else {
-                            // Cursor is at wrong position - this is a fresh INSERT, not a replacement
-                            None
-                        }
-                    } else {
-                        // No current row - this is a fresh INSERT, not an UPDATE
-                        None
-                    }
-                };
-
-                state.op_insert_state.old_record = old_record;
                 if flag.has(InsertFlags::REQUIRE_SEEK) {
                     state.op_insert_state.sub_state = OpInsertSubState::Seek;
+                } else if needs_capture {
+                    state.op_insert_state.sub_state = OpInsertSubState::CaptureRecord;
                 } else {
                     state.op_insert_state.sub_state = OpInsertSubState::Insert;
                 }
@@ -6904,7 +6854,56 @@ pub fn op_insert(
                 )? {
                     return Ok(InsnFunctionStepResult::IO(io));
                 }
+                let has_dependent_views = {
+                    let schema = program.connection.schema.read();
+                    !schema
+                        .get_dependent_materialized_views(table_name)
+                        .is_empty()
+                };
+                let needs_capture =
+                    has_dependent_views && !flag.has(InsertFlags::UPDATE_ROWID_CHANGE);
+                if needs_capture {
+                    state.op_insert_state.sub_state = OpInsertSubState::CaptureRecord;
+                } else {
+                    state.op_insert_state.sub_state = OpInsertSubState::Insert;
+                }
+                continue;
+            }
+            OpInsertSubState::CaptureRecord => {
+                let insert_key = match &state.registers[*key_reg].get_value() {
+                    Value::Numeric(Numeric::Integer(i)) => *i,
+                    _ => unreachable!("expected integer key in insert"),
+                };
+
+                let cursor = state.get_cursor(*cursor_id);
+                let cursor = cursor.as_btree_mut();
+                let maybe_key = return_if_io!(cursor.rowid());
+                let old_record = if let Some(key) = maybe_key {
+                    if key == insert_key {
+                        let maybe_record = return_if_io!(cursor.record());
+                        if let Some(record) = maybe_record {
+                            let mut values = record.get_values_owned()?;
+                            let schema = program.connection.schema.read();
+                            if let Some(table) = schema.get_table(table_name) {
+                                for (i, col) in table.columns().iter().enumerate() {
+                                    if col.is_rowid_alias() && i < values.len() {
+                                        values[i] = Value::from_i64(key);
+                                    }
+                                }
+                            }
+                            Some((key, values))
+                        } else {
+                            None
+                        }
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+                state.op_insert_state.old_record = old_record;
                 state.op_insert_state.sub_state = OpInsertSubState::Insert;
+                continue;
             }
             OpInsertSubState::Insert => {
                 let key = match &state.registers[*key_reg].get_value() {
