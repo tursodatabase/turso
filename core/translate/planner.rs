@@ -319,7 +319,10 @@ fn parse_from_clause_table(
             )
         }
         ast::SelectTable::Select(subselect, maybe_alias) => {
-            // Build outer query refs from existing outer refs and CTEs
+            // Build outer query refs for the subquery from two sources:
+            // 1. Existing outer query refs (from enclosing queries) - preserve their is_lateral_ref flag
+            // 2. CTEs available in this scope - these are NOT lateral refs because CTE references
+            //    are for table lookup, not for correlated column access from preceding FROM tables
             let mut outer_query_refs_for_subquery: Vec<OuterQueryReference> = table_references
                 .outer_query_refs()
                 .iter()
@@ -332,7 +335,7 @@ fn parse_from_clause_table(
                             internal_id: t.internal_id,
                             table: t.table,
                             col_used_mask: ColumnUsedMask::default(),
-                            is_lateral_ref: false, // CTEs are not LATERAL refs
+                            is_lateral_ref: false,
                         }),
                 )
                 .collect();
@@ -341,12 +344,20 @@ fn parse_from_clause_table(
             // This allows the subquery to reference columns from tables appearing to its left.
             if is_lateral {
                 for joined_table in table_references.joined_tables().iter() {
+                    // Currently, LATERAL only works when preceding tables are subqueries.
+                    // BTree/Virtual tables require cursor emission order changes (future work).
+                    if !matches!(joined_table.table, Table::FromClauseSubquery(_)) {
+                        crate::bail_parse_error!(
+                            "LATERAL JOIN currently only supports subqueries as preceding tables, not base tables like '{}'",
+                            joined_table.identifier
+                        );
+                    }
                     outer_query_refs_for_subquery.push(OuterQueryReference {
                         identifier: joined_table.identifier.clone(),
                         internal_id: joined_table.internal_id,
                         table: joined_table.table.clone(),
                         col_used_mask: ColumnUsedMask::default(),
-                        is_lateral_ref: true, // LATERAL refs allow column resolution
+                        is_lateral_ref: true, // Mark as LATERAL ref for column resolution
                     });
                 }
             }

@@ -80,4 +80,17 @@ do_catchsql_test lateral-error-right-lateral {
     SELECT * FROM (SELECT 1 AS x) AS t1 RIGHT LATERAL JOIN (SELECT x) AS t2;
 } {1 {RIGHT JOIN is not supported}}
 
+# Error: LATERAL with base table on left side (not yet supported)
+# This is a current limitation - LATERAL only works with subqueries as preceding tables.
+# Support for BTree tables requires changes to cursor emission order (future work).
+do_catchsql_test lateral-error-btree-left-side {
+    CREATE TABLE IF NOT EXISTS base_tbl (x INTEGER);
+    SELECT * FROM base_tbl LATERAL JOIN (SELECT x * 10 AS y) AS sub;
+} {1 {LATERAL JOIN currently only supports subqueries as preceding tables, not base tables like 'base_tbl'}}
+
+# Cleanup base_tbl
+do_execsql_test lateral-cleanup-btree-test {
+    DROP TABLE IF EXISTS base_tbl;
+} {}
+
 finish_test
