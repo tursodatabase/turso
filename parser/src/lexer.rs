@@ -85,6 +85,7 @@ fn keyword_or_id_token(input: &[u8]) -> TokenType {
         b"JOIN" => TokenType::TK_JOIN,
         b"KEY" => TokenType::TK_KEY,
         b"LAST" => TokenType::TK_LAST,
+        b"LATERAL" => TokenType::TK_JOIN_KW,
         b"LEFT" => TokenType::TK_JOIN_KW,
         b"LIKE" => TokenType::TK_LIKE_KW,
         b"LIMIT" => TokenType::TK_LIMIT,

@@ -102,6 +102,7 @@ fn join_type_from_bytes(s: &[u8]) -> Result<JoinType> {
         b"CROSS" => Ok(JoinType::INNER | JoinType::CROSS),
         b"FULL" => Ok(JoinType::LEFT | JoinType::RIGHT | JoinType::OUTER),
         b"INNER" => Ok(JoinType::INNER),
+        b"LATERAL" => Ok(JoinType::LATERAL),
         b"LEFT" => Ok(JoinType::LEFT | JoinType::OUTER),
         b"NATURAL" => Ok(JoinType::NATURAL),
         b"RIGHT" => Ok(JoinType::RIGHT | JoinType::OUTER),
@@ -134,6 +135,13 @@ fn new_join_type(n0: &[u8], n1: Option<&[u8]>, n2: Option<&[u8]>) -> Result<Join
             from_bytes_as_str(n1.unwrap_or(&[])),
             from_bytes_as_str(n2.unwrap_or(&[])),
         )));
+    }
+
+    // LATERAL cannot be combined with OUTER joins (LEFT/RIGHT/FULL)
+    if jt.contains(JoinType::LATERAL) && jt.contains(JoinType::OUTER) {
+        return Err(Error::Custom(
+            "LEFT/RIGHT LATERAL JOIN is not yet supported".to_string(),
+        ));
     }
 
     Ok(jt)

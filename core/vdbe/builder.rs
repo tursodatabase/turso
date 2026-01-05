@@ -157,6 +157,11 @@ pub struct ProgramBuilder {
     hash_build_signatures: HashMap<usize, HashBuildSignature>,
     /// Hash tables to keep open across subplans (e.g. materialization).
     hash_tables_to_keep_open: HashSet<usize>,
+    /// Maps FROM clause subquery table internal IDs (as usize) to their result column start register.
+    /// This allows LATERAL joins to look up the result registers of preceding subqueries,
+    /// even when the subquery is accessed through outer_query_refs (where the clone doesn't
+    /// have the register info).
+    subquery_result_regs: HashMap<usize, usize>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -363,6 +368,7 @@ impl ProgramBuilder {
             cursor_overrides: HashMap::new(),
             hash_build_signatures: HashMap::new(),
             hash_tables_to_keep_open: HashSet::new(),
+            subquery_result_regs: HashMap::new(),
         }
     }
 
@@ -1034,6 +1040,23 @@ impl ProgramBuilder {
     /// Check if a cursor override is active for a given table.
     pub fn has_cursor_override(&self, table_ref_id: TableInternalId) -> bool {
         self.cursor_overrides.contains_key(&table_ref_id.into())
+    }
+
+    /// Register a subquery's result column start register.
+    /// This allows LATERAL joins to look up the result registers of preceding subqueries.
+    pub fn register_subquery_result_reg(
+        &mut self,
+        table_ref_id: TableInternalId,
+        result_start_reg: usize,
+    ) {
+        self.subquery_result_regs
+            .insert(table_ref_id.into(), result_start_reg);
+    }
+
+    /// Look up a subquery's result column start register by table internal ID.
+    /// Returns None if the table is not a registered subquery.
+    pub fn get_subquery_result_reg(&self, table_ref_id: TableInternalId) -> Option<usize> {
+        self.subquery_result_regs.get(&table_ref_id.into()).copied()
     }
 
     // translate [CursorKey] to cursor id

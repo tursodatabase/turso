@@ -2347,11 +2347,20 @@ pub fn translate_expr(
                 Table::FromClauseSubquery(from_clause_subquery) => {
                     // If we are reading a column from a subquery, we instead copy the column from the
                     // subquery's result registers.
-                    program.emit_insn(Insn::Copy {
-                        src_reg: from_clause_subquery
+                    let result_start_reg = if is_from_outer_query_scope {
+                        // For LATERAL joins, the table might be from outer_query_refs where the clone
+                        // doesn't have result_columns_start_reg set. Look it up from program builder.
+                        program
+                            .get_subquery_result_reg(*table_ref_id)
+                            .or(from_clause_subquery.result_columns_start_reg)
+                            .expect("Subquery result_columns_start_reg must be set (checked both program registry and table)")
+                    } else {
+                        from_clause_subquery
                             .result_columns_start_reg
                             .expect("Subquery result_columns_start_reg must be set")
-                            + *column,
+                    };
+                    program.emit_insn(Insn::Copy {
+                        src_reg: result_start_reg + *column,
                         dst_reg: target_register,
                         extra_amount: 0,
                     });
@@ -3823,7 +3832,11 @@ pub fn bind_and_rewrite_expr<'a>(
                             // lookup (e.g., FROM cte1), not for column resolution. Columns from
                             // CTEs should only be accessible when the CTE is explicitly in the
                             // FROM clause, not as implicit outer references.
-                            if matches!(outer_ref.table, Table::FromClauseSubquery(_)) {
+                            // However, LATERAL refs are different - they DO allow column resolution
+                            // from preceding FROM clause tables (including subqueries).
+                            if matches!(outer_ref.table, Table::FromClauseSubquery(_))
+                                && !outer_ref.is_lateral_ref
+                            {
                                 continue;
                             }
                             let col_idx = outer_ref.table.columns().iter().position(|c| {

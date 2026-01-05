@@ -823,14 +823,15 @@ pub fn compute_best_join_order<'a>(
     }
     join_order.clear();
 
-    // As mentioned, inner joins are commutative. Outer joins are NOT.
-    // Example:
+    // As mentioned, inner joins are commutative. Outer joins and LATERAL joins are NOT.
+    // Examples:
     // "a LEFT JOIN b" can NOT be reordered as "b LEFT JOIN a".
-    // If there are outer joins in the plan, ensure correct ordering.
+    // "a LATERAL JOIN (SELECT a.x)" can NOT be reordered - the LATERAL subquery depends on 'a'.
+    // If there are outer joins or LATERAL joins in the plan, ensure correct ordering.
     let left_join_illegal_map = {
         let left_join_count = joined_tables
             .iter()
-            .filter(|t| t.join_info.as_ref().is_some_and(|j| j.outer))
+            .filter(|t| t.join_info.as_ref().is_some_and(|j| j.outer || j.lateral))
             .count();
         if left_join_count == 0 {
             None
@@ -840,7 +841,14 @@ pub fn compute_best_join_order<'a>(
                 HashMap::with_capacity(left_join_count);
             for (i, _) in joined_tables.iter().enumerate() {
                 for (j, joined_table) in joined_tables.iter().enumerate().skip(i + 1) {
-                    if joined_table.join_info.as_ref().is_some_and(|j| j.outer) {
+                    // For OUTER or LATERAL joins, the right-side table depends on left-side tables.
+                    // LATERAL subqueries reference columns from preceding tables, so they cannot
+                    // be reordered to appear before those tables.
+                    if joined_table
+                        .join_info
+                        .as_ref()
+                        .is_some_and(|ji| ji.outer || ji.lateral)
+                    {
                         // bitwise OR the masks
                         if let Some(illegal_lhs) = left_join_illegal_map.get_mut(&i) {
                             illegal_lhs.add_table(j);
@@ -1055,11 +1063,12 @@ pub fn compute_greedy_join_order<'a>(
         return Ok(None);
     }
 
-    // Outer join RHS tables require all preceding tables to be joined first.
+    // Outer join and LATERAL join RHS tables require all preceding tables to be joined first.
+    // LATERAL subqueries reference columns from preceding tables, so they have the same constraint.
     let left_join_deps: HashMap<usize, TableMask> = joined_tables
         .iter()
         .enumerate()
-        .filter(|(_, t)| t.join_info.as_ref().is_some_and(|ji| ji.outer))
+        .filter(|(_, t)| t.join_info.as_ref().is_some_and(|ji| ji.outer || ji.lateral))
         .map(|(j, _)| {
             let mut required = TableMask::new();
             for k in 0..j {
@@ -1677,6 +1686,7 @@ mod tests {
                 t2.clone(),
                 Some(JoinInfo {
                     outer: false,
+                    lateral: false,
                     using: vec![],
                 }),
                 table_id_counter.next(),
@@ -1792,6 +1802,7 @@ mod tests {
                 table_customers.clone(),
                 Some(JoinInfo {
                     outer: false,
+                    lateral: false,
                     using: vec![],
                 }),
                 table_id_counter.next(),
@@ -1800,6 +1811,7 @@ mod tests {
                 table_order_items.clone(),
                 Some(JoinInfo {
                     outer: false,
+                    lateral: false,
                     using: vec![],
                 }),
                 table_id_counter.next(),
@@ -1994,6 +2006,7 @@ mod tests {
                 t2.clone(),
                 Some(JoinInfo {
                     outer: false,
+                    lateral: false,
                     using: vec![],
                 }),
                 table_id_counter.next(),
@@ -2002,6 +2015,7 @@ mod tests {
                 t3.clone(),
                 Some(JoinInfo {
                     outer: false,
+                    lateral: false,
                     using: vec![],
                 }),
                 table_id_counter.next(),
@@ -2109,6 +2123,7 @@ mod tests {
                     t.clone(),
                     Some(JoinInfo {
                         outer: false,
+                        lateral: false,
                         using: vec![],
                     }),
                     table_id_counter.next(),
@@ -2118,6 +2133,7 @@ mod tests {
                 fact_table.clone(),
                 Some(JoinInfo {
                     outer: false,
+                    lateral: false,
                     using: vec![],
                 }),
                 table_id_counter.next(),
@@ -2805,6 +2821,7 @@ mod tests {
                 t2.clone(),
                 Some(JoinInfo {
                     outer: false,
+                    lateral: false,
                     using: vec![],
                 }),
                 table_id_counter.next(),

@@ -574,6 +574,9 @@ pub fn select_star(tables: &[JoinedTable], out_columns: &mut Vec<ResultSetColumn
 pub struct JoinInfo {
     /// Whether this is an OUTER JOIN.
     pub outer: bool,
+    /// Whether this is a LATERAL JOIN. LATERAL subqueries can reference tables
+    /// appearing to their left in the FROM clause.
+    pub lateral: bool,
     /// The USING clause for the join, if any. NATURAL JOIN is transformed into USING (col1, col2, ...).
     pub using: Vec<ast::Name>,
 }
@@ -635,6 +638,10 @@ pub struct OuterQueryReference {
     /// i.e., if the subquery depends on tables T and U,
     /// then both T and U need to be in scope for the subquery to be evaluated.
     pub col_used_mask: ColumnUsedMask,
+    /// Whether this reference comes from a LATERAL JOIN. LATERAL references
+    /// allow column resolution from preceding FROM clause tables, even if
+    /// they are subqueries (FromClauseSubquery).
+    pub is_lateral_ref: bool,
 }
 
 impl OuterQueryReference {

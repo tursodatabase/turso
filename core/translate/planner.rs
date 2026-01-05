@@ -292,7 +292,13 @@ fn parse_from_clause_table(
     vtab_predicates: &mut Vec<Expr>,
     ctes: &mut Vec<JoinedTable>,
     connection: &Arc<crate::Connection>,
+    is_lateral: bool,
 ) -> Result<()> {
+    // LATERAL can only be applied to subqueries, not plain tables or table-valued functions
+    if is_lateral && !matches!(table, ast::SelectTable::Select(..)) {
+        crate::bail_parse_error!("LATERAL can only be applied to subqueries");
+    }
+
     match table {
         ast::SelectTable::Table(qualified_name, maybe_alias, indexed) => {
             if indexed.is_some() {
@@ -313,7 +319,8 @@ fn parse_from_clause_table(
             )
         }
         ast::SelectTable::Select(subselect, maybe_alias) => {
-            let outer_query_refs_for_subquery = table_references
+            // Build outer query refs from existing outer refs and CTEs
+            let mut outer_query_refs_for_subquery: Vec<OuterQueryReference> = table_references
                 .outer_query_refs()
                 .iter()
                 .cloned()
@@ -325,9 +332,24 @@ fn parse_from_clause_table(
                             internal_id: t.internal_id,
                             table: t.table,
                             col_used_mask: ColumnUsedMask::default(),
+                            is_lateral_ref: false, // CTEs are not LATERAL refs
                         }),
                 )
-                .collect::<Vec<_>>();
+                .collect();
+
+            // For LATERAL joins, also include all preceding tables from the current FROM clause.
+            // This allows the subquery to reference columns from tables appearing to its left.
+            if is_lateral {
+                for joined_table in table_references.joined_tables().iter() {
+                    outer_query_refs_for_subquery.push(OuterQueryReference {
+                        identifier: joined_table.identifier.clone(),
+                        internal_id: joined_table.internal_id,
+                        table: joined_table.table.clone(),
+                        col_used_mask: ColumnUsedMask::default(),
+                        is_lateral_ref: true, // LATERAL refs allow column resolution
+                    });
+                }
+            }
             let Plan::Select(subplan) = prepare_select_plan(
                 subselect,
                 resolver,
@@ -455,7 +477,9 @@ fn parse_table(
             .cloned()
             .or_else(|| Some(ast::As::As(table_name.clone())));
 
-        // Recursively call parse_from_clause_table with the view as a SELECT
+        // Recursively call parse_from_clause_table with the view as a SELECT.
+        // Views are expanded as non-LATERAL subqueries - their column references were
+        // resolved at view creation time, not invocation time.
         let result = parse_from_clause_table(
             ast::SelectTable::Select(*subselect.clone(), view_alias),
             resolver,
@@ -464,6 +488,7 @@ fn parse_table(
             vtab_predicates,
             ctes,
             connection,
+            false, // Views are not LATERAL
         );
         view.done();
         return result;
@@ -696,6 +721,7 @@ pub fn parse_from(
                     internal_id: t.internal_id,
                     table: t.table.clone(),
                     col_used_mask: ColumnUsedMask::default(),
+                    is_lateral_ref: false, // CTEs are not LATERAL refs
                 }
             }));
 
@@ -724,6 +750,8 @@ pub fn parse_from(
     let from_owned = std::mem::take(&mut from).unwrap();
     let select_owned = from_owned.select;
     let joins_owned = from_owned.joins;
+    // Parse the first table in the FROM clause - it cannot be LATERAL since
+    // there are no preceding tables to reference
     parse_from_clause_table(
         *select_owned,
         resolver,
@@ -732,6 +760,7 @@ pub fn parse_from(
         vtab_predicates,
         &mut ctes_as_subqueries,
         connection,
+        false, // First table cannot be LATERAL
     )?;
 
     for join in joins_owned.into_iter() {
@@ -1094,17 +1123,9 @@ fn parse_join(
         constraint,
     } = join;
 
-    parse_from_clause_table(
-        table.as_ref().clone(),
-        resolver,
-        program,
-        table_references,
-        vtab_predicates,
-        ctes,
-        connection,
-    )?;
-
-    let (outer, natural) = match join_operator {
+    // Extract join flags from the operator BEFORE processing the table,
+    // since LATERAL affects how the table's subquery references are resolved
+    let (outer, natural, is_lateral) = match &join_operator {
         ast::JoinOperator::TypedJoin(Some(join_type)) => {
             if join_type.contains(JoinType::RIGHT) {
                 crate::bail_parse_error!("RIGHT JOIN is not supported");
@@ -1114,10 +1135,22 @@ fn parse_join(
             }
             let is_outer = join_type.contains(JoinType::OUTER);
             let is_natural = join_type.contains(JoinType::NATURAL);
-            (is_outer, is_natural)
+            let is_lateral = join_type.contains(JoinType::LATERAL);
+            (is_outer, is_natural, is_lateral)
         }
-        _ => (false, false),
+        _ => (false, false, false),
     };
+
+    parse_from_clause_table(
+        table.as_ref().clone(),
+        resolver,
+        program,
+        table_references,
+        vtab_predicates,
+        ctes,
+        connection,
+        is_lateral,
+    )?;
 
     if natural && constraint.is_some() {
         crate::bail_parse_error!("NATURAL JOIN cannot be combined with ON or USING clause");
@@ -1293,7 +1326,11 @@ fn parse_join(
         .joined_tables_mut()
         .get_mut(last_idx)
         .unwrap();
-    rightmost_table.join_info = Some(JoinInfo { outer, using });
+    rightmost_table.join_info = Some(JoinInfo {
+        outer,
+        lateral: is_lateral,
+        using,
+    });
 
     Ok(())
 }

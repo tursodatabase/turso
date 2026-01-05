@@ -151,6 +151,7 @@ fn plan_subqueries_with_outer_query_access<'a>(
                 identifier: t.identifier.clone(),
                 internal_id: t.internal_id,
                 col_used_mask: ColumnUsedMask::default(),
+                is_lateral_ref: false,
             })
             .chain(
                 referenced_tables
@@ -161,6 +162,7 @@ fn plan_subqueries_with_outer_query_access<'a>(
                         identifier: t.identifier.clone(),
                         internal_id: t.internal_id,
                         col_used_mask: ColumnUsedMask::default(),
+                        is_lateral_ref: t.is_lateral_ref, // Preserve LATERAL flag
                     }),
             )
             .collect::<Vec<_>>()
@@ -577,6 +579,9 @@ pub fn emit_from_clause_subqueries(
             // This is done so that translate_expr() can read the result columns of the subquery,
             // as if it were reading from a regular table.
             from_clause_subquery.result_columns_start_reg = Some(result_columns_start);
+            // Also register in program builder so LATERAL joins can look it up.
+            // This is needed because LATERAL refs have cloned tables that don't get the reg update.
+            program.register_subquery_result_reg(table_reference.internal_id, result_columns_start);
         }
 
         program.pop_current_parent_explain();
