@@ -27,11 +27,17 @@ pub struct WorkloadContext<'a> {
     pub enable_mvcc: bool,
     /// Tables vec built from sim_state.tables for GenerationContext
     pub(crate) tables_vec: Vec<Table>,
+    /// Views vec built from sim_state.views for GenerationContext
+    pub(crate) views_vec: Vec<sql_generation::model::view::View>,
 }
 
 impl GenerationContext for WorkloadContext<'_> {
     fn tables(&self) -> &Vec<Table> {
         &self.tables_vec
+    }
+
+    fn views(&self) -> &Vec<sql_generation::model::view::View> {
+        &self.views_vec
     }
 
     fn opts(&self) -> &Opts {

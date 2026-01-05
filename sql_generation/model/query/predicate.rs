@@ -68,6 +68,13 @@ impl Predicate {
         Self(expr).parens()
     }
 
+    /// Equality without parentheses - needed for JOIN ON clauses in materialized views
+    /// where the DBSP parser requires simple equality without parentheses
+    pub fn eq_bare(lhs: Predicate, rhs: Predicate) -> Self {
+        let expr = ast::Expr::Binary(Box::new(lhs.0), ast::Operator::Equals, Box::new(rhs.0));
+        Self(expr)
+    }
+
     pub fn is(lhs: Predicate, rhs: Predicate) -> Self {
         let expr = ast::Expr::Binary(Box::new(lhs.0), ast::Operator::Is, Box::new(rhs.0));
         Self(expr).parens()
@@ -86,6 +93,58 @@ impl Predicate {
     pub fn parens(self) -> Self {
         let expr = ast::Expr::Parenthesized(vec![Box::new(self.0)]);
         Self(expr)
+    }
+
+    /// Create a qualified column reference (table.column or alias.column)
+    pub fn qualified_column(table_or_alias: &str, column: &str) -> Self {
+        Self(ast::Expr::Qualified(
+            ast::Name::from_string(table_or_alias),
+            ast::Name::from_string(column),
+        ))
+    }
+
+    /// Create an integer literal
+    pub fn literal_int(n: i64) -> Self {
+        Self(ast::Expr::Literal(ast::Literal::Numeric(n.to_string())))
+    }
+
+    /// Create a text literal (wraps the string in single quotes)
+    pub fn literal_text(s: &str) -> Self {
+        Self(ast::Expr::Literal(ast::Literal::String(format!("'{s}'"))))
+    }
+
+    /// Binary addition
+    #[allow(clippy::should_implement_trait)]
+    pub fn add(lhs: Predicate, rhs: Predicate) -> Self {
+        let expr = ast::Expr::Binary(Box::new(lhs.0), ast::Operator::Add, Box::new(rhs.0));
+        Self(expr)
+    }
+
+    /// String concatenation (lhs || rhs || ...)
+    pub fn concat(predicates: Vec<Predicate>) -> Self {
+        if predicates.is_empty() {
+            Self::literal_text("")
+        } else if predicates.len() == 1 {
+            predicates.into_iter().next().unwrap()
+        } else {
+            let mut iter = predicates.into_iter();
+            let first = iter.next().unwrap();
+            iter.fold(first, |acc, p| {
+                let expr = ast::Expr::Binary(Box::new(acc.0), ast::Operator::Concat, Box::new(p.0));
+                Self(expr)
+            })
+        }
+    }
+
+    /// Less than comparison
+    pub fn lt(lhs: Predicate, rhs: Predicate) -> Self {
+        let expr = ast::Expr::Binary(Box::new(lhs.0), ast::Operator::Less, Box::new(rhs.0));
+        Self(expr).parens()
+    }
+
+    /// IS NULL check
+    pub fn is_null(predicate: Predicate) -> Self {
+        Self::is(predicate, Self::null())
     }
 
     pub fn eval(&self, row: &[SimValue], table: &Table) -> Option<SimValue> {

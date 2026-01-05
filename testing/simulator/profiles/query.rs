@@ -31,6 +31,21 @@ pub struct QueryProfile {
     pub drop_index: u32,
     #[garde(skip)]
     pub pragma_weight: u32,
+    #[garde(skip)]
+    pub create_matview_weight: u32,
+    #[garde(skip)]
+    pub drop_matview_weight: u32,
+    #[garde(skip)]
+    pub enable_cdc_weight: u32,
+    /// Enable plan-level transaction batching (groups multiple DML ops in transactions)
+    #[garde(skip)]
+    pub enable_transaction_batching: bool,
+    /// Probability of starting a batch transaction (0.0-1.0)
+    #[garde(skip)]
+    pub transaction_batch_start_probability: f64,
+    /// Probability of committing when in transaction (0.0-1.0)
+    #[garde(skip)]
+    pub transaction_batch_commit_probability: f64,
 }
 
 impl Default for QueryProfile {
@@ -48,6 +63,12 @@ impl Default for QueryProfile {
             alter_table_weight: 2,
             drop_index: 2,
             pragma_weight: 2,
+            create_matview_weight: 0,
+            drop_matview_weight: 0,
+            enable_cdc_weight: 0,
+            enable_transaction_batching: true,
+            transaction_batch_start_probability: 0.3,
+            transaction_batch_commit_probability: 0.3,
         }
     }
 }
@@ -64,6 +85,9 @@ impl QueryProfile {
             + self.drop_table_weight
             + self.alter_table_weight
             + self.pragma_weight
+            + self.create_matview_weight
+            + self.drop_matview_weight
+            + self.enable_cdc_weight
     }
 }
 
