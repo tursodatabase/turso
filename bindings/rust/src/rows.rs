@@ -47,9 +47,14 @@ pub struct Row {
 }
 
 impl Row {
-    pub fn get_value(&self, index: usize) -> Result<Value> {
-        let value = &self.values[index];
-        match value {
+    pub fn get_value(&self, idx: usize) -> Result<Value> {
+        let val = self.values.get(idx).ok_or_else(|| {
+            Error::Misuse(format!(
+                "column index {idx} out of bounds (row has {} columns)",
+                self.values.len()
+            ))
+        })?;
+        match val {
             turso_sdk_kit::rsapi::Value::Integer(i) => Ok(Value::Integer(*i)),
             turso_sdk_kit::rsapi::Value::Null => Ok(Value::Null),
             turso_sdk_kit::rsapi::Value::Float(f) => Ok(Value::Real(*f)),
@@ -62,7 +67,12 @@ impl Row {
     where
         T: turso_sdk_kit::rsapi::FromValue,
     {
-        let val = &self.values[idx];
+        let val = self.values.get(idx).ok_or_else(|| {
+            Error::Misuse(format!(
+                "column index {idx} out of bounds (row has {} columns)",
+                self.values.len()
+            ))
+        })?;
         T::from_sql(val.clone()).map_err(|err| Error::ConversionFailure(err.to_string()))
     }
 

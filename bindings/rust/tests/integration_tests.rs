@@ -607,6 +607,31 @@ async fn test_transaction_prepared_statement() {
     assert_eq!(id, 1);
 }
 
+#[tokio::test]
+async fn test_row_get_value_out_of_bounds() {
+    let db = Builder::new_local(":memory:").build().await.unwrap();
+    let conn = db.connect().unwrap();
+
+    conn.execute("CREATE TABLE t (x INTEGER)", ())
+        .await
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1)", ()).await.unwrap();
+
+    let mut rows = conn.query("SELECT x FROM t", ()).await.unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+
+    // Valid index works
+    assert!(row.get_value(0).is_ok());
+
+    // Out of bounds returns error instead of panicking
+    let result = row.get_value(999);
+    assert!(matches!(result, Err(Error::Misuse(_))));
+
+    // Also test get<T>() for OOB
+    let result: Result<i64, _> = row.get(999);
+    assert!(matches!(result, Err(Error::Misuse(_))));
+}
+
 // Test Connection clone
 #[tokio::test]
 async fn test_connection_clone() {
