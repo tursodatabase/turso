@@ -8808,7 +8808,12 @@ pub fn op_integrity_check(
             current_root_idx,
             state: integrity_check_state,
         } => {
-            return_if_io!(integrity_check(integrity_check_state, errors, pager));
+            return_if_io!(integrity_check(
+                integrity_check_state,
+                errors,
+                pager,
+                mv_store.as_ref()
+            ));
             if *current_root_idx < roots.len() {
                 integrity_check_state.start(roots[*current_root_idx], PageCategory::Normal, errors);
                 *current_root_idx += 1;
