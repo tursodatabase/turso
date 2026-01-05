@@ -1989,7 +1989,6 @@ impl Drop for Limbo {
     }
 }
 
-
 fn fetch_single_i64(rows: &mut turso_core::Statement) -> anyhow::Result<i64> {
     let mut result: Option<i64> = None;
     rows.run_with_row_callback(|row| {

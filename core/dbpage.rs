@@ -39,6 +39,11 @@ impl InternalVirtualTable for DbPageTable {
     }
 
     /// TODO: sqlite does where_onerow optimization using idx_flag, we should do that eventually.. probably not needed for now.
+    /// Analyzes query constraints and returns cost estimates to help pick the best query plan.
+    ///
+    /// We encode constraint info into `idx_num` as a bitmask, which `filter()` later uses:
+    /// - Bit 0 (0x1): equality on `pgno` - enables single-page lookup
+    /// - Bit 1 (0x2): equality on `schema` - we only support "main", so we let SQLite handle filtering if the user provides a different schema.
     fn best_index(
         &self,
         constraints: &[ConstraintInfo],
@@ -66,7 +71,7 @@ impl InternalVirtualTable for DbPageTable {
                         // schema column
                         2 => {
                             idx_num |= 2;
-                            usage.omit = true;
+                            usage.omit = false;
                         }
                         _ => {}
                     }
@@ -105,6 +110,11 @@ impl DbPageCursor {
 }
 
 impl InternalVirtualTableCursor for DbPageCursor {
+    /// iterates based on constraints identified by `best_index()`.
+    ///
+    /// When `idx_num` has bit 0 set, we do a single-page lookup using `args[0]` as the page number.
+    /// If the requested page is out of range (≤0 or beyond db size), the scan returns empty.
+    /// Otherwise, we do a full table scan over all pages starting from page 1.
     fn filter(&mut self, args: &[Value], _idx_str: Option<String>, idx_num: i32) -> Result<bool> {
         let db_size = self
             .pager
@@ -145,7 +155,8 @@ impl InternalVirtualTableCursor for DbPageCursor {
                 // check for the pending byte page  - this only needs when db is more than 1 gb.
                 if let Some(pending_page) = self.pager.pending_byte_page_id() {
                     if self.pgno == pending_page as i64 {
-                        let page_size = self.pager.usable_space() + self.pager.get_reserved_space().unwrap_or(0) as usize;
+                        let page_size = self.pager.usable_space()
+                            + self.pager.get_reserved_space().unwrap_or(0) as usize;
                         return Ok(Value::from_blob(vec![0u8; page_size]));
                     }
                 }
