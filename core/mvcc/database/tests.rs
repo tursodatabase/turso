@@ -2013,4 +2013,8 @@ fn test_rollback_with_index() {
     // This query will try to use index to find the row, if we rollback correctly it shouldn't panic
     let rows = get_rows(&conn, "SELECT * FROM t where b = 1");
     assert_eq!(rows.len(), 0);
+
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
 }
