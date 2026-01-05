@@ -504,14 +504,15 @@ impl Property {
                 let table_name = create.table.name.clone();
 
                 let assertion = InteractionType::Assertion(Assertion::new("creating two tables with the name should result in a failure for the second query"
-                                    .to_string(), move |stack: &Vec<ResultSet>, env| {
+                                    .to_string(), move |stack: &Vec<ResultSet>, _env| {
                                 let last = stack.last().unwrap();
                                 match last {
                                     Ok(success) => Ok(Err(format!("expected table creation to fail but it succeeded: {success:?}"))),
                                     Err(e) => {
                                         if e.to_string().to_lowercase().contains(&format!("table {table_name} already exists")) {
-                                             // On error we rollback the transaction if there is any active here
-                                            env.rollback_conn(connection_index);
+                                            // Statement error does NOT roll back the transaction in SQLite.
+                                            // Only the failed statement is rejected; prior changes remain valid.
+                                            // Do NOT call rollback_conn() here.
                                             Ok(Ok(()))
                                         } else {
                                             Ok(Err(format!("expected table already exists error, got: {e}")))
@@ -860,24 +861,26 @@ impl Property {
                 // but no IO happens right after it
                 let assert = Assertion::new(
                     "fault occured".to_string(),
-                    move |stack, env: &mut SimulatorEnv| {
+                    move |stack, _env: &mut SimulatorEnv| {
                         let last = stack.last().unwrap();
                         match last {
                             Ok(_) => {
                                 let _ = query_clone
-                                    .shadow(&mut env.get_conn_tables_mut(connection_index));
+                                    .shadow(&mut _env.get_conn_tables_mut(connection_index));
                                 Ok(Ok(()))
                             }
                             Err(err) => {
-                                // We cannot make any assumptions about the error content; all we are about is, if the statement errored,
-                                // we don't shadow the results into the simulator env, i.e. we assume whatever the statement did was rolled back.
+                                // Statement-level I/O failures do NOT automatically roll back the
+                                // transaction in SQLite. Only the failed statement is rejected;
+                                // the transaction continues with prior changes intact.
+                                // We don't shadow this failed statement's results.
                                 tracing::error!("Fault injection produced error: {err}");
 
                                 if let LimboError::CheckpointFailed(msg) = err {
-                                    // Checkpoint failure means the transaction is committed because the WAL commit succeeded, so we DON'T rollback,
-                                    // and the results of the query are shadowed into the simulator environment
+                                    // Checkpoint failure means the transaction is committed because
+                                    // the WAL commit succeeded, so we shadow the query results.
                                     query_clone
-                                        .shadow(&mut env.get_conn_tables_mut(connection_index))
+                                        .shadow(&mut _env.get_conn_tables_mut(connection_index))
                                         .expect("Failed to shadow tables");
                                     tracing::error!(
                                         "Fault injection produced CheckpointFailed error: {msg}"
@@ -885,8 +888,8 @@ impl Property {
                                     return Ok(Ok(()));
                                 }
 
-                                // On error we rollback the transaction if there is any active here
-                                env.rollback_conn(connection_index);
+                                // Do NOT call rollback_conn() here. Statement errors don't roll
+                                // back the transaction - only the failed statement is rejected.
                                 Ok(Ok(()))
                             }
                         }
@@ -946,6 +949,7 @@ impl Property {
                 ]);
 
                 let select_tlp = Select {
+                    with: None,
                     body: SelectBody {
                         select: Box::new(SelectInner {
                             distinctness: select.body.select.distinctness,
