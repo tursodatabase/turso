@@ -284,6 +284,7 @@ fn add_aggregate_if_not_exists(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn parse_from_clause_table(
     table: ast::SelectTable,
     resolver: &Resolver,
@@ -319,6 +320,9 @@ fn parse_from_clause_table(
             )
         }
         ast::SelectTable::Select(subselect, maybe_alias) => {
+            // Check subquery nesting depth before recursing
+            program.try_incr_nesting()?;
+
             // Build outer query refs for the subquery from two sources:
             // 1. Existing outer query refs (from enclosing queries) - preserve their is_lateral_ref flag
             // 2. CTEs available in this scope - these are NOT lateral refs because CTE references
@@ -347,6 +351,7 @@ fn parse_from_clause_table(
                     // Currently, LATERAL only works when preceding tables are subqueries.
                     // BTree/Virtual tables require cursor emission order changes (future work).
                     if !matches!(joined_table.table, Table::FromClauseSubquery(_)) {
+                        program.decr_nesting();
                         crate::bail_parse_error!(
                             "LATERAL JOIN currently only supports subqueries as preceding tables, not base tables like '{}'",
                             joined_table.identifier
@@ -361,15 +366,16 @@ fn parse_from_clause_table(
                     });
                 }
             }
-            let Plan::Select(subplan) = prepare_select_plan(
+            let subplan_result = prepare_select_plan(
                 subselect,
                 resolver,
                 program,
                 &outer_query_refs_for_subquery,
                 QueryDestination::placeholder_for_subquery(),
                 connection,
-            )?
-            else {
+            );
+            program.decr_nesting();
+            let Plan::Select(subplan) = subplan_result? else {
                 crate::bail_parse_error!("Only non-compound SELECT queries are currently supported in FROM clause subqueries");
             };
             let cur_table_index = table_references.joined_tables().len();

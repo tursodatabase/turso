@@ -41,6 +41,12 @@ impl TableRefIdCounter {
 
 use super::{BranchOffset, CursorID, ExplainState, Insn, InsnReference, JumpTarget, Program};
 
+/// Maximum allowed subquery nesting depth.
+/// This prevents stack overflow from deeply nested or malicious queries.
+/// SQLite uses SQLITE_MAX_EXPR_DEPTH (default 1000) for a similar purpose.
+/// We use a more conservative value since Rust's default stack size is smaller.
+pub const MAX_SUBQUERY_DEPTH: usize = 100;
+
 /// A key that uniquely identifies a cursor.
 /// The key is a pair of table reference id and index.
 /// The index is only provided when the cursor is an index cursor.
@@ -1142,6 +1148,27 @@ impl ProgramBuilder {
         self.nested_level -= 1;
     }
 
+    /// Increment nesting level with depth limit check.
+    /// Returns an error if the maximum subquery depth would be exceeded.
+    /// Use this when entering a new subquery scope during query planning.
+    #[inline]
+    pub fn try_incr_nesting(&mut self) -> crate::Result<()> {
+        if self.nested_level >= MAX_SUBQUERY_DEPTH {
+            crate::bail_parse_error!(
+                "subquery nesting depth exceeds maximum of {}",
+                MAX_SUBQUERY_DEPTH
+            );
+        }
+        self.nested_level += 1;
+        Ok(())
+    }
+
+    /// Get the current nesting level.
+    #[inline]
+    pub fn nesting_level(&self) -> usize {
+        self.nested_level
+    }
+
     /// Initialize the program with basic setup and return initial metadata and labels
     pub fn prologue(&mut self) {
         if self.is_subprogram {
@@ -1375,5 +1402,66 @@ impl ProgramBuilder {
             resolve_type: self.resolve_type,
             explain_state: RwLock::new(ExplainState::default()),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::QueryMode;
+
+    fn test_builder() -> ProgramBuilder {
+        ProgramBuilder::new(
+            QueryMode::Normal,
+            CaptureDataChangesMode::Off,
+            ProgramBuilderOpts {
+                num_cursors: 0,
+                approx_num_insns: 0,
+                approx_num_labels: 0,
+            },
+        )
+    }
+
+    #[test]
+    fn test_subquery_depth_limit_enforced() {
+        let mut builder = test_builder();
+
+        // Increment nesting up to the limit - should succeed
+        for _ in 0..MAX_SUBQUERY_DEPTH {
+            assert!(builder.try_incr_nesting().is_ok());
+        }
+        assert_eq!(builder.nesting_level(), MAX_SUBQUERY_DEPTH);
+
+        // One more should fail
+        let result = builder.try_incr_nesting();
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("subquery nesting depth exceeds maximum"),
+            "Expected error message about depth, got: {}",
+            err_msg
+        );
+
+        // Nesting level should not have changed after failure
+        assert_eq!(builder.nesting_level(), MAX_SUBQUERY_DEPTH);
+    }
+
+    #[test]
+    fn test_nesting_increment_decrement() {
+        let mut builder = test_builder();
+
+        assert_eq!(builder.nesting_level(), 0);
+
+        builder.incr_nesting();
+        assert_eq!(builder.nesting_level(), 1);
+
+        builder.incr_nesting();
+        assert_eq!(builder.nesting_level(), 2);
+
+        builder.decr_nesting();
+        assert_eq!(builder.nesting_level(), 1);
+
+        builder.decr_nesting();
+        assert_eq!(builder.nesting_level(), 0);
     }
 }

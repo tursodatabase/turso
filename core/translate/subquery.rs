@@ -207,6 +207,9 @@ fn get_subquery_parser<'a>(
     move |expr: &mut ast::Expr| -> Result<WalkControl> {
         match expr {
             ast::Expr::Exists(_) => {
+                // Check subquery nesting depth before recursing
+                program.try_incr_nesting()?;
+
                 let subquery_id = program.table_reference_counter.next();
                 let outer_query_refs = get_outer_query_refs(referenced_tables);
 
@@ -222,14 +225,16 @@ fn get_subquery_parser<'a>(
                     unreachable!();
                 };
 
-                let plan = prepare_select_plan(
+                let plan_result = prepare_select_plan(
                     subselect,
                     resolver,
                     program,
                     &outer_query_refs,
                     QueryDestination::ExistsSubqueryResult { result_reg },
                     connection,
-                )?;
+                );
+                program.decr_nesting();
+                let plan = plan_result?;
                 let Plan::Select(mut plan) = plan else {
                     crate::bail_parse_error!(
                         "compound SELECT queries not supported yet in WHERE clause subqueries"
@@ -253,6 +258,9 @@ fn get_subquery_parser<'a>(
                 Ok(WalkControl::Continue)
             }
             ast::Expr::Subquery(_) => {
+                // Check subquery nesting depth before recursing
+                program.try_incr_nesting()?;
+
                 let subquery_id = program.table_reference_counter.next();
                 let outer_query_refs = get_outer_query_refs(referenced_tables);
 
@@ -270,14 +278,16 @@ fn get_subquery_parser<'a>(
                 let ast::Expr::Subquery(subselect) = std::mem::replace(expr, result_expr) else {
                     unreachable!();
                 };
-                let plan = prepare_select_plan(
+                let plan_result = prepare_select_plan(
                     subselect,
                     resolver,
                     program,
                     &outer_query_refs,
                     QueryDestination::Unset,
                     connection,
-                )?;
+                );
+                program.decr_nesting();
+                let plan = plan_result?;
                 let Plan::Select(mut plan) = plan else {
                     crate::bail_parse_error!(
                         "compound SELECT queries not supported yet in WHERE clause subqueries"
@@ -330,6 +340,9 @@ fn get_subquery_parser<'a>(
                 Ok(WalkControl::Continue)
             }
             ast::Expr::InSelect { .. } => {
+                // Check subquery nesting depth before recursing
+                program.try_incr_nesting()?;
+
                 let subquery_id = program.table_reference_counter.next();
                 let outer_query_refs = get_outer_query_refs(referenced_tables);
 
@@ -338,14 +351,16 @@ fn get_subquery_parser<'a>(
                 else {
                     unreachable!();
                 };
-                let plan = prepare_select_plan(
+                let plan_result = prepare_select_plan(
                     rhs,
                     resolver,
                     program,
                     &outer_query_refs,
                     QueryDestination::Unset,
                     connection,
-                )?;
+                );
+                program.decr_nesting();
+                let plan = plan_result?;
                 let Plan::Select(mut plan) = plan else {
                     crate::bail_parse_error!(
                         "compound SELECT queries not supported yet in WHERE clause subqueries"
