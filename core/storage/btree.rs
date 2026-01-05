@@ -5835,6 +5835,15 @@ pub fn integrity_check(
         else {
             return Ok(IOResult::Done(()));
         };
+        let page_idx = if page_idx < 0 {
+            turso_assert!(
+                mv_store.is_some(),
+                "negative page index without mvcc found during integrity check"
+            );
+            -page_idx
+        } else {
+            page_idx
+        };
         let page = match state.page.take() {
             Some(page) => page,
             None => {
