@@ -229,6 +229,14 @@ impl Connection {
         conn.set_busy_timeout(duration);
         Ok(())
     }
+
+    /// Create a point-in-time snapshot of the database to the specified path.
+    /// Note: Does not work with in-memory databases or MVCC mode.
+    pub fn snapshot(&self, output_path: &str) -> Result<()> {
+        let conn = self.get_inner_connection()?;
+        conn.snapshot(output_path)?;
+        Ok(())
+    }
 }
 
 impl Debug for Connection {
