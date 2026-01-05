@@ -5815,11 +5815,13 @@ pub fn integrity_check(
         else {
             panic!("Page stack is empty on integrity_check start");
         };
-        let table_id = mv_store.get_table_id_from_root_page(root_page);
-        if !mv_store.is_btree_allocated(&table_id) {
-            state.page_stack.pop();
-            return Ok(IOResult::Done(()));
-        };
+        if root_page < 0 {
+            let table_id = mv_store.get_table_id_from_root_page(root_page);
+            if !mv_store.is_btree_allocated(&table_id) {
+                state.page_stack.pop();
+                return Ok(IOResult::Done(()));
+            };
+        }
     }
     if state.db_size == 0 {
         state.page_stack.pop();
