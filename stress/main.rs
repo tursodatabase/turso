@@ -829,7 +829,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 let sql = &plan.queries_per_thread[thread][query_index];
                 if !opts.silent {
                     if opts.verbose {
-                        println!("executing query {sql}");
+                        println!("thread#{thread} executing query {sql}");
                     } else if query_index % 100 == 0 {
                         print!(
                             "\r{:.2} %",
@@ -844,28 +844,28 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 if let Err(e) = conn.execute(sql, ()).await {
                     match e {
                         turso::Error::Corrupt(e) => {
-                            panic!("Error[FATAL] executing query: {}", e);
+                            panic!("thread#{thread} Error[FATAL] executing query: {}", e);
                         }
                         turso::Error::Constraint(e) => {
                             if opts.verbose {
-                                println!("Error[WARNING] executing query: {e}");
+                                println!("thread#{thread} Error[WARNING] executing query: {e}");
                             }
                         }
                         turso::Error::Busy(e) => {
-                            println!("Error[WARNING] executing query: {e}");
+                            println!("thread#{thread} Error[WARNING] executing query: {e}");
                         }
                         turso::Error::Error(e) => {
                             if opts.verbose {
-                                println!("Error executing query: {e}");
+                                println!("thread#{thread} Error executing query: {e}");
                             }
                         }
                         turso::Error::DatabaseFull(e) => {
-                            eprintln!("Database full: {e}");
+                            eprintln!("thread#{thread} Database full: {e}");
                         }
                         turso::Error::IoError(kind) => {
-                            eprintln!("I/O error ({kind:?}), continuing...");
+                            eprintln!("thread#{thread} I/O error ({kind:?}), continuing...");
                         }
-                        _ => panic!("Error[FATAL] executing query: {}", e),
+                        _ => panic!("thread#{thread} Error[FATAL] executing query: {}", e),
                     }
                 }
                 if opts.verbose {
@@ -881,19 +881,21 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         Ok(Some(row)) => {
                             let value = row.get_value(0).unwrap();
                             if value != "ok".into() {
-                                panic!("integrity check failed: {:?}", value);
+                                panic!("thread#{thread} integrity check failed: {:?}", value);
                             }
                         }
                         Ok(None) => {
-                            panic!("integrity check failed: no rows");
+                            panic!("thread#{thread} integrity check failed: no rows");
                         }
                         Err(e) => {
-                            println!("Error performing integrity check: {e}");
+                            println!("thread#{thread} Error performing integrity check: {e}");
                         }
                     }
                     match res.next().await {
-                        Ok(Some(_)) => panic!("integrity check failed: more than 1 row"),
-                        Err(e) => println!("Error performing integrity check: {e}"),
+                        Ok(Some(_)) => {
+                            panic!("thread#{thread} integrity check failed: more than 1 row")
+                        }
+                        Err(e) => println!("thread#{thread} Error performing integrity check: {e}"),
                         _ => {}
                     }
                     if opts.verbose {
