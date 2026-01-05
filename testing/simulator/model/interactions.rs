@@ -831,6 +831,7 @@ fn reopen_database(env: &mut SimulatorEnv) {
     // 1. Close all connections without default checkpoint-on-close behavior
     // to expose bugs related to how we handle WAL
     let mvcc = env.profile.experimental_mvcc;
+    let enable_views = env.profile.enable_views;
     let num_conns = env.connections.len();
 
     // Clear shadow transaction state for all connections since reopening
@@ -859,11 +860,15 @@ fn reopen_database(env: &mut SimulatorEnv) {
         }
         SimulationType::Default | SimulationType::Doublecheck => {
             env.db = None;
+            let mut db_opts = turso_core::DatabaseOpts::new().with_autovacuum(true);
+            if mvcc || enable_views {
+                db_opts = db_opts.with_views(true);
+            }
             let db = match turso_core::Database::open_file_with_flags(
                 env.io.clone(),
                 env.get_db_path().to_str().expect("path should be 'to_str'"),
                 turso_core::OpenFlags::default(),
-                turso_core::DatabaseOpts::new().with_autovacuum(true),
+                db_opts,
                 None,
             ) {
                 Ok(db) => db,

@@ -59,13 +59,14 @@ impl Arbitrary for FromClause {
                 let predicate = Predicate::arbitrary_from(rng, context, &table);
                 Some(JoinedTable {
                     table: joined_table_name,
+                    alias: None,
                     join_type: JoinType::Inner,
                     on: predicate,
                 })
             })
             .collect();
         FromClause {
-            table: SelectTable::Table(table.name.clone()),
+            table: SelectTable::Table(table.name.clone(), None),
             joins,
         }
     }
@@ -224,6 +225,7 @@ impl Arbitrary for Select {
         }
 
         Self {
+            with: None,
             body: SelectBody {
                 select: Box::new(first),
                 compounds: rest
@@ -296,6 +298,7 @@ impl Arbitrary for Insert {
 
             for _ in 1..nesting_depth {
                 select = Select {
+                    with: None,
                     body: SelectBody {
                         select: Box::new(SelectInner {
                             distinctness: Distinctness::All,
