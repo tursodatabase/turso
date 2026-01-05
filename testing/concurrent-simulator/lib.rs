@@ -769,6 +769,7 @@ impl Whopper {
                         opts: &self.opts,
                         enable_mvcc: self.context.enable_mvcc,
                         tables_vec: self.context.state.tables_vec(),
+                        views_vec: Vec::new(), // Views not yet tracked in simulator
                     };
 
                     // Generate operation from workload; skip current workload if it returned None

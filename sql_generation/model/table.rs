@@ -152,6 +152,8 @@ pub struct Index {
 pub struct JoinedTable {
     /// table name
     pub table: String,
+    /// optional table alias
+    pub alias: Option<String>,
     /// `JOIN` type
     pub join_type: JoinType,
     /// `ON` clause

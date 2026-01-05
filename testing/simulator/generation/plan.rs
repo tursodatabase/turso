@@ -3,20 +3,16 @@ use std::{num::NonZeroUsize, vec};
 use sql_generation::{
     generation::{Arbitrary, ArbitraryFrom, GenerationContext, frequency},
     model::query::{
-        Create,
         transaction::{Begin, Commit},
     },
 };
 
 use crate::{
-    SimulatorEnv,
     generation::{
-        WeightedDistribution,
         property::PropertyDistribution,
         query::{QueryDistribution, possible_queries},
     },
     model::{
-        Query,
         interactions::{
             Fault, Interaction, InteractionBuilder, InteractionPlan, InteractionPlanIterator,
             InteractionType, Interactions, InteractionsType,
@@ -296,9 +292,12 @@ impl<'a, R: rand::Rng> InteractionPlanIterator for PlanGenerator<'a, R> {
         // intercept interaction to update metrics
         if let Some(next_interaction) = next_interaction.as_ref() {
             // Skip counting queries that come from Properties that only exist to check tables
-            if let Some(property_meta) = next_interaction.property_meta
-                && !property_meta.property.check_tables()
-            {
+            // But always count direct query interactions (property_meta is None)
+            let should_update_stats = match next_interaction.property_meta {
+                Some(property_meta) => !property_meta.property.check_tables(),
+                None => true,
+            };
+            if should_update_stats {
                 self.plan.stats_mut().update(next_interaction);
             }
             self.plan.push(next_interaction.clone());

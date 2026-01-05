@@ -14,7 +14,6 @@ use std::io::{IsTerminal, Write};
 use std::path::Path;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex};
-use tracing_subscriber::EnvFilter;
 use tracing_subscriber::field::MakeExt;
 use tracing_subscriber::fmt::format;
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
@@ -121,6 +120,12 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn testing_main(cli_opts: &mut SimulatorCLI, profile: &Profile) -> anyhow::Result<()> {
+    // Auto-enable differential testing if the profile requires it
+    if profile.differential_required && !cli_opts.differential && !cli_opts.doublecheck {
+        tracing::info!("Profile requires differential testing - enabling automatically");
+        cli_opts.differential = true;
+    }
+
     let mut bugbase = if cli_opts.disable_bugbase {
         None
     } else {
