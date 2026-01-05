@@ -110,11 +110,7 @@ pprof = { version = "0.14.0", features = ["criterion", "flamegraph"] }
 
 [dev-dependencies]
 memory-stats = "1.2.0"
-criterion = { workspace = true, features = [
-    "html_reports",
-    "async",
-    "async_futures",
-] }
+codspeed-criterion-compat = { workspace = true }
 rstest = "0.18.2"
 rusqlite = { workspace = true, features = ["series"] }
 quickcheck = { version = "1.0", default-features = false }

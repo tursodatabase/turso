@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, SamplingMode};
+use codspeed_criterion_compat::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, SamplingMode};
 use pprof::criterion::{Output, PProfProfiler};
 use turso_core::{Database, PlatformIO};
 

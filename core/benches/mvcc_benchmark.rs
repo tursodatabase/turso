@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use criterion::async_executor::FuturesExecutor;
-use criterion::{criterion_group, criterion_main, Criterion, Throughput};
+use codspeed_criterion_compat::async_executor::FuturesExecutor;
+use codspeed_criterion_compat::{criterion_group, criterion_main, Criterion, Throughput};
 use pprof::criterion::{Output, PProfProfiler};
 use turso_core::mvcc::clock::LocalClock;
 use turso_core::mvcc::database::{MvStore, Row, RowID, RowKey};
