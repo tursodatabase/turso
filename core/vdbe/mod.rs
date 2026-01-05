@@ -234,6 +234,21 @@ impl Register {
     pub fn is_null(&self) -> bool {
         matches!(self, Register::Value(Value::Null))
     }
+
+    #[inline(always)]
+    /// Sets the value of the register to an integer,
+    /// reusing the existing Register::Value(Value::Integer(_)) if possible,
+    /// which is faster than always creating a new one.
+    pub fn set_int(&mut self, val: i64) {
+        match self {
+            Register::Value(Value::Integer(existing)) => {
+                *existing = val;
+            }
+            _ => {
+                *self = Register::Value(Value::Integer(val));
+            }
+        }
+    }
 }
 
 /// A row is a the list of registers that hold the values for a filtered row. This row is a pointer, therefore

@@ -1605,42 +1605,30 @@ pub fn op_column(
                                     state.registers[*dest] = Register::Value(Value::Null);
                                 }
                                 // I8
-                                1 => {
-                                    state.registers[*dest] =
-                                        Register::Value(Value::Integer(buf[0] as i8 as i64));
-                                }
+                                1 => state.registers[*dest].set_int(buf[0] as i8 as i64),
                                 // I16
-                                2 => {
-                                    state.registers[*dest] =
-                                        Register::Value(Value::Integer(i16::from_be_bytes([
-                                            buf[0], buf[1],
-                                        ])
-                                            as i64));
-                                }
+                                2 => state.registers[*dest]
+                                    .set_int(i16::from_be_bytes([buf[0], buf[1]]) as i64),
                                 // I24
                                 3 => {
                                     let sign_extension = (buf[0] > 0x7F) as u8 * 0xFF;
-                                    let value = Value::Integer(i32::from_be_bytes([
+                                    state.registers[*dest].set_int(i32::from_be_bytes([
                                         sign_extension,
                                         buf[0],
                                         buf[1],
                                         buf[2],
                                     ])
                                         as i64);
-                                    state.registers[*dest] = Register::Value(value);
                                 }
                                 // I32
-                                4 => {
-                                    let value = Value::Integer(i32::from_be_bytes([
-                                        buf[0], buf[1], buf[2], buf[3],
-                                    ])
-                                        as i64);
-                                    state.registers[*dest] = Register::Value(value);
-                                }
+                                4 => state.registers[*dest]
+                                    .set_int(
+                                        i32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as i64
+                                    ),
                                 // I48
                                 5 => {
                                     let sign_extension = (buf[0] > 0x7F) as u8 * 0xFF;
-                                    let value = Value::Integer(i64::from_be_bytes([
+                                    state.registers[*dest].set_int(i64::from_be_bytes([
                                         sign_extension,
                                         sign_extension,
                                         buf[0],
@@ -1650,61 +1638,63 @@ pub fn op_column(
                                         buf[4],
                                         buf[5],
                                     ]));
-                                    state.registers[*dest] = Register::Value(value);
                                 }
                                 // I64
-                                6 => {
-                                    let value = Value::Integer(i64::from_be_bytes(
-                                        buf[..8]
-                                            .try_into()
-                                            .expect("slice should be exactly 8 bytes"),
-                                    ));
-                                    state.registers[*dest] = Register::Value(value);
-                                }
+                                6 => state.registers[*dest].set_int(i64::from_be_bytes(
+                                    buf[..8]
+                                        .try_into()
+                                        .expect("slice should be exactly 8 bytes"),
+                                )),
                                 // F64
                                 7 => {
-                                    let value = Value::Float(f64::from_be_bytes(
+                                    let val = f64::from_be_bytes(
                                         buf[..8]
                                             .try_into()
                                             .expect("slice should be exactly 8 bytes"),
-                                    ));
-                                    state.registers[*dest] = Register::Value(value);
-                                }
-                                // CONST_INT0
-                                8 => {
-                                    state.registers[*dest] = Register::Value(Value::Integer(0));
-                                }
-                                // CONST_INT1
-                                9 => {
-                                    state.registers[*dest] = Register::Value(Value::Integer(1));
-                                }
-                                // BLOB
-                                n if n >= 12 && n & 1 == 0 => {
-                                    // Try to reuse the registers when allocation is not needed.
-                                    match state.registers[*dest] {
-                                        Register::Value(Value::Blob(ref mut existing_blob)) => {
-                                            existing_blob.do_extend(&buf);
+                                    );
+                                    match &mut state.registers[*dest] {
+                                        Register::Value(Value::Float(existing)) => {
+                                            *existing = val;
                                         }
                                         _ => {
                                             state.registers[*dest] =
-                                                Register::Value(Value::Blob(buf.to_vec()));
+                                                Register::Value(Value::Float(val));
                                         }
                                     }
                                 }
+                                // CONST_INT0
+                                8 => state.registers[*dest].set_int(0),
+                                // CONST_INT1
+                                9 => state.registers[*dest].set_int(1),
+                                // BLOB
+                                n if n >= 12 && n & 1 == 0 => match state.registers[*dest] {
+                                    Register::Value(Value::Blob(ref mut existing_blob)) => {
+                                        existing_blob.do_extend(&buf);
+                                    }
+                                    _ => {
+                                        state.registers[*dest] =
+                                            Register::Value(Value::Blob(buf.to_vec()));
+                                    }
+                                },
                                 // TEXT
                                 n if n >= 13 && n & 1 == 1 => {
-                                    // Try to reuse the registers when allocation is not needed.
+                                    // SAFETY: serial type is TEXT, which guarantees valid UTF-8
+                                    let text = if cfg!(debug_assertions) {
+                                        std::str::from_utf8(buf).map_err(|e| {
+                                            LimboError::InternalError(format!(
+                                                "Invalid UTF-8 in TEXT serial type: {e}",
+                                            ))
+                                        })?
+                                    } else {
+                                        // SAFETY: TEXT serial type contains valid UTF-8 unless we opened a sqlite DB
+                                        // with corrupted data in the text column.
+                                        unsafe { std::str::from_utf8_unchecked(buf) }
+                                    };
                                     match state.registers[*dest] {
                                         Register::Value(Value::Text(ref mut existing_text)) => {
-                                            // SAFETY: We know the text is valid UTF-8 because we only accept valid UTF-8 and the serial type is TEXT.
-                                            let text =
-                                                unsafe { std::str::from_utf8_unchecked(buf) };
                                             existing_text.do_extend(&text);
                                         }
                                         _ => {
-                                            // SAFETY: We know the text is valid UTF-8 because we only accept valid UTF-8 and the serial type is TEXT.
-                                            let text =
-                                                unsafe { std::str::from_utf8_unchecked(buf) };
                                             state.registers[*dest] = Register::Value(Value::Text(
                                                 Text::new(text.to_string()),
                                             ));
@@ -1717,7 +1707,7 @@ pub fn op_column(
                             break 'outer;
                         };
 
-                        // DEFAULT handling. Try to reuse the registers when allocation is not needed.
+                        // DEFAULT handling
                         let Some(ref default) = default else {
                             state.registers[*dest] = Register::Value(Value::Null);
                             break;
@@ -2894,7 +2884,7 @@ pub fn op_row_id(
                     .expect("cursor_id should be valid")
                 {
                     if let Some(ref rowid) = return_if_io!(btree_cursor.rowid()) {
-                        state.registers[*dest] = Register::Value(Value::Integer(*rowid));
+                        state.registers[*dest].set_int(*rowid);
                     } else {
                         state.registers[*dest] = Register::Value(Value::Null);
                     }
@@ -2904,7 +2894,7 @@ pub fn op_row_id(
                 {
                     let rowid = virtual_cursor.rowid();
                     if rowid != 0 {
-                        state.registers[*dest] = Register::Value(Value::Integer(rowid));
+                        state.registers[*dest].set_int(rowid);
                     } else {
                         state.registers[*dest] = Register::Value(Value::Null);
                     }
@@ -2913,7 +2903,7 @@ pub fn op_row_id(
                     .expect("cursor_id should be valid")
                 {
                     if let Some(rowid) = return_if_io!(mv_cursor.rowid()) {
-                        state.registers[*dest] = Register::Value(Value::Integer(rowid));
+                        state.registers[*dest].set_int(rowid);
                     } else {
                         state.registers[*dest] = Register::Value(Value::Null);
                     }
@@ -2922,7 +2912,7 @@ pub fn op_row_id(
                     .expect("cursor_id should be valid")
                 {
                     if let Some(rowid) = return_if_io!(cursor.query_rowid()) {
-                        state.registers[*dest] = Register::Value(Value::Integer(rowid));
+                        state.registers[*dest].set_int(rowid);
                     } else {
                         state.registers[*dest] = Register::Value(Value::Null);
                     }
