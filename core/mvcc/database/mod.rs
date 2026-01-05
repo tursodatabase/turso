@@ -2310,7 +2310,37 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
         for rowid in &tx.write_set {
             let rowid = rowid.value();
-            if let Some(row_versions) = self.rows.get(rowid) {
+            self.rollback_rowid(tx_id, rowid);
+        }
+
+        if connection.schema.read().schema_version > connection.db.schema.lock().schema_version {
+            // Connection made schema changes during tx and rolled back -> revert connection-local schema.
+            *connection.schema.write() = connection.db.clone_schema();
+        }
+
+        let tx = tx_unlocked.value();
+        tx.state.store(TransactionState::Terminated);
+        tracing::trace!("terminate(tx_id={})", tx_id);
+        // FIXME: verify that we can already remove the transaction here!
+        // Maybe it's fine for snapshot isolation, but too early for serializable?
+        self.remove_tx(tx_id);
+    }
+
+    fn rollback_rowid(&self, tx_id: u64, rowid: &RowID) {
+        if rowid.row_id.is_int_key() {
+            self.rollback_table_rowid(tx_id, rowid);
+        } else {
+            self.rollback_index_rowid(tx_id, rowid);
+        }
+    }
+
+    fn rollback_index_rowid(&self, tx_id: u64, rowid: &RowID) {
+        if let Some(index) = self.index_rows.get(&rowid.table_id) {
+            let index = index.value();
+            let RowKey::Record(ref index_key) = rowid.row_id else {
+                panic!("Index writes must have a record key");
+            };
+            if let Some(row_versions) = index.get(index_key) {
                 let mut row_versions = row_versions.value().write();
                 for rv in row_versions.iter_mut() {
                     if let Some(TxTimestampOrID::TxID(id)) = rv.begin {
@@ -2328,18 +2358,26 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 }
             }
         }
+    }
 
-        if connection.schema.read().schema_version > connection.db.schema.lock().schema_version {
-            // Connection made schema changes during tx and rolled back -> revert connection-local schema.
-            *connection.schema.write() = connection.db.clone_schema();
+    fn rollback_table_rowid(&self, tx_id: u64, rowid: &RowID) {
+        if let Some(row_versions) = self.rows.get(rowid) {
+            let mut row_versions = row_versions.value().write();
+            for rv in row_versions.iter_mut() {
+                if let Some(TxTimestampOrID::TxID(id)) = rv.begin {
+                    assert_eq!(id, tx_id);
+                    // If the transaction has aborted,
+                    // it marks all its new versions as garbage and sets their Begin
+                    // and End timestamps to infinity to make them invisible
+                    // See section 2.4: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf
+                    rv.begin = None;
+                    rv.end = None;
+                } else if rv.end == Some(TxTimestampOrID::TxID(tx_id)) {
+                    // undo deletions by this transaction
+                    rv.end = None;
+                }
+            }
         }
-
-        let tx = tx_unlocked.value();
-        tx.state.store(TransactionState::Terminated);
-        tracing::trace!("terminate(tx_id={})", tx_id);
-        // FIXME: verify that we can already remove the transaction here!
-        // Maybe it's fine for snapshot isolation, but too early for serializable?
-        self.remove_tx(tx_id);
     }
 
     /// Returns true if the given transaction is the exclusive transaction.
@@ -2930,7 +2968,7 @@ fn is_begin_visible(txs: &SkipMap<TxID, Transaction>, tx: &Transaction, rv: &Row
         Some(TxTimestampOrID::TxID(rv_begin)) => {
             let tb = txs
                 .get(&rv_begin)
-                .expect("transaction should exist in txs map");
+                .expect(&format!("transaction {rv_begin:?} should exist in txs map"));
             let tb = tb.value();
             let visible = match tb.state.load() {
                 TransactionState::Active => tx.tx_id == tb.tx_id && rv.end.is_none(),
