@@ -2968,7 +2968,7 @@ fn is_begin_visible(txs: &SkipMap<TxID, Transaction>, tx: &Transaction, rv: &Row
         Some(TxTimestampOrID::TxID(rv_begin)) => {
             let tb = txs
                 .get(&rv_begin)
-                .expect(&format!("transaction {rv_begin:?} should exist in txs map"));
+                .unwrap_or_else(|| panic!("transaction {rv_begin:?} should exist in txs map"));
             let tb = tb.value();
             let visible = match tb.state.load() {
                 TransactionState::Active => tx.tx_id == tb.tx_id && rv.end.is_none(),

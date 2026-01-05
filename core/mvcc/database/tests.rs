@@ -1996,3 +1996,21 @@ fn test_mvcc_integrity_check() {
 
     ensure_integrity();
 }
+
+#[test]
+fn test_rollback_with_index() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b INTEGER UNIQUE)")
+        .unwrap();
+
+    // we insert with default values
+    conn.execute("BEGIN CONCURRENT").unwrap();
+    conn.execute("INSERT INTO t values (1, 1)").unwrap();
+    conn.execute("ROLLBACK").unwrap();
+
+    // This query will try to use index to find the row, if we rollback correctly it shouldn't panic
+    let rows = get_rows(&conn, "SELECT * FROM t where b = 1");
+    assert_eq!(rows.len(), 0);
+}
