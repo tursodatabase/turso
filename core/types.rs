@@ -142,6 +142,11 @@ impl<T: AnyText> Extendable<T> for Text {
                 let needed = other_str.len();
                 if s.capacity() >= needed {
                     // SAFETY: capacity >= needed, source is valid UTF-8
+                    debug_assert!(
+                        s.as_ptr().wrapping_add(s.len()) <= other_str.as_ptr()
+                            || other_str.as_ptr().wrapping_add(other_str.len()) <= s.as_ptr(),
+                        "source and destination ranges must not overlap"
+                    );
                     unsafe {
                         std::ptr::copy_nonoverlapping(other_str.as_ptr(), s.as_mut_ptr(), needed);
                         s.as_mut_vec().set_len(needed);
@@ -165,6 +170,11 @@ impl<T: AnyBlob> Extendable<T> for Vec<u8> {
         let needed = other_slice.len();
         if self.capacity() >= needed {
             // SAFETY: capacity >= needed
+            debug_assert!(
+                self.as_ptr().wrapping_add(self.len()) <= other_slice.as_ptr()
+                    || other_slice.as_ptr().wrapping_add(other_slice.len()) <= self.as_ptr(),
+                "source and destination ranges must not overlap"
+            );
             unsafe {
                 std::ptr::copy_nonoverlapping(other_slice.as_ptr(), self.as_mut_ptr(), needed);
                 self.set_len(needed);
