@@ -794,13 +794,9 @@ fn bench_limbo_mvcc(
         });
     }
     loop {
-        let mut all_finished = true;
-        for conn in &mut connecitons {
-            if !conn.inserts.is_empty() || conn.current_statement.is_some() {
-                all_finished = false;
-                break;
-            }
-        }
+        let all_finished = connecitons
+            .iter()
+            .all(|conn| conn.inserts.is_empty() && conn.current_statement.is_none());
         for conn in connecitons.iter_mut() {
             if conn.current_statement.is_none() && !conn.inserts.is_empty() {
                 let write = conn.inserts.pop().unwrap();
@@ -812,17 +808,23 @@ fn bench_limbo_mvcc(
                 continue;
             }
             let stmt = conn.current_statement.as_mut().unwrap();
+            let is_commit = stmt.get_sql() == "COMMIT";
             match stmt.step() {
                 // These you be only possible cases in write concurrency.
                 // No rows because insert doesn't return
                 // No interrupt because insert doesn't interrupt
                 // No busy because insert in mvcc should be multi concurrent write
                 Ok(StepResult::Done) => {
-                    // Now do commit
-                    conn.current_statement = Some(conn.conn.prepare("COMMIT").unwrap());
+                    if is_commit {
+                        // COMMIT finished, clear statement to start next transaction
+                        conn.current_statement = None;
+                        conn.current_insert = None;
+                    } else {
+                        // INSERT finished, now do commit
+                        conn.current_statement = Some(conn.conn.prepare("COMMIT").unwrap());
+                    }
                 }
                 Ok(StepResult::IO) => {
-                    stmt.step().unwrap();
                     // let's skip doing I/O here, we want to perform io only after all the statements are stepped
                 }
                 Ok(StepResult::Busy) => {
@@ -834,7 +836,6 @@ fn bench_limbo_mvcc(
                     stmt.reset();
                 }
                 Err(err) => {
-                    dbg!(&err);
                     if let LimboError::SchemaUpdated = err {
                         conn.current_statement = Some(
                             conn.conn
@@ -843,10 +844,6 @@ fn bench_limbo_mvcc(
                         );
                         continue;
                     }
-                    dbg!(
-                        conn.current_statement.as_ref().map(|stmt| stmt.get_sql()),
-                        &conn.current_insert
-                    );
                     panic!("unexpected error: {err:?}");
                 }
                 _ => {
