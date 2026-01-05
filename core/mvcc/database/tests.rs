@@ -1956,3 +1956,31 @@ fn test_skips_updated_rowid() {
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0][1].as_int().unwrap(), 3);
 }
+
+#[test]
+fn test_mvcc_integrity_check() {
+    tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_max_level(tracing_subscriber::filter::LevelFilter::TRACE)
+        .init();
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY)")
+        .unwrap();
+
+    // we insert with default values
+    conn.execute("INSERT INTO t values(1)").unwrap();
+
+    let ensure_integrity = || {
+        let rows = get_rows(&conn, "PRAGMA integrity_check");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(&rows[0][0].cast_text().unwrap(), "ok");
+    };
+
+    ensure_integrity();
+
+    conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
+
+    ensure_integrity();
+}

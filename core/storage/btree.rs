@@ -25,7 +25,7 @@ use crate::{
         SeekResult,
     },
     util::IOExt,
-    Completion,
+    Completion, MvStore,
 };
 
 use crate::{
@@ -5800,8 +5800,28 @@ pub fn integrity_check(
     state: &mut IntegrityCheckState,
     errors: &mut Vec<IntegrityCheckError>,
     pager: &Arc<Pager>,
+    mv_store: Option<&Arc<MvStore>>,
 ) -> Result<IOResult<()>> {
+    if let Some(mv_store) = mv_store {
+        let Some(IntegrityCheckPageEntry {
+            page_idx: root_page,
+            ..
+        }) = state.page_stack.last().cloned()
+        else {
+            panic!("Page stack is empty on integrity_check start");
+        };
+        if root_page < 0 {
+            let table_id = mv_store.get_table_id_from_root_page(root_page);
+            turso_assert!(
+                !mv_store.is_btree_allocated(&table_id),
+                "we got a negative page index that is reported as allocated"
+            );
+            state.page_stack.pop();
+            return Ok(IOResult::Done(()));
+        }
+    }
     if state.db_size == 0 {
+        state.page_stack.pop();
         return Ok(IOResult::Done(()));
     }
     loop {
@@ -5814,6 +5834,10 @@ pub fn integrity_check(
         else {
             return Ok(IOResult::Done(()));
         };
+        turso_assert!(
+            page_idx >= 0,
+            "pages should be positive during integrity check"
+        );
         let page = match state.page.take() {
             Some(page) => page,
             None => {
