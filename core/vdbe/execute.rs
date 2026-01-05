@@ -1682,8 +1682,7 @@ pub fn op_column(
                                     let text = if cfg!(debug_assertions) {
                                         std::str::from_utf8(buf).map_err(|e| {
                                             LimboError::InternalError(format!(
-                                                "Invalid UTF-8 in TEXT serial type: {}",
-                                                e
+                                                "Invalid UTF-8 in TEXT serial type: {e}",
                                             ))
                                         })?
                                     } else {
