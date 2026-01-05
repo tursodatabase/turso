@@ -2350,14 +2350,22 @@ pub fn translate_expr(
                     let result_start_reg = if is_from_outer_query_scope {
                         // For LATERAL joins, the table might be from outer_query_refs where the clone
                         // doesn't have result_columns_start_reg set. Look it up from program builder.
-                        program
+                        let Some(reg) = program
                             .get_subquery_result_reg(*table_ref_id)
                             .or(from_clause_subquery.result_columns_start_reg)
-                            .expect("Subquery result_columns_start_reg must be set (checked both program registry and table)")
+                        else {
+                            crate::bail_parse_error!(
+                                "Internal error: subquery result register not found for LATERAL reference"
+                            );
+                        };
+                        reg
                     } else {
-                        from_clause_subquery
-                            .result_columns_start_reg
-                            .expect("Subquery result_columns_start_reg must be set")
+                        let Some(reg) = from_clause_subquery.result_columns_start_reg else {
+                            crate::bail_parse_error!(
+                                "Internal error: subquery result register not initialized"
+                            );
+                        };
+                        reg
                     };
                     program.emit_insn(Insn::Copy {
                         src_reg: result_start_reg + *column,

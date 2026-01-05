@@ -828,17 +828,17 @@ pub fn compute_best_join_order<'a>(
     // "a LEFT JOIN b" can NOT be reordered as "b LEFT JOIN a".
     // "a LATERAL JOIN (SELECT a.x)" can NOT be reordered - the LATERAL subquery depends on 'a'.
     // If there are outer joins or LATERAL joins in the plan, ensure correct ordering.
-    let left_join_illegal_map = {
-        let left_join_count = joined_tables
+    let non_commutative_join_deps = {
+        let non_commutative_count = joined_tables
             .iter()
             .filter(|t| t.join_info.as_ref().is_some_and(|j| j.outer || j.lateral))
             .count();
-        if left_join_count == 0 {
+        if non_commutative_count == 0 {
             None
         } else {
             // map from rhs table index to lhs table index
-            let mut left_join_illegal_map: HashMap<usize, TableMask> =
-                HashMap::with_capacity(left_join_count);
+            let mut non_commutative_join_deps: HashMap<usize, TableMask> =
+                HashMap::with_capacity(non_commutative_count);
             for (i, _) in joined_tables.iter().enumerate() {
                 for (j, joined_table) in joined_tables.iter().enumerate().skip(i + 1) {
                     // For OUTER or LATERAL joins, the right-side table depends on left-side tables.
@@ -850,17 +850,17 @@ pub fn compute_best_join_order<'a>(
                         .is_some_and(|ji| ji.outer || ji.lateral)
                     {
                         // bitwise OR the masks
-                        if let Some(illegal_lhs) = left_join_illegal_map.get_mut(&i) {
+                        if let Some(illegal_lhs) = non_commutative_join_deps.get_mut(&i) {
                             illegal_lhs.add_table(j);
                         } else {
                             let mut mask = TableMask::new();
                             mask.add_table(j);
-                            left_join_illegal_map.insert(i, mask);
+                            non_commutative_join_deps.insert(i, mask);
                         }
                     }
                 }
             }
-            Some(left_join_illegal_map)
+            Some(non_commutative_join_deps)
         }
     };
 
@@ -890,14 +890,14 @@ pub fn compute_best_join_order<'a>(
                     continue;
                 }
 
-                // If this join ordering would violate LEFT JOIN ordering restrictions, skip.
-                if let Some(illegal_lhs) = left_join_illegal_map
+                // If this join ordering would violate OUTER/LATERAL join ordering constraints, skip.
+                if let Some(illegal_lhs) = non_commutative_join_deps
                     .as_ref()
                     .and_then(|deps| deps.get(&rhs_idx))
                 {
                     let legal = !lhs_mask.intersects(illegal_lhs);
                     if !legal {
-                        continue; // Don't allow RHS before its LEFT in LEFT JOIN
+                        continue; // Don't allow RHS before its prerequisite tables in OUTER/LATERAL joins
                     }
                 }
 
