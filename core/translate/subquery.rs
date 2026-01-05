@@ -691,7 +691,7 @@ pub fn emit_non_from_clause_subquery(
     query_type: &SubqueryType,
     is_correlated: bool,
 ) -> Result<()> {
-    program.incr_nesting();
+    program.try_incr_nesting()?;
 
     let label_skip_after_first_run = if !is_correlated {
         let label = program.allocate_label();

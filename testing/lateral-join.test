@@ -297,4 +297,142 @@ do_execsql_test lateral-qualified-access {
         LATERAL JOIN (SELECT x * 2 AS y) AS t2;
 } {5|10|15}
 
+# ============================================================================
+# True aggregate tests (as opposed to scalar MAX/MIN functions)
+# These tests use actual aggregate functions over multiple rows
+# ============================================================================
+
+# Setup table for aggregate tests
+do_execsql_test lateral-aggregate-setup {
+    CREATE TABLE agg_test (id INTEGER PRIMARY KEY, category TEXT, value INTEGER);
+    INSERT INTO agg_test VALUES (1, 'A', 10), (2, 'A', 20), (3, 'B', 30), (4, 'B', 40), (5, 'B', 50);
+} {}
+
+# LATERAL with COUNT aggregate - count items matching outer reference
+do_execsql_test lateral-true-aggregate-count {
+    SELECT cat.category, item_count.cnt FROM
+        (SELECT DISTINCT category FROM agg_test) AS cat
+        LATERAL JOIN (SELECT COUNT(*) AS cnt FROM agg_test WHERE category = cat.category) AS item_count
+    ORDER BY cat.category;
+} {A|2
+B|3}
+
+# LATERAL with SUM aggregate
+do_execsql_test lateral-true-aggregate-sum {
+    SELECT cat.category, totals.total FROM
+        (SELECT DISTINCT category FROM agg_test) AS cat
+        LATERAL JOIN (SELECT SUM(value) AS total FROM agg_test WHERE category = cat.category) AS totals
+    ORDER BY cat.category;
+} {A|30
+B|120}
+
+# LATERAL with AVG aggregate
+do_execsql_test lateral-true-aggregate-avg {
+    SELECT cat.category, avgs.average FROM
+        (SELECT DISTINCT category FROM agg_test) AS cat
+        LATERAL JOIN (SELECT AVG(value) AS average FROM agg_test WHERE category = cat.category) AS avgs
+    ORDER BY cat.category;
+} {A|15.0
+B|40.0}
+
+# LATERAL with multiple aggregates in same subquery
+do_execsql_test lateral-true-aggregate-multiple {
+    SELECT cat.category, stats.cnt, stats.total, stats.avg_val FROM
+        (SELECT DISTINCT category FROM agg_test) AS cat
+        LATERAL JOIN (
+            SELECT COUNT(*) AS cnt, SUM(value) AS total, AVG(value) AS avg_val
+            FROM agg_test WHERE category = cat.category
+        ) AS stats
+    ORDER BY cat.category;
+} {A|2|30|15.0
+B|3|120|40.0}
+
+# Cleanup aggregate test table
+do_execsql_test lateral-aggregate-cleanup {
+    DROP TABLE agg_test;
+} {}
+
+# ============================================================================
+# ORDER BY and LIMIT tests inside LATERAL subqueries
+# ============================================================================
+
+# Setup table for ORDER BY/LIMIT tests
+do_execsql_test lateral-orderby-setup {
+    CREATE TABLE items (id INTEGER PRIMARY KEY, grp TEXT, val INTEGER);
+    INSERT INTO items VALUES (1, 'X', 100), (2, 'X', 200), (3, 'X', 150);
+    INSERT INTO items VALUES (4, 'Y', 50), (5, 'Y', 75), (6, 'Y', 25);
+} {}
+
+# LATERAL with ORDER BY to get max value per group
+do_execsql_test lateral-orderby-desc {
+    SELECT g.grp, top.val FROM
+        (SELECT DISTINCT grp FROM items) AS g
+        LATERAL JOIN (SELECT val FROM items WHERE grp = g.grp ORDER BY val DESC LIMIT 1) AS top
+    ORDER BY g.grp;
+} {X|200
+Y|75}
+
+# LATERAL with ORDER BY ASC to get min value per group
+do_execsql_test lateral-orderby-asc {
+    SELECT g.grp, bottom.val FROM
+        (SELECT DISTINCT grp FROM items) AS g
+        LATERAL JOIN (SELECT val FROM items WHERE grp = g.grp ORDER BY val ASC LIMIT 1) AS bottom
+    ORDER BY g.grp;
+} {X|100
+Y|25}
+
+# LATERAL with LIMIT 2 - top N per group
+do_execsql_test lateral-limit-top-n {
+    SELECT g.grp, top2.val FROM
+        (SELECT DISTINCT grp FROM items) AS g
+        LATERAL JOIN (SELECT val FROM items WHERE grp = g.grp ORDER BY val DESC LIMIT 2) AS top2
+    ORDER BY g.grp, top2.val DESC;
+} {X|200
+X|150
+Y|75
+Y|50}
+
+# LATERAL with OFFSET
+do_execsql_test lateral-limit-offset {
+    SELECT g.grp, second.val FROM
+        (SELECT DISTINCT grp FROM items) AS g
+        LATERAL JOIN (SELECT val FROM items WHERE grp = g.grp ORDER BY val DESC LIMIT 1 OFFSET 1) AS second
+    ORDER BY g.grp;
+} {X|150
+Y|50}
+
+# Cleanup ORDER BY/LIMIT test table
+do_execsql_test lateral-orderby-cleanup {
+    DROP TABLE items;
+} {}
+
+# ============================================================================
+# CTE (Common Table Expression) with LATERAL tests
+# ============================================================================
+
+# CTE with LATERAL referencing CTE column in computation
+do_execsql_test lateral-cte-computation {
+    WITH base AS (SELECT 5 AS x)
+    SELECT x, computed.result FROM base
+    LATERAL JOIN (SELECT x * x + x AS result) AS computed;
+} {5|30}
+
+# Multiple CTEs with LATERAL
+do_execsql_test lateral-cte-multiple {
+    WITH
+        a AS (SELECT 2 AS val),
+        b AS (SELECT 3 AS multiplier)
+    SELECT a.val, b.multiplier, product.p FROM
+        a JOIN b ON 1=1
+        LATERAL JOIN (SELECT a.val * b.multiplier AS p) AS product;
+} {2|3|6}
+
+# CTE with chained LATERAL joins
+do_execsql_test lateral-cte-chained {
+    WITH source AS (SELECT 100 AS base_val)
+    SELECT s.base_val, step1.half, step2.quarter FROM source AS s
+    LATERAL JOIN (SELECT base_val / 2 AS half) AS step1
+    LATERAL JOIN (SELECT half / 2 AS quarter) AS step2;
+} {100|50|25}
+
 finish_test

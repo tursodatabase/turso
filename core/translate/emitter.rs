@@ -1179,7 +1179,7 @@ fn emit_program_for_delete(
         });
 
         // Execute the rowset SELECT plan to populate the rowset.
-        program.incr_nesting();
+        program.try_incr_nesting()?;
         emit_program_for_select(program, resolver, rowset_plan)?;
         program.decr_nesting();
 
@@ -1930,7 +1930,7 @@ fn emit_program_for_update(
             cursor_id: temp_cursor_id.unwrap(),
             is_table: true,
         });
-        program.incr_nesting();
+        program.try_incr_nesting()?;
         emit_program_for_select(program, resolver, ephemeral_plan)?;
         program.decr_nesting();
         Arc::new(table)
