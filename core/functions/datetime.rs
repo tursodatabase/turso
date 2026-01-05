@@ -553,14 +553,16 @@ fn last_day_in_month(year: i32, month: u32) -> u32 {
 }
 
 fn get_date_time_from_time_value_string(value: &str) -> Option<ParsedDateTime> {
-    let value = value.trim();
-
+    // Check for 'now' BEFORE trimming - SQLite does NOT trim whitespace for 'now'
     if value.eq_ignore_ascii_case("now") {
         return Some(ParsedDateTime::new(
             chrono::Local::now().to_utc().naive_utc(),
             true,
         ));
     }
+
+    let value = value.trim();
+
 
     if let Ok(julian_day) = value.parse::<f64>() {
         return get_date_time_from_time_value_float(julian_day);

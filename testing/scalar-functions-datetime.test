@@ -1038,3 +1038,16 @@ do_execsql_test timediff-julian-day {
 do_execsql_test timediff-different-time-formats {
   SELECT timediff('23:59:59', '00:00:00');
 } {"+0000-00-00 23:59:59.000"}
+
+# Whitespace around 'now' should be rejected (SQLite compatibility)
+do_execsql_test datetime-whitespace-now-rejected {
+  SELECT datetime('  now  ');
+} {{}}
+
+do_execsql_test datetime-whitespace-now-rejected-leading {
+  SELECT datetime(' now');
+} {{}}
+
+do_execsql_test datetime-whitespace-now-rejected-trailing {
+  SELECT datetime('now ');
+} {{}}
