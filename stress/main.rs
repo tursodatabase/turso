@@ -776,6 +776,11 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         stop = true;
                         break;
                     }
+                    Err(turso::Error::Error(e)) if e.contains("snapshot is stale") => {
+                        // fixme: refactor BusySnapshot to a separate error instead of using string comparison bullshit
+                        println!("Error (busy snapshot): {e}");
+                        retry_counter += 1;
+                    }
                     Err(e) => {
                         panic!("Error creating table: {e}");
                     }
