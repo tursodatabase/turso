@@ -2343,18 +2343,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             if let Some(row_versions) = index.get(index_key) {
                 let mut row_versions = row_versions.value().write();
                 for rv in row_versions.iter_mut() {
-                    if let Some(TxTimestampOrID::TxID(id)) = rv.begin {
-                        assert_eq!(id, tx_id);
-                        // If the transaction has aborted,
-                        // it marks all its new versions as garbage and sets their Begin
-                        // and End timestamps to infinity to make them invisible
-                        // See section 2.4: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf
-                        rv.begin = None;
-                        rv.end = None;
-                    } else if rv.end == Some(TxTimestampOrID::TxID(tx_id)) {
-                        // undo deletions by this transaction
-                        rv.end = None;
-                    }
+                    rollback_row_version(tx_id, rv);
                 }
             }
         }
@@ -2364,18 +2353,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         if let Some(row_versions) = self.rows.get(rowid) {
             let mut row_versions = row_versions.value().write();
             for rv in row_versions.iter_mut() {
-                if let Some(TxTimestampOrID::TxID(id)) = rv.begin {
-                    assert_eq!(id, tx_id);
-                    // If the transaction has aborted,
-                    // it marks all its new versions as garbage and sets their Begin
-                    // and End timestamps to infinity to make them invisible
-                    // See section 2.4: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf
-                    rv.begin = None;
-                    rv.end = None;
-                } else if rv.end == Some(TxTimestampOrID::TxID(tx_id)) {
-                    // undo deletions by this transaction
-                    rv.end = None;
-                }
+                rollback_row_version(tx_id, rv);
             }
         }
     }
@@ -2850,6 +2828,20 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     pub fn is_btree_allocated(&self, table_id: &MVTableId) -> bool {
         let maybe_root_page = self.table_id_to_rootpage.get(table_id);
         maybe_root_page.is_some_and(|entry| entry.value().is_some())
+    }
+}
+
+fn rollback_row_version(tx_id: u64, rv: &mut RowVersion) {
+    if rv.begin == Some(TxTimestampOrID::TxID(tx_id)) {
+        // If the transaction has aborted,
+        // it marks all its new versions as garbage and sets their Begin
+        // and End timestamps to infinity to make them invisible
+        // See section 2.4: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf
+        rv.begin = None;
+        rv.end = None;
+    } else if rv.end == Some(TxTimestampOrID::TxID(tx_id)) {
+        // undo deletions by this transaction
+        rv.end = None;
     }
 }
 
