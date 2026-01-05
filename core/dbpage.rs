@@ -43,7 +43,7 @@ impl InternalVirtualTable for DbPageTable {
     ///
     /// We encode constraint info into `idx_num` as a bitmask, which `filter()` later uses:
     /// - Bit 0 (0x1): equality on `pgno` - enables single-page lookup
-    /// - Bit 1 (0x2): equality on `schema` - we only support "main", so we let SQLite handle filtering if the user provides a different schema.
+    /// - Bit 1 (0x2): equality on `schema` - we only support "main", so we let Turso handle filtering if the user provides a different schema.
     fn best_index(
         &self,
         constraints: &[ConstraintInfo],
