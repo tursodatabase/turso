@@ -15,6 +15,7 @@ use turso_ext::{ConstraintInfo, ConstraintUsage};
 use turso_parser::ast::{self, Expr, SortOrder, TriggerEvent};
 
 use crate::{
+    function::Deterministic,
     schema::{BTreeTable, Index, IndexColumn, Schema, Table, ROWID_SENTINEL},
     translate::{
         insert::ROWID_COLUMN,

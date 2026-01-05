@@ -1,9 +1,11 @@
 #![allow(unused)]
+use crate::function::Deterministic;
 use crate::incremental::view::IncrementalView;
 use crate::numeric::StrToF64;
 use crate::schema::ColDef;
 use crate::translate::emitter::TransactionMode;
 use crate::translate::expr::{walk_expr_mut, WalkControl};
+use crate::translate::optimizer::Optimizable;
 use crate::translate::plan::JoinedTable;
 use crate::translate::planner::parse_row_id;
 use crate::types::IOResult;
@@ -684,40 +686,7 @@ pub fn columns_from_create_table_body(
             "CREATE TABLE body must contain columns and constraints".to_string(),
         ));
     };
-
-    use turso_parser::ast;
-
     Ok(columns.iter().map(Into::into).collect())
-}
-
-/// This function checks if a given expression is a constant value that can be pushed down to the database engine.
-/// It is expected to be called with the other half of a binary expression with an Expr::Column
-pub fn can_pushdown_predicate(
-    top_level_expr: &Expr,
-    table_idx: usize,
-    join_order: &[JoinOrderMember],
-) -> Result<bool> {
-    let mut can_pushdown = true;
-    walk_expr(top_level_expr, &mut |expr: &Expr| -> Result<WalkControl> {
-        match expr {
-            Expr::Column { table, .. } | Expr::RowId { table, .. } => {
-                let join_idx = join_order
-                    .iter()
-                    .position(|t| t.table_id == *table)
-                    .expect("table not found in join_order");
-                can_pushdown &= join_idx <= table_idx;
-            }
-            Expr::FunctionCall { args, name, .. } => {
-                let function = crate::function::Func::resolve_function(name.as_str(), args.len())?;
-                // is deterministic
-                can_pushdown &= function.is_deterministic();
-            }
-            _ => {}
-        };
-        Ok(WalkControl::Continue)
-    })?;
-
-    Ok(can_pushdown)
 }
 
 #[derive(Debug, Default, PartialEq)]
