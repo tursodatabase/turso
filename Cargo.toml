@@ -41,24 +41,24 @@ members = [
 exclude = ["perf/latency/limbo", "turso-test-runner"]
 
 [workspace.package]
-version = "0.4.0-pre.21"
+version = "0.4.0"
 authors = ["the Limbo authors"]
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/tursodatabase/turso"
 
 [workspace.dependencies]
-turso = { path = "bindings/rust", version = "0.4.0-pre.21" }
-turso_node = { path = "bindings/javascript", version = "0.4.0-pre.21" }
-turso_sdk_kit = { path = "sdk-kit", version = "0.4.0-pre.21" }
-turso_sdk_kit_macros = { path = "sdk-kit-macros", version = "0.4.0-pre.21" }
-turso_sync_sdk_kit = { path = "sync/sdk-kit", version = "0.4.0-pre.21" }
-limbo_completion = { path = "extensions/completion", version = "0.4.0-pre.21" }
-turso_core = { path = "core", version = "0.4.0-pre.21" }
-turso_sync_engine = { path = "sync/engine", version = "0.4.0-pre.21" }
-turso_ext = { path = "extensions/core", version = "0.4.0-pre.21" }
-turso_macros = { path = "macros", version = "0.4.0-pre.21" }
-turso_parser = { path = "parser", version = "0.4.0-pre.21" }
+turso = { path = "bindings/rust", version = "0.4.0" }
+turso_node = { path = "bindings/javascript", version = "0.4.0" }
+turso_sdk_kit = { path = "sdk-kit", version = "0.4.0" }
+turso_sdk_kit_macros = { path = "sdk-kit-macros", version = "0.4.0" }
+turso_sync_sdk_kit = { path = "sync/sdk-kit", version = "0.4.0" }
+limbo_completion = { path = "extensions/completion", version = "0.4.0" }
+turso_core = { path = "core", version = "0.4.0" }
+turso_sync_engine = { path = "sync/engine", version = "0.4.0" }
+turso_ext = { path = "extensions/core", version = "0.4.0" }
+turso_macros = { path = "macros", version = "0.4.0" }
+turso_parser = { path = "parser", version = "0.4.0" }
 sql_generation = { path = "sql_generation" }
 strum = { version = "0.26", features = ["derive"] }
 strum_macros = "0.26"
