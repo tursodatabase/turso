@@ -1,5 +1,6 @@
 [package]
 name = "turso_sdk_kit"
+description = "Turso SDK kit"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
