@@ -2071,7 +2071,7 @@ impl Connection {
         // Another checkpoint may run in this window and we may end up with corrupted db file
         // To prevent checkpoint to run in this window, we will try to acquire read lock with slot 0
         // Holding slot 0 blocks ALL checkpoints (they need exclusive read_locks[0]).
-        
+
         // Retry loop: TRUNCATE checkpoint + begin_read_tx until we acquire slot 0.
         const MAX_RETRIES: u32 = 10;
         for attempt in 0..MAX_RETRIES {

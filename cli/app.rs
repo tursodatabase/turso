@@ -6,10 +6,7 @@ use crate::{
     },
     config::Config,
     helper::LimboHelper,
-    input::{
-        get_io, get_writer, ApplyWriter, DbLocation, NoopProgress, OutputMode, ProgressSink,
-        Settings, StderrProgress,
-    },
+    input::{get_io, get_writer, DbLocation, NoopProgress, OutputMode, ProgressSink, Settings},
     manual,
     opcodes_dictionary::OPCODE_DESCRIPTIONS,
     read_state_machine::ReadState,
@@ -1790,6 +1787,7 @@ impl Limbo {
 
     fn clone_database(&mut self, output_file: &str) -> anyhow::Result<()> {
         self.conn.snapshot(output_file)?;
+        let _ = self.writeln(format!("Database cloned to '{output_file}'"));
         Ok(())
     }
 
