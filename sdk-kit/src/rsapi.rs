@@ -696,6 +696,12 @@ impl TursoConnection {
         Ok(())
     }
 
+    /// Create a point-in-time snapshot of the database to the specified path
+    pub fn snapshot(&self, output_path: &str) -> Result<(), TursoError> {
+        self.connection.snapshot(output_path)?;
+        Ok(())
+    }
+
     /// helper method to get C raw container to the TursoConnection instance
     /// this method is used in the capi wrappers
     pub fn to_capi(self: Arc<Self>) -> *mut capi::c::turso_connection_t {

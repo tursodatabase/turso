@@ -194,6 +194,16 @@ turso_status_code_t turso_connection_close(
     /** Optional return error parameter (can be null) */
     const char **error_opt_out);
 
+/** Create a point-in-time snapshot of the database to the specified path
+ * Note: Does not work with in-memory databases or MVCC mode
+ */
+turso_status_code_t turso_connection_snapshot(
+    const turso_connection_t *self,
+    /* zero-terminated C string path for output file */
+    const char *output_path,
+    /** Optional return error parameter (can be null) */
+    const char **error_opt_out);
+
 /** Execute single statement
  * execute returns TURSO_DONE if execution completed
  * execute returns TURSO_IO if async_io was set and execution needs IO in order to make progress
