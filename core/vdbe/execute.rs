@@ -1679,7 +1679,18 @@ pub fn op_column(
                                 // TEXT
                                 n if n >= 13 && n & 1 == 1 => {
                                     // SAFETY: serial type is TEXT, which guarantees valid UTF-8
-                                    let text = unsafe { std::str::from_utf8_unchecked(buf) };
+                                    let text = if cfg!(debug_assertions) {
+                                        std::str::from_utf8(buf).map_err(|e| {
+                                            LimboError::InternalError(format!(
+                                                "Invalid UTF-8 in TEXT serial type: {}",
+                                                e
+                                            ))
+                                        })?
+                                    } else {
+                                        // SAFETY: TEXT serial type contains valid UTF-8 unless we opened a sqlite DB
+                                        // with corrupted data in the text column.
+                                        unsafe { std::str::from_utf8_unchecked(buf) }
+                                    };
                                     match state.registers[*dest] {
                                         Register::Value(Value::Text(ref mut existing_text)) => {
                                             existing_text.do_extend(&text);
