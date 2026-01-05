@@ -242,4 +242,59 @@ do_catchsql_test lateral-verify-regular-join-fails {
     SELECT * FROM (SELECT 5 AS x) AS outer_tbl JOIN (SELECT x * x AS square) AS inner_tbl;
 } {1 {no such column: x}}
 
+# ============================================================================
+# Additional LATERAL tests
+# ============================================================================
+
+# Empty left side - should produce no rows
+do_execsql_test lateral-empty-left-side {
+    SELECT * FROM
+        (SELECT 1 AS x WHERE 0) AS t1
+        LATERAL JOIN (SELECT x + 100 AS y) AS t2;
+} {}
+
+# LATERAL with filtering in subquery
+do_execsql_test lateral-with-filter {
+    SELECT * FROM
+        (SELECT 10 AS x) AS t1
+        LATERAL JOIN (SELECT x * 2 AS y WHERE x > 5) AS t2;
+} {10|20}
+
+# LATERAL subquery with WHERE that filters out - empty result
+do_execsql_test lateral-filter-empty {
+    SELECT * FROM
+        (SELECT 3 AS x) AS t1
+        LATERAL JOIN (SELECT x * 10 AS y WHERE x > 5) AS t2;
+} {}
+
+# ============================================================================
+# Mixed join tests - LATERAL combined with regular joins
+# ============================================================================
+
+# Regular join followed by LATERAL
+do_execsql_test lateral-mixed-regular-then-lateral {
+    SELECT * FROM
+        (SELECT 1 AS a) AS t1
+        JOIN (SELECT 2 AS b) AS t2
+        LATERAL JOIN (SELECT a + b AS c) AS t3;
+} {1|2|3}
+
+# ============================================================================
+# Column shadowing and ambiguity tests
+# ============================================================================
+
+# LATERAL subquery can shadow outer column names
+do_execsql_test lateral-column-shadowing {
+    SELECT t2.x FROM
+        (SELECT 10 AS x) AS t1
+        LATERAL JOIN (SELECT x + 1 AS x) AS t2;
+} {11}
+
+# Both outer and inner columns accessible with qualification
+do_execsql_test lateral-qualified-access {
+    SELECT t1.x, t2.y, t1.x + t2.y AS sum FROM
+        (SELECT 5 AS x) AS t1
+        LATERAL JOIN (SELECT x * 2 AS y) AS t2;
+} {5|10|15}
+
 finish_test

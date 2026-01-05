@@ -828,41 +828,22 @@ pub fn compute_best_join_order<'a>(
     // "a LEFT JOIN b" can NOT be reordered as "b LEFT JOIN a".
     // "a LATERAL JOIN (SELECT a.x)" can NOT be reordered - the LATERAL subquery depends on 'a'.
     // If there are outer joins or LATERAL joins in the plan, ensure correct ordering.
-    let non_commutative_join_deps = {
-        let non_commutative_count = joined_tables
-            .iter()
-            .filter(|t| t.join_info.as_ref().is_some_and(|j| j.outer || j.lateral))
-            .count();
-        if non_commutative_count == 0 {
-            None
-        } else {
-            // map from rhs table index to lhs table index
-            let mut non_commutative_join_deps: HashMap<usize, TableMask> =
-                HashMap::with_capacity(non_commutative_count);
-            for (i, _) in joined_tables.iter().enumerate() {
-                for (j, joined_table) in joined_tables.iter().enumerate().skip(i + 1) {
-                    // For OUTER or LATERAL joins, the right-side table depends on left-side tables.
-                    // LATERAL subqueries reference columns from preceding tables, so they cannot
-                    // be reordered to appear before those tables.
-                    if joined_table
-                        .join_info
-                        .as_ref()
-                        .is_some_and(|ji| ji.outer || ji.lateral)
-                    {
-                        // bitwise OR the masks
-                        if let Some(illegal_lhs) = non_commutative_join_deps.get_mut(&i) {
-                            illegal_lhs.add_table(j);
-                        } else {
-                            let mut mask = TableMask::new();
-                            mask.add_table(j);
-                            non_commutative_join_deps.insert(i, mask);
-                        }
-                    }
-                }
+    //
+    // For each OUTER/LATERAL table at index j, we build a mask of all tables 0..j that must
+    // be present in the join before table j can be added. This matches the greedy optimizer's
+    // approach in `compute_greedy_join_order`.
+    let non_commutative_join_deps: HashMap<usize, TableMask> = joined_tables
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| t.join_info.as_ref().is_some_and(|ji| ji.outer || ji.lateral))
+        .map(|(j, _)| {
+            let mut required = TableMask::new();
+            for k in 0..j {
+                required.add_table(k);
             }
-            Some(non_commutative_join_deps)
-        }
-    };
+            (j, required)
+        })
+        .collect();
 
     // Now that we have our single-table base cases, we can start considering join subsets of 2 tables and more.
     // Try to join each single table to each other table.
@@ -890,13 +871,10 @@ pub fn compute_best_join_order<'a>(
                     continue;
                 }
 
-                // If this join ordering would violate OUTER/LATERAL join ordering constraints, skip.
-                if let Some(illegal_lhs) = non_commutative_join_deps
-                    .as_ref()
-                    .and_then(|deps| deps.get(&rhs_idx))
-                {
-                    let legal = !lhs_mask.intersects(illegal_lhs);
-                    if !legal {
+                // OUTER/LATERAL join RHS tables require all preceding tables to be joined first.
+                // This check ensures we don't add table j until all tables 0..j are present.
+                if let Some(required) = non_commutative_join_deps.get(&rhs_idx) {
+                    if !lhs_mask.contains_all(required) {
                         continue; // Don't allow RHS before its prerequisite tables in OUTER/LATERAL joins
                     }
                 }
@@ -1065,7 +1043,7 @@ pub fn compute_greedy_join_order<'a>(
 
     // Outer join and LATERAL join RHS tables require all preceding tables to be joined first.
     // LATERAL subqueries reference columns from preceding tables, so they have the same constraint.
-    let left_join_deps: HashMap<usize, TableMask> = joined_tables
+    let non_commutative_deps: HashMap<usize, TableMask> = joined_tables
         .iter()
         .enumerate()
         .filter(|(_, t)| t.join_info.as_ref().is_some_and(|ji| ji.outer || ji.lateral))
@@ -1083,7 +1061,7 @@ pub fn compute_greedy_join_order<'a>(
 
     // Pick starting table: prefer tables with high "hub score" (referenced by many constraints).
     let first_idx =
-        find_best_starting_table(num_tables, constraints, base_table_rows, &left_join_deps);
+        find_best_starting_table(num_tables, constraints, base_table_rows, &non_commutative_deps);
     let first_table = &joined_tables[first_idx];
     join_order.push(JoinOrderMember {
         table_id: first_table.internal_id,
@@ -1127,7 +1105,7 @@ pub fn compute_greedy_join_order<'a>(
         let mut has_connected_candidate = false;
         for &idx in &remaining {
             // Outer join RHS requires all preceding tables joined first
-            if let Some(required) = left_join_deps.get(&idx) {
+            if let Some(required) = non_commutative_deps.get(&idx) {
                 if !current_mask.contains_all(required) {
                     continue;
                 }
@@ -1229,7 +1207,7 @@ fn find_best_starting_table(
     num_tables: usize,
     constraints: &[TableConstraints],
     base_table_rows: &[RowCountEstimate],
-    left_join_deps: &HashMap<usize, TableMask>,
+    non_commutative_deps: &HashMap<usize, TableMask>,
 ) -> usize {
     // hub_score[t] = count of usable constraints on OTHER tables that reference t.
     // If we join t first, each such constraint becomes usable for an index lookup.
@@ -1246,7 +1224,7 @@ fn find_best_starting_table(
 
     let mut best: Option<(usize, f64)> = None;
     for t in 0..num_tables {
-        if left_join_deps.contains_key(&t) {
+        if non_commutative_deps.contains_key(&t) {
             continue; // Outer join RHS - cannot be first
         }
 

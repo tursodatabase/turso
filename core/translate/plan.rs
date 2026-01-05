@@ -574,8 +574,16 @@ pub fn select_star(tables: &[JoinedTable], out_columns: &mut Vec<ResultSetColumn
 pub struct JoinInfo {
     /// Whether this is an OUTER JOIN.
     pub outer: bool,
-    /// Whether this is a LATERAL JOIN. LATERAL subqueries can reference tables
-    /// appearing to their left in the FROM clause.
+    /// Whether this is a LATERAL JOIN (SQL:1999). When true, the subquery on
+    /// the right side of this join can reference columns from tables appearing
+    /// to its left in the FROM clause. This enables correlated subqueries in
+    /// the FROM clause position.
+    ///
+    /// Example: `SELECT * FROM t1 LATERAL JOIN (SELECT t1.x + 1) AS sub`
+    /// Here 'sub' can reference t1.x because of LATERAL.
+    ///
+    /// LATERAL joins cannot be reordered by the optimizer since the subquery
+    /// depends on the preceding tables being available.
     pub lateral: bool,
     /// The USING clause for the join, if any. NATURAL JOIN is transformed into USING (col1, col2, ...).
     pub using: Vec<ast::Name>,
@@ -624,6 +632,14 @@ pub struct JoinedTable {
     pub database_id: usize,
 }
 
+/// A reference to a table from an outer query scope.
+///
+/// This struct is used in three contexts:
+/// 1. **Correlated subqueries**: References to tables from enclosing SELECT statements
+/// 2. **CTE table lookup**: References to CTEs for table name resolution (not column resolution)
+/// 3. **LATERAL joins**: References to preceding FROM clause tables in LATERAL subqueries
+///
+/// The `is_lateral_ref` flag distinguishes case 3 from cases 1 and 2.
 #[derive(Debug, Clone)]
 pub struct OuterQueryReference {
     /// The name of the table as referred to in the query, either the literal name or an alias e.g. "users" or "u"
@@ -638,9 +654,15 @@ pub struct OuterQueryReference {
     /// i.e., if the subquery depends on tables T and U,
     /// then both T and U need to be in scope for the subquery to be evaluated.
     pub col_used_mask: ColumnUsedMask,
-    /// Whether this reference comes from a LATERAL JOIN. LATERAL references
-    /// allow column resolution from preceding FROM clause tables, even if
-    /// they are subqueries (FromClauseSubquery).
+    /// Whether this reference comes from a LATERAL JOIN.
+    ///
+    /// When `true`, this reference allows column resolution from preceding FROM clause
+    /// tables, even if they are subqueries (`Table::FromClauseSubquery`). This is the
+    /// key distinction: non-LATERAL `FromClauseSubquery` refs in `outer_query_refs` are
+    /// only for CTE table lookup, not for column access.
+    ///
+    /// When `false`, and the table is a `FromClauseSubquery`, column resolution is
+    /// skipped for this reference (it's only used for CTE table name matching).
     pub is_lateral_ref: bool,
 }
 
