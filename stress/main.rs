@@ -2,7 +2,7 @@ mod opts;
 
 use clap::Parser;
 use core::panic;
-use opts::Opts;
+use opts::{Opts, TxMode};
 #[cfg(not(feature = "antithesis"))]
 use rand::rngs::StdRng;
 #[cfg(not(feature = "antithesis"))]
@@ -512,7 +512,10 @@ fn generate_plan(opts: &Opts) -> Result<Plan, Box<dyn std::error::Error + Send +
                 std::io::stdout().flush().unwrap();
             }
             let tx = if get_random() % 2 == 0 {
-                Some("BEGIN;")
+                match opts.tx_mode {
+                    TxMode::SQLite => Some("BEGIN;"),
+                    TxMode::Concurrent => Some("BEGIN CONCURRENT;"),
+                }
             } else {
                 None
             };
@@ -737,7 +740,16 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let plan = plan.clone();
         let conn = db.lock().await.connect()?;
 
-        conn.busy_timeout(std::time::Duration::from_millis(opts.busy_timeout))?;
+        match opts.tx_mode {
+            TxMode::SQLite => {
+                conn.pragma_update("journal_mode", "WAL").await?;
+                conn.busy_timeout(std::time::Duration::from_millis(opts.busy_timeout))?;
+            }
+            TxMode::Concurrent => {
+                conn.pragma_update("journal_mode", "experimental_mvcc")
+                    .await?;
+            }
+        };
 
         conn.execute("PRAGMA data_sync_retry = 1", ()).await?;
 
