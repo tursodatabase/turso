@@ -54,6 +54,18 @@ jobs:
         uses: useblacksmith/setup-python@v6
         with:
           python-version: "3.10"
+      # Used for testing the benchmark actually compiles and runs correctly
+      - name: Cache TPC-H
+        id: cache-primes
+        uses: useblacksmith/cache@v5
+        with:
+          path: ${{ env.DB_FILE }}
+          key: tpc-h
+      - name: Download TPC-H
+        if: steps.cache-primes.outputs.cache-hit != 'true'
+        env:
+          DB_URL: "https://github.com/lovasoa/TPCH-sqlite/releases/download/v1.0/TPC-H.db"
+        run: wget -O $DB_FILE --no-verbose $DB_URL
       - name: Build
         env:
           SCCACHE_GHA_ENABLED: "true"
