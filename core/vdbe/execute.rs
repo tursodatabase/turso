@@ -3398,11 +3398,7 @@ pub fn seek_internal(
                             SeekOp::LT | SeekOp::LE { .. } => cursor.prev()?,
                         };
                         match result {
-                            IOResult::Done(found) => {
-                                cursor.set_has_record(found);
-                                cursor.invalidate_record();
-                                found
-                            }
+                            IOResult::Done(()) => cursor.has_record(),
                             IOResult::IO(io) => return Ok(SeekInternalResult::IO(io)),
                         }
                     };

@@ -518,7 +518,8 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
                 }
                 Some(AdvanceBtreeState::NextBtree) => {
                     let peek = &mut self.dual_peek;
-                    let found = return_if_io!(self.btree_cursor.next());
+                    return_if_io!(self.btree_cursor.next());
+                    let found = self.btree_cursor.has_record();
                     if !found {
                         peek.btree_peek = CursorPeek::Exhausted;
                         self.btree_advance_state = None;
@@ -596,8 +597,9 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
                     }
                 }
                 Some(AdvanceBtreeState::NextBtree) => {
-                    let found = return_if_io!(self.btree_cursor.prev());
+                    return_if_io!(self.btree_cursor.prev());
                     let peek = &mut self.dual_peek;
+                    let found = self.btree_cursor.has_record();
                     if !found {
                         peek.btree_peek = CursorPeek::Exhausted;
                         self.btree_advance_state = None;
@@ -856,7 +858,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
     /// Move the cursor to the next row. Returns true if the cursor moved to the next row, false if the cursor is at the end of the table.
     ///
     /// Uses dual-cursor approach: only advances the cursor that was just consumed.
-    fn next(&mut self) -> Result<IOResult<bool>> {
+    fn next(&mut self) -> Result<IOResult<()>> {
         if self.state.is_none() {
             // If BeforeFirst and peek not initialized, initialize the iterators and peek values
             let current_pos = self.get_current_pos();
@@ -909,7 +911,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                 }
                 CursorPosition::End => {
                     self.state = None;
-                    return Ok(IOResult::Done(false));
+                    return Ok(IOResult::Done(()));
                 }
             };
 
@@ -934,16 +936,13 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
         self.invalidate_record();
         self.state = None;
 
-        Ok(IOResult::Done(matches!(
-            self.get_current_pos(),
-            CursorPosition::Loaded { .. }
-        )))
+        Ok(IOResult::Done(()))
     }
 
     /// Move the cursor to the previous row. Returns true if the cursor moved, false if at the beginning.
     ///
     /// Uses dual-cursor approach: only advances the cursor that was just consumed.
-    fn prev(&mut self) -> Result<IOResult<bool>> {
+    fn prev(&mut self) -> Result<IOResult<()>> {
         if self.state.is_none() {
             // If End and peek not initialized, initialize via last()
             let current_pos = self.get_current_pos();
@@ -993,7 +992,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                 }
                 CursorPosition::BeforeFirst => {
                     self.state = None;
-                    return Ok(IOResult::Done(false));
+                    return Ok(IOResult::Done(()));
                 }
             };
 
@@ -1017,10 +1016,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
         self.invalidate_record();
         self.state = None;
 
-        Ok(IOResult::Done(matches!(
-            self.get_current_pos(),
-            CursorPosition::Loaded { .. }
-        )))
+        Ok(IOResult::Done(()))
     }
 
     fn rowid(&mut self) -> Result<IOResult<Option<i64>>> {
