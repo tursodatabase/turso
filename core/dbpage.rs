@@ -71,7 +71,8 @@ impl InternalVirtualTable for DbPageTable {
                         // schema column
                         2 => {
                             idx_num |= 2;
-                            usage.omit = false;
+                            usage.argv_index = Some(if (idx_num & 1) != 0 { 2 } else { 1 });
+                            usage.omit = true;
                         }
                         _ => {}
                     }
@@ -97,6 +98,8 @@ pub struct DbPageCursor {
     pager: Arc<Pager>,
     pgno: i64,
     mx_pgno: i64,
+    /// If true, schema constraint was for non-"main" schema, so return no rows
+    schema_mismatch: bool,
 }
 
 impl DbPageCursor {
@@ -105,6 +108,7 @@ impl DbPageCursor {
             pager,
             pgno: 1,
             mx_pgno: 0,
+            schema_mismatch: false,
         }
     }
 }
@@ -116,6 +120,8 @@ impl InternalVirtualTableCursor for DbPageCursor {
     /// If the requested page is out of range (≤0 or beyond db size), the scan returns empty.
     /// Otherwise, we do a full table scan over all pages starting from page 1.
     fn filter(&mut self, args: &[Value], _idx_str: Option<String>, idx_num: i32) -> Result<bool> {
+        self.schema_mismatch = false;
+
         let db_size = self
             .pager
             .io
@@ -123,12 +129,15 @@ impl InternalVirtualTableCursor for DbPageCursor {
 
         self.mx_pgno = db_size as i64;
 
+        let mut arg_idx = 0;
+
         if (idx_num & 1) != 0 {
-            let pgno = if let Some(Value::Integer(val)) = args.first() {
+            let pgno = if let Some(Value::Integer(val)) = args.get(arg_idx) {
                 *val
             } else {
                 0
             };
+            arg_idx += 1;
 
             if pgno > 0 && pgno <= self.mx_pgno {
                 self.pgno = pgno;
@@ -140,10 +149,22 @@ impl InternalVirtualTableCursor for DbPageCursor {
             self.pgno = 1;
         }
 
+        if (idx_num & 2) != 0 {
+            if let Some(Value::Text(schema)) = args.get(arg_idx) {
+                if schema.as_str() != "main" {
+                    self.schema_mismatch = true;
+                    return Ok(false);
+                }
+            }
+        }
+
         Ok(self.pgno <= self.mx_pgno)
     }
 
     fn next(&mut self) -> Result<bool> {
+        if self.schema_mismatch {
+            return Ok(false);
+        }
         self.pgno += 1;
         Ok(self.pgno <= self.mx_pgno)
     }
