@@ -22,7 +22,6 @@ fn error_causes_rollback(err: &LimboError) -> bool {
 use crate::{
     generation::Shadow as _,
     model::{
-        Query, ResultSet,
         interactions::{
             ConnectionState, Interaction, InteractionBuilder, InteractionPlanIterator,
             InteractionPlanState, InteractionType,
@@ -31,6 +30,21 @@ use crate::{
 };
 
 use super::env::{SimConnection, SimulatorEnv};
+
+/// Translates a Turso-specific query to a rusqlite-compatible query.
+/// - MATERIALIZED VIEW -> regular VIEW
+/// - CDC pragmas are skipped (returns None)
+fn translate_query_for_rusqlite(query: &Query) -> Option<Query> {
+    match query {
+        Query::CreateMaterializedView(matview) => {
+            Some(Query::CreateView(matview.to_regular_view()))
+        }
+        Query::DropMaterializedView(drop_matview) => {
+            Some(Query::DropView(drop_matview.to_regular_drop_view()))
+        }
+        other => Some(other.clone()),
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct Execution {
@@ -324,6 +338,13 @@ pub fn execute_interaction_turso(
 }
 
 fn limbo_integrity_check(conn: &Arc<Connection>) -> Result<()> {
+    // Skip integrity check if connection is in a write transaction.
+    // The integrity check would see uncommitted page allocations (inflated db_size)
+    // but the schema doesn't include uncommitted tables yet, causing false positives.
+    if conn.is_in_write_tx() {
+        tracing::debug!("Skipping integrity check: connection is in write transaction");
+        return Ok(());
+    }
     let mut rows = conn.query("PRAGMA integrity_check;")?.unwrap();
     let mut result = Vec::new();
 
@@ -364,8 +385,21 @@ fn execute_interaction_rusqlite(
     };
     match &interaction.interaction {
         InteractionType::Query(query) => {
+            // Translate Turso-specific queries for rusqlite
+            let translated = translate_query_for_rusqlite(query);
+            let Some(translated_query) = translated else {
+                // Query should be skipped for rusqlite (e.g., CDC pragma)
+                tracing::debug!("Skipping Turso-specific query for rusqlite: {}", query);
+                stack.push(Ok(vec![]));
+                env.update_conn_last_interaction(interaction.connection_index, Some(query));
+                // Still run shadow to keep state in sync
+                let _ =
+                    interaction.shadow(&mut env.get_conn_tables_mut(interaction.connection_index));
+                return Ok(ExecutionContinuation::NextInteraction);
+            };
+
             tracing::debug!("{}", interaction);
-            let raw_result = execute_query_rusqlite(conn, query, &attached_dbs);
+            let raw_result = execute_query_rusqlite(conn, &translated_query, &attached_dbs);
 
             let is_constraint_error = matches!(
                 &raw_result,

@@ -7,7 +7,6 @@ use serde::{Deserialize, Serialize};
 use sql_generation::model::query::select::SelectTable;
 use sql_generation::model::{
     query::{
-        Create, CreateIndex, Delete, Drop, DropIndex, Insert, Select,
         alter_table::{AlterTable, AlterTableType},
         pragma::Pragma,
         select::{CompoundOperator, FromClause, ResultColumn, SelectInner},
@@ -15,8 +14,8 @@ use sql_generation::model::{
         update::{SetValue, Update},
     },
     table::{Column, ColumnType, Index, JoinTable, JoinType, SimValue, Table, TableContext},
+    view::View,
 };
-use turso_core::Value;
 use turso_core::turso_assert_eq;
 use turso_parser::ast::Distinctness;
 
@@ -244,11 +243,15 @@ pub(crate) type ResultSet = turso_core::Result<Vec<Vec<SimValue>>>;
 #[derive(Debug, Clone, Serialize, Deserialize, strum::EnumDiscriminants)]
 pub enum Query {
     Create(Create),
+    CreateView(CreateView),
+    CreateMaterializedView(CreateMaterializedView),
     Select(Select),
     Insert(Insert),
     Delete(Delete),
     Update(Update),
     Drop(Drop),
+    DropView(DropView),
+    DropMaterializedView(DropMaterializedView),
     CreateIndex(CreateIndex),
     AlterTable(AlterTable),
     DropIndex(DropIndex),
@@ -287,6 +290,9 @@ impl Query {
         match self {
             Query::Select(select) => select.dependencies(),
             Query::Create(_) => IndexSet::new(),
+            Query::CreateView(view) => view.select.dependencies(),
+            Query::CreateMaterializedView(view) => view.select.dependencies(),
+            Query::DropView(_) | Query::DropMaterializedView(_) => IndexSet::new(),
             Query::Insert(Insert::Select { table, .. })
             | Query::Insert(Insert::Values { table, .. })
             | Query::Delete(Delete { table, .. })
@@ -313,6 +319,8 @@ impl Query {
     pub fn uses(&self) -> Vec<String> {
         match self {
             Query::Create(Create { table }) => vec![table.name.clone()],
+            Query::CreateView(view) => vec![view.name.clone()],
+            Query::CreateMaterializedView(view) => vec![view.name.clone()],
             Query::Select(select) => select.dependencies().into_iter().collect(),
             Query::Insert(Insert::Select { table, .. })
             | Query::Insert(Insert::Values { table, .. })
@@ -330,6 +338,8 @@ impl Query {
             | Query::DropIndex(DropIndex {
                 table_name: table, ..
             }) => vec![table.clone()],
+            Query::DropView(view) => vec![view.name.clone()],
+            Query::DropMaterializedView(view) => vec![view.name.clone()],
             Query::Begin(..) | Query::Commit(..) | Query::Rollback(..) => vec![],
             Query::Placeholder => vec![],
             Query::Pragma(_) => vec![],
@@ -349,8 +359,12 @@ impl Query {
         matches!(
             self,
             Self::Create(..)
+                | Self::CreateView(..)
+                | Self::CreateMaterializedView(..)
                 | Self::CreateIndex(..)
                 | Self::Drop(..)
+                | Self::DropView(..)
+                | Self::DropMaterializedView(..)
                 | Self::AlterTable(..)
                 | Self::DropIndex(..)
         )
@@ -376,11 +390,15 @@ impl Display for Query {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Create(create) => write!(f, "{create}"),
+            Self::CreateView(view) => write!(f, "{view}"),
+            Self::CreateMaterializedView(view) => write!(f, "{view}"),
             Self::Select(select) => write!(f, "{select}"),
             Self::Insert(insert) => write!(f, "{insert}"),
             Self::Delete(delete) => write!(f, "{delete}"),
             Self::Update(update) => write!(f, "{update}"),
             Self::Drop(drop) => write!(f, "{drop}"),
+            Self::DropView(view) => write!(f, "{view}"),
+            Self::DropMaterializedView(view) => write!(f, "{view}"),
             Self::CreateIndex(create_index) => write!(f, "{create_index}"),
             Self::AlterTable(alter_table) => write!(f, "{alter_table}"),
             Self::DropIndex(drop_index) => write!(f, "{drop_index}"),
@@ -402,11 +420,15 @@ impl Shadow for Query {
 
         match self {
             Query::Create(create) => create.shadow(env),
+            Query::CreateView(view) => view.shadow(env),
+            Query::CreateMaterializedView(view) => view.shadow(env),
             Query::Insert(insert) => insert.shadow(env),
             Query::Delete(delete) => delete.shadow(env),
             Query::Select(select) => select.shadow(env),
             Query::Update(update) => update.shadow(env),
             Query::Drop(drop) => drop.shadow(env),
+            Query::DropView(view) => view.shadow(env),
+            Query::DropMaterializedView(view) => view.shadow(env),
             Query::CreateIndex(create_index) => Ok(create_index.shadow(env)),
             Query::AlterTable(alter_table) => alter_table.shadow(env),
             Query::DropIndex(drop_index) => drop_index.shadow(env),
@@ -431,6 +453,10 @@ bitflags! {
         const CREATE_INDEX = 1 << 6;
         const ALTER_TABLE = 1 << 7;
         const DROP_INDEX = 1 << 8;
+        const CREATE_VIEW = 1 << 9;
+        const CREATE_MATERIALIZED_VIEW = 1 << 10;
+        const DROP_VIEW = 1 << 11;
+        const DROP_MATERIALIZED_VIEW = 1 << 12;
     }
 }
 
@@ -453,11 +479,15 @@ impl From<QueryDiscriminants> for QueryCapabilities {
     fn from(value: QueryDiscriminants) -> Self {
         match value {
             QueryDiscriminants::Create => Self::CREATE,
+            QueryDiscriminants::CreateView => Self::CREATE_VIEW,
+            QueryDiscriminants::CreateMaterializedView => Self::CREATE_MATERIALIZED_VIEW,
             QueryDiscriminants::Select => Self::SELECT,
             QueryDiscriminants::Insert => Self::INSERT,
             QueryDiscriminants::Delete => Self::DELETE,
             QueryDiscriminants::Update => Self::UPDATE,
             QueryDiscriminants::Drop => Self::DROP,
+            QueryDiscriminants::DropView => Self::DROP_VIEW,
+            QueryDiscriminants::DropMaterializedView => Self::DROP_MATERIALIZED_VIEW,
             QueryDiscriminants::CreateIndex => Self::CREATE_INDEX,
             QueryDiscriminants::AlterTable => Self::ALTER_TABLE,
             QueryDiscriminants::DropIndex => Self::DROP_INDEX,
@@ -478,10 +508,14 @@ impl QueryDiscriminants {
     pub const ALL_NO_TRANSACTION: &'_ [QueryDiscriminants] = &[
         QueryDiscriminants::Select,
         QueryDiscriminants::Create,
+        QueryDiscriminants::CreateView,
+        QueryDiscriminants::CreateMaterializedView,
         QueryDiscriminants::Insert,
         QueryDiscriminants::Update,
         QueryDiscriminants::Delete,
         QueryDiscriminants::Drop,
+        QueryDiscriminants::DropView,
+        QueryDiscriminants::DropMaterializedView,
         QueryDiscriminants::CreateIndex,
         QueryDiscriminants::AlterTable,
         QueryDiscriminants::DropIndex,
@@ -806,14 +840,35 @@ impl Shadow for FromClause {
     type Result = anyhow::Result<JoinTable>;
     fn shadow(&self, tables: &mut ShadowTablesMut) -> Self::Result {
         let mut join_table = match &self.table {
-            SelectTable::Table(table) => {
-                let first_table = tables
-                    .iter()
-                    .find(|t| t.name == *table)
-                    .context("Table not found")?;
-                JoinTable {
-                    tables: vec![first_table.clone()],
-                    rows: first_table.rows.clone(),
+            SelectTable::Table(table, _) => {
+                if let Some(first_table) = tables.iter().find(|t| t.name == *table) {
+                    JoinTable {
+                        tables: vec![first_table.clone()],
+                        rows: first_table.rows.clone(),
+                    }
+                } else if let Some((view_select, _)) = tables.find_view_select(table) {
+                    // Skip shadow evaluation if the view's SELECT references itself
+                    // (recursive CTE with same name as the matview). The shadow doesn't
+                    // model CTEs, so this would cause infinite recursion.
+                    let deps = view_select.dependencies();
+                    if deps.contains(table.as_str()) {
+                        return Ok(JoinTable {
+                            tables: vec![Table::anonymous(vec![])],
+                            rows: vec![],
+                        });
+                    }
+                    let result_tables: Vec<Table> = tables
+                        .iter()
+                        .filter(|t| deps.contains(t.name.as_str()))
+                        .cloned()
+                        .collect();
+                    let rows = view_select.shadow(tables)?;
+                    JoinTable {
+                        tables: result_tables,
+                        rows,
+                    }
+                } else {
+                    anyhow::bail!("Table not found: {table}");
                 }
             }
             SelectTable::Select(select) => {
@@ -832,10 +887,25 @@ impl Shadow for FromClause {
         };
 
         for join in &self.joins {
-            let joined_table = tables
-                .iter()
-                .find(|t| t.name == join.table)
-                .context("Joined table not found")?;
+            let joined_table = if let Some(t) = tables.iter().find(|t| t.name == join.table) {
+                t.clone()
+            } else if let Some((view_select, _)) = tables.find_view_select(&join.table) {
+                let rows = view_select.shadow(tables)?;
+                let deps = view_select.dependencies();
+                let columns: Vec<Column> = tables
+                    .iter()
+                    .filter(|t| deps.contains(t.name.as_str()))
+                    .flat_map(|t| t.columns.clone())
+                    .collect();
+                Table {
+                    name: join.table.clone(),
+                    columns,
+                    rows,
+                    indexes: vec![],
+                }
+            } else {
+                anyhow::bail!("Joined table not found: {}", join.table);
+            };
 
             join_table.tables.push(joined_table.clone());
 
@@ -1232,6 +1302,48 @@ impl Shadow for DropIndex {
         table
             .indexes
             .retain(|index| index.index_name != self.index_name);
+        Ok(vec![])
+    }
+}
+
+impl Shadow for CreateView {
+    type Result = anyhow::Result<Vec<Vec<SimValue>>>;
+
+    fn shadow(&self, tables: &mut ShadowTablesMut<'_>) -> Self::Result {
+        let view = View::regular(self.name.clone(), self.select.clone());
+        tables.record_create_view(view.clone());
+        tables.views_mut().push(view);
+        Ok(vec![])
+    }
+}
+
+impl Shadow for CreateMaterializedView {
+    type Result = anyhow::Result<Vec<Vec<SimValue>>>;
+
+    fn shadow(&self, tables: &mut ShadowTablesMut<'_>) -> Self::Result {
+        let view = View::materialized(self.name.clone(), self.select.clone());
+        tables.record_create_view(view.clone());
+        tables.views_mut().push(view);
+        Ok(vec![])
+    }
+}
+
+impl Shadow for DropView {
+    type Result = anyhow::Result<Vec<Vec<SimValue>>>;
+
+    fn shadow(&self, tables: &mut ShadowTablesMut<'_>) -> Self::Result {
+        tables.record_drop_view(self.name.clone());
+        tables.views_mut().retain(|v| v.name != self.name);
+        Ok(vec![])
+    }
+}
+
+impl Shadow for DropMaterializedView {
+    type Result = anyhow::Result<Vec<Vec<SimValue>>>;
+
+    fn shadow(&self, tables: &mut ShadowTablesMut<'_>) -> Self::Result {
+        tables.record_drop_view(self.name.clone());
+        tables.views_mut().retain(|v| v.name != self.name);
         Ok(vec![])
     }
 }

@@ -4,7 +4,6 @@ use sql_generation::generation::GenerationContext;
 
 use crate::{
     model::{
-        Query,
         interactions::{Interaction, InteractionType},
     },
     profiles::query::QueryProfile,
@@ -22,6 +21,9 @@ pub struct Remaining {
     pub alter_table: u32,
     pub drop_index: u32,
     pub pragma_count: u32,
+    pub create_matview: u32,
+    pub drop_matview: u32,
+    pub enable_cdc: u32,
 }
 
 impl Remaining {
@@ -44,6 +46,9 @@ impl Remaining {
         let total_alter_table = (max_interactions * opts.alter_table_weight) / total_weight;
         let total_drop_index = (max_interactions * opts.drop_index) / total_weight;
         let total_pragma = (max_interactions * opts.pragma_weight) / total_weight;
+        let total_create_matview = (max_interactions * opts.create_matview_weight) / total_weight;
+        let total_drop_matview = (max_interactions * opts.drop_matview_weight) / total_weight;
+        let total_enable_cdc = (max_interactions * opts.enable_cdc_weight) / total_weight;
 
         let remaining_select = total_select
             .checked_sub(stats.select_count)
@@ -91,6 +96,26 @@ impl Remaining {
             remaining_drop_index = 0;
         }
 
+        let remaining_create_matview = total_create_matview
+            .checked_sub(stats.create_matview_count)
+            .unwrap_or_default();
+        let remaining_enable_cdc = total_enable_cdc
+            .checked_sub(stats.enable_cdc_count)
+            .unwrap_or_default();
+
+        // Calculate remaining drop matview from profile weight
+        // We can only drop matviews if more have been created than dropped in this plan
+        let net_matviews_created = stats
+            .create_matview_count
+            .saturating_sub(stats.drop_matview_count);
+        let remaining_drop_matview = if net_matviews_created > 0 {
+            total_drop_matview
+                .checked_sub(stats.drop_matview_count)
+                .unwrap_or_default()
+        } else {
+            0
+        };
+
         Remaining {
             select: remaining_select,
             insert: remaining_insert,
@@ -102,6 +127,9 @@ impl Remaining {
             alter_table: remaining_alter_table,
             drop_index: remaining_drop_index,
             pragma_count: remaining_pragma,
+            create_matview: remaining_create_matview,
+            drop_matview: remaining_drop_matview,
+            enable_cdc: remaining_enable_cdc,
         }
     }
 }
@@ -121,6 +149,9 @@ pub(crate) struct InteractionStats {
     pub alter_table_count: u32,
     pub drop_index_count: u32,
     pub pragma_count: u32,
+    pub create_matview_count: u32,
+    pub drop_matview_count: u32,
+    pub enable_cdc_count: u32,
 }
 
 impl InteractionStats {
@@ -149,6 +180,10 @@ impl InteractionStats {
             Query::DropIndex(_) => self.drop_index_count += 1,
             Query::Placeholder => {}
             Query::Pragma(_) => self.pragma_count += 1,
+            Query::CreateView(_) => {}
+            Query::CreateMaterializedView(_) => self.create_matview_count += 1,
+            Query::DropView(_) => {}
+            Query::DropMaterializedView(_) => self.drop_matview_count += 1,
         }
     }
 }
@@ -157,7 +192,7 @@ impl Display for InteractionStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Read: {}, Insert: {}, Delete: {}, Update: {}, Create: {}, CreateIndex: {}, Drop: {}, Begin: {}, Commit: {}, Rollback: {}, Alter Table: {}, Drop Index: {}",
+            "Read: {}, Insert: {}, Delete: {}, Update: {}, Create: {}, CreateIndex: {}, Drop: {}, Begin: {}, Commit: {}, Rollback: {}, Alter Table: {}, Drop Index: {}, CreateMatview: {}, DropMatview: {}",
             self.select_count,
             self.insert_count,
             self.delete_count,
@@ -170,6 +205,8 @@ impl Display for InteractionStats {
             self.rollback_count,
             self.alter_table_count,
             self.drop_index_count,
+            self.create_matview_count,
+            self.drop_matview_count,
         )
     }
 }
