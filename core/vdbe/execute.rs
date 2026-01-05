@@ -1599,47 +1599,36 @@ pub fn op_column(
                             };
                             let serial_type = record_cursor.serials_offsets[target_column].0;
 
-                            macro_rules! set_int {
-                                ($val:expr) => {
-                                    match &mut state.registers[*dest] {
-                                        Register::Value(Value::Integer(existing)) => {
-                                            *existing = $val;
-                                        }
-                                        _ => {
-                                            state.registers[*dest] =
-                                                Register::Value(Value::Integer($val));
-                                        }
-                                    }
-                                };
-                            }
-
                             match serial_type {
                                 // NULL
                                 0 => {
                                     state.registers[*dest] = Register::Value(Value::Null);
                                 }
                                 // I8
-                                1 => set_int!(buf[0] as i8 as i64),
+                                1 => state.registers[*dest].set_int(buf[0] as i8 as i64),
                                 // I16
-                                2 => set_int!(i16::from_be_bytes([buf[0], buf[1]]) as i64),
+                                2 => state.registers[*dest]
+                                    .set_int(i16::from_be_bytes([buf[0], buf[1]]) as i64),
                                 // I24
                                 3 => {
                                     let sign_extension = (buf[0] > 0x7F) as u8 * 0xFF;
-                                    set_int!(i32::from_be_bytes([
+                                    state.registers[*dest].set_int(i32::from_be_bytes([
                                         sign_extension,
                                         buf[0],
                                         buf[1],
                                         buf[2],
-                                    ]) as i64);
+                                    ])
+                                        as i64);
                                 }
                                 // I32
-                                4 => set_int!(
-                                    i32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as i64
-                                ),
+                                4 => state.registers[*dest]
+                                    .set_int(
+                                        i32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as i64
+                                    ),
                                 // I48
                                 5 => {
                                     let sign_extension = (buf[0] > 0x7F) as u8 * 0xFF;
-                                    set_int!(i64::from_be_bytes([
+                                    state.registers[*dest].set_int(i64::from_be_bytes([
                                         sign_extension,
                                         sign_extension,
                                         buf[0],
@@ -1651,10 +1640,10 @@ pub fn op_column(
                                     ]));
                                 }
                                 // I64
-                                6 => set_int!(i64::from_be_bytes(
+                                6 => state.registers[*dest].set_int(i64::from_be_bytes(
                                     buf[..8]
                                         .try_into()
-                                        .expect("slice should be exactly 8 bytes")
+                                        .expect("slice should be exactly 8 bytes"),
                                 )),
                                 // F64
                                 7 => {
@@ -1674,9 +1663,9 @@ pub fn op_column(
                                     }
                                 }
                                 // CONST_INT0
-                                8 => set_int!(0),
+                                8 => state.registers[*dest].set_int(0),
                                 // CONST_INT1
-                                9 => set_int!(1),
+                                9 => state.registers[*dest].set_int(1),
                                 // BLOB
                                 n if n >= 12 && n & 1 == 0 => match state.registers[*dest] {
                                     Register::Value(Value::Blob(ref mut existing_blob)) => {
