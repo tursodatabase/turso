@@ -749,11 +749,15 @@ impl SimulatorEnv {
         }
         self.db = None;
 
+        let mut db_opts = turso_core::DatabaseOpts::new().with_autovacuum(true);
+        if self.profile.enable_views || self.profile.experimental_mvcc {
+            db_opts = db_opts.with_views(true);
+        }
         let db = match Database::open_file_with_flags(
             io.clone(),
             db_path.to_str().unwrap(),
             turso_core::OpenFlags::default(),
-            turso_core::DatabaseOpts::new().with_autovacuum(true),
+            db_opts,
             None,
         ) {
             Ok(db) => db,
@@ -763,6 +767,17 @@ impl SimulatorEnv {
             }
         };
         self.io = io;
+
+        // Switch to MVCC mode if the profile says to use MVCC
+        if self.profile.experimental_mvcc {
+            let conn = db
+                .connect()
+                .expect("Failed to create connection for MVCC setup");
+            conn.execute("PRAGMA journal_mode = 'experimental_mvcc'")
+                .expect("Failed to enable MVCC mode");
+            conn.close().expect("Failed to close MVCC setup connection");
+        }
+
         self.db = Some(db);
     }
 
@@ -895,11 +910,15 @@ impl SimulatorEnv {
             ),
         };
 
+        let mut db_opts = turso_core::DatabaseOpts::new().with_autovacuum(true);
+        if profile.enable_views || profile.experimental_mvcc {
+            db_opts = db_opts.with_views(true);
+        }
         let db = match Database::open_file_with_flags(
             io.clone(),
             db_path.to_str().unwrap(),
             turso_core::OpenFlags::default(),
-            turso_core::DatabaseOpts::new().with_autovacuum(true),
+            db_opts,
             None,
         ) {
             Ok(db) => db,
@@ -915,6 +934,7 @@ impl SimulatorEnv {
                 .expect("Failed to create connection for MVCC setup");
             conn.execute("PRAGMA journal_mode = 'experimental_mvcc'")
                 .expect("Failed to enable MVCC mode");
+            conn.close().expect("Failed to close MVCC setup connection");
         }
 
         let connections = (0..profile.max_connections)

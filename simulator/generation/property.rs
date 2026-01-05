@@ -16,7 +16,6 @@ use sql_generation::{
             alter_table::{AlterTable, AlterTableType},
             predicate::Predicate,
             select::{CompoundOperator, CompoundSelect, ResultColumn, SelectBody, SelectInner},
-            transaction::{Begin, Commit, Rollback},
             update::Update,
         },
         table::SimValue,
@@ -35,7 +34,7 @@ use crate::{
             Assertion, Interaction, InteractionBuilder, InteractionType, PropertyMetadata,
         },
         metrics::Remaining,
-        property::{InteractiveQueryInfo, Property, PropertyDiscriminants},
+        property::{Property, PropertyDiscriminants},
     },
     runner::env::SimulatorEnv,
 };
@@ -163,17 +162,15 @@ impl Property {
                         .unwrap();
                     let query = Query::arbitrary_from(rng, ctx, query_distr);
                     match &query {
-                        Query::Insert(Insert::Values { table: t, values })
-                            if *t == table_name
-                                && values.iter().any(|v| predicate.test(v, table)) =>
+                        Query::Insert(Insert::Values {
+                            table: t, values, ..
+                        }) if *t == table_name
+                            && values.iter().any(|v| predicate.test(v, table)) =>
                         {
                             // A row that holds for the predicate will not be inserted.
                             None
                         }
-                        Query::Insert(Insert::Select {
-                            table: t,
-                            select: _,
-                        }) if t == &table.name => {
+                        Query::Insert(Insert::Select { table: t, .. }) if t == &table.name => {
                             // A row that holds for the predicate will not be inserted.
                             None
                         }
@@ -393,9 +390,8 @@ impl Property {
                 row_index,
                 queries,
                 select,
-                interactive,
             } => {
-                let (table, values) = if let Insert::Values { table, values } = insert {
+                let (table, values) = if let Insert::Values { table, values, .. } = insert {
                     (table, values)
                 } else {
                     unreachable!(
@@ -430,18 +426,9 @@ impl Property {
 
                 let assertion = InteractionType::Assertion(Assertion::new(
                     format!(
-                        "row [{:?}] should be found in table {}, interactive={} commit={}, rollback={}",
+                        "row [{:?}] should be found in table {}",
                         row.iter().map(|v| v.to_string()).collect::<Vec<String>>(),
                         insert.table(),
-                        interactive.is_some(),
-                        interactive
-                            .as_ref()
-                            .map(|i| i.end_with_commit)
-                            .unwrap_or(false),
-                        interactive
-                            .as_ref()
-                            .map(|i| !i.end_with_commit)
-                            .unwrap_or(false),
                     ),
                     move |stack: &Vec<ResultSet>, _| {
                         let rows = stack.last().unwrap();
@@ -504,14 +491,15 @@ impl Property {
                 let table_name = create.table.name.clone();
 
                 let assertion = InteractionType::Assertion(Assertion::new("creating two tables with the name should result in a failure for the second query"
-                                    .to_string(), move |stack: &Vec<ResultSet>, env| {
+                                    .to_string(), move |stack: &Vec<ResultSet>, _env| {
                                 let last = stack.last().unwrap();
                                 match last {
                                     Ok(success) => Ok(Err(format!("expected table creation to fail but it succeeded: {success:?}"))),
                                     Err(e) => {
                                         if e.to_string().to_lowercase().contains(&format!("table {table_name} already exists")) {
-                                             // On error we rollback the transaction if there is any active here
-                                            env.rollback_conn(connection_index);
+                                            // Statement error does NOT roll back the transaction in SQLite.
+                                            // Only the failed statement is rejected; prior changes remain valid.
+                                            // Do NOT call rollback_conn() here.
                                             Ok(Ok(()))
                                         } else {
                                             Ok(Err(format!("expected table already exists error, got: {e}")))
@@ -860,24 +848,26 @@ impl Property {
                 // but no IO happens right after it
                 let assert = Assertion::new(
                     "fault occured".to_string(),
-                    move |stack, env: &mut SimulatorEnv| {
+                    move |stack, _env: &mut SimulatorEnv| {
                         let last = stack.last().unwrap();
                         match last {
                             Ok(_) => {
                                 let _ = query_clone
-                                    .shadow(&mut env.get_conn_tables_mut(connection_index));
+                                    .shadow(&mut _env.get_conn_tables_mut(connection_index));
                                 Ok(Ok(()))
                             }
                             Err(err) => {
-                                // We cannot make any assumptions about the error content; all we are about is, if the statement errored,
-                                // we don't shadow the results into the simulator env, i.e. we assume whatever the statement did was rolled back.
+                                // Statement-level I/O failures do NOT automatically roll back the
+                                // transaction in SQLite. Only the failed statement is rejected;
+                                // the transaction continues with prior changes intact.
+                                // We don't shadow this failed statement's results.
                                 tracing::error!("Fault injection produced error: {err}");
 
                                 if let LimboError::CheckpointFailed(msg) = err {
-                                    // Checkpoint failure means the transaction is committed because the WAL commit succeeded, so we DON'T rollback,
-                                    // and the results of the query are shadowed into the simulator environment
+                                    // Checkpoint failure means the transaction is committed because
+                                    // the WAL commit succeeded, so we shadow the query results.
                                     query_clone
-                                        .shadow(&mut env.get_conn_tables_mut(connection_index))
+                                        .shadow(&mut _env.get_conn_tables_mut(connection_index))
                                         .expect("Failed to shadow tables");
                                     tracing::error!(
                                         "Fault injection produced CheckpointFailed error: {msg}"
@@ -885,8 +875,8 @@ impl Property {
                                     return Ok(Ok(()));
                                 }
 
-                                // On error we rollback the transaction if there is any active here
-                                env.rollback_conn(connection_index);
+                                // Do NOT call rollback_conn() here. Statement errors don't roll
+                                // back the transaction - only the failed statement is rejected.
                                 Ok(Ok(()))
                             }
                         }
@@ -946,6 +936,7 @@ impl Property {
                 ]);
 
                 let select_tlp = Select {
+                    with: None,
                     body: SelectBody {
                         select: Box::new(SelectInner {
                             distinctness: select.body.select.distinctness,
@@ -1200,7 +1191,7 @@ fn property_insert_values_select<R: rand::Rng + ?Sized>(
     rng: &mut R,
     _query_distr: &QueryDistribution,
     ctx: &impl GenerationContext,
-    mvcc: bool,
+    _mvcc: bool,
 ) -> Property {
     assert!(!ctx.tables().is_empty());
     // Get a random table
@@ -1218,39 +1209,13 @@ fn property_insert_values_select<R: rand::Rng + ?Sized>(
     let insert_query = Query::Insert(Insert::Values {
         table: table.name.clone(),
         values: rows,
+        conflict: None,
     });
 
-    // Choose if we want queries to be executed in an interactive transaction
-    let interactive = if !mvcc && rng.random_bool(0.5) {
-        Some(InteractiveQueryInfo {
-            start_with_immediate: rng.random_bool(0.5),
-            end_with_commit: rng.random_bool(0.5),
-        })
-    } else {
-        None
-    };
-
+    // Generate 0-2 placeholder queries between INSERT and SELECT
+    // Transaction boundaries are now managed at the plan level, not here
     let amount = rng.random_range(0..3);
-
-    let mut queries = Vec::with_capacity(amount + 2);
-
-    if let Some(ref interactive) = interactive {
-        queries.push(Query::Begin(if interactive.start_with_immediate {
-            Begin::Immediate
-        } else {
-            Begin::Deferred
-        }));
-    }
-
-    queries.extend(std::iter::repeat_n(Query::Placeholder, amount));
-
-    if let Some(ref interactive) = interactive {
-        queries.push(if interactive.end_with_commit {
-            Query::Commit(Commit)
-        } else {
-            Query::Rollback(Rollback)
-        });
-    }
+    let queries = vec![Query::Placeholder; amount];
 
     // Select the row
     let select_query = Select::simple(
@@ -1263,7 +1228,6 @@ fn property_insert_values_select<R: rand::Rng + ?Sized>(
         row_index,
         queries,
         select: select_query,
-        interactive,
     }
 }
 
