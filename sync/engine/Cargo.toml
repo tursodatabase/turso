@@ -1,5 +1,6 @@
 [package]
 name = "turso_sync_engine"
+description = "Turso sync engine"
 version.workspace = true
 authors.workspace = true
 edition.workspace = true
