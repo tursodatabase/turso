@@ -2067,17 +2067,38 @@ impl Connection {
             ));
         };
 
-        // TRUNCATE checkpoint - flushes all WAL data to DB file and empties WAL
-        let _ = pager.blocking_checkpoint(
-            CheckpointMode::Truncate {
-                upper_bound_inclusive: None,
-            },
-            self.get_sync_mode(),
-        )?;
+        // There is a race condition after checkpointing and before copying database file.
+        // Another checkpoint may run in this window and we may end up with corrupted db file
+        // To prevent checkpoint to run in this window, we will try to acquire read lock with slot 0
+        // Holding slot 0 blocks ALL checkpoints (they need exclusive read_locks[0]).
+        
+        // Retry loop: TRUNCATE checkpoint + begin_read_tx until we acquire slot 0.
+        const MAX_RETRIES: u32 = 10;
+        for attempt in 0..MAX_RETRIES {
+            // TRUNCATE checkpoint - flushes all WAL data to DB file and empties WAL
+            let _ = pager.blocking_checkpoint(
+                CheckpointMode::Truncate {
+                    upper_bound_inclusive: None,
+                },
+                self.get_sync_mode(),
+            )?;
 
-        // Acquire read lock - prevents other checkpoints during copy
-        // After TRUNCATE, DB file is complete. New writes go to WAL only, not DB file.
-        pager.begin_read_tx()?;
+            // Immediately try to acquire read lock
+            pager.begin_read_tx()?;
+
+            // Check if we got slot 0 (WAL was still empty, no writer snuck in)
+            if wal.get_read_lock_slot() == Some(0) {
+                break; // Success - slot 0 blocks all checkpoints
+            }
+
+            // A writer snuck in between TRUNCATE and begin_read_tx - we got slot 1-4
+            // This doesn't fully protect against other checkpoints, so retry
+            wal.end_read_tx();
+
+            if attempt == MAX_RETRIES - 1 {
+                return Err(LimboError::Busy);
+            }
+        }
 
         // Copy the database file
         let result = (|| -> Result<()> {

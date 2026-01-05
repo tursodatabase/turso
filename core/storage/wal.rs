@@ -261,6 +261,9 @@ pub trait Wal: Debug + Send + Sync {
     /// End a write transaction.
     fn end_write_tx(&self);
 
+    /// Get the current read lock slot index, or None if no read lock is held.
+    fn get_read_lock_slot(&self) -> Option<usize>;
+
     /// Find the latest frame containing a page.
     ///
     /// optional frame_watermark parameter can be passed to force WAL to find frame not larger than watermark value
@@ -1089,6 +1092,16 @@ impl Wal for WalFile {
             tracing::debug!("end_read_tx(slot={slot})");
         } else {
             tracing::debug!("end_read_tx(slot=no_lock)");
+        }
+    }
+
+    /// Get the current read lock slot index, or None if no read lock is held.
+    fn get_read_lock_slot(&self) -> Option<usize> {
+        let slot = self.max_frame_read_lock_index.load(Ordering::Acquire);
+        if slot == NO_LOCK_HELD {
+            None
+        } else {
+            Some(slot)
         }
     }
 
