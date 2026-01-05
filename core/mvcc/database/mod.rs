@@ -2808,6 +2808,11 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             allocator
         }
     }
+
+    pub fn is_btree_allocated(&self, table_id: &MVTableId) -> bool {
+        let maybe_root_page = self.table_id_to_rootpage.get(table_id);
+        maybe_root_page.is_some_and(|entry| entry.value().is_some())
+    }
 }
 
 impl RowidAllocator {

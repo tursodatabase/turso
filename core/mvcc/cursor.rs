@@ -437,8 +437,7 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
     }
 
     fn is_btree_allocated(&self) -> bool {
-        let maybe_root_page = self.db.table_id_to_rootpage.get(&self.table_id);
-        maybe_root_page.is_some_and(|entry| entry.value().is_some())
+        self.db.is_btree_allocated(&self.table_id)
     }
 
     fn query_btree_version_is_valid(&self, key: &RowKey) -> bool {
