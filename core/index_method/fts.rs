@@ -1,15 +1,19 @@
 use crate::index_method::{
-    parse_patterns, IndexMethod, IndexMethodAttachment, IndexMethodConfiguration,
-    IndexMethodCursor, IndexMethodDefinition,
+    open_index_cursor, parse_patterns, IndexMethod, IndexMethodAttachment,
+    IndexMethodConfiguration, IndexMethodCursor, IndexMethodDefinition,
 };
+use crate::return_if_io;
 use crate::schema::IndexColumn;
-use crate::types::IOResult;
+use crate::storage::btree::{BTreeCursor, BTreeKey, CursorTrait};
+use crate::translate::collate::CollationSeq;
+use crate::types::{IOResult, ImmutableRecord, KeyInfo, SeekKey, SeekOp, SeekResult, Text};
 use crate::vdbe::Register;
-use crate::{Connection, LimboError, Result, StepResult, Value};
+use crate::{Connection, LimboError, Result, Value};
+use std::collections::HashMap;
 use std::io::{BufWriter, Write};
 use std::ops::Range;
-use std::path::Path;
-use std::sync::Arc;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
 use tantivy::directory::error::{DeleteError, OpenReadError, OpenWriteError};
 use tantivy::directory::{
     Directory, FileHandle, OwnedBytes, TerminatingWrite, WatchCallback, WatchHandle,
@@ -21,11 +25,261 @@ use tantivy::{
     Index, IndexSettings,
 };
 use tantivy::{DocAddress, HasLen, IndexReader, IndexWriter, Searcher, TantivyDocument};
+use turso_parser::ast::SortOrder;
 use turso_parser::ast::{self, Select};
 
 pub const FTS_INDEX_METHOD_NAME: &str = "fts";
 pub const DEFAULT_MEMORY_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 pub const DEFAULT_CHUNK_SIZE: usize = 512 * 1024;
+/// Number of documents to batch before committing to Tantivy
+pub const BATCH_COMMIT_SIZE: usize = 1000;
+
+/// Helper to create KeyInfo for text collation
+fn key_info() -> KeyInfo {
+    KeyInfo {
+        sort_order: SortOrder::Asc,
+        collation: CollationSeq::Binary,
+    }
+}
+
+fn name(name: impl ToString) -> ast::Name {
+    ast::Name::exact(name.to_string())
+}
+
+type PendingWrites = Arc<RwLock<Vec<(PathBuf, Vec<u8>)>>>;
+
+/// CachedBTreeDirectory: In-memory Directory implementation for Tantivy.
+/// All operations are synchronous and work on in-memory data only.
+/// Actual BTree IO happens in the FtsCursor state machines.
+#[derive(Debug, Clone)]
+pub struct CachedBTreeDirectory {
+    /// Files loaded into memory: path -> content
+    files: Arc<RwLock<HashMap<PathBuf, Vec<u8>>>>,
+    /// Pending writes to be flushed to BTree
+    pending_writes: PendingWrites,
+    /// Pending deletes to be flushed to BTree
+    pending_deletes: Arc<RwLock<Vec<PathBuf>>>,
+}
+impl Default for CachedBTreeDirectory {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CachedBTreeDirectory {
+    pub fn new() -> Self {
+        Self {
+            files: Arc::new(RwLock::new(HashMap::new())),
+            pending_writes: Arc::new(RwLock::new(Vec::new())),
+            pending_deletes: Arc::new(RwLock::new(Vec::new())),
+        }
+    }
+
+    /// Create from preloaded files
+    pub fn with_files(files: HashMap<PathBuf, Vec<u8>>) -> Self {
+        Self {
+            files: Arc::new(RwLock::new(files)),
+            pending_writes: Arc::new(RwLock::new(Vec::new())),
+            pending_deletes: Arc::new(RwLock::new(Vec::new())),
+        }
+    }
+
+    /// Get pending writes for flushing, deduplicated to keep only the last write for each path.
+    /// This is critical because Tantivy may write the same file multiple times during indexing,
+    /// and we only want to persist the final version of each file.
+    pub fn take_pending_writes(&self) -> Vec<(PathBuf, Vec<u8>)> {
+        let mut pending = self.pending_writes.write().unwrap();
+        let all_writes = std::mem::take(&mut *pending);
+
+        // Deduplicate: keep only the last write for each path
+        // Use a HashMap to track the last write index for each path
+        let mut last_write_idx: HashMap<PathBuf, usize> = HashMap::new();
+        for (idx, (path, _)) in all_writes.iter().enumerate() {
+            last_write_idx.insert(path.clone(), idx);
+        }
+
+        // Collect only the entries that are the last write for their path
+        let deduped: Vec<(PathBuf, Vec<u8>)> = all_writes
+            .into_iter()
+            .enumerate()
+            .filter(|(idx, (path, _))| last_write_idx.get(path) == Some(idx))
+            .map(|(_, entry)| entry)
+            .collect();
+
+        tracing::debug!(
+            "FTS take_pending_writes: {} entries after deduplication",
+            deduped.len()
+        );
+        deduped
+    }
+
+    /// Get pending deletes for flushing
+    pub fn take_pending_deletes(&self) -> Vec<PathBuf> {
+        let mut pending = self.pending_deletes.write().unwrap();
+        std::mem::take(&mut *pending)
+    }
+
+    /// Check if there are pending changes
+    pub fn has_pending_changes(&self) -> bool {
+        let writes = self.pending_writes.read().unwrap();
+        let deletes = self.pending_deletes.read().unwrap();
+        !writes.is_empty() || !deletes.is_empty()
+    }
+}
+
+/// In-memory file handle for CachedBTreeDirectory
+struct CachedFileHandle {
+    data: Vec<u8>,
+}
+
+impl std::fmt::Debug for CachedFileHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CachedFileHandle")
+            .field("len", &self.data.len())
+            .finish()
+    }
+}
+
+impl HasLen for CachedFileHandle {
+    fn len(&self) -> usize {
+        self.data.len()
+    }
+}
+
+impl FileHandle for CachedFileHandle {
+    fn read_bytes(&self, range: Range<usize>) -> std::io::Result<OwnedBytes> {
+        if range.end > self.data.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "range exceeds file length",
+            ));
+        }
+        if range.start >= range.end {
+            return Ok(OwnedBytes::new(Vec::new()));
+        }
+        Ok(OwnedBytes::new(self.data[range].to_vec()))
+    }
+}
+
+/// In-memory writer for CachedBTreeDirectory
+struct CachedWriter {
+    path: PathBuf,
+    buffer: Vec<u8>,
+    directory: CachedBTreeDirectory,
+}
+
+impl Write for CachedWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.buffer.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for CachedWriter {
+    fn drop(&mut self) {
+        // Commit the write to the directory
+        let data = std::mem::take(&mut self.buffer);
+        if !data.is_empty() {
+            // Update in-memory files
+            let mut files = self.directory.files.write().unwrap();
+            files.insert(self.path.clone(), data.clone());
+            drop(files);
+            // Queue for BTree flush
+            let mut pending = self.directory.pending_writes.write().unwrap();
+            pending.push((self.path.clone(), data));
+        }
+    }
+}
+
+impl TerminatingWrite for CachedWriter {
+    fn terminate_ref(&mut self, _: tantivy::directory::AntiCallToken) -> std::io::Result<()> {
+        // Commit the write to the directory
+        let data = std::mem::take(&mut self.buffer);
+        // Update in-memory files
+        let mut files = self.directory.files.write().unwrap();
+        files.insert(self.path.clone(), data.clone());
+        drop(files);
+        // Queue for BTree flush
+        let mut pending = self.directory.pending_writes.write().unwrap();
+        pending.push((self.path.clone(), data));
+        Ok(())
+    }
+}
+
+impl Directory for CachedBTreeDirectory {
+    fn get_file_handle(
+        &self,
+        path: &Path,
+    ) -> std::result::Result<Arc<dyn FileHandle>, OpenReadError> {
+        let files = self.files.read().unwrap();
+        let data = files
+            .get(path)
+            .ok_or_else(|| OpenReadError::FileDoesNotExist(path.to_path_buf()))?
+            .clone();
+        Ok(Arc::new(CachedFileHandle { data }))
+    }
+
+    fn exists(&self, path: &Path) -> std::result::Result<bool, OpenReadError> {
+        let files = self.files.read().unwrap();
+        Ok(files.contains_key(path))
+    }
+
+    fn delete(&self, path: &Path) -> std::result::Result<(), DeleteError> {
+        // Remove from in-memory files
+        let mut files = self.files.write().unwrap();
+        files.remove(path);
+        drop(files);
+        // Queue for BTree deletion
+        let mut pending = self.pending_deletes.write().unwrap();
+        pending.push(path.to_path_buf());
+        Ok(())
+    }
+
+    fn open_write(
+        &self,
+        path: &Path,
+    ) -> std::result::Result<BufWriter<Box<dyn TerminatingWrite>>, OpenWriteError> {
+        // First delete existing file
+        let _ = self.delete(path);
+        let writer: Box<dyn TerminatingWrite> = Box::new(CachedWriter {
+            path: path.to_path_buf(),
+            buffer: Vec::new(),
+            directory: self.clone(),
+        });
+        Ok(BufWriter::new(writer))
+    }
+
+    fn atomic_read(&self, path: &Path) -> std::result::Result<Vec<u8>, OpenReadError> {
+        let files = self.files.read().unwrap();
+        files
+            .get(path)
+            .cloned()
+            .ok_or_else(|| OpenReadError::FileDoesNotExist(path.to_path_buf()))
+    }
+
+    fn atomic_write(&self, path: &Path, data: &[u8]) -> std::io::Result<()> {
+        // Update in-memory files
+        let mut files = self.files.write().unwrap();
+        files.insert(path.to_path_buf(), data.to_vec());
+        drop(files);
+        // Queue for BTree flush
+        let mut pending = self.pending_writes.write().unwrap();
+        pending.push((path.to_path_buf(), data.to_vec()));
+        Ok(())
+    }
+
+    fn sync_directory(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn watch(&self, _cb: WatchCallback) -> std::result::Result<WatchHandle, tantivy::TantivyError> {
+        Ok(WatchHandle::empty())
+    }
+}
 
 #[derive(Debug)]
 /// FtsIndexMethod: Factory for creating FTS attachments
@@ -159,231 +413,11 @@ impl IndexMethodAttachment for FtsIndexAttachment {
 
     fn init(&self) -> Result<Box<dyn IndexMethodCursor>> {
         Ok(Box::new(FtsCursor::new(
-            self.cfg.clone(),
+            &self.cfg,
             self.schema.clone(),
             self.rowid_field,
             self.text_fields.clone(),
         )))
-    }
-}
-
-#[derive(Clone)]
-/// BTreeDirectory : Tantivy Directory impl backed by btree table storage
-pub struct BTreeDirectory {
-    /// Database table name for storage
-    table_name: String,
-    /// Chunk size for storage
-    chunk_size: usize,
-    /// Database connection
-    connection: Arc<Connection>,
-}
-
-impl std::fmt::Debug for BTreeDirectory {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BTreeDirectory")
-            .field("table_name", &self.table_name)
-            .field("chunk_size", &self.chunk_size)
-            .finish()
-    }
-}
-
-impl BTreeDirectory {
-    pub fn new(connection: Arc<Connection>, table_name: String, chunk_size: usize) -> Result<Self> {
-        initialize_btree_storage_table(&connection, &table_name)?;
-        Ok(Self {
-            table_name,
-            chunk_size,
-            connection,
-        })
-    }
-
-    /// Get total length of file by summing all chunk sizes
-    fn fetch_file_len(&self, path: &str) -> std::result::Result<usize, OpenReadError> {
-        let stmt_ast = ast_builder::select_total_length_by_path(&self.table_name, path);
-        self.connection.start_nested();
-        let mut stmt =
-            self.connection
-                .prepare_stmt(stmt_ast)
-                .map_err(|e| OpenReadError::IoError {
-                    io_error: std::io::Error::other(e.to_string()).into(),
-                    filepath: path.into(),
-                })?;
-
-        stmt.program.needs_stmt_subtransactions = false;
-
-        let result = loop {
-            match stmt.step() {
-                Ok(StepResult::Row) => {
-                    let val = if let Some(row) = stmt.row() {
-                        let values: Vec<_> = row.get_values().cloned().collect();
-                        if let Some(Value::Integer(n)) = values.first() {
-                            *n as usize
-                        } else {
-                            0
-                        }
-                    } else {
-                        0
-                    };
-                    break Ok(val);
-                }
-                Ok(StepResult::Done) => break Ok(0),
-                Ok(StepResult::IO) => {
-                    let _ = self.connection.pager.load().io.step();
-                    continue;
-                }
-                Ok(StepResult::Busy) => continue,
-                Ok(StepResult::Interrupt) => {
-                    break Err(OpenReadError::IoError {
-                        io_error: std::io::Error::other("interrupted").into(),
-                        filepath: path.into(),
-                    });
-                }
-                Err(e) => {
-                    break Err(OpenReadError::IoError {
-                        io_error: std::io::Error::other(e.to_string()).into(),
-                        filepath: path.into(),
-                    });
-                }
-            }
-        };
-
-        self.connection.end_nested();
-        result
-    }
-
-    /// Check if any row exists for path
-    fn exists_row_for_path(&self, path: &str) -> std::result::Result<bool, OpenReadError> {
-        let stmt_ast = ast_builder::select_exists_by_path(&self.table_name, path);
-        self.connection.start_nested();
-        let mut stmt =
-            self.connection
-                .prepare_stmt(stmt_ast)
-                .map_err(|e| OpenReadError::IoError {
-                    io_error: std::io::Error::other(e.to_string()).into(),
-                    filepath: path.into(),
-                })?;
-
-        stmt.program.needs_stmt_subtransactions = false;
-
-        let result = loop {
-            match stmt.step() {
-                Ok(StepResult::Row) => break Ok(true),
-                Ok(StepResult::Done) => break Ok(false),
-                Ok(StepResult::IO) => {
-                    let _ = self.connection.pager.load().io.step();
-                    continue;
-                }
-                Ok(StepResult::Busy) => continue,
-                Ok(StepResult::Interrupt) => {
-                    break Err(OpenReadError::IoError {
-                        io_error: std::io::Error::other("interrupted").into(),
-                        filepath: path.into(),
-                    });
-                }
-                Err(e) => {
-                    break Err(OpenReadError::IoError {
-                        io_error: std::io::Error::other(e.to_string()).into(),
-                        filepath: path.into(),
-                    });
-                }
-            }
-        };
-
-        self.connection.end_nested();
-        result
-    }
-
-    /// Delete all chunks for a path
-    fn delete_all_chunks_for_path(&self, path: &str) -> std::result::Result<(), DeleteError> {
-        let stmt_ast = ast_builder::delete_by_path(&self.table_name, path);
-        self.connection.start_nested();
-        let mut stmt =
-            self.connection
-                .prepare_stmt(stmt_ast)
-                .map_err(|e| DeleteError::IoError {
-                    io_error: std::io::Error::other(e.to_string()).into(),
-                    filepath: path.into(),
-                })?;
-
-        stmt.program.needs_stmt_subtransactions = false;
-        let res = stmt.run_ignore_rows();
-        self.connection.end_nested();
-
-        res.map_err(|e| DeleteError::IoError {
-            io_error: std::io::Error::other(e.to_string()).into(),
-            filepath: path.into(),
-        })
-    }
-
-    /// Read all bytes for a path (concatenating chunks in order)
-    fn read_all_bytes_for_path(&self, path: &str) -> std::result::Result<Vec<u8>, OpenReadError> {
-        let stmt_ast = ast_builder::select_bytes_by_path(&self.table_name, path);
-        self.connection.start_nested();
-        let mut stmt =
-            self.connection
-                .prepare_stmt(stmt_ast)
-                .map_err(|e| OpenReadError::IoError {
-                    io_error: std::io::Error::other(e.to_string()).into(),
-                    filepath: path.into(),
-                })?;
-
-        stmt.program.needs_stmt_subtransactions = false;
-
-        let mut data = Vec::new();
-        let result = loop {
-            match stmt.step() {
-                Ok(StepResult::Row) => {
-                    if let Some(row) = stmt.row() {
-                        let values: Vec<_> = row.get_values().cloned().collect();
-                        if let Some(Value::Blob(bytes)) = values.first() {
-                            data.extend_from_slice(bytes);
-                        }
-                    }
-                }
-                Ok(StepResult::Done) => break Ok(data),
-                Ok(StepResult::IO) => {
-                    let _ = self.connection.pager.load().io.step();
-                    continue;
-                }
-                Ok(StepResult::Busy) => continue,
-                Ok(StepResult::Interrupt) => {
-                    break Err(OpenReadError::IoError {
-                        io_error: std::io::Error::other("interrupted").into(),
-                        filepath: path.into(),
-                    });
-                }
-                Err(e) => {
-                    break Err(OpenReadError::IoError {
-                        io_error: std::io::Error::other(e.to_string()).into(),
-                        filepath: path.into(),
-                    });
-                }
-            }
-        };
-
-        self.connection.end_nested();
-        result
-    }
-
-    /// Atomically overwrite file with single chunk (delete + insert)
-    fn atomic_overwrite_single_chunk(&self, path: &str, data: &[u8]) -> std::io::Result<()> {
-        // Delete existing
-        let _ = self.delete_all_chunks_for_path(path);
-
-        // Insert new - use hex encoding for blob data
-        let hex_data: String = data.iter().map(|b| format!("{b:02x}")).collect();
-        let stmt_ast = ast_builder::insert_chunk(&self.table_name, path, 0, &hex_data);
-        self.connection.start_nested();
-        let mut insert_stmt = self
-            .connection
-            .prepare_stmt(stmt_ast)
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
-
-        insert_stmt.program.needs_stmt_subtransactions = false;
-        let res = insert_stmt.run_ignore_rows();
-        self.connection.end_nested();
-
-        res.map_err(|e| std::io::Error::other(e.to_string()))
     }
 }
 
@@ -402,18 +436,27 @@ fn initialize_btree_storage_table(conn: &Arc<Connection>, table_name: &str) -> R
         body: ast::CreateTableBody::ColumnsAndConstraints {
             columns: vec![
                 ast::ColumnDefinition {
-                    col_name: ast_builder::name("path"),
-                    col_type: Some(ast_builder::text_type()),
+                    col_name: name("path"),
+                    col_type: Some(ast::Type {
+                        name: "TEXT".to_string(),
+                        size: None,
+                    }),
                     constraints: vec![NOTNULL_CONSTRAINT],
                 },
                 ast::ColumnDefinition {
-                    col_name: ast_builder::name("chunk_no"),
-                    col_type: Some(ast_builder::integer_type()),
+                    col_name: name("chunk_no"),
+                    col_type: Some(ast::Type {
+                        name: "INTEGER".to_string(),
+                        size: None,
+                    }),
                     constraints: vec![NOTNULL_CONSTRAINT],
                 },
                 ast::ColumnDefinition {
-                    col_name: ast_builder::name("bytes"),
-                    col_type: Some(ast_builder::blob_type()),
+                    col_name: name("bytes"),
+                    col_type: Some(ast::Type {
+                        name: "BLOB".to_string(),
+                        size: None,
+                    }),
                     constraints: vec![NOTNULL_CONSTRAINT],
                 },
             ],
@@ -422,23 +465,30 @@ fn initialize_btree_storage_table(conn: &Arc<Connection>, table_name: &str) -> R
         },
         temporary: false,
         if_not_exists: true,
-        tbl_name: ast_builder::table_name(table_name),
+        tbl_name: ast::QualifiedName::single(name(table_name)),
     };
-    // "CREATE UNIQUE INDEX IF NOT EXISTS idx_name ON table_name (path, chunk_no);"
+    // "CREATE INDEX IF NOT EXISTS idx_name ON table_name USING backing_btree (path, chunk_no, bytes);"
+    // Use backing_btree to create a BTree that stores all columns without rowid indirection
+    // This allows direct cursor access with the exact key structure
     let create_index_stmt = ast::Stmt::CreateIndex {
-        unique: true,
+        unique: false, // backing_btree doesn't use unique constraint
         if_not_exists: true,
-        idx_name: ast_builder::table_name(&format!("{table_name}_key")),
-        tbl_name: ast_builder::name(table_name),
-        using: None,
+        idx_name: ast::QualifiedName::single(name(format!("{table_name}_key"))),
+        tbl_name: name(table_name),
+        using: Some(name("backing_btree")),
         columns: vec![
             ast::SortedColumn {
-                expr: Box::new(ast::Expr::Name(ast_builder::name("path"))),
+                expr: Box::new(ast::Expr::Name(name("path"))),
                 order: None,
                 nulls: None,
             },
             ast::SortedColumn {
-                expr: Box::new(ast::Expr::Name(ast_builder::name("chunk_no"))),
+                expr: Box::new(ast::Expr::Name(name("chunk_no"))),
+                order: None,
+                nulls: None,
+            },
+            ast::SortedColumn {
+                expr: Box::new(ast::Expr::Name(name("bytes"))),
                 order: None,
                 nulls: None,
             },
@@ -468,305 +518,6 @@ fn initialize_btree_storage_table(conn: &Arc<Connection>, table_name: &str) -> R
     Ok(())
 }
 
-/// FileHandle impl for reading from btree storage
-struct BTreeFileHandle {
-    /// Underlying database connection
-    conn: Arc<Connection>,
-    /// Name of table for storage
-    table_name: String,
-    /// Tantivy path being read
-    path: String,
-    /// Total length of file in bytes
-    len: usize,
-    /// Size of chunks in bytes
-    chunk_size: usize,
-}
-
-impl std::fmt::Debug for BTreeFileHandle {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("BTreeFileHandle")
-            .field("table_name", &self.table_name)
-            .field("path", &self.path)
-            .field("len", &self.len)
-            .field("chunk_size", &self.chunk_size)
-            .finish()
-    }
-}
-
-impl HasLen for BTreeFileHandle {
-    fn len(&self) -> usize {
-        self.len
-    }
-}
-
-impl FileHandle for BTreeFileHandle {
-    fn read_bytes(&self, range: Range<usize>) -> std::io::Result<OwnedBytes> {
-        if range.end > self.len {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "range exceeds file length",
-            ));
-        }
-        if range.start >= range.end {
-            return Ok(OwnedBytes::new(Vec::new()));
-        }
-
-        // Calculate which chunks we need based on byte positions
-        // chunk_no = byte_offset / chunk_size
-        let first_chunk = (range.start / self.chunk_size) as i64;
-        let last_chunk = ((range.end - 1) / self.chunk_size) as i64;
-
-        let stmt = ast_builder::select_chunk_by_path_and_no(
-            self.table_name.as_str(),
-            self.path.as_str(),
-            first_chunk,
-            last_chunk,
-        );
-        self.conn.start_nested();
-        let mut stmt = self
-            .conn
-            .prepare_stmt(stmt)
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
-
-        stmt.program.needs_stmt_subtransactions = false;
-
-        let mut chunks: Vec<(i64, Vec<u8>)> = Vec::new();
-        let loop_result: std::io::Result<()> = loop {
-            match stmt.step() {
-                Ok(StepResult::Row) => {
-                    if let Some(row) = stmt.row() {
-                        let values: Vec<_> = row.get_values().cloned().collect();
-                        if values.len() >= 2 {
-                            if let (Some(Value::Integer(chunk_no)), Some(Value::Blob(bytes))) =
-                                (values.first(), values.get(1))
-                            {
-                                chunks.push((*chunk_no, bytes.clone()));
-                            }
-                        }
-                    }
-                }
-                Ok(StepResult::Done) => break Ok(()),
-                Ok(StepResult::IO) => {
-                    let _ = self.conn.pager.load().io.step();
-                    continue;
-                }
-                Ok(StepResult::Busy) => continue,
-                Ok(StepResult::Interrupt) => {
-                    break Err(std::io::Error::other("interrupted"));
-                }
-                Err(e) => break Err(std::io::Error::other(e.to_string())),
-            }
-        };
-
-        self.conn.end_nested();
-        loop_result?;
-
-        // Concatenate chunks
-        let mut buf = Vec::new();
-        for (_, bytes) in &chunks {
-            buf.extend_from_slice(bytes);
-        }
-
-        // Calculate offset within the concatenated chunks
-        let offset_into_first = range.start - (first_chunk as usize * self.chunk_size);
-        let needed = range.end - range.start;
-
-        if offset_into_first + needed > buf.len() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                format!(
-                    "insufficient data: needed {} bytes at offset {}, but only {} bytes available (from {} chunks)",
-                    needed, offset_into_first, buf.len(), chunks.len()
-                ),
-            ));
-        }
-
-        let slice = &buf[offset_into_first..offset_into_first + needed];
-        Ok(OwnedBytes::new(slice.to_vec()))
-    }
-}
-
-/// BTreeWrite - Write impl for writing chunks to btree storage
-/// Uses position-based chunk numbers: chunk_no = byte_offset / chunk_size
-struct BTreeWrite {
-    /// Underlying database connection
-    conn: Arc<Connection>,
-    /// Table name for storage
-    table_name: String,
-    /// Path being written
-    path: String,
-    /// Chunk size for storage (DEFAULT 512KB)
-    chunk_size: usize,
-    /// Buffer for current chunk
-    buffer: Vec<u8>,
-    /// Current chunk number (based on byte position)
-    current_chunk: i64,
-}
-
-impl BTreeWrite {
-    fn new(conn: Arc<Connection>, table_name: String, path: String, chunk_size: usize) -> Self {
-        Self {
-            conn,
-            table_name,
-            path,
-            chunk_size,
-            buffer: Vec::with_capacity(chunk_size),
-            current_chunk: 0,
-        }
-    }
-
-    fn write_chunk(&mut self, chunk_no: i64, data: &[u8]) -> std::io::Result<()> {
-        if data.is_empty() {
-            return Ok(());
-        }
-
-        // Use hex encoding for blob data
-        let hex_data = bytes_to_hex(data);
-        let stmt_ast =
-            ast_builder::insert_or_replace_chunk(&self.table_name, &self.path, chunk_no, &hex_data);
-        self.conn.start_nested();
-        let mut stmt = self
-            .conn
-            .prepare_stmt(stmt_ast)
-            .map_err(|e| std::io::Error::other(e.to_string()))?;
-
-        // Execute within nested context to avoid transaction conflicts
-        stmt.program.needs_stmt_subtransactions = false;
-        let res = stmt.run_ignore_rows();
-        self.conn.end_nested();
-        res.map_err(|e| std::io::Error::other(e.to_string()))?;
-
-        Ok(())
-    }
-
-    fn flush_current_chunk(&mut self) -> std::io::Result<()> {
-        if self.buffer.is_empty() {
-            return Ok(());
-        }
-        let chunk_data = std::mem::take(&mut self.buffer);
-        self.write_chunk(self.current_chunk, &chunk_data)?;
-        Ok(())
-    }
-}
-
-/// Convert bytes to hex string for SQL X'' literals
-fn bytes_to_hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
-}
-
-impl Write for BTreeWrite {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let mut remaining = buf;
-        while !remaining.is_empty() {
-            let space_in_chunk = self.chunk_size - self.buffer.len();
-            let to_write = remaining.len().min(space_in_chunk);
-            self.buffer.extend_from_slice(&remaining[..to_write]);
-            remaining = &remaining[to_write..];
-
-            // If chunk is full, write it and move to next chunk
-            if self.buffer.len() >= self.chunk_size {
-                // Clone the buffer to avoid borrow conflict
-                let chunk_data = std::mem::take(&mut self.buffer);
-                self.write_chunk(self.current_chunk, &chunk_data)?;
-                self.current_chunk += 1;
-            }
-        }
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        // Don't flush partial chunks on regular flush - only on terminate
-        // This ensures chunks are written with consistent sizes except for the last one
-        Ok(())
-    }
-}
-
-impl Drop for BTreeWrite {
-    fn drop(&mut self) {
-        // Flush any remaining data in buffer
-        let _ = self.flush_current_chunk();
-    }
-}
-
-impl TerminatingWrite for BTreeWrite {
-    fn terminate_ref(&mut self, _: tantivy::directory::AntiCallToken) -> std::io::Result<()> {
-        // Flush any remaining data (the final partial chunk)
-        self.flush_current_chunk()
-    }
-}
-
-/// Directory trait implementation for BTreeDirectory
-impl Directory for BTreeDirectory {
-    fn get_file_handle(
-        &self,
-        path: &Path,
-    ) -> std::result::Result<Arc<dyn FileHandle>, OpenReadError> {
-        let path_str = path.to_string_lossy().to_string();
-        // Check if file exists first
-        if !self.exists_row_for_path(&path_str)? {
-            return Err(OpenReadError::FileDoesNotExist(path.to_path_buf()));
-        }
-        let len = self.fetch_file_len(&path_str)?;
-        Ok(Arc::new(BTreeFileHandle {
-            conn: self.connection.clone(),
-            table_name: self.table_name.clone(),
-            path: path_str,
-            len,
-            chunk_size: self.chunk_size,
-        }))
-    }
-
-    fn exists(&self, path: &Path) -> std::result::Result<bool, OpenReadError> {
-        let path_str = path.to_string_lossy().to_string();
-        self.exists_row_for_path(&path_str)
-    }
-
-    fn delete(&self, path: &Path) -> std::result::Result<(), DeleteError> {
-        let path_str = path.to_string_lossy().to_string();
-        self.delete_all_chunks_for_path(&path_str)
-    }
-
-    fn open_write(
-        &self,
-        path: &Path,
-    ) -> std::result::Result<BufWriter<Box<dyn TerminatingWrite>>, OpenWriteError> {
-        let path_str = path.to_string_lossy().to_string();
-        // Delete existing file first
-        let _ = self.delete_all_chunks_for_path(&path_str);
-        let writer: Box<dyn TerminatingWrite> = Box::new(BTreeWrite::new(
-            self.connection.clone(),
-            self.table_name.clone(),
-            path_str,
-            self.chunk_size,
-        ));
-        Ok(BufWriter::new(writer))
-    }
-
-    fn atomic_read(&self, path: &Path) -> std::result::Result<Vec<u8>, OpenReadError> {
-        let path_str = path.to_string_lossy().to_string();
-        // Check if file exists first - atomic_read must return FileDoesNotExist
-        // error when file is absent (not empty bytes)
-        if !self.exists_row_for_path(&path_str)? {
-            return Err(OpenReadError::FileDoesNotExist(path.to_path_buf()));
-        }
-        self.read_all_bytes_for_path(&path_str)
-    }
-
-    fn atomic_write(&self, path: &Path, data: &[u8]) -> std::io::Result<()> {
-        let path_str = path.to_string_lossy().to_string();
-        self.atomic_overwrite_single_chunk(&path_str, data)
-    }
-
-    fn sync_directory(&self) -> std::io::Result<()> {
-        Ok(())
-    }
-
-    fn watch(&self, _cb: WatchCallback) -> std::result::Result<WatchHandle, tantivy::TantivyError> {
-        // Watch not needed for our use case
-        Ok(WatchHandle::empty())
-    }
-}
-
 /// Pattern indices for FTS queries
 const FTS_PATTERN_SCORE: i64 = 0;
 const FTS_PATTERN_COMBINED_ORDERED_LIMIT: i64 = 1;
@@ -777,19 +528,118 @@ const FTS_PATTERN_MATCH_LIMIT: i64 = 5;
 const FTS_PATTERN_MATCH: i64 = 6;
 const TANTIVY_META_FILE: &str = "meta.json";
 
+/// State machine for FTS cursor async operations
+#[derive(Debug)]
+enum FtsState {
+    /// Initial state
+    Init,
+    /// Rewinding cursor to start
+    Rewinding,
+    /// Loading files from BTree into memory
+    LoadingFiles {
+        files: HashMap<PathBuf, Vec<u8>>,
+        current_path: Option<String>,
+        current_chunks: Vec<(i64, Vec<u8>)>,
+    },
+    /// Creating/opening Tantivy index
+    CreatingIndex,
+    /// Ready for operations
+    Ready,
+    /// Deleting old chunks for a path before writing new ones
+    DeletingOldChunks {
+        writes: Vec<(PathBuf, Vec<u8>)>,
+        write_idx: usize,
+        path_str: String,
+    },
+    /// Advancing cursor after seek returned TryAdvance
+    AdvancingAfterSeek {
+        writes: Vec<(PathBuf, Vec<u8>)>,
+        write_idx: usize,
+        path_str: String,
+    },
+    /// Deleting a single chunk during old chunk cleanup - waiting for delete to complete
+    DeletingOldChunk {
+        writes: Vec<(PathBuf, Vec<u8>)>,
+        write_idx: usize,
+        path_str: String,
+    },
+    /// Performing the actual delete operation (cursor positioned, just waiting for IO)
+    PerformingDelete {
+        writes: Vec<(PathBuf, Vec<u8>)>,
+        write_idx: usize,
+        path_str: String,
+    },
+    /// Advancing cursor after delete to get the next record
+    AdvancingAfterDelete {
+        writes: Vec<(PathBuf, Vec<u8>)>,
+        write_idx: usize,
+        path_str: String,
+    },
+    /// Flushing pending writes to BTree - seeking phase
+    SeekingWrite {
+        writes: Vec<(PathBuf, Vec<u8>)>,
+        write_idx: usize,
+        chunk_idx: usize,
+    },
+    /// Flushing pending writes to BTree - insert phase (after seek completed)
+    InsertingWrite {
+        writes: Vec<(PathBuf, Vec<u8>)>,
+        write_idx: usize,
+        chunk_idx: usize,
+        record: ImmutableRecord,
+    },
+    /// Flushing pending writes to BTree - tracking state
+    FlushingWrites {
+        writes: Vec<(PathBuf, Vec<u8>)>,
+        write_idx: usize,
+        chunk_idx: usize,
+    },
+    /// Flushing pending deletes to BTree
+    FlushingDeletes {
+        deletes: Vec<PathBuf>,
+        delete_idx: usize,
+    },
+    /// Seeking for delete operation
+    SeekingDelete {
+        deletes: Vec<PathBuf>,
+        delete_idx: usize,
+    },
+    /// Deleting record at cursor position
+    DeletingRecord {
+        deletes: Vec<PathBuf>,
+        delete_idx: usize,
+    },
+}
+
 /// Cursor for executing FTS queries
 pub struct FtsCursor {
-    cfg: IndexMethodConfiguration,
     schema: Schema,
     rowid_field: Field,
     text_fields: Vec<(IndexColumn, Field)>,
 
-    // Lazy-initialized components
-    directory: Option<Arc<BTreeDirectory>>,
+    // Storage table name for BTree directory
+    dir_table_name: String,
+
+    // Connection for blocking IO in Drop
+    connection: Option<Arc<Connection>>,
+
+    // BTree cursor for direct access (no SQL execution)
+    fts_dir_cursor: Option<BTreeCursor>,
+
+    // Cached directory for Tantivy (in-memory)
+    cached_directory: Option<CachedBTreeDirectory>,
+
+    // Tantivy components
     index: Option<Index>,
     reader: Option<IndexReader>,
     writer: Option<IndexWriter>,
     searcher: Option<Searcher>,
+
+    // State machine for async operations
+    state: FtsState,
+
+    // Batching: count of uncommitted documents in Tantivy
+    pending_docs_count: usize,
 
     // Query state
     current_hits: Vec<(f32, DocAddress, i64)>,
@@ -799,118 +649,929 @@ pub struct FtsCursor {
 }
 
 impl FtsCursor {
+    /// Maximum number of results when no LIMIT clause is specified.
+    /// Used to prevent excessive memory usage, users needing more results should always specify
+    /// LIMIT.
+    const MAX_NO_LIMIT_RESULT: usize = 10_000_000;
+
     pub fn new(
-        cfg: IndexMethodConfiguration,
+        cfg: &IndexMethodConfiguration,
         schema: Schema,
         rowid_field: Field,
         text_fields: Vec<(IndexColumn, Field)>,
     ) -> Self {
+        let dir_table_name = format!(
+            "{}fts_dir_{}",
+            crate::schema::TURSO_INTERNAL_PREFIX,
+            cfg.index_name
+        );
         Self {
-            cfg,
             schema,
             rowid_field,
             text_fields,
-            directory: None,
+            dir_table_name,
+            connection: None,
+            fts_dir_cursor: None,
+            cached_directory: None,
             index: None,
             reader: None,
             writer: None,
             searcher: None,
+            state: FtsState::Init,
+            pending_docs_count: 0,
             current_hits: Vec::new(),
             hit_pos: 0,
             current_pattern: FTS_PATTERN_SCORE,
         }
     }
 
-    fn ensure_index_initialized(&mut self, conn: &Arc<Connection>) -> Result<()> {
-        if self.index.is_some() {
+    /// Open the BTree cursor for FTS directory storage
+    fn open_cursor(&mut self, conn: &Arc<Connection>) -> Result<()> {
+        if self.fts_dir_cursor.is_some() {
             return Ok(());
         }
+        // Open cursor for the FTS directory index
+        // The index stores all 3 columns: (path, chunk_no, bytes) as the key
+        // This is similar to how toy_vector_sparse_ivf stores all data in the index
+        let index_name = format!("{}_key", self.dir_table_name);
+        let cursor = open_index_cursor(
+            conn,
+            &self.dir_table_name,
+            &index_name,
+            // path (TEXT), chunk_no (INTEGER), bytes (BLOB) - all 3 columns in the key
+            vec![key_info(), key_info(), key_info()],
+        )?;
+        self.fts_dir_cursor = Some(cursor);
+        Ok(())
+    }
 
-        let dir_table_name = format!(
-            "{}fts_dir_{}",
-            crate::schema::TURSO_INTERNAL_PREFIX,
-            self.cfg.index_name
-        );
-        let dir = BTreeDirectory::new(conn.clone(), dir_table_name, DEFAULT_CHUNK_SIZE)?;
+    /// Finalize file loading: combine chunks into complete file
+    fn finalize_current_file(
+        files: &mut HashMap<PathBuf, Vec<u8>>,
+        current_path: &Option<String>,
+        current_chunks: &mut Vec<(i64, Vec<u8>)>,
+    ) {
+        if let Some(path) = current_path {
+            if !current_chunks.is_empty() {
+                // Sort by chunk_no
+                current_chunks.sort_by_key(|(chunk_no, _)| *chunk_no);
 
-        let index_exists = dir.exists(Path::new(TANTIVY_META_FILE)).unwrap_or(false);
+                // CRITICAL FIX: Deduplicate chunks with the same chunk_no.
+                // Due to the async state machine, the same chunk may be inserted
+                // multiple times into the BTree. Keep only the LAST chunk for each chunk_no.
+                let mut deduped_chunks: Vec<(i64, Vec<u8>)> = Vec::new();
+                for (chunk_no, bytes) in current_chunks.drain(..) {
+                    if let Some(last) = deduped_chunks.last_mut() {
+                        if last.0 == chunk_no {
+                            // Replace with the newer one (last one wins)
+                            *last = (chunk_no, bytes);
+                        } else {
+                            deduped_chunks.push((chunk_no, bytes));
+                        }
+                    } else {
+                        deduped_chunks.push((chunk_no, bytes));
+                    }
+                }
 
-        // Clone for storage, original for Index
-        let dir_for_storage = Arc::new(dir.clone());
+                // Verify chunk sequence integrity
+                for (i, (chunk_no, _)) in deduped_chunks.iter().enumerate() {
+                    if *chunk_no != i as i64 {
+                        tracing::error!(
+                            "FTS CHUNK GAP DETECTED: path={}, expected chunk_no={}, got={}",
+                            path,
+                            i,
+                            chunk_no
+                        );
+                    }
+                }
+
+                let data: Vec<u8> = deduped_chunks
+                    .iter()
+                    .flat_map(|(_, bytes)| bytes.clone())
+                    .collect();
+                tracing::debug!(
+                    "FTS finalize_current_file: path={}, num_chunks={}, total_bytes={}",
+                    path,
+                    deduped_chunks.len(),
+                    data.len()
+                );
+                files.insert(PathBuf::from(path), data);
+            }
+        }
+    }
+
+    /// Create Tantivy index from cached directory
+    fn create_index_from_cache(&mut self) -> Result<()> {
+        let cached_dir = self
+            .cached_directory
+            .as_ref()
+            .ok_or_else(|| LimboError::InternalError("cached directory not initialized".into()))?
+            .clone();
+
+        let index_exists = cached_dir
+            .exists(Path::new(TANTIVY_META_FILE))
+            .unwrap_or(false);
 
         let index = if index_exists {
-            Index::open(dir).map_err(|e| LimboError::InternalError(e.to_string()))?
+            Index::open(cached_dir).map_err(|e| LimboError::InternalError(e.to_string()))?
         } else {
-            Index::create(dir, self.schema.clone(), IndexSettings::default())
+            Index::create(cached_dir, self.schema.clone(), IndexSettings::default())
                 .map_err(|e| LimboError::InternalError(e.to_string()))?
         };
 
-        self.directory = Some(dir_for_storage);
         self.index = Some(index);
         Ok(())
+    }
+
+    /// Internal helper to continue flush_writes state machine
+    fn flush_writes_internal(&mut self) -> Result<IOResult<()>> {
+        loop {
+            match &mut self.state {
+                FtsState::FlushingWrites {
+                    writes,
+                    write_idx,
+                    chunk_idx,
+                } => {
+                    if *write_idx >= writes.len() {
+                        // Done with writes
+                        self.state = FtsState::Ready;
+                        return Ok(IOResult::Done(()));
+                    }
+
+                    // If starting a new file (chunk_idx == 0), first delete old chunks
+                    if *chunk_idx == 0 {
+                        let path_str = writes[*write_idx].0.to_string_lossy().to_string();
+                        self.state = FtsState::DeletingOldChunks {
+                            writes: std::mem::take(writes),
+                            write_idx: *write_idx,
+                            path_str,
+                        };
+                        continue;
+                    }
+
+                    let (_, data) = &writes[*write_idx];
+                    let chunk_size = DEFAULT_CHUNK_SIZE;
+                    let total_chunks = data.len().div_ceil(chunk_size);
+
+                    // Adjust chunk_idx if it was the special "start writing" marker
+                    let actual_chunk_idx = if *chunk_idx == usize::MAX {
+                        0
+                    } else {
+                        *chunk_idx
+                    };
+
+                    if actual_chunk_idx >= total_chunks.max(1) {
+                        // Move to next file
+                        *write_idx += 1;
+                        *chunk_idx = 0;
+                        continue;
+                    }
+
+                    // Transition to seeking state for writing this chunk
+                    self.state = FtsState::SeekingWrite {
+                        writes: std::mem::take(writes),
+                        write_idx: *write_idx,
+                        chunk_idx: actual_chunk_idx,
+                    };
+                }
+                FtsState::DeletingOldChunks {
+                    writes,
+                    write_idx,
+                    path_str,
+                } => {
+                    let cursor = self.fts_dir_cursor.as_mut().ok_or_else(|| {
+                        LimboError::InternalError("cursor not initialized".into())
+                    })?;
+
+                    tracing::debug!("FTS flush: deleting old chunks for path={}", path_str);
+
+                    // Seek to first chunk of this path (with empty blob as minimum)
+                    let seek_key = ImmutableRecord::from_values(
+                        &[
+                            Value::Text(Text::new(path_str.clone())),
+                            Value::Integer(0),
+                            Value::Blob(vec![]),
+                        ],
+                        3,
+                    );
+
+                    let seek_result =
+                        return_if_io!(cursor
+                            .seek(SeekKey::IndexKey(&seek_key), SeekOp::GE { eq_only: false }));
+
+                    match seek_result {
+                        SeekResult::NotFound => {
+                            // No matching records at all, start writing
+                            self.state = FtsState::FlushingWrites {
+                                writes: std::mem::take(writes),
+                                write_idx: *write_idx,
+                                chunk_idx: usize::MAX,
+                            };
+                        }
+                        SeekResult::TryAdvance => {
+                            // Cursor positioned at leaf but not on matching entry, need to advance
+                            self.state = FtsState::AdvancingAfterSeek {
+                                writes: std::mem::take(writes),
+                                write_idx: *write_idx,
+                                path_str: std::mem::take(path_str),
+                            };
+                        }
+                        SeekResult::Found => {
+                            // Found a record at or after our seek key, check it
+                            self.state = FtsState::DeletingOldChunk {
+                                writes: std::mem::take(writes),
+                                write_idx: *write_idx,
+                                path_str: std::mem::take(path_str),
+                            };
+                        }
+                    }
+                }
+                FtsState::AdvancingAfterSeek {
+                    writes,
+                    write_idx,
+                    path_str,
+                } => {
+                    let cursor = self.fts_dir_cursor.as_mut().ok_or_else(|| {
+                        LimboError::InternalError("cursor not initialized".into())
+                    })?;
+
+                    let has_next = return_if_io!(cursor.next());
+
+                    if has_next {
+                        // Now positioned on a record, check if it matches our path
+                        self.state = FtsState::DeletingOldChunk {
+                            writes: std::mem::take(writes),
+                            write_idx: *write_idx,
+                            path_str: std::mem::take(path_str),
+                        };
+                    } else {
+                        // No more records, start writing
+                        self.state = FtsState::FlushingWrites {
+                            writes: std::mem::take(writes),
+                            write_idx: *write_idx,
+                            chunk_idx: usize::MAX,
+                        };
+                    }
+                }
+                FtsState::DeletingOldChunk {
+                    writes,
+                    write_idx,
+                    path_str,
+                } => {
+                    let cursor = self.fts_dir_cursor.as_mut().ok_or_else(|| {
+                        LimboError::InternalError("cursor not initialized".into())
+                    })?;
+
+                    if !cursor.has_record() {
+                        // No more records, start writing new chunks
+                        self.state = FtsState::FlushingWrites {
+                            writes: std::mem::take(writes),
+                            write_idx: *write_idx,
+                            chunk_idx: usize::MAX, // Special value to trigger first write
+                        };
+                        continue;
+                    }
+
+                    // Check if current record matches our path
+                    let record = return_if_io!(cursor.record());
+                    let current_path = record.as_ref().and_then(|r| {
+                        r.get_value_opt(0).and_then(|v| match v {
+                            crate::types::ValueRef::Text(t) => Some(t.value.to_string()),
+                            _ => None,
+                        })
+                    });
+
+                    if current_path.as_deref() == Some(path_str.as_str()) {
+                        // Transition to PerformingDelete to actually do the delete
+                        self.state = FtsState::PerformingDelete {
+                            writes: std::mem::take(writes),
+                            write_idx: *write_idx,
+                            path_str: std::mem::take(path_str),
+                        };
+                    } else {
+                        // No more chunks for this path, start writing new chunks
+                        // Use usize::MAX as special marker that old chunks have been deleted
+                        self.state = FtsState::FlushingWrites {
+                            writes: std::mem::take(writes),
+                            write_idx: *write_idx,
+                            chunk_idx: usize::MAX,
+                        };
+                    }
+                }
+                FtsState::PerformingDelete {
+                    writes,
+                    write_idx,
+                    path_str,
+                } => {
+                    let cursor = self.fts_dir_cursor.as_mut().ok_or_else(|| {
+                        LimboError::InternalError("cursor not initialized".into())
+                    })?;
+
+                    // Perform the delete - if IO is needed, we'll come back to this state
+                    return_if_io!(cursor.delete());
+
+                    // Delete completed, advance cursor to next record before checking again
+                    self.state = FtsState::AdvancingAfterDelete {
+                        writes: std::mem::take(writes),
+                        write_idx: *write_idx,
+                        path_str: std::mem::take(path_str),
+                    };
+                }
+                FtsState::AdvancingAfterDelete {
+                    writes,
+                    write_idx,
+                    path_str,
+                } => {
+                    let cursor = self.fts_dir_cursor.as_mut().ok_or_else(|| {
+                        LimboError::InternalError("cursor not initialized".into())
+                    })?;
+
+                    // Advance cursor to next record after delete
+                    let has_next = return_if_io!(cursor.next());
+
+                    if has_next {
+                        // Check the next record in DeletingOldChunk state
+                        self.state = FtsState::DeletingOldChunk {
+                            writes: std::mem::take(writes),
+                            write_idx: *write_idx,
+                            path_str: std::mem::take(path_str),
+                        };
+                    } else {
+                        // No more records, start writing
+                        self.state = FtsState::FlushingWrites {
+                            writes: std::mem::take(writes),
+                            write_idx: *write_idx,
+                            chunk_idx: usize::MAX,
+                        };
+                    }
+                }
+                FtsState::SeekingWrite {
+                    writes,
+                    write_idx,
+                    chunk_idx,
+                } => {
+                    let cursor = self.fts_dir_cursor.as_mut().ok_or_else(|| {
+                        LimboError::InternalError("cursor not initialized".into())
+                    })?;
+
+                    let (path, data) = &writes[*write_idx];
+                    let path_str = path.to_string_lossy().to_string();
+                    let chunk_size = DEFAULT_CHUNK_SIZE;
+                    let actual_chunk_idx = if *chunk_idx == usize::MAX {
+                        0
+                    } else {
+                        *chunk_idx
+                    };
+
+                    let start = actual_chunk_idx * chunk_size;
+                    let end = (start + chunk_size).min(data.len());
+                    let chunk_data = if start < data.len() {
+                        &data[start..end]
+                    } else {
+                        &[]
+                    };
+
+                    // Create record: [path, chunk_no, bytes]
+                    let record = ImmutableRecord::from_values(
+                        &[
+                            Value::Text(Text::new(path_str.clone())),
+                            Value::Integer(actual_chunk_idx as i64),
+                            Value::Blob(chunk_data.to_vec()),
+                        ],
+                        3,
+                    );
+
+                    // Seek to find the correct position using GE (not eq_only)
+                    // This positions the cursor at or after where the record should be inserted
+                    let _result = return_if_io!(
+                        cursor.seek(SeekKey::IndexKey(&record), SeekOp::GE { eq_only: false })
+                    );
+
+                    // Transition to InsertingWrite - don't do insert in same state to avoid re-seeking on IO
+                    self.state = FtsState::InsertingWrite {
+                        writes: std::mem::take(writes),
+                        write_idx: *write_idx,
+                        chunk_idx: actual_chunk_idx,
+                        record,
+                    };
+                }
+                FtsState::InsertingWrite {
+                    writes,
+                    write_idx,
+                    chunk_idx,
+                    record,
+                } => {
+                    let cursor = self.fts_dir_cursor.as_mut().ok_or_else(|| {
+                        LimboError::InternalError("cursor not initialized".into())
+                    })?;
+
+                    // Insert into BTree - the cursor should be positioned correctly after seek
+                    return_if_io!(cursor.insert(&BTreeKey::IndexKey(record)));
+
+                    // Move to next chunk
+                    self.state = FtsState::FlushingWrites {
+                        writes: std::mem::take(writes),
+                        write_idx: *write_idx,
+                        chunk_idx: *chunk_idx + 1,
+                    };
+                }
+                FtsState::Ready => {
+                    return Ok(IOResult::Done(()));
+                }
+                _ => {
+                    return Err(LimboError::InternalError(
+                        "unexpected state in flush_writes_internal".into(),
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Internal helper to continue flush_deletes state machine
+    fn flush_deletes_internal(&mut self) -> Result<IOResult<()>> {
+        loop {
+            match &mut self.state {
+                FtsState::FlushingDeletes {
+                    deletes,
+                    delete_idx,
+                } => {
+                    if *delete_idx >= deletes.len() {
+                        self.state = FtsState::Ready;
+                        return Ok(IOResult::Done(()));
+                    }
+
+                    self.state = FtsState::SeekingDelete {
+                        deletes: std::mem::take(deletes),
+                        delete_idx: *delete_idx,
+                    };
+                }
+                FtsState::SeekingDelete {
+                    deletes,
+                    delete_idx,
+                } => {
+                    let cursor = self.fts_dir_cursor.as_mut().ok_or_else(|| {
+                        LimboError::InternalError("cursor not initialized".into())
+                    })?;
+
+                    let path = &deletes[*delete_idx];
+                    let path_str = path.to_string_lossy().to_string();
+
+                    // Seek to first chunk of this path with empty blob (minimum value for bytes)
+                    let seek_key = ImmutableRecord::from_values(
+                        &[
+                            Value::Text(Text::new(path_str)),
+                            Value::Integer(0),
+                            Value::Blob(vec![]),
+                        ],
+                        3,
+                    );
+
+                    let _result =
+                        return_if_io!(cursor
+                            .seek(SeekKey::IndexKey(&seek_key), SeekOp::GE { eq_only: false }));
+
+                    self.state = FtsState::DeletingRecord {
+                        deletes: std::mem::take(deletes),
+                        delete_idx: *delete_idx,
+                    };
+                }
+                FtsState::DeletingRecord {
+                    deletes,
+                    delete_idx,
+                } => {
+                    let cursor = self.fts_dir_cursor.as_mut().ok_or_else(|| {
+                        LimboError::InternalError("cursor not initialized".into())
+                    })?;
+
+                    let path = &deletes[*delete_idx];
+                    let path_str = path.to_string_lossy().to_string();
+
+                    if !cursor.has_record() {
+                        // No more records, move to next path
+                        *delete_idx += 1;
+                        if *delete_idx >= deletes.len() {
+                            self.state = FtsState::Ready;
+                            return Ok(IOResult::Done(()));
+                        }
+                        self.state = FtsState::FlushingDeletes {
+                            deletes: std::mem::take(deletes),
+                            delete_idx: *delete_idx,
+                        };
+                        continue;
+                    }
+
+                    // Check if current record matches our path
+                    let record = return_if_io!(cursor.record());
+                    let matches = if let Some(record) = record {
+                        match record.get_value_opt(0) {
+                            Some(crate::types::ValueRef::Text(t)) => t.value == path_str,
+                            _ => false,
+                        }
+                    } else {
+                        false
+                    };
+
+                    if matches {
+                        // Delete this record
+                        return_if_io!(cursor.delete());
+                        // Cursor automatically moves to next, stay in this state
+                    } else {
+                        // No more chunks for this path, move to next
+                        *delete_idx += 1;
+                        if *delete_idx >= deletes.len() {
+                            self.state = FtsState::Ready;
+                            return Ok(IOResult::Done(()));
+                        }
+                        self.state = FtsState::FlushingDeletes {
+                            deletes: std::mem::take(deletes),
+                            delete_idx: *delete_idx,
+                        };
+                    }
+                }
+                FtsState::Ready => {
+                    return Ok(IOResult::Done(()));
+                }
+                _ => {
+                    return Err(LimboError::InternalError(
+                        "unexpected state in flush_deletes_internal".into(),
+                    ));
+                }
+            }
+        }
+    }
+
+    /// Commit pending documents to Tantivy and flush to BTree
+    pub fn commit_and_flush(&mut self) -> Result<IOResult<()>> {
+        // Handle flush state machine if already in progress
+        match &self.state {
+            FtsState::FlushingWrites { .. }
+            | FtsState::DeletingOldChunks { .. }
+            | FtsState::AdvancingAfterSeek { .. }
+            | FtsState::DeletingOldChunk { .. }
+            | FtsState::PerformingDelete { .. }
+            | FtsState::AdvancingAfterDelete { .. }
+            | FtsState::SeekingWrite { .. }
+            | FtsState::InsertingWrite { .. } => {
+                return self.flush_writes_internal();
+            }
+            _ => {}
+        }
+
+        if self.pending_docs_count == 0 {
+            return Ok(IOResult::Done(()));
+        }
+
+        // Commit Tantivy to make documents visible
+        if let Some(ref mut writer) = self.writer {
+            tracing::debug!(
+                "FTS commit_and_flush: committing {} documents",
+                self.pending_docs_count
+            );
+            writer
+                .commit()
+                .map_err(|e| LimboError::InternalError(format!("FTS commit error: {e}")))?;
+        }
+        if let Some(ref reader) = self.reader {
+            reader
+                .reload()
+                .map_err(|e| LimboError::InternalError(format!("FTS reader reload error: {e}")))?;
+            self.searcher = Some(reader.searcher());
+        }
+
+        self.pending_docs_count = 0;
+
+        // Flush pending writes to BTree via async state machine
+        if let Some(ref dir) = self.cached_directory {
+            let writes = dir.take_pending_writes();
+            if !writes.is_empty() {
+                tracing::debug!(
+                    "FTS commit_and_flush: flushing {} files to BTree",
+                    writes.len()
+                );
+                self.state = FtsState::FlushingWrites {
+                    writes,
+                    write_idx: 0,
+                    chunk_idx: 0,
+                };
+                return self.flush_writes_internal();
+            }
+        }
+
+        Ok(IOResult::Done(()))
     }
 }
 
 impl Drop for FtsCursor {
     fn drop(&mut self) {
-        // Commit any pending writes before dropping
+        // Skip cleanup if we're already panicking
+        if std::thread::panicking() {
+            return;
+        }
+
+        // Only flush if we have pending documents
+        if self.pending_docs_count == 0 {
+            return;
+        }
+
+        // Commit any pending writes to Tantivy
         if let Some(ref mut writer) = self.writer {
-            let _ = writer.commit();
+            if let Err(e) = writer.commit() {
+                tracing::error!("FTS Drop: failed to commit writer: {}", e);
+                return;
+            }
+        }
+
+        // Flush pending writes to BTree (blocking)
+        // Clone pager Arc before we start to avoid borrow conflicts
+        let pager = match &self.connection {
+            Some(conn) => conn.pager.load().clone(),
+            None => {
+                tracing::warn!("FTS Drop: no connection for flush");
+                return;
+            }
+        };
+
+        let writes = match &self.cached_directory {
+            Some(dir) => dir.take_pending_writes(),
+            None => return,
+        };
+
+        if writes.is_empty() {
+            return;
+        }
+
+        tracing::debug!(
+            "FTS Drop: blocking flush of {} files to BTree",
+            writes.len()
+        );
+
+        // Set up flush state machine
+        self.state = FtsState::FlushingWrites {
+            writes,
+            write_idx: 0,
+            chunk_idx: 0,
+        };
+
+        // Run blocking flush
+        loop {
+            match self.flush_writes_internal() {
+                Ok(IOResult::Done(())) => break,
+                Ok(IOResult::IO(_)) => {
+                    // Advance IO
+                    if let Err(e) = pager.io.step() {
+                        tracing::error!("FTS Drop: IO error during flush: {}", e);
+                        break;
+                    }
+                }
+                Err(e) => {
+                    tracing::error!("FTS Drop: error during flush: {}", e);
+                    break;
+                }
+            }
         }
     }
 }
 
 impl IndexMethodCursor for FtsCursor {
     fn create(&mut self, conn: &Arc<Connection>) -> Result<IOResult<()>> {
-        self.ensure_index_initialized(conn)?;
+        // Ensure storage table exists (still uses SQL for DDL)
+        initialize_btree_storage_table(conn, &self.dir_table_name)?;
         Ok(IOResult::Done(()))
     }
 
     fn destroy(&mut self, _conn: &Arc<Connection>) -> Result<IOResult<()>> {
-        // Drop all Tantivy components
+        // Commit any pending Tantivy writes first
+        if let Some(ref mut writer) = self.writer {
+            let _ = writer.commit();
+        }
+
+        // Flush pending changes to BTree
+        if let Some(ref dir) = self.cached_directory {
+            if dir.has_pending_changes() {
+                // Start flush state machine
+                let writes = dir.take_pending_writes();
+                let deletes = dir.take_pending_deletes();
+
+                if !writes.is_empty() {
+                    self.state = FtsState::FlushingWrites {
+                        writes,
+                        write_idx: 0,
+                        chunk_idx: 0,
+                    };
+                    return self.flush_writes_internal();
+                }
+                if !deletes.is_empty() {
+                    self.state = FtsState::FlushingDeletes {
+                        deletes,
+                        delete_idx: 0,
+                    };
+                    return self.flush_deletes_internal();
+                }
+            }
+        }
+
+        // Drop all components
         self.searcher = None;
         self.reader = None;
         self.writer = None;
         self.index = None;
-        self.directory = None;
+        self.cached_directory = None;
+        self.fts_dir_cursor = None;
+        self.state = FtsState::Init;
         Ok(IOResult::Done(()))
     }
 
     fn open_read(&mut self, conn: &Arc<Connection>) -> Result<IOResult<()>> {
-        self.ensure_index_initialized(conn)?;
+        loop {
+            match &mut self.state {
+                FtsState::Init => {
+                    // Store connection for blocking flush in Drop
+                    self.connection = Some(conn.clone());
+                    // Ensure storage table exists
+                    initialize_btree_storage_table(conn, &self.dir_table_name)?;
+                    // Open BTree cursor
+                    self.open_cursor(conn)?;
+                    self.state = FtsState::Rewinding;
+                }
+                FtsState::Rewinding => {
+                    let cursor = self.fts_dir_cursor.as_mut().ok_or_else(|| {
+                        LimboError::InternalError("cursor not initialized".into())
+                    })?;
+                    return_if_io!(cursor.rewind());
+                    self.state = FtsState::LoadingFiles {
+                        files: HashMap::new(),
+                        current_path: None,
+                        current_chunks: Vec::new(),
+                    };
+                }
+                FtsState::LoadingFiles {
+                    files,
+                    current_path,
+                    current_chunks,
+                } => {
+                    let cursor = self.fts_dir_cursor.as_mut().ok_or_else(|| {
+                        LimboError::InternalError("cursor not initialized".into())
+                    })?;
 
-        if let Some(ref index) = self.index {
-            self.reader = Some(
-                index
-                    .reader()
-                    .map_err(|e| LimboError::InternalError(e.to_string()))?,
-            );
-            if let Some(ref reader) = self.reader {
-                self.searcher = Some(reader.searcher());
+                    if !cursor.has_record() {
+                        // Done loading - finalize last file
+                        Self::finalize_current_file(files, current_path, current_chunks);
+                        // Create cached directory with loaded files
+                        let loaded_files = std::mem::take(files);
+                        self.cached_directory =
+                            Some(CachedBTreeDirectory::with_files(loaded_files));
+                        self.state = FtsState::CreatingIndex;
+                        continue;
+                    }
+
+                    // Read current record
+                    let record = return_if_io!(cursor.record());
+                    if let Some(record) = record {
+                        // Record format: [path, chunk_no, bytes]
+                        let path = record.get_value_opt(0).and_then(|v| match v {
+                            crate::types::ValueRef::Text(t) => Some(t.value.to_string()),
+                            _ => None,
+                        });
+                        let chunk_no = record.get_value_opt(1).and_then(|v| match v {
+                            crate::types::ValueRef::Integer(i) => Some(i),
+                            _ => None,
+                        });
+                        let bytes = record.get_value_opt(2).and_then(|v| match v {
+                            crate::types::ValueRef::Blob(b) => Some(b.to_vec()),
+                            _ => None,
+                        });
+
+                        if let (Some(path_str), Some(chunk_no), Some(bytes)) =
+                            (path, chunk_no, bytes)
+                        {
+                            tracing::debug!(
+                                "FTS load: record path={}, chunk_no={}, bytes_len={}",
+                                path_str,
+                                chunk_no,
+                                bytes.len()
+                            );
+                            // Check if we've moved to a new file
+                            if current_path.as_ref() != Some(&path_str) {
+                                // Finalize previous file
+                                Self::finalize_current_file(files, current_path, current_chunks);
+                                *current_path = Some(path_str.clone());
+                            }
+                            current_chunks.push((chunk_no, bytes));
+                        } else {
+                            tracing::warn!("FTS load: skipping malformed record");
+                        }
+                    }
+
+                    // Move to next record
+                    return_if_io!(cursor.next());
+                }
+                FtsState::CreatingIndex => {
+                    // Log loaded files for debugging
+                    if let Some(ref dir) = self.cached_directory {
+                        let files = dir.files.read().unwrap();
+                        tracing::debug!(
+                            "FTS CreatingIndex: loaded {} files from BTree",
+                            files.len()
+                        );
+                    }
+
+                    // Create Tantivy index from cached directory
+                    self.create_index_from_cache()?;
+
+                    // Create reader and searcher
+                    if let Some(ref index) = self.index {
+                        self.reader = Some(
+                            index
+                                .reader()
+                                .map_err(|e| LimboError::InternalError(e.to_string()))?,
+                        );
+                        if let Some(ref reader) = self.reader {
+                            self.searcher = Some(reader.searcher());
+                        }
+                    }
+                    self.state = FtsState::Ready;
+                    return Ok(IOResult::Done(()));
+                }
+                FtsState::Ready => {
+                    return Ok(IOResult::Done(()));
+                }
+                _ => {
+                    return Err(LimboError::InternalError(
+                        "unexpected state in open_read".into(),
+                    ));
+                }
             }
         }
-        Ok(IOResult::Done(()))
     }
 
     fn open_write(&mut self, conn: &Arc<Connection>) -> Result<IOResult<()>> {
-        self.ensure_index_initialized(conn)?;
+        // Ensure connection is stored for blocking flush in Drop
+        if self.connection.is_none() {
+            self.connection = Some(conn.clone());
+        }
 
+        // First do open_read to load existing index
+        match &self.state {
+            FtsState::Ready => {}
+            _ => {
+                let result = self.open_read(conn)?;
+                if let IOResult::IO(io) = result {
+                    return Ok(IOResult::IO(io));
+                }
+            }
+        }
+        // Should we assert no writer here? Tantivy enforces single writer
+        // it's just unsure if this can be called multiple times
+        if self.writer.is_some() {
+            return Ok(IOResult::Done(()));
+        }
+
+        // Now create writer
         if let Some(ref index) = self.index {
-            // Use single-threaded mode to avoid concurrent access to BTreeDirectory
-            // Our Connection is not thread-safe for concurrent queries
+            // Use single-threaded mode to avoid concurrent access
             let writer = index
                 .writer_with_num_threads(1, DEFAULT_MEMORY_BUDGET_BYTES)
                 .map_err(|e| LimboError::InternalError(e.to_string()))?;
-            // Disable background merges: our BTreeDirectory can't handle concurrent access
-            // from the merge thread. Merges will happen synchronously during commit instead.
+            // Disable background merges
             writer.set_merge_policy(Box::new(NoMergePolicy));
-
             self.writer = Some(writer);
         }
         Ok(IOResult::Done(()))
     }
 
     fn insert(&mut self, values: &[Register]) -> Result<IOResult<()>> {
+        // Handle flush state machine if in progress - loop until flush completes
+        // This is critical: we must NOT return Done when flush completes,
+        // otherwise the VDBE thinks the insert is done but we never added the document!
+        loop {
+            match &self.state {
+                FtsState::FlushingWrites { .. }
+                | FtsState::DeletingOldChunks { .. }
+                | FtsState::AdvancingAfterSeek { .. }
+                | FtsState::DeletingOldChunk { .. }
+                | FtsState::PerformingDelete { .. }
+                | FtsState::AdvancingAfterDelete { .. }
+                | FtsState::SeekingWrite { .. }
+                | FtsState::InsertingWrite { .. } => {
+                    let result = self.flush_writes_internal()?;
+                    match result {
+                        IOResult::IO(io) => return Ok(IOResult::IO(io)),
+                        IOResult::Done(()) => continue, // Flush done, check state again
+                    }
+                }
+                FtsState::FlushingDeletes { .. }
+                | FtsState::SeekingDelete { .. }
+                | FtsState::DeletingRecord { .. } => {
+                    let result = self.flush_deletes_internal()?;
+                    match result {
+                        IOResult::IO(io) => return Ok(IOResult::IO(io)),
+                        IOResult::Done(()) => continue, // Flush done, check state again
+                    }
+                }
+                _ => break, // Not flushing, proceed with insert
+            }
+        }
+
         let Some(ref mut writer) = self.writer else {
             return Err(LimboError::InternalError(
                 "FTS writer not initialized - call open_write first".into(),
@@ -947,8 +1608,14 @@ impl IndexMethodCursor for FtsCursor {
             .add_document(doc)
             .map_err(|e| LimboError::InternalError(format!("FTS add_document error: {e}")))?;
 
-        // Don't commit on every insert: Tantivy will auto-commit when memory budget is reached
-        // Final commit happens when writer is dropped or explicitly called
+        self.pending_docs_count += 1;
+
+        // Batch commits: only commit every BATCH_COMMIT_SIZE documents
+        // This dramatically improves bulk insert performance
+        if self.pending_docs_count >= BATCH_COMMIT_SIZE {
+            return self.commit_and_flush();
+        }
+
         Ok(IOResult::Done(()))
     }
 
@@ -1008,7 +1675,9 @@ impl IndexMethodCursor for FtsCursor {
         // - Patterns WITH LIMIT: use the captured limit value from values[2]
         let limit = match pattern_idx {
             // Patterns without LIMIT - fetch all matches
-            FTS_PATTERN_MATCH | FTS_PATTERN_COMBINED | FTS_PATTERN_COMBINED_ORDERED => 10_000_000,
+            FTS_PATTERN_MATCH | FTS_PATTERN_COMBINED | FTS_PATTERN_COMBINED_ORDERED => {
+                Self::MAX_NO_LIMIT_RESULT
+            }
             // Patterns with LIMIT - use captured limit value
             FTS_PATTERN_SCORE
             | FTS_PATTERN_MATCH_LIMIT
@@ -1111,277 +1780,5 @@ impl IndexMethodCursor for FtsCursor {
         }
         let (_, _, rowid) = self.current_hits[self.hit_pos];
         Ok(IOResult::Done(Some(rowid)))
-    }
-}
-
-/// AST builder module for FTS storage operations.
-/// These helpers construct AST nodes directly so we an avoid the SQL string parsing overhead.
-mod ast_builder {
-    use turso_parser::ast::{
-        self, Expr, FromClause, FunctionTail, InsertBody, Limit, Literal, Name, OneSelect,
-        Operator, QualifiedName, ResultColumn, Select, SelectBody, SelectTable, SortOrder,
-        SortedColumn, Stmt,
-    };
-
-    /// Build a Name from a string
-    pub fn name(s: &str) -> Name {
-        Name::exact(s.to_string())
-    }
-
-    /// Build a QualifiedName from a table name
-    pub fn table_name(table: &str) -> QualifiedName {
-        QualifiedName::single(name(table))
-    }
-
-    /// Build a column identifier expression
-    fn col(column: &str) -> Box<Expr> {
-        Box::new(Expr::Id(name(column)))
-    }
-
-    /// Build a string literal expression
-    fn str_lit(s: &str) -> Box<Expr> {
-        // The translator's sanitize_string() expects quotes around the string,
-        // so we need to include them when building AST programmatically
-        Box::new(Expr::Literal(Literal::String(format!(
-            "'{}'",
-            s.replace('\'', "''")
-        ))))
-    }
-
-    pub fn integer_type() -> ast::Type {
-        ast::Type {
-            name: "INTEGER".to_string(),
-            size: None,
-        }
-    }
-
-    pub fn text_type() -> ast::Type {
-        ast::Type {
-            name: "TEXT".to_string(),
-            size: None,
-        }
-    }
-    pub fn blob_type() -> ast::Type {
-        ast::Type {
-            name: "BLOB".to_string(),
-            size: None,
-        }
-    }
-
-    /// Build an integer literal expression
-    fn int_lit(n: i64) -> Box<Expr> {
-        Box::new(Expr::Literal(Literal::Numeric(n.to_string())))
-    }
-
-    /// Build a blob literal from hex string (already encoded)
-    fn blob_lit(hex: &str) -> Box<Expr> {
-        Box::new(Expr::Literal(Literal::Blob(hex.to_string())))
-    }
-
-    /// Build a binary equals expression: lhs = rhs
-    fn eq(lhs: Box<Expr>, rhs: Box<Expr>) -> Box<Expr> {
-        Box::new(Expr::Binary(lhs, Operator::Equals, rhs))
-    }
-
-    /// Build FROM clause for a single table
-    fn from_table(table: &str) -> Option<FromClause> {
-        Some(FromClause {
-            select: Box::new(SelectTable::Table(table_name(table), None, None)),
-            joins: vec![],
-        })
-    }
-
-    /// Build ORDER BY clause for a column
-    fn order_by_asc(column: &str) -> Vec<SortedColumn> {
-        vec![SortedColumn {
-            expr: col(column),
-            order: Some(SortOrder::Asc),
-            nulls: None,
-        }]
-    }
-
-    /// Build: SELECT {columns} FROM {table} WHERE path = '{path}' ORDER BY chunk_no ASC
-    pub fn select_bytes_by_path(table: &str, path: &str) -> Stmt {
-        Stmt::Select(Select {
-            with: None,
-            body: SelectBody {
-                select: OneSelect::Select {
-                    distinctness: None,
-                    columns: vec![ResultColumn::Expr(col("bytes"), None)],
-                    from: from_table(table),
-                    where_clause: Some(eq(col("path"), str_lit(path))),
-                    group_by: None,
-                    window_clause: vec![],
-                },
-                compounds: vec![],
-            },
-            order_by: order_by_asc("chunk_no"),
-            limit: None,
-        })
-    }
-
-    /// Build: SELECT 1 FROM {table} WHERE path = '{path}' LIMIT 1
-    pub fn select_exists_by_path(table: &str, path: &str) -> Stmt {
-        Stmt::Select(Select {
-            with: None,
-            body: SelectBody {
-                select: OneSelect::Select {
-                    distinctness: None,
-                    columns: vec![ResultColumn::Expr(int_lit(1), None)],
-                    from: from_table(table),
-                    where_clause: Some(eq(col("path"), str_lit(path))),
-                    group_by: None,
-                    window_clause: vec![],
-                },
-                compounds: vec![],
-            },
-            order_by: vec![],
-            limit: Some(Limit {
-                expr: int_lit(1),
-                offset: None,
-            }),
-        })
-    }
-
-    /// Build: SELECT SUM(LENGTH(bytes)) FROM {table} WHERE path = '{path}'
-    pub fn select_total_length_by_path(table: &str, path: &str) -> Stmt {
-        // SUM(LENGTH(bytes))
-        let length_call = Box::new(Expr::FunctionCall {
-            name: name("LENGTH"),
-            distinctness: None,
-            args: vec![col("bytes")],
-            order_by: vec![],
-            filter_over: FunctionTail {
-                filter_clause: None,
-                over_clause: None,
-            },
-        });
-        let sum_call = Box::new(Expr::FunctionCall {
-            name: name("SUM"),
-            distinctness: None,
-            args: vec![length_call],
-            order_by: vec![],
-            filter_over: FunctionTail {
-                filter_clause: None,
-                over_clause: None,
-            },
-        });
-
-        Stmt::Select(Select {
-            with: None,
-            body: SelectBody {
-                select: OneSelect::Select {
-                    distinctness: None,
-                    columns: vec![ResultColumn::Expr(sum_call, None)],
-                    from: from_table(table),
-                    where_clause: Some(eq(col("path"), str_lit(path))),
-                    group_by: None,
-                    window_clause: vec![],
-                },
-                compounds: vec![],
-            },
-            order_by: vec![],
-            limit: None,
-        })
-    }
-
-    /// Build: DELETE FROM {table} WHERE path = '{path}'
-    pub fn delete_by_path(table: &str, path: &str) -> Stmt {
-        Stmt::Delete {
-            with: None,
-            tbl_name: table_name(table),
-            indexed: None,
-            where_clause: Some(eq(col("path"), str_lit(path))),
-            returning: vec![],
-            order_by: vec![],
-            limit: None,
-        }
-    }
-
-    /// Build: INSERT INTO {table} (path, chunk_no, bytes) VALUES ('{path}', {chunk_no}, X'{hex_data}')
-    pub fn insert_chunk(table: &str, path: &str, chunk_no: i64, hex_data: &str) -> Stmt {
-        insert_chunk_internal(table, path, chunk_no, hex_data, None)
-    }
-
-    /// Build: INSERT OR REPLACE INTO {table} (path, chunk_no, bytes) VALUES ('{path}', {chunk_no}, X'{hex_data}')
-    pub fn insert_or_replace_chunk(table: &str, path: &str, chunk_no: i64, hex_data: &str) -> Stmt {
-        use turso_parser::ast::ResolveType;
-        insert_chunk_internal(table, path, chunk_no, hex_data, Some(ResolveType::Replace))
-    }
-
-    /// Build: SELECT chunk_no, bytes FROM {} WHERE path = '{}' AND chunk_no >= {} AND chunk_no <= {} ORDER BY chunk_no ASC
-    pub fn select_chunk_by_path_and_no(
-        table: &str,
-        path: &str,
-        chunk_min: i64,
-        chunk_max: i64,
-    ) -> Stmt {
-        Stmt::Select(Select {
-            with: None,
-            body: SelectBody {
-                select: OneSelect::Select {
-                    distinctness: None,
-                    columns: vec![
-                        ResultColumn::Expr(col("chunk_no"), None),
-                        ResultColumn::Expr(col("bytes"), None),
-                    ],
-                    from: from_table(table),
-                    where_clause: Some(Box::new(Expr::Binary(
-                        eq(col("path"), str_lit(path)),
-                        Operator::And,
-                        Box::new(Expr::Binary(
-                            Box::new(Expr::Binary(
-                                col("chunk_no"),
-                                Operator::GreaterEquals,
-                                int_lit(chunk_min),
-                            )),
-                            Operator::And,
-                            Box::new(Expr::Binary(
-                                col("chunk_no"),
-                                Operator::LessEquals,
-                                int_lit(chunk_max),
-                            )),
-                        )),
-                    ))),
-                    group_by: None,
-                    window_clause: vec![],
-                },
-                compounds: vec![],
-            },
-            order_by: order_by_asc("chunk_no"),
-            limit: None,
-        })
-    }
-
-    fn insert_chunk_internal(
-        table: &str,
-        path: &str,
-        chunk_no: i64,
-        hex_data: &str,
-        or_conflict: Option<turso_parser::ast::ResolveType>,
-    ) -> Stmt {
-        // VALUES clause as a Select with OneSelect::Values
-        let values_select = Select {
-            with: None,
-            body: SelectBody {
-                select: OneSelect::Values(vec![vec![
-                    str_lit(path),
-                    int_lit(chunk_no),
-                    blob_lit(hex_data),
-                ]]),
-                compounds: vec![],
-            },
-            order_by: vec![],
-            limit: None,
-        };
-
-        Stmt::Insert {
-            with: None,
-            or_conflict,
-            tbl_name: table_name(table),
-            columns: vec![name("path"), name("chunk_no"), name("bytes")],
-            body: InsertBody::Select(values_select, None),
-            returning: vec![],
-        }
     }
 }
