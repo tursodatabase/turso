@@ -637,20 +637,30 @@ fn parse_datetime_with_optional_tz(value: &str, format: &str) -> Option<ParsedDa
         return None;
     }
 
-    // Case A: Format includes timezone specifier (e.g. %:z) -> Return UTC
-    let with_tz_format = format.to_owned() + "%:z";
-    if let Ok(dt) = DateTime::parse_from_str(value, &with_tz_format) {
-        return Some(ParsedDateTime::new(
-            dt.with_timezone(&Utc).naive_utc(),
-            true,
-        ));
-    }
+    // Check if value might have a timezone before trying expensive timezone parsing
+    let has_tz = value.ends_with('Z')
+        || value
+            .as_bytes()
+            .iter()
+            .rev()
+            .take(6)
+            .any(|&b| b == b'+' || b == b'-');
 
-    // Case B: String manually ends in 'Z' (UTC) -> Return UTC
-    if value.ends_with('Z') {
-        let value_without_tz = &value[0..value.len() - 1];
-        if let Ok(dt) = NaiveDateTime::parse_from_str(value_without_tz, format) {
-            return Some(ParsedDateTime::new(dt, true));
+    if has_tz {
+        // Case A: Format includes timezone specifier (e.g. %:z) -> Return UTC
+        let with_tz_format = format.to_owned() + "%:z";
+        if let Ok(dt) = DateTime::parse_from_str(value, &with_tz_format) {
+            return Some(ParsedDateTime::new(
+                dt.with_timezone(&Utc).naive_utc(),
+                true,
+            ));
+        }
+
+        // Case B: String manually ends in 'Z' (UTC) -> Return UTC
+        if let Some(value_without_z) = value.strip_suffix("Z") {
+            if let Ok(dt) = NaiveDateTime::parse_from_str(value_without_z, format) {
+                return Some(ParsedDateTime::new(dt, true));
+            }
         }
     }
 
