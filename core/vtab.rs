@@ -39,6 +39,7 @@ impl VirtualTable {
         }
     }
 
+    #[cfg(feature = "cli_only")]
     fn dbpage_virtual_table() -> Arc<VirtualTable> {
         let dbpage_table = crate::dbpage::DbPageTable::new();
         let dbpage_vtab = VirtualTable {
@@ -71,6 +72,7 @@ impl VirtualTable {
         #[cfg(feature = "json")]
         vtables.extend(Self::json_virtual_tables());
 
+        #[cfg(feature = "cli_only")]
         vtables.push(Self::dbpage_virtual_table());
 
         vtables

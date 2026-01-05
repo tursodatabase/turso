@@ -113,6 +113,7 @@ pub use vdbe::{
     FromValueRow, Register,
 };
 
+#[cfg(feature = "cli_only")]
 pub mod dbpage;
 
 /// Configuration for database features
