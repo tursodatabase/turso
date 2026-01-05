@@ -5821,6 +5821,7 @@ pub fn integrity_check(
                 !mv_store.is_btree_allocated(&table_id),
                 "we got a negative page index that is reported as allocated"
             );
+            state.page_stack.pop();
             return Ok(IOResult::Done(()));
         }
     }
