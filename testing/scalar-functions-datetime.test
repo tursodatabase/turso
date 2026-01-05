@@ -1051,3 +1051,24 @@ do_execsql_test datetime-whitespace-now-rejected-leading {
 do_execsql_test datetime-whitespace-now-rejected-trailing {
   SELECT datetime('now ');
 } {{}}
+
+# Fractional modifiers
+do_execsql_test datetime-fractional-days {
+  SELECT datetime('2024-01-15', '+1.5 days');
+} {{2024-01-16 12:00:00}}
+
+do_execsql_test datetime-fractional-hours {
+  SELECT datetime('2024-01-15', '+0.5 hours');
+} {{2024-01-15 00:30:00}}
+
+do_execsql_test datetime-fractional-days-negative {
+  SELECT datetime('2024-01-15', '-2.25 days');
+} {{2024-01-12 18:00:00}}
+
+do_execsql_test datetime-fractional-minutes {
+  SELECT datetime('2024-01-15 12:00:00', '+30.5 minutes');
+} {{2024-01-15 12:30:30}}
+
+do_execsql_test datetime-fractional-seconds {
+  SELECT datetime('2024-01-15 12:00:00', '+90.5 seconds');
+} {{2024-01-15 12:01:30}}
