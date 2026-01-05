@@ -2885,14 +2885,7 @@ pub fn op_row_id(
                     .expect("cursor_id should be valid")
                 {
                     if let Some(ref rowid) = return_if_io!(btree_cursor.rowid()) {
-                        match &mut state.registers[*dest] {
-                            Register::Value(Value::Integer(existing_rowid)) => {
-                                *existing_rowid = *rowid;
-                            }
-                            _ => {
-                                state.registers[*dest] = Register::Value(Value::Integer(*rowid));
-                            }
-                        }
+                        state.registers[*dest].set_int(*rowid);
                     } else {
                         state.registers[*dest] = Register::Value(Value::Null);
                     }
@@ -2902,7 +2895,7 @@ pub fn op_row_id(
                 {
                     let rowid = virtual_cursor.rowid();
                     if rowid != 0 {
-                        state.registers[*dest] = Register::Value(Value::Integer(rowid));
+                        state.registers[*dest].set_int(rowid);
                     } else {
                         state.registers[*dest] = Register::Value(Value::Null);
                     }
@@ -2911,7 +2904,7 @@ pub fn op_row_id(
                     .expect("cursor_id should be valid")
                 {
                     if let Some(rowid) = return_if_io!(mv_cursor.rowid()) {
-                        state.registers[*dest] = Register::Value(Value::Integer(rowid));
+                        state.registers[*dest].set_int(rowid);
                     } else {
                         state.registers[*dest] = Register::Value(Value::Null);
                     }
@@ -2920,7 +2913,7 @@ pub fn op_row_id(
                     .expect("cursor_id should be valid")
                 {
                     if let Some(rowid) = return_if_io!(cursor.query_rowid()) {
-                        state.registers[*dest] = Register::Value(Value::Integer(rowid));
+                        state.registers[*dest].set_int(rowid);
                     } else {
                         state.registers[*dest] = Register::Value(Value::Null);
                     }
