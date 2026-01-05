@@ -1,6 +1,26 @@
+use std::fmt;
 use std::path::PathBuf;
 
 use clap::{command, Parser};
+
+/// Transaction mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+#[clap(rename_all = "lowercase")]
+pub enum TxMode {
+    /// SQLite transaction mode with single-writer, multiple-reader semantics.
+    SQLite,
+    /// Concurrent transaction mode with multiple-writer, multiple-reader semantics.
+    Concurrent,
+}
+
+impl fmt::Display for TxMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TxMode::SQLite => write!(f, "sqlite"),
+            TxMode::Concurrent => write!(f, "concurrent"),
+        }
+    }
+}
 
 #[derive(Parser)]
 #[command(name = "turso_stress")]
@@ -9,6 +29,10 @@ pub struct Opts {
     /// Verbose mode
     #[clap(short = 'v', long, help = "verbose mode")]
     pub verbose: bool,
+
+    /// Transaction mode
+    #[clap(long, help = "transaction mode", default_value_t = TxMode::SQLite)]
+    pub tx_mode: TxMode,
 
     /// Silent mode
     #[clap(long, help = "silent mode")]
