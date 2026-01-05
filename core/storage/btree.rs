@@ -5817,10 +5817,11 @@ pub fn integrity_check(
         };
         if root_page < 0 {
             let table_id = mv_store.get_table_id_from_root_page(root_page);
-            if !mv_store.is_btree_allocated(&table_id) {
-                state.page_stack.pop();
-                return Ok(IOResult::Done(()));
-            };
+            turso_assert!(
+                !mv_store.is_btree_allocated(&table_id),
+                "we got a negative page index that is reported as allocated"
+            );
+            return Ok(IOResult::Done(()));
         }
     }
     if state.db_size == 0 {
@@ -5837,15 +5838,10 @@ pub fn integrity_check(
         else {
             return Ok(IOResult::Done(()));
         };
-        let page_idx = if page_idx < 0 {
-            turso_assert!(
-                mv_store.is_some(),
-                "negative page index without mvcc found during integrity check"
-            );
-            -page_idx
-        } else {
-            page_idx
-        };
+        turso_assert!(
+            page_idx >= 0,
+            "pages should be positive during integrity check"
+        );
         let page = match state.page.take() {
             Some(page) => page,
             None => {
