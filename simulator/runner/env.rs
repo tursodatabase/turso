@@ -523,17 +523,24 @@ where
                             .iter_mut()
                             .find(|t| &t.name == table_name)
                             .expect("Table should exist in committed tables");
-                        // Use the final name to look up in transaction_tables (which has current state)
+                        // Use the final name to look up in transaction_tables (which has current state).
+                        // Note: current_tables represents the FINAL state after all transaction
+                        // operations, not intermediate states. If a table was dropped later in
+                        // the same transaction, it won't exist in current_tables even though
+                        // we're processing an earlier AddColumn operation. In that case, we skip
+                        // the sanity check but still apply the column change to committed_tables
+                        // (which will be removed when we later process the DropTable operation).
                         let final_name = name_to_final.get(table_name).unwrap_or(table_name);
-                        let txn_table = transaction_tables
+                        if let Some(txn_table) = transaction_tables
                             .current_tables
                             .iter()
                             .find(|t| &t.name == final_name)
-                            .expect("Transaction table should exist");
-                        assert!(
-                            txn_table.columns.len() > committed.columns.len(),
-                            "Transaction table should have more columns than committed table"
-                        );
+                        {
+                            assert!(
+                                txn_table.columns.len() > committed.columns.len(),
+                                "Transaction table should have more columns than committed table"
+                            );
+                        }
                         committed.columns.push(column.clone());
                         let new_col_count = committed.columns.len();
                         // Add NULL only for rows that need it.
@@ -554,17 +561,19 @@ where
                             .iter_mut()
                             .find(|t| &t.name == table_name)
                             .expect("Table should exist in committed tables");
-                        // Use the final name to look up in transaction_tables (which has current state)
+                        // Use the final name to look up in transaction_tables (which has current state).
+                        // See comment in AddColumn above for why this lookup is optional.
                         let final_name = name_to_final.get(table_name).unwrap_or(table_name);
-                        let txn_table = transaction_tables
+                        if let Some(txn_table) = transaction_tables
                             .current_tables
                             .iter()
                             .find(|t| &t.name == final_name)
-                            .expect("Transaction table should exist");
-                        assert!(
-                            txn_table.columns.len() < committed.columns.len(),
-                            "Transaction table should have fewer columns than committed table"
-                        );
+                        {
+                            assert!(
+                                txn_table.columns.len() < committed.columns.len(),
+                                "Transaction table should have fewer columns than committed table"
+                            );
+                        }
                         let old_col_count = committed.columns.len();
                         committed.columns.remove(*column_index);
                         // Only remove from rows that have the old column count.
