@@ -85,6 +85,7 @@ miette = "7.6.0"
 bitflags = "2.9.4"
 fallible-iterator = "0.3.0"
 criterion = "0.5"
+codspeed-criterion-compat = "4.2.0"
 chrono = { version = "0.4.42", default-features = false }
 hex = "0.4"
 antithesis_sdk = { version = "0.2", default-features = false }

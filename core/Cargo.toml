@@ -115,6 +115,7 @@ criterion = { workspace = true, features = [
     "async",
     "async_futures",
 ] }
+codspeed-criterion-compat = { workspace = true }
 rstest = "0.18.2"
 rusqlite = { workspace = true, features = ["series"] }
 quickcheck = { version = "1.0", default-features = false }

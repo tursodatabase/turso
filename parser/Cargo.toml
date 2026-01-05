@@ -28,6 +28,7 @@ memchr = "2.7.6"
 [dev-dependencies]
 fallible-iterator = { workspace = true }
 criterion = { workspace = true, features = ["html_reports" ] }
+codspeed-criterion-compat = { workspace = true }
 
 [target.'cfg(not(target_family = "windows"))'.dev-dependencies]
 pprof = { version = "0.14.0", features = ["criterion", "flamegraph"] }

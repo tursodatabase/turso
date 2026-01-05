@@ -1,4 +1,4 @@
-use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+use codspeed_criterion_compat::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
 use pprof::criterion::{Output, PProfProfiler};
 use turso_parser::{lexer::Lexer, parser::Parser};
 
@@ -66,8 +66,19 @@ fn bench_lexer(criterion: &mut Criterion) {
 }
 
 criterion_group! {
+
+#[cfg(not(target_family = "windows"))]
+criterion_group! {
     name = benches;
     config = Criterion::default().with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
     targets = bench_parser, bench_parser_insert_batch, bench_lexer
 }
+
+#[cfg(target_family = "windows")]
+criterion_group! {
+    name = benches;
+    config = Criterion::default();
+    targets = bench_parser, bench_parser_insert_batch, bench_lexer
+}
+
 criterion_main!(benches);
