@@ -781,6 +781,11 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         println!("Error (busy snapshot): {e}");
                         retry_counter += 1;
                     }
+                    Err(turso::Error::IoError(kind)) => {
+                        eprintln!("I/O error ({kind:?}), stopping");
+                        stop = true;
+                        break;
+                    }
                     Err(e) => {
                         panic!("Error creating table: {e}");
                     }
