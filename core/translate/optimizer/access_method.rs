@@ -104,6 +104,10 @@ pub fn find_best_access_method_for_join_order(
             input_cardinality,
             base_row_count,
         ),
+        // TODO(performance): LATERAL subqueries are re-executed for each row from preceding
+        // tables. The cost model should multiply the base subquery cost by the driving table's
+        // cardinality to better reflect the actual execution cost. Currently all FROM-clause
+        // subqueries are treated uniformly regardless of correlation.
         Table::FromClauseSubquery(_) => Ok(Some(AccessMethod {
             cost: estimate_cost_for_scan_or_seek(None, &[], &[], input_cardinality, base_row_count),
             params: AccessMethodParams::Subquery,

@@ -1102,7 +1102,7 @@ pub fn compute_greedy_join_order<'a>(
 
         let mut has_connected_candidate = false;
         for &idx in &remaining {
-            // Outer join RHS requires all preceding tables joined first
+            // OUTER/LATERAL join RHS requires all preceding tables joined first
             if let Some(required) = non_commutative_deps.get(&idx) {
                 if !current_mask.contains_all(required) {
                     continue;
@@ -1200,7 +1200,7 @@ pub fn compute_greedy_join_order<'a>(
 /// starting there allows all dimensions to use their PK indexes.
 ///
 /// Score = (base_rows * filter_selectivity) / (1 + hub_score)
-/// Lower score wins. Outer join RHS tables are excluded (have ordering dependencies).
+/// Lower score wins. OUTER/LATERAL join RHS tables are excluded (have ordering dependencies).
 fn find_best_starting_table(
     num_tables: usize,
     constraints: &[TableConstraints],
@@ -1223,7 +1223,7 @@ fn find_best_starting_table(
     let mut best: Option<(usize, f64)> = None;
     for t in 0..num_tables {
         if non_commutative_deps.contains_key(&t) {
-            continue; // Outer join RHS - cannot be first
+            continue; // OUTER/LATERAL join RHS - cannot be first
         }
 
         let base_rows = *base_table_rows[t];

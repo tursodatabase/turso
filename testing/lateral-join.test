@@ -994,4 +994,161 @@ do_execsql_test lateral-three-refs-same-outer {
         LATERAL JOIN (SELECT base * base AS squared) AS t4;
 } {7|17|14|49}
 
+# ==============================================================================
+# Additional test coverage for edge cases
+# ==============================================================================
+
+# Setup tables for GROUP BY and DISTINCT tests
+do_execsql_test lateral-setup-groupby-table {
+    CREATE TABLE lateral_grp_data (cat TEXT, subcat TEXT, amount INTEGER);
+    INSERT INTO lateral_grp_data VALUES ('A', 'x', 10), ('A', 'y', 20), ('A', 'x', 30), ('B', 'z', 100);
+} {}
+
+do_execsql_test lateral-setup-distinct-table {
+    CREATE TABLE lateral_dup_data (id INTEGER, val INTEGER);
+    INSERT INTO lateral_dup_data VALUES (1, 10), (1, 10), (1, 20), (2, 30), (2, 30);
+} {}
+
+do_execsql_test lateral-setup-categories {
+    CREATE TABLE lateral_categories (cat TEXT);
+    INSERT INTO lateral_categories VALUES ('A'), ('B');
+} {}
+
+do_execsql_test lateral-setup-ids {
+    CREATE TABLE lateral_ids (id INTEGER);
+    INSERT INTO lateral_ids VALUES (1), (2);
+} {}
+
+do_execsql_test lateral-setup-vals {
+    CREATE TABLE lateral_vals (val INTEGER);
+    INSERT INTO lateral_vals VALUES (1), (50), (100), (150);
+} {}
+
+# GROUP BY inside LATERAL subquery - aggregate per correlated group
+do_execsql_test lateral-groupby-inside-lateral {
+    SELECT t1.cat, t2.subcat, t2.total FROM
+        (SELECT cat FROM lateral_categories) AS t1
+        LATERAL JOIN (
+            SELECT subcat, SUM(amount) AS total
+            FROM lateral_grp_data
+            WHERE lateral_grp_data.cat = t1.cat
+            GROUP BY subcat
+        ) AS t2
+    ORDER BY t1.cat, t2.subcat;
+} {A|x|40
+A|y|20
+B|z|100}
+
+# GROUP BY inside LATERAL with HAVING
+do_execsql_test lateral-groupby-having-inside {
+    SELECT t1.cat, t2.subcat, t2.total FROM
+        (SELECT cat FROM lateral_categories) AS t1
+        LATERAL JOIN (
+            SELECT subcat, SUM(amount) AS total
+            FROM lateral_grp_data
+            WHERE lateral_grp_data.cat = t1.cat
+            GROUP BY subcat
+            HAVING SUM(amount) > 25
+        ) AS t2
+    ORDER BY t1.cat, t2.subcat;
+} {A|x|40
+B|z|100}
+
+# DISTINCT inside LATERAL with actual duplicates
+do_execsql_test lateral-distinct-with-duplicates {
+    SELECT t1.id, t2.distinct_val FROM
+        (SELECT id FROM lateral_ids) AS t1
+        LATERAL JOIN (
+            SELECT DISTINCT val AS distinct_val
+            FROM lateral_dup_data
+            WHERE lateral_dup_data.id = t1.id
+        ) AS t2
+    ORDER BY t1.id, t2.distinct_val;
+} {1|10
+1|20
+2|30}
+
+# Empty inner result - LATERAL returns 0 rows due to WHERE filter
+do_execsql_test lateral-empty-inner-impossible-condition {
+    SELECT * FROM
+        (SELECT 5 AS x) AS t1
+        LATERAL JOIN (SELECT x AS y WHERE x > 100) AS t2;
+} {}
+
+# Mix of matching and non-matching in multi-row outer
+do_execsql_test lateral-empty-inner-mixed {
+    SELECT t1.val, t2.doubled FROM
+        (SELECT val FROM lateral_vals) AS t1
+        LATERAL JOIN (
+            SELECT val * 2 AS doubled
+            WHERE val BETWEEN 10 AND 120
+        ) AS t2
+    ORDER BY t1.val;
+} {50|100
+100|200}
+
+# Cleanup test tables
+do_execsql_test lateral-cleanup-tables {
+    DROP TABLE lateral_grp_data;
+    DROP TABLE lateral_dup_data;
+    DROP TABLE lateral_categories;
+    DROP TABLE lateral_ids;
+    DROP TABLE lateral_vals;
+} {}
+
+# Type coercion: Integer vs Float comparison
+do_execsql_test lateral-type-coercion-float {
+    SELECT * FROM
+        (SELECT 5.5 AS x) AS t1
+        LATERAL JOIN (SELECT x = 5 AS is_five, x = 5.5 AS is_five_point_five) AS t2;
+} {5.5|0|1}
+
+# Type coercion: String-to-number in arithmetic
+do_execsql_test lateral-type-coercion-string-to-num {
+    SELECT * FROM
+        (SELECT '42' AS x) AS t1
+        LATERAL JOIN (SELECT x + 1 AS result) AS t2;
+} {42|43}
+
+# Type coercion: NULL propagation in type-mixed arithmetic
+do_execsql_test lateral-type-coercion-null-mixed {
+    SELECT * FROM
+        (SELECT NULL AS x) AS t1
+        LATERAL JOIN (SELECT x + 1.5 AS result, TYPEOF(x + 1.5) AS type_info) AS t2;
+} {||}
+
+# LATERAL where later subquery uses columns from TWO earlier LATERAL subqueries
+do_execsql_test lateral-multi-dependency {
+    SELECT * FROM
+        (SELECT 10 AS a) AS t1
+        LATERAL JOIN (SELECT a * 2 AS b) AS t2
+        LATERAL JOIN (SELECT b + 5 AS c) AS t3
+        LATERAL JOIN (SELECT a + b + c AS total) AS t4;
+} {10|20|25|55}
+
+# Cross-referencing non-adjacent LATERAL joins (skip intermediate tables)
+do_execsql_test lateral-non-adjacent-refs {
+    SELECT * FROM
+        (SELECT 1 AS first) AS t1
+        LATERAL JOIN (SELECT 2 AS second) AS t2
+        LATERAL JOIN (SELECT 3 AS third) AS t3
+        LATERAL JOIN (SELECT 4 AS fourth) AS t4
+        LATERAL JOIN (SELECT first + third AS sum_1_3) AS t5;
+} {1|2|3|4|4}
+
+# Moderate depth chain (10 levels) - verify correct accumulation
+do_execsql_test lateral-depth-10-chain {
+    SELECT result FROM
+        (SELECT 1 AS x0) AS t0
+        LATERAL JOIN (SELECT x0 + 1 AS x1) AS t1
+        LATERAL JOIN (SELECT x1 + 1 AS x2) AS t2
+        LATERAL JOIN (SELECT x2 + 1 AS x3) AS t3
+        LATERAL JOIN (SELECT x3 + 1 AS x4) AS t4
+        LATERAL JOIN (SELECT x4 + 1 AS x5) AS t5
+        LATERAL JOIN (SELECT x5 + 1 AS x6) AS t6
+        LATERAL JOIN (SELECT x6 + 1 AS x7) AS t7
+        LATERAL JOIN (SELECT x7 + 1 AS x8) AS t8
+        LATERAL JOIN (SELECT x8 + 1 AS result) AS t9;
+} {10}
+
 finish_test

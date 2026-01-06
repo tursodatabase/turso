@@ -1455,8 +1455,7 @@ mod tests {
         let err_msg = result.unwrap_err().to_string();
         assert!(
             err_msg.contains("subquery nesting depth exceeds maximum"),
-            "Expected error message about depth, got: {}",
-            err_msg
+            "Expected error message about depth, got: {err_msg}"
         );
 
         // Nesting level should not have changed after failure
