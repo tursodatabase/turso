@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.4.1 -- 2026-01-06
+
+### Fixed
+
+* Fix path not fsyncing the DB file after truncate checkpoint (Preston Thorpe)
+
 ## 0.4.0 -- 2026-01-05
 
 ### Added
