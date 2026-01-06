@@ -95,6 +95,144 @@ do_execsql_test date-with-invalid-modifier {
   SELECT date('2023-05-18', 'invalid modifier');
 } {{}}
 
+# julianday edge cases
+
+do_execsql_test julianday-null-input {
+  SELECT julianday(NULL);
+} {{}}
+
+do_execsql_test julianday-invalid-input {
+  SELECT julianday('not a date');
+} {{}}
+
+do_execsql_test julianday-empty-string {
+  SELECT julianday('');
+} {{}}
+
+do_execsql_test julianday-negative-timezone {
+  SELECT julianday('2023-05-18 15:30:45-05:00');
+} {2460083.3546875}
+
+do_execsql_test julianday-z-suffix {
+  SELECT julianday('2023-05-18 15:30:45Z');
+} {2460083.14635417}
+
+do_execsql_test julianday-iso8601-t-separator {
+  SELECT julianday('2023-05-18T15:30:45');
+} {2460083.14635417}
+
+do_execsql_test julianday-out-of-range {
+  SELECT julianday('10001-01-01');
+} {{}}
+
+do_execsql_test julianday-string-with-modifier {
+  SELECT julianday('2023-05-18 12:00:00', '+1 day');
+} {2460084.0}
+
+do_execsql_test julianday-string-with-start-of-month {
+  SELECT julianday('2023-05-18', 'start of month');
+} {2460065.5}
+
+do_execsql_test julianday-string-with-minutes-modifier {
+  SELECT julianday('2023-05-18 12:00:00', '+30 minutes');
+} {2460083.02083333}
+
+# timediff argument count
+
+do_execsql_test_error timediff-one-arg {
+  SELECT timediff('12:00:00');
+} {wrong number of arguments.*}
+
+# floor/ceiling edge cases
+
+do_execsql_test date-floor-then-add-day {
+  SELECT date('2024-01-31', '+1 month', 'floor', '+1 day');
+} {2024-03-01}
+
+do_execsql_test datetime-floor-then-add-hours {
+  SELECT datetime('2024-01-31 10:00:00', '+1 month', 'floor', '+2 hours');
+} {{2024-02-29 12:00:00}}
+
+do_execsql_test date-fractional-month-floor {
+  SELECT date('2024-01-15', '+1.5 month', 'floor');
+} {2024-03-01}
+
+do_execsql_test datetime-fractional-month-floor {
+  SELECT datetime('2024-01-15 00:00:00', '+1.5 month', 'floor');
+} {{2024-03-01 00:00:00}}
+
+# modifier ordering errors
+
+do_execsql_test unixepoch-not-first-modifier {
+  SELECT date(1000, '+1 day', 'unixepoch');
+} {{}}
+
+do_execsql_test julianday-not-first-modifier {
+  SELECT date(2460000, '+1 day', 'julianday');
+} {{}}
+
+do_execsql_test unixepoch-after-start-of-day {
+  SELECT datetime(86400, 'start of day', 'unixepoch');
+} {{}}
+
+do_execsql_test julianday-after-hours-modifier {
+  SELECT time(2460083, '+1 hour', 'julianday');
+} {{}}
+
+# negative date-only offset
+
+do_execsql_test date-negative-date-offset {
+  SELECT date('2023-05-18', '-0001-01-01');
+} {2022-04-17}
+
+do_execsql_test date-negative-date-offset-2 {
+  SELECT date('2023-12-31', '-0001-00-00');
+} {2022-12-31}
+
+do_execsql_test date-with-+1200-offset {
+  SELECT date('2023-05-18 23:30:45+1200');
+} {{}}
+
+do_execsql_test date-with-+12-offset {
+  SELECT date('2023-05-18 23:30:45+12');
+} {{}}
+
+do_execsql_test datetime-huge-number  {
+  SELECT datetime(9466848000000.0, 'unixepoch');
+} {{}}
+
+do_execsql_test datetime-negative-date-offset {
+  SELECT datetime('2023-05-18 12:30:00', '-0001-01-01');
+} {{2022-04-17 12:30:00}}
+
+do_execsql_test unixepoch-negative-date-offset {
+  SELECT unixepoch('2023-05-18', '-0001-01-01');
+} {1650153600}
+
+do_execsql_test date-with-auto-julianday-top {
+	SELECT date(5373484, 'auto');
+} {9999-12-31}
+
+do_execsql_test date-with-auto-unixepoch-top {
+	SELECT date(5373484.5, 'auto');
+} {1970-03-04}
+
+do_execsql_test date-with-auto-julianday-bottom {
+	SELECT date(0, 'auto');
+} {-4713-11-24}
+
+do_execsql_test date-with-auto-unixepoch-bottom {
+	SELECT date(-1, 'auto');
+} {1969-12-31}
+
+do_execsql_test date-with-unixepoch {
+	SELECT date(2460292.5, 'unixepoch');
+} {1970-01-29}
+
+do_execsql_test date-with-julianday {
+	SELECT date(2460292.5, 'julianday');
+} {2023-12-14}
+
 do_execsql_test time-no-arg {
   SELECT length(time()) = 8;
 } {1}
@@ -215,6 +353,31 @@ do_execsql_test time-with-invalid-modifier {
   SELECT time('2023-05-18 15:30:45', '+1 hour', 'invalid modifier');
 } {{}}
 
+do_execsql_test time-with-auto {
+	SELECT time('2025-12-12 16:30:00', 'auto');
+} {16:30:00}
+
+do_execsql_test time-with-unixepoch {
+	SELECT time(2460292.5, 'unixepoch');
+} {11:24:52}
+
+do_execsql_test time-with-unixepoch-modifiers {
+	SELECT time(2460292.5, 'unixepoch', '+1 hour', '15 seconds');
+} {12:25:07}
+
+do_execsql_test time-with-julianday {
+	SELECT time(2460292.5, 'julianday');
+} {00:00:00}
+
+do_execsql_test time-with-julianday {
+	SELECT time(2460292.5, 'julianday');
+} {00:00:00}
+
+do_execsql_test time-with-julianday-modifiers {
+	SELECT time(2460292, 'julianday', '+1 hour', '+15 second', '+7 minute');
+} {13:07:15}
+
+
 do_execsql_test unixepoch-at-start {
   SELECT unixepoch('1970-01-01');
 } {0}
@@ -234,6 +397,130 @@ do_execsql_test unixepoch-at-start-of-time {
 do_execsql_test unixepoch-at-millisecond-precision-input-produces-seconds-precision-output {
   SELECT unixepoch('2022-01-27 12:59:28.052');
 } {1643288368}
+
+do_execsql_test unixepoch-with-modifier-start-of-day {
+  SELECT unixepoch('2023-05-18 15:30:45', 'start of day');
+} {1684368000}
+
+do_execsql_test unixepoch-with-modifier-start-of-month {
+  SELECT unixepoch('2023-05-18', 'start of month');
+} {1682899200}
+
+do_execsql_test unixepoch-with-modifier-start-of-year {
+  SELECT unixepoch('2023-05-18', 'start of year');
+} {1672531200}
+
+do_execsql_test unixepoch-with-modifier-add-months {
+  SELECT unixepoch('2023-05-18', '+2 months');
+} {1689638400}
+
+do_execsql_test unixepoch-with-modifier-subtract-months {
+  SELECT unixepoch('2023-05-18', '-3 months');
+} {1676678400}
+
+do_execsql_test unixepoch-with-modifier-add-years {
+  SELECT unixepoch('2023-05-18', '+1 year');
+} {1715990400}
+
+do_execsql_test unixepoch-with-modifier-subtract-years {
+  SELECT unixepoch('2023-05-18', '-2 years');
+} {1621296000}
+
+do_execsql_test unixepoch-default-ceiling {
+  SELECT unixepoch('2024-01-31', '+1 month'); 
+} {1709337600}
+
+do_execsql_test unixepoch-default-ceiling-fractional {
+  SELECT unixepoch('2024-01-31', '+1.5 month'); 
+} {1710633600}
+
+do_execsql_test unixepoch-floor {
+  SELECT unixepoch('2024-01-31', '+1 month', 'floor');
+} {1709164800}
+
+do_execsql_test unixepoch-floor-keeps-time {
+  SELECT unixepoch('2024-01-31 10:20:30', '+1 month', 'floor');
+} {1709202030}
+
+do_execsql_test unixepoch-ceiling-keeps-time {
+  SELECT unixepoch('2024-01-31 10:20:30', '+1 month', 'ceiling');
+} {1709374830}
+
+do_execsql_test unixepoch-ceiling-floor-2 {
+  SELECT unixepoch('2024-01-31', '+1 month', 'floor');
+} {1709164800}
+
+do_execsql_test unixepoch-ceiling-floor-5 {
+  SELECT unixepoch('2024-01-31', '+1 month', '+1 month', 'floor');
+} {1712016000}
+
+do_execsql_test unixepoch-ceiling-floor-6 {
+  SELECT unixepoch('2024-01-31', '+1 month', 'ceiling');
+} {1709337600}
+
+do_execsql_test unixepoch-ceiling-floor-7 {
+  SELECT unixepoch('2024-01-31', '+1 month', 'floor', 'ceiling');
+} {1709164800}
+
+do_execsql_test unixepoch-ceiling-floor-8 {
+  SELECT unixepoch('2024-01-31', '+1 month', '+1 day', 'floor');
+} {1709424000}
+
+do_execsql_test unixepoch-with-modifier-weekday {
+  SELECT unixepoch('2023-05-18', 'weekday 0');
+} {1684627200}
+
+do_execsql_test unixepoch-with-subsec {
+  SELECT unixepoch('2023-05-18 15:30:45.123', 'subsec');
+} {1684423845.123}
+
+do_execsql_test unixepoch-with-modifier-add-months-31 {
+  SELECT unixepoch('2023-01-31', '+1 month');
+} {1677801600}
+
+do_execsql_test unixepoch-with-modifier-subtract-months-31 {
+  SELECT unixepoch('2023-03-31', '-1 month');
+} {1677801600}
+
+do_execsql_test unixepoch-with-modifier-add-months-large {
+  SELECT unixepoch('2023-01-31', '+13 months');
+} {1709337600}
+
+do_execsql_test unixepoch-with-modifier-subtract-months-large {
+  SELECT unixepoch('2023-01-31', '-13 months');
+} {1640908800}
+
+do_execsql_test unixepoch-with-modifier-february-leap-year {
+  SELECT unixepoch('2020-02-29', '+12 months');
+} {1614556800}
+
+do_execsql_test unixepoch-with-modifier-february-non-leap-year {
+  SELECT unixepoch('2019-02-28', '+12 months');
+} {1582848000}
+
+do_execsql_test unixepoch-with-modifier-date {
+  SELECT unixepoch('2023-02-15 15:30:45', '+0001-01-01');
+} {1710603045}
+
+do_execsql_test unixepoch-with-modifier-datetime-pos {
+  SELECT unixepoch('2023-02-15 15:30:45', '+0001-01-01 15:30');
+} {1710658845}
+
+do_execsql_test unixepoch-with-modifier-sub {
+  SELECT unixepoch('2023-12-12', '-0002-10-10 15:30:45');
+} {1612168155}
+
+do_execsql_test unixepoch-with-modifier-add {
+  SELECT unixepoch('2023-12-12', '+0002-10-10 15:30:45');
+} {1792683045}
+
+do_execsql_test unixepoch-with-multiple-modifiers {
+  SELECT unixepoch('2023-05-18', '+1 month', '-10 days', 'start of year');
+} {1672531200}
+
+do_execsql_test unixepoch-with-multiple-modifiers-datetime {
+  SELECT unixepoch('2024-01-31', '+1 month', '+13 hours', '+5 minutes', '+62 seconds');
+} {1709384762}
 
 do_execsql_test date-with-modifier-start-of-day {
   SELECT date('2023-05-18 15:30:45', 'start of day');
@@ -258,6 +545,26 @@ do_execsql_test datetime-default-ceiling {
 do_execsql_test datetime-floor-keeps-time {
   SELECT datetime('2024-01-31 10:20:30', '+1 month', 'floor');
 } {{2024-02-29 10:20:30}}
+
+do_execsql_test datetime-julianday-negative {
+  SELECT datetime(-1, 'julianday');
+} {{}}
+
+do_execsql_test datetime-unixepoch-negative {
+  SELECT datetime(-0.5, 'unixepoch');
+} {{1969-12-31 23:59:59}}
+
+do_execsql_test datetime-unixepoch-4decimal {
+  SELECT datetime(0.9999, 'unixepoch');
+} {{1970-01-01 00:00:01}}
+
+do_execsql_test datetime-fractional-month {
+  SELECT datetime('2025-01-01', '+1.5 month');
+} {{2025-02-16 00:00:00}}
+
+do_execsql_test datetime-fractional-year {
+  SELECT datetime('2025-01-01', '+1.5 year');
+} {{2026-07-02 12:00:00}}
 
 do_execsql_test datetime-ceiling-keeps-time {
   SELECT datetime('2024-01-31 10:20:30', '+1 month', 'ceiling');
@@ -517,6 +824,10 @@ do_execsql_test julianday-max-day {
 
 
 set FMT {%d,%e,%f,%F,%G,%g,%H,%I,%j,%J,%k,%l,%i,%m,%M,%p,%P,%R,%s,%S,%T,%U,%u,%V,%w,%W,%Y,%%}
+
+do_execsql_test strftime-error-null {
+	SELECT strftime('%Y', 'not-a-valid-date');
+} {{}}
 
 do_execsql_test strftime-day {
     SELECT strftime('%d', '2025-01-23T13:10:30.567');
