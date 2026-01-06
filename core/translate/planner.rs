@@ -405,7 +405,12 @@ fn parse_from_clause_table(
             &args,
             connection,
         ),
-        _ => todo!(),
+        ast::SelectTable::Sub(_, _) => {
+            crate::bail_parse_error!(
+                "Parenthesized FROM clause syntax (e.g., '(table1, table2)') is not supported yet; \
+                use explicit JOINs instead"
+            )
+        }
     }
 }
 

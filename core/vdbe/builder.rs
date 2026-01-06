@@ -1158,7 +1158,11 @@ impl ProgramBuilder {
 
     #[inline]
     pub fn decr_nesting(&mut self) {
-        self.nested_level -= 1;
+        debug_assert!(
+            self.nested_level > 0,
+            "decr_nesting called when nesting level is already 0"
+        );
+        self.nested_level = self.nested_level.saturating_sub(1);
     }
 
     /// Increment nesting level with depth limit check.

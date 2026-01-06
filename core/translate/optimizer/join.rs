@@ -55,6 +55,30 @@ impl JoinN {
     }
 }
 
+/// Compute the dependency masks for tables that require non-commutative join ordering.
+///
+/// For OUTER joins and LATERAL joins, the RHS table depends on all preceding tables
+/// being joined first. This function builds a map from each such table's index to
+/// a bitmask of all tables that must precede it in the join order.
+///
+/// Example: For "a JOIN b LEFT JOIN c LATERAL JOIN d":
+/// - Table c (LEFT JOIN) requires {a, b} to be joined first
+/// - Table d (LATERAL) requires {a, b, c} to be joined first
+fn compute_non_commutative_join_deps(joined_tables: &[JoinedTable]) -> HashMap<usize, TableMask> {
+    joined_tables
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| t.join_info.as_ref().is_some_and(|ji| ji.outer || ji.lateral))
+        .map(|(j, _)| {
+            let mut required = TableMask::new();
+            for k in 0..j {
+                required.add_table(k);
+            }
+            (j, required)
+        })
+        .collect()
+}
+
 /// Join n-1 tables with the n'th table.
 /// Returns None if the plan is worse than the provided cost upper bound or if no valid access method is found.
 ///
@@ -828,22 +852,7 @@ pub fn compute_best_join_order<'a>(
     // "a LEFT JOIN b" can NOT be reordered as "b LEFT JOIN a".
     // "a LATERAL JOIN (SELECT a.x)" can NOT be reordered - the LATERAL subquery depends on 'a'.
     // If there are outer joins or LATERAL joins in the plan, ensure correct ordering.
-    //
-    // For each OUTER/LATERAL table at index j, we build a mask of all tables 0..j that must
-    // be present in the join before table j can be added. This matches the greedy optimizer's
-    // approach in `compute_greedy_join_order`.
-    let non_commutative_join_deps: HashMap<usize, TableMask> = joined_tables
-        .iter()
-        .enumerate()
-        .filter(|(_, t)| t.join_info.as_ref().is_some_and(|ji| ji.outer || ji.lateral))
-        .map(|(j, _)| {
-            let mut required = TableMask::new();
-            for k in 0..j {
-                required.add_table(k);
-            }
-            (j, required)
-        })
-        .collect();
+    let non_commutative_join_deps = compute_non_commutative_join_deps(joined_tables);
 
     // Now that we have our single-table base cases, we can start considering join subsets of 2 tables and more.
     // Try to join each single table to each other table.
@@ -1043,18 +1052,7 @@ pub fn compute_greedy_join_order<'a>(
 
     // Outer join and LATERAL join RHS tables require all preceding tables to be joined first.
     // LATERAL subqueries reference columns from preceding tables, so they have the same constraint.
-    let non_commutative_deps: HashMap<usize, TableMask> = joined_tables
-        .iter()
-        .enumerate()
-        .filter(|(_, t)| t.join_info.as_ref().is_some_and(|ji| ji.outer || ji.lateral))
-        .map(|(j, _)| {
-            let mut required = TableMask::new();
-            for k in 0..j {
-                required.add_table(k);
-            }
-            (j, required)
-        })
-        .collect();
+    let non_commutative_deps = compute_non_commutative_join_deps(joined_tables);
 
     let mut remaining: Vec<usize> = (0..num_tables).collect();
     let mut join_order: Vec<JoinOrderMember> = Vec::with_capacity(num_tables);
