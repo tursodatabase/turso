@@ -743,6 +743,9 @@ pub fn parse_from(
             }));
 
             // CTE can refer to other CTEs that came before it, plus any schema tables or tables in the outer scope.
+            // Check subquery nesting depth before recursing to prevent deeply nested CTEs
+            // from exceeding the maximum subquery depth limit.
+            program.try_incr_nesting()?;
             let cte_plan = prepare_select_plan(
                 cte.select,
                 resolver,
@@ -750,7 +753,9 @@ pub fn parse_from(
                 &outer_query_refs_for_cte,
                 QueryDestination::placeholder_for_subquery(),
                 connection,
-            )?;
+            );
+            program.decr_nesting();
+            let cte_plan = cte_plan?;
             let Plan::Select(cte_plan) = cte_plan else {
                 crate::bail_parse_error!("Only SELECT queries are currently supported in CTEs");
             };

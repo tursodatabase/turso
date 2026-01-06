@@ -435,4 +435,49 @@ do_execsql_test lateral-cte-chained {
     LATERAL JOIN (SELECT half / 2 AS quarter) AS step2;
 } {100|50|25}
 
+# ============================================================================
+# Depth limit tests
+# ============================================================================
+
+# Test that deeply nested LATERAL joins are rejected when exceeding the limit.
+# The maximum subquery depth is 100, so 101+ nested levels should fail.
+# We build the query dynamically using TCL to avoid writing 101 joins manually.
+set depth_limit_query "SELECT * FROM (SELECT 1 AS x0) AS t0"
+for {set i 1} {$i <= 101} {incr i} {
+    set prev [expr {$i - 1}]
+    append depth_limit_query " LATERAL JOIN (SELECT x$prev AS x$i) AS t$i"
+}
+do_catchsql_test lateral-depth-limit-exceeded $depth_limit_query {1 {subquery nesting depth exceeds maximum of 100}}
+
+# Verify that 100 levels of nesting (just at the limit) succeeds
+set depth_at_limit_query "SELECT t99.x99 FROM (SELECT 1 AS x0) AS t0"
+for {set i 1} {$i < 100} {incr i} {
+    set prev [expr {$i - 1}]
+    append depth_at_limit_query " LATERAL JOIN (SELECT x$prev + 1 AS x$i) AS t$i"
+}
+do_execsql_test lateral-depth-at-limit $depth_at_limit_query {100}
+
+# ============================================================================
+# Forward reference rejection tests
+# ============================================================================
+
+# LATERAL should not be able to reference tables that come AFTER it in the FROM clause.
+# This tests that the scoping is correct - only preceding tables are visible.
+# For qualified column references (table.column), the error is "no such table"
+# because the table lookup fails before column lookup.
+do_catchsql_test lateral-forward-reference-rejected {
+    SELECT * FROM
+        (SELECT 1 AS x) AS t1
+        LATERAL JOIN (SELECT later.y AS val) AS t2
+        JOIN (SELECT 2 AS y) AS later;
+} {1 {no such table: later}}
+
+# Forward reference with unqualified column name should also fail
+do_catchsql_test lateral-forward-reference-unqualified {
+    SELECT * FROM
+        (SELECT 1 AS a) AS first_tbl
+        LATERAL JOIN (SELECT future_col * 2 AS result) AS middle
+        JOIN (SELECT 99 AS future_col) AS last_tbl;
+} {1 {no such column: future_col}}
+
 finish_test
