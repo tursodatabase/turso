@@ -408,15 +408,12 @@ fn emit_materialized_build_inputs(
     let mut build_inputs: HashMap<usize, MaterializedBuildInput> = HashMap::new();
     let mut materializations: Vec<MaterializationSpec> = Vec::new();
     let mut hash_tables_to_keep_open: HashSet<usize> = HashSet::new();
-    let mut seen_hash_build_tables: HashSet<usize> = HashSet::new();
 
     // Keep hash tables open while running materialization subplans so we can reuse them.
+    // A build table may appear in multiple hash joins when chaining, so we do not
+    // treat repeated build tables as an error.
     for table in plan.table_references.joined_tables().iter() {
         if let Operation::HashJoin(hash_join_op) = &table.op {
-            turso_assert!(
-                seen_hash_build_tables.insert(hash_join_op.build_table_idx),
-                "hash join build table appears multiple times in plan"
-            );
             let build_table = &plan.table_references.joined_tables()[hash_join_op.build_table_idx];
             hash_tables_to_keep_open.insert(build_table.internal_id.into());
         }

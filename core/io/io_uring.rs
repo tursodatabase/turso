@@ -605,9 +605,10 @@ impl IO for UringIO {
             "fixed buffer length must be logical block aligned"
         );
         let mut inner = self.inner.lock();
-        let slot = inner.free_arenas.iter().position(|e| e.is_none()).ok_or({
-            crate::error::CompletionError::UringIOError("no free fixed buffer slots")
-        })?;
+        let slot =
+            inner.free_arenas.iter().position(|e| e.is_none()).ok_or({
+                crate::error::CompletionError::UringIOError("no free fixed buffer slots")
+            })?;
         unsafe {
             inner.ring.ring.submitter().register_buffers_update(
                 slot as u32,

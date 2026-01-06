@@ -1,5 +1,6 @@
 use crate::{
     schema::{Column, Index, Schema},
+    stats::TableStat,
     translate::{
         collate::get_collseq_from_expr,
         expr::{as_binary_components, comparison_affinity},
@@ -403,6 +404,15 @@ fn estimate_join_eq_selectivity(
         available_indexes,
     );
 
+    let left_stats = schema
+        .analyze_stats
+        .table_stats(table_reference.table.get_name());
+    let right_stats = schema
+        .analyze_stats
+        .table_stats(other_table.table.get_name());
+    let left_ndv = join_ndv_with_fallback(left_stats, left_ndv);
+    let right_ndv = join_ndv_with_fallback(right_stats, right_ndv);
+
     let max_ndv = match (left_ndv, right_ndv) {
         (Some(left), Some(right)) => left.max(right),
         (Some(left), None) | (None, Some(left)) => left,
@@ -412,6 +422,50 @@ fn estimate_join_eq_selectivity(
         return None;
     }
     Some((1.0 / max_ndv).clamp(0.0, 1.0))
+}
+
+/// Estimate selectivity for a cross-table equality when we only know the tables,
+/// not the specific columns.
+///
+/// This is a fallback used for expression-based equi-joins (e.g. CAST/expressions)
+/// when we lack per-column stats. We approximate NDV using row counts, and fall
+/// back to sqrt(rows) when ANALYZE data is missing.
+fn estimate_generic_eq_join_selectivity(
+    schema: &Schema,
+    left_table: &JoinedTable,
+    right_table: &JoinedTable,
+) -> Option<f64> {
+    let left_stats = schema
+        .analyze_stats
+        .table_stats(left_table.table.get_name());
+    let right_stats = schema
+        .analyze_stats
+        .table_stats(right_table.table.get_name());
+    let left_ndv = join_ndv_with_fallback(left_stats, None).unwrap_or(0.0);
+    let right_ndv = join_ndv_with_fallback(right_stats, None).unwrap_or(0.0);
+
+    let max_ndv = left_ndv.max(right_ndv);
+    if max_ndv <= 0.0 {
+        return None;
+    }
+    Some((1.0 / max_ndv).clamp(0.0, 1.0))
+}
+
+/// Normalize NDV estimates for join selectivity.
+///
+/// If ANALYZE stats are missing, we fall back to sqrt(row_count). When we already
+/// have a column NDV, we clamp it to at least the fallback to avoid underestimates.
+fn join_ndv_with_fallback(stats: Option<&TableStat>, column_ndv: Option<f64>) -> Option<f64> {
+    let row_count = stats
+        .and_then(|s| s.row_count)
+        .unwrap_or(ESTIMATED_HARDCODED_ROWS_PER_TABLE as u64) as f64;
+    let has_stats = stats.is_some() && stats.and_then(|s| s.row_count).is_some();
+    let fallback_ndv = row_count.sqrt().max(1.0);
+    if has_stats {
+        Some(column_ndv.unwrap_or_else(|| row_count.max(1.0)))
+    } else {
+        Some(column_ndv.unwrap_or(fallback_ndv).max(fallback_ndv))
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -436,6 +490,7 @@ fn estimate_constraint_selectivity(
     constraining_expr: &ast::Expr,
     available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
     table_references: &TableReferences,
+    subqueries: &[NonFromClauseSubquery],
 ) -> f64 {
     // Special-case: equality to another table's column is likely an equi-join.
     if operator == ast::Operator::Equals {
@@ -455,6 +510,22 @@ fn estimate_constraint_selectivity(
                     table_references,
                 ) {
                     return selectivity;
+                }
+            }
+        }
+        if let Ok(mask) = table_mask_from_expr(constraining_expr, table_references, subqueries) {
+            if mask.table_count() == 1 {
+                if let Some(other_idx) = mask.tables_iter().next() {
+                    let other_table = &table_references.joined_tables()[other_idx];
+                    if other_table.internal_id != table_reference.internal_id {
+                        if let Some(selectivity) = estimate_generic_eq_join_selectivity(
+                            schema,
+                            table_reference,
+                            other_table,
+                        ) {
+                            return selectivity;
+                        }
+                    }
                 }
             }
         }
@@ -562,6 +633,7 @@ pub fn constraints_from_where_clause(
                                 rhs,
                                 available_indexes,
                                 table_references,
+                                subqueries,
                             ),
                             usable: true,
                         });
@@ -589,6 +661,7 @@ pub fn constraints_from_where_clause(
                                 rhs,
                                 available_indexes,
                                 table_references,
+                                subqueries,
                             ),
                             usable: true,
                         });
@@ -601,13 +674,32 @@ pub fn constraints_from_where_clause(
                     subqueries,
                 ) =>
                 {
+                    let selectivity = estimate_constraint_selectivity(
+                        schema,
+                        table_reference,
+                        None,
+                        None,
+                        operator,
+                        rhs,
+                        available_indexes,
+                        table_references,
+                        subqueries,
+                    );
+                    tracing::debug!(
+                        table = table_reference.table.get_name(),
+                        where_clause_pos = i,
+                        operator = ?operator,
+                        lhs_mask = ?table_mask_from_expr(rhs, table_references, subqueries)?,
+                        selectivity,
+                        "expr constraint (lhs matches table)"
+                    );
                     cs.constraints.push(Constraint {
                         where_clause_pos: (i, BinaryExprSide::Rhs),
                         operator,
                         table_col_pos: None,
                         expr: Some(lhs.clone()),
                         lhs_mask: table_mask_from_expr(rhs, table_references, subqueries)?,
-                        selectivity: SELECTIVITY_OTHER,
+                        selectivity,
                         usable: true,
                     });
                 }
@@ -632,6 +724,7 @@ pub fn constraints_from_where_clause(
                                 lhs,
                                 available_indexes,
                                 table_references,
+                                subqueries,
                             ),
                             usable: true,
                         });
@@ -656,6 +749,7 @@ pub fn constraints_from_where_clause(
                                 lhs,
                                 available_indexes,
                                 table_references,
+                                subqueries,
                             ),
                             usable: true,
                         });
@@ -668,13 +762,32 @@ pub fn constraints_from_where_clause(
                     subqueries,
                 ) =>
                 {
+                    let selectivity = estimate_constraint_selectivity(
+                        schema,
+                        table_reference,
+                        None,
+                        None,
+                        operator,
+                        lhs,
+                        available_indexes,
+                        table_references,
+                        subqueries,
+                    );
+                    tracing::debug!(
+                        table = table_reference.table.get_name(),
+                        where_clause_pos = i,
+                        operator = ?operator,
+                        lhs_mask = ?table_mask_from_expr(lhs, table_references, subqueries)?,
+                        selectivity,
+                        "expr constraint (rhs matches table)"
+                    );
                     cs.constraints.push(Constraint {
                         where_clause_pos: (i, BinaryExprSide::Lhs),
                         operator: opposite_cmp_op(operator),
                         table_col_pos: None,
                         expr: Some(rhs.clone()),
                         lhs_mask: table_mask_from_expr(lhs, table_references, subqueries)?,
-                        selectivity: SELECTIVITY_OTHER,
+                        selectivity,
                         usable: true,
                     });
                 }
