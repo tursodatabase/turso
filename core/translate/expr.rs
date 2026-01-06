@@ -2355,14 +2355,14 @@ pub fn translate_expr(
                             .or(from_clause_subquery.result_columns_start_reg)
                         else {
                             crate::bail_parse_error!(
-                                "Internal error: subquery result register not found for LATERAL reference"
+                                "unable to resolve column reference in LATERAL subquery"
                             );
                         };
                         reg
                     } else {
                         let Some(reg) = from_clause_subquery.result_columns_start_reg else {
                             crate::bail_parse_error!(
-                                "Internal error: subquery result register not initialized"
+                                "unable to resolve subquery column reference"
                             );
                         };
                         reg

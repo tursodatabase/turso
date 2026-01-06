@@ -1138,7 +1138,20 @@ impl ProgramBuilder {
         self.collation = None;
     }
 
+    /// Increment nesting level without checking depth limit.
+    ///
+    /// # Deprecated
+    /// This method does not check for maximum subquery depth and can lead to
+    /// stack overflow with deeply nested queries. Use [`try_incr_nesting`] instead
+    /// for production code that processes untrusted queries.
+    ///
+    /// This method is kept for test code that needs to manipulate nesting level
+    /// without going through the depth check.
     #[inline]
+    #[deprecated(
+        since = "0.4.0",
+        note = "Use try_incr_nesting() instead to enforce depth limits"
+    )]
     pub fn incr_nesting(&mut self) {
         self.nested_level += 1;
     }
@@ -1447,6 +1460,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)] // Testing the deprecated method intentionally
     fn test_nesting_increment_decrement() {
         let mut builder = test_builder();
 

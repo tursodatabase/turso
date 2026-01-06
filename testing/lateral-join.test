@@ -458,6 +458,171 @@ for {set i 1} {$i < 100} {incr i} {
 do_execsql_test lateral-depth-at-limit $depth_at_limit_query {100}
 
 # ============================================================================
+# Multi-row LATERAL tests (CRITICAL - tests re-evaluation per row)
+# ============================================================================
+
+# Setup table for multi-row tests
+do_execsql_test lateral-multirow-setup {
+    CREATE TABLE nums (x INTEGER);
+    INSERT INTO nums VALUES (1), (2), (3);
+    CREATE TABLE nums5 (n INTEGER);
+    INSERT INTO nums5 VALUES (1), (2), (3), (4), (5);
+    CREATE TABLE pairs (x INTEGER, y INTEGER);
+    INSERT INTO pairs VALUES (1, 2), (3, 4), (5, 6);
+    CREATE TABLE letters (letter TEXT);
+    INSERT INTO letters VALUES ('a'), ('b'), ('c');
+    CREATE TABLE nums4 (n INTEGER);
+    INSERT INTO nums4 VALUES (1), (2), (3), (4);
+    CREATE TABLE nums_with_null (x INTEGER);
+    INSERT INTO nums_with_null VALUES (1), (NULL), (3);
+} {}
+
+# Multi-row left side - LATERAL subquery re-evaluated for each row
+# This is the most critical test for LATERAL semantics
+do_execsql_test lateral-multirow-basic {
+    SELECT * FROM
+        (SELECT x FROM nums) AS t1
+        LATERAL JOIN (SELECT x * 10 AS y) AS t2
+    ORDER BY x;
+} {1|10
+2|20
+3|30}
+
+# Multi-row with chained LATERAL - each step re-evaluated
+do_execsql_test lateral-multirow-chained {
+    SELECT * FROM
+        (SELECT x AS a FROM nums) AS t1
+        LATERAL JOIN (SELECT a + 10 AS b) AS t2
+        LATERAL JOIN (SELECT a + b AS c) AS t3
+    ORDER BY a;
+} {1|11|12
+2|12|14
+3|13|16}
+
+# Multi-row with computation that depends on row value
+do_execsql_test lateral-multirow-computation {
+    SELECT t1.n, sq.square FROM
+        (SELECT n FROM nums5) AS t1
+        LATERAL JOIN (SELECT n * n AS square) AS sq
+    ORDER BY n;
+} {1|1
+2|4
+3|9
+4|16
+5|25}
+
+# Multi-row with WHERE filter in LATERAL - different rows may match or not
+do_execsql_test lateral-multirow-filtered {
+    SELECT * FROM
+        (SELECT n AS x FROM nums5) AS t1
+        LATERAL JOIN (SELECT x * 2 AS doubled WHERE x > 3) AS t2
+    ORDER BY x;
+} {4|8
+5|10}
+
+# Multi-row with string values
+do_execsql_test lateral-multirow-strings {
+    SELECT * FROM
+        (SELECT letter FROM letters) AS t1
+        LATERAL JOIN (SELECT letter || letter AS doubled, UPPER(letter) AS upper_letter) AS t2
+    ORDER BY letter;
+} {a|aa|A
+b|bb|B
+c|cc|C}
+
+# Multi-row referencing multiple columns
+do_execsql_test lateral-multirow-multiple-cols {
+    SELECT t1.x, t1.y, computed.sum, computed.prod FROM
+        (SELECT x, y FROM pairs) AS t1
+        LATERAL JOIN (SELECT x + y AS sum, x * y AS prod) AS computed
+    ORDER BY x;
+} {1|2|3|2
+3|4|7|12
+5|6|11|30}
+
+# Multi-row with CASE expression - different behavior per row
+do_execsql_test lateral-multirow-case {
+    SELECT n, category FROM
+        (SELECT n FROM nums4) AS t1
+        LATERAL JOIN (SELECT CASE WHEN n % 2 = 0 THEN 'even' ELSE 'odd' END AS category) AS t2
+    ORDER BY n;
+} {1|odd
+2|even
+3|odd
+4|even}
+
+# Multi-row with NULL values mixed in
+do_execsql_test lateral-multirow-with-nulls {
+    SELECT t1.x, t2.result FROM
+        (SELECT x FROM nums_with_null) AS t1
+        LATERAL JOIN (SELECT COALESCE(x, 0) * 10 AS result) AS t2
+    ORDER BY COALESCE(t1.x, 0);
+} {|0
+1|10
+3|30}
+
+# Cleanup multi-row test tables
+do_execsql_test lateral-multirow-cleanup {
+    DROP TABLE nums;
+    DROP TABLE nums5;
+    DROP TABLE pairs;
+    DROP TABLE letters;
+    DROP TABLE nums4;
+    DROP TABLE nums_with_null;
+} {}
+
+# ============================================================================
+# GROUP BY with LATERAL tests
+# ============================================================================
+
+# Setup for GROUP BY tests
+do_execsql_test lateral-groupby-setup {
+    CREATE TABLE sales (category TEXT, amount INTEGER);
+    INSERT INTO sales VALUES ('A', 100), ('A', 150), ('B', 200), ('B', 50), ('B', 100);
+} {}
+
+# LATERAL with GROUP BY in outer query - group stats
+do_execsql_test lateral-groupby-outer {
+    SELECT cat.category, stats.hundreds FROM
+        (SELECT category, SUM(amount) AS total FROM sales GROUP BY category) AS cat
+        LATERAL JOIN (SELECT total / 100 AS hundreds) AS stats
+    ORDER BY cat.category;
+} {A|2
+B|3}
+
+# Cleanup GROUP BY tests
+do_execsql_test lateral-groupby-cleanup {
+    DROP TABLE sales;
+} {}
+
+# ============================================================================
+# EXISTS with LATERAL tests
+# ============================================================================
+
+# Setup for EXISTS tests
+do_execsql_test lateral-exists-setup {
+    CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, category TEXT);
+    CREATE TABLE inventory (product_id INTEGER, stock INTEGER);
+    INSERT INTO products VALUES (1, 'Widget', 'A'), (2, 'Gadget', 'A'), (3, 'Gizmo', 'B');
+    INSERT INTO inventory VALUES (1, 10), (2, 0), (3, 5);
+} {}
+
+# LATERAL reference inside EXISTS subquery
+do_execsql_test lateral-exists-inner {
+    SELECT p.name FROM
+        (SELECT * FROM products) AS p
+        LATERAL JOIN (SELECT 1 AS has_stock WHERE EXISTS (SELECT 1 FROM inventory WHERE product_id = p.id AND stock > 0)) AS inv
+    ORDER BY p.name;
+} {Gizmo
+Widget}
+
+# Cleanup EXISTS tests
+do_execsql_test lateral-exists-cleanup {
+    DROP TABLE products;
+    DROP TABLE inventory;
+} {}
+
+# ============================================================================
 # Forward reference rejection tests
 # ============================================================================
 

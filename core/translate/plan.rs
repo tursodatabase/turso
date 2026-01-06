@@ -302,7 +302,10 @@ pub struct JoinOrderMember {
     /// The index of the table in the original join order.
     /// This is used to index into e.g. [TableReferences::joined_tables()]
     pub original_idx: usize,
-    /// Whether this member is the right side of an OUTER JOIN
+    /// Whether this member is the right side of an OUTER JOIN.
+    /// Note: LATERAL joins also have non-commutative ordering constraints,
+    /// but those are enforced via `non_commutative_join_deps` in the optimizer,
+    /// not via this field.
     pub is_outer: bool,
 }
 
