@@ -316,3 +316,69 @@ proc do_execsql_test_in_memory_error {test_name sql_statements expected_error_pa
 proc is_turso_mvcc {} {
     return [expr {[info exists ::env(SQLITE_EXEC)] && $::env(SQLITE_EXEC) eq "scripts/turso-mvcc-sqlite3"}]
 }
+
+# do_catchsql_test - test that expects either success (code 0) or error (code 1)
+# expected format: {code message} where code is 0 for success, 1 for error
+proc do_catchsql_test {test_name sql_statements expected} {
+    foreach db $::test_dbs {
+        test_put "Running catchsql test" $db $test_name
+        set combined_sql [string trim $sql_statements]
+
+        # Extract expected code and message from the expected list
+        set expected_code [lindex $expected 0]
+        set expected_msg [lindex $expected 1]
+
+        # Try to execute the SQL and capture both success and error cases
+        if {[catch {evaluate_sql $::sqlite_exec $db $combined_sql} result]} {
+            # Command failed (exec returned non-zero) - this is an error
+            set actual_code 1
+            set actual_msg $result
+        } else {
+            # Command succeeded - check if the result contains error indicators
+            if {[regexp {(×|Parse error:|Runtime error:|Error:|error:)} $result]} {
+                # Output contains error indicators - treat as error
+                set actual_code 1
+                set actual_msg $result
+            } else {
+                # No error indicators - treat as success
+                set actual_code 0
+                set actual_msg $result
+            }
+        }
+
+        # Check if the code matches
+        if {$actual_code != $expected_code} {
+            error_put $sql_statements
+            puts ""
+            puts "expected code '$expected_code' but got '$actual_code'"
+            puts "result message: '$actual_msg'"
+            exit 1
+        }
+
+        # If we expected an error (code 1), check that the message matches
+        if {$expected_code == 1} {
+            # Clean up the actual message for comparison
+            # Remove ANSI codes, box-drawing chars, and normalize whitespace
+            set cleaned_actual [regsub -all {\x1b\[[0-9;]*m} $actual_msg ""]
+            set cleaned_actual [regsub -all {[\u2500-\u257F×]} $cleaned_actual ""]
+            set cleaned_actual [regsub -all {Parse error:\s*} $cleaned_actual ""]
+            set cleaned_actual [regsub -all {Runtime error:\s*} $cleaned_actual ""]
+            # Normalize all whitespace (newlines, multiple spaces) to single spaces
+            set cleaned_actual [regsub -all {\s+} $cleaned_actual " "]
+            set cleaned_actual [string trim $cleaned_actual]
+
+            # Normalize expected message whitespace too
+            set cleaned_expected [regsub -all {\s+} $expected_msg " "]
+            set cleaned_expected [string trim $cleaned_expected]
+
+            # Check if the expected message appears in the actual output
+            if {[string first $cleaned_expected $cleaned_actual] == -1} {
+                error_put $sql_statements
+                puts ""
+                puts "expected error message: '$cleaned_expected'"
+                puts "actual error message: '$cleaned_actual'"
+                exit 1
+            }
+        }
+    }
+}
