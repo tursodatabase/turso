@@ -173,8 +173,6 @@ pub fn join_lhs_and_rhs<'a>(
     //
     // - The would-be build table is accessed via a scan, or we can preserve its
     //   filters by materializing rowids.
-    // - Choosing hash join does not destroy a useful ORDER BY the nested-loop
-    //   plan would satisfy.
     // - The probe table is not using a selective index seek we’d prefer to keep.
     // - The build table has no remaining constraints from prior tables that are
     //   not already consumed as hash-join keys in earlier hash joins.
