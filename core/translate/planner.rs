@@ -893,9 +893,17 @@ impl TableMask {
     pub fn intersects(&self, other: &TableMask) -> bool {
         self.0 & other.0 != 0
     }
+
+    /// Iterate the table indices present in this mask.
+    pub fn tables_iter(&self) -> impl Iterator<Item = usize> + '_ {
+        (0..127).filter(move |table_no| self.contains_table(*table_no))
+    }
 }
 
 /// Returns a [TableMask] representing the tables referenced in the given expression.
+///
+/// This includes outer references from subqueries, even if the subquery plan has
+/// already been consumed, by relying on the cached outer reference ids.
 /// Used in the optimizer for constraint analysis.
 pub fn table_mask_from_expr(
     top_level_expr: &Expr,
@@ -930,23 +938,42 @@ pub fn table_mask_from_expr(
                 else {
                     crate::bail_parse_error!("subquery not found");
                 };
-                let SubqueryState::Unevaluated { plan } = &subquery.state else {
-                    crate::bail_parse_error!("subquery has already been evaluated");
-                };
-                let used_outer_query_refs = plan
-                    .as_ref()
-                    .unwrap()
-                    .table_references
-                    .outer_query_refs()
-                    .iter()
-                    .filter(|t| t.is_used());
-                for outer_query_ref in used_outer_query_refs {
-                    if let Some(table_idx) = table_references
-                        .joined_tables()
-                        .iter()
-                        .position(|t| t.internal_id == outer_query_ref.internal_id)
-                    {
-                        mask.add_table(table_idx);
+                match &subquery.state {
+                    SubqueryState::Unevaluated { plan } => {
+                        let used_outer_query_refs = plan
+                            .as_ref()
+                            .unwrap()
+                            .table_references
+                            .outer_query_refs()
+                            .iter()
+                            .filter(|t| t.is_used());
+                        for outer_query_ref in used_outer_query_refs {
+                            if let Some(table_idx) = table_references
+                                .joined_tables()
+                                .iter()
+                                .position(|t| t.internal_id == outer_query_ref.internal_id)
+                            {
+                                mask.add_table(table_idx);
+                            }
+                        }
+                    }
+                    SubqueryState::Evaluated { outer_ref_ids, .. } => {
+                        // Now hash-join plans can now translate some correlated subqueries early, we
+                        // still revisit those predicates even though the plan has already been consumed.
+                        // Without this cache we'd panic or lose the knowledge that an outer table was required.
+                        //
+                        // Example: `SELECT t.a FROM t WHERE t.a = (SELECT MAX(x.a) FROM x WHERE x.b = t.b)`.
+                        // The outer expression `x.b = t.b` is visited after the subquery is translated,
+                        // so we need cached `outer_ref_ids` to realize that `t` must already be in scope.
+                        for outer_ref_id in outer_ref_ids {
+                            if let Some(table_idx) = table_references
+                                .joined_tables()
+                                .iter()
+                                .position(|t| t.internal_id == *outer_ref_id)
+                            {
+                                mask.add_table(table_idx);
+                            }
+                        }
                     }
                 }
             }
@@ -958,8 +985,11 @@ pub fn table_mask_from_expr(
     Ok(mask)
 }
 
-/// When a table referenced in the expression is not found in join_order, we check if it's
-/// a hash join build table. If so, we map the condition to the probe table's loop position.
+/// Determines the earliest loop where an expression can be safely evaluated.
+///
+/// When a referenced table is not found in `join_order`, we check if it's a hash-join
+/// build table and map the condition to the probe loop where its rows are produced.
+/// Subquery references are also respected, even after their plans are consumed.
 pub fn determine_where_to_eval_expr(
     top_level_expr: &Expr,
     join_order: &[JoinOrderMember],
@@ -1001,7 +1031,7 @@ pub fn determine_where_to_eval_expr(
                     crate::bail_parse_error!("subquery not found");
                 };
                 match &subquery.state {
-                    SubqueryState::Evaluated { evaluated_at } => {
+                    SubqueryState::Evaluated { evaluated_at, .. } => {
                         eval_at = eval_at.max(*evaluated_at);
                     }
                     SubqueryState::Unevaluated { plan } => {
@@ -1013,13 +1043,27 @@ pub fn determine_where_to_eval_expr(
                             .iter()
                             .filter(|t| t.is_used());
                         for outer_ref in used_outer_refs {
-                            let Some(join_idx) = join_order
+                            let join_idx = join_order
                                 .iter()
                                 .position(|t| t.table_id == outer_ref.internal_id)
-                            else {
-                                continue;
-                            };
-                            eval_at = eval_at.max(EvalAt::Loop(join_idx));
+                                .or_else(|| {
+                                    let tables = table_references?;
+                                    for (probe_idx, member) in join_order.iter().enumerate() {
+                                        let probe_table =
+                                            &tables.joined_tables()[member.original_idx];
+                                        if let Operation::HashJoin(ref hj) = probe_table.op {
+                                            let build_table =
+                                                &tables.joined_tables()[hj.build_table_idx];
+                                            if build_table.internal_id == outer_ref.internal_id {
+                                                return Some(probe_idx);
+                                            }
+                                        }
+                                    }
+                                    None
+                                });
+                            if let Some(join_idx) = join_idx {
+                                eval_at = eval_at.max(EvalAt::Loop(join_idx));
+                            }
                         }
                         return Ok(WalkControl::Continue);
                     }

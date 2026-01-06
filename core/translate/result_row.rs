@@ -115,27 +115,69 @@ pub fn emit_result_row_and_limit(
         QueryDestination::EphemeralTable {
             cursor_id: table_cursor_id,
             table,
+            rowid_mode,
         } => {
             let record_reg = program.alloc_register();
-            if plan.result_columns.len() > 1 {
-                program.emit_insn(Insn::MakeRecord {
-                    start_reg: to_u16(result_columns_start_reg),
-                    count: to_u16(plan.result_columns.len() - 1),
-                    dest_reg: to_u16(record_reg),
-                    index_name: Some(table.name.clone()),
-                    affinity_str: None,
-                });
+            match rowid_mode {
+                super::plan::EphemeralRowidMode::FromResultColumns => {
+                    // For single-column case (RowidOnly materialization), we still need to
+                    // create a record containing the rowid so it can be read back later.
+                    // The rowid is used as both the key (for deduplication) and stored
+                    // in the record (for read-back via Column instruction).
+                    if plan.result_columns.len() == 1 {
+                        // Single column case: create a record with just the rowid value
+                        program.emit_insn(Insn::MakeRecord {
+                            start_reg: to_u16(result_columns_start_reg),
+                            count: to_u16(1),
+                            dest_reg: to_u16(record_reg),
+                            index_name: Some(table.name.clone()),
+                            affinity_str: None,
+                        });
+                    } else if plan.result_columns.len() > 1 {
+                        program.emit_insn(Insn::MakeRecord {
+                            start_reg: to_u16(result_columns_start_reg),
+                            count: to_u16(plan.result_columns.len() - 1),
+                            dest_reg: to_u16(record_reg),
+                            index_name: Some(table.name.clone()),
+                            affinity_str: None,
+                        });
+                    }
+                    program.emit_insn(Insn::Insert {
+                        cursor: *table_cursor_id,
+                        key_reg: result_columns_start_reg + (plan.result_columns.len() - 1), // Rowid reg is the last register
+                        record_reg,
+                        // since we are not doing an Insn::NewRowid or an Insn::NotExists here, we need to seek to ensure the insertion happens in the correct place.
+                        flag: InsertFlags::new()
+                            .require_seek()
+                            .is_ephemeral_table_insert(),
+                        table_name: table.name.clone(),
+                    });
+                }
+                super::plan::EphemeralRowidMode::Auto => {
+                    if !plan.result_columns.is_empty() {
+                        program.emit_insn(Insn::MakeRecord {
+                            start_reg: to_u16(result_columns_start_reg),
+                            count: to_u16(plan.result_columns.len()),
+                            dest_reg: to_u16(record_reg),
+                            index_name: Some(table.name.clone()),
+                            affinity_str: None,
+                        });
+                    }
+                    let rowid_reg = program.alloc_register();
+                    program.emit_insn(Insn::NewRowid {
+                        cursor: *table_cursor_id,
+                        rowid_reg,
+                        prev_largest_reg: 0,
+                    });
+                    program.emit_insn(Insn::Insert {
+                        cursor: *table_cursor_id,
+                        key_reg: rowid_reg,
+                        record_reg,
+                        flag: InsertFlags::new().is_ephemeral_table_insert(),
+                        table_name: table.name.clone(),
+                    });
+                }
             }
-            program.emit_insn(Insn::Insert {
-                cursor: *table_cursor_id,
-                key_reg: result_columns_start_reg + (plan.result_columns.len() - 1), // Rowid reg is the last register
-                record_reg,
-                // since we are not doing an Insn::NewRowid or an Insn::NotExists here, we need to seek to ensure the insertion happens in the correct place.
-                flag: InsertFlags::new()
-                    .require_seek()
-                    .is_ephemeral_table_insert(),
-                table_name: table.name.clone(),
-            });
         }
         QueryDestination::CoroutineYield { yield_reg, .. } => {
             program.emit_insn(Insn::Yield {

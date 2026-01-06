@@ -26,8 +26,9 @@ use crate::{
             order::{ColumnTarget, OrderTarget},
         },
         plan::{
-            ColumnUsedMask, HashJoinOp, IndexMethodQuery, NonFromClauseSubquery,
-            OuterQueryReference, QueryDestination, ResultSetColumn, Scan, SeekKeyComponent,
+            ColumnUsedMask, EphemeralRowidMode, HashJoinOp, IndexMethodQuery,
+            NonFromClauseSubquery, OuterQueryReference, QueryDestination, ResultSetColumn, Scan,
+            SeekKeyComponent,
         },
         trigger_exec::has_relevant_triggers_type_only,
     },
@@ -48,6 +49,7 @@ use super::{
         DeletePlan, GroupBy, IterationDirection, JoinOrderMember, JoinedTable, Operation, Plan,
         Search, SeekDef, SeekKey, SelectPlan, TableReferences, UpdatePlan, WhereTerm,
     },
+    planner::TableMask,
 };
 
 pub(crate) mod access_method;
@@ -329,6 +331,7 @@ fn add_ephemeral_table_to_update_plan(
         query_destination: QueryDestination::EphemeralTable {
             cursor_id: temp_cursor_id,
             table: ephemeral_table,
+            rowid_mode: EphemeralRowidMode::FromResultColumns,
         },
         join_order,
         offset: None,
@@ -771,30 +774,85 @@ fn optimize_table_access(
         best_plan.table_numbers().collect::<Vec<_>>(),
     );
 
-    // Collect hash join build table indices. These tables should NOT be in the join_order
-    // because they are fully consumed during hash table building (similar to how ephemeral
-    // index source tables work). The build table's cursor is still opened and used, but
-    // it doesn't participate in the main loop iteration structure.
-    let hash_join_build_tables: Vec<usize> = best_access_methods
-        .iter()
-        .filter_map(|&am_idx| {
-            let arena = &access_methods_arena;
-            arena.get(am_idx).and_then(|am| {
-                if let AccessMethodParams::HashJoin {
-                    build_table_idx, ..
-                } = &am.params
-                {
-                    Some(*build_table_idx)
-                } else {
-                    None
-                }
+    // Collect hash join build/probe table indices. Build tables are excluded from the main
+    // join order because they are consumed during hash build. A table may appear as both
+    // probe and build (probe->build chaining) only when the build input is materialized.
+    let (hash_join_build_tables, hash_join_probe_tables): (Vec<usize>, Vec<usize>) =
+        best_access_methods
+            .iter()
+            .filter_map(|&am_idx| {
+                let arena = &access_methods_arena;
+                arena.get(am_idx).and_then(|am| {
+                    if let AccessMethodParams::HashJoin {
+                        build_table_idx,
+                        probe_table_idx,
+                        ..
+                    } = &am.params
+                    {
+                        Some((*build_table_idx, *probe_table_idx))
+                    } else {
+                        None
+                    }
+                })
             })
-        })
+            .unzip();
+    #[cfg(debug_assertions)]
+    {
+        let mut probe_tables: HashSet<usize> = HashSet::new();
+        let mut build_tables: HashMap<usize, bool> = HashMap::new();
+        let mut pos_by_table: Vec<Option<usize>> =
+            vec![None; table_references.joined_tables().len()];
+        for (pos, table_idx) in best_table_numbers.iter().enumerate() {
+            pos_by_table[*table_idx] = Some(pos);
+        }
+
+        for &am_idx in best_access_methods.iter() {
+            let arena = &access_methods_arena;
+            let Some(am) = arena.get(am_idx) else {
+                continue;
+            };
+            if let AccessMethodParams::HashJoin {
+                build_table_idx,
+                probe_table_idx,
+                materialize_build_input,
+                ..
+            } = &am.params
+            {
+                if let (Some(build_pos), Some(probe_pos)) = (
+                    pos_by_table[*build_table_idx],
+                    pos_by_table[*probe_table_idx],
+                ) {
+                    crate::turso_assert!(
+                        probe_pos == build_pos + 1,
+                        "hash join build/probe tables are not adjacent in join order"
+                    );
+                }
+                probe_tables.insert(*probe_table_idx);
+                build_tables.insert(*build_table_idx, *materialize_build_input);
+            }
+        }
+
+        for (build_table_idx, materialize_build_input) in build_tables {
+            if probe_tables.contains(&build_table_idx) {
+                crate::turso_assert!(
+                    materialize_build_input,
+                    "probe->build chaining requires materialized build input"
+                );
+            }
+        }
+    }
+    let hash_join_build_only_tables: HashSet<usize> = hash_join_build_tables
+        .iter()
+        .copied()
+        .filter(|table_idx| !hash_join_probe_tables.contains(table_idx))
         .collect();
 
     let best_join_order: Vec<JoinOrderMember> = best_table_numbers
         .iter()
-        .filter(|table_number| !hash_join_build_tables.contains(table_number))
+        .filter(|table_number| {
+            !hash_join_build_tables.contains(table_number)
+                || hash_join_probe_tables.contains(table_number)
+        })
         .map(|&table_number| JoinOrderMember {
             table_id: table_references.joined_tables_mut()[table_number].internal_id,
             original_idx: table_number,
@@ -941,6 +999,10 @@ fn optimize_table_access(
                         .join_info
                         .as_ref()
                         .is_some_and(|join_info| join_info.outer);
+                    // Build-only hash-join tables do not have a main-loop cursor,
+                    // so leave cross-table constraints for probe-side evaluation.
+                    let defer_cross_table_constraints =
+                        hash_join_build_only_tables.contains(&table_idx);
                     for cref in constraint_refs.iter() {
                         for constraint_vec_pos in &[cref.eq, cref.lower_bound, cref.upper_bound] {
                             let Some(constraint_vec_pos) = constraint_vec_pos else {
@@ -961,6 +1023,9 @@ fn optimize_table_access(
                                 // this will cause a null row to be emitted for EVERY row of t1.
                                 // Note: in most cases like this, the LEFT JOIN could just be converted into an INNER JOIN (because e.g. t2.id=5 statically excludes any null rows),
                                 // but that optimization should not be done here - it should be done before the join order optimization happens.
+                                continue;
+                            }
+                            if defer_cross_table_constraints && !constraint.lhs_mask.is_empty() {
                                 continue;
                             }
                             where_term.consumed = true;
@@ -1030,6 +1095,8 @@ fn optimize_table_access(
                 probe_table_idx,
                 join_keys,
                 mem_budget,
+                materialize_build_input,
+                use_bloom_filter,
             } => {
                 // Mark WHERE clause terms as consumed since we're using hash join
                 for join_key in join_keys.iter() {
@@ -1042,8 +1109,69 @@ fn optimize_table_access(
                         probe_table_idx: *probe_table_idx,
                         join_keys: join_keys.clone(),
                         mem_budget: *mem_budget,
+                        materialize_build_input: *materialize_build_input,
+                        use_bloom_filter: *use_bloom_filter,
                     });
             }
+        }
+    }
+
+    let mut probe_pos_by_table: Vec<Option<usize>> =
+        vec![None; table_references.joined_tables().len()];
+    for (pos, member) in best_join_order.iter().enumerate() {
+        let table = &table_references.joined_tables()[member.original_idx];
+        if matches!(table.op, Operation::HashJoin(_)) {
+            probe_pos_by_table[member.original_idx] = Some(pos);
+        }
+    }
+
+    // If hash-join build constraints are still evaluated later (not consumed),
+    // avoid materializing the build input to reduce redundant scans.
+    for table in table_references.joined_tables_mut().iter_mut() {
+        let Operation::HashJoin(hash_join_op) = &mut table.op else {
+            continue;
+        };
+        if !hash_join_op.materialize_build_input {
+            continue;
+        }
+        let Some(probe_pos) = best_join_order
+            .iter()
+            .position(|member| member.original_idx == hash_join_op.probe_table_idx)
+        else {
+            continue;
+        };
+        let build_table_was_prior_probe = probe_pos_by_table
+            .get(hash_join_op.build_table_idx)
+            .copied()
+            .flatten()
+            .is_some_and(|pos| pos < probe_pos);
+        if build_table_was_prior_probe {
+            continue;
+        }
+        let prior_mask = TableMask::from_table_number_iter(
+            best_join_order[..probe_pos]
+                .iter()
+                .map(|member| member.original_idx),
+        );
+        let join_key_indices: HashSet<usize> = hash_join_op
+            .join_keys
+            .iter()
+            .map(|key| key.where_clause_idx)
+            .collect();
+        let build_constraints = &constraints_per_table[hash_join_op.build_table_idx];
+        let mut has_prior_constraints = false;
+        for constraint in build_constraints.constraints.iter() {
+            if !constraint.lhs_mask.intersects(&prior_mask) {
+                continue;
+            }
+            if join_key_indices.contains(&constraint.where_clause_pos.0) {
+                continue;
+            }
+            has_prior_constraints = true;
+            break;
+        }
+        if !has_prior_constraints {
+            hash_join_op.materialize_build_input = false;
         }
     }
 
