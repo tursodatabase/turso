@@ -8,7 +8,10 @@ use codspeed_criterion_compat::{
     black_box, criterion_group, criterion_main, BenchmarkId, Criterion,
 };
 use regex::Regex;
-use std::{sync::Arc, time::Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tempfile::TempDir;
 use turso_core::{Database, LimboError, PlatformIO, StepResult};
 
@@ -133,7 +136,7 @@ fn bench_alter(criterion: &mut Criterion) {
                     conn.execute("DROP TABLE y").unwrap();
                     elapsed
                 })
-                .sum()
+                .sum::<Duration>()
         });
     });
 
@@ -152,7 +155,7 @@ fn bench_alter(criterion: &mut Criterion) {
                         conn.execute("DROP TABLE y", ()).unwrap();
                         elapsed
                     })
-                    .sum()
+                    .sum::<Duration>()
             });
         });
     }
@@ -178,7 +181,7 @@ fn bench_alter(criterion: &mut Criterion) {
                     conn.execute("DROP TABLE x").unwrap();
                     elapsed
                 })
-                .sum()
+                .sum::<Duration>()
         });
     });
 
@@ -198,7 +201,7 @@ fn bench_alter(criterion: &mut Criterion) {
                         conn.execute("DROP TABLE x", ()).unwrap();
                         elapsed
                     })
-                    .sum()
+                    .sum::<Duration>()
             });
         });
     }
@@ -224,7 +227,7 @@ fn bench_alter(criterion: &mut Criterion) {
                     conn.execute("DROP TABLE x").unwrap();
                     elapsed
                 })
-                .sum()
+                .sum::<Duration>()
         });
     });
 
@@ -243,7 +246,7 @@ fn bench_alter(criterion: &mut Criterion) {
                         conn.execute("DROP TABLE x", ()).unwrap();
                         elapsed
                     })
-                    .sum()
+                    .sum::<Duration>()
             });
         });
     }
@@ -269,7 +272,7 @@ fn bench_alter(criterion: &mut Criterion) {
                     conn.execute("DROP TABLE x").unwrap();
                     elapsed
                 })
-                .sum()
+                .sum::<Duration>()
         });
     });
 
@@ -288,7 +291,7 @@ fn bench_alter(criterion: &mut Criterion) {
                         conn.execute("DROP TABLE x", ()).unwrap();
                         elapsed
                     })
-                    .sum()
+                    .sum::<Duration>()
             });
         });
     }
