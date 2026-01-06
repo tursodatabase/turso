@@ -1,9 +1,16 @@
 pub mod cli;
 pub mod rust;
 
-use crate::parser::ast::DatabaseConfig;
+use crate::{DatabaseLocation, parser::ast::DatabaseConfig};
 use async_trait::async_trait;
-use std::time::Duration;
+use std::{path::PathBuf, time::Duration};
+
+/// Provides resolved paths for default databases
+pub trait DefaultDatabaseResolver: Send + Sync {
+    /// Resolve a database location to an actual path
+    /// Returns Some(path) for Default/DefaultNoRowidAlias, None otherwise
+    fn resolve(&self, location: &DatabaseLocation) -> Option<PathBuf>;
+}
 
 /// Result from executing SQL
 #[derive(Debug, Clone)]

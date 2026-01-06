@@ -3,7 +3,7 @@
 //! This module provides functionality to generate SQLite databases populated
 //! with fake user and product data for testing purposes.
 
-use crate::backends::cli::DefaultDatabaseResolver;
+use crate::backends::DefaultDatabaseResolver;
 use crate::parser::ast::{DatabaseLocation, TestFile};
 use anyhow::{Context, Result};
 use fake::Dummy;

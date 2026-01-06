@@ -1,4 +1,5 @@
 use super::{BackendError, DatabaseInstance, QueryResult, SqlBackend};
+use crate::backends::DefaultDatabaseResolver;
 use crate::parser::ast::{DatabaseConfig, DatabaseLocation};
 use async_trait::async_trait;
 use std::path::PathBuf;
@@ -9,13 +10,6 @@ use tempfile::NamedTempFile;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::time::timeout;
-
-/// Provides resolved paths for default databases
-pub trait DefaultDatabaseResolver: Send + Sync {
-    /// Resolve a database location to an actual path
-    /// Returns Some(path) for Default/DefaultNoRowidAlias, None otherwise
-    fn resolve(&self, location: &DatabaseLocation) -> Option<PathBuf>;
-}
 
 /// CLI backend that executes SQL via the tursodb CLI tool
 pub struct CliBackend {
@@ -54,6 +48,11 @@ impl CliBackend {
 
     /// Set the default database resolver
     pub fn with_default_db_resolver(mut self, resolver: Arc<dyn DefaultDatabaseResolver>) -> Self {
+        self.default_db_resolver = Some(resolver);
+        self
+    }
+
+    pub fn set_default_db_resolver(mut self, resolver: Arc<dyn DefaultDatabaseResolver>) -> Self {
         self.default_db_resolver = Some(resolver);
         self
     }
