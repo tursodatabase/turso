@@ -20,7 +20,7 @@ use crate::vdbe::Register;
 use crate::vtab::VirtualTableCursor;
 use crate::{Completion, CompletionError, Result, IO};
 use std::borrow::{Borrow, Cow};
-use std::cell::Cell;
+use std::cell::{Cell, UnsafeCell};
 use std::fmt::{Debug, Display};
 use std::iter::{FusedIterator, Peekable};
 use std::ops::Deref;
@@ -910,6 +910,18 @@ impl<'a> TryFrom<ValueRef<'a>> for &'a str {
     }
 }
 
+/// Cached header information for O(1) column access.
+/// Stores pre-computed serial types and data offsets for each column.
+/// This avoids re-parsing the header for every column access.
+#[derive(Clone)]
+pub struct CachedHeader {
+    /// Byte offset where data section begins (after header)
+    data_start: u32,
+    /// For each column: (serial_type, cumulative_data_offset)
+    /// cumulative_data_offset is the byte offset from data_start where this column's data begins
+    columns: Vec<(u64, u32)>,
+}
+
 /// This struct serves the purpose of not allocating multiple vectors of bytes if not needed.
 /// A value in a record that has already been serialized can stay serialized and what this struct offsers
 /// is easy acces to each value which point to the payload.
@@ -921,6 +933,10 @@ pub struct ImmutableRecord {
     //
     // payload is the Vec<u8> but in order to use Register which holds ImmutableRecord as a Value - we store Vec<u8> as Value::Blob
     payload: Value,
+    /// Lazily computed header cache for O(1) column access.
+    /// Uses UnsafeCell for interior mutability without runtime borrow checking overhead.
+    /// SAFETY: ImmutableRecord is single-threaded (see Send/Sync impls above).
+    cached_header: UnsafeCell<Option<CachedHeader>>,
 }
 
 // SAFETY: all ImmutableRecord instances are intended to be used in a single thread
@@ -932,6 +948,8 @@ impl Clone for ImmutableRecord {
     fn clone(&self) -> Self {
         Self {
             payload: self.payload.clone(),
+            // Clone the cache if present - it's still valid for the cloned payload
+            cached_header: UnsafeCell::new(unsafe { (*self.cached_header.get()).clone() }),
         }
     }
 }
@@ -1052,12 +1070,14 @@ impl ImmutableRecord {
     pub fn new(payload_capacity: usize) -> Self {
         Self {
             payload: Value::Blob(Vec::with_capacity(payload_capacity)),
+            cached_header: UnsafeCell::new(None),
         }
     }
 
     pub fn from_bin_record(payload: Vec<u8>) -> Self {
         Self {
             payload: Value::Blob(payload),
+            cached_header: UnsafeCell::new(None),
         }
     }
 
@@ -1252,6 +1272,7 @@ impl ImmutableRecord {
         writer.assert_finish_capacity();
         Self {
             payload: Value::Blob(buf),
+            cached_header: UnsafeCell::new(None),
         }
     }
 
@@ -1292,6 +1313,12 @@ impl ImmutableRecord {
     #[inline]
     pub fn invalidate(&mut self) {
         self.as_blob_mut().clear();
+        // Mark the cache as invalid but keep the allocation for reuse
+        // SAFETY: We have &mut self, so exclusive access is guaranteed
+        if let Some(cache) = unsafe { &mut *self.cached_header.get() } {
+            cache.columns.clear(); // Clear but keep allocation
+            cache.data_start = 0;
+        }
     }
 
     #[inline]
@@ -1307,6 +1334,305 @@ impl ImmutableRecord {
     #[inline(always)]
     pub fn iter(&self) -> Result<ValueIterator<'_>, LimboError> {
         ValueIterator::new(self.get_payload())
+    }
+
+    /// Returns a reference to the cached header, computing it if not already cached.
+    /// The cache stores pre-computed serial types and data offsets for O(1) column access.
+    ///
+    /// SAFETY: This uses UnsafeCell for interior mutability. The caller must ensure
+    /// single-threaded access (which is guaranteed by ImmutableRecord's design).
+    #[inline]
+    pub fn get_cached_header(&self) -> Result<&CachedHeader> {
+        let cache_ptr = self.cached_header.get();
+        // SAFETY: Single-threaded access guaranteed by ImmutableRecord's design
+        let cache = unsafe { &mut *cache_ptr };
+        match cache {
+            Some(c) if !c.columns.is_empty() => {
+                // Cache is valid
+            }
+            Some(c) => {
+                // Cache exists but is invalidated - recompute reusing allocation
+                self.compute_header_cache_into(c)?;
+            }
+            None => {
+                // First time - create cache
+                *cache = Some(self.compute_header_cache()?);
+            }
+        }
+        // SAFETY: We just ensured it's Some and valid
+        Ok(unsafe { cache.as_ref().unwrap_unchecked() })
+    }
+
+    /// Computes the header cache by parsing the record header once.
+    fn compute_header_cache(&self) -> Result<CachedHeader> {
+        let payload = self.get_payload();
+        let (header_size, header_varint_len) = read_varint(payload)?;
+        let header_size = header_size as usize;
+
+        if unlikely(header_size > payload.len() || header_varint_len > payload.len()) {
+            return Err(LimboError::Corrupt(
+                "Payload too small for indicated header size".into(),
+            ));
+        }
+
+        let header = &payload[header_varint_len..header_size];
+        let data_start = header_size as u32;
+
+        let mut columns = Vec::new();
+        let mut header_pos = 0;
+        let mut data_offset: u32 = 0;
+
+        while header_pos < header.len() {
+            let (serial_type, bytes_read) = read_varint(&header[header_pos..])?;
+            header_pos += bytes_read;
+
+            columns.push((serial_type, data_offset));
+
+            // Calculate size of this column's data
+            let size = match serial_type {
+                0 => 0,                                              // NULL
+                1 => 1,                                              // I8
+                2 => 2,                                              // I16
+                3 => 3,                                              // I24
+                4 => 4,                                              // I32
+                5 => 6,                                              // I48
+                6 => 8,                                              // I64
+                7 => 8,                                              // F64
+                8 | 9 => 0,                                          // CONST_INT0, CONST_INT1
+                10 | 11 => 0,                                        // Reserved
+                n if n >= 12 && n & 1 == 0 => ((n - 12) / 2) as u32, // Blob
+                n if n >= 13 => ((n - 13) / 2) as u32,               // Text
+                _ => 0,
+            };
+            data_offset += size;
+        }
+
+        Ok(CachedHeader {
+            data_start,
+            columns,
+        })
+    }
+
+    /// Computes the header cache into an existing CachedHeader, reusing its Vec allocation.
+    fn compute_header_cache_into(&self, cache: &mut CachedHeader) -> Result<()> {
+        let payload = self.get_payload();
+        let (header_size, header_varint_len) = read_varint(payload)?;
+        let header_size = header_size as usize;
+
+        if unlikely(header_size > payload.len() || header_varint_len > payload.len()) {
+            return Err(LimboError::Corrupt(
+                "Payload too small for indicated header size".into(),
+            ));
+        }
+
+        let header = &payload[header_varint_len..header_size];
+        cache.data_start = header_size as u32;
+        cache.columns.clear(); // Keep allocation
+
+        let mut header_pos = 0;
+        let mut data_offset: u32 = 0;
+
+        while header_pos < header.len() {
+            let (serial_type, bytes_read) = read_varint(&header[header_pos..])?;
+            header_pos += bytes_read;
+
+            cache.columns.push((serial_type, data_offset));
+
+            // Calculate size of this column's data
+            let size = match serial_type {
+                0 => 0,                                              // NULL
+                1 => 1,                                              // I8
+                2 => 2,                                              // I16
+                3 => 3,                                              // I24
+                4 => 4,                                              // I32
+                5 => 6,                                              // I48
+                6 => 8,                                              // I64
+                7 => 8,                                              // F64
+                8 | 9 => 0,                                          // CONST_INT0, CONST_INT1
+                10 | 11 => 0,                                        // Reserved
+                n if n >= 12 && n & 1 == 0 => ((n - 12) / 2) as u32, // Blob
+                n if n >= 13 => ((n - 13) / 2) as u32,               // Text
+                _ => 0,
+            };
+            data_offset += size;
+        }
+
+        Ok(())
+    }
+
+    /// Reads a column value directly into a register using cached header offsets.
+    /// This provides O(1) column access after the header is cached.
+    ///
+    /// Returns `Some(Ok(()))` on success, `Some(Err(...))` on error,
+    /// or `None` if the column index is out of bounds.
+    #[inline]
+    pub fn read_column_into_register(
+        &self,
+        column: usize,
+        dest: &mut Register,
+    ) -> Option<Result<()>> {
+        let cache = match self.get_cached_header() {
+            Ok(c) => c,
+            Err(e) => {
+                mark_unlikely();
+                return Some(Err(e));
+            }
+        };
+
+        let (serial_type, data_offset) = *cache.columns.get(column)?;
+        let payload = self.get_payload();
+        let data_start = cache.data_start as usize;
+        let data = &payload[data_start + data_offset as usize..];
+
+        // Decode directly into register based on serial type
+        match serial_type {
+            // NULL
+            0 => {
+                *dest = Register::Value(Value::Null);
+            }
+            // I8
+            1 => {
+                if unlikely(data.is_empty()) {
+                    return Some(Err(LimboError::Corrupt("Data too small for I8".into())));
+                }
+                dest.set_int(data[0] as i8 as i64);
+            }
+            // I16
+            2 => {
+                if unlikely(data.len() < 2) {
+                    return Some(Err(LimboError::Corrupt("Data too small for I16".into())));
+                }
+                dest.set_int(i16::from_be_bytes([data[0], data[1]]) as i64);
+            }
+            // I24
+            3 => {
+                if unlikely(data.len() < 3) {
+                    return Some(Err(LimboError::Corrupt("Data too small for I24".into())));
+                }
+                let sign_extension = if data[0] <= 0x7F { 0 } else { 0xFF };
+                dest.set_int(
+                    i32::from_be_bytes([sign_extension, data[0], data[1], data[2]]) as i64,
+                );
+            }
+            // I32
+            4 => {
+                if unlikely(data.len() < 4) {
+                    return Some(Err(LimboError::Corrupt("Data too small for I32".into())));
+                }
+                dest.set_int(i32::from_be_bytes([data[0], data[1], data[2], data[3]]) as i64);
+            }
+            // I48
+            5 => {
+                if unlikely(data.len() < 6) {
+                    return Some(Err(LimboError::Corrupt("Data too small for I48".into())));
+                }
+                let sign_extension = if data[0] <= 0x7F { 0 } else { 0xFF };
+                dest.set_int(i64::from_be_bytes([
+                    sign_extension,
+                    sign_extension,
+                    data[0],
+                    data[1],
+                    data[2],
+                    data[3],
+                    data[4],
+                    data[5],
+                ]));
+            }
+            // I64
+            6 => {
+                if unlikely(data.len() < 8) {
+                    return Some(Err(LimboError::Corrupt("Data too small for I64".into())));
+                }
+                dest.set_int(i64::from_be_bytes([
+                    data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
+                ]));
+            }
+            // F64
+            7 => {
+                if unlikely(data.len() < 8) {
+                    return Some(Err(LimboError::Corrupt("Data too small for F64".into())));
+                }
+                let val = f64::from_be_bytes([
+                    data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
+                ]);
+                match dest {
+                    Register::Value(Value::Float(existing)) => {
+                        *existing = val;
+                    }
+                    _ => {
+                        *dest = Register::Value(Value::Float(val));
+                    }
+                }
+            }
+            // CONST_INT0
+            8 => {
+                dest.set_int(0);
+            }
+            // CONST_INT1
+            9 => {
+                dest.set_int(1);
+            }
+            // Reserved
+            10 | 11 => {
+                mark_unlikely();
+                return Some(Err(LimboError::Corrupt(format!(
+                    "Reserved serial type: {serial_type}"
+                ))));
+            }
+            // BLOB (n >= 12 && n & 1 == 0)
+            n if n >= 12 && n & 1 == 0 => {
+                let len = ((n - 12) / 2) as usize;
+                if unlikely(data.len() < len) {
+                    return Some(Err(LimboError::Corrupt("Data too small for blob".into())));
+                }
+                let blob_data = &data[..len];
+                match dest {
+                    Register::Value(Value::Blob(existing_blob)) => {
+                        existing_blob.do_extend(&blob_data);
+                    }
+                    _ => {
+                        *dest = Register::Value(Value::Blob(blob_data.to_vec()));
+                    }
+                }
+            }
+            // TEXT (n >= 13 && n & 1 == 1)
+            n if n >= 13 && n & 1 == 1 => {
+                let len = ((n - 13) / 2) as usize;
+                if unlikely(data.len() < len) {
+                    return Some(Err(LimboError::Corrupt("Data too small for text".into())));
+                }
+                let text_data = &data[..len];
+                let text_str = if cfg!(debug_assertions) {
+                    match std::str::from_utf8(text_data) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            return Some(Err(LimboError::InternalError(format!(
+                                "Invalid UTF-8 in TEXT serial type: {e}"
+                            ))));
+                        }
+                    }
+                } else {
+                    // SAFETY: TEXT serial type contains valid UTF-8
+                    unsafe { std::str::from_utf8_unchecked(text_data) }
+                };
+                match dest {
+                    Register::Value(Value::Text(existing_text)) => {
+                        existing_text.do_extend(&text_str);
+                    }
+                    _ => {
+                        *dest = Register::Value(Value::Text(Text::new(text_str.to_string())));
+                    }
+                }
+            }
+            _ => {
+                mark_unlikely();
+                return Some(Err(LimboError::Corrupt(format!(
+                    "Invalid serial type: {serial_type}"
+                ))));
+            }
+        }
+
+        Some(Ok(()))
     }
 
     #[inline]
