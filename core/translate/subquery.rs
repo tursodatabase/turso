@@ -125,7 +125,7 @@ pub fn plan_subqueries_from_select_plan(
     update_column_used_masks(
         &mut plan.table_references,
         &mut plan.non_from_clause_subqueries,
-    );
+    )?;
     Ok(())
 }
 
@@ -458,13 +458,13 @@ fn get_subquery_parser<'a>(
 fn update_column_used_masks(
     table_refs: &mut TableReferences,
     subqueries: &mut [NonFromClauseSubquery],
-) {
+) -> crate::Result<()> {
     for subquery in subqueries.iter_mut() {
         let SubqueryState::Unevaluated { plan } = &mut subquery.state else {
-            panic!("subquery has already been evaluated");
+            crate::bail_parse_error!("internal error: subquery has already been evaluated");
         };
         let Some(child_plan) = plan.as_mut() else {
-            panic!("subquery has no plan");
+            crate::bail_parse_error!("internal error: subquery has no plan");
         };
 
         for child_outer_query_ref in child_plan
@@ -485,6 +485,7 @@ fn update_column_used_masks(
             }
         }
     }
+    Ok(())
 }
 
 /// Emit the subqueries contained in the FROM clause.

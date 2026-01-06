@@ -1151,4 +1151,111 @@ do_execsql_test lateral-depth-10-chain {
         LATERAL JOIN (SELECT x8 + 1 AS result) AS t9;
 } {10}
 
+# ==============================================================================
+# Nested LATERAL tests - LATERAL inside LATERAL subqueries
+# ==============================================================================
+
+# Basic nested LATERAL: inner LATERAL references outer's bound value
+do_execsql_test lateral-nested-basic {
+    SELECT * FROM
+        (SELECT 10 AS x) AS outer_t
+        LATERAL JOIN (
+            SELECT * FROM (SELECT x AS y) AS inner1
+            LATERAL JOIN (SELECT y * 2 AS z) AS inner2
+        ) AS nested_lateral;
+} {10 10 20}
+
+# Nested LATERAL with cross-reference: inner LATERAL references both outer and sibling
+do_execsql_test lateral-nested-cross-ref {
+    SELECT * FROM
+        (SELECT 5 AS a) AS t1
+        LATERAL JOIN (
+            SELECT * FROM (SELECT a + 1 AS b) AS inner1
+            LATERAL JOIN (SELECT a + b AS c) AS inner2
+        ) AS nested;
+} {5 6 11}
+
+# Three levels of LATERAL nesting
+do_execsql_test lateral-nested-three-levels {
+    SELECT * FROM
+        (SELECT 1 AS x) AS level0
+        LATERAL JOIN (
+            SELECT * FROM (SELECT x + 10 AS y) AS level1a
+            LATERAL JOIN (
+                SELECT * FROM (SELECT y + 100 AS z) AS level2a
+                LATERAL JOIN (SELECT x + y + z AS total) AS level2b
+            ) AS level1b
+        ) AS nested;
+} {1 11 111 123}
+
+# Nested LATERAL with aggregates inside
+do_execsql_test lateral-nested-with-aggregate {
+    SELECT * FROM
+        (SELECT 3 AS n) AS outer_t
+        LATERAL JOIN (
+            SELECT * FROM (SELECT n AS val) AS inner1
+            LATERAL JOIN (SELECT val * val AS squared) AS inner2
+        ) AS nested;
+} {3 3 9}
+
+# Nested LATERAL accessing grandparent scope
+do_execsql_test lateral-nested-grandparent-ref {
+    SELECT * FROM
+        (SELECT 7 AS grandparent_val) AS gp
+        LATERAL JOIN (
+            SELECT * FROM (SELECT 2 AS parent_val) AS p
+            LATERAL JOIN (SELECT grandparent_val + parent_val AS sum_val) AS child
+        ) AS nested;
+} {7 2 9}
+
+# Multiple parallel nested LATERALs
+do_execsql_test lateral-nested-parallel {
+    SELECT a, r1, r2 FROM
+        (SELECT 4 AS a) AS t1
+        LATERAL JOIN (
+            SELECT * FROM (SELECT a * 2 AS x) AS inner1
+            LATERAL JOIN (SELECT x + 1 AS r1) AS inner2
+        ) AS nested1
+        LATERAL JOIN (
+            SELECT * FROM (SELECT a * 3 AS y) AS inner3
+            LATERAL JOIN (SELECT y + 2 AS r2) AS inner4
+        ) AS nested2;
+} {4 9 14}
+
+# Deeply nested LATERAL chain (4 levels deep)
+do_execsql_test lateral-nested-deep-chain {
+    SELECT * FROM
+        (SELECT 1 AS v1) AS t1
+        LATERAL JOIN (
+            SELECT * FROM (SELECT v1 + 1 AS v2) AS t2
+            LATERAL JOIN (
+                SELECT * FROM (SELECT v2 + 1 AS v3) AS t3
+                LATERAL JOIN (
+                    SELECT * FROM (SELECT v3 + 1 AS v4) AS t4
+                    LATERAL JOIN (SELECT v1 + v2 + v3 + v4 AS total) AS t5
+                ) AS inner3
+            ) AS inner2
+        ) AS inner1;
+} {1 2 3 4 10}
+
+# Nested LATERAL with WHERE clause filtering
+do_execsql_test lateral-nested-with-filter {
+    SELECT * FROM
+        (SELECT 5 AS threshold) AS outer_t
+        LATERAL JOIN (
+            SELECT * FROM (SELECT 3 AS val) AS inner1
+            LATERAL JOIN (SELECT val * 2 AS doubled WHERE val < threshold) AS inner2
+        ) AS nested;
+} {5 3 6}
+
+# Nested LATERAL producing no rows (filter eliminates all)
+do_execsql_test lateral-nested-empty-result {
+    SELECT * FROM
+        (SELECT 2 AS threshold) AS outer_t
+        LATERAL JOIN (
+            SELECT * FROM (SELECT 10 AS val) AS inner1
+            LATERAL JOIN (SELECT val * 2 AS doubled WHERE val < threshold) AS inner2
+        ) AS nested;
+} {}
+
 finish_test
