@@ -1038,3 +1038,82 @@ do_execsql_test timediff-julian-day {
 do_execsql_test timediff-different-time-formats {
   SELECT timediff('23:59:59', '00:00:00');
 } {"+0000-00-00 23:59:59.000"}
+
+# Edge case regression tests
+
+# Whitespace around 'now' should be rejected (SQLite compatibility)
+do_execsql_test datetime-whitespace-now-rejected {
+  SELECT datetime('  now  ');
+} {{}}
+
+do_execsql_test datetime-whitespace-now-rejected-leading {
+  SELECT datetime(' now');
+} {{}}
+
+do_execsql_test datetime-whitespace-now-rejected-trailing {
+  SELECT datetime('now ');
+} {{}}
+
+# Negative years should be parsed correctly
+do_execsql_test datetime-negative-year {
+  SELECT datetime('-0001-01-01');
+} {{-0001-01-01 00:00:00}}
+
+do_execsql_test datetime-negative-year-with-time {
+  SELECT datetime('-0001-06-15 12:30:45');
+} {{-0001-06-15 12:30:45}}
+
+do_execsql_test date-negative-year {
+  SELECT date('-0001-01-01');
+} {-0001-01-01}
+
+# Date overflow (SQLite compatibility - invalid days overflow to next month)
+do_execsql_test datetime-date-overflow-feb30 {
+  SELECT datetime('2024-02-30');
+} {{2024-03-01 00:00:00}}
+
+do_execsql_test datetime-date-overflow-feb31 {
+  SELECT datetime('2024-02-31');
+} {{2024-03-02 00:00:00}}
+
+do_execsql_test datetime-date-overflow-apr31 {
+  SELECT datetime('2024-04-31');
+} {{2024-05-01 00:00:00}}
+
+do_execsql_test datetime-date-overflow-feb29-non-leap {
+  SELECT datetime('2023-02-29');
+} {{2023-03-01 00:00:00}}
+
+do_execsql_test date-date-overflow-feb30 {
+  SELECT date('2024-02-30');
+} {2024-03-01}
+
+# Fractional modifiers
+do_execsql_test datetime-fractional-days {
+  SELECT datetime('2024-01-15', '+1.5 days');
+} {{2024-01-16 12:00:00}}
+
+do_execsql_test datetime-fractional-hours {
+  SELECT datetime('2024-01-15', '+0.5 hours');
+} {{2024-01-15 00:30:00}}
+
+do_execsql_test datetime-fractional-days-negative {
+  SELECT datetime('2024-01-15', '-2.25 days');
+} {{2024-01-12 18:00:00}}
+
+do_execsql_test datetime-fractional-minutes {
+  SELECT datetime('2024-01-15 12:00:00', '+30.5 minutes');
+} {{2024-01-15 12:30:30}}
+
+do_execsql_test datetime-fractional-seconds {
+  SELECT datetime('2024-01-15 12:00:00', '+90.5 seconds');
+} {{2024-01-15 12:01:30}}
+
+# Trailing garbage after fractional seconds should be rejected
+do_execsql_test datetime-trailing-garbage-rejected {
+  SELECT datetime('10:30:45.12abc');
+} {{}}
+
+do_execsql_test datetime-trailing-garbage-date-rejected {
+  SELECT datetime('2024-01-15 10:30:45.123xyz');
+} {{}}

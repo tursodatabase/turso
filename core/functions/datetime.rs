@@ -553,8 +553,7 @@ fn last_day_in_month(year: i32, month: u32) -> u32 {
 }
 
 fn get_date_time_from_time_value_string(value: &str) -> Option<ParsedDateTime> {
-    let value = value.trim();
-
+    // SQLite does not trim whitespace for 'now', so check before trimming
     if value.eq_ignore_ascii_case("now") {
         return Some(ParsedDateTime::new(
             chrono::Local::now().to_utc().naive_utc(),
@@ -562,10 +561,26 @@ fn get_date_time_from_time_value_string(value: &str) -> Option<ParsedDateTime> {
         ));
     }
 
+    let value = value.trim();
+
     if let Ok(julian_day) = value.parse::<f64>() {
         return get_date_time_from_time_value_float(julian_day);
     }
 
+    // Fast path: custom parser for common formats (avoids chrono overhead)
+    if let Some(dt) = parse_datetime_fast(value) {
+        // Round nanoseconds to milliseconds for SQLite compatibility
+        let nanos = dt.nanosecond();
+        let ms = (nanos + 500_000) / 1_000_000;
+        let rounded_dt = if ms >= 1000 {
+            dt.with_nanosecond(999_000_000).unwrap()
+        } else {
+            dt.with_nanosecond(ms * 1_000_000).unwrap()
+        };
+        return Some(ParsedDateTime::new(rounded_dt, false));
+    }
+
+    // Slow path: fall back to chrono for unusual formats with timezones
     if value.starts_with('+') {
         return None;
     }
@@ -591,6 +606,11 @@ fn get_date_time_from_time_value_string(value: &str) -> Option<ParsedDateTime> {
                 &format!("2000-01-01 {value}"),
                 &format!("%Y-%m-%d {format}"),
             )
+        } else if *format == "%Y-%m-%d" {
+            // Date-only format: parse as NaiveDate and add midnight time
+            NaiveDate::parse_from_str(value, format)
+                .ok()
+                .map(|d| ParsedDateTime::new(d.and_hms_opt(0, 0, 0).unwrap(), false))
         } else {
             parse_datetime_with_optional_tz(value, format)
         };
@@ -616,6 +636,257 @@ fn get_date_time_from_time_value_string(value: &str) -> Option<ParsedDateTime> {
     None
 }
 
+/// Fast path parser for common datetime formats.
+/// Avoids chrono's slow generic parser for the most common cases.
+fn parse_datetime_fast(value: &str) -> Option<NaiveDateTime> {
+    let bytes = value.as_bytes();
+    let len = bytes.len();
+
+    // Quick check: if it has timezone indicators, skip fast path
+    // (timezone strings end with Z, or have +/- followed by HH:MM)
+    if len > 0 && (bytes[len - 1] == b'Z' || has_timezone_offset(bytes)) {
+        return None;
+    }
+
+    match len {
+        // HH:MM (5 chars)
+        5 => try_parse_time_hhmm(bytes),
+        // HH:MM:SS (8 chars)
+        8 => try_parse_time_hhmmss(bytes),
+        // HH:MM:SS.f to HH:MM:SS.fffffffff (9-17 chars)
+        // Check for time pattern: colon at position 2
+        9..=17 if bytes[2] == b':' && bytes.get(8) == Some(&b'.') => {
+            try_parse_time_with_frac(bytes)
+        }
+        // YYYY-MM-DD (10 chars) - must come after time-with-frac check
+        10 => try_parse_date_only(bytes),
+        // YYYY-MM-DD HH:MM (16 chars)
+        16 => try_parse_datetime_hhmm(bytes),
+        // YYYY-MM-DD HH:MM:SS (19 chars)
+        19 => try_parse_datetime_hhmmss(bytes),
+        // YYYY-MM-DD HH:MM:SS.fff (20+ chars)
+        20..=32 if bytes.get(19) == Some(&b'.') => try_parse_datetime_with_frac(bytes),
+        _ => None,
+    }
+}
+
+#[inline(always)]
+fn has_timezone_offset(bytes: &[u8]) -> bool {
+    // Check for +HH:MM or -HH:MM pattern at the end of datetime strings
+    // Minimum string with timezone: "HH:MM+HH:MM" (11 chars)
+    // Date-only "YYYY-MM-DD" (10 chars) cannot have timezone, so len < 11 is safe
+    let len = bytes.len();
+    if len < 11 {
+        return false;
+    }
+    // Check positions where timezone offset could start (len-6 for +HH:MM, len-5 for +HHMM)
+    for &pos in &[len - 6, len - 5] {
+        let b = bytes[pos];
+        if b == b'+' || b == b'-' {
+            return true;
+        }
+    }
+    false
+}
+
+#[inline(always)]
+fn parse_2digits(bytes: &[u8]) -> Option<u32> {
+    let d1 = bytes[0].wrapping_sub(b'0');
+    let d2 = bytes[1].wrapping_sub(b'0');
+    if d1 > 9 || d2 > 9 {
+        return None;
+    }
+    Some((d1 as u32) * 10 + (d2 as u32))
+}
+
+#[inline(always)]
+fn parse_4digits(bytes: &[u8]) -> Option<u32> {
+    let d1 = bytes[0].wrapping_sub(b'0');
+    let d2 = bytes[1].wrapping_sub(b'0');
+    let d3 = bytes[2].wrapping_sub(b'0');
+    let d4 = bytes[3].wrapping_sub(b'0');
+    if d1 > 9 || d2 > 9 || d3 > 9 || d4 > 9 {
+        return None;
+    }
+    Some((d1 as u32) * 1000 + (d2 as u32) * 100 + (d3 as u32) * 10 + (d4 as u32))
+}
+
+/// Parse fractional seconds, returning nanoseconds.
+/// Returns None if there are any non-digit characters (SQLite rejects trailing garbage).
+fn parse_fractional_nanos(bytes: &[u8]) -> Option<u32> {
+    let mut nanos = 0u32;
+    let mut multiplier = 100_000_000u32;
+
+    for (i, &b) in bytes.iter().enumerate() {
+        let d = b.wrapping_sub(b'0');
+        if d > 9 {
+            // Non-digit found - reject
+            return None;
+        }
+        // Only count first 9 digits for nanosecond precision
+        if i < 9 {
+            nanos += (d as u32) * multiplier;
+            multiplier /= 10;
+        }
+    }
+    Some(nanos)
+}
+
+/// Create a NaiveDate with SQLite-compatible overflow behavior.
+/// Invalid dates like Feb 30 overflow to the next month (Mar 2).
+/// Day 0 is rejected (SQLite also rejects it).
+fn make_date_with_overflow(year: i32, month: u32, day: u32) -> Option<NaiveDate> {
+    // Validate month range
+    if !(1..=12).contains(&month) {
+        return None;
+    }
+    // Day 0 is rejected (SQLite rejects it)
+    if day == 0 {
+        return None;
+    }
+    // Try direct construction first (fast path for valid dates)
+    if let Some(date) = NaiveDate::from_ymd_opt(year, month, day) {
+        return Some(date);
+    }
+    // Day is invalid for this month - overflow to next month(s)
+    // Start from day 1 of the given month and add (day - 1) days
+    let base = NaiveDate::from_ymd_opt(year, month, 1)?;
+    base.checked_add_signed(TimeDelta::days(day as i64 - 1))
+}
+
+/// Try to parse YYYY-MM-DD
+fn try_parse_date_only(bytes: &[u8]) -> Option<NaiveDateTime> {
+    if bytes[4] != b'-' || bytes[7] != b'-' {
+        return None;
+    }
+    let year = parse_4digits(&bytes[0..4])? as i32;
+    let month = parse_2digits(&bytes[5..7])?;
+    let day = parse_2digits(&bytes[8..10])?;
+
+    let date = make_date_with_overflow(year, month, day)?;
+    Some(date.and_hms_opt(0, 0, 0).unwrap())
+}
+
+/// Try to parse YYYY-MM-DD HH:MM or YYYY-MM-DDTHH:MM
+fn try_parse_datetime_hhmm(bytes: &[u8]) -> Option<NaiveDateTime> {
+    if bytes[4] != b'-' || bytes[7] != b'-' {
+        return None;
+    }
+    let sep = bytes[10];
+    if sep != b' ' && sep != b'T' {
+        return None;
+    }
+    if bytes[13] != b':' {
+        return None;
+    }
+
+    let year = parse_4digits(&bytes[0..4])? as i32;
+    let month = parse_2digits(&bytes[5..7])?;
+    let day = parse_2digits(&bytes[8..10])?;
+    let hour = parse_2digits(&bytes[11..13])?;
+    let min = parse_2digits(&bytes[14..16])?;
+
+    let date = make_date_with_overflow(year, month, day)?;
+    let time = NaiveTime::from_hms_opt(hour, min, 0)?;
+    Some(NaiveDateTime::new(date, time))
+}
+
+/// Try to parse YYYY-MM-DD HH:MM:SS or YYYY-MM-DDTHH:MM:SS
+fn try_parse_datetime_hhmmss(bytes: &[u8]) -> Option<NaiveDateTime> {
+    if bytes[4] != b'-' || bytes[7] != b'-' {
+        return None;
+    }
+    let sep = bytes[10];
+    if sep != b' ' && sep != b'T' {
+        return None;
+    }
+    if bytes[13] != b':' || bytes[16] != b':' {
+        return None;
+    }
+
+    let year = parse_4digits(&bytes[0..4])? as i32;
+    let month = parse_2digits(&bytes[5..7])?;
+    let day = parse_2digits(&bytes[8..10])?;
+    let hour = parse_2digits(&bytes[11..13])?;
+    let min = parse_2digits(&bytes[14..16])?;
+    let sec = parse_2digits(&bytes[17..19])?;
+
+    let date = make_date_with_overflow(year, month, day)?;
+    let time = NaiveTime::from_hms_opt(hour, min, sec)?;
+    Some(NaiveDateTime::new(date, time))
+}
+
+/// Try to parse YYYY-MM-DD HH:MM:SS.fff...
+fn try_parse_datetime_with_frac(bytes: &[u8]) -> Option<NaiveDateTime> {
+    if bytes[4] != b'-' || bytes[7] != b'-' {
+        return None;
+    }
+    let sep = bytes[10];
+    if sep != b' ' && sep != b'T' {
+        return None;
+    }
+    if bytes[13] != b':' || bytes[16] != b':' || bytes[19] != b'.' {
+        return None;
+    }
+
+    let year = parse_4digits(&bytes[0..4])? as i32;
+    let month = parse_2digits(&bytes[5..7])?;
+    let day = parse_2digits(&bytes[8..10])?;
+    let hour = parse_2digits(&bytes[11..13])?;
+    let min = parse_2digits(&bytes[14..16])?;
+    let sec = parse_2digits(&bytes[17..19])?;
+    let nanos = parse_fractional_nanos(&bytes[20..])?;
+
+    let date = make_date_with_overflow(year, month, day)?;
+    let time = NaiveTime::from_hms_nano_opt(hour, min, sec, nanos)?;
+    Some(NaiveDateTime::new(date, time))
+}
+
+/// Try to parse HH:MM (time only, assumes date 2000-01-01)
+fn try_parse_time_hhmm(bytes: &[u8]) -> Option<NaiveDateTime> {
+    if bytes[2] != b':' {
+        return None;
+    }
+    let hour = parse_2digits(&bytes[0..2])?;
+    let min = parse_2digits(&bytes[3..5])?;
+    // For time-only formats, assume date 2000-01-01
+    // Ref: https://sqlite.org/lang_datefunc.html#tmval
+    let date = NaiveDate::from_ymd_opt(2000, 1, 1).expect("2000-01-01 is a valid date");
+    let time = NaiveTime::from_hms_opt(hour, min, 0)?;
+    Some(NaiveDateTime::new(date, time))
+}
+
+/// Try to parse HH:MM:SS (time only, assumes date 2000-01-01)
+fn try_parse_time_hhmmss(bytes: &[u8]) -> Option<NaiveDateTime> {
+    if bytes[2] != b':' || bytes[5] != b':' {
+        return None;
+    }
+    let hour = parse_2digits(&bytes[0..2])?;
+    let min = parse_2digits(&bytes[3..5])?;
+    let sec = parse_2digits(&bytes[6..8])?;
+    // For time-only formats, assume date 2000-01-01
+    // Ref: https://sqlite.org/lang_datefunc.html#tmval
+    let date = NaiveDate::from_ymd_opt(2000, 1, 1).expect("2000-01-01 is a valid date");
+    let time = NaiveTime::from_hms_opt(hour, min, sec)?;
+    Some(NaiveDateTime::new(date, time))
+}
+
+/// Try to parse HH:MM:SS.fff... (time only with fractional seconds)
+fn try_parse_time_with_frac(bytes: &[u8]) -> Option<NaiveDateTime> {
+    if bytes[2] != b':' || bytes[5] != b':' || bytes[8] != b'.' {
+        return None;
+    }
+    let hour = parse_2digits(&bytes[0..2])?;
+    let min = parse_2digits(&bytes[3..5])?;
+    let sec = parse_2digits(&bytes[6..8])?;
+    let nanos = parse_fractional_nanos(&bytes[9..])?;
+    // For time-only formats, assume date 2000-01-01
+    // Ref: https://sqlite.org/lang_datefunc.html#tmval
+    let date = NaiveDate::from_ymd_opt(2000, 1, 1).expect("2000-01-01 is a valid date");
+    let time = NaiveTime::from_hms_nano_opt(hour, min, sec, nanos)?;
+    Some(NaiveDateTime::new(date, time))
+}
+
 fn parse_datetime_with_optional_tz(value: &str, format: &str) -> Option<ParsedDateTime> {
     let is_invalid_suffix = |s: &str| -> bool {
         let b = s.as_bytes();
@@ -635,20 +906,30 @@ fn parse_datetime_with_optional_tz(value: &str, format: &str) -> Option<ParsedDa
         return None;
     }
 
-    // Case A: Format includes timezone specifier (e.g. %:z) -> Return UTC
-    let with_tz_format = format.to_owned() + "%:z";
-    if let Ok(dt) = DateTime::parse_from_str(value, &with_tz_format) {
-        return Some(ParsedDateTime::new(
-            dt.with_timezone(&Utc).naive_utc(),
-            true,
-        ));
-    }
+    // Check if value might have a timezone before trying expensive timezone parsing
+    let has_tz = value.ends_with('Z')
+        || value
+            .as_bytes()
+            .iter()
+            .rev()
+            .take(6)
+            .any(|&b| b == b'+' || b == b'-');
 
-    // Case B: String manually ends in 'Z' (UTC) -> Return UTC
-    if value.ends_with('Z') {
-        let value_without_tz = &value[0..value.len() - 1];
-        if let Ok(dt) = NaiveDateTime::parse_from_str(value_without_tz, format) {
-            return Some(ParsedDateTime::new(dt, true));
+    if has_tz {
+        // Case A: Format includes timezone specifier (e.g. %:z) -> Return UTC
+        let with_tz_format = format.to_owned() + "%:z";
+        if let Ok(dt) = DateTime::parse_from_str(value, &with_tz_format) {
+            return Some(ParsedDateTime::new(
+                dt.with_timezone(&Utc).naive_utc(),
+                true,
+            ));
+        }
+
+        // Case B: String manually ends in 'Z' (UTC) -> Return UTC
+        if let Some(value_without_z) = value.strip_suffix("Z") {
+            if let Ok(dt) = NaiveDateTime::parse_from_str(value_without_z, format) {
+                return Some(ParsedDateTime::new(dt, true));
+            }
         }
     }
 
@@ -1400,18 +1681,18 @@ mod tests {
             Value::build_text("2024-07-21 25:00:00"), // Invalid hour
             Value::build_text("2024-07-21 23:60:00"), // Invalid minute
             Value::build_text("2024-07-21 22:58:60"), // Invalid second
-            Value::build_text("2024-07-32"),          // Invalid day
-            Value::build_text("2024-13-01"),          // Invalid month
-            Value::build_text("invalid_date"),        // Completely invalid string
-            Value::build_text(""),                    // Empty string
-            Value::Integer(i64::MAX),                 // Large Julian day
-            Value::Integer(-1),                       // Negative Julian day
-            Value::Float(f64::MAX),                   // Large float
-            Value::Float(-1.0),                       // Negative Julian day as float
-            Value::Float(f64::NAN),                   // NaN
-            Value::Float(f64::INFINITY),              // Infinity
-            Value::Null,                              // Null value
-            Value::Blob(vec![1, 2, 3]),               // Blob (unsupported type)
+            // Note: Invalid days now overflow like SQLite (2024-07-32 -> 2024-08-01)
+            Value::build_text("2024-13-01"),   // Invalid month
+            Value::build_text("invalid_date"), // Completely invalid string
+            Value::build_text(""),             // Empty string
+            Value::Integer(i64::MAX),          // Large Julian day
+            Value::Integer(-1),                // Negative Julian day
+            Value::Float(f64::MAX),            // Large float
+            Value::Float(-1.0),                // Negative Julian day as float
+            Value::Float(f64::NAN),            // NaN
+            Value::Float(f64::INFINITY),       // Infinity
+            Value::Null,                       // Null value
+            Value::Blob(vec![1, 2, 3]),        // Blob (unsupported type)
             // Invalid timezone tests
             Value::build_text("2024-07-21T12:00:00+24:00"), // Invalid timezone offset (too large)
             Value::build_text("2024-07-21T12:00:00-24:00"), // Invalid timezone offset (too small)
@@ -1529,18 +1810,18 @@ mod tests {
             Value::build_text("2024-07-21 25:00:00"), // Invalid hour
             Value::build_text("2024-07-21 23:60:00"), // Invalid minute
             Value::build_text("2024-07-21 22:58:60"), // Invalid second
-            Value::build_text("2024-07-32"),          // Invalid day
-            Value::build_text("2024-13-01"),          // Invalid month
-            Value::build_text("invalid_date"),        // Completely invalid string
-            Value::build_text(""),                    // Empty string
-            Value::Integer(i64::MAX),                 // Large Julian day
-            Value::Integer(-1),                       // Negative Julian day
-            Value::Float(f64::MAX),                   // Large float
-            Value::Float(-1.0),                       // Negative Julian day as float
-            Value::Float(f64::NAN),                   // NaN
-            Value::Float(f64::INFINITY),              // Infinity
-            Value::Null,                              // Null value
-            Value::Blob(vec![1, 2, 3]),               // Blob (unsupported type)
+            // Note: Invalid days now overflow like SQLite (2024-07-32 -> 2024-08-01)
+            Value::build_text("2024-13-01"),   // Invalid month
+            Value::build_text("invalid_date"), // Completely invalid string
+            Value::build_text(""),             // Empty string
+            Value::Integer(i64::MAX),          // Large Julian day
+            Value::Integer(-1),                // Negative Julian day
+            Value::Float(f64::MAX),            // Large float
+            Value::Float(-1.0),                // Negative Julian day as float
+            Value::Float(f64::NAN),            // NaN
+            Value::Float(f64::INFINITY),       // Infinity
+            Value::Null,                       // Null value
+            Value::Blob(vec![1, 2, 3]),        // Blob (unsupported type)
             // Invalid timezone tests
             Value::build_text("2024-07-21T12:00:00+24:00"), // Invalid timezone offset (too large)
             Value::build_text("2024-07-21T12:00:00-24:00"), // Invalid timezone offset (too small)
@@ -2673,5 +2954,242 @@ mod tests {
             Value::Float(f) => assert!((f - 0.999).abs() < f64::EPSILON),
             _ => panic!("Expected Float result"),
         }
+    }
+
+    // Tests specifically for the fast path datetime parsing functions
+    #[test]
+    fn test_fast_path_date_only() {
+        // Valid dates - check exact values
+        assert_eq!(
+            parse_datetime_fast("2024-01-01"),
+            Some(create_datetime(2024, 1, 1, 0, 0, 0))
+        );
+        assert_eq!(
+            parse_datetime_fast("0001-01-01"),
+            Some(create_datetime(1, 1, 1, 0, 0, 0))
+        );
+        assert_eq!(
+            parse_datetime_fast("9999-12-31"),
+            Some(create_datetime(9999, 12, 31, 0, 0, 0))
+        );
+
+        // Leap year Feb 29
+        assert_eq!(
+            parse_datetime_fast("2024-02-29"),
+            Some(create_datetime(2024, 2, 29, 0, 0, 0))
+        );
+        // Non-leap year Feb 29 overflows to Mar 1 (SQLite compatibility)
+        assert_eq!(
+            parse_datetime_fast("2023-02-29"),
+            Some(create_datetime(2023, 3, 1, 0, 0, 0))
+        );
+
+        // Invalid months still rejected
+        assert_eq!(parse_datetime_fast("2024-00-01"), None); // Month 0
+        assert_eq!(parse_datetime_fast("2024-13-01"), None); // Month 13
+
+        // Invalid days overflow (SQLite compatibility)
+        assert_eq!(parse_datetime_fast("2024-01-00"), None); // Day 0 rejected (can't add -1 days)
+        assert_eq!(
+            parse_datetime_fast("2024-01-32"),
+            Some(create_datetime(2024, 2, 1, 0, 0, 0))
+        ); // Day 32 -> Feb 1
+
+        // Wrong separators
+        assert_eq!(parse_datetime_fast("2024/01/01"), None);
+        assert_eq!(parse_datetime_fast("2024.01.01"), None);
+
+        // Non-digits
+        assert_eq!(parse_datetime_fast("202X-01-01"), None);
+        assert_eq!(parse_datetime_fast("2024-0a-01"), None);
+    }
+
+    #[test]
+    fn test_fast_path_datetime_formats() {
+        // YYYY-MM-DD HH:MM (16 chars)
+        assert_eq!(
+            parse_datetime_fast("2024-01-15 10:30"),
+            Some(create_datetime(2024, 1, 15, 10, 30, 0))
+        );
+        assert_eq!(
+            parse_datetime_fast("2024-01-15T10:30"),
+            Some(create_datetime(2024, 1, 15, 10, 30, 0))
+        );
+        assert_eq!(parse_datetime_fast("2024-01-15X10:30"), None); // Bad separator
+
+        // YYYY-MM-DD HH:MM:SS (19 chars)
+        assert_eq!(
+            parse_datetime_fast("2024-01-15 10:30:45"),
+            Some(create_datetime(2024, 1, 15, 10, 30, 45))
+        );
+        assert_eq!(
+            parse_datetime_fast("2024-01-15T10:30:45"),
+            Some(create_datetime(2024, 1, 15, 10, 30, 45))
+        );
+
+        // Invalid time components
+        assert_eq!(parse_datetime_fast("2024-01-15 25:30:45"), None); // Hour > 23
+        assert_eq!(parse_datetime_fast("2024-01-15 10:60:45"), None); // Min > 59
+        assert_eq!(parse_datetime_fast("2024-01-15 10:30:60"), None); // Sec > 59
+    }
+
+    #[test]
+    fn test_fast_path_time_only() {
+        // Time-only formats use 2000-01-01 as the default date per SQLite spec
+        // HH:MM (5 chars)
+        assert_eq!(
+            parse_datetime_fast("10:30"),
+            Some(create_datetime(2000, 1, 1, 10, 30, 0))
+        );
+        assert_eq!(
+            parse_datetime_fast("00:00"),
+            Some(create_datetime(2000, 1, 1, 0, 0, 0))
+        );
+        assert_eq!(
+            parse_datetime_fast("23:59"),
+            Some(create_datetime(2000, 1, 1, 23, 59, 0))
+        );
+        assert_eq!(parse_datetime_fast("24:00"), None); // Hour 24 invalid
+        assert_eq!(parse_datetime_fast("10:60"), None); // Min 60 invalid
+
+        // HH:MM:SS (8 chars)
+        assert_eq!(
+            parse_datetime_fast("10:30:45"),
+            Some(create_datetime(2000, 1, 1, 10, 30, 45))
+        );
+        assert_eq!(
+            parse_datetime_fast("00:00:00"),
+            Some(create_datetime(2000, 1, 1, 0, 0, 0))
+        );
+        assert_eq!(
+            parse_datetime_fast("23:59:59"),
+            Some(create_datetime(2000, 1, 1, 23, 59, 59))
+        );
+
+        // HH:MM:SS.fff (time with fractional) - also uses 2000-01-01
+        let dt = parse_datetime_fast("10:30:45.123").unwrap();
+        assert_eq!(dt.year(), 2000);
+        assert_eq!(dt.month(), 1);
+        assert_eq!(dt.day(), 1);
+        assert_eq!(dt.hour(), 10);
+        assert_eq!(dt.minute(), 30);
+        assert_eq!(dt.second(), 45);
+        assert_eq!(dt.nanosecond(), 123000000);
+
+        let dt = parse_datetime_fast("10:30:45.1").unwrap();
+        assert_eq!(dt.nanosecond(), 100000000);
+    }
+
+    #[test]
+    fn test_fast_path_skips_timezone_strings() {
+        // These should return None (skip fast path) and be handled by slow path
+        assert_eq!(parse_datetime_fast("2024-01-15 10:30:45Z"), None);
+        assert_eq!(parse_datetime_fast("2024-01-15 10:30:45+02:00"), None);
+        assert_eq!(parse_datetime_fast("2024-01-15 10:30:45-05:00"), None);
+        assert_eq!(parse_datetime_fast("10:30:45+02:00"), None);
+    }
+
+    #[test]
+    fn test_fast_path_fractional_seconds_precision() {
+        // Test that fractional seconds are parsed correctly
+        let dt = parse_datetime_fast("2024-01-15 10:30:45.123456789").unwrap();
+        assert_eq!(dt.year(), 2024);
+        assert_eq!(dt.month(), 1);
+        assert_eq!(dt.day(), 15);
+        assert_eq!(dt.hour(), 10);
+        assert_eq!(dt.minute(), 30);
+        assert_eq!(dt.second(), 45);
+        assert_eq!(dt.nanosecond(), 123456789);
+
+        let dt = parse_datetime_fast("2024-01-15 10:30:45.1").unwrap();
+        assert_eq!(dt.nanosecond(), 100000000);
+
+        let dt = parse_datetime_fast("2024-01-15 10:30:45.100").unwrap();
+        assert_eq!(dt.nanosecond(), 100000000);
+
+        let dt = parse_datetime_fast("2024-01-15 10:30:45.000").unwrap();
+        assert_eq!(dt.nanosecond(), 0);
+    }
+
+    #[test]
+    fn test_fast_path_month_day_boundaries() {
+        // 30-day months
+        assert_eq!(
+            parse_datetime_fast("2024-04-30"),
+            Some(create_datetime(2024, 4, 30, 0, 0, 0))
+        );
+        // April 31 overflows to May 1 (SQLite compatibility)
+        assert_eq!(
+            parse_datetime_fast("2024-04-31"),
+            Some(create_datetime(2024, 5, 1, 0, 0, 0))
+        );
+
+        // 31-day months
+        assert_eq!(
+            parse_datetime_fast("2024-01-31"),
+            Some(create_datetime(2024, 1, 31, 0, 0, 0))
+        );
+        assert_eq!(
+            parse_datetime_fast("2024-03-31"),
+            Some(create_datetime(2024, 3, 31, 0, 0, 0))
+        );
+
+        // February
+        assert_eq!(
+            parse_datetime_fast("2024-02-29"),
+            Some(create_datetime(2024, 2, 29, 0, 0, 0))
+        ); // Leap year
+           // Non-leap year Feb 29 overflows to Mar 1 (SQLite compatibility)
+        assert_eq!(
+            parse_datetime_fast("2023-02-29"),
+            Some(create_datetime(2023, 3, 1, 0, 0, 0))
+        );
+        assert_eq!(
+            parse_datetime_fast("2024-02-28"),
+            Some(create_datetime(2024, 2, 28, 0, 0, 0))
+        );
+    }
+
+    #[test]
+    fn test_fast_path_edge_cases() {
+        // Empty and very short strings
+        assert_eq!(parse_datetime_fast(""), None);
+        assert_eq!(parse_datetime_fast("a"), None);
+        assert_eq!(parse_datetime_fast("ab"), None);
+        assert_eq!(parse_datetime_fast("abc"), None);
+        assert_eq!(parse_datetime_fast("abcd"), None);
+
+        // Year 0000 - valid in chrono's proleptic Gregorian calendar (year 0 = 1 BCE)
+        assert_eq!(
+            parse_datetime_fast("0000-01-01"),
+            Some(create_datetime(0, 1, 1, 0, 0, 0))
+        );
+
+        // Whitespace - fast path does NOT trim (by design, for speed)
+        assert_eq!(parse_datetime_fast(" 2024-01-01"), None); // Wrong length (11)
+        assert_eq!(parse_datetime_fast("2024-01-01 "), None); // Wrong length (11)
+
+        // Tab as separator (not space or T)
+        assert_eq!(parse_datetime_fast("2024-01-15\t10:30:45"), None);
+
+        // Wrong length strings that look like dates
+        assert_eq!(parse_datetime_fast("2024-1-01"), None); // 9 chars, month not padded
+        assert_eq!(parse_datetime_fast("2024-01-1"), None); // 9 chars, day not padded
+
+        // Correct length but wrong format
+        assert_eq!(parse_datetime_fast("aaaa-bb-cc"), None);
+        assert_eq!(parse_datetime_fast("2024-01-01abc"), None); // 13 chars, no match
+
+        // Negative years - fast path doesn't handle (falls through to slow path)
+        // 11 chars "-2024-01-01" doesn't match any fast path pattern
+        assert_eq!(parse_datetime_fast("-2024-01-01"), None);
+
+        // Trailing garbage after fractional seconds - rejected like SQLite
+        assert_eq!(parse_datetime_fast("10:30:45.12abc"), None);
+        assert_eq!(parse_datetime_fast("2024-01-15 10:30:45.123xyz"), None);
+
+        // But valid fractional seconds still work
+        let dt = parse_datetime_fast("10:30:45.12").unwrap();
+        assert_eq!(dt.nanosecond(), 120000000); // .12 = 120ms
     }
 }
