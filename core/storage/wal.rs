@@ -2585,7 +2585,7 @@ impl WalFile {
     /// because we might overwrite content the reader is reading from the database file.
     ///
     /// A checkpoint must never overwrite a page in the main DB file if some
-    /// active reader might still need to read that page from the WAL.  
+    /// active reader might still need to read that page from the WAL.
     /// Concretely: the checkpoint may only copy frames `<= aReadMark[k]` for
     /// every in-use reader slot `k > 0`.
     ///
