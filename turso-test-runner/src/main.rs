@@ -8,7 +8,8 @@ use std::time::Duration;
 use std::{path::PathBuf, time::Instant};
 use turso_test_runner::{
     DefaultDatabases, Format, OutputFormat, ParseError, RunnerConfig, TestRunner,
-    backends::cli::CliBackend, backends::rust::RustBackend, create_output, load_test_files, summarize, tcl_converter,
+    backends::cli::CliBackend, backends::rust::RustBackend, create_output, load_test_files,
+    summarize, tcl_converter,
 };
 
 #[derive(Parser)]
@@ -187,18 +188,13 @@ async fn run_tests(
     };
 
     // Create backend with resolver if we have generated databases
-    let backend = if let Some(ref dbs) = default_dbs {
-        CliBackend::new(&binary)
-            .with_timeout(Duration::from_secs(timeout))
-            .with_mvcc(mvcc)
-            .with_default_db_resolver(Arc::new(DefaultDatabasesResolver(
-                dbs.default_path.clone(),
-                dbs.no_rowid_alias_path.clone(),
-            )))
+    let resolver = if let Some(ref dbs) = default_dbs {
+        Some(Arc::new(DefaultDatabasesResolver(
+            dbs.default_path.clone(),
+            dbs.no_rowid_alias_path.clone(),
+        )))
     } else {
-        CliBackend::new(&binary)
-            .with_timeout(Duration::from_secs(timeout))
-            .with_mvcc(mvcc)
+        None
     };
 
     // Create runner config
@@ -214,7 +210,22 @@ async fn run_tests(
     // Run tests based on backend selection
     let results = match backend_type.as_str() {
         "cli" => {
-            let backend = CliBackend::new(&binary).with_timeout(Duration::from_secs(timeout));
+            let mut backend = if let Some(ref dbs) = default_dbs {
+                CliBackend::new(&binary)
+                    .with_timeout(Duration::from_secs(timeout))
+                    .with_mvcc(mvcc)
+                    .with_default_db_resolver(Arc::new(DefaultDatabasesResolver(
+                        dbs.default_path.clone(),
+                        dbs.no_rowid_alias_path.clone(),
+                    )))
+            } else {
+                CliBackend::new(&binary)
+                    .with_timeout(Duration::from_secs(timeout))
+                    .with_mvcc(mvcc)
+            };
+            if let Some(resolver) = resolver {
+                backend = backend.with_default_db_resolver(resolver);
+            }
             let runner = TestRunner::new(backend).with_config(config);
             runner
                 .run_loaded_tests(loaded, |result| {
@@ -224,7 +235,10 @@ async fn run_tests(
                 .await
         }
         "rust" => {
-            let backend = RustBackend::new();
+            let mut backend = RustBackend::new();
+            if let Some(resolver) = resolver {
+                backend = backend.with_default_db_resolver(resolver);
+            }
             let runner = TestRunner::new(backend).with_config(config);
             runner
                 .run_loaded_tests(loaded, |result| {

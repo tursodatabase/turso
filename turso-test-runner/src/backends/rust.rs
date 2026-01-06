@@ -1,17 +1,12 @@
 use super::{BackendError, DatabaseInstance, QueryResult, SqlBackend};
-use crate::parser::ast::{DatabaseConfig, DatabaseLocation};
+use crate::{
+    backends::DefaultDatabaseResolver,
+    parser::ast::{DatabaseConfig, DatabaseLocation},
+};
 use async_trait::async_trait;
-use std::path::PathBuf;
 use std::sync::Arc;
 use tempfile::NamedTempFile;
 use turso::{Builder, Connection, Database, Value};
-
-/// Provides resolved paths for default databases
-pub trait DefaultDatabaseResolver: Send + Sync {
-    /// Resolve a database location to an actual path
-    /// Returns Some(path) for Default/DefaultNoRowidAlias, None otherwise
-    fn resolve(&self, location: &DatabaseLocation) -> Option<PathBuf>;
-}
 
 /// Native Rust backend using Turso bindings directly
 pub struct RustBackend {
