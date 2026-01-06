@@ -3391,6 +3391,8 @@ impl Pager {
                     let res = return_if_io!(wal.checkpoint(self, mode));
                     let mut state = self.checkpoint_state.write();
                     if matches!(mode, CheckpointMode::Truncate { .. })
+                        // `everything_backfilled` will be true for successful truncate checkpoint
+                        // as it will be all zeros, and we need to fsync+possibly trunc the db file
                         && res.everything_backfilled()
                     {
                         state.phase = CheckpointPhase::TruncateDbFile {
