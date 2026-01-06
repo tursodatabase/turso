@@ -53,6 +53,9 @@ cargo bench --profile bench-profile --bench benchmark
 - Turso aims for SQLite compatibility
 - Use `EXPLAIN` to compare bytecode between SQLite and Turso when debugging
 - The `testing/all.test` file contains compatibility tests which can be run with `make test`
+- Files named `testing/*.test` can be run individually by first compiling Turso (`cargo build --bin tursodb`), then executing them with `SQLITE_EXEC=scripts/limbo-sqlite3`
+- Every functional change must be accompanied by a test, preferably a SQL test, that fails without the change, and passes when the change is applied.
+- Favour writing tests first.
 - Deterministic simulation testing using the `simulator` and `whopper` tools
 
 ## PR Guidelines
