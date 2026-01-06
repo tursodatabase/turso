@@ -3,11 +3,19 @@ use crate::parser::ast::{DatabaseConfig, DatabaseLocation};
 use async_trait::async_trait;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 use tempfile::NamedTempFile;
 use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::time::timeout;
+
+/// Provides resolved paths for default databases
+pub trait DefaultDatabaseResolver: Send + Sync {
+    /// Resolve a database location to an actual path
+    /// Returns Some(path) for Default/DefaultNoRowidAlias, None otherwise
+    fn resolve(&self, location: &DatabaseLocation) -> Option<PathBuf>;
+}
 
 /// CLI backend that executes SQL via the tursodb CLI tool
 pub struct CliBackend {
@@ -17,6 +25,8 @@ pub struct CliBackend {
     working_dir: Option<PathBuf>,
     /// Timeout for query execution
     timeout: Duration,
+    /// Resolver for default database paths
+    default_db_resolver: Option<Arc<dyn DefaultDatabaseResolver>>,
 }
 
 impl CliBackend {
@@ -26,6 +36,7 @@ impl CliBackend {
             binary_path: binary_path.into(),
             working_dir: None,
             timeout: Duration::from_secs(30),
+            default_db_resolver: None,
         }
     }
 
@@ -38,6 +49,12 @@ impl CliBackend {
     /// Set the timeout for query execution
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    /// Set the default database resolver
+    pub fn with_default_db_resolver(mut self, resolver: Arc<dyn DefaultDatabaseResolver>) -> Self {
+        self.default_db_resolver = Some(resolver);
         self
     }
 }
@@ -61,23 +78,18 @@ impl SqlBackend for CliBackend {
                 (path, Some(temp), false)
             }
             DatabaseLocation::Path(path) => (path.to_string_lossy().to_string(), None, false),
-            DatabaseLocation::Default => {
-                // Default database uses INTEGER PRIMARY KEY (rowid alias)
-                let db_path = self
-                    .working_dir
+            DatabaseLocation::Default | DatabaseLocation::DefaultNoRowidAlias => {
+                // Resolve the path using the resolver
+                let resolved = self
+                    .default_db_resolver
                     .as_ref()
-                    .map(|d| d.join("testing/database.db"))
-                    .unwrap_or_else(|| PathBuf::from("testing/database.db"));
-                (db_path.to_string_lossy().to_string(), None, false)
-            }
-            DatabaseLocation::DefaultNoRowidAlias => {
-                // No rowid alias database uses INT PRIMARY KEY
-                let db_path = self
-                    .working_dir
-                    .as_ref()
-                    .map(|d| d.join("testing/database-no-rowidalias.db"))
-                    .unwrap_or_else(|| PathBuf::from("testing/database-no-rowidalias.db"));
-                (db_path.to_string_lossy().to_string(), None, false)
+                    .and_then(|r| r.resolve(&config.location))
+                    .ok_or_else(|| {
+                        BackendError::CreateDatabase(
+                            "default database not generated - no resolver configured".to_string(),
+                        )
+                    })?;
+                (resolved.to_string_lossy().to_string(), None, false)
             }
         };
 

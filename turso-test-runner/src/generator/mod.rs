@@ -3,6 +3,8 @@
 //! This module provides functionality to generate SQLite databases populated
 //! with fake user and product data for testing purposes.
 
+use crate::backends::cli::DefaultDatabaseResolver;
+use crate::parser::ast::{DatabaseLocation, TestFile};
 use fake::Dummy;
 use fake::Fake;
 use fake::faker::address::en::{CityName, StateAbbr, StreetName, ZipCode};
@@ -12,6 +14,8 @@ use fake::faker::phone_number::en::PhoneNumber;
 use rand::Rng;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
+use std::path::PathBuf;
+use tempfile::TempDir;
 use turso::{Builder, Connection, Result as TursoResult};
 
 /// Product list for generating product data
@@ -193,7 +197,11 @@ async fn insert_products(
                 INSERT INTO products (id, name, price)
                 VALUES (?1, ?2, ?3)
                 "#,
-                [(idx + 1).to_string(), product.name, product.price.to_string()],
+                [
+                    (idx + 1).to_string(),
+                    product.name,
+                    product.price.to_string(),
+                ],
             )
             .await?;
         } else {
@@ -209,6 +217,128 @@ async fn insert_products(
     }
 
     Ok(())
+}
+
+/// Which default databases are needed for a test run
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DefaultDatabaseNeeds {
+    /// Need the default database with INTEGER PRIMARY KEY (rowid alias)
+    pub default: bool,
+    /// Need the default database with INT PRIMARY KEY (no rowid alias)
+    pub no_rowid_alias: bool,
+}
+
+impl DefaultDatabaseNeeds {
+    /// Check if any default databases are needed
+    pub fn any(&self) -> bool {
+        self.default || self.no_rowid_alias
+    }
+}
+
+/// Holds paths to generated default databases
+///
+/// The temp directory is kept alive as long as this struct exists.
+/// When dropped, the temp directory and all generated databases are cleaned up.
+pub struct DefaultDatabases {
+    /// Temp directory holding the generated databases
+    _temp_dir: TempDir,
+    /// Path to the default database (INTEGER PRIMARY KEY)
+    pub default_path: Option<PathBuf>,
+    /// Path to the no-rowid-alias database (INT PRIMARY KEY)
+    pub no_rowid_alias_path: Option<PathBuf>,
+}
+
+impl DefaultDatabases {
+    /// Scan test files to determine which default databases are needed
+    pub fn scan_needs<'a>(
+        test_files: impl IntoIterator<Item = &'a TestFile>,
+    ) -> DefaultDatabaseNeeds {
+        let mut needs = DefaultDatabaseNeeds::default();
+
+        for file in test_files {
+            for db_config in &file.databases {
+                match db_config.location {
+                    DatabaseLocation::Default => needs.default = true,
+                    DatabaseLocation::DefaultNoRowidAlias => needs.no_rowid_alias = true,
+                    _ => {}
+                }
+            }
+        }
+
+        needs
+    }
+
+    /// Generate the needed default databases
+    ///
+    /// Returns None if no default databases are needed.
+    pub async fn generate(
+        needs: DefaultDatabaseNeeds,
+        seed: u64,
+        user_count: usize,
+    ) -> Result<Option<Self>, GeneratorError> {
+        if !needs.any() {
+            return Ok(None);
+        }
+
+        let temp_dir = TempDir::new().map_err(|e| GeneratorError::TempDir(e.to_string()))?;
+
+        let mut default_path = None;
+        let mut no_rowid_alias_path = None;
+
+        if needs.default {
+            let path = temp_dir.path().join("database.db");
+            let config = GeneratorConfig {
+                db_path: path.to_string_lossy().to_string(),
+                user_count,
+                seed,
+                no_rowid_alias: false,
+            };
+            generate_database(&config)
+                .await
+                .map_err(|e| GeneratorError::Generation(e.to_string()))?;
+            default_path = Some(path);
+        }
+
+        if needs.no_rowid_alias {
+            let path = temp_dir.path().join("database-no-rowidalias.db");
+            let config = GeneratorConfig {
+                db_path: path.to_string_lossy().to_string(),
+                user_count,
+                seed,
+                no_rowid_alias: true,
+            };
+            generate_database(&config)
+                .await
+                .map_err(|e| GeneratorError::Generation(e.to_string()))?;
+            no_rowid_alias_path = Some(path);
+        }
+
+        Ok(Some(Self {
+            _temp_dir: temp_dir,
+            default_path,
+            no_rowid_alias_path,
+        }))
+    }
+}
+
+impl DefaultDatabaseResolver for DefaultDatabases {
+    fn resolve(&self, location: &DatabaseLocation) -> Option<PathBuf> {
+        match location {
+            DatabaseLocation::Default => self.default_path.clone(),
+            DatabaseLocation::DefaultNoRowidAlias => self.no_rowid_alias_path.clone(),
+            _ => None,
+        }
+    }
+}
+
+/// Errors that can occur during database generation
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum GeneratorError {
+    #[error("failed to create temp directory: {0}")]
+    TempDir(String),
+
+    #[error("failed to generate database: {0}")]
+    Generation(String),
 }
 
 #[cfg(test)]

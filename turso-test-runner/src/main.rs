@@ -7,8 +7,8 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::{path::PathBuf, time::Instant};
 use turso_test_runner::{
-    Format, OutputFormat, ParseError, RunnerConfig, TestRunner, backends::cli::CliBackend,
-    create_output, summarize, tcl_converter,
+    DefaultDatabases, Format, OutputFormat, ParseError, RunnerConfig, TestRunner,
+    backends::cli::CliBackend, create_output, load_test_files, summarize, tcl_converter,
 };
 
 #[derive(Parser)]
@@ -98,6 +98,11 @@ async fn main() -> ExitCode {
     }
 }
 
+/// Default seed for reproducible database generation
+const DEFAULT_SEED: u64 = 42;
+/// Default number of users to generate
+const DEFAULT_USER_COUNT: usize = 10000;
+
 async fn run_tests(
     paths: Vec<PathBuf>,
     binary: PathBuf,
@@ -143,8 +148,43 @@ async fn run_tests(
         }
     };
 
-    // Create backend
-    let backend = CliBackend::new(&binary).with_timeout(Duration::from_secs(timeout));
+    // Load and parse test files
+    let loaded = match load_test_files(&paths).await {
+        Ok(loaded) => loaded,
+        Err(e) => {
+            eprintln!("Error loading test files: {}", e);
+            return ExitCode::from(1);
+        }
+    };
+
+    // Check if we need to generate default databases
+    let needs = DefaultDatabases::scan_needs(loaded.test_files());
+
+    // Generate default databases if needed
+    let default_dbs = if needs.any() {
+        eprintln!("Generating default databases...");
+        match DefaultDatabases::generate(needs, DEFAULT_SEED, DEFAULT_USER_COUNT).await {
+            Ok(dbs) => dbs,
+            Err(e) => {
+                eprintln!("Error generating default databases: {}", e);
+                return ExitCode::from(1);
+            }
+        }
+    } else {
+        None
+    };
+
+    // Create backend with resolver if we have generated databases
+    let backend = if let Some(ref dbs) = default_dbs {
+        CliBackend::new(&binary)
+            .with_timeout(Duration::from_secs(timeout))
+            .with_default_db_resolver(Arc::new(DefaultDatabasesResolver(
+                dbs.default_path.clone(),
+                dbs.no_rowid_alias_path.clone(),
+            )))
+    } else {
+        CliBackend::new(&binary).with_timeout(Duration::from_secs(timeout))
+    };
 
     // Create runner config
     let mut config = RunnerConfig::default().with_max_jobs(jobs);
@@ -162,7 +202,7 @@ async fn run_tests(
 
     // Run tests with streaming output
     let results = match runner
-        .run_paths(&paths, |result| {
+        .run_loaded_tests(loaded, |result| {
             output.write_test(result);
             output.flush();
         })
@@ -185,6 +225,19 @@ async fn run_tests(
         ExitCode::SUCCESS
     } else {
         ExitCode::from(1)
+    }
+}
+
+/// Simple resolver that holds the paths directly
+struct DefaultDatabasesResolver(Option<PathBuf>, Option<PathBuf>);
+
+impl turso_test_runner::DefaultDatabaseResolver for DefaultDatabasesResolver {
+    fn resolve(&self, location: &turso_test_runner::DatabaseLocation) -> Option<PathBuf> {
+        match location {
+            turso_test_runner::DatabaseLocation::Default => self.0.clone(),
+            turso_test_runner::DatabaseLocation::DefaultNoRowidAlias => self.1.clone(),
+            _ => None,
+        }
     }
 }
 
