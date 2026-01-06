@@ -68,7 +68,11 @@ fn compute_non_commutative_join_deps(joined_tables: &[JoinedTable]) -> HashMap<u
     joined_tables
         .iter()
         .enumerate()
-        .filter(|(_, t)| t.join_info.as_ref().is_some_and(|ji| ji.outer || ji.lateral))
+        .filter(|(_, t)| {
+            t.join_info
+                .as_ref()
+                .is_some_and(|ji| ji.outer || ji.lateral)
+        })
         .map(|(j, _)| {
             let mut required = TableMask::new();
             for k in 0..j {
@@ -1069,8 +1073,12 @@ pub fn compute_greedy_join_order<'a>(
     let mut join_order: Vec<JoinOrderMember> = Vec::with_capacity(num_tables);
 
     // Pick starting table: prefer tables with high "hub score" (referenced by many constraints).
-    let first_idx =
-        find_best_starting_table(num_tables, constraints, base_table_rows, &non_commutative_deps);
+    let first_idx = find_best_starting_table(
+        num_tables,
+        constraints,
+        base_table_rows,
+        &non_commutative_deps,
+    );
     let first_table = &joined_tables[first_idx];
     join_order.push(JoinOrderMember {
         table_id: first_table.internal_id,

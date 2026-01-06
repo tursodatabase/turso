@@ -2361,9 +2361,7 @@ pub fn translate_expr(
                         reg
                     } else {
                         let Some(reg) = from_clause_subquery.result_columns_start_reg else {
-                            crate::bail_parse_error!(
-                                "unable to resolve subquery column reference"
-                            );
+                            crate::bail_parse_error!("unable to resolve subquery column reference");
                         };
                         reg
                     };
