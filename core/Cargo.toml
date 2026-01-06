@@ -35,6 +35,7 @@ encryption = []
 checksum = []
 cli_only = []
 test_helper = []
+bench = []
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = { version = "0.7.5", optional = true }
@@ -141,3 +142,8 @@ harness = false
 [[bench]]
 name = "tpc_h_benchmark"
 harness = false
+
+[[bench]]
+name = "sql_functions"
+harness = false
+required-features = ["bench"]

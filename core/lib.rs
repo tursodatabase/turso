@@ -7,6 +7,9 @@ mod error;
 mod ext;
 mod fast_lock;
 mod function;
+#[cfg(feature = "bench")]
+pub mod functions;
+#[cfg(not(feature = "bench"))]
 mod functions;
 mod incremental;
 pub mod index_method;
