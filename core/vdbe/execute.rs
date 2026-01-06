@@ -1521,9 +1521,14 @@ pub fn op_column(
                             let mut payload_iterator = record.iter()?;
 
                             // Parse the header for serial types incrementally until we have the target column
-                            match payload_iterator.nth(*column) {
-                                Some(d) => {
-                                    state.registers[*dest] = Register::Value(d?.to_owned());
+                            // Use nth_into_register to write directly to the register without
+                            // creating intermediate ValueRef allocations
+                            use crate::vdbe::ValueIteratorExt;
+                            match payload_iterator
+                                .nth_into_register(*column, &mut state.registers[*dest])
+                            {
+                                Some(result) => {
+                                    result?;
                                     break 'outer;
                                 }
                                 None => {

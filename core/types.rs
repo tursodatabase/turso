@@ -1424,6 +1424,30 @@ impl<'a> ValueIterator<'a> {
     pub fn is_empty(&self) -> bool {
         self.header_section.get().is_empty()
     }
+
+    /// Returns a reference to the current header section.
+    #[inline(always)]
+    pub fn header_section_ref(&self) -> &'a [u8] {
+        self.header_section.get()
+    }
+
+    /// Returns a reference to the current data section.
+    #[inline(always)]
+    pub fn data_section_ref(&self) -> &'a [u8] {
+        self.data_section.get()
+    }
+
+    /// Sets the header section to a new slice.
+    #[inline(always)]
+    pub fn set_header_section(&self, header: &'a [u8]) {
+        self.header_section.set(header);
+    }
+
+    /// Sets the data section to a new slice.
+    #[inline(always)]
+    pub fn set_data_section(&self, data: &'a [u8]) {
+        self.data_section.set(data);
+    }
 }
 
 impl<'a> Iterator for ValueIterator<'a> {
