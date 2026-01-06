@@ -10,7 +10,7 @@ pub use backends::cli::DefaultDatabaseResolver;
 pub use backends::{BackendError, DatabaseInstance, QueryResult, SqlBackend};
 pub use comparison::{ComparisonResult, compare};
 pub use generator::{
-    DefaultDatabaseNeeds, DefaultDatabases, GeneratorConfig, GeneratorError, generate_database,
+    DefaultDatabaseNeeds, DefaultDatabases, GeneratorConfig, generate_database,
 };
 pub use output::{Format, OutputFormat, create_output};
 pub use parser::ast::{

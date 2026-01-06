@@ -55,3 +55,6 @@ turso = { path = "../bindings/rust", default-features = false }
 
 [dev-dependencies]
 pretty_assertions = "1"
+
+[profile.dev.package.turso]
+inherits = "release"
