@@ -5,6 +5,7 @@
 
 use crate::backends::cli::DefaultDatabaseResolver;
 use crate::parser::ast::{DatabaseLocation, TestFile};
+use anyhow::{Context, Result};
 use fake::Dummy;
 use fake::Fake;
 use fake::faker::address::en::{CityName, StateAbbr, StreetName, ZipCode};
@@ -16,7 +17,7 @@ use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 use std::path::PathBuf;
 use tempfile::TempDir;
-use turso::{Builder, Connection, Result as TursoResult};
+use turso::{Builder, Connection};
 
 /// Product list for generating product data
 const PRODUCT_LIST: &[&str] = &[
@@ -98,85 +99,138 @@ impl Default for GeneratorConfig {
 }
 
 /// Generate a database with fake user and product data
-pub async fn generate_database(config: &GeneratorConfig) -> TursoResult<()> {
-    let db = Builder::new_local(&config.db_path).build().await?;
-    let conn = db.connect()?;
+pub async fn generate_database(config: &GeneratorConfig) -> Result<()> {
+    let db = Builder::new_local(&config.db_path)
+        .build()
+        .await
+        .with_context(|| format!("failed to create database at '{}'", config.db_path))?;
+
+    let conn = db
+        .connect()
+        .with_context(|| format!("failed to connect to database '{}'", config.db_path))?;
+
     let mut rng = ChaCha8Rng::seed_from_u64(config.seed);
 
-    create_tables(&conn, config.no_rowid_alias).await?;
-    insert_users(&conn, config.user_count, &mut rng).await?;
-    insert_products(&conn, config.no_rowid_alias, &mut rng).await?;
+    conn.execute("BEGIN", ())
+        .await
+        .context("failed to execute BEGIN transaction")?;
+
+    create_tables(&conn, config.no_rowid_alias)
+        .await
+        .context("failed to create tables")?;
+
+    insert_users(&conn, config.user_count, config.no_rowid_alias, &mut rng)
+        .await
+        .context("failed to insert users")?;
+
+    insert_products(&conn, config.no_rowid_alias, &mut rng)
+        .await
+        .context("failed to insert products")?;
+
+    conn.execute("COMMIT", ())
+        .await
+        .context("failed to execute COMMIT transaction")?;
 
     Ok(())
 }
 
-async fn create_tables(conn: &Connection, no_rowid_alias: bool) -> TursoResult<()> {
+async fn create_tables(conn: &Connection, no_rowid_alias: bool) -> Result<()> {
     let pk_type = if no_rowid_alias {
         "INT PRIMARY KEY"
     } else {
         "INTEGER PRIMARY KEY"
     };
 
-    conn.execute(
-        &format!(
-            r#"
-            CREATE TABLE IF NOT EXISTS users (
-                id {pk_type},
-                first_name TEXT,
-                last_name TEXT,
-                email TEXT,
-                phone_number TEXT,
-                address TEXT,
-                city TEXT,
-                state TEXT,
-                zipcode TEXT,
-                age INTEGER
-            )
-            "#
-        ),
-        (),
-    )
-    .await?;
+    let users_sql = format!(
+        r#"
+        CREATE TABLE IF NOT EXISTS users (
+            id {pk_type},
+            first_name TEXT,
+            last_name TEXT,
+            email TEXT,
+            phone_number TEXT,
+            address TEXT,
+            city TEXT,
+            state TEXT,
+            zipcode TEXT,
+            age INTEGER
+        )
+        "#
+    );
 
-    conn.execute(
-        &format!(
-            r#"
-            CREATE TABLE IF NOT EXISTS products (
-                id {pk_type},
-                name TEXT,
-                price REAL
-            )
-            "#
-        ),
-        (),
-    )
-    .await?;
+    conn.execute(&users_sql, ())
+        .await
+        .with_context(|| format!("failed to create users table: {}", users_sql.trim()))?;
+
+    let products_sql = format!(
+        r#"
+        CREATE TABLE IF NOT EXISTS products (
+            id {pk_type},
+            name TEXT,
+            price REAL
+        )
+        "#
+    );
+
+    conn.execute(&products_sql, ())
+        .await
+        .with_context(|| format!("failed to create products table: {}", products_sql.trim()))?;
 
     Ok(())
 }
 
-async fn insert_users(conn: &Connection, count: usize, rng: &mut ChaCha8Rng) -> TursoResult<()> {
-    for _ in 0..count {
+async fn insert_users(
+    conn: &Connection,
+    count: usize,
+    no_rowid_alias: bool,
+    rng: &mut ChaCha8Rng,
+) -> Result<()> {
+    for i in 0..count {
         let user: User = fake::Faker.fake_with_rng(rng);
 
-        conn.execute(
-            r#"
-            INSERT INTO users (first_name, last_name, email, phone_number, address, city, state, zipcode, age)
-            VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
-            "#,
-            [
-                user.first_name,
-                user.last_name,
-                user.email,
-                user.phone_number,
-                user.address,
-                user.city,
-                user.state,
-                user.zipcode,
-                user.age.to_string(),
-            ],
-        )
-        .await?;
+        if no_rowid_alias {
+            // For INT PRIMARY KEY, we need to explicitly provide the id
+            conn.execute(
+                r#"
+                INSERT INTO users (id, first_name, last_name, email, phone_number, address, city, state, zipcode, age)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
+                "#,
+                [
+                    (i + 1).to_string(),
+                    user.first_name,
+                    user.last_name,
+                    user.email,
+                    user.phone_number,
+                    user.address,
+                    user.city,
+                    user.state,
+                    user.zipcode,
+                    user.age.to_string(),
+                ],
+            )
+            .await
+            .with_context(|| format!("failed to insert user {} of {}", i + 1, count))?;
+        } else {
+            conn.execute(
+                r#"
+                INSERT INTO users (first_name, last_name, email, phone_number, address, city, state, zipcode, age)
+                VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                "#,
+                [
+                    user.first_name,
+                    user.last_name,
+                    user.email,
+                    user.phone_number,
+                    user.address,
+                    user.city,
+                    user.state,
+                    user.zipcode,
+                    user.age.to_string(),
+                ],
+            )
+            .await
+            .with_context(|| format!("failed to insert user {} of {}", i + 1, count))?;
+        }
     }
 
     Ok(())
@@ -186,7 +240,7 @@ async fn insert_products(
     conn: &Connection,
     no_rowid_alias: bool,
     rng: &mut ChaCha8Rng,
-) -> TursoResult<()> {
+) -> Result<()> {
     for (idx, product_name) in PRODUCT_LIST.iter().enumerate() {
         let product = Product::new(product_name, rng);
 
@@ -199,20 +253,34 @@ async fn insert_products(
                 "#,
                 [
                     (idx + 1).to_string(),
-                    product.name,
+                    product.name.clone(),
                     product.price.to_string(),
                 ],
             )
-            .await?;
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to insert product '{}' (id={}, price={})",
+                    product.name,
+                    idx + 1,
+                    product.price
+                )
+            })?;
         } else {
             conn.execute(
                 r#"
                 INSERT INTO products (name, price)
                 VALUES (?1, ?2)
                 "#,
-                [product.name, product.price.to_string()],
+                [product.name.clone(), product.price.to_string()],
             )
-            .await?;
+            .await
+            .with_context(|| {
+                format!(
+                    "failed to insert product '{}' (price={})",
+                    product.name, product.price
+                )
+            })?;
         }
     }
 
@@ -275,12 +343,12 @@ impl DefaultDatabases {
         needs: DefaultDatabaseNeeds,
         seed: u64,
         user_count: usize,
-    ) -> Result<Option<Self>, GeneratorError> {
+    ) -> Result<Option<Self>> {
         if !needs.any() {
             return Ok(None);
         }
 
-        let temp_dir = TempDir::new().map_err(|e| GeneratorError::TempDir(e.to_string()))?;
+        let temp_dir = TempDir::new().context("failed to create temp directory for databases")?;
 
         let mut default_path = None;
         let mut no_rowid_alias_path = None;
@@ -295,7 +363,7 @@ impl DefaultDatabases {
             };
             generate_database(&config)
                 .await
-                .map_err(|e| GeneratorError::Generation(e.to_string()))?;
+                .context("failed to generate default database (INTEGER PRIMARY KEY)")?;
             default_path = Some(path);
         }
 
@@ -309,7 +377,7 @@ impl DefaultDatabases {
             };
             generate_database(&config)
                 .await
-                .map_err(|e| GeneratorError::Generation(e.to_string()))?;
+                .context("failed to generate no-rowid-alias database (INT PRIMARY KEY)")?;
             no_rowid_alias_path = Some(path);
         }
 
@@ -331,37 +399,25 @@ impl DefaultDatabaseResolver for DefaultDatabases {
     }
 }
 
-/// Errors that can occur during database generation
-#[derive(Debug, Clone, thiserror::Error)]
-pub enum GeneratorError {
-    #[error("failed to create temp directory: {0}")]
-    TempDir(String),
-
-    #[error("failed to generate database: {0}")]
-    Generation(String),
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use tempfile::NamedTempFile;
 
-    #[tokio::test]
-    async fn test_generate_database() {
-        let temp_file = NamedTempFile::new().unwrap();
-        let db_path = temp_file.path().to_str().unwrap();
-
-        let config = GeneratorConfig {
+    fn new_config(db_path: &str) -> GeneratorConfig {
+        GeneratorConfig {
             db_path: db_path.to_string(),
             user_count: 10,
             seed: 42,
             no_rowid_alias: false,
-        };
+        }
+    }
 
+    async fn generate_db(config: GeneratorConfig) {
         generate_database(&config).await.unwrap();
 
         // Verify the data was inserted
-        let db = Builder::new_local(db_path).build().await.unwrap();
+        let db = Builder::new_local(&config.db_path).build().await.unwrap();
         let conn = db.connect().unwrap();
 
         // Check user count
@@ -378,5 +434,23 @@ mod tests {
         let row = rows.next().await.unwrap().unwrap();
         let count = row.get::<i64>(0).unwrap();
         assert_eq!(count, PRODUCT_LIST.len() as i64);
+    }
+
+    #[tokio::test]
+    async fn test_generate_database() {
+        let temp_file = NamedTempFile::new().unwrap();
+        let db_path = temp_file.path().to_str().unwrap();
+
+        let config = new_config(db_path);
+
+        generate_db(config).await;
+
+        let temp_file = NamedTempFile::new().unwrap();
+        let db_path = temp_file.path().to_str().unwrap();
+
+        let mut config = new_config(db_path);
+        config.no_rowid_alias = true;
+
+        generate_db(config).await;
     }
 }
