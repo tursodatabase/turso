@@ -565,25 +565,7 @@ impl Database {
             AutoVacuumMode::None
         };
 
-        // Force autovacuum to None if the experimental flag is not enabled
-        let final_mode = if !self.opts.enable_autovacuum {
-            if mode != AutoVacuumMode::None {
-                tracing::warn!(
-                        "Database has autovacuum enabled but --experimental-autovacuum flag is not set. Forcing autovacuum to None."
-                    );
-            }
-            AutoVacuumMode::None
-        } else {
-            mode
-        };
-
-        pager.set_auto_vacuum_mode(final_mode);
-
-        tracing::debug!(
-                "Opened existing database. Detected auto_vacuum_mode from header: {:?}, final mode: {:?}",
-                mode,
-                final_mode
-            );
+        pager.set_auto_vacuum_mode(mode);
 
         Ok(pager)
     }
@@ -598,6 +580,20 @@ impl Database {
 
         let mut pager = self._init()?;
         assert!(pager.wal.is_none(), "Pager should have no WAL yet");
+
+        let is_autovacuumed_db = self.io.block(|| {
+            pager.with_header(|header| {
+                header.vacuum_mode_largest_root_page.get() > 0
+                    || header.incremental_vacuum_enabled.get() > 0
+            })
+        })?;
+
+        if is_autovacuumed_db && !self.opts.enable_autovacuum {
+            tracing::warn!(
+                        "Database has autovacuum enabled but --experimental-autovacuum flag is not set. Opening in readonly mode."
+                    );
+            self.open_flags |= OpenFlags::ReadOnly;
+        }
 
         let header: HeaderRefMut = self.io.block(|| HeaderRefMut::from_pager(&pager))?;
         let header_mut = header.borrow_mut();
@@ -2768,6 +2764,56 @@ impl Iterator for QueryRunner<'_> {
             }
             Ok(None) => None,
             Err(err) => Some(Result::Err(LimboError::from(err))),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::{Database, DatabaseOpts, OpenFlags, PlatformIO};
+    use rusqlite::Connection;
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_autovacuum_readonly_behavior() {
+        // (autovacuum_mode, enable_autovacuum_flag, expected_readonly)
+        // TODO: Add encrypted case ("NONE", false, false) after fixing https://github.com/tursodatabase/turso/issues/4519
+        let test_cases = [
+            ("NONE", false, false),
+            ("NONE", true, false),
+            ("FULL", false, true),
+            ("FULL", true, false),
+            ("INCREMENTAL", false, true),
+            ("INCREMENTAL", true, false),
+        ];
+
+        for (autovacuum_mode, enable_autovacuum_flag, expected_readonly) in test_cases {
+            let temp_dir = TempDir::new().unwrap();
+            let db_path = temp_dir.path().join("test.db");
+
+            {
+                let conn = Connection::open(&db_path).unwrap();
+                conn.pragma_update(None, "auto_vacuum", autovacuum_mode)
+                    .unwrap();
+            }
+
+            let io = Arc::new(PlatformIO::new().unwrap()) as Arc<dyn crate::IO>;
+            let opts = DatabaseOpts::new().with_autovacuum(enable_autovacuum_flag);
+            let db = Database::open_file_with_flags(
+                io,
+                db_path.to_str().unwrap(),
+                OpenFlags::default(),
+                opts,
+                None,
+            )
+            .unwrap();
+
+            assert_eq!(
+                db.is_readonly(),
+                expected_readonly,
+                "autovacuum={autovacuum_mode}, flag={enable_autovacuum_flag}: expected readonly={expected_readonly}"
+            );
         }
     }
 }
