@@ -814,9 +814,27 @@ pub fn compute_best_join_order<'a>(
     let mut best_plan_memo: HashMap<TableMask, HashMap<usize, JoinN>> =
         HashMap::with_capacity(2usize.pow(num_tables as u32 - 1));
 
+    // Compute non-commutative join dependencies BEFORE the base case loop.
+    // Tables with OUTER/LATERAL join constraints cannot be valid starting points
+    // because they require predecessor tables to be joined first.
+    //
+    // Examples:
+    // "a LEFT JOIN b" can NOT be reordered as "b LEFT JOIN a".
+    // "a LATERAL JOIN (SELECT a.x)" can NOT be reordered - the LATERAL subquery depends on 'a'.
+    let non_commutative_join_deps = compute_non_commutative_join_deps(joined_tables);
+
     // Dynamic programming base case: calculate the best way to access each single table, as if
     // there were no other tables.
+    // IMPORTANT: Skip tables with non-commutative dependencies - they can only be added as RHS
+    // when their required predecessor tables are already in the LHS.
     for i in 0..num_tables {
+        // Tables with OUTER/LATERAL join constraints cannot be valid 1-table subsets.
+        // They must be added via the RHS path where the constraint check ensures
+        // all required predecessors are present.
+        if non_commutative_join_deps.contains_key(&i) {
+            continue;
+        }
+
         let mut mask = TableMask::new();
         mask.add_table(i);
         let table_ref = &joined_tables[i];
@@ -846,13 +864,6 @@ pub fn compute_best_join_order<'a>(
         }
     }
     join_order.clear();
-
-    // As mentioned, inner joins are commutative. Outer joins and LATERAL joins are NOT.
-    // Examples:
-    // "a LEFT JOIN b" can NOT be reordered as "b LEFT JOIN a".
-    // "a LATERAL JOIN (SELECT a.x)" can NOT be reordered - the LATERAL subquery depends on 'a'.
-    // If there are outer joins or LATERAL joins in the plan, ensure correct ordering.
-    let non_commutative_join_deps = compute_non_commutative_join_deps(joined_tables);
 
     // Now that we have our single-table base cases, we can start considering join subsets of 2 tables and more.
     // Try to join each single table to each other table.
@@ -1124,7 +1135,7 @@ pub fn compute_greedy_join_order<'a>(
 
         for &idx in &remaining {
             // Outer join RHS requires all preceding tables joined first
-            if let Some(required) = left_join_deps.get(&idx) {
+            if let Some(required) = non_commutative_deps.get(&idx) {
                 if !current_mask.contains_all(required) {
                     continue;
                 }
