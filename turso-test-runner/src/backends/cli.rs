@@ -61,6 +61,24 @@ impl SqlBackend for CliBackend {
                 (path, Some(temp), false)
             }
             DatabaseLocation::Path(path) => (path.to_string_lossy().to_string(), None, false),
+            DatabaseLocation::Default => {
+                // Default database uses INTEGER PRIMARY KEY (rowid alias)
+                let db_path = self
+                    .working_dir
+                    .as_ref()
+                    .map(|d| d.join("testing/database.db"))
+                    .unwrap_or_else(|| PathBuf::from("testing/database.db"));
+                (db_path.to_string_lossy().to_string(), None, false)
+            }
+            DatabaseLocation::DefaultNoRowidAlias => {
+                // No rowid alias database uses INT PRIMARY KEY
+                let db_path = self
+                    .working_dir
+                    .as_ref()
+                    .map(|d| d.join("testing/database-no-rowidalias.db"))
+                    .unwrap_or_else(|| PathBuf::from("testing/database-no-rowidalias.db"));
+                (db_path.to_string_lossy().to_string(), None, false)
+            }
         };
 
         Ok(Box::new(CliDatabaseInstance {

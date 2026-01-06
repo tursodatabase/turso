@@ -77,6 +77,9 @@ pub struct GeneratorConfig {
     pub user_count: usize,
     /// Seed for reproducible random generation
     pub seed: u64,
+    /// If true, use INT PRIMARY KEY instead of INTEGER PRIMARY KEY
+    /// This prevents the rowid alias optimization in SQLite
+    pub no_rowid_alias: bool,
 }
 
 impl Default for GeneratorConfig {
@@ -85,6 +88,7 @@ impl Default for GeneratorConfig {
             db_path: "database.db".to_string(),
             user_count: 10000,
             seed: 42,
+            no_rowid_alias: false,
         }
     }
 }
@@ -95,41 +99,51 @@ pub async fn generate_database(config: &GeneratorConfig) -> TursoResult<()> {
     let conn = db.connect()?;
     let mut rng = ChaCha8Rng::seed_from_u64(config.seed);
 
-    create_tables(&conn).await?;
+    create_tables(&conn, config.no_rowid_alias).await?;
     insert_users(&conn, config.user_count, &mut rng).await?;
-    insert_products(&conn, &mut rng).await?;
+    insert_products(&conn, config.no_rowid_alias, &mut rng).await?;
 
     Ok(())
 }
 
-async fn create_tables(conn: &Connection) -> TursoResult<()> {
+async fn create_tables(conn: &Connection, no_rowid_alias: bool) -> TursoResult<()> {
+    let pk_type = if no_rowid_alias {
+        "INT PRIMARY KEY"
+    } else {
+        "INTEGER PRIMARY KEY"
+    };
+
     conn.execute(
-        r#"
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY,
-            first_name TEXT,
-            last_name TEXT,
-            email TEXT,
-            phone_number TEXT,
-            address TEXT,
-            city TEXT,
-            state TEXT,
-            zipcode TEXT,
-            age INTEGER
-        )
-        "#,
+        &format!(
+            r#"
+            CREATE TABLE IF NOT EXISTS users (
+                id {pk_type},
+                first_name TEXT,
+                last_name TEXT,
+                email TEXT,
+                phone_number TEXT,
+                address TEXT,
+                city TEXT,
+                state TEXT,
+                zipcode TEXT,
+                age INTEGER
+            )
+            "#
+        ),
         (),
     )
     .await?;
 
     conn.execute(
-        r#"
-        CREATE TABLE IF NOT EXISTS products (
-            id INTEGER PRIMARY KEY,
-            name TEXT,
-            price REAL
-        )
-        "#,
+        &format!(
+            r#"
+            CREATE TABLE IF NOT EXISTS products (
+                id {pk_type},
+                name TEXT,
+                price REAL
+            )
+            "#
+        ),
         (),
     )
     .await?;
@@ -164,18 +178,34 @@ async fn insert_users(conn: &Connection, count: usize, rng: &mut ChaCha8Rng) -> 
     Ok(())
 }
 
-async fn insert_products(conn: &Connection, rng: &mut ChaCha8Rng) -> TursoResult<()> {
-    for product_name in PRODUCT_LIST {
+async fn insert_products(
+    conn: &Connection,
+    no_rowid_alias: bool,
+    rng: &mut ChaCha8Rng,
+) -> TursoResult<()> {
+    for (idx, product_name) in PRODUCT_LIST.iter().enumerate() {
         let product = Product::new(product_name, rng);
 
-        conn.execute(
-            r#"
-            INSERT INTO products (name, price)
-            VALUES (?1, ?2)
-            "#,
-            [product.name, product.price.to_string()],
-        )
-        .await?;
+        if no_rowid_alias {
+            // For INT PRIMARY KEY, we need to explicitly provide the id
+            conn.execute(
+                r#"
+                INSERT INTO products (id, name, price)
+                VALUES (?1, ?2, ?3)
+                "#,
+                [(idx + 1).to_string(), product.name, product.price.to_string()],
+            )
+            .await?;
+        } else {
+            conn.execute(
+                r#"
+                INSERT INTO products (name, price)
+                VALUES (?1, ?2)
+                "#,
+                [product.name, product.price.to_string()],
+            )
+            .await?;
+        }
     }
 
     Ok(())
@@ -195,6 +225,7 @@ mod tests {
             db_path: db_path.to_string(),
             user_count: 10,
             seed: 42,
+            no_rowid_alias: false,
         };
 
         generate_database(&config).await.unwrap();
