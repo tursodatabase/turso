@@ -1343,7 +1343,7 @@ impl BTreeCursor {
         index_key: &ImmutableRecord,
         cmp: SeekOp,
     ) -> Result<IOResult<()>> {
-        let key_values = index_key.get_values();
+        let key_values = index_key.get_values()?;
         let record_comparer = {
             let index_info = self
                 .index_info
@@ -1782,7 +1782,7 @@ impl BTreeCursor {
         key: &ImmutableRecord,
         seek_op: SeekOp,
     ) -> Result<IOResult<SeekResult>> {
-        let key_values = key.get_values();
+        let key_values = key.get_values()?;
         let record_comparer = {
             let index_info = self
                 .index_info
@@ -2083,7 +2083,7 @@ impl BTreeCursor {
         let record = bkey
             .get_record()
             .expect("expected record present on insert");
-        let record_values = record.get_values();
+        let record_values = record.get_values()?;
         if let CursorState::None = &self.state {
             self.state = CursorState::Write(WriteState::Start);
         }
@@ -2132,7 +2132,7 @@ impl BTreeCursor {
                                     self.get_immutable_record()
                                         .as_ref()
                                         .unwrap()
-                                        .get_values().as_slice(),
+                                        .get_values()?.as_slice(),
                                         &self.index_info.as_ref().unwrap().key_info,
                                 );
                                 if cmp == Ordering::Equal {
@@ -8693,6 +8693,7 @@ mod tests {
                 let record = record.as_ref().unwrap();
                 let cur = record
                     .get_values()
+                    .unwrap()
                     .iter()
                     .map(ValueRef::to_owned)
                     .collect::<Vec<_>>();
@@ -8941,8 +8942,7 @@ mod tests {
                 }
             };
             let record = record.as_ref().unwrap();
-            let cur = record.get_values().clone();
-            let cur = cur.first().unwrap();
+            let cur = record.get_value(0).expect("expected at least one column");
             let ValueRef::Blob(ref cur) = cur else {
                 panic!("expected blob, got {cur:?}");
             };
