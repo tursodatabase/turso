@@ -36,14 +36,17 @@ pub mod types;
 mod util;
 #[cfg(feature = "uuid")]
 mod uuid;
+#[cfg(feature = "bench")]
+pub mod vdbe;
+#[cfg(not(feature = "bench"))]
 mod vdbe;
 pub mod vector;
 mod vtab;
 
-#[cfg(feature = "fuzz")]
+#[cfg(any(feature = "fuzz", feature = "bench"))]
 pub mod numeric;
 
-#[cfg(not(feature = "fuzz"))]
+#[cfg(not(any(feature = "fuzz", feature = "bench")))]
 mod numeric;
 
 use crate::busy::{BusyHandler, BusyHandlerCallback};

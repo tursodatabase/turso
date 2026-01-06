@@ -1,4 +1,6 @@
 mod datetime;
+mod likeop;
+mod numeric;
 
 use divan::AllocProfiler;
 use mimalloc::MiMalloc;
