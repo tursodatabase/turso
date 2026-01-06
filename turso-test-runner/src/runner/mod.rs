@@ -7,6 +7,106 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::Semaphore;
 
+/// Result of loading test files
+pub struct LoadedTests {
+    /// Successfully parsed test files with their paths
+    pub files: Vec<(PathBuf, TestFile)>,
+    /// Parse/read errors as FileResults (for reporting)
+    pub errors: Vec<FileResult>,
+}
+
+impl LoadedTests {
+    /// Get just the TestFile references for scanning (e.g., for default database needs)
+    pub fn test_files(&self) -> impl Iterator<Item = &TestFile> {
+        self.files.iter().map(|(_, tf)| tf)
+    }
+}
+
+/// Load and parse test files from paths
+///
+/// This function handles:
+/// - Resolving directories (globbing for .sqltest files)
+/// - Reading and parsing each file
+/// - Collecting parse errors separately for reporting
+pub async fn load_test_files(paths: &[PathBuf]) -> Result<LoadedTests, BackendError> {
+    let mut files = Vec::new();
+    let mut errors = Vec::new();
+
+    for path in paths {
+        if path.is_dir() {
+            let pattern = path.join("**/*.sqltest");
+            let pattern_str = pattern.to_string_lossy();
+
+            for entry in glob::glob(&pattern_str)
+                .map_err(|e| BackendError::Execute(format!("invalid glob pattern: {}", e)))?
+            {
+                match entry {
+                    Ok(file_path) => {
+                        load_single_file(&file_path, &mut files, &mut errors).await;
+                    }
+                    Err(e) => {
+                        return Err(BackendError::Execute(format!("glob error: {}", e)));
+                    }
+                }
+            }
+        } else if path.is_file() {
+            load_single_file(path, &mut files, &mut errors).await;
+        }
+    }
+
+    Ok(LoadedTests { files, errors })
+}
+
+async fn load_single_file(
+    path: &PathBuf,
+    files: &mut Vec<(PathBuf, TestFile)>,
+    errors: &mut Vec<FileResult>,
+) {
+    match tokio::fs::read_to_string(path).await {
+        Ok(content) => match crate::parse(&content) {
+            Ok(test_file) => {
+                files.push((path.clone(), test_file));
+            }
+            Err(e) => {
+                errors.push(FileResult {
+                    file: path.clone(),
+                    results: vec![TestResult {
+                        name: "parse".to_string(),
+                        file: path.clone(),
+                        database: DatabaseConfig {
+                            location: crate::parser::ast::DatabaseLocation::Memory,
+                            readonly: false,
+                        },
+                        outcome: TestOutcome::Error {
+                            message: format!("parse error: {}", e),
+                        },
+                        duration: Duration::ZERO,
+                    }],
+                    duration: Duration::ZERO,
+                });
+            }
+        },
+        Err(e) => {
+            errors.push(FileResult {
+                file: path.clone(),
+                results: vec![TestResult {
+                    name: "read".to_string(),
+                    file: path.clone(),
+                    database: DatabaseConfig {
+                        location: crate::parser::ast::DatabaseLocation::Memory,
+                        readonly: false,
+                    },
+                    outcome: TestOutcome::Error {
+                        message: format!("read error: {}", e),
+                    },
+                    duration: Duration::ZERO,
+                }],
+                duration: Duration::ZERO,
+            });
+        }
+    }
+}
+
 /// Result of running a single test
 #[derive(Debug, Clone)]
 pub struct TestResult {
@@ -227,9 +327,29 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
 
     /// Run tests from multiple paths (files or directories) - all in parallel
     /// The callback is called for each test result as it completes
+    ///
+    /// This is a convenience method that loads and runs tests in one call.
+    /// For more control (e.g., to inspect files before running), use
+    /// `load_test_files` followed by `run_loaded_tests`.
     pub async fn run_paths<F>(
         &self,
         paths: &[PathBuf],
+        on_result: F,
+    ) -> Result<Vec<FileResult>, BackendError>
+    where
+        F: FnMut(&TestResult),
+    {
+        let loaded = load_test_files(paths).await?;
+        self.run_loaded_tests(loaded, on_result).await
+    }
+
+    /// Run pre-loaded test files
+    ///
+    /// Use this when you need to inspect the test files before running
+    /// (e.g., to check for default database needs).
+    pub async fn run_loaded_tests<F>(
+        &self,
+        loaded: LoadedTests,
         mut on_result: F,
     ) -> Result<Vec<FileResult>, BackendError>
     where
@@ -237,126 +357,17 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
     {
         let start = Instant::now();
 
-        // Collect all test files first
-        let mut test_files: Vec<(PathBuf, TestFile)> = Vec::new();
-        let mut parse_errors: Vec<FileResult> = Vec::new();
-
-        for path in paths {
-            if path.is_dir() {
-                let pattern = path.join("**/*.sqltest");
-                let pattern_str = pattern.to_string_lossy();
-
-                for entry in glob::glob(&pattern_str)
-                    .map_err(|e| BackendError::Execute(format!("invalid glob pattern: {}", e)))?
-                {
-                    match entry {
-                        Ok(file_path) => match std::fs::read_to_string(&file_path) {
-                            Ok(content) => match crate::parse(&content) {
-                                Ok(test_file) => {
-                                    test_files.push((file_path, test_file));
-                                }
-                                Err(e) => {
-                                    let result = TestResult {
-                                        name: "parse".to_string(),
-                                        file: file_path.clone(),
-                                        database: DatabaseConfig {
-                                            location: crate::parser::ast::DatabaseLocation::Memory,
-                                            readonly: false,
-                                        },
-                                        outcome: TestOutcome::Error {
-                                            message: format!("parse error: {}", e),
-                                        },
-                                        duration: Duration::ZERO,
-                                    };
-                                    on_result(&result);
-                                    parse_errors.push(FileResult {
-                                        file: file_path,
-                                        results: vec![result],
-                                        duration: Duration::ZERO,
-                                    });
-                                }
-                            },
-                            Err(e) => {
-                                let result = TestResult {
-                                    name: "read".to_string(),
-                                    file: file_path.clone(),
-                                    database: DatabaseConfig {
-                                        location: crate::parser::ast::DatabaseLocation::Memory,
-                                        readonly: false,
-                                    },
-                                    outcome: TestOutcome::Error {
-                                        message: format!("read error: {}", e),
-                                    },
-                                    duration: Duration::ZERO,
-                                };
-                                on_result(&result);
-                                parse_errors.push(FileResult {
-                                    file: file_path,
-                                    results: vec![result],
-                                    duration: Duration::ZERO,
-                                });
-                            }
-                        },
-                        Err(e) => {
-                            return Err(BackendError::Execute(format!("glob error: {}", e)));
-                        }
-                    }
-                }
-            } else if path.is_file() {
-                match std::fs::read_to_string(path) {
-                    Ok(content) => match crate::parse(&content) {
-                        Ok(test_file) => {
-                            test_files.push((path.clone(), test_file));
-                        }
-                        Err(e) => {
-                            let result = TestResult {
-                                name: "parse".to_string(),
-                                file: path.clone(),
-                                database: DatabaseConfig {
-                                    location: crate::parser::ast::DatabaseLocation::Memory,
-                                    readonly: false,
-                                },
-                                outcome: TestOutcome::Error {
-                                    message: format!("parse error: {}", e),
-                                },
-                                duration: Duration::ZERO,
-                            };
-                            on_result(&result);
-                            parse_errors.push(FileResult {
-                                file: path.clone(),
-                                results: vec![result],
-                                duration: Duration::ZERO,
-                            });
-                        }
-                    },
-                    Err(e) => {
-                        let result = TestResult {
-                            name: "read".to_string(),
-                            file: path.clone(),
-                            database: DatabaseConfig {
-                                location: crate::parser::ast::DatabaseLocation::Memory,
-                                readonly: false,
-                            },
-                            outcome: TestOutcome::Error {
-                                message: format!("read error: {}", e),
-                            },
-                            duration: Duration::ZERO,
-                        };
-                        on_result(&result);
-                        parse_errors.push(FileResult {
-                            file: path.clone(),
-                            results: vec![result],
-                            duration: Duration::ZERO,
-                        });
-                    }
-                }
+        // Report any parse/read errors
+        for error_result in &loaded.errors {
+            for result in &error_result.results {
+                on_result(result);
             }
         }
 
         // Spawn ALL test tasks from ALL files at once into a single FuturesUnordered
         let mut all_futures: FuturesUnordered<_> = FuturesUnordered::new();
 
-        for (path, test_file) in &test_files {
+        for (path, test_file) in &loaded.files {
             let file_futures = self.spawn_file_tests(path, test_file);
             for future in file_futures {
                 let path = path.clone();
@@ -392,7 +403,7 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
         }
 
         // Convert to FileResults
-        let mut all_results = parse_errors;
+        let mut all_results = loaded.errors;
         let total_duration = start.elapsed();
 
         for (path, results) in results_by_file {
