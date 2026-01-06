@@ -2733,6 +2733,10 @@ impl SymbolTable {
             self.index_methods.insert(name.clone(), module.clone());
         }
     }
+    // Returns an iterator over all functions
+    pub fn iter_functions(&self) -> impl Iterator<Item = &Arc<function::ExternalFunc>> {
+        self.functions.values()
+    }
 }
 
 pub struct QueryRunner<'a> {
