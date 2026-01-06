@@ -124,6 +124,7 @@ env_logger = { workspace = true }
 test-log = { version = "0.2.17", features = ["trace"] }
 sorted-vec = "0.8.6"
 mimalloc = { workspace = true, default-features = false }
+divan.workspace = true
 
 [[bench]]
 name = "benchmark"
