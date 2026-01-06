@@ -868,13 +868,15 @@ fn update_auto_vacuum_mode(
         crate::storage::pager::HeaderRefMut::from_pager(&pager)
     })?;
     
-    // Modify the header
+    // Modify the header in a tight scope
     {
         let header = header_ref.borrow_mut();
         header.vacuum_mode_largest_root_page = largest_root_page_number.into();
     }
     
     // Write the header page to disk to ensure the file is created
+    // This is necessary because SQLite's behavior is to create a DB file
+    // when any write transaction modifies an empty database
     let completion = crate::storage::sqlite3_ondisk::begin_write_btree_page(&pager, header_ref.page())?;
     pager.io.wait_for_completion(completion)?;
     
@@ -1045,6 +1047,8 @@ fn is_database_empty(schema: &Schema, pager: &Arc<Pager>) -> crate::Result<bool>
 
     match db_size_result {
         Err(_) => Ok(true),
+        // Size 0 means no pages allocated yet, size 1 means only page 1 (header) exists
+        // Both indicate an empty database with no user data
         Ok(size) => Ok(size == 0 || size == 1),
     }
 }
