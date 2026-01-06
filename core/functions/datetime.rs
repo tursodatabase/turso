@@ -553,7 +553,7 @@ fn last_day_in_month(year: i32, month: u32) -> u32 {
 }
 
 fn get_date_time_from_time_value_string(value: &str) -> Option<ParsedDateTime> {
-    // Check for 'now' BEFORE trimming - SQLite does NOT trim whitespace for 'now'
+    // SQLite does not trim whitespace for 'now', so check before trimming
     if value.eq_ignore_ascii_case("now") {
         return Some(ParsedDateTime::new(
             chrono::Local::now().to_utc().naive_utc(),
@@ -563,15 +563,13 @@ fn get_date_time_from_time_value_string(value: &str) -> Option<ParsedDateTime> {
 
     let value = value.trim();
 
-
     if let Ok(julian_day) = value.parse::<f64>() {
         return get_date_time_from_time_value_float(julian_day);
     }
 
-    // Fast path: try custom parser for common formats first (avoids chrono overhead)
-    // Fast path doesn't handle timezones, so is_utc = false (local/abstract time)
+    // Fast path: custom parser for common formats (avoids chrono overhead)
     if let Some(dt) = parse_datetime_fast(value) {
-        // Round nanoseconds to milliseconds (same as slow path)
+        // Round nanoseconds to milliseconds for SQLite compatibility
         let nanos = dt.nanosecond();
         let ms = (nanos + 500_000) / 1_000_000;
         let rounded_dt = if ms >= 1000 {
@@ -610,7 +608,6 @@ fn get_date_time_from_time_value_string(value: &str) -> Option<ParsedDateTime> {
             )
         } else if *format == "%Y-%m-%d" {
             // Date-only format: parse as NaiveDate and add midnight time
-            // No timezone info, so is_utc = false (local/abstract time)
             NaiveDate::parse_from_str(value, format)
                 .ok()
                 .map(|d| ParsedDateTime::new(d.and_hms_opt(0, 0, 0).unwrap(), false))
