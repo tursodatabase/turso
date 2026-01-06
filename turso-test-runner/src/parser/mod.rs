@@ -87,6 +87,20 @@ impl Parser {
                     readonly: false,
                 })
             }
+            Some(Token::Default) => {
+                self.advance();
+                Ok(DatabaseConfig {
+                    location: DatabaseLocation::Default,
+                    readonly: true,
+                })
+            }
+            Some(Token::DefaultNoRowidAlias) => {
+                self.advance();
+                Ok(DatabaseConfig {
+                    location: DatabaseLocation::DefaultNoRowidAlias,
+                    readonly: true,
+                })
+            }
             Some(Token::Path(path)) => {
                 let path = path.clone();
                 self.advance();
@@ -104,7 +118,7 @@ impl Parser {
                 })
             }
             Some(token) => Err(self.error(format!(
-                "expected database specifier (:memory:, :temp:, or path), got {token}"
+                "expected database specifier (:memory:, :temp:, :default:, :default-no-rowidalias:, or path), got {token}"
             ))),
             None => Err(self.error("expected database specifier, got EOF".to_string())),
         }
