@@ -926,6 +926,19 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     println!("Done. SQL statements written to {}", opts.log_file);
     println!("Database file: {db_file}");
 
+    // Switch back to WAL mode before SQLite integrity check if we were in MVCC mode.
+    // SQLite/rusqlite doesn't understand MVCC journal mode.
+    if opts.tx_mode == TxMode::Concurrent {
+        let mut builder = Builder::new_local(&db_file);
+        if let Some(ref vfs) = vfs_option {
+            builder = builder.with_io(vfs.clone());
+        }
+        let db = builder.build().await?;
+        let conn = db.connect()?;
+        conn.pragma_update("journal_mode", "WAL").await?;
+        println!("Switched journal mode back to WAL for SQLite integrity check");
+    }
+
     #[cfg(not(miri))]
     {
         println!("Running SQLite Integrity check");
