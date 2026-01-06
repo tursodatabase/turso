@@ -2244,8 +2244,10 @@ impl WalFile {
     }
 
     fn reset_internal_states(&self) {
-        self.max_frame_read_lock_index
-            .store(NO_LOCK_HELD, Ordering::Release);
+        // NOTE: Do NOT reset max_frame_read_lock_index here!
+        // The read lock must be released via end_read_tx() which both unlocks
+        // the actual lock AND sets the index to NO_LOCK_HELD. Resetting the index
+        // here without releasing the lock causes a lock leak.
         self.ongoing_checkpoint.write().reset();
         self.syncing.store(false, Ordering::Release);
     }
