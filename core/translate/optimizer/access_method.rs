@@ -436,9 +436,16 @@ pub fn try_hash_join_access_method(
         return None;
     }
     // Hash joins only support INNER JOIN semantics.
-    // Don't use hash joins for any form of OUTER JOINs
-    if build_table.join_info.as_ref().is_some_and(|ji| ji.outer)
-        || probe_table.join_info.as_ref().is_some_and(|ji| ji.outer)
+    // Don't use hash joins for any form of OUTER JOINs or LATERAL JOINs.
+    // LATERAL joins require re-execution per outer row and cannot use hash join.
+    if build_table
+        .join_info
+        .as_ref()
+        .is_some_and(|ji| ji.outer || ji.lateral)
+        || probe_table
+            .join_info
+            .as_ref()
+            .is_some_and(|ji| ji.outer || ji.lateral)
     {
         return None;
     }

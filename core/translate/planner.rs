@@ -378,6 +378,24 @@ fn parse_from_clause_table(
             let Plan::Select(subplan) = subplan_result? else {
                 crate::bail_parse_error!("Only non-compound SELECT queries are currently supported in FROM clause subqueries");
             };
+
+            // Propagate column usage from LATERAL refs back to the parent's joined tables.
+            // This ensures covering index decisions account for columns used by LATERAL subqueries.
+            if is_lateral {
+                for lateral_ref in subplan
+                    .table_references
+                    .outer_query_refs()
+                    .iter()
+                    .filter(|r| r.is_lateral_ref && r.is_used())
+                {
+                    if let Some(parent_table) = table_references
+                        .find_joined_table_by_internal_id_mut(lateral_ref.internal_id)
+                    {
+                        parent_table.col_used_mask |= &lateral_ref.col_used_mask;
+                    }
+                }
+            }
+
             let cur_table_index = table_references.joined_tables().len();
             let identifier = maybe_alias
                 .map(|a| match a {
