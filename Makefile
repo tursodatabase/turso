@@ -101,6 +101,7 @@ test-alter-column:
 	RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) ./testing/alter_column.test
 .PHONY: test-alter-column
 
+
 reset-db:
 	./scripts/clone_test_db.sh
 .PHONY: reset-db

@@ -2,9 +2,9 @@ pub mod args;
 pub mod import;
 
 use args::{
-    CwdArgs, DbConfigArgs, EchoArgs, ExitArgs, HeadersArgs, IndexesArgs, LoadExtensionArgs,
-    ManualArgs, NullValueArgs, OpcodesArgs, OpenArgs, OutputModeArgs, SchemaArgs, SetOutputArgs,
-    StatsArgs, TablesArgs, TimerArgs,
+    CwdArgs, DbConfigArgs, DbtotxtArgs, EchoArgs, ExitArgs, HeadersArgs, IndexesArgs,
+    LoadExtensionArgs, ManualArgs, NullValueArgs, OpcodesArgs, OpenArgs, OutputModeArgs,
+    SchemaArgs, SetOutputArgs, StatsArgs, TablesArgs, TimerArgs,
 };
 use clap::Parser;
 use import::ImportArgs;
@@ -97,6 +97,8 @@ pub enum Command {
     /// Display manual pages for features
     #[command(name = "manual", display_name = ".manual", alias = "man")]
     Manual(ManualArgs),
+    #[command(name = "dbtotxt", display_name = ".dbtotxt")]
+    Dbtotxt(DbtotxtArgs),
 }
 
 const _HELP_TEMPLATE: &str = "{before-help}{name}

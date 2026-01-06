@@ -380,6 +380,37 @@ def test_tables_with_attached_db():
     shell.quit()
 
 
+def test_dbtotxt():
+    shell = TestTursoShell(init_commands="")
+    shell.run_test(
+        "dbtotxt-empty",
+        ".dbtotxt",
+        "| size 0 pagesize 4096 filename :memory:\n| end :memory:",
+    )
+    shell.quit()
+
+    shell = TestTursoShell(init_commands="")
+    shell.execute_dot("CREATE TABLE t(x);")
+    expected = (
+        "| size 8192 pagesize 4096 filename :memory:\n"
+        "| page 1 offset 0\n"
+        "|      0: 53 51 4c 69 74 65 20 66 6f 72 6d 61 74 20 33 00   SQLite format 3.\n"
+        "|     16: 10 00 02 02 00 40 20 20 00 00 00 01 00 00 00 02   .....@  ........\n"
+        "|     32: 00 00 00 00 00 00 00 00 00 00 00 01 00 00 00 04   ................\n"
+        "|     48: ff ff f8 30 00 00 00 00 00 00 00 01 00 00 00 00   ...0............\n"
+        "|     80: 00 00 00 00 00 00 00 00 00 00 00 00 00 2e 7e 58   ..............~X\n"
+        "|     96: 00 2e 7e 58 0d 00 00 00 01 0f de 00 0f de 00 00   ..~X............\n"
+        "|   4048: 00 00 00 00 00 00 00 00 00 00 00 00 00 00 20 01   .............. .\n"
+        "|   4064: 06 17 0f 0f 01 31 74 61 62 6c 65 74 74 02 43 52   .....1tablett.CR\n"
+        "|   4080: 45 41 54 45 20 54 41 42 4c 45 20 74 20 28 78 29   EATE TABLE t (x)\n"
+        "| page 2 offset 4096\n"
+        "|      0: 0d 00 00 00 00 10 00 00 00 00 00 00 00 00 00 00   ................\n"
+        "| end :memory:"
+    )
+    shell.run_test("dbtotxt-with-table", ".dbtotxt", expected)
+    shell.quit()
+
+
 def main():
     console.info("Running all turso CLI tests...")
     test_basic_queries()
@@ -405,6 +436,7 @@ def main():
     test_copy_memory_db_to_file()
     test_parse_error()
     test_tables_with_attached_db()
+    test_dbtotxt()
     console.info("All tests have passed")
 
 

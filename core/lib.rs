@@ -113,6 +113,9 @@ pub use vdbe::{
     FromValueRow, Register,
 };
 
+#[cfg(feature = "cli_only")]
+pub mod dbpage;
+
 /// Configuration for database features
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DatabaseOpts {
