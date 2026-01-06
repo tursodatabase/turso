@@ -1149,7 +1149,7 @@ impl ProgramBuilder {
     /// without going through the depth check.
     #[inline]
     #[deprecated(
-        since = "0.4.0",
+        since = "0.4.1",
         note = "Use try_incr_nesting() instead to enforce depth limits"
     )]
     pub fn incr_nesting(&mut self) {
