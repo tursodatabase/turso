@@ -1,5 +1,5 @@
-@database database/testing.db readonly
-@database database/testing_norowidalias.db readonly
+@database :default:
+@database :default-no-rowidalias:
 
 # Test attach reserved name - main (should fail)
 test attach-reserved-main {
