@@ -940,7 +940,7 @@ enum CommitState {
 }
 
 #[derive(Debug, Default)]
-struct CheckpointState {
+pub struct WalCheckpointState {
     phase: CheckpointPhase,
     /// The checkpoint result, set after WAL checkpoint completes
     result: Option<CheckpointResult>,
@@ -1133,8 +1133,8 @@ pub struct Pager {
     subjournal: RwLock<Option<Subjournal>>,
     savepoints: Arc<RwLock<Vec<Savepoint>>>,
     commit_info: RwLock<CommitInfo>,
-    checkpoint_state: RwLock<CheckpointState>,
     syncing: Arc<AtomicBool>,
+    checkpointing: Arc<AtomicBool>,
     auto_vacuum_mode: AtomicU8,
     /// Mutex for synchronizing database initialization to prevent race conditions
     init_lock: Arc<Mutex<()>>,
@@ -1321,8 +1321,8 @@ impl Pager {
                 page_sources: Vec::new(),
                 page_source_cursor: 0,
             }),
+            checkpointing: Arc::new(AtomicBool::new(false)),
             syncing: Arc::new(AtomicBool::new(false)),
-            checkpoint_state: RwLock::new(CheckpointState::default()),
             buffer_pool,
             auto_vacuum_mode: AtomicU8::new(AutoVacuumMode::None.into()),
             init_lock,
@@ -2180,6 +2180,7 @@ impl Pager {
         };
         tracing::trace!("commit_tx(schema_did_change={})", schema_did_change);
         let commit_status = return_if_io!(self.commit_dirty_pages(
+            &connection.checkpoint_state,
             connection.is_wal_auto_checkpoint_disabled(),
             connection.get_sync_mode(),
             connection.get_data_sync_retry()
@@ -2931,6 +2932,7 @@ impl Pager {
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn commit_dirty_pages(
         &self,
+        conn_checkpoint_state: &RwLock<WalCheckpointState>,
         wal_auto_checkpoint_disabled: bool,
         sync_mode: SyncMode,
         data_sync_retry: bool,
@@ -2948,6 +2950,7 @@ impl Pager {
         }
 
         match self.commit_dirty_pages_inner(
+            conn_checkpoint_state,
             wal_auto_checkpoint_disabled,
             sync_mode,
             data_sync_retry,
@@ -2963,6 +2966,7 @@ impl Pager {
     #[instrument(skip_all, level = Level::DEBUG)]
     fn commit_dirty_pages_inner(
         &self,
+        conn_checkpoint_state: &RwLock<WalCheckpointState>,
         wal_auto_checkpoint_disabled: bool,
         sync_mode: SyncMode,
         data_sync_retry: bool,
@@ -3205,19 +3209,23 @@ impl Pager {
                     let checkpoint_mode = CheckpointMode::Passive {
                         upper_bound_inclusive: None,
                     };
-                    match self.checkpoint(checkpoint_mode, sync_mode, false) {
+                    self.checkpointing.store(true, Ordering::Release);
+                    match self.checkpoint(conn_checkpoint_state, checkpoint_mode, sync_mode, false)
+                    {
                         Err(LimboError::Busy) => {
                             tracing::debug!("Auto-checkpoint skipped: busy");
                             return Ok(IOResult::Done(PagerCommitResult::WalWritten));
                         }
                         Err(e) => {
                             tracing::error!("Auto-checkpoint failed: {}", e);
+                            self.checkpointing.store(false, Ordering::Release);
                             return Err(LimboError::CheckpointFailed(e.to_string()));
                         }
                         Ok(IOResult::IO(IOCompletions::Single(c))) => {
                             io_yield_one!(c);
                         }
                         Ok(IOResult::Done(res)) => {
+                            self.checkpointing.store(false, Ordering::Release);
                             return Ok(IOResult::Done(PagerCommitResult::Checkpointed(res)));
                         }
                     }
@@ -3332,13 +3340,11 @@ impl Pager {
     }
 
     pub fn is_checkpointing(&self) -> bool {
-        self.checkpoint_state.read().phase != CheckpointPhase::NotCheckpointing
+        self.checkpointing.load(Ordering::Acquire)
     }
 
     fn reset_checkpoint_state(&self) {
-        let mut state = self.checkpoint_state.write();
-        state.phase = CheckpointPhase::NotCheckpointing;
-        state.result = None;
+        self.checkpointing.store(false, Ordering::Release);
         self.commit_info.write().state = CommitState::PrepareWal;
     }
 
@@ -3355,12 +3361,15 @@ impl Pager {
 
     #[instrument(skip_all, level = Level::DEBUG, name = "pager_checkpoint",)]
     /// Checkpoint the WAL to the database file (if needed).
+    /// Each connection stores their own checkpoint state to prevent races.
     /// Args:
+    /// - conn_state: The checkpoint state for the connection performing the checkpoint.
     /// - mode: The checkpoint mode to use (PASSIVE, FULL, RESTART, TRUNCATE)
     /// - sync_mode: The fsync mode to use (OFF, NORMAL, FULL)
     /// - clear_page_cache: Whether to clear the page cache after checkpointing
     pub fn checkpoint(
         &self,
+        conn_state: &RwLock<WalCheckpointState>,
         mode: CheckpointMode,
         sync_mode: crate::SyncMode,
         clear_page_cache: bool,
@@ -3374,10 +3383,11 @@ impl Pager {
             // Clone the phase to check what state we're in, but keep result in place
             // This is important because we need to be careful not to e.g. clone and drop the checkpoint result which
             // causes a drop of CheckpointLocks prematurely and results in a panic.
-            let phase = self.checkpoint_state.read().phase.clone();
+            let mut state = conn_state.write();
+            let phase = state.phase.clone();
             match phase {
                 CheckpointPhase::NotCheckpointing => {
-                    self.checkpoint_state.write().phase = CheckpointPhase::Checkpoint {
+                    state.phase = CheckpointPhase::Checkpoint {
                         mode,
                         sync_mode,
                         clear_page_cache,
@@ -3389,7 +3399,6 @@ impl Pager {
                     clear_page_cache,
                 } => {
                     let res = return_if_io!(wal.checkpoint(self, mode));
-                    let mut state = self.checkpoint_state.write();
                     if matches!(mode, CheckpointMode::Truncate { .. })
                         // `everything_backfilled` will be true for successful truncate checkpoint
                         // as it will be all zeros, and we need to fsync+possibly trunc the db file
@@ -3411,14 +3420,12 @@ impl Pager {
                     clear_page_cache,
                 } => {
                     let should_skip_truncate = {
-                        let state = self.checkpoint_state.read();
                         let result = state.result.as_ref().expect("result should be set");
                         // Skip if we already sent truncate
                         result.db_truncate_sent
                     };
 
                     if should_skip_truncate {
-                        let mut state = self.checkpoint_state.write();
                         if sync_mode == crate::SyncMode::Off {
                             state.phase = CheckpointPhase::Finalize { clear_page_cache };
                         } else {
@@ -3434,7 +3441,6 @@ impl Pager {
                     let expected = (db_size * page_size.get()) as u64;
                     if expected >= self.db_file.size()? {
                         // No truncation needed, move to next phase
-                        let mut state = self.checkpoint_state.write();
                         if sync_mode == crate::SyncMode::Off {
                             state.phase = CheckpointPhase::Finalize { clear_page_cache };
                         } else {
@@ -3451,8 +3457,7 @@ impl Pager {
                             );
                         }),
                     )?;
-                    self.checkpoint_state
-                        .write()
+                    state
                         .result
                         .as_mut()
                         .expect("result should be set")
@@ -3461,7 +3466,6 @@ impl Pager {
                 }
                 CheckpointPhase::SyncDbFile { clear_page_cache } => {
                     let need_sync_db_file = {
-                        let state = self.checkpoint_state.read();
                         let result = state.result.as_ref().expect("result should be set");
                         !result.db_sync_sent
                     };
@@ -3471,15 +3475,13 @@ impl Pager {
                             !self.syncing.load(Ordering::SeqCst),
                             "syncing should be done"
                         );
-                        self.checkpoint_state.write().phase =
-                            CheckpointPhase::Finalize { clear_page_cache };
+                        state.phase = CheckpointPhase::Finalize { clear_page_cache };
                         continue;
                     }
 
                     let c =
                         sqlite3_ondisk::begin_sync(self.db_file.as_ref(), self.syncing.clone())?;
-                    self.checkpoint_state
-                        .write()
+                    state
                         .result
                         .as_mut()
                         .expect("result should be set")
@@ -3487,7 +3489,6 @@ impl Pager {
                     io_yield_one!(c);
                 }
                 CheckpointPhase::Finalize { clear_page_cache } => {
-                    let mut state = self.checkpoint_state.write();
                     let mut res = state.result.take().expect("result should be set");
 
                     // Release checkpoint guard
@@ -3540,6 +3541,7 @@ impl Pager {
     /// deletes the WAL file.
     pub fn checkpoint_shutdown(
         &self,
+        conn_state: &RwLock<WalCheckpointState>,
         wal_auto_checkpoint_disabled: bool,
         sync_mode: crate::SyncMode,
     ) -> Result<()> {
@@ -3556,6 +3558,7 @@ impl Pager {
         }
         if !wal_auto_checkpoint_disabled {
             while let Err(LimboError::Busy) = self.blocking_checkpoint(
+                conn_state,
                 CheckpointMode::Truncate {
                     upper_bound_inclusive: None,
                 },
@@ -3582,10 +3585,12 @@ impl Pager {
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn blocking_checkpoint(
         &self,
+        conn_state: &RwLock<WalCheckpointState>,
         mode: CheckpointMode,
         sync_mode: crate::SyncMode,
     ) -> Result<CheckpointResult> {
-        self.io.block(|| self.checkpoint(mode, sync_mode, true))
+        self.io
+            .block(|| self.checkpoint(conn_state, mode, sync_mode, true))
     }
 
     pub fn freepage_list(&self) -> u32 {
@@ -4115,12 +4120,12 @@ impl Pager {
     }
 
     fn reset_internal_states(&self) {
-        *self.checkpoint_state.write() = CheckpointState::default();
         self.syncing.store(false, Ordering::SeqCst);
         self.commit_info.write().reset();
         *self.allocate_page_state.write() = AllocatePageState::Start;
         *self.free_page_state.write() = FreePageState::Start;
         *self.spill_state.write() = SpillState::Idle;
+        self.checkpointing.store(false, Ordering::Release);
         #[cfg(not(feature = "omit_autovacuum"))]
         {
             let mut vacuum_state = self.vacuum_state.write();

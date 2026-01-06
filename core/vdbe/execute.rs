@@ -393,6 +393,7 @@ pub fn op_checkpoint(
         }
     }
     let step_result = program.connection.pager.load().checkpoint(
+        &program.connection.checkpoint_state,
         *checkpoint_mode,
         program.connection.get_sync_mode(),
         true,
@@ -9887,6 +9888,7 @@ fn op_journal_mode_inner(
                 } else {
                     // WAL checkpoint
                     let checkpoint_result = pager.checkpoint(
+                        &program.connection.checkpoint_state,
                         CheckpointMode::Truncate {
                             upper_bound_inclusive: None,
                         },

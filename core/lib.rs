@@ -50,7 +50,7 @@ use crate::stats::refresh_analyze_stats;
 use crate::storage::checksum::CHECKSUM_REQUIRED_RESERVED_BYTES;
 use crate::storage::encryption::AtomicCipherMode;
 use crate::storage::journal_mode;
-use crate::storage::pager::{self, AutoVacuumMode, HeaderRef, HeaderRefMut};
+use crate::storage::pager::{self, AutoVacuumMode, HeaderRef, HeaderRefMut, WalCheckpointState};
 use crate::storage::sqlite3_ondisk::{RawVersion, Version};
 use crate::translate::pragma::TURSO_CDC_DEFAULT_TABLE_NAME;
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
@@ -769,6 +769,7 @@ impl Database {
             fk_pragma: AtomicBool::new(false),
             fk_deferred_violations: AtomicIsize::new(0),
             vtab_txn_states: RwLock::new(HashSet::new()),
+            checkpoint_state: RwLock::new(WalCheckpointState::default()),
         });
         self.n_connections
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
@@ -1284,6 +1285,8 @@ pub struct Connection {
     fk_deferred_violations: AtomicIsize,
     /// Track when each virtual table instance is currently in transaction.
     vtab_txn_states: RwLock<HashSet<u64>>,
+    /// Per-Connection checkpoint state
+    checkpoint_state: RwLock<WalCheckpointState>,
 }
 
 // SAFETY: This needs to be audited for thread safety.
@@ -1949,6 +1952,7 @@ impl Connection {
                     .io
                     .block(|| {
                         pager.commit_dirty_pages(
+                            &self.checkpoint_state,
                             true,
                             self.get_sync_mode(),
                             self.get_data_sync_retry(),
@@ -2009,9 +2013,11 @@ impl Connection {
             ));
             io.as_ref().block(|| ckpt_sm.step(&()))
         } else {
-            self.pager
-                .load()
-                .blocking_checkpoint(mode, self.get_sync_mode())
+            self.pager.load().blocking_checkpoint(
+                &self.checkpoint_state,
+                mode,
+                self.get_sync_mode(),
+            )
         }
     }
 
@@ -2037,6 +2043,7 @@ impl Connection {
 
         if self.db.n_connections.fetch_sub(1, Ordering::SeqCst).eq(&1) && !self.db.is_readonly() {
             self.pager.load().checkpoint_shutdown(
+                &self.checkpoint_state,
                 self.is_wal_auto_checkpoint_disabled(),
                 self.get_sync_mode(),
             )?;
