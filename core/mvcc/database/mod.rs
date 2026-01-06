@@ -2310,23 +2310,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
         for rowid in &tx.write_set {
             let rowid = rowid.value();
-            if let Some(row_versions) = self.rows.get(rowid) {
-                let mut row_versions = row_versions.value().write();
-                for rv in row_versions.iter_mut() {
-                    if let Some(TxTimestampOrID::TxID(id)) = rv.begin {
-                        assert_eq!(id, tx_id);
-                        // If the transaction has aborted,
-                        // it marks all its new versions as garbage and sets their Begin
-                        // and End timestamps to infinity to make them invisible
-                        // See section 2.4: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf
-                        rv.begin = None;
-                        rv.end = None;
-                    } else if rv.end == Some(TxTimestampOrID::TxID(tx_id)) {
-                        // undo deletions by this transaction
-                        rv.end = None;
-                    }
-                }
-            }
+            self.rollback_rowid(tx_id, rowid);
         }
 
         if connection.schema.read().schema_version > connection.db.schema.lock().schema_version {
@@ -2340,6 +2324,38 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         // FIXME: verify that we can already remove the transaction here!
         // Maybe it's fine for snapshot isolation, but too early for serializable?
         self.remove_tx(tx_id);
+    }
+
+    fn rollback_rowid(&self, tx_id: u64, rowid: &RowID) {
+        if rowid.row_id.is_int_key() {
+            self.rollback_table_rowid(tx_id, rowid);
+        } else {
+            self.rollback_index_rowid(tx_id, rowid);
+        }
+    }
+
+    fn rollback_index_rowid(&self, tx_id: u64, rowid: &RowID) {
+        if let Some(index) = self.index_rows.get(&rowid.table_id) {
+            let index = index.value();
+            let RowKey::Record(ref index_key) = rowid.row_id else {
+                panic!("Index writes must have a record key");
+            };
+            if let Some(row_versions) = index.get(index_key) {
+                let mut row_versions = row_versions.value().write();
+                for rv in row_versions.iter_mut() {
+                    rollback_row_version(tx_id, rv);
+                }
+            }
+        }
+    }
+
+    fn rollback_table_rowid(&self, tx_id: u64, rowid: &RowID) {
+        if let Some(row_versions) = self.rows.get(rowid) {
+            let mut row_versions = row_versions.value().write();
+            for rv in row_versions.iter_mut() {
+                rollback_row_version(tx_id, rv);
+            }
+        }
     }
 
     /// Returns true if the given transaction is the exclusive transaction.
@@ -2815,6 +2831,20 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     }
 }
 
+fn rollback_row_version(tx_id: u64, rv: &mut RowVersion) {
+    if rv.begin == Some(TxTimestampOrID::TxID(tx_id)) {
+        // If the transaction has aborted,
+        // it marks all its new versions as garbage and sets their Begin
+        // and End timestamps to infinity to make them invisible
+        // See section 2.4: https://www.cs.cmu.edu/~15721-f24/papers/Hekaton.pdf
+        rv.begin = None;
+        rv.end = None;
+    } else if rv.end == Some(TxTimestampOrID::TxID(tx_id)) {
+        // undo deletions by this transaction
+        rv.end = None;
+    }
+}
+
 impl RowidAllocator {
     /// Returns None if no rowid could be allocated.
     /// Returns Some((new_rowid, prev_last_rowid)) where prev_last_rowid is None if table was empty
@@ -2930,7 +2960,7 @@ fn is_begin_visible(txs: &SkipMap<TxID, Transaction>, tx: &Transaction, rv: &Row
         Some(TxTimestampOrID::TxID(rv_begin)) => {
             let tb = txs
                 .get(&rv_begin)
-                .expect("transaction should exist in txs map");
+                .unwrap_or_else(|| panic!("transaction {rv_begin:?} should exist in txs map"));
             let tb = tb.value();
             let visible = match tb.state.load() {
                 TransactionState::Active => tx.tx_id == tb.tx_id && rv.end.is_none(),
