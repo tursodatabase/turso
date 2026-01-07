@@ -1518,7 +1518,6 @@ fn test_rollback_without_mvcc() {
     assert_eq!(row[0], Value::Text("initial".into()));
 }
 
-
 #[test]
 fn test_wal_savepoint_rollback_on_constraint_violation() {
     let tmp_db = TempDatabase::new("test_90969.db");
@@ -1538,7 +1537,6 @@ fn test_wal_savepoint_rollback_on_constraint_violation() {
     conn.execute("COMMIT").unwrap();
 
     conn.execute("BEGIN").unwrap();
-
 
     let result =
         conn.execute("UPDATE t SET val = 'modified', u = CASE WHEN id = 1000 THEN 1 ELSE u END");
