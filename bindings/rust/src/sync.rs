@@ -448,7 +448,9 @@ impl IoWorker {
                             )
                             .await;
                         }
-                        turso_sync_sdk_kit::sync_engine_io::SyncEngineIoRequest::FullRead { path } => {
+                        turso_sync_sdk_kit::sync_engine_io::SyncEngineIoRequest::FullRead {
+                            path,
+                        } => {
                             IoWorker::process_full_read(
                                 path,
                                 item.get_completion().clone(),
@@ -474,12 +476,12 @@ impl IoWorker {
                 // Step callbacks and notify woken futures.
                 this.sync.step_io_callbacks();
                 IoWorker::notify_progress(&wakers);
-                
+
                 // If we didn't process anything this round, we're done.
                 if !processed_any {
                     break;
                 }
-                
+
                 // Yield to allow woken tasks to run on their executors.
                 // They may queue more IO items, so we loop again.
                 tokio::task::yield_now().await;
