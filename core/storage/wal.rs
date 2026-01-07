@@ -1924,6 +1924,7 @@ impl WalFile {
     pub fn new(
         io: Arc<dyn IO>,
         shared: Arc<RwLock<WalFileShared>>,
+        (last_checksum, max_frame): ((u32, u32), u64),
         buffer_pool: Arc<BufferPool>,
     ) -> Self {
         let (last_checksum, max_frame) = {
