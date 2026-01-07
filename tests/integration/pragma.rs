@@ -167,3 +167,47 @@ fn test_pragma_page_sizes_with_writes_persists(db: TempDatabase) {
         assert_eq!(page_size, test_page_size);
     }
 }
+
+#[turso_macros::test(mvcc)]
+fn test_pragma_auto_vacuum_writes_db_file(db: TempDatabase) {
+    use std::path::Path;
+    
+    // Create a new database with autovacuum enabled
+    let opts = turso_core::DatabaseOpts::new()
+        .with_encryption(true)
+        .with_autovacuum(true);
+    let flags = db.db_flags;
+    let builder = TempDatabase::builder()
+        .with_flags(flags)
+        .with_opts(opts);
+    
+    let db = builder.build();
+    let db_path = &db.path;
+    
+    {
+        let conn = db.connect_limbo();
+        
+        // Set auto_vacuum pragma on empty database
+        conn.execute("PRAGMA auto_vacuum=FULL").unwrap();
+        
+        // Verify that auto_vacuum was set
+        let mut rows = conn.query("PRAGMA auto_vacuum").unwrap().unwrap();
+        let StepResult::Row = rows.step().unwrap() else {
+            panic!("expected row");
+        };
+        let row = rows.row().unwrap();
+        let Value::Integer(auto_vacuum_mode) = row.get_value(0) else {
+            panic!("expected integer value");
+        };
+        assert_eq!(*auto_vacuum_mode, 1); // 1 = FULL
+    }
+    
+    // Check if the database file exists after setting auto_vacuum
+    let file_exists = Path::new(db_path).exists();
+    
+    // The file should be created when auto_vacuum is set
+    assert!(
+        file_exists,
+        "Database file should be created after setting PRAGMA auto_vacuum"
+    );
+}
