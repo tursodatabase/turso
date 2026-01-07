@@ -291,6 +291,7 @@ fn add_ephemeral_table_to_update_plan(
                 internal_id: table.internal_id,
                 table: table.table.clone(),
                 col_used_mask: table.col_used_mask.clone(),
+                is_lateral_ref: false,
             });
     }
 

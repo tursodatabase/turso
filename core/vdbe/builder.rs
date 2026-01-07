@@ -41,6 +41,12 @@ impl TableRefIdCounter {
 
 use super::{BranchOffset, CursorID, ExplainState, Insn, InsnReference, JumpTarget, Program};
 
+/// Maximum allowed subquery nesting depth.
+/// This prevents stack overflow from deeply nested or malicious queries.
+/// SQLite uses SQLITE_MAX_EXPR_DEPTH (default 1000) for a similar purpose.
+/// We use a more conservative value since Rust's default stack size is smaller.
+pub const MAX_SUBQUERY_DEPTH: usize = 100;
+
 /// A key that uniquely identifies a cursor.
 /// The key is a pair of table reference id and index.
 /// The index is only provided when the cursor is an index cursor.
@@ -157,6 +163,11 @@ pub struct ProgramBuilder {
     hash_build_signatures: HashMap<usize, HashBuildSignature>,
     /// Hash tables to keep open across subplans (e.g. materialization).
     hash_tables_to_keep_open: HashSet<usize>,
+    /// Maps FROM clause subquery table internal IDs (as usize) to their result column start register.
+    /// This allows LATERAL joins to look up the result registers of preceding subqueries,
+    /// even when the subquery is accessed through outer_query_refs (where the clone doesn't
+    /// have the register info).
+    subquery_result_regs: HashMap<usize, usize>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -363,6 +374,7 @@ impl ProgramBuilder {
             cursor_overrides: HashMap::new(),
             hash_build_signatures: HashMap::new(),
             hash_tables_to_keep_open: HashSet::new(),
+            subquery_result_regs: HashMap::new(),
         }
     }
 
@@ -1036,6 +1048,23 @@ impl ProgramBuilder {
         self.cursor_overrides.contains_key(&table_ref_id.into())
     }
 
+    /// Register a subquery's result column start register.
+    /// This allows LATERAL joins to look up the result registers of preceding subqueries.
+    pub fn register_subquery_result_reg(
+        &mut self,
+        table_ref_id: TableInternalId,
+        result_start_reg: usize,
+    ) {
+        self.subquery_result_regs
+            .insert(table_ref_id.into(), result_start_reg);
+    }
+
+    /// Look up a subquery's result column start register by table internal ID.
+    /// Returns None if the table is not a registered subquery.
+    pub fn get_subquery_result_reg(&self, table_ref_id: TableInternalId) -> Option<usize> {
+        self.subquery_result_regs.get(&table_ref_id.into()).copied()
+    }
+
     // translate [CursorKey] to cursor id
     pub fn resolve_cursor_id_safe(&self, key: &CursorKey) -> Option<CursorID> {
         // Check cursor overrides first, only apply override for table cursors.
@@ -1109,14 +1138,52 @@ impl ProgramBuilder {
         self.collation = None;
     }
 
+    /// Increment nesting level without checking depth limit.
+    ///
+    /// # Deprecated
+    /// This method does not check for maximum subquery depth and can lead to
+    /// stack overflow with deeply nested queries. Use [`try_incr_nesting`] instead
+    /// for production code that processes untrusted queries.
+    ///
+    /// This method is kept for test code that needs to manipulate nesting level
+    /// without going through the depth check.
     #[inline]
+    #[deprecated(
+        since = "0.4.1",
+        note = "Use try_incr_nesting() instead to enforce depth limits"
+    )]
     pub fn incr_nesting(&mut self) {
         self.nested_level += 1;
     }
 
     #[inline]
     pub fn decr_nesting(&mut self) {
-        self.nested_level -= 1;
+        debug_assert!(
+            self.nested_level > 0,
+            "decr_nesting called when nesting level is already 0"
+        );
+        self.nested_level = self.nested_level.saturating_sub(1);
+    }
+
+    /// Increment nesting level with depth limit check.
+    /// Returns an error if the maximum subquery depth would be exceeded.
+    /// Use this when entering a new subquery scope during query planning.
+    #[inline]
+    pub fn try_incr_nesting(&mut self) -> crate::Result<()> {
+        if self.nested_level >= MAX_SUBQUERY_DEPTH {
+            crate::bail_parse_error!(
+                "subquery nesting depth exceeds maximum of {}",
+                MAX_SUBQUERY_DEPTH
+            );
+        }
+        self.nested_level += 1;
+        Ok(())
+    }
+
+    /// Get the current nesting level.
+    #[inline]
+    pub fn nesting_level(&self) -> usize {
+        self.nested_level
     }
 
     /// Initialize the program with basic setup and return initial metadata and labels
@@ -1352,5 +1419,66 @@ impl ProgramBuilder {
             resolve_type: self.resolve_type,
             explain_state: RwLock::new(ExplainState::default()),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::QueryMode;
+
+    fn test_builder() -> ProgramBuilder {
+        ProgramBuilder::new(
+            QueryMode::Normal,
+            CaptureDataChangesMode::Off,
+            ProgramBuilderOpts {
+                num_cursors: 0,
+                approx_num_insns: 0,
+                approx_num_labels: 0,
+            },
+        )
+    }
+
+    #[test]
+    fn test_subquery_depth_limit_enforced() {
+        let mut builder = test_builder();
+
+        // Increment nesting up to the limit - should succeed
+        for _ in 0..MAX_SUBQUERY_DEPTH {
+            assert!(builder.try_incr_nesting().is_ok());
+        }
+        assert_eq!(builder.nesting_level(), MAX_SUBQUERY_DEPTH);
+
+        // One more should fail
+        let result = builder.try_incr_nesting();
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("subquery nesting depth exceeds maximum"),
+            "Expected error message about depth, got: {err_msg}"
+        );
+
+        // Nesting level should not have changed after failure
+        assert_eq!(builder.nesting_level(), MAX_SUBQUERY_DEPTH);
+    }
+
+    #[test]
+    #[allow(deprecated)] // Testing the deprecated method intentionally
+    fn test_nesting_increment_decrement() {
+        let mut builder = test_builder();
+
+        assert_eq!(builder.nesting_level(), 0);
+
+        builder.incr_nesting();
+        assert_eq!(builder.nesting_level(), 1);
+
+        builder.incr_nesting();
+        assert_eq!(builder.nesting_level(), 2);
+
+        builder.decr_nesting();
+        assert_eq!(builder.nesting_level(), 1);
+
+        builder.decr_nesting();
+        assert_eq!(builder.nesting_level(), 0);
     }
 }

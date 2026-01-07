@@ -903,6 +903,8 @@ bitflags::bitflags! {
         const RIGHT   = 0x10;
         /// `OUTER`
         const OUTER   = 0x20;
+        /// `LATERAL` - allows subquery to reference preceding tables
+        const LATERAL = 0x40;
     }
 }
 

@@ -125,7 +125,7 @@ pub fn plan_subqueries_from_select_plan(
     update_column_used_masks(
         &mut plan.table_references,
         &mut plan.non_from_clause_subqueries,
-    );
+    )?;
     Ok(())
 }
 
@@ -151,6 +151,7 @@ fn plan_subqueries_with_outer_query_access<'a>(
                 identifier: t.identifier.clone(),
                 internal_id: t.internal_id,
                 col_used_mask: ColumnUsedMask::default(),
+                is_lateral_ref: false,
             })
             .chain(
                 referenced_tables
@@ -161,6 +162,7 @@ fn plan_subqueries_with_outer_query_access<'a>(
                         identifier: t.identifier.clone(),
                         internal_id: t.internal_id,
                         col_used_mask: ColumnUsedMask::default(),
+                        is_lateral_ref: t.is_lateral_ref, // Preserve LATERAL flag
                     }),
             )
             .collect::<Vec<_>>()
@@ -205,6 +207,9 @@ fn get_subquery_parser<'a>(
     move |expr: &mut ast::Expr| -> Result<WalkControl> {
         match expr {
             ast::Expr::Exists(_) => {
+                // Check subquery nesting depth before recursing
+                program.try_incr_nesting()?;
+
                 let subquery_id = program.table_reference_counter.next();
                 let outer_query_refs = get_outer_query_refs(referenced_tables);
 
@@ -220,14 +225,16 @@ fn get_subquery_parser<'a>(
                     unreachable!();
                 };
 
-                let plan = prepare_select_plan(
+                let plan_result = prepare_select_plan(
                     subselect,
                     resolver,
                     program,
                     &outer_query_refs,
                     QueryDestination::ExistsSubqueryResult { result_reg },
                     connection,
-                )?;
+                );
+                program.decr_nesting();
+                let plan = plan_result?;
                 let Plan::Select(mut plan) = plan else {
                     crate::bail_parse_error!(
                         "compound SELECT queries not supported yet in WHERE clause subqueries"
@@ -251,6 +258,9 @@ fn get_subquery_parser<'a>(
                 Ok(WalkControl::Continue)
             }
             ast::Expr::Subquery(_) => {
+                // Check subquery nesting depth before recursing
+                program.try_incr_nesting()?;
+
                 let subquery_id = program.table_reference_counter.next();
                 let outer_query_refs = get_outer_query_refs(referenced_tables);
 
@@ -268,14 +278,16 @@ fn get_subquery_parser<'a>(
                 let ast::Expr::Subquery(subselect) = std::mem::replace(expr, result_expr) else {
                     unreachable!();
                 };
-                let plan = prepare_select_plan(
+                let plan_result = prepare_select_plan(
                     subselect,
                     resolver,
                     program,
                     &outer_query_refs,
                     QueryDestination::Unset,
                     connection,
-                )?;
+                );
+                program.decr_nesting();
+                let plan = plan_result?;
                 let Plan::Select(mut plan) = plan else {
                     crate::bail_parse_error!(
                         "compound SELECT queries not supported yet in WHERE clause subqueries"
@@ -328,6 +340,9 @@ fn get_subquery_parser<'a>(
                 Ok(WalkControl::Continue)
             }
             ast::Expr::InSelect { .. } => {
+                // Check subquery nesting depth before recursing
+                program.try_incr_nesting()?;
+
                 let subquery_id = program.table_reference_counter.next();
                 let outer_query_refs = get_outer_query_refs(referenced_tables);
 
@@ -336,14 +351,16 @@ fn get_subquery_parser<'a>(
                 else {
                     unreachable!();
                 };
-                let plan = prepare_select_plan(
+                let plan_result = prepare_select_plan(
                     rhs,
                     resolver,
                     program,
                     &outer_query_refs,
                     QueryDestination::Unset,
                     connection,
-                )?;
+                );
+                program.decr_nesting();
+                let plan = plan_result?;
                 let Plan::Select(mut plan) = plan else {
                     crate::bail_parse_error!(
                         "compound SELECT queries not supported yet in WHERE clause subqueries"
@@ -441,13 +458,13 @@ fn get_subquery_parser<'a>(
 fn update_column_used_masks(
     table_refs: &mut TableReferences,
     subqueries: &mut [NonFromClauseSubquery],
-) {
+) -> crate::Result<()> {
     for subquery in subqueries.iter_mut() {
         let SubqueryState::Unevaluated { plan } = &mut subquery.state else {
-            panic!("subquery has already been evaluated");
+            crate::bail_parse_error!("internal error: subquery has already been evaluated");
         };
         let Some(child_plan) = plan.as_mut() else {
-            panic!("subquery has no plan");
+            crate::bail_parse_error!("internal error: subquery has no plan");
         };
 
         for child_outer_query_ref in child_plan
@@ -468,6 +485,7 @@ fn update_column_used_masks(
             }
         }
     }
+    Ok(())
 }
 
 /// Emit the subqueries contained in the FROM clause.
@@ -577,6 +595,9 @@ pub fn emit_from_clause_subqueries(
             // This is done so that translate_expr() can read the result columns of the subquery,
             // as if it were reading from a regular table.
             from_clause_subquery.result_columns_start_reg = Some(result_columns_start);
+            // Also register in program builder so LATERAL joins can look it up.
+            // This is needed because LATERAL refs have cloned tables that don't get the reg update.
+            program.register_subquery_result_reg(table_reference.internal_id, result_columns_start);
         }
 
         program.pop_current_parent_explain();
@@ -671,68 +692,75 @@ pub fn emit_non_from_clause_subquery(
     query_type: &SubqueryType,
     is_correlated: bool,
 ) -> Result<()> {
-    program.incr_nesting();
+    program.try_incr_nesting()?;
 
-    let label_skip_after_first_run = if !is_correlated {
-        let label = program.allocate_label();
-        program.emit_insn(Insn::Once {
-            target_pc_when_reentered: label,
-        });
-        Some(label)
-    } else {
-        None
-    };
+    // Use a closure to ensure decr_nesting() is called on all exit paths,
+    // including early returns from errors within the match arms.
+    let result = (|| {
+        let label_skip_after_first_run = if !is_correlated {
+            let label = program.allocate_label();
+            program.emit_insn(Insn::Once {
+                target_pc_when_reentered: label,
+            });
+            Some(label)
+        } else {
+            None
+        };
 
-    match query_type {
-        SubqueryType::Exists { result_reg, .. } => {
-            let subroutine_reg = program.alloc_register();
-            program.emit_insn(Insn::BeginSubrtn {
-                dest: subroutine_reg,
-                dest_end: None,
-            });
-            program.emit_insn(Insn::Integer {
-                value: 0,
-                dest: *result_reg,
-            });
-            emit_program_for_select(program, &t_ctx.resolver, plan)?;
-            program.emit_insn(Insn::Return {
-                return_reg: subroutine_reg,
-                can_fallthrough: true,
-            });
-        }
-        SubqueryType::In { cursor_id } => {
-            program.emit_insn(Insn::OpenEphemeral {
-                cursor_id: *cursor_id,
-                is_table: false,
-            });
-            emit_program_for_select(program, &t_ctx.resolver, plan)?;
-        }
-        SubqueryType::RowValue {
-            result_reg_start,
-            num_regs,
-        } => {
-            let subroutine_reg = program.alloc_register();
-            program.emit_insn(Insn::BeginSubrtn {
-                dest: subroutine_reg,
-                dest_end: None,
-            });
-            for result_reg in *result_reg_start..*result_reg_start + *num_regs {
-                program.emit_insn(Insn::Null {
-                    dest: result_reg,
+        match query_type {
+            SubqueryType::Exists { result_reg, .. } => {
+                let subroutine_reg = program.alloc_register();
+                program.emit_insn(Insn::BeginSubrtn {
+                    dest: subroutine_reg,
                     dest_end: None,
                 });
+                program.emit_insn(Insn::Integer {
+                    value: 0,
+                    dest: *result_reg,
+                });
+                emit_program_for_select(program, &t_ctx.resolver, plan)?;
+                program.emit_insn(Insn::Return {
+                    return_reg: subroutine_reg,
+                    can_fallthrough: true,
+                });
             }
-            emit_program_for_select(program, &t_ctx.resolver, plan)?;
-            program.emit_insn(Insn::Return {
-                return_reg: subroutine_reg,
-                can_fallthrough: true,
-            });
+            SubqueryType::In { cursor_id } => {
+                program.emit_insn(Insn::OpenEphemeral {
+                    cursor_id: *cursor_id,
+                    is_table: false,
+                });
+                emit_program_for_select(program, &t_ctx.resolver, plan)?;
+            }
+            SubqueryType::RowValue {
+                result_reg_start,
+                num_regs,
+            } => {
+                let subroutine_reg = program.alloc_register();
+                program.emit_insn(Insn::BeginSubrtn {
+                    dest: subroutine_reg,
+                    dest_end: None,
+                });
+                for result_reg in *result_reg_start..*result_reg_start + *num_regs {
+                    program.emit_insn(Insn::Null {
+                        dest: result_reg,
+                        dest_end: None,
+                    });
+                }
+                emit_program_for_select(program, &t_ctx.resolver, plan)?;
+                program.emit_insn(Insn::Return {
+                    return_reg: subroutine_reg,
+                    can_fallthrough: true,
+                });
+            }
         }
-    }
-    if let Some(label) = label_skip_after_first_run {
-        program.preassign_label_to_next_insn(label);
-    }
+        if let Some(label) = label_skip_after_first_run {
+            program.preassign_label_to_next_insn(label);
+        }
 
+        Ok(())
+    })();
+
+    // Always decrement nesting, regardless of success or failure above
     program.decr_nesting();
-    Ok(())
+    result
 }

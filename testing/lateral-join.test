@@ -1,0 +1,1285 @@
+#!/usr/bin/env tclsh
+
+# Tests for LATERAL JOIN functionality
+# Based on Master's thesis "Lateral Join for SQLite" by Jonatan Braun (2021)
+#
+# Note: LATERAL JOIN currently works with subqueries as the left-side table.
+# Support for BTree tables as the left-side requires additional changes to
+# the cursor emission order and is a future enhancement.
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+
+# Basic LATERAL JOIN with simple value binding
+# The subquery references the outer value 'x' from q1
+do_execsql_test lateral-basic-value-binding {
+    SELECT * FROM (SELECT 42 AS x) AS q1 LATERAL JOIN (SELECT x + 1 AS res) AS result;
+} {42|43}
+
+# Chained LATERAL JOINs (like thesis example)
+# Each subsequent subquery can reference columns from all preceding tables
+do_execsql_test lateral-chained {
+    SELECT result.res FROM
+        (SELECT 42 AS x) AS q1
+        LATERAL JOIN (SELECT x AS y_2) AS let1
+        LATERAL JOIN (SELECT y_2 + 1 AS res) AS result;
+} {43}
+
+# Multiple LATERAL with references to different preceding tables
+do_execsql_test lateral-multiple-references {
+    SELECT * FROM
+        (SELECT 10 AS a) AS t1
+        LATERAL JOIN (SELECT a * 2 AS b) AS t2
+        LATERAL JOIN (SELECT a + b AS c) AS t3;
+} {10|20|30}
+
+# LATERAL JOIN vs regular JOIN - LATERAL can reference outer, regular cannot
+# This shows that LATERAL actually makes the reference work
+do_execsql_test lateral-versus-regular-join {
+    SELECT * FROM (SELECT 5 AS x) AS outer_tbl LATERAL JOIN (SELECT x * x AS square) AS inner_tbl;
+} {5|25}
+
+# LATERAL with nested computation
+do_execsql_test lateral-nested-computation {
+    SELECT result
+    FROM (SELECT 100 AS base) AS q1
+    LATERAL JOIN (SELECT base / 10 AS tenth) AS q2
+    LATERAL JOIN (SELECT tenth + 5 AS result) AS q3;
+} {15}
+
+# LATERAL with string values
+do_execsql_test lateral-string-values {
+    SELECT * FROM (SELECT 'hello' AS greeting) AS q1 LATERAL JOIN (SELECT greeting || ' world' AS message) AS q2;
+} {{hello|hello world}}
+
+# LATERAL referencing multiple columns from preceding subquery
+do_execsql_test lateral-multiple-columns {
+    SELECT sum
+    FROM (SELECT 1 AS a, 2 AS b, 3 AS c) AS q1
+    LATERAL JOIN (SELECT a + b + c AS sum) AS q2;
+} {6}
+
+# Error: LATERAL on non-subquery should fail
+do_catchsql_test lateral-error-non-subquery {
+    CREATE TABLE IF NOT EXISTS dummy1 (x INTEGER);
+    SELECT * FROM dummy1 LATERAL JOIN dummy1;
+} {1 {LATERAL can only be applied to subqueries}}
+
+# Cleanup
+do_execsql_test lateral-cleanup-error-test {
+    DROP TABLE IF EXISTS dummy1;
+} {}
+
+# Error: LEFT LATERAL JOIN should fail (not supported)
+do_catchsql_test lateral-error-left-lateral {
+    SELECT * FROM (SELECT 1 AS x) AS t1 LEFT LATERAL JOIN (SELECT x) AS t2;
+} {1 {LEFT/RIGHT LATERAL JOIN is not yet supported}}
+
+# Error: RIGHT LATERAL JOIN should fail (not supported)
+do_catchsql_test lateral-error-right-lateral {
+    SELECT * FROM (SELECT 1 AS x) AS t1 RIGHT LATERAL JOIN (SELECT x) AS t2;
+} {1 {LEFT/RIGHT LATERAL JOIN is not yet supported}}
+
+# Error: LATERAL with base table on left side (not yet supported)
+# This is a current limitation - LATERAL only works with subqueries as preceding tables.
+# Support for BTree tables requires changes to cursor emission order (future work).
+do_catchsql_test lateral-error-btree-left-side {
+    CREATE TABLE IF NOT EXISTS base_tbl (x INTEGER);
+    SELECT * FROM base_tbl LATERAL JOIN (SELECT x * 10 AS y) AS sub;
+} {1 {LATERAL JOIN currently only supports subqueries as preceding tables, not base tables like 'base_tbl'}}
+
+# Cleanup base_tbl
+do_execsql_test lateral-cleanup-btree-test {
+    DROP TABLE IF EXISTS base_tbl;
+} {}
+
+# ============================================================================
+# Additional edge case tests (addressing review feedback)
+# ============================================================================
+
+# LATERAL with NULL values - ensure NULL propagation works correctly
+do_execsql_test lateral-null-handling-basic {
+    SELECT * FROM (SELECT NULL AS x) AS q1 LATERAL JOIN (SELECT x IS NULL AS is_null) AS q2;
+} {|1}
+
+# LATERAL with NULL in arithmetic - NULL propagation
+do_execsql_test lateral-null-arithmetic {
+    SELECT * FROM (SELECT NULL AS x) AS q1 LATERAL JOIN (SELECT x + 10 AS result) AS q2;
+} {|}
+
+# LATERAL with COALESCE to handle NULL
+do_execsql_test lateral-null-coalesce {
+    SELECT result FROM (SELECT NULL AS x) AS q1 LATERAL JOIN (SELECT COALESCE(x, 0) + 5 AS result) AS q2;
+} {5}
+
+# LATERAL with WHERE clause filtering
+do_execsql_test lateral-where-clause-basic {
+    SELECT * FROM
+        (SELECT 10 AS x) AS q1
+        LATERAL JOIN (SELECT x * 2 AS doubled WHERE x > 5) AS q2;
+} {10|20}
+
+# LATERAL with WHERE clause that filters out (empty result)
+do_execsql_test lateral-where-clause-filter-out {
+    SELECT * FROM
+        (SELECT 3 AS x) AS q1
+        LATERAL JOIN (SELECT x * 2 AS doubled WHERE x > 5) AS q2;
+} {}
+
+# Deeply nested LATERAL chains (4 levels)
+do_execsql_test lateral-deep-nesting-4-levels {
+    SELECT result FROM
+        (SELECT 1 AS a) AS t1
+        LATERAL JOIN (SELECT a + 1 AS b) AS t2
+        LATERAL JOIN (SELECT b + 1 AS c) AS t3
+        LATERAL JOIN (SELECT c + 1 AS d) AS t4
+        LATERAL JOIN (SELECT a + b + c + d AS result) AS t5;
+} {10}
+
+# Deeply nested LATERAL with mixed references (referencing non-adjacent tables)
+do_execsql_test lateral-deep-mixed-refs {
+    SELECT * FROM
+        (SELECT 100 AS base) AS t1
+        LATERAL JOIN (SELECT base / 10 AS step1) AS t2
+        LATERAL JOIN (SELECT base / 100 AS step2) AS t3
+        LATERAL JOIN (SELECT base + step1 + step2 AS total) AS t4;
+} {100|10|1|111}
+
+# LATERAL with aggregate function in subquery
+do_execsql_test lateral-aggregate-simple {
+    SELECT * FROM
+        (SELECT 5 AS x) AS q1
+        LATERAL JOIN (SELECT MAX(x, 10) AS bigger) AS q2;
+} {5|10}
+
+# LATERAL with multiple aggregate-like functions
+do_execsql_test lateral-multiple-functions {
+    SELECT * FROM
+        (SELECT 3 AS x, 7 AS y) AS q1
+        LATERAL JOIN (SELECT MIN(x, y) AS smaller, MAX(x, y) AS bigger, ABS(x - y) AS diff) AS q2;
+} {3|7|3|7|4}
+
+# LATERAL with CASE expression
+do_execsql_test lateral-case-expression {
+    SELECT category FROM
+        (SELECT 85 AS score) AS q1
+        LATERAL JOIN (SELECT CASE WHEN score >= 90 THEN 'A' WHEN score >= 80 THEN 'B' ELSE 'C' END AS category) AS q2;
+} {B}
+
+# LATERAL with type coercion (integer to string concatenation)
+do_execsql_test lateral-type-coercion {
+    SELECT result FROM
+        (SELECT 42 AS num) AS q1
+        LATERAL JOIN (SELECT 'Value: ' || num AS result) AS q2;
+} {{Value: 42}}
+
+# LATERAL with boolean expressions
+do_execsql_test lateral-boolean-expr {
+    SELECT * FROM
+        (SELECT 10 AS x, 20 AS y) AS q1
+        LATERAL JOIN (SELECT x < y AS less_than, x = y AS equal, x > y AS greater_than) AS q2;
+} {10|20|1|0|0}
+
+# LATERAL with BETWEEN operator
+do_execsql_test lateral-between-operator {
+    SELECT in_range FROM
+        (SELECT 15 AS val, 10 AS low, 20 AS high) AS q1
+        LATERAL JOIN (SELECT val BETWEEN low AND high AS in_range) AS q2;
+} {1}
+
+# LATERAL with IN operator (literal list)
+do_execsql_test lateral-in-operator {
+    SELECT is_vowel FROM
+        (SELECT 'a' AS letter) AS q1
+        LATERAL JOIN (SELECT letter IN ('a', 'e', 'i', 'o', 'u') AS is_vowel) AS q2;
+} {1}
+
+# LATERAL preserving column ordering
+do_execsql_test lateral-column-ordering {
+    SELECT t1.a, t2.b, t3.c, t4.d FROM
+        (SELECT 1 AS a) AS t1
+        LATERAL JOIN (SELECT 2 AS b) AS t2
+        LATERAL JOIN (SELECT 3 AS c) AS t3
+        LATERAL JOIN (SELECT 4 AS d) AS t4;
+} {1|2|3|4}
+
+# LATERAL with empty string
+do_execsql_test lateral-empty-string {
+    SELECT * FROM (SELECT '' AS x) AS q1 LATERAL JOIN (SELECT LENGTH(x) AS len, x || 'suffix' AS concat) AS q2;
+} {|0|suffix}
+
+# LATERAL with negative numbers
+do_execsql_test lateral-negative-numbers {
+    SELECT * FROM
+        (SELECT -5 AS x) AS q1
+        LATERAL JOIN (SELECT ABS(x) AS absolute, x * -1 AS negated) AS q2;
+} {-5|5|5}
+
+# LATERAL with floating point numbers
+do_execsql_test lateral-float-numbers {
+    SELECT * FROM
+        (SELECT 3.14159 AS pi) AS q1
+        LATERAL JOIN (SELECT ROUND(pi, 2) AS rounded) AS q2;
+} {3.14159|3.14}
+
+# LATERAL with expression in the left-side subquery
+do_execsql_test lateral-complex-left-expr {
+    SELECT result FROM
+        (SELECT (10 + 20) * 2 AS computed) AS q1
+        LATERAL JOIN (SELECT computed / 6 AS result) AS q2;
+} {10}
+
+# LATERAL with DISTINCT in inner subquery (testing dedup)
+do_execsql_test lateral-with-distinct {
+    SELECT * FROM
+        (SELECT 5 AS x) AS q1
+        LATERAL JOIN (SELECT DISTINCT x AS val) AS q2;
+} {5|5}
+
+# Test that regular (non-LATERAL) join still cannot reference outer columns
+# This verifies LATERAL is actually needed for the cross-reference
+do_catchsql_test lateral-verify-regular-join-fails {
+    SELECT * FROM (SELECT 5 AS x) AS outer_tbl JOIN (SELECT x * x AS square) AS inner_tbl;
+} {1 {no such column: x}}
+
+# ============================================================================
+# Additional LATERAL tests
+# ============================================================================
+
+# Empty left side - should produce no rows
+do_execsql_test lateral-empty-left-side {
+    SELECT * FROM
+        (SELECT 1 AS x WHERE 0) AS t1
+        LATERAL JOIN (SELECT x + 100 AS y) AS t2;
+} {}
+
+# LATERAL with filtering in subquery
+do_execsql_test lateral-with-filter {
+    SELECT * FROM
+        (SELECT 10 AS x) AS t1
+        LATERAL JOIN (SELECT x * 2 AS y WHERE x > 5) AS t2;
+} {10|20}
+
+# LATERAL subquery with WHERE that filters out - empty result
+do_execsql_test lateral-filter-empty {
+    SELECT * FROM
+        (SELECT 3 AS x) AS t1
+        LATERAL JOIN (SELECT x * 10 AS y WHERE x > 5) AS t2;
+} {}
+
+# ============================================================================
+# Mixed join tests - LATERAL combined with regular joins
+# ============================================================================
+
+# Regular join followed by LATERAL
+do_execsql_test lateral-mixed-regular-then-lateral {
+    SELECT * FROM
+        (SELECT 1 AS a) AS t1
+        JOIN (SELECT 2 AS b) AS t2
+        LATERAL JOIN (SELECT a + b AS c) AS t3;
+} {1|2|3}
+
+# ============================================================================
+# Column shadowing and ambiguity tests
+# ============================================================================
+
+# LATERAL subquery can shadow outer column names
+do_execsql_test lateral-column-shadowing {
+    SELECT t2.x FROM
+        (SELECT 10 AS x) AS t1
+        LATERAL JOIN (SELECT x + 1 AS x) AS t2;
+} {11}
+
+# Both outer and inner columns accessible with qualification
+do_execsql_test lateral-qualified-access {
+    SELECT t1.x, t2.y, t1.x + t2.y AS sum FROM
+        (SELECT 5 AS x) AS t1
+        LATERAL JOIN (SELECT x * 2 AS y) AS t2;
+} {5|10|15}
+
+# ============================================================================
+# True aggregate tests (as opposed to scalar MAX/MIN functions)
+# These tests use actual aggregate functions over multiple rows
+# ============================================================================
+
+# Setup table for aggregate tests
+do_execsql_test lateral-aggregate-setup {
+    DROP TABLE IF EXISTS agg_test;
+    CREATE TABLE agg_test (id INTEGER PRIMARY KEY, category TEXT, value INTEGER);
+    INSERT INTO agg_test VALUES (1, 'A', 10), (2, 'A', 20), (3, 'B', 30), (4, 'B', 40), (5, 'B', 50);
+} {}
+
+# LATERAL with COUNT aggregate - count items matching outer reference
+do_execsql_test lateral-true-aggregate-count {
+    SELECT cat.category, item_count.cnt FROM
+        (SELECT DISTINCT category FROM agg_test) AS cat
+        LATERAL JOIN (SELECT COUNT(*) AS cnt FROM agg_test WHERE category = cat.category) AS item_count
+    ORDER BY cat.category;
+} {A|2
+B|3}
+
+# LATERAL with SUM aggregate
+do_execsql_test lateral-true-aggregate-sum {
+    SELECT cat.category, totals.total FROM
+        (SELECT DISTINCT category FROM agg_test) AS cat
+        LATERAL JOIN (SELECT SUM(value) AS total FROM agg_test WHERE category = cat.category) AS totals
+    ORDER BY cat.category;
+} {A|30
+B|120}
+
+# LATERAL with AVG aggregate
+do_execsql_test lateral-true-aggregate-avg {
+    SELECT cat.category, avgs.average FROM
+        (SELECT DISTINCT category FROM agg_test) AS cat
+        LATERAL JOIN (SELECT AVG(value) AS average FROM agg_test WHERE category = cat.category) AS avgs
+    ORDER BY cat.category;
+} {A|15.0
+B|40.0}
+
+# LATERAL with multiple aggregates in same subquery
+do_execsql_test lateral-true-aggregate-multiple {
+    SELECT cat.category, stats.cnt, stats.total, stats.avg_val FROM
+        (SELECT DISTINCT category FROM agg_test) AS cat
+        LATERAL JOIN (
+            SELECT COUNT(*) AS cnt, SUM(value) AS total, AVG(value) AS avg_val
+            FROM agg_test WHERE category = cat.category
+        ) AS stats
+    ORDER BY cat.category;
+} {A|2|30|15.0
+B|3|120|40.0}
+
+# Cleanup aggregate test table
+do_execsql_test lateral-aggregate-cleanup {
+    DROP TABLE agg_test;
+} {}
+
+# ============================================================================
+# ORDER BY and LIMIT tests inside LATERAL subqueries
+# ============================================================================
+
+# Setup table for ORDER BY/LIMIT tests
+do_execsql_test lateral-orderby-setup {
+    DROP TABLE IF EXISTS items;
+    CREATE TABLE items (id INTEGER PRIMARY KEY, grp TEXT, val INTEGER);
+    INSERT INTO items VALUES (1, 'X', 100), (2, 'X', 200), (3, 'X', 150);
+    INSERT INTO items VALUES (4, 'Y', 50), (5, 'Y', 75), (6, 'Y', 25);
+} {}
+
+# LATERAL with ORDER BY to get max value per group
+do_execsql_test lateral-orderby-desc {
+    SELECT g.grp, top.val FROM
+        (SELECT DISTINCT grp FROM items) AS g
+        LATERAL JOIN (SELECT val FROM items WHERE grp = g.grp ORDER BY val DESC LIMIT 1) AS top
+    ORDER BY g.grp;
+} {X|200
+Y|75}
+
+# LATERAL with ORDER BY ASC to get min value per group
+do_execsql_test lateral-orderby-asc {
+    SELECT g.grp, bottom.val FROM
+        (SELECT DISTINCT grp FROM items) AS g
+        LATERAL JOIN (SELECT val FROM items WHERE grp = g.grp ORDER BY val ASC LIMIT 1) AS bottom
+    ORDER BY g.grp;
+} {X|100
+Y|25}
+
+# LATERAL with LIMIT 2 - top N per group
+do_execsql_test lateral-limit-top-n {
+    SELECT g.grp, top2.val FROM
+        (SELECT DISTINCT grp FROM items) AS g
+        LATERAL JOIN (SELECT val FROM items WHERE grp = g.grp ORDER BY val DESC LIMIT 2) AS top2
+    ORDER BY g.grp, top2.val DESC;
+} {X|200
+X|150
+Y|75
+Y|50}
+
+# LATERAL with OFFSET
+do_execsql_test lateral-limit-offset {
+    SELECT g.grp, second.val FROM
+        (SELECT DISTINCT grp FROM items) AS g
+        LATERAL JOIN (SELECT val FROM items WHERE grp = g.grp ORDER BY val DESC LIMIT 1 OFFSET 1) AS second
+    ORDER BY g.grp;
+} {X|150
+Y|50}
+
+# Cleanup ORDER BY/LIMIT test table
+do_execsql_test lateral-orderby-cleanup {
+    DROP TABLE items;
+} {}
+
+# ============================================================================
+# CTE (Common Table Expression) with LATERAL tests
+# ============================================================================
+
+# CTE with LATERAL referencing CTE column in computation
+do_execsql_test lateral-cte-computation {
+    WITH base AS (SELECT 5 AS x)
+    SELECT x, computed.result FROM base
+    LATERAL JOIN (SELECT x * x + x AS result) AS computed;
+} {5|30}
+
+# Multiple CTEs with LATERAL
+do_execsql_test lateral-cte-multiple {
+    WITH
+        a AS (SELECT 2 AS val),
+        b AS (SELECT 3 AS multiplier)
+    SELECT a.val, b.multiplier, product.p FROM
+        a JOIN b ON 1=1
+        LATERAL JOIN (SELECT a.val * b.multiplier AS p) AS product;
+} {2|3|6}
+
+# CTE with chained LATERAL joins
+do_execsql_test lateral-cte-chained {
+    WITH source AS (SELECT 100 AS base_val)
+    SELECT s.base_val, step1.half, step2.quarter FROM source AS s
+    LATERAL JOIN (SELECT base_val / 2 AS half) AS step1
+    LATERAL JOIN (SELECT half / 2 AS quarter) AS step2;
+} {100|50|25}
+
+# ============================================================================
+# Depth limit tests (SKIPPED - too slow for regular testing)
+# ============================================================================
+
+# # Test that deeply nested LATERAL joins are rejected when exceeding the limit.
+# # The maximum subquery depth is 100, so 101+ nested levels should fail.
+# # We build the query dynamically using TCL to avoid writing 101 joins manually.
+# set depth_limit_query "SELECT * FROM (SELECT 1 AS x0) AS t0"
+# for {set i 1} {$i <= 101} {incr i} {
+#     set prev [expr {$i - 1}]
+#     append depth_limit_query " LATERAL JOIN (SELECT x$prev AS x$i) AS t$i"
+# }
+# do_catchsql_test lateral-depth-limit-exceeded $depth_limit_query {1 {subquery nesting depth exceeds maximum of 100}}
+
+# # Verify that 100 levels of nesting (just at the limit) succeeds
+# set depth_at_limit_query "SELECT t99.x99 FROM (SELECT 1 AS x0) AS t0"
+# for {set i 1} {$i < 100} {incr i} {
+#     set prev [expr {$i - 1}]
+#     append depth_at_limit_query " LATERAL JOIN (SELECT x$prev + 1 AS x$i) AS t$i"
+# }
+# do_execsql_test lateral-depth-at-limit $depth_at_limit_query {100}
+
+# ============================================================================
+# Multi-row LATERAL tests (CRITICAL - tests re-evaluation per row)
+# ============================================================================
+
+# Setup table for multi-row tests
+do_execsql_test lateral-multirow-setup {
+    DROP TABLE IF EXISTS nums;
+    DROP TABLE IF EXISTS nums5;
+    DROP TABLE IF EXISTS pairs;
+    DROP TABLE IF EXISTS letters;
+    DROP TABLE IF EXISTS nums4;
+    DROP TABLE IF EXISTS nums_with_null;
+    CREATE TABLE nums (x INTEGER);
+    INSERT INTO nums VALUES (1), (2), (3);
+    CREATE TABLE nums5 (n INTEGER);
+    INSERT INTO nums5 VALUES (1), (2), (3), (4), (5);
+    CREATE TABLE pairs (x INTEGER, y INTEGER);
+    INSERT INTO pairs VALUES (1, 2), (3, 4), (5, 6);
+    CREATE TABLE letters (letter TEXT);
+    INSERT INTO letters VALUES ('a'), ('b'), ('c');
+    CREATE TABLE nums4 (n INTEGER);
+    INSERT INTO nums4 VALUES (1), (2), (3), (4);
+    CREATE TABLE nums_with_null (x INTEGER);
+    INSERT INTO nums_with_null VALUES (1), (NULL), (3);
+} {}
+
+# Multi-row left side - LATERAL subquery re-evaluated for each row
+# This is the most critical test for LATERAL semantics
+do_execsql_test lateral-multirow-basic {
+    SELECT * FROM
+        (SELECT x FROM nums) AS t1
+        LATERAL JOIN (SELECT x * 10 AS y) AS t2
+    ORDER BY x;
+} {1|10
+2|20
+3|30}
+
+# Multi-row with chained LATERAL - each step re-evaluated
+do_execsql_test lateral-multirow-chained {
+    SELECT * FROM
+        (SELECT x AS a FROM nums) AS t1
+        LATERAL JOIN (SELECT a + 10 AS b) AS t2
+        LATERAL JOIN (SELECT a + b AS c) AS t3
+    ORDER BY a;
+} {1|11|12
+2|12|14
+3|13|16}
+
+# Multi-row with computation that depends on row value
+do_execsql_test lateral-multirow-computation {
+    SELECT t1.n, sq.square FROM
+        (SELECT n FROM nums5) AS t1
+        LATERAL JOIN (SELECT n * n AS square) AS sq
+    ORDER BY n;
+} {1|1
+2|4
+3|9
+4|16
+5|25}
+
+# Multi-row with WHERE filter in LATERAL - different rows may match or not
+do_execsql_test lateral-multirow-filtered {
+    SELECT * FROM
+        (SELECT n AS x FROM nums5) AS t1
+        LATERAL JOIN (SELECT x * 2 AS doubled WHERE x > 3) AS t2
+    ORDER BY x;
+} {4|8
+5|10}
+
+# Multi-row with string values
+do_execsql_test lateral-multirow-strings {
+    SELECT * FROM
+        (SELECT letter FROM letters) AS t1
+        LATERAL JOIN (SELECT letter || letter AS doubled, UPPER(letter) AS upper_letter) AS t2
+    ORDER BY letter;
+} {a|aa|A
+b|bb|B
+c|cc|C}
+
+# Multi-row referencing multiple columns
+do_execsql_test lateral-multirow-multiple-cols {
+    SELECT t1.x, t1.y, computed.sum, computed.prod FROM
+        (SELECT x, y FROM pairs) AS t1
+        LATERAL JOIN (SELECT x + y AS sum, x * y AS prod) AS computed
+    ORDER BY x;
+} {1|2|3|2
+3|4|7|12
+5|6|11|30}
+
+# Multi-row with CASE expression - different behavior per row
+do_execsql_test lateral-multirow-case {
+    SELECT n, category FROM
+        (SELECT n FROM nums4) AS t1
+        LATERAL JOIN (SELECT CASE WHEN n % 2 = 0 THEN 'even' ELSE 'odd' END AS category) AS t2
+    ORDER BY n;
+} {1|odd
+2|even
+3|odd
+4|even}
+
+# Multi-row with NULL values mixed in
+do_execsql_test lateral-multirow-with-nulls {
+    SELECT t1.x, t2.result FROM
+        (SELECT x FROM nums_with_null) AS t1
+        LATERAL JOIN (SELECT COALESCE(x, 0) * 10 AS result) AS t2
+    ORDER BY COALESCE(t1.x, 0);
+} {|0
+1|10
+3|30}
+
+# Cleanup multi-row test tables
+do_execsql_test lateral-multirow-cleanup {
+    DROP TABLE nums;
+    DROP TABLE nums5;
+    DROP TABLE pairs;
+    DROP TABLE letters;
+    DROP TABLE nums4;
+    DROP TABLE nums_with_null;
+} {}
+
+# ============================================================================
+# GROUP BY with LATERAL tests
+# ============================================================================
+
+# Setup for GROUP BY tests
+do_execsql_test lateral-groupby-setup {
+    DROP TABLE IF EXISTS sales;
+    CREATE TABLE sales (category TEXT, amount INTEGER);
+    INSERT INTO sales VALUES ('A', 100), ('A', 150), ('B', 200), ('B', 50), ('B', 100);
+} {}
+
+# LATERAL with GROUP BY in outer query - group stats
+do_execsql_test lateral-groupby-outer {
+    SELECT cat.category, stats.hundreds FROM
+        (SELECT category, SUM(amount) AS total FROM sales GROUP BY category) AS cat
+        LATERAL JOIN (SELECT total / 100 AS hundreds) AS stats
+    ORDER BY cat.category;
+} {A|2
+B|3}
+
+# Cleanup GROUP BY tests
+do_execsql_test lateral-groupby-cleanup {
+    DROP TABLE sales;
+} {}
+
+# ============================================================================
+# EXISTS with LATERAL tests
+# ============================================================================
+
+# Setup for EXISTS tests
+do_execsql_test lateral-exists-setup {
+    DROP TABLE IF EXISTS products;
+    DROP TABLE IF EXISTS inventory;
+    CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, category TEXT);
+    CREATE TABLE inventory (product_id INTEGER, stock INTEGER);
+    INSERT INTO products VALUES (1, 'Widget', 'A'), (2, 'Gadget', 'A'), (3, 'Gizmo', 'B');
+    INSERT INTO inventory VALUES (1, 10), (2, 0), (3, 5);
+} {}
+
+# LATERAL reference inside EXISTS subquery
+do_execsql_test lateral-exists-inner {
+    SELECT p.name FROM
+        (SELECT * FROM products) AS p
+        LATERAL JOIN (SELECT 1 AS has_stock WHERE EXISTS (SELECT 1 FROM inventory WHERE product_id = p.id AND stock > 0)) AS inv
+    ORDER BY p.name;
+} {Gizmo
+Widget}
+
+# Cleanup EXISTS tests
+do_execsql_test lateral-exists-cleanup {
+    DROP TABLE products;
+    DROP TABLE inventory;
+} {}
+
+# ============================================================================
+# Forward reference rejection tests
+# ============================================================================
+
+# LATERAL should not be able to reference tables that come AFTER it in the FROM clause.
+# This tests that the scoping is correct - only preceding tables are visible.
+# For qualified column references (table.column), the error is "no such table"
+# because the table lookup fails before column lookup.
+do_catchsql_test lateral-forward-reference-rejected {
+    SELECT * FROM
+        (SELECT 1 AS x) AS t1
+        LATERAL JOIN (SELECT later.y AS val) AS t2
+        JOIN (SELECT 2 AS y) AS later;
+} {1 {no such table: later}}
+
+# Forward reference with unqualified column name should also fail
+do_catchsql_test lateral-forward-reference-unqualified {
+    SELECT * FROM
+        (SELECT 1 AS a) AS first_tbl
+        LATERAL JOIN (SELECT future_col * 2 AS result) AS middle
+        JOIN (SELECT 99 AS future_col) AS last_tbl;
+} {1 {no such column: future_col}}
+
+# ============================================================================
+# Additional error case tests (from PR review)
+# ============================================================================
+
+# Invalid column reference in LATERAL should fail with clear error
+do_catchsql_test lateral-error-invalid-column {
+    SELECT * FROM (SELECT 1 AS x) AS t1 LATERAL JOIN (SELECT undefined_col + 1 AS y) AS t2;
+} {1 {no such column: undefined_col}}
+
+# LATERAL with typo in column name
+do_catchsql_test lateral-error-typo-column {
+    SELECT * FROM (SELECT 100 AS amount) AS t1 LATERAL JOIN (SELECT ammount * 2 AS doubled) AS t2;
+} {1 {no such column: ammount}}
+
+# ============================================================================
+# Mixed join type tests - LEFT JOIN combined with LATERAL (from PR review)
+# ============================================================================
+
+# LEFT JOIN followed by LATERAL - NULL from LEFT JOIN should propagate
+do_execsql_test lateral-left-join-then-lateral {
+    SELECT t1.a, t2.b, t3.c FROM
+        (SELECT 1 AS a) AS t1
+        LEFT JOIN (SELECT 2 AS b WHERE 0) AS t2 ON 1=1
+        LATERAL JOIN (SELECT a + COALESCE(b, 100) AS c) AS t3;
+} {1||101}
+
+# LEFT JOIN with match followed by LATERAL
+do_execsql_test lateral-left-join-match-then-lateral {
+    SELECT t1.a, t2.b, t3.c FROM
+        (SELECT 1 AS a) AS t1
+        LEFT JOIN (SELECT 2 AS b) AS t2 ON 1=1
+        LATERAL JOIN (SELECT a + b AS c) AS t3;
+} {1|2|3}
+
+# LATERAL followed by LEFT JOIN
+do_execsql_test lateral-then-left-join {
+    SELECT t1.a, t2.b, t3.c FROM
+        (SELECT 1 AS a) AS t1
+        LATERAL JOIN (SELECT a * 2 AS b) AS t2
+        LEFT JOIN (SELECT 3 AS c WHERE 0) AS t3 ON 1=1;
+} {1|2|}
+
+# LATERAL followed by LEFT JOIN with match
+do_execsql_test lateral-then-left-join-match {
+    SELECT t1.a, t2.b, t3.c FROM
+        (SELECT 5 AS a) AS t1
+        LATERAL JOIN (SELECT a * 2 AS b) AS t2
+        LEFT JOIN (SELECT 10 AS c) AS t3 ON t2.b = t3.c;
+} {5|10|10}
+
+# Multiple LEFT JOINs with LATERAL in between
+do_execsql_test lateral-mixed-left-lateral-left {
+    SELECT t1.x, t2.y, t3.z, t4.w FROM
+        (SELECT 1 AS x) AS t1
+        LEFT JOIN (SELECT 2 AS y) AS t2 ON 1=1
+        LATERAL JOIN (SELECT x + y AS z) AS t3
+        LEFT JOIN (SELECT 4 AS w WHERE 0) AS t4 ON 1=1;
+} {1|2|3|}
+
+# ============================================================================
+# LATERAL with UNION/set operations inside subquery (from PR review)
+# Note: Compound queries (UNION/INTERSECT/EXCEPT) are not yet supported in
+# FROM clause subqueries. These tests verify the error message is correct.
+# ============================================================================
+
+# LATERAL with UNION ALL in subquery - should fail (not yet supported)
+do_catchsql_test lateral-union-all-not-supported {
+    SELECT * FROM
+        (SELECT 5 AS x) AS t1
+        LATERAL JOIN (
+            SELECT x * 2 AS result
+            UNION ALL
+            SELECT x * 3 AS result
+        ) AS t2
+    ORDER BY result;
+} {1 {Only non-compound SELECT queries are currently supported in FROM clause subqueries}}
+
+# LATERAL with UNION in subquery - should fail (not yet supported)
+do_catchsql_test lateral-union-not-supported {
+    SELECT * FROM
+        (SELECT 4 AS x) AS t1
+        LATERAL JOIN (
+            SELECT x * 2 AS result
+            UNION
+            SELECT x + 4 AS result
+        ) AS t2;
+} {1 {Only non-compound SELECT queries are currently supported in FROM clause subqueries}}
+
+# LATERAL with INTERSECT in subquery - should fail (not yet supported)
+do_catchsql_test lateral-intersect-not-supported {
+    SELECT * FROM
+        (SELECT 3 AS x) AS t1
+        LATERAL JOIN (
+            SELECT x AS val
+            INTERSECT
+            SELECT 3 AS val
+        ) AS t2;
+} {1 {Only non-compound SELECT queries are currently supported in FROM clause subqueries}}
+
+# LATERAL with EXCEPT in subquery - should fail (not yet supported)
+do_catchsql_test lateral-except-not-supported {
+    SELECT * FROM
+        (SELECT 5 AS x) AS t1
+        LATERAL JOIN (
+            SELECT x AS val
+            EXCEPT
+            SELECT 6 AS val
+        ) AS t2;
+} {1 {Only non-compound SELECT queries are currently supported in FROM clause subqueries}}
+
+# ============================================================================
+# LATERAL with varying result counts per outer row (from PR review)
+# ============================================================================
+
+# Setup tables for varying counts test
+do_execsql_test lateral-varying-setup {
+    DROP TABLE IF EXISTS varying_outer;
+    DROP TABLE IF EXISTS varying_inner;
+    CREATE TABLE varying_outer (id INTEGER, count_limit INTEGER);
+    INSERT INTO varying_outer VALUES (1, 2), (2, 0), (3, 1), (4, 3);
+    CREATE TABLE varying_inner (n INTEGER);
+    INSERT INTO varying_inner VALUES (1), (2), (3), (4), (5);
+} {}
+
+# LATERAL that returns different number of rows per outer row
+do_execsql_test lateral-varying-result-counts {
+    SELECT t1.id, t2.n FROM
+        (SELECT * FROM varying_outer) AS t1
+        LATERAL JOIN (SELECT n FROM varying_inner WHERE n <= t1.count_limit) AS t2
+    ORDER BY t1.id, t2.n;
+} {1|1
+1|2
+3|1
+4|1
+4|2
+4|3}
+
+# LATERAL where some outer rows produce empty inner results
+do_execsql_test lateral-varying-some-empty {
+    SELECT t1.id, t1.count_limit FROM
+        (SELECT * FROM varying_outer) AS t1
+        LATERAL JOIN (SELECT 1 AS dummy WHERE t1.count_limit > 0) AS t2
+    ORDER BY t1.id;
+} {1|2
+3|1
+4|3}
+
+# Cleanup varying counts tables
+do_execsql_test lateral-varying-cleanup {
+    DROP TABLE varying_outer;
+    DROP TABLE varying_inner;
+} {}
+
+# ============================================================================
+# Complex NULL scenarios (from PR review)
+# ============================================================================
+
+# Setup for NULL tests - use a table instead of UNION since compound queries
+# aren't supported in FROM clause subqueries
+do_execsql_test lateral-null-setup {
+    DROP TABLE IF EXISTS null_test_outer;
+    DROP TABLE IF EXISTS null_test_nums;
+    CREATE TABLE null_test_outer (grp TEXT);
+    INSERT INTO null_test_outer VALUES (NULL), ('A');
+    CREATE TABLE null_test_nums (x INTEGER);
+    INSERT INTO null_test_nums VALUES (NULL), (5);
+} {}
+
+# NULL in join condition affecting LATERAL
+do_execsql_test lateral-null-join-condition {
+    SELECT t1.grp, t2.cnt FROM
+        (SELECT grp FROM null_test_outer) AS t1
+        LATERAL JOIN (
+            SELECT COUNT(*) AS cnt FROM (SELECT 1 WHERE grp IS NOT NULL)
+        ) AS t2
+    ORDER BY COALESCE(grp, 'ZZZ');
+} {A|1
+|0}
+
+# Multiple NULL values propagating through LATERAL chain
+do_execsql_test lateral-null-chain {
+    SELECT t1.x, t2.y, t3.z FROM
+        (SELECT x FROM null_test_nums) AS t1
+        LATERAL JOIN (SELECT x + 10 AS y) AS t2
+        LATERAL JOIN (SELECT y * 2 AS z) AS t3
+    ORDER BY COALESCE(t1.x, 0);
+} {||
+5|15|30}
+
+# NULL comparison with IS pattern
+do_execsql_test lateral-null-is-check {
+    SELECT t1.x, t2.is_five FROM
+        (SELECT x FROM null_test_nums) AS t1
+        LATERAL JOIN (SELECT (x IS 5) AS is_five) AS t2
+    ORDER BY COALESCE(t1.x, 0);
+} {|0
+5|1}
+
+# Cleanup NULL tests
+do_execsql_test lateral-null-cleanup {
+    DROP TABLE null_test_outer;
+    DROP TABLE null_test_nums;
+} {}
+
+# ============================================================================
+# LATERAL with HAVING clause in subquery (from PR review)
+# ============================================================================
+
+# Setup for HAVING test
+do_execsql_test lateral-having-setup {
+    DROP TABLE IF EXISTS having_test;
+    DROP TABLE IF EXISTS having_outer;
+    CREATE TABLE having_test (category TEXT, val INTEGER);
+    INSERT INTO having_test VALUES ('A', 10), ('A', 20), ('B', 5), ('C', 100), ('C', 200), ('C', 300);
+    CREATE TABLE having_outer (min_count INTEGER);
+    INSERT INTO having_outer VALUES (2), (3);
+} {}
+
+# LATERAL with HAVING filtering based on outer reference
+do_execsql_test lateral-having-filter {
+    SELECT t1.min_count, t2.category, t2.total FROM
+        (SELECT min_count FROM having_outer) AS t1
+        LATERAL JOIN (
+            SELECT category, SUM(val) AS total
+            FROM having_test
+            GROUP BY category
+            HAVING COUNT(*) >= t1.min_count
+        ) AS t2
+    ORDER BY t1.min_count, t2.category;
+} {2|A|30
+2|C|600
+3|C|600}
+
+# Cleanup HAVING test
+do_execsql_test lateral-having-cleanup {
+    DROP TABLE having_test;
+    DROP TABLE having_outer;
+} {}
+
+# ============================================================================
+# LATERAL with aliased expressions from outer query (from PR review)
+# ============================================================================
+
+# LATERAL referencing complex aliased expression
+do_execsql_test lateral-aliased-complex-expr {
+    SELECT t1.computed, t2.doubled FROM
+        (SELECT (10 + 20) * 3 AS computed) AS t1
+        LATERAL JOIN (SELECT computed * 2 AS doubled) AS t2;
+} {90|180}
+
+# LATERAL with multiple aliased expressions
+do_execsql_test lateral-multiple-aliases {
+    SELECT t1.a, t1.b, t1.c, t2.sum, t2.product FROM
+        (SELECT 2 AS a, 3 AS b, 5 AS c) AS t1
+        LATERAL JOIN (SELECT a + b + c AS sum, a * b * c AS product) AS t2;
+} {2|3|5|10|30}
+
+# LATERAL referencing CASE expression alias
+do_execsql_test lateral-case-alias {
+    SELECT t1.val, t1.category, t2.description FROM
+        (SELECT 75 AS val, CASE WHEN 75 >= 70 THEN 'pass' ELSE 'fail' END AS category) AS t1
+        LATERAL JOIN (SELECT category || ': ' || val AS description) AS t2;
+} {{75|pass|pass: 75}}
+
+# ============================================================================
+# Edge case: LATERAL with LIMIT returning 0 or 1 rows (from PR review)
+# ============================================================================
+
+# Setup for LIMIT edge case test
+do_execsql_test lateral-limit-edge-setup {
+    DROP TABLE IF EXISTS limit_test;
+    DROP TABLE IF EXISTS data_source;
+    CREATE TABLE limit_test (id INTEGER, threshold INTEGER);
+    INSERT INTO limit_test VALUES (1, 5), (2, 0), (3, 10);
+    CREATE TABLE data_source (val INTEGER);
+    INSERT INTO data_source VALUES (1), (2), (3), (4), (5), (6), (7), (8), (9), (10);
+} {}
+
+# LATERAL with LIMIT 1 that returns 0 rows for some outer rows
+do_execsql_test lateral-limit-zero-or-one {
+    SELECT t1.id, t2.val FROM
+        (SELECT * FROM limit_test) AS t1
+        LATERAL JOIN (SELECT val FROM data_source WHERE val <= t1.threshold ORDER BY val DESC LIMIT 1) AS t2
+    ORDER BY t1.id;
+} {1|5
+3|10}
+
+# Cleanup LIMIT edge case
+do_execsql_test lateral-limit-edge-cleanup {
+    DROP TABLE limit_test;
+    DROP TABLE data_source;
+} {}
+
+# ============================================================================
+# LATERAL with correlated subquery inside (nested correlation - from PR review)
+# ============================================================================
+
+# Setup for nested correlation test
+do_execsql_test lateral-nested-corr-setup {
+    DROP TABLE IF EXISTS outer_tbl;
+    DROP TABLE IF EXISTS inner_tbl;
+    CREATE TABLE outer_tbl (id INTEGER);
+    CREATE TABLE inner_tbl (outer_id INTEGER, val INTEGER);
+    INSERT INTO outer_tbl VALUES (1), (2), (3);
+    INSERT INTO inner_tbl VALUES (1, 10), (1, 20), (2, 30), (3, 40), (3, 50), (3, 60);
+} {}
+
+# LATERAL containing EXISTS that references the LATERAL's outer context
+do_execsql_test lateral-nested-exists {
+    SELECT t1.id, t2.has_large FROM
+        (SELECT * FROM outer_tbl) AS t1
+        LATERAL JOIN (
+            SELECT EXISTS (SELECT 1 FROM inner_tbl WHERE outer_id = t1.id AND val > 45) AS has_large
+        ) AS t2
+    ORDER BY t1.id;
+} {1|0
+2|0
+3|1}
+
+# LATERAL containing scalar subquery that references outer context
+do_execsql_test lateral-nested-scalar {
+    SELECT t1.id, t2.max_val FROM
+        (SELECT * FROM outer_tbl) AS t1
+        LATERAL JOIN (
+            SELECT (SELECT MAX(val) FROM inner_tbl WHERE outer_id = t1.id) AS max_val
+        ) AS t2
+    ORDER BY t1.id;
+} {1|20
+2|30
+3|60}
+
+# Cleanup nested correlation test
+do_execsql_test lateral-nested-corr-cleanup {
+    DROP TABLE outer_tbl;
+    DROP TABLE inner_tbl;
+} {}
+
+# ============================================================================
+# Two LATERAL subqueries referencing same outer table (from PR review)
+# ============================================================================
+
+# Multiple LATERAL joins all referencing the first table
+do_execsql_test lateral-multiple-refs-same-outer {
+    SELECT * FROM
+        (SELECT 5 AS x) AS t1
+        LATERAL JOIN (SELECT x * 2 AS doubled) AS t2
+        JOIN (SELECT 100 AS constant) AS t3
+        LATERAL JOIN (SELECT t1.x + t3.constant AS combined) AS t4;
+} {5|10|100|105}
+
+# Three LATERAL joins all referencing t1
+do_execsql_test lateral-three-refs-same-outer {
+    SELECT t1.base, t2.plus10, t3.times2, t4.squared FROM
+        (SELECT 7 AS base) AS t1
+        LATERAL JOIN (SELECT base + 10 AS plus10) AS t2
+        LATERAL JOIN (SELECT base * 2 AS times2) AS t3
+        LATERAL JOIN (SELECT base * base AS squared) AS t4;
+} {7|17|14|49}
+
+# ==============================================================================
+# Additional test coverage for edge cases
+# ==============================================================================
+
+# Setup tables for GROUP BY and DISTINCT tests
+do_execsql_test lateral-setup-groupby-table {
+    DROP TABLE IF EXISTS lateral_grp_data;
+    CREATE TABLE lateral_grp_data (cat TEXT, subcat TEXT, amount INTEGER);
+    INSERT INTO lateral_grp_data VALUES ('A', 'x', 10), ('A', 'y', 20), ('A', 'x', 30), ('B', 'z', 100);
+} {}
+
+do_execsql_test lateral-setup-distinct-table {
+    DROP TABLE IF EXISTS lateral_dup_data;
+    CREATE TABLE lateral_dup_data (id INTEGER, val INTEGER);
+    INSERT INTO lateral_dup_data VALUES (1, 10), (1, 10), (1, 20), (2, 30), (2, 30);
+} {}
+
+do_execsql_test lateral-setup-categories {
+    DROP TABLE IF EXISTS lateral_categories;
+    CREATE TABLE lateral_categories (cat TEXT);
+    INSERT INTO lateral_categories VALUES ('A'), ('B');
+} {}
+
+do_execsql_test lateral-setup-ids {
+    DROP TABLE IF EXISTS lateral_ids;
+    CREATE TABLE lateral_ids (id INTEGER);
+    INSERT INTO lateral_ids VALUES (1), (2);
+} {}
+
+do_execsql_test lateral-setup-vals {
+    DROP TABLE IF EXISTS lateral_vals;
+    CREATE TABLE lateral_vals (val INTEGER);
+    INSERT INTO lateral_vals VALUES (1), (50), (100), (150);
+} {}
+
+# GROUP BY inside LATERAL subquery - aggregate per correlated group
+do_execsql_test lateral-groupby-inside-lateral {
+    SELECT t1.cat, t2.subcat, t2.total FROM
+        (SELECT cat FROM lateral_categories) AS t1
+        LATERAL JOIN (
+            SELECT subcat, SUM(amount) AS total
+            FROM lateral_grp_data
+            WHERE lateral_grp_data.cat = t1.cat
+            GROUP BY subcat
+        ) AS t2
+    ORDER BY t1.cat, t2.subcat;
+} {A|x|40
+A|y|20
+B|z|100}
+
+# GROUP BY inside LATERAL with HAVING
+do_execsql_test lateral-groupby-having-inside {
+    SELECT t1.cat, t2.subcat, t2.total FROM
+        (SELECT cat FROM lateral_categories) AS t1
+        LATERAL JOIN (
+            SELECT subcat, SUM(amount) AS total
+            FROM lateral_grp_data
+            WHERE lateral_grp_data.cat = t1.cat
+            GROUP BY subcat
+            HAVING SUM(amount) > 25
+        ) AS t2
+    ORDER BY t1.cat, t2.subcat;
+} {A|x|40
+B|z|100}
+
+# DISTINCT inside LATERAL with actual duplicates
+do_execsql_test lateral-distinct-with-duplicates {
+    SELECT t1.id, t2.distinct_val FROM
+        (SELECT id FROM lateral_ids) AS t1
+        LATERAL JOIN (
+            SELECT DISTINCT val AS distinct_val
+            FROM lateral_dup_data
+            WHERE lateral_dup_data.id = t1.id
+        ) AS t2
+    ORDER BY t1.id, t2.distinct_val;
+} {1|10
+1|20
+2|30}
+
+# Empty inner result - LATERAL returns 0 rows due to WHERE filter
+do_execsql_test lateral-empty-inner-impossible-condition {
+    SELECT * FROM
+        (SELECT 5 AS x) AS t1
+        LATERAL JOIN (SELECT x AS y WHERE x > 100) AS t2;
+} {}
+
+# Mix of matching and non-matching in multi-row outer
+do_execsql_test lateral-empty-inner-mixed {
+    SELECT t1.val, t2.doubled FROM
+        (SELECT val FROM lateral_vals) AS t1
+        LATERAL JOIN (
+            SELECT val * 2 AS doubled
+            WHERE val BETWEEN 10 AND 120
+        ) AS t2
+    ORDER BY t1.val;
+} {50|100
+100|200}
+
+# Cleanup test tables
+do_execsql_test lateral-cleanup-tables {
+    DROP TABLE lateral_grp_data;
+    DROP TABLE lateral_dup_data;
+    DROP TABLE lateral_categories;
+    DROP TABLE lateral_ids;
+    DROP TABLE lateral_vals;
+} {}
+
+# Type coercion: Integer vs Float comparison
+do_execsql_test lateral-type-coercion-float {
+    SELECT * FROM
+        (SELECT 5.5 AS x) AS t1
+        LATERAL JOIN (SELECT x = 5 AS is_five, x = 5.5 AS is_five_point_five) AS t2;
+} {5.5|0|1}
+
+# Type coercion: String-to-number in arithmetic
+do_execsql_test lateral-type-coercion-string-to-num {
+    SELECT * FROM
+        (SELECT '42' AS x) AS t1
+        LATERAL JOIN (SELECT x + 1 AS result) AS t2;
+} {42|43}
+
+# Type coercion: NULL propagation in type-mixed arithmetic
+do_execsql_test lateral-type-coercion-null-mixed {
+    SELECT * FROM
+        (SELECT NULL AS x) AS t1
+        LATERAL JOIN (SELECT x + 1.5 AS result, TYPEOF(x + 1.5) AS type_info) AS t2;
+} {||null}
+
+# LATERAL where later subquery uses columns from TWO earlier LATERAL subqueries
+do_execsql_test lateral-multi-dependency {
+    SELECT * FROM
+        (SELECT 10 AS a) AS t1
+        LATERAL JOIN (SELECT a * 2 AS b) AS t2
+        LATERAL JOIN (SELECT b + 5 AS c) AS t3
+        LATERAL JOIN (SELECT a + b + c AS total) AS t4;
+} {10|20|25|55}
+
+# Cross-referencing non-adjacent LATERAL joins (skip intermediate tables)
+do_execsql_test lateral-non-adjacent-refs {
+    SELECT * FROM
+        (SELECT 1 AS first) AS t1
+        LATERAL JOIN (SELECT 2 AS second) AS t2
+        LATERAL JOIN (SELECT 3 AS third) AS t3
+        LATERAL JOIN (SELECT 4 AS fourth) AS t4
+        LATERAL JOIN (SELECT first + third AS sum_1_3) AS t5;
+} {1|2|3|4|4}
+
+# Moderate depth chain (10 levels) - verify correct accumulation
+do_execsql_test lateral-depth-10-chain {
+    SELECT result FROM
+        (SELECT 1 AS x0) AS t0
+        LATERAL JOIN (SELECT x0 + 1 AS x1) AS t1
+        LATERAL JOIN (SELECT x1 + 1 AS x2) AS t2
+        LATERAL JOIN (SELECT x2 + 1 AS x3) AS t3
+        LATERAL JOIN (SELECT x3 + 1 AS x4) AS t4
+        LATERAL JOIN (SELECT x4 + 1 AS x5) AS t5
+        LATERAL JOIN (SELECT x5 + 1 AS x6) AS t6
+        LATERAL JOIN (SELECT x6 + 1 AS x7) AS t7
+        LATERAL JOIN (SELECT x7 + 1 AS x8) AS t8
+        LATERAL JOIN (SELECT x8 + 1 AS result) AS t9;
+} {10}
+
+# ==============================================================================
+# Nested LATERAL tests - LATERAL inside LATERAL subqueries
+# ==============================================================================
+
+# Basic nested LATERAL: inner LATERAL references outer's bound value
+do_execsql_test lateral-nested-basic {
+    SELECT * FROM
+        (SELECT 10 AS x) AS outer_t
+        LATERAL JOIN (
+            SELECT * FROM (SELECT x AS y) AS inner1
+            LATERAL JOIN (SELECT y * 2 AS z) AS inner2
+        ) AS nested_lateral;
+} {10|10|20}
+
+# Nested LATERAL with cross-reference: inner LATERAL references both outer and sibling
+do_execsql_test lateral-nested-cross-ref {
+    SELECT * FROM
+        (SELECT 5 AS a) AS t1
+        LATERAL JOIN (
+            SELECT * FROM (SELECT a + 1 AS b) AS inner1
+            LATERAL JOIN (SELECT a + b AS c) AS inner2
+        ) AS nested;
+} {5|6|11}
+
+# Three levels of LATERAL nesting
+do_execsql_test lateral-nested-three-levels {
+    SELECT * FROM
+        (SELECT 1 AS x) AS level0
+        LATERAL JOIN (
+            SELECT * FROM (SELECT x + 10 AS y) AS level1a
+            LATERAL JOIN (
+                SELECT * FROM (SELECT y + 100 AS z) AS level2a
+                LATERAL JOIN (SELECT x + y + z AS total) AS level2b
+            ) AS level1b
+        ) AS nested;
+} {1|11|111|123}
+
+# Nested LATERAL with aggregates inside
+do_execsql_test lateral-nested-with-aggregate {
+    SELECT * FROM
+        (SELECT 3 AS n) AS outer_t
+        LATERAL JOIN (
+            SELECT * FROM (SELECT n AS val) AS inner1
+            LATERAL JOIN (SELECT val * val AS squared) AS inner2
+        ) AS nested;
+} {3|3|9}
+
+# Nested LATERAL accessing grandparent scope
+do_execsql_test lateral-nested-grandparent-ref {
+    SELECT * FROM
+        (SELECT 7 AS grandparent_val) AS gp
+        LATERAL JOIN (
+            SELECT * FROM (SELECT 2 AS parent_val) AS p
+            LATERAL JOIN (SELECT grandparent_val + parent_val AS sum_val) AS child
+        ) AS nested;
+} {7|2|9}
+
+# Multiple parallel nested LATERALs
+do_execsql_test lateral-nested-parallel {
+    SELECT a, r1, r2 FROM
+        (SELECT 4 AS a) AS t1
+        LATERAL JOIN (
+            SELECT * FROM (SELECT a * 2 AS x) AS inner1
+            LATERAL JOIN (SELECT x + 1 AS r1) AS inner2
+        ) AS nested1
+        LATERAL JOIN (
+            SELECT * FROM (SELECT a * 3 AS y) AS inner3
+            LATERAL JOIN (SELECT y + 2 AS r2) AS inner4
+        ) AS nested2;
+} {4|9|14}
+
+# Deeply nested LATERAL chain (4 levels deep)
+do_execsql_test lateral-nested-deep-chain {
+    SELECT * FROM
+        (SELECT 1 AS v1) AS t1
+        LATERAL JOIN (
+            SELECT * FROM (SELECT v1 + 1 AS v2) AS t2
+            LATERAL JOIN (
+                SELECT * FROM (SELECT v2 + 1 AS v3) AS t3
+                LATERAL JOIN (
+                    SELECT * FROM (SELECT v3 + 1 AS v4) AS t4
+                    LATERAL JOIN (SELECT v1 + v2 + v3 + v4 AS total) AS t5
+                ) AS inner3
+            ) AS inner2
+        ) AS inner1;
+} {1|2|3|4|10}
+
+# Nested LATERAL with WHERE clause filtering
+do_execsql_test lateral-nested-with-filter {
+    SELECT * FROM
+        (SELECT 5 AS threshold) AS outer_t
+        LATERAL JOIN (
+            SELECT * FROM (SELECT 3 AS val) AS inner1
+            LATERAL JOIN (SELECT val * 2 AS doubled WHERE val < threshold) AS inner2
+        ) AS nested;
+} {5|3|6}
+
+# Nested LATERAL producing no rows (filter eliminates all)
+do_execsql_test lateral-nested-empty-result {
+    SELECT * FROM
+        (SELECT 2 AS threshold) AS outer_t
+        LATERAL JOIN (
+            SELECT * FROM (SELECT 10 AS val) AS inner1
+            LATERAL JOIN (SELECT val * 2 AS doubled WHERE val < threshold) AS inner2
+        ) AS nested;
+} {}

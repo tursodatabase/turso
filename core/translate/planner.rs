@@ -284,6 +284,7 @@ fn add_aggregate_if_not_exists(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn parse_from_clause_table(
     table: ast::SelectTable,
     resolver: &Resolver,
@@ -292,7 +293,13 @@ fn parse_from_clause_table(
     vtab_predicates: &mut Vec<Expr>,
     ctes: &mut Vec<JoinedTable>,
     connection: &Arc<crate::Connection>,
+    is_lateral: bool,
 ) -> Result<()> {
+    // LATERAL can only be applied to subqueries, not plain tables or table-valued functions
+    if is_lateral && !matches!(table, ast::SelectTable::Select(..)) {
+        crate::bail_parse_error!("LATERAL can only be applied to subqueries");
+    }
+
     match table {
         ast::SelectTable::Table(qualified_name, maybe_alias, indexed) => {
             if indexed.is_some() {
@@ -313,7 +320,14 @@ fn parse_from_clause_table(
             )
         }
         ast::SelectTable::Select(subselect, maybe_alias) => {
-            let outer_query_refs_for_subquery = table_references
+            // Check subquery nesting depth before recursing
+            program.try_incr_nesting()?;
+
+            // Build outer query refs for the subquery from two sources:
+            // 1. Existing outer query refs (from enclosing queries) - preserve their is_lateral_ref flag
+            // 2. CTEs available in this scope - these are NOT lateral refs because CTE references
+            //    are for table lookup, not for correlated column access from preceding FROM tables
+            let mut outer_query_refs_for_subquery: Vec<OuterQueryReference> = table_references
                 .outer_query_refs()
                 .iter()
                 .cloned()
@@ -325,20 +339,63 @@ fn parse_from_clause_table(
                             internal_id: t.internal_id,
                             table: t.table,
                             col_used_mask: ColumnUsedMask::default(),
+                            is_lateral_ref: false,
                         }),
                 )
-                .collect::<Vec<_>>();
-            let Plan::Select(subplan) = prepare_select_plan(
+                .collect();
+
+            // For LATERAL joins, also include all preceding tables from the current FROM clause.
+            // This allows the subquery to reference columns from tables appearing to its left.
+            if is_lateral {
+                for joined_table in table_references.joined_tables().iter() {
+                    // Currently, LATERAL only works when preceding tables are subqueries.
+                    // BTree/Virtual tables require cursor emission order changes (future work).
+                    if !matches!(joined_table.table, Table::FromClauseSubquery(_)) {
+                        program.decr_nesting();
+                        crate::bail_parse_error!(
+                            "LATERAL JOIN currently only supports subqueries as preceding tables, not base tables like '{}'",
+                            joined_table.identifier
+                        );
+                    }
+                    outer_query_refs_for_subquery.push(OuterQueryReference {
+                        identifier: joined_table.identifier.clone(),
+                        internal_id: joined_table.internal_id,
+                        table: joined_table.table.clone(),
+                        col_used_mask: ColumnUsedMask::default(),
+                        is_lateral_ref: true, // Mark as LATERAL ref for column resolution
+                    });
+                }
+            }
+            let subplan_result = prepare_select_plan(
                 subselect,
                 resolver,
                 program,
                 &outer_query_refs_for_subquery,
                 QueryDestination::placeholder_for_subquery(),
                 connection,
-            )?
-            else {
+            );
+            program.decr_nesting();
+            let Plan::Select(subplan) = subplan_result? else {
                 crate::bail_parse_error!("Only non-compound SELECT queries are currently supported in FROM clause subqueries");
             };
+
+            // Propagate column usage from LATERAL refs back to the parent's joined tables.
+            // This ensures covering index decisions account for columns used by LATERAL subqueries.
+            if is_lateral {
+                for lateral_ref in subplan
+                    .table_references
+                    .outer_query_refs()
+                    .iter()
+                    .filter(|r| r.is_lateral_ref && r.is_used())
+                {
+                    if let Some(parent_table) = table_references
+                        .find_joined_table_by_internal_id_mut(lateral_ref.internal_id)
+                    {
+                        parent_table.col_used_mask |= &lateral_ref.col_used_mask;
+                    }
+                }
+            }
+
             let cur_table_index = table_references.joined_tables().len();
             let identifier = maybe_alias
                 .map(|a| match a {
@@ -366,7 +423,12 @@ fn parse_from_clause_table(
             &args,
             connection,
         ),
-        _ => todo!(),
+        ast::SelectTable::Sub(_, _) => {
+            crate::bail_parse_error!(
+                "Parenthesized FROM clause syntax (e.g., '(table1, table2)') is not supported yet; \
+                use explicit JOINs instead"
+            )
+        }
     }
 }
 
@@ -455,7 +517,9 @@ fn parse_table(
             .cloned()
             .or_else(|| Some(ast::As::As(table_name.clone())));
 
-        // Recursively call parse_from_clause_table with the view as a SELECT
+        // Recursively call parse_from_clause_table with the view as a SELECT.
+        // Views are expanded as non-LATERAL subqueries - their column references were
+        // resolved at view creation time, not invocation time.
         let result = parse_from_clause_table(
             ast::SelectTable::Select(*subselect.clone(), view_alias),
             resolver,
@@ -464,6 +528,7 @@ fn parse_table(
             vtab_predicates,
             ctes,
             connection,
+            false, // Views are not LATERAL
         );
         view.done();
         return result;
@@ -696,10 +761,14 @@ pub fn parse_from(
                     internal_id: t.internal_id,
                     table: t.table.clone(),
                     col_used_mask: ColumnUsedMask::default(),
+                    is_lateral_ref: false, // CTEs are not LATERAL refs
                 }
             }));
 
             // CTE can refer to other CTEs that came before it, plus any schema tables or tables in the outer scope.
+            // Check subquery nesting depth before recursing to prevent deeply nested CTEs
+            // from exceeding the maximum subquery depth limit.
+            program.try_incr_nesting()?;
             let cte_plan = prepare_select_plan(
                 cte.select,
                 resolver,
@@ -707,7 +776,9 @@ pub fn parse_from(
                 &outer_query_refs_for_cte,
                 QueryDestination::placeholder_for_subquery(),
                 connection,
-            )?;
+            );
+            program.decr_nesting();
+            let cte_plan = cte_plan?;
             let Plan::Select(cte_plan) = cte_plan else {
                 crate::bail_parse_error!("Only SELECT queries are currently supported in CTEs");
             };
@@ -724,6 +795,8 @@ pub fn parse_from(
     let from_owned = std::mem::take(&mut from).unwrap();
     let select_owned = from_owned.select;
     let joins_owned = from_owned.joins;
+    // Parse the first table in the FROM clause - it cannot be LATERAL since
+    // there are no preceding tables to reference
     parse_from_clause_table(
         *select_owned,
         resolver,
@@ -732,6 +805,7 @@ pub fn parse_from(
         vtab_predicates,
         &mut ctes_as_subqueries,
         connection,
+        false, // First table cannot be LATERAL
     )?;
 
     for join in joins_owned.into_iter() {
@@ -1094,17 +1168,9 @@ fn parse_join(
         constraint,
     } = join;
 
-    parse_from_clause_table(
-        table.as_ref().clone(),
-        resolver,
-        program,
-        table_references,
-        vtab_predicates,
-        ctes,
-        connection,
-    )?;
-
-    let (outer, natural) = match join_operator {
+    // Extract join flags from the operator BEFORE processing the table,
+    // since LATERAL affects how the table's subquery references are resolved
+    let (outer, natural, is_lateral) = match &join_operator {
         ast::JoinOperator::TypedJoin(Some(join_type)) => {
             if join_type.contains(JoinType::RIGHT) {
                 crate::bail_parse_error!("RIGHT JOIN is not supported");
@@ -1114,10 +1180,22 @@ fn parse_join(
             }
             let is_outer = join_type.contains(JoinType::OUTER);
             let is_natural = join_type.contains(JoinType::NATURAL);
-            (is_outer, is_natural)
+            let is_lateral = join_type.contains(JoinType::LATERAL);
+            (is_outer, is_natural, is_lateral)
         }
-        _ => (false, false),
+        _ => (false, false, false),
     };
+
+    parse_from_clause_table(
+        table.as_ref().clone(),
+        resolver,
+        program,
+        table_references,
+        vtab_predicates,
+        ctes,
+        connection,
+        is_lateral,
+    )?;
 
     if natural && constraint.is_some() {
         crate::bail_parse_error!("NATURAL JOIN cannot be combined with ON or USING clause");
@@ -1293,7 +1371,11 @@ fn parse_join(
         .joined_tables_mut()
         .get_mut(last_idx)
         .unwrap();
-    rightmost_table.join_info = Some(JoinInfo { outer, using });
+    rightmost_table.join_info = Some(JoinInfo {
+        outer,
+        lateral: is_lateral,
+        using,
+    });
 
     Ok(())
 }

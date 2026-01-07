@@ -59,7 +59,7 @@ uv-sync-test:
 	uv sync --all-extras --dev --package turso_test
 .PHONE: uv-sync
 
-test: build uv-sync-test test-compat test-alter-column test-vector test-sqlite3 test-shell test-memory test-write test-update test-constraint test-collate test-extensions test-mvcc test-matviews
+test: build uv-sync-test test-compat test-alter-column test-vector test-sqlite3 test-shell test-memory test-write test-update test-constraint test-collate test-extensions test-mvcc test-matviews test-lateral
 .PHONY: test
 
 test-extensions: build uv-sync-test
@@ -73,8 +73,19 @@ test-shell: build uv-sync-test
 test-compat: check-tcl-version
 	RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) ./testing/all.test
 
-test-compat-mvcc: check-tcl-version
-	RUST_LOG=$(RUST_LOG) SQLITE_EXEC=scripts/turso-mvcc-sqlite3 ./testing/all-mvcc.test
+# Reset testing databases to their original state from git
+# This is necessary because MVCC tests modify the database headers
+reset-test-dbs:
+	@echo "Resetting testing databases to original state..."
+	@git checkout testing/testing.db testing/testing_norowidalias.db 2>/dev/null || true
+	@rm -f testing/testing.db-log testing/testing.db-wal testing/testing_norowidalias.db-log testing/testing_norowidalias.db-wal 2>/dev/null || true
+.PHONY: reset-test-dbs
+
+test-compat-mvcc: check-tcl-version reset-test-dbs
+	RUST_LOG=$(RUST_LOG) SQLITE_EXEC=scripts/turso-mvcc-sqlite3 ./testing/all-mvcc.test; \
+	ret=$$?; \
+	$(MAKE) reset-test-dbs; \
+	exit $$ret
 
 test-single: check-tcl-version
 	@if [ -z "$(TEST)" ]; then \
@@ -96,6 +107,10 @@ test-time:
 test-matviews:
 	RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) ./testing/materialized_views.test
 .PHONY: test-matviews
+
+test-lateral:
+	RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) ./testing/lateral-join.test
+.PHONY: test-lateral
 
 test-alter-column:
 	RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) ./testing/alter_column.test

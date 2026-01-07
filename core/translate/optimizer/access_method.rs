@@ -104,6 +104,10 @@ pub fn find_best_access_method_for_join_order(
             input_cardinality,
             base_row_count,
         ),
+        // TODO(performance): LATERAL subqueries are re-executed for each row from preceding
+        // tables. The cost model should multiply the base subquery cost by the driving table's
+        // cardinality to better reflect the actual execution cost. Currently all FROM-clause
+        // subqueries are treated uniformly regardless of correlation.
         Table::FromClauseSubquery(_) => Ok(Some(AccessMethod {
             cost: estimate_cost_for_scan_or_seek(None, &[], &[], input_cardinality, base_row_count),
             params: AccessMethodParams::Subquery,
@@ -432,9 +436,16 @@ pub fn try_hash_join_access_method(
         return None;
     }
     // Hash joins only support INNER JOIN semantics.
-    // Don't use hash joins for any form of OUTER JOINs
-    if build_table.join_info.as_ref().is_some_and(|ji| ji.outer)
-        || probe_table.join_info.as_ref().is_some_and(|ji| ji.outer)
+    // Don't use hash joins for any form of OUTER JOINs or LATERAL JOINs.
+    // LATERAL joins require re-execution per outer row and cannot use hash join.
+    if build_table
+        .join_info
+        .as_ref()
+        .is_some_and(|ji| ji.outer || ji.lateral)
+        || probe_table
+            .join_info
+            .as_ref()
+            .is_some_and(|ji| ji.outer || ji.lateral)
     {
         return None;
     }

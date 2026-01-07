@@ -55,6 +55,34 @@ impl JoinN {
     }
 }
 
+/// Compute the dependency masks for tables that require non-commutative join ordering.
+///
+/// For OUTER joins and LATERAL joins, the RHS table depends on all preceding tables
+/// being joined first. This function builds a map from each such table's index to
+/// a bitmask of all tables that must precede it in the join order.
+///
+/// Example: For "a JOIN b LEFT JOIN c LATERAL JOIN d":
+/// - Table c (LEFT JOIN) requires {a, b} to be joined first
+/// - Table d (LATERAL) requires {a, b, c} to be joined first
+fn compute_non_commutative_join_deps(joined_tables: &[JoinedTable]) -> HashMap<usize, TableMask> {
+    joined_tables
+        .iter()
+        .enumerate()
+        .filter(|(_, t)| {
+            t.join_info
+                .as_ref()
+                .is_some_and(|ji| ji.outer || ji.lateral)
+        })
+        .map(|(j, _)| {
+            let mut required = TableMask::new();
+            for k in 0..j {
+                required.add_table(k);
+            }
+            (j, required)
+        })
+        .collect()
+}
+
 /// Join n-1 tables with the n'th table.
 /// Returns None if the plan is worse than the provided cost upper bound or if no valid access method is found.
 ///
@@ -790,9 +818,27 @@ pub fn compute_best_join_order<'a>(
     let mut best_plan_memo: HashMap<TableMask, HashMap<usize, JoinN>> =
         HashMap::with_capacity(2usize.pow(num_tables as u32 - 1));
 
+    // Compute non-commutative join dependencies BEFORE the base case loop.
+    // Tables with OUTER/LATERAL join constraints cannot be valid starting points
+    // because they require predecessor tables to be joined first.
+    //
+    // Examples:
+    // "a LEFT JOIN b" can NOT be reordered as "b LEFT JOIN a".
+    // "a LATERAL JOIN (SELECT a.x)" can NOT be reordered - the LATERAL subquery depends on 'a'.
+    let non_commutative_join_deps = compute_non_commutative_join_deps(joined_tables);
+
     // Dynamic programming base case: calculate the best way to access each single table, as if
     // there were no other tables.
+    // IMPORTANT: Skip tables with non-commutative dependencies - they can only be added as RHS
+    // when their required predecessor tables are already in the LHS.
     for i in 0..num_tables {
+        // Tables with OUTER/LATERAL join constraints cannot be valid 1-table subsets.
+        // They must be added via the RHS path where the constraint check ensures
+        // all required predecessors are present.
+        if non_commutative_join_deps.contains_key(&i) {
+            continue;
+        }
+
         let mut mask = TableMask::new();
         mask.add_table(i);
         let table_ref = &joined_tables[i];
@@ -823,39 +869,6 @@ pub fn compute_best_join_order<'a>(
     }
     join_order.clear();
 
-    // As mentioned, inner joins are commutative. Outer joins are NOT.
-    // Example:
-    // "a LEFT JOIN b" can NOT be reordered as "b LEFT JOIN a".
-    // If there are outer joins in the plan, ensure correct ordering.
-    let left_join_illegal_map = {
-        let left_join_count = joined_tables
-            .iter()
-            .filter(|t| t.join_info.as_ref().is_some_and(|j| j.outer))
-            .count();
-        if left_join_count == 0 {
-            None
-        } else {
-            // map from rhs table index to lhs table index
-            let mut left_join_illegal_map: HashMap<usize, TableMask> =
-                HashMap::with_capacity(left_join_count);
-            for (i, _) in joined_tables.iter().enumerate() {
-                for (j, joined_table) in joined_tables.iter().enumerate().skip(i + 1) {
-                    if joined_table.join_info.as_ref().is_some_and(|j| j.outer) {
-                        // bitwise OR the masks
-                        if let Some(illegal_lhs) = left_join_illegal_map.get_mut(&i) {
-                            illegal_lhs.add_table(j);
-                        } else {
-                            let mut mask = TableMask::new();
-                            mask.add_table(j);
-                            left_join_illegal_map.insert(i, mask);
-                        }
-                    }
-                }
-            }
-            Some(left_join_illegal_map)
-        }
-    };
-
     // Now that we have our single-table base cases, we can start considering join subsets of 2 tables and more.
     // Try to join each single table to each other table.
     for subset_size in 2..=num_tables {
@@ -882,14 +895,11 @@ pub fn compute_best_join_order<'a>(
                     continue;
                 }
 
-                // If this join ordering would violate LEFT JOIN ordering restrictions, skip.
-                if let Some(illegal_lhs) = left_join_illegal_map
-                    .as_ref()
-                    .and_then(|deps| deps.get(&rhs_idx))
-                {
-                    let legal = !lhs_mask.intersects(illegal_lhs);
-                    if !legal {
-                        continue; // Don't allow RHS before its LEFT in LEFT JOIN
+                // OUTER/LATERAL join RHS tables require all preceding tables to be joined first.
+                // This check ensures we don't add table j until all tables 0..j are present.
+                if let Some(required) = non_commutative_join_deps.get(&rhs_idx) {
+                    if !lhs_mask.contains_all(required) {
+                        continue; // Don't allow RHS before its prerequisite tables in OUTER/LATERAL joins
                     }
                 }
 
@@ -1055,26 +1065,20 @@ pub fn compute_greedy_join_order<'a>(
         return Ok(None);
     }
 
-    // Outer join RHS tables require all preceding tables to be joined first.
-    let left_join_deps: HashMap<usize, TableMask> = joined_tables
-        .iter()
-        .enumerate()
-        .filter(|(_, t)| t.join_info.as_ref().is_some_and(|ji| ji.outer))
-        .map(|(j, _)| {
-            let mut required = TableMask::new();
-            for k in 0..j {
-                required.add_table(k);
-            }
-            (j, required)
-        })
-        .collect();
+    // Outer join and LATERAL join RHS tables require all preceding tables to be joined first.
+    // LATERAL subqueries reference columns from preceding tables, so they have the same constraint.
+    let non_commutative_deps = compute_non_commutative_join_deps(joined_tables);
 
     let mut remaining: Vec<usize> = (0..num_tables).collect();
     let mut join_order: Vec<JoinOrderMember> = Vec::with_capacity(num_tables);
 
     // Pick starting table: prefer tables with high "hub score" (referenced by many constraints).
-    let first_idx =
-        find_best_starting_table(num_tables, constraints, base_table_rows, &left_join_deps);
+    let first_idx = find_best_starting_table(
+        num_tables,
+        constraints,
+        base_table_rows,
+        &non_commutative_deps,
+    );
     let first_table = &joined_tables[first_idx];
     join_order.push(JoinOrderMember {
         table_id: first_table.internal_id,
@@ -1117,8 +1121,8 @@ pub fn compute_greedy_join_order<'a>(
 
         let mut has_connected_candidate = false;
         for &idx in &remaining {
-            // Outer join RHS requires all preceding tables joined first
-            if let Some(required) = left_join_deps.get(&idx) {
+            // OUTER/LATERAL join RHS requires all preceding tables joined first
+            if let Some(required) = non_commutative_deps.get(&idx) {
                 if !current_mask.contains_all(required) {
                     continue;
                 }
@@ -1139,7 +1143,7 @@ pub fn compute_greedy_join_order<'a>(
 
         for &idx in &remaining {
             // Outer join RHS requires all preceding tables joined first
-            if let Some(required) = left_join_deps.get(&idx) {
+            if let Some(required) = non_commutative_deps.get(&idx) {
                 if !current_mask.contains_all(required) {
                     continue;
                 }
@@ -1215,12 +1219,12 @@ pub fn compute_greedy_join_order<'a>(
 /// starting there allows all dimensions to use their PK indexes.
 ///
 /// Score = (base_rows * filter_selectivity) / (1 + hub_score)
-/// Lower score wins. Outer join RHS tables are excluded (have ordering dependencies).
+/// Lower score wins. OUTER/LATERAL join RHS tables are excluded (have ordering dependencies).
 fn find_best_starting_table(
     num_tables: usize,
     constraints: &[TableConstraints],
     base_table_rows: &[RowCountEstimate],
-    left_join_deps: &HashMap<usize, TableMask>,
+    non_commutative_deps: &HashMap<usize, TableMask>,
 ) -> usize {
     // hub_score[t] = count of usable constraints on OTHER tables that reference t.
     // If we join t first, each such constraint becomes usable for an index lookup.
@@ -1237,8 +1241,8 @@ fn find_best_starting_table(
 
     let mut best: Option<(usize, f64)> = None;
     for t in 0..num_tables {
-        if left_join_deps.contains_key(&t) {
-            continue; // Outer join RHS - cannot be first
+        if non_commutative_deps.contains_key(&t) {
+            continue; // OUTER/LATERAL join RHS - cannot be first
         }
 
         let base_rows = *base_table_rows[t];
@@ -1677,6 +1681,7 @@ mod tests {
                 t2.clone(),
                 Some(JoinInfo {
                     outer: false,
+                    lateral: false,
                     using: vec![],
                 }),
                 table_id_counter.next(),
@@ -1792,6 +1797,7 @@ mod tests {
                 table_customers.clone(),
                 Some(JoinInfo {
                     outer: false,
+                    lateral: false,
                     using: vec![],
                 }),
                 table_id_counter.next(),
@@ -1800,6 +1806,7 @@ mod tests {
                 table_order_items.clone(),
                 Some(JoinInfo {
                     outer: false,
+                    lateral: false,
                     using: vec![],
                 }),
                 table_id_counter.next(),
@@ -1994,6 +2001,7 @@ mod tests {
                 t2.clone(),
                 Some(JoinInfo {
                     outer: false,
+                    lateral: false,
                     using: vec![],
                 }),
                 table_id_counter.next(),
@@ -2002,6 +2010,7 @@ mod tests {
                 t3.clone(),
                 Some(JoinInfo {
                     outer: false,
+                    lateral: false,
                     using: vec![],
                 }),
                 table_id_counter.next(),
@@ -2109,6 +2118,7 @@ mod tests {
                     t.clone(),
                     Some(JoinInfo {
                         outer: false,
+                        lateral: false,
                         using: vec![],
                     }),
                     table_id_counter.next(),
@@ -2118,6 +2128,7 @@ mod tests {
                 fact_table.clone(),
                 Some(JoinInfo {
                     outer: false,
+                    lateral: false,
                     using: vec![],
                 }),
                 table_id_counter.next(),
@@ -2805,6 +2816,7 @@ mod tests {
                 t2.clone(),
                 Some(JoinInfo {
                     outer: false,
+                    lateral: false,
                     using: vec![],
                 }),
                 table_id_counter.next(),

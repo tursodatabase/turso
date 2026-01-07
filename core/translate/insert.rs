@@ -1330,7 +1330,7 @@ fn init_source_emission<'a>(
                     yield_reg,
                     coroutine_implementation_start: ctx.halt_label,
                 };
-                program.incr_nesting();
+                program.try_incr_nesting()?;
                 let result =
                     translate_select(select, resolver, program, query_destination, connection)?;
                 if result.num_result_cols != required_column_count {

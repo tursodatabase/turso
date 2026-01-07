@@ -155,6 +155,7 @@ pub fn translate_alter_table(
                             internal_id: TableInternalId::from(0),
                             table: Table::BTree(Arc::new(btree.clone())),
                             col_used_mask: ColumnUsedMask::default(),
+                            is_lateral_ref: false,
                         }],
                     );
                     let where_copy = index
