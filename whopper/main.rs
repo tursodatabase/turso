@@ -82,6 +82,7 @@ struct Stats {
     inserts: usize,
     updates: usize,
     deletes: usize,
+    checkpoints: usize,
     integrity_checks: usize,
 }
 
@@ -226,7 +227,7 @@ fn main() -> anyhow::Result<()> {
 
     let progress_interval = config.max_steps / 10;
     let progress_stages = [
-        "       .             I/U/D/C",
+        "       .             I/U/D/CK/INT",
         "       .             ",
         "       .             ",
         "       |             ",
@@ -248,11 +249,12 @@ fn main() -> anyhow::Result<()> {
         io.step()?;
         if progress_interval > 0 && (i + 1) % progress_interval == 0 {
             println!(
-                "{}{}/{}/{}/{}",
+                "{}{}/{}/{}/{}/{}",
                 progress_stages[progress_index],
                 context.stats.inserts,
                 context.stats.updates,
                 context.stats.deletes,
+                context.stats.checkpoints,
                 context.stats.integrity_checks
             );
             progress_index += 1;
@@ -535,6 +537,16 @@ fn perform_work(
                     trace!("{} {}", fiber_idx, begin_cmd);
                 }
             } else if action == 30 {
+                // WAL checkpoint with random mode
+                let checkpoint_modes = ["PASSIVE", "FULL", "RESTART", "TRUNCATE"];
+                let mode = checkpoint_modes[rng.random_range(0..checkpoint_modes.len())];
+                let sql = format!("PRAGMA wal_checkpoint({})", mode);
+                if let Ok(stmt) = context.fibers[fiber_idx].connection.prepare(&sql) {
+                    context.fibers[fiber_idx].statement.replace(Some(stmt));
+                    context.stats.checkpoints += 1;
+                    trace!("{} {}", fiber_idx, sql);
+                }
+            } else if action == 31 {
                 // Integrity check
                 if let Ok(stmt) = context.fibers[fiber_idx]
                     .connection
