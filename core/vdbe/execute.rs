@@ -415,7 +415,9 @@ pub fn op_checkpoint(
             Ok(InsnFunctionStepResult::Step)
         }
         Ok(IOResult::IO(io)) => Ok(InsnFunctionStepResult::IO(io)),
-        Err(_err) => {
+        Err(err) => {
+            tracing::error!("PRAGMA wal_checkpoint failed: {err:?}");
+            program.connection.pager.load().clear_checkpoint_state();
             state.registers[*dest] = Register::Value(Value::Integer(1));
             state.pc += 1;
             Ok(InsnFunctionStepResult::Step)
