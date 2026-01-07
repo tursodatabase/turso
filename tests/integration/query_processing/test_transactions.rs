@@ -1517,3 +1517,64 @@ fn test_rollback_without_mvcc() {
     let row = helper_read_single_row(stmt);
     assert_eq!(row[0], Value::Text("initial".into()));
 }
+
+
+#[test]
+fn test_wal_savepoint_rollback_on_constraint_violation() {
+    let tmp_db = TempDatabase::new("test_90969.db");
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("PRAGMA cache_size = 200").unwrap();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, u INTEGER UNIQUE, val TEXT)")
+        .unwrap();
+
+    let padding = "x".repeat(2000);
+    conn.execute("BEGIN").unwrap();
+    for i in 1..=1000 {
+        conn.execute(&format!("INSERT INTO t VALUES ({i}, {i}, '{padding}')"))
+            .unwrap();
+    }
+    conn.execute("COMMIT").unwrap();
+
+    conn.execute("BEGIN").unwrap();
+
+
+    let result =
+        conn.execute("UPDATE t SET val = 'modified', u = CASE WHEN id = 1000 THEN 1 ELSE u END");
+    assert!(
+        matches!(result, Err(LimboError::Constraint(_))),
+        "Expected UNIQUE constraint violation, got: {result:?}"
+    );
+
+    let stmt = conn
+        .query("SELECT val FROM t WHERE id = 1")
+        .unwrap()
+        .unwrap();
+    let row = helper_read_single_row(stmt);
+    let Value::Text(val) = &row[0] else {
+        panic!("Expected text value");
+    };
+    assert_eq!(
+        val.as_str(),
+        &padding,
+        "Row should have original value after failed UPDATE rollback"
+    );
+
+    conn.execute("INSERT INTO t VALUES (1001, 1001, 'new')")
+        .unwrap();
+    conn.execute("COMMIT").unwrap();
+
+    let stmt = conn.query("PRAGMA integrity_check").unwrap().unwrap();
+    println!("{:?}", stmt);
+    let row = helper_read_single_row(stmt);
+    assert_eq!(
+        row[0],
+        Value::build_text("ok"),
+        "Database should pass integrity check after savepoint rollback"
+    );
+
+    let stmt = conn.query("SELECT COUNT(*) FROM t").unwrap().unwrap();
+    let row = helper_read_single_row(stmt);
+    assert_eq!(row[0], Value::Integer(1001));
+}
