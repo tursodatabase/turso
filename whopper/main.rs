@@ -470,6 +470,21 @@ fn perform_work(
                             context.fibers[fiber_idx].state = FiberState::Idle;
                             return Ok(());
                         }
+                        turso_core::LimboError::BusySnapshot => {
+                            trace!("{} Stale snapshot, rolling back transaction", fiber_idx);
+                            drop(stmt_borrow);
+                            context.fibers[fiber_idx].statement.replace(None);
+                            if matches!(context.fibers[fiber_idx].state, FiberState::InTx)
+                                && let Ok(rollback_stmt) =
+                                    context.fibers[fiber_idx].connection.prepare("ROLLBACK")
+                            {
+                                context.fibers[fiber_idx]
+                                    .statement
+                                    .replace(Some(rollback_stmt));
+                                context.fibers[fiber_idx].state = FiberState::Idle;
+                            }
+                            return Ok(());
+                        }
                         _ => {
                             return Err(e.into());
                         }
