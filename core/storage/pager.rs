@@ -959,6 +959,9 @@ enum CheckpointPhase {
     TruncateDbFile {
         sync_mode: crate::SyncMode,
         clear_page_cache: bool,
+        /// Whether we've invalidated page 1 from cache (needed because checkpoint may write
+        /// pages directly from WALto DB file, so cached page 1 of the checkpointer connection may have stale database_size)
+        page1_invalidated: bool,
     },
     /// Sync the database file after checkpoint (if sync_mode != Off and we backfilled any frames from the WAL).
     SyncDbFile { clear_page_cache: bool },
@@ -3404,6 +3407,7 @@ impl Pager {
                         state.phase = CheckpointPhase::TruncateDbFile {
                             sync_mode,
                             clear_page_cache,
+                            page1_invalidated: false,
                         };
                     } else if res.num_backfilled == 0 || sync_mode == crate::SyncMode::Off {
                         state.phase = CheckpointPhase::Finalize { clear_page_cache };
@@ -3415,6 +3419,7 @@ impl Pager {
                 CheckpointPhase::TruncateDbFile {
                     sync_mode,
                     clear_page_cache,
+                    page1_invalidated,
                 } => {
                     let should_skip_truncate = {
                         let state = self.checkpoint_state.read();
@@ -3431,6 +3436,18 @@ impl Pager {
                             state.phase = CheckpointPhase::SyncDbFile { clear_page_cache };
                         }
                         continue;
+                    }
+                    // Invalidate page 1 (header) in cache before reading - checkpoint potentially wrote pages
+                    // directly to DB file from the WAL, so the checkpointer connections' page 1 may have stale database_size.
+                    if !page1_invalidated {
+                        let page1_key = PageCacheKey::new(DatabaseHeader::PAGE_ID);
+                        self.page_cache.write().delete(page1_key)?;
+                        let mut state = self.checkpoint_state.write();
+                        state.phase = CheckpointPhase::TruncateDbFile {
+                            sync_mode,
+                            clear_page_cache,
+                            page1_invalidated: true,
+                        };
                     }
 
                     // Truncate the database file unless already at correct size
