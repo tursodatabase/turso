@@ -31,7 +31,7 @@ make test
 make test-single TEST=modulename.test
 
 # Run the CLI
-cargo run --package turso_cli --bin tursodb database.db
+cargo run --package turso_cli -q -m list --bin tursodb database.db
 
 # Format code (ALWAYS run before committing)
 cargo fmt
