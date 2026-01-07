@@ -1563,12 +1563,12 @@ fn test_wal_savepoint_rollback_on_constraint_violation() {
         .unwrap();
     conn.execute("COMMIT").unwrap();
 
-    let stmt = conn.query("PRAGMA integrity_check").unwrap().unwrap();
-    println!("{stmt:?}");
-    let row = helper_read_single_row(stmt);
+    let rusqlite_conn = rusqlite::Connection::open(tmp_db.path.clone()).unwrap();
+    let result: String = rusqlite_conn
+        .pragma_query_value(None, "integrity_check", |row| row.get(0))
+        .unwrap();
     assert_eq!(
-        row[0],
-        Value::build_text("ok"),
+        result, "ok",
         "Database should pass integrity check after savepoint rollback"
     );
 

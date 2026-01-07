@@ -31,6 +31,13 @@ use crate::{
     CompletionError, IOContext, LimboError, Result,
 };
 
+/// this contains the frame to rollback to and its associated checksum.
+#[derive(Debug, Clone)]
+pub struct RollbackTo {
+    pub frame: u64,
+    pub checksum: (u32, u32),
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct CheckpointResult {
     /// number of frames in WAL that could have been backfilled
@@ -333,7 +340,7 @@ pub trait Wal: Debug + Send + Sync {
     fn get_checkpoint_seq(&self) -> u32;
     fn get_max_frame(&self) -> u64;
     fn get_min_frame(&self) -> u64;
-    fn rollback(&self, to_frame: Option<u64>, checksum: Option<(u32, u32)>);
+    fn rollback(&self, rollback_to: Option<RollbackTo>);
     fn abort_checkpoint(&self);
     fn get_last_checksum(&self) -> (u32, u32);
 
@@ -1511,10 +1518,16 @@ impl Wal for WalFile {
     }
     #[instrument(skip_all, level = Level::DEBUG)]
 
-    fn rollback(&self, to_frame: Option<u64>, checksum: Option<(u32, u32)>) {
+    fn rollback(&self, rollback_to: Option<RollbackTo>) {
         let (max_frame, last_checksum) = self.with_shared(|shared| {
-            let max_frame = to_frame.unwrap_or_else(|| shared.max_frame.load(Ordering::Acquire));
-            let last_checksum = checksum.unwrap_or(shared.last_checksum);
+            let max_frame = rollback_to
+                .as_ref()
+                .map(|r| r.frame)
+                .unwrap_or_else(|| shared.max_frame.load(Ordering::Acquire));
+            let last_checksum = rollback_to
+                .as_ref()
+                .map(|r| r.checksum)
+                .unwrap_or(shared.last_checksum);
             let mut frame_cache = shared.frame_cache.lock();
             frame_cache.retain(|_page_id, frames| {
                 // keep frames <= max_frame

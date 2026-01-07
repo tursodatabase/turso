@@ -11,7 +11,7 @@ use crate::storage::{
         CELL_PTR_SIZE_BYTES, INTERIOR_PAGE_HEADER_SIZE_BYTES, LEAF_PAGE_HEADER_SIZE_BYTES,
         MINIMUM_CELL_SIZE,
     },
-    wal::{CheckpointResult, Wal, IOV_MAX},
+    wal::{CheckpointResult, RollbackTo, Wal, IOV_MAX},
 };
 use crate::types::{IOCompletions, WalState};
 use crate::util::IOExt as _;
@@ -1636,7 +1636,10 @@ impl Pager {
         if let Some(wal) = &self.wal {
             let wal_max_frame = savepoint.wal_max_frame.load(Ordering::SeqCst);
             let wal_checksum = *savepoint.wal_checksum.read();
-            wal.rollback(Some(wal_max_frame), Some(wal_checksum));
+            wal.rollback(Some(RollbackTo {
+                frame: wal_max_frame,
+                checksum: wal_checksum,
+            }));
         }
 
         Ok(true)
@@ -4156,7 +4159,7 @@ impl Pager {
         }
         if is_write {
             if let Some(wal) = self.wal.as_ref() {
-                wal.rollback(None, None);
+                wal.rollback(None);
             }
         }
     }
