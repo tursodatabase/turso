@@ -1,13 +1,13 @@
 use branches::mark_unlikely;
 use turso_parser::ast::SortOrder;
 
+use crate::sync::{atomic, Arc};
 use bumpalo::Bump;
 use parking_lot::RwLock;
 use std::cmp::{Eq, Ord, Ordering, PartialEq, PartialOrd, Reverse};
 use std::collections::BinaryHeap;
 use std::ptr::NonNull;
 use std::rc::Rc;
-use std::sync::{atomic, Arc};
 
 use crate::io::TempFile;
 use crate::types::{IOCompletions, ValueIterator};

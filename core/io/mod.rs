@@ -1,5 +1,6 @@
 use crate::storage::buffer_pool::ArenaBuffer;
 use crate::storage::sqlite3_ondisk::WAL_FRAME_HEADER_SIZE;
+use crate::sync::Arc;
 use crate::{turso_assert, BufferPool, Result};
 use bitflags::bitflags;
 use cfg_block::cfg_block;
@@ -7,7 +8,6 @@ use rand::{Rng, RngCore};
 use std::cell::RefCell;
 use std::fmt;
 use std::ptr::NonNull;
-use std::sync::Arc;
 use std::{fmt::Debug, pin::Pin};
 
 cfg_block! {
@@ -49,7 +49,7 @@ pub trait File: Send + Sync {
     fn pwrite(&self, pos: u64, buffer: Arc<Buffer>, c: Completion) -> Result<Completion>;
     fn sync(&self, c: Completion) -> Result<Completion>;
     fn pwritev(&self, pos: u64, buffers: Vec<Arc<Buffer>>, c: Completion) -> Result<Completion> {
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        use crate::sync::atomic::{AtomicUsize, Ordering};
         if buffers.is_empty() {
             c.complete(0);
             return Ok(c);

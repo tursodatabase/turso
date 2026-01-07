@@ -1,7 +1,7 @@
+use crate::sync::atomic::{AtomicBool, Ordering};
 use std::{
     cell::UnsafeCell,
     ops::{Deref, DerefMut},
-    sync::atomic::{AtomicBool, Ordering},
 };
 
 #[derive(Debug)]
@@ -59,7 +59,7 @@ impl<T> SpinLock<T> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use crate::sync::Arc;
 
     use super::SpinLock;
 

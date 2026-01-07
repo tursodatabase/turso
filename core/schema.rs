@@ -121,6 +121,7 @@ impl Trigger {
 }
 
 use crate::storage::btree::{BTreeCursor, CursorTrait};
+use crate::sync::Arc;
 use crate::translate::collate::CollationSeq;
 use crate::translate::plan::{SelectPlan, TableReferences};
 use crate::util::{
@@ -135,7 +136,6 @@ use core::fmt;
 use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Deref;
-use std::sync::Arc;
 use tracing::trace;
 use turso_parser::ast::{
     self, ColumnDefinition, Expr, InitDeferredPred, Literal, RefAct, SortOrder, TableOptions,

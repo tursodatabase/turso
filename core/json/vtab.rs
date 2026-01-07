@@ -1,6 +1,6 @@
-use parking_lot::RwLock;
+use crate::sync::{Arc, RwLock};
 use std::iter::successors;
-use std::{result::Result, sync::Arc};
+use std::result::Result;
 
 use turso_ext::{ConstraintOp, ConstraintUsage, ResultCode};
 
@@ -72,7 +72,7 @@ impl InternalVirtualTable for JsonVirtualTable {
     fn open(
         &self,
         _conn: Arc<Connection>,
-    ) -> crate::Result<std::sync::Arc<RwLock<dyn InternalVirtualTableCursor + 'static>>> {
+    ) -> crate::Result<Arc<RwLock<dyn InternalVirtualTableCursor + 'static>>> {
         Ok(Arc::new(RwLock::new(JsonEachCursor::empty(
             self.traversal_mode.clone(),
         ))))

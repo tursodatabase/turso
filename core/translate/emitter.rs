@@ -1,9 +1,9 @@
 // This module contains code for emitting bytecode instructions for SQL query execution.
 // It handles translating high-level SQL operations into low-level bytecode that can be executed by the virtual machine.
 
+use crate::sync::Arc;
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroUsize;
-use std::sync::Arc;
 
 use tracing::{instrument, Level};
 use turso_parser::ast::{self, Expr, Literal, TableInternalId, TriggerEvent, TriggerTime};

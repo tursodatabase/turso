@@ -15,6 +15,7 @@ use crate::incremental::operator::{
 use crate::schema::Type;
 use crate::storage::btree::{BTreeCursor, BTreeKey, CursorTrait};
 // Note: logical module must be made pub(crate) in translate/mod.rs
+use crate::sync::{atomic::Ordering, Arc};
 use crate::translate::logical::{
     BinaryOperator, Column, ColumnInfo, JoinType as LogicalJoinType, LogicalExpr, LogicalPlan,
     LogicalSchema, SchemaRef,
@@ -24,7 +25,6 @@ use crate::Pager;
 use crate::{return_and_restore_if_io, return_if_io, LimboError, Result};
 use std::collections::HashMap;
 use std::fmt::{self, Display, Formatter};
-use std::sync::{atomic::Ordering, Arc};
 
 // The state table has 5 columns: operator_id, zset_id, element_id, value, weight
 const OPERATOR_COLUMNS: usize = 5;
@@ -1630,8 +1630,8 @@ impl DbspCompiler {
         // For all expressions (simple or complex), use CompiledExpression::compile
         // This handles both trivial cases and complex VDBE compilation
         // We need to set up the necessary context
+        use crate::sync::Arc;
         use crate::{Database, MemoryIO, SymbolTable};
-        use std::sync::Arc;
 
         // Create an internal connection for expression compilation
         let io = Arc::new(MemoryIO::new());
@@ -2266,10 +2266,10 @@ mod tests {
     use crate::incremental::operator::{FilterOperator, FilterPredicate};
     use crate::schema::{BTreeTable, ColDef, Column as SchemaColumn, Schema, Type};
     use crate::storage::pager::CreateBTreeFlags;
+    use crate::sync::Arc;
     use crate::translate::logical::{ColumnInfo, LogicalPlanBuilder, LogicalSchema};
     use crate::util::IOExt;
     use crate::{Database, MemoryIO, Pager, IO};
-    use std::sync::Arc;
     use turso_parser::ast;
     use turso_parser::parser::Parser;
 

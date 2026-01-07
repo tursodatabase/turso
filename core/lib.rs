@@ -52,6 +52,10 @@ use crate::storage::encryption::AtomicCipherMode;
 use crate::storage::journal_mode;
 use crate::storage::pager::{self, AutoVacuumMode, HeaderRef, HeaderRefMut};
 use crate::storage::sqlite3_ondisk::{RawVersion, Version};
+use crate::sync::{
+    atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicUsize, Ordering},
+    Arc, LazyLock, Weak,
+};
 use crate::translate::pragma::TURSO_CDC_DEFAULT_TABLE_NAME;
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
 use crate::types::{WalFrameInfo, WalState};
@@ -82,10 +86,6 @@ use std::{
     collections::HashMap,
     fmt::{self, Display},
     ops::Deref,
-    sync::{
-        atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicUsize, Ordering},
-        Arc, LazyLock, Weak,
-    },
 };
 #[cfg(feature = "fs")]
 use storage::database::DatabaseFile;
@@ -300,7 +300,9 @@ impl fmt::Debug for Database {
 
         debug_struct.field(
             "n_connections",
-            &self.n_connections.load(std::sync::atomic::Ordering::SeqCst),
+            &self
+                .n_connections
+                .load(crate::sync::atomic::Ordering::SeqCst),
         );
         debug_struct.finish()
     }
@@ -773,7 +775,7 @@ impl Database {
             vtab_txn_states: RwLock::new(HashSet::new()),
         });
         self.n_connections
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            .fetch_add(1, crate::sync::atomic::Ordering::SeqCst);
         let builtin_syms = self.builtin_syms.read();
         // add built-in extensions symbols to the connection to prevent having to load each time
         conn.syms.write().extend(&builtin_syms);
@@ -1298,7 +1300,7 @@ impl Drop for Connection {
             // if connection wasn't properly closed, decrement the connection counter
             self.db
                 .n_connections
-                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                .fetch_sub(1, crate::sync::atomic::Ordering::SeqCst);
         }
     }
 }
@@ -2536,12 +2538,12 @@ impl Connection {
 
     pub fn get_data_sync_retry(&self) -> bool {
         self.data_sync_retry
-            .load(std::sync::atomic::Ordering::SeqCst)
+            .load(crate::sync::atomic::Ordering::SeqCst)
     }
 
     pub fn set_data_sync_retry(&self, value: bool) {
         self.data_sync_retry
-            .store(value, std::sync::atomic::Ordering::SeqCst);
+            .store(value, crate::sync::atomic::Ordering::SeqCst);
     }
 
     /// Creates a HashSet of modules that have been loaded

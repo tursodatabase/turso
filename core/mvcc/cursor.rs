@@ -8,6 +8,7 @@ use crate::mvcc::database::{
     SortableIndexKey,
 };
 use crate::storage::btree::{BTreeCursor, BTreeKey, CursorTrait};
+use crate::sync::Arc;
 use crate::translate::plan::IterationDirection;
 use crate::types::{
     compare_immutable, IOCompletions, IOResult, ImmutableRecord, IndexInfo, SeekKey, SeekOp,
@@ -18,7 +19,6 @@ use crate::{Pager, Value};
 use std::any::Any;
 use std::fmt::Debug;
 use std::ops::Bound;
-use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 enum CursorPosition {

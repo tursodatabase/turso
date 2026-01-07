@@ -13,6 +13,10 @@ use crate::storage::{
     },
     wal::{CheckpointResult, Wal, IOV_MAX},
 };
+use crate::sync::atomic::{
+    AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
+};
+use crate::sync::Arc;
 use crate::types::{IOCompletions, WalState};
 use crate::util::IOExt as _;
 use crate::{
@@ -24,10 +28,6 @@ use arc_swap::ArcSwapOption;
 use parking_lot::{Mutex, RwLock};
 use roaring::RoaringBitmap;
 use std::cell::UnsafeCell;
-use std::sync::atomic::{
-    AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
-};
-use std::sync::Arc;
 use tracing::{instrument, trace, Level};
 
 use super::btree::offset::{
@@ -4498,7 +4498,7 @@ pub(crate) mod ptrmap {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use crate::sync::Arc;
 
     use parking_lot::RwLock;
 
@@ -4533,7 +4533,7 @@ mod tests {
 #[cfg(test)]
 #[cfg(not(feature = "omit_autovacuum"))]
 mod ptrmap_tests {
-    use std::sync::Arc;
+    use crate::sync::Arc;
 
     use super::ptrmap::*;
     use super::*;

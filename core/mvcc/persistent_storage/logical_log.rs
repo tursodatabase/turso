@@ -1,5 +1,6 @@
 // FIXME: remove this once we add recovery
 #![allow(dead_code)]
+use crate::sync::Arc;
 use crate::{
     io::ReadComplete,
     mvcc::database::{LogRecord, MVTableId, Row, RowID, RowKey, RowVersion, SortableIndexKey},
@@ -9,7 +10,6 @@ use crate::{
     Buffer, Completion, CompletionError, LimboError, Result,
 };
 use parking_lot::RwLock;
-use std::sync::Arc;
 
 use crate::File;
 
@@ -650,6 +650,7 @@ mod tests {
         ChaCha8Rng,
     };
 
+    use crate::sync::Arc;
     use crate::{
         mvcc::database::{
             tests::{commit_tx, generate_simple_string_row, MvccTestDbNoConn},
@@ -658,7 +659,6 @@ mod tests {
         types::{ImmutableRecord, IndexInfo, Text},
         Value, ValueRef,
     };
-    use std::sync::Arc;
 
     use super::LogRecordType;
 

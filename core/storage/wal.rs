@@ -1,17 +1,17 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+use crate::sync::OnceLock;
 use parking_lot::Mutex;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::array;
 use std::borrow::Cow;
 use std::collections::BTreeMap;
-use std::sync::OnceLock;
 use strum::EnumString;
 use tracing::{instrument, Level};
 
+use crate::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use parking_lot::RwLock;
 use std::fmt::{Debug, Formatter};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::{fmt, sync::Arc};
 
 use super::buffer_pool::BufferPool;
@@ -500,7 +500,7 @@ struct OngoingCheckpoint {
 
 struct InflightWriteBatch {
     done: Arc<AtomicBool>,
-    err: Arc<std::sync::OnceLock<CompletionError>>,
+    err: Arc<crate::sync::OnceLock<CompletionError>>,
 }
 
 impl OngoingCheckpoint {
@@ -2834,6 +2834,7 @@ impl WalFileShared {
 
 #[cfg(test)]
 pub mod test {
+    use crate::sync::{atomic::Ordering, Arc};
     use crate::{
         storage::{
             sqlite3_ondisk::{self, WAL_HEADER_SIZE},
@@ -2847,7 +2848,6 @@ pub mod test {
     use parking_lot::{Mutex, RwLock};
     #[cfg(unix)]
     use std::os::unix::fs::MetadataExt;
-    use std::sync::{atomic::Ordering, Arc};
     #[allow(clippy::arc_with_non_send_sync)]
     pub(crate) fn get_database() -> (Arc<Database>, std::path::PathBuf) {
         let mut path = tempfile::tempdir().unwrap().keep();

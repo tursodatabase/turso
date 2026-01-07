@@ -1,8 +1,8 @@
 //! VDBE bytecode generation for pragma statements.
 //! More info: https://www.sqlite.org/pragma.html.
 
+use crate::sync::Arc;
 use chrono::Datelike;
-use std::sync::Arc;
 use turso_macros::match_ignore_ascii_case;
 use turso_parser::ast::{self, ColumnDefinition, Expr, Literal};
 use turso_parser::ast::{PragmaName, QualifiedName};

@@ -1,4 +1,5 @@
 use crate::schema::{Index, IndexColumn, Schema};
+use crate::sync::Arc;
 use crate::translate::collate::get_collseq_from_expr;
 use crate::translate::emitter::{emit_query, LimitCtx, Resolver, TranslateCtx};
 use crate::translate::expr::translate_expr;
@@ -7,7 +8,6 @@ use crate::vdbe::builder::{CursorType, ProgramBuilder};
 use crate::vdbe::insn::{to_u16, Insn};
 use crate::vdbe::BranchOffset;
 use crate::{emit_explain, LimboError, QueryMode, SymbolTable};
-use std::sync::Arc;
 use tracing::instrument;
 use turso_parser::ast::{CompoundOperator, Expr, Literal, SortOrder};
 

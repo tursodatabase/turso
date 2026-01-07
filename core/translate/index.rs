@@ -1,5 +1,5 @@
+use crate::sync::Arc;
 use std::collections::HashMap;
-use std::sync::Arc;
 
 use crate::bail_parse_error;
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;

@@ -5,10 +5,10 @@ use crate::incremental::dbsp::{Delta, DeltaPair};
 use crate::incremental::operator::{
     ComputationTracker, DbspStateCursors, EvalState, IncrementalOperator,
 };
+use crate::sync::Arc;
 use crate::types::IOResult;
 use crate::Result;
 use parking_lot::Mutex;
-use std::sync::Arc;
 
 /// Input operator - source of data for the circuit
 /// Represents base relations/tables that receive external updates

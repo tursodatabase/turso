@@ -6,10 +6,10 @@ use crate::incremental::expr_compiler::CompiledExpression;
 use crate::incremental::operator::{
     ComputationTracker, DbspStateCursors, EvalState, IncrementalOperator,
 };
+use crate::sync::{atomic::Ordering, Arc};
 use crate::types::IOResult;
 use crate::{Connection, Database, Result, Value};
 use parking_lot::Mutex;
-use std::sync::{atomic::Ordering, Arc};
 
 #[derive(Debug, Clone)]
 pub struct ProjectColumn {

@@ -6,10 +6,10 @@ use crate::incremental::dbsp::{Delta, DeltaPair};
 use crate::incremental::operator::{
     ComputationTracker, DbspStateCursors, EvalState, IncrementalOperator,
 };
+use crate::sync::Arc;
 use crate::types::IOResult;
 use crate::{Result, Value};
 use parking_lot::Mutex;
-use std::sync::Arc;
 
 /// Filter predicate for filtering rows
 #[derive(Debug, Clone)]

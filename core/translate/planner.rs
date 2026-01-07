@@ -1,5 +1,5 @@
+use crate::sync::Arc;
 use std::cmp::PartialEq;
-use std::sync::Arc;
 
 use super::{
     expr::walk_expr,
@@ -1340,7 +1340,7 @@ where
 #[allow(clippy::type_complexity)]
 pub fn parse_limit(
     mut limit: Limit,
-    connection: &std::sync::Arc<crate::Connection>,
+    connection: &crate::sync::Arc<crate::Connection>,
 ) -> Result<(Option<Box<Expr>>, Option<Box<Expr>>)> {
     bind_and_rewrite_expr(
         &mut limit.expr,

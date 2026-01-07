@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use crate::sync::Arc;
 
 use crate::ast;
 use crate::ext::VTabImpl;

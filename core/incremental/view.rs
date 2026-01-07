@@ -3,6 +3,7 @@ use super::dbsp::Delta;
 use super::operator::ComputationTracker;
 use crate::schema::{BTreeTable, Schema};
 use crate::storage::btree::CursorTrait;
+use crate::sync::Arc;
 use crate::translate::logical::LogicalPlanBuilder;
 use crate::types::{IOResult, Value};
 use crate::util::{extract_view_columns, ViewColumnSchema};
@@ -12,7 +13,6 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::rc::Rc;
-use std::sync::Arc;
 use turso_parser::ast;
 use turso_parser::{
     ast::{Cmd, Stmt},
@@ -1137,8 +1137,8 @@ impl IncrementalView {
     /// This method is only for materialized views and will persist data to the btree
     pub fn populate_from_table(
         &mut self,
-        conn: &std::sync::Arc<crate::Connection>,
-        pager: &std::sync::Arc<crate::Pager>,
+        conn: &crate::sync::Arc<crate::Connection>,
+        pager: &crate::sync::Arc<crate::Pager>,
         _btree_cursor: &mut dyn CursorTrait,
     ) -> crate::Result<IOResult<()>> {
         // Assert that this is a materialized view with a root page
@@ -1400,7 +1400,7 @@ impl IncrementalView {
 mod tests {
     use super::*;
     use crate::schema::{BTreeTable, ColDef, Column as SchemaColumn, Schema, Type};
-    use std::sync::Arc;
+    use crate::sync::Arc;
     use turso_parser::ast;
     use turso_parser::parser::Parser;
 

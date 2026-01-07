@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use crate::sync::Arc;
 use turso_parser::{
     ast::{self, TableInternalId},
     parser::Parser,
@@ -1911,7 +1911,7 @@ fn rewrite_expr_for_column_rename(
     let is_renaming_trigger_table = trigger_table_name_norm == target_table_name_norm;
 
     // Get context table if provided (for UPDATE/DELETE WHERE clauses)
-    let context_table_info: Option<(std::sync::Arc<crate::schema::BTreeTable>, String, bool)> =
+    let context_table_info: Option<(crate::sync::Arc<crate::schema::BTreeTable>, String, bool)> =
         if let Some(ctx_name) = context_table_name {
             let ctx_name_norm = normalize_ident(ctx_name);
             let is_renaming = ctx_name_norm == target_table_name_norm;

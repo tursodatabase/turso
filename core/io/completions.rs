@@ -84,7 +84,7 @@ pub(super) struct CompletionInner {
     completion_type: CompletionType,
     /// None means we completed successfully
     // Thread safe with OnceLock
-    pub(super) result: std::sync::OnceLock<Option<CompletionError>>,
+    pub(super) result: crate::sync::OnceLock<Option<CompletionError>>,
     context: Context,
     /// Optional parent group this completion belongs to
     parent: OnceLock<Arc<GroupCompletionInner>>,
@@ -525,7 +525,7 @@ mod tests {
 
     #[test]
     fn test_completion_group_empty() {
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use crate::sync::atomic::{AtomicBool, Ordering};
 
         let callback_called = Arc::new(AtomicBool::new(false));
         let callback_called_clone = callback_called.clone();
@@ -608,7 +608,7 @@ mod tests {
 
     #[test]
     fn test_completion_group_callback() {
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use crate::sync::atomic::{AtomicBool, Ordering};
         let called = Arc::new(AtomicBool::new(false));
         let called_clone = called.clone();
 
@@ -690,7 +690,7 @@ mod tests {
 
     #[test]
     fn test_completion_group_mixed_finished_and_pending() {
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use crate::sync::atomic::{AtomicBool, Ordering};
         let called = Arc::new(AtomicBool::new(false));
         let called_clone = called.clone();
 
@@ -756,7 +756,7 @@ mod tests {
         // when code used drain() to move completions into a group, because
         // finished completions would be removed from the source but not tracked
         // by the group, effectively losing them.
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        use crate::sync::atomic::{AtomicUsize, Ordering};
 
         let callback_count = Arc::new(AtomicUsize::new(0));
         let callback_count_clone = callback_count.clone();
@@ -812,7 +812,7 @@ mod tests {
     fn test_completion_group_with_all_finished_successfully() {
         // Edge case: all completions are already successfully finished
         // when added to the group. The group should complete immediately.
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use crate::sync::atomic::{AtomicBool, Ordering};
 
         let callback_called = Arc::new(AtomicBool::new(false));
         let callback_called_clone = callback_called.clone();
@@ -846,7 +846,7 @@ mod tests {
 
     #[test]
     fn test_completion_group_nested() {
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        use crate::sync::atomic::{AtomicUsize, Ordering};
 
         // Track callbacks at different levels
         let parent_called = Arc::new(AtomicUsize::new(0));
@@ -931,7 +931,7 @@ mod tests {
 
     #[test]
     fn test_completion_group_nested_with_error() {
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use crate::sync::atomic::{AtomicBool, Ordering};
 
         let parent_called = Arc::new(AtomicBool::new(false));
         let child_called = Arc::new(AtomicBool::new(false));
@@ -1145,7 +1145,7 @@ mod tests {
 
     #[test]
     fn test_completion_callback_receives_success_result() {
-        use std::sync::atomic::{AtomicI32, Ordering};
+        use crate::sync::atomic::{AtomicI32, Ordering};
 
         let result_value = Arc::new(AtomicI32::new(-1));
         let result_value_clone = result_value.clone();
@@ -1164,7 +1164,7 @@ mod tests {
 
     #[test]
     fn test_completion_callback_receives_error_result() {
-        use std::sync::atomic::{AtomicBool, Ordering};
+        use crate::sync::atomic::{AtomicBool, Ordering};
 
         let got_error = Arc::new(AtomicBool::new(false));
         let got_error_clone = got_error.clone();
@@ -1184,7 +1184,7 @@ mod tests {
     #[test]
     fn test_completion_idempotent_complete() {
         // Completing a completion multiple times should only trigger the callback once
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        use crate::sync::atomic::{AtomicUsize, Ordering};
 
         let call_count = Arc::new(AtomicUsize::new(0));
         let call_count_clone = call_count.clone();
@@ -1205,7 +1205,7 @@ mod tests {
     #[test]
     fn test_completion_idempotent_error() {
         // Erroring a completion multiple times should only trigger the callback once
-        use std::sync::atomic::{AtomicUsize, Ordering};
+        use crate::sync::atomic::{AtomicUsize, Ordering};
 
         let call_count = Arc::new(AtomicUsize::new(0));
         let call_count_clone = call_count.clone();

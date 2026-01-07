@@ -1,4 +1,5 @@
 use crate::schema::{BTreeTable, Trigger};
+use crate::sync::Arc;
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::translate_expr;
 use crate::translate::{translate_inner, ProgramBuilder, ProgramBuilderOpts};
@@ -8,7 +9,6 @@ use crate::{bail_parse_error, QueryMode, Result, Statement};
 use parking_lot::RwLock;
 use std::collections::HashSet;
 use std::num::NonZero;
-use std::sync::Arc;
 use turso_parser::ast::{self, Expr, TriggerEvent, TriggerTime};
 
 /// Context for trigger execution

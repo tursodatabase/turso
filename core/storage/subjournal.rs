@@ -1,4 +1,4 @@
-use std::sync::{
+use crate::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
 };
