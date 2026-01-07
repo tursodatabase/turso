@@ -1,3 +1,7 @@
+[alias]
+nextest-loom = ["nextest", "run", "--profile", "loom", "--config", "build.rustflags=[\"--cfg=tokio_unstable\", \"--cfg=loom\"]"]
+nextest-shuttle = ["nextest", "run", "--profile", "shuttle", "--config", "build.rustflags=[\"--cfg=tokio_unstable\", \"--cfg=shuttle\"]"]
+
 [env]
 LIBSQLITE3_FLAGS = "-DSQLITE_ENABLE_MATH_FUNCTIONS" # necessary for rusqlite dependency in order to bundle SQLite with math functions included
 
