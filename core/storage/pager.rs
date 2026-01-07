@@ -4573,9 +4573,9 @@ mod ptrmap_tests {
         let page_cache = Arc::new(RwLock::new(PageCache::new(sz as usize)));
 
         let wal_shared = WalFileShared::new_shared(
-                io.open_file("test.db-wal", OpenFlags::Create, false)
-                    .unwrap(),
-            )
+            io.open_file("test.db-wal", OpenFlags::Create, false)
+                .unwrap(),
+        )
         .unwrap();
         let last_checksum_and_max_frame = wal_shared.read().last_checksum_and_max_frame();
         let wal: Arc<dyn Wal> = Arc::new(WalFile::new(
