@@ -1,39 +1,45 @@
-#[cfg(loom)]
-pub(crate) use loom_adapter::*;
+#[cfg(shuttle)]
+pub(crate) use shuttle_adapter::*;
 
-#[cfg(not(loom))]
+#[cfg(not(shuttle))]
 pub(crate) use std_adapter::*;
 
-#[cfg(loom)]
-mod loom_adapter {
-    pub use loom::sync::atomic;
-    // Use std::sync::Arc/Weak since loom doesn't support Arc::downgrade/Weak
-    pub use std::sync::{Arc, Weak};
+#[cfg(shuttle)]
+mod shuttle_adapter {
+    pub use shuttle::sync::atomic;
+    pub use shuttle::sync::{Arc, Weak};
+    pub use std::sync::{LazyLock, OnceLock};
 
+    use std::fmt::{self, Debug};
     use std::ops::{Deref, DerefMut};
 
-    #[derive(Debug)]
-    pub struct Mutex<T>(loom::sync::Mutex<T>);
+    pub struct Mutex<T: ?Sized>(shuttle::sync::Mutex<T>);
+
+    impl<T: ?Sized + fmt::Debug> fmt::Debug for Mutex<T> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            let mut d = f.debug_struct("Mutex");
+            match self.try_lock() {
+                Some(guard) => d.field("data", &&*guard),
+                None => d.field("data", &format_args!("<locked>")),
+            };
+            d.finish()
+        }
+    }
 
     impl<T> Mutex<T> {
         pub fn new(val: T) -> Self {
-            Self(loom::sync::Mutex::new(val))
+            Self(shuttle::sync::Mutex::new(val))
         }
+    }
 
+    impl<T: ?Sized> Mutex<T> {
+        #[allow(dead_code)]
         pub fn lock(&self) -> MutexGuard<'_, T> {
             MutexGuard(self.0.lock().unwrap())
         }
 
         pub fn try_lock(&self) -> Option<MutexGuard<'_, T>> {
             self.0.try_lock().ok().map(MutexGuard)
-        }
-
-        pub fn into_inner(self) -> T {
-            self.0.into_inner().unwrap()
-        }
-
-        pub fn get_mut(&mut self) -> &mut T {
-            self.0.get_mut().unwrap()
         }
     }
 
@@ -43,29 +49,45 @@ mod loom_adapter {
         }
     }
 
-    pub struct MutexGuard<'a, T>(loom::sync::MutexGuard<'a, T>);
+    pub struct MutexGuard<'a, T: ?Sized>(shuttle::sync::MutexGuard<'a, T>);
 
-    impl<T> Deref for MutexGuard<'_, T> {
+    impl<T: ?Sized> Deref for MutexGuard<'_, T> {
         type Target = T;
         fn deref(&self) -> &T {
             &self.0
         }
     }
 
-    impl<T> DerefMut for MutexGuard<'_, T> {
+    impl<T: ?Sized> DerefMut for MutexGuard<'_, T> {
         fn deref_mut(&mut self) -> &mut T {
             &mut self.0
         }
     }
 
-    #[derive(Debug)]
-    pub struct RwLock<T>(loom::sync::RwLock<T>);
+    pub struct RwLock<T: ?Sized>(shuttle::sync::RwLock<T>);
+
+    impl<T: ?Sized + fmt::Debug> fmt::Debug for RwLock<T> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            let mut d = f.debug_struct("RwLock");
+            match self.try_read() {
+                Some(guard) => d.field("data", &&*guard),
+                None => d.field("data", &format_args!("<locked>")),
+            };
+            d.finish()
+        }
+    }
 
     impl<T> RwLock<T> {
         pub fn new(val: T) -> Self {
-            Self(loom::sync::RwLock::new(val))
+            Self(shuttle::sync::RwLock::new(val))
         }
 
+        pub fn into_inner(self) -> T {
+            self.0.into_inner().unwrap()
+        }
+    }
+
+    impl<T: ?Sized> RwLock<T> {
         pub fn read(&self) -> RwLockReadGuard<'_, T> {
             RwLockReadGuard(self.0.read().unwrap())
         }
@@ -82,10 +104,6 @@ mod loom_adapter {
             self.0.try_write().ok().map(RwLockWriteGuard)
         }
 
-        pub fn into_inner(self) -> T {
-            self.0.into_inner().unwrap()
-        }
-
         pub fn get_mut(&mut self) -> &mut T {
             self.0.get_mut().unwrap()
         }
@@ -97,32 +115,44 @@ mod loom_adapter {
         }
     }
 
-    pub struct RwLockReadGuard<'a, T>(loom::sync::RwLockReadGuard<'a, T>);
+    pub struct RwLockReadGuard<'a, T: ?Sized>(shuttle::sync::RwLockReadGuard<'a, T>);
 
-    impl<T> Deref for RwLockReadGuard<'_, T> {
+    impl<T: Debug> Debug for RwLockReadGuard<'_, T> {
+        fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            Debug::fmt(&self.0, f)
+        }
+    }
+
+    impl<T: ?Sized> Deref for RwLockReadGuard<'_, T> {
         type Target = T;
         fn deref(&self) -> &T {
             &self.0
         }
     }
 
-    pub struct RwLockWriteGuard<'a, T>(loom::sync::RwLockWriteGuard<'a, T>);
+    pub struct RwLockWriteGuard<'a, T: ?Sized>(shuttle::sync::RwLockWriteGuard<'a, T>);
 
-    impl<T> Deref for RwLockWriteGuard<'_, T> {
+    impl<T: Debug> Debug for RwLockWriteGuard<'_, T> {
+        fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            Debug::fmt(&self.0, f)
+        }
+    }
+
+    impl<T: ?Sized> Deref for RwLockWriteGuard<'_, T> {
         type Target = T;
         fn deref(&self) -> &T {
             &self.0
         }
     }
 
-    impl<T> DerefMut for RwLockWriteGuard<'_, T> {
+    impl<T: ?Sized> DerefMut for RwLockWriteGuard<'_, T> {
         fn deref_mut(&mut self) -> &mut T {
             &mut self.0
         }
     }
 }
 
-#[cfg(not(loom))]
+#[cfg(not(shuttle))]
 mod std_adapter {
     pub use parking_lot::{Mutex, RwLock, RwLockReadGuard, RwLockWriteGuard};
     pub use std::sync::{atomic, Arc, LazyLock, OnceLock, Weak};
