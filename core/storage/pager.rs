@@ -3336,10 +3336,16 @@ impl Pager {
     }
 
     fn reset_checkpoint_state(&self) {
+        self.clear_checkpoint_state();
+        self.commit_info.write().state = CommitState::PrepareWal;
+    }
+
+    /// Reset checkpoint state machine to initial state.
+    /// Use this to clean up after a failed explicit checkpoint (PRAGMA wal_checkpoint).
+    pub fn clear_checkpoint_state(&self) {
         let mut state = self.checkpoint_state.write();
         state.phase = CheckpointPhase::NotCheckpointing;
         state.result = None;
-        self.commit_info.write().state = CommitState::PrepareWal;
     }
 
     /// Clean up after a checkpoint failure. The WAL commit succeeded but checkpoint failed.
