@@ -1,6 +1,6 @@
 {
   "name": "@tursodatabase/sync",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "repository": {
     "type": "git",
     "url": "https://github.com/tursodatabase/turso"
@@ -44,8 +44,8 @@
     ]
   },
   "dependencies": {
-    "@tursodatabase/database-common": "^0.4.1",
-    "@tursodatabase/sync-common": "^0.4.1"
+    "@tursodatabase/database-common": "^0.4.2",
+    "@tursodatabase/sync-common": "^0.4.2"
   },
   "imports": {
     "#index": "./index.js"
