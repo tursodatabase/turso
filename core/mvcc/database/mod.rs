@@ -2348,6 +2348,21 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         }
     }
 
+    /// Rolls back a savepoint within a transaction.
+    /// FIXME: implement open/close savepoint for individual statements
+    pub fn rollback_first_savepoint(&self, tx_id: u64) -> Result<()> {
+        let tx = self.txs.get(&tx_id).unwrap_or_else(|| {
+            panic!("Transaction {tx_id} not found while rolling back savepoint")
+        });
+
+        let tx = tx.value();
+        for rowid in &tx.write_set {
+            self.rollback_rowid(tx_id, &rowid);
+        }
+        tx.write_set.clear();
+        Ok(())
+    }
+
     /// Returns true if the given transaction is the exclusive transaction.
     #[inline]
     pub fn is_exclusive_tx(&self, tx_id: &TxID) -> bool {
