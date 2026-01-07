@@ -225,3 +225,9 @@ endif
 sim-schema: 
 	mkdir -p  simulator/configs/custom
 	cargo run -p limbo_sim -- print-schema > simulator/configs/custom/profile-schema.json
+
+test-shuttle:
+	RUSTFLAGS='--cfg tokio_unstable --cfg shuttle' cargo nextest run --profile shuttle --package turso_core
+
+test-loom:
+	RUSTFLAGS='--cfg tokio_unstable --cfg loom' cargo nextest run --profile loom --package turso_core

@@ -1,6 +1,6 @@
 [profile.loom]
-# Filter to only run tests with "loom_" prefix
-default-filter = 'test(/^loom_/)'
+# Filter to only run tests with "loom_" in the name
+default-filter = 'test(/loom_/)'
 # Loom tests are slow - model checking explores all interleavings
 slow-timeout = { period = "120s", terminate-after = 2 }
 fail-fast = false
@@ -8,8 +8,8 @@ failure-output = "final"
 test-threads = 1
 
 [profile.shuttle]
-# Filter to only run tests with "shuttle_" prefix
-default-filter = 'test(/^shuttle_/)'
+# Filter to only run tests containing "shuttle_" in the name
+default-filter = 'test(/shuttle_/)'
 slow-timeout = { period = "60s", terminate-after = 2 }
 fail-fast = false
 failure-output = "final"
