@@ -7,7 +7,9 @@ use crate::schema::IndexColumn;
 use crate::storage::btree::{BTreeCursor, BTreeKey, CursorTrait};
 use crate::storage::pager::Pager;
 use crate::translate::collate::CollationSeq;
-use crate::types::{IOResult, ImmutableRecord, IndexInfo, KeyInfo, SeekKey, SeekOp, SeekResult, Text};
+use crate::types::{
+    IOResult, ImmutableRecord, IndexInfo, KeyInfo, SeekKey, SeekOp, SeekResult, Text,
+};
 use crate::vdbe::Register;
 use crate::{Connection, LimboError, Result, Value};
 use parking_lot::RwLock;
@@ -219,6 +221,10 @@ pub struct HybridBTreeDirectory {
     /// Pending writes to be flushed to BTree
     pending_writes: Arc<RwLock<Vec<(PathBuf, Vec<u8>)>>>,
 
+    /// Writes currently being flushed to BTree (still readable during flush)
+    /// This preserves data for reads during async flush operations
+    flushing_writes: Arc<RwLock<HashMap<PathBuf, Vec<u8>>>>,
+
     /// Pending deletes to be flushed to BTree
     pending_deletes: Arc<RwLock<Vec<PathBuf>>>,
 
@@ -247,6 +253,7 @@ impl Clone for HybridBTreeDirectory {
             hot_cache: Arc::clone(&self.hot_cache),
             chunk_cache: Arc::clone(&self.chunk_cache),
             pending_writes: Arc::clone(&self.pending_writes),
+            flushing_writes: Arc::clone(&self.flushing_writes),
             pending_deletes: Arc::clone(&self.pending_deletes),
             pager: Arc::clone(&self.pager),
             btree_root_page: self.btree_root_page,
@@ -262,6 +269,7 @@ impl HybridBTreeDirectory {
             hot_cache: Arc::new(RwLock::new(HashMap::new())),
             chunk_cache: Arc::new(ChunkLruCache::new(chunk_cache_capacity)),
             pending_writes: Arc::new(RwLock::new(Vec::new())),
+            flushing_writes: Arc::new(RwLock::new(HashMap::new())),
             pending_deletes: Arc::new(RwLock::new(Vec::new())),
             pager,
             btree_root_page,
@@ -281,6 +289,7 @@ impl HybridBTreeDirectory {
             hot_cache: Arc::new(RwLock::new(hot_files)),
             chunk_cache: Arc::new(ChunkLruCache::new(chunk_cache_capacity)),
             pending_writes: Arc::new(RwLock::new(Vec::new())),
+            flushing_writes: Arc::new(RwLock::new(HashMap::new())),
             pending_deletes: Arc::new(RwLock::new(Vec::new())),
             pager,
             btree_root_page,
@@ -288,6 +297,7 @@ impl HybridBTreeDirectory {
     }
 
     /// Get pending writes for flushing, deduplicated to keep only the last write for each path.
+    /// The writes are also copied to flushing_writes so they remain readable during async flush.
     pub fn take_pending_writes(&self) -> Vec<(PathBuf, Vec<u8>)> {
         let mut pending = self.pending_writes.write();
         let all_writes = std::mem::take(&mut *pending);
@@ -305,11 +315,30 @@ impl HybridBTreeDirectory {
             .map(|(_, entry)| entry)
             .collect();
 
+        // Copy to flushing_writes so data remains readable during async flush
+        {
+            let mut flushing = self.flushing_writes.write();
+            for (path, data) in &deduped {
+                flushing.insert(path.clone(), data.clone());
+            }
+        }
+
         tracing::debug!(
             "FTS take_pending_writes: {} entries after deduplication",
             deduped.len()
         );
         deduped
+    }
+
+    /// Clear flushing_writes after flush completes successfully.
+    /// Call this after all writes have been persisted to BTree.
+    pub fn complete_flush(&self) {
+        let mut flushing = self.flushing_writes.write();
+        tracing::debug!(
+            "FTS complete_flush: clearing {} entries from flushing_writes",
+            flushing.len()
+        );
+        flushing.clear();
     }
 
     /// Get pending deletes for flushing.
@@ -323,6 +352,28 @@ impl HybridBTreeDirectory {
         let writes = self.pending_writes.read();
         let deletes = self.pending_deletes.read();
         !writes.is_empty() || !deletes.is_empty()
+    }
+
+    /// Find file data in pending writes or flushing writes.
+    /// Checks pending_writes first, then flushing_writes (for in-flight flushes).
+    pub fn find_in_pending_writes(&self, path: &Path) -> Option<Vec<u8>> {
+        // Check pending_writes first (most recent)
+        {
+            let pending = self.pending_writes.read();
+            if let Some((_, data)) = pending.iter().rev().find(|(p, _)| p == path) {
+                return Some(data.clone());
+            }
+        }
+
+        // Check flushing_writes (data being flushed but not yet in BTree)
+        {
+            let flushing = self.flushing_writes.read();
+            if let Some(data) = flushing.get(path) {
+                return Some(data.clone());
+            }
+        }
+
+        None
     }
 
     /// Blocking read of a single chunk from BTree.
@@ -361,7 +412,8 @@ impl HybridBTreeDirectory {
                     // Need to advance, try next
                     loop {
                         match cursor.next() {
-                            Ok(IOResult::Done(has_next)) => {
+                            Ok(IOResult::Done(_)) => {
+                                let has_next = cursor.has_record();
                                 if !has_next {
                                     return Err(std::io::Error::new(
                                         std::io::ErrorKind::NotFound,
@@ -371,16 +423,12 @@ impl HybridBTreeDirectory {
                                 break;
                             }
                             Ok(IOResult::IO(_)) => {
-                                self.pager.io.step().map_err(|e| {
-                                    std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
-                                })?;
+                                self.pager
+                                    .io
+                                    .step()
+                                    .map_err(|e| std::io::Error::other(e.to_string()))?;
                             }
-                            Err(e) => {
-                                return Err(std::io::Error::new(
-                                    std::io::ErrorKind::Other,
-                                    e.to_string(),
-                                ))
-                            }
+                            Err(e) => return Err(std::io::Error::other(e.to_string())),
                         }
                     }
                     break;
@@ -392,13 +440,12 @@ impl HybridBTreeDirectory {
                     ));
                 }
                 Ok(IOResult::IO(_)) => {
-                    self.pager.io.step().map_err(|e| {
-                        std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
-                    })?;
+                    self.pager
+                        .io
+                        .step()
+                        .map_err(|e| std::io::Error::other(e.to_string()))?;
                 }
-                Err(e) => {
-                    return Err(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
-                }
+                Err(e) => return Err(std::io::Error::other(e.to_string())),
             }
         }
 
@@ -407,13 +454,12 @@ impl HybridBTreeDirectory {
             match cursor.record() {
                 Ok(IOResult::Done(r)) => break r,
                 Ok(IOResult::IO(_)) => {
-                    self.pager.io.step().map_err(|e| {
-                        std::io::Error::new(std::io::ErrorKind::Other, e.to_string())
-                    })?;
+                    self.pager
+                        .io
+                        .step()
+                        .map_err(|e| std::io::Error::other(e.to_string()))?;
                 }
-                Err(e) => {
-                    return Err(std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
-                }
+                Err(e) => return Err(std::io::Error::other(e.to_string())),
             }
         };
 
@@ -449,8 +495,7 @@ impl HybridBTreeDirectory {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 format!(
-                    "wrong chunk: expected {}:{}, got {}:{}",
-                    path_str, chunk_no, found_path, found_chunk
+                    "wrong chunk: expected {path_str}:{chunk_no}, got {found_path}:{found_chunk}",
                 ),
             ));
         }
@@ -541,6 +586,11 @@ impl FileHandle for LazyFileHandle {
             }
         }
 
+        // Check pending/flushing writes (data not yet persisted to BTree)
+        if let Some(data) = self.directory.find_in_pending_writes(&self.path) {
+            return Ok(OwnedBytes::new(data[range].to_vec()));
+        }
+
         // Calculate required chunks
         let chunk_size = DEFAULT_CHUNK_SIZE;
         let start_chunk = range.start / chunk_size;
@@ -566,7 +616,11 @@ impl FileHandle for LazyFileHandle {
                 chunk.len()
             };
 
-            result.extend_from_slice(&chunk[local_start..local_end.min(chunk.len())]);
+            // Defensive bounds check to prevent panics
+            let local_end = local_end.min(chunk.len());
+            let local_start = local_start.min(local_end);
+
+            result.extend_from_slice(&chunk[local_start..local_end]);
         }
 
         Ok(OwnedBytes::new(result))
@@ -599,11 +653,13 @@ impl Drop for HybridWriter {
             // Update catalog
             let num_chunks = data.len().div_ceil(DEFAULT_CHUNK_SIZE);
             let metadata = FileMetadata::new(&self.path, data.len(), num_chunks);
-            self.directory.update_catalog(self.path.clone(), metadata.clone());
+            self.directory
+                .update_catalog(self.path.clone(), metadata.clone());
 
             // If it's a hot file category, add to hot cache
             if metadata.category.is_hot() {
-                self.directory.add_to_hot_cache(self.path.clone(), data.clone());
+                self.directory
+                    .add_to_hot_cache(self.path.clone(), data.clone());
             }
 
             // Queue for BTree flush
@@ -620,7 +676,8 @@ impl TerminatingWrite for HybridWriter {
         // Update catalog
         let num_chunks = data.len().div_ceil(DEFAULT_CHUNK_SIZE).max(1);
         let metadata = FileMetadata::new(&self.path, data.len(), num_chunks);
-        self.directory.update_catalog(self.path.clone(), metadata.clone());
+        self.directory
+            .update_catalog(self.path.clone(), metadata.clone());
 
         // If it's a hot file category, add to hot cache
         if metadata.category.is_hot() {
@@ -646,6 +703,12 @@ impl Directory for HybridBTreeDirectory {
             if let Some(data) = hot.get(path) {
                 return Ok(Arc::new(CachedFileHandle { data: data.clone() }));
             }
+        }
+
+        // Check pending writes (files written but not yet flushed to BTree)
+        // This is critical for cold files that are immediately read back by Tantivy
+        if let Some(data) = self.find_in_pending_writes(path) {
+            return Ok(Arc::new(CachedFileHandle { data }));
         }
 
         // Check catalog for file metadata
@@ -716,6 +779,11 @@ impl Directory for HybridBTreeDirectory {
             if let Some(data) = hot.get(path) {
                 return Ok(data.clone());
             }
+        }
+
+        // Check pending writes (files written but not yet flushed to BTree)
+        if let Some(data) = self.find_in_pending_writes(path) {
+            return Ok(data);
         }
 
         // Check if file exists in catalog
@@ -1445,12 +1513,14 @@ impl FtsCursor {
         // Get root page for HybridBTreeDirectory
         let pager = conn.pager.load().clone();
         let schema = conn.schema.read();
-        let scratch = schema.get_index(&self.dir_table_name, &index_name).ok_or_else(|| {
-            LimboError::InternalError(format!(
-                "index {} for table {} not found",
-                index_name, self.dir_table_name
-            ))
-        })?;
+        let scratch = schema
+            .get_index(&self.dir_table_name, &index_name)
+            .ok_or_else(|| {
+                LimboError::InternalError(format!(
+                    "index {} for table {} not found",
+                    index_name, self.dir_table_name
+                ))
+            })?;
         let root_page = scratch.root_page;
         drop(schema);
 
@@ -1478,8 +1548,12 @@ impl FtsCursor {
                 Index::open(hybrid_dir.clone())
                     .map_err(|e| LimboError::InternalError(e.to_string()))?
             } else {
-                Index::create(hybrid_dir.clone(), self.schema.clone(), IndexSettings::default())
-                    .map_err(|e| LimboError::InternalError(e.to_string()))?
+                Index::create(
+                    hybrid_dir.clone(),
+                    self.schema.clone(),
+                    IndexSettings::default(),
+                )
+                .map_err(|e| LimboError::InternalError(e.to_string()))?
             };
 
             self.index = Some(index);
@@ -1518,7 +1592,10 @@ impl FtsCursor {
                     chunk_idx,
                 } => {
                     if *write_idx >= writes.len() {
-                        // Done with writes
+                        // Done with writes - clear flushing_writes since data is now in BTree
+                        if let Some(ref dir) = self.hybrid_directory {
+                            dir.complete_flush();
+                        }
                         self.state = FtsState::Ready;
                         return Ok(IOResult::Done(()));
                     }
@@ -1620,7 +1697,8 @@ impl FtsCursor {
                         LimboError::InternalError("cursor not initialized".into())
                     })?;
 
-                    let has_next = return_if_io!(cursor.next());
+                    return_if_io!(cursor.next());
+                    let has_next = cursor.has_record();
 
                     if has_next {
                         // Now positioned on a record, check if it matches our path
@@ -1712,7 +1790,8 @@ impl FtsCursor {
                     })?;
 
                     // Advance cursor to next record after delete
-                    let has_next = return_if_io!(cursor.next());
+                    return_if_io!(cursor.next());
+                    let has_next = cursor.has_record();
 
                     if has_next {
                         // Check the next record in DeletingOldChunk state
@@ -1999,7 +2078,51 @@ impl Drop for FtsCursor {
             return;
         }
 
-        // Only flush if we have pending documents
+        // Clone pager Arc before we start to avoid borrow conflicts
+        let pager = match &self.connection {
+            Some(conn) => conn.pager.load().clone(),
+            None => {
+                tracing::warn!("FTS Drop: no connection for flush");
+                return;
+            }
+        };
+
+        // Check if we're already in a flushing state (from commit_and_flush)
+        // This can happen when commit_and_flush started a flush but yielded for IO
+        // and the cursor is being dropped before the flush completed
+        let is_flushing = matches!(
+            &self.state,
+            FtsState::FlushingWrites { .. }
+                | FtsState::DeletingOldChunks { .. }
+                | FtsState::AdvancingAfterSeek { .. }
+                | FtsState::DeletingOldChunk { .. }
+                | FtsState::PerformingDelete { .. }
+                | FtsState::AdvancingAfterDelete { .. }
+                | FtsState::SeekingWrite { .. }
+                | FtsState::InsertingWrite { .. }
+        );
+
+        if is_flushing {
+            // Complete the in-progress flush
+            tracing::debug!("FTS Drop: completing in-progress flush");
+            loop {
+                match self.flush_writes_internal() {
+                    Ok(IOResult::Done(())) => break,
+                    Ok(IOResult::IO(_)) => {
+                        if let Err(e) = pager.io.step() {
+                            tracing::error!("FTS Drop: IO error during flush: {}", e);
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        tracing::error!("FTS Drop: error during flush: {}", e);
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Only flush new pending documents if we have any
         if self.pending_docs_count == 0 {
             return;
         }
@@ -2011,16 +2134,6 @@ impl Drop for FtsCursor {
                 return;
             }
         }
-
-        // Flush pending writes to BTree (blocking)
-        // Clone pager Arc before we start to avoid borrow conflicts
-        let pager = match &self.connection {
-            Some(conn) => conn.pager.load().clone(),
-            None => {
-                tracing::warn!("FTS Drop: no connection for flush");
-                return;
-            }
-        };
 
         // Check HybridBTreeDirectory first, then fall back to CachedBTreeDirectory
         let writes = if let Some(ref dir) = self.hybrid_directory {
@@ -2211,10 +2324,13 @@ impl IndexMethodCursor for FtsCursor {
                             _ => None,
                         });
                         // Get blob size for estimation (we don't read the full blob)
-                        let blob_size = record.get_value_opt(2).map(|v| match v {
-                            crate::types::ValueRef::Blob(b) => b.len(),
-                            _ => 0,
-                        }).unwrap_or(0);
+                        let blob_size = record
+                            .get_value_opt(2)
+                            .map(|v| match v {
+                                crate::types::ValueRef::Blob(b) => b.len(),
+                                _ => 0,
+                            })
+                            .unwrap_or(0);
 
                         if let (Some(path_str), Some(chunk_no)) = (path, chunk_no) {
                             // Track path transition
@@ -2263,7 +2379,8 @@ impl IndexMethodCursor for FtsCursor {
                                 }
                             }
 
-                            let data: Vec<u8> = deduped.iter().flat_map(|(_, b)| b.clone()).collect();
+                            let data: Vec<u8> =
+                                deduped.iter().flat_map(|(_, b)| b.clone()).collect();
                             loaded_files.insert(path.clone(), data.clone());
 
                             // Add to hot cache
@@ -2281,7 +2398,11 @@ impl IndexMethodCursor for FtsCursor {
                             }
                             Err(e) => {
                                 // File might not exist yet (new index), just log and continue
-                                tracing::debug!("FTS: could not preload {}: {}", next_path.display(), e);
+                                tracing::debug!(
+                                    "FTS: could not preload {}: {}",
+                                    next_path.display(),
+                                    e
+                                );
                             }
                         }
                         continue;
@@ -2298,10 +2419,7 @@ impl IndexMethodCursor for FtsCursor {
                 FtsState::CreatingIndex => {
                     // Log loaded files for debugging
                     if let Some(ref dir) = self.hybrid_directory {
-                        tracing::debug!(
-                            "FTS CreatingIndex (hybrid): {:?}",
-                            dir
-                        );
+                        tracing::debug!("FTS CreatingIndex (hybrid): {:?}", dir);
                     } else if let Some(ref dir) = self.cached_directory {
                         let files = dir.files.read();
                         tracing::debug!(
