@@ -229,3 +229,13 @@ do_execsql_test printf-19029102 {
 do_execsql_test format-19029102 {
    select format('%d', 3.9);
 } {3}
+
+# https://github.com/tursodatabase/turso/issues/4512
+# Test for SELECT DISTINCT with aggregates (ungrouped)
+do_execsql_test_on_specific_db {:memory:} select-distinct-aggregate-ungrouped {
+  CREATE TABLE t0 (c0 REAL);
+  CREATE TABLE t1 (c0 INT);
+  INSERT INTO t0 VALUES (1.0), (2.0);
+  INSERT INTO t1 VALUES (1), (2);
+  SELECT DISTINCT COUNT(t0.c0) FROM t0, t1;
+} {4}
