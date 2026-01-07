@@ -117,6 +117,7 @@ pub use vdbe::{
 pub mod dbpage;
 
 pub(crate) mod sync;
+pub(crate) mod thread;
 
 /// Configuration for database features
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]

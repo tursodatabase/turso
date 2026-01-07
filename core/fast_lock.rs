@@ -1,4 +1,5 @@
 use crate::sync::atomic::{AtomicBool, Ordering};
+use crate::thread::spin_loop;
 use std::{
     cell::UnsafeCell,
     ops::{Deref, DerefMut},
@@ -47,7 +48,7 @@ impl<T> SpinLock<T> {
 
     pub fn lock(&self) -> SpinLockGuard<'_, T> {
         while self.locked.swap(true, Ordering::Acquire) {
-            std::hint::spin_loop();
+            spin_loop();
         }
         SpinLockGuard { lock: self }
     }
