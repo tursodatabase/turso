@@ -28,6 +28,7 @@ use tantivy::{
     schema::{Field, Schema},
     Index, IndexSettings,
 };
+use tantivy::tokenizer::{NgramTokenizer, RawTokenizer, SimpleTokenizer, WhitespaceTokenizer};
 use tantivy::{DocAddress, HasLen, IndexReader, IndexWriter, Searcher, TantivyDocument};
 use turso_parser::ast::SortOrder;
 use turso_parser::ast::{self, Select};
@@ -1100,10 +1101,46 @@ pub struct FtsIndexAttachment {
     text_fields: Vec<(IndexColumn, Field)>,
     /// Parsed query patterns
     patterns: Vec<Select>,
+    /// Tokenizer name for text fields
+    tokenizer_name: String,
 }
+
+/// Supported tokenizer names for FTS indexes
+pub const SUPPORTED_TOKENIZERS: &[&str] = &[
+    "default",    // Tantivy default: lowercase + punctuation split + 40 char limit
+    "raw",        // No tokenization - exact match only
+    "simple",     // Basic whitespace/punctuation split
+    "whitespace", // Split on whitespace only
+    "ngram",      // N-gram tokenizer (2-3 chars by default)
+];
 
 impl FtsIndexAttachment {
     pub fn new(cfg: IndexMethodConfiguration) -> Result<Self> {
+        // Parse tokenizer from WITH clause parameters, default to "default"
+        // The parser may include surrounding quotes in the value, so we strip them
+        let tokenizer_name = cfg
+            .parameters
+            .get("tokenizer")
+            .and_then(|v| match v {
+                Value::Text(t) => {
+                    let s = t.to_string();
+                    // Strip surrounding single or double quotes if present
+                    let trimmed = s.trim_matches(|c| c == '\'' || c == '"');
+                    Some(trimmed.to_string())
+                }
+                _ => None,
+            })
+            .unwrap_or_else(|| "default".to_string());
+
+        // Validate tokenizer name
+        if !SUPPORTED_TOKENIZERS.contains(&tokenizer_name.as_str()) {
+            return Err(LimboError::ParseError(format!(
+                "unsupported FTS tokenizer '{}'. Supported tokenizers: {}",
+                tokenizer_name,
+                SUPPORTED_TOKENIZERS.join(", ")
+            )));
+        }
+
         // Build Tantivy schema (no Directory or Index creation yet)
         let mut schema_builder = Schema::builder();
 
@@ -1115,7 +1152,7 @@ impl FtsIndexAttachment {
             let opts = tantivy::schema::TextOptions::default()
                 .set_indexing_options(
                     tantivy::schema::TextFieldIndexing::default()
-                        .set_tokenizer("default")
+                        .set_tokenizer(&tokenizer_name)
                         .set_index_option(
                             tantivy::schema::IndexRecordOption::WithFreqsAndPositions,
                         ),
@@ -1192,6 +1229,7 @@ impl FtsIndexAttachment {
             rowid_field,
             text_fields,
             patterns,
+            tokenizer_name,
         })
     }
 }
@@ -1212,6 +1250,7 @@ impl IndexMethodAttachment for FtsIndexAttachment {
             self.schema.clone(),
             self.rowid_field,
             self.text_fields.clone(),
+            self.tokenizer_name.clone(),
         )))
     }
 }
@@ -1427,6 +1466,9 @@ pub struct FtsCursor {
     // Storage table name for BTree directory
     dir_table_name: String,
 
+    // Tokenizer name for registering with Tantivy
+    tokenizer_name: String,
+
     // Connection for blocking IO in Drop
     connection: Option<Arc<Connection>>,
 
@@ -1472,6 +1514,7 @@ impl FtsCursor {
         schema: Schema,
         rowid_field: Field,
         text_fields: Vec<(IndexColumn, Field)>,
+        tokenizer_name: String,
     ) -> Self {
         let dir_table_name = format!(
             "{}fts_dir_{}",
@@ -1483,6 +1526,7 @@ impl FtsCursor {
             rowid_field,
             text_fields,
             dir_table_name,
+            tokenizer_name,
             connection: None,
             fts_dir_cursor: None,
             btree_root_page: None,
@@ -1536,6 +1580,26 @@ impl FtsCursor {
         Ok(())
     }
 
+    /// Register custom tokenizers with Tantivy index
+    fn register_tokenizers(&self, index: &Index) {
+        let tokenizers = index.tokenizers();
+
+        // Register "raw" tokenizer - no tokenization, exact match only
+        tokenizers.register("raw", RawTokenizer::default());
+
+        // Register "simple" tokenizer - basic whitespace/punctuation split
+        tokenizers.register("simple", SimpleTokenizer::default());
+
+        // Register "whitespace" tokenizer - split on whitespace only
+        tokenizers.register("whitespace", WhitespaceTokenizer::default());
+
+        // Register "ngram" tokenizer - 2-3 character n-grams for substring matching
+        // Using prefix=false for full n-gram (not just prefix)
+        if let Ok(ngram) = NgramTokenizer::new(2, 3, false) {
+            tokenizers.register("ngram", ngram);
+        }
+    }
+
     /// Create Tantivy index from directory (hybrid or cached)
     fn create_index_from_directory(&mut self) -> Result<()> {
         // Prefer HybridBTreeDirectory if available
@@ -1555,6 +1619,9 @@ impl FtsCursor {
                 )
                 .map_err(|e| LimboError::InternalError(e.to_string()))?
             };
+
+            // Register custom tokenizers
+            self.register_tokenizers(&index);
 
             self.index = Some(index);
             return Ok(());
@@ -1577,6 +1644,9 @@ impl FtsCursor {
             Index::create(cached_dir, self.schema.clone(), IndexSettings::default())
                 .map_err(|e| LimboError::InternalError(e.to_string()))?
         };
+
+        // Register custom tokenizers
+        self.register_tokenizers(&index);
 
         self.index = Some(index);
         Ok(())
