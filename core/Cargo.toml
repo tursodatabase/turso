@@ -125,6 +125,12 @@ test-log = { version = "0.2.17", features = ["trace"] }
 sorted-vec = "0.8.6"
 mimalloc = { workspace = true, default-features = false }
 
+[target.'cfg(loom)'.dev-dependencies]
+loom = { workspace = true }
+
+[target.'cfg(shuttle)'.dev-dependencies]
+shuttle = { workspace = true }
+
 [[bench]]
 name = "benchmark"
 harness = false
