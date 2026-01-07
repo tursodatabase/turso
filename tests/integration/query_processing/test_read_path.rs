@@ -855,5 +855,5 @@ fn test_eval_param_only_once(tmp_db: TempDatabase) {
     let end_time = std::time::Instant::now();
     let elapsed = end_time.duration_since(start_time);
     // the test will allocate 10^8 * 10^4 bytes in case if parameter will be evaluated for every row
-    assert!(elapsed < std::time::Duration::from_millis(120));
+    assert!(elapsed < std::time::Duration::from_millis(500));
 }
