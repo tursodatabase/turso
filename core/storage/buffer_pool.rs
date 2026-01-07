@@ -2,11 +2,11 @@ use super::{slot_bitmap::SlotBitmap, sqlite3_ondisk::WAL_FRAME_HEADER_SIZE};
 use crate::fast_lock::SpinLock;
 use crate::io::TEMP_BUFFER_CACHE;
 use crate::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
-use crate::sync::Mutex;
 use crate::sync::{Arc, Weak};
 use crate::{turso_assert, Buffer, LimboError, IO};
 use std::cell::UnsafeCell;
 use std::ptr::NonNull;
+use std::sync::OnceLock;
 
 #[derive(Debug)]
 /// A buffer allocated from an arena from `[BufferPool]`
@@ -111,13 +111,11 @@ struct PoolInner {
     /// plus 24 byte `WAL_FRAME_HEADER_SIZE`, preventing the fragmentation
     /// or complex book-keeping needed to use the same arena for both sizes.
     wal_frame_arena: Option<Arc<Arena>>,
-    /// A lock preventing concurrent initialization.
-    init_lock: Mutex<()>,
     /// The size of each `Arena`, in bytes.
-    arena_size: AtomicUsize,
+    arena_size: usize,
     /// The `[Database::page_size]`, which the `page_arena` will use to
     /// return buffers from `Self::get_page`.
-    db_page_size: AtomicUsize,
+    db_page_size: OnceLock<usize>,
 }
 
 unsafe impl Sync for PoolInner {}
@@ -154,9 +152,8 @@ impl BufferPool {
             inner: UnsafeCell::new(PoolInner {
                 page_arena: None,
                 wal_frame_arena: None,
-                arena_size: arena_size.into(),
-                db_page_size: Self::DEFAULT_PAGE_SIZE.into(),
-                init_lock: Mutex::new(()),
+                arena_size,
+                db_page_size: OnceLock::new(),
                 io: None,
             }),
         }
@@ -225,19 +222,34 @@ impl BufferPool {
             tracing::trace!("Buffer pool already initialized, skipping finalize");
             return Ok(());
         }
-        inner.db_page_size.store(page_size, Ordering::SeqCst);
-        inner.init_arenas()?;
+
+        // Tries to atomically (guarenteed by the OnceLock) initialize the page size for the inner pool.
+        // If it succeeds, we now have to initialize the arenas.
+        // If the initialization fails, this means the arenas have already been initialized by a previous thread
+        // This avoids a potential TOCTOU race, where 2 threads could try to initalize the arena at the same time
+        // after checking the `db_page_size`
+        if inner.db_page_size.set(page_size).is_ok() {
+            inner.init_arenas()?;
+        };
         Ok(())
     }
 }
 
 impl PoolInner {
+    #[inline]
+    pub fn get_db_page_size(&self) -> usize {
+        *(self
+            .db_page_size
+            .get()
+            .unwrap_or(&BufferPool::DEFAULT_PAGE_SIZE))
+    }
+
     /// Allocate a buffer of the given length from the pool, falling back to
     /// temporary thread local buffers if the pool is not initialized or is full.
     pub fn allocate(&self, len: usize) -> Buffer {
         turso_assert!(len > 0, "Cannot allocate zero-length buffer");
 
-        let db_page_size = self.db_page_size.load(Ordering::SeqCst);
+        let db_page_size = self.get_db_page_size();
         let wal_frame_size = db_page_size + WAL_FRAME_HEADER_SIZE;
 
         // Check if this is exactly a WAL frame size allocation
@@ -256,7 +268,7 @@ impl PoolInner {
     }
 
     fn get_db_page_buffer(&mut self) -> Buffer {
-        let db_page_size = self.db_page_size.load(Ordering::SeqCst);
+        let db_page_size = self.get_db_page_size();
         self.page_arena
             .as_ref()
             .and_then(|arena| Arena::try_alloc(arena, db_page_size))
@@ -264,7 +276,7 @@ impl PoolInner {
     }
 
     fn get_wal_frame_buffer(&mut self) -> Buffer {
-        let len = self.db_page_size.load(Ordering::SeqCst) + WAL_FRAME_HEADER_SIZE;
+        let len = self.get_db_page_size() + WAL_FRAME_HEADER_SIZE;
         self.wal_frame_arena
             .as_ref()
             .and_then(|wal_arena| Arena::try_alloc(wal_arena, len))
@@ -273,13 +285,9 @@ impl PoolInner {
 
     /// Allocate a new arena for the pool to use
     fn init_arenas(&mut self) -> crate::Result<()> {
-        // Prevent concurrent growth
-        let Some(_guard) = self.init_lock.try_lock() else {
-            tracing::debug!("Buffer pool is already growing, skipping initialization");
-            return Ok(()); // Already in progress
-        };
-        let arena_size = self.arena_size.load(Ordering::SeqCst);
-        let db_page_size = self.db_page_size.load(Ordering::SeqCst);
+        let db_page_size = self.get_db_page_size();
+        let arena_size = self.arena_size;
+
         let io = self.io.as_ref().expect("Pool not initialized").clone();
 
         // Create regular page arena
@@ -678,34 +686,32 @@ mod shuttle_tests {
     /// Multiple threads trying to finalize should be safe.
     #[test]
     fn shuttle_concurrent_finalize() {
-        shuttle::check_random(
-            || {
-                let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
-                let pool = BufferPool::begin_init(&io, BufferPool::TEST_ARENA_SIZE);
-                let pool2 = Arc::clone(&pool);
-                let pool3 = Arc::clone(&pool);
+        let test = || {
+            let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+            let pool = BufferPool::begin_init(&io, BufferPool::TEST_ARENA_SIZE);
+            let pool2 = Arc::clone(&pool);
+            let pool3 = Arc::clone(&pool);
 
-                let h1 = thread::spawn(move || {
-                    let _ = pool.finalize_with_page_size(4096);
-                });
+            let h1 = thread::spawn(move || {
+                let _ = pool.finalize_with_page_size(4096).unwrap();
+            });
 
-                let h2 = thread::spawn(move || {
-                    let _ = pool2.finalize_with_page_size(4096);
-                });
+            let h2 = thread::spawn(move || {
+                let _ = pool2.finalize_with_page_size(4096).unwrap();
+            });
 
-                // Also try to allocate while finalizing
-                let h3 = thread::spawn(move || {
-                    // This may get a temporary buffer if arena isn't ready
-                    let buf = pool3.allocate(4096);
-                    assert_eq!(buf.len(), 4096);
-                });
+            // Also try to allocate while finalizing
+            let h3 = thread::spawn(move || {
+                // This may get a temporary buffer if arena isn't ready
+                let buf = pool3.allocate(4096);
+                assert_eq!(buf.len(), 4096);
+            });
 
-                h1.join().unwrap();
-                h2.join().unwrap();
-                h3.join().unwrap();
-            },
-            1000,
-        );
+            h1.join().unwrap();
+            h2.join().unwrap();
+            h3.join().unwrap();
+        };
+        shuttle::check_random(test, 1000);
     }
 
     /// Test concurrent writes to the same ArenaBuffer at the SAME offsets.
