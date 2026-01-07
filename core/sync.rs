@@ -123,6 +123,12 @@ mod shuttle_adapter {
         }
     }
 
+    impl<'a, T: fmt::Display + ?Sized + 'a> fmt::Display for RwLockReadGuard<'a, T> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            (**self).fmt(f)
+        }
+    }
+
     impl<T: ?Sized> Deref for RwLockReadGuard<'_, T> {
         type Target = T;
         fn deref(&self) -> &T {
@@ -135,6 +141,12 @@ mod shuttle_adapter {
     impl<T: Debug> Debug for RwLockWriteGuard<'_, T> {
         fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
             Debug::fmt(&self.0, f)
+        }
+    }
+
+    impl<'a, T: fmt::Display + ?Sized + 'a> fmt::Display for RwLockWriteGuard<'a, T> {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            (**self).fmt(f)
         }
     }
 
