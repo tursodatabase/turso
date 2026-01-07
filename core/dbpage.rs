@@ -1,9 +1,9 @@
 use crate::storage::pager::Pager;
+use crate::sync::Arc;
 use crate::util::IOExt;
 use crate::vtab::{InternalVirtualTable, InternalVirtualTableCursor};
 use crate::{Connection, Result, Value};
 use parking_lot::RwLock;
-use std::sync::Arc;
 use turso_ext::{
     ConstraintInfo, ConstraintOp, ConstraintUsage, IndexInfo, OrderByInfo, ResultCode,
 };

@@ -1,12 +1,12 @@
 use crate::pragma::{PragmaVirtualTable, PragmaVirtualTableCursor};
 use crate::schema::Column;
+use crate::sync::atomic::{AtomicPtr, Ordering};
+use crate::sync::Arc;
 use crate::util::columns_from_create_table_body;
 use crate::{Connection, LimboError, SymbolTable, Value};
 use parking_lot::RwLock;
 use std::ffi::c_void;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicPtr, Ordering};
-use std::sync::Arc;
 use turso_ext::{ConstraintInfo, IndexInfo, OrderByInfo, ResultCode, VTabKind, VTabModuleImpl};
 use turso_parser::{ast, parser::Parser};
 
@@ -31,7 +31,7 @@ impl VirtualTable {
     pub(crate) fn id(&self) -> u64 {
         self.vtab_id
     }
-    pub(crate) fn readonly(self: &Arc<VirtualTable>) -> bool {
+    pub(crate) fn readonly(&self) -> bool {
         match &self.vtab_type {
             VirtualTableType::Pragma(_) => true,
             VirtualTableType::External(table) => table.readonly(),

@@ -116,6 +116,8 @@ pub use vdbe::{
 #[cfg(feature = "cli_only")]
 pub mod dbpage;
 
+pub(crate) mod sync;
+
 /// Configuration for database features
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct DatabaseOpts {

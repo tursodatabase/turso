@@ -94,6 +94,12 @@ rapidhash = "4.1.1"
 branches = { version = "0.4.3", default-features = false }
 bumpalo = { version = "3", features = ["collections"] }
 
+[target.'cfg(loom)'.dependencies]
+loom = { workspace = true }
+
+[target.'cfg(shuttle)'.dependencies]
+shuttle = { workspace = true }
+
 # Use pure-rust for Android to avoid C cross-compilation issues
 [target.'cfg(target_os = "android")'.dependencies]
 aegis = { version = "0.9.5", features = ["pure-rust"] }
@@ -125,11 +131,7 @@ test-log = { version = "0.2.17", features = ["trace"] }
 sorted-vec = "0.8.6"
 mimalloc = { workspace = true, default-features = false }
 
-[target.'cfg(loom)'.dev-dependencies]
-loom = { workspace = true }
 
-[target.'cfg(shuttle)'.dev-dependencies]
-shuttle = { workspace = true }
 
 [[bench]]
 name = "benchmark"
