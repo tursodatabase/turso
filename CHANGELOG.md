@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.4.2 -- 2026-01-07
+
+### Fixed
+
+* core/mvcc: rollback index rows (Pere Diaz Bou)
+* core/vdbe: check negative root pages with `integrity_check` (Pere Diaz Bou)
+* Track WAL state in savepoints for proper rollback (Pavan Nambi)
+* Reset checkpoint state when PRAGMA wal_checkpoint fails (Jussi Saurio)
+* fix/checkpoint: always read page1 from db file when truncating (Jussi Saurio)
+* Fix WAL truncate checkpoint discarding uncheckpointed frames (Jussi Saurio)
+
 ## 0.4.1 -- 2026-01-06
 
 ### Fixed
