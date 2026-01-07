@@ -65,6 +65,10 @@ struct SimulatorFiber {
     connection: Arc<Connection>,
     state: FiberState,
     statement: RefCell<Option<Statement>>,
+    /// Indexes created in the current transaction (table_name, index_name)
+    pending_creates: Vec<(String, String)>,
+    /// Indexes dropped in the current transaction (table_name, index_name)
+    pending_drops: Vec<(String, String)>,
 }
 
 struct SimulatorContext {
@@ -209,6 +213,8 @@ fn main() -> anyhow::Result<()> {
             connection: conn,
             state: FiberState::Idle,
             statement: RefCell::new(None),
+            pending_creates: Vec::new(),
+            pending_drops: Vec::new(),
         });
     }
 
@@ -514,9 +520,20 @@ fn perform_work(
     }
     context.fibers[fiber_idx].statement.replace(None);
     match context.fibers[fiber_idx].state {
-        FiberState::Committing | FiberState::RollingBack => {
-            // COMMIT or ROLLBACK completed successfully, transition to Idle
-            trace!("{} Transaction ended successfully", fiber_idx);
+        FiberState::Committing => {
+            trace!("{} Transaction committed successfully", fiber_idx);
+            for idx in context.fibers[fiber_idx].pending_creates.drain(..) {
+                context.indexes.push(idx);
+            }
+            for drop_idx in context.fibers[fiber_idx].pending_drops.drain(..) {
+                context.indexes.retain(|idx| *idx != drop_idx);
+            }
+            context.fibers[fiber_idx].state = FiberState::Idle;
+        }
+        FiberState::RollingBack => {
+            trace!("{} Transaction rolled back", fiber_idx);
+            context.fibers[fiber_idx].pending_creates.clear();
+            context.fibers[fiber_idx].pending_drops.clear();
             context.fibers[fiber_idx].state = FiberState::Idle;
         }
         FiberState::Idle => {
@@ -612,31 +629,60 @@ fn perform_work(
                     // CREATE INDEX (2%)
                     if !context.disable_indexes {
                         let create_index = CreateIndex::arbitrary(rng, context);
-                        let sql = create_index.to_string();
-                        if let Ok(stmt) = context.fibers[fiber_idx].connection.prepare(&sql) {
-                            context.fibers[fiber_idx].statement.replace(Some(stmt));
-                            context.indexes.push((
-                                create_index.index.table_name.clone(),
-                                create_index.index_name.clone(),
-                            ));
+                        let index_name = &create_index.index_name;
+                        let already_exists = context
+                            .indexes
+                            .iter()
+                            .any(|(_, name)| name == index_name)
+                            || context
+                                .fibers
+                                .iter()
+                                .any(|f| f.pending_creates.iter().any(|(_, name)| name == index_name));
+                        if !already_exists {
+                            let sql = create_index.to_string();
+                            if let Ok(stmt) = context.fibers[fiber_idx].connection.prepare(&sql) {
+                                context.fibers[fiber_idx].statement.replace(Some(stmt));
+                                context.fibers[fiber_idx].pending_creates.push((
+                                    create_index.index.table_name.clone(),
+                                    create_index.index_name.clone(),
+                                ));
+                            }
+                            trace!("{} CREATE INDEX: {}", fiber_idx, sql);
                         }
-                        trace!("{} CREATE INDEX: {}", fiber_idx, sql);
                     }
                 }
                 72..=73 => {
                     // DROP INDEX (2%)
-                    if !context.disable_indexes && !context.indexes.is_empty() {
-                        let index_idx = rng.random_range(0..context.indexes.len());
-                        let (table_name, index_name) = context.indexes.remove(index_idx);
-                        let drop_index = DropIndex {
-                            table_name,
-                            index_name,
-                        };
-                        let sql = drop_index.to_string();
-                        if let Ok(stmt) = context.fibers[fiber_idx].connection.prepare(&sql) {
-                            context.fibers[fiber_idx].statement.replace(Some(stmt));
+                    if !context.disable_indexes {
+                        let all_pending_drops: Vec<_> = context
+                            .fibers
+                            .iter()
+                            .flat_map(|f| f.pending_drops.iter())
+                            .collect();
+                        let available: Vec<_> = context
+                            .indexes
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, idx)| !all_pending_drops.contains(&idx))
+                            .collect();
+                        if !available.is_empty() {
+                            let pick = rng.random_range(0..available.len());
+                            let (_, (table_name, index_name)) = available[pick];
+                            let drop_index = DropIndex {
+                                table_name: table_name.clone(),
+                                index_name: index_name.clone(),
+                            };
+                            let sql = drop_index.to_string();
+                            if let Ok(stmt) =
+                                context.fibers[fiber_idx].connection.prepare(&sql)
+                            {
+                                context.fibers[fiber_idx].statement.replace(Some(stmt));
+                                context.fibers[fiber_idx]
+                                    .pending_drops
+                                    .push((table_name.clone(), index_name.clone()));
+                            }
+                            trace!("{} DROP INDEX: {}", fiber_idx, sql);
                         }
-                        trace!("{} DROP INDEX: {}", fiber_idx, sql);
                     }
                 }
                 74..=86 => {
