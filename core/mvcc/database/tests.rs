@@ -1914,10 +1914,6 @@ fn test_cursor_with_btree_and_mvcc_seek_after_checkpoint() {
 
 #[test]
 fn test_cursor_with_btree_and_mvcc_delete_after_checkpoint() {
-    tracing_subscriber::fmt()
-        .with_ansi(false)
-        .with_max_level(tracing_subscriber::filter::LevelFilter::TRACE)
-        .init();
     let mut db = MvccTestDbNoConn::new_with_random_db();
     // First write some rows and checkpoint so data is flushed to BTree file (.db)
     {
@@ -1937,10 +1933,6 @@ fn test_cursor_with_btree_and_mvcc_delete_after_checkpoint() {
 
 #[test]
 fn test_skips_updated_rowid() {
-    tracing_subscriber::fmt()
-        .with_ansi(false)
-        .with_max_level(tracing_subscriber::filter::LevelFilter::TRACE)
-        .init();
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
 
@@ -1971,10 +1963,6 @@ fn test_skips_updated_rowid() {
 
 #[test]
 fn test_mvcc_integrity_check() {
-    tracing_subscriber::fmt()
-        .with_ansi(false)
-        .with_max_level(tracing_subscriber::filter::LevelFilter::TRACE)
-        .init();
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
 
@@ -2014,6 +2002,222 @@ fn test_rollback_with_index() {
     let rows = get_rows(&conn, "SELECT * FROM t where b = 1");
     assert_eq!(rows.len(), 0);
 
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+}
+/// 1. BEGIN CONCURRENT (start interactive transaction)
+/// 2. UPDATE modifies col_a's index, then fails constraint check on col_b
+/// 3. The partial index changes are NOT rolled back (this is the bug!)
+/// 4. COMMIT succeeds, persisting the inconsistent state
+/// 5. Later UPDATE on same row fails: "IdxDelete: no matching index entry found"
+///    because table row has old value but index has new value
+#[test]
+fn test_update_multiple_unique_columns_partial_rollback() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    // Create table with multiple unique columns (like blue_sun_77 in the bug)
+    conn.execute(
+        "CREATE TABLE t(
+            id INTEGER PRIMARY KEY,
+            col_a TEXT UNIQUE,
+            col_b REAL UNIQUE
+        )",
+    )
+    .unwrap();
+
+    // Insert two rows - one to update, one to cause conflict
+    conn.execute("INSERT INTO t VALUES (1, 'original_a', 1.0)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (2, 'other_a', 2.0)")
+        .unwrap();
+
+    // Start an INTERACTIVE transaction - this is KEY to reproducing the bug!
+    // In auto-commit mode, the entire transaction is rolled back on error.
+    // In interactive mode, only the statement should be rolled back.
+    conn.execute("BEGIN CONCURRENT").unwrap();
+
+    // Try to UPDATE row 1 with:
+    // - col_a = 'new_a' (index modification happens first)
+    // - col_b = 2.0 (should FAIL - conflicts with row 2)
+    //
+    // The UPDATE bytecode does:
+    // 1. Delete old index entry for col_a ('original_a', 1)
+    // 2. Insert new index entry for col_a ('new_a', 1)
+    // 3. Delete old index entry for col_b (1.0, 1)
+    // 4. Check constraint for col_b (2.0) - FAIL with Halt err_code=1555!
+    //
+    // BUG: Without proper statement rollback, steps 1-3 are committed!
+    let result = conn.execute("UPDATE t SET col_a = 'new_a', col_b = 2.0 WHERE id = 1");
+    assert!(
+        result.is_err(),
+        "Expected unique constraint violation on col_b"
+    );
+
+    // COMMIT the transaction - this is what the stress test does after the error!
+    // In the buggy case, this commits the partial index changes from the failed UPDATE.
+    conn.execute("COMMIT").unwrap();
+
+    // Now in a NEW transaction, try to UPDATE the same row.
+    // If the previous statement's partial changes were committed:
+    // - Table row still has col_a = 'original_a' (UPDATE didn't complete)
+    // - But index for col_a now has 'new_a' instead of 'original_a'!
+    // - This UPDATE reads 'original_a' from table, tries to delete that index entry
+    // - CRASH: "IdxDelete: no matching index entry found for key ['original_a', 1]"
+    conn.execute("UPDATE t SET col_a = 'updated_a', col_b = 3.0 WHERE id = 1")
+        .unwrap();
+
+    // Verify the update worked
+    let rows = get_rows(&conn, "SELECT * FROM t WHERE id = 1");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][1].cast_text().unwrap(), "updated_a");
+
+    // Integrity check
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+}
+
+/// Similar test but with the constraint error happening on the third unique column.
+/// This tests that ALL previous index modifications are rolled back.
+/// Uses interactive transaction (BEGIN CONCURRENT) to reproduce the bug.
+#[test]
+fn test_update_three_unique_columns_partial_rollback() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    // Create table with three unique columns
+    conn.execute(
+        "CREATE TABLE t(
+            id INTEGER PRIMARY KEY,
+            col_a TEXT UNIQUE,
+            col_b REAL UNIQUE,
+            col_c INTEGER UNIQUE
+        )",
+    )
+    .unwrap();
+
+    // Insert two rows
+    conn.execute("INSERT INTO t VALUES (1, 'a1', 1.0, 100)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (2, 'a2', 2.0, 200)")
+        .unwrap();
+
+    // Start interactive transaction
+    conn.execute("BEGIN CONCURRENT").unwrap();
+
+    // Try to UPDATE row 1 with:
+    // - col_a = 'new_a' (index modified)
+    // - col_b = 3.0 (index modified)
+    // - col_c = 200 (FAIL - conflicts with row 2)
+    // BUG: col_a and col_b index changes are NOT rolled back!
+    let result =
+        conn.execute("UPDATE t SET col_a = 'new_a', col_b = 3.0, col_c = 200 WHERE id = 1");
+    assert!(
+        result.is_err(),
+        "Expected unique constraint violation on col_c"
+    );
+
+    // COMMIT - in buggy case, this commits partial index changes
+    conn.execute("COMMIT").unwrap();
+
+    // Now try to UPDATE the same row - this should work but may crash
+    // if col_a or col_b index entries are inconsistent
+    conn.execute("UPDATE t SET col_a = 'updated_a', col_b = 5.0, col_c = 500 WHERE id = 1")
+        .unwrap();
+
+    // Verify index lookups work
+    let rows = get_rows(&conn, "SELECT * FROM t WHERE col_a = 'updated_a'");
+    assert_eq!(rows.len(), 1);
+
+    let rows = get_rows(&conn, "SELECT * FROM t WHERE col_b = 5.0");
+    assert_eq!(rows.len(), 1);
+
+    let rows = get_rows(&conn, "SELECT * FROM t WHERE col_c = 500");
+    assert_eq!(rows.len(), 1);
+
+    // Integrity check
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+}
+
+/// Test that simulates the exact sequence from the stress test bug:
+/// Multiple interactive transactions updating the same row, with constraint errors.
+///
+/// From the log:
+/// - tx 248: UPDATE row with pk=1.37, sets unique_col='sweet_wind_280' -> COMMIT
+/// - tx 1149: BEGIN, UPDATE same row (modifies unique_col index, fails on other_unique), COMMIT
+///   BUG: partial index changes from failed UPDATE are committed!
+/// - tx 1324: UPDATE same row -> CRASH "IdxDelete: no matching index entry found"
+#[test]
+fn test_sequential_updates_with_constraint_errors() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    conn.execute(
+        "CREATE TABLE t(
+            pk REAL PRIMARY KEY,
+            unique_col TEXT UNIQUE,
+            other_unique REAL UNIQUE
+        )",
+    )
+    .unwrap();
+
+    // Insert initial rows (simulating the stress test setup)
+    conn.execute("INSERT INTO t VALUES (1.37, 'sweet_wind_280', 9.05)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (2.13, 'other_value', 2.13)")
+        .unwrap();
+
+    // First successful update (like tx 248 in the bug)
+    conn.execute("UPDATE t SET unique_col = 'cold_grass_813', other_unique = 3.90 WHERE pk = 1.37")
+        .unwrap();
+
+    // Verify the update
+    let rows = get_rows(&conn, "SELECT unique_col FROM t WHERE pk = 1.37");
+    assert_eq!(rows[0][0].cast_text().unwrap(), "cold_grass_813");
+
+    // Like tx 1149: Start interactive transaction
+    conn.execute("BEGIN CONCURRENT").unwrap();
+
+    // Try an update that will fail on other_unique (conflicts with row 2)
+    // The UPDATE will:
+    // 1. Delete old index entry for unique_col ('cold_grass_813')
+    // 2. Insert new index entry for unique_col ('new_value')
+    // 3. Delete old index entry for other_unique (3.90)
+    // 4. Check constraint for other_unique (2.13) -> FAIL!
+    // BUG: Steps 1-3 are NOT rolled back!
+    let result =
+        conn.execute("UPDATE t SET unique_col = 'new_value', other_unique = 2.13 WHERE pk = 1.37");
+    assert!(result.is_err(), "Expected unique constraint violation");
+
+    // COMMIT the transaction (like the stress test does after the error)
+    // BUG: This commits the partial index changes!
+    conn.execute("COMMIT").unwrap();
+
+    // Like tx 1324: Try another update on the same row
+    // If partial changes were committed:
+    // - Table row has unique_col = 'cold_grass_813'
+    // - But unique_col index has 'new_value' (not 'cold_grass_813')!
+    // - This UPDATE reads 'cold_grass_813' from table, tries to delete that index entry
+    // - CRASH: "IdxDelete: no matching index entry found"
+    conn.execute("UPDATE t SET unique_col = 'fresh_sun_348', other_unique = 5.0 WHERE pk = 1.37")
+        .unwrap();
+
+    // Verify final state
+    let rows = get_rows(
+        &conn,
+        "SELECT unique_col, other_unique FROM t WHERE pk = 1.37",
+    );
+    assert_eq!(rows[0][0].cast_text().unwrap(), "fresh_sun_348");
+
+    // Verify index lookups work
+    let rows = get_rows(&conn, "SELECT * FROM t WHERE unique_col = 'fresh_sun_348'");
+    assert_eq!(rows.len(), 1);
+
+    // Integrity check
     let rows = get_rows(&conn, "PRAGMA integrity_check");
     assert_eq!(rows.len(), 1);
     assert_eq!(&rows[0][0].to_string(), "ok");
