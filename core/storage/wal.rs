@@ -2294,8 +2294,23 @@ impl WalFile {
                             checkpoint_max_frame.saturating_sub(ongoing_chkpt.min_frame - 1);
 
                         if matches!(mode, CheckpointMode::Truncate { .. }) {
-                            // sqlite always returns zeros for truncate mode
-                            CheckpointResult::default()
+                            // SQLite returns zeros for TRUNCATE mode on success, but we must
+                            // first verify we actually checkpointed everything. If not, we need
+                            // to return a result that will fail the everything_backfilled() check.
+                            // This prevents truncating the WAL when active readers prevented us
+                            // from checkpointing all frames.
+                            if checkpoint_max_frame < current_mx {
+                                // We didn't checkpoint everything - return actual counts so the
+                                // require_all_backfilled check will fail and return SQLITE_BUSY
+                                CheckpointResult::new(
+                                    frames_possible,
+                                    frames_checkpointed,
+                                    checkpoint_max_frame,
+                                )
+                            } else {
+                                // Success - return zeros per SQLite spec
+                                CheckpointResult::default()
+                            }
                         } else if frames_checkpointed == 0
                             && matches!(mode, CheckpointMode::Restart)
                         // if we restarted the log but didn't backfill pages we still have to
