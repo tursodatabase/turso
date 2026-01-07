@@ -420,67 +420,68 @@ impl IoWorker {
             Client::builder(TokioExecutor::new()).build::<_, Full<Bytes>>(https);
 
         while rx.recv().await.is_some() {
-            // Process all pending items in the sync IO queue.
-            let mut made_progress = false;
+            // Process all pending items in the sync IO queue. Keep looping until
+            // there are no more items even after yielding to allow woken tasks to
+            // potentially queue more work.
             loop {
-                let item = this.sync.take_io_item();
-                let Some(item) = item else {
-                    this.sync.step_io_callbacks();
-                    IoWorker::notify_progress(&wakers);
-                    break;
-                };
-
-                made_progress = true;
-
-                match item.get_request() {
-                    turso_sync_sdk_kit::sync_engine_io::SyncEngineIoRequest::Http {
-                        url,
-                        method,
-                        path,
-                        body,
-                        headers,
-                    } => {
-                        IoWorker::process_http(
-                            &this,
-                            &client,
-                            url.as_deref(),
+                // Process all available items.
+                let mut processed_any = false;
+                while let Some(item) = this.sync.take_io_item() {
+                    processed_any = true;
+                    match item.get_request() {
+                        turso_sync_sdk_kit::sync_engine_io::SyncEngineIoRequest::Http {
+                            url,
                             method,
                             path,
-                            body.as_ref().map(|v| Bytes::from(v.clone())),
+                            body,
                             headers,
-                            item.get_completion().clone(),
-                        )
-                        .await;
-                    }
-                    turso_sync_sdk_kit::sync_engine_io::SyncEngineIoRequest::FullRead { path } => {
-                        IoWorker::process_full_read(
-                            path,
-                            item.get_completion().clone(),
-                            &this.sync,
-                        )
-                        .await;
-                    }
-                    turso_sync_sdk_kit::sync_engine_io::SyncEngineIoRequest::FullWrite {
-                        path,
-                        content,
-                    } => {
-                        IoWorker::process_full_write(
+                        } => {
+                            IoWorker::process_http(
+                                &this,
+                                &client,
+                                url.as_deref(),
+                                method,
+                                path,
+                                body.as_ref().map(|v| Bytes::from(v.clone())),
+                                headers,
+                                item.get_completion().clone(),
+                            )
+                            .await;
+                        }
+                        turso_sync_sdk_kit::sync_engine_io::SyncEngineIoRequest::FullRead { path } => {
+                            IoWorker::process_full_read(
+                                path,
+                                item.get_completion().clone(),
+                                &this.sync,
+                            )
+                            .await;
+                        }
+                        turso_sync_sdk_kit::sync_engine_io::SyncEngineIoRequest::FullWrite {
                             path,
                             content,
-                            item.get_completion().clone(),
-                            &this.sync,
-                        )
-                        .await;
+                        } => {
+                            IoWorker::process_full_write(
+                                path,
+                                content,
+                                item.get_completion().clone(),
+                                &this.sync,
+                            )
+                            .await;
+                        }
                     }
                 }
-            }
 
-            // Run queued IO callbacks and wake all pending ops, yielding control
-            // to allow them to make progress before we loop again.
-            if made_progress {
+                // Step callbacks and notify woken futures.
                 this.sync.step_io_callbacks();
                 IoWorker::notify_progress(&wakers);
-                // Let waiting tasks run on their executors.
+                
+                // If we didn't process anything this round, we're done.
+                if !processed_any {
+                    break;
+                }
+                
+                // Yield to allow woken tasks to run on their executors.
+                // They may queue more IO items, so we loop again.
                 tokio::task::yield_now().await;
             }
         }
