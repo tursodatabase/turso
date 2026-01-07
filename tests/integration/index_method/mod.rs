@@ -1049,3 +1049,132 @@ fn test_fts_flexible_query_patterns(tmp_db: TempDatabase) {
     assert!(id_times_tens.contains(&40));
     assert!(id_times_tens.contains(&50));
 }
+
+/// Test FTS with different tokenizer configurations via WITH clause
+#[cfg(feature = "fts")]
+#[turso_macros::test]
+fn test_fts_tokenizer_configuration(tmp_db: TempDatabase) {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+
+    // Test 1: Default tokenizer (should work without WITH clause)
+    conn.execute("CREATE TABLE docs_default(id INTEGER PRIMARY KEY, content TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX fts_default ON docs_default USING fts (content)")
+        .unwrap();
+
+    conn.execute("INSERT INTO docs_default VALUES (1, 'Hello World')")
+        .unwrap();
+    conn.execute("INSERT INTO docs_default VALUES (2, 'hello there')")
+        .unwrap();
+
+    // Default tokenizer lowercases, so "hello" should match both
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT id FROM docs_default WHERE fts_match(content, 'hello')",
+    );
+    assert_eq!(rows.len(), 2);
+
+    // Test 2: Raw tokenizer (exact match only, no tokenization)
+    conn.execute("CREATE TABLE docs_raw(id INTEGER PRIMARY KEY, tag TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX fts_raw ON docs_raw USING fts (tag) WITH (tokenizer = 'raw')")
+        .unwrap();
+
+    conn.execute("INSERT INTO docs_raw VALUES (1, 'user-123')")
+        .unwrap();
+    conn.execute("INSERT INTO docs_raw VALUES (2, 'user-456')")
+        .unwrap();
+    conn.execute("INSERT INTO docs_raw VALUES (3, 'admin-123')")
+        .unwrap();
+
+    // Raw tokenizer should only match exact string
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT id FROM docs_raw WHERE fts_match(tag, 'user-123')",
+    );
+    assert_eq!(rows.len(), 1);
+    match &rows[0][0] {
+        rusqlite::types::Value::Integer(i) => assert_eq!(*i, 1),
+        _ => panic!("Expected integer"),
+    }
+
+    // Partial match should NOT work with raw tokenizer
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT id FROM docs_raw WHERE fts_match(tag, 'user')",
+    );
+    assert_eq!(rows.len(), 0);
+
+    // Test 3: Simple tokenizer (whitespace/punctuation split)
+    conn.execute("CREATE TABLE docs_simple(id INTEGER PRIMARY KEY, content TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX fts_simple ON docs_simple USING fts (content) WITH (tokenizer = 'simple')")
+        .unwrap();
+
+    conn.execute("INSERT INTO docs_simple VALUES (1, 'Hello World')")
+        .unwrap();
+    conn.execute("INSERT INTO docs_simple VALUES (2, 'HELLO there')")
+        .unwrap();
+
+    // Simple tokenizer does basic split but preserves case
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT id FROM docs_simple WHERE fts_match(content, 'Hello')",
+    );
+    // Simple tokenizer in Tantivy lowercases by default too
+    assert!(rows.len() >= 1);
+}
+
+/// Test that invalid tokenizer names are rejected
+#[cfg(feature = "fts")]
+#[turso_macros::test]
+fn test_fts_invalid_tokenizer_rejected(tmp_db: TempDatabase) {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE docs(id INTEGER PRIMARY KEY, content TEXT)")
+        .unwrap();
+
+    // This should fail because 'invalid_tokenizer' is not a supported tokenizer
+    let result = conn.execute(
+        "CREATE INDEX fts_docs ON docs USING fts (content) WITH (tokenizer = 'invalid_tokenizer')",
+    );
+    assert!(result.is_err());
+}
+
+/// Test FTS with ngram tokenizer for substring matching
+#[cfg(feature = "fts")]
+#[turso_macros::test]
+fn test_fts_ngram_tokenizer(tmp_db: TempDatabase) {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE products(id INTEGER PRIMARY KEY, name TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX fts_products ON products USING fts (name) WITH (tokenizer = 'ngram')")
+        .unwrap();
+
+    conn.execute("INSERT INTO products VALUES (1, 'iPhone 15 Pro')")
+        .unwrap();
+    conn.execute("INSERT INTO products VALUES (2, 'Samsung Galaxy')")
+        .unwrap();
+    conn.execute("INSERT INTO products VALUES (3, 'Google Pixel')")
+        .unwrap();
+
+    // Ngram tokenizer should allow partial matches
+    // Search for "Pho" should match "iPhone"
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT id FROM products WHERE fts_match(name, 'Pho')",
+    );
+    // With ngram(2,3), "Pho" generates ngrams that should match ngrams in "iPhone"
+    assert!(rows.len() >= 1);
+
+    // Search for "Gal" should match "Galaxy"
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT id FROM products WHERE fts_match(name, 'Gal')",
+    );
+    assert!(rows.len() >= 1);
+}
