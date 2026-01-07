@@ -8,8 +8,8 @@ use crate::{
         },
         expr::{
             bind_and_rewrite_expr, emit_returning_results, process_returning_clause,
-            translate_expr, translate_expr_no_constant_opt, walk_expr_mut, BindingBehavior,
-            NoConstantOptReason, WalkControl,
+            rewrite_between_expr, translate_expr, translate_expr_no_constant_opt, walk_expr_mut,
+            BindingBehavior, NoConstantOptReason, WalkControl,
         },
         fkeys::{
             build_index_affinity_string, emit_fk_violation, emit_guarded_fk_decrement,
@@ -445,6 +445,7 @@ pub fn translate_insert(
         &insertion,
         &constraints,
         &mut preflight_ctx,
+        connection,
     )?;
 
     let notnull_resume_label = emit_notnulls(&mut program, &ctx, &insertion, resolver)?;
@@ -468,7 +469,7 @@ pub fn translate_insert(
     });
 
     if has_upsert {
-        emit_commit_phase(&mut program, resolver, &insertion, &ctx)?;
+        emit_commit_phase(&mut program, resolver, &insertion, &ctx, connection)?;
     }
 
     if has_fks {
@@ -690,11 +691,15 @@ fn emit_partial_index_check(
     resolver: &Resolver,
     index: &Index,
     insertion: &Insertion,
+    _connection: &Arc<crate::Connection>,
 ) -> Result<Option<BranchOffset>> {
     let Some(where_clause) = &index.where_clause else {
         return Ok(None);
     };
     let mut where_for_eval = where_clause.as_ref().clone();
+    // First rewrite BETWEEN expressions to Binary expressions
+    rewrite_between_expr(&mut where_for_eval)?;
+    // Then rewrite column references to use insertion registers
     rewrite_partial_index_where(&mut where_for_eval, insertion)?;
     let reg = program.alloc_register();
     translate_expr_no_constant_opt(
@@ -723,6 +728,7 @@ fn emit_commit_phase(
     resolver: &Resolver,
     insertion: &Insertion,
     ctx: &InsertEmitCtx,
+    connection: &Arc<crate::Connection>,
 ) -> Result<()> {
     for index in resolver.schema.get_indices(ctx.table.name.as_str()) {
         let idx_cursor_id = ctx
@@ -733,7 +739,7 @@ fn emit_commit_phase(
             .expect("no cursor found for index");
 
         // Re-evaluate partial predicate on the would-be inserted image
-        let commit_skip_label = emit_partial_index_check(program, resolver, index, insertion)?;
+        let commit_skip_label = emit_partial_index_check(program, resolver, index, insertion, connection)?;
 
         let num_cols = index.columns.len();
         let idx_start_reg = program.alloc_registers(num_cols + 1);
@@ -1965,6 +1971,7 @@ fn emit_index_uniqueness_check(
     position: Option<usize>,
     upsert_catch_all: Option<usize>,
     preflight: &mut PreflightCtx,
+    connection: &Arc<crate::Connection>,
 ) -> Result<()> {
     // find which cursor we opened earlier for this index
     let idx_cursor_id = ctx
@@ -1975,7 +1982,7 @@ fn emit_index_uniqueness_check(
         .expect("no cursor found for index");
 
     // For partial indexes, evaluate the WHERE clause and skip if false
-    let maybe_skip_probe_label = emit_partial_index_check(program, resolver, index, insertion)?;
+    let maybe_skip_probe_label = emit_partial_index_check(program, resolver, index, insertion, connection)?;
 
     let num_cols = index.columns.len();
     // allocate scratch registers for the index columns plus rowid
@@ -2175,6 +2182,7 @@ fn emit_preflight_constraint_checks(
     insertion: &Insertion,
     constraints: &ConstraintsToCheck,
     preflight: &mut PreflightCtx,
+    connection: &Arc<crate::Connection>,
 ) -> Result<()> {
     for (constraint, position) in &constraints.constraints_to_check {
         match constraint {
@@ -2199,6 +2207,7 @@ fn emit_preflight_constraint_checks(
                     *position,
                     constraints.upsert_catch_all_position,
                     preflight,
+                    connection,
                 )?;
             }
             ResolvedUpsertTarget::CatchAll => unreachable!(),

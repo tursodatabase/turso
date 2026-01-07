@@ -4006,6 +4006,40 @@ pub fn bind_and_rewrite_expr<'a>(
     Ok(())
 }
 
+/// Rewrite BETWEEN expressions to Binary expressions with AND/OR.
+/// This is a subset of bind_and_rewrite_expr that only handles BETWEEN rewriting.
+pub fn rewrite_between_expr(expr: &mut ast::Expr) -> Result<()> {
+    walk_expr_mut(expr, &mut |e: &mut ast::Expr| -> Result<WalkControl> {
+        if let ast::Expr::Between {
+            lhs,
+            not,
+            start,
+            end,
+        } = e
+        {
+            let (lower_op, upper_op) = if *not {
+                (ast::Operator::Greater, ast::Operator::Greater)
+            } else {
+                (ast::Operator::LessEquals, ast::Operator::LessEquals)
+            };
+            let start = start.take_ownership();
+            let lhs_v = lhs.take_ownership();
+            let end = end.take_ownership();
+
+            let lower = ast::Expr::Binary(Box::new(start), lower_op, Box::new(lhs_v.clone()));
+            let upper = ast::Expr::Binary(Box::new(lhs_v), upper_op, Box::new(end));
+
+            *e = if *not {
+                ast::Expr::Binary(Box::new(lower), ast::Operator::Or, Box::new(upper))
+            } else {
+                ast::Expr::Binary(Box::new(lower), ast::Operator::And, Box::new(upper))
+            };
+        }
+        Ok(WalkControl::Continue)
+    })?;
+    Ok(())
+}
+
 /// Recursively walks a mutable expression, applying a function to each sub-expression.
 pub fn walk_expr_mut<F>(expr: &mut ast::Expr, func: &mut F) -> Result<WalkControl>
 where
