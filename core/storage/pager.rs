@@ -17,6 +17,7 @@ use crate::sync::atomic::{
     AtomicBool, AtomicU16, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering,
 };
 use crate::sync::Arc;
+use crate::sync::{Mutex, RwLock};
 use crate::types::{IOCompletions, WalState};
 use crate::util::IOExt as _;
 use crate::{
@@ -25,7 +26,6 @@ use crate::{
 };
 use crate::{io_yield_one, Buffer, CompletionError, IOContext, OpenFlags, SyncMode, IO};
 use arc_swap::ArcSwapOption;
-use parking_lot::{Mutex, RwLock};
 use roaring::RoaringBitmap;
 use std::cell::UnsafeCell;
 use tracing::{instrument, trace, Level};
@@ -4500,7 +4500,7 @@ pub(crate) mod ptrmap {
 mod tests {
     use crate::sync::Arc;
 
-    use parking_lot::RwLock;
+    use crate::sync::RwLock;
 
     use crate::storage::page_cache::{PageCache, PageCacheKey};
 

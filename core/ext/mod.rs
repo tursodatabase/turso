@@ -7,6 +7,7 @@ use crate::index_method::{
     BACKING_BTREE_INDEX_METHOD_NAME, TOY_VECTOR_SPARSE_IVF_INDEX_METHOD_NAME,
 };
 use crate::schema::{Schema, Table};
+use crate::sync::Mutex;
 #[cfg(all(target_os = "linux", feature = "io_uring", not(miri)))]
 use crate::UringIO;
 use crate::{function::ExternalFunc, Connection, Database};
@@ -15,7 +16,6 @@ use crate::{vtab::VirtualTable, SymbolTable};
 use crate::{LimboError, IO};
 #[cfg(feature = "fs")]
 pub use dynamic::{add_builtin_vfs_extensions, add_vfs_module, list_vfs_modules, VfsMod};
-use parking_lot::Mutex;
 use std::{
     ffi::{c_char, c_void, CStr, CString},
     sync::Arc,

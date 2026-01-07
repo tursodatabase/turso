@@ -1,6 +1,6 @@
+use crate::sync::RwLock;
 use crossbeam_skiplist::map::Entry;
 use crossbeam_skiplist::SkipMap;
-use parking_lot::RwLock;
 
 use crate::mvcc::clock::LogicalClock;
 use crate::mvcc::database::{

@@ -1,5 +1,5 @@
 use crate::sync::Arc;
-use parking_lot::RwLock;
+use crate::sync::RwLock;
 use std::fmt::Debug;
 
 pub mod logical_log;

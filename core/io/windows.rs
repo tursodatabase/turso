@@ -1,7 +1,7 @@
 use crate::{
     io::clock::DefaultClock, Clock, Completion, File, Instant, LimboError, OpenFlags, Result, IO,
 };
-use parking_lot::RwLock;
+use crate::sync::RwLock;
 use std::io::{Read, Seek, Write};
 use crate::sync::Arc;
 use tracing::{debug, instrument, trace, Level};

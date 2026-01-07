@@ -1,6 +1,7 @@
 // FIXME: remove this once we add recovery
 #![allow(dead_code)]
 use crate::sync::Arc;
+use crate::sync::RwLock;
 use crate::{
     io::ReadComplete,
     mvcc::database::{LogRecord, MVTableId, Row, RowID, RowKey, RowVersion, SortableIndexKey},
@@ -9,7 +10,6 @@ use crate::{
     types::{ImmutableRecord, IndexInfo},
     Buffer, Completion, CompletionError, LimboError, Result,
 };
-use parking_lot::RwLock;
 
 use crate::File;
 
@@ -554,7 +554,7 @@ impl StreamingLogicalLogReader {
         Ok(buffer)
     }
 
-    fn get_buffer(&self) -> parking_lot::RwLockReadGuard<'_, Vec<u8>> {
+    fn get_buffer(&self) -> crate::sync::RwLockReadGuard<'_, Vec<u8>> {
         self.buffer.read()
     }
 

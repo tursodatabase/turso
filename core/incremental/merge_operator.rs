@@ -6,9 +6,9 @@ use crate::incremental::operator::{
     ComputationTracker, DbspStateCursors, EvalState, IncrementalOperator,
 };
 use crate::sync::Arc;
+use crate::sync::Mutex;
 use crate::types::IOResult;
 use crate::Result;
-use parking_lot::Mutex;
 use std::collections::{hash_map::DefaultHasher, HashMap};
 use std::fmt::{self, Display};
 use std::hash::{Hash, Hasher};

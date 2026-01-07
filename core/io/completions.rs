@@ -7,7 +7,7 @@ use std::{
     task::Waker,
 };
 
-use parking_lot::Mutex;
+use crate::sync::Mutex;
 
 use crate::{Buffer, CompletionError};
 

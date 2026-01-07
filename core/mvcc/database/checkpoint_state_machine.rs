@@ -10,12 +10,12 @@ use crate::storage::pager::CreateBTreeFlags;
 use crate::storage::wal::{CheckpointMode, TursoRwLock};
 use crate::sync::atomic::Ordering;
 use crate::sync::Arc;
+use crate::sync::RwLock;
 use crate::types::{IOCompletions, IOResult, ImmutableRecord};
 use crate::{
     CheckpointResult, Completion, Connection, IOExt, LimboError, Pager, Result, TransactionState,
     Value, ValueRef,
 };
-use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU64;
 

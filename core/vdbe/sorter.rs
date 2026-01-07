@@ -1,9 +1,9 @@
 use branches::mark_unlikely;
 use turso_parser::ast::SortOrder;
 
+use crate::sync::RwLock;
 use crate::sync::{atomic, Arc};
 use bumpalo::Bump;
-use parking_lot::RwLock;
 use std::cmp::{Eq, Ord, Ordering, PartialEq, PartialOrd, Reverse};
 use std::collections::BinaryHeap;
 use std::ptr::NonNull;

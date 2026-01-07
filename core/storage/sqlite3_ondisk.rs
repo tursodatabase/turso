@@ -60,11 +60,11 @@ use crate::storage::pager::Pager;
 use crate::storage::wal::READMARK_NOT_USED;
 use crate::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use crate::sync::Arc;
+use crate::sync::RwLock;
 use crate::types::{SerialType, SerialTypeKind, TextRef, TextSubtype, ValueRef};
 use crate::{
     bail_corrupt_error, turso_assert, CompletionError, File, IOContext, Result, WalFileShared,
 };
-use parking_lot::RwLock;
 use rustc_hash::FxHashMap;
 use std::collections::BTreeMap;
 use std::mem::MaybeUninit;

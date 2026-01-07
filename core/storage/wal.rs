@@ -1,7 +1,7 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
+use crate::sync::Mutex;
 use crate::sync::OnceLock;
-use parking_lot::Mutex;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::array;
 use std::borrow::Cow;
@@ -10,7 +10,7 @@ use strum::EnumString;
 use tracing::{instrument, Level};
 
 use crate::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
-use parking_lot::RwLock;
+use crate::sync::RwLock;
 use std::fmt::{Debug, Formatter};
 use std::{fmt, sync::Arc};
 
@@ -1974,7 +1974,7 @@ impl WalFile {
         WAL_HEADER_SIZE as u64 + page_offset
     }
 
-    fn _get_shared_mut(&self) -> parking_lot::RwLockWriteGuard<'_, WalFileShared> {
+    fn _get_shared_mut(&self) -> crate::sync::RwLockWriteGuard<'_, WalFileShared> {
         // WASM in browser main thread doesn't have a way to "park" a thread
         // so, we spin way here instead of calling blocking lock
         #[cfg(target_family = "wasm")]
@@ -1993,7 +1993,7 @@ impl WalFile {
         }
     }
 
-    fn _get_shared(&self) -> parking_lot::RwLockReadGuard<'_, WalFileShared> {
+    fn _get_shared(&self) -> crate::sync::RwLockReadGuard<'_, WalFileShared> {
         // WASM in browser main thread doesn't have a way to "park" a thread
         // so, we spin way here instead of calling blocking lock
         #[cfg(target_family = "wasm")]
@@ -2835,6 +2835,7 @@ impl WalFileShared {
 #[cfg(test)]
 pub mod test {
     use crate::sync::{atomic::Ordering, Arc};
+    use crate::sync::{Mutex, RwLock};
     use crate::{
         storage::{
             sqlite3_ondisk::{self, WAL_HEADER_SIZE},
@@ -2845,7 +2846,6 @@ pub mod test {
         CheckpointMode, CheckpointResult, Completion, Connection, Database, LimboError, PlatformIO,
         Wal, WalFileShared, IO,
     };
-    use parking_lot::{Mutex, RwLock};
     #[cfg(unix)]
     use std::os::unix::fs::MetadataExt;
     #[allow(clippy::arc_with_non_send_sync)]

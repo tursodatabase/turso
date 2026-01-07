@@ -56,6 +56,7 @@ use crate::sync::{
     atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, AtomicUsize, Ordering},
     Arc, LazyLock, Weak,
 };
+use crate::sync::{Mutex, RwLock};
 use crate::translate::pragma::TURSO_CDC_DEFAULT_TABLE_NAME;
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
 use crate::types::{WalFrameInfo, WalState};
@@ -76,7 +77,6 @@ pub use io::{
     Buffer, Completion, CompletionType, File, GroupCompletion, MemoryIO, OpenFlags, PlatformIO,
     SyscallIO, WriteCompletion, IO,
 };
-use parking_lot::{Mutex, RwLock};
 use rustc_hash::FxHashMap;
 use schema::Schema;
 pub use statement::Statement;
@@ -239,7 +239,9 @@ pub struct Database {
     shared_wal: Arc<RwLock<WalFileShared>>,
     init_lock: Arc<Mutex<()>>,
     open_flags: OpenFlags,
-    builtin_syms: RwLock<SymbolTable>,
+    // Use parking lot RwLock here and not `crate::sync::RwLock` because it relies on `data_ptr` and that is experimental
+    // in std.
+    builtin_syms: parking_lot::RwLock<SymbolTable>,
     opts: DatabaseOpts,
     n_connections: AtomicUsize,
 
@@ -357,7 +359,7 @@ impl Database {
             _shared_page_cache: shared_page_cache.clone(),
             shared_wal,
             db_file,
-            builtin_syms: syms.into(),
+            builtin_syms: parking_lot::RwLock::new(syms),
             io: io.clone(),
             open_flags: flags,
             init_lock: Arc::new(Mutex::new(())),
@@ -749,7 +751,7 @@ impl Database {
             last_insert_rowid: AtomicI64::new(0),
             last_change: AtomicI64::new(0),
             total_changes: AtomicI64::new(0),
-            syms: RwLock::new(SymbolTable::new()),
+            syms: parking_lot::RwLock::new(SymbolTable::new()),
             _shared_cache: false,
             cache_size: AtomicI32::new(default_cache_size),
             page_size: AtomicU16::new(page_size.get_raw()),
@@ -1241,7 +1243,7 @@ pub struct Connection {
     last_insert_rowid: AtomicI64,
     last_change: AtomicI64,
     total_changes: AtomicI64,
-    syms: RwLock<SymbolTable>,
+    syms: parking_lot::RwLock<SymbolTable>,
     _shared_cache: bool,
     cache_size: AtomicI32,
     /// page size used for an uninitialized database or the next vacuum command.
@@ -2087,7 +2089,7 @@ impl Connection {
 
     pub fn get_capture_data_changes(
         &self,
-    ) -> parking_lot::RwLockReadGuard<'_, CaptureDataChangesMode> {
+    ) -> crate::sync::RwLockReadGuard<'_, CaptureDataChangesMode> {
         self.capture_data_changes.read()
     }
     pub fn set_capture_data_changes(&self, opts: CaptureDataChangesMode) {
@@ -2622,7 +2624,7 @@ impl Connection {
     }
 
     /// Get a reference to the busy handler.
-    pub fn get_busy_handler(&self) -> parking_lot::RwLockReadGuard<'_, BusyHandler> {
+    pub fn get_busy_handler(&self) -> crate::sync::RwLockReadGuard<'_, BusyHandler> {
         self.busy_handler.read()
     }
 

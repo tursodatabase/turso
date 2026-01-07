@@ -86,7 +86,7 @@ use super::{
     insn::{Cookie, RegisterOrLiteral},
     CommitState,
 };
-use parking_lot::{Mutex, RwLock};
+use crate::sync::{Mutex, RwLock};
 use turso_parser::ast::{self, ForeignKeyClause, Name, ResolveType};
 use turso_parser::parser::Parser;
 

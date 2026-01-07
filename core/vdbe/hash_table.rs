@@ -1,3 +1,4 @@
+use crate::sync::RwLock;
 use crate::sync::{
     atomic::{self, AtomicUsize},
     Arc,
@@ -12,7 +13,6 @@ use crate::{
     types::{IOCompletions, IOResult, Value, ValueRef},
     CompletionError, Result,
 };
-use parking_lot::RwLock;
 use rapidhash::fast::RapidHasher;
 use std::cmp::{Eq, Ordering};
 use std::hash::Hasher;

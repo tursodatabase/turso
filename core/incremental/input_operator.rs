@@ -6,9 +6,9 @@ use crate::incremental::operator::{
     ComputationTracker, DbspStateCursors, EvalState, IncrementalOperator,
 };
 use crate::sync::Arc;
+use crate::sync::Mutex;
 use crate::types::IOResult;
 use crate::Result;
-use parking_lot::Mutex;
 
 /// Input operator - source of data for the circuit
 /// Represents base relations/tables that receive external updates

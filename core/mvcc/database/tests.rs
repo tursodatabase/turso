@@ -5,7 +5,7 @@ use crate::io::PlatformIO;
 use crate::mvcc::clock::LocalClock;
 use crate::mvcc::cursor::MvccCursorType;
 use crate::storage::sqlite3_ondisk::DatabaseHeader;
-use parking_lot::RwLock;
+use crate::sync::RwLock;
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
 

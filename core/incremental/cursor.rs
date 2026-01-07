@@ -1,4 +1,5 @@
 use crate::sync::Arc;
+use crate::sync::Mutex;
 use crate::{
     incremental::{
         compiler::{DeltaSet, ExecuteState},
@@ -10,7 +11,6 @@ use crate::{
     types::{IOResult, SeekKey, SeekOp, SeekResult, Value},
     LimboError, Pager, Result,
 };
-use parking_lot::Mutex;
 
 /// State machine for seek operations
 #[derive(Debug)]

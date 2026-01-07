@@ -3,7 +3,7 @@ use crate::error::LimboError;
 use crate::io::clock::{Clock, DefaultClock, Instant};
 use crate::io::common;
 use crate::Result;
-use parking_lot::Mutex;
+use crate::sync::Mutex;
 use rustix::{
     fd::{AsFd, AsRawFd},
     fs::{self, FlockOperation},
