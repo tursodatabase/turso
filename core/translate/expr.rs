@@ -395,7 +395,7 @@ pub fn translate_condition_expr(
             crate::bail_parse_error!("RAISE in WHERE clause is not supported");
         }
         ast::Expr::Between { .. } => {
-            crate::bail_parse_error!("BETWEEN expression should have been rewritten in optmizer")
+            crate::bail_parse_error!("expression should have been rewritten in optimizer")
         }
         ast::Expr::Variable(_) => {
             crate::bail_parse_error!(
@@ -852,7 +852,7 @@ pub fn translate_expr(
             }
         }
         ast::Expr::Between { .. } => {
-            crate::bail_parse_error!("expression should have been rewritten in optmizer")
+            crate::bail_parse_error!("expression should have been rewritten in optimizer")
         }
         ast::Expr::Binary(e1, op, e2) => {
             binary_expr_shared(

@@ -2695,7 +2695,7 @@ fn emit_replace_delete_conflicting_row(
             .expect("index to exist");
         let skip_delete_label = if index.where_clause.is_some() {
             let where_copy = index
-                .bind_where_expr(Some(table_references), connection)
+                .bind_where_expr(Some(table_references), connection)?
                 .expect("where clause to exist");
             let skip_label = program.allocate_label();
             let reg = program.alloc_register();

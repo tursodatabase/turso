@@ -158,7 +158,7 @@ pub fn translate_alter_table(
                         }],
                     );
                     let where_copy = index
-                        .bind_where_expr(Some(&mut table_references), connection)
+                        .bind_where_expr(Some(&mut table_references), connection)?
                         .ok_or_else(|| {
                             LimboError::ParseError(
                                 "index where clause unexpectedly missing".to_string(),

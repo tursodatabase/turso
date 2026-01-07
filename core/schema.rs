@@ -2924,20 +2924,19 @@ impl Index {
         &self,
         table_refs: Option<&mut TableReferences>,
         connection: &Arc<Connection>,
-    ) -> Option<ast::Expr> {
+    ) -> crate::Result<Option<ast::Expr>> {
         let Some(where_clause) = &self.where_clause else {
-            return None;
+            return Ok(None);
         };
         let mut expr = where_clause.clone();
         bind_and_rewrite_expr(
-            &mut expr,
+            expr.as_mut(),
             table_refs,
             None,
             connection,
             BindingBehavior::ResultColumnsNotAllowed,
-        )
-        .ok()?;
-        Some(*expr)
+        )?;
+        Ok(Some(*expr))
     }
 }
 
