@@ -621,12 +621,18 @@ impl ProgramState {
             match end_statement {
                 EndStatement::ReleaseSavepoint => pager.release_savepoint(),
                 EndStatement::RollbackSavepoint => {
-                    match pager.rollback_to_newest_savepoint() {
-                        // We sometimes call end_statement() on errors without explicitly knowing whether a stmt transaction
-                        // caused the error or not. If it didn't, don't reset any FK violation counters.
-                        Ok(false) => break 'outer Ok(()),
-                        Err(err) => break 'outer Err(err),
-                        _ => {}
+                    if let Some(mv_store) = connection.mv_store().as_ref() {
+                        if let Some(tx_id) = connection.get_mv_tx_id() {
+                            mv_store.rollback_first_savepoint(tx_id)?;
+                        }
+                    } else {
+                        match pager.rollback_to_newest_savepoint() {
+                            // We sometimes call end_statement() on errors without explicitly knowing whether a stmt transaction
+                            // caused the error or not. If it didn't, don't reset any FK violation counters.
+                            Ok(false) => break 'outer Ok(()),
+                            Err(err) => break 'outer Err(err),
+                            _ => {}
+                        }
                     }
                     // Reset the deferred foreign key violations counter to the value it had at the start of the statement.
                     // This is used to ensure that if an interactive transaction had deferred FK violations, they are not lost.
