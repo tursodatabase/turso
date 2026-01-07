@@ -400,9 +400,19 @@ impl Buffer {
             Self::Pooled(buf) => buf.as_ptr() as *mut u8,
         }
     }
+
+    #[inline]
+    pub fn is_pooled(&self) -> bool {
+        matches!(self, Self::Pooled(..))
+    }
+
+    #[inline]
+    pub fn is_heap(&self) -> bool {
+        matches!(self, Self::Heap(..))
+    }
 }
 
-thread_local! {
+crate::thread::thread_local! {
     /// thread local cache to re-use temporary buffers to prevent churn when pool overflows
     pub static TEMP_BUFFER_CACHE: RefCell<TempBufferCache> = RefCell::new(TempBufferCache::new());
 }
