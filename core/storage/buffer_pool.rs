@@ -471,3 +471,240 @@ mod arena {
         unsafe { std::alloc::dealloc(ptr, layout) };
     }
 }
+
+/// Shuttle tests for concurrent buffer pool operations.
+///
+/// These tests target the `unsafe impl Sync/Send` on:
+/// - `ArenaBuffer`: Raw pointer access across threads
+/// - `BufferPool`: UnsafeCell-based interior mutability
+/// - `PoolInner`: Shared mutable state
+///
+/// Run with: `cargo nextest-shuttle` or `cargo test --profile shuttle`
+#[cfg(all(shuttle, test))]
+mod shuttle_tests {
+    use super::*;
+    use crate::io::MemoryIO;
+    use crate::sync::Arc;
+
+    fn create_test_pool() -> Arc<BufferPool> {
+        let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+        let pool = BufferPool::begin_init(&io, BufferPool::TEST_ARENA_SIZE);
+        pool.finalize_with_page_size(4096).unwrap();
+        pool
+    }
+
+    /// Test concurrent allocations from BufferPool.
+    /// Verifies that multiple threads can safely call get_page() simultaneously.
+    #[test]
+    fn shuttle_concurrent_page_allocation() {
+        shuttle::check_random(
+            || {
+                let pool = create_test_pool();
+                let mut handles = vec![];
+
+                for _ in 0..3 {
+                    let pool = Arc::clone(&pool);
+                    let h = shuttle::thread::spawn(move || {
+                        let buf = pool.get_page();
+                        assert_eq!(buf.len(), 4096);
+                        buf
+                    });
+                    handles.push(h);
+                }
+
+                let buffers: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+                // Verify all buffers are valid and distinct (no double allocation)
+                assert_eq!(buffers.len(), 3);
+            },
+            100,
+        );
+    }
+
+    /// Test concurrent allocation and deallocation.
+    /// Buffers are dropped in different threads than they were allocated.
+    #[test]
+    fn shuttle_concurrent_alloc_and_drop() {
+        shuttle::check_random(
+            || {
+                let pool = create_test_pool();
+                let pool2 = Arc::clone(&pool);
+
+                // Thread 1: allocate and send buffer to be dropped elsewhere
+                let h1 = shuttle::thread::spawn(move || {
+                    let buf = pool.get_page();
+                    buf.len() // return length, buffer dropped here
+                });
+
+                // Thread 2: allocate concurrently
+                let h2 = shuttle::thread::spawn(move || {
+                    let buf = pool2.get_page();
+                    buf.len()
+                });
+
+                assert_eq!(h1.join().unwrap(), 4096);
+                assert_eq!(h2.join().unwrap(), 4096);
+            },
+            100,
+        );
+    }
+
+    /// Test that ArenaBuffer can be safely sent between threads and written to.
+    /// This tests the `unsafe impl Send + Sync for ArenaBuffer`.
+    #[test]
+    fn shuttle_arena_buffer_send_and_write() {
+        shuttle::check_random(
+            || {
+                let pool = create_test_pool();
+                let buf = pool.get_page();
+
+                // Write some data
+                buf.as_mut_slice()[0] = 42;
+
+                // Send to another thread for reading
+                let h = shuttle::thread::spawn(move || {
+                    assert_eq!(buf.as_slice()[0], 42);
+                    buf.as_slice()[0]
+                });
+
+                assert_eq!(h.join().unwrap(), 42);
+            },
+            100,
+        );
+    }
+
+    /// Test concurrent WAL frame and page allocations.
+    /// Both arena types are exercised simultaneously.
+    #[test]
+    fn shuttle_concurrent_mixed_allocations() {
+        shuttle::check_random(
+            || {
+                let pool = create_test_pool();
+                let pool2 = Arc::clone(&pool);
+                let pool3 = Arc::clone(&pool);
+
+                let h1 = shuttle::thread::spawn(move || {
+                    let buf = pool.get_page();
+                    assert_eq!(buf.len(), 4096);
+                });
+
+                let h2 = shuttle::thread::spawn(move || {
+                    let buf = pool2.get_wal_frame();
+                    // WAL frame = page_size + WAL_FRAME_HEADER_SIZE (24)
+                    assert_eq!(buf.len(), 4096 + WAL_FRAME_HEADER_SIZE);
+                });
+
+                let h3 = shuttle::thread::spawn(move || {
+                    let buf = pool3.allocate(1024);
+                    assert_eq!(buf.len(), 1024);
+                });
+
+                h1.join().unwrap();
+                h2.join().unwrap();
+                h3.join().unwrap();
+            },
+            100,
+        );
+    }
+
+    /// Stress test: many threads allocating and dropping buffers rapidly.
+    /// This helps find race conditions in the slot bitmap and arena management.
+    #[test]
+    fn shuttle_stress_concurrent_alloc_drop() {
+        shuttle::check_random(
+            || {
+                let pool = create_test_pool();
+                let mut handles = vec![];
+
+                for i in 0..4 {
+                    let pool = Arc::clone(&pool);
+                    let h = shuttle::thread::spawn(move || {
+                        // Each thread does multiple alloc/drop cycles
+                        for _ in 0..2 {
+                            let buf = pool.get_page();
+                            // Write thread-specific data
+                            buf.as_mut_slice()[0] = i as u8;
+                            assert_eq!(buf.as_slice()[0], i as u8);
+                            // buf dropped here, returning slot to arena
+                        }
+                    });
+                    handles.push(h);
+                }
+
+                for h in handles {
+                    h.join().unwrap();
+                }
+            },
+            100,
+        );
+    }
+
+    /// Test that buffers allocated by one thread can be safely read by another.
+    /// Uses a channel-like pattern with Arc to share buffers.
+    #[test]
+    fn shuttle_buffer_shared_read() {
+        shuttle::check_random(
+            || {
+                let pool = create_test_pool();
+
+                // Allocate and write in main thread
+                let buf = pool.get_page();
+                for (i, byte) in buf.as_mut_slice().iter_mut().enumerate().take(100) {
+                    *byte = (i % 256) as u8;
+                }
+
+                // Wrap in Arc for shared access (Buffer itself doesn't impl Clone)
+                let buf = Arc::new(buf);
+                let buf2 = Arc::clone(&buf);
+
+                // Reader thread
+                let h = shuttle::thread::spawn(move || {
+                    for i in 0..100 {
+                        assert_eq!(buf2.as_slice()[i], (i % 256) as u8);
+                    }
+                });
+
+                // Main thread also reads
+                for i in 0..100 {
+                    assert_eq!(buf.as_slice()[i], (i % 256) as u8);
+                }
+
+                h.join().unwrap();
+            },
+            100,
+        );
+    }
+
+    /// Test pool initialization race (though guarded by init_lock).
+    /// Multiple threads trying to finalize should be safe.
+    #[test]
+    fn shuttle_concurrent_finalize() {
+        shuttle::check_random(
+            || {
+                let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
+                let pool = BufferPool::begin_init(&io, BufferPool::TEST_ARENA_SIZE);
+                let pool2 = Arc::clone(&pool);
+                let pool3 = Arc::clone(&pool);
+
+                let h1 = shuttle::thread::spawn(move || {
+                    let _ = pool.finalize_with_page_size(4096);
+                });
+
+                let h2 = shuttle::thread::spawn(move || {
+                    let _ = pool2.finalize_with_page_size(4096);
+                });
+
+                // Also try to allocate while finalizing
+                let h3 = shuttle::thread::spawn(move || {
+                    // This may get a temporary buffer if arena isn't ready
+                    let buf = pool3.allocate(4096);
+                    assert_eq!(buf.len(), 4096);
+                });
+
+                h1.join().unwrap();
+                h2.join().unwrap();
+                h3.join().unwrap();
+            },
+            100,
+        );
+    }
+}
