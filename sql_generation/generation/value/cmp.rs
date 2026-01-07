@@ -115,22 +115,51 @@ fn mutate_string<R: rand::Rng + ?Sized>(
     rng: &mut R,
     mutation_type: MutationType,
 ) -> String {
+    if t.is_empty() {
+        // Handle empty string: for increment, return a single char; for decrement, stay empty
+        return if mutation_type == MutationType::Increment {
+            "A".to_string()
+        } else {
+            String::new()
+        };
+    }
+
     let mut chars = t.chars().map(|c| c as u32).collect::<Vec<_>>();
-    let mut index;
-    let mut max_loops = 100;
-    loop {
-        index = rng.random_range(0..chars.len());
-        if chars[index] > UPPERCASE_A && chars[index] < UPPERCASE_Z
-            || chars[index] > LOWERCASE_A && chars[index] < LOWERCASE_Z
-        {
+
+    // Try to find a character that can be safely incremented/decremented
+    let mut index = None;
+    for _ in 0..100 {
+        let candidate = rng.random_range(0..chars.len());
+        let c = chars[candidate];
+        // Check if character is in the "safe" range (not at boundary)
+        let can_decrement =
+            (c > UPPERCASE_A && c <= UPPERCASE_Z) || (c > LOWERCASE_A && c <= LOWERCASE_Z);
+        let can_increment =
+            (c >= UPPERCASE_A && c < UPPERCASE_Z) || (c >= LOWERCASE_A && c < LOWERCASE_Z);
+
+        if mutation_type == MutationType::Decrement && can_decrement {
+            index = Some(candidate);
             break;
-        }
-        max_loops -= 1;
-        if max_loops == 0 {
-            panic!("Failed to find a printable character to decrement");
+        } else if mutation_type == MutationType::Increment && can_increment {
+            index = Some(candidate);
+            break;
         }
     }
 
+    // Fallback: if no suitable character found, use length-based mutation
+    if index.is_none() {
+        return if mutation_type == MutationType::Decrement {
+            // For decrement: remove last char (shorter string < original)
+            let mut s = t.to_string();
+            s.pop();
+            s
+        } else {
+            // For increment: append a char (longer string > original)
+            format!("{}A", t)
+        };
+    }
+
+    let index = index.unwrap();
     if mutation_type == MutationType::Decrement {
         chars[index] -= 1;
     } else {

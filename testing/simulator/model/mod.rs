@@ -646,7 +646,7 @@ impl Shadow for Update {
                         if let Some((idx, _)) =
                             columns.iter().enumerate().find(|(_, c)| &c.name == column)
                         {
-                            new_row[idx] = set_value.clone();
+                            new_row[idx] = set_value.value().clone();
                         }
                     }
                     (old_row.clone(), new_row)
@@ -674,7 +674,7 @@ impl Shadow for Update {
                     if let Some((idx, _)) =
                         columns.iter().enumerate().find(|(_, c)| &c.name == column)
                     {
-                        row[idx] = set_value.clone();
+                        row[idx] = set_value.value().clone();
                     }
                 }
             }

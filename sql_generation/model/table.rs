@@ -58,6 +58,11 @@ impl Table {
             indexes: vec![],
         }
     }
+
+    /// Returns true if any column in this table has a UNIQUE constraint.
+    pub fn has_any_unique_column(&self) -> bool {
+        self.columns.iter().any(|c| c.has_unique_constraint())
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -81,6 +86,15 @@ impl PartialEq for Column {
 }
 
 impl Eq for Column {}
+
+impl Column {
+    /// Returns true if this column has a UNIQUE constraint.
+    pub fn has_unique_constraint(&self) -> bool {
+        self.constraints
+            .iter()
+            .any(|c| matches!(c, ColumnConstraint::Unique(_)))
+    }
+}
 
 impl Display for Column {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
