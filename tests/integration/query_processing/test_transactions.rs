@@ -1531,7 +1531,7 @@ fn test_wal_savepoint_rollback_on_constraint_violation() {
     let padding = "x".repeat(2000);
     conn.execute("BEGIN").unwrap();
     for i in 1..=1000 {
-        conn.execute(&format!("INSERT INTO t VALUES ({i}, {i}, '{padding}')"))
+        conn.execute(format!("INSERT INTO t VALUES ({i}, {i}, '{padding}')"))
             .unwrap();
     }
     conn.execute("COMMIT").unwrap();
@@ -1564,7 +1564,7 @@ fn test_wal_savepoint_rollback_on_constraint_violation() {
     conn.execute("COMMIT").unwrap();
 
     let stmt = conn.query("PRAGMA integrity_check").unwrap().unwrap();
-    println!("{:?}", stmt);
+    println!("{stmt:?}");
     let row = helper_read_single_row(stmt);
     assert_eq!(
         row[0],

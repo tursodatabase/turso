@@ -1633,7 +1633,6 @@ impl Pager {
         if let Some(wal) = &self.wal {
             let wal_max_frame = savepoint.wal_max_frame.load(Ordering::SeqCst);
             let wal_checksum = *savepoint.wal_checksum.read();
-            let current_max_frame = wal.get_max_frame();
             wal.rollback(Some(wal_max_frame), Some(wal_checksum));
         }
 
