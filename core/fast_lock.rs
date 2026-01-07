@@ -63,7 +63,7 @@ impl<T> SpinLock<T> {
     pub fn lock_slow(&self) -> SpinLockGuard<'_, T> {
         while self
             .locked
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_err()
         {
             std::hint::spin_loop();
