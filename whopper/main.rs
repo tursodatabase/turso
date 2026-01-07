@@ -504,6 +504,39 @@ fn perform_work(
                             }
                             return Ok(());
                         }
+                        turso_core::LimboError::CompletionError(_) => {
+                            // I/O error - log it and try to recover by rolling back
+                            tracing::warn!("{} I/O error: {}, recovering", fiber_idx, e);
+                            drop(stmt_borrow);
+                            context.fibers[fiber_idx].statement.replace(None);
+                            // Only attempt rollback if we're actually in a transaction
+                            if matches!(
+                                context.fibers[fiber_idx].state,
+                                FiberState::InTx | FiberState::Committing | FiberState::RollingBack
+                            ) {
+                                if let Ok(rollback_stmt) =
+                                    context.fibers[fiber_idx].connection.prepare("ROLLBACK")
+                                {
+                                    context.fibers[fiber_idx]
+                                        .statement
+                                        .replace(Some(rollback_stmt));
+                                    context.fibers[fiber_idx].state = FiberState::RollingBack;
+                                } else {
+                                    context.fibers[fiber_idx].state = FiberState::Idle;
+                                }
+                            } else {
+                                context.fibers[fiber_idx].state = FiberState::Idle;
+                            }
+                            return Ok(());
+                        }
+                        turso_core::LimboError::TxError(_) => {
+                            // Transaction error (e.g., rollback when no tx active) - just reset state
+                            tracing::warn!("{} Transaction error: {}, resetting", fiber_idx, e);
+                            drop(stmt_borrow);
+                            context.fibers[fiber_idx].statement.replace(None);
+                            context.fibers[fiber_idx].state = FiberState::Idle;
+                            return Ok(());
+                        }
                         _ => {
                             return Err(e.into());
                         }
