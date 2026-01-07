@@ -1095,15 +1095,27 @@ pub struct Savepoint {
     /// If the database grows during the savepoint and a rollback to the savepoint is performed,
     /// the pages exceeding the database size at the start of the savepoint will be ignored.
     db_size: AtomicU32,
+    /// We might want to rollback.
+    /// WAL max frame at the start of the savepoint.
+    wal_max_frame: AtomicU64,
+    /// WAL checksum at the start of the savepoint.
+    wal_checksum: RwLock<(u32, u32)>,
 }
 
 impl Savepoint {
-    pub fn new(subjournal_offset: u64, db_size: u32) -> Self {
+    pub fn new(
+        subjournal_offset: u64,
+        db_size: u32,
+        wal_max_frame: u64,
+        wal_checksum: (u32, u32),
+    ) -> Self {
         Self {
             start_offset: AtomicU64::new(subjournal_offset),
             write_offset: AtomicU64::new(subjournal_offset),
             page_bitmap: RwLock::new(RoaringBitmap::new()),
             db_size: AtomicU32::new(db_size),
+            wal_max_frame: AtomicU64::new(wal_max_frame),
+            wal_checksum: RwLock::new(wal_checksum),
         }
     }
 
@@ -1489,7 +1501,12 @@ impl Pager {
         // the subjournal offset should always be 0 as we should only have max 1 savepoint
         // opened at any given time.
         turso_assert!(subjournal_offset == 0, "subjournal offset should be 0");
-        let savepoint = Savepoint::new(subjournal_offset, db_size);
+        let (wal_max_frame, wal_checksum) = if let Some(wal) = &self.wal {
+            (wal.get_max_frame(), wal.get_last_checksum())
+        } else {
+            (0, (0, 0))
+        };
+        let savepoint = Savepoint::new(subjournal_offset, db_size, wal_max_frame, wal_checksum);
         let mut savepoints = self.savepoints.write();
         turso_assert!(
             savepoints.is_empty(),
@@ -1615,6 +1632,12 @@ impl Pager {
         );
 
         self.page_cache.write().truncate(db_size as usize)?;
+
+        if let Some(wal) = &self.wal {
+            let wal_max_frame = savepoint.wal_max_frame.load(Ordering::SeqCst);
+            let wal_checksum = *savepoint.wal_checksum.read();
+            wal.rollback(Some(wal_max_frame), Some(wal_checksum));
+        }
 
         Ok(true)
     }
@@ -4133,7 +4156,7 @@ impl Pager {
         }
         if is_write {
             if let Some(wal) = self.wal.as_ref() {
-                wal.rollback();
+                wal.rollback(None, None);
             }
         }
     }
