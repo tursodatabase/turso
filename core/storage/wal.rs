@@ -333,8 +333,9 @@ pub trait Wal: Debug + Send + Sync {
     fn get_checkpoint_seq(&self) -> u32;
     fn get_max_frame(&self) -> u64;
     fn get_min_frame(&self) -> u64;
-    fn rollback(&self);
+    fn rollback(&self, to_frame: Option<u64>, checksum: Option<(u32, u32)>);
     fn abort_checkpoint(&self);
+    fn get_last_checksum(&self) -> (u32, u32);
 
     /// Return unique set of pages changed **after** frame_watermark position and until current WAL session max_frame_no
     fn changed_pages_after(&self, frame_watermark: u64) -> Result<Vec<u32>>;
@@ -1505,10 +1506,15 @@ impl Wal for WalFile {
         self.min_frame.load(Ordering::Acquire)
     }
 
+    fn get_last_checksum(&self) -> (u32, u32) {
+        *self.last_checksum.read()
+    }
     #[instrument(skip_all, level = Level::DEBUG)]
-    fn rollback(&self) {
+
+    fn rollback(&self, to_frame: Option<u64>, checksum: Option<(u32, u32)>) {
         let (max_frame, last_checksum) = self.with_shared(|shared| {
-            let max_frame = shared.max_frame.load(Ordering::Acquire);
+            let max_frame = to_frame.unwrap_or_else(|| shared.max_frame.load(Ordering::Acquire));
+            let last_checksum = checksum.unwrap_or(shared.last_checksum);
             let mut frame_cache = shared.frame_cache.lock();
             frame_cache.retain(|_page_id, frames| {
                 // keep frames <= max_frame
@@ -1517,7 +1523,7 @@ impl Wal for WalFile {
                 }
                 !frames.is_empty()
             });
-            (max_frame, shared.last_checksum)
+            (max_frame, last_checksum)
         });
         *self.last_checksum.write() = last_checksum;
         self.max_frame.store(max_frame, Ordering::Release);
