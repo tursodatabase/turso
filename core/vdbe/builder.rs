@@ -32,6 +32,7 @@ impl TableRefIdCounter {
         }
     }
 
+    #[expect(clippy::should_implement_trait)]
     pub fn next(&mut self) -> ast::TableInternalId {
         let id = self.next_free;
         self.next_free += 1;

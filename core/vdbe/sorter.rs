@@ -176,6 +176,7 @@ impl Sorter {
         }
     }
 
+    #[expect(clippy::should_implement_trait)]
     pub fn next(&mut self) -> Result<IOResult<()>> {
         if self.chunks.is_empty() {
             match self.records.pop() {

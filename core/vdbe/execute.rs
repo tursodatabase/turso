@@ -4320,10 +4320,7 @@ pub fn op_rowset_add(
         }
     };
 
-    let rowset = state
-        .rowsets
-        .entry(*rowset_reg)
-        .or_insert_with(crate::vdbe::rowset::RowSet::new);
+    let rowset = state.rowsets.entry(*rowset_reg).or_default();
 
     rowset.insert(rowid);
 
@@ -4411,10 +4408,7 @@ pub fn op_rowset_test(
         }
     };
 
-    let rowset = state
-        .rowsets
-        .entry(*rowset_reg)
-        .or_insert_with(crate::vdbe::rowset::RowSet::new);
+    let rowset = state.rowsets.entry(*rowset_reg).or_default();
 
     let found = if *batch == 0 {
         // SQLite rowsets assume that in each batch, the caller makes sure no

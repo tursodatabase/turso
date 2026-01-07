@@ -548,7 +548,7 @@ fn round_with_precision(bencher: Bencher) {
 
 #[divan::bench]
 fn round_high_precision(bencher: Bencher) {
-    let value = Value::Float(3.141592653589793);
+    let value = Value::Float(std::f64::consts::PI);
     let precision = Value::Integer(10);
     bencher.bench_local(|| black_box(&value).exec_round(Some(black_box(&precision))));
 }

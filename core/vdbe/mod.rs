@@ -168,10 +168,12 @@ impl BranchOffset {
     /// Adds an integer value to the branch offset.
     /// Returns a new branch offset.
     /// Panics if the branch offset is a label or placeholder.
+    #[expect(clippy::should_implement_trait)]
     pub fn add<N: Into<u32>>(self, n: N) -> BranchOffset {
         BranchOffset::Offset(self.as_offset_int() + n.into())
     }
 
+    #[expect(clippy::should_implement_trait)]
     pub fn sub<N: Into<u32>>(self, n: N) -> BranchOffset {
         BranchOffset::Offset(self.as_offset_int() - n.into())
     }
@@ -1545,6 +1547,10 @@ impl Row {
 
     pub fn len(&self) -> usize {
         self.count
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
     }
 }
 
