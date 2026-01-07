@@ -101,3 +101,11 @@ do_execsql_test_on_specific_db {:memory:} create-index-on-shadowed-rowid-alias-2
     SELECT name FROM sqlite_schema WHERE type='index';
 } {idx11}
 
+# creating index with NOT IN in WHERE clause should succeed
+do_execsql_test_on_specific_db {:memory:} create-index-with-not-in-where {
+    CREATE TABLE t12(c0);
+    INSERT INTO t12 VALUES (1), (2), (3);
+    CREATE INDEX idx12 ON t12(c0) WHERE c0 NOT IN (1, 2);
+    SELECT name FROM sqlite_schema WHERE type='index';
+} {idx12}
+
