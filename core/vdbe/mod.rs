@@ -504,6 +504,7 @@ impl ProgramState {
         if let Some(max_cursors) = max_cursors {
             self.cursors.resize_with(max_cursors, || None);
             self.cursor_seqs.resize(max_cursors, 0);
+            self.deferred_seeks.resize(max_cursors, None);
         }
         if let Some(max_registers) = max_registers {
             self.registers
