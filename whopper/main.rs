@@ -57,6 +57,8 @@ struct SimulatorConfig {
 enum FiberState {
     Idle,
     InTx,
+    Committing,
+    RollingBack,
 }
 
 struct SimulatorFiber {
@@ -432,15 +434,17 @@ fn perform_work(
                             trace!("{} Schema changed, rolling back transaction", fiber_idx);
                             drop(stmt_borrow);
                             context.fibers[fiber_idx].statement.replace(None);
-                            // Rollback the transaction if we're in one
-                            if matches!(context.fibers[fiber_idx].state, FiberState::InTx)
-                                && let Ok(rollback_stmt) =
-                                    context.fibers[fiber_idx].connection.prepare("ROLLBACK")
+                            // Rollback the transaction if we're in one (or retry if rollback failed)
+                            if matches!(
+                                context.fibers[fiber_idx].state,
+                                FiberState::InTx | FiberState::Committing | FiberState::RollingBack
+                            ) && let Ok(rollback_stmt) =
+                                context.fibers[fiber_idx].connection.prepare("ROLLBACK")
                             {
                                 context.fibers[fiber_idx]
                                     .statement
                                     .replace(Some(rollback_stmt));
-                                context.fibers[fiber_idx].state = FiberState::Idle;
+                                context.fibers[fiber_idx].state = FiberState::RollingBack;
                             }
                             return Ok(());
                         }
@@ -448,19 +452,23 @@ fn perform_work(
                             trace!("{} Database busy, rolling back transaction", fiber_idx);
                             drop(stmt_borrow);
                             context.fibers[fiber_idx].statement.replace(None);
-                            // Rollback the transaction if we're in one
-                            if matches!(context.fibers[fiber_idx].state, FiberState::InTx)
-                                && let Ok(rollback_stmt) =
-                                    context.fibers[fiber_idx].connection.prepare("ROLLBACK")
+                            // Rollback the transaction if we're in one (or retry if rollback failed)
+                            if matches!(
+                                context.fibers[fiber_idx].state,
+                                FiberState::InTx | FiberState::Committing | FiberState::RollingBack
+                            ) && let Ok(rollback_stmt) =
+                                context.fibers[fiber_idx].connection.prepare("ROLLBACK")
                             {
                                 context.fibers[fiber_idx]
                                     .statement
                                     .replace(Some(rollback_stmt));
-                                context.fibers[fiber_idx].state = FiberState::Idle;
+                                context.fibers[fiber_idx].state = FiberState::RollingBack;
                             }
                             return Ok(());
                         }
                         turso_core::LimboError::WriteWriteConflict => {
+                            // Write-write conflict means the transaction was automatically
+                            // rolled back by the database engine
                             trace!(
                                 "{} Write-write conflict, transaction automatically rolled back",
                                 fiber_idx
@@ -474,14 +482,17 @@ fn perform_work(
                             trace!("{} Stale snapshot, rolling back transaction", fiber_idx);
                             drop(stmt_borrow);
                             context.fibers[fiber_idx].statement.replace(None);
-                            if matches!(context.fibers[fiber_idx].state, FiberState::InTx)
-                                && let Ok(rollback_stmt) =
-                                    context.fibers[fiber_idx].connection.prepare("ROLLBACK")
+                            // Rollback the transaction if we're in one (or retry if rollback failed)
+                            if matches!(
+                                context.fibers[fiber_idx].state,
+                                FiberState::InTx | FiberState::Committing | FiberState::RollingBack
+                            ) && let Ok(rollback_stmt) =
+                                context.fibers[fiber_idx].connection.prepare("ROLLBACK")
                             {
                                 context.fibers[fiber_idx]
                                     .statement
                                     .replace(Some(rollback_stmt));
-                                context.fibers[fiber_idx].state = FiberState::Idle;
+                                context.fibers[fiber_idx].state = FiberState::RollingBack;
                             }
                             return Ok(());
                         }
@@ -501,6 +512,11 @@ fn perform_work(
     }
     context.fibers[fiber_idx].statement.replace(None);
     match context.fibers[fiber_idx].state {
+        FiberState::Committing | FiberState::RollingBack => {
+            // COMMIT or ROLLBACK completed successfully, transition to Idle
+            trace!("{} Transaction ended successfully", fiber_idx);
+            context.fibers[fiber_idx].state = FiberState::Idle;
+        }
         FiberState::Idle => {
             let action = rng.random_range(0..100);
             if action <= 29 {
@@ -615,7 +631,7 @@ fn perform_work(
                     // COMMIT (13%)
                     if let Ok(stmt) = context.fibers[fiber_idx].connection.prepare("COMMIT") {
                         context.fibers[fiber_idx].statement.replace(Some(stmt));
-                        context.fibers[fiber_idx].state = FiberState::Idle;
+                        context.fibers[fiber_idx].state = FiberState::Committing;
                     }
                     trace!("{} COMMIT", fiber_idx);
                 }
@@ -623,7 +639,7 @@ fn perform_work(
                     // ROLLBACK (13%)
                     if let Ok(stmt) = context.fibers[fiber_idx].connection.prepare("ROLLBACK") {
                         context.fibers[fiber_idx].statement.replace(Some(stmt));
-                        context.fibers[fiber_idx].state = FiberState::Idle;
+                        context.fibers[fiber_idx].state = FiberState::RollingBack;
                     }
                     trace!("{} ROLLBACK", fiber_idx);
                 }
