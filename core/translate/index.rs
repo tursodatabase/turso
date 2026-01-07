@@ -21,7 +21,6 @@ use crate::translate::plan::{
 };
 use crate::vdbe::builder::CursorKey;
 use crate::vdbe::insn::{to_u16, CmpInsFlags, Cookie};
-use crate::vdbe::BranchOffset;
 use crate::{
     schema::{BTreeTable, Index, IndexColumn, PseudoCursorType},
     storage::pager::CreateBTreeFlags,
