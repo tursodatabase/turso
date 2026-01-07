@@ -3336,10 +3336,16 @@ impl Pager {
     }
 
     fn reset_checkpoint_state(&self) {
+        self.clear_checkpoint_state();
+        self.commit_info.write().state = CommitState::PrepareWal;
+    }
+
+    /// Reset checkpoint state machine to initial state.
+    /// Use this to clean up after a failed explicit checkpoint (PRAGMA wal_checkpoint).
+    pub fn clear_checkpoint_state(&self) {
         let mut state = self.checkpoint_state.write();
         state.phase = CheckpointPhase::NotCheckpointing;
         state.result = None;
-        self.commit_info.write().state = CommitState::PrepareWal;
     }
 
     /// Clean up after a checkpoint failure. The WAL commit succeeded but checkpoint failed.
@@ -3489,18 +3495,19 @@ impl Pager {
                 CheckpointPhase::Finalize { clear_page_cache } => {
                     let mut state = self.checkpoint_state.write();
                     let mut res = state.result.take().expect("result should be set");
-
-                    // Release checkpoint guard
-                    res.release_guard();
+                    state.phase = CheckpointPhase::NotCheckpointing;
 
                     // Clear page cache only if requested (explicit checkpoints do this, auto-checkpoint does not)
                     if clear_page_cache {
                         self.page_cache.write().clear(false).map_err(|e| {
+                            res.release_guard();
                             LimboError::InternalError(format!("Failed to clear page cache: {e:?}"))
                         })?;
                     }
 
-                    state.phase = CheckpointPhase::NotCheckpointing;
+                    // Release checkpoint guard
+                    res.release_guard();
+
                     return Ok(IOResult::Done(res));
                 }
             }
