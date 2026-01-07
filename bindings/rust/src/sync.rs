@@ -424,7 +424,7 @@ impl IoWorker {
             // there are no more items even after yielding to allow woken tasks to
             // potentially queue more work.
             loop {
-                // Process all available items.
+                // Process all available items in this batch.
                 let mut processed_any = false;
                 while let Some(item) = this.sync.take_io_item() {
                     processed_any = true;
@@ -473,17 +473,20 @@ impl IoWorker {
                     }
                 }
 
-                // Step callbacks and notify woken futures.
+                // Always step callbacks after processing (or checking for) items.
+                // This is necessary even when no items were processed, as callbacks
+                // may need to progress the state machine.
                 this.sync.step_io_callbacks();
                 IoWorker::notify_progress(&wakers);
 
-                // If we didn't process anything this round, we're done.
+                // If no items were processed in this iteration, we're done processing
+                // for this kick. Exit and wait for the next kick.
                 if !processed_any {
                     break;
                 }
 
-                // Yield to allow woken tasks to run on their executors.
-                // They may queue more IO items, so we loop again.
+                // We processed items. Yield to allow woken futures to run on their
+                // executors. They may queue more IO items, so loop back to process them.
                 tokio::task::yield_now().await;
             }
         }
