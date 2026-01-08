@@ -639,7 +639,7 @@ impl SortedChunk {
         let total_bytes_read_copy = self.total_bytes_read.clone();
         let read_complete = Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
             let Ok((buf, bytes_read)) = res else {
-                return;
+                return None;
             };
             let read_buf_ref = buf.clone();
             let read_buf = read_buf_ref.as_slice();
@@ -647,7 +647,7 @@ impl SortedChunk {
             let bytes_read = bytes_read as usize;
             if bytes_read == 0 {
                 *chunk_io_state_copy.write() = SortedChunkIOState::ReadEOF;
-                return;
+                return None;
             }
             *chunk_io_state_copy.write() = SortedChunkIOState::ReadComplete;
 
@@ -661,6 +661,7 @@ impl SortedChunk {
 
             stored_buffer_len_copy.store(stored_buf_len, atomic::Ordering::SeqCst);
             total_bytes_read_copy.fetch_add(bytes_read, atomic::Ordering::SeqCst);
+            None
         });
 
         let c = Completion::new_read(read_buffer_ref, read_complete);

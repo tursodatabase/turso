@@ -209,10 +209,11 @@ pub async fn wal_apply_from_file<Ctx>(
     for offset in (0..size).step_by(WAL_FRAME_SIZE) {
         let c = Completion::new_read(buffer.clone(), move |result| {
             let Ok((_, size)) = result else {
-                return;
+                return None;
             };
             // todo(sivukhin): we need to error out in case of partial read
             assert!(size as usize == WAL_FRAME_SIZE);
+            None
         });
         let c = frames_file.pread(offset, c)?;
         while !c.succeeded() {
@@ -1130,11 +1131,12 @@ pub async fn read_wal_salt<Ctx>(
     let buffer = Arc::new(Buffer::new_temporary(WAL_HEADER));
     let c = Completion::new_read(buffer.clone(), |result| {
         let Ok((buffer, len)) = result else {
-            return;
+            return None;
         };
         if (len as usize) < WAL_HEADER {
             buffer.as_mut_slice().fill(0);
         }
+        None
     });
     let c = wal.pread(0, c)?;
     while !c.succeeded() {

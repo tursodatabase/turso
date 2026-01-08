@@ -514,7 +514,7 @@ impl<IO: SyncEngineIo> DatabaseStorage for LazyDatabaseStorage<IO> {
             let check_buffer = Arc::new(Buffer::new_temporary(size));
             let check_c = dirty_file.pread(
                 page_offset,
-                Completion::new_read(check_buffer.clone(), |_| {}),
+                Completion::new_read(check_buffer.clone(), |_| None),
             )?;
             assert!(
                 check_c.finished(),
@@ -524,7 +524,7 @@ impl<IO: SyncEngineIo> DatabaseStorage for LazyDatabaseStorage<IO> {
             let clean_buffer = r.buf_arc();
             let clean_c = self.clean_file.pread(
                 page_offset,
-                Completion::new_read(clean_buffer.clone(), |_| {}),
+                Completion::new_read(clean_buffer.clone(), |_| None),
             )?;
             assert!(
                 clean_c.finished(),

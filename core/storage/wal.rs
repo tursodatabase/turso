@@ -1231,17 +1231,26 @@ impl Wal for WalFile {
                 tracing::error!(err = ?res.unwrap_err());
                 page.clear_locked();
                 page.clear_wal_tag();
-                return;
+                return None; // IO error already captured in completion
             };
             let buf_len = buf.len();
-            turso_assert!(
-                bytes_read == buf_len as i32,
-                "read({bytes_read}) less than expected({buf_len}): frame_id={frame_id}"
-            );
+            if bytes_read != buf_len as i32 {
+                tracing::error!(
+                    "WAL short read on page {page_idx}, frame_id={frame_id}: expected {buf_len} bytes, got {bytes_read}"
+                );
+                page.clear_locked();
+                page.clear_wal_tag();
+                return Some(CompletionError::ShortRead {
+                    page_idx,
+                    expected: buf_len,
+                    actual: bytes_read as usize,
+                });
+            }
             let cloned = frame.clone();
             finish_read_page(page.get().id, buf, cloned);
             let epoch = shared_file.read().epoch.load(Ordering::Acquire);
             frame.set_wal_tag(frame_id, epoch);
+            None
         });
         let file = self.with_shared(|shared| {
             turso_assert!(
@@ -1288,7 +1297,7 @@ impl Wal for WalFile {
         };
         let complete = Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
             let Ok((buf, bytes_read)) = res else {
-                return;
+                return None;
             };
             let buf_len = buf.len();
             turso_assert!(
@@ -1324,6 +1333,7 @@ impl Wal for WalFile {
                     }
                 }
             }
+            None
         });
         let file = self.with_shared(|shared| {
             turso_assert!(
@@ -1381,7 +1391,7 @@ impl Wal for WalFile {
                 let conflict = conflict.clone();
                 move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
                     let Ok((buf, bytes_read)) = res else {
-                        return;
+                        return None;
                     };
                     let buf_len = buf.len();
                     turso_assert!(
@@ -1392,6 +1402,7 @@ impl Wal for WalFile {
                     if buf.as_slice() != page {
                         *conflict.lock() = true;
                     }
+                    None
                 }
             });
             let file = self.with_shared(|shared| {
@@ -2648,7 +2659,7 @@ impl WalFile {
             let buf_slot = buf_slot.clone();
             Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
                 let Ok((buf, read)) = res else {
-                    return;
+                    return None;
                 };
                 let buf_len = buf.len();
                 turso_assert!(
@@ -2656,6 +2667,7 @@ impl WalFile {
                     "read({read}) != expected({buf_len}): frame_id={frame_id}"
                 );
                 *buf_slot.lock() = Some(buf);
+                None
             })
         };
         // schedule read of the page payload

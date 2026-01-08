@@ -1399,10 +1399,12 @@ impl HashTable {
                                     .extend_from_slice(&buf.as_slice()[..bytes_read as usize]);
                                 buffer_len.fetch_add(bytes_read as usize, atomic::Ordering::SeqCst);
                                 io_state.set(SpillIOState::ReadComplete);
+                                None
                             }
                             Err(e) => {
                                 tracing::error!("Error reading spilled partition chunk: {e:?}");
                                 io_state.set(SpillIOState::Error);
+                                None
                             }
                         },
                     );
