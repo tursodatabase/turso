@@ -1108,6 +1108,7 @@ fn new_tx(tx_id: TxID, begin_ts: u64, state: TransactionState) -> Transaction {
         write_set: SkipSet::new(),
         read_set: SkipSet::new(),
         header: RwLock::new(DatabaseHeader::default()),
+        savepoint_stack: RwLock::new(Vec::new()),
     }
 }
 
@@ -1126,6 +1127,7 @@ fn test_snapshot_isolation_tx_visible1() {
 
     let rv_visible = |begin: Option<TxTimestampOrID>, end: Option<TxTimestampOrID>| {
         let row_version = RowVersion {
+            id: 0, // Dummy ID for visibility tests
             begin,
             end,
             row: generate_simple_string_row((-2).into(), 1, "testme"),
@@ -1521,6 +1523,7 @@ fn transaction_display() {
         write_set,
         read_set,
         header: RwLock::new(DatabaseHeader::default()),
+        savepoint_stack: RwLock::new(Vec::new()),
     };
 
     let expected = "{ state: Preparing, id: 42, begin_ts: 20250914, write_set: [RowID { table_id: MVTableId(-2), row_id: Int(11) }, RowID { table_id: MVTableId(-2), row_id: Int(13) }], read_set: [RowID { table_id: MVTableId(-2), row_id: Int(17) }, RowID { table_id: MVTableId(-2), row_id: Int(19) }] }";
@@ -2215,6 +2218,183 @@ fn test_sequential_updates_with_constraint_errors() {
 
     // Verify index lookups work
     let rows = get_rows(&conn, "SELECT * FROM t WHERE unique_col = 'fresh_sun_348'");
+    assert_eq!(rows.len(), 1);
+
+    // Integrity check
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+}
+
+/// Test that multiple successful statements in an interactive transaction
+/// have their changes preserved when a subsequent statement fails.
+/// This tests the statement-level savepoint functionality.
+#[test]
+fn test_savepoint_multiple_statements_last_fails() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)").unwrap();
+
+    // Start interactive transaction
+    conn.execute("BEGIN CONCURRENT").unwrap();
+
+    // Statement 1: Insert row 1 - success
+    conn.execute("INSERT INTO t VALUES (1)").unwrap();
+
+    // Statement 2: Insert row 2 - success
+    conn.execute("INSERT INTO t VALUES (2)").unwrap();
+
+    // Statement 3: Insert row 1 again - fails with PK violation
+    let result = conn.execute("INSERT INTO t VALUES (1)");
+    assert!(result.is_err(), "Expected primary key violation");
+
+    // COMMIT - should preserve statements 1 and 2
+    conn.execute("COMMIT").unwrap();
+
+    // Verify rows 1 and 2 exist
+    let rows = get_rows(&conn, "SELECT * FROM t ORDER BY id");
+    assert_eq!(rows.len(), 2);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+    assert_eq!(rows[1][0].as_int().unwrap(), 2);
+
+    // Integrity check
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+}
+
+/// Test that when the same row is modified by multiple statements,
+/// and the second modification fails, the first modification is preserved.
+#[test]
+fn test_savepoint_same_row_multiple_statements() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER, other_unique INTEGER UNIQUE)")
+        .unwrap();
+
+    // Insert initial row and a row to cause conflict
+    conn.execute("INSERT INTO t VALUES (1, 100, 1)").unwrap();
+    conn.execute("INSERT INTO t VALUES (2, 200, 2)").unwrap();
+
+    // Start interactive transaction
+    conn.execute("BEGIN CONCURRENT").unwrap();
+
+    // Statement 1: Update row 1's value to 150 - success
+    conn.execute("UPDATE t SET v = 150 WHERE id = 1").unwrap();
+
+    // Statement 2: Try to update row 1 with conflicting other_unique - fails
+    let result = conn.execute("UPDATE t SET v = 175, other_unique = 2 WHERE id = 1");
+    assert!(result.is_err(), "Expected unique constraint violation");
+
+    // COMMIT - should preserve statement 1's change (v = 150)
+    conn.execute("COMMIT").unwrap();
+
+    // Verify row 1 has v = 150 (from statement 1), not 175 (from failed statement 2)
+    let rows = get_rows(&conn, "SELECT v, other_unique FROM t WHERE id = 1");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 150);
+    assert_eq!(rows[0][1].as_int().unwrap(), 1); // other_unique unchanged
+
+    // Integrity check
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+}
+
+/// Test that index operations are properly tracked per-statement.
+/// When a statement fails after partially modifying indexes,
+/// only that statement's index changes are rolled back.
+#[test]
+fn test_savepoint_index_multiple_statements() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    conn.execute(
+        "CREATE TABLE t(
+            id INTEGER PRIMARY KEY,
+            name TEXT UNIQUE,
+            value INTEGER UNIQUE
+        )",
+    )
+    .unwrap();
+
+    // Insert rows
+    conn.execute("INSERT INTO t VALUES (1, 'a', 10)").unwrap();
+    conn.execute("INSERT INTO t VALUES (2, 'b', 20)").unwrap();
+
+    // Start interactive transaction
+    conn.execute("BEGIN CONCURRENT").unwrap();
+
+    // Statement 1: Successfully change name for row 1
+    conn.execute("UPDATE t SET name = 'c' WHERE id = 1").unwrap();
+
+    // Statement 2: Try to change name to 'b' (conflict with row 2) - fails
+    let result = conn.execute("UPDATE t SET name = 'b' WHERE id = 1");
+    assert!(result.is_err(), "Expected unique constraint violation on name");
+
+    // COMMIT
+    conn.execute("COMMIT").unwrap();
+
+    // Verify row 1 has name 'c' from statement 1
+    let rows = get_rows(&conn, "SELECT name FROM t WHERE id = 1");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].cast_text().unwrap(), "c");
+
+    // Verify index lookups work correctly
+    let rows = get_rows(&conn, "SELECT id FROM t WHERE name = 'c'");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 1);
+
+    // 'a' should no longer be in the index
+    let rows = get_rows(&conn, "SELECT id FROM t WHERE name = 'a'");
+    assert_eq!(rows.len(), 0);
+
+    // 'b' should still point to row 2
+    let rows = get_rows(&conn, "SELECT id FROM t WHERE name = 'b'");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_int().unwrap(), 2);
+
+    // Integrity check
+    let rows = get_rows(&conn, "PRAGMA integrity_check");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(&rows[0][0].to_string(), "ok");
+}
+
+/// Test INSERT followed by DELETE of same row, then another statement fails.
+/// The insert+delete should be preserved (row shouldn't exist).
+#[test]
+fn test_savepoint_insert_delete_then_fail() {
+    let db = MvccTestDbNoConn::new_with_random_db();
+    let conn = db.connect();
+
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, v INTEGER UNIQUE)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (2, 200)").unwrap();
+
+    // Start interactive transaction
+    conn.execute("BEGIN CONCURRENT").unwrap();
+
+    // Statement 1: Insert row 1
+    conn.execute("INSERT INTO t VALUES (1, 100)").unwrap();
+
+    // Statement 2: Delete row 1
+    conn.execute("DELETE FROM t WHERE id = 1").unwrap();
+
+    // Statement 3: Try to insert with conflicting unique value - fails
+    let result = conn.execute("INSERT INTO t VALUES (3, 200)");
+    assert!(result.is_err(), "Expected unique constraint violation");
+
+    // COMMIT
+    conn.execute("COMMIT").unwrap();
+
+    // Verify row 1 does not exist (was deleted in statement 2)
+    let rows = get_rows(&conn, "SELECT * FROM t WHERE id = 1");
+    assert_eq!(rows.len(), 0);
+
+    // Row 2 should still exist
+    let rows = get_rows(&conn, "SELECT * FROM t WHERE id = 2");
     assert_eq!(rows.len(), 1);
 
     // Integrity check
