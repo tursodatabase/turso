@@ -356,7 +356,6 @@ fn optimize_subqueries(plan: &mut SelectPlan, schema: &Schema) -> Result<()> {
 
 #[allow(clippy::too_many_arguments)]
 fn optimize_table_access_with_custom_modules(
-    schema: &Schema,
     result_columns: &mut [ResultSetColumn],
     table_references: &mut TableReferences,
     available_indexes: &HashMap<String, VecDeque<Arc<Index>>>,
@@ -409,14 +408,14 @@ fn optimize_table_access_with_custom_modules(
 
             for column in columns.iter_mut() {
                 if let ast::ResultColumn::Expr(e, _) = column {
-                    simple_bind_expr(schema, table, &[], e)?;
+                    simple_bind_expr(table, &[], e)?;
                 }
             }
             for column in pattern.order_by.iter_mut() {
-                simple_bind_expr(schema, table, columns, &mut column.expr)?;
+                simple_bind_expr(table, columns, &mut column.expr)?;
             }
             if let Some(pattern_where) = where_clause {
-                simple_bind_expr(schema, table, columns, pattern_where)?;
+                simple_bind_expr(table, columns, pattern_where)?;
             }
 
             if name.name.as_str() != table.table.get_name() {
@@ -639,7 +638,6 @@ fn optimize_table_access(
 
     if table_references.joined_tables().len() == 1 {
         let optimized = optimize_table_access_with_custom_modules(
-            schema,
             result_columns,
             table_references,
             available_indexes,

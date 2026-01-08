@@ -1,31 +1,23 @@
-#![allow(unused)]
-use crate::function::Deterministic;
 use crate::incremental::view::IncrementalView;
 use crate::numeric::StrToF64;
 use crate::schema::ColDef;
 use crate::translate::emitter::TransactionMode;
 use crate::translate::expr::{walk_expr_mut, WalkControl};
-use crate::translate::optimizer::Optimizable;
 use crate::translate::plan::JoinedTable;
 use crate::translate::planner::parse_row_id;
 use crate::types::IOResult;
+use crate::IO;
 use crate::{
-    schema::{self, BTreeTable, Column, Schema, Table, Type, DBSP_TABLE_PREFIX},
-    translate::{collate::CollationSeq, expr::walk_expr, plan::JoinOrderMember},
+    schema::{Column, Schema, Table, Type},
     types::{Value, ValueType},
-    LimboError, OpenFlags, Result, Statement, StepResult, SymbolTable,
+    LimboError, OpenFlags, Result, Statement, SymbolTable,
 };
-use crate::{Connection, MvStore, IO};
 use either::Either;
 use parking_lot::Mutex;
-use std::sync::atomic::AtomicU8;
-use std::{collections::HashMap, rc::Rc, sync::Arc};
+use std::{collections::HashMap, sync::Arc};
 use tracing::{instrument, Level};
 use turso_macros::match_ignore_ascii_case;
-use turso_parser::ast::{
-    self, fmt::ToTokens, Cmd, CreateTableBody, Expr, FunctionTail, Literal, Stmt, UnaryOperator,
-};
-use turso_parser::parser::Parser;
+use turso_parser::ast::{self, CreateTableBody, Expr, Literal, UnaryOperator};
 
 #[macro_export]
 macro_rules! io_yield_one {
@@ -132,7 +124,7 @@ pub fn parse_schema_rows(
     schema: &mut Schema,
     syms: &SymbolTable,
     mv_tx: Option<(u64, TransactionMode)>,
-    mut existing_views: HashMap<String, Arc<Mutex<IncrementalView>>>,
+    _existing_views: HashMap<String, Arc<Mutex<IncrementalView>>>,
     enable_triggers: bool,
 ) -> Result<()> {
     rows.set_mv_tx(mv_tx);
@@ -175,7 +167,7 @@ pub fn parse_schema_rows(
             mv_store.as_ref(),
             enable_triggers,
         )
-    });
+    })?;
 
     schema.populate_indices(
         syms,
@@ -333,7 +325,6 @@ pub fn check_literal_equivalency(lhs: &Literal, rhs: &Literal) -> bool {
 
 /// bind AST identifiers to either Column or Rowid if possible
 pub fn simple_bind_expr(
-    schema: &Schema,
     joined_table: &JoinedTable,
     result_columns: &[ast::ResultColumn],
     expr: &mut ast::Expr,
@@ -380,7 +371,7 @@ pub fn simple_bind_expr(
             _ => {}
         }
         Ok(WalkControl::Continue)
-    });
+    })?;
     Ok(())
 }
 
@@ -686,6 +677,7 @@ pub fn columns_from_create_table_body(
             "CREATE TABLE body must contain columns and constraints".to_string(),
         ));
     };
+
     Ok(columns.iter().map(Into::into).collect())
 }
 
@@ -947,50 +939,6 @@ pub fn trim_ascii_whitespace(s: &str) -> &str {
     }
 }
 
-/// When casting a TEXT value to INTEGER, the longest possible prefix of the value that can be interpreted as an integer number
-/// is extracted from the TEXT value and the remainder ignored. Any leading spaces in the TEXT value when converting from TEXT to INTEGER are ignored.
-/// If there is no prefix that can be interpreted as an integer number, the result of the conversion is 0.
-/// If the prefix integer is greater than +9223372036854775807 then the result of the cast is exactly +9223372036854775807.
-/// Similarly, if the prefix integer is less than -9223372036854775808 then the result of the cast is exactly -9223372036854775808.
-/// When casting to INTEGER, if the text looks like a floating point value with an exponent, the exponent will be ignored
-/// because it is no part of the integer prefix. For example, "CAST('123e+5' AS INTEGER)" results in 123, not in 12300000.
-/// The CAST operator understands decimal integers only — conversion of hexadecimal integers stops at the "x" in the "0x" prefix of the hexadecimal integer string and thus result of the CAST is always zero.
-pub fn cast_text_to_integer(text: &str) -> Value {
-    let text = text.trim();
-    if text.is_empty() {
-        return Value::Integer(0);
-    }
-    if let Ok(i) = text.parse::<i64>() {
-        return Value::Integer(i);
-    }
-    let bytes = text.as_bytes();
-    let mut end = 0;
-    if bytes[0] == b'-' {
-        end = 1;
-    }
-    while end < bytes.len() && bytes[end].is_ascii_digit() {
-        end += 1;
-    }
-    text[..end]
-        .parse::<i64>()
-        .map_or(Value::Integer(0), Value::Integer)
-}
-
-/// When casting a TEXT value to REAL, the longest possible prefix of the value that can be interpreted
-/// as a real number is extracted from the TEXT value and the remainder ignored. Any leading spaces in
-/// the TEXT value are ignored when converging from TEXT to REAL.
-/// If there is no prefix that can be interpreted as a real number, the result of the conversion is 0.0.
-pub fn cast_text_to_real(text: &str) -> Value {
-    let trimmed = text.trim();
-    if trimmed.is_empty() {
-        return Value::Float(0.0);
-    }
-    let Ok((_, text)) = parse_numeric_str(trimmed) else {
-        return Value::Float(0.0);
-    };
-    text.parse::<f64>().map_or(Value::Float(0.0), Value::Float)
-}
-
 /// NUMERIC Casting a TEXT or BLOB value into NUMERIC yields either an INTEGER or a REAL result.
 /// If the input text looks like an integer (there is no decimal point nor exponent) and the value
 /// is small enough to fit in a 64-bit signed integer, then the result will be INTEGER.
@@ -1091,10 +1039,6 @@ fn parse_numeric_str(text: &str) -> Result<(ValueType, &str), ()> {
         },
         &text[..end],
     ))
-}
-
-pub fn cast_text_to_numeric(txt: &str) -> Value {
-    checked_cast_text_to_numeric(txt, false).unwrap_or(Value::Integer(0))
 }
 
 // Check if float can be losslessly converted to 51-bit integer
@@ -1530,8 +1474,8 @@ pub fn rewrite_inline_col_fk_target_if_needed(
 #[cfg(test)]
 pub mod tests {
     use super::*;
-    use crate::{schema::Type as SchemaValueType, types::Text};
-    use turso_parser::ast::{self, Expr, Literal, Name, Operator::*, Type};
+    use crate::schema::Type as SchemaValueType;
+    use turso_parser::ast::{self, Expr, FunctionTail, Literal, Name, Operator::*, Type};
 
     #[test]
     fn test_normalize_ident() {
@@ -2115,142 +2059,315 @@ pub mod tests {
 
     #[test]
     fn test_text_to_integer() {
-        assert_eq!(cast_text_to_integer("1"), Value::Integer(1),);
-        assert_eq!(cast_text_to_integer("-1"), Value::Integer(-1),);
         assert_eq!(
-            cast_text_to_integer("1823400-00000"),
-            Value::Integer(1823400),
-        );
-        assert_eq!(cast_text_to_integer("-10000000"), Value::Integer(-10000000),);
-        assert_eq!(cast_text_to_integer("123xxx"), Value::Integer(123),);
-        assert_eq!(
-            cast_text_to_integer("9223372036854775807"),
-            Value::Integer(i64::MAX),
+            checked_cast_text_to_numeric("1", false).unwrap(),
+            Value::Integer(1)
         );
         assert_eq!(
-            cast_text_to_integer("9223372036854775808"),
-            Value::Integer(0),
+            checked_cast_text_to_numeric("-1", false).unwrap(),
+            Value::Integer(-1)
         );
         assert_eq!(
-            cast_text_to_integer("-9223372036854775808"),
-            Value::Integer(i64::MIN),
+            checked_cast_text_to_numeric("1823400-00000", false).unwrap(),
+            Value::Integer(1823400)
         );
         assert_eq!(
-            cast_text_to_integer("-9223372036854775809"),
-            Value::Integer(0),
+            checked_cast_text_to_numeric("-10000000", false).unwrap(),
+            Value::Integer(-10000000)
         );
-        assert_eq!(cast_text_to_integer("-"), Value::Integer(0),);
+        assert_eq!(
+            checked_cast_text_to_numeric("123xxx", false).unwrap(),
+            Value::Integer(123)
+        );
+        assert_eq!(
+            checked_cast_text_to_numeric("9223372036854775807", false).unwrap(),
+            Value::Integer(i64::MAX)
+        );
+        // Overflow becomes Float (different from cast_text_to_integer which returned 0)
+        assert_eq!(
+            checked_cast_text_to_numeric("9223372036854775808", false).unwrap(),
+            Value::Float(9.22337203685478e18)
+        );
+        assert_eq!(
+            checked_cast_text_to_numeric("-9223372036854775808", false).unwrap(),
+            Value::Integer(i64::MIN)
+        );
+        // Overflow becomes Float (different from cast_text_to_integer which returned 0)
+        assert_eq!(
+            checked_cast_text_to_numeric("-9223372036854775809", false).unwrap(),
+            Value::Float(-9.22337203685478e18)
+        );
+        assert!(checked_cast_text_to_numeric("-", false).is_err());
     }
 
     #[test]
     fn test_text_to_real() {
-        assert_eq!(cast_text_to_real("1"), Value::Float(1.0));
-        assert_eq!(cast_text_to_real("-1"), Value::Float(-1.0));
-        assert_eq!(cast_text_to_real("1.0"), Value::Float(1.0));
-        assert_eq!(cast_text_to_real("-1.0"), Value::Float(-1.0));
-        assert_eq!(cast_text_to_real("1e10"), Value::Float(1e10));
-        assert_eq!(cast_text_to_real("-1e10"), Value::Float(-1e10));
-        assert_eq!(cast_text_to_real("1e-10"), Value::Float(1e-10));
-        assert_eq!(cast_text_to_real("-1e-10"), Value::Float(-1e-10));
-        assert_eq!(cast_text_to_real("1.123e10"), Value::Float(1.123e10));
-        assert_eq!(cast_text_to_real("-1.123e10"), Value::Float(-1.123e10));
-        assert_eq!(cast_text_to_real("1.123e-10"), Value::Float(1.123e-10));
-        assert_eq!(cast_text_to_real("-1.123-e-10"), Value::Float(-1.123));
-        assert_eq!(cast_text_to_real("1-282584294928"), Value::Float(1.0));
         assert_eq!(
-            cast_text_to_real("1.7976931348623157e309"),
+            checked_cast_text_to_numeric("1", false).unwrap(),
+            Value::Integer(1)
+        );
+        assert_eq!(
+            checked_cast_text_to_numeric("-1", false).unwrap(),
+            Value::Integer(-1)
+        );
+        assert_eq!(
+            checked_cast_text_to_numeric("1.0", false).unwrap(),
+            Value::Float(1.0)
+        );
+        assert_eq!(
+            checked_cast_text_to_numeric("-1.0", false).unwrap(),
+            Value::Float(-1.0)
+        );
+        assert_eq!(
+            checked_cast_text_to_numeric("1e10", false).unwrap(),
+            Value::Float(1e10)
+        );
+        assert_eq!(
+            checked_cast_text_to_numeric("-1e10", false).unwrap(),
+            Value::Float(-1e10)
+        );
+        assert_eq!(
+            checked_cast_text_to_numeric("1e-10", false).unwrap(),
+            Value::Float(1e-10)
+        );
+        assert_eq!(
+            checked_cast_text_to_numeric("-1e-10", false).unwrap(),
+            Value::Float(-1e-10)
+        );
+        assert_eq!(
+            checked_cast_text_to_numeric("1.123e10", false).unwrap(),
+            Value::Float(1.123e10)
+        );
+        assert_eq!(
+            checked_cast_text_to_numeric("-1.123e10", false).unwrap(),
+            Value::Float(-1.123e10)
+        );
+        assert_eq!(
+            checked_cast_text_to_numeric("1.123e-10", false).unwrap(),
+            Value::Float(1.123e-10)
+        );
+        assert_eq!(
+            checked_cast_text_to_numeric("-1.123-e-10", false).unwrap(),
+            Value::Float(-1.123)
+        );
+        assert_eq!(
+            checked_cast_text_to_numeric("1-282584294928", false).unwrap(),
+            Value::Integer(1)
+        );
+        assert_eq!(
+            checked_cast_text_to_numeric("1.7976931348623157e309", false).unwrap(),
             Value::Float(f64::INFINITY),
         );
         assert_eq!(
-            cast_text_to_real("-1.7976931348623157e308"),
+            checked_cast_text_to_numeric("-1.7976931348623157e308", false).unwrap(),
             Value::Float(f64::MIN),
         );
         assert_eq!(
-            cast_text_to_real("-1.7976931348623157e309"),
+            checked_cast_text_to_numeric("-1.7976931348623157e309", false).unwrap(),
             Value::Float(f64::NEG_INFINITY),
         );
-        assert_eq!(cast_text_to_real("1E"), Value::Float(1.0));
-        assert_eq!(cast_text_to_real("1EE"), Value::Float(1.0));
-        assert_eq!(cast_text_to_real("-1E"), Value::Float(-1.0));
-        assert_eq!(cast_text_to_real("1."), Value::Float(1.0));
-        assert_eq!(cast_text_to_real("-1."), Value::Float(-1.0));
-        assert_eq!(cast_text_to_real("1.23E"), Value::Float(1.23));
-        assert_eq!(cast_text_to_real(".1.23E-"), Value::Float(0.1));
-        assert_eq!(cast_text_to_real("0"), Value::Float(0.0));
-        assert_eq!(cast_text_to_real("-0"), Value::Float(0.0));
-        assert_eq!(cast_text_to_real("-0"), Value::Float(0.0));
-        assert_eq!(cast_text_to_real("-0.0"), Value::Float(0.0));
-        assert_eq!(cast_text_to_real("0.0"), Value::Float(0.0));
-        assert_eq!(cast_text_to_real("-"), Value::Float(0.0));
+        assert_eq!(
+            checked_cast_text_to_numeric("1E", false).unwrap(),
+            Value::Float(1.0)
+        );
+        assert_eq!(
+            checked_cast_text_to_numeric("1EE", false).unwrap(),
+            Value::Float(1.0)
+        );
+        assert_eq!(
+            checked_cast_text_to_numeric("-1E", false).unwrap(),
+            Value::Float(-1.0)
+        );
+        assert_eq!(
+            checked_cast_text_to_numeric("1.", false).unwrap(),
+            Value::Float(1.0)
+        );
+        assert_eq!(
+            checked_cast_text_to_numeric("-1.", false).unwrap(),
+            Value::Float(-1.0)
+        );
+        assert_eq!(
+            checked_cast_text_to_numeric("1.23E", false).unwrap(),
+            Value::Float(1.23)
+        );
+        assert_eq!(
+            checked_cast_text_to_numeric(".1.23E-", false).unwrap(),
+            Value::Float(0.1)
+        );
+        assert_eq!(
+            checked_cast_text_to_numeric("0", false).unwrap(),
+            Value::Integer(0)
+        );
+        assert_eq!(
+            checked_cast_text_to_numeric("-0", false).unwrap(),
+            Value::Integer(0)
+        );
+        assert_eq!(
+            checked_cast_text_to_numeric("-0", false).unwrap(),
+            Value::Integer(0)
+        );
+        assert_eq!(
+            checked_cast_text_to_numeric("-0.0", false).unwrap(),
+            Value::Float(0.0)
+        );
+        assert_eq!(
+            checked_cast_text_to_numeric("0.0", false).unwrap(),
+            Value::Float(0.0)
+        );
+        assert!(checked_cast_text_to_numeric("-", false).is_err());
     }
 
     #[test]
     fn test_text_to_numeric() {
-        assert_eq!(cast_text_to_numeric("1"), Value::Integer(1));
-        assert_eq!(cast_text_to_numeric("-1"), Value::Integer(-1));
         assert_eq!(
-            cast_text_to_numeric("1823400-00000"),
+            checked_cast_text_to_numeric("1", false).unwrap(),
+            Value::Integer(1)
+        );
+        assert_eq!(
+            checked_cast_text_to_numeric("-1", false).unwrap(),
+            Value::Integer(-1)
+        );
+        assert_eq!(
+            checked_cast_text_to_numeric("1823400-00000", false).unwrap(),
             Value::Integer(1823400)
         );
-        assert_eq!(cast_text_to_numeric("-10000000"), Value::Integer(-10000000));
-        assert_eq!(cast_text_to_numeric("123xxx"), Value::Integer(123));
         assert_eq!(
-            cast_text_to_numeric("9223372036854775807"),
+            checked_cast_text_to_numeric("-10000000", false).unwrap(),
+            Value::Integer(-10000000)
+        );
+        assert_eq!(
+            checked_cast_text_to_numeric("123xxx", false).unwrap(),
+            Value::Integer(123)
+        );
+        assert_eq!(
+            checked_cast_text_to_numeric("9223372036854775807", false).unwrap(),
             Value::Integer(i64::MAX)
         );
         assert_eq!(
-            cast_text_to_numeric("9223372036854775808"),
+            checked_cast_text_to_numeric("9223372036854775808", false).unwrap(),
             Value::Float(9.22337203685478e18)
         ); // Exceeds i64, becomes float
         assert_eq!(
-            cast_text_to_numeric("-9223372036854775808"),
+            checked_cast_text_to_numeric("-9223372036854775808", false).unwrap(),
             Value::Integer(i64::MIN)
         );
         assert_eq!(
-            cast_text_to_numeric("-9223372036854775809"),
+            checked_cast_text_to_numeric("-9223372036854775809", false).unwrap(),
             Value::Float(-9.22337203685478e18)
         ); // Exceeds i64, becomes float
 
-        assert_eq!(cast_text_to_numeric("1.0"), Value::Float(1.0));
-        assert_eq!(cast_text_to_numeric("-1.0"), Value::Float(-1.0));
-        assert_eq!(cast_text_to_numeric("1e10"), Value::Float(1e10));
-        assert_eq!(cast_text_to_numeric("-1e10"), Value::Float(-1e10));
-        assert_eq!(cast_text_to_numeric("1e-10"), Value::Float(1e-10));
-        assert_eq!(cast_text_to_numeric("-1e-10"), Value::Float(-1e-10));
-        assert_eq!(cast_text_to_numeric("1.123e10"), Value::Float(1.123e10));
-        assert_eq!(cast_text_to_numeric("-1.123e10"), Value::Float(-1.123e10));
-        assert_eq!(cast_text_to_numeric("1.123e-10"), Value::Float(1.123e-10));
-        assert_eq!(cast_text_to_numeric("-1.123-e-10"), Value::Float(-1.123));
-        assert_eq!(cast_text_to_numeric("1-282584294928"), Value::Integer(1));
-        assert_eq!(cast_text_to_numeric("xxx"), Value::Integer(0));
         assert_eq!(
-            cast_text_to_numeric("1.7976931348623157e309"),
+            checked_cast_text_to_numeric("1.0", false).unwrap(),
+            Value::Float(1.0)
+        );
+        assert_eq!(
+            checked_cast_text_to_numeric("-1.0", false).unwrap(),
+            Value::Float(-1.0)
+        );
+        assert_eq!(
+            checked_cast_text_to_numeric("1e10", false).unwrap(),
+            Value::Float(1e10)
+        );
+        assert_eq!(
+            checked_cast_text_to_numeric("-1e10", false).unwrap(),
+            Value::Float(-1e10)
+        );
+        assert_eq!(
+            checked_cast_text_to_numeric("1e-10", false).unwrap(),
+            Value::Float(1e-10)
+        );
+        assert_eq!(
+            checked_cast_text_to_numeric("-1e-10", false).unwrap(),
+            Value::Float(-1e-10)
+        );
+        assert_eq!(
+            checked_cast_text_to_numeric("1.123e10", false).unwrap(),
+            Value::Float(1.123e10)
+        );
+        assert_eq!(
+            checked_cast_text_to_numeric("-1.123e10", false).unwrap(),
+            Value::Float(-1.123e10)
+        );
+        assert_eq!(
+            checked_cast_text_to_numeric("1.123e-10", false).unwrap(),
+            Value::Float(1.123e-10)
+        );
+        assert_eq!(
+            checked_cast_text_to_numeric("-1.123-e-10", false).unwrap(),
+            Value::Float(-1.123)
+        );
+        assert_eq!(
+            checked_cast_text_to_numeric("1-282584294928", false).unwrap(),
+            Value::Integer(1)
+        );
+        assert!(checked_cast_text_to_numeric("xxx", false).is_err());
+        assert_eq!(
+            checked_cast_text_to_numeric("1.7976931348623157e309", false).unwrap(),
             Value::Float(f64::INFINITY)
         );
         assert_eq!(
-            cast_text_to_numeric("-1.7976931348623157e308"),
+            checked_cast_text_to_numeric("-1.7976931348623157e308", false).unwrap(),
             Value::Float(f64::MIN)
         );
         assert_eq!(
-            cast_text_to_numeric("-1.7976931348623157e309"),
+            checked_cast_text_to_numeric("-1.7976931348623157e309", false).unwrap(),
             Value::Float(f64::NEG_INFINITY)
         );
 
-        assert_eq!(cast_text_to_numeric("1E"), Value::Float(1.0));
-        assert_eq!(cast_text_to_numeric("1EE"), Value::Float(1.0));
-        assert_eq!(cast_text_to_numeric("-1E"), Value::Float(-1.0));
-        assert_eq!(cast_text_to_numeric("1."), Value::Float(1.0));
-        assert_eq!(cast_text_to_numeric("-1."), Value::Float(-1.0));
-        assert_eq!(cast_text_to_numeric("1.23E"), Value::Float(1.23));
-        assert_eq!(cast_text_to_numeric("1.23E-"), Value::Float(1.23));
+        assert_eq!(
+            checked_cast_text_to_numeric("1E", false).unwrap(),
+            Value::Float(1.0)
+        );
+        assert_eq!(
+            checked_cast_text_to_numeric("1EE", false).unwrap(),
+            Value::Float(1.0)
+        );
+        assert_eq!(
+            checked_cast_text_to_numeric("-1E", false).unwrap(),
+            Value::Float(-1.0)
+        );
+        assert_eq!(
+            checked_cast_text_to_numeric("1.", false).unwrap(),
+            Value::Float(1.0)
+        );
+        assert_eq!(
+            checked_cast_text_to_numeric("-1.", false).unwrap(),
+            Value::Float(-1.0)
+        );
+        assert_eq!(
+            checked_cast_text_to_numeric("1.23E", false).unwrap(),
+            Value::Float(1.23)
+        );
+        assert_eq!(
+            checked_cast_text_to_numeric("1.23E-", false).unwrap(),
+            Value::Float(1.23)
+        );
 
-        assert_eq!(cast_text_to_numeric("0"), Value::Integer(0));
-        assert_eq!(cast_text_to_numeric("-0"), Value::Integer(0));
-        assert_eq!(cast_text_to_numeric("-0.0"), Value::Float(0.0));
-        assert_eq!(cast_text_to_numeric("0.0"), Value::Float(0.0));
-        assert_eq!(cast_text_to_numeric("-"), Value::Integer(0));
-        assert_eq!(cast_text_to_numeric("-e"), Value::Integer(0));
-        assert_eq!(cast_text_to_numeric("-E"), Value::Integer(0));
+        assert_eq!(
+            checked_cast_text_to_numeric("0", false).unwrap(),
+            Value::Integer(0)
+        );
+        assert_eq!(
+            checked_cast_text_to_numeric("-0", false).unwrap(),
+            Value::Integer(0)
+        );
+        assert_eq!(
+            checked_cast_text_to_numeric("-0.0", false).unwrap(),
+            Value::Float(0.0)
+        );
+        assert_eq!(
+            checked_cast_text_to_numeric("0.0", false).unwrap(),
+            Value::Float(0.0)
+        );
+        assert!(checked_cast_text_to_numeric("-", false).is_err());
+        assert_eq!(
+            checked_cast_text_to_numeric("-e", false).unwrap(),
+            Value::Float(0.0)
+        );
+        assert_eq!(
+            checked_cast_text_to_numeric("-E", false).unwrap(),
+            Value::Float(0.0)
+        );
     }
 
     #[test]
