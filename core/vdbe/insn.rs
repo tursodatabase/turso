@@ -25,6 +25,37 @@ use strum_macros::{EnumDiscriminants, FromRepr, VariantArray};
 use turso_macros::Description;
 use turso_parser::ast::SortOrder;
 
+/// Metadata for a table during integrity check, used for constraint validation.
+#[derive(Debug, Clone)]
+pub struct IntegrityCheckTable {
+    /// Table name (for error messages)
+    pub name: String,
+    /// Root page of the table's B-tree
+    pub root_page: i64,
+    /// Indexes on this table
+    pub indexes: Vec<IntegrityCheckIndex>,
+    /// Columns with NOT NULL constraint (column index, column name)
+    pub not_null_columns: Vec<(usize, String)>,
+    /// Position of INTEGER PRIMARY KEY column if it exists (rowid alias).
+    /// This column's value is stored as NULL in the record; the rowid should be used instead.
+    pub rowid_alias_column_pos: Option<usize>,
+}
+
+/// Metadata for an index during integrity check.
+#[derive(Debug, Clone)]
+pub struct IntegrityCheckIndex {
+    /// Index name (for error messages)
+    pub name: String,
+    /// Root page of the index's B-tree
+    pub root_page: i64,
+    /// Whether this is a UNIQUE index
+    pub unique: bool,
+    /// Column positions in the table (for building index keys from table rows)
+    pub column_positions: Vec<usize>,
+    /// Index info for cursor operations (sort order, collation, etc)
+    pub index_info: std::sync::Arc<crate::types::IndexInfo>,
+}
+
 /// Flags provided to comparison instructions (e.g. Eq, Ne) which determine behavior related to NULL values.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct CmpInsFlags(usize);
@@ -1240,6 +1271,11 @@ pub enum Insn {
         max_errors: usize,
         roots: Vec<i64>,
         message_register: usize,
+        /// If true, this is a quick_check that skips expensive index consistency validation.
+        /// If false, this is a full integrity_check.
+        quick: bool,
+        /// Table metadata for index count validation (only used when quick=false)
+        tables: Vec<IntegrityCheckTable>,
     },
     RenameTable {
         from: String,

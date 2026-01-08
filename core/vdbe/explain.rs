@@ -1796,6 +1796,8 @@ pub fn insn_to_row(
                 max_errors,
                 roots,
                 message_register,
+                quick,
+                tables,
             } => (
                 "IntegrityCk",
                 *max_errors as i64,
@@ -1803,7 +1805,10 @@ pub fn insn_to_row(
                 0,
                 Value::build_text(""),
                 0,
-                format!("roots={roots:?} message_register={message_register}"),
+                format!(
+                    "roots={roots:?} message_register={message_register} quick={quick} tables={}",
+                    tables.len()
+                ),
             ),
             Insn::RowData { cursor_id, dest } => (
                 "RowData",

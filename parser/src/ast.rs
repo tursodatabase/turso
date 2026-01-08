@@ -1478,6 +1478,8 @@ pub enum PragmaName {
     IntegrityCheck,
     /// `journal_mode` pragma
     JournalMode,
+    /// Run a quick integrity check (skips expensive index consistency validation)
+    QuickCheck,
     /// encryption key for encrypted databases, specified as hexadecimal string.
     #[strum(serialize = "hexkey")]
     #[cfg_attr(feature = "serde", serde(rename = "hexkey"))]
