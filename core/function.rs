@@ -200,13 +200,13 @@ impl Display for VectorFunc {
 pub enum FtsFunc {
     /// fts_score(col1, col2, ..., query): computes FTS relevance score
     /// When used with an FTS index, the optimizer routes through the index method
-    FtsScore,
+    Score,
     /// fts_match(col1, col2, ..., query): returns true if document matches query
     /// Used in WHERE clause for filtering rows by FTS match
-    FtsMatch,
+    Match,
     /// fts_highlight(text, query, before_tag, after_tag): returns text with matching terms highlighted
     /// Wraps matching query terms in the text with before_tag and after_tag markers
-    FtsHighlight,
+    Highlight,
 }
 
 #[cfg(feature = "fts")]
@@ -220,9 +220,9 @@ impl FtsFunc {
 impl Display for FtsFunc {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let str = match self {
-            Self::FtsScore => "fts_score",
-            Self::FtsMatch => "fts_match",
-            Self::FtsHighlight => "fts_highlight",
+            Self::Score => "fts_score",
+            Self::Match => "fts_match",
+            Self::Highlight => "fts_highlight",
         };
         write!(f, "{str}")
     }
@@ -973,11 +973,11 @@ impl Func {
             "vector_slice" => Ok(Self::Vector(VectorFunc::VectorSlice)),
             // FTS functions
             #[cfg(feature = "fts")]
-            "fts_score" => Ok(Self::Fts(FtsFunc::FtsScore)),
+            "fts_score" => Ok(Self::Fts(FtsFunc::Score)),
             #[cfg(feature = "fts")]
-            "fts_match" => Ok(Self::Fts(FtsFunc::FtsMatch)),
+            "fts_match" => Ok(Self::Fts(FtsFunc::Match)),
             #[cfg(feature = "fts")]
-            "fts_highlight" => Ok(Self::Fts(FtsFunc::FtsHighlight)),
+            "fts_highlight" => Ok(Self::Fts(FtsFunc::Highlight)),
             _ => crate::bail_parse_error!("no such function: {}", name),
         }
     }
