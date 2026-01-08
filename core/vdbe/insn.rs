@@ -1021,6 +1021,11 @@ pub enum Insn {
         db: usize,
         cursor_id: CursorID,
     },
+    /// Optimize custom index method (calls [crate::index_method::IndexMethodCursor::optimize] under the hood)
+    IndexMethodOptimize {
+        db: usize,
+        cursor_id: CursorID,
+    },
     /// Query custom index method (call [crate::index_method::IndexMethodCursor::query_start] under the hood)
     IndexMethodQuery {
         db: usize,
@@ -1539,6 +1544,7 @@ impl InsnVariants {
             InsnVariants::CreateBtree => execute::op_create_btree,
             InsnVariants::IndexMethodCreate => execute::op_index_method_create,
             InsnVariants::IndexMethodDestroy => execute::op_index_method_destroy,
+            InsnVariants::IndexMethodOptimize => execute::op_index_method_optimize,
             InsnVariants::IndexMethodQuery => execute::op_index_method_query,
             InsnVariants::Destroy => execute::op_destroy,
             InsnVariants::ResetSorter => execute::op_reset_sorter,
