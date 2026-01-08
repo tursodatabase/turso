@@ -43,6 +43,16 @@ cargo clippy --workspace --all-features --all-targets -- --deny=warnings
 cargo bench --profile bench-profile --bench benchmark
 ```
 
+## If you are running inside a CI environment
+
+- If you are run as part of a CI action (e.g. a Github Action), you will have a limit of autonomous actions you can take.
+  At the present moment, this can be looked up from [this file](.github/workflows/claude.yml), specifically the `max-turns`
+  parameter.
+- If you get close to reaching your "turn limit" (autonomous action limit), you are allowed to commit and push your changes
+  in a WIP state and even open a WIP PR, after which you can continue in another CI action if necessary.
+- Because of the max-turns limitation, be mindful not to spiral into rabbit hole investigations and remind yourself what
+  your key focus is.
+
 ## Code Style Requirements
 
 1. **Always run `cargo fmt`** before committing
