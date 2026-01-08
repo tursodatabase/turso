@@ -1908,6 +1908,8 @@ pub fn halt(
         }
         state.end_statement(&program.connection, pager, EndStatement::ReleaseSavepoint)?;
         vtab_commit_all(&program.connection)?;
+        // Flush any pending index method writes before commit
+        index_method_pre_commit_all(state, pager)?;
         program
             .commit_txn(pager.clone(), state, mv_store.as_ref(), false)
             .map(Into::into)
@@ -1932,6 +1934,27 @@ fn vtab_commit_all(conn: &Connection) -> crate::Result<()> {
             .find(|(_, vtab)| vtab.id() == id)
             .expect("vtab must exist");
         vtab.1.commit()?;
+    }
+    Ok(())
+}
+
+/// Flush pending writes on all index method cursors before transaction commit.
+/// This ensures index method writes are persisted as part of the transaction.
+fn index_method_pre_commit_all(state: &mut ProgramState, pager: &Arc<Pager>) -> crate::Result<()> {
+    for cursor_opt in state.cursors.iter_mut() {
+        if let Some(Cursor::IndexMethod(cursor)) = cursor_opt {
+            loop {
+                match cursor.pre_commit()? {
+                    IOResult::Done(()) => break,
+                    IOResult::IO(io) => {
+                        // Wait for I/O to complete
+                        while !io.finished() {
+                            pager.io.step()?;
+                        }
+                    }
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -2328,6 +2351,11 @@ pub fn op_auto_commit(
                 "cannot use BEGIN after BEGIN CONCURRENT".to_string(),
             ));
         }
+    }
+
+    // For explicit COMMIT, flush any pending index method writes first
+    if is_commit_req {
+        index_method_pre_commit_all(state, pager)?;
     }
 
     let res = program
@@ -5919,6 +5947,43 @@ pub fn op_function(
                 FtsFunc::FtsMatch => {
                     // Without an FTS index match, return 0 (false) as default
                     state.registers[*dest] = Register::Value(Value::Integer(0));
+                }
+                FtsFunc::FtsHighlight => {
+                    // fts_highlight(text, query, before_tag, after_tag)
+                    // This is a scalar function that works without an FTS index
+                    if arg_count < 4 {
+                        return Err(LimboError::InvalidArgument(
+                            "fts_highlight requires 4 arguments: text, query, before_tag, after_tag"
+                                .to_string(),
+                        ));
+                    }
+
+                    let text = state.registers[*start_reg].get_value();
+                    let query = state.registers[*start_reg + 1].get_value();
+                    let before_tag = state.registers[*start_reg + 2].get_value();
+                    let after_tag = state.registers[*start_reg + 3].get_value();
+
+                    // Handle NULL values
+                    if matches!(text, Value::Null)
+                        || matches!(query, Value::Null)
+                        || matches!(before_tag, Value::Null)
+                        || matches!(after_tag, Value::Null)
+                    {
+                        state.registers[*dest] = Register::Value(Value::Null);
+                    } else {
+                        let text_str = text.to_string();
+                        let query_str = query.to_string();
+                        let before_str = before_tag.to_string();
+                        let after_str = after_tag.to_string();
+
+                        let highlighted = crate::index_method::fts::fts_highlight(
+                            &text_str,
+                            &query_str,
+                            &before_str,
+                            &after_str,
+                        );
+                        state.registers[*dest] = Register::Value(Value::build_text(highlighted));
+                    }
                 }
             }
         }

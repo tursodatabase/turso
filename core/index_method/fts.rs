@@ -13,7 +13,7 @@ use crate::types::{
 use crate::vdbe::Register;
 use crate::{Connection, LimboError, Result, Value};
 use parking_lot::RwLock;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{BufWriter, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
@@ -24,18 +24,22 @@ use tantivy::directory::{
 };
 use tantivy::merge_policy::NoMergePolicy;
 use tantivy::schema::Value as TantivySchemaValue;
+use tantivy::tokenizer::{NgramTokenizer, RawTokenizer, SimpleTokenizer, WhitespaceTokenizer};
 use tantivy::{
     schema::{Field, Schema},
     Index, IndexSettings,
 };
-use tantivy::tokenizer::{NgramTokenizer, RawTokenizer, SimpleTokenizer, WhitespaceTokenizer};
 use tantivy::{DocAddress, HasLen, IndexReader, IndexWriter, Searcher, TantivyDocument};
 use turso_parser::ast::SortOrder;
 use turso_parser::ast::{self, Select};
 
 pub const FTS_INDEX_METHOD_NAME: &str = "fts";
+
+/// 64MB default memory budget
 pub const DEFAULT_MEMORY_BUDGET_BYTES: usize = 64 * 1024 * 1024;
-pub const DEFAULT_CHUNK_SIZE: usize = 512 * 1024;
+
+/// 1MB default chunk size
+pub const DEFAULT_CHUNK_SIZE: usize = 1024 * 1024;
 /// Number of documents to batch before committing to Tantivy
 pub const BATCH_COMMIT_SIZE: usize = 1000;
 
@@ -44,10 +48,70 @@ pub const DEFAULT_HOT_CACHE_BYTES: usize = 64 * 1024 * 1024; // 64MB
 /// Default memory budget for chunk LRU cache
 pub const DEFAULT_CHUNK_CACHE_BYTES: usize = 128 * 1024 * 1024; // 128MB
 
+/// Highlight matching terms in text by wrapping them with tags.
+///
+/// Standalone function that can be used without an FTS index.
+/// It tokenizes both the query and text using Tantivy's default tokenizer,
+/// finds matching terms, and wraps them with the specified tags.
+pub fn fts_highlight(text: &str, query: &str, before_tag: &str, after_tag: &str) -> String {
+    use tantivy::tokenizer::{TextAnalyzer, TokenStream};
+    if text.is_empty() || query.is_empty() {
+        return text.to_string();
+    }
+    let mut tokenizer = TextAnalyzer::builder(SimpleTokenizer::default())
+        .filter(tantivy::tokenizer::LowerCaser)
+        .build();
+
+    // Extract query terms (lowercased)
+    let query_terms: HashSet<String> = {
+        let mut terms = HashSet::new();
+        let mut query_stream = tokenizer.token_stream(query);
+        while let Some(token) = query_stream.next() {
+            terms.insert(token.text.to_string());
+        }
+        terms
+    };
+    if query_terms.is_empty() {
+        return text.to_string();
+    }
+
+    // Tokenize the text and track positions of matching tokens
+    let match_ranges: Vec<(usize, usize)> = {
+        let mut ranges = Vec::new();
+        let mut text_stream = tokenizer.token_stream(text);
+        while let Some(token) = text_stream.next() {
+            if query_terms.contains(&token.text) {
+                ranges.push((token.offset_from, token.offset_to));
+            }
+        }
+        ranges
+    };
+
+    if match_ranges.is_empty() {
+        return text.to_string();
+    }
+
+    // Build the highlighted text by inserting tags at match positions
+    // Process in reverse order to avoid offset shifting issues
+    let mut result = text.to_string();
+    for (start, end) in match_ranges.into_iter().rev() {
+        // Ensure offsets are valid UTF-8 boundaries
+        if start <= result.len()
+            && end <= result.len()
+            && result.is_char_boundary(start)
+            && result.is_char_boundary(end)
+        {
+            result.insert_str(end, after_tag);
+            result.insert_str(start, before_tag);
+        }
+    }
+    result
+}
+
 /// File classification for hybrid caching strategy.
 /// Determines which files are kept hot in memory vs lazy-loaded on demand.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum FileCategory {
+enum FileCategory {
     /// Always in memory: meta.json, .managed.json, .lock (typically < 64KB)
     Metadata,
     /// Hot files: .term dictionaries - loaded on first access, kept in LRU
@@ -59,13 +123,14 @@ pub enum FileCategory {
 }
 
 impl FileCategory {
+    const METADATA_FILES: [&'static str; 3] = ["meta.json", ".managed.json", ".lock"];
     /// Classify a file based on its path/extension.
-    pub fn from_path(path: &Path) -> Self {
+    fn from_path(path: &Path) -> Self {
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
 
-        // Check for known Tantivy metadata files first (by full name)
-        if name == "meta.json" || name == ".managed.json" || name == ".lock" {
+        // Check for known Tantivy metadata files first
+        if Self::METADATA_FILES.contains(&name) {
             return FileCategory::Metadata;
         }
 
@@ -84,12 +149,12 @@ impl FileCategory {
     }
 
     /// Returns true if files in this category should be preloaded at startup.
-    pub fn should_preload(&self) -> bool {
+    const fn should_preload(&self) -> bool {
         matches!(self, FileCategory::Metadata)
     }
 
     /// Returns true if files in this category should be kept in the hot cache.
-    pub fn is_hot(&self) -> bool {
+    const fn is_hot(&self) -> bool {
         matches!(
             self,
             FileCategory::Metadata | FileCategory::TermDictionary | FileCategory::FastFields
@@ -100,17 +165,17 @@ impl FileCategory {
 /// Metadata about a file stored in the FTS directory.
 /// Used for catalog-first loading where we build file metadata without loading content.
 #[derive(Debug, Clone)]
-pub struct FileMetadata {
+struct FileMetadata {
     /// Total file size in bytes
-    pub size: usize,
+    size: usize,
     /// Number of chunks this file is split into
-    pub num_chunks: usize,
+    num_chunks: usize,
     /// File category for caching decisions
-    pub category: FileCategory,
+    category: FileCategory,
 }
 
 impl FileMetadata {
-    pub fn new(path: &Path, size: usize, num_chunks: usize) -> Self {
+    fn new(path: &Path, size: usize, num_chunks: usize) -> Self {
         Self {
             size,
             num_chunks,
@@ -119,89 +184,143 @@ impl FileMetadata {
     }
 }
 
-/// LRU cache for chunk data with memory budget enforcement.
-/// Uses a simple linked-list approach where we track insertion order
-/// and evict from the front (oldest) when over capacity.
-#[derive(Debug)]
+type ChunkKey = (PathBuf, i64);
+
+/// Eviction samples per put
+const EVICTION_SAMPLES: usize = 8;
+
+/// Approximate LRU cache for FTS chunk data with memory budget enforcement.
+///
+/// Uses sampling-based eviction: on capacity overflow, samples K random entries
+/// and evicts the least recently accessed.
 pub struct ChunkLruCache {
-    /// Maximum capacity in bytes
     capacity: usize,
-    /// Current size in bytes
-    current_size: std::sync::atomic::AtomicUsize,
-    /// Entries: (path, chunk_no) -> chunk data
-    /// Using Vec as simple LRU - move accessed items to end, evict from front
-    entries: RwLock<Vec<((PathBuf, i64), Vec<u8>)>>,
+    inner: RwLock<CacheInner>,
+}
+
+#[derive(Debug)]
+struct CacheInner {
+    current_size: usize,
+    clock: u64,
+    entries: HashMap<ChunkKey, CacheEntry>,
+}
+
+#[derive(Debug)]
+struct CacheEntry {
+    data: Vec<u8>,
+    accessed: u64,
+}
+
+impl std::fmt::Debug for ChunkLruCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let inner = self.inner.read();
+        f.debug_struct("ChunkLruCache")
+            .field("capacity", &self.capacity)
+            .field("current_size", &inner.current_size)
+            .field("entries", &inner.entries.len())
+            .finish()
+    }
 }
 
 impl ChunkLruCache {
-    pub fn new(capacity: usize) -> Self {
+    fn new(capacity: usize) -> Self {
         Self {
             capacity,
-            current_size: std::sync::atomic::AtomicUsize::new(0),
-            entries: RwLock::new(Vec::new()),
+            inner: RwLock::new(CacheInner {
+                current_size: 0,
+                clock: 0,
+                entries: HashMap::new(),
+            }),
         }
     }
 
-    /// Get a chunk from the cache, refreshing its position (LRU).
-    pub fn get(&self, key: &(PathBuf, i64)) -> Option<Vec<u8>> {
-        let mut entries = self.entries.write();
-        if let Some(pos) = entries.iter().position(|(k, _)| k == key) {
-            // Move to end (most recently used)
-            let entry = entries.remove(pos);
-            let data = entry.1.clone();
-            entries.push(entry);
-            Some(data)
+    /// Lookup chunk, updating access timestamp. Returns cloned data.
+    fn get(&self, key: &ChunkKey) -> Option<Vec<u8>> {
+        let mut inner = self.inner.write();
+        inner.clock += 1;
+        let ts = inner.clock;
+        if let Some(entry) = inner.entries.get_mut(key) {
+            entry.accessed = ts;
+            Some(entry.data.clone())
         } else {
             None
         }
     }
 
-    /// Insert a chunk into the cache, evicting old entries if over capacity.
-    pub fn put(&self, key: (PathBuf, i64), value: Vec<u8>) {
-        let value_size = value.len();
-        let mut entries = self.entries.write();
+    /// Insert chunk, evicting stale entries if over capacity.
+    ///
+    /// Eviction uses sampling: examines K entries and evicts the one with
+    /// the oldest access timestamp. Repeat until under capacity.
+    fn put(&self, key: ChunkKey, value: Vec<u8>) {
+        let size = value.len();
+        let mut inner = self.inner.write();
 
-        // Remove existing entry for this key if present
-        if let Some(pos) = entries.iter().position(|(k, _)| k == &key) {
-            let (_, old_data) = entries.remove(pos);
-            self.current_size
-                .fetch_sub(old_data.len(), std::sync::atomic::Ordering::Relaxed);
+        // Check for existing entry - get old size if present
+        let old_size = inner.entries.get(&key).map(|e| e.data.len());
+
+        if let Some(old) = old_size {
+            // Update existing entry
+            inner.clock += 1;
+            let ts = inner.clock;
+            let entry = inner.entries.get_mut(&key).unwrap();
+            entry.data = value;
+            entry.accessed = ts;
+            inner.current_size = inner.current_size - old + size;
+            return;
         }
 
-        // Evict from front (oldest) until we have room
-        while self.current_size.load(std::sync::atomic::Ordering::Relaxed) + value_size
-            > self.capacity
-            && !entries.is_empty()
-        {
-            let (_, evicted) = entries.remove(0);
-            self.current_size
-                .fetch_sub(evicted.len(), std::sync::atomic::Ordering::Relaxed);
-        }
+        // Evict until under capacity
+        while inner.current_size + size > self.capacity && !inner.entries.is_empty() {
+            let victim = {
+                inner
+                    .entries
+                    .iter()
+                    .take(EVICTION_SAMPLES)
+                    .min_by_key(|(_, e)| e.accessed)
+                    .map(|(k, _)| k.clone())
+            };
 
-        // Insert new entry at end (most recently used)
-        entries.push((key, value));
-        self.current_size
-            .fetch_add(value_size, std::sync::atomic::Ordering::Relaxed);
-    }
-
-    /// Invalidate all chunks for a given path.
-    pub fn invalidate(&self, path: &Path) {
-        let mut entries = self.entries.write();
-        let mut i = 0;
-        while i < entries.len() {
-            if entries[i].0 .0 == path {
-                let (_, data) = entries.remove(i);
-                self.current_size
-                    .fetch_sub(data.len(), std::sync::atomic::Ordering::Relaxed);
-            } else {
-                i += 1;
+            match victim {
+                Some(k) => {
+                    if let Some(e) = inner.entries.remove(&k) {
+                        inner.current_size -= e.data.len();
+                    }
+                }
+                None => break,
             }
         }
+
+        inner.clock += 1;
+        let ts = inner.clock;
+        inner.entries.insert(
+            key,
+            CacheEntry {
+                data: value,
+                accessed: ts,
+            },
+        );
+        inner.current_size += size;
     }
 
-    /// Get current memory usage in bytes.
-    pub fn size(&self) -> usize {
-        self.current_size.load(std::sync::atomic::Ordering::Relaxed)
+    /// Invalidate all chunks for a file path.
+    /// Called when a file is deleted or overwritten.
+    fn invalidate(&self, path: &Path) {
+        let mut inner = self.inner.write();
+        let mut freed = 0usize;
+        inner.entries.retain(|(p, _), e| {
+            if p == path {
+                freed += e.data.len();
+                false
+            } else {
+                true
+            }
+        });
+        inner.current_size -= freed;
+    }
+
+    /// Current memory usage in bytes.
+    fn size(&self) -> usize {
+        self.inner.read().current_size
     }
 }
 
@@ -209,7 +328,7 @@ impl ChunkLruCache {
 /// - Metadata files (meta.json, etc.) are always kept in hot cache
 /// - Large segment files (.idx, .pos, .store) are lazy-loaded on demand
 /// - Uses LRU chunk cache to bound memory usage
-pub struct HybridBTreeDirectory {
+struct HybridBTreeDirectory {
     /// File catalog: path -> metadata (always in memory, no content)
     catalog: Arc<RwLock<HashMap<PathBuf, FileMetadata>>>,
 
@@ -263,22 +382,33 @@ impl Clone for HybridBTreeDirectory {
 }
 
 impl HybridBTreeDirectory {
-    /// Create a new hybrid directory with the given pager and BTree root page.
-    pub fn new(pager: Arc<Pager>, btree_root_page: i64, chunk_cache_capacity: usize) -> Self {
+    /// Create a clone with fresh (empty) pending state.
+    /// This is used when creating a new cursor from a cached directory to ensure
+    /// each cursor has its own isolated pending_writes/pending_deletes.
+    /// This prevents the bug where writes from one cursor affect the Drop behavior
+    /// of another cursor.
+    fn clone_with_fresh_pending(&self) -> Self {
         Self {
-            catalog: Arc::new(RwLock::new(HashMap::new())),
-            hot_cache: Arc::new(RwLock::new(HashMap::new())),
-            chunk_cache: Arc::new(ChunkLruCache::new(chunk_cache_capacity)),
+            catalog: Arc::clone(&self.catalog),
+            hot_cache: Arc::clone(&self.hot_cache),
+            chunk_cache: Arc::clone(&self.chunk_cache),
+            // Fresh pending state - not shared with cache
             pending_writes: Arc::new(RwLock::new(Vec::new())),
             flushing_writes: Arc::new(RwLock::new(HashMap::new())),
             pending_deletes: Arc::new(RwLock::new(Vec::new())),
-            pager,
-            btree_root_page,
+            pager: Arc::clone(&self.pager),
+            btree_root_page: self.btree_root_page,
         }
     }
+}
 
+fn io_not_found<M: Into<Box<dyn std::error::Error + Send + Sync>>>(msg: M) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::NotFound, msg)
+}
+
+impl HybridBTreeDirectory {
     /// Create from preloaded catalog and hot cache files.
-    pub fn with_preloaded(
+    fn with_preloaded(
         pager: Arc<Pager>,
         btree_root_page: i64,
         catalog: HashMap<PathBuf, FileMetadata>,
@@ -299,7 +429,7 @@ impl HybridBTreeDirectory {
 
     /// Get pending writes for flushing, deduplicated to keep only the last write for each path.
     /// The writes are also copied to flushing_writes so they remain readable during async flush.
-    pub fn take_pending_writes(&self) -> Vec<(PathBuf, Vec<u8>)> {
+    fn take_pending_writes(&self) -> Vec<(PathBuf, Vec<u8>)> {
         let mut pending = self.pending_writes.write();
         let all_writes = std::mem::take(&mut *pending);
 
@@ -333,7 +463,7 @@ impl HybridBTreeDirectory {
 
     /// Clear flushing_writes after flush completes successfully.
     /// Call this after all writes have been persisted to BTree.
-    pub fn complete_flush(&self) {
+    fn complete_flush(&self) {
         let mut flushing = self.flushing_writes.write();
         tracing::debug!(
             "FTS complete_flush: clearing {} entries from flushing_writes",
@@ -342,22 +472,9 @@ impl HybridBTreeDirectory {
         flushing.clear();
     }
 
-    /// Get pending deletes for flushing.
-    pub fn take_pending_deletes(&self) -> Vec<PathBuf> {
-        let mut pending = self.pending_deletes.write();
-        std::mem::take(&mut *pending)
-    }
-
-    /// Check if there are pending changes.
-    pub fn has_pending_changes(&self) -> bool {
-        let writes = self.pending_writes.read();
-        let deletes = self.pending_deletes.read();
-        !writes.is_empty() || !deletes.is_empty()
-    }
-
     /// Find file data in pending writes or flushing writes.
     /// Checks pending_writes first, then flushing_writes (for in-flight flushes).
-    pub fn find_in_pending_writes(&self, path: &Path) -> Option<Vec<u8>> {
+    fn find_in_pending_writes(&self, path: &Path) -> Option<Vec<u8>> {
         // Check pending_writes first (most recent)
         {
             let pending = self.pending_writes.read();
@@ -365,7 +482,6 @@ impl HybridBTreeDirectory {
                 return Some(data.clone());
             }
         }
-
         // Check flushing_writes (data being flushed but not yet in BTree)
         {
             let flushing = self.flushing_writes.read();
@@ -377,24 +493,27 @@ impl HybridBTreeDirectory {
         None
     }
 
+    const CHUNK_LEN: usize = 3;
+
     /// Blocking read of a single chunk from BTree.
     /// Called from LazyFileHandle::read_bytes when chunk is not in cache.
     fn get_chunk_blocking(&self, path: &Path, chunk_no: i64) -> std::io::Result<Vec<u8>> {
-        // 1. Check chunk cache first
+        // Check chunk cache first
         let cache_key = (path.to_path_buf(), chunk_no);
         if let Some(chunk) = self.chunk_cache.get(&cache_key) {
             return Ok(chunk);
         }
 
-        // 2. Create a temporary cursor for this read
-        let mut cursor = BTreeCursor::new(self.pager.clone(), self.btree_root_page, 3);
+        // Create a temporary cursor for this read
+        let mut cursor =
+            BTreeCursor::new(self.pager.clone(), self.btree_root_page, Self::CHUNK_LEN);
         cursor.index_info = Some(Arc::new(IndexInfo {
             has_rowid: false,
-            num_cols: 3,
+            num_cols: Self::CHUNK_LEN,
             key_info: vec![key_info(), key_info(), key_info()],
         }));
 
-        // 3. Seek to the specific chunk
+        // Seek to the specific chunk
         let path_str = path.to_string_lossy().to_string();
         let seek_key = ImmutableRecord::from_values(
             &[
@@ -402,10 +521,10 @@ impl HybridBTreeDirectory {
                 Value::Integer(chunk_no),
                 Value::Blob(vec![]), // minimum blob for GE seek
             ],
-            3,
+            Self::CHUNK_LEN,
         );
 
-        // 4. Blocking seek loop
+        // Blocking seek loop
         loop {
             match cursor.seek(SeekKey::IndexKey(&seek_key), SeekOp::GE { eq_only: false }) {
                 Ok(IOResult::Done(SeekResult::Found)) => break,
@@ -416,10 +535,11 @@ impl HybridBTreeDirectory {
                             Ok(IOResult::Done(_)) => {
                                 let has_next = cursor.has_record();
                                 if !has_next {
-                                    return Err(std::io::Error::new(
-                                        std::io::ErrorKind::NotFound,
-                                        format!("chunk {}:{} not found", path.display(), chunk_no),
-                                    ));
+                                    return Err(io_not_found(format!(
+                                        "chunk {}:{} not found",
+                                        path.display(),
+                                        chunk_no
+                                    )));
                                 }
                                 break;
                             }
@@ -435,10 +555,11 @@ impl HybridBTreeDirectory {
                     break;
                 }
                 Ok(IOResult::Done(SeekResult::NotFound)) => {
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::NotFound,
-                        format!("chunk {}:{} not found", path.display(), chunk_no),
-                    ));
+                    return Err(io_not_found(format!(
+                        "chunk {}:{} not found",
+                        path.display(),
+                        chunk_no
+                    )));
                 }
                 Ok(IOResult::IO(_)) => {
                     self.pager
@@ -464,9 +585,7 @@ impl HybridBTreeDirectory {
             }
         };
 
-        let record = record.ok_or_else(|| {
-            std::io::Error::new(std::io::ErrorKind::NotFound, "no record at cursor")
-        })?;
+        let record = record.ok_or_else(|| io_not_found("no record at cursor"))?;
 
         // 6. Validate and extract - record format: [path, chunk_no, bytes]
         let found_path = record.get_value_opt(0).and_then(|v| match v {
@@ -493,12 +612,9 @@ impl HybridBTreeDirectory {
         };
 
         if found_path != path_str || found_chunk != chunk_no {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!(
-                    "wrong chunk: expected {path_str}:{chunk_no}, got {found_path}:{found_chunk}",
-                ),
-            ));
+            return Err(io_not_found(format!(
+                "wrong chunk: expected {path_str}:{chunk_no}, got {found_path}:{found_chunk}",
+            )));
         }
 
         // 7. Add to cache
@@ -509,14 +625,11 @@ impl HybridBTreeDirectory {
 
     /// Load an entire file by concatenating all its chunks (blocking).
     /// Used for loading hot files during preload phase.
-    pub fn load_file_blocking(&self, path: &Path) -> std::io::Result<Vec<u8>> {
+    fn load_file_blocking(&self, path: &Path) -> std::io::Result<Vec<u8>> {
         let catalog = self.catalog.read();
-        let metadata = catalog.get(path).ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                format!("file not in catalog: {}", path.display()),
-            )
-        })?;
+        let metadata = catalog
+            .get(path)
+            .ok_or_else(|| io_not_found(format!("file not in catalog: {}", path.display())))?;
 
         let mut result = Vec::with_capacity(metadata.size);
         for chunk_no in 0..metadata.num_chunks as i64 {
@@ -528,13 +641,13 @@ impl HybridBTreeDirectory {
     }
 
     /// Add a file to the hot cache.
-    pub fn add_to_hot_cache(&self, path: PathBuf, data: Vec<u8>) {
+    fn add_to_hot_cache(&self, path: PathBuf, data: Vec<u8>) {
         let mut hot = self.hot_cache.write();
         hot.insert(path, data);
     }
 
     /// Update the catalog with file metadata.
-    pub fn update_catalog(&self, path: PathBuf, metadata: FileMetadata) {
+    fn update_catalog(&self, path: PathBuf, metadata: FileMetadata) {
         let mut catalog = self.catalog.write();
         catalog.insert(path, metadata);
     }
@@ -842,6 +955,68 @@ fn name(name: impl ToString) -> ast::Name {
     ast::Name::exact(name.to_string())
 }
 
+/// Parse field weights from a string like "body=2.0,title=1.0"
+/// Returns a HashMap mapping column names to boost factors
+fn parse_field_weights(weights_str: &str, columns: &[IndexColumn]) -> Result<HashMap<String, f32>> {
+    let mut weights = HashMap::new();
+
+    if weights_str.is_empty() {
+        return Ok(weights);
+    }
+
+    // Get valid column names for validation
+    let valid_columns: std::collections::HashSet<&str> =
+        columns.iter().map(|c| c.name.as_str()).collect();
+
+    // Parse format: "col1=1.5,col2=2.0"
+    for part in weights_str.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+
+        let (col_name, weight_str) = part.split_once('=').ok_or_else(|| {
+            LimboError::ParseError(format!(
+                "invalid weight format '{part}'. Expected 'column=weight' (e.g., 'title=2.0')",
+            ))
+        })?;
+
+        let col_name = col_name.trim();
+        let weight_str = weight_str.trim();
+
+        // Validate column exists in index
+        if !valid_columns.contains(col_name) {
+            return Err(LimboError::ParseError(format!(
+                "unknown column '{}' in weights. Valid columns: {}",
+                col_name,
+                columns
+                    .iter()
+                    .map(|c| c.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )));
+        }
+
+        // Parse weight as f32
+        let weight: f32 = weight_str.parse().map_err(|_| {
+            LimboError::ParseError(format!(
+                "invalid weight value '{weight_str}' for column '{col_name}'. Expected a number (e.g., 2.0)",
+            ))
+        })?;
+
+        // Validate weight is positive
+        if weight <= 0.0 {
+            return Err(LimboError::ParseError(format!(
+                "weight for column '{col_name}' must be positive, got {weight}",
+            )));
+        }
+
+        weights.insert(col_name.to_string(), weight);
+    }
+
+    Ok(weights)
+}
+
 type PendingWrites = Arc<RwLock<Vec<(PathBuf, Vec<u8>)>>>;
 
 /// CachedBTreeDirectory: In-memory Directory implementation for Tantivy.
@@ -1088,6 +1263,24 @@ impl IndexMethod for FtsIndexMethod {
     }
 }
 
+/// Cached FTS directory that can be shared across cursors
+/// This avoids expensive catalog loading on every query
+/// Note: We only cache the directory (with catalog), not the Index/Reader
+/// because each cursor needs its own Index to handle writes correctly
+pub struct CachedFtsDirectory {
+    /// Cached HybridBTreeDirectory with catalog already loaded
+    directory: HybridBTreeDirectory,
+}
+
+impl std::fmt::Debug for CachedFtsDirectory {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CachedFtsDirectory")
+            .field("directory", &"HybridBTreeDirectory")
+            .finish()
+    }
+}
+
+#[allow(dead_code)]
 #[derive(Debug)]
 /// IndexAttachment holds configuration, creates cursors
 pub struct FtsIndexAttachment {
@@ -1103,6 +1296,10 @@ pub struct FtsIndexAttachment {
     patterns: Vec<Select>,
     /// Tokenizer name for text fields
     tokenizer_name: String,
+    /// Field weights for boosting (column_name -> boost factor)
+    field_weights: HashMap<String, f32>,
+    /// Cached directory shared across cursors (avoids catalog reload on each query)
+    cached_directory_state: Arc<RwLock<Option<CachedFtsDirectory>>>,
 }
 
 /// Supported tokenizer names for FTS indexes
@@ -1140,6 +1337,20 @@ impl FtsIndexAttachment {
                 SUPPORTED_TOKENIZERS.join(", ")
             )));
         }
+
+        // Parse field weights from WITH clause: weights='body=2.0,title=1.0'
+        let field_weights = if let Some(weights_value) = cfg.parameters.get("weights") {
+            let weights_str = match weights_value {
+                Value::Text(t) => {
+                    let s = t.to_string();
+                    s.trim_matches(|c| c == '\'' || c == '"').to_string()
+                }
+                _ => String::new(),
+            };
+            parse_field_weights(&weights_str, &cfg.columns)?
+        } else {
+            HashMap::new()
+        };
 
         // Build Tantivy schema (no Directory or Index creation yet)
         let mut schema_builder = Schema::builder();
@@ -1230,6 +1441,8 @@ impl FtsIndexAttachment {
             text_fields,
             patterns,
             tokenizer_name,
+            field_weights,
+            cached_directory_state: Arc::new(RwLock::new(None)),
         })
     }
 }
@@ -1251,6 +1464,8 @@ impl IndexMethodAttachment for FtsIndexAttachment {
             self.rowid_field,
             self.text_fields.clone(),
             self.tokenizer_name.clone(),
+            self.field_weights.clone(),
+            self.cached_directory_state.clone(),
         )))
     }
 }
@@ -1372,8 +1587,9 @@ enum FtsState {
     /// Loading file catalog from BTree (metadata only, not content)
     /// This is the new catalog-first approach for HybridBTreeDirectory
     LoadingCatalog {
-        /// Accumulated file metadata: path -> (max_chunk_no, estimated_size)
-        catalog_builder: HashMap<PathBuf, (i64, usize)>,
+        /// Accumulated file metadata: path -> (chunk_no -> blob_size)
+        /// Using nested HashMap to properly deduplicate by (path, chunk_no) pairs
+        catalog_builder: HashMap<PathBuf, HashMap<i64, usize>>,
         current_path: Option<String>,
     },
     /// Preloading essential files (meta.json and other hot files)
@@ -1458,6 +1674,7 @@ enum FtsState {
 }
 
 /// Cursor for executing FTS queries
+#[allow(dead_code)]
 pub struct FtsCursor {
     schema: Schema,
     rowid_field: Field,
@@ -1468,6 +1685,12 @@ pub struct FtsCursor {
 
     // Tokenizer name for registering with Tantivy
     tokenizer_name: String,
+
+    // Field weights for boosting (column_name -> boost factor)
+    field_weights: HashMap<String, f32>,
+
+    // Shared directory cache from attachment (avoids catalog reload on each query)
+    shared_directory_cache: Arc<RwLock<Option<CachedFtsDirectory>>>,
 
     // Connection for blocking IO in Drop
     connection: Option<Arc<Connection>>,
@@ -1515,6 +1738,8 @@ impl FtsCursor {
         rowid_field: Field,
         text_fields: Vec<(IndexColumn, Field)>,
         tokenizer_name: String,
+        field_weights: HashMap<String, f32>,
+        shared_directory_cache: Arc<RwLock<Option<CachedFtsDirectory>>>,
     ) -> Self {
         let dir_table_name = format!(
             "{}fts_dir_{}",
@@ -1527,6 +1752,8 @@ impl FtsCursor {
             text_fields,
             dir_table_name,
             tokenizer_name,
+            field_weights,
+            shared_directory_cache,
             connection: None,
             fts_dir_cursor: None,
             btree_root_page: None,
@@ -2104,6 +2331,16 @@ impl FtsCursor {
             writer
                 .commit()
                 .map_err(|e| LimboError::InternalError(format!("FTS commit error: {e}")))?;
+
+            // Invalidate shared directory cache since index has changed
+            // Next query will reload the updated catalog
+            {
+                let mut cache = self.shared_directory_cache.write();
+                if cache.is_some() {
+                    tracing::debug!("FTS commit_and_flush: invalidating cached directory");
+                    *cache = None;
+                }
+            }
         }
         if let Some(ref reader) = self.reader {
             reader
@@ -2148,14 +2385,21 @@ impl Drop for FtsCursor {
             return;
         }
 
-        // Clone pager Arc before we start to avoid borrow conflicts
-        let pager = match &self.connection {
-            Some(conn) => conn.pager.load().clone(),
+        // Get connection reference for transaction check and pager access
+        let conn = match &self.connection {
+            Some(conn) => conn.clone(),
             None => {
-                tracing::warn!("FTS Drop: no connection for flush");
+                if self.pending_docs_count > 0 {
+                    tracing::warn!(
+                        "FTS Drop: {} pending documents lost (no connection)",
+                        self.pending_docs_count
+                    );
+                }
                 return;
             }
         };
+
+        let pager = conn.pager.load().clone();
 
         // Check if we're already in a flushing state (from commit_and_flush)
         // This can happen when commit_and_flush started a flush but yielded for IO
@@ -2173,7 +2417,14 @@ impl Drop for FtsCursor {
         );
 
         if is_flushing {
-            // Complete the in-progress flush
+            // Only complete in-progress flush if we're still in a write transaction
+            // Otherwise we'd be writing to BTree outside of a transaction, causing dirty pages panic
+            if !conn.is_in_write_tx() {
+                tracing::warn!(
+                    "FTS Drop: in-progress flush abandoned (transaction already committed)"
+                );
+                return;
+            }
             tracing::debug!("FTS Drop: completing in-progress flush");
             loop {
                 match self.flush_writes_internal() {
@@ -2190,10 +2441,25 @@ impl Drop for FtsCursor {
                     }
                 }
             }
+            return;
         }
 
         // Only flush new pending documents if we have any
         if self.pending_docs_count == 0 {
+            return;
+        }
+
+        // CRITICAL: Only flush if we're still in a write transaction.
+        // If the transaction has already committed (auto-commit), flushing to BTree
+        // would create dirty pages outside of any transaction, causing the
+        // "dirty pages must be empty for read txn" panic on the next read.
+        if !conn.is_in_write_tx() {
+            tracing::warn!(
+                "FTS Drop: {} pending documents will be lost (transaction already committed). \
+                 This can happen with single-row INSERTs to tables with FTS indexes. \
+                 Consider using explicit transactions for better FTS consistency.",
+                self.pending_docs_count
+            );
             return;
         }
 
@@ -2202,6 +2468,17 @@ impl Drop for FtsCursor {
             if let Err(e) = writer.commit() {
                 tracing::error!("FTS Drop: failed to commit writer: {}", e);
                 return;
+            }
+
+            // Invalidate shared directory cache since index has changed
+            // This MUST happen after commit but before we check for pending writes
+            // to ensure the next cursor loads fresh data from BTree
+            {
+                let mut cache = self.shared_directory_cache.write();
+                if cache.is_some() {
+                    tracing::debug!("FTS Drop: invalidating cached directory");
+                    *cache = None;
+                }
             }
         }
 
@@ -2307,8 +2584,29 @@ impl IndexMethodCursor for FtsCursor {
                     self.connection = Some(conn.clone());
                     // Ensure storage table exists
                     initialize_btree_storage_table(conn, &self.dir_table_name)?;
-                    // Open BTree cursor
+                    // Open BTree cursor (needed for btree_root_page)
                     self.open_cursor(conn)?;
+
+                    // Check for cached directory from attachment - avoids expensive catalog reload
+                    // Note: We only cache the directory (with catalog), not Index/Reader
+                    // Each cursor needs its own Index to handle writes correctly
+                    {
+                        let cache = self.shared_directory_cache.read();
+                        if let Some(ref cached) = *cache {
+                            tracing::debug!(
+                                "FTS open_read: using cached directory (skipping catalog load)"
+                            );
+                            // Clone with fresh pending state to ensure this cursor's writes
+                            // don't affect other cursors or cause Drop to flush after txn commits
+                            self.hybrid_directory =
+                                Some(cached.directory.clone_with_fresh_pending());
+                            // Skip to CreatingIndex to build Index/Reader from cached directory
+                            self.state = FtsState::CreatingIndex;
+                            continue;
+                        }
+                    }
+
+                    // No cache available, proceed with full catalog loading
                     self.state = FtsState::Rewinding;
                 }
                 FtsState::Rewinding => {
@@ -2335,7 +2633,10 @@ impl IndexMethodCursor for FtsCursor {
                         let mut catalog = HashMap::new();
                         let mut files_to_load = Vec::new();
 
-                        for (path, (max_chunk, total_size)) in catalog_builder.drain() {
+                        for (path, chunks) in catalog_builder.drain() {
+                            // Calculate max_chunk and total_size from deduplicated chunks
+                            let max_chunk = chunks.keys().max().copied().unwrap_or(0);
+                            let total_size: usize = chunks.values().sum();
                             let num_chunks = (max_chunk + 1) as usize;
                             let metadata = FileMetadata::new(&path, total_size, num_chunks);
 
@@ -2408,11 +2709,12 @@ impl IndexMethodCursor for FtsCursor {
                                 *current_path = Some(path_str.clone());
                             }
 
-                            // Update catalog builder
+                            // Update catalog builder - store blob_size per chunk_no
+                            // This properly deduplicates: if same chunk_no appears twice,
+                            // we keep the last one (which should be the newest)
                             let path_buf = PathBuf::from(&path_str);
-                            let entry = catalog_builder.entry(path_buf).or_insert((0, 0));
-                            entry.0 = entry.0.max(chunk_no); // max chunk_no
-                            entry.1 += blob_size; // total size
+                            let chunks = catalog_builder.entry(path_buf).or_default();
+                            chunks.insert(chunk_no, blob_size);
                         }
                     }
 
@@ -2512,6 +2814,18 @@ impl IndexMethodCursor for FtsCursor {
                             self.searcher = Some(reader.searcher());
                         }
                     }
+
+                    // Cache the directory for future queries (avoids catalog reload)
+                    // Note: We only cache the directory, not Index/Reader, so each cursor
+                    // gets its own Index for proper write isolation
+                    if let Some(ref dir) = self.hybrid_directory {
+                        let mut cache = self.shared_directory_cache.write();
+                        *cache = Some(CachedFtsDirectory {
+                            directory: dir.clone(),
+                        });
+                        tracing::debug!("FTS CreatingIndex: cached directory for future queries");
+                    }
+
                     self.state = FtsState::Ready;
                     return Ok(IOResult::Done(()));
                 }
@@ -2634,7 +2948,7 @@ impl IndexMethodCursor for FtsCursor {
         self.pending_docs_count += 1;
 
         // Batch commits: only commit every BATCH_COMMIT_SIZE documents
-        // This dramatically improves bulk insert performance
+        // This dramatically improves bulk insert performance for CREATE INDEX
         if self.pending_docs_count >= BATCH_COMMIT_SIZE {
             return self.commit_and_flush();
         }
@@ -2725,7 +3039,15 @@ impl IndexMethodCursor for FtsCursor {
             .as_ref()
             .ok_or_else(|| LimboError::InternalError("FTS index not initialized".into()))?;
 
-        let parser = tantivy::query::QueryParser::for_index(index, default_fields);
+        let mut parser = tantivy::query::QueryParser::for_index(index, default_fields);
+
+        // Apply field boosts if configured
+        for (col, field) in &self.text_fields {
+            if let Some(&boost) = self.field_weights.get(&col.name) {
+                parser.set_field_boost(*field, boost);
+            }
+        }
+
         let query = parser
             .parse_query(&query_str)
             .map_err(|e| LimboError::InternalError(format!("FTS parse error: {e}")))?;
@@ -2803,5 +3125,35 @@ impl IndexMethodCursor for FtsCursor {
         }
         let (_, _, rowid) = self.current_hits[self.hit_pos];
         Ok(IOResult::Done(Some(rowid)))
+    }
+
+    /// Flush any pending writes before transaction commit.
+    /// This ensures FTS writes are persisted as part of the transaction.
+    fn pre_commit(&mut self) -> Result<IOResult<()>> {
+        // First, check if we're in the middle of a flush operation that needs to continue
+        // This handles the case where commit_and_flush() returned IOResult::IO and we need
+        // to continue the flush after IO completes
+        match &self.state {
+            FtsState::FlushingWrites { .. }
+            | FtsState::DeletingOldChunks { .. }
+            | FtsState::AdvancingAfterSeek { .. }
+            | FtsState::DeletingOldChunk { .. }
+            | FtsState::PerformingDelete { .. }
+            | FtsState::AdvancingAfterDelete { .. }
+            | FtsState::SeekingWrite { .. }
+            | FtsState::InsertingWrite { .. } => {
+                return self.flush_writes_internal();
+            }
+            _ => {}
+        }
+
+        if self.pending_docs_count > 0 {
+            tracing::debug!(
+                "FTS pre_commit: flushing {} pending documents",
+                self.pending_docs_count
+            );
+            return self.commit_and_flush();
+        }
+        Ok(IOResult::Done(()))
     }
 }

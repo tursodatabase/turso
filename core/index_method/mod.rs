@@ -115,6 +115,14 @@ pub trait IndexMethodCursor {
     /// enrich its result with name, comment, rating columns from original table accessing original row by its rowid
     /// returned from query_rowid(...) method
     fn query_rowid(&mut self) -> Result<IOResult<Option<i64>>>;
+
+    /// Called before transaction commit to flush any pending writes.
+    /// This ensures index method writes are persisted as part of the transaction.
+    /// Index methods that batch writes should implement this to flush their buffers.
+    /// Default implementation does nothing (for index methods that don't need it).
+    fn pre_commit(&mut self) -> Result<IOResult<()>> {
+        Ok(IOResult::Done(()))
+    }
 }
 
 /// helper method to open table BTree cursor in the index method implementation
