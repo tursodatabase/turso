@@ -1770,3 +1770,96 @@ fn test_fts_with_explicit_transactions(tmp_db: TempDatabase) {
         "Rust articles should still be indexed after rollback"
     );
 }
+
+#[cfg(feature = "fts")]
+#[turso_macros::test(init_sql = "CREATE TABLE docs(id INTEGER PRIMARY KEY, title TEXT, body TEXT)")]
+fn test_fts_optimize_index(tmp_db: TempDatabase) {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+
+    // Create FTS index
+    conn.execute("CREATE INDEX fts_docs ON docs USING fts (title, body)")
+        .unwrap();
+
+    // Insert multiple batches of documents to create multiple segments
+    for i in 0..10 {
+        conn.execute(&format!(
+            "INSERT INTO docs VALUES ({}, 'Document {}', 'Content about topic {} with keywords')",
+            i,
+            i,
+            i
+        ))
+        .unwrap();
+    }
+
+    // Verify documents are searchable
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT id FROM docs WHERE fts_match(title, body, 'Document')",
+    );
+    assert_eq!(rows.len(), 10, "Should find all 10 documents");
+
+    // Run OPTIMIZE INDEX on specific index
+    conn.execute("OPTIMIZE INDEX fts_docs").unwrap();
+
+    // Verify documents are still searchable after optimize
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT id FROM docs WHERE fts_match(title, body, 'Document')",
+    );
+    assert_eq!(
+        rows.len(),
+        10,
+        "Should still find all 10 documents after optimize"
+    );
+
+    // Verify content is correct
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT id FROM docs WHERE fts_match(title, body, 'topic')",
+    );
+    assert_eq!(rows.len(), 10, "Should find all documents with 'topic'");
+}
+
+#[cfg(feature = "fts")]
+#[turso_macros::test(init_sql = "CREATE TABLE articles(id INTEGER PRIMARY KEY, title TEXT)")]
+fn test_fts_optimize_all_indexes(tmp_db: TempDatabase) {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+
+    // Create second table manually
+    conn.execute("CREATE TABLE posts(id INTEGER PRIMARY KEY, content TEXT)")
+        .unwrap();
+
+    // Create FTS indexes on multiple tables
+    conn.execute("CREATE INDEX fts_articles ON articles USING fts (title)")
+        .unwrap();
+    conn.execute("CREATE INDEX fts_posts ON posts USING fts (content)")
+        .unwrap();
+
+    // Insert data
+    conn.execute("INSERT INTO articles VALUES (1, 'Rust Programming')")
+        .unwrap();
+    conn.execute("INSERT INTO articles VALUES (2, 'Python Guide')")
+        .unwrap();
+    conn.execute("INSERT INTO posts VALUES (1, 'Learning Rust is fun')")
+        .unwrap();
+    conn.execute("INSERT INTO posts VALUES (2, 'Advanced Rust patterns')")
+        .unwrap();
+
+    // Run OPTIMIZE INDEX without specifying index name (optimizes all)
+    conn.execute("OPTIMIZE INDEX").unwrap();
+
+    // Verify all indexes still work
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT id FROM articles WHERE fts_match(title, 'Rust')",
+    );
+    assert_eq!(rows.len(), 1, "Should find Rust article");
+
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT id FROM posts WHERE fts_match(content, 'Rust')",
+    );
+    assert_eq!(rows.len(), 2, "Should find both Rust posts");
+}
