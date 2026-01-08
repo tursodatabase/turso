@@ -402,3 +402,11 @@ do_execsql_test_in_memory_any_error having_without_group_by_non_aggregate_error 
     INSERT INTO t VALUES (1), (2), (3);
     SELECT a FROM t HAVING a = 1;
 }
+
+# Regression test: GROUP BY with constant false WHERE clause (e.g., WHERE 0)
+# should return empty result set, not panic due to unopened sorter cursor.
+do_execsql_test_on_specific_db {:memory:} group_by_where_false {
+    CREATE TABLE t0 (c0 INT);
+    INSERT INTO t0 VALUES (1);
+    SELECT c0, COUNT(*) FROM t0 WHERE 0 GROUP BY c0;
+} {}

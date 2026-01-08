@@ -955,15 +955,6 @@ pub fn emit_query<'a>(
     // Emit FROM clause subqueries first so the results can be read in the main query loop.
     emit_from_clause_subqueries(program, t_ctx, &mut plan.table_references, &plan.join_order)?;
 
-    // No rows will be read from source table loops if there is a constant false condition eg. WHERE 0
-    // however an aggregation might still happen,
-    // e.g. SELECT COUNT(*) WHERE 0 returns a row with 0, not an empty result set
-    if plan.contains_constant_false_condition {
-        program.emit_insn(Insn::Goto {
-            target_pc: after_main_loop_label,
-        });
-    }
-
     // For non-grouped aggregation queries that also have non-aggregate columns,
     // we need to ensure non-aggregate columns are only emitted once.
     // This flag helps track whether we've already emitted these columns.
@@ -1038,6 +1029,17 @@ pub fn emit_query<'a>(
     }
 
     init_limit(program, t_ctx, &plan.limit, &plan.offset)?;
+
+    // No rows will be read from source table loops if there is a constant false condition eg. WHERE 0
+    // however an aggregation might still happen,
+    // e.g. SELECT COUNT(*) WHERE 0 returns a row with 0, not an empty result set.
+    // This Goto must be placed AFTER all initialization (cursors, sorters, etc.) so that
+    // resources like the GROUP BY sorter are properly opened before we skip to the aggregation phase.
+    if plan.contains_constant_false_condition {
+        program.emit_insn(Insn::Goto {
+            target_pc: after_main_loop_label,
+        });
+    }
 
     init_loop(
         program,
