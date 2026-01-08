@@ -1197,3 +1197,45 @@ do_execsql_test_on_specific_db {:memory:} ignore-notnull-with-unique {
     SELECT * FROM t ORDER BY a;
 } {1|10
 3|30}
+
+# INSERT INTO ... SELECT ... UNION ... tests (GitHub issue #3946)
+# Ensures all rows from all branches of a compound select are inserted
+
+do_execsql_test_on_specific_db {:memory:} insert-select-union-all-branches {
+    CREATE TABLE t1 (id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE t2 (id INTEGER PRIMARY KEY, name TEXT);
+    INSERT INTO t1 VALUES (1, 'a'), (2, 'b');
+    INSERT INTO t2 SELECT id, name FROM t1 UNION SELECT 3, 'c';
+    SELECT * FROM t2 ORDER BY id;
+} {1|a
+2|b
+3|c}
+
+do_execsql_test_on_specific_db {:memory:} insert-select-union-all-all-branches {
+    CREATE TABLE t (id INTEGER PRIMARY KEY);
+    INSERT INTO t VALUES (1), (2);
+    INSERT INTO t SELECT 3 UNION ALL SELECT 4;
+    SELECT * FROM t ORDER BY id;
+} {1
+2
+3
+4}
+
+do_execsql_test_on_specific_db {:memory:} insert-select-union-three-branches {
+    CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE t2 (id INTEGER PRIMARY KEY, val TEXT);
+    INSERT INTO t1 VALUES (1, 'a');
+    INSERT INTO t2 SELECT id, val FROM t1 UNION SELECT 2, 'b' UNION SELECT 3, 'c';
+    SELECT * FROM t2 ORDER BY id;
+} {1|a
+2|b
+3|c}
+
+do_execsql_test_on_specific_db {:memory:} insert-select-union-with-table-reference {
+    CREATE TABLE t(a PRIMARY KEY, b);
+    INSERT INTO t VALUES (1, 'x');
+    INSERT INTO t SELECT a+1, 'y' FROM t UNION SELECT a+2, 'z' FROM t;
+    SELECT * FROM t ORDER BY a;
+} {1|x
+2|y
+3|z}
