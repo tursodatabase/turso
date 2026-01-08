@@ -1,7 +1,6 @@
 use crate::sync::Arc;
 use std::collections::HashMap;
 
-use crate::bail_parse_error;
 use crate::error::SQLITE_CONSTRAINT_UNIQUE;
 use crate::function::{Deterministic, Func};
 use crate::index_method::IndexMethodConfiguration;
@@ -19,9 +18,10 @@ use crate::translate::insert::format_unique_violation_desc;
 use crate::translate::plan::{
     ColumnUsedMask, IterationDirection, JoinedTable, Operation, Scan, TableReferences,
 };
-use crate::vdbe::builder::CursorKey;
+use crate::vdbe::builder::{CursorKey, ProgramBuilderOpts};
 use crate::vdbe::insn::{to_u16, CmpInsFlags, Cookie};
 use crate::vdbe::BranchOffset;
+use crate::{bail_parse_error, LimboError};
 use crate::{
     schema::{BTreeTable, Index, IndexColumn, PseudoCursorType},
     storage::pager::CreateBTreeFlags,
@@ -81,7 +81,7 @@ pub fn translate_create_index(
             original_idx_name
         );
     }
-    let opts = crate::vdbe::builder::ProgramBuilderOpts {
+    let opts = ProgramBuilderOpts {
         num_cursors: 5,
         approx_num_insns: 40,
         approx_num_labels: 5,
@@ -749,7 +749,7 @@ pub fn translate_drop_index(
     mut program: ProgramBuilder,
 ) -> crate::Result<ProgramBuilder> {
     let idx_name = normalize_ident(idx_name);
-    let opts = crate::vdbe::builder::ProgramBuilderOpts {
+    let opts = ProgramBuilderOpts {
         num_cursors: 5,
         approx_num_insns: 40,
         approx_num_labels: 5,
@@ -936,10 +936,10 @@ pub fn translate_drop_index(
 /// If idx_name is provided, optimize that specific index.
 /// If idx_name is None, optimize all index method indexes.
 pub fn translate_optimize(
-    idx_name: Option<turso_parser::ast::QualifiedName>,
+    idx_name: Option<ast::QualifiedName>,
     resolver: &Resolver,
     mut program: ProgramBuilder,
-    connection: &std::sync::Arc<crate::Connection>,
+    connection: &Arc<crate::Connection>,
 ) -> crate::Result<ProgramBuilder> {
     if !connection.experimental_index_method_enabled() {
         crate::bail_parse_error!(
@@ -947,7 +947,7 @@ pub fn translate_optimize(
         )
     }
 
-    let opts = crate::vdbe::builder::ProgramBuilderOpts {
+    let opts = ProgramBuilderOpts {
         num_cursors: 5,
         approx_num_insns: 20,
         approx_num_labels: 2,
@@ -968,7 +968,7 @@ pub fn translate_optimize(
                         indexes_to_optimize.push(idx.clone());
                     } else {
                         // Not an index method index - nothing to optimize
-                        tracing::info!(
+                        tracing::debug!(
                             "OPTIMIZE INDEX: {} is not an index method index, nothing to optimize",
                             idx_name
                         );
@@ -983,9 +983,8 @@ pub fn translate_optimize(
         }
 
         if !found {
-            return Err(crate::error::LimboError::InvalidArgument(format!(
-                "No such index: {}",
-                idx_name
+            return Err(LimboError::InvalidArgument(format!(
+                "No such index: {idx_name}"
             )));
         }
     } else {
@@ -999,7 +998,7 @@ pub fn translate_optimize(
         }
 
         if indexes_to_optimize.is_empty() {
-            tracing::info!("OPTIMIZE INDEX: no index method indexes found to optimize");
+            tracing::debug!("OPTIMIZE INDEX: no index method indexes found to optimize");
             return Ok(program);
         }
     }

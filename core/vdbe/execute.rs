@@ -1943,16 +1943,17 @@ fn vtab_commit_all(conn: &Connection) -> crate::Result<()> {
 /// Flush pending writes on all index method cursors before transaction commit.
 /// This ensures index method writes are persisted as part of the transaction.
 fn index_method_pre_commit_all(state: &mut ProgramState, pager: &Arc<Pager>) -> crate::Result<()> {
-    for cursor_opt in state.cursors.iter_mut() {
-        if let Some(Cursor::IndexMethod(cursor)) = cursor_opt {
-            loop {
-                match cursor.pre_commit()? {
-                    IOResult::Done(()) => break,
-                    IOResult::IO(io) => {
-                        // Wait for I/O to complete
-                        while !io.finished() {
-                            pager.io.step()?;
-                        }
+    for cursor_opt in state.cursors.iter_mut().flatten() {
+        let Cursor::IndexMethod(cursor) = cursor_opt else {
+            continue;
+        };
+        loop {
+            match cursor.pre_commit()? {
+                IOResult::Done(()) => break,
+                IOResult::IO(io) => {
+                    // Wait for I/O to complete
+                    while !io.finished() {
+                        pager.io.step()?;
                     }
                 }
             }
@@ -5942,15 +5943,15 @@ pub fn op_function(
             // If we reach here, just return a fallback since no FTS index matched.
             use crate::function::FtsFunc;
             match fts_func {
-                FtsFunc::FtsScore => {
+                FtsFunc::Score => {
                     // Without an FTS index match, return 0.0 as a default score
                     state.registers[*dest] = Register::Value(Value::Float(0.0));
                 }
-                FtsFunc::FtsMatch => {
+                FtsFunc::Match => {
                     // Without an FTS index match, return 0 (false) as default
                     state.registers[*dest] = Register::Value(Value::Integer(0));
                 }
-                FtsFunc::FtsHighlight => {
+                FtsFunc::Highlight => {
                     // fts_highlight(col1, col2, ..., before_tag, after_tag, query)
                     // Variable number of text columns, followed by before_tag, after_tag, query
                     // Minimum: fts_highlight(text, before_tag, after_tag, query) = 4 args
@@ -5964,12 +5965,9 @@ pub fn op_function(
                     // Last 3 args are: before_tag, after_tag, query
                     // First N-3 args are text columns
                     let num_text_cols = arg_count - 3;
-                    let before_tag =
-                        state.registers[*start_reg + num_text_cols].get_value();
-                    let after_tag =
-                        state.registers[*start_reg + num_text_cols + 1].get_value();
-                    let query =
-                        state.registers[*start_reg + num_text_cols + 2].get_value();
+                    let before_tag = state.registers[*start_reg + num_text_cols].get_value();
+                    let after_tag = state.registers[*start_reg + num_text_cols + 1].get_value();
+                    let query = state.registers[*start_reg + num_text_cols + 2].get_value();
 
                     // Handle NULL values in tags or query
                     if matches!(query, Value::Null)
