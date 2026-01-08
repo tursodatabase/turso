@@ -8719,7 +8719,7 @@ pub fn op_integrity_check(
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(
         IntegrityCk {
-            max_errors: _,
+            max_errors,
             roots,
             message_register,
             quick,
