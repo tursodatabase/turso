@@ -58,6 +58,20 @@ cargo bench --profile bench-profile --bench benchmark
 8. Minimize heap allocations and write CPU-friendly code. This is code where a microsecond is a long time.
 9. Your objective is to produce robust, correct code, not to "make it work". Consider race conditions, data races and edge cases. On a long enough
    timeline, ALL bugs that can happen WILL happen.
+10. If you write an if-statement, it must be a case where both branches can expectedly be reached. If it's a case where only one branch should ever be
+    hit, then either an internal error should be returned or an assertion be made instead of the if-statement. Choose assertion if reaching the invalid
+    branch risks data corruption or incorrect results. Don't "hedge your bets" by writing if-statements just to stay on the happy path.
+
+## Writing comments
+
+- Do NOT write comments that just repeat what the code does, unless the code is intrinsically very complex and readers would benefit
+  from a clear summary. Prefer to comment WHY something is done.
+- ALWAYS document functions, structs, enums, struct members and enum variants. Apply the same principle as above, though: focus on
+  why a given struct/enum/variant is necessary.
+- Do NOT EVER write comments that reference a conversation between a human and an AI agent, e.g.
+    * "This test should trigger the bug"
+    * "Phase 1 (existing code)" <- "existing code" is completley meaningless to a reader who encounters this code in the codebase
+    * "Header validation (added)" <- "added" when? it makes no sense to a reader.
 
 ## Testing Practices
 
