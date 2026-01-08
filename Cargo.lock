@@ -5429,6 +5429,7 @@ dependencies = [
  "ryu",
  "serde",
  "simsimd",
+ "smallvec",
  "sorted-vec",
  "strum",
  "strum_macros",

@@ -1,4 +1,5 @@
 use rustc_hash::FxHashMap;
+use smallvec::SmallVec;
 use tracing::{instrument, Level};
 
 use crate::{
@@ -7149,12 +7150,9 @@ fn defragment_page(page: &PageContent, usable_space: usize, max_frag_bytes: isiz
     fn process_cells(
         page: &PageContent,
         usable_space: usize,
-        cells_info: &mut [CellInfo],
-        cell_count: usize,
+        cells: &mut [CellInfo],
         is_physically_sorted: bool,
     ) -> Result<()> {
-        let cells = &mut cells_info[..cell_count];
-
         if !is_physically_sorted {
             // Sort cells by old physical offset in descending order.
             // Using unstable sort is fine as the original order doesn't matter.
@@ -7215,50 +7213,7 @@ fn defragment_page(page: &PageContent, usable_space: usize, max_frag_bytes: isiz
     let max_local = payload_overflow_threshold_max(page_type, usable_space);
     let min_local = payload_overflow_threshold_min(page_type, usable_space);
 
-    if cell_count <= MAX_STACK_CELLS {
-        // Use stack allocation for small cell counts (common case).
-        let mut stack_cells: [CellInfo; MAX_STACK_CELLS] = [CellInfo {
-            old_offset: 0,
-            size: 0,
-            pointer_index: 0,
-        }; MAX_STACK_CELLS];
-
-        for (i, item) in stack_cells.iter_mut().enumerate().take(cell_count) {
-            let pc = page.read_u16_no_offset(cell_offset + (i * 2));
-            let (_, size) = page._cell_get_raw_region_faster(
-                i,
-                usable_space,
-                cell_count,
-                max_local,
-                min_local,
-                page_type,
-            );
-
-            if pc > last_offset {
-                is_physically_sorted = false;
-            }
-            last_offset = pc;
-
-            *item = CellInfo {
-                old_offset: pc,
-                size: size as u16,
-                pointer_index: i,
-            };
-        }
-
-        process_cells(
-            page,
-            usable_space,
-            &mut stack_cells,
-            cell_count,
-            is_physically_sorted,
-        )?;
-        debug_validate_cells!(page, usable_space);
-        return Ok(());
-    }
-
-    // Fall back to heap allocation for large cell counts (rare case).
-    let mut heap_cells = Vec::with_capacity(cell_count);
+    let mut cells = SmallVec::<[CellInfo; MAX_STACK_CELLS]>::with_capacity(cell_count);
     for i in 0..cell_count {
         let pc = page.read_u16_no_offset(cell_offset + (i * 2));
         let (_, size) = page._cell_get_raw_region_faster(
@@ -7275,20 +7230,14 @@ fn defragment_page(page: &PageContent, usable_space: usize, max_frag_bytes: isiz
         }
         last_offset = pc;
 
-        heap_cells.push(CellInfo {
+        cells.push(CellInfo {
             old_offset: pc,
             size: size as u16,
             pointer_index: i,
         });
     }
 
-    process_cells(
-        page,
-        usable_space,
-        &mut heap_cells,
-        cell_count,
-        is_physically_sorted,
-    )?;
+    process_cells(page, usable_space, &mut cells, is_physically_sorted)?;
     debug_validate_cells!(page, usable_space);
     Ok(())
 }
