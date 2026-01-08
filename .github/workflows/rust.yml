@@ -67,6 +67,12 @@ jobs:
           LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
         run: cargo nextest run --workspace --all-features --locked --no-fail-fast -E 'not test(/^fuzz_tests::/)' --failure-output=final
         timeout-minutes: 20
+      - name: Test integrity_check corruption (no checksum)
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: "sccache"
+        run: cargo nextest run -p core_tester --locked --no-fail-fast -E 'test(integrity_check)' --failure-output=final
+        timeout-minutes: 5
       - name: Test doctests
         env:
           SCCACHE_GHA_ENABLED: "true"

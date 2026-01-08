@@ -7,7 +7,9 @@ use turso_macros::match_ignore_ascii_case;
 use turso_parser::ast::{self, ColumnDefinition, Expr, Literal};
 use turso_parser::ast::{PragmaName, QualifiedName};
 
-use super::integrity_check::translate_integrity_check;
+use super::integrity_check::{
+    translate_integrity_check, translate_quick_check, MAX_INTEGRITY_CHECK_ERRORS,
+};
 use crate::pragma::pragma_for;
 use crate::schema::Schema;
 use crate::storage::encryption::{CipherMode, EncryptionKey};
@@ -30,6 +32,17 @@ fn list_pragmas(program: &mut ProgramBuilder) {
         program.emit_result_row(register, 1);
     }
     program.add_pragma_result_column("pragma_list".into());
+}
+
+/// Parse max_errors from an optional value expression.
+/// Returns the parsed integer if value is a numeric literal, otherwise returns the default.
+fn parse_max_errors_from_value(value: &Option<Expr>) -> usize {
+    match value {
+        Some(Expr::Literal(Literal::Numeric(n))) => {
+            n.parse::<usize>().unwrap_or(MAX_INTEGRITY_CHECK_ERRORS)
+        }
+        _ => MAX_INTEGRITY_CHECK_ERRORS,
+    }
 }
 
 pub fn translate_pragma(
@@ -60,7 +73,11 @@ pub fn translate_pragma(
     let (mut program, mode) = match body {
         None => query_pragma(pragma, resolver.schema, None, pager, connection, program)?,
         Some(ast::PragmaBody::Equals(value) | ast::PragmaBody::Call(value)) => match pragma {
-            PragmaName::TableInfo | PragmaName::TableXinfo => query_pragma(
+            // These pragmas take a parameter but are queries, not setters
+            PragmaName::TableInfo
+            | PragmaName::TableXinfo
+            | PragmaName::IntegrityCheck
+            | PragmaName::QuickCheck => query_pragma(
                 pragma,
                 resolver.schema,
                 Some(*value),
@@ -329,6 +346,7 @@ fn update_pragma(
             Ok((program, TransactionMode::None))
         }
         PragmaName::IntegrityCheck => unreachable!("integrity_check cannot be set"),
+        PragmaName::QuickCheck => unreachable!("quick_check cannot be set"),
         PragmaName::UnstableCaptureDataChangesConn => {
             let value = parse_string(&value)?;
             // todo(sivukhin): ideally, we should consistently update capture_data_changes connection flag only after successfull execution of schema change statement
@@ -673,7 +691,13 @@ fn query_pragma(
             Ok((program, TransactionMode::None))
         }
         PragmaName::IntegrityCheck => {
-            translate_integrity_check(schema, &mut program)?;
+            let max_errors = parse_max_errors_from_value(&value);
+            translate_integrity_check(schema, &mut program, max_errors)?;
+            Ok((program, TransactionMode::Read))
+        }
+        PragmaName::QuickCheck => {
+            let max_errors = parse_max_errors_from_value(&value);
+            translate_quick_check(schema, &mut program, max_errors)?;
             Ok((program, TransactionMode::Read))
         }
         PragmaName::UnstableCaptureDataChangesConn => {

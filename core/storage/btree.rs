@@ -5688,6 +5688,26 @@ pub enum IntegrityCheckError {
     PageNeverUsed { page_id: i64 },
     #[error("Pending byte page {page_id} is being used")]
     PendingBytePageUsed { page_id: i64 },
+    #[error("wrong # of entries in index {index_name}")]
+    IndexEntryCountMismatch {
+        index_name: String,
+        table_name: String,
+        index_count: usize,
+        table_count: usize,
+    },
+    #[error("NULL value in {table_name}.{column_name}")]
+    NotNullViolation {
+        table_name: String,
+        column_name: String,
+        rowid: i64,
+    },
+    #[error("non-unique entry in index {index_name}")]
+    UniqueViolation { index_name: String },
+    #[error("row {row_number} missing from index {index_name}")]
+    RowMissingFromIndex {
+        row_number: usize,
+        index_name: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

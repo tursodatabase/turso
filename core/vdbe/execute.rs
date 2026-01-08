@@ -8550,14 +8550,167 @@ pub fn op_count(
     Ok(InsnFunctionStepResult::Step)
 }
 
+/// Format integrity check errors into a result string.
+/// Returns "ok" if no errors, otherwise newline-separated error messages.
+fn format_integrity_check_result(errors: &[IntegrityCheckError]) -> String {
+    if errors.is_empty() {
+        "ok".to_string()
+    } else {
+        errors
+            .iter()
+            .map(|e| e.to_string())
+            .collect::<Vec<String>>()
+            .join("\n")
+    }
+}
+
 pub enum OpIntegrityCheckState {
     Start,
-    Checking {
+    /// Phase 1: B-tree structural checks
+    CheckingBTreeStructure {
         errors: Vec<IntegrityCheckError>,
         current_root_idx: usize,
         state: IntegrityCheckState,
     },
+    /// Phase 2: Index entry count validation (runs for both quick_check and integrity_check)
+    /// Counts rows in each table and entries in each index, then compares.
+    ValidatingIndexCounts {
+        errors: Vec<IntegrityCheckError>,
+        /// Index into the tables list
+        current_table_idx: usize,
+        /// Index into the current table's indexes list
+        current_index_idx: usize,
+        /// Row count for the current table (populated during table scan)
+        table_row_count: usize,
+        /// Entry count for the current index (populated during index scan)
+        index_entry_count: usize,
+        /// State of the current validation sub-phase
+        substate: IndexCountValidationSubstate,
+        /// Cursor used for counting (persisted across I/O yields)
+        cursor: Option<Box<BTreeCursor>>,
+    },
+    /// Phase 3: NOT NULL constraint validation (skipped when quick=true)
+    /// Scans table rows and checks that NOT NULL columns don't contain NULL values.
+    ValidatingNotNull {
+        errors: Vec<IntegrityCheckError>,
+        /// Index into the tables list
+        current_table_idx: usize,
+        /// Cursor used for row scanning (persisted across I/O yields)
+        cursor: Option<Box<BTreeCursor>>,
+        /// State of the current validation sub-phase
+        substate: NotNullValidationSubstate,
+    },
+    /// Phase 4: UNIQUE constraint validation (skipped when quick=true)
+    /// Scans unique indexes and checks for duplicate keys.
+    ValidatingUnique {
+        errors: Vec<IntegrityCheckError>,
+        /// Index into the tables list
+        current_table_idx: usize,
+        /// Index into the current table's indexes list
+        current_index_idx: usize,
+        /// Cursor used for index scanning (persisted across I/O yields)
+        cursor: Option<Box<BTreeCursor>>,
+        /// Previous key values for duplicate detection (None if at start of index or prev had NULL)
+        /// Excludes rowid. Set to None if any value is NULL (NULL != NULL for UNIQUE).
+        previous_key: Option<Vec<Value>>,
+        /// State of the current validation sub-phase
+        substate: UniqueValidationSubstate,
+    },
+    /// Phase 5: Row-index consistency validation (skipped when quick=true)
+    /// For each table row, verifies it has a corresponding entry in each index.
+    ValidatingRowIndexConsistency {
+        errors: Vec<IntegrityCheckError>,
+        /// Index into the tables list
+        current_table_idx: usize,
+        /// Cursor for scanning table rows
+        table_cursor: Option<Box<BTreeCursor>>,
+        /// Cursor for searching in indexes
+        index_cursor: Option<Box<BTreeCursor>>,
+        /// Current row number (1-indexed, for error messages)
+        row_number: usize,
+        /// State of the current validation sub-phase
+        substate: RowIndexValidationSubstate,
+    },
 }
+
+/// Sub-states for index count validation
+#[derive(Debug, Clone)]
+pub enum IndexCountValidationSubstate {
+    /// Starting count validation for a new table
+    StartTable,
+    /// Counting rows in the current table
+    CountingTableRows,
+    /// Starting count validation for a new index
+    StartIndex,
+    /// Counting entries in the current index
+    CountingIndexEntries,
+    /// Comparing counts and moving to next
+    ComparingCounts,
+}
+
+/// Sub-states for NOT NULL constraint validation
+#[derive(Debug, Clone)]
+pub enum NotNullValidationSubstate {
+    /// Starting validation for a new table
+    StartTable,
+    /// Rewinding to the beginning of the table
+    Rewinding,
+    /// Checking columns in the current row
+    CheckingRow,
+    /// Advancing to the next row
+    Advancing,
+}
+
+/// Sub-states for UNIQUE constraint validation
+#[derive(Debug, Clone)]
+pub enum UniqueValidationSubstate {
+    /// Starting validation for a new table
+    StartTable,
+    /// Starting validation for a new index
+    StartIndex,
+    /// Rewinding to the beginning of the index
+    Rewinding,
+    /// Reading current key and comparing with previous
+    CheckingKey,
+    /// Advancing to the next entry
+    Advancing,
+}
+
+/// Sub-states for row-index consistency validation
+#[derive(Debug, Clone)]
+pub enum RowIndexValidationSubstate {
+    /// Starting validation for a new table
+    StartTable,
+    /// Rewinding to the beginning of the table
+    RewindingTable,
+    /// Checking current row against all indexes
+    CheckingRow {
+        /// Current index being checked (0..indexes.len())
+        current_index_idx: usize,
+        /// Cached values from current row (extracted once, used for all indexes)
+        row_values: Vec<Value>,
+        /// Rowid of current row (for building index key)
+        rowid: i64,
+    },
+    /// Searching for row in current index
+    SearchingIndex {
+        current_index_idx: usize,
+        row_values: Vec<Value>,
+        rowid: i64,
+        /// Pre-built key values for the index search (indexed_cols + rowid)
+        key_values: Vec<Value>,
+    },
+    /// Advancing cursor after TryAdvance result from seek
+    /// This happens when seek found a match in an interior node but needs to navigate to leaf
+    AdvancingAfterTryAdvance {
+        current_index_idx: usize,
+        row_values: Vec<Value>,
+        rowid: i64,
+    },
+    /// Advancing to the next row
+    Advancing,
+}
+
 pub fn op_integrity_check(
     program: &Program,
     state: &mut ProgramState,
@@ -8569,6 +8722,8 @@ pub fn op_integrity_check(
             max_errors: _,
             roots,
             message_register,
+            quick,
+            tables,
         },
         insn
     );
@@ -8595,17 +8750,17 @@ pub fn op_integrity_check(
                     PageCategory::FreeListTrunk,
                     &mut errors,
                 );
-            } else {
+            } else if !roots.is_empty() {
                 integrity_check_state.start(roots[0], PageCategory::Normal, &mut errors);
                 current_root_idx += 1;
             }
-            state.op_integrity_check_state = OpIntegrityCheckState::Checking {
+            state.op_integrity_check_state = OpIntegrityCheckState::CheckingBTreeStructure {
                 errors,
                 state: integrity_check_state,
                 current_root_idx,
             };
         }
-        OpIntegrityCheckState::Checking {
+        OpIntegrityCheckState::CheckingBTreeStructure {
             errors,
             current_root_idx,
             state: integrity_check_state,
@@ -8674,18 +8829,771 @@ pub fn op_integrity_check(
                         })
                     }
                 }
-                let message = if errors.is_empty() {
-                    "ok".to_string()
-                } else {
-                    errors
+
+                // Phase 2: Index count validation (skip for quick_check per SQLite)
+                if !*quick && tables.iter().any(|t| !t.indexes.is_empty()) {
+                    // Transition to index count validation phase
+                    let errors = std::mem::take(errors);
+                    state.op_integrity_check_state = OpIntegrityCheckState::ValidatingIndexCounts {
+                        errors,
+                        current_table_idx: 0,
+                        current_index_idx: 0,
+                        table_row_count: 0,
+                        index_entry_count: 0,
+                        substate: IndexCountValidationSubstate::StartTable,
+                        cursor: None,
+                    };
+                    return Ok(InsnFunctionStepResult::Step);
+                }
+
+                // Phase 3: NOT NULL constraint validation (skip for quick_check per SQLite)
+                if !*quick && tables.iter().any(|t| !t.not_null_columns.is_empty()) {
+                    // Transition to NOT NULL validation phase
+                    let errors = std::mem::take(errors);
+                    state.op_integrity_check_state = OpIntegrityCheckState::ValidatingNotNull {
+                        errors,
+                        current_table_idx: 0,
+                        cursor: None,
+                        substate: NotNullValidationSubstate::StartTable,
+                    };
+                    return Ok(InsnFunctionStepResult::Step);
+                }
+
+                // Phase 4: UNIQUE constraint validation (skip if quick_check)
+                if !*quick
+                    && tables
                         .iter()
-                        .map(|e| e.to_string())
-                        .collect::<Vec<String>>()
-                        .join("\n")
-                };
+                        .any(|t| t.indexes.iter().any(|idx| idx.unique))
+                {
+                    let errors = std::mem::take(errors);
+                    state.op_integrity_check_state = OpIntegrityCheckState::ValidatingUnique {
+                        errors,
+                        current_table_idx: 0,
+                        current_index_idx: 0,
+                        cursor: None,
+                        previous_key: None,
+                        substate: UniqueValidationSubstate::StartTable,
+                    };
+                    return Ok(InsnFunctionStepResult::Step);
+                }
+
+                // Finish: generate result message
+                let message = format_integrity_check_result(errors);
                 state.registers[*message_register] = Register::Value(Value::build_text(message));
                 state.op_integrity_check_state = OpIntegrityCheckState::Start;
                 state.pc += 1;
+            }
+        }
+        OpIntegrityCheckState::ValidatingIndexCounts {
+            errors,
+            current_table_idx,
+            current_index_idx,
+            table_row_count,
+            index_entry_count,
+            substate,
+            cursor,
+        } => {
+            loop {
+                match substate {
+                    IndexCountValidationSubstate::StartTable => {
+                        // Skip tables without indexes
+                        while *current_table_idx < tables.len()
+                            && tables[*current_table_idx].indexes.is_empty()
+                        {
+                            *current_table_idx += 1;
+                        }
+
+                        if *current_table_idx >= tables.len() {
+                            // Done with all tables, transition to NOT NULL validation, UNIQUE validation,
+                            // row-index validation, or finish
+
+                            // Phase 3: NOT NULL constraint validation (skip for quick_check)
+                            if !*quick && tables.iter().any(|t| !t.not_null_columns.is_empty()) {
+                                let errors = std::mem::take(errors);
+                                state.op_integrity_check_state =
+                                    OpIntegrityCheckState::ValidatingNotNull {
+                                        errors,
+                                        current_table_idx: 0,
+                                        cursor: None,
+                                        substate: NotNullValidationSubstate::StartTable,
+                                    };
+                                return Ok(InsnFunctionStepResult::Step);
+                            }
+
+                            // Phase 4: UNIQUE constraint validation (skip for quick_check)
+                            if !*quick
+                                && tables
+                                    .iter()
+                                    .any(|t| t.indexes.iter().any(|idx| idx.unique))
+                            {
+                                let errors = std::mem::take(errors);
+                                state.op_integrity_check_state =
+                                    OpIntegrityCheckState::ValidatingUnique {
+                                        errors,
+                                        current_table_idx: 0,
+                                        current_index_idx: 0,
+                                        cursor: None,
+                                        previous_key: None,
+                                        substate: UniqueValidationSubstate::StartTable,
+                                    };
+                                return Ok(InsnFunctionStepResult::Step);
+                            }
+
+                            // Phase 5: Row-index consistency validation (skip if quick_check)
+                            if !*quick && tables.iter().any(|t| !t.indexes.is_empty()) {
+                                let errors = std::mem::take(errors);
+                                state.op_integrity_check_state =
+                                    OpIntegrityCheckState::ValidatingRowIndexConsistency {
+                                        errors,
+                                        current_table_idx: 0,
+                                        table_cursor: None,
+                                        index_cursor: None,
+                                        row_number: 0,
+                                        substate: RowIndexValidationSubstate::StartTable,
+                                    };
+                                return Ok(InsnFunctionStepResult::Step);
+                            }
+
+                            // Finish: generate result message
+                            let message = format_integrity_check_result(errors);
+                            state.registers[*message_register] =
+                                Register::Value(Value::build_text(message));
+                            state.op_integrity_check_state = OpIntegrityCheckState::Start;
+                            state.pc += 1;
+                            return Ok(InsnFunctionStepResult::Step);
+                        }
+
+                        // Create cursor for current table
+                        let table = &tables[*current_table_idx];
+                        *cursor = Some(Box::new(BTreeCursor::new(
+                            pager.clone(),
+                            table.root_page,
+                            0, // num_columns not needed for counting
+                        )));
+                        *substate = IndexCountValidationSubstate::CountingTableRows;
+                    }
+                    IndexCountValidationSubstate::CountingTableRows => {
+                        let btree_cursor = cursor.as_mut().unwrap();
+                        let count = return_if_io!(btree_cursor.count());
+                        *table_row_count = count;
+                        *cursor = None;
+                        *current_index_idx = 0;
+                        *substate = IndexCountValidationSubstate::StartIndex;
+                    }
+                    IndexCountValidationSubstate::StartIndex => {
+                        let table = &tables[*current_table_idx];
+                        if *current_index_idx >= table.indexes.len() {
+                            // Done with all indexes for this table, move to next table
+                            *current_table_idx += 1;
+                            *substate = IndexCountValidationSubstate::StartTable;
+                            continue;
+                        }
+
+                        // Create cursor for current index
+                        let index = &table.indexes[*current_index_idx];
+                        *cursor = Some(Box::new(BTreeCursor::new(
+                            pager.clone(),
+                            index.root_page,
+                            0, // num_columns not needed for counting
+                        )));
+                        *substate = IndexCountValidationSubstate::CountingIndexEntries;
+                    }
+                    IndexCountValidationSubstate::CountingIndexEntries => {
+                        let btree_cursor = cursor.as_mut().unwrap();
+                        let count = return_if_io!(btree_cursor.count());
+                        *index_entry_count = count;
+                        *cursor = None;
+                        *substate = IndexCountValidationSubstate::ComparingCounts;
+                    }
+                    IndexCountValidationSubstate::ComparingCounts => {
+                        let table = &tables[*current_table_idx];
+                        let index = &table.indexes[*current_index_idx];
+
+                        if *table_row_count != *index_entry_count {
+                            errors.push(IntegrityCheckError::IndexEntryCountMismatch {
+                                index_name: index.name.clone(),
+                                table_name: table.name.clone(),
+                                index_count: *index_entry_count,
+                                table_count: *table_row_count,
+                            });
+
+                            // Check if we've reached max errors
+                            if errors.len() >= *max_errors {
+                                let message = format_integrity_check_result(errors);
+                                state.registers[*message_register] =
+                                    Register::Value(Value::build_text(message));
+                                state.op_integrity_check_state = OpIntegrityCheckState::Start;
+                                state.pc += 1;
+                                return Ok(InsnFunctionStepResult::Step);
+                            }
+                        }
+
+                        // Move to next index
+                        *current_index_idx += 1;
+                        *substate = IndexCountValidationSubstate::StartIndex;
+                    }
+                }
+            }
+        }
+        OpIntegrityCheckState::ValidatingNotNull {
+            errors,
+            current_table_idx,
+            cursor,
+            substate,
+        } => {
+            loop {
+                match substate {
+                    NotNullValidationSubstate::StartTable => {
+                        // Skip tables without NOT NULL columns
+                        while *current_table_idx < tables.len()
+                            && tables[*current_table_idx].not_null_columns.is_empty()
+                        {
+                            *current_table_idx += 1;
+                        }
+
+                        if *current_table_idx >= tables.len() {
+                            // Done with all tables, transition to UNIQUE validation, row-index validation, or finish
+
+                            // Phase 4: UNIQUE constraint validation (skip for quick_check)
+                            // Note: We can only be in ValidatingNotNull if quick=false, but check anyway for clarity
+                            if !*quick
+                                && tables
+                                    .iter()
+                                    .any(|t| t.indexes.iter().any(|idx| idx.unique))
+                            {
+                                let errors = std::mem::take(errors);
+                                state.op_integrity_check_state =
+                                    OpIntegrityCheckState::ValidatingUnique {
+                                        errors,
+                                        current_table_idx: 0,
+                                        current_index_idx: 0,
+                                        cursor: None,
+                                        previous_key: None,
+                                        substate: UniqueValidationSubstate::StartTable,
+                                    };
+                                return Ok(InsnFunctionStepResult::Step);
+                            }
+
+                            // Phase 5: Row-index consistency validation (skip if quick_check)
+                            if !*quick && tables.iter().any(|t| !t.indexes.is_empty()) {
+                                let errors = std::mem::take(errors);
+                                state.op_integrity_check_state =
+                                    OpIntegrityCheckState::ValidatingRowIndexConsistency {
+                                        errors,
+                                        current_table_idx: 0,
+                                        table_cursor: None,
+                                        index_cursor: None,
+                                        row_number: 0,
+                                        substate: RowIndexValidationSubstate::StartTable,
+                                    };
+                                return Ok(InsnFunctionStepResult::Step);
+                            }
+
+                            // Finish: generate result message
+                            let message = format_integrity_check_result(errors);
+                            state.registers[*message_register] =
+                                Register::Value(Value::build_text(message));
+                            state.op_integrity_check_state = OpIntegrityCheckState::Start;
+                            state.pc += 1;
+                            return Ok(InsnFunctionStepResult::Step);
+                        }
+
+                        // Create cursor for current table
+                        let table = &tables[*current_table_idx];
+                        *cursor = Some(Box::new(BTreeCursor::new(
+                            pager.clone(),
+                            table.root_page,
+                            0,
+                        )));
+                        *substate = NotNullValidationSubstate::Rewinding;
+                    }
+                    NotNullValidationSubstate::Rewinding => {
+                        let btree_cursor = cursor.as_mut().unwrap();
+                        return_if_io!(btree_cursor.rewind());
+                        if !btree_cursor.has_record() {
+                            // Table is empty, move to next table
+                            *cursor = None;
+                            *current_table_idx += 1;
+                            *substate = NotNullValidationSubstate::StartTable;
+                            continue;
+                        }
+                        *substate = NotNullValidationSubstate::CheckingRow;
+                    }
+                    NotNullValidationSubstate::CheckingRow => {
+                        let table = &tables[*current_table_idx];
+                        let btree_cursor = cursor.as_mut().unwrap();
+
+                        // Get rowid for error messages - must exist since has_record() was true
+                        let rowid = return_if_io!(btree_cursor.rowid())
+                            .expect("rowid must exist when has_record() is true");
+
+                        // Get the record and check NOT NULL columns
+                        let record = return_if_io!(btree_cursor.record())
+                            .expect("record must exist when has_record() is true");
+                        let values = record.get_values()?;
+                        for (col_idx, col_name) in &table.not_null_columns {
+                            if *col_idx < values.len() {
+                                let value = &values[*col_idx];
+                                if matches!(value, ValueRef::Null) {
+                                    errors.push(IntegrityCheckError::NotNullViolation {
+                                        table_name: table.name.clone(),
+                                        column_name: col_name.clone(),
+                                        rowid,
+                                    });
+
+                                    // Check if we've reached max errors
+                                    if errors.len() >= *max_errors {
+                                        let message = format_integrity_check_result(errors);
+                                        state.registers[*message_register] =
+                                            Register::Value(Value::build_text(message));
+                                        state.op_integrity_check_state =
+                                            OpIntegrityCheckState::Start;
+                                        state.pc += 1;
+                                        return Ok(InsnFunctionStepResult::Step);
+                                    }
+                                }
+                            }
+                        }
+
+                        *substate = NotNullValidationSubstate::Advancing;
+                    }
+                    NotNullValidationSubstate::Advancing => {
+                        let btree_cursor = cursor.as_mut().unwrap();
+                        return_if_io!(btree_cursor.next());
+                        if btree_cursor.has_record() {
+                            *substate = NotNullValidationSubstate::CheckingRow;
+                        } else {
+                            // Done with this table, move to next
+                            *cursor = None;
+                            *current_table_idx += 1;
+                            *substate = NotNullValidationSubstate::StartTable;
+                        }
+                    }
+                }
+            }
+        }
+        OpIntegrityCheckState::ValidatingUnique {
+            errors,
+            current_table_idx,
+            current_index_idx,
+            cursor,
+            previous_key,
+            substate,
+        } => {
+            loop {
+                match substate {
+                    UniqueValidationSubstate::StartTable => {
+                        // Skip tables without unique indexes
+                        while *current_table_idx < tables.len()
+                            && !tables[*current_table_idx]
+                                .indexes
+                                .iter()
+                                .any(|idx| idx.unique)
+                        {
+                            *current_table_idx += 1;
+                        }
+
+                        if *current_table_idx >= tables.len() {
+                            // Done with all tables, transition to row-index validation or finish
+                            // Note: We're in UNIQUE validation, so quick=false is guaranteed,
+                            // but we check anyway for clarity and consistency.
+                            if !*quick && tables.iter().any(|t| !t.indexes.is_empty()) {
+                                let errors = std::mem::take(errors);
+                                state.op_integrity_check_state =
+                                    OpIntegrityCheckState::ValidatingRowIndexConsistency {
+                                        errors,
+                                        current_table_idx: 0,
+                                        table_cursor: None,
+                                        index_cursor: None,
+                                        row_number: 0,
+                                        substate: RowIndexValidationSubstate::StartTable,
+                                    };
+                                return Ok(InsnFunctionStepResult::Step);
+                            }
+
+                            // Finish: generate result message
+                            let message = format_integrity_check_result(errors);
+                            state.registers[*message_register] =
+                                Register::Value(Value::build_text(message));
+                            state.op_integrity_check_state = OpIntegrityCheckState::Start;
+                            state.pc += 1;
+                            return Ok(InsnFunctionStepResult::Step);
+                        }
+
+                        *current_index_idx = 0;
+                        *substate = UniqueValidationSubstate::StartIndex;
+                    }
+                    UniqueValidationSubstate::StartIndex => {
+                        let table = &tables[*current_table_idx];
+
+                        // Find next unique index
+                        while *current_index_idx < table.indexes.len()
+                            && !table.indexes[*current_index_idx].unique
+                        {
+                            *current_index_idx += 1;
+                        }
+
+                        if *current_index_idx >= table.indexes.len() {
+                            // Done with all indexes for this table, move to next table
+                            *current_table_idx += 1;
+                            *substate = UniqueValidationSubstate::StartTable;
+                            continue;
+                        }
+
+                        // Create cursor for current unique index
+                        let index = &table.indexes[*current_index_idx];
+                        *cursor = Some(Box::new(BTreeCursor::new(
+                            pager.clone(),
+                            index.root_page,
+                            0,
+                        )));
+                        *previous_key = None;
+                        *substate = UniqueValidationSubstate::Rewinding;
+                    }
+                    UniqueValidationSubstate::Rewinding => {
+                        let btree_cursor = cursor.as_mut().unwrap();
+                        return_if_io!(btree_cursor.rewind());
+                        if !btree_cursor.has_record() {
+                            // Index is empty, move to next index
+                            *cursor = None;
+                            *current_index_idx += 1;
+                            *substate = UniqueValidationSubstate::StartIndex;
+                            continue;
+                        }
+                        *substate = UniqueValidationSubstate::CheckingKey;
+                    }
+                    UniqueValidationSubstate::CheckingKey => {
+                        let table = &tables[*current_table_idx];
+                        let index = &table.indexes[*current_index_idx];
+                        let btree_cursor = cursor.as_mut().unwrap();
+
+                        // Get current record (index key) - must exist since has_record() was true
+                        let record = return_if_io!(btree_cursor.record())
+                            .expect("record must exist when has_record() is true");
+                        let values = record.get_values()?;
+
+                        // For unique indexes, compare all values except the last one (rowid)
+                        // If we have a previous key and the non-rowid portions match, it's a violation
+                        if values.len() > 1 {
+                            // Extract key values (excluding rowid which is the last value)
+                            let key_values: Vec<Value> = values[..values.len() - 1]
+                                .iter()
+                                .map(|v| v.to_owned())
+                                .collect();
+
+                            // Check if any value is NULL - NULLs are never duplicates (NULL != NULL)
+                            let has_null = key_values.iter().any(|v| matches!(v, Value::Null));
+
+                            if !has_null {
+                                // Only compare if current key has no NULLs
+                                if let Some(prev) = previous_key.as_ref() {
+                                    // Compare value-by-value using existing Value comparison
+                                    if key_values.len() == prev.len()
+                                        && key_values.iter().zip(prev.iter()).all(|(a, b)| a == b)
+                                    {
+                                        errors.push(IntegrityCheckError::UniqueViolation {
+                                            index_name: index.name.clone(),
+                                        });
+
+                                        // Check if we've reached max errors
+                                        if errors.len() >= *max_errors {
+                                            let message = format_integrity_check_result(errors);
+                                            state.registers[*message_register] =
+                                                Register::Value(Value::build_text(message));
+                                            state.op_integrity_check_state =
+                                                OpIntegrityCheckState::Start;
+                                            state.pc += 1;
+                                            return Ok(InsnFunctionStepResult::Step);
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Store current key for next comparison (None if has NULL)
+                            *previous_key = if has_null { None } else { Some(key_values) };
+                        }
+
+                        *substate = UniqueValidationSubstate::Advancing;
+                    }
+                    UniqueValidationSubstate::Advancing => {
+                        let btree_cursor = cursor.as_mut().unwrap();
+                        return_if_io!(btree_cursor.next());
+                        if btree_cursor.has_record() {
+                            *substate = UniqueValidationSubstate::CheckingKey;
+                        } else {
+                            // Done with this index, move to next
+                            *cursor = None;
+                            *current_index_idx += 1;
+                            *substate = UniqueValidationSubstate::StartIndex;
+                        }
+                    }
+                }
+            }
+        }
+        OpIntegrityCheckState::ValidatingRowIndexConsistency {
+            errors,
+            current_table_idx,
+            table_cursor,
+            index_cursor,
+            row_number,
+            substate,
+        } => {
+            loop {
+                match substate {
+                    RowIndexValidationSubstate::StartTable => {
+                        // Skip tables without indexes
+                        while *current_table_idx < tables.len()
+                            && tables[*current_table_idx].indexes.is_empty()
+                        {
+                            *current_table_idx += 1;
+                        }
+
+                        if *current_table_idx >= tables.len() {
+                            // Done with all tables, finish
+                            let message = format_integrity_check_result(errors);
+                            state.registers[*message_register] =
+                                Register::Value(Value::build_text(message));
+                            state.op_integrity_check_state = OpIntegrityCheckState::Start;
+                            state.pc += 1;
+                            return Ok(InsnFunctionStepResult::Step);
+                        }
+
+                        // Create cursor for current table
+                        let table = &tables[*current_table_idx];
+                        *table_cursor = Some(Box::new(BTreeCursor::new(
+                            pager.clone(),
+                            table.root_page,
+                            0,
+                        )));
+                        *row_number = 0;
+                        *substate = RowIndexValidationSubstate::RewindingTable;
+                    }
+                    RowIndexValidationSubstate::RewindingTable => {
+                        let btree_cursor = table_cursor.as_mut().unwrap();
+                        return_if_io!(btree_cursor.rewind());
+                        if !btree_cursor.has_record() {
+                            // Table is empty, move to next table
+                            *table_cursor = None;
+                            *current_table_idx += 1;
+                            *substate = RowIndexValidationSubstate::StartTable;
+                            continue;
+                        }
+                        // Start checking the first row
+                        *row_number = 1;
+
+                        // Get record values and rowid - must exist since has_record() is true
+                        let rowid = return_if_io!(btree_cursor.rowid())
+                            .expect("rowid must exist when has_record() is true");
+                        let record = return_if_io!(btree_cursor.record())
+                            .expect("record must exist when has_record() is true");
+                        let row_values =
+                            record.get_values()?.iter().map(|v| v.to_owned()).collect();
+
+                        *substate = RowIndexValidationSubstate::CheckingRow {
+                            current_index_idx: 0,
+                            row_values,
+                            rowid,
+                        };
+                    }
+                    RowIndexValidationSubstate::CheckingRow {
+                        current_index_idx,
+                        row_values,
+                        rowid,
+                    } => {
+                        let table = &tables[*current_table_idx];
+
+                        if *current_index_idx >= table.indexes.len() {
+                            // Done with all indexes for this row, advance to next row
+                            *index_cursor = None;
+                            *substate = RowIndexValidationSubstate::Advancing;
+                            continue;
+                        }
+
+                        // Open cursor for this index if not already open
+                        let index = &table.indexes[*current_index_idx];
+                        if index_cursor.is_none() {
+                            let mut cursor = BTreeCursor::new(pager.clone(), index.root_page, 0);
+                            cursor.index_info = Some(index.index_info.clone());
+                            *index_cursor = Some(Box::new(cursor));
+                        }
+
+                        // Build the index key from table row values
+                        // Index key = (indexed_col_values..., rowid)
+                        let mut key_values: Vec<Value> =
+                            Vec::with_capacity(index.column_positions.len() + 1);
+                        for &pos in &index.column_positions {
+                            // For INTEGER PRIMARY KEY columns, the value in the record is NULL
+                            // but the actual value is the rowid
+                            let value = if table.rowid_alias_column_pos == Some(pos) {
+                                Value::Integer(*rowid)
+                            } else {
+                                // Handle columns added via ALTER TABLE ADD COLUMN: existing rows
+                                // don't have values for these columns, they're implicitly NULL.
+                                if pos >= row_values.len() {
+                                    Value::Null
+                                } else {
+                                    row_values[pos].clone()
+                                }
+                            };
+                            key_values.push(value);
+                        }
+                        key_values.push(Value::Integer(*rowid));
+
+                        // Transition to searching - the actual seek happens in SearchingIndex
+                        let idx = *current_index_idx;
+                        let vals = std::mem::take(row_values);
+                        let rid = *rowid;
+                        *substate = RowIndexValidationSubstate::SearchingIndex {
+                            current_index_idx: idx,
+                            row_values: vals,
+                            rowid: rid,
+                            key_values,
+                        };
+                        continue;
+                    }
+                    RowIndexValidationSubstate::SearchingIndex {
+                        current_index_idx,
+                        row_values,
+                        rowid,
+                        key_values,
+                    } => {
+                        // Build index record for seeking
+                        let index_record =
+                            ImmutableRecord::from_values(key_values.as_slice(), key_values.len());
+
+                        // Search for the key in the index using exact match
+                        let idx_cursor = index_cursor.as_mut().unwrap();
+                        let seek_key = SeekKey::IndexKey(&index_record);
+
+                        let result =
+                            return_if_io!(idx_cursor.seek(seek_key, SeekOp::GE { eq_only: true }));
+
+                        match result {
+                            SeekResult::Found => {
+                                // Found - move to next index
+                                *index_cursor = None;
+                                let idx = *current_index_idx + 1;
+                                let vals = std::mem::take(row_values);
+                                let rid = *rowid;
+                                *substate = RowIndexValidationSubstate::CheckingRow {
+                                    current_index_idx: idx,
+                                    row_values: vals,
+                                    rowid: rid,
+                                };
+                            }
+                            SeekResult::NotFound => {
+                                // Row not found in index
+                                let table = &tables[*current_table_idx];
+                                let index = &table.indexes[*current_index_idx];
+                                errors.push(IntegrityCheckError::RowMissingFromIndex {
+                                    row_number: *row_number,
+                                    index_name: index.name.clone(),
+                                });
+
+                                // Check if we've reached max errors
+                                if errors.len() >= *max_errors {
+                                    let message = format_integrity_check_result(errors);
+                                    state.registers[*message_register] =
+                                        Register::Value(Value::build_text(message));
+                                    state.op_integrity_check_state = OpIntegrityCheckState::Start;
+                                    state.pc += 1;
+                                    return Ok(InsnFunctionStepResult::Step);
+                                }
+
+                                // Move to next index
+                                *index_cursor = None;
+                                let idx = *current_index_idx + 1;
+                                let vals = std::mem::take(row_values);
+                                let rid = *rowid;
+                                *substate = RowIndexValidationSubstate::CheckingRow {
+                                    current_index_idx: idx,
+                                    row_values: vals,
+                                    rowid: rid,
+                                };
+                            }
+                            SeekResult::TryAdvance => {
+                                // Need to advance cursor to reach the leaf entry
+                                // Transition to new state BEFORE calling next() for re-entrancy safety
+                                let idx = *current_index_idx;
+                                let vals = std::mem::take(row_values);
+                                let rid = *rowid;
+                                *substate = RowIndexValidationSubstate::AdvancingAfterTryAdvance {
+                                    current_index_idx: idx,
+                                    row_values: vals,
+                                    rowid: rid,
+                                };
+                                continue;
+                            }
+                        }
+                    }
+                    RowIndexValidationSubstate::AdvancingAfterTryAdvance {
+                        current_index_idx,
+                        row_values,
+                        rowid,
+                    } => {
+                        let idx_cursor = index_cursor.as_mut().unwrap();
+                        return_if_io!(idx_cursor.next());
+
+                        let found = idx_cursor.has_record();
+
+                        if !found {
+                            // Row not found in index
+                            let table = &tables[*current_table_idx];
+                            let index = &table.indexes[*current_index_idx];
+                            errors.push(IntegrityCheckError::RowMissingFromIndex {
+                                row_number: *row_number,
+                                index_name: index.name.clone(),
+                            });
+
+                            // Check if we've reached max errors
+                            if errors.len() >= *max_errors {
+                                let message = format_integrity_check_result(errors);
+                                state.registers[*message_register] =
+                                    Register::Value(Value::build_text(message));
+                                state.op_integrity_check_state = OpIntegrityCheckState::Start;
+                                state.pc += 1;
+                                return Ok(InsnFunctionStepResult::Step);
+                            }
+                        }
+
+                        // Move to next index
+                        *index_cursor = None;
+                        let idx = *current_index_idx + 1;
+                        let vals = std::mem::take(row_values);
+                        let rid = *rowid;
+                        *substate = RowIndexValidationSubstate::CheckingRow {
+                            current_index_idx: idx,
+                            row_values: vals,
+                            rowid: rid,
+                        };
+                    }
+                    RowIndexValidationSubstate::Advancing => {
+                        let btree_cursor = table_cursor.as_mut().unwrap();
+                        return_if_io!(btree_cursor.next());
+                        if btree_cursor.has_record() {
+                            *row_number += 1;
+
+                            // Get record values and rowid - must exist since has_record() is true
+                            let rowid = return_if_io!(btree_cursor.rowid())
+                                .expect("rowid must exist when has_record() is true");
+                            let record = return_if_io!(btree_cursor.record())
+                                .expect("record must exist when has_record() is true");
+                            let row_values =
+                                record.get_values()?.iter().map(|v| v.to_owned()).collect();
+
+                            *substate = RowIndexValidationSubstate::CheckingRow {
+                                current_index_idx: 0,
+                                row_values,
+                                rowid,
+                            };
+                        } else {
+                            // Done with this table, move to next
+                            *table_cursor = None;
+                            *current_table_idx += 1;
+                            *substate = RowIndexValidationSubstate::StartTable;
+                        }
+                    }
+                }
             }
         }
     }
