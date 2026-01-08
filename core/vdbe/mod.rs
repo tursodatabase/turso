@@ -38,7 +38,7 @@ use crate::{
     return_if_io,
     schema::Trigger,
     state_machine::StateMachine,
-    storage::{pager::PagerCommitResult, sqlite3_ondisk::SmallVec},
+    storage::pager::PagerCommitResult,
     translate::{collate::CollationSeq, plan::TableReferences},
     types::{IOCompletions, IOResult},
     vdbe::{
@@ -52,6 +52,8 @@ use crate::{
     },
     ValueRef,
 };
+
+use smallvec::SmallVec;
 
 use crate::{
     storage::pager::Pager,
@@ -346,7 +348,7 @@ pub struct ProgramState {
     /// If an element is present, it means the coroutine with the given register number has ended.
     ended_coroutine: Vec<u32>,
     /// Indicate whether an [Insn::Once] instruction at a given program counter position has already been executed, well, once.
-    once: SmallVec<u32, 4>,
+    once: SmallVec<[u32; 4]>,
     regex_cache: RegexCache,
     pub execution_state: ProgramExecutionState,
     pub parameters: HashMap<NonZero<usize>, Value>,
@@ -423,7 +425,7 @@ impl ProgramState {
             last_compare: None,
             deferred_seeks: vec![None; max_cursors],
             ended_coroutine: vec![],
-            once: SmallVec::<u32, 4>::new(),
+            once: SmallVec::<[u32; 4]>::new(),
             regex_cache: RegexCache::new(),
             execution_state: ProgramExecutionState::Init,
             parameters: HashMap::new(),
