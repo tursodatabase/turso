@@ -2,6 +2,7 @@ mod common;
 mod functions;
 mod fuzz_transaction;
 mod index_method;
+mod integrity_check;
 mod pragma;
 mod query_processing;
 mod storage;
