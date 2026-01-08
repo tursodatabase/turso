@@ -1183,16 +1183,17 @@ fn test_fts_ngram_tokenizer(tmp_db: TempDatabase) {
 }
 
 /// Test fts_highlight function for text highlighting
+/// Signature: fts_highlight(text1, text2, ..., before_tag, after_tag, query)
 #[cfg(feature = "fts")]
 #[turso_macros::test]
 fn test_fts_highlight_basic(tmp_db: TempDatabase) {
     let _ = env_logger::try_init();
     let conn = tmp_db.connect_limbo();
 
-    // Test basic highlighting
+    // Test basic highlighting (single text column)
     let rows = limbo_exec_rows(
         &conn,
-        "SELECT fts_highlight('The quick brown fox', 'quick', '<b>', '</b>')",
+        "SELECT fts_highlight('The quick brown fox', '<b>', '</b>', 'quick')",
     );
     assert_eq!(rows.len(), 1);
     match &rows[0][0] {
@@ -1205,7 +1206,7 @@ fn test_fts_highlight_basic(tmp_db: TempDatabase) {
     // Test multiple matches
     let rows = limbo_exec_rows(
         &conn,
-        "SELECT fts_highlight('hello world hello', 'hello', '[', ']')",
+        "SELECT fts_highlight('hello world hello', '[', ']', 'hello')",
     );
     assert_eq!(rows.len(), 1);
     match &rows[0][0] {
@@ -1218,7 +1219,7 @@ fn test_fts_highlight_basic(tmp_db: TempDatabase) {
     // Test case-insensitive matching (tokenizer lowercases)
     let rows = limbo_exec_rows(
         &conn,
-        "SELECT fts_highlight('Hello World', 'hello', '<em>', '</em>')",
+        "SELECT fts_highlight('Hello World', '<em>', '</em>', 'hello')",
     );
     assert_eq!(rows.len(), 1);
     match &rows[0][0] {
@@ -1231,7 +1232,7 @@ fn test_fts_highlight_basic(tmp_db: TempDatabase) {
     // Test no matches - should return original text
     let rows = limbo_exec_rows(
         &conn,
-        "SELECT fts_highlight('The quick brown fox', 'zebra', '<b>', '</b>')",
+        "SELECT fts_highlight('The quick brown fox', '<b>', '</b>', 'zebra')",
     );
     assert_eq!(rows.len(), 1);
     match &rows[0][0] {
@@ -1244,12 +1245,25 @@ fn test_fts_highlight_basic(tmp_db: TempDatabase) {
     // Test empty query - should return original text
     let rows = limbo_exec_rows(
         &conn,
-        "SELECT fts_highlight('Some text here', '', '<b>', '</b>')",
+        "SELECT fts_highlight('Some text here', '<b>', '</b>', '')",
     );
     assert_eq!(rows.len(), 1);
     match &rows[0][0] {
         rusqlite::types::Value::Text(s) => {
             assert_eq!(s, "Some text here");
+        }
+        _ => panic!("Expected text result"),
+    }
+
+    // Test multiple text columns
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT fts_highlight('Hello world', 'Goodbye moon', '<b>', '</b>', 'world')",
+    );
+    assert_eq!(rows.len(), 1);
+    match &rows[0][0] {
+        rusqlite::types::Value::Text(s) => {
+            assert_eq!(s, "Hello <b>world</b> Goodbye moon");
         }
         _ => panic!("Expected text result"),
     }
@@ -1275,9 +1289,10 @@ fn test_fts_highlight_with_fts_query(tmp_db: TempDatabase) {
         .unwrap();
 
     // Query with fts_match and fts_highlight together
+    // New signature: fts_highlight(text..., before_tag, after_tag, query)
     let rows = limbo_exec_rows(
         &conn,
-        "SELECT id, fts_highlight(body, 'database', '<mark>', '</mark>') as highlighted FROM articles WHERE fts_match(title, body, 'database')",
+        "SELECT id, fts_highlight(body, '<mark>', '</mark>', 'database') as highlighted FROM articles WHERE fts_match(title, body, 'database')",
     );
 
     // Should match article 1 (has "database" in both title and body)
@@ -1303,18 +1318,40 @@ fn test_fts_highlight_null_handling(tmp_db: TempDatabase) {
     let _ = env_logger::try_init();
     let conn = tmp_db.connect_limbo();
 
-    // NULL text should return NULL
+    // NULL text should skip that column (not return NULL)
+    // New behavior: NULL text columns are skipped when concatenating
     let rows = limbo_exec_rows(
         &conn,
-        "SELECT fts_highlight(NULL, 'query', '<b>', '</b>')",
+        "SELECT fts_highlight(NULL, 'some text', '<b>', '</b>', 'text')",
     );
     assert_eq!(rows.len(), 1);
-    assert!(matches!(rows[0][0], rusqlite::types::Value::Null));
+    match &rows[0][0] {
+        rusqlite::types::Value::Text(s) => {
+            assert_eq!(s, "some <b>text</b>");
+        }
+        _ => panic!("Expected text result"),
+    }
 
     // NULL query should return NULL
     let rows = limbo_exec_rows(
         &conn,
-        "SELECT fts_highlight('text', NULL, '<b>', '</b>')",
+        "SELECT fts_highlight('text', '<b>', '</b>', NULL)",
+    );
+    assert_eq!(rows.len(), 1);
+    assert!(matches!(rows[0][0], rusqlite::types::Value::Null));
+
+    // NULL before_tag should return NULL
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT fts_highlight('text', NULL, '</b>', 'query')",
+    );
+    assert_eq!(rows.len(), 1);
+    assert!(matches!(rows[0][0], rusqlite::types::Value::Null));
+
+    // NULL after_tag should return NULL
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT fts_highlight('text', '<b>', NULL, 'query')",
     );
     assert_eq!(rows.len(), 1);
     assert!(matches!(rows[0][0], rusqlite::types::Value::Null));
