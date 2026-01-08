@@ -35,6 +35,7 @@ encryption = []
 checksum = []
 cli_only = []
 test_helper = []
+bench = []
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = { version = "0.7.5", optional = true }
@@ -131,6 +132,7 @@ env_logger = { workspace = true }
 test-log = { version = "0.2.17", features = ["trace"] }
 sorted-vec = "0.8.6"
 mimalloc = { workspace = true, default-features = false }
+divan.workspace = true
 
 
 
@@ -149,3 +151,8 @@ harness = false
 [[bench]]
 name = "tpc_h_benchmark"
 harness = false
+
+[[bench]]
+name = "sql_functions"
+harness = false
+required-features = ["bench"]

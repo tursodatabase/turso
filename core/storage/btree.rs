@@ -5691,7 +5691,7 @@ pub enum IntegrityCheckError {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(crate) enum PageCategory {
+pub enum PageCategory {
     Normal,
     Overflow,
     FreeListTrunk,

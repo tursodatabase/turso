@@ -98,6 +98,7 @@ similar-asserts = { version = "1.7.0" }
 bitmaps = { version = "3.2.1", default-features = false }
 console-subscriber = { version = "0.4.1" }
 either = { version = "1.15" }
+divan = "0.1.21"
 
 # Multi threading testing
 loom = { version = "0.7" }

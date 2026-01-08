@@ -55,6 +55,12 @@ pub struct RowSet {
     mode: RowSetMode,
 }
 
+impl Default for RowSet {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl RowSet {
     /// Creates a new empty RowSet.
     pub fn new() -> Self {
