@@ -66,4 +66,32 @@ if {![is_turso_mvcc]} {
         INSERT INTO t1 VALUES (1, 'a'), (2, 'b');
         PRAGMA quick_check;
     } {ok}
+
+    # Test integrity_check with INTEGER PRIMARY KEY NOT NULL (rowid alias)
+    # The INTEGER PRIMARY KEY column is an alias for the rowid and is stored
+    # separately from the record payload. The NOT NULL check should not report
+    # a false positive for this column.
+    do_execsql_test_on_specific_db ":memory:" integrity-check-ipk-not-null {
+        CREATE TABLE t4(
+            col1 INTEGER,
+            col2 INTEGER NOT NULL PRIMARY KEY,
+            col3 TEXT NOT NULL
+        );
+        INSERT INTO t4 VALUES (1, 100, 'a'), (2, 200, 'b'), (NULL, 300, 'c');
+        PRAGMA integrity_check;
+    } {ok}
+
+    # Test integrity_check with INTEGER PRIMARY KEY NOT NULL and multiple NOT NULL columns
+    do_execsql_test_on_specific_db ":memory:" integrity-check-ipk-not-null-multi {
+        CREATE TABLE t5(
+            a INTEGER,
+            b INTEGER NOT NULL PRIMARY KEY,
+            c NUMERIC NOT NULL,
+            d TEXT,
+            e TEXT NOT NULL
+        );
+        INSERT INTO t5 VALUES (1, 10, 100, 'x', 'y');
+        INSERT INTO t5 VALUES (NULL, 20, 200, NULL, 'z');
+        PRAGMA integrity_check;
+    } {ok}
 }
