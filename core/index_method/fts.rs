@@ -2978,6 +2978,13 @@ impl IndexMethodCursor for FtsCursor {
         let term = tantivy::Term::from_field_i64(self.rowid_field, rowid);
         writer.delete_term(term);
 
+        // Track delete as a pending operation so commit_and_flush() will run
+        // and invalidate the shared directory cache
+        self.pending_docs_count += 1;
+        if self.pending_docs_count >= BATCH_COMMIT_SIZE {
+            return self.commit_and_flush();
+        }
+
         Ok(IOResult::Done(()))
     }
 
