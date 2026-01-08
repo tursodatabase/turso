@@ -66,6 +66,7 @@ jobs:
           additional_permissions: |
             actions: read
           claude_args: |
+            --model claude-opus-4-5-20251101
             --max-turns 50
             --allowedTools "Bash(cargo:*),Bash(git:*),Bash(make:*),Bash(rustfmt:*),Bash(python:*),Edit,Write,Read,Glob,Grep,TodoWrite,Task,WebSearch"
             --disallowedTools "Bash(rm -rf *),Bash(sudo *),Bash(curl *),Bash(wget *)"
