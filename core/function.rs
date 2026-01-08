@@ -204,6 +204,9 @@ pub enum FtsFunc {
     /// fts_match(col1, col2, ..., query): returns true if document matches query
     /// Used in WHERE clause for filtering rows by FTS match
     FtsMatch,
+    /// fts_highlight(text, query, before_tag, after_tag): returns text with matching terms highlighted
+    /// Wraps matching query terms in the text with before_tag and after_tag markers
+    FtsHighlight,
 }
 
 #[cfg(feature = "fts")]
@@ -219,6 +222,7 @@ impl Display for FtsFunc {
         let str = match self {
             Self::FtsScore => "fts_score",
             Self::FtsMatch => "fts_match",
+            Self::FtsHighlight => "fts_highlight",
         };
         write!(f, "{str}")
     }
@@ -972,6 +976,8 @@ impl Func {
             "fts_score" => Ok(Self::Fts(FtsFunc::FtsScore)),
             #[cfg(feature = "fts")]
             "fts_match" => Ok(Self::Fts(FtsFunc::FtsMatch)),
+            #[cfg(feature = "fts")]
+            "fts_highlight" => Ok(Self::Fts(FtsFunc::FtsHighlight)),
             _ => crate::bail_parse_error!("no such function: {}", name),
         }
     }
