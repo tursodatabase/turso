@@ -67,20 +67,23 @@ fn translate_integrity_check_impl(
                 }
             }
 
-            // Collect NOT NULL columns for constraint validation
+            // Get INTEGER PRIMARY KEY column position if it exists (rowid alias).
+            // This column's value is stored as NULL in the record because the actual value is the rowid.
+            let rowid_alias_column_pos = btree_table.get_rowid_alias_column().map(|(pos, _)| pos);
+
+            // Collect NOT NULL columns for constraint validation.
+            // We must exclude the rowid alias column because it's stored as NULL in the record
+            // (the actual value is the rowid, not in the record payload).
             let not_null_columns: Vec<(usize, String)> = btree_table
                 .columns
                 .iter()
                 .enumerate()
-                .filter(|(_, col)| col.notnull())
+                .filter(|(idx, col)| col.notnull() && Some(*idx) != rowid_alias_column_pos)
                 .map(|(idx, col)| {
                     let name = col.name.clone().unwrap_or_else(|| format!("column{idx}"));
                     (idx, name)
                 })
                 .collect();
-
-            // Get INTEGER PRIMARY KEY column position if it exists (rowid alias)
-            let rowid_alias_column_pos = btree_table.get_rowid_alias_column().map(|(pos, _)| pos);
 
             tables.push(IntegrityCheckTable {
                 name: btree_table.name.clone(),
