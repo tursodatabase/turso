@@ -287,6 +287,11 @@ pub enum Stmt {
         // into expression
         into: Option<Box<Expr>>,
     },
+    /// `OPTIMIZE INDEX`: index name
+    Optimize {
+        /// index name (None means optimize all indexes)
+        idx_name: Option<QualifiedName>,
+    },
 }
 
 #[repr(transparent)]
