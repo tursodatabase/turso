@@ -123,7 +123,7 @@ enum FileCategory {
 }
 
 impl FileCategory {
-    const METADATA_FILES: [&'static str; 3] = ["meta.json", ".managed.json", ".lock"];
+    const METADATA_FILES: [&'static str; 3] = [TANTIVY_META_FILE, ".managed.json", ".lock"];
     /// Classify a file based on its path/extension.
     fn from_path(path: &Path) -> Self {
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
@@ -2534,44 +2534,43 @@ impl IndexMethodCursor for FtsCursor {
         Ok(IOResult::Done(()))
     }
 
-    fn destroy(&mut self, _conn: &Arc<Connection>) -> Result<IOResult<()>> {
-        // Commit any pending Tantivy writes first
-        if let Some(ref mut writer) = self.writer {
-            let _ = writer.commit();
-        }
+    fn destroy(&mut self, conn: &Arc<Connection>) -> Result<IOResult<()>> {
+        tracing::debug!(
+            "FTS destroy: dropping internal storage {}",
+            self.dir_table_name
+        );
 
-        // Flush pending changes to BTree
-        if let Some(ref dir) = self.cached_directory {
-            if dir.has_pending_changes() {
-                // Start flush state machine
-                let writes = dir.take_pending_writes();
-                let deletes = dir.take_pending_deletes();
-
-                if !writes.is_empty() {
-                    self.state = FtsState::FlushingWrites {
-                        writes,
-                        write_idx: 0,
-                        chunk_idx: 0,
-                    };
-                    return self.flush_writes_internal();
-                }
-                if !deletes.is_empty() {
-                    self.state = FtsState::FlushingDeletes {
-                        deletes,
-                        delete_idx: 0,
-                    };
-                    return self.flush_deletes_internal();
-                }
-            }
-        }
-
-        // Drop all components
+        // Drop all in-memory components first
         self.searcher = None;
         self.reader = None;
         self.writer = None;
         self.index = None;
         self.cached_directory = None;
+        self.hybrid_directory = None;
         self.fts_dir_cursor = None;
+
+        // Invalidate shared directory cache
+        {
+            let mut cache = self.shared_directory_cache.write();
+            *cache = None;
+        }
+
+        // Drop the internal storage table and index
+        // The backing_btree index will be dropped automatically when the table is dropped
+        // Use start_nested() before prepare() to bypass system table protection,
+        // then use prepare/run_ignore_rows pattern and disable subtransactions to avoid Busy error
+        let drop_table_ast = ast::Stmt::DropTable {
+            if_exists: true,
+            tbl_name: ast::QualifiedName::single(ast::Name::exact(self.dir_table_name.clone())),
+        };
+        conn.start_nested();
+        let mut stmt = conn.prepare_stmt(drop_table_ast)?;
+        // Disable subtransactions since we're already inside a transaction from the parent DROP INDEX
+        stmt.program.needs_stmt_subtransactions = false;
+        let result = stmt.run_ignore_rows();
+        conn.end_nested();
+        result?;
+
         self.state = FtsState::Init;
         Ok(IOResult::Done(()))
     }
