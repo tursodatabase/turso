@@ -1,40 +1,114 @@
 use crate::{
     schema::Schema,
-    vdbe::{builder::ProgramBuilder, insn::Insn},
+    types::IndexInfo,
+    vdbe::{
+        builder::ProgramBuilder,
+        insn::{Insn, IntegrityCheckIndex, IntegrityCheckTable},
+    },
 };
+use std::sync::Arc;
 
 /// Maximum number of errors to report with integrity check. If we exceed this number we will short
-/// circuit the procedure and return early to not waste time.
-const MAX_INTEGRITY_CHECK_ERRORS: usize = 10;
+/// circuit the procedure and return early to not waste time. SQLite uses 100 as the default.
+pub const MAX_INTEGRITY_CHECK_ERRORS: usize = 100;
 
+/// Translate PRAGMA integrity_check.
+/// This performs a full integrity check including index consistency validation.
 pub fn translate_integrity_check(
     schema: &Schema,
     program: &mut ProgramBuilder,
+    max_errors: usize,
+) -> crate::Result<()> {
+    translate_integrity_check_impl(schema, program, max_errors, false)
+}
+
+/// Translate PRAGMA quick_check.
+/// This performs a quick integrity check that skips expensive index consistency validation.
+pub fn translate_quick_check(
+    schema: &Schema,
+    program: &mut ProgramBuilder,
+    max_errors: usize,
+) -> crate::Result<()> {
+    translate_integrity_check_impl(schema, program, max_errors, true)
+}
+
+/// Internal implementation for both integrity_check and quick_check.
+fn translate_integrity_check_impl(
+    schema: &Schema,
+    program: &mut ProgramBuilder,
+    max_errors: usize,
+    quick: bool,
 ) -> crate::Result<()> {
     let mut root_pages = Vec::with_capacity(schema.tables.len() + schema.indexes.len());
-    // Collect root pages to run integrity check on
+    let mut tables = Vec::with_capacity(schema.tables.len());
+
+    // Collect root pages and table/index metadata for integrity check
     for table in schema.tables.values() {
-        if let crate::schema::Table::BTree(table) = table.as_ref() {
-            root_pages.push(table.root_page);
-            if let Some(indexes) = schema.indexes.get(table.name.as_str()) {
+        if let crate::schema::Table::BTree(btree_table) = table.as_ref() {
+            root_pages.push(btree_table.root_page);
+
+            let mut table_indexes = Vec::new();
+            if let Some(indexes) = schema.indexes.get(btree_table.name.as_str()) {
                 for index in indexes.iter() {
                     if index.root_page > 0 {
                         root_pages.push(index.root_page);
+                        table_indexes.push(IntegrityCheckIndex {
+                            name: index.name.clone(),
+                            root_page: index.root_page,
+                            unique: index.unique,
+                            column_positions: index
+                                .columns
+                                .iter()
+                                .map(|c| c.pos_in_table)
+                                .collect(),
+                            index_info: Arc::new(IndexInfo::new_from_index(index)),
+                        });
                     }
                 }
             }
+
+            // Collect NOT NULL columns for constraint validation
+            let not_null_columns: Vec<(usize, String)> = btree_table
+                .columns
+                .iter()
+                .enumerate()
+                .filter(|(_, col)| col.notnull())
+                .map(|(idx, col)| {
+                    let name = col.name.clone().unwrap_or_else(|| format!("column{idx}"));
+                    (idx, name)
+                })
+                .collect();
+
+            // Get INTEGER PRIMARY KEY column position if it exists (rowid alias)
+            let rowid_alias_column_pos = btree_table.get_rowid_alias_column().map(|(pos, _)| pos);
+
+            tables.push(IntegrityCheckTable {
+                name: btree_table.name.clone(),
+                root_page: btree_table.root_page,
+                indexes: table_indexes,
+                not_null_columns,
+                rowid_alias_column_pos,
+            });
         };
     }
+
     let message_register = program.alloc_register();
     program.emit_insn(Insn::IntegrityCk {
-        max_errors: MAX_INTEGRITY_CHECK_ERRORS,
+        max_errors,
         roots: root_pages,
         message_register,
+        quick,
+        tables,
     });
     program.emit_insn(Insn::ResultRow {
         start_reg: message_register,
         count: 1,
     });
-    program.add_pragma_result_column("integrity_check".into());
+    let column_name = if quick {
+        "quick_check"
+    } else {
+        "integrity_check"
+    };
+    program.add_pragma_result_column(column_name.into());
     Ok(())
 }
