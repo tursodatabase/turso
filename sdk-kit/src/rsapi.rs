@@ -563,6 +563,7 @@ impl TursoDatabase {
                     "autovacuum" => opts.with_autovacuum(true),
                     "triggers" => opts.with_triggers(true),
                     "encryption" => opts.with_encryption(true),
+                    "attach" => opts.with_attach(true),
                     _ => opts,
                 };
             }

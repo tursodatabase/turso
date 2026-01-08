@@ -84,10 +84,10 @@ test('attach', () => {
     const path1 = `test-${(Math.random() * 10000) | 0}.db`;
     const path2 = `test-${(Math.random() * 10000) | 0}.db`;
     try {
-        const db1 = new Database(path1);
+        const db1 = new Database(path1, { experimental: ["attach"] });
         db1.exec("CREATE TABLE t(x)");
         db1.exec("INSERT INTO t VALUES (1), (2), (3)");
-        const db2 = new Database(path2);
+        const db2 = new Database(path2, { experimental: ["attach"] });
         db2.exec("CREATE TABLE q(x)");
         db2.exec("INSERT INTO q VALUES (4), (5), (6)");
 
