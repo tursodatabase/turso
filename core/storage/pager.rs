@@ -4572,13 +4572,16 @@ mod ptrmap_tests {
         let buffer_pool = BufferPool::begin_init(&io, (sz * page_size) as usize);
         let page_cache = Arc::new(RwLock::new(PageCache::new(sz as usize)));
 
+        let wal_shared = WalFileShared::new_shared(
+            io.open_file("test.db-wal", OpenFlags::Create, false)
+                .unwrap(),
+        )
+        .unwrap();
+        let last_checksum_and_max_frame = wal_shared.read().last_checksum_and_max_frame();
         let wal: Arc<dyn Wal> = Arc::new(WalFile::new(
             io.clone(),
-            WalFileShared::new_shared(
-                io.open_file("test.db-wal", OpenFlags::Create, false)
-                    .unwrap(),
-            )
-            .unwrap(),
+            wal_shared,
+            last_checksum_and_max_frame,
             buffer_pool.clone(),
         ));
 

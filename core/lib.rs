@@ -682,9 +682,11 @@ impl Database {
         // MVCC currently requires a WAL open to function
         let shared_wal = WalFileShared::open_shared_if_exists(&self.io, &self.wal_path, flags)?;
 
+        let last_checksum_and_max_frame = shared_wal.read().last_checksum_and_max_frame();
         let wal = Arc::new(WalFile::new(
             self.io.clone(),
             Arc::clone(&shared_wal),
+            last_checksum_and_max_frame,
             pager.buffer_pool.clone(),
         ));
 
@@ -894,6 +896,7 @@ impl Database {
             Some(Arc::new(WalFile::new(
                 self.io.clone(),
                 self.shared_wal.clone(),
+                shared_wal.last_checksum_and_max_frame(),
                 buffer_pool.clone(),
             )))
         } else {

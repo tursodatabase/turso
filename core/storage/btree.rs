@@ -9097,7 +9097,13 @@ mod tests {
 
         let wal_file = io.open_file("test.wal", OpenFlags::Create, false).unwrap();
         let wal_shared = WalFileShared::new_shared(wal_file).unwrap();
-        let wal: Arc<dyn Wal> = Arc::new(WalFile::new(io.clone(), wal_shared, buffer_pool.clone()));
+        let last_checksum_and_max_frame = wal_shared.read().last_checksum_and_max_frame();
+        let wal: Arc<dyn Wal> = Arc::new(WalFile::new(
+            io.clone(),
+            wal_shared,
+            last_checksum_and_max_frame,
+            buffer_pool.clone(),
+        ));
 
         // For new empty databases, init_page_1 must be Some(page) so allocate_page1() can be called
         let init_page_1 = Arc::new(ArcSwapOption::new(Some(default_page1(None))));

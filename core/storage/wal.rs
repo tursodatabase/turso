@@ -1924,15 +1924,9 @@ impl WalFile {
     pub fn new(
         io: Arc<dyn IO>,
         shared: Arc<RwLock<WalFileShared>>,
+        (last_checksum, max_frame): ((u32, u32), u64),
         buffer_pool: Arc<BufferPool>,
     ) -> Self {
-        let (last_checksum, max_frame) = {
-            let shared_guard = shared.read();
-            (
-                shared_guard.last_checksum,
-                shared_guard.max_frame.load(Ordering::Acquire),
-            )
-        };
         let now = io.now();
         Self {
             io,
@@ -2693,6 +2687,9 @@ impl WalFile {
 }
 
 impl WalFileShared {
+    pub fn last_checksum_and_max_frame(&self) -> ((u32, u32), u64) {
+        (self.last_checksum, self.max_frame.load(Ordering::Acquire))
+    }
     pub fn open_shared_if_exists(
         io: &Arc<dyn IO>,
         path: &str,
