@@ -1556,3 +1556,651 @@ mod tests {
         cache.verify_cache_integrity();
     }
 }
+
+/// Shuttle tests for concurrent access patterns on PageCache.
+/// These tests verify that PageCache behaves correctly when accessed
+/// through Arc<RwLock<PageCache>> by multiple threads, similar to how
+/// it's used by the Pager.
+#[cfg(all(test, shuttle))]
+mod shuttle_tests {
+    use super::*;
+    use crate::storage::pager::Page;
+    use crate::sync::{Arc, RwLock};
+    use crate::thread;
+
+    fn page_with_content(page_id: usize) -> PageRef {
+        let page = Arc::new(Page::new(page_id as i64));
+        {
+            let inner = page.get();
+            inner.buffer = Some(Arc::new(crate::Buffer::new_temporary(4096)));
+        }
+        page.set_loaded();
+        page
+    }
+
+    /// Asserts that an insert result is one of the expected outcomes for clean pages:
+    /// - Ok(()) on success
+    /// - CacheError::Full when cache is at capacity and cannot evict
+    /// - CacheError::KeyExists when inserting same Arc with existing key
+    fn assert_insert_result(result: Result<(), CacheError>, key: PageCacheKey) {
+        match result {
+            Ok(()) => {}
+            Err(CacheError::Full) => {}
+            Err(CacheError::KeyExists) => {}
+            Err(e) => panic!(
+                "Unexpected insert error for key {:?}: {:?}. Expected Ok, Full, or KeyExists",
+                key, e
+            ),
+        }
+    }
+
+    /// Asserts that a delete result is one of the expected outcomes for clean pages:
+    /// - Ok(()) on success (including when key doesn't exist)
+    /// Delete of clean, unlocked, unpinned pages should always succeed.
+    fn assert_delete_result(result: Result<(), CacheError>, key: PageCacheKey) {
+        match result {
+            Ok(()) => {}
+            Err(e) => panic!(
+                "Unexpected delete error for key {:?}: {:?}. Clean pages should always delete successfully",
+                key, e
+            ),
+        }
+    }
+
+    /// Asserts that a get result is valid:
+    /// - Ok(Some(page)) when page exists
+    /// - Ok(None) when page doesn't exist or was evicted
+    fn assert_get_result(result: crate::Result<Option<PageRef>>, key: PageCacheKey) {
+        match result {
+            Ok(Some(_)) => {}
+            Ok(None) => {}
+            Err(e) => panic!(
+                "Unexpected get error for key {:?}: {:?}. Get should not fail",
+                key, e
+            ),
+        }
+    }
+
+    /// Asserts that make_room_for returns expected results:
+    /// - Ok(()) on success
+    /// - CacheError::Full when cannot evict enough pages
+    fn assert_make_room_result(result: Result<(), CacheError>) {
+        match result {
+            Ok(()) => {}
+            Err(CacheError::Full) => {}
+            Err(e) => panic!(
+                "Unexpected make_room_for error: {:?}. Expected Ok or Full",
+                e
+            ),
+        }
+    }
+
+    /// Concurrent insert operations from multiple threads.
+    /// Verifies that the SIEVE eviction algorithm and clock hand remain
+    /// valid when multiple threads race to insert pages.
+    #[test]
+    fn shuttle_concurrent_inserts() {
+        shuttle::check_random(
+            || {
+                const CACHE_SIZE: usize = 10;
+                const NTHREADS: usize = 4;
+                const PAGES_PER_THREAD: usize = 5;
+
+                let cache = Arc::new(RwLock::new(PageCache::new_with_spill(CACHE_SIZE, true)));
+
+                thread::scope(|s| {
+                    for t in 0..NTHREADS {
+                        let cache = cache.clone();
+                        s.spawn(move || {
+                            for i in 0..PAGES_PER_THREAD {
+                                // Use unique page IDs per thread, starting at 2
+                                let page_id = 2 + t * PAGES_PER_THREAD + i;
+                                let key = PageCacheKey::new(page_id);
+                                let page = page_with_content(page_id);
+
+                                let mut guard = cache.write();
+                                let result = guard.insert(key, page);
+                                // Insert may fail with Full (cache at capacity) but not other errors
+                                assert_insert_result(result, key);
+                            }
+                        });
+                    }
+                });
+
+                // Verify final state: cache should not exceed capacity
+                let guard = cache.read();
+                assert!(
+                    guard.len() <= CACHE_SIZE,
+                    "Cache exceeded capacity: {} > {}",
+                    guard.len(),
+                    CACHE_SIZE
+                );
+            },
+            1000,
+        );
+    }
+
+    /// Concurrent get and insert operations.
+    /// Tests the common pattern where multiple threads read pages while
+    /// others are inserting new pages that may trigger eviction.
+    #[test]
+    fn shuttle_concurrent_get_and_insert() {
+        shuttle::check_random(
+            || {
+                const CACHE_SIZE: usize = 5;
+
+                let cache = Arc::new(RwLock::new(PageCache::new_with_spill(CACHE_SIZE, true)));
+
+                // Pre-populate the cache with some pages
+                {
+                    let mut guard = cache.write();
+                    for i in 2..=4 {
+                        let key = PageCacheKey::new(i);
+                        let page = page_with_content(i);
+                        assert_insert_result(guard.insert(key, page), key);
+                    }
+                }
+
+                thread::scope(|s| {
+                    // Reader threads: repeatedly read existing pages
+                    for _ in 0..2 {
+                        let cache = cache.clone();
+                        s.spawn(move || {
+                            for page_id in 2..=4 {
+                                let key = PageCacheKey::new(page_id);
+                                let mut guard = cache.write();
+                                // get() bumps ref_bit, affecting eviction order
+                                // Page may or may not exist due to concurrent eviction
+                                assert_get_result(guard.get(&key), key);
+                            }
+                        });
+                    }
+
+                    // Writer threads: insert new pages that may trigger eviction
+                    for t in 0..2 {
+                        let cache = cache.clone();
+                        s.spawn(move || {
+                            for i in 0..3 {
+                                let page_id = 10 + t * 10 + i;
+                                let key = PageCacheKey::new(page_id);
+                                let page = page_with_content(page_id);
+
+                                let mut guard = cache.write();
+                                assert_insert_result(guard.insert(key, page), key);
+                            }
+                        });
+                    }
+                });
+
+                let guard = cache.read();
+                assert!(guard.len() <= CACHE_SIZE);
+            },
+            1000,
+        );
+    }
+
+    /// Concurrent delete operations.
+    /// Verifies clock hand validity when multiple threads delete pages
+    /// that may be pointed to by the clock hand.
+    #[test]
+    fn shuttle_concurrent_deletes() {
+        shuttle::check_random(
+            || {
+                const CACHE_SIZE: usize = 10;
+
+                let cache = Arc::new(RwLock::new(PageCache::new_with_spill(CACHE_SIZE, true)));
+
+                // Pre-populate the cache
+                {
+                    let mut guard = cache.write();
+                    for i in 2..=9 {
+                        let key = PageCacheKey::new(i);
+                        let page = page_with_content(i);
+                        assert_insert_result(guard.insert(key, page), key);
+                    }
+                }
+
+                let keys: Vec<PageCacheKey> = (2..=9).map(PageCacheKey::new).collect();
+
+                thread::scope(|s| {
+                    // Multiple threads try to delete different pages
+                    for chunk in keys.chunks(2) {
+                        let cache = cache.clone();
+                        let chunk = chunk.to_vec();
+                        s.spawn(move || {
+                            for key in chunk {
+                                let mut guard = cache.write();
+                                // Delete of clean pages should always succeed
+                                assert_delete_result(guard.delete(key), key);
+                            }
+                        });
+                    }
+                });
+
+                let guard = cache.read();
+                // All deletable pages should be gone
+                for i in 2..=9 {
+                    assert!(!guard.contains_key(&PageCacheKey::new(i)));
+                }
+                assert_eq!(guard.len(), 0);
+            },
+            1000,
+        );
+    }
+
+    /// Concurrent insert and delete operations.
+    /// Tests the scenario where threads are simultaneously inserting
+    /// and deleting pages, stressing the intrusive list management.
+    #[test]
+    fn shuttle_concurrent_insert_and_delete() {
+        shuttle::check_random(
+            || {
+                const CACHE_SIZE: usize = 8;
+
+                let cache = Arc::new(RwLock::new(PageCache::new_with_spill(CACHE_SIZE, true)));
+
+                thread::scope(|s| {
+                    // Thread 1: Insert pages
+                    let cache1 = cache.clone();
+                    s.spawn(move || {
+                        for i in 2..=6 {
+                            let key = PageCacheKey::new(i);
+                            let page = page_with_content(i);
+                            let mut guard = cache1.write();
+                            assert_insert_result(guard.insert(key, page), key);
+                        }
+                    });
+
+                    // Thread 2: Try to delete pages (some may not exist yet)
+                    let cache2 = cache.clone();
+                    s.spawn(move || {
+                        for i in 2..=4 {
+                            let key = PageCacheKey::new(i);
+                            let mut guard = cache2.write();
+                            // Delete succeeds even if key doesn't exist
+                            assert_delete_result(guard.delete(key), key);
+                        }
+                    });
+
+                    // Thread 3: Insert more pages
+                    let cache3 = cache.clone();
+                    s.spawn(move || {
+                        for i in 10..=14 {
+                            let key = PageCacheKey::new(i);
+                            let page = page_with_content(i);
+                            let mut guard = cache3.write();
+                            assert_insert_result(guard.insert(key, page), key);
+                        }
+                    });
+                });
+
+                let guard = cache.read();
+                assert!(guard.len() <= CACHE_SIZE);
+            },
+            1000,
+        );
+    }
+
+    /// Tests the read-then-write pattern used by Pager.
+    /// This is a critical pattern where a thread reads cache state,
+    /// releases the lock, then acquires write lock to modify.
+    /// Other threads may modify the cache in between.
+    #[test]
+    fn shuttle_read_then_write_pattern() {
+        shuttle::check_random(
+            || {
+                const CACHE_SIZE: usize = 5;
+
+                let cache = Arc::new(RwLock::new(PageCache::new_with_spill(CACHE_SIZE, true)));
+
+                // Pre-populate near capacity
+                {
+                    let mut guard = cache.write();
+                    for i in 2..=5 {
+                        let key = PageCacheKey::new(i);
+                        let page = page_with_content(i);
+                        assert_insert_result(guard.insert(key, page), key);
+                    }
+                }
+
+                thread::scope(|s| {
+                    // Threads that do read-then-write (check if needs_spill, then insert)
+                    for t in 0..3 {
+                        let cache = cache.clone();
+                        s.spawn(move || {
+                            // Read phase: check if spill is needed
+                            let needs_spill = {
+                                let guard = cache.read();
+                                guard.needs_spill()
+                            };
+                            // Lock released - other threads may modify cache here
+
+                            // Write phase: insert page
+                            let page_id = 20 + t;
+                            let key = PageCacheKey::new(page_id);
+                            let page = page_with_content(page_id);
+
+                            let mut guard = cache.write();
+                            if needs_spill {
+                                // In real code, we'd spill dirty pages first
+                                // For this test, just try to make room
+                                assert_make_room_result(guard.make_room_for(1));
+                            }
+                            assert_insert_result(guard.insert(key, page), key);
+                        });
+                    }
+                });
+
+                let guard = cache.read();
+                assert!(guard.len() <= CACHE_SIZE);
+            },
+            1000,
+        );
+    }
+
+    /// Tests concurrent resize operations.
+    /// Resize may need to evict pages while other threads are inserting.
+    #[test]
+    fn shuttle_concurrent_resize() {
+        shuttle::check_random(
+            || {
+                let cache = Arc::new(RwLock::new(PageCache::new_with_spill(10, true)));
+
+                // Pre-populate
+                {
+                    let mut guard = cache.write();
+                    for i in 2..=8 {
+                        let key = PageCacheKey::new(i);
+                        let page = page_with_content(i);
+                        assert_insert_result(guard.insert(key, page), key);
+                    }
+                }
+
+                thread::scope(|s| {
+                    // Thread 1: resize smaller
+                    let cache1 = cache.clone();
+                    s.spawn(move || {
+                        let mut guard = cache1.write();
+                        // Resize returns Done or PendingEvictions
+                        let result = guard.resize(5);
+                        assert!(
+                            matches!(
+                                result,
+                                CacheResizeResult::Done | CacheResizeResult::PendingEvictions
+                            ),
+                            "Unexpected resize result: {:?}",
+                            result
+                        );
+                    });
+
+                    // Thread 2: try to insert pages
+                    let cache2 = cache.clone();
+                    s.spawn(move || {
+                        for i in 20..=22 {
+                            let key = PageCacheKey::new(i);
+                            let page = page_with_content(i);
+                            let mut guard = cache2.write();
+                            assert_insert_result(guard.insert(key, page), key);
+                        }
+                    });
+
+                    // Thread 3: resize larger then smaller again
+                    let cache3 = cache.clone();
+                    s.spawn(move || {
+                        {
+                            let mut guard = cache3.write();
+                            let result = guard.resize(15);
+                            assert!(matches!(
+                                result,
+                                CacheResizeResult::Done | CacheResizeResult::PendingEvictions
+                            ));
+                        }
+                        {
+                            let mut guard = cache3.write();
+                            let result = guard.resize(4);
+                            assert!(matches!(
+                                result,
+                                CacheResizeResult::Done | CacheResizeResult::PendingEvictions
+                            ));
+                        }
+                    });
+                });
+
+                let guard = cache.read();
+                // Final capacity depends on which resize ran last
+                assert!(guard.len() <= guard.capacity());
+            },
+            1000,
+        );
+    }
+
+    /// Tests peek operations under concurrent modification.
+    /// peek with touch=true affects eviction order via ref_bit.
+    #[test]
+    fn shuttle_concurrent_peek() {
+        shuttle::check_random(
+            || {
+                const CACHE_SIZE: usize = 5;
+
+                let cache = Arc::new(RwLock::new(PageCache::new_with_spill(CACHE_SIZE, true)));
+
+                // Pre-populate
+                {
+                    let mut guard = cache.write();
+                    for i in 2..=5 {
+                        let key = PageCacheKey::new(i);
+                        let page = page_with_content(i);
+                        assert_insert_result(guard.insert(key, page), key);
+                    }
+                }
+
+                thread::scope(|s| {
+                    // Peekers that touch (bump ref_bit)
+                    for _ in 0..2 {
+                        let cache = cache.clone();
+                        s.spawn(move || {
+                            for i in 2..=5 {
+                                let key = PageCacheKey::new(i);
+                                let mut guard = cache.write();
+                                // peek returns Some or None, never errors
+                                // Page may have been evicted by concurrent insert
+                                let _page = guard.peek(&key, true);
+                            }
+                        });
+                    }
+
+                    // Inserters that trigger eviction
+                    for t in 0..2 {
+                        let cache = cache.clone();
+                        s.spawn(move || {
+                            for i in 0..3 {
+                                let page_id = 30 + t * 10 + i;
+                                let key = PageCacheKey::new(page_id);
+                                let page = page_with_content(page_id);
+                                let mut guard = cache.write();
+                                assert_insert_result(guard.insert(key, page), key);
+                            }
+                        });
+                    }
+                });
+
+                let guard = cache.read();
+                assert!(guard.len() <= CACHE_SIZE);
+            },
+            1000,
+        );
+    }
+
+    /// Tests clear operation under concurrent access.
+    #[test]
+    fn shuttle_concurrent_clear() {
+        shuttle::check_random(
+            || {
+                const CACHE_SIZE: usize = 10;
+
+                let cache = Arc::new(RwLock::new(PageCache::new_with_spill(CACHE_SIZE, true)));
+
+                thread::scope(|s| {
+                    // Thread 1: populate cache
+                    let cache1 = cache.clone();
+                    s.spawn(move || {
+                        for i in 2..=8 {
+                            let key = PageCacheKey::new(i);
+                            let page = page_with_content(i);
+                            let mut guard = cache1.write();
+                            assert_insert_result(guard.insert(key, page), key);
+                        }
+                    });
+
+                    // Thread 2: clear the cache
+                    let cache2 = cache.clone();
+                    s.spawn(move || {
+                        let mut guard = cache2.write();
+                        // Clear should succeed since pages are clean (not dirty)
+                        // clear(false) fails if any page is dirty
+                        let result = guard.clear(false);
+                        // Clear may fail if pages were marked dirty by another thread
+                        // In this test all pages are clean, so it should succeed
+                        assert!(
+                            result.is_ok(),
+                            "Clear of clean pages should succeed: {:?}",
+                            result
+                        );
+                    });
+
+                    // Thread 3: more inserts after potential clear
+                    let cache3 = cache.clone();
+                    s.spawn(move || {
+                        for i in 20..=25 {
+                            let key = PageCacheKey::new(i);
+                            let page = page_with_content(i);
+                            let mut guard = cache3.write();
+                            assert_insert_result(guard.insert(key, page), key);
+                        }
+                    });
+                });
+
+                let guard = cache.read();
+                // Cache state depends on execution order
+                assert!(guard.len() <= CACHE_SIZE);
+            },
+            1000,
+        );
+    }
+
+    /// Tests truncate operation under concurrent access.
+    #[test]
+    fn shuttle_concurrent_truncate() {
+        shuttle::check_random(
+            || {
+                const CACHE_SIZE: usize = 20;
+
+                let cache = Arc::new(RwLock::new(PageCache::new_with_spill(CACHE_SIZE, true)));
+
+                // Pre-populate with pages spanning a range
+                {
+                    let mut guard = cache.write();
+                    for i in 2..=15 {
+                        let key = PageCacheKey::new(i);
+                        let page = page_with_content(i);
+                        assert_insert_result(guard.insert(key, page), key);
+                    }
+                }
+
+                thread::scope(|s| {
+                    // Thread 1: truncate to page 8
+                    let cache1 = cache.clone();
+                    s.spawn(move || {
+                        let mut guard = cache1.write();
+                        // Truncate should succeed for clean pages
+                        let result = guard.truncate(8);
+                        assert!(
+                            result.is_ok(),
+                            "Truncate of clean pages should succeed: {:?}",
+                            result
+                        );
+                    });
+
+                    // Thread 2: insert pages NOT in the original set (avoid key collision)
+                    let cache2 = cache.clone();
+                    s.spawn(move || {
+                        for i in 30..=34 {
+                            let key = PageCacheKey::new(i);
+                            let page = page_with_content(i);
+                            let mut guard = cache2.write();
+                            assert_insert_result(guard.insert(key, page), key);
+                        }
+                    });
+
+                    // Thread 3: read pages that may or may not exist
+                    let cache3 = cache.clone();
+                    s.spawn(move || {
+                        for i in 5..=12 {
+                            let key = PageCacheKey::new(i);
+                            let mut guard = cache3.write();
+                            // Pages may have been truncated or evicted
+                            assert_get_result(guard.get(&key), key);
+                        }
+                    });
+                });
+
+                let guard = cache.read();
+                assert!(guard.len() <= CACHE_SIZE);
+            },
+            1000,
+        );
+    }
+
+    /// Heavy concurrent load test with many threads doing mixed operations.
+    #[test]
+    fn shuttle_heavy_concurrent_load() {
+        shuttle::check_random(
+            || {
+                const CACHE_SIZE: usize = 8;
+                const NTHREADS: usize = 4;
+
+                let cache = Arc::new(RwLock::new(PageCache::new_with_spill(CACHE_SIZE, true)));
+                let counter = Arc::new(crate::sync::atomic::AtomicUsize::new(100));
+
+                thread::scope(|s| {
+                    for _ in 0..NTHREADS {
+                        let cache = cache.clone();
+                        let counter = counter.clone();
+                        s.spawn(move || {
+                            // Each thread does a mix of operations
+                            for _ in 0..5 {
+                                let page_id =
+                                    counter.fetch_add(1, crate::sync::atomic::Ordering::SeqCst);
+                                let key = PageCacheKey::new(page_id);
+
+                                // Insert - may fail with Full if cache is at capacity
+                                {
+                                    let page = page_with_content(page_id);
+                                    let mut guard = cache.write();
+                                    assert_insert_result(guard.insert(key, page), key);
+                                }
+
+                                // Read back - page may have been evicted already
+                                {
+                                    let mut guard = cache.write();
+                                    assert_get_result(guard.get(&key), key);
+                                }
+
+                                // Maybe delete (every other iteration)
+                                if page_id % 2 == 0 {
+                                    let mut guard = cache.write();
+                                    // Delete of clean pages should always succeed
+                                    assert_delete_result(guard.delete(key), key);
+                                }
+                            }
+                        });
+                    }
+                });
+
+                let guard = cache.read();
+                assert!(guard.len() <= CACHE_SIZE);
+            },
+            1000,
+        );
+    }
+}
