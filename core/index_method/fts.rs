@@ -1763,8 +1763,8 @@ enum FtsState {
     CreatingIndex,
     /// Ready for operations
     Ready,
-    /// Deleting old chunks for a path before writing new ones
-    DeletingOldChunks {
+    /// Seeking to first chunk of a path before deleting old chunks
+    SeekingOldChunks {
         writes: Vec<(PathBuf, Vec<u8>)>,
         write_idx: usize,
         path_str: String,
@@ -1775,19 +1775,19 @@ enum FtsState {
         write_idx: usize,
         path_str: String,
     },
-    /// Deleting a single chunk during old chunk cleanup - waiting for delete to complete
-    DeletingOldChunk {
+    /// Checking if current record's path matches (to determine if it should be deleted)
+    CheckingChunkPath {
         writes: Vec<(PathBuf, Vec<u8>)>,
         write_idx: usize,
         path_str: String,
     },
-    /// Performing the actual delete operation (cursor positioned, just waiting for IO)
-    PerformingDelete {
+    /// Performing the actual delete of a chunk
+    DeletingChunk {
         writes: Vec<(PathBuf, Vec<u8>)>,
         write_idx: usize,
         path_str: String,
     },
-    /// Advancing cursor after delete to get the next record
+    /// Advancing cursor after delete to check next record
     AdvancingAfterDelete {
         writes: Vec<(PathBuf, Vec<u8>)>,
         write_idx: usize,
@@ -2035,7 +2035,7 @@ impl FtsCursor {
                     // If starting a new file (chunk_idx == 0), first delete old chunks
                     if *chunk_idx == 0 {
                         let path_str = writes[*write_idx].0.to_string_lossy().to_string();
-                        self.state = FtsState::DeletingOldChunks {
+                        self.state = FtsState::SeekingOldChunks {
                             writes: std::mem::take(writes),
                             write_idx: *write_idx,
                             path_str,
@@ -2068,7 +2068,7 @@ impl FtsCursor {
                         chunk_idx: actual_chunk_idx,
                     };
                 }
-                FtsState::DeletingOldChunks {
+                FtsState::SeekingOldChunks {
                     writes,
                     write_idx,
                     path_str,
@@ -2112,7 +2112,7 @@ impl FtsCursor {
                         }
                         SeekResult::Found => {
                             // Found a record at or after our seek key, check it
-                            self.state = FtsState::DeletingOldChunk {
+                            self.state = FtsState::CheckingChunkPath {
                                 writes: std::mem::take(writes),
                                 write_idx: *write_idx,
                                 path_str: std::mem::take(path_str),
@@ -2134,7 +2134,7 @@ impl FtsCursor {
 
                     if has_next {
                         // Now positioned on a record, check if it matches our path
-                        self.state = FtsState::DeletingOldChunk {
+                        self.state = FtsState::CheckingChunkPath {
                             writes: std::mem::take(writes),
                             write_idx: *write_idx,
                             path_str: std::mem::take(path_str),
@@ -2148,7 +2148,7 @@ impl FtsCursor {
                         };
                     }
                 }
-                FtsState::DeletingOldChunk {
+                FtsState::CheckingChunkPath {
                     writes,
                     write_idx,
                     path_str,
@@ -2177,8 +2177,8 @@ impl FtsCursor {
                     });
 
                     if current_path.as_deref() == Some(path_str.as_str()) {
-                        // Transition to PerformingDelete to actually do the delete
-                        self.state = FtsState::PerformingDelete {
+                        // Transition to DeletingChunk to actually do the delete
+                        self.state = FtsState::DeletingChunk {
                             writes: std::mem::take(writes),
                             write_idx: *write_idx,
                             path_str: std::mem::take(path_str),
@@ -2193,7 +2193,7 @@ impl FtsCursor {
                         };
                     }
                 }
-                FtsState::PerformingDelete {
+                FtsState::DeletingChunk {
                     writes,
                     write_idx,
                     path_str,
@@ -2226,8 +2226,8 @@ impl FtsCursor {
                     let has_next = cursor.has_record();
 
                     if has_next {
-                        // Check the next record in DeletingOldChunk state
-                        self.state = FtsState::DeletingOldChunk {
+                        // Check the next record in CheckingChunkPath state
+                        self.state = FtsState::CheckingChunkPath {
                             writes: std::mem::take(writes),
                             write_idx: *write_idx,
                             path_str: std::mem::take(path_str),
@@ -2442,10 +2442,10 @@ impl FtsCursor {
         // Handle flush state machine if already in progress
         match &self.state {
             FtsState::FlushingWrites { .. }
-            | FtsState::DeletingOldChunks { .. }
+            | FtsState::SeekingOldChunks { .. }
             | FtsState::AdvancingAfterSeek { .. }
-            | FtsState::DeletingOldChunk { .. }
-            | FtsState::PerformingDelete { .. }
+            | FtsState::CheckingChunkPath { .. }
+            | FtsState::DeletingChunk { .. }
             | FtsState::AdvancingAfterDelete { .. }
             | FtsState::SeekingWrite { .. }
             | FtsState::InsertingWrite { .. } => {
@@ -2548,10 +2548,10 @@ impl Drop for FtsCursor {
         let is_flushing = matches!(
             &self.state,
             FtsState::FlushingWrites { .. }
-                | FtsState::DeletingOldChunks { .. }
+                | FtsState::SeekingOldChunks { .. }
                 | FtsState::AdvancingAfterSeek { .. }
-                | FtsState::DeletingOldChunk { .. }
-                | FtsState::PerformingDelete { .. }
+                | FtsState::CheckingChunkPath { .. }
+                | FtsState::DeletingChunk { .. }
                 | FtsState::AdvancingAfterDelete { .. }
                 | FtsState::SeekingWrite { .. }
                 | FtsState::InsertingWrite { .. }
@@ -3016,10 +3016,10 @@ impl IndexMethodCursor for FtsCursor {
         loop {
             match &self.state {
                 FtsState::FlushingWrites { .. }
-                | FtsState::DeletingOldChunks { .. }
+                | FtsState::SeekingOldChunks { .. }
                 | FtsState::AdvancingAfterSeek { .. }
-                | FtsState::DeletingOldChunk { .. }
-                | FtsState::PerformingDelete { .. }
+                | FtsState::CheckingChunkPath { .. }
+                | FtsState::DeletingChunk { .. }
                 | FtsState::AdvancingAfterDelete { .. }
                 | FtsState::SeekingWrite { .. }
                 | FtsState::InsertingWrite { .. } => {
@@ -3280,10 +3280,10 @@ impl IndexMethodCursor for FtsCursor {
         // to continue the flush after IO completes
         match &self.state {
             FtsState::FlushingWrites { .. }
-            | FtsState::DeletingOldChunks { .. }
+            | FtsState::SeekingOldChunks { .. }
             | FtsState::AdvancingAfterSeek { .. }
-            | FtsState::DeletingOldChunk { .. }
-            | FtsState::PerformingDelete { .. }
+            | FtsState::CheckingChunkPath { .. }
+            | FtsState::DeletingChunk { .. }
             | FtsState::AdvancingAfterDelete { .. }
             | FtsState::SeekingWrite { .. }
             | FtsState::InsertingWrite { .. } => {
@@ -3377,9 +3377,9 @@ impl IndexMethodCursor for FtsCursor {
 
         // Reload reader to see merged segments
         if let Some(ref reader) = self.reader {
-            reader
-                .reload()
-                .map_err(|e| LimboError::InternalError(format!("FTS optimize reader reload: {e}")))?;
+            reader.reload().map_err(|e| {
+                LimboError::InternalError(format!("FTS optimize reader reload: {e}"))
+            })?;
             self.searcher = Some(reader.searcher());
         }
 
