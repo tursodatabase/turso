@@ -1,4 +1,4 @@
-use parking_lot::RwLock;
+use crate::sync::RwLock;
 use turso_parser::ast::{self, Expr, Literal, Name, QualifiedName, RefAct};
 
 use super::{translate_inner, ProgramBuilder, ProgramBuilderOpts};

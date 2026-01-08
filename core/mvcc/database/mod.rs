@@ -11,6 +11,10 @@ use crate::storage::btree::CursorTrait;
 use crate::storage::btree::CursorValidState;
 use crate::storage::sqlite3_ondisk::DatabaseHeader;
 use crate::storage::wal::TursoRwLock;
+use crate::sync::atomic::{AtomicBool, AtomicI64};
+use crate::sync::atomic::{AtomicU64, Ordering};
+use crate::sync::Arc;
+use crate::sync::{Mutex, RwLock};
 use crate::translate::emitter::TransactionMode;
 use crate::translate::plan::IterationDirection;
 use crate::turso_assert;
@@ -29,14 +33,10 @@ use crate::ValueRef;
 use crate::{Connection, Pager};
 use crossbeam_skiplist::map::Entry;
 use crossbeam_skiplist::{SkipMap, SkipSet};
-use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
 use std::fmt::Debug;
 use std::marker::PhantomData;
 use std::ops::Bound;
-use std::sync::atomic::{AtomicBool, AtomicI64};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
 use tracing::instrument;
 use tracing::Level;
 
@@ -1833,11 +1833,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     fn find_last_visible_version(
         &self,
         tx: &Transaction,
-        row: &crossbeam_skiplist::map::Entry<
-            '_,
-            RowID,
-            parking_lot::lock_api::RwLock<parking_lot::RawRwLock, Vec<RowVersion>>,
-        >,
+        row: &crossbeam_skiplist::map::Entry<'_, RowID, RwLock<Vec<RowVersion>>>,
     ) -> Option<RowID> {
         row.value()
             .read()
@@ -1850,11 +1846,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     fn find_last_visible_index_version(
         &self,
         tx: &Transaction,
-        row: crossbeam_skiplist::map::Entry<
-            '_,
-            SortableIndexKey,
-            parking_lot::lock_api::RwLock<parking_lot::RawRwLock, Vec<RowVersion>>,
-        >,
+        row: crossbeam_skiplist::map::Entry<'_, SortableIndexKey, RwLock<Vec<RowVersion>>>,
     ) -> Option<RowID> {
         row.value()
             .read()
@@ -1867,11 +1859,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     fn find_next_visible_index_row<'a, I>(&self, tx: &Transaction, mut rows: I) -> Option<RowID>
     where
         I: Iterator<
-            Item = crossbeam_skiplist::map::Entry<
-                'a,
-                SortableIndexKey,
-                parking_lot::lock_api::RwLock<parking_lot::RawRwLock, Vec<RowVersion>>,
-            >,
+            Item = crossbeam_skiplist::map::Entry<'a, SortableIndexKey, RwLock<Vec<RowVersion>>>,
         >,
     {
         loop {
@@ -1889,13 +1877,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         table_id: MVTableId,
     ) -> Option<RowID>
     where
-        I: Iterator<
-            Item = crossbeam_skiplist::map::Entry<
-                'a,
-                RowID,
-                parking_lot::lock_api::RwLock<parking_lot::RawRwLock, Vec<RowVersion>>,
-            >,
-        >,
+        I: Iterator<Item = crossbeam_skiplist::map::Entry<'a, RowID, RwLock<Vec<RowVersion>>>>,
     {
         loop {
             let row = rows.next()?;

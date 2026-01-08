@@ -444,7 +444,7 @@ pub type CloseStmtFn = unsafe extern "C" fn(ctx: *mut Stmt);
 #[repr(C)]
 #[derive(Debug, Clone)]
 pub struct Conn {
-    // std::sync::Weak from core::Connection
+    // crate::sync::Weak from core::Connection
     pub _ctx: *mut c_void,
     pub _prepare_stmt: PrepareStmtFn,
     pub _execute: ExecuteFn,

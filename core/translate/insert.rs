@@ -1,3 +1,4 @@
+use crate::sync::Arc;
 use crate::{
     error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE},
     schema::{self, BTreeTable, ColDef, Column, Index, IndexColumn, ResolvedFkRef, Schema, Table},
@@ -46,7 +47,6 @@ use crate::{
     Connection, LimboError, Result, VirtualTable,
 };
 use std::num::NonZeroUsize;
-use std::sync::Arc;
 use turso_parser::ast::{
     self, Expr, InsertBody, OneSelect, QualifiedName, ResolveType, ResultColumn, TriggerEvent,
     TriggerTime, Upsert, UpsertDo,

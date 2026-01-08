@@ -4,7 +4,7 @@ use super::{common, Completion, CompletionInner, File, OpenFlags, IO};
 use crate::io::clock::{Clock, DefaultClock, Instant};
 use crate::storage::wal::CKPT_BATCH_PAGES;
 use crate::{turso_assert, CompletionError, LimboError, Result};
-use parking_lot::Mutex;
+use crate::sync::Mutex;
 use rustix::fs::{self, FlockOperation, OFlags};
 use std::ptr::NonNull;
 use std::{

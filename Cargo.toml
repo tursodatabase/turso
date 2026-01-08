@@ -99,6 +99,11 @@ bitmaps = { version = "3.2.1", default-features = false }
 console-subscriber = { version = "0.4.1" }
 either = { version = "1.15" }
 
+# Multi threading testing
+loom = { version = "0.7" }
+shuttle = { version = "0.8.1" }
+
+
 [profile.dev.package.similar]
 opt-level = 3
 
@@ -132,6 +137,9 @@ codegen-units = 16        # Less cross-unit inlining
 [profile.dist]
 inherits = "release"
 lto = "thin"
+
+[workspace.lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(loom)', 'cfg(shuttle)'] }
 
 [workspace.lints.clippy]
 or_fun_call = "deny"

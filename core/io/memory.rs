@@ -3,7 +3,7 @@ use crate::turso_assert;
 use crate::{io::clock::DefaultClock, Result};
 
 use crate::io::clock::Instant;
-use parking_lot::Mutex;
+use crate::sync::Mutex;
 use std::{
     cell::{Cell, UnsafeCell},
     collections::{BTreeMap, HashMap},

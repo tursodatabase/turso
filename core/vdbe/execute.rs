@@ -86,7 +86,7 @@ use super::{
     insn::{Cookie, RegisterOrLiteral},
     CommitState,
 };
-use parking_lot::{Mutex, RwLock};
+use crate::sync::{Mutex, RwLock};
 use turso_parser::ast::{self, ForeignKeyClause, Name, ResolveType};
 use turso_parser::parser::Parser;
 
@@ -6262,7 +6262,7 @@ pub fn op_insert(
                     program.connection.update_last_rowid(rowid);
                     program
                         .n_change
-                        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        .fetch_add(1, crate::sync::atomic::Ordering::SeqCst);
                 }
                 let schema = program.connection.schema.read();
                 let dependent_views = schema.get_dependent_materialized_views(table_name);
@@ -6474,7 +6474,7 @@ pub fn op_delete(
         // i.e. the DELETE and subsequent INSERT of a row are the same "change".
         program
             .n_change
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            .fetch_add(1, crate::sync::atomic::Ordering::SeqCst);
     }
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)

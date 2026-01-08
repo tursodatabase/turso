@@ -7,10 +7,10 @@ use crate::incremental::operator::{
 };
 use crate::incremental::persistence::WriteRow;
 use crate::storage::btree::CursorTrait;
+use crate::sync::Arc;
+use crate::sync::Mutex;
 use crate::types::{IOResult, ImmutableRecord, SeekKey, SeekOp, SeekResult};
 use crate::{return_and_restore_if_io, return_if_io, Result, Value};
-use parking_lot::Mutex;
-use std::sync::Arc;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum JoinType {

@@ -1,12 +1,12 @@
 use super::{slot_bitmap::SlotBitmap, sqlite3_ondisk::WAL_FRAME_HEADER_SIZE};
 use crate::fast_lock::SpinLock;
 use crate::io::TEMP_BUFFER_CACHE;
+use crate::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+use crate::sync::Mutex;
+use crate::sync::{Arc, Weak};
 use crate::{turso_assert, Buffer, LimboError, IO};
-use parking_lot::Mutex;
 use std::cell::UnsafeCell;
 use std::ptr::NonNull;
-use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
-use std::sync::{Arc, Weak};
 
 #[derive(Debug)]
 /// A buffer allocated from an arena from `[BufferPool]`

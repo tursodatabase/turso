@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use crate::sync::Arc;
 
 use tracing::{instrument, Level};
 use turso_parser::ast::{self, Expr, SubqueryType, UnaryOperator};
@@ -4512,7 +4512,7 @@ pub fn emit_function_call(
 pub fn process_returning_clause(
     returning: &mut [ast::ResultColumn],
     table_references: &mut TableReferences,
-    connection: &std::sync::Arc<crate::Connection>,
+    connection: &crate::sync::Arc<crate::Connection>,
 ) -> Result<Vec<ResultSetColumn>> {
     let mut result_columns = Vec::with_capacity(returning.len());
 

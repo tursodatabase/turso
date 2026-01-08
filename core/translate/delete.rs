@@ -1,4 +1,5 @@
 use crate::schema::{Schema, Table};
+use crate::sync::Arc;
 use crate::translate::emitter::{emit_program, Resolver};
 use crate::translate::expr::process_returning_clause;
 use crate::translate::optimizer::optimize_plan;
@@ -11,7 +12,6 @@ use crate::translate::trigger_exec::has_relevant_triggers_type_only;
 use crate::util::normalize_ident;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::Result;
-use std::sync::Arc;
 use turso_parser::ast::{Expr, Limit, QualifiedName, ResultColumn, TriggerEvent};
 
 use super::plan::{ColumnUsedMask, JoinedTable, TableReferences};

@@ -95,6 +95,12 @@ branches = { version = "0.4.3", default-features = false }
 bumpalo = { version = "3", features = ["collections"] }
 smallvec = "1.15.1"
 
+[target.'cfg(loom)'.dependencies]
+loom = { workspace = true }
+
+[target.'cfg(shuttle)'.dependencies]
+shuttle = { workspace = true }
+
 # Use pure-rust for Android to avoid C cross-compilation issues
 [target.'cfg(target_os = "android")'.dependencies]
 aegis = { version = "0.9.5", features = ["pure-rust"] }
@@ -125,6 +131,8 @@ env_logger = { workspace = true }
 test-log = { version = "0.2.17", features = ["trace"] }
 sorted-vec = "0.8.6"
 mimalloc = { workspace = true, default-features = false }
+
+
 
 [[bench]]
 name = "benchmark"

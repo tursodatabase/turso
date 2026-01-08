@@ -1,3 +1,8 @@
+use crate::sync::RwLock;
+use crate::sync::{
+    atomic::{self, AtomicUsize},
+    Arc,
+};
 use crate::{
     error::LimboError,
     io::{Buffer, Completion, TempFile, IO},
@@ -8,15 +13,10 @@ use crate::{
     types::{IOCompletions, IOResult, Value, ValueRef},
     CompletionError, Result,
 };
-use parking_lot::RwLock;
 use rapidhash::fast::RapidHasher;
+use std::cmp::{Eq, Ordering};
 use std::hash::Hasher;
-use std::sync::{atomic, Arc};
 use std::{cell::RefCell, collections::VecDeque};
-use std::{
-    cmp::{Eq, Ordering},
-    sync::atomic::AtomicUsize,
-};
 use turso_macros::AtomicEnum;
 
 const DEFAULT_SEED: u64 = 1337;

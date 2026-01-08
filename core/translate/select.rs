@@ -4,6 +4,7 @@ use super::plan::{
     Search, TableReferences, WhereTerm, Window,
 };
 use crate::schema::Table;
+use crate::sync::Arc;
 use crate::translate::emitter::{OperationMode, Resolver};
 use crate::translate::expr::{bind_and_rewrite_expr, expr_vector_size, BindingBehavior};
 use crate::translate::group_by::compute_group_by_sort_order;
@@ -20,7 +21,6 @@ use crate::vdbe::builder::ProgramBuilderOpts;
 use crate::vdbe::insn::Insn;
 use crate::Connection;
 use crate::{vdbe::builder::ProgramBuilder, Result};
-use std::sync::Arc;
 use turso_parser::ast::ResultColumn;
 use turso_parser::ast::{self, CompoundSelect, Expr};
 

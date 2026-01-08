@@ -1,5 +1,5 @@
+use crate::sync::Arc;
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 
 use crate::schema::ROWID_SENTINEL;
 use crate::translate::emitter::Resolver;

@@ -1,6 +1,6 @@
+use crate::sync::{atomic::Ordering, Arc};
 use intrusive_collections::{intrusive_adapter, LinkedList, LinkedListLink};
 use rustc_hash::FxHashMap;
-use std::sync::{atomic::Ordering, Arc};
 use tracing::trace;
 
 use crate::{
@@ -689,11 +689,11 @@ mod tests {
     use super::*;
     use crate::storage::page_cache::CacheError;
     use crate::storage::pager::{Page, PageRef};
+    use crate::sync::Arc;
     use rand_chacha::{
         rand_core::{RngCore, SeedableRng},
         ChaCha8Rng,
     };
-    use std::sync::Arc;
 
     fn create_key(id: usize) -> PageCacheKey {
         PageCacheKey::new(id)

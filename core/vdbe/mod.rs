@@ -62,6 +62,7 @@ use crate::{
 
 #[cfg(feature = "json")]
 use crate::json::JsonCacheCell;
+use crate::sync::RwLock;
 use crate::{Connection, MvStore, Result, TransactionState};
 use branches::{mark_unlikely, unlikely};
 use builder::{CursorKey, QueryMode};
@@ -69,7 +70,6 @@ use execute::{
     InsnFunction, InsnFunctionStepResult, OpIdxDeleteState, OpIntegrityCheckState,
     OpOpenEphemeralState,
 };
-use parking_lot::RwLock;
 use turso_parser::ast::ResolveType;
 
 use crate::vdbe::bloom_filter::BloomFilter;

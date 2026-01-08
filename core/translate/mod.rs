@@ -46,6 +46,7 @@ mod window;
 
 use crate::schema::Schema;
 use crate::storage::pager::Pager;
+use crate::sync::Arc;
 use crate::translate::delete::translate_delete;
 use crate::translate::emitter::Resolver;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts, QueryMode};
@@ -58,7 +59,6 @@ use insert::translate_insert;
 use rollback::translate_rollback;
 use schema::{translate_create_table, translate_create_virtual_table, translate_drop_table};
 use select::translate_select;
-use std::sync::Arc;
 use tracing::{instrument, Level};
 use transaction::{translate_tx_begin, translate_tx_commit};
 use turso_parser::ast::{self, Indexed};

@@ -1,4 +1,4 @@
-use parking_lot::RwLock;
+use crate::sync::RwLock;
 use std::{
     collections::{HashMap, HashSet},
     sync::{atomic::AtomicI64, Arc},
@@ -193,7 +193,7 @@ pub enum CursorType {
     VirtualTable(Arc<VirtualTable>),
     MaterializedView(
         Arc<BTreeTable>,
-        Arc<parking_lot::Mutex<crate::incremental::view::IncrementalView>>,
+        Arc<crate::sync::Mutex<crate::incremental::view::IncrementalView>>,
     ),
 }
 

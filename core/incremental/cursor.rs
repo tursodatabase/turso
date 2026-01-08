@@ -1,3 +1,5 @@
+use crate::sync::Arc;
+use crate::sync::Mutex;
 use crate::{
     incremental::{
         compiler::{DeltaSet, ExecuteState},
@@ -9,8 +11,6 @@ use crate::{
     types::{IOResult, SeekKey, SeekOp, SeekResult, Value},
     LimboError, Pager, Result,
 };
-use parking_lot::Mutex;
-use std::sync::Arc;
 
 /// State machine for seek operations
 #[derive(Debug)]
@@ -294,9 +294,9 @@ impl MaterializedViewCursor {
 mod tests {
     use super::*;
     use crate::storage::btree::BTreeCursor;
+    use crate::sync::Arc;
     use crate::util::IOExt;
     use crate::{Connection, Database, OpenFlags};
-    use std::sync::Arc;
 
     /// Helper to create a test connection with a table and materialized view
     fn create_test_connection() -> Result<Arc<Connection>> {

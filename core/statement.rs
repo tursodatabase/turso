@@ -89,7 +89,7 @@ impl Statement {
     pub fn n_change(&self) -> i64 {
         self.program
             .n_change
-            .load(std::sync::atomic::Ordering::SeqCst)
+            .load(crate::sync::atomic::Ordering::SeqCst)
     }
 
     pub fn set_mv_tx(&mut self, mv_tx: Option<(u64, TransactionMode)>) {

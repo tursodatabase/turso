@@ -147,7 +147,7 @@ pub fn get_collseq_from_expr(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use crate::sync::Arc;
 
     use turso_parser::ast::{Literal, Name, Operator, TableInternalId, UnaryOperator};
 

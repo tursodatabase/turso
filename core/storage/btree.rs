@@ -9074,9 +9074,9 @@ mod tests {
                 db_file,
                 Some(wal),
                 io,
-                Arc::new(parking_lot::RwLock::new(PageCache::new(10))),
+                Arc::new(crate::sync::RwLock::new(PageCache::new(10))),
                 buffer_pool,
-                Arc::new(parking_lot::Mutex::new(())),
+                Arc::new(crate::sync::Mutex::new(())),
                 init_page_1,
             )
             .unwrap(),

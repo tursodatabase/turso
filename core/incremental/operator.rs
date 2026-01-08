@@ -13,11 +13,11 @@ pub use crate::incremental::project_operator::{ProjectColumn, ProjectOperator};
 use crate::incremental::dbsp::{Delta, DeltaPair};
 use crate::schema::{Index, IndexColumn};
 use crate::storage::btree::BTreeCursor;
+use crate::sync::Arc;
+use crate::sync::Mutex;
 use crate::types::IOResult;
 use crate::Result;
-use parking_lot::Mutex;
 use std::fmt::Debug;
-use std::sync::Arc;
 
 /// Struct to hold both table and index cursors for DBSP state operations
 pub struct DbspStateCursors {
@@ -263,15 +263,15 @@ mod tests {
     use crate::incremental::dbsp::HashableRow;
     use crate::storage::btree::CursorTrait;
     use crate::storage::pager::CreateBTreeFlags;
+    use crate::sync::Arc;
+    use crate::sync::Mutex;
     use crate::types::Text;
     use crate::util::IOExt;
     use crate::Value;
     use crate::{Database, MemoryIO, IO};
-    use parking_lot::Mutex;
-    use std::sync::Arc;
 
     /// Create a test pager for operator tests with both table and index
-    fn create_test_pager() -> (std::sync::Arc<crate::Pager>, i64, i64) {
+    fn create_test_pager() -> (crate::sync::Arc<crate::Pager>, i64, i64) {
         let io: Arc<dyn IO> = Arc::new(MemoryIO::new());
         let db = Database::open_file(io.clone(), ":memory:").unwrap();
         let conn = db.connect().unwrap();
@@ -302,7 +302,7 @@ mod tests {
     /// Returns a Delta with all the current aggregate values
     fn get_current_state_from_btree(
         agg: &AggregateOperator,
-        pager: &std::sync::Arc<crate::Pager>,
+        pager: &crate::sync::Arc<crate::Pager>,
         cursors: &mut DbspStateCursors,
     ) -> Delta {
         let mut result = Delta::new();

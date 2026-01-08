@@ -1,6 +1,6 @@
-use parking_lot::RwLock;
+use crate::sync::Arc;
+use crate::sync::RwLock;
 use std::fmt::Debug;
-use std::sync::Arc;
 
 pub mod logical_log;
 use crate::mvcc::database::LogRecord;

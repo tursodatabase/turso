@@ -8,12 +8,12 @@ use crate::incremental::operator::{
 };
 use crate::incremental::persistence::{ReadRecord, WriteRow};
 use crate::storage::btree::CursorTrait;
+use crate::sync::Arc;
+use crate::sync::Mutex;
 use crate::types::{IOResult, ImmutableRecord, SeekKey, SeekOp, SeekResult, ValueRef};
 use crate::{return_and_restore_if_io, return_if_io, LimboError, Result, Value};
-use parking_lot::Mutex;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fmt::{self, Display};
-use std::sync::Arc;
 
 // Architecture of the Aggregate Operator
 // ========================================

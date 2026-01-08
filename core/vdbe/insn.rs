@@ -11,6 +11,7 @@ pub fn to_u16(v: usize) -> u16 {
 }
 
 use super::{execute, AggFunc, BranchOffset, CursorID, FuncCtx, InsnFunction, PageIdx};
+use crate::sync::RwLock;
 use crate::{
     schema::{BTreeTable, Column, Index},
     storage::{pager::CreateBTreeFlags, wal::CheckpointMode},
@@ -19,7 +20,6 @@ use crate::{
     vdbe::affinity::Affinity,
     Statement, Value,
 };
-use parking_lot::RwLock;
 use strum::EnumCount;
 use strum_macros::{EnumDiscriminants, FromRepr, VariantArray};
 use turso_macros::Description;

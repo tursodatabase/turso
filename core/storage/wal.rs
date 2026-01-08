@@ -1,17 +1,17 @@
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
-use parking_lot::Mutex;
+use crate::sync::Mutex;
+use crate::sync::OnceLock;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::array;
 use std::borrow::Cow;
 use std::collections::BTreeMap;
-use std::sync::OnceLock;
 use strum::EnumString;
 use tracing::{instrument, Level};
 
-use parking_lot::RwLock;
+use crate::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
+use crate::sync::RwLock;
 use std::fmt::{Debug, Formatter};
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::{fmt, sync::Arc};
 
 use super::buffer_pool::BufferPool;
@@ -507,7 +507,7 @@ struct OngoingCheckpoint {
 
 struct InflightWriteBatch {
     done: Arc<AtomicBool>,
-    err: Arc<std::sync::OnceLock<CompletionError>>,
+    err: Arc<crate::sync::OnceLock<CompletionError>>,
 }
 
 impl OngoingCheckpoint {
@@ -1981,7 +1981,7 @@ impl WalFile {
         WAL_HEADER_SIZE as u64 + page_offset
     }
 
-    fn _get_shared_mut(&self) -> parking_lot::RwLockWriteGuard<'_, WalFileShared> {
+    fn _get_shared_mut(&self) -> crate::sync::RwLockWriteGuard<'_, WalFileShared> {
         // WASM in browser main thread doesn't have a way to "park" a thread
         // so, we spin way here instead of calling blocking lock
         #[cfg(target_family = "wasm")]
@@ -2000,7 +2000,7 @@ impl WalFile {
         }
     }
 
-    fn _get_shared(&self) -> parking_lot::RwLockReadGuard<'_, WalFileShared> {
+    fn _get_shared(&self) -> crate::sync::RwLockReadGuard<'_, WalFileShared> {
         // WASM in browser main thread doesn't have a way to "park" a thread
         // so, we spin way here instead of calling blocking lock
         #[cfg(target_family = "wasm")]
@@ -2844,6 +2844,8 @@ impl WalFileShared {
 
 #[cfg(test)]
 pub mod test {
+    use crate::sync::{atomic::Ordering, Arc};
+    use crate::sync::{Mutex, RwLock};
     use crate::{
         storage::{
             sqlite3_ondisk::{self, WAL_HEADER_SIZE},
@@ -2854,10 +2856,8 @@ pub mod test {
         CheckpointMode, CheckpointResult, Completion, Connection, Database, LimboError, PlatformIO,
         Wal, WalFileShared, IO,
     };
-    use parking_lot::{Mutex, RwLock};
     #[cfg(unix)]
     use std::os::unix::fs::MetadataExt;
-    use std::sync::{atomic::Ordering, Arc};
     #[allow(clippy::arc_with_non_send_sync)]
     pub(crate) fn get_database() -> (Arc<Database>, std::path::PathBuf) {
         let mut path = tempfile::tempdir().unwrap().keep();

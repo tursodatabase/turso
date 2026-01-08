@@ -2,6 +2,7 @@ use crate::function::{Deterministic, Func};
 use crate::incremental::view::IncrementalView;
 use crate::index_method::{IndexMethodAttachment, IndexMethodConfiguration};
 use crate::stats::AnalyzeStats;
+use crate::sync::RwLock;
 use crate::translate::emitter::Resolver;
 use crate::translate::expr::{bind_and_rewrite_expr, walk_expr, BindingBehavior, WalkControl};
 use crate::translate::index::{resolve_index_method_parameters, resolve_sorted_columns};
@@ -10,7 +11,6 @@ use crate::translate::planner::ROWID_STRS;
 use crate::types::IOResult;
 use crate::util::{exprs_are_equivalent, normalize_ident};
 use crate::vdbe::affinity::Affinity;
-use parking_lot::RwLock;
 use turso_macros::AtomicEnum;
 
 #[derive(Debug, Clone, AtomicEnum)]
@@ -121,6 +121,8 @@ impl Trigger {
 }
 
 use crate::storage::btree::{BTreeCursor, CursorTrait};
+use crate::sync::Arc;
+use crate::sync::Mutex;
 use crate::translate::collate::CollationSeq;
 use crate::translate::plan::{SelectPlan, TableReferences};
 use crate::util::{
@@ -132,10 +134,8 @@ use crate::{
     Connection, LimboError, MvCursor, MvStore, Pager, SymbolTable, ValueRef, VirtualTable,
 };
 use core::fmt;
-use parking_lot::Mutex;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ops::Deref;
-use std::sync::Arc;
 use tracing::trace;
 use turso_parser::ast::{
     self, ColumnDefinition, Expr, InitDeferredPred, Literal, RefAct, SortOrder, TableOptions,

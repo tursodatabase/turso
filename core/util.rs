@@ -3,6 +3,8 @@ use crate::function::Deterministic;
 use crate::incremental::view::IncrementalView;
 use crate::numeric::StrToF64;
 use crate::schema::ColDef;
+use crate::sync::atomic::AtomicU8;
+use crate::sync::Mutex;
 use crate::translate::emitter::TransactionMode;
 use crate::translate::expr::{walk_expr_mut, WalkControl};
 use crate::translate::optimizer::Optimizable;
@@ -17,8 +19,6 @@ use crate::{
 };
 use crate::{Connection, MvStore, IO};
 use either::Either;
-use parking_lot::Mutex;
-use std::sync::atomic::AtomicU8;
 use std::{collections::HashMap, rc::Rc, sync::Arc};
 use tracing::{instrument, Level};
 use turso_macros::match_ignore_ascii_case;
