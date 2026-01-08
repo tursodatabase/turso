@@ -5949,35 +5949,51 @@ pub fn op_function(
                     state.registers[*dest] = Register::Value(Value::Integer(0));
                 }
                 FtsFunc::FtsHighlight => {
-                    // fts_highlight(text, query, before_tag, after_tag)
-                    // This is a scalar function that works without an FTS index
+                    // fts_highlight(col1, col2, ..., before_tag, after_tag, query)
+                    // Variable number of text columns, followed by before_tag, after_tag, query
+                    // Minimum: fts_highlight(text, before_tag, after_tag, query) = 4 args
                     if arg_count < 4 {
                         return Err(LimboError::InvalidArgument(
-                            "fts_highlight requires 4 arguments: text, query, before_tag, after_tag"
+                            "fts_highlight requires at least 4 arguments: text, before_tag, after_tag, query"
                                 .to_string(),
                         ));
                     }
 
-                    let text = state.registers[*start_reg].get_value();
-                    let query = state.registers[*start_reg + 1].get_value();
-                    let before_tag = state.registers[*start_reg + 2].get_value();
-                    let after_tag = state.registers[*start_reg + 3].get_value();
+                    // Last 3 args are: before_tag, after_tag, query
+                    // First N-3 args are text columns
+                    let num_text_cols = arg_count - 3;
+                    let before_tag =
+                        state.registers[*start_reg + num_text_cols].get_value();
+                    let after_tag =
+                        state.registers[*start_reg + num_text_cols + 1].get_value();
+                    let query =
+                        state.registers[*start_reg + num_text_cols + 2].get_value();
 
-                    // Handle NULL values
-                    if matches!(text, Value::Null)
-                        || matches!(query, Value::Null)
+                    // Handle NULL values in tags or query
+                    if matches!(query, Value::Null)
                         || matches!(before_tag, Value::Null)
                         || matches!(after_tag, Value::Null)
                     {
                         state.registers[*dest] = Register::Value(Value::Null);
                     } else {
-                        let text_str = text.to_string();
                         let query_str = query.to_string();
                         let before_str = before_tag.to_string();
                         let after_str = after_tag.to_string();
 
+                        // Concatenate all text columns with space separator
+                        let mut combined_text = String::new();
+                        for i in 0..num_text_cols {
+                            let text = state.registers[*start_reg + i].get_value();
+                            if !matches!(text, Value::Null) {
+                                if !combined_text.is_empty() {
+                                    combined_text.push(' ');
+                                }
+                                combined_text.push_str(&text.to_string());
+                            }
+                        }
+
                         let highlighted = crate::index_method::fts::fts_highlight(
-                            &text_str,
+                            &combined_text,
                             &query_str,
                             &before_str,
                             &after_str,
