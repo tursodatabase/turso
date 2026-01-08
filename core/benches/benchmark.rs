@@ -348,10 +348,13 @@ fn bench_prepare_query(criterion: &mut Criterion) {
         let query = whitespace_re.replace_all(query, " ").to_string();
         let query = query.as_str();
 
+        let byte_index: usize = query.chars().take(50).map(|c| c.len_utf8()).sum();
+
         let mut group = criterion.benchmark_group(format!("Prepare `{query}`"));
 
         group.bench_with_input(
-            BenchmarkId::new("limbo_parse_query", query),
+            // Limit the size of the benchmark id so that Codspeed does not through errors
+            BenchmarkId::new("limbo_parse_query", &query[..byte_index]),
             query,
             |b, query| {
                 b.iter(|| {
@@ -364,7 +367,7 @@ fn bench_prepare_query(criterion: &mut Criterion) {
             let sqlite_conn = rusqlite_open();
 
             group.bench_with_input(
-                BenchmarkId::new("sqlite_parse_query", query),
+                BenchmarkId::new("sqlite_parse_query", &query[..byte_index]),
                 query,
                 |b, query| {
                     b.iter(|| {
