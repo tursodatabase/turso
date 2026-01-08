@@ -334,7 +334,7 @@ pub struct ProgramState {
     pub pc: InsnReference,
     pub(crate) cursors: Vec<Option<Cursor>>,
     cursor_seqs: Vec<i64>,
-    registers: Vec<Register>,
+    registers: Box<[Register]>,
     pub(crate) result_row: Option<Row>,
     last_compare: Option<std::cmp::Ordering>,
     deferred_seeks: Vec<Option<(CursorID, CursorID)>>,
@@ -411,7 +411,7 @@ impl ProgramState {
     pub fn new(max_registers: usize, max_cursors: usize) -> Self {
         let cursors: Vec<Option<Cursor>> = (0..max_cursors).map(|_| None).collect();
         let cursor_seqs = vec![0i64; max_cursors];
-        let registers = vec![Register::Value(Value::Null); max_registers];
+        let registers = vec![Register::Value(Value::Null); max_registers].into_boxed_slice();
         Self {
             io_completions: None,
             pc: 0,
@@ -505,9 +505,13 @@ impl ProgramState {
             self.cursor_seqs.resize(max_cursors, 0);
             self.deferred_seeks.resize(max_cursors, None);
         }
+        self.result_row = None;
         if let Some(max_registers) = max_registers {
-            self.registers
-                .resize_with(max_registers, || Register::Value(Value::Null));
+            // into_vec and into_boxed_slice do not allocate
+            let mut registers = std::mem::take(&mut self.registers).into_vec();
+            // As we are dropping whatever is in the result row, we can be sure that no one is referencing values from `*const Register` inside `Row`.
+            registers.resize_with(max_registers, || Register::Value(Value::Null));
+            self.registers = registers.into_boxed_slice();
         }
         // reset cursors as they can have cached information which will be no longer relevant on next program execution
         self.cursors.iter_mut().for_each(|c| {
