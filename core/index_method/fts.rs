@@ -2552,24 +2552,8 @@ impl Drop for FtsCursor {
         );
 
         if is_flushing {
-            // Only complete in-progress flush if we're still in a write transaction
-            // Otherwise we'd be writing to BTree outside of a transaction, causing dirty pages panic
-            //
-            // NOTE: This should NEVER happen in normal operation. The VDBE's
-            // index_method_pre_commit_all() loops until flush completes before commit.
-            // If we reach here with an in-progress flush and no write transaction,
-            // it indicates a bug in the commit flow.
-            if !conn.is_in_write_tx() {
-                debug_assert!(
-                    false,
-                    "FTS Drop: in-progress flush abandoned - pre_commit loop should have completed this"
-                );
-                tracing::error!(
-                    "FTS Drop: in-progress flush abandoned (transaction already committed). \
-                     This is unexpected - pre_commit should have completed the flush."
-                );
-                return;
-            }
+            turso_assert!(conn.is_in_write_tx(), "FTS Drop: in-progress flush abandoned (transaction already committed). pre_commit should have completed the flush.");
+
             tracing::debug!("FTS Drop: completing in-progress flush");
             loop {
                 match self.flush_writes_internal() {
