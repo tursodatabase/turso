@@ -262,12 +262,6 @@ pub struct Row {
     count: usize,
 }
 
-// SAFETY: This needs to be audited for thread safety.
-// See: https://github.com/tursodatabase/turso/issues/1552
-unsafe impl Send for Row {}
-unsafe impl Sync for Row {}
-crate::assert::assert_send_sync!(Row);
-
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum TxnCleanup {
     None,
@@ -404,8 +398,11 @@ impl std::fmt::Debug for Program {
     }
 }
 
-// SAFETY: This needs to be audited for thread safety.
 // See: https://github.com/tursodatabase/turso/issues/1552
+// SAFETY: Rust cannot derive Send + Sync automatically mainly because of `Row` struct
+// as it contains a `*const Register`. 
+// Program State upholds Rust aliasing rules with `Row` by only giving out immutable references to
+// the internal `result_row` and by invalidating the result row whenever the program is stepped.
 unsafe impl Send for ProgramState {}
 unsafe impl Sync for ProgramState {}
 crate::assert::assert_send_sync!(ProgramState);
