@@ -123,6 +123,13 @@ pub trait IndexMethodCursor {
     fn pre_commit(&mut self) -> Result<IOResult<()>> {
         Ok(IOResult::Done(()))
     }
+
+    /// Optimize the index by merging segments or performing other maintenance.
+    /// For FTS indexes, this triggers Tantivy's segment merge operation.
+    /// Default implementation does nothing (for index methods that don't need it).
+    fn optimize(&mut self, _connection: &Arc<Connection>) -> Result<IOResult<()>> {
+        Ok(IOResult::Done(()))
+    }
 }
 
 /// helper method to open table BTree cursor in the index method implementation
