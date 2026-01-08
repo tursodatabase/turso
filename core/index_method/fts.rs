@@ -1,37 +1,37 @@
-use crate::index_method::{
-    parse_patterns, IndexMethod, IndexMethodAttachment, IndexMethodConfiguration,
-    IndexMethodCursor, IndexMethodDefinition,
+use crate::{
+    index_method::{
+        parse_patterns, IndexMethod, IndexMethodAttachment, IndexMethodConfiguration,
+        IndexMethodCursor, IndexMethodDefinition,
+    },
+    return_if_io,
+    schema::IndexColumn,
+    storage::{
+        btree::{BTreeCursor, BTreeKey, CursorTrait},
+        pager::Pager,
+    },
+    translate::collate::CollationSeq,
+    turso_assert,
+    types::{IOResult, ImmutableRecord, IndexInfo, KeyInfo, SeekKey, SeekOp, SeekResult, Text},
+    vdbe::Register,
+    Connection, LimboError, Result, Value,
 };
-use crate::schema::IndexColumn;
-use crate::storage::btree::{BTreeCursor, BTreeKey, CursorTrait};
-use crate::storage::pager::Pager;
-use crate::translate::collate::CollationSeq;
-use crate::types::{
-    IOResult, ImmutableRecord, IndexInfo, KeyInfo, SeekKey, SeekOp, SeekResult, Text,
-};
-use crate::vdbe::Register;
-use crate::{return_if_io, turso_assert};
-use crate::{Connection, LimboError, Result, Value};
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
 use std::io::{BufWriter, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use tantivy::directory::error::{DeleteError, OpenReadError, OpenWriteError};
-use tantivy::directory::{
-    Directory, FileHandle, OwnedBytes, TerminatingWrite, WatchCallback, WatchHandle,
-};
-use tantivy::merge_policy::NoMergePolicy;
-use tantivy::schema::Value as TantivySchemaValue;
-use tantivy::tokenizer::{NgramTokenizer, RawTokenizer, SimpleTokenizer, WhitespaceTokenizer};
 use tantivy::{
-    schema::{Field, Schema},
-    Index, IndexSettings,
+    directory::{
+        error::{DeleteError, OpenReadError, OpenWriteError},
+        Directory, FileHandle, OwnedBytes, TerminatingWrite, WatchCallback, WatchHandle,
+    },
+    merge_policy::NoMergePolicy,
+    schema::{Field, Schema, Value as TantivySchemaValue},
+    tokenizer::{NgramTokenizer, RawTokenizer, SimpleTokenizer, WhitespaceTokenizer},
+    DocAddress, HasLen, Index, IndexReader, IndexSettings, IndexWriter, Searcher, TantivyDocument,
 };
-use tantivy::{DocAddress, HasLen, IndexReader, IndexWriter, Searcher, TantivyDocument};
-use turso_parser::ast::SortOrder;
-use turso_parser::ast::{self, Select};
+use turso_parser::ast::{self, Select, SortOrder};
 
 /// Name identifier for the FTS index method, used in `CREATE INDEX ... USING fts`.
 pub const FTS_INDEX_METHOD_NAME: &str = "fts";
@@ -99,8 +99,8 @@ pub fn fts_highlight(text: &str, query: &str, before_tag: &str, after_tag: &str)
         return text.to_string();
     }
 
-    // Build the highlighted text by inserting tags at match positions
-    // Process in reverse order to avoid offset shifting issues
+    // Build the highlighted text by inserting tags at match positions,
+    // apply edits from the end backward when offsets are precomputed.
     let mut result = text.to_string();
     for (start, end) in match_ranges.into_iter().rev() {
         // Ensure offsets are valid UTF-8 boundaries
