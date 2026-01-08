@@ -910,3 +910,84 @@ pub fn translate_drop_index(
 
     Ok(program)
 }
+
+/// Translate `OPTIMIZE INDEX [idx_name]` statement.
+/// If idx_name is provided, optimize that specific index.
+/// If idx_name is None, optimize all index method indexes.
+pub fn translate_optimize(
+    idx_name: Option<turso_parser::ast::QualifiedName>,
+    resolver: &Resolver,
+    mut program: ProgramBuilder,
+    connection: &std::sync::Arc<crate::Connection>,
+) -> crate::Result<ProgramBuilder> {
+    if !connection.experimental_index_method_enabled() {
+        crate::bail_parse_error!(
+            "OPTIMIZE INDEX requires experimental index method feature. Enable with --experimental-index-method flag"
+        )
+    }
+
+    let opts = crate::vdbe::builder::ProgramBuilderOpts {
+        num_cursors: 5,
+        approx_num_insns: 20,
+        approx_num_labels: 2,
+    };
+    program.extend(&opts);
+
+    let mut indexes_to_optimize = Vec::new();
+
+    if let Some(name) = idx_name {
+        // Optimize a specific index
+        let idx_name = normalize_ident(name.name.as_str());
+        let mut found = false;
+
+        for val in resolver.schema.indexes.values() {
+            for idx in val {
+                if idx.name == idx_name {
+                    if idx.index_method.is_some() && !idx.is_backing_btree_index() {
+                        indexes_to_optimize.push(idx.clone());
+                    } else {
+                        // Not an index method index - nothing to optimize
+                        tracing::info!(
+                            "OPTIMIZE INDEX: {} is not an index method index, nothing to optimize",
+                            idx_name
+                        );
+                    }
+                    found = true;
+                    break;
+                }
+            }
+            if found {
+                break;
+            }
+        }
+
+        if !found {
+            return Err(crate::error::LimboError::InvalidArgument(format!(
+                "No such index: {}",
+                idx_name
+            )));
+        }
+    } else {
+        // Optimize all index method indexes
+        for val in resolver.schema.indexes.values() {
+            for idx in val {
+                if idx.index_method.is_some() && !idx.is_backing_btree_index() {
+                    indexes_to_optimize.push(idx.clone());
+                }
+            }
+        }
+
+        if indexes_to_optimize.is_empty() {
+            tracing::info!("OPTIMIZE INDEX: no index method indexes found to optimize");
+            return Ok(program);
+        }
+    }
+
+    // Emit optimize instructions for each index method index
+    for idx in &indexes_to_optimize {
+        let cursor_id = program.alloc_cursor_index(None, idx)?;
+        program.emit_insn(Insn::IndexMethodOptimize { db: 0, cursor_id });
+    }
+
+    Ok(program)
+}
