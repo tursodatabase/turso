@@ -256,7 +256,7 @@ pub struct MvccLazyCursor<Clock: LogicalClock> {
     /// Stateful MVCC table iterator if this is a table cursor.
     table_iterator: Option<MvccIterator<'static, RowID>>,
     /// Stateful MVCC index iterator if this is an index cursor.
-    index_iterator: Option<MvccIterator<'static, SortableIndexKey>>,
+    index_iterator: Option<MvccIterator<'static, Arc<SortableIndexKey>>>,
     mv_cursor_type: MvccCursorType,
     table_id: MVTableId,
     tx_id: u64,
@@ -786,7 +786,7 @@ impl<Clock: LogicalClock + 'static> MvccLazyCursor<Clock> {
                     .get_or_insert_with(self.table_id, SkipMap::new);
                 let index_rows = index_rows.value();
                 let iter_box = Box::new(index_rows.iter());
-                self.index_iterator = Some(static_iterator_hack!(iter_box, SortableIndexKey));
+                self.index_iterator = Some(static_iterator_hack!(iter_box, Arc<SortableIndexKey>));
             }
         }
     }
@@ -1507,7 +1507,7 @@ impl<Clock: LogicalClock + 'static> CursorTrait for MvccLazyCursor<Clock> {
                     .get_or_insert_with(self.table_id, SkipMap::new);
                 let index_rows = index_rows.value();
                 let iter_box = Box::new(index_rows.iter());
-                self.index_iterator = Some(static_iterator_hack!(iter_box, SortableIndexKey));
+                self.index_iterator = Some(static_iterator_hack!(iter_box, Arc<SortableIndexKey>));
             }
         }
 
