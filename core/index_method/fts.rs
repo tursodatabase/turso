@@ -2436,8 +2436,9 @@ impl FtsCursor {
         }
     }
 
-    /// Commit pending documents to Tantivy and flush to BTree
-    pub fn commit_and_flush(&mut self) -> Result<IOResult<()>> {
+    /// Commit pending documents to Tantivy and flush to BTree.
+    /// If `force_flush` is true, flushes directory writes even when no pending docs.
+    fn commit_and_flush_inner(&mut self, force_flush: bool) -> Result<IOResult<()>> {
         // Handle flush state machine if already in progress
         match &self.state {
             FtsState::FlushingWrites { .. }
@@ -2453,7 +2454,7 @@ impl FtsCursor {
             _ => {}
         }
 
-        if self.pending_docs_count == 0 {
+        if self.pending_docs_count == 0 && !force_flush {
             return Ok(IOResult::Done(()));
         }
 
@@ -2510,6 +2511,11 @@ impl FtsCursor {
         }
 
         Ok(IOResult::Done(()))
+    }
+
+    /// Commit pending documents to Tantivy and flush to BTree.
+    pub fn commit_and_flush(&mut self) -> Result<IOResult<()>> {
+        self.commit_and_flush_inner(false)
     }
 }
 
@@ -3360,7 +3366,7 @@ impl IndexMethodCursor for FtsCursor {
             }
         }
 
-        // Commit merge and invalidate shared directory cache since we changed the structure, and flush
+        // Commit merge and invalidate shared directory cache since we changed the structure
         writer
             .commit()
             .map_err(|e| LimboError::InternalError(format!("FTS optimize commit failed: {e}")))?;
@@ -3368,6 +3374,16 @@ impl IndexMethodCursor for FtsCursor {
             let mut cache = self.shared_directory_cache.write();
             *cache = None;
         }
-        self.commit_and_flush()
+
+        // Reload reader to see merged segments
+        if let Some(ref reader) = self.reader {
+            reader
+                .reload()
+                .map_err(|e| LimboError::InternalError(format!("FTS optimize reader reload: {e}")))?;
+            self.searcher = Some(reader.searcher());
+        }
+
+        // Force flush directory writes to BTree (even though pending_docs_count == 0)
+        self.commit_and_flush_inner(true)
     }
 }
