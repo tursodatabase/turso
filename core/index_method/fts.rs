@@ -2,7 +2,6 @@ use crate::index_method::{
     parse_patterns, IndexMethod, IndexMethodAttachment, IndexMethodConfiguration,
     IndexMethodCursor, IndexMethodDefinition,
 };
-use crate::return_if_io;
 use crate::schema::IndexColumn;
 use crate::storage::btree::{BTreeCursor, BTreeKey, CursorTrait};
 use crate::storage::pager::Pager;
@@ -11,6 +10,7 @@ use crate::types::{
     IOResult, ImmutableRecord, IndexInfo, KeyInfo, SeekKey, SeekOp, SeekResult, Text,
 };
 use crate::vdbe::Register;
+use crate::{return_if_io, turso_assert};
 use crate::{Connection, LimboError, Result, Value};
 use parking_lot::RwLock;
 use std::collections::{HashMap, HashSet};
@@ -324,16 +324,165 @@ impl ChunkLruCache {
     }
 }
 
+/// Bounded LRU cache for hot files (metadata, term dictionaries, fast fields).
+/// Similar to ChunkLruCache but uses PathBuf as key instead of (PathBuf, chunk_no).
+pub struct HotLruCache {
+    capacity: usize,
+    inner: RwLock<HotCacheInner>,
+}
+
+#[derive(Debug)]
+struct HotCacheInner {
+    current_size: usize,
+    clock: u64,
+    entries: HashMap<PathBuf, HotCacheEntry>,
+}
+
+#[derive(Debug)]
+struct HotCacheEntry {
+    data: Vec<u8>,
+    accessed: u64,
+}
+
+impl std::fmt::Debug for HotLruCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let inner = self.inner.read();
+        f.debug_struct("HotLruCache")
+            .field("capacity", &self.capacity)
+            .field("current_size", &inner.current_size)
+            .field("entries", &inner.entries.len())
+            .finish()
+    }
+}
+
+impl HotLruCache {
+    /// Create from preloaded files (used during initialization).
+    fn with_preloaded(capacity: usize, files: HashMap<PathBuf, Vec<u8>>) -> Self {
+        let current_size: usize = files.values().map(|v| v.len()).sum();
+        let entries: HashMap<PathBuf, HotCacheEntry> = files
+            .into_iter()
+            .enumerate()
+            .map(|(i, (path, data))| {
+                (
+                    path,
+                    HotCacheEntry {
+                        data,
+                        accessed: i as u64,
+                    },
+                )
+            })
+            .collect();
+
+        Self {
+            capacity,
+            inner: RwLock::new(HotCacheInner {
+                current_size,
+                clock: entries.len() as u64,
+                entries,
+            }),
+        }
+    }
+
+    /// Lookup file, updating access timestamp. Returns cloned data.
+    fn get(&self, path: &Path) -> Option<Vec<u8>> {
+        let mut inner = self.inner.write();
+        inner.clock += 1;
+        let ts = inner.clock;
+        if let Some(entry) = inner.entries.get_mut(path) {
+            entry.accessed = ts;
+            Some(entry.data.clone())
+        } else {
+            None
+        }
+    }
+
+    /// Check if file exists in cache.
+    fn contains(&self, path: &Path) -> bool {
+        self.inner.read().entries.contains_key(path)
+    }
+
+    /// Insert file, evicting stale entries if over capacity.
+    fn put(&self, path: PathBuf, value: Vec<u8>) {
+        let size = value.len();
+        let mut inner = self.inner.write();
+
+        // Check for existing entry - get old size if present
+        let old_size = inner.entries.get(&path).map(|e| e.data.len());
+
+        if let Some(old) = old_size {
+            // Update existing entry
+            inner.clock += 1;
+            let ts = inner.clock;
+            let entry = inner.entries.get_mut(&path).unwrap();
+            entry.data = value;
+            entry.accessed = ts;
+            inner.current_size = inner.current_size - old + size;
+            return;
+        }
+
+        // Evict until under capacity
+        while inner.current_size + size > self.capacity && !inner.entries.is_empty() {
+            let victim = {
+                inner
+                    .entries
+                    .iter()
+                    .take(EVICTION_SAMPLES)
+                    .min_by_key(|(_, e)| e.accessed)
+                    .map(|(k, _)| k.clone())
+            };
+
+            match victim {
+                Some(k) => {
+                    if let Some(e) = inner.entries.remove(&k) {
+                        inner.current_size -= e.data.len();
+                    }
+                }
+                None => break,
+            }
+        }
+
+        inner.clock += 1;
+        let ts = inner.clock;
+        inner.entries.insert(
+            path,
+            HotCacheEntry {
+                data: value,
+                accessed: ts,
+            },
+        );
+        inner.current_size += size;
+    }
+
+    /// Remove a file from the cache.
+    fn remove(&self, path: &Path) {
+        let mut inner = self.inner.write();
+        if let Some(e) = inner.entries.remove(path) {
+            inner.current_size -= e.data.len();
+        }
+    }
+
+    /// Current memory usage in bytes.
+    fn size(&self) -> usize {
+        self.inner.read().current_size
+    }
+
+    /// Number of entries in the cache.
+    fn len(&self) -> usize {
+        self.inner.read().entries.len()
+    }
+}
+
 /// Hybrid Directory implementation for Tantivy with lazy loading.
 /// - Metadata files (meta.json, etc.) are always kept in hot cache
 /// - Large segment files (.idx, .pos, .store) are lazy-loaded on demand
-/// - Uses LRU chunk cache to bound memory usage
+/// - Uses LRU caches for both hot files and chunks to bound memory usage
 struct HybridBTreeDirectory {
     /// File catalog: path -> metadata (always in memory, no content)
     catalog: Arc<RwLock<HashMap<PathBuf, FileMetadata>>>,
 
-    /// Hot cache: fully loaded files (metadata, term dictionaries)
-    hot_cache: Arc<RwLock<HashMap<PathBuf, Vec<u8>>>>,
+    /// Hot cache: LRU cache for frequently accessed files (metadata, term dictionaries)
+    /// Bounded to DEFAULT_HOT_CACHE_BYTES (64MB) to prevent unbounded memory growth
+    hot_cache: Arc<HotLruCache>,
 
     /// Chunk cache: LRU cache for lazy-loaded segment chunks
     chunk_cache: Arc<ChunkLruCache>,
@@ -359,7 +508,8 @@ impl std::fmt::Debug for HybridBTreeDirectory {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("HybridBTreeDirectory")
             .field("catalog_size", &self.catalog.read().len())
-            .field("hot_cache_size", &self.hot_cache.read().len())
+            .field("hot_cache_size", &self.hot_cache.len())
+            .field("hot_cache_bytes", &self.hot_cache.size())
             .field("chunk_cache_size", &self.chunk_cache.size())
             .field("btree_root_page", &self.btree_root_page)
             .finish()
@@ -413,11 +563,12 @@ impl HybridBTreeDirectory {
         btree_root_page: i64,
         catalog: HashMap<PathBuf, FileMetadata>,
         hot_files: HashMap<PathBuf, Vec<u8>>,
+        hot_cache_capacity: usize,
         chunk_cache_capacity: usize,
     ) -> Self {
         Self {
             catalog: Arc::new(RwLock::new(catalog)),
-            hot_cache: Arc::new(RwLock::new(hot_files)),
+            hot_cache: Arc::new(HotLruCache::with_preloaded(hot_cache_capacity, hot_files)),
             chunk_cache: Arc::new(ChunkLruCache::new(chunk_cache_capacity)),
             pending_writes: Arc::new(RwLock::new(Vec::new())),
             flushing_writes: Arc::new(RwLock::new(HashMap::new())),
@@ -642,8 +793,7 @@ impl HybridBTreeDirectory {
 
     /// Add a file to the hot cache.
     fn add_to_hot_cache(&self, path: PathBuf, data: Vec<u8>) {
-        let mut hot = self.hot_cache.write();
-        hot.insert(path, data);
+        self.hot_cache.put(path, data);
     }
 
     /// Update the catalog with file metadata.
@@ -693,11 +843,8 @@ impl FileHandle for LazyFileHandle {
         }
 
         // Check hot cache first
-        {
-            let hot = self.directory.hot_cache.read();
-            if let Some(data) = hot.get(&self.path) {
-                return Ok(OwnedBytes::new(data[range].to_vec()));
-            }
+        if let Some(data) = self.directory.hot_cache.get(&self.path) {
+            return Ok(OwnedBytes::new(data[range].to_vec()));
         }
 
         // Check pending/flushing writes (data not yet persisted to BTree)
@@ -812,11 +959,8 @@ impl Directory for HybridBTreeDirectory {
         path: &Path,
     ) -> std::result::Result<Arc<dyn FileHandle>, OpenReadError> {
         // Check hot cache first
-        {
-            let hot = self.hot_cache.read();
-            if let Some(data) = hot.get(path) {
-                return Ok(Arc::new(CachedFileHandle { data: data.clone() }));
-            }
+        if let Some(data) = self.hot_cache.get(path) {
+            return Ok(Arc::new(CachedFileHandle { data }));
         }
 
         // Check pending writes (files written but not yet flushed to BTree)
@@ -840,11 +984,8 @@ impl Directory for HybridBTreeDirectory {
 
     fn exists(&self, path: &Path) -> std::result::Result<bool, OpenReadError> {
         // Check hot cache
-        {
-            let hot = self.hot_cache.read();
-            if hot.contains_key(path) {
-                return Ok(true);
-            }
+        if self.hot_cache.contains(path) {
+            return Ok(true);
         }
         // Check catalog
         let catalog = self.catalog.read();
@@ -853,10 +994,7 @@ impl Directory for HybridBTreeDirectory {
 
     fn delete(&self, path: &Path) -> std::result::Result<(), DeleteError> {
         // Remove from hot cache
-        {
-            let mut hot = self.hot_cache.write();
-            hot.remove(path);
-        }
+        self.hot_cache.remove(path);
         // Remove from catalog
         {
             let mut catalog = self.catalog.write();
@@ -888,11 +1026,8 @@ impl Directory for HybridBTreeDirectory {
 
     fn atomic_read(&self, path: &Path) -> std::result::Result<Vec<u8>, OpenReadError> {
         // Check hot cache first (includes recently written files)
-        {
-            let hot = self.hot_cache.read();
-            if let Some(data) = hot.get(path) {
-                return Ok(data.clone());
-            }
+        if let Some(data) = self.hot_cache.get(path) {
+            return Ok(data);
         }
 
         // Check pending writes (files written but not yet flushed to BTree)
@@ -2419,9 +2554,19 @@ impl Drop for FtsCursor {
         if is_flushing {
             // Only complete in-progress flush if we're still in a write transaction
             // Otherwise we'd be writing to BTree outside of a transaction, causing dirty pages panic
+            //
+            // NOTE: This should NEVER happen in normal operation. The VDBE's
+            // index_method_pre_commit_all() loops until flush completes before commit.
+            // If we reach here with an in-progress flush and no write transaction,
+            // it indicates a bug in the commit flow.
             if !conn.is_in_write_tx() {
-                tracing::warn!(
-                    "FTS Drop: in-progress flush abandoned (transaction already committed)"
+                debug_assert!(
+                    false,
+                    "FTS Drop: in-progress flush abandoned - pre_commit loop should have completed this"
+                );
+                tracing::error!(
+                    "FTS Drop: in-progress flush abandoned (transaction already committed). \
+                     This is unexpected - pre_commit should have completed the flush."
                 );
                 return;
             }
@@ -2449,19 +2594,14 @@ impl Drop for FtsCursor {
             return;
         }
 
-        // CRITICAL: Only flush if we're still in a write transaction.
         // If the transaction has already committed (auto-commit), flushing to BTree
         // would create dirty pages outside of any transaction, causing the
         // "dirty pages must be empty for read txn" panic on the next read.
-        if !conn.is_in_write_tx() {
-            tracing::warn!(
-                "FTS Drop: {} pending documents will be lost (transaction already committed). \
-                 This can happen with single-row INSERTs to tables with FTS indexes. \
-                 Consider using explicit transactions for better FTS consistency.",
-                self.pending_docs_count
-            );
-            return;
-        }
+        turso_assert!(
+            conn.is_in_write_tx(),
+            "FTS Drop: {} docs remaining: transaction already committed, cannot flush",
+            self.pending_docs_count
+        );
 
         // Commit any pending writes to Tantivy
         if let Some(ref mut writer) = self.writer {
@@ -2664,6 +2804,7 @@ impl IndexMethodCursor for FtsCursor {
                             root_page,
                             catalog,
                             HashMap::new(), // Will be filled in PreloadingEssentials
+                            DEFAULT_HOT_CACHE_BYTES,
                             DEFAULT_CHUNK_CACHE_BYTES,
                         );
                         self.hybrid_directory = Some(hybrid_dir);
