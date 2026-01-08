@@ -404,10 +404,10 @@ async fn read_page<Ctx, IO: SyncEngineIo>(
     if prefetch {
         tracing::info!("read_page(page={page}): trying to prefetch more pages");
         let content = PageContent::new(buffer.clone());
-        if content.maybe_page_type().is_some() {
+        if content.page_type().is_ok() {
             tracing::info!(
                 "read_page(page={page}): detected valid page for prefetch load: {:?}",
-                content.maybe_page_type()
+                content.page_type().ok()
             );
             let mut page_refs = Vec::with_capacity(content.cell_count() + 1);
             for cell_id in 0..content.cell_count() {
@@ -417,7 +417,7 @@ async fn read_page<Ctx, IO: SyncEngineIo>(
                     );
                     break;
                 };
-                if let Some(pointer) = content.rightmost_pointer() {
+                if let Some(pointer) = content.rightmost_pointer().ok().flatten() {
                     page_refs.push(pointer);
                 }
                 match cell {

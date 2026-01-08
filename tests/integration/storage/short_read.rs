@@ -127,7 +127,7 @@ fn test_truncated_wal_returns_short_read_error() {
             Err(err) => {
                 let err_string = err.to_string();
                 assert!(
-                    err_string.contains("short read") || err_string.contains("ShortRead"),
+                    err_string.contains("short read"),
                     "Expected 'short read' error, got: {err_string}",
                 );
             }
@@ -135,19 +135,14 @@ fn test_truncated_wal_returns_short_read_error() {
     }
 }
 
-/// Test that punching a hole in a database page results in error handling, not panic.
-/// NOTE: This test is currently disabled because zeroed pages cause a different
-/// kind of error (invalid page type) that isn't handled gracefully yet.
-/// The short read handling we implemented only covers truncated files.
+/// Test that zeroing a database page results in a Corrupt error.
 #[test]
-#[ignore = "zeroed page corruption handling requires additional work beyond short read fixes"]
-fn test_zeroed_page_returns_error() {
+fn test_zeroed_page_returns_corrupt_error() {
     let _ = env_logger::try_init();
     let db_name = format!("test-zeroed-page-{}.db", rng().next_u32());
     let tmp_db = TempDatabase::new(&db_name);
     let db_path = tmp_db.path.clone();
 
-    // Create and populate the database
     {
         let conn = tmp_db.connect_limbo();
         run_query(
@@ -157,7 +152,6 @@ fn test_zeroed_page_returns_error() {
         )
         .unwrap();
 
-        // Insert enough data to create multiple pages
         for _ in 0..100 {
             run_query(
                 &tmp_db,
@@ -171,35 +165,28 @@ fn test_zeroed_page_returns_error() {
         run_query(&tmp_db, &conn, "PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
     }
 
-    // Zero out the second page (bytes 4096-8191)
+    // Zero out page 2 (bytes 4096-8191)
     {
         let mut file_contents = std::fs::read(&db_path).unwrap();
         assert!(
             file_contents.len() >= 8192,
             "Database should have at least 2 pages"
         );
-
-        // Zero out the second page
         file_contents[4096..8192].fill(0);
         std::fs::write(&db_path, file_contents).unwrap();
     }
 
-    // Open and try to query - should handle gracefully
     {
         let existing_db = TempDatabase::new_with_existent(&db_path);
         let conn = existing_db.connect_limbo();
 
         let result = limbo_exec_rows_fallible(&existing_db, &conn, "SELECT * FROM test");
 
-        // The query should fail with an error (the zeroed page makes the btree invalid)
-        // We don't panic, we return an error
-        if result.is_ok() {
-            // If by chance the zeroed page wasn't needed for this query,
-            // that's also acceptable - the test is about not panicking
-            println!("Query succeeded despite zeroed page - page may not have been accessed");
-        } else {
-            let err = result.unwrap_err();
-            println!("Query failed as expected with: {err}");
-        }
+        let err = result.expect_err("Query on database with zeroed page must return an error");
+        let err_string = err.to_string();
+        assert!(
+            err_string.contains("Corrupt") && err_string.contains("Invalid page type: 0"),
+            "Expected 'Corrupt database: Invalid page type: 0' error, got: {err_string}",
+        );
     }
 }

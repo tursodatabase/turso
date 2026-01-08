@@ -784,7 +784,7 @@ pub fn read_btree_cell(
     pos: usize,
     usable_size: usize,
 ) -> Result<BTreeCell> {
-    let page_type = page_content.page_type();
+    let page_type = page_content.page_type()?;
     let max_local = payload_overflow_threshold_max(page_type, usable_size);
     let min_local = payload_overflow_threshold_min(page_type, usable_size);
     match page_type {

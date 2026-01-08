@@ -144,6 +144,11 @@ pub enum CompletionError {
     },
     #[error("tursodb not compiled with checksum feature")]
     ChecksumNotEnabled,
+    #[error("Corrupt page {page_idx}: {message}")]
+    Corrupt {
+        page_idx: usize,
+        message: &'static str,
+    },
 }
 
 #[cold]
