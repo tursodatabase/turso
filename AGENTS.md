@@ -27,8 +27,11 @@ cargo test
 # Run tests with make (recommended)
 make test
 
+# Running a single TCL test module (*.test). TEST basepath defaults to ./testing/
+make test-single TEST=modulename.test
+
 # Run the CLI
-cargo run --package turso_cli --bin tursodb database.db
+cargo run --package turso_cli -q -m list --bin tursodb database.db
 
 # Format code (ALWAYS run before committing)
 cargo fmt
@@ -47,22 +50,34 @@ cargo bench --profile bench-profile --bench benchmark
 3. Follow existing patterns in the codebase
 4. Keep commits atomic and focused (see CONTRIBUTING.md)
 5. Don't mix logic changes with formatting/refactoring
+6. CRITICAL: this is a production database, not a toy. Correctness is absolutely paramount. No workarounds or quick hacks. All errors must be handled,
+   invariants must be checked. Assert often. Never silently fail or swallow edge cases. It is more important that the program CRASHES if it reaches an
+   invalid state that might endanger data integrity, than that it continues execution in some undefined state.
+7. Use the power of the Rust language to your advantage. Make illegal states unrepresentable. Use exhaustive pattern matching, and prefer enums over
+   strings or other "sentinel" types.
+8. Minimize heap allocations and write CPU-friendly code. This is code where a microsecond is a long time.
+9. Your objective is to produce robust, correct code, not to "make it work". Consider race conditions, data races and edge cases. On a long enough
+   timeline, ALL bugs that can happen WILL happen.
 
-## Testing Philosophy
+## Testing Practices
 
 - Turso aims for SQLite compatibility
-- Use `EXPLAIN` to compare bytecode between SQLite and Turso when debugging
-- The `testing/all.test` file contains compatibility tests which can be run with `make test`
-- Files named `testing/*.test` can be run individually by first compiling Turso (`cargo build --bin tursodb`), then executing them with `SQLITE_EXEC=scripts/limbo-sqlite3`
 - Every functional change must be accompanied by a test, preferably a SQL test, that fails without the change, and passes when the change is applied.
 - Favour writing tests first.
-- Deterministic simulation testing using the `simulator` and `whopper` tools
+- For simple compatibility tests, prefer TCL tests (./testing/*.test) and prefer to use the `do_execsql_test_on_specific_db {:memory:}` format where
+  an in-memory DB is used.
+- For regression tests, a good choice is to use Rust integration tests, found in e.g. ./tests/integration/test_transactions.rs
+- For complex features, fuzz tests are a good idea, found in e.g. ./tests/fuzz/mod.rs
+- CRITICAL: do NOT invent new test formats: add tests to existing test modules that follow existing patterns. If you add a new test module file,
+  make sure its tests follow patterns from other, existing files.
+- For manually inspecting `turso` output, you can use e.g. `cargo run --bin tursodb :memory: 'your statement here'`, including `EXPLAIN` queries
+  to inspect the bytecode plan.
 
 ## PR Guidelines
 
 - Keep PRs focused and as small as possible
 - Each commit should be atomic and tell a story
-- Run the full test suite before submitting
+- Run any relevant tests before submitting
 - CI checks: formatting, Clippy warnings, test failures
 
 ## Debugging Tips
