@@ -7511,7 +7511,7 @@ pub fn op_index_method_destroy(
     if let Some(_mv_store) = mv_store.as_ref() {
         todo!("MVCC is not supported yet");
     }
-    if let (_, CursorType::IndexMethod(module)) = &program.cursor_ref[*cursor_id] {
+    if let Some((_, CursorType::IndexMethod(module))) = program.cursor_ref.get(*cursor_id) {
         if state.cursors[*cursor_id].is_none() {
             let cursor = module.init()?;
             let cursor_ref = &mut state.cursors[*cursor_id];
