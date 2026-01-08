@@ -7544,6 +7544,38 @@ pub fn op_index_method_destroy(
     Ok(InsnFunctionStepResult::Step)
 }
 
+pub fn op_index_method_optimize(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(IndexMethodOptimize { db, cursor_id }, insn);
+    assert_eq!(*db, 0);
+    if program.connection.is_readonly(*db) {
+        return Err(LimboError::ReadOnly);
+    }
+    let mv_store = program.connection.mv_store();
+    if let Some(_mv_store) = mv_store.as_ref() {
+        todo!("MVCC is not supported yet");
+    }
+    if let Some((_, CursorType::IndexMethod(module))) = program.cursor_ref.get(*cursor_id) {
+        if state.cursors[*cursor_id].is_none() {
+            let cursor = module.init()?;
+            let cursor_ref = &mut state.cursors[*cursor_id];
+            *cursor_ref = Some(Cursor::IndexMethod(cursor));
+        }
+    }
+    let cursor = state.cursors[*cursor_id]
+        .as_mut()
+        .expect("cursor should exist");
+    let cursor = cursor.as_index_method_mut();
+    return_if_io!(cursor.optimize(&program.connection));
+
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
 pub fn op_index_method_query(
     program: &Program,
     state: &mut ProgramState,
