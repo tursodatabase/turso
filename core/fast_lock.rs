@@ -45,8 +45,27 @@ impl<T> SpinLock<T> {
         }
     }
 
+    #[inline(always)]
     pub fn lock(&self) -> SpinLockGuard<'_, T> {
-        while self.locked.swap(true, Ordering::Acquire) {
+        if self
+            .locked
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            SpinLockGuard { lock: self }
+        } else {
+            self.lock_slow()
+        }
+    }
+
+    #[inline(never)]
+    #[cold]
+    pub fn lock_slow(&self) -> SpinLockGuard<'_, T> {
+        while self
+            .locked
+            .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
             std::hint::spin_loop();
         }
         SpinLockGuard { lock: self }
