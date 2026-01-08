@@ -33,20 +33,28 @@ use tantivy::{DocAddress, HasLen, IndexReader, IndexWriter, Searcher, TantivyDoc
 use turso_parser::ast::SortOrder;
 use turso_parser::ast::{self, Select};
 
+/// Name identifier for the FTS index method, used in `CREATE INDEX ... USING fts`.
 pub const FTS_INDEX_METHOD_NAME: &str = "fts";
 
-/// 64MB default memory budget
+/// Default memory budget (64MB) for Tantivy's IndexWriter.
+/// Controls how much memory Tantivy uses for in-memory indexing before flushing to disk.
 pub const DEFAULT_MEMORY_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 
-/// 1MB default chunk size
+/// Default chunk size (1MB) for splitting large files when storing in BTree.
+/// Files larger than this are split into multiple chunks for efficient storage and retrieval.
 pub const DEFAULT_CHUNK_SIZE: usize = 1024 * 1024;
-/// Number of documents to batch before committing to Tantivy
+
+/// Number of documents to batch before committing to Tantivy.
+/// Higher values improve throughput but increase memory usage and latency.
 pub const BATCH_COMMIT_SIZE: usize = 1000;
 
-/// Default memory budget for hot cache (metadata + term dictionaries)
-pub const DEFAULT_HOT_CACHE_BYTES: usize = 64 * 1024 * 1024; // 64MB
-/// Default memory budget for chunk LRU cache
-pub const DEFAULT_CHUNK_CACHE_BYTES: usize = 128 * 1024 * 1024; // 128MB
+/// Default memory budget (64MB) for hot cache (metadata + term dictionaries).
+/// Hot files are frequently accessed and kept in an LRU cache.
+pub const DEFAULT_HOT_CACHE_BYTES: usize = 64 * 1024 * 1024;
+
+/// Default memory budget (128MB) for chunk LRU cache.
+/// Caches segment data chunks loaded on-demand from the BTree.
+pub const DEFAULT_CHUNK_CACHE_BYTES: usize = 128 * 1024 * 1024;
 
 /// Highlight matching terms in text by wrapping them with tags.
 ///
@@ -223,6 +231,7 @@ impl std::fmt::Debug for ChunkLruCache {
 }
 
 impl ChunkLruCache {
+    /// Creates a new chunk cache with the specified capacity in bytes.
     fn new(capacity: usize) -> Self {
         Self {
             capacity,
@@ -472,13 +481,17 @@ impl HotLruCache {
     }
 }
 
+/// Type aliases to please the almighty clippy
+type Catalog = HashMap<PathBuf, FileMetadata>;
+type PendingWrites = Vec<(PathBuf, Vec<u8>)>;
+
 /// Hybrid Directory implementation for Tantivy with lazy loading.
 /// - Metadata files (meta.json, etc.) are always kept in hot cache
 /// - Large segment files (.idx, .pos, .store) are lazy-loaded on demand
 /// - Uses LRU caches for both hot files and chunks to bound memory usage
 struct HybridBTreeDirectory {
     /// File catalog: path -> metadata (always in memory, no content)
-    catalog: Arc<RwLock<HashMap<PathBuf, FileMetadata>>>,
+    catalog: Arc<RwLock<Catalog>>,
 
     /// Hot cache: LRU cache for frequently accessed files (metadata, term dictionaries)
     /// Bounded to DEFAULT_HOT_CACHE_BYTES (64MB) to prevent unbounded memory growth
@@ -488,7 +501,7 @@ struct HybridBTreeDirectory {
     chunk_cache: Arc<ChunkLruCache>,
 
     /// Pending writes to be flushed to BTree
-    pending_writes: Arc<RwLock<Vec<(PathBuf, Vec<u8>)>>>,
+    pending_writes: Arc<RwLock<PendingWrites>>,
 
     /// Writes currently being flushed to BTree (still readable during flush)
     /// This preserves data for reads during async flush operations
@@ -1152,8 +1165,6 @@ fn parse_field_weights(weights_str: &str, columns: &[IndexColumn]) -> Result<Has
     Ok(weights)
 }
 
-type PendingWrites = Arc<RwLock<Vec<(PathBuf, Vec<u8>)>>>;
-
 /// CachedBTreeDirectory: In-memory Directory implementation for Tantivy.
 /// All operations are synchronous and work on in-memory data only.
 /// Actual BTree IO happens in the FtsCursor state machines.
@@ -1162,7 +1173,7 @@ pub struct CachedBTreeDirectory {
     /// Files loaded into memory: path -> content
     files: Arc<RwLock<HashMap<PathBuf, Vec<u8>>>>,
     /// Pending writes to be flushed to BTree
-    pending_writes: PendingWrites,
+    pending_writes: Arc<RwLock<PendingWrites>>,
     /// Pending deletes to be flushed to BTree
     pending_deletes: Arc<RwLock<Vec<PathBuf>>>,
 }
@@ -1387,8 +1398,12 @@ impl Directory for CachedBTreeDirectory {
     }
 }
 
+/// Factory for creating FTS index attachments.
+///
+/// Implements the `IndexMethod` trait to integrate with turso's index method system.
+/// When a user creates an FTS index with `CREATE INDEX ... USING fts (...)`,
+/// this factory creates an `FtsIndexAttachment` with the specified configuration.
 #[derive(Debug)]
-/// FtsIndexMethod: Factory for creating FTS attachments
 pub struct FtsIndexMethod;
 
 impl IndexMethod for FtsIndexMethod {
@@ -1398,12 +1413,12 @@ impl IndexMethod for FtsIndexMethod {
     }
 }
 
-/// Cached FTS directory that can be shared across cursors
-/// This avoids expensive catalog loading on every query
-/// Note: We only cache the directory (with catalog), not the Index/Reader
-/// because each cursor needs its own Index to handle writes correctly
+/// Cached FTS directory shared across cursors to avoid expensive catalog reloads.
+///
+/// Contains a `HybridBTreeDirectory` with its catalog already loaded from the BTree.
+/// Only the directory is cached, not the Tantivy Index/Reader, because each cursor
+/// needs its own Index instance to handle writes correctly.
 pub struct CachedFtsDirectory {
-    /// Cached HybridBTreeDirectory with catalog already loaded
     directory: HybridBTreeDirectory,
 }
 
@@ -1415,25 +1430,31 @@ impl std::fmt::Debug for CachedFtsDirectory {
     }
 }
 
+/// FTS index attachment that holds configuration and creates cursors for queries.
+///
+/// Created by `FtsIndexMethod::attach()` and implements `IndexMethodAttachment`.
+/// Stores the Tantivy schema, field mappings, query patterns, and a shared
+/// directory cache to optimize repeated queries.
 #[allow(dead_code)]
 #[derive(Debug)]
-/// IndexAttachment holds configuration, creates cursors
 pub struct FtsIndexAttachment {
-    /// Configuration for this index
+    /// Internal configuration
     cfg: IndexMethodConfiguration,
-    /// Underlying Tantivy schema
+    /// Tantivy schema for the FTS index
     schema: Schema,
-    /// Field for rowid
+    /// Tantivy field for the rowid column
     rowid_field: Field,
-    /// Text fields mapping
+    /// Schema fields for each indexed text column
     text_fields: Vec<(IndexColumn, Field)>,
-    /// Parsed query patterns
+    /// Parsed query patterns for FTS queries
     patterns: Vec<Select>,
-    /// Tokenizer name for text fields
+    /// Name of the tantivy tokenizer to use
     tokenizer_name: String,
-    /// Field weights for boosting (column_name -> boost factor)
+    /// Weights for each field in FTS scoring
+    /// Created from WITH clause parameters
+    /// e.g. WITH (tokenizer='default',weights='col1=1.0,col2=2.0')
     field_weights: HashMap<String, f32>,
-    /// Cached directory shared across cursors (avoids catalog reload on each query)
+    /// In-memory cached tantivy directory state
     cached_directory_state: Arc<RwLock<Option<CachedFtsDirectory>>>,
 }
 
@@ -1808,65 +1829,44 @@ enum FtsState {
     },
 }
 
-/// Cursor for executing FTS queries
+/// Cursor for executing FTS operations (queries, inserts, deletes).
+///
+/// Implements `IndexMethodCursor` to integrate with turso's VDBE execution.
+/// Uses a state machine pattern for async IO operations. Manages:
+/// - Tantivy index/reader/writer/searcher instances
+/// - BTree storage via `HybridBTreeDirectory`
+/// - Document batching for efficient bulk inserts
+/// - Query result iteration
 #[allow(dead_code)]
 pub struct FtsCursor {
     schema: Schema,
     rowid_field: Field,
     text_fields: Vec<(IndexColumn, Field)>,
-
-    // Storage table name for BTree directory
     dir_table_name: String,
-
-    // Tokenizer name for registering with Tantivy
     tokenizer_name: String,
-
-    // Field weights for boosting (column_name -> boost factor)
     field_weights: HashMap<String, f32>,
-
-    // Shared directory cache from attachment (avoids catalog reload on each query)
     shared_directory_cache: Arc<RwLock<Option<CachedFtsDirectory>>>,
-
-    // Connection for blocking IO in Drop
     connection: Option<Arc<Connection>>,
-
-    // BTree cursor for direct access (no SQL execution)
     fts_dir_cursor: Option<BTreeCursor>,
-
-    // BTree root page for the FTS directory index (needed for HybridBTreeDirectory)
     btree_root_page: Option<i64>,
-
-    // Cached directory for Tantivy (in-memory) - legacy
     cached_directory: Option<CachedBTreeDirectory>,
-
-    // Hybrid directory for Tantivy (lazy loading)
     hybrid_directory: Option<HybridBTreeDirectory>,
-
-    // Tantivy components
     index: Option<Index>,
     reader: Option<IndexReader>,
     writer: Option<IndexWriter>,
     searcher: Option<Searcher>,
-
-    // State machine for async operations
     state: FtsState,
-
-    // Batching: count of uncommitted documents in Tantivy
     pending_docs_count: usize,
-
-    // Query state
     current_hits: Vec<(f32, DocAddress, i64)>,
     hit_pos: usize,
-    /// Which pattern is being used (0=fts_score, 1=fts_match)
     current_pattern: i64,
 }
 
 impl FtsCursor {
-    /// Maximum number of results when no LIMIT clause is specified.
-    /// Used to prevent excessive memory usage, users needing more results should always specify
-    /// LIMIT.
+    /// Maximum results when no LIMIT is specified (10 million).
     const MAX_NO_LIMIT_RESULT: usize = 10_000_000;
 
+    /// Creates a new FTS cursor with the given configuration.
     pub fn new(
         cfg: &IndexMethodConfiguration,
         schema: Schema,
@@ -2668,12 +2668,13 @@ impl Drop for FtsCursor {
 }
 
 impl IndexMethodCursor for FtsCursor {
+    /// Creates the FTS index storage (internal BTree table for Tantivy files).
     fn create(&mut self, conn: &Arc<Connection>) -> Result<IOResult<()>> {
-        // Ensure storage table exists (still uses SQL for DDL)
         initialize_btree_storage_table(conn, &self.dir_table_name)?;
         Ok(IOResult::Done(()))
     }
 
+    /// Destroys the FTS index, dropping all storage and clearing caches.
     fn destroy(&mut self, conn: &Arc<Connection>) -> Result<IOResult<()>> {
         tracing::debug!(
             "FTS destroy: dropping internal storage {}",
@@ -2715,11 +2716,12 @@ impl IndexMethodCursor for FtsCursor {
         Ok(IOResult::Done(()))
     }
 
+    /// Opens the index for reading, loading the catalog and creating a searcher.
+    /// Uses async state machine for non-blocking IO during catalog/file loading.
     fn open_read(&mut self, conn: &Arc<Connection>) -> Result<IOResult<()>> {
         loop {
             match &mut self.state {
                 FtsState::Init => {
-                    // Store connection for blocking flush in Drop
                     self.connection = Some(conn.clone());
                     // Ensure storage table exists
                     initialize_btree_storage_table(conn, &self.dir_table_name)?;
@@ -2981,8 +2983,9 @@ impl IndexMethodCursor for FtsCursor {
         }
     }
 
+    /// Opens the index for writing, creating the IndexWriter.
+    /// Calls `open_read` first if not already initialized.
     fn open_write(&mut self, conn: &Arc<Connection>) -> Result<IOResult<()>> {
-        // Ensure connection is stored for blocking flush in Drop
         if self.connection.is_none() {
             self.connection = Some(conn.clone());
         }
@@ -3016,10 +3019,10 @@ impl IndexMethodCursor for FtsCursor {
         Ok(IOResult::Done(()))
     }
 
+    /// Inserts a document into the FTS index.
+    /// Values are text columns followed by rowid. Batches commits for efficiency.
     fn insert(&mut self, values: &[Register]) -> Result<IOResult<()>> {
-        // Handle flush state machine if in progress - loop until flush completes
-        // This is critical: we must NOT return Done when flush completes,
-        // otherwise the VDBE thinks the insert is done but we never added the document!
+        // Handle flush state machine if in progress
         loop {
             match &self.state {
                 FtsState::FlushingWrites { .. }
@@ -3096,13 +3099,13 @@ impl IndexMethodCursor for FtsCursor {
         Ok(IOResult::Done(()))
     }
 
+    /// Deletes a document from the FTS index by rowid.
     fn delete(&mut self, values: &[Register]) -> Result<IOResult<()>> {
         let Some(ref mut writer) = self.writer else {
             return Err(LimboError::InternalError(
                 "FTS writer not initialized - call open_write first".into(),
             ));
         };
-
         // Last register is rowid
         let rowid_reg = values.last().ok_or_else(|| {
             LimboError::InternalError("FTS delete requires at least rowid".into())
@@ -3129,6 +3132,8 @@ impl IndexMethodCursor for FtsCursor {
         Ok(IOResult::Done(()))
     }
 
+    /// Starts an FTS query. Parses the query string and executes the search.
+    /// Returns true if there are results, false otherwise.
     fn query_start(&mut self, values: &[Register]) -> Result<IOResult<bool>> {
         let Some(ref searcher) = self.searcher else {
             return Err(LimboError::InternalError(
@@ -3222,6 +3227,7 @@ impl IndexMethodCursor for FtsCursor {
         Ok(IOResult::Done(!self.current_hits.is_empty()))
     }
 
+    /// Advances to the next query result. Returns true if more results exist.
     fn query_next(&mut self) -> Result<IOResult<bool>> {
         if self.hit_pos >= self.current_hits.len() {
             return Ok(IOResult::Done(false));
@@ -3230,6 +3236,7 @@ impl IndexMethodCursor for FtsCursor {
         Ok(IOResult::Done(self.hit_pos < self.current_hits.len()))
     }
 
+    /// Returns the column value for the current result (score or match indicator).
     fn query_column(&mut self, idx: usize) -> Result<IOResult<Value>> {
         // Column 0 = score for fts_score, or 1 (true) for fts_match
         if idx != 0 {
@@ -3266,6 +3273,7 @@ impl IndexMethodCursor for FtsCursor {
         }
     }
 
+    /// Returns the rowid for the current query result.
     fn query_rowid(&mut self) -> Result<IOResult<Option<i64>>> {
         if self.hit_pos >= self.current_hits.len() {
             return Ok(IOResult::Done(None));
@@ -3274,7 +3282,7 @@ impl IndexMethodCursor for FtsCursor {
         Ok(IOResult::Done(Some(rowid)))
     }
 
-    /// Flush any pending writes before transaction commit.
+    /// Flushes pending writes before transaction commit.
     /// This ensures FTS writes are persisted as part of the transaction.
     fn pre_commit(&mut self) -> Result<IOResult<()>> {
         // First, check if we're in the middle of a flush operation that needs to continue
@@ -3302,5 +3310,80 @@ impl IndexMethodCursor for FtsCursor {
             return self.commit_and_flush();
         }
         Ok(IOResult::Done(()))
+    }
+
+    /// Optimizes the FTS index by merging all segments into one.
+    /// Call via `OPTIMIZE INDEX idx_name` SQL command.
+    fn optimize(&mut self, connection: &Arc<Connection>) -> Result<IOResult<()>> {
+        // First ensure any pending documents are flushed
+        if self.pending_docs_count > 0 {
+            tracing::info!(
+                "FTS optimize: flushing {} pending documents first",
+                self.pending_docs_count
+            );
+            return_if_io!(self.commit_and_flush());
+        }
+
+        // If we're not open for writing, open it
+        if self.writer.is_none() {
+            return_if_io!(self.open_write(connection));
+        }
+
+        let index = self
+            .index
+            .as_ref()
+            .ok_or_else(|| LimboError::InternalError("FTS index not initialized".to_string()))?;
+        let writer = self
+            .writer
+            .as_mut()
+            .ok_or_else(|| LimboError::InternalError("FTS writer not initialized".to_string()))?;
+
+        // Get all searchable segment IDs
+        let segment_ids = index
+            .searchable_segment_ids()
+            .map_err(|e| LimboError::InternalError(format!("FTS optimize: {e}")))?;
+
+        if segment_ids.len() <= 1 {
+            tracing::debug!(
+                "FTS optimize: nothing to merge ({} segments)",
+                segment_ids.len()
+            );
+            return Ok(IOResult::Done(()));
+        }
+
+        tracing::debug!(
+            "FTS optimize: merging {} segments into one",
+            segment_ids.len()
+        );
+        // Schedule the merge operation
+        let merge_future = writer.merge(&segment_ids);
+        // Wait for merge to complete (blocking)
+        match merge_future.wait() {
+            Ok(Some(segment_meta)) => {
+                tracing::info!(
+                    "FTS optimize: merge completed, new segment has {} docs",
+                    segment_meta.num_docs()
+                );
+            }
+            Ok(None) => {
+                // Merge was cancelled or no merge was needed
+                tracing::info!("FTS optimize: merge was cancelled or no merge needed");
+            }
+            Err(e) => {
+                return Err(LimboError::InternalError(format!(
+                    "FTS optimize merge failed: {e}",
+                )));
+            }
+        }
+
+        // Commit merge and invalidate shared directory cache since we changed the structure, and flush
+        writer
+            .commit()
+            .map_err(|e| LimboError::InternalError(format!("FTS optimize commit failed: {e}")))?;
+        {
+            let mut cache = self.shared_directory_cache.write();
+            *cache = None;
+        }
+        self.commit_and_flush()
     }
 }
