@@ -97,6 +97,13 @@ pub fn emit_ungrouped_aggregation<'a>(
         t_ctx.limit_ctx,
     )?;
 
+    // Resolve the SELECT DISTINCT label if present
+    // When a duplicate is found by the Found instruction, jump here to skip emitting the row
+    if let Distinctness::Distinct { ctx } = &plan.distinctness {
+        let distinct_ctx = ctx.as_ref().expect("distinct context must exist");
+        program.preassign_label_to_next_insn(distinct_ctx.label_on_conflict);
+    }
+
     program.resolve_label(end_label, program.offset());
 
     Ok(())
