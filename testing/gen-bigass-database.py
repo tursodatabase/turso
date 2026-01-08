@@ -405,8 +405,8 @@ for i in range(10000):
     tags = ", ".join(fake.words(nb=random.randint(3, 6)))
     # 2-4 sentence summary
     summary = " ".join(fake.sentences(nb=random.randint(2, 4)))
-    # 8-20 paragraphs for body text (substantial content for FTS)
-    body = "\n\n".join(fake.paragraphs(nb=random.randint(8, 20)))
+    # 20-50 paragraphs body
+    body = "\n\n".join(fake.paragraphs(nb=random.randint(20, 50)))
     published_at = fake.date_time_between(start_date="-2y", end_date="now")
     updated_at = fake.date_time_between(start_date=published_at, end_date="now")
 
