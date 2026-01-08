@@ -50,6 +50,15 @@ jobs:
         with:
           fetch-depth: 1
 
+      # Handle fork PRs: checkout the PR branch when triggered from a PR context
+      # This is needed because fork branches don't exist in the base repository
+      - name: Checkout PR branch from fork
+        if: github.event.issue.pull_request || github.event.pull_request
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr checkout ${{ github.event.issue.number || github.event.pull_request.number }}
+
       - name: Set up Rust
         uses: dtolnay/rust-toolchain@stable
         with:
