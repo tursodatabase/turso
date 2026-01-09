@@ -1531,3 +1531,8 @@ do_execsql_test_on_specific_db {:memory:} values-select-empty-db {
 do_execsql_test_on_specific_db {:memory:} select-sqlite-schema-empty-db {
   select group_concat(name) over () from sqlite_schema;
 } {}
+
+# Test that ?0 is rejected with a proper error message (issue #4556)
+do_execsql_test_error select-param-zero-invalid {
+  SELECT ?0
+} {.*variable number must be between.*}
