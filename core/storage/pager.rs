@@ -430,7 +430,7 @@ impl PageInner {
 
     #[inline(always)]
     pub fn cell_table_interior_read_rowid(&self, idx: usize) -> crate::Result<i64> {
-        debug_assert!(self.page_type().ok() == Some(PageType::TableInterior));
+        debug_assert!(matches!(self.page_type(), Ok(PageType::TableInterior)));
         let buf = self.as_ptr();
         let cell_pointer_array_start = self.header_size();
         let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
@@ -441,26 +441,26 @@ impl PageInner {
     }
 
     #[inline(always)]
-    pub fn cell_interior_read_left_child_page(&self, idx: usize) -> crate::Result<u32> {
+    pub fn cell_interior_read_left_child_page(&self, idx: usize) -> u32 {
         debug_assert!(matches!(
-            self.page_type().ok(),
-            Some(PageType::TableInterior) | Some(PageType::IndexInterior)
+            self.page_type(),
+            Ok(PageType::TableInterior) | Ok(PageType::IndexInterior)
         ));
         let buf = self.as_ptr();
         let cell_pointer_array_start = self.header_size();
         let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
         let cell_pointer = self.read_u16(cell_pointer) as usize;
-        Ok(u32::from_be_bytes([
+        u32::from_be_bytes([
             buf[cell_pointer],
             buf[cell_pointer + 1],
             buf[cell_pointer + 2],
             buf[cell_pointer + 3],
-        ]))
+        ])
     }
 
     #[inline(always)]
     pub fn cell_table_leaf_read_rowid(&self, idx: usize) -> crate::Result<i64> {
-        debug_assert!(self.page_type().ok() == Some(PageType::TableLeaf));
+        debug_assert!(matches!(self.page_type(), Ok(PageType::TableLeaf)));
         let buf = self.as_ptr();
         let cell_pointer_array_start = self.header_size();
         let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
