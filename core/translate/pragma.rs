@@ -71,20 +71,15 @@ pub fn translate_pragma(
     };
 
     let (mut program, mode) = match body {
-        None => query_pragma(pragma, resolver.schema, None, pager, connection, program)?,
+        None => query_pragma(pragma, resolver, None, pager, connection, program)?,
         Some(ast::PragmaBody::Equals(value) | ast::PragmaBody::Call(value)) => match pragma {
             // These pragmas take a parameter but are queries, not setters
             PragmaName::TableInfo
             | PragmaName::TableXinfo
             | PragmaName::IntegrityCheck
-            | PragmaName::QuickCheck => query_pragma(
-                pragma,
-                resolver.schema,
-                Some(*value),
-                pager,
-                connection,
-                program,
-            )?,
+            | PragmaName::QuickCheck => {
+                query_pragma(pragma, resolver, Some(*value), pager, connection, program)?
+            }
             _ => update_pragma(pragma, resolver, *value, pager, connection, program)?,
         },
     };
@@ -193,7 +188,7 @@ fn update_pragma(
         PragmaName::LegacyFileFormat => Ok((program, TransactionMode::None)),
         PragmaName::WalCheckpoint => query_pragma(
             PragmaName::WalCheckpoint,
-            resolver.schema,
+            resolver,
             Some(value),
             pager,
             connection,
@@ -202,7 +197,7 @@ fn update_pragma(
         PragmaName::ModuleList => Ok((program, TransactionMode::None)),
         PragmaName::PageCount => query_pragma(
             PragmaName::PageCount,
-            resolver.schema,
+            resolver,
             None,
             pager,
             connection,
@@ -379,7 +374,7 @@ fn update_pragma(
         PragmaName::DatabaseList => unreachable!("database_list cannot be set"),
         PragmaName::QueryOnly => query_pragma(
             PragmaName::QueryOnly,
-            resolver.schema,
+            resolver,
             Some(value),
             pager,
             connection,
@@ -387,7 +382,7 @@ fn update_pragma(
         ),
         PragmaName::FreelistCount => query_pragma(
             PragmaName::FreelistCount,
-            resolver.schema,
+            resolver,
             Some(value),
             pager,
             connection,
@@ -440,12 +435,13 @@ fn update_pragma(
 
 fn query_pragma(
     pragma: PragmaName,
-    schema: &Schema,
+    resolver: &Resolver,
     value: Option<ast::Expr>,
     pager: Arc<Pager>,
     connection: Arc<crate::Connection>,
     mut program: ProgramBuilder,
 ) -> crate::Result<(ProgramBuilder, TransactionMode)> {
+    let schema = resolver.schema;
     let register = program.alloc_register();
     match pragma {
         PragmaName::ApplicationId => {
@@ -692,12 +688,12 @@ fn query_pragma(
         }
         PragmaName::IntegrityCheck => {
             let max_errors = parse_max_errors_from_value(&value);
-            translate_integrity_check(schema, &mut program, max_errors)?;
+            translate_integrity_check(schema, &mut program, resolver, max_errors)?;
             Ok((program, TransactionMode::Read))
         }
         PragmaName::QuickCheck => {
             let max_errors = parse_max_errors_from_value(&value);
-            translate_quick_check(schema, &mut program, max_errors)?;
+            translate_quick_check(schema, &mut program, resolver, max_errors)?;
             Ok((program, TransactionMode::Read))
         }
         PragmaName::UnstableCaptureDataChangesConn => {
