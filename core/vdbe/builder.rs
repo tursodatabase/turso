@@ -1,7 +1,6 @@
-use crate::sync::RwLock;
 use std::{
     collections::{HashMap, HashSet},
-    sync::{atomic::AtomicI64, Arc},
+    sync::Arc,
 };
 
 use tracing::{instrument, Level};
@@ -40,7 +39,7 @@ impl TableRefIdCounter {
     }
 }
 
-use super::{BranchOffset, CursorID, ExplainState, Insn, InsnReference, JumpTarget, Program};
+use super::{BranchOffset, CursorID, Insn, InsnReference, JumpTarget, Program};
 
 /// A key that uniquely identifies a cursor.
 /// The key is a pair of table reference id and index.
@@ -1340,7 +1339,6 @@ impl ProgramBuilder {
             comments: self.comments,
             connection,
             parameters: self.parameters,
-            n_change: AtomicI64::new(0),
             change_cnt_on,
             result_columns: self.result_columns,
             table_references: self.table_references,
@@ -1351,7 +1349,6 @@ impl ProgramBuilder {
             is_subprogram: self.is_subprogram,
             contains_trigger_subprograms,
             resolve_type: self.resolve_type,
-            explain_state: RwLock::new(ExplainState::default()),
         })
     }
 }
