@@ -1,0 +1,134 @@
+#!/usr/bin/env tclsh
+# tests are frm sqlite/test/json105.test
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+
+# json_extract tests with [#] path extension
+do_execsql_test_on_specific_db {:memory:} json105-extract {
+    CREATE TABLE t1(j);
+    INSERT INTO t1(j) VALUES('{"a":1,"b":[1,[2,3],4],"c":99}');
+    SELECT quote(json_extract(j,'$.b[#]')) FROM t1;
+    SELECT quote(json_extract(j,'$.b[#-1]')) FROM t1;
+    SELECT quote(json_extract(j,'$.b[#-2]')) FROM t1;
+    SELECT quote(json_extract(j,'$.b[#-02]')) FROM t1;
+    SELECT quote(json_extract(j,'$.b[#-3]')) FROM t1;
+    SELECT quote(json_extract(j,'$.b[#-4]')) FROM t1;
+    SELECT quote(json_extract(j,'$.b[#-2][#-1]')) FROM t1;
+    SELECT quote(json_extract(j,'$.b[0]','$.b[#-1]')) FROM t1;
+    SELECT quote(json_extract(j,'$.a[#-1]')) FROM t1;
+    SELECT quote(json_extract(j,'$.b[#-000001]')) FROM t1;
+} {NULL
+4
+'[2,3]'
+'[2,3]'
+1
+NULL
+3
+'[1,4]'
+NULL
+4}
+
+# json_remove tests with [#] path extension
+do_execsql_test_on_specific_db {:memory:} json105-remove {
+    CREATE TABLE t1(j);
+    INSERT INTO t1(j) VALUES('{"a":1,"b":[1,[2,3],4],"c":99}');
+    SELECT quote(json_remove(j,'$.b[#]')) FROM t1;
+    SELECT quote(json_remove(j,'$.b[#-0]')) FROM t1;
+    SELECT quote(json_remove(j,'$.b[#-1]')) FROM t1;
+    SELECT quote(json_remove(j,'$.b[#-2]')) FROM t1;
+    SELECT quote(json_remove(j,'$.b[#-3]')) FROM t1;
+    SELECT quote(json_remove(j,'$.b[#-4]')) FROM t1;
+    SELECT quote(json_remove(j,'$.b[#-2][#-1]')) FROM t1;
+    SELECT quote(json_remove(j,'$.b[0]','$.b[#-1]')) FROM t1;
+    SELECT quote(json_remove(j,'$.b[#-1]','$.b[0]')) FROM t1;
+    SELECT quote(json_remove(j,'$.b[#-1]','$.b[#-2]')) FROM t1;
+    SELECT quote(json_remove(j,'$.b[#-1]','$.b[#-1]')) FROM t1;
+    SELECT quote(json_remove(j,'$.b[#-2]','$.b[#-1]')) FROM t1;
+} {'{"a":1,"b":[1,[2,3],4],"c":99}'
+'{"a":1,"b":[1,[2,3],4],"c":99}'
+'{"a":1,"b":[1,[2,3]],"c":99}'
+'{"a":1,"b":[1,4],"c":99}'
+'{"a":1,"b":[[2,3],4],"c":99}'
+'{"a":1,"b":[1,[2,3],4],"c":99}'
+'{"a":1,"b":[1,[2],4],"c":99}'
+'{"a":1,"b":[[2,3]],"c":99}'
+'{"a":1,"b":[[2,3]],"c":99}'
+'{"a":1,"b":[[2,3]],"c":99}'
+'{"a":1,"b":[1],"c":99}'
+'{"a":1,"b":[1],"c":99}'}
+
+# json_insert tests with [#] path extension
+do_execsql_test_on_specific_db {:memory:} json105-insert {
+    CREATE TABLE t1(j);
+    INSERT INTO t1(j) VALUES('{"a":1,"b":[1,[2,3],4],"c":99}');
+    SELECT quote(json_insert(j,'$.b[#]','AAA')) FROM t1;
+    SELECT quote(json_insert(j,'$.b[1][#]','AAA')) FROM t1;
+    SELECT quote(json_insert(j,'$.b[1][#]','AAA','$.b[#]','BBB')) FROM t1;
+    SELECT quote(json_insert(j,'$.b[#]','AAA','$.b[#]','BBB')) FROM t1;
+} {'{"a":1,"b":[1,[2,3],4,"AAA"],"c":99}'
+'{"a":1,"b":[1,[2,3,"AAA"],4],"c":99}'
+'{"a":1,"b":[1,[2,3,"AAA"],4,"BBB"],"c":99}'
+'{"a":1,"b":[1,[2,3],4,"AAA","BBB"],"c":99}'}
+
+# json_set tests with [#] path extension
+do_execsql_test_on_specific_db {:memory:} json105-set {
+    CREATE TABLE t1(j);
+    INSERT INTO t1(j) VALUES('{"a":1,"b":[1,[2,3],4],"c":99}');
+    SELECT quote(json_set(j,'$.b[#]','AAA')) FROM t1;
+    SELECT quote(json_set(j,'$.b[1][#]','AAA')) FROM t1;
+    SELECT quote(json_set(j,'$.b[1][#]','AAA','$.b[#]','BBB')) FROM t1;
+    SELECT quote(json_set(j,'$.b[#]','AAA','$.b[#]','BBB')) FROM t1;
+    SELECT quote(json_set(j,'$.b[#-1]','AAA')) FROM t1;
+    SELECT quote(json_set(j,'$.b[1][#-1]','AAA')) FROM t1;
+    SELECT quote(json_set(j,'$.b[1][#-1]','AAA','$.b[#-1]','BBB')) FROM t1;
+    SELECT quote(json_set(j,'$.b[#-1]','AAA','$.b[#-1]','BBB')) FROM t1;
+} {'{"a":1,"b":[1,[2,3],4,"AAA"],"c":99}'
+'{"a":1,"b":[1,[2,3,"AAA"],4],"c":99}'
+'{"a":1,"b":[1,[2,3,"AAA"],4,"BBB"],"c":99}'
+'{"a":1,"b":[1,[2,3],4,"AAA","BBB"],"c":99}'
+'{"a":1,"b":[1,[2,3],"AAA"],"c":99}'
+'{"a":1,"b":[1,[2,"AAA"],4],"c":99}'
+'{"a":1,"b":[1,[2,"AAA"],"BBB"],"c":99}'
+'{"a":1,"b":[1,[2,3],"BBB"],"c":99}'}
+
+# json_replace tests with [#] path extension
+do_execsql_test_on_specific_db {:memory:} json105-replace {
+    CREATE TABLE t1(j);
+    INSERT INTO t1(j) VALUES('{"a":1,"b":[1,[2,3],4],"c":99}');
+    SELECT quote(json_replace(j,'$.b[#]','AAA')) FROM t1;
+    SELECT quote(json_replace(j,'$.b[1][#]','AAA')) FROM t1;
+    SELECT quote(json_replace(j,'$.b[1][#]','AAA','$.b[#]','BBB')) FROM t1;
+    SELECT quote(json_replace(j,'$.b[#]','AAA','$.b[#]','BBB')) FROM t1;
+    SELECT quote(json_replace(j,'$.b[#-1]','AAA')) FROM t1;
+    SELECT quote(json_replace(j,'$.b[1][#-1]','AAA')) FROM t1;
+    SELECT quote(json_replace(j,'$.b[1][#-1]','AAA','$.b[#-1]','BBB')) FROM t1;
+    SELECT quote(json_replace(j,'$.b[#-1]','AAA','$.b[#-1]','BBB')) FROM t1;
+} {'{"a":1,"b":[1,[2,3],4],"c":99}'
+'{"a":1,"b":[1,[2,3],4],"c":99}'
+'{"a":1,"b":[1,[2,3],4],"c":99}'
+'{"a":1,"b":[1,[2,3],4],"c":99}'
+'{"a":1,"b":[1,[2,3],"AAA"],"c":99}'
+'{"a":1,"b":[1,[2,"AAA"],4],"c":99}'
+'{"a":1,"b":[1,[2,"AAA"],"BBB"],"c":99}'
+'{"a":1,"b":[1,[2,3],"BBB"],"c":99}'}
+
+do_execsql_test_on_specific_db :memory: json105-bad-paths {
+    SELECT quote(json_extract('{}', '$.b[#-]'));
+    SELECT quote(json_extract('{}', '$.b[#9]'));
+    SELECT quote(json_extract('{}', '$.b[#+2]'));
+    SELECT quote(json_extract('{}', '$.b[#-1'));
+    SELECT quote(json_extract('{}', '$.b[#-1x]'));
+} {NULL
+NULL
+NULL
+NULL
+NULL}
+
+do_execsql_test_on_specific_db {:memory:} json-append-test {
+    SELECT json_set('["a"]', '$[1]', 'b');
+    SELECT json_set('["a"]', '$[5]', 'b');
+} {
+    {["a","b"]}
+    {["a"]}
+}
