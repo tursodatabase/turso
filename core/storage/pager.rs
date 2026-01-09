@@ -4308,7 +4308,7 @@ pub fn default_page1(cipher: Option<&CipherMode>) -> PageRef {
     page
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy)]
 pub struct CreateBTreeFlags(pub u8);
 impl CreateBTreeFlags {
     pub const TABLE: u8 = 0b0001;

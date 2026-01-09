@@ -748,6 +748,7 @@ pub struct ExplainState {
     subprogram_start_pc: Option<usize>,
 }
 
+#[derive(Clone)]
 pub struct Program {
     pub max_registers: usize,
     // we store original indices because we don't want to create new vec from
