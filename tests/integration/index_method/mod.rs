@@ -1128,7 +1128,7 @@ fn test_fts_tokenizer_configuration(tmp_db: TempDatabase) {
         "SELECT id FROM docs_simple WHERE fts_match(content, 'Hello')",
     );
     // Simple tokenizer in Tantivy lowercases by default too
-    assert!(rows.len() >= 1);
+    assert!(!rows.is_empty());
 }
 
 /// Test that invalid tokenizer names are rejected
@@ -1176,14 +1176,14 @@ fn test_fts_ngram_tokenizer(tmp_db: TempDatabase) {
         "SELECT id FROM products WHERE fts_match(name, 'Pho')",
     );
     // With ngram(2,3), "Pho" generates ngrams that should match ngrams in "iPhone"
-    assert!(rows.len() >= 1);
+    assert!(!rows.is_empty());
 
     // Search for "Gal" should match "Galaxy"
     let rows = limbo_exec_rows(
         &conn,
         "SELECT id FROM products WHERE fts_match(name, 'Gal')",
     );
-    assert!(rows.len() >= 1);
+    assert!(!rows.is_empty());
 }
 
 /// Test fts_highlight function for text highlighting
@@ -1300,7 +1300,7 @@ fn test_fts_highlight_with_fts_query(tmp_db: TempDatabase) {
     );
 
     // Should match article 1 (has "database" in both title and body)
-    assert!(rows.len() >= 1);
+    assert!(!rows.is_empty());
 
     // Check that the highlighted body contains the mark tags
     let mut found_highlight = false;
@@ -1571,14 +1571,10 @@ fn test_fts_comprehensive_lifecycle(tmp_db: TempDatabase) {
         };
         let term1 = terms[(i - 1) % terms.len()];
         let term2 = terms[i % terms.len()];
-        let title = format!("{} Article {}", term1, i);
-        let body = format!(
-            "This is article {} about {} and {}. More content here.",
-            i, term1, term2
-        );
+        let title = format!("{term1} Article {i}");
+        let body = format!("This is article {i} about {term1} and {term2}. More content here.",);
         conn.execute(format!(
-            "INSERT INTO docs VALUES ({}, '{}', '{}', '{}')",
-            i, category, title, body
+            "INSERT INTO docs VALUES ({i}, '{category}', '{title}', '{body}')",
         ))
         .unwrap();
     }
@@ -1588,21 +1584,21 @@ fn test_fts_comprehensive_lifecycle(tmp_db: TempDatabase) {
         &conn,
         "SELECT id FROM docs WHERE fts_match(title, body, 'Rust')",
     );
-    assert!(rows.len() > 0, "Should find Rust documents");
+    assert!(!rows.is_empty(), "Should find Rust documents");
     let rust_count_initial = rows.len();
 
     let rows = limbo_exec_rows(
         &conn,
         "SELECT id FROM docs WHERE fts_match(title, body, 'Python')",
     );
-    assert!(rows.len() > 0, "Should find Python documents");
+    assert!(!rows.is_empty(), "Should find Python documents");
 
     // Query with score ordering
     let rows = limbo_exec_rows(
         &conn,
         "SELECT fts_score(title, body, 'programming') as score, id FROM docs WHERE fts_match(title, body, 'programming') ORDER BY score DESC LIMIT 10",
     );
-    assert!(rows.len() > 0, "Should find programming documents");
+    assert!(!rows.is_empty(), "Should find programming documents");
 
     // 3. Insert new documents
     conn.execute("INSERT INTO docs VALUES (101, 'tech', 'Advanced Rust Techniques', 'Deep dive into Rust programming patterns and idioms')")
@@ -1653,7 +1649,7 @@ fn test_fts_comprehensive_lifecycle(tmp_db: TempDatabase) {
     // Note: If FTS doesn't support delete yet, this may still find the doc
     // For now, just verify the query doesn't panic
     let _ = rows.len(); // Query should not panic after delete
-    if !has_deleted_doc && rows.len() == 0 {
+    if !has_deleted_doc && rows.is_empty() {
         // FTS properly removed the deleted document
     }
 
@@ -1679,7 +1675,7 @@ fn test_fts_comprehensive_lifecycle(tmp_db: TempDatabase) {
         "SELECT id FROM docs WHERE fts_match(title, body, 'Python')",
     );
     assert!(
-        rows.len() > 0,
+        !rows.is_empty(),
         "Should still find Python documents after update"
     );
 
@@ -1711,7 +1707,7 @@ fn test_fts_comprehensive_lifecycle(tmp_db: TempDatabase) {
     );
     // Should find tech documents about Rust
     assert!(
-        rows.len() > 0,
+        !rows.is_empty(),
         "Should find tech documents about Rust with complex query"
     );
 
@@ -1814,9 +1810,8 @@ fn test_fts_optimize_index(tmp_db: TempDatabase) {
 
     // Insert multiple batches of documents to create multiple segments
     for i in 0..10 {
-        conn.execute(&format!(
-            "INSERT INTO docs VALUES ({}, 'Document {}', 'Content about topic {} with keywords')",
-            i, i, i
+        conn.execute(format!(
+            "INSERT INTO docs VALUES ({i}, 'Document {i}', 'Content about topic {i} with keywords')",
         ))
         .unwrap();
     }
@@ -2151,4 +2146,235 @@ fn test_fts_with_left_join(tmp_db: TempDatabase) {
         .filter(|r| matches!(&r[2], rusqlite::types::Value::Null))
         .count();
     assert_eq!(null_category_count, 1, "One post should have NULL category");
+}
+
+/// Test that FTS participates in join order optimization.
+/// Uses EXPLAIN QUERY PLAN to verify the actual join order and that FTS is used.
+#[cfg(feature = "fts")]
+#[turso_macros::test]
+fn test_fts_join_order_optimization(tmp_db: TempDatabase) {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+
+    // Create a small authors table and a larger articles table
+    conn.execute("CREATE TABLE authors(id INTEGER PRIMARY KEY, name TEXT)")
+        .unwrap();
+    conn.execute(
+        "CREATE TABLE articles(id INTEGER PRIMARY KEY, title TEXT, body TEXT, author_id INTEGER)",
+    )
+    .unwrap();
+
+    // Create FTS index on articles
+    conn.execute("CREATE INDEX fts_articles ON articles USING fts (title, body)")
+        .unwrap();
+
+    // Insert a few authors (small table)
+    for i in 1..=5 {
+        conn.execute(format!("INSERT INTO authors VALUES ({i}, 'Author{i}')"))
+            .unwrap();
+    }
+
+    // Insert many articles (larger table) - more than authors to show cardinality difference
+    for i in 1..=50 {
+        let author_id = (i % 5) + 1;
+        let (title, body) = if i % 10 == 0 {
+            // Every 10th article is about database
+            (
+                format!("Database Article {i}"),
+                "Content about database systems and SQL".to_string(),
+            )
+        } else {
+            (
+                format!("General Article {i}"),
+                "General content about various topics".to_string(),
+            )
+        };
+        conn.execute(format!(
+            "INSERT INTO articles VALUES ({i}, '{title}', '{body}', {author_id})"
+        ))
+        .unwrap();
+    }
+
+    // Check the query plan using EXPLAIN QUERY PLAN
+    let query = "SELECT a.id, a.title, u.name FROM articles a JOIN authors u ON a.author_id = u.id WHERE fts_match(a.title, a.body, 'database')";
+    let eqp_rows = limbo_exec_rows(&conn, &format!("EXPLAIN QUERY PLAN {query}"));
+
+    // Extract table access order and check for FTS usage
+    let mut table_order = Vec::new();
+    let mut has_fts_search = false;
+    for row in &eqp_rows {
+        if let rusqlite::types::Value::Text(detail) = &row[3] {
+            // Check for FTS index method query (format: "QUERY INDEX METHOD fts")
+            if detail.contains("INDEX METHOD") || detail.contains("fts_articles") {
+                has_fts_search = true;
+            }
+            // Extract table name from SCAN or SEARCH lines
+            if let Some(rest) = detail.strip_prefix("SCAN ") {
+                let table = rest.split_whitespace().next().unwrap();
+                table_order.push(table.to_string());
+            } else if let Some(rest) = detail.strip_prefix("SEARCH ") {
+                let table = rest.split_whitespace().next().unwrap();
+                table_order.push(table.to_string());
+            } else if detail.starts_with("QUERY INDEX METHOD") {
+                // FTS queries show up as "QUERY INDEX METHOD fts"
+                table_order.push("articles".to_string());
+            }
+        }
+    }
+
+    // Verify that the optimizer is using the FTS index
+    assert!(
+        has_fts_search,
+        "Expected FTS index to be used in query plan. Plan details: {:?}",
+        eqp_rows
+            .iter()
+            .filter_map(|r| r.get(3).and_then(|v| match v {
+                rusqlite::types::Value::Text(t) => Some(t.as_str()),
+                _ => None,
+            }))
+            .collect::<Vec<_>>()
+    );
+
+    // Verify the join order: FTS (articles) should be first, authors second
+    assert_eq!(
+        table_order.len(),
+        2,
+        "Expected 2 tables in join order, got: {table_order:?}"
+    );
+    assert_eq!(
+        table_order[0], "articles",
+        "Expected articles (FTS) to be first in join order, got: {table_order:?}"
+    );
+    assert!(
+        table_order[1] == "u" || table_order[1] == "authors",
+        "Expected authors to be second in join order, got: {table_order:?}"
+    );
+
+    // Execute the query and verify results
+    let rows = limbo_exec_rows(&conn, query);
+
+    // Should find 5 articles about database (every 10th: 10, 20, 30, 40, 50)
+    assert_eq!(rows.len(), 5, "Should find 5 articles about database");
+
+    // Verify all results have valid author names
+    for row in &rows {
+        let author_name = match &row[2] {
+            rusqlite::types::Value::Text(t) => t.clone(),
+            _ => panic!("Expected text for author name"),
+        };
+        assert!(
+            author_name.starts_with("Author"),
+            "Author name should start with 'Author'"
+        );
+    }
+
+    // Test with reversed table order in SQL - optimizer should still use FTS
+    let query2 = "SELECT a.id, a.title, u.name FROM authors u JOIN articles a ON u.id = a.author_id WHERE fts_match(a.title, a.body, 'database')";
+    let eqp_rows2 = limbo_exec_rows(&conn, &format!("EXPLAIN QUERY PLAN {query2}"));
+
+    // Verify FTS is still used regardless of SQL table order
+    let mut has_fts_search2 = false;
+    for row in &eqp_rows2 {
+        if let rusqlite::types::Value::Text(detail) = &row[3] {
+            if detail.contains("INDEX METHOD") || detail.contains("fts_articles") {
+                has_fts_search2 = true;
+            }
+        }
+    }
+    assert!(
+        has_fts_search2,
+        "Expected FTS index to be used with reversed table order. Plan details: {:?}",
+        eqp_rows2
+            .iter()
+            .filter_map(|r| r.get(3).and_then(|v| match v {
+                rusqlite::types::Value::Text(t) => Some(t.as_str()),
+                _ => None,
+            }))
+            .collect::<Vec<_>>()
+    );
+
+    let rows2 = limbo_exec_rows(&conn, query2);
+    assert_eq!(
+        rows2.len(),
+        5,
+        "Should find same 5 articles with reversed table order"
+    );
+}
+
+/// Test FTS with multiple joins to verify cost-based optimization works
+/// with more complex join patterns.
+#[cfg(feature = "fts")]
+#[turso_macros::test]
+fn test_fts_multi_table_join(tmp_db: TempDatabase) {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+
+    // Create three tables: categories, authors, articles
+    conn.execute("CREATE TABLE categories(id INTEGER PRIMARY KEY, name TEXT)")
+        .unwrap();
+    conn.execute("CREATE TABLE authors(id INTEGER PRIMARY KEY, name TEXT)")
+        .unwrap();
+    conn.execute(
+        "CREATE TABLE articles(id INTEGER PRIMARY KEY, title TEXT, body TEXT, author_id INTEGER, category_id INTEGER)",
+    )
+    .unwrap();
+
+    // Create FTS index on articles
+    conn.execute("CREATE INDEX fts_articles ON articles USING fts (title, body)")
+        .unwrap();
+
+    // Insert categories
+    conn.execute("INSERT INTO categories VALUES (1, 'Technology')")
+        .unwrap();
+    conn.execute("INSERT INTO categories VALUES (2, 'Science')")
+        .unwrap();
+    conn.execute("INSERT INTO categories VALUES (3, 'Arts')")
+        .unwrap();
+
+    // Insert authors
+    conn.execute("INSERT INTO authors VALUES (1, 'Alice')")
+        .unwrap();
+    conn.execute("INSERT INTO authors VALUES (2, 'Bob')")
+        .unwrap();
+
+    // Insert articles
+    conn.execute(
+        "INSERT INTO articles VALUES (1, 'Database Systems', 'Introduction to database management', 1, 1)",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO articles VALUES (2, 'Machine Learning', 'AI and neural networks', 2, 2)",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO articles VALUES (3, 'SQL Performance', 'Optimizing database queries', 1, 1)",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO articles VALUES (4, 'Modern Art', 'Contemporary art movements', 2, 3)",
+    )
+    .unwrap();
+
+    // Test three-way join with FTS
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT a.title, u.name, c.name FROM articles a \
+         JOIN authors u ON a.author_id = u.id \
+         JOIN categories c ON a.category_id = c.id \
+         WHERE fts_match(a.title, a.body, 'database')",
+    );
+
+    // Should find 2 articles about database (articles 1 and 3)
+    assert_eq!(rows.len(), 2, "Should find 2 articles about database");
+
+    // Verify we got the right combination
+    let titles: Vec<String> = rows
+        .iter()
+        .filter_map(|r| match &r[0] {
+            rusqlite::types::Value::Text(t) => Some(t.clone()),
+            _ => None,
+        })
+        .collect();
+    assert!(titles.contains(&"Database Systems".to_string()));
+    assert!(titles.contains(&"SQL Performance".to_string()));
 }

@@ -3390,10 +3390,6 @@ impl IndexMethodCursor for FtsCursor {
     /// Estimates the cost of executing a query with the given pattern.
     ///
     /// FTS queries are typically very selective (returning a small fraction of rows).
-    /// The cost model accounts for:
-    /// - Logarithmic term dictionary lookup
-    /// - Linear scan of posting lists
-    /// - LIMIT clause reducing work for top-N queries
     fn estimate_cost(
         &self,
         pattern_idx: usize,
