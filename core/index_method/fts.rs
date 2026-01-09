@@ -3350,14 +3350,14 @@ impl IndexMethodCursor for FtsCursor {
         // Wait for merge to complete (blocking)
         match merge_future.wait() {
             Ok(Some(segment_meta)) => {
-                tracing::info!(
+                tracing::debug!(
                     "FTS optimize: merge completed, new segment has {} docs",
                     segment_meta.num_docs()
                 );
             }
             Ok(None) => {
                 // Merge was cancelled or no merge was needed
-                tracing::info!("FTS optimize: merge was cancelled or no merge needed");
+                tracing::debug!("FTS optimize: merge was cancelled or no merge needed");
             }
             Err(e) => {
                 return Err(LimboError::InternalError(format!(
@@ -3385,5 +3385,45 @@ impl IndexMethodCursor for FtsCursor {
 
         // Force flush directory writes to BTree (even though pending_docs_count == 0)
         self.commit_and_flush_inner(true)
+    }
+
+    /// Estimates the cost of executing a query with the given pattern.
+    ///
+    /// FTS queries are typically very selective (returning a small fraction of rows).
+    /// The cost model accounts for:
+    /// - Logarithmic term dictionary lookup
+    /// - Linear scan of posting lists
+    /// - LIMIT clause reducing work for top-N queries
+    fn estimate_cost(
+        &self,
+        pattern_idx: usize,
+        base_table_rows: f64,
+    ) -> Option<super::IndexMethodCostEstimate> {
+        // FTS is typically very selective - assume ~1% of rows match
+        // This is a conservative estimate; real selectivity depends on query terms
+        let selectivity = 0.01;
+        let estimated_rows = (base_table_rows * selectivity).max(1.0) as u64;
+
+        // Cost model:
+        // - Base cost: logarithmic in vocabulary size (approximated by table size)
+        // - Result cost: linear in number of results
+        let base_cost = (base_table_rows.max(1.0)).ln() * 10.0;
+        let result_cost = estimated_rows as f64 * 0.1;
+
+        // Patterns with LIMIT are significantly cheaper because Tantivy's TopDocs
+        // collector can terminate early. Pattern indices:
+        // 0 = SCORE (ORDER BY + LIMIT)
+        // 1 = COMBINED_ORDERED_LIMIT (WHERE + ORDER BY + LIMIT)
+        // 3 = COMBINED_LIMIT (WHERE + LIMIT)
+        // 5 = MATCH_LIMIT (WHERE + LIMIT)
+        let limit_factor = match pattern_idx {
+            0 | 1 | 3 | 5 => 0.5, // Patterns with LIMIT
+            _ => 1.0,
+        };
+
+        Some(super::IndexMethodCostEstimate {
+            estimated_cost: (base_cost + result_cost) * limit_factor,
+            estimated_rows,
+        })
     }
 }

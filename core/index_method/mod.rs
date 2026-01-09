@@ -61,6 +61,17 @@ pub struct IndexMethodDefinition<'a> {
     pub backing_btree: bool,
 }
 
+/// Cost estimate returned by custom index methods for optimizer integration.
+/// This enables the optimizer to make cost-based decisions when choosing between
+/// custom index methods and traditional BTree indexes.
+#[derive(Debug, Clone, Copy)]
+pub struct IndexMethodCostEstimate {
+    /// Estimated CPU/IO cost (lower is better, comparable to optimizer Cost values)
+    pub estimated_cost: f64,
+    /// Estimated number of rows returned by the query
+    pub estimated_rows: u64,
+}
+
 /// cursor opened for index method and capable of executing DML/DDL/DQL queries for the index method over fixed table
 pub trait IndexMethodCursor {
     /// create necessary components for index method (usually, this is a bunch of btree-s)
@@ -129,6 +140,28 @@ pub trait IndexMethodCursor {
     /// Default implementation does nothing (for index methods that don't need it).
     fn optimize(&mut self, _connection: &Arc<Connection>) -> Result<IOResult<()>> {
         Ok(IOResult::Done(()))
+    }
+
+    /// Estimate the cost of executing a query with the given pattern.
+    ///
+    /// This method enables the optimizer to make cost-based decisions when choosing
+    /// between custom index methods and traditional BTree indexes.
+    ///
+    /// # Arguments
+    /// * `pattern_idx` - The index of the pattern being considered (from IndexMethodDefinition::patterns)
+    /// * `base_table_rows` - Estimated rows in the base table (from ANALYZE statistics if available)
+    ///
+    /// # Returns
+    /// - `Some(estimate)` - Cost estimate for cost-based optimization decisions
+    /// - `None` - No cost estimate available; optimizer should use index method when pattern matches
+    ///   (preserving the pre-cost-estimation behavior of always preferring index methods)
+    fn estimate_cost(
+        &self,
+        pattern_idx: usize,
+        base_table_rows: f64,
+    ) -> Option<IndexMethodCostEstimate> {
+        let _ = (pattern_idx, base_table_rows);
+        None
     }
 }
 
