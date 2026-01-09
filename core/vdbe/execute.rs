@@ -8683,6 +8683,10 @@ pub enum RowIndexValidationSubstate {
     StartTable,
     /// Rewinding to the beginning of the table
     RewindingTable,
+    /// Fetching rowid after rewind/advance succeeded and has_record() is true
+    FetchingRowId,
+    /// Fetching record after rowid was fetched
+    FetchingRecord { rowid: i64 },
     /// Checking current row against all indexes
     CheckingRow {
         /// Current index being checked (0..indexes.len())
@@ -9380,19 +9384,27 @@ pub fn op_integrity_check(
                         }
                         // Start checking the first row
                         *row_number = 1;
-
-                        // Get record values and rowid - must exist since has_record() is true
+                        *substate = RowIndexValidationSubstate::FetchingRowId;
+                        continue;
+                    }
+                    RowIndexValidationSubstate::FetchingRowId => {
+                        let btree_cursor = table_cursor.as_mut().unwrap();
                         let rowid = return_if_io!(btree_cursor.rowid())
                             .expect("rowid must exist when has_record() is true");
+                        *substate = RowIndexValidationSubstate::FetchingRecord { rowid };
+                        continue;
+                    }
+                    RowIndexValidationSubstate::FetchingRecord { rowid } => {
+                        let btree_cursor = table_cursor.as_mut().unwrap();
                         let record = return_if_io!(btree_cursor.record())
                             .expect("record must exist when has_record() is true");
                         let row_values =
                             record.get_values()?.iter().map(|v| v.to_owned()).collect();
-
+                        let rid = *rowid;
                         *substate = RowIndexValidationSubstate::CheckingRow {
                             current_index_idx: 0,
                             row_values,
-                            rowid,
+                            rowid: rid,
                         };
                     }
                     RowIndexValidationSubstate::CheckingRow {
@@ -9572,20 +9584,8 @@ pub fn op_integrity_check(
                         return_if_io!(btree_cursor.next());
                         if btree_cursor.has_record() {
                             *row_number += 1;
-
-                            // Get record values and rowid - must exist since has_record() is true
-                            let rowid = return_if_io!(btree_cursor.rowid())
-                                .expect("rowid must exist when has_record() is true");
-                            let record = return_if_io!(btree_cursor.record())
-                                .expect("record must exist when has_record() is true");
-                            let row_values =
-                                record.get_values()?.iter().map(|v| v.to_owned()).collect();
-
-                            *substate = RowIndexValidationSubstate::CheckingRow {
-                                current_index_idx: 0,
-                                row_values,
-                                rowid,
-                            };
+                            *substate = RowIndexValidationSubstate::FetchingRowId;
+                            continue;
                         } else {
                             // Done with this table, move to next
                             *table_cursor = None;
