@@ -192,8 +192,13 @@ impl Connection {
         let pager = self.pager.load().clone();
         let mode = QueryMode::new(&cmd);
         let (Cmd::Stmt(stmt) | Cmd::Explain(stmt) | Cmd::ExplainQueryPlan(stmt)) = cmd;
+
+        // Read lock + Arc::Clone the schema here to avoid a possible recursive read lock in `op_parse_schema`,
+        // where we try to read the schema again there
+        let schema = self.schema.read().clone();
+
         let program = translate::translate(
-            self.schema.read().deref(),
+            &schema,
             stmt,
             pager.clone(),
             self.clone(),
