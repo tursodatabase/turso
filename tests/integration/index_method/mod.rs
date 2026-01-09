@@ -1112,8 +1112,10 @@ fn test_fts_tokenizer_configuration(tmp_db: TempDatabase) {
     // Test 3: Simple tokenizer (whitespace/punctuation split)
     conn.execute("CREATE TABLE docs_simple(id INTEGER PRIMARY KEY, content TEXT)")
         .unwrap();
-    conn.execute("CREATE INDEX fts_simple ON docs_simple USING fts (content) WITH (tokenizer = 'simple')")
-        .unwrap();
+    conn.execute(
+        "CREATE INDEX fts_simple ON docs_simple USING fts (content) WITH (tokenizer = 'simple')",
+    )
+    .unwrap();
 
     conn.execute("INSERT INTO docs_simple VALUES (1, 'Hello World')")
         .unwrap();
@@ -1155,8 +1157,10 @@ fn test_fts_ngram_tokenizer(tmp_db: TempDatabase) {
 
     conn.execute("CREATE TABLE products(id INTEGER PRIMARY KEY, name TEXT)")
         .unwrap();
-    conn.execute("CREATE INDEX fts_products ON products USING fts (name) WITH (tokenizer = 'ngram')")
-        .unwrap();
+    conn.execute(
+        "CREATE INDEX fts_products ON products USING fts (name) WITH (tokenizer = 'ngram')",
+    )
+    .unwrap();
 
     conn.execute("INSERT INTO products VALUES (1, 'iPhone 15 Pro')")
         .unwrap();
@@ -1308,7 +1312,10 @@ fn test_fts_highlight_with_fts_query(tmp_db: TempDatabase) {
             }
         }
     }
-    assert!(found_highlight, "Expected highlighted text with <mark> tags");
+    assert!(
+        found_highlight,
+        "Expected highlighted text with <mark> tags"
+    );
 }
 
 /// Test fts_highlight with NULL values
@@ -1333,26 +1340,17 @@ fn test_fts_highlight_null_handling(tmp_db: TempDatabase) {
     }
 
     // NULL query should return NULL
-    let rows = limbo_exec_rows(
-        &conn,
-        "SELECT fts_highlight('text', '<b>', '</b>', NULL)",
-    );
+    let rows = limbo_exec_rows(&conn, "SELECT fts_highlight('text', '<b>', '</b>', NULL)");
     assert_eq!(rows.len(), 1);
     assert!(matches!(rows[0][0], rusqlite::types::Value::Null));
 
     // NULL before_tag should return NULL
-    let rows = limbo_exec_rows(
-        &conn,
-        "SELECT fts_highlight('text', NULL, '</b>', 'query')",
-    );
+    let rows = limbo_exec_rows(&conn, "SELECT fts_highlight('text', NULL, '</b>', 'query')");
     assert_eq!(rows.len(), 1);
     assert!(matches!(rows[0][0], rusqlite::types::Value::Null));
 
     // NULL after_tag should return NULL
-    let rows = limbo_exec_rows(
-        &conn,
-        "SELECT fts_highlight('text', '<b>', NULL, 'query')",
-    );
+    let rows = limbo_exec_rows(&conn, "SELECT fts_highlight('text', '<b>', NULL, 'query')");
     assert_eq!(rows.len(), 1);
     assert!(matches!(rows[0][0], rusqlite::types::Value::Null));
 }
@@ -1431,21 +1429,18 @@ fn test_fts_invalid_weights_rejected(tmp_db: TempDatabase) {
     assert!(result.is_err());
 
     // Invalid weight value should fail
-    let result = conn.execute(
-        "CREATE INDEX fts_bad2 ON docs USING fts (title) WITH (weights='title=abc')",
-    );
+    let result =
+        conn.execute("CREATE INDEX fts_bad2 ON docs USING fts (title) WITH (weights='title=abc')");
     assert!(result.is_err());
 
     // Negative weight should fail
-    let result = conn.execute(
-        "CREATE INDEX fts_bad3 ON docs USING fts (title) WITH (weights='title=-1.0')",
-    );
+    let result =
+        conn.execute("CREATE INDEX fts_bad3 ON docs USING fts (title) WITH (weights='title=-1.0')");
     assert!(result.is_err());
 
     // Missing equals sign should fail
-    let result = conn.execute(
-        "CREATE INDEX fts_bad4 ON docs USING fts (title) WITH (weights='title2.0')",
-    );
+    let result =
+        conn.execute("CREATE INDEX fts_bad4 ON docs USING fts (title) WITH (weights='title2.0')");
     assert!(result.is_err());
 }
 
@@ -1453,7 +1448,9 @@ fn test_fts_invalid_weights_rejected(tmp_db: TempDatabase) {
 /// This tests that FTS cursor caching doesn't share pending_writes between cursors,
 /// which would cause writes from one cursor to affect the Drop behavior of another.
 #[cfg(feature = "fts")]
-#[turso_macros::test(init_sql = "CREATE TABLE articles(id INTEGER PRIMARY KEY, title TEXT, body TEXT)")]
+#[turso_macros::test(
+    init_sql = "CREATE TABLE articles(id INTEGER PRIMARY KEY, title TEXT, body TEXT)"
+)]
 fn test_fts_query_insert_query_no_panic(tmp_db: TempDatabase) {
     let _ = env_logger::try_init();
     let conn = tmp_db.connect_limbo();
@@ -1463,19 +1460,30 @@ fn test_fts_query_insert_query_no_panic(tmp_db: TempDatabase) {
         .unwrap();
 
     // Insert some initial data
-    conn.execute("INSERT INTO articles VALUES (1, 'Rust Programming', 'Rust is a systems language')")
-        .unwrap();
+    conn.execute(
+        "INSERT INTO articles VALUES (1, 'Rust Programming', 'Rust is a systems language')",
+    )
+    .unwrap();
     conn.execute("INSERT INTO articles VALUES (2, 'Python Guide', 'Python is easy to learn')")
         .unwrap();
 
     // Query a few times (this caches the directory)
-    let rows = limbo_exec_rows(&conn, "SELECT * FROM articles WHERE fts_match(title, body, 'Rust')");
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT * FROM articles WHERE fts_match(title, body, 'Rust')",
+    );
     assert_eq!(rows.len(), 1);
 
-    let rows = limbo_exec_rows(&conn, "SELECT * FROM articles WHERE fts_match(title, body, 'Python')");
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT * FROM articles WHERE fts_match(title, body, 'Python')",
+    );
     assert_eq!(rows.len(), 1);
 
-    let rows = limbo_exec_rows(&conn, "SELECT * FROM articles WHERE fts_match(title, body, 'programming')");
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT * FROM articles WHERE fts_match(title, body, 'programming')",
+    );
     assert_eq!(rows.len(), 1);
 
     // Insert more data (this should not cause dirty pages to leak to next read)
@@ -1483,11 +1491,17 @@ fn test_fts_query_insert_query_no_panic(tmp_db: TempDatabase) {
         .unwrap();
 
     // Query again - should NOT panic with "dirty pages must be empty for read txn"
-    let rows = limbo_exec_rows(&conn, "SELECT * FROM articles WHERE fts_match(title, body, 'Go')");
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT * FROM articles WHERE fts_match(title, body, 'Go')",
+    );
     assert_eq!(rows.len(), 1);
 
     // One more query to ensure everything is stable
-    let rows = limbo_exec_rows(&conn, "SELECT * FROM articles WHERE fts_match(title, body, 'Rust')");
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT * FROM articles WHERE fts_match(title, body, 'Rust')",
+    );
     assert_eq!(rows.len(), 1);
 }
 
@@ -1501,7 +1515,9 @@ fn test_fts_query_insert_query_no_panic(tmp_db: TempDatabase) {
 /// 7. Large update
 /// 8. Query again
 #[cfg(feature = "fts")]
-#[turso_macros::test(init_sql = "CREATE TABLE docs(id INTEGER PRIMARY KEY, category TEXT, title TEXT, body TEXT)")]
+#[turso_macros::test(
+    init_sql = "CREATE TABLE docs(id INTEGER PRIMARY KEY, category TEXT, title TEXT, body TEXT)"
+)]
 fn test_fts_comprehensive_lifecycle(tmp_db: TempDatabase) {
     let _ = env_logger::try_init();
     let conn = tmp_db.connect_limbo();
@@ -1513,7 +1529,12 @@ fn test_fts_comprehensive_lifecycle(tmp_db: TempDatabase) {
     // Insert a moderate number of rows (100 documents across 4 categories)
     let categories = ["tech", "science", "business", "entertainment"];
     let tech_terms = [
-        "Rust", "Python", "JavaScript", "programming", "software", "database",
+        "Rust",
+        "Python",
+        "JavaScript",
+        "programming",
+        "software",
+        "database",
     ];
     let science_terms = [
         "physics",
@@ -1532,7 +1553,12 @@ fn test_fts_comprehensive_lifecycle(tmp_db: TempDatabase) {
         "strategy",
     ];
     let entertainment_terms = [
-        "movie", "music", "concert", "festival", "celebrity", "streaming",
+        "movie",
+        "music",
+        "concert",
+        "festival",
+        "celebrity",
+        "streaming",
     ];
 
     for i in 1..=100 {
@@ -1621,9 +1647,9 @@ fn test_fts_comprehensive_lifecycle(tmp_db: TempDatabase) {
     );
     // After delete, should not find document 101's content
     // (or may still find it depending on FTS delete implementation)
-    let has_deleted_doc = rows.iter().any(|r| {
-        matches!(&r[0], rusqlite::types::Value::Integer(101))
-    });
+    let has_deleted_doc = rows
+        .iter()
+        .any(|r| matches!(&r[0], rusqlite::types::Value::Integer(101)));
     // Note: If FTS doesn't support delete yet, this may still find the doc
     // For now, just verify the query doesn't panic
     let _ = rows.len(); // Query should not panic after delete
@@ -1652,7 +1678,10 @@ fn test_fts_comprehensive_lifecycle(tmp_db: TempDatabase) {
         &conn,
         "SELECT id FROM docs WHERE fts_match(title, body, 'Python')",
     );
-    assert!(rows.len() > 0, "Should still find Python documents after update");
+    assert!(
+        rows.len() > 0,
+        "Should still find Python documents after update"
+    );
 
     let _science_rows = limbo_exec_rows(
         &conn,
@@ -1697,7 +1726,9 @@ fn test_fts_comprehensive_lifecycle(tmp_db: TempDatabase) {
 
 /// Test FTS behavior with explicit transactions
 #[cfg(feature = "fts")]
-#[turso_macros::test(init_sql = "CREATE TABLE articles(id INTEGER PRIMARY KEY, title TEXT, content TEXT)")]
+#[turso_macros::test(
+    init_sql = "CREATE TABLE articles(id INTEGER PRIMARY KEY, title TEXT, content TEXT)"
+)]
 fn test_fts_with_explicit_transactions(tmp_db: TempDatabase) {
     let _ = env_logger::try_init();
     let conn = tmp_db.connect_limbo();
@@ -1707,8 +1738,10 @@ fn test_fts_with_explicit_transactions(tmp_db: TempDatabase) {
         .unwrap();
 
     // Insert initial data
-    conn.execute("INSERT INTO articles VALUES (1, 'Rust Basics', 'Introduction to Rust programming')")
-        .unwrap();
+    conn.execute(
+        "INSERT INTO articles VALUES (1, 'Rust Basics', 'Introduction to Rust programming')",
+    )
+    .unwrap();
 
     // Verify initial data is indexed
     let rows = limbo_exec_rows(
@@ -1721,8 +1754,10 @@ fn test_fts_with_explicit_transactions(tmp_db: TempDatabase) {
     conn.execute("BEGIN").unwrap();
 
     // Insert within transaction
-    conn.execute("INSERT INTO articles VALUES (2, 'Advanced Rust', 'Rust ownership and lifetimes')")
-        .unwrap();
+    conn.execute(
+        "INSERT INTO articles VALUES (2, 'Advanced Rust', 'Rust ownership and lifetimes')",
+    )
+    .unwrap();
     conn.execute("INSERT INTO articles VALUES (3, 'Python Guide', 'Python for beginners')")
         .unwrap();
 
@@ -1753,11 +1788,7 @@ fn test_fts_with_explicit_transactions(tmp_db: TempDatabase) {
         &conn,
         "SELECT id FROM articles WHERE fts_match(title, content, 'Go')",
     );
-    assert_eq!(
-        rows.len(),
-        0,
-        "Should not find Go article after rollback"
-    );
+    assert_eq!(rows.len(), 0, "Should not find Go article after rollback");
 
     // Verify other data still intact
     let rows = limbo_exec_rows(
@@ -1785,9 +1816,7 @@ fn test_fts_optimize_index(tmp_db: TempDatabase) {
     for i in 0..10 {
         conn.execute(&format!(
             "INSERT INTO docs VALUES ({}, 'Document {}', 'Content about topic {} with keywords')",
-            i,
-            i,
-            i
+            i, i, i
         ))
         .unwrap();
     }
@@ -1862,4 +1891,264 @@ fn test_fts_optimize_all_indexes(tmp_db: TempDatabase) {
         "SELECT id FROM posts WHERE fts_match(content, 'Rust')",
     );
     assert_eq!(rows.len(), 2, "Should find both Rust posts");
+}
+
+/// Test that FTS functions work with column arguments in any order.
+/// The index is created with columns (title, body), but queries should work
+/// with fts_match(body, title, ...) as well as fts_match(title, body, ...).
+#[cfg(feature = "fts")]
+#[turso_macros::test]
+fn test_fts_column_order_agnostic(tmp_db: TempDatabase) {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+
+    // Create table and FTS index with columns in order (title, body)
+    conn.execute("CREATE TABLE articles(id INTEGER PRIMARY KEY, title TEXT, body TEXT)")
+        .unwrap();
+    conn.execute("CREATE INDEX fts_articles ON articles USING fts (title, body)")
+        .unwrap();
+
+    // Insert test data - use 'database' in both articles 1 and 3
+    conn.execute(
+        "INSERT INTO articles VALUES (1, 'Database Design', 'Learn about database systems')",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO articles VALUES (2, 'Web Development', 'Building modern web applications')",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO articles VALUES (3, 'SQL Basics', 'Introduction to database and SQL')",
+    )
+    .unwrap();
+
+    // Test standard column order: fts_match(title, body, ...)
+    let rows_standard = limbo_exec_rows(
+        &conn,
+        "SELECT id FROM articles WHERE fts_match(title, body, 'database')",
+    );
+    assert_eq!(
+        rows_standard.len(),
+        2,
+        "Standard order should find 2 matches (articles 1 and 3)"
+    );
+    let ids_standard: Vec<i64> = rows_standard
+        .iter()
+        .filter_map(|r| match &r[0] {
+            rusqlite::types::Value::Integer(i) => Some(*i),
+            _ => None,
+        })
+        .collect();
+    assert!(ids_standard.contains(&1));
+    assert!(ids_standard.contains(&3));
+
+    // Test reversed column order: fts_match(body, title, ...)
+    // This should work with column-order-agnostic matching
+    let rows_reversed = limbo_exec_rows(
+        &conn,
+        "SELECT id FROM articles WHERE fts_match(body, title, 'database')",
+    );
+    assert_eq!(
+        rows_reversed.len(),
+        2,
+        "Reversed column order should find same 2 matches"
+    );
+    let ids_reversed: Vec<i64> = rows_reversed
+        .iter()
+        .filter_map(|r| match &r[0] {
+            rusqlite::types::Value::Integer(i) => Some(*i),
+            _ => None,
+        })
+        .collect();
+    assert!(ids_reversed.contains(&1));
+    assert!(ids_reversed.contains(&3));
+
+    // Test fts_score with reversed column order
+    let rows_score_reversed = limbo_exec_rows(
+        &conn,
+        "SELECT id, fts_score(body, title, 'database') as score FROM articles WHERE fts_match(body, title, 'database') ORDER BY score DESC",
+    );
+    assert_eq!(
+        rows_score_reversed.len(),
+        2,
+        "fts_score with reversed columns should work"
+    );
+
+    // Verify both orderings return the same results
+    assert_eq!(
+        ids_standard.len(),
+        ids_reversed.len(),
+        "Both column orderings should return same number of results"
+    );
+    for id in &ids_standard {
+        assert!(
+            ids_reversed.contains(id),
+            "Both orderings should return same IDs"
+        );
+    }
+}
+
+/// Test that FTS works with JOIN queries (multi-table queries).
+/// This tests the removal of the single-table restriction for custom index methods.
+#[cfg(feature = "fts")]
+#[turso_macros::test]
+fn test_fts_with_join(tmp_db: TempDatabase) {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+
+    // Create tables
+    conn.execute(
+        "CREATE TABLE articles(id INTEGER PRIMARY KEY, title TEXT, body TEXT, author_id INTEGER)",
+    )
+    .unwrap();
+    conn.execute("CREATE TABLE authors(id INTEGER PRIMARY KEY, name TEXT)")
+        .unwrap();
+
+    // Create FTS index on articles
+    conn.execute("CREATE INDEX fts_articles ON articles USING fts (title, body)")
+        .unwrap();
+
+    // Insert authors
+    conn.execute("INSERT INTO authors VALUES (1, 'Alice')")
+        .unwrap();
+    conn.execute("INSERT INTO authors VALUES (2, 'Bob')")
+        .unwrap();
+    conn.execute("INSERT INTO authors VALUES (3, 'Charlie')")
+        .unwrap();
+
+    // Insert articles with author references - use 'database' consistently
+    conn.execute(
+        "INSERT INTO articles VALUES (1, 'Database Design', 'Learn about database systems', 1)",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO articles VALUES (2, 'Web Development', 'Building modern web applications', 2)",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO articles VALUES (3, 'SQL Basics', 'Introduction to database and SQL', 1)",
+    )
+    .unwrap();
+    conn.execute("INSERT INTO articles VALUES (4, 'API Design', 'RESTful API best practices', 3)")
+        .unwrap();
+
+    // Test FTS with JOIN - find articles about 'database' with author names
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT a.id, a.title, u.name FROM articles a JOIN authors u ON a.author_id = u.id WHERE fts_match(a.title, a.body, 'database')",
+    );
+    assert_eq!(
+        rows.len(),
+        2,
+        "Should find 2 articles about database (articles 1 and 3)"
+    );
+
+    // Verify the results contain expected data
+    let result_ids: Vec<i64> = rows
+        .iter()
+        .filter_map(|r| match &r[0] {
+            rusqlite::types::Value::Integer(i) => Some(*i),
+            _ => None,
+        })
+        .collect();
+    assert!(result_ids.contains(&1), "Should include article 1");
+    assert!(result_ids.contains(&3), "Should include article 3");
+
+    // Verify author names are correctly joined
+    let author_names: Vec<String> = rows
+        .iter()
+        .filter_map(|r| match &r[2] {
+            rusqlite::types::Value::Text(s) => Some(s.clone()),
+            _ => None,
+        })
+        .collect();
+    // Both articles 1 and 3 are by Alice
+    assert_eq!(
+        author_names.iter().filter(|&n| n == "Alice").count(),
+        2,
+        "Both matching articles should be by Alice"
+    );
+
+    // Test FTS with JOIN and additional WHERE conditions
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT a.id, a.title, u.name FROM articles a JOIN authors u ON a.author_id = u.id WHERE fts_match(a.title, a.body, 'web') AND u.name = 'Bob'",
+    );
+    assert_eq!(rows.len(), 1, "Should find 1 article about web by Bob");
+    let id = match &rows[0][0] {
+        rusqlite::types::Value::Integer(i) => *i,
+        _ => panic!("Expected integer id"),
+    };
+    assert_eq!(id, 2, "Should be article 2 (Web Development by Bob)");
+}
+
+/// Test FTS with LEFT JOIN to ensure outer joins work correctly with FTS.
+#[cfg(feature = "fts")]
+#[turso_macros::test]
+fn test_fts_with_left_join(tmp_db: TempDatabase) {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+
+    // Create tables
+    conn.execute(
+        "CREATE TABLE posts(id INTEGER PRIMARY KEY, title TEXT, content TEXT, category_id INTEGER)",
+    )
+    .unwrap();
+    conn.execute("CREATE TABLE categories(id INTEGER PRIMARY KEY, name TEXT)")
+        .unwrap();
+
+    // Create FTS index
+    conn.execute("CREATE INDEX fts_posts ON posts USING fts (title, content)")
+        .unwrap();
+
+    // Insert categories
+    conn.execute("INSERT INTO categories VALUES (1, 'Technology')")
+        .unwrap();
+    conn.execute("INSERT INTO categories VALUES (2, 'Science')")
+        .unwrap();
+
+    // Insert posts - some with category, some without (NULL category_id)
+    conn.execute(
+        "INSERT INTO posts VALUES (1, 'Rust Programming', 'Systems programming with Rust', 1)",
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO posts VALUES (2, 'Python Basics', 'Introduction to Python programming', 1)",
+    )
+    .unwrap();
+    conn.execute("INSERT INTO posts VALUES (3, 'Rust in Nature', 'How rust affects metal', 2)")
+        .unwrap();
+    conn.execute(
+        "INSERT INTO posts VALUES (4, 'Uncategorized Rust', 'A post about Rust without category', NULL)",
+    )
+    .unwrap();
+
+    // Test FTS with LEFT JOIN - should include post without category
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT p.id, p.title, c.name FROM posts p LEFT JOIN categories c ON p.category_id = c.id WHERE fts_match(p.title, p.content, 'Rust')",
+    );
+    assert_eq!(rows.len(), 3, "Should find 3 posts about Rust");
+
+    // Verify we got the right posts
+    let result_ids: Vec<i64> = rows
+        .iter()
+        .filter_map(|r| match &r[0] {
+            rusqlite::types::Value::Integer(i) => Some(*i),
+            _ => None,
+        })
+        .collect();
+    assert!(result_ids.contains(&1), "Should include post 1");
+    assert!(result_ids.contains(&3), "Should include post 3");
+    assert!(
+        result_ids.contains(&4),
+        "Should include post 4 (uncategorized)"
+    );
+
+    // Verify NULL category is preserved in LEFT JOIN
+    let null_category_count = rows
+        .iter()
+        .filter(|r| matches!(&r[2], rusqlite::types::Value::Null))
+        .count();
+    assert_eq!(null_category_count, 1, "One post should have NULL category");
 }
