@@ -958,12 +958,9 @@ async fn test_prepare_cached_stress() {
     // Insert many rows using cached statement
     for i in 0..100 {
         let mut stmt = conn.prepare_cached(insert_query).await.unwrap();
-        stmt.execute(vec![
-            Value::Integer(i),
-            Value::Text(format!("value_{i}").into()),
-        ])
-        .await
-        .unwrap();
+        stmt.execute(vec![Value::Integer(i), Value::Text(format!("value_{i}"))])
+            .await
+            .unwrap();
     }
 
     // Query many times using cached statement
