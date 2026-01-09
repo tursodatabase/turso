@@ -772,3 +772,249 @@ async fn test_transaction_with_insert_returning_then_commit() {
     let count: i64 = count_rows.next().await.unwrap().unwrap().get(0).unwrap();
     assert_eq!(count, 3, "All rows should be committed");
 }
+
+#[tokio::test]
+async fn test_prepare_cached_basic() {
+    let db = Builder::new_local(":memory:").build().await.unwrap();
+    let conn = db.connect().unwrap();
+
+    conn.execute("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)", ())
+        .await
+        .unwrap();
+
+    // First call should cache the statement
+    let mut stmt1 = conn
+        .prepare_cached("SELECT * FROM users WHERE id = ?")
+        .await
+        .unwrap();
+
+    // Insert some data and query
+    conn.execute("INSERT INTO users VALUES (1, 'Alice')", ())
+        .await
+        .unwrap();
+
+    let mut rows = stmt1.query(vec![Value::Integer(1)]).await.unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get::<i64>(0).unwrap(), 1);
+    assert_eq!(row.get::<String>(1).unwrap(), "Alice");
+    drop(rows);
+    drop(stmt1);
+
+    // Second call should use cached statement
+    let mut stmt2 = conn
+        .prepare_cached("SELECT * FROM users WHERE id = ?")
+        .await
+        .unwrap();
+
+    let mut rows = stmt2.query(vec![Value::Integer(1)]).await.unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get::<i64>(0).unwrap(), 1);
+    assert_eq!(row.get::<String>(1).unwrap(), "Alice");
+}
+
+#[tokio::test]
+async fn test_prepare_cached_multiple_statements() {
+    let db = Builder::new_local(":memory:").build().await.unwrap();
+    let conn = db.connect().unwrap();
+
+    conn.execute("CREATE TABLE t (id INTEGER, value TEXT)", ())
+        .await
+        .unwrap();
+
+    // Cache multiple different statements
+    let queries = vec![
+        "SELECT * FROM t WHERE id = ?",
+        "SELECT * FROM t WHERE value = ?",
+        "INSERT INTO t VALUES (?, ?)",
+    ];
+
+    for query in &queries {
+        let _ = conn.prepare_cached(*query).await.unwrap();
+    }
+
+    // All should be cached and work correctly
+    let mut stmt1 = conn.prepare_cached(queries[0]).await.unwrap();
+    let mut stmt2 = conn.prepare_cached(queries[1]).await.unwrap();
+    let mut stmt3 = conn.prepare_cached(queries[2]).await.unwrap();
+
+    // Insert data
+    stmt3
+        .execute(vec![Value::Integer(1), Value::Text("test".into())])
+        .await
+        .unwrap();
+
+    // Query using both cached SELECT statements
+    let mut rows = stmt1.query(vec![Value::Integer(1)]).await.unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get::<i64>(0).unwrap(), 1);
+    drop(rows);
+
+    let mut rows = stmt2.query(vec![Value::Text("test".into())]).await.unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    assert_eq!(row.get::<String>(1).unwrap(), "test");
+}
+
+#[tokio::test]
+async fn test_prepare_cached_independent_state() {
+    // Verify that each cached statement has independent execution state
+    let db = Builder::new_local(":memory:").build().await.unwrap();
+    let conn = db.connect().unwrap();
+
+    conn.execute("CREATE TABLE t (id INTEGER)", ())
+        .await
+        .unwrap();
+
+    for i in 1..=5 {
+        conn.execute(&format!("INSERT INTO t VALUES ({i})"), ())
+            .await
+            .unwrap();
+    }
+
+    let query = "SELECT * FROM t ORDER BY id";
+
+    // Get two statements from cache
+    let mut stmt1 = conn.prepare_cached(query).await.unwrap();
+    let mut stmt2 = conn.prepare_cached(query).await.unwrap();
+
+    // Start iterating with stmt1
+    let mut rows1 = stmt1.query(()).await.unwrap();
+    let row1 = rows1.next().await.unwrap().unwrap();
+    assert_eq!(row1.get::<i64>(0).unwrap(), 1);
+
+    // Start iterating with stmt2 - should have its own state
+    let mut rows2 = stmt2.query(()).await.unwrap();
+    let row2 = rows2.next().await.unwrap().unwrap();
+    assert_eq!(row2.get::<i64>(0).unwrap(), 1);
+
+    // Continue with stmt1 - should be at next row
+    let row1 = rows1.next().await.unwrap().unwrap();
+    assert_eq!(row1.get::<i64>(0).unwrap(), 2);
+
+    // Continue with stmt2 - should also be at next row (independent state)
+    let row2 = rows2.next().await.unwrap().unwrap();
+    assert_eq!(row2.get::<i64>(0).unwrap(), 2);
+}
+
+#[tokio::test]
+async fn test_prepare_cached_with_parameters() {
+    let db = Builder::new_local(":memory:").build().await.unwrap();
+    let conn = db.connect().unwrap();
+
+    conn.execute(
+        "CREATE TABLE users (id INTEGER, name TEXT, age INTEGER)",
+        (),
+    )
+    .await
+    .unwrap();
+
+    conn.execute("INSERT INTO users VALUES (1, 'Alice', 30)", ())
+        .await
+        .unwrap();
+    conn.execute("INSERT INTO users VALUES (2, 'Bob', 25)", ())
+        .await
+        .unwrap();
+    conn.execute("INSERT INTO users VALUES (3, 'Charlie', 35)", ())
+        .await
+        .unwrap();
+
+    let query = "SELECT name FROM users WHERE age > ?";
+
+    // Use cached statement with different parameters
+    let mut stmt = conn.prepare_cached(query).await.unwrap();
+
+    let mut rows = stmt.query(vec![Value::Integer(25)]).await.unwrap();
+    let mut names = Vec::new();
+    while let Some(row) = rows.next().await.unwrap() {
+        names.push(row.get::<String>(0).unwrap());
+    }
+    assert_eq!(names.len(), 2);
+    assert!(names.contains(&"Alice".to_string()));
+    assert!(names.contains(&"Charlie".to_string()));
+    drop(rows);
+
+    // Reuse cached statement with different parameter
+    let mut rows = stmt.query(vec![Value::Integer(30)]).await.unwrap();
+    let mut names = Vec::new();
+    while let Some(row) = rows.next().await.unwrap() {
+        names.push(row.get::<String>(0).unwrap());
+    }
+    assert_eq!(names.len(), 1);
+    assert_eq!(names[0], "Charlie");
+}
+
+#[tokio::test]
+async fn test_prepare_cached_stress() {
+    // Stress test to ensure cache works correctly under repeated use
+    let db = Builder::new_local(":memory:").build().await.unwrap();
+    let conn = db.connect().unwrap();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, value TEXT)", ())
+        .await
+        .unwrap();
+
+    let insert_query = "INSERT INTO t (id, value) VALUES (?, ?)";
+    let select_query = "SELECT value FROM t WHERE id = ?";
+
+    // Insert many rows using cached statement
+    for i in 0..100 {
+        let mut stmt = conn.prepare_cached(insert_query).await.unwrap();
+        stmt.execute(vec![
+            Value::Integer(i),
+            Value::Text(format!("value_{i}").into()),
+        ])
+        .await
+        .unwrap();
+    }
+
+    // Query many times using cached statement
+    for i in 0..100 {
+        let mut stmt = conn.prepare_cached(select_query).await.unwrap();
+        let mut rows = stmt.query(vec![Value::Integer(i)]).await.unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        assert_eq!(row.get::<String>(0).unwrap(), format!("value_{i}"));
+    }
+}
+
+#[tokio::test]
+async fn test_prepare_vs_prepare_cached_equivalence() {
+    // Verify that prepare_cached produces same results as prepare
+    let db = Builder::new_local(":memory:").build().await.unwrap();
+    let conn = db.connect().unwrap();
+
+    conn.execute("CREATE TABLE t (x INTEGER, y TEXT)", ())
+        .await
+        .unwrap();
+
+    conn.execute("INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')", ())
+        .await
+        .unwrap();
+
+    let query = "SELECT * FROM t ORDER BY x";
+
+    // Results from prepare
+    let mut stmt1 = conn.prepare(query).await.unwrap();
+    let mut rows1 = stmt1.query(()).await.unwrap();
+    let mut results1 = Vec::new();
+    while let Some(row) = rows1.next().await.unwrap() {
+        results1.push((row.get::<i64>(0).unwrap(), row.get::<String>(1).unwrap()));
+    }
+
+    // Results from prepare_cached
+    let mut stmt2 = conn.prepare_cached(query).await.unwrap();
+    let mut rows2 = stmt2.query(()).await.unwrap();
+    let mut results2 = Vec::new();
+    while let Some(row) = rows2.next().await.unwrap() {
+        results2.push((row.get::<i64>(0).unwrap(), row.get::<String>(1).unwrap()));
+    }
+
+    // Should produce identical results
+    assert_eq!(results1, results2);
+    assert_eq!(
+        results1,
+        vec![
+            (1, "a".to_string()),
+            (2, "b".to_string()),
+            (3, "c".to_string()),
+        ]
+    );
+}

@@ -1,6 +1,5 @@
 use std::{
     borrow::Cow,
-    cell::RefCell,
     collections::HashMap,
     fmt::Display,
     sync::{Arc, Mutex, Once, RwLock},
