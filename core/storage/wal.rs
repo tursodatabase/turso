@@ -1236,12 +1236,12 @@ impl Wal for WalFile {
             let buf_len = buf.len();
             if bytes_read != buf_len as i32 {
                 tracing::error!(
-                    "WAL short read on page {page_idx}, frame_id={frame_id}: expected {buf_len} bytes, got {bytes_read}"
+                    "WAL short read at offset {offset}, page {page_idx}, frame_id={frame_id}: expected {buf_len} bytes, got {bytes_read}"
                 );
                 page.clear_locked();
                 page.clear_wal_tag();
-                return Some(CompletionError::ShortRead {
-                    page_idx,
+                return Some(CompletionError::ShortReadWalFrame {
+                    offset,
                     expected: buf_len,
                     actual: bytes_read as usize,
                 });
@@ -1302,10 +1302,10 @@ impl Wal for WalFile {
             let buf_len = buf.len();
             if bytes_read != buf_len as i32 {
                 tracing::error!(
-                    "short read on WAL frame {frame_id}: expected {buf_len} bytes, got {bytes_read}"
+                    "short read on WAL frame {frame_id} at offset {offset}: expected {buf_len} bytes, got {bytes_read}"
                 );
-                return Some(CompletionError::ShortRead {
-                    page_idx: frame_id as usize,
+                return Some(CompletionError::ShortReadWalFrame {
+                    offset,
                     expected: buf_len,
                     actual: bytes_read as usize,
                 });
@@ -1402,10 +1402,10 @@ impl Wal for WalFile {
                     let buf_len = buf.len();
                     if bytes_read != buf_len as i32 {
                         tracing::error!(
-                            "short read on WAL frame validation, page_id={page_id}: expected {buf_len} bytes, got {bytes_read}"
+                            "short read on WAL frame validation at offset {offset}, page_id={page_id}: expected {buf_len} bytes, got {bytes_read}"
                         );
-                        return Some(CompletionError::ShortRead {
-                            page_idx: page_id as usize,
+                        return Some(CompletionError::ShortReadWalFrame {
+                            offset,
                             expected: buf_len,
                             actual: bytes_read as usize,
                         });
