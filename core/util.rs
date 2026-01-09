@@ -14,7 +14,10 @@ use crate::{
     LimboError, OpenFlags, Result, Statement, SymbolTable,
 };
 use either::Either;
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 use tracing::{instrument, Level};
 use turso_macros::match_ignore_ascii_case;
 use turso_parser::ast::{self, CreateTableBody, Expr, Literal, UnaryOperator};
@@ -470,6 +473,135 @@ pub fn try_capture_parameters(pattern: &Expr, query: &Expr) -> Option<HashMap<i3
     }
 }
 
+/// Returns the number of column arguments for FTS functions.
+/// FTS functions have column arguments followed by non-column arguments:
+/// - fts_match(col1, col2, ..., query_string) -> columns = args.len() - 1
+/// - fts_score(col1, col2, ..., query_string) -> columns = args.len() - 1
+/// - fts_highlight(col1, col2, ..., before_tag, after_tag, query_string) -> columns = args.len() - 3
+///
+/// Returns 0 for non-FTS functions.
+/// Specific for FTS but cannot gate behind feature = "fts" so it must
+/// live in util.rs :/
+pub fn count_fts_column_args(expr: &Expr) -> usize {
+    match expr {
+        Expr::FunctionCall { name, args, .. } => {
+            let name_lower = name.as_str().to_lowercase();
+            match name_lower.as_str() {
+                "fts_match" | "fts_score" => args.len().saturating_sub(1),
+                "fts_highlight" => args.len().saturating_sub(3),
+                _ => 0,
+            }
+        }
+        _ => 0,
+    }
+}
+
+/// Match FTS function calls where column arguments can appear in any order.
+///
+/// FTS functions like `fts_match(col1, col2, 'query')` should match
+/// `fts_match(col2, col1, 'query')` as long as the same columns are used.
+///
+/// Semi-specific for FTS but cannot gate behind feature = "fts" so it must
+/// live in util.rs :/
+pub fn try_capture_parameters_column_agnostic(
+    pattern: &Expr,         // pattern expression from index definition
+    query: &Expr,           // the actual query expression
+    num_column_args: usize, // number of leading column arguments
+) -> Option<HashMap<i32, Expr>> {
+    // If not a function call or no column args, fall back to standard matching
+    if num_column_args == 0 {
+        return try_capture_parameters(pattern, query);
+    }
+
+    let (
+        Expr::FunctionCall {
+            name: pattern_name,
+            distinctness: pattern_distinct,
+            args: pattern_args,
+            order_by: pattern_order,
+            filter_over: pattern_filter,
+        },
+        Expr::FunctionCall {
+            name: query_name,
+            distinctness: query_distinct,
+            args: query_args,
+            order_by: query_order,
+            filter_over: query_filter,
+        },
+    ) = (pattern, query)
+    else {
+        return try_capture_parameters(pattern, query);
+    };
+    // Function names must match
+    if !pattern_name
+        .as_str()
+        .eq_ignore_ascii_case(query_name.as_str())
+    {
+        return None;
+    }
+
+    // Argument counts must match
+    if pattern_args.len() != query_args.len() {
+        return None;
+    }
+    // Distinctness must match (we don't support it)
+    if pattern_distinct.is_some() || query_distinct.is_some() {
+        return None;
+    }
+    // ORDER BY within function not supported
+    if !pattern_order.is_empty() || !query_order.is_empty() {
+        return None;
+    }
+
+    // Filter/over clause not supported
+    if pattern_filter.filter_clause.is_some() || pattern_filter.over_clause.is_some() {
+        return None;
+    }
+    if query_filter.filter_clause.is_some() || query_filter.over_clause.is_some() {
+        return None;
+    }
+
+    let mut captured = HashMap::new();
+
+    // Split args into column args (reorderable) and remaining args (positional)
+    let pattern_col_args = &pattern_args[..num_column_args];
+    let query_col_args = &query_args[..num_column_args];
+    let pattern_rest = &pattern_args[num_column_args..];
+    let query_rest = &query_args[num_column_args..];
+
+    // For column arguments: check that the same set of columns is used (order-independent)
+    // We use a greedy matching approach: for each query column, find a matching pattern column
+    let mut matched_pattern_indices: HashSet<usize> = HashSet::new();
+
+    for query_col in query_col_args {
+        let mut found_match = false;
+        for (i, pattern_col) in pattern_col_args.iter().enumerate() {
+            if matched_pattern_indices.contains(&i) {
+                continue;
+            }
+            if exprs_are_equivalent(pattern_col, query_col) {
+                matched_pattern_indices.insert(i);
+                found_match = true;
+                break;
+            }
+        }
+        if !found_match {
+            return None;
+        }
+    }
+    // All pattern columns must be matched
+    if matched_pattern_indices.len() != pattern_col_args.len() {
+        return None;
+    }
+    // Remaining args must match positionally (includes the query string parameter)
+    for (pattern_arg, query_arg) in pattern_rest.iter().zip(query_rest.iter()) {
+        let result = try_capture_parameters(pattern_arg, query_arg)?;
+        captured.extend(result);
+    }
+
+    Some(captured)
+}
+
 /// This function is used to determine whether two expressions are logically
 /// equivalent in the context of queries, even if their representations
 /// differ. e.g.: `SUM(x)` and `sum(x)`, `x + y` and `y + x`
@@ -634,6 +766,20 @@ pub fn exprs_are_equivalent(expr1: &Expr, expr2: &Expr) -> bool {
                     .zip(rhs2.iter())
                     .all(|(a, b)| exprs_are_equivalent(a, b))
         }
+        (
+            Expr::Column {
+                database: db1,
+                is_rowid_alias: r1,
+                table: tbl_1,
+                column: col_1,
+            },
+            Expr::Column {
+                database: db2,
+                is_rowid_alias: r2,
+                table: tbl_2,
+                column: col_2,
+            },
+        ) => tbl_1 == tbl_2 && col_1 == col_2 && db1 == db2 && r1 == r2,
         // fall back to naive equality check
         _ => expr1 == expr2,
     }
