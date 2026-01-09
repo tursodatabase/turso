@@ -140,6 +140,53 @@ fn test_truncated_wal_returns_short_read_error() {
     }
 }
 
+/// Test that truncating the database header results in a ShortRead error.
+#[cfg(not(feature = "checksum"))]
+#[test]
+fn test_truncated_header_returns_short_read_error() {
+    let _ = env_logger::try_init();
+    let db_name = format!("test-truncated-header-{}.db", rng().next_u32());
+    let tmp_db = TempDatabase::new(&db_name);
+    let db_path = tmp_db.path.clone();
+
+    // Create a minimal database
+    {
+        let conn = tmp_db.connect_limbo();
+        run_query(
+            &tmp_db,
+            &conn,
+            "CREATE TABLE test (id INTEGER PRIMARY KEY);",
+        )
+        .unwrap();
+        do_flush(&conn, &tmp_db).unwrap();
+        run_query(&tmp_db, &conn, "PRAGMA wal_checkpoint(TRUNCATE);").unwrap();
+    }
+
+    // Truncate the database to only 50 bytes (less than a full header read)
+    {
+        let file = OpenOptions::new()
+            .write(true)
+            .open(&db_path)
+            .expect("Failed to open database file for truncation");
+        file.set_len(50).expect("Failed to truncate database file");
+    }
+
+    // Opening the database should fail with a short read error
+    {
+        let existing_db = TempDatabase::new_with_existent(&db_path);
+        match existing_db.db.connect() {
+            Ok(_) => panic!("Connection to database with truncated header must fail"),
+            Err(err) => {
+                let err_string = err.to_string();
+                assert!(
+                    err_string.contains("short read"),
+                    "Expected 'short read' error, got: {err_string}",
+                );
+            }
+        }
+    }
+}
+
 /// Test that zeroing a database page results in a Corrupt error.
 #[cfg(not(feature = "checksum"))]
 #[test]
