@@ -179,10 +179,8 @@ impl Database {
                 Arc::new(BackingBtreeIndexMethod),
             );
             #[cfg(feature = "fts")]
-            syms.index_methods.insert(
-                FTS_INDEX_METHOD_NAME.to_string(),
-                Arc::new(FtsIndexMethod),
-            );
+            syms.index_methods
+                .insert(FTS_INDEX_METHOD_NAME.to_string(), Arc::new(FtsIndexMethod));
         }
         let syms = self.builtin_syms.data_ptr();
         // Pass the mutex pointer and the appropriate handler

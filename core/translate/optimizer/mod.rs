@@ -34,7 +34,8 @@ use crate::{
     },
     types::SeekOp,
     util::{
-        exprs_are_equivalent, simple_bind_expr, try_capture_parameters, try_substitute_parameters,
+        count_fts_column_args, exprs_are_equivalent, simple_bind_expr, try_capture_parameters,
+        try_capture_parameters_column_agnostic, try_substitute_parameters,
     },
     vdbe::{
         affinity::Affinity,
@@ -369,13 +370,17 @@ fn optimize_table_access_with_custom_modules(
     offset: &mut Option<Box<Expr>>,
 ) -> Result<bool> {
     let tables = table_references.joined_tables_mut();
-    assert_eq!(tables.len(), 1);
+    if tables.is_empty() {
+        return Ok(false);
+    }
 
     // group by is not supported for now
     if group_by.is_some() {
         return Ok(false);
     }
 
+    // Only optimize the first table with custom index methods.
+    // This allows FTS to be used as the driving table in joins.
     let table = &mut tables[0];
     let Some(indexes) = available_indexes.get(table.table.get_name()) else {
         return Ok(false);
@@ -446,8 +451,18 @@ fn optimize_table_access_with_custom_modules(
                     if *query_order != pattern_column.order.unwrap_or(SortOrder::Asc) {
                         continue 'pattern;
                     }
-                    let Some(captured) = try_capture_parameters(&pattern_column.expr, query_column)
-                    else {
+                    // Use column-agnostic matching for FTS functions in ORDER BY
+                    let num_col_args = count_fts_column_args(&pattern_column.expr);
+                    let captured = if num_col_args > 0 {
+                        try_capture_parameters_column_agnostic(
+                            &pattern_column.expr,
+                            query_column,
+                            num_col_args,
+                        )
+                    } else {
+                        try_capture_parameters(&pattern_column.expr, query_column)
+                    };
+                    let Some(captured) = captured else {
                         continue 'pattern;
                     };
                     parameters.extend(captured);
@@ -482,7 +497,18 @@ fn optimize_table_access_with_custom_modules(
             }
             if let Some(pattern_where) = where_clause {
                 for (i, query_where) in where_query.iter().enumerate() {
-                    let captured = try_capture_parameters(pattern_where, &query_where.expr);
+                    // Use column-agnostic matching for FTS functions to allow
+                    // column arguments in any order (e.g., fts_match(a, b, q) matches fts_match(b, a, q))
+                    let num_col_args = count_fts_column_args(pattern_where);
+                    let captured = if num_col_args > 0 {
+                        try_capture_parameters_column_agnostic(
+                            pattern_where,
+                            &query_where.expr,
+                            num_col_args,
+                        )
+                    } else {
+                        try_capture_parameters(pattern_where, &query_where.expr)
+                    };
                     let Some(captured) = captured else {
                         continue;
                     };
@@ -666,7 +692,10 @@ fn optimize_table_access(
         );
     }
 
-    if table_references.joined_tables().len() == 1 {
+    // Try to optimize the first table with custom index methods (e.g., FTS).
+    // This allows FTS to drive the query even in multi-table joins.
+    if !table_references.joined_tables().is_empty() {
+        let is_single_table = table_references.joined_tables().len() == 1;
         let optimized = optimize_table_access_with_custom_modules(
             result_columns,
             table_references,
@@ -678,7 +707,13 @@ fn optimize_table_access(
             offset,
         )?;
         if optimized {
-            return Ok(None);
+            // For single-table queries, we're done - custom index handles everything
+            if is_single_table {
+                return Ok(None);
+            }
+            // For multi-table queries, continue with normal optimization for remaining tables.
+            // The first table is already optimized with custom index, but we need to
+            // set up join access methods for the other tables.
         }
     }
 
@@ -892,6 +927,15 @@ fn optimize_table_access(
     // We iterate over ALL tables (including hash join build tables) to set their operations,
     // even though build tables are not in best_join_order.
     for (i, &table_idx) in best_table_numbers.iter().enumerate() {
+        // Skip tables that already have an IndexMethodQuery operation set.
+        // This happens when the first table was optimized with a custom index (e.g., FTS)
+        // and we're continuing to optimize remaining tables in a multi-table query.
+        if matches!(
+            table_references.joined_tables()[table_idx].op,
+            Operation::IndexMethodQuery(_)
+        ) {
+            continue;
+        }
         let access_method = &mut access_methods_arena[best_access_methods[i]];
         match &mut access_method.params {
             AccessMethodParams::BTreeTable {
