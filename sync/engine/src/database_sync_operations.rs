@@ -109,23 +109,32 @@ pub fn connect_untracked(tape: &DatabaseTape) -> Result<Arc<turso_core::Connecti
     Ok(conn)
 }
 
+/// HTTP header key for the encryption key, for the encrypted Turso Cloud databases
+pub const ENCRYPTION_KEY_HEADER: &str = "x-turso-encryption-key";
+
 pub struct SyncOperationCtx<'a, IO: SyncEngineIo, Ctx> {
     pub coro: &'a Coro<Ctx>,
     pub io: &'a SyncEngineIoStats<IO>,
     // optional remote url set in the saved configuration section of metadata file
     pub remote_url: Option<String>,
+    // optional remote encryption key for the encrypted Turso Cloud databases, base64 encoded
+    pub remote_encryption_key: Option<String>,
 }
 
 impl<'a, IO: SyncEngineIo, Ctx> SyncOperationCtx<'a, IO, Ctx> {
+    /// Create a sync operation context.
+    /// `remote_encryption_key` should be base64-encoded if provided.
     pub fn new(
         coro: &'a Coro<Ctx>,
         io: &'a SyncEngineIoStats<IO>,
         remote_url: Option<String>,
+        remote_encryption_key: Option<&str>,
     ) -> Self {
         Self {
             coro,
             io,
             remote_url: remote_url.map(|x| x.to_string()),
+            remote_encryption_key: remote_encryption_key.map(|k| k.to_string()),
         }
     }
     pub fn http(
@@ -135,8 +144,15 @@ impl<'a, IO: SyncEngineIo, Ctx> SyncOperationCtx<'a, IO, Ctx> {
         body: Option<Vec<u8>>,
         headers: &[(&str, &str)],
     ) -> Result<IO::DataCompletionBytes> {
-        let remote_url = self.remote_url.as_deref();
-        self.io.http(remote_url, method, path, body, headers)
+        let encryption_header = self
+            .remote_encryption_key
+            .as_ref()
+            .map(|key| (ENCRYPTION_KEY_HEADER, key.as_str()));
+
+        let all_headers: Vec<_> = headers.iter().copied().chain(encryption_header).collect();
+
+        self.io
+            .http(self.remote_url.as_deref(), method, path, body, &all_headers)
     }
 }
 
@@ -1741,5 +1757,11 @@ mod tests {
                 genawaiter::GeneratorState::Complete(result) => break result.unwrap(),
             }
         }
+    }
+
+    #[test]
+    fn test_remote_encryption_key_header_constant() {
+        use super::ENCRYPTION_KEY_HEADER;
+        assert_eq!(ENCRYPTION_KEY_HEADER, "x-turso-encryption-key");
     }
 }

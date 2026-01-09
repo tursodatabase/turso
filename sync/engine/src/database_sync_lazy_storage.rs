@@ -228,6 +228,8 @@ pub struct LazyDatabaseStorage<IO: SyncEngineIo> {
     opts: PartialSyncOpts,
     // optional remote_url from saved configuration section of metadata file
     remote_url: Option<String>,
+    // optional encryption key (base64 encoded) for encrypted Turso Cloud databases
+    remote_encryption_key: Option<String>,
 }
 
 impl<IO: SyncEngineIo> LazyDatabaseStorage<IO> {
@@ -238,6 +240,7 @@ impl<IO: SyncEngineIo> LazyDatabaseStorage<IO> {
         server_revision: String,
         opts: PartialSyncOpts,
         remote_url: Option<String>,
+        remote_encryption_key: Option<String>,
     ) -> Result<Self, errors::Error> {
         let clean_file_size = Arc::new(clean_file.size()?.into());
         Ok(Self {
@@ -249,6 +252,7 @@ impl<IO: SyncEngineIo> LazyDatabaseStorage<IO> {
             opts,
             page_states: Arc::new(Mutex::new(PageStates::new())),
             remote_url,
+            remote_encryption_key,
         })
     }
 }
@@ -544,6 +548,7 @@ impl<IO: SyncEngineIo> DatabaseStorage for LazyDatabaseStorage<IO> {
         );
         let mut generator = genawaiter::sync::Gen::new({
             let remote_url = self.remote_url.clone();
+            let remote_encryption_key = self.remote_encryption_key.clone();
             let sync_engine_io = self.sync_engine_io.clone();
             let server_revision = self.server_revision.clone();
             let clean_file = self.clean_file.clone();
@@ -555,7 +560,12 @@ impl<IO: SyncEngineIo> DatabaseStorage for LazyDatabaseStorage<IO> {
             move |coro| async move {
                 let coro = Coro::new((), coro);
                 let mut guard = PageStatesGuard::new(&page_states);
-                let ctx = &SyncOperationCtx::new(&coro, &sync_engine_io, remote_url);
+                let ctx = &SyncOperationCtx::new(
+                    &coro,
+                    &sync_engine_io,
+                    remote_url,
+                    remote_encryption_key.as_deref(),
+                );
                 read_page(
                     ctx,
                     clean_file,
