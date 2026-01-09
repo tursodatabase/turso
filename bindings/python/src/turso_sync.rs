@@ -70,6 +70,8 @@ pub struct PyTursoSyncDatabaseConfig {
     // reserved bytes which must be set for the database - necessary if remote encryption is set for the db in cloud
     pub reserved_bytes: Option<usize>,
     pub partial_sync: Option<PyTursoPartialSyncOpts>,
+    // base64-encoded encryption key for the ecnrypted Turso Cloud databases
+    pub remote_encryption_key: Option<String>,
 }
 
 #[pymethods]
@@ -83,7 +85,9 @@ impl PyTursoSyncDatabaseConfig {
         bootstrap_if_empty=true,
         reserved_bytes=None,
         partial_sync=None,
+        remote_encryption_key=None,
     ))]
+    #[allow(clippy::too_many_arguments)]
     fn new(
         path: String,
         client_name: String,
@@ -92,6 +96,7 @@ impl PyTursoSyncDatabaseConfig {
         bootstrap_if_empty: bool,
         reserved_bytes: Option<usize>,
         partial_sync: Option<&PyTursoPartialSyncOpts>,
+        remote_encryption_key: Option<String>,
     ) -> Self {
         Self {
             path,
@@ -101,6 +106,7 @@ impl PyTursoSyncDatabaseConfig {
             bootstrap_if_empty,
             reserved_bytes,
             partial_sync: partial_sync.cloned(),
+            remote_encryption_key,
         }
     }
 }
@@ -150,6 +156,7 @@ pub fn py_turso_sync_new(
             }
             None => None,
         },
+        remote_encryption_key: sync_config.remote_encryption_key.clone(),
     };
     let database =
         TursoDatabaseSync::<Vec<u8>>::new(db_config, sync_config).map_err(turso_error_to_py_err)?;
