@@ -67,7 +67,6 @@ use crate::{
 };
 use rustc_hash::FxHashMap;
 use std::collections::BTreeMap;
-use std::mem::MaybeUninit;
 use std::pin::Pin;
 
 /// The minimum size of a cell in bytes.
@@ -879,87 +878,6 @@ pub fn validate_serial_type(value: u64) -> Result<()> {
         crate::bail_corrupt_error!("Invalid serial type: {}", value);
     }
     Ok(())
-}
-
-pub struct SmallVec<T, const N: usize = 64> {
-    /// Stack allocated data
-    pub data: [std::mem::MaybeUninit<T>; N],
-    /// Length of the vector, accounting for both stack and heap allocated data
-    pub len: usize,
-    /// Extra data on heap
-    pub extra_data: Option<Vec<T>>,
-}
-
-impl<T: Default + Copy, const N: usize> Default for SmallVec<T, N> {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl<T: Default + Copy, const N: usize> SmallVec<T, N> {
-    pub fn new() -> Self {
-        Self {
-            data: unsafe { std::mem::MaybeUninit::uninit().assume_init() },
-            len: 0,
-            extra_data: None,
-        }
-    }
-
-    pub fn push(&mut self, value: T) {
-        if self.len < self.data.len() {
-            self.data[self.len] = MaybeUninit::new(value);
-            self.len += 1;
-        } else {
-            if self.extra_data.is_none() {
-                self.extra_data = Some(Vec::new());
-            }
-            self.extra_data.as_mut().unwrap().push(value);
-            self.len += 1;
-        }
-    }
-
-    fn get_from_heap(&self, index: usize) -> T {
-        assert!(self.extra_data.is_some());
-        assert!(index >= self.data.len());
-        let extra_data_index = index - self.data.len();
-        let extra_data = self.extra_data.as_ref().unwrap();
-        assert!(extra_data_index < extra_data.len());
-        extra_data[extra_data_index]
-    }
-
-    pub fn get(&self, index: usize) -> Option<T> {
-        if index >= self.len {
-            return None;
-        }
-        let data_is_on_stack = index < self.data.len();
-        if data_is_on_stack {
-            // SAFETY: We know this index is initialized we checked for index < self.len earlier above.
-            unsafe { Some(self.data[index].assume_init()) }
-        } else {
-            Some(self.get_from_heap(index))
-        }
-    }
-}
-
-impl<T: Default + Copy, const N: usize> SmallVec<T, N> {
-    pub fn iter(&self) -> SmallVecIter<'_, T, N> {
-        SmallVecIter { vec: self, pos: 0 }
-    }
-}
-
-pub struct SmallVecIter<'a, T, const N: usize> {
-    vec: &'a SmallVec<T, N>,
-    pos: usize,
-}
-
-impl<T: Default + Copy, const N: usize> Iterator for SmallVecIter<'_, T, N> {
-    type Item = T;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let next = self.vec.get(self.pos)?;
-        self.pos += 1;
-        Some(next)
-    }
 }
 
 /// Reads a value that might reference the buffer it is reading from. Be sure to store RefValue with the buffer
@@ -2053,35 +1971,6 @@ mod tests {
             let result = validate_serial_type(i);
             assert!(result.is_ok());
         }
-    }
-
-    #[test]
-    fn test_smallvec_iter() {
-        let mut small_vec = SmallVec::<i32, 4>::new();
-        (0..8).for_each(|i| small_vec.push(i));
-
-        let mut iter = small_vec.iter();
-        assert_eq!(iter.next(), Some(0));
-        assert_eq!(iter.next(), Some(1));
-        assert_eq!(iter.next(), Some(2));
-        assert_eq!(iter.next(), Some(3));
-        assert_eq!(iter.next(), Some(4));
-        assert_eq!(iter.next(), Some(5));
-        assert_eq!(iter.next(), Some(6));
-        assert_eq!(iter.next(), Some(7));
-        assert_eq!(iter.next(), None);
-    }
-
-    #[test]
-    fn test_smallvec_get() {
-        let mut small_vec = SmallVec::<i32, 4>::new();
-        (0..8).for_each(|i| small_vec.push(i));
-
-        (0..8usize).for_each(|i| {
-            assert_eq!(small_vec.get(i), Some(i as i32));
-        });
-
-        assert_eq!(small_vec.get(8), None);
     }
 
     #[rstest]
