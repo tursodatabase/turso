@@ -56,6 +56,7 @@ The database has the following experimental features:
 * **`BEGIN CONCURRENT`** for improved write throughput using multi-version concurrency control (MVCC).
 * **Encryption at rest** for protecting the data locally.
 * **Incremental computation** using DBSP for incremental view maintenance and query subscriptions.
+* **Full-Text-Search** using the awesome [tantivy](https://github.com/quickwit-oss/tantivy) library
 
 The following features are on our current roadmap:
 
