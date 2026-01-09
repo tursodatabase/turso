@@ -13,7 +13,7 @@ use crate::util::exprs_are_equivalent;
 use crate::vdbe::hash_table::DEFAULT_MEM_BUDGET;
 use crate::{
     schema::{Index, Table},
-    translate::plan::{IterationDirection, JoinOrderMember, JoinedTable},
+    translate::plan::{IndexMethodQuery, IterationDirection, JoinOrderMember, JoinedTable},
     vtab::VirtualTable,
     LimboError, Result,
 };
@@ -76,6 +76,15 @@ pub enum AccessMethodParams {
         materialize_build_input: bool,
         /// Whether to use a bloom filter on the probe side.
         use_bloom_filter: bool,
+    },
+    /// Custom index method access (e.g., FTS).
+    /// This variant is used when the optimizer determines that a custom index method
+    /// should be used for table access in a join query.
+    IndexMethod {
+        /// The fully constructed IndexMethodQuery operation to apply to this table.
+        query: IndexMethodQuery,
+        /// Index in WHERE clause that was covered by this index method (if any).
+        where_covered: Option<usize>,
     },
 }
 

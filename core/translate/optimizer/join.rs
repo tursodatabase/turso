@@ -23,6 +23,7 @@ use super::{
     constraints::TableConstraints,
     cost::ESTIMATED_HARDCODED_ROWS_PER_TABLE,
     order::OrderTarget,
+    IndexMethodCandidate,
 };
 
 // Upper bound on rowids to materialize for a hash build input.
@@ -80,6 +81,7 @@ pub fn join_lhs_and_rhs<'a>(
     where_clause: &mut [WhereTerm],
     where_term_table_ids: &[HashSet<TableInternalId>],
     subqueries: &[NonFromClauseSubquery],
+    index_method_candidates: &[IndexMethodCandidate],
 ) -> Result<Option<JoinN>> {
     // The input cardinality for this join is the output cardinality of the previous join.
     // For example, in a 2-way join, if the left table has 1000 rows, and the right table will return 2 rows for each of the left table's rows,
@@ -561,6 +563,34 @@ pub fn join_lhs_and_rhs<'a>(
         }
     }
 
+    // Check if there's an index method candidate for this table (e.g., FTS)
+    // and compare its cost against the current best access method.
+    if let Some(candidate) = index_method_candidates
+        .iter()
+        .find(|c| c.table_idx == rhs_table_number)
+    {
+        if let Some(cost_estimate) = &candidate.cost_estimate {
+            // FTS cost depends on whether it's the outer table (no LHS) or inner table
+            let fts_cost = if lhs.is_none() {
+                // Outer table: FTS cost is fixed
+                Cost(cost_estimate.estimated_cost)
+            } else {
+                // Inner table: FTS cost is multiplied by input cardinality
+                Cost(cost_estimate.estimated_cost * input_cardinality as f64)
+            };
+
+            if fts_cost < best_access_method.cost {
+                best_access_method = AccessMethod {
+                    cost: fts_cost,
+                    params: AccessMethodParams::IndexMethod {
+                        query: candidate.to_query(),
+                        where_covered: candidate.where_covered,
+                    },
+                };
+            }
+        }
+    }
+
     let cost = lhs_cost + best_access_method.cost;
 
     if cost > cost_upper_bound {
@@ -694,6 +724,7 @@ pub struct BestJoinOrderResult {
 
 /// Compute the best way to join a given set of tables.
 /// Returns the best [JoinN] if one exists, otherwise returns None.
+#[allow(clippy::too_many_arguments)]
 pub fn compute_best_join_order<'a>(
     joined_tables: &[JoinedTable],
     maybe_order_target: Option<&OrderTarget>,
@@ -702,6 +733,7 @@ pub fn compute_best_join_order<'a>(
     access_methods_arena: &'a mut Vec<AccessMethod>,
     where_clause: &mut [WhereTerm],
     subqueries: &[NonFromClauseSubquery],
+    index_method_candidates: &[IndexMethodCandidate],
 ) -> Result<Option<BestJoinOrderResult>> {
     // Skip work if we have no tables to consider.
     if joined_tables.is_empty() {
@@ -725,6 +757,7 @@ pub fn compute_best_join_order<'a>(
             where_clause,
             &where_term_table_ids,
             subqueries,
+            index_method_candidates,
         );
     }
 
@@ -738,6 +771,7 @@ pub fn compute_best_join_order<'a>(
         where_clause,
         &where_term_table_ids,
         subqueries,
+        index_method_candidates,
     )?;
 
     // Keep track of both 1. the best plan overall (not considering sorting), and 2. the best ordered plan (which might not be the same).
@@ -816,6 +850,7 @@ pub fn compute_best_join_order<'a>(
             where_clause,
             &where_term_table_ids,
             subqueries,
+            index_method_candidates,
         )?;
         if let Some(rel) = rel {
             best_plan_memo.entry(mask).or_default().insert(i, rel);
@@ -938,6 +973,7 @@ pub fn compute_best_join_order<'a>(
                         where_clause,
                         &where_term_table_ids,
                         subqueries,
+                        index_method_candidates,
                     )?;
                     join_order.clear();
 
@@ -1049,6 +1085,7 @@ pub fn compute_greedy_join_order<'a>(
     where_clause: &mut [WhereTerm],
     where_term_table_ids: &[HashSet<TableInternalId>],
     subqueries: &[NonFromClauseSubquery],
+    index_method_candidates: &[IndexMethodCandidate],
 ) -> Result<Option<BestJoinOrderResult>> {
     let num_tables = joined_tables.len();
     if num_tables == 0 {
@@ -1097,6 +1134,7 @@ pub fn compute_greedy_join_order<'a>(
         where_clause,
         where_term_table_ids,
         subqueries,
+        index_method_candidates,
     )?;
 
     if current_plan.is_none() {
@@ -1178,6 +1216,7 @@ pub fn compute_greedy_join_order<'a>(
                 where_clause,
                 where_term_table_ids,
                 subqueries,
+                index_method_candidates,
             )? {
                 if best.as_ref().is_none_or(|(_, b)| plan.cost < b.cost) {
                     best = Some((idx, plan));
@@ -1273,6 +1312,7 @@ pub fn compute_naive_left_deep_plan<'a>(
     where_clause: &mut [WhereTerm],
     where_term_table_ids: &[HashSet<TableInternalId>],
     subqueries: &[NonFromClauseSubquery],
+    index_method_candidates: &[IndexMethodCandidate],
 ) -> Result<Option<JoinN>> {
     let n = joined_tables.len();
     assert!(n > 0);
@@ -1302,6 +1342,7 @@ pub fn compute_naive_left_deep_plan<'a>(
         where_clause,
         where_term_table_ids,
         subqueries,
+        index_method_candidates,
     )?;
     if best_plan.is_none() {
         return Ok(None);
@@ -1323,6 +1364,7 @@ pub fn compute_naive_left_deep_plan<'a>(
             where_clause,
             where_term_table_ids,
             subqueries,
+            index_method_candidates,
         )?;
         if best_plan.is_none() {
             return Ok(None);
@@ -1479,6 +1521,7 @@ mod tests {
             &mut access_methods_arena,
             &mut where_clause,
             &[],
+            &[],
         )
         .unwrap();
         assert!(result.is_none());
@@ -1518,6 +1561,7 @@ mod tests {
             &base_table_rows,
             &mut access_methods_arena,
             &mut where_clause,
+            &[],
             &[],
         )
         .unwrap()
@@ -1568,6 +1612,7 @@ mod tests {
             &base_table_rows,
             &mut access_methods_arena,
             &mut where_clause,
+            &[],
             &[],
         )
         .unwrap();
@@ -1646,6 +1691,7 @@ mod tests {
             &base_table_rows,
             &mut access_methods_arena,
             &mut where_clause,
+            &[],
             &[],
         )
         .unwrap();
@@ -1735,6 +1781,7 @@ mod tests {
             &base_table_rows,
             &mut access_methods_arena,
             &mut where_clause,
+            &[],
             &[],
         )
         .unwrap();
@@ -1926,6 +1973,7 @@ mod tests {
             &mut access_methods_arena,
             &mut where_clause,
             &[],
+            &[],
         )
         .unwrap();
         assert!(result.is_some());
@@ -2044,6 +2092,7 @@ mod tests {
             &mut access_methods_arena,
             &mut where_clause,
             &[],
+            &[],
         )
         .unwrap()
         .unwrap();
@@ -2159,6 +2208,7 @@ mod tests {
             &mut access_methods_arena,
             &mut where_clause,
             &[],
+            &[],
         )
         .unwrap();
         assert!(result.is_some());
@@ -2252,6 +2302,7 @@ mod tests {
             &base_table_rows,
             &mut access_methods_arena,
             &mut where_clause,
+            &[],
             &[],
         )
         .unwrap()
@@ -2387,6 +2438,7 @@ mod tests {
             &mut access_methods_arena,
             &mut where_clause,
             &[],
+            &[],
         )
         .unwrap()
         .unwrap();
@@ -2509,6 +2561,7 @@ mod tests {
             &base_table_rows,
             &mut access_methods_arena,
             &mut where_clause,
+            &[],
             &[],
         )
         .unwrap()
@@ -2650,6 +2703,7 @@ mod tests {
             &base_table_rows,
             &mut access_methods_arena,
             &mut where_clause,
+            &[],
             &[],
         )
         .unwrap()
@@ -2862,6 +2916,7 @@ mod tests {
             &base_table_rows,
             &mut access_methods_arena,
             &mut where_clause,
+            &[],
             &[],
         )
         .unwrap();
