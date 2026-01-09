@@ -1077,6 +1077,16 @@ do_execsql_test_in_memory_any_error limit-column-reference-error {
   SELECT * FROM t LIMIT (t.a);
 }
 
+# Regression test for https://github.com/tursodatabase/turso/issues/4554
+# LIMIT clause with hex/underscore numeric literals should work
+do_execsql_test_on_specific_db {:memory:} limit-hex-literal {
+  SELECT 1 LIMIT 0x10;
+} {1}
+
+do_execsql_test_on_specific_db {:memory:} limit-underscore-literal {
+  SELECT 1 LIMIT 1_2_3;
+} {1}
+
 do_execsql_test select-binary-collation {
   SELECT 'a' = 'A';
   SELECT 'a' = 'a';
