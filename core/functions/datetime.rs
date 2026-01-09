@@ -994,8 +994,8 @@ fn strip_timezone_suffix(s: &str) -> &str {
     // Check +HH:MM or -HH:MM (length >= 6)
     if s.len() >= 6 {
         let idx = s.len() - 6;
-        let c = s.chars().nth(idx).unwrap();
-        if (c == '+' || c == '-') && s[idx + 3..].starts_with(':') {
+        let c = s.as_bytes()[idx];
+        if (c == b'+' || c == b'-') && s.as_bytes()[idx + 3] == b':' {
             let h_part = &s[idx + 1..idx + 3];
             let m_part = &s[idx + 4..];
 
