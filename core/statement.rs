@@ -87,7 +87,7 @@ impl Statement {
     }
 
     pub fn n_change(&self) -> i64 {
-        self.program
+        self.state
             .n_change
             .load(crate::sync::atomic::Ordering::SeqCst)
     }
@@ -451,7 +451,7 @@ impl Statement {
         // as abort uses auto_txn_cleanup value - it needs to be called before state.reset
         self.program.abort(&self.pager, None, &mut self.state);
         self.state.reset(max_registers, max_cursors);
-        self.program.n_change.store(0, Ordering::SeqCst);
+        self.state.n_change.store(0, Ordering::SeqCst);
         self.busy = false;
         self.busy_handler_state = None;
     }

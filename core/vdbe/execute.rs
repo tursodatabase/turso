@@ -6235,7 +6235,7 @@ pub fn op_insert(
                 };
                 if let Some(rowid) = maybe_rowid {
                     program.connection.update_last_rowid(rowid);
-                    program
+                    state
                         .n_change
                         .fetch_add(1, crate::sync::atomic::Ordering::SeqCst);
                 }
@@ -6442,7 +6442,7 @@ pub fn op_delete(
     if !is_part_of_update {
         // DELETEs do not count towards the total changes if they are part of an UPDATE statement,
         // i.e. the DELETE and subsequent INSERT of a row are the same "change".
-        program
+        state
             .n_change
             .fetch_add(1, crate::sync::atomic::Ordering::SeqCst);
     }
