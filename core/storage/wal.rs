@@ -1297,13 +1297,19 @@ impl Wal for WalFile {
         };
         let complete = Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
             let Ok((buf, bytes_read)) = res else {
-                return None;
+                return None; // IO error already captured in completion
             };
             let buf_len = buf.len();
-            turso_assert!(
-                bytes_read == buf_len as i32,
-                "read({bytes_read}) != expected({buf_len})"
-            );
+            if bytes_read != buf_len as i32 {
+                tracing::error!(
+                    "short read on WAL frame {frame_id}: expected {buf_len} bytes, got {bytes_read}"
+                );
+                return Some(CompletionError::ShortRead {
+                    page_idx: frame_id as usize,
+                    expected: buf_len,
+                    actual: bytes_read as usize,
+                });
+            }
             let buf_ptr = buf.as_ptr();
             let frame_ptr = frame_ptr as *mut u8;
             let frame_ref: &mut [u8] =
@@ -1391,13 +1397,19 @@ impl Wal for WalFile {
                 let conflict = conflict.clone();
                 move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
                     let Ok((buf, bytes_read)) = res else {
-                        return None;
+                        return None; // IO error already captured in completion
                     };
                     let buf_len = buf.len();
-                    turso_assert!(
-                        bytes_read == buf_len as i32,
-                        "read({bytes_read}) != expected({buf_len})"
-                    );
+                    if bytes_read != buf_len as i32 {
+                        tracing::error!(
+                            "short read on WAL frame validation, page_id={page_id}: expected {buf_len} bytes, got {bytes_read}"
+                        );
+                        return Some(CompletionError::ShortRead {
+                            page_idx: page_id as usize,
+                            expected: buf_len,
+                            actual: bytes_read as usize,
+                        });
+                    }
                     let page = unsafe { std::slice::from_raw_parts(page_ptr as *mut u8, page_len) };
                     if buf.as_slice() != page {
                         *conflict.lock() = true;
