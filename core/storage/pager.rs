@@ -4139,8 +4139,17 @@ impl Pager {
     #[instrument(skip_all, level = Level::DEBUG)]
     pub fn rollback(&self, schema_did_change: bool, connection: &Connection, is_write: bool) {
         tracing::debug!(schema_did_change);
-        self.clear_page_cache(is_write);
         if is_write {
+            let clear_dirty = true;
+            // The page cache only needs to be cleared if we are rolling back a write transaction.
+            // If a read transaction rolls back, and the next read transaction detects that the
+            // database has changed in between (see db_changed() in wal.rs), then the page cache
+            // will be cleared. Since the read transaction itself has not modified anything, it can proceed
+            // with its cached pages in case the database has NOT changed in between.
+            //
+            // Even in the case of a write transaction, clearing the entire page cache is overkill,
+            // since we only need to clear the dirty pages that were modified by the write transaction.
+            self.clear_page_cache(clear_dirty);
             self.dirty_pages.write().clear();
         } else {
             turso_assert!(
