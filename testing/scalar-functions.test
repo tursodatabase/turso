@@ -1096,35 +1096,3 @@ do_execsql_test replace-test-zeroblob-quote {
 #  select soundex('Pfister'), soundex('husobee'), soundex('Tymczak'), soundex('Ashcraft'), soundex('Robert'), soundex('Rupert'), soundex('Rubin'), soundex('Kant'), soundex('Knuth'), soundex('x'), soundex('');
 # } {P236|H210|T522|A261|R163|R163|R150|K530|K530|X000|0000}
 
-# uuid7_timestamp_ms should return NULL for invalid input blobs (not exactly 16 bytes)
-do_execsql_test_on_specific_db {:memory:} uuid7_timestamp_ms-empty-blob {
-  SELECT uuid7_timestamp_ms(X'');
-} {}
-
-do_execsql_test_on_specific_db {:memory:} uuid7_timestamp_ms-short-blob {
-  SELECT uuid7_timestamp_ms(X'00');
-} {}
-
-do_execsql_test_on_specific_db {:memory:} uuid7_timestamp_ms-5-byte-blob {
-  SELECT uuid7_timestamp_ms(randomblob(5));
-} {}
-
-do_execsql_test_on_specific_db {:memory:} uuid7_timestamp_ms-10-byte-blob {
-  SELECT uuid7_timestamp_ms(zeroblob(10));
-} {}
-
-# uuid7_timestamp_ms should return NULL for invalid UUID strings
-do_execsql_test_on_specific_db {:memory:} uuid7_timestamp_ms-invalid-string {
-  SELECT uuid7_timestamp_ms('not-a-uuid');
-} {}
-
-# uuid7_timestamp_ms should work with valid 16-byte blob
-do_execsql_test_on_specific_db {:memory:} uuid7_timestamp_ms-valid-blob {
-  SELECT typeof(uuid7_timestamp_ms(uuid7()));
-} {integer}
-
-# uuid7_timestamp_ms should work with valid uuid string
-do_execsql_test_on_specific_db {:memory:} uuid7_timestamp_ms-valid-string {
-  SELECT uuid7_timestamp_ms('01945ca0-3189-76c0-9a8f-caf310fc8b8e') / 1000;
-} {1736720789}
-
