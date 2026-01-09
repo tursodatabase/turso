@@ -9433,19 +9433,21 @@ pub fn op_integrity_check(
                         // Index key = (indexed_col_values..., rowid)
                         let mut key_values: Vec<Value> =
                             Vec::with_capacity(index.column_positions.len() + 1);
-                        for &pos in &index.column_positions {
+                        for (col_idx, &pos) in index.column_positions.iter().enumerate() {
                             // For INTEGER PRIMARY KEY columns, the value in the record is NULL
                             // but the actual value is the rowid
                             let value = if table.rowid_alias_column_pos == Some(pos) {
                                 Value::Integer(*rowid)
+                            } else if pos >= row_values.len() {
+                                // Columns added via ALTER TABLE ADD COLUMN: existing rows
+                                // don't have values for these columns. Use the column's
+                                // DEFAULT value from the pre-evaluated register. This is
+                                // NULL if no DEFAULT value is defined for the column.
+                                state.registers[index.default_values_start_reg + col_idx]
+                                    .get_value()
+                                    .clone()
                             } else {
-                                // Handle columns added via ALTER TABLE ADD COLUMN: existing rows
-                                // don't have values for these columns, they're implicitly NULL.
-                                if pos >= row_values.len() {
-                                    Value::Null
-                                } else {
-                                    row_values[pos].clone()
-                                }
+                                row_values[pos].clone()
                             };
                             key_values.push(value);
                         }

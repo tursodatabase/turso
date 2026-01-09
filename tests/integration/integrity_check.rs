@@ -1349,3 +1349,105 @@ fn test_integrity_check_row_missing_from_index(db: TempDatabase) {
         }
     }
 }
+
+/// Test integrity_check with index on column added via ALTER TABLE ADD COLUMN with DEFAULT.
+///
+/// This is a regression test for a bug where integrity_check would report false positives
+/// ("row X missing from index") because it used NULL for missing columns instead of the
+/// column's DEFAULT value.
+///
+/// The bug occurs because:
+/// 1. Old rows (inserted before ALTER TABLE) don't physically store the new column
+/// 2. When CREATE INDEX builds the index, it uses the DEFAULT value for these rows
+/// 3. But integrity_check was using NULL when reading these rows to verify the index
+/// 4. This caused a seek mismatch: index has (DEFAULT, rowid), but check looked for (NULL, rowid)
+#[turso_macros::test]
+fn test_integrity_check_index_on_column_with_default(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    // Create table and insert rows BEFORE adding the column with DEFAULT
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY, name TEXT);")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'alice');").unwrap();
+    conn.execute("INSERT INTO t VALUES (2, 'bob');").unwrap();
+    conn.execute("INSERT INTO t VALUES (3, 'charlie');")
+        .unwrap();
+
+    // Add column with DEFAULT - old rows don't physically have this column,
+    // but its value is implicitly the DEFAULT (42)
+    conn.execute("ALTER TABLE t ADD COLUMN extra INTEGER DEFAULT 42;")
+        .unwrap();
+
+    // Create index on the new column - index entries will contain the DEFAULT value (42)
+    conn.execute("CREATE INDEX idx_extra ON t(extra);").unwrap();
+
+    checkpoint_database(&conn);
+
+    // Integrity check must use DEFAULT (42) not NULL when checking old rows
+    let result = run_integrity_check(&conn);
+    assert_eq!(
+        result, "ok",
+        "Integrity check should pass - must use DEFAULT value for missing columns"
+    );
+}
+
+/// More complex test: multiple tables, multiple columns with different DEFAULT types,
+/// composite indexes, and a mix of rows inserted before and after ALTER TABLE.
+#[turso_macros::test]
+fn test_integrity_check_multiple_tables_with_defaults(db: TempDatabase) {
+    let conn = db.connect_limbo();
+
+    // Table 1: Will have INTEGER and TEXT defaults
+    conn.execute("CREATE TABLE users(id INTEGER PRIMARY KEY, name TEXT);")
+        .unwrap();
+    conn.execute("INSERT INTO users VALUES (1, 'alice');")
+        .unwrap();
+    conn.execute("INSERT INTO users VALUES (2, 'bob');")
+        .unwrap();
+
+    // Table 2: Will have REAL default
+    conn.execute("CREATE TABLE products(id INTEGER PRIMARY KEY, title TEXT);")
+        .unwrap();
+    conn.execute("INSERT INTO products VALUES (100, 'Widget');")
+        .unwrap();
+    conn.execute("INSERT INTO products VALUES (101, 'Gadget');")
+        .unwrap();
+    conn.execute("INSERT INTO products VALUES (102, 'Gizmo');")
+        .unwrap();
+
+    // Add columns with various DEFAULT types to table 1
+    conn.execute("ALTER TABLE users ADD COLUMN age INTEGER DEFAULT 0;")
+        .unwrap();
+    conn.execute("ALTER TABLE users ADD COLUMN status TEXT DEFAULT 'active';")
+        .unwrap();
+
+    // Add column with REAL default to table 2
+    conn.execute("ALTER TABLE products ADD COLUMN price REAL DEFAULT 9.99;")
+        .unwrap();
+
+    // Insert some rows AFTER the ALTER TABLE (these will have the columns physically)
+    conn.execute("INSERT INTO users VALUES (3, 'charlie', 30, 'inactive');")
+        .unwrap();
+    conn.execute("INSERT INTO products VALUES (103, 'Doohickey', 19.99);")
+        .unwrap();
+
+    // Create indexes on the new columns - these must use DEFAULT values for old rows
+    conn.execute("CREATE INDEX idx_users_age ON users(age);")
+        .unwrap();
+    conn.execute("CREATE INDEX idx_users_status ON users(status);")
+        .unwrap();
+    conn.execute("CREATE INDEX idx_products_price ON products(price);")
+        .unwrap();
+
+    // Create a composite index spanning original and new columns
+    conn.execute("CREATE INDEX idx_users_composite ON users(name, age, status);")
+        .unwrap();
+
+    checkpoint_database(&conn);
+
+    let result = run_integrity_check(&conn);
+    assert_eq!(
+        result, "ok",
+        "Integrity check should pass with multiple tables and various DEFAULT types"
+    );
+}

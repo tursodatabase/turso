@@ -52,6 +52,11 @@ pub struct IntegrityCheckIndex {
     pub unique: bool,
     /// Column positions in the table (for building index keys from table rows)
     pub column_positions: Vec<usize>,
+    /// Starting register containing default values for indexed columns.
+    /// Used for columns added via ALTER TABLE ADD COLUMN with DEFAULT - old rows
+    /// don't physically have these columns, so we use these pre-evaluated defaults.
+    /// The registers are contiguous: [default_values_start_reg..default_values_start_reg + column_positions.len())
+    pub default_values_start_reg: usize,
     /// Index info for cursor operations (sort order, collation, etc)
     pub index_info: std::sync::Arc<crate::types::IndexInfo>,
 }
