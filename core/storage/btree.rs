@@ -4806,6 +4806,7 @@ impl CursorTrait for BTreeCursor {
             if has_record {
                 self.set_has_record(has_record);
                 // If we are positioned at a record, we stop here without advancing.
+                self.read_overflow_state = None;
                 return Ok(IOResult::Done(()));
             }
             // But: if we aren't currently positioned at a record (for example, we are at the end of a page),
@@ -4821,6 +4822,7 @@ impl CursorTrait for BTreeCursor {
                 AdvanceState::Advance => {
                     return_if_io!(self.get_next_record());
                     self.advance_state = AdvanceState::Start;
+                    self.read_overflow_state = None;
                     return Ok(IOResult::Done(()));
                 }
             }
@@ -4833,6 +4835,7 @@ impl CursorTrait for BTreeCursor {
         let cursor_has_record = return_if_io!(self.move_to_rightmost(always_seek));
         self.set_has_record(cursor_has_record);
         self.invalidate_record();
+        self.read_overflow_state = None;
         Ok(IOResult::Done(()))
     }
 
@@ -4847,6 +4850,7 @@ impl CursorTrait for BTreeCursor {
                 AdvanceState::Advance => {
                     return_if_io!(self.get_prev_record());
                     self.advance_state = AdvanceState::Start;
+                    self.read_overflow_state = None;
                     return Ok(IOResult::Done(()));
                 }
             }
@@ -4889,6 +4893,7 @@ impl CursorTrait for BTreeCursor {
         // Reset seek state
         self.seek_state = CursorSeekState::Start;
         self.valid_state = CursorValidState::Valid;
+        self.read_overflow_state = None;
         Ok(IOResult::Done(seek_result))
     }
 
@@ -5508,6 +5513,7 @@ impl CursorTrait for BTreeCursor {
                 RewindState::NextRecord => {
                     return_if_io!(self.get_next_record());
                     self.rewind_state = RewindState::Start;
+                    self.read_overflow_state = None;
                     return Ok(IOResult::Done(()));
                 }
             }
