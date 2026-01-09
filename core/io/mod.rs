@@ -476,7 +476,7 @@ impl TempBufferCache {
 mod shuttle_tests {
     use super::*;
     use crate::io::{Buffer, Completion, OpenFlags, IO};
-    use crate::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use crate::sync::atomic::{AtomicUsize, Ordering};
     use crate::sync::Arc;
     use crate::thread;
 
@@ -484,30 +484,117 @@ mod shuttle_tests {
     /// Allows the same test logic to run against different IO backends.
     trait IOFactory: Send + Sync + 'static {
         fn create(&self) -> Arc<dyn IO>;
+        /// Returns a unique temp directory path for this factory instance.
+        fn temp_dir(&self) -> String;
     }
 
-    struct MemoryIOFactory;
+    struct MemoryIOFactory {
+        id: u64,
+    }
+
+    impl MemoryIOFactory {
+        fn new() -> Self {
+            use crate::sync::atomic::AtomicU64;
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            Self {
+                id: COUNTER.fetch_add(1, Ordering::SeqCst),
+            }
+        }
+    }
 
     impl IOFactory for MemoryIOFactory {
         fn create(&self) -> Arc<dyn IO> {
             Arc::new(MemoryIO::new())
         }
+        fn temp_dir(&self) -> String {
+            format!("mem_{}", self.id)
+        }
+    }
+
+    #[cfg(all(target_family = "unix", feature = "fs", not(miri)))]
+    struct PlatformIOFactory {
+        temp_dir: tempfile::TempDir,
+    }
+
+    #[cfg(all(target_family = "unix", feature = "fs", not(miri)))]
+    impl PlatformIOFactory {
+        fn new() -> Self {
+            Self {
+                temp_dir: tempfile::tempdir().unwrap(),
+            }
+        }
+    }
+
+    #[cfg(all(target_family = "unix", feature = "fs", not(miri)))]
+    impl IOFactory for PlatformIOFactory {
+        fn create(&self) -> Arc<dyn IO> {
+            Arc::new(PlatformIO::new().unwrap())
+        }
+        fn temp_dir(&self) -> String {
+            self.temp_dir.path().to_str().unwrap().to_string()
+        }
+    }
+
+    #[cfg(all(target_os = "linux", feature = "io_uring", feature = "fs", not(miri)))]
+    struct UringIOFactory {
+        temp_dir: tempfile::TempDir,
+    }
+
+    #[cfg(all(target_os = "linux", feature = "io_uring", feature = "fs", not(miri)))]
+    impl UringIOFactory {
+        fn new() -> Self {
+            Self {
+                temp_dir: tempfile::tempdir().unwrap(),
+            }
+        }
+    }
+
+    #[cfg(all(target_os = "linux", feature = "io_uring", feature = "fs", not(miri)))]
+    impl IOFactory for UringIOFactory {
+        fn create(&self) -> Arc<dyn IO> {
+            Arc::new(UringIO::new().unwrap())
+        }
+        fn temp_dir(&self) -> String {
+            self.temp_dir.path().to_str().unwrap().to_string()
+        }
+    }
+
+    /// Macro to generate shuttle tests for all IO implementations.
+    /// Creates a test for MemoryIO, and conditionally for PlatformIO and UringIO.
+    macro_rules! shuttle_io_test {
+        ($test_name:ident, $test_impl:ident) => {
+            paste::paste! {
+                #[test]
+                fn [<shuttle_ $test_name _memory>]() {
+                    shuttle::check_random(|| $test_impl(MemoryIOFactory::new()), 1000);
+                }
+
+                #[cfg(all(target_family = "unix", feature = "fs", not(miri)))]
+                #[test]
+                fn [<shuttle_ $test_name _platform>]() {
+                    shuttle::check_random(|| $test_impl(PlatformIOFactory::new()), 1000);
+                }
+
+                #[cfg(all(target_os = "linux", feature = "io_uring", feature = "fs", not(miri)))]
+                #[test]
+                fn [<shuttle_ $test_name _uring>]() {
+                    shuttle::check_random(|| $test_impl(UringIOFactory::new()), 1000);
+                }
+            }
+        };
     }
 
     /// Helper to wait for a completion synchronously and assert it succeeded.
     fn wait_completion_ok(io: &dyn IO, c: &Completion) {
         io.wait_for_completion(c.clone()).unwrap();
-        assert!(
-            c.succeeded(),
-            "completion failed: {:?}",
-            c.get_error()
-        );
+        assert!(c.succeeded(), "completion failed: {:?}", c.get_error());
         assert!(!c.failed());
         assert!(c.finished());
         assert!(c.get_error().is_none());
     }
 
     /// Helper to wait for a completion synchronously without asserting success.
+    #[allow(dead_code)]
     fn wait_completion(io: &dyn IO, c: &Completion) {
         io.wait_for_completion(c.clone()).unwrap();
         assert!(c.finished());
@@ -516,13 +603,15 @@ mod shuttle_tests {
     /// Test concurrent file creation from multiple threads.
     fn test_concurrent_file_creation_impl<F: IOFactory>(factory: F) {
         let io = factory.create();
+        let base = factory.temp_dir();
         let mut handles = vec![];
         const NUM_THREADS: usize = 3;
 
         for i in 0..NUM_THREADS {
             let io = io.clone();
+            let base = base.clone();
             handles.push(thread::spawn(move || {
-                let path = format!("test_file_{}.db", i);
+                let path = format!("{}/test_file_{}.db", base, i);
                 let file = io.open_file(&path, OpenFlags::Create, false).unwrap();
                 assert!(file.size().unwrap() == 0);
             }));
@@ -533,15 +622,13 @@ mod shuttle_tests {
         }
     }
 
-    #[test]
-    fn shuttle_concurrent_file_creation() {
-        shuttle::check_random(|| test_concurrent_file_creation_impl(MemoryIOFactory), 1000);
-    }
+    shuttle_io_test!(concurrent_file_creation, test_concurrent_file_creation_impl);
 
     /// Test concurrent writes to different offsets in the same file.
     fn test_concurrent_writes_different_offsets_impl<F: IOFactory>(factory: F) {
         let io = factory.create();
-        let file = io.open_file("test.db", OpenFlags::Create, false).unwrap();
+        let path = format!("{}/test.db", factory.temp_dir());
+        let file = io.open_file(&path, OpenFlags::Create, false).unwrap();
 
         let mut handles = vec![];
         const NUM_THREADS: usize = 3;
@@ -586,18 +673,16 @@ mod shuttle_tests {
         }
     }
 
-    #[test]
-    fn shuttle_concurrent_writes_different_offsets() {
-        shuttle::check_random(
-            || test_concurrent_writes_different_offsets_impl(MemoryIOFactory),
-            1000,
-        );
-    }
+    shuttle_io_test!(
+        concurrent_writes_different_offsets,
+        test_concurrent_writes_different_offsets_impl
+    );
 
     /// Test concurrent reads and writes to the same file.
     fn test_concurrent_read_write_impl<F: IOFactory>(factory: F) {
         let io = factory.create();
-        let file = io.open_file("test.db", OpenFlags::Create, false).unwrap();
+        let path = format!("{}/test.db", factory.temp_dir());
+        let file = io.open_file(&path, OpenFlags::Create, false).unwrap();
 
         // First write some initial data
         let initial_data = vec![0xAA; 1000];
@@ -654,15 +739,13 @@ mod shuttle_tests {
         );
     }
 
-    #[test]
-    fn shuttle_concurrent_read_write() {
-        shuttle::check_random(|| test_concurrent_read_write_impl(MemoryIOFactory), 1000);
-    }
+    shuttle_io_test!(concurrent_read_write, test_concurrent_read_write_impl);
 
     /// Test that completion callbacks are invoked correctly under concurrency.
     fn test_completion_callbacks_concurrent_impl<F: IOFactory>(factory: F) {
         let io = factory.create();
-        let file = io.open_file("test.db", OpenFlags::Create, false).unwrap();
+        let path = format!("{}/test.db", factory.temp_dir());
+        let file = io.open_file(&path, OpenFlags::Create, false).unwrap();
 
         let callback_count = Arc::new(AtomicUsize::new(0));
         let mut handles = vec![];
@@ -692,18 +775,16 @@ mod shuttle_tests {
         assert_eq!(callback_count.load(Ordering::SeqCst), NUM_WRITES);
     }
 
-    #[test]
-    fn shuttle_completion_callbacks_concurrent() {
-        shuttle::check_random(
-            || test_completion_callbacks_concurrent_impl(MemoryIOFactory),
-            1000,
-        );
-    }
+    shuttle_io_test!(
+        completion_callbacks_concurrent,
+        test_completion_callbacks_concurrent_impl
+    );
 
     /// Test concurrent truncate operations.
     fn test_concurrent_truncate_impl<F: IOFactory>(factory: F) {
         let io = factory.create();
-        let file = io.open_file("test.db", OpenFlags::Create, false).unwrap();
+        let path = format!("{}/test.db", factory.temp_dir());
+        let file = io.open_file(&path, OpenFlags::Create, false).unwrap();
 
         // Write initial data
         let initial = vec![0xFF; 5000];
@@ -735,15 +816,13 @@ mod shuttle_tests {
         assert!(final_size == 1000 || final_size == 2000 || final_size == 3000);
     }
 
-    #[test]
-    fn shuttle_concurrent_truncate() {
-        shuttle::check_random(|| test_concurrent_truncate_impl(MemoryIOFactory), 1000);
-    }
+    shuttle_io_test!(concurrent_truncate, test_concurrent_truncate_impl);
 
     /// Test pwritev with concurrent reads.
     fn test_pwritev_with_concurrent_reads_impl<F: IOFactory>(factory: F) {
         let io = factory.create();
-        let file = io.open_file("test.db", OpenFlags::Create, false).unwrap();
+        let path = format!("{}/test.db", factory.temp_dir());
+        let file = io.open_file(&path, OpenFlags::Create, false).unwrap();
 
         // Write initial data so reads have something to return
         let initial = vec![0x11; 2000];
@@ -821,25 +900,24 @@ mod shuttle_tests {
         );
     }
 
-    #[test]
-    fn shuttle_pwritev_with_concurrent_reads() {
-        shuttle::check_random(
-            || test_pwritev_with_concurrent_reads_impl(MemoryIOFactory),
-            1000,
-        );
-    }
+    shuttle_io_test!(
+        pwritev_with_concurrent_reads,
+        test_pwritev_with_concurrent_reads_impl
+    );
 
     /// Test concurrent access to multiple files.
     fn test_concurrent_multifile_access_impl<F: IOFactory>(factory: F) {
         let io = factory.create();
+        let base = factory.temp_dir();
 
         let mut handles = vec![];
         const NUM_FILES: usize = 3;
 
         for i in 0..NUM_FILES {
             let io = io.clone();
+            let base = base.clone();
             handles.push(thread::spawn(move || {
-                let path = format!("file_{}.db", i);
+                let path = format!("{}/file_{}.db", base, i);
                 let file = io.open_file(&path, OpenFlags::Create, false).unwrap();
 
                 // Write to file
@@ -864,18 +942,16 @@ mod shuttle_tests {
         }
     }
 
-    #[test]
-    fn shuttle_concurrent_multifile_access() {
-        shuttle::check_random(
-            || test_concurrent_multifile_access_impl(MemoryIOFactory),
-            1000,
-        );
-    }
+    shuttle_io_test!(
+        concurrent_multifile_access,
+        test_concurrent_multifile_access_impl
+    );
 
     /// Test file locking under concurrent access.
     fn test_file_locking_concurrent_impl<F: IOFactory>(factory: F) {
         let io = factory.create();
-        let file = io.open_file("test.db", OpenFlags::Create, false).unwrap();
+        let path = format!("{}/test.db", factory.temp_dir());
+        let file = io.open_file(&path, OpenFlags::Create, false).unwrap();
 
         let mut handles = vec![];
 
@@ -900,15 +976,13 @@ mod shuttle_tests {
         }
     }
 
-    #[test]
-    fn shuttle_file_locking_concurrent() {
-        shuttle::check_random(|| test_file_locking_concurrent_impl(MemoryIOFactory), 1000);
-    }
+    shuttle_io_test!(file_locking_concurrent, test_file_locking_concurrent_impl);
 
     /// Test reading past end of file returns zero bytes.
     fn test_read_past_eof_impl<F: IOFactory>(factory: F) {
         let io = factory.create();
-        let file = io.open_file("test.db", OpenFlags::Create, false).unwrap();
+        let path = format!("{}/test.db", factory.temp_dir());
+        let file = io.open_file(&path, OpenFlags::Create, false).unwrap();
 
         // Write 100 bytes
         let data = vec![0xAA; 100];
@@ -933,7 +1007,7 @@ mod shuttle_tests {
                     }
                 });
                 let c = file.pread(200, c).unwrap(); // Past EOF
-                // Reading past EOF succeeds with 0 bytes read
+                                                     // Reading past EOF succeeds with 0 bytes read
                 wait_completion_ok(io.as_ref(), &c);
                 assert_eq!(bytes_read.load(Ordering::SeqCst), 0);
             }));
@@ -944,15 +1018,13 @@ mod shuttle_tests {
         }
     }
 
-    #[test]
-    fn shuttle_read_past_eof() {
-        shuttle::check_random(|| test_read_past_eof_impl(MemoryIOFactory), 1000);
-    }
+    shuttle_io_test!(read_past_eof, test_read_past_eof_impl);
 
     /// Test empty write operations.
     fn test_empty_write_impl<F: IOFactory>(factory: F) {
         let io = factory.create();
-        let file = io.open_file("test.db", OpenFlags::Create, false).unwrap();
+        let path = format!("{}/test.db", factory.temp_dir());
+        let file = io.open_file(&path, OpenFlags::Create, false).unwrap();
 
         let mut handles = vec![];
 
@@ -975,15 +1047,13 @@ mod shuttle_tests {
         assert_eq!(file.size().unwrap(), 0);
     }
 
-    #[test]
-    fn shuttle_empty_write() {
-        shuttle::check_random(|| test_empty_write_impl(MemoryIOFactory), 1000);
-    }
+    shuttle_io_test!(empty_write, test_empty_write_impl);
 
     /// Test sync operations under concurrency.
     fn test_concurrent_sync_impl<F: IOFactory>(factory: F) {
         let io = factory.create();
-        let file = io.open_file("test.db", OpenFlags::Create, false).unwrap();
+        let path = format!("{}/test.db", factory.temp_dir());
+        let file = io.open_file(&path, OpenFlags::Create, false).unwrap();
 
         // Write some data first
         let data = vec![0xFF; 1000];
@@ -1010,24 +1080,24 @@ mod shuttle_tests {
         }
     }
 
-    #[test]
-    fn shuttle_concurrent_sync() {
-        shuttle::check_random(|| test_concurrent_sync_impl(MemoryIOFactory), 1000);
-    }
+    shuttle_io_test!(concurrent_sync, test_concurrent_sync_impl);
 
     /// Test concurrent open of the same file returns same file instance.
     fn test_concurrent_open_same_file_impl<F: IOFactory>(factory: F) {
         let io = factory.create();
+        let base = factory.temp_dir();
+        let path = format!("{}/shared.db", base);
 
         // Create file first
-        let _ = io.open_file("shared.db", OpenFlags::Create, false).unwrap();
+        let _ = io.open_file(&path, OpenFlags::Create, false).unwrap();
 
         let mut handles = vec![];
 
         for _ in 0..3 {
             let io = io.clone();
+            let path = path.clone();
             handles.push(thread::spawn(move || {
-                let file = io.open_file("shared.db", OpenFlags::None, false).unwrap();
+                let file = io.open_file(&path, OpenFlags::None, false).unwrap();
                 // Write a byte to prove we got a valid file
                 let buf = Arc::new(Buffer::new(vec![0xAA]));
                 let c = Completion::new_write(|_| {});
@@ -1041,21 +1111,19 @@ mod shuttle_tests {
         }
     }
 
-    #[test]
-    fn shuttle_concurrent_open_same_file() {
-        shuttle::check_random(
-            || test_concurrent_open_same_file_impl(MemoryIOFactory),
-            1000,
-        );
-    }
+    shuttle_io_test!(
+        concurrent_open_same_file,
+        test_concurrent_open_same_file_impl
+    );
 
     /// Test file removal while concurrent access.
     fn test_file_remove_concurrent_impl<F: IOFactory>(factory: F) {
         let io = factory.create();
+        let base = factory.temp_dir();
 
         // Create multiple files
         for i in 0..3 {
-            let path = format!("remove_{}.db", i);
+            let path = format!("{}/remove_{}.db", base, i);
             let file = io.open_file(&path, OpenFlags::Create, false).unwrap();
             let buf = Arc::new(Buffer::new(vec![0xFF; 100]));
             let c = Completion::new_write(|_| {});
@@ -1068,8 +1136,9 @@ mod shuttle_tests {
         // Remove files concurrently
         for i in 0..3 {
             let io = io.clone();
+            let base = base.clone();
             handles.push(thread::spawn(move || {
-                let path = format!("remove_{}.db", i);
+                let path = format!("{}/remove_{}.db", base, i);
                 io.remove_file(&path).unwrap();
             }));
         }
@@ -1079,15 +1148,13 @@ mod shuttle_tests {
         }
     }
 
-    #[test]
-    fn shuttle_file_remove_concurrent() {
-        shuttle::check_random(|| test_file_remove_concurrent_impl(MemoryIOFactory), 1000);
-    }
+    shuttle_io_test!(file_remove_concurrent, test_file_remove_concurrent_impl);
 
     /// Test write spanning multiple internal pages.
     fn test_large_write_concurrent_impl<F: IOFactory>(factory: F) {
         let io = factory.create();
-        let file = io.open_file("test.db", OpenFlags::Create, false).unwrap();
+        let path = format!("{}/test.db", factory.temp_dir());
+        let file = io.open_file(&path, OpenFlags::Create, false).unwrap();
 
         let mut handles = vec![];
 
@@ -1129,15 +1196,14 @@ mod shuttle_tests {
         }
     }
 
-    #[test]
-    fn shuttle_large_write_concurrent() {
-        shuttle::check_random(|| test_large_write_concurrent_impl(MemoryIOFactory), 1000);
-    }
+    shuttle_io_test!(large_write_concurrent, test_large_write_concurrent_impl);
 
     /// Test has_hole and punch_hole under concurrency.
+    /// Note: Only runs on MemoryIO as hole operations are not supported on all backends.
     fn test_hole_operations_concurrent_impl<F: IOFactory>(factory: F) {
         let io = factory.create();
-        let file = io.open_file("test.db", OpenFlags::Create, false).unwrap();
+        let path = format!("{}/test.db", factory.temp_dir());
+        let file = io.open_file(&path, OpenFlags::Create, false).unwrap();
 
         // Write data spanning multiple pages (at least 3 pages = 12288 bytes)
         let data = vec![0xFF; 16384];
@@ -1173,10 +1239,11 @@ mod shuttle_tests {
         }
     }
 
+    // hole_operations only runs on MemoryIO since not all backends support holes
     #[test]
-    fn shuttle_hole_operations_concurrent() {
+    fn shuttle_hole_operations_concurrent_memory() {
         shuttle::check_random(
-            || test_hole_operations_concurrent_impl(MemoryIOFactory),
+            || test_hole_operations_concurrent_impl(MemoryIOFactory::new()),
             1000,
         );
     }
@@ -1184,7 +1251,8 @@ mod shuttle_tests {
     /// Test that partial reads work correctly at EOF boundary.
     fn test_partial_read_at_eof_impl<F: IOFactory>(factory: F) {
         let io = factory.create();
-        let file = io.open_file("test.db", OpenFlags::Create, false).unwrap();
+        let path = format!("{}/test.db", factory.temp_dir());
+        let file = io.open_file(&path, OpenFlags::Create, false).unwrap();
 
         // Write exactly 150 bytes
         let data = vec![0xAB; 150];
@@ -1224,15 +1292,13 @@ mod shuttle_tests {
         }
     }
 
-    #[test]
-    fn shuttle_partial_read_at_eof() {
-        shuttle::check_random(|| test_partial_read_at_eof_impl(MemoryIOFactory), 1000);
-    }
+    shuttle_io_test!(partial_read_at_eof, test_partial_read_at_eof_impl);
 
     /// Test empty pwritev.
     fn test_empty_pwritev_impl<F: IOFactory>(factory: F) {
         let io = factory.create();
-        let file = io.open_file("test.db", OpenFlags::Create, false).unwrap();
+        let path = format!("{}/test.db", factory.temp_dir());
+        let file = io.open_file(&path, OpenFlags::Create, false).unwrap();
 
         let mut handles = vec![];
 
@@ -1252,21 +1318,20 @@ mod shuttle_tests {
         }
     }
 
-    #[test]
-    fn shuttle_empty_pwritev() {
-        shuttle::check_random(|| test_empty_pwritev_impl(MemoryIOFactory), 1000);
-    }
+    shuttle_io_test!(empty_pwritev, test_empty_pwritev_impl);
 
     /// Test error case: opening non-existent file without Create flag.
     fn test_open_nonexistent_without_create_impl<F: IOFactory>(factory: F) {
         let io = factory.create();
+        let base = factory.temp_dir();
 
         let mut handles = vec![];
 
         for i in 0..3 {
             let io = io.clone();
+            let base = base.clone();
             handles.push(thread::spawn(move || {
-                let path = format!("nonexistent_{}.db", i);
+                let path = format!("{}/nonexistent_{}.db", base, i);
                 let result = io.open_file(&path, OpenFlags::None, false);
                 assert!(result.is_err());
             }));
@@ -1277,19 +1342,17 @@ mod shuttle_tests {
         }
     }
 
-    #[test]
-    fn shuttle_open_nonexistent_without_create() {
-        shuttle::check_random(
-            || test_open_nonexistent_without_create_impl(MemoryIOFactory),
-            1000,
-        );
-    }
+    shuttle_io_test!(
+        open_nonexistent_without_create,
+        test_open_nonexistent_without_create_impl
+    );
 
     /// Test concurrent writes to overlapping regions.
     /// This tests that the final state is consistent (one of the writes wins).
     fn test_concurrent_overlapping_writes_impl<F: IOFactory>(factory: F) {
         let io = factory.create();
-        let file = io.open_file("test.db", OpenFlags::Create, false).unwrap();
+        let path = format!("{}/test.db", factory.temp_dir());
+        let file = io.open_file(&path, OpenFlags::Create, false).unwrap();
 
         let write_complete = Arc::new(AtomicUsize::new(0));
         let mut handles = vec![];
@@ -1331,11 +1394,8 @@ mod shuttle_tests {
         assert!(read_buf.as_slice().iter().all(|&b| b == first_byte));
     }
 
-    #[test]
-    fn shuttle_concurrent_overlapping_writes() {
-        shuttle::check_random(
-            || test_concurrent_overlapping_writes_impl(MemoryIOFactory),
-            1000,
-        );
-    }
+    shuttle_io_test!(
+        concurrent_overlapping_writes,
+        test_concurrent_overlapping_writes_impl
+    );
 }
