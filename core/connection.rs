@@ -8,6 +8,8 @@ use crate::sync::{
 use crate::types::{WalFrameInfo, WalState};
 #[cfg(feature = "fs")]
 use crate::util::{OpenMode, OpenOptions};
+#[cfg(all(feature = "fs", feature = "conn_raw_api"))]
+use crate::Page;
 use crate::{
     ast, function,
     io::{MemoryIO, PlatformIO, IO},
@@ -16,8 +18,8 @@ use crate::{
     vdbe, AllViewsTxState, AtomicCipherMode, AtomicSyncMode, AtomicTransactionState, BusyHandler,
     BusyHandlerCallback, CaptureDataChangesMode, CheckpointMode, CheckpointResult, CipherMode, Cmd,
     Completion, ConnectionMetrics, Database, DatabaseCatalog, DatabaseOpts, Duration,
-    EncryptionKey, EncryptionOpts, IndexMethod, LimboError, MvStore, OpenFlags, Page, PageSize,
-    Pager, Parser, QueryMode, QueryRunner, Result, Schema, Statement, SyncMode, TransactionMode,
+    EncryptionKey, EncryptionOpts, IndexMethod, LimboError, MvStore, OpenFlags, PageSize, Pager,
+    Parser, QueryMode, QueryRunner, Result, Schema, Statement, SyncMode, TransactionMode,
     TransactionState, Trigger, Value, VirtualTable,
 };
 use arc_swap::ArcSwap;

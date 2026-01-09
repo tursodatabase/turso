@@ -1620,12 +1620,7 @@ impl Pager {
             self.upsert_page_in_cache(page_id as usize, page, false)?;
         }
 
-        let truncate_completion = self
-            .subjournal
-            .read()
-            .as_ref()
-            .unwrap()
-            .truncate(journal_start_offset)?;
+        let truncate_completion = subjournal.truncate(journal_start_offset)?;
         assert!(
             truncate_completion.succeeded(),
             "memory IO should complete immediately"
