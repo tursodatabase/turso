@@ -143,8 +143,6 @@ impl FileCategory {
         }
 
         match ext {
-            // Lock files
-            "lock" => FileCategory::Metadata,
             // Term dictionary - hot for queries
             "term" => FileCategory::TermDictionary,
             // Fast fields and field norms - small, frequently accessed
@@ -197,32 +195,29 @@ type ChunkKey = (PathBuf, i64);
 /// Eviction samples per put
 const EVICTION_SAMPLES: usize = 8;
 
-/// Approximate LRU cache for FTS chunk data with memory budget enforcement.
-///
-/// Uses sampling-based eviction: on capacity overflow, samples K random entries
-/// and evicts the least recently accessed.
-pub struct ChunkLruCache {
+/// Generic bounded LRU cache with sampling-based eviction.
+pub struct LruCache<K> {
     capacity: usize,
-    inner: RwLock<CacheInner>,
+    inner: RwLock<LruCacheInner<K>>,
 }
 
 #[derive(Debug)]
-struct CacheInner {
+struct LruCacheInner<K> {
     current_size: usize,
     clock: u64,
-    entries: HashMap<ChunkKey, CacheEntry>,
+    entries: HashMap<K, LruCacheEntry>,
 }
 
 #[derive(Debug)]
-struct CacheEntry {
+struct LruCacheEntry {
     data: Vec<u8>,
     accessed: u64,
 }
 
-impl std::fmt::Debug for ChunkLruCache {
+impl<K: std::fmt::Debug> std::fmt::Debug for LruCache<K> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let inner = self.inner.read();
-        f.debug_struct("ChunkLruCache")
+        f.debug_struct("LruCache")
             .field("capacity", &self.capacity)
             .field("current_size", &inner.current_size)
             .field("entries", &inner.entries.len())
@@ -230,12 +225,12 @@ impl std::fmt::Debug for ChunkLruCache {
     }
 }
 
-impl ChunkLruCache {
-    /// Creates a new chunk cache with the specified capacity in bytes.
+impl<K: Eq + std::hash::Hash + Clone> LruCache<K> {
+    /// Creates a new empty cache with the specified capacity in bytes.
     fn new(capacity: usize) -> Self {
         Self {
             capacity,
-            inner: RwLock::new(CacheInner {
+            inner: RwLock::new(LruCacheInner {
                 current_size: 0,
                 clock: 0,
                 entries: HashMap::new(),
@@ -243,8 +238,12 @@ impl ChunkLruCache {
         }
     }
 
-    /// Lookup chunk, updating access timestamp. Returns cloned data.
-    fn get(&self, key: &ChunkKey) -> Option<Vec<u8>> {
+    /// Lookup entry, updating access timestamp. Returns cloned data.
+    fn get<Q>(&self, key: &Q) -> Option<Vec<u8>>
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: Eq + std::hash::Hash + ?Sized,
+    {
         let mut inner = self.inner.write();
         inner.clock += 1;
         let ts = inner.clock;
@@ -256,11 +255,11 @@ impl ChunkLruCache {
         }
     }
 
-    /// Insert chunk, evicting stale entries if over capacity.
+    /// Insert entry, evicting stale entries if over capacity.
     ///
     /// Eviction uses sampling: examines K entries and evicts the one with
     /// the oldest access timestamp. Repeat until under capacity.
-    fn put(&self, key: ChunkKey, value: Vec<u8>) {
+    fn put(&self, key: K, value: Vec<u8>) {
         let size = value.len();
         let mut inner = self.inner.write();
 
@@ -303,7 +302,7 @@ impl ChunkLruCache {
         let ts = inner.clock;
         inner.entries.insert(
             key,
-            CacheEntry {
+            LruCacheEntry {
                 data: value,
                 accessed: ts,
             },
@@ -311,6 +310,40 @@ impl ChunkLruCache {
         inner.current_size += size;
     }
 
+    /// Remove an entry from the cache.
+    fn remove<Q>(&self, key: &Q)
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: Eq + std::hash::Hash + ?Sized,
+    {
+        let mut inner = self.inner.write();
+        if let Some(e) = inner.entries.remove(key) {
+            inner.current_size -= e.data.len();
+        }
+    }
+
+    /// Current memory usage in bytes.
+    fn size(&self) -> usize {
+        self.inner.read().current_size
+    }
+
+    /// Number of entries in the cache.
+    fn len(&self) -> usize {
+        self.inner.read().entries.len()
+    }
+
+    /// Check if key exists in cache.
+    fn contains<Q>(&self, key: &Q) -> bool
+    where
+        K: std::borrow::Borrow<Q>,
+        Q: Eq + std::hash::Hash + ?Sized,
+    {
+        self.inner.read().entries.contains_key(key)
+    }
+}
+
+/// Specialized methods for ChunkKey (PathBuf, i64) caches.
+impl LruCache<ChunkKey> {
     /// Invalidate all chunks for a file path.
     /// Called when a file is deleted or overwritten.
     fn invalidate(&self, path: &Path) {
@@ -326,55 +359,20 @@ impl ChunkLruCache {
         });
         inner.current_size -= freed;
     }
-
-    /// Current memory usage in bytes.
-    fn size(&self) -> usize {
-        self.inner.read().current_size
-    }
 }
 
-/// Bounded LRU cache for hot files (metadata, term dictionaries, fast fields).
-/// Similar to ChunkLruCache but uses PathBuf as key instead of (PathBuf, chunk_no).
-pub struct HotLruCache {
-    capacity: usize,
-    inner: RwLock<HotCacheInner>,
-}
-
-#[derive(Debug)]
-struct HotCacheInner {
-    current_size: usize,
-    clock: u64,
-    entries: HashMap<PathBuf, HotCacheEntry>,
-}
-
-#[derive(Debug)]
-struct HotCacheEntry {
-    data: Vec<u8>,
-    accessed: u64,
-}
-
-impl std::fmt::Debug for HotLruCache {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let inner = self.inner.read();
-        f.debug_struct("HotLruCache")
-            .field("capacity", &self.capacity)
-            .field("current_size", &inner.current_size)
-            .field("entries", &inner.entries.len())
-            .finish()
-    }
-}
-
-impl HotLruCache {
+/// Specialized methods for PathBuf caches (hot files).
+impl LruCache<PathBuf> {
     /// Create from preloaded files (used during initialization).
     fn with_preloaded(capacity: usize, files: HashMap<PathBuf, Vec<u8>>) -> Self {
         let current_size: usize = files.values().map(|v| v.len()).sum();
-        let entries: HashMap<PathBuf, HotCacheEntry> = files
+        let entries: HashMap<PathBuf, LruCacheEntry> = files
             .into_iter()
             .enumerate()
             .map(|(i, (path, data))| {
                 (
                     path,
-                    HotCacheEntry {
+                    LruCacheEntry {
                         data,
                         accessed: i as u64,
                     },
@@ -384,102 +382,20 @@ impl HotLruCache {
 
         Self {
             capacity,
-            inner: RwLock::new(HotCacheInner {
+            inner: RwLock::new(LruCacheInner {
                 current_size,
                 clock: entries.len() as u64,
                 entries,
             }),
         }
     }
-
-    /// Lookup file, updating access timestamp. Returns cloned data.
-    fn get(&self, path: &Path) -> Option<Vec<u8>> {
-        let mut inner = self.inner.write();
-        inner.clock += 1;
-        let ts = inner.clock;
-        if let Some(entry) = inner.entries.get_mut(path) {
-            entry.accessed = ts;
-            Some(entry.data.clone())
-        } else {
-            None
-        }
-    }
-
-    /// Check if file exists in cache.
-    fn contains(&self, path: &Path) -> bool {
-        self.inner.read().entries.contains_key(path)
-    }
-
-    /// Insert file, evicting stale entries if over capacity.
-    fn put(&self, path: PathBuf, value: Vec<u8>) {
-        let size = value.len();
-        let mut inner = self.inner.write();
-
-        // Check for existing entry - get old size if present
-        let old_size = inner.entries.get(&path).map(|e| e.data.len());
-
-        if let Some(old) = old_size {
-            // Update existing entry
-            inner.clock += 1;
-            let ts = inner.clock;
-            let entry = inner.entries.get_mut(&path).unwrap();
-            entry.data = value;
-            entry.accessed = ts;
-            inner.current_size = inner.current_size - old + size;
-            return;
-        }
-
-        // Evict until under capacity
-        while inner.current_size + size > self.capacity && !inner.entries.is_empty() {
-            let victim = {
-                inner
-                    .entries
-                    .iter()
-                    .take(EVICTION_SAMPLES)
-                    .min_by_key(|(_, e)| e.accessed)
-                    .map(|(k, _)| k.clone())
-            };
-
-            match victim {
-                Some(k) => {
-                    if let Some(e) = inner.entries.remove(&k) {
-                        inner.current_size -= e.data.len();
-                    }
-                }
-                None => break,
-            }
-        }
-
-        inner.clock += 1;
-        let ts = inner.clock;
-        inner.entries.insert(
-            path,
-            HotCacheEntry {
-                data: value,
-                accessed: ts,
-            },
-        );
-        inner.current_size += size;
-    }
-
-    /// Remove a file from the cache.
-    fn remove(&self, path: &Path) {
-        let mut inner = self.inner.write();
-        if let Some(e) = inner.entries.remove(path) {
-            inner.current_size -= e.data.len();
-        }
-    }
-
-    /// Current memory usage in bytes.
-    fn size(&self) -> usize {
-        self.inner.read().current_size
-    }
-
-    /// Number of entries in the cache.
-    fn len(&self) -> usize {
-        self.inner.read().entries.len()
-    }
 }
+
+/// Type alias for chunk cache (backward compatibility).
+pub type ChunkLruCache = LruCache<ChunkKey>;
+
+/// Type alias for hot file cache (backward compatibility).
+pub type HotLruCache = LruCache<PathBuf>;
 
 /// Type aliases to please the almighty clippy
 type Catalog = HashMap<PathBuf, FileMetadata>;
