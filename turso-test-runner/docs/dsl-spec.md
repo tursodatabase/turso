@@ -45,6 +45,8 @@ Every file must have at least one `@database` declaration.
 ```
 @database :memory:
 @database :temp:
+@database :default:
+@database :default-no-rowidalias:
 @database path/to/file.db readonly
 ```
 
@@ -54,13 +56,30 @@ Every file must have at least one `@database` declaration.
 |------|-------------|
 | `:memory:` | Fresh in-memory database for each test |
 | `:temp:` | Fresh temporary file database for each test |
+| `:default:` | Pre-generated database with `INTEGER PRIMARY KEY` (rowid alias) |
+| `:default-no-rowidalias:` | Pre-generated database with `INT PRIMARY KEY` (no rowid alias) |
 | `path readonly` | Existing database opened in read-only mode |
+
+### Default Databases
+
+The `:default:` and `:default-no-rowidalias:` database types use pre-generated databases containing fake user and product data. These databases must be generated before running tests.
+
+- `:default:` - Uses `INTEGER PRIMARY KEY`, which creates a rowid alias (column is an alias for the internal rowid)
+- `:default-no-rowidalias:` - Uses `INT PRIMARY KEY`, which does NOT create a rowid alias (column is a regular integer with a unique constraint)
+
+Both databases contain:
+- `users` table: id, first_name, last_name, email, phone_number, address, city, state, zipcode, age
+- `products` table: id, name, price
+
+Database file locations:
+- `:default:` → `testing/database.db`
+- `:default-no-rowidalias:` → `testing/database-no-rowidalias.db`
 
 ### Rules
 
 1. **All databases in a file must be the same type:**
    - Writable (`:memory:`, `:temp:`) - can be mixed together
-   - Readonly (`path readonly`) - cannot mix with writable
+   - Readonly (`path readonly`, `:default:`, `:default-no-rowidalias:`) - cannot mix with writable
 
 2. **Multiple databases**: When multiple databases are declared, all tests run against each database.
 
@@ -74,6 +93,12 @@ Every file must have at least one `@database` declaration.
 # Readonly file - only readonly paths allowed
 @database testing/testing.db readonly
 @database testing/testing_small.db readonly
+
+# Default databases - pre-generated with fake data
+@database :default:
+
+# Default database without rowid alias
+@database :default-no-rowidalias:
 ```
 
 ## Setup Blocks
@@ -130,6 +155,7 @@ Decorators appear before the `test` keyword:
 |-----------|-------------|
 | `@setup <name>` | Apply a named setup before the test (can be repeated) |
 | `@skip "reason"` | Skip this test with the given reason |
+| `@backend <name>` | Only run this test on the specified backend (e.g., `cli`, `rust`) |
 
 ### Expect Modifiers
 
@@ -225,6 +251,24 @@ test select-buggy-feature {
 expect {
     result
 }
+
+# Backend-specific test (only runs with CLI backend)
+@backend cli
+test cli-specific-feature {
+    SELECT sqlite_version();
+}
+expect pattern {
+    ^3\.\d+\.\d+$
+}
+
+# Backend-specific test (only runs with Rust backend)
+@backend rust
+test rust-specific-feature {
+    SELECT 'rust-only';
+}
+expect {
+    rust-only
+}
 ```
 
 ## Grammar (EBNF-like)
@@ -233,13 +277,14 @@ expect {
 file            = { database_decl | setup_block | test_case }
 
 database_decl   = "@database" database_spec NEWLINE
-database_spec   = ":memory:" | ":temp:" | PATH ["readonly"]
+database_spec   = ":memory:" | ":temp:" | ":default:" | ":default-no-rowidalias:" | PATH ["readonly"]
 
 setup_block     = "setup" IDENTIFIER block
 test_case       = { decorator } "test" IDENTIFIER block expect_block
 
 decorator       = "@setup" IDENTIFIER NEWLINE
                 | "@skip" STRING NEWLINE
+                | "@backend" IDENTIFIER NEWLINE
 
 expect_block    = "expect" [expect_modifier] block
 
@@ -337,9 +382,9 @@ The lexer uses the [Logos](https://docs.rs/logos) crate (v0.16) for tokenization
 - **Block content extraction**: When `{` is encountered, a custom callback extracts all content until the matching `}`, handling nested braces. This allows arbitrary SQL and expected output without special escaping.
 
 - **Tokens**: The lexer produces these token types:
-  - Keywords: `@database`, `@setup`, `@skip`, `setup`, `test`, `expect`
+  - Keywords: `@database`, `@setup`, `@skip`, `@backend`, `setup`, `test`, `expect`
   - Modifiers: `error`, `pattern`, `unordered`, `readonly`
-  - Database types: `:memory:`, `:temp:`
+  - Database types: `:memory:`, `:temp:`, `:default:`, `:default-no-rowidalias:`
   - Block content: `{...}` (content between braces)
   - Identifiers, strings, paths, comments, newlines
 
@@ -367,6 +412,7 @@ pub struct TestCase {
     pub expectation: Expectation,
     pub setups: Vec<String>,
     pub skip: Option<String>,
+    pub backend: Option<String>,  // Only run on specified backend
 }
 
 pub enum Expectation {

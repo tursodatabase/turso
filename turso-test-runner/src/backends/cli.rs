@@ -1,8 +1,10 @@
 use super::{BackendError, DatabaseInstance, QueryResult, SqlBackend};
+use crate::backends::DefaultDatabaseResolver;
 use crate::parser::ast::{DatabaseConfig, DatabaseLocation};
 use async_trait::async_trait;
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 use tempfile::NamedTempFile;
 use tokio::io::AsyncWriteExt;
@@ -17,6 +19,8 @@ pub struct CliBackend {
     working_dir: Option<PathBuf>,
     /// Timeout for query execution
     timeout: Duration,
+    /// Resolver for default database paths
+    default_db_resolver: Option<Arc<dyn DefaultDatabaseResolver>>,
 }
 
 impl CliBackend {
@@ -26,6 +30,7 @@ impl CliBackend {
             binary_path: binary_path.into(),
             working_dir: None,
             timeout: Duration::from_secs(30),
+            default_db_resolver: None,
         }
     }
 
@@ -38,6 +43,17 @@ impl CliBackend {
     /// Set the timeout for query execution
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
+        self
+    }
+
+    /// Set the default database resolver
+    pub fn with_default_db_resolver(mut self, resolver: Arc<dyn DefaultDatabaseResolver>) -> Self {
+        self.default_db_resolver = Some(resolver);
+        self
+    }
+
+    pub fn set_default_db_resolver(mut self, resolver: Arc<dyn DefaultDatabaseResolver>) -> Self {
+        self.default_db_resolver = Some(resolver);
         self
     }
 }
@@ -61,6 +77,19 @@ impl SqlBackend for CliBackend {
                 (path, Some(temp), false)
             }
             DatabaseLocation::Path(path) => (path.to_string_lossy().to_string(), None, false),
+            DatabaseLocation::Default | DatabaseLocation::DefaultNoRowidAlias => {
+                // Resolve the path using the resolver
+                let resolved = self
+                    .default_db_resolver
+                    .as_ref()
+                    .and_then(|r| r.resolve(&config.location))
+                    .ok_or_else(|| {
+                        BackendError::CreateDatabase(
+                            "default database not generated - no resolver configured".to_string(),
+                        )
+                    })?;
+                (resolved.to_string_lossy().to_string(), None, false)
+            }
         };
 
         Ok(Box::new(CliDatabaseInstance {
@@ -96,23 +125,33 @@ impl CliDatabaseInstance {
     async fn run_sql(&self, sql: &str) -> Result<QueryResult, BackendError> {
         let mut cmd = Command::new(&self.binary_path);
 
+        let file_name = self
+            .binary_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| {
+                BackendError::Execute(format!("binary path does not contain a file name"))
+            })?;
+        let is_sqlite = file_name.starts_with("sqlite");
+        let is_turso_cli = file_name.starts_with("tursodb") || file_name.starts_with("turso");
+
         // Set working directory if specified
         if let Some(dir) = &self.working_dir {
             cmd.current_dir(dir);
         }
 
-        // Build command arguments
-        cmd.arg(&self.db_path);
+        if is_sqlite {
+            cmd.arg(format!("file:{}?immutable=1", self.db_path));
+        }
 
         // Only add -q flag for tursodb/turso (not sqlite3 or other CLIs)
-        if let Some(name) = self.binary_path.file_name().and_then(|n| n.to_str()) {
-            if name.starts_with("tursodb") || name.starts_with("turso") {
-                cmd.arg("-q"); // Quiet mode - suppress banner
-                cmd.arg("-m").arg("list"); // List mode for pipe-separated output
-                cmd.arg("--experimental-views");
-                cmd.arg("--experimental-strict");
-                cmd.arg("--experimental-triggers");
-            }
+        if is_turso_cli {
+            cmd.arg(&self.db_path);
+            cmd.arg("-q"); // Quiet mode - suppress banner
+            cmd.arg("-m").arg("list"); // List mode for pipe-separated output
+            cmd.arg("--experimental-views");
+            cmd.arg("--experimental-strict");
+            cmd.arg("--experimental-triggers");
         }
 
         if self.readonly {

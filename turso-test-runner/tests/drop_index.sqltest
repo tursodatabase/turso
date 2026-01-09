@@ -1,0 +1,75 @@
+@database :memory:
+
+# Basic DROP INDEX functionality
+test drop-index-basic-1 {
+    CREATE TABLE t1 (x INTEGER PRIMARY KEY);
+    CREATE INDEX t_idx on t1 (x);
+    INSERT INTO t1 VALUES (1);
+    INSERT INTO t1 VALUES (2);
+    DROP INDEX t_idx;
+    SELECT count(*) FROM sqlite_schema WHERE type='index' AND name='t_idx';
+}
+expect {
+    0
+}
+
+# Test DROP INDEX IF EXISTS on existing index
+test drop-index-if-exists-1 {
+    CREATE TABLE t2 (x INTEGER PRIMARY KEY);
+    CREATE INDEX t_idx2 on t2 (x);
+    DROP INDEX IF EXISTS t_idx2;
+    SELECT count(*) FROM sqlite_schema WHERE type='index' AND name='t_idx2';
+}
+expect {
+    0
+}
+
+# Test DROP INDEX IF EXISTS on non-existent index
+test drop-index-if-exists-2 {
+    DROP TABLE IF EXISTS nonexistent_index;
+    SELECT 'success';
+}
+expect {
+    success
+}
+
+# Test dropping non-existant index produces an error
+test drop-index-no-index {
+    DROP INDEX t_idx;
+}
+expect error {
+    no such index: t_idx
+}
+
+# Test dropping index after multiple inserts and deletes
+test drop-index-after-ops-1 {
+    CREATE TABLE t6 (x INTEGER PRIMARY KEY);
+    CREATE INDEX t_idx6 on t6 (x);
+    INSERT INTO t6 VALUES (1);
+    INSERT INTO t6 VALUES (2);
+    DELETE FROM t6 WHERE x = 1;
+    INSERT INTO t6 VALUES (3);
+    DROP INDEX t_idx6;
+    SELECT count(*) FROM sqlite_schema WHERE type='index' AND name='t_idx6';
+}
+expect {
+    0
+}
+
+# Test dropping of indices associated with unique or primary contraint indices produces an error
+test drop-index-primary-key-index {
+    CREATE TABLE t15a (id TEXT PRIMARY KEY );
+    DROP INDEX sqlite_autoindex_t15a_1;
+}
+expect error {
+    index associated with UNIQUE or PRIMARY KEY constraint cannot be dropped
+}
+
+test drop-index-unique-index {
+    CREATE TABLE t15b (id INT UNIQUE );
+    DROP INDEX sqlite_autoindex_t15b_1;
+}
+expect error {
+    index associated with UNIQUE or PRIMARY KEY constraint cannot be dropped
+}
+

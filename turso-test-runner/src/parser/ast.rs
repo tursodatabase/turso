@@ -38,6 +38,9 @@ pub struct TestCase {
     pub setups: Vec<SetupRef>,
     /// If set, skip this test with the given reason
     pub skip: Option<String>,
+    /// If set, only run this test on the specified backend(s)
+    /// Valid values: "rust", "cli"
+    pub backend: Option<String>,
 }
 
 /// What we expect from executing the SQL
@@ -71,6 +74,10 @@ pub enum DatabaseLocation {
     TempFile,
     /// Path to an existing database file
     Path(PathBuf),
+    /// Generated default database with INTEGER PRIMARY KEY (`:default:`)
+    Default,
+    /// Generated default database with INT PRIMARY KEY - no rowid alias (`:default-no-rowidalias:`)
+    DefaultNoRowidAlias,
 }
 
 impl DatabaseConfig {
@@ -90,6 +97,8 @@ impl Display for DatabaseLocation {
             DatabaseLocation::Memory => f.write_str(":memory:"),
             DatabaseLocation::TempFile => f.write_str(":temp:"),
             DatabaseLocation::Path(path_buf) => write!(f, "{}", path_buf.display()),
+            DatabaseLocation::Default => f.write_str(":default:"),
+            DatabaseLocation::DefaultNoRowidAlias => f.write_str(":default-no-rowidalias:"),
         }
     }
 }
