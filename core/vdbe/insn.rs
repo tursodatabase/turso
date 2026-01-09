@@ -200,7 +200,7 @@ impl<T: Copy + std::fmt::Display> std::fmt::Display for RegisterOrLiteral<T> {
 }
 
 /// Data for HashBuild instruction (boxed to keep Insn small).
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct HashBuildData {
     pub cursor_id: CursorID,
     pub key_start_reg: usize,
@@ -217,7 +217,7 @@ pub struct HashBuildData {
 
 // There are currently 190 opcodes in sqlite
 #[repr(u8)]
-#[derive(Description, Debug, EnumDiscriminants)]
+#[derive(Description, Debug, Clone, EnumDiscriminants)]
 #[strum_discriminants(vis(pub(crate)))]
 #[strum_discriminants(derive(VariantArray, EnumCount, FromRepr))]
 #[strum_discriminants(name(InsnVariants))]
