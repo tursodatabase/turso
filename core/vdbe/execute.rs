@@ -1910,7 +1910,6 @@ pub fn halt(
         }
         state.end_statement(&program.connection, pager, EndStatement::ReleaseSavepoint)?;
         vtab_commit_all(&program.connection)?;
-        // Flush any pending index method writes before commit
         index_method_pre_commit_all(state, pager)?;
         program
             .commit_txn(pager.clone(), state, mv_store.as_ref(), false)
@@ -1951,7 +1950,6 @@ fn index_method_pre_commit_all(state: &mut ProgramState, pager: &Arc<Pager>) -> 
             match cursor.pre_commit()? {
                 IOResult::Done(()) => break,
                 IOResult::IO(io) => {
-                    // Wait for I/O to complete
                     while !io.finished() {
                         pager.io.step()?;
                     }
