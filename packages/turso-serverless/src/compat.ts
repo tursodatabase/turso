@@ -3,18 +3,24 @@ import { DatabaseError } from './error.js';
 
 /**
  * Configuration options for creating a libSQL-compatible client.
- * 
+ *
  * @remarks
- * This interface matches the libSQL client configuration but only `url` and `authToken` 
- * are supported in the serverless compatibility layer. Other options will throw validation errors.
+ * This interface matches the libSQL client configuration. The `url`, `authToken`, and
+ * `remoteEncryptionKey` options are supported in the serverless compatibility layer.
+ * Other options will throw validation errors.
  */
 export interface Config {
   /** Database URL (required) */
   url: string;
   /** Authentication token for the database */
   authToken?: string;
-  /** @deprecated Database encryption key - not supported in serverless mode */
+  /** @deprecated Local database encryption key - not supported in serverless mode */
   encryptionKey?: string;
+  /**
+   * Encryption key for the remote database (base64 encoded)
+   * to enable access to encrypted Turso Cloud databases.
+   */
+  remoteEncryptionKey?: string;
   /** @deprecated Sync server URL - not supported in serverless mode */
   syncUrl?: string;
   /** @deprecated Sync frequency in seconds - not supported in serverless mode */
@@ -133,10 +139,11 @@ class LibSQLClient implements Client {
 
   constructor(config: Config) {
     this.validateConfig(config);
-    
+
     const sessionConfig: SessionConfig = {
       url: config.url,
-      authToken: config.authToken || ''
+      authToken: config.authToken || '',
+      remoteEncryptionKey: config.remoteEncryptionKey
     };
     this.session = new Session(sessionConfig);
   }
@@ -176,7 +183,7 @@ class LibSQLClient implements Client {
     if (unsupportedOptions.length > 0) {
       const optionsList = unsupportedOptions.map(opt => `'${opt.key}'`).join(', ');
       throw new LibsqlError(
-        `Unsupported configuration options: ${optionsList}. Only 'url' and 'authToken' are supported in the serverless compatibility layer.`,
+        `Unsupported configuration options: ${optionsList}. Only 'url', 'authToken', and 'remoteEncryptionKey' are supported in the serverless compatibility layer.`,
         "UNSUPPORTED_CONFIG"
       );
     }
