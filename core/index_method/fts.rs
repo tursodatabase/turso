@@ -391,16 +391,11 @@ impl LruCache<PathBuf> {
     }
 }
 
-/// Type alias for chunk cache (backward compatibility).
-pub type ChunkLruCache = LruCache<ChunkKey>;
-
-/// Type alias for hot file cache (backward compatibility).
-pub type HotLruCache = LruCache<PathBuf>;
-
 /// Type aliases to please the almighty clippy
 type Catalog = HashMap<PathBuf, FileMetadata>;
 type PendingWrites = Vec<(PathBuf, Vec<u8>)>;
 
+#[derive(Clone)]
 /// Hybrid Directory implementation for Tantivy with lazy loading.
 /// - Metadata files (meta.json, etc.) are always kept in hot cache
 /// - Large segment files (.idx, .pos, .store) are lazy-loaded on demand
@@ -411,10 +406,10 @@ struct HybridBTreeDirectory {
 
     /// Hot cache: LRU cache for frequently accessed files (metadata, term dictionaries)
     /// Bounded to DEFAULT_HOT_CACHE_BYTES (64MB) to prevent unbounded memory growth
-    hot_cache: Arc<HotLruCache>,
+    hot_cache: Arc<LruCache<PathBuf>>,
 
     /// Chunk cache: LRU cache for lazy-loaded segment chunks
-    chunk_cache: Arc<ChunkLruCache>,
+    chunk_cache: Arc<LruCache<ChunkKey>>,
 
     /// Pending writes to be flushed to BTree
     pending_writes: Arc<RwLock<PendingWrites>>,
@@ -426,7 +421,7 @@ struct HybridBTreeDirectory {
     /// Pending deletes to be flushed to BTree
     pending_deletes: Arc<RwLock<Vec<PathBuf>>>,
 
-    /// Reference to pager for blocking IO
+    /// Reference to pager for IO
     pager: Arc<Pager>,
 
     /// BTree root page for the FTS directory index
@@ -442,21 +437,6 @@ impl std::fmt::Debug for HybridBTreeDirectory {
             .field("chunk_cache_size", &self.chunk_cache.size())
             .field("btree_root_page", &self.btree_root_page)
             .finish()
-    }
-}
-
-impl Clone for HybridBTreeDirectory {
-    fn clone(&self) -> Self {
-        Self {
-            catalog: Arc::clone(&self.catalog),
-            hot_cache: Arc::clone(&self.hot_cache),
-            chunk_cache: Arc::clone(&self.chunk_cache),
-            pending_writes: Arc::clone(&self.pending_writes),
-            flushing_writes: Arc::clone(&self.flushing_writes),
-            pending_deletes: Arc::clone(&self.pending_deletes),
-            pager: Arc::clone(&self.pager),
-            btree_root_page: self.btree_root_page,
-        }
     }
 }
 
@@ -497,8 +477,11 @@ impl HybridBTreeDirectory {
     ) -> Self {
         Self {
             catalog: Arc::new(RwLock::new(catalog)),
-            hot_cache: Arc::new(HotLruCache::with_preloaded(hot_cache_capacity, hot_files)),
-            chunk_cache: Arc::new(ChunkLruCache::new(chunk_cache_capacity)),
+            hot_cache: Arc::new(LruCache::<PathBuf>::with_preloaded(
+                hot_cache_capacity,
+                hot_files,
+            )),
+            chunk_cache: Arc::new(LruCache::<ChunkKey>::new(chunk_cache_capacity)),
             pending_writes: Arc::new(RwLock::new(Vec::new())),
             flushing_writes: Arc::new(RwLock::new(HashMap::new())),
             pending_deletes: Arc::new(RwLock::new(Vec::new())),
@@ -651,7 +634,7 @@ impl HybridBTreeDirectory {
             }
         }
 
-        // 5. Extract chunk data with blocking record read
+        // Extract chunk data with blocking record read
         let record = loop {
             match cursor.record() {
                 Ok(IOResult::Done(r)) => break r,
@@ -667,7 +650,7 @@ impl HybridBTreeDirectory {
 
         let record = record.ok_or_else(|| io_not_found("no record at cursor"))?;
 
-        // 6. Validate and extract - record format: [path, chunk_no, bytes]
+        // Validate and extract - record format: [path, chunk_no, bytes]
         let found_path = record.get_value_opt(0).and_then(|v| match v {
             crate::types::ValueRef::Text(t) => Some(t.value.to_string()),
             _ => None,
@@ -697,7 +680,6 @@ impl HybridBTreeDirectory {
             )));
         }
 
-        // 7. Add to cache
         self.chunk_cache.put(cache_key, bytes.clone());
 
         Ok(bytes)
@@ -729,6 +711,40 @@ impl HybridBTreeDirectory {
     fn update_catalog(&self, path: PathBuf, metadata: FileMetadata) {
         let mut catalog = self.catalog.write();
         catalog.insert(path, metadata);
+    }
+}
+
+/// Simple in-memory file handle for data already loaded (hot cache, pending writes).
+struct InMemoryFileHandle {
+    data: Vec<u8>,
+}
+
+impl std::fmt::Debug for InMemoryFileHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("InMemoryFileHandle")
+            .field("len", &self.data.len())
+            .finish()
+    }
+}
+
+impl HasLen for InMemoryFileHandle {
+    fn len(&self) -> usize {
+        self.data.len()
+    }
+}
+
+impl FileHandle for InMemoryFileHandle {
+    fn read_bytes(&self, range: Range<usize>) -> std::io::Result<OwnedBytes> {
+        if range.end > self.data.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "range exceeds file length",
+            ));
+        }
+        if range.start >= range.end {
+            return Ok(OwnedBytes::new(Vec::new()));
+        }
+        Ok(OwnedBytes::new(self.data[range].to_vec()))
     }
 }
 
@@ -817,7 +833,7 @@ impl FileHandle for LazyFileHandle {
     }
 }
 
-/// In-memory writer for HybridBTreeDirectory (same as CachedWriter).
+/// In-memory writer for HybridBTreeDirectory.
 struct HybridWriter {
     path: PathBuf,
     buffer: Vec<u8>,
@@ -889,13 +905,13 @@ impl Directory for HybridBTreeDirectory {
     ) -> std::result::Result<Arc<dyn FileHandle>, OpenReadError> {
         // Check hot cache first
         if let Some(data) = self.hot_cache.get(path) {
-            return Ok(Arc::new(CachedFileHandle { data }));
+            return Ok(Arc::new(InMemoryFileHandle { data }));
         }
 
         // Check pending writes (files written but not yet flushed to BTree)
         // This is critical for cold files that are immediately read back by Tantivy
         if let Some(data) = self.find_in_pending_writes(path) {
-            return Ok(Arc::new(CachedFileHandle { data }));
+            return Ok(Arc::new(InMemoryFileHandle { data }));
         }
 
         // Check catalog for file metadata
@@ -943,7 +959,16 @@ impl Directory for HybridBTreeDirectory {
         &self,
         path: &Path,
     ) -> std::result::Result<BufWriter<Box<dyn TerminatingWrite>>, OpenWriteError> {
-        // First delete existing file
+        // Tantivy's Directory trait documentation states files "may not previously exist",
+        // and the standard MmapDirectory implementation uses OpenOptions::create_new(true)
+        // which fails with FileAlreadyExists if the file is present.
+        // However, Tantivy may call open_write on existing files during operations like
+        // segment merging or metadata updates. To handle this gracefully, we delete any
+        // existing file first. The error is ignored because:
+        // 1. If the file doesn't exist, delete() succeeds (no-op on missing files)
+        // 2. Our delete() implementation always returns Ok(()) - it only removes entries
+        //    from in-memory structures (hot_cache, catalog, chunk_cache) and queues the
+        //    BTree deletion, none of which can fail.
         let _ = self.delete(path);
         let writer: Box<dyn TerminatingWrite> = Box::new(HybridWriter {
             path: path.to_path_buf(),
@@ -968,7 +993,6 @@ impl Directory for HybridBTreeDirectory {
         {
             let catalog = self.catalog.read();
             if !catalog.contains_key(path) {
-                // File doesn't exist - return proper error for Tantivy
                 return Err(OpenReadError::FileDoesNotExist(path.to_path_buf()));
             }
         }
@@ -1068,7 +1092,6 @@ fn parse_field_weights(weights_str: &str, columns: &[IndexColumn]) -> Result<Has
             ))
         })?;
 
-        // Validate weight is positive
         if weight <= 0.0 {
             return Err(LimboError::ParseError(format!(
                 "weight for column '{col_name}' must be positive, got {weight}",
@@ -1079,239 +1102,6 @@ fn parse_field_weights(weights_str: &str, columns: &[IndexColumn]) -> Result<Has
     }
 
     Ok(weights)
-}
-
-/// CachedBTreeDirectory: In-memory Directory implementation for Tantivy.
-/// All operations are synchronous and work on in-memory data only.
-/// Actual BTree IO happens in the FtsCursor state machines.
-#[derive(Debug, Clone)]
-pub struct CachedBTreeDirectory {
-    /// Files loaded into memory: path -> content
-    files: Arc<RwLock<HashMap<PathBuf, Vec<u8>>>>,
-    /// Pending writes to be flushed to BTree
-    pending_writes: Arc<RwLock<PendingWrites>>,
-    /// Pending deletes to be flushed to BTree
-    pending_deletes: Arc<RwLock<Vec<PathBuf>>>,
-}
-impl Default for CachedBTreeDirectory {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl CachedBTreeDirectory {
-    pub fn new() -> Self {
-        Self {
-            files: Arc::new(RwLock::new(HashMap::new())),
-            pending_writes: Arc::new(RwLock::new(Vec::new())),
-            pending_deletes: Arc::new(RwLock::new(Vec::new())),
-        }
-    }
-
-    /// Create from preloaded files
-    pub fn with_files(files: HashMap<PathBuf, Vec<u8>>) -> Self {
-        Self {
-            files: Arc::new(RwLock::new(files)),
-            pending_writes: Arc::new(RwLock::new(Vec::new())),
-            pending_deletes: Arc::new(RwLock::new(Vec::new())),
-        }
-    }
-
-    /// Get pending writes for flushing, deduplicated to keep only the last write for each path.
-    /// This is critical because Tantivy may write the same file multiple times during indexing,
-    /// and we only want to persist the final version of each file.
-    pub fn take_pending_writes(&self) -> Vec<(PathBuf, Vec<u8>)> {
-        let mut pending = self.pending_writes.write();
-        let all_writes = std::mem::take(&mut *pending);
-
-        // Deduplicate: keep only the last write for each path
-        // Use a HashMap to track the last write index for each path
-        let mut last_write_idx: HashMap<PathBuf, usize> = HashMap::new();
-        for (idx, (path, _)) in all_writes.iter().enumerate() {
-            last_write_idx.insert(path.clone(), idx);
-        }
-
-        // Collect only the entries that are the last write for their path
-        let deduped: Vec<(PathBuf, Vec<u8>)> = all_writes
-            .into_iter()
-            .enumerate()
-            .filter(|(idx, (path, _))| last_write_idx.get(path) == Some(idx))
-            .map(|(_, entry)| entry)
-            .collect();
-
-        tracing::debug!(
-            "FTS take_pending_writes: {} entries after deduplication",
-            deduped.len()
-        );
-        deduped
-    }
-
-    /// Get pending deletes for flushing
-    pub fn take_pending_deletes(&self) -> Vec<PathBuf> {
-        let mut pending = self.pending_deletes.write();
-        std::mem::take(&mut *pending)
-    }
-
-    /// Check if there are pending changes
-    pub fn has_pending_changes(&self) -> bool {
-        let writes = self.pending_writes.read();
-        let deletes = self.pending_deletes.read();
-        !writes.is_empty() || !deletes.is_empty()
-    }
-}
-
-/// In-memory file handle for CachedBTreeDirectory
-struct CachedFileHandle {
-    data: Vec<u8>,
-}
-
-impl std::fmt::Debug for CachedFileHandle {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CachedFileHandle")
-            .field("len", &self.data.len())
-            .finish()
-    }
-}
-
-impl HasLen for CachedFileHandle {
-    fn len(&self) -> usize {
-        self.data.len()
-    }
-}
-
-impl FileHandle for CachedFileHandle {
-    fn read_bytes(&self, range: Range<usize>) -> std::io::Result<OwnedBytes> {
-        if range.end > self.data.len() {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "range exceeds file length",
-            ));
-        }
-        if range.start >= range.end {
-            return Ok(OwnedBytes::new(Vec::new()));
-        }
-        Ok(OwnedBytes::new(self.data[range].to_vec()))
-    }
-}
-
-/// In-memory writer for CachedBTreeDirectory
-struct CachedWriter {
-    path: PathBuf,
-    buffer: Vec<u8>,
-    directory: CachedBTreeDirectory,
-}
-
-impl Write for CachedWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.buffer.extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl Drop for CachedWriter {
-    fn drop(&mut self) {
-        // Commit the write to the directory
-        let data = std::mem::take(&mut self.buffer);
-        if !data.is_empty() {
-            // Update in-memory files
-            let mut files = self.directory.files.write();
-            files.insert(self.path.clone(), data.clone());
-            drop(files);
-            // Queue for BTree flush
-            let mut pending = self.directory.pending_writes.write();
-            pending.push((self.path.clone(), data));
-        }
-    }
-}
-
-impl TerminatingWrite for CachedWriter {
-    fn terminate_ref(&mut self, _: tantivy::directory::AntiCallToken) -> std::io::Result<()> {
-        // Commit the write to the directory
-        let data = std::mem::take(&mut self.buffer);
-        // Update in-memory files
-        let mut files = self.directory.files.write();
-        files.insert(self.path.clone(), data.clone());
-        drop(files);
-        // Queue for BTree flush
-        let mut pending = self.directory.pending_writes.write();
-        pending.push((self.path.clone(), data));
-        Ok(())
-    }
-}
-
-impl Directory for CachedBTreeDirectory {
-    fn get_file_handle(
-        &self,
-        path: &Path,
-    ) -> std::result::Result<Arc<dyn FileHandle>, OpenReadError> {
-        let files = self.files.read();
-        let data = files
-            .get(path)
-            .ok_or_else(|| OpenReadError::FileDoesNotExist(path.to_path_buf()))?
-            .clone();
-        Ok(Arc::new(CachedFileHandle { data }))
-    }
-
-    fn exists(&self, path: &Path) -> std::result::Result<bool, OpenReadError> {
-        let files = self.files.read();
-        Ok(files.contains_key(path))
-    }
-
-    fn delete(&self, path: &Path) -> std::result::Result<(), DeleteError> {
-        // Remove from in-memory files
-        let mut files = self.files.write();
-        files.remove(path);
-        drop(files);
-        // Queue for BTree deletion
-        let mut pending = self.pending_deletes.write();
-        pending.push(path.to_path_buf());
-        Ok(())
-    }
-
-    fn open_write(
-        &self,
-        path: &Path,
-    ) -> std::result::Result<BufWriter<Box<dyn TerminatingWrite>>, OpenWriteError> {
-        // First delete existing file
-        let _ = self.delete(path);
-        let writer: Box<dyn TerminatingWrite> = Box::new(CachedWriter {
-            path: path.to_path_buf(),
-            buffer: Vec::new(),
-            directory: self.clone(),
-        });
-        Ok(BufWriter::new(writer))
-    }
-
-    fn atomic_read(&self, path: &Path) -> std::result::Result<Vec<u8>, OpenReadError> {
-        let files = self.files.read();
-        files
-            .get(path)
-            .cloned()
-            .ok_or_else(|| OpenReadError::FileDoesNotExist(path.to_path_buf()))
-    }
-
-    fn atomic_write(&self, path: &Path, data: &[u8]) -> std::io::Result<()> {
-        // Update in-memory files
-        let mut files = self.files.write();
-        files.insert(path.to_path_buf(), data.to_vec());
-        drop(files);
-        // Queue for BTree flush
-        let mut pending = self.pending_writes.write();
-        pending.push((path.to_path_buf(), data.to_vec()));
-        Ok(())
-    }
-
-    fn sync_directory(&self) -> std::io::Result<()> {
-        Ok(())
-    }
-
-    fn watch(&self, _cb: WatchCallback) -> std::result::Result<WatchHandle, tantivy::TantivyError> {
-        Ok(WatchHandle::empty())
-    }
 }
 
 /// Factory for creating FTS index attachments.
@@ -1765,7 +1555,6 @@ pub struct FtsCursor {
     connection: Option<Arc<Connection>>,
     fts_dir_cursor: Option<BTreeCursor>,
     btree_root_page: Option<i64>,
-    cached_directory: Option<CachedBTreeDirectory>,
     hybrid_directory: Option<HybridBTreeDirectory>,
     index: Option<Index>,
     reader: Option<IndexReader>,
@@ -1808,7 +1597,6 @@ impl FtsCursor {
             connection: None,
             fts_dir_cursor: None,
             btree_root_page: None,
-            cached_directory: None,
             hybrid_directory: None,
             index: None,
             reader: None,
@@ -1905,29 +1693,7 @@ impl FtsCursor {
             return Ok(());
         }
 
-        // Fall back to CachedBTreeDirectory
-        let cached_dir = self
-            .cached_directory
-            .as_ref()
-            .ok_or_else(|| LimboError::InternalError("no directory initialized".into()))?
-            .clone();
-
-        let index_exists = cached_dir
-            .exists(Path::new(TANTIVY_META_FILE))
-            .unwrap_or(false);
-
-        let index = if index_exists {
-            Index::open(cached_dir).map_err(|e| LimboError::InternalError(e.to_string()))?
-        } else {
-            Index::create(cached_dir, self.schema.clone(), IndexSettings::default())
-                .map_err(|e| LimboError::InternalError(e.to_string()))?
-        };
-
-        // Register custom tokenizers
-        self.register_tokenizers(&index);
-
-        self.index = Some(index);
-        Ok(())
+        Err(LimboError::InternalError("no directory initialized".into()))
     }
 
     /// Internal helper to continue flush_writes state machine
@@ -2404,14 +2170,11 @@ impl FtsCursor {
         self.pending_docs_count = 0;
 
         // Flush pending writes to BTree via async state machine
-        // Check HybridBTreeDirectory first, then fall back to CachedBTreeDirectory
-        let writes = if let Some(ref dir) = self.hybrid_directory {
-            dir.take_pending_writes()
-        } else if let Some(ref dir) = self.cached_directory {
-            dir.take_pending_writes()
-        } else {
-            Vec::new()
-        };
+        let writes = self
+            .hybrid_directory
+            .as_ref()
+            .map(|dir| dir.take_pending_writes())
+            .unwrap_or_default();
 
         if !writes.is_empty() {
             tracing::debug!(
@@ -2528,14 +2291,10 @@ impl Drop for FtsCursor {
             }
         }
 
-        // Check HybridBTreeDirectory first, then fall back to CachedBTreeDirectory
-        let writes = if let Some(ref dir) = self.hybrid_directory {
-            dir.take_pending_writes()
-        } else if let Some(ref dir) = self.cached_directory {
-            dir.take_pending_writes()
-        } else {
+        let Some(ref dir) = self.hybrid_directory else {
             return;
         };
+        let writes = dir.take_pending_writes();
 
         if writes.is_empty() {
             return;
@@ -2592,7 +2351,6 @@ impl IndexMethodCursor for FtsCursor {
         self.reader = None;
         self.writer = None;
         self.index = None;
-        self.cached_directory = None;
         self.hybrid_directory = None;
         self.fts_dir_cursor = None;
 
@@ -2839,16 +2597,10 @@ impl IndexMethodCursor for FtsCursor {
                 FtsState::CreatingIndex => {
                     // Log loaded files for debugging
                     if let Some(ref dir) = self.hybrid_directory {
-                        tracing::debug!("FTS CreatingIndex (hybrid): {:?}", dir);
-                    } else if let Some(ref dir) = self.cached_directory {
-                        let files = dir.files.read();
-                        tracing::debug!(
-                            "FTS CreatingIndex (cached): loaded {} files from BTree",
-                            files.len()
-                        );
+                        tracing::debug!("FTS CreatingIndex: {:?}", dir);
                     }
 
-                    // Create Tantivy index from directory (hybrid or cached)
+                    // Create Tantivy index from directory
                     self.create_index_from_directory()?;
 
                     // Create reader and searcher
