@@ -146,6 +146,19 @@ impl Connection {
         Ok(statement)
     }
 
+    /// Prepare a SQL statement for later execution, caching it in the connection.
+    pub async fn prepare_cached(&self, sql: impl AsRef<str>) -> Result<Statement> {
+        let conn = self.get_inner_connection()?;
+        let stmt = conn.prepare_cached(sql)?;
+
+        #[allow(clippy::arc_with_non_send_sync)]
+        let statement = Statement {
+            conn: self.clone(),
+            inner: Arc::new(Mutex::new(stmt)),
+        };
+        Ok(statement)
+    }
+
     async fn prepare_execute_batch(&self, sql: impl AsRef<str>) -> Result<()> {
         self.maybe_handle_dangling_tx().await?;
         let conn = self.get_inner_connection()?;

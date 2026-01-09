@@ -611,7 +611,7 @@ impl Display for MathFunc {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum AlterTableFunc {
     RenameTable,
     AlterColumn,
@@ -628,7 +628,7 @@ impl Display for AlterTableFunc {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub enum Func {
     Agg(AggFunc),
     Scalar(ScalarFunc),
@@ -655,7 +655,7 @@ impl Display for Func {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct FuncCtx {
     pub func: Func,
     pub arg_count: usize,
