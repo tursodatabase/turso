@@ -1,5 +1,7 @@
 use std::{
     borrow::Cow,
+    cell::RefCell,
+    collections::HashMap,
     fmt::Display,
     sync::{Arc, Mutex, Once, RwLock},
     task::Waker,
@@ -15,7 +17,7 @@ use tracing_subscriber::{
 };
 use turso_core::{
     storage::database::DatabaseFile, types::AsValueRef, Connection, Database, DatabaseOpts,
-    DatabaseStorage, LimboError, OpenFlags, Statement, StepResult, IO,
+    DatabaseStorage, LimboError, OpenFlags, Pager, QueryMode, Statement, StepResult, IO,
 };
 
 use crate::{
@@ -626,11 +628,18 @@ impl TursoDatabase {
     }
 }
 
+struct CachedStatement {
+    program: turso_core::Program,
+    pager: Arc<Pager>,
+    query_mode: QueryMode,
+}
+
 #[derive(Clone)]
 pub struct TursoConnection {
     async_io: bool,
     concurrent_guard: Arc<ConcurrentGuard>,
     connection: Arc<Connection>,
+    cached_statements: Arc<Mutex<HashMap<String, Arc<CachedStatement>>>>,
 }
 
 impl TursoConnection {
@@ -639,6 +648,7 @@ impl TursoConnection {
             async_io: config.async_io,
             connection,
             concurrent_guard: Arc::new(ConcurrentGuard::new()),
+            cached_statements: Arc::new(Mutex::new(HashMap::new())),
         })
     }
     /// Set busy timeout for the connection
@@ -651,6 +661,7 @@ impl TursoConnection {
     pub fn last_insert_rowid(&self) -> i64 {
         self.connection.last_insert_rowid()
     }
+
     /// prepares single SQL statement
     pub fn prepare_single(&self, sql: impl AsRef<str>) -> Result<Box<TursoStatement>, TursoError> {
         let statement = self.connection.prepare(sql)?;
@@ -660,6 +671,47 @@ impl TursoConnection {
             statement,
         }))
     }
+
+    /// Prepare a statement from the provided SQL string and cache it for future use.
+    pub fn prepare_cached(&self, sql: impl AsRef<str>) -> Result<Box<TursoStatement>, TursoError> {
+        let sql_str = sql.as_ref();
+
+        // Check if we have a cached version
+        if let Some(cached) = self.cached_statements.lock().unwrap().get(sql_str) {
+            // Clone the cached program and create a new Statement with fresh state
+            let statement = Statement::new(
+                cached.program.clone(),
+                cached.pager.clone(),
+                cached.query_mode,
+            );
+            return Ok(Box::new(TursoStatement {
+                concurrent_guard: self.concurrent_guard.clone(),
+                async_io: self.async_io,
+                statement,
+            }));
+        }
+
+        // Not cached, prepare it fresh
+        let statement = self.connection.prepare(sql_str)?;
+
+        // Cache it for future use
+        let cached = Arc::new(CachedStatement {
+            program: statement.get_program().clone(),
+            pager: statement.get_pager().clone(),
+            query_mode: statement.get_query_mode(),
+        });
+        self.cached_statements
+            .lock()
+            .unwrap()
+            .insert(sql_str.to_string(), cached);
+
+        Ok(Box::new(TursoStatement {
+            concurrent_guard: self.concurrent_guard.clone(),
+            async_io: self.async_io,
+            statement,
+        }))
+    }
+
     /// prepares first SQL statement from the string and return prepared statement and position after the end of the parsed statement
     /// this method can be useful if SDK provides an execute(...) method which run all statements from the provided input in sequence
     pub fn prepare_first(

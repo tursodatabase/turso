@@ -86,6 +86,14 @@ impl Statement {
         self.query_mode
     }
 
+    pub fn get_program(&self) -> &vdbe::Program {
+        &self.program
+    }
+
+    pub fn get_pager(&self) -> &Arc<Pager> {
+        &self.pager
+    }
+
     pub fn n_change(&self) -> i64 {
         self.state
             .n_change

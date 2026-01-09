@@ -116,7 +116,7 @@ use util::parse_schema_rows;
 pub use util::IOExt;
 pub use vdbe::{
     builder::QueryMode, explain::EXPLAIN_COLUMNS, explain::EXPLAIN_QUERY_PLAN_COLUMNS,
-    FromValueRow, Register,
+    FromValueRow, Program, Register,
 };
 
 #[cfg(feature = "cli_only")]
