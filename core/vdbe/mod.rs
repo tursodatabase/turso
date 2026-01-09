@@ -378,6 +378,8 @@ pub struct ProgramState {
     op_hash_probe_state: Option<OpHashProbeState>,
     hash_tables: HashMap<usize, HashTable>,
     uses_subjournal: bool,
+    pub n_change: AtomicI64,
+    pub explain_state: RwLock<ExplainState>,
 }
 
 impl std::fmt::Debug for Program {
@@ -447,6 +449,8 @@ impl ProgramState {
             bloom_filters: HashMap::new(),
             hash_tables: HashMap::new(),
             uses_subjournal: false,
+            n_change: AtomicI64::new(0),
+            explain_state: RwLock::new(ExplainState::default()),
         }
     }
 
@@ -540,6 +544,8 @@ impl ProgramState {
         self.hash_tables.clear();
         self.op_hash_build_state = None;
         self.op_hash_probe_state = None;
+        self.n_change.store(0, Ordering::SeqCst);
+        *self.explain_state.write() = ExplainState::default();
     }
 
     pub fn get_cursor(&mut self, cursor_id: CursorID) -> &mut Cursor {
@@ -730,7 +736,6 @@ pub struct Program {
     pub comments: Vec<(InsnReference, &'static str)>,
     pub parameters: crate::parameters::Parameters,
     pub connection: Arc<Connection>,
-    pub n_change: AtomicI64,
     pub change_cnt_on: bool,
     pub result_columns: Vec<ResultSetColumn>,
     pub table_references: TableReferences,
@@ -750,7 +755,6 @@ pub struct Program {
     /// Whether the program contains any trigger subprograms.
     pub contains_trigger_subprograms: bool,
     pub resolve_type: ResolveType,
-    pub explain_state: RwLock<ExplainState>,
 }
 
 impl Program {
@@ -804,7 +808,7 @@ impl Program {
         // FIXME: do we need this?
         state.metrics.vm_steps = state.metrics.vm_steps.saturating_add(1);
 
-        let mut explain_state = self.explain_state.write();
+        let mut explain_state = state.explain_state.write();
 
         // Check if we're processing a subprogram
         if let Some(sub_idx) = explain_state.current_subprogram_index {
@@ -848,7 +852,9 @@ impl Program {
             // Process the subprogram - it will handle its own explain_step internally
             // The subprogram's explain_step will process all its instructions (including any nested subprograms)
             // and return StepResult::Row for each instruction, then StepResult::Done when finished
+            drop(explain_state);
             let result = p.step(state, pager.clone(), QueryMode::Explain, None)?;
+            let mut explain_state = state.explain_state.write();
 
             match result {
                 StepResult::Done => {
@@ -1234,22 +1240,14 @@ impl Program {
                 let TransactionState::Write { .. } = connection.get_tx_state() else {
                     unreachable!("invalid state for write commit step")
                 };
-                self.step_end_write_txn(
-                    &pager,
-                    &mut program_state.commit_state,
-                    &connection,
-                    rollback,
-                )
+                self.step_end_write_txn(&pager, &connection, program_state, rollback)
             } else if auto_commit {
                 let current_state = connection.get_tx_state();
                 tracing::trace!("Auto-commit state: {:?}", current_state);
                 match current_state {
-                    TransactionState::Write { .. } => self.step_end_write_txn(
-                        &pager,
-                        &mut program_state.commit_state,
-                        &connection,
-                        rollback,
-                    ),
+                    TransactionState::Write { .. } => {
+                        self.step_end_write_txn(&pager, &connection, program_state, rollback)
+                    }
                     TransactionState::Read => {
                         connection.set_tx_state(TransactionState::None);
                         pager.end_read_tx();
@@ -1263,21 +1261,22 @@ impl Program {
             } else {
                 if self.change_cnt_on {
                     self.connection
-                        .set_changes(self.n_change.load(Ordering::SeqCst));
+                        .set_changes(program_state.n_change.load(Ordering::SeqCst));
                 }
                 Ok(IOResult::Done(()))
             }
         }
     }
 
-    #[instrument(skip(self, pager, connection), level = Level::DEBUG)]
+    #[instrument(skip(self, pager, connection, program_state), level = Level::DEBUG)]
     fn step_end_write_txn(
         &self,
         pager: &Arc<Pager>,
-        commit_state: &mut CommitState,
         connection: &Connection,
+        program_state: &mut ProgramState,
         rollback: bool,
     ) -> Result<IOResult<()>> {
+        let commit_state = &mut program_state.commit_state;
         let cacheflush_status = if !rollback {
             match pager.commit_tx(connection) {
                 Ok(status) => status,
@@ -1287,7 +1286,7 @@ impl Program {
                     tracing::warn!("Commit succeeded but autocheckpoint failed: {}", msg);
                     if self.change_cnt_on {
                         self.connection
-                            .set_changes(self.n_change.load(Ordering::SeqCst));
+                            .set_changes(program_state.n_change.load(Ordering::SeqCst));
                     }
                     // Update global schema if this was a DDL transaction.
                     // Must be done before clearing TX state, otherwise abort() won't know
@@ -1310,7 +1309,7 @@ impl Program {
             IOResult::Done(_) => {
                 if self.change_cnt_on {
                     self.connection
-                        .set_changes(self.n_change.load(Ordering::SeqCst));
+                        .set_changes(program_state.n_change.load(Ordering::SeqCst));
                 }
                 connection.set_tx_state(TransactionState::None);
                 *commit_state = CommitState::Ready;
