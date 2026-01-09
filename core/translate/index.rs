@@ -21,7 +21,6 @@ use crate::translate::plan::{
 };
 use crate::vdbe::builder::CursorKey;
 use crate::vdbe::insn::{to_u16, CmpInsFlags, Cookie};
-use crate::vdbe::BranchOffset;
 use crate::{
     schema::{BTreeTable, Index, IndexColumn, PseudoCursorType},
     storage::pager::CreateBTreeFlags,
@@ -261,20 +260,22 @@ pub fn translate_create_index(
         // Then insert the record into the sorter
         let mut skip_row_label = None;
         if let Some(where_clause) = where_clause {
-            let label = program.allocate_label();
+            let skip_label = program.allocate_label();
+            let continue_label = program.allocate_label();
             translate_condition_expr(
                 &mut program,
                 &table_references,
                 &where_clause,
                 ConditionMetadata {
                     jump_if_condition_is_true: false,
-                    jump_target_when_false: label,
-                    jump_target_when_true: BranchOffset::Placeholder,
-                    jump_target_when_null: label,
+                    jump_target_when_false: skip_label,
+                    jump_target_when_true: continue_label,
+                    jump_target_when_null: skip_label,
                 },
                 resolver,
             )?;
-            skip_row_label = Some(label);
+            program.resolve_label(continue_label, program.offset());
+            skip_row_label = Some(skip_label);
         }
 
         let start_reg = program.alloc_registers(columns.len() + 1);
@@ -358,20 +359,22 @@ pub fn translate_create_index(
         // Then insert the record into the sorter
         let mut skip_row_label = None;
         if let Some(where_clause) = where_clause {
-            let label = program.allocate_label();
+            let skip_label = program.allocate_label();
+            let continue_label = program.allocate_label();
             translate_condition_expr(
                 &mut program,
                 &table_references,
                 &where_clause,
                 ConditionMetadata {
                     jump_if_condition_is_true: false,
-                    jump_target_when_false: label,
-                    jump_target_when_true: BranchOffset::Placeholder,
-                    jump_target_when_null: label,
+                    jump_target_when_false: skip_label,
+                    jump_target_when_true: continue_label,
+                    jump_target_when_null: skip_label,
                 },
                 resolver,
             )?;
-            skip_row_label = Some(label);
+            program.resolve_label(continue_label, program.offset());
+            skip_row_label = Some(skip_label);
         }
 
         let start_reg = program.alloc_registers(columns.len() + 1);
