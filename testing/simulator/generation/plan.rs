@@ -43,7 +43,37 @@ impl InteractionPlan {
         rng: &mut impl rand::Rng,
         env: &mut SimulatorEnv,
     ) -> Option<Interactions> {
-        // First interaction
+        // First interaction or continue scenario initialization
+        if self.len_properties() == 0 {
+            // Check if coordinated matview scenario is enabled
+            if env.profile.query.enable_coordinated_matview_scenario {
+                // Generate coordinated matview scenario
+                let scenario = CoordinatedMatviewScenario::generate();
+
+                // Build all setup queries: CREATE TABLEs, initial INSERTs, CREATE MATERIALIZED VIEWs
+                let mut setup_queries = Vec::new();
+                setup_queries.extend(scenario.create_table_queries());
+                setup_queries.extend(scenario.initial_insert_queries());
+                setup_queries.extend(scenario.create_matview_queries());
+
+                // Store remaining queries for subsequent interactions
+                self.coordinated_matview_scenario_queries = Some(setup_queries);
+            }
+        }
+
+        // If we have pending scenario queries, generate them first
+        if let Some(ref mut queries) = self.coordinated_matview_scenario_queries {
+            if !queries.is_empty() {
+                let query = queries.remove(0);
+                let interactions = Interactions::new(0, InteractionsType::Query(query));
+                return Some(interactions);
+            } else {
+                // All scenario queries generated, clear the flag
+                self.coordinated_matview_scenario_queries = None;
+            }
+        }
+
+        // First interaction (if scenario not enabled or completed)
         if self.len_properties() == 0 {
             // First create at least one table
             let create_query = Create::arbitrary(&mut env.rng.clone(), &env.connection_context(0));
@@ -504,5 +534,228 @@ impl ArbitraryFrom<(&SimulatorEnv, &InteractionStats, usize)> for Interactions {
         };
 
         frequency(choices, rng)
+    }
+}
+
+/// Coordinated materialized view scenario for IVM testing.
+/// Creates base tables, populates them with initial data, and creates materialized views.
+/// This provides a consistent setup for testing incremental view maintenance.
+pub struct CoordinatedMatviewScenario {
+    pub base_tables: Vec<CoordinatedTable>,
+    pub matviews: Vec<CoordinatedMatview>,
+}
+
+pub struct CoordinatedTable {
+    pub name: String,
+    pub columns: Vec<(String, String)>, // (name, type)
+    pub initial_rows: Vec<Vec<String>>,
+}
+
+#[allow(dead_code)]
+pub struct CoordinatedMatview {
+    pub name: String,
+    pub select_sql: String,
+}
+
+impl CoordinatedMatviewScenario {
+    /// Generate a scenario for testing materialized views.
+    /// Creates navigation_history, navigation_cursor, and blocks tables
+    /// with materialized views that join them.
+    pub fn generate() -> Self {
+        let navigation_history = CoordinatedTable {
+            name: "navigation_history".to_string(),
+            columns: vec![
+                ("id".to_string(), "INTEGER PRIMARY KEY".to_string()),
+                ("block_id".to_string(), "INTEGER".to_string()),
+                ("created_at".to_string(), "TEXT".to_string()),
+            ],
+            initial_rows: vec![
+                vec![
+                    "1".to_string(),
+                    "100".to_string(),
+                    "'2024-01-01'".to_string(),
+                ],
+                vec![
+                    "2".to_string(),
+                    "101".to_string(),
+                    "'2024-01-02'".to_string(),
+                ],
+            ],
+        };
+
+        let navigation_cursor = CoordinatedTable {
+            name: "navigation_cursor".to_string(),
+            columns: vec![
+                ("id".to_string(), "INTEGER PRIMARY KEY".to_string()),
+                ("history_id".to_string(), "INTEGER".to_string()),
+                ("cursor_pos".to_string(), "INTEGER".to_string()),
+            ],
+            initial_rows: vec![vec!["1".to_string(), "1".to_string(), "0".to_string()]],
+        };
+
+        let blocks = CoordinatedTable {
+            name: "blocks".to_string(),
+            columns: vec![
+                ("id".to_string(), "INTEGER PRIMARY KEY".to_string()),
+                ("parent_id".to_string(), "INTEGER".to_string()),
+                ("content".to_string(), "TEXT".to_string()),
+            ],
+            initial_rows: vec![
+                vec![
+                    "100".to_string(),
+                    "NULL".to_string(),
+                    "'Root block'".to_string(),
+                ],
+                vec![
+                    "101".to_string(),
+                    "100".to_string(),
+                    "'Child block'".to_string(),
+                ],
+            ],
+        };
+
+        let current_focus = CoordinatedMatview {
+            name: "current_focus".to_string(),
+            select_sql: "SELECT nc.*, nh.block_id, nh.created_at FROM navigation_cursor nc INNER JOIN navigation_history nh ON nc.history_id = nh.id".to_string(),
+        };
+
+        let blocks_with_paths = CoordinatedMatview {
+            name: "blocks_with_paths".to_string(),
+            select_sql: "SELECT * FROM blocks".to_string(),
+        };
+
+        Self {
+            base_tables: vec![navigation_history, navigation_cursor, blocks],
+            matviews: vec![current_focus, blocks_with_paths],
+        }
+    }
+
+    /// Generate CREATE TABLE queries for all base tables
+    pub fn create_table_queries(&self) -> Vec<Query> {
+        use sql_generation::model::query::Create;
+        use sql_generation::model::table::{Column, ColumnType, Table};
+
+        self.base_tables
+            .iter()
+            .map(|t| {
+                let columns = t
+                    .columns
+                    .iter()
+                    .map(|(name, type_str)| {
+                        let col_type = if type_str.contains("INTEGER") {
+                            ColumnType::Integer
+                        } else {
+                            ColumnType::Text
+                        };
+                        Column {
+                            name: name.clone(),
+                            column_type: col_type,
+                            constraints: vec![],
+                        }
+                    })
+                    .collect();
+
+                Query::Create(Create {
+                    table: Table {
+                        name: t.name.clone(),
+                        columns,
+                        indexes: vec![],
+                        rows: vec![],
+                    },
+                })
+            })
+            .collect()
+    }
+
+    /// Generate INSERT queries for initial data
+    pub fn initial_insert_queries(&self) -> Vec<Query> {
+        use sql_generation::model::query::Insert;
+        use sql_generation::model::table::SimValue;
+        use turso_core::Value;
+
+        self.base_tables
+            .iter()
+            .flat_map(|t| {
+                t.initial_rows.iter().map(|row| {
+                    let values: Vec<SimValue> = row
+                        .iter()
+                        .map(|v| {
+                            if v == "NULL" {
+                                SimValue(Value::Null)
+                            } else if let Ok(i) = v.parse::<i64>() {
+                                SimValue(Value::from_i64(i))
+                            } else {
+                                // Strip quotes from string literals
+                                let s = v.trim_matches('\'');
+                                SimValue(Value::Text(s.to_string().into()))
+                            }
+                        })
+                        .collect();
+
+                    Query::Insert(Insert::Values {
+                        table: t.name.clone(),
+                        values: vec![values],
+                        conflict: None,
+                        on_conflict: None,
+                    })
+                })
+            })
+            .collect()
+    }
+
+    /// Generate CREATE MATERIALIZED VIEW queries
+    pub fn create_matview_queries(&self) -> Vec<Query> {
+        use sql_generation::model::query::predicate::Predicate;
+        use sql_generation::model::query::select::{
+            FromClause, ResultColumn, SelectBody, SelectInner, SelectTable,
+        };
+        use sql_generation::model::query::{CreateMaterializedView, Select};
+        use sql_generation::model::table::JoinedTable;
+        use turso_parser::ast::Distinctness;
+
+        self.matviews
+            .iter()
+            .map(|mv| {
+                // For current_focus, generate a proper join query
+                let select = if mv.name == "current_focus" {
+                    Select {
+                        with: None,
+                        body: SelectBody {
+                            select: Box::new(SelectInner {
+                                distinctness: Distinctness::All,
+                                columns: vec![ResultColumn::Star],
+                                from: Some(FromClause {
+                                    table: SelectTable::Table(
+                                        "navigation_cursor".to_string(),
+                                        Some("nc".to_string()),
+                                    ),
+                                    joins: vec![JoinedTable {
+                                        table: "navigation_history".to_string(),
+                                        alias: Some("nh".to_string()),
+                                        join_type: sql_generation::model::table::JoinType::Inner,
+                                        on: Predicate::eq_bare(
+                                            Predicate::qualified_column("nc", "history_id"),
+                                            Predicate::qualified_column("nh", "id"),
+                                        ),
+                                    }],
+                                }),
+                                where_clause: Predicate::true_(),
+                                order_by: None,
+                            }),
+                            compounds: vec![],
+                        },
+                        limit: None,
+                    }
+                } else {
+                    // Simple SELECT * FROM blocks for blocks_with_paths
+                    Select::simple("blocks".to_string(), Predicate::true_())
+                };
+
+                Query::CreateMaterializedView(CreateMaterializedView {
+                    name: mv.name.clone(),
+                    select,
+                })
+            })
+            .collect()
     }
 }
