@@ -16,6 +16,7 @@ use crate::{
     Connection, LimboError, Result, Value,
 };
 use parking_lot::RwLock;
+use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::io::{BufWriter, Write};
 use std::ops::Range;
@@ -59,6 +60,16 @@ pub const DEFAULT_HOT_CACHE_BYTES: usize = 64 * 1024 * 1024;
 /// Caches segment data chunks loaded on-demand from the BTree.
 pub const DEFAULT_CHUNK_CACHE_BYTES: usize = 128 * 1024 * 1024;
 
+// Thread-local tokenizer cache to avoid creating a new tokenizer for each call.
+// TextAnalyzer is not Send/Sync, so we use thread_local storage.
+thread_local! {
+    static FTS_TOKENIZER: RefCell<TextAnalyzer> = RefCell::new(
+        TextAnalyzer::builder(SimpleTokenizer::default())
+            .filter(tantivy::tokenizer::LowerCaser)
+            .build()
+    );
+}
+
 /// Highlight matching terms in text by wrapping them with tags.
 ///
 /// Standalone function that can be used without an FTS index.
@@ -68,54 +79,74 @@ pub fn fts_highlight(text: &str, query: &str, before_tag: &str, after_tag: &str)
     if text.is_empty() || query.is_empty() {
         return text.to_string();
     }
-    let mut tokenizer = TextAnalyzer::builder(SimpleTokenizer::default())
-        .filter(tantivy::tokenizer::LowerCaser)
-        .build();
 
-    // Extract query terms (lowercased)
-    let query_terms: HashSet<String> = {
-        let mut terms = HashSet::new();
-        let mut query_stream = tokenizer.token_stream(query);
-        while let Some(token) = query_stream.next() {
-            terms.insert(token.text.to_string());
-        }
-        terms
-    };
-    if query_terms.is_empty() {
-        return text.to_string();
-    }
+    FTS_TOKENIZER.with(|tokenizer| {
+        let mut tokenizer = tokenizer.borrow_mut();
 
-    // Tokenize the text and track positions of matching tokens
-    let match_ranges: Vec<(usize, usize)> = {
-        let mut ranges = Vec::new();
-        let mut text_stream = tokenizer.token_stream(text);
-        while let Some(token) = text_stream.next() {
-            if query_terms.contains(&token.text) {
-                ranges.push((token.offset_from, token.offset_to));
+        // Extract query terms (lowercased)
+        let query_terms: HashSet<String> = {
+            let mut terms = HashSet::new();
+            let mut query_stream = tokenizer.token_stream(query);
+            while let Some(token) = query_stream.next() {
+                terms.insert(token.text.to_string());
             }
+            terms
+        };
+        if query_terms.is_empty() {
+            return text.to_string();
         }
-        ranges
-    };
 
-    if match_ranges.is_empty() {
-        return text.to_string();
-    }
+        // Tokenize the text and track positions of matching tokens
+        let match_ranges: Vec<(usize, usize)> = {
+            let mut ranges = Vec::new();
+            let mut text_stream = tokenizer.token_stream(text);
+            while let Some(token) = text_stream.next() {
+                if query_terms.contains(&token.text) {
+                    ranges.push((token.offset_from, token.offset_to));
+                }
+            }
+            ranges
+        };
 
-    // Build the highlighted text by inserting tags at match positions,
-    // apply edits from the end backward when offsets are precomputed.
-    let mut result = text.to_string();
-    for (start, end) in match_ranges.into_iter().rev() {
-        // Ensure offsets are valid UTF-8 boundaries
-        if start <= result.len()
-            && end <= result.len()
-            && result.is_char_boundary(start)
-            && result.is_char_boundary(end)
-        {
-            result.insert_str(end, after_tag);
-            result.insert_str(start, before_tag);
+        if match_ranges.is_empty() {
+            return text.to_string();
         }
-    }
-    result
+
+        // Optimized string building: pre-calculate size and build forward
+        let extra_len = match_ranges.len() * (before_tag.len() + after_tag.len());
+        let mut result = String::with_capacity(text.len() + extra_len);
+        let mut last_end = 0;
+
+        for (start, end) in &match_ranges {
+            // Validate UTF-8 boundaries
+            if *start > text.len()
+                || *end > text.len()
+                || !text.is_char_boundary(*start)
+                || !text.is_char_boundary(*end)
+            {
+                continue;
+            }
+
+            // Append text before this match
+            if *start > last_end {
+                result.push_str(&text[last_end..*start]);
+            }
+
+            // Append highlighted match
+            result.push_str(before_tag);
+            result.push_str(&text[*start..*end]);
+            result.push_str(after_tag);
+
+            last_end = *end;
+        }
+
+        // Append remaining text after last match
+        if last_end < text.len() {
+            result.push_str(&text[last_end..]);
+        }
+
+        result
+    })
 }
 
 /// Check if text matches a query by testing for any common terms.
@@ -127,31 +158,32 @@ pub fn fts_match(text: &str, query: &str) -> bool {
     if text.is_empty() || query.is_empty() {
         return false;
     }
-    let mut tokenizer = TextAnalyzer::builder(SimpleTokenizer::default())
-        .filter(tantivy::tokenizer::LowerCaser)
-        .build();
 
-    // Extract query terms (lowercased)
-    let query_terms: HashSet<String> = {
-        let mut terms = HashSet::new();
-        let mut query_stream = tokenizer.token_stream(query);
-        while let Some(token) = query_stream.next() {
-            terms.insert(token.text.to_string());
-        }
-        terms
-    };
-    if query_terms.is_empty() {
-        return false;
-    }
+    FTS_TOKENIZER.with(|tokenizer| {
+        let mut tokenizer = tokenizer.borrow_mut();
 
-    // Tokenize the text and check if any query terms appear
-    let mut text_stream = tokenizer.token_stream(text);
-    while let Some(token) = text_stream.next() {
-        if query_terms.contains(&token.text) {
-            return true;
+        // Extract query terms (lowercased)
+        let query_terms: HashSet<String> = {
+            let mut terms = HashSet::new();
+            let mut query_stream = tokenizer.token_stream(query);
+            while let Some(token) = query_stream.next() {
+                terms.insert(token.text.to_string());
+            }
+            terms
+        };
+        if query_terms.is_empty() {
+            return false;
         }
-    }
-    false
+
+        // Tokenize the text and check if any query terms appear
+        let mut text_stream = tokenizer.token_stream(text);
+        while let Some(token) = text_stream.next() {
+            if query_terms.contains(&token.text) {
+                return true;
+            }
+        }
+        false
+    })
 }
 
 /// File classification for hybrid caching strategy.
@@ -310,7 +342,7 @@ impl<K: Eq + std::hash::Hash + Clone> LruCache<K> {
             // Update existing entry
             inner.clock += 1;
             let ts = inner.clock;
-            let entry = inner.entries.get_mut(&key).unwrap();
+            let entry = inner.entries.get_mut(&key).expect("entry must exist");
             entry.data = value;
             entry.accessed = ts;
             inner.current_size = inner.current_size - old + size;
@@ -433,7 +465,7 @@ impl LruCache<PathBuf> {
 
 /// Type aliases to please the almighty clippy
 type Catalog = HashMap<PathBuf, FileMetadata>;
-type PendingWrites = Vec<(PathBuf, Vec<u8>)>;
+type PendingWrites = HashMap<PathBuf, Vec<u8>>;
 
 /// Tantivy Directory implementation backed by Turso's BTree storage.
 ///
@@ -520,7 +552,7 @@ impl HybridBTreeDirectory {
             hot_cache: Arc::clone(&self.hot_cache),
             chunk_cache: Arc::clone(&self.chunk_cache),
             // Fresh pending state - not shared with cache
-            pending_writes: Arc::new(RwLock::new(Vec::new())),
+            pending_writes: Arc::new(RwLock::new(HashMap::new())),
             flushing_writes: Arc::new(RwLock::new(HashMap::new())),
             pending_deletes: Arc::new(RwLock::new(Vec::new())),
             pager: Arc::clone(&self.pager),
@@ -550,7 +582,7 @@ impl HybridBTreeDirectory {
                 hot_files,
             )),
             chunk_cache: Arc::new(LruCache::<ChunkKey>::new(chunk_cache_capacity)),
-            pending_writes: Arc::new(RwLock::new(Vec::new())),
+            pending_writes: Arc::new(RwLock::new(HashMap::new())),
             flushing_writes: Arc::new(RwLock::new(HashMap::new())),
             pending_deletes: Arc::new(RwLock::new(Vec::new())),
             pager,
@@ -558,38 +590,26 @@ impl HybridBTreeDirectory {
         }
     }
 
-    /// Get pending writes for flushing, deduplicated to keep only the last write for each path.
+    /// Get pending writes for flushing.
+    /// With HashMap, writes are automatically deduplicated (only latest write per path is kept).
     /// The writes are also copied to flushing_writes so they remain readable during async flush.
     fn take_pending_writes(&self) -> Vec<(PathBuf, Vec<u8>)> {
         let mut pending = self.pending_writes.write();
-        let all_writes = std::mem::take(&mut *pending);
+        let writes_map = std::mem::take(&mut *pending);
 
-        // keep only the last write for each path as we only care about the final state of each file
-        let mut last_write_idx: HashMap<PathBuf, usize> = HashMap::new();
-        for (idx, (path, _)) in all_writes.iter().enumerate() {
-            last_write_idx.insert(path.clone(), idx);
-        }
-
-        let deduped: Vec<(PathBuf, Vec<u8>)> = all_writes
-            .into_iter()
-            .enumerate()
-            .filter(|(idx, (path, _))| last_write_idx.get(path) == Some(idx))
-            .map(|(_, entry)| entry)
-            .collect();
+        // Convert HashMap to Vec for the state machine
+        let writes: Vec<(PathBuf, Vec<u8>)> = writes_map.into_iter().collect();
 
         // Copy to flushing_writes so data remains readable during async flush
         {
             let mut flushing = self.flushing_writes.write();
-            for (path, data) in &deduped {
+            for (path, data) in &writes {
                 flushing.insert(path.clone(), data.clone());
             }
         }
 
-        tracing::debug!(
-            "FTS take_pending_writes: {} entries after deduplication",
-            deduped.len()
-        );
-        deduped
+        tracing::debug!("FTS take_pending_writes: {} entries", writes.len());
+        writes
     }
 
     /// Clear flushing_writes after flush completes successfully.
@@ -604,12 +624,12 @@ impl HybridBTreeDirectory {
     }
 
     /// Find file data in pending writes or flushing writes.
-    /// Checks pending_writes first, then flushing_writes (for in-flight flushes).
+    /// Checks pending_writes first (O(1) HashMap lookup), then flushing_writes.
     fn find_in_pending_writes(&self, path: &Path) -> Option<Vec<u8>> {
-        // Check pending_writes first (most recent)
+        // Check pending_writes first (most recent) - O(1) lookup
         {
             let pending = self.pending_writes.read();
-            if let Some((_, data)) = pending.iter().rev().find(|(p, _)| p == path) {
+            if let Some(data) = pending.get(path) {
                 return Some(data.clone());
             }
         }
@@ -626,16 +646,43 @@ impl HybridBTreeDirectory {
 
     const CHUNK_LEN: usize = 3;
 
-    /// Blocking read of a single chunk from BTree.
-    /// Called from LazyFileHandle::read_bytes when chunk is not in cache.
-    fn get_chunk_blocking(&self, path: &Path, chunk_no: i64) -> std::io::Result<Vec<u8>> {
-        // Check chunk cache first
-        let cache_key = (path.to_path_buf(), chunk_no);
-        if let Some(chunk) = self.chunk_cache.get(&cache_key) {
-            return Ok(chunk);
+    /// Blocking read of a range of chunks from BTree using a single cursor.
+    /// Efficient for both single and multiple chunk reads, as it only seeks once
+    /// and advances sequentially.
+    fn get_chunks_range_blocking(
+        &self,
+        path: &Path,
+        start_chunk: usize,
+        end_chunk: usize,
+    ) -> std::io::Result<Vec<Vec<u8>>> {
+        if start_chunk > end_chunk {
+            return Ok(Vec::new());
         }
 
-        // Create a temporary cursor for this read
+        let mut chunks = Vec::with_capacity(end_chunk - start_chunk + 1);
+        let path_str = path.to_string_lossy().to_string();
+
+        // Check cache for all requested chunks first
+        let mut uncached_start = None;
+        for chunk_no in start_chunk..=end_chunk {
+            let cache_key = (path.to_path_buf(), chunk_no as i64);
+            if let Some(chunk) = self.chunk_cache.get(&cache_key) {
+                chunks.push(chunk);
+            } else {
+                // Found first uncached chunk
+                uncached_start = Some(chunk_no);
+                break;
+            }
+        }
+
+        // If all chunks were cached, return them
+        if uncached_start.is_none() {
+            return Ok(chunks);
+        }
+
+        let uncached_start = uncached_start.unwrap();
+
+        // Create cursor and seek to first uncached chunk
         let mut cursor =
             BTreeCursor::new(self.pager.clone(), self.btree_root_page, Self::CHUNK_LEN);
         cursor.index_info = Some(Arc::new(IndexInfo {
@@ -644,32 +691,28 @@ impl HybridBTreeDirectory {
             key_info: vec![key_info(), key_info(), key_info()],
         }));
 
-        // Seek to the specific chunk
-        let path_str = path.to_string_lossy().to_string();
         let seek_key = ImmutableRecord::from_values(
             &[
                 Value::Text(Text::new(path_str.clone())),
-                Value::Integer(chunk_no),
-                Value::Blob(vec![]), // minimum blob for GE seek
+                Value::Integer(uncached_start as i64),
+                Value::Blob(vec![]),
             ],
             Self::CHUNK_LEN,
         );
 
-        // Blocking seek loop
+        // Blocking seek to first chunk
         loop {
             match cursor.seek(SeekKey::IndexKey(&seek_key), SeekOp::GE { eq_only: false }) {
                 Ok(IOResult::Done(SeekResult::Found)) => break,
                 Ok(IOResult::Done(SeekResult::TryAdvance)) => {
-                    // Need to advance, try next
                     loop {
                         match cursor.next() {
                             Ok(IOResult::Done(_)) => {
-                                let has_next = cursor.has_record();
-                                if !has_next {
+                                if !cursor.has_record() {
                                     return Err(io_not_found(format!(
                                         "chunk {}:{} not found",
                                         path.display(),
-                                        chunk_no
+                                        uncached_start
                                     )));
                                 }
                                 break;
@@ -689,7 +732,7 @@ impl HybridBTreeDirectory {
                     return Err(io_not_found(format!(
                         "chunk {}:{} not found",
                         path.display(),
-                        chunk_no
+                        uncached_start
                     )));
                 }
                 Ok(IOResult::IO(_)) => {
@@ -702,68 +745,105 @@ impl HybridBTreeDirectory {
             }
         }
 
-        // Extract chunk data with blocking record read
-        let record = loop {
-            match cursor.record() {
-                Ok(IOResult::Done(r)) => break r,
-                Ok(IOResult::IO(_)) => {
-                    self.pager
-                        .io
-                        .step()
-                        .map_err(|e| std::io::Error::other(e.to_string()))?;
+        // Read remaining chunks sequentially
+        for expected_chunk_no in uncached_start..=end_chunk {
+            // Check if cursor has a record
+            if !cursor.has_record() {
+                return Err(io_not_found(format!(
+                    "chunk {}:{} not found (cursor exhausted)",
+                    path.display(),
+                    expected_chunk_no
+                )));
+            }
+
+            // Read current record
+            let record = loop {
+                match cursor.record() {
+                    Ok(IOResult::Done(r)) => break r,
+                    Ok(IOResult::IO(_)) => {
+                        self.pager
+                            .io
+                            .step()
+                            .map_err(|e| std::io::Error::other(e.to_string()))?;
+                    }
+                    Err(e) => return Err(std::io::Error::other(e.to_string())),
                 }
-                Err(e) => return Err(std::io::Error::other(e.to_string())),
+            };
+
+            let record = record.ok_or_else(|| io_not_found("no record at cursor"))?;
+
+            // Extract and validate
+            let found_path = record.get_value_opt(0).and_then(|v| match v {
+                crate::types::ValueRef::Text(t) => Some(t.value.to_string()),
+                _ => None,
+            });
+            let found_chunk = record.get_value_opt(1).and_then(|v| match v {
+                crate::types::ValueRef::Integer(i) => Some(i),
+                _ => None,
+            });
+            let bytes = record.get_value_opt(2).and_then(|v| match v {
+                crate::types::ValueRef::Blob(b) => Some(b.to_vec()),
+                _ => None,
+            });
+
+            let (found_path_str, found_chunk_no, bytes) = match (found_path, found_chunk, bytes) {
+                (Some(p), Some(c), Some(b)) => (p, c, b),
+                _ => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "malformed chunk record",
+                    ))
+                }
+            };
+
+            if found_path_str != path_str || found_chunk_no != expected_chunk_no as i64 {
+                return Err(io_not_found(format!(
+                    "wrong chunk: expected {path_str}:{expected_chunk_no}, got {found_path_str}:{found_chunk_no}",
+                )));
             }
-        };
 
-        let record = record.ok_or_else(|| io_not_found("no record at cursor"))?;
+            // Cache and collect the chunk
+            let cache_key = (path.to_path_buf(), expected_chunk_no as i64);
+            self.chunk_cache.put(cache_key, bytes.clone());
+            chunks.push(bytes);
 
-        // Validate and extract - record format: [path, chunk_no, bytes]
-        let found_path = record.get_value_opt(0).and_then(|v| match v {
-            crate::types::ValueRef::Text(t) => Some(t.value.to_string()),
-            _ => None,
-        });
-        let found_chunk = record.get_value_opt(1).and_then(|v| match v {
-            crate::types::ValueRef::Integer(i) => Some(i),
-            _ => None,
-        });
-        let bytes = record.get_value_opt(2).and_then(|v| match v {
-            crate::types::ValueRef::Blob(b) => Some(b.to_vec()),
-            _ => None,
-        });
-
-        let (found_path, found_chunk, bytes) = match (found_path, found_chunk, bytes) {
-            (Some(p), Some(c), Some(b)) => (p, c, b),
-            _ => {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "malformed chunk record",
-                ))
+            // Advance cursor to next record (unless this is the last chunk we need)
+            if expected_chunk_no < end_chunk {
+                loop {
+                    match cursor.next() {
+                        Ok(IOResult::Done(_)) => break,
+                        Ok(IOResult::IO(_)) => {
+                            self.pager
+                                .io
+                                .step()
+                                .map_err(|e| std::io::Error::other(e.to_string()))?;
+                        }
+                        Err(e) => return Err(std::io::Error::other(e.to_string())),
+                    }
+                }
             }
-        };
-
-        if found_path != path_str || found_chunk != chunk_no {
-            return Err(io_not_found(format!(
-                "wrong chunk: expected {path_str}:{chunk_no}, got {found_path}:{found_chunk}",
-            )));
         }
 
-        self.chunk_cache.put(cache_key, bytes.clone());
-
-        Ok(bytes)
+        Ok(chunks)
     }
 
     /// Load an entire file by concatenating all its chunks (blocking).
-    /// Used for loading hot files during preload phase.
+    /// Uses efficient bulk read with a single cursor seek.
     fn load_file_blocking(&self, path: &Path) -> std::io::Result<Vec<u8>> {
         let catalog = self.catalog.read();
         let metadata = catalog
             .get(path)
             .ok_or_else(|| io_not_found(format!("file not in catalog: {}", path.display())))?;
 
+        if metadata.num_chunks == 0 {
+            return Ok(Vec::new());
+        }
+
+        let chunks =
+            self.get_chunks_range_blocking(path, 0, metadata.num_chunks.saturating_sub(1))?;
+
         let mut result = Vec::with_capacity(metadata.size);
-        for chunk_no in 0..metadata.num_chunks as i64 {
-            let chunk = self.get_chunk_blocking(path, chunk_no)?;
+        for chunk in chunks {
             result.extend_from_slice(&chunk);
         }
 
@@ -870,15 +950,18 @@ impl FileHandle for LazyFileHandle {
         let start_chunk = range.start / chunk_size;
         let end_chunk = range.end.saturating_sub(1) / chunk_size;
 
-        // Collect chunks
+        // Use efficient bulk read when multiple chunks are needed
+        let chunks =
+            self.directory
+                .get_chunks_range_blocking(&self.path, start_chunk, end_chunk)?;
+
+        // Collect result from chunks
         let mut result = Vec::with_capacity(range.len());
-        for chunk_no in start_chunk..=end_chunk {
-            let chunk = self
-                .directory
-                .get_chunk_blocking(&self.path, chunk_no as i64)?;
+        for (i, chunk) in chunks.into_iter().enumerate() {
+            let chunk_no = start_chunk + i;
+            let chunk_start = chunk_no * chunk_size;
 
             // Calculate slice within this chunk
-            let chunk_start = chunk_no * chunk_size;
             let local_start = if chunk_no == start_chunk {
                 range.start - chunk_start
             } else {
@@ -890,7 +973,14 @@ impl FileHandle for LazyFileHandle {
                 chunk.len()
             };
 
-            // Defensive bounds check to prevent panics
+            // Defensive bounds check - should not be needed if logic is correct
+            debug_assert!(
+                local_start <= chunk.len() && local_end <= chunk.len(),
+                "chunk slice out of bounds: local_start={}, local_end={}, chunk_len={}",
+                local_start,
+                local_end,
+                chunk.len()
+            );
             let local_end = local_end.min(chunk.len());
             let local_start = local_start.min(local_end);
 
@@ -936,9 +1026,9 @@ impl Drop for HybridWriter {
                     .add_to_hot_cache(self.path.clone(), data.clone());
             }
 
-            // Queue for BTree flush
+            // Queue for BTree flush (HashMap auto-deduplicates by path)
             let mut pending = self.directory.pending_writes.write();
-            pending.push((self.path.clone(), data));
+            pending.insert(self.path.clone(), data);
         }
     }
 }
@@ -947,21 +1037,24 @@ impl TerminatingWrite for HybridWriter {
     fn terminate_ref(&mut self, _: tantivy::directory::AntiCallToken) -> std::io::Result<()> {
         let data = std::mem::take(&mut self.buffer);
 
-        // Update catalog
-        let num_chunks = data.len().div_ceil(DEFAULT_CHUNK_SIZE).max(1);
+        // Calculate chunks (0 for empty files, consistent with Drop impl)
+        let num_chunks = data.len().div_ceil(DEFAULT_CHUNK_SIZE);
+
+        // Update catalog - even empty files should exist in the catalog
         let metadata = FileMetadata::new(&self.path, data.len(), num_chunks);
         self.directory
             .update_catalog(self.path.clone(), metadata.clone());
 
-        // If it's a hot file category, add to hot cache
+        // If it's a hot file category, add to hot cache (even if empty)
         if metadata.category.is_hot() {
             self.directory
                 .add_to_hot_cache(self.path.clone(), data.clone());
         }
 
-        // Queue for BTree flush
+        // Queue for BTree flush (HashMap auto-deduplicates by path)
+        // Empty files are still queued to ensure they can be read back from pending writes
         let mut pending = self.directory.pending_writes.write();
-        pending.push((self.path.clone(), data));
+        pending.insert(self.path.clone(), data);
         Ok(())
     }
 }
@@ -1084,9 +1177,9 @@ impl Directory for HybridBTreeDirectory {
             self.add_to_hot_cache(path.to_path_buf(), data.to_vec());
         }
 
-        // Queue for BTree flush
+        // Queue for BTree flush (HashMap auto-deduplicates by path)
         let mut pending = self.pending_writes.write();
-        pending.push((path.to_path_buf(), data.to_vec()));
+        pending.insert(path.to_path_buf(), data.to_vec());
         Ok(())
     }
 
@@ -1568,7 +1661,8 @@ enum FtsState {
     SeekingWrite {
         writes: Vec<(PathBuf, Vec<u8>)>,
         write_idx: usize,
-        chunk_idx: usize,
+        /// Current chunk index to write. None means old chunks deleted, ready to start from 0.
+        chunk_idx: Option<usize>,
     },
     /// Flushing pending writes to BTree - insert phase (after seek completed)
     InsertingWrite {
@@ -1581,7 +1675,8 @@ enum FtsState {
     FlushingWrites {
         writes: Vec<(PathBuf, Vec<u8>)>,
         write_idx: usize,
-        chunk_idx: usize,
+        /// Current chunk index. None means old chunks need deletion first, then start from 0.
+        chunk_idx: Option<usize>,
     },
     /// Flushing pending deletes to BTree
     FlushingDeletes {
@@ -1631,8 +1726,9 @@ pub struct FtsCursor {
 }
 
 impl FtsCursor {
-    /// Maximum results when no LIMIT is specified (10 million).
-    const MAX_NO_LIMIT_RESULT: usize = 10_000_000;
+    /// Maximum results when no LIMIT is specified (1 million).
+    /// TODO: configurable?
+    const MAX_NO_LIMIT_RESULT: usize = 1_000_000;
 
     /// Creates a new FTS cursor with the given configuration.
     pub fn new(
@@ -1775,8 +1871,8 @@ impl FtsCursor {
                         return Ok(IOResult::Done(()));
                     }
 
-                    // If starting a new file (chunk_idx == 0), first delete old chunks
-                    if *chunk_idx == 0 {
+                    // If starting a new file (chunk_idx is Some(0)), first delete old chunks
+                    if *chunk_idx == Some(0) {
                         let path_str = writes[*write_idx].0.to_string_lossy().to_string();
                         self.state = FtsState::SeekingOldChunks {
                             writes: std::mem::take(writes),
@@ -1790,17 +1886,13 @@ impl FtsCursor {
                     let chunk_size = DEFAULT_CHUNK_SIZE;
                     let total_chunks = data.len().div_ceil(chunk_size);
 
-                    // Adjust chunk_idx if it was the special "start writing" marker
-                    let actual_chunk_idx = if *chunk_idx == usize::MAX {
-                        0
-                    } else {
-                        *chunk_idx
-                    };
+                    // None means old chunks deleted, ready to start from 0
+                    let actual_chunk_idx = chunk_idx.unwrap_or(0);
 
-                    if actual_chunk_idx >= total_chunks.max(1) {
-                        // Move to next file
+                    // Empty files (0 chunks) or all chunks written - move to next file
+                    if total_chunks == 0 || actual_chunk_idx >= total_chunks {
                         *write_idx += 1;
-                        *chunk_idx = 0;
+                        *chunk_idx = Some(0);
                         continue;
                     }
 
@@ -1808,7 +1900,7 @@ impl FtsCursor {
                     self.state = FtsState::SeekingWrite {
                         writes: std::mem::take(writes),
                         write_idx: *write_idx,
-                        chunk_idx: actual_chunk_idx,
+                        chunk_idx: Some(actual_chunk_idx),
                     };
                 }
                 FtsState::SeekingOldChunks {
@@ -1819,7 +1911,6 @@ impl FtsCursor {
                     let cursor = self.fts_dir_cursor.as_mut().ok_or_else(|| {
                         LimboError::InternalError("cursor not initialized".into())
                     })?;
-
                     tracing::debug!("FTS flush: deleting old chunks for path={}", path_str);
 
                     // Seek to first chunk of this path (with empty blob as minimum)
@@ -1838,11 +1929,11 @@ impl FtsCursor {
 
                     match seek_result {
                         SeekResult::NotFound => {
-                            // No matching records at all, start writing
+                            // No matching records at all, start writing from chunk 0
                             self.state = FtsState::FlushingWrites {
                                 writes: std::mem::take(writes),
                                 write_idx: *write_idx,
-                                chunk_idx: usize::MAX,
+                                chunk_idx: None, // None = ready to start from chunk 0
                             };
                         }
                         SeekResult::TryAdvance => {
@@ -1887,7 +1978,7 @@ impl FtsCursor {
                         self.state = FtsState::FlushingWrites {
                             writes: std::mem::take(writes),
                             write_idx: *write_idx,
-                            chunk_idx: usize::MAX,
+                            chunk_idx: None, // Ready to start from chunk 0
                         };
                     }
                 }
@@ -1905,7 +1996,7 @@ impl FtsCursor {
                         self.state = FtsState::FlushingWrites {
                             writes: std::mem::take(writes),
                             write_idx: *write_idx,
-                            chunk_idx: usize::MAX, // Special value to trigger first write
+                            chunk_idx: None, // Ready to start from chunk 0 // Special value to trigger first write
                         };
                         continue;
                     }
@@ -1932,7 +2023,7 @@ impl FtsCursor {
                         self.state = FtsState::FlushingWrites {
                             writes: std::mem::take(writes),
                             write_idx: *write_idx,
-                            chunk_idx: usize::MAX,
+                            chunk_idx: None, // Ready to start from chunk 0
                         };
                     }
                 }
@@ -1980,7 +2071,7 @@ impl FtsCursor {
                         self.state = FtsState::FlushingWrites {
                             writes: std::mem::take(writes),
                             write_idx: *write_idx,
-                            chunk_idx: usize::MAX,
+                            chunk_idx: None, // Ready to start from chunk 0
                         };
                     }
                 }
@@ -1996,11 +2087,8 @@ impl FtsCursor {
                     let (path, data) = &writes[*write_idx];
                     let path_str = path.to_string_lossy().to_string();
                     let chunk_size = DEFAULT_CHUNK_SIZE;
-                    let actual_chunk_idx = if *chunk_idx == usize::MAX {
-                        0
-                    } else {
-                        *chunk_idx
-                    };
+                    // None means ready to start from chunk 0
+                    let actual_chunk_idx = chunk_idx.unwrap_or(0);
 
                     let start = actual_chunk_idx * chunk_size;
                     let end = (start + chunk_size).min(data.len());
@@ -2026,7 +2114,7 @@ impl FtsCursor {
                         cursor.seek(SeekKey::IndexKey(&record), SeekOp::GE { eq_only: false })
                     );
 
-                    // Transition to InsertingWrite - don't do insert in same state to avoid re-seeking on IO
+                    // don't do insert in same state to avoid re-seeking on IO
                     self.state = FtsState::InsertingWrite {
                         writes: std::mem::take(writes),
                         write_idx: *write_idx,
@@ -2044,14 +2132,14 @@ impl FtsCursor {
                         LimboError::InternalError("cursor not initialized".into())
                     })?;
 
-                    // Insert into BTree - the cursor should be positioned correctly after seek
+                    // the cursor should be positioned correctly after seek
                     return_if_io!(cursor.insert(&BTreeKey::IndexKey(record)));
 
                     // Move to next chunk
                     self.state = FtsState::FlushingWrites {
                         writes: std::mem::take(writes),
                         write_idx: *write_idx,
-                        chunk_idx: *chunk_idx + 1,
+                        chunk_idx: Some(*chunk_idx + 1),
                     };
                 }
                 FtsState::Ready => {
@@ -2245,7 +2333,7 @@ impl FtsCursor {
             self.state = FtsState::FlushingWrites {
                 writes,
                 write_idx: 0,
-                chunk_idx: 0,
+                chunk_idx: Some(0),
             };
             return self.flush_writes_internal();
         }
@@ -2370,7 +2458,7 @@ impl Drop for FtsCursor {
         self.state = FtsState::FlushingWrites {
             writes,
             write_idx: 0,
-            chunk_idx: 0,
+            chunk_idx: Some(0),
         };
 
         // Run blocking flush
@@ -2378,7 +2466,6 @@ impl Drop for FtsCursor {
             match self.flush_writes_internal() {
                 Ok(IOResult::Done(())) => break,
                 Ok(IOResult::IO(_)) => {
-                    // Advance IO
                     if let Err(e) = pager.io.step() {
                         tracing::error!("FTS Drop: IO error during flush: {}", e);
                         break;
@@ -2636,12 +2723,30 @@ impl IndexMethodCursor for FtsCursor {
                                 hybrid_dir.add_to_hot_cache(next_path, data);
                             }
                             Err(e) => {
-                                // File might not exist yet (new index), just log and continue
-                                tracing::debug!(
-                                    "FTS: could not preload {}: {}",
-                                    next_path.display(),
-                                    e
-                                );
+                                let category = FileCategory::from_path(&next_path);
+                                // NotFound is expected for new empty indexes
+                                if e.kind() == std::io::ErrorKind::NotFound {
+                                    // Expected for new index, just log at debug level
+                                    tracing::debug!(
+                                        "FTS: preload skipped (not found): {}",
+                                        next_path.display()
+                                    );
+                                } else if category == FileCategory::Metadata {
+                                    // Metadata files are critical - propagate error
+                                    return Err(LimboError::InternalError(format!(
+                                        "FTS: failed to preload metadata file {}: {}",
+                                        next_path.display(),
+                                        e
+                                    )));
+                                } else {
+                                    // Non-critical file, warn but continue
+                                    tracing::warn!(
+                                        "FTS: could not preload {} ({:?}): {}",
+                                        next_path.display(),
+                                        category,
+                                        e
+                                    );
+                                }
                             }
                         }
                         continue;
@@ -2894,13 +2999,27 @@ impl IndexMethodCursor for FtsCursor {
                 if values.len() > 2 {
                     match &values[2] {
                         Register::Value(Value::Integer(i)) => *i as usize,
-                        _ => 10,
+                        _ => {
+                            tracing::debug!(
+                                "FTS query_start: LIMIT value is not an integer, using default 10"
+                            );
+                            10
+                        }
                     }
                 } else {
+                    tracing::debug!(
+                        "FTS query_start: LIMIT pattern but no limit value provided, using default 10"
+                    );
                     10
                 }
             }
-            _ => 10,
+            _ => {
+                tracing::debug!(
+                    "FTS query_start: unknown pattern {}, using default limit 10",
+                    pattern_idx
+                );
+                10
+            }
         };
 
         // Build query over all text fields
