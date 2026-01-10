@@ -180,6 +180,16 @@ bench-exclude-tpc-h:
 	fi
 .PHONY: bench-exclude-tpc-h
 
+codspeed-build-bench-exclude-tpc-h:
+	@benchmarks=$$(cargo bench --bench 2>&1 | grep -A 1000 '^Available bench targets:' | grep -v '^Available bench targets:' | grep -v '^ *$$' | grep -v 'tpc_h_benchmark' | xargs -I {} printf -- "--bench %s " {}); \
+	if [ -z "$$benchmarks" ]; then \
+		echo "No benchmarks found (excluding tpc_h_benchmark)."; \
+		exit 1; \
+	else \
+		cargo codspeed build $$benchmarks --features codspeed; \
+	fi
+.PHONY: codspeed-build-bench-exclude-tpc-h
+
 docker-cli-build:
 	docker build -f Dockerfile.cli -t turso-cli .
 

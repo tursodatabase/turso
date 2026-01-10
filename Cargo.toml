@@ -84,7 +84,11 @@ indexmap = "2.11.1"
 miette = "7.6.0"
 bitflags = "2.9.4"
 fallible-iterator = "0.3.0"
-criterion = "0.5"
+
+criterion = "0.5.0"
+codspeed-criterion-compat = "4.2.1"
+divan = { package = "codspeed-divan-compat", version = "4.2.1" }
+
 chrono = { version = "0.4.42", default-features = false }
 hex = "0.4"
 antithesis_sdk = { version = "0.2", default-features = false }
@@ -98,7 +102,6 @@ similar-asserts = { version = "1.7.0" }
 bitmaps = { version = "3.2.1", default-features = false }
 console-subscriber = { version = "0.4.1" }
 either = { version = "1.15" }
-divan = "0.1.21"
 
 # Multi threading testing
 loom = { version = "0.7" }

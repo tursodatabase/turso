@@ -1,7 +1,17 @@
+#[cfg(not(feature = "codspeed"))]
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion};
+#[cfg(not(feature = "codspeed"))]
 use pprof::criterion::{Output, PProfProfiler};
+
+#[cfg(feature = "codspeed")]
+use codspeed_criterion_compat::{
+    black_box, criterion_group, criterion_main, BenchmarkId, Criterion,
+};
 use regex::Regex;
-use std::{sync::Arc, time::Instant};
+use std::{
+    sync::Arc,
+    time::{Duration, Instant},
+};
 use tempfile::TempDir;
 use turso_core::{Database, LimboError, PlatformIO, StepResult};
 
@@ -126,7 +136,7 @@ fn bench_alter(criterion: &mut Criterion) {
                     conn.execute("DROP TABLE y").unwrap();
                     elapsed
                 })
-                .sum()
+                .sum::<Duration>()
         });
     });
 
@@ -145,7 +155,7 @@ fn bench_alter(criterion: &mut Criterion) {
                         conn.execute("DROP TABLE y", ()).unwrap();
                         elapsed
                     })
-                    .sum()
+                    .sum::<Duration>()
             });
         });
     }
@@ -171,7 +181,7 @@ fn bench_alter(criterion: &mut Criterion) {
                     conn.execute("DROP TABLE x").unwrap();
                     elapsed
                 })
-                .sum()
+                .sum::<Duration>()
         });
     });
 
@@ -191,7 +201,7 @@ fn bench_alter(criterion: &mut Criterion) {
                         conn.execute("DROP TABLE x", ()).unwrap();
                         elapsed
                     })
-                    .sum()
+                    .sum::<Duration>()
             });
         });
     }
@@ -217,7 +227,7 @@ fn bench_alter(criterion: &mut Criterion) {
                     conn.execute("DROP TABLE x").unwrap();
                     elapsed
                 })
-                .sum()
+                .sum::<Duration>()
         });
     });
 
@@ -236,7 +246,7 @@ fn bench_alter(criterion: &mut Criterion) {
                         conn.execute("DROP TABLE x", ()).unwrap();
                         elapsed
                     })
-                    .sum()
+                    .sum::<Duration>()
             });
         });
     }
@@ -262,7 +272,7 @@ fn bench_alter(criterion: &mut Criterion) {
                     conn.execute("DROP TABLE x").unwrap();
                     elapsed
                 })
-                .sum()
+                .sum::<Duration>()
         });
     });
 
@@ -281,7 +291,7 @@ fn bench_alter(criterion: &mut Criterion) {
                         conn.execute("DROP TABLE x", ()).unwrap();
                         elapsed
                     })
-                    .sum()
+                    .sum::<Duration>()
             });
         });
     }
@@ -338,10 +348,13 @@ fn bench_prepare_query(criterion: &mut Criterion) {
         let query = whitespace_re.replace_all(query, " ").to_string();
         let query = query.as_str();
 
+        let byte_index: usize = query.chars().take(50).map(|c| c.len_utf8()).sum();
+
         let mut group = criterion.benchmark_group(format!("Prepare `{query}`"));
 
         group.bench_with_input(
-            BenchmarkId::new("limbo_parse_query", query),
+            // Limit the size of the benchmark id so that Codspeed does not through errors
+            BenchmarkId::new("limbo_parse_query", &query[..byte_index]),
             query,
             |b, query| {
                 b.iter(|| {
@@ -354,7 +367,7 @@ fn bench_prepare_query(criterion: &mut Criterion) {
             let sqlite_conn = rusqlite_open();
 
             group.bench_with_input(
-                BenchmarkId::new("sqlite_parse_query", query),
+                BenchmarkId::new("sqlite_parse_query", &query[..byte_index]),
                 query,
                 |b, query| {
                     b.iter(|| {
@@ -787,13 +800,9 @@ fn bench_limbo_mvcc(
         });
     }
     loop {
-        let mut all_finished = true;
-        for conn in &mut connecitons {
-            if !conn.inserts.is_empty() || conn.current_statement.is_some() {
-                all_finished = false;
-                break;
-            }
-        }
+        let all_finished = connecitons
+            .iter()
+            .all(|conn| conn.inserts.is_empty() && conn.current_statement.is_none());
         for conn in connecitons.iter_mut() {
             if conn.current_statement.is_none() && !conn.inserts.is_empty() {
                 let write = conn.inserts.pop().unwrap();
@@ -805,17 +814,23 @@ fn bench_limbo_mvcc(
                 continue;
             }
             let stmt = conn.current_statement.as_mut().unwrap();
+            let is_commit = stmt.get_sql() == "COMMIT";
             match stmt.step() {
                 // These you be only possible cases in write concurrency.
                 // No rows because insert doesn't return
                 // No interrupt because insert doesn't interrupt
                 // No busy because insert in mvcc should be multi concurrent write
                 Ok(StepResult::Done) => {
-                    // Now do commit
-                    conn.current_statement = Some(conn.conn.prepare("COMMIT").unwrap());
+                    if is_commit {
+                        // COMMIT finished, clear statement to start next transaction
+                        conn.current_statement = None;
+                        conn.current_insert = None;
+                    } else {
+                        // INSERT finished, now do commit
+                        conn.current_statement = Some(conn.conn.prepare("COMMIT").unwrap());
+                    }
                 }
                 Ok(StepResult::IO) => {
-                    stmt.step().unwrap();
                     // let's skip doing I/O here, we want to perform io only after all the statements are stepped
                 }
                 Ok(StepResult::Busy) => {
@@ -1016,9 +1031,18 @@ fn bench_insert_randomblob(criterion: &mut Criterion) {
     group.finish();
 }
 
+#[cfg(not(feature = "codspeed"))]
 criterion_group! {
     name = benches;
     config = Criterion::default().with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
     targets = bench_open, bench_alter, bench_prepare_query, bench_execute_select_1, bench_execute_select_rows, bench_execute_select_count, bench_insert_rows, bench_concurrent_writes, bench_insert_randomblob
 }
+
+#[cfg(feature = "codspeed")]
+criterion_group! {
+    name = benches;
+    config = Criterion::default();
+    targets = bench_open, bench_alter, bench_prepare_query, bench_execute_select_1, bench_execute_select_rows, bench_execute_select_count, bench_insert_rows, bench_concurrent_writes, bench_insert_randomblob
+}
+
 criterion_main!(benches);

@@ -1,8 +1,17 @@
 use std::sync::Arc;
 
-use criterion::async_executor::FuturesExecutor;
-use criterion::{criterion_group, criterion_main, Criterion, Throughput};
+#[cfg(not(feature = "codspeed"))]
+use criterion::{
+    async_executor::FuturesExecutor, criterion_group, criterion_main, Criterion, Throughput,
+};
+#[cfg(not(feature = "codspeed"))]
 use pprof::criterion::{Output, PProfProfiler};
+
+#[cfg(feature = "codspeed")]
+use codspeed_criterion_compat::{
+    async_executor::FuturesExecutor, criterion_group, criterion_main, Criterion, Throughput,
+};
+
 use turso_core::mvcc::clock::LocalClock;
 use turso_core::mvcc::database::{MvStore, Row, RowID, RowKey};
 use turso_core::types::{IOResult, ImmutableRecord, Text};
@@ -172,9 +181,18 @@ fn bench(c: &mut Criterion) {
     });
 }
 
+#[cfg(not(feature = "codspeed"))]
 criterion_group! {
     name = benches;
     config = Criterion::default().with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
     targets = bench
 }
+
+#[cfg(feature = "codspeed")]
+criterion_group! {
+    name = benches;
+    config = Criterion::default();
+    targets = bench
+}
+
 criterion_main!(benches);

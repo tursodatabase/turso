@@ -1,8 +1,13 @@
+#[cfg(not(feature = "codspeed"))]
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
+#[cfg(not(feature = "codspeed"))]
 use pprof::{
     criterion::{Output, PProfProfiler},
     flamegraph::Options,
 };
+
+#[cfg(feature = "codspeed")]
+use codspeed_criterion_compat::{black_box, criterion_group, criterion_main, Criterion};
 use std::sync::Arc;
 use turso_core::{Database, PlatformIO};
 
@@ -934,9 +939,17 @@ fn bench_json_patch(criterion: &mut Criterion) {
     }
 }
 
+#[cfg(not(feature = "codspeed"))]
 criterion_group! {
     name = benches;
     config = Criterion::default().with_profiler(PProfProfiler::new(100, Output::Flamegraph(Some(Options::default()))));
+    targets = bench, bench_sequential_jsonb, bench_json_patch
+}
+
+#[cfg(feature = "codspeed")]
+criterion_group! {
+    name = benches;
+    config = Criterion::default();
     targets = bench, bench_sequential_jsonb, bench_json_patch
 }
 
