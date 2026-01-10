@@ -1838,6 +1838,7 @@ impl Limbo {
         (!trimmed.is_empty())
             .then_some(())
             .ok_or_else(|| anyhow!("SQL file \"{}\" is empty", path))?;
+        let _ = content.trim();
 
         let mut query_buffer = String::new();
 
