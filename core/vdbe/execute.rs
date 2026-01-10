@@ -5946,8 +5946,40 @@ pub fn op_function(
                     state.registers[*dest] = Register::Value(Value::Float(0.0));
                 }
                 FtsFunc::Match => {
-                    // Without an FTS index match, return 0 (false) as default
-                    state.registers[*dest] = Register::Value(Value::Integer(0));
+                    // fts_match(col1, col2, ..., query): returns 1 if any column matches query
+                    // Minimum: fts_match(text, query) = 2 args
+                    if arg_count < 2 {
+                        return Err(LimboError::InvalidArgument(
+                            "fts_match requires at least 2 arguments: text, query".to_string(),
+                        ));
+                    }
+
+                    // Last arg is the query, first N-1 args are text columns
+                    let num_text_cols = arg_count - 1;
+                    let query = state.registers[*start_reg + num_text_cols].get_value();
+
+                    if matches!(query, Value::Null) {
+                        state.registers[*dest] = Register::Value(Value::Integer(0));
+                    } else {
+                        let query_str = query.to_string();
+
+                        // Concatenate all text columns with space separator
+                        let est_len = 16;
+                        let mut combined_text = String::with_capacity(num_text_cols * est_len);
+                        for i in 0..num_text_cols {
+                            let text = state.registers[*start_reg + i].get_value();
+                            if !matches!(text, Value::Null) {
+                                if !combined_text.is_empty() {
+                                    combined_text.push(' ');
+                                }
+                                combined_text.push_str(&text.to_string());
+                            }
+                        }
+
+                        let matches =
+                            crate::index_method::fts::fts_match(&combined_text, &query_str);
+                        state.registers[*dest] = Register::Value(Value::Integer(matches.into()));
+                    }
                 }
                 FtsFunc::Highlight => {
                     // fts_highlight(col1, col2, ..., before_tag, after_tag, query)
