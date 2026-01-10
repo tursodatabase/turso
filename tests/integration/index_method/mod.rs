@@ -1829,7 +1829,7 @@ fn test_fts_optimize_index(tmp_db: TempDatabase) {
     // Verify documents are still searchable after optimize
     let rows = limbo_exec_rows(
         &conn,
-        "SELECT id FROM docs WHERE fts_match(title, body, 'Document')",
+        "SELECT id FROM docs WHERE title, body MATCH 'Document'",
     );
     assert_eq!(
         rows.len(),
@@ -1838,10 +1838,7 @@ fn test_fts_optimize_index(tmp_db: TempDatabase) {
     );
 
     // Verify content is correct
-    let rows = limbo_exec_rows(
-        &conn,
-        "SELECT id FROM docs WHERE fts_match(title, body, 'topic')",
-    );
+    let rows = limbo_exec_rows(&conn, "SELECT id FROM docs WHERE title, body MATCH 'topic'");
     assert_eq!(rows.len(), 10, "Should find all documents with 'topic'");
 }
 
@@ -1881,10 +1878,7 @@ fn test_fts_optimize_all_indexes(tmp_db: TempDatabase) {
     );
     assert_eq!(rows.len(), 1, "Should find Rust article");
 
-    let rows = limbo_exec_rows(
-        &conn,
-        "SELECT id FROM posts WHERE fts_match(content, 'Rust')",
-    );
+    let rows = limbo_exec_rows(&conn, "SELECT id FROM posts WHERE content MATCH 'Rust'");
     assert_eq!(rows.len(), 2, "Should find both Rust posts");
 }
 
@@ -2030,7 +2024,7 @@ fn test_fts_with_join(tmp_db: TempDatabase) {
     // Test FTS with JOIN - find articles about 'database' with author names
     let rows = limbo_exec_rows(
         &conn,
-        "SELECT a.id, a.title, u.name FROM articles a JOIN authors u ON a.author_id = u.id WHERE fts_match(a.title, a.body, 'database')",
+        "SELECT a.id, a.title, u.name FROM articles a JOIN authors u ON a.author_id = u.id WHERE a.title, a.body MATCH 'database'",
     );
     assert_eq!(
         rows.len(),
@@ -2067,7 +2061,7 @@ fn test_fts_with_join(tmp_db: TempDatabase) {
     // Test FTS with JOIN and additional WHERE conditions
     let rows = limbo_exec_rows(
         &conn,
-        "SELECT a.id, a.title, u.name FROM articles a JOIN authors u ON a.author_id = u.id WHERE fts_match(a.title, a.body, 'web') AND u.name = 'Bob'",
+        "SELECT a.id, a.title, u.name FROM articles a JOIN authors u ON a.author_id = u.id WHERE a.title, a.body MATCH 'web' AND u.name = 'Bob'",
     );
     assert_eq!(rows.len(), 1, "Should find 1 article about web by Bob");
     let id = match &rows[0][0] {
