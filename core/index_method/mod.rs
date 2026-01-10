@@ -129,15 +129,11 @@ pub trait IndexMethodCursor {
 
     /// Called before transaction commit to flush any pending writes.
     /// This ensures index method writes are persisted as part of the transaction.
-    /// Index methods that batch writes should implement this to flush their buffers.
-    /// Default implementation does nothing (for index methods that don't need it).
     fn pre_commit(&mut self) -> Result<IOResult<()>> {
         Ok(IOResult::Done(()))
     }
 
     /// Optimize the index by merging segments or performing other maintenance.
-    /// For FTS indexes, this triggers Tantivy's segment merge operation.
-    /// Default implementation does nothing (for index methods that don't need it).
     fn optimize(&mut self, _connection: &Arc<Connection>) -> Result<IOResult<()>> {
         Ok(IOResult::Done(()))
     }
@@ -146,15 +142,6 @@ pub trait IndexMethodCursor {
     ///
     /// This method enables the optimizer to make cost-based decisions when choosing
     /// between custom index methods and traditional BTree indexes.
-    ///
-    /// # Arguments
-    /// * `pattern_idx` - The index of the pattern being considered (from IndexMethodDefinition::patterns)
-    /// * `base_table_rows` - Estimated rows in the base table (from ANALYZE statistics if available)
-    ///
-    /// # Returns
-    /// - `Some(estimate)` - Cost estimate for cost-based optimization decisions
-    /// - `None` - No cost estimate available; optimizer should use index method when pattern matches
-    ///   (preserving the pre-cost-estimation behavior of always preferring index methods)
     fn estimate_cost(
         &self,
         pattern_idx: usize,
