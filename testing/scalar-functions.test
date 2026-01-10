@@ -187,6 +187,18 @@ do_execsql_test replace-null {
   select replace('test', null, 'example')
 } {}
 
+do_execsql_test_error_content replace-wrong-arg-count-0 {
+  select replace()
+} {wrong number of arguments to function replace()}
+
+do_execsql_test_error_content replace-wrong-arg-count-2 {
+  select replace('a', 'b')
+} {wrong number of arguments to function replace()}
+
+do_execsql_test_error_content replace-wrong-arg-count-4 {
+  select replace('a', 'b', 'c', 'd')
+} {wrong number of arguments to function replace()}
+
 do_execsql_test hex {
   select hex('limbo')
 } {6C696D626F}

@@ -1858,9 +1858,9 @@ pub fn translate_expr(
                             Ok(target_register)
                         }
                         ScalarFunc::Replace => {
-                            if !args.len() == 3 {
+                            if args.len() != 3 {
                                 crate::bail_parse_error!(
-                                    "function {}() requires exactly 3 arguments",
+                                    "wrong number of arguments to function {}()",
                                     srf.to_string()
                                 )
                             }
