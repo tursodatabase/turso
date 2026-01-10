@@ -116,6 +116,43 @@ pub fn fts_highlight(text: &str, query: &str, before_tag: &str, after_tag: &str)
     result
 }
 
+/// Check if text matches a query by testing for any common terms.
+///
+/// Standalone function that can be used without an FTS index.
+/// It tokenizes both the query and text using Tantivy's default tokenizer,
+/// and returns true if any query terms appear in the text.
+pub fn fts_match(text: &str, query: &str) -> bool {
+    use tantivy::tokenizer::{TextAnalyzer, TokenStream};
+    if text.is_empty() || query.is_empty() {
+        return false;
+    }
+    let mut tokenizer = TextAnalyzer::builder(SimpleTokenizer::default())
+        .filter(tantivy::tokenizer::LowerCaser)
+        .build();
+
+    // Extract query terms (lowercased)
+    let query_terms: HashSet<String> = {
+        let mut terms = HashSet::new();
+        let mut query_stream = tokenizer.token_stream(query);
+        while let Some(token) = query_stream.next() {
+            terms.insert(token.text.to_string());
+        }
+        terms
+    };
+    if query_terms.is_empty() {
+        return false;
+    }
+
+    // Tokenize the text and check if any query terms appear
+    let mut text_stream = tokenizer.token_stream(text);
+    while let Some(token) = text_stream.next() {
+        if query_terms.contains(&token.text) {
+            return true;
+        }
+    }
+    false
+}
+
 /// File classification for hybrid caching strategy.
 /// Determines which files are kept hot in memory vs lazy-loaded on demand.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1061,9 +1098,6 @@ impl Directory for HybridBTreeDirectory {
 }
 
 /// Creates default `KeyInfo` for BTree index columns.
-///
-/// Used when setting up the BTree cursor for the FTS directory storage.
-/// All columns use ascending sort order and binary collation for exact matching.
 fn key_info() -> KeyInfo {
     KeyInfo {
         sort_order: SortOrder::Asc,
@@ -1072,15 +1106,12 @@ fn key_info() -> KeyInfo {
 }
 
 /// Creates an AST `Name` node from a string.
-///
-/// Convenience wrapper for building SQL AST nodes programmatically
-/// when creating the internal FTS storage table and index.
 fn name(name: impl ToString) -> ast::Name {
     ast::Name::exact(name.to_string())
 }
 
 /// Parse field weights from a string like "body=2.0,title=1.0"
-/// Returns a HashMap mapping column names to boost factors
+/// Returns a HashMap mapping column names to tantivy 'boost factors'
 fn parse_field_weights(weights_str: &str, columns: &[IndexColumn]) -> Result<HashMap<String, f32>> {
     let mut weights = HashMap::new();
 
@@ -1121,13 +1152,11 @@ fn parse_field_weights(weights_str: &str, columns: &[IndexColumn]) -> Result<Has
             )));
         }
 
-        // Parse weight as f32
         let weight: f32 = weight_str.parse().map_err(|_| {
             LimboError::ParseError(format!(
                 "invalid weight value '{weight_str}' for column '{col_name}'. Expected a number (e.g., 2.0)",
             ))
         })?;
-
         if weight <= 0.0 {
             return Err(LimboError::ParseError(format!(
                 "weight for column '{col_name}' must be positive, got {weight}",
@@ -1372,13 +1401,16 @@ const NOTNULL_CONSTRAINT: ast::NamedColumnConstraint = ast::NamedColumnConstrain
 };
 
 fn initialize_btree_storage_table(conn: &Arc<Connection>, table_name: &str) -> Result<()> {
+    const PATH_COLUMN: &str = "path";
+    const CHUNK_NO_COLUMN: &str = "chunk_no";
+    const BYTES_COLUMN: &str = "bytes";
     // inline ast to reduce parsing overhead
     // CREATE TABLE table_name (path TEXT NOT NULL, chunk_no INTEGER NOT NULL, bytes BLOB NOT NULL);
     let create_table_stmt = ast::Stmt::CreateTable {
         body: ast::CreateTableBody::ColumnsAndConstraints {
             columns: vec![
                 ast::ColumnDefinition {
-                    col_name: name("path"),
+                    col_name: name(PATH_COLUMN),
                     col_type: Some(ast::Type {
                         name: "TEXT".to_string(),
                         size: None,
@@ -1386,7 +1418,7 @@ fn initialize_btree_storage_table(conn: &Arc<Connection>, table_name: &str) -> R
                     constraints: vec![NOTNULL_CONSTRAINT],
                 },
                 ast::ColumnDefinition {
-                    col_name: name("chunk_no"),
+                    col_name: name(CHUNK_NO_COLUMN),
                     col_type: Some(ast::Type {
                         name: "INTEGER".to_string(),
                         size: None,
@@ -1394,7 +1426,7 @@ fn initialize_btree_storage_table(conn: &Arc<Connection>, table_name: &str) -> R
                     constraints: vec![NOTNULL_CONSTRAINT],
                 },
                 ast::ColumnDefinition {
-                    col_name: name("bytes"),
+                    col_name: name(BYTES_COLUMN),
                     col_type: Some(ast::Type {
                         name: "BLOB".to_string(),
                         size: None,
@@ -1417,20 +1449,20 @@ fn initialize_btree_storage_table(conn: &Arc<Connection>, table_name: &str) -> R
         if_not_exists: true,
         idx_name: ast::QualifiedName::single(name(format!("{table_name}_key"))),
         tbl_name: name(table_name),
-        using: Some(name("backing_btree")),
+        using: Some(name(super::BACKING_BTREE_INDEX_METHOD_NAME)),
         columns: vec![
             ast::SortedColumn {
-                expr: Box::new(ast::Expr::Name(name("path"))),
+                expr: Box::new(ast::Expr::Name(name(PATH_COLUMN))),
                 order: None,
                 nulls: None,
             },
             ast::SortedColumn {
-                expr: Box::new(ast::Expr::Name(name("chunk_no"))),
+                expr: Box::new(ast::Expr::Name(name(CHUNK_NO_COLUMN))),
                 order: None,
                 nulls: None,
             },
             ast::SortedColumn {
-                expr: Box::new(ast::Expr::Name(name("bytes"))),
+                expr: Box::new(ast::Expr::Name(name(BYTES_COLUMN))),
                 order: None,
                 nulls: None,
             },

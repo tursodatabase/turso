@@ -565,6 +565,7 @@ pub fn join_lhs_and_rhs<'a>(
 
     // Check if there's an index method candidate for this table (e.g., FTS)
     // and compare its cost against the current best access method.
+    let mut index_method_estimated_rows: Option<u64> = None;
     if let Some(candidate) = index_method_candidates
         .iter()
         .find(|c| c.table_idx == rhs_table_number)
@@ -587,6 +588,8 @@ pub fn join_lhs_and_rhs<'a>(
                         where_covered: candidate.where_covered,
                     },
                 };
+                // Track index_method estimated_rows for output cardinality
+                index_method_estimated_rows = Some(cost_estimate.estimated_rows);
             }
         }
     }
@@ -606,8 +609,15 @@ pub fn join_lhs_and_rhs<'a>(
     // Produce a number of rows estimated to be returned when this table is filtered by the WHERE clause.
     // If this table is the rightmost table in the join order, we multiply by the input cardinality,
     // which is the output cardinality of the previous tables.
-    let output_cardinality =
-        (input_cardinality as f64 * *rhs_base_rows * output_cardinality_multiplier).ceil() as usize;
+    //
+    // If an index method was selected, use its estimated_rows instead of the base table estimate
+    let output_cardinality = if let Some(estimated_rows) = index_method_estimated_rows {
+        // When index_method is outer (input_cardinality=1), use the estimated_rows directly
+        // If it's inner, multiply by input_cardinality (each outer row triggers FTS)
+        (input_cardinality as f64 * estimated_rows as f64).ceil() as usize
+    } else {
+        (input_cardinality as f64 * *rhs_base_rows * output_cardinality_multiplier).ceil() as usize
+    };
 
     Ok(Some(JoinN {
         data: best_access_methods,
