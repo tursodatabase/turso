@@ -22,6 +22,8 @@ pub struct Remaining {
     pub alter_table: u32,
     pub drop_index: u32,
     pub pragma_count: u32,
+    pub create_matview: u32,
+    pub enable_cdc: u32,
 }
 
 impl Remaining {
@@ -44,6 +46,8 @@ impl Remaining {
         let total_alter_table = (max_interactions * opts.alter_table_weight) / total_weight;
         let total_drop_index = (max_interactions * opts.drop_index) / total_weight;
         let total_pragma = (max_interactions * opts.pragma_weight) / total_weight;
+        let total_create_matview = (max_interactions * opts.create_matview_weight) / total_weight;
+        let total_enable_cdc = (max_interactions * opts.enable_cdc_weight) / total_weight;
 
         let remaining_select = total_select
             .checked_sub(stats.select_count)
@@ -91,6 +95,13 @@ impl Remaining {
             remaining_drop_index = 0;
         }
 
+        let remaining_create_matview = total_create_matview
+            .checked_sub(stats.create_matview_count)
+            .unwrap_or_default();
+        let remaining_enable_cdc = total_enable_cdc
+            .checked_sub(stats.enable_cdc_count)
+            .unwrap_or_default();
+
         Remaining {
             select: remaining_select,
             insert: remaining_insert,
@@ -102,6 +113,8 @@ impl Remaining {
             alter_table: remaining_alter_table,
             drop_index: remaining_drop_index,
             pragma_count: remaining_pragma,
+            create_matview: remaining_create_matview,
+            enable_cdc: remaining_enable_cdc,
         }
     }
 }
@@ -121,6 +134,8 @@ pub(crate) struct InteractionStats {
     pub alter_table_count: u32,
     pub drop_index_count: u32,
     pub pragma_count: u32,
+    pub create_matview_count: u32,
+    pub enable_cdc_count: u32,
 }
 
 impl InteractionStats {
@@ -148,7 +163,19 @@ impl InteractionStats {
             Query::AlterTable(_) => self.alter_table_count += 1,
             Query::DropIndex(_) => self.drop_index_count += 1,
             Query::Placeholder => {}
-            Query::Pragma(_) => self.pragma_count += 1,
+            Query::Pragma(pragma) => {
+                self.pragma_count += 1;
+                if matches!(
+                    pragma,
+                    sql_generation::model::query::pragma::Pragma::CaptureDataChanges(_)
+                ) {
+                    self.enable_cdc_count += 1;
+                }
+            }
+            Query::CreateView(_) => {}
+            Query::CreateMaterializedView(_) => self.create_matview_count += 1,
+            Query::DropView(_) => {}
+            Query::DropMaterializedView(_) => {}
         }
     }
 }
@@ -157,7 +184,7 @@ impl Display for InteractionStats {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(
             f,
-            "Read: {}, Insert: {}, Delete: {}, Update: {}, Create: {}, CreateIndex: {}, Drop: {}, Begin: {}, Commit: {}, Rollback: {}, Alter Table: {}, Drop Index: {}",
+            "Read: {}, Insert: {}, Delete: {}, Update: {}, Create: {}, CreateIndex: {}, Drop: {}, Begin: {}, Commit: {}, Rollback: {}, Alter Table: {}, Drop Index: {}, CreateMatview: {}, EnableCDC: {}",
             self.select_count,
             self.insert_count,
             self.delete_count,
@@ -170,6 +197,8 @@ impl Display for InteractionStats {
             self.rollback_count,
             self.alter_table_count,
             self.drop_index_count,
+            self.create_matview_count,
+            self.enable_cdc_count,
         )
     }
 }
