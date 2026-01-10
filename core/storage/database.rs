@@ -122,7 +122,7 @@ impl DatabaseStorage for DatabaseFile {
                     Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
                         let Ok((buf, bytes_read)) = res else {
                             tracing::error!(err = ?res.unwrap_err());
-                            return;
+                            return None;
                         };
                         assert!(
                             bytes_read > 0,
@@ -145,6 +145,7 @@ impl DatabaseStorage for DatabaseFile {
                                 original_c.error(CompletionError::DecryptionError { page_idx });
                             }
                         }
+                        None
                     });
                 let wrapped_completion = Completion::new_read(read_buffer, decrypt_complete);
                 self.file.pread(pos, wrapped_completion)
@@ -157,12 +158,12 @@ impl DatabaseStorage for DatabaseFile {
                 let verify_complete =
                     Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
                         let Ok((buf, bytes_read)) = res else {
-                            return;
+                            return None;
                         };
                         if bytes_read <= 0 {
                             tracing::trace!("Read page {page_idx} with {} bytes", bytes_read);
                             original_c.complete(bytes_read);
-                            return;
+                            return None;
                         }
                         match checksum_ctx.verify_checksum(buf.as_mut_slice(), page_idx) {
                             Ok(_) => {
@@ -179,6 +180,7 @@ impl DatabaseStorage for DatabaseFile {
                                 original_c.error(e);
                             }
                         }
+                        None
                     });
 
                 let wrapped_completion = Completion::new_read(read_buffer, verify_complete);

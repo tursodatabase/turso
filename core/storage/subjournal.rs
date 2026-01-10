@@ -71,9 +71,21 @@ impl Subjournal {
         let c = Completion::new_read(
             page_id_buffer,
             move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
-                let Ok((_buffer, _bytes_read)) = res else {
-                    return;
+                let Ok((buf, bytes_read)) = res else {
+                    return None;
                 };
+                let expected = buf.len();
+                if bytes_read != expected as i32 {
+                    tracing::error!(
+                        "subjournal short read: expected {expected} bytes, got {bytes_read}"
+                    );
+                    return Some(CompletionError::ShortRead {
+                        page_idx: 0, // reading page number header, not a page
+                        expected,
+                        actual: bytes_read as usize,
+                    });
+                }
+                None
             },
         );
         let c = self.file.pread(offset, c)?;
@@ -95,13 +107,21 @@ impl Subjournal {
             buffer,
             move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
                 let Ok((buf, bytes_read)) = res else {
-                    return;
+                    return None;
                 };
-                assert!(
-                    bytes_read == page_size as i32,
-                    "bytes_read should be page_size"
-                );
-                finish_read_page(page.get().id, buf, page.clone());
+                let page_idx = page.get().id;
+                if bytes_read != page_size as i32 {
+                    tracing::error!(
+                        "subjournal short read on page {page_idx}: expected {page_size} bytes, got {bytes_read}"
+                    );
+                    return Some(CompletionError::ShortRead {
+                        page_idx,
+                        expected: page_size,
+                        actual: bytes_read as usize,
+                    });
+                }
+                finish_read_page(page_idx, buf, page.clone());
+                None
             },
         );
         let c = self.file.pread(offset, c)?;

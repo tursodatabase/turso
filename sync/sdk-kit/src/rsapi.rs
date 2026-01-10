@@ -138,6 +138,7 @@ pub struct TursoDatabaseSync<TBytes: AsRef<[u8]> + Send + Sync + 'static> {
     db_io: Option<Arc<dyn IO>>,
 }
 
+#[allow(unused_variables)]
 fn persistent_io(partial: bool) -> Result<Arc<dyn IO>, turso_sync_engine::errors::Error> {
     #[cfg(target_os = "linux")]
     {

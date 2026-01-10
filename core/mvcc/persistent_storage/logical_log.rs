@@ -307,7 +307,7 @@ impl StreamingLogicalLogReader {
             let mut header = header.write();
             let Ok((buf, bytes_read)) = res else {
                 tracing::error!("couldn't ready log err={:?}", res,);
-                return;
+                return None;
             };
             if bytes_read != LOG_HEADER_MAX_SIZE as i32 {
                 tracing::error!(
@@ -315,7 +315,7 @@ impl StreamingLogicalLogReader {
                     bytes_read,
                     LOG_HEADER_MAX_SIZE
                 );
-                return;
+                return None;
             }
             let buf = buf.as_slice();
             header.version = buf[0];
@@ -324,6 +324,7 @@ impl StreamingLogicalLogReader {
             ]);
             header.encrypted = buf[9];
             tracing::trace!("LogicalLog header={:?}", header);
+            None
         });
         let c = Completion::new_read(header_buf, completion);
         self.offset += LOG_HEADER_MAX_SIZE;
@@ -610,6 +611,7 @@ impl StreamingLogicalLogReader {
                 if bytes_read > 0 {
                     buffer.extend_from_slice(&buf[..bytes_read as usize]);
                 }
+                None
             });
             let c = Completion::new_read(header_buf, completion);
             let c = self.file.pread(self.offset as u64, c)?;

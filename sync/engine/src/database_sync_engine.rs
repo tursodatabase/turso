@@ -143,7 +143,10 @@ async fn full_read<Ctx, IO: SyncEngineIo>(
     loop {
         let c = Completion::new_read(buffer.clone(), {
             let read_len = read_len.clone();
-            move |r| *read_len.lock().unwrap() = r.expect("memory io must not fail").1
+            move |r| {
+                *read_len.lock().unwrap() = r.expect("memory io must not fail").1;
+                None
+            }
         });
         let read = file.pread(offset, c).expect("memory io must not fail");
         assert!(read.finished(), "memory io must complete immediately");

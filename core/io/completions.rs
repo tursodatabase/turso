@@ -11,7 +11,10 @@ use crate::sync::Mutex;
 
 use crate::{Buffer, CompletionError};
 
-pub type ReadComplete = dyn Fn(Result<(Arc<Buffer>, i32), CompletionError>) + Send + Sync;
+/// Callback for read completions. Returns `Some(error)` if the callback detects an error
+/// (e.g., short read), which will be stored in the completion and propagated to VDBE.
+pub type ReadComplete =
+    dyn Fn(Result<(Arc<Buffer>, i32), CompletionError>) -> Option<CompletionError> + Send + Sync;
 pub type WriteComplete = dyn Fn(Result<i32, CompletionError>) + Send + Sync;
 pub type SyncComplete = dyn Fn(Result<i32, CompletionError>) + Send + Sync;
 pub type TruncateComplete = dyn Fn(Result<i32, CompletionError>) + Send + Sync;
@@ -281,7 +284,10 @@ impl Completion {
 
     pub fn new_read<F>(buf: Arc<Buffer>, complete: F) -> Self
     where
-        F: Fn(Result<(Arc<Buffer>, i32), CompletionError>) + Send + Sync + 'static,
+        F: Fn(Result<(Arc<Buffer>, i32), CompletionError>) -> Option<CompletionError>
+            + Send
+            + Sync
+            + 'static,
     {
         Self::new(CompletionType::Read(ReadCompletion::new(
             buf,
@@ -388,18 +394,35 @@ impl Completion {
     fn callback(&self, result: Result<i32, CompletionError>) {
         let inner = self.get_inner();
         inner.result.get_or_init(|| {
-            match &inner.completion_type {
+            // Run the type-specific callback. For ReadCompletion, this returns
+            // an optional error detected by the callback (e.g., short read).
+            let callback_error = match &inner.completion_type {
                 CompletionType::Read(r) => r.callback(result),
-                CompletionType::Write(w) => w.callback(result),
-                CompletionType::Sync(s) => s.callback(result), // fix
-                CompletionType::Truncate(t) => t.callback(result),
-                CompletionType::Group(g) => g.callback(result),
-                CompletionType::Yield => {}
+                CompletionType::Write(w) => {
+                    w.callback(result);
+                    None
+                }
+                CompletionType::Sync(s) => {
+                    s.callback(result);
+                    None
+                }
+                CompletionType::Truncate(t) => {
+                    t.callback(result);
+                    None
+                }
+                CompletionType::Group(g) => {
+                    g.callback(result);
+                    None
+                }
+                CompletionType::Yield => None,
             };
+
+            // Use callback error if present, otherwise use the original IO error
+            let final_error = callback_error.or_else(|| result.err());
 
             if let Some(group) = inner.parent.get() {
                 // Capture first error in group
-                if let Err(err) = result {
+                if let Some(err) = final_error {
                     let _ = group.result.set(Some(err));
                 }
                 let prev = group.outstanding.fetch_sub(1, Ordering::SeqCst);
@@ -422,7 +445,7 @@ impl Completion {
                 }
             }
 
-            result.err()
+            final_error
         });
         // call the waker regardless
         inner.context.wake();
@@ -466,8 +489,8 @@ impl ReadCompletion {
         &self.buf
     }
 
-    pub fn callback(&self, bytes_read: Result<i32, CompletionError>) {
-        (self.complete)(bytes_read.map(|b| (self.buf.clone(), b)));
+    pub fn callback(&self, bytes_read: Result<i32, CompletionError>) -> Option<CompletionError> {
+        (self.complete)(bytes_read.map(|b| (self.buf.clone(), b)))
     }
 
     pub fn buf_arc(&self) -> Arc<Buffer> {
@@ -1018,7 +1041,7 @@ mod tests {
     #[test]
     fn test_read_completion_pending_status() {
         let buf = Arc::new(crate::Buffer::new_temporary(4096));
-        let c = Completion::new_read(buf, |_| {});
+        let c = Completion::new_read(buf, |_| None);
 
         assert!(!c.finished());
         assert!(!c.succeeded());
@@ -1029,7 +1052,7 @@ mod tests {
     #[test]
     fn test_read_completion_success() {
         let buf = Arc::new(crate::Buffer::new_temporary(4096));
-        let c = Completion::new_read(buf, |_| {});
+        let c = Completion::new_read(buf, |_| None);
 
         c.complete(1024);
 
@@ -1042,7 +1065,7 @@ mod tests {
     #[test]
     fn test_read_completion_failure() {
         let buf = Arc::new(crate::Buffer::new_temporary(4096));
-        let c = Completion::new_read(buf, |_| {});
+        let c = Completion::new_read(buf, |_| None);
 
         c.error(CompletionError::Aborted);
 
