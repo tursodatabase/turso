@@ -184,6 +184,26 @@ pub enum Property {
     Queries {
         queries: Vec<Query>,
     },
+    /// IvmConsistency tests that incremental view maintenance produces the
+    /// same results as recomputing a materialized view from scratch.
+    /// The execution of the property is as follows:
+    ///     BEGIN IMMEDIATE
+    ///     DML_0 (INSERT/UPDATE/DELETE on base tables)
+    ///     DML_1
+    ///     ...
+    ///     DML_n
+    ///     COMMIT
+    ///     SELECT * FROM <matview_name>
+    ///     <view_definition> (fresh computation)
+    ///     ASSERT results match
+    IvmConsistency {
+        /// Name of the materialized view being tested
+        matview_name: String,
+        /// The SELECT that defines the view (for fresh computation)
+        view_definition: Select,
+        /// DML queries to execute in transaction (trigger IVM)
+        dml_queries: Vec<Query>,
+    },
 }
 
 impl Property {
@@ -203,6 +223,7 @@ impl Property {
                 | Property::DeleteSelect { .. }
                 | Property::DropSelect { .. }
                 | Property::Queries { .. }
+                | Property::IvmConsistency { .. }
         )
     }
 
@@ -213,6 +234,7 @@ impl Property {
             | Property::DeleteSelect { queries, .. }
             | Property::DropSelect { queries, .. }
             | Property::Queries { queries } => Some(queries),
+            Property::IvmConsistency { dml_queries, .. } => Some(dml_queries),
             Property::FsyncNoWait { .. } | Property::FaultyQuery { .. } => None,
             Property::SelectLimit { .. }
             | Property::SelectSelectOptimizer { .. }

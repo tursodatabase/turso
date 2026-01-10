@@ -46,6 +46,9 @@ pub struct QueryProfile {
     /// Probability of committing when in transaction (0.0-1.0)
     #[garde(skip)]
     pub transaction_batch_commit_probability: f64,
+    /// Enable coordinated materialized view scenario (setup base tables + matviews first)
+    #[garde(skip)]
+    pub enable_coordinated_matview_scenario: bool,
 }
 
 impl Default for QueryProfile {
@@ -69,6 +72,7 @@ impl Default for QueryProfile {
             enable_transaction_batching: true,
             transaction_batch_start_probability: 0.3,
             transaction_batch_commit_probability: 0.3,
+            enable_coordinated_matview_scenario: false,
         }
     }
 }

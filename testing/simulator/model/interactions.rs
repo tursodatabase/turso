@@ -40,6 +40,9 @@ pub(crate) struct InteractionPlan {
     /// Tracks which connection has a pending (generated but not executed) transaction.
     /// Used in non-MVCC mode to prevent generating nested transactions.
     pending_txn_conn: Option<usize>,
+
+    /// Pending setup queries for coordinated matview scenario
+    pub coordinated_matview_scenario_queries: Option<Vec<Query>>,
 }
 
 impl InteractionPlan {
@@ -52,6 +55,7 @@ impl InteractionPlan {
             len_properties: 0,
             next_interaction_id: NonZeroUsize::new(1).unwrap(),
             pending_txn_conn: None,
+            coordinated_matview_scenario_queries: None,
         }
     }
 
