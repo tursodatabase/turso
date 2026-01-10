@@ -192,6 +192,7 @@ fn emit_compound_select(
                 if matches!(
                     right_most.query_destination,
                     QueryDestination::EphemeralIndex { .. }
+                        | QueryDestination::CoroutineYield { .. }
                 ) {
                     plan.query_destination = right_most.query_destination.clone();
                 }

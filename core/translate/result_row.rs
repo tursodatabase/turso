@@ -9,7 +9,7 @@ use crate::{
 
 use super::{
     emitter::{LimitCtx, Resolver},
-    expr::translate_expr,
+    expr::{translate_expr, translate_expr_no_constant_opt, NoConstantOptReason},
     plan::{Distinctness, QueryDestination, SelectPlan},
 };
 
@@ -34,6 +34,18 @@ pub fn emit_select_result(
     }
 
     let start_reg = reg_result_cols_start;
+    // For compound selects (UNION, UNION ALL, etc.), multiple subselects may share the same
+    // result column registers. If constants are moved to the init section, they can be
+    // overwritten by subsequent subselects before being used.
+    //
+    // We conservatively disable constant optimization for EphemeralIndex and CoroutineYield
+    // destinations because these are used in compound select contexts. This is slightly
+    // over-broad (e.g., simple INSERT INTO ... SELECT with no UNION doesn't need this),
+    // but we lack context here to distinguish compound vs non-compound cases.
+    let disable_constant_opt = matches!(
+        plan.query_destination,
+        QueryDestination::EphemeralIndex { .. } | QueryDestination::CoroutineYield { .. }
+    );
     for (i, rc) in plan.result_columns.iter().enumerate().filter(|(_, rc)| {
         // For aggregate queries, we handle columns differently; example: select id, first_name, sum(age) from users limit 1;
         // 1. Columns with aggregates (e.g., sum(age)) are computed in each iteration of aggregation
@@ -45,13 +57,24 @@ pub fn emit_select_result(
             || reg_nonagg_emit_once_flag.is_none()
     }) {
         let reg = start_reg + i;
-        translate_expr(
-            program,
-            Some(&plan.table_references),
-            &rc.expr,
-            reg,
-            resolver,
-        )?;
+        if disable_constant_opt {
+            translate_expr_no_constant_opt(
+                program,
+                Some(&plan.table_references),
+                &rc.expr,
+                reg,
+                resolver,
+                NoConstantOptReason::RegisterReuse,
+            )?;
+        } else {
+            translate_expr(
+                program,
+                Some(&plan.table_references),
+                &rc.expr,
+                reg,
+                resolver,
+            )?;
+        }
     }
 
     // Handle SELECT DISTINCT deduplication
