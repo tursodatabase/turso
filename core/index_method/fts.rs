@@ -28,7 +28,10 @@ use tantivy::{
     },
     merge_policy::NoMergePolicy,
     schema::{Field, Schema, Value as TantivySchemaValue},
-    tokenizer::{NgramTokenizer, RawTokenizer, SimpleTokenizer, WhitespaceTokenizer},
+    tokenizer::{
+        NgramTokenizer, RawTokenizer, SimpleTokenizer, TextAnalyzer, TokenStream,
+        WhitespaceTokenizer,
+    },
     DocAddress, HasLen, Index, IndexReader, IndexSettings, IndexWriter, Searcher, TantivyDocument,
 };
 use turso_parser::ast::{self, Select, SortOrder};
@@ -62,7 +65,6 @@ pub const DEFAULT_CHUNK_CACHE_BYTES: usize = 128 * 1024 * 1024;
 /// It tokenizes both the query and text using Tantivy's default tokenizer,
 /// finds matching terms, and wraps them with the specified tags.
 pub fn fts_highlight(text: &str, query: &str, before_tag: &str, after_tag: &str) -> String {
-    use tantivy::tokenizer::{TextAnalyzer, TokenStream};
     if text.is_empty() || query.is_empty() {
         return text.to_string();
     }
@@ -122,7 +124,6 @@ pub fn fts_highlight(text: &str, query: &str, before_tag: &str, after_tag: &str)
 /// It tokenizes both the query and text using Tantivy's default tokenizer,
 /// and returns true if any query terms appear in the text.
 pub fn fts_match(text: &str, query: &str) -> bool {
-    use tantivy::tokenizer::{TextAnalyzer, TokenStream};
     if text.is_empty() || query.is_empty() {
         return false;
     }
@@ -170,6 +171,7 @@ enum FileCategory {
 impl FileCategory {
     const METADATA_FILES: [&'static str; 3] = [TANTIVY_META_FILE, ".managed.json", ".lock"];
     /// Classify a file based on its path/extension.
+    /// https://fulmicoton.gitbooks.io/tantivy-doc/content/index-files.html
     fn from_path(path: &Path) -> Self {
         let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
@@ -186,7 +188,7 @@ impl FileCategory {
             "fast" | "fieldnorm" => FileCategory::FastFields,
             // Segment data - large, lazy-loaded
             "idx" | "pos" | "store" => FileCategory::SegmentData,
-            "lock" => FileCategory::Metadata,
+            "lock" | "info" => FileCategory::Metadata,
             // Default to segment data (lazy-loaded)
             _ => FileCategory::SegmentData,
         }
