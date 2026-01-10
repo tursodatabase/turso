@@ -186,6 +186,8 @@ impl Statement {
                     waker.wake_by_ref();
                 }
                 res = Ok(StepResult::IO);
+                #[cfg(shuttle)]
+                crate::thread::spin_loop();
             }
             // else: Handler says stop, res stays as Busy
         }
