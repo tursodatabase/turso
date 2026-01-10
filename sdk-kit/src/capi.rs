@@ -209,6 +209,27 @@ pub extern "C" fn turso_connection_close(
 
 #[no_mangle]
 #[signature(c)]
+pub extern "C" fn turso_connection_snapshot(
+    connection: *const c::turso_connection_t,
+    output_path: *const std::ffi::c_char,
+    error_opt_out: *mut *const std::ffi::c_char,
+) -> c::turso_status_code_t {
+    let output_path = match unsafe { str_from_c_str(output_path) } {
+        Ok(path) => path,
+        Err(err) => return unsafe { err.to_capi(error_opt_out) },
+    };
+    let connection = match unsafe { TursoConnection::ref_from_capi(connection) } {
+        Ok(connection) => connection,
+        Err(err) => return unsafe { err.to_capi(error_opt_out) },
+    };
+    match connection.snapshot(output_path) {
+        Ok(()) => c::turso_status_code_t::TURSO_OK,
+        Err(err) => unsafe { err.to_capi(error_opt_out) },
+    }
+}
+
+#[no_mangle]
+#[signature(c)]
 pub extern "C" fn turso_statement_run_io(
     statement: *const c::turso_statement_t,
     error_opt_out: *mut *const std::ffi::c_char,

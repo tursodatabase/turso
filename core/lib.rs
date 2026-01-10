@@ -2027,6 +2027,109 @@ impl Connection {
         }
     }
 
+    /// Create a point-in-time snapshot of the database by copying the database file.
+    #[cfg(feature = "fs")]
+    pub fn snapshot(self: &Arc<Self>, output_path: &str) -> Result<()> {
+        self._snapshot_copy_file(output_path)
+    }
+
+    /// Create a point-in-time snapshot of the database by copying the database file.
+    ///
+    /// This function:
+    /// 1. Performs a TRUNCATE checkpoint to flush all WAL data to the database file
+    /// 2. Acquires a read lock to prevent other checkpoints during copy
+    /// 3. Copies the database file (new writes go to WAL, not DB file)
+    /// 4. Releases the read lock
+    #[cfg(feature = "fs")]
+    fn _snapshot_copy_file(self: &Arc<Self>, output_path: &str) -> Result<()> {
+        use crate::util::MEMORY_PATH;
+        use std::path::Path;
+
+        if self.is_closed() {
+            return Err(LimboError::InternalError("Connection closed".to_string()));
+        }
+
+        // FIXME: enable mvcc
+        if self.mvcc_enabled() {
+            return Err(LimboError::InternalError(
+                "Snapshot not yet supported with MVCC mode".to_string(),
+            ));
+        }
+
+        // Cannot snapshot in-memory databases
+        if self.db.path == MEMORY_PATH {
+            return Err(LimboError::InvalidArgument(
+                "Cannot snapshot in-memory database".to_string(),
+            ));
+        }
+
+        let path = Path::new(output_path);
+        if path.exists() {
+            return Err(LimboError::InvalidArgument(format!(
+                "Output file already exists: {output_path}"
+            )));
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| {
+                LimboError::InternalError(format!("Failed to create parent directory: {e}"))
+            })?;
+        }
+
+        let pager = self.pager.load();
+        let Some(wal) = pager.wal.as_ref() else {
+            return Err(LimboError::InternalError(
+                "Cannot snapshot database without WAL".to_string(),
+            ));
+        };
+
+        // There is a race condition after checkpointing and before copying database file.
+        // Another checkpoint may run in this window and we may end up with corrupted db file
+        // To prevent checkpoint to run in this window, we will try to acquire read lock with slot 0
+        // Holding slot 0 blocks ALL checkpoints (they need exclusive read_locks[0]).
+
+        // Retry loop: TRUNCATE checkpoint + begin_read_tx until we acquire slot 0.
+        const MAX_RETRIES: u32 = 10;
+        for attempt in 0..MAX_RETRIES {
+            // TRUNCATE checkpoint - flushes all WAL data to DB file and empties WAL
+            let _ = pager.blocking_checkpoint(
+                CheckpointMode::Truncate {
+                    upper_bound_inclusive: None,
+                },
+                self.get_sync_mode(),
+            )?;
+
+            // Immediately try to acquire read lock
+            pager.begin_read_tx()?;
+
+            // Check if we got slot 0 (WAL was still empty, no writer snuck in)
+            if wal.get_read_lock_slot() == Some(0) {
+                break; // Success - slot 0 blocks all checkpoints
+            }
+
+            // A writer snuck in between TRUNCATE and begin_read_tx - we got slot 1-4
+            // This doesn't fully protect against other checkpoints, so retry
+            wal.end_read_tx();
+
+            if attempt == MAX_RETRIES - 1 {
+                return Err(LimboError::Busy);
+            }
+        }
+
+        // Copy the database file
+        let result = (|| -> Result<()> {
+            let source_path = Path::new(&self.db.path);
+            std::fs::copy(source_path, path).map_err(|e| {
+                LimboError::InternalError(format!("Failed to copy database file: {e}"))
+            })?;
+            Ok(())
+        })();
+
+        // Release read lock
+        wal.end_read_tx();
+
+        result
+    }
+
     /// Close a connection and checkpoint.
     pub fn close(&self) -> Result<()> {
         if self.is_closed() {

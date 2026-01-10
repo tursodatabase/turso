@@ -191,12 +191,12 @@ pub struct ApplyWriter<'a> {
 }
 
 impl<'a> ApplyWriter<'a> {
-    pub fn new(target: &'a Arc<turso_core::Connection>) -> Self {
-        Self {
-            target,
-            buf: Vec::new(),
-        }
-    }
+    // pub fn new(target: &'a Arc<turso_core::Connection>) -> Self {
+    //     Self {
+    //         target,
+    //         buf: Vec::new(),
+    //     }
+    // }
 
     // Find the next statement terminator ;\n or ;\r\n in a byte buffer.
     // Returns (end_idx_inclusive, drain_len), where drain_len includes the newline(s).
@@ -231,21 +231,21 @@ impl<'a> ApplyWriter<'a> {
     }
 
     // Handle final trailing statement that ends with ';' followed only by ASCII whitespace.
-    pub fn finish(mut self) -> io::Result<()> {
-        // Skip if buffer empty or no ';'
-        if let Some(semicolon_pos) = self.buf.iter().rposition(|&b| b == b';') {
-            // Are all bytes after ';' ASCII whitespace?
-            if self.buf[semicolon_pos + 1..]
-                .iter()
-                .all(|&b| matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
-            {
-                let stmt_bytes = self.buf[..=semicolon_pos].to_vec();
-                self.buf.clear();
-                self.exec_stmt_bytes(&stmt_bytes)?;
-            }
-        }
-        Ok(())
-    }
+    // pub fn finish(mut self) -> io::Result<()> {
+    //     // Skip if buffer empty or no ';'
+    //     if let Some(semicolon_pos) = self.buf.iter().rposition(|&b| b == b';') {
+    //         // Are all bytes after ';' ASCII whitespace?
+    //         if self.buf[semicolon_pos + 1..]
+    //             .iter()
+    //             .all(|&b| matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
+    //         {
+    //             let stmt_bytes = self.buf[..=semicolon_pos].to_vec();
+    //             self.buf.clear();
+    //             self.exec_stmt_bytes(&stmt_bytes)?;
+    //         }
+    //     }
+    // Ok(())
+    // }
 
     fn exec_stmt_bytes(&self, stmt_bytes: &[u8]) -> io::Result<()> {
         // SQL must be UTF-8. If not, surface a clear error.
