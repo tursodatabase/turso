@@ -10,6 +10,12 @@ repository.workspace = true
 description = "The Limbo stress tester"
 publish = false
 
+[lints]
+workspace = true
+
+[lib]
+path = "lib.rs"
+
 [[bin]]
 name = "turso_stress"
 path = "main.rs"
@@ -29,3 +35,7 @@ tracing-appender = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
 turso = { workspace = true }
 rusqlite = { workspace = true }
+
+[target.'cfg(shuttle)'.dependencies]
+shuttle = { workspace = true }
+
