@@ -6,6 +6,8 @@ use turso_parser::ast::{self, Expr, SubqueryType, UnaryOperator};
 use super::emitter::Resolver;
 use super::optimizer::Optimizable;
 use super::plan::TableReferences;
+#[cfg(feature = "fts")]
+use crate::function::FtsFunc;
 #[cfg(feature = "json")]
 use crate::function::JsonFunc;
 use crate::function::{Func, FuncCtx, MathFuncArity, ScalarFunc, VectorFunc};
@@ -3465,7 +3467,28 @@ fn translate_like_base(
                 },
             });
         }
-        ast::LikeOperator::Match => crate::bail_parse_error!("MATCH in LIKE is not supported"),
+        #[cfg(feature = "fts")]
+        ast::LikeOperator::Match => {
+            // Transform `lhs MATCH rhs` to `fts_match(lhs, rhs)`
+            // where lhs is the text column(s) and rhs is the query string
+            let arg_count = 2;
+            let start_reg = program.alloc_registers(arg_count);
+            translate_expr(program, referenced_tables, lhs, start_reg, resolver)?;
+            translate_expr(program, referenced_tables, rhs, start_reg + 1, resolver)?;
+            program.emit_insn(Insn::Function {
+                constant_mask: 0,
+                start_reg,
+                dest: target_register,
+                func: FuncCtx {
+                    func: Func::Fts(FtsFunc::Match),
+                    arg_count,
+                },
+            });
+        }
+        #[cfg(not(feature = "fts"))]
+        ast::LikeOperator::Match => {
+            crate::bail_parse_error!("MATCH requires the 'fts' feature to be enabled")
+        }
         ast::LikeOperator::Regexp => crate::bail_parse_error!("REGEXP in LIKE is not supported"),
     }
 

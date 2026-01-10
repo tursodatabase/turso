@@ -1,24 +1,9 @@
-use std::{
-    cmp::Ordering,
-    collections::{HashMap, HashSet, VecDeque},
-    sync::Arc,
-};
-
-use constraints::{
-    constraints_from_where_clause, usable_constraints_for_join_order, Constraint, ConstraintRef,
-};
-use cost::{Cost, ESTIMATED_HARDCODED_ROWS_PER_TABLE};
-use join::{compute_best_join_order, BestJoinOrderResult};
-use lift_common_subexpressions::lift_common_subexpressions_from_binary_or_terms;
-use order::{compute_order_target, plan_satisfies_order_target, EliminatesSortBy};
-use turso_ext::{ConstraintInfo, ConstraintUsage};
-use turso_parser::ast::{self, Expr, SortOrder, TriggerEvent};
-
 use crate::{
     function::Deterministic,
     index_method::IndexMethodCostEstimate,
     schema::{BTreeTable, Index, IndexColumn, Schema, Table, ROWID_SENTINEL},
     translate::{
+        expr::{walk_expr_mut, WalkControl},
         insert::ROWID_COLUMN,
         optimizer::{
             access_method::AccessMethodParams,
@@ -44,6 +29,20 @@ use crate::{
     },
     LimboError, Result,
 };
+use constraints::{
+    constraints_from_where_clause, usable_constraints_for_join_order, Constraint, ConstraintRef,
+};
+use cost::{Cost, ESTIMATED_HARDCODED_ROWS_PER_TABLE};
+use join::{compute_best_join_order, BestJoinOrderResult};
+use lift_common_subexpressions::lift_common_subexpressions_from_binary_or_terms;
+use order::{compute_order_target, plan_satisfies_order_target, EliminatesSortBy};
+use std::{
+    cmp::Ordering,
+    collections::{HashMap, HashSet, VecDeque},
+    sync::Arc,
+};
+use turso_ext::{ConstraintInfo, ConstraintUsage};
+use turso_parser::ast::{self, Expr, FunctionTail, LikeOperator, Name, SortOrder, TriggerEvent};
 
 use super::{
     emitter::Resolver,
@@ -430,12 +429,54 @@ pub fn optimize_plan(program: &mut ProgramBuilder, plan: &mut Plan, schema: &Sch
     Ok(())
 }
 
+#[cfg(feature = "fts")]
+/// Transform MATCH expressions to fts_match() function calls.
+fn transform_match_to_fts_match(where_clause: &mut [WhereTerm]) {
+    for term in where_clause.iter_mut() {
+        let _ = walk_expr_mut(&mut term.expr, &mut |e: &mut Expr| -> Result<WalkControl> {
+            match e {
+                Expr::Like {
+                    lhs,
+                    not,
+                    op: LikeOperator::Match,
+                    rhs,
+                    escape: _,
+                } => {
+                    // Transform `lhs MATCH rhs` -> `fts_match(lhs, rhs)`
+                    let func_call = Expr::FunctionCall {
+                        name: Name::exact("fts_match".to_string()),
+                        distinctness: None,
+                        args: vec![lhs.clone(), rhs.clone()],
+                        order_by: vec![],
+                        filter_over: FunctionTail {
+                            filter_clause: None,
+                            over_clause: None,
+                        },
+                    };
+                    if *not {
+                        // For NOT MATCH, just wrap the whole thing in a unary NOT
+                        *e = Expr::Unary(ast::UnaryOperator::Not, Box::new(func_call));
+                    } else {
+                        *e = func_call;
+                    }
+                    Ok(WalkControl::Continue)
+                }
+                _ => Ok(WalkControl::Continue),
+            }
+        });
+    }
+}
+
 /**
  * Make a few passes over the plan to optimize it.
  * TODO: these could probably be done in less passes,
  * but having them separate makes them easier to understand
  */
 pub fn optimize_select_plan(plan: &mut SelectPlan, schema: &Schema) -> Result<()> {
+    // Transform MATCH expressions to fts_match() for FTS optimizer recognition
+    #[cfg(feature = "fts")]
+    transform_match_to_fts_match(&mut plan.where_clause);
+
     optimize_subqueries(plan, schema)?;
     lift_common_subexpressions_from_binary_or_terms(&mut plan.where_clause)?;
     if let ConstantConditionEliminationResult::ImpossibleCondition =
@@ -466,6 +507,9 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, schema: &Schema) -> Result<()
 }
 
 fn optimize_delete_plan(plan: &mut DeletePlan, schema: &Schema) -> Result<()> {
+    #[cfg(feature = "fts")]
+    transform_match_to_fts_match(&mut plan.where_clause);
+
     lift_common_subexpressions_from_binary_or_terms(&mut plan.where_clause)?;
     if let ConstantConditionEliminationResult::ImpossibleCondition =
         eliminate_constant_conditions(&mut plan.where_clause)?
@@ -499,6 +543,8 @@ fn optimize_update_plan(
     plan: &mut UpdatePlan,
     schema: &Schema,
 ) -> Result<()> {
+    #[cfg(feature = "fts")]
+    transform_match_to_fts_match(&mut plan.where_clause);
     lift_common_subexpressions_from_binary_or_terms(&mut plan.where_clause)?;
     if let ConstantConditionEliminationResult::ImpossibleCondition =
         eliminate_constant_conditions(&mut plan.where_clause)?
