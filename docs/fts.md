@@ -153,6 +153,8 @@ Three FTS functions are provided:
 - **`fts_match(col1, col2, ..., 'query')`** - Returns a boolean indicating if the row matches (used in WHERE clause)
 - **`fts_highlight(col1, col2, ..., before_tag, after_tag, 'query')`** - Returns text with matching terms wrapped in tags
 
+`WHERE col MATCH 'query'` is available for use instead of `fts_match(col, 'query')`
+
 ### Basic Query Examples
 
 ```sql

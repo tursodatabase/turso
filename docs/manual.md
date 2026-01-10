@@ -888,6 +888,7 @@ WITH (tokenizer = 'simple', weights = 'name=3.0,description=1.0');
 Turso provides three FTS functions:
 
 #### `fts_match(col1, col2, ..., 'query')`
+#### or `WHERE col1, col2 MATCH 'query'`
 
 Returns a boolean indicating if the row matches the query. Used in `WHERE` clauses:
 
