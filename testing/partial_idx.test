@@ -586,3 +586,11 @@ do_execsql_test_on_specific_db {:memory:} partial-index-between-simple {
 5
 10
 15}
+
+# Original SQLancer test case that exposed the BETWEEN rewriting bug
+do_execsql_test_on_specific_db {:memory:} partial-index-between-sqlancer {
+    CREATE TABLE t1(c0);
+    CREATE UNIQUE INDEX IF NOT EXISTS i70 ON t1(CAST(((c0) IS FALSE) AS INTEGER) DESC) WHERE (((((((c0)) BETWEEN ((c0)) AND ((c0))))OR(ROUND(c0, NULL))))OR(((NULL)*(c0))));
+    INSERT INTO t1 VALUES (1);
+    SELECT * FROM t1;
+} {1}

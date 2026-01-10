@@ -445,7 +445,6 @@ pub fn translate_insert(
         &insertion,
         &constraints,
         &mut preflight_ctx,
-        connection,
     )?;
 
     let notnull_resume_label = emit_notnulls(&mut program, &ctx, &insertion, resolver)?;
@@ -469,7 +468,7 @@ pub fn translate_insert(
     });
 
     if has_upsert {
-        emit_commit_phase(&mut program, resolver, &insertion, &ctx, connection)?;
+        emit_commit_phase(&mut program, resolver, &insertion, &ctx)?;
     }
 
     if has_fks {
@@ -691,7 +690,6 @@ fn emit_partial_index_check(
     resolver: &Resolver,
     index: &Index,
     insertion: &Insertion,
-    _connection: &Arc<crate::Connection>,
 ) -> Result<Option<BranchOffset>> {
     let Some(where_clause) = &index.where_clause else {
         return Ok(None);
@@ -728,7 +726,6 @@ fn emit_commit_phase(
     resolver: &Resolver,
     insertion: &Insertion,
     ctx: &InsertEmitCtx,
-    connection: &Arc<crate::Connection>,
 ) -> Result<()> {
     for index in resolver.schema.get_indices(ctx.table.name.as_str()) {
         let idx_cursor_id = ctx
@@ -739,7 +736,7 @@ fn emit_commit_phase(
             .expect("no cursor found for index");
 
         // Re-evaluate partial predicate on the would-be inserted image
-        let commit_skip_label = emit_partial_index_check(program, resolver, index, insertion, connection)?;
+        let commit_skip_label = emit_partial_index_check(program, resolver, index, insertion)?;
 
         let num_cols = index.columns.len();
         let idx_start_reg = program.alloc_registers(num_cols + 1);
@@ -1961,7 +1958,6 @@ fn emit_pk_uniqueness_check(
 
 /// Emit bytecode to check index uniqueness constraint.
 /// Handles partial index predicates, ON REPLACE, UPSERT routing, and non-unique indexes.
-#[allow(clippy::too_many_arguments)]
 fn emit_index_uniqueness_check(
     program: &mut ProgramBuilder,
     ctx: &mut InsertEmitCtx,
@@ -1971,7 +1967,6 @@ fn emit_index_uniqueness_check(
     position: Option<usize>,
     upsert_catch_all: Option<usize>,
     preflight: &mut PreflightCtx,
-    connection: &Arc<crate::Connection>,
 ) -> Result<()> {
     // find which cursor we opened earlier for this index
     let idx_cursor_id = ctx
@@ -1982,7 +1977,7 @@ fn emit_index_uniqueness_check(
         .expect("no cursor found for index");
 
     // For partial indexes, evaluate the WHERE clause and skip if false
-    let maybe_skip_probe_label = emit_partial_index_check(program, resolver, index, insertion, connection)?;
+    let maybe_skip_probe_label = emit_partial_index_check(program, resolver, index, insertion)?;
 
     let num_cols = index.columns.len();
     // allocate scratch registers for the index columns plus rowid
@@ -2182,7 +2177,6 @@ fn emit_preflight_constraint_checks(
     insertion: &Insertion,
     constraints: &ConstraintsToCheck,
     preflight: &mut PreflightCtx,
-    connection: &Arc<crate::Connection>,
 ) -> Result<()> {
     for (constraint, position) in &constraints.constraints_to_check {
         match constraint {
@@ -2207,7 +2201,6 @@ fn emit_preflight_constraint_checks(
                     *position,
                     constraints.upsert_catch_all_position,
                     preflight,
-                    connection,
                 )?;
             }
             ResolvedUpsertTarget::CatchAll => unreachable!(),
