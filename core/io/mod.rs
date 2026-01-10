@@ -1125,6 +1125,7 @@ mod shuttle_tests {
                 let file = io
                     .open_file(path.to_str().unwrap(), OpenFlags::None, false)
                     .unwrap();
+                thread::yield_now();
                 // Write a byte to prove we got a valid file
                 let buf = Arc::new(Buffer::new(vec![0xAA]));
                 let c = Completion::new_write(|_| {});
