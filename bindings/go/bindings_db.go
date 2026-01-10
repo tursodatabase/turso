@@ -108,6 +108,8 @@ type TursoDatabaseConfig struct {
 	// optional encryption parameters
 	// as encryption is experimental - ExperimentalFeatures must have "encryption" in the list
 	Encryption TursoDatabaseEncryptionOpts
+	// BusyTimeout in milliseconds (0 = no timeout, immediate SQLITE_BUSY)
+	BusyTimeout int
 }
 
 // define all necessary private C structs

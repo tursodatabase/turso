@@ -105,6 +105,9 @@ func (d *tursoDbDriver) Open(dsn string) (driver.Conn, error) {
 		turso_database_deinit(db)
 		return nil, err
 	}
+	if config.BusyTimeout > 0 {
+		turso_connection_set_busy_timeout_ms(c, int64(config.BusyTimeout))
+	}
 	return &tursoDbConnection{
 		db:    db,
 		conn:  c,
@@ -469,7 +472,7 @@ func (tx *tursoDbTx) Rollback() error {
 
 // Helpers
 
-// parseDSN supports format: <path>[?experimental=<string>&async=0|1&vfs=<string>&encryption_cipher=<string>&encryption_hexkey=<string>]
+// parseDSN supports format: <path>[?experimental=<string>&async=0|1&vfs=<string>&encryption_cipher=<string>&encryption_hexkey=<string>&_busy_timeout=<int>]
 func parseDSN(dsn string) (TursoDatabaseConfig, error) {
 	config := TursoDatabaseConfig{Path: dsn}
 	qMark := strings.IndexByte(dsn, '?')
@@ -494,6 +497,12 @@ func parseDSN(dsn string) (TursoDatabaseConfig, error) {
 		}
 		if v := vals.Get("encryption_hexkey"); v != "" {
 			config.Encryption.Hexkey = v
+		}
+		if v := vals.Get("_busy_timeout"); v != "" {
+			var timeout int
+			if _, err := fmt.Sscanf(v, "%d", &timeout); err == nil {
+				config.BusyTimeout = timeout
+			}
 		}
 	}
 	return config, nil
