@@ -1518,6 +1518,8 @@ pub enum PragmaName {
     WalCheckpoint,
     /// Sets or queries the threshold (in bytes) at which MVCC triggers an automatic checkpoint.
     MvccCheckpointThreshold,
+    /// Returns list of all available text comparison rules
+    CollationList,
 }
 
 /// `CREATE TRIGGER` time

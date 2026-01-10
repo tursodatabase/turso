@@ -155,6 +155,7 @@ pub fn pragma_for(pragma: &PragmaName) -> Pragma {
             PragmaFlags::NoColumns1 | PragmaFlags::Result0,
             &["cache_spill"],
         ),
+        CollationList => Pragma::new(PragmaFlags::ReadOnly, &["seq", "name"]),
     }
 }
 
