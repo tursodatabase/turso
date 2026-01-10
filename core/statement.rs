@@ -46,6 +46,8 @@ pub struct Statement {
     busy_handler_state: Option<BusyHandlerState>,
 }
 
+crate::assert::assert_send_sync!(Statement);
+
 impl std::fmt::Debug for Statement {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Statement").finish()
