@@ -149,6 +149,7 @@ impl FileCategory {
             "fast" | "fieldnorm" => FileCategory::FastFields,
             // Segment data - large, lazy-loaded
             "idx" | "pos" | "store" => FileCategory::SegmentData,
+            "lock" => FileCategory::Metadata,
             // Default to segment data (lazy-loaded)
             _ => FileCategory::SegmentData,
         }
@@ -395,11 +396,39 @@ impl LruCache<PathBuf> {
 type Catalog = HashMap<PathBuf, FileMetadata>;
 type PendingWrites = Vec<(PathBuf, Vec<u8>)>;
 
+/// Tantivy Directory implementation backed by Turso's BTree storage.
+///
+/// Tantivy stores its index as a collection of files (segments, metadata, term dictionaries, etc.).
+/// The `Directory` trait is Tantivy's storage abstraction for reading, writing, and managing
+/// these files. Tantivy's Directory methods are synchronous, so we must do blocking IO to back
+/// these operations and cache data in memory for performance.
+///
+/// FTS index files are stored in a BTree with the schema `(path TEXT, chunk_no INTEGER, bytes BLOB)`.
+/// Large files are split into chunks of `DEFAULT_CHUNK_SIZE` (1MB) to enable efficient
+/// partial reads and bounded memory usage during loading.
+///
+/// We use a two-tier caching strategy to optimize for Tantivy's access patterns:
+///
+/// 1. `hot_cache` (keyed by `PathBuf`): Caches entire files for small,
+///    frequently-accessed files that benefit from being fully resident in memory:
+///    - Metadata files (meta.json, .managed.json, .lock)
+///    - Term dictionaries (.term) - critical for query performance
+///    - Fast fields and field norms (.fast, .fieldnorm)
+///
+/// 2. `chunk_cache` (keyed by `(PathBuf, chunk_no)`): Caches individual 1MB chunks
+///    of large segment files. Large files like posting lists (.idx), positions (.pos),
+///    and document store (.store) are split into 1MB chunks when stored in the BTree.
+///    When Tantivy reads a byte range, we load only the chunks covering that range,
+///    allowing partial file access without loading entire multi-MB files into memory.
+///
+/// Writes are buffered in memory (`pending_writes`) and flushed to the BTree when:
+/// - A Tantivy commit occurs (via `commit_and_flush`)
+/// - The cursor is dropped with pending documents
+/// - The transaction is about to commit (via `pre_commit`)
+///
+/// During flush, writes are moved to `flushing_writes` so they remain readable while
+/// the async BTree write completes.
 #[derive(Clone)]
-/// Hybrid Directory implementation for Tantivy with lazy loading.
-/// - Metadata files (meta.json, etc.) are always kept in hot cache
-/// - Large segment files (.idx, .pos, .store) are lazy-loaded on demand
-/// - Uses LRU caches for both hot files and chunks to bound memory usage
 struct HybridBTreeDirectory {
     /// File catalog: path -> metadata (always in memory, no content)
     catalog: Arc<RwLock<Catalog>>,
@@ -496,7 +525,7 @@ impl HybridBTreeDirectory {
         let mut pending = self.pending_writes.write();
         let all_writes = std::mem::take(&mut *pending);
 
-        // Deduplicate: keep only the last write for each path
+        // keep only the last write for each path as we only care about the final state of each file
         let mut last_write_idx: HashMap<PathBuf, usize> = HashMap::new();
         for (idx, (path, _)) in all_writes.iter().enumerate() {
             last_write_idx.insert(path.clone(), idx);
@@ -1031,7 +1060,10 @@ impl Directory for HybridBTreeDirectory {
     }
 }
 
-/// Helper to create KeyInfo for text collation
+/// Creates default `KeyInfo` for BTree index columns.
+///
+/// Used when setting up the BTree cursor for the FTS directory storage.
+/// All columns use ascending sort order and binary collation for exact matching.
 fn key_info() -> KeyInfo {
     KeyInfo {
         sort_order: SortOrder::Asc,
@@ -1039,6 +1071,10 @@ fn key_info() -> KeyInfo {
     }
 }
 
+/// Creates an AST `Name` node from a string.
+///
+/// Convenience wrapper for building SQL AST nodes programmatically
+/// when creating the internal FTS storage table and index.
 fn name(name: impl ToString) -> ast::Name {
     ast::Name::exact(name.to_string())
 }
@@ -1141,7 +1177,6 @@ impl std::fmt::Debug for CachedFtsDirectory {
 /// Created by `FtsIndexMethod::attach()` and implements `IndexMethodAttachment`.
 /// Stores the Tantivy schema, field mappings, query patterns, and a shared
 /// directory cache to optimize repeated queries.
-#[allow(dead_code)]
 #[derive(Debug)]
 pub struct FtsIndexAttachment {
     /// Internal configuration
@@ -1154,11 +1189,9 @@ pub struct FtsIndexAttachment {
     text_fields: Vec<(IndexColumn, Field)>,
     /// Parsed query patterns for FTS queries
     patterns: Vec<Select>,
-    /// Name of the tantivy tokenizer to use
-    tokenizer_name: String,
-    /// Weights for each field in FTS scoring
-    /// Created from WITH clause parameters
-    /// e.g. WITH (tokenizer='default',weights='col1=1.0,col2=2.0')
+    /// Weights for each field in FTS scoring.
+    /// Created from WITH clause parameters,
+    /// e.g. `WITH (tokenizer='default',weights='col1=1.0,col2=2.0')`.
     field_weights: HashMap<String, f32>,
     /// In-memory cached tantivy directory state
     cached_directory_state: Arc<RwLock<Option<CachedFtsDirectory>>>,
@@ -1302,7 +1335,6 @@ impl FtsIndexAttachment {
             rowid_field,
             text_fields,
             patterns,
-            tokenizer_name,
             field_weights,
             cached_directory_state: Arc::new(RwLock::new(None)),
         })
@@ -1325,7 +1357,6 @@ impl IndexMethodAttachment for FtsIndexAttachment {
             self.schema.clone(),
             self.rowid_field,
             self.text_fields.clone(),
-            self.tokenizer_name.clone(),
             self.field_weights.clone(),
             self.cached_directory_state.clone(),
         )))
@@ -1543,13 +1574,11 @@ enum FtsState {
 /// - BTree storage via `HybridBTreeDirectory`
 /// - Document batching for efficient bulk inserts
 /// - Query result iteration
-#[allow(dead_code)]
 pub struct FtsCursor {
     schema: Schema,
     rowid_field: Field,
     text_fields: Vec<(IndexColumn, Field)>,
     dir_table_name: String,
-    tokenizer_name: String,
     field_weights: HashMap<String, f32>,
     shared_directory_cache: Arc<RwLock<Option<CachedFtsDirectory>>>,
     connection: Option<Arc<Connection>>,
@@ -1577,7 +1606,6 @@ impl FtsCursor {
         schema: Schema,
         rowid_field: Field,
         text_fields: Vec<(IndexColumn, Field)>,
-        tokenizer_name: String,
         field_weights: HashMap<String, f32>,
         shared_directory_cache: Arc<RwLock<Option<CachedFtsDirectory>>>,
     ) -> Self {
@@ -1591,7 +1619,6 @@ impl FtsCursor {
             rowid_field,
             text_fields,
             dir_table_name,
-            tokenizer_name,
             field_weights,
             shared_directory_cache,
             connection: None,
