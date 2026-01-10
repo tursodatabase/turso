@@ -158,6 +158,12 @@ impl Sorter {
                     }
                 }
                 SortState::InitHeap => {
+                    // Check for write errors before proceeding
+                    if self.chunks.iter().any(|chunk| {
+                        matches!(*chunk.io_state.read(), SortedChunkIOState::WriteError)
+                    }) {
+                        return Err(CompletionError::IOError(std::io::ErrorKind::WriteZero).into());
+                    }
                     turso_assert!(
                         !self.chunks.iter().any(|chunk| {
                             matches!(*chunk.io_state.read(), SortedChunkIOState::WaitingForWrite)
@@ -240,6 +246,12 @@ impl Sorter {
                             if !c.succeeded() {
                                 io_yield_one!(c);
                             }
+                        }
+                        // Check for write errors immediately after flush completes
+                        if self.chunks.iter().any(|chunk| {
+                            matches!(*chunk.io_state.read(), SortedChunkIOState::WriteError)
+                        }) {
+                            return Err(CompletionError::IOError(std::io::ErrorKind::WriteZero).into());
                         }
                     }
                 }
@@ -688,12 +700,15 @@ impl SortedChunk {
         let chunk_io_state_copy = self.io_state.clone();
         let write_complete = Box::new(move |res: Result<i32, CompletionError>| {
             let Ok(bytes_written) = res else {
+                *chunk_io_state_copy.write() = SortedChunkIOState::WriteError;
                 return;
             };
-            *chunk_io_state_copy.write() = SortedChunkIOState::WriteComplete;
             let buf_len = buffer_ref_copy.len();
             if bytes_written < buf_len as i32 {
                 tracing::error!("wrote({bytes_written}) less than expected({buf_len})");
+                *chunk_io_state_copy.write() = SortedChunkIOState::WriteError;
+            } else {
+                *chunk_io_state_copy.write() = SortedChunkIOState::WriteComplete;
             }
         });
 
@@ -911,6 +926,7 @@ enum SortedChunkIOState {
     ReadComplete,
     WaitingForWrite,
     WriteComplete,
+    WriteError,
     ReadEOF,
     None,
 }

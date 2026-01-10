@@ -28,6 +28,6 @@ if [[ "$CHECKSUM_ENABLED" == true && "$ENCRYPTION_ENABLED" == true ]]; then
     exit 1
 fi
 
-cargo build $FEATURES -p turso_whopper
+cargo build --release $FEATURES -p turso_whopper
 
-time RUST_BACKTRACE=full ./target/debug/turso_whopper "${ARGS[@]}"
+time RUST_BACKTRACE=full ./target/release/turso_whopper "${ARGS[@]}"
