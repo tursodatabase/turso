@@ -71,6 +71,10 @@ pub enum DatabaseLocation {
     TempFile,
     /// Path to an existing database file
     Path(PathBuf),
+    /// Generated default database with INTEGER PRIMARY KEY (`:default:`)
+    Default,
+    /// Generated default database with INT PRIMARY KEY - no rowid alias (`:default-no-rowidalias:`)
+    DefaultNoRowidAlias,
 }
 
 impl DatabaseConfig {
@@ -90,6 +94,8 @@ impl Display for DatabaseLocation {
             DatabaseLocation::Memory => f.write_str(":memory:"),
             DatabaseLocation::TempFile => f.write_str(":temp:"),
             DatabaseLocation::Path(path_buf) => write!(f, "{}", path_buf.display()),
+            DatabaseLocation::Default => f.write_str(":default:"),
+            DatabaseLocation::DefaultNoRowidAlias => f.write_str(":default-no-rowidalias:"),
         }
     }
 }
