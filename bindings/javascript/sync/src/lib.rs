@@ -139,6 +139,9 @@ pub struct SyncEngineOpts {
     pub protocol_version: Option<SyncEngineProtocolVersion>,
     pub bootstrap_if_empty: bool,
     pub remote_encryption: Option<String>,
+    /// Base64-encoded encryption key for the Turso Cloud database.
+    /// Must match the key used when creating the encrypted database.
+    pub remote_encryption_key: Option<String>,
     pub partial_sync_opts: Option<JsPartialSyncOpts>,
 }
 
@@ -153,6 +156,7 @@ struct SyncEngineOptsFilled {
     pub protocol_version: DatabaseSyncEngineProtocolVersion,
     pub bootstrap_if_empty: bool,
     pub remote_encryption: Option<CipherMode>,
+    pub remote_encryption_key: Option<String>,
     pub partial_sync_opts: Option<PartialSyncOpts>,
 }
 
@@ -287,6 +291,7 @@ impl SyncEngine {
                 },
                 None => None,
             },
+            remote_encryption_key: opts.remote_encryption_key.clone(),
         };
         Ok(SyncEngine {
             opts: opts_filled,
@@ -316,6 +321,7 @@ impl SyncEngine {
                 .map(|x| x.required_metadata_size())
                 .unwrap_or(0),
             partial_sync_opts: self.opts.partial_sync_opts.clone(),
+            remote_encryption_key: self.opts.remote_encryption_key.clone(),
         };
 
         let io = self.io()?;

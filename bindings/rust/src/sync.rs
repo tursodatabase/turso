@@ -43,6 +43,8 @@ pub struct Builder {
     bootstrap_if_empty: bool,
     // Partial sync configuration (EXPERIMENTAL).
     partial_sync_config_experimental: Option<PartialSyncOpts>,
+    // Encryption key(base64-encoded) for the Turso Cloud database
+    remote_encryption_key: Option<String>,
 }
 
 impl Builder {
@@ -56,6 +58,7 @@ impl Builder {
             long_poll_timeout: None,
             bootstrap_if_empty: true,
             partial_sync_config_experimental: None,
+            remote_encryption_key: None,
         }
     }
 
@@ -96,6 +99,13 @@ impl Builder {
         self
     }
 
+    // Set encryption key (base64-encoded) for the Turso Cloud database.
+    // The key will be sent as x-turso-encryption-key header with sync HTTP requests.
+    pub fn with_remote_encryption_key(mut self, base64_key: impl Into<String>) -> Self {
+        self.remote_encryption_key = Some(base64_key.into());
+        self
+    }
+
     // Build the synced database object, initialize and open it.
     pub async fn build(self) -> Result<Database> {
         // Build core database config for the embedded engine.
@@ -130,6 +140,7 @@ impl Builder {
             bootstrap_if_empty: self.bootstrap_if_empty,
             reserved_bytes: None,
             partial_sync_opts: self.partial_sync_config_experimental.clone(),
+            remote_encryption_key: self.remote_encryption_key.clone(),
         };
 
         // Create sync wrapper.
