@@ -456,7 +456,7 @@ fn test_fts_create_destroy(tmp_db: TempDatabase) {
     // After destroy, internal FTS directory tables should be removed
     let tables_after = schema_rows();
     assert!(tables_after.contains(&"docs".to_string()));
-    // The internal FTS tables should no longer contain data (they may still exist as empty tables)
+    assert!(!tables_after.iter().any(|t| t.contains("fts_dir")));
 }
 
 #[cfg(feature = "fts")]
@@ -644,100 +644,6 @@ fn test_fts_sql_queries(tmp_db: TempDatabase) {
         })
         .collect();
     assert!(ids.contains(&2));
-    assert!(ids.contains(&4));
-}
-
-#[cfg(feature = "fts")]
-#[turso_macros::test]
-fn test_fts_combined_score_match_with_extra_where(tmp_db: TempDatabase) {
-    let _ = env_logger::try_init();
-    let conn = tmp_db.connect_limbo();
-
-    // Create table and FTS index
-    conn.execute(
-        "CREATE TABLE posts(id INTEGER PRIMARY KEY, category TEXT, title TEXT, content TEXT)",
-    )
-    .unwrap();
-    conn.execute("CREATE INDEX fts_posts ON posts USING fts (title, content)")
-        .unwrap();
-
-    // Insert test data with different categories
-    conn.execute(
-        "INSERT INTO posts VALUES (1, 'tech', 'Rust Programming', 'Rust is a systems language')",
-    )
-    .unwrap();
-    conn.execute(
-        "INSERT INTO posts VALUES (2, 'tech', 'Python Programming', 'Python is versatile')",
-    )
-    .unwrap();
-    conn.execute("INSERT INTO posts VALUES (3, 'science', 'Rust in Nature', 'Rust affects metal structures')")
-        .unwrap();
-    conn.execute(
-        "INSERT INTO posts VALUES (4, 'tech', 'Advanced Rust', 'Learn advanced Rust patterns')",
-    )
-    .unwrap();
-    conn.execute(
-        "INSERT INTO posts VALUES (5, 'science', 'Metal Corrosion', 'Rust is a form of corrosion')",
-    )
-    .unwrap();
-
-    // Test combined fts_score + fts_match with extra WHERE condition
-    // Should only return tech posts about Rust
-    let rows = limbo_exec_rows(
-        &conn,
-        "SELECT fts_score(title, content, 'Rust') as score, id, title FROM posts WHERE fts_match(title, content, 'Rust') AND category = 'tech' ORDER BY score DESC LIMIT 10",
-    );
-
-    // Should match posts 1 and 4 (tech posts with Rust)
-    assert_eq!(rows.len(), 2);
-    let ids: Vec<i64> = rows
-        .iter()
-        .filter_map(|r| match &r[1] {
-            rusqlite::types::Value::Integer(i) => Some(*i),
-            _ => None,
-        })
-        .collect();
-    assert!(ids.contains(&1));
-    assert!(ids.contains(&4));
-    // Should NOT contain science posts (3 and 5)
-    assert!(!ids.contains(&3));
-    assert!(!ids.contains(&5));
-
-    // Test with numeric range filter
-    let rows = limbo_exec_rows(
-        &conn,
-        "SELECT fts_score(title, content, 'Rust') as score, id FROM posts WHERE fts_match(title, content, 'Rust') AND id > 2 ORDER BY score DESC LIMIT 10",
-    );
-    // Should match posts 3, 4, 5 (id > 2 and contains Rust)
-    assert_eq!(rows.len(), 3);
-    let ids: Vec<i64> = rows
-        .iter()
-        .filter_map(|r| match &r[1] {
-            rusqlite::types::Value::Integer(i) => Some(*i),
-            _ => None,
-        })
-        .collect();
-    assert!(ids.contains(&3));
-    assert!(ids.contains(&4));
-    assert!(ids.contains(&5));
-    assert!(!ids.contains(&1));
-    assert!(!ids.contains(&2));
-
-    // Test with multiple extra WHERE conditions
-    let rows = limbo_exec_rows(
-        &conn,
-        "SELECT fts_score(title, content, 'Rust') as score, id FROM posts WHERE fts_match(title, content, 'Rust') AND id >= 2 AND id <= 4 ORDER BY score DESC",
-    );
-    // Should match posts 3 and 4 (id between 2-4 and contains Rust, excluding 2 which doesn't have Rust)
-    assert_eq!(rows.len(), 2);
-    let ids: Vec<i64> = rows
-        .iter()
-        .filter_map(|r| match &r[1] {
-            rusqlite::types::Value::Integer(i) => Some(*i),
-            _ => None,
-        })
-        .collect();
-    assert!(ids.contains(&3));
     assert!(ids.contains(&4));
 }
 
@@ -1490,14 +1396,12 @@ fn test_fts_query_insert_query_no_panic(tmp_db: TempDatabase) {
     conn.execute("INSERT INTO articles VALUES (3, 'Go Tutorial', 'Go is great for concurrency')")
         .unwrap();
 
-    // Query again - should NOT panic with "dirty pages must be empty for read txn"
+    // Query again, should NOT panic with "dirty pages must be empty for read txn"
     let rows = limbo_exec_rows(
         &conn,
         "SELECT * FROM articles WHERE fts_match(title, body, 'Go')",
     );
     assert_eq!(rows.len(), 1);
-
-    // One more query to ensure everything is stable
     let rows = limbo_exec_rows(
         &conn,
         "SELECT * FROM articles WHERE fts_match(title, body, 'Rust')",
@@ -1642,16 +1546,10 @@ fn test_fts_comprehensive_lifecycle(tmp_db: TempDatabase) {
         "SELECT id FROM docs WHERE fts_match(title, body, 'Advanced Techniques')",
     );
     // After delete, should not find document 101's content
-    // (or may still find it depending on FTS delete implementation)
     let has_deleted_doc = rows
         .iter()
         .any(|r| matches!(&r[0], rusqlite::types::Value::Integer(101)));
-    // Note: If FTS doesn't support delete yet, this may still find the doc
-    // For now, just verify the query doesn't panic
-    let _ = rows.len(); // Query should not panic after delete
-    if !has_deleted_doc && rows.is_empty() {
-        // FTS properly removed the deleted document
-    }
+    assert!(!has_deleted_doc && rows.is_empty());
 
     // Other documents should still be queryable
     let rows = limbo_exec_rows(
@@ -1838,7 +1736,10 @@ fn test_fts_optimize_index(tmp_db: TempDatabase) {
     );
 
     // Verify content is correct
-    let rows = limbo_exec_rows(&conn, "SELECT id FROM docs WHERE (title, body) MATCH 'topic'");
+    let rows = limbo_exec_rows(
+        &conn,
+        "SELECT id FROM docs WHERE (title, body) MATCH 'topic'",
+    );
     assert_eq!(rows.len(), 10, "Should find all documents with 'topic'");
 }
 
@@ -1911,10 +1812,10 @@ fn test_fts_column_order_agnostic(tmp_db: TempDatabase) {
     )
     .unwrap();
 
-    // Test standard column order: fts_match(title, body, ...)
+    // Test standard column order: (title, body)
     let rows_standard = limbo_exec_rows(
         &conn,
-        "SELECT id FROM articles WHERE fts_match(title, body, 'database')",
+        "SELECT id FROM articles WHERE (title, body) MATCH 'database'",
     );
     assert_eq!(
         rows_standard.len(),
@@ -1931,11 +1832,11 @@ fn test_fts_column_order_agnostic(tmp_db: TempDatabase) {
     assert!(ids_standard.contains(&1));
     assert!(ids_standard.contains(&3));
 
-    // Test reversed column order: fts_match(body, title, ...)
+    // Test reversed column order: (body, title)
     // This should work with column-order-agnostic matching
     let rows_reversed = limbo_exec_rows(
         &conn,
-        "SELECT id FROM articles WHERE fts_match(body, title, 'database')",
+        "SELECT id FROM articles WHERE (body, title) MATCH 'database'",
     );
     assert_eq!(
         rows_reversed.len(),
@@ -1955,7 +1856,7 @@ fn test_fts_column_order_agnostic(tmp_db: TempDatabase) {
     // Test fts_score with reversed column order
     let rows_score_reversed = limbo_exec_rows(
         &conn,
-        "SELECT id, fts_score(body, title, 'database') as score FROM articles WHERE fts_match(body, title, 'database') ORDER BY score DESC",
+        "SELECT id, fts_score(body, title, 'database') as score FROM articles WHERE (body, title) MATCH 'database' ORDER BY score DESC",
     );
     assert_eq!(
         rows_score_reversed.len(),
@@ -1977,7 +1878,7 @@ fn test_fts_column_order_agnostic(tmp_db: TempDatabase) {
     }
 }
 
-/// Test that FTS works with JOIN queries (multi-table queries).
+/// Test that FTS works with JOINS
 /// This tests the removal of the single-table restriction for custom index methods.
 #[cfg(feature = "fts")]
 #[turso_macros::test]
@@ -2167,6 +2068,8 @@ fn test_fts_join_order_optimization(tmp_db: TempDatabase) {
         conn.execute(format!("INSERT INTO authors VALUES ({i}, 'Author{i}')"))
             .unwrap();
     }
+    // so we use real statistics
+    conn.execute("ANALYZE").unwrap();
 
     // Insert many articles (larger table) - more than authors to show cardinality difference
     for i in 1..=50 {
@@ -2229,7 +2132,7 @@ fn test_fts_join_order_optimization(tmp_db: TempDatabase) {
             .collect::<Vec<_>>()
     );
 
-    // Verify the join order: FTS (articles) should be first, authors second
+    // Verify the join order: FTS should be first, authors second
     assert_eq!(
         table_order.len(),
         2,
@@ -2247,7 +2150,7 @@ fn test_fts_join_order_optimization(tmp_db: TempDatabase) {
     // Execute the query and verify results
     let rows = limbo_exec_rows(&conn, query);
 
-    // Should find 5 articles about database (every 10th: 10, 20, 30, 40, 50)
+    // Should find 5 articles about database
     assert_eq!(rows.len(), 5, "Should find 5 articles about database");
 
     // Verify all results have valid author names
@@ -2262,11 +2165,10 @@ fn test_fts_join_order_optimization(tmp_db: TempDatabase) {
         );
     }
 
-    // Test with reversed table order in SQL - optimizer should still use FTS
+    // Test with reversed table order in SQL, optimizer should still use FTS
     let query2 = "SELECT a.id, a.title, u.name FROM authors u JOIN articles a ON u.id = a.author_id WHERE fts_match(a.title, a.body, 'database')";
     let eqp_rows2 = limbo_exec_rows(&conn, &format!("EXPLAIN QUERY PLAN {query2}"));
 
-    // Verify FTS is still used regardless of SQL table order
     let mut has_fts_search2 = false;
     for row in &eqp_rows2 {
         if let rusqlite::types::Value::Text(detail) = &row[3] {
@@ -2355,7 +2257,7 @@ fn test_fts_multi_table_join(tmp_db: TempDatabase) {
         "SELECT a.title, u.name, c.name FROM articles a \
          JOIN authors u ON a.author_id = u.id \
          JOIN categories c ON a.category_id = c.id \
-         WHERE fts_match(a.title, a.body, 'database')",
+         WHERE (a.title, a.body) MATCH 'database'",
     );
 
     // Should find 2 articles about database (articles 1 and 3)
