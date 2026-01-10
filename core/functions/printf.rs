@@ -59,24 +59,93 @@ pub fn exec_printf(values: &[Register]) -> crate::Result<Value> {
             continue;
         }
 
-        match chars.next() {
-            Some('%') => {
-                result.push('%');
-                continue;
+        // Check for %% escape
+        if let Some(&'%') = chars.peek() {
+            chars.next(); // consume the second %
+            result.push('%');
+            continue;
+        }
+
+        let mut zero_pad = false;
+        let mut width = None;
+        let mut precision = None;
+
+        if let Some(&'0') = chars.peek() {
+            chars.next();
+            zero_pad = true;
+        }
+
+        // Parse width
+        let mut width_str = String::new();
+        while let Some(&c) = chars.peek() {
+            if c.is_ascii_digit() {
+                width_str.push(c);
+                chars.next();
+            } else {
+                break;
             }
+        }
+        if !width_str.is_empty() {
+            width = width_str.parse().ok();
+        }
+
+        if let Some(&'.') = chars.peek() {
+            chars.next();
+            let mut precision_str = String::new();
+            while let Some(&c) = chars.peek() {
+                if c.is_ascii_digit() {
+                    precision_str.push(c);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+            precision = if precision_str.is_empty() {
+                Some(0)
+            } else {
+                precision_str.parse().ok()
+            };
+        }
+
+        match chars.next() {
             Some('d') | Some('i') => {
                 if args_index >= values.len() {
                     return Err(LimboError::InvalidArgument("not enough arguments".into()));
                 }
                 let value = &values[args_index].get_value();
-                match value {
-                    Value::Integer(i) => result.push_str(&i.to_string()),
-                    Value::Float(f) => {
-                        let truncated_val = *f as i64;
-                        result.push_str(&truncated_val.to_string());
+                let int_value = match value {
+                    Value::Integer(i) => *i,
+                    Value::Float(f) => *f as i64,
+                    _ => 0,
+                };
+
+                let mut formatted = if let Some(p) = precision {
+                    if int_value < 0 {
+                        format!("-{:0p$}", (-int_value))
+                    } else {
+                        format!("{int_value:0p$}")
                     }
-                    _ => result.push('0'),
+                } else {
+                    int_value.to_string()
+                };
+
+                if let Some(w) = width {
+                    if w > formatted.len() {
+                        if zero_pad && precision.is_none() {
+                            if int_value < 0 {
+                                let neg_value = -int_value;
+                                let pad_width = w - 1;
+                                formatted = format!("-{neg_value:0pad_width$}");
+                            } else {
+                                formatted = format!("{int_value:0w$}");
+                            }
+                        } else {
+                            formatted = format!("{formatted:>w$}");
+                        }
+                    }
                 }
+
+                result.push_str(&formatted);
                 args_index += 1;
             }
             Some('u') => {
