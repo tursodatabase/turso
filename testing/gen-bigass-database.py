@@ -397,7 +397,7 @@ for i in range(10000):
     if i % 1000 == 0:
         print(f"  Generated {i} articles...")
 
-    title = fake.sentence(nb_words=random.randint(5, 12)).rstrip('.')
+    title = fake.sentence(nb_words=random.randint(5, 12)).rstrip(".")
     subtitle = fake.sentence(nb_words=random.randint(8, 15))
     author = fake.name()
     category = random.choice(categories)
