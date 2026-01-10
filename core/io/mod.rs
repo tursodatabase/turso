@@ -1261,9 +1261,11 @@ mod shuttle_tests {
             let file = file.clone();
             handles.push(thread::spawn(move || {
                 // Check various regions
-                let _ = file.has_hole(0, 4096);
-                let _ = file.has_hole(4096, 4096);
-                let _ = file.has_hole(8192, 4096);
+                let has_hole = file.has_hole(0, 4096).unwrap();
+                assert!(!has_hole);
+                let _ = file.has_hole(4096, 4096).unwrap();
+                let has_hole = file.has_hole(8192, 4096).unwrap();
+                assert!(!has_hole);
             }));
         }
 
