@@ -22,6 +22,7 @@ pub struct Remaining {
     pub drop_index: u32,
     pub pragma_count: u32,
     pub create_matview: u32,
+    pub drop_matview: u32,
     pub enable_cdc: u32,
 }
 
