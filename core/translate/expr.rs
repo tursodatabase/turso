@@ -3469,12 +3469,27 @@ fn translate_like_base(
         }
         #[cfg(feature = "fts")]
         ast::LikeOperator::Match => {
-            // Transform `lhs MATCH rhs` to `fts_match(lhs, rhs)`
-            // where lhs is the text column(s) and rhs is the query string
-            let arg_count = 2;
+            // Transform MATCH to fts_match():
+            // - `col MATCH 'query'` -> `fts_match(col, 'query')`
+            // - `(col1, col2) MATCH 'query'` -> `fts_match(col1, col2, 'query')`
+            let columns: Vec<&ast::Expr> = match lhs.as_ref() {
+                ast::Expr::Parenthesized(cols) => cols.iter().map(|c| c.as_ref()).collect(),
+                other => vec![other],
+            };
+            let arg_count = columns.len() + 1; // columns + query
             let start_reg = program.alloc_registers(arg_count);
-            translate_expr(program, referenced_tables, lhs, start_reg, resolver)?;
-            translate_expr(program, referenced_tables, rhs, start_reg + 1, resolver)?;
+
+            for (i, col) in columns.iter().enumerate() {
+                translate_expr(program, referenced_tables, col, start_reg + i, resolver)?;
+            }
+            translate_expr(
+                program,
+                referenced_tables,
+                rhs,
+                start_reg + columns.len(),
+                resolver,
+            )?;
+
             program.emit_insn(Insn::Function {
                 constant_mask: 0,
                 start_reg,
@@ -4859,9 +4874,10 @@ pub fn expr_vector_size(expr: &Expr) -> Result<usize> {
             }
             1
         }
-        Expr::Like { lhs, rhs, .. } => {
+        Expr::Like { lhs, rhs, op, .. } => {
             let evs_lhs = expr_vector_size(lhs)?;
-            if evs_lhs != 1 {
+            // MATCH allows multi-column LHS: (col1, col2) MATCH 'query'
+            if evs_lhs != 1 && *op != ast::LikeOperator::Match {
                 crate::bail_parse_error!(
                     "left operand of LIKE must return 1 value. Got: ({evs_lhs})"
                 );

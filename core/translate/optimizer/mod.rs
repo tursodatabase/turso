@@ -442,11 +442,19 @@ fn transform_match_to_fts_match(where_clause: &mut [WhereTerm]) {
                     rhs,
                     escape: _,
                 } => {
-                    // Transform `lhs MATCH rhs` -> `fts_match(lhs, rhs)`
+                    // Transform MATCH to fts_match():
+                    // - `col MATCH 'query'` -> `fts_match(col, 'query')`
+                    // - `(col1, col2) MATCH 'query'` -> `fts_match(col1, col2, 'query')`
+                    let mut args: Vec<Box<Expr>> = match lhs.as_ref() {
+                        Expr::Parenthesized(cols) => cols.clone(),
+                        _ => vec![lhs.clone()],
+                    };
+                    args.push(rhs.clone());
+
                     let func_call = Expr::FunctionCall {
                         name: Name::exact("fts_match".to_string()),
                         distinctness: None,
-                        args: vec![lhs.clone(), rhs.clone()],
+                        args,
                         order_by: vec![],
                         filter_over: FunctionTail {
                             filter_clause: None,
