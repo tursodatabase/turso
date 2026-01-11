@@ -709,7 +709,8 @@ impl Database {
         pager.set_schema_cookie(None);
 
         if open_mv_store {
-            let mv_store = journal_mode::open_mv_store(self.io.as_ref(), &self.path)?;
+            let mv_store =
+                journal_mode::open_mv_store(self.io.as_ref(), &self.path, self.open_flags)?;
             self.mv_store.store(Some(mv_store));
         }
 
