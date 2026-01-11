@@ -28,7 +28,7 @@ use tantivy::{
         Directory, FileHandle, OwnedBytes, TerminatingWrite, WatchCallback, WatchHandle,
     },
     merge_policy::NoMergePolicy,
-    schema::{Field, Schema, Value as TantivySchemaValue},
+    schema::{Field, Schema},
     tokenizer::{
         NgramTokenizer, RawTokenizer, SimpleTokenizer, TextAnalyzer, TokenStream,
         WhitespaceTokenizer,
@@ -1374,8 +1374,10 @@ impl FtsIndexAttachment {
         // Build Tantivy schema (no Directory or Index creation yet)
         let mut schema_builder = Schema::builder();
 
-        let rowid_field = schema_builder
-            .add_i64_field("rowid", tantivy::schema::INDEXED | tantivy::schema::STORED);
+        // Use FAST field for rowid to enable efficient columnar access during query result retrieval.
+        // This avoids loading full documents from the .store file just to get the rowid.
+        let rowid_field =
+            schema_builder.add_i64_field("rowid", tantivy::schema::INDEXED | tantivy::schema::FAST);
 
         let mut text_fields = Vec::with_capacity(cfg.columns.len());
         for col in &cfg.columns {
@@ -3048,19 +3050,37 @@ impl IndexMethodCursor for FtsCursor {
 
         self.current_hits.clear();
         self.hit_pos = 0;
+
+        // Group results by segment for efficient fast field access.
+        // This avoids creating a new fast field reader for each document.
+        let mut by_segment: HashMap<u32, Vec<(f32, tantivy::DocAddress)>> = HashMap::new();
         for (score, doc_addr) in top_docs {
-            let retrieved: TantivyDocument = searcher
-                .doc(doc_addr)
-                .map_err(|e| LimboError::InternalError(format!("FTS doc load error: {e}")))?;
-
-            let rowid_vals = retrieved.get_all(self.rowid_field);
-            let rowid = rowid_vals
-                .filter_map(|v| TantivySchemaValue::as_i64(&v))
-                .next()
-                .ok_or_else(|| LimboError::InternalError("FTS doc missing rowid".into()))?;
-
-            self.current_hits.push((score, doc_addr, rowid));
+            by_segment
+                .entry(doc_addr.segment_ord)
+                .or_default()
+                .push((score, doc_addr));
         }
+
+        // Process each segment's results with a single fast field reader.
+        // Fast fields provide columnar O(1) access to rowids without loading full documents.
+        for (segment_ord, hits) in by_segment {
+            let segment_reader = searcher.segment_reader(segment_ord);
+            let rowid_reader = segment_reader
+                .fast_fields()
+                .i64("rowid")
+                .map_err(|e| LimboError::InternalError(format!("FTS fast field error: {e}")))?;
+
+            for (score, doc_addr) in hits {
+                let rowid = rowid_reader.first(doc_addr.doc_id).ok_or_else(|| {
+                    LimboError::InternalError("FTS: rowid fast field missing value".into())
+                })?;
+                self.current_hits.push((score, doc_addr, rowid));
+            }
+        }
+
+        // Re-sort by score since we grouped by segment (preserves original ranking order)
+        self.current_hits
+            .sort_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(std::cmp::Ordering::Equal));
 
         Ok(IOResult::Done(!self.current_hits.is_empty()))
     }
