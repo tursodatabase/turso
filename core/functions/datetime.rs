@@ -209,17 +209,6 @@ fn set_to_current(p: &mut DateTime) {
     p.clear_ymd_hms_tz();
 }
 
-fn parse_modifier_ymd(z: &str) -> Option<(i32, i32, i32)> {
-    let parts: Vec<&str> = z.split('-').collect();
-    if parts.len() != 3 {
-        return None;
-    }
-    let y = parts[0].parse::<i32>().ok()?;
-    let m = parts[1].parse::<i32>().ok()?;
-    let d = parts[2].parse::<i32>().ok()?;
-    Some((y, m, d))
-}
-
 fn parse_date_or_time(value: &str, p: &mut DateTime) -> Result<()> {
     if parse_yyyy_mm_dd(value, p) {
         return Ok(());
@@ -599,6 +588,9 @@ fn parse_modifier(p: &mut DateTime, z: &str, idx: usize) -> Result<()> {
             Err(InvalidModifier(format!("Invalid weekday: {}", z)))
         }
         Some('s') if z_lower.starts_with("start of ") => {
+            if !p.valid_jd && !p.valid_ymd && !p.valid_hms {
+                return Err(InvalidModifier(format!("Invalid start of: {}", z)));
+            }
             p.compute_ymd();
             p.valid_hms = true;
             p.h = 0;
@@ -641,57 +633,83 @@ fn parse_arithmetic_modifier(p: &mut DateTime, z: &str) -> Result<()> {
     } else {
         z
     };
-    let end_date_idx = clean_z.find(' ').unwrap_or(clean_z.len());
-    let date_part = &clean_z[..end_date_idx];
 
     // Case 1: YYYY-MM-DD Arithmetic
-    if date_part.len() >= 8 && date_part.contains('-') {
-        if let Some((y, m, d)) = parse_modifier_ymd(date_part) {
-            p.compute_ymd_hms();
-            p.valid_jd = false;
+    if clean_z.len() >= 10
+        && clean_z.as_bytes().get(4) == Some(&b'-')
+        && clean_z.as_bytes().get(7) == Some(&b'-')
+    {
+        let y_res = get_digits(&clean_z[0..4], 4, 0, 9999);
+        let m_res = get_digits(&clean_z[5..7], 2, 0, 11);
+        let d_res = get_digits(&clean_z[8..10], 2, 0, 30);
 
-            let y_adj = y as i64;
-            let m_adj = m as i64;
-            let d_adj = d as i64;
+        if let (Some((y, _)), Some((m, _)), Some((d, _))) = (y_res, m_res, d_res) {
+            let rem = &clean_z[10..];
+            let mut valid_format = true;
+            let mut time_str = None;
 
-            if is_neg {
-                p.y = p.y.wrapping_sub(y_adj as i32);
-                p.m = p.m.wrapping_sub(m_adj as i32);
-            } else {
-                p.y = p.y.wrapping_add(y_adj as i32);
-                p.m = p.m.wrapping_add(m_adj as i32);
+            if !rem.is_empty() {
+                if rem.starts_with(' ') {
+                    time_str = Some(rem.trim_start());
+                } else {
+                    valid_format = false;
+                }
             }
 
-            let m_current = p.m as i64;
-            let x = if m_current > 0 {
-                (m_current - 1) / 12
-            } else {
-                (m_current - 12) / 12
-            };
-            p.y = p.y.wrapping_add(x as i32);
-            p.m = (m_current - x * 12) as i32;
+            if valid_format {
+                p.compute_ymd_hms();
+                p.valid_jd = false;
 
-            p.compute_floor();
-            p.compute_jd();
+                let y_adj = y as i64;
+                let m_adj = m as i64;
+                let d_adj = d as i64;
 
-            let day_diff = if is_neg { -d_adj } else { d_adj };
-            p.i_jd = p.i_jd.wrapping_add(day_diff.wrapping_mul(JD_TO_MS));
+                if is_neg {
+                    p.y = p.y.wrapping_sub(y_adj as i32);
+                    p.m = p.m.wrapping_sub(m_adj as i32);
+                } else {
+                    p.y = p.y.wrapping_add(y_adj as i32);
+                    p.m = p.m.wrapping_add(m_adj as i32);
+                }
 
-            if end_date_idx < clean_z.len() {
-                let time_part = &clean_z[end_date_idx..].trim();
-                if !time_part.is_empty() {
+                // Normalize months
+                let m_current = p.m as i64;
+                let x = if m_current > 0 {
+                    (m_current - 1) / 12
+                } else {
+                    (m_current - 12) / 12
+                };
+                p.y = p.y.wrapping_add(x as i32);
+                p.m = (m_current - x * 12) as i32;
+
+                p.compute_floor();
+                p.compute_jd();
+
+                // Apply day offset
+                let day_diff = if is_neg { -d_adj } else { d_adj };
+                p.i_jd = p.i_jd.wrapping_add(day_diff.wrapping_mul(JD_TO_MS));
+
+                // Apply time offset if present
+                if let Some(t_val) = time_str {
                     let mut tx = DateTime::default();
-                    if parse_hh_mm_ss(time_part, &mut tx) {
+                    if parse_hh_mm_ss(t_val, &mut tx) {
                         tx.compute_jd();
                         let ms = (tx.h as i64 * 3600000)
                             + (tx.min as i64 * 60000)
                             + (tx.s * 1000.0) as i64;
                         p.i_jd = p.i_jd.wrapping_add((sign as i64).wrapping_mul(ms));
+                    } else {
+                        // If time parsing failed, the whole modifier is invalid
+                        return Err(InvalidModifier(format!(
+                            "Invalid time in arithmetic modifier: {}",
+                            z
+                        )));
                     }
                 }
+
+                p.clear_ymd_hms_tz();
+                return Ok(());
             }
-            p.clear_ymd_hms_tz();
-            return Ok(());
         }
     }
 
