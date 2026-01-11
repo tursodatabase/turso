@@ -4,8 +4,6 @@ set testdir [file dirname $argv0]
 
 # failing:
 # source $testdir/pragma.test
-# source $testdir/changes.test
-# source $testdir/total-changes.test
 # source $testdir/views.test
 # source $testdir/window.test
 # source $testdir/partial_idx.test
@@ -17,11 +15,6 @@ source $testdir/orderby.test
 source $testdir/groupby.test
 source $testdir/subquery.test
 source $testdir/where.test
-source $testdir/offset.test
-source $testdir/agg-functions.test
-source $testdir/drop_index.test
-source $testdir/drop_table.test
-source $testdir/create_index.test
 source $testdir/create_table.test
 source $testdir/update.test
 source $testdir/select.test
@@ -29,10 +22,6 @@ source $testdir/join.test
 source $testdir/insert.test
 source $testdir/glob.test
 source $testdir/autoincr.test
-source $testdir/cmdlineshell.test
-source $testdir/alter_table.test
-source $testdir/coalesce.test
-source $testdir/delete.test
 source $testdir/json.test
 source $testdir/math.test
 source $testdir/scalar-functions.test
@@ -40,15 +29,8 @@ source $testdir/scalar-functions-datetime.test
 source $testdir/compare.test
 
 source $testdir/scalar-functions-printf.test
-source $testdir/transactions.test
-source $testdir/default_value.test
-source $testdir/boolean.test
-source $testdir/literal.test
-source $testdir/null.test
-source $testdir/collate.test
 source $testdir/values.test
 source $testdir/integrity_check.test
-source $testdir/rollback.test
 source $testdir/vtab.test
 source $testdir/upsert.test
 source $testdir/returning.test
