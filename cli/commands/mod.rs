@@ -3,7 +3,7 @@ pub mod import;
 
 use args::{
     CwdArgs, DbConfigArgs, DbtotxtArgs, EchoArgs, ExitArgs, HeadersArgs, IndexesArgs,
-    LoadExtensionArgs, ManualArgs, NullValueArgs, OpcodesArgs, OpenArgs, OutputModeArgs,
+    LoadExtensionArgs, ManualArgs, NullValueArgs, OpcodesArgs, OpenArgs, OutputModeArgs, ReadArgs,
     SchemaArgs, SetOutputArgs, StatsArgs, TablesArgs, TimerArgs,
 };
 use clap::Parser;
@@ -97,6 +97,9 @@ pub enum Command {
     /// Display manual pages for features
     #[command(name = "manual", display_name = ".manual", alias = "man")]
     Manual(ManualArgs),
+    /// Execute SQL statements from a file
+    #[command(name = "read", display_name = ".read")]
+    Read(ReadArgs),
     #[command(name = "dbtotxt", display_name = ".dbtotxt")]
     Dbtotxt(DbtotxtArgs),
 }

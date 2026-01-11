@@ -775,6 +775,11 @@ impl Limbo {
                         HeadersMode::Off => false,
                     };
                 }
+                Command::Read(args) => {
+                    if let Err(e) = self.read_sql_file(&args.path) {
+                        let _ = self.writeln(e.to_string());
+                    }
+                }
                 Command::Clone(args) => {
                     if let Err(e) = self.clone_database(&args.output_file) {
                         let _ = self.writeln(e.to_string());
@@ -1817,6 +1822,43 @@ impl Limbo {
         let mut applier = ApplyWriter::new(&target);
         Self::dump_database_from_conn(false, self.conn.clone(), &mut applier, StderrProgress)?;
         applier.finish()?;
+        Ok(())
+    }
+
+    fn read_sql_file(&mut self, path: &str) -> anyhow::Result<()> {
+        let content = std::fs::read_to_string(path)
+            .map_err(|e| anyhow!("Error: cannot open \"{}\" - {}", path, e))?;
+
+        let delimeter = ';';
+        let mut in_single_quote: bool = false;
+        let mut in_double_quote: bool = false;
+
+        let trimmed = content.trim();
+
+        (!trimmed.is_empty())
+            .then_some(())
+            .ok_or_else(|| anyhow!("SQL file \"{}\" is empty", path))?;
+
+        let mut query_buffer = String::new();
+
+        for ch in content.chars() {
+            if ch == '\'' && !in_double_quote {
+                in_single_quote = !in_single_quote;
+            }
+
+            if ch == '"' && !in_single_quote {
+                in_double_quote = !in_double_quote;
+            }
+
+            query_buffer.push(ch);
+
+            if ch == delimeter && !in_single_quote && !in_double_quote {
+                self.run_query(&query_buffer);
+                query_buffer.clear();
+            }
+        }
+
+        query_buffer.clear();
         Ok(())
     }
 
