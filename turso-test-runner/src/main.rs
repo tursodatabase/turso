@@ -46,6 +46,10 @@ enum Commands {
         /// Timeout per query in seconds
         #[arg(long, default_value_t = 90)]
         timeout: u64,
+
+        /// Enable MVCC mode (experimental journal mode)
+        #[arg(long)]
+        mvcc: bool,
     },
 
     /// Validate test file syntax
@@ -87,7 +91,8 @@ async fn main() -> ExitCode {
             jobs,
             output,
             timeout,
-        } => run_tests(paths, binary, filter, jobs, output, timeout).await,
+            mvcc,
+        } => run_tests(paths, binary, filter, jobs, output, timeout, mvcc).await,
         Commands::Check { paths } => check_files(paths),
         Commands::Convert {
             paths,
@@ -110,6 +115,7 @@ async fn run_tests(
     jobs: usize,
     output_format: String,
     timeout: u64,
+    mvcc: bool,
 ) -> ExitCode {
     // Resolve paths, trying to add .sqltest extension if missing
     let mut resolved_paths = Vec::new();
@@ -163,7 +169,7 @@ async fn run_tests(
     // Generate default databases if needed
     let default_dbs = if needs.any() {
         eprintln!("Generating default databases...");
-        match DefaultDatabases::generate(needs, DEFAULT_SEED, DEFAULT_USER_COUNT).await {
+        match DefaultDatabases::generate(needs, DEFAULT_SEED, DEFAULT_USER_COUNT, mvcc).await {
             Ok(dbs) => dbs,
             Err(e) => {
                 eprintln!("Error generating default databases: {}", e);
@@ -178,12 +184,15 @@ async fn run_tests(
     let backend = if let Some(ref dbs) = default_dbs {
         CliBackend::new(&binary)
             .with_timeout(Duration::from_secs(timeout))
+            .with_mvcc(mvcc)
             .with_default_db_resolver(Arc::new(DefaultDatabasesResolver(
                 dbs.default_path.clone(),
                 dbs.no_rowid_alias_path.clone(),
             )))
     } else {
-        CliBackend::new(&binary).with_timeout(Duration::from_secs(timeout))
+        CliBackend::new(&binary)
+            .with_timeout(Duration::from_secs(timeout))
+            .with_mvcc(mvcc)
     };
 
     // Create runner config

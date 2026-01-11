@@ -85,6 +85,8 @@ pub struct GeneratorConfig {
     /// If true, use INT PRIMARY KEY instead of INTEGER PRIMARY KEY
     /// This prevents the rowid alias optimization in SQLite
     pub no_rowid_alias: bool,
+    /// Enable MVCC mode (experimental journal mode)
+    pub mvcc: bool,
 }
 
 impl Default for GeneratorConfig {
@@ -94,6 +96,7 @@ impl Default for GeneratorConfig {
             user_count: 10000,
             seed: 42,
             no_rowid_alias: false,
+            mvcc: false,
         }
     }
 }
@@ -108,6 +111,17 @@ pub async fn generate_database(config: &GeneratorConfig) -> Result<()> {
     let conn = db
         .connect()
         .with_context(|| format!("failed to connect to database '{}'", config.db_path))?;
+
+    // Enable MVCC mode if requested (must be done before any transactions)
+    if config.mvcc {
+        // Use query instead of execute since PRAGMA returns a result row
+        let mut rows = conn
+            .query("PRAGMA journal_mode = 'experimental_mvcc'", ())
+            .await
+            .context("failed to enable MVCC mode")?;
+        // Consume the result row
+        while let Some(_) = rows.next().await? {}
+    }
 
     let mut rng = ChaCha8Rng::seed_from_u64(config.seed);
 
@@ -130,6 +144,20 @@ pub async fn generate_database(config: &GeneratorConfig) -> Result<()> {
     conn.execute("COMMIT", ())
         .await
         .context("failed to execute COMMIT transaction")?;
+
+    // Checkpoint to ensure data is written to the main database file.
+    // This is required for SQLite to read the database with immutable=1 mode,
+    // which doesn't read WAL files.
+    let mut rows = conn
+        .query("PRAGMA wal_checkpoint(TRUNCATE)", ())
+        .await
+        .context("failed to checkpoint database")?;
+    // Consume the result
+    while let Some(_) = rows.next().await? {}
+
+    // Explicitly close connection and database to release locks
+    drop(conn);
+    drop(db);
 
     Ok(())
 }
@@ -351,6 +379,7 @@ impl DefaultDatabases {
         needs: DefaultDatabaseNeeds,
         seed: u64,
         user_count: usize,
+        mvcc: bool,
     ) -> Result<Option<Self>> {
         if !needs.any() {
             return Ok(None);
@@ -368,6 +397,7 @@ impl DefaultDatabases {
                 user_count,
                 seed,
                 no_rowid_alias: false,
+                mvcc,
             };
             generate_database(&config)
                 .await
@@ -382,6 +412,7 @@ impl DefaultDatabases {
                 user_count,
                 seed,
                 no_rowid_alias: true,
+                mvcc,
             };
             generate_database(&config)
                 .await
@@ -418,6 +449,7 @@ mod tests {
             user_count: 10,
             seed: 42,
             no_rowid_alias: false,
+            mvcc: false,
         }
     }
 

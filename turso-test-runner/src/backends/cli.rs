@@ -27,6 +27,8 @@ pub struct CliBackend {
     timeout: Duration,
     /// Resolver for default database paths
     default_db_resolver: Option<Arc<dyn DefaultDatabaseResolver>>,
+    /// Enable MVCC mode
+    mvcc: bool,
 }
 
 impl CliBackend {
@@ -37,6 +39,7 @@ impl CliBackend {
             working_dir: None,
             timeout: Duration::from_secs(30),
             default_db_resolver: None,
+            mvcc: false,
         }
     }
 
@@ -55,6 +58,12 @@ impl CliBackend {
     /// Set the default database resolver
     pub fn with_default_db_resolver(mut self, resolver: Arc<dyn DefaultDatabaseResolver>) -> Self {
         self.default_db_resolver = Some(resolver);
+        self
+    }
+
+    /// Enable MVCC mode (experimental journal mode)
+    pub fn with_mvcc(mut self, mvcc: bool) -> Self {
+        self.mvcc = mvcc;
         self
     }
 }
@@ -102,6 +111,7 @@ impl SqlBackend for CliBackend {
             _temp_file: temp_file,
             is_memory,
             setup_buffer: Vec::new(),
+            mvcc: self.mvcc,
         }))
     }
 }
@@ -119,6 +129,8 @@ pub struct CliDatabaseInstance {
     is_memory: bool,
     /// Buffer of setup SQL (for memory databases)
     setup_buffer: Vec<String>,
+    /// Enable MVCC mode
+    mvcc: bool,
 }
 
 impl CliDatabaseInstance {
@@ -169,10 +181,17 @@ impl CliDatabaseInstance {
             .spawn()
             .map_err(|e| BackendError::Execute(format!("failed to spawn tursodb: {}", e)))?;
 
+        // Prepend MVCC pragma if enabled (skip for readonly databases)
+        let sql_to_execute = if self.mvcc && is_turso_cli && !self.readonly {
+            format!("PRAGMA journal_mode = 'experimental_mvcc';\n{}", sql)
+        } else {
+            sql.to_string()
+        };
+
         // Write SQL to stdin
         if let Some(stdin) = child.stdin.as_mut() {
             stdin
-                .write_all(sql.as_bytes())
+                .write_all(sql_to_execute.as_bytes())
                 .await
                 .map_err(|e| BackendError::Execute(format!("failed to write to stdin: {}", e)))?;
         }
@@ -212,7 +231,16 @@ impl CliDatabaseInstance {
             )));
         }
 
-        let rows = parse_list_output(&stdout);
+        let mut rows = parse_list_output(&stdout);
+
+        // Filter out MVCC pragma output if present
+        if self.mvcc && !rows.is_empty() {
+            if let Some(first_row) = rows.first() {
+                if first_row.len() == 1 && first_row[0] == "experimental_mvcc" {
+                    rows.remove(0);
+                }
+            }
+        }
 
         Ok(QueryResult::success(rows))
     }

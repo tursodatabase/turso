@@ -37,33 +37,40 @@ check: build-runner
 	$(TEST_RUNNER) check tests
 	$(TEST_RUNNER) check turso-tests
 
+# MVCC mode flag (set MVCC=1 to enable)
+ifdef MVCC
+    MVCC_FLAG := --mvcc
+else
+    MVCC_FLAG :=
+endif
+
 # Run all tests
 run: build
-	$(TEST_RUNNER) run tests --binary $(TURSODB)
-	$(TEST_RUNNER) run turso-tests --binary $(TURSODB)
+	$(TEST_RUNNER) run tests --binary $(TURSODB) $(MVCC_FLAG)
+	$(TEST_RUNNER) run turso-tests --binary $(TURSODB) $(MVCC_FLAG)
 
 # Alias for run
 test: run
 
 # Run tests with filter
 run-filter: build
-	$(TEST_RUNNER) run tests --binary $(TURSODB) --filter $(FILTER)
+	$(TEST_RUNNER) run tests --binary $(TURSODB) --filter $(FILTER) $(MVCC_FLAG)
 
 # Run a single test file: make run-one FILE=tests/select/memory.sqltest
 run-one: build
-	$(TEST_RUNNER) run $(FILE) --binary $(TURSODB)
+	$(TEST_RUNNER) run $(FILE) --binary $(TURSODB) $(MVCC_FLAG)
 
 # Run only core tests
 run-tests: build
-	$(TEST_RUNNER) run tests --binary $(TURSODB)
+	$(TEST_RUNNER) run tests --binary $(TURSODB) $(MVCC_FLAG)
 
 # Run only turso-specific tests
 run-turso-tests: build
-	$(TEST_RUNNER) run turso-tests --binary $(TURSODB)
+	$(TEST_RUNNER) run turso-tests --binary $(TURSODB) $(MVCC_FLAG)
 
 # Run example tests
 run-examples: build
-	$(TEST_RUNNER) run examples --binary $(TURSODB)
+	$(TEST_RUNNER) run examples --binary $(TURSODB) $(MVCC_FLAG)
 
 # Install SQLite binary
 install-sqlite:
