@@ -1064,6 +1064,15 @@ impl Program {
                     // Instruction blocked - will retry at same PC
                     return Ok(StepResult::Busy);
                 }
+                Err(LimboError::BusySnapshot)
+                    if self.connection.transaction_state.get() == TransactionState::None =>
+                {
+                    // For interactive transactions that are already in a read transaction, retrying BusySnapshot is pointless
+                    // because the snapshot will continue to be stale no matter how many times we retry.
+                    // However, for auto-commits or BEGIN IMMEDIATE, failing to promote to write transaction means it was rolled
+                    // back, so auto-retrying can be useful.
+                    return Ok(StepResult::Busy);
+                }
                 Err(err) => {
                     self.abort(&pager, Some(&err), state);
                     return Err(err);
