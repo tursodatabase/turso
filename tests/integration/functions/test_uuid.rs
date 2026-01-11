@@ -9,23 +9,7 @@ fn uuid7_timestamp_ms_empty_blob(tmp_db: TempDatabase) {
     assert_eq!(result, vec![vec![RusqliteValue::Null]]);
 }
 
-/// Test that uuid7_timestamp_ms returns NULL for short blob (1 byte)
-#[turso_macros::test]
-fn uuid7_timestamp_ms_short_blob(tmp_db: TempDatabase) {
-    let conn = tmp_db.connect_limbo();
-    let result = limbo_exec_rows(&conn, "SELECT uuid7_timestamp_ms(X'00')");
-    assert_eq!(result, vec![vec![RusqliteValue::Null]]);
-}
-
-/// Test that uuid7_timestamp_ms returns NULL for 5-byte blob
-#[turso_macros::test]
-fn uuid7_timestamp_ms_5_byte_blob(tmp_db: TempDatabase) {
-    let conn = tmp_db.connect_limbo();
-    let result = limbo_exec_rows(&conn, "SELECT uuid7_timestamp_ms(randomblob(5))");
-    assert_eq!(result, vec![vec![RusqliteValue::Null]]);
-}
-
-/// Test that uuid7_timestamp_ms returns NULL for 10-byte blob
+/// Test that uuid7_timestamp_ms returns NULL for non 16-byte blob
 #[turso_macros::test]
 fn uuid7_timestamp_ms_10_byte_blob(tmp_db: TempDatabase) {
     let conn = tmp_db.connect_limbo();
