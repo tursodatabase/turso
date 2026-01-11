@@ -76,7 +76,7 @@ impl DateTime {
             m = 1;
             d = 1;
         }
-        if y < -4713 || y > 9999 || self.raw_s {
+        if !(-4713..=9999).contains(&y) || self.raw_s {
             self.set_error();
             return;
         }
@@ -134,15 +134,13 @@ impl DateTime {
     }
 
     fn compute_hms(&mut self) {
-        let day_ms: i32;
-        let day_min: i32;
         if self.valid_hms {
             return;
         }
         self.compute_jd();
-        day_ms = ((self.i_jd + 43200000) % 86400000) as i32;
+        let day_ms = ((self.i_jd + 43200000) % 86400000) as i32;
         self.s = (day_ms % 60000) as f64 / 1000.0;
-        day_min = day_ms / 60000;
+        let day_min = day_ms / 60000;
         self.min = day_min % 60;
         self.h = day_min / 60;
         self.raw_s = false;
@@ -164,9 +162,7 @@ impl DateTime {
         assert!(self.valid_ymd || self.is_error);
         assert!(self.d >= 0 && self.d <= 31);
         assert!(self.m >= 0 && self.m <= 12);
-        if self.d <= 28 {
-            self.n_floor = 0;
-        } else if ((1 << self.m) & 0x15aa) != 0 {
+        if self.d <= 28 || ((1 << self.m) & 0x15aa) != 0 {
             self.n_floor = 0;
         } else if self.m != 2 {
             self.n_floor = if self.d == 31 { 1 } else { 0 };
@@ -223,7 +219,7 @@ fn parse_date_or_time(value: &str, p: &mut DateTime) -> Result<()> {
     if let Ok(val) = value.parse::<f64>() {
         p.s = val;
         p.raw_s = true;
-        if val >= 0.0 && val < 5373484.5 {
+        if (0.0..5373484.5).contains(&val) {
             p.i_jd = (val * JD_TO_MS as f64 + 0.5) as i64;
             p.valid_jd = true;
         }
@@ -479,8 +475,7 @@ fn parse_modifier(p: &mut DateTime, z: &str, idx: usize) -> Result<()> {
         Some('a') if z_lower == "auto" => {
             if idx > 0 {
                 return Err(InvalidModifier(format!(
-                    "Modifier 'auto' must be first: {}",
-                    z
+                    "Modifier 'auto' must be first: {z}"
                 )));
             }
             auto_adjust_date(p);
@@ -504,8 +499,7 @@ fn parse_modifier(p: &mut DateTime, z: &str, idx: usize) -> Result<()> {
         Some('j') if z_lower == "julianday" => {
             if idx > 0 {
                 return Err(InvalidModifier(format!(
-                    "Modifier 'julianday' must be first: {}",
-                    z
+                    "Modifier 'julianday' must be first: {z}"
                 )));
             }
             if p.valid_jd && p.raw_s {
@@ -513,8 +507,7 @@ fn parse_modifier(p: &mut DateTime, z: &str, idx: usize) -> Result<()> {
                 Ok(())
             } else {
                 Err(InvalidModifier(format!(
-                    "Invalid use of julianday modifier: {}",
-                    z
+                    "Invalid use of julianday modifier: {z}"
                 )))
             }
         }
@@ -536,8 +529,7 @@ fn parse_modifier(p: &mut DateTime, z: &str, idx: usize) -> Result<()> {
         Some('u') if z_lower == "unixepoch" => {
             if idx > 0 {
                 return Err(InvalidModifier(format!(
-                    "Modifier 'unixepoch' must be first: {}",
-                    z
+                    "Modifier 'unixepoch' must be first: {z}"
                 )));
             }
             if p.raw_s {
@@ -549,8 +541,7 @@ fn parse_modifier(p: &mut DateTime, z: &str, idx: usize) -> Result<()> {
                 Ok(())
             } else {
                 Err(InvalidModifier(format!(
-                    "Invalid use of unixepoch modifier: {}",
-                    z
+                    "Invalid use of unixepoch modifier: {z}"
                 )))
             }
         }
@@ -571,7 +562,7 @@ fn parse_modifier(p: &mut DateTime, z: &str, idx: usize) -> Result<()> {
         }
         Some('w') if z_lower.starts_with("weekday ") => {
             if let Ok(val) = z[8..].trim().parse::<f64>() {
-                if val >= 0.0 && val < 7.0 && (val as i64 as f64) == val {
+                if (0.0..7.0).contains(&val) && (val as i64 as f64) == val {
                     let n = val as i64;
                     p.compute_ymd_hms();
                     p.valid_jd = false;
@@ -585,11 +576,11 @@ fn parse_modifier(p: &mut DateTime, z: &str, idx: usize) -> Result<()> {
                     return Ok(());
                 }
             }
-            Err(InvalidModifier(format!("Invalid weekday: {}", z)))
+            Err(InvalidModifier(format!("Invalid weekday: {z}")))
         }
         Some('s') if z_lower.starts_with("start of ") => {
             if !p.valid_jd && !p.valid_ymd && !p.valid_hms {
-                return Err(InvalidModifier(format!("Invalid start of: {}", z)));
+                return Err(InvalidModifier(format!("Invalid start of: {z}")));
             }
             p.compute_ymd();
             p.valid_hms = true;
@@ -611,7 +602,7 @@ fn parse_modifier(p: &mut DateTime, z: &str, idx: usize) -> Result<()> {
             } else if suffix == "day" {
                 Ok(())
             } else {
-                Err(InvalidModifier(format!("Invalid start of: {}", z)))
+                Err(InvalidModifier(format!("Invalid start of: {z}")))
             }
         }
         Some('s') if z_lower == "subsec" || z_lower == "subsecond" => {
@@ -619,7 +610,7 @@ fn parse_modifier(p: &mut DateTime, z: &str, idx: usize) -> Result<()> {
             Ok(())
         }
         Some('+') | Some('-') | Some('0'..='9') => parse_arithmetic_modifier(p, z),
-        _ => Err(InvalidModifier(format!("Unknown modifier: {}", z))),
+        _ => Err(InvalidModifier(format!("Unknown modifier: {z}"))),
     }
 }
 
@@ -701,8 +692,7 @@ fn parse_arithmetic_modifier(p: &mut DateTime, z: &str) -> Result<()> {
                     } else {
                         // If time parsing failed, the whole modifier is invalid
                         return Err(InvalidModifier(format!(
-                            "Invalid time in arithmetic modifier: {}",
-                            z
+                            "Invalid time in arithmetic modifier: {z}"
                         )));
                     }
                 }
@@ -748,7 +738,7 @@ fn parse_arithmetic_modifier(p: &mut DateTime, z: &str) -> Result<()> {
                         _ => 0.0,
                     };
                     if !limit_check(val, limit) {
-                        return Err(InvalidModifier(format!("Modifier out of range: {}", z)));
+                        return Err(InvalidModifier(format!("Modifier out of range: {z}")));
                     }
 
                     p.compute_jd();
@@ -767,7 +757,7 @@ fn parse_arithmetic_modifier(p: &mut DateTime, z: &str) -> Result<()> {
                 }
                 "month" | "months" => {
                     if !limit_check(val, 176546.0) {
-                        return Err(InvalidModifier(format!("Modifier out of range: {}", z)));
+                        return Err(InvalidModifier(format!("Modifier out of range: {z}")));
                     }
                     p.compute_ymd_hms();
                     let int_months = val as i64;
@@ -796,7 +786,7 @@ fn parse_arithmetic_modifier(p: &mut DateTime, z: &str) -> Result<()> {
                 }
                 "year" | "years" => {
                     if !limit_check(val, 14713.0) {
-                        return Err(InvalidModifier(format!("Modifier out of range: {}", z)));
+                        return Err(InvalidModifier(format!("Modifier out of range: {z}")));
                     }
                     p.compute_ymd_hms();
                     let int_years = val as i64;
@@ -821,10 +811,7 @@ fn parse_arithmetic_modifier(p: &mut DateTime, z: &str) -> Result<()> {
         }
     }
 
-    Err(InvalidModifier(format!(
-        "Invalid arithmetic modifier: {}",
-        z
-    )))
+    Err(InvalidModifier(format!("Invalid arithmetic modifier: {z}")))
 }
 
 pub fn exec_datetime_general<I, E, V>(values: I, func_type: &str) -> Value
@@ -1141,8 +1128,7 @@ where
     let mut res = String::new();
     write!(
         res,
-        "{}{:04}-{:02}-{:02} {:02}:{:02}:{:06.3}",
-        sign, y, m, days, hours, mins, secs
+        "{sign}{y:04}-{m:02}-{days:02} {hours:02}:{mins:02}:{secs:06.3}"
     )
     .unwrap();
 
@@ -1272,17 +1258,17 @@ where
                 if s > 59.999 {
                     s = 59.999;
                 }
-                write!(res, "{:06.3}", s).unwrap()
+                write!(res, "{s:06.3}").unwrap()
             }
             Some('g') => {
-                let mut y_iso = p.clone();
+                let mut y_iso = p;
                 y_iso.i_jd += (3 - days_after_mon(&p)) * 86400000;
                 y_iso.valid_ymd = false;
                 y_iso.compute_ymd();
                 write!(res, "{:02}", y_iso.y % 100).unwrap();
             }
             Some('G') => {
-                let mut y_iso = p.clone();
+                let mut y_iso = p;
                 y_iso.i_jd += (3 - days_after_mon(&p)) * 86400000;
                 y_iso.valid_ymd = false;
                 y_iso.compute_ymd();
@@ -1291,7 +1277,7 @@ where
             Some('H') => write!(res, "{:02}", p.h).unwrap(),
             Some('I') => {
                 let h = if p.h % 12 == 0 { 12 } else { p.h % 12 };
-                write!(res, "{:02}", h).unwrap();
+                write!(res, "{h:02}").unwrap();
             }
             Some('j') => {
                 write!(res, "{:03}", days_after_jan1(&p) + 1).unwrap();
@@ -1299,17 +1285,17 @@ where
             Some('J') => {
                 let val = p.i_jd as f64 / 86400000.0;
                 if val.abs() >= 1_000_000.0 && val.abs() < 10_000_000.0 {
-                    let s = format!("{:.9}", val);
+                    let s = format!("{val:.9}");
                     let trimmed = s.trim_end_matches('0').trim_end_matches('.');
-                    write!(res, "{}", trimmed).unwrap();
+                    write!(res, "{trimmed}").unwrap();
                 } else {
-                    write!(res, "{}", val).unwrap();
+                    write!(res, "{val}").unwrap();
                 }
             }
             Some('k') => write!(res, "{:2}", p.h).unwrap(),
             Some('l') => {
                 let h = if p.h % 12 == 0 { 12 } else { p.h % 12 };
-                write!(res, "{:2}", h).unwrap();
+                write!(res, "{h:2}").unwrap();
             }
             Some('m') => write!(res, "{:02}", p.m).unwrap(),
             Some('M') => write!(res, "{:02}", p.min).unwrap(),
@@ -1324,26 +1310,26 @@ where
                 if w == 0 {
                     w = 7;
                 }
-                write!(res, "{}", w).unwrap();
+                write!(res, "{w}").unwrap();
             }
             Some('U') => {
                 let w = (days_after_jan1(&p) - days_after_sun(&p) + 7) / 7;
-                write!(res, "{:02}", w).unwrap();
+                write!(res, "{w:02}").unwrap();
             }
             Some('V') => {
-                let mut temp = p.clone();
+                let mut temp = p;
                 temp.i_jd += (3 - days_after_mon(&p)) * 86400000;
                 temp.valid_ymd = false;
                 temp.compute_ymd();
                 let w = days_after_jan1(&temp) / 7 + 1;
-                write!(res, "{:02}", w).unwrap();
+                write!(res, "{w:02}").unwrap();
             }
             Some('w') => {
                 write!(res, "{}", days_after_sun(&p)).unwrap();
             }
             Some('W') => {
                 let w = (days_after_jan1(&p) - days_after_mon(&p) + 7) / 7;
-                write!(res, "{:02}", w).unwrap();
+                write!(res, "{w:02}").unwrap();
             }
             Some('Y') => write!(res, "{:04}", p.y).unwrap(),
             Some('%') => res.push('%'),
