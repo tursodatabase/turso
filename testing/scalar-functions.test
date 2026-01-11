@@ -981,6 +981,32 @@ do_execsql_test cast-null-to-any {
   SELECT CAST(NULL AS INTEGER), CAST(NULL AS TEXT), CAST(NULL AS BLOB), CAST(NULL AS REAL), CAST(NULL AS NUMERIC);
 } {||||}
 
+# CAST without type name - SQLite treats this as NUMERIC affinity
+# https://github.com/tursodatabase/turso/issues/4550
+do_execsql_test cast-without-type-integer {
+  SELECT CAST(1 AS);
+} {1}
+
+do_execsql_test cast-without-type-text-numeric {
+  SELECT CAST('hello' AS);
+} {0}
+
+do_execsql_test cast-without-type-text-integer-string {
+  SELECT CAST('123' AS);
+} {123}
+
+do_execsql_test cast-without-type-text-real-string {
+  SELECT typeof(CAST('123.45' AS)), CAST('123.45' AS);
+} {real|123.45}
+
+do_execsql_test cast-without-type-null {
+  SELECT CAST(NULL AS);
+} {}
+
+do_execsql_test cast-without-type-in-expression {
+  SELECT 1 WHERE CAST(1 AS) = 1;
+} {1}
+
 # CAST smoke test in where clause
 do_execsql_test cast-in-where {
   select age from users where age = cast('45' as integer) limit 1;
