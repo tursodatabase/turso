@@ -47,7 +47,7 @@ pub(crate) struct SimulatorFile {
 type IoOperation = Box<dyn FnOnce(&SimulatorFile) -> Result<turso_core::Completion>>;
 
 pub struct DelayedIo {
-    pub time: turso_core::Instant,
+    pub time: turso_core::WallClockInstant,
     pub op: IoOperation,
 }
 
@@ -97,7 +97,7 @@ impl SimulatorFile {
     }
 
     #[instrument(skip_all, level = Level::TRACE)]
-    fn generate_latency_duration(&self) -> Option<turso_core::Instant> {
+    fn generate_latency_duration(&self) -> Option<turso_core::WallClockInstant> {
         let mut rng = self.rng.borrow_mut();
         // Chance to introduce some latency
         rng.random_bool(self.latency_probability as f64 / 100.0)
@@ -109,7 +109,7 @@ impl SimulatorFile {
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
-    pub fn run_queued_io(&self, now: turso_core::Instant) -> Result<()> {
+    pub fn run_queued_io(&self, now: turso_core::WallClockInstant) -> Result<()> {
         let mut queued_io = self.queued_io.borrow_mut();
         for io in queued_io.extract_if(.., |item| item.time <= now) {
             let _c = (io.op)(self)?;

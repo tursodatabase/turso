@@ -5,7 +5,7 @@ use std::{
 
 use rand::{Rng, RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
-use turso_core::{Clock, IO, Instant, OpenFlags, PlatformIO, Result};
+use turso_core::{Clock, IO, MonotonicInstant, OpenFlags, PlatformIO, Result, WallClockInstant};
 
 use crate::runner::{SimIO, cli::IoBackend, clock::SimulatorClock, file::SimulatorFile};
 
@@ -99,7 +99,11 @@ impl SimIO for SimulatorIO {
 }
 
 impl Clock for SimulatorIO {
-    fn now(&self) -> Instant {
+    fn current_time_monotonic(&self) -> MonotonicInstant {
+        MonotonicInstant::now()
+    }
+
+    fn current_time_wall_clock(&self) -> WallClockInstant {
         self.clock.now().into()
     }
 }
@@ -139,7 +143,7 @@ impl IO for SimulatorIO {
     }
 
     fn step(&self) -> Result<()> {
-        let now = self.now();
+        let now = self.current_time_wall_clock();
         for file in self.files.borrow().iter() {
             file.run_queued_io(now)?;
         }

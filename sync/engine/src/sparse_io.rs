@@ -5,7 +5,8 @@ use std::{
 
 use tracing::{instrument, Level};
 use turso_core::{
-    io::clock::DefaultClock, Buffer, Clock, Completion, File, Instant, OpenFlags, Result, IO,
+    io::clock::DefaultClock, Buffer, Clock, Completion, File, MonotonicInstant, OpenFlags, Result,
+    WallClockInstant, IO,
 };
 
 pub struct SparseLinuxIo {}
@@ -45,8 +46,12 @@ impl IO for SparseLinuxIo {
 }
 
 impl Clock for SparseLinuxIo {
-    fn now(&self) -> Instant {
-        DefaultClock.now()
+    fn current_time_monotonic(&self) -> MonotonicInstant {
+        DefaultClock.current_time_monotonic()
+    }
+
+    fn current_time_wall_clock(&self) -> WallClockInstant {
+        DefaultClock.current_time_wall_clock()
     }
 }
 
