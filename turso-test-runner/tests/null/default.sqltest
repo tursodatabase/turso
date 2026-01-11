@@ -1,5 +1,4 @@
-@database database/testing.db readonly
-@database database/testing_norowidalias.db readonly
+@database :memory:
 
 test isnull {
     select null isnull, 'hi' isnull;
