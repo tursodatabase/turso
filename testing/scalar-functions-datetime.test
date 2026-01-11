@@ -1117,3 +1117,20 @@ do_execsql_test datetime-trailing-garbage-rejected {
 do_execsql_test datetime-trailing-garbage-date-rejected {
   SELECT datetime('2024-01-15 10:30:45.123xyz');
 } {{}}
+
+# Overflows
+do_execsql_test arithmetic-overflow {
+  SELECT datetime('2000-01-01', '-262145 years', 'start of year');
+} {{}}
+
+do_execsql_test out-of-bounds-unixepoch {
+  SELECT datetime(-99999999999999999, 'unixepoch', 'start of month');
+} {{}}
+
+do_execsql_test arithmetic-overflow-julianday {
+  SELECT datetime(9999999999999999999.0, 'julianday', 'start of month');
+} {{}}
+
+do_execsql_test overflows-with-large-days-modifier {
+  SELECT datetime('9999-12-31', '+100000000 days', 'start of year');
+} {{}}
