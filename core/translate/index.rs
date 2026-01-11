@@ -189,7 +189,7 @@ pub fn translate_create_index(
         }],
         vec![],
     );
-    let where_clause = idx.bind_where_expr(Some(&mut table_references), connection);
+    let where_clause = idx.bind_where_expr(Some(&mut table_references), connection)?;
 
     // Create a new B-Tree and store the root page index in a register
     let root_page_reg = program.alloc_register();
