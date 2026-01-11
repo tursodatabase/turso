@@ -684,7 +684,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     config.max_steps = shuttle::MaxSteps::FailAfter(10_000_000);
 
     // let scheduler = DfsScheduler::new(None, false);
-    let scheduler = RandomScheduler::new(10);
+    let scheduler = RandomScheduler::new(5);
     let runner = shuttle::Runner::new(scheduler, config);
     runner.run(|| shuttle::future::block_on(Box::pin(async_main())).unwrap());
 
