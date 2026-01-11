@@ -1,5 +1,9 @@
 #[cfg(target_family = "windows")]
 use crate::error::CompletionError;
+use crate::sync::{
+    atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, Ordering},
+    Arc, RwLock,
+};
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
 use crate::types::{WalFrameInfo, WalState};
 #[cfg(feature = "fs")]
@@ -17,15 +21,10 @@ use crate::{
     TransactionState, Trigger, Value, VirtualTable,
 };
 use arc_swap::ArcSwap;
-use parking_lot::RwLock;
 use rustc_hash::FxHashMap;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Display;
 use std::ops::Deref;
-use std::sync::{
-    atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, Ordering},
-    Arc,
-};
 use tracing::{instrument, Level};
 
 pub struct Connection {
