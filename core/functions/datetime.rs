@@ -322,7 +322,7 @@ fn parse_yyyy_mm_dd(mut z: &str, p: &mut DateTime) -> bool {
 fn parse_hh_mm_ss(mut z: &str, p: &mut DateTime) -> bool {
     let h: i32;
     let m: i32;
-    let mut s: i32 = 0;
+    let s: i32;
     let mut ms: f64 = 0.0;
 
     if let Some((val, rem)) = get_digits(z, 2, 0, 24) {
