@@ -1134,3 +1134,16 @@ do_execsql_test arithmetic-overflow-julianday {
 do_execsql_test overflows-with-large-days-modifier {
   SELECT datetime('9999-12-31', '+100000000 days', 'start of year');
 } {{}}
+
+# Invalid date and time
+do_execsql_test invalid-date {
+  select date('2024-07-21 24:00:00');
+} {2024-07-21}
+
+do_execsql_test invalid-time {
+  select time('2024-07-21 24:59:59');
+} {24:59:59}
+
+do_execsql_test invalid-datetime {
+  select time('2024-07-21 24:59:59');
+} {{2024-07-21 24:59:59}}
