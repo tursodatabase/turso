@@ -1137,16 +1137,17 @@ do_execsql_test overflows-with-large-days-modifier {
 
 # Invalid date and time
 do_execsql_test invalid-date {
-  select date('2024-07-21 24:00:00');
+  SELECT date('2024-07-21 24:00:00');
 } {2024-07-21}
 
 do_execsql_test invalid-time {
-  select time('2024-07-21 24:59:59');
+  SELECT time('2024-07-21 24:59:59');
 } {24:59:59}
 
 do_execsql_test invalid-datetime {
-  select time('2024-07-21 24:59:59');
+  SELECT datetime('2024-07-21 24:59:59');
 } {{2024-07-21 24:59:59}}
+
 # Regression tests for multi-byte UTF-8 characters (issue #4551)
 # These should return NULL, not panic
 
