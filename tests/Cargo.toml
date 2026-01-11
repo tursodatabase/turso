@@ -44,6 +44,7 @@ test-log = { version = "0.2.17", features = ["trace"] }
 turso_macros.workspace = true
 
 [features]
-default = ["test_helper"]
+default = ["test_helper", "fts"]
 checksum = ["turso_core/checksum"]
 test_helper = ["turso_core/test_helper"]
+fts = ["turso_core/fts"]

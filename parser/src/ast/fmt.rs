@@ -612,6 +612,14 @@ impl ToTokens for Stmt {
                 }
                 Ok(())
             }
+            Self::Optimize { idx_name } => {
+                s.append(TK_OPTIMIZE, None)?;
+                s.append(TK_INDEX, None)?;
+                if let Some(name) = idx_name {
+                    name.to_tokens(s, context)?;
+                }
+                Ok(())
+            }
             Self::Release { name } => {
                 s.append(TK_RELEASE, None)?;
                 name.to_tokens(s, context)

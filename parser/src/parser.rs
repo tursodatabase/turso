@@ -609,7 +609,8 @@ impl<'a> Parser<'a> {
             TK_INSERT,
             TK_REPLACE,
             TK_UPDATE,
-            TK_REINDEX
+            TK_REINDEX,
+            TK_OPTIMIZE
         );
 
         match tok.token_type {
@@ -632,6 +633,7 @@ impl<'a> Parser<'a> {
             TK_INSERT | TK_REPLACE => self.parse_insert(),
             TK_UPDATE => self.parse_update(),
             TK_REINDEX => self.parse_reindex(),
+            TK_OPTIMIZE => self.parse_optimize(),
             _ => unreachable!(),
         }
     }
@@ -4133,6 +4135,21 @@ impl<'a> Parser<'a> {
                 _ => Ok(Stmt::Reindex { name: None }),
             },
             _ => Ok(Stmt::Reindex { name: None }),
+        }
+    }
+
+    /// Parse `OPTIMIZE INDEX [idx_name]`
+    fn parse_optimize(&mut self) -> Result<Stmt> {
+        eat_assert!(self, TK_OPTIMIZE);
+        eat_expect!(self, TK_INDEX);
+        match self.peek()? {
+            Some(tok) => match tok.token_type.fallback_id_if_ok() {
+                TK_ID | TK_STRING | TK_JOIN_KW | TK_INDEXED => Ok(Stmt::Optimize {
+                    idx_name: Some(self.parse_fullname(false)?),
+                }),
+                _ => Ok(Stmt::Optimize { idx_name: None }),
+            },
+            _ => Ok(Stmt::Optimize { idx_name: None }),
         }
     }
 }
