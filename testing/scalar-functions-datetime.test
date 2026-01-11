@@ -918,6 +918,14 @@ do_execsql_test strftime-seconds-since-epoch {
     SELECT strftime('%s', '2025-01-23T13:14:30.567');
 } {1737638070}
 
+do_execsql_test strftime-with-subsec {
+    SELECT strftime('%s', '2000-01-01 12:00:00.123', 'subsec');
+} {946728000.123}
+
+do_execsql_test strftime-with-subsec-math {
+    SELECT (strftime('%s', '2000-01-01 12:00:00.123', 'subsec') - 946728000);
+} {0.123000025749207}
+
 do_execsql_test strftime-seconds {
     SELECT strftime('%S', '2025-01-23T13:14:30.567');
 } {30}

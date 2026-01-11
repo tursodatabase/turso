@@ -179,10 +179,8 @@ fn get_digits(z: &str, digits: usize, min_val: i32, max_val: i32) -> Option<(i32
         return None;
     }
     let bytes = z.as_bytes();
-    for i in 0..digits {
-        if !bytes[i].is_ascii_digit() {
-            return None;
-        }
+    if !bytes.iter().take(digits).all(|b| b.is_ascii_digit()) {
+        return None;
     }
     let slice = &z[..digits];
     let val = slice.parse::<i32>().ok()?;
@@ -1302,7 +1300,13 @@ where
             Some('p') => write!(res, "{}", if p.h >= 12 { "PM" } else { "AM" }).unwrap(),
             Some('P') => write!(res, "{}", if p.h >= 12 { "pm" } else { "am" }).unwrap(),
             Some('R') => write!(res, "{:02}:{:02}", p.h, p.min).unwrap(),
-            Some('s') => write!(res, "{}", (p.i_jd - 210866760000000) / 1000).unwrap(),
+            Some('s') => {
+                if p.use_subsec {
+                    write!(res, "{:.3}", (p.i_jd - 210866760000000) as f64 / 1000.0).unwrap();
+                } else {
+                    write!(res, "{}", (p.i_jd - 210866760000000) / 1000).unwrap();
+                }
+            }
             Some('S') => write!(res, "{:02}", p.s as i32).unwrap(),
             Some('T') => write!(res, "{:02}:{:02}:{:02}", p.h, p.min, p.s as i32).unwrap(),
             Some('u') => {
