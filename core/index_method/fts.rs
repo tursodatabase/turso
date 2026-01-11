@@ -44,9 +44,9 @@ pub const FTS_INDEX_METHOD_NAME: &str = "fts";
 /// Controls how much memory Tantivy uses for in-memory indexing before flushing to disk.
 pub const DEFAULT_MEMORY_BUDGET_BYTES: usize = 64 * 1024 * 1024;
 
-/// Default chunk size (1MB) for splitting large files when storing in BTree.
+/// Default chunk size (152KB) for splitting large files when storing in BTree.
 /// Files larger than this are split into multiple chunks for efficient storage and retrieval.
-pub const DEFAULT_CHUNK_SIZE: usize = 1024 * 1024;
+pub const DEFAULT_CHUNK_SIZE: usize = 512 * 1024;
 
 /// Number of documents to batch before committing to Tantivy.
 /// Higher values improve throughput but increase memory usage and latency.
