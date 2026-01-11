@@ -182,10 +182,13 @@ fn get_digits(z: &str, digits: usize, min_val: i32, max_val: i32) -> Option<(i32
     if z.len() < digits {
         return None;
     }
-    let slice = &z[..digits];
-    if !slice.chars().all(|c| c.is_ascii_digit()) {
-        return None;
+    let bytes = z.as_bytes();
+    for i in 0..digits {
+        if !bytes[i].is_ascii_digit() {
+            return None;
+        }
     }
+    let slice = &z[..digits];
     let val = slice.parse::<i32>().ok()?;
     if val < min_val || val > max_val {
         return None;
