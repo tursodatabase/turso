@@ -300,27 +300,19 @@ One table, and one index: per each FTS index
     );
     ```
     
-- **Unique index:**
+- **Index:**
     
     ```sql
-    CREATE UNIQUE INDEX fts_dir_{idx_id}_key ON fts_dir_{idx_id} 
-    (path, chunk_no ASC);
+    CREATE INDEX IF NOT EXISTS idx_name ON table_name USING backing_btree (path, chunk_no, bytes)
     ```
-    
+ 
 
-This way we can use an index cursor to `SeekGE` (path, chunk_no) where chunk_no is just computed from the offset requested by `read_bytes` on the file handle.
+Use `backing_btree` to create a BTree that stores all columns without rowid indirection
+This allows direct cursor access with the exact key structure. This way we can use an index cursor to `SeekGE` (path, chunk_no) where chunk_no is just computed from the offset requested by `read_bytes` on the file handle.
 
-# Current Architecture
+# Current Architecture: HybridBTreeDirectory
 
-## Problem Statement
-
-The original `CachedBTreeDirectory` implementation loaded ALL Tantivy files into memory at startup. This doesn't scale for medium to large indexes (100MB - 1GB+), causing significant memory pressure.
-
-Additionally, Tantivy's synchronous `Directory` trait needed careful integration with our async BTree storage layer.
-
-## New Architecture: HybridBTreeDirectory
-
-The redesigned architecture uses a hybrid approach that balances memory usage and performance:
+The architecture uses a hybrid approach that balances memory usage and performance:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
