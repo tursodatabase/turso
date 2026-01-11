@@ -1,11 +1,11 @@
-@database database/testing.db readonly
-@database database/testing_norowidalias.db readonly
+@database :default:
+@database :default-no-rowidalias:
 
 test select-avg {
     SELECT avg(age) FROM users;
 }
 expect {
-    50.396
+    50.4576
 }
 
 test select-avg-text {
@@ -19,7 +19,7 @@ test select-sum {
     SELECT sum(age) FROM users;
 }
 expect {
-    503960
+    504576
 }
 
 test select-sum-text {
@@ -33,7 +33,7 @@ test select-total {
     SELECT total(age) FROM users;
 }
 expect {
-    503960.0
+    504576.0
 }
 
 test select-total-text {
@@ -96,14 +96,14 @@ test select-max-text {
     SELECT max(first_name) FROM users;
 }
 expect {
-    Zoe
+    Zula
 }
 
 test select-min-text {
     SELECT min(first_name) FROM users;
 }
 expect {
-    Aaron
+    Aaliyah
 }
 
 test select-group-concat {
@@ -201,30 +201,30 @@ test select-non-agg-cols-should-be-not-null {
     SELECT id, first_name, sum(age) FROM users LIMIT 1;
 }
 expect {
-    1|Jamie|503960
+    1|Dan|504576
 }
 
 test select-with-group-by-and-agg-1 {
     SELECT id, first_name, avg(age) FROM users group by last_name limit 1;
 }
 expect {
-    274|Debra|66.25
+    276|Zander|47.2777777777778
 }
 
 test select-with-group-by-and-agg-2 {
     select first_name, last_name from users where state = 'AL' group by last_name limit 10;
 }
 expect {
-    Jay|Acosta
-    Daniel|Adams
-    Aaron|Baker
-    Sharon|Becker
-    Kim|Berg
-    Donald|Bishop
-    Brian|Bradford
-    Jesus|Bradley
-    John|Brown
-    Hunter|Burke
+    Ottis|Abernathy
+    Dewayne|Auer
+    Mariela|Bailey
+    Amely|Becker
+    Korbin|Beer
+    Catalina|Berge
+    Layne|Bernier
+    Ulices|Bins
+    Kade|Bosco
+    Kaley|Botsford
 }
 
 test select-agg-json-array {
@@ -256,16 +256,17 @@ test select-json-group-object {
     order by price;
 }
 expect {
-1.0|{"9":"boots"}
-18.0|{"3":"shirt"}
-25.0|{"4":"sweater"}
-33.0|{"10":"coat"}
-70.0|{"6":"shorts"}
-74.0|{"5":"sweatshirt"}
-78.0|{"7":"jeans"}
-79.0|{"1":"hat"}
-81.0|{"11":"accessories"}
-82.0|{"2":"cap","8":"sneakers"}
+8.85709624556419|{"10":"coat"}
+22.7209470048471|{"3":"shirt"}
+23.8100541984648|{"5":"sweatshirt"}
+32.2475410444338|{"2":"cap"}
+36.1006791183673|{"8":"sneakers"}
+47.5875632652657|{"11":"accessories"}
+47.9379799632405|{"7":"jeans"}
+50.0363795824125|{"6":"shorts"}
+59.7782771700224|{"9":"boots"}
+68.9227440029754|{"4":"sweater"}
+82.9389679823547|{"1":"hat"}
 }
 
 test select-json-group-object-no-sorting-required {
@@ -278,11 +279,11 @@ test select-json-group-object-no-sorting-required {
     limit 5;
 }
 expect {
-1|{"6737":"Amy"}
-2|{"2297":"Amy","3580":"Amanda"}
-3|{"3437":"Amanda"}
-5|{"2378":"Amy","3227":"Amy","5605":"Amanda"}
-7|{"2454":"Amber"}
+3|{"6115":"Amelia","8536":"Amara"}
+4|{"4647":"Amelia"}
+5|{"8740":"Amy"}
+8|{"2505":"Ambrose","3430":"Amara"}
+11|{"523":"Amparo"}
 }
 
 test select-max-star {
