@@ -297,6 +297,7 @@ pub enum TursoStatusCode {
 #[derive(Debug, Clone)]
 pub enum TursoError {
     Busy(String),
+    BusySnapshot(String),
     Interrupt(String),
     Error(String),
     Misuse(String),
@@ -334,6 +335,7 @@ impl TursoError {
     pub fn to_capi_code(&self) -> capi::c::turso_status_code_t {
         match self {
             TursoError::Busy(_) => capi::c::turso_status_code_t::TURSO_BUSY,
+            TursoError::BusySnapshot(_) => capi::c::turso_status_code_t::TURSO_BUSY_SNAPSHOT,
             TursoError::Interrupt(_) => capi::c::turso_status_code_t::TURSO_INTERRUPT,
             TursoError::Error(_) => capi::c::turso_status_code_t::TURSO_ERROR,
             TursoError::Misuse(_) => capi::c::turso_status_code_t::TURSO_MISUSE,
@@ -351,6 +353,7 @@ impl Display for TursoError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             TursoError::Busy(s)
+            | TursoError::BusySnapshot(s)
             | TursoError::Interrupt(s)
             | TursoError::Error(s)
             | TursoError::Misuse(s)
@@ -384,6 +387,9 @@ impl From<LimboError> for TursoError {
             LimboError::DatabaseFull(e) => TursoError::DatabaseFull(e),
             LimboError::ReadOnly => TursoError::Readonly("database is readonly".to_string()),
             LimboError::Busy => TursoError::Busy("database is locked".to_string()),
+            LimboError::BusySnapshot => TursoError::BusySnapshot(
+                "database snapshot is stale, rollback and retry the transaction".to_string(),
+            ),
             LimboError::CompletionError(turso_core::CompletionError::IOError(kind)) => {
                 TursoError::IoError(kind)
             }

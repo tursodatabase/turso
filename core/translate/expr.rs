@@ -962,9 +962,12 @@ pub fn translate_expr(
             Ok(target_register)
         }
         ast::Expr::Cast { expr, type_name } => {
-            let type_name = type_name.as_ref().unwrap(); // TODO: why is this optional?
             translate_expr(program, referenced_tables, expr, target_register, resolver)?;
-            let type_affinity = Affinity::affinity(&type_name.name);
+            // SQLite allows CAST(x AS) without a type name, treating it as NUMERIC affinity
+            let type_affinity = type_name
+                .as_ref()
+                .map(|t| Affinity::affinity(&t.name))
+                .unwrap_or(Affinity::Numeric);
             program.emit_insn(Insn::Cast {
                 reg: target_register,
                 affinity: type_affinity,

@@ -48,7 +48,7 @@ use crate::translate::trigger_exec::{
 };
 use crate::translate::values::emit_values;
 use crate::translate::window::{emit_window_results, init_window, WindowMetadata};
-use crate::util::{exprs_are_equivalent, normalize_ident};
+use crate::util::{exprs_are_equivalent, normalize_ident, parse_numeric_literal};
 use crate::vdbe::affinity::Affinity;
 use crate::vdbe::builder::{CursorKey, CursorType, ProgramBuilder};
 use crate::vdbe::insn::{
@@ -3351,16 +3351,17 @@ fn init_limit(
     if limit_ctx.initialize_counter {
         if let Some(expr) = limit {
             match expr.as_ref() {
-                Expr::Literal(Literal::Numeric(n)) => {
-                    if let Ok(value) = n.parse::<i64>() {
+                Expr::Literal(Literal::Numeric(n)) => match parse_numeric_literal(n)? {
+                    crate::types::Value::Integer(value) => {
                         program.add_comment(program.offset(), "LIMIT counter");
                         program.emit_insn(Insn::Integer {
                             value,
                             dest: limit_ctx.reg_limit,
                         });
-                    } else {
+                    }
+                    crate::types::Value::Float(value) => {
                         program.emit_insn(Insn::Real {
-                            value: n.parse::<f64>().unwrap(),
+                            value,
                             dest: limit_ctx.reg_limit,
                         });
                         program.add_comment(program.offset(), "LIMIT counter");
@@ -3368,7 +3369,8 @@ fn init_limit(
                             reg: limit_ctx.reg_limit,
                         });
                     }
-                }
+                    _ => unreachable!("parse_numeric_literal only returns Integer or Float"),
+                },
                 _ => {
                     let r = limit_ctx.reg_limit;
 
@@ -3384,23 +3386,22 @@ fn init_limit(
             let offset_reg = program.alloc_register();
             t_ctx.reg_offset = Some(offset_reg);
             match expr.as_ref() {
-                Expr::Literal(Literal::Numeric(n)) => {
-                    if let Ok(value) = n.parse::<i64>() {
+                Expr::Literal(Literal::Numeric(n)) => match parse_numeric_literal(n)? {
+                    crate::types::Value::Integer(value) => {
                         program.emit_insn(Insn::Integer {
                             value,
                             dest: offset_reg,
                         });
-                    } else {
-                        let value = n.parse::<f64>()?;
+                    }
+                    crate::types::Value::Float(value) => {
                         program.emit_insn(Insn::Real {
                             value,
-                            dest: limit_ctx.reg_limit,
+                            dest: offset_reg,
                         });
-                        program.emit_insn(Insn::MustBeInt {
-                            reg: limit_ctx.reg_limit,
-                        });
+                        program.emit_insn(Insn::MustBeInt { reg: offset_reg });
                     }
-                }
+                    _ => unreachable!("parse_numeric_literal only returns Integer or Float"),
+                },
                 _ => {
                     _ = translate_expr(program, None, expr, offset_reg, &t_ctx.resolver)?;
                 }

@@ -1117,3 +1117,26 @@ do_execsql_test datetime-trailing-garbage-rejected {
 do_execsql_test datetime-trailing-garbage-date-rejected {
   SELECT datetime('2024-01-15 10:30:45.123xyz');
 } {{}}
+
+# Regression tests for multi-byte UTF-8 characters (issue #4551)
+# These should return NULL, not panic
+
+do_execsql_test datetime-multibyte-utf8-emoji {
+  SELECT datetime('2024-01-01 🎉🎉');
+} {{}}
+
+do_execsql_test date-multibyte-utf8-chinese {
+  SELECT date('2024-01-01 中文字');
+} {{}}
+
+do_execsql_test time-multibyte-utf8-japanese {
+  SELECT time('2024-01-01 日本語');
+} {{}}
+
+do_execsql_test julianday-multibyte-utf8-cyrillic {
+  SELECT julianday('2024-01-01 Привет');
+} {{}}
+
+do_execsql_test datetime-multibyte-utf8-greek {
+  SELECT datetime('2024-01-01 αβγδεζ');
+} {{}}

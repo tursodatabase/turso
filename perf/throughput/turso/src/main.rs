@@ -227,7 +227,7 @@ async fn worker_thread(
                         .await
                     {
                         Ok(_) => insert_count += 1,
-                        Err(turso::Error::Error(msg)) if msg.contains("snapshot is stale") => {
+                        Err(turso::Error::BusySnapshot(_)) => {
                             eprintln!("[Thread {thread_id}] Snapshot is stale during INSERT, rolling back transaction");
                             conn.execute("ROLLBACK", ())
                                 .await
