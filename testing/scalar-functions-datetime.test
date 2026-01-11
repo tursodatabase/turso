@@ -1170,3 +1170,33 @@ do_execsql_test julianday-multibyte-utf8-cyrillic {
 do_execsql_test datetime-multibyte-utf8-greek {
   SELECT datetime('2024-01-01 αβγδεζ');
 } {{}}
+
+# Invalid Leap Years
+do_execsql_test date-leapyear-floor {
+  SELECT date('2000-02-31', 'floor');
+} {2000-02-29}
+
+do_execsql_test date-leapyear-floor2 {
+  SELECT date('1999-02-31', 'floor');
+} {1999-02-28}
+
+do_execsql_test date-leapyear-ceiling {
+  SELECT date('2000-02-31', 'ceiling');
+} {2000-03-02}
+
+do_execsql_test date-leapyear-ceiling2 {
+  SELECT date('1999-02-31', 'ceiling');
+} {1999-03-03}
+
+do_execsql_test leapyear-plus-month {
+	SELECT date('2023-02-31', '+1 month');
+} {2023-03-31}
+
+do_execsql_test invalid-date-format {
+  SELECT datetime('now', '+2024-1-1');
+} {{}}
+
+do_execsql_test invalid-datetime-modifier-format {
+  SELECT datetime(-100, 'start of month');
+} {{}}
+
