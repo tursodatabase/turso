@@ -359,12 +359,14 @@ impl Property {
                                 for row in rows {
                                     for (i, (col, set_val)) in update.set_values.iter().enumerate()
                                     {
-                                        let val = set_val.value();
+                                        let val = set_val.simple_value();
                                         if &row[i] != val {
                                             let update_rows = update
                                                 .set_values
                                                 .iter()
-                                                .map(|(_, set_value)| set_value.value().clone())
+                                                .map(|(_, set_value)| {
+                                                    set_value.simple_value().clone()
+                                                })
                                                 .collect::<Vec<_>>();
                                             print_diff(
                                                 &[row.to_vec()],
@@ -1262,10 +1264,7 @@ impl Property {
 
                         for row in before_rows {
                             if !final_rows.contains(row) {
-                                return Ok(Err(format!(
-                                    "row {:?} missing after commit",
-                                    row
-                                )));
+                                return Ok(Err(format!("row {:?} missing after commit", row)));
                             }
                         }
 
@@ -1460,8 +1459,14 @@ fn property_read_your_updates_back<R: rand::Rng + ?Sized>(
     ctx: &impl GenerationContext,
     _mvcc: bool,
 ) -> Property {
-    // e.g. UPDATE t SET a=1, b=2 WHERE c=1;
-    let update = Update::arbitrary(rng, ctx);
+    let update = loop {
+        let candidate = Update::arbitrary(rng, ctx);
+        if !candidate.has_case_when() {
+            break candidate;
+        }
+        // in-theory this could cause infinite loop but very very very very unlikely so ok
+    };
+
     // e.g. SELECT a, b FROM t WHERE c=1;
     let select = Select::single(
         update.table().to_string(),

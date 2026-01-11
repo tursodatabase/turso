@@ -12,7 +12,7 @@ use sql_generation::model::{
         pragma::Pragma,
         select::{CompoundOperator, FromClause, ResultColumn, SelectInner},
         transaction::{Begin, Commit, Rollback},
-        update::Update,
+        update::{SetValue, Update},
     },
     table::{Index, JoinTable, JoinType, SimValue, Table, TableContext},
 };
@@ -622,7 +622,7 @@ impl Shadow for Update {
 
     fn shadow(&self, tables: &mut ShadowTablesMut) -> Self::Result {
         // First pass: find rows to update and compute old/new values
-        let (columns, updates) = {
+        let updates = {
             let table = tables.iter().find(|t| t.name == self.table);
             let table = if let Some(table) = table {
                 table
@@ -634,7 +634,7 @@ impl Shadow for Update {
             };
 
             let t2 = table.clone();
-            let columns = table.columns.clone();
+            let columns = &table.columns;
 
             let updates: Vec<(Vec<SimValue>, Vec<SimValue>)> = table
                 .rows
@@ -646,14 +646,27 @@ impl Shadow for Update {
                         if let Some((idx, _)) =
                             columns.iter().enumerate().find(|(_, c)| &c.name == column)
                         {
-                            new_row[idx] = set_value.value().clone();
+                            match set_value {
+                                SetValue::Simple(v) => {
+                                    new_row[idx] = v.clone();
+                                }
+                                SetValue::CaseWhen {
+                                    condition,
+                                    then_value,
+                                    ..
+                                } => {
+                                    if condition.test(old_row, &t2) {
+                                        new_row[idx] = then_value.clone();
+                                    }
+                                }
+                            }
                         }
                     }
                     (old_row.clone(), new_row)
                 })
                 .collect();
 
-            (columns, updates)
+            updates
         };
 
         // Record the operations for transaction tracking
@@ -664,18 +677,9 @@ impl Shadow for Update {
 
         // Second pass: apply the updates
         if let Some(table) = tables.iter_mut().find(|t| t.name == self.table) {
-            let t2 = table.clone();
-            for row in table
-                .rows
-                .iter_mut()
-                .filter(|r| self.predicate.test(r, &t2))
-            {
-                for (column, set_value) in &self.set_values {
-                    if let Some((idx, _)) =
-                        columns.iter().enumerate().find(|(_, c)| &c.name == column)
-                    {
-                        row[idx] = set_value.value().clone();
-                    }
+            for (old_row, new_row) in &updates {
+                if let Some(row) = table.rows.iter_mut().find(|r| *r == old_row) {
+                    *row = new_row.clone();
                 }
             }
         }

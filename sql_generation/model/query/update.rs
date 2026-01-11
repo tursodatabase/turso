@@ -21,13 +21,18 @@ pub enum SetValue {
 }
 
 impl SetValue {
-    /// Returns the value used for shadow model verification.
-    /// For CaseWhen, returns then_value (shadow assumes condition matches).
-    pub fn value(&self) -> &SimValue {
+    /// Returns the simple value
+    pub fn simple_value(&self) -> &SimValue {
         match self {
             SetValue::Simple(v) => v,
-            SetValue::CaseWhen { then_value, .. } => then_value,
+            SetValue::CaseWhen { .. } => {
+                panic!("simple_value() called on CaseWhen variant")
+            }
         }
+    }
+
+    pub fn is_case_when(&self) -> bool {
+        matches!(self, SetValue::CaseWhen { .. })
     }
 }
 
@@ -60,6 +65,10 @@ pub struct Update {
 impl Update {
     pub fn table(&self) -> &str {
         &self.table
+    }
+
+    pub fn has_case_when(&self) -> bool {
+        self.set_values.iter().any(|(_, v)| v.is_case_when())
     }
 }
 

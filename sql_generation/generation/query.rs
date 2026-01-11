@@ -493,24 +493,34 @@ impl Arbitrary for Update {
             .filter(|c| !c.has_unique_constraint())
             .collect();
 
+        // (first row and last row have different values)
+        let last_row_idx = table.rows.len().saturating_sub(1);
+        let conflict_capable_columns: Vec<(usize, &Column)> = if table.rows.len() >= 2 {
+            unique_columns
+                .iter()
+                .filter(|(col_idx, _)| {
+                    table.rows[0][*col_idx] != table.rows[last_row_idx][*col_idx]
+                })
+                .copied()
+                .collect()
+        } else {
+            vec![]
+        };
+
         // CASE WHEN:
         // 1. Profile explicitly enables force_late_failure
-        // 2. Table has at least one UNIQUE column
-        // 3. Table has at least 2 rows (so we can create a conflict)
-        // 4. Table has at least one non-UNIQUE column (for the marker update)
+        // 2. Table has conflict-capable UNIQUE columns
+        // 3. Table has at least one non-UNIQUE column
         let use_case_when = update_opts.force_late_failure
-            && !unique_columns.is_empty()
-            && table.rows.len() >= 2
+            && !conflict_capable_columns.is_empty()
             && !non_unique_columns.is_empty();
 
         let (set_values, predicate) = if use_case_when {
-
-            let (unique_col_idx, unique_col) = *pick(&unique_columns, rng);
+            let (unique_col_idx, unique_col) = *pick(&conflict_capable_columns, rng);
             let marker_col = *pick(&non_unique_columns, rng);
 
             // Get values from first and last rows for conflict
             let first_row_unique = table.rows[0][unique_col_idx].clone();
-            let last_row_idx = table.rows.len() - 1;
             let last_row_unique = table.rows[last_row_idx][unique_col_idx].clone();
 
             let mut set_values: Vec<(String, SetValue)> = Vec::new();
