@@ -6,7 +6,7 @@ use turso_parser::ast::{self, Expr, SubqueryType, UnaryOperator};
 use super::emitter::Resolver;
 use super::optimizer::Optimizable;
 use super::plan::TableReferences;
-#[cfg(feature = "fts")]
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
 use crate::function::FtsFunc;
 #[cfg(feature = "json")]
 use crate::function::JsonFunc;
@@ -2185,7 +2185,7 @@ pub fn translate_expr(
                         Ok(target_register)
                     }
                 },
-                #[cfg(feature = "fts")]
+                #[cfg(all(feature = "fts", not(target_family = "wasm")))]
                 Func::Fts(_) => {
                     // FTS functions are handled via index method pattern matching.
                     // If we reach here, no index matched, so translate as a regular function call.
@@ -3467,7 +3467,7 @@ fn translate_like_base(
                 },
             });
         }
-        #[cfg(feature = "fts")]
+        #[cfg(all(feature = "fts", not(target_family = "wasm")))]
         ast::LikeOperator::Match => {
             // Transform MATCH to fts_match():
             // - `col MATCH 'query'` -> `fts_match(col, 'query')`

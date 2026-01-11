@@ -5935,7 +5935,7 @@ pub fn op_function(
                 state.registers[*dest + 4] = Register::Value(sql.clone());
             }
         }
-        #[cfg(feature = "fts")]
+        #[cfg(all(feature = "fts", not(target_family = "wasm")))]
         crate::function::Func::Fts(fts_func) => {
             // FTS functions are typically handled via index method pattern matching.
             // If we reach here, just return a fallback since no FTS index matched.

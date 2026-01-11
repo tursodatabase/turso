@@ -195,7 +195,7 @@ impl Display for VectorFunc {
 }
 
 /// Full-text search functions
-#[cfg(feature = "fts")]
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
 #[derive(Debug, Clone, PartialEq)]
 pub enum FtsFunc {
     /// fts_score(col1, col2, ..., query): computes FTS relevance score
@@ -209,14 +209,14 @@ pub enum FtsFunc {
     Highlight,
 }
 
-#[cfg(feature = "fts")]
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
 impl FtsFunc {
     pub fn is_deterministic(&self) -> bool {
         true
     }
 }
 
-#[cfg(feature = "fts")]
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
 impl Display for FtsFunc {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let str = match self {
@@ -668,7 +668,7 @@ pub enum Func {
     Scalar(ScalarFunc),
     Math(MathFunc),
     Vector(VectorFunc),
-    #[cfg(feature = "fts")]
+    #[cfg(all(feature = "fts", not(target_family = "wasm")))]
     Fts(FtsFunc),
     #[cfg(feature = "json")]
     Json(JsonFunc),
@@ -683,7 +683,7 @@ impl Display for Func {
             Self::Scalar(scalar_func) => write!(f, "{scalar_func}"),
             Self::Math(math_func) => write!(f, "{math_func}"),
             Self::Vector(vector_func) => write!(f, "{vector_func}"),
-            #[cfg(feature = "fts")]
+            #[cfg(all(feature = "fts", not(target_family = "wasm")))]
             Self::Fts(fts_func) => write!(f, "{fts_func}"),
             #[cfg(feature = "json")]
             Self::Json(json_func) => write!(f, "{json_func}"),
@@ -706,7 +706,7 @@ impl Deterministic for Func {
             Self::Scalar(scalar_func) => scalar_func.is_deterministic(),
             Self::Math(math_func) => math_func.is_deterministic(),
             Self::Vector(vector_func) => vector_func.is_deterministic(),
-            #[cfg(feature = "fts")]
+            #[cfg(all(feature = "fts", not(target_family = "wasm")))]
             Self::Fts(fts_func) => fts_func.is_deterministic(),
             #[cfg(feature = "json")]
             Self::Json(json_func) => json_func.is_deterministic(),
@@ -972,11 +972,11 @@ impl Func {
             "vector_concat" => Ok(Self::Vector(VectorFunc::VectorConcat)),
             "vector_slice" => Ok(Self::Vector(VectorFunc::VectorSlice)),
             // FTS functions
-            #[cfg(feature = "fts")]
+            #[cfg(all(feature = "fts", not(target_family = "wasm")))]
             "fts_score" => Ok(Self::Fts(FtsFunc::Score)),
-            #[cfg(feature = "fts")]
+            #[cfg(all(feature = "fts", not(target_family = "wasm")))]
             "fts_match" => Ok(Self::Fts(FtsFunc::Match)),
-            #[cfg(feature = "fts")]
+            #[cfg(all(feature = "fts", not(target_family = "wasm")))]
             "fts_highlight" => Ok(Self::Fts(FtsFunc::Highlight)),
             _ => crate::bail_parse_error!("no such function: {}", name),
         }

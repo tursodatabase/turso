@@ -429,7 +429,7 @@ pub fn optimize_plan(program: &mut ProgramBuilder, plan: &mut Plan, schema: &Sch
     Ok(())
 }
 
-#[cfg(feature = "fts")]
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
 /// Transform MATCH expressions to fts_match() function calls.
 fn transform_match_to_fts_match(where_clause: &mut [WhereTerm]) {
     for term in where_clause.iter_mut() {
@@ -482,7 +482,7 @@ fn transform_match_to_fts_match(where_clause: &mut [WhereTerm]) {
  */
 pub fn optimize_select_plan(plan: &mut SelectPlan, schema: &Schema) -> Result<()> {
     // Transform MATCH expressions to fts_match() for FTS optimizer recognition
-    #[cfg(feature = "fts")]
+    #[cfg(all(feature = "fts", not(target_family = "wasm")))]
     transform_match_to_fts_match(&mut plan.where_clause);
 
     optimize_subqueries(plan, schema)?;
@@ -515,7 +515,7 @@ pub fn optimize_select_plan(plan: &mut SelectPlan, schema: &Schema) -> Result<()
 }
 
 fn optimize_delete_plan(plan: &mut DeletePlan, schema: &Schema) -> Result<()> {
-    #[cfg(feature = "fts")]
+    #[cfg(all(feature = "fts", not(target_family = "wasm")))]
     transform_match_to_fts_match(&mut plan.where_clause);
 
     lift_common_subexpressions_from_binary_or_terms(&mut plan.where_clause)?;
@@ -551,7 +551,7 @@ fn optimize_update_plan(
     plan: &mut UpdatePlan,
     schema: &Schema,
 ) -> Result<()> {
-    #[cfg(feature = "fts")]
+    #[cfg(all(feature = "fts", not(target_family = "wasm")))]
     transform_match_to_fts_match(&mut plan.where_clause);
     lift_common_subexpressions_from_binary_or_terms(&mut plan.where_clause)?;
     if let ConstantConditionEliminationResult::ImpossibleCondition =
