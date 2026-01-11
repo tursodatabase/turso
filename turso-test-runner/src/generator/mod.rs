@@ -143,24 +143,32 @@ async fn create_tables(conn: &Connection, no_rowid_alias: bool) -> Result<()> {
 
     let users_sql = format!(
         r#"
-        CREATE TABLE IF NOT EXISTS users (
-            id {pk_type},
-            first_name TEXT,
-            last_name TEXT,
-            email TEXT,
-            phone_number TEXT,
-            address TEXT,
-            city TEXT,
-            state TEXT,
-            zipcode TEXT,
-            age INTEGER
-        )
+        CREATE TABLE users (
+        id {pk_type},
+        first_name TEXT,
+        last_name TEXT,
+        email TEXT,
+        phone_number TEXT,
+        address TEXT,
+        city TEXT,
+        state TEXT,
+        zipcode TEXT,
+        age INTEGER
+    );
         "#
     );
 
     conn.execute(&users_sql, ())
         .await
         .with_context(|| format!("failed to create users table: {}", users_sql.trim()))?;
+
+    if !no_rowid_alias {
+        let index_sql = format!("CREATE INDEX age_idx ON users (age);");
+
+        conn.execute(&index_sql, ())
+            .await
+            .with_context(|| format!("failed to create user index table: {}", index_sql.trim()))?;
+    }
 
     let products_sql = format!(
         r#"
