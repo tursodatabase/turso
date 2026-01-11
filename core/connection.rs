@@ -1,3 +1,5 @@
+#[cfg(target_family = "windows")]
+use crate::error::CompletionError;
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
 use crate::types::{WalFrameInfo, WalState};
 #[cfg(feature = "fs")]
