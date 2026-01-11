@@ -18,6 +18,12 @@ pub enum PyTursoStatusCode {
     Io = 3,
 }
 create_exception!(turso, Busy, PyException, "database is locked");
+create_exception!(
+    turso,
+    BusySnapshot,
+    PyException,
+    "database snapshot is stale"
+);
 create_exception!(turso, Interrupt, PyException, "interrupted");
 create_exception!(turso, Error, PyException, "generic error");
 create_exception!(turso, Misuse, PyException, "API misuse");
@@ -31,6 +37,7 @@ create_exception!(turso, IoError, PyException, "I/O error");
 pub(crate) fn turso_error_to_py_err(err: TursoError) -> PyErr {
     match err {
         rsapi::TursoError::Busy(message) => Busy::new_err(message),
+        rsapi::TursoError::BusySnapshot(message) => BusySnapshot::new_err(message),
         rsapi::TursoError::Interrupt(message) => Interrupt::new_err(message),
         rsapi::TursoError::Error(message) => Error::new_err(message),
         rsapi::TursoError::Misuse(message) => Misuse::new_err(message),
