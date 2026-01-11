@@ -88,6 +88,8 @@ pub enum Error {
     #[error("{0}")]
     Busy(String),
     #[error("{0}")]
+    BusySnapshot(String),
+    #[error("{0}")]
     Interrupt(String),
     #[error("{0}")]
     Error(String),
@@ -111,6 +113,7 @@ impl From<turso_sdk_kit::rsapi::TursoError> for Error {
     fn from(value: turso_sdk_kit::rsapi::TursoError) -> Self {
         match value {
             turso_sdk_kit::rsapi::TursoError::Busy(err) => Error::Busy(err),
+            turso_sdk_kit::rsapi::TursoError::BusySnapshot(err) => Error::BusySnapshot(err),
             turso_sdk_kit::rsapi::TursoError::Interrupt(err) => Error::Interrupt(err),
             turso_sdk_kit::rsapi::TursoError::Error(err) => Error::Error(err),
             turso_sdk_kit::rsapi::TursoError::Misuse(err) => Error::Misuse(err),

@@ -776,8 +776,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         stop = true;
                         break;
                     }
-                    Err(turso::Error::Error(e)) if e.contains("snapshot is stale") => {
-                        // fixme: refactor BusySnapshot to a separate error instead of using string comparison bullshit
+                    Err(turso::Error::BusySnapshot(e)) => {
                         println!("Error (busy snapshot): {e}");
                         retry_counter += 1;
                     }
@@ -863,6 +862,9 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         }
                         turso::Error::Busy(e) => {
                             println!("thread#{thread} Error[WARNING] executing query: {e}");
+                        }
+                        turso::Error::BusySnapshot(e) => {
+                            println!("thread#{thread} Error[WARNING] busy snapshot: {e}");
                         }
                         turso::Error::Error(e) => {
                             if opts.verbose {
