@@ -87,11 +87,13 @@ pub enum Command {
     /// Show names of indexes
     #[command(name = "indexes", display_name = ".indexes")]
     ListIndexes(IndexesArgs),
+    /// Toggle query execution timing on/off
     #[command(name = "timer", display_name = ".timer")]
     Timer(TimerArgs),
     /// Toggle column headers on/off in list mode
     #[command(name = "headers", display_name = ".headers")]
     Headers(HeadersArgs),
+    /// Clone the current database to a new file
     #[command(name = "clone", display_name = ".clone")]
     Clone(CloneArgs),
     /// Display manual pages for features

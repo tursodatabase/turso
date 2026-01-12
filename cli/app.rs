@@ -6,10 +6,7 @@ use crate::{
     },
     config::Config,
     helper::LimboHelper,
-    input::{
-        get_io, get_writer, ApplyWriter, DbLocation, NoopProgress, OutputMode, ProgressSink,
-        Settings, StderrProgress,
-    },
+    input::{get_io, get_writer, DbLocation, NoopProgress, OutputMode, ProgressSink, Settings},
     manual,
     opcodes_dictionary::OPCODE_DESCRIPTIONS,
     read_state_machine::ReadState,
@@ -1806,17 +1803,8 @@ impl Limbo {
     }
 
     fn clone_database(&mut self, output_file: &str) -> anyhow::Result<()> {
-        use std::path::Path;
-        if Path::new(output_file).exists() {
-            anyhow::bail!("Refusing to overwrite existing file: {output_file}");
-        }
-        let io: Arc<dyn turso_core::IO> = Arc::new(turso_core::PlatformIO::new()?);
-        let db = Database::open_file(io.clone(), output_file)?;
-        let target = db.connect()?;
-
-        let mut applier = ApplyWriter::new(&target);
-        Self::dump_database_from_conn(false, self.conn.clone(), &mut applier, StderrProgress)?;
-        applier.finish()?;
+        self.conn.snapshot(output_file)?;
+        let _ = self.writeln(format!("Database cloned to '{output_file}'"));
         Ok(())
     }
 
