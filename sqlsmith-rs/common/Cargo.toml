@@ -1,0 +1,15 @@
+[package]
+name = "sqlsmith-rs-common"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+fern = "0.7.1"
+humantime = "2.2.0"
+log = "0.4.27"
+serde.workspace = true
+serde_json.workspace = true
+sqlsmith-rs-drivers = { path = "../drivers" }

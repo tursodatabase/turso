@@ -1,0 +1,16 @@
+[package]
+name = "sqlsmith-rs-drivers"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+anyhow.workspace = true
+turso.workspace = true
+log = "0.4.27"
+once_cell = "1.21.3"
+rusqlite.workspace = true
+serde.workspace = true
+tokio = { workspace = true, features = ["full"] }

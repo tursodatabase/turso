@@ -24,6 +24,9 @@ members = [
     "macros",
     "simulator",
     "sqlite3",
+    "sqlsmith-rs/common",
+    "sqlsmith-rs/drivers",
+    "sqlsmith-rs/executor",
     "stress",
     "testing/sqlite_test_ext",
     "tests",
@@ -60,6 +63,9 @@ turso_ext = { path = "extensions/core", version = "0.4.0" }
 turso_macros = { path = "macros", version = "0.4.0" }
 turso_parser = { path = "parser", version = "0.4.0" }
 sql_generation = { path = "sql_generation" }
+sqlsmith-rs-common = { path = "sqlsmith-rs/common" }
+sqlsmith-rs-drivers = { path = "sqlsmith-rs/drivers" }
+sqlsmith-rs-executor = { path = "sqlsmith-rs/executor" }
 strum = { version = "0.26", features = ["derive"] }
 strum_macros = "0.26"
 serde = "1.0"

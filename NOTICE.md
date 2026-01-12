@@ -40,3 +40,8 @@ This project depends on libm, distributed by the rust-lang project:
 * License: licenses/extensions/libm-apache-license.md (Apache License v2.0)
 * License: licenses/extensions/libm-mit-license.md (MIT License)
 * Homepage: https://github.com/rust-lang/libm
+
+This project depends on sqlsmith-rs, distributed by cyw0ng95:
+
+* License: licenses/sqlsmith-rs/LICENSE (MIT License)
+* Homepage: https://github.com/cyw0ng95/sqlsmith-rs
