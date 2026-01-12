@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [lib]
-path = "engines/mod.rs"
+path = "lib.rs"
 
 [[bin]]
 name = "executor"

@@ -5911,6 +5911,8 @@ dependencies = [
  "hex",
  "rand 0.9.2",
  "rusqlite",
+ "sqlsmith-rs-common",
+ "sqlsmith-rs-executor",
  "tempfile",
  "tokio",
  "tracing-appender",

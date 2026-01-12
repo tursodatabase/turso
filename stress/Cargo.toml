@@ -29,3 +29,5 @@ tracing-appender = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter", "json"] }
 turso = { workspace = true }
 rusqlite = { workspace = true }
+sqlsmith-rs-executor.workspace = true
+sqlsmith-rs-common.workspace = true
