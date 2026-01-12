@@ -101,3 +101,70 @@ do_execsql_test_on_specific_db {:memory:} create-index-on-shadowed-rowid-alias-2
     SELECT name FROM sqlite_schema WHERE type='index';
 } {idx11}
 
+# SQLite interprets single-quoted strings in index expressions as column names
+# (for backwards compatibility), not as string literals. We match this behavior.
+# Expression indexes are not currently enabled in MVCC.
+if {![is_turso_mvcc]} {
+    # String literal that doesn't match a column should fail.
+    # SQLite error: "no such column: literal"
+    do_execsql_test_in_memory_any_error create-index-string-literal-no-such-column {
+        CREATE TABLE t12(c0, c1, c2);
+        CREATE INDEX idx12 ON t12('nonexistent');
+    }
+
+    # String literal that matches a column name should succeed (SQLite quirk).
+    do_execsql_test_on_specific_db {:memory:} create-index-string-literal-matches-column {
+        CREATE TABLE t12b(c0, c1, mycolumn);
+        CREATE INDEX idx12b ON t12b('mycolumn');
+        SELECT name FROM sqlite_schema WHERE type='index';
+    } {idx12b}
+
+    # Numeric literal as index column is allowed (SQLite allows this).
+    do_execsql_test_on_specific_db {:memory:} create-index-numeric-literal-column {
+        CREATE TABLE t13(c0, c1);
+        CREATE INDEX idx13 ON t13(42);
+        SELECT name FROM sqlite_schema WHERE type='index';
+    } {idx13}
+
+    # Pure numeric expression (no column refs) is allowed (SQLite allows this).
+    do_execsql_test_on_specific_db {:memory:} create-index-literal-expression {
+        CREATE TABLE t14(c0, c1);
+        CREATE INDEX idx14 ON t14(1 + 1);
+        SELECT name FROM sqlite_schema WHERE type='index';
+    } {idx14}
+
+    # Expression with column reference should succeed.
+    do_execsql_test_on_specific_db {:memory:} create-index-expression-with-column {
+        CREATE TABLE t15(c0, c1);
+        CREATE INDEX idx15 ON t15(c0 + 1);
+        SELECT name FROM sqlite_schema WHERE type='index';
+    } {idx15}
+
+    # Multiple columns where one is a string literal not matching any column should fail.
+    # SQLite error: "no such column: literal"
+    do_execsql_test_in_memory_any_error create-index-mixed-string-literal-column {
+        CREATE TABLE t16(c0, c1, c2);
+        CREATE INDEX idx16 ON t16(c0, 'nonexistent', c1);
+    }
+
+    # String literal inside an expression is allowed.
+    do_execsql_test_on_specific_db {:memory:} create-index-string-in-expression {
+        CREATE TABLE t17(c0, c1);
+        CREATE INDEX idx17 ON t17(c0 || 'suffix');
+        SELECT name FROM sqlite_schema WHERE type='index';
+    } {idx17}
+
+    # Deeply parenthesized string literal matching column should succeed.
+    do_execsql_test_on_specific_db {:memory:} create-index-parenthesized-string-matches-column {
+        CREATE TABLE t18(mycol, other);
+        CREATE INDEX idx18 ON t18((((('mycol')))));
+        SELECT name FROM sqlite_schema WHERE type='index';
+    } {idx18}
+
+    # Deeply parenthesized string literal not matching column should fail.
+    do_execsql_test_in_memory_any_error create-index-parenthesized-string-no-such-column {
+        CREATE TABLE t19(c0, c1);
+        CREATE INDEX idx19 ON t19((((('nonexistent')))));
+    }
+}
+
