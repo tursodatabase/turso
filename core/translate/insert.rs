@@ -739,7 +739,8 @@ fn emit_commit_phase(
             .expect("no cursor found for index");
 
         // Re-evaluate partial predicate on the would-be inserted image
-        let commit_skip_label = emit_partial_index_check(program, resolver, index, insertion, connection)?;
+        let commit_skip_label =
+            emit_partial_index_check(program, resolver, index, insertion, connection)?;
 
         let num_cols = index.columns.len();
         let idx_start_reg = program.alloc_registers(num_cols + 1);
@@ -1982,7 +1983,8 @@ fn emit_index_uniqueness_check(
         .expect("no cursor found for index");
 
     // For partial indexes, evaluate the WHERE clause and skip if false
-    let maybe_skip_probe_label = emit_partial_index_check(program, resolver, index, insertion, connection)?;
+    let maybe_skip_probe_label =
+        emit_partial_index_check(program, resolver, index, insertion, connection)?;
 
     let num_cols = index.columns.len();
     // allocate scratch registers for the index columns plus rowid
