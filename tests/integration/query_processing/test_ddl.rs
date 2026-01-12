@@ -122,3 +122,42 @@ fn test_allow_drop_unreferenced_columns(tmp_db: TempDatabase) -> anyhow::Result<
 
     Ok(())
 }
+
+/// WITHOUT ROWID tables are not supported
+#[turso_macros::test]
+fn test_create_table_without_rowid_not_supported(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+
+    let res = conn.execute("CREATE TABLE t(a INTEGER PRIMARY KEY, b TEXT) WITHOUT ROWID");
+    assert!(
+        res.is_err(),
+        "Expected error when creating WITHOUT ROWID table"
+    );
+    assert!(
+        res.unwrap_err()
+            .to_string()
+            .contains("WITHOUT ROWID tables are not supported"),
+        "Expected error message about WITHOUT ROWID not being supported"
+    );
+    Ok(())
+}
+
+#[turso_macros::test]
+fn test_create_table_without_rowid_composite_pk(tmp_db: TempDatabase) -> anyhow::Result<()> {
+    let _ = env_logger::try_init();
+    let conn = tmp_db.connect_limbo();
+
+    let res = conn.execute("CREATE TABLE t(a TEXT, b INT, PRIMARY KEY(a, b)) WITHOUT ROWID");
+    assert!(
+        res.is_err(),
+        "Expected error when creating WITHOUT ROWID table with composite primary key"
+    );
+    assert!(
+        res.unwrap_err()
+            .to_string()
+            .contains("WITHOUT ROWID tables are not supported"),
+        "Expected error message about WITHOUT ROWID not being supported"
+    );
+    Ok(())
+}
