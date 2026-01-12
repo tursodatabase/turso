@@ -193,23 +193,13 @@ impl Default for InsertOpts {
     }
 }
 
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Validate)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, Validate)]
 #[serde(deny_unknown_fields, default)]
 pub struct UpdateOpts {
     #[garde(skip)]
     pub padding_size: Option<usize>,
     #[garde(skip)]
     pub force_late_failure: bool,
-}
-
-impl Default for UpdateOpts {
-    fn default() -> Self {
-        Self {
-            padding_size: None,
-            force_late_failure: false,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Validate)]

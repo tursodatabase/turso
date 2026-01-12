@@ -21,6 +21,33 @@ use turso_parser::ast::Distinctness;
 use crate::runner::env::TransactionMode;
 use crate::{generation::Shadow, runner::env::ShadowTablesMut};
 
+/// Validate UNIQUE constraints for rows being inserted
+fn validate_unique_insert(
+    table_name: &str,
+    columns: &[sql_generation::model::table::Column],
+    existing_rows: &[Vec<SimValue>],
+    new_rows: &[Vec<SimValue>],
+) -> anyhow::Result<()> {
+    for (row_idx, row) in new_rows.iter().enumerate() {
+        for (col_idx, col) in columns.iter().enumerate() {
+            if col.has_unique_constraint() && row[col_idx].0 != turso_core::Value::Null {
+                let duplicate = existing_rows
+                    .iter()
+                    .chain(new_rows[..row_idx].iter())
+                    .any(|existing| existing[col_idx] == row[col_idx]);
+                if duplicate {
+                    return Err(anyhow::anyhow!(
+                        "UNIQUE constraint violation: column '{}' in table '{}'",
+                        col.name,
+                        table_name
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub mod interactions;
 pub mod metrics;
 pub mod property;
@@ -373,52 +400,28 @@ impl Shadow for Insert {
 
     //FIXME this doesn't handle type affinity
     fn shadow(&self, tables: &mut ShadowTablesMut) -> Self::Result {
-        match self {
-            Insert::Values { table, values } => {
-                if !tables.iter().any(|t| &t.name == table) {
-                    return Err(anyhow::anyhow!(
-                        "Table {} does not exist. INSERT statement ignored.",
-                        table
-                    ));
-                }
+        let (table_name, rows) = match self {
+            Insert::Values { table, values } => (table.clone(), values.clone()),
+            Insert::Select { table, select } => (table.clone(), select.shadow(tables)?),
+        };
 
-                // Record each inserted row for transaction tracking
-                for row in values {
-                    tables.record_insert(table.clone(), row.clone());
-                }
+        let sim_table = tables
+            .iter()
+            .find(|t| t.name == table_name)
+            .ok_or_else(|| anyhow::anyhow!("Table {} does not exist", table_name))?;
 
-                // Insert the rows
-                tables
-                    .iter_mut()
-                    .find(|t| &t.name == table)
-                    .expect("We already validated that the table exists")
-                    .rows
-                    .extend(values.clone());
-            }
-            Insert::Select { table, select } => {
-                let rows = select.shadow(tables)?;
+        validate_unique_insert(&table_name, &sim_table.columns, &sim_table.rows, &rows)?;
 
-                if !tables.iter().any(|t| &t.name == table) {
-                    return Err(anyhow::anyhow!(
-                        "Table {} does not exist. INSERT statement ignored.",
-                        table
-                    ));
-                }
-
-                // Record each inserted row for transaction tracking
-                for row in &rows {
-                    tables.record_insert(table.clone(), row.clone());
-                }
-
-                // Insert the rows
-                tables
-                    .iter_mut()
-                    .find(|t| &t.name == table)
-                    .expect("We already validated that the table exists")
-                    .rows
-                    .extend(rows);
-            }
+        for row in &rows {
+            tables.record_insert(table_name.clone(), row.clone());
         }
+
+        tables
+            .iter_mut()
+            .find(|t| t.name == table_name)
+            .unwrap()
+            .rows
+            .extend(rows);
 
         Ok(vec![])
     }
@@ -622,7 +625,7 @@ impl Shadow for Update {
 
     fn shadow(&self, tables: &mut ShadowTablesMut) -> Self::Result {
         // First pass: find rows to update and compute old/new values
-        let updates = {
+        let (updates, columns) = {
             let table = tables.iter().find(|t| t.name == self.table);
             let table = if let Some(table) = table {
                 table
@@ -634,7 +637,7 @@ impl Shadow for Update {
             };
 
             let t2 = table.clone();
-            let columns = &table.columns;
+            let columns = table.columns.clone();
 
             let updates: Vec<(Vec<SimValue>, Vec<SimValue>)> = table
                 .rows
@@ -653,8 +656,9 @@ impl Shadow for Update {
                                 SetValue::CaseWhen {
                                     condition,
                                     then_value,
-                                    ..
+                                    else_column,
                                 } => {
+                                    debug_assert_eq!(else_column, column);
                                     if condition.test(old_row, &t2) {
                                         new_row[idx] = then_value.clone();
                                     }
@@ -666,8 +670,53 @@ impl Shadow for Update {
                 })
                 .collect();
 
-            updates
+            (updates, columns)
         };
+
+        if let Some(table) = tables.iter().find(|t| t.name == self.table) {
+            for (idx, col) in columns.iter().enumerate() {
+                if col.has_unique_constraint() {
+                    let new_values: Vec<_> = updates
+                        .iter()
+                        .map(|(_, new)| &new[idx])
+                        .filter(|v| v.0 != turso_core::Value::Null)
+                        .collect();
+                    for (i, v1) in new_values.iter().enumerate() {
+                        for v2 in new_values.iter().skip(i + 1) {
+                            if v1 == v2 {
+                                return Err(anyhow::anyhow!(
+                                    "UNIQUE constraint violation: column '{}' would have duplicate value {:?} in table '{}'",
+                                    col.name,
+                                    v1,
+                                    self.table
+                                ));
+                            }
+                        }
+                    }
+
+                    for (_, new_row) in &updates {
+                        let new_value = &new_row[idx];
+                        if new_value.0 == turso_core::Value::Null {
+                            continue;
+                        }
+                        for existing in &table.rows {
+                            let is_being_updated = updates.iter().any(|(old, _)| old == existing);
+                            if is_being_updated {
+                                continue;
+                            }
+                            if &existing[idx] == new_value {
+                                return Err(anyhow::anyhow!(
+                                    "UNIQUE constraint violation: column '{}' value {:?} already exists in table '{}'",
+                                    col.name,
+                                    new_value,
+                                    self.table
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+        }
 
         // Record the operations for transaction tracking
         for (old_row, new_row) in &updates {

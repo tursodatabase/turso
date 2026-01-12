@@ -14,7 +14,7 @@ pub enum SetValue {
     /// Conditional assignment: col = CASE WHEN cond THEN val ELSE col END
     /// Used for partial updates that should fail on constraint violation
     CaseWhen {
-        condition: Predicate,
+        condition: Box<Predicate>,
         then_value: SimValue,
         else_column: String,
     },
@@ -29,10 +29,6 @@ impl SetValue {
                 panic!("simple_value() called on CaseWhen variant")
             }
         }
-    }
-
-    pub fn is_case_when(&self) -> bool {
-        matches!(self, SetValue::CaseWhen { .. })
     }
 }
 
@@ -68,7 +64,9 @@ impl Update {
     }
 
     pub fn has_case_when(&self) -> bool {
-        self.set_values.iter().any(|(_, v)| v.is_case_when())
+        self.set_values
+            .iter()
+            .any(|(_, v)| matches!(v, SetValue::CaseWhen { .. }))
     }
 }
 

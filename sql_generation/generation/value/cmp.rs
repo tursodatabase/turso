@@ -132,15 +132,16 @@ fn mutate_string<R: rand::Rng + ?Sized>(
         let candidate = rng.random_range(0..chars.len());
         let c = chars[candidate];
         // Check if character is in the "safe" range (not at boundary)
-        let can_decrement =
-            (c > UPPERCASE_A && c <= UPPERCASE_Z) || (c > LOWERCASE_A && c <= LOWERCASE_Z);
+        let can_decrement = ((UPPERCASE_A + 1)..=UPPERCASE_Z).contains(&c)
+            || ((LOWERCASE_A + 1)..=LOWERCASE_Z).contains(&c);
         let can_increment =
-            (c >= UPPERCASE_A && c < UPPERCASE_Z) || (c >= LOWERCASE_A && c < LOWERCASE_Z);
+            (UPPERCASE_A..UPPERCASE_Z).contains(&c) || (LOWERCASE_A..LOWERCASE_Z).contains(&c);
 
-        if mutation_type == MutationType::Decrement && can_decrement {
-            index = Some(candidate);
-            break;
-        } else if mutation_type == MutationType::Increment && can_increment {
+        let can_mutate = match mutation_type {
+            MutationType::Decrement => can_decrement,
+            MutationType::Increment => can_increment,
+        };
+        if can_mutate {
             index = Some(candidate);
             break;
         }
@@ -155,7 +156,7 @@ fn mutate_string<R: rand::Rng + ?Sized>(
             s
         } else {
             // For increment: append a char (longer string > original)
-            format!("{}A", t)
+            format!("{t}A")
         };
     }
 

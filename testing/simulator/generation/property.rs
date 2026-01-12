@@ -19,7 +19,7 @@ use sql_generation::{
             transaction::{Begin, Commit, Rollback},
             update::Update,
         },
-        table::SimValue,
+        table::{SimValue, Table},
     },
 };
 use strum::IntoEnumIterator;
@@ -333,7 +333,7 @@ impl Property {
                             if conn_tables.iter().any(|t| t.name == table) {
                                 Ok(Ok(()))
                             } else {
-                                Ok(Err(format!("table {} does not exist", table)))
+                                Ok(Err(format!("table {table} does not exist")))
                             }
                         }
                     },
@@ -1130,7 +1130,7 @@ impl Property {
                 let table_dependency = table.clone();
 
                 let assumption = InteractionType::Assumption(Assertion::new(
-                    format!("table {} exists", table),
+                    format!("table {table} exists"),
                     {
                         let table_name = table.clone();
                         move |_: &Vec<ResultSet>, env: &mut SimulatorEnv| {
@@ -1141,8 +1141,7 @@ impl Property {
                                 let available_tables: Vec<String> =
                                     conn_tables.iter().map(|t| t.name.clone()).collect();
                                 Ok(Err(format!(
-                                    "table '{}' not found. available tables: {:?}",
-                                    table_name, available_tables
+                                    "table '{table_name}' not found. available tables: {available_tables:?}"
                                 )))
                             }
                         }
@@ -1166,11 +1165,6 @@ impl Property {
                     builder
                 };
 
-                let snapshot_after_dml =
-                    InteractionBuilder::with_interaction(InteractionType::Query(Query::Select(
-                        Select::simple(table.clone(), Predicate::true_()),
-                    )));
-
                 let commit_tx = InteractionBuilder::with_interaction(InteractionType::Query(
                     Query::Commit(Commit),
                 ));
@@ -1181,103 +1175,34 @@ impl Property {
                 ));
 
                 let assertion = InteractionType::Assertion(Assertion::new(
-                    format!("{} should be unchanged after failed statement", table_name),
+                    format!("{table_name} unchanged after failed statement"),
                     move |stack: &Vec<ResultSet>, _env| {
-                        // Stack layout:
-                        // [0] = snapshot before (outside tx)
-                        // [1] = BEGIN result
-                        // [2] = DML result (may be Ok or Err)
-                        // [3] = snapshot after DML (inside tx)
-                        // [4] = COMMIT result
-                        // [5] = final SELECT (after commit)
+                        // Stack: [0]=before, [1]=BEGIN, [2]=DML, [3]=COMMIT, [4]=final
+                        let (before, dml_result, final_result) = (&stack[0], &stack[2], &stack[4]);
 
-                        let before = &stack[0];
-                        let dml_result = &stack[2];
-                        let after_dml = &stack[3];
-                        let final_result = &stack[5];
-
+                        // Skip check if DML succeeded (no rollback to verify)
                         if dml_result.is_ok() {
-                            tracing::trace!(
-                                "StatementAtomicity: DML succeeded, skipping atomicity check"
-                            );
                             return Ok(Ok(()));
                         }
 
-                        tracing::debug!("StatementAtomicity: DML failed, verifying atomicity");
+                        let before_rows = before.as_ref().map_err(|e| {
+                            LimboError::InternalError(format!("before SELECT failed: {e}"))
+                        })?;
+                        let final_rows = final_result.as_ref().map_err(|e| {
+                            LimboError::InternalError(format!("final SELECT failed: {e}"))
+                        })?;
 
-                        let before_rows = match before {
-                            Ok(rows) => rows,
-                            Err(e) => {
-                                return Err(LimboError::InternalError(format!(
-                                    "snapshot before SELECT failed: {}",
-                                    e
-                                )));
-                            }
-                        };
-
-                        let after_dml_rows = match after_dml {
-                            Ok(rows) => rows,
-                            Err(e) => {
-                                return Err(LimboError::InternalError(format!(
-                                    "snapshot after DML SELECT failed: {}",
-                                    e
-                                )));
-                            }
-                        };
-
-                        let final_rows = match final_result {
-                            Ok(rows) => rows,
-                            Err(e) => {
-                                return Err(LimboError::InternalError(format!(
-                                    "final SELECT failed: {}",
-                                    e
-                                )));
-                            }
-                        };
-
-                        // Check in-transaction snapshot matches before
-                        if before_rows.len() != after_dml_rows.len() {
-                            return Ok(Err(format!(
-                                "row count changed from {} to {} after failed statement (in-tx)",
-                                before_rows.len(),
-                                after_dml_rows.len()
-                            )));
-                        }
-
-                        for row in before_rows {
-                            if !after_dml_rows.contains(row) {
-                                return Ok(Err(format!(
-                                    "row {:?} was modified by failed statement (in-tx)",
-                                    row
-                                )));
-                            }
-                        }
-
-                        // Check final snapshot after commit matches before
+                        // Failed statement should leave table unchanged
                         if before_rows.len() != final_rows.len() {
                             return Ok(Err(format!(
-                                "row count changed from {} to {} after commit",
+                                "row count changed: {} -> {}",
                                 before_rows.len(),
                                 final_rows.len()
                             )));
                         }
-
-                        for row in before_rows {
-                            if !final_rows.contains(row) {
-                                return Ok(Err(format!("row {:?} missing after commit", row)));
-                            }
+                        if before_rows != final_rows {
+                            return Ok(Err("table content changed after failed statement".into()));
                         }
-
-                        for row in final_rows {
-                            if !before_rows.contains(row) {
-                                return Ok(Err(format!(
-                                    "unexpected row {:?} appeared after commit",
-                                    row
-                                )));
-                            }
-                        }
-
-                        tracing::trace!("StatementAtomicity: PASSED");
                         Ok(Ok(()))
                     },
                     vec![table_dependency],
@@ -1288,7 +1213,6 @@ impl Property {
                     snapshot_before,
                     begin_tx,
                     dml_interaction,
-                    snapshot_after_dml,
                     commit_tx,
                     final_select,
                     InteractionBuilder::with_interaction(assertion),
@@ -1459,12 +1383,18 @@ fn property_read_your_updates_back<R: rand::Rng + ?Sized>(
     ctx: &impl GenerationContext,
     _mvcc: bool,
 ) -> Property {
+    let mut attempts = 0;
     let update = loop {
+        if attempts > 10_000 {
+            panic!(
+                "property_read_your_updates_back: failed to generate non-CaseWhen update after {attempts} attempts"
+            );
+        }
         let candidate = Update::arbitrary(rng, ctx);
         if !candidate.has_case_when() {
             break candidate;
         }
-        // in-theory this could cause infinite loop but very very very very unlikely so ok
+        attempts += 1;
     };
 
     // e.g. SELECT a, b FROM t WHERE c=1;
@@ -1692,9 +1622,57 @@ fn property_faulty_query<R: rand::Rng + ?Sized>(
     }
 }
 
-/// Generate a property that tests statement atomicity.
-///
-/// Verifies that if a DML statement fails, the table state remains unchanged.
+fn generate_failing_insert<R: rand::Rng + ?Sized>(
+    rng: &mut R,
+    ctx: &impl GenerationContext,
+) -> Option<(String, Insert)> {
+    let tables_with_unique: Vec<&Table> = ctx
+        .tables()
+        .iter()
+        .filter(|t| t.has_any_unique_column())
+        .collect();
+
+    let table = *pick(&tables_with_unique, rng);
+
+    let unique_col_indices: Vec<usize> = table
+        .columns
+        .iter()
+        .enumerate()
+        .filter(|(_, c)| c.has_unique_constraint())
+        .map(|(i, _)| i)
+        .collect();
+
+    let first_unique_idx = unique_col_indices[0];
+    let unique_col = &table.columns[first_unique_idx];
+    let duplicate_value = SimValue::arbitrary_from(rng, ctx, &unique_col.column_type);
+
+    let num_rows = rng.random_range(2..=5);
+    let values: Vec<Vec<SimValue>> = (0..num_rows)
+        .map(|_| {
+            table
+                .columns
+                .iter()
+                .enumerate()
+                .map(|(col_idx, col)| {
+                    if unique_col_indices.contains(&col_idx) {
+                        duplicate_value.clone()
+                    } else {
+                        SimValue::arbitrary_from(rng, ctx, &col.column_type)
+                    }
+                })
+                .collect()
+        })
+        .collect();
+
+    Some((
+        table.name.clone(),
+        Insert::Values {
+            table: table.name.clone(),
+            values,
+        },
+    ))
+}
+
 fn property_statement_atomicity<R: rand::Rng + ?Sized>(
     rng: &mut R,
     _query_distr: &QueryDistribution,
@@ -1703,9 +1681,16 @@ fn property_statement_atomicity<R: rand::Rng + ?Sized>(
 ) -> Property {
     assert!(!ctx.tables().is_empty());
 
-    let update = Update::arbitrary(rng, ctx);
-    let table_name = update.table.clone();
-    let statement = Query::Update(update);
+    let has_unique_tables = ctx.tables().iter().any(|t| t.has_any_unique_column());
+
+    let (table_name, statement) = if has_unique_tables && rng.random_bool(0.5) {
+        let (table, insert) = generate_failing_insert(rng, ctx)
+            .expect("should have UNIQUE tables since has_unique_tables is true");
+        (table, Query::Insert(insert))
+    } else {
+        let update = Update::arbitrary(rng, ctx);
+        (update.table.clone(), Query::Update(update))
+    };
 
     Property::StatementAtomicity {
         table: table_name,
@@ -1893,12 +1878,10 @@ impl PropertyDiscriminants {
             PropertyDiscriminants::FsyncNoWait => QueryCapabilities::all(),
             PropertyDiscriminants::FaultyQuery => QueryCapabilities::all(),
             PropertyDiscriminants::Queries => panic!("queries property should not be generated"),
-            PropertyDiscriminants::StatementAtomicity => {
-                QueryCapabilities::SELECT
-                    .union(QueryCapabilities::INSERT)
-                    .union(QueryCapabilities::UPDATE)
-                    .union(QueryCapabilities::DELETE)
-            }
+            PropertyDiscriminants::StatementAtomicity => QueryCapabilities::SELECT
+                .union(QueryCapabilities::INSERT)
+                .union(QueryCapabilities::UPDATE)
+                .union(QueryCapabilities::DELETE),
         }
     }
 }

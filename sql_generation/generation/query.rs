@@ -20,39 +20,6 @@ use turso_parser::ast::{Expr, SortOrder};
 
 use super::{backtrack, pick};
 
-/// Pick a table preferring ones without UNIQUE columns.
-/// Returns the table and whether it has any UNIQUE column.
-fn pick_table_preferring_non_unique<'a, R: Rng + ?Sized>(
-    tables: &'a [Table],
-    rng: &mut R,
-) -> (&'a Table, bool) {
-    let non_unique: Vec<_> = tables
-        .iter()
-        .filter(|t| !t.has_any_unique_column())
-        .collect();
-    if non_unique.is_empty() {
-        (pick(tables, rng), true)
-    } else {
-        (*pick(&non_unique, rng), false)
-    }
-}
-
-/// Convert a number to a letter-only string
-/// This is used for unique value generation to avoid non-letter characters
-/// that cause issues with the shrinker's mutate_string function.
-fn number_to_letters(mut n: u64) -> String {
-    let mut result = String::with_capacity(16);
-    result.push_str("uniq");
-    loop {
-        result.push((b'a' + (n % 26) as u8) as char);
-        n /= 26;
-        if n == 0 {
-            break;
-        }
-    }
-    result
-}
-
 impl Arbitrary for Create {
     fn arbitrary<R: Rng + ?Sized, C: GenerationContext>(rng: &mut R, context: &C) -> Self {
         Create {
@@ -276,8 +243,7 @@ impl Arbitrary for Insert {
     fn arbitrary<R: Rng + ?Sized, C: GenerationContext>(rng: &mut R, env: &C) -> Self {
         let opts = &env.opts().query.insert;
         let gen_values = |rng: &mut R| {
-            // Prefer tables without UNIQUE columns to avoid constraint violations
-            let (table, has_unique) = pick_table_preferring_non_unique(env.tables(), rng);
+            let table = pick(env.tables(), rng);
 
             let num_rows = rng.random_range(opts.min_rows.get()..opts.max_rows.get());
             let base_offset: i64 = rng.random_range(1_000_000_000..2_000_000_000);
@@ -289,9 +255,7 @@ impl Arbitrary for Insert {
                         .iter()
                         .enumerate()
                         .map(|(col_idx, c)| {
-                            let is_unique = has_unique && c.has_unique_constraint();
-
-                            if is_unique {
+                            if c.has_unique_constraint() {
                                 let unique_offset =
                                     base_offset + (col_idx as i64 * 10_000_000) + row_idx as i64;
                                 match c.column_type {
@@ -302,12 +266,12 @@ impl Arbitrary for Insert {
                                         SimValue(turso_core::Value::Float(unique_offset as f64))
                                     }
                                     crate::model::table::ColumnType::Text => {
-                                        let s = number_to_letters(unique_offset as u64);
+                                        let s = format!("u{unique_offset}");
                                         SimValue(turso_core::Value::Text(s.into()))
                                     }
                                     crate::model::table::ColumnType::Blob => {
-                                        let s = number_to_letters(unique_offset as u64);
-                                        SimValue(turso_core::Value::Blob(s.into_bytes().into()))
+                                        let s = format!("u{unique_offset}");
+                                        SimValue(turso_core::Value::Blob(s.into_bytes()))
                                     }
                                 }
                             } else {
@@ -529,7 +493,7 @@ impl Arbitrary for Update {
                 let padding = "X".repeat(padding_size);
                 match marker_col.column_type {
                     crate::model::table::ColumnType::Blob => {
-                        SimValue(turso_core::Value::Blob(padding.into_bytes().into()))
+                        SimValue(turso_core::Value::Blob(padding.into_bytes()))
                     }
                     _ => SimValue(turso_core::Value::Text(padding.into())),
                 }
@@ -541,10 +505,10 @@ impl Arbitrary for Update {
             set_values.push((
                 unique_col.name.clone(),
                 SetValue::CaseWhen {
-                    condition: Predicate::eq(
+                    condition: Box::new(Predicate::eq(
                         Predicate::column(unique_col.name.clone()),
                         Predicate::value(last_row_unique),
-                    ),
+                    )),
                     then_value: first_row_unique,
                     else_column: unique_col.name.clone(),
                 },
@@ -562,11 +526,11 @@ impl Arbitrary for Update {
                 crate::model::table::ColumnType::Float => {
                     SimValue(turso_core::Value::Float(base_offset as f64))
                 }
-                crate::model::table::ColumnType::Text => SimValue(turso_core::Value::Text(
-                    number_to_letters(base_offset as u64).into(),
-                )),
+                crate::model::table::ColumnType::Text => {
+                    SimValue(turso_core::Value::Text(format!("u{base_offset}").into()))
+                }
                 crate::model::table::ColumnType::Blob => SimValue(turso_core::Value::Blob(
-                    number_to_letters(base_offset as u64).into_bytes().into(),
+                    format!("u{base_offset}").into_bytes(),
                 )),
             };
 
@@ -680,6 +644,8 @@ impl ArbitraryFrom<(&Table, &[AlterTableTypeDiscriminants])> for AlterTableType 
                 AlterTableType::AddColumn { column }
             }
             AlterTableTypeDiscriminants::AlterColumn => {
+                use turso_parser::ast::ColumnConstraint;
+
                 let col_diff = get_column_diff(table);
 
                 if col_diff.is_empty() {
@@ -701,9 +667,14 @@ impl ArbitraryFrom<(&Table, &[AlterTableTypeDiscriminants])> for AlterTableType 
                 let col_idx = pick_index(col_diff.len(), rng);
                 let col_name = col_diff.get_index(col_idx).unwrap();
 
+                let mut column = Column::arbitrary(rng, context);
+                column
+                    .constraints
+                    .retain(|c| !matches!(c, ColumnConstraint::Unique(_)));
+
                 AlterTableType::AlterColumn {
                     old: col_name.to_string(),
-                    new: Column::arbitrary(rng, context),
+                    new: column,
                 }
             }
             AlterTableTypeDiscriminants::RenameColumn => AlterTableType::RenameColumn {
