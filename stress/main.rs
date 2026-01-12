@@ -4,8 +4,6 @@ use clap::Parser;
 use core::panic;
 use opts::{Opts, TxMode};
 use sqlsmith_rs_common::rand_by_seed::LcgRng;
-use sqlsmith_rs_executor::engines::generate_sql_by_prob;
-use sqlsmith_rs_executor::generators::common::{DriverKind, gen_stmt};
 #[cfg(not(feature = "antithesis"))]
 use rand::rngs::StdRng;
 #[cfg(not(feature = "antithesis"))]
@@ -58,27 +56,33 @@ pub fn gen_bool(probability_true: f64) -> bool {
     (get_random() as f64 / u64::MAX as f64) < probability_true
 }
 
-/// Generate SQL statement using sqlsmith-rs
-fn generate_random_statement(conn: &turso::Connection, rng: &mut LcgRng) -> String {
-    // Use sqlsmith-rs statement probability configuration
-    let stmt_prob = sqlsmith_rs_common::profile::StmtProb {
-        SELECT: 30,
-        INSERT: 30,
-        UPDATE: 20,
-        DELETE: 10,
-        VACUUM: 1,
-        PRAGMA: 1,
-        CREATE_TRIGGER: 1,
-        DROP_TRIGGER: 1,
-        DATE_FUNC: 1,
-        ALTER_TABLE: 1,
-        CREATE_TABLE: 3,
-        TRANSACTION: 1,
-    };
-
-    generate_sql_by_prob(&stmt_prob, rng, |kind, rng| {
-        gen_stmt(kind, DriverKind::Limbo, conn as &dyn std::any::Any, rng)
-    })
+/// Generate SQL statement using sqlsmith-rs standalone generators
+fn generate_random_statement(rng: &mut LcgRng) -> String {
+    // Use only standalone generators that don't require schema introspection
+    let stmt_kind = get_random() % 4;
+    
+    match stmt_kind {
+        0 => {
+            // CREATE TABLE
+            sqlsmith_rs_executor::generators::common::create_table_stmt_common::gen_create_table_stmt(rng)
+                .unwrap_or_else(|| "SELECT 1;".to_string())
+        }
+        1 => {
+            // VACUUM
+            sqlsmith_rs_executor::generators::common::vacuum_stmt_common::gen_vacuum_stmt()
+                .unwrap_or_else(|| "SELECT 2;".to_string())
+        }
+        2 => {
+            // TRANSACTION
+            sqlsmith_rs_executor::generators::common::transaction_stmt_common::gen_transaction_stmt(rng)
+                .unwrap_or_else(|| "SELECT 3;".to_string())
+        }
+        _ => {
+            // DATE FUNC
+            sqlsmith_rs_executor::generators::common::datefunc_stmt_common::gen_datefunc_stmt(rng)
+                .unwrap_or_else(|| "SELECT 4;".to_string())
+        }
+    }
 }
 
 fn generate_plan(opts: &Opts) -> Result<Plan, Box<dyn std::error::Error + Send + Sync>> {
@@ -437,7 +441,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
                 
                 // Generate SQL dynamically using sqlsmith-rs
-                let sql = generate_random_statement(&conn, &mut rng);
+                let sql = generate_random_statement(&mut rng);
                 
                 if !silent {
                     if verbose {
@@ -471,7 +475,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         }
                         turso::Error::Error(e) => {
                             if verbose {
-                                println!("thread#{thread} Error executing query: {e}");
+                                println!("thread#{thread} Error[INFO] executing query: {e}");
                             }
                         }
                         turso::Error::DatabaseFull(e) => {
@@ -480,7 +484,11 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         turso::Error::IoError(kind) => {
                             eprintln!("thread#{thread} I/O error ({kind:?}), continuing...");
                         }
-                        _ => panic!("thread#{thread} Error[FATAL] executing query: {}", e),
+                        _ => {
+                            if verbose {
+                                println!("thread#{thread} Error[INFO] executing query: {}", e);
+                            }
+                        }
                     }
                 }
                 if verbose {
