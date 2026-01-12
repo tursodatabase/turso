@@ -235,7 +235,7 @@ async fn run_tests(
                 .await
         }
         "rust" => {
-            let mut backend = RustBackend::new();
+            let mut backend = RustBackend::new().with_mvcc(mvcc);
             if let Some(resolver) = resolver {
                 backend = backend.with_default_db_resolver(resolver);
             }

@@ -12,18 +12,27 @@ use turso::{Builder, Connection, Database, Value};
 pub struct RustBackend {
     /// Resolver for default database paths
     default_db_resolver: Option<Arc<dyn DefaultDatabaseResolver>>,
+    /// Enable MVCC mode
+    mvcc: bool,
 }
 
 impl RustBackend {
     pub fn new() -> Self {
         Self {
             default_db_resolver: None,
+            mvcc: false,
         }
     }
 
     /// Set the default database resolver
     pub fn with_default_db_resolver(mut self, resolver: Arc<dyn DefaultDatabaseResolver>) -> Self {
         self.default_db_resolver = Some(resolver);
+        self
+    }
+
+    /// Enable MVCC mode (experimental journal mode)
+    pub fn with_mvcc(mut self, mvcc: bool) -> Self {
+        self.mvcc = mvcc;
         self
     }
 }
@@ -78,6 +87,16 @@ impl SqlBackend for RustBackend {
         let conn = db
             .connect()
             .map_err(|e| BackendError::CreateDatabase(e.to_string()))?;
+
+        // Enable MVCC mode if requested (must be done before any transactions)
+        if self.mvcc {
+            let mut rows = conn
+                .query("PRAGMA journal_mode = 'experimental_mvcc'", ())
+                .await
+                .map_err(|e| BackendError::CreateDatabase(format!("failed to enable MVCC mode: {}", e)))?;
+            // Consume the result row
+            let _ = rows.next().await;
+        }
 
         Ok(Box::new(RustDatabaseInstance {
             _db: db,
