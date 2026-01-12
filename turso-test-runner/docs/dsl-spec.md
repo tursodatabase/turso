@@ -154,7 +154,16 @@ Decorators appear before the `test` keyword:
 | Decorator | Description |
 |-----------|-------------|
 | `@setup <name>` | Apply a named setup before the test (can be repeated) |
-| `@skip "reason"` | Skip this test with the given reason |
+| `@skip "reason"` | Skip this test unconditionally with the given reason |
+| `@skip-if <condition> "reason"` | Skip this test conditionally based on runtime configuration |
+
+#### Skip Conditions
+
+The `@skip-if` decorator supports the following conditions:
+
+| Condition | Description |
+|-----------|-------------|
+| `mvcc` | Skip when MVCC mode is enabled (`--mvcc` flag) |
 
 ### Expect Modifiers
 
@@ -242,13 +251,24 @@ expect unordered {
     Alice
 }
 
-# Skipped test
+# Skipped test (unconditional)
 @skip "known bug #123"
 test select-buggy-feature {
     SELECT buggy();
 }
 expect {
     result
+}
+
+# Conditionally skipped test (only skipped in MVCC mode)
+@skip-if mvcc "total_changes not supported in MVCC mode"
+test total-changes {
+    CREATE TABLE t (id INTEGER PRIMARY KEY);
+    INSERT INTO t VALUES (1), (2), (3);
+    SELECT total_changes();
+}
+expect {
+    3
 }
 ```
 
@@ -265,6 +285,9 @@ test_case       = { decorator } "test" IDENTIFIER block expect_block
 
 decorator       = "@setup" IDENTIFIER NEWLINE
                 | "@skip" STRING NEWLINE
+                | "@skip-if" skip_condition STRING NEWLINE
+
+skip_condition  = "mvcc"
 
 expect_block    = "expect" [expect_modifier] block
 
@@ -362,8 +385,9 @@ The lexer uses the [Logos](https://docs.rs/logos) crate (v0.16) for tokenization
 - **Block content extraction**: When `{` is encountered, a custom callback extracts all content until the matching `}`, handling nested braces. This allows arbitrary SQL and expected output without special escaping.
 
 - **Tokens**: The lexer produces these token types:
-  - Keywords: `@database`, `@setup`, `@skip`, `setup`, `test`, `expect`
-  - Modifiers: `error`, `pattern`, `unordered`, `readonly`
+  - Keywords: `@database`, `@setup`, `@skip`, `@skip-if`, `setup`, `test`, `expect`
+  - Modifiers: `error`, `pattern`, `unordered`, `readonly`, `raw`
+  - Skip conditions: `mvcc`
   - Database types: `:memory:`, `:temp:`, `:default:`, `:default-no-rowidalias:`
   - Block content: `{...}` (content between braces)
   - Identifiers, strings, paths, comments, newlines
@@ -390,8 +414,17 @@ pub struct TestCase {
     pub name: String,
     pub sql: String,
     pub expectation: Expectation,
-    pub setups: Vec<String>,
-    pub skip: Option<String>,
+    pub setups: Vec<SetupRef>,
+    pub skip: Option<Skip>,
+}
+
+pub struct Skip {
+    pub reason: String,
+    pub condition: Option<SkipCondition>,
+}
+
+pub enum SkipCondition {
+    Mvcc,  // Skip when MVCC mode is enabled
 }
 
 pub enum Expectation {
