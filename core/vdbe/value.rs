@@ -970,9 +970,7 @@ impl Value {
 
     pub fn exec_concat(&self, rhs: &Value) -> Value {
         if let (Value::Blob(lhs), Value::Blob(rhs)) = (self, rhs) {
-            return Value::build_text(
-                String::from_utf8_lossy(&[lhs.as_slice(), rhs.as_slice()].concat()).into_owned(),
-            );
+            return Value::Blob([lhs.as_slice(), rhs.as_slice()].concat().to_vec());
         }
 
         let Some(lhs) = self.cast_text() else {

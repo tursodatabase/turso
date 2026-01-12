@@ -23,3 +23,7 @@ do_execsql_test concat-4 {
 do_execsql_test concat-4 {
     SELECT 'A good ' || name FROM products WHERE name = 'watch';
 } {}
+
+do_execsql_test concat-blob {
+    SELECT hex(x'01' || x'02');
+} {0102}
