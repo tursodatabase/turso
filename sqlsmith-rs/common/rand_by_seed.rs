@@ -5,7 +5,10 @@ pub struct LcgRng {
 
 impl LcgRng {
     pub fn new(seed: u64) -> Self {
-        LcgRng { next: seed, base_seed: seed }
+        LcgRng {
+            next: seed,
+            base_seed: seed,
+        }
     }
 
     pub fn rand(&mut self) -> i64 {

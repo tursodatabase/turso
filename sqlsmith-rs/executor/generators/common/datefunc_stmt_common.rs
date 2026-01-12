@@ -4,13 +4,7 @@ use sqlsmith_rs_common::rand_by_seed::LcgRng;
 /// # Arguments
 /// * `rng` - Random number generator for value selection
 pub fn gen_datefunc_stmt(rng: &mut LcgRng) -> Option<String> {
-    const FUNCTIONS: &[&str] = &[
-        "date",
-        "time",
-        "datetime",
-        "julianday",
-        "strftime",
-    ];
+    const FUNCTIONS: &[&str] = &["date", "time", "datetime", "julianday", "strftime"];
 
     // Only valid modifiers from https://sqlite.org/lang_datefunc.html
     const MODIFIERS: &[&str] = &[
@@ -44,7 +38,10 @@ pub fn gen_datefunc_stmt(rng: &mut LcgRng) -> Option<String> {
             format!("'{:04}-{:02}-{:02}'", year, month, day)
         } else {
             // Full datetime
-            format!("'{:04}-{:02}-{:02} {:02}:{:02}:{:02}'", year, month, day, hour, min, sec)
+            format!(
+                "'{:04}-{:02}-{:02} {:02}:{:02}:{:02}'",
+                year, month, day, hour, min, sec
+            )
         }
     };
 

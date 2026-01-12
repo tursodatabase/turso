@@ -1,7 +1,7 @@
+use serde::{Deserialize, Serialize};
 use sqlsmith_rs_common::profile::Profile;
 use sqlsmith_rs_common::rand_by_seed::LcgRng;
-use sqlsmith_rs_drivers::{DRIVER_KIND, DatabaseDriver, new_conn};
-use serde::{Serialize, Deserialize};
+use sqlsmith_rs_drivers::{new_conn, DatabaseDriver, DRIVER_KIND};
 use std::collections::HashMap;
 use std::time::Duration;
 
@@ -152,10 +152,9 @@ where
     "SELECT 4;".to_string()
 }
 
-
 pub fn submit_stats_blocking(stats: ExecutionStats) -> Result<(), Box<dyn std::error::Error>> {
     let client = reqwest::blocking::Client::new();
-    
+
     match client
         .post("http://127.0.0.1:8080/internal/stat/submit")
         .json(&stats)
@@ -163,7 +162,10 @@ pub fn submit_stats_blocking(stats: ExecutionStats) -> Result<(), Box<dyn std::e
     {
         Ok(response) => {
             if response.status().is_success() {
-                log::info!("Statistics submitted successfully for executor: {}", stats.executor_id);
+                log::info!(
+                    "Statistics submitted successfully for executor: {}",
+                    stats.executor_id
+                );
                 Ok(())
             } else {
                 let error_msg = format!("Failed to submit statistics: HTTP {}", response.status());

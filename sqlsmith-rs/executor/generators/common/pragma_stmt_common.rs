@@ -46,7 +46,6 @@ pub fn get_pragma_stmt_by_seed(rng: &mut LcgRng) -> Option<String> {
         NoArg("threads"),
         NoArg("trusted_schema"),
         NoArg("writable_schema"),
-
         // Boolean pragmas
         BoolArg("foreign_keys"),
         BoolArg("case_sensitive_like"),
@@ -60,7 +59,6 @@ pub fn get_pragma_stmt_by_seed(rng: &mut LcgRng) -> Option<String> {
         BoolArg("read_uncommitted"),
         BoolArg("reverse_unordered_selects"),
         BoolArg("trusted_schema"),
-
         // Integer pragmas
         IntArg("cache_size", -10000, 10000),
         IntArg("page_size", 512, 65536),
@@ -69,7 +67,6 @@ pub fn get_pragma_stmt_by_seed(rng: &mut LcgRng) -> Option<String> {
         IntArg("max_page_count", 1, 1000000),
         IntArg("soft_heap_limit", 0, 104857600),
         IntArg("threads", 0, 8),
-
         // String pragmas
         StringArg("journal_mode"),
         StringArg("locking_mode"),

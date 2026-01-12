@@ -44,9 +44,7 @@ impl DatabaseDriver for AnyDatabaseDriver {
 }
 
 /// 通用接口：根据 DRIVER_KIND 创建驱动和连接
-pub async fn new_conn(
-    kind: DRIVER_KIND,
-) -> Result<AnyDatabaseDriver> {
+pub async fn new_conn(kind: DRIVER_KIND) -> Result<AnyDatabaseDriver> {
     match kind {
         DRIVER_KIND::SQLITE_IN_MEM => {
             let driver = sqlite_in_mem::SqliteDriver::new()?;

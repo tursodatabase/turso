@@ -35,7 +35,7 @@ pub struct StmtProb {
     pub DATE_FUNC: u64,    // 新增 DATE_FUNC 字段
     pub ALTER_TABLE: u64,  // 新增 ALTER_TABLE 字段
     pub CREATE_TABLE: u64, // 保留 CREATE_TABLE 字段
-    pub TRANSACTION: u64, // 保留 TRANSACTION 字段
+    pub TRANSACTION: u64,  // 保留 TRANSACTION 字段
 }
 
 pub fn read_profile() -> Profile {
@@ -134,7 +134,10 @@ impl Profile {
         if let Some(debug) = &self.debug {
             items.push(format!("show_success_sql={}", debug.show_success_sql));
             items.push(format!("show_failed_sql={}", debug.show_failed_sql));
-            items.push(format!("show_sql_before_exec={}", debug.show_sql_before_exec));
+            items.push(format!(
+                "show_sql_before_exec={}",
+                debug.show_sql_before_exec
+            ));
             items.push(format!("write_log_file={}", debug.write_log_file)); // 新增打印
         }
         log::info!("Profile: {}", items.join(", "));

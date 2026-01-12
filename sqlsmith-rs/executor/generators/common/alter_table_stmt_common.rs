@@ -10,10 +10,7 @@ pub trait AlterTableLike {
 /// # Arguments
 /// * `tables` - List of available tables to alter
 /// * `rng` - Random number generator for value selection
-pub fn gen_alter_table_stmt<T: AlterTableLike>(
-    tables: &[T],
-    rng: &mut LcgRng,
-) -> Option<String> {
+pub fn gen_alter_table_stmt<T: AlterTableLike>(tables: &[T], rng: &mut LcgRng) -> Option<String> {
     if tables.is_empty() {
         return None;
     }

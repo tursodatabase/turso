@@ -1,11 +1,11 @@
 use crate::generators::common::drop_trigger_stmt_common::gen_drop_trigger_stmt;
-use crate::generators::common::{DriverKind, SqlKind, gen_stmt};
+use crate::generators::common::{gen_stmt, DriverKind, SqlKind};
 use rusqlite::Connection;
 use sqlsmith_rs_common::rand_by_seed::LcgRng;
 pub mod schema;
 
 // 集成 select_stmt.rs
-use crate::generators::common::select_stmt_common::{TableLike, gen_select_stmt};
+use crate::generators::common::select_stmt_common::{gen_select_stmt, TableLike};
 impl TableLike for schema::TableInfo {
     fn name(&self) -> &str {
         &self.name
@@ -21,12 +21,15 @@ impl crate::generators::common::alter_table_stmt_common::AlterTableLike for sche
         &self.name
     }
     fn columns(&self) -> Vec<(String, String)> {
-        self.columns.iter().map(|col| (col.clone(), String::new())).collect()
+        self.columns
+            .iter()
+            .map(|col| (col.clone(), String::new()))
+            .collect()
     }
 }
 
 // 集成 insert_stmt.rs
-use crate::generators::common::insert_stmt_common::{TableColumnLike, gen_insert_stmt};
+use crate::generators::common::insert_stmt_common::{gen_insert_stmt, TableColumnLike};
 // 修改结构体，直接拥有 name 的所有权
 struct TableWithColumns {
     name: String,
@@ -43,7 +46,7 @@ impl TableColumnLike for TableWithColumns {
 
 // 集成 update_stmt.rs
 use crate::generators::common::update_stmt_common::{
-    TableColumnLike as UpdateTableColumnLike, gen_update_stmt,
+    gen_update_stmt, TableColumnLike as UpdateTableColumnLike,
 };
 // 修改结构体，直接拥有 name 的所有权
 struct UpdateTableWithColumns {
@@ -126,9 +129,9 @@ pub fn get_stmt_by_seed(
             gen_drop_trigger_stmt(&table_names, seeder)
         }
         SqlKind::Vacuum => crate::generators::common::vacuum_stmt_common::gen_vacuum_stmt(),
-        SqlKind::Pragma => crate::generators::common::pragma_stmt_common::get_pragma_stmt_by_seed(
-            seeder,
-        ),
+        SqlKind::Pragma => {
+            crate::generators::common::pragma_stmt_common::get_pragma_stmt_by_seed(seeder)
+        }
         SqlKind::CreateTrigger => {
             let tables_with_columns = schema::get_tables_with_columns(sqlite_conn);
             let mut wrapped_tables = Vec::new();
@@ -145,20 +148,22 @@ pub fn get_stmt_by_seed(
                 &wrapped_tables,
                 seeder,
             )
-        },
+        }
         SqlKind::AlterTable => {
             let tables = match schema::get(sqlite_conn) {
                 Ok(t) if !t.is_empty() => t,
                 _ => return None,
             };
-            crate::generators::common::alter_table_stmt_common::gen_alter_table_stmt(&tables, seeder)
+            crate::generators::common::alter_table_stmt_common::gen_alter_table_stmt(
+                &tables, seeder,
+            )
         }
         SqlKind::DateFunc => {
             crate::generators::common::datefunc_stmt_common::gen_datefunc_stmt(seeder)
-        },
+        }
         SqlKind::CreateTable => {
             crate::generators::common::create_table_stmt_common::gen_create_table_stmt(seeder)
-        },
+        }
         SqlKind::Transaction => {
             crate::generators::common::transaction_stmt_common::gen_transaction_stmt(seeder)
         }

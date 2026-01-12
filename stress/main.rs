@@ -3,11 +3,11 @@ mod opts;
 use clap::Parser;
 use core::panic;
 use opts::{Opts, TxMode};
-use sqlsmith_rs_common::rand_by_seed::LcgRng;
 #[cfg(not(feature = "antithesis"))]
 use rand::rngs::StdRng;
 #[cfg(not(feature = "antithesis"))]
 use rand::{Rng, SeedableRng};
+use sqlsmith_rs_common::rand_by_seed::LcgRng;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::sync::Arc;
@@ -52,7 +52,6 @@ pub struct Plan {
     pub nr_threads: usize,
 }
 
-
 pub fn gen_bool(probability_true: f64) -> bool {
     (get_random() as f64 / u64::MAX as f64) < probability_true
 }
@@ -61,7 +60,7 @@ pub fn gen_bool(probability_true: f64) -> bool {
 fn generate_random_statement(rng: &mut LcgRng) -> String {
     // Use only standalone generators that don't require schema introspection
     let stmt_kind = (rng.rand().unsigned_abs() % 4) as u64;
-    
+
     match stmt_kind {
         0 => {
             // CREATE TABLE
@@ -75,8 +74,10 @@ fn generate_random_statement(rng: &mut LcgRng) -> String {
         }
         2 => {
             // TRANSACTION
-            sqlsmith_rs_executor::generators::common::transaction_stmt_common::gen_transaction_stmt(rng)
-                .unwrap_or_else(|| "SELECT 3;".to_string())
+            sqlsmith_rs_executor::generators::common::transaction_stmt_common::gen_transaction_stmt(
+                rng,
+            )
+            .unwrap_or_else(|| "SELECT 3;".to_string())
         }
         _ => {
             // DATE FUNC
@@ -108,13 +109,13 @@ fn generate_plan(opts: &Opts) -> Result<Plan, Box<dyn std::error::Error + Send +
         let mut rng = LcgRng::new(get_random());
         let table_count = opts.tables.unwrap_or(5);
         let mut ddl_statements = vec![];
-        
+
         for _ in 0..table_count {
             if let Some(create_table_stmt) = sqlsmith_rs_executor::generators::common::create_table_stmt_common::gen_create_table_stmt(&mut rng) {
                 ddl_statements.push(create_table_stmt);
             }
         }
-        
+
         if !opts.skip_log {
             writeln!(log_file, "{}", ddl_statements.len())?;
             for stmt in &ddl_statements {
@@ -410,10 +411,10 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             conn.execute("PRAGMA data_sync_retry = 1", ()).await?;
 
             println!("\rExecuting queries...");
-            
+
             // Initialize RNG for SQL generation
             let mut rng = LcgRng::new(seed);
-            
+
             for query_index in 0..nr_queries {
                 if gen_bool(0.0) {
                     // disabled
@@ -439,10 +440,10 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     conn = db_guard.connect()?;
                     conn.busy_timeout(std::time::Duration::from_millis(busy_timeout))?;
                 }
-                
+
                 // Generate SQL dynamically using sqlsmith-rs
                 let sql = generate_random_statement(&mut rng);
-                
+
                 if !silent {
                     if verbose {
                         println!("thread#{thread} executing query {sql}");

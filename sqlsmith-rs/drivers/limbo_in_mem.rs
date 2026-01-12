@@ -1,12 +1,12 @@
 use super::DatabaseDriver;
 use anyhow::Result;
-use turso::{Builder, Connection, Database};
 use log::info;
 use once_cell::sync::OnceCell;
 use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use turso::{Builder, Connection, Database};
 
 pub struct LimboDriver {
     conn: Connection,
@@ -18,16 +18,18 @@ static INIT_DONE: OnceCell<AtomicBool> = OnceCell::new();
 
 impl LimboDriver {
     pub async fn new() -> Result<Self> {
-        let db = GLOBAL_DB.get_or_try_init(|| {
-            // Run the blocking DB creation in a separate thread to avoid nested runtime
-            std::thread::spawn(|| {
-                let rt = tokio::runtime::Runtime::new()?;
-                let db = rt.block_on(async { Builder::new_local(":memory:").build().await })?;
-                Ok::<Arc<Database>, anyhow::Error>(Arc::new(db))
-            })
-            .join()
-            .map_err(|e| anyhow::anyhow!("Thread panicked: {:?}", e))?
-        })?.clone();
+        let db = GLOBAL_DB
+            .get_or_try_init(|| {
+                // Run the blocking DB creation in a separate thread to avoid nested runtime
+                std::thread::spawn(|| {
+                    let rt = tokio::runtime::Runtime::new()?;
+                    let db = rt.block_on(async { Builder::new_local(":memory:").build().await })?;
+                    Ok::<Arc<Database>, anyhow::Error>(Arc::new(db))
+                })
+                .join()
+                .map_err(|e| anyhow::anyhow!("Thread panicked: {:?}", e))?
+            })?
+            .clone();
 
         let conn = db.connect()?;
         let driver = Self { conn };
@@ -52,10 +54,9 @@ impl LimboDriver {
         for stmt in sql_content.split(';') {
             let stmt = stmt.trim();
             if !stmt.is_empty() {
-                self.conn
-                    .execute(stmt, ())
-                    .await
-                    .map_err(|e| anyhow::anyhow!("Failed to execute Limbo init SQL: {}\nError: {}", stmt, e))?;
+                self.conn.execute(stmt, ()).await.map_err(|e| {
+                    anyhow::anyhow!("Failed to execute Limbo init SQL: {}\nError: {}", stmt, e)
+                })?;
             }
         }
         info!("(Limbo) TPC-C tables created successfully.");

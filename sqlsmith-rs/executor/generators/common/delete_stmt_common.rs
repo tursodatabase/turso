@@ -55,7 +55,10 @@ pub fn gen_delete_stmt<T: TableColumnLike>(tables: &[T], rng: &mut LcgRng) -> Op
             selected_cols.swap(i, j);
         }
         let selected_cols = &selected_cols[..col_count];
-        let col_names: Vec<&str> = selected_cols.iter().map(|(name, _)| name.as_str()).collect();
+        let col_names: Vec<&str> = selected_cols
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect();
         format!("RETURNING {}", col_names.join(", "))
     } else {
         String::new()
