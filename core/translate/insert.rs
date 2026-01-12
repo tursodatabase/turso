@@ -695,9 +695,7 @@ fn emit_partial_index_check(
         return Ok(None);
     };
     let mut where_for_eval = where_clause.as_ref().clone();
-    // First rewrite BETWEEN expressions to Binary expressions
     rewrite_between_expr(&mut where_for_eval)?;
-    // Then rewrite column references to use insertion registers
     rewrite_partial_index_where(&mut where_for_eval, insertion)?;
     let reg = program.alloc_register();
     translate_expr_no_constant_opt(
