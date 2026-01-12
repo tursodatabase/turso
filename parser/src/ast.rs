@@ -609,6 +609,10 @@ pub enum Literal {
     Keyword(String),
     /// `NULL`
     Null,
+    /// `TRUE` - SQLite boolean literal (equivalent to 1 but semantically distinct for IS TRUE)
+    True,
+    /// `FALSE` - SQLite boolean literal (equivalent to 0 but semantically distinct for IS FALSE)
+    False,
     /// `CURRENT_DATE`
     CurrentDate,
     /// `CURRENT_TIME`

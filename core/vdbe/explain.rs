@@ -1565,6 +1565,15 @@ pub fn insn_to_row(
                 0,
                 format!("r[{dest}]=!r[{reg}]"),
             ),
+            Insn::IsTrue { reg, dest, null_value, invert } => (
+                "IsTrue",
+                *reg as i64,
+                *dest as i64,
+                if *null_value { 1 } else { 0 },
+                Value::build_text(""),
+                if *invert { 1 } else { 0 },
+                format!("r[{dest}] = IsTrue(r[{reg}], null={}, invert={})", *null_value as i64, *invert as i64),
+            ),
             Insn::Concat { lhs, rhs, dest } => (
                 "Concat",
                 *rhs as i64,

@@ -1422,6 +1422,8 @@ impl Optimizable for ast::Expr {
                 ast::Literal::Blob(_) => true,
                 ast::Literal::Keyword(_) => true,
                 ast::Literal::Null => false,
+                ast::Literal::True => true,
+                ast::Literal::False => true,
                 ast::Literal::CurrentDate => true,
                 ast::Literal::CurrentTime => true,
                 ast::Literal::CurrentTimestamp => true,

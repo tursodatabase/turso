@@ -1582,10 +1582,10 @@ impl<'a> Parser<'a> {
                 } else {
                     match_ignore_ascii_case!(match name {
                         b"true" => {
-                            Ok(Box::new(Expr::Literal(Literal::Numeric("1".into()))))
+                            Ok(Box::new(Expr::Literal(Literal::True)))
                         }
                         b"false" => {
-                            Ok(Box::new(Expr::Literal(Literal::Numeric("0".into()))))
+                            Ok(Box::new(Expr::Literal(Literal::False)))
                         }
                         _ => Ok(Box::new(Expr::Id(Name::from_bytes(name)))),
                     })
@@ -3153,9 +3153,9 @@ impl<'a> Parser<'a> {
             _ => {
                 let name = self.parse_nm()?;
                 let expr = if name.as_str().eq_ignore_ascii_case("true") {
-                    Expr::Literal(Literal::Numeric("1".into()))
+                    Expr::Literal(Literal::True)
                 } else if name.as_str().eq_ignore_ascii_case("false") {
-                    Expr::Literal(Literal::Numeric("0".into()))
+                    Expr::Literal(Literal::False)
                 } else {
                     Expr::Id(name)
                 };

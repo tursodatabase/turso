@@ -3,6 +3,7 @@ use crate::function::AlterTableFunc;
 use crate::mvcc::cursor::{MvccCursorType, NextRowidResult};
 use crate::mvcc::database::CheckpointStateMachine;
 use crate::mvcc::LocalClock;
+use crate::numeric::Numeric;
 use crate::schema::{Table, SQLITE_SEQUENCE_TABLE_NAME};
 use crate::state_machine::StateMachine;
 use crate::storage::btree::{
@@ -8029,6 +8030,51 @@ pub fn op_not(
 ) -> Result<InsnFunctionStepResult> {
     load_insn!(Not { reg, dest }, insn);
     state.registers[*dest] = Register::Value(state.registers[*reg].get_value().exec_boolean_not());
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+/// Implements IS TRUE, IS FALSE, IS NOT TRUE, IS NOT FALSE.
+/// A value is "true" only if it's a non-zero number.
+/// Text and blobs are parsed as numbers; if not parseable, treated as 0 (falsy).
+/// NULL is handled specially with the null_value parameter.
+pub fn op_is_true(
+    _program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(
+        IsTrue {
+            reg,
+            dest,
+            null_value,
+            invert
+        },
+        insn
+    );
+    let value = state.registers[*reg].get_value();
+    // Use Numeric::try_into_bool which handles the conversion of text/blob to numbers
+    let final_result = match Numeric::from(value).try_into_bool() {
+        // For NULL, store null_value directly (no inversion)
+        None => {
+            if *null_value {
+                1
+            } else {
+                0
+            }
+        }
+        // For non-NULL, optionally invert the boolean result
+        Some(is_truthy) => {
+            let result = if is_truthy { 1 } else { 0 };
+            if *invert {
+                1 - result
+            } else {
+                result
+            }
+        }
+    };
+    state.registers[*dest] = Register::Value(Value::Integer(final_result));
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
 }
