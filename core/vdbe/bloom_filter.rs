@@ -1,4 +1,4 @@
-use bloom::{BloomFilter as BloomFilterInner, ASMS};
+use fastbloom::BloomFilter as BloomFilterInner;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 
@@ -38,7 +38,8 @@ impl BloomFilter {
     /// Creates a new bloom filter with the specified expected item count and false positive rate.
     pub fn with_capacity(expected_items: u32, false_positive_rate: f32) -> Self {
         Self {
-            inner: BloomFilterInner::with_rate(false_positive_rate, expected_items),
+            inner: BloomFilterInner::with_false_pos(false_positive_rate as f64)
+                .expected_items(expected_items as usize),
             count: 0,
         }
     }
