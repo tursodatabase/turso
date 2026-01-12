@@ -277,3 +277,18 @@ FROM
 ORDER BY
 value;
  }
+
+# https://github.com/tursodatabase/turso/issues/4608
+# Float literals in ORDER BY should be treated as constant expressions, not column references.
+# They should not cause parse errors.
+do_execsql_test_on_specific_db {:memory:} orderby_float_literal {
+    SELECT 1 ORDER BY 0.5;
+} {1}
+
+do_execsql_test_on_specific_db {:memory:} orderby_float_literal_with_table {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (3), (1), (2);
+    SELECT x FROM t ORDER BY 0.5;
+} {3
+1
+2}
