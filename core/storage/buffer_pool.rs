@@ -3,7 +3,7 @@ use crate::fast_lock::SpinLock;
 use crate::io::TEMP_BUFFER_CACHE;
 use crate::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
 use crate::sync::{Arc, Weak};
-use crate::{turso_assert, Buffer, LimboError, IO};
+use crate::{turso_assert, turso_assert_greater_than, Buffer, LimboError, IO};
 use std::cell::UnsafeCell;
 use std::ptr::NonNull;
 use std::sync::OnceLock;
@@ -247,7 +247,7 @@ impl PoolInner {
     /// Allocate a buffer of the given length from the pool, falling back to
     /// temporary thread local buffers if the pool is not initialized or is full.
     pub fn allocate(&self, len: usize) -> Buffer {
-        turso_assert!(len > 0, "Cannot allocate zero-length buffer");
+        turso_assert_greater_than!(len, 0, "Cannot allocate zero-length buffer");
 
         let db_page_size = self.get_db_page_size();
         let wal_frame_size = db_page_size + WAL_FRAME_HEADER_SIZE;

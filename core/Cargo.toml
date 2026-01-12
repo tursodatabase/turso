@@ -18,7 +18,7 @@ path = "lib.rs"
 
 [features]
 default = ["fs", "uuid", "time", "json", "series", "encryption"]
-antithesis = ["dep:antithesis_sdk", "antithesis_sdk?/full"]
+antithesis = ["dep:antithesis_sdk", "antithesis_sdk?/full", "dep:serde_json"]
 tracing_release = ["tracing/release_max_level_info"]
 conn_raw_api = []
 fs = ["turso_ext/vfs"]
@@ -74,6 +74,7 @@ uncased = "0.9.10"
 strum_macros = { workspace = true }
 bitflags = { workspace = true }
 serde = { workspace = true, optional = true, features = ["derive"] }
+serde_json = { workspace = true, optional = true }
 paste = "1.0.15"
 uuid = { version = "1.11.0", features = ["v4", "v5", "v7"], optional = true }
 tempfile = { workspace = true }
@@ -95,6 +96,9 @@ branches = { version = "0.4.3", default-features = false }
 bumpalo = { version = "3", features = ["collections"] }
 smallvec = "1.15.1"
 fastbloom = "0.14.1"
+
+[target.'cfg(antithesis)'.dependencies]
+json = "0.12.4"
 
 [target.'cfg(loom)'.dependencies]
 loom = { workspace = true }
