@@ -653,6 +653,13 @@ impl Value {
             (Value::Text(t), None) => {
                 Value::build_text(trim_type.trim(t.as_str(), &[' ']).to_string())
             }
+            // For Integer/Float without pattern, convert to text and trim spaces.
+            // TRIM() always returns TEXT in SQLite.
+            (Value::Integer(_) | Value::Float(_), None) => {
+                let text = self.to_string();
+                Value::build_text(trim_type.trim(&text, &[' ']).to_string())
+            }
+            // NULL and Blob return unchanged
             (reg, _) => reg.to_owned(),
         }
     }
@@ -1624,6 +1631,16 @@ mod tests {
         let input_str = Value::build_text("\na");
         let expected_str = Value::build_text("\na");
         assert_eq!(input_str.exec_trim(None), expected_str);
+
+        // TRIM on Integer should return TEXT (SQLite compatibility)
+        let input_int = Value::Integer(12345);
+        let expected_text = Value::build_text("12345");
+        assert_eq!(input_int.exec_trim(None), expected_text);
+
+        // TRIM on Float should return TEXT (SQLite compatibility)
+        let input_float = Value::Float(123.5);
+        let expected_text = Value::build_text("123.5");
+        assert_eq!(input_float.exec_trim(None), expected_text);
     }
 
     #[test]
