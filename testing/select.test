@@ -27,6 +27,70 @@ do_execsql_test select-false {
   SELECT false
 } {0}
 
+# IS TRUE/IS FALSE tests - SQLite uses truth semantics (only non-zero numbers are truthy)
+do_execsql_test_on_specific_db {:memory:} is-true-integer {
+  SELECT 8 IS TRUE, 1 IS TRUE, 0 IS TRUE, -1 IS TRUE;
+} {1|1|0|1}
+
+do_execsql_test_on_specific_db {:memory:} is-true-float {
+  SELECT 0.0 IS TRUE, 0.5 IS TRUE, -0.5 IS TRUE;
+} {0|1|1}
+
+do_execsql_test_on_specific_db {:memory:} is-true-text {
+  SELECT 'hello' IS TRUE, '' IS TRUE, '0' IS TRUE, '1' IS TRUE, '42' IS TRUE;
+} {0|0|0|1|1}
+
+do_execsql_test_on_specific_db {:memory:} is-true-null {
+  SELECT NULL IS TRUE;
+} {0}
+
+do_execsql_test_on_specific_db {:memory:} is-false-integer {
+  SELECT 8 IS FALSE, 1 IS FALSE, 0 IS FALSE, -1 IS FALSE;
+} {0|0|1|0}
+
+do_execsql_test_on_specific_db {:memory:} is-false-float {
+  SELECT 0.0 IS FALSE, 0.5 IS FALSE, -0.5 IS FALSE;
+} {1|0|0}
+
+do_execsql_test_on_specific_db {:memory:} is-false-text {
+  SELECT 'hello' IS FALSE, '' IS FALSE, '0' IS FALSE, '1' IS FALSE;
+} {1|1|1|0}
+
+do_execsql_test_on_specific_db {:memory:} is-false-null {
+  SELECT NULL IS FALSE;
+} {0}
+
+do_execsql_test_on_specific_db {:memory:} is-not-true-integer {
+  SELECT 8 IS NOT TRUE, 1 IS NOT TRUE, 0 IS NOT TRUE;
+} {0|0|1}
+
+do_execsql_test_on_specific_db {:memory:} is-not-true-null {
+  SELECT NULL IS NOT TRUE;
+} {1}
+
+do_execsql_test_on_specific_db {:memory:} is-not-false-integer {
+  SELECT 8 IS NOT FALSE, 1 IS NOT FALSE, 0 IS NOT FALSE;
+} {1|1|0}
+
+do_execsql_test_on_specific_db {:memory:} is-not-false-null {
+  SELECT NULL IS NOT FALSE;
+} {1}
+
+# IS TRUE/IS FALSE in WHERE clause
+do_execsql_test_on_specific_db {:memory:} is-true-where {
+  CREATE TABLE t_truth(x);
+  INSERT INTO t_truth VALUES(1),(0),(NULL),(8),('hello');
+  SELECT x FROM t_truth WHERE x IS TRUE;
+} {1
+8}
+
+do_execsql_test_on_specific_db {:memory:} is-false-where {
+  CREATE TABLE t_truth(x);
+  INSERT INTO t_truth VALUES(1),(0),(NULL),(8),('hello');
+  SELECT x FROM t_truth WHERE x IS FALSE;
+} {0
+hello}
+
 do_execsql_test select-text-escape-1 {
   SELECT '''a'
 } {'a}
