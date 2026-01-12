@@ -196,7 +196,7 @@ async fn run_tests(
     };
 
     // Create runner config
-    let mut config = RunnerConfig::default().with_max_jobs(jobs);
+    let mut config = RunnerConfig::default().with_max_jobs(jobs).with_mvcc(mvcc);
     if let Some(f) = filter {
         config = config.with_filter(f);
     }

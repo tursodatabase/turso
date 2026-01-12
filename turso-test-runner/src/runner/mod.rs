@@ -204,6 +204,8 @@ pub struct RunnerConfig {
     pub max_jobs: usize,
     /// Test name filter (glob pattern)
     pub filter: Option<String>,
+    /// Whether MVCC mode is enabled
+    pub mvcc: bool,
 }
 
 impl Default for RunnerConfig {
@@ -211,6 +213,7 @@ impl Default for RunnerConfig {
         Self {
             max_jobs: num_cpus::get(),
             filter: None,
+            mvcc: false,
         }
     }
 }
@@ -223,6 +226,11 @@ impl RunnerConfig {
 
     pub fn with_filter(mut self, filter: impl Into<String>) -> Self {
         self.filter = Some(filter.into());
+        self
+    }
+
+    pub fn with_mvcc(mut self, mvcc: bool) -> Self {
+        self.mvcc = mvcc;
         self
     }
 }
@@ -276,10 +284,11 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
                 let db_config = db_config.clone();
                 let setups = test_file.setups.clone();
                 let file_path = path.to_path_buf();
+                let mvcc = self.config.mvcc;
 
                 futures.push(tokio::spawn(async move {
                     let _permit = semaphore.acquire_owned().await.unwrap();
-                    run_single_test(backend, file_path, db_config, test, setups).await
+                    run_single_test(backend, file_path, db_config, test, setups, mvcc).await
                 }));
             }
         }
@@ -425,20 +434,27 @@ async fn run_single_test<B: SqlBackend>(
     db_config: DatabaseConfig,
     test: TestCase,
     setups: std::collections::HashMap<String, String>,
+    mvcc: bool,
 ) -> TestResult {
     let start = Instant::now();
 
     // Check if skipped
-    if let Some(reason) = &test.skip {
-        return TestResult {
-            name: test.name,
-            file: file_path,
-            database: db_config,
-            outcome: TestOutcome::Skipped {
-                reason: reason.clone(),
-            },
-            duration: start.elapsed(),
+    if let Some(skip) = &test.skip {
+        let should_skip = match &skip.condition {
+            None => true, // Unconditional skip
+            Some(crate::parser::ast::SkipCondition::Mvcc) => mvcc,
         };
+        if should_skip {
+            return TestResult {
+                name: test.name,
+                file: file_path,
+                database: db_config,
+                outcome: TestOutcome::Skipped {
+                    reason: skip.reason.clone(),
+                },
+                duration: start.elapsed(),
+            };
+        }
     }
 
     // Create database instance

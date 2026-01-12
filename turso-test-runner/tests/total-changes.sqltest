@@ -1,6 +1,6 @@
 @database :memory:
 
-#!/usr/bin/env tclsh
+@skip-if mvcc "total_changes not supported in MVCC mode"
 test total-changes-on-basic-insert {
     create table temp (t1 integer, primary key (t1));
     insert into temp values (1);
@@ -10,6 +10,7 @@ expect {
     1
 }
 
+@skip-if mvcc "total_changes not supported in MVCC mode"
 test total-changes-on-multiple-row-insert {
     create table temp (t1 integer, primary key (t1));
     insert into temp values (1), (2), (3);
@@ -19,6 +20,7 @@ expect {
     3
 }
 
+@skip-if mvcc "total_changes not supported in MVCC mode"
 test total-changes-on-multiple-inserts {
     create table temp (t1 integer, primary key (t1));
     insert into temp values (1), (2), (3);
@@ -29,6 +31,7 @@ expect {
     7
 }
 
+@skip-if mvcc "total_changes not supported in MVCC mode"
 test total-changes-on-update-single-row {
     create table temp (t1 integer primary key, t2 text);
     insert into temp values (1, 'a'), (2, 'b'), (3, 'c');
@@ -39,6 +42,7 @@ expect {
     4
 }
 
+@skip-if mvcc "total_changes not supported in MVCC mode"
 test total-changes-on-update-multiple-rows {
     create table temp (t1 integer primary key, t2 text);
     insert into temp values (1, 'a'), (2, 'b'), (3, 'c');
@@ -49,6 +53,7 @@ expect {
     5
 }
 
+@skip-if mvcc "total_changes not supported in MVCC mode"
 test total-changes-on-update-no-match {
     create table temp (t1 integer primary key, t2 text);
     insert into temp values (1, 'a'), (2, 'b');

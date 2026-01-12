@@ -44,6 +44,14 @@ pub enum Token {
     #[token("@skip")]
     AtSkip,
 
+    /// `@skip-if`
+    #[token("@skip-if")]
+    AtSkipIf,
+
+    /// `mvcc` keyword (for skip conditions)
+    #[token("mvcc")]
+    Mvcc,
+
     /// `setup` keyword
     #[token("setup")]
     Setup,
@@ -128,6 +136,8 @@ impl fmt::Display for Token {
             Token::AtDatabase => write!(f, "@database"),
             Token::AtSetup => write!(f, "@setup"),
             Token::AtSkip => write!(f, "@skip"),
+            Token::AtSkipIf => write!(f, "@skip-if"),
+            Token::Mvcc => write!(f, "mvcc"),
             Token::Setup => write!(f, "setup"),
             Token::Test => write!(f, "test"),
             Token::Expect => write!(f, "expect"),
@@ -190,7 +200,7 @@ pub fn tokenize(input: &str) -> Result<Vec<SpannedToken>, LexerError> {
 fn suggest_fix(slice: &str) -> Option<String> {
     if slice.starts_with('@') {
         Some(format!(
-            "Valid directives are: @database, @setup, @skip. Did you mean one of these?"
+            "Valid directives are: @database, @setup, @skip, @skip-if. Did you mean one of these?"
         ))
     } else if slice.starts_with(':') {
         Some(

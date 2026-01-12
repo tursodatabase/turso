@@ -36,8 +36,24 @@ pub struct TestCase {
     pub expectation: Expectation,
     /// Setup references with their spans
     pub setups: Vec<SetupRef>,
-    /// If set, skip this test with the given reason
-    pub skip: Option<String>,
+    /// If set, skip this test (unconditionally or conditionally)
+    pub skip: Option<Skip>,
+}
+
+/// Skip configuration for a test
+#[derive(Debug, Clone, PartialEq)]
+pub struct Skip {
+    /// The reason for skipping
+    pub reason: String,
+    /// Optional condition for skipping (if None, always skip)
+    pub condition: Option<SkipCondition>,
+}
+
+/// Conditions for skipping a test
+#[derive(Debug, Clone, PartialEq)]
+pub enum SkipCondition {
+    /// Skip when MVCC mode is enabled
+    Mvcc,
 }
 
 /// What we expect from executing the SQL

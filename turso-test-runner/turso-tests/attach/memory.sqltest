@@ -1,5 +1,6 @@
 @database :memory:
 
+@skip-if mvcc "attach not supported in MVCC mode"
 # Test querying attached file database
 test attach-db-query {
     ATTACH DATABASE "database/testing_small.db" AS small;
@@ -19,6 +20,7 @@ expect {
     0|main|
 }
 
+@skip-if mvcc "attach not supported in MVCC mode"
 # Test attach in-memory database
 test attach-memory-database {
     ATTACH DATABASE ':memory:' AS mem;
@@ -29,6 +31,7 @@ expect {
     2|mem|
 }
 
+@skip-if mvcc "attach not supported in MVCC mode"
 # Test join between main and attached database
 test attach-cross-database-join {
     ATTACH DATABASE "database/testing_small.db" as small;
