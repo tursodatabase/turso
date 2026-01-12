@@ -46,6 +46,7 @@ fn get_random() -> u64 {
 #[derive(Debug)]
 pub struct Plan {
     pub ddl_statements: Vec<String>,
+    // Note: queries_per_thread is no longer used with sqlsmith-rs as queries are generated dynamically
     pub queries_per_thread: Vec<Vec<String>>,
     pub nr_iterations: usize,
     pub nr_threads: usize,
@@ -59,7 +60,7 @@ pub fn gen_bool(probability_true: f64) -> bool {
 /// Generate SQL statement using sqlsmith-rs standalone generators
 fn generate_random_statement(rng: &mut LcgRng) -> String {
     // Use only standalone generators that don't require schema introspection
-    let stmt_kind = get_random() % 4;
+    let stmt_kind = (rng.rand().unsigned_abs() % 4) as u64;
     
     match stmt_kind {
         0 => {
@@ -98,10 +99,10 @@ fn generate_plan(opts: &Opts) -> Result<Plan, Box<dyn std::error::Error + Send +
         nr_threads: opts.nr_threads,
     };
 
-    // For now, if db_ref is provided, we'll error out since we're simplifying
+    // For now, if db_ref is provided, return an error since we're using simplified SQL generation
     if opts.db_ref.is_some() {
         writeln!(log_file, "{}", 0)?;
-        eprintln!("Note: db_ref feature not yet implemented with sqlsmith-rs");
+        return Err("db_ref feature not yet implemented with sqlsmith-rs".into());
     } else {
         // Generate simple DDL statements using sqlsmith-rs
         let mut rng = LcgRng::new(get_random());
@@ -123,8 +124,7 @@ fn generate_plan(opts: &Opts) -> Result<Plan, Box<dyn std::error::Error + Send +
         plan.ddl_statements = ddl_statements;
     }
 
-    // Generate queries - note that we can't generate them yet because we need a connection
-    // We'll generate them later when we have the connection
+    // Initialize empty query vectors (queries are now generated dynamically during execution)
     for id in 0..opts.nr_threads {
         writeln!(log_file, "{id}")?;
         plan.queries_per_thread.push(vec![]);
