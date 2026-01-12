@@ -53,54 +53,54 @@ jobs:
           mode: simulation
           run: cargo codspeed run
 
-  tpc-h:
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    env:
-      DB_FILE: "perf/tpc-h/TPC-H.db"
-    steps:
-      - uses: actions/checkout@v4
+  # tpc-h:
+  #   runs-on: ubuntu-latest
+  #   timeout-minutes: 60
+  #   env:
+  #     DB_FILE: "perf/tpc-h/TPC-H.db"
+  #   steps:
+  #     - uses: actions/checkout@v4
 
-      - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+  #     - name: Setup Rust toolchain
+  #       uses: dtolnay/rust-toolchain@stable
 
-      - name: Setup mold linker
-        uses: rui314/setup-mold@v1
+  #     - name: Setup mold linker
+  #       uses: rui314/setup-mold@v1
 
-      - uses: Swatinem/rust-cache@v2
-        with:
-          prefix-key: "v1-rust-codspeed"
-          cache-on-failure: true
+  #     - uses: Swatinem/rust-cache@v2
+  #       with:
+  #         prefix-key: "v1-rust-codspeed"
+  #         cache-on-failure: true
 
-      - name: Setup sccache
-        uses: mozilla-actions/sccache-action@v0.0.9
+  #     - name: Setup sccache
+  #       uses: mozilla-actions/sccache-action@v0.0.9
 
-      - name: Install cargo-codspeed
-        uses: taiki-e/install-action@v2
-        with:
-          tool: cargo-codspeed
+  #     - name: Install cargo-codspeed
+  #       uses: taiki-e/install-action@v2
+  #       with:
+  #         tool: cargo-codspeed
 
-      - name: Cache TPC-H
-        id: cache-tpch
-        uses: actions/cache@v4
-        with:
-          path: ${{ env.DB_FILE }}
-          key: tpc-h
+  #     - name: Cache TPC-H
+  #       id: cache-tpch
+  #       uses: actions/cache@v4
+  #       with:
+  #         path: ${{ env.DB_FILE }}
+  #         key: tpc-h
 
-      - name: Download TPC-H
-        if: steps.cache-tpch.outputs.cache-hit != 'true'
-        env:
-          DB_URL: "https://github.com/lovasoa/TPCH-sqlite/releases/download/v1.0/TPC-H.db"
-        run: wget -O $DB_FILE --no-verbose $DB_URL
+  #     - name: Download TPC-H
+  #       if: steps.cache-tpch.outputs.cache-hit != 'true'
+  #       env:
+  #         DB_URL: "https://github.com/lovasoa/TPCH-sqlite/releases/download/v1.0/TPC-H.db"
+  #       run: wget -O $DB_FILE --no-verbose $DB_URL
 
-      - name: Build TPC-H benchmark
-        env:
-          SCCACHE_GHA_ENABLED: "true"
-          RUSTC_WRAPPER: "sccache"
-        run: cargo codspeed build --features codspeed --bench tpc_h_benchmark 
+  #     - name: Build TPC-H benchmark
+  #       env:
+  #         SCCACHE_GHA_ENABLED: "true"
+  #         RUSTC_WRAPPER: "sccache"
+  #       run: cargo codspeed build --features codspeed --bench tpc_h_benchmark 
 
-      - name: Run TPC-H benchmark
-        uses: CodSpeedHQ/action@v4.5.2
-        with:
-          mode: simulation
-          run: cargo codspeed run --bench tpc_h_benchmark
+  #     - name: Run TPC-H benchmark
+  #       uses: CodSpeedHQ/action@v4.5.2
+  #       with:
+  #         mode: simulation
+  #         run: cargo codspeed run --bench tpc_h_benchmark
