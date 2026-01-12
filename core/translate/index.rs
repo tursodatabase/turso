@@ -12,8 +12,8 @@ use crate::translate::emitter::{
     emit_cdc_full_record, emit_cdc_insns, prepare_cdc_if_necessary, OperationMode, Resolver,
 };
 use crate::translate::expr::{
-    bind_and_rewrite_expr, translate_condition_expr, translate_expr, walk_expr, BindingBehavior,
-    ConditionMetadata, WalkControl,
+    bind_and_rewrite_expr, translate_condition_expr, translate_expr, unwrap_parens, walk_expr,
+    BindingBehavior, ConditionMetadata, WalkControl,
 };
 use crate::translate::insert::format_unique_violation_desc;
 use crate::translate::plan::{
@@ -515,7 +515,9 @@ pub fn resolve_sorted_columns(
     for sc in cols {
         let order = sc.order.unwrap_or(SortOrder::Asc);
         let (explicit_collation, base_expr) = extract_collation(sc.expr.as_ref())?;
-        if let Some((pos, column_name, column)) = resolve_index_column(base_expr, table) {
+        // Unwrap parentheses for column resolution (SQLite treats (('col')) same as 'col')
+        let unwrapped_expr = unwrap_parens(base_expr)?;
+        if let Some((pos, column_name, column)) = resolve_index_column(unwrapped_expr, table) {
             let collation = explicit_collation.or_else(|| column.collation_opt());
             resolved.push(IndexColumn {
                 name: column_name,
@@ -527,7 +529,7 @@ pub fn resolve_sorted_columns(
             });
             continue;
         }
-        if !validate_index_expression(sc.expr.as_ref(), table) {
+        if !validate_index_expression(unwrapped_expr, table) {
             crate::bail_parse_error!("Error: invalid expression in CREATE INDEX: {}", sc.expr);
         }
         resolved.push(IndexColumn {
@@ -565,6 +567,12 @@ fn resolve_index_column<'a>(
 ) -> Option<(usize, String, &'a Column)> {
     let (pos, column) = match expr {
         Expr::Id(col_name) | Expr::Name(col_name) => table.get_column(col_name.as_str())?,
+        // SQLite interprets single-quoted strings as column names in index expressions
+        // (backwards compatibility quirk). We do the same. The string includes quotes.
+        Expr::Literal(ast::Literal::String(col_name)) => {
+            let unquoted = col_name.trim_matches('\'');
+            table.get_column(unquoted)?
+        }
         Expr::Qualified(_, col) | Expr::DoublyQualified(_, _, col) => {
             table.get_column(col.as_str())?
         }
@@ -588,7 +596,17 @@ fn resolve_index_column<'a>(
 /// (a.k.a.: deterministic functions). Obviously, functions like random() will not work well in an index. But also functions like sqlite_version(), though they
 /// are constant across any one database connection, are not constant across the life of the underlying database file, and hence may not be used in a CREATE INDEX statement.
 /// Expressions in CREATE INDEX statements may not use subqueries.
+/// Additionally, a standalone string literal is interpreted as a column name (for backwards
+/// compatibility with SQLite), not as a string literal. It is rejected if no such column exists.
 fn validate_index_expression(expr: &Expr, table: &BTreeTable) -> bool {
+    // A top-level string literal would have been handled by resolve_index_column().
+    // If we get here with a string literal, it means the column doesn't exist.
+    // (SQLite interprets standalone string literals as column names for backwards compat.)
+    // Note: extract_collation already unwraps parentheses, so we check the unwrapped expr.
+    if matches!(expr, Expr::Literal(ast::Literal::String(_))) {
+        return false;
+    }
+
     let tbl_norm = normalize_ident(table.name.as_str());
     let has_col = |name: &str| {
         let n = normalize_ident(name);
@@ -609,6 +627,9 @@ fn validate_index_expression(expr: &Expr, table: &BTreeTable) -> bool {
             return Ok(WalkControl::SkipChildren);
         }
         match e {
+            // String literals inside expressions are allowed (e.g., `c0 || 'suffix'`).
+            // Standalone string literals are handled by resolve_index_column() which interprets
+            // them as column names (SQLite backwards compat quirk).
             Expr::Literal(_) | Expr::RowId { .. } => {}
             // must be a column of the target table
             Expr::Id(n) | Expr::Name(n) => {

@@ -372,9 +372,16 @@ fn to_turso_step_result_error<'local>(
     env: &mut JNIEnv<'local>,
     error_message: &str,
 ) -> JObject<'local> {
-    let error_str = env
-        .new_string(error_message)
-        .unwrap_or_else(|_| env.new_string("Unknown error").unwrap());
+    // Clear any pending exception first, as JNI calls won't work with a pending exception.
+    // This can happen if set_err_msg_and_throw_exception was called before this function.
+    if env.exception_check().unwrap_or(false) {
+        let _ = env.exception_clear();
+    }
+
+    let error_str = match env.new_string(error_message) {
+        Ok(s) => s,
+        Err(_) => return JObject::null(),
+    };
     let error_obj: JObject = error_str.into();
     let ctor_args = vec![
         JValue::Int(STEP_RESULT_ID_ERROR),
