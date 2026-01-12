@@ -73,7 +73,7 @@ pub struct DbSyncStatus {
 }
 
 pub struct DbChangesStatus {
-    pub time: turso_core::Instant,
+    pub time: turso_core::WallClockInstant,
     pub revision: DatabasePullRevision,
     pub file_slot: Option<MutexSlot<Arc<dyn turso_core::File>>>,
 }

@@ -6,7 +6,9 @@ use std::fs::{File as StdFile, OpenOptions};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use tracing::debug;
-use turso_core::{Clock, Completion, File, IO, Instant, OpenFlags, Result};
+use turso_core::{
+    Clock, Completion, File, IO, MonotonicInstant, OpenFlags, Result, WallClockInstant,
+};
 
 #[derive(Debug, Clone)]
 pub struct IOFaultConfig {
@@ -71,9 +73,13 @@ impl Drop for SimulatorIO {
 }
 
 impl Clock for SimulatorIO {
-    fn now(&self) -> Instant {
+    fn current_time_monotonic(&self) -> MonotonicInstant {
+        MonotonicInstant::now()
+    }
+
+    fn current_time_wall_clock(&self) -> WallClockInstant {
         let micros = self.time.load(Ordering::Relaxed);
-        Instant {
+        WallClockInstant {
             secs: (micros / 1_000_000) as i64,
             micros: (micros % 1_000_000) as u32,
         }

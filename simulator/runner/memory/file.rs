@@ -119,7 +119,7 @@ impl MemorySimFile {
     }
 
     #[instrument(skip_all, level = Level::TRACE)]
-    fn generate_latency(&self) -> Option<turso_core::Instant> {
+    fn generate_latency(&self) -> Option<turso_core::WallClockInstant> {
         let mut rng = self.rng.borrow_mut();
         // Chance to introduce some latency
         rng.random_bool(self.latency_probability as f64 / 100.0)

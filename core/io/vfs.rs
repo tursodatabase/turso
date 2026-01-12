@@ -1,6 +1,6 @@
 use super::{Buffer, Completion, File, OpenFlags, IO};
 use crate::ext::VfsMod;
-use crate::io::clock::{Clock, DefaultClock, Instant};
+use crate::io::clock::{Clock, DefaultClock, MonotonicInstant, WallClockInstant};
 use crate::io::CompletionInner;
 use crate::{LimboError, Result};
 use std::ffi::{c_void, CString};
@@ -9,8 +9,12 @@ use std::sync::Arc;
 use turso_ext::{BufferRef, IOCallback, SendPtr, VfsFileImpl, VfsImpl};
 
 impl Clock for VfsMod {
-    fn now(&self) -> Instant {
-        DefaultClock.now()
+    fn current_time_monotonic(&self) -> MonotonicInstant {
+        DefaultClock.current_time_monotonic()
+    }
+
+    fn current_time_wall_clock(&self) -> WallClockInstant {
+        DefaultClock.current_time_wall_clock()
     }
 }
 

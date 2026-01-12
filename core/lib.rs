@@ -63,7 +63,7 @@ use crate::{incremental::view::AllViewsTxState, translate::emitter::TransactionM
 use arc_swap::{ArcSwap, ArcSwapOption};
 use core::str;
 pub use error::{CompletionError, LimboError};
-pub use io::clock::{Clock, Instant};
+pub use io::clock::{Clock, MonotonicInstant, WallClockInstant};
 #[cfg(all(feature = "fs", target_family = "unix", not(miri)))]
 pub use io::UnixIO;
 #[cfg(all(feature = "fs", target_os = "linux", feature = "io_uring", not(miri)))]

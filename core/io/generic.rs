@@ -1,4 +1,5 @@
-use crate::{io::clock::DefaultClock, Clock, Completion, File, Instant, OpenFlags, Result, IO};
+use crate::io::clock::{DefaultClock, MonotonicInstant, WallClockInstant};
+use crate::{Clock, Completion, File, OpenFlags, Result, IO};
 use parking_lot::RwLock;
 use std::io::{Read, Seek, Write};
 use std::sync::Arc;
@@ -43,8 +44,12 @@ impl IO for GenericIO {
 }
 
 impl Clock for GenericIO {
-    fn now(&self) -> Instant {
-        DefaultClock.now()
+    fn current_time_monotonic(&self) -> MonotonicInstant {
+        DefaultClock.current_time_monotonic()
+    }
+
+    fn current_time_wall_clock(&self) -> WallClockInstant {
+        DefaultClock.current_time_wall_clock()
     }
 }
 

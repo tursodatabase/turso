@@ -1,4 +1,4 @@
-use crate::Instant;
+use crate::MonotonicInstant;
 use std::time::Duration;
 
 /// Type alias for busy handler callback function.
@@ -52,7 +52,7 @@ pub struct BusyHandlerState {
     /// Number of times the busy handler has been invoked for this locking event
     invocation_count: i32,
     /// For timeout-based handlers: the next timeout instant to wait until
-    timeout: Instant,
+    timeout: MonotonicInstant,
     /// For timeout-based handlers: the current iteration index into DELAYS
     iteration: usize,
 }
@@ -91,7 +91,7 @@ impl BusyHandlerState {
     ];
 
     /// Create a new busy handler state
-    pub fn new(now: Instant) -> Self {
+    pub fn new(now: MonotonicInstant) -> Self {
         Self {
             invocation_count: 0,
             timeout: now,
@@ -100,14 +100,14 @@ impl BusyHandlerState {
     }
 
     /// Reset the state for a new locking event
-    pub fn reset(&mut self, now: Instant) {
+    pub fn reset(&mut self, now: MonotonicInstant) {
         self.invocation_count = 0;
         self.timeout = now;
         self.iteration = 0;
     }
 
     /// Get the current timeout instant
-    pub fn timeout(&self) -> Instant {
+    pub fn timeout(&self) -> MonotonicInstant {
         self.timeout
     }
 
@@ -118,7 +118,7 @@ impl BusyHandlerState {
     ///
     /// For timeout-based handlers, this also updates the internal timeout instant.
     /// For custom handlers, this invokes the callback and respects its return value.
-    pub fn invoke(&mut self, handler: &BusyHandler, now: Instant) -> bool {
+    pub fn invoke(&mut self, handler: &BusyHandler, now: MonotonicInstant) -> bool {
         match handler {
             BusyHandler::None => {
                 // No handler: return BUSY immediately
@@ -142,7 +142,7 @@ impl BusyHandlerState {
     /// Implements sqliteDefaultBusyCallback logic for timeout-based handling.
     ///
     /// This uses an exponentially increasing delay schedule, capped at 100ms per iteration.
-    fn invoke_timeout_handler(&mut self, max_duration: Duration, now: Instant) -> bool {
+    fn invoke_timeout_handler(&mut self, max_duration: Duration, now: MonotonicInstant) -> bool {
         let idx = self.iteration.min(11);
         let mut delay = Self::DELAYS[idx];
         let mut prior = Self::TOTALS[idx];
@@ -170,21 +170,11 @@ impl BusyHandlerState {
     ///
     /// This returns the duration between `now` and the timeout instant.
     /// Returns `Duration::ZERO` if the timeout has already passed.
-    pub fn get_delay(&self, now: Instant) -> Duration {
-        if now.secs > self.timeout.secs
-            || (now.secs == self.timeout.secs && now.micros >= self.timeout.micros)
-        {
+    pub fn get_delay(&self, now: MonotonicInstant) -> Duration {
+        if now >= self.timeout {
             Duration::ZERO
         } else {
-            let secs_diff = (self.timeout.secs - now.secs) as u64;
-            let micros_diff = if self.timeout.micros >= now.micros {
-                self.timeout.micros - now.micros
-            } else {
-                // Borrow from seconds
-                return Duration::from_secs(secs_diff.saturating_sub(1))
-                    + Duration::from_micros((1_000_000 + self.timeout.micros - now.micros) as u64);
-            };
-            Duration::from_secs(secs_diff) + Duration::from_micros(micros_diff as u64)
+            self.timeout.duration_since(now)
         }
     }
 }
@@ -192,8 +182,9 @@ impl BusyHandlerState {
 #[cfg(test)]
 mod tests {
     use super::*;
-    fn test_instant() -> Instant {
-        Instant { secs: 0, micros: 0 }
+
+    fn test_instant() -> MonotonicInstant {
+        MonotonicInstant::now()
     }
 
     #[test]
@@ -365,7 +356,7 @@ mod tests {
         state.invoke(&handler, now);
 
         // Reset
-        let later = Instant { secs: 1, micros: 0 };
+        let later = MonotonicInstant::now();
         state.reset(later);
 
         // Should be back to initial state
@@ -377,25 +368,21 @@ mod tests {
 
     #[test]
     fn test_get_delay_when_timeout_passed() {
-        let now = Instant {
-            secs: 10,
-            micros: 0,
-        };
+        let now = MonotonicInstant::now();
         let state = BusyHandlerState::new(now);
 
         // Timeout is at `now`, so any time >= now should return zero delay
         assert_eq!(state.get_delay(now), Duration::ZERO);
 
-        let later = Instant {
-            secs: 11,
-            micros: 0,
-        };
+        // A later time should also return zero
+        std::thread::sleep(Duration::from_micros(10));
+        let later = MonotonicInstant::now();
         assert_eq!(state.get_delay(later), Duration::ZERO);
     }
 
     #[test]
     fn test_get_delay_calculates_remaining_time() {
-        let now = Instant { secs: 0, micros: 0 };
+        let now = MonotonicInstant::now();
         let mut state = BusyHandlerState::new(now);
 
         let handler = BusyHandler::Timeout(Duration::from_millis(100));
@@ -404,13 +391,5 @@ mod tests {
         // Check delay from `now` - should be 1ms
         let delay = state.get_delay(now);
         assert_eq!(delay, Duration::from_millis(1));
-
-        // Check delay from half-way point
-        let half = Instant {
-            secs: 0,
-            micros: 500,
-        };
-        let delay = state.get_delay(half);
-        assert_eq!(delay, Duration::from_micros(500));
     }
 }
