@@ -27,6 +27,8 @@ interface BaseFailure {
 	reproductionSql?: string;
 	corruptionAnalysis?: CorruptionAnalysis;
 	dbPath?: string;
+	/** Random seed used for this SQLancer run - allows reproduction even after crashes. */
+	seed?: number;
 }
 
 /** SQLancer detected different results between queries. */

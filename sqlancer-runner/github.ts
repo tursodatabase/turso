@@ -147,16 +147,18 @@ export class GithubClient {
 
 	private createFaultDetails(failure: SqlancerFailure): string {
 		const gitShortHash = this.GIT_HASH.substring(0, 7);
+		const seedInfo = failure.seed !== undefined ? `\n- **Seed**: ${failure.seed}` : '';
+		const seedArg = failure.seed !== undefined ? ` --seed ${failure.seed}` : '';
 		return `- **Oracle**: ${failure.oracle}
 - **Git Hash**: ${this.GIT_HASH}
 - **Timestamp**: ${new Date().toISOString()}
-- **Failure Type**: ${failure.type}
+- **Failure Type**: ${failure.type}${seedInfo}
 
 ### Run locally
 
 \`\`\`bash
 git checkout ${this.GIT_HASH}
-./scripts/run-sqlancer.sh --oracle ${failure.oracle} --timeout 300
+./scripts/run-sqlancer.sh --oracle ${failure.oracle} --timeout 300${seedArg}
 \`\`\`
 
 ### Run with Docker

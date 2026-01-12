@@ -99,13 +99,24 @@ function createTimeout(seconds: number, runNumber: number): Promise<never> & { c
 }
 
 /**
+ * Generate a random seed for SQLancer.
+ * We generate this before running so we can log it - if the process crashes,
+ * we'll still have the seed to reproduce the issue.
+ */
+function generateSeed(): number {
+	// SQLancer uses Java's Random which takes a long seed
+	// Generate a random 48-bit integer (safe for JS number precision)
+	return Math.floor(Math.random() * 0xFFFFFFFFFFFF);
+}
+
+/**
  * Run SQLancer with specified oracle.
  */
 async function runSqlancer(
 	oracle: string,
 	timeoutSeconds: number,
 	runNumber: number
-): Promise<{ success: boolean; failure?: SqlancerFailure }> {
+): Promise<{ success: boolean; failure?: SqlancerFailure; seed?: number }> {
 	// Verify prerequisites on first run
 	if (runNumber === 0) {
 		console.log("Verifying SQLancer prerequisites...");
@@ -126,6 +137,9 @@ async function runSqlancer(
 
 	const sqlancerJarPath = path.join(SQLANCER_DIR, "target", sqlancerJar);
 
+	// Generate seed BEFORE starting - if process crashes, we still have the seed logged
+	const seed = generateSeed();
+
 	const args = [
 		`-Djava.library.path=${NATIVE_LIB_DIR}`,
 		"-cp",
@@ -137,6 +151,8 @@ async function runSqlancer(
 		"1",
 		"--print-progress-summary",
 		"true",
+		"--random-seed",
+		String(seed),
 		"limbo",
 		"--oracle",
 		oracle,
@@ -157,26 +173,35 @@ async function runSqlancer(
 		"false",
 	];
 
-	console.log(`[${new Date().toISOString()}] Run ${runNumber}: java ${args.slice(0, 5).join(" ")} ... --oracle ${oracle}`);
+	// Log seed BEFORE starting process - critical for crash reproduction
+	console.log(`[${new Date().toISOString()}] Run ${runNumber}: oracle=${oracle} seed=${seed}`);
 
 	let proc: ChildProcess;
 	let stdout = "";
 	let stderr = "";
 
 	const runPromise = new Promise<{ exitCode: number; timedOut: boolean }>((resolve) => {
+		// Always pipe stdout/stderr so we capture output for GitHub issues
 		proc = spawn("java", args, {
 			cwd: SQLANCER_DIR,
-			stdio: LOG_TO_STDOUT ? "inherit" : ["ignore", "pipe", "pipe"],
+			stdio: ["ignore", "pipe", "pipe"],
 		});
 
-		if (!LOG_TO_STDOUT) {
-			proc.stdout?.on("data", (data) => {
-				stdout += data.toString();
-			});
-			proc.stderr?.on("data", (data) => {
-				stderr += data.toString();
-			});
-		}
+		proc.stdout?.on("data", (data) => {
+			const chunk = data.toString();
+			stdout += chunk;
+			if (LOG_TO_STDOUT) {
+				process.stdout.write(chunk);
+			}
+		});
+
+		proc.stderr?.on("data", (data) => {
+			const chunk = data.toString();
+			stderr += chunk;
+			if (LOG_TO_STDOUT) {
+				process.stderr.write(chunk);
+			}
+		});
 
 		proc.on("close", (code) => {
 			resolve({ exitCode: code || 0, timedOut: false });
@@ -195,7 +220,7 @@ async function runSqlancer(
 		timeoutPromise.clear();
 
 		if (result.exitCode === 0) {
-			return { success: true };
+			return { success: true, seed };
 		}
 
 		// Parse the failure
@@ -207,7 +232,10 @@ async function runSqlancer(
 			path.join(SQLANCER_DIR, "logs")
 		);
 
-		return { success: false, failure };
+		// Add seed to failure for reproducibility
+		failure.seed = seed;
+
+		return { success: false, failure, seed };
 	} catch (error) {
 		timeoutPromise.clear();
 
@@ -222,9 +250,10 @@ async function runSqlancer(
 				output: stdout + stderr,
 				errorSummary: `Timeout after ${timeoutSeconds}s`,
 				timeoutSeconds,
+				seed,
 			};
 
-			return { success: false, failure };
+			return { success: false, failure, seed };
 		}
 
 		throw error;
