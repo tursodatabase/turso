@@ -999,7 +999,7 @@ fn parse_numeric_str(text: &str) -> Result<(ValueType, &str), ()> {
     let mut end = 0;
     let mut has_decimal = false;
     let mut has_exponent = false;
-    if bytes[0] == b'-' {
+    if bytes[0] == b'-' || bytes[0] == b'+' {
         end = 1;
     }
     while end < bytes.len() {
@@ -1020,7 +1020,7 @@ fn parse_numeric_str(text: &str) -> Result<(ValueType, &str), ()> {
             _ => break,
         }
     }
-    if end == 0 || (end == 1 && bytes[0] == b'-') {
+    if end == 0 || (end == 1 && (bytes[0] == b'-' || bytes[0] == b'+')) {
         return Err(());
     }
     // edge case: if it ends with exponent, strip and cast valid digits as float
@@ -2374,6 +2374,7 @@ pub mod tests {
     fn test_parse_numeric_str_valid_integer() {
         assert_eq!(parse_numeric_str("123"), Ok((ValueType::Integer, "123")));
         assert_eq!(parse_numeric_str("-456"), Ok((ValueType::Integer, "-456")));
+        assert_eq!(parse_numeric_str("+789"), Ok((ValueType::Integer, "+789")));
         assert_eq!(
             parse_numeric_str("000789"),
             Ok((ValueType::Integer, "000789"))
@@ -2390,7 +2391,12 @@ pub mod tests {
             parse_numeric_str("-0.789"),
             Ok((ValueType::Float, "-0.789"))
         );
+        assert_eq!(
+            parse_numeric_str("+0.789"),
+            Ok((ValueType::Float, "+0.789"))
+        );
         assert_eq!(parse_numeric_str("1e10"), Ok((ValueType::Float, "1e10")));
+        assert_eq!(parse_numeric_str("+1e10"), Ok((ValueType::Float, "+1e10")));
         assert_eq!(
             parse_numeric_str("-1.23e-4"),
             Ok((ValueType::Float, "-1.23e-4"))
@@ -2416,6 +2422,7 @@ pub mod tests {
         assert_eq!(parse_numeric_str(""), Err(()));
         assert_eq!(parse_numeric_str("abc"), Err(()));
         assert_eq!(parse_numeric_str("-"), Err(()));
+        assert_eq!(parse_numeric_str("+"), Err(()));
         assert_eq!(parse_numeric_str("e10"), Err(()));
         assert_eq!(parse_numeric_str(".e10"), Err(()));
     }
