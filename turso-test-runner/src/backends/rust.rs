@@ -245,9 +245,49 @@ fn format_real(f: f64) -> String {
     if f.fract() == 0.0 {
         format!("{}.0", f as i64)
     } else {
-        // Use default formatting which should match SQLite for most cases
-        format!("{}", f)
+        // Format with 15 significant digits to match SQLite's %!.15g format
+        // Then remove trailing zeros after the decimal point
+        format_with_significant_digits(f, 15)
     }
+}
+
+/// Format a float with a specific number of significant digits, removing trailing zeros
+fn format_with_significant_digits(f: f64, sig_digits: usize) -> String {
+    if f == 0.0 {
+        return "0.0".to_string();
+    }
+
+    let abs_f = f.abs();
+    // Count digits before decimal point
+    let digits_before_decimal = if abs_f >= 1.0 {
+        (abs_f.log10().floor() as usize) + 1
+    } else {
+        0
+    };
+
+    // Calculate decimal places needed for the desired significant digits
+    let decimal_places = if digits_before_decimal >= sig_digits {
+        0
+    } else {
+        sig_digits - digits_before_decimal
+    };
+
+    // Format with calculated decimal places
+    let formatted = format!("{:.prec$}", f, prec = decimal_places);
+
+    // Remove trailing zeros after decimal point, but keep at least one digit after decimal
+    let formatted = if formatted.contains('.') {
+        let trimmed = formatted.trim_end_matches('0');
+        if trimmed.ends_with('.') {
+            format!("{}0", trimmed)
+        } else {
+            trimmed.to_string()
+        }
+    } else {
+        formatted
+    };
+
+    formatted
 }
 
 /// Clean up exponential notation to match SQLite's format
