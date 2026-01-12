@@ -21,8 +21,8 @@ use crate::sync::{Mutex, RwLock};
 use crate::types::{IOCompletions, WalState};
 use crate::util::IOExt as _;
 use crate::{
-    io::CompletionGroup, return_if_io, turso_assert, types::WalFrameInfo, Completion, Connection,
-    IOResult, LimboError, Result, TransactionState,
+    io::CompletionGroup, return_if_io, turso_assert, turso_assert_reachable, types::WalFrameInfo,
+    Completion, Connection, IOResult, LimboError, Result, TransactionState,
 };
 use crate::{io_yield_one, Buffer, CompletionError, IOContext, OpenFlags, SyncMode, IO};
 use arc_swap::ArcSwapOption;
@@ -146,6 +146,7 @@ impl HeaderRefMut {
     }
 }
 
+#[derive(Debug)]
 pub struct PageInner {
     pub flags: AtomicUsize,
     pub id: usize,
@@ -3447,6 +3448,7 @@ impl Pager {
                     clear_page_cache,
                     page1_invalidated,
                 } => {
+                    turso_assert_reachable!("truncate checkpoint path executed");
                     let should_skip_truncate = {
                         let state = self.checkpoint_state.read();
                         let result = state.result.as_ref().expect("result should be set");
