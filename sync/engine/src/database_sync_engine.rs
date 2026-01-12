@@ -256,7 +256,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
                     revert_since_wal_watermark: 0,
                     last_pushed_change_id_hint: 0,
                     last_pushed_pull_gen_hint: 0,
-                    last_pull_unix_time: Some(io.now().secs),
+                    last_pull_unix_time: Some(io.current_time_wall_clock().secs),
                     last_push_unix_time: None,
                     partial_bootstrap_server_revision: if partial {
                         Some(revision.clone())
@@ -712,7 +712,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
 
         let file = acquire_slot(&self.changes_file)?;
 
-        let now = self.io.now();
+        let now = self.io.current_time_wall_clock();
         let revision = self.meta().synced_revision.clone();
         let ctx = &SyncOperationCtx::new(coro, &self.sync_engine_io, self.meta().remote_url());
         let next_revision = wal_pull_to_file(
@@ -1011,7 +1011,7 @@ impl<IO: SyncEngineIo> DatabaseSyncEngine<IO> {
 
         self.update_meta(coro, |m| {
             m.last_pushed_change_id_hint = change_id;
-            m.last_push_unix_time = Some(self.io.now().secs);
+            m.last_push_unix_time = Some(self.io.current_time_wall_clock().secs);
         })
         .await?;
 

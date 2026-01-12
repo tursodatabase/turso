@@ -18,8 +18,9 @@ use super::buffer_pool::BufferPool;
 use super::pager::{PageRef, Pager};
 use super::sqlite3_ondisk::{self, checksum_wal, WalHeader, WAL_MAGIC_BE, WAL_MAGIC_LE};
 use crate::fast_lock::SpinLock;
+use crate::io::clock::MonotonicInstant;
 use crate::io::CompletionGroup;
-use crate::io::{clock, File, IO};
+use crate::io::{File, IO};
 use crate::storage::database::EncryptionOrChecksum;
 use crate::storage::sqlite3_ondisk::{
     begin_read_wal_frame, begin_read_wal_frame_raw, finish_read_page, prepare_wal_frame,
@@ -486,7 +487,7 @@ impl std::ops::DerefMut for WriteBatch {
 /// Information and structures for processing a checkpoint operation.
 struct OngoingCheckpoint {
     /// Used for benchmarking/debugging a checkpoint operation.
-    time: clock::Instant,
+    time: MonotonicInstant,
     /// minimum frame number to be backfilled by this checkpoint operation.
     min_frame: u64,
     /// maximum safe frame number that will be backfilled by this checkpoint operation.
@@ -1940,7 +1941,7 @@ impl WalFile {
         (last_checksum, max_frame): ((u32, u32), u64),
         buffer_pool: Arc<BufferPool>,
     ) -> Self {
-        let now = io.now();
+        let now = io.current_time_monotonic();
         Self {
             io,
             // default to max frame in WAL, so that when we read schema we can read from WAL too if it's there.
@@ -2164,7 +2165,7 @@ impl WalFile {
                         oc.inflight_writes.clear();
                         oc.inflight_reads.clear();
                         oc.state = CheckpointState::Processing;
-                        oc.time = self.io.now();
+                        oc.time = self.io.current_time_monotonic();
                     }
                     tracing::trace!(
                         "checkpoint_start(min_frame={}, max_frame={})",
@@ -2409,10 +2410,8 @@ impl WalFile {
                     tracing::debug!(
                         "total time spent checkpointing: {:?}",
                         self.io
-                            .now()
-                            .to_system_time()
-                            .duration_since(oc_time.to_system_time())
-                            .expect("time")
+                            .current_time_monotonic()
+                            .duration_since(oc_time)
                             .as_millis()
                     );
                     self.ongoing_checkpoint.write().state = CheckpointState::Start;
