@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.4.3 -- 2026-01-12
+
+### Added
+
+* bindings/rust: support `prepare_cached` (Pere Diaz Bou)
+
+### Fixed
+
+* Disallow WITHOUT ROWID tables (Jussi Saurio)
+* core/vdbe: move mutable fields from Program to ProgramState (Pere Diaz Bou)
+* avoid recursive read locks (Nikita Sivukhin)
+
 ## 0.4.2 -- 2026-01-07
 
 ### Fixed
