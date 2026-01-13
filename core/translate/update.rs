@@ -22,6 +22,7 @@ use super::plan::{
     ColumnUsedMask, IterationDirection, JoinedTable, Plan, TableReferences, UpdatePlan,
 };
 use super::planner::parse_where;
+use super::subquery::{plan_subqueries_from_select_plan, plan_subqueries_from_where_clause};
 /*
 * Update is simple. By default we scan the table, and for each row, we check the WHERE
 * clause. If it evaluates to true, we build the new record with the updated value and insert.
@@ -58,6 +59,25 @@ pub fn translate_update(
     connection: &Arc<crate::Connection>,
 ) -> crate::Result<ProgramBuilder> {
     let mut plan = prepare_update_plan(&mut program, resolver.schema, body, connection, false)?;
+
+    // Plan subqueries in the WHERE clause
+    if let Plan::Update(ref mut update_plan) = plan {
+        if let Some(ref mut ephemeral_plan) = update_plan.ephemeral_plan {
+            // When using ephemeral plan (key columns are being updated), subqueries are in the ephemeral_plan's WHERE
+            plan_subqueries_from_select_plan(&mut program, ephemeral_plan, resolver, connection)?;
+        } else {
+            // Normal path: subqueries are in the UPDATE plan's WHERE
+            plan_subqueries_from_where_clause(
+                &mut program,
+                &mut update_plan.non_from_clause_subqueries,
+                &mut update_plan.table_references,
+                &mut update_plan.where_clause,
+                resolver,
+                connection,
+            )?;
+        }
+    }
+
     optimize_plan(&mut program, &mut plan, resolver.schema)?;
     let opts = ProgramBuilderOpts {
         num_cursors: 1,
@@ -79,9 +99,23 @@ pub fn translate_update_for_schema_change(
 ) -> crate::Result<ProgramBuilder> {
     let mut plan = prepare_update_plan(&mut program, resolver.schema, body, connection, true)?;
 
-    if let Plan::Update(plan) = &mut plan {
+    if let Plan::Update(update_plan) = &mut plan {
         if program.capture_data_changes_mode().has_updates() {
-            plan.cdc_update_alter_statement = Some(ddl_query.to_string());
+            update_plan.cdc_update_alter_statement = Some(ddl_query.to_string());
+        }
+
+        // Plan subqueries in the WHERE clause
+        if let Some(ref mut ephemeral_plan) = update_plan.ephemeral_plan {
+            plan_subqueries_from_select_plan(&mut program, ephemeral_plan, resolver, connection)?;
+        } else {
+            plan_subqueries_from_where_clause(
+                &mut program,
+                &mut update_plan.non_from_clause_subqueries,
+                &mut update_plan.table_references,
+                &mut update_plan.where_clause,
+                resolver,
+                connection,
+            )?;
         }
     }
 
@@ -379,6 +413,7 @@ pub fn prepare_update_plan(
         indexes_to_update,
         ephemeral_plan: None,
         cdc_update_alter_statement: None,
+        non_from_clause_subqueries: vec![],
     }))
 }
 
