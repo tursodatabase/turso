@@ -530,3 +530,60 @@ do_execsql_test_in_memory_any_error update-integer-pk-overflow-error {
     INSERT INTO t VALUES (9223372036854775807);
     UPDATE t SET a = a + 1;
 }
+
+# Test UPDATE with IN subquery
+do_execsql_test_on_specific_db {:memory:} update-in-subquery-1 {
+    CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE t2 (ref_id INTEGER);
+    INSERT INTO t1 VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd');
+    INSERT INTO t2 VALUES (1), (2), (NULL);
+    UPDATE t1 SET val = 'updated' WHERE id IN (SELECT ref_id FROM t2 WHERE ref_id IS NOT NULL);
+    SELECT id, val FROM t1 ORDER BY id;
+} {
+    {1|updated}
+    {2|updated}
+    {3|c}
+    {4|d}
+}
+
+# Test UPDATE with NOT IN subquery
+do_execsql_test_on_specific_db {:memory:} update-not-in-subquery-1 {
+    CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE t2 (ref_id INTEGER);
+    INSERT INTO t1 VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd');
+    INSERT INTO t2 VALUES (1), (2), (NULL);
+    UPDATE t1 SET val = 'updated' WHERE id NOT IN (SELECT ref_id FROM t2 WHERE ref_id IS NOT NULL);
+    SELECT id, val FROM t1 ORDER BY id;
+} {
+    {1|a}
+    {2|b}
+    {3|updated}
+    {4|updated}
+}
+
+# Test UPDATE with IN subquery returning empty set
+do_execsql_test_on_specific_db {:memory:} update-in-subquery-empty-1 {
+    CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE t2 (ref_id INTEGER);
+    INSERT INTO t1 VALUES (1, 'a'), (2, 'b'), (3, 'c');
+    UPDATE t1 SET val = 'updated' WHERE id IN (SELECT ref_id FROM t2);
+    SELECT id, val FROM t1 ORDER BY id;
+} {
+    {1|a}
+    {2|b}
+    {3|c}
+}
+
+# Test UPDATE with NOT IN subquery returning empty set (should update all)
+do_execsql_test_on_specific_db {:memory:} update-not-in-subquery-empty-1 {
+    CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE t2 (ref_id INTEGER);
+    INSERT INTO t1 VALUES (1, 'a'), (2, 'b'), (3, 'c');
+    UPDATE t1 SET val = 'updated' WHERE id NOT IN (SELECT ref_id FROM t2);
+    SELECT id, val FROM t1 ORDER BY id;
+} {
+    {1|updated}
+    {2|updated}
+    {3|updated}
+}
+
