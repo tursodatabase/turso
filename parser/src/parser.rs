@@ -188,6 +188,11 @@ impl<'a> Parser<'a> {
             let variable_id = variable_str
                 .parse::<u32>()
                 .map_err(|e| Error::Custom(format!("non-integer positional variable id: {e}")))?;
+            if variable_id == 0 {
+                return Err(Error::Custom(
+                    "variable number must be between ?1 and ?250000".to_string(),
+                ));
+            }
             self.last_variable_id = variable_id;
             Ok(Expr::Variable(from_bytes(token)))
         }
