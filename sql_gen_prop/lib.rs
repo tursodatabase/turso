@@ -18,6 +18,7 @@ pub mod create_table;
 pub mod delete;
 pub mod drop_index;
 pub mod drop_table;
+pub mod generator;
 pub mod insert;
 pub mod profile;
 pub mod result;
@@ -31,19 +32,21 @@ pub mod value;
 pub mod view;
 
 // Re-export main types for convenience
-pub use alter_table::{AlterTableOp, AlterTableOpKind, AlterTableOpWeights, AlterTableStatement};
+pub use alter_table::{
+    AlterTableContext, AlterTableOp, AlterTableOpKind, AlterTableOpWeights, AlterTableStatement,
+};
 pub use condition::{ComparisonOp, Condition, LogicalOp, OrderByItem, OrderDirection};
 pub use create_index::{CreateIndexStatement, IndexColumn};
 pub use create_table::CreateTableStatement;
 pub use delete::DeleteStatement;
 pub use drop_index::DropIndexStatement;
 pub use drop_table::DropTableStatement;
+pub use generator::{SqlGeneratorKind, WeightedKindIteratorExt};
 pub use insert::InsertStatement;
 pub use profile::{StatementProfile, WeightedProfile};
 pub use schema::{ColumnDef, DataType, Index, Schema, SchemaBuilder, Table, View};
 pub use select::SelectStatement;
-pub use statement::SqlStatement;
-pub use statement::StatementKind;
+pub use statement::{SqlStatement, StatementContext, StatementKind};
 pub use transaction::{
     BeginStatement, CommitStatement, ReleaseStatement, RollbackStatement, SavepointStatement,
     TransactionType,
@@ -58,7 +61,7 @@ pub mod strategies {
     // ALTER TABLE
     pub use crate::alter_table::{
         alter_table_add_column, alter_table_drop_column, alter_table_for_schema,
-        alter_table_for_table, alter_table_rename_column, alter_table_rename_to,
+        alter_table_rename_column, alter_table_rename_to,
     };
     // Conditions
     pub use crate::condition::{

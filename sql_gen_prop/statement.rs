@@ -10,6 +10,7 @@ use crate::create_table::{CreateTableStatement, create_table};
 use crate::delete::{DeleteStatement, delete_for_table};
 use crate::drop_index::DropIndexStatement;
 use crate::drop_table::{DropTableStatement, drop_table_for_schema, drop_table_for_table};
+use crate::generator::SqlGeneratorKind;
 use crate::insert::{InsertStatement, insert_for_table};
 use crate::profile::StatementProfile;
 use crate::schema::{Schema, Table};
@@ -24,6 +25,15 @@ use crate::utility::{
     vacuum,
 };
 use crate::view::{CreateViewStatement, DropViewStatement, create_view, drop_view_for_schema};
+
+/// Context needed for statement generation.
+#[derive(Debug, Clone)]
+pub struct StatementContext<'a> {
+    /// The schema to generate statements for.
+    pub schema: &'a Schema,
+    /// Optional profile for controlling generation weights.
+    pub profile: Option<&'a StatementProfile>,
+}
 
 /// Union of all supported SQL statements.
 #[derive(Debug, Clone, strum::EnumDiscriminants)]
@@ -89,72 +99,6 @@ impl fmt::Display for SqlStatement {
 }
 
 impl StatementKind {
-    /// Returns true if this statement kind can be generated for the given schema.
-    pub fn available(&self, schema: &Schema) -> bool {
-        match self {
-            // DML requires tables
-            StatementKind::Select
-            | StatementKind::Insert
-            | StatementKind::Update
-            | StatementKind::Delete => !schema.tables.is_empty(),
-
-            // DDL - Table operations
-            StatementKind::CreateTable => true,
-            StatementKind::DropTable | StatementKind::AlterTable => !schema.tables.is_empty(),
-
-            // DDL - Index operations
-            StatementKind::CreateIndex => !schema.tables.is_empty(),
-            StatementKind::DropIndex => !schema.indexes.is_empty(),
-
-            // DDL - View operations
-            StatementKind::CreateView => !schema.tables.is_empty(),
-            StatementKind::DropView => true, // Can always generate DROP VIEW IF EXISTS
-
-            // Transaction control - always available
-            StatementKind::Begin
-            | StatementKind::Commit
-            | StatementKind::Rollback
-            | StatementKind::Savepoint
-            | StatementKind::Release => true,
-
-            // Utility - always available
-            StatementKind::Vacuum | StatementKind::Analyze | StatementKind::Reindex => true,
-        }
-    }
-
-    /// If Statement is currently supported. This is an arbitrary filter to remove unsupported statements
-    pub fn supported(&self) -> bool {
-        match self {
-            // DML requires tables
-            StatementKind::Select
-            | StatementKind::Insert
-            | StatementKind::Update
-            | StatementKind::Delete => true,
-
-            // DDL - Table operations
-            StatementKind::CreateTable => true,
-            StatementKind::DropTable | StatementKind::AlterTable => true,
-
-            // DDL - Index operations
-            StatementKind::CreateIndex => true,
-            StatementKind::DropIndex => true,
-
-            // DDL - View operations
-            StatementKind::CreateView => false,
-            StatementKind::DropView => false,
-
-            // Transaction control
-            StatementKind::Begin
-            | StatementKind::Commit
-            | StatementKind::Rollback
-            | StatementKind::Savepoint
-            | StatementKind::Release => false,
-
-            // Utility - always available
-            StatementKind::Vacuum | StatementKind::Analyze | StatementKind::Reindex => false,
-        }
-    }
-
     /// Returns true if this statement kind is DDL (modifies schema).
     pub fn is_ddl(&self) -> bool {
         matches!(
@@ -191,17 +135,88 @@ impl StatementKind {
                 | StatementKind::Release
         )
     }
+}
+
+impl SqlGeneratorKind for StatementKind {
+    type Context<'a> = Schema;
+    type Output = SqlStatement;
+    type Profile = StatementProfile;
+
+    /// Returns true if this statement kind can be generated for the given schema.
+    fn available(&self, schema: &Self::Context<'_>) -> bool {
+        match self {
+            // DML requires tables
+            StatementKind::Select
+            | StatementKind::Insert
+            | StatementKind::Update
+            | StatementKind::Delete => !schema.tables.is_empty(),
+
+            // DDL - Table operations
+            StatementKind::CreateTable => true,
+            StatementKind::DropTable | StatementKind::AlterTable => !schema.tables.is_empty(),
+
+            // DDL - Index operations
+            StatementKind::CreateIndex => !schema.tables.is_empty(),
+            StatementKind::DropIndex => !schema.indexes.is_empty(),
+
+            // DDL - View operations
+            StatementKind::CreateView => !schema.tables.is_empty(),
+            StatementKind::DropView => true, // Can always generate DROP VIEW IF EXISTS
+
+            // Transaction control - always available
+            StatementKind::Begin
+            | StatementKind::Commit
+            | StatementKind::Rollback
+            | StatementKind::Savepoint
+            | StatementKind::Release => true,
+
+            // Utility - always available
+            StatementKind::Vacuum | StatementKind::Analyze | StatementKind::Reindex => true,
+        }
+    }
+
+    fn supported(&self) -> bool {
+        match self {
+            // DML requires tables
+            StatementKind::Select
+            | StatementKind::Insert
+            | StatementKind::Update
+            | StatementKind::Delete => true,
+
+            // DDL - Table operations
+            StatementKind::CreateTable => true,
+            StatementKind::DropTable | StatementKind::AlterTable => true,
+
+            // DDL - Index operations
+            StatementKind::CreateIndex => true,
+            StatementKind::DropIndex => true,
+
+            // DDL - View operations
+            StatementKind::CreateView => false,
+            StatementKind::DropView => false,
+
+            // Transaction control
+            StatementKind::Begin
+            | StatementKind::Commit
+            | StatementKind::Rollback
+            | StatementKind::Savepoint
+            | StatementKind::Release => false,
+
+            // Utility - always available
+            StatementKind::Vacuum | StatementKind::Analyze | StatementKind::Reindex => false,
+        }
+    }
 
     /// Builds a strategy for generating this statement kind.
     ///
-    /// Caller must ensure `is_available(schema)` returns true before calling this.
-    /// The optional `profile` is used to pass sub-profiles (e.g., `alter_table_profile`)
+    /// Caller must ensure `available(schema)` returns true before calling this.
+    /// The optional `profile` is used to pass sub-profiles (e.g., `alter_table.extra`)
     /// to statement generators that support fine-grained control.
-    pub fn strategy(
+    fn strategy<'a>(
         &self,
-        schema: &Schema,
-        profile: Option<&StatementProfile>,
-    ) -> BoxedStrategy<SqlStatement> {
+        schema: &Self::Context<'a>,
+        profile: Option<&Self::Profile>,
+    ) -> BoxedStrategy<Self::Output> {
         let tables = schema.tables.clone();
         match self {
             // DML

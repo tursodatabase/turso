@@ -13,8 +13,17 @@ use proptest::prelude::*;
 use strum::IntoEnumIterator;
 
 use crate::create_table::{column_def, identifier_excluding};
-use crate::schema::ColumnDef;
-use crate::schema::{Schema, Table};
+use crate::generator::SqlGeneratorKind;
+use crate::schema::{ColumnDef, Schema, Table};
+
+/// Context needed for ALTER TABLE operation generation.
+#[derive(Debug, Clone)]
+pub struct AlterTableContext<'a> {
+    /// The table being altered.
+    pub table: &'a Table,
+    /// The schema containing the table.
+    pub schema: &'a Schema,
+}
 
 /// Enum representing the kinds of ALTER TABLE operations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum::EnumIter)]
@@ -29,9 +38,14 @@ pub enum AlterTableOpKind {
     DropColumn,
 }
 
-impl AlterTableOpKind {
+impl SqlGeneratorKind for AlterTableOpKind {
+    type Context<'a> = AlterTableContext<'a>;
+    type Output = AlterTableStatement;
+    type Profile = (); // Weights are handled externally via AlterTableOpWeights
+
     /// Returns true if this operation kind can be generated for the given table.
-    pub fn available(&self, table: &Table) -> bool {
+    fn available(&self, ctx: &Self::Context<'_>) -> bool {
+        let table = ctx.table;
         match self {
             // RENAME TO is always available
             AlterTableOpKind::RenameTo => true,
@@ -47,7 +61,7 @@ impl AlterTableOpKind {
     }
 
     /// Returns true if this operation kind is currently supported for generation.
-    pub fn supported(&self) -> bool {
+    fn supported(&self) -> bool {
         match self {
             AlterTableOpKind::RenameTo => true,
             AlterTableOpKind::RenameColumn => true,
@@ -59,12 +73,16 @@ impl AlterTableOpKind {
     /// Builds a strategy for generating this operation kind.
     ///
     /// Caller must ensure `available(table)` returns true before calling this.
-    pub fn strategy(&self, table: &Table, schema: &Schema) -> BoxedStrategy<AlterTableStatement> {
+    fn strategy<'a>(
+        &self,
+        ctx: &Self::Context<'_>,
+        _profile: Option<&Self::Profile>,
+    ) -> BoxedStrategy<Self::Output> {
         match self {
-            AlterTableOpKind::RenameTo => alter_table_rename_to(table, schema),
-            AlterTableOpKind::RenameColumn => alter_table_rename_column(table),
-            AlterTableOpKind::AddColumn => alter_table_add_column(table),
-            AlterTableOpKind::DropColumn => alter_table_drop_column(table),
+            AlterTableOpKind::RenameTo => alter_table_rename_to(ctx.table, ctx.schema),
+            AlterTableOpKind::RenameColumn => alter_table_rename_column(ctx.table),
+            AlterTableOpKind::AddColumn => alter_table_add_column(ctx.table),
+            AlterTableOpKind::DropColumn => alter_table_drop_column(ctx.table),
         }
     }
 }
@@ -287,34 +305,12 @@ pub fn alter_table_drop_column(table: &Table) -> BoxedStrategy<AlterTableStateme
     }
 }
 
-/// Generate any ALTER TABLE statement for a table with optional operation weights.
+/// Generate any ALTER TABLE statement for a schema with optional operation weights.
 ///
 /// When `op_weights` is `None`, uses default weights for all applicable operation types.
 /// When `op_weights` is `Some`, uses the specified weights to control operation distribution.
 ///
 /// Operations are filtered based on table state via `AlterTableOpKind::available()`.
-pub fn alter_table_for_table(
-    table: &Table,
-    schema: &Schema,
-    op_weights: Option<&AlterTableOpWeights>,
-) -> BoxedStrategy<AlterTableStatement> {
-    let w = op_weights.cloned().unwrap_or_default();
-
-    let strategies: Vec<(u32, BoxedStrategy<AlterTableStatement>)> = w
-        .enabled_operations()
-        .filter(|(kind, _)| kind.supported() && kind.available(table))
-        .map(|(kind, weight)| (weight, kind.strategy(table, schema)))
-        .collect();
-
-    assert!(
-        !strategies.is_empty(),
-        "No valid ALTER TABLE operations can be generated for the given table and profile"
-    );
-
-    proptest::strategy::Union::new_weighted(strategies).boxed()
-}
-
-/// Generate any ALTER TABLE statement for a schema with optional operation weights.
 pub fn alter_table_for_schema(
     schema: &Schema,
     op_weights: Option<&AlterTableOpWeights>,
@@ -329,7 +325,24 @@ pub fn alter_table_for_schema(
     let op_weights_clone = op_weights.cloned();
     proptest::sample::select((*tables).clone())
         .prop_flat_map(move |table| {
-            alter_table_for_table(&table, &schema_clone, op_weights_clone.as_ref())
+            let w = op_weights_clone.clone().unwrap_or_default();
+            let ctx = AlterTableContext {
+                table: &table,
+                schema: &schema_clone,
+            };
+
+            let strategies: Vec<(u32, BoxedStrategy<AlterTableStatement>)> = w
+                .enabled_operations()
+                .filter(|(kind, _)| kind.supported() && kind.available(&ctx))
+                .map(|(kind, weight)| (weight, kind.strategy(&ctx, None)))
+                .collect();
+
+            assert!(
+                !strategies.is_empty(),
+                "No valid ALTER TABLE operations can be generated for the given table and profile"
+            );
+
+            proptest::strategy::Union::new_weighted(strategies)
         })
         .boxed()
 }
@@ -368,14 +381,13 @@ mod tests {
         }
 
         #[test]
-        fn alter_table_for_table_with_default_profile(stmt in alter_table_for_table(&test_table(), &test_schema(), None)) {
+        fn alter_table_for_schema_with_default_profile(stmt in alter_table_for_schema(&test_schema(), None)) {
             let sql = stmt.to_string();
             prop_assert!(sql.starts_with("ALTER TABLE \"users\""));
         }
 
         #[test]
-        fn alter_table_for_table_add_only(stmt in alter_table_for_table(
-            &test_table(),
+        fn alter_table_for_schema_add_only(stmt in alter_table_for_schema(
             &test_schema(),
             Some(&AlterTableOpWeights::none().with_add_column(100))
         )) {
