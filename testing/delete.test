@@ -84,3 +84,64 @@ do_execsql_test_on_specific_db {:memory:} doubly-qualified-delete {
    delete from test where main.test.col = 2;
    select col from test;
 } {1}
+
+# Test DELETE with IN subquery
+do_execsql_test_on_specific_db {:memory:} delete-in-subquery-1 {
+    CREATE TABLE file_input (id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE eval_input_path (file_input_id INTEGER);
+    INSERT INTO file_input VALUES (1, 'file1'), (2, 'file2'), (3, 'file3'), (4, 'file4');
+    INSERT INTO eval_input_path VALUES (1), (2), (NULL);
+    DELETE FROM file_input WHERE id IN (SELECT file_input_id FROM eval_input_path WHERE file_input_id IS NOT NULL);
+    SELECT id, name FROM file_input ORDER BY id;
+} {
+    {3|file3}
+    {4|file4}
+}
+
+# Test DELETE with NOT IN subquery
+do_execsql_test_on_specific_db {:memory:} delete-not-in-subquery-1 {
+    CREATE TABLE file_input (id INTEGER PRIMARY KEY, name TEXT);
+    CREATE TABLE eval_input_path (file_input_id INTEGER);
+    INSERT INTO file_input VALUES (1, 'file1'), (2, 'file2'), (3, 'file3'), (4, 'file4');
+    INSERT INTO eval_input_path VALUES (1), (2), (NULL);
+    DELETE FROM file_input WHERE id NOT IN (SELECT file_input_id FROM eval_input_path WHERE file_input_id IS NOT NULL);
+    SELECT id, name FROM file_input ORDER BY id;
+} {
+    {1|file1}
+    {2|file2}
+}
+
+# Test DELETE with IN subquery returning empty set
+do_execsql_test_on_specific_db {:memory:} delete-in-subquery-empty-1 {
+    CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE t2 (ref_id INTEGER);
+    INSERT INTO t1 VALUES (1, 'a'), (2, 'b'), (3, 'c');
+    DELETE FROM t1 WHERE id IN (SELECT ref_id FROM t2);
+    SELECT id, val FROM t1 ORDER BY id;
+} {
+    {1|a}
+    {2|b}
+    {3|c}
+}
+
+# Test DELETE with NOT IN subquery returning empty set (should delete all)
+do_execsql_test_on_specific_db {:memory:} delete-not-in-subquery-empty-1 {
+    CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE t2 (ref_id INTEGER);
+    INSERT INTO t1 VALUES (1, 'a'), (2, 'b'), (3, 'c');
+    DELETE FROM t1 WHERE id NOT IN (SELECT ref_id FROM t2);
+    SELECT id, val FROM t1 ORDER BY id;
+} {}
+
+# Test DELETE with IN subquery and multiple columns in outer table
+do_execsql_test_on_specific_db {:memory:} delete-in-subquery-multicol-1 {
+    CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, price REAL);
+    CREATE TABLE discontinued (product_id INTEGER);
+    INSERT INTO products VALUES (1, 'Widget', 10.99), (2, 'Gadget', 25.50), (3, 'Doodad', 5.00);
+    INSERT INTO discontinued VALUES (2);
+    DELETE FROM products WHERE id IN (SELECT product_id FROM discontinued);
+    SELECT id, name FROM products ORDER BY id;
+} {
+    {1|Widget}
+    {3|Doodad}
+}
