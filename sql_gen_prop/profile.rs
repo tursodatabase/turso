@@ -87,7 +87,8 @@ pub struct StatementProfile {
     // DDL weights - Tables
     pub create_table_weight: u32,
     pub drop_table_weight: u32,
-    pub alter_table_weight: u32,
+    /// ALTER TABLE weight and optional operation-level weights.
+    pub alter_table: WeightedProfile<AlterTableOpWeights>,
 
     // DDL weights - Indexes
     pub create_index_weight: u32,
@@ -108,11 +109,6 @@ pub struct StatementProfile {
     pub vacuum_weight: u32,
     pub analyze_weight: u32,
     pub reindex_weight: u32,
-
-    // Sub-profiles for fine-grained control
-    /// Operation weights for ALTER TABLE statements.
-    /// When `None`, uses default weights for ALTER TABLE operations.
-    pub alter_table_op_weights: Option<AlterTableOpWeights>,
 }
 
 impl Default for StatementProfile {
@@ -127,7 +123,7 @@ impl Default for StatementProfile {
             // DDL - less frequent
             create_table_weight: 2,
             drop_table_weight: 1,
-            alter_table_weight: 1,
+            alter_table: WeightedProfile::new(1),
             create_index_weight: 2,
             drop_index_weight: 1,
             create_view_weight: 1,
@@ -144,9 +140,6 @@ impl Default for StatementProfile {
             vacuum_weight: 0,
             analyze_weight: 0,
             reindex_weight: 0,
-
-            // Sub-profiles
-            alter_table_op_weights: None,
         }
     }
 }
@@ -161,7 +154,7 @@ impl StatementProfile {
             delete_weight: 0,
             create_table_weight: 0,
             drop_table_weight: 0,
-            alter_table_weight: 0,
+            alter_table: WeightedProfile::new(0),
             create_index_weight: 0,
             drop_index_weight: 0,
             create_view_weight: 0,
@@ -174,7 +167,6 @@ impl StatementProfile {
             vacuum_weight: 0,
             analyze_weight: 0,
             reindex_weight: 0,
-            alter_table_op_weights: None,
         }
     }
 
@@ -218,7 +210,7 @@ impl StatementProfile {
         Self {
             create_table_weight: 20,
             drop_table_weight: 15,
-            alter_table_weight: 15,
+            alter_table: WeightedProfile::new(15),
             create_index_weight: 20,
             drop_index_weight: 10,
             create_view_weight: 10,
@@ -285,7 +277,16 @@ impl StatementProfile {
 
     /// Builder method to set ALTER TABLE weight.
     pub fn with_alter_table(mut self, weight: u32) -> Self {
-        self.alter_table_weight = weight;
+        self.alter_table.weight = weight;
+        self
+    }
+
+    /// Builder method to set ALTER TABLE profile with weight and operation weights.
+    pub fn with_alter_table_profile(
+        mut self,
+        profile: WeightedProfile<AlterTableOpWeights>,
+    ) -> Self {
+        self.alter_table = profile;
         self
     }
 
@@ -369,14 +370,6 @@ impl StatementProfile {
         self
     }
 
-    // Builder methods for sub-profiles
-
-    /// Builder method to set ALTER TABLE operation weights.
-    pub fn with_alter_table_op_weights(mut self, op_weights: AlterTableOpWeights) -> Self {
-        self.alter_table_op_weights = Some(op_weights);
-        self
-    }
-
     /// Returns the total DML weight.
     pub fn dml_weight(&self) -> u32 {
         self.select_weight + self.insert_weight + self.update_weight + self.delete_weight
@@ -386,7 +379,7 @@ impl StatementProfile {
     pub fn ddl_weight(&self) -> u32 {
         self.create_table_weight
             + self.drop_table_weight
-            + self.alter_table_weight
+            + self.alter_table.weight
             + self.create_index_weight
             + self.drop_index_weight
             + self.create_view_weight
@@ -441,7 +434,7 @@ impl StatementProfile {
             StatementKind::Delete => self.delete_weight,
             StatementKind::CreateTable => self.create_table_weight,
             StatementKind::DropTable => self.drop_table_weight,
-            StatementKind::AlterTable => self.alter_table_weight,
+            StatementKind::AlterTable => self.alter_table.weight,
             StatementKind::CreateIndex => self.create_index_weight,
             StatementKind::DropIndex => self.drop_index_weight,
             StatementKind::CreateView => self.create_view_weight,

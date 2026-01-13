@@ -10,10 +10,64 @@ use std::collections::HashSet;
 use std::fmt;
 
 use proptest::prelude::*;
+use strum::IntoEnumIterator;
 
 use crate::create_table::{column_def, identifier_excluding};
 use crate::schema::ColumnDef;
 use crate::schema::{Schema, Table};
+
+/// Enum representing the kinds of ALTER TABLE operations.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum::EnumIter)]
+pub enum AlterTableOpKind {
+    /// RENAME TO new_name
+    RenameTo,
+    /// RENAME COLUMN old_name TO new_name
+    RenameColumn,
+    /// ADD COLUMN column_def
+    AddColumn,
+    /// DROP COLUMN column_name
+    DropColumn,
+}
+
+impl AlterTableOpKind {
+    /// Returns true if this operation kind can be generated for the given table.
+    pub fn available(&self, table: &Table) -> bool {
+        match self {
+            // RENAME TO is always available
+            AlterTableOpKind::RenameTo => true,
+            // ADD COLUMN is always available
+            AlterTableOpKind::AddColumn => true,
+            // RENAME COLUMN requires at least one column
+            AlterTableOpKind::RenameColumn => !table.columns.is_empty(),
+            // DROP COLUMN requires droppable (non-PK) columns and more than one column
+            AlterTableOpKind::DropColumn => {
+                table.columns.len() > 1 && table.columns.iter().any(|c| !c.primary_key)
+            }
+        }
+    }
+
+    /// Returns true if this operation kind is currently supported for generation.
+    pub fn supported(&self) -> bool {
+        match self {
+            AlterTableOpKind::RenameTo => true,
+            AlterTableOpKind::RenameColumn => true,
+            AlterTableOpKind::AddColumn => true,
+            AlterTableOpKind::DropColumn => true,
+        }
+    }
+
+    /// Builds a strategy for generating this operation kind.
+    ///
+    /// Caller must ensure `available(table)` returns true before calling this.
+    pub fn strategy(&self, table: &Table, schema: &Schema) -> BoxedStrategy<AlterTableStatement> {
+        match self {
+            AlterTableOpKind::RenameTo => alter_table_rename_to(table, schema),
+            AlterTableOpKind::RenameColumn => alter_table_rename_column(table),
+            AlterTableOpKind::AddColumn => alter_table_add_column(table),
+            AlterTableOpKind::DropColumn => alter_table_drop_column(table),
+        }
+    }
+}
 
 /// Weights for ALTER TABLE operation types.
 ///
@@ -85,6 +139,23 @@ impl AlterTableOpWeights {
     /// Returns true if at least one operation type is enabled.
     pub fn has_enabled_operations(&self) -> bool {
         self.total_weight() > 0
+    }
+
+    /// Returns the weight for a given operation kind.
+    pub fn weight_for(&self, kind: AlterTableOpKind) -> u32 {
+        match kind {
+            AlterTableOpKind::RenameTo => self.rename_to,
+            AlterTableOpKind::RenameColumn => self.rename_column,
+            AlterTableOpKind::AddColumn => self.add_column,
+            AlterTableOpKind::DropColumn => self.drop_column,
+        }
+    }
+
+    /// Returns an iterator over all operation kinds with weight > 0.
+    pub fn enabled_operations(&self) -> impl Iterator<Item = (AlterTableOpKind, u32)> + '_ {
+        AlterTableOpKind::iter()
+            .map(|kind| (kind, self.weight_for(kind)))
+            .filter(|(_, w)| *w > 0)
     }
 }
 
@@ -221,9 +292,7 @@ pub fn alter_table_drop_column(table: &Table) -> BoxedStrategy<AlterTableStateme
 /// When `op_weights` is `None`, uses default weights for all applicable operation types.
 /// When `op_weights` is `Some`, uses the specified weights to control operation distribution.
 ///
-/// Operations are filtered based on table state:
-/// - RENAME COLUMN requires at least one column
-/// - DROP COLUMN requires at least one non-primary-key column and more than one column total
+/// Operations are filtered based on table state via `AlterTableOpKind::available()`.
 pub fn alter_table_for_table(
     table: &Table,
     schema: &Schema,
@@ -231,38 +300,18 @@ pub fn alter_table_for_table(
 ) -> BoxedStrategy<AlterTableStatement> {
     let w = op_weights.cloned().unwrap_or_default();
 
-    let has_droppable_cols =
-        table.columns.iter().any(|c| !c.primary_key) && table.columns.len() > 1;
-    let has_columns = !table.columns.is_empty();
-
-    let mut weighted_strategies: Vec<(u32, BoxedStrategy<AlterTableStatement>)> = Vec::new();
-
-    // RENAME TO is always available
-    if w.rename_to > 0 {
-        weighted_strategies.push((w.rename_to, alter_table_rename_to(table, schema)));
-    }
-
-    // ADD COLUMN is always available
-    if w.add_column > 0 {
-        weighted_strategies.push((w.add_column, alter_table_add_column(table)));
-    }
-
-    // RENAME COLUMN requires columns to exist
-    if has_columns && w.rename_column > 0 {
-        weighted_strategies.push((w.rename_column, alter_table_rename_column(table)));
-    }
-
-    // DROP COLUMN requires droppable columns
-    if has_droppable_cols && w.drop_column > 0 {
-        weighted_strategies.push((w.drop_column, alter_table_drop_column(table)));
-    }
+    let strategies: Vec<(u32, BoxedStrategy<AlterTableStatement>)> = w
+        .enabled_operations()
+        .filter(|(kind, _)| kind.supported() && kind.available(table))
+        .map(|(kind, weight)| (weight, kind.strategy(table, schema)))
+        .collect();
 
     assert!(
-        !weighted_strategies.is_empty(),
+        !strategies.is_empty(),
         "No valid ALTER TABLE operations can be generated for the given table and profile"
     );
 
-    proptest::strategy::Union::new_weighted(weighted_strategies).boxed()
+    proptest::strategy::Union::new_weighted(strategies).boxed()
 }
 
 /// Generate any ALTER TABLE statement for a schema with optional operation weights.

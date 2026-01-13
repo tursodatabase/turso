@@ -31,7 +31,7 @@ pub mod value;
 pub mod view;
 
 // Re-export main types for convenience
-pub use alter_table::{AlterTableOp, AlterTableOpWeights, AlterTableStatement};
+pub use alter_table::{AlterTableOp, AlterTableOpKind, AlterTableOpWeights, AlterTableStatement};
 pub use condition::{ComparisonOp, Condition, LogicalOp, OrderByItem, OrderDirection};
 pub use create_index::{CreateIndexStatement, IndexColumn};
 pub use create_table::CreateTableStatement;

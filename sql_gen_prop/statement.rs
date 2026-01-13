@@ -226,7 +226,7 @@ impl StatementKind {
                 .prop_map(SqlStatement::DropTable)
                 .boxed(),
             StatementKind::AlterTable => {
-                let op_weights = profile.and_then(|p| p.alter_table_op_weights.as_ref());
+                let op_weights = profile.and_then(|p| p.alter_table.extra.as_ref());
                 alter_table_for_schema(schema, op_weights)
                     .prop_map(SqlStatement::AlterTable)
                     .boxed()
@@ -345,7 +345,7 @@ pub fn statement_for_schema(
 
     let strategies: Vec<(u32, BoxedStrategy<SqlStatement>)> = p
         .enabled_statements()
-        .filter(|(kind, _)| kind.available(schema))
+        .filter(|(kind, _)| kind.supported() && kind.available(schema))
         .map(|(kind, weight)| (weight, kind.strategy(schema, Some(&p))))
         .collect();
 
