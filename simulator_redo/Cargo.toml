@@ -1,0 +1,15 @@
+[package]
+name = "sim_redo"
+version.workspace = true
+authors.workspace = true
+edition = "2024"
+license.workspace = true
+repository.workspace = true
+
+[lib]
+path = "lib.rs"
+
+[dependencies]
+
+[lints]
+workspace = true
