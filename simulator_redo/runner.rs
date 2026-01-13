@@ -3,9 +3,10 @@
 //! This module orchestrates the simulation by:
 //! 1. Creating both Turso and SQLite databases
 //! 2. Generating and executing CREATE TABLE statements
-//! 3. Generating statements using sql_gen_prop
+//! 3. Generating statements (DML and DDL) using sql_gen_prop
 //! 4. Executing them on both databases
 //! 5. Checking the differential oracle
+//! 6. Re-introspecting schemas after DDL statements
 
 use std::sync::Arc;
 
@@ -14,6 +15,7 @@ use proptest::strategy::{Strategy, ValueTree};
 use proptest::test_runner::TestRunner;
 use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
+use sql_gen_prop::{Schema, SqlStatement};
 use turso_core::Database;
 
 use crate::oracle::{OracleResult, check_differential};
@@ -103,19 +105,6 @@ impl Simulator {
             self.config.num_statements
         );
 
-        // Step 1: Generate and execute CREATE TABLE statements
-        self.create_tables()?;
-
-        // Step 2: Introspect the schema
-        let schema = SchemaIntrospector::from_turso(&self.turso_conn)
-            .context("Failed to introspect Turso schema")?;
-
-        if schema.tables.is_empty() {
-            bail!("No tables found after CREATE TABLE");
-        }
-
-        tracing::info!("Schema introspected: {} tables", schema.tables.len());
-
         // Step 3: Generate and execute statements
         // Create a deterministic seed for proptest
         let seed_bytes: [u8; 32] = {
@@ -132,37 +121,52 @@ impl Simulator {
             ),
         );
 
+        let mut schema = self.introspect_and_verify_schemas()?;
+
         for i in 0..self.config.num_statements {
-            // Generate a statement
+            // Generate a statement (DML or DDL)
             let strategy = sql_gen_prop::strategies::statement_for_schema(&schema);
             let value_tree = strategy
                 .new_tree(&mut test_runner)
-                .map_err(|e| anyhow::anyhow!("Failed to generate statement: {}", e))?;
+                .map_err(|e| anyhow::anyhow!("Failed to generate statement: {e}"))?;
 
             let stmt = value_tree.current();
             let sql = stmt.to_string();
+            let is_ddl = Self::is_ddl_statement(&stmt);
 
             if self.config.verbose {
-                tracing::info!("Statement {}: {}", i, sql);
+                let stmt_type = if is_ddl { "DDL" } else { "DML" };
+                tracing::info!("Statement {} [{}]: {}", i, stmt_type, sql);
             }
 
             // Execute on both databases and check oracle
             match check_differential(&self.turso_conn, &self.sqlite_conn, &sql) {
                 Ok(OracleResult::Pass) => {
                     stats.statements_executed += 1;
+
+                    // After DDL statements, re-introspect both databases and verify schemas match
+                    if is_ddl {
+                        schema = self.introspect_and_verify_schemas().map_err(|e| {
+                            anyhow::anyhow!("Schema mismatch after DDL statement {i} ({sql}): {e}")
+                        })?;
+                        tracing::debug!(
+                            "Schema updated after DDL: {} tables, {} indexes",
+                            schema.tables.len(),
+                            schema.indexes.len()
+                        );
+                    }
                 }
                 Ok(OracleResult::Fail(reason)) => {
                     stats.oracle_failures += 1;
-                    tracing::error!("Oracle failure at statement {}: {}", i, reason);
+                    tracing::error!("Oracle failure at statement {i}: {reason}");
                     if !self.config.verbose {
-                        // Print the failing statement
-                        tracing::error!("Failing SQL: {}", sql);
+                        tracing::error!("Failing SQL: {sql}");
                     }
-                    return Err(anyhow::anyhow!("Oracle failure: {}", reason));
+                    return Err(anyhow::anyhow!("Oracle failure: {reason}"));
                 }
                 Err(e) => {
                     stats.errors += 1;
-                    tracing::warn!("Error executing statement {}: {}", i, e);
+                    tracing::warn!("Error executing statement {i}: {e}");
                 }
             }
         }
@@ -177,55 +181,60 @@ impl Simulator {
         Ok(stats)
     }
 
-    /// Create tables in both databases.
-    fn create_tables(&mut self) -> Result<()> {
-        for table_idx in 0..self.config.num_tables {
-            let table_name = format!("t{table_idx}");
-            let create_sql = self.generate_create_table(&table_name);
-
-            tracing::debug!("Creating table: {create_sql}");
-
-            // Execute on Turso
-            self.turso_conn
-                .execute(&create_sql)
-                .context(format!("Failed to create table {table_name} in Turso"))?;
-
-            // Execute on SQLite
-            self.sqlite_conn
-                .execute(&create_sql, [])
-                .context(format!("Failed to create table {table_name} in SQLite"))?;
-        }
-
-        Ok(())
+    /// Check if a statement is a DDL statement (modifies schema).
+    fn is_ddl_statement(stmt: &SqlStatement) -> bool {
+        matches!(
+            stmt,
+            SqlStatement::CreateTable(_)
+                | SqlStatement::CreateIndex(_)
+                | SqlStatement::DropTable(_)
+                | SqlStatement::DropIndex(_)
+        )
     }
 
-    /// Generate a CREATE TABLE statement.
-    fn generate_create_table(&mut self, table_name: &str) -> String {
-        use rand::Rng;
+    /// Introspect schemas from both databases and verify they match.
+    fn introspect_and_verify_schemas(&self) -> Result<Schema> {
+        let turso_schema = SchemaIntrospector::from_turso(&self.turso_conn)
+            .context("Failed to introspect Turso schema")?;
+        let sqlite_schema = SchemaIntrospector::from_sqlite(&self.sqlite_conn)
+            .context("Failed to introspect SQLite schema")?;
 
-        let mut columns = Vec::new();
+        // Verify table names match
+        let turso_tables: std::collections::HashSet<_> =
+            turso_schema.tables.iter().map(|t| &t.name).collect();
+        let sqlite_tables: std::collections::HashSet<_> =
+            sqlite_schema.tables.iter().map(|t| &t.name).collect();
 
-        // Always add an integer primary key
-        columns.push("\"id\" INTEGER PRIMARY KEY".to_string());
-
-        // Add additional columns
-        for col_idx in 1..self.config.columns_per_table {
-            let col_name = format!("c{col_idx}");
-            let col_type = match self.rng.random_range(0..4) {
-                0 => "INTEGER",
-                1 => "REAL",
-                2 => "TEXT",
-                _ => "BLOB",
-            };
-            let nullable = if self.rng.random_bool(0.5) {
-                ""
-            } else {
-                " NOT NULL"
-            };
-            columns.push(format!("\"{col_name}\" {col_type}{nullable}"));
+        if turso_tables != sqlite_tables {
+            bail!(
+                "Table mismatch: Turso has {:?}, SQLite has {:?}",
+                turso_tables,
+                sqlite_tables
+            );
         }
 
-        format!("CREATE TABLE \"{table_name}\" ({})", columns.join(", "))
+        // Verify each table's columns match
+        for turso_table in &turso_schema.tables {
+            let sqlite_table = sqlite_schema
+                .tables
+                .iter()
+                .find(|t| t.name == turso_table.name)
+                .expect("Table should exist in SQLite schema");
+
+            let turso_cols: Vec<_> = turso_table.columns.iter().map(|c| &c.name).collect();
+            let sqlite_cols: Vec<_> = sqlite_table.columns.iter().map(|c| &c.name).collect();
+
+            if turso_cols != sqlite_cols {
+                bail!(
+                    "Column mismatch in table '{}': Turso has {:?}, SQLite has {:?}",
+                    turso_table.name,
+                    turso_cols,
+                    sqlite_cols
+                );
+            }
+        }
+
+        Ok(turso_schema)
     }
 }
 
@@ -236,7 +245,8 @@ mod tests {
     #[test]
     fn test_sim_config_default() {
         let config = SimConfig::default();
-        assert_eq!(config.seed, 42);
+        // seed is now randomly generated by default
+        assert!(config.seed > 0);
         assert_eq!(config.num_tables, 2);
         assert_eq!(config.num_statements, 100);
     }
