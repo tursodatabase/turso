@@ -2990,7 +2990,7 @@ impl Pager {
 
         let result =
             self.commit_dirty_pages_inner(wal_auto_checkpoint_disabled, sync_mode, data_sync_retry);
-        if let Err(..) = &result {
+        if result.is_err() {
             self.commit_info.write().reset();
         }
         result

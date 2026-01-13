@@ -217,7 +217,7 @@ fn test_integrity_check_cell_out_of_range(db: TempDatabase) {
     conn.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY, data TEXT);")
         .unwrap();
     for i in 0..100 {
-        conn.execute(&format!(
+        conn.execute(format!(
             "INSERT INTO t1 VALUES ({}, '{}');",
             i,
             "x".repeat(30) // Enough to ensure data is on page 2
@@ -285,14 +285,12 @@ fn test_integrity_check_cell_out_of_range(db: TempDatabase) {
         Ok(msg) => {
             assert!(
                 msg.contains("out of range"),
-                "Expected 'out of range' error, got: {}",
-                msg
+                "Expected 'out of range' error, got: {msg}"
             );
         }
         Err(panic_msg) => {
             panic!(
-                "Expected integrity_check to return CellOutOfRange error, but it panicked: {}",
-                panic_msg
+                "Expected integrity_check to return CellOutOfRange error, but it panicked: {panic_msg}"
             );
         }
     }
@@ -313,7 +311,7 @@ fn test_integrity_check_freelist_count_mismatch(db: TempDatabase) {
     conn.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY, data TEXT);")
         .unwrap();
     for i in 0..100 {
-        conn.execute(&format!(
+        conn.execute(format!(
             "INSERT INTO t1 VALUES ({}, '{}');",
             i,
             "x".repeat(100)
@@ -368,14 +366,12 @@ fn test_integrity_check_freelist_count_mismatch(db: TempDatabase) {
         Ok(msg) => {
             assert!(
                 msg.contains("Freelist count mismatch"),
-                "Expected 'Freelist count mismatch' error, got: {}",
-                msg
+                "Expected 'Freelist count mismatch' error, got: {msg}"
             );
         }
         Err(panic_msg) => {
             panic!(
-                "Expected integrity_check to return FreelistCountMismatch error, but it panicked: {}",
-                panic_msg
+                "Expected integrity_check to return FreelistCountMismatch error, but it panicked: {panic_msg}"
             );
         }
     }
@@ -399,7 +395,7 @@ fn test_integrity_check_index_entry_count_mismatch(db: TempDatabase) {
 
     // Insert exactly 10 rows
     for i in 0..10 {
-        conn.execute(&format!("INSERT INTO t1 VALUES ({}, 'name{}');", i, i))
+        conn.execute(format!("INSERT INTO t1 VALUES ({i}, 'name{i}');"))
             .unwrap();
     }
 
@@ -453,14 +449,12 @@ fn test_integrity_check_index_entry_count_mismatch(db: TempDatabase) {
         Ok(msg) => {
             assert!(
                 msg.contains("wrong # of entries"),
-                "Expected 'wrong # of entries' error, got: {}",
-                msg
+                "Expected 'wrong # of entries' error, got: {msg}"
             );
         }
         Err(panic_msg) => {
             panic!(
-                "Expected integrity_check to return IndexEntryCountMismatch error, but it panicked: {}",
-                panic_msg
+                "Expected integrity_check to return IndexEntryCountMismatch error, but it panicked: {panic_msg}"
             );
         }
     }
@@ -564,14 +558,12 @@ fn test_integrity_check_not_null_violation(db: TempDatabase) {
         Ok(msg) => {
             assert!(
                 msg.contains("NULL value"),
-                "Expected 'NULL value' error, got: {}",
-                msg
+                "Expected 'NULL value' error, got: {msg}"
             );
         }
         Err(panic_msg) => {
             panic!(
-                "Expected integrity_check to return NotNullViolation error, but it panicked: {}",
-                panic_msg
+                "Expected integrity_check to return NotNullViolation error, but it panicked: {panic_msg}"
             );
         }
     }
@@ -595,7 +587,7 @@ fn test_integrity_check_page_referenced_multiple_times(db: TempDatabase) {
 
     // Insert enough data to create multiple leaf pages and possibly interior pages
     for i in 0..500 {
-        conn.execute(&format!(
+        conn.execute(format!(
             "INSERT INTO t1 VALUES ({}, '{}');",
             i,
             "x".repeat(100) // Large enough to fill multiple pages
@@ -646,9 +638,7 @@ fn test_integrity_check_page_referenced_multiple_times(db: TempDatabase) {
         let cell_count = read_u16_be(&page, 3);
         assert!(
             cell_count >= 2,
-            "Interior page {} should have at least 2 cells, got {}",
-            page_num,
-            cell_count
+            "Interior page {page_num} should have at least 2 cells, got {cell_count}"
         );
 
         // Read first cell pointer
@@ -674,14 +664,12 @@ fn test_integrity_check_page_referenced_multiple_times(db: TempDatabase) {
         Ok(msg) => {
             assert!(
                 msg.contains("referenced multiple times"),
-                "Expected 'referenced multiple times' error, got: {}",
-                msg
+                "Expected 'referenced multiple times' error, got: {msg}"
             );
         }
         Err(panic_msg) => {
             panic!(
-                "Expected integrity_check to return PageReferencedMultipleTimes error, but it panicked: {}",
-                panic_msg
+                "Expected integrity_check to return PageReferencedMultipleTimes error, but it panicked: {panic_msg}"
             );
         }
     }
@@ -702,7 +690,7 @@ fn test_integrity_check_cell_overlap(db: TempDatabase) {
         .unwrap();
     // Insert enough rows to have multiple cells
     for i in 0..20 {
-        conn.execute(&format!("INSERT INTO t1 VALUES ({}, 'data_{}');", i, i))
+        conn.execute(format!("INSERT INTO t1 VALUES ({i}, 'data_{i}');"))
             .unwrap();
     }
 
@@ -754,14 +742,12 @@ fn test_integrity_check_cell_overlap(db: TempDatabase) {
         Ok(msg) => {
             assert!(
                 msg.contains("overlap"),
-                "Expected 'overlap' error, got: {}",
-                msg
+                "Expected 'overlap' error, got: {msg}"
             );
         }
         Err(panic_msg) => {
             panic!(
-                "Expected integrity_check to return CellOverlap error, but it panicked: {}",
-                panic_msg
+                "Expected integrity_check to return CellOverlap error, but it panicked: {panic_msg}"
             );
         }
     }
@@ -781,7 +767,7 @@ fn test_integrity_check_unexpected_fragmentation(db: TempDatabase) {
     conn.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY, data TEXT);")
         .unwrap();
     for i in 0..10 {
-        conn.execute(&format!("INSERT INTO t1 VALUES ({}, 'data{}');", i, i))
+        conn.execute(format!("INSERT INTO t1 VALUES ({i}, 'data{i}');"))
             .unwrap();
     }
 
@@ -825,14 +811,12 @@ fn test_integrity_check_unexpected_fragmentation(db: TempDatabase) {
         Ok(msg) => {
             assert!(
                 msg.contains("fragmentation"),
-                "Expected 'fragmentation' error, got: {}",
-                msg
+                "Expected 'fragmentation' error, got: {msg}"
             );
         }
         Err(panic_msg) => {
             panic!(
-                "Expected integrity_check to return UnexpectedFragmentation error, but it panicked: {}",
-                panic_msg
+                "Expected integrity_check to return UnexpectedFragmentation error, but it panicked: {panic_msg}"
             );
         }
     }
@@ -883,14 +867,12 @@ fn test_integrity_check_page_never_used(db: TempDatabase) {
         Ok(msg) => {
             assert!(
                 msg.contains("never used"),
-                "Expected 'never used' error, got: {}",
-                msg
+                "Expected 'never used' error, got: {msg}"
             );
         }
         Err(panic_msg) => {
             panic!(
-                "Expected integrity_check to return PageNeverUsed error, but it panicked: {}",
-                panic_msg
+                "Expected integrity_check to return PageNeverUsed error, but it panicked: {panic_msg}"
             );
         }
     }
@@ -982,14 +964,12 @@ fn test_integrity_check_unique_violation(db: TempDatabase) {
         Ok(msg) => {
             assert!(
                 msg.contains("non-unique entry"),
-                "Expected 'non-unique entry' error, got: {}",
-                msg
+                "Expected 'non-unique entry' error, got: {msg}"
             );
         }
         Err(panic_msg) => {
             panic!(
-                "Expected integrity_check to return UniqueViolation error, but it panicked: {}",
-                panic_msg
+                "Expected integrity_check to return UniqueViolation error, but it panicked: {panic_msg}"
             );
         }
     }
@@ -1012,7 +992,7 @@ fn test_integrity_check_cell_overflows_page(db: TempDatabase) {
     conn.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY, data TEXT);")
         .unwrap();
     for i in 0..20 {
-        conn.execute(&format!("INSERT INTO t1 VALUES ({}, 'data_{}');", i, i))
+        conn.execute(format!("INSERT INTO t1 VALUES ({i}, 'data_{i}');"))
             .unwrap();
     }
 
@@ -1073,16 +1053,14 @@ fn test_integrity_check_cell_overflows_page(db: TempDatabase) {
             // If corruption is detected gracefully, verify the error message
             assert!(
                 msg.contains("extends out of page") || msg.contains("out of range"),
-                "Expected cell overflow error, got: {}",
-                msg
+                "Expected cell overflow error, got: {msg}"
             );
         }
         Err(panic_msg) => {
             // The pager panics on this corruption with a slice bounds error
             assert!(
                 panic_msg.contains("out of range for slice"),
-                "Expected slice bounds panic, got: {}",
-                panic_msg
+                "Expected slice bounds panic, got: {panic_msg}"
             );
         }
     }
@@ -1106,7 +1084,7 @@ fn test_integrity_check_cell_rowid_out_of_range(db: TempDatabase) {
 
     // Insert enough rows to get multiple cells per page
     for i in 1..50 {
-        conn.execute(&format!("INSERT INTO t1 VALUES ({}, {});", i, i))
+        conn.execute(format!("INSERT INTO t1 VALUES ({i}, {i});"))
             .unwrap();
     }
 
@@ -1162,14 +1140,12 @@ fn test_integrity_check_cell_rowid_out_of_range(db: TempDatabase) {
         Ok(msg) => {
             assert!(
                 msg.contains("rowid") && msg.contains("wrong order"),
-                "Expected 'rowid ... wrong order' error, got: {}",
-                msg
+                "Expected 'rowid ... wrong order' error, got: {msg}"
             );
         }
         Err(panic_msg) => {
             panic!(
-                "Expected integrity_check to return CellRowidOutOfRange error, but it panicked: {}",
-                panic_msg
+                "Expected integrity_check to return CellRowidOutOfRange error, but it panicked: {panic_msg}"
             );
         }
     }
@@ -1192,7 +1168,7 @@ fn test_integrity_check_freeblock_out_of_range(db: TempDatabase) {
     conn.execute("CREATE TABLE t1(id INTEGER PRIMARY KEY, data TEXT);")
         .unwrap();
     for i in 0..10 {
-        conn.execute(&format!("INSERT INTO t1 VALUES ({}, 'data{}');", i, i))
+        conn.execute(format!("INSERT INTO t1 VALUES ({i}, 'data{i}');"))
             .unwrap();
     }
 
@@ -1250,14 +1226,12 @@ fn test_integrity_check_freeblock_out_of_range(db: TempDatabase) {
                     || msg.contains("fragmentation")
                     || msg.contains("overlap")
                     || msg != "ok",
-                "Expected freeblock error or some error, got: {}",
-                msg
+                "Expected freeblock error or some error, got: {msg}"
             );
         }
         Err(panic_msg) => {
             panic!(
-                "Expected integrity_check to return an error, but it panicked: {}",
-                panic_msg
+                "Expected integrity_check to return an error, but it panicked: {panic_msg}"
             );
         }
     }
@@ -1283,7 +1257,7 @@ fn test_integrity_check_row_missing_from_index(db: TempDatabase) {
 
     // Insert rows - using fixed-length strings for predictable layout
     for i in 0..10 {
-        conn.execute(&format!("INSERT INTO t1 VALUES ({}, 'name_{:03}');", i, i))
+        conn.execute(format!("INSERT INTO t1 VALUES ({i}, 'name_{i:03}');"))
             .unwrap();
     }
 
@@ -1332,19 +1306,16 @@ fn test_integrity_check_row_missing_from_index(db: TempDatabase) {
             // Should detect both: wrong count AND row missing from index
             assert!(
                 msg.contains("wrong # of entries"),
-                "Expected 'wrong # of entries', got: {}",
-                msg
+                "Expected 'wrong # of entries', got: {msg}"
             );
             assert!(
                 msg.contains("missing from index"),
-                "Expected 'missing from index', got: {}",
-                msg
+                "Expected 'missing from index', got: {msg}"
             );
         }
         Err(panic_msg) => {
             panic!(
-                "Expected integrity_check to return error, but it panicked: {}",
-                panic_msg
+                "Expected integrity_check to return error, but it panicked: {panic_msg}"
             );
         }
     }
