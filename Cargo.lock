@@ -4961,6 +4961,8 @@ version = "0.4.0"
 dependencies = [
  "anyhow",
  "clap",
+ "indexmap 2.11.1",
+ "parking_lot",
  "proptest",
  "rand 0.9.2",
  "rand_chacha 0.9.0",

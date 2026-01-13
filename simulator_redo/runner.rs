@@ -18,6 +18,7 @@ use rand_chacha::ChaCha8Rng;
 use sql_gen_prop::{Schema, SqlStatement};
 use turso_core::Database;
 
+use crate::memory::{MemorySimIO, SimIO};
 use crate::oracle::{OracleResult, check_differential};
 use crate::schema::SchemaIntrospector;
 
@@ -67,18 +68,20 @@ pub struct Simulator {
     sqlite_conn: rusqlite::Connection,
     #[expect(dead_code)]
     turso_db: Arc<Database>,
+    /// In-memory IO for the Turso database.
+    io: Arc<MemorySimIO>,
 }
 
 impl Simulator {
     /// Create a new simulator with in-memory databases.
     ///
-    /// Uses `turso_core::MemoryIO` for deterministic in-memory storage.
+    /// Uses `MemorySimIO` for deterministic in-memory storage.
     pub fn new(config: SimConfig) -> Result<Self> {
         let rng = ChaCha8Rng::seed_from_u64(config.seed);
 
-        // Create Turso in-memory database using MemoryIO
-        let io = Arc::new(turso_core::MemoryIO::new());
-        let turso_db = Database::open_file(io, ":memory:")?;
+        // Create Turso in-memory database using MemorySimIO
+        let io = Arc::new(MemorySimIO::new(config.seed));
+        let turso_db = Database::open_file(io.clone(), "test.db")?;
         let turso_conn = turso_db.connect()?;
 
         // Create SQLite in-memory database
@@ -91,7 +94,16 @@ impl Simulator {
             turso_conn,
             sqlite_conn,
             turso_db,
+            io,
         })
+    }
+
+    /// Persist the in-memory database files to disk.
+    ///
+    /// Writes `.db`, `.wal`, and `.lg` files to the filesystem.
+    pub fn persist_files(&self) -> Result<()> {
+        self.io.persist_files()?;
+        Ok(())
     }
 
     /// Run the simulation.

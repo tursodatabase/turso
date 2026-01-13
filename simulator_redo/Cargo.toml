@@ -14,7 +14,7 @@ path = "main.rs"
 path = "lib.rs"
 
 [dependencies]
-turso_core.workspace = true
+turso_core = { workspace = true, features = ["simulator"] }
 sql_gen_prop = { path = "../sql_gen_prop" }
 rusqlite.workspace = true
 rand.workspace = true
@@ -24,6 +24,8 @@ tracing.workspace = true
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
 clap = { workspace = true, features = ["derive"] }
 proptest = "1.9"
+indexmap.workspace = true
+parking_lot.workspace = true
 
 [lints]
 workspace = true
