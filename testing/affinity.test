@@ -250,3 +250,26 @@ do_execsql_test_on_specific_db {:memory:} affinity-ascii-whitespace-1.1 {
   INSERT INTO nb1 VALUES ('12' || CHAR(160));
   SELECT TYPEOF(i), LENGTH(i) FROM nb1;
 } {text|3}
+
+# ============================================
+# REAL affinity with leading + sign
+# Strings with leading + should be converted to REAL
+# ============================================
+do_execsql_test_on_specific_db {:memory:} affinity-real-leading-plus-sign {
+  CREATE TABLE t0 (c0 REAL);
+  INSERT INTO t0 VALUES ('+3'), ('+3.14'), ('+1e5');
+  SELECT typeof(c0), c0 FROM t0 ORDER BY rowid;
+} {real|3.0
+real|3.14
+real|100000.0}
+
+do_execsql_test_on_specific_db {:memory:} affinity-real-mixed-signs {
+  CREATE TABLE t0 (c0 REAL);
+  INSERT INTO t0 VALUES ('+3'), ('-5'), ('+3.14'), ('-3.14'), ('+1e5'), ('-1e5');
+  SELECT typeof(c0), c0 FROM t0 ORDER BY rowid;
+} {real|3.0
+real|-5.0
+real|3.14
+real|-3.14
+real|100000.0
+real|-100000.0}
