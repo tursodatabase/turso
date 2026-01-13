@@ -13,6 +13,7 @@ pub mod delete;
 pub mod drop_index;
 pub mod drop_table;
 pub mod insert;
+pub mod profile;
 pub mod result;
 pub mod schema;
 pub mod select;
@@ -28,6 +29,7 @@ pub use delete::DeleteStatement;
 pub use drop_index::DropIndexStatement;
 pub use drop_table::DropTableStatement;
 pub use insert::InsertStatement;
+pub use profile::StatementProfile;
 pub use schema::{Column, DataType, Index, Schema, Table};
 pub use select::SelectStatement;
 pub use statement::SqlStatement;
@@ -159,14 +161,14 @@ mod tests {
         }
 
         #[test]
-        fn generated_statement_for_schema(stmt in strategies::statement_for_schema(&test_schema())) {
+        fn generated_statement_for_schema(stmt in strategies::statement_for_schema(&test_schema(), None)) {
             let sql = stmt.to_string();
             // Should be a valid SQL statement
             prop_assert!(!sql.is_empty());
         }
 
         #[test]
-        fn generated_sequence_has_correct_length(stmts in strategies::statement_sequence(&test_schema(), 5..10)) {
+        fn generated_sequence_has_correct_length(stmts in strategies::statement_sequence(&test_schema(), None, 5..10)) {
             prop_assert!(stmts.len() >= 5 && stmts.len() < 10);
         }
     }

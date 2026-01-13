@@ -137,7 +137,7 @@ impl Simulator {
 
         for i in 0..self.config.num_statements {
             // Generate a statement (DML or DDL)
-            let strategy = sql_gen_prop::strategies::statement_for_schema(&schema);
+            let strategy = sql_gen_prop::strategies::statement_for_schema(&schema, None);
             let value_tree = strategy
                 .new_tree(&mut test_runner)
                 .map_err(|e| anyhow::anyhow!("Failed to generate statement: {e}"))?;
