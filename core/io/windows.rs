@@ -1,6 +1,5 @@
-use crate::{
-    io::clock::DefaultClock, Clock, Completion, File, Instant, LimboError, OpenFlags, Result, IO,
-};
+use crate::io::clock::{DefaultClock, MonotonicInstant, WallClockInstant};
+use crate::{Clock, Completion, File, LimboError, OpenFlags, Result, IO};
 use crate::sync::RwLock;
 use std::io::{Read, Seek, Write};
 use crate::sync::Arc;
@@ -45,8 +44,12 @@ impl IO for WindowsIO {
 }
 
 impl Clock for WindowsIO {
-    fn now(&self) -> Instant {
-        DefaultClock.now()
+    fn current_time_monotonic(&self) -> MonotonicInstant {
+        DefaultClock.current_time_monotonic()
+    }
+
+    fn current_time_wall_clock(&self) -> WallClockInstant {
+        DefaultClock.current_time_wall_clock()
     }
 }
 

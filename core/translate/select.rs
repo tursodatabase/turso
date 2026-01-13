@@ -676,24 +676,31 @@ fn add_vtab_predicates_to_where_clause(
 /// Replaces a column number in an ORDER BY or GROUP BY expression with a copy of the column expression.
 /// For example, in SELECT u.first_name, count(1) FROM users u GROUP BY 1 ORDER BY 2,
 /// the column number 1 is replaced with u.first_name and the column number 2 is replaced with count(1).
+///
+/// Per SQLite documentation, only constant integers are treated as column references.
+/// Non-integer numeric literals (floats) are treated as constant expressions.
 fn replace_column_number_with_copy_of_column_expr(
     order_by_or_group_by_expr: &mut ast::Expr,
     columns: &[ResultSetColumn],
 ) -> Result<()> {
     if let ast::Expr::Literal(ast::Literal::Numeric(num)) = order_by_or_group_by_expr {
-        let column_number = num.parse::<usize>()?;
-        if column_number == 0 {
-            crate::bail_parse_error!("invalid column index: {}", column_number);
+        // Only treat as column reference if it parses as a positive integer.
+        // Float literals like "0.5" or "1.0" are valid constant expressions, not column references.
+        if let Ok(column_number) = num.parse::<usize>() {
+            if column_number == 0 {
+                crate::bail_parse_error!("invalid column index: {}", column_number);
+            }
+            let maybe_result_column = columns.get(column_number - 1);
+            match maybe_result_column {
+                Some(ResultSetColumn { expr, .. }) => {
+                    *order_by_or_group_by_expr = expr.clone();
+                }
+                None => {
+                    crate::bail_parse_error!("invalid column index: {}", column_number)
+                }
+            };
         }
-        let maybe_result_column = columns.get(column_number - 1);
-        match maybe_result_column {
-            Some(ResultSetColumn { expr, .. }) => {
-                *order_by_or_group_by_expr = expr.clone();
-            }
-            None => {
-                crate::bail_parse_error!("invalid column index: {}", column_number)
-            }
-        };
+        // Otherwise, leave the expression as-is (constant expression, case 3 per SQLite docs)
     }
     Ok(())
 }

@@ -79,7 +79,7 @@ use crate::{
     },
 };
 
-use crate::{info, turso_assert, OpenFlags, Row, TransactionState, ValueRef};
+use crate::{connection::Row, info, turso_assert, OpenFlags, TransactionState, ValueRef};
 
 use super::{
     insn::{Cookie, RegisterOrLiteral},
@@ -108,7 +108,7 @@ use crate::{
 use super::{make_record, Program, ProgramState, Register};
 
 #[cfg(feature = "fs")]
-use crate::resolve_ext_path;
+use crate::connection::resolve_ext_path;
 use crate::{bail_constraint_error, must_be_btree_cursor, MvStore, Pager, Result};
 
 /// Macro to destructure an Insn enum variant, only to be used when it

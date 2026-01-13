@@ -1,9 +1,8 @@
 use super::{Buffer, Clock, Completion, File, OpenFlags, IO};
-use crate::turso_assert;
-use crate::{io::clock::DefaultClock, Result};
-
-use crate::io::clock::Instant;
+use crate::io::clock::{DefaultClock, MonotonicInstant, WallClockInstant};
 use crate::sync::Mutex;
+use crate::turso_assert;
+use crate::Result;
 use std::{
     cell::{Cell, UnsafeCell},
     collections::{BTreeMap, HashMap},
@@ -36,8 +35,12 @@ impl Default for MemoryIO {
 }
 
 impl Clock for MemoryIO {
-    fn now(&self) -> Instant {
-        DefaultClock.now()
+    fn current_time_monotonic(&self) -> MonotonicInstant {
+        DefaultClock.current_time_monotonic()
+    }
+
+    fn current_time_wall_clock(&self) -> WallClockInstant {
+        DefaultClock.current_time_wall_clock()
     }
 }
 

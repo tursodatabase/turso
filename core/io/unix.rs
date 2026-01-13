@@ -1,6 +1,6 @@
 use super::{Completion, File, OpenFlags, IO};
 use crate::error::LimboError;
-use crate::io::clock::{Clock, DefaultClock, Instant};
+use crate::io::clock::{Clock, DefaultClock, MonotonicInstant, WallClockInstant};
 use crate::io::common;
 use crate::Result;
 use crate::sync::Mutex;
@@ -26,8 +26,12 @@ impl UnixIO {
 }
 
 impl Clock for UnixIO {
-    fn now(&self) -> Instant {
-        DefaultClock.now()
+    fn current_time_monotonic(&self) -> MonotonicInstant {
+        DefaultClock.current_time_monotonic()
+    }
+
+    fn current_time_wall_clock(&self) -> WallClockInstant {
+        DefaultClock.current_time_wall_clock()
     }
 }
 

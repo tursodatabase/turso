@@ -87,7 +87,6 @@ intrusive-collections = "0.9.7"
 roaring = "0.11.2"
 simsimd = "6.5.3"
 arc-swap = "1.7"
-bloom = "0.3.2"
 rustc-hash = "2.0"
 either = { workspace = true }
 tracing-subscriber.workspace = true
@@ -95,6 +94,7 @@ rapidhash = "4.1.1"
 branches = { version = "0.4.3", default-features = false }
 bumpalo = { version = "3", features = ["collections"] }
 smallvec = "1.15.1"
+fastbloom = "0.14.1"
 
 [target.'cfg(loom)'.dependencies]
 loom = { workspace = true }

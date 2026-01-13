@@ -119,7 +119,7 @@ impl Statement {
     fn _step(&mut self, waker: Option<&Waker>) -> Result<StepResult> {
         // If we're waiting for a busy handler timeout, check if we can proceed
         if let Some(busy_state) = self.busy_handler_state.as_ref() {
-            if self.pager.io.now() < busy_state.timeout() {
+            if self.pager.io.current_time_monotonic() < busy_state.timeout() {
                 // Yield the query as the timeout has not been reached yet
                 if let Some(waker) = waker {
                     waker.wake_by_ref();
@@ -169,7 +169,7 @@ impl Statement {
 
         // Handle busy result by invoking the busy handler
         if matches!(res, Ok(StepResult::Busy)) {
-            let now = self.pager.io.now();
+            let now = self.pager.io.current_time_monotonic();
             let handler = self.program.connection.get_busy_handler();
 
             // Initialize or get existing busy handler state

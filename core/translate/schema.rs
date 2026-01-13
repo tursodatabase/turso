@@ -29,6 +29,9 @@ fn validate(body: &ast::CreateTableBody, connection: &Connection) -> Result<()> 
         options, columns, ..
     } = &body
     {
+        if options.contains(ast::TableOptions::WITHOUT_ROWID) {
+            bail_parse_error!("WITHOUT ROWID tables are not supported");
+        }
         if options.contains(ast::TableOptions::STRICT) && !connection.experimental_strict_enabled()
         {
             bail_parse_error!(

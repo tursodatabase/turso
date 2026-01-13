@@ -5,7 +5,7 @@ use indexmap::IndexMap;
 use parking_lot::Mutex;
 use rand::{Rng, RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
-use turso_core::{Clock, Completion, IO, Instant, OpenFlags, Result};
+use turso_core::{Clock, Completion, IO, MonotonicInstant, OpenFlags, Result, WallClockInstant};
 
 use crate::runner::SimIO;
 use crate::runner::clock::SimulatorClock;
@@ -53,7 +53,7 @@ impl OperationType {
 
 #[derive(Debug)]
 pub struct Operation {
-    pub time: Option<turso_core::Instant>,
+    pub time: Option<turso_core::WallClockInstant>,
     pub op: OperationType,
     pub fault: bool,
     pub fd: Arc<Fd>,
@@ -210,7 +210,11 @@ impl SimIO for MemorySimIO {
 }
 
 impl Clock for MemorySimIO {
-    fn now(&self) -> Instant {
+    fn current_time_monotonic(&self) -> MonotonicInstant {
+        MonotonicInstant::now()
+    }
+
+    fn current_time_wall_clock(&self) -> WallClockInstant {
         self.clock.now().into()
     }
 }
@@ -250,7 +254,7 @@ impl IO for MemorySimIO {
             timeouts.len = timeouts.len()
         );
         let files = self.files.borrow_mut();
-        let now = self.now();
+        let now = self.current_time_wall_clock();
 
         callbacks.append(&mut timeouts);
 
