@@ -10,6 +10,7 @@ repository.workspace = true
 path = "lib.rs"
 
 [dependencies]
+proptest = "1.9"
 
 [lints]
 workspace = true
