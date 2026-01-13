@@ -1850,10 +1850,12 @@ mod tests {
 
     #[test]
     fn test_parse_other_modifiers() {
-        let mut p = DateTime::default();
         // Setup state for modifiers that require specific preconditions
-        p.valid_jd = true;
-        p.raw_s = true;
+        let mut p = DateTime {
+            valid_jd: true,
+            raw_s: true,
+            ..DateTime::default()
+        };
 
         // Modifiers that should just parse OK
         assert!(parse_modifier(&mut p, "localtime", 1).is_ok());
