@@ -1154,6 +1154,30 @@ fn emit_program_for_delete(
         })
         .collect::<Vec<_>>();
 
+    // Evaluate uncorrelated subqueries as early as possible (only for normal path without rowset)
+    // For the rowset path, subqueries are handled by emit_program_for_select on the rowset_plan.
+    if plan.rowset_plan.is_none() {
+        for subquery in plan
+            .non_from_clause_subqueries
+            .iter_mut()
+            .filter(|s| !s.has_been_evaluated())
+        {
+            let eval_at = subquery.get_eval_at(&join_order, Some(&plan.table_references))?;
+            if eval_at != EvalAt::BeforeLoop {
+                continue;
+            }
+            let subquery_plan = subquery.consume_plan(EvalAt::BeforeLoop);
+
+            emit_non_from_clause_subquery(
+                program,
+                &mut t_ctx,
+                *subquery_plan,
+                &subquery.query_type,
+                subquery.correlated,
+            )?;
+        }
+    }
+
     // Initialize cursors and other resources needed for query execution
     init_loop(
         program,
@@ -1164,7 +1188,7 @@ fn emit_program_for_delete(
         OperationMode::DELETE,
         &plan.where_clause,
         &join_order,
-        &mut [],
+        &mut plan.non_from_clause_subqueries,
     )?;
 
     // If there's a rowset_plan, materialize rowids into a RowSet first and then iterate the RowSet
@@ -1269,7 +1293,7 @@ fn emit_program_for_delete(
             &plan.where_clause,
             None,
             OperationMode::DELETE,
-            &mut [],
+            &mut plan.non_from_clause_subqueries,
         )?;
 
         emit_delete_insns(
@@ -1969,6 +1993,30 @@ fn emit_program_for_update(
         })
         .collect::<Vec<_>>();
 
+    // Evaluate uncorrelated subqueries as early as possible (only for normal path without ephemeral table)
+    // For the ephemeral path, subqueries are handled by emit_program_for_select on the ephemeral_plan.
+    if !has_ephemeral_table {
+        for subquery in plan
+            .non_from_clause_subqueries
+            .iter_mut()
+            .filter(|s| !s.has_been_evaluated())
+        {
+            let eval_at = subquery.get_eval_at(&join_order, Some(&plan.table_references))?;
+            if eval_at != EvalAt::BeforeLoop {
+                continue;
+            }
+            let subquery_plan = subquery.consume_plan(EvalAt::BeforeLoop);
+
+            emit_non_from_clause_subquery(
+                program,
+                &mut t_ctx,
+                *subquery_plan,
+                &subquery.query_type,
+                subquery.correlated,
+            )?;
+        }
+    }
+
     // Initialize the main loop
     init_loop(
         program,
@@ -1979,7 +2027,7 @@ fn emit_program_for_update(
         mode.clone(),
         &plan.where_clause,
         &join_order,
-        &mut [],
+        &mut plan.non_from_clause_subqueries,
     )?;
 
     // Prepare index cursors
@@ -2016,7 +2064,7 @@ fn emit_program_for_update(
         &plan.where_clause,
         temp_cursor_id,
         mode.clone(),
-        &mut [],
+        &mut plan.non_from_clause_subqueries,
     )?;
 
     let target_table_cursor_id =

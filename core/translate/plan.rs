@@ -502,6 +502,8 @@ pub struct DeletePlan {
     pub rowset_plan: Option<SelectPlan>,
     /// Register ID for the RowSet (if rowset_plan is Some)
     pub rowset_reg: Option<usize>,
+    /// Subqueries that appear in the WHERE clause (for non-rowset path)
+    pub non_from_clause_subqueries: Vec<NonFromClauseSubquery>,
 }
 
 #[derive(Debug, Clone)]
@@ -526,6 +528,8 @@ pub struct UpdatePlan {
     // For ALTER TABLE turso-db emits appropriate DDL statement in the "updates" cell of CDC table
     // This field is present only for update plan created for ALTER TABLE when CDC mode has "updates" values
     pub cdc_update_alter_statement: Option<String>,
+    /// Subqueries that appear in the WHERE clause (for non-ephemeral path)
+    pub non_from_clause_subqueries: Vec<NonFromClauseSubquery>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

@@ -12,7 +12,7 @@ use crate::{
         optimizer::optimize_select_plan,
         plan::{
             ColumnUsedMask, JoinOrderMember, NonFromClauseSubquery, OuterQueryReference, Plan,
-            SubqueryPosition, SubqueryState,
+            SubqueryPosition, SubqueryState, TableReferences, WhereTerm,
         },
         select::prepare_select_plan,
     },
@@ -26,7 +26,7 @@ use crate::{
 use super::{
     emitter::{emit_query, Resolver, TranslateCtx},
     main_loop::LoopLabels,
-    plan::{Operation, QueryDestination, Scan, Search, SelectPlan, TableReferences},
+    plan::{Operation, QueryDestination, Scan, Search, SelectPlan},
 };
 
 // Compute query plans for subqueries occurring in any position other than the FROM clause.
@@ -126,6 +126,32 @@ pub fn plan_subqueries_from_select_plan(
         &mut plan.table_references,
         &mut plan.non_from_clause_subqueries,
     );
+    Ok(())
+}
+
+/// Compute query plans for subqueries in a DML statement's WHERE clause.
+/// This is used by DELETE and UPDATE statements which only have subqueries in the WHERE clause.
+/// Similar to [plan_subqueries_from_select_plan] but only handles the WHERE clause
+/// since these statements don't have GROUP BY, ORDER BY, or result column subqueries.
+pub fn plan_subqueries_from_where_clause(
+    program: &mut ProgramBuilder,
+    non_from_clause_subqueries: &mut Vec<NonFromClauseSubquery>,
+    table_references: &mut TableReferences,
+    where_clause: &mut [WhereTerm],
+    resolver: &Resolver,
+    connection: &Arc<Connection>,
+) -> Result<()> {
+    plan_subqueries_with_outer_query_access(
+        program,
+        non_from_clause_subqueries,
+        table_references,
+        resolver,
+        where_clause.iter_mut().map(|t| &mut t.expr),
+        connection,
+        SubqueryPosition::Where,
+    )?;
+
+    update_column_used_masks(table_references, non_from_clause_subqueries);
     Ok(())
 }
 
