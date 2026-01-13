@@ -5,7 +5,7 @@
 //!
 //! - **DML**: SELECT, INSERT, UPDATE, DELETE
 //! - **DDL**: CREATE TABLE, CREATE INDEX, DROP TABLE, DROP INDEX, ALTER TABLE,
-//!   CREATE VIEW, DROP VIEW
+//!   CREATE VIEW, DROP VIEW, CREATE TRIGGER, DROP TRIGGER
 //! - **Transaction control**: BEGIN, COMMIT, ROLLBACK, SAVEPOINT, RELEASE
 //! - **Utility**: VACUUM, ANALYZE, REINDEX
 //!
@@ -15,9 +15,11 @@ pub mod alter_table;
 pub mod condition;
 pub mod create_index;
 pub mod create_table;
+pub mod create_trigger;
 pub mod delete;
 pub mod drop_index;
 pub mod drop_table;
+pub mod drop_trigger;
 pub mod generator;
 pub mod insert;
 pub mod profile;
@@ -38,13 +40,18 @@ pub use alter_table::{
 pub use condition::{ComparisonOp, Condition, LogicalOp, OrderByItem, OrderDirection};
 pub use create_index::{CreateIndexStatement, IndexColumn};
 pub use create_table::CreateTableStatement;
+pub use create_trigger::{
+    CreateTriggerContext, CreateTriggerKind, CreateTriggerOpWeights, CreateTriggerStatement,
+    TriggerEvent, TriggerTiming,
+};
 pub use delete::DeleteStatement;
 pub use drop_index::DropIndexStatement;
 pub use drop_table::DropTableStatement;
+pub use drop_trigger::DropTriggerStatement;
 pub use generator::{SqlGeneratorKind, WeightedKindIteratorExt};
 pub use insert::InsertStatement;
 pub use profile::{StatementProfile, WeightedProfile};
-pub use schema::{ColumnDef, DataType, Index, Schema, SchemaBuilder, Table, View};
+pub use schema::{ColumnDef, DataType, Index, Schema, SchemaBuilder, Table, Trigger, View};
 pub use select::SelectStatement;
 pub use statement::{SqlStatement, StatementContext, StatementKind};
 pub use transaction::{
@@ -104,6 +111,11 @@ pub mod strategies {
     };
     // Views
     pub use crate::view::{create_view, drop_view, drop_view_for_schema};
+    // Triggers
+    pub use crate::create_trigger::{
+        create_trigger_for_schema, create_trigger_for_table, create_trigger_with_timing_event,
+    };
+    pub use crate::drop_trigger::{drop_trigger, drop_trigger_for_schema};
 }
 
 #[cfg(test)]

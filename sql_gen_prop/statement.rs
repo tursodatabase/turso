@@ -7,9 +7,11 @@ use std::rc::Rc;
 use crate::alter_table::{AlterTableStatement, alter_table_for_schema};
 use crate::create_index::{CreateIndexStatement, create_index, create_index_for_table};
 use crate::create_table::{CreateTableStatement, create_table};
+use crate::create_trigger::{CreateTriggerStatement, create_trigger_for_schema};
 use crate::delete::{DeleteStatement, delete_for_table};
 use crate::drop_index::DropIndexStatement;
 use crate::drop_table::{DropTableStatement, drop_table_for_schema, drop_table_for_table};
+use crate::drop_trigger::{DropTriggerStatement, drop_trigger_for_schema};
 use crate::generator::SqlGeneratorKind;
 use crate::insert::{InsertStatement, insert_for_table};
 use crate::profile::StatementProfile;
@@ -59,6 +61,10 @@ pub enum SqlStatement {
     CreateView(CreateViewStatement),
     DropView(DropViewStatement),
 
+    // DDL - Triggers
+    CreateTrigger(CreateTriggerStatement),
+    DropTrigger(DropTriggerStatement),
+
     // Transaction control
     Begin(BeginStatement),
     Commit(CommitStatement),
@@ -86,6 +92,8 @@ impl fmt::Display for SqlStatement {
             SqlStatement::DropIndex(s) => write!(f, "{s}"),
             SqlStatement::CreateView(s) => write!(f, "{s}"),
             SqlStatement::DropView(s) => write!(f, "{s}"),
+            SqlStatement::CreateTrigger(s) => write!(f, "{s}"),
+            SqlStatement::DropTrigger(s) => write!(f, "{s}"),
             SqlStatement::Begin(s) => write!(f, "{s}"),
             SqlStatement::Commit(s) => write!(f, "{s}"),
             SqlStatement::Rollback(s) => write!(f, "{s}"),
@@ -110,6 +118,8 @@ impl StatementKind {
                 | StatementKind::DropIndex
                 | StatementKind::CreateView
                 | StatementKind::DropView
+                | StatementKind::CreateTrigger
+                | StatementKind::DropTrigger
         )
     }
 
@@ -163,6 +173,10 @@ impl SqlGeneratorKind for StatementKind {
             StatementKind::CreateView => !schema.tables.is_empty(),
             StatementKind::DropView => true, // Can always generate DROP VIEW IF EXISTS
 
+            // DDL - Trigger operations
+            StatementKind::CreateTrigger => !schema.tables.is_empty(),
+            StatementKind::DropTrigger => true, // Can always generate DROP TRIGGER IF EXISTS
+
             // Transaction control - always available
             StatementKind::Begin
             | StatementKind::Commit
@@ -194,6 +208,10 @@ impl SqlGeneratorKind for StatementKind {
             // DDL - View operations
             StatementKind::CreateView => false,
             StatementKind::DropView => false,
+
+            // DDL - Trigger operations
+            StatementKind::CreateTrigger => false,
+            StatementKind::DropTrigger => false,
 
             // Transaction control
             StatementKind::Begin
@@ -270,6 +288,17 @@ impl SqlGeneratorKind for StatementKind {
                 .boxed(),
             StatementKind::DropView => drop_view_for_schema(schema)
                 .prop_map(SqlStatement::DropView)
+                .boxed(),
+
+            // DDL - Triggers
+            StatementKind::CreateTrigger => {
+                let op_weights = profile.and_then(|p| p.create_trigger.extra.as_ref());
+                create_trigger_for_schema(schema, op_weights)
+                    .prop_map(SqlStatement::CreateTrigger)
+                    .boxed()
+            }
+            StatementKind::DropTrigger => drop_trigger_for_schema(schema)
+                .prop_map(SqlStatement::DropTrigger)
                 .boxed(),
 
             // Transaction control

@@ -387,12 +387,12 @@ mod tests {
         }
 
         #[test]
-        fn alter_table_for_schema_add_only(stmt in alter_table_for_schema(
+        fn alter_table_for_schema_rename_only(stmt in alter_table_for_schema(
             &test_schema(),
-            Some(&AlterTableOpWeights::none().with_add_column(100))
+            Some(&AlterTableOpWeights::none().with_rename_to(100))
         )) {
             let sql = stmt.to_string();
-            prop_assert!(sql.contains("ADD COLUMN"));
+            prop_assert!(sql.contains("RENAME TO"));
         }
     }
 

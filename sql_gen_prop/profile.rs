@@ -6,6 +6,7 @@
 use strum::IntoEnumIterator;
 
 use crate::alter_table::AlterTableOpWeights;
+use crate::create_trigger::CreateTriggerOpWeights;
 use crate::statement::StatementKind;
 
 /// A weighted profile that holds an overall weight and optional detailed settings.
@@ -73,7 +74,7 @@ impl<T: Default> Default for WeightedProfile<T> {
 /// Statement types are divided into:
 /// - **DML (Data Manipulation)**: SELECT, INSERT, UPDATE, DELETE
 /// - **DDL (Data Definition)**: CREATE TABLE, CREATE INDEX, DROP TABLE, DROP INDEX,
-///   ALTER TABLE, CREATE VIEW, DROP VIEW
+///   ALTER TABLE, CREATE VIEW, DROP VIEW, CREATE TRIGGER, DROP TRIGGER
 /// - **Transaction control**: BEGIN, COMMIT, ROLLBACK, SAVEPOINT, RELEASE
 /// - **Utility**: VACUUM, ANALYZE, REINDEX
 #[derive(Debug, Clone)]
@@ -97,6 +98,12 @@ pub struct StatementProfile {
     // DDL weights - Views
     pub create_view_weight: u32,
     pub drop_view_weight: u32,
+
+    // DDL weights - Triggers
+    /// CREATE TRIGGER weight and optional operation-level weights.
+    pub create_trigger: WeightedProfile<CreateTriggerOpWeights>,
+    /// DROP TRIGGER weight.
+    pub drop_trigger_weight: u32,
 
     // Transaction control weights
     pub begin_weight: u32,
@@ -128,6 +135,8 @@ impl Default for StatementProfile {
             drop_index_weight: 1,
             create_view_weight: 1,
             drop_view_weight: 1,
+            create_trigger: WeightedProfile::new(1),
+            drop_trigger_weight: 1,
 
             // Transaction control - disabled by default (can cause issues with oracle)
             begin_weight: 0,
@@ -159,6 +168,8 @@ impl StatementProfile {
             drop_index_weight: 0,
             create_view_weight: 0,
             drop_view_weight: 0,
+            create_trigger: WeightedProfile::new(0),
+            drop_trigger_weight: 0,
             begin_weight: 0,
             commit_weight: 0,
             rollback_weight: 0,
@@ -318,6 +329,29 @@ impl StatementProfile {
         self
     }
 
+    // Builder methods for DDL - Triggers
+
+    /// Builder method to set CREATE TRIGGER weight.
+    pub fn with_create_trigger(mut self, weight: u32) -> Self {
+        self.create_trigger.weight = weight;
+        self
+    }
+
+    /// Builder method to set CREATE TRIGGER profile with weight and operation weights.
+    pub fn with_create_trigger_profile(
+        mut self,
+        profile: WeightedProfile<CreateTriggerOpWeights>,
+    ) -> Self {
+        self.create_trigger = profile;
+        self
+    }
+
+    /// Builder method to set DROP TRIGGER weight.
+    pub fn with_drop_trigger(mut self, weight: u32) -> Self {
+        self.drop_trigger_weight = weight;
+        self
+    }
+
     // Builder methods for transaction control
 
     /// Builder method to set BEGIN weight.
@@ -384,6 +418,8 @@ impl StatementProfile {
             + self.drop_index_weight
             + self.create_view_weight
             + self.drop_view_weight
+            + self.create_trigger.weight
+            + self.drop_trigger_weight
     }
 
     /// Returns the total transaction control weight.
@@ -439,6 +475,8 @@ impl StatementProfile {
             StatementKind::DropIndex => self.drop_index_weight,
             StatementKind::CreateView => self.create_view_weight,
             StatementKind::DropView => self.drop_view_weight,
+            StatementKind::CreateTrigger => self.create_trigger.weight,
+            StatementKind::DropTrigger => self.drop_trigger_weight,
             StatementKind::Begin => self.begin_weight,
             StatementKind::Commit => self.commit_weight,
             StatementKind::Rollback => self.rollback_weight,

@@ -175,12 +175,29 @@ impl View {
     }
 }
 
+/// A trigger definition in a schema.
+#[derive(Debug, Clone)]
+pub struct Trigger {
+    pub name: String,
+    pub table_name: String,
+}
+
+impl Trigger {
+    pub fn new(name: impl Into<String>, table_name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            table_name: table_name.into(),
+        }
+    }
+}
+
 /// Builder for constructing a schema.
 #[derive(Debug, Default)]
 pub struct SchemaBuilder {
     tables: Vec<Table>,
     indexes: Vec<Index>,
     views: Vec<View>,
+    triggers: Vec<Trigger>,
 }
 
 impl SchemaBuilder {
@@ -203,16 +220,22 @@ impl SchemaBuilder {
         self
     }
 
+    pub fn add_trigger(mut self, trigger: Trigger) -> Self {
+        self.triggers.push(trigger);
+        self
+    }
+
     pub fn build(self) -> Schema {
         Schema {
             tables: Rc::new(self.tables),
             indexes: Rc::new(self.indexes),
             views: Rc::new(self.views),
+            triggers: Rc::new(self.triggers),
         }
     }
 }
 
-/// A schema containing tables, indexes, and views.
+/// A schema containing tables, indexes, views, and triggers.
 ///
 /// Uses `Rc` internally to allow cheap cloning for strategy composition.
 /// Use `SchemaBuilder` to construct a schema.
@@ -221,6 +244,7 @@ pub struct Schema {
     pub tables: Rc<Vec<Table>>,
     pub indexes: Rc<Vec<Index>>,
     pub views: Rc<Vec<View>>,
+    pub triggers: Rc<Vec<Trigger>>,
 }
 
 impl Default for Schema {
@@ -260,6 +284,19 @@ impl Schema {
         self.indexes
             .iter()
             .filter(|i| i.table_name == table_name)
+            .collect()
+    }
+
+    /// Returns all trigger names in the schema.
+    pub fn trigger_names(&self) -> HashSet<String> {
+        self.triggers.iter().map(|t| t.name.clone()).collect()
+    }
+
+    /// Returns triggers for a specific table.
+    pub fn triggers_for_table(&self, table_name: &str) -> Vec<&Trigger> {
+        self.triggers
+            .iter()
+            .filter(|t| t.table_name == table_name)
             .collect()
     }
 }
