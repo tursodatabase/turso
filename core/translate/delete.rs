@@ -9,7 +9,7 @@ use crate::translate::plan::{
 };
 use crate::translate::planner::{parse_limit, parse_where};
 use crate::translate::subquery::{
-    plan_subqueries_from_delete_plan, plan_subqueries_from_select_plan,
+    plan_subqueries_from_select_plan, plan_subqueries_from_where_clause,
 };
 use crate::translate::trigger_exec::has_relevant_triggers_type_only;
 use crate::util::normalize_ident;
@@ -52,9 +52,11 @@ pub fn translate_delete(
             plan_subqueries_from_select_plan(&mut program, rowset_plan, resolver, connection)?;
         } else {
             // Normal path: subqueries are in the DELETE plan's WHERE
-            plan_subqueries_from_delete_plan(
+            plan_subqueries_from_where_clause(
                 &mut program,
-                delete_plan_inner,
+                &mut delete_plan_inner.non_from_clause_subqueries,
+                &mut delete_plan_inner.table_references,
+                &mut delete_plan_inner.where_clause,
                 resolver,
                 connection,
             )?;
