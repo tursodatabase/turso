@@ -7,6 +7,7 @@
 use std::sync::Arc;
 
 use anyhow::Result;
+use sql_gen_prop::SqlStatement;
 use sql_gen_prop::SqlValue;
 use sql_gen_prop::result::diff_results;
 use turso_core::Value;
@@ -16,6 +17,8 @@ use turso_core::Value;
 pub enum OracleResult {
     /// The oracle check passed.
     Pass,
+    /// The oracle check passed but with a warning (e.g., LIMIT without ORDER BY).
+    Warning(String),
     /// The oracle check failed with a reason.
     Fail(String),
 }
@@ -23,6 +26,10 @@ pub enum OracleResult {
 impl OracleResult {
     pub fn is_pass(&self) -> bool {
         matches!(self, OracleResult::Pass)
+    }
+
+    pub fn is_warning(&self) -> bool {
+        matches!(self, OracleResult::Warning(_))
     }
 
     pub fn is_fail(&self) -> bool {
@@ -37,10 +44,12 @@ pub struct Row(pub Vec<SqlValue>);
 /// Trait for oracles that can check database properties.
 pub trait Oracle {
     /// Check the oracle after executing a statement.
-    /// Returns Pass if the property holds, Fail with a reason otherwise.
+    ///
+    /// Returns Pass if the property holds, Warning for non-fatal issues,
+    /// or Fail with a reason otherwise.
     fn check(
         &self,
-        sql: &str,
+        stmt: &SqlStatement,
         turso_result: &QueryResult,
         sqlite_result: &QueryResult,
     ) -> OracleResult;
@@ -72,18 +81,26 @@ pub struct DifferentialOracle;
 impl Oracle for DifferentialOracle {
     fn check(
         &self,
-        sql: &str,
+        stmt: &SqlStatement,
         turso_result: &QueryResult,
         sqlite_result: &QueryResult,
     ) -> OracleResult {
+        let has_unordered_limit = stmt.has_unordered_limit();
+
         match (turso_result, sqlite_result) {
             (QueryResult::Rows(turso_rows), QueryResult::Rows(sqlite_rows)) => {
-                // Use multiset comparison - rows may be in different order
-                // (especially with LIMIT without ORDER BY)
                 let diff = diff_results(turso_rows, sqlite_rows);
                 if !diff.is_empty() {
+                    // For LIMIT without ORDER BY, the result set may legitimately differ
+                    // since the order is undefined. Return a warning instead of failure.
+                    if has_unordered_limit {
+                        return OracleResult::Warning(format!(
+                            "Row set mismatch for unordered LIMIT query (results may vary due to undefined order):\n  SQL: {stmt}\n  Only in Turso: {:?}\n  Only in SQLite: {:?}",
+                            diff.only_in_first, diff.only_in_second
+                        ));
+                    }
                     return OracleResult::Fail(format!(
-                        "Row set mismatch for query '{sql}':\n  Only in Turso: {:?}\n  Only in SQLite: {:?}",
+                        "Row set mismatch:\n  SQL: {stmt}\n  Only in Turso: {:?}\n  Only in SQLite: {:?}",
                         diff.only_in_first, diff.only_in_second
                     ));
                 }
@@ -93,21 +110,21 @@ impl Oracle for DifferentialOracle {
             (QueryResult::Ok, QueryResult::Ok) => OracleResult::Pass,
             (QueryResult::Error(turso_err), QueryResult::Error(_sqlite_err)) => {
                 // Both errored - this is acceptable (both rejected invalid SQL)
-                tracing::debug!("Both databases errored on query '{sql}': {turso_err}");
+                tracing::debug!("Both databases errored on: {stmt}: {turso_err}");
                 OracleResult::Pass
             }
             (QueryResult::Error(turso_err), _) => OracleResult::Fail(format!(
-                "Turso errored but SQLite succeeded for query '{sql}': {turso_err}"
+                "Turso errored but SQLite succeeded:\n  SQL: {stmt}\n  Error: {turso_err}"
             )),
             (_, QueryResult::Error(sqlite_err)) => OracleResult::Fail(format!(
-                "SQLite errored but Turso succeeded for query '{sql}': {sqlite_err}"
+                "SQLite errored but Turso succeeded:\n  SQL: {stmt}\n  Error: {sqlite_err}"
             )),
             (QueryResult::Rows(rows), QueryResult::Ok) => {
                 if rows.is_empty() {
                     OracleResult::Pass
                 } else {
                     OracleResult::Fail(format!(
-                        "Turso returned {} rows but SQLite returned Ok for query '{sql}'",
+                        "Turso returned {} rows but SQLite returned Ok:\n  SQL: {stmt}",
                         rows.len()
                     ))
                 }
@@ -117,7 +134,7 @@ impl Oracle for DifferentialOracle {
                     OracleResult::Pass
                 } else {
                     OracleResult::Fail(format!(
-                        "SQLite returned {} rows but Turso returned Ok for query '{sql}'",
+                        "SQLite returned {} rows but Turso returned Ok:\n  SQL: {stmt}",
                         rows.len()
                     ))
                 }
@@ -231,13 +248,14 @@ impl DifferentialOracle {
 pub fn check_differential(
     turso_conn: &Arc<turso_core::Connection>,
     sqlite_conn: &rusqlite::Connection,
-    sql: &str,
+    stmt: &SqlStatement,
 ) -> Result<OracleResult> {
-    let turso_result = DifferentialOracle::execute_turso(turso_conn, sql);
-    let sqlite_result = DifferentialOracle::execute_sqlite(sqlite_conn, sql);
+    let sql = stmt.to_string();
+    let turso_result = DifferentialOracle::execute_turso(turso_conn, &sql);
+    let sqlite_result = DifferentialOracle::execute_sqlite(sqlite_conn, &sql);
 
     let oracle = DifferentialOracle;
-    Ok(oracle.check(sql, &turso_result, &sqlite_result))
+    Ok(oracle.check(stmt, &turso_result, &sqlite_result))
 }
 
 #[cfg(test)]
@@ -260,7 +278,14 @@ mod tests {
     fn test_oracle_result() {
         assert!(OracleResult::Pass.is_pass());
         assert!(!OracleResult::Pass.is_fail());
+        assert!(!OracleResult::Pass.is_warning());
+
+        assert!(OracleResult::Warning("test".into()).is_warning());
+        assert!(!OracleResult::Warning("test".into()).is_pass());
+        assert!(!OracleResult::Warning("test".into()).is_fail());
+
         assert!(OracleResult::Fail("test".into()).is_fail());
         assert!(!OracleResult::Fail("test".into()).is_pass());
+        assert!(!OracleResult::Fail("test".into()).is_warning());
     }
 }

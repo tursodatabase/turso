@@ -17,6 +17,16 @@ pub struct SelectStatement {
     pub offset: Option<u32>,
 }
 
+impl SelectStatement {
+    /// Returns true if this SELECT has a LIMIT clause without an ORDER BY.
+    ///
+    /// Queries with LIMIT but no ORDER BY may return different rows between
+    /// database implementations since the order is undefined.
+    pub fn has_unordered_limit(&self) -> bool {
+        self.limit.is_some() && self.order_by.is_empty()
+    }
+}
+
 impl fmt::Display for SelectStatement {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "SELECT ")?;

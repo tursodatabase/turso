@@ -57,6 +57,8 @@ impl Default for SimConfig {
 pub struct SimStats {
     /// Number of statements executed.
     pub statements_executed: usize,
+    /// Number of oracle warnings (e.g., LIMIT without ORDER BY mismatches).
+    pub warnings: usize,
     /// Number of oracle failures.
     pub oracle_failures: usize,
     /// Number of errors encountered.
@@ -167,7 +169,7 @@ impl Simulator {
             }
 
             // Execute on both databases and check oracle
-            match check_differential(&self.turso_conn, &self.sqlite_conn, &sql) {
+            match check_differential(&self.turso_conn, &self.sqlite_conn, &stmt) {
                 Ok(OracleResult::Pass) => {
                     stats.statements_executed += 1;
 
@@ -181,6 +183,18 @@ impl Simulator {
                             schema.tables.len(),
                             schema.indexes.len()
                         );
+                    }
+                }
+                Ok(OracleResult::Warning(reason)) => {
+                    stats.statements_executed += 1;
+                    stats.warnings += 1;
+                    tracing::warn!("Oracle warning at statement {i}: {reason}");
+
+                    // Still process DDL after warnings
+                    if is_ddl {
+                        schema = self.introspect_and_verify_schemas().map_err(|e| {
+                            anyhow::anyhow!("Schema mismatch after DDL statement {i} ({sql}): {e}")
+                        })?;
                     }
                 }
                 Ok(OracleResult::Fail(reason)) => {
@@ -199,8 +213,9 @@ impl Simulator {
         }
 
         tracing::info!(
-            "Simulation complete: {} statements executed, {} failures, {} errors",
+            "Simulation complete: {} statements executed, {} warnings, {} failures, {} errors",
             stats.statements_executed,
+            stats.warnings,
             stats.oracle_failures,
             stats.errors
         );
