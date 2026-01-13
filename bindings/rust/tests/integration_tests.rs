@@ -1015,3 +1015,36 @@ async fn test_prepare_vs_prepare_cached_equivalence() {
         ]
     );
 }
+
+/// This will fail if self.once is not reset in ProgramState::reset.
+#[tokio::test]
+async fn test_once_not_cleared_on_reset_with_coroutine() {
+    let db = Builder::new_local(":memory:").build().await.unwrap();
+    let conn = db.connect().unwrap();
+
+    // This query generates bytecode with Once inside a coroutine:
+    // The outer FROM-clause subquery creates a coroutine, and the inner
+    // scalar subquery (SELECT 1) uses Once to evaluate only once per execution.
+    let mut stmt = conn
+        .prepare("SELECT * FROM (SELECT (SELECT 1))")
+        .await
+        .unwrap();
+
+    let mut rows = stmt.query(()).await.unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+    let value: i64 = row.get(0).unwrap();
+    assert_eq!(value, 1);
+    assert!(rows.next().await.unwrap().is_none());
+    drop(rows);
+
+    stmt.reset().unwrap();
+
+    let mut rows = stmt.query(()).await.unwrap();
+    let row = rows.next().await.unwrap().unwrap();
+
+    assert_eq!(
+        row.get_value(0).unwrap(),
+        Value::Integer(1),
+        "Second execution should return 1, not Null. Bug: state.once not cleared in reset()"
+    );
+}
