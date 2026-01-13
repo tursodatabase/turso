@@ -26,34 +26,77 @@ impl fmt::Display for DataType {
     }
 }
 
-/// A column definition in a table schema.
+/// A column definition for table schemas and CREATE TABLE statements.
 #[derive(Debug, Clone)]
-pub struct Column {
+pub struct ColumnDef {
     pub name: String,
     pub data_type: DataType,
     pub nullable: bool,
     pub primary_key: bool,
+    pub unique: bool,
+    pub default: Option<String>,
 }
 
-impl Column {
+impl ColumnDef {
+    /// Create a new column definition with default settings (nullable, not primary key).
     pub fn new(name: impl Into<String>, data_type: DataType) -> Self {
         Self {
             name: name.into(),
             data_type,
             nullable: true,
             primary_key: false,
+            unique: false,
+            default: None,
         }
     }
 
+    /// Mark the column as NOT NULL.
     pub fn not_null(mut self) -> Self {
         self.nullable = false;
         self
     }
 
+    /// Mark the column as PRIMARY KEY (implies NOT NULL).
     pub fn primary_key(mut self) -> Self {
         self.primary_key = true;
         self.nullable = false;
         self
+    }
+
+    /// Mark the column as UNIQUE.
+    pub fn unique(mut self) -> Self {
+        self.unique = true;
+        self
+    }
+
+    /// Set a default value for the column.
+    pub fn default_value(mut self, value: impl Into<String>) -> Self {
+        self.default = Some(value.into());
+        self
+    }
+}
+
+impl fmt::Display for ColumnDef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "\"{}\" {}", self.name, self.data_type)?;
+
+        if self.primary_key {
+            write!(f, " PRIMARY KEY")?;
+        }
+
+        if !self.nullable && !self.primary_key {
+            write!(f, " NOT NULL")?;
+        }
+
+        if self.unique && !self.primary_key {
+            write!(f, " UNIQUE")?;
+        }
+
+        if let Some(default) = &self.default {
+            write!(f, " DEFAULT {default}")?;
+        }
+
+        Ok(())
     }
 }
 
@@ -61,11 +104,11 @@ impl Column {
 #[derive(Debug, Clone)]
 pub struct Table {
     pub name: String,
-    pub columns: Vec<Column>,
+    pub columns: Vec<ColumnDef>,
 }
 
 impl Table {
-    pub fn new(name: impl Into<String>, columns: Vec<Column>) -> Self {
+    pub fn new(name: impl Into<String>, columns: Vec<ColumnDef>) -> Self {
         Self {
             name: name.into(),
             columns,
@@ -73,7 +116,7 @@ impl Table {
     }
 
     /// Returns columns that can be used in WHERE clauses (non-blob types).
-    pub fn filterable_columns(&self) -> Vec<&Column> {
+    pub fn filterable_columns(&self) -> Vec<&ColumnDef> {
         self.columns
             .iter()
             .filter(|c| c.data_type != DataType::Blob)
@@ -81,7 +124,7 @@ impl Table {
     }
 
     /// Returns columns that can be updated (non-primary key).
-    pub fn updatable_columns(&self) -> Vec<&Column> {
+    pub fn updatable_columns(&self) -> Vec<&ColumnDef> {
         self.columns.iter().filter(|c| !c.primary_key).collect()
     }
 }

@@ -11,7 +11,8 @@ use std::fmt;
 
 use proptest::prelude::*;
 
-use crate::create_table::{ColumnDef, column_def, identifier_excluding};
+use crate::create_table::{column_def, identifier_excluding};
+use crate::schema::ColumnDef;
 use crate::schema::{Schema, Table};
 
 /// Types of ALTER TABLE operations.
@@ -181,15 +182,15 @@ pub fn alter_table_for_schema(schema: &Schema) -> BoxedStrategy<AlterTableStatem
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{Column, DataType, SchemaBuilder};
+    use crate::schema::{ColumnDef, DataType, SchemaBuilder};
 
     fn test_table() -> Table {
         Table::new(
             "users",
             vec![
-                Column::new("id", DataType::Integer).primary_key(),
-                Column::new("name", DataType::Text).not_null(),
-                Column::new("email", DataType::Text),
+                ColumnDef::new("id", DataType::Integer).primary_key(),
+                ColumnDef::new("name", DataType::Text).not_null(),
+                ColumnDef::new("email", DataType::Text),
             ],
         )
     }

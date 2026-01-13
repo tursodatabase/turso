@@ -34,13 +34,13 @@ pub mod view;
 pub use alter_table::{AlterTableOp, AlterTableStatement};
 pub use condition::{ComparisonOp, Condition, LogicalOp, OrderByItem, OrderDirection};
 pub use create_index::{CreateIndexStatement, IndexColumn};
-pub use create_table::{ColumnDef, CreateTableStatement};
+pub use create_table::CreateTableStatement;
 pub use delete::DeleteStatement;
 pub use drop_index::DropIndexStatement;
 pub use drop_table::DropTableStatement;
 pub use insert::InsertStatement;
 pub use profile::StatementProfile;
-pub use schema::{Column, DataType, Index, Schema, SchemaBuilder, Table, View};
+pub use schema::{ColumnDef, DataType, Index, Schema, SchemaBuilder, Table, View};
 pub use select::SelectStatement;
 pub use statement::SqlStatement;
 pub use statement::StatementKind;
@@ -113,21 +113,21 @@ mod tests {
             .add_table(Table::new(
                 "users",
                 vec![
-                    Column::new("id", DataType::Integer).primary_key(),
-                    Column::new("name", DataType::Text).not_null(),
-                    Column::new("email", DataType::Text),
-                    Column::new("age", DataType::Integer),
-                    Column::new("balance", DataType::Real),
+                    ColumnDef::new("id", DataType::Integer).primary_key(),
+                    ColumnDef::new("name", DataType::Text).not_null(),
+                    ColumnDef::new("email", DataType::Text),
+                    ColumnDef::new("age", DataType::Integer),
+                    ColumnDef::new("balance", DataType::Real),
                 ],
             ))
             .add_table(Table::new(
                 "posts",
                 vec![
-                    Column::new("id", DataType::Integer).primary_key(),
-                    Column::new("user_id", DataType::Integer).not_null(),
-                    Column::new("title", DataType::Text).not_null(),
-                    Column::new("content", DataType::Text),
-                    Column::new("data", DataType::Blob),
+                    ColumnDef::new("id", DataType::Integer).primary_key(),
+                    ColumnDef::new("user_id", DataType::Integer).not_null(),
+                    ColumnDef::new("title", DataType::Text).not_null(),
+                    ColumnDef::new("content", DataType::Text),
+                    ColumnDef::new("data", DataType::Blob),
                 ],
             ))
             .add_index(Index::new(

@@ -4,7 +4,7 @@ use proptest::prelude::*;
 use std::fmt;
 
 use crate::condition::{Condition, optional_where_clause};
-use crate::schema::{Column, Table};
+use crate::schema::{ColumnDef, Table};
 use crate::value::{SqlValue, value_for_type};
 
 /// An UPDATE statement.
@@ -37,7 +37,7 @@ impl fmt::Display for UpdateStatement {
 /// Generate an UPDATE statement for a table.
 pub fn update_for_table(table: &Table) -> BoxedStrategy<UpdateStatement> {
     let table_name = table.name.clone();
-    let updatable: Vec<Column> = table.updatable_columns().into_iter().cloned().collect();
+    let updatable: Vec<ColumnDef> = table.updatable_columns().into_iter().cloned().collect();
 
     if updatable.is_empty() {
         // No updatable columns: update nothing (unusual but valid)
@@ -61,7 +61,7 @@ pub fn update_for_table(table: &Table) -> BoxedStrategy<UpdateStatement> {
         optional_where_clause(&table_for_where),
     )
         .prop_flat_map(move |(indices, where_clause)| {
-            let selected_cols: Vec<&Column> =
+            let selected_cols: Vec<&ColumnDef> =
                 indices.iter().map(|&i| &updatable_clone[i]).collect();
 
             let assignment_strategies: Vec<BoxedStrategy<(String, SqlValue)>> = selected_cols

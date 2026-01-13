@@ -4,42 +4,7 @@ use proptest::prelude::*;
 use std::collections::HashSet;
 use std::fmt;
 
-use crate::schema::{DataType, Schema};
-
-/// A column definition for CREATE TABLE.
-#[derive(Debug, Clone)]
-pub struct ColumnDef {
-    pub name: String,
-    pub data_type: DataType,
-    pub nullable: bool,
-    pub primary_key: bool,
-    pub unique: bool,
-    pub default: Option<String>,
-}
-
-impl fmt::Display for ColumnDef {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "\"{}\" {}", self.name, self.data_type)?;
-
-        if self.primary_key {
-            write!(f, " PRIMARY KEY")?;
-        }
-
-        if !self.nullable && !self.primary_key {
-            write!(f, " NOT NULL")?;
-        }
-
-        if self.unique && !self.primary_key {
-            write!(f, " UNIQUE")?;
-        }
-
-        if let Some(default) = &self.default {
-            write!(f, " DEFAULT {default}")?;
-        }
-
-        Ok(())
-    }
-}
+use crate::schema::{ColumnDef, DataType, Schema};
 
 /// A CREATE TABLE statement.
 #[derive(Debug, Clone)]

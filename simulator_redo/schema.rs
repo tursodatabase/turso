@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use sql_gen_prop::{Column, DataType, Schema, SchemaBuilder, Table};
+use sql_gen_prop::{ColumnDef, DataType, Schema, SchemaBuilder, Table};
 
 /// Introspects schema from a database connection.
 pub struct SchemaIntrospector;
@@ -77,7 +77,7 @@ impl SchemaIntrospector {
     fn get_columns_turso(
         conn: &Arc<turso_core::Connection>,
         table_name: &str,
-    ) -> Result<Vec<Column>> {
+    ) -> Result<Vec<ColumnDef>> {
         let mut columns = Vec::new();
         // Use PRAGMA table_info to get column information
         let query = format!("PRAGMA table_info(\"{table_name}\")");
@@ -109,7 +109,7 @@ impl SchemaIntrospector {
             };
 
             let data_type = Self::parse_type(&type_str);
-            let mut column = Column::new(name, data_type);
+            let mut column = ColumnDef::new(name, data_type);
 
             if !notnull && !pk {
                 // Column is nullable (default)
@@ -129,7 +129,7 @@ impl SchemaIntrospector {
         Ok(columns)
     }
 
-    fn get_columns_sqlite(conn: &rusqlite::Connection, table_name: &str) -> Result<Vec<Column>> {
+    fn get_columns_sqlite(conn: &rusqlite::Connection, table_name: &str) -> Result<Vec<ColumnDef>> {
         let query = format!("PRAGMA table_info(\"{table_name}\")");
         let mut stmt = conn.prepare(&query).context("Failed to prepare PRAGMA")?;
 
@@ -149,7 +149,7 @@ impl SchemaIntrospector {
         let mut result = Vec::new();
         for (name, type_str, notnull, pk) in columns {
             let data_type = Self::parse_type(&type_str.to_uppercase());
-            let mut column = Column::new(name, data_type);
+            let mut column = ColumnDef::new(name, data_type);
 
             if notnull || pk {
                 column = column.not_null();

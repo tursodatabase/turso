@@ -123,15 +123,15 @@ pub fn drop_view(view_name: String) -> impl Strategy<Value = DropViewStatement> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{Column, DataType, SchemaBuilder, Table};
+    use crate::schema::{ColumnDef, DataType, SchemaBuilder, Table};
 
     fn test_schema() -> Schema {
         SchemaBuilder::new()
             .add_table(Table::new(
                 "users",
                 vec![
-                    Column::new("id", DataType::Integer).primary_key(),
-                    Column::new("name", DataType::Text),
+                    ColumnDef::new("id", DataType::Integer).primary_key(),
+                    ColumnDef::new("name", DataType::Text),
                 ],
             ))
             .build()

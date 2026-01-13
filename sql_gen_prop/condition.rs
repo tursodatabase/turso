@@ -3,7 +3,7 @@
 use proptest::prelude::*;
 use std::fmt;
 
-use crate::schema::{Column, Table};
+use crate::schema::{ColumnDef, Table};
 use crate::value::{SqlValue, value_for_type};
 
 /// Comparison operators for WHERE clauses.
@@ -130,7 +130,7 @@ pub fn order_direction() -> impl Strategy<Value = OrderDirection> {
 }
 
 /// Generate a simple condition for a column.
-pub fn simple_condition(column: &Column) -> BoxedStrategy<Condition> {
+pub fn simple_condition(column: &ColumnDef) -> BoxedStrategy<Condition> {
     let col_name = column.name.clone();
     let col_name2 = column.name.clone();
     let col_name3 = column.name.clone();

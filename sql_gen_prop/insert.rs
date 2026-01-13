@@ -3,7 +3,7 @@
 use proptest::prelude::*;
 use std::fmt;
 
-use crate::schema::{Column, Table};
+use crate::schema::Table;
 use crate::value::{SqlValue, value_for_type};
 
 /// An INSERT statement.
@@ -32,7 +32,7 @@ impl fmt::Display for InsertStatement {
 /// Generate an INSERT statement for a table.
 pub fn insert_for_table(table: &Table) -> BoxedStrategy<InsertStatement> {
     let table_name = table.name.clone();
-    let columns: Vec<Column> = table.columns.clone();
+    let columns = table.columns.clone();
 
     let col_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
 
