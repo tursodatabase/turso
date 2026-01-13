@@ -528,6 +528,7 @@ impl ProgramState {
         self.last_compare = None;
         self.deferred_seeks.iter_mut().for_each(|s| *s = None);
         self.ended_coroutine.clear();
+        self.once.clear();
         self.regex_cache.like.clear();
         self.execution_state = ProgramExecutionState::Init;
         self.current_collation = None;
