@@ -45,7 +45,7 @@ simulator.log
 profile.json.gz
 simulator-output/
 tests/*.sql
-
+stress-go/stress-go
 &1
 bisected.sql
 *.log
