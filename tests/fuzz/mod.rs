@@ -6535,8 +6535,8 @@ mod fuzz_tests {
         log::info!("dml_subquery_fuzz seed: {seed}");
 
         const NUM_FUZZ_ITERATIONS: usize = 500;
-        const MAX_ROWS_PER_TABLE: usize = 50;
-        const MIN_ROWS_PER_TABLE: usize = 5;
+        const MAX_ROWS_PER_TABLE: usize = 500;
+        const MIN_ROWS_PER_TABLE: usize = 50;
 
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
@@ -6556,7 +6556,6 @@ mod fuzz_tests {
             sqlite_exec_rows(&sqlite_conn, schema);
         }
 
-        // Helper function to populate tables with random data
         fn populate_tables(
             limbo_conn: &std::sync::Arc<turso_core::Connection>,
             sqlite_conn: &rusqlite::Connection,
@@ -6588,7 +6587,7 @@ mod fuzz_tests {
                 } else {
                     rng.random_range(1..=num_main_rows as i64).to_string()
                 };
-                let insert_sql = format!("INSERT INTO ref_data VALUES ({});", ref_val);
+                let insert_sql = format!("INSERT INTO ref_data VALUES ({ref_val});");
                 debug_string.push_str(&insert_sql);
                 debug_string.push('\n');
                 limbo_exec_rows(limbo_conn, &insert_sql);
@@ -6596,7 +6595,6 @@ mod fuzz_tests {
             }
         }
 
-        // Helper to verify both databases have identical state
         fn verify_tables_match(
             limbo_conn: &std::sync::Arc<turso_core::Connection>,
             sqlite_conn: &rusqlite::Connection,
@@ -6631,7 +6629,7 @@ mod fuzz_tests {
         log::info!("DDL/DML to reproduce manually:\n{debug_ddl_dml_string}");
 
         for iter_num in 0..NUM_FUZZ_ITERATIONS {
-            let query_type = rng.random_range(0..6);
+            let query_type = rng.random_range(0..14);
             let query = match query_type {
                 0 => {
                     // DELETE with IN subquery
@@ -6641,8 +6639,7 @@ mod fuzz_tests {
                         ""
                     };
                     format!(
-                        "DELETE FROM main_data WHERE id IN (SELECT ref_id FROM ref_data{});",
-                        subquery_filter
+                        "DELETE FROM main_data WHERE id IN (SELECT ref_id FROM ref_data{subquery_filter});",
                     )
                 }
                 1 => {
@@ -6653,8 +6650,7 @@ mod fuzz_tests {
                         ""
                     };
                     format!(
-                        "DELETE FROM main_data WHERE id NOT IN (SELECT ref_id FROM ref_data{});",
-                        subquery_filter
+                        "DELETE FROM main_data WHERE id NOT IN (SELECT ref_id FROM ref_data{subquery_filter});",
                     )
                 }
                 2 => {
@@ -6666,8 +6662,7 @@ mod fuzz_tests {
                         ""
                     };
                     format!(
-                        "UPDATE main_data SET value = {} WHERE id IN (SELECT ref_id FROM ref_data{});",
-                        new_value, subquery_filter
+                        "UPDATE main_data SET value = {new_value} WHERE id IN (SELECT ref_id FROM ref_data{subquery_filter});",
                     )
                 }
                 3 => {
@@ -6679,16 +6674,14 @@ mod fuzz_tests {
                         ""
                     };
                     format!(
-                        "UPDATE main_data SET value = {} WHERE id NOT IN (SELECT ref_id FROM ref_data{});",
-                        new_value, subquery_filter
+                        "UPDATE main_data SET value = {new_value} WHERE id NOT IN (SELECT ref_id FROM ref_data{subquery_filter});",
                     )
                 }
                 4 => {
                     // DELETE with IN subquery + additional condition
                     let category = rng.random_range(1..10);
                     format!(
-                        "DELETE FROM main_data WHERE category = {} AND id IN (SELECT ref_id FROM ref_data WHERE ref_id IS NOT NULL);",
-                        category
+                        "DELETE FROM main_data WHERE category = {category} AND id IN (SELECT ref_id FROM ref_data WHERE ref_id IS NOT NULL);",
                     )
                 }
                 5 => {
@@ -6696,8 +6689,55 @@ mod fuzz_tests {
                     let new_value = rng.random_range(-1000..1000);
                     let category = rng.random_range(1..10);
                     format!(
-                        "UPDATE main_data SET value = {} WHERE category = {} AND id NOT IN (SELECT ref_id FROM ref_data WHERE ref_id IS NOT NULL);",
-                        new_value, category
+                        "UPDATE main_data SET value = {new_value} WHERE category = {category} AND id NOT IN (SELECT ref_id FROM ref_data WHERE ref_id IS NOT NULL);",
+                    )
+                }
+                6 => {
+                    // DELETE with EXISTS subquery (correlated)
+                    "DELETE FROM main_data WHERE EXISTS (SELECT 1 FROM ref_data WHERE ref_data.ref_id = main_data.id);".into()
+                }
+                7 => {
+                    // DELETE with NOT EXISTS subquery (correlated)
+                    "DELETE FROM main_data WHERE NOT EXISTS (SELECT 1 FROM ref_data WHERE ref_data.ref_id = main_data.id);".into()
+                }
+                8 => {
+                    // UPDATE with EXISTS subquery (correlated)
+                    let new_value = rng.random_range(-1000..1000);
+                    format!(
+                        "UPDATE main_data SET value = {new_value} WHERE EXISTS (SELECT 1 FROM ref_data WHERE ref_data.ref_id = main_data.id);",
+                    )
+                }
+                9 => {
+                    // UPDATE with NOT EXISTS subquery (correlated)
+                    let new_value = rng.random_range(-1000..1000);
+                    format!(
+                        "UPDATE main_data SET value = {new_value} WHERE NOT EXISTS (SELECT 1 FROM ref_data WHERE ref_data.ref_id = main_data.id);",
+                    )
+                }
+                10 => {
+                    // DELETE with scalar comparison subquery (=)
+                    let category = rng.random_range(1..10);
+                    format!(
+                        "DELETE FROM main_data WHERE category = (SELECT {category} FROM (SELECT {category} AS c));",
+                    )
+                }
+                11 => {
+                    // DELETE with scalar comparison subquery (>) using aggregate
+                    "DELETE FROM main_data WHERE value > (SELECT AVG(value) FROM main_data);".into()
+                }
+                12 => {
+                    // UPDATE with scalar comparison subquery (=)
+                    let new_value = rng.random_range(-1000..1000);
+                    let category = rng.random_range(1..10);
+                    format!(
+                        "UPDATE main_data SET value = {new_value} WHERE category = (SELECT {category} FROM (SELECT {category} AS c));",
+                    )
+                }
+                13 => {
+                    // UPDATE with scalar comparison subquery (<) using aggregate
+                    let new_value = rng.random_range(-1000..1000);
+                    format!(
+                        "UPDATE main_data SET value = {new_value} WHERE value < (SELECT AVG(value) FROM main_data);",
                     )
                 }
                 _ => unreachable!(),
