@@ -550,13 +550,13 @@ pub fn translate_condition_expr(
         }
         ast::Expr::Parenthesized(exprs) => {
             if exprs.len() == 1 {
-                let _ = translate_condition_expr(
+                translate_condition_expr(
                     program,
                     referenced_tables,
                     &exprs[0],
                     condition_metadata,
                     resolver,
-                );
+                )?;
             } else {
                 crate::bail_parse_error!(
                     "parenthesized conditional should have exactly one expression"
