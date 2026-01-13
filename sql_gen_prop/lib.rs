@@ -13,6 +13,7 @@ pub mod delete;
 pub mod drop_index;
 pub mod drop_table;
 pub mod insert;
+pub mod result;
 pub mod schema;
 pub mod select;
 pub mod statement;

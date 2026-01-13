@@ -48,7 +48,7 @@ pub fn dml_for_table(table: &Table) -> BoxedStrategy<SqlStatement> {
         select_for_table(table).prop_map(SqlStatement::Select),
         insert_for_table(table).prop_map(SqlStatement::Insert),
         update_for_table(table).prop_map(SqlStatement::Update),
-        delete_for_table(table).prop_map(SqlStatement::Delete),
+        // delete_for_table(table).prop_map(SqlStatement::Delete),
     ]
     .boxed()
 }

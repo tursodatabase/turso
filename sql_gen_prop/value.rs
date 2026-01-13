@@ -2,6 +2,7 @@
 
 use proptest::prelude::*;
 use std::fmt;
+use std::hash::{Hash, Hasher};
 
 use crate::schema::DataType;
 
@@ -33,6 +34,24 @@ impl PartialEq for SqlValue {
             (SqlValue::Text(a), SqlValue::Text(b)) => a == b,
             (SqlValue::Blob(a), SqlValue::Blob(b)) => a == b,
             _ => false,
+        }
+    }
+}
+
+impl Eq for SqlValue {}
+
+impl Hash for SqlValue {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            SqlValue::Integer(i) => i.hash(state),
+            SqlValue::Real(f) => {
+                // Hash the bit representation for consistency
+                f.to_bits().hash(state);
+            }
+            SqlValue::Text(s) => s.hash(state),
+            SqlValue::Blob(b) => b.hash(state),
+            SqlValue::Null => {}
         }
     }
 }

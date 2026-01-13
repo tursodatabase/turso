@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use anyhow::Result;
 use sql_gen_prop::SqlValue;
+use sql_gen_prop::result::diff_results;
 use turso_core::Value;
 
 /// Result of an oracle check.
@@ -30,7 +31,7 @@ impl OracleResult {
 }
 
 /// A row of values from a query result.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Row(pub Vec<SqlValue>);
 
 /// Trait for oracles that can check database properties.
@@ -77,22 +78,14 @@ impl Oracle for DifferentialOracle {
     ) -> OracleResult {
         match (turso_result, sqlite_result) {
             (QueryResult::Rows(turso_rows), QueryResult::Rows(sqlite_rows)) => {
-                if turso_rows.len() != sqlite_rows.len() {
+                // Use multiset comparison - rows may be in different order
+                // (especially with LIMIT without ORDER BY)
+                let diff = diff_results(turso_rows, sqlite_rows);
+                if !diff.is_empty() {
                     return OracleResult::Fail(format!(
-                        "Row count mismatch for query '{sql}': Turso returned {} rows, SQLite returned {} rows",
-                        turso_rows.len(),
-                        sqlite_rows.len()
+                        "Row set mismatch for query '{sql}':\n  Only in Turso: {:?}\n  Only in SQLite: {:?}",
+                        diff.only_in_first, diff.only_in_second
                     ));
-                }
-
-                for (i, (turso_row, sqlite_row)) in
-                    turso_rows.iter().zip(sqlite_rows.iter()).enumerate()
-                {
-                    if turso_row != sqlite_row {
-                        return OracleResult::Fail(format!(
-                            "Row {i} mismatch for query '{sql}':\n  Turso:  {turso_row:?}\n  SQLite: {sqlite_row:?}"
-                        ));
-                    }
                 }
 
                 OracleResult::Pass

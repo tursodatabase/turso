@@ -62,14 +62,15 @@ fn main() -> Result<()> {
     tracing::info!("Starting sim_redo with config: {:?}", config);
 
     let mut simulator = Simulator::new(config)?;
-    let stats = simulator.run()?;
-
-    tracing::info!("Final stats: {:?}", stats);
+    let stats = simulator.run();
 
     if args.keep_files {
         tracing::info!("Persisting database files to disk...");
         simulator.persist_files()?;
     }
+
+    let stats = stats?;
+    tracing::info!("Final stats: {:?}", stats);
 
     if stats.oracle_failures > 0 {
         std::process::exit(1);
