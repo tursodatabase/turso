@@ -8,7 +8,9 @@ import (
 	"math/rand"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -84,6 +86,11 @@ var (
 	db              *gorm.DB
 	stats           Stats
 	checkpointMutex sync.Mutex
+	// workerPauseMu is used to pause all workers during integrity checks.
+	// Workers hold a read lock, integrity check holds a write lock.
+	workerPauseMu sync.RWMutex
+	// dbPath is stored globally for the integrity check worker
+	globalDbPath string
 )
 
 func main() {
@@ -91,6 +98,7 @@ func main() {
 	if dbPath == "" {
 		dbPath = "stress_test.db"
 	}
+	globalDbPath = dbPath
 
 	checkpointInterval := 1000 * time.Millisecond
 	if intervalStr := os.Getenv("CHECKPOINT_INTERVAL_MS"); intervalStr != "" {
@@ -167,6 +175,9 @@ func main() {
 
 	// Start stats reporter
 	go statsReporter(ctx)
+
+	// Start integrity check worker (every 30 seconds)
+	go integrityCheckWorker(ctx, 30*time.Second)
 
 	// Setup HTTP routes
 	mux := http.NewServeMux()
@@ -274,6 +285,60 @@ func statsReporter(ctx context.Context) {
 	}
 }
 
+// Integrity check worker - periodically pauses all workers and runs sqlite3 integrity_check
+func integrityCheckWorker(ctx context.Context, interval time.Duration) {
+	log.Println("Integrity check worker started")
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Println("Integrity check worker stopped")
+			return
+		case <-ticker.C:
+			doIntegrityCheck()
+		}
+	}
+}
+
+func doIntegrityCheck() {
+	log.Println("[integrity] Pausing all workers for integrity check...")
+
+	// Acquire write lock to pause all workers
+	workerPauseMu.Lock()
+	defer workerPauseMu.Unlock()
+
+	// Also pause checkpoints during integrity check
+	checkpointMutex.Lock()
+	defer checkpointMutex.Unlock()
+
+	log.Println("[integrity] All workers paused, running sqlite3 integrity_check...")
+
+	// Run sqlite3 PRAGMA integrity_check
+	cmd := exec.Command("sqlite3", globalDbPath, "PRAGMA integrity_check;")
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		log.Printf("[integrity] ERROR running sqlite3: %v", err)
+		log.Printf("[integrity] Output: %s", string(output))
+		stats.Errors.Add(1)
+		return
+	}
+
+	result := strings.TrimSpace(string(output))
+	if result == "ok" {
+		log.Println("[integrity] Database integrity check PASSED")
+	} else {
+		log.Printf("[integrity] DATABASE CORRUPTION DETECTED!")
+		log.Printf("[integrity] Output: %s", result)
+		stats.Errors.Add(1)
+		// Optionally exit on corruption
+		log.Fatal("[integrity] Exiting due to database corruption")
+	}
+
+	log.Println("[integrity] Resuming workers...")
+}
+
 // Stress worker that continuously hammers HTTP endpoints
 func stressWorker(ctx context.Context, id int, baseURL string) {
 	client := &http.Client{Timeout: 30 * time.Second}
@@ -298,6 +363,9 @@ func stressWorker(ctx context.Context, id int, baseURL string) {
 			log.Printf("Stress worker %d stopped", id)
 			return
 		default:
+			// Acquire read lock - will block if integrity check is running
+			workerPauseMu.RLock()
+
 			endpoint := weighted[rand.Intn(len(weighted))]
 			url := baseURL + endpoint
 
@@ -314,6 +382,8 @@ func stressWorker(ctx context.Context, id int, baseURL string) {
 				req.Header.Set("Content-Type", "application/json")
 				resp, err = client.Do(req)
 			}
+
+			workerPauseMu.RUnlock()
 
 			if err != nil {
 				// Connection errors are expected during high load, don't spam logs
