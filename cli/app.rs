@@ -20,7 +20,8 @@ use clap::Parser;
 use comfy_table::{Attribute, Cell, CellAlignment, ContentArrangement, Row, Table};
 use rustyline::{error::ReadlineError, history::DefaultHistory, Editor};
 use std::{
-    io::{self, BufRead, IsTerminal, Write},
+    fs::File,
+    io::{self, BufRead, BufReader, IsTerminal, Write},
     mem::{forget, ManuallyDrop},
     path::PathBuf,
     sync::{
@@ -783,6 +784,11 @@ impl Limbo {
                 Command::Manual(args) => {
                     let w = self.writer.as_mut().unwrap();
                     if let Err(e) = manual::display_manual(args.page.as_deref(), w) {
+                        let _ = self.writeln(e.to_string());
+                    }
+                }
+                Command::Read(args) => {
+                    if let Err(e) = self.read_sql_file(&args.path) {
                         let _ = self.writeln(e.to_string());
                     }
                 }
@@ -1817,6 +1823,112 @@ impl Limbo {
         let mut applier = ApplyWriter::new(&target);
         Self::dump_database_from_conn(false, self.conn.clone(), &mut applier, StderrProgress)?;
         applier.finish()?;
+        Ok(())
+    }
+
+    fn read_sql_file(&mut self, path: &str) -> anyhow::Result<()> {
+        let file =
+            File::open(path).map_err(|e| anyhow!("Error: cannot open \"{}\" – {}", path, e))?;
+        let reader = BufReader::new(file);
+
+        let mut query_buffer = String::new();
+        let mut in_single_quote: bool = false; // ''
+        let mut in_double_quote: bool = false; // ""
+        let mut in_block_comment = false; //  /* */
+        let mut in_hash = false; // #
+        let mut in_line_comment = false; // --
+
+        for line in reader.lines() {
+            let mut line = line
+                .map_err(|e| anyhow!("Error: file \"{}\" is not valid UTF-8 text – {}", path, e))?;
+            line.push('\n');
+            let mut iter = line.chars().peekable();
+
+            while let Some(ch) = iter.next() {
+                // Check exit for line comment and hash
+                if (in_line_comment || in_hash) && ch == '\n' {
+                    in_line_comment = false;
+                    in_hash = false;
+                    query_buffer.push(ch);
+                    continue;
+                }
+
+                // Check exit for block comment
+                if in_block_comment && ch == '*' && iter.peek() == Some(&'/') {
+                    query_buffer.push(ch);
+                    query_buffer.push('/');
+                    iter.next();
+                    in_block_comment = false;
+                    continue;
+                }
+
+                // Push into the query buffer if its inside comments
+                if in_line_comment || in_block_comment || in_hash {
+                    query_buffer.push(ch);
+                    continue;
+                }
+
+                // Block comment detection
+                if ch == '/' && iter.peek() == Some(&'*') && !in_single_quote && !in_double_quote {
+                    query_buffer.push('/');
+                    query_buffer.push('*');
+                    iter.next();
+                    in_block_comment = true;
+                    continue;
+                }
+
+                // Hash detection, instead of pushing '#' it pushes '-', '-'
+                // to make it act like line comment
+                if ch == '#' && !in_single_quote && !in_double_quote {
+                    query_buffer.push('-');
+                    query_buffer.push('-');
+                    in_hash = true;
+                    continue;
+                }
+
+                // Line comment detection
+                if ch == '-' && iter.peek() == Some(&'-') && !in_single_quote && !in_double_quote {
+                    query_buffer.push(ch);
+                    query_buffer.push('-');
+                    iter.next();
+                    in_line_comment = true;
+                    continue;
+                }
+
+                // Single quote
+                if ch == '\'' && !in_double_quote {
+                    in_single_quote = !in_single_quote;
+                }
+
+                // Double quote
+                if ch == '"' && !in_single_quote {
+                    in_double_quote = !in_double_quote;
+                }
+
+                query_buffer.push(ch);
+
+                if ch == ';'
+                    && !in_single_quote
+                    && !in_double_quote
+                    && !in_block_comment
+                    && !in_line_comment
+                    && !in_hash
+                {
+                    self.run_query(&query_buffer);
+                    query_buffer.clear();
+                }
+            }
+
+            // Reset comments
+            in_line_comment = false;
+            in_hash = false;
+        }
+
+        let remaining = query_buffer.trim();
+        if !remaining.is_empty() {
+            self.run_query(remaining);
+        }
+        query_buffer.clear();
         Ok(())
     }
 

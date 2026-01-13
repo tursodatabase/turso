@@ -410,9 +410,81 @@ def test_dbtotxt():
     shell.run_test("dbtotxt-with-table", ".dbtotxt", expected)
     shell.quit()
 
+def test_read_command():
+    shell = TestTursoShell()
+    try:
+        shell.run_test("read-non-existing-file", ".read /12jo/ddwuidu/s.sql",
+            (
+                'Error: cannot open "/12jo/ddwuidu/s.sql" – '
+                'No such file or directory (os error 2)'
+            )
+        )
+
+
+        wrong_sql_file = Path("wrong.sql")
+        wrong_sql_file.write_text("""
+        DROP TABLE IF EXISTS students;
+        CREATE TABLE students (
+            id INTEGER PRIMARY KEY,
+            name TEXT,
+            email TEXT
+        );
+
+        INSERT INTO students (name,email) VALUES ('Alice','a@a.com');
+
+        -- THIS LINE IS INTENTIONALLY BROKEN
+        INSRT INTO students (name,email) VALUES ('Broken','b@b.com');
+
+        INSERT INTO students (name,email) VALUES ('Charlie','c@c.com');
+        """)
+
+        shell.run_test_fn(
+            ".read wrong.sql",
+            lambda result: "INSRT" in result
+        )
+
+        emp_sql_file = Path("empty.sql")
+        emp_sql_file.write_text("")
+        shell.run_test("read-empty-file", ".read empty.sql", "")
+
+        happy_sql_file = Path("happy.sql")
+        happy_sql_file.write_text("""
+        DROP TABLE IF EXISTS students;
+        CREATE TABLE students (
+            id INTEGER PRIMARY KEY,
+            name TEXT,
+            email TEXT
+        );
+
+        INSERT INTO students (name,email) VALUES ('Alice','a@a.com');
+
+        INSERT INTO students (name,email) VALUES ('Broken','b@b.com');
+
+        INSERT INTO students (name,email) VALUES ('Charlie','c@c.com');
+        """)
+        shell.run_test("read-happy-file", ".read happy.sql", "")
+
+        binary_sql_file = Path("binary_test.bin")
+        binary_sql_file.write_bytes(os.urandom(512))
+
+        shell.run_test("read-binary-file", ".read binary_test.bin",
+            (
+                'Error: file "binary_test.bin" is not valid UTF-8 text – '
+                'stream did not contain valid UTF-8'
+            )
+        )
+
+    finally:
+        for f in ["wrong.sql", "empty.sql", "happy.sql", "binary_test.bin"]:
+            p = Path(f)
+            if p.exists():
+                p.unlink()
+
+    shell.quit()
 
 def main():
     console.info("Running all turso CLI tests...")
+    test_read_command()
     test_basic_queries()
     test_schema_operations()
     test_file_operations()
