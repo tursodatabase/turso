@@ -455,6 +455,18 @@ pub fn translate_condition_expr(
                 resolver,
             )?;
         }
+        // Handle IS TRUE/IS FALSE/IS NOT TRUE/IS NOT FALSE in conditions
+        // Delegate to translate_expr which handles these correctly with IsTrue instruction
+        ast::Expr::Binary(_, ast::Operator::Is | ast::Operator::IsNot, e2)
+            if matches!(
+                e2.as_ref(),
+                ast::Expr::Literal(ast::Literal::True) | ast::Expr::Literal(ast::Literal::False)
+            ) =>
+        {
+            let reg = program.alloc_register();
+            translate_expr(program, Some(referenced_tables), expr, reg, resolver)?;
+            emit_cond_jump(program, condition_metadata, reg);
+        }
         ast::Expr::Binary(e1, op, e2) => {
             let result_reg = program.alloc_register();
             binary_expr_shared(
@@ -855,6 +867,36 @@ pub fn translate_expr(
             crate::bail_parse_error!("expression should have been rewritten in optmizer")
         }
         ast::Expr::Binary(e1, op, e2) => {
+            // Handle IS TRUE/IS FALSE/IS NOT TRUE/IS NOT FALSE specially.
+            // These use truth semantics (only non-zero numbers are truthy) rather than equality.
+            if let Some((is_not, is_true_literal)) = match (op, e2.as_ref()) {
+                (ast::Operator::Is, ast::Expr::Literal(ast::Literal::True)) => Some((false, true)),
+                (ast::Operator::Is, ast::Expr::Literal(ast::Literal::False)) => {
+                    Some((false, false))
+                }
+                (ast::Operator::IsNot, ast::Expr::Literal(ast::Literal::True)) => {
+                    Some((true, true))
+                }
+                (ast::Operator::IsNot, ast::Expr::Literal(ast::Literal::False)) => {
+                    Some((true, false))
+                }
+                _ => None,
+            } {
+                let reg = program.alloc_register();
+                translate_expr(program, referenced_tables, e1, reg, resolver)?;
+                // For NULL: IS variants return 0, IS NOT variants return 1
+                // For non-NULL: IS TRUE/IS NOT FALSE return truthy, IS FALSE/IS NOT TRUE return !truthy
+                let null_value = is_not;
+                let invert = is_not == is_true_literal;
+                program.emit_insn(Insn::IsTrue {
+                    reg,
+                    dest: target_register,
+                    null_value,
+                    invert,
+                });
+                return Ok(target_register);
+            }
+
             binary_expr_shared(
                 program,
                 referenced_tables,
@@ -4450,6 +4492,20 @@ pub fn emit_literal(
             program.emit_insn(Insn::Null {
                 dest: target_register,
                 dest_end: None,
+            });
+            Ok(target_register)
+        }
+        ast::Literal::True => {
+            program.emit_insn(Insn::Integer {
+                value: 1,
+                dest: target_register,
+            });
+            Ok(target_register)
+        }
+        ast::Literal::False => {
+            program.emit_insn(Insn::Integer {
+                value: 0,
+                dest: target_register,
             });
             Ok(target_register)
         }

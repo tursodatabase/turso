@@ -948,6 +948,8 @@ impl ToTokens for Literal {
             Self::Blob(ref blob) => s.append(TK_BLOB, Some(blob)),
             Self::Keyword(ref str) => s.append(TK_ID, Some(str)), // TODO Validate TK_ID
             Self::Null => s.append(TK_NULL, None),
+            Self::True => s.append(TK_ID, Some("TRUE")),
+            Self::False => s.append(TK_ID, Some("FALSE")),
             Self::CurrentDate => s.append(TK_CTIME_KW, Some("CURRENT_DATE")),
             Self::CurrentTime => s.append(TK_CTIME_KW, Some("CURRENT_TIME")),
             Self::CurrentTimestamp => s.append(TK_CTIME_KW, Some("CURRENT_TIMESTAMP")),

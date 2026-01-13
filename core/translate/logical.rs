@@ -1906,6 +1906,8 @@ impl<'a> LogicalPlanBuilder<'a> {
     fn build_literal(lit: &ast::Literal) -> Result<Value> {
         match lit {
             ast::Literal::Null => Ok(Value::Null),
+            ast::Literal::True => Ok(Value::Integer(1)),
+            ast::Literal::False => Ok(Value::Integer(0)),
             ast::Literal::Keyword(k) => {
                 let k_bytes = k.as_bytes();
                 match_ignore_ascii_case!(match k_bytes {

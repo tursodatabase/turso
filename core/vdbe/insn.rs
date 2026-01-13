@@ -1164,6 +1164,23 @@ pub enum Insn {
         reg: usize,
         dest: usize,
     },
+    /// Interpret the value in register `reg` as a boolean and store in `dest`.
+    /// Used to implement IS TRUE, IS FALSE, IS NOT TRUE, IS NOT FALSE.
+    ///
+    /// A value is considered "true" if it is a non-zero number.
+    /// Strings, blobs, and zero are "false". NULL is handled specially.
+    ///
+    /// - If reg is NULL, store `null_value` in dest
+    /// - Otherwise, store 1 if the value is a non-zero number, 0 otherwise
+    /// - If `invert` is true, invert the result (0↔1)
+    IsTrue {
+        reg: usize,
+        dest: usize,
+        /// Value to store if input is NULL (0 or 1)
+        null_value: bool,
+        /// Whether to invert the result
+        invert: bool,
+    },
     /// Concatenates the `rhs` and `lhs` values and stores the result in the third register.
     Concat {
         lhs: usize,
@@ -1556,6 +1573,7 @@ impl InsnVariants {
             InsnVariants::Variable => execute::op_variable,
             InsnVariants::ZeroOrNull => execute::op_zero_or_null,
             InsnVariants::Not => execute::op_not,
+            InsnVariants::IsTrue => execute::op_is_true,
             InsnVariants::Concat => execute::op_concat,
             InsnVariants::And => execute::op_and,
             InsnVariants::Or => execute::op_or,
