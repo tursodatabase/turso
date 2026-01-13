@@ -18,7 +18,7 @@ import * as path from "path";
 import { GithubClient } from "./github.ts";
 import { SlackClient } from "./slack.ts";
 import { parseFailure, isCorruptionError, type SqlancerFailure } from "./logParse.ts";
-import { analyzeCorruption, preserveCorruptDatabase } from "./corruptionAnalysis.ts";
+import { analyzeCorruption, preserveCorruptDatabase, findSqlancerDatabases } from "./corruptionAnalysis.ts";
 
 // Configuration from environment
 const TIME_LIMIT_MINUTES = parseInt(process.env.TIME_LIMIT_MINUTES || "240", 10); // 4 hours default
@@ -539,21 +539,47 @@ async function main(): Promise<void> {
 				console.log(`[${new Date().toISOString()}] Run ${stats.totalRuns}: FAILURE (${result.failure.type})`);
 				stats.oracleStats[oracle].failures++;
 
-				// Check for corruption and run analysis
-				if (isCorruptionError(result.failure)) {
-					stats.corruptions++;
-					console.log("  Corruption detected, running analysis...");
+				// Run corruption analysis for corruption errors OR crashes/panics
+				// Crashes might have left a corrupt database that's useful for debugging
+				const shouldAnalyze = isCorruptionError(result.failure) ||
+					result.failure.type === "crash" ||
+					result.failure.type === "exception";
+
+				if (shouldAnalyze) {
+					if (isCorruptionError(result.failure)) {
+						stats.corruptions++;
+					}
+					console.log(`  Running database analysis for ${result.failure.type}...`);
+
+					// Find the database to analyze
+					let dbToAnalyze: string | null = null;
 
 					if (result.failure.dbPath) {
-						// Preserve the corrupt database
-						const preserved = await preserveCorruptDatabase(result.failure.dbPath, ANALYSIS_DIR);
+						// Use the known path from error parsing
+						dbToAnalyze = result.failure.dbPath;
+					} else {
+						// For crashes/panics, search for recently modified databases
+						const databases = findSqlancerDatabases(SQLANCER_DIR);
+						if (databases.length > 0) {
+							console.log(`  Found ${databases.length} database(s): ${databases.join(", ")}`);
+							// Use the most recently modified one
+							dbToAnalyze = databases[0];
+						}
+					}
+
+					if (dbToAnalyze) {
+						// Preserve the database
+						const preserved = await preserveCorruptDatabase(dbToAnalyze, ANALYSIS_DIR);
 
 						if (preserved) {
 							const analysis = await analyzeCorruption(preserved);
 							if (analysis) {
 								result.failure.corruptionAnalysis = analysis;
+								console.log(`  Analysis complete: ${analysis.walInfo.totalFrames} WAL frames`);
 							}
 						}
+					} else {
+						console.log("  No database found for analysis");
 					}
 				}
 

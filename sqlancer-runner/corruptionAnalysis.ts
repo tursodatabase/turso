@@ -212,6 +212,51 @@ function runCommand(
 }
 
 /**
+ * Find SQLancer database files in the logs/working directory.
+ * SQLancer creates databases in its logs directory.
+ * Returns paths to any .db files found, sorted by modification time (most recent first).
+ */
+export function findSqlancerDatabases(sqlancerDir: string): string[] {
+	const databases: { path: string; mtime: number }[] = [];
+
+	// Check common locations where SQLancer creates databases
+	const searchDirs = [
+		path.join(sqlancerDir, "logs", "limbo"),
+		path.join(sqlancerDir, "logs"),
+		sqlancerDir,
+		"/tmp",
+	];
+
+	for (const dir of searchDirs) {
+		if (!fs.existsSync(dir)) {
+			continue;
+		}
+
+		try {
+			const files = fs.readdirSync(dir);
+			for (const file of files) {
+				if (file.endsWith(".db")) {
+					const fullPath = path.join(dir, file);
+					// Only include files modified in the last hour (likely from this run)
+					const stats = fs.statSync(fullPath);
+					const ageMs = Date.now() - stats.mtime.getTime();
+					if (ageMs < 60 * 60 * 1000) {
+						databases.push({ path: fullPath, mtime: stats.mtime.getTime() });
+					}
+				}
+			}
+		} catch {
+			// Ignore permission errors, etc.
+		}
+	}
+
+	// Sort by modification time, most recent first
+	databases.sort((a, b) => b.mtime - a.mtime);
+
+	return databases.map(d => d.path);
+}
+
+/**
  * Copy database files to analysis directory for preservation.
  * Returns path to copied database.
  */
