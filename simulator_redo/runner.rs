@@ -11,6 +11,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
+use comfy_table::{Attribute, Cell, Color, ContentArrangement, Table};
 use proptest::strategy::{Strategy, ValueTree};
 use proptest::test_runner::TestRunner;
 use rand::{RngCore, SeedableRng};
@@ -63,6 +64,87 @@ pub struct SimStats {
     pub oracle_failures: usize,
     /// Number of errors encountered.
     pub errors: usize,
+}
+
+impl SimStats {
+    /// Returns true if the simulation completed successfully (no failures).
+    pub fn is_success(&self) -> bool {
+        self.oracle_failures == 0
+    }
+
+    /// Create a colorful table displaying simulation results.
+    pub fn to_table(&self, config: &SimConfig) -> Table {
+        let mut table = Table::new();
+        table.set_content_arrangement(ContentArrangement::Dynamic);
+
+        // Header
+        let status = if self.is_success() {
+            Cell::new("PASSED").fg(Color::Green).add_attribute(Attribute::Bold)
+        } else {
+            Cell::new("FAILED").fg(Color::Red).add_attribute(Attribute::Bold)
+        };
+
+        table.set_header(vec![
+            Cell::new("Simulation Results").add_attribute(Attribute::Bold),
+            status,
+        ]);
+
+        // Config section
+        table.add_row(vec![
+            Cell::new("Seed").fg(Color::Cyan),
+            Cell::new(config.seed),
+        ]);
+        table.add_row(vec![
+            Cell::new("Target Statements").fg(Color::Cyan),
+            Cell::new(config.num_statements),
+        ]);
+
+        // Results section
+        table.add_row(vec![
+            Cell::new("Statements Executed").fg(Color::Blue),
+            Cell::new(self.statements_executed).fg(Color::Blue),
+        ]);
+
+        // Warnings - yellow if any
+        let warnings_cell = if self.warnings > 0 {
+            Cell::new(self.warnings).fg(Color::Yellow)
+        } else {
+            Cell::new(self.warnings).fg(Color::Green)
+        };
+        table.add_row(vec![
+            Cell::new("Warnings").fg(Color::Yellow),
+            warnings_cell,
+        ]);
+
+        // Failures - red if any
+        let failures_cell = if self.oracle_failures > 0 {
+            Cell::new(self.oracle_failures).fg(Color::Red).add_attribute(Attribute::Bold)
+        } else {
+            Cell::new(self.oracle_failures).fg(Color::Green)
+        };
+        table.add_row(vec![
+            Cell::new("Oracle Failures").fg(Color::Red),
+            failures_cell,
+        ]);
+
+        // Errors - red if any
+        let errors_cell = if self.errors > 0 {
+            Cell::new(self.errors).fg(Color::Red)
+        } else {
+            Cell::new(self.errors).fg(Color::Green)
+        };
+        table.add_row(vec![
+            Cell::new("Errors").fg(Color::Red),
+            errors_cell,
+        ]);
+
+        table
+    }
+
+    /// Print the stats as a colorful table to stdout.
+    pub fn print_table(&self, config: &SimConfig) {
+        println!("\n{}", self.to_table(config));
+    }
 }
 
 /// The main simulator.
@@ -127,6 +209,15 @@ impl Simulator {
     pub fn run(&mut self) -> Result<SimStats> {
         let mut stats = SimStats::default();
 
+        let result = self.run_inner(&mut stats);
+
+        // Always print stats table, even on error
+        stats.print_table(&self.config);
+
+        result.map(|()| stats)
+    }
+
+    fn run_inner(&mut self, stats: &mut SimStats) -> Result<()> {
         tracing::info!(
             "Starting simulation with seed={}, tables={}, statements={}",
             self.config.seed,
@@ -134,7 +225,6 @@ impl Simulator {
             self.config.num_statements
         );
 
-        // Step 3: Generate and execute statements
         // Create a deterministic seed for proptest
         let seed_bytes: [u8; 32] = {
             let mut bytes = [0u8; 32];
@@ -212,15 +302,7 @@ impl Simulator {
             }
         }
 
-        tracing::info!(
-            "Simulation complete: {} statements executed, {} warnings, {} failures, {} errors",
-            stats.statements_executed,
-            stats.warnings,
-            stats.oracle_failures,
-            stats.errors
-        );
-
-        Ok(stats)
+        Ok(())
     }
 
     /// Check if a statement is a DDL statement (modifies schema).

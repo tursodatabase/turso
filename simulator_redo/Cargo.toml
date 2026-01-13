@@ -26,6 +26,7 @@ clap = { workspace = true, features = ["derive"] }
 proptest = "1.9"
 indexmap.workspace = true
 parking_lot.workspace = true
+comfy-table = "7"
 
 [lints]
 workspace = true
