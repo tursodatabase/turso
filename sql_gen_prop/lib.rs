@@ -30,7 +30,7 @@ pub use drop_index::DropIndexStatement;
 pub use drop_table::DropTableStatement;
 pub use insert::InsertStatement;
 pub use profile::StatementProfile;
-pub use schema::{Column, DataType, Index, Schema, Table};
+pub use schema::{Column, DataType, Index, Schema, SchemaBuilder, Table};
 pub use select::SelectStatement;
 pub use statement::SqlStatement;
 pub use statement::StatementKind;
@@ -69,7 +69,7 @@ mod tests {
     use proptest::prelude::*;
 
     fn test_schema() -> Schema {
-        Schema::new()
+        SchemaBuilder::new()
             .add_table(Table::new(
                 "users",
                 vec![
@@ -96,6 +96,7 @@ mod tests {
                 vec!["email".to_string()],
             ))
             .add_index(Index::new("idx_posts_user", "posts", vec!["user_id".to_string()]).unique())
+            .build()
     }
 
     proptest! {

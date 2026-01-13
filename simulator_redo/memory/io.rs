@@ -62,11 +62,7 @@ impl SimIO for MemorySimIO {
         tracing::debug!("persist_files: {} files tracked", files.len());
         for (file_path, file) in files.iter() {
             let buf = file.buffer.borrow();
-            tracing::debug!(
-                "  file: {:?}, size: {} bytes",
-                file_path,
-                buf.len()
-            );
+            tracing::debug!("  file: {:?}, size: {} bytes", file_path, buf.len());
             // Only persist database-related files
             if file_path.ends_with(".db")
                 || file_path.ends_with("wal")

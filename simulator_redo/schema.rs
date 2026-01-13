@@ -6,7 +6,7 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use sql_gen_prop::{Column, DataType, Schema, Table};
+use sql_gen_prop::{Column, DataType, Schema, SchemaBuilder, Table};
 
 /// Introspects schema from a database connection.
 pub struct SchemaIntrospector;
@@ -15,31 +15,31 @@ impl SchemaIntrospector {
     /// Introspect schema from a Turso connection.
     pub fn from_turso(conn: &Arc<turso_core::Connection>) -> Result<Schema> {
         let table_names = Self::get_table_names_turso(conn)?;
-        let mut schema = Schema::new();
+        let mut builder = SchemaBuilder::new();
 
         for table_name in table_names {
             let columns = Self::get_columns_turso(conn, &table_name)?;
             if !columns.is_empty() {
-                schema = schema.add_table(Table::new(table_name, columns));
+                builder = builder.add_table(Table::new(table_name, columns));
             }
         }
 
-        Ok(schema)
+        Ok(builder.build())
     }
 
     /// Introspect schema from a SQLite connection.
     pub fn from_sqlite(conn: &rusqlite::Connection) -> Result<Schema> {
         let table_names = Self::get_table_names_sqlite(conn)?;
-        let mut schema = Schema::new();
+        let mut builder = SchemaBuilder::new();
 
         for table_name in table_names {
             let columns = Self::get_columns_sqlite(conn, &table_name)?;
             if !columns.is_empty() {
-                schema = schema.add_table(Table::new(table_name, columns));
+                builder = builder.add_table(Table::new(table_name, columns));
             }
         }
 
-        Ok(schema)
+        Ok(builder.build())
     }
 
     fn get_table_names_turso(conn: &Arc<turso_core::Connection>) -> Result<Vec<String>> {

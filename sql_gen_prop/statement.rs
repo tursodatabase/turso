@@ -2,6 +2,7 @@
 
 use proptest::prelude::*;
 use std::fmt;
+use std::rc::Rc;
 
 use crate::create_index::{CreateIndexStatement, create_index, create_index_for_table};
 use crate::create_table::{CreateTableStatement, create_table};
@@ -106,11 +107,11 @@ impl StatementKind {
 }
 
 /// Helper to create a table-based DML strategy.
-fn table_dml<F>(tables: Vec<Table>, f: F) -> BoxedStrategy<SqlStatement>
+fn table_dml<F>(tables: Rc<Vec<Table>>, f: F) -> BoxedStrategy<SqlStatement>
 where
     F: Fn(&Table) -> BoxedStrategy<SqlStatement> + 'static,
 {
-    proptest::sample::select(tables)
+    proptest::sample::select((*tables).clone())
         .prop_flat_map(move |t| f(&t))
         .boxed()
 }

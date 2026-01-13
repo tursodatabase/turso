@@ -122,7 +122,7 @@ pub fn create_index(schema: &Schema) -> BoxedStrategy<CreateIndexStatement> {
     );
 
     let existing_indexes = schema.index_names();
-    let tables: Vec<Table> = schema.tables.clone();
+    let tables = (*schema.tables).clone();
 
     proptest::sample::select(tables)
         .prop_flat_map(move |table| {

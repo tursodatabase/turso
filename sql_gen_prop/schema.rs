@@ -2,6 +2,7 @@
 
 use std::collections::HashSet;
 use std::fmt;
+use std::rc::Rc;
 
 /// SQL data types supported by the generator.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -114,19 +115,16 @@ impl Index {
     }
 }
 
-/// A schema containing tables and indexes.
-#[derive(Debug, Clone, Default)]
-pub struct Schema {
-    pub tables: Vec<Table>,
-    pub indexes: Vec<Index>,
+/// Builder for constructing a schema.
+#[derive(Debug, Default)]
+pub struct SchemaBuilder {
+    tables: Vec<Table>,
+    indexes: Vec<Index>,
 }
 
-impl Schema {
+impl SchemaBuilder {
     pub fn new() -> Self {
-        Self {
-            tables: Vec::new(),
-            indexes: Vec::new(),
-        }
+        Self::default()
     }
 
     pub fn add_table(mut self, table: Table) -> Self {
@@ -139,6 +137,31 @@ impl Schema {
         self
     }
 
+    pub fn build(self) -> Schema {
+        Schema {
+            tables: Rc::new(self.tables),
+            indexes: Rc::new(self.indexes),
+        }
+    }
+}
+
+/// A schema containing tables and indexes.
+///
+/// Uses `Rc` internally to allow cheap cloning for strategy composition.
+/// Use `SchemaBuilder` to construct a schema.
+#[derive(Debug, Clone)]
+pub struct Schema {
+    pub tables: Rc<Vec<Table>>,
+    pub indexes: Rc<Vec<Index>>,
+}
+
+impl Default for Schema {
+    fn default() -> Self {
+        SchemaBuilder::new().build()
+    }
+}
+
+impl Schema {
     /// Returns all table names in the schema.
     pub fn table_names(&self) -> HashSet<String> {
         self.tables.iter().map(|t| t.name.clone()).collect()

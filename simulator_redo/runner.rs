@@ -226,7 +226,7 @@ impl Simulator {
         }
 
         // Verify each table's columns match
-        for turso_table in &turso_schema.tables {
+        for turso_table in turso_schema.tables.iter() {
             let sqlite_table = sqlite_schema
                 .tables
                 .iter()
