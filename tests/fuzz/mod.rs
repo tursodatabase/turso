@@ -6525,6 +6525,232 @@ mod fuzz_tests {
         }
     }
 
+    /// Fuzz test for DELETE/UPDATE statements with IN/NOT IN subqueries.
+    /// This test generates random DELETE and UPDATE statements using IN/NOT IN subqueries
+    /// and compares results between Limbo and SQLite to ensure correctness.
+    #[turso_macros::test(mvcc)]
+    pub fn dml_subquery_fuzz(db: TempDatabase) {
+        let _ = env_logger::try_init();
+        let (mut rng, seed) = rng_from_time_or_env();
+        log::info!("dml_subquery_fuzz seed: {seed}");
+
+        const NUM_FUZZ_ITERATIONS: usize = 500;
+        const MAX_ROWS_PER_TABLE: usize = 50;
+        const MIN_ROWS_PER_TABLE: usize = 5;
+
+        let limbo_conn = db.connect_limbo();
+        let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let mut debug_ddl_dml_string = String::new();
+
+        // Create two related tables for subquery testing
+        let table_schemas = [
+            "CREATE TABLE main_data (id INTEGER PRIMARY KEY, value INTEGER, category INTEGER);",
+            "CREATE TABLE ref_data (ref_id INTEGER);",
+        ];
+
+        for schema in &table_schemas {
+            debug_ddl_dml_string.push_str(schema);
+            debug_ddl_dml_string.push('\n');
+            limbo_exec_rows(&limbo_conn, schema);
+            sqlite_exec_rows(&sqlite_conn, schema);
+        }
+
+        // Helper function to populate tables with random data
+        fn populate_tables(
+            limbo_conn: &std::sync::Arc<turso_core::Connection>,
+            sqlite_conn: &rusqlite::Connection,
+            rng: &mut ChaCha8Rng,
+            debug_string: &mut String,
+            min_rows: usize,
+            max_rows: usize,
+        ) {
+            // Populate main_data
+            let num_main_rows = rng.random_range(min_rows..=max_rows);
+            for i in 1..=num_main_rows {
+                let insert_sql = format!(
+                    "INSERT INTO main_data VALUES ({}, {}, {});",
+                    i,
+                    rng.random_range(-100..100),
+                    rng.random_range(1..10)
+                );
+                debug_string.push_str(&insert_sql);
+                debug_string.push('\n');
+                limbo_exec_rows(limbo_conn, &insert_sql);
+                sqlite_exec_rows(sqlite_conn, &insert_sql);
+            }
+
+            // Populate ref_data with subset of main_data ids and some NULLs
+            let num_ref_rows = rng.random_range(min_rows / 2..=max_rows / 2);
+            for _ in 0..num_ref_rows {
+                let ref_val = if rng.random_bool(0.1) {
+                    "NULL".to_string()
+                } else {
+                    rng.random_range(1..=num_main_rows as i64).to_string()
+                };
+                let insert_sql = format!("INSERT INTO ref_data VALUES ({});", ref_val);
+                debug_string.push_str(&insert_sql);
+                debug_string.push('\n');
+                limbo_exec_rows(limbo_conn, &insert_sql);
+                sqlite_exec_rows(sqlite_conn, &insert_sql);
+            }
+        }
+
+        // Helper to verify both databases have identical state
+        fn verify_tables_match(
+            limbo_conn: &std::sync::Arc<turso_core::Connection>,
+            sqlite_conn: &rusqlite::Connection,
+            query: &str,
+            seed: u64,
+            debug_string: &str,
+        ) {
+            let verify_query = "SELECT * FROM main_data ORDER BY id";
+            let limbo_rows = limbo_exec_rows(limbo_conn, verify_query);
+            let sqlite_rows = sqlite_exec_rows(sqlite_conn, verify_query);
+
+            if limbo_rows != sqlite_rows {
+                panic!(
+                    "Results mismatch after query: {query}\n\
+                     Limbo main_data: {limbo_rows:?}\n\
+                     SQLite main_data: {sqlite_rows:?}\n\
+                     Seed: {seed}\n\n\
+                     DDL/DML to reproduce:\n{debug_string}"
+                );
+            }
+        }
+
+        populate_tables(
+            &limbo_conn,
+            &sqlite_conn,
+            &mut rng,
+            &mut debug_ddl_dml_string,
+            MIN_ROWS_PER_TABLE,
+            MAX_ROWS_PER_TABLE,
+        );
+
+        log::info!("DDL/DML to reproduce manually:\n{debug_ddl_dml_string}");
+
+        for iter_num in 0..NUM_FUZZ_ITERATIONS {
+            let query_type = rng.random_range(0..6);
+            let query = match query_type {
+                0 => {
+                    // DELETE with IN subquery
+                    let subquery_filter = if rng.random_bool(0.5) {
+                        " WHERE ref_id IS NOT NULL"
+                    } else {
+                        ""
+                    };
+                    format!(
+                        "DELETE FROM main_data WHERE id IN (SELECT ref_id FROM ref_data{});",
+                        subquery_filter
+                    )
+                }
+                1 => {
+                    // DELETE with NOT IN subquery
+                    let subquery_filter = if rng.random_bool(0.5) {
+                        " WHERE ref_id IS NOT NULL"
+                    } else {
+                        ""
+                    };
+                    format!(
+                        "DELETE FROM main_data WHERE id NOT IN (SELECT ref_id FROM ref_data{});",
+                        subquery_filter
+                    )
+                }
+                2 => {
+                    // UPDATE with IN subquery
+                    let new_value = rng.random_range(-1000..1000);
+                    let subquery_filter = if rng.random_bool(0.5) {
+                        " WHERE ref_id IS NOT NULL"
+                    } else {
+                        ""
+                    };
+                    format!(
+                        "UPDATE main_data SET value = {} WHERE id IN (SELECT ref_id FROM ref_data{});",
+                        new_value, subquery_filter
+                    )
+                }
+                3 => {
+                    // UPDATE with NOT IN subquery
+                    let new_value = rng.random_range(-1000..1000);
+                    let subquery_filter = if rng.random_bool(0.5) {
+                        " WHERE ref_id IS NOT NULL"
+                    } else {
+                        ""
+                    };
+                    format!(
+                        "UPDATE main_data SET value = {} WHERE id NOT IN (SELECT ref_id FROM ref_data{});",
+                        new_value, subquery_filter
+                    )
+                }
+                4 => {
+                    // DELETE with IN subquery + additional condition
+                    let category = rng.random_range(1..10);
+                    format!(
+                        "DELETE FROM main_data WHERE category = {} AND id IN (SELECT ref_id FROM ref_data WHERE ref_id IS NOT NULL);",
+                        category
+                    )
+                }
+                5 => {
+                    // UPDATE with NOT IN subquery + additional condition
+                    let new_value = rng.random_range(-1000..1000);
+                    let category = rng.random_range(1..10);
+                    format!(
+                        "UPDATE main_data SET value = {} WHERE category = {} AND id NOT IN (SELECT ref_id FROM ref_data WHERE ref_id IS NOT NULL);",
+                        new_value, category
+                    )
+                }
+                _ => unreachable!(),
+            };
+
+            log::info!(
+                "Iteration {}/{NUM_FUZZ_ITERATIONS}: Query: {query}",
+                iter_num + 1,
+            );
+
+            debug_ddl_dml_string.push_str(&query);
+            debug_ddl_dml_string.push('\n');
+
+            // Execute on both databases
+            limbo_exec_rows(&limbo_conn, &query);
+            sqlite_conn.execute(&query, params![]).unwrap();
+
+            // Verify tables match
+            verify_tables_match(
+                &limbo_conn,
+                &sqlite_conn,
+                &query,
+                seed,
+                &debug_ddl_dml_string,
+            );
+
+            // Periodically repopulate tables to ensure we have data to work with
+            if iter_num % 50 == 49 {
+                // Clear and repopulate
+                limbo_exec_rows(&limbo_conn, "DELETE FROM main_data;");
+                sqlite_conn
+                    .execute("DELETE FROM main_data;", params![])
+                    .unwrap();
+                limbo_exec_rows(&limbo_conn, "DELETE FROM ref_data;");
+                sqlite_conn
+                    .execute("DELETE FROM ref_data;", params![])
+                    .unwrap();
+
+                debug_ddl_dml_string.push_str("DELETE FROM main_data;\n");
+                debug_ddl_dml_string.push_str("DELETE FROM ref_data;\n");
+
+                populate_tables(
+                    &limbo_conn,
+                    &sqlite_conn,
+                    &mut rng,
+                    &mut debug_ddl_dml_string,
+                    MIN_ROWS_PER_TABLE,
+                    MAX_ROWS_PER_TABLE,
+                );
+            }
+        }
+    }
+
     #[derive(Clone, Debug)]
     struct FuzzTestColumn {
         name: String,
