@@ -33,6 +33,7 @@ pub use profile::StatementProfile;
 pub use schema::{Column, DataType, Index, Schema, Table};
 pub use select::SelectStatement;
 pub use statement::SqlStatement;
+pub use statement::StatementKind;
 pub use update::UpdateStatement;
 pub use value::SqlValue;
 

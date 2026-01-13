@@ -15,7 +15,9 @@ use crate::select::{SelectStatement, select_for_table};
 use crate::update::{UpdateStatement, update_for_table};
 
 /// Union of all supported SQL statements.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, strum::EnumDiscriminants)]
+#[strum_discriminants(name(StatementKind), vis(pub))]
+#[strum_discriminants(derive(strum::EnumIter))]
 pub enum SqlStatement {
     Select(SelectStatement),
     Insert(InsertStatement),
@@ -38,6 +40,67 @@ impl fmt::Display for SqlStatement {
             SqlStatement::CreateIndex(s) => write!(f, "{s}"),
             SqlStatement::DropTable(s) => write!(f, "{s}"),
             SqlStatement::DropIndex(s) => write!(f, "{s}"),
+        }
+    }
+}
+
+impl StatementKind {
+    /// Returns true if this statement kind can be generated for the given schema.
+    pub fn is_available(&self, schema: &Schema) -> bool {
+        match self {
+            // DML and most DDL require tables
+            StatementKind::Select
+            | StatementKind::Insert
+            | StatementKind::Update
+            | StatementKind::Delete
+            | StatementKind::CreateIndex
+            | StatementKind::DropTable => !schema.tables.is_empty(),
+            // DROP INDEX requires indexes
+            StatementKind::DropIndex => !schema.indexes.is_empty(),
+            // CREATE TABLE is always available
+            StatementKind::CreateTable => true,
+        }
+    }
+
+    /// Builds a strategy for generating this statement kind.
+    ///
+    /// Caller must ensure `is_available(schema)` returns true before calling this.
+    pub fn strategy(&self, schema: &Schema) -> BoxedStrategy<SqlStatement> {
+        let tables = schema.tables.clone();
+        match self {
+            StatementKind::Select => table_dml(tables, |t| {
+                select_for_table(t).prop_map(SqlStatement::Select).boxed()
+            }),
+            StatementKind::Insert => table_dml(tables, |t| {
+                insert_for_table(t).prop_map(SqlStatement::Insert).boxed()
+            }),
+            StatementKind::Update => table_dml(tables, |t| {
+                update_for_table(t).prop_map(SqlStatement::Update).boxed()
+            }),
+            StatementKind::Delete => table_dml(tables, |t| {
+                delete_for_table(t).prop_map(SqlStatement::Delete).boxed()
+            }),
+            StatementKind::CreateIndex => create_index(schema)
+                .prop_map(SqlStatement::CreateIndex)
+                .boxed(),
+            StatementKind::DropTable => drop_table_for_schema(schema)
+                .prop_map(SqlStatement::DropTable)
+                .boxed(),
+            StatementKind::CreateTable => create_table(schema)
+                .prop_map(SqlStatement::CreateTable)
+                .boxed(),
+            StatementKind::DropIndex => {
+                let index_names: Vec<String> =
+                    schema.indexes.iter().map(|i| i.name.clone()).collect();
+                (proptest::sample::select(index_names), any::<bool>())
+                    .prop_map(|(name, if_exists)| {
+                        SqlStatement::DropIndex(DropIndexStatement {
+                            index_name: name,
+                            if_exists,
+                        })
+                    })
+                    .boxed()
+            }
         }
     }
 }
@@ -95,100 +158,18 @@ pub fn dml_for_schema(schema: &Schema) -> BoxedStrategy<SqlStatement> {
 /// When `profile` is `None`, uses default weights for all applicable statement types.
 /// When `profile` is `Some`, uses the specified weights to control statement distribution.
 ///
-/// This respects schema constraints:
-/// - DML statements require tables to exist
-/// - CREATE INDEX requires tables to exist
-/// - DROP TABLE requires tables to exist
-/// - DROP INDEX requires indexes to exist
-/// - CREATE TABLE is always available
+/// Schema constraints are enforced via `StatementKind::is_available`.
 pub fn statement_for_schema(
     schema: &Schema,
     profile: Option<&StatementProfile>,
 ) -> BoxedStrategy<SqlStatement> {
     let p = profile.cloned().unwrap_or_default();
-    let tables = schema.tables.clone();
-    let has_tables = !tables.is_empty();
-    let index_names: Vec<String> = schema.indexes.iter().map(|i| i.name.clone()).collect();
 
-    // Build weighted strategies conditionally to avoid constructing invalid strategies
-    let mut strategies: Vec<(u32, BoxedStrategy<SqlStatement>)> = Vec::new();
-
-    // DML (require tables)
-    if has_tables {
-        if p.select_weight > 0 {
-            strategies.push((
-                p.select_weight,
-                table_dml(tables.clone(), |t| {
-                    select_for_table(t).prop_map(SqlStatement::Select).boxed()
-                }),
-            ));
-        }
-        if p.insert_weight > 0 {
-            strategies.push((
-                p.insert_weight,
-                table_dml(tables.clone(), |t| {
-                    insert_for_table(t).prop_map(SqlStatement::Insert).boxed()
-                }),
-            ));
-        }
-        if p.update_weight > 0 {
-            strategies.push((
-                p.update_weight,
-                table_dml(tables.clone(), |t| {
-                    update_for_table(t).prop_map(SqlStatement::Update).boxed()
-                }),
-            ));
-        }
-        if p.delete_weight > 0 {
-            strategies.push((
-                p.delete_weight,
-                table_dml(tables.clone(), |t| {
-                    delete_for_table(t).prop_map(SqlStatement::Delete).boxed()
-                }),
-            ));
-        }
-        if p.create_index_weight > 0 {
-            strategies.push((
-                p.create_index_weight,
-                create_index(schema)
-                    .prop_map(SqlStatement::CreateIndex)
-                    .boxed(),
-            ));
-        }
-        if p.drop_table_weight > 0 {
-            strategies.push((
-                p.drop_table_weight,
-                drop_table_for_schema(schema)
-                    .prop_map(SqlStatement::DropTable)
-                    .boxed(),
-            ));
-        }
-    }
-
-    // CREATE TABLE is always available
-    if p.create_table_weight > 0 {
-        strategies.push((
-            p.create_table_weight,
-            create_table(schema)
-                .prop_map(SqlStatement::CreateTable)
-                .boxed(),
-        ));
-    }
-
-    // DROP INDEX requires indexes to exist
-    if !index_names.is_empty() && p.drop_index_weight > 0 {
-        strategies.push((
-            p.drop_index_weight,
-            (proptest::sample::select(index_names), any::<bool>())
-                .prop_map(|(name, if_exists)| {
-                    SqlStatement::DropIndex(DropIndexStatement {
-                        index_name: name,
-                        if_exists,
-                    })
-                })
-                .boxed(),
-        ));
-    }
+    let strategies: Vec<(u32, BoxedStrategy<SqlStatement>)> = p
+        .enabled_statements()
+        .filter(|(kind, _)| kind.is_available(schema))
+        .map(|(kind, weight)| (weight, kind.strategy(schema)))
+        .collect();
 
     assert!(
         !strategies.is_empty(),

@@ -3,6 +3,10 @@
 //! Profiles allow fine-grained control over which types of statements are
 //! generated and with what relative frequency.
 
+use strum::IntoEnumIterator;
+
+use crate::statement::StatementKind;
+
 /// Profile controlling SQL statement generation weights.
 ///
 /// Each weight determines the relative probability of generating that
@@ -202,6 +206,27 @@ impl StatementProfile {
     /// Returns true if any DDL statement is enabled.
     pub fn has_ddl(&self) -> bool {
         self.ddl_weight() > 0
+    }
+
+    /// Returns the weight for a given statement kind.
+    pub fn weight_for(&self, kind: StatementKind) -> u32 {
+        match kind {
+            StatementKind::Select => self.select_weight,
+            StatementKind::Insert => self.insert_weight,
+            StatementKind::Update => self.update_weight,
+            StatementKind::Delete => self.delete_weight,
+            StatementKind::CreateTable => self.create_table_weight,
+            StatementKind::CreateIndex => self.create_index_weight,
+            StatementKind::DropTable => self.drop_table_weight,
+            StatementKind::DropIndex => self.drop_index_weight,
+        }
+    }
+
+    /// Returns an iterator over all statement kinds with weight > 0.
+    pub fn enabled_statements(&self) -> impl Iterator<Item = (StatementKind, u32)> + '_ {
+        StatementKind::iter()
+            .map(|kind| (kind, self.weight_for(kind)))
+            .filter(|(_, w)| *w > 0)
     }
 }
 
