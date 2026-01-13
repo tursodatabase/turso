@@ -816,6 +816,7 @@ impl Connection {
                 mv_store.clone(),
                 self.clone(),
                 true,
+                self.get_sync_mode(),
             ));
             io.as_ref().block(|| ckpt_sm.step(&()))
         } else {
