@@ -1230,9 +1230,7 @@ fn test_integrity_check_freeblock_out_of_range(db: TempDatabase) {
             );
         }
         Err(panic_msg) => {
-            panic!(
-                "Expected integrity_check to return an error, but it panicked: {panic_msg}"
-            );
+            panic!("Expected integrity_check to return an error, but it panicked: {panic_msg}");
         }
     }
 }
@@ -1314,9 +1312,7 @@ fn test_integrity_check_row_missing_from_index(db: TempDatabase) {
             );
         }
         Err(panic_msg) => {
-            panic!(
-                "Expected integrity_check to return error, but it panicked: {panic_msg}"
-            );
+            panic!("Expected integrity_check to return error, but it panicked: {panic_msg}");
         }
     }
 }
