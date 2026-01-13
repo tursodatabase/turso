@@ -1144,6 +1144,76 @@ do_execsql_test_in_memory_any_error duplicate-with-cte-name {
   WITH t as (SELECT 1), t as (SELECT 2)  SELECT  * FROM t2;
 }
 
+# CTE referenced multiple times (issue: CTE cannot be referenced multiple times)
+do_execsql_test_on_specific_db {:memory:} cte-multiple-refs-basic {
+  WITH t AS (SELECT 1 as x) SELECT * FROM t, t as t2;
+} {1|1}
+
+do_execsql_test_on_specific_db {:memory:} cte-multiple-refs-self-join {
+  WITH t AS (SELECT 1 as x) SELECT * FROM t JOIN t as t2 ON t.x = t2.x;
+} {1|1}
+
+do_execsql_test_on_specific_db {:memory:} cte-multiple-refs-scalar-subquery {
+  WITH t AS (SELECT 1 as x) SELECT (SELECT MAX(x) FROM t) as mx, t.x FROM t;
+} {1|1}
+
+do_execsql_test_on_specific_db {:memory:} cte-multiple-refs-where-subquery {
+  WITH t AS (SELECT 1 as x, 2 as y) SELECT * FROM t WHERE x IN (SELECT x FROM t);
+} {1|2}
+
+do_execsql_test_on_specific_db {:memory:} cte-multiple-refs-with-data {
+  CREATE TABLE items(id INTEGER PRIMARY KEY, val INTEGER);
+  INSERT INTO items VALUES (1, 10), (2, 20), (3, 30);
+  WITH cte AS (SELECT * FROM items WHERE val >= 20)
+  SELECT a.id, b.id FROM cte a, cte b WHERE a.id <= b.id ORDER BY a.id, b.id;
+} {2|2
+2|3
+3|3}
+
+# Test CTEs with transitive dependencies and multiple references
+# (b references a, c references b twice but not a directly)
+do_execsql_test_on_specific_db {:memory:} cte-transitive-deps-multi-ref {
+  WITH
+    a AS (SELECT 1 as x),
+    b AS (SELECT x + 1 as y FROM a),
+    c AS (SELECT b1.y, b2.y FROM b as b1, b as b2)
+  SELECT * FROM c;
+} {2|2}
+
+# Test CTE chain where later CTE references multiple earlier CTEs
+do_execsql_test_on_specific_db {:memory:} cte-multiple-deps {
+  WITH
+    a AS (SELECT 1 as x),
+    b AS (SELECT 2 as y),
+    c AS (SELECT x, y FROM a, b)
+  SELECT * FROM c;
+} {1|2}
+
+# Multiple CTEs all referencing the same base CTE
+do_execsql_test_on_specific_db {:memory:} cte-fan-out-refs {
+  WITH
+    base AS (SELECT 1 as x),
+    a AS (SELECT x FROM base),
+    b AS (SELECT x FROM base),
+    c AS (SELECT x FROM base)
+  SELECT a.x + b.x + c.x FROM a, b, c;
+} {3}
+
+# Deep transitive chain with multiple references at the end
+do_execsql_test_on_specific_db {:memory:} cte-deep-chain-multi-ref {
+  WITH
+    a AS (SELECT 1 as v),
+    b AS (SELECT v*2 as v FROM a),
+    c AS (SELECT v*2 as v FROM b),
+    d AS (SELECT d1.v, d2.v FROM c d1, c d2)
+  SELECT * FROM d;
+} {4|4}
+
+# CTE referenced in JOIN ON clause
+do_execsql_test_on_specific_db {:memory:} cte-join-on-clause {
+  WITH t AS (SELECT 1 as x) SELECT * FROM t t1 JOIN t t2 ON t1.x = t2.x;
+} {1|1}
+
 do_execsql_test_on_specific_db {:memory:} collation-rtrim-1 {
   SELECT 'x' || CHAR(9) = 'x' COLLATE RTRIM;
 } {0}
