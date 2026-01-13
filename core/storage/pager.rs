@@ -1200,17 +1200,6 @@ pub struct VacuumState {
 }
 
 #[derive(Debug, Clone)]
-/// The status of the current cache flush.
-pub enum PagerCommitResult {
-    /// The WAL was written to disk and fsynced.
-    WalWritten,
-    /// The WAL was written, fsynced, and a checkpoint was performed.
-    /// The database file was then also fsynced.
-    Checkpointed(CheckpointResult),
-    Rollback,
-}
-
-#[derive(Debug, Clone)]
 enum AllocatePageState {
     Start,
     /// Search the trunk page for an available free list leaf.
@@ -1270,7 +1259,6 @@ enum SpillState {
         completions: Vec<Completion>,
     },
 }
-
 enum CacheFlushStep {
     /// Yield to caller with pending I/O, resume with given phase
     Yield(CacheFlushState, IOCompletions),
@@ -2193,33 +2181,58 @@ impl Pager {
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
-    pub fn commit_tx(&self, connection: &Connection) -> Result<IOResult<PagerCommitResult>> {
+    pub fn commit_tx(&self, connection: &Connection) -> Result<IOResult<()>> {
         if connection.is_nested_stmt() {
             // Parent statement will handle the transaction commit.
-            return Ok(IOResult::Done(PagerCommitResult::Rollback));
+            return Ok(IOResult::Done(()));
         }
         let Some(wal) = self.wal.as_ref() else {
             // TODO: Unsure what the semantics of "end_tx" is for in-memory databases, ephemeral tables and ephemeral indexes.
-            return Ok(IOResult::Done(PagerCommitResult::Rollback));
+            return Ok(IOResult::Done(()));
         };
+
         let (_, schema_did_change) = match connection.get_tx_state() {
             TransactionState::Write { schema_did_change } => (true, schema_did_change),
             _ => (false, false),
         };
-        tracing::trace!("commit_tx(schema_did_change={})", schema_did_change);
-        let commit_status = return_if_io!(self.commit_dirty_pages(
-            connection.is_wal_auto_checkpoint_disabled(),
-            connection.get_sync_mode(),
-            connection.get_data_sync_retry()
-        ));
-        wal.end_write_tx();
-        wal.end_read_tx();
+
+        loop {
+            let commit_state = self.commit_info.read().state;
+            tracing::debug!("commit_state: {:?}", commit_state);
+            match commit_state {
+                CommitState::AutoCheckpoint => {
+                    return_if_io!(self.checkpoint(
+                        CheckpointMode::Passive {
+                            upper_bound_inclusive: None,
+                        },
+                        connection.get_sync_mode(),
+                        true,
+                    ));
+                    self.commit_dirty_pages_end();
+                    break;
+                }
+                _ => {
+                    return_if_io!(self.commit_dirty_pages(
+                        connection.is_wal_auto_checkpoint_disabled(),
+                        connection.get_sync_mode(),
+                        connection.get_data_sync_retry()
+                    ));
+                    wal.end_write_tx();
+                    wal.end_read_tx();
+
+                    if self.commit_info.read().state != CommitState::AutoCheckpoint {
+                        self.commit_dirty_pages_end();
+                        break;
+                    }
+                }
+            }
+        }
 
         if schema_did_change {
             let schema = connection.schema.read().clone();
             connection.db.update_schema_if_newer(schema);
         }
-        Ok(IOResult::Done(commit_status))
+        Ok(IOResult::Done(()))
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
@@ -2962,7 +2975,7 @@ impl Pager {
         wal_auto_checkpoint_disabled: bool,
         sync_mode: SyncMode,
         data_sync_retry: bool,
-    ) -> Result<IOResult<PagerCommitResult>> {
+    ) -> Result<IOResult<()>> {
         {
             let mut commit_info = self.commit_info.write();
             if commit_info.state == CommitState::PrepareWal {
@@ -2975,17 +2988,16 @@ impl Pager {
             return Ok(IOResult::IO(c));
         }
 
-        match self.commit_dirty_pages_inner(
-            wal_auto_checkpoint_disabled,
-            sync_mode,
-            data_sync_retry,
-        ) {
-            r @ (Ok(IOResult::Done(..)) | Err(..)) => {
-                self.commit_info.write().reset();
-                r
-            }
-            Ok(IOResult::IO(io)) => Ok(IOResult::IO(io)),
+        let result =
+            self.commit_dirty_pages_inner(wal_auto_checkpoint_disabled, sync_mode, data_sync_retry);
+        if let Err(..) = &result {
+            self.commit_info.write().reset();
         }
+        result
+    }
+
+    pub fn commit_dirty_pages_end(&self) {
+        self.commit_info.write().reset();
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
@@ -2994,7 +3006,7 @@ impl Pager {
         wal_auto_checkpoint_disabled: bool,
         sync_mode: SyncMode,
         data_sync_retry: bool,
-    ) -> Result<IOResult<PagerCommitResult>> {
+    ) -> Result<IOResult<()>> {
         let Some(wal) = self.wal.as_ref() else {
             return Err(LimboError::InternalError(
                 "commit_dirty_pages() called without WAL".into(),
@@ -3036,7 +3048,7 @@ impl Pager {
                     let dirty_pages = self.dirty_pages.read();
 
                     if dirty_pages.is_empty() {
-                        return Ok(IOResult::Done(PagerCommitResult::WalWritten));
+                        return Ok(IOResult::Done(()));
                     }
                     commit_info.initialize(dirty_pages.len() as usize);
                     let mut cache = self.page_cache.write();
@@ -3134,7 +3146,7 @@ impl Pager {
                             self.dirty_pages.read().is_empty(),
                             "dirty pages must be empty if no frames prepared"
                         );
-                        return Ok(IOResult::Done(PagerCommitResult::WalWritten));
+                        return Ok(IOResult::Done(()));
                     }
                     // Submit all WAL writes
                     let wal_file = wal.wal_file()?;
@@ -3224,32 +3236,13 @@ impl Pager {
                     self.dirty_pages.write().clear();
                     commit_info.prepared_frames.clear();
 
-                    if wal_auto_checkpoint_disabled || !wal.should_checkpoint() {
-                        return Ok(IOResult::Done(PagerCommitResult::WalWritten));
+                    let need_checkpoint = !wal_auto_checkpoint_disabled && wal.should_checkpoint();
+                    if need_checkpoint {
+                        commit_info.state = CommitState::AutoCheckpoint;
                     }
-                    commit_info.state = CommitState::AutoCheckpoint;
+                    return Ok(IOResult::Done(()));
                 }
-                CommitState::AutoCheckpoint => {
-                    let checkpoint_mode = CheckpointMode::Passive {
-                        upper_bound_inclusive: None,
-                    };
-                    match self.checkpoint(checkpoint_mode, sync_mode, false) {
-                        Err(LimboError::Busy) => {
-                            tracing::debug!("Auto-checkpoint skipped: busy");
-                            return Ok(IOResult::Done(PagerCommitResult::WalWritten));
-                        }
-                        Err(e) => {
-                            tracing::error!("Auto-checkpoint failed: {}", e);
-                            return Err(LimboError::CheckpointFailed(e.to_string()));
-                        }
-                        Ok(IOResult::IO(IOCompletions::Single(c))) => {
-                            io_yield_one!(c);
-                        }
-                        Ok(IOResult::Done(res)) => {
-                            return Ok(IOResult::Done(PagerCommitResult::Checkpointed(res)));
-                        }
-                    }
-                }
+                CommitState::AutoCheckpoint => panic!("checkpoint must be handled externally"),
             }
         }
     }

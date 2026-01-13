@@ -767,6 +767,8 @@ impl Connection {
     /// All frames written after last commit frame (db_size > 0) within the session will be rolled back
     #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
     pub fn wal_insert_end(self: &Arc<Connection>, force_commit: bool) -> Result<()> {
+        use crate::{return_if_io, types::IOResult};
+
         {
             let pager = self.pager.load();
 
@@ -780,11 +782,13 @@ impl Connection {
                 pager
                     .io
                     .block(|| {
-                        pager.commit_dirty_pages(
+                        return_if_io!(pager.commit_dirty_pages(
                             true,
                             self.get_sync_mode(),
                             self.get_data_sync_retry(),
-                        )
+                        ));
+                        pager.commit_dirty_pages_end();
+                        Ok(IOResult::Done(()))
                     })
                     .err()
             } else {
