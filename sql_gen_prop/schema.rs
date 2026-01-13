@@ -1,5 +1,6 @@
 //! Schema types for defining database structure.
 
+use std::collections::HashSet;
 use std::fmt;
 
 /// SQL data types supported by the generator.
@@ -84,19 +85,80 @@ impl Table {
     }
 }
 
-/// A schema containing multiple tables.
+/// An index definition in a schema.
+#[derive(Debug, Clone)]
+pub struct Index {
+    pub name: String,
+    pub table_name: String,
+    pub columns: Vec<String>,
+    pub unique: bool,
+}
+
+impl Index {
+    pub fn new(
+        name: impl Into<String>,
+        table_name: impl Into<String>,
+        columns: Vec<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            table_name: table_name.into(),
+            columns,
+            unique: false,
+        }
+    }
+
+    pub fn unique(mut self) -> Self {
+        self.unique = true;
+        self
+    }
+}
+
+/// A schema containing tables and indexes.
 #[derive(Debug, Clone, Default)]
 pub struct Schema {
     pub tables: Vec<Table>,
+    pub indexes: Vec<Index>,
 }
 
 impl Schema {
     pub fn new() -> Self {
-        Self { tables: Vec::new() }
+        Self {
+            tables: Vec::new(),
+            indexes: Vec::new(),
+        }
     }
 
     pub fn add_table(mut self, table: Table) -> Self {
         self.tables.push(table);
         self
+    }
+
+    pub fn add_index(mut self, index: Index) -> Self {
+        self.indexes.push(index);
+        self
+    }
+
+    /// Returns all table names in the schema.
+    pub fn table_names(&self) -> HashSet<String> {
+        self.tables.iter().map(|t| t.name.clone()).collect()
+    }
+
+    /// Returns all index names in the schema.
+    pub fn index_names(&self) -> HashSet<String> {
+        self.indexes.iter().map(|i| i.name.clone()).collect()
+    }
+
+    /// Returns a table by name.
+    pub fn get_table(&self, name: &str) -> Option<&Table> {
+        self.tables.iter().find(|t| t.name == name)
+    }
+
+    /// Returns indexes for a specific table.
+    pub fn indexes_for_table(&self, table_name: &str) -> Vec<&Index> {
+        self.indexes
+            .iter()
+            .filter(|i| i.table_name == table_name)
+            .collect()
     }
 }
