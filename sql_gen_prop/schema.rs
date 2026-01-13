@@ -115,11 +115,29 @@ impl Index {
     }
 }
 
+/// A view definition in a schema.
+#[derive(Debug, Clone)]
+pub struct View {
+    pub name: String,
+    /// The SELECT statement that defines the view.
+    pub select_sql: String,
+}
+
+impl View {
+    pub fn new(name: impl Into<String>, select_sql: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            select_sql: select_sql.into(),
+        }
+    }
+}
+
 /// Builder for constructing a schema.
 #[derive(Debug, Default)]
 pub struct SchemaBuilder {
     tables: Vec<Table>,
     indexes: Vec<Index>,
+    views: Vec<View>,
 }
 
 impl SchemaBuilder {
@@ -137,15 +155,21 @@ impl SchemaBuilder {
         self
     }
 
+    pub fn add_view(mut self, view: View) -> Self {
+        self.views.push(view);
+        self
+    }
+
     pub fn build(self) -> Schema {
         Schema {
             tables: Rc::new(self.tables),
             indexes: Rc::new(self.indexes),
+            views: Rc::new(self.views),
         }
     }
 }
 
-/// A schema containing tables and indexes.
+/// A schema containing tables, indexes, and views.
 ///
 /// Uses `Rc` internally to allow cheap cloning for strategy composition.
 /// Use `SchemaBuilder` to construct a schema.
@@ -153,6 +177,7 @@ impl SchemaBuilder {
 pub struct Schema {
     pub tables: Rc<Vec<Table>>,
     pub indexes: Rc<Vec<Index>>,
+    pub views: Rc<Vec<View>>,
 }
 
 impl Default for Schema {
@@ -172,9 +197,19 @@ impl Schema {
         self.indexes.iter().map(|i| i.name.clone()).collect()
     }
 
+    /// Returns all view names in the schema.
+    pub fn view_names(&self) -> HashSet<String> {
+        self.views.iter().map(|v| v.name.clone()).collect()
+    }
+
     /// Returns a table by name.
     pub fn get_table(&self, name: &str) -> Option<&Table> {
         self.tables.iter().find(|t| t.name == name)
+    }
+
+    /// Returns a view by name.
+    pub fn get_view(&self, name: &str) -> Option<&View> {
+        self.views.iter().find(|v| v.name == name)
     }
 
     /// Returns indexes for a specific table.

@@ -1,11 +1,17 @@
 //! SQL generation library using proptest.
 //!
 //! This crate provides composable strategies for generating valid SQL statements
-//! given a schema definition. It supports SELECT, INSERT, UPDATE, DELETE,
-//! CREATE TABLE, CREATE INDEX, DROP TABLE, and DROP INDEX operations.
+//! given a schema definition. It supports:
+//!
+//! - **DML**: SELECT, INSERT, UPDATE, DELETE
+//! - **DDL**: CREATE TABLE, CREATE INDEX, DROP TABLE, DROP INDEX, ALTER TABLE,
+//!   CREATE VIEW, DROP VIEW
+//! - **Transaction control**: BEGIN, COMMIT, ROLLBACK, SAVEPOINT, RELEASE
+//! - **Utility**: VACUUM, ANALYZE, REINDEX
 //!
 //! All DDL generators are schema-aware to avoid naming conflicts.
 
+pub mod alter_table;
 pub mod condition;
 pub mod create_index;
 pub mod create_table;
@@ -18,10 +24,14 @@ pub mod result;
 pub mod schema;
 pub mod select;
 pub mod statement;
+pub mod transaction;
 pub mod update;
+pub mod utility;
 pub mod value;
+pub mod view;
 
 // Re-export main types for convenience
+pub use alter_table::{AlterTableOp, AlterTableStatement};
 pub use condition::{ComparisonOp, Condition, LogicalOp, OrderByItem, OrderDirection};
 pub use create_index::{CreateIndexStatement, IndexColumn};
 pub use create_table::{ColumnDef, CreateTableStatement};
@@ -30,37 +40,67 @@ pub use drop_index::DropIndexStatement;
 pub use drop_table::DropTableStatement;
 pub use insert::InsertStatement;
 pub use profile::StatementProfile;
-pub use schema::{Column, DataType, Index, Schema, SchemaBuilder, Table};
+pub use schema::{Column, DataType, Index, Schema, SchemaBuilder, Table, View};
 pub use select::SelectStatement;
 pub use statement::SqlStatement;
 pub use statement::StatementKind;
+pub use transaction::{
+    BeginStatement, CommitStatement, ReleaseStatement, RollbackStatement, SavepointStatement,
+    TransactionType,
+};
 pub use update::UpdateStatement;
+pub use utility::{AnalyzeStatement, ReindexStatement, VacuumStatement};
 pub use value::SqlValue;
+pub use view::{CreateViewStatement, DropViewStatement};
 
 /// Strategies for generating SQL values and statements.
 pub mod strategies {
+    // ALTER TABLE
+    pub use crate::alter_table::{
+        alter_table_add_column, alter_table_drop_column, alter_table_for_schema,
+        alter_table_for_table, alter_table_rename_column, alter_table_rename_to,
+    };
+    // Conditions
     pub use crate::condition::{
         comparison_op, condition_for_table, logical_op, optional_where_clause, order_by_for_table,
         order_direction, simple_condition,
     };
+    // CREATE INDEX
     pub use crate::create_index::{create_index, create_index_for_table, index_column};
+    // CREATE TABLE
     pub use crate::create_table::{
         column_def, create_table, data_type, identifier, identifier_excluding,
         primary_key_column_def,
     };
+    // DELETE
     pub use crate::delete::delete_for_table;
+    // DROP INDEX
     pub use crate::drop_index::{drop_index, drop_index_named};
+    // DROP TABLE
     pub use crate::drop_table::{drop_table, drop_table_for_schema, drop_table_for_table};
+    // INSERT
     pub use crate::insert::insert_for_table;
+    // SELECT
     pub use crate::select::select_for_table;
+    // Statement union
     pub use crate::statement::{
         dml_for_schema, dml_for_table, dml_sequence, statement_for_schema, statement_for_table,
         statement_sequence,
     };
+    // Transaction control
+    pub use crate::transaction::{
+        begin, commit, release, rollback, rollback_to_savepoint, savepoint, transaction_type,
+    };
+    // UPDATE
     pub use crate::update::update_for_table;
+    // Utility statements
+    pub use crate::utility::{analyze, analyze_for_schema, reindex, reindex_for_schema, vacuum};
+    // Values
     pub use crate::value::{
         blob_value, integer_value, null_value, real_value, text_value, value_for_type,
     };
+    // Views
+    pub use crate::view::{create_view, drop_view, drop_view_for_schema};
 }
 
 #[cfg(test)]

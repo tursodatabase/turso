@@ -4,6 +4,7 @@ use proptest::prelude::*;
 use std::fmt;
 use std::rc::Rc;
 
+use crate::alter_table::{AlterTableStatement, alter_table_for_schema};
 use crate::create_index::{CreateIndexStatement, create_index, create_index_for_table};
 use crate::create_table::{CreateTableStatement, create_table};
 use crate::delete::{DeleteStatement, delete_for_table};
@@ -13,21 +14,52 @@ use crate::insert::{InsertStatement, insert_for_table};
 use crate::profile::StatementProfile;
 use crate::schema::{Schema, Table};
 use crate::select::{SelectStatement, select_for_table};
+use crate::transaction::{
+    BeginStatement, CommitStatement, ReleaseStatement, RollbackStatement, SavepointStatement,
+    begin, commit, rollback,
+};
 use crate::update::{UpdateStatement, update_for_table};
+use crate::utility::{
+    AnalyzeStatement, ReindexStatement, VacuumStatement, analyze_for_schema, reindex_for_schema,
+    vacuum,
+};
+use crate::view::{CreateViewStatement, DropViewStatement, create_view, drop_view_for_schema};
 
 /// Union of all supported SQL statements.
 #[derive(Debug, Clone, strum::EnumDiscriminants)]
 #[strum_discriminants(name(StatementKind), vis(pub))]
 #[strum_discriminants(derive(strum::EnumIter))]
 pub enum SqlStatement {
+    // DML
     Select(SelectStatement),
     Insert(InsertStatement),
     Update(UpdateStatement),
     Delete(DeleteStatement),
+
+    // DDL - Tables
     CreateTable(CreateTableStatement),
-    CreateIndex(CreateIndexStatement),
     DropTable(DropTableStatement),
+    AlterTable(AlterTableStatement),
+
+    // DDL - Indexes
+    CreateIndex(CreateIndexStatement),
     DropIndex(DropIndexStatement),
+
+    // DDL - Views
+    CreateView(CreateViewStatement),
+    DropView(DropViewStatement),
+
+    // Transaction control
+    Begin(BeginStatement),
+    Commit(CommitStatement),
+    Rollback(RollbackStatement),
+    Savepoint(SavepointStatement),
+    Release(ReleaseStatement),
+
+    // Utility
+    Vacuum(VacuumStatement),
+    Analyze(AnalyzeStatement),
+    Reindex(ReindexStatement),
 }
 
 impl fmt::Display for SqlStatement {
@@ -38,9 +70,20 @@ impl fmt::Display for SqlStatement {
             SqlStatement::Update(s) => write!(f, "{s}"),
             SqlStatement::Delete(s) => write!(f, "{s}"),
             SqlStatement::CreateTable(s) => write!(f, "{s}"),
-            SqlStatement::CreateIndex(s) => write!(f, "{s}"),
             SqlStatement::DropTable(s) => write!(f, "{s}"),
+            SqlStatement::AlterTable(s) => write!(f, "{s}"),
+            SqlStatement::CreateIndex(s) => write!(f, "{s}"),
             SqlStatement::DropIndex(s) => write!(f, "{s}"),
+            SqlStatement::CreateView(s) => write!(f, "{s}"),
+            SqlStatement::DropView(s) => write!(f, "{s}"),
+            SqlStatement::Begin(s) => write!(f, "{s}"),
+            SqlStatement::Commit(s) => write!(f, "{s}"),
+            SqlStatement::Rollback(s) => write!(f, "{s}"),
+            SqlStatement::Savepoint(s) => write!(f, "{s}"),
+            SqlStatement::Release(s) => write!(f, "{s}"),
+            SqlStatement::Vacuum(s) => write!(f, "{s}"),
+            SqlStatement::Analyze(s) => write!(f, "{s}"),
+            SqlStatement::Reindex(s) => write!(f, "{s}"),
         }
     }
 }
@@ -49,18 +92,71 @@ impl StatementKind {
     /// Returns true if this statement kind can be generated for the given schema.
     pub fn is_available(&self, schema: &Schema) -> bool {
         match self {
-            // DML and most DDL require tables
+            // DML requires tables
             StatementKind::Select
             | StatementKind::Insert
             | StatementKind::Update
-            | StatementKind::Delete
-            | StatementKind::CreateIndex
-            | StatementKind::DropTable => !schema.tables.is_empty(),
-            // DROP INDEX requires indexes
-            StatementKind::DropIndex => !schema.indexes.is_empty(),
-            // CREATE TABLE is always available
+            | StatementKind::Delete => !schema.tables.is_empty(),
+
+            // DDL - Table operations
             StatementKind::CreateTable => true,
+            StatementKind::DropTable | StatementKind::AlterTable => !schema.tables.is_empty(),
+
+            // DDL - Index operations
+            StatementKind::CreateIndex => !schema.tables.is_empty(),
+            StatementKind::DropIndex => !schema.indexes.is_empty(),
+
+            // DDL - View operations
+            StatementKind::CreateView => !schema.tables.is_empty(),
+            StatementKind::DropView => true, // Can always generate DROP VIEW IF EXISTS
+
+            // Transaction control - always available
+            StatementKind::Begin
+            | StatementKind::Commit
+            | StatementKind::Rollback
+            | StatementKind::Savepoint
+            | StatementKind::Release => true,
+
+            // Utility - always available
+            StatementKind::Vacuum | StatementKind::Analyze | StatementKind::Reindex => true,
         }
+    }
+
+    /// Returns true if this statement kind is DDL (modifies schema).
+    pub fn is_ddl(&self) -> bool {
+        matches!(
+            self,
+            StatementKind::CreateTable
+                | StatementKind::DropTable
+                | StatementKind::AlterTable
+                | StatementKind::CreateIndex
+                | StatementKind::DropIndex
+                | StatementKind::CreateView
+                | StatementKind::DropView
+        )
+    }
+
+    /// Returns true if this statement kind is DML (data manipulation).
+    pub fn is_dml(&self) -> bool {
+        matches!(
+            self,
+            StatementKind::Select
+                | StatementKind::Insert
+                | StatementKind::Update
+                | StatementKind::Delete
+        )
+    }
+
+    /// Returns true if this statement kind is transaction control.
+    pub fn is_transaction(&self) -> bool {
+        matches!(
+            self,
+            StatementKind::Begin
+                | StatementKind::Commit
+                | StatementKind::Rollback
+                | StatementKind::Savepoint
+                | StatementKind::Release
+        )
     }
 
     /// Builds a strategy for generating this statement kind.
@@ -69,6 +165,7 @@ impl StatementKind {
     pub fn strategy(&self, schema: &Schema) -> BoxedStrategy<SqlStatement> {
         let tables = schema.tables.clone();
         match self {
+            // DML
             StatementKind::Select => table_dml(tables, |t| {
                 select_for_table(t).prop_map(SqlStatement::Select).boxed()
             }),
@@ -81,14 +178,21 @@ impl StatementKind {
             StatementKind::Delete => table_dml(tables, |t| {
                 delete_for_table(t).prop_map(SqlStatement::Delete).boxed()
             }),
-            StatementKind::CreateIndex => create_index(schema)
-                .prop_map(SqlStatement::CreateIndex)
+
+            // DDL - Tables
+            StatementKind::CreateTable => create_table(schema)
+                .prop_map(SqlStatement::CreateTable)
                 .boxed(),
             StatementKind::DropTable => drop_table_for_schema(schema)
                 .prop_map(SqlStatement::DropTable)
                 .boxed(),
-            StatementKind::CreateTable => create_table(schema)
-                .prop_map(SqlStatement::CreateTable)
+            StatementKind::AlterTable => alter_table_for_schema(schema)
+                .prop_map(SqlStatement::AlterTable)
+                .boxed(),
+
+            // DDL - Indexes
+            StatementKind::CreateIndex => create_index(schema)
+                .prop_map(SqlStatement::CreateIndex)
                 .boxed(),
             StatementKind::DropIndex => {
                 let index_names: Vec<String> =
@@ -102,6 +206,37 @@ impl StatementKind {
                     })
                     .boxed()
             }
+
+            // DDL - Views
+            StatementKind::CreateView => create_view(schema)
+                .prop_map(SqlStatement::CreateView)
+                .boxed(),
+            StatementKind::DropView => drop_view_for_schema(schema)
+                .prop_map(SqlStatement::DropView)
+                .boxed(),
+
+            // Transaction control
+            StatementKind::Begin => begin().prop_map(SqlStatement::Begin).boxed(),
+            StatementKind::Commit => commit().prop_map(SqlStatement::Commit).boxed(),
+            StatementKind::Rollback => rollback().prop_map(SqlStatement::Rollback).boxed(),
+            StatementKind::Savepoint => crate::transaction::savepoint()
+                .prop_map(SqlStatement::Savepoint)
+                .boxed(),
+            StatementKind::Release => {
+                // Generate a release with a random savepoint name
+                crate::create_table::identifier()
+                    .prop_map(|name| SqlStatement::Release(ReleaseStatement { name }))
+                    .boxed()
+            }
+
+            // Utility
+            StatementKind::Vacuum => vacuum().prop_map(SqlStatement::Vacuum).boxed(),
+            StatementKind::Analyze => analyze_for_schema(schema)
+                .prop_map(SqlStatement::Analyze)
+                .boxed(),
+            StatementKind::Reindex => reindex_for_schema(schema)
+                .prop_map(SqlStatement::Reindex)
+                .boxed(),
         }
     }
 }

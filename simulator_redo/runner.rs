@@ -15,7 +15,7 @@ use proptest::strategy::{Strategy, ValueTree};
 use proptest::test_runner::TestRunner;
 use rand::{RngCore, SeedableRng};
 use rand_chacha::ChaCha8Rng;
-use sql_gen_prop::{Schema, SqlStatement};
+use sql_gen_prop::{Schema, SqlStatement, StatementKind};
 use turso_core::Database;
 
 use crate::memory::{MemorySimIO, SimIO};
@@ -195,13 +195,7 @@ impl Simulator {
 
     /// Check if a statement is a DDL statement (modifies schema).
     fn is_ddl_statement(stmt: &SqlStatement) -> bool {
-        matches!(
-            stmt,
-            SqlStatement::CreateTable(_)
-                | SqlStatement::CreateIndex(_)
-                | SqlStatement::DropTable(_)
-                | SqlStatement::DropIndex(_)
-        )
+        StatementKind::from(stmt).is_ddl()
     }
 
     /// Introspect schemas from both databases and verify they match.

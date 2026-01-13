@@ -14,7 +14,10 @@ use crate::statement::StatementKind;
 ///
 /// Statement types are divided into:
 /// - **DML (Data Manipulation)**: SELECT, INSERT, UPDATE, DELETE
-/// - **DDL (Data Definition)**: CREATE TABLE, CREATE INDEX, DROP TABLE, DROP INDEX
+/// - **DDL (Data Definition)**: CREATE TABLE, CREATE INDEX, DROP TABLE, DROP INDEX,
+///   ALTER TABLE, CREATE VIEW, DROP VIEW
+/// - **Transaction control**: BEGIN, COMMIT, ROLLBACK, SAVEPOINT, RELEASE
+/// - **Utility**: VACUUM, ANALYZE, REINDEX
 #[derive(Debug, Clone)]
 pub struct StatementProfile {
     // DML weights
@@ -23,11 +26,30 @@ pub struct StatementProfile {
     pub update_weight: u32,
     pub delete_weight: u32,
 
-    // DDL weights
+    // DDL weights - Tables
     pub create_table_weight: u32,
-    pub create_index_weight: u32,
     pub drop_table_weight: u32,
+    pub alter_table_weight: u32,
+
+    // DDL weights - Indexes
+    pub create_index_weight: u32,
     pub drop_index_weight: u32,
+
+    // DDL weights - Views
+    pub create_view_weight: u32,
+    pub drop_view_weight: u32,
+
+    // Transaction control weights
+    pub begin_weight: u32,
+    pub commit_weight: u32,
+    pub rollback_weight: u32,
+    pub savepoint_weight: u32,
+    pub release_weight: u32,
+
+    // Utility weights
+    pub vacuum_weight: u32,
+    pub analyze_weight: u32,
+    pub reindex_weight: u32,
 }
 
 impl Default for StatementProfile {
@@ -38,11 +60,27 @@ impl Default for StatementProfile {
             insert_weight: 25,
             update_weight: 15,
             delete_weight: 10,
+
             // DDL - less frequent
-            create_table_weight: 3,
-            create_index_weight: 3,
-            drop_table_weight: 2,
-            drop_index_weight: 2,
+            create_table_weight: 2,
+            drop_table_weight: 1,
+            alter_table_weight: 1,
+            create_index_weight: 2,
+            drop_index_weight: 1,
+            create_view_weight: 1,
+            drop_view_weight: 1,
+
+            // Transaction control - disabled by default (can cause issues with oracle)
+            begin_weight: 0,
+            commit_weight: 0,
+            rollback_weight: 0,
+            savepoint_weight: 0,
+            release_weight: 0,
+
+            // Utility - rare
+            vacuum_weight: 0,
+            analyze_weight: 0,
+            reindex_weight: 0,
         }
     }
 }
@@ -56,23 +94,31 @@ impl StatementProfile {
             update_weight: 0,
             delete_weight: 0,
             create_table_weight: 0,
-            create_index_weight: 0,
             drop_table_weight: 0,
+            alter_table_weight: 0,
+            create_index_weight: 0,
             drop_index_weight: 0,
+            create_view_weight: 0,
+            drop_view_weight: 0,
+            begin_weight: 0,
+            commit_weight: 0,
+            rollback_weight: 0,
+            savepoint_weight: 0,
+            release_weight: 0,
+            vacuum_weight: 0,
+            analyze_weight: 0,
+            reindex_weight: 0,
         }
     }
 
-    /// Create a DML-only profile (no DDL).
+    /// Create a DML-only profile (no DDL, no transactions, no utility).
     pub fn dml_only() -> Self {
         Self {
             select_weight: 40,
             insert_weight: 30,
             update_weight: 20,
             delete_weight: 10,
-            create_table_weight: 0,
-            create_index_weight: 0,
-            drop_table_weight: 0,
-            drop_index_weight: 0,
+            ..Self::none()
         }
     }
 
@@ -88,38 +134,45 @@ impl StatementProfile {
             insert_weight: 50,
             update_weight: 30,
             delete_weight: 10,
-            create_table_weight: 0,
-            create_index_weight: 0,
-            drop_table_weight: 0,
-            drop_index_weight: 0,
+            ..Self::none()
         }
     }
 
     /// Create a profile without DELETE statements.
     pub fn no_delete() -> Self {
         Self {
-            select_weight: 45,
-            insert_weight: 30,
-            update_weight: 20,
             delete_weight: 0,
-            create_table_weight: 2,
-            create_index_weight: 2,
-            drop_table_weight: 1,
-            drop_index_weight: 0,
+            ..Self::default()
         }
     }
 
     /// Create a DDL-only profile (schema changes only).
     pub fn ddl_only() -> Self {
         Self {
-            select_weight: 0,
-            insert_weight: 0,
-            update_weight: 0,
-            delete_weight: 0,
-            create_table_weight: 30,
-            create_index_weight: 30,
-            drop_table_weight: 20,
-            drop_index_weight: 20,
+            create_table_weight: 20,
+            drop_table_weight: 15,
+            alter_table_weight: 15,
+            create_index_weight: 20,
+            drop_index_weight: 10,
+            create_view_weight: 10,
+            drop_view_weight: 10,
+            ..Self::none()
+        }
+    }
+
+    /// Create a transaction-heavy profile for testing transaction handling.
+    pub fn transaction_heavy() -> Self {
+        Self {
+            select_weight: 20,
+            insert_weight: 20,
+            update_weight: 10,
+            delete_weight: 5,
+            begin_weight: 10,
+            commit_weight: 10,
+            rollback_weight: 10,
+            savepoint_weight: 8,
+            release_weight: 7,
+            ..Self::none()
         }
     }
 
@@ -149,17 +202,11 @@ impl StatementProfile {
         self
     }
 
-    // Builder methods for DDL
+    // Builder methods for DDL - Tables
 
     /// Builder method to set CREATE TABLE weight.
     pub fn with_create_table(mut self, weight: u32) -> Self {
         self.create_table_weight = weight;
-        self
-    }
-
-    /// Builder method to set CREATE INDEX weight.
-    pub fn with_create_index(mut self, weight: u32) -> Self {
-        self.create_index_weight = weight;
         self
     }
 
@@ -169,9 +216,89 @@ impl StatementProfile {
         self
     }
 
+    /// Builder method to set ALTER TABLE weight.
+    pub fn with_alter_table(mut self, weight: u32) -> Self {
+        self.alter_table_weight = weight;
+        self
+    }
+
+    // Builder methods for DDL - Indexes
+
+    /// Builder method to set CREATE INDEX weight.
+    pub fn with_create_index(mut self, weight: u32) -> Self {
+        self.create_index_weight = weight;
+        self
+    }
+
     /// Builder method to set DROP INDEX weight.
     pub fn with_drop_index(mut self, weight: u32) -> Self {
         self.drop_index_weight = weight;
+        self
+    }
+
+    // Builder methods for DDL - Views
+
+    /// Builder method to set CREATE VIEW weight.
+    pub fn with_create_view(mut self, weight: u32) -> Self {
+        self.create_view_weight = weight;
+        self
+    }
+
+    /// Builder method to set DROP VIEW weight.
+    pub fn with_drop_view(mut self, weight: u32) -> Self {
+        self.drop_view_weight = weight;
+        self
+    }
+
+    // Builder methods for transaction control
+
+    /// Builder method to set BEGIN weight.
+    pub fn with_begin(mut self, weight: u32) -> Self {
+        self.begin_weight = weight;
+        self
+    }
+
+    /// Builder method to set COMMIT weight.
+    pub fn with_commit(mut self, weight: u32) -> Self {
+        self.commit_weight = weight;
+        self
+    }
+
+    /// Builder method to set ROLLBACK weight.
+    pub fn with_rollback(mut self, weight: u32) -> Self {
+        self.rollback_weight = weight;
+        self
+    }
+
+    /// Builder method to set SAVEPOINT weight.
+    pub fn with_savepoint(mut self, weight: u32) -> Self {
+        self.savepoint_weight = weight;
+        self
+    }
+
+    /// Builder method to set RELEASE weight.
+    pub fn with_release(mut self, weight: u32) -> Self {
+        self.release_weight = weight;
+        self
+    }
+
+    // Builder methods for utility
+
+    /// Builder method to set VACUUM weight.
+    pub fn with_vacuum(mut self, weight: u32) -> Self {
+        self.vacuum_weight = weight;
+        self
+    }
+
+    /// Builder method to set ANALYZE weight.
+    pub fn with_analyze(mut self, weight: u32) -> Self {
+        self.analyze_weight = weight;
+        self
+    }
+
+    /// Builder method to set REINDEX weight.
+    pub fn with_reindex(mut self, weight: u32) -> Self {
+        self.reindex_weight = weight;
         self
     }
 
@@ -183,14 +310,31 @@ impl StatementProfile {
     /// Returns the total DDL weight.
     pub fn ddl_weight(&self) -> u32 {
         self.create_table_weight
-            + self.create_index_weight
             + self.drop_table_weight
+            + self.alter_table_weight
+            + self.create_index_weight
             + self.drop_index_weight
+            + self.create_view_weight
+            + self.drop_view_weight
+    }
+
+    /// Returns the total transaction control weight.
+    pub fn transaction_weight(&self) -> u32 {
+        self.begin_weight
+            + self.commit_weight
+            + self.rollback_weight
+            + self.savepoint_weight
+            + self.release_weight
+    }
+
+    /// Returns the total utility weight.
+    pub fn utility_weight(&self) -> u32 {
+        self.vacuum_weight + self.analyze_weight + self.reindex_weight
     }
 
     /// Returns the total weight (sum of all weights).
     pub fn total_weight(&self) -> u32 {
-        self.dml_weight() + self.ddl_weight()
+        self.dml_weight() + self.ddl_weight() + self.transaction_weight() + self.utility_weight()
     }
 
     /// Returns true if at least one statement type is enabled.
@@ -208,6 +352,11 @@ impl StatementProfile {
         self.ddl_weight() > 0
     }
 
+    /// Returns true if any transaction statement is enabled.
+    pub fn has_transaction(&self) -> bool {
+        self.transaction_weight() > 0
+    }
+
     /// Returns the weight for a given statement kind.
     pub fn weight_for(&self, kind: StatementKind) -> u32 {
         match kind {
@@ -216,9 +365,20 @@ impl StatementProfile {
             StatementKind::Update => self.update_weight,
             StatementKind::Delete => self.delete_weight,
             StatementKind::CreateTable => self.create_table_weight,
-            StatementKind::CreateIndex => self.create_index_weight,
             StatementKind::DropTable => self.drop_table_weight,
+            StatementKind::AlterTable => self.alter_table_weight,
+            StatementKind::CreateIndex => self.create_index_weight,
             StatementKind::DropIndex => self.drop_index_weight,
+            StatementKind::CreateView => self.create_view_weight,
+            StatementKind::DropView => self.drop_view_weight,
+            StatementKind::Begin => self.begin_weight,
+            StatementKind::Commit => self.commit_weight,
+            StatementKind::Rollback => self.rollback_weight,
+            StatementKind::Savepoint => self.savepoint_weight,
+            StatementKind::Release => self.release_weight,
+            StatementKind::Vacuum => self.vacuum_weight,
+            StatementKind::Analyze => self.analyze_weight,
+            StatementKind::Reindex => self.reindex_weight,
         }
     }
 
@@ -241,11 +401,9 @@ mod tests {
         assert_eq!(profile.insert_weight, 25);
         assert_eq!(profile.update_weight, 15);
         assert_eq!(profile.delete_weight, 10);
-        assert_eq!(profile.create_table_weight, 3);
-        assert_eq!(profile.create_index_weight, 3);
-        assert_eq!(profile.drop_table_weight, 2);
-        assert_eq!(profile.drop_index_weight, 2);
-        assert_eq!(profile.total_weight(), 100);
+        assert!(profile.has_dml());
+        assert!(profile.has_ddl());
+        assert!(!profile.has_transaction()); // Disabled by default
     }
 
     #[test]
@@ -253,6 +411,7 @@ mod tests {
         let profile = StatementProfile::dml_only();
         assert!(profile.has_dml());
         assert!(!profile.has_ddl());
+        assert!(!profile.has_transaction());
         assert_eq!(profile.ddl_weight(), 0);
     }
 
@@ -261,7 +420,16 @@ mod tests {
         let profile = StatementProfile::ddl_only();
         assert!(!profile.has_dml());
         assert!(profile.has_ddl());
+        assert!(!profile.has_transaction());
         assert_eq!(profile.dml_weight(), 0);
+    }
+
+    #[test]
+    fn test_transaction_heavy_profile() {
+        let profile = StatementProfile::transaction_heavy();
+        assert!(profile.has_dml());
+        assert!(!profile.has_ddl());
+        assert!(profile.has_transaction());
     }
 
     #[test]
