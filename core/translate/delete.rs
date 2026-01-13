@@ -8,6 +8,9 @@ use crate::translate::plan::{
     ResultSetColumn, Scan, SelectPlan,
 };
 use crate::translate::planner::{parse_limit, parse_where};
+use crate::translate::subquery::{
+    plan_subqueries_from_delete_plan, plan_subqueries_from_select_plan,
+};
 use crate::translate::trigger_exec::has_relevant_triggers_type_only;
 use crate::util::normalize_ident;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
@@ -41,6 +44,23 @@ pub fn translate_delete(
         returning,
         connection,
     )?;
+
+    // Plan subqueries in the WHERE clause
+    if let Plan::Delete(ref mut delete_plan_inner) = delete_plan {
+        if let Some(ref mut rowset_plan) = delete_plan_inner.rowset_plan {
+            // When using rowset (triggers present), subqueries are in the rowset_plan's WHERE
+            plan_subqueries_from_select_plan(&mut program, rowset_plan, resolver, connection)?;
+        } else {
+            // Normal path: subqueries are in the DELETE plan's WHERE
+            plan_subqueries_from_delete_plan(
+                &mut program,
+                delete_plan_inner,
+                resolver,
+                connection,
+            )?;
+        }
+    }
+
     optimize_plan(&mut program, &mut delete_plan, resolver.schema)?;
     if let Plan::Delete(delete_plan_inner) = &mut delete_plan {
         // Rewrite the Delete plan after optimization whenever a RowSet is used (DELETE triggers
@@ -217,6 +237,7 @@ pub fn prepare_delete_plan(
             indexes,
             rowset_plan: Some(rowset_plan),
             rowset_reg: Some(rowset_reg),
+            non_from_clause_subqueries: vec![],
         }))
     } else {
         Ok(Plan::Delete(DeletePlan {
@@ -230,6 +251,7 @@ pub fn prepare_delete_plan(
             indexes,
             rowset_plan: None,
             rowset_reg: None,
+            non_from_clause_subqueries: vec![],
         }))
     }
 }

@@ -11,8 +11,8 @@ use crate::{
         expr::{unwrap_parens, walk_expr_mut, WalkControl},
         optimizer::optimize_select_plan,
         plan::{
-            ColumnUsedMask, JoinOrderMember, NonFromClauseSubquery, OuterQueryReference, Plan,
-            SubqueryPosition, SubqueryState,
+            ColumnUsedMask, DeletePlan, JoinOrderMember, NonFromClauseSubquery, OuterQueryReference,
+            Plan, SubqueryPosition, SubqueryState,
         },
         select::prepare_select_plan,
     },
@@ -121,6 +121,33 @@ pub fn plan_subqueries_from_select_plan(
             walk_expr_mut(offset, &mut subquery_parser)?;
         }
     }
+
+    update_column_used_masks(
+        &mut plan.table_references,
+        &mut plan.non_from_clause_subqueries,
+    );
+    Ok(())
+}
+
+/// Compute query plans for subqueries in a DELETE statement's WHERE clause.
+/// Similar to [plan_subqueries_from_select_plan] but only handles the WHERE clause
+/// since DELETE statements don't have GROUP BY, ORDER BY, or result column subqueries.
+pub fn plan_subqueries_from_delete_plan(
+    program: &mut ProgramBuilder,
+    plan: &mut DeletePlan,
+    resolver: &Resolver,
+    connection: &Arc<Connection>,
+) -> Result<()> {
+    // WHERE
+    plan_subqueries_with_outer_query_access(
+        program,
+        &mut plan.non_from_clause_subqueries,
+        &mut plan.table_references,
+        resolver,
+        plan.where_clause.iter_mut().map(|t| &mut t.expr),
+        connection,
+        SubqueryPosition::Where,
+    )?;
 
     update_column_used_masks(
         &mut plan.table_references,

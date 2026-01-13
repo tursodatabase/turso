@@ -502,6 +502,8 @@ pub struct DeletePlan {
     pub rowset_plan: Option<SelectPlan>,
     /// Register ID for the RowSet (if rowset_plan is Some)
     pub rowset_reg: Option<usize>,
+    /// Subqueries that appear in the WHERE clause (for non-rowset path)
+    pub non_from_clause_subqueries: Vec<NonFromClauseSubquery>,
 }
 
 #[derive(Debug, Clone)]
