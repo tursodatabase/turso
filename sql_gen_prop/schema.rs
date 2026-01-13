@@ -5,7 +5,7 @@ use std::fmt;
 use std::rc::Rc;
 
 /// SQL data types supported by the generator.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DataType {
     Integer,
     Real,
@@ -116,16 +116,15 @@ impl Table {
     }
 
     /// Returns columns that can be used in WHERE clauses (non-blob types).
-    pub fn filterable_columns(&self) -> Vec<&ColumnDef> {
+    pub fn filterable_columns(&self) -> impl Iterator<Item = &ColumnDef> {
         self.columns
             .iter()
             .filter(|c| c.data_type != DataType::Blob)
-            .collect()
     }
 
     /// Returns columns that can be updated (non-primary key).
-    pub fn updatable_columns(&self) -> Vec<&ColumnDef> {
-        self.columns.iter().filter(|c| !c.primary_key).collect()
+    pub fn updatable_columns(&self) -> impl Iterator<Item = &ColumnDef> {
+        self.columns.iter().filter(|c| !c.primary_key)
     }
 }
 

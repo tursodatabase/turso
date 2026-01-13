@@ -47,7 +47,7 @@ mod tests {
     fn test_delete_display() {
         let stmt = DeleteStatement {
             table: "users".to_string(),
-            where_clause: Some(Condition::Comparison {
+            where_clause: Some(Condition::SimpleComparison {
                 column: "id".to_string(),
                 op: ComparisonOp::Eq,
                 value: SqlValue::Integer(1),

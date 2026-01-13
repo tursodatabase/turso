@@ -4,14 +4,16 @@ use proptest::prelude::*;
 use std::fmt;
 
 use crate::condition::{Condition, optional_where_clause};
+use crate::expression::{Expression, ExpressionContext};
+use crate::function::builtin_functions;
 use crate::schema::{ColumnDef, Table};
-use crate::value::{SqlValue, value_for_type};
 
 /// An UPDATE statement.
 #[derive(Debug, Clone)]
 pub struct UpdateStatement {
     pub table: String,
-    pub assignments: Vec<(String, SqlValue)>,
+    /// Column assignments as (column_name, expression) pairs.
+    pub assignments: Vec<(String, Expression)>,
     pub where_clause: Option<Condition>,
 }
 
@@ -34,15 +36,16 @@ impl fmt::Display for UpdateStatement {
     }
 }
 
-/// Generate an UPDATE statement for a table.
+/// Generate an UPDATE statement for a table with expression support.
+///
+/// This generates function calls and other expressions in SET values.
 pub fn update_for_table(table: &Table) -> BoxedStrategy<UpdateStatement> {
     let table_name = table.name.clone();
-    let updatable: Vec<ColumnDef> = table.updatable_columns().into_iter().cloned().collect();
+    let updatable: Vec<ColumnDef> = table.updatable_columns().cloned().collect();
+    let functions = builtin_functions();
 
     if updatable.is_empty() {
-        // No updatable columns: update nothing (unusual but valid)
-        let table_for_where = table.clone();
-        return optional_where_clause(&table_for_where)
+        return optional_where_clause(table)
             .prop_map(move |where_clause| UpdateStatement {
                 table: table_name.clone(),
                 assignments: vec![],
@@ -51,25 +54,29 @@ pub fn update_for_table(table: &Table) -> BoxedStrategy<UpdateStatement> {
             .boxed();
     }
 
+    // Build expression context with columns (allows `SET x = x + 1` style expressions)
+    let ctx = ExpressionContext::new(functions)
+        .with_columns(table.columns.clone())
+        .with_max_depth(2)
+        .with_aggregates(false);
+
     let col_indices: Vec<usize> = (0..updatable.len()).collect();
     let updatable_clone = updatable.clone();
 
-    let table_for_where = table.clone();
-
     (
         proptest::sample::subsequence(col_indices, 1..=updatable.len()),
-        optional_where_clause(&table_for_where),
+        optional_where_clause(table),
     )
         .prop_flat_map(move |(indices, where_clause)| {
             let selected_cols: Vec<&ColumnDef> =
                 indices.iter().map(|&i| &updatable_clone[i]).collect();
 
-            let assignment_strategies: Vec<BoxedStrategy<(String, SqlValue)>> = selected_cols
+            let assignment_strategies: Vec<BoxedStrategy<(String, Expression)>> = selected_cols
                 .iter()
                 .map(|c| {
                     let name = c.name.clone();
-                    value_for_type(&c.data_type, c.nullable)
-                        .prop_map(move |v| (name.clone(), v))
+                    crate::expression::expression_for_type(Some(&c.data_type), &ctx, 2)
+                        .prop_map(move |expr| (name.clone(), expr))
                         .boxed()
                 })
                 .collect();
@@ -91,16 +98,21 @@ pub fn update_for_table(table: &Table) -> BoxedStrategy<UpdateStatement> {
 mod tests {
     use super::*;
     use crate::condition::ComparisonOp;
+    use crate::schema::DataType;
+    use crate::value::SqlValue;
 
     #[test]
     fn test_update_display() {
         let stmt = UpdateStatement {
             table: "users".to_string(),
             assignments: vec![
-                ("name".to_string(), SqlValue::Text("Bob".to_string())),
-                ("age".to_string(), SqlValue::Integer(30)),
+                (
+                    "name".to_string(),
+                    Expression::Value(SqlValue::Text("Bob".to_string())),
+                ),
+                ("age".to_string(), Expression::Value(SqlValue::Integer(30))),
             ],
-            where_clause: Some(Condition::Comparison {
+            where_clause: Some(Condition::SimpleComparison {
                 column: "id".to_string(),
                 op: ComparisonOp::Eq,
                 value: SqlValue::Integer(1),
@@ -112,5 +124,40 @@ mod tests {
             sql,
             "UPDATE \"users\" SET \"name\" = 'Bob', \"age\" = 30 WHERE \"id\" = 1"
         );
+    }
+
+    #[test]
+    fn test_update_with_expression() {
+        let stmt = UpdateStatement {
+            table: "users".to_string(),
+            assignments: vec![(
+                "name".to_string(),
+                Expression::function_call("UPPER", vec![Expression::Column("name".to_string())]),
+            )],
+            where_clause: None,
+        };
+
+        let sql = stmt.to_string();
+        assert_eq!(sql, "UPDATE \"users\" SET \"name\" = UPPER(\"name\")");
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn generated_update_is_valid(
+            stmt in {
+                let table = Table::new(
+                    "test",
+                    vec![
+                        ColumnDef::new("id", DataType::Integer).primary_key(),
+                        ColumnDef::new("name", DataType::Text),
+                        ColumnDef::new("age", DataType::Integer),
+                    ],
+                );
+                update_for_table(&table)
+            }
+        ) {
+            let sql = stmt.to_string();
+            proptest::prop_assert!(sql.starts_with("UPDATE \"test\" SET"));
+        }
     }
 }

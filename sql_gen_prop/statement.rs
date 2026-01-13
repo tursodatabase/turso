@@ -250,7 +250,7 @@ impl SqlGeneratorKind for StatementKind {
     ) -> BoxedStrategy<Self::Output> {
         let tables = schema.tables.clone();
         match self {
-            // DML
+            // DML - all use expression generation
             StatementKind::Select => table_dml(tables, |t| {
                 select_for_table(t).prop_map(SqlStatement::Select).boxed()
             }),
@@ -351,7 +351,7 @@ where
 }
 
 /// Generate a DML (Data Manipulation Language) statement for a table.
-/// Includes SELECT, INSERT, UPDATE, DELETE.
+/// Includes SELECT, INSERT, UPDATE, DELETE with expression support.
 pub fn dml_for_table(table: &Table) -> BoxedStrategy<SqlStatement> {
     prop_oneof![
         select_for_table(table).prop_map(SqlStatement::Select),

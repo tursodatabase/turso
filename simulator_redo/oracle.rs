@@ -124,7 +124,7 @@ impl Oracle for DifferentialOracle {
                     OracleResult::Pass
                 } else {
                     OracleResult::Fail(format!(
-                        "Turso returned {} rows but SQLite returned Ok:\n  SQL: {stmt}",
+                        "Turso returned {} rows but SQLite returned no rows:\n  SQL: {stmt}",
                         rows.len()
                     ))
                 }
@@ -134,7 +134,7 @@ impl Oracle for DifferentialOracle {
                     OracleResult::Pass
                 } else {
                     OracleResult::Fail(format!(
-                        "SQLite returned {} rows but Turso returned Ok:\n  SQL: {stmt}",
+                        "SQLite returned {} rows but Turso returned no rows:\n  SQL: {stmt}",
                         rows.len()
                     ))
                 }

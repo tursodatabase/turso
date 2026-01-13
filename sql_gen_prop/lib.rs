@@ -8,6 +8,7 @@
 //!   CREATE VIEW, DROP VIEW, CREATE TRIGGER, DROP TRIGGER
 //! - **Transaction control**: BEGIN, COMMIT, ROLLBACK, SAVEPOINT, RELEASE
 //! - **Utility**: VACUUM, ANALYZE, REINDEX
+//! - **Expressions**: Function calls, column references, literals, and nested expressions
 //!
 //! All DDL generators are schema-aware to avoid naming conflicts.
 
@@ -20,6 +21,8 @@ pub mod delete;
 pub mod drop_index;
 pub mod drop_table;
 pub mod drop_trigger;
+pub mod expression;
+pub mod function;
 pub mod generator;
 pub mod insert;
 pub mod profile;
@@ -48,6 +51,10 @@ pub use delete::DeleteStatement;
 pub use drop_index::DropIndexStatement;
 pub use drop_table::DropTableStatement;
 pub use drop_trigger::DropTriggerStatement;
+pub use expression::{BinaryOperator, Expression, ExpressionContext, UnaryOperator};
+pub use function::{
+    Arity, FunctionCategory, FunctionContext, FunctionDef, FunctionProfile, FunctionRegistry,
+};
 pub use generator::{SqlGeneratorKind, WeightedKindIteratorExt};
 pub use insert::InsertStatement;
 pub use profile::{StatementProfile, WeightedProfile};
@@ -72,8 +79,10 @@ pub mod strategies {
     };
     // Conditions
     pub use crate::condition::{
-        comparison_op, condition_for_table, logical_op, optional_where_clause, order_by_for_table,
-        order_direction, simple_condition,
+        comparison_op, condition_for_table, condition_for_table_with_expressions,
+        expression_condition, logical_op, optional_where_clause,
+        optional_where_clause_with_expressions, order_by_for_table,
+        order_by_for_table_with_expressions, order_direction, simple_condition,
     };
     // CREATE INDEX
     pub use crate::create_index::{create_index, create_index_for_table, index_column};
@@ -116,6 +125,17 @@ pub mod strategies {
         create_trigger_for_schema, create_trigger_for_table, create_trigger_with_timing_event,
     };
     pub use crate::drop_trigger::{drop_trigger, drop_trigger_for_schema};
+    // Expressions
+    pub use crate::expression::{
+        column_expression, expression, expression_for_type, function_call_expression,
+        select_expression_for_table, value_expression, where_expression_for_table,
+    };
+    // Functions
+    pub use crate::function::{
+        aggregate_function, aggregate_functions, blob_functions, builtin_functions,
+        control_flow_functions, datetime_functions, function_from_registry, functions_in_category,
+        math_functions, null_handling_functions, scalar_function, string_functions, type_functions,
+    };
 }
 
 #[cfg(test)]
