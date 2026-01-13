@@ -431,6 +431,28 @@ do_execsql_test rtrim-no-match-pattern {
   SELECT rtrim('Limbo', 'xyz');
 } {Limbo}
 
+# TRIM always returns TEXT, even for numeric inputs.
+# This is important for expression indexes that use TRIM on numeric columns.
+do_execsql_test trim-integer-returns-text {
+  SELECT typeof(trim(42));
+} {text}
+
+do_execsql_test trim-float-returns-text {
+  SELECT typeof(trim(3.14));
+} {text}
+
+do_execsql_test ltrim-integer-returns-text {
+  SELECT typeof(ltrim(42));
+} {text}
+
+do_execsql_test rtrim-integer-returns-text {
+  SELECT typeof(rtrim(42));
+} {text}
+
+do_execsql_test trim-integer-with-pattern-returns-text {
+  SELECT typeof(trim(123, '1'));
+} {text}
+
 do_execsql_test round-float-no-precision {
   SELECT round(123.456);
 } {123.0}
@@ -1133,4 +1155,3 @@ do_execsql_test replace-test-zeroblob-quote {
 # do_execsql_test soundex-text {
 #  select soundex('Pfister'), soundex('husobee'), soundex('Tymczak'), soundex('Ashcraft'), soundex('Robert'), soundex('Rupert'), soundex('Rubin'), soundex('Kant'), soundex('Knuth'), soundex('x'), soundex('');
 # } {P236|H210|T522|A261|R163|R163|R150|K530|K530|X000|0000}
-
