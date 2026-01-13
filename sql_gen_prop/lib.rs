@@ -31,7 +31,7 @@ pub mod value;
 pub mod view;
 
 // Re-export main types for convenience
-pub use alter_table::{AlterTableOp, AlterTableStatement};
+pub use alter_table::{AlterTableOp, AlterTableOpWeights, AlterTableStatement};
 pub use condition::{ComparisonOp, Condition, LogicalOp, OrderByItem, OrderDirection};
 pub use create_index::{CreateIndexStatement, IndexColumn};
 pub use create_table::CreateTableStatement;
@@ -39,7 +39,7 @@ pub use delete::DeleteStatement;
 pub use drop_index::DropIndexStatement;
 pub use drop_table::DropTableStatement;
 pub use insert::InsertStatement;
-pub use profile::StatementProfile;
+pub use profile::{StatementProfile, WeightedProfile};
 pub use schema::{ColumnDef, DataType, Index, Schema, SchemaBuilder, Table, View};
 pub use select::SelectStatement;
 pub use statement::SqlStatement;

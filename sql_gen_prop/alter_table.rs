@@ -15,6 +15,79 @@ use crate::create_table::{column_def, identifier_excluding};
 use crate::schema::ColumnDef;
 use crate::schema::{Schema, Table};
 
+/// Weights for ALTER TABLE operation types.
+///
+/// Each weight determines the relative probability of generating that
+/// operation type. A weight of 0 disables that operation type entirely.
+#[derive(Debug, Clone)]
+pub struct AlterTableOpWeights {
+    /// Weight for RENAME TO operations.
+    pub rename_to: u32,
+    /// Weight for RENAME COLUMN operations.
+    pub rename_column: u32,
+    /// Weight for ADD COLUMN operations.
+    pub add_column: u32,
+    /// Weight for DROP COLUMN operations.
+    pub drop_column: u32,
+}
+
+impl Default for AlterTableOpWeights {
+    fn default() -> Self {
+        Self {
+            rename_to: 10,
+            rename_column: 20,
+            add_column: 40,
+            drop_column: 30,
+        }
+    }
+}
+
+impl AlterTableOpWeights {
+    /// Create weights with all values set to zero.
+    pub fn none() -> Self {
+        Self {
+            rename_to: 0,
+            rename_column: 0,
+            add_column: 0,
+            drop_column: 0,
+        }
+    }
+
+    /// Builder method to set RENAME TO weight.
+    pub fn with_rename_to(mut self, weight: u32) -> Self {
+        self.rename_to = weight;
+        self
+    }
+
+    /// Builder method to set RENAME COLUMN weight.
+    pub fn with_rename_column(mut self, weight: u32) -> Self {
+        self.rename_column = weight;
+        self
+    }
+
+    /// Builder method to set ADD COLUMN weight.
+    pub fn with_add_column(mut self, weight: u32) -> Self {
+        self.add_column = weight;
+        self
+    }
+
+    /// Builder method to set DROP COLUMN weight.
+    pub fn with_drop_column(mut self, weight: u32) -> Self {
+        self.drop_column = weight;
+        self
+    }
+
+    /// Returns the total weight (sum of all weights).
+    pub fn total_weight(&self) -> u32 {
+        self.rename_to + self.rename_column + self.add_column + self.drop_column
+    }
+
+    /// Returns true if at least one operation type is enabled.
+    pub fn has_enabled_operations(&self) -> bool {
+        self.total_weight() > 0
+    }
+}
+
 /// Types of ALTER TABLE operations.
 #[derive(Debug, Clone)]
 pub enum AlterTableOp {
@@ -59,7 +132,7 @@ impl fmt::Display for AlterTableStatement {
 /// Generate an ALTER TABLE RENAME TO statement.
 pub fn alter_table_rename_to(table: &Table, schema: &Schema) -> BoxedStrategy<AlterTableStatement> {
     let table_name = table.name.clone();
-    let existing_names: HashSet<String> = schema.table_names();
+    let existing_names = schema.table_names();
     identifier_excluding(existing_names)
         .prop_map(move |new_name| AlterTableStatement {
             table_name: table_name.clone(),
@@ -143,30 +216,60 @@ pub fn alter_table_drop_column(table: &Table) -> BoxedStrategy<AlterTableStateme
     }
 }
 
-/// Generate any ALTER TABLE statement for a table.
-pub fn alter_table_for_table(table: &Table, schema: &Schema) -> BoxedStrategy<AlterTableStatement> {
+/// Generate any ALTER TABLE statement for a table with optional operation weights.
+///
+/// When `op_weights` is `None`, uses default weights for all applicable operation types.
+/// When `op_weights` is `Some`, uses the specified weights to control operation distribution.
+///
+/// Operations are filtered based on table state:
+/// - RENAME COLUMN requires at least one column
+/// - DROP COLUMN requires at least one non-primary-key column and more than one column total
+pub fn alter_table_for_table(
+    table: &Table,
+    schema: &Schema,
+    op_weights: Option<&AlterTableOpWeights>,
+) -> BoxedStrategy<AlterTableStatement> {
+    let w = op_weights.cloned().unwrap_or_default();
+
     let has_droppable_cols =
         table.columns.iter().any(|c| !c.primary_key) && table.columns.len() > 1;
     let has_columns = !table.columns.is_empty();
 
-    let mut strategies: Vec<BoxedStrategy<AlterTableStatement>> = vec![
-        alter_table_rename_to(table, schema),
-        alter_table_add_column(table),
-    ];
+    let mut weighted_strategies: Vec<(u32, BoxedStrategy<AlterTableStatement>)> = Vec::new();
 
-    if has_columns {
-        strategies.push(alter_table_rename_column(table));
+    // RENAME TO is always available
+    if w.rename_to > 0 {
+        weighted_strategies.push((w.rename_to, alter_table_rename_to(table, schema)));
     }
 
-    if has_droppable_cols {
-        strategies.push(alter_table_drop_column(table));
+    // ADD COLUMN is always available
+    if w.add_column > 0 {
+        weighted_strategies.push((w.add_column, alter_table_add_column(table)));
     }
 
-    proptest::strategy::Union::new(strategies).boxed()
+    // RENAME COLUMN requires columns to exist
+    if has_columns && w.rename_column > 0 {
+        weighted_strategies.push((w.rename_column, alter_table_rename_column(table)));
+    }
+
+    // DROP COLUMN requires droppable columns
+    if has_droppable_cols && w.drop_column > 0 {
+        weighted_strategies.push((w.drop_column, alter_table_drop_column(table)));
+    }
+
+    assert!(
+        !weighted_strategies.is_empty(),
+        "No valid ALTER TABLE operations can be generated for the given table and profile"
+    );
+
+    proptest::strategy::Union::new_weighted(weighted_strategies).boxed()
 }
 
-/// Generate any ALTER TABLE statement for a schema.
-pub fn alter_table_for_schema(schema: &Schema) -> BoxedStrategy<AlterTableStatement> {
+/// Generate any ALTER TABLE statement for a schema with optional operation weights.
+pub fn alter_table_for_schema(
+    schema: &Schema,
+    op_weights: Option<&AlterTableOpWeights>,
+) -> BoxedStrategy<AlterTableStatement> {
     assert!(
         !schema.tables.is_empty(),
         "Schema must have at least one table"
@@ -174,8 +277,11 @@ pub fn alter_table_for_schema(schema: &Schema) -> BoxedStrategy<AlterTableStatem
 
     let tables = schema.tables.clone();
     let schema_clone = schema.clone();
+    let op_weights_clone = op_weights.cloned();
     proptest::sample::select((*tables).clone())
-        .prop_flat_map(move |table| alter_table_for_table(&table, &schema_clone))
+        .prop_flat_map(move |table| {
+            alter_table_for_table(&table, &schema_clone, op_weights_clone.as_ref())
+        })
         .boxed()
 }
 
@@ -211,5 +317,43 @@ mod tests {
             let sql = stmt.to_string();
             prop_assert!(sql.starts_with("ALTER TABLE \"users\" ADD COLUMN"));
         }
+
+        #[test]
+        fn alter_table_for_table_with_default_profile(stmt in alter_table_for_table(&test_table(), &test_schema(), None)) {
+            let sql = stmt.to_string();
+            prop_assert!(sql.starts_with("ALTER TABLE \"users\""));
+        }
+
+        #[test]
+        fn alter_table_for_table_add_only(stmt in alter_table_for_table(
+            &test_table(),
+            &test_schema(),
+            Some(&AlterTableOpWeights::none().with_add_column(100))
+        )) {
+            let sql = stmt.to_string();
+            prop_assert!(sql.contains("ADD COLUMN"));
+        }
+    }
+
+    #[test]
+    fn test_alter_table_op_weights_default() {
+        let weights = AlterTableOpWeights::default();
+        assert_eq!(weights.rename_to, 10);
+        assert_eq!(weights.rename_column, 20);
+        assert_eq!(weights.add_column, 40);
+        assert_eq!(weights.drop_column, 30);
+        assert!(weights.has_enabled_operations());
+    }
+
+    #[test]
+    fn test_alter_table_op_weights_builder() {
+        let weights = AlterTableOpWeights::none()
+            .with_rename_to(25)
+            .with_add_column(75);
+        assert_eq!(weights.rename_to, 25);
+        assert_eq!(weights.rename_column, 0);
+        assert_eq!(weights.add_column, 75);
+        assert_eq!(weights.drop_column, 0);
+        assert_eq!(weights.total_weight(), 100);
     }
 }

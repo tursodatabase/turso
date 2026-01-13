@@ -90,7 +90,7 @@ impl fmt::Display for SqlStatement {
 
 impl StatementKind {
     /// Returns true if this statement kind can be generated for the given schema.
-    pub fn is_available(&self, schema: &Schema) -> bool {
+    pub fn available(&self, schema: &Schema) -> bool {
         match self {
             // DML requires tables
             StatementKind::Select
@@ -119,6 +119,39 @@ impl StatementKind {
 
             // Utility - always available
             StatementKind::Vacuum | StatementKind::Analyze | StatementKind::Reindex => true,
+        }
+    }
+
+    /// If Statement is currently supported. This is an arbitrary filter to remove unsupported statements
+    pub fn supported(&self) -> bool {
+        match self {
+            // DML requires tables
+            StatementKind::Select
+            | StatementKind::Insert
+            | StatementKind::Update
+            | StatementKind::Delete => true,
+
+            // DDL - Table operations
+            StatementKind::CreateTable => true,
+            StatementKind::DropTable | StatementKind::AlterTable => true,
+
+            // DDL - Index operations
+            StatementKind::CreateIndex => true,
+            StatementKind::DropIndex => true,
+
+            // DDL - View operations
+            StatementKind::CreateView => false,
+            StatementKind::DropView => false,
+
+            // Transaction control
+            StatementKind::Begin
+            | StatementKind::Commit
+            | StatementKind::Rollback
+            | StatementKind::Savepoint
+            | StatementKind::Release => false,
+
+            // Utility - always available
+            StatementKind::Vacuum | StatementKind::Analyze | StatementKind::Reindex => false,
         }
     }
 
@@ -162,7 +195,13 @@ impl StatementKind {
     /// Builds a strategy for generating this statement kind.
     ///
     /// Caller must ensure `is_available(schema)` returns true before calling this.
-    pub fn strategy(&self, schema: &Schema) -> BoxedStrategy<SqlStatement> {
+    /// The optional `profile` is used to pass sub-profiles (e.g., `alter_table_profile`)
+    /// to statement generators that support fine-grained control.
+    pub fn strategy(
+        &self,
+        schema: &Schema,
+        profile: Option<&StatementProfile>,
+    ) -> BoxedStrategy<SqlStatement> {
         let tables = schema.tables.clone();
         match self {
             // DML
@@ -186,9 +225,12 @@ impl StatementKind {
             StatementKind::DropTable => drop_table_for_schema(schema)
                 .prop_map(SqlStatement::DropTable)
                 .boxed(),
-            StatementKind::AlterTable => alter_table_for_schema(schema)
-                .prop_map(SqlStatement::AlterTable)
-                .boxed(),
+            StatementKind::AlterTable => {
+                let op_weights = profile.and_then(|p| p.alter_table_op_weights.as_ref());
+                alter_table_for_schema(schema, op_weights)
+                    .prop_map(SqlStatement::AlterTable)
+                    .boxed()
+            }
 
             // DDL - Indexes
             StatementKind::CreateIndex => create_index(schema)
@@ -303,8 +345,8 @@ pub fn statement_for_schema(
 
     let strategies: Vec<(u32, BoxedStrategy<SqlStatement>)> = p
         .enabled_statements()
-        .filter(|(kind, _)| kind.is_available(schema))
-        .map(|(kind, weight)| (weight, kind.strategy(schema)))
+        .filter(|(kind, _)| kind.available(schema))
+        .map(|(kind, weight)| (weight, kind.strategy(schema, Some(&p))))
         .collect();
 
     assert!(

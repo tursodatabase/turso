@@ -5,7 +5,65 @@
 
 use strum::IntoEnumIterator;
 
+use crate::alter_table::AlterTableOpWeights;
 use crate::statement::StatementKind;
+
+/// A weighted profile that holds an overall weight and optional detailed settings.
+///
+/// This generic struct allows statement types to have both:
+/// - A weight determining how often this statement type is generated relative to others
+/// - Optional detailed settings for fine-grained control within that statement type
+#[derive(Debug, Clone)]
+pub struct WeightedProfile<T> {
+    /// The overall weight for this statement type.
+    pub weight: u32,
+    /// Optional detailed settings for fine-grained control.
+    pub extra: Option<T>,
+}
+
+impl<T> WeightedProfile<T> {
+    /// Create a new weighted profile with the given weight and no detail.
+    pub const fn new(weight: u32) -> Self {
+        Self {
+            weight,
+            extra: None,
+        }
+    }
+
+    /// Create a new weighted profile with weight and detail.
+    pub const fn with_detail(weight: u32, detail: T) -> Self {
+        Self {
+            weight,
+            extra: Some(detail),
+        }
+    }
+
+    /// Builder method to set the weight.
+    pub fn weight(mut self, weight: u32) -> Self {
+        self.weight = weight;
+        self
+    }
+
+    /// Builder method to set the detail.
+    pub fn extra(mut self, detail: T) -> Self {
+        self.extra = Some(detail);
+        self
+    }
+
+    /// Returns true if the weight is greater than zero.
+    pub fn is_enabled(&self) -> bool {
+        self.weight > 0
+    }
+}
+
+impl<T: Default> Default for WeightedProfile<T> {
+    fn default() -> Self {
+        Self {
+            weight: 0,
+            extra: None,
+        }
+    }
+}
 
 /// Profile controlling SQL statement generation weights.
 ///
@@ -50,6 +108,11 @@ pub struct StatementProfile {
     pub vacuum_weight: u32,
     pub analyze_weight: u32,
     pub reindex_weight: u32,
+
+    // Sub-profiles for fine-grained control
+    /// Operation weights for ALTER TABLE statements.
+    /// When `None`, uses default weights for ALTER TABLE operations.
+    pub alter_table_op_weights: Option<AlterTableOpWeights>,
 }
 
 impl Default for StatementProfile {
@@ -81,6 +144,9 @@ impl Default for StatementProfile {
             vacuum_weight: 0,
             analyze_weight: 0,
             reindex_weight: 0,
+
+            // Sub-profiles
+            alter_table_op_weights: None,
         }
     }
 }
@@ -108,6 +174,7 @@ impl StatementProfile {
             vacuum_weight: 0,
             analyze_weight: 0,
             reindex_weight: 0,
+            alter_table_op_weights: None,
         }
     }
 
@@ -299,6 +366,14 @@ impl StatementProfile {
     /// Builder method to set REINDEX weight.
     pub fn with_reindex(mut self, weight: u32) -> Self {
         self.reindex_weight = weight;
+        self
+    }
+
+    // Builder methods for sub-profiles
+
+    /// Builder method to set ALTER TABLE operation weights.
+    pub fn with_alter_table_op_weights(mut self, op_weights: AlterTableOpWeights) -> Self {
+        self.alter_table_op_weights = Some(op_weights);
         self
     }
 
