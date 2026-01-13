@@ -8,6 +8,7 @@
 //! 5. Checking the differential oracle
 //! 6. Re-introspecting schemas after DDL statements
 
+use std::io::Write;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
@@ -208,16 +209,30 @@ impl Simulator {
     /// Run the simulation.
     pub fn run(&mut self) -> Result<SimStats> {
         let mut stats = SimStats::default();
+        let mut executed_sql = Vec::new();
 
-        let result = self.run_inner(&mut stats);
+        let result = self.run_inner(&mut stats, &mut executed_sql);
 
-        // Always print stats table, even on error
+        // Always write SQL file and print stats, even on error
+        if let Err(e) = Self::write_sql_file(&executed_sql) {
+            tracing::warn!("Failed to write test.sql: {e}");
+        }
         stats.print_table(&self.config);
 
         result.map(|()| stats)
     }
 
-    fn run_inner(&mut self, stats: &mut SimStats) -> Result<()> {
+    /// Write all executed SQL statements to test.sql
+    fn write_sql_file(statements: &[String]) -> Result<()> {
+        let mut file = std::fs::File::create("test.sql")?;
+        for sql in statements {
+            writeln!(file, "{sql};")?;
+        }
+        tracing::info!("Wrote {} statements to test.sql", statements.len());
+        Ok(())
+    }
+
+    fn run_inner(&mut self, stats: &mut SimStats, executed_sql: &mut Vec<String>) -> Result<()> {
         tracing::info!(
             "Starting simulation with seed={}, tables={}, statements={}",
             self.config.seed,
@@ -262,6 +277,7 @@ impl Simulator {
             match check_differential(&self.turso_conn, &self.sqlite_conn, &stmt) {
                 Ok(OracleResult::Pass) => {
                     stats.statements_executed += 1;
+                    executed_sql.push(sql.clone());
 
                     // After DDL statements, re-introspect both databases and verify schemas match
                     if is_ddl {
@@ -278,6 +294,7 @@ impl Simulator {
                 Ok(OracleResult::Warning(reason)) => {
                     stats.statements_executed += 1;
                     stats.warnings += 1;
+                    executed_sql.push(sql.clone());
                     tracing::warn!("Oracle warning at statement {i}: {reason}");
 
                     // Still process DDL after warnings
@@ -289,6 +306,7 @@ impl Simulator {
                 }
                 Ok(OracleResult::Fail(reason)) => {
                     stats.oracle_failures += 1;
+                    executed_sql.push(format!("-- FAILED: {sql}"));
                     tracing::error!("Oracle failure at statement {i}: {reason}");
                     if !self.config.verbose {
                         tracing::error!("Failing SQL: {sql}");
@@ -297,6 +315,7 @@ impl Simulator {
                 }
                 Err(e) => {
                     stats.errors += 1;
+                    executed_sql.push(format!("-- ERROR: {sql}"));
                     tracing::warn!("Error executing statement {i}: {e}");
                 }
             }
