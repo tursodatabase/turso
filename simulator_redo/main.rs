@@ -31,6 +31,10 @@ struct Args {
     /// Enable verbose output.
     #[arg(short, long)]
     verbose: bool,
+
+    /// Persist database files to disk after simulation.
+    #[arg(short, long)]
+    keep_files: bool,
 }
 
 fn main() -> Result<()> {
@@ -61,6 +65,11 @@ fn main() -> Result<()> {
     let stats = simulator.run()?;
 
     tracing::info!("Final stats: {:?}", stats);
+
+    if args.keep_files {
+        tracing::info!("Persisting database files to disk...");
+        simulator.persist_files()?;
+    }
 
     if stats.oracle_failures > 0 {
         std::process::exit(1);
