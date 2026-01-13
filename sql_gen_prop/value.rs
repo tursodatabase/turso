@@ -15,6 +15,28 @@ pub enum SqlValue {
     Null,
 }
 
+impl PartialEq for SqlValue {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (SqlValue::Null, SqlValue::Null) => true,
+            (SqlValue::Integer(a), SqlValue::Integer(b)) => a == b,
+            (SqlValue::Real(a), SqlValue::Real(b)) => {
+                // Handle NaN and compare with tolerance for floating point
+                if a.is_nan() && b.is_nan() {
+                    true
+                } else if a.is_nan() || b.is_nan() {
+                    false
+                } else {
+                    (a - b).abs() < 1e-10 || a == b
+                }
+            }
+            (SqlValue::Text(a), SqlValue::Text(b)) => a == b,
+            (SqlValue::Blob(a), SqlValue::Blob(b)) => a == b,
+            _ => false,
+        }
+    }
+}
+
 impl fmt::Display for SqlValue {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
