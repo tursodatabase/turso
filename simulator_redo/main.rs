@@ -57,6 +57,7 @@ fn main() -> Result<()> {
         columns_per_table: args.columns_per_table,
         num_statements: args.num_statements,
         verbose: args.verbose,
+        keep_files: args.keep_files,
     };
 
     tracing::info!("Starting sim_redo with config: {:?}", config);

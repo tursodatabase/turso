@@ -35,6 +35,8 @@ pub struct SimConfig {
     pub num_statements: usize,
     /// Whether to print verbose output.
     pub verbose: bool,
+    /// Keep simulation databases
+    pub keep_files: bool,
 }
 
 impl Default for SimConfig {
@@ -45,6 +47,7 @@ impl Default for SimConfig {
             columns_per_table: 5,
             num_statements: 100,
             verbose: false,
+            keep_files: false,
         }
     }
 }
@@ -79,14 +82,26 @@ impl Simulator {
     pub fn new(config: SimConfig) -> Result<Self> {
         let rng = ChaCha8Rng::seed_from_u64(config.seed);
 
+        if !out_dir.exists() {
+            std::fs::create_dir_all(&out_dir)?;
+        }
+
         // Create Turso in-memory database using MemorySimIO
         let io = Arc::new(MemorySimIO::new(config.seed));
         let turso_db = Database::open_file(io.clone(), "test.db")?;
         let turso_conn = turso_db.connect()?;
 
         // Create SQLite in-memory database
-        let sqlite_conn = rusqlite::Connection::open_in_memory()
-            .context("Failed to open SQLite in-memory database")?;
+        let sqlite_conn = if config.keep_files {
+            let path = std::path::Path::new("test-sqlite.db");
+            if path.exists() {
+                std::fs::remove_file(path)?;
+            }
+            rusqlite::Connection::open("test-sqlite.db")
+        } else {
+            rusqlite::Connection::open_in_memory()
+        }
+        .context("Failed to open SQLite database")?;
 
         Ok(Self {
             config,
@@ -100,7 +115,7 @@ impl Simulator {
 
     /// Persist the in-memory database files to disk.
     ///
-    /// Writes `.db`, `.wal`, and `.lg` files to the filesystem.
+    /// Writes `.db`, `.wal`, and `.log` files to the filesystem.
     pub fn persist_files(&self) -> Result<()> {
         self.io.persist_files()?;
         Ok(())
@@ -265,6 +280,7 @@ mod tests {
             columns_per_table: 3,
             num_statements: 10,
             verbose: false,
+            keep_files: false,
         };
         let sim = Simulator::new(config);
         assert!(sim.is_ok());

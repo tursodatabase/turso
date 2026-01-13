@@ -65,7 +65,7 @@ impl SqlGeneratorKind for AlterTableOpKind {
         match self {
             AlterTableOpKind::RenameTo => true,
             AlterTableOpKind::RenameColumn => true,
-            AlterTableOpKind::AddColumn => true,
+            AlterTableOpKind::AddColumn => false,
             AlterTableOpKind::DropColumn => true,
         }
     }
