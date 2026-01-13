@@ -212,13 +212,14 @@ impl TursoRwLock {
     #[inline]
     pub fn upgrade(&self) -> bool {
         let cur = self.0.load(Ordering::Acquire);
-
-        // available only if we have single reader
-        if cur != Self::READER_INC {
+        // Check for single reader: exactly one reader, any value
+        if (cur & !Self::VALUE_MASK) != Self::READER_INC {
             return false;
         }
-        self.0 // Safety: Failure here can be Relaxed as we will read again on next iteration.
-            .compare_exchange(cur, Self::WRITER, Ordering::Acquire, Ordering::Relaxed)
+        // Preserve value bits, replace reader with writer
+        let desired = (cur & Self::VALUE_MASK) | Self::WRITER;
+        self.0
+            .compare_exchange(cur, desired, Ordering::Acquire, Ordering::Relaxed)
             .is_ok()
     }
 
@@ -227,8 +228,10 @@ impl TursoRwLock {
     #[inline]
     pub fn downgrade(&self) {
         let cur = self.0.load(Ordering::Acquire);
-        debug_assert!(cur == Self::WRITER);
-        self.0.store(Self::READER_INC, Ordering::Release);
+        debug_assert!(Self::has_writer(cur));
+        // Preserve value bits, replace writer with one reader
+        let desired = (cur & Self::VALUE_MASK) | Self::READER_INC;
+        self.0.store(desired, Ordering::Release);
     }
 
     #[inline]
