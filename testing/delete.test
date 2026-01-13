@@ -145,3 +145,91 @@ do_execsql_test_on_specific_db {:memory:} delete-in-subquery-multicol-1 {
     {1|Widget}
     {3|Doodad}
 }
+
+# Test DELETE with EXISTS subquery
+do_execsql_test_on_specific_db {:memory:} delete-exists-subquery-1 {
+    CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER, status TEXT);
+    CREATE TABLE order_items (order_id INTEGER, product TEXT);
+    INSERT INTO orders VALUES (1, 100, 'pending'), (2, 101, 'pending'), (3, 102, 'pending');
+    INSERT INTO order_items VALUES (1, 'widget'), (3, 'gadget');
+    DELETE FROM orders WHERE EXISTS (SELECT 1 FROM order_items WHERE order_items.order_id = orders.id);
+    SELECT id, status FROM orders ORDER BY id;
+} {
+    {2|pending}
+}
+
+# Test DELETE with NOT EXISTS subquery
+do_execsql_test_on_specific_db {:memory:} delete-not-exists-subquery-1 {
+    CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER, status TEXT);
+    CREATE TABLE order_items (order_id INTEGER, product TEXT);
+    INSERT INTO orders VALUES (1, 100, 'pending'), (2, 101, 'pending'), (3, 102, 'pending');
+    INSERT INTO order_items VALUES (1, 'widget'), (3, 'gadget');
+    DELETE FROM orders WHERE NOT EXISTS (SELECT 1 FROM order_items WHERE order_items.order_id = orders.id);
+    SELECT id, status FROM orders ORDER BY id;
+} {
+    {1|pending}
+    {3|pending}
+}
+
+# Test DELETE with scalar comparison subquery (=)
+do_execsql_test_on_specific_db {:memory:} delete-scalar-eq-subquery-1 {
+    CREATE TABLE employees (id INTEGER PRIMARY KEY, name TEXT, department_id INTEGER);
+    CREATE TABLE departments (id INTEGER PRIMARY KEY, name TEXT);
+    INSERT INTO employees VALUES (1, 'Alice', 1), (2, 'Bob', 2), (3, 'Charlie', 1);
+    INSERT INTO departments VALUES (1, 'Sales'), (2, 'Engineering');
+    DELETE FROM employees WHERE department_id = (SELECT id FROM departments WHERE name = 'Sales');
+    SELECT id, name FROM employees ORDER BY id;
+} {
+    {2|Bob}
+}
+
+# Test DELETE with scalar comparison subquery (>)
+do_execsql_test_on_specific_db {:memory:} delete-scalar-gt-subquery-1 {
+    CREATE TABLE t1 (id INTEGER PRIMARY KEY, val INTEGER);
+    CREATE TABLE t2 (max_val INTEGER);
+    INSERT INTO t1 VALUES (1, 10), (2, 20), (3, 30), (4, 40);
+    INSERT INTO t2 VALUES (25);
+    DELETE FROM t1 WHERE val > (SELECT max_val FROM t2);
+    SELECT id, val FROM t1 ORDER BY id;
+} {
+    {1|10}
+    {2|20}
+}
+
+# Test DELETE with scalar comparison subquery (<)
+do_execsql_test_on_specific_db {:memory:} delete-scalar-lt-subquery-1 {
+    CREATE TABLE t1 (id INTEGER PRIMARY KEY, val INTEGER);
+    CREATE TABLE t2 (min_val INTEGER);
+    INSERT INTO t1 VALUES (1, 10), (2, 20), (3, 30), (4, 40);
+    INSERT INTO t2 VALUES (25);
+    DELETE FROM t1 WHERE val < (SELECT min_val FROM t2);
+    SELECT id, val FROM t1 ORDER BY id;
+} {
+    {3|30}
+    {4|40}
+}
+
+# Test DELETE with scalar subquery using aggregate
+do_execsql_test_on_specific_db {:memory:} delete-scalar-agg-subquery-1 {
+    CREATE TABLE items (id INTEGER PRIMARY KEY, score INTEGER);
+    INSERT INTO items VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50);
+    DELETE FROM items WHERE score < (SELECT AVG(score) FROM items);
+    SELECT id, score FROM items ORDER BY id;
+} {
+    {3|30}
+    {4|40}
+    {5|50}
+}
+
+# Test DELETE with EXISTS and empty subquery result
+do_execsql_test_on_specific_db {:memory:} delete-exists-empty-1 {
+    CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT);
+    CREATE TABLE t2 (ref_id INTEGER);
+    INSERT INTO t1 VALUES (1, 'a'), (2, 'b'), (3, 'c');
+    DELETE FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.ref_id = t1.id);
+    SELECT id, val FROM t1 ORDER BY id;
+} {
+    {1|a}
+    {2|b}
+    {3|c}
+}
