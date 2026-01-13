@@ -665,7 +665,7 @@ mod shuttle_tests {
         for i in 0..NUM_THREADS {
             let read_buf = Arc::new(Buffer::new_temporary(100));
             let pos = (i * 100) as u64;
-            let c = Completion::new_read(read_buf.clone(), |_| {});
+            let c = Completion::new_read(read_buf.clone(), |_| None);
             let c = file.pread(pos, c).unwrap();
             wait_completion_ok(io.as_ref(), &c);
 
@@ -707,7 +707,7 @@ mod shuttle_tests {
             let io = io.clone();
             handles.push(thread::spawn(move || {
                 let read_buf = Arc::new(Buffer::new_temporary(100));
-                let c = Completion::new_read(read_buf.clone(), |_| {});
+                let c = Completion::new_read(read_buf.clone(), |_| None);
                 let c = file.pread(0, c).unwrap();
                 wait_completion_ok(io.as_ref(), &c);
 
@@ -738,7 +738,7 @@ mod shuttle_tests {
 
         // Verify the write at offset 500 succeeded
         let read_buf = Arc::new(Buffer::new_temporary(100));
-        let c = Completion::new_read(read_buf.clone(), |_| {});
+        let c = Completion::new_read(read_buf.clone(), |_| None);
         let c = file.pread(500, c).unwrap();
         wait_completion_ok(io.as_ref(), &c);
         assert!(
@@ -869,7 +869,7 @@ mod shuttle_tests {
             let io = io.clone();
             handles.push(thread::spawn(move || {
                 let buf = Arc::new(Buffer::new_temporary(100));
-                let c = Completion::new_read(buf.clone(), |_| {});
+                let c = Completion::new_read(buf.clone(), |_| None);
                 let c = file.pread(0, c).unwrap();
                 wait_completion_ok(io.as_ref(), &c);
 
@@ -895,7 +895,7 @@ mod shuttle_tests {
 
         // After all threads complete, verify pwritev data is present
         let read_buf = Arc::new(Buffer::new_temporary(300));
-        let c = Completion::new_read(read_buf.clone(), |_| {});
+        let c = Completion::new_read(read_buf.clone(), |_| None);
         let c = file.pread(0, c).unwrap();
         wait_completion_ok(io.as_ref(), &c);
 
@@ -945,7 +945,7 @@ mod shuttle_tests {
 
                 // Read back and verify
                 let read_buf = Arc::new(Buffer::new_temporary(200));
-                let c = Completion::new_read(read_buf.clone(), |_| {});
+                let c = Completion::new_read(read_buf.clone(), |_| None);
                 let c = file.pread(0, c).unwrap();
                 wait_completion_ok(io.as_ref(), &c);
 
@@ -1025,6 +1025,7 @@ mod shuttle_tests {
                     if let Ok((_, n)) = res {
                         bytes_read_clone.store(n as usize, Ordering::SeqCst);
                     }
+                    None
                 });
                 let c = file.pread(200, c).unwrap(); // Past EOF
                                                      // Reading past EOF succeeds with 0 bytes read
@@ -1214,7 +1215,7 @@ mod shuttle_tests {
         for i in 0..2 {
             let read_buf = Arc::new(Buffer::new_temporary(10000));
             let pos = (i * 10000) as u64;
-            let c = Completion::new_read(read_buf.clone(), |_| {});
+            let c = Completion::new_read(read_buf.clone(), |_| None);
             let c = file.pread(pos, c).unwrap();
             wait_completion_ok(io.as_ref(), &c);
 
@@ -1314,6 +1315,7 @@ mod shuttle_tests {
                     if let Ok((_, n)) = res {
                         bytes_read_clone.store(n as usize, Ordering::SeqCst);
                     }
+                    None
                 });
                 let c = file.pread(100, c).unwrap();
                 wait_completion_ok(io.as_ref(), &c);
@@ -1425,7 +1427,7 @@ mod shuttle_tests {
 
         // Read back and verify we got one of the written values
         let read_buf = Arc::new(Buffer::new_temporary(100));
-        let c = Completion::new_read(read_buf.clone(), |_| {});
+        let c = Completion::new_read(read_buf.clone(), |_| None);
         let c = file.pread(0, c).unwrap();
         wait_completion_ok(io.as_ref(), &c);
 
