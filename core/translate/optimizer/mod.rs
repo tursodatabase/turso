@@ -135,7 +135,7 @@ fn optimize_delete_plan(plan: &mut DeletePlan, schema: &Schema) -> Result<()> {
         &mut plan.where_clause,
         &mut plan.order_by,
         &mut None,
-        &[],
+        &plan.non_from_clause_subqueries,
         &mut plan.limit,
         &mut plan.offset,
     )?;
@@ -163,7 +163,7 @@ fn optimize_update_plan(
         &mut plan.where_clause,
         &mut plan.order_by,
         &mut None,
-        &[],
+        &plan.non_from_clause_subqueries,
         &mut plan.limit,
         &mut plan.offset,
     )?;
