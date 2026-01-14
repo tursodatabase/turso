@@ -3,7 +3,7 @@ use crate::numeric::StrToF64;
 use crate::schema::ColDef;
 use crate::sync::Mutex;
 use crate::translate::emitter::TransactionMode;
-use crate::translate::expr::{walk_expr_mut, WalkControl};
+use crate::translate::expr::{walk_expr, walk_expr_mut, WalkControl};
 use crate::translate::plan::JoinedTable;
 use crate::translate::planner::parse_row_id;
 use crate::types::IOResult;
@@ -783,6 +783,22 @@ pub fn exprs_are_equivalent(expr1: &Expr, expr2: &Expr) -> bool {
         // fall back to naive equality check
         _ => expr1 == expr2,
     }
+}
+
+/// "evaluate" an expression to determine if it contains a poisonous NULL
+/// which will propagate through most expressions and result in it's evaluation
+/// into NULL. This is used to prevent things like the following:
+/// `ALTER TABLE t ADD COLUMN (a NOT NULL DEFAULT (NULL + 5)`
+pub(crate) fn expr_contains_null(expr: &ast::Expr) -> bool {
+    let mut contains_null = false;
+    let _ = walk_expr(expr, &mut |expr: &ast::Expr| -> Result<WalkControl> {
+        if let ast::Expr::Literal(ast::Literal::Null) = expr {
+            contains_null = true;
+            return Ok(WalkControl::SkipChildren);
+        }
+        Ok(WalkControl::Continue)
+    }); // infallible
+    contains_null
 }
 
 // this function returns the affinity type and whether the type name was exactly "INTEGER"

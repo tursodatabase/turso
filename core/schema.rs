@@ -2162,9 +2162,13 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
     })
 }
 
+/// SQLite treats bare identifiers in DEFAULT clauses as string literals.
+/// E.g., `DEFAULT hello` becomes the string "hello", not a column reference.
 pub fn translate_ident_to_string_literal(expr: &Expr) -> Option<Box<Expr>> {
     match expr {
-        Expr::Name(name) => Some(Box::new(Expr::Literal(Literal::String(name.as_literal())))),
+        Expr::Name(name) | Expr::Id(name) => {
+            Some(Box::new(Expr::Literal(Literal::String(name.as_literal()))))
+        }
         _ => None,
     }
 }
