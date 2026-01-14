@@ -410,3 +410,17 @@ do_execsql_test_on_specific_db {:memory:} group_by_where_false {
     INSERT INTO t0 VALUES (1);
     SELECT c0, COUNT(*) FROM t0 WHERE 0 GROUP BY c0;
 } {}
+
+# Regression test for issue #2923: ORDER BY aggregate not in SELECT
+# The ORDER BY expression uses an aggregate (max(email)) that is not mentioned
+# in the SELECT clause. This requires correct expression matching between
+# the ORDER BY aggregate and the computed aggregate value.
+do_execsql_test_on_specific_db {:memory:} groupby_orderby_agg_not_in_select {
+    CREATE TABLE t2923 (name TEXT, value INT, email TEXT);
+    INSERT INTO t2923 VALUES ('Alice', 10, 'z@example.com');
+    INSERT INTO t2923 VALUES ('Alice', 20, 'a@example.com');
+    INSERT INTO t2923 VALUES ('Bob', 30, 'y@example.com');
+    INSERT INTO t2923 VALUES ('Bob', 40, 'b@example.com');
+    SELECT name, sum(value) FROM t2923 GROUP BY name ORDER BY max(email) DESC;
+} {Alice|30
+Bob|70}
