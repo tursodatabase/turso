@@ -3500,7 +3500,7 @@ fn translate_like_base(
                 },
             });
         }
-        #[cfg(not(feature = "fts"))]
+        #[cfg(any(not(feature = "fts"), target_family = "wasm"))]
         ast::LikeOperator::Match => {
             crate::bail_parse_error!("MATCH requires the 'fts' feature to be enabled")
         }
