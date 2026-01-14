@@ -1296,9 +1296,16 @@ impl JoinedTable {
             Plan::Select(select_plan) => {
                 (&select_plan.result_columns, &select_plan.table_references)
             }
-            Plan::CompoundSelect { right_most, .. } => {
-                // For compound selects, use the rightmost select's result columns
-                (&right_most.result_columns, &right_most.table_references)
+            Plan::CompoundSelect {
+                left, right_most, ..
+            } => {
+                // For compound selects, SQLite uses the leftmost select's column names.
+                // The leftmost select is left[0] if the vec is not empty, otherwise right_most.
+                if !left.is_empty() {
+                    (&left[0].0.result_columns, &left[0].0.table_references)
+                } else {
+                    (&right_most.result_columns, &right_most.table_references)
+                }
             }
             Plan::Delete(_) | Plan::Update(_) => {
                 unreachable!("DELETE/UPDATE plans cannot be subqueries")

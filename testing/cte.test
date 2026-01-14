@@ -207,3 +207,110 @@ do_execsql_test_on_specific_db {:memory:} cte-update-returning {
     INSERT INTO t VALUES (1),(2),(3);
     WITH vals AS (SELECT 1 as x) UPDATE t SET x = x + 100 WHERE x IN (SELECT x FROM vals) RETURNING x;
 } {101}
+
+# =============================================================================
+# Compound SELECT column name propagation to downstream CTEs
+# SQLite uses the leftmost SELECT's column names for compound queries
+# =============================================================================
+
+# Column names from UNION propagate to downstream CTEs
+do_execsql_test_on_specific_db {:memory:} cte-compound-colname-union {
+    WITH t1 AS (SELECT 1 AS x UNION SELECT 2), t2 AS (SELECT x FROM t1) SELECT * FROM t2 ORDER BY 1;
+} {1
+2}
+
+# Column names from UNION ALL propagate to downstream CTEs
+do_execsql_test_on_specific_db {:memory:} cte-compound-colname-union-all {
+    WITH t1 AS (SELECT 1 AS x UNION ALL SELECT 2), t2 AS (SELECT x FROM t1 WHERE x > 0) SELECT * FROM t2 ORDER BY 1;
+} {1
+2}
+
+# Column names from INTERSECT propagate to downstream CTEs
+do_execsql_test_on_specific_db {:memory:} cte-compound-colname-intersect {
+    WITH t1 AS (SELECT 1 AS x INTERSECT SELECT 1), t2 AS (SELECT x FROM t1) SELECT * FROM t2;
+} {1}
+
+# Column names from EXCEPT propagate to downstream CTEs
+do_execsql_test_on_specific_db {:memory:} cte-compound-colname-except {
+    WITH t1 AS (SELECT 1 AS x EXCEPT SELECT 2), t2 AS (SELECT x FROM t1) SELECT * FROM t2;
+} {1}
+
+# Multiple columns with aliased names from compound CTE
+do_execsql_test_on_specific_db {:memory:} cte-compound-colname-multi {
+    WITH t1 AS (SELECT 1 AS a, 2 AS b UNION SELECT 3, 4), t2 AS (SELECT a, b, a + b AS sum FROM t1) SELECT * FROM t2 ORDER BY a;
+} {1|2|3
+3|4|7}
+
+# =============================================================================
+# Compound SELECT in FROM clause subqueries
+# =============================================================================
+
+# Basic UNION in FROM clause subquery
+do_execsql_test_on_specific_db {:memory:} cte-compound-from-union {
+    SELECT * FROM (SELECT 1 UNION SELECT 2) ORDER BY 1;
+} {1
+2}
+
+# UNION ALL in FROM clause subquery
+do_execsql_test_on_specific_db {:memory:} cte-compound-from-union-all {
+    SELECT * FROM (SELECT 1 UNION ALL SELECT 2) ORDER BY 1;
+} {1
+2}
+
+# INTERSECT in FROM clause subquery
+do_execsql_test_on_specific_db {:memory:} cte-compound-from-intersect {
+    SELECT * FROM (SELECT 1 INTERSECT SELECT 1);
+} {1}
+
+# EXCEPT in FROM clause subquery
+do_execsql_test_on_specific_db {:memory:} cte-compound-from-except {
+    SELECT * FROM (SELECT 1 EXCEPT SELECT 2);
+} {1}
+
+# Compound SELECT in FROM with alias
+do_execsql_test_on_specific_db {:memory:} cte-compound-from-alias {
+    SELECT * FROM (SELECT 1 UNION SELECT 2) AS t ORDER BY 1;
+} {1
+2}
+
+# Compound SELECT in FROM with aggregate in outer query
+do_execsql_test_on_specific_db {:memory:} cte-compound-from-aggregate {
+    SELECT COUNT(*), SUM(val) FROM (SELECT 1 AS val UNION ALL SELECT 2 UNION ALL SELECT 3);
+} {3|6}
+
+# =============================================================================
+# CTEs visibility in scalar subqueries in SELECT list
+# =============================================================================
+
+# Basic CTE in scalar subquery without FROM clause
+do_execsql_test_on_specific_db {:memory:} cte-scalar-subquery-no-from {
+    WITH t AS (SELECT 1 AS x) SELECT (SELECT x FROM t) AS subq;
+} {1}
+
+# CTE in scalar subquery with aggregation
+do_execsql_test_on_specific_db {:memory:} cte-scalar-subquery-aggregate {
+    WITH t AS (SELECT 1 AS x UNION ALL SELECT 2 UNION ALL SELECT 3) SELECT (SELECT SUM(x) FROM t) AS total;
+} {6}
+
+# CTE in scalar subquery with outer FROM clause
+do_execsql_test_on_specific_db {:memory:} cte-scalar-subquery-with-from {
+    CREATE TABLE tbl(id);
+    INSERT INTO tbl VALUES (1),(2);
+    WITH c AS (SELECT 100 AS val) SELECT id, (SELECT val FROM c) AS const FROM tbl ORDER BY id;
+} {1|100
+2|100}
+
+# Multiple CTEs referenced in different scalar subqueries
+do_execsql_test_on_specific_db {:memory:} cte-scalar-subquery-multi-cte {
+    WITH a AS (SELECT 10 AS x), b AS (SELECT 20 AS y) SELECT (SELECT x FROM a), (SELECT y FROM b);
+} {10|20}
+
+# CTE chain referenced in scalar subquery
+do_execsql_test_on_specific_db {:memory:} cte-scalar-subquery-chain {
+    WITH a AS (SELECT 5 AS x), b AS (SELECT x * 2 AS y FROM a) SELECT (SELECT y FROM b);
+} {10}
+
+# CTE with compound SELECT in scalar subquery
+do_execsql_test_on_specific_db {:memory:} cte-scalar-subquery-compound {
+    WITH t AS (SELECT 1 UNION SELECT 2 UNION SELECT 3) SELECT (SELECT COUNT(*) FROM t);
+} {3}
