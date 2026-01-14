@@ -116,7 +116,7 @@ pub fn update_for_table(
 
     let table_clone = table.clone();
     if updatable.is_empty() {
-        return optional_where_clause(&table_clone, &condition_profile)
+        return optional_where_clause(&table_clone, None, &condition_profile)
             .prop_map(move |where_clause| UpdateStatement {
                 table: table_name.clone(),
                 assignments: vec![],
@@ -136,7 +136,7 @@ pub fn update_for_table(
 
     (
         proptest::sample::subsequence(col_indices, 1..=updatable.len()),
-        optional_where_clause(&table_clone, &condition_profile),
+        optional_where_clause(&table_clone, None, &condition_profile),
     )
         .prop_flat_map(move |(indices, where_clause)| {
             let selected_cols: Vec<&ColumnDef> =

@@ -59,7 +59,7 @@ pub fn delete_for_table(
     let table_name = table.name.clone();
     let condition_profile = &profile.condition_profile;
 
-    optional_where_clause(table, condition_profile)
+    optional_where_clause(table, None, condition_profile)
         .prop_map(move |where_clause| DeleteStatement {
             table: table_name.clone(),
             where_clause,

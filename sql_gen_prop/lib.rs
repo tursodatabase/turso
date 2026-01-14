@@ -40,7 +40,10 @@ pub mod view;
 pub use alter_table::{
     AlterTableContext, AlterTableOp, AlterTableOpKind, AlterTableOpWeights, AlterTableStatement,
 };
-pub use condition::{ComparisonOp, Condition, LogicalOp, OrderByItem, OrderDirection};
+pub use condition::{
+    ComparisonOp, Condition, ConditionProfile, LogicalOp, OrderByItem, OrderDirection,
+    SubqueryProfile, SubqueryQuantifier, SubquerySelect,
+};
 pub use create_index::{CreateIndexStatement, IndexColumn};
 pub use create_table::{ColumnProfile, CreateTableStatement, DataTypeWeights, PrimaryKeyProfile};
 pub use create_trigger::{
@@ -60,7 +63,7 @@ pub use function::{
 pub use generator::{SqlGeneratorKind, WeightedKindIteratorExt};
 pub use insert::InsertStatement;
 pub use profile::{
-    ConditionProfile, CreateIndexProfile, CreateTableProfile, CreateTriggerProfile, DeleteProfile,
+    CreateIndexProfile, CreateTableProfile, CreateTriggerProfile, DeleteProfile,
     ExtendedExpressionProfile, ExtendedFunctionProfile, GenerationProfile, InsertProfile,
     SelectProfile, StatementProfile, UpdateProfile, ValueProfile, WeightedProfile,
 };
@@ -89,6 +92,9 @@ pub mod strategies {
         expression_condition, logical_op, optional_where_clause,
         optional_where_clause_with_expressions, order_by_for_table,
         order_by_for_table_with_expressions, order_direction, simple_condition,
+        // Subquery strategies
+        comparison_subquery_condition, exists_condition, in_subquery_condition,
+        subquery_select_for_table,
     };
     // CREATE INDEX
     pub use crate::create_index::{create_index, create_index_for_table, index_column};

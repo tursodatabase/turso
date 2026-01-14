@@ -254,7 +254,7 @@ pub fn select_for_table(
 
     (
         columns_strategy,
-        optional_where_clause(table, &condition_profile),
+        optional_where_clause(table, None, &condition_profile),
         order_by_for_table(table, &condition_profile),
         proptest::option::of(limit_range),
         proptest::option::of(offset_range),
