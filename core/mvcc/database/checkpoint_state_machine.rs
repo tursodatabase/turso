@@ -13,8 +13,8 @@ use crate::sync::Arc;
 use crate::sync::RwLock;
 use crate::types::{IOCompletions, IOResult, ImmutableRecord};
 use crate::{
-    CheckpointResult, Completion, Connection, IOExt, LimboError, Pager, Result, TransactionState,
-    Value, ValueRef,
+    CheckpointResult, Completion, Connection, IOExt, LimboError, Pager, Result, SyncMode,
+    TransactionState, Value, ValueRef,
 };
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU64;
@@ -114,6 +114,8 @@ pub struct CheckpointStateMachine<Clock: LogicalClock> {
     /// process in a transaction we don't want to change the state as we assume we are already on a
     /// write transaction and any failure will be cleared on vdbe error handling.
     update_transaction_state: bool,
+    /// The synchronous mode for fsync operations. When set to Off, fsync is skipped.
+    sync_mode: SyncMode,
 }
 
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
@@ -146,6 +148,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
         mvstore: Arc<MvStore<Clock>>,
         connection: Arc<Connection>,
         update_transaction_state: bool,
+        sync_mode: SyncMode,
     ) -> Self {
         let checkpoint_lock = mvstore.blocking_checkpoint_lock.clone();
         let index_id_to_index = connection
@@ -187,6 +190,7 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             index_id_to_index,
             checkpoint_result: None,
             update_transaction_state,
+            sync_mode,
         }
     }
 
@@ -1048,6 +1052,12 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
             }
 
             CheckpointState::FsyncLogicalLog => {
+                // Skip fsync when synchronous mode is off
+                if self.sync_mode == SyncMode::Off {
+                    tracing::debug!("Skipping fsync of logical log file (synchronous=off)");
+                    self.state = CheckpointState::CheckpointWal;
+                    return Ok(TransitionResult::Continue);
+                }
                 tracing::debug!("Fsyncing logical log file");
                 let c = self.fsync_logical_log()?;
                 self.state = CheckpointState::CheckpointWal;

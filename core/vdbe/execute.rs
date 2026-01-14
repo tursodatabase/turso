@@ -364,6 +364,7 @@ pub fn op_checkpoint(
             mv_store.clone(),
             program.connection.clone(),
             true,
+            program.connection.get_sync_mode(),
         ));
         let CheckpointResult {
             num_attempted,
@@ -10802,6 +10803,7 @@ fn op_journal_mode_inner(
                                 mv_store.clone(),
                                 program.connection.clone(),
                                 true,
+                                program.connection.get_sync_mode(),
                             )));
                     }
 
