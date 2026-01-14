@@ -16,24 +16,24 @@ do_execsql_test_on_specific_db {:memory:} cte-chain {
     WITH a AS (SELECT 1 as x), b AS (SELECT x FROM a), c AS (SELECT x FROM b), d AS (SELECT x FROM c) SELECT * FROM d;
 } {1}
 
-# CTE with UNION (previously failed)
+# CTE with UNION
 do_execsql_test_on_specific_db {:memory:} cte-union {
     WITH t AS (SELECT 1 as x UNION SELECT 2) SELECT * FROM t ORDER BY 1;
 } {1
 2}
 
-# CTE with UNION ALL (previously failed)
+# CTE with UNION ALL
 do_execsql_test_on_specific_db {:memory:} cte-union-all {
     WITH t AS (SELECT 1 as x UNION ALL SELECT 2) SELECT * FROM t ORDER BY 1;
 } {1
 2}
 
-# CTE with INTERSECT (previously failed)
+# CTE with INTERSECT
 do_execsql_test_on_specific_db {:memory:} cte-intersect {
     WITH t AS (SELECT 1 as x INTERSECT SELECT 1) SELECT * FROM t;
 } {1}
 
-# CTE with EXCEPT (previously failed)
+# CTE with EXCEPT
 do_execsql_test_on_specific_db {:memory:} cte-except {
     WITH t AS (SELECT 1 as x EXCEPT SELECT 2) SELECT * FROM t;
 } {1}
@@ -60,9 +60,6 @@ do_execsql_test_on_specific_db {:memory:} cte-union-multi-ref {
 2|2}
 
 # CTE with UNION and aggregate
-# Note: Column naming in compound select CTEs has a known limitation
-# where aliases from the first SELECT are not propagated - this is a
-# separate issue from compound query support in CTEs
 do_execsql_test_on_specific_db {:memory:} cte-union-aggregate {
     WITH t AS (SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3) SELECT COUNT(*) FROM t;
 } {3}
