@@ -17,7 +17,7 @@ permissions:
 
 jobs:
   benchmarks:
-    runs-on: ubuntu-latest
+    runs-on: codspeed-macro
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
@@ -50,7 +50,7 @@ jobs:
       - name: Run benchmarks (excluding TPC-H)
         uses: CodSpeedHQ/action@v4.5.2
         with:
-          mode: simulation
+          mode: walltime
           run: cargo codspeed run
 
   # tpc-h:
