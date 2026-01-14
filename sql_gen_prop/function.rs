@@ -20,6 +20,7 @@
 use std::fmt;
 
 use proptest::prelude::*;
+use strum::IntoEnumIterator;
 
 use crate::generator::SqlGeneratorKind;
 use crate::schema::DataType;
@@ -283,6 +284,12 @@ impl FunctionProfile {
             FunctionCategory::Window => self.window_weight,
             FunctionCategory::Other => self.other_weight,
         }
+    }
+
+    pub fn enabled_operations(&self) -> impl Iterator<Item = (FunctionCategory, u32)> {
+        FunctionCategory::iter()
+            .map(|cat| (cat, self.weight_for(cat)))
+            .filter(|(_, w)| *w > 0)
     }
 }
 

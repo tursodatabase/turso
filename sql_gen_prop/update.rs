@@ -75,7 +75,7 @@ pub fn update_for_table(table: &Table) -> BoxedStrategy<UpdateStatement> {
                 .iter()
                 .map(|c| {
                     let name = c.name.clone();
-                    crate::expression::expression_for_type(Some(&c.data_type), &ctx, 2)
+                    crate::expression::expression_for_type(Some(&c.data_type), &ctx)
                         .prop_map(move |expr| (name.clone(), expr))
                         .boxed()
                 })

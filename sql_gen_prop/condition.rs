@@ -223,7 +223,7 @@ pub fn expression_condition(
 
     let comparison = (
         comparison_op(),
-        crate::expression::expression_for_type(Some(&data_type), &ctx_clone, 1),
+        crate::expression::expression_for_type(Some(&data_type), &ctx_clone),
     )
         .prop_map(move |(op, right)| Condition::Comparison {
             left: col_expr.clone(),

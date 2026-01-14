@@ -51,7 +51,9 @@ pub use delete::DeleteStatement;
 pub use drop_index::DropIndexStatement;
 pub use drop_table::DropTableStatement;
 pub use drop_trigger::DropTriggerStatement;
-pub use expression::{BinaryOperator, Expression, ExpressionContext, UnaryOperator};
+pub use expression::{
+    BinaryOperator, Expression, ExpressionContext, ExpressionKind, ExpressionProfile, UnaryOperator,
+};
 pub use function::{
     Arity, FunctionCategory, FunctionContext, FunctionDef, FunctionProfile, FunctionRegistry,
 };
@@ -126,10 +128,7 @@ pub mod strategies {
     };
     pub use crate::drop_trigger::{drop_trigger, drop_trigger_for_schema};
     // Expressions
-    pub use crate::expression::{
-        column_expression, expression, expression_for_type, function_call_expression,
-        select_expression_for_table, value_expression, where_expression_for_table,
-    };
+    pub use crate::expression::{expression, expression_for_type};
     // Functions
     pub use crate::function::{
         aggregate_function, aggregate_functions, blob_functions, builtin_functions,

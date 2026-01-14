@@ -48,7 +48,7 @@ pub fn insert_for_table(table: &Table) -> BoxedStrategy<InsertStatement> {
 
     let value_strategies: Vec<BoxedStrategy<Expression>> = columns
         .iter()
-        .map(|c| crate::expression::expression_for_type(Some(&c.data_type), &ctx, 2))
+        .map(|c| crate::expression::expression_for_type(Some(&c.data_type), &ctx))
         .collect();
 
     value_strategies
