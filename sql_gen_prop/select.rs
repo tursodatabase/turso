@@ -4,9 +4,7 @@ use proptest::prelude::*;
 use std::fmt;
 use std::ops::RangeInclusive;
 
-use crate::condition::{
-    Condition, ConditionProfile, OrderByItem, optional_where_clause, order_by_for_table,
-};
+use crate::condition::{ConditionProfile, OrderByItem, optional_where_clause, order_by_for_table};
 use crate::expression::{Expression, ExpressionContext, ExpressionProfile};
 use crate::function::builtin_functions;
 use crate::schema::{Schema, TableRef};
@@ -157,7 +155,7 @@ pub struct SelectStatement {
     pub table: String,
     /// The columns/expressions in the SELECT list. Empty means SELECT *.
     pub columns: Vec<Expression>,
-    pub where_clause: Option<Condition>,
+    pub where_clause: Option<Expression>,
     pub order_by: Vec<OrderByItem>,
     pub limit: Option<u32>,
     pub offset: Option<u32>,
@@ -276,7 +274,8 @@ pub fn select_for_table(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::condition::{ComparisonOp, OrderDirection};
+    use crate::condition::OrderDirection;
+    use crate::expression::BinaryOperator;
     use crate::value::SqlValue;
 
     #[test]
@@ -287,11 +286,11 @@ mod tests {
                 Expression::Column("id".to_string()),
                 Expression::Column("name".to_string()),
             ],
-            where_clause: Some(Condition::SimpleComparison {
-                column: "age".to_string(),
-                op: ComparisonOp::Ge,
-                value: SqlValue::Integer(21),
-            }),
+            where_clause: Some(Expression::binary(
+                Expression::Column("age".to_string()),
+                BinaryOperator::Ge,
+                Expression::Value(SqlValue::Integer(21)),
+            )),
             order_by: vec![OrderByItem::column("name", OrderDirection::Asc)],
             limit: Some(10),
             offset: Some(5),

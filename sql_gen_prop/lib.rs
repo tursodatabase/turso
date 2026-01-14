@@ -41,8 +41,7 @@ pub use alter_table::{
     AlterTableContext, AlterTableOp, AlterTableOpKind, AlterTableOpWeights, AlterTableStatement,
 };
 pub use condition::{
-    ComparisonOp, Condition, ConditionProfile, LogicalOp, OrderByItem, OrderDirection,
-    SubqueryProfile, SubqueryQuantifier,
+    ConditionProfile, OrderByItem, OrderDirection, SubqueryProfile, SubqueryQuantifier,
 };
 pub use create_index::{CreateIndexStatement, IndexColumn};
 pub use create_table::{ColumnProfile, CreateTableStatement, DataTypeWeights, PrimaryKeyProfile};

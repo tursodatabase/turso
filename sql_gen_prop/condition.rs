@@ -1,11 +1,15 @@
 //! WHERE clause conditions and generation strategies.
+//!
+//! This module provides strategies for generating WHERE clause expressions.
+//! The main types are now in the expression module; this module provides
+//! generation strategies.
 
 use proptest::prelude::*;
 use std::fmt;
 
 use std::rc::Rc;
 
-use crate::expression::{Expression, ExpressionContext};
+use crate::expression::{BinaryOperator, Expression, ExpressionContext};
 use crate::function::{FunctionRegistry, builtin_functions};
 use crate::schema::{ColumnDef, DataType, Schema, TableRef};
 use crate::select::SelectStatement;
@@ -297,210 +301,6 @@ impl fmt::Display for SubqueryQuantifier {
     }
 }
 
-// =============================================================================
-// COMPARISON AND LOGICAL OPERATORS
-// =============================================================================
-
-/// Comparison operators for WHERE clauses.
-#[derive(Debug, Clone, Copy)]
-pub enum ComparisonOp {
-    Eq,
-    Ne,
-    Lt,
-    Le,
-    Gt,
-    Ge,
-}
-
-impl fmt::Display for ComparisonOp {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ComparisonOp::Eq => write!(f, "="),
-            ComparisonOp::Ne => write!(f, "!="),
-            ComparisonOp::Lt => write!(f, "<"),
-            ComparisonOp::Le => write!(f, "<="),
-            ComparisonOp::Gt => write!(f, ">"),
-            ComparisonOp::Ge => write!(f, ">="),
-        }
-    }
-}
-
-/// Logical operators for combining conditions.
-#[derive(Debug, Clone, Copy)]
-pub enum LogicalOp {
-    And,
-    Or,
-}
-
-impl fmt::Display for LogicalOp {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            LogicalOp::And => write!(f, "AND"),
-            LogicalOp::Or => write!(f, "OR"),
-        }
-    }
-}
-
-// =============================================================================
-// CONDITION ENUM
-// =============================================================================
-
-/// A WHERE clause condition.
-#[derive(Debug, Clone)]
-pub enum Condition {
-    /// A comparison between two expressions (e.g., `col = value` or `UPPER(name) = 'ALICE'`).
-    Comparison {
-        left: Expression,
-        op: ComparisonOp,
-        right: Expression,
-    },
-    /// Legacy comparison with column name and SqlValue (for backward compatibility).
-    SimpleComparison {
-        column: String,
-        op: ComparisonOp,
-        value: SqlValue,
-    },
-    /// Check if an expression is NULL.
-    IsNull { expr: Expression },
-    /// Check if an expression is NOT NULL.
-    IsNotNull { expr: Expression },
-    /// Legacy IS NULL with column name (for backward compatibility).
-    SimpleIsNull { column: String },
-    /// Legacy IS NOT NULL with column name (for backward compatibility).
-    SimpleIsNotNull { column: String },
-    /// Logical AND of two conditions.
-    And(Box<Condition>, Box<Condition>),
-    /// Logical OR of two conditions.
-    Or(Box<Condition>, Box<Condition>),
-
-    // =========================================================================
-    // SUBQUERY CONDITIONS
-    // =========================================================================
-    /// EXISTS subquery condition (e.g., `EXISTS (SELECT ...)`).
-    Exists { subquery: Box<SelectStatement> },
-    /// NOT EXISTS subquery condition (e.g., `NOT EXISTS (SELECT ...)`).
-    NotExists { subquery: Box<SelectStatement> },
-    /// IN subquery condition (e.g., `expr IN (SELECT ...)`).
-    InSubquery {
-        expr: Expression,
-        subquery: Box<SelectStatement>,
-    },
-    /// NOT IN subquery condition (e.g., `expr NOT IN (SELECT ...)`).
-    NotInSubquery {
-        expr: Expression,
-        subquery: Box<SelectStatement>,
-    },
-    /// Comparison with ANY subquery (e.g., `expr op ANY (SELECT ...)`).
-    AnySubquery {
-        left: Expression,
-        op: ComparisonOp,
-        subquery: Box<SelectStatement>,
-    },
-    /// Comparison with ALL subquery (e.g., `expr op ALL (SELECT ...)`).
-    AllSubquery {
-        left: Expression,
-        op: ComparisonOp,
-        subquery: Box<SelectStatement>,
-    },
-}
-
-impl Condition {
-    /// Create a comparison condition between two expressions.
-    pub fn comparison(left: Expression, op: ComparisonOp, right: Expression) -> Self {
-        Condition::Comparison { left, op, right }
-    }
-
-    /// Create an IS NULL condition on an expression.
-    pub fn is_null(expr: Expression) -> Self {
-        Condition::IsNull { expr }
-    }
-
-    /// Create an IS NOT NULL condition on an expression.
-    pub fn is_not_null(expr: Expression) -> Self {
-        Condition::IsNotNull { expr }
-    }
-
-    /// Create an EXISTS subquery condition.
-    pub fn exists(subquery: SelectStatement) -> Self {
-        Condition::Exists {
-            subquery: Box::new(subquery),
-        }
-    }
-
-    /// Create a NOT EXISTS subquery condition.
-    pub fn not_exists(subquery: SelectStatement) -> Self {
-        Condition::NotExists {
-            subquery: Box::new(subquery),
-        }
-    }
-
-    /// Create an IN subquery condition.
-    pub fn in_subquery(expr: Expression, subquery: SelectStatement) -> Self {
-        Condition::InSubquery {
-            expr,
-            subquery: Box::new(subquery),
-        }
-    }
-
-    /// Create a NOT IN subquery condition.
-    pub fn not_in_subquery(expr: Expression, subquery: SelectStatement) -> Self {
-        Condition::NotInSubquery {
-            expr,
-            subquery: Box::new(subquery),
-        }
-    }
-
-    /// Create a comparison with ANY subquery condition.
-    pub fn any_subquery(left: Expression, op: ComparisonOp, subquery: SelectStatement) -> Self {
-        Condition::AnySubquery {
-            left,
-            op,
-            subquery: Box::new(subquery),
-        }
-    }
-
-    /// Create a comparison with ALL subquery condition.
-    pub fn all_subquery(left: Expression, op: ComparisonOp, subquery: SelectStatement) -> Self {
-        Condition::AllSubquery {
-            left,
-            op,
-            subquery: Box::new(subquery),
-        }
-    }
-}
-
-impl fmt::Display for Condition {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Condition::Comparison { left, op, right } => {
-                write!(f, "{left} {op} {right}")
-            }
-            Condition::SimpleComparison { column, op, value } => {
-                write!(f, "\"{column}\" {op} {value}")
-            }
-            Condition::IsNull { expr } => write!(f, "{expr} IS NULL"),
-            Condition::IsNotNull { expr } => write!(f, "{expr} IS NOT NULL"),
-            Condition::SimpleIsNull { column } => write!(f, "\"{column}\" IS NULL"),
-            Condition::SimpleIsNotNull { column } => write!(f, "\"{column}\" IS NOT NULL"),
-            Condition::And(left, right) => write!(f, "({left} AND {right})"),
-            Condition::Or(left, right) => write!(f, "({left} OR {right})"),
-            // Subquery conditions
-            Condition::Exists { subquery } => write!(f, "EXISTS ({subquery})"),
-            Condition::NotExists { subquery } => write!(f, "NOT EXISTS ({subquery})"),
-            Condition::InSubquery { expr, subquery } => write!(f, "{expr} IN ({subquery})"),
-            Condition::NotInSubquery { expr, subquery } => {
-                write!(f, "{expr} NOT IN ({subquery})")
-            }
-            Condition::AnySubquery { left, op, subquery } => {
-                write!(f, "{left} {op} ANY ({subquery})")
-            }
-            Condition::AllSubquery { left, op, subquery } => {
-                write!(f, "{left} {op} ALL ({subquery})")
-            }
-        }
-    }
-}
-
 /// ORDER BY direction.
 #[derive(Debug, Clone, Copy)]
 pub enum OrderDirection {
@@ -541,21 +341,21 @@ impl fmt::Display for OrderByItem {
     }
 }
 
-/// Generate a comparison operator.
-pub fn comparison_op() -> impl Strategy<Value = ComparisonOp> {
+/// Generate a comparison operator (BinaryOperator for comparisons).
+pub fn comparison_op() -> impl Strategy<Value = BinaryOperator> {
     prop_oneof![
-        Just(ComparisonOp::Eq),
-        Just(ComparisonOp::Ne),
-        Just(ComparisonOp::Lt),
-        Just(ComparisonOp::Le),
-        Just(ComparisonOp::Gt),
-        Just(ComparisonOp::Ge),
+        Just(BinaryOperator::Eq),
+        Just(BinaryOperator::Ne),
+        Just(BinaryOperator::Lt),
+        Just(BinaryOperator::Le),
+        Just(BinaryOperator::Gt),
+        Just(BinaryOperator::Ge),
     ]
 }
 
-/// Generate a logical operator.
-pub fn logical_op() -> impl Strategy<Value = LogicalOp> {
-    prop_oneof![Just(LogicalOp::And), Just(LogicalOp::Or),]
+/// Generate a logical operator (BinaryOperator for And/Or).
+pub fn logical_op() -> impl Strategy<Value = BinaryOperator> {
+    prop_oneof![Just(BinaryOperator::And), Just(BinaryOperator::Or),]
 }
 
 /// Generate an order direction.
@@ -563,8 +363,8 @@ pub fn order_direction() -> impl Strategy<Value = OrderDirection> {
     prop_oneof![Just(OrderDirection::Asc), Just(OrderDirection::Desc),]
 }
 
-/// Generate a simple condition for a column (using legacy SimpleComparison).
-pub fn simple_condition(column: &ColumnDef) -> BoxedStrategy<Condition> {
+/// Generate a simple condition for a column.
+pub fn simple_condition(column: &ColumnDef) -> BoxedStrategy<Expression> {
     let col_name = column.name.clone();
     let col_name2 = column.name.clone();
     let col_name3 = column.name.clone();
@@ -574,21 +374,21 @@ pub fn simple_condition(column: &ColumnDef) -> BoxedStrategy<Condition> {
         comparison_op(),
         value_for_type(&column.data_type, false, &value_profile),
     )
-        .prop_map(move |(op, value)| Condition::SimpleComparison {
-            column: col_name.clone(),
-            op,
-            value,
+        .prop_map(move |(op, value)| {
+            Expression::binary(
+                Expression::Column(col_name.clone()),
+                op,
+                Expression::Value(value),
+            )
         });
 
     if column.nullable {
         prop_oneof![
             comparison,
-            Just(Condition::SimpleIsNull {
-                column: col_name2.clone()
-            }),
-            Just(Condition::SimpleIsNotNull {
-                column: col_name3.clone()
-            }),
+            Just(Expression::is_null(Expression::Column(col_name2.clone()))),
+            Just(Expression::is_not_null(Expression::Column(
+                col_name3.clone()
+            ))),
         ]
         .boxed()
     } else {
@@ -600,7 +400,7 @@ pub fn simple_condition(column: &ColumnDef) -> BoxedStrategy<Condition> {
 pub fn expression_condition(
     column: &ColumnDef,
     ctx: &ExpressionContext,
-) -> BoxedStrategy<Condition> {
+) -> BoxedStrategy<Expression> {
     let col_expr = Expression::Column(column.name.clone());
     let data_type = column.data_type;
     let ctx_clone = ctx.clone();
@@ -609,19 +409,15 @@ pub fn expression_condition(
         comparison_op(),
         crate::expression::expression_for_type(Some(&data_type), &ctx_clone),
     )
-        .prop_map(move |(op, right)| Condition::Comparison {
-            left: col_expr.clone(),
-            op,
-            right,
-        });
+        .prop_map(move |(op, right)| Expression::binary(col_expr.clone(), op, right));
 
     if column.nullable {
         let col_expr2 = Expression::Column(column.name.clone());
         let col_expr3 = Expression::Column(column.name.clone());
         prop_oneof![
             comparison,
-            Just(Condition::IsNull { expr: col_expr2 }),
-            Just(Condition::IsNotNull { expr: col_expr3 }),
+            Just(Expression::is_null(col_expr2)),
+            Just(Expression::is_not_null(col_expr3)),
         ]
         .boxed()
     } else {
@@ -638,7 +434,7 @@ pub fn condition_for_table(
     table: &TableRef,
     schema: &Schema,
     profile: &ConditionProfile,
-) -> BoxedStrategy<Condition> {
+) -> BoxedStrategy<Expression> {
     let functions = builtin_functions();
     condition_for_table_internal(table, schema, &functions, profile, profile.max_depth)
 }
@@ -650,14 +446,14 @@ fn condition_for_table_internal(
     functions: &FunctionRegistry,
     profile: &ConditionProfile,
     depth: u32,
-) -> BoxedStrategy<Condition> {
+) -> BoxedStrategy<Expression> {
     let filterable = table.filterable_columns().collect::<Vec<_>>();
     if filterable.is_empty() {
-        return Just(Condition::Comparison {
-            left: Expression::Value(SqlValue::Integer(1)),
-            op: ComparisonOp::Eq,
-            right: Expression::Value(SqlValue::Integer(1)),
-        })
+        return Just(Expression::binary(
+            Expression::Value(SqlValue::Integer(1)),
+            BinaryOperator::Eq,
+            Expression::Value(SqlValue::Integer(1)),
+        ))
         .boxed();
     }
 
@@ -667,7 +463,7 @@ fn condition_for_table_internal(
         .with_aggregates(false);
 
     // Create leaf strategies from all filterable columns
-    let expr_leaves: Vec<BoxedStrategy<Condition>> = filterable
+    let expr_leaves: Vec<BoxedStrategy<Expression>> = filterable
         .iter()
         .map(|c| expression_condition(c, &ctx))
         .collect();
@@ -675,7 +471,7 @@ fn condition_for_table_internal(
 
     // Build leaf strategy including subqueries if enabled
     let subquery_profile = &profile.subquery_profile;
-    let leaf_strategy: BoxedStrategy<Condition> =
+    let leaf_strategy: BoxedStrategy<Expression> =
         if subquery_profile.any_enabled() && !schema.tables.is_empty() {
             let subquery_total = subquery_profile.total_weight();
             let simple_weight = profile.simple_condition_weight;
@@ -721,7 +517,7 @@ fn condition_for_table_internal(
                 &profile_inner,
                 depth - 1,
             )
-            .prop_map(move |right| Condition::And(Box::new(left.clone()), Box::new(right)))
+            .prop_map(move |right| Expression::and(left.clone(), right))
         })
         .boxed()
 }
@@ -731,18 +527,18 @@ fn subquery_condition_for_tables(
     outer_table: &TableRef,
     tables: &[TableRef],
     profile: &SubqueryProfile,
-) -> BoxedStrategy<Condition> {
+) -> BoxedStrategy<Expression> {
     if tables.is_empty() || !profile.any_enabled() {
-        return Just(Condition::Comparison {
-            left: Expression::Value(SqlValue::Integer(1)),
-            op: ComparisonOp::Eq,
-            right: Expression::Value(SqlValue::Integer(1)),
-        })
+        return Just(Expression::binary(
+            Expression::Value(SqlValue::Integer(1)),
+            BinaryOperator::Eq,
+            Expression::Value(SqlValue::Integer(1)),
+        ))
         .boxed();
     }
 
     // Build weighted strategies for enabled subquery types
-    let mut weighted_strategies: Vec<(u32, BoxedStrategy<Condition>)> = vec![];
+    let mut weighted_strategies: Vec<(u32, BoxedStrategy<Expression>)> = vec![];
 
     if profile.enable_exists && profile.exists_weight > 0 {
         let tables_vec = tables.to_vec();
@@ -833,11 +629,11 @@ fn subquery_condition_for_tables(
     }
 
     if weighted_strategies.is_empty() {
-        return Just(Condition::Comparison {
-            left: Expression::Value(SqlValue::Integer(1)),
-            op: ComparisonOp::Eq,
-            right: Expression::Value(SqlValue::Integer(1)),
-        })
+        return Just(Expression::binary(
+            Expression::Value(SqlValue::Integer(1)),
+            BinaryOperator::Eq,
+            Expression::Value(SqlValue::Integer(1)),
+        ))
         .boxed();
     }
 
@@ -852,7 +648,7 @@ pub fn optional_where_clause(
     table: &TableRef,
     schema: &Schema,
     profile: &ConditionProfile,
-) -> BoxedStrategy<Option<Condition>> {
+) -> BoxedStrategy<Option<Expression>> {
     let table_clone = table.clone();
     let schema_clone = schema.clone();
     let profile_clone = profile.clone();
@@ -979,13 +775,13 @@ pub fn exists_condition(
     subquery_table: &TableRef,
     profile: &SubqueryProfile,
     negated: bool,
-) -> BoxedStrategy<Condition> {
+) -> BoxedStrategy<Expression> {
     subquery_select_for_table(subquery_table, profile, None)
         .prop_map(move |subquery| {
             if negated {
-                Condition::not_exists(subquery)
+                Expression::not_exists(subquery)
             } else {
-                Condition::exists(subquery)
+                Expression::exists(subquery)
             }
         })
         .boxed()
@@ -997,7 +793,7 @@ pub fn in_subquery_condition(
     subquery_table: &TableRef,
     profile: &SubqueryProfile,
     negated: bool,
-) -> BoxedStrategy<Condition> {
+) -> BoxedStrategy<Expression> {
     let filterable: Vec<ColumnDef> = outer_table.filterable_columns().cloned().collect();
 
     if filterable.is_empty() {
@@ -1020,9 +816,9 @@ pub fn in_subquery_condition(
                 move |subquery| {
                     let expr = Expression::Column(col_name.clone());
                     if negated {
-                        Condition::not_in_subquery(expr, subquery)
+                        Expression::not_in_subquery(expr, subquery)
                     } else {
-                        Condition::in_subquery(expr, subquery)
+                        Expression::in_subquery(expr, subquery)
                     }
                 },
             )
@@ -1036,7 +832,7 @@ pub fn comparison_subquery_condition(
     subquery_table: &TableRef,
     profile: &SubqueryProfile,
     quantifier: SubqueryQuantifier,
-) -> BoxedStrategy<Condition> {
+) -> BoxedStrategy<Expression> {
     let filterable: Vec<ColumnDef> = outer_table.filterable_columns().cloned().collect();
 
     if filterable.is_empty() {
@@ -1061,8 +857,8 @@ pub fn comparison_subquery_condition(
                 .prop_map(move |(op, subquery)| {
                     let left = Expression::Column(col_name.clone());
                     match quantifier {
-                        SubqueryQuantifier::Any => Condition::any_subquery(left, op, subquery),
-                        SubqueryQuantifier::All => Condition::all_subquery(left, op, subquery),
+                        SubqueryQuantifier::Any => Expression::any_subquery(left, op, subquery),
+                        SubqueryQuantifier::All => Expression::all_subquery(left, op, subquery),
                     }
                 })
         })
@@ -1072,32 +868,34 @@ pub fn comparison_subquery_condition(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_condition_display() {
-        let cond = Condition::SimpleComparison {
-            column: "age".to_string(),
-            op: ComparisonOp::Gt,
-            value: SqlValue::Integer(18),
-        };
-        assert_eq!(cond.to_string(), "\"age\" > 18");
-
-        let null_cond = Condition::SimpleIsNull {
-            column: "email".to_string(),
-        };
-        assert_eq!(null_cond.to_string(), "\"email\" IS NULL");
-
-        let and_cond = Condition::And(Box::new(cond.clone()), Box::new(null_cond));
-        assert_eq!(and_cond.to_string(), "(\"age\" > 18 AND \"email\" IS NULL)");
-    }
+    use crate::value::SqlValue;
 
     #[test]
     fn test_expression_condition_display() {
-        let cond = Condition::Comparison {
-            left: Expression::function_call("UPPER", vec![Expression::Column("name".to_string())]),
-            op: ComparisonOp::Eq,
-            right: Expression::Value(SqlValue::Text("ALICE".to_string())),
-        };
+        // Simple comparison
+        let cond = Expression::binary(
+            Expression::Column("age".to_string()),
+            BinaryOperator::Gt,
+            Expression::Value(SqlValue::Integer(18)),
+        );
+        assert_eq!(cond.to_string(), "\"age\" > 18");
+
+        // IS NULL
+        let null_cond = Expression::is_null(Expression::Column("email".to_string()));
+        assert_eq!(null_cond.to_string(), "\"email\" IS NULL");
+
+        // AND condition
+        let and_cond = Expression::and(cond.clone(), null_cond);
+        assert_eq!(and_cond.to_string(), "\"age\" > 18 AND \"email\" IS NULL");
+    }
+
+    #[test]
+    fn test_expression_with_function_display() {
+        let cond = Expression::binary(
+            Expression::function_call("UPPER", vec![Expression::Column("name".to_string())]),
+            BinaryOperator::Eq,
+            Expression::Value(SqlValue::Text("ALICE".to_string())),
+        );
         assert_eq!(cond.to_string(), "UPPER(\"name\") = 'ALICE'");
     }
 
@@ -1147,11 +945,11 @@ mod tests {
         let subquery_with_where = SelectStatement {
             table: "users".to_string(),
             columns: vec![],
-            where_clause: Some(Condition::SimpleComparison {
-                column: "active".to_string(),
-                op: ComparisonOp::Eq,
-                value: SqlValue::Integer(1),
-            }),
+            where_clause: Some(Expression::binary(
+                Expression::Column("active".to_string()),
+                BinaryOperator::Eq,
+                Expression::Value(SqlValue::Integer(1)),
+            )),
             order_by: vec![],
             limit: None,
             offset: None,
@@ -1177,11 +975,11 @@ mod tests {
         let subquery_full = SelectStatement {
             table: "users".to_string(),
             columns: vec![Expression::Column("id".to_string())],
-            where_clause: Some(Condition::SimpleComparison {
-                column: "active".to_string(),
-                op: ComparisonOp::Eq,
-                value: SqlValue::Integer(1),
-            }),
+            where_clause: Some(Expression::binary(
+                Expression::Column("active".to_string()),
+                BinaryOperator::Eq,
+                Expression::Value(SqlValue::Integer(1)),
+            )),
             order_by: vec![],
             limit: Some(100),
             offset: None,
@@ -1195,7 +993,7 @@ mod tests {
     #[test]
     fn test_exists_condition_display() {
         let subquery = test_select("orders");
-        let cond = Condition::exists(subquery);
+        let cond = Expression::exists(subquery);
         assert_eq!(cond.to_string(), "EXISTS (SELECT * FROM \"orders\")");
     }
 
@@ -1204,16 +1002,16 @@ mod tests {
         let subquery = SelectStatement {
             table: "orders".to_string(),
             columns: vec![],
-            where_clause: Some(Condition::SimpleComparison {
-                column: "user_id".to_string(),
-                op: ComparisonOp::Eq,
-                value: SqlValue::Integer(1),
-            }),
+            where_clause: Some(Expression::binary(
+                Expression::Column("user_id".to_string()),
+                BinaryOperator::Eq,
+                Expression::Value(SqlValue::Integer(1)),
+            )),
             order_by: vec![],
             limit: None,
             offset: None,
         };
-        let cond = Condition::not_exists(subquery);
+        let cond = Expression::not_exists(subquery);
         assert_eq!(
             cond.to_string(),
             "NOT EXISTS (SELECT * FROM \"orders\" WHERE \"user_id\" = 1)"
@@ -1230,7 +1028,7 @@ mod tests {
             limit: None,
             offset: None,
         };
-        let cond = Condition::in_subquery(Expression::Column("dept_id".to_string()), subquery);
+        let cond = Expression::in_subquery(Expression::Column("dept_id".to_string()), subquery);
         assert_eq!(
             cond.to_string(),
             "\"dept_id\" IN (SELECT \"id\" FROM \"departments\")"
@@ -1247,7 +1045,7 @@ mod tests {
             limit: None,
             offset: None,
         };
-        let cond = Condition::not_in_subquery(Expression::Column("id".to_string()), subquery);
+        let cond = Expression::not_in_subquery(Expression::Column("id".to_string()), subquery);
         assert_eq!(
             cond.to_string(),
             "\"id\" NOT IN (SELECT \"user_id\" FROM \"blacklist\")"
@@ -1264,9 +1062,9 @@ mod tests {
             limit: None,
             offset: None,
         };
-        let cond = Condition::any_subquery(
+        let cond = Expression::any_subquery(
             Expression::Column("salary".to_string()),
-            ComparisonOp::Gt,
+            BinaryOperator::Gt,
             subquery,
         );
         assert_eq!(
@@ -1285,9 +1083,9 @@ mod tests {
             limit: None,
             offset: None,
         };
-        let cond = Condition::all_subquery(
+        let cond = Expression::all_subquery(
             Expression::Column("score".to_string()),
-            ComparisonOp::Ge,
+            BinaryOperator::Ge,
             subquery,
         );
         assert_eq!(

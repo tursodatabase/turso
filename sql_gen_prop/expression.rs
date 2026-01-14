@@ -19,6 +19,7 @@ use strum::IntoEnumIterator;
 use crate::function::{FunctionCategory, FunctionDef, FunctionProfile, FunctionRegistry};
 use crate::generator::SqlGeneratorKind;
 use crate::schema::{ColumnDef, DataType};
+use crate::select::SelectStatement;
 use crate::value::{SqlValue, value_for_type};
 
 /// A SQL expression that can appear in SELECT lists, WHERE clauses, etc.
@@ -55,7 +56,41 @@ pub enum Expression {
         target_type: DataType,
     },
     /// A subquery expression (for scalar subqueries).
-    Subquery(String),
+    Subquery(Box<SelectStatement>),
+
+    // =========================================================================
+    // CONDITION EXPRESSIONS (for WHERE clauses)
+    // =========================================================================
+    /// IS NULL expression.
+    IsNull { expr: Box<Expression> },
+    /// IS NOT NULL expression.
+    IsNotNull { expr: Box<Expression> },
+    /// EXISTS subquery (e.g., `EXISTS (SELECT ...)`).
+    Exists { subquery: Box<SelectStatement> },
+    /// NOT EXISTS subquery (e.g., `NOT EXISTS (SELECT ...)`).
+    NotExists { subquery: Box<SelectStatement> },
+    /// IN subquery (e.g., `expr IN (SELECT ...)`).
+    InSubquery {
+        expr: Box<Expression>,
+        subquery: Box<SelectStatement>,
+    },
+    /// NOT IN subquery (e.g., `expr NOT IN (SELECT ...)`).
+    NotInSubquery {
+        expr: Box<Expression>,
+        subquery: Box<SelectStatement>,
+    },
+    /// Comparison with ANY subquery (e.g., `expr op ANY (SELECT ...)`).
+    AnySubquery {
+        left: Box<Expression>,
+        op: BinaryOperator,
+        subquery: Box<SelectStatement>,
+    },
+    /// Comparison with ALL subquery (e.g., `expr op ALL (SELECT ...)`).
+    AllSubquery {
+        left: Box<Expression>,
+        op: BinaryOperator,
+        subquery: Box<SelectStatement>,
+    },
 }
 
 /// The kind of expression for generation control.
@@ -250,7 +285,22 @@ impl fmt::Display for Expression {
             Expression::Cast { expr, target_type } => {
                 write!(f, "CAST({expr} AS {target_type})")
             }
-            Expression::Subquery(sql) => write!(f, "({sql})"),
+            Expression::Subquery(subquery) => write!(f, "({subquery})"),
+            // Condition expressions
+            Expression::IsNull { expr } => write!(f, "{expr} IS NULL"),
+            Expression::IsNotNull { expr } => write!(f, "{expr} IS NOT NULL"),
+            Expression::Exists { subquery } => write!(f, "EXISTS ({subquery})"),
+            Expression::NotExists { subquery } => write!(f, "NOT EXISTS ({subquery})"),
+            Expression::InSubquery { expr, subquery } => write!(f, "{expr} IN ({subquery})"),
+            Expression::NotInSubquery { expr, subquery } => {
+                write!(f, "{expr} NOT IN ({subquery})")
+            }
+            Expression::AnySubquery { left, op, subquery } => {
+                write!(f, "{left} {op} ANY ({subquery})")
+            }
+            Expression::AllSubquery { left, op, subquery } => {
+                write!(f, "{left} {op} ALL ({subquery})")
+            }
         }
     }
 }
@@ -302,6 +352,87 @@ impl Expression {
             expr: Box::new(expr),
             target_type,
         }
+    }
+
+    // =========================================================================
+    // CONDITION EXPRESSION HELPERS
+    // =========================================================================
+
+    /// Create an IS NULL expression.
+    pub fn is_null(expr: Expression) -> Self {
+        Expression::IsNull {
+            expr: Box::new(expr),
+        }
+    }
+
+    /// Create an IS NOT NULL expression.
+    pub fn is_not_null(expr: Expression) -> Self {
+        Expression::IsNotNull {
+            expr: Box::new(expr),
+        }
+    }
+
+    /// Create an EXISTS subquery expression.
+    pub fn exists(subquery: SelectStatement) -> Self {
+        Expression::Exists {
+            subquery: Box::new(subquery),
+        }
+    }
+
+    /// Create a NOT EXISTS subquery expression.
+    pub fn not_exists(subquery: SelectStatement) -> Self {
+        Expression::NotExists {
+            subquery: Box::new(subquery),
+        }
+    }
+
+    /// Create an IN subquery expression.
+    pub fn in_subquery(expr: Expression, subquery: SelectStatement) -> Self {
+        Expression::InSubquery {
+            expr: Box::new(expr),
+            subquery: Box::new(subquery),
+        }
+    }
+
+    /// Create a NOT IN subquery expression.
+    pub fn not_in_subquery(expr: Expression, subquery: SelectStatement) -> Self {
+        Expression::NotInSubquery {
+            expr: Box::new(expr),
+            subquery: Box::new(subquery),
+        }
+    }
+
+    /// Create an ANY subquery expression.
+    pub fn any_subquery(left: Expression, op: BinaryOperator, subquery: SelectStatement) -> Self {
+        Expression::AnySubquery {
+            left: Box::new(left),
+            op,
+            subquery: Box::new(subquery),
+        }
+    }
+
+    /// Create an ALL subquery expression.
+    pub fn all_subquery(left: Expression, op: BinaryOperator, subquery: SelectStatement) -> Self {
+        Expression::AllSubquery {
+            left: Box::new(left),
+            op,
+            subquery: Box::new(subquery),
+        }
+    }
+
+    /// Create a comparison expression using BinaryOp.
+    pub fn comparison(left: Expression, op: BinaryOperator, right: Expression) -> Self {
+        Expression::binary(left, op, right)
+    }
+
+    /// Create an AND expression.
+    pub fn and(left: Expression, right: Expression) -> Self {
+        Expression::binary(left, BinaryOperator::And, right)
+    }
+
+    /// Create an OR expression.
+    pub fn or(left: Expression, right: Expression) -> Self {
+        Expression::binary(left, BinaryOperator::Or, right)
     }
 }
 

@@ -3,7 +3,8 @@
 use proptest::prelude::*;
 use std::fmt;
 
-use crate::condition::{Condition, ConditionProfile, optional_where_clause};
+use crate::condition::{ConditionProfile, optional_where_clause};
+use crate::expression::Expression;
 use crate::schema::{Schema, TableRef};
 
 // =============================================================================
@@ -36,7 +37,7 @@ impl DeleteProfile {
 #[derive(Debug, Clone)]
 pub struct DeleteStatement {
     pub table: String,
-    pub where_clause: Option<Condition>,
+    pub where_clause: Option<Expression>,
 }
 
 impl fmt::Display for DeleteStatement {
@@ -71,18 +72,18 @@ pub fn delete_for_table(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::condition::ComparisonOp;
+    use crate::expression::BinaryOperator;
     use crate::value::SqlValue;
 
     #[test]
     fn test_delete_display() {
         let stmt = DeleteStatement {
             table: "users".to_string(),
-            where_clause: Some(Condition::SimpleComparison {
-                column: "id".to_string(),
-                op: ComparisonOp::Eq,
-                value: SqlValue::Integer(1),
-            }),
+            where_clause: Some(Expression::binary(
+                Expression::Column("id".to_string()),
+                BinaryOperator::Eq,
+                Expression::Value(SqlValue::Integer(1)),
+            )),
         };
 
         let sql = stmt.to_string();

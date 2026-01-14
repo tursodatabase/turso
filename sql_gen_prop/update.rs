@@ -3,7 +3,7 @@
 use proptest::prelude::*;
 use std::fmt;
 
-use crate::condition::{Condition, ConditionProfile, optional_where_clause};
+use crate::condition::{ConditionProfile, optional_where_clause};
 use crate::expression::{Expression, ExpressionContext, ExpressionProfile};
 use crate::function::builtin_functions;
 use crate::schema::{ColumnDef, Schema, TableRef};
@@ -78,7 +78,7 @@ pub struct UpdateStatement {
     pub table: String,
     /// Column assignments as (column_name, expression) pairs.
     pub assignments: Vec<(String, Expression)>,
-    pub where_clause: Option<Condition>,
+    pub where_clause: Option<Expression>,
 }
 
 impl fmt::Display for UpdateStatement {
@@ -171,7 +171,7 @@ pub fn update_for_table(
 mod tests {
     use super::*;
     use crate::Table;
-    use crate::condition::ComparisonOp;
+    use crate::expression::BinaryOperator;
     use crate::schema::DataType;
     use crate::value::SqlValue;
 
@@ -186,11 +186,11 @@ mod tests {
                 ),
                 ("age".to_string(), Expression::Value(SqlValue::Integer(30))),
             ],
-            where_clause: Some(Condition::SimpleComparison {
-                column: "id".to_string(),
-                op: ComparisonOp::Eq,
-                value: SqlValue::Integer(1),
-            }),
+            where_clause: Some(Expression::binary(
+                Expression::Column("id".to_string()),
+                BinaryOperator::Eq,
+                Expression::Value(SqlValue::Integer(1)),
+            )),
         };
 
         let sql = stmt.to_string();
