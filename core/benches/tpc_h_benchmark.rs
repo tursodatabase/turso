@@ -1,7 +1,15 @@
 use std::sync::Arc;
 
+#[cfg(not(feature = "codspeed"))]
 use criterion::{black_box, criterion_group, criterion_main, BenchmarkId, Criterion, SamplingMode};
+#[cfg(not(feature = "codspeed"))]
 use pprof::criterion::{Output, PProfProfiler};
+
+#[cfg(feature = "codspeed")]
+use codspeed_criterion_compat::{
+    black_box, criterion_group, criterion_main, BenchmarkId, Criterion, SamplingMode,
+};
+
 use turso_core::{Database, PlatformIO};
 
 const TPC_H_PATH: &str = "../perf/tpc-h/TPC-H.db";
@@ -134,9 +142,18 @@ fn bench_tpc_h_queries(criterion: &mut Criterion) {
     }
 }
 
+#[cfg(not(feature = "codspeed"))]
 criterion_group! {
     name = benches;
     config = Criterion::default().with_profiler(PProfProfiler::new(100, Output::Flamegraph(None)));
     targets = bench_tpc_h_queries
 }
+
+#[cfg(feature = "codspeed")]
+criterion_group! {
+    name = benches;
+    config = Criterion::default();
+    targets = bench_tpc_h_queries
+}
+
 criterion_main!(benches);
