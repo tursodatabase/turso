@@ -605,6 +605,11 @@ do_execsql_test nullif {
   select nullif('limbo', 'limbo')
 } {}
 
+# Regression test: NULLIF with complex first argument that allocates internal registers
+do_execsql_test nullif-complex-first-arg {
+  select nullif((1 IN (2,3)), 5)
+} {0}
+
 do_execsql_test substr-3-args {
   SELECT substr('limbo', 1, 3);
 } {lim}

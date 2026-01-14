@@ -1855,7 +1855,10 @@ pub fn translate_expr(
                                 );
                             }
 
+                            // Allocate both registers first to ensure they're consecutive,
+                            // since translate_expr may allocate internal registers.
                             let first_reg = program.alloc_register();
+                            let second_reg = program.alloc_register();
                             translate_expr(
                                 program,
                                 referenced_tables,
@@ -1863,8 +1866,7 @@ pub fn translate_expr(
                                 first_reg,
                                 resolver,
                             )?;
-                            let second_reg = program.alloc_register();
-                            let _ = translate_expr(
+                            translate_expr(
                                 program,
                                 referenced_tables,
                                 &args[1],
