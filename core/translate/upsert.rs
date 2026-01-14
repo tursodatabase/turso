@@ -7,7 +7,7 @@ use turso_parser::ast::{self, TriggerEvent, TriggerTime, Upsert};
 use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
 use crate::schema::{IndexColumn, ROWID_SENTINEL};
 use crate::translate::emitter::UpdateRowSource;
-use crate::translate::expr::{walk_expr, WalkControl};
+use crate::translate::expr::{rewrite_between_expr, walk_expr, WalkControl};
 use crate::translate::fkeys::{
     emit_fk_child_update_counters, emit_parent_key_change_checks, fire_fk_update_actions,
 };
@@ -1125,6 +1125,7 @@ fn eval_partial_pred_for_row_image(
         return None;
     };
     let mut e = where_expr.as_ref().clone();
+    rewrite_between_expr(&mut e);
     rewrite_expr_to_registers(
         &mut e, table, row_start, rowid_reg, None,  // table_name
         None,  // insertion
