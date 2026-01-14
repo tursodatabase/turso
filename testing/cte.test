@@ -93,3 +93,117 @@ do_execsql_test_on_specific_db {:memory:} cte-intersect-limit {
 do_execsql_test_on_specific_db {:memory:} cte-except-limit {
     WITH t AS (SELECT 1 UNION SELECT 2 EXCEPT SELECT 2 LIMIT 2) SELECT * FROM t;
 } {1}
+
+# =============================================================================
+# CTE with DML statements (INSERT, UPDATE, DELETE)
+# =============================================================================
+
+# CTE with INSERT - basic case
+do_execsql_test_on_specific_db {:memory:} cte-insert-basic {
+    CREATE TABLE t(x);
+    WITH c AS (SELECT 1 as x) INSERT INTO t SELECT * FROM c;
+    SELECT * FROM t;
+} {1}
+
+# CTE with INSERT - multiple rows via UNION
+do_execsql_test_on_specific_db {:memory:} cte-insert-union {
+    CREATE TABLE t(x);
+    WITH c AS (SELECT 1 UNION SELECT 2 UNION SELECT 3) INSERT INTO t SELECT * FROM c;
+    SELECT * FROM t ORDER BY 1;
+} {1
+2
+3}
+
+# CTE with INSERT - CTE chain
+do_execsql_test_on_specific_db {:memory:} cte-insert-chain {
+    CREATE TABLE t(x);
+    WITH a AS (SELECT 1 as x), b AS (SELECT x + 10 FROM a) INSERT INTO t SELECT * FROM b;
+    SELECT * FROM t;
+} {11}
+
+# CTE with DELETE - basic case
+do_execsql_test_on_specific_db {:memory:} cte-delete-basic {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (1),(2),(3);
+    WITH vals AS (SELECT 1 as x) DELETE FROM t WHERE x IN (SELECT x FROM vals);
+    SELECT * FROM t ORDER BY 1;
+} {2
+3}
+
+# CTE with DELETE - multiple values via UNION (using SELECT *)
+do_execsql_test_on_specific_db {:memory:} cte-delete-union {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (1),(2),(3),(4);
+    WITH odd AS (SELECT 1 UNION SELECT 3) DELETE FROM t WHERE x IN (SELECT * FROM odd);
+    SELECT * FROM t ORDER BY 1;
+} {2
+4}
+
+# CTE with DELETE - CTE chain
+do_execsql_test_on_specific_db {:memory:} cte-delete-chain {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (1),(2),(3);
+    WITH a AS (SELECT 1 as x), b AS (SELECT x FROM a) DELETE FROM t WHERE x IN (SELECT x FROM b);
+    SELECT * FROM t ORDER BY 1;
+} {2
+3}
+
+# CTE with UPDATE - basic case in WHERE
+do_execsql_test_on_specific_db {:memory:} cte-update-where {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (1),(2),(3);
+    WITH vals AS (SELECT 1 as x) UPDATE t SET x = x + 10 WHERE x IN (SELECT x FROM vals);
+    SELECT * FROM t ORDER BY 1;
+} {2
+3
+11}
+
+# CTE with UPDATE - CTE chain in WHERE
+do_execsql_test_on_specific_db {:memory:} cte-update-chain {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (1),(2),(3);
+    WITH a AS (SELECT 2 as x), b AS (SELECT x FROM a) UPDATE t SET x = x * 100 WHERE x IN (SELECT x FROM b);
+    SELECT * FROM t ORDER BY 1;
+} {1
+3
+200}
+
+# CTE with multiple CTEs referenced in DML
+# Note: Using SELECT * for compound CTEs due to known column naming limitation
+do_execsql_test_on_specific_db {:memory:} cte-delete-multiple-ctes {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (1),(2),(3),(4),(5);
+    WITH low AS (SELECT 1 UNION SELECT 2), high AS (SELECT 4 UNION SELECT 5)
+    DELETE FROM t WHERE x IN (SELECT * FROM low) OR x IN (SELECT * FROM high);
+    SELECT * FROM t;
+} {3}
+
+# Multiple references to same CTE in WHERE clause (simple CTE without UNION)
+do_execsql_test_on_specific_db {:memory:} cte-multi-ref-where {
+    CREATE TABLE t(x, y);
+    INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);
+    WITH vals AS (SELECT 2 as v)
+    DELETE FROM t WHERE x IN (SELECT v FROM vals) AND y IN (SELECT v * 10 FROM vals);
+    SELECT * FROM t ORDER BY 1;
+} {1|10
+3|30}
+
+# CTE with INSERT and RETURNING
+do_execsql_test_on_specific_db {:memory:} cte-insert-returning {
+    CREATE TABLE t(x);
+    WITH c AS (SELECT 42 as x) INSERT INTO t SELECT * FROM c RETURNING x;
+} {42}
+
+# CTE with DELETE and RETURNING
+do_execsql_test_on_specific_db {:memory:} cte-delete-returning {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (1),(2),(3);
+    WITH vals AS (SELECT 2 as x) DELETE FROM t WHERE x IN (SELECT x FROM vals) RETURNING x;
+} {2}
+
+# CTE with UPDATE and RETURNING
+do_execsql_test_on_specific_db {:memory:} cte-update-returning {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (1),(2),(3);
+    WITH vals AS (SELECT 1 as x) UPDATE t SET x = x + 100 WHERE x IN (SELECT x FROM vals) RETURNING x;
+} {101}

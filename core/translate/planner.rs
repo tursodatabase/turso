@@ -407,6 +407,86 @@ fn plan_cte(
     }
 }
 
+/// Plan CTEs from a WITH clause and add them as outer query references.
+/// This is used by DML statements (DELETE, UPDATE) to make CTEs available
+/// for subqueries in WHERE and SET clauses.
+pub fn plan_ctes_as_outer_refs(
+    with: Option<With>,
+    resolver: &Resolver,
+    program: &mut ProgramBuilder,
+    table_references: &mut TableReferences,
+    connection: &Arc<crate::Connection>,
+) -> Result<()> {
+    let Some(with) = with else {
+        return Ok(());
+    };
+
+    if with.recursive {
+        crate::bail_parse_error!("Recursive CTEs are not yet supported");
+    }
+
+    for cte in with.ctes {
+        if cte.materialized == Materialized::Yes {
+            crate::bail_parse_error!("Materialized CTEs are not yet supported");
+        }
+        if !cte.columns.is_empty() {
+            crate::bail_parse_error!("CTE columns are not yet supported");
+        }
+
+        let cte_name = normalize_ident(cte.tbl_name.as_str());
+
+        // Check for duplicate CTE names
+        if table_references
+            .outer_query_refs()
+            .iter()
+            .any(|r| r.identifier == cte_name)
+        {
+            crate::bail_parse_error!("duplicate WITH table name: {}", cte.tbl_name.as_str());
+        }
+
+        // Check if CTE name conflicts with catalog table
+        if resolver.schema.get_table(&cte_name).is_some() {
+            crate::bail_parse_error!(
+                "CTE name {} conflicts with catalog table name",
+                cte.tbl_name.as_str()
+            );
+        }
+
+        // Plan the CTE SELECT
+        let cte_plan = prepare_select_plan(
+            cte.select,
+            resolver,
+            program,
+            table_references.outer_query_refs(),
+            QueryDestination::placeholder_for_subquery(),
+            connection,
+        )?;
+
+        // Convert plan to JoinedTable to extract column info
+        let joined_table = match cte_plan {
+            Plan::Select(_) | Plan::CompoundSelect { .. } => JoinedTable::new_subquery_from_plan(
+                cte_name.clone(),
+                cte_plan,
+                None,
+                program.table_reference_counter.next(),
+            )?,
+            Plan::Delete(_) | Plan::Update(_) => {
+                crate::bail_parse_error!("Only SELECT queries are supported in CTEs")
+            }
+        };
+
+        // Add CTE as outer query reference so it's available to subqueries
+        table_references.add_outer_query_reference(OuterQueryReference {
+            identifier: cte_name,
+            internal_id: joined_table.internal_id,
+            table: joined_table.table,
+            col_used_mask: ColumnUsedMask::default(),
+        });
+    }
+
+    Ok(())
+}
+
 fn parse_from_clause_table(
     table: ast::SelectTable,
     resolver: &Resolver,
