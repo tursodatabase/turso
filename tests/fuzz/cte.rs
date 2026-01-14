@@ -106,7 +106,7 @@ mod cte_tests {
         (format!("SELECT {}", cols.join(", ")), aliases)
     }
 
-    #[turso_macros::test(mvcc)]
+    #[turso_macros::test]
     pub fn cte_dml_scenario(db: TempDatabase) {
         let _ = env_logger::try_init();
         let (mut rng, seed) = rng_from_time_or_env();
@@ -192,7 +192,7 @@ mod cte_tests {
         }
     }
 
-    #[turso_macros::test(mvcc)]
+    #[turso_macros::test]
     pub fn cte_quoted_names_scenario(db: TempDatabase) {
         let _ = env_logger::try_init();
         let (mut rng, seed) = rng_from_time_or_env();
@@ -250,7 +250,7 @@ mod cte_tests {
 
     /// Tests complex feature interactions: CTE chains with compound selects,
     /// aggregates on CTE joins, multiple references with different operations.
-    #[turso_macros::test(mvcc)]
+    #[turso_macros::test]
     pub fn cte_feature_interaction_scenario(db: TempDatabase) {
         let _ = env_logger::try_init();
         let (mut rng, seed) = rng_from_time_or_env();
@@ -544,7 +544,7 @@ mod cte_tests {
     }
 
     /// Tests CTEs with persistent tables and indexes to exercise query planner paths.
-    #[turso_macros::test(mvcc)]
+    #[turso_macros::test]
     pub fn cte_with_real_tables_scenario(db: TempDatabase) {
         let _ = env_logger::try_init();
         let (mut rng, seed) = rng_from_time_or_env();
@@ -711,7 +711,7 @@ mod cte_tests {
     }
 
     /// Comprehensive CTE fuzz test combining multiple features in each query.
-    #[turso_macros::test(mvcc)]
+    #[turso_macros::test]
     pub fn cte_comprehensive_scenario(db: TempDatabase) {
         let _ = env_logger::try_init();
         let (mut rng, seed) = rng_from_time_or_env();
@@ -1553,7 +1553,7 @@ mod cte_tests {
     }
 
     /// RNG-driven CTE fuzzer that generates truly random CTE queries
-    #[turso_macros::test(mvcc)]
+    #[turso_macros::test]
     pub fn cte_fuzz(db: TempDatabase) {
         let _ = env_logger::try_init();
         let (mut rng, seed) = rng_from_time_or_env();
