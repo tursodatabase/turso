@@ -5,6 +5,7 @@ use std::collections::HashSet;
 use std::fmt;
 use std::ops::RangeInclusive;
 
+use crate::profile::StatementProfile;
 use crate::schema::{ColumnDef, DataType, Schema};
 
 // =============================================================================
@@ -581,14 +582,16 @@ fn if_not_exists_with_probability(probability: u8) -> BoxedStrategy<bool> {
 /// Generate a CREATE TABLE statement with profile.
 pub fn create_table(
     schema: &Schema,
-    profile: &CreateTableProfile,
+    profile: &StatementProfile,
 ) -> BoxedStrategy<CreateTableStatement> {
     let existing_names = schema.table_names();
 
-    let column_count_range = profile.column_count_range.clone();
-    let column_profile = profile.column.clone();
-    let pk_profile = profile.primary_key.clone();
-    let if_not_exists_prob = profile.if_not_exists_probability;
+    // Extract profile values from the CreateTableProfile
+    let create_table_profile = profile.create_table_profile();
+    let column_count_range = create_table_profile.column_count_range.clone();
+    let column_profile = create_table_profile.column.clone();
+    let pk_profile = create_table_profile.primary_key.clone();
+    let if_not_exists_prob = create_table_profile.if_not_exists_probability;
 
     (
         identifier_excluding(existing_names),
@@ -627,6 +630,7 @@ pub fn create_table(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::profile::{StatementProfile, WeightedProfile};
     use crate::schema::SchemaBuilder;
     use proptest::test_runner::TestRunner;
 
@@ -790,14 +794,18 @@ mod tests {
     proptest! {
         #[test]
         fn generated_create_table_has_columns(
-            stmt in create_table(&empty_schema(), &CreateTableProfile::default())
+            stmt in create_table(&empty_schema(), &StatementProfile::default())
         ) {
             prop_assert!(!stmt.columns.is_empty());
         }
 
         #[test]
         fn generated_create_table_with_strict_profile(
-            stmt in create_table(&empty_schema(), &CreateTableProfile::strict())
+            stmt in create_table(
+                &empty_schema(),
+                &StatementProfile::default()
+                    .with_create_table_profile(WeightedProfile::with_extra(1, CreateTableProfile::strict()))
+            )
         ) {
             let sql = stmt.to_string();
             prop_assert!(sql.starts_with("CREATE TABLE"));
@@ -807,7 +815,11 @@ mod tests {
 
         #[test]
         fn generated_create_table_with_small_profile(
-            stmt in create_table(&empty_schema(), &CreateTableProfile::small())
+            stmt in create_table(
+                &empty_schema(),
+                &StatementProfile::default()
+                    .with_create_table_profile(WeightedProfile::with_extra(1, CreateTableProfile::small()))
+            )
         ) {
             // Small profile: 1-3 columns plus optional PK
             prop_assert!(stmt.columns.len() <= 5);

@@ -7,6 +7,7 @@ use std::ops::RangeInclusive;
 use crate::condition::{ConditionProfile, OrderByItem, optional_where_clause, order_by_for_table};
 use crate::expression::{Expression, ExpressionContext, ExpressionProfile};
 use crate::function::builtin_functions;
+use crate::profile::StatementProfile;
 use crate::schema::{Schema, TableRef};
 
 // =============================================================================
@@ -209,22 +210,23 @@ impl fmt::Display for SelectStatement {
 pub fn select_for_table(
     table: &TableRef,
     schema: &Schema,
-    profile: &SelectProfile,
+    profile: &StatementProfile,
 ) -> BoxedStrategy<SelectStatement> {
     let table_name = table.name.clone();
     let col_names: Vec<String> = table.columns.iter().map(|c| c.name.clone()).collect();
     let functions = builtin_functions();
 
-    // Extract profile values
-    let expression_max_depth = profile.expression_max_depth;
-    let allow_aggregates = profile.allow_aggregates;
-    let select_star_weight = profile.select_star_weight;
-    let expression_list_weight = profile.expression_list_weight;
-    let column_list_weight = profile.column_list_weight;
-    let expression_count_range = profile.expression_count_range.clone();
-    let limit_range = profile.limit_range.clone();
-    let offset_range = profile.offset_range.clone();
-    let condition_profile = profile.condition_profile.clone();
+    // Extract profile values from the SelectProfile
+    let select_profile = profile.select_profile();
+    let expression_max_depth = select_profile.expression_max_depth;
+    let allow_aggregates = select_profile.allow_aggregates;
+    let select_star_weight = select_profile.select_star_weight;
+    let expression_list_weight = select_profile.expression_list_weight;
+    let column_list_weight = select_profile.column_list_weight;
+    let expression_count_range = select_profile.expression_count_range.clone();
+    let limit_range = select_profile.limit_range.clone();
+    let offset_range = select_profile.offset_range.clone();
+    let condition_profile = select_profile.condition_profile.clone();
 
     // Build expression context for generating expressions
     let ctx = ExpressionContext::new(functions)
@@ -335,7 +337,7 @@ mod tests {
                 );
                 let schema = crate::schema::SchemaBuilder::new().add_table(table.clone()).build();
                 let table_ref: crate::schema::TableRef = table.into();
-                select_for_table(&table_ref, &schema, &SelectProfile::default())
+                select_for_table(&table_ref, &schema, &StatementProfile::default())
             }
         ) {
             let sql = stmt.to_string();
@@ -361,7 +363,7 @@ mod tests {
             .add_table(table.clone())
             .build();
         let table_ref: crate::schema::TableRef = table.into();
-        let strategy = select_for_table(&table_ref, &schema, &SelectProfile::default());
+        let strategy = select_for_table(&table_ref, &schema, &StatementProfile::default());
 
         let mut runner = TestRunner::default();
         let mut found_function = false;

@@ -251,33 +251,31 @@ impl SqlGeneratorKind for StatementKind {
         let tables = schema.tables.clone();
         match self {
             // DML - all use expression generation
-            StatementKind::Select => table_dml(tables, schema, |t, s| {
-                select_for_table(t, s, &crate::select::SelectProfile::default())
+            StatementKind::Select => table_dml(tables, schema, profile, |t, s, p| {
+                select_for_table(t, s, p)
                     .prop_map(SqlStatement::Select)
                     .boxed()
             }),
-            StatementKind::Insert => table_dml(tables, schema, |t, _s| {
-                insert_for_table(t, &crate::insert::InsertProfile::default())
+            StatementKind::Insert => table_dml(tables, schema, profile, |t, _s, p| {
+                insert_for_table(t, p)
                     .prop_map(SqlStatement::Insert)
                     .boxed()
             }),
-            StatementKind::Update => table_dml(tables, schema, |t, s| {
-                update_for_table(t, s, &crate::update::UpdateProfile::default())
+            StatementKind::Update => table_dml(tables, schema, profile, |t, s, p| {
+                update_for_table(t, s, p)
                     .prop_map(SqlStatement::Update)
                     .boxed()
             }),
-            StatementKind::Delete => table_dml(tables, schema, |t, s| {
-                delete_for_table(t, s, &crate::delete::DeleteProfile::default())
+            StatementKind::Delete => table_dml(tables, schema, profile, |t, s, p| {
+                delete_for_table(t, s, p)
                     .prop_map(SqlStatement::Delete)
                     .boxed()
             }),
 
             // DDL - Tables
-            StatementKind::CreateTable => {
-                create_table(schema, &crate::create_table::CreateTableProfile::default())
-                    .prop_map(SqlStatement::CreateTable)
-                    .boxed()
-            }
+            StatementKind::CreateTable => create_table(schema, profile)
+                .prop_map(SqlStatement::CreateTable)
+                .boxed(),
             StatementKind::DropTable => drop_table_for_schema(schema)
                 .prop_map(SqlStatement::DropTable)
                 .boxed(),
@@ -286,11 +284,9 @@ impl SqlGeneratorKind for StatementKind {
                 .boxed(),
 
             // DDL - Indexes
-            StatementKind::CreateIndex => {
-                create_index(schema, &crate::create_index::CreateIndexProfile::default())
-                    .prop_map(SqlStatement::CreateIndex)
-                    .boxed()
-            }
+            StatementKind::CreateIndex => create_index(schema, profile)
+                .prop_map(SqlStatement::CreateIndex)
+                .boxed(),
             StatementKind::DropIndex => {
                 let index_names: Vec<String> =
                     schema.indexes.iter().map(|i| i.name.clone()).collect();
@@ -347,49 +343,44 @@ impl SqlGeneratorKind for StatementKind {
 }
 
 /// Helper to create a table-based DML strategy.
-fn table_dml<F>(tables: Rc<Vec<TableRef>>, schema: &Schema, f: F) -> BoxedStrategy<SqlStatement>
+fn table_dml<F>(
+    tables: Rc<Vec<TableRef>>,
+    schema: &Schema,
+    profile: &StatementProfile,
+    f: F,
+) -> BoxedStrategy<SqlStatement>
 where
-    F: Fn(&TableRef, &Schema) -> BoxedStrategy<SqlStatement> + 'static,
+    F: Fn(&TableRef, &Schema, &StatementProfile) -> BoxedStrategy<SqlStatement> + 'static,
 {
     let schema_clone = schema.clone();
+    let profile_clone = profile.clone();
     proptest::sample::select((*tables).clone())
-        .prop_flat_map(move |t| f(&t, &schema_clone))
+        .prop_flat_map(move |t| f(&t, &schema_clone, &profile_clone))
         .boxed()
 }
 
 /// Generate a DML (Data Manipulation Language) statement for a table.
 /// Includes SELECT, INSERT, UPDATE, DELETE with expression support.
 pub fn dml_for_table(table: &TableRef, schema: &Schema) -> BoxedStrategy<SqlStatement> {
+    let profile = StatementProfile::default();
     prop_oneof![
-        select_for_table(table, schema, &crate::select::SelectProfile::default())
-            .prop_map(SqlStatement::Select),
-        insert_for_table(table, &crate::insert::InsertProfile::default())
-            .prop_map(SqlStatement::Insert),
-        update_for_table(table, schema, &crate::update::UpdateProfile::default())
-            .prop_map(SqlStatement::Update),
-        delete_for_table(table, schema, &crate::delete::DeleteProfile::default())
-            .prop_map(SqlStatement::Delete),
+        select_for_table(table, schema, &profile).prop_map(SqlStatement::Select),
+        insert_for_table(table, &profile).prop_map(SqlStatement::Insert),
+        update_for_table(table, schema, &profile).prop_map(SqlStatement::Update),
+        delete_for_table(table, schema, &profile).prop_map(SqlStatement::Delete),
     ]
     .boxed()
 }
 
 /// Generate any SQL statement for a table, using schema context for safe DDL generation.
 pub fn statement_for_table(table: &TableRef, schema: &Schema) -> BoxedStrategy<SqlStatement> {
+    let profile = StatementProfile::default();
     prop_oneof![
-        select_for_table(table, schema, &crate::select::SelectProfile::default())
-            .prop_map(SqlStatement::Select),
-        insert_for_table(table, &crate::insert::InsertProfile::default())
-            .prop_map(SqlStatement::Insert),
-        update_for_table(table, schema, &crate::update::UpdateProfile::default())
-            .prop_map(SqlStatement::Update),
-        delete_for_table(table, schema, &crate::delete::DeleteProfile::default())
-            .prop_map(SqlStatement::Delete),
-        create_index_for_table(
-            table,
-            schema,
-            &crate::create_index::CreateIndexProfile::default()
-        )
-        .prop_map(SqlStatement::CreateIndex),
+        select_for_table(table, schema, &profile).prop_map(SqlStatement::Select),
+        insert_for_table(table, &profile).prop_map(SqlStatement::Insert),
+        update_for_table(table, schema, &profile).prop_map(SqlStatement::Update),
+        delete_for_table(table, schema, &profile).prop_map(SqlStatement::Delete),
+        create_index_for_table(table, schema, &profile).prop_map(SqlStatement::CreateIndex),
         drop_table_for_table(table).prop_map(SqlStatement::DropTable),
     ]
     .boxed()

@@ -383,13 +383,10 @@ fn trigger_body(
     // Generate 1-3 DML statements for the trigger body
     proptest::collection::vec(
         prop_oneof![
-            select_for_table(table, schema, profile.select_profile())
-                .prop_map(TriggerSqlStatement::Select),
-            insert_for_table(table, profile.insert_profile()).prop_map(TriggerSqlStatement::Insert),
-            update_for_table(table, schema, profile.update_profile())
-                .prop_map(TriggerSqlStatement::Update),
-            delete_for_table(table, schema, profile.delete_profile())
-                .prop_map(TriggerSqlStatement::Delete),
+            select_for_table(table, schema, profile).prop_map(TriggerSqlStatement::Select),
+            insert_for_table(table, profile).prop_map(TriggerSqlStatement::Insert),
+            update_for_table(table, schema, profile).prop_map(TriggerSqlStatement::Update),
+            delete_for_table(table, schema, profile).prop_map(TriggerSqlStatement::Delete),
         ],
         1..=3,
     )

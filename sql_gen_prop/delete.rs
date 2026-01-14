@@ -5,6 +5,7 @@ use std::fmt;
 
 use crate::condition::{ConditionProfile, optional_where_clause};
 use crate::expression::Expression;
+use crate::profile::StatementProfile;
 use crate::schema::{Schema, TableRef};
 
 // =============================================================================
@@ -56,10 +57,10 @@ impl fmt::Display for DeleteStatement {
 pub fn delete_for_table(
     table: &TableRef,
     schema: &Schema,
-    profile: &DeleteProfile,
+    profile: &StatementProfile,
 ) -> BoxedStrategy<DeleteStatement> {
     let table_name = table.name.clone();
-    let condition_profile = &profile.condition_profile;
+    let condition_profile = &profile.delete_profile().condition_profile;
 
     optional_where_clause(table, schema, condition_profile)
         .prop_map(move |where_clause| DeleteStatement {

@@ -6,6 +6,7 @@ use std::fmt;
 use crate::condition::{ConditionProfile, optional_where_clause};
 use crate::expression::{Expression, ExpressionContext, ExpressionProfile};
 use crate::function::builtin_functions;
+use crate::profile::StatementProfile;
 use crate::schema::{ColumnDef, Schema, TableRef};
 
 // =============================================================================
@@ -104,16 +105,17 @@ impl fmt::Display for UpdateStatement {
 pub fn update_for_table(
     table: &TableRef,
     schema: &Schema,
-    profile: &UpdateProfile,
+    profile: &StatementProfile,
 ) -> BoxedStrategy<UpdateStatement> {
     let table_name = table.name.clone();
     let updatable: Vec<ColumnDef> = table.updatable_columns().cloned().collect();
     let functions = builtin_functions();
 
-    // Extract profile values
-    let expression_max_depth = profile.expression_max_depth;
-    let allow_aggregates = profile.allow_aggregates;
-    let condition_profile = profile.condition_profile.clone();
+    // Extract profile values from the UpdateProfile
+    let update_profile = profile.update_profile();
+    let expression_max_depth = update_profile.expression_max_depth;
+    let allow_aggregates = update_profile.allow_aggregates;
+    let condition_profile = update_profile.condition_profile.clone();
 
     let table_clone = table.clone();
     let schema_clone = schema.clone();
@@ -172,6 +174,7 @@ mod tests {
     use super::*;
     use crate::Table;
     use crate::expression::BinaryOperator;
+    use crate::profile::StatementProfile;
     use crate::schema::DataType;
     use crate::value::SqlValue;
 
@@ -229,7 +232,7 @@ mod tests {
                 );
                 let schema = crate::schema::SchemaBuilder::new().add_table(table.clone()).build();
                 let table_ref: crate::schema::TableRef = table.into();
-                update_for_table(&table_ref, &schema, &UpdateProfile::default())
+                update_for_table(&table_ref, &schema, &StatementProfile::default())
             }
         ) {
             let sql = stmt.to_string();

@@ -268,7 +268,12 @@ impl Simulator {
 
         let mut schema = self.introspect_and_verify_schemas()?;
 
-        let profile = sql_gen_prop::profile::StatementProfile::default();
+        let mut profile = sql_gen_prop::profile::StatementProfile::default();
+        profile
+            .select
+            .extra
+            .condition_profile
+            .order_by_allow_integer_positions = false;
 
         for i in 0..self.config.num_statements {
             // Generate a statement (DML or DDL)

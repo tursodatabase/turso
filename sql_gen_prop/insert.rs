@@ -5,6 +5,7 @@ use std::fmt;
 
 use crate::expression::{Expression, ExpressionContext, ExpressionProfile};
 use crate::function::builtin_functions;
+use crate::profile::StatementProfile;
 use crate::schema::TableRef;
 
 // =============================================================================
@@ -88,15 +89,16 @@ impl fmt::Display for InsertStatement {
 /// Generate an INSERT statement for a table with profile.
 pub fn insert_for_table(
     table: &TableRef,
-    profile: &InsertProfile,
+    profile: &StatementProfile,
 ) -> BoxedStrategy<InsertStatement> {
     let table_name = table.name.clone();
     let columns = table.columns.clone();
     let functions = builtin_functions();
 
-    // Extract profile values
-    let expression_max_depth = profile.expression_max_depth;
-    let allow_aggregates = profile.allow_aggregates;
+    // Extract profile values from the InsertProfile
+    let insert_profile = profile.insert_profile();
+    let expression_max_depth = insert_profile.expression_max_depth;
+    let allow_aggregates = insert_profile.allow_aggregates;
 
     let col_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
 
@@ -124,6 +126,7 @@ pub fn insert_for_table(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::profile::StatementProfile;
     use crate::schema::{ColumnDef, DataType, Table};
     use crate::value::SqlValue;
 
@@ -177,7 +180,7 @@ mod tests {
                         ColumnDef::new("name", DataType::Text),
                     ],
                 ).into();
-                insert_for_table(&table, &InsertProfile::default())
+                insert_for_table(&table, &StatementProfile::default())
             }
         ) {
             let sql = stmt.to_string();

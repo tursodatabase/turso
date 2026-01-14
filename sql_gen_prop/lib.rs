@@ -192,7 +192,7 @@ mod tests {
         #[test]
         fn generated_select_is_valid_sql(stmt in {
             let schema = test_schema();
-            strategies::select_for_table(&schema.tables[0], &schema, &SelectProfile::default())
+            strategies::select_for_table(&schema.tables[0], &schema, &StatementProfile::default())
         }) {
             let sql = stmt.to_string();
             prop_assert!(sql.starts_with("SELECT"));
@@ -200,7 +200,7 @@ mod tests {
         }
 
         #[test]
-        fn generated_insert_is_valid_sql(stmt in strategies::insert_for_table(&test_schema().tables[0], &InsertProfile::default())) {
+        fn generated_insert_is_valid_sql(stmt in strategies::insert_for_table(&test_schema().tables[0], &StatementProfile::default())) {
             let sql = stmt.to_string();
             prop_assert!(sql.starts_with("INSERT INTO \"users\""));
             prop_assert!(sql.contains("VALUES"));
@@ -209,7 +209,7 @@ mod tests {
         #[test]
         fn generated_update_is_valid_sql(stmt in {
             let schema = test_schema();
-            strategies::update_for_table(&schema.tables[0], &schema, &UpdateProfile::default())
+            strategies::update_for_table(&schema.tables[0], &schema, &StatementProfile::default())
         }) {
             let sql = stmt.to_string();
             prop_assert!(sql.starts_with("UPDATE \"users\""));
@@ -218,14 +218,14 @@ mod tests {
         #[test]
         fn generated_delete_is_valid_sql(stmt in {
             let schema = test_schema();
-            strategies::delete_for_table(&schema.tables[0], &schema, &DeleteProfile::default())
+            strategies::delete_for_table(&schema.tables[0], &schema, &StatementProfile::default())
         }) {
             let sql = stmt.to_string();
             prop_assert!(sql.starts_with("DELETE FROM \"users\""));
         }
 
         #[test]
-        fn generated_create_table_avoids_conflicts(stmt in strategies::create_table(&test_schema(), &CreateTableProfile::default())) {
+        fn generated_create_table_avoids_conflicts(stmt in strategies::create_table(&test_schema(), &StatementProfile::default())) {
             // Should not generate a table named "users" or "posts"
             prop_assert!(stmt.table_name != "users");
             prop_assert!(stmt.table_name != "posts");
@@ -233,14 +233,14 @@ mod tests {
         }
 
         #[test]
-        fn generated_create_index_is_valid_sql(stmt in strategies::create_index_for_table(&test_schema().tables[0], &test_schema(), &CreateIndexProfile::default())) {
+        fn generated_create_index_is_valid_sql(stmt in strategies::create_index_for_table(&test_schema().tables[0], &test_schema(), &StatementProfile::default())) {
             let sql = stmt.to_string();
             prop_assert!(sql.contains("INDEX"));
             prop_assert!(sql.contains("ON \"users\""));
         }
 
         #[test]
-        fn generated_create_index_for_schema_is_valid(stmt in strategies::create_index(&test_schema(), &CreateIndexProfile::default())) {
+        fn generated_create_index_for_schema_is_valid(stmt in strategies::create_index(&test_schema(), &StatementProfile::default())) {
             let sql = stmt.to_string();
             prop_assert!(sql.contains("INDEX"));
             // Should be on one of the existing tables

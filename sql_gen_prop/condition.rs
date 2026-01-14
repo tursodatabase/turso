@@ -9,7 +9,7 @@ use std::fmt;
 
 use std::rc::Rc;
 
-use crate::expression::{BinaryOperator, Expression, ExpressionContext};
+use crate::expression::{BinaryOperator, Expression, ExpressionContext, ExpressionKind};
 use crate::function::{FunctionRegistry, builtin_functions};
 use crate::schema::{ColumnDef, DataType, Schema, TableRef};
 use crate::select::SelectStatement;
@@ -201,6 +201,10 @@ pub struct ConditionProfile {
     /// Weight for simple (non-subquery) conditions relative to subquery conditions.
     /// Higher values make subquery conditions less likely.
     pub simple_condition_weight: u32,
+    /// Whether to allow integer literals in ORDER BY expressions.
+    /// When false, ORDER BY will only use columns and expressions, not integer
+    /// position references like `ORDER BY 1, 2`.
+    pub order_by_allow_integer_positions: bool,
 }
 
 impl Default for ConditionProfile {
@@ -218,6 +222,7 @@ impl ConditionProfile {
             expression_max_depth: 1,
             subquery_profile: SubqueryProfile::default(),
             simple_condition_weight: 80,
+            order_by_allow_integer_positions: true,
         }
     }
 
@@ -229,6 +234,7 @@ impl ConditionProfile {
             expression_max_depth: 0,
             subquery_profile: SubqueryProfile::disabled(),
             simple_condition_weight: 100,
+            order_by_allow_integer_positions: false,
         }
     }
 
@@ -240,6 +246,7 @@ impl ConditionProfile {
             expression_max_depth: 2,
             subquery_profile: SubqueryProfile::default(),
             simple_condition_weight: 60,
+            order_by_allow_integer_positions: true,
         }
     }
 
@@ -270,6 +277,12 @@ impl ConditionProfile {
     /// Builder method to set the simple condition weight.
     pub fn with_simple_condition_weight(mut self, weight: u32) -> Self {
         self.simple_condition_weight = weight;
+        self
+    }
+
+    /// Builder method to set whether integer positions are allowed in ORDER BY.
+    pub fn with_order_by_integer_positions(mut self, allow: bool) -> Self {
+        self.order_by_allow_integer_positions = allow;
         self
     }
 
@@ -662,6 +675,8 @@ pub fn optional_where_clause(
 /// Generate ORDER BY items for a table with profile.
 ///
 /// Uses expression-based ORDER BY with builtin functions.
+/// When `order_by_allow_integer_positions` is false, literal values are excluded
+/// to prevent integer position references like `ORDER BY 1, 2`.
 pub fn order_by_for_table(
     table: &TableRef,
     profile: &ConditionProfile,
@@ -674,10 +689,16 @@ pub fn order_by_for_table(
     }
 
     let functions = builtin_functions();
-    let ctx = ExpressionContext::new(functions)
+    let mut ctx = ExpressionContext::new(functions)
         .with_columns(table.columns.clone())
         .with_max_depth(expr_max_depth)
         .with_aggregates(false);
+
+    // When integer positions are not allowed, disable value expressions entirely
+    // to prevent generating integer literals that would be interpreted as column positions
+    if !profile.order_by_allow_integer_positions {
+        ctx.profile = ctx.profile.with_weight(ExpressionKind::Value, 0);
+    }
 
     proptest::collection::vec(
         (crate::expression::expression(&ctx), order_direction()),
@@ -1133,6 +1154,54 @@ mod tests {
 
         let no_subqueries = ConditionProfile::no_subqueries();
         assert!(!no_subqueries.subquery_profile.any_enabled());
+    }
+
+    #[test]
+    fn test_order_by_integer_positions_config() {
+        // Default allows integer positions
+        let profile = ConditionProfile::default();
+        assert!(profile.order_by_allow_integer_positions);
+
+        // Simple profile disables them to avoid column position reference issues
+        let simple = ConditionProfile::simple();
+        assert!(!simple.order_by_allow_integer_positions);
+
+        // Can be disabled via builder
+        let profile = ConditionProfile::default().with_order_by_integer_positions(false);
+        assert!(!profile.order_by_allow_integer_positions);
+    }
+
+    #[test]
+    fn test_order_by_no_integers() {
+        use crate::schema::{DataType, Table};
+        use proptest::strategy::Strategy;
+        use proptest::test_runner::TestRunner;
+
+        let table: TableRef = Table::new(
+            "test",
+            vec![
+                ColumnDef::new("id", DataType::Integer).primary_key(),
+                ColumnDef::new("name", DataType::Text),
+            ],
+        )
+        .into();
+
+        // Simple profile has integer positions disabled
+        let profile = ConditionProfile::simple();
+        let strategy = order_by_for_table(&table, &profile);
+
+        let mut runner = TestRunner::default();
+        for _ in 0..50 {
+            let items = strategy.new_tree(&mut runner).unwrap().current();
+            for item in &items {
+                let expr_str = item.expr.to_string();
+                // Should not be a bare integer (but integers in expressions are fine)
+                assert!(
+                    !expr_str.chars().all(|c| c.is_ascii_digit()),
+                    "Found bare integer literal in ORDER BY: {expr_str}"
+                );
+            }
+        }
     }
 
     proptest::proptest! {

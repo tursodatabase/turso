@@ -5,6 +5,7 @@ use std::fmt;
 
 use crate::condition::OrderDirection;
 use crate::create_table::identifier_excluding;
+use crate::profile::StatementProfile;
 use crate::schema::{Schema, TableRef};
 
 // =============================================================================
@@ -106,14 +107,14 @@ pub fn index_column(col_name: String) -> impl Strategy<Value = IndexColumn> {
 pub fn create_index_for_table(
     table: &TableRef,
     schema: &Schema,
-    profile: &CreateIndexProfile,
+    profile: &StatementProfile,
 ) -> BoxedStrategy<CreateIndexStatement> {
     let table_name = table.name.clone();
     let col_names: Vec<String> = table.columns.iter().map(|c| c.name.clone()).collect();
     let existing_indexes = schema.index_names();
 
-    // Extract profile values
-    let max_columns = profile.max_columns;
+    // Extract profile values from the CreateIndexProfile
+    let max_columns = profile.create_index_profile().max_columns;
 
     if col_names.is_empty() {
         return Just(CreateIndexStatement {
@@ -156,15 +157,15 @@ pub fn create_index_for_table(
 /// Generate a CREATE INDEX statement for any table with profile.
 pub fn create_index(
     schema: &Schema,
-    profile: &CreateIndexProfile,
+    profile: &StatementProfile,
 ) -> BoxedStrategy<CreateIndexStatement> {
     assert!(
         !schema.tables.is_empty(),
         "Schema must have at least one table"
     );
 
-    // Extract profile values
-    let max_columns = profile.max_columns;
+    // Extract profile values from the CreateIndexProfile
+    let max_columns = profile.create_index_profile().max_columns;
 
     let existing_indexes = schema.index_names();
     let tables = (*schema.tables).clone();
