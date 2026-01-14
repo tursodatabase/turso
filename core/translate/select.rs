@@ -514,14 +514,20 @@ fn prepare_one_select_plan(
             }
 
             if let Some(group_by) = &mut plan.group_by {
-                // now that we have resolved the ORDER BY expressions and aggregates, we can
-                // compute the necessary sort order for the GROUP BY clause
-                group_by.sort_order = Some(compute_group_by_sort_order(
-                    &group_by.exprs,
-                    &plan.order_by,
-                    &plan.aggregates,
-                    resolver,
-                ));
+                // SQLite compatibility: when GROUP BY and ORDER BY have the same number
+                // of expressions, SQLite copies the sort directions from ORDER BY to
+                // GROUP BY position-by-position (see sqlite3CopySortOrder in select.c).
+                // This ensures the GROUP BY traversal order matches ORDER BY semantics.
+                group_by.sort_order = Some(if group_by.exprs.len() == plan.order_by.len() {
+                    plan.order_by.iter().map(|(_, dir)| *dir).collect()
+                } else {
+                    compute_group_by_sort_order(
+                        &group_by.exprs,
+                        &plan.order_by,
+                        &plan.aggregates,
+                        resolver,
+                    )
+                });
             }
 
             // Parse the LIMIT/OFFSET clause
