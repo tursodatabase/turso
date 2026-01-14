@@ -27,7 +27,7 @@ use crate::IOExt;
 use crate::LimboError;
 use crate::Result;
 use crate::ValueRef;
-use crate::{Connection, Pager};
+use crate::{Connection, Pager, SyncMode};
 use crossbeam_skiplist::map::Entry;
 use crossbeam_skiplist::{SkipMap, SkipSet};
 use parking_lot::{Mutex, RwLock};
@@ -510,6 +510,8 @@ pub struct CommitStateMachine<Clock: LogicalClock> {
     commit_coordinator: Arc<CommitCoordinator>,
     header: Arc<RwLock<Option<DatabaseHeader>>>,
     pager: Arc<Pager>,
+    /// The synchronous mode for fsync operations. When set to Off, fsync is skipped.
+    sync_mode: SyncMode,
     _phantom: PhantomData<Clock>,
 }
 
@@ -552,6 +554,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
         connection: Arc<Connection>,
         commit_coordinator: Arc<CommitCoordinator>,
         header: Arc<RwLock<Option<DatabaseHeader>>>,
+        sync_mode: SyncMode,
     ) -> Self {
         let pager = connection.pager.load().clone();
         Self {
@@ -564,6 +567,7 @@ impl<Clock: LogicalClock> CommitStateMachine<Clock> {
             commit_coordinator,
             pager,
             header,
+            sync_mode,
             _phantom: PhantomData,
         }
     }
@@ -825,6 +829,12 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
             }
 
             CommitState::SyncLogicalLog { end_ts } => {
+                // Skip fsync when synchronous mode is off
+                if self.sync_mode == SyncMode::Off {
+                    tracing::debug!("Skipping fsync of logical log (synchronous=off)");
+                    self.state = CommitState::EndCommitLogicalLog { end_ts: *end_ts };
+                    return Ok(TransitionResult::Continue);
+                }
                 let c = mvcc_store.storage.sync()?;
                 self.state = CommitState::EndCommitLogicalLog { end_ts: *end_ts };
                 // if Completion Completed without errors we can continue
@@ -894,6 +904,7 @@ impl<Clock: LogicalClock> StateTransition for CommitStateMachine<Clock> {
                         mvcc_store.clone(),
                         self.connection.clone(),
                         false,
+                        self.connection.get_sync_mode(),
                     ));
                     let state_machine = Mutex::new(state_machine);
                     self.state = CommitState::Checkpoint { state_machine };
@@ -2216,6 +2227,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                 connection.clone(),
                 self.commit_coordinator.clone(),
                 self.global_header.clone(),
+                connection.get_sync_mode(),
             ));
         Ok(state_machine)
     }

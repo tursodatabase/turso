@@ -365,6 +365,7 @@ pub fn op_checkpoint(
             mv_store.clone(),
             program.connection.clone(),
             true,
+            program.connection.get_sync_mode(),
         ));
         loop {
             let result = ckpt_sm.step(&())?;
@@ -10057,6 +10058,7 @@ fn op_journal_mode_inner(
                                 mv_store.clone(),
                                 program.connection.clone(),
                                 true,
+                                program.connection.get_sync_mode(),
                             )));
                     }
 
