@@ -98,7 +98,6 @@ pub mod strategies {
         optional_where_clause,
         order_by_for_table,
         order_direction,
-        simple_condition,
         subquery_select_for_table,
     };
     // CREATE INDEX

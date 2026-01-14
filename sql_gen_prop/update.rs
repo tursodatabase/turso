@@ -115,12 +115,12 @@ pub fn update_for_table(
     let update_profile = profile.update_profile();
     let expression_max_depth = update_profile.expression_max_depth;
     let allow_aggregates = update_profile.allow_aggregates;
-    let condition_profile = update_profile.condition_profile.clone();
 
     let table_clone = table.clone();
     let schema_clone = schema.clone();
+    let profile_clone = profile.clone();
     if updatable.is_empty() {
-        return optional_where_clause(&table_clone, &schema_clone, &condition_profile)
+        return optional_where_clause(&table_clone, &schema_clone, &profile_clone)
             .prop_map(move |where_clause| UpdateStatement {
                 table: table_name.clone(),
                 assignments: vec![],
@@ -140,7 +140,7 @@ pub fn update_for_table(
 
     (
         proptest::sample::subsequence(col_indices, 1..=updatable.len()),
-        optional_where_clause(&table_clone, &schema_clone, &condition_profile),
+        optional_where_clause(&table_clone, &schema_clone, &profile_clone),
     )
         .prop_flat_map(move |(indices, where_clause)| {
             let selected_cols: Vec<&ColumnDef> =

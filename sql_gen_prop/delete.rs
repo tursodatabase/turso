@@ -60,9 +60,8 @@ pub fn delete_for_table(
     profile: &StatementProfile,
 ) -> BoxedStrategy<DeleteStatement> {
     let table_name = table.name.clone();
-    let condition_profile = &profile.delete_profile().condition_profile;
 
-    optional_where_clause(table, schema, condition_profile)
+    optional_where_clause(table, schema, profile)
         .prop_map(move |where_clause| DeleteStatement {
             table: table_name.clone(),
             where_clause,

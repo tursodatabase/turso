@@ -5,6 +5,7 @@ use proptest::string::string_regex;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 
+use crate::profile::StatementProfile;
 use crate::schema::DataType;
 
 // =============================================================================
@@ -149,15 +150,16 @@ pub fn real_value() -> impl Strategy<Value = SqlValue> {
 }
 
 /// Generate a text value with profile-controlled parameters.
-pub fn text_value(profile: &ValueProfile) -> impl Strategy<Value = SqlValue> + 'static {
-    string_regex(&profile.text_pattern)
+pub fn text_value(profile: &StatementProfile) -> impl Strategy<Value = SqlValue> + 'static {
+    let value_profile = &profile.generation.value;
+    string_regex(&value_profile.text_pattern)
         .unwrap()
         .prop_map(SqlValue::Text)
 }
 
 /// Generate a blob value with profile-controlled parameters.
-pub fn blob_value(profile: &ValueProfile) -> impl Strategy<Value = SqlValue> + 'static {
-    let max_size = profile.blob_max_size;
+pub fn blob_value(profile: &StatementProfile) -> impl Strategy<Value = SqlValue> + 'static {
+    let max_size = profile.generation.value.blob_max_size;
     proptest::collection::vec(any::<u8>(), 0..=max_size).prop_map(SqlValue::Blob)
 }
 
@@ -170,7 +172,7 @@ pub fn null_value() -> impl Strategy<Value = SqlValue> {
 pub fn value_for_type(
     data_type: &DataType,
     nullable: bool,
-    profile: &ValueProfile,
+    profile: &StatementProfile,
 ) -> BoxedStrategy<SqlValue> {
     let base: BoxedStrategy<SqlValue> = match data_type {
         DataType::Integer => integer_value().boxed(),

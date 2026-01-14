@@ -226,7 +226,6 @@ pub fn select_for_table(
     let expression_count_range = select_profile.expression_count_range.clone();
     let limit_range = select_profile.limit_range.clone();
     let offset_range = select_profile.offset_range.clone();
-    let condition_profile = select_profile.condition_profile.clone();
 
     // Build expression context for generating expressions
     let ctx = ExpressionContext::new(functions)
@@ -255,8 +254,8 @@ pub fn select_for_table(
 
     (
         columns_strategy,
-        optional_where_clause(table, schema, &condition_profile),
-        order_by_for_table(table, &condition_profile),
+        optional_where_clause(table, schema, profile),
+        order_by_for_table(table, profile),
         proptest::option::of(limit_range),
         proptest::option::of(offset_range),
     )

@@ -796,8 +796,7 @@ fn value_expression_strategy(
     profile: &StatementProfile,
 ) -> BoxedStrategy<Expression> {
     let data_type = ctx.target_type.unwrap_or(DataType::Integer);
-    let value_profile = &profile.generation.value;
-    value_for_type(&data_type, true, &value_profile)
+    value_for_type(&data_type, true, profile)
         .prop_map(Expression::Value)
         .boxed()
 }
