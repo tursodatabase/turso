@@ -506,9 +506,10 @@ mod tests {
                 .with_before_insert(50)
                 .with_before_update(50);
             create_trigger_for_table(
-            &test_table().into(),
-            &test_schema(),
-            &Default::default())
+                &test_table().into(),
+                &test_schema(),
+                &profile,
+            )
         }
         ) {
             let sql = stmt.to_string();

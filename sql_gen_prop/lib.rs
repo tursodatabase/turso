@@ -42,7 +42,9 @@ pub use alter_table::{
 };
 pub use condition::{ComparisonOp, Condition, LogicalOp, OrderByItem, OrderDirection};
 pub use create_index::{CreateIndexStatement, IndexColumn};
-pub use create_table::CreateTableStatement;
+pub use create_table::{
+    ColumnProfile, CreateTableStatement, DataTypeWeights, PrimaryKeyProfile,
+};
 pub use create_trigger::{
     CreateTriggerContext, CreateTriggerKind, CreateTriggerOpWeights, CreateTriggerStatement,
     TriggerEvent, TriggerTiming,
