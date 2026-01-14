@@ -22,7 +22,7 @@ import { analyzeCorruption, preserveCorruptDatabase, findSqlancerDatabases } fro
 
 // Configuration from environment
 const TIME_LIMIT_MINUTES = parseInt(process.env.TIME_LIMIT_MINUTES || "240", 10); // 4 hours default
-const PER_RUN_TIMEOUT_SECONDS = parseInt(process.env.PER_RUN_TIMEOUT_SECONDS || "300", 10); // 5 min default
+const PER_RUN_TIMEOUT_SECONDS = parseInt(process.env.PER_RUN_TIMEOUT_SECONDS || "600", 10); // 10 min default
 const SLEEP_BETWEEN_RUNS_SECONDS = parseInt(process.env.SLEEP_BETWEEN_RUNS_SECONDS || "5", 10);
 const LOG_TO_STDOUT = process.env.LOG_TO_STDOUT === "true";
 const GIT_HASH = process.env.GIT_HASH || "unknown";
@@ -583,12 +583,14 @@ async function main(): Promise<void> {
 					}
 				}
 
-				// Post GitHub issue
-				try {
-					await github.postGitHubIssue(result.failure);
-					stats.issuesPosted++;
-				} catch (error) {
-					console.error(`  Failed to post GitHub issue: ${error}`);
+				// Post GitHub issue (skip timeouts - they're not actionable bugs)
+				if (result.failure.type !== "timeout") {
+					try {
+						await github.postGitHubIssue(result.failure);
+						stats.issuesPosted++;
+					} catch (error) {
+						console.error(`  Failed to post GitHub issue: ${error}`);
+					}
 				}
 			} else {
 				console.log(`[${new Date().toISOString()}] Run ${stats.totalRuns}: OK`);

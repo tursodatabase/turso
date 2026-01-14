@@ -23,6 +23,12 @@ export class GithubClient {
 	app: App | null;
 	initialized: boolean = false;
 	openIssues: { title: string; number: number }[] = [];
+	/** Issue number for the current ECS run - all failures get added as comments to this issue. */
+	currentRunIssueNumber: number | null = null;
+	/** Count of failures reported on the current run issue. */
+	failuresReportedThisRun: number = 0;
+	/** Failure summaries already reported this run (for deduplication within a run). */
+	reportedFailureSummaries: string[] = [];
 
 	constructor() {
 		this.GIT_HASH = process.env.GIT_HASH || "unknown";
@@ -59,37 +65,66 @@ export class GithubClient {
 		this.initialized = true;
 	}
 
+	/**
+	 * Report a failure to GitHub.
+	 *
+	 * Strategy: Create ONE issue per ECS task run, then add each failure as a comment.
+	 * This prevents the issue spam that was happening with Levenshtein-based deduplication.
+	 * Timeout failures are skipped entirely.
+	 * Duplicate failures within the same run are also skipped.
+	 */
 	async postGitHubIssue(failure: SqlancerFailure): Promise<void> {
+		// Skip timeout failures - they're not actionable bugs
+		if (failure.type === "timeout") {
+			console.log(`Skipping GitHub issue for timeout failure`);
+			return;
+		}
+
 		if (!this.initialized) {
 			await this.initialize();
 		}
 
-		let title = this.createIssueTitle(failure);
-		title = title.slice(0, GITHUB_ISSUE_TITLE_MAX_LENGTH);
+		// Create a summary key for deduplication
+		const failureSummary = this.createIssueTitle(failure);
 
-		// Check for similar existing issues using Levenshtein distance
-		for (const existingIssue of this.openIssues) {
-			const SIMILARITY_THRESHOLD = 6;
-			if (levenshtein(existingIssue.title, title) < SIMILARITY_THRESHOLD) {
-				console.log(`Found similar issue #${existingIssue.number}: "${existingIssue.title}"`);
-				await this.commentOnIssue(existingIssue.number, failure);
+		// Check if we've already reported a similar failure in this run
+		const SIMILARITY_THRESHOLD = 20;
+		for (const reported of this.reportedFailureSummaries) {
+			if (levenshtein(reported, failureSummary) < SIMILARITY_THRESHOLD) {
+				console.log(`Skipping duplicate failure (similar to already reported): ${failureSummary.slice(0, 80)}...`);
 				return;
 			}
 		}
 
-		let body = this.createIssueBody(failure);
+		// Track this failure as reported
+		this.reportedFailureSummaries.push(failureSummary);
+
+		// If we already have an issue for this run, add a comment instead of creating a new issue
+		if (this.currentRunIssueNumber !== null) {
+			await this.commentOnIssue(this.currentRunIssueNumber, failure);
+			this.failuresReportedThisRun++;
+			return;
+		}
+
+		// Create the first issue for this ECS run
+		let title = this.createRunIssueTitle();
+		title = title.slice(0, GITHUB_ISSUE_TITLE_MAX_LENGTH);
+
+		let body = this.createRunIssueBody(failure);
 		body = body.slice(0, GITHUB_ISSUE_BODY_MAX_LENGTH);
 
 		if (this.mode === 'dry-run') {
-			console.log(`Dry-run mode: Would create issue in ${this.GITHUB_REPO}`);
+			console.log(`Dry-run mode: Would create run issue in ${this.GITHUB_REPO}`);
 			console.log(`Title: ${title}`);
 			console.log(`Body:\n${body}`);
+			this.currentRunIssueNumber = -1; // Placeholder for dry-run
+			this.failuresReportedThisRun = 1;
 			return;
 		}
 
 		if (this.openIssues.length >= MAX_OPEN_SQLANCER_ISSUES) {
 			console.log(`Max open SQLancer issues reached: ${MAX_OPEN_SQLANCER_ISSUES}`);
-			console.log(`Would create issue with title: ${title}`);
+			console.log(`Would create run issue with title: ${title}`);
 			return;
 		}
 
@@ -104,7 +139,9 @@ export class GithubClient {
 			labels: ['bug', 'sqlancer', 'automated']
 		});
 
-		console.log(`Successfully created GitHub issue: ${response.data.html_url}`);
+		console.log(`Successfully created GitHub run issue: ${response.data.html_url}`);
+		this.currentRunIssueNumber = response.data.number;
+		this.failuresReportedThisRun = 1;
 		this.openIssues.push({ title, number: response.data.number });
 	}
 
@@ -145,6 +182,67 @@ export class GithubClient {
 		}
 	}
 
+	/** Create a title for the ECS run issue that encompasses all failures in the run. */
+	private createRunIssueTitle(): string {
+		const date = new Date().toISOString().split('T')[0];
+		const shortHash = this.GIT_HASH.substring(0, 7);
+		return `SQLancer run failures - ${date} (${shortHash})`;
+	}
+
+	/** Create the body for the ECS run issue, including the first failure. */
+	private createRunIssueBody(firstFailure: SqlancerFailure): string {
+		return `## SQLancer ECS Run - Failures Detected
+
+This issue tracks failures from a SQLancer fuzzing run.
+Each failure is reported as a comment below.
+
+- **Git Hash**: ${this.GIT_HASH}
+- **Run Started**: ${new Date().toISOString()}
+
+---
+
+## First Failure
+
+${this.createFailureSection(firstFailure)}
+`;
+	}
+
+	/** Create a formatted section for a single failure (used in both issue body and comments). */
+	private createFailureSection(failure: SqlancerFailure): string {
+		let section = `### ${this.createIssueTitle(failure)}
+
+${this.createFaultDetails(failure)}
+
+<details>
+<summary>SQLancer Output (last 10KB)</summary>
+
+\`\`\`
+${failure.output.slice(-10000)}
+\`\`\`
+
+</details>
+`;
+
+		if (failure.reproductionSql) {
+			section += `
+<details>
+<summary>Reproduction SQL</summary>
+
+\`\`\`sql
+${failure.reproductionSql.slice(0, 20000)}
+\`\`\`
+
+</details>
+`;
+		}
+
+		if (failure.corruptionAnalysis) {
+			section += this.formatCorruptionAnalysis(failure.corruptionAnalysis);
+		}
+
+		return section;
+	}
+
 	private createFaultDetails(failure: SqlancerFailure): string {
 		const gitShortHash = this.GIT_HASH.substring(0, 7);
 		const seedInfo = failure.seed !== undefined ? `\n- **Seed**: ${failure.seed}` : '';
@@ -171,41 +269,10 @@ docker run -e TIME_LIMIT_MINUTES=10 -e LOG_TO_STDOUT=true sqlancer-runner:${gitS
 	}
 
 	private createCommentBody(failure: SqlancerFailure): string {
-		return `### Duplicate occurrence detected
+		return `## Additional Failure
 
-${this.createFaultDetails(failure)}
+${this.createFailureSection(failure)}
 `;
-	}
-
-	private createIssueBody(failure: SqlancerFailure): string {
-		let body = `## SQLancer failure type: ${failure.type}
-
-${this.createFaultDetails(failure)}
-
-### SQLancer Output
-
-\`\`\`
-${failure.output.slice(0, 10000)}
-\`\`\`
-`;
-
-		// Add reproduction SQL if available
-		if (failure.reproductionSql) {
-			body += `
-### Reproduction SQL
-
-\`\`\`sql
-${failure.reproductionSql.slice(0, 20000)}
-\`\`\`
-`;
-		}
-
-		// Add corruption analysis if available
-		if (failure.corruptionAnalysis) {
-			body += this.formatCorruptionAnalysis(failure.corruptionAnalysis);
-		}
-
-		return body;
 	}
 
 	private formatCorruptionAnalysis(analysis: CorruptionAnalysis): string {
