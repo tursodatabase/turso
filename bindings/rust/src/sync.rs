@@ -27,28 +27,51 @@ pub use turso_sync_sdk_kit::rsapi::PartialSyncOpts;
 // Constants used across the sync module
 const DEFAULT_CLIENT_NAME: &str = "turso-sync-rust";
 
-/// Parse cipher string and return required reserved bytes. These configs match with the Turso
-/// Cloud encryption settings.
-///
-/// Supported ciphers:
-/// - aes256gcm, aes128gcm, chacha20poly1305: 28 reserved bytes (12-byte nonce + 16-byte tag)
-/// - aegis128l, aegis128x2, aegis128x4: 32 reserved bytes (16-byte nonce + 16-byte tag)
-/// - aegis256, aegis256x2, aegis256x4: 48 reserved bytes (32-byte nonce + 16-byte tag)
-fn parse_cipher_reserved_bytes(cipher: &str) -> Option<usize> {
-    match cipher.to_lowercase().as_str() {
-        // 12-byte nonce + 16-byte tag = 28 bytes
-        "aes256gcm" | "aes-256-gcm" => Some(28),
-        "aes128gcm" | "aes-128-gcm" => Some(28),
-        "chacha20poly1305" | "chacha20-poly1305" => Some(28),
-        // 16-byte nonce + 16-byte tag = 32 bytes
-        "aegis128l" | "aegis-128l" => Some(32),
-        "aegis128x2" | "aegis-128x2" => Some(32),
-        "aegis128x4" | "aegis-128x4" => Some(32),
-        // 32-byte nonce + 16-byte tag = 48 bytes
-        "aegis256" | "aegis-256" => Some(48),
-        "aegis256x2" | "aegis-256x2" => Some(48),
-        "aegis256x4" | "aegis-256x4" => Some(48),
-        _ => None,
+/// Encryption cipher for Turso Cloud remote encryption.
+/// These match the server-side encryption settings.
+#[derive(Debug, Clone, Copy)]
+pub enum RemoteEncryptionCipher {
+    Aes256Gcm,
+    Aes128Gcm,
+    ChaCha20Poly1305,
+    Aegis128L,
+    Aegis128X2,
+    Aegis128X4,
+    Aegis256,
+    Aegis256X2,
+    Aegis256X4,
+}
+
+impl RemoteEncryptionCipher {
+    /// Returns the total reserved bytes as required by the server
+    pub fn reserved_bytes(&self) -> usize {
+        match self {
+            Self::Aes256Gcm | Self::Aes128Gcm | Self::ChaCha20Poly1305 => 28,
+            Self::Aegis128L | Self::Aegis128X2 | Self::Aegis128X4 => 32,
+            Self::Aegis256 | Self::Aegis256X2 | Self::Aegis256X4 => 48,
+        }
+    }
+}
+
+impl std::str::FromStr for RemoteEncryptionCipher {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "aes256gcm" | "aes-256-gcm" => Ok(Self::Aes256Gcm),
+            "aes128gcm" | "aes-128-gcm" => Ok(Self::Aes128Gcm),
+            "chacha20poly1305" | "chacha20-poly1305" => Ok(Self::ChaCha20Poly1305),
+            "aegis128l" | "aegis-128l" => Ok(Self::Aegis128L),
+            "aegis128x2" | "aegis-128x2" => Ok(Self::Aegis128X2),
+            "aegis128x4" | "aegis-128x4" => Ok(Self::Aegis128X4),
+            "aegis256" | "aegis-256" => Ok(Self::Aegis256),
+            "aegis256x2" | "aegis-256x2" => Ok(Self::Aegis256X2),
+            "aegis256x4" | "aegis-256x4" => Ok(Self::Aegis256X4),
+            _ => Err(format!(
+                "unknown cipher: '{s}'. Supported: aes256gcm, aes128gcm, chacha20poly1305, \
+                 aegis128l, aegis128x2, aegis128x4, aegis256, aegis256x2, aegis256x4"
+            )),
+        }
     }
 }
 
@@ -70,8 +93,8 @@ pub struct Builder {
     partial_sync_config_experimental: Option<PartialSyncOpts>,
     // Encryption key (base64-encoded) for the Turso Cloud database
     remote_encryption_key: Option<String>,
-    // Encryption cipher name for the Turso Cloud database
-    remote_encryption_cipher: Option<String>,
+    // Encryption cipher for the Turso Cloud database
+    remote_encryption_cipher: Option<RemoteEncryptionCipher>,
 }
 
 impl Builder {
@@ -128,18 +151,14 @@ impl Builder {
     }
 
     /// Set encryption key (base64-encoded) and cipher for the Turso Cloud database.
-    ///
-    /// Supported ciphers:
-    /// - "aes256gcm", "aes128gcm", "chacha20poly1305": 28 reserved bytes
-    /// - "aegis128l", "aegis128x2", "aegis128x4": 32 reserved bytes
-    /// - "aegis256", "aegis256x2", "aegis256x4": 48 reserved bytes
+    /// The cipher is used to calculate the correct reserved_bytes for the database.
     pub fn with_remote_encryption(
         mut self,
         base64_key: impl Into<String>,
-        cipher: impl Into<String>,
+        cipher: RemoteEncryptionCipher,
     ) -> Self {
         self.remote_encryption_key = Some(base64_key.into());
-        self.remote_encryption_cipher = Some(cipher.into());
+        self.remote_encryption_cipher = Some(cipher);
         self
     }
 
@@ -172,19 +191,10 @@ impl Builder {
             None
         };
 
-        // parse cipher and calculate reserved_bytes if provided.
-        let reserved_bytes = if let Some(cipher) = &self.remote_encryption_cipher {
-            let bytes = parse_cipher_reserved_bytes(cipher).ok_or_else(|| {
-                Error::Error(format!(
-                    "unknown encryption cipher: '{cipher}'. Supported: aes256gcm, aes128gcm, \
-                     chacha20poly1305, aegis128l, aegis128x2, aegis128x4, aegis256, \
-                     aegis256x2, aegis256x4"
-                ))
-            })?;
-            Some(bytes)
-        } else {
-            None
-        };
+        // Calculate reserved_bytes from cipher if provided.
+        let reserved_bytes = self
+            .remote_encryption_cipher
+            .map(|cipher| cipher.reserved_bytes());
 
         // Build sync engine config.
         let sync_config = turso_sync_sdk_kit::rsapi::TursoDatabaseSyncConfig {
