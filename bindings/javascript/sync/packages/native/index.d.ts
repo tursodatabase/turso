@@ -252,11 +252,6 @@ export interface SyncEngineOpts {
   protocolVersion?: SyncEngineProtocolVersion
   bootstrapIfEmpty: boolean
   remoteEncryption?: string
-  /**
-   * Base64-encoded encryption key for the Turso Cloud database.
-   * Must match the key used when creating the encrypted database.
-   */
-  remoteEncryptionKey?: string
   partialSyncOpts?: JsPartialSyncOpts
 }
 
