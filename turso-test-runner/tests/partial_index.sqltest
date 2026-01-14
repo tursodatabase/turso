@@ -1,6 +1,6 @@
 @database :memory:
+@skip-if mvcc "partial indexes are not yet supported with MVCC"
 
-# Partial indexes with BETWEEN expressions
 
 # Create a partial index with BETWEEN and verify it exists
 test partial-index-between-create {
