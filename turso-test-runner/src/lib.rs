@@ -6,8 +6,9 @@ pub mod parser;
 pub mod runner;
 pub mod tcl_converter;
 
-pub use backends::cli::DefaultDatabaseResolver;
-pub use backends::{BackendError, DatabaseInstance, QueryResult, SqlBackend};
+pub use backends::{
+    BackendError, DatabaseInstance, DefaultDatabaseResolver, QueryResult, SqlBackend,
+};
 pub use comparison::{ComparisonResult, compare};
 pub use generator::{DefaultDatabaseNeeds, DefaultDatabases, GeneratorConfig, generate_database};
 pub use output::{Format, OutputFormat, create_output};

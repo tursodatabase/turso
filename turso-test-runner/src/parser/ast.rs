@@ -38,6 +38,9 @@ pub struct TestCase {
     pub setups: Vec<SetupRef>,
     /// If set, skip this test (unconditionally or conditionally)
     pub skip: Option<Skip>,
+    /// If set, only run this test on the specified backend(s)
+    /// Valid values: "rust", "cli"
+    pub backend: Option<String>,
 }
 
 /// Skip configuration for a test

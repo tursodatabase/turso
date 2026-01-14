@@ -1,5 +1,6 @@
 @database :default:
 
+@backend cli
 test schema {
     .schema
 }
@@ -30,6 +31,8 @@ CREATE INDEX age_idx ON users (age);
 #        price REAL
 #    );
 #CREATE INDEX age_idx2 on users (age);"}
+
+@backend cli
 test schema-1 {
     .schema users
 }
@@ -54,6 +57,8 @@ CREATE INDEX age_idx ON users (age);
 #       age INTEGER
 #   );
 #CREATE INDEX age_idx2 on users (age);"}
+
+@backend cli
 test schema-2 {
     .schema products
 }

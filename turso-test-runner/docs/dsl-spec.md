@@ -156,6 +156,7 @@ Decorators appear before the `test` keyword:
 | `@setup <name>` | Apply a named setup before the test (can be repeated) |
 | `@skip "reason"` | Skip this test unconditionally with the given reason |
 | `@skip-if <condition> "reason"` | Skip this test conditionally based on runtime configuration |
+| `@backend <name>` | Only run this test on the specified backend (e.g., `cli`, `rust`) |
 
 #### Skip Conditions
 
@@ -270,6 +271,24 @@ test total-changes {
 expect {
     3
 }
+
+# Backend-specific test (only runs with CLI backend)
+@backend cli
+test cli-specific-feature {
+    SELECT sqlite_version();
+}
+expect pattern {
+    ^3\.\d+\.\d+$
+}
+
+# Backend-specific test (only runs with Rust backend)
+@backend rust
+test rust-specific-feature {
+    SELECT 'rust-only';
+}
+expect {
+    rust-only
+}
 ```
 
 ## Grammar (EBNF-like)
@@ -288,6 +307,7 @@ decorator       = "@setup" IDENTIFIER NEWLINE
                 | "@skip-if" skip_condition STRING NEWLINE
 
 skip_condition  = "mvcc"
+                | "@backend" IDENTIFIER NEWLINE
 
 expect_block    = "expect" [expect_modifier] block
 
@@ -385,7 +405,7 @@ The lexer uses the [Logos](https://docs.rs/logos) crate (v0.16) for tokenization
 - **Block content extraction**: When `{` is encountered, a custom callback extracts all content until the matching `}`, handling nested braces. This allows arbitrary SQL and expected output without special escaping.
 
 - **Tokens**: The lexer produces these token types:
-  - Keywords: `@database`, `@setup`, `@skip`, `@skip-if`, `setup`, `test`, `expect`
+  - Keywords: `@database`, `@setup`, `@skip`, `@skip-if`, `@backend`, `setup`, `test`, `expect`
   - Modifiers: `error`, `pattern`, `unordered`, `readonly`, `raw`
   - Skip conditions: `mvcc`
   - Database types: `:memory:`, `:temp:`, `:default:`, `:default-no-rowidalias:`
@@ -414,6 +434,7 @@ pub struct TestCase {
     pub name: String,
     pub sql: String,
     pub expectation: Expectation,
+    pub backend: Option<String>,  // Only run on specified backend
     pub setups: Vec<SetupRef>,
     pub skip: Option<Skip>,
 }

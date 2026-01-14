@@ -8,7 +8,8 @@ use std::time::Duration;
 use std::{path::PathBuf, time::Instant};
 use turso_test_runner::{
     DefaultDatabases, Format, OutputFormat, ParseError, RunnerConfig, TestRunner,
-    backends::cli::CliBackend, create_output, load_test_files, summarize, tcl_converter,
+    backends::cli::CliBackend, backends::rust::RustBackend, create_output, load_test_files,
+    summarize, tcl_converter,
 };
 
 #[derive(Parser)]
@@ -27,7 +28,11 @@ enum Commands {
         #[arg(required = true)]
         paths: Vec<PathBuf>,
 
-        /// Path to tursodb binary
+        /// Backend to use: "rust" (native) or "cli" (subprocess)
+        #[arg(long, default_value = "rust")]
+        backend: String,
+
+        /// Path to tursodb binary (only used with --backend cli)
         #[arg(long, default_value = "tursodb")]
         binary: PathBuf,
 
@@ -43,7 +48,7 @@ enum Commands {
         #[arg(short, long, default_value = "pretty")]
         output: String,
 
-        /// Timeout per query in seconds
+        /// Timeout per query in seconds (only used with --backend cli)
         #[arg(long, default_value_t = 90)]
         timeout: u64,
 
@@ -86,13 +91,14 @@ async fn main() -> ExitCode {
     match cli.command {
         Commands::Run {
             paths,
+            backend,
             binary,
             filter,
             jobs,
             output,
             timeout,
             mvcc,
-        } => run_tests(paths, binary, filter, jobs, output, timeout, mvcc).await,
+        } => run_tests(paths, backend, binary, filter, jobs, output, timeout, mvcc).await,
         Commands::Check { paths } => check_files(paths),
         Commands::Convert {
             paths,
@@ -110,6 +116,7 @@ const DEFAULT_USER_COUNT: usize = 10000;
 
 async fn run_tests(
     paths: Vec<PathBuf>,
+    backend_type: String,
     binary: PathBuf,
     filter: Option<String>,
     jobs: usize,
@@ -181,18 +188,13 @@ async fn run_tests(
     };
 
     // Create backend with resolver if we have generated databases
-    let backend = if let Some(ref dbs) = default_dbs {
-        CliBackend::new(&binary)
-            .with_timeout(Duration::from_secs(timeout))
-            .with_mvcc(mvcc)
-            .with_default_db_resolver(Arc::new(DefaultDatabasesResolver(
-                dbs.default_path.clone(),
-                dbs.no_rowid_alias_path.clone(),
-            )))
+    let resolver = if let Some(ref dbs) = default_dbs {
+        Some(Arc::new(DefaultDatabasesResolver(
+            dbs.default_path.clone(),
+            dbs.no_rowid_alias_path.clone(),
+        )))
     } else {
-        CliBackend::new(&binary)
-            .with_timeout(Duration::from_secs(timeout))
-            .with_mvcc(mvcc)
+        None
     };
 
     // Create runner config
@@ -201,22 +203,57 @@ async fn run_tests(
         config = config.with_filter(f);
     }
 
-    // Create runner
-    let runner = TestRunner::new(backend).with_config(config);
-
     // Create output formatter
     let mut output: Box<dyn OutputFormat> = create_output(format);
-
     let start = Instant::now();
 
-    // Run tests with streaming output
-    let results = match runner
-        .run_loaded_tests(loaded, |result| {
-            output.write_test(result);
-            output.flush();
-        })
-        .await
-    {
+    // Run tests based on backend selection
+    let results = match backend_type.as_str() {
+        "cli" => {
+            let mut backend = if let Some(ref dbs) = default_dbs {
+                CliBackend::new(&binary)
+                    .with_timeout(Duration::from_secs(timeout))
+                    .with_mvcc(mvcc)
+                    .with_default_db_resolver(Arc::new(DefaultDatabasesResolver(
+                        dbs.default_path.clone(),
+                        dbs.no_rowid_alias_path.clone(),
+                    )))
+            } else {
+                CliBackend::new(&binary)
+                    .with_timeout(Duration::from_secs(timeout))
+                    .with_mvcc(mvcc)
+            };
+            if let Some(resolver) = resolver {
+                backend = backend.with_default_db_resolver(resolver);
+            }
+            let runner = TestRunner::new(backend).with_config(config);
+            runner
+                .run_loaded_tests(loaded, |result| {
+                    output.write_test(result);
+                    output.flush();
+                })
+                .await
+        }
+        "rust" => {
+            let mut backend = RustBackend::new().with_mvcc(mvcc);
+            if let Some(resolver) = resolver {
+                backend = backend.with_default_db_resolver(resolver);
+            }
+            let runner = TestRunner::new(backend).with_config(config);
+            runner
+                .run_loaded_tests(loaded, |result| {
+                    output.write_test(result);
+                    output.flush();
+                })
+                .await
+        }
+        other => {
+            eprintln!("Error: unknown backend '{}'. Use 'rust' or 'cli'", other);
+            return ExitCode::from(2);
+        }
+    };
+
+    let results = match results {
         Ok(r) => r,
         Err(e) => {
             eprintln!("Error running tests: {}", e);

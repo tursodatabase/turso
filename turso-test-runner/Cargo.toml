@@ -51,7 +51,12 @@ chumsky = "0.12.0"
 fake = { version = "4.4", features = ["derive", "rand_core"] }
 rand = "0.9"
 rand_chacha = "0.9"
+
+# Turso Rust bindings
 turso = { path = "../bindings/rust", default-features = false }
+
+# Turso SQL parser (for splitting multi-statement SQL)
+turso_parser = { path = "../parser" }
 
 [dev-dependencies]
 pretty_assertions = "1"
