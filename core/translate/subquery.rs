@@ -604,6 +604,8 @@ pub fn emit_from_clause_subqueries(
             // This is done so that translate_expr() can read the result columns of the subquery,
             // as if it were reading from a regular table.
             from_clause_subquery.result_columns_start_reg = Some(result_columns_start);
+            // Also store in program builder so nested subqueries can look it up by internal_id.
+            program.set_subquery_result_reg(table_reference.internal_id, result_columns_start);
         }
 
         program.pop_current_parent_explain();

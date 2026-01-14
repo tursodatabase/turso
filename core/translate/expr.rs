@@ -2461,11 +2461,19 @@ pub fn translate_expr(
                 Table::FromClauseSubquery(from_clause_subquery) => {
                     // If we are reading a column from a subquery, we instead copy the column from the
                     // subquery's result registers.
-                    program.emit_insn(Insn::Copy {
-                        src_reg: from_clause_subquery
+                    let result_columns_start = if is_from_outer_query_scope {
+                        // For outer query subqueries, look up the register from the program builder
+                        // since the cloned subquery doesn't have the register set yet.
+                        program.get_subquery_result_reg(*table_ref_id).expect(
+                            "Outer query subquery result_columns_start_reg must be set in program",
+                        )
+                    } else {
+                        from_clause_subquery
                             .result_columns_start_reg
                             .expect("Subquery result_columns_start_reg must be set")
-                            + *column,
+                    };
+                    program.emit_insn(Insn::Copy {
+                        src_reg: result_columns_start + *column,
                         dst_reg: target_register,
                         extra_amount: 0,
                     });

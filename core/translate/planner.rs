@@ -950,6 +950,26 @@ pub fn parse_from(
                 referenced_cte_indices,
             });
         }
+
+        // Add CTEs to outer_query_refs so they're visible to WHERE/HAVING clause subqueries.
+        // Each CTE is planned here and added to outer_query_refs, then subsequent references
+        // from the FROM clause can still get fresh plans via cte_definitions lookup.
+        for (idx, cte_def) in cte_definitions.iter().enumerate() {
+            let cte_table = plan_cte(
+                idx,
+                &cte_definitions,
+                table_references.outer_query_refs(),
+                resolver,
+                program,
+                connection,
+            )?;
+            table_references.add_outer_query_reference(OuterQueryReference {
+                identifier: cte_def.name.clone(),
+                internal_id: cte_table.internal_id,
+                table: cte_table.table,
+                col_used_mask: ColumnUsedMask::default(),
+            });
+        }
     }
 
     let from_owned = std::mem::take(&mut from).unwrap();
