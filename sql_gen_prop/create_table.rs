@@ -497,26 +497,28 @@ pub fn column_def_with_profile(profile: &ColumnProfile) -> BoxedStrategy<ColumnD
         0u8..100, // for UNIQUE decision
         0u8..100, // for DEFAULT decision
     )
-        .prop_flat_map(move |(name, dt, not_null_roll, unique_roll, default_roll)| {
-            let nullable = not_null_roll >= not_null_prob;
-            let unique = unique_roll < unique_prob;
-            let has_default = default_roll < default_prob;
+        .prop_flat_map(
+            move |(name, dt, not_null_roll, unique_roll, default_roll)| {
+                let nullable = not_null_roll >= not_null_prob;
+                let unique = unique_roll < unique_prob;
+                let has_default = default_roll < default_prob;
 
-            let default_strategy = if has_default {
-                default_value_for_type(dt)
-            } else {
-                Just(None).boxed()
-            };
+                let default_strategy = if has_default {
+                    default_value_for_type(dt)
+                } else {
+                    Just(None).boxed()
+                };
 
-            default_strategy.prop_map(move |default| ColumnDef {
-                name: name.clone(),
-                data_type: dt,
-                nullable,
-                primary_key: false,
-                unique,
-                default,
-            })
-        })
+                default_strategy.prop_map(move |default| ColumnDef {
+                    name: name.clone(),
+                    data_type: dt,
+                    nullable,
+                    primary_key: false,
+                    unique,
+                    default,
+                })
+            },
+        )
         .boxed()
 }
 
@@ -526,17 +528,21 @@ pub fn column_def() -> BoxedStrategy<ColumnDef> {
 }
 
 /// Generate a primary key column definition with profile.
-pub fn primary_key_column_def_with_profile(profile: &PrimaryKeyProfile) -> BoxedStrategy<ColumnDef> {
+pub fn primary_key_column_def_with_profile(
+    profile: &PrimaryKeyProfile,
+) -> BoxedStrategy<ColumnDef> {
     let data_type_weights = profile.data_type_weights.clone();
 
-    (identifier(), data_type_weighted(&data_type_weights)).prop_map(|(name, data_type)| ColumnDef {
-        name,
-        data_type,
-        nullable: false,
-        primary_key: true,
-        unique: false,
-        default: None,
-    }).boxed()
+    (identifier(), data_type_weighted(&data_type_weights))
+        .prop_map(|(name, data_type)| ColumnDef {
+            name,
+            data_type,
+            nullable: false,
+            primary_key: true,
+            unique: false,
+            default: None,
+        })
+        .boxed()
 }
 
 /// Generate a primary key column definition with default settings.
@@ -553,15 +559,17 @@ fn optional_primary_key(profile: &PrimaryKeyProfile) -> BoxedStrategy<Option<Col
     } else {
         let include_prob = profile.include_probability;
         let profile = profile.clone();
-        (0u8..100).prop_flat_map(move |roll| {
-            if roll < include_prob {
-                primary_key_column_def_with_profile(&profile)
-                    .prop_map(Some)
-                    .boxed()
-            } else {
-                Just(None).boxed()
-            }
-        }).boxed()
+        (0u8..100)
+            .prop_flat_map(move |roll| {
+                if roll < include_prob {
+                    primary_key_column_def_with_profile(&profile)
+                        .prop_map(Some)
+                        .boxed()
+                } else {
+                    Just(None).boxed()
+                }
+            })
+            .boxed()
     }
 }
 

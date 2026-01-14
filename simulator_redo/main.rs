@@ -104,6 +104,18 @@ fn run_single(args: &Args) -> Result<()> {
         simulator.persist_files()?;
     }
 
+    // Write schema to JSON file
+    match simulator.get_schema() {
+        Ok(schema) => {
+            let json = serde_json::to_string_pretty(&schema)?;
+            std::fs::write(simulator.out_dir.join("schema.json"), &json)?;
+            tracing::info!("Wrote schema to schema.json");
+        }
+        Err(e) => {
+            tracing::warn!("Failed to get schema for JSON dump: {e}");
+        }
+    }
+
     let stats = stats?;
 
     if stats.oracle_failures > 0 {

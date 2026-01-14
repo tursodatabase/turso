@@ -9,6 +9,7 @@
 //! 6. Re-introspecting schemas after DDL statements
 
 use std::io::Write;
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
@@ -158,6 +159,8 @@ pub struct Simulator {
     turso_db: Arc<Database>,
     /// In-memory IO for the Turso database.
     io: Arc<MemorySimIO>,
+    /// Directory to save run artifacts
+    pub out_dir: PathBuf,
 }
 
 impl Simulator {
@@ -165,6 +168,7 @@ impl Simulator {
     ///
     /// Uses `MemorySimIO` for deterministic in-memory storage.
     pub fn new(config: SimConfig) -> Result<Self> {
+        let out_dir: PathBuf = "simulator-output".into();
         let rng = ChaCha8Rng::seed_from_u64(config.seed);
 
         if !out_dir.exists() {
@@ -173,16 +177,16 @@ impl Simulator {
 
         // Create Turso in-memory database using MemorySimIO
         let io = Arc::new(MemorySimIO::new(config.seed));
-        let turso_db = Database::open_file(io.clone(), "test.db")?;
+        let turso_db = Database::open_file(io.clone(), out_dir.join("test.db").to_str().unwrap())?;
         let turso_conn = turso_db.connect()?;
 
         // Create SQLite in-memory database
         let sqlite_conn = if config.keep_files {
-            let path = std::path::Path::new("test-sqlite.db");
+            let path = out_dir.join("test-sqlite.db");
             if path.exists() {
-                std::fs::remove_file(path)?;
+                std::fs::remove_file(&path)?;
             }
-            rusqlite::Connection::open("test-sqlite.db")
+            rusqlite::Connection::open(path.to_str().unwrap())
         } else {
             rusqlite::Connection::open_in_memory()
         }
@@ -195,6 +199,7 @@ impl Simulator {
             sqlite_conn,
             turso_db,
             io,
+            out_dir,
         })
     }
 
@@ -206,6 +211,12 @@ impl Simulator {
         Ok(())
     }
 
+    /// Introspect and return the current schema from the Turso database.
+    pub fn get_schema(&self) -> Result<Schema> {
+        SchemaIntrospector::from_turso(&self.turso_conn)
+            .context("Failed to introspect Turso schema")
+    }
+
     /// Run the simulation.
     pub fn run(&mut self) -> Result<SimStats> {
         let mut stats = SimStats::default();
@@ -214,7 +225,7 @@ impl Simulator {
         let result = self.run_inner(&mut stats, &mut executed_sql);
 
         // Always write SQL file and print stats, even on error
-        if let Err(e) = Self::write_sql_file(&executed_sql) {
+        if let Err(e) = self.write_sql_file(&executed_sql) {
             tracing::warn!("Failed to write test.sql: {e}");
         }
         stats.print_table(&self.config);
@@ -223,8 +234,8 @@ impl Simulator {
     }
 
     /// Write all executed SQL statements to test.sql
-    fn write_sql_file(statements: &[String]) -> Result<()> {
-        let mut file = std::fs::File::create("test.sql")?;
+    fn write_sql_file(&self, statements: &[String]) -> Result<()> {
+        let mut file = std::fs::File::create(self.out_dir.join("test.sql"))?;
         for sql in statements {
             writeln!(file, "{sql};")?;
         }
@@ -257,9 +268,11 @@ impl Simulator {
 
         let mut schema = self.introspect_and_verify_schemas()?;
 
+        let profile = sql_gen_prop::profile::StatementProfile::default();
+
         for i in 0..self.config.num_statements {
             // Generate a statement (DML or DDL)
-            let strategy = sql_gen_prop::strategies::statement_for_schema(&schema, &sql_gen_prop::profile::StatementProfile::default());
+            let strategy = sql_gen_prop::strategies::statement_for_schema(&schema, &profile);
             let value_tree = strategy
                 .new_tree(&mut test_runner)
                 .map_err(|e| anyhow::anyhow!("Failed to generate statement: {e}"))?;

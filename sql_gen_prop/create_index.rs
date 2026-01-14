@@ -190,7 +190,10 @@ pub fn create_index(
                 identifier_excluding(existing),
                 any::<bool>(), // unique
                 any::<bool>(), // if_not_exists
-                proptest::sample::subsequence(col_names.clone(), 1..=col_names.len().min(max_columns)),
+                proptest::sample::subsequence(
+                    col_names.clone(),
+                    1..=col_names.len().min(max_columns),
+                ),
             )
                 .prop_flat_map(
                     move |(index_suffix, unique, if_not_exists, selected_cols)| {

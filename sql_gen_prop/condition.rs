@@ -251,13 +251,14 @@ pub fn simple_condition(column: &ColumnDef) -> BoxedStrategy<Condition> {
     let col_name3 = column.name.clone();
     let value_profile = crate::value::ValueProfile::default();
 
-    let comparison =
-        (comparison_op(), value_for_type(&column.data_type, false, &value_profile)).prop_map(move |(op, value)| {
-            Condition::SimpleComparison {
-                column: col_name.clone(),
-                op,
-                value,
-            }
+    let comparison = (
+        comparison_op(),
+        value_for_type(&column.data_type, false, &value_profile),
+    )
+        .prop_map(move |(op, value)| Condition::SimpleComparison {
+            column: col_name.clone(),
+            op,
+            value,
         });
 
     if column.nullable {

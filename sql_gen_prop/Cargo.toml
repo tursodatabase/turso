@@ -12,6 +12,7 @@ path = "lib.rs"
 [dependencies]
 proptest = "1.9"
 strum.workspace = true
+serde = { workspace = true, features = ["derive", "rc"] }
 
 [lints]
 workspace = true

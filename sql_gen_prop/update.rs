@@ -3,7 +3,7 @@
 use proptest::prelude::*;
 use std::fmt;
 
-use crate::condition::{ConditionProfile, Condition, optional_where_clause};
+use crate::condition::{Condition, ConditionProfile, optional_where_clause};
 use crate::expression::{Expression, ExpressionContext, ExpressionProfile};
 use crate::function::builtin_functions;
 use crate::schema::{ColumnDef, TableRef};

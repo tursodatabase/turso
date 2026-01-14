@@ -27,6 +27,7 @@ proptest = "1.9"
 indexmap.workspace = true
 parking_lot.workspace = true
 comfy-table = "7"
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

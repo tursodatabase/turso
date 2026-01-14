@@ -4,13 +4,15 @@ use std::collections::HashSet;
 use std::fmt;
 use std::rc::Rc;
 
+use serde::Serialize;
+
 pub type TableRef = Rc<Table>;
 pub type IndexRef = Rc<Index>;
 pub type ViewRef = Rc<View>;
 pub type TriggerRef = Rc<Trigger>;
 
 /// SQL data types supported by the generator.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum DataType {
     Integer,
     Real,
@@ -32,7 +34,7 @@ impl fmt::Display for DataType {
 }
 
 /// A column definition for table schemas and CREATE TABLE statements.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct ColumnDef {
     pub name: String,
     pub data_type: DataType,
@@ -106,7 +108,7 @@ impl fmt::Display for ColumnDef {
 }
 
 /// A table schema definition.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Table {
     pub name: String,
     pub columns: Vec<ColumnDef>,
@@ -134,7 +136,7 @@ impl Table {
 }
 
 /// An index definition in a schema.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Index {
     pub name: String,
     pub table_name: String,
@@ -163,7 +165,7 @@ impl Index {
 }
 
 /// A view definition in a schema.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct View {
     pub name: String,
     /// The SELECT statement that defines the view.
@@ -180,7 +182,7 @@ impl View {
 }
 
 /// A trigger definition in a schema.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Trigger {
     pub name: String,
     pub table_name: String,
@@ -243,7 +245,7 @@ impl SchemaBuilder {
 ///
 /// Uses `Rc` internally to allow cheap cloning for strategy composition.
 /// Use `SchemaBuilder` to construct a schema.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Schema {
     pub tables: Rc<Vec<TableRef>>,
     pub indexes: Rc<Vec<IndexRef>>,
