@@ -23,6 +23,7 @@ use proptest::prelude::*;
 use strum::IntoEnumIterator;
 
 use crate::generator::SqlGeneratorKind;
+use crate::profile::StatementProfile;
 use crate::schema::DataType;
 
 /// Categories of SQL functions.
@@ -396,7 +397,6 @@ impl Default for FunctionContext<'_> {
 impl SqlGeneratorKind for FunctionCategory {
     type Context<'a> = FunctionContext<'a>;
     type Output = FunctionDef;
-    type Profile = FunctionProfile;
 
     fn available(&self, ctx: &Self::Context<'_>) -> bool {
         match self {
@@ -409,7 +409,7 @@ impl SqlGeneratorKind for FunctionCategory {
     fn strategy<'a>(
         &self,
         _ctx: &Self::Context<'a>,
-        _profile: &Self::Profile,
+        _profile: &StatementProfile,
     ) -> BoxedStrategy<Self::Output> {
         let funcs = functions_in_category(*self);
         if funcs.is_empty() {

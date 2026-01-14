@@ -18,6 +18,7 @@ use strum::IntoEnumIterator;
 
 use crate::function::{FunctionCategory, FunctionDef, FunctionProfile, FunctionRegistry};
 use crate::generator::SqlGeneratorKind;
+use crate::profile::StatementProfile;
 use crate::schema::{ColumnDef, DataType};
 use crate::select::SelectStatement;
 use crate::value::{SqlValue, value_for_type};
@@ -721,7 +722,6 @@ impl ExpressionContext {
 impl SqlGeneratorKind for ExpressionKind {
     type Context<'a> = ExpressionContext;
     type Output = Expression;
-    type Profile = ExpressionProfile;
 
     fn available(&self, ctx: &Self::Context<'_>) -> bool {
         match self {
@@ -776,10 +776,10 @@ impl SqlGeneratorKind for ExpressionKind {
     fn strategy<'a>(
         &self,
         ctx: &Self::Context<'a>,
-        _profile: &Self::Profile,
+        profile: &StatementProfile,
     ) -> BoxedStrategy<Self::Output> {
         match self {
-            ExpressionKind::Value => value_expression_strategy(ctx),
+            ExpressionKind::Value => value_expression_strategy(ctx, profile),
             ExpressionKind::Column => column_expression_strategy(ctx),
             ExpressionKind::FunctionCall => function_call_expression_strategy(ctx),
             ExpressionKind::BinaryOp => binary_op_expression_strategy(ctx),
@@ -791,9 +791,12 @@ impl SqlGeneratorKind for ExpressionKind {
 }
 
 /// Generate a literal value expression.
-fn value_expression_strategy(ctx: &ExpressionContext) -> BoxedStrategy<Expression> {
+fn value_expression_strategy(
+    ctx: &ExpressionContext,
+    profile: &StatementProfile,
+) -> BoxedStrategy<Expression> {
     let data_type = ctx.target_type.unwrap_or(DataType::Integer);
-    let value_profile = crate::value::ValueProfile::default();
+    let value_profile = &profile.generation.value;
     value_for_type(&data_type, true, &value_profile)
         .prop_map(Expression::Value)
         .boxed()
@@ -976,11 +979,12 @@ fn cast_expression_strategy(ctx: &ExpressionContext) -> BoxedStrategy<Expression
 
 /// Generate an expression using the context's profile.
 pub fn expression(ctx: &ExpressionContext) -> BoxedStrategy<Expression> {
+    let profile = StatementProfile::default();
     let weighted_strategies: Vec<(u32, BoxedStrategy<Expression>)> = ctx
         .profile
         .enabled_kinds()
         .filter(|(kind, _)| kind.available(ctx))
-        .map(|(kind, weight)| (weight, kind.strategy(ctx, &ctx.profile)))
+        .map(|(kind, weight)| (weight, kind.strategy(ctx, &profile)))
         .collect();
 
     if weighted_strategies.is_empty() {

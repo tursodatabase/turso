@@ -5,6 +5,8 @@
 
 use proptest::prelude::*;
 
+use crate::profile::StatementProfile;
+
 /// Trait for kinds of SQL operations that can be generated.
 ///
 /// This trait abstracts the common pattern of having an enum of operation kinds
@@ -19,8 +21,6 @@ use proptest::prelude::*;
 ///   This is a GAT (Generic Associated Type) that supports lifetimes, allowing contexts
 ///   that borrow data (e.g., `AlterTableContext<'a>`).
 /// - `Output`: The type of statement/operation this generator produces.
-/// - `Profile`: Configuration type for fine-grained control over generation.
-///   Use `()` for generators that don't need additional configuration.
 ///
 /// # Example
 ///
@@ -28,13 +28,12 @@ use proptest::prelude::*;
 /// impl SqlGeneratorKind for MyOpKind {
 ///     type Context<'a> = MyContext<'a>;
 ///     type Output = MyStatement;
-///     type Profile = MyProfile;
 ///
 ///     fn available(&self, ctx: &Self::Context<'_>) -> bool {
 ///         // Check if this operation can be generated given the context
 ///     }
 ///
-///     fn strategy(&self, ctx: &Self::Context<'_>, profile: &Self::Profile) -> BoxedStrategy<Self::Output> {
+///     fn strategy(&self, ctx: &Self::Context<'_>, profile: &StatementProfile) -> BoxedStrategy<Self::Output> {
 ///         // Build the proptest strategy using the profile
 ///     }
 /// }
@@ -46,10 +45,6 @@ pub trait SqlGeneratorKind: Sized + Copy {
 
     /// The output type produced by this generator.
     type Output;
-
-    /// Profile type for fine-grained control over generation.
-    /// Use `()` for generators that don't need additional configuration.
-    type Profile;
 
     /// Returns true if this kind can be generated given the context.
     ///
@@ -72,18 +67,18 @@ pub trait SqlGeneratorKind: Sized + Copy {
     /// before calling this method.
     ///
     /// The `profile` parameter provides fine-grained control over generation.
-    /// Pass `&Profile::default()` for default generation behavior.
+    /// Pass `&StatementProfile::default()` for default generation behavior.
     fn strategy<'a>(
         &self,
         ctx: &Self::Context<'a>,
-        profile: &Self::Profile,
+        profile: &StatementProfile,
     ) -> BoxedStrategy<Self::Output>;
 }
 
 /// Extension trait providing helper methods for iterators of (Kind, weight) pairs.
-pub trait WeightedKindIteratorExt<K, O, P>: Iterator<Item = (K, u32)>
+pub trait WeightedKindIteratorExt<K, O>: Iterator<Item = (K, u32)>
 where
-    K: SqlGeneratorKind<Output = O, Profile = P>,
+    K: SqlGeneratorKind<Output = O>,
 {
     /// Filters to only supported and available operations, then builds weighted strategies.
     ///
@@ -93,7 +88,7 @@ where
     fn into_weighted_strategies(
         self,
         ctx: &K::Context<'_>,
-        profile: &P,
+        profile: &StatementProfile,
     ) -> Vec<(u32, BoxedStrategy<O>)>
     where
         Self: Sized,
@@ -104,10 +99,10 @@ where
     }
 }
 
-impl<I, K, O, P> WeightedKindIteratorExt<K, O, P> for I
+impl<I, K, O> WeightedKindIteratorExt<K, O> for I
 where
     I: Iterator<Item = (K, u32)>,
-    K: SqlGeneratorKind<Output = O, Profile = P>,
+    K: SqlGeneratorKind<Output = O>,
 {
 }
 
@@ -124,7 +119,6 @@ mod tests {
     impl SqlGeneratorKind for TestKind {
         type Context<'a> = bool; // Simple context: true = available, false = not
         type Output = &'static str;
-        type Profile = (); // No profile needed
 
         fn available(&self, ctx: &Self::Context<'_>) -> bool {
             match self {
@@ -136,7 +130,7 @@ mod tests {
         fn strategy(
             &self,
             _ctx: &Self::Context<'_>,
-            _profile: &Self::Profile,
+            _profile: &StatementProfile,
         ) -> BoxedStrategy<Self::Output> {
             match self {
                 TestKind::A => Just("A").boxed(),
@@ -148,13 +142,20 @@ mod tests {
     #[test]
     fn test_weighted_kind_iterator() {
         let kinds = [(TestKind::A, 10), (TestKind::B, 20)];
+        let profile = StatementProfile::default();
 
         // When context is true, both should be available
-        let strategies: Vec<_> = kinds.iter().copied().into_weighted_strategies(&true, &());
+        let strategies: Vec<_> = kinds
+            .iter()
+            .copied()
+            .into_weighted_strategies(&true, &profile);
         assert_eq!(strategies.len(), 2);
 
         // When context is false, only A should be available
-        let strategies: Vec<_> = kinds.iter().copied().into_weighted_strategies(&false, &());
+        let strategies: Vec<_> = kinds
+            .iter()
+            .copied()
+            .into_weighted_strategies(&false, &profile);
         assert_eq!(strategies.len(), 1);
     }
 }

@@ -107,7 +107,6 @@ impl CreateTriggerKind {
 impl SqlGeneratorKind for CreateTriggerKind {
     type Context<'a> = CreateTriggerContext<'a>;
     type Output = CreateTriggerStatement;
-    type Profile = StatementProfile;
 
     fn available(&self, _ctx: &Self::Context<'_>) -> bool {
         // All trigger kinds are available if we have a table
@@ -128,7 +127,7 @@ impl SqlGeneratorKind for CreateTriggerKind {
     fn strategy<'a>(
         &self,
         ctx: &Self::Context<'_>,
-        profile: &Self::Profile,
+        profile: &StatementProfile,
     ) -> BoxedStrategy<Self::Output> {
         create_trigger_with_timing_event(
             ctx.table,

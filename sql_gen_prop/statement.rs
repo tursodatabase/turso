@@ -163,7 +163,6 @@ impl StatementKind {
 impl SqlGeneratorKind for StatementKind {
     type Context<'a> = Schema;
     type Output = SqlStatement;
-    type Profile = StatementProfile;
 
     /// Returns true if this statement kind can be generated for the given schema.
     fn available(&self, schema: &Self::Context<'_>) -> bool {
@@ -246,7 +245,7 @@ impl SqlGeneratorKind for StatementKind {
     fn strategy<'a>(
         &self,
         schema: &Self::Context<'a>,
-        profile: &Self::Profile,
+        profile: &StatementProfile,
     ) -> BoxedStrategy<Self::Output> {
         let tables = schema.tables.clone();
         match self {
@@ -279,9 +278,11 @@ impl SqlGeneratorKind for StatementKind {
             StatementKind::DropTable => drop_table_for_schema(schema)
                 .prop_map(SqlStatement::DropTable)
                 .boxed(),
-            StatementKind::AlterTable => alter_table_for_schema(schema, &profile.alter_table.extra)
-                .prop_map(SqlStatement::AlterTable)
-                .boxed(),
+            StatementKind::AlterTable => {
+                alter_table_for_schema(schema, &profile.alter_table.extra, profile)
+                    .prop_map(SqlStatement::AlterTable)
+                    .boxed()
+            }
 
             // DDL - Indexes
             StatementKind::CreateIndex => create_index(schema, profile)
