@@ -1208,3 +1208,98 @@ do_execsql_test invalid-datetime-modifier-format {
   SELECT datetime(-100, 'start of month');
 } {{}}
 
+# UTC modifier tests
+do_execsql_test datetime-utc-basic {
+  SELECT typeof(datetime('2024-01-15 12:00:00', 'utc'));
+} {text}
+
+do_execsql_test datetime-utc-with-z-suffix {
+  SELECT datetime('2024-01-15 12:00:00Z', 'utc');
+} {{2024-01-15 12:00:00}}
+
+do_execsql_test datetime-utc-idempotent {
+  SELECT datetime('2024-01-15 12:00:00Z', 'utc', 'utc');
+} {{2024-01-15 12:00:00}}
+
+do_execsql_test datetime-localtime-utc-roundtrip {
+  SELECT datetime('2024-01-15 12:00:00Z', 'localtime', 'utc');
+} {{2024-01-15 12:00:00}}
+
+# Localtime modifier tests
+do_execsql_test datetime-localtime-basic {
+  SELECT typeof(datetime('2024-01-15 12:00:00', 'localtime'));
+} {text}
+
+# julianday modifier tests
+do_execsql_test datetime-julianday-modifier {
+  SELECT datetime(2460400.5, 'julianday');
+} {{2024-03-31 00:00:00}}
+
+do_execsql_test strftime-julianday-modifier {
+  SELECT strftime('%Y-%m-%d', 2460400.5, 'julianday');
+} {2024-03-31}
+
+do_execsql_test unixepoch-julianday-modifier {
+  SELECT unixepoch(2440587.5, 'julianday');
+} {0}
+
+# unixepoch modifier tests
+do_execsql_test time-unixepoch-modifier {
+  SELECT time(3661, 'unixepoch');
+} {01:01:01}
+
+do_execsql_test julianday-unixepoch-modifier {
+  SELECT julianday(0, 'unixepoch');
+} {2440587.5}
+
+do_execsql_test strftime-unixepoch-modifier {
+  SELECT strftime('%Y-%m-%d %H:%M:%S', 946684800, 'unixepoch');
+} {{2000-01-01 00:00:00}}
+
+do_execsql_test datetime-unixepoch-negative {
+  SELECT datetime(-86400, 'unixepoch');
+} {{1969-12-31 00:00:00}}
+
+# auto modifier tests
+do_execsql_test datetime-auto-julianday {
+  SELECT datetime(2460400.5, 'auto');
+} {{2024-03-31 00:00:00}}
+
+do_execsql_test datetime-auto-unixepoch {
+  SELECT datetime(1711065600, 'auto');
+} {{2024-03-22 00:00:00}}
+
+do_execsql_test julianday-auto {
+  SELECT julianday(0, 'auto');
+} {0.0}
+
+do_execsql_test unixepoch-auto {
+  SELECT unixepoch(2440587.5, 'auto');
+} {0}
+
+do_execsql_test strftime-auto {
+  SELECT strftime('%Y-%m-%d', 2460400.5, 'auto');
+} {2024-03-31}
+
+# subsec modifier tests
+do_execsql_test datetime-without-subsec {
+  SELECT datetime('2024-01-15 12:30:45.123');
+} {{2024-01-15 12:30:45}}
+
+do_execsql_test datetime-with-subsec {
+  SELECT datetime('2024-01-15 12:30:45.123', 'subsec');
+} {{2024-01-15 12:30:45.123}}
+
+# Combined modifier tests
+do_execsql_test datetime-floor-localtime {
+  SELECT typeof(datetime('2024-01-31', '+1 month', 'floor', 'localtime'));
+} {text}
+
+do_execsql_test datetime-auto-start-of-month {
+  SELECT datetime(1711065600, 'auto', 'start of month');
+} {{2024-03-01 00:00:00}}
+
+do_execsql_test date-julianday-floor {
+  SELECT date(2460400.5, 'julianday', '+1 month', 'floor');
+} {2024-04-30}
+
