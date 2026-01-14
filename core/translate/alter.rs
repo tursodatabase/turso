@@ -487,10 +487,10 @@ pub fn translate_alter_table(
             // 1. NOT NULL columns without a non-null default (existing rows would get NULL)
             // 2. Non-deterministic defaults like CURRENT_TIME (can't backfill existing rows)
             let needs_notnull_check = column.notnull()
-                && !column
+                && column
                     .default
                     .as_ref()
-                    .is_some_and(|default| !crate::util::expr_contains_null(default));
+                    .is_none_or(|default| crate::util::expr_contains_null(default));
 
             let needs_nondeterministic_check = column
                 .default
