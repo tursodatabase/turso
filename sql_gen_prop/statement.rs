@@ -251,23 +251,23 @@ impl SqlGeneratorKind for StatementKind {
         let tables = schema.tables.clone();
         match self {
             // DML - all use expression generation
-            StatementKind::Select => table_dml(tables, |t| {
-                select_for_table(t, &crate::select::SelectProfile::default())
+            StatementKind::Select => table_dml(tables, schema, |t, s| {
+                select_for_table(t, s, &crate::select::SelectProfile::default())
                     .prop_map(SqlStatement::Select)
                     .boxed()
             }),
-            StatementKind::Insert => table_dml(tables, |t| {
+            StatementKind::Insert => table_dml(tables, schema, |t, _s| {
                 insert_for_table(t, &crate::insert::InsertProfile::default())
                     .prop_map(SqlStatement::Insert)
                     .boxed()
             }),
-            StatementKind::Update => table_dml(tables, |t| {
-                update_for_table(t, &crate::update::UpdateProfile::default())
+            StatementKind::Update => table_dml(tables, schema, |t, s| {
+                update_for_table(t, s, &crate::update::UpdateProfile::default())
                     .prop_map(SqlStatement::Update)
                     .boxed()
             }),
-            StatementKind::Delete => table_dml(tables, |t| {
-                delete_for_table(t, &crate::delete::DeleteProfile::default())
+            StatementKind::Delete => table_dml(tables, schema, |t, s| {
+                delete_for_table(t, s, &crate::delete::DeleteProfile::default())
                     .prop_map(SqlStatement::Delete)
                     .boxed()
             }),
@@ -347,26 +347,27 @@ impl SqlGeneratorKind for StatementKind {
 }
 
 /// Helper to create a table-based DML strategy.
-fn table_dml<F>(tables: Rc<Vec<TableRef>>, f: F) -> BoxedStrategy<SqlStatement>
+fn table_dml<F>(tables: Rc<Vec<TableRef>>, schema: &Schema, f: F) -> BoxedStrategy<SqlStatement>
 where
-    F: Fn(&TableRef) -> BoxedStrategy<SqlStatement> + 'static,
+    F: Fn(&TableRef, &Schema) -> BoxedStrategy<SqlStatement> + 'static,
 {
+    let schema_clone = schema.clone();
     proptest::sample::select((*tables).clone())
-        .prop_flat_map(move |t| f(&t))
+        .prop_flat_map(move |t| f(&t, &schema_clone))
         .boxed()
 }
 
 /// Generate a DML (Data Manipulation Language) statement for a table.
 /// Includes SELECT, INSERT, UPDATE, DELETE with expression support.
-pub fn dml_for_table(table: &TableRef) -> BoxedStrategy<SqlStatement> {
+pub fn dml_for_table(table: &TableRef, schema: &Schema) -> BoxedStrategy<SqlStatement> {
     prop_oneof![
-        select_for_table(table, &crate::select::SelectProfile::default())
+        select_for_table(table, schema, &crate::select::SelectProfile::default())
             .prop_map(SqlStatement::Select),
         insert_for_table(table, &crate::insert::InsertProfile::default())
             .prop_map(SqlStatement::Insert),
-        update_for_table(table, &crate::update::UpdateProfile::default())
+        update_for_table(table, schema, &crate::update::UpdateProfile::default())
             .prop_map(SqlStatement::Update),
-        delete_for_table(table, &crate::delete::DeleteProfile::default())
+        delete_for_table(table, schema, &crate::delete::DeleteProfile::default())
             .prop_map(SqlStatement::Delete),
     ]
     .boxed()
@@ -375,13 +376,13 @@ pub fn dml_for_table(table: &TableRef) -> BoxedStrategy<SqlStatement> {
 /// Generate any SQL statement for a table, using schema context for safe DDL generation.
 pub fn statement_for_table(table: &TableRef, schema: &Schema) -> BoxedStrategy<SqlStatement> {
     prop_oneof![
-        select_for_table(table, &crate::select::SelectProfile::default())
+        select_for_table(table, schema, &crate::select::SelectProfile::default())
             .prop_map(SqlStatement::Select),
         insert_for_table(table, &crate::insert::InsertProfile::default())
             .prop_map(SqlStatement::Insert),
-        update_for_table(table, &crate::update::UpdateProfile::default())
+        update_for_table(table, schema, &crate::update::UpdateProfile::default())
             .prop_map(SqlStatement::Update),
-        delete_for_table(table, &crate::delete::DeleteProfile::default())
+        delete_for_table(table, schema, &crate::delete::DeleteProfile::default())
             .prop_map(SqlStatement::Delete),
         create_index_for_table(
             table,
@@ -401,8 +402,12 @@ pub fn dml_for_schema(schema: &Schema) -> BoxedStrategy<SqlStatement> {
         "Schema must have at least one table"
     );
 
-    let table_strategies: Vec<BoxedStrategy<SqlStatement>> =
-        schema.tables.iter().map(dml_for_table).collect();
+    let schema_clone = schema.clone();
+    let table_strategies: Vec<BoxedStrategy<SqlStatement>> = schema
+        .tables
+        .iter()
+        .map(|t| dml_for_table(t, &schema_clone))
+        .collect();
 
     proptest::strategy::Union::new(table_strategies).boxed()
 }

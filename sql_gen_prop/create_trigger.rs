@@ -377,15 +377,19 @@ pub fn trigger_event() -> impl Strategy<Value = TriggerEvent> {
 /// Generate a trigger body containing valid DML statements.
 fn trigger_body(
     table: &TableRef,
+    schema: &Schema,
     profile: &StatementProfile,
 ) -> BoxedStrategy<Vec<TriggerSqlStatement>> {
     // Generate 1-3 DML statements for the trigger body
     proptest::collection::vec(
         prop_oneof![
-            select_for_table(table, profile.select_profile()).prop_map(TriggerSqlStatement::Select),
+            select_for_table(table, schema, profile.select_profile())
+                .prop_map(TriggerSqlStatement::Select),
             insert_for_table(table, profile.insert_profile()).prop_map(TriggerSqlStatement::Insert),
-            update_for_table(table, profile.update_profile()).prop_map(TriggerSqlStatement::Update),
-            delete_for_table(table, profile.delete_profile()).prop_map(TriggerSqlStatement::Delete),
+            update_for_table(table, schema, profile.update_profile())
+                .prop_map(TriggerSqlStatement::Update),
+            delete_for_table(table, schema, profile.delete_profile())
+                .prop_map(TriggerSqlStatement::Delete),
         ],
         1..=3,
     )
@@ -406,7 +410,7 @@ pub fn create_trigger_with_timing_event(
     (
         identifier_excluding(existing_triggers),
         any::<bool>(),
-        trigger_body(table, profile),
+        trigger_body(table, schema, profile),
     )
         .prop_map(move |(name, if_not_exists, body)| CreateTriggerStatement {
             name,

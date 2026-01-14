@@ -9,7 +9,7 @@ use crate::condition::{
 };
 use crate::expression::{Expression, ExpressionContext, ExpressionProfile};
 use crate::function::builtin_functions;
-use crate::schema::TableRef;
+use crate::schema::{Schema, TableRef};
 
 // =============================================================================
 // SELECT STATEMENT PROFILE
@@ -210,6 +210,7 @@ impl fmt::Display for SelectStatement {
 /// Generate a SELECT statement for a table with profile.
 pub fn select_for_table(
     table: &TableRef,
+    schema: &Schema,
     profile: &SelectProfile,
 ) -> BoxedStrategy<SelectStatement> {
     let table_name = table.name.clone();
@@ -254,7 +255,7 @@ pub fn select_for_table(
 
     (
         columns_strategy,
-        optional_where_clause(table, None, &condition_profile),
+        optional_where_clause(table, schema, &condition_profile),
         order_by_for_table(table, &condition_profile),
         proptest::option::of(limit_range),
         proptest::option::of(offset_range),
@@ -332,8 +333,10 @@ mod tests {
                         crate::schema::ColumnDef::new("name", crate::schema::DataType::Text),
                         crate::schema::ColumnDef::new("age", crate::schema::DataType::Integer),
                     ],
-                ).into();
-                select_for_table(&table, &SelectProfile::default())
+                );
+                let schema = crate::schema::SchemaBuilder::new().add_table(table.clone()).build();
+                let table_ref: crate::schema::TableRef = table.into();
+                select_for_table(&table_ref, &schema, &SelectProfile::default())
             }
         ) {
             let sql = stmt.to_string();
@@ -354,9 +357,10 @@ mod tests {
                 crate::schema::ColumnDef::new("name", crate::schema::DataType::Text),
                 crate::schema::ColumnDef::new("age", crate::schema::DataType::Integer),
             ],
-        )
-        .into();
-        let strategy = select_for_table(&table, &SelectProfile::default());
+        );
+        let schema = crate::schema::SchemaBuilder::new().add_table(table.clone()).build();
+        let table_ref: crate::schema::TableRef = table.into();
+        let strategy = select_for_table(&table_ref, &schema, &SelectProfile::default());
 
         let mut runner = TestRunner::default();
         let mut found_function = false;

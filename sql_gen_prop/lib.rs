@@ -185,7 +185,10 @@ mod tests {
 
     proptest! {
         #[test]
-        fn generated_select_is_valid_sql(stmt in strategies::select_for_table(&test_schema().tables[0], &SelectProfile::default())) {
+        fn generated_select_is_valid_sql(stmt in {
+            let schema = test_schema();
+            strategies::select_for_table(&schema.tables[0], &schema, &SelectProfile::default())
+        }) {
             let sql = stmt.to_string();
             prop_assert!(sql.starts_with("SELECT"));
             prop_assert!(sql.contains("FROM \"users\""));
@@ -199,13 +202,19 @@ mod tests {
         }
 
         #[test]
-        fn generated_update_is_valid_sql(stmt in strategies::update_for_table(&test_schema().tables[0], &UpdateProfile::default())) {
+        fn generated_update_is_valid_sql(stmt in {
+            let schema = test_schema();
+            strategies::update_for_table(&schema.tables[0], &schema, &UpdateProfile::default())
+        }) {
             let sql = stmt.to_string();
             prop_assert!(sql.starts_with("UPDATE \"users\""));
         }
 
         #[test]
-        fn generated_delete_is_valid_sql(stmt in strategies::delete_for_table(&test_schema().tables[0], &DeleteProfile::default())) {
+        fn generated_delete_is_valid_sql(stmt in {
+            let schema = test_schema();
+            strategies::delete_for_table(&schema.tables[0], &schema, &DeleteProfile::default())
+        }) {
             let sql = stmt.to_string();
             prop_assert!(sql.starts_with("DELETE FROM \"users\""));
         }

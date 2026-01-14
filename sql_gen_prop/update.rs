@@ -6,7 +6,7 @@ use std::fmt;
 use crate::condition::{Condition, ConditionProfile, optional_where_clause};
 use crate::expression::{Expression, ExpressionContext, ExpressionProfile};
 use crate::function::builtin_functions;
-use crate::schema::{ColumnDef, TableRef};
+use crate::schema::{ColumnDef, Schema, TableRef};
 
 // =============================================================================
 // UPDATE STATEMENT PROFILE
@@ -103,6 +103,7 @@ impl fmt::Display for UpdateStatement {
 /// Generate an UPDATE statement for a table with profile.
 pub fn update_for_table(
     table: &TableRef,
+    schema: &Schema,
     profile: &UpdateProfile,
 ) -> BoxedStrategy<UpdateStatement> {
     let table_name = table.name.clone();
@@ -115,8 +116,9 @@ pub fn update_for_table(
     let condition_profile = profile.condition_profile.clone();
 
     let table_clone = table.clone();
+    let schema_clone = schema.clone();
     if updatable.is_empty() {
-        return optional_where_clause(&table_clone, None, &condition_profile)
+        return optional_where_clause(&table_clone, &schema_clone, &condition_profile)
             .prop_map(move |where_clause| UpdateStatement {
                 table: table_name.clone(),
                 assignments: vec![],
@@ -136,7 +138,7 @@ pub fn update_for_table(
 
     (
         proptest::sample::subsequence(col_indices, 1..=updatable.len()),
-        optional_where_clause(&table_clone, None, &condition_profile),
+        optional_where_clause(&table_clone, &schema_clone, &condition_profile),
     )
         .prop_flat_map(move |(indices, where_clause)| {
             let selected_cols: Vec<&ColumnDef> =
@@ -224,8 +226,10 @@ mod tests {
                         ColumnDef::new("name", DataType::Text),
                         ColumnDef::new("age", DataType::Integer),
                     ],
-                ).into();
-                update_for_table(&table, &UpdateProfile::default())
+                );
+                let schema = crate::schema::SchemaBuilder::new().add_table(table.clone()).build();
+                let table_ref: crate::schema::TableRef = table.into();
+                update_for_table(&table_ref, &schema, &UpdateProfile::default())
             }
         ) {
             let sql = stmt.to_string();

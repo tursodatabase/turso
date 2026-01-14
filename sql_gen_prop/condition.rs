@@ -700,11 +700,11 @@ pub fn expression_condition(
 
 /// Generate a condition tree for a table (recursive, bounded depth).
 ///
-/// If a schema is provided and the profile enables subqueries, subquery conditions
-/// will be included using tables from the schema.
+/// When the profile enables subqueries, subquery conditions will be included
+/// using tables from the schema.
 pub fn condition_for_table(
     table: &TableRef,
-    schema: Option<&Schema>,
+    schema: &Schema,
     profile: &ConditionProfile,
 ) -> BoxedStrategy<Condition> {
     condition_for_table_internal(table, schema, profile, profile.max_depth)
@@ -713,7 +713,7 @@ pub fn condition_for_table(
 /// Internal recursive implementation of condition_for_table.
 fn condition_for_table_internal(
     table: &TableRef,
-    schema: Option<&Schema>,
+    schema: &Schema,
     profile: &ConditionProfile,
     depth: u32,
 ) -> BoxedStrategy<Condition> {
@@ -735,31 +735,24 @@ fn condition_for_table_internal(
 
     // Build leaf strategy including subqueries if enabled
     let subquery_profile = &profile.subquery_profile;
-    let leaf_strategy: BoxedStrategy<Condition> = if subquery_profile.any_enabled() {
-        // Get tables for subqueries: use schema tables or fall back to current table
-        let subquery_tables: Rc<Vec<TableRef>> = schema
-            .map(|s| s.tables.clone())
-            .unwrap_or_else(|| Rc::new(vec![table.clone()]));
+    let leaf_strategy: BoxedStrategy<Condition> = if subquery_profile.any_enabled()
+        && !schema.tables.is_empty()
+    {
+        let subquery_total = subquery_profile.total_weight();
+        let simple_weight = profile.simple_condition_weight;
 
-        if !subquery_tables.is_empty() {
-            let subquery_total = subquery_profile.total_weight();
-            let simple_weight = profile.simple_condition_weight;
-
-            if subquery_total > 0 {
-                let sq_tables = subquery_tables.clone();
-                let sq_profile = subquery_profile.clone();
-                let outer_table = table.clone();
-                proptest::strategy::Union::new_weighted(vec![
-                    (simple_weight, simple_leaf),
-                    (
-                        subquery_total,
-                        subquery_condition_for_tables(&outer_table, &sq_tables, &sq_profile),
-                    ),
-                ])
-                .boxed()
-            } else {
-                simple_leaf
-            }
+        if subquery_total > 0 {
+            let sq_tables = schema.tables.clone();
+            let sq_profile = subquery_profile.clone();
+            let outer_table = table.clone();
+            proptest::strategy::Union::new_weighted(vec![
+                (simple_weight, simple_leaf),
+                (
+                    subquery_total,
+                    subquery_condition_for_tables(&outer_table, &sq_tables, &sq_profile),
+                ),
+            ])
+            .boxed()
         } else {
             simple_leaf
         }
@@ -773,25 +766,15 @@ fn condition_for_table_internal(
 
     // Recursive case
     let table_clone = table.clone();
-    let schema_tables = schema.map(|s| s.tables.clone());
+    let schema_clone = schema.clone();
     let profile_clone = profile.clone();
     leaf_strategy
         .prop_flat_map(move |left| {
             let table_inner = table_clone.clone();
-            let schema_inner = schema_tables.as_ref().map(|t| Schema {
-                tables: t.clone(),
-                indexes: Rc::new(vec![]),
-                views: Rc::new(vec![]),
-                triggers: Rc::new(vec![]),
-            });
+            let schema_inner = schema_clone.clone();
             let profile_inner = profile_clone.clone();
-            condition_for_table_internal(
-                &table_inner,
-                schema_inner.as_ref(),
-                &profile_inner,
-                depth - 1,
-            )
-            .prop_map(move |right| Condition::And(Box::new(left.clone()), Box::new(right)))
+            condition_for_table_internal(&table_inner, &schema_inner, &profile_inner, depth - 1)
+                .prop_map(move |right| Condition::And(Box::new(left.clone()), Box::new(right)))
         })
         .boxed()
 }
@@ -916,11 +899,11 @@ fn subquery_condition_for_tables(
 
 /// Generate a condition tree for a table with expression support.
 ///
-/// If a schema is provided and the profile enables subqueries, subquery conditions
-/// will be included using tables from the schema.
+/// When the profile enables subqueries, subquery conditions will be included
+/// using tables from the schema.
 pub fn condition_for_table_with_expressions(
     table: &TableRef,
-    schema: Option<&Schema>,
+    schema: &Schema,
     functions: &FunctionRegistry,
     profile: &ConditionProfile,
 ) -> BoxedStrategy<Condition> {
@@ -936,7 +919,7 @@ pub fn condition_for_table_with_expressions(
 /// Internal recursive implementation of condition_for_table_with_expressions.
 fn condition_for_table_with_expressions_internal(
     table: &TableRef,
-    schema: Option<&Schema>,
+    schema: &Schema,
     functions: &FunctionRegistry,
     profile: &ConditionProfile,
     depth: u32,
@@ -963,31 +946,24 @@ fn condition_for_table_with_expressions_internal(
 
     // Build leaf strategy including subqueries if enabled
     let subquery_profile = &profile.subquery_profile;
-    let leaf_strategy: BoxedStrategy<Condition> = if subquery_profile.any_enabled() {
-        // Get tables for subqueries: use schema tables or fall back to current table
-        let subquery_tables: Rc<Vec<TableRef>> = schema
-            .map(|s| s.tables.clone())
-            .unwrap_or_else(|| Rc::new(vec![table.clone()]));
+    let leaf_strategy: BoxedStrategy<Condition> = if subquery_profile.any_enabled()
+        && !schema.tables.is_empty()
+    {
+        let subquery_total = subquery_profile.total_weight();
+        let simple_weight = profile.simple_condition_weight;
 
-        if !subquery_tables.is_empty() {
-            let subquery_total = subquery_profile.total_weight();
-            let simple_weight = profile.simple_condition_weight;
-
-            if subquery_total > 0 {
-                let sq_tables = subquery_tables.clone();
-                let sq_profile = subquery_profile.clone();
-                let outer_table = table.clone();
-                proptest::strategy::Union::new_weighted(vec![
-                    (simple_weight, simple_leaf),
-                    (
-                        subquery_total,
-                        subquery_condition_for_tables(&outer_table, &sq_tables, &sq_profile),
-                    ),
-                ])
-                .boxed()
-            } else {
-                simple_leaf
-            }
+        if subquery_total > 0 {
+            let sq_tables = schema.tables.clone();
+            let sq_profile = subquery_profile.clone();
+            let outer_table = table.clone();
+            proptest::strategy::Union::new_weighted(vec![
+                (simple_weight, simple_leaf),
+                (
+                    subquery_total,
+                    subquery_condition_for_tables(&outer_table, &sq_tables, &sq_profile),
+                ),
+            ])
+            .boxed()
         } else {
             simple_leaf
         }
@@ -1001,23 +977,18 @@ fn condition_for_table_with_expressions_internal(
 
     // Recursive case
     let table_clone = table.clone();
-    let schema_tables = schema.map(|s| s.tables.clone());
+    let schema_clone = schema.clone();
     let functions_clone = functions.clone();
     let profile_clone = profile.clone();
     leaf_strategy
         .prop_flat_map(move |left| {
             let table_inner = table_clone.clone();
-            let schema_inner = schema_tables.as_ref().map(|t| Schema {
-                tables: t.clone(),
-                indexes: Rc::new(vec![]),
-                views: Rc::new(vec![]),
-                triggers: Rc::new(vec![]),
-            });
+            let schema_inner = schema_clone.clone();
             let funcs_inner = functions_clone.clone();
             let profile_inner = profile_clone.clone();
             condition_for_table_with_expressions_internal(
                 &table_inner,
-                schema_inner.as_ref(),
+                &schema_inner,
                 &funcs_inner,
                 &profile_inner,
                 depth - 1,
@@ -1029,62 +1000,46 @@ fn condition_for_table_with_expressions_internal(
 
 /// Generate an optional WHERE clause for a table with profile.
 ///
-/// If a schema is provided and the profile enables subqueries, subquery conditions
-/// will be included using tables from the schema.
+/// When the profile enables subqueries, subquery conditions will be included
+/// using tables from the schema.
 pub fn optional_where_clause(
     table: &TableRef,
-    schema: Option<&Schema>,
+    schema: &Schema,
     profile: &ConditionProfile,
 ) -> BoxedStrategy<Option<Condition>> {
     let table_clone = table.clone();
-    let schema_tables = schema.map(|s| s.tables.clone());
+    let schema_clone = schema.clone();
     let profile_clone = profile.clone();
     prop_oneof![
         Just(None),
-        {
-            let schema_inner = schema_tables.as_ref().map(|t| Schema {
-                tables: t.clone(),
-                indexes: Rc::new(vec![]),
-                views: Rc::new(vec![]),
-                triggers: Rc::new(vec![]),
-            });
-            condition_for_table(&table_clone, schema_inner.as_ref(), &profile_clone).prop_map(Some)
-        },
+        condition_for_table(&table_clone, &schema_clone, &profile_clone).prop_map(Some),
     ]
     .boxed()
 }
 
 /// Generate an optional WHERE clause with expression support and profile.
 ///
-/// If a schema is provided and the profile enables subqueries, subquery conditions
-/// will be included using tables from the schema.
+/// When the profile enables subqueries, subquery conditions will be included
+/// using tables from the schema.
 pub fn optional_where_clause_with_expressions(
     table: &TableRef,
-    schema: Option<&Schema>,
+    schema: &Schema,
     functions: &FunctionRegistry,
     profile: &ConditionProfile,
 ) -> BoxedStrategy<Option<Condition>> {
     let table_clone = table.clone();
-    let schema_tables = schema.map(|s| s.tables.clone());
+    let schema_clone = schema.clone();
     let functions_clone = functions.clone();
     let profile_clone = profile.clone();
     prop_oneof![
         Just(None),
-        {
-            let schema_inner = schema_tables.as_ref().map(|t| Schema {
-                tables: t.clone(),
-                indexes: Rc::new(vec![]),
-                views: Rc::new(vec![]),
-                triggers: Rc::new(vec![]),
-            });
-            condition_for_table_with_expressions(
-                &table_clone,
-                schema_inner.as_ref(),
-                &functions_clone,
-                &profile_clone,
-            )
-            .prop_map(Some)
-        },
+        condition_for_table_with_expressions(
+            &table_clone,
+            &schema_clone,
+            &functions_clone,
+            &profile_clone,
+        )
+        .prop_map(Some),
     ]
     .boxed()
 }
@@ -1205,9 +1160,16 @@ pub fn subquery_select_for_table(
 
     // Generate optional simple WHERE clause (no subqueries to avoid infinite recursion)
     let simple_profile = ConditionProfile::simple().with_max_depth(1);
+    // Create a minimal schema with just this table for the simple condition
+    let simple_schema = Schema {
+        tables: Rc::new(vec![table_clone.clone()]),
+        indexes: Rc::new(vec![]),
+        views: Rc::new(vec![]),
+        triggers: Rc::new(vec![]),
+    };
     let where_strategy = prop_oneof![
         3 => Just(None),
-        2 => condition_for_table(&table_clone, None, &simple_profile).prop_map(Some),
+        2 => condition_for_table(&table_clone, &simple_schema, &simple_profile).prop_map(Some),
     ];
 
     // Generate optional LIMIT
@@ -1584,7 +1546,7 @@ mod tests {
                     .add_table(orders_table)
                     .build();
                 let profile = ConditionProfile::complex();
-                condition_for_table(&users_table, Some(&schema), &profile)
+                condition_for_table(&users_table, &schema, &profile)
             }
         ) {
             let sql = cond.to_string();
