@@ -57,12 +57,18 @@ struct SimulatorConfig {
 enum FiberState {
     Idle,
     InTx,
+    Committing,
+    RollingBack,
 }
 
 struct SimulatorFiber {
     connection: Arc<Connection>,
     state: FiberState,
     statement: RefCell<Option<Statement>>,
+    /// Indexes created in the current transaction (table_name, index_name)
+    pending_creates: Vec<(String, String)>,
+    /// Indexes dropped in the current transaction (table_name, index_name)
+    pending_drops: Vec<(String, String)>,
 }
 
 struct SimulatorContext {
@@ -80,6 +86,7 @@ struct Stats {
     inserts: usize,
     updates: usize,
     deletes: usize,
+    checkpoints: usize,
     integrity_checks: usize,
 }
 
@@ -206,6 +213,8 @@ fn main() -> anyhow::Result<()> {
             connection: conn,
             state: FiberState::Idle,
             statement: RefCell::new(None),
+            pending_creates: Vec::new(),
+            pending_drops: Vec::new(),
         });
     }
 
@@ -224,7 +233,7 @@ fn main() -> anyhow::Result<()> {
 
     let progress_interval = config.max_steps / 10;
     let progress_stages = [
-        "       .             I/U/D/C",
+        "       .             I/U/D/CK/INT",
         "       .             ",
         "       .             ",
         "       |             ",
@@ -246,11 +255,12 @@ fn main() -> anyhow::Result<()> {
         io.step()?;
         if progress_interval > 0 && (i + 1) % progress_interval == 0 {
             println!(
-                "{}{}/{}/{}/{}",
+                "{}{}/{}/{}/{}/{}",
                 progress_stages[progress_index],
                 context.stats.inserts,
                 context.stats.updates,
                 context.stats.deletes,
+                context.stats.checkpoints,
                 context.stats.integrity_checks
             );
             progress_index += 1;
@@ -432,15 +442,17 @@ fn perform_work(
                             trace!("{} Schema changed, rolling back transaction", fiber_idx);
                             drop(stmt_borrow);
                             context.fibers[fiber_idx].statement.replace(None);
-                            // Rollback the transaction if we're in one
-                            if matches!(context.fibers[fiber_idx].state, FiberState::InTx)
-                                && let Ok(rollback_stmt) =
-                                    context.fibers[fiber_idx].connection.prepare("ROLLBACK")
+                            // Rollback the transaction if we're in one (or retry if rollback failed)
+                            if matches!(
+                                context.fibers[fiber_idx].state,
+                                FiberState::InTx | FiberState::Committing | FiberState::RollingBack
+                            ) && let Ok(rollback_stmt) =
+                                context.fibers[fiber_idx].connection.prepare("ROLLBACK")
                             {
                                 context.fibers[fiber_idx]
                                     .statement
                                     .replace(Some(rollback_stmt));
-                                context.fibers[fiber_idx].state = FiberState::Idle;
+                                context.fibers[fiber_idx].state = FiberState::RollingBack;
                             }
                             return Ok(());
                         }
@@ -448,19 +460,23 @@ fn perform_work(
                             trace!("{} Database busy, rolling back transaction", fiber_idx);
                             drop(stmt_borrow);
                             context.fibers[fiber_idx].statement.replace(None);
-                            // Rollback the transaction if we're in one
-                            if matches!(context.fibers[fiber_idx].state, FiberState::InTx)
-                                && let Ok(rollback_stmt) =
-                                    context.fibers[fiber_idx].connection.prepare("ROLLBACK")
+                            // Rollback the transaction if we're in one (or retry if rollback failed)
+                            if matches!(
+                                context.fibers[fiber_idx].state,
+                                FiberState::InTx | FiberState::Committing | FiberState::RollingBack
+                            ) && let Ok(rollback_stmt) =
+                                context.fibers[fiber_idx].connection.prepare("ROLLBACK")
                             {
                                 context.fibers[fiber_idx]
                                     .statement
                                     .replace(Some(rollback_stmt));
-                                context.fibers[fiber_idx].state = FiberState::Idle;
+                                context.fibers[fiber_idx].state = FiberState::RollingBack;
                             }
                             return Ok(());
                         }
                         turso_core::LimboError::WriteWriteConflict => {
+                            // Write-write conflict means the transaction was automatically
+                            // rolled back by the database engine
                             trace!(
                                 "{} Write-write conflict, transaction automatically rolled back",
                                 fiber_idx
@@ -474,15 +490,51 @@ fn perform_work(
                             trace!("{} Stale snapshot, rolling back transaction", fiber_idx);
                             drop(stmt_borrow);
                             context.fibers[fiber_idx].statement.replace(None);
-                            if matches!(context.fibers[fiber_idx].state, FiberState::InTx)
-                                && let Ok(rollback_stmt) =
-                                    context.fibers[fiber_idx].connection.prepare("ROLLBACK")
+                            // Rollback the transaction if we're in one (or retry if rollback failed)
+                            if matches!(
+                                context.fibers[fiber_idx].state,
+                                FiberState::InTx | FiberState::Committing | FiberState::RollingBack
+                            ) && let Ok(rollback_stmt) =
+                                context.fibers[fiber_idx].connection.prepare("ROLLBACK")
                             {
                                 context.fibers[fiber_idx]
                                     .statement
                                     .replace(Some(rollback_stmt));
+                                context.fibers[fiber_idx].state = FiberState::RollingBack;
+                            }
+                            return Ok(());
+                        }
+                        turso_core::LimboError::CompletionError(_) => {
+                            // I/O error - log it and try to recover by rolling back
+                            tracing::warn!("{} I/O error: {}, recovering", fiber_idx, e);
+                            drop(stmt_borrow);
+                            context.fibers[fiber_idx].statement.replace(None);
+                            // Only attempt rollback if we're actually in a transaction
+                            if matches!(
+                                context.fibers[fiber_idx].state,
+                                FiberState::InTx | FiberState::Committing | FiberState::RollingBack
+                            ) {
+                                if let Ok(rollback_stmt) =
+                                    context.fibers[fiber_idx].connection.prepare("ROLLBACK")
+                                {
+                                    context.fibers[fiber_idx]
+                                        .statement
+                                        .replace(Some(rollback_stmt));
+                                    context.fibers[fiber_idx].state = FiberState::RollingBack;
+                                } else {
+                                    context.fibers[fiber_idx].state = FiberState::Idle;
+                                }
+                            } else {
                                 context.fibers[fiber_idx].state = FiberState::Idle;
                             }
+                            return Ok(());
+                        }
+                        turso_core::LimboError::TxError(_) => {
+                            // Transaction error (e.g., rollback when no tx active) - just reset state
+                            tracing::warn!("{} Transaction error: {}, resetting", fiber_idx, e);
+                            drop(stmt_borrow);
+                            context.fibers[fiber_idx].statement.replace(None);
+                            context.fibers[fiber_idx].state = FiberState::Idle;
                             return Ok(());
                         }
                         _ => {
@@ -501,6 +553,22 @@ fn perform_work(
     }
     context.fibers[fiber_idx].statement.replace(None);
     match context.fibers[fiber_idx].state {
+        FiberState::Committing => {
+            trace!("{} Transaction committed successfully", fiber_idx);
+            for idx in context.fibers[fiber_idx].pending_creates.drain(..) {
+                context.indexes.push(idx);
+            }
+            for drop_idx in context.fibers[fiber_idx].pending_drops.drain(..) {
+                context.indexes.retain(|idx| *idx != drop_idx);
+            }
+            context.fibers[fiber_idx].state = FiberState::Idle;
+        }
+        FiberState::RollingBack => {
+            trace!("{} Transaction rolled back", fiber_idx);
+            context.fibers[fiber_idx].pending_creates.clear();
+            context.fibers[fiber_idx].pending_drops.clear();
+            context.fibers[fiber_idx].state = FiberState::Idle;
+        }
         FiberState::Idle => {
             let action = rng.random_range(0..100);
             if action <= 29 {
@@ -519,6 +587,16 @@ fn perform_work(
                     trace!("{} {}", fiber_idx, begin_cmd);
                 }
             } else if action == 30 {
+                // WAL checkpoint with random mode
+                let checkpoint_modes = ["PASSIVE", "FULL", "RESTART", "TRUNCATE"];
+                let mode = checkpoint_modes[rng.random_range(0..checkpoint_modes.len())];
+                let sql = format!("PRAGMA wal_checkpoint({})", mode);
+                if let Ok(stmt) = context.fibers[fiber_idx].connection.prepare(&sql) {
+                    context.fibers[fiber_idx].statement.replace(Some(stmt));
+                    context.stats.checkpoints += 1;
+                    trace!("{} {}", fiber_idx, sql);
+                }
+            } else if action == 31 {
                 // Integrity check
                 if let Ok(stmt) = context.fibers[fiber_idx]
                     .connection
@@ -584,38 +662,67 @@ fn perform_work(
                     // CREATE INDEX (2%)
                     if !context.disable_indexes {
                         let create_index = CreateIndex::arbitrary(rng, context);
-                        let sql = create_index.to_string();
-                        if let Ok(stmt) = context.fibers[fiber_idx].connection.prepare(&sql) {
-                            context.fibers[fiber_idx].statement.replace(Some(stmt));
-                            context.indexes.push((
-                                create_index.index.table_name.clone(),
-                                create_index.index_name.clone(),
-                            ));
+                        let index_name = &create_index.index_name;
+                        let already_exists = context
+                            .indexes
+                            .iter()
+                            .any(|(_, name)| name == index_name)
+                            || context
+                                .fibers
+                                .iter()
+                                .any(|f| f.pending_creates.iter().any(|(_, name)| name == index_name));
+                        if !already_exists {
+                            let sql = create_index.to_string();
+                            if let Ok(stmt) = context.fibers[fiber_idx].connection.prepare(&sql) {
+                                context.fibers[fiber_idx].statement.replace(Some(stmt));
+                                context.fibers[fiber_idx].pending_creates.push((
+                                    create_index.index.table_name.clone(),
+                                    create_index.index_name.clone(),
+                                ));
+                            }
+                            trace!("{} CREATE INDEX: {}", fiber_idx, sql);
                         }
-                        trace!("{} CREATE INDEX: {}", fiber_idx, sql);
                     }
                 }
                 72..=73 => {
                     // DROP INDEX (2%)
-                    if !context.disable_indexes && !context.indexes.is_empty() {
-                        let index_idx = rng.random_range(0..context.indexes.len());
-                        let (table_name, index_name) = context.indexes.remove(index_idx);
-                        let drop_index = DropIndex {
-                            table_name,
-                            index_name,
-                        };
-                        let sql = drop_index.to_string();
-                        if let Ok(stmt) = context.fibers[fiber_idx].connection.prepare(&sql) {
-                            context.fibers[fiber_idx].statement.replace(Some(stmt));
+                    if !context.disable_indexes {
+                        let all_pending_drops: Vec<_> = context
+                            .fibers
+                            .iter()
+                            .flat_map(|f| f.pending_drops.iter())
+                            .collect();
+                        let available: Vec<_> = context
+                            .indexes
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, idx)| !all_pending_drops.contains(&idx))
+                            .collect();
+                        if !available.is_empty() {
+                            let pick = rng.random_range(0..available.len());
+                            let (_, (table_name, index_name)) = available[pick];
+                            let drop_index = DropIndex {
+                                table_name: table_name.clone(),
+                                index_name: index_name.clone(),
+                            };
+                            let sql = drop_index.to_string();
+                            if let Ok(stmt) =
+                                context.fibers[fiber_idx].connection.prepare(&sql)
+                            {
+                                context.fibers[fiber_idx].statement.replace(Some(stmt));
+                                context.fibers[fiber_idx]
+                                    .pending_drops
+                                    .push((table_name.clone(), index_name.clone()));
+                            }
+                            trace!("{} DROP INDEX: {}", fiber_idx, sql);
                         }
-                        trace!("{} DROP INDEX: {}", fiber_idx, sql);
                     }
                 }
                 74..=86 => {
                     // COMMIT (13%)
                     if let Ok(stmt) = context.fibers[fiber_idx].connection.prepare("COMMIT") {
                         context.fibers[fiber_idx].statement.replace(Some(stmt));
-                        context.fibers[fiber_idx].state = FiberState::Idle;
+                        context.fibers[fiber_idx].state = FiberState::Committing;
                     }
                     trace!("{} COMMIT", fiber_idx);
                 }
@@ -623,7 +730,7 @@ fn perform_work(
                     // ROLLBACK (13%)
                     if let Ok(stmt) = context.fibers[fiber_idx].connection.prepare("ROLLBACK") {
                         context.fibers[fiber_idx].statement.replace(Some(stmt));
-                        context.fibers[fiber_idx].state = FiberState::Idle;
+                        context.fibers[fiber_idx].state = FiberState::RollingBack;
                     }
                     trace!("{} ROLLBACK", fiber_idx);
                 }

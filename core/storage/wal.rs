@@ -1228,7 +1228,7 @@ impl Wal for WalFile {
         let shared_file = self.shared.clone();
         let complete = Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
             let Ok((buf, bytes_read)) = res else {
-                tracing::error!(err = ?res.unwrap_err());
+                tracing::debug!(err = ?res.unwrap_err());
                 page.clear_locked();
                 page.clear_wal_tag();
                 return;
@@ -1320,7 +1320,7 @@ impl Wal for WalFile {
                         frame_ref[WAL_FRAME_HEADER_SIZE..].copy_from_slice(&decrypted_data);
                     }
                     Err(_) => {
-                        tracing::error!("Failed to decrypt page data for frame_id={frame_id}");
+                        tracing::debug!("Failed to decrypt page data for frame_id={frame_id}");
                     }
                 }
             }
@@ -1467,7 +1467,7 @@ impl Wal for WalFile {
         mode: CheckpointMode,
     ) -> Result<IOResult<CheckpointResult>> {
         self.checkpoint_inner(pager, mode).inspect_err(|e| {
-            tracing::error!("Wal Checkpoint failed: {e}");
+            tracing::debug!("WAL checkpoint failed: {e}");
             let _ = self.checkpoint_guard.write().take();
             self.ongoing_checkpoint.write().state = CheckpointState::Start;
         })
@@ -2602,7 +2602,7 @@ impl WalFile {
             shared.read_locks[idx].unlock();
         }
         if let Some(e) = e {
-            tracing::error!(
+            tracing::debug!(
                 "Failed to restart WAL header: {:?}, releasing read locks",
                 e
             );

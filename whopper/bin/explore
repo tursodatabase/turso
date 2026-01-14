@@ -28,9 +28,9 @@ if [[ "$CHECKSUM_ENABLED" == true && "$ENCRYPTION_ENABLED" == true ]]; then
     exit 1
 fi
 
-cargo build $FEATURES -p turso_whopper
+cargo build --release $FEATURES -p turso_whopper
 
-echo "Running Whopper in an infinite loop in 'chaos' mode..."
+echo "Running Whopper in an infinite loop in 'fast' mode..."
 while true; do
-    time RUST_BACKTRACE=full ./target/debug/turso_whopper --mode chaos "${ARGS[@]}"
+    time RUST_BACKTRACE=full ./target/release/turso_whopper --mode fast "${ARGS[@]}"
 done
