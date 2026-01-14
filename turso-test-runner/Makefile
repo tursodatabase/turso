@@ -2,7 +2,7 @@
 
 # Paths
 ROOT_DIR := $(shell cd .. && pwd)
-SQLITE := sqlite3
+SQLITE := $(ROOT_DIR)/.sqlite3/sqlite3
 
 # Use release mode in CI, debug mode locally
 ifdef CI
@@ -16,7 +16,7 @@ endif
 TURSODB := $(ROOT_DIR)/target/$(TARGET_DIR)/tursodb
 TEST_RUNNER := ./target/$(TARGET_DIR)/turso-test-runner
 
-.PHONY: all build build-tursodb build-runner check run test run-examples test-sqlite convert clean
+.PHONY: all build build-tursodb build-runner check run test run-examples install-sqlite test-sqlite convert clean
 
 # Build everything
 all: build
@@ -37,37 +37,61 @@ check: build-runner
 	$(TEST_RUNNER) check tests
 	$(TEST_RUNNER) check turso-tests
 
-# Run all tests
+# MVCC mode flag (set MVCC=1 to enable)
+ifdef MVCC
+    MVCC_FLAG := --mvcc
+else
+    MVCC_FLAG :=
+endif
+
+# Backend selection (cli or rust)
+BACKEND ?= cli
+
+# Run all tests with selected backend
 run: build
-	$(TEST_RUNNER) run tests --binary $(TURSODB)
-	$(TEST_RUNNER) run turso-tests --binary $(TURSODB)
+	$(TEST_RUNNER) run tests --backend $(BACKEND) --binary $(TURSODB) $(MVCC_FLAG)
+	$(TEST_RUNNER) run turso-tests --backend $(BACKEND) --binary $(TURSODB) $(MVCC_FLAG)
+
+# Run tests with CLI backend (spawns tursodb subprocess)
+run-cli: build
+	$(TEST_RUNNER) run tests --backend cli --binary $(TURSODB) $(MVCC_FLAG)
+	$(TEST_RUNNER) run turso-tests --backend cli --binary $(TURSODB) $(MVCC_FLAG)
+
+# Run tests with Rust backend (native turso bindings)
+run-rust: build-runner
+	$(TEST_RUNNER) run tests --backend rust $(MVCC_FLAG)
+	$(TEST_RUNNER) run turso-tests --backend rust $(MVCC_FLAG)
 
 # Alias for run
 test: run
 
 # Run tests with filter
 run-filter: build
-	$(TEST_RUNNER) run tests --binary $(TURSODB) --filter $(FILTER)
+	$(TEST_RUNNER) run tests --binary $(TURSODB) --filter $(FILTER) $(MVCC_FLAG)
 
 # Run a single test file: make run-one FILE=tests/select/memory.sqltest
 run-one: build
-	$(TEST_RUNNER) run $(FILE) --binary $(TURSODB)
+	$(TEST_RUNNER) run $(FILE) --binary $(TURSODB) $(MVCC_FLAG)
 
 # Run only core tests
 run-tests: build
-	$(TEST_RUNNER) run tests --binary $(TURSODB)
+	$(TEST_RUNNER) run tests --binary $(TURSODB) $(MVCC_FLAG)
 
 # Run only turso-specific tests
 run-turso-tests: build
-	$(TEST_RUNNER) run turso-tests --binary $(TURSODB)
+	$(TEST_RUNNER) run turso-tests --binary $(TURSODB) $(MVCC_FLAG)
 
 # Run example tests
 run-examples: build
-	$(TEST_RUNNER) run examples --binary $(TURSODB)
+	$(TEST_RUNNER) run examples --binary $(TURSODB) $(MVCC_FLAG)
+
+# Install SQLite binary
+install-sqlite:
+	$(ROOT_DIR)/scripts/install-sqlite3.sh
 
 # Run tests against SQLite
-test-sqlite: build-runner
-	$(TEST_RUNNER) run tests --binary $(SQLITE)
+test-sqlite: build-runner install-sqlite
+	$(TEST_RUNNER) run tests --backend cli --binary $(SQLITE)
 
 # Convert Tcl .test files to .sqltest format
 # Usage: make convert                    - convert all .test files in ../testing to ./converted

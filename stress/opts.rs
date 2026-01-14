@@ -47,7 +47,7 @@ pub struct Opts {
         short = 'i',
         long,
         help = "the number of iterations",
-        default_value_t = normal_or_miri(100_000, 1000)
+        default_value_t = normal_or_constrained(100_000, 1000)
     )]
     pub nr_iterations: usize,
 
@@ -109,9 +109,11 @@ pub struct Opts {
     pub db_ref: Option<PathBuf>,
 }
 
-const fn normal_or_miri<T: Copy>(normal_val: T, miri_val: T) -> T {
-    if cfg!(miri) {
-        miri_val
+/// Returns a constrained value when running under miri or shuttle,
+/// since these tools have much higher overhead and explore execution states.
+const fn normal_or_constrained<T: Copy>(normal_val: T, constrained_val: T) -> T {
+    if cfg!(miri) || cfg!(shuttle) {
+        constrained_val
     } else {
         normal_val
     }

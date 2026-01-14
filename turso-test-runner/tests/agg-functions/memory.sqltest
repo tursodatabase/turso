@@ -1,0 +1,40 @@
+@database :memory:
+
+test min-null-regression-test {
+    CREATE TABLE t (a);
+    INSERT INTO t VALUES ('abc'), (NULL);
+    SELECT min(a) FROM t;
+}
+expect {
+    abc
+}
+
+test max-null-regression-test {
+    CREATE TABLE t (a);
+    INSERT INTO t VALUES ('abc'), (NULL);
+    SELECT max(a) FROM t;
+}
+expect {
+    abc
+}
+
+test group-concat-null-values-test {
+    CREATE TABLE t (a);
+    INSERT INTO t VALUES ('a'), (''), ('b'), (NULL), ('c');
+    SELECT group_concat(a) FROM t;
+}
+expect {
+    a,,b,c
+}
+
+test select-distinct-aggregate-ungrouped {
+    CREATE TABLE t0 (c0 REAL);
+  CREATE TABLE t1 (c0 INT);
+  INSERT INTO t0 VALUES (1.0), (2.0);
+  INSERT INTO t1 VALUES (1), (2);
+  SELECT DISTINCT COUNT(t0.c0) FROM t0, t1;
+}
+expect {
+    4
+}
+

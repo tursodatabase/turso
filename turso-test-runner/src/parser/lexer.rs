@@ -44,6 +44,18 @@ pub enum Token {
     #[token("@skip")]
     AtSkip,
 
+    /// `@skip-if`
+    #[token("@skip-if")]
+    AtSkipIf,
+
+    /// `mvcc` keyword (for skip conditions)
+    #[token("mvcc")]
+    Mvcc,
+
+    /// `@backend`
+    #[token("@backend")]
+    AtBackend,
+
     /// `setup` keyword
     #[token("setup")]
     Setup,
@@ -84,6 +96,14 @@ pub enum Token {
     #[token(":temp:")]
     TempFile,
 
+    /// `:default:` - uses generated database with INTEGER PRIMARY KEY
+    #[token(":default:")]
+    Default,
+
+    /// `:default-no-rowidalias:` - uses generated database with INT PRIMARY KEY
+    #[token(":default-no-rowidalias:")]
+    DefaultNoRowidAlias,
+
     /// `{` followed by content until matching `}`
     #[token("{", extract_block_content)]
     BlockContent(String),
@@ -120,6 +140,9 @@ impl fmt::Display for Token {
             Token::AtDatabase => write!(f, "@database"),
             Token::AtSetup => write!(f, "@setup"),
             Token::AtSkip => write!(f, "@skip"),
+            Token::AtSkipIf => write!(f, "@skip-if"),
+            Token::Mvcc => write!(f, "mvcc"),
+            Token::AtBackend => write!(f, "@backend"),
             Token::Setup => write!(f, "setup"),
             Token::Test => write!(f, "test"),
             Token::Expect => write!(f, "expect"),
@@ -130,6 +153,8 @@ impl fmt::Display for Token {
             Token::Readonly => write!(f, "readonly"),
             Token::Memory => write!(f, ":memory:"),
             Token::TempFile => write!(f, ":temp:"),
+            Token::Default => write!(f, ":default:"),
+            Token::DefaultNoRowidAlias => write!(f, ":default-no-rowidalias:"),
             Token::BlockContent(_) => write!(f, "{{...}}"),
             Token::Identifier(s) => write!(f, "{s}"),
             Token::String(s) => write!(f, "\"{s}\""),
@@ -180,10 +205,13 @@ pub fn tokenize(input: &str) -> Result<Vec<SpannedToken>, LexerError> {
 fn suggest_fix(slice: &str) -> Option<String> {
     if slice.starts_with('@') {
         Some(format!(
-            "Valid directives are: @database, @setup, @skip. Did you mean one of these?"
+            "Valid directives are: @database, @setup, @skip, @skip-if, @backend. Did you mean one of these?"
         ))
     } else if slice.starts_with(':') {
-        Some("Database specifiers are :memory: or :temp:".to_string())
+        Some(
+            "Database specifiers are :memory:, :temp:, :default:, or :default-no-rowidalias:"
+                .to_string(),
+        )
     } else {
         None
     }

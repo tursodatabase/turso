@@ -17,6 +17,7 @@ This document is a quick helper to get you going.
   - [Compatibility tests](#compatibility-tests)
     - [Prerequisites](#prerequisites)
     - [Running the tests](#running-the-tests)
+  - [SQL Test Runner](#sql-test-runner)
   - [TPC-H](#tpc-h)
   - [Deterministic simulation tests](#deterministic-simulation-tests)
     - [Whopper](#whopper)
@@ -250,6 +251,19 @@ SQLITE_EXEC=sqlite3 SQLITE_FLAGS="" make test
 ```
 
 When working on a new feature, please consider adding a test case for it.
+
+## SQL Test Runner
+
+The `turso-test-runner` crate provides a dedicated test runner with a custom DSL for writing SQL tests.
+Tests should be added to `turso-test-runner/tests/` using the `.sqltest` format.
+
+To run tests:
+
+```console
+make -c turso-test-runner run
+```
+
+For full documentation on the DSL syntax and CLI usage, see the [turso-test-runner docs](turso-test-runner/docs/).
 
 ## TPC-H
 

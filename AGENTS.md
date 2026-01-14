@@ -30,6 +30,9 @@ make test
 # Running a single TCL test module (*.test). TEST basepath defaults to ./testing/
 make test-single TEST=modulename.test
 
+# Run test with make (.sqltest)
+make -C turso-test-runner run-cli
+
 # Run the CLI
 cargo run --package turso_cli -q -m list --bin tursodb database.db
 
@@ -88,8 +91,7 @@ cargo bench --profile bench-profile --bench benchmark
 - Turso aims for SQLite compatibility
 - Every functional change must be accompanied by a test, preferably a SQL test, that fails without the change, and passes when the change is applied.
 - Favour writing tests first.
-- For simple compatibility tests, prefer TCL tests (./testing/*.test) and prefer to use the `do_execsql_test_on_specific_db {:memory:}` format where
-  an in-memory DB is used.
+- For simple compatibility tests, prefer .sqltest test (./turso-test-runner/tests/*.sqltest) or TCL tests (./testing/*.test) when a sqltest file does not exist for your type of queries. Also prefer to use the `@database :memory:` (.sqltest) or `do_execsql_test_on_specific_db {:memory:}` (.test) format where an in-memory DB is used.
 - For regression tests, a good choice is to use Rust integration tests, found in e.g. ./tests/integration/test_transactions.rs
 - For complex features, fuzz tests are a good idea, found in e.g. ./tests/fuzz/mod.rs
 - CRITICAL: do NOT invent new test formats: add tests to existing test modules that follow existing patterns. If you add a new test module file,

@@ -46,6 +46,8 @@ pub struct Statement {
     busy_handler_state: Option<BusyHandlerState>,
 }
 
+crate::assert::assert_send_sync!(Statement);
+
 impl std::fmt::Debug for Statement {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Statement").finish()
@@ -184,6 +186,8 @@ impl Statement {
                     waker.wake_by_ref();
                 }
                 res = Ok(StepResult::IO);
+                #[cfg(shuttle)]
+                crate::thread::spin_loop();
             }
             // else: Handler says stop, res stays as Busy
         }

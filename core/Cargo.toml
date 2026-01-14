@@ -37,6 +37,7 @@ cli_only = []
 test_helper = []
 bench = []
 fts = ["dep:tantivy"]
+codspeed = ["bench"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
 io-uring = { version = "0.7.5", optional = true }
@@ -121,6 +122,11 @@ pprof = { version = "0.14.0", features = ["criterion", "flamegraph"] }
 [dev-dependencies]
 memory-stats = "1.2.0"
 criterion = { workspace = true, features = [
+    "html_reports",
+    "async",
+    "async_futures",
+] }
+codspeed-criterion-compat = { workspace = true, features = [
     "html_reports",
     "async",
     "async_futures",

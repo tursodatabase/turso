@@ -263,6 +263,8 @@ pub enum VirtualTableCursor {
     Internal(Arc<RwLock<dyn InternalVirtualTableCursor>>),
 }
 
+crate::assert::assert_send_sync!(VirtualTableCursor);
+
 impl VirtualTableCursor {
     pub(crate) fn next(&mut self) -> crate::Result<bool> {
         match self {
@@ -477,6 +479,12 @@ pub struct ExtVirtualTableCursor {
     implementation: Arc<VTabModuleImpl>,
     vtab_id: u64,
 }
+
+// SAFETY: Extension provider must guarantee Send + Sync on their side
+// we cannot properly infer Send + Sync for dynamic libraries
+unsafe impl Send for ExtVirtualTableCursor {}
+unsafe impl Sync for ExtVirtualTableCursor {}
+crate::assert::assert_send_sync!(ExtVirtualTableCursor);
 
 impl ExtVirtualTableCursor {
     fn new(

@@ -1,13 +1,15 @@
 use clap::{Parser, Subcommand};
 use miette::{NamedSource, Report};
+use owo_colors::OwoColorize;
 use std::process::ExitCode;
 use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 use std::{path::PathBuf, time::Instant};
 use turso_test_runner::{
-    Format, OutputFormat, ParseError, RunnerConfig, TestRunner, backends::cli::CliBackend,
-    create_output, summarize, tcl_converter,
+    DefaultDatabases, Format, OutputFormat, ParseError, RunnerConfig, TestRunner,
+    backends::cli::CliBackend, backends::rust::RustBackend, create_output, load_test_files,
+    summarize, tcl_converter,
 };
 
 #[derive(Parser)]
@@ -26,7 +28,11 @@ enum Commands {
         #[arg(required = true)]
         paths: Vec<PathBuf>,
 
-        /// Path to tursodb binary
+        /// Backend to use: "rust" (native) or "cli" (subprocess)
+        #[arg(long, default_value = "rust")]
+        backend: String,
+
+        /// Path to tursodb binary (only used with --backend cli)
         #[arg(long, default_value = "tursodb")]
         binary: PathBuf,
 
@@ -42,9 +48,13 @@ enum Commands {
         #[arg(short, long, default_value = "pretty")]
         output: String,
 
-        /// Timeout per query in seconds
+        /// Timeout per query in seconds (only used with --backend cli)
         #[arg(long, default_value_t = 90)]
         timeout: u64,
+
+        /// Enable MVCC mode (experimental journal mode)
+        #[arg(long)]
+        mvcc: bool,
     },
 
     /// Validate test file syntax
@@ -81,12 +91,14 @@ async fn main() -> ExitCode {
     match cli.command {
         Commands::Run {
             paths,
+            backend,
             binary,
             filter,
             jobs,
             output,
             timeout,
-        } => run_tests(paths, binary, filter, jobs, output, timeout).await,
+            mvcc,
+        } => run_tests(paths, backend, binary, filter, jobs, output, timeout, mvcc).await,
         Commands::Check { paths } => check_files(paths),
         Commands::Convert {
             paths,
@@ -97,13 +109,20 @@ async fn main() -> ExitCode {
     }
 }
 
+/// Default seed for reproducible database generation
+const DEFAULT_SEED: u64 = 42;
+/// Default number of users to generate
+const DEFAULT_USER_COUNT: usize = 10000;
+
 async fn run_tests(
     paths: Vec<PathBuf>,
+    backend_type: String,
     binary: PathBuf,
     filter: Option<String>,
     jobs: usize,
     output_format: String,
     timeout: u64,
+    mvcc: bool,
 ) -> ExitCode {
     // Resolve paths, trying to add .sqltest extension if missing
     let mut resolved_paths = Vec::new();
@@ -142,31 +161,99 @@ async fn run_tests(
         }
     };
 
-    // Create backend
-    let backend = CliBackend::new(&binary).with_timeout(Duration::from_secs(timeout));
+    // Load and parse test files
+    let loaded = match load_test_files(&paths).await {
+        Ok(loaded) => loaded,
+        Err(e) => {
+            eprintln!("Error loading test files: {}", e);
+            return ExitCode::from(1);
+        }
+    };
+
+    // Check if we need to generate default databases
+    let needs = DefaultDatabases::scan_needs(loaded.test_files());
+
+    // Generate default databases if needed
+    let default_dbs = if needs.any() {
+        eprintln!("Generating default databases...");
+        match DefaultDatabases::generate(needs, DEFAULT_SEED, DEFAULT_USER_COUNT, mvcc).await {
+            Ok(dbs) => dbs,
+            Err(e) => {
+                eprintln!("Error generating default databases: {}", e);
+                return ExitCode::from(1);
+            }
+        }
+    } else {
+        None
+    };
+
+    // Create backend with resolver if we have generated databases
+    let resolver = if let Some(ref dbs) = default_dbs {
+        Some(Arc::new(DefaultDatabasesResolver(
+            dbs.default_path.clone(),
+            dbs.no_rowid_alias_path.clone(),
+        )))
+    } else {
+        None
+    };
 
     // Create runner config
-    let mut config = RunnerConfig::default().with_max_jobs(jobs);
+    let mut config = RunnerConfig::default().with_max_jobs(jobs).with_mvcc(mvcc);
     if let Some(f) = filter {
         config = config.with_filter(f);
     }
 
-    // Create runner
-    let runner = TestRunner::new(backend).with_config(config);
-
     // Create output formatter
     let mut output: Box<dyn OutputFormat> = create_output(format);
-
     let start = Instant::now();
 
-    // Run tests with streaming output
-    let results = match runner
-        .run_paths(&paths, |result| {
-            output.write_test(result);
-            output.flush();
-        })
-        .await
-    {
+    // Run tests based on backend selection
+    let results = match backend_type.as_str() {
+        "cli" => {
+            let mut backend = if let Some(ref dbs) = default_dbs {
+                CliBackend::new(&binary)
+                    .with_timeout(Duration::from_secs(timeout))
+                    .with_mvcc(mvcc)
+                    .with_default_db_resolver(Arc::new(DefaultDatabasesResolver(
+                        dbs.default_path.clone(),
+                        dbs.no_rowid_alias_path.clone(),
+                    )))
+            } else {
+                CliBackend::new(&binary)
+                    .with_timeout(Duration::from_secs(timeout))
+                    .with_mvcc(mvcc)
+            };
+            if let Some(resolver) = resolver {
+                backend = backend.with_default_db_resolver(resolver);
+            }
+            let runner = TestRunner::new(backend).with_config(config);
+            runner
+                .run_loaded_tests(loaded, |result| {
+                    output.write_test(result);
+                    output.flush();
+                })
+                .await
+        }
+        "rust" => {
+            let mut backend = RustBackend::new().with_mvcc(mvcc);
+            if let Some(resolver) = resolver {
+                backend = backend.with_default_db_resolver(resolver);
+            }
+            let runner = TestRunner::new(backend).with_config(config);
+            runner
+                .run_loaded_tests(loaded, |result| {
+                    output.write_test(result);
+                    output.flush();
+                })
+                .await
+        }
+        other => {
+            eprintln!("Error: unknown backend '{}'. Use 'rust' or 'cli'", other);
+            return ExitCode::from(2);
+        }
+    };
+
+    let results = match results {
         Ok(r) => r,
         Err(e) => {
             eprintln!("Error running tests: {}", e);
@@ -184,6 +271,19 @@ async fn run_tests(
         ExitCode::SUCCESS
     } else {
         ExitCode::from(1)
+    }
+}
+
+/// Simple resolver that holds the paths directly
+struct DefaultDatabasesResolver(Option<PathBuf>, Option<PathBuf>);
+
+impl turso_test_runner::DefaultDatabaseResolver for DefaultDatabasesResolver {
+    fn resolve(&self, location: &turso_test_runner::DatabaseLocation) -> Option<PathBuf> {
+        match location {
+            turso_test_runner::DatabaseLocation::Default => self.0.clone(),
+            turso_test_runner::DatabaseLocation::DefaultNoRowidAlias => self.1.clone(),
+            _ => None,
+        }
     }
 }
 
@@ -274,8 +374,6 @@ fn convert_files(
     to_stdout: bool,
     verbose: bool,
 ) -> ExitCode {
-    use colored::Colorize;
-
     let mut total_tests = 0;
     let mut total_warnings = 0;
     let mut files_processed = 0;
@@ -351,8 +449,6 @@ fn convert_single_file(
     to_stdout: bool,
     _verbose: bool,
 ) -> (usize, usize) {
-    use colored::Colorize;
-
     let content = match std::fs::read_to_string(path) {
         Ok(c) => Arc::new(c),
         Err(e) => {

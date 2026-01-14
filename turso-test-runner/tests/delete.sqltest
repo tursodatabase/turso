@@ -1,20 +1,21 @@
-#!/usr/bin/env tclsh
-
-set testdir [file dirname $argv0]
-source $testdir/tester.tcl
+@database :memory:
 
 # Basic single row delete test
-do_execsql_test_on_specific_db {:memory:} delete-single-1 {
+test delete-single-1 {
     CREATE TABLE t1 (x INTEGER PRIMARY KEY);
     INSERT INTO t1 VALUES (1);
     INSERT INTO t1 VALUES (2);
     INSERT INTO t1 VALUES (3);
     DELETE FROM t1 WHERE x = 2;
     SELECT * FROM t1 ORDER BY x;
-} {1 3}
+}
+expect {
+    1
+    3
+}
 
 # Test alternating delete-insert pattern to stress freelist
-do_execsql_test_on_specific_db {:memory:} delete-insert-alternate-1 {
+test delete-insert-alternate-1 {
     CREATE TABLE t4 (x INTEGER PRIMARY KEY);
     INSERT INTO t4 VALUES (1);
     INSERT INTO t4 VALUES (2);
@@ -24,10 +25,15 @@ do_execsql_test_on_specific_db {:memory:} delete-insert-alternate-1 {
     DELETE FROM t4 WHERE x = 1;
     INSERT INTO t4 VALUES (5);
     SELECT * FROM t4 ORDER BY x;
-} {3 4 5}
+}
+expect {
+    3
+    4
+    5
+}
 
 # Test deleting from both ends
-do_execsql_test_on_specific_db {:memory:} delete-ends-1 {
+test delete-ends-1 {
     CREATE TABLE t5 (x INTEGER PRIMARY KEY);
     INSERT INTO t5 VALUES (1);
     INSERT INTO t5 VALUES (2);
@@ -38,10 +44,15 @@ do_execsql_test_on_specific_db {:memory:} delete-ends-1 {
     DELETE FROM t5 WHERE x = 1;
     DELETE FROM t5 WHERE x = 5;
     SELECT * FROM t5 ORDER BY x;
-} {2 3 4}
+}
+expect {
+    2
+    3
+    4
+}
 
 # Test delete-insert cycles with value reuse
-do_execsql_test_on_specific_db {:memory:} delete-reuse-1 {
+test delete-reuse-1 {
     CREATE TABLE t6 (x INTEGER PRIMARY KEY);
     INSERT INTO t6 VALUES (1);
     INSERT INTO t6 VALUES (2);
@@ -49,187 +60,217 @@ do_execsql_test_on_specific_db {:memory:} delete-reuse-1 {
     DELETE FROM t6 WHERE x = 2;
     INSERT INTO t6 VALUES (2);  -- Reuse same value
     SELECT * FROM t6 ORDER BY x;
-} {1 2 3}
+}
+expect {
+    1
+    2
+    3
+}
 
 # Test delete works when there are indexes
-do_execsql_test_on_specific_db {:memory:} delete-all-with-indexes-1 {
+test delete-all-with-indexes-1 {
     CREATE TABLE t (a PRIMARY KEY);
     CREATE INDEX tasc ON t(a);
     CREATE INDEX tdesc ON t(a DESC);
     INSERT INTO t VALUES (randomblob(1000));
     DELETE FROM t;
     SELECT * FROM t;
-} {}
+}
+expect {
+}
 
-do_execsql_test_on_specific_db {:memory:} delete_where_falsy {
+test delete_where_falsy {
     CREATE TABLE resourceful_schurz (diplomatic_kaplan BLOB);
     INSERT INTO resourceful_schurz VALUES (X'696E646570656E64656E745F6A6165636B6C65'), (X'67656E65726F75735F62617262616E65677261'), (X'73757065725F74616E6E656E6261756D'), (X'6D6F76696E675F6E616F756D6F76'), (X'7374756E6E696E675F6B62');
     INSERT INTO resourceful_schurz VALUES (X'70617373696F6E6174655F726F62696E'), (X'666169746866756C5F74686F6D6173'), (X'76696272616E745F6D69726F736C6176'), (X'737061726B6C696E675F67726179');
     DELETE FROM resourceful_schurz WHERE - x'666169746866756c5f74686f6d6173';
     SELECT * FROM resourceful_schurz;
-} {independent_jaeckle
-generous_barbanegra
-super_tannenbaum
-moving_naoumov
-stunning_kb
-passionate_robin
-faithful_thomas
-vibrant_miroslav
-sparkling_gray}
+}
+expect {
+    independent_jaeckle
+    generous_barbanegra
+    super_tannenbaum
+    moving_naoumov
+    stunning_kb
+    passionate_robin
+    faithful_thomas
+    vibrant_miroslav
+    sparkling_gray
+}
 
-do_execsql_test_on_specific_db {:memory:} doubly-qualified-delete {
-   create table test(col);
-   insert into test(col) values (1);
-   insert into test(col) values (2);
-   delete from test where main.test.col = 2;
-   select col from test;
-} {1}
+test doubly-qualified-delete {
+    create table test(col);
+    insert into test(col) values (1);
+    insert into test(col) values (2);
+    delete from test where main.test.col = 2;
+    select col from test;
+}
+expect {
+    1
+}
 
 # Test DELETE with IN subquery
-do_execsql_test_on_specific_db {:memory:} delete-in-subquery-1 {
+test delete-in-subquery-1 {
     CREATE TABLE file_input (id INTEGER PRIMARY KEY, name TEXT);
     CREATE TABLE eval_input_path (file_input_id INTEGER);
     INSERT INTO file_input VALUES (1, 'file1'), (2, 'file2'), (3, 'file3'), (4, 'file4');
     INSERT INTO eval_input_path VALUES (1), (2), (NULL);
     DELETE FROM file_input WHERE id IN (SELECT file_input_id FROM eval_input_path WHERE file_input_id IS NOT NULL);
     SELECT id, name FROM file_input ORDER BY id;
-} {
-    {3|file3}
-    {4|file4}
+}
+expect {
+    3|file3
+    4|file4
 }
 
+
 # Test DELETE with NOT IN subquery
-do_execsql_test_on_specific_db {:memory:} delete-not-in-subquery-1 {
+test delete-not-in-subquery-1  {
     CREATE TABLE file_input (id INTEGER PRIMARY KEY, name TEXT);
     CREATE TABLE eval_input_path (file_input_id INTEGER);
     INSERT INTO file_input VALUES (1, 'file1'), (2, 'file2'), (3, 'file3'), (4, 'file4');
     INSERT INTO eval_input_path VALUES (1), (2), (NULL);
     DELETE FROM file_input WHERE id NOT IN (SELECT file_input_id FROM eval_input_path WHERE file_input_id IS NOT NULL);
     SELECT id, name FROM file_input ORDER BY id;
-} {
-    {1|file1}
-    {2|file2}
+}
+expect {
+    1|file1
+    2|file2
 }
 
 # Test DELETE with IN subquery returning empty set
-do_execsql_test_on_specific_db {:memory:} delete-in-subquery-empty-1 {
+test delete-in-subquery-empty-1  {
     CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT);
     CREATE TABLE t2 (ref_id INTEGER);
     INSERT INTO t1 VALUES (1, 'a'), (2, 'b'), (3, 'c');
     DELETE FROM t1 WHERE id IN (SELECT ref_id FROM t2);
     SELECT id, val FROM t1 ORDER BY id;
-} {
-    {1|a}
-    {2|b}
-    {3|c}
+}
+expect {
+    1|a
+    2|b
+    3|c
 }
 
+
 # Test DELETE with NOT IN subquery returning empty set (should delete all)
-do_execsql_test_on_specific_db {:memory:} delete-not-in-subquery-empty-1 {
+test delete-not-in-subquery-empty-1 {
     CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT);
     CREATE TABLE t2 (ref_id INTEGER);
     INSERT INTO t1 VALUES (1, 'a'), (2, 'b'), (3, 'c');
     DELETE FROM t1 WHERE id NOT IN (SELECT ref_id FROM t2);
     SELECT id, val FROM t1 ORDER BY id;
-} {}
+}
+expect {
+}
 
 # Test DELETE with IN subquery and multiple columns in outer table
-do_execsql_test_on_specific_db {:memory:} delete-in-subquery-multicol-1 {
+test delete-in-subquery-multicol-1 {
     CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, price REAL);
     CREATE TABLE discontinued (product_id INTEGER);
     INSERT INTO products VALUES (1, 'Widget', 10.99), (2, 'Gadget', 25.50), (3, 'Doodad', 5.00);
     INSERT INTO discontinued VALUES (2);
     DELETE FROM products WHERE id IN (SELECT product_id FROM discontinued);
     SELECT id, name FROM products ORDER BY id;
-} {
-    {1|Widget}
-    {3|Doodad}
+}
+expect {
+    1|Widget
+    3|Doodad
 }
 
+
 # Test DELETE with EXISTS subquery
-do_execsql_test_on_specific_db {:memory:} delete-exists-subquery-1 {
+test delete-exists-subquery-1 {
     CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER, status TEXT);
     CREATE TABLE order_items (order_id INTEGER, product TEXT);
     INSERT INTO orders VALUES (1, 100, 'pending'), (2, 101, 'pending'), (3, 102, 'pending');
     INSERT INTO order_items VALUES (1, 'widget'), (3, 'gadget');
     DELETE FROM orders WHERE EXISTS (SELECT 1 FROM order_items WHERE order_items.order_id = orders.id);
     SELECT id, status FROM orders ORDER BY id;
-} {
-    {2|pending}
+}
+expect {
+    2|pending
 }
 
 # Test DELETE with NOT EXISTS subquery
-do_execsql_test_on_specific_db {:memory:} delete-not-exists-subquery-1 {
+test delete-not-exists-subquery-1 {
     CREATE TABLE orders (id INTEGER PRIMARY KEY, customer_id INTEGER, status TEXT);
     CREATE TABLE order_items (order_id INTEGER, product TEXT);
     INSERT INTO orders VALUES (1, 100, 'pending'), (2, 101, 'pending'), (3, 102, 'pending');
     INSERT INTO order_items VALUES (1, 'widget'), (3, 'gadget');
     DELETE FROM orders WHERE NOT EXISTS (SELECT 1 FROM order_items WHERE order_items.order_id = orders.id);
     SELECT id, status FROM orders ORDER BY id;
-} {
-    {1|pending}
-    {3|pending}
+}
+expect {
+    1|pending
+    3|pending
 }
 
 # Test DELETE with scalar comparison subquery (=)
-do_execsql_test_on_specific_db {:memory:} delete-scalar-eq-subquery-1 {
+test delete-scalar-eq-subquery-1 {
     CREATE TABLE employees (id INTEGER PRIMARY KEY, name TEXT, department_id INTEGER);
     CREATE TABLE departments (id INTEGER PRIMARY KEY, name TEXT);
     INSERT INTO employees VALUES (1, 'Alice', 1), (2, 'Bob', 2), (3, 'Charlie', 1);
     INSERT INTO departments VALUES (1, 'Sales'), (2, 'Engineering');
     DELETE FROM employees WHERE department_id = (SELECT id FROM departments WHERE name = 'Sales');
     SELECT id, name FROM employees ORDER BY id;
-} {
-    {2|Bob}
+}
+expect {
+    2|Bob
 }
 
 # Test DELETE with scalar comparison subquery (>)
-do_execsql_test_on_specific_db {:memory:} delete-scalar-gt-subquery-1 {
+test delete-scalar-gt-subquery-1 {
     CREATE TABLE t1 (id INTEGER PRIMARY KEY, val INTEGER);
     CREATE TABLE t2 (max_val INTEGER);
     INSERT INTO t1 VALUES (1, 10), (2, 20), (3, 30), (4, 40);
     INSERT INTO t2 VALUES (25);
     DELETE FROM t1 WHERE val > (SELECT max_val FROM t2);
     SELECT id, val FROM t1 ORDER BY id;
-} {
-    {1|10}
-    {2|20}
+}
+expect {
+    1|10
+    2|20
 }
 
 # Test DELETE with scalar comparison subquery (<)
-do_execsql_test_on_specific_db {:memory:} delete-scalar-lt-subquery-1 {
+test delete-scalar-lt-subquery-1 {
     CREATE TABLE t1 (id INTEGER PRIMARY KEY, val INTEGER);
     CREATE TABLE t2 (min_val INTEGER);
     INSERT INTO t1 VALUES (1, 10), (2, 20), (3, 30), (4, 40);
     INSERT INTO t2 VALUES (25);
     DELETE FROM t1 WHERE val < (SELECT min_val FROM t2);
     SELECT id, val FROM t1 ORDER BY id;
-} {
-    {3|30}
-    {4|40}
+}
+expect {
+    3|30
+    4|40
 }
 
+
 # Test DELETE with scalar subquery using aggregate
-do_execsql_test_on_specific_db {:memory:} delete-scalar-agg-subquery-1 {
+test delete-scalar-agg-subquery-1 {
     CREATE TABLE items (id INTEGER PRIMARY KEY, score INTEGER);
     INSERT INTO items VALUES (1, 10), (2, 20), (3, 30), (4, 40), (5, 50);
     DELETE FROM items WHERE score < (SELECT AVG(score) FROM items);
     SELECT id, score FROM items ORDER BY id;
-} {
-    {3|30}
-    {4|40}
-    {5|50}
+}
+expect {
+    3|30
+    4|40
+    5|50
 }
 
 # Test DELETE with EXISTS and empty subquery result
-do_execsql_test_on_specific_db {:memory:} delete-exists-empty-1 {
+test delete-exists-empty-1 {
     CREATE TABLE t1 (id INTEGER PRIMARY KEY, val TEXT);
     CREATE TABLE t2 (ref_id INTEGER);
     INSERT INTO t1 VALUES (1, 'a'), (2, 'b'), (3, 'c');
     DELETE FROM t1 WHERE EXISTS (SELECT 1 FROM t2 WHERE t2.ref_id = t1.id);
     SELECT id, val FROM t1 ORDER BY id;
-} {
-    {1|a}
-    {2|b}
-    {3|c}
+}
+expect {
+    1|a
+    2|b
+    3|c
 }

@@ -1719,7 +1719,9 @@ impl<'a> Parser<'a> {
                     eat_assert!(self, TK_BETWEEN);
                     let start = self.parse_expr(pre)?;
                     eat_expect!(self, TK_AND);
-                    let end = self.parse_expr(pre)?;
+                    // Use pre + 1 so that same-precedence operators (like IS NOT NULL)
+                    // bind to the whole BETWEEN expression, not just the end value
+                    let end = self.parse_expr(pre + 1)?;
                     Box::new(Expr::Between {
                         lhs: result,
                         not,
@@ -1800,11 +1802,13 @@ impl<'a> Parser<'a> {
                         _ => unreachable!(),
                     };
 
-                    let expr = self.parse_expr(pre)?;
+                    // Use pre + 1 so that same-precedence operators (like IS NOT NULL)
+                    // bind to the whole LIKE expression, not just the pattern
+                    let expr = self.parse_expr(pre + 1)?;
                     let escape = if let Some(tok) = self.peek()? {
                         if tok.token_type == TK_ESCAPE {
                             eat_assert!(self, TK_ESCAPE);
-                            Some(self.parse_expr(pre)?)
+                            Some(self.parse_expr(pre + 1)?)
                         } else {
                             None
                         }

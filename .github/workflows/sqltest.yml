@@ -7,6 +7,10 @@ on:
   pull_request:
     branches: ["main"]
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.sha }}
+  cancel-in-progress: true
+
 env:
   CARGO_TERM_COLOR: always
 
@@ -25,8 +29,8 @@ jobs:
       - name: Check test syntax
         run: make -C turso-test-runner check
 
-  sqltest-run:
-    name: Run SQL tests
+  sqltest-run-cli:
+    name: Run SQL tests (CLI backend)
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
     steps:
@@ -34,12 +38,38 @@ jobs:
       - uses: useblacksmith/rust-cache@v3
         with:
           prefix-key: "v1-rust"
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
       - name: Build tursodb
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: "sccache"
         run: make -C turso-test-runner build-tursodb
+      - name: Build test runner
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: "sccache"
+        run: make -C turso-test-runner build-runner
+      - name: Run tests
+        run: make -C turso-test-runner run-cli
+      - name: Run tests (MVCC)
+        run: make -C turso-test-runner run-cli MVCC=1
+
+  sqltest-run-rust:
+    name: Run SQL tests (Rust backend)
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v3
+      - uses: useblacksmith/rust-cache@v3
+        with:
+          prefix-key: "v1-rust"
       - name: Build test runner
         run: make -C turso-test-runner build-runner
       - name: Run tests
-        run: make -C turso-test-runner run
+        run: make -C turso-test-runner run-rust
+      - name: Run tests (MVCC)
+        run: make -C turso-test-runner run-rust MVCC=1
 
   sqltest-sqlite:
     name: Run SQL tests (SQLite)

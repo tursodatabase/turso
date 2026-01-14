@@ -182,7 +182,7 @@ pub fn gen_bool(probability_true: f64) -> bool {
 }
 
 pub fn gen_schema(table_count: Option<usize>) -> ArbitrarySchema {
-    let table_count = table_count.unwrap_or((get_random() % 10 + 1) as usize);
+    let table_count = table_count.unwrap_or_else(|| (get_random() % 10 + 1) as usize);
     let mut tables = Vec::with_capacity(table_count);
     let mut table_names = HashSet::new();
 
@@ -666,12 +666,29 @@ fn sqlite_integrity_check(
     Ok(())
 }
 
+#[cfg(not(shuttle))]
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
 
     rt.block_on(async_main())
+}
+
+#[cfg(shuttle)]
+fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use shuttle::scheduler::RandomScheduler;
+
+    let mut config = shuttle::Config::default();
+    config.stack_size *= 10;
+    config.max_steps = shuttle::MaxSteps::FailAfter(10_000_000);
+
+    // let scheduler = DfsScheduler::new(None, false);
+    let scheduler = RandomScheduler::new(5);
+    let runner = shuttle::Runner::new(scheduler, config);
+    runner.run(|| shuttle::future::block_on(Box::pin(async_main())).unwrap());
+
+    Ok(())
 }
 
 async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -802,7 +819,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         let db = db.clone();
         let vfs_for_task = vfs_option.clone();
 
-        let handle = tokio::spawn(async move {
+        let handle = turso_stress::future::spawn(async move {
             let mut conn = db.lock().await.connect()?;
 
             conn.busy_timeout(std::time::Duration::from_millis(opts.busy_timeout))?;

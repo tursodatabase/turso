@@ -59,7 +59,7 @@ uv-sync-test:
 	uv sync --all-extras --dev --package turso_test
 .PHONE: uv-sync
 
-test: build uv-sync-test test-compat test-alter-column test-vector test-sqlite3 test-shell test-memory test-write test-update test-constraint test-collate test-extensions test-mvcc test-matviews test-json
+test: build uv-sync-test test-compat test-sqlite3 test-shell test-memory test-write test-update test-constraint test-collate test-extensions test-mvcc test-matviews test-json
 .PHONY: test
 
 test-extensions: build uv-sync-test
@@ -85,10 +85,6 @@ test-single: check-tcl-version
 .PHONY: test-single
 .PHONY: test-compat
 
-test-vector:
-	RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) ./testing/vector.test
-.PHONY: test-vector
-
 test-time:
 	RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) ./testing/time.test
 .PHONY: test-time
@@ -96,10 +92,6 @@ test-time:
 test-matviews:
 	RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) ./testing/materialized_views.test
 .PHONY: test-matviews
-
-test-alter-column:
-	RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) ./testing/alter_column.test
-.PHONY: test-alter-column
 
 
 reset-db:
@@ -179,6 +171,16 @@ bench-exclude-tpc-h:
 		cargo bench $$benchmarks; \
 	fi
 .PHONY: bench-exclude-tpc-h
+
+codspeed-build-bench-exclude-tpc-h:
+	@benchmarks=$$(cargo bench --bench 2>&1 | grep -A 1000 '^Available bench targets:' | grep -v '^Available bench targets:' | grep -v '^ *$$' | grep -v 'tpc_h_benchmark' | xargs -I {} printf -- "--bench %s " {}); \
+	if [ -z "$$benchmarks" ]; then \
+		echo "No benchmarks found (excluding tpc_h_benchmark)."; \
+		exit 1; \
+	else \
+		cargo codspeed build $$benchmarks --features codspeed; \
+	fi
+.PHONY: codspeed-build-bench-exclude-tpc-h
 
 docker-cli-build:
 	docker build -f Dockerfile.cli -t turso-cli .
