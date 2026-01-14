@@ -27,6 +27,31 @@ pub use turso_sync_sdk_kit::rsapi::PartialSyncOpts;
 // Constants used across the sync module
 const DEFAULT_CLIENT_NAME: &str = "turso-sync-rust";
 
+/// Parse cipher string and return required reserved bytes. These configs match with the Turso
+/// Cloud encryption settings.
+///
+/// Supported ciphers:
+/// - aes256gcm, aes128gcm, chacha20poly1305: 28 reserved bytes (12-byte nonce + 16-byte tag)
+/// - aegis128l, aegis128x2, aegis128x4: 32 reserved bytes (16-byte nonce + 16-byte tag)
+/// - aegis256, aegis256x2, aegis256x4: 48 reserved bytes (32-byte nonce + 16-byte tag)
+fn parse_cipher_reserved_bytes(cipher: &str) -> Option<usize> {
+    match cipher.to_lowercase().as_str() {
+        // 12-byte nonce + 16-byte tag = 28 bytes
+        "aes256gcm" | "aes-256-gcm" => Some(28),
+        "aes128gcm" | "aes-128-gcm" => Some(28),
+        "chacha20poly1305" | "chacha20-poly1305" => Some(28),
+        // 16-byte nonce + 16-byte tag = 32 bytes
+        "aegis128l" | "aegis-128l" => Some(32),
+        "aegis128x2" | "aegis-128x2" => Some(32),
+        "aegis128x4" | "aegis-128x4" => Some(32),
+        // 32-byte nonce + 16-byte tag = 48 bytes
+        "aegis256" | "aegis-256" => Some(48),
+        "aegis256x2" | "aegis-256x2" => Some(48),
+        "aegis256x4" | "aegis-256x4" => Some(48),
+        _ => None,
+    }
+}
+
 // Builder for a synced database.
 pub struct Builder {
     // Absolute or relative path to local database file (":memory:" is supported).
@@ -43,8 +68,10 @@ pub struct Builder {
     bootstrap_if_empty: bool,
     // Partial sync configuration (EXPERIMENTAL).
     partial_sync_config_experimental: Option<PartialSyncOpts>,
-    // Encryption key(base64-encoded) for the Turso Cloud database
+    // Encryption key (base64-encoded) for the Turso Cloud database
     remote_encryption_key: Option<String>,
+    // Encryption cipher name for the Turso Cloud database
+    remote_encryption_cipher: Option<String>,
 }
 
 impl Builder {
@@ -59,6 +86,7 @@ impl Builder {
             bootstrap_if_empty: true,
             partial_sync_config_experimental: None,
             remote_encryption_key: None,
+            remote_encryption_cipher: None,
         }
     }
 
@@ -99,8 +127,26 @@ impl Builder {
         self
     }
 
-    // Set encryption key (base64-encoded) for the Turso Cloud database.
-    // The key will be sent as x-turso-encryption-key header with sync HTTP requests.
+    /// Set encryption key (base64-encoded) and cipher for the Turso Cloud database.
+    ///
+    /// Supported ciphers:
+    /// - "aes256gcm", "aes128gcm", "chacha20poly1305": 28 reserved bytes
+    /// - "aegis128l", "aegis128x2", "aegis128x4": 32 reserved bytes
+    /// - "aegis256", "aegis256x2", "aegis256x4": 48 reserved bytes
+    pub fn with_remote_encryption(
+        mut self,
+        base64_key: impl Into<String>,
+        cipher: impl Into<String>,
+    ) -> Self {
+        self.remote_encryption_key = Some(base64_key.into());
+        self.remote_encryption_cipher = Some(cipher.into());
+        self
+    }
+
+    /// Set encryption key (base64-encoded) for the Turso Cloud database.
+    /// The key will be sent as x-turso-encryption-key header with sync HTTP requests.
+    /// Note: For deferred sync (no initial bootstrap), use with_remote_encryption() instead
+    /// to also specify the cipher for correct reserved_bytes calculation.
     pub fn with_remote_encryption_key(mut self, base64_key: impl Into<String>) -> Self {
         self.remote_encryption_key = Some(base64_key.into());
         self
@@ -126,6 +172,20 @@ impl Builder {
             None
         };
 
+        // parse cipher and calculate reserved_bytes if provided.
+        let reserved_bytes = if let Some(cipher) = &self.remote_encryption_cipher {
+            let bytes = parse_cipher_reserved_bytes(cipher).ok_or_else(|| {
+                Error::Error(format!(
+                    "unknown encryption cipher: '{cipher}'. Supported: aes256gcm, aes128gcm, \
+                     chacha20poly1305, aegis128l, aegis128x2, aegis128x4, aegis256, \
+                     aegis256x2, aegis256x4"
+                ))
+            })?;
+            Some(bytes)
+        } else {
+            None
+        };
+
         // Build sync engine config.
         let sync_config = turso_sync_sdk_kit::rsapi::TursoDatabaseSyncConfig {
             path: self.path.clone(),
@@ -138,7 +198,7 @@ impl Builder {
                 .long_poll_timeout
                 .map(|d| d.as_millis().min(u32::MAX as u128) as u32),
             bootstrap_if_empty: self.bootstrap_if_empty,
-            reserved_bytes: None,
+            reserved_bytes,
             partial_sync_opts: self.partial_sync_config_experimental.clone(),
             remote_encryption_key: self.remote_encryption_key.clone(),
         };
