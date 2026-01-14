@@ -10,7 +10,6 @@ use crate::{
     translate::{
         emitter::Resolver,
         expr::{walk_expr, WalkControl},
-        optimizer::Optimizable,
         plan::{ColumnUsedMask, OuterQueryReference, TableReferences},
     },
     util::normalize_ident,
@@ -23,6 +22,70 @@ use crate::{
 };
 
 use super::{schema::SQLITE_TABLEID, update::translate_update_for_schema_change};
+
+fn validate(alter_table: &ast::AlterTableBody, table_name: &str) -> Result<()> {
+    // Check if someone is trying to ALTER a system table
+    if crate::schema::is_system_table(table_name) {
+        crate::bail_parse_error!("table {} may not be modified", table_name);
+    }
+    if let ast::AlterTableBody::RenameTo(new_table_name) = alter_table {
+        let normalized_new_name = normalize_ident(new_table_name.as_str());
+        if RESERVED_TABLE_PREFIXES
+            .iter()
+            .any(|prefix| normalized_new_name.starts_with(prefix))
+        {
+            crate::bail_parse_error!("Object name reserved for internal use: {}", new_table_name);
+        }
+    }
+
+    Ok(())
+}
+
+/// Check if an expression is a valid "constant" default for ALTER TABLE ADD COLUMN.
+/// SQLite is very strict here - it only allows:
+/// - Literals (numbers, strings, blobs, NULL, CURRENT_TIME/DATE/TIMESTAMP)
+/// - Bare identifiers (treated as string literals, e.g., `DEFAULT hello` → "hello")
+/// - Signed literals (+5, -5, +NULL, -NULL)
+/// - Parenthesized versions of the above
+///
+/// It does NOT allow:
+/// - Binary operations like (5 + 3)
+/// - Function calls like COALESCE(NULL, 5)
+/// - Comparisons, CASE expressions, CAST, etc.
+///
+/// Note: CURRENT_TIME/DATE/TIMESTAMP are allowed here but will be rejected at
+/// runtime if the table has existing rows (see `default_requires_empty_table`).
+fn is_strict_constant_default(expr: &ast::Expr) -> bool {
+    match expr {
+        ast::Expr::Literal(_) => true,
+        // Bare identifiers are treated as string literals in DEFAULT clause
+        ast::Expr::Id(_) => true,
+        ast::Expr::Unary(ast::UnaryOperator::Positive | ast::UnaryOperator::Negative, inner) => {
+            // Only allow unary +/- on literals
+            matches!(inner.as_ref(), ast::Expr::Literal(_))
+        }
+        ast::Expr::Parenthesized(exprs) => {
+            // Parenthesized expression with a single inner expression
+            exprs.len() == 1 && is_strict_constant_default(&exprs[0])
+        }
+        _ => false,
+    }
+}
+
+/// Check if a default expression requires the table to be empty (non-deterministic defaults).
+/// CURRENT_TIME, CURRENT_DATE, CURRENT_TIMESTAMP cannot be used to backfill existing rows.
+fn default_requires_empty_table(expr: &ast::Expr) -> bool {
+    match expr {
+        ast::Expr::Literal(lit) => matches!(
+            lit,
+            ast::Literal::CurrentDate | ast::Literal::CurrentTime | ast::Literal::CurrentTimestamp
+        ),
+        ast::Expr::Parenthesized(exprs) => {
+            exprs.len() == 1 && default_requires_empty_table(&exprs[0])
+        }
+        _ => false,
+    }
+}
 
 pub fn translate_alter_table(
     alter: ast::AlterTable,
@@ -37,22 +100,7 @@ pub fn translate_alter_table(
         body: alter_table,
     } = alter;
     let table_name = table_name.name.as_str();
-
-    // Check if someone is trying to ALTER a system table
-    if crate::schema::is_system_table(table_name) {
-        crate::bail_parse_error!("table {} may not be modified", table_name);
-    }
-
-    if let ast::AlterTableBody::RenameTo(new_table_name) = &alter_table {
-        let normalized_new_name = normalize_ident(new_table_name.as_str());
-
-        if RESERVED_TABLE_PREFIXES
-            .iter()
-            .any(|prefix| normalized_new_name.starts_with(prefix))
-        {
-            crate::bail_parse_error!("Object name reserved for internal use: {}", new_table_name);
-        }
-    }
+    validate(&alter_table, table_name)?;
 
     let table_indexes = resolver.schema.get_indices(table_name).collect::<Vec<_>>();
 
@@ -327,13 +375,14 @@ pub fn translate_alter_table(
             let constraints = col_def.constraints.clone();
             let column = Column::from(&col_def);
 
+            // SQLite is very strict about what constitutes a "constant" default for
+            // ALTER TABLE ADD COLUMN. It only allows literals and signed literals,
+            // not arbitrary constant expressions like (5 + 3) or COALESCE(NULL, 5).
             if column
                 .default
                 .as_ref()
-                .is_some_and(|default| !default.is_constant(resolver))
+                .is_some_and(|default| !is_strict_constant_default(default))
             {
-                // TODO: This is slightly inaccurate since sqlite returns a `Runtime
-                // error`.
                 return Err(LimboError::ParseError(
                     "Cannot add a column with non-constant default".to_string(),
                 ));
@@ -432,6 +481,58 @@ pub fn translate_alter_table(
                     "generated UPDATE statement did not parse as expected".to_string(),
                 ));
             };
+
+            // Check if we need to verify the table is empty at runtime.
+            // This is required for:
+            // 1. NOT NULL columns without a non-null default (existing rows would get NULL)
+            // 2. Non-deterministic defaults like CURRENT_TIME (can't backfill existing rows)
+            let needs_notnull_check = column.notnull()
+                && column
+                    .default
+                    .as_ref()
+                    .is_none_or(|default| crate::util::expr_contains_null(default));
+
+            let needs_nondeterministic_check = column
+                .default
+                .as_ref()
+                .is_some_and(|default| default_requires_empty_table(default));
+
+            let (needs_empty_table_check, error_message) =
+                if needs_notnull_check && needs_nondeterministic_check {
+                    // Both conditions - use NOT NULL message (more specific)
+                    (true, "Cannot add a NOT NULL column with default value NULL")
+                } else if needs_notnull_check {
+                    (true, "Cannot add a NOT NULL column with default value NULL")
+                } else if needs_nondeterministic_check {
+                    (true, "Cannot add a column with non-constant default")
+                } else {
+                    (false, "")
+                };
+
+            if needs_empty_table_check {
+                // Emit bytecode to check if the table has any rows.
+                let check_cursor_id =
+                    program.alloc_cursor_id(CursorType::BTreeTable(original_btree.clone()));
+                program.emit_insn(Insn::OpenRead {
+                    cursor_id: check_cursor_id,
+                    root_page: original_btree.root_page,
+                    db: 0,
+                });
+
+                let skip_error_label = program.allocate_label();
+                program.emit_insn(Insn::Rewind {
+                    cursor_id: check_cursor_id,
+                    pc_if_empty: skip_error_label,
+                });
+
+                // Table has rows - emit error
+                program.emit_insn(Insn::Halt {
+                    err_code: 1,
+                    description: error_message.to_string(),
+                });
+
+                program.resolve_label(skip_error_label, program.offset());
+            }
 
             translate_update_for_schema_change(
                 update,

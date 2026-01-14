@@ -396,3 +396,125 @@ expect {
     CREATE TABLE s (a, b, FOREIGN KEY (b) REFERENCES t(a, c))
 }
 
+# NOT NULL column without default on EMPTY table should succeed (SQLite behavior)
+test alter-table-add-notnull-col-empty-table {
+    CREATE TABLE t (a);
+    ALTER TABLE t ADD b NOT NULL;
+    SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 't';
+}
+expect {
+    CREATE TABLE t (a, b NOT NULL)
+}
+
+# NOT NULL column without default should fail on non-empty table
+test fail-alter-table-add-notnull-col-nonempty {
+    CREATE TABLE t (a);
+    INSERT INTO t VALUES (1);
+    ALTER TABLE t ADD b NOT NULL;
+}
+expect error {
+}
+
+# NOT NULL column with DEFAULT NULL should fail on non-empty table
+test fail-alter-table-add-notnull-default-null {
+    CREATE TABLE t (a);
+    INSERT INTO t VALUES (1);
+    ALTER TABLE t ADD b NOT NULL DEFAULT NULL;
+}
+expect error {
+}
+
+# NOT NULL column with non-null default should succeed on non-empty table
+test alter-table-add-notnull-col-with-default {
+    CREATE TABLE t (a);
+    INSERT INTO t VALUES (1);
+    ALTER TABLE t ADD b NOT NULL DEFAULT 42;
+    INSERT INTO t (a) VALUES (2);
+    SELECT * FROM t ORDER BY a;
+}
+expect {
+    1|42
+    2|42
+}
+
+# Binary expressions like (NULL + 5) are rejected as non-constant
+test fail-alter-table-add-nonconstant-default {
+    CREATE TABLE t (a);
+    INSERT INTO t VALUES (1);
+    ALTER TABLE t ADD b DEFAULT (NULL + 5);
+}
+expect error {
+}
+
+# CURRENT_TIMESTAMP on empty table should succeed
+test alter-table-add-current-timestamp-empty {
+    CREATE TABLE t (a);
+    ALTER TABLE t ADD b DEFAULT CURRENT_TIMESTAMP;
+    SELECT sql FROM sqlite_schema WHERE type = 'table' AND name = 't';
+}
+expect {
+    CREATE TABLE t (a, b DEFAULT CURRENT_TIMESTAMP)
+}
+
+# CURRENT_TIMESTAMP on non-empty table should fail
+test fail-alter-table-add-current-timestamp-nonempty {
+    CREATE TABLE t (a);
+    INSERT INTO t VALUES (1);
+    ALTER TABLE t ADD b DEFAULT CURRENT_TIMESTAMP;
+}
+expect error {
+}
+
+# CURRENT_TIME on non-empty table should fail
+test fail-alter-table-add-current-time-nonempty {
+    CREATE TABLE t (a);
+    INSERT INTO t VALUES (1);
+    ALTER TABLE t ADD b DEFAULT CURRENT_TIME;
+}
+expect error {
+}
+
+# CURRENT_DATE on non-empty table should fail
+test fail-alter-table-add-current-date-nonempty {
+    CREATE TABLE t (a);
+    INSERT INTO t VALUES (1);
+    ALTER TABLE t ADD b DEFAULT CURRENT_DATE;
+}
+expect error {
+}
+
+# Bare identifier as default is treated as string literal (SQLite behavior)
+test alter-table-add-identifier-default {
+    CREATE TABLE t (a);
+    ALTER TABLE t ADD b DEFAULT hello;
+    INSERT INTO t (a) VALUES (1);
+    SELECT a, b, typeof(b) FROM t;
+}
+expect {
+    1|hello|text
+}
+
+# Signed literal defaults should work
+test alter-table-add-signed-default {
+    CREATE TABLE t (a);
+    ALTER TABLE t ADD b DEFAULT -42;
+    ALTER TABLE t ADD c DEFAULT +99;
+    INSERT INTO t (a) VALUES (1);
+    SELECT * FROM t;
+}
+expect {
+    1|-42|99
+}
+
+# Parenthesized literal defaults should work
+test alter-table-add-parens-default {
+    CREATE TABLE t (a);
+    ALTER TABLE t ADD b DEFAULT (123);
+    ALTER TABLE t ADD c DEFAULT (-456);
+    INSERT INTO t (a) VALUES (1);
+    SELECT * FROM t;
+}
+expect {
+    1|123|-456
+}
+
