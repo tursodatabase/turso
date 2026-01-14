@@ -6,9 +6,9 @@ use std::fmt;
 use std::rc::Rc;
 
 use crate::expression::{Expression, ExpressionContext};
-use crate::function::FunctionRegistry;
+use crate::function::{FunctionRegistry, builtin_functions};
 use crate::schema::{ColumnDef, DataType, Schema, TableRef};
-use crate::value::{value_for_type, SqlValue};
+use crate::value::{SqlValue, value_for_type};
 
 // =============================================================================
 // SUBQUERY PROFILE (defined first because ConditionProfile depends on it)
@@ -436,21 +436,13 @@ pub enum Condition {
         value: SqlValue,
     },
     /// Check if an expression is NULL.
-    IsNull {
-        expr: Expression,
-    },
+    IsNull { expr: Expression },
     /// Check if an expression is NOT NULL.
-    IsNotNull {
-        expr: Expression,
-    },
+    IsNotNull { expr: Expression },
     /// Legacy IS NULL with column name (for backward compatibility).
-    SimpleIsNull {
-        column: String,
-    },
+    SimpleIsNull { column: String },
     /// Legacy IS NOT NULL with column name (for backward compatibility).
-    SimpleIsNotNull {
-        column: String,
-    },
+    SimpleIsNotNull { column: String },
     /// Logical AND of two conditions.
     And(Box<Condition>, Box<Condition>),
     /// Logical OR of two conditions.
@@ -460,13 +452,9 @@ pub enum Condition {
     // SUBQUERY CONDITIONS
     // =========================================================================
     /// EXISTS subquery condition (e.g., `EXISTS (SELECT ...)`).
-    Exists {
-        subquery: SubquerySelect,
-    },
+    Exists { subquery: SubquerySelect },
     /// NOT EXISTS subquery condition (e.g., `NOT EXISTS (SELECT ...)`).
-    NotExists {
-        subquery: SubquerySelect,
-    },
+    NotExists { subquery: SubquerySelect },
     /// IN subquery condition (e.g., `expr IN (SELECT ...)`).
     InSubquery {
         expr: Expression,
@@ -700,6 +688,7 @@ pub fn expression_condition(
 
 /// Generate a condition tree for a table (recursive, bounded depth).
 ///
+/// Uses expression-based conditions with builtin functions.
 /// When the profile enables subqueries, subquery conditions will be included
 /// using tables from the schema.
 pub fn condition_for_table(
@@ -707,58 +696,65 @@ pub fn condition_for_table(
     schema: &Schema,
     profile: &ConditionProfile,
 ) -> BoxedStrategy<Condition> {
-    condition_for_table_internal(table, schema, profile, profile.max_depth)
+    let functions = builtin_functions();
+    condition_for_table_internal(table, schema, &functions, profile, profile.max_depth)
 }
 
 /// Internal recursive implementation of condition_for_table.
 fn condition_for_table_internal(
     table: &TableRef,
     schema: &Schema,
+    functions: &FunctionRegistry,
     profile: &ConditionProfile,
     depth: u32,
 ) -> BoxedStrategy<Condition> {
     let filterable = table.filterable_columns().collect::<Vec<_>>();
     if filterable.is_empty() {
-        // No filterable columns: generate a tautology
-        return Just(Condition::SimpleComparison {
-            column: "1".to_string(),
+        return Just(Condition::Comparison {
+            left: Expression::Value(SqlValue::Integer(1)),
             op: ComparisonOp::Eq,
-            value: SqlValue::Integer(1),
+            right: Expression::Value(SqlValue::Integer(1)),
         })
         .boxed();
     }
 
+    let ctx = ExpressionContext::new(functions.clone())
+        .with_columns(table.columns.clone())
+        .with_max_depth(profile.expression_max_depth)
+        .with_aggregates(false);
+
     // Create leaf strategies from all filterable columns
-    let simple_leaves: Vec<BoxedStrategy<Condition>> =
-        filterable.iter().map(|c| simple_condition(c)).collect();
-    let simple_leaf = proptest::strategy::Union::new(simple_leaves).boxed();
+    let expr_leaves: Vec<BoxedStrategy<Condition>> = filterable
+        .iter()
+        .map(|c| expression_condition(c, &ctx))
+        .collect();
+    let expr_leaf = proptest::strategy::Union::new(expr_leaves).boxed();
 
     // Build leaf strategy including subqueries if enabled
     let subquery_profile = &profile.subquery_profile;
-    let leaf_strategy: BoxedStrategy<Condition> = if subquery_profile.any_enabled()
-        && !schema.tables.is_empty()
-    {
-        let subquery_total = subquery_profile.total_weight();
-        let simple_weight = profile.simple_condition_weight;
+    let leaf_strategy: BoxedStrategy<Condition> =
+        if subquery_profile.any_enabled() && !schema.tables.is_empty() {
+            let subquery_total = subquery_profile.total_weight();
+            let simple_weight = profile.simple_condition_weight;
 
-        if subquery_total > 0 {
-            let sq_tables = schema.tables.clone();
-            let sq_profile = subquery_profile.clone();
-            let outer_table = table.clone();
-            proptest::strategy::Union::new_weighted(vec![
-                (simple_weight, simple_leaf),
-                (
-                    subquery_total,
-                    subquery_condition_for_tables(&outer_table, &sq_tables, &sq_profile),
-                ),
-            ])
-            .boxed()
+            if subquery_total > 0 {
+                let sq_tables = schema.tables.clone();
+                let sq_profile = subquery_profile.clone();
+                let outer_table = table.clone();
+                proptest::strategy::Union::new_weighted(vec![
+                    (simple_weight, expr_leaf),
+                    (
+                        subquery_total,
+                        subquery_condition_for_tables(&outer_table, &sq_tables, &sq_profile),
+                    ),
+                ])
+                .boxed()
+            } else {
+                expr_leaf
+            }
         } else {
-            simple_leaf
-        }
-    } else {
-        simple_leaf
-    };
+            expr_leaf
+        };
 
     if depth == 0 {
         return leaf_strategy;
@@ -767,14 +763,22 @@ fn condition_for_table_internal(
     // Recursive case
     let table_clone = table.clone();
     let schema_clone = schema.clone();
+    let functions_clone = functions.clone();
     let profile_clone = profile.clone();
     leaf_strategy
         .prop_flat_map(move |left| {
             let table_inner = table_clone.clone();
             let schema_inner = schema_clone.clone();
+            let funcs_inner = functions_clone.clone();
             let profile_inner = profile_clone.clone();
-            condition_for_table_internal(&table_inner, &schema_inner, &profile_inner, depth - 1)
-                .prop_map(move |right| Condition::And(Box::new(left.clone()), Box::new(right)))
+            condition_for_table_internal(
+                &table_inner,
+                &schema_inner,
+                &funcs_inner,
+                &profile_inner,
+                depth - 1,
+            )
+            .prop_map(move |right| Condition::And(Box::new(left.clone()), Box::new(right)))
         })
         .boxed()
 }
@@ -897,107 +901,6 @@ fn subquery_condition_for_tables(
     proptest::strategy::Union::new_weighted(weighted_strategies).boxed()
 }
 
-/// Generate a condition tree for a table with expression support.
-///
-/// When the profile enables subqueries, subquery conditions will be included
-/// using tables from the schema.
-pub fn condition_for_table_with_expressions(
-    table: &TableRef,
-    schema: &Schema,
-    functions: &FunctionRegistry,
-    profile: &ConditionProfile,
-) -> BoxedStrategy<Condition> {
-    condition_for_table_with_expressions_internal(
-        table,
-        schema,
-        functions,
-        profile,
-        profile.max_depth,
-    )
-}
-
-/// Internal recursive implementation of condition_for_table_with_expressions.
-fn condition_for_table_with_expressions_internal(
-    table: &TableRef,
-    schema: &Schema,
-    functions: &FunctionRegistry,
-    profile: &ConditionProfile,
-    depth: u32,
-) -> BoxedStrategy<Condition> {
-    let filterable = table.filterable_columns().collect::<Vec<_>>();
-    if filterable.is_empty() {
-        return Just(Condition::Comparison {
-            left: Expression::Value(SqlValue::Integer(1)),
-            op: ComparisonOp::Eq,
-            right: Expression::Value(SqlValue::Integer(1)),
-        })
-        .boxed();
-    }
-
-    let ctx = ExpressionContext::new(functions.clone())
-        .with_columns(table.columns.clone())
-        .with_max_depth(profile.expression_max_depth)
-        .with_aggregates(false);
-
-    // Create leaf strategies from all filterable columns
-    let simple_leaves: Vec<BoxedStrategy<Condition>> =
-        filterable.iter().map(|c| expression_condition(c, &ctx)).collect();
-    let simple_leaf = proptest::strategy::Union::new(simple_leaves).boxed();
-
-    // Build leaf strategy including subqueries if enabled
-    let subquery_profile = &profile.subquery_profile;
-    let leaf_strategy: BoxedStrategy<Condition> = if subquery_profile.any_enabled()
-        && !schema.tables.is_empty()
-    {
-        let subquery_total = subquery_profile.total_weight();
-        let simple_weight = profile.simple_condition_weight;
-
-        if subquery_total > 0 {
-            let sq_tables = schema.tables.clone();
-            let sq_profile = subquery_profile.clone();
-            let outer_table = table.clone();
-            proptest::strategy::Union::new_weighted(vec![
-                (simple_weight, simple_leaf),
-                (
-                    subquery_total,
-                    subquery_condition_for_tables(&outer_table, &sq_tables, &sq_profile),
-                ),
-            ])
-            .boxed()
-        } else {
-            simple_leaf
-        }
-    } else {
-        simple_leaf
-    };
-
-    if depth == 0 {
-        return leaf_strategy;
-    }
-
-    // Recursive case
-    let table_clone = table.clone();
-    let schema_clone = schema.clone();
-    let functions_clone = functions.clone();
-    let profile_clone = profile.clone();
-    leaf_strategy
-        .prop_flat_map(move |left| {
-            let table_inner = table_clone.clone();
-            let schema_inner = schema_clone.clone();
-            let funcs_inner = functions_clone.clone();
-            let profile_inner = profile_clone.clone();
-            condition_for_table_with_expressions_internal(
-                &table_inner,
-                &schema_inner,
-                &funcs_inner,
-                &profile_inner,
-                depth - 1,
-            )
-            .prop_map(move |right| Condition::And(Box::new(left.clone()), Box::new(right)))
-        })
-        .boxed()
-}
-
 /// Generate an optional WHERE clause for a table with profile.
 ///
 /// When the profile enables subqueries, subquery conditions will be included
@@ -1017,74 +920,11 @@ pub fn optional_where_clause(
     .boxed()
 }
 
-/// Generate an optional WHERE clause with expression support and profile.
-///
-/// When the profile enables subqueries, subquery conditions will be included
-/// using tables from the schema.
-pub fn optional_where_clause_with_expressions(
-    table: &TableRef,
-    schema: &Schema,
-    functions: &FunctionRegistry,
-    profile: &ConditionProfile,
-) -> BoxedStrategy<Option<Condition>> {
-    let table_clone = table.clone();
-    let schema_clone = schema.clone();
-    let functions_clone = functions.clone();
-    let profile_clone = profile.clone();
-    prop_oneof![
-        Just(None),
-        condition_for_table_with_expressions(
-            &table_clone,
-            &schema_clone,
-            &functions_clone,
-            &profile_clone,
-        )
-        .prop_map(Some),
-    ]
-    .boxed()
-}
-
 /// Generate ORDER BY items for a table with profile.
+///
+/// Uses expression-based ORDER BY with builtin functions.
 pub fn order_by_for_table(
     table: &TableRef,
-    profile: &ConditionProfile,
-) -> BoxedStrategy<Vec<OrderByItem>> {
-    let max_items = profile.max_order_by_items;
-    let filterable = table.filterable_columns().collect::<Vec<_>>();
-    if filterable.is_empty() {
-        return Just(vec![]).boxed();
-    }
-
-    let col_names: Vec<String> = filterable.iter().map(|c| c.name.clone()).collect();
-
-    proptest::collection::vec(
-        (proptest::sample::select(col_names), order_direction()),
-        0..=max_items,
-    )
-    .prop_map(|items| {
-        // Deduplicate columns in ORDER BY
-        let mut seen = std::collections::HashSet::new();
-        items
-            .into_iter()
-            .filter_map(|(column, direction)| {
-                if seen.insert(column.clone()) {
-                    Some(OrderByItem {
-                        expr: Expression::Column(column),
-                        direction,
-                    })
-                } else {
-                    None
-                }
-            })
-            .collect()
-    })
-    .boxed()
-}
-
-/// Generate ORDER BY items for a table with expression support and profile.
-pub fn order_by_for_table_with_expressions(
-    table: &TableRef,
-    functions: &FunctionRegistry,
     profile: &ConditionProfile,
 ) -> BoxedStrategy<Vec<OrderByItem>> {
     let max_items = profile.max_order_by_items;
@@ -1094,7 +934,8 @@ pub fn order_by_for_table_with_expressions(
         return Just(vec![]).boxed();
     }
 
-    let ctx = ExpressionContext::new(functions.clone())
+    let functions = builtin_functions();
+    let ctx = ExpressionContext::new(functions)
         .with_columns(table.columns.clone())
         .with_max_depth(expr_max_depth)
         .with_aggregates(false);
@@ -1151,7 +992,7 @@ pub fn subquery_select_for_table(
         None => {
             // For EXISTS, we can select anything (or *)
             prop_oneof![
-                Just(vec![]), // SELECT *
+                Just(vec![]),                                        // SELECT *
                 Just(vec![Expression::Value(SqlValue::Integer(1))]), // SELECT 1
             ]
             .boxed()
@@ -1179,13 +1020,11 @@ pub fn subquery_select_for_table(
     ];
 
     (columns_strategy, where_strategy, limit_strategy)
-        .prop_map(move |(columns, where_clause, limit)| {
-            SubquerySelect {
-                table: table_name.clone(),
-                columns,
-                where_clause: where_clause.map(Box::new),
-                limit,
-            }
+        .prop_map(move |(columns, where_clause, limit)| SubquerySelect {
+            table: table_name.clone(),
+            columns,
+            where_clause: where_clause.map(Box::new),
+            limit,
         })
         .boxed()
 }
@@ -1214,10 +1053,7 @@ pub fn in_subquery_condition(
     profile: &SubqueryProfile,
     negated: bool,
 ) -> BoxedStrategy<Condition> {
-    let filterable: Vec<ColumnDef> = outer_table
-        .filterable_columns()
-        .cloned()
-        .collect();
+    let filterable: Vec<ColumnDef> = outer_table.filterable_columns().cloned().collect();
 
     if filterable.is_empty() {
         // Fallback to a tautology EXISTS
@@ -1235,15 +1071,16 @@ pub fn in_subquery_condition(
             let profile_inner = profile_clone.clone();
             let sq_table = subquery_table_clone.clone();
 
-            subquery_select_for_table(&sq_table, &profile_inner, Some(data_type))
-                .prop_map(move |subquery| {
+            subquery_select_for_table(&sq_table, &profile_inner, Some(data_type)).prop_map(
+                move |subquery| {
                     let expr = Expression::Column(col_name.clone());
                     if negated {
                         Condition::NotInSubquery { expr, subquery }
                     } else {
                         Condition::InSubquery { expr, subquery }
                     }
-                })
+                },
+            )
         })
         .boxed()
 }
@@ -1255,10 +1092,7 @@ pub fn comparison_subquery_condition(
     profile: &SubqueryProfile,
     quantifier: SubqueryQuantifier,
 ) -> BoxedStrategy<Condition> {
-    let filterable: Vec<ColumnDef> = outer_table
-        .filterable_columns()
-        .cloned()
-        .collect();
+    let filterable: Vec<ColumnDef> = outer_table.filterable_columns().cloned().collect();
 
     if filterable.is_empty() {
         // Fallback to EXISTS
@@ -1340,17 +1174,19 @@ mod tests {
         let subquery = SubquerySelect::new("users");
         assert_eq!(subquery.to_string(), "SELECT * FROM \"users\"");
 
-        let subquery_with_cols = SubquerySelect::new("users")
-            .with_columns(vec![Expression::Column("id".to_string())]);
-        assert_eq!(subquery_with_cols.to_string(), "SELECT \"id\" FROM \"users\"");
+        let subquery_with_cols =
+            SubquerySelect::new("users").with_columns(vec![Expression::Column("id".to_string())]);
+        assert_eq!(
+            subquery_with_cols.to_string(),
+            "SELECT \"id\" FROM \"users\""
+        );
 
-        let subquery_with_where = SubquerySelect::new("users").with_where(
-            Condition::SimpleComparison {
+        let subquery_with_where =
+            SubquerySelect::new("users").with_where(Condition::SimpleComparison {
                 column: "active".to_string(),
                 op: ComparisonOp::Eq,
                 value: SqlValue::Integer(1),
-            },
-        );
+            });
         assert_eq!(
             subquery_with_where.to_string(),
             "SELECT * FROM \"users\" WHERE \"active\" = 1"
@@ -1385,12 +1221,11 @@ mod tests {
 
     #[test]
     fn test_not_exists_condition_display() {
-        let subquery = SubquerySelect::new("orders")
-            .with_where(Condition::SimpleComparison {
-                column: "user_id".to_string(),
-                op: ComparisonOp::Eq,
-                value: SqlValue::Integer(1),
-            });
+        let subquery = SubquerySelect::new("orders").with_where(Condition::SimpleComparison {
+            column: "user_id".to_string(),
+            op: ComparisonOp::Eq,
+            value: SqlValue::Integer(1),
+        });
         let cond = Condition::not_exists(subquery);
         assert_eq!(
             cond.to_string(),
@@ -1402,10 +1237,7 @@ mod tests {
     fn test_in_subquery_condition_display() {
         let subquery = SubquerySelect::new("departments")
             .with_columns(vec![Expression::Column("id".to_string())]);
-        let cond = Condition::in_subquery(
-            Expression::Column("dept_id".to_string()),
-            subquery,
-        );
+        let cond = Condition::in_subquery(Expression::Column("dept_id".to_string()), subquery);
         assert_eq!(
             cond.to_string(),
             "\"dept_id\" IN (SELECT \"id\" FROM \"departments\")"
@@ -1416,10 +1248,7 @@ mod tests {
     fn test_not_in_subquery_condition_display() {
         let subquery = SubquerySelect::new("blacklist")
             .with_columns(vec![Expression::Column("user_id".to_string())]);
-        let cond = Condition::not_in_subquery(
-            Expression::Column("id".to_string()),
-            subquery,
-        );
+        let cond = Condition::not_in_subquery(Expression::Column("id".to_string()), subquery);
         assert_eq!(
             cond.to_string(),
             "\"id\" NOT IN (SELECT \"user_id\" FROM \"blacklist\")"

@@ -88,10 +88,8 @@ pub mod strategies {
     };
     // Conditions
     pub use crate::condition::{
-        comparison_op, condition_for_table, condition_for_table_with_expressions,
-        expression_condition, logical_op, optional_where_clause,
-        optional_where_clause_with_expressions, order_by_for_table,
-        order_by_for_table_with_expressions, order_direction, simple_condition,
+        comparison_op, condition_for_table, expression_condition, logical_op,
+        optional_where_clause, order_by_for_table, order_direction, simple_condition,
         // Subquery strategies
         comparison_subquery_condition, exists_condition, in_subquery_condition,
         subquery_select_for_table,
