@@ -392,16 +392,19 @@ fn plan_cte(
         QueryDestination::placeholder_for_subquery(),
         connection,
     )?;
-    let Plan::Select(cte_plan) = cte_plan else {
-        crate::bail_parse_error!("Only SELECT queries are currently supported in CTEs");
-    };
 
-    JoinedTable::new_subquery(
-        cte_def.name.clone(),
-        cte_plan,
-        None,
-        program.table_reference_counter.next(),
-    )
+    // CTEs can be either simple SELECT or compound SELECT (UNION/INTERSECT/EXCEPT)
+    match cte_plan {
+        Plan::Select(_) | Plan::CompoundSelect { .. } => JoinedTable::new_subquery_from_plan(
+            cte_def.name.clone(),
+            cte_plan,
+            None,
+            program.table_reference_counter.next(),
+        ),
+        Plan::Delete(_) | Plan::Update(_) => {
+            crate::bail_parse_error!("DELETE/UPDATE queries are not supported in CTEs")
+        }
+    }
 }
 
 fn parse_from_clause_table(

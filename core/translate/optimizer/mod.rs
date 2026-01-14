@@ -350,7 +350,21 @@ fn add_ephemeral_table_to_update_plan(
 fn optimize_subqueries(plan: &mut SelectPlan, schema: &Schema) -> Result<()> {
     for table in plan.table_references.joined_tables_mut() {
         if let Table::FromClauseSubquery(from_clause_subquery) = &mut table.table {
-            optimize_select_plan(&mut from_clause_subquery.plan, schema)?;
+            // Use match to handle both SelectPlan and CompoundSelect variants
+            match from_clause_subquery.plan.as_mut() {
+                Plan::Select(select_plan) => optimize_select_plan(select_plan, schema)?,
+                Plan::CompoundSelect {
+                    left, right_most, ..
+                } => {
+                    optimize_select_plan(right_most, schema)?;
+                    for (select_plan, _) in left {
+                        optimize_select_plan(select_plan, schema)?;
+                    }
+                }
+                Plan::Delete(_) | Plan::Update(_) => {
+                    // These shouldn't appear in FROM clause subqueries
+                }
+            }
         }
     }
 
