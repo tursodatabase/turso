@@ -918,6 +918,14 @@ do_execsql_test strftime-seconds-since-epoch {
     SELECT strftime('%s', '2025-01-23T13:14:30.567');
 } {1737638070}
 
+do_execsql_test strftime-with-subsec {
+    SELECT strftime('%s', '2000-01-01 12:00:00.123', 'subsec');
+} {946728000.123}
+
+do_execsql_test strftime-with-subsec-math {
+    SELECT (strftime('%s', '2000-01-01 12:00:00.123', 'subsec') - 946728000);
+} {0.123000025749207}
+
 do_execsql_test strftime-seconds {
     SELECT strftime('%S', '2025-01-23T13:14:30.567');
 } {30}
@@ -1118,6 +1126,36 @@ do_execsql_test datetime-trailing-garbage-date-rejected {
   SELECT datetime('2024-01-15 10:30:45.123xyz');
 } {{}}
 
+# Overflows
+do_execsql_test arithmetic-overflow {
+  SELECT datetime('2000-01-01', '-262145 years', 'start of year');
+} {{}}
+
+do_execsql_test out-of-bounds-unixepoch {
+  SELECT datetime(-99999999999999999, 'unixepoch', 'start of month');
+} {{}}
+
+do_execsql_test arithmetic-overflow-julianday {
+  SELECT datetime(9999999999999999999.0, 'julianday', 'start of month');
+} {{}}
+
+do_execsql_test overflows-with-large-days-modifier {
+  SELECT datetime('9999-12-31', '+100000000 days', 'start of year');
+} {{}}
+
+# Invalid date and time
+do_execsql_test invalid-date {
+  SELECT date('2024-07-21 24:00:00');
+} {2024-07-21}
+
+do_execsql_test invalid-time {
+  SELECT time('2024-07-21 24:59:59');
+} {24:59:59}
+
+do_execsql_test invalid-datetime {
+  SELECT datetime('2024-07-21 24:59:59');
+} {{2024-07-21 24:59:59}}
+
 # Regression tests for multi-byte UTF-8 characters (issue #4551)
 # These should return NULL, not panic
 
@@ -1140,3 +1178,128 @@ do_execsql_test julianday-multibyte-utf8-cyrillic {
 do_execsql_test datetime-multibyte-utf8-greek {
   SELECT datetime('2024-01-01 αβγδεζ');
 } {{}}
+
+# Invalid Leap Years
+do_execsql_test date-leapyear-floor {
+  SELECT date('2000-02-31', 'floor');
+} {2000-02-29}
+
+do_execsql_test date-leapyear-floor2 {
+  SELECT date('1999-02-31', 'floor');
+} {1999-02-28}
+
+do_execsql_test date-leapyear-ceiling {
+  SELECT date('2000-02-31', 'ceiling');
+} {2000-03-02}
+
+do_execsql_test date-leapyear-ceiling2 {
+  SELECT date('1999-02-31', 'ceiling');
+} {1999-03-03}
+
+do_execsql_test leapyear-plus-month {
+	SELECT date('2023-02-31', '+1 month');
+} {2023-03-31}
+
+do_execsql_test invalid-date-format {
+  SELECT datetime('now', '+2024-1-1');
+} {{}}
+
+do_execsql_test invalid-datetime-modifier-format {
+  SELECT datetime(-100, 'start of month');
+} {{}}
+
+# UTC modifier tests
+do_execsql_test datetime-utc-basic {
+  SELECT typeof(datetime('2024-01-15 12:00:00', 'utc'));
+} {text}
+
+do_execsql_test datetime-utc-with-z-suffix {
+  SELECT datetime('2024-01-15 12:00:00Z', 'utc');
+} {{2024-01-15 12:00:00}}
+
+do_execsql_test datetime-utc-idempotent {
+  SELECT datetime('2024-01-15 12:00:00Z', 'utc', 'utc');
+} {{2024-01-15 12:00:00}}
+
+do_execsql_test datetime-localtime-utc-roundtrip {
+  SELECT datetime('2024-01-15 12:00:00Z', 'localtime', 'utc');
+} {{2024-01-15 12:00:00}}
+
+# Localtime modifier tests
+do_execsql_test datetime-localtime-basic {
+  SELECT typeof(datetime('2024-01-15 12:00:00', 'localtime'));
+} {text}
+
+# julianday modifier tests
+do_execsql_test datetime-julianday-modifier {
+  SELECT datetime(2460400.5, 'julianday');
+} {{2024-03-31 00:00:00}}
+
+do_execsql_test strftime-julianday-modifier {
+  SELECT strftime('%Y-%m-%d', 2460400.5, 'julianday');
+} {2024-03-31}
+
+do_execsql_test unixepoch-julianday-modifier {
+  SELECT unixepoch(2440587.5, 'julianday');
+} {0}
+
+# unixepoch modifier tests
+do_execsql_test time-unixepoch-modifier {
+  SELECT time(3661, 'unixepoch');
+} {01:01:01}
+
+do_execsql_test julianday-unixepoch-modifier {
+  SELECT julianday(0, 'unixepoch');
+} {2440587.5}
+
+do_execsql_test strftime-unixepoch-modifier {
+  SELECT strftime('%Y-%m-%d %H:%M:%S', 946684800, 'unixepoch');
+} {{2000-01-01 00:00:00}}
+
+do_execsql_test datetime-unixepoch-negative {
+  SELECT datetime(-86400, 'unixepoch');
+} {{1969-12-31 00:00:00}}
+
+# auto modifier tests
+do_execsql_test datetime-auto-julianday {
+  SELECT datetime(2460400.5, 'auto');
+} {{2024-03-31 00:00:00}}
+
+do_execsql_test datetime-auto-unixepoch {
+  SELECT datetime(1711065600, 'auto');
+} {{2024-03-22 00:00:00}}
+
+do_execsql_test julianday-auto {
+  SELECT julianday(0, 'auto');
+} {0.0}
+
+do_execsql_test unixepoch-auto {
+  SELECT unixepoch(2440587.5, 'auto');
+} {0}
+
+do_execsql_test strftime-auto {
+  SELECT strftime('%Y-%m-%d', 2460400.5, 'auto');
+} {2024-03-31}
+
+# subsec modifier tests
+do_execsql_test datetime-without-subsec {
+  SELECT datetime('2024-01-15 12:30:45.123');
+} {{2024-01-15 12:30:45}}
+
+do_execsql_test datetime-with-subsec {
+  SELECT datetime('2024-01-15 12:30:45.123', 'subsec');
+} {{2024-01-15 12:30:45.123}}
+
+# Combined modifier tests
+do_execsql_test datetime-floor-localtime {
+  SELECT typeof(datetime('2024-01-31', '+1 month', 'floor', 'localtime'));
+} {text}
+
+do_execsql_test datetime-auto-start-of-month {
+  SELECT datetime(1711065600, 'auto', 'start of month');
+} {{2024-03-01 00:00:00}}
+
+do_execsql_test date-julianday-floor {
+  SELECT date(2460400.5, 'julianday', '+1 month', 'floor');
+} {2024-04-30}
+
