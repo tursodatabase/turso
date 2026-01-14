@@ -302,6 +302,70 @@ impl FunctionProfile {
     }
 }
 
+// =============================================================================
+// EXTENDED FUNCTION PROFILE
+// =============================================================================
+
+/// Extended function profile with arity limits.
+#[derive(Debug, Clone)]
+pub struct ExtendedFunctionProfile {
+    /// Base function profile.
+    pub base: FunctionProfile,
+    /// Maximum extra args for variadic functions beyond minimum.
+    pub variadic_extra_args: usize,
+    /// Maximum value for ZEROBLOB size.
+    pub zeroblob_max_size: i64,
+    /// Maximum args for variadic functions like PRINTF, CHAR.
+    pub variadic_max_args: usize,
+}
+
+impl Default for ExtendedFunctionProfile {
+    fn default() -> Self {
+        Self {
+            base: FunctionProfile::default(),
+            variadic_extra_args: 5,
+            zeroblob_max_size: 1024,
+            variadic_max_args: 10,
+        }
+    }
+}
+
+impl ExtendedFunctionProfile {
+    /// Create a minimal function profile.
+    pub fn minimal() -> Self {
+        Self {
+            base: FunctionProfile::default(),
+            variadic_extra_args: 2,
+            zeroblob_max_size: 256,
+            variadic_max_args: 3,
+        }
+    }
+
+    /// Builder method to set base profile.
+    pub fn with_base(mut self, base: FunctionProfile) -> Self {
+        self.base = base;
+        self
+    }
+
+    /// Builder method to set variadic extra args.
+    pub fn with_variadic_extra_args(mut self, count: usize) -> Self {
+        self.variadic_extra_args = count;
+        self
+    }
+
+    /// Builder method to set zeroblob max size.
+    pub fn with_zeroblob_max_size(mut self, size: i64) -> Self {
+        self.zeroblob_max_size = size;
+        self
+    }
+
+    /// Builder method to set variadic max args.
+    pub fn with_variadic_max_args(mut self, count: usize) -> Self {
+        self.variadic_max_args = count;
+        self
+    }
+}
+
 /// Context for function generation.
 #[derive(Debug, Clone)]
 pub struct FunctionContext<'a> {
@@ -345,7 +409,7 @@ impl SqlGeneratorKind for FunctionCategory {
     fn strategy<'a>(
         &self,
         _ctx: &Self::Context<'a>,
-        _profile: Option<&Self::Profile>,
+        _profile: &Self::Profile,
     ) -> BoxedStrategy<Self::Output> {
         let funcs = functions_in_category(*self);
         if funcs.is_empty() {

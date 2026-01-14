@@ -8,6 +8,69 @@ use crate::function::FunctionRegistry;
 use crate::schema::{ColumnDef, TableRef};
 use crate::value::{SqlValue, value_for_type};
 
+// =============================================================================
+// CONDITION GENERATION PROFILE
+// =============================================================================
+
+/// Profile for controlling WHERE clause and condition generation.
+#[derive(Debug, Clone)]
+pub struct ConditionProfile {
+    /// Maximum depth for condition trees (AND/OR nesting).
+    pub max_depth: u32,
+    /// Maximum number of ORDER BY items.
+    pub max_order_by_items: usize,
+    /// Maximum depth for expressions within conditions.
+    pub expression_max_depth: u32,
+}
+
+impl Default for ConditionProfile {
+    fn default() -> Self {
+        Self {
+            max_depth: 2,
+            max_order_by_items: 3,
+            expression_max_depth: 1,
+        }
+    }
+}
+
+impl ConditionProfile {
+    /// Create a profile for simple conditions (no nesting).
+    pub fn simple() -> Self {
+        Self {
+            max_depth: 0,
+            max_order_by_items: 1,
+            expression_max_depth: 0,
+        }
+    }
+
+    /// Create a profile for complex conditions.
+    pub fn complex() -> Self {
+        Self {
+            max_depth: 4,
+            max_order_by_items: 5,
+            expression_max_depth: 2,
+        }
+    }
+
+    /// Builder method to set the max depth.
+    pub fn with_max_depth(mut self, depth: u32) -> Self {
+        self.max_depth = depth;
+        self
+    }
+
+    /// Builder method to set the max ORDER BY items.
+    pub fn with_max_order_by_items(mut self, count: usize) -> Self {
+        self.max_order_by_items = count;
+        self
+    }
+
+    /// Builder method to set the expression max depth.
+    pub fn with_expression_max_depth(mut self, depth: u32) -> Self {
+        self.expression_max_depth = depth;
+        self
+    }
+}
+
 /// Comparison operators for WHERE clauses.
 #[derive(Debug, Clone, Copy)]
 pub enum ComparisonOp {
@@ -186,9 +249,10 @@ pub fn simple_condition(column: &ColumnDef) -> BoxedStrategy<Condition> {
     let col_name = column.name.clone();
     let col_name2 = column.name.clone();
     let col_name3 = column.name.clone();
+    let value_profile = crate::value::ValueProfile::default();
 
     let comparison =
-        (comparison_op(), value_for_type(&column.data_type, false)).prop_map(move |(op, value)| {
+        (comparison_op(), value_for_type(&column.data_type, false, &value_profile)).prop_map(move |(op, value)| {
             Condition::SimpleComparison {
                 column: col_name.clone(),
                 op,
@@ -282,6 +346,7 @@ pub fn condition_for_table_with_expressions(
     table: &TableRef,
     functions: &FunctionRegistry,
     max_depth: u32,
+    expression_max_depth: u32,
 ) -> BoxedStrategy<Condition> {
     let filterable = table.filterable_columns().collect::<Vec<_>>();
     if filterable.is_empty() {
@@ -295,7 +360,7 @@ pub fn condition_for_table_with_expressions(
 
     let ctx = ExpressionContext::new(functions.clone())
         .with_columns(table.columns.clone())
-        .with_max_depth(1)
+        .with_max_depth(expression_max_depth)
         .with_aggregates(false);
 
     // Create leaf strategies from all filterable columns
@@ -313,38 +378,60 @@ pub fn condition_for_table_with_expressions(
     leaf.prop_flat_map(move |left| {
         let table_inner = table_clone.clone();
         let funcs_inner = functions_clone.clone();
-        condition_for_table_with_expressions(&table_inner, &funcs_inner, max_depth - 1)
-            .prop_map(move |right| Condition::And(Box::new(left.clone()), Box::new(right)))
+        condition_for_table_with_expressions(
+            &table_inner,
+            &funcs_inner,
+            max_depth - 1,
+            expression_max_depth,
+        )
+        .prop_map(move |right| Condition::And(Box::new(left.clone()), Box::new(right)))
     })
     .boxed()
 }
 
-/// Generate an optional WHERE clause for a table.
-pub fn optional_where_clause(table: &TableRef) -> BoxedStrategy<Option<Condition>> {
+/// Generate an optional WHERE clause for a table with profile.
+pub fn optional_where_clause(
+    table: &TableRef,
+    profile: &ConditionProfile,
+) -> BoxedStrategy<Option<Condition>> {
+    let max_depth = profile.max_depth;
     let table_clone = table.clone();
     prop_oneof![
         Just(None),
-        condition_for_table(&table_clone, 2).prop_map(Some),
+        condition_for_table(&table_clone, max_depth).prop_map(Some),
     ]
     .boxed()
 }
 
-/// Generate an optional WHERE clause for a table with expression support.
+/// Generate an optional WHERE clause with expression support and profile.
 pub fn optional_where_clause_with_expressions(
     table: &TableRef,
     functions: &FunctionRegistry,
+    profile: &ConditionProfile,
 ) -> BoxedStrategy<Option<Condition>> {
+    let max_depth = profile.max_depth;
+    let expr_max_depth = profile.expression_max_depth;
     let table_clone = table.clone();
     let functions_clone = functions.clone();
     prop_oneof![
         Just(None),
-        condition_for_table_with_expressions(&table_clone, &functions_clone, 2).prop_map(Some),
+        condition_for_table_with_expressions(
+            &table_clone,
+            &functions_clone,
+            max_depth,
+            expr_max_depth
+        )
+        .prop_map(Some),
     ]
     .boxed()
 }
 
-/// Generate ORDER BY items for a table (simple column references).
-pub fn order_by_for_table(table: &TableRef) -> BoxedStrategy<Vec<OrderByItem>> {
+/// Generate ORDER BY items for a table with profile.
+pub fn order_by_for_table(
+    table: &TableRef,
+    profile: &ConditionProfile,
+) -> BoxedStrategy<Vec<OrderByItem>> {
+    let max_items = profile.max_order_by_items;
     let filterable = table.filterable_columns().collect::<Vec<_>>();
     if filterable.is_empty() {
         return Just(vec![]).boxed();
@@ -354,7 +441,7 @@ pub fn order_by_for_table(table: &TableRef) -> BoxedStrategy<Vec<OrderByItem>> {
 
     proptest::collection::vec(
         (proptest::sample::select(col_names), order_direction()),
-        0..=3,
+        0..=max_items,
     )
     .prop_map(|items| {
         // Deduplicate columns in ORDER BY
@@ -376,11 +463,14 @@ pub fn order_by_for_table(table: &TableRef) -> BoxedStrategy<Vec<OrderByItem>> {
     .boxed()
 }
 
-/// Generate ORDER BY items for a table with expression support.
+/// Generate ORDER BY items for a table with expression support and profile.
 pub fn order_by_for_table_with_expressions(
     table: &TableRef,
     functions: &FunctionRegistry,
+    profile: &ConditionProfile,
 ) -> BoxedStrategy<Vec<OrderByItem>> {
+    let max_items = profile.max_order_by_items;
+    let expr_max_depth = profile.expression_max_depth;
     let filterable = table.filterable_columns().collect::<Vec<_>>();
     if filterable.is_empty() {
         return Just(vec![]).boxed();
@@ -388,12 +478,12 @@ pub fn order_by_for_table_with_expressions(
 
     let ctx = ExpressionContext::new(functions.clone())
         .with_columns(table.columns.clone())
-        .with_max_depth(1)
+        .with_max_depth(expr_max_depth)
         .with_aggregates(false);
 
     proptest::collection::vec(
         (crate::expression::expression(&ctx), order_direction()),
-        0..=3,
+        0..=max_items,
     )
     .prop_map(|items| {
         items

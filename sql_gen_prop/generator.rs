@@ -19,7 +19,7 @@ use proptest::prelude::*;
 ///   This is a GAT (Generic Associated Type) that supports lifetimes, allowing contexts
 ///   that borrow data (e.g., `AlterTableContext<'a>`).
 /// - `Output`: The type of statement/operation this generator produces.
-/// - `Profile`: Optional configuration type for fine-grained control over generation.
+/// - `Profile`: Configuration type for fine-grained control over generation.
 ///   Use `()` for generators that don't need additional configuration.
 ///
 /// # Example
@@ -34,8 +34,8 @@ use proptest::prelude::*;
 ///         // Check if this operation can be generated given the context
 ///     }
 ///
-///     fn strategy(&self, ctx: &Self::Context<'_>, profile: Option<&Self::Profile>) -> BoxedStrategy<Self::Output> {
-///         // Build the proptest strategy, optionally using the profile
+///     fn strategy(&self, ctx: &Self::Context<'_>, profile: &Self::Profile) -> BoxedStrategy<Self::Output> {
+///         // Build the proptest strategy using the profile
 ///     }
 /// }
 /// ```
@@ -47,7 +47,7 @@ pub trait SqlGeneratorKind: Sized + Copy {
     /// The output type produced by this generator.
     type Output;
 
-    /// Optional profile type for fine-grained control over generation.
+    /// Profile type for fine-grained control over generation.
     /// Use `()` for generators that don't need additional configuration.
     type Profile;
 
@@ -71,12 +71,12 @@ pub trait SqlGeneratorKind: Sized + Copy {
     /// Caller should ensure `available(ctx)` and `supported()` return true
     /// before calling this method.
     ///
-    /// The optional `profile` parameter provides fine-grained control over
-    /// generation for kinds that support it.
+    /// The `profile` parameter provides fine-grained control over generation.
+    /// Pass `&Profile::default()` for default generation behavior.
     fn strategy<'a>(
         &self,
         ctx: &Self::Context<'a>,
-        profile: Option<&Self::Profile>,
+        profile: &Self::Profile,
     ) -> BoxedStrategy<Self::Output>;
 }
 
@@ -93,7 +93,7 @@ where
     fn into_weighted_strategies(
         self,
         ctx: &K::Context<'_>,
-        profile: Option<&P>,
+        profile: &P,
     ) -> Vec<(u32, BoxedStrategy<O>)>
     where
         Self: Sized,
@@ -136,7 +136,7 @@ mod tests {
         fn strategy(
             &self,
             _ctx: &Self::Context<'_>,
-            _profile: Option<&Self::Profile>,
+            _profile: &Self::Profile,
         ) -> BoxedStrategy<Self::Output> {
             match self {
                 TestKind::A => Just("A").boxed(),
@@ -150,11 +150,11 @@ mod tests {
         let kinds = [(TestKind::A, 10), (TestKind::B, 20)];
 
         // When context is true, both should be available
-        let strategies: Vec<_> = kinds.iter().copied().into_weighted_strategies(&true, None);
+        let strategies: Vec<_> = kinds.iter().copied().into_weighted_strategies(&true, &());
         assert_eq!(strategies.len(), 2);
 
         // When context is false, only A should be available
-        let strategies: Vec<_> = kinds.iter().copied().into_weighted_strategies(&false, None);
+        let strategies: Vec<_> = kinds.iter().copied().into_weighted_strategies(&false, &());
         assert_eq!(strategies.len(), 1);
     }
 }

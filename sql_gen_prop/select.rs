@@ -2,11 +2,154 @@
 
 use proptest::prelude::*;
 use std::fmt;
+use std::ops::RangeInclusive;
 
-use crate::condition::{Condition, OrderByItem, optional_where_clause, order_by_for_table};
-use crate::expression::{Expression, ExpressionContext};
+use crate::condition::{
+    Condition, ConditionProfile, OrderByItem, optional_where_clause, order_by_for_table,
+};
+use crate::expression::{Expression, ExpressionContext, ExpressionProfile};
 use crate::function::builtin_functions;
 use crate::schema::TableRef;
+
+// =============================================================================
+// SELECT STATEMENT PROFILE
+// =============================================================================
+
+/// Profile for controlling SELECT statement generation.
+#[derive(Debug, Clone)]
+pub struct SelectProfile {
+    /// Maximum depth for expressions in SELECT list.
+    pub expression_max_depth: u32,
+    /// Whether to allow aggregate functions.
+    pub allow_aggregates: bool,
+    /// Weight for SELECT * (empty column list).
+    pub select_star_weight: u32,
+    /// Weight for expression list in SELECT.
+    pub expression_list_weight: u32,
+    /// Weight for column subsequence in SELECT.
+    pub column_list_weight: u32,
+    /// Range for number of expressions in SELECT list.
+    pub expression_count_range: RangeInclusive<usize>,
+    /// Range for LIMIT clause values.
+    pub limit_range: RangeInclusive<u32>,
+    /// Range for OFFSET clause values.
+    pub offset_range: RangeInclusive<u32>,
+    /// Expression profile for SELECT expressions.
+    pub expression_profile: ExpressionProfile,
+    /// Condition profile for WHERE clause.
+    pub condition_profile: ConditionProfile,
+}
+
+impl Default for SelectProfile {
+    fn default() -> Self {
+        Self {
+            expression_max_depth: 2,
+            allow_aggregates: true,
+            select_star_weight: 3,
+            expression_list_weight: 7,
+            column_list_weight: 5,
+            expression_count_range: 1..=5,
+            limit_range: 1..=1000,
+            offset_range: 0..=100,
+            expression_profile: ExpressionProfile::default(),
+            condition_profile: ConditionProfile::default(),
+        }
+    }
+}
+
+impl SelectProfile {
+    /// Create a profile for simple SELECT queries.
+    pub fn simple() -> Self {
+        Self {
+            expression_max_depth: 1,
+            allow_aggregates: false,
+            select_star_weight: 5,
+            expression_list_weight: 3,
+            column_list_weight: 7,
+            expression_count_range: 1..=3,
+            limit_range: 1..=100,
+            offset_range: 0..=10,
+            expression_profile: ExpressionProfile::simple(),
+            condition_profile: ConditionProfile::simple(),
+        }
+    }
+
+    /// Create a profile for complex SELECT queries.
+    pub fn complex() -> Self {
+        Self {
+            expression_max_depth: 4,
+            allow_aggregates: true,
+            select_star_weight: 1,
+            expression_list_weight: 10,
+            column_list_weight: 3,
+            expression_count_range: 1..=10,
+            limit_range: 1..=10000,
+            offset_range: 0..=1000,
+            expression_profile: ExpressionProfile::function_heavy(),
+            condition_profile: ConditionProfile::complex(),
+        }
+    }
+
+    /// Builder method to set expression max depth.
+    pub fn with_expression_max_depth(mut self, depth: u32) -> Self {
+        self.expression_max_depth = depth;
+        self
+    }
+
+    /// Builder method to set whether aggregates are allowed.
+    pub fn with_aggregates(mut self, allow: bool) -> Self {
+        self.allow_aggregates = allow;
+        self
+    }
+
+    /// Builder method to set SELECT * weight.
+    pub fn with_select_star_weight(mut self, weight: u32) -> Self {
+        self.select_star_weight = weight;
+        self
+    }
+
+    /// Builder method to set expression list weight.
+    pub fn with_expression_list_weight(mut self, weight: u32) -> Self {
+        self.expression_list_weight = weight;
+        self
+    }
+
+    /// Builder method to set column list weight.
+    pub fn with_column_list_weight(mut self, weight: u32) -> Self {
+        self.column_list_weight = weight;
+        self
+    }
+
+    /// Builder method to set expression count range.
+    pub fn with_expression_count_range(mut self, range: RangeInclusive<usize>) -> Self {
+        self.expression_count_range = range;
+        self
+    }
+
+    /// Builder method to set LIMIT range.
+    pub fn with_limit_range(mut self, range: RangeInclusive<u32>) -> Self {
+        self.limit_range = range;
+        self
+    }
+
+    /// Builder method to set OFFSET range.
+    pub fn with_offset_range(mut self, range: RangeInclusive<u32>) -> Self {
+        self.offset_range = range;
+        self
+    }
+
+    /// Builder method to set expression profile.
+    pub fn with_expression_profile(mut self, profile: ExpressionProfile) -> Self {
+        self.expression_profile = profile;
+        self
+    }
+
+    /// Builder method to set condition profile.
+    pub fn with_condition_profile(mut self, profile: ConditionProfile) -> Self {
+        self.condition_profile = profile;
+        self
+    }
+}
 
 /// A SELECT statement.
 #[derive(Debug, Clone)]
@@ -64,37 +207,57 @@ impl fmt::Display for SelectStatement {
     }
 }
 
-/// Generate a SELECT statement for a table with expression support.
-///
-/// This generates function calls and other expressions in the SELECT list.
-pub fn select_for_table(table: &TableRef) -> BoxedStrategy<SelectStatement> {
+/// Generate a SELECT statement for a table with profile.
+pub fn select_for_table(
+    table: &TableRef,
+    profile: &SelectProfile,
+) -> BoxedStrategy<SelectStatement> {
     let table_name = table.name.clone();
     let col_names: Vec<String> = table.columns.iter().map(|c| c.name.clone()).collect();
     let functions = builtin_functions();
 
+    // Extract profile values
+    let expression_max_depth = profile.expression_max_depth;
+    let allow_aggregates = profile.allow_aggregates;
+    let select_star_weight = profile.select_star_weight;
+    let expression_list_weight = profile.expression_list_weight;
+    let column_list_weight = profile.column_list_weight;
+    let expression_count_range = profile.expression_count_range.clone();
+    let limit_range = profile.limit_range.clone();
+    let offset_range = profile.offset_range.clone();
+    let condition_profile = profile.condition_profile.clone();
+
     // Build expression context for generating expressions
     let ctx = ExpressionContext::new(functions)
         .with_columns(table.columns.clone())
-        .with_max_depth(2)
-        .with_aggregates(true);
+        .with_max_depth(expression_max_depth)
+        .with_aggregates(allow_aggregates);
 
     // Generate either SELECT * or a list of expressions
-    let columns_strategy = prop_oneof![
-        3 => Just(vec![]), // SELECT * (weighted less)
-        7 => proptest::collection::vec(
-            crate::expression::expression(&ctx),
-            1..=5
+    let columns_strategy = proptest::strategy::Union::new_weighted(vec![
+        (
+            select_star_weight,
+            Just(vec![]).boxed(), // SELECT *
         ),
-        5 => proptest::sample::subsequence(col_names.clone(), 1..=col_names.len())
-            .prop_map(|cols| cols.into_iter().map(Expression::Column).collect::<Vec<_>>()),
-    ];
+        (
+            expression_list_weight,
+            proptest::collection::vec(crate::expression::expression(&ctx), expression_count_range)
+                .boxed(),
+        ),
+        (
+            column_list_weight,
+            proptest::sample::subsequence(col_names.clone(), 1..=col_names.len())
+                .prop_map(|cols| cols.into_iter().map(Expression::Column).collect::<Vec<_>>())
+                .boxed(),
+        ),
+    ]);
 
     (
         columns_strategy,
-        optional_where_clause(table),
-        order_by_for_table(table),
-        proptest::option::of(1u32..1000),
-        proptest::option::of(0u32..100),
+        optional_where_clause(table, &condition_profile),
+        order_by_for_table(table, &condition_profile),
+        proptest::option::of(limit_range),
+        proptest::option::of(offset_range),
     )
         .prop_map(
             move |(columns, where_clause, order_by, limit, offset)| SelectStatement {
@@ -170,7 +333,7 @@ mod tests {
                         crate::schema::ColumnDef::new("age", crate::schema::DataType::Integer),
                     ],
                 ).into();
-                select_for_table(&table)
+                select_for_table(&table, &SelectProfile::default())
             }
         ) {
             let sql = stmt.to_string();
@@ -193,7 +356,7 @@ mod tests {
             ],
         )
         .into();
-        let strategy = select_for_table(&table);
+        let strategy = select_for_table(&table, &SelectProfile::default());
 
         let mut runner = TestRunner::default();
         let mut found_function = false;

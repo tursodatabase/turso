@@ -6,8 +6,20 @@
 use strum::IntoEnumIterator;
 
 use crate::alter_table::AlterTableOpWeights;
-use crate::create_trigger::CreateTriggerOpWeights;
 use crate::statement::StatementKind;
+
+// Re-export profiles from their respective modules
+pub use crate::condition::ConditionProfile;
+pub use crate::create_index::CreateIndexProfile;
+pub use crate::create_table::CreateTableProfile;
+pub use crate::create_trigger::{CreateTriggerOpWeights, CreateTriggerProfile};
+pub use crate::delete::DeleteProfile;
+pub use crate::expression::{ExpressionProfile, ExtendedExpressionProfile};
+pub use crate::function::{ExtendedFunctionProfile, FunctionProfile};
+pub use crate::insert::InsertProfile;
+pub use crate::select::SelectProfile;
+pub use crate::update::UpdateProfile;
+pub use crate::value::ValueProfile;
 
 /// A weighted profile that holds an overall weight and optional detailed settings.
 ///
@@ -15,28 +27,25 @@ use crate::statement::StatementKind;
 /// - A weight determining how often this statement type is generated relative to others
 /// - Optional detailed settings for fine-grained control within that statement type
 #[derive(Debug, Clone)]
-pub struct WeightedProfile<T> {
+pub struct WeightedProfile<T: Default> {
     /// The overall weight for this statement type.
     pub weight: u32,
     /// Optional detailed settings for fine-grained control.
-    pub extra: Option<T>,
+    pub extra: T,
 }
 
-impl<T> WeightedProfile<T> {
+impl<T: Default> WeightedProfile<T> {
     /// Create a new weighted profile with the given weight and no detail.
-    pub const fn new(weight: u32) -> Self {
+    pub fn new(weight: u32) -> Self {
         Self {
             weight,
-            extra: None,
+            extra: Default::default(),
         }
     }
 
     /// Create a new weighted profile with weight and detail.
-    pub const fn with_detail(weight: u32, detail: T) -> Self {
-        Self {
-            weight,
-            extra: Some(detail),
-        }
+    pub const fn with_extra(weight: u32, extra: T) -> Self {
+        Self { weight, extra }
     }
 
     /// Builder method to set the weight.
@@ -46,8 +55,8 @@ impl<T> WeightedProfile<T> {
     }
 
     /// Builder method to set the detail.
-    pub fn extra(mut self, detail: T) -> Self {
-        self.extra = Some(detail);
+    pub fn extra(mut self, extra: T) -> Self {
+        self.extra = extra;
         self
     }
 
@@ -61,10 +70,80 @@ impl<T: Default> Default for WeightedProfile<T> {
     fn default() -> Self {
         Self {
             weight: 0,
-            extra: None,
+            extra: Default::default(),
         }
     }
 }
+
+// =============================================================================
+// GLOBAL GENERATION PROFILE
+// =============================================================================
+
+/// Global profile containing all generation settings.
+///
+/// This profile aggregates all sub-profiles and provides a single point
+/// of configuration for the entire SQL generation system.
+#[derive(Debug, Clone, Default)]
+pub struct GenerationProfile {
+    /// Profile for value generation.
+    pub value: ValueProfile,
+    /// Extended expression profile.
+    pub expression: ExtendedExpressionProfile,
+    /// Extended function profile.
+    pub function: ExtendedFunctionProfile,
+    /// Condition profile.
+    pub condition: ConditionProfile,
+}
+
+impl GenerationProfile {
+    /// Create a minimal profile for fast testing.
+    pub fn minimal() -> Self {
+        Self {
+            value: ValueProfile::minimal(),
+            expression: ExtendedExpressionProfile::simple(),
+            function: ExtendedFunctionProfile::minimal(),
+            condition: ConditionProfile::simple(),
+        }
+    }
+
+    /// Create a complex profile for thorough testing.
+    pub fn complex() -> Self {
+        Self {
+            value: ValueProfile::large(),
+            expression: ExtendedExpressionProfile::complex(),
+            function: ExtendedFunctionProfile::default(),
+            condition: ConditionProfile::complex(),
+        }
+    }
+
+    /// Builder method to set value profile.
+    pub fn with_value(mut self, profile: ValueProfile) -> Self {
+        self.value = profile;
+        self
+    }
+
+    /// Builder method to set expression profile.
+    pub fn with_expression(mut self, profile: ExtendedExpressionProfile) -> Self {
+        self.expression = profile;
+        self
+    }
+
+    /// Builder method to set function profile.
+    pub fn with_function(mut self, profile: ExtendedFunctionProfile) -> Self {
+        self.function = profile;
+        self
+    }
+
+    /// Builder method to set condition profile.
+    pub fn with_condition(mut self, profile: ConditionProfile) -> Self {
+        self.condition = profile;
+        self
+    }
+}
+
+// =============================================================================
+// STATEMENT PROFILE
+// =============================================================================
 
 /// Profile controlling SQL statement generation weights.
 ///
@@ -79,29 +158,39 @@ impl<T: Default> Default for WeightedProfile<T> {
 /// - **Utility**: VACUUM, ANALYZE, REINDEX
 #[derive(Debug, Clone)]
 pub struct StatementProfile {
-    // DML weights
-    pub select_weight: u32,
-    pub insert_weight: u32,
-    pub update_weight: u32,
-    pub delete_weight: u32,
+    // DML weights with optional profiles
+    /// SELECT weight and optional generation profile.
+    pub select: WeightedProfile<SelectProfile>,
+    /// INSERT weight and optional generation profile.
+    pub insert: WeightedProfile<InsertProfile>,
+    /// UPDATE weight and optional generation profile.
+    pub update: WeightedProfile<UpdateProfile>,
+    /// DELETE weight and optional generation profile.
+    pub delete: WeightedProfile<DeleteProfile>,
 
     // DDL weights - Tables
-    pub create_table_weight: u32,
+    /// CREATE TABLE weight and optional generation profile.
+    pub create_table: WeightedProfile<CreateTableProfile>,
+    /// DROP TABLE weight (no extra profile needed).
     pub drop_table_weight: u32,
     /// ALTER TABLE weight and optional operation-level weights.
     pub alter_table: WeightedProfile<AlterTableOpWeights>,
 
     // DDL weights - Indexes
-    pub create_index_weight: u32,
+    /// CREATE INDEX weight and optional generation profile.
+    pub create_index: WeightedProfile<CreateIndexProfile>,
+    /// DROP INDEX weight (no extra profile needed).
     pub drop_index_weight: u32,
 
     // DDL weights - Views
+    /// CREATE VIEW weight (no extra profile needed).
     pub create_view_weight: u32,
+    /// DROP VIEW weight (no extra profile needed).
     pub drop_view_weight: u32,
 
     // DDL weights - Triggers
     /// CREATE TRIGGER weight and optional operation-level weights.
-    pub create_trigger: WeightedProfile<CreateTriggerOpWeights>,
+    pub create_trigger: WeightedProfile<CreateTriggerProfile>,
     /// DROP TRIGGER weight.
     pub drop_trigger_weight: u32,
 
@@ -116,22 +205,26 @@ pub struct StatementProfile {
     pub vacuum_weight: u32,
     pub analyze_weight: u32,
     pub reindex_weight: u32,
+
+    // Global generation profile
+    /// Global profile for value, expression, function, and condition generation.
+    pub generation: GenerationProfile,
 }
 
 impl Default for StatementProfile {
     fn default() -> Self {
         Self {
             // DML - most common operations
-            select_weight: 40,
-            insert_weight: 25,
-            update_weight: 15,
-            delete_weight: 10,
+            select: WeightedProfile::new(40),
+            insert: WeightedProfile::new(25),
+            update: WeightedProfile::new(15),
+            delete: WeightedProfile::new(10),
 
             // DDL - less frequent
-            create_table_weight: 2,
+            create_table: WeightedProfile::new(2),
             drop_table_weight: 1,
             alter_table: WeightedProfile::new(1),
-            create_index_weight: 2,
+            create_index: WeightedProfile::new(2),
             drop_index_weight: 1,
             create_view_weight: 1,
             drop_view_weight: 1,
@@ -149,6 +242,9 @@ impl Default for StatementProfile {
             vacuum_weight: 0,
             analyze_weight: 0,
             reindex_weight: 0,
+
+            // Global generation profile
+            generation: GenerationProfile::default(),
         }
     }
 }
@@ -157,14 +253,14 @@ impl StatementProfile {
     /// Create a profile with all weights set to zero.
     pub fn none() -> Self {
         Self {
-            select_weight: 0,
-            insert_weight: 0,
-            update_weight: 0,
-            delete_weight: 0,
-            create_table_weight: 0,
+            select: WeightedProfile::new(0),
+            insert: WeightedProfile::new(0),
+            update: WeightedProfile::new(0),
+            delete: WeightedProfile::new(0),
+            create_table: WeightedProfile::new(0),
             drop_table_weight: 0,
             alter_table: WeightedProfile::new(0),
-            create_index_weight: 0,
+            create_index: WeightedProfile::new(0),
             drop_index_weight: 0,
             create_view_weight: 0,
             drop_view_weight: 0,
@@ -178,16 +274,17 @@ impl StatementProfile {
             vacuum_weight: 0,
             analyze_weight: 0,
             reindex_weight: 0,
+            generation: GenerationProfile::default(),
         }
     }
 
     /// Create a DML-only profile (no DDL, no transactions, no utility).
     pub fn dml_only() -> Self {
         Self {
-            select_weight: 40,
-            insert_weight: 30,
-            update_weight: 20,
-            delete_weight: 10,
+            select: WeightedProfile::new(40),
+            insert: WeightedProfile::new(30),
+            update: WeightedProfile::new(20),
+            delete: WeightedProfile::new(10),
             ..Self::none()
         }
     }
@@ -200,10 +297,10 @@ impl StatementProfile {
     /// Create a write-heavy profile (mostly INSERT/UPDATE, no DDL).
     pub fn write_heavy() -> Self {
         Self {
-            select_weight: 10,
-            insert_weight: 50,
-            update_weight: 30,
-            delete_weight: 10,
+            select: WeightedProfile::new(10),
+            insert: WeightedProfile::new(50),
+            update: WeightedProfile::new(30),
+            delete: WeightedProfile::new(10),
             ..Self::none()
         }
     }
@@ -211,7 +308,7 @@ impl StatementProfile {
     /// Create a profile without DELETE statements.
     pub fn no_delete() -> Self {
         Self {
-            delete_weight: 0,
+            delete: WeightedProfile::new(0),
             ..Self::default()
         }
     }
@@ -219,10 +316,10 @@ impl StatementProfile {
     /// Create a DDL-only profile (schema changes only).
     pub fn ddl_only() -> Self {
         Self {
-            create_table_weight: 20,
+            create_table: WeightedProfile::new(20),
             drop_table_weight: 15,
             alter_table: WeightedProfile::new(15),
-            create_index_weight: 20,
+            create_index: WeightedProfile::new(20),
             drop_index_weight: 10,
             create_view_weight: 10,
             drop_view_weight: 10,
@@ -233,10 +330,10 @@ impl StatementProfile {
     /// Create a transaction-heavy profile for testing transaction handling.
     pub fn transaction_heavy() -> Self {
         Self {
-            select_weight: 20,
-            insert_weight: 20,
-            update_weight: 10,
-            delete_weight: 5,
+            select: WeightedProfile::new(20),
+            insert: WeightedProfile::new(20),
+            update: WeightedProfile::new(10),
+            delete: WeightedProfile::new(5),
             begin_weight: 10,
             commit_weight: 10,
             rollback_weight: 10,
@@ -250,25 +347,49 @@ impl StatementProfile {
 
     /// Builder method to set SELECT weight.
     pub fn with_select(mut self, weight: u32) -> Self {
-        self.select_weight = weight;
+        self.select.weight = weight;
+        self
+    }
+
+    /// Builder method to set SELECT profile with weight and generation settings.
+    pub fn with_select_profile(mut self, profile: WeightedProfile<SelectProfile>) -> Self {
+        self.select = profile;
         self
     }
 
     /// Builder method to set INSERT weight.
     pub fn with_insert(mut self, weight: u32) -> Self {
-        self.insert_weight = weight;
+        self.insert.weight = weight;
+        self
+    }
+
+    /// Builder method to set INSERT profile with weight and generation settings.
+    pub fn with_insert_profile(mut self, profile: WeightedProfile<InsertProfile>) -> Self {
+        self.insert = profile;
         self
     }
 
     /// Builder method to set UPDATE weight.
     pub fn with_update(mut self, weight: u32) -> Self {
-        self.update_weight = weight;
+        self.update.weight = weight;
+        self
+    }
+
+    /// Builder method to set UPDATE profile with weight and generation settings.
+    pub fn with_update_profile(mut self, profile: WeightedProfile<UpdateProfile>) -> Self {
+        self.update = profile;
         self
     }
 
     /// Builder method to set DELETE weight.
     pub fn with_delete(mut self, weight: u32) -> Self {
-        self.delete_weight = weight;
+        self.delete.weight = weight;
+        self
+    }
+
+    /// Builder method to set DELETE profile with weight and generation settings.
+    pub fn with_delete_profile(mut self, profile: WeightedProfile<DeleteProfile>) -> Self {
+        self.delete = profile;
         self
     }
 
@@ -276,7 +397,16 @@ impl StatementProfile {
 
     /// Builder method to set CREATE TABLE weight.
     pub fn with_create_table(mut self, weight: u32) -> Self {
-        self.create_table_weight = weight;
+        self.create_table.weight = weight;
+        self
+    }
+
+    /// Builder method to set CREATE TABLE profile with weight and generation settings.
+    pub fn with_create_table_profile(
+        mut self,
+        profile: WeightedProfile<CreateTableProfile>,
+    ) -> Self {
+        self.create_table = profile;
         self
     }
 
@@ -305,7 +435,16 @@ impl StatementProfile {
 
     /// Builder method to set CREATE INDEX weight.
     pub fn with_create_index(mut self, weight: u32) -> Self {
-        self.create_index_weight = weight;
+        self.create_index.weight = weight;
+        self
+    }
+
+    /// Builder method to set CREATE INDEX profile with weight and generation settings.
+    pub fn with_create_index_profile(
+        mut self,
+        profile: WeightedProfile<CreateIndexProfile>,
+    ) -> Self {
+        self.create_index = profile;
         self
     }
 
@@ -337,10 +476,10 @@ impl StatementProfile {
         self
     }
 
-    /// Builder method to set CREATE TRIGGER profile with weight and operation weights.
+    /// Builder method to set CREATE TRIGGER profile with weight and generation settings.
     pub fn with_create_trigger_profile(
         mut self,
-        profile: WeightedProfile<CreateTriggerOpWeights>,
+        profile: WeightedProfile<CreateTriggerProfile>,
     ) -> Self {
         self.create_trigger = profile;
         self
@@ -404,17 +543,25 @@ impl StatementProfile {
         self
     }
 
+    // Builder method for global generation profile
+
+    /// Builder method to set global generation profile.
+    pub fn with_generation(mut self, profile: GenerationProfile) -> Self {
+        self.generation = profile;
+        self
+    }
+
     /// Returns the total DML weight.
     pub fn dml_weight(&self) -> u32 {
-        self.select_weight + self.insert_weight + self.update_weight + self.delete_weight
+        self.select.weight + self.insert.weight + self.update.weight + self.delete.weight
     }
 
     /// Returns the total DDL weight.
     pub fn ddl_weight(&self) -> u32 {
-        self.create_table_weight
+        self.create_table.weight
             + self.drop_table_weight
             + self.alter_table.weight
-            + self.create_index_weight
+            + self.create_index.weight
             + self.drop_index_weight
             + self.create_view_weight
             + self.drop_view_weight
@@ -464,14 +611,14 @@ impl StatementProfile {
     /// Returns the weight for a given statement kind.
     pub fn weight_for(&self, kind: StatementKind) -> u32 {
         match kind {
-            StatementKind::Select => self.select_weight,
-            StatementKind::Insert => self.insert_weight,
-            StatementKind::Update => self.update_weight,
-            StatementKind::Delete => self.delete_weight,
-            StatementKind::CreateTable => self.create_table_weight,
+            StatementKind::Select => self.select.weight,
+            StatementKind::Insert => self.insert.weight,
+            StatementKind::Update => self.update.weight,
+            StatementKind::Delete => self.delete.weight,
+            StatementKind::CreateTable => self.create_table.weight,
             StatementKind::DropTable => self.drop_table_weight,
             StatementKind::AlterTable => self.alter_table.weight,
-            StatementKind::CreateIndex => self.create_index_weight,
+            StatementKind::CreateIndex => self.create_index.weight,
             StatementKind::DropIndex => self.drop_index_weight,
             StatementKind::CreateView => self.create_view_weight,
             StatementKind::DropView => self.drop_view_weight,
@@ -494,6 +641,43 @@ impl StatementProfile {
             .map(|kind| (kind, self.weight_for(kind)))
             .filter(|(_, w)| *w > 0)
     }
+
+    // Convenience accessor methods
+
+    /// Returns the SELECT profile or default.
+    pub fn select_profile(&self) -> &SelectProfile {
+        &self.select.extra
+    }
+
+    /// Returns the INSERT profile or default.
+    pub fn insert_profile(&self) -> &InsertProfile {
+        &self.insert.extra
+    }
+
+    /// Returns the UPDATE profile or default.
+    pub fn update_profile(&self) -> &UpdateProfile {
+        &self.update.extra
+    }
+
+    /// Returns the DELETE profile or default.
+    pub fn delete_profile(&self) -> &DeleteProfile {
+        &self.delete.extra
+    }
+
+    /// Returns the CREATE TABLE profile or default.
+    pub fn create_table_profile(&self) -> &CreateTableProfile {
+        &self.create_table.extra
+    }
+
+    /// Returns the CREATE INDEX profile or default.
+    pub fn create_index_profile(&self) -> &CreateIndexProfile {
+        &self.create_index.extra
+    }
+
+    /// Returns the CREATE TRIGGER profile or default.
+    pub fn create_trigger_profile(&self) -> &CreateTriggerProfile {
+        &self.create_trigger.extra
+    }
 }
 
 #[cfg(test)]
@@ -503,10 +687,10 @@ mod tests {
     #[test]
     fn test_default_profile() {
         let profile = StatementProfile::default();
-        assert_eq!(profile.select_weight, 40);
-        assert_eq!(profile.insert_weight, 25);
-        assert_eq!(profile.update_weight, 15);
-        assert_eq!(profile.delete_weight, 10);
+        assert_eq!(profile.select.weight, 40);
+        assert_eq!(profile.insert.weight, 25);
+        assert_eq!(profile.update.weight, 15);
+        assert_eq!(profile.delete.weight, 10);
         assert!(profile.has_dml());
         assert!(profile.has_ddl());
         assert!(!profile.has_transaction()); // Disabled by default
@@ -541,20 +725,20 @@ mod tests {
     #[test]
     fn test_read_only_profile() {
         let profile = StatementProfile::read_only();
-        assert_eq!(profile.select_weight, 100);
-        assert_eq!(profile.insert_weight, 0);
-        assert_eq!(profile.update_weight, 0);
-        assert_eq!(profile.delete_weight, 0);
+        assert_eq!(profile.select.weight, 100);
+        assert_eq!(profile.insert.weight, 0);
+        assert_eq!(profile.update.weight, 0);
+        assert_eq!(profile.delete.weight, 0);
         assert_eq!(profile.ddl_weight(), 0);
     }
 
     #[test]
     fn test_no_delete_profile() {
         let profile = StatementProfile::no_delete();
-        assert_eq!(profile.delete_weight, 0);
-        assert!(profile.select_weight > 0);
-        assert!(profile.insert_weight > 0);
-        assert!(profile.update_weight > 0);
+        assert_eq!(profile.delete.weight, 0);
+        assert!(profile.select.weight > 0);
+        assert!(profile.insert.weight > 0);
+        assert!(profile.update.weight > 0);
     }
 
     #[test]
@@ -563,9 +747,62 @@ mod tests {
             .with_select(50)
             .with_insert(30)
             .with_create_table(20);
-        assert_eq!(profile.select_weight, 50);
-        assert_eq!(profile.insert_weight, 30);
-        assert_eq!(profile.create_table_weight, 20);
+        assert_eq!(profile.select.weight, 50);
+        assert_eq!(profile.insert.weight, 30);
+        assert_eq!(profile.create_table.weight, 20);
         assert_eq!(profile.total_weight(), 100);
+    }
+
+    #[test]
+    fn test_value_profile() {
+        let profile = ValueProfile::default();
+        assert_eq!(profile.text_max_length, 100);
+        assert_eq!(profile.blob_max_size, 100);
+
+        let minimal = ValueProfile::minimal();
+        assert_eq!(minimal.text_max_length, 10);
+    }
+
+    #[test]
+    fn test_condition_profile() {
+        let profile = ConditionProfile::default();
+        assert_eq!(profile.max_depth, 2);
+        assert_eq!(profile.max_order_by_items, 3);
+
+        let simple = ConditionProfile::simple();
+        assert_eq!(simple.max_depth, 0);
+    }
+
+    #[test]
+    fn test_select_profile() {
+        let profile = SelectProfile::default();
+        assert_eq!(profile.expression_max_depth, 2);
+        assert!(profile.allow_aggregates);
+        assert_eq!(*profile.limit_range.start(), 1);
+        assert_eq!(*profile.limit_range.end(), 1000);
+
+        let simple = SelectProfile::simple();
+        assert!(!simple.allow_aggregates);
+    }
+
+    #[test]
+    fn test_generation_profile() {
+        let profile = GenerationProfile::default();
+        assert_eq!(profile.value.text_max_length, 100);
+        assert_eq!(profile.condition.max_depth, 2);
+
+        let minimal = GenerationProfile::minimal();
+        assert_eq!(minimal.value.text_max_length, 10);
+    }
+
+    #[test]
+    fn test_statement_profile_with_profiles() {
+        let select_profile = SelectProfile::complex();
+        let profile = StatementProfile::default()
+            .with_select_profile(WeightedProfile::with_extra(50, select_profile.clone()))
+            .with_generation(GenerationProfile::minimal());
+
+        assert_eq!(profile.select.weight, 50);
+        assert_eq!(profile.generation.value.text_max_length, 10);
     }
 }

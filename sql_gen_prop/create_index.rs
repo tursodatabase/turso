@@ -7,6 +7,41 @@ use crate::condition::OrderDirection;
 use crate::create_table::identifier_excluding;
 use crate::schema::{Schema, TableRef};
 
+// =============================================================================
+// CREATE INDEX PROFILE
+// =============================================================================
+
+/// Profile for controlling CREATE INDEX statement generation.
+#[derive(Debug, Clone)]
+pub struct CreateIndexProfile {
+    /// Maximum number of columns in an index.
+    pub max_columns: usize,
+}
+
+impl Default for CreateIndexProfile {
+    fn default() -> Self {
+        Self { max_columns: 4 }
+    }
+}
+
+impl CreateIndexProfile {
+    /// Create a profile for single-column indexes.
+    pub fn single_column() -> Self {
+        Self { max_columns: 1 }
+    }
+
+    /// Create a profile for composite indexes.
+    pub fn composite() -> Self {
+        Self { max_columns: 8 }
+    }
+
+    /// Builder method to set max columns.
+    pub fn with_max_columns(mut self, count: usize) -> Self {
+        self.max_columns = count;
+        self
+    }
+}
+
 /// A column reference in an index.
 #[derive(Debug, Clone)]
 pub struct IndexColumn {
@@ -67,14 +102,18 @@ pub fn index_column(col_name: String) -> impl Strategy<Value = IndexColumn> {
     })
 }
 
-/// Generate a CREATE INDEX statement for a specific table, avoiding existing index names.
+/// Generate a CREATE INDEX statement for a table with profile.
 pub fn create_index_for_table(
     table: &TableRef,
     schema: &Schema,
+    profile: &CreateIndexProfile,
 ) -> BoxedStrategy<CreateIndexStatement> {
     let table_name = table.name.clone();
     let col_names: Vec<String> = table.columns.iter().map(|c| c.name.clone()).collect();
     let existing_indexes = schema.index_names();
+
+    // Extract profile values
+    let max_columns = profile.max_columns;
 
     if col_names.is_empty() {
         return Just(CreateIndexStatement {
@@ -91,7 +130,7 @@ pub fn create_index_for_table(
         identifier_excluding(existing_indexes),
         any::<bool>(), // unique
         any::<bool>(), // if_not_exists
-        proptest::sample::subsequence(col_names.clone(), 1..=col_names.len().min(4)),
+        proptest::sample::subsequence(col_names.clone(), 1..=col_names.len().min(max_columns)),
     )
         .prop_flat_map(
             move |(index_suffix, unique, if_not_exists, selected_cols)| {
@@ -114,12 +153,18 @@ pub fn create_index_for_table(
         .boxed()
 }
 
-/// Generate a CREATE INDEX statement for any table in a schema, avoiding existing index names.
-pub fn create_index(schema: &Schema) -> BoxedStrategy<CreateIndexStatement> {
+/// Generate a CREATE INDEX statement for any table with profile.
+pub fn create_index(
+    schema: &Schema,
+    profile: &CreateIndexProfile,
+) -> BoxedStrategy<CreateIndexStatement> {
     assert!(
         !schema.tables.is_empty(),
         "Schema must have at least one table"
     );
+
+    // Extract profile values
+    let max_columns = profile.max_columns;
 
     let existing_indexes = schema.index_names();
     let tables = (*schema.tables).clone();
@@ -145,7 +190,7 @@ pub fn create_index(schema: &Schema) -> BoxedStrategy<CreateIndexStatement> {
                 identifier_excluding(existing),
                 any::<bool>(), // unique
                 any::<bool>(), // if_not_exists
-                proptest::sample::subsequence(col_names.clone(), 1..=col_names.len().min(4)),
+                proptest::sample::subsequence(col_names.clone(), 1..=col_names.len().min(max_columns)),
             )
                 .prop_flat_map(
                     move |(index_suffix, unique, if_not_exists, selected_cols)| {

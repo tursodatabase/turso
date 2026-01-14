@@ -439,6 +439,69 @@ impl ExpressionProfile {
     }
 }
 
+// =============================================================================
+// EXTENDED EXPRESSION PROFILE
+// =============================================================================
+
+/// Extended expression profile with additional configuration.
+#[derive(Debug, Clone)]
+pub struct ExtendedExpressionProfile {
+    /// Base expression profile.
+    pub base: ExpressionProfile,
+    /// Range for number of CASE WHEN clauses.
+    pub case_when_clause_range: std::ops::RangeInclusive<usize>,
+    /// Default max depth for expressions.
+    pub default_max_depth: u32,
+}
+
+impl Default for ExtendedExpressionProfile {
+    fn default() -> Self {
+        Self {
+            base: ExpressionProfile::default(),
+            case_when_clause_range: 1..=3,
+            default_max_depth: 3,
+        }
+    }
+}
+
+impl ExtendedExpressionProfile {
+    /// Create a simple expression profile.
+    pub fn simple() -> Self {
+        Self {
+            base: ExpressionProfile::simple(),
+            case_when_clause_range: 1..=1,
+            default_max_depth: 1,
+        }
+    }
+
+    /// Create a complex expression profile.
+    pub fn complex() -> Self {
+        Self {
+            base: ExpressionProfile::function_heavy(),
+            case_when_clause_range: 1..=5,
+            default_max_depth: 5,
+        }
+    }
+
+    /// Builder method to set base profile.
+    pub fn with_base(mut self, base: ExpressionProfile) -> Self {
+        self.base = base;
+        self
+    }
+
+    /// Builder method to set CASE WHEN clause range.
+    pub fn with_case_when_clause_range(mut self, range: std::ops::RangeInclusive<usize>) -> Self {
+        self.case_when_clause_range = range;
+        self
+    }
+
+    /// Builder method to set default max depth.
+    pub fn with_default_max_depth(mut self, depth: u32) -> Self {
+        self.default_max_depth = depth;
+        self
+    }
+}
+
 /// Context for generating expressions.
 ///
 /// This context owns its data to allow use in proptest strategies.
@@ -456,6 +519,8 @@ pub struct ExpressionContext {
     pub target_type: Option<DataType>,
     /// The expression generation profile.
     pub profile: ExpressionProfile,
+    /// Range for number of CASE WHEN clauses.
+    pub case_when_clause_range: std::ops::RangeInclusive<usize>,
 }
 
 impl ExpressionContext {
@@ -468,6 +533,7 @@ impl ExpressionContext {
             allow_aggregates: false,
             target_type: None,
             profile: ExpressionProfile::default(),
+            case_when_clause_range: 1..=3,
         }
     }
 
@@ -501,6 +567,15 @@ impl ExpressionContext {
         self
     }
 
+    /// Set the CASE WHEN clause range.
+    pub fn with_case_when_clause_range(
+        mut self,
+        range: std::ops::RangeInclusive<usize>,
+    ) -> Self {
+        self.case_when_clause_range = range;
+        self
+    }
+
     /// Create a child context with reduced depth.
     fn child_context(&self, depth: u32) -> Self {
         Self {
@@ -510,6 +585,7 @@ impl ExpressionContext {
             allow_aggregates: self.allow_aggregates,
             target_type: self.target_type,
             profile: self.profile.clone(),
+            case_when_clause_range: self.case_when_clause_range.clone(),
         }
     }
 }
@@ -572,7 +648,7 @@ impl SqlGeneratorKind for ExpressionKind {
     fn strategy<'a>(
         &self,
         ctx: &Self::Context<'a>,
-        _profile: Option<&Self::Profile>,
+        _profile: &Self::Profile,
     ) -> BoxedStrategy<Self::Output> {
         match self {
             ExpressionKind::Value => value_expression_strategy(ctx),
@@ -589,7 +665,8 @@ impl SqlGeneratorKind for ExpressionKind {
 /// Generate a literal value expression.
 fn value_expression_strategy(ctx: &ExpressionContext) -> BoxedStrategy<Expression> {
     let data_type = ctx.target_type.unwrap_or(DataType::Integer);
-    value_for_type(&data_type, true)
+    let value_profile = crate::value::ValueProfile::default();
+    value_for_type(&data_type, true, &value_profile)
         .prop_map(Expression::Value)
         .boxed()
 }
@@ -740,11 +817,12 @@ fn case_expression_strategy(ctx: &ExpressionContext) -> BoxedStrategy<Expression
     let cond_ctx = child_ctx.clone().with_target_type(Some(DataType::Integer));
     let then_ctx = child_ctx.clone();
 
-    // Generate 1-3 WHEN clauses
+    // Use the context's case_when_clause_range
+    let when_clause_range = ctx.case_when_clause_range.clone();
     let when_clause_strategy = (expression(&cond_ctx), expression(&then_ctx));
 
     (
-        proptest::collection::vec(when_clause_strategy, 1..=3),
+        proptest::collection::vec(when_clause_strategy, when_clause_range),
         proptest::option::of(expression(&child_ctx)),
     )
         .prop_map(|(when_clauses, else_clause)| Expression::Case {
@@ -773,7 +851,7 @@ pub fn expression(ctx: &ExpressionContext) -> BoxedStrategy<Expression> {
         .profile
         .enabled_kinds()
         .filter(|(kind, _)| kind.available(ctx))
-        .map(|(kind, weight)| (weight, kind.strategy(ctx, Some(&ctx.profile))))
+        .map(|(kind, weight)| (weight, kind.strategy(ctx, &ctx.profile)))
         .collect();
 
     if weighted_strategies.is_empty() {

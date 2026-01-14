@@ -3,8 +3,34 @@
 use proptest::prelude::*;
 use std::fmt;
 
-use crate::condition::{Condition, optional_where_clause};
+use crate::condition::{Condition, ConditionProfile, optional_where_clause};
 use crate::schema::TableRef;
+
+// =============================================================================
+// DELETE STATEMENT PROFILE
+// =============================================================================
+
+/// Profile for controlling DELETE statement generation.
+#[derive(Debug, Clone, Default)]
+pub struct DeleteProfile {
+    /// Condition profile for WHERE clause.
+    pub condition_profile: ConditionProfile,
+}
+
+impl DeleteProfile {
+    /// Create a profile for simple DELETE queries.
+    pub fn simple() -> Self {
+        Self {
+            condition_profile: ConditionProfile::simple(),
+        }
+    }
+
+    /// Builder method to set condition profile.
+    pub fn with_condition_profile(mut self, profile: ConditionProfile) -> Self {
+        self.condition_profile = profile;
+        self
+    }
+}
 
 /// A DELETE statement.
 #[derive(Debug, Clone)]
@@ -25,11 +51,15 @@ impl fmt::Display for DeleteStatement {
     }
 }
 
-/// Generate a DELETE statement for a table.
-pub fn delete_for_table(table: &TableRef) -> BoxedStrategy<DeleteStatement> {
+/// Generate a DELETE statement for a table with profile.
+pub fn delete_for_table(
+    table: &TableRef,
+    profile: &DeleteProfile,
+) -> BoxedStrategy<DeleteStatement> {
     let table_name = table.name.clone();
+    let condition_profile = &profile.condition_profile;
 
-    optional_where_clause(table)
+    optional_where_clause(table, condition_profile)
         .prop_map(move |where_clause| DeleteStatement {
             table: table_name.clone(),
             where_clause,

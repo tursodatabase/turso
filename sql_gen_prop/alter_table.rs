@@ -76,7 +76,7 @@ impl SqlGeneratorKind for AlterTableOpKind {
     fn strategy<'a>(
         &self,
         ctx: &Self::Context<'_>,
-        _profile: Option<&Self::Profile>,
+        _profile: &Self::Profile,
     ) -> BoxedStrategy<Self::Output> {
         match self {
             AlterTableOpKind::RenameTo => alter_table_rename_to(ctx.table, ctx.schema),
@@ -313,7 +313,7 @@ pub fn alter_table_drop_column(table: &Table) -> BoxedStrategy<AlterTableStateme
 /// Operations are filtered based on table state via `AlterTableOpKind::available()`.
 pub fn alter_table_for_schema(
     schema: &Schema,
-    op_weights: Option<&AlterTableOpWeights>,
+    op_weights: &AlterTableOpWeights,
 ) -> BoxedStrategy<AlterTableStatement> {
     assert!(
         !schema.tables.is_empty(),
@@ -322,10 +322,10 @@ pub fn alter_table_for_schema(
 
     let tables = schema.tables.clone();
     let schema_clone = schema.clone();
-    let op_weights_clone = op_weights.cloned();
+    let op_weights_clone = op_weights.clone();
     proptest::sample::select((*tables).clone())
         .prop_flat_map(move |table| {
-            let w = op_weights_clone.clone().unwrap_or_default();
+            let w = &op_weights_clone;
             let ctx = AlterTableContext {
                 table: &table,
                 schema: &schema_clone,
@@ -334,7 +334,7 @@ pub fn alter_table_for_schema(
             let strategies: Vec<(u32, BoxedStrategy<AlterTableStatement>)> = w
                 .enabled_operations()
                 .filter(|(kind, _)| kind.supported() && kind.available(&ctx))
-                .map(|(kind, weight)| (weight, kind.strategy(&ctx, None)))
+                .map(|(kind, weight)| (weight, kind.strategy(&ctx, &())))
                 .collect();
 
             assert!(
@@ -381,7 +381,7 @@ mod tests {
         }
 
         #[test]
-        fn alter_table_for_schema_with_default_profile(stmt in alter_table_for_schema(&test_schema(), None)) {
+        fn alter_table_for_schema_with_default_profile(stmt in alter_table_for_schema(&test_schema(), &Default::default())) {
             let sql = stmt.to_string();
             prop_assert!(sql.starts_with("ALTER TABLE \"users\""));
         }
@@ -389,7 +389,7 @@ mod tests {
         #[test]
         fn alter_table_for_schema_rename_only(stmt in alter_table_for_schema(
             &test_schema(),
-            Some(&AlterTableOpWeights::none().with_rename_to(100))
+            &AlterTableOpWeights::none().with_rename_to(100)
         )) {
             let sql = stmt.to_string();
             prop_assert!(sql.contains("RENAME TO"));

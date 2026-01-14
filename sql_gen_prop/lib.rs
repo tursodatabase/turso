@@ -59,7 +59,11 @@ pub use function::{
 };
 pub use generator::{SqlGeneratorKind, WeightedKindIteratorExt};
 pub use insert::InsertStatement;
-pub use profile::{StatementProfile, WeightedProfile};
+pub use profile::{
+    ConditionProfile, CreateIndexProfile, CreateTableProfile, CreateTriggerProfile, DeleteProfile,
+    ExtendedExpressionProfile, ExtendedFunctionProfile, GenerationProfile, InsertProfile,
+    SelectProfile, StatementProfile, UpdateProfile, ValueProfile, WeightedProfile,
+};
 pub use schema::{ColumnDef, DataType, Index, Schema, SchemaBuilder, Table, Trigger, View};
 pub use select::SelectStatement;
 pub use statement::{SqlStatement, StatementContext, StatementKind};
@@ -175,33 +179,33 @@ mod tests {
 
     proptest! {
         #[test]
-        fn generated_select_is_valid_sql(stmt in strategies::select_for_table(&test_schema().tables[0])) {
+        fn generated_select_is_valid_sql(stmt in strategies::select_for_table(&test_schema().tables[0], &SelectProfile::default())) {
             let sql = stmt.to_string();
             prop_assert!(sql.starts_with("SELECT"));
             prop_assert!(sql.contains("FROM \"users\""));
         }
 
         #[test]
-        fn generated_insert_is_valid_sql(stmt in strategies::insert_for_table(&test_schema().tables[0])) {
+        fn generated_insert_is_valid_sql(stmt in strategies::insert_for_table(&test_schema().tables[0], &InsertProfile::default())) {
             let sql = stmt.to_string();
             prop_assert!(sql.starts_with("INSERT INTO \"users\""));
             prop_assert!(sql.contains("VALUES"));
         }
 
         #[test]
-        fn generated_update_is_valid_sql(stmt in strategies::update_for_table(&test_schema().tables[0])) {
+        fn generated_update_is_valid_sql(stmt in strategies::update_for_table(&test_schema().tables[0], &UpdateProfile::default())) {
             let sql = stmt.to_string();
             prop_assert!(sql.starts_with("UPDATE \"users\""));
         }
 
         #[test]
-        fn generated_delete_is_valid_sql(stmt in strategies::delete_for_table(&test_schema().tables[0])) {
+        fn generated_delete_is_valid_sql(stmt in strategies::delete_for_table(&test_schema().tables[0], &DeleteProfile::default())) {
             let sql = stmt.to_string();
             prop_assert!(sql.starts_with("DELETE FROM \"users\""));
         }
 
         #[test]
-        fn generated_create_table_avoids_conflicts(stmt in strategies::create_table(&test_schema())) {
+        fn generated_create_table_avoids_conflicts(stmt in strategies::create_table(&test_schema(), &CreateTableProfile::default())) {
             // Should not generate a table named "users" or "posts"
             prop_assert!(stmt.table_name != "users");
             prop_assert!(stmt.table_name != "posts");
@@ -209,14 +213,14 @@ mod tests {
         }
 
         #[test]
-        fn generated_create_index_is_valid_sql(stmt in strategies::create_index_for_table(&test_schema().tables[0], &test_schema())) {
+        fn generated_create_index_is_valid_sql(stmt in strategies::create_index_for_table(&test_schema().tables[0], &test_schema(), &CreateIndexProfile::default())) {
             let sql = stmt.to_string();
             prop_assert!(sql.contains("INDEX"));
             prop_assert!(sql.contains("ON \"users\""));
         }
 
         #[test]
-        fn generated_create_index_for_schema_is_valid(stmt in strategies::create_index(&test_schema())) {
+        fn generated_create_index_for_schema_is_valid(stmt in strategies::create_index(&test_schema(), &CreateIndexProfile::default())) {
             let sql = stmt.to_string();
             prop_assert!(sql.contains("INDEX"));
             // Should be on one of the existing tables
@@ -237,14 +241,14 @@ mod tests {
         }
 
         #[test]
-        fn generated_statement_for_schema(stmt in strategies::statement_for_schema(&test_schema(), None)) {
+        fn generated_statement_for_schema(stmt in strategies::statement_for_schema(&test_schema(), &profile::StatementProfile::default())) {
             let sql = stmt.to_string();
             // Should be a valid SQL statement
             prop_assert!(!sql.is_empty());
         }
 
         #[test]
-        fn generated_sequence_has_correct_length(stmts in strategies::statement_sequence(&test_schema(), None, 5..10)) {
+        fn generated_sequence_has_correct_length(stmts in strategies::statement_sequence(&test_schema(), &profile::StatementProfile::default(), 5..10)) {
             prop_assert!(stmts.len() >= 5 && stmts.len() < 10);
         }
     }

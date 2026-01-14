@@ -3,9 +3,63 @@
 use proptest::prelude::*;
 use std::fmt;
 
-use crate::expression::{Expression, ExpressionContext};
+use crate::expression::{Expression, ExpressionContext, ExpressionProfile};
 use crate::function::builtin_functions;
 use crate::schema::TableRef;
+
+// =============================================================================
+// INSERT STATEMENT PROFILE
+// =============================================================================
+
+/// Profile for controlling INSERT statement generation.
+#[derive(Debug, Clone)]
+pub struct InsertProfile {
+    /// Maximum depth for expressions in VALUES.
+    pub expression_max_depth: u32,
+    /// Whether to allow aggregate functions (usually false for INSERT).
+    pub allow_aggregates: bool,
+    /// Expression profile for value expressions.
+    pub expression_profile: ExpressionProfile,
+}
+
+impl Default for InsertProfile {
+    fn default() -> Self {
+        Self {
+            expression_max_depth: 2,
+            allow_aggregates: false,
+            expression_profile: ExpressionProfile::default(),
+        }
+    }
+}
+
+impl InsertProfile {
+    /// Create a profile for simple INSERT (values only, no functions).
+    pub fn simple() -> Self {
+        Self {
+            expression_max_depth: 0,
+            allow_aggregates: false,
+            expression_profile: ExpressionProfile::simple(),
+        }
+    }
+
+    /// Builder method to set expression max depth.
+    pub fn with_expression_max_depth(mut self, depth: u32) -> Self {
+        self.expression_max_depth = depth;
+        self
+    }
+
+    /// Builder method to set whether aggregates are allowed.
+    pub fn with_aggregates(mut self, allow: bool) -> Self {
+        self.allow_aggregates = allow;
+        self
+    }
+
+    /// Builder method to set expression profile.
+    pub fn with_expression_profile(mut self, profile: ExpressionProfile) -> Self {
+        self.expression_profile = profile;
+        self
+    }
+}
 
 /// An INSERT statement.
 #[derive(Debug, Clone)]
@@ -31,20 +85,25 @@ impl fmt::Display for InsertStatement {
     }
 }
 
-/// Generate an INSERT statement for a table with expression support.
-///
-/// This generates function calls and other expressions in the VALUES clause.
-pub fn insert_for_table(table: &TableRef) -> BoxedStrategy<InsertStatement> {
+/// Generate an INSERT statement for a table with profile.
+pub fn insert_for_table(
+    table: &TableRef,
+    profile: &InsertProfile,
+) -> BoxedStrategy<InsertStatement> {
     let table_name = table.name.clone();
     let columns = table.columns.clone();
     let functions = builtin_functions();
 
+    // Extract profile values
+    let expression_max_depth = profile.expression_max_depth;
+    let allow_aggregates = profile.allow_aggregates;
+
     let col_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
 
-    // Build expression context (no column refs for INSERT values, no aggregates)
+    // Build expression context (no column refs for INSERT values)
     let ctx = ExpressionContext::new(functions)
-        .with_max_depth(2)
-        .with_aggregates(false);
+        .with_max_depth(expression_max_depth)
+        .with_aggregates(allow_aggregates);
 
     let value_strategies: Vec<BoxedStrategy<Expression>> = columns
         .iter()
@@ -118,7 +177,7 @@ mod tests {
                         ColumnDef::new("name", DataType::Text),
                     ],
                 ).into();
-                insert_for_table(&table)
+                insert_for_table(&table, &InsertProfile::default())
             }
         ) {
             let sql = stmt.to_string();

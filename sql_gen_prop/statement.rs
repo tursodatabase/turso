@@ -241,47 +241,56 @@ impl SqlGeneratorKind for StatementKind {
     /// Builds a strategy for generating this statement kind.
     ///
     /// Caller must ensure `available(schema)` returns true before calling this.
-    /// The optional `profile` is used to pass sub-profiles (e.g., `alter_table.extra`)
+    /// The `profile` is used to pass sub-profiles (e.g., `alter_table.extra`)
     /// to statement generators that support fine-grained control.
     fn strategy<'a>(
         &self,
         schema: &Self::Context<'a>,
-        profile: Option<&Self::Profile>,
+        profile: &Self::Profile,
     ) -> BoxedStrategy<Self::Output> {
         let tables = schema.tables.clone();
         match self {
             // DML - all use expression generation
             StatementKind::Select => table_dml(tables, |t| {
-                select_for_table(t).prop_map(SqlStatement::Select).boxed()
+                select_for_table(t, &crate::select::SelectProfile::default())
+                    .prop_map(SqlStatement::Select)
+                    .boxed()
             }),
             StatementKind::Insert => table_dml(tables, |t| {
-                insert_for_table(t).prop_map(SqlStatement::Insert).boxed()
+                insert_for_table(t, &crate::insert::InsertProfile::default())
+                    .prop_map(SqlStatement::Insert)
+                    .boxed()
             }),
             StatementKind::Update => table_dml(tables, |t| {
-                update_for_table(t).prop_map(SqlStatement::Update).boxed()
+                update_for_table(t, &crate::update::UpdateProfile::default())
+                    .prop_map(SqlStatement::Update)
+                    .boxed()
             }),
             StatementKind::Delete => table_dml(tables, |t| {
-                delete_for_table(t).prop_map(SqlStatement::Delete).boxed()
+                delete_for_table(t, &crate::delete::DeleteProfile::default())
+                    .prop_map(SqlStatement::Delete)
+                    .boxed()
             }),
 
             // DDL - Tables
-            StatementKind::CreateTable => create_table(schema)
-                .prop_map(SqlStatement::CreateTable)
-                .boxed(),
+            StatementKind::CreateTable => {
+                create_table(schema, &crate::create_table::CreateTableProfile::default())
+                    .prop_map(SqlStatement::CreateTable)
+                    .boxed()
+            }
             StatementKind::DropTable => drop_table_for_schema(schema)
                 .prop_map(SqlStatement::DropTable)
                 .boxed(),
-            StatementKind::AlterTable => {
-                let op_weights = profile.and_then(|p| p.alter_table.extra.as_ref());
-                alter_table_for_schema(schema, op_weights)
-                    .prop_map(SqlStatement::AlterTable)
-                    .boxed()
-            }
+            StatementKind::AlterTable => alter_table_for_schema(schema, &profile.alter_table.extra)
+                .prop_map(SqlStatement::AlterTable)
+                .boxed(),
 
             // DDL - Indexes
-            StatementKind::CreateIndex => create_index(schema)
-                .prop_map(SqlStatement::CreateIndex)
-                .boxed(),
+            StatementKind::CreateIndex => {
+                create_index(schema, &crate::create_index::CreateIndexProfile::default())
+                    .prop_map(SqlStatement::CreateIndex)
+                    .boxed()
+            }
             StatementKind::DropIndex => {
                 let index_names: Vec<String> =
                     schema.indexes.iter().map(|i| i.name.clone()).collect();
@@ -304,12 +313,9 @@ impl SqlGeneratorKind for StatementKind {
                 .boxed(),
 
             // DDL - Triggers
-            StatementKind::CreateTrigger => {
-                let op_weights = profile.and_then(|p| p.create_trigger.extra.as_ref());
-                create_trigger_for_schema(schema, op_weights)
-                    .prop_map(SqlStatement::CreateTrigger)
-                    .boxed()
-            }
+            StatementKind::CreateTrigger => create_trigger_for_schema(schema, profile)
+                .prop_map(SqlStatement::CreateTrigger)
+                .boxed(),
             StatementKind::DropTrigger => drop_trigger_for_schema(schema)
                 .prop_map(SqlStatement::DropTrigger)
                 .boxed(),
@@ -354,10 +360,14 @@ where
 /// Includes SELECT, INSERT, UPDATE, DELETE with expression support.
 pub fn dml_for_table(table: &TableRef) -> BoxedStrategy<SqlStatement> {
     prop_oneof![
-        select_for_table(table).prop_map(SqlStatement::Select),
-        insert_for_table(table).prop_map(SqlStatement::Insert),
-        update_for_table(table).prop_map(SqlStatement::Update),
-        delete_for_table(table).prop_map(SqlStatement::Delete),
+        select_for_table(table, &crate::select::SelectProfile::default())
+            .prop_map(SqlStatement::Select),
+        insert_for_table(table, &crate::insert::InsertProfile::default())
+            .prop_map(SqlStatement::Insert),
+        update_for_table(table, &crate::update::UpdateProfile::default())
+            .prop_map(SqlStatement::Update),
+        delete_for_table(table, &crate::delete::DeleteProfile::default())
+            .prop_map(SqlStatement::Delete),
     ]
     .boxed()
 }
@@ -365,11 +375,20 @@ pub fn dml_for_table(table: &TableRef) -> BoxedStrategy<SqlStatement> {
 /// Generate any SQL statement for a table, using schema context for safe DDL generation.
 pub fn statement_for_table(table: &TableRef, schema: &Schema) -> BoxedStrategy<SqlStatement> {
     prop_oneof![
-        select_for_table(table).prop_map(SqlStatement::Select),
-        insert_for_table(table).prop_map(SqlStatement::Insert),
-        update_for_table(table).prop_map(SqlStatement::Update),
-        delete_for_table(table).prop_map(SqlStatement::Delete),
-        create_index_for_table(table, schema).prop_map(SqlStatement::CreateIndex),
+        select_for_table(table, &crate::select::SelectProfile::default())
+            .prop_map(SqlStatement::Select),
+        insert_for_table(table, &crate::insert::InsertProfile::default())
+            .prop_map(SqlStatement::Insert),
+        update_for_table(table, &crate::update::UpdateProfile::default())
+            .prop_map(SqlStatement::Update),
+        delete_for_table(table, &crate::delete::DeleteProfile::default())
+            .prop_map(SqlStatement::Delete),
+        create_index_for_table(
+            table,
+            schema,
+            &crate::create_index::CreateIndexProfile::default()
+        )
+        .prop_map(SqlStatement::CreateIndex),
         drop_table_for_table(table).prop_map(SqlStatement::DropTable),
     ]
     .boxed()
@@ -388,22 +407,18 @@ pub fn dml_for_schema(schema: &Schema) -> BoxedStrategy<SqlStatement> {
     proptest::strategy::Union::new(table_strategies).boxed()
 }
 
-/// Generate any SQL statement for a schema with an optional profile.
+/// Generate any SQL statement for a schema with a profile.
 ///
-/// When `profile` is `None`, uses default weights for all applicable statement types.
-/// When `profile` is `Some`, uses the specified weights to control statement distribution.
-///
+/// Uses the specified profile weights to control statement distribution.
 /// Schema constraints are enforced via `StatementKind::is_available`.
 pub fn statement_for_schema(
     schema: &Schema,
-    profile: Option<&StatementProfile>,
+    profile: &StatementProfile,
 ) -> BoxedStrategy<SqlStatement> {
-    let p = profile.cloned().unwrap_or_default();
-
-    let strategies: Vec<(u32, BoxedStrategy<SqlStatement>)> = p
+    let strategies: Vec<(u32, BoxedStrategy<SqlStatement>)> = profile
         .enabled_statements()
         .filter(|(kind, _)| kind.supported() && kind.available(schema))
-        .map(|(kind, weight)| (weight, kind.strategy(schema, Some(&p))))
+        .map(|(kind, weight)| (weight, kind.strategy(schema, profile)))
         .collect();
 
     assert!(
@@ -414,16 +429,16 @@ pub fn statement_for_schema(
     proptest::strategy::Union::new_weighted(strategies).boxed()
 }
 
-/// Generate a sequence of SQL statements for a schema with an optional profile.
+/// Generate a sequence of SQL statements for a schema with a profile.
 pub fn statement_sequence(
     schema: &Schema,
-    profile: Option<&StatementProfile>,
+    profile: &StatementProfile,
     count: impl Into<proptest::collection::SizeRange>,
 ) -> BoxedStrategy<Vec<SqlStatement>> {
-    let profile = profile.cloned().unwrap_or_default();
+    let profile = profile.clone();
     let schema = schema.clone();
     proptest::collection::vec(
-        proptest::strategy::LazyJust::new(move || statement_for_schema(&schema, Some(&profile)))
+        proptest::strategy::LazyJust::new(move || statement_for_schema(&schema, &profile))
             .prop_flat_map(|s| s),
         count,
     )

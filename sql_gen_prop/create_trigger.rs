@@ -17,7 +17,7 @@ use crate::insert::insert_for_table;
 use crate::schema::{Schema, TableRef};
 use crate::select::select_for_table;
 use crate::update::update_for_table;
-use crate::{DeleteStatement, InsertStatement, SelectStatement, UpdateStatement};
+use crate::{DeleteStatement, InsertStatement, SelectStatement, StatementProfile, UpdateStatement};
 
 /// Context needed for CREATE TRIGGER generation.
 #[derive(Debug, Clone)]
@@ -107,7 +107,7 @@ impl CreateTriggerKind {
 impl SqlGeneratorKind for CreateTriggerKind {
     type Context<'a> = CreateTriggerContext<'a>;
     type Output = CreateTriggerStatement;
-    type Profile = ();
+    type Profile = StatementProfile;
 
     fn available(&self, _ctx: &Self::Context<'_>) -> bool {
         // All trigger kinds are available if we have a table
@@ -128,9 +128,15 @@ impl SqlGeneratorKind for CreateTriggerKind {
     fn strategy<'a>(
         &self,
         ctx: &Self::Context<'_>,
-        _profile: Option<&Self::Profile>,
+        profile: &Self::Profile,
     ) -> BoxedStrategy<Self::Output> {
-        create_trigger_with_timing_event(ctx.table, ctx.schema, self.timing(), self.event())
+        create_trigger_with_timing_event(
+            ctx.table,
+            ctx.schema,
+            profile,
+            self.timing(),
+            self.event(),
+        )
     }
 }
 
@@ -245,6 +251,61 @@ impl CreateTriggerOpWeights {
     }
 }
 
+// =============================================================================
+// CREATE TRIGGER PROFILE
+// =============================================================================
+
+/// Profile for controlling CREATE TRIGGER statement generation.
+#[derive(Debug, Clone)]
+pub struct CreateTriggerProfile {
+    /// Operation weights for trigger types.
+    pub op_weights: CreateTriggerOpWeights,
+    /// Range for number of statements in trigger body.
+    pub body_statement_count_range: std::ops::RangeInclusive<usize>,
+}
+
+impl Default for CreateTriggerProfile {
+    fn default() -> Self {
+        Self {
+            op_weights: CreateTriggerOpWeights::default(),
+            body_statement_count_range: 1..=3,
+        }
+    }
+}
+
+impl CreateTriggerProfile {
+    /// Create a profile with minimal trigger bodies.
+    pub fn minimal() -> Self {
+        Self {
+            op_weights: CreateTriggerOpWeights::default(),
+            body_statement_count_range: 1..=1,
+        }
+    }
+
+    /// Create a profile with complex trigger bodies.
+    pub fn complex() -> Self {
+        Self {
+            op_weights: CreateTriggerOpWeights::default(),
+            body_statement_count_range: 2..=5,
+        }
+    }
+
+    /// Builder method to set operation weights.
+    pub fn with_op_weights(mut self, weights: CreateTriggerOpWeights) -> Self {
+        self.op_weights = weights;
+        self
+    }
+
+    /// Builder method to set body statement count range.
+    pub fn with_body_statement_count_range(
+        mut self,
+        range: std::ops::RangeInclusive<usize>,
+    ) -> Self {
+        self.body_statement_count_range = range;
+        self
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum TriggerSqlStatement {
     Select(SelectStatement),
@@ -314,14 +375,17 @@ pub fn trigger_event() -> impl Strategy<Value = TriggerEvent> {
 }
 
 /// Generate a trigger body containing valid DML statements.
-fn trigger_body(table: &TableRef) -> BoxedStrategy<Vec<TriggerSqlStatement>> {
+fn trigger_body(
+    table: &TableRef,
+    profile: &StatementProfile,
+) -> BoxedStrategy<Vec<TriggerSqlStatement>> {
     // Generate 1-3 DML statements for the trigger body
     proptest::collection::vec(
         prop_oneof![
-            select_for_table(&table).prop_map(TriggerSqlStatement::Select),
-            insert_for_table(&table).prop_map(TriggerSqlStatement::Insert),
-            update_for_table(&table).prop_map(TriggerSqlStatement::Update),
-            delete_for_table(&table).prop_map(TriggerSqlStatement::Delete),
+            select_for_table(table, profile.select_profile()).prop_map(TriggerSqlStatement::Select),
+            insert_for_table(table, profile.insert_profile()).prop_map(TriggerSqlStatement::Insert),
+            update_for_table(table, profile.update_profile()).prop_map(TriggerSqlStatement::Update),
+            delete_for_table(table, profile.delete_profile()).prop_map(TriggerSqlStatement::Delete),
         ],
         1..=3,
     )
@@ -332,6 +396,7 @@ fn trigger_body(table: &TableRef) -> BoxedStrategy<Vec<TriggerSqlStatement>> {
 pub fn create_trigger_with_timing_event(
     table: &TableRef,
     schema: &Schema,
+    profile: &StatementProfile,
     timing: TriggerTiming,
     event: TriggerEvent,
 ) -> BoxedStrategy<CreateTriggerStatement> {
@@ -341,7 +406,7 @@ pub fn create_trigger_with_timing_event(
     (
         identifier_excluding(existing_triggers),
         any::<bool>(),
-        trigger_body(table),
+        trigger_body(table, profile),
     )
         .prop_map(move |(name, if_not_exists, body)| CreateTriggerStatement {
             name,
@@ -358,15 +423,15 @@ pub fn create_trigger_with_timing_event(
 pub fn create_trigger_for_table(
     table: &TableRef,
     schema: &Schema,
-    op_weights: Option<&CreateTriggerOpWeights>,
+    profile: &StatementProfile,
 ) -> BoxedStrategy<CreateTriggerStatement> {
-    let w = op_weights.cloned().unwrap_or_default();
+    let w = &profile.create_trigger_profile().op_weights;
     let ctx = CreateTriggerContext { table, schema };
 
     let strategies: Vec<(u32, BoxedStrategy<CreateTriggerStatement>)> = w
         .enabled_operations()
         .filter(|(kind, _)| kind.supported() && kind.available(&ctx))
-        .map(|(kind, weight)| (weight, kind.strategy(&ctx, None)))
+        .map(|(kind, weight)| (weight, kind.strategy(&ctx, profile)))
         .collect();
 
     assert!(
@@ -380,7 +445,7 @@ pub fn create_trigger_for_table(
 /// Generate a CREATE TRIGGER statement for any table in the schema.
 pub fn create_trigger_for_schema(
     schema: &Schema,
-    op_weights: Option<&CreateTriggerOpWeights>,
+    profile: &StatementProfile,
 ) -> BoxedStrategy<CreateTriggerStatement> {
     assert!(
         !schema.tables.is_empty(),
@@ -389,11 +454,9 @@ pub fn create_trigger_for_schema(
 
     let tables = schema.tables.clone();
     let schema_clone = schema.clone();
-    let op_weights_clone = op_weights.cloned();
+    let profile = profile.clone();
     proptest::sample::select((*tables).clone())
-        .prop_flat_map(move |table| {
-            create_trigger_for_table(&table, &schema_clone, op_weights_clone.as_ref())
-        })
+        .prop_flat_map(move |table| create_trigger_for_table(&table, &schema_clone, &profile))
         .boxed()
 }
 
@@ -422,7 +485,7 @@ mod tests {
 
     proptest! {
         #[test]
-        fn create_trigger_generates_valid_sql(stmt in create_trigger_for_table(&test_table().into(), &test_schema(), None)) {
+        fn create_trigger_generates_valid_sql(stmt in create_trigger_for_table(&test_table().into(), &test_schema(), &Default::default())) {
             let sql = stmt.to_string();
             prop_assert!(sql.starts_with("CREATE TRIGGER"));
             prop_assert!(sql.contains("ON \"users\""));
@@ -430,20 +493,24 @@ mod tests {
         }
 
         #[test]
-        fn create_trigger_for_schema_generates_valid_sql(stmt in create_trigger_for_schema(&test_schema(), None)) {
+        fn create_trigger_for_schema_generates_valid_sql(stmt in create_trigger_for_schema(&test_schema(), &Default::default())) {
             let sql = stmt.to_string();
             prop_assert!(sql.starts_with("CREATE TRIGGER"));
             prop_assert!(sql.contains("BEGIN") && sql.contains("END"));
         }
 
         #[test]
-        fn create_trigger_before_only(stmt in create_trigger_for_table(
+        fn create_trigger_before_only(stmt in {
+            let mut profile = StatementProfile::default();
+            profile.create_trigger.extra.op_weights = CreateTriggerOpWeights::none()
+                .with_before_insert(50)
+                .with_before_update(50);
+            create_trigger_for_table(
             &test_table().into(),
             &test_schema(),
-            Some(&CreateTriggerOpWeights::none()
-                .with_before_insert(50)
-                .with_before_update(50))
-        )) {
+            &Default::default())
+        }
+        ) {
             let sql = stmt.to_string();
             prop_assert!(sql.contains("BEFORE"));
         }
