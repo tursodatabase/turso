@@ -5,7 +5,7 @@ use std::fmt;
 
 use crate::expression::{Expression, ExpressionContext};
 use crate::function::FunctionRegistry;
-use crate::schema::{ColumnDef, Table};
+use crate::schema::{ColumnDef, TableRef};
 use crate::value::{SqlValue, value_for_type};
 
 /// Comparison operators for WHERE clauses.
@@ -246,7 +246,7 @@ pub fn expression_condition(
 }
 
 /// Generate a condition tree for a table (recursive, bounded depth).
-pub fn condition_for_table(table: &Table, max_depth: u32) -> BoxedStrategy<Condition> {
+pub fn condition_for_table(table: &TableRef, max_depth: u32) -> BoxedStrategy<Condition> {
     let filterable = table.filterable_columns().collect::<Vec<_>>();
     if filterable.is_empty() {
         // No filterable columns: generate a tautology
@@ -279,7 +279,7 @@ pub fn condition_for_table(table: &Table, max_depth: u32) -> BoxedStrategy<Condi
 
 /// Generate a condition tree for a table with expression support.
 pub fn condition_for_table_with_expressions(
-    table: &Table,
+    table: &TableRef,
     functions: &FunctionRegistry,
     max_depth: u32,
 ) -> BoxedStrategy<Condition> {
@@ -320,7 +320,7 @@ pub fn condition_for_table_with_expressions(
 }
 
 /// Generate an optional WHERE clause for a table.
-pub fn optional_where_clause(table: &Table) -> BoxedStrategy<Option<Condition>> {
+pub fn optional_where_clause(table: &TableRef) -> BoxedStrategy<Option<Condition>> {
     let table_clone = table.clone();
     prop_oneof![
         Just(None),
@@ -331,7 +331,7 @@ pub fn optional_where_clause(table: &Table) -> BoxedStrategy<Option<Condition>> 
 
 /// Generate an optional WHERE clause for a table with expression support.
 pub fn optional_where_clause_with_expressions(
-    table: &Table,
+    table: &TableRef,
     functions: &FunctionRegistry,
 ) -> BoxedStrategy<Option<Condition>> {
     let table_clone = table.clone();
@@ -344,7 +344,7 @@ pub fn optional_where_clause_with_expressions(
 }
 
 /// Generate ORDER BY items for a table (simple column references).
-pub fn order_by_for_table(table: &Table) -> BoxedStrategy<Vec<OrderByItem>> {
+pub fn order_by_for_table(table: &TableRef) -> BoxedStrategy<Vec<OrderByItem>> {
     let filterable = table.filterable_columns().collect::<Vec<_>>();
     if filterable.is_empty() {
         return Just(vec![]).boxed();
@@ -378,7 +378,7 @@ pub fn order_by_for_table(table: &Table) -> BoxedStrategy<Vec<OrderByItem>> {
 
 /// Generate ORDER BY items for a table with expression support.
 pub fn order_by_for_table_with_expressions(
-    table: &Table,
+    table: &TableRef,
     functions: &FunctionRegistry,
 ) -> BoxedStrategy<Vec<OrderByItem>> {
     let filterable = table.filterable_columns().collect::<Vec<_>>();

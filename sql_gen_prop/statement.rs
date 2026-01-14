@@ -15,7 +15,7 @@ use crate::drop_trigger::{DropTriggerStatement, drop_trigger_for_schema};
 use crate::generator::SqlGeneratorKind;
 use crate::insert::{InsertStatement, insert_for_table};
 use crate::profile::StatementProfile;
-use crate::schema::{Schema, Table};
+use crate::schema::{Schema, TableRef};
 use crate::select::{SelectStatement, select_for_table};
 use crate::transaction::{
     BeginStatement, CommitStatement, ReleaseStatement, RollbackStatement, SavepointStatement,
@@ -341,9 +341,9 @@ impl SqlGeneratorKind for StatementKind {
 }
 
 /// Helper to create a table-based DML strategy.
-fn table_dml<F>(tables: Rc<Vec<Table>>, f: F) -> BoxedStrategy<SqlStatement>
+fn table_dml<F>(tables: Rc<Vec<TableRef>>, f: F) -> BoxedStrategy<SqlStatement>
 where
-    F: Fn(&Table) -> BoxedStrategy<SqlStatement> + 'static,
+    F: Fn(&TableRef) -> BoxedStrategy<SqlStatement> + 'static,
 {
     proptest::sample::select((*tables).clone())
         .prop_flat_map(move |t| f(&t))
@@ -352,7 +352,7 @@ where
 
 /// Generate a DML (Data Manipulation Language) statement for a table.
 /// Includes SELECT, INSERT, UPDATE, DELETE with expression support.
-pub fn dml_for_table(table: &Table) -> BoxedStrategy<SqlStatement> {
+pub fn dml_for_table(table: &TableRef) -> BoxedStrategy<SqlStatement> {
     prop_oneof![
         select_for_table(table).prop_map(SqlStatement::Select),
         insert_for_table(table).prop_map(SqlStatement::Insert),
@@ -363,7 +363,7 @@ pub fn dml_for_table(table: &Table) -> BoxedStrategy<SqlStatement> {
 }
 
 /// Generate any SQL statement for a table, using schema context for safe DDL generation.
-pub fn statement_for_table(table: &Table, schema: &Schema) -> BoxedStrategy<SqlStatement> {
+pub fn statement_for_table(table: &TableRef, schema: &Schema) -> BoxedStrategy<SqlStatement> {
     prop_oneof![
         select_for_table(table).prop_map(SqlStatement::Select),
         insert_for_table(table).prop_map(SqlStatement::Insert),

@@ -4,7 +4,7 @@ use proptest::prelude::*;
 use std::fmt;
 
 use crate::condition::{Condition, optional_where_clause};
-use crate::schema::Table;
+use crate::schema::TableRef;
 
 /// A DELETE statement.
 #[derive(Debug, Clone)]
@@ -26,7 +26,7 @@ impl fmt::Display for DeleteStatement {
 }
 
 /// Generate a DELETE statement for a table.
-pub fn delete_for_table(table: &Table) -> BoxedStrategy<DeleteStatement> {
+pub fn delete_for_table(table: &TableRef) -> BoxedStrategy<DeleteStatement> {
     let table_name = table.name.clone();
 
     optional_where_clause(table)

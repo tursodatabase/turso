@@ -5,7 +5,7 @@ use std::fmt;
 
 use crate::expression::{Expression, ExpressionContext};
 use crate::function::builtin_functions;
-use crate::schema::Table;
+use crate::schema::TableRef;
 
 /// An INSERT statement.
 #[derive(Debug, Clone)]
@@ -34,7 +34,7 @@ impl fmt::Display for InsertStatement {
 /// Generate an INSERT statement for a table with expression support.
 ///
 /// This generates function calls and other expressions in the VALUES clause.
-pub fn insert_for_table(table: &Table) -> BoxedStrategy<InsertStatement> {
+pub fn insert_for_table(table: &TableRef) -> BoxedStrategy<InsertStatement> {
     let table_name = table.name.clone();
     let columns = table.columns.clone();
     let functions = builtin_functions();
@@ -117,7 +117,7 @@ mod tests {
                         ColumnDef::new("id", DataType::Integer).primary_key(),
                         ColumnDef::new("name", DataType::Text),
                     ],
-                );
+                ).into();
                 insert_for_table(&table)
             }
         ) {

@@ -4,7 +4,7 @@ use proptest::prelude::*;
 use std::fmt;
 
 use crate::create_table::identifier;
-use crate::schema::{Schema, Table};
+use crate::schema::{Schema, TableRef};
 
 /// A DROP TABLE statement.
 #[derive(Debug, Clone)]
@@ -26,7 +26,7 @@ impl fmt::Display for DropTableStatement {
 }
 
 /// Generate a DROP TABLE statement for a specific table.
-pub fn drop_table_for_table(table: &Table) -> BoxedStrategy<DropTableStatement> {
+pub fn drop_table_for_table(table: &TableRef) -> BoxedStrategy<DropTableStatement> {
     let table_name = table.name.clone();
 
     any::<bool>()

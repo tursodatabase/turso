@@ -14,7 +14,7 @@ use crate::create_table::identifier_excluding;
 use crate::delete::delete_for_table;
 use crate::generator::SqlGeneratorKind;
 use crate::insert::insert_for_table;
-use crate::schema::{Schema, Table};
+use crate::schema::{Schema, TableRef};
 use crate::select::select_for_table;
 use crate::update::update_for_table;
 use crate::{DeleteStatement, InsertStatement, SelectStatement, UpdateStatement};
@@ -23,7 +23,7 @@ use crate::{DeleteStatement, InsertStatement, SelectStatement, UpdateStatement};
 #[derive(Debug, Clone)]
 pub struct CreateTriggerContext<'a> {
     /// The table to create triggers on.
-    pub table: &'a Table,
+    pub table: &'a TableRef,
     /// The schema containing the table.
     pub schema: &'a Schema,
 }
@@ -314,15 +314,14 @@ pub fn trigger_event() -> impl Strategy<Value = TriggerEvent> {
 }
 
 /// Generate a trigger body containing valid DML statements.
-fn trigger_body(table: &Table) -> BoxedStrategy<Vec<TriggerSqlStatement>> {
+fn trigger_body(table: &TableRef) -> BoxedStrategy<Vec<TriggerSqlStatement>> {
     // Generate 1-3 DML statements for the trigger body
-    let table_clone = table.clone();
     proptest::collection::vec(
         prop_oneof![
-            select_for_table(&table_clone).prop_map(TriggerSqlStatement::Select),
-            insert_for_table(&table_clone).prop_map(TriggerSqlStatement::Insert),
-            update_for_table(&table_clone).prop_map(TriggerSqlStatement::Update),
-            delete_for_table(&table_clone).prop_map(TriggerSqlStatement::Delete),
+            select_for_table(&table).prop_map(TriggerSqlStatement::Select),
+            insert_for_table(&table).prop_map(TriggerSqlStatement::Insert),
+            update_for_table(&table).prop_map(TriggerSqlStatement::Update),
+            delete_for_table(&table).prop_map(TriggerSqlStatement::Delete),
         ],
         1..=3,
     )
@@ -331,7 +330,7 @@ fn trigger_body(table: &Table) -> BoxedStrategy<Vec<TriggerSqlStatement>> {
 
 /// Generate a CREATE TRIGGER statement with specific timing and event.
 pub fn create_trigger_with_timing_event(
-    table: &Table,
+    table: &TableRef,
     schema: &Schema,
     timing: TriggerTiming,
     event: TriggerEvent,
@@ -357,7 +356,7 @@ pub fn create_trigger_with_timing_event(
 
 /// Generate a CREATE TRIGGER statement for a table with optional operation weights.
 pub fn create_trigger_for_table(
-    table: &Table,
+    table: &TableRef,
     schema: &Schema,
     op_weights: Option<&CreateTriggerOpWeights>,
 ) -> BoxedStrategy<CreateTriggerStatement> {
@@ -401,7 +400,10 @@ pub fn create_trigger_for_schema(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::schema::{ColumnDef, DataType, SchemaBuilder};
+    use crate::{
+        Table,
+        schema::{ColumnDef, DataType, SchemaBuilder},
+    };
 
     fn test_table() -> Table {
         Table::new(
@@ -420,7 +422,7 @@ mod tests {
 
     proptest! {
         #[test]
-        fn create_trigger_generates_valid_sql(stmt in create_trigger_for_table(&test_table(), &test_schema(), None)) {
+        fn create_trigger_generates_valid_sql(stmt in create_trigger_for_table(&test_table().into(), &test_schema(), None)) {
             let sql = stmt.to_string();
             prop_assert!(sql.starts_with("CREATE TRIGGER"));
             prop_assert!(sql.contains("ON \"users\""));
@@ -436,7 +438,7 @@ mod tests {
 
         #[test]
         fn create_trigger_before_only(stmt in create_trigger_for_table(
-            &test_table(),
+            &test_table().into(),
             &test_schema(),
             Some(&CreateTriggerOpWeights::none()
                 .with_before_insert(50)

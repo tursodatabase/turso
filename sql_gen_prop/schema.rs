@@ -4,6 +4,11 @@ use std::collections::HashSet;
 use std::fmt;
 use std::rc::Rc;
 
+pub type TableRef = Rc<Table>;
+pub type IndexRef = Rc<Index>;
+pub type ViewRef = Rc<View>;
+pub type TriggerRef = Rc<Trigger>;
+
 /// SQL data types supported by the generator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DataType {
@@ -193,10 +198,10 @@ impl Trigger {
 /// Builder for constructing a schema.
 #[derive(Debug, Default)]
 pub struct SchemaBuilder {
-    tables: Vec<Table>,
-    indexes: Vec<Index>,
-    views: Vec<View>,
-    triggers: Vec<Trigger>,
+    tables: Vec<TableRef>,
+    indexes: Vec<IndexRef>,
+    views: Vec<ViewRef>,
+    triggers: Vec<TriggerRef>,
 }
 
 impl SchemaBuilder {
@@ -205,22 +210,22 @@ impl SchemaBuilder {
     }
 
     pub fn add_table(mut self, table: Table) -> Self {
-        self.tables.push(table);
+        self.tables.push(Rc::new(table));
         self
     }
 
     pub fn add_index(mut self, index: Index) -> Self {
-        self.indexes.push(index);
+        self.indexes.push(Rc::new(index));
         self
     }
 
     pub fn add_view(mut self, view: View) -> Self {
-        self.views.push(view);
+        self.views.push(Rc::new(view));
         self
     }
 
     pub fn add_trigger(mut self, trigger: Trigger) -> Self {
-        self.triggers.push(trigger);
+        self.triggers.push(Rc::new(trigger));
         self
     }
 
@@ -240,10 +245,10 @@ impl SchemaBuilder {
 /// Use `SchemaBuilder` to construct a schema.
 #[derive(Debug, Clone)]
 pub struct Schema {
-    pub tables: Rc<Vec<Table>>,
-    pub indexes: Rc<Vec<Index>>,
-    pub views: Rc<Vec<View>>,
-    pub triggers: Rc<Vec<Trigger>>,
+    pub tables: Rc<Vec<TableRef>>,
+    pub indexes: Rc<Vec<IndexRef>>,
+    pub views: Rc<Vec<ViewRef>>,
+    pub triggers: Rc<Vec<TriggerRef>>,
 }
 
 impl Default for Schema {
@@ -269,17 +274,17 @@ impl Schema {
     }
 
     /// Returns a table by name.
-    pub fn get_table(&self, name: &str) -> Option<&Table> {
+    pub fn get_table(&self, name: &str) -> Option<&TableRef> {
         self.tables.iter().find(|t| t.name == name)
     }
 
     /// Returns a view by name.
-    pub fn get_view(&self, name: &str) -> Option<&View> {
+    pub fn get_view(&self, name: &str) -> Option<&ViewRef> {
         self.views.iter().find(|v| v.name == name)
     }
 
     /// Returns indexes for a specific table.
-    pub fn indexes_for_table(&self, table_name: &str) -> Vec<&Index> {
+    pub fn indexes_for_table(&self, table_name: &str) -> Vec<&IndexRef> {
         self.indexes
             .iter()
             .filter(|i| i.table_name == table_name)
@@ -292,7 +297,7 @@ impl Schema {
     }
 
     /// Returns triggers for a specific table.
-    pub fn triggers_for_table(&self, table_name: &str) -> Vec<&Trigger> {
+    pub fn triggers_for_table(&self, table_name: &str) -> Vec<&TriggerRef> {
         self.triggers
             .iter()
             .filter(|t| t.table_name == table_name)

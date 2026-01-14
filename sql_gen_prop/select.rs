@@ -6,7 +6,7 @@ use std::fmt;
 use crate::condition::{Condition, OrderByItem, optional_where_clause, order_by_for_table};
 use crate::expression::{Expression, ExpressionContext};
 use crate::function::builtin_functions;
-use crate::schema::Table;
+use crate::schema::TableRef;
 
 /// A SELECT statement.
 #[derive(Debug, Clone)]
@@ -67,7 +67,7 @@ impl fmt::Display for SelectStatement {
 /// Generate a SELECT statement for a table with expression support.
 ///
 /// This generates function calls and other expressions in the SELECT list.
-pub fn select_for_table(table: &Table) -> BoxedStrategy<SelectStatement> {
+pub fn select_for_table(table: &TableRef) -> BoxedStrategy<SelectStatement> {
     let table_name = table.name.clone();
     let col_names: Vec<String> = table.columns.iter().map(|c| c.name.clone()).collect();
     let functions = builtin_functions();
@@ -169,7 +169,7 @@ mod tests {
                         crate::schema::ColumnDef::new("name", crate::schema::DataType::Text),
                         crate::schema::ColumnDef::new("age", crate::schema::DataType::Integer),
                     ],
-                );
+                ).into();
                 select_for_table(&table)
             }
         ) {
@@ -191,7 +191,8 @@ mod tests {
                 crate::schema::ColumnDef::new("name", crate::schema::DataType::Text),
                 crate::schema::ColumnDef::new("age", crate::schema::DataType::Integer),
             ],
-        );
+        )
+        .into();
         let strategy = select_for_table(&table);
 
         let mut runner = TestRunner::default();

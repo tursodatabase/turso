@@ -6,7 +6,7 @@ use std::fmt;
 use crate::condition::{Condition, optional_where_clause};
 use crate::expression::{Expression, ExpressionContext};
 use crate::function::builtin_functions;
-use crate::schema::{ColumnDef, Table};
+use crate::schema::{ColumnDef, TableRef};
 
 /// An UPDATE statement.
 #[derive(Debug, Clone)]
@@ -39,7 +39,7 @@ impl fmt::Display for UpdateStatement {
 /// Generate an UPDATE statement for a table with expression support.
 ///
 /// This generates function calls and other expressions in SET values.
-pub fn update_for_table(table: &Table) -> BoxedStrategy<UpdateStatement> {
+pub fn update_for_table(table: &TableRef) -> BoxedStrategy<UpdateStatement> {
     let table_name = table.name.clone();
     let updatable: Vec<ColumnDef> = table.updatable_columns().cloned().collect();
     let functions = builtin_functions();
@@ -97,6 +97,7 @@ pub fn update_for_table(table: &Table) -> BoxedStrategy<UpdateStatement> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Table;
     use crate::condition::ComparisonOp;
     use crate::schema::DataType;
     use crate::value::SqlValue;
@@ -152,7 +153,7 @@ mod tests {
                         ColumnDef::new("name", DataType::Text),
                         ColumnDef::new("age", DataType::Integer),
                     ],
-                );
+                ).into();
                 update_for_table(&table)
             }
         ) {

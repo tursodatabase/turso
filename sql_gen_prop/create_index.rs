@@ -5,7 +5,7 @@ use std::fmt;
 
 use crate::condition::OrderDirection;
 use crate::create_table::identifier_excluding;
-use crate::schema::{Schema, Table};
+use crate::schema::{Schema, TableRef};
 
 /// A column reference in an index.
 #[derive(Debug, Clone)]
@@ -69,7 +69,7 @@ pub fn index_column(col_name: String) -> impl Strategy<Value = IndexColumn> {
 
 /// Generate a CREATE INDEX statement for a specific table, avoiding existing index names.
 pub fn create_index_for_table(
-    table: &Table,
+    table: &TableRef,
     schema: &Schema,
 ) -> BoxedStrategy<CreateIndexStatement> {
     let table_name = table.name.clone();
