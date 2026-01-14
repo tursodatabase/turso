@@ -10879,7 +10879,11 @@ fn op_journal_mode_inner(
                 // Setup new mode
                 if matches!(new_mode, journal_mode::JournalMode::ExperimentalMvcc) {
                     let db_path = program.connection.get_database_canonical_path();
-                    let mv_store = journal_mode::open_mv_store(pager.io.as_ref(), &db_path)?;
+                    let mv_store = journal_mode::open_mv_store(
+                        pager.io.as_ref(),
+                        &db_path,
+                        program.connection.db.open_flags,
+                    )?;
                     program.connection.db.mv_store.store(Some(mv_store.clone()));
                     program.connection.demote_to_mvcc_connection();
                     mv_store.bootstrap(program.connection.clone())?;

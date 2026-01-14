@@ -1,0 +1,63 @@
+@database :default:
+
+test schema {
+    .schema
+}
+expect unordered {
+CREATE TABLE users (id INTEGER PRIMARY KEY, first_name TEXT, last_name TEXT, email TEXT, phone_number TEXT, address TEXT, city TEXT, state TEXT, zipcode TEXT, age INTEGER);
+CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, price REAL);
+CREATE INDEX age_idx ON users (age);
+}
+
+# FIXME sqlite does something different with .schema than what we are doing
+#do_execsql_test_on_specific_db testing/testing_norowidalias.db schema {
+#  .schema
+#} {"CREATE TABLE IF NOT EXISTS users (
+#        id INT PRIMARY KEY,
+#        first_name TEXT,
+#        last_name TEXT,
+#        email TEXT,
+#        phone_number TEXT,
+#        address TEXT,
+#        city TEXT,
+#        state TEXT,
+#        zipcode TEXT,
+#        age INTEGER
+#    );
+#CREATE TABLE IF NOT EXISTS products (
+#        id INT PRIMARY KEY,
+#        name TEXT,
+#        price REAL
+#    );
+#CREATE INDEX age_idx2 on users (age);"}
+test schema-1 {
+    .schema users
+}
+expect raw {
+CREATE TABLE users (id INTEGER PRIMARY KEY, first_name TEXT, last_name TEXT, email TEXT, phone_number TEXT, address TEXT, city TEXT, state TEXT, zipcode TEXT, age INTEGER);
+CREATE INDEX age_idx ON users (age);
+}
+
+# FIXME sqlite does something different with .schema than what we are doing
+#do_execsql_test_on_specific_db testing/testing_norowidalias.db schema-1 {
+#  .schema users
+#} {"CREATE TABLE IF NOT EXISTS users (
+#       id INT PRIMARY KEY,
+#       first_name TEXT,
+#       last_name TEXT,
+#       email TEXT,
+#       phone_number TEXT,
+#       address TEXT,
+#       city TEXT,
+#       state TEXT,
+#       zipcode TEXT,
+#       age INTEGER
+#   );
+#CREATE INDEX age_idx2 on users (age);"}
+test schema-2 {
+    .schema products
+}
+expect raw {
+CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, price REAL);
+}
+

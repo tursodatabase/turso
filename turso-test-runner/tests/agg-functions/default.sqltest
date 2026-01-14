@@ -1,0 +1,346 @@
+@database :default:
+@database :default-no-rowidalias:
+
+test select-avg {
+    SELECT avg(age) FROM users;
+}
+expect {
+    50.4576
+}
+
+test select-avg-text {
+    SELECT avg(first_name) FROM users;
+}
+expect {
+    0.0
+}
+
+test select-sum {
+    SELECT sum(age) FROM users;
+}
+expect {
+    504576
+}
+
+test select-sum-text {
+    SELECT sum(first_name) FROM users;
+}
+expect {
+    0.0
+}
+
+test select-total {
+    SELECT total(age) FROM users;
+}
+expect {
+    504576.0
+}
+
+test select-total-text {
+    SELECT total(first_name) FROM users WHERE id < 3;
+}
+expect {
+    0.0
+}
+
+test select-limit {
+    SELECT typeof(id) FROM users LIMIT 1;
+}
+expect {
+    integer
+}
+
+test select-count {
+    SELECT count(id) FROM users;
+}
+expect {
+    10000
+}
+
+test select-count-2 {
+    SELECT count(*) FROM users;
+}
+expect {
+    10000
+}
+
+test select-count-constant-true {
+    SELECT count(*) FROM users WHERE true;
+}
+expect {
+    10000
+}
+
+test select-count-constant-false {
+    SELECT count(*) FROM users WHERE false;
+}
+expect {
+    0
+}
+
+test select-max {
+    SELECT max(age) FROM users;
+}
+expect {
+    100
+}
+
+test select-min {
+    SELECT min(age) FROM users;
+}
+expect {
+    1
+}
+
+test select-max-text {
+    SELECT max(first_name) FROM users;
+}
+expect {
+    Zula
+}
+
+test select-min-text {
+    SELECT min(first_name) FROM users;
+}
+expect {
+    Aaliyah
+}
+
+test select-group-concat {
+    SELECT group_concat(name) FROM products;
+}
+expect {
+    hat,cap,shirt,sweater,sweatshirt,shorts,jeans,sneakers,boots,coat,accessories
+}
+
+test select-group-concat-with-delimiter {
+    SELECT group_concat(name, ';') FROM products;
+}
+expect {
+    hat;cap;shirt;sweater;sweatshirt;shorts;jeans;sneakers;boots;coat;accessories
+}
+
+test select-group-concat-with-delimiter-expression {
+    SELECT group_concat(name, ';' || '|') FROM products;
+}
+expect {
+    hat;|cap;|shirt;|sweater;|sweatshirt;|shorts;|jeans;|sneakers;|boots;|coat;|accessories
+}
+
+test select-group-concat-with-column-delimiter {
+    SELECT group_concat(name, id) FROM products;
+}
+expect {
+    hat2cap3shirt4sweater5sweatshirt6shorts7jeans8sneakers9boots10coat11accessories
+}
+
+test select-group-concat-with-column-delimiter-group-by {
+    SELECT group_concat(name, id) FROM products GROUP BY '1';
+}
+expect {
+    hat2cap3shirt4sweater5sweatshirt6shorts7jeans8sneakers9boots10coat11accessories
+}
+
+test select-string-agg-with-delimiter {
+    SELECT string_agg(name, ',') FROM products;
+}
+expect {
+    hat,cap,shirt,sweater,sweatshirt,shorts,jeans,sneakers,boots,coat,accessories
+}
+
+test select-string-agg-with-delimiter-expression {
+    SELECT string_agg(name, ';' || '|') FROM products;
+}
+expect {
+    hat;|cap;|shirt;|sweater;|sweatshirt;|shorts;|jeans;|sneakers;|boots;|coat;|accessories
+}
+
+test select-string-agg-with-column-delimiter {
+    SELECT string_agg(name, id) FROM products;
+}
+expect {
+    hat2cap3shirt4sweater5sweatshirt6shorts7jeans8sneakers9boots10coat11accessories
+}
+
+test select-string-agg-with-column-delimiter-group-by {
+    SELECT string_agg(name, id) FROM products GROUP BY '1';
+}
+expect {
+    hat2cap3shirt4sweater5sweatshirt6shorts7jeans8sneakers9boots10coat11accessories
+}
+
+test select-agg-unary-negative {
+    SELECT -max(age) FROM users;
+}
+expect {
+    -100
+}
+
+test select-agg-unary-positive {
+    SELECT +max(age) FROM users;
+}
+expect {
+    100
+}
+
+test select-agg-binary-unary-negative {
+    SELECT min(age) + -max(age) FROM users;
+}
+expect {
+    -99
+}
+
+test select-agg-binary-unary-positive {
+    SELECT min(age) + +max(age) FROM users;
+}
+expect {
+    101
+}
+
+test select-non-agg-cols-should-be-not-null {
+    SELECT id, first_name, sum(age) FROM users LIMIT 1;
+}
+expect {
+    1|Dan|504576
+}
+
+test select-with-group-by-and-agg-1 {
+    SELECT id, first_name, avg(age) FROM users group by last_name limit 1;
+}
+expect {
+    276|Zander|47.2777777777778
+}
+
+test select-with-group-by-and-agg-2 {
+    select first_name, last_name from users where state = 'AL' group by last_name limit 10;
+}
+expect {
+    Ottis|Abernathy
+    Dewayne|Auer
+    Mariela|Bailey
+    Amely|Becker
+    Korbin|Beer
+    Catalina|Berge
+    Layne|Bernier
+    Ulices|Bins
+    Kade|Bosco
+    Kaley|Botsford
+}
+
+test select-agg-json-array {
+    SELECT json_group_array(name) FROM products;
+}
+expect {
+    ["hat","cap","shirt","sweater","sweatshirt","shorts","jeans","sneakers","boots","coat","accessories"]
+}
+
+test select-agg-json-array-object {
+    SELECT json_group_array(json_object('name', name)) FROM products;
+}
+expect {
+    [{"name":"hat"},{"name":"cap"},{"name":"shirt"},{"name":"sweater"},{"name":"sweatshirt"},{"name":"shorts"},{"name":"jeans"},{"name":"sneakers"},{"name":"boots"},{"name":"coat"},{"name":"accessories"}]
+}
+
+test select-distinct-agg-functions {
+    SELECT sum(distinct age), count(distinct age), avg(distinct age) FROM users;
+}
+expect {
+    5050|100|50.5
+}
+
+test select-json-group-object {
+    select price,
+    json_group_object(cast (id as text), name)
+    from products
+    group by price
+    order by price;
+}
+expect {
+8.85709624556419|{"10":"coat"}
+22.7209470048471|{"3":"shirt"}
+23.8100541984648|{"5":"sweatshirt"}
+32.2475410444338|{"2":"cap"}
+36.1006791183673|{"8":"sneakers"}
+47.5875632652657|{"11":"accessories"}
+47.9379799632405|{"7":"jeans"}
+50.0363795824125|{"6":"shorts"}
+59.7782771700224|{"9":"boots"}
+68.9227440029754|{"4":"sweater"}
+82.9389679823547|{"1":"hat"}
+}
+
+test select-json-group-object-no-sorting-required {
+    select age,
+    json_group_object(cast (id as text), first_name)
+    from users
+    where first_name like 'Am%'
+    group by age
+    order by age
+    limit 5;
+}
+expect {
+3|{"6115":"Amelia","8536":"Amara"}
+4|{"4647":"Amelia"}
+5|{"8740":"Amy"}
+8|{"2505":"Ambrose","3430":"Amara"}
+11|{"523":"Amparo"}
+}
+
+test select-max-star {
+    SELECT max(*) FROM users;
+}
+expect error {
+    wrong number of arguments to function
+}
+
+test select-max-star-in-expression {
+    SELECT CASE WHEN max(*) > 0 THEN 1 ELSE 0 END FROM users;
+}
+expect error {
+    wrong number of arguments to function
+}
+
+test select-scalar-func-star {
+    SELECT abs(*) FROM users;
+}
+expect error {
+    wrong number of arguments to function
+}
+
+test select-scalar-func-star-in-expression {
+    SELECT CASE WHEN abs(*) > 0 THEN 1 ELSE 0 END FROM users;
+}
+expect error {
+    wrong number of arguments to function
+}
+
+test select-nested-agg-func {
+    SELECT max(abs(sum(age))), sum(age) FROM users;
+}
+expect error {
+    misuse of aggregate function
+}
+
+test select-nested-agg-func-in-expression {
+    SELECT CASE WHEN max(abs(sum(age))) > 0 THEN 1 ELSE 0 END, sum(age) FROM users;
+}
+expect error {
+    misuse of aggregate function
+}
+
+# https://github.com/tursodatabase/turso/issues/3308
+test printf-19029102 {
+    select printf('%d', 3.9);
+}
+expect {
+    3
+}
+
+# same thing for format
+test format-19029102 {
+    select format('%d', 3.9);
+}
+expect {
+    3
+}
+

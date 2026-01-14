@@ -59,7 +59,7 @@ uv-sync-test:
 	uv sync --all-extras --dev --package turso_test
 .PHONE: uv-sync
 
-test: build uv-sync-test test-compat test-alter-column test-vector test-sqlite3 test-shell test-memory test-write test-update test-constraint test-collate test-extensions test-mvcc test-matviews test-json
+test: build uv-sync-test test-compat test-sqlite3 test-shell test-memory test-write test-update test-constraint test-collate test-extensions test-mvcc test-matviews test-json
 .PHONY: test
 
 test-extensions: build uv-sync-test
@@ -85,10 +85,6 @@ test-single: check-tcl-version
 .PHONY: test-single
 .PHONY: test-compat
 
-test-vector:
-	RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) ./testing/vector.test
-.PHONY: test-vector
-
 test-time:
 	RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) ./testing/time.test
 .PHONY: test-time
@@ -96,10 +92,6 @@ test-time:
 test-matviews:
 	RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) ./testing/materialized_views.test
 .PHONY: test-matviews
-
-test-alter-column:
-	RUST_LOG=$(RUST_LOG) SQLITE_EXEC=$(SQLITE_EXEC) ./testing/alter_column.test
-.PHONY: test-alter-column
 
 
 reset-db:

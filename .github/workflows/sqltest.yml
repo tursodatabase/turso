@@ -34,9 +34,17 @@ jobs:
       - uses: useblacksmith/rust-cache@v3
         with:
           prefix-key: "v1-rust"
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
       - name: Build tursodb
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: "sccache"
         run: make -C turso-test-runner build-tursodb
       - name: Build test runner
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: "sccache"
         run: make -C turso-test-runner build-runner
       - name: Run tests
         run: make -C turso-test-runner run

@@ -36,8 +36,24 @@ pub struct TestCase {
     pub expectation: Expectation,
     /// Setup references with their spans
     pub setups: Vec<SetupRef>,
-    /// If set, skip this test with the given reason
-    pub skip: Option<String>,
+    /// If set, skip this test (unconditionally or conditionally)
+    pub skip: Option<Skip>,
+}
+
+/// Skip configuration for a test
+#[derive(Debug, Clone, PartialEq)]
+pub struct Skip {
+    /// The reason for skipping
+    pub reason: String,
+    /// Optional condition for skipping (if None, always skip)
+    pub condition: Option<SkipCondition>,
+}
+
+/// Conditions for skipping a test
+#[derive(Debug, Clone, PartialEq)]
+pub enum SkipCondition {
+    /// Skip when MVCC mode is enabled
+    Mvcc,
 }
 
 /// What we expect from executing the SQL
@@ -71,6 +87,10 @@ pub enum DatabaseLocation {
     TempFile,
     /// Path to an existing database file
     Path(PathBuf),
+    /// Generated default database with INTEGER PRIMARY KEY (`:default:`)
+    Default,
+    /// Generated default database with INT PRIMARY KEY - no rowid alias (`:default-no-rowidalias:`)
+    DefaultNoRowidAlias,
 }
 
 impl DatabaseConfig {
@@ -90,6 +110,8 @@ impl Display for DatabaseLocation {
             DatabaseLocation::Memory => f.write_str(":memory:"),
             DatabaseLocation::TempFile => f.write_str(":temp:"),
             DatabaseLocation::Path(path_buf) => write!(f, "{}", path_buf.display()),
+            DatabaseLocation::Default => f.write_str(":default:"),
+            DatabaseLocation::DefaultNoRowidAlias => f.write_str(":default-no-rowidalias:"),
         }
     }
 }

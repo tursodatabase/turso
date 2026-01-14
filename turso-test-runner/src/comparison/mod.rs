@@ -82,14 +82,8 @@ fn compare_error(actual: &QueryResult, expected_pattern: Option<&str>) -> Compar
             // Normalize whitespace in both error and pattern for flexible matching
             let normalized_err = normalize_whitespace(err);
             let normalized_pattern = normalize_whitespace(pattern);
-            if normalized_err.contains(&normalized_pattern) {
-                ComparisonResult::Match
-            } else {
-                ComparisonResult::mismatch(format!(
-                    "error message '{}' does not contain expected pattern '{}'",
-                    err, pattern
-                ))
-            }
+
+            pattern::compare_error(&normalized_err, &normalized_pattern)
         }
     }
 }

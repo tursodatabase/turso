@@ -48,7 +48,7 @@ impl Parser {
                     }
                     setups.insert(name, sql);
                 }
-                Some(Token::AtSetup | Token::AtSkip | Token::Test) => {
+                Some(Token::AtSetup | Token::AtSkip | Token::AtSkipIf | Token::Test) => {
                     tests.push(self.parse_test()?);
                 }
                 Some(token) => {
@@ -87,6 +87,20 @@ impl Parser {
                     readonly: false,
                 })
             }
+            Some(Token::Default) => {
+                self.advance();
+                Ok(DatabaseConfig {
+                    location: DatabaseLocation::Default,
+                    readonly: true,
+                })
+            }
+            Some(Token::DefaultNoRowidAlias) => {
+                self.advance();
+                Ok(DatabaseConfig {
+                    location: DatabaseLocation::DefaultNoRowidAlias,
+                    readonly: true,
+                })
+            }
             Some(Token::Path(path)) => {
                 let path = path.clone();
                 self.advance();
@@ -104,7 +118,7 @@ impl Parser {
                 })
             }
             Some(token) => Err(self.error(format!(
-                "expected database specifier (:memory:, :temp:, or path), got {token}"
+                "expected database specifier (:memory:, :temp:, :default:, :default-no-rowidalias:, or path), got {token}"
             ))),
             None => Err(self.error("expected database specifier, got EOF".to_string())),
         }
@@ -138,7 +152,21 @@ impl Parser {
                 }
                 Some(Token::AtSkip) => {
                     self.advance();
-                    skip = Some(self.expect_string()?);
+                    let reason = self.expect_string()?;
+                    skip = Some(ast::Skip {
+                        reason,
+                        condition: None,
+                    });
+                    self.skip_newlines_and_comments();
+                }
+                Some(Token::AtSkipIf) => {
+                    self.advance();
+                    let condition = self.parse_skip_condition()?;
+                    let reason = self.expect_string()?;
+                    skip = Some(ast::Skip {
+                        reason,
+                        condition: Some(condition),
+                    });
                     self.skip_newlines_and_comments();
                 }
                 _ => break,
@@ -221,6 +249,17 @@ impl Parser {
                 Err(self.error(format!("expected expect modifier or block, got {token}")))
             }
             None => Err(self.error("expected expect block, got EOF".to_string())),
+        }
+    }
+
+    fn parse_skip_condition(&mut self) -> Result<ast::SkipCondition, ParseError> {
+        match self.peek() {
+            Some(Token::Mvcc) => {
+                self.advance();
+                Ok(ast::SkipCondition::Mvcc)
+            }
+            Some(token) => Err(self.error(format!("expected skip condition (mvcc), got {token}"))),
+            None => Err(self.error("expected skip condition, got EOF".to_string())),
         }
     }
 
@@ -561,7 +600,37 @@ expect {
 "#;
 
         let file = parse(input).unwrap();
-        assert_eq!(file.tests[0].skip, Some("known bug".to_string()));
+        assert_eq!(
+            file.tests[0].skip,
+            Some(ast::Skip {
+                reason: "known bug".to_string(),
+                condition: None,
+            })
+        );
+    }
+
+    #[test]
+    fn test_parse_skip_if_mvcc() {
+        let input = r#"
+@database :memory:
+
+@skip-if mvcc "total_changes not supported in MVCC"
+test total-changes {
+    SELECT total_changes();
+}
+expect {
+    1
+}
+"#;
+
+        let file = parse(input).unwrap();
+        assert_eq!(
+            file.tests[0].skip,
+            Some(ast::Skip {
+                reason: "total_changes not supported in MVCC".to_string(),
+                condition: Some(ast::SkipCondition::Mvcc),
+            })
+        );
     }
 
     #[test]

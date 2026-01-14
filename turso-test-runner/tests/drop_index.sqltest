@@ -1,40 +1,48 @@
-#!/usr/bin/env tclsh
-
-set testdir [file dirname $argv0]
-source $testdir/tester.tcl
+@database :memory:
 
 # Basic DROP INDEX functionality
-do_execsql_test_on_specific_db {:memory:} drop-index-basic-1 {
+test drop-index-basic-1 {
     CREATE TABLE t1 (x INTEGER PRIMARY KEY);
     CREATE INDEX t_idx on t1 (x);
     INSERT INTO t1 VALUES (1);
     INSERT INTO t1 VALUES (2);
     DROP INDEX t_idx;
     SELECT count(*) FROM sqlite_schema WHERE type='index' AND name='t_idx';
-} {0}
+}
+expect {
+    0
+}
 
 # Test DROP INDEX IF EXISTS on existing index
-do_execsql_test_on_specific_db {:memory:} drop-index-if-exists-1 {
+test drop-index-if-exists-1 {
     CREATE TABLE t2 (x INTEGER PRIMARY KEY);
     CREATE INDEX t_idx2 on t2 (x);
     DROP INDEX IF EXISTS t_idx2;
     SELECT count(*) FROM sqlite_schema WHERE type='index' AND name='t_idx2';
-} {0}
+}
+expect {
+    0
+}
 
 # Test DROP INDEX IF EXISTS on non-existent index
-do_execsql_test_on_specific_db {:memory:} drop-index-if-exists-2 {
+test drop-index-if-exists-2 {
     DROP TABLE IF EXISTS nonexistent_index;
     SELECT 'success';
-} {success}
+}
+expect {
+    success
+}
 
 # Test dropping non-existant index produces an error
-do_execsql_test_error_content drop-index-no-index {
+test drop-index-no-index {
     DROP INDEX t_idx;
-} {"No such index: t_idx"}
-
+}
+expect error {
+    no such index: t_idx
+}
 
 # Test dropping index after multiple inserts and deletes
-do_execsql_test_on_specific_db {:memory:} drop-index-after-ops-1 {
+test drop-index-after-ops-1 {
     CREATE TABLE t6 (x INTEGER PRIMARY KEY);
     CREATE INDEX t_idx6 on t6 (x);
     INSERT INTO t6 VALUES (1);
@@ -43,16 +51,25 @@ do_execsql_test_on_specific_db {:memory:} drop-index-after-ops-1 {
     INSERT INTO t6 VALUES (3);
     DROP INDEX t_idx6;
     SELECT count(*) FROM sqlite_schema WHERE type='index' AND name='t_idx6';
-} {0}
+}
+expect {
+    0
+}
 
 # Test dropping of indices associated with unique or primary contraint indices produces an error
-do_execsql_test_in_memory_error_content  drop-index-primary-key-index {
+test drop-index-primary-key-index {
     CREATE TABLE t15a (id TEXT PRIMARY KEY );
     DROP INDEX sqlite_autoindex_t15a_1;
-} {"index associated with UNIQUE or PRIMARY KEY constraint cannot be dropped"}
+}
+expect error {
+    index associated with UNIQUE or PRIMARY KEY constraint cannot be dropped
+}
 
-
-do_execsql_test_in_memory_error_content drop-index-unique-index {
+test drop-index-unique-index {
     CREATE TABLE t15b (id INT UNIQUE );
     DROP INDEX sqlite_autoindex_t15b_1;
-} {"index associated with UNIQUE or PRIMARY KEY constraint cannot be dropped"}
+}
+expect error {
+    index associated with UNIQUE or PRIMARY KEY constraint cannot be dropped
+}
+

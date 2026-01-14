@@ -1,11 +1,34 @@
 use super::{ComparisonResult, format_rows};
-use regex::Regex;
+use regex::RegexBuilder;
+
+/// Compare error string against a pattern (case-insensitive)
+/// The pattern is escaped to treat it as a literal substring match
+pub fn compare_error(actual: &str, pattern: &str) -> ComparisonResult {
+    // Escape the pattern to treat it as a literal string for substring matching
+    let escaped_pattern = regex::escape(pattern);
+    match RegexBuilder::new(&escaped_pattern)
+        .case_insensitive(true)
+        .build()
+    {
+        Ok(re) => {
+            if re.is_match(actual) {
+                ComparisonResult::Match
+            } else {
+                ComparisonResult::mismatch(format!(
+                    "error message '{}' does not contain expected pattern '{}'",
+                    actual, pattern
+                ))
+            }
+        }
+        Err(e) => ComparisonResult::mismatch(format!("invalid regex pattern: {}", e)),
+    }
+}
 
 /// Compare rows against a regex pattern
 pub fn compare(actual: &[Vec<String>], pattern: &str) -> ComparisonResult {
     let actual_str = format_rows(actual);
 
-    match Regex::new(pattern) {
+    match RegexBuilder::new(pattern).build() {
         Ok(re) => {
             if re.is_match(&actual_str) {
                 ComparisonResult::Match
