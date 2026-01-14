@@ -1680,3 +1680,19 @@ do_execsql_test_on_specific_db {:memory:} select-sqlite-schema-empty-db {
 do_execsql_test_error select-param-zero-invalid {
   SELECT ?0
 } {.*variable number must be between.*}
+
+# Test BETWEEN ... AND ... IS NOT NULL operator precedence (issue #4653)
+# The IS NOT NULL should bind to the whole BETWEEN expression, not just the end value
+do_execsql_test_on_specific_db {:memory:} between-is-not-null-precedence {
+  SELECT 'x' BETWEEN 1 AND 2 IS NOT NULL;
+} {1}
+
+# Test LIKE ... IS NOT NULL operator precedence (issue #4653)
+do_execsql_test_on_specific_db {:memory:} like-is-not-null-precedence {
+  SELECT 'x' LIKE 'y' IS NOT NULL;
+} {1}
+
+# Test GLOB ... IS NOT NULL operator precedence (issue #4653)
+do_execsql_test_on_specific_db {:memory:} glob-is-not-null-precedence {
+  SELECT 'x' GLOB 'y' IS NOT NULL;
+} {1}
