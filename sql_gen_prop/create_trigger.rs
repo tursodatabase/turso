@@ -293,7 +293,7 @@ impl fmt::Display for CreateTriggerStatement {
             self.name, self.timing, self.event, self.table_name
         )?;
         for stmt in &self.body {
-            write!(f, "{}; ", stmt)?;
+            write!(f, "{stmt}; ")?;
         }
         write!(f, "END")
     }

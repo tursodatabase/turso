@@ -260,6 +260,8 @@ pub fn check_differential(
 
 #[cfg(test)]
 mod tests {
+    use core::f64;
+
     use super::*;
 
     #[test]
@@ -271,7 +273,10 @@ mod tests {
             SqlValue::Text("hello".into()),
             SqlValue::Text("hello".into())
         );
-        assert_eq!(SqlValue::Real(3.14), SqlValue::Real(3.14));
+        assert_eq!(
+            SqlValue::Real(f64::consts::PI),
+            SqlValue::Real(f64::consts::PI)
+        );
     }
 
     #[test]

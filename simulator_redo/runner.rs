@@ -80,9 +80,13 @@ impl SimStats {
 
         // Header
         let status = if self.is_success() {
-            Cell::new("PASSED").fg(Color::Green).add_attribute(Attribute::Bold)
+            Cell::new("PASSED")
+                .fg(Color::Green)
+                .add_attribute(Attribute::Bold)
         } else {
-            Cell::new("FAILED").fg(Color::Red).add_attribute(Attribute::Bold)
+            Cell::new("FAILED")
+                .fg(Color::Red)
+                .add_attribute(Attribute::Bold)
         };
 
         table.set_header(vec![
@@ -112,14 +116,13 @@ impl SimStats {
         } else {
             Cell::new(self.warnings).fg(Color::Green)
         };
-        table.add_row(vec![
-            Cell::new("Warnings").fg(Color::Yellow),
-            warnings_cell,
-        ]);
+        table.add_row(vec![Cell::new("Warnings").fg(Color::Yellow), warnings_cell]);
 
         // Failures - red if any
         let failures_cell = if self.oracle_failures > 0 {
-            Cell::new(self.oracle_failures).fg(Color::Red).add_attribute(Attribute::Bold)
+            Cell::new(self.oracle_failures)
+                .fg(Color::Red)
+                .add_attribute(Attribute::Bold)
         } else {
             Cell::new(self.oracle_failures).fg(Color::Green)
         };
@@ -134,10 +137,7 @@ impl SimStats {
         } else {
             Cell::new(self.errors).fg(Color::Green)
         };
-        table.add_row(vec![
-            Cell::new("Errors").fg(Color::Red),
-            errors_cell,
-        ]);
+        table.add_row(vec![Cell::new("Errors").fg(Color::Red), errors_cell]);
 
         table
     }
