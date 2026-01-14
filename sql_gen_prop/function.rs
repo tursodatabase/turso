@@ -123,6 +123,8 @@ pub struct FunctionDef {
     pub is_window: bool,
     /// Whether this function is deterministic (same inputs always give same output).
     pub is_deterministic: bool,
+    /// Maximum value for integer arguments (for functions like ZEROBLOB that allocate memory).
+    pub int_arg_max: Option<i64>,
 }
 
 impl FunctionDef {
@@ -138,6 +140,7 @@ impl FunctionDef {
             is_aggregate: false,
             is_window: false,
             is_deterministic: true,
+            int_arg_max: None,
         }
     }
 
@@ -199,6 +202,12 @@ impl FunctionDef {
     /// Mark as non-deterministic.
     pub fn non_deterministic(mut self) -> Self {
         self.is_deterministic = false;
+        self
+    }
+
+    /// Set maximum value for integer arguments (for functions that allocate memory).
+    pub fn int_arg_max(mut self, max: i64) -> Self {
+        self.int_arg_max = Some(max);
         self
     }
 
@@ -598,7 +607,8 @@ pub fn type_functions() -> Vec<FunctionDef> {
         FunctionDef::new("ZEROBLOB")
             .typed_args(&[DataType::Integer])
             .returns(DataType::Blob)
-            .category(FunctionCategory::Type),
+            .category(FunctionCategory::Type)
+            .int_arg_max(1024),
     ]
 }
 

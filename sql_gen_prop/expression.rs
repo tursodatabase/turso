@@ -668,14 +668,23 @@ fn function_call_for_def(
         return Just(Expression::function_call(name, vec![])).boxed();
     }
 
+    let int_arg_max = func.int_arg_max;
     (func.min_args..=func.max_args)
         .prop_flat_map(move |n| {
             (0..n)
                 .map(|i| {
-                    expression(
-                        &ctx.child_context(depth.saturating_sub(1))
-                            .with_target_type(func.expected_type_at(i).cloned()),
-                    )
+                    let arg_type = func.expected_type_at(i).cloned();
+                    // Use bounded integers for functions with int_arg_max
+                    if let (Some(max), Some(DataType::Integer)) = (int_arg_max, arg_type.as_ref()) {
+                        (0..=max)
+                            .prop_map(|v| Expression::Value(SqlValue::Integer(v)))
+                            .boxed()
+                    } else {
+                        expression(
+                            &ctx.child_context(depth.saturating_sub(1))
+                                .with_target_type(arg_type),
+                        )
+                    }
                 })
                 .collect::<Vec<_>>()
         })
