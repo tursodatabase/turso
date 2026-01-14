@@ -28,8 +28,8 @@ use crate::storage::sqlite3_ondisk::{
 };
 use crate::types::{IOCompletions, IOResult};
 use crate::{
-    bail_corrupt_error, io_yield_one, return_if_io, turso_assert, Buffer, Completion,
-    CompletionError, IOContext, LimboError, Result,
+    bail_corrupt_error, io_yield_one, turso_assert, Buffer, Completion, CompletionError, IOContext,
+    LimboError, Result,
 };
 
 /// this contains the frame to rollback to and its associated checksum.
@@ -51,6 +51,10 @@ pub struct CheckpointResult {
     maybe_guard: Option<CheckpointLocks>,
     pub db_truncate_sent: bool,
     pub db_sync_sent: bool,
+    /// Whether WAL truncation I/O has been submitted (for TRUNCATE checkpoint mode)
+    pub wal_truncate_sent: bool,
+    /// Whether WAL sync I/O has been submitted after truncation
+    pub wal_sync_sent: bool,
 }
 
 impl Drop for CheckpointResult {
@@ -68,6 +72,8 @@ impl CheckpointResult {
             maybe_guard: None,
             db_sync_sent: false,
             db_truncate_sent: false,
+            wal_truncate_sent: false,
+            wal_sync_sent: false,
         }
     }
 
@@ -355,6 +361,11 @@ pub trait Wal: Debug + Send + Sync {
     /// This should't be used with regular WAL mode.
     fn update_max_frame(&self);
 
+    /// Truncate WAL file to zero and sync it. This is called AFTER the DB file has been
+    /// synced during TRUNCATE checkpoint mode, ensuring data durability.
+    /// The result parameter is used to track I/O progress (wal_truncate_sent, wal_sync_sent).
+    fn truncate_wal(&self, result: &mut CheckpointResult) -> Result<IOResult<()>>;
+
     #[cfg(debug_assertions)]
     fn as_any(&self) -> &dyn std::any::Any;
 }
@@ -363,11 +374,12 @@ pub trait Wal: Debug + Send + Sync {
 pub enum CheckpointState {
     Start,
     Processing,
-    Finalize,
-    Truncate {
+    /// Determine the checkpoint result: update nBackfills, restart log if needed.
+    DetermineResult,
+    /// Final cleanup: release locks, clear internal state, return result.
+    /// WAL truncation (if needed) is handled by pager.rs via truncate_wal() AFTER the DB is synced.
+    Finalize {
         checkpoint_result: Option<CheckpointResult>,
-        truncate_sent: bool,
-        sync_sent: bool,
     },
 }
 
@@ -1932,6 +1944,10 @@ impl Wal for WalFile {
             self.max_frame.store(new_max_frame, Ordering::Release);
         })
     }
+
+    fn truncate_wal(&self, result: &mut CheckpointResult) -> Result<IOResult<()>> {
+        self.truncate_log(result)
+    }
 }
 
 impl WalFile {
@@ -2107,6 +2123,8 @@ impl WalFile {
                             maybe_guard: None,
                             db_sync_sent: false,
                             db_truncate_sent: false,
+                            wal_truncate_sent: false,
+                            wal_sync_sent: false,
                         }));
                     }
                     // acquire the appropriate exclusive locks depending on the checkpoint mode
@@ -2276,7 +2294,7 @@ impl WalFile {
                     if nr_completions > 0 {
                         io_yield_one!(group.build());
                     } else if ongoing_chkpt.complete() {
-                        ongoing_chkpt.state = CheckpointState::Finalize;
+                        ongoing_chkpt.state = CheckpointState::DetermineResult;
                     } else {
                         // This should be impossible now so we treat it as logic error.
                         return Err(LimboError::InternalError(
@@ -2284,11 +2302,9 @@ impl WalFile {
                         ));
                     }
                 }
-                // All eligible frames copied to the db file
-                // Update nBackfills
-                // In Restart or Truncate mode, we need to restart the log over and possibly truncate the file
-                // Release all locks and return the current num of wal frames and the amount we backfilled
-                CheckpointState::Finalize => {
+                // All eligible frames copied to the db file.
+                // Compute checkpoint result, update nBackfills, restart log if needed.
+                CheckpointState::DetermineResult => {
                     let mut ongoing_chkpt = self.ongoing_checkpoint.write();
                     turso_assert!(
                         ongoing_chkpt.complete(),
@@ -2360,26 +2376,27 @@ impl WalFile {
                     if mode.should_restart_log() {
                         self.restart_log(mode)?;
                     }
-                    ongoing_chkpt.state = CheckpointState::Truncate {
+                    ongoing_chkpt.state = CheckpointState::Finalize {
                         checkpoint_result: Some(checkpoint_result),
-                        truncate_sent: false,
-                        sync_sent: false,
                     };
                 }
-                CheckpointState::Truncate { .. } => {
-                    if matches!(mode, CheckpointMode::Truncate { .. }) {
-                        return_if_io!(self.truncate_log());
-                    }
+                CheckpointState::Finalize { .. } => {
+                    // NOTE: For TRUNCATE mode,WAL truncation is NOT done here.
+                    // It is deferred to pager.rs after the DB file has been synced,
+                    // at which point it calls truncate_wal().
+                    // This ensures data durability: if a crash occurs after WAL truncation
+                    // but before DB sync, the data would be lost. By truncating the WAL
+                    // only after the DB is safely synced, we guarantee recoverability.
                     if mode.should_restart_log() {
                         Self::unlock_after_restart(&self.shared, None);
                     }
                     let mut checkpoint_result = {
                         let mut oc = self.ongoing_checkpoint.write();
-                        let CheckpointState::Truncate {
+                        let CheckpointState::Finalize {
                             checkpoint_result, ..
                         } = &mut oc.state
                         else {
-                            panic!("unxpected state");
+                            panic!("unexpected state");
                         };
                         checkpoint_result.take().unwrap()
                     };
@@ -2525,7 +2542,8 @@ impl WalFile {
         Ok(())
     }
 
-    fn truncate_log(&self) -> Result<IOResult<()>> {
+    /// Truncate WAL file to zero and sync it. Called by pager AFTER DB file is synced.
+    fn truncate_log(&self, result: &mut CheckpointResult) -> Result<IOResult<()>> {
         let file = self.with_shared(|shared| {
             turso_assert!(
                 shared.enabled.load(Ordering::Relaxed),
@@ -2535,25 +2553,11 @@ impl WalFile {
             shared.file.as_ref().unwrap().clone()
         });
 
-        let (truncate_sent_val, sync_sent_val) = {
-            let oc = self.ongoing_checkpoint.read();
-            let CheckpointState::Truncate {
-                sync_sent,
-                truncate_sent,
-                ..
-            } = &oc.state
-            else {
-                panic!("unxpected state");
-            };
-            (*truncate_sent, *sync_sent)
-        };
-        if !truncate_sent_val {
-            // For TRUNCATE mode: shrink the WAL file to 0 B
-
+        if !result.wal_truncate_sent {
             let c = Completion::new_trunc({
                 let shared = self.shared.clone();
-                move |result| {
-                    if let Err(err) = result {
+                move |res| {
+                    if let Err(err) = res {
                         Self::unlock_after_restart(
                             &shared,
                             Some(&LimboError::InternalError(err.to_string())),
@@ -2566,33 +2570,23 @@ impl WalFile {
             let c = file
                 .truncate(0, c)
                 .inspect_err(|e| Self::unlock_after_restart(&self.shared, Some(e)))?;
-            {
-                let mut oc = self.ongoing_checkpoint.write();
-                if let CheckpointState::Truncate { truncate_sent, .. } = &mut oc.state {
-                    *truncate_sent = true;
-                }
-            }
+            result.wal_truncate_sent = true;
             io_yield_one!(c);
-        } else if !sync_sent_val {
+        } else if !result.wal_sync_sent {
             let shared = self.shared.clone();
             let c = file
-                .sync(Completion::new_sync(move |result| {
-                    if let Err(err) = result {
+                .sync(Completion::new_sync(move |res| {
+                    if let Err(err) = res {
                         Self::unlock_after_restart(
                             &shared,
                             Some(&LimboError::InternalError(err.to_string())),
                         );
                     } else {
-                        tracing::trace!("WAL file synced after reset/truncation");
+                        tracing::trace!("WAL file synced after truncation");
                     }
                 }))
                 .inspect_err(|e| Self::unlock_after_restart(&self.shared, Some(e)))?;
-            {
-                let mut oc = self.ongoing_checkpoint.write();
-                if let CheckpointState::Truncate { sync_sent, .. } = &mut oc.state {
-                    *sync_sent = true;
-                }
-            }
+            result.wal_sync_sent = true;
             io_yield_one!(c);
         }
         Ok(IOResult::Done(()))
