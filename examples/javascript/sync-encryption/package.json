@@ -6,6 +6,6 @@
     "start": "node sync_example.mjs"
   },
   "dependencies": {
-    "@tursodatabase/sync": "file:.."
+    "@tursodatabase/sync": "file:../../../bindings/javascript/sync/packages/native"
   }
 }
