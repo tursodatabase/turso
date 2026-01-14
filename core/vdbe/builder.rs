@@ -492,6 +492,11 @@ impl ProgramBuilder {
         reg
     }
 
+    /// Returns the next register that will be allocated by alloc_register/alloc_registers.
+    pub fn peek_next_register(&self) -> usize {
+        self.next_free_register
+    }
+
     pub fn alloc_registers_and_init_w_null(&mut self, amount: usize) -> usize {
         let reg = self.alloc_registers(amount);
         self.emit_insn(Insn::Null {

@@ -124,7 +124,7 @@ use crate::storage::btree::{BTreeCursor, CursorTrait};
 use crate::sync::Arc;
 use crate::sync::Mutex;
 use crate::translate::collate::CollationSeq;
-use crate::translate::plan::{SelectPlan, TableReferences};
+use crate::translate::plan::{Plan, TableReferences};
 use crate::util::{
     module_args_from_sql, module_name_from_sql, type_from_name, IOExt, UnparsedFromSqlIndex,
 };
@@ -1711,8 +1711,9 @@ impl PseudoCursorType {
 pub struct FromClauseSubquery {
     /// The name of the derived table; uses the alias if available.
     pub name: String,
-    /// The query plan for the derived table.
-    pub plan: Box<SelectPlan>,
+    /// The query plan for the derived table. Can be either a simple SelectPlan
+    /// or a compound select (UNION/INTERSECT/EXCEPT).
+    pub plan: Box<Plan>,
     /// The columns of the derived table.
     pub columns: Vec<Column>,
     /// The start register for the result columns of the derived table;

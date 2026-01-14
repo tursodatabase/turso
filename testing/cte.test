@@ -1,0 +1,95 @@
+#!/usr/bin/env tclsh
+
+set testdir [file dirname $argv0]
+source $testdir/tester.tcl
+
+# Basic CTE tests
+do_execsql_test_on_specific_db {:memory:} cte-basic {
+    WITH t AS (SELECT 1 as x) SELECT * FROM t;
+} {1}
+
+do_execsql_test_on_specific_db {:memory:} cte-multiple {
+    WITH t1 AS (SELECT 1 as x), t2 AS (SELECT 2 as y) SELECT * FROM t1, t2;
+} {1|2}
+
+do_execsql_test_on_specific_db {:memory:} cte-chain {
+    WITH a AS (SELECT 1 as x), b AS (SELECT x FROM a), c AS (SELECT x FROM b), d AS (SELECT x FROM c) SELECT * FROM d;
+} {1}
+
+# CTE with UNION (previously failed)
+do_execsql_test_on_specific_db {:memory:} cte-union {
+    WITH t AS (SELECT 1 as x UNION SELECT 2) SELECT * FROM t ORDER BY 1;
+} {1
+2}
+
+# CTE with UNION ALL (previously failed)
+do_execsql_test_on_specific_db {:memory:} cte-union-all {
+    WITH t AS (SELECT 1 as x UNION ALL SELECT 2) SELECT * FROM t ORDER BY 1;
+} {1
+2}
+
+# CTE with INTERSECT (previously failed)
+do_execsql_test_on_specific_db {:memory:} cte-intersect {
+    WITH t AS (SELECT 1 as x INTERSECT SELECT 1) SELECT * FROM t;
+} {1}
+
+# CTE with EXCEPT (previously failed)
+do_execsql_test_on_specific_db {:memory:} cte-except {
+    WITH t AS (SELECT 1 as x EXCEPT SELECT 2) SELECT * FROM t;
+} {1}
+
+# CTE with multiple UNIONs
+do_execsql_test_on_specific_db {:memory:} cte-multiple-unions {
+    WITH t AS (SELECT 1 as x UNION SELECT 2 UNION SELECT 3) SELECT * FROM t ORDER BY 1;
+} {1
+2
+3}
+
+# CTE with UNION referenced by another CTE
+do_execsql_test_on_specific_db {:memory:} cte-union-ref {
+    WITH t AS (SELECT 1 as x UNION SELECT 2), u AS (SELECT * FROM t) SELECT * FROM u ORDER BY 1;
+} {1
+2}
+
+# CTE with UNION used multiple times
+do_execsql_test_on_specific_db {:memory:} cte-union-multi-ref {
+    WITH t AS (SELECT 1 as x UNION SELECT 2) SELECT * FROM t as a, t as b ORDER BY 1, 2;
+} {1|1
+1|2
+2|1
+2|2}
+
+# CTE with UNION and aggregate
+# Note: Column naming in compound select CTEs has a known limitation
+# where aliases from the first SELECT are not propagated - this is a
+# separate issue from compound query support in CTEs
+do_execsql_test_on_specific_db {:memory:} cte-union-aggregate {
+    WITH t AS (SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3) SELECT COUNT(*) FROM t;
+} {3}
+
+# CTE with compound query and LIMIT
+do_execsql_test_on_specific_db {:memory:} cte-union-limit {
+    WITH t AS (SELECT 1 UNION SELECT 2 UNION SELECT 3 LIMIT 2) SELECT * FROM t ORDER BY 1;
+} {1
+2}
+
+# CTE with compound query and LIMIT 1
+do_execsql_test_on_specific_db {:memory:} cte-union-limit-one {
+    WITH t AS (SELECT 1 UNION SELECT 2 LIMIT 1) SELECT * FROM t;
+} {1}
+
+# CTE with compound query and LIMIT + OFFSET
+do_execsql_test_on_specific_db {:memory:} cte-union-limit-offset {
+    WITH t AS (SELECT 1 UNION SELECT 2 UNION SELECT 3 LIMIT 2 OFFSET 1) SELECT * FROM t ORDER BY 1;
+} {2
+3}
+
+# CTE with INTERSECT and LIMIT
+do_execsql_test_on_specific_db {:memory:} cte-intersect-limit {
+    WITH t AS (SELECT 1 INTERSECT SELECT 1 LIMIT 1) SELECT * FROM t;
+} {1}
+
+# CTE with EXCEPT and LIMIT
+do_execsql_test_on_specific_db {:memory:} cte-except-limit {
+    WITH t AS (SELECT 1 UNION SELECT 2 EXCEPT SELECT 2 LIMIT 2) SELECT * FROM t;
+} {1}

@@ -948,11 +948,11 @@ pub fn open_loop(
                     }
                     (Scan::Subquery, Table::FromClauseSubquery(from_clause_subquery)) => {
                         let (yield_reg, coroutine_implementation_start) =
-                            match &from_clause_subquery.plan.query_destination {
-                                QueryDestination::CoroutineYield {
+                            match from_clause_subquery.plan.select_query_destination() {
+                                Some(QueryDestination::CoroutineYield {
                                     yield_reg,
                                     coroutine_implementation_start,
-                                } => (*yield_reg, *coroutine_implementation_start),
+                                }) => (*yield_reg, *coroutine_implementation_start),
                                 _ => unreachable!("Subquery table with non-subquery query type"),
                             };
                         // In case the subquery is an inner loop, it needs to be reinitialized on each iteration of the outer loop.

@@ -705,6 +705,23 @@ fn replace_column_number_with_copy_of_column_expr(
     Ok(())
 }
 
+/// Count required cursors for a Plan (either Select or CompoundSelect)
+fn count_plan_required_cursors_for_plan(plan: &Plan) -> usize {
+    match plan {
+        Plan::Select(select_plan) => count_plan_required_cursors(select_plan),
+        Plan::CompoundSelect {
+            left, right_most, ..
+        } => {
+            count_plan_required_cursors(right_most)
+                + left
+                    .iter()
+                    .map(|(p, _)| count_plan_required_cursors(p))
+                    .sum::<usize>()
+        }
+        Plan::Delete(_) | Plan::Update(_) => 0,
+    }
+}
+
 fn count_plan_required_cursors(plan: &SelectPlan) -> usize {
     let num_table_cursors: usize = plan
         .joined_tables()
@@ -718,7 +735,7 @@ fn count_plan_required_cursors(plan: &SelectPlan) -> usize {
             Operation::IndexMethodQuery(_) => 1,
             Operation::HashJoin(_) => 2,
         } + if let Table::FromClauseSubquery(from_clause_subquery) = &t.table {
-            count_plan_required_cursors(&from_clause_subquery.plan)
+            count_plan_required_cursors_for_plan(&from_clause_subquery.plan)
         } else {
             0
         })
@@ -733,6 +750,24 @@ fn count_plan_required_cursors(plan: &SelectPlan) -> usize {
     num_table_cursors + num_sorter_cursors + num_pseudo_cursors
 }
 
+/// Estimate number of instructions for a Plan (either Select or CompoundSelect)
+fn estimate_num_instructions_for_plan(plan: &Plan) -> usize {
+    match plan {
+        Plan::Select(select_plan) => estimate_num_instructions(select_plan),
+        Plan::CompoundSelect {
+            left, right_most, ..
+        } => {
+            estimate_num_instructions(right_most)
+                + left
+                    .iter()
+                    .map(|(p, _)| estimate_num_instructions(p))
+                    .sum::<usize>()
+                + 20 // overhead for compound select operations
+        }
+        Plan::Delete(_) | Plan::Update(_) => 0,
+    }
+}
+
 fn estimate_num_instructions(select: &SelectPlan) -> usize {
     let table_instructions: usize = select
         .joined_tables()
@@ -743,7 +778,7 @@ fn estimate_num_instructions(select: &SelectPlan) -> usize {
             Operation::IndexMethodQuery(_) => 15,
             Operation::HashJoin(_) => 20,
         } + if let Table::FromClauseSubquery(from_clause_subquery) = &t.table {
-            10 + estimate_num_instructions(&from_clause_subquery.plan)
+            10 + estimate_num_instructions_for_plan(&from_clause_subquery.plan)
         } else {
             0
         })
@@ -754,6 +789,24 @@ fn estimate_num_instructions(select: &SelectPlan) -> usize {
     let condition_instructions = select.where_clause.len() * 3;
 
     20 + table_instructions + group_by_instructions + order_by_instructions + condition_instructions
+}
+
+/// Estimate number of labels for a Plan (either Select or CompoundSelect)
+fn estimate_num_labels_for_plan(plan: &Plan) -> usize {
+    match plan {
+        Plan::Select(select_plan) => estimate_num_labels(select_plan),
+        Plan::CompoundSelect {
+            left, right_most, ..
+        } => {
+            estimate_num_labels(right_most)
+                + left
+                    .iter()
+                    .map(|(p, _)| estimate_num_labels(p))
+                    .sum::<usize>()
+                + 10 // overhead for compound select operations
+        }
+        Plan::Delete(_) | Plan::Update(_) => 0,
+    }
 }
 
 fn estimate_num_labels(select: &SelectPlan) -> usize {
@@ -768,7 +821,7 @@ fn estimate_num_labels(select: &SelectPlan) -> usize {
             Operation::IndexMethodQuery(_) => 3,
             Operation::HashJoin(_) => 3,
         } + if let Table::FromClauseSubquery(from_clause_subquery) = &t.table {
-            3 + estimate_num_labels(&from_clause_subquery.plan)
+            3 + estimate_num_labels_for_plan(&from_clause_subquery.plan)
         } else {
             0
         })

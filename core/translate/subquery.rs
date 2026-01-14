@@ -7,6 +7,7 @@ use crate::{
     schema::{Index, IndexColumn, Table},
     translate::{
         collate::get_collseq_from_expr,
+        compound_select::emit_program_for_compound_select,
         emitter::emit_program_for_select,
         expr::{unwrap_parens, walk_expr_mut, WalkControl},
         optimizer::optimize_select_plan,
@@ -572,7 +573,7 @@ pub fn emit_from_clause_subqueries(
         if let Table::FromClauseSubquery(from_clause_subquery) = &mut table_reference.table {
             // Emit the subquery and get the start register of the result columns.
             let result_columns_start =
-                emit_from_clause_subquery(program, &mut from_clause_subquery.plan, t_ctx)?;
+                emit_from_clause_subquery(program, from_clause_subquery.plan.as_mut(), t_ctx)?;
             // Set the start register of the subquery's result columns.
             // This is done so that translate_expr() can read the result columns of the subquery,
             // as if it were reading from a regular table.
@@ -586,7 +587,7 @@ pub fn emit_from_clause_subqueries(
 
 /// Emit a FROM clause subquery and return the start register of the result columns.
 /// This is done by emitting a coroutine that stores the result columns in sequential registers.
-/// Each FROM clause subquery has its own separate SelectPlan which is wrapped in a coroutine.
+/// Each FROM clause subquery has its own Plan (either SelectPlan or CompoundSelect) which is wrapped in a coroutine.
 ///
 /// The resulting bytecode from a subquery is mostly exactly the same as a regular query, except:
 /// - it ends in an EndCoroutine instead of a Halt.
@@ -595,20 +596,22 @@ pub fn emit_from_clause_subqueries(
 ///   so that translate_expr() can read the result columns of the subquery,
 ///   as if it were reading from a regular table.
 ///
-/// Since a subquery has its own SelectPlan, it can contain nested subqueries,
+/// Since a subquery has its own Plan, it can contain nested subqueries,
 /// which can contain even more nested subqueries, etc.
 pub fn emit_from_clause_subquery(
     program: &mut ProgramBuilder,
-    plan: &mut SelectPlan,
+    plan: &mut Plan,
     t_ctx: &mut TranslateCtx,
 ) -> Result<usize> {
     let yield_reg = program.alloc_register();
     let coroutine_implementation_start_offset = program.allocate_label();
-    match &mut plan.query_destination {
-        QueryDestination::CoroutineYield {
+
+    // Set up the coroutine yield destination for the plan
+    match plan.select_query_destination_mut() {
+        Some(QueryDestination::CoroutineYield {
             yield_reg: y,
             coroutine_implementation_start,
-        } => {
+        }) => {
             // The parent query will use this register to jump to/from the subquery.
             *y = yield_reg;
             // The parent query will use this register to reinitialize the coroutine when it needs to run multiple times.
@@ -616,37 +619,57 @@ pub fn emit_from_clause_subquery(
         }
         _ => unreachable!("emit_from_clause_subquery called on non-subquery"),
     }
-    let end_coroutine_label = program.allocate_label();
-    let mut metadata = TranslateCtx {
-        labels_main_loop: (0..plan.joined_tables().len())
-            .map(|_| LoopLabels::new(program))
-            .collect(),
-        label_main_loop_end: None,
-        meta_group_by: None,
-        meta_left_joins: (0..plan.joined_tables().len()).map(|_| None).collect(),
-        meta_sort: None,
-        reg_agg_start: None,
-        reg_nonagg_emit_once_flag: None,
-        reg_result_cols_start: None,
-        limit_ctx: None,
-        reg_offset: None,
-        reg_limit_offset_sum: None,
-        resolver: Resolver::new(t_ctx.resolver.schema, t_ctx.resolver.symbol_table),
-        non_aggregate_expressions: Vec::new(),
-        cdc_cursor_id: None,
-        meta_window: None,
-        materialized_build_inputs: std::collections::HashMap::new(),
-        hash_table_contexts: std::collections::HashMap::new(),
-    };
+
     let subquery_body_end_label = program.allocate_label();
+
     program.emit_insn(Insn::InitCoroutine {
         yield_reg,
         jump_on_definition: subquery_body_end_label,
         start_offset: coroutine_implementation_start_offset,
     });
     program.preassign_label_to_next_insn(coroutine_implementation_start_offset);
-    let result_column_start_reg = emit_query(program, plan, &mut metadata)?;
-    program.resolve_label(end_coroutine_label, program.offset());
+
+    let result_column_start_reg = match plan {
+        Plan::Select(select_plan) => {
+            let mut metadata = TranslateCtx {
+                labels_main_loop: (0..select_plan.joined_tables().len())
+                    .map(|_| LoopLabels::new(program))
+                    .collect(),
+                label_main_loop_end: None,
+                meta_group_by: None,
+                meta_left_joins: (0..select_plan.joined_tables().len())
+                    .map(|_| None)
+                    .collect(),
+                meta_sort: None,
+                reg_agg_start: None,
+                reg_nonagg_emit_once_flag: None,
+                reg_result_cols_start: None,
+                limit_ctx: None,
+                reg_offset: None,
+                reg_limit_offset_sum: None,
+                resolver: Resolver::new(t_ctx.resolver.schema, t_ctx.resolver.symbol_table),
+                non_aggregate_expressions: Vec::new(),
+                cdc_cursor_id: None,
+                meta_window: None,
+                materialized_build_inputs: std::collections::HashMap::new(),
+                hash_table_contexts: std::collections::HashMap::new(),
+            };
+            emit_query(program, select_plan, &mut metadata)?
+        }
+        Plan::CompoundSelect { .. } => {
+            // Clone the plan to pass to emit_program_for_compound_select (it takes ownership)
+            let plan_clone = plan.clone();
+            let resolver = Resolver::new(t_ctx.resolver.schema, t_ctx.resolver.symbol_table);
+            // emit_program_for_compound_select returns the result column start register
+            // for coroutine mode, which is needed by the outer query.
+            emit_program_for_compound_select(program, &resolver, plan_clone)?
+                .expect("compound CTE in coroutine mode must have result register")
+        }
+        Plan::Delete(_) | Plan::Update(_) => {
+            unreachable!("DELETE/UPDATE plans cannot be FROM clause subqueries")
+        }
+    };
+
     program.emit_insn(Insn::EndCoroutine { yield_reg });
     program.preassign_label_to_next_insn(subquery_body_end_label);
     Ok(result_column_start_reg)
