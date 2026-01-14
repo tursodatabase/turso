@@ -10,6 +10,7 @@ from typing import Any, Callable, Iterable, Optional, Tuple, Union
 
 from ._turso import (
     Misuse,
+    PyRemoteEncryptionCipher as RemoteEncryptionCipher,
     PyTursoAsyncOperation,
     PyTursoAsyncOperationResultKind,
     PyTursoConnection,
@@ -416,6 +417,7 @@ def connect_sync(
     experimental_features: Optional[str] = None,
     isolation_level: Optional[str] = "DEFERRED",
     remote_encryption_key: Optional[str] = None,
+    remote_encryption_cipher: Optional[RemoteEncryptionCipher] = None,
 ) -> ConnectionSync:
     """
     Create and open a synchronized database connection.
@@ -429,6 +431,7 @@ def connect_sync(
     - partial_sync_experimental: EXPERIMENTAL partial sync configuration
     - experimental_features, isolation_level: passed to underlying connection
     - remote_encryption_key: base64-encoded encryption key for encrypted Turso Cloud databases
+    - remote_encryption_cipher: encryption cipher for the remote database (used to calculate reserved_bytes)
     """
     # Resolve client name
     cname = client_name or "turso-sync-py"
@@ -471,6 +474,7 @@ def connect_sync(
         if partial_sync_experimental is not None
         else None,
         remote_encryption_key=remote_encryption_key,
+        remote_encryption_cipher=remote_encryption_cipher,
     )
 
     # Create sync database holder

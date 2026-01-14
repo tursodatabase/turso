@@ -3,9 +3,13 @@
  * Turso Database Sync example with Turso Cloud (with optional remote encryption)
  *
  * Environment variables:
- *   TURSO_REMOTE_URL          - Remote database URL (default: http://localhost:8080)
- *   TURSO_AUTH_TOKEN          - Auth token (optional)
- *   TURSO_REMOTE_ENCRYPTION_KEY - Base64-encoded encryption key (optional)
+ *   TURSO_REMOTE_URL              - Remote database URL (default: http://localhost:8080)
+ *   TURSO_AUTH_TOKEN              - Auth token (optional)
+ *   TURSO_REMOTE_ENCRYPTION_KEY   - Base64-encoded encryption key (optional)
+ *   TURSO_REMOTE_ENCRYPTION_CIPHER - Cipher name (default: aes256gcm)
+ *     Supported: aes256gcm, aes128gcm, chacha20poly1305,
+ *                aegis128l, aegis128x2, aegis128x4,
+ *                aegis256, aegis256x2, aegis256x4
  */
 
 import { connect } from '@tursodatabase/sync';
@@ -14,10 +18,14 @@ async function main() {
     const remoteUrl = process.env.TURSO_REMOTE_URL || 'http://localhost:8080';
     const authToken = process.env.TURSO_AUTH_TOKEN;
     const encryptionKey = process.env.TURSO_REMOTE_ENCRYPTION_KEY;
+    const encryptionCipher = process.env.TURSO_REMOTE_ENCRYPTION_CIPHER || 'aes256gcm';
 
     console.log(`Remote URL: ${remoteUrl}`);
     console.log(`Auth Token: ${authToken != null}`);
     console.log(`Encryption: ${encryptionKey != null}`);
+    if (encryptionKey) {
+        console.log(`Cipher: ${encryptionCipher}`);
+    }
 
     const opts = {
         path: ':memory:',
@@ -28,7 +36,8 @@ async function main() {
     // use remote encryption if key is provided
     if (encryptionKey) {
         opts.remoteEncryption = {
-            key: encryptionKey
+            key: encryptionKey,
+            cipher: encryptionCipher,
         };
     }
 
