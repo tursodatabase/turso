@@ -10,7 +10,6 @@ from typing import Any, Callable, Iterable, Optional, Tuple, Union
 
 from ._turso import (
     Misuse,
-    PyRemoteEncryptionCipher as RemoteEncryptionCipher,
     PyTursoAsyncOperation,
     PyTursoAsyncOperationResultKind,
     PyTursoConnection,
@@ -22,6 +21,9 @@ from ._turso import (
     PyTursoSyncIoItem,
     PyTursoSyncIoItemRequestKind,
     py_turso_sync_new,
+)
+from ._turso import (
+    PyRemoteEncryptionCipher as RemoteEncryptionCipher,
 )
 from .lib import Connection as _Connection
 from .lib import _map_turso_exception

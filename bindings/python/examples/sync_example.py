@@ -15,8 +15,7 @@ Environment variables:
 
 import os
 
-from turso.sync import connect, RemoteEncryptionCipher
-
+from turso.sync import RemoteEncryptionCipher, connect
 
 # Map cipher string to enum
 CIPHER_MAP = {
