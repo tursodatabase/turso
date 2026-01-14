@@ -17,7 +17,7 @@ name = "turso_core"
 path = "lib.rs"
 
 [features]
-default = ["fs", "uuid", "time", "json", "series", "encryption"]
+default = ["fs", "uuid", "time", "json", "series", "encryption", "fts"]
 antithesis = ["dep:antithesis_sdk", "antithesis_sdk?/full"]
 tracing_release = ["tracing/release_max_level_info"]
 conn_raw_api = []
@@ -36,6 +36,7 @@ checksum = []
 cli_only = []
 test_helper = []
 bench = []
+fts = ["dep:tantivy"]
 codspeed = ["bench"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -49,6 +50,7 @@ libc = { version = "0.2.172" }
 
 [target.'cfg(not(target_family = "wasm"))'.dependencies]
 libloading = "0.8.6"
+tantivy = { version = "0.25.0", optional = true }
 
 [dependencies]
 antithesis_sdk = { workspace = true, optional = true }

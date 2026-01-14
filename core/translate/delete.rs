@@ -31,7 +31,7 @@ pub fn translate_delete(
     let tbl_name = normalize_ident(tbl_name.name.as_str());
 
     // Check if this is a system table that should be protected from direct writes
-    if crate::schema::is_system_table(&tbl_name) {
+    if !connection.is_nested_stmt() && crate::schema::is_system_table(&tbl_name) {
         crate::bail_parse_error!("table {} may not be modified", tbl_name);
     }
 

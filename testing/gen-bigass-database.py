@@ -374,6 +374,53 @@ cursor.executemany(
     tickets_data,
 )
 
+cursor.execute("""
+    CREATE TABLE IF NOT EXISTS articles (
+        id INTEGER PRIMARY KEY,
+        title TEXT,
+        subtitle TEXT,
+        author TEXT,
+        category TEXT,
+        tags TEXT,
+        summary TEXT,
+        body TEXT,
+        published_at TIMESTAMP,
+        updated_at TIMESTAMP
+    )
+""")
+
+print("Generating articles for FTS testing...")
+categories = ["technology", "science", "business", "health", "politics", "entertainment", "sports", "lifestyle"]
+
+articles_data = []
+for i in range(10000):
+    if i % 1000 == 0:
+        print(f"  Generated {i} articles...")
+
+    title = fake.sentence(nb_words=random.randint(5, 12)).rstrip(".")
+    subtitle = fake.sentence(nb_words=random.randint(8, 15))
+    author = fake.name()
+    category = random.choice(categories)
+    # 3-6 comma-separated tags
+    tags = ", ".join(fake.words(nb=random.randint(3, 6)))
+    # 2-4 sentence summary
+    summary = " ".join(fake.sentences(nb=random.randint(2, 4)))
+    # 20-50 paragraphs body
+    body = "\n\n".join(fake.paragraphs(nb=random.randint(20, 50)))
+    published_at = fake.date_time_between(start_date="-2y", end_date="now")
+    updated_at = fake.date_time_between(start_date=published_at, end_date="now")
+
+    articles_data.append((title, subtitle, author, category, tags, summary, body, published_at, updated_at))
+
+cursor.executemany(
+    """
+    INSERT INTO articles (title, subtitle, author, category, tags, summary, body, published_at, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+""",
+    articles_data,
+)
+
+
 print("Creating indexes...")
 cursor.execute("CREATE INDEX age_idx on users (age)")
 cursor.execute("CREATE INDEX IF NOT EXISTS idx_orders_user_id ON orders(user_id)")
@@ -385,7 +432,8 @@ cursor.execute("CREATE INDEX IF NOT EXISTS idx_reviews_user_id ON reviews(user_i
 cursor.execute("CREATE INDEX IF NOT EXISTS idx_inventory_product_id ON inventory_transactions(product_id)")
 cursor.execute("CREATE INDEX IF NOT EXISTS idx_tickets_user_id ON customer_support_tickets(user_id)")
 cursor.execute("CREATE INDEX IF NOT EXISTS idx_tickets_status ON customer_support_tickets(status)")
-
+cursor.execute("CREATE INDEX IF NOT EXISTS idx_articles_category ON articles(category)")
+cursor.execute("CREATE INDEX IF NOT EXISTS idx_articles_author ON articles(author)")
 conn.commit()
 
 # Print summary statistics
@@ -397,11 +445,10 @@ print(f"Order Items: {cursor.execute('SELECT COUNT(*) FROM order_items').fetchon
 print(f"Reviews: {cursor.execute('SELECT COUNT(*) FROM reviews').fetchone()[0]:,}")
 print(f"Inventory Transactions: {cursor.execute('SELECT COUNT(*) FROM inventory_transactions').fetchone()[0]:,}")
 print(f"Support Tickets: {cursor.execute('SELECT COUNT(*) FROM customer_support_tickets').fetchone()[0]:,}")
-
+print(f"Articles: {cursor.execute('SELECT COUNT(*) FROM articles').fetchone()[0]:,}")
 # Calculate approximate database size
 cursor.execute("SELECT page_count * page_size as size FROM pragma_page_count(), pragma_page_size()")
 size_bytes = cursor.fetchone()[0]
 print(f"\nApproximate database size: {size_bytes / (1024 * 1024):.2f} MB")
-
 conn.close()
 print("\nDatabase created successfully!")

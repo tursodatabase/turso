@@ -2,6 +2,8 @@
 mod dynamic;
 mod vtab_xconnect;
 use crate::index_method::backing_btree::BackingBtreeIndexMethod;
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+use crate::index_method::fts::{FtsIndexMethod, FTS_INDEX_METHOD_NAME};
 use crate::index_method::toy_vector_sparse_ivf::VectorSparseInvertedIndexMethod;
 use crate::index_method::{
     BACKING_BTREE_INDEX_METHOD_NAME, TOY_VECTOR_SPARSE_IVF_INDEX_METHOD_NAME,
@@ -176,6 +178,9 @@ impl Database {
                 BACKING_BTREE_INDEX_METHOD_NAME.to_string(),
                 Arc::new(BackingBtreeIndexMethod),
             );
+            #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+            syms.index_methods
+                .insert(FTS_INDEX_METHOD_NAME.to_string(), Arc::new(FtsIndexMethod));
         }
         let syms = self.builtin_syms.data_ptr();
         // Pass the mutex pointer and the appropriate handler

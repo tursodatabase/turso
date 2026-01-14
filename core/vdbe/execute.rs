@@ -1910,6 +1910,7 @@ pub fn halt(
         }
         state.end_statement(&program.connection, pager, EndStatement::ReleaseSavepoint)?;
         vtab_commit_all(&program.connection)?;
+        index_method_pre_commit_all(state, pager)?;
         program
             .commit_txn(pager.clone(), state, mv_store.as_ref(), false)
             .map(Into::into)
@@ -1934,6 +1935,27 @@ fn vtab_commit_all(conn: &Connection) -> crate::Result<()> {
             .find(|(_, vtab)| vtab.id() == id)
             .expect("vtab must exist");
         vtab.1.commit()?;
+    }
+    Ok(())
+}
+
+/// Flush pending writes on all index method cursors before transaction commit.
+/// This ensures index method writes are persisted as part of the transaction.
+fn index_method_pre_commit_all(state: &mut ProgramState, pager: &Arc<Pager>) -> crate::Result<()> {
+    for cursor_opt in state.cursors.iter_mut().flatten() {
+        let Cursor::IndexMethod(cursor) = cursor_opt else {
+            continue;
+        };
+        loop {
+            match cursor.pre_commit()? {
+                IOResult::Done(()) => break,
+                IOResult::IO(io) => {
+                    while !io.finished() {
+                        pager.io.step()?;
+                    }
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -2330,6 +2352,11 @@ pub fn op_auto_commit(
                 "cannot use BEGIN after BEGIN CONCURRENT".to_string(),
             ));
         }
+    }
+
+    // For explicit COMMIT, flush any pending index method writes first
+    if is_commit_req {
+        index_method_pre_commit_all(state, pager)?;
     }
 
     let res = program
@@ -5908,6 +5935,104 @@ pub fn op_function(
                 state.registers[*dest + 4] = Register::Value(sql.clone());
             }
         }
+        #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+        crate::function::Func::Fts(fts_func) => {
+            // FTS functions are typically handled via index method pattern matching.
+            // If we reach here, just return a fallback since no FTS index matched.
+            use crate::function::FtsFunc;
+            match fts_func {
+                FtsFunc::Score => {
+                    // Without an FTS index match, return 0.0 as a default score
+                    state.registers[*dest] = Register::Value(Value::Float(0.0));
+                }
+                FtsFunc::Match => {
+                    // fts_match(col1, col2, ..., query): returns 1 if any column matches query
+                    // Minimum: fts_match(text, query) = 2 args
+                    if arg_count < 2 {
+                        return Err(LimboError::InvalidArgument(
+                            "fts_match requires at least 2 arguments: text, query".to_string(),
+                        ));
+                    }
+
+                    // Last arg is the query, first N-1 args are text columns
+                    let num_text_cols = arg_count - 1;
+                    let query = state.registers[*start_reg + num_text_cols].get_value();
+
+                    if matches!(query, Value::Null) {
+                        state.registers[*dest] = Register::Value(Value::Integer(0));
+                    } else {
+                        let query_str = query.to_string();
+
+                        // Concatenate all text columns with space separator
+                        let est_len = 16;
+                        let mut combined_text = String::with_capacity(num_text_cols * est_len);
+                        for i in 0..num_text_cols {
+                            let text = state.registers[*start_reg + i].get_value();
+                            if !matches!(text, Value::Null) {
+                                if !combined_text.is_empty() {
+                                    combined_text.push(' ');
+                                }
+                                combined_text.push_str(&text.to_string());
+                            }
+                        }
+
+                        let matches =
+                            crate::index_method::fts::fts_match(&combined_text, &query_str);
+                        state.registers[*dest] = Register::Value(Value::Integer(matches.into()));
+                    }
+                }
+                FtsFunc::Highlight => {
+                    // fts_highlight(col1, col2, ..., before_tag, after_tag, query)
+                    // Variable number of text columns, followed by before_tag, after_tag, query
+                    // Minimum: fts_highlight(text, before_tag, after_tag, query) = 4 args
+                    if arg_count < 4 {
+                        return Err(LimboError::InvalidArgument(
+                            "fts_highlight requires at least 4 arguments: text, before_tag, after_tag, query"
+                                .to_string(),
+                        ));
+                    }
+
+                    // Last 3 args are: before_tag, after_tag, query
+                    // First N-3 args are text columns
+                    let num_text_cols = arg_count - 3;
+                    let before_tag = state.registers[*start_reg + num_text_cols].get_value();
+                    let after_tag = state.registers[*start_reg + num_text_cols + 1].get_value();
+                    let query = state.registers[*start_reg + num_text_cols + 2].get_value();
+
+                    // Handle NULL values in tags or query
+                    if matches!(query, Value::Null)
+                        || matches!(before_tag, Value::Null)
+                        || matches!(after_tag, Value::Null)
+                    {
+                        state.registers[*dest] = Register::Value(Value::Null);
+                    } else {
+                        let query_str = query.to_string();
+                        let before_str = before_tag.to_string();
+                        let after_str = after_tag.to_string();
+
+                        // Concatenate all text columns with space separator
+                        let mut combined_text = String::new();
+                        for i in 0..num_text_cols {
+                            let text = state.registers[*start_reg + i].get_value();
+                            if !matches!(text, Value::Null) {
+                                if !combined_text.is_empty() {
+                                    combined_text.push(' ');
+                                }
+                                combined_text.push_str(&text.to_string());
+                            }
+                        }
+
+                        let highlighted = crate::index_method::fts::fts_highlight(
+                            &combined_text,
+                            &query_str,
+                            &before_str,
+                            &after_str,
+                        );
+                        state.registers[*dest] = Register::Value(Value::build_text(highlighted));
+                    }
+                }
+            }
+        }
         crate::function::Func::Agg(_) => {
             unreachable!("Aggregate functions should not be handled here")
         }
@@ -7430,7 +7555,7 @@ pub fn op_index_method_destroy(
     if let Some(_mv_store) = mv_store.as_ref() {
         todo!("MVCC is not supported yet");
     }
-    if let (_, CursorType::IndexMethod(module)) = &program.cursor_ref[*cursor_id] {
+    if let Some((_, CursorType::IndexMethod(module))) = program.cursor_ref.get(*cursor_id) {
         if state.cursors[*cursor_id].is_none() {
             let cursor = module.init()?;
             let cursor_ref = &mut state.cursors[*cursor_id];
@@ -7442,6 +7567,38 @@ pub fn op_index_method_destroy(
         .expect("cursor should exist");
     let cursor = cursor.as_index_method_mut();
     return_if_io!(cursor.destroy(&program.connection));
+
+    state.pc += 1;
+    Ok(InsnFunctionStepResult::Step)
+}
+
+pub fn op_index_method_optimize(
+    program: &Program,
+    state: &mut ProgramState,
+    insn: &Insn,
+    _pager: &Arc<Pager>,
+) -> Result<InsnFunctionStepResult> {
+    load_insn!(IndexMethodOptimize { db, cursor_id }, insn);
+    assert_eq!(*db, 0);
+    if program.connection.is_readonly(*db) {
+        return Err(LimboError::ReadOnly);
+    }
+    let mv_store = program.connection.mv_store();
+    if let Some(_mv_store) = mv_store.as_ref() {
+        todo!("MVCC is not supported yet");
+    }
+    if let Some((_, CursorType::IndexMethod(module))) = program.cursor_ref.get(*cursor_id) {
+        if state.cursors[*cursor_id].is_none() {
+            let cursor = module.init()?;
+            let cursor_ref = &mut state.cursors[*cursor_id];
+            *cursor_ref = Some(Cursor::IndexMethod(cursor));
+        }
+    }
+    let cursor = state.cursors[*cursor_id]
+        .as_mut()
+        .expect("cursor should exist");
+    let cursor = cursor.as_index_method_mut();
+    return_if_io!(cursor.optimize(&program.connection));
 
     state.pc += 1;
     Ok(InsnFunctionStepResult::Step)
@@ -7464,9 +7621,6 @@ pub fn op_index_method_query(
         insn
     );
     assert_eq!(*db, 0);
-    if program.connection.is_readonly(*db) {
-        return Err(LimboError::ReadOnly);
-    }
     let mv_store = program.connection.mv_store();
     if let Some(_mv_store) = mv_store.as_ref() {
         todo!("MVCC is not supported yet");

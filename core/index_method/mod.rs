@@ -11,6 +11,8 @@ use crate::{
 };
 
 pub mod backing_btree;
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+pub mod fts;
 pub mod toy_vector_sparse_ivf;
 
 pub const BACKING_BTREE_INDEX_METHOD_NAME: &str = "backing_btree";
@@ -57,6 +59,17 @@ pub struct IndexMethodDefinition<'a> {
     pub patterns: &'a [ast::Select],
     /// special marker which forces tursodb core to treat index method as backing btree - so it will allocate real btree on disk for that index method
     pub backing_btree: bool,
+}
+
+/// Cost estimate returned by custom index methods for optimizer integration.
+/// This enables the optimizer to make cost-based decisions when choosing between
+/// custom index methods and traditional BTree indexes.
+#[derive(Debug, Clone, Copy)]
+pub struct IndexMethodCostEstimate {
+    /// Estimated CPU/IO cost (lower is better, comparable to optimizer Cost values)
+    pub estimated_cost: f64,
+    /// Estimated number of rows returned by the query
+    pub estimated_rows: u64,
 }
 
 /// cursor opened for index method and capable of executing DML/DDL/DQL queries for the index method over fixed table
@@ -113,6 +126,30 @@ pub trait IndexMethodCursor {
     /// enrich its result with name, comment, rating columns from original table accessing original row by its rowid
     /// returned from query_rowid(...) method
     fn query_rowid(&mut self) -> Result<IOResult<Option<i64>>>;
+
+    /// Called before transaction commit to flush any pending writes.
+    /// This ensures index method writes are persisted as part of the transaction.
+    fn pre_commit(&mut self) -> Result<IOResult<()>> {
+        Ok(IOResult::Done(()))
+    }
+
+    /// Optimize the index by merging segments or performing other maintenance.
+    fn optimize(&mut self, _connection: &Arc<Connection>) -> Result<IOResult<()>> {
+        Ok(IOResult::Done(()))
+    }
+
+    /// Estimate the cost of executing a query with the given pattern.
+    ///
+    /// This method enables the optimizer to make cost-based decisions when choosing
+    /// between custom index methods and traditional BTree indexes.
+    fn estimate_cost(
+        &self,
+        pattern_idx: usize,
+        base_table_rows: f64,
+    ) -> Option<IndexMethodCostEstimate> {
+        let _ = (pattern_idx, base_table_rows);
+        None
+    }
 }
 
 /// helper method to open table BTree cursor in the index method implementation

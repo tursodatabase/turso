@@ -6,6 +6,8 @@ use turso_parser::ast::{self, Expr, SubqueryType, UnaryOperator};
 use super::emitter::Resolver;
 use super::optimizer::Optimizable;
 use super::plan::TableReferences;
+#[cfg(all(feature = "fts", not(target_family = "wasm")))]
+use crate::function::FtsFunc;
 #[cfg(feature = "json")]
 use crate::function::JsonFunc;
 use crate::function::{Func, FuncCtx, MathFuncArity, ScalarFunc, VectorFunc};
@@ -2191,6 +2193,19 @@ pub fn translate_expr(
                         Ok(target_register)
                     }
                 },
+                #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+                Func::Fts(_) => {
+                    // FTS functions are handled via index method pattern matching.
+                    // If we reach here, no index matched, so translate as a regular function call.
+                    translate_function(
+                        program,
+                        args,
+                        referenced_tables,
+                        resolver,
+                        target_register,
+                        func_ctx,
+                    )
+                }
                 Func::AlterTable(_) => unreachable!(),
             }
         }
@@ -3460,7 +3475,43 @@ fn translate_like_base(
                 },
             });
         }
-        ast::LikeOperator::Match => crate::bail_parse_error!("MATCH in LIKE is not supported"),
+        #[cfg(all(feature = "fts", not(target_family = "wasm")))]
+        ast::LikeOperator::Match => {
+            // Transform MATCH to fts_match():
+            // - `col MATCH 'query'` -> `fts_match(col, 'query')`
+            // - `(col1, col2) MATCH 'query'` -> `fts_match(col1, col2, 'query')`
+            let columns: Vec<&ast::Expr> = match lhs.as_ref() {
+                ast::Expr::Parenthesized(cols) => cols.iter().map(|c| c.as_ref()).collect(),
+                other => vec![other],
+            };
+            let arg_count = columns.len() + 1; // columns + query
+            let start_reg = program.alloc_registers(arg_count);
+
+            for (i, col) in columns.iter().enumerate() {
+                translate_expr(program, referenced_tables, col, start_reg + i, resolver)?;
+            }
+            translate_expr(
+                program,
+                referenced_tables,
+                rhs,
+                start_reg + columns.len(),
+                resolver,
+            )?;
+
+            program.emit_insn(Insn::Function {
+                constant_mask: 0,
+                start_reg,
+                dest: target_register,
+                func: FuncCtx {
+                    func: Func::Fts(FtsFunc::Match),
+                    arg_count,
+                },
+            });
+        }
+        #[cfg(any(not(feature = "fts"), target_family = "wasm"))]
+        ast::LikeOperator::Match => {
+            crate::bail_parse_error!("MATCH requires the 'fts' feature to be enabled")
+        }
         ast::LikeOperator::Regexp => crate::bail_parse_error!("REGEXP in LIKE is not supported"),
     }
 
@@ -4831,9 +4882,10 @@ pub fn expr_vector_size(expr: &Expr) -> Result<usize> {
             }
             1
         }
-        Expr::Like { lhs, rhs, .. } => {
+        Expr::Like { lhs, rhs, op, .. } => {
             let evs_lhs = expr_vector_size(lhs)?;
-            if evs_lhs != 1 {
+            // MATCH allows multi-column LHS: (col1, col2) MATCH 'query'
+            if evs_lhs != 1 && *op != ast::LikeOperator::Match {
                 crate::bail_parse_error!(
                     "left operand of LIKE must return 1 value. Got: ({evs_lhs})"
                 );
