@@ -44,6 +44,52 @@ fn get_random() -> u64 {
     antithesis_sdk::random::get_random()
 }
 
+/// A Shuttle scheduler that uses Antithesis's RNG for all randomness.
+///
+/// This enables Antithesis to control:
+/// - Which task runs next at each scheduling point
+/// - All random values requested by the test workload
+///
+/// The scheduler runs indefinitely since Antithesis controls test duration.
+#[cfg(all(shuttle, feature = "antithesis"))]
+mod antithesis_scheduler {
+    use shuttle::scheduler::{Schedule, Scheduler, Task, TaskId};
+
+    pub struct AntithesisScheduler;
+
+    impl AntithesisScheduler {
+        pub fn new() -> Self {
+            AntithesisScheduler
+        }
+    }
+
+    impl Scheduler for AntithesisScheduler {
+        /// Start a new execution. Always returns Some to run indefinitely.
+        /// Antithesis controls when to terminate the test externally.
+        fn new_execution(&mut self) -> Option<Schedule> {
+            Some(Schedule::default())
+        }
+
+        /// Select the next task to run from the list of runnable tasks.
+        /// Uses Antithesis's random_choice to make the selection, enabling
+        /// Antithesis to guide exploration of different interleaving patterns.
+        fn next_task(
+            &mut self,
+            runnable_tasks: &[&Task],
+            _current_task: Option<TaskId>,
+            _is_yielding: bool,
+        ) -> Option<TaskId> {
+            antithesis_sdk::random::random_choice(runnable_tasks).map(|task| task.id())
+        }
+
+        /// Generate the next random u64 value.
+        /// Delegates directly to Antithesis RNG for full control.
+        fn next_u64(&mut self) -> u64 {
+            antithesis_sdk::random::get_random()
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Plan {
     pub ddl_statements: Vec<String>,
@@ -675,7 +721,27 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     rt.block_on(async_main())
 }
 
-#[cfg(shuttle)]
+/// Main entry point when running with both Shuttle and Antithesis.
+/// Uses AntithesisScheduler for Antithesis-controlled randomness.
+#[cfg(all(shuttle, feature = "antithesis"))]
+fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    use antithesis_scheduler::AntithesisScheduler;
+
+    let mut config = shuttle::Config::default();
+    config.stack_size *= 10;
+    // Use a very high step limit since Antithesis controls duration
+    config.max_steps = shuttle::MaxSteps::FailAfter(100_000_000);
+
+    let scheduler = AntithesisScheduler::new();
+    let runner = shuttle::Runner::new(scheduler, config);
+
+    // Run indefinitely - Antithesis will terminate when done exploring
+    runner.run(|| shuttle::future::block_on(Box::pin(async_main())).unwrap());
+
+    Ok(())
+}
+
+#[cfg(all(shuttle, not(feature = "antithesis")))]
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use shuttle::scheduler::RandomScheduler;
 
