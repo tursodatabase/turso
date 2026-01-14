@@ -186,6 +186,27 @@ jobs:
             ./scripts/run-sim ${{ matrix.profile.args }} || exit 1
           done
 
+  sim-redo:
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Setup mold linker
+        uses: rui314/setup-mold@v1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          prefix-key: "v1-rust"
+          cache-on-failure: true
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Run sim_redo
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: "sccache"
+        run: |
+          cargo run -p sim_redo -- -n 1000 loop 10
+
   test-limbo:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 20
