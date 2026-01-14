@@ -3477,19 +3477,29 @@ mod fuzz_tests {
                     // Maybe include int column comparison
                     if !int_cols.is_empty() && rng.random_bool(0.8) {
                         let c = &int_cols[rng.random_range(0..int_cols.len())];
-                        match rng.random_range(0..3) {
+                        match rng.random_range(0..4) {
                             0 => parts.push(format!("{c} IS NOT NULL")),
                             1 => {
                                 let n = rng.random_range(-10..=20);
                                 let op = *["<", "<=", "=", ">=", ">"].choose(&mut rng).unwrap();
                                 parts.push(format!("{c} {op} {n}"));
                             }
-                            _ => {
+                            2 => {
                                 let n = rng.random_range(0..=1);
                                 parts.push(format!(
                                     "{c} IS {}",
                                     if n == 0 { "NULL" } else { "NOT NULL" }
                                 ));
+                            }
+                            _ => {
+                                // BETWEEN expression
+                                let lo = rng.random_range(-10..=10);
+                                let hi = rng.random_range(lo..=20);
+                                if rng.random_bool(0.2) {
+                                    parts.push(format!("{c} NOT BETWEEN {lo} AND {hi}"));
+                                } else {
+                                    parts.push(format!("{c} BETWEEN {lo} AND {hi}"));
+                                }
                             }
                         }
                     }
