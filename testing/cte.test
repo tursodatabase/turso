@@ -314,3 +314,32 @@ do_execsql_test_on_specific_db {:memory:} cte-scalar-subquery-chain {
 do_execsql_test_on_specific_db {:memory:} cte-scalar-subquery-compound {
     WITH t AS (SELECT 1 UNION SELECT 2 UNION SELECT 3) SELECT (SELECT COUNT(*) FROM t);
 } {3}
+
+# =============================================================================
+# Error cases for unsupported CTE features
+# =============================================================================
+
+# CTE with explicit column names (not yet supported)
+do_execsql_test_in_memory_error_content cte-explicit-columns-unsupported {
+    WITH t(a, b) AS (SELECT 1, 2) SELECT * FROM t;
+} {CTE columns are not yet supported}
+
+# Recursive CTEs (not yet supported)
+do_execsql_test_in_memory_error_content cte-recursive-unsupported {
+    WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM cnt WHERE x<5) SELECT * FROM cnt;
+} {Recursive CTEs are not yet supported}
+
+# MATERIALIZED hint (not yet supported)
+do_execsql_test_in_memory_error_content cte-materialized-unsupported {
+    WITH t AS MATERIALIZED (SELECT 1 as x) SELECT * FROM t;
+} {Materialized CTEs are not yet supported}
+
+# NOT MATERIALIZED hint is accepted (ignored but valid)
+do_execsql_test_on_specific_db {:memory:} cte-not-materialized-accepted {
+    WITH t AS NOT MATERIALIZED (SELECT 1 as x) SELECT * FROM t;
+} {1}
+
+# Duplicate CTE names should fail
+do_execsql_test_in_memory_error_content cte-duplicate-name {
+    WITH t AS (SELECT 1), t AS (SELECT 2) SELECT * FROM t;
+} {duplicate WITH table name}
