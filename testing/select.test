@@ -1680,3 +1680,7 @@ do_execsql_test_on_specific_db {:memory:} select-sqlite-schema-empty-db {
 do_execsql_test_error select-param-zero-invalid {
   SELECT ?0
 } {.*variable number must be between.*}
+
+do_execsql_test_on_specific_db {:memory:} substr-i64-min-start {
+  SELECT SUBSTR('hello', -9223372036854775808);
+} {hello}

@@ -451,7 +451,7 @@ impl Value {
             // The left-most character of X is number 1.
             // If Y is negative then the first character of the substring is found by counting from the right rather than the left.
             let first_position = if start < 0 {
-                bytes_len.saturating_sub((start).abs())
+                bytes_len.saturating_sub((start).saturating_abs())
             } else {
                 start - 1
             };
