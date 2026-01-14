@@ -293,10 +293,20 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
                 let setups = test_file.setups.clone();
                 let file_path = path.to_path_buf();
                 let mvcc = self.config.mvcc;
+                let global_skip = test_file.global_skip.clone();
 
                 futures.push(tokio::spawn(async move {
                     let _permit = semaphore.acquire_owned().await.unwrap();
-                    run_single_test(backend, file_path, db_config, test, setups, mvcc).await
+                    run_single_test(
+                        backend,
+                        file_path,
+                        db_config,
+                        test,
+                        setups,
+                        mvcc,
+                        global_skip,
+                    )
+                    .await
                 }));
             }
         }
@@ -443,11 +453,13 @@ async fn run_single_test<B: SqlBackend>(
     test: TestCase,
     setups: std::collections::HashMap<String, String>,
     mvcc: bool,
+    global_skip: Option<crate::parser::ast::Skip>,
 ) -> TestResult {
     let start = Instant::now();
 
-    // Check if skipped
-    if let Some(skip) = &test.skip {
+    // Check if skipped (per-test skip overrides global skip)
+    let effective_skip = test.skip.as_ref().or(global_skip.as_ref());
+    if let Some(skip) = effective_skip {
         let should_skip = match &skip.condition {
             None => true, // Unconditional skip
             Some(crate::parser::ast::SkipCondition::Mvcc) => mvcc,

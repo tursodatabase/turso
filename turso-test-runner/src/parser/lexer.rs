@@ -48,6 +48,14 @@ pub enum Token {
     #[token("@skip-if")]
     AtSkipIf,
 
+    /// `@skip-file` (global file-level skip)
+    #[token("@skip-file")]
+    AtSkipFile,
+
+    /// `@skip-file-if` (global file-level conditional skip)
+    #[token("@skip-file-if")]
+    AtSkipFileIf,
+
     /// `mvcc` keyword (for skip conditions)
     #[token("mvcc")]
     Mvcc,
@@ -141,6 +149,8 @@ impl fmt::Display for Token {
             Token::AtSetup => write!(f, "@setup"),
             Token::AtSkip => write!(f, "@skip"),
             Token::AtSkipIf => write!(f, "@skip-if"),
+            Token::AtSkipFile => write!(f, "@skip-file"),
+            Token::AtSkipFileIf => write!(f, "@skip-file-if"),
             Token::Mvcc => write!(f, "mvcc"),
             Token::AtBackend => write!(f, "@backend"),
             Token::Setup => write!(f, "setup"),

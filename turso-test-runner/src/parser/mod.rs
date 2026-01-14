@@ -29,6 +29,7 @@ impl Parser {
         let mut databases = Vec::new();
         let mut setups = HashMap::new();
         let mut tests = Vec::new();
+        let mut global_skip = None;
 
         while !self.is_at_end() {
             self.skip_newlines_and_comments();
@@ -41,6 +42,13 @@ impl Parser {
                 Some(Token::AtDatabase) => {
                     databases.push(self.parse_database()?);
                 }
+                // Global @skip-file or @skip-file-if: applies to all tests in the file
+                Some(Token::AtSkipFile) => {
+                    global_skip = Some(self.parse_global_skip()?);
+                }
+                Some(Token::AtSkipFileIf) => {
+                    global_skip = Some(self.parse_global_skip_if()?);
+                }
                 Some(Token::Setup) => {
                     let (name, sql) = self.parse_setup()?;
                     if setups.contains_key(&name) {
@@ -48,7 +56,13 @@ impl Parser {
                     }
                     setups.insert(name, sql);
                 }
-                Some(Token::AtSetup | Token::AtSkip | Token::AtSkipIf | Token::AtBackend | Token::Test) => {
+                Some(
+                    Token::AtSetup
+                    | Token::AtSkip
+                    | Token::AtSkipIf
+                    | Token::AtBackend
+                    | Token::Test,
+                ) => {
                     tests.push(self.parse_test()?);
                 }
                 Some(token) => {
@@ -62,6 +76,7 @@ impl Parser {
             databases,
             setups,
             tests,
+            global_skip,
         };
 
         self.validate(&test_file)?;
@@ -122,6 +137,25 @@ impl Parser {
             ))),
             None => Err(self.error("expected database specifier, got EOF".to_string())),
         }
+    }
+
+    fn parse_global_skip(&mut self) -> Result<ast::Skip, ParseError> {
+        self.expect_token(Token::AtSkipFile)?;
+        let reason = self.expect_string()?;
+        Ok(ast::Skip {
+            reason,
+            condition: None,
+        })
+    }
+
+    fn parse_global_skip_if(&mut self) -> Result<ast::Skip, ParseError> {
+        self.expect_token(Token::AtSkipFileIf)?;
+        let condition = self.parse_skip_condition()?;
+        let reason = self.expect_string()?;
+        Ok(ast::Skip {
+            reason,
+            condition: Some(condition),
+        })
     }
 
     fn parse_setup(&mut self) -> Result<(String, String), ParseError> {
@@ -752,5 +786,108 @@ expect {
 
         let result = parse(input);
         assert!(matches!(result, Err(ParseError::ValidationError { .. })));
+    }
+
+    #[test]
+    fn test_parse_global_skip() {
+        let input = r#"
+@database :memory:
+@skip-file "all tests skipped"
+
+test select-1 {
+    SELECT 1;
+}
+expect {
+    1
+}
+"#;
+
+        let file = parse(input).unwrap();
+        assert_eq!(
+            file.global_skip,
+            Some(ast::Skip {
+                reason: "all tests skipped".to_string(),
+                condition: None,
+            })
+        );
+        // Per-test skip should be None since we're using global skip
+        assert!(file.tests[0].skip.is_none());
+    }
+
+    #[test]
+    fn test_parse_global_skip_if_mvcc() {
+        let input = r#"
+@database :memory:
+@skip-file-if mvcc "MVCC not supported for this file"
+
+test select-1 {
+    SELECT 1;
+}
+expect {
+    1
+}
+
+test select-2 {
+    SELECT 2;
+}
+expect {
+    2
+}
+"#;
+
+        let file = parse(input).unwrap();
+        assert_eq!(
+            file.global_skip,
+            Some(ast::Skip {
+                reason: "MVCC not supported for this file".to_string(),
+                condition: Some(ast::SkipCondition::Mvcc),
+            })
+        );
+        // All tests should have no per-test skip
+        assert!(file.tests[0].skip.is_none());
+        assert!(file.tests[1].skip.is_none());
+    }
+
+    #[test]
+    fn test_parse_global_skip_with_per_test_override() {
+        let input = r#"
+@database :memory:
+@skip-file-if mvcc "global skip reason"
+
+test test-with-override {
+    SELECT 1;
+}
+expect {
+    1
+}
+
+@skip "per-test skip"
+test test-overridden {
+    SELECT 2;
+}
+expect {
+    2
+}
+"#;
+
+        let file = parse(input).unwrap();
+        // Global skip should be set
+        assert_eq!(
+            file.global_skip,
+            Some(ast::Skip {
+                reason: "global skip reason".to_string(),
+                condition: Some(ast::SkipCondition::Mvcc),
+            })
+        );
+        // First test has no per-test skip (uses global)
+        assert!(file.tests[0].skip.is_none());
+        // Second test has per-test skip (overrides global)
+        assert_eq!(
+            file.tests[1].skip,
+            Some(ast::Skip {
+                reason: "per-test skip".to_string(),
+                condition: None,
+            })
+        );
     }
 }

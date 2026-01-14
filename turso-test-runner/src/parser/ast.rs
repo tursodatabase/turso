@@ -12,6 +12,8 @@ pub struct TestFile {
     pub setups: HashMap<String, String>,
     /// Test cases
     pub tests: Vec<TestCase>,
+    /// Global skip directive that applies to all tests in the file
+    pub global_skip: Option<Skip>,
 }
 
 /// A setup reference with its span in the source
