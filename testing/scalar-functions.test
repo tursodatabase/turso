@@ -39,6 +39,11 @@ do_execsql_test concat_ws-complex-args {
   select concat_ws(',', 'a' || 'b', 'b' || 'c', 'c' || 'd');
 } {ab,bc,cd}
 
+# Regression test: CONCAT with complex first argument that allocates internal registers
+do_execsql_test concat-complex-first-arg {
+  select concat((1 IN (2,3)), 'hello', 'world')
+} {0helloworld}
+
 do_execsql_test char {
   select char(108, 105)
 } {li}
@@ -604,6 +609,11 @@ do_execsql_test nullif {
 do_execsql_test nullif {
   select nullif('limbo', 'limbo')
 } {}
+
+# Regression test: NULLIF with complex first argument that allocates internal registers
+do_execsql_test nullif-complex-first-arg {
+  select nullif((1 IN (2,3)), 5)
+} {0}
 
 do_execsql_test substr-3-args {
   SELECT substr('limbo', 1, 3);

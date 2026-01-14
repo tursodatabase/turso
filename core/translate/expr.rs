@@ -1375,15 +1375,21 @@ pub fn translate_expr(
                                     srf.to_string()
                                 );
                             };
-                            let mut start_reg = None;
-                            for arg in args.iter() {
-                                let reg = program.alloc_register();
-                                start_reg = Some(start_reg.unwrap_or(reg));
-                                translate_expr(program, referenced_tables, arg, reg, resolver)?;
+                            // Allocate all registers upfront to ensure they're consecutive,
+                            // since translate_expr may allocate internal registers.
+                            let start_reg = program.alloc_registers(args.len());
+                            for (i, arg) in args.iter().enumerate() {
+                                translate_expr(
+                                    program,
+                                    referenced_tables,
+                                    arg,
+                                    start_reg + i,
+                                    resolver,
+                                )?;
                             }
                             program.emit_insn(Insn::Function {
                                 constant_mask: 0,
-                                start_reg: start_reg.unwrap(),
+                                start_reg,
                                 dest: target_register,
                                 func: func_ctx,
                             });
@@ -1855,7 +1861,10 @@ pub fn translate_expr(
                                 );
                             }
 
+                            // Allocate both registers first to ensure they're consecutive,
+                            // since translate_expr may allocate internal registers.
                             let first_reg = program.alloc_register();
+                            let second_reg = program.alloc_register();
                             translate_expr(
                                 program,
                                 referenced_tables,
@@ -1863,8 +1872,7 @@ pub fn translate_expr(
                                 first_reg,
                                 resolver,
                             )?;
-                            let second_reg = program.alloc_register();
-                            let _ = translate_expr(
+                            translate_expr(
                                 program,
                                 referenced_tables,
                                 &args[1],
