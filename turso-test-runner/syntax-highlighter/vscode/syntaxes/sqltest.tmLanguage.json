@@ -1,0 +1,162 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "SQLTest",
+  "scopeName": "source.sqltest",
+  "patterns": [
+    { "include": "#comment" },
+    { "include": "#database-declaration" },
+    { "include": "#setup-block" },
+    { "include": "#test-decorator" },
+    { "include": "#test-block" },
+    { "include": "#expect-block" }
+  ],
+  "repository": {
+    "comment": {
+      "name": "comment.line.number-sign.sqltest",
+      "match": "#.*$"
+    },
+    "database-declaration": {
+      "name": "meta.database-declaration.sqltest",
+      "begin": "(@database)\\s+",
+      "beginCaptures": {
+        "1": { "name": "keyword.control.directive.sqltest" }
+      },
+      "end": "$",
+      "patterns": [
+        {
+          "name": "constant.language.sqltest",
+          "match": ":(memory|temp|default|default-no-rowidalias):"
+        },
+        {
+          "name": "storage.modifier.sqltest",
+          "match": "\\breadonly\\b"
+        },
+        {
+          "name": "string.unquoted.path.sqltest",
+          "match": "[a-zA-Z0-9_./-]+\\.[a-zA-Z0-9]+"
+        }
+      ]
+    },
+    "setup-block": {
+      "name": "meta.setup-block.sqltest",
+      "begin": "\\b(setup)\\s+([a-zA-Z_][a-zA-Z0-9_-]*)\\s*(\\{)",
+      "beginCaptures": {
+        "1": { "name": "keyword.control.sqltest" },
+        "2": { "name": "entity.name.function.sqltest" },
+        "3": { "name": "punctuation.section.block.begin.sqltest" }
+      },
+      "end": "(\\})",
+      "endCaptures": {
+        "1": { "name": "punctuation.section.block.end.sqltest" }
+      },
+      "contentName": "source.sql",
+      "patterns": [
+        { "include": "source.sql" }
+      ]
+    },
+    "test-decorator": {
+      "patterns": [
+        { "include": "#decorator-setup" },
+        { "include": "#decorator-skip" },
+        { "include": "#decorator-skip-if" },
+        { "include": "#decorator-backend" }
+      ]
+    },
+    "decorator-setup": {
+      "name": "meta.decorator.setup.sqltest",
+      "match": "(@setup)\\s+([a-zA-Z_][a-zA-Z0-9_-]*)",
+      "captures": {
+        "1": { "name": "keyword.control.directive.sqltest" },
+        "2": { "name": "entity.name.function.sqltest" }
+      }
+    },
+    "decorator-skip": {
+      "name": "meta.decorator.skip.sqltest",
+      "begin": "(@skip)\\s+(\")",
+      "beginCaptures": {
+        "1": { "name": "keyword.control.directive.sqltest" },
+        "2": { "name": "punctuation.definition.string.begin.sqltest" }
+      },
+      "end": "(\")",
+      "endCaptures": {
+        "1": { "name": "punctuation.definition.string.end.sqltest" }
+      },
+      "contentName": "string.quoted.double.sqltest",
+      "patterns": [
+        {
+          "name": "constant.character.escape.sqltest",
+          "match": "\\\\."
+        }
+      ]
+    },
+    "decorator-skip-if": {
+      "name": "meta.decorator.skip-if.sqltest",
+      "begin": "(@skip-if)\\s+(mvcc)\\s+(\")",
+      "beginCaptures": {
+        "1": { "name": "keyword.control.directive.sqltest" },
+        "2": { "name": "constant.language.sqltest" },
+        "3": { "name": "punctuation.definition.string.begin.sqltest" }
+      },
+      "end": "(\")",
+      "endCaptures": {
+        "1": { "name": "punctuation.definition.string.end.sqltest" }
+      },
+      "contentName": "string.quoted.double.sqltest",
+      "patterns": [
+        {
+          "name": "constant.character.escape.sqltest",
+          "match": "\\\\."
+        }
+      ]
+    },
+    "decorator-backend": {
+      "name": "meta.decorator.backend.sqltest",
+      "match": "(@backend)\\s+(rust|cli)",
+      "captures": {
+        "1": { "name": "keyword.control.directive.sqltest" },
+        "2": { "name": "constant.language.sqltest" }
+      }
+    },
+    "test-block": {
+      "name": "meta.test-block.sqltest",
+      "begin": "\\b(test)\\s+([a-zA-Z_][a-zA-Z0-9_-]*)\\s*(\\{)",
+      "beginCaptures": {
+        "1": { "name": "keyword.control.sqltest" },
+        "2": { "name": "entity.name.function.sqltest" },
+        "3": { "name": "punctuation.section.block.begin.sqltest" }
+      },
+      "end": "(\\})",
+      "endCaptures": {
+        "1": { "name": "punctuation.section.block.end.sqltest" }
+      },
+      "contentName": "source.sql",
+      "patterns": [
+        { "include": "source.sql" }
+      ]
+    },
+    "expect-block": {
+      "name": "meta.expect-block.sqltest",
+      "begin": "\\b(expect)(?:\\s+(error|pattern|unordered|raw))?\\s*(\\{)",
+      "beginCaptures": {
+        "1": { "name": "keyword.control.sqltest" },
+        "2": { "name": "storage.modifier.sqltest" },
+        "3": { "name": "punctuation.section.block.begin.sqltest" }
+      },
+      "end": "(\\})",
+      "endCaptures": {
+        "1": { "name": "punctuation.section.block.end.sqltest" }
+      },
+      "patterns": [
+        { "include": "#expect-content" }
+      ]
+    },
+    "expect-content": {
+      "patterns": [
+        {
+          "name": "punctuation.separator.pipe.sqltest",
+          "match": "\\|"
+        }
+      ]
+    }
+  }
+}
