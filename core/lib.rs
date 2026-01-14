@@ -224,8 +224,14 @@ pub(crate) type MvCursor = mvcc::cursor::MvccLazyCursor<mvcc::LocalClock>;
 /// `Database` object per a database file. We need because it is not safe
 /// to have multiple independent WAL files open because coordination
 /// happens at process-level POSIX file advisory locks.
-static DATABASE_MANAGER: LazyLock<Mutex<HashMap<String, Weak<Database>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+///
+/// Uses parking_lot::Mutex instead of crate::sync::Mutex because this static
+/// must persist across shuttle test iterations. Shuttle resets its execution
+/// state between iterations, but static variables persist - using shuttle's
+/// Mutex here would cause panics when the second iteration tries to lock a
+/// mutex that belongs to a stale execution context.
+static DATABASE_MANAGER: LazyLock<parking_lot::Mutex<HashMap<String, Weak<Database>>>> =
+    LazyLock::new(|| parking_lot::Mutex::new(HashMap::new()));
 
 /// The `Database` object contains per database file state that is shared
 /// between multiple connections.
