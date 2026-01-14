@@ -5449,6 +5449,7 @@ version = "0.4.0"
 dependencies = [
  "anyhow",
  "bytes",
+ "futures-timer",
  "http-body-util",
  "hyper",
  "hyper-tls",

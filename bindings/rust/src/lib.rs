@@ -52,10 +52,11 @@ pub use params::params_from_iter;
 pub use params::IntoParams;
 
 use std::fmt::Debug;
-use std::future::Future;
+use std::future::poll_fn;
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::task::Poll;
+use std::time::Duration;
 
 // Re-exports rows
 pub use crate::rows::{Row, Rows};
@@ -177,7 +178,7 @@ impl Builder {
                 } else {
                     None
                 },
-                async_io: false,
+                async_io: true,
                 encryption: self.encryption_opts,
                 vfs: self.vfs,
                 io: None,
@@ -217,78 +218,82 @@ pub struct Statement {
     inner: Arc<Mutex<Box<turso_sdk_kit::rsapi::TursoStatement>>>,
 }
 
-struct Execute {
-    stmt: Statement,
-}
-
-assert_send_sync!(Execute);
-
-impl Future for Execute {
-    type Output = Result<u64>;
-
-    fn poll(
-        self: std::pin::Pin<&mut Self>,
-        cx: &mut std::task::Context<'_>,
-    ) -> std::task::Poll<Self::Output> {
-        match self.stmt.step(None, cx)? {
-            Poll::Ready(_) => {
-                let n_change = self.stmt.inner.lock().unwrap().n_change();
-                Poll::Ready(Ok(n_change as u64))
-            }
-            Poll::Pending => Poll::Pending,
-        }
-    }
+/// Result of a single step operation, used internally to handle async IO.
+enum StepResult {
+    Row(Row),
+    Done,
+    BusyWait(Duration),
 }
 
 impl Statement {
-    fn step(
-        &self,
-        columns: Option<usize>,
-        cx: &mut std::task::Context<'_>,
-    ) -> Poll<Result<Option<Row>>> {
-        let mut stmt = self.inner.lock().unwrap();
-        match stmt.step(Some(cx.waker()))? {
-            turso_sdk_kit::rsapi::TursoStatusCode::Row => {
-                if let Some(columns) = columns {
-                    let mut values = Vec::with_capacity(columns);
-                    for i in 0..columns {
-                        let value = stmt.row_value(i)?;
-                        values.push(value.to_owned());
+    async fn step(&self, columns: Option<usize>) -> Result<Option<Row>> {
+        loop {
+            let result = poll_fn(|cx| {
+                let mut stmt = self.inner.lock().unwrap();
+                loop {
+                    let status = stmt.step(Some(cx.waker()))?;
+                    match status {
+                        turso_sdk_kit::rsapi::TursoStatusCode::Row => {
+                            if let Some(columns) = columns {
+                                let mut values = Vec::with_capacity(columns);
+                                for i in 0..columns {
+                                    let value = stmt.row_value(i)?;
+                                    values.push(value.to_owned());
+                                }
+                                return Poll::Ready(Ok(StepResult::Row(Row { values })));
+                            } else {
+                                return Poll::Ready(Err(Error::Misuse(
+                                    "unexpected row during execution".to_string(),
+                                )));
+                            }
+                        }
+                        turso_sdk_kit::rsapi::TursoStatusCode::Done => {
+                            return Poll::Ready(Ok(StepResult::Done));
+                        }
+                        turso_sdk_kit::rsapi::TursoStatusCode::Io => {
+                            if let Some(delay) = stmt.get_busy_delay() {
+                                return Poll::Ready(Ok(StepResult::BusyWait(delay)));
+                            }
+                            stmt.run_io()?;
+                            if let Some(extra_io) = &self.conn.extra_io {
+                                drop(stmt);
+                                extra_io(cx.waker().clone())?;
+                                return Poll::Pending;
+                            }
+                            // Sync IO - loop to retry step() (keeping lock)
+                        }
                     }
-                    Poll::Ready(Ok(Some(Row { values })))
-                } else {
-                    Poll::Ready(Err(Error::Misuse(
-                        "unexpected row during execution".to_string(),
-                    )))
                 }
-            }
-            turso_sdk_kit::rsapi::TursoStatusCode::Done => Poll::Ready(Ok(None)),
-            turso_sdk_kit::rsapi::TursoStatusCode::Io => {
-                stmt.run_io()?;
-                if let Some(extra_io) = &self.conn.extra_io {
-                    extra_io(cx.waker().clone())?;
+            })
+            .await?;
+
+            match result {
+                StepResult::Row(row) => return Ok(Some(row)),
+                StepResult::Done => return Ok(None),
+                StepResult::BusyWait(delay) => {
+                    futures_timer::Delay::new(delay).await;
                 }
-                Poll::Pending
             }
         }
     }
     /// Query the database with this prepared statement.
     pub async fn query(&mut self, params: impl IntoParams) -> Result<Rows> {
         self.reset()?;
-
-        let mut stmt = self.inner.lock().unwrap();
-        let params = params.into_params()?;
-        match params {
-            params::Params::None => (),
-            params::Params::Positional(values) => {
-                for (i, value) in values.into_iter().enumerate() {
-                    stmt.bind_positional(i + 1, value.into())?;
+        {
+            let mut stmt = self.inner.lock().unwrap();
+            let params = params.into_params()?;
+            match params {
+                params::Params::None => (),
+                params::Params::Positional(values) => {
+                    for (i, value) in values.into_iter().enumerate() {
+                        stmt.bind_positional(i + 1, value.into())?;
+                    }
                 }
-            }
-            params::Params::Named(values) => {
-                for (name, value) in values.into_iter() {
-                    let position = stmt.named_position(name)?;
-                    stmt.bind_positional(position, value.into())?;
+                params::Params::Named(values) => {
+                    for (name, value) in values.into_iter() {
+                        let position = stmt.named_position(name)?;
+                        stmt.bind_positional(position, value.into())?;
+                    }
                 }
             }
         }
@@ -320,8 +325,9 @@ impl Statement {
             }
         }
 
-        let execute = Execute { stmt: self.clone() };
-        execute.await
+        self.step(None).await?;
+        let n_change = self.inner.lock().unwrap().n_change();
+        Ok(n_change as u64)
     }
 
     /// Returns columns of the result of this prepared statement.

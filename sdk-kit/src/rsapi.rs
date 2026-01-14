@@ -914,6 +914,15 @@ impl TursoStatement {
         self.statement._io().step()?;
         Ok(())
     }
+
+    /// Returns the remaining delay before the busy handler timeout expires.
+    ///
+    /// This is used by async callers to schedule a proper sleep instead of
+    /// busy-spinning. Returns `None` if there is no pending busy timeout.
+    pub fn get_busy_delay(&self) -> Option<Duration> {
+        self.statement.get_busy_delay()
+    }
+
     /// get row value reference currently pointed by the statement
     /// note, that this row will no longer be valid after execution of methods like [Self::step]/[Self::execute]/[Self::finalize]/[Self::reset]
     pub fn row_value(&self, index: usize) -> Result<turso_core::ValueRef, TursoError> {
