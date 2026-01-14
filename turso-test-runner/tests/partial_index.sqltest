@@ -1,0 +1,238 @@
+@database :memory:
+
+# Partial indexes with BETWEEN expressions
+
+# Create a partial index with BETWEEN and verify it exists
+test partial-index-between-create {
+    CREATE TABLE t1(id INTEGER PRIMARY KEY, val INTEGER, data TEXT);
+    CREATE INDEX idx_between ON t1(val) WHERE val BETWEEN 10 AND 20;
+    SELECT name FROM sqlite_master WHERE type='index';
+}
+expect {
+    idx_between
+}
+
+# INSERT into table with partial index containing BETWEEN
+test partial-index-between-insert {
+    CREATE TABLE t2(id INTEGER PRIMARY KEY, val INTEGER, data TEXT);
+    CREATE INDEX idx_t2 ON t2(val) WHERE val BETWEEN 5 AND 15;
+    INSERT INTO t2 VALUES(1, 3, 'below');
+    INSERT INTO t2 VALUES(2, 10, 'inside');
+    INSERT INTO t2 VALUES(3, 15, 'boundary');
+    INSERT INTO t2 VALUES(4, 20, 'above');
+    SELECT id, val FROM t2 ORDER BY id;
+}
+expect {
+    1|3
+    2|10
+    3|15
+    4|20
+}
+
+# UPDATE rows with partial index containing BETWEEN - moving in/out of index range
+test partial-index-between-update {
+    CREATE TABLE t3(id INTEGER PRIMARY KEY, val INTEGER);
+    CREATE INDEX idx_t3 ON t3(val) WHERE val BETWEEN 0 AND 10;
+    INSERT INTO t3 VALUES(1, 5);
+    INSERT INTO t3 VALUES(2, 15);
+    UPDATE t3 SET val = 20 WHERE id = 1;
+    UPDATE t3 SET val = 5 WHERE id = 2;
+    SELECT id, val FROM t3 ORDER BY id;
+}
+expect {
+    1|20
+    2|5
+}
+
+# DELETE rows with partial index containing BETWEEN
+test partial-index-between-delete {
+    CREATE TABLE t4(id INTEGER PRIMARY KEY, val INTEGER);
+    CREATE INDEX idx_t4 ON t4(val) WHERE val BETWEEN 100 AND 200;
+    INSERT INTO t4 VALUES(1, 50);
+    INSERT INTO t4 VALUES(2, 150);
+    INSERT INTO t4 VALUES(3, 250);
+    DELETE FROM t4 WHERE id = 2;
+    SELECT id, val FROM t4 ORDER BY id;
+}
+expect {
+    1|50
+    3|250
+}
+
+# SELECT with partial index containing BETWEEN - verify data integrity
+test partial-index-between-select {
+    CREATE TABLE t5(id INTEGER PRIMARY KEY, val INTEGER, name TEXT);
+    CREATE INDEX idx_t5 ON t5(val) WHERE val BETWEEN 1 AND 100;
+    INSERT INTO t5 VALUES(1, 0, 'zero');
+    INSERT INTO t5 VALUES(2, 50, 'fifty');
+    INSERT INTO t5 VALUES(3, 100, 'hundred');
+    INSERT INTO t5 VALUES(4, 101, 'over');
+    SELECT name FROM t5 WHERE val BETWEEN 1 AND 100 ORDER BY val;
+}
+expect {
+    fifty
+    hundred
+}
+
+# Multiple partial indexes with BETWEEN on same table
+test partial-index-between-multiple {
+    CREATE TABLE t6(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER);
+    CREATE INDEX idx_t6_a ON t6(a) WHERE a BETWEEN 0 AND 50;
+    CREATE INDEX idx_t6_b ON t6(b) WHERE b BETWEEN 50 AND 100;
+    INSERT INTO t6 VALUES(1, 25, 75);
+    INSERT INTO t6 VALUES(2, 75, 25);
+    INSERT INTO t6 VALUES(3, 25, 25);
+    SELECT id, a, b FROM t6 ORDER BY id;
+}
+expect {
+    1|25|75
+    2|75|25
+    3|25|25
+}
+
+# Partial index with BETWEEN on text column
+test partial-index-between-text {
+    CREATE TABLE t7(id INTEGER PRIMARY KEY, code TEXT);
+    CREATE INDEX idx_t7 ON t7(code) WHERE code BETWEEN 'A' AND 'M';
+    INSERT INTO t7 VALUES(1, 'Alpha');
+    INSERT INTO t7 VALUES(2, 'Beta');
+    INSERT INTO t7 VALUES(3, 'Zeta');
+    SELECT id, code FROM t7 ORDER BY id;
+}
+expect {
+    1|Alpha
+    2|Beta
+    3|Zeta
+}
+
+# Partial index with BETWEEN combined with other conditions
+test partial-index-between-combined {
+    CREATE TABLE t8(id INTEGER PRIMARY KEY, val INTEGER, active INTEGER);
+    CREATE INDEX idx_t8 ON t8(val) WHERE val BETWEEN 1 AND 10 AND active = 1;
+    INSERT INTO t8 VALUES(1, 5, 1);
+    INSERT INTO t8 VALUES(2, 5, 0);
+    INSERT INTO t8 VALUES(3, 15, 1);
+    SELECT id, val, active FROM t8 ORDER BY id;
+}
+expect {
+    1|5|1
+    2|5|0
+    3|15|1
+}
+
+# UNIQUE partial index with BETWEEN - should enforce uniqueness only within range
+test partial-index-between-unique {
+    CREATE TABLE t9(id INTEGER PRIMARY KEY, val INTEGER, code TEXT);
+    CREATE UNIQUE INDEX idx_t9 ON t9(code) WHERE val BETWEEN 1 AND 10;
+    INSERT INTO t9 VALUES(1, 5, 'A');
+    INSERT INTO t9 VALUES(2, 15, 'A');
+    INSERT INTO t9 VALUES(3, 20, 'A');
+    SELECT id, val, code FROM t9 ORDER BY id;
+}
+expect {
+    1|5|A
+    2|15|A
+    3|20|A
+}
+
+# UNIQUE partial index with BETWEEN - conflict within range should fail
+test partial-index-between-unique-conflict {
+    CREATE TABLE t10(id INTEGER PRIMARY KEY, val INTEGER, code TEXT);
+    CREATE UNIQUE INDEX idx_t10 ON t10(code) WHERE val BETWEEN 1 AND 10;
+    INSERT INTO t10 VALUES(1, 5, 'A');
+    INSERT INTO t10 VALUES(2, 7, 'A');
+}
+expect error {
+}
+
+# UPSERT with partial index containing BETWEEN
+test partial-index-between-upsert {
+    CREATE TABLE t11(id INTEGER PRIMARY KEY, val INTEGER, data TEXT);
+    CREATE UNIQUE INDEX idx_t11 ON t11(val) WHERE val BETWEEN 0 AND 100;
+    INSERT INTO t11 VALUES(1, 50, 'first');
+    INSERT OR REPLACE INTO t11 VALUES(2, 50, 'replaced');
+    SELECT id, val, data FROM t11 ORDER BY id;
+}
+expect {
+    2|50|replaced
+}
+
+# Bulk operations with partial index containing BETWEEN
+test partial-index-between-bulk {
+    CREATE TABLE t12(id INTEGER PRIMARY KEY, val INTEGER);
+    CREATE INDEX idx_t12 ON t12(val) WHERE val BETWEEN -10 AND 10;
+    INSERT INTO t12 VALUES(1, -15);
+    INSERT INTO t12 VALUES(2, -5);
+    INSERT INTO t12 VALUES(3, 0);
+    INSERT INTO t12 VALUES(4, 5);
+    INSERT INTO t12 VALUES(5, 15);
+    DELETE FROM t12 WHERE val BETWEEN -5 AND 5;
+    SELECT id, val FROM t12 ORDER BY id;
+}
+expect {
+    1|-15
+    5|15
+}
+
+# Update moving multiple rows in/out of BETWEEN range
+test partial-index-between-update-multi {
+    CREATE TABLE t13(id INTEGER PRIMARY KEY, val INTEGER);
+    CREATE INDEX idx_t13 ON t13(val) WHERE val BETWEEN 10 AND 20;
+    INSERT INTO t13 VALUES(1, 5);
+    INSERT INTO t13 VALUES(2, 15);
+    INSERT INTO t13 VALUES(3, 25);
+    UPDATE t13 SET val = val + 10;
+    SELECT id, val FROM t13 ORDER BY id;
+}
+expect {
+    1|15
+    2|25
+    3|35
+}
+
+# NOT BETWEEN in partial index
+test partial-index-not-between {
+    CREATE TABLE t14(id INTEGER PRIMARY KEY, val INTEGER);
+    CREATE INDEX idx_t14 ON t14(val) WHERE val NOT BETWEEN 10 AND 20;
+    INSERT INTO t14 VALUES(1, 5);
+    INSERT INTO t14 VALUES(2, 15);
+    INSERT INTO t14 VALUES(3, 25);
+    SELECT id, val FROM t14 ORDER BY id;
+}
+expect {
+    1|5
+    2|15
+    3|25
+}
+
+# Partial index with BETWEEN and NULL handling
+test partial-index-between-null {
+    CREATE TABLE t15(id INTEGER PRIMARY KEY, val INTEGER);
+    CREATE INDEX idx_t15 ON t15(val) WHERE val BETWEEN 1 AND 100;
+    INSERT INTO t15 VALUES(1, NULL);
+    INSERT INTO t15 VALUES(2, 50);
+    INSERT INTO t15 VALUES(3, NULL);
+    SELECT id, val FROM t15 ORDER BY id;
+}
+expect {
+    1|
+    2|50
+    3|
+}
+
+# Nested BETWEEN expressions in partial index
+test partial-index-between-nested {
+    CREATE TABLE t16(id INTEGER PRIMARY KEY, a INTEGER, b INTEGER);
+    CREATE INDEX idx_t16 ON t16(a, b) WHERE a BETWEEN 1 AND 10 AND b BETWEEN 20 AND 30;
+    INSERT INTO t16 VALUES(1, 5, 25);
+    INSERT INTO t16 VALUES(2, 5, 50);
+    INSERT INTO t16 VALUES(3, 15, 25);
+    INSERT INTO t16 VALUES(4, 15, 50);
+    SELECT id, a, b FROM t16 ORDER BY id;
+}
+expect {
+    1|5|25
+    2|5|50
+    3|15|25
+    4|15|50
+}
