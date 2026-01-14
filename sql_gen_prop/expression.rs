@@ -568,10 +568,7 @@ impl ExpressionContext {
     }
 
     /// Set the CASE WHEN clause range.
-    pub fn with_case_when_clause_range(
-        mut self,
-        range: std::ops::RangeInclusive<usize>,
-    ) -> Self {
+    pub fn with_case_when_clause_range(mut self, range: std::ops::RangeInclusive<usize>) -> Self {
         self.case_when_clause_range = range;
         self
     }
@@ -710,6 +707,7 @@ fn function_call_expression_strategy(ctx: &ExpressionContext) -> BoxedStrategy<E
                         .is_none_or(|t| f.return_type.as_ref().is_none_or(|rt| rt == t))
                 })
                 .filter(|f| ctx.allow_aggregates || !f.is_aggregate)
+                .filter(|f| f.is_deterministic)
                 .cloned()
                 .collect();
 
