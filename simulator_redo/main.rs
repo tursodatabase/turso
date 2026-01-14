@@ -4,7 +4,7 @@
 //! results against SQLite for generated SQL statements.
 
 use anyhow::Result;
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use rand::RngCore;
 use sim_redo::{SimConfig, Simulator};
 
@@ -12,7 +12,10 @@ use sim_redo::{SimConfig, Simulator};
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Random seed for deterministic execution.
+    #[command(subcommand)]
+    command: Option<Commands>,
+
+    /// Random seed for deterministic execution (only used without subcommand).
     #[arg(short, long, default_value_t = rand::rng().next_u64())]
     seed: u64,
 
@@ -37,6 +40,16 @@ struct Args {
     keep_files: bool,
 }
 
+#[derive(Subcommand, Debug)]
+enum Commands {
+    /// Run the simulator in a loop with random seeds.
+    Loop {
+        /// Number of iterations to run (0 for infinite).
+        #[arg(default_value_t = 0)]
+        iterations: u64,
+    },
+}
+
 fn main() -> Result<()> {
     // Initialize tracing
     let mut subscriber = tracing_subscriber::fmt().with_env_filter(
@@ -49,8 +62,29 @@ fn main() -> Result<()> {
     }
     subscriber.init();
 
-    let args = Args::parse();
+    let mut args = Args::parse();
 
+    match args.command {
+        Some(Commands::Loop { iterations }) => {
+            let mut iteration = 0u64;
+            loop {
+                args.seed = rand::rng().next_u64();
+                tracing::info!("Iteration {}: seed {}", iteration + 1, args.seed);
+                run_single(&args)?;
+
+                iteration += 1;
+                if iterations > 0 && iteration >= iterations {
+                    tracing::info!("Completed {} iterations successfully", iterations);
+                    break;
+                }
+            }
+            Ok(())
+        }
+        None => run_single(&args),
+    }
+}
+
+fn run_single(args: &Args) -> Result<()> {
     let config = SimConfig {
         seed: args.seed,
         num_tables: args.num_tables,
