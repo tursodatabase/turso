@@ -8,6 +8,7 @@ use std::rc::Rc;
 use crate::expression::{Expression, ExpressionContext};
 use crate::function::{FunctionRegistry, builtin_functions};
 use crate::schema::{ColumnDef, DataType, Schema, TableRef};
+use crate::select::SelectStatement;
 use crate::value::{SqlValue, value_for_type};
 
 // =============================================================================
@@ -278,82 +279,6 @@ impl ConditionProfile {
     }
 }
 
-// =============================================================================
-// SUBQUERY SELECT TYPE
-// =============================================================================
-
-/// A simplified SELECT statement for use in subqueries.
-///
-/// This is a self-contained representation that avoids circular dependencies
-/// with the select module. Subqueries in conditions use this simpler form
-/// which does not support nested subqueries in its WHERE clause.
-#[derive(Debug, Clone)]
-pub struct SubquerySelect {
-    /// The table to select from.
-    pub table: String,
-    /// The columns to select. Empty means SELECT *.
-    pub columns: Vec<Expression>,
-    /// Optional simple WHERE clause (no subqueries).
-    pub where_clause: Option<Box<Condition>>,
-    /// Optional LIMIT clause.
-    pub limit: Option<u32>,
-}
-
-impl SubquerySelect {
-    /// Create a new subquery select.
-    pub fn new(table: impl Into<String>) -> Self {
-        Self {
-            table: table.into(),
-            columns: vec![],
-            where_clause: None,
-            limit: None,
-        }
-    }
-
-    /// Set the columns to select.
-    pub fn with_columns(mut self, columns: Vec<Expression>) -> Self {
-        self.columns = columns;
-        self
-    }
-
-    /// Set the WHERE clause.
-    pub fn with_where(mut self, condition: Condition) -> Self {
-        self.where_clause = Some(Box::new(condition));
-        self
-    }
-
-    /// Set the LIMIT clause.
-    pub fn with_limit(mut self, limit: u32) -> Self {
-        self.limit = Some(limit);
-        self
-    }
-}
-
-impl fmt::Display for SubquerySelect {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "SELECT ")?;
-
-        if self.columns.is_empty() {
-            write!(f, "*")?;
-        } else {
-            let cols: Vec<String> = self.columns.iter().map(|c| c.to_string()).collect();
-            write!(f, "{}", cols.join(", "))?;
-        }
-
-        write!(f, " FROM \"{}\"", self.table)?;
-
-        if let Some(cond) = &self.where_clause {
-            write!(f, " WHERE {cond}")?;
-        }
-
-        if let Some(limit) = self.limit {
-            write!(f, " LIMIT {limit}")?;
-        }
-
-        Ok(())
-    }
-}
-
 /// Quantifier for comparison subqueries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubqueryQuantifier {
@@ -452,30 +377,30 @@ pub enum Condition {
     // SUBQUERY CONDITIONS
     // =========================================================================
     /// EXISTS subquery condition (e.g., `EXISTS (SELECT ...)`).
-    Exists { subquery: SubquerySelect },
+    Exists { subquery: Box<SelectStatement> },
     /// NOT EXISTS subquery condition (e.g., `NOT EXISTS (SELECT ...)`).
-    NotExists { subquery: SubquerySelect },
+    NotExists { subquery: Box<SelectStatement> },
     /// IN subquery condition (e.g., `expr IN (SELECT ...)`).
     InSubquery {
         expr: Expression,
-        subquery: SubquerySelect,
+        subquery: Box<SelectStatement>,
     },
     /// NOT IN subquery condition (e.g., `expr NOT IN (SELECT ...)`).
     NotInSubquery {
         expr: Expression,
-        subquery: SubquerySelect,
+        subquery: Box<SelectStatement>,
     },
     /// Comparison with ANY subquery (e.g., `expr op ANY (SELECT ...)`).
     AnySubquery {
         left: Expression,
         op: ComparisonOp,
-        subquery: SubquerySelect,
+        subquery: Box<SelectStatement>,
     },
     /// Comparison with ALL subquery (e.g., `expr op ALL (SELECT ...)`).
     AllSubquery {
         left: Expression,
         op: ComparisonOp,
-        subquery: SubquerySelect,
+        subquery: Box<SelectStatement>,
     },
 }
 
@@ -496,33 +421,51 @@ impl Condition {
     }
 
     /// Create an EXISTS subquery condition.
-    pub fn exists(subquery: SubquerySelect) -> Self {
-        Condition::Exists { subquery }
+    pub fn exists(subquery: SelectStatement) -> Self {
+        Condition::Exists {
+            subquery: Box::new(subquery),
+        }
     }
 
     /// Create a NOT EXISTS subquery condition.
-    pub fn not_exists(subquery: SubquerySelect) -> Self {
-        Condition::NotExists { subquery }
+    pub fn not_exists(subquery: SelectStatement) -> Self {
+        Condition::NotExists {
+            subquery: Box::new(subquery),
+        }
     }
 
     /// Create an IN subquery condition.
-    pub fn in_subquery(expr: Expression, subquery: SubquerySelect) -> Self {
-        Condition::InSubquery { expr, subquery }
+    pub fn in_subquery(expr: Expression, subquery: SelectStatement) -> Self {
+        Condition::InSubquery {
+            expr,
+            subquery: Box::new(subquery),
+        }
     }
 
     /// Create a NOT IN subquery condition.
-    pub fn not_in_subquery(expr: Expression, subquery: SubquerySelect) -> Self {
-        Condition::NotInSubquery { expr, subquery }
+    pub fn not_in_subquery(expr: Expression, subquery: SelectStatement) -> Self {
+        Condition::NotInSubquery {
+            expr,
+            subquery: Box::new(subquery),
+        }
     }
 
     /// Create a comparison with ANY subquery condition.
-    pub fn any_subquery(left: Expression, op: ComparisonOp, subquery: SubquerySelect) -> Self {
-        Condition::AnySubquery { left, op, subquery }
+    pub fn any_subquery(left: Expression, op: ComparisonOp, subquery: SelectStatement) -> Self {
+        Condition::AnySubquery {
+            left,
+            op,
+            subquery: Box::new(subquery),
+        }
     }
 
     /// Create a comparison with ALL subquery condition.
-    pub fn all_subquery(left: Expression, op: ComparisonOp, subquery: SubquerySelect) -> Self {
-        Condition::AllSubquery { left, op, subquery }
+    pub fn all_subquery(left: Expression, op: ComparisonOp, subquery: SelectStatement) -> Self {
+        Condition::AllSubquery {
+            left,
+            op,
+            subquery: Box::new(subquery),
+        }
     }
 }
 
@@ -957,7 +900,7 @@ pub fn order_by_for_table(
 // SUBQUERY GENERATION STRATEGIES
 // =============================================================================
 
-/// Generate a SubquerySelect for a given table.
+/// Generate a SelectStatement for use in subqueries.
 ///
 /// The generated subquery will be simple (no nested subqueries in WHERE clause)
 /// to prevent infinite recursion.
@@ -965,7 +908,7 @@ pub fn subquery_select_for_table(
     table: &TableRef,
     profile: &SubqueryProfile,
     target_type: Option<DataType>,
-) -> BoxedStrategy<SubquerySelect> {
+) -> BoxedStrategy<SelectStatement> {
     let table_name = table.name.clone();
     let columns = table.columns.clone();
     let table_clone = table.clone();
@@ -1020,11 +963,13 @@ pub fn subquery_select_for_table(
     ];
 
     (columns_strategy, where_strategy, limit_strategy)
-        .prop_map(move |(columns, where_clause, limit)| SubquerySelect {
+        .prop_map(move |(columns, where_clause, limit)| SelectStatement {
             table: table_name.clone(),
             columns,
-            where_clause: where_clause.map(Box::new),
+            where_clause,
+            order_by: vec![],
             limit,
+            offset: None,
         })
         .boxed()
 }
@@ -1038,9 +983,9 @@ pub fn exists_condition(
     subquery_select_for_table(subquery_table, profile, None)
         .prop_map(move |subquery| {
             if negated {
-                Condition::NotExists { subquery }
+                Condition::not_exists(subquery)
             } else {
-                Condition::Exists { subquery }
+                Condition::exists(subquery)
             }
         })
         .boxed()
@@ -1075,9 +1020,9 @@ pub fn in_subquery_condition(
                 move |subquery| {
                     let expr = Expression::Column(col_name.clone());
                     if negated {
-                        Condition::NotInSubquery { expr, subquery }
+                        Condition::not_in_subquery(expr, subquery)
                     } else {
-                        Condition::InSubquery { expr, subquery }
+                        Condition::in_subquery(expr, subquery)
                     }
                 },
             )
@@ -1116,8 +1061,8 @@ pub fn comparison_subquery_condition(
                 .prop_map(move |(op, subquery)| {
                     let left = Expression::Column(col_name.clone());
                     match quantifier {
-                        SubqueryQuantifier::Any => Condition::AnySubquery { left, op, subquery },
-                        SubqueryQuantifier::All => Condition::AllSubquery { left, op, subquery },
+                        SubqueryQuantifier::Any => Condition::any_subquery(left, op, subquery),
+                        SubqueryQuantifier::All => Condition::all_subquery(left, op, subquery),
                     }
                 })
         })
@@ -1169,43 +1114,78 @@ mod tests {
     // SUBQUERY CONDITION TESTS
     // =========================================================================
 
+    /// Helper to create a simple SelectStatement for tests.
+    fn test_select(table: &str) -> SelectStatement {
+        SelectStatement {
+            table: table.to_string(),
+            columns: vec![],
+            where_clause: None,
+            order_by: vec![],
+            limit: None,
+            offset: None,
+        }
+    }
+
     #[test]
-    fn test_subquery_select_display() {
-        let subquery = SubquerySelect::new("users");
+    fn test_select_statement_in_subquery_display() {
+        let subquery = test_select("users");
         assert_eq!(subquery.to_string(), "SELECT * FROM \"users\"");
 
-        let subquery_with_cols =
-            SubquerySelect::new("users").with_columns(vec![Expression::Column("id".to_string())]);
+        let subquery_with_cols = SelectStatement {
+            table: "users".to_string(),
+            columns: vec![Expression::Column("id".to_string())],
+            where_clause: None,
+            order_by: vec![],
+            limit: None,
+            offset: None,
+        };
         assert_eq!(
             subquery_with_cols.to_string(),
             "SELECT \"id\" FROM \"users\""
         );
 
-        let subquery_with_where =
-            SubquerySelect::new("users").with_where(Condition::SimpleComparison {
+        let subquery_with_where = SelectStatement {
+            table: "users".to_string(),
+            columns: vec![],
+            where_clause: Some(Condition::SimpleComparison {
                 column: "active".to_string(),
                 op: ComparisonOp::Eq,
                 value: SqlValue::Integer(1),
-            });
+            }),
+            order_by: vec![],
+            limit: None,
+            offset: None,
+        };
         assert_eq!(
             subquery_with_where.to_string(),
             "SELECT * FROM \"users\" WHERE \"active\" = 1"
         );
 
-        let subquery_with_limit = SubquerySelect::new("users").with_limit(10);
+        let subquery_with_limit = SelectStatement {
+            table: "users".to_string(),
+            columns: vec![],
+            where_clause: None,
+            order_by: vec![],
+            limit: Some(10),
+            offset: None,
+        };
         assert_eq!(
             subquery_with_limit.to_string(),
             "SELECT * FROM \"users\" LIMIT 10"
         );
 
-        let subquery_full = SubquerySelect::new("users")
-            .with_columns(vec![Expression::Column("id".to_string())])
-            .with_where(Condition::SimpleComparison {
+        let subquery_full = SelectStatement {
+            table: "users".to_string(),
+            columns: vec![Expression::Column("id".to_string())],
+            where_clause: Some(Condition::SimpleComparison {
                 column: "active".to_string(),
                 op: ComparisonOp::Eq,
                 value: SqlValue::Integer(1),
-            })
-            .with_limit(100);
+            }),
+            order_by: vec![],
+            limit: Some(100),
+            offset: None,
+        };
         assert_eq!(
             subquery_full.to_string(),
             "SELECT \"id\" FROM \"users\" WHERE \"active\" = 1 LIMIT 100"
@@ -1214,18 +1194,25 @@ mod tests {
 
     #[test]
     fn test_exists_condition_display() {
-        let subquery = SubquerySelect::new("orders");
+        let subquery = test_select("orders");
         let cond = Condition::exists(subquery);
         assert_eq!(cond.to_string(), "EXISTS (SELECT * FROM \"orders\")");
     }
 
     #[test]
     fn test_not_exists_condition_display() {
-        let subquery = SubquerySelect::new("orders").with_where(Condition::SimpleComparison {
-            column: "user_id".to_string(),
-            op: ComparisonOp::Eq,
-            value: SqlValue::Integer(1),
-        });
+        let subquery = SelectStatement {
+            table: "orders".to_string(),
+            columns: vec![],
+            where_clause: Some(Condition::SimpleComparison {
+                column: "user_id".to_string(),
+                op: ComparisonOp::Eq,
+                value: SqlValue::Integer(1),
+            }),
+            order_by: vec![],
+            limit: None,
+            offset: None,
+        };
         let cond = Condition::not_exists(subquery);
         assert_eq!(
             cond.to_string(),
@@ -1235,8 +1222,14 @@ mod tests {
 
     #[test]
     fn test_in_subquery_condition_display() {
-        let subquery = SubquerySelect::new("departments")
-            .with_columns(vec![Expression::Column("id".to_string())]);
+        let subquery = SelectStatement {
+            table: "departments".to_string(),
+            columns: vec![Expression::Column("id".to_string())],
+            where_clause: None,
+            order_by: vec![],
+            limit: None,
+            offset: None,
+        };
         let cond = Condition::in_subquery(Expression::Column("dept_id".to_string()), subquery);
         assert_eq!(
             cond.to_string(),
@@ -1246,8 +1239,14 @@ mod tests {
 
     #[test]
     fn test_not_in_subquery_condition_display() {
-        let subquery = SubquerySelect::new("blacklist")
-            .with_columns(vec![Expression::Column("user_id".to_string())]);
+        let subquery = SelectStatement {
+            table: "blacklist".to_string(),
+            columns: vec![Expression::Column("user_id".to_string())],
+            where_clause: None,
+            order_by: vec![],
+            limit: None,
+            offset: None,
+        };
         let cond = Condition::not_in_subquery(Expression::Column("id".to_string()), subquery);
         assert_eq!(
             cond.to_string(),
@@ -1257,8 +1256,14 @@ mod tests {
 
     #[test]
     fn test_any_subquery_condition_display() {
-        let subquery = SubquerySelect::new("salaries")
-            .with_columns(vec![Expression::Column("amount".to_string())]);
+        let subquery = SelectStatement {
+            table: "salaries".to_string(),
+            columns: vec![Expression::Column("amount".to_string())],
+            where_clause: None,
+            order_by: vec![],
+            limit: None,
+            offset: None,
+        };
         let cond = Condition::any_subquery(
             Expression::Column("salary".to_string()),
             ComparisonOp::Gt,
@@ -1272,8 +1277,14 @@ mod tests {
 
     #[test]
     fn test_all_subquery_condition_display() {
-        let subquery = SubquerySelect::new("scores")
-            .with_columns(vec![Expression::Column("value".to_string())]);
+        let subquery = SelectStatement {
+            table: "scores".to_string(),
+            columns: vec![Expression::Column("value".to_string())],
+            where_clause: None,
+            order_by: vec![],
+            limit: None,
+            offset: None,
+        };
         let cond = Condition::all_subquery(
             Expression::Column("score".to_string()),
             ComparisonOp::Ge,

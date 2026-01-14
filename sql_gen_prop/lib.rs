@@ -42,7 +42,7 @@ pub use alter_table::{
 };
 pub use condition::{
     ComparisonOp, Condition, ConditionProfile, LogicalOp, OrderByItem, OrderDirection,
-    SubqueryProfile, SubqueryQuantifier, SubquerySelect,
+    SubqueryProfile, SubqueryQuantifier,
 };
 pub use create_index::{CreateIndexStatement, IndexColumn};
 pub use create_table::{ColumnProfile, CreateTableStatement, DataTypeWeights, PrimaryKeyProfile};
@@ -88,10 +88,18 @@ pub mod strategies {
     };
     // Conditions
     pub use crate::condition::{
-        comparison_op, condition_for_table, expression_condition, logical_op,
-        optional_where_clause, order_by_for_table, order_direction, simple_condition,
+        comparison_op,
         // Subquery strategies
-        comparison_subquery_condition, exists_condition, in_subquery_condition,
+        comparison_subquery_condition,
+        condition_for_table,
+        exists_condition,
+        expression_condition,
+        in_subquery_condition,
+        logical_op,
+        optional_where_clause,
+        order_by_for_table,
+        order_direction,
+        simple_condition,
         subquery_select_for_table,
     };
     // CREATE INDEX

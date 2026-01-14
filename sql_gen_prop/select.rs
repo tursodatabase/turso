@@ -358,7 +358,9 @@ mod tests {
                 crate::schema::ColumnDef::new("age", crate::schema::DataType::Integer),
             ],
         );
-        let schema = crate::schema::SchemaBuilder::new().add_table(table.clone()).build();
+        let schema = crate::schema::SchemaBuilder::new()
+            .add_table(table.clone())
+            .build();
         let table_ref: crate::schema::TableRef = table.into();
         let strategy = select_for_table(&table_ref, &schema, &SelectProfile::default());
 
