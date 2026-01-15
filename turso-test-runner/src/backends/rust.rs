@@ -93,7 +93,9 @@ impl SqlBackend for RustBackend {
             let mut rows = conn
                 .query("PRAGMA journal_mode = 'experimental_mvcc'", ())
                 .await
-                .map_err(|e| BackendError::CreateDatabase(format!("failed to enable MVCC mode: {}", e)))?;
+                .map_err(|e| {
+                    BackendError::CreateDatabase(format!("failed to enable MVCC mode: {}", e))
+                })?;
             // Consume the result row
             let _ = rows.next().await;
         }
