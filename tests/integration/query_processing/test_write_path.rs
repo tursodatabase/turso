@@ -1267,3 +1267,42 @@ pub fn test_conflict_inside_txn(limbo: TempDatabase) {
         limbo_exec_rows(&conn2, "SELECT * FROM t")
     );
 }
+
+#[test]
+pub fn test_reopen_database_wal_restart() {
+    let _ = env_logger::try_init();
+    let db_path = tempfile::NamedTempFile::new().unwrap();
+    let (_file, db_path) = db_path.keep().unwrap();
+    tracing::info!("path: {:?}", db_path);
+    {
+        let tmp_db = TempDatabase::builder().with_db_path(&db_path).build();
+        let conn1 = tmp_db.connect_limbo();
+        conn1.execute("CREATE TABLE t (x);").unwrap();
+        conn1
+            .execute("INSERT INTO t VALUES (randomblob(1000000))")
+            .unwrap();
+        conn1
+            .execute("INSERT INTO t VALUES (randomblob(1000000))")
+            .unwrap();
+        conn1
+            .execute("INSERT INTO t VALUES (randomblob(1000000))")
+            .unwrap();
+        conn1
+            .execute("INSERT INTO t VALUES (randomblob(2000000))")
+            .unwrap();
+
+        conn1.execute("PRAGMA wal_checkpoint(RESTART)").unwrap();
+
+        conn1.execute("CREATE TABLE q(x)").unwrap();
+        println!(
+            "create table err: {:?}",
+            conn1.execute("CREATE TABLE q(x)").unwrap_err()
+        );
+    }
+    // reopen database
+    {
+        let tmp_db = TempDatabase::builder().with_db_path(&db_path).build();
+        let conn2 = tmp_db.connect_limbo();
+        println!("rows: {:?}", limbo_exec_rows(&conn2, "SELECT * FROM q"));
+    }
+}
