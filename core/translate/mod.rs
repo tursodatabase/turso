@@ -136,8 +136,7 @@ pub fn translate(
             .table()
             .map(|s| s.to_string());
         if let Some(cdc_table_name) = cdc_table_name {
-            if let Some(cdc_prepared) =
-                emitter::prepare_cdc_if_necessary(&mut program, schema, "")?
+            if let Some(cdc_prepared) = emitter::prepare_cdc_if_necessary(&mut program, schema, "")?
             {
                 let (cdc_cursor_id, _) = cdc_prepared;
                 emitter::emit_cdc_commit_record(&mut program, &resolver, cdc_cursor_id)?;
@@ -146,10 +145,9 @@ pub fn translate(
                 let Some(cdc_btree) = turso_cdc_table.btree().clone() else {
                     bail_parse_error!("no such table: {}", cdc_table_name);
                 };
-                let cdc_cursor_id =
-                    program.alloc_cursor_id(crate::vdbe::builder::CursorType::BTreeTable(
-                        cdc_btree.clone(),
-                    ));
+                let cdc_cursor_id = program.alloc_cursor_id(
+                    crate::vdbe::builder::CursorType::BTreeTable(cdc_btree.clone()),
+                );
                 program.emit_insn(Insn::OpenWrite {
                     cursor_id: cdc_cursor_id,
                     root_page: cdc_btree.root_page.into(),
@@ -210,7 +208,9 @@ pub fn translate_inner(
             attach::translate_attach(&expr, resolver, &db_name, &key, program)?
         }
         ast::Stmt::Begin { typ, name } => translate_tx_begin(typ, name, resolver.schema, program)?,
-        ast::Stmt::Commit { name } => translate_tx_commit(name, resolver.schema, resolver, program)?,
+        ast::Stmt::Commit { name } => {
+            translate_tx_commit(name, resolver.schema, resolver, program)?
+        }
         ast::Stmt::CreateIndex { .. } => {
             translate_create_index(program, connection, resolver, stmt)?
         }

@@ -67,7 +67,10 @@ pub fn translate_tx_commit(
     });
 
     // Emit CDC COMMIT record if CDC is enabled
-    let cdc_table_name = program.capture_data_changes_mode().table().map(|s| s.to_string());
+    let cdc_table_name = program
+        .capture_data_changes_mode()
+        .table()
+        .map(|s| s.to_string());
     if let Some(cdc_table_name) = cdc_table_name {
         if let Some(cdc_prepared) = prepare_cdc_if_necessary(&mut program, schema, "")? {
             let (cdc_cursor_id, _) = cdc_prepared;
@@ -81,10 +84,9 @@ pub fn translate_tx_commit(
             let Some(cdc_btree) = turso_cdc_table.btree().clone() else {
                 crate::bail_parse_error!("no such table: {}", cdc_table_name);
             };
-            let cdc_cursor_id =
-                program.alloc_cursor_id(crate::vdbe::builder::CursorType::BTreeTable(
-                    cdc_btree.clone(),
-                ));
+            let cdc_cursor_id = program.alloc_cursor_id(
+                crate::vdbe::builder::CursorType::BTreeTable(cdc_btree.clone()),
+            );
             program.emit_insn(Insn::OpenWrite {
                 cursor_id: cdc_cursor_id,
                 root_page: cdc_btree.root_page.into(),
