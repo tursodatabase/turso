@@ -50,6 +50,7 @@ use crate::sync::Arc;
 use crate::translate::delete::translate_delete;
 use crate::translate::emitter::Resolver;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts, QueryMode};
+use crate::vdbe::insn::Insn;
 use crate::vdbe::Program;
 use crate::{bail_parse_error, Connection, Result, SymbolTable};
 use alter::translate_alter_table;
@@ -98,6 +99,7 @@ pub fn translate(
     program.prologue();
     let mut resolver = Resolver::new(schema, syms);
 
+    let stmt_for_check = stmt.clone();
     program = match stmt {
         // There can be no nesting with pragma, so lift it up here
         ast::Stmt::Pragma { name, body } => {
@@ -105,6 +107,58 @@ pub fn translate(
         }
         stmt => translate_inner(stmt, &mut resolver, program, &connection, input)?,
     };
+
+    // Emit CDC COMMIT record for auto-commit mode write statements
+    let is_write = matches!(
+        stmt_for_check,
+        ast::Stmt::AlterTable { .. }
+            | ast::Stmt::Analyze { .. }
+            | ast::Stmt::CreateIndex { .. }
+            | ast::Stmt::CreateTable { .. }
+            | ast::Stmt::CreateTrigger { .. }
+            | ast::Stmt::CreateView { .. }
+            | ast::Stmt::CreateMaterializedView { .. }
+            | ast::Stmt::CreateVirtualTable(..)
+            | ast::Stmt::Delete { .. }
+            | ast::Stmt::DropIndex { .. }
+            | ast::Stmt::DropTable { .. }
+            | ast::Stmt::DropView { .. }
+            | ast::Stmt::Reindex { .. }
+            | ast::Stmt::Optimize { .. }
+            | ast::Stmt::Update { .. }
+            | ast::Stmt::Insert { .. }
+    );
+    let is_explicit_commit = matches!(stmt_for_check, ast::Stmt::Commit { .. });
+
+    if connection.is_autocommit() && is_write && !is_explicit_commit {
+        let cdc_table_name = program
+            .capture_data_changes_mode()
+            .table()
+            .map(|s| s.to_string());
+        if let Some(cdc_table_name) = cdc_table_name {
+            if let Some(cdc_prepared) =
+                emitter::prepare_cdc_if_necessary(&mut program, schema, "")?
+            {
+                let (cdc_cursor_id, _) = cdc_prepared;
+                emitter::emit_cdc_commit_record(&mut program, &resolver, cdc_cursor_id)?;
+            } else if let Some(turso_cdc_table) = schema.get_table(&cdc_table_name) {
+                // CDC table exists but wasn't opened yet, open it now
+                let Some(cdc_btree) = turso_cdc_table.btree().clone() else {
+                    bail_parse_error!("no such table: {}", cdc_table_name);
+                };
+                let cdc_cursor_id =
+                    program.alloc_cursor_id(crate::vdbe::builder::CursorType::BTreeTable(
+                        cdc_btree.clone(),
+                    ));
+                program.emit_insn(Insn::OpenWrite {
+                    cursor_id: cdc_cursor_id,
+                    root_page: cdc_btree.root_page.into(),
+                    db: 0,
+                });
+                emitter::emit_cdc_commit_record(&mut program, &resolver, cdc_cursor_id)?;
+            }
+        }
+    }
 
     program.epilogue(schema);
 
@@ -156,7 +210,7 @@ pub fn translate_inner(
             attach::translate_attach(&expr, resolver, &db_name, &key, program)?
         }
         ast::Stmt::Begin { typ, name } => translate_tx_begin(typ, name, resolver.schema, program)?,
-        ast::Stmt::Commit { name } => translate_tx_commit(name, program)?,
+        ast::Stmt::Commit { name } => translate_tx_commit(name, resolver.schema, resolver, program)?,
         ast::Stmt::CreateIndex { .. } => {
             translate_create_index(program, connection, resolver, stmt)?
         }

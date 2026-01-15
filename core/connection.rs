@@ -1015,6 +1015,11 @@ impl Connection {
         self.auto_commit.load(Ordering::SeqCst)
     }
 
+    /// Returns true if the connection is in autocommit mode (not in an explicit transaction)
+    pub fn is_autocommit(&self) -> bool {
+        self.get_auto_commit()
+    }
+
     pub fn parse_schema_rows(self: &Arc<Connection>) -> Result<()> {
         if self.is_closed() {
             return Err(LimboError::InternalError("Connection closed".to_string()));

@@ -87,7 +87,11 @@ The CDC table (default name: `turso_cdc`) contains the following columns:
 | `updates` | BLOB | Details of updated columns (for mode: full) |
 | `change_txn_id` | INTEGER | Transaction ID for grouping changes by transaction |
 
-\* COMMIT records (change_type=2) are reserved for future use to mark transaction boundaries explicitly.
+\* COMMIT records (change_type=2) mark the end of a transaction. They are emitted:
+  - After each statement in auto-commit mode
+  - At the end of explicit transactions (when COMMIT is executed)
+  - COMMIT records have NULL values for `table_name`, `id`, `before`, `after`, and `updates`
+  - The `change_txn_id` of a COMMIT record matches the transaction it terminates
 
 ## Transaction Boundaries
 
@@ -145,6 +149,23 @@ SELECT
     END as boundary
 FROM turso_cdc
 ORDER BY change_id;
+
+-- Use COMMIT records to identify transaction boundaries
+SELECT * FROM turso_cdc WHERE change_type = 2;  -- Show all COMMIT records
+
+-- Get all changes with their transaction's COMMIT record
+SELECT
+    c1.change_id,
+    c1.change_type,
+    c1.table_name,
+    c1.change_txn_id,
+    c2.change_id as commit_change_id
+FROM turso_cdc c1
+LEFT JOIN turso_cdc c2
+    ON c1.change_txn_id = c2.change_txn_id
+    AND c2.change_type = 2
+WHERE c1.table_name IS NOT NULL  -- Exclude COMMIT records from left side
+ORDER BY c1.change_id;
 ```
 
 ## Querying Changes
@@ -163,6 +184,9 @@ SELECT * FROM turso_cdc WHERE change_type = 0;
 
 -- View only deletes
 SELECT * FROM turso_cdc WHERE change_type = -1;
+
+-- View only COMMIT records
+SELECT * FROM turso_cdc WHERE change_type = 2;
 
 -- View changes for a specific table
 SELECT * FROM turso_cdc WHERE table_name = 'users';
