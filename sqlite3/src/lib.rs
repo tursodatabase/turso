@@ -1136,7 +1136,7 @@ pub unsafe extern "C" fn sqlite3_bind_text(
             Err(_) => return SQLITE_ERROR,
         }
     } else {
-        let slice = std::slice::from_raw_parts(text, len as usize);
+        let slice = std::slice::from_raw_parts(text as *const u8, len as usize);
         match std::str::from_utf8(slice) {
             Ok(s) => s.to_owned(),
             Err(_) => return SQLITE_ERROR,
@@ -1149,13 +1149,13 @@ pub unsafe extern "C" fn sqlite3_bind_text(
             .stmt
             .bind_at(NonZero::new_unchecked(idx as usize), val);
     } else if ptr_val == static_ptr {
-        let slice = std::slice::from_raw_parts(text, str_value.len());
+        let slice = std::slice::from_raw_parts(text as *const u8, str_value.len());
         let val = Value::from_text(std::str::from_utf8(slice).unwrap());
         stmt_ref
             .stmt
             .bind_at(NonZero::new_unchecked(idx as usize), val);
     } else {
-        let slice = std::slice::from_raw_parts(text, str_value.len());
+        let slice = std::slice::from_raw_parts(text as *const u8, str_value.len());
         let val = Value::from_text(std::str::from_utf8(slice).unwrap());
         stmt_ref
             .stmt

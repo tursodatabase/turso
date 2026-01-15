@@ -198,7 +198,7 @@ pub unsafe fn bytes_from_slice<'a>(
             "expected slice, got null pointer".to_string(),
         ));
     }
-    Ok(std::slice::from_raw_parts(ptr, len))
+    Ok(std::slice::from_raw_parts(ptr as *const u8, len))
 }
 
 /// SAFETY: slice must points to the valid memory

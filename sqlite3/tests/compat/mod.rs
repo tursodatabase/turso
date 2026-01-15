@@ -564,7 +564,7 @@ mod tests {
             let col2_len = sqlite3_column_bytes(stmt, 0);
             assert!(!col2_ptr.is_null());
 
-            let col2_slice = std::slice::from_raw_parts(col2_ptr, col2_len as usize);
+            let col2_slice = std::slice::from_raw_parts(col2_ptr as *const u8, col2_len as usize);
             let col2_str = std::str::from_utf8(col2_slice).unwrap().to_owned();
 
             assert_eq!(col2_str, "abc");
@@ -660,7 +660,7 @@ mod tests {
             assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
             let col2_ptr = sqlite3_column_blob(stmt, 0);
             let col2_len = sqlite3_column_bytes(stmt, 0);
-            let col2_slice = std::slice::from_raw_parts(col2_ptr, col2_len as usize);
+            let col2_slice = std::slice::from_raw_parts(col2_ptr as *const u8, col2_len as usize);
             assert_eq!(col2_slice, &data2[..2]);
 
             assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
