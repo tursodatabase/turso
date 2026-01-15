@@ -1,8 +1,7 @@
-use crate::sync::Arc;
-use crate::translate::expr::rewrite_between_expr;
 use crate::{
     error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE},
     schema::{self, BTreeTable, ColDef, Column, Index, IndexColumn, ResolvedFkRef, Schema, Table},
+    sync::Arc,
     translate::{
         emitter::{
             emit_cdc_full_record, emit_cdc_insns, emit_cdc_patch_record, prepare_cdc_if_necessary,
@@ -10,8 +9,8 @@ use crate::{
         },
         expr::{
             bind_and_rewrite_expr, emit_returning_results, process_returning_clause,
-            translate_expr, translate_expr_no_constant_opt, walk_expr_mut, BindingBehavior,
-            NoConstantOptReason, WalkControl,
+            rewrite_between_expr, translate_expr, translate_expr_no_constant_opt, walk_expr_mut,
+            BindingBehavior, NoConstantOptReason, WalkControl,
         },
         fkeys::{
             build_index_affinity_string, emit_fk_violation, emit_guarded_fk_decrement,
