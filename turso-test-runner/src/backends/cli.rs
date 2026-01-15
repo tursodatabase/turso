@@ -11,7 +11,7 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::time::timeout;
 
-/// CLI backend that executes SQL via the tursodb CLI tool
+/// CLI backend that executes SQL via the tursodb or sqlite3 CLI tools
 pub struct CliBackend {
     /// Path to the tursodb binary
     binary_path: PathBuf,
