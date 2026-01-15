@@ -1354,7 +1354,7 @@ pub fn open_loop(
 
             emit_non_from_clause_subquery(
                 program,
-                t_ctx,
+                &t_ctx.resolver,
                 *plan,
                 &subquery.query_type,
                 subquery.correlated,

@@ -159,7 +159,7 @@ pub fn plan_subqueries_from_where_clause(
 /// Compute query plans for subqueries in VALUES expressions.
 /// This is used by INSERT statements with VALUES clauses and SELECT with VALUES.
 /// The VALUES expressions may contain scalar subqueries that need to be planned.
-#[allow(clippy::vec_box)] // Vec<Box<Expr>> is the parser's output format
+#[allow(clippy::vec_box)]
 pub fn plan_subqueries_from_values(
     program: &mut ProgramBuilder,
     non_from_clause_subqueries: &mut Vec<NonFromClauseSubquery>,
@@ -773,24 +773,6 @@ pub fn emit_from_clause_subquery(
 /// - a range of registers for RowValue subqueries,
 /// - an ephemeral index for IN subqueries.
 pub fn emit_non_from_clause_subquery(
-    program: &mut ProgramBuilder,
-    t_ctx: &mut TranslateCtx,
-    plan: SelectPlan,
-    query_type: &SubqueryType,
-    is_correlated: bool,
-) -> Result<()> {
-    emit_non_from_clause_subquery_with_resolver(
-        program,
-        &t_ctx.resolver,
-        plan,
-        query_type,
-        is_correlated,
-    )
-}
-
-/// Same as `emit_non_from_clause_subquery` but takes a Resolver directly.
-/// This is useful for contexts that don't have a TranslateCtx (e.g., INSERT statements).
-pub fn emit_non_from_clause_subquery_with_resolver(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
     plan: SelectPlan,

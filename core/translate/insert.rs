@@ -22,7 +22,7 @@ use crate::{
         },
         planner::{plan_ctes_as_outer_refs, ROWID_STRS},
         select::translate_select,
-        subquery::{emit_non_from_clause_subquery_with_resolver, plan_subqueries_from_returning},
+        subquery::{emit_non_from_clause_subquery, plan_subqueries_from_returning},
         trigger_exec::{
             fire_trigger, get_relevant_triggers_type_and_time, has_relevant_triggers_type_only,
             TriggerContext,
@@ -386,7 +386,7 @@ pub fn translate_insert(
         }
         let subquery_plan = subquery.consume_plan(EvalAt::BeforeLoop);
 
-        emit_non_from_clause_subquery_with_resolver(
+        emit_non_from_clause_subquery(
             &mut program,
             resolver,
             *subquery_plan,

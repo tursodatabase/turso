@@ -943,7 +943,7 @@ pub fn emit_query<'a>(
 
         emit_non_from_clause_subquery(
             program,
-            t_ctx,
+            &t_ctx.resolver,
             *plan,
             &subquery.query_type,
             subquery.correlated,
@@ -1175,7 +1175,7 @@ fn emit_program_for_delete(
 
             emit_non_from_clause_subquery(
                 program,
-                &mut t_ctx,
+                &t_ctx.resolver,
                 *subquery_plan,
                 &subquery.query_type,
                 subquery.correlated,
@@ -2014,7 +2014,7 @@ fn emit_program_for_update(
 
             emit_non_from_clause_subquery(
                 program,
-                &mut t_ctx,
+                &t_ctx.resolver,
                 *subquery_plan,
                 &subquery.query_type,
                 subquery.correlated,
