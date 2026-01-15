@@ -1544,6 +1544,7 @@ pub struct BTreeTable {
     pub has_autoincrement: bool,
     pub unique_sets: Vec<UniqueSet>,
     pub foreign_keys: Vec<Arc<ForeignKey>>,
+    // FIXME: check_constraints now ONLY parsed and stored in the schema - but they are not enforced by DB yet!
     pub check_constraints: Vec<CheckConstraint>,
 }
 
