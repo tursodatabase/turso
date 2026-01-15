@@ -1,6 +1,5 @@
 use crate::common::{do_flush, run_query, run_query_on_row, TempDatabase};
 use rand::{rng, RngCore};
-use std::panic;
 use turso_core::Row;
 
 #[test]
@@ -90,7 +89,7 @@ fn test_checksum_detects_corruption() {
 
     {
         let mut file_contents = std::fs::read(&db_path).unwrap();
-        assert_eq!(file_contents.len(), 8192, "File should be 4096 bytes");
+        assert_eq!(file_contents.len(), 8192, "File should be 8192 bytes");
 
         // lets corrupt the db at byte 2025, the year of Turso DB
         file_contents[2025] = !file_contents[2025];
@@ -99,20 +98,18 @@ fn test_checksum_detects_corruption() {
 
     {
         let existing_db = TempDatabase::new_with_existent(&db_path);
-        // this query should fail and result in panic because db is now corrupted
-        let should_panic = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-            let conn = existing_db.connect_limbo();
-            run_query_on_row(
-                &existing_db,
-                &conn,
-                "SELECT * FROM test",
-                |_: &Row| unreachable!(),
-            )
-            .unwrap();
-        }));
-        assert!(
-            should_panic.is_err(),
-            "should panic when accessing corrupted DB"
-        );
+        // Connecting should fail with a checksum error because the header page is corrupted
+        let result = existing_db.db.connect();
+
+        match result {
+            Ok(_) => panic!("should return error when connecting to corrupted DB"),
+            Err(e) => {
+                let err_msg = e.to_string();
+                assert!(
+                    err_msg.contains("Checksum mismatch"),
+                    "error should indicate checksum mismatch, got: {err_msg}"
+                );
+            }
+        }
     }
 }
