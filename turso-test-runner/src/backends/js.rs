@@ -11,12 +11,12 @@ use tokio::io::AsyncWriteExt;
 use tokio::process::Command;
 use tokio::time::timeout;
 
-/// CLI backend that executes SQL via the tursodb CLI tool
-pub struct CliBackend {
-    /// Path to the tursodb binary
-    binary_path: PathBuf,
-    /// Working directory for the CLI
-    working_dir: Option<PathBuf>,
+/// JavaScript backend that executes SQL via Node.js and @tursodatabase/database
+pub struct JsBackend {
+    /// Path to the Node.js binary
+    node_path: PathBuf,
+    /// Path to the runner script
+    script_path: PathBuf,
     /// Timeout for query execution
     timeout: Duration,
     /// Resolver for default database paths
@@ -25,22 +25,16 @@ pub struct CliBackend {
     mvcc: bool,
 }
 
-impl CliBackend {
-    /// Create a new CLI backend with the given binary path
-    pub fn new(binary_path: impl Into<PathBuf>) -> Self {
+impl JsBackend {
+    /// Create a new JavaScript backend with the given node and script paths
+    pub fn new(node_path: impl Into<PathBuf>, script_path: impl Into<PathBuf>) -> Self {
         Self {
-            binary_path: binary_path.into(),
-            working_dir: None,
+            node_path: node_path.into(),
+            script_path: script_path.into(),
             timeout: Duration::from_secs(30),
             default_db_resolver: None,
             mvcc: false,
         }
-    }
-
-    /// Set the working directory for the CLI
-    pub fn with_working_dir(mut self, dir: impl Into<PathBuf>) -> Self {
-        self.working_dir = Some(dir.into());
-        self
     }
 
     /// Set the timeout for query execution
@@ -60,17 +54,12 @@ impl CliBackend {
         self.mvcc = mvcc;
         self
     }
-
-    pub fn set_default_db_resolver(mut self, resolver: Arc<dyn DefaultDatabaseResolver>) -> Self {
-        self.default_db_resolver = Some(resolver);
-        self
-    }
 }
 
 #[async_trait]
-impl SqlBackend for CliBackend {
+impl SqlBackend for JsBackend {
     fn name(&self) -> &str {
-        "cli"
+        "js"
     }
 
     async fn create_database(
@@ -101,9 +90,9 @@ impl SqlBackend for CliBackend {
             }
         };
 
-        Ok(Box::new(CliDatabaseInstance {
-            binary_path: self.binary_path.clone(),
-            working_dir: self.working_dir.clone(),
+        Ok(Box::new(JsDatabaseInstance {
+            node_path: self.node_path.clone(),
+            script_path: self.script_path.clone(),
             db_path,
             readonly: config.readonly,
             timeout: self.timeout,
@@ -115,10 +104,10 @@ impl SqlBackend for CliBackend {
     }
 }
 
-/// A database instance that executes SQL via CLI subprocess
-pub struct CliDatabaseInstance {
-    binary_path: PathBuf,
-    working_dir: Option<PathBuf>,
+/// A database instance that executes SQL via Node.js subprocess
+pub struct JsDatabaseInstance {
+    node_path: PathBuf,
+    script_path: PathBuf,
     db_path: String,
     readonly: bool,
     timeout: Duration,
@@ -132,39 +121,14 @@ pub struct CliDatabaseInstance {
     mvcc: bool,
 }
 
-impl CliDatabaseInstance {
-    /// Execute SQL by spawning a CLI process
+impl JsDatabaseInstance {
+    /// Execute SQL by spawning a Node.js process
     async fn run_sql(&self, sql: &str) -> Result<QueryResult, BackendError> {
-        let mut cmd = Command::new(&self.binary_path);
+        let mut cmd = Command::new(&self.node_path);
 
-        let file_name = self
-            .binary_path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .ok_or_else(|| {
-                BackendError::Execute(format!("binary path does not contain a file name"))
-            })?;
-        let is_sqlite = file_name.starts_with("sqlite");
-        let is_turso_cli = file_name.starts_with("tursodb") || file_name.starts_with("turso");
-
-        // Set working directory if specified
-        if let Some(dir) = &self.working_dir {
-            cmd.current_dir(dir);
-        }
-
-        if is_sqlite {
-            cmd.arg(format!("file:{}?immutable=1", self.db_path));
-        }
-
-        // Only add -q flag for tursodb/turso (not sqlite3 or other CLIs)
-        if is_turso_cli {
-            cmd.arg(&self.db_path);
-            cmd.arg("-q"); // Quiet mode - suppress banner
-            cmd.arg("-m").arg("list"); // List mode for pipe-separated output
-            cmd.arg("--experimental-views");
-            cmd.arg("--experimental-strict");
-            cmd.arg("--experimental-triggers");
-        }
+        // Arguments: script path, database path, optional --readonly
+        cmd.arg(&self.script_path);
+        cmd.arg(&self.db_path);
 
         if self.readonly {
             cmd.arg("--readonly");
@@ -178,11 +142,11 @@ impl CliDatabaseInstance {
         // Spawn the process
         let mut child = cmd
             .spawn()
-            .map_err(|e| BackendError::Execute(format!("failed to spawn tursodb: {}", e)))?;
+            .map_err(|e| BackendError::Execute(format!("failed to spawn node: {e}")))?;
 
         // Prepend MVCC pragma if enabled (skip for readonly databases)
-        let sql_to_execute = if self.mvcc && is_turso_cli && !self.readonly {
-            format!("PRAGMA journal_mode = 'experimental_mvcc';\n{}", sql)
+        let sql_to_execute = if self.mvcc && !self.readonly {
+            format!("PRAGMA journal_mode = 'experimental_mvcc';\n{sql}")
         } else {
             sql.to_string()
         };
@@ -192,7 +156,7 @@ impl CliDatabaseInstance {
             stdin
                 .write_all(sql_to_execute.as_bytes())
                 .await
-                .map_err(|e| BackendError::Execute(format!("failed to write to stdin: {}", e)))?;
+                .map_err(|e| BackendError::Execute(format!("failed to write to stdin: {e}")))?;
         }
         child.stdin.take(); // Close stdin to signal end of input
 
@@ -200,7 +164,7 @@ impl CliDatabaseInstance {
         let output = timeout(self.timeout, child.wait_with_output())
             .await
             .map_err(|_| BackendError::Timeout(self.timeout))?
-            .map_err(|e| BackendError::Execute(format!("failed to read output: {}", e)))?;
+            .map_err(|e| BackendError::Execute(format!("failed to read output: {e}")))?;
 
         // Parse stdout
         let stdout = String::from_utf8_lossy(&output.stdout);
@@ -211,8 +175,8 @@ impl CliDatabaseInstance {
             return Ok(QueryResult::error(stderr.trim().to_string()));
         }
 
-        // Check for errors in stdout (tursodb outputs errors like "× Parse error: ...")
-        if stdout.contains("× ") || stdout.contains("error:") || stdout.contains("Error:") {
+        // Check for errors in stdout (the runner outputs "Error: ...")
+        if stdout.starts_with("Error:") || stdout.contains("\nError:") {
             return Ok(QueryResult::error(stdout.trim().to_string()));
         }
 
@@ -246,7 +210,7 @@ impl CliDatabaseInstance {
 }
 
 #[async_trait]
-impl DatabaseInstance for CliDatabaseInstance {
+impl DatabaseInstance for JsDatabaseInstance {
     async fn execute_setup(&mut self, sql: &str) -> Result<(), BackendError> {
         if self.is_memory {
             // For memory databases, buffer the setup SQL for later
