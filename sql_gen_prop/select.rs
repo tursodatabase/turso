@@ -469,16 +469,21 @@ pub fn order_by_for_table(
     }
 
     let functions = builtin_functions();
-    let mut ctx = ExpressionContext::new(functions, Schema::default())
-        .with_columns(table.columns.clone())
-        .with_max_depth(expr_max_depth)
-        .with_aggregates(false);
+
+    // Start with the profile from settings
+    let mut profile_for_order_by = expr_profile.clone();
 
     // When integer positions are not allowed, disable value expressions entirely
     // to prevent generating integer literals that would be interpreted as column positions
     if !expr_profile.order_by_allow_integer_positions {
-        ctx.profile = ctx.profile.with_weight(ExpressionKind::Value, 0);
+        profile_for_order_by = profile_for_order_by.with_weight(ExpressionKind::Value, 0);
     }
+
+    let ctx = ExpressionContext::new(functions, Schema::default())
+        .with_columns(table.columns.clone())
+        .with_max_depth(expr_max_depth)
+        .with_aggregates(false)
+        .with_profile(profile_for_order_by);
 
     proptest::collection::vec(
         (crate::expression::expression(&ctx), order_direction()),

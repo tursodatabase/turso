@@ -562,15 +562,8 @@ impl ExpressionProfile {
             unary_op_weight: 5,
             case_weight: 4,
             cast_weight: 3,
-            // Inherit settings from self
-            condition_max_depth: self.condition_max_depth,
-            max_order_by_items: self.max_order_by_items,
-            condition_expression_max_depth: self.condition_expression_max_depth,
-            simple_condition_weight: self.simple_condition_weight,
-            order_by_allow_integer_positions: self.order_by_allow_integer_positions,
-            subquery_limit_max: self.subquery_limit_max,
-            function_profile: self.function_profile,
-            ..Self::default()
+            // Inherit all other settings from self
+            ..self
         }
     }
 
