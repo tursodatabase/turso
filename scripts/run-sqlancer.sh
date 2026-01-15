@@ -2,7 +2,13 @@
 set -e
 
 # Run SQLancer against Limbo
-# Usage: ./scripts/run-sqlancer.sh [--oracle ORACLE] [--timeout SECONDS]
+# Usage: ./scripts/run-sqlancer.sh [--oracle ORACLE] [--timeout SECONDS] [--seed SEED]
+#
+# Options:
+#   --oracle ORACLE    SQLancer oracle to use (NoREC, PQS, TLP). Default: NoREC
+#   --timeout SECONDS  Timeout in seconds. Default: 60
+#   --seed SEED        Random seed for reproducibility. If not set, uses random seed.
+#   --clean            Remove and re-clone SQLancer directory
 #
 # This script sets up SQLancer with a dedicated Limbo provider that handles
 # Limbo-specific SQL compatibility. The provider is patched into upstream
@@ -19,12 +25,14 @@ MAVEN_VERSION="3.9.6"
 MAVEN_DIR="/tmp/apache-maven-$MAVEN_VERSION"
 ORACLE="${ORACLE:-NoREC}"
 TIMEOUT="${TIMEOUT:-60}"
+SEED=""
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
     case $1 in
         --oracle) ORACLE="$2"; shift 2 ;;
         --timeout) TIMEOUT="$2"; shift 2 ;;
+        --seed) SEED="$2"; shift 2 ;;
         --clean) CLEAN=1; shift ;;
         *) echo "Unknown option: $1"; exit 1 ;;
     esac
@@ -221,9 +229,18 @@ echo ""
 echo "=== Running SQLancer against Limbo ==="
 echo "Oracle: $ORACLE"
 echo "Timeout: ${TIMEOUT}s"
+if [[ -n "$SEED" ]]; then
+    echo "Seed: $SEED"
+fi
 echo ""
 
 SQLANCER_JAR=$(ls target/sqlancer-*.jar | head -1)
+
+# Build seed argument if provided
+SEED_ARGS=""
+if [[ -n "$SEED" ]]; then
+    SEED_ARGS="--random-seed $SEED"
+fi
 
 # Run with both SQLancer and Limbo JARs on classpath
 # Disable features Limbo doesn't support yet
@@ -233,6 +250,7 @@ java -Djava.library.path="$NATIVE_LIB_DIR" \
     --timeout-seconds "$TIMEOUT" \
     --num-threads 1 \
     --print-progress-summary true \
+    $SEED_ARGS \
     limbo \
     --oracle "$ORACLE" \
     --test-temp-tables false \
