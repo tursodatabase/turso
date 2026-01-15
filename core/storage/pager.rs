@@ -3453,6 +3453,10 @@ impl Pager {
                 } => {
                     let should_skip_truncate_db_file = {
                         let state = self.checkpoint_state.read();
+                        turso_assert!(
+                            matches!(state.mode, Some(CheckpointMode::Truncate { .. })),
+                            "mode should be truncate in CheckpointPhase::TruncateDbFile"
+                        );
                         let result = state.result.as_ref().expect("result should be set");
                         // Skip if we already sent truncate
                         result.db_truncate_sent
@@ -3558,6 +3562,10 @@ impl Pager {
                     // If crash occurred after WAL truncate but before DB sync, data would be lost.
                     let need_wal_truncate = {
                         let state = self.checkpoint_state.read();
+                        turso_assert!(
+                            matches!(state.mode, Some(CheckpointMode::Truncate { .. })),
+                            "mode should be truncate in CheckpointPhase::TruncateWalFile"
+                        );
                         let result = state.result.as_ref().expect("result should be set");
                         !result.wal_truncate_sent || !result.wal_sync_sent
                     };
