@@ -1055,8 +1055,7 @@ impl Value {
             if !inner.contains(['%', '_']) {
                 return Ok(text
                     .to_ascii_lowercase()
-                    .find(&inner.to_ascii_lowercase())
-                    .is_some());
+                    .contains(&inner.to_ascii_lowercase()));
             }
         }
 
