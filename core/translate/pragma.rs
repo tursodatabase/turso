@@ -2,9 +2,10 @@
 //! More info: https://www.sqlite.org/pragma.html.
 
 use crate::sync::Arc;
+use crate::translate::insert::translate_insert;
 use chrono::Datelike;
 use turso_macros::match_ignore_ascii_case;
-use turso_parser::ast::{self, ColumnDefinition, Expr, Literal, Name, NamedTableConstraint};
+use turso_parser::ast::{self, ColumnDefinition, Expr, Literal, Select, SelectBody};
 use turso_parser::ast::{PragmaName, QualifiedName};
 
 use super::integrity_check::{
@@ -48,7 +49,7 @@ fn parse_max_errors_from_value(value: &Option<Expr>) -> usize {
 }
 
 pub fn translate_pragma(
-    resolver: &Resolver,
+    resolver: &mut Resolver,
     name: &ast::QualifiedName,
     body: Option<ast::PragmaBody>,
     pager: Arc<Pager>,
@@ -103,7 +104,7 @@ pub fn translate_pragma(
 
 fn update_pragma(
     pragma: PragmaName,
-    resolver: &Resolver,
+    resolver: &mut Resolver,
     value: ast::Expr,
     pager: Arc<Pager>,
     connection: Arc<crate::Connection>,
@@ -346,11 +347,29 @@ fn update_pragma(
         PragmaName::QuickCheck => unreachable!("quick_check cannot be set"),
         PragmaName::UnstableCaptureDataChangesConn => {
             let value = parse_string(&value)?;
-            // todo(sivukhin): ideally, we should consistently update capture_data_changes connection flag only after successfull execution of schema change statement
-            // but for now, let's keep it as is...
             let opts = CaptureDataChangesMode::parse(&value)?;
             if let Some(table) = &opts.table() {
                 if resolver.schema.get_table(table).is_none() {
+                    let turso_cdc_metadata_name =
+                        ast::Name::exact(TURSO_CDC_METADATA_TABLE_NAME.to_string());
+                    let turso_cdc_metadata_columns = turso_cdc_metadata_table_columns();
+                    program = translate_create_table(
+                        QualifiedName {
+                            db_name: None,
+                            name: turso_cdc_metadata_name.clone(),
+                            alias: None,
+                        },
+                        resolver,
+                        false,
+                        true, // if_not_exists
+                        ast::CreateTableBody::ColumnsAndConstraints {
+                            columns: turso_cdc_metadata_columns.clone(),
+                            constraints: vec![],
+                            options: ast::TableOptions::NONE,
+                        },
+                        program,
+                        &connection,
+                    )?;
                     program = translate_create_table(
                         QualifiedName {
                             db_name: None,
@@ -362,14 +381,48 @@ fn update_pragma(
                         true, // if_not_exists
                         ast::CreateTableBody::ColumnsAndConstraints {
                             columns: turso_cdc_table_columns(),
-                            constraints: vec![NamedTableConstraint {
-                                name: Some(Name::exact(CAPTURE_DATA_CHANGES_LATEST.to_string())),
-                                constraint: ast::TableConstraint::Check(Box::new(Expr::Literal(
-                                    Literal::Numeric("1".to_string()),
-                                ))),
-                            }],
+                            constraints: vec![],
                             options: ast::TableOptions::NONE,
                         },
+                        program,
+                        &connection,
+                    )?;
+                    program = translate_insert(
+                        resolver,
+                        Some(ast::ResolveType::Ignore),
+                        QualifiedName {
+                            db_name: None,
+                            name: turso_cdc_metadata_name.clone(),
+                            alias: None,
+                        },
+                        vec![
+                            turso_cdc_metadata_columns[0].col_name.clone(),
+                            turso_cdc_metadata_columns[1].col_name.clone(),
+                            turso_cdc_metadata_columns[2].col_name.clone(),
+                        ],
+                        ast::InsertBody::Select(
+                            Select {
+                                limit: None,
+                                with: None,
+                                order_by: vec![],
+                                body: SelectBody {
+                                    select: ast::OneSelect::Values(vec![vec![
+                                        Box::new(ast::Expr::Literal(ast::Literal::String(
+                                            table.to_string(),
+                                        ))),
+                                        Box::new(ast::Expr::Literal(ast::Literal::String(
+                                            "version".to_string(),
+                                        ))),
+                                        Box::new(ast::Expr::Literal(ast::Literal::String(
+                                            CAPTURE_DATA_CHANGES_LATEST.to_string(),
+                                        ))),
+                                    ]]),
+                                    compounds: vec![],
+                                },
+                            },
+                            None,
+                        ),
+                        vec![],
                         program,
                         &connection,
                     )?;

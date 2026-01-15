@@ -9,7 +9,9 @@ use crate::Page;
 use crate::{
     ast, function,
     io::{MemoryIO, PlatformIO, IO},
-    match_ignore_ascii_case, parse_schema_rows, refresh_analyze_stats, translate, turso_assert,
+    match_ignore_ascii_case, parse_schema_rows, refresh_analyze_stats,
+    translate::{self, pragma::TURSO_CDC_METADATA_TABLE_NAME},
+    turso_assert,
     util::IOExt,
     vdbe, AllViewsTxState, AtomicCipherMode, AtomicSyncMode, AtomicTransactionState, BusyHandler,
     BusyHandlerCallback, CaptureDataChangesMode, CheckpointMode, CheckpointResult, CipherMode, Cmd,
@@ -17,7 +19,7 @@ use crate::{
     EncryptionKey, EncryptionOpts, IndexMethod, LimboError, MvStore, OpenFlags, PageSize, Pager,
     Parser, QueryMode, QueryRunner, Result, Schema, Statement, SyncMode, TransactionMode,
     TransactionState, Trigger, Value, VirtualTable, CAPTURE_DATA_CHANGES_LATEST,
-    CAPTURE_DATA_CHANGES_V1, CAPTURE_DATA_CHANGES_VERSIONS,
+    CAPTURE_DATA_CHANGES_V1,
 };
 use crate::{
     sync::{
@@ -935,28 +937,38 @@ impl Connection {
                 version: CAPTURE_DATA_CHANGES_LATEST,
             });
         };
+
         let schema = self.schema.read();
-        let Some(cdc_table) = schema.get_table(table) else {
-            // this can happen when we initialize CDC with PRAGMA unstable_capture_data_changes_conn('...')
-            // because this pragma internally execute DDL statement to create table
+        // Check if metadata table exists
+        let has_metadata_table = schema.get_table(TURSO_CDC_METADATA_TABLE_NAME).is_some();
+
+        // Check if CDC table exists
+        let has_cdc_table = schema.get_table(table).is_some();
+        drop(schema);
+
+        if !has_cdc_table {
+            // CDC table doesn't exist yet
             return Ok(CaptureDataChangesInfo {
                 mode,
                 version: CAPTURE_DATA_CHANGES_LATEST,
             });
-        };
-        for constraint in cdc_table.check_constraints() {
-            for version in CAPTURE_DATA_CHANGES_VERSIONS {
-                if constraint.name.as_deref() == Some(version) {
-                    tracing::debug!("get_capture_data_changes_info: detected CDC version from named constraint metadata: {:?}", constraint.name);
-                    return Ok(CaptureDataChangesInfo { mode, version });
-                }
-            }
         }
-        // no version "annotation" means first version of the CDC
-        Ok(CaptureDataChangesInfo {
-            mode,
-            version: CAPTURE_DATA_CHANGES_V1,
-        })
+
+        // If metadata table exists, assume version is LATEST (as inserted by pragma)
+        // If metadata table doesn't exist, this is an old database with V1
+        let version = if has_metadata_table {
+            CAPTURE_DATA_CHANGES_LATEST
+        } else {
+            CAPTURE_DATA_CHANGES_V1
+        };
+
+        tracing::debug!(
+            "get_capture_data_changes_info: CDC version = {} (metadata_table_exists={})",
+            version,
+            has_metadata_table
+        );
+
+        Ok(CaptureDataChangesInfo { mode, version })
     }
     pub fn set_capture_data_changes(&self, opts: CaptureDataChangesMode) {
         *self.capture_data_changes.write() = opts;
