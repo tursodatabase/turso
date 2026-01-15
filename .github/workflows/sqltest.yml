@@ -71,6 +71,48 @@ jobs:
       - name: Run tests (MVCC)
         run: make -C turso-test-runner run-rust MVCC=1
 
+  sqltest-run-js:
+    name: Run SQL tests (JS backend)
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: bindings/javascript
+    steps:
+      - uses: actions/checkout@v3
+      - uses: useblacksmith/rust-cache@v3
+        with:
+          prefix-key: "v1-rust"
+      - name: Setup node
+        uses: useblacksmith/setup-node@v5
+        with:
+          node-version: 20
+      - name: Setup sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Install JS dependencies
+        run: yarn install
+      - name: Build common package
+        run: yarn workspace @tursodatabase/database-common build
+      - name: Build native bindings
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: "sccache"
+        run: yarn workspace @tursodatabase/database napi-build --target x86_64-unknown-linux-gnu
+      - name: Build TypeScript
+        run: yarn workspace @tursodatabase/database tsc-build
+      - name: Build test runner
+        working-directory: turso-test-runner
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: "sccache"
+        run: cargo build --release
+      - name: Run tests
+        working-directory: turso-test-runner
+        run: make run-js
+      - name: Run tests (MVCC)
+        working-directory: turso-test-runner
+        run: make run-js MVCC=1
+
   sqltest-sqlite:
     name: Run SQL tests (SQLite)
     runs-on: blacksmith-4vcpu-ubuntu-2404

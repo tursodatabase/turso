@@ -270,6 +270,35 @@ async fn run_tests(
                 return ExitCode::from(2);
             }
 
+            // Check that native bindings are built
+            let native_dir = js_dir.join("packages/native");
+            let has_native_bindings = native_dir
+                .read_dir()
+                .map(|entries| {
+                    entries
+                        .filter_map(|e| e.ok())
+                        .any(|e| e.path().extension().is_some_and(|ext| ext == "node"))
+                })
+                .unwrap_or(false);
+
+            if !has_native_bindings {
+                eprintln!("Error: JavaScript native bindings not found");
+                eprintln!(
+                    "Expected .node file in {}",
+                    native_dir.display()
+                );
+                eprintln!();
+                eprintln!("Build the bindings first:");
+                eprintln!("  make -C turso-test-runner build-js-bindings");
+                eprintln!();
+                eprintln!("Or manually:");
+                eprintln!("  cd bindings/javascript");
+                eprintln!("  yarn install");
+                eprintln!("  yarn workspace @tursodatabase/database-common build");
+                eprintln!("  yarn workspace @tursodatabase/database build");
+                return ExitCode::from(2);
+            }
+
             let mut backend = JsBackend::new(&node, &script_path)
                 .with_timeout(Duration::from_secs(timeout))
                 .with_mvcc(mvcc);

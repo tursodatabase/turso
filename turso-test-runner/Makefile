@@ -16,7 +16,7 @@ endif
 TURSODB := $(ROOT_DIR)/target/$(TARGET_DIR)/tursodb
 TEST_RUNNER := ./target/$(TARGET_DIR)/turso-test-runner
 
-.PHONY: all build build-tursodb build-runner check run test run-examples install-sqlite test-sqlite convert clean
+.PHONY: all build build-tursodb build-runner check run test run-examples install-sqlite test-sqlite convert clean run-js build-js-bindings
 
 # Build everything
 all: build
@@ -61,6 +61,16 @@ run-cli: build
 run-rust: build-runner
 	$(TEST_RUNNER) run tests --backend rust $(MVCC_FLAG)
 	$(TEST_RUNNER) run turso-tests --backend rust $(MVCC_FLAG)
+
+# Build JavaScript bindings (requires Node.js and yarn)
+JS_DIR := $(ROOT_DIR)/bindings/javascript
+build-js-bindings:
+	cd $(JS_DIR) && yarn install && yarn workspace @tursodatabase/database-common build && yarn workspace @tursodatabase/database build
+
+# Run tests with JavaScript backend (Node.js + @tursodatabase/database)
+run-js: build-runner build-js-bindings
+	$(TEST_RUNNER) run tests --backend js $(MVCC_FLAG)
+	$(TEST_RUNNER) run turso-tests --backend js $(MVCC_FLAG)
 
 # Alias for run
 test: run
