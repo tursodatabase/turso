@@ -157,6 +157,9 @@ pub struct ProgramBuilder {
     hash_build_signatures: HashMap<usize, HashBuildSignature>,
     /// Hash tables to keep open across subplans (e.g. materialization).
     hash_tables_to_keep_open: HashSet<usize>,
+    /// Maps table internal_id to result_columns_start_reg for FROM clause subqueries.
+    /// Used when nested subqueries need to reference columns from outer query subqueries.
+    subquery_result_regs: HashMap<TableInternalId, usize>,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
@@ -363,6 +366,7 @@ impl ProgramBuilder {
             cursor_overrides: HashMap::new(),
             hash_build_signatures: HashMap::new(),
             hash_tables_to_keep_open: HashSet::new(),
+            subquery_result_regs: HashMap::new(),
         }
     }
 
@@ -413,6 +417,18 @@ impl ProgramBuilder {
     /// Clear the hash build signature for the given hash table id.
     pub fn clear_hash_build_signature(&mut self, hash_table_id: usize) {
         self.hash_build_signatures.remove(&hash_table_id);
+    }
+
+    /// Store the result_columns_start_reg for a FROM clause subquery by its internal_id.
+    /// Used so nested subqueries can access columns from outer query subqueries.
+    pub fn set_subquery_result_reg(&mut self, internal_id: TableInternalId, result_reg: usize) {
+        self.subquery_result_regs.insert(internal_id, result_reg);
+    }
+
+    /// Look up the result_columns_start_reg for a FROM clause subquery by its internal_id.
+    /// Returns None if the subquery hasn't been emitted yet.
+    pub fn get_subquery_result_reg(&self, internal_id: TableInternalId) -> Option<usize> {
+        self.subquery_result_regs.get(&internal_id).copied()
     }
 
     pub fn set_needs_stmt_subtransactions(&mut self, needs_stmt_subtransactions: bool) {
@@ -490,6 +506,11 @@ impl ProgramBuilder {
         let reg = self.next_free_register;
         self.next_free_register += amount;
         reg
+    }
+
+    /// Returns the next register that will be allocated by alloc_register/alloc_registers.
+    pub fn peek_next_register(&self) -> usize {
+        self.next_free_register
     }
 
     pub fn alloc_registers_and_init_w_null(&mut self, amount: usize) -> usize {

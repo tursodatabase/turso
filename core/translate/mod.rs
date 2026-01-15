@@ -243,9 +243,6 @@ pub fn translate_inner(
             order_by,
             with,
         } => {
-            if with.is_some() {
-                bail_parse_error!("WITH clause is not supported in DELETE");
-            }
             if indexed.is_some_and(|i| matches!(i, Indexed::IndexedBy(_))) {
                 bail_parse_error!("INDEXED BY clause is not supported in DELETE");
             }
@@ -258,6 +255,7 @@ pub fn translate_inner(
                 where_clause,
                 limit,
                 returning,
+                with,
                 program,
                 connection,
             )?
@@ -319,21 +317,17 @@ pub fn translate_inner(
             columns,
             body,
             returning,
-        } => {
-            if with.is_some() {
-                crate::bail_parse_error!("WITH clause is not supported");
-            }
-            translate_insert(
-                resolver,
-                or_conflict,
-                tbl_name,
-                columns,
-                body,
-                returning,
-                program,
-                connection,
-            )?
-        }
+        } => translate_insert(
+            resolver,
+            or_conflict,
+            tbl_name,
+            columns,
+            body,
+            returning,
+            with,
+            program,
+            connection,
+        )?,
     };
 
     // Indicate write operations so that in the epilogue we can emit the correct type of transaction

@@ -336,7 +336,9 @@ pub fn emit_program(
         Plan::Select(plan) => emit_program_for_select(program, resolver, plan),
         Plan::Delete(plan) => emit_program_for_delete(connection, resolver, program, plan),
         Plan::Update(plan) => emit_program_for_update(connection, resolver, program, plan, after),
-        Plan::CompoundSelect { .. } => emit_program_for_compound_select(program, resolver, plan),
+        Plan::CompoundSelect { .. } => {
+            emit_program_for_compound_select(program, resolver, plan).map(|_| ())
+        }
     }
 }
 

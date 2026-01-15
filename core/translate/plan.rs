@@ -220,6 +220,66 @@ pub enum Plan {
     Update(UpdatePlan),
 }
 
+impl Plan {
+    /// Returns true if this SELECT plan contains a reference to the given table.
+    /// For compound selects, checks all component selects.
+    /// Returns false for Delete/Update plans.
+    pub fn select_contains_table(&self, table: &Table) -> bool {
+        match self {
+            Plan::Select(select_plan) => select_plan.table_references.contains_table(table),
+            Plan::CompoundSelect {
+                left, right_most, ..
+            } => {
+                right_most.table_references.contains_table(table)
+                    || left
+                        .iter()
+                        .any(|(plan, _)| plan.table_references.contains_table(table))
+            }
+            Plan::Delete(_) | Plan::Update(_) => false,
+        }
+    }
+
+    /// Returns the query destination for Select/CompoundSelect plans.
+    /// Returns None for Delete/Update plans.
+    pub fn select_query_destination(&self) -> Option<&QueryDestination> {
+        match self {
+            Plan::Select(select_plan) => Some(&select_plan.query_destination),
+            Plan::CompoundSelect { right_most, .. } => Some(&right_most.query_destination),
+            Plan::Delete(_) | Plan::Update(_) => None,
+        }
+    }
+
+    /// Returns a mutable reference to the query destination for Select/CompoundSelect plans.
+    /// Returns None for Delete/Update plans.
+    pub fn select_query_destination_mut(&mut self) -> Option<&mut QueryDestination> {
+        match self {
+            Plan::Select(select_plan) => Some(&mut select_plan.query_destination),
+            Plan::CompoundSelect { right_most, .. } => Some(&mut right_most.query_destination),
+            Plan::Delete(_) | Plan::Update(_) => None,
+        }
+    }
+
+    /// Returns the result columns for Select/CompoundSelect plans.
+    /// Returns None for Delete/Update plans.
+    pub fn select_result_columns(&self) -> Option<&[ResultSetColumn]> {
+        match self {
+            Plan::Select(select_plan) => Some(&select_plan.result_columns),
+            Plan::CompoundSelect { right_most, .. } => Some(&right_most.result_columns),
+            Plan::Delete(_) | Plan::Update(_) => None,
+        }
+    }
+
+    /// Returns the table references for Select/CompoundSelect plans.
+    /// Returns None for Delete/Update plans.
+    pub fn select_table_references(&self) -> Option<&TableReferences> {
+        match self {
+            Plan::Select(select_plan) => Some(&select_plan.table_references),
+            Plan::CompoundSelect { right_most, .. } => Some(&right_most.table_references),
+            Plan::Delete(_) | Plan::Update(_) => None,
+        }
+    }
+}
+
 /// The destination of the results of a query.
 /// Typically, the results of a query are returned to the caller.
 /// However, there are some cases where the results are not returned to the caller,
@@ -887,7 +947,7 @@ impl TableReferences {
             .chain(self.outer_query_refs.iter().map(|t| &t.table))
             .any(|t| match t {
                 Table::FromClauseSubquery(subquery_table) => {
-                    subquery_table.plan.table_references.contains_table(table)
+                    subquery_table.plan.select_contains_table(table)
                 }
                 _ => t == table,
             })
@@ -1175,7 +1235,7 @@ impl JoinedTable {
         }
     }
 
-    /// Creates a new TableReference for a subquery.
+    /// Creates a new TableReference for a subquery from a SelectPlan.
     pub fn new_subquery(
         identifier: String,
         plan: SelectPlan,
@@ -1202,6 +1262,75 @@ impl JoinedTable {
             column.set_collation(get_collseq_from_expr(
                 &plan.result_columns[i].expr,
                 &plan.table_references,
+            )?);
+        }
+
+        let table = Table::FromClauseSubquery(FromClauseSubquery {
+            name: identifier.clone(),
+            plan: Box::new(Plan::Select(plan)),
+            columns,
+            result_columns_start_reg: None,
+        });
+        Ok(Self {
+            op: Operation::default_scan_for(&table),
+            table,
+            identifier,
+            internal_id,
+            join_info,
+            col_used_mask: ColumnUsedMask::default(),
+            column_use_counts: Vec::new(),
+            expression_index_usages: Vec::new(),
+            database_id: 0,
+        })
+    }
+
+    /// Creates a new TableReference for a subquery from a Plan (either SelectPlan or CompoundSelect).
+    pub fn new_subquery_from_plan(
+        identifier: String,
+        plan: Plan,
+        join_info: Option<JoinInfo>,
+        internal_id: TableInternalId,
+    ) -> Result<Self> {
+        // Get result columns and table references from the plan
+        let (result_columns, table_references) = match &plan {
+            Plan::Select(select_plan) => {
+                (&select_plan.result_columns, &select_plan.table_references)
+            }
+            Plan::CompoundSelect {
+                left, right_most, ..
+            } => {
+                // For compound selects, SQLite uses the leftmost select's column names.
+                // The leftmost select is left[0] if the vec is not empty, otherwise right_most.
+                if !left.is_empty() {
+                    (&left[0].0.result_columns, &left[0].0.table_references)
+                } else {
+                    (&right_most.result_columns, &right_most.table_references)
+                }
+            }
+            Plan::Delete(_) | Plan::Update(_) => {
+                unreachable!("DELETE/UPDATE plans cannot be subqueries")
+            }
+        };
+
+        let mut columns = result_columns
+            .iter()
+            .map(|rc| {
+                Column::new(
+                    rc.name(table_references).map(String::from),
+                    "BLOB".to_string(),
+                    None,
+                    None,
+                    Type::Blob, // FIXME: infer proper type
+                    None,
+                    ColDef::default(),
+                )
+            })
+            .collect::<Vec<_>>();
+
+        for (i, column) in columns.iter_mut().enumerate() {
+            column.set_collation(get_collseq_from_expr(
+                &result_columns[i].expr,
+                table_references,
             )?);
         }
 

@@ -469,11 +469,8 @@ impl ToTokens for JoinedTable {
             }
             Table::FromClauseSubquery(from_clause_subquery) => {
                 s.append(TokenType::TK_LP, None)?;
-                // Could possibly merge the contexts together here
-                from_clause_subquery.plan.to_tokens(
-                    s,
-                    &PlanContext(&[&from_clause_subquery.plan.table_references]),
-                )?;
+                // Plan::to_tokens creates its own context internally, so we pass BlankContext here.
+                from_clause_subquery.plan.to_tokens(s, &BlankContext)?;
                 s.append(TokenType::TK_RP, None)?;
 
                 s.append(TokenType::TK_AS, None)?;

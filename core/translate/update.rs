@@ -21,7 +21,7 @@ use super::optimizer::optimize_plan;
 use super::plan::{
     ColumnUsedMask, IterationDirection, JoinedTable, Plan, TableReferences, UpdatePlan,
 };
-use super::planner::parse_where;
+use super::planner::{parse_where, plan_ctes_as_outer_refs};
 use super::subquery::{plan_subqueries_from_select_plan, plan_subqueries_from_where_clause};
 /*
 * Update is simple. By default we scan the table, and for each row, we check the WHERE
@@ -58,7 +58,7 @@ pub fn translate_update(
     mut program: ProgramBuilder,
     connection: &Arc<crate::Connection>,
 ) -> crate::Result<ProgramBuilder> {
-    let mut plan = prepare_update_plan(&mut program, resolver.schema, body, connection, false)?;
+    let mut plan = prepare_update_plan(&mut program, resolver, body, connection, false)?;
 
     // Plan subqueries in the WHERE clause
     if let Plan::Update(ref mut update_plan) = plan {
@@ -97,7 +97,7 @@ pub fn translate_update_for_schema_change(
     ddl_query: &str,
     after: impl FnOnce(&mut ProgramBuilder),
 ) -> crate::Result<ProgramBuilder> {
-    let mut plan = prepare_update_plan(&mut program, resolver.schema, body, connection, true)?;
+    let mut plan = prepare_update_plan(&mut program, resolver, body, connection, true)?;
 
     if let Plan::Update(update_plan) = &mut plan {
         if program.capture_data_changes_mode().has_updates() {
@@ -144,9 +144,6 @@ fn validate_update(
     {
         crate::bail_parse_error!("table {} may not be modified", table_name);
     }
-    if body.with.is_some() {
-        bail_parse_error!("WITH clause is not supported in UPDATE");
-    }
     if body.or_conflict.is_some() {
         bail_parse_error!("ON CONFLICT clause is not supported in UPDATE");
     }
@@ -187,11 +184,12 @@ fn validate_update(
 
 pub fn prepare_update_plan(
     program: &mut ProgramBuilder,
-    schema: &Schema,
+    resolver: &Resolver,
     mut body: ast::Update,
     connection: &Arc<crate::Connection>,
     is_internal_schema_change: bool,
 ) -> crate::Result<Plan> {
+    let schema = resolver.schema;
     let table_name = &body.tbl_name.name;
     let table = match schema.get_table(table_name.as_str()) {
         Some(table) => table,
@@ -204,6 +202,10 @@ pub fn prepare_update_plan(
         is_internal_schema_change,
         connection,
     )?;
+
+    // Extract WITH clause before borrowing body mutably
+    let with = body.with.take();
+
     let table_name = table.get_name();
     let iter_dir = body
         .order_by
@@ -235,6 +237,9 @@ pub fn prepare_update_plan(
         database_id: 0,
     }];
     let mut table_references = TableReferences::new(joined_tables, vec![]);
+
+    // Plan CTEs and add them as outer query references for subquery resolution
+    plan_ctes_as_outer_refs(with, resolver, program, &mut table_references, connection)?;
 
     let column_lookup: HashMap<String, usize> = table
         .columns()

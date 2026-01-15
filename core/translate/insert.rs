@@ -50,7 +50,7 @@ use crate::{
 use std::num::NonZeroUsize;
 use turso_parser::ast::{
     self, Expr, InsertBody, OneSelect, QualifiedName, ResolveType, ResultColumn, TriggerEvent,
-    TriggerTime, Upsert, UpsertDo,
+    TriggerTime, Upsert, UpsertDo, With,
 };
 
 /// Validate anything with this insert statement that should throw an early parse error
@@ -207,6 +207,7 @@ pub fn translate_insert(
     columns: Vec<ast::Name>,
     mut body: InsertBody,
     mut returning: Vec<ResultColumn>,
+    with: Option<With>,
     mut program: ProgramBuilder,
     connection: &Arc<crate::Connection>,
 ) -> Result<ProgramBuilder> {
@@ -216,6 +217,27 @@ pub fn translate_insert(
         approx_num_labels: 5,
     };
     program.extend(&opts);
+
+    // Merge INSERT's WITH clause into the SELECT source's WITH clause
+    if let Some(insert_with) = with {
+        if let InsertBody::Select(select, _) = &mut body {
+            match &mut select.with {
+                Some(select_with) => {
+                    // Prepend INSERT's CTEs to SELECT's CTEs
+                    let mut merged = insert_with.ctes;
+                    merged.append(&mut select_with.ctes);
+                    select_with.ctes = merged;
+                    select_with.recursive |= insert_with.recursive;
+                }
+                None => select.with = Some(insert_with),
+            }
+        } else {
+            // WITH clause on INSERT with VALUES or DEFAULT VALUES is not useful
+            // e.g. WITH unused AS (SELECT c FROM a) INSERT INTO b VALUES (1, 2, 3)
+            // but: we can, and indeed must, just ignore it instead of erroring.
+            // leaving this empty else block here for documentation.
+        }
+    }
 
     let table_name = &tbl_name.name;
     let table = match resolver.schema.get_table(table_name.as_str()) {
