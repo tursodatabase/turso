@@ -138,7 +138,8 @@ pub struct SyncEngineOpts {
     pub use_transform: bool,
     pub protocol_version: Option<SyncEngineProtocolVersion>,
     pub bootstrap_if_empty: bool,
-    pub remote_encryption: Option<String>,
+    /// Encryption cipher for the Turso Cloud database.
+    pub remote_encryption_cipher: Option<String>,
     /// Base64-encoded encryption key for the Turso Cloud database.
     /// Must match the key used when creating the encrypted database.
     pub remote_encryption_key: Option<String>,
@@ -155,7 +156,7 @@ struct SyncEngineOptsFilled {
     pub use_transform: bool,
     pub protocol_version: DatabaseSyncEngineProtocolVersion,
     pub bootstrap_if_empty: bool,
-    pub remote_encryption: Option<CipherMode>,
+    pub remote_encryption_cipher: Option<CipherMode>,
     pub remote_encryption_key: Option<String>,
     pub partial_sync_opts: Option<PartialSyncOpts>,
 }
@@ -257,7 +258,7 @@ impl SyncEngine {
                 _ => DatabaseSyncEngineProtocolVersion::V1,
             },
             bootstrap_if_empty: opts.bootstrap_if_empty,
-            remote_encryption: match opts.remote_encryption.as_deref() {
+            remote_encryption_cipher: match opts.remote_encryption_cipher.as_deref() {
                 Some("aes256gcm") | Some("aes-256-gcm") => Some(CipherMode::Aes256Gcm),
                 Some("aes128gcm") | Some("aes-128-gcm") => Some(CipherMode::Aes128Gcm),
                 Some("chacha20poly1305") | Some("chacha20-poly1305") => {
@@ -322,7 +323,7 @@ impl SyncEngine {
             bootstrap_if_empty: self.opts.bootstrap_if_empty,
             reserved_bytes: self
                 .opts
-                .remote_encryption
+                .remote_encryption_cipher
                 .map(|x| x.required_metadata_size())
                 .unwrap_or(0),
             partial_sync_opts: self.opts.partial_sync_opts.clone(),
