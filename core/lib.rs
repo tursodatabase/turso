@@ -548,19 +548,32 @@ impl Database {
         let pager = self.init_pager(None)?;
         pager.enable_encryption(self.opts.enable_encryption);
 
-        let header_ref = pager.io.block(|| HeaderRef::from_pager(&pager))?;
+        // Start read transaction before reading page 1 to acquire a read lock
+        // that prevents concurrent checkpoints from truncating the WAL
+        pager.begin_read_tx()?;
 
-        let header = header_ref.borrow();
+        // Read header within the read transaction, ensuring cleanup on error
+        let result = (|| -> Result<AutoVacuumMode> {
+            let header_ref = pager.io.block(|| HeaderRef::from_pager(&pager))?;
+            let header = header_ref.borrow();
 
-        let mode = if header.vacuum_mode_largest_root_page.get() > 0 {
-            if header.incremental_vacuum_enabled.get() > 0 {
-                AutoVacuumMode::Incremental
+            let mode = if header.vacuum_mode_largest_root_page.get() > 0 {
+                if header.incremental_vacuum_enabled.get() > 0 {
+                    AutoVacuumMode::Incremental
+                } else {
+                    AutoVacuumMode::Full
+                }
             } else {
-                AutoVacuumMode::Full
-            }
-        } else {
-            AutoVacuumMode::None
-        };
+                AutoVacuumMode::None
+            };
+
+            Ok(mode)
+        })();
+
+        // Always end read transaction, even on error
+        pager.end_read_tx();
+
+        let mode = result?;
 
         // Force autovacuum to None if the experimental flag is not enabled
         let final_mode = if !self.opts.enable_autovacuum {

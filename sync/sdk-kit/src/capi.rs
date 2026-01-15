@@ -596,9 +596,6 @@ mod tests {
             assert_eq!(status, turso_status_code_t::TURSO_OK);
 
             let status = turso_sync_operation_resume(operation, std::ptr::null_mut());
-            assert_eq!(status, turso_status_code_t::TURSO_IO);
-
-            let status = turso_sync_operation_resume(operation, std::ptr::null_mut());
             assert_eq!(status, turso_status_code_t::TURSO_DONE);
 
             assert_eq!(

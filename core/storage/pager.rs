@@ -4292,6 +4292,8 @@ impl Pager {
         // we only read the header which is unencrypted, but the rest of the page is. If so, lets
         // clear the cache.
         self.clear_page_cache(false);
+        // Also invalidate cached schema cookie to force re-read of page 1 with encryption
+        self.set_schema_cookie(None);
         Ok(())
     }
 
