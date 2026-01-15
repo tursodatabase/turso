@@ -13,7 +13,6 @@
 //! All DDL generators are schema-aware to avoid naming conflicts.
 
 pub mod alter_table;
-pub mod condition;
 pub mod create_index;
 pub mod create_table;
 pub mod create_trigger;
@@ -40,7 +39,6 @@ pub mod view;
 pub use alter_table::{
     AlterTableContext, AlterTableOp, AlterTableOpKind, AlterTableOpWeights, AlterTableStatement,
 };
-pub use condition::{OrderByItem, OrderDirection, SubqueryQuantifier};
 pub use create_index::{CreateIndexStatement, IndexColumn};
 pub use create_table::{ColumnProfile, CreateTableStatement, DataTypeWeights, PrimaryKeyProfile};
 pub use create_trigger::{
@@ -65,7 +63,7 @@ pub use profile::{
     SelectProfile, StatementProfile, UpdateProfile, ValueProfile, WeightedProfile,
 };
 pub use schema::{ColumnDef, DataType, Index, Schema, SchemaBuilder, Table, Trigger, View};
-pub use select::SelectStatement;
+pub use select::{OrderByItem, OrderDirection, SelectStatement};
 pub use statement::{SqlStatement, StatementContext, StatementKind};
 pub use transaction::{
     BeginStatement, CommitStatement, ReleaseStatement, RollbackStatement, SavepointStatement,
@@ -83,16 +81,14 @@ pub mod strategies {
         alter_table_add_column, alter_table_drop_column, alter_table_for_schema,
         alter_table_rename_column, alter_table_rename_to,
     };
-    // Conditions
-    pub use crate::condition::{
+    // Conditions and SELECT helpers
+    pub use crate::select::{
         comparison_op,
-        // Subquery strategies
         comparison_subquery_condition,
         condition_for_table,
         exists_condition,
         expression_condition,
         in_subquery_condition,
-        logical_op,
         optional_where_clause,
         order_by_for_table,
         order_direction,

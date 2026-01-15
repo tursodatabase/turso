@@ -3,7 +3,6 @@
 use proptest::prelude::*;
 use std::fmt;
 
-use crate::condition::OrderDirection;
 use crate::create_table::identifier_excluding;
 use crate::profile::StatementProfile;
 use crate::schema::{Schema, TableRef};
