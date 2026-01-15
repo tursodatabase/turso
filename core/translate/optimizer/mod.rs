@@ -362,7 +362,10 @@ fn optimize_subqueries(plan: &mut SelectPlan, schema: &Schema) -> Result<()> {
                     }
                 }
                 Plan::Delete(_) | Plan::Update(_) => {
-                    // These shouldn't appear in FROM clause subqueries
+                    return Err(LimboError::InternalError(
+                        "DELETE/UPDATE plans should not appear in FROM clause subqueries"
+                            .to_string(),
+                    ));
                 }
             }
         }

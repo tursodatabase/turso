@@ -227,7 +227,9 @@ pub fn translate_insert(
             }
         } else {
             // WITH clause on INSERT with VALUES or DEFAULT VALUES is not useful
-            // but we can just ignore it rather than error
+            // e.g. WITH unused AS (SELECT c FROM a) INSERT INTO b VALUES (1, 2, 3)
+            // but: we can, and indeed must, just ignore it instead of erroring.
+            // leaving this empty else block here for documentation.
         }
     }
 
