@@ -38,14 +38,14 @@ pub async fn load_test_files(paths: &[PathBuf]) -> Result<LoadedTests, BackendEr
             let pattern_str = pattern.to_string_lossy();
 
             for entry in glob::glob(&pattern_str)
-                .map_err(|e| BackendError::Execute(format!("invalid glob pattern: {}", e)))?
+                .map_err(|e| BackendError::Execute(format!("invalid glob pattern: {e}")))?
             {
                 match entry {
                     Ok(file_path) => {
                         load_single_file(&file_path, &mut files, &mut errors).await;
                     }
                     Err(e) => {
-                        return Err(BackendError::Execute(format!("glob error: {}", e)));
+                        return Err(BackendError::Execute(format!("glob error: {e}")));
                     }
                 }
             }
@@ -337,7 +337,7 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
                             readonly: false,
                         },
                         outcome: TestOutcome::Error {
-                            message: format!("task panicked: {}", e),
+                            message: format!("task panicked: {e}"),
                         },
                         duration: Duration::ZERO,
                     });
@@ -417,7 +417,7 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
                         readonly: false,
                     },
                     outcome: TestOutcome::Error {
-                        message: format!("task panicked: {}", e),
+                        message: format!("task panicked: {e}"),
                     },
                     duration: Duration::ZERO,
                 },
@@ -533,7 +533,7 @@ async fn run_single_test<B: SqlBackend>(
                 file: file_path,
                 database: db_config,
                 outcome: TestOutcome::Error {
-                    message: format!("execution failed: {}", e),
+                    message: format!("execution failed: {e}"),
                 },
                 duration: start.elapsed(),
             };
