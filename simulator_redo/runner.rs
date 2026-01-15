@@ -8,7 +8,9 @@
 //! 5. Checking the differential oracle
 //! 6. Re-introspecting schemas after DDL statements
 
+use std::cell::RefCell;
 use std::io::Write;
+use std::panic::RefUnwindSafe;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -152,7 +154,7 @@ impl SimStats {
 /// The main simulator.
 pub struct Simulator {
     config: SimConfig,
-    rng: ChaCha8Rng,
+    rng: RefCell<ChaCha8Rng>,
     turso_conn: Arc<turso_core::Connection>,
     sqlite_conn: rusqlite::Connection,
     #[expect(dead_code)]
@@ -162,6 +164,8 @@ pub struct Simulator {
     /// Directory to save run artifacts
     pub out_dir: PathBuf,
 }
+
+impl RefUnwindSafe for Simulator {}
 
 impl Simulator {
     /// Create a new simulator with in-memory databases.
@@ -194,7 +198,7 @@ impl Simulator {
 
         Ok(Self {
             config,
-            rng,
+            rng: RefCell::new(rng),
             turso_conn,
             sqlite_conn,
             turso_db,
@@ -218,7 +222,7 @@ impl Simulator {
     }
 
     /// Run the simulation.
-    pub fn run(&mut self) -> Result<SimStats> {
+    pub fn run(&self) -> Result<SimStats> {
         let mut stats = SimStats::default();
         let mut executed_sql = Vec::new();
 
@@ -243,7 +247,7 @@ impl Simulator {
         Ok(())
     }
 
-    fn run_inner(&mut self, stats: &mut SimStats, executed_sql: &mut Vec<String>) -> Result<()> {
+    fn run_inner(&self, stats: &mut SimStats, executed_sql: &mut Vec<String>) -> Result<()> {
         tracing::info!(
             "Starting simulation with seed={}, tables={}, statements={}",
             self.config.seed,
@@ -254,7 +258,7 @@ impl Simulator {
         // Create a deterministic seed for proptest
         let seed_bytes: [u8; 32] = {
             let mut bytes = [0u8; 32];
-            self.rng.fill_bytes(&mut bytes);
+            self.rng.borrow_mut().fill_bytes(&mut bytes);
             bytes
         };
 

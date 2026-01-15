@@ -3,8 +3,16 @@
 //! This binary runs a differential testing simulator that compares Turso
 //! results against SQLite for generated SQL statements.
 
+use std::{
+    io::{IsTerminal, stdin},
+    panic::{self},
+    process::Stdio,
+    sync::Arc,
+};
+
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use parking_lot::Mutex;
 use rand::RngCore;
 use sim_redo::{SimConfig, Simulator};
 
@@ -96,8 +104,38 @@ fn run_single(args: &Args) -> Result<()> {
 
     tracing::info!("Starting sim_redo with config: {:?}", config);
 
-    let mut simulator = Simulator::new(config)?;
-    let stats = simulator.run();
+    let simulator = Simulator::new(config)?;
+
+    let panic_info = Arc::new(Mutex::new(None::<String>));
+    let info_clone = Arc::clone(&panic_info);
+
+    let prev_hook = panic::take_hook();
+
+    panic::set_hook(Box::new(move |info| {
+        *info_clone.lock() = Some(info.to_string());
+    }));
+
+    let stats = std::panic::catch_unwind(|| simulator.run()).map_err(|err| {
+        let msg = if let Some(s) = err.downcast_ref::<&str>() {
+            s.to_string()
+        } else if let Some(s) = err.downcast_ref::<String>() {
+            s.clone()
+        } else {
+            "Unknown panic".to_string()
+        };
+        let mut err = anyhow::anyhow!("{msg}");
+        if let Some(msg) = panic_info.lock().take() {
+            err = err.context(msg);
+        }
+
+        err
+    });
+    let stats = match stats {
+        Ok(inner) => inner,
+        Err(e) => Err(e),
+    };
+
+    panic::set_hook(prev_hook);
 
     if args.keep_files {
         tracing::info!("Persisting database files to disk...");
