@@ -1046,10 +1046,10 @@ impl Value {
         if pattern.len() > 1 && pattern.starts_with('%') && pattern.ends_with('%') {
             let inner = &pattern[1..pattern.len() - 1];
             if !inner.contains(['%', '_']) {
-                if let Some(_) = text.to_ascii_lowercase().find(&inner.to_ascii_lowercase()) {
-                    return true;
-                }
-                return false;
+                return text
+                    .to_ascii_lowercase()
+                    .find(&inner.to_ascii_lowercase())
+                    .is_some();
             }
         }
 
