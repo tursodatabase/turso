@@ -1,9 +1,5 @@
 #[cfg(target_family = "windows")]
 use crate::error::CompletionError;
-use crate::sync::{
-    atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, Ordering},
-    Arc, RwLock,
-};
 #[cfg(all(feature = "fs", feature = "conn_raw_api"))]
 use crate::types::{WalFrameInfo, WalState};
 #[cfg(feature = "fs")]
@@ -20,7 +16,15 @@ use crate::{
     Completion, ConnectionMetrics, Database, DatabaseCatalog, DatabaseOpts, Duration,
     EncryptionKey, EncryptionOpts, IndexMethod, LimboError, MvStore, OpenFlags, PageSize, Pager,
     Parser, QueryMode, QueryRunner, Result, Schema, Statement, SyncMode, TransactionMode,
-    TransactionState, Trigger, Value, VirtualTable,
+    TransactionState, Trigger, Value, VirtualTable, CAPTURE_DATA_CHANGES_LATEST,
+    CAPTURE_DATA_CHANGES_V1, CAPTURE_DATA_CHANGES_VERSIONS,
+};
+use crate::{
+    sync::{
+        atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicIsize, AtomicU16, Ordering},
+        Arc, RwLock,
+    },
+    CaptureDataChangesInfo,
 };
 use arc_swap::ArcSwap;
 use rustc_hash::FxHashMap;
@@ -918,10 +922,40 @@ impl Connection {
         self.cache_size.store(size, Ordering::SeqCst);
     }
 
-    pub fn get_capture_data_changes(
-        &self,
-    ) -> crate::sync::RwLockReadGuard<'_, CaptureDataChangesMode> {
-        self.capture_data_changes.read()
+    pub fn get_capture_data_changes_mode(&self) -> CaptureDataChangesMode {
+        self.capture_data_changes.read().clone()
+    }
+
+    pub fn get_capture_data_changes_info(&self) -> Result<CaptureDataChangesInfo> {
+        let mode = self.capture_data_changes.read().clone();
+        let Some(table) = mode.table() else {
+            assert!(mode == CaptureDataChangesMode::Off);
+            return Ok(CaptureDataChangesInfo {
+                mode,
+                version: CAPTURE_DATA_CHANGES_LATEST,
+            });
+        };
+        let schema = self.schema.read();
+        let Some(cdc_table) = schema.get_table(table) else {
+            // this can happen when we initialize CDC with PRAGMA unstable_capture_data_changes_conn('...')
+            // because this pragma internally execute DDL statement to create table
+            return Ok(CaptureDataChangesInfo {
+                mode,
+                version: CAPTURE_DATA_CHANGES_LATEST,
+            });
+        };
+        for column in cdc_table.columns() {
+            for version in CAPTURE_DATA_CHANGES_VERSIONS {
+                if column.ty_str.contains(version) {
+                    return Ok(CaptureDataChangesInfo { mode, version });
+                }
+            }
+        }
+        // no version "annotation" means first version of the CDC
+        Ok(CaptureDataChangesInfo {
+            mode,
+            version: CAPTURE_DATA_CHANGES_V1,
+        })
     }
     pub fn set_capture_data_changes(&self, opts: CaptureDataChangesMode) {
         *self.capture_data_changes.write() = opts;

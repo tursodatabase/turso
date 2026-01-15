@@ -22,7 +22,9 @@ use crate::translate::schema::translate_create_table;
 use crate::util::{normalize_ident, parse_signed_number, parse_string, IOExt as _};
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::vdbe::insn::{Cookie, Insn};
-use crate::{bail_parse_error, CaptureDataChangesMode, LimboError, Value};
+use crate::{
+    bail_parse_error, CaptureDataChangesMode, LimboError, Value, CAPTURE_DATA_CHANGES_LATEST,
+};
 use std::str::FromStr;
 use strum::IntoEnumIterator;
 
@@ -699,7 +701,7 @@ fn query_pragma(
         PragmaName::UnstableCaptureDataChangesConn => {
             let pragma = pragma_for(&pragma);
             let second_column = program.alloc_register();
-            let opts = connection.get_capture_data_changes();
+            let opts = connection.get_capture_data_changes_mode();
             program.emit_string8(opts.mode_name().to_string(), register);
             if let Some(table) = &opts.table() {
                 program.emit_string8(table.to_string(), second_column);
@@ -971,7 +973,8 @@ fn turso_cdc_table_columns() -> Vec<ColumnDefinition> {
         ast::ColumnDefinition {
             col_name: ast::Name::exact("change_type".to_string()),
             col_type: Some(ast::Type {
-                name: "INTEGER".to_string(),
+                // we put version of CDC in the change_type column because change_id must have INTEGER type in order to be rowid alias
+                name: format!("INTEGER {}", CAPTURE_DATA_CHANGES_LATEST),
                 size: None,
             }),
             constraints: vec![],

@@ -1095,6 +1095,25 @@ impl Database {
     }
 }
 
+// V1 schema:
+// - change_id INTEGER PRIMARY KEY AUTOINCREMENT,
+// - change_time INTEGER,
+// - change_type INTEGER <cdc_version>,
+// - table_name TEXT,
+// - id ANY,
+// - before BLOB,
+// - after BLOB,
+// - updates BLOB
+static CAPTURE_DATA_CHANGES_V1: &str = "V1";
+static CAPTURE_DATA_CHANGES_LATEST: &str = CAPTURE_DATA_CHANGES_V1;
+static CAPTURE_DATA_CHANGES_VERSIONS: &[&str] = &[CAPTURE_DATA_CHANGES_V1];
+
+#[derive(Debug, Clone)]
+pub struct CaptureDataChangesInfo {
+    pub mode: CaptureDataChangesMode,
+    pub version: &'static str,
+}
+
 #[derive(Debug, Clone, Eq, PartialEq)]
 pub enum CaptureDataChangesMode {
     Off,

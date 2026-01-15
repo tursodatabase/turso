@@ -100,7 +100,7 @@ pub fn translate_update_for_schema_change(
     let mut plan = prepare_update_plan(&mut program, resolver.schema, body, connection, true)?;
 
     if let Plan::Update(update_plan) = &mut plan {
-        if program.capture_data_changes_mode().has_updates() {
+        if program.capture_data_changes_info().mode.has_updates() {
             update_plan.cdc_update_alter_statement = Some(ddl_query.to_string());
         }
 

@@ -405,7 +405,7 @@ pub fn emit_schema_entry(
     });
 
     if let Some(cdc_table_cursor_id) = cdc_table_cursor_id {
-        let after_record_reg = if program.capture_data_changes_mode().has_after() {
+        let after_record_reg = if program.capture_data_changes_info().mode.has_after() {
             Some(record_reg)
         } else {
             None
@@ -742,7 +742,7 @@ pub fn translate_drop_table(
             flags: CmpInsFlags::default(),
             collation: None,
         });
-        let before_record_reg = if program.capture_data_changes_mode().has_before() {
+        let before_record_reg = if program.capture_data_changes_info().mode.has_before() {
             Some(emit_cdc_full_record(
                 &mut program,
                 &schema_table.columns,

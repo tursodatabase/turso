@@ -16,7 +16,7 @@ use crate::{
         emitter::{MaterializedColumnRef, TransactionMode},
         plan::{ResultSetColumn, TableReferences},
     },
-    CaptureDataChangesMode, Connection, Value, VirtualTable,
+    CaptureDataChangesInfo, Connection, Value, VirtualTable,
 };
 
 #[derive(Default)]
@@ -132,7 +132,7 @@ pub struct ProgramBuilder {
     nested_level: usize,
     init_label: BranchOffset,
     start_offset: BranchOffset,
-    capture_data_changes_mode: CaptureDataChangesMode,
+    capture_data_changes_info: CaptureDataChangesInfo,
     // TODO: when we support multiple dbs, this should be a write mask to track which DBs need to be written
     txn_mode: TransactionMode,
     rollback: bool,
@@ -297,20 +297,20 @@ macro_rules! emit_explain {
 impl ProgramBuilder {
     pub fn new(
         query_mode: QueryMode,
-        capture_data_changes_mode: CaptureDataChangesMode,
+        capture_data_changes_info: CaptureDataChangesInfo,
         opts: ProgramBuilderOpts,
     ) -> Self {
-        ProgramBuilder::_new(query_mode, capture_data_changes_mode, opts, None, false)
+        ProgramBuilder::_new(query_mode, capture_data_changes_info, opts, None, false)
     }
     pub fn new_for_trigger(
         query_mode: QueryMode,
-        capture_data_changes_mode: CaptureDataChangesMode,
+        capture_data_changes_info: CaptureDataChangesInfo,
         opts: ProgramBuilderOpts,
         trigger: Arc<Trigger>,
     ) -> Self {
         ProgramBuilder::_new(
             query_mode,
-            capture_data_changes_mode,
+            capture_data_changes_info,
             opts,
             Some(trigger),
             true,
@@ -320,14 +320,14 @@ impl ProgramBuilder {
     /// an existing transaction and doesn't emit Transaction instructions.
     pub fn new_for_subprogram(
         query_mode: QueryMode,
-        capture_data_changes_mode: CaptureDataChangesMode,
+        capture_data_changes_info: CaptureDataChangesInfo,
         opts: ProgramBuilderOpts,
     ) -> Self {
-        ProgramBuilder::_new(query_mode, capture_data_changes_mode, opts, None, true)
+        ProgramBuilder::_new(query_mode, capture_data_changes_info, opts, None, true)
     }
     fn _new(
         query_mode: QueryMode,
-        capture_data_changes_mode: CaptureDataChangesMode,
+        capture_data_changes_info: CaptureDataChangesInfo,
         opts: ProgramBuilderOpts,
         trigger: Option<Arc<Trigger>>,
         is_subprogram: bool,
@@ -350,7 +350,7 @@ impl ProgramBuilder {
             // These labels will be filled when `prologue()` is called
             init_label: BranchOffset::Placeholder,
             start_offset: BranchOffset::Placeholder,
-            capture_data_changes_mode,
+            capture_data_changes_info,
             txn_mode: TransactionMode::None,
             rollback: false,
             query_mode,
@@ -419,8 +419,8 @@ impl ProgramBuilder {
         self.needs_stmt_subtransactions = needs_stmt_subtransactions;
     }
 
-    pub fn capture_data_changes_mode(&self) -> &CaptureDataChangesMode {
-        &self.capture_data_changes_mode
+    pub fn capture_data_changes_info(&self) -> &CaptureDataChangesInfo {
+        &self.capture_data_changes_info
     }
 
     pub fn extend(&mut self, opts: &ProgramBuilderOpts) {

@@ -943,7 +943,7 @@ pub fn emit_upsert(
         let new_rowid = new_rowid_reg.unwrap_or(ctx.conflict_rowid_reg);
         if new_rowid_reg.is_some() {
             // DELETE (before)
-            let before_rec = if program.capture_data_changes_mode().has_before() {
+            let before_rec = if program.capture_data_changes_info().mode.has_before() {
                 Some(emit_cdc_full_record(
                     program,
                     table.columns(),
@@ -966,7 +966,7 @@ pub fn emit_upsert(
             )?;
 
             // INSERT (after)
-            let after_rec = if program.capture_data_changes_mode().has_after() {
+            let after_rec = if program.capture_data_changes_info().mode.has_after() {
                 Some(emit_cdc_patch_record(
                     program, table, new_start, rec, new_rowid,
                 ))
@@ -985,7 +985,7 @@ pub fn emit_upsert(
                 table.get_name(),
             )?;
         } else {
-            let after_rec = if program.capture_data_changes_mode().has_after() {
+            let after_rec = if program.capture_data_changes_info().mode.has_after() {
                 Some(emit_cdc_patch_record(
                     program,
                     table,
@@ -996,7 +996,7 @@ pub fn emit_upsert(
             } else {
                 None
             };
-            let before_rec = if program.capture_data_changes_mode().has_before() {
+            let before_rec = if program.capture_data_changes_info().mode.has_before() {
                 Some(emit_cdc_full_record(
                     program,
                     table.columns(),

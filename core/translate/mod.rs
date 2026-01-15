@@ -86,7 +86,7 @@ pub fn translate(
 
     let mut program = ProgramBuilder::new(
         query_mode,
-        connection.get_capture_data_changes().clone(),
+        connection.get_capture_data_changes_info()?,
         // These options will be extended whithin each translate program
         ProgramBuilderOpts {
             num_cursors: 1,
