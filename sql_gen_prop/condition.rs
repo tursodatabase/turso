@@ -167,7 +167,7 @@ fn condition_for_table_internal(
     }
 
     let expr_profile = &profile.generation.expression.base;
-    let ctx = ExpressionContext::new(functions.clone())
+    let ctx = ExpressionContext::new(functions.clone(), schema.clone())
         .with_columns(table.columns.clone())
         .with_max_depth(expr_profile.condition_expression_max_depth)
         .with_aggregates(false);
@@ -383,7 +383,7 @@ pub fn order_by_for_table(
     }
 
     let functions = builtin_functions();
-    let mut ctx = ExpressionContext::new(functions)
+    let mut ctx = ExpressionContext::new(functions, Schema::default())
         .with_columns(table.columns.clone())
         .with_max_depth(expr_max_depth)
         .with_aggregates(false);

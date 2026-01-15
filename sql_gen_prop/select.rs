@@ -217,7 +217,7 @@ pub fn select_for_table(
     let offset_range = select_profile.offset_range.clone();
 
     // Build expression context for generating expressions
-    let ctx = ExpressionContext::new(functions)
+    let ctx = ExpressionContext::new(functions, schema.clone())
         .with_columns(table.columns.clone())
         .with_max_depth(expression_max_depth)
         .with_aggregates(allow_aggregates);

@@ -103,7 +103,7 @@ pub fn insert_for_table(
     let col_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
 
     // Build expression context (no column refs for INSERT values)
-    let ctx = ExpressionContext::new(functions)
+    let ctx = ExpressionContext::new(functions, crate::schema::Schema::default())
         .with_max_depth(expression_max_depth)
         .with_aggregates(allow_aggregates);
 

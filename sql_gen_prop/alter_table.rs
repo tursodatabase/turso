@@ -26,19 +26,6 @@ pub struct AlterTableContext<'a> {
     pub schema: &'a Schema,
 }
 
-/// Enum representing the kinds of ALTER TABLE operations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum::EnumIter)]
-pub enum AlterTableOpKind {
-    /// RENAME TO new_name
-    RenameTo,
-    /// RENAME COLUMN old_name TO new_name
-    RenameColumn,
-    /// ADD COLUMN column_def
-    AddColumn,
-    /// DROP COLUMN column_name
-    DropColumn,
-}
-
 impl SqlGeneratorKind for AlterTableOpKind {
     type Context<'a> = AlterTableContext<'a>;
     type Output = AlterTableStatement;
@@ -178,7 +165,9 @@ impl AlterTableOpWeights {
 }
 
 /// Types of ALTER TABLE operations.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, strum::EnumDiscriminants)]
+#[strum_discriminants(name(AlterTableOpKind), vis(pub))]
+#[strum_discriminants(derive(Hash, strum::EnumIter))]
 pub enum AlterTableOp {
     /// RENAME TO new_name
     RenameTo(String),

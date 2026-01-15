@@ -123,7 +123,7 @@ pub fn update_for_table(
     }
 
     // Build expression context with columns (allows `SET x = x + 1` style expressions)
-    let ctx = ExpressionContext::new(functions)
+    let ctx = ExpressionContext::new(functions, schema.clone())
         .with_columns(table.columns.clone())
         .with_max_depth(expression_max_depth)
         .with_aggregates(allow_aggregates);

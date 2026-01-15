@@ -24,7 +24,9 @@ use crate::select::SelectStatement;
 use crate::value::{SqlValue, value_for_type};
 
 /// A SQL expression that can appear in SELECT lists, WHERE clauses, etc.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, strum::EnumDiscriminants)]
+#[strum_discriminants(name(ExpressionKind), vis(pub))]
+#[strum_discriminants(derive(Hash, strum::EnumIter))]
 pub enum Expression {
     /// A literal value (integer, text, etc.).
     Value(SqlValue),
@@ -56,7 +58,7 @@ pub enum Expression {
         expr: Box<Expression>,
         target_type: DataType,
     },
-    /// A subquery expression (for scalar subqueries).
+    /// A subquery expression.
     Subquery(Box<SelectStatement>),
 
     // =========================================================================
@@ -92,39 +94,6 @@ pub enum Expression {
         op: BinaryOperator,
         subquery: Box<SelectStatement>,
     },
-}
-
-/// The kind of expression for generation control.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, strum::EnumIter)]
-pub enum ExpressionKind {
-    /// A literal value.
-    Value,
-    /// A column reference.
-    Column,
-    /// A function call.
-    FunctionCall,
-    /// A binary operation.
-    BinaryOp,
-    /// A unary operation.
-    UnaryOp,
-    /// A CASE expression.
-    Case,
-    /// A CAST expression.
-    Cast,
-}
-
-impl fmt::Display for ExpressionKind {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ExpressionKind::Value => write!(f, "Value"),
-            ExpressionKind::Column => write!(f, "Column"),
-            ExpressionKind::FunctionCall => write!(f, "FunctionCall"),
-            ExpressionKind::BinaryOp => write!(f, "BinaryOp"),
-            ExpressionKind::UnaryOp => write!(f, "UnaryOp"),
-            ExpressionKind::Case => write!(f, "Case"),
-            ExpressionKind::Cast => write!(f, "Cast"),
-        }
-    }
 }
 
 /// Binary operators for expressions.
@@ -440,6 +409,9 @@ impl Expression {
 /// Profile for controlling expression generation weights.
 #[derive(Debug, Clone)]
 pub struct ExpressionProfile {
+    // =========================================================================
+    // Primary expression weights
+    // =========================================================================
     /// Weight for literal value expressions.
     pub value_weight: u32,
     /// Weight for column reference expressions.
@@ -454,11 +426,35 @@ pub struct ExpressionProfile {
     pub case_weight: u32,
     /// Weight for CAST expressions.
     pub cast_weight: u32,
+    /// Weight for parenthesized expressions.
+    pub parenthesized_weight: u32,
+    /// Weight for scalar subquery expressions.
+    pub subquery_weight: u32,
     /// Profile for controlling function category weights.
     pub function_profile: FunctionProfile,
 
     // =========================================================================
-    // Condition generation settings
+    // Condition expression weights
+    // =========================================================================
+    /// Weight for IS NULL expressions.
+    pub is_null_weight: u32,
+    /// Weight for IS NOT NULL expressions.
+    pub is_not_null_weight: u32,
+    /// Weight for EXISTS subquery expressions.
+    pub exists_weight: u32,
+    /// Weight for NOT EXISTS subquery expressions.
+    pub not_exists_weight: u32,
+    /// Weight for IN subquery expressions.
+    pub in_subquery_weight: u32,
+    /// Weight for NOT IN subquery expressions.
+    pub not_in_subquery_weight: u32,
+    /// Weight for ANY comparison subquery expressions.
+    pub any_subquery_weight: u32,
+    /// Weight for ALL comparison subquery expressions.
+    pub all_subquery_weight: u32,
+
+    // =========================================================================
+    // Generation settings
     // =========================================================================
     /// Maximum depth for condition trees (AND/OR nesting).
     pub condition_max_depth: u32,
@@ -470,22 +466,6 @@ pub struct ExpressionProfile {
     pub simple_condition_weight: u32,
     /// Whether to allow integer literals in ORDER BY expressions.
     pub order_by_allow_integer_positions: bool,
-
-    // =========================================================================
-    // Subquery generation settings
-    // =========================================================================
-    /// Weight for EXISTS conditions.
-    pub exists_weight: u32,
-    /// Weight for NOT EXISTS conditions.
-    pub not_exists_weight: u32,
-    /// Weight for IN subquery conditions.
-    pub in_subquery_weight: u32,
-    /// Weight for NOT IN subquery conditions.
-    pub not_in_subquery_weight: u32,
-    /// Weight for ANY comparison subquery conditions.
-    pub any_subquery_weight: u32,
-    /// Weight for ALL comparison subquery conditions.
-    pub all_subquery_weight: u32,
     /// Maximum LIMIT value for subqueries.
     pub subquery_limit_max: u32,
 }
@@ -493,6 +473,7 @@ pub struct ExpressionProfile {
 impl Default for ExpressionProfile {
     fn default() -> Self {
         Self {
+            // Primary expression weights
             value_weight: 30,
             column_weight: 30,
             function_call_weight: 20,
@@ -500,20 +481,24 @@ impl Default for ExpressionProfile {
             unary_op_weight: 5,
             case_weight: 3,
             cast_weight: 2,
+            parenthesized_weight: 2,
+            subquery_weight: 3,
             function_profile: FunctionProfile::default(),
-            // Condition settings
-            condition_max_depth: 2,
-            max_order_by_items: 3,
-            condition_expression_max_depth: 1,
-            simple_condition_weight: 80,
-            order_by_allow_integer_positions: true,
-            // Subquery settings
+            // Condition expression weights
+            is_null_weight: 5,
+            is_not_null_weight: 5,
             exists_weight: 5,
             not_exists_weight: 3,
             in_subquery_weight: 8,
             not_in_subquery_weight: 4,
             any_subquery_weight: 3,
             all_subquery_weight: 3,
+            // Generation settings
+            condition_max_depth: 2,
+            max_order_by_items: 3,
+            condition_expression_max_depth: 1,
+            simple_condition_weight: 80,
+            order_by_allow_integer_positions: true,
             subquery_limit_max: 100,
         }
     }
@@ -572,19 +557,23 @@ impl ExpressionProfile {
             unary_op_weight: 0,
             case_weight: 0,
             cast_weight: 0,
-            // Simple condition settings
-            condition_max_depth: 0,
-            max_order_by_items: 1,
-            condition_expression_max_depth: 0,
-            simple_condition_weight: 100,
-            order_by_allow_integer_positions: false,
-            // Disable all subqueries
+            parenthesized_weight: 0,
+            subquery_weight: 0,
+            // Disable all condition expressions
+            is_null_weight: 0,
+            is_not_null_weight: 0,
             exists_weight: 0,
             not_exists_weight: 0,
             in_subquery_weight: 0,
             not_in_subquery_weight: 0,
             any_subquery_weight: 0,
             all_subquery_weight: 0,
+            // Simple generation settings
+            condition_max_depth: 0,
+            max_order_by_items: 1,
+            condition_expression_max_depth: 0,
+            simple_condition_weight: 100,
+            order_by_allow_integer_positions: false,
             ..Self::default()
         }
     }
@@ -630,6 +619,16 @@ impl ExpressionProfile {
             ExpressionKind::UnaryOp => self.unary_op_weight = weight,
             ExpressionKind::Case => self.case_weight = weight,
             ExpressionKind::Cast => self.cast_weight = weight,
+            ExpressionKind::Parenthesized => self.parenthesized_weight = weight,
+            ExpressionKind::Subquery => self.subquery_weight = weight,
+            ExpressionKind::IsNull => self.is_null_weight = weight,
+            ExpressionKind::IsNotNull => self.is_not_null_weight = weight,
+            ExpressionKind::Exists => self.exists_weight = weight,
+            ExpressionKind::NotExists => self.not_exists_weight = weight,
+            ExpressionKind::InSubquery => self.in_subquery_weight = weight,
+            ExpressionKind::NotInSubquery => self.not_in_subquery_weight = weight,
+            ExpressionKind::AnySubquery => self.any_subquery_weight = weight,
+            ExpressionKind::AllSubquery => self.all_subquery_weight = weight,
         }
         self
     }
@@ -650,6 +649,16 @@ impl ExpressionProfile {
             ExpressionKind::UnaryOp => self.unary_op_weight,
             ExpressionKind::Case => self.case_weight,
             ExpressionKind::Cast => self.cast_weight,
+            ExpressionKind::Parenthesized => self.parenthesized_weight,
+            ExpressionKind::Subquery => self.subquery_weight,
+            ExpressionKind::IsNull => self.is_null_weight,
+            ExpressionKind::IsNotNull => self.is_not_null_weight,
+            ExpressionKind::Exists => self.exists_weight,
+            ExpressionKind::NotExists => self.not_exists_weight,
+            ExpressionKind::InSubquery => self.in_subquery_weight,
+            ExpressionKind::NotInSubquery => self.not_in_subquery_weight,
+            ExpressionKind::AnySubquery => self.any_subquery_weight,
+            ExpressionKind::AllSubquery => self.all_subquery_weight,
         }
     }
 
@@ -810,11 +819,13 @@ pub struct ExpressionContext {
     pub profile: ExpressionProfile,
     /// Range for number of CASE WHEN clauses.
     pub case_when_clause_range: std::ops::RangeInclusive<usize>,
+    /// Schema for generating subqueries.
+    pub schema: crate::schema::Schema,
 }
 
 impl ExpressionContext {
     /// Create a new context for expression generation.
-    pub fn new(functions: FunctionRegistry) -> Self {
+    pub fn new(functions: FunctionRegistry, schema: crate::schema::Schema) -> Self {
         Self {
             columns: Vec::new(),
             functions,
@@ -823,6 +834,7 @@ impl ExpressionContext {
             target_type: None,
             profile: ExpressionProfile::default(),
             case_when_clause_range: 1..=3,
+            schema,
         }
     }
 
@@ -872,6 +884,7 @@ impl ExpressionContext {
             target_type: self.target_type,
             profile: self.profile.clone(),
             case_when_clause_range: self.case_when_clause_range.clone(),
+            schema: self.schema.clone(),
         }
     }
 }
@@ -923,10 +936,27 @@ impl SqlGeneratorKind for ExpressionKind {
             }
             ExpressionKind::Case => ctx.max_depth > 0,
             ExpressionKind::Cast => ctx.max_depth > 0,
+            // Parenthesized just wraps another expression
+            ExpressionKind::Parenthesized => ctx.max_depth > 0,
+            // Scalar subquery requires tables in schema
+            ExpressionKind::Subquery => ctx.max_depth > 0 && !ctx.schema.tables.is_empty(),
+            // IS NULL / IS NOT NULL require columns
+            ExpressionKind::IsNull | ExpressionKind::IsNotNull => !ctx.columns.is_empty(),
+            // Subquery conditions require tables in schema
+            ExpressionKind::Exists | ExpressionKind::NotExists => !ctx.schema.tables.is_empty(),
+            // IN/NOT IN subqueries require columns and tables in schema
+            ExpressionKind::InSubquery | ExpressionKind::NotInSubquery => {
+                !ctx.columns.is_empty() && !ctx.schema.tables.is_empty()
+            }
+            // ANY/ALL subqueries require columns and tables in schema
+            ExpressionKind::AnySubquery | ExpressionKind::AllSubquery => {
+                !ctx.columns.is_empty() && !ctx.schema.tables.is_empty()
+            }
         }
     }
 
     fn supported(&self) -> bool {
+        // All expression kinds are supported
         true
     }
 
@@ -943,6 +973,20 @@ impl SqlGeneratorKind for ExpressionKind {
             ExpressionKind::UnaryOp => unary_op_expression_strategy(ctx),
             ExpressionKind::Case => case_expression_strategy(ctx),
             ExpressionKind::Cast => cast_expression_strategy(ctx),
+            ExpressionKind::Parenthesized => parenthesized_expression_strategy(ctx, profile),
+            ExpressionKind::Subquery => subquery_expression_strategy(ctx, profile),
+            ExpressionKind::IsNull => is_null_expression_strategy(ctx, false),
+            ExpressionKind::IsNotNull => is_null_expression_strategy(ctx, true),
+            ExpressionKind::Exists => exists_expression_strategy(ctx, profile, false),
+            ExpressionKind::NotExists => exists_expression_strategy(ctx, profile, true),
+            ExpressionKind::InSubquery => in_subquery_expression_strategy(ctx, profile, false),
+            ExpressionKind::NotInSubquery => in_subquery_expression_strategy(ctx, profile, true),
+            ExpressionKind::AnySubquery => {
+                comparison_subquery_expression_strategy(ctx, profile, false)
+            }
+            ExpressionKind::AllSubquery => {
+                comparison_subquery_expression_strategy(ctx, profile, true)
+            }
         }
     }
 }
@@ -1133,6 +1177,167 @@ fn cast_expression_strategy(ctx: &ExpressionContext) -> BoxedStrategy<Expression
         .boxed()
 }
 
+/// Generate a parenthesized expression.
+fn parenthesized_expression_strategy(
+    ctx: &ExpressionContext,
+    _profile: &StatementProfile,
+) -> BoxedStrategy<Expression> {
+    let child_ctx = ctx.child_context(ctx.max_depth.saturating_sub(1));
+    expression(&child_ctx)
+        .prop_map(|expr| Expression::Parenthesized(Box::new(expr)))
+        .boxed()
+}
+
+/// Generate a scalar subquery expression.
+fn subquery_expression_strategy(
+    ctx: &ExpressionContext,
+    profile: &StatementProfile,
+) -> BoxedStrategy<Expression> {
+    let tables = ctx.schema.tables.clone();
+
+    proptest::sample::select((*tables).clone())
+        .prop_flat_map({
+            let profile = profile.clone();
+            move |table| {
+                crate::select::select_for_table(&table, &crate::schema::Schema::default(), &profile)
+                    .prop_map(|select| Expression::Subquery(Box::new(select)))
+            }
+        })
+        .boxed()
+}
+
+/// Generate an IS NULL or IS NOT NULL expression.
+fn is_null_expression_strategy(
+    ctx: &ExpressionContext,
+    negated: bool,
+) -> BoxedStrategy<Expression> {
+    let col_names: Vec<String> = ctx.columns.iter().map(|c| c.name.clone()).collect();
+
+    proptest::sample::select(col_names)
+        .prop_map(move |name| {
+            let expr = Expression::Column(name);
+            if negated {
+                Expression::is_not_null(expr)
+            } else {
+                Expression::is_null(expr)
+            }
+        })
+        .boxed()
+}
+
+/// Generate an EXISTS or NOT EXISTS expression.
+fn exists_expression_strategy(
+    ctx: &ExpressionContext,
+    profile: &StatementProfile,
+    negated: bool,
+) -> BoxedStrategy<Expression> {
+    let tables = ctx.schema.tables.clone();
+
+    proptest::sample::select((*tables).clone())
+        .prop_flat_map({
+            let profile = profile.clone();
+            move |table| {
+                crate::select::select_for_table(&table, &crate::schema::Schema::default(), &profile)
+            }
+        })
+        .prop_map(move |select| {
+            if negated {
+                Expression::NotExists {
+                    subquery: Box::new(select),
+                }
+            } else {
+                Expression::Exists {
+                    subquery: Box::new(select),
+                }
+            }
+        })
+        .boxed()
+}
+
+/// Generate an IN or NOT IN subquery expression.
+fn in_subquery_expression_strategy(
+    ctx: &ExpressionContext,
+    profile: &StatementProfile,
+    negated: bool,
+) -> BoxedStrategy<Expression> {
+    let tables = ctx.schema.tables.clone();
+    let col_names: Vec<String> = ctx.columns.iter().map(|c| c.name.clone()).collect();
+
+    (
+        proptest::sample::select(col_names),
+        proptest::sample::select((*tables).clone()),
+    )
+        .prop_flat_map({
+            let profile = profile.clone();
+            move |(col_name, table)| {
+                crate::select::select_for_table(&table, &crate::schema::Schema::default(), &profile)
+                    .prop_map(move |select| (col_name.clone(), select))
+            }
+        })
+        .prop_map(move |(col_name, select)| {
+            let expr = Expression::Column(col_name);
+            if negated {
+                Expression::NotInSubquery {
+                    expr: Box::new(expr),
+                    subquery: Box::new(select),
+                }
+            } else {
+                Expression::InSubquery {
+                    expr: Box::new(expr),
+                    subquery: Box::new(select),
+                }
+            }
+        })
+        .boxed()
+}
+
+/// Generate an ANY or ALL comparison subquery expression.
+fn comparison_subquery_expression_strategy(
+    ctx: &ExpressionContext,
+    profile: &StatementProfile,
+    is_all: bool,
+) -> BoxedStrategy<Expression> {
+    let tables = ctx.schema.tables.clone();
+    let col_names: Vec<String> = ctx.columns.iter().map(|c| c.name.clone()).collect();
+
+    (
+        proptest::sample::select(col_names),
+        prop_oneof![
+            Just(BinaryOperator::Eq),
+            Just(BinaryOperator::Ne),
+            Just(BinaryOperator::Lt),
+            Just(BinaryOperator::Le),
+            Just(BinaryOperator::Gt),
+            Just(BinaryOperator::Ge),
+        ],
+        proptest::sample::select((*tables).clone()),
+    )
+        .prop_flat_map({
+            let profile = profile.clone();
+            move |(col_name, op, table)| {
+                crate::select::select_for_table(&table, &crate::schema::Schema::default(), &profile)
+                    .prop_map(move |select| (col_name.clone(), op, select))
+            }
+        })
+        .prop_map(move |(col_name, op, select)| {
+            let left = Expression::Column(col_name);
+            if is_all {
+                Expression::AllSubquery {
+                    left: Box::new(left),
+                    op,
+                    subquery: Box::new(select),
+                }
+            } else {
+                Expression::AnySubquery {
+                    left: Box::new(left),
+                    op,
+                    subquery: Box::new(select),
+                }
+            }
+        })
+        .boxed()
+}
+
 /// Generate an expression using the context's profile.
 pub fn expression(ctx: &ExpressionContext) -> BoxedStrategy<Expression> {
     let profile = StatementProfile::default();
@@ -1283,8 +1488,9 @@ mod tests {
 
     #[test]
     fn test_expression_kind_available() {
+        use crate::schema::Schema;
         let registry = builtin_functions();
-        let ctx = ExpressionContext::new(registry)
+        let ctx = ExpressionContext::new(registry, Schema::default())
             .with_max_depth(2)
             .with_columns(vec![ColumnDef::new("id", DataType::Integer)]);
 
@@ -1297,11 +1503,12 @@ mod tests {
         assert!(ExpressionKind::Cast.available(&ctx));
 
         // With no columns, Column is not available
-        let ctx_no_cols = ExpressionContext::new(builtin_functions()).with_max_depth(2);
+        let ctx_no_cols =
+            ExpressionContext::new(builtin_functions(), Schema::default()).with_max_depth(2);
         assert!(!ExpressionKind::Column.available(&ctx_no_cols));
 
         // With depth 0, recursive expressions are not available
-        let ctx_no_depth = ExpressionContext::new(builtin_functions())
+        let ctx_no_depth = ExpressionContext::new(builtin_functions(), Schema::default())
             .with_max_depth(0)
             .with_columns(vec![ColumnDef::new("id", DataType::Integer)]);
         assert!(!ExpressionKind::FunctionCall.available(&ctx_no_depth));
@@ -1330,7 +1537,7 @@ mod tests {
         fn generated_expression_is_valid(
             expr in {
                 let registry = builtin_functions();
-                let ctx = ExpressionContext::new(registry).with_max_depth(2);
+                let ctx = ExpressionContext::new(registry, crate::schema::Schema::default()).with_max_depth(2);
                 expression(&ctx)
             }
         ) {
@@ -1341,11 +1548,12 @@ mod tests {
 
     #[test]
     fn test_functions_are_generated() {
+        use crate::schema::Schema;
         use proptest::strategy::Strategy;
         use proptest::test_runner::TestRunner;
 
         let registry = builtin_functions();
-        let ctx = ExpressionContext::new(registry).with_max_depth(3);
+        let ctx = ExpressionContext::new(registry, Schema::default()).with_max_depth(3);
         let strategy = expression(&ctx);
 
         let mut runner = TestRunner::default();
@@ -1367,12 +1575,13 @@ mod tests {
 
     #[test]
     fn test_binary_ops_are_generated() {
+        use crate::schema::Schema;
         use proptest::strategy::Strategy;
         use proptest::test_runner::TestRunner;
 
         let registry = builtin_functions();
         let profile = ExpressionProfile::default().with_weight(ExpressionKind::BinaryOp, 50);
-        let ctx = ExpressionContext::new(registry)
+        let ctx = ExpressionContext::new(registry, Schema::default())
             .with_max_depth(3)
             .with_profile(profile);
         let strategy = expression(&ctx);
@@ -1396,12 +1605,13 @@ mod tests {
 
     #[test]
     fn test_simple_profile_only_values_and_columns() {
+        use crate::schema::Schema;
         use proptest::strategy::Strategy;
         use proptest::test_runner::TestRunner;
 
         let registry = builtin_functions();
         let profile = ExpressionProfile::simple();
-        let ctx = ExpressionContext::new(registry)
+        let ctx = ExpressionContext::new(registry, Schema::default())
             .with_max_depth(3)
             .with_columns(vec![ColumnDef::new("id", DataType::Integer)])
             .with_profile(profile);
