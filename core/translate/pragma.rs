@@ -977,6 +977,14 @@ fn turso_cdc_table_columns() -> Vec<ColumnDefinition> {
             constraints: vec![],
         },
         ast::ColumnDefinition {
+            col_name: ast::Name::exact("change_txn_id".to_string()),
+            col_type: Some(ast::Type {
+                name: "INTEGER".to_string(),
+                size: None,
+            }),
+            constraints: vec![],
+        },
+        ast::ColumnDefinition {
             col_name: ast::Name::exact("table_name".to_string()),
             col_type: Some(ast::Type {
                 name: "TEXT".to_string(),
@@ -1009,14 +1017,6 @@ fn turso_cdc_table_columns() -> Vec<ColumnDefinition> {
             col_name: ast::Name::exact("updates".to_string()),
             col_type: Some(ast::Type {
                 name: "BLOB".to_string(),
-                size: None,
-            }),
-            constraints: vec![],
-        },
-        ast::ColumnDefinition {
-            col_name: ast::Name::exact("change_txn_id".to_string()),
-            col_type: Some(ast::Type {
-                name: "INTEGER".to_string(),
                 size: None,
             }),
             constraints: vec![],

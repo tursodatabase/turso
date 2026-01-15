@@ -361,12 +361,12 @@ impl TryFrom<&turso_core::Row> for DatabaseChange {
         let change_id = get_core_value_i64(row, 0)?;
         let change_time = get_core_value_i64(row, 1)? as u64;
         let change_type = get_core_value_i64(row, 2)?;
-        let table_name = get_core_value_text(row, 3)?;
-        let id = get_core_value_i64(row, 4)?;
-        let before = get_core_value_blob_or_null(row, 5)?;
-        let after = get_core_value_blob_or_null(row, 6)?;
-        let updates = get_core_value_blob_or_null(row, 7)?;
-        let change_txn_id = get_core_value_i64_or_null(row, 8)?;
+        let change_txn_id = get_core_value_i64_or_null(row, 3)?;
+        let table_name = get_core_value_text(row, 4)?;
+        let id = get_core_value_i64(row, 5)?;
+        let before = get_core_value_blob_or_null(row, 6)?;
+        let after = get_core_value_blob_or_null(row, 7)?;
+        let updates = get_core_value_blob_or_null(row, 8)?;
 
         let change_type = match change_type {
             -1 => DatabaseChangeType::Delete,

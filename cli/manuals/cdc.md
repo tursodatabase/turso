@@ -80,12 +80,12 @@ The CDC table (default name: `turso_cdc`) contains the following columns:
 | `change_id` | INTEGER | Auto-incrementing unique identifier for each change |
 | `change_time` | INTEGER | Timestamp of the change (Unix epoch) |
 | `change_type` | INTEGER | Type of change: 1 (INSERT), 0 (UPDATE), -1 (DELETE), 2 (COMMIT)* |
+| `change_txn_id` | INTEGER | Transaction ID for grouping changes by transaction |
 | `table_name` | TEXT | Name of the table that was changed |
 | `id` | varies | Primary key/rowid of the changed row |
 | `before` | BLOB | Row data before the change (for modes: before, full) |
 | `after` | BLOB | Row data after the change (for modes: after, full) |
 | `updates` | BLOB | Details of updated columns (for mode: full) |
-| `change_txn_id` | INTEGER | Transaction ID for grouping changes by transaction |
 
 \* COMMIT records (change_type=2) mark the end of a transaction. They are emitted:
   - After each statement in auto-commit mode
