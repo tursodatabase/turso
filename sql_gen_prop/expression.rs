@@ -456,6 +456,38 @@ pub struct ExpressionProfile {
     pub cast_weight: u32,
     /// Profile for controlling function category weights.
     pub function_profile: FunctionProfile,
+
+    // =========================================================================
+    // Condition generation settings
+    // =========================================================================
+    /// Maximum depth for condition trees (AND/OR nesting).
+    pub condition_max_depth: u32,
+    /// Maximum number of ORDER BY items.
+    pub max_order_by_items: usize,
+    /// Maximum depth for expressions within conditions.
+    pub condition_expression_max_depth: u32,
+    /// Weight for simple (non-subquery) conditions relative to subquery conditions.
+    pub simple_condition_weight: u32,
+    /// Whether to allow integer literals in ORDER BY expressions.
+    pub order_by_allow_integer_positions: bool,
+
+    // =========================================================================
+    // Subquery generation settings
+    // =========================================================================
+    /// Weight for EXISTS conditions.
+    pub exists_weight: u32,
+    /// Weight for NOT EXISTS conditions.
+    pub not_exists_weight: u32,
+    /// Weight for IN subquery conditions.
+    pub in_subquery_weight: u32,
+    /// Weight for NOT IN subquery conditions.
+    pub not_in_subquery_weight: u32,
+    /// Weight for ANY comparison subquery conditions.
+    pub any_subquery_weight: u32,
+    /// Weight for ALL comparison subquery conditions.
+    pub all_subquery_weight: u32,
+    /// Maximum LIMIT value for subqueries.
+    pub subquery_limit_max: u32,
 }
 
 impl Default for ExpressionProfile {
@@ -469,6 +501,20 @@ impl Default for ExpressionProfile {
             case_weight: 3,
             cast_weight: 2,
             function_profile: FunctionProfile::default(),
+            // Condition settings
+            condition_max_depth: 2,
+            max_order_by_items: 3,
+            condition_expression_max_depth: 1,
+            simple_condition_weight: 80,
+            order_by_allow_integer_positions: true,
+            // Subquery settings
+            exists_weight: 5,
+            not_exists_weight: 3,
+            in_subquery_weight: 8,
+            not_in_subquery_weight: 4,
+            any_subquery_weight: 3,
+            all_subquery_weight: 3,
+            subquery_limit_max: 100,
         }
     }
 }
@@ -484,7 +530,7 @@ impl ExpressionProfile {
             unary_op_weight: 14,
             case_weight: 13,
             cast_weight: 13,
-            function_profile: FunctionProfile::default(),
+            ..Self::default()
         }
     }
 
@@ -498,7 +544,7 @@ impl ExpressionProfile {
             unary_op_weight: 5,
             case_weight: 3,
             cast_weight: 2,
-            function_profile: FunctionProfile::default(),
+            ..Self::default()
         }
     }
 
@@ -512,11 +558,11 @@ impl ExpressionProfile {
             unary_op_weight: 5,
             case_weight: 4,
             cast_weight: 3,
-            function_profile: FunctionProfile::default(),
+            ..Self::default()
         }
     }
 
-    /// Create a profile for simple expressions (values and columns only).
+    /// Create a profile for simple expressions (values and columns only, no subqueries).
     pub fn simple() -> Self {
         Self {
             value_weight: 50,
@@ -526,8 +572,52 @@ impl ExpressionProfile {
             unary_op_weight: 0,
             case_weight: 0,
             cast_weight: 0,
-            function_profile: FunctionProfile::default(),
+            // Simple condition settings
+            condition_max_depth: 0,
+            max_order_by_items: 1,
+            condition_expression_max_depth: 0,
+            simple_condition_weight: 100,
+            order_by_allow_integer_positions: false,
+            // Disable all subqueries
+            exists_weight: 0,
+            not_exists_weight: 0,
+            in_subquery_weight: 0,
+            not_in_subquery_weight: 0,
+            any_subquery_weight: 0,
+            all_subquery_weight: 0,
+            ..Self::default()
         }
+    }
+
+    /// Create a complex profile for thorough testing.
+    pub fn complex() -> Self {
+        Self {
+            function_call_weight: 30,
+            binary_op_weight: 15,
+            case_weight: 8,
+            cast_weight: 5,
+            // Complex condition settings
+            condition_max_depth: 4,
+            max_order_by_items: 5,
+            condition_expression_max_depth: 2,
+            simple_condition_weight: 60,
+            ..Self::default()
+        }
+    }
+
+    /// Returns the total weight for all enabled subquery condition types.
+    pub fn total_subquery_weight(&self) -> u32 {
+        self.exists_weight
+            + self.not_exists_weight
+            + self.in_subquery_weight
+            + self.not_in_subquery_weight
+            + self.any_subquery_weight
+            + self.all_subquery_weight
+    }
+
+    /// Returns true if any subquery conditions are enabled.
+    pub fn any_subquery_enabled(&self) -> bool {
+        self.total_subquery_weight() > 0
     }
 
     /// Builder method to set the weight for an expression kind.
@@ -568,6 +658,73 @@ impl ExpressionProfile {
         ExpressionKind::iter()
             .map(|kind| (kind, self.weight_for(kind)))
             .filter(|(_, weight)| *weight > 0)
+    }
+
+    // =========================================================================
+    // Condition builder methods
+    // =========================================================================
+
+    /// Builder method to set the condition max depth.
+    pub fn with_condition_max_depth(mut self, depth: u32) -> Self {
+        self.condition_max_depth = depth;
+        self
+    }
+
+    /// Builder method to set the max ORDER BY items.
+    pub fn with_max_order_by_items(mut self, count: usize) -> Self {
+        self.max_order_by_items = count;
+        self
+    }
+
+    /// Builder method to set the condition expression max depth.
+    pub fn with_condition_expression_max_depth(mut self, depth: u32) -> Self {
+        self.condition_expression_max_depth = depth;
+        self
+    }
+
+    /// Builder method to set the simple condition weight.
+    pub fn with_simple_condition_weight(mut self, weight: u32) -> Self {
+        self.simple_condition_weight = weight;
+        self
+    }
+
+    /// Builder method to set whether integer positions are allowed in ORDER BY.
+    pub fn with_order_by_integer_positions(mut self, allow: bool) -> Self {
+        self.order_by_allow_integer_positions = allow;
+        self
+    }
+
+    // =========================================================================
+    // Subquery builder methods
+    // =========================================================================
+
+    /// Builder method to set the EXISTS weight.
+    pub fn with_exists_weight(mut self, weight: u32) -> Self {
+        self.exists_weight = weight;
+        self
+    }
+
+    /// Builder method to set the IN subquery weight.
+    pub fn with_in_subquery_weight(mut self, weight: u32) -> Self {
+        self.in_subquery_weight = weight;
+        self
+    }
+
+    /// Builder method to set the subquery limit max.
+    pub fn with_subquery_limit_max(mut self, max: u32) -> Self {
+        self.subquery_limit_max = max;
+        self
+    }
+
+    /// Builder method to disable all subqueries.
+    pub fn with_subqueries_disabled(mut self) -> Self {
+        self.exists_weight = 0;
+        self.not_exists_weight = 0;
+        self.in_subquery_weight = 0;
+        self.not_in_subquery_weight = 0;
+        self.any_subquery_weight = 0;
+        self.all_subquery_weight = 0;
+        self
     }
 }
 

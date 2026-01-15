@@ -4,7 +4,7 @@ use proptest::prelude::*;
 use std::fmt;
 use std::ops::RangeInclusive;
 
-use crate::condition::{ConditionProfile, OrderByItem, optional_where_clause, order_by_for_table};
+use crate::condition::{OrderByItem, optional_where_clause, order_by_for_table};
 use crate::expression::{Expression, ExpressionContext, ExpressionProfile};
 use crate::function::builtin_functions;
 use crate::profile::StatementProfile;
@@ -35,8 +35,6 @@ pub struct SelectProfile {
     pub offset_range: RangeInclusive<u32>,
     /// Expression profile for SELECT expressions.
     pub expression_profile: ExpressionProfile,
-    /// Condition profile for WHERE clause.
-    pub condition_profile: ConditionProfile,
 }
 
 impl Default for SelectProfile {
@@ -51,7 +49,6 @@ impl Default for SelectProfile {
             limit_range: 1..=1000,
             offset_range: 0..=100,
             expression_profile: ExpressionProfile::default(),
-            condition_profile: ConditionProfile::default(),
         }
     }
 }
@@ -69,7 +66,6 @@ impl SelectProfile {
             limit_range: 1..=100,
             offset_range: 0..=10,
             expression_profile: ExpressionProfile::simple(),
-            condition_profile: ConditionProfile::simple(),
         }
     }
 
@@ -85,7 +81,6 @@ impl SelectProfile {
             limit_range: 1..=10000,
             offset_range: 0..=1000,
             expression_profile: ExpressionProfile::function_heavy(),
-            condition_profile: ConditionProfile::complex(),
         }
     }
 
@@ -140,12 +135,6 @@ impl SelectProfile {
     /// Builder method to set expression profile.
     pub fn with_expression_profile(mut self, profile: ExpressionProfile) -> Self {
         self.expression_profile = profile;
-        self
-    }
-
-    /// Builder method to set condition profile.
-    pub fn with_condition_profile(mut self, profile: ConditionProfile) -> Self {
-        self.condition_profile = profile;
         self
     }
 }

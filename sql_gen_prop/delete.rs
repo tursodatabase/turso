@@ -3,7 +3,7 @@
 use proptest::prelude::*;
 use std::fmt;
 
-use crate::condition::{ConditionProfile, optional_where_clause};
+use crate::condition::optional_where_clause;
 use crate::expression::Expression;
 use crate::profile::StatementProfile;
 use crate::schema::{Schema, TableRef};
@@ -13,24 +13,16 @@ use crate::schema::{Schema, TableRef};
 // =============================================================================
 
 /// Profile for controlling DELETE statement generation.
+///
+/// DELETE statements use the condition settings from the global
+/// `StatementProfile.generation.expression.base` for WHERE clause generation.
 #[derive(Debug, Clone, Default)]
-pub struct DeleteProfile {
-    /// Condition profile for WHERE clause.
-    pub condition_profile: ConditionProfile,
-}
+pub struct DeleteProfile;
 
 impl DeleteProfile {
     /// Create a profile for simple DELETE queries.
     pub fn simple() -> Self {
-        Self {
-            condition_profile: ConditionProfile::simple(),
-        }
-    }
-
-    /// Builder method to set condition profile.
-    pub fn with_condition_profile(mut self, profile: ConditionProfile) -> Self {
-        self.condition_profile = profile;
-        self
+        Self
     }
 }
 

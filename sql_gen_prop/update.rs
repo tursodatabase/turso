@@ -3,7 +3,7 @@
 use proptest::prelude::*;
 use std::fmt;
 
-use crate::condition::{ConditionProfile, optional_where_clause};
+use crate::condition::optional_where_clause;
 use crate::expression::{Expression, ExpressionContext, ExpressionProfile};
 use crate::function::builtin_functions;
 use crate::profile::StatementProfile;
@@ -14,6 +14,9 @@ use crate::schema::{ColumnDef, Schema, TableRef};
 // =============================================================================
 
 /// Profile for controlling UPDATE statement generation.
+///
+/// UPDATE statements use the condition settings from the global
+/// `StatementProfile.generation.expression.base` for WHERE clause generation.
 #[derive(Debug, Clone)]
 pub struct UpdateProfile {
     /// Maximum depth for expressions in SET values.
@@ -22,8 +25,6 @@ pub struct UpdateProfile {
     pub allow_aggregates: bool,
     /// Expression profile for SET expressions.
     pub expression_profile: ExpressionProfile,
-    /// Condition profile for WHERE clause.
-    pub condition_profile: ConditionProfile,
 }
 
 impl Default for UpdateProfile {
@@ -32,7 +33,6 @@ impl Default for UpdateProfile {
             expression_max_depth: 2,
             allow_aggregates: false,
             expression_profile: ExpressionProfile::default(),
-            condition_profile: ConditionProfile::default(),
         }
     }
 }
@@ -44,7 +44,6 @@ impl UpdateProfile {
             expression_max_depth: 0,
             allow_aggregates: false,
             expression_profile: ExpressionProfile::simple(),
-            condition_profile: ConditionProfile::simple(),
         }
     }
 
@@ -63,12 +62,6 @@ impl UpdateProfile {
     /// Builder method to set expression profile.
     pub fn with_expression_profile(mut self, profile: ExpressionProfile) -> Self {
         self.expression_profile = profile;
-        self
-    }
-
-    /// Builder method to set condition profile.
-    pub fn with_condition_profile(mut self, profile: ConditionProfile) -> Self {
-        self.condition_profile = profile;
         self
     }
 }

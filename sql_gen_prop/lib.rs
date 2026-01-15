@@ -40,9 +40,7 @@ pub mod view;
 pub use alter_table::{
     AlterTableContext, AlterTableOp, AlterTableOpKind, AlterTableOpWeights, AlterTableStatement,
 };
-pub use condition::{
-    ConditionProfile, OrderByItem, OrderDirection, SubqueryProfile, SubqueryQuantifier,
-};
+pub use condition::{OrderByItem, OrderDirection, SubqueryQuantifier};
 pub use create_index::{CreateIndexStatement, IndexColumn};
 pub use create_table::{ColumnProfile, CreateTableStatement, DataTypeWeights, PrimaryKeyProfile};
 pub use create_trigger::{

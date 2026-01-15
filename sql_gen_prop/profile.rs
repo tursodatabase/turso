@@ -9,7 +9,6 @@ use crate::alter_table::AlterTableOpWeights;
 use crate::statement::StatementKind;
 
 // Re-export profiles from their respective modules
-pub use crate::condition::ConditionProfile;
 pub use crate::create_index::CreateIndexProfile;
 pub use crate::create_table::CreateTableProfile;
 pub use crate::create_trigger::{CreateTriggerOpWeights, CreateTriggerProfile};
@@ -87,12 +86,10 @@ impl<T: Default> Default for WeightedProfile<T> {
 pub struct GenerationProfile {
     /// Profile for value generation.
     pub value: ValueProfile,
-    /// Extended expression profile.
+    /// Extended expression profile (includes condition and subquery settings).
     pub expression: ExtendedExpressionProfile,
     /// Extended function profile.
     pub function: ExtendedFunctionProfile,
-    /// Condition profile.
-    pub condition: ConditionProfile,
 }
 
 impl GenerationProfile {
@@ -102,7 +99,6 @@ impl GenerationProfile {
             value: ValueProfile::minimal(),
             expression: ExtendedExpressionProfile::simple(),
             function: ExtendedFunctionProfile::minimal(),
-            condition: ConditionProfile::simple(),
         }
     }
 
@@ -112,7 +108,6 @@ impl GenerationProfile {
             value: ValueProfile::large(),
             expression: ExtendedExpressionProfile::complex(),
             function: ExtendedFunctionProfile::default(),
-            condition: ConditionProfile::complex(),
         }
     }
 
@@ -131,12 +126,6 @@ impl GenerationProfile {
     /// Builder method to set function profile.
     pub fn with_function(mut self, profile: ExtendedFunctionProfile) -> Self {
         self.function = profile;
-        self
-    }
-
-    /// Builder method to set condition profile.
-    pub fn with_condition(mut self, profile: ConditionProfile) -> Self {
-        self.condition = profile;
         self
     }
 }
@@ -764,13 +753,14 @@ mod tests {
     }
 
     #[test]
-    fn test_condition_profile() {
-        let profile = ConditionProfile::default();
-        assert_eq!(profile.max_depth, 2);
+    fn test_expression_profile_condition_settings() {
+        let profile = ExpressionProfile::default();
+        assert_eq!(profile.condition_max_depth, 2);
         assert_eq!(profile.max_order_by_items, 3);
 
-        let simple = ConditionProfile::simple();
-        assert_eq!(simple.max_depth, 0);
+        let simple = ExpressionProfile::simple();
+        assert_eq!(simple.condition_max_depth, 0);
+        assert!(!simple.any_subquery_enabled());
     }
 
     #[test]
@@ -789,7 +779,7 @@ mod tests {
     fn test_generation_profile() {
         let profile = GenerationProfile::default();
         assert_eq!(profile.value.text_max_length, 100);
-        assert_eq!(profile.condition.max_depth, 2);
+        assert_eq!(profile.expression.base.condition_max_depth, 2);
 
         let minimal = GenerationProfile::minimal();
         assert_eq!(minimal.value.text_max_length, 10);

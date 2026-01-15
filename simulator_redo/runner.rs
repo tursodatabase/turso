@@ -270,9 +270,9 @@ impl Simulator {
 
         let mut profile = sql_gen_prop::profile::StatementProfile::default();
         profile
-            .select
-            .extra
-            .condition_profile
+            .generation
+            .expression
+            .base
             .order_by_allow_integer_positions = false;
 
         for i in 0..self.config.num_statements {

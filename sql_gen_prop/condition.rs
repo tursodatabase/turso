@@ -10,218 +10,13 @@ use std::fmt;
 use std::rc::Rc;
 
 use crate::StatementProfile;
-use crate::expression::{BinaryOperator, Expression, ExpressionContext, ExpressionKind};
+use crate::expression::{
+    BinaryOperator, Expression, ExpressionContext, ExpressionKind, ExpressionProfile,
+};
 use crate::function::{FunctionRegistry, builtin_functions};
 use crate::schema::{ColumnDef, DataType, Schema, TableRef};
 use crate::select::SelectStatement;
 use crate::value::SqlValue;
-
-// =============================================================================
-// SUBQUERY PROFILE (defined first because ConditionProfile depends on it)
-// =============================================================================
-
-/// Profile for controlling subquery generation in conditions.
-#[derive(Debug, Clone)]
-pub struct SubqueryProfile {
-    /// Weight for EXISTS conditions relative to other leaf conditions.
-    pub exists_weight: u32,
-    /// Weight for NOT EXISTS conditions.
-    pub not_exists_weight: u32,
-    /// Weight for IN subquery conditions.
-    pub in_subquery_weight: u32,
-    /// Weight for NOT IN subquery conditions.
-    pub not_in_subquery_weight: u32,
-    /// Weight for ANY comparison subquery conditions.
-    pub any_subquery_weight: u32,
-    /// Weight for ALL comparison subquery conditions.
-    pub all_subquery_weight: u32,
-    /// Maximum LIMIT value for subqueries.
-    pub subquery_limit_max: u32,
-}
-
-impl Default for SubqueryProfile {
-    fn default() -> Self {
-        Self {
-            exists_weight: 5,
-            not_exists_weight: 3,
-            in_subquery_weight: 8,
-            not_in_subquery_weight: 4,
-            any_subquery_weight: 3,
-            all_subquery_weight: 3,
-            subquery_limit_max: 100,
-        }
-    }
-}
-
-impl SubqueryProfile {
-    /// Create a profile with no subqueries enabled.
-    pub fn disabled() -> Self {
-        Self {
-            exists_weight: 0,
-            not_exists_weight: 0,
-            in_subquery_weight: 0,
-            not_in_subquery_weight: 0,
-            any_subquery_weight: 0,
-            all_subquery_weight: 0,
-            subquery_limit_max: 100,
-        }
-    }
-
-    /// Create a profile that only enables EXISTS subqueries.
-    pub fn exists_only() -> Self {
-        Self {
-            exists_weight: 5,
-            not_exists_weight: 3,
-            in_subquery_weight: 0,
-            not_in_subquery_weight: 0,
-            any_subquery_weight: 0,
-            all_subquery_weight: 0,
-            subquery_limit_max: 100,
-        }
-    }
-
-    /// Create a profile that only enables IN subqueries.
-    pub fn in_only() -> Self {
-        Self {
-            exists_weight: 0,
-            not_exists_weight: 0,
-            in_subquery_weight: 8,
-            not_in_subquery_weight: 4,
-            any_subquery_weight: 0,
-            all_subquery_weight: 0,
-            subquery_limit_max: 100,
-        }
-    }
-
-    /// Returns the total weight for all enabled subquery condition types.
-    pub fn total_weight(&self) -> u32 {
-        let mut weight = 0;
-        weight += self.exists_weight;
-        weight += self.not_exists_weight;
-        weight += self.in_subquery_weight;
-        weight += self.not_in_subquery_weight;
-        weight += self.any_subquery_weight + self.all_subquery_weight;
-        weight
-    }
-
-    /// Returns true if any subquery conditions are enabled.
-    pub fn any_enabled(&self) -> bool {
-        self.total_weight() > 0
-    }
-}
-
-// =============================================================================
-// CONDITION GENERATION PROFILE
-// =============================================================================
-
-/// Profile for controlling WHERE clause and condition generation.
-#[derive(Debug, Clone)]
-pub struct ConditionProfile {
-    /// Maximum depth for condition trees (AND/OR nesting).
-    pub max_depth: u32,
-    /// Maximum number of ORDER BY items.
-    pub max_order_by_items: usize,
-    /// Maximum depth for expressions within conditions.
-    pub expression_max_depth: u32,
-    /// Profile for subquery conditions.
-    pub subquery_profile: SubqueryProfile,
-    /// Weight for simple (non-subquery) conditions relative to subquery conditions.
-    /// Higher values make subquery conditions less likely.
-    pub simple_condition_weight: u32,
-    /// Whether to allow integer literals in ORDER BY expressions.
-    /// When false, ORDER BY will only use columns and expressions, not integer
-    /// position references like `ORDER BY 1, 2`.
-    pub order_by_allow_integer_positions: bool,
-}
-
-impl Default for ConditionProfile {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl ConditionProfile {
-    /// Create a new default profile.
-    pub fn new() -> Self {
-        Self {
-            max_depth: 2,
-            max_order_by_items: 3,
-            expression_max_depth: 1,
-            subquery_profile: SubqueryProfile::default(),
-            simple_condition_weight: 80,
-            order_by_allow_integer_positions: true,
-        }
-    }
-
-    /// Create a profile for simple conditions (no nesting, no subqueries).
-    pub fn simple() -> Self {
-        Self {
-            max_depth: 0,
-            max_order_by_items: 1,
-            expression_max_depth: 0,
-            subquery_profile: SubqueryProfile::disabled(),
-            simple_condition_weight: 100,
-            order_by_allow_integer_positions: false,
-        }
-    }
-
-    /// Create a profile for complex conditions (with subqueries).
-    pub fn complex() -> Self {
-        Self {
-            max_depth: 4,
-            max_order_by_items: 5,
-            expression_max_depth: 2,
-            subquery_profile: SubqueryProfile::default(),
-            simple_condition_weight: 60,
-            order_by_allow_integer_positions: true,
-        }
-    }
-
-    /// Builder method to set the max depth.
-    pub fn with_max_depth(mut self, depth: u32) -> Self {
-        self.max_depth = depth;
-        self
-    }
-
-    /// Builder method to set the max ORDER BY items.
-    pub fn with_max_order_by_items(mut self, count: usize) -> Self {
-        self.max_order_by_items = count;
-        self
-    }
-
-    /// Builder method to set the expression max depth.
-    pub fn with_expression_max_depth(mut self, depth: u32) -> Self {
-        self.expression_max_depth = depth;
-        self
-    }
-
-    /// Builder method to set the subquery profile.
-    pub fn with_subquery_profile(mut self, profile: SubqueryProfile) -> Self {
-        self.subquery_profile = profile;
-        self
-    }
-
-    /// Builder method to set the simple condition weight.
-    pub fn with_simple_condition_weight(mut self, weight: u32) -> Self {
-        self.simple_condition_weight = weight;
-        self
-    }
-
-    /// Builder method to set whether integer positions are allowed in ORDER BY.
-    pub fn with_order_by_integer_positions(mut self, allow: bool) -> Self {
-        self.order_by_allow_integer_positions = allow;
-        self
-    }
-
-    /// Create a profile with no subqueries.
-    pub fn no_subqueries() -> Self {
-        Self {
-            subquery_profile: SubqueryProfile::disabled(),
-            simple_condition_weight: 100,
-            ..Self::new()
-        }
-    }
-}
 
 /// Quantifier for comparison subqueries.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -343,13 +138,13 @@ pub fn condition_for_table(
     profile: &StatementProfile,
 ) -> BoxedStrategy<Expression> {
     let functions = builtin_functions();
-    let condition_profile = &profile.generation.condition;
+    let expr_profile = &profile.generation.expression.base;
     condition_for_table_internal(
         table,
         schema,
         &functions,
         profile,
-        condition_profile.max_depth,
+        expr_profile.condition_max_depth,
     )
 }
 
@@ -371,25 +166,21 @@ fn condition_for_table_internal(
         .boxed();
     }
 
-    let condition_profile = &profile.generation.condition;
+    let expr_profile = &profile.generation.expression.base;
     let ctx = ExpressionContext::new(functions.clone())
         .with_columns(table.columns.clone())
-        .with_max_depth(condition_profile.expression_max_depth)
+        .with_max_depth(expr_profile.condition_expression_max_depth)
         .with_aggregates(false);
 
     // Create leaf strategies from all filterable columns
-    let expr_leaves: Vec<BoxedStrategy<Expression>> = filterable
-        .iter()
-        .map(|c| expression_condition(c, &ctx))
-        .collect();
+    let expr_leaves = filterable.iter().map(|c| expression_condition(c, &ctx));
     let expr_leaf = proptest::strategy::Union::new(expr_leaves).boxed();
 
     // Build leaf strategy including subqueries if enabled
-    let subquery_profile = &condition_profile.subquery_profile;
     let leaf_strategy: BoxedStrategy<Expression> =
-        if subquery_profile.any_enabled() && !schema.tables.is_empty() {
-            let subquery_total = subquery_profile.total_weight();
-            let simple_weight = condition_profile.simple_condition_weight;
+        if expr_profile.any_subquery_enabled() && !schema.tables.is_empty() {
+            let subquery_total = expr_profile.total_subquery_weight();
+            let simple_weight = expr_profile.simple_condition_weight;
 
             if subquery_total > 0 {
                 let sq_tables = schema.tables.clone();
@@ -443,8 +234,8 @@ fn subquery_condition_for_tables(
     tables: &[TableRef],
     profile: &StatementProfile,
 ) -> BoxedStrategy<Expression> {
-    let subquery_profile = &profile.generation.condition.subquery_profile;
-    if tables.is_empty() || !subquery_profile.any_enabled() {
+    let expr_profile = &profile.generation.expression.base;
+    if tables.is_empty() || !expr_profile.any_subquery_enabled() {
         return Just(Expression::binary(
             Expression::Value(SqlValue::Integer(1)),
             BinaryOperator::Eq,
@@ -456,34 +247,34 @@ fn subquery_condition_for_tables(
     // Build weighted strategies for enabled subquery types
     let mut weighted_strategies: Vec<(u32, BoxedStrategy<Expression>)> = vec![];
 
-    if subquery_profile.exists_weight > 0 {
+    if expr_profile.exists_weight > 0 {
         let tables_vec = tables.to_vec();
         let profile_clone = profile.clone();
         weighted_strategies.push((
-            subquery_profile.exists_weight,
+            expr_profile.exists_weight,
             proptest::sample::select(tables_vec)
                 .prop_flat_map(move |table| exists_condition(&table, &profile_clone, false))
                 .boxed(),
         ));
     }
 
-    if subquery_profile.not_exists_weight > 0 {
+    if expr_profile.not_exists_weight > 0 {
         let tables_vec = tables.to_vec();
         let profile_clone = profile.clone();
         weighted_strategies.push((
-            subquery_profile.not_exists_weight,
+            expr_profile.not_exists_weight,
             proptest::sample::select(tables_vec)
                 .prop_flat_map(move |table| exists_condition(&table, &profile_clone, true))
                 .boxed(),
         ));
     }
 
-    if subquery_profile.in_subquery_weight > 0 {
+    if expr_profile.in_subquery_weight > 0 {
         let tables_vec = tables.to_vec();
         let outer = outer_table.clone();
         let profile_clone = profile.clone();
         weighted_strategies.push((
-            subquery_profile.in_subquery_weight,
+            expr_profile.in_subquery_weight,
             proptest::sample::select(tables_vec)
                 .prop_flat_map(move |table| {
                     in_subquery_condition(&outer, &table, &profile_clone, false)
@@ -492,12 +283,12 @@ fn subquery_condition_for_tables(
         ));
     }
 
-    if subquery_profile.not_in_subquery_weight > 0 {
+    if expr_profile.not_in_subquery_weight > 0 {
         let tables_vec = tables.to_vec();
         let outer = outer_table.clone();
         let profile_clone = profile.clone();
         weighted_strategies.push((
-            subquery_profile.not_in_subquery_weight,
+            expr_profile.not_in_subquery_weight,
             proptest::sample::select(tables_vec)
                 .prop_flat_map(move |table| {
                     in_subquery_condition(&outer, &table, &profile_clone, true)
@@ -506,12 +297,12 @@ fn subquery_condition_for_tables(
         ));
     }
 
-    if subquery_profile.any_subquery_weight > 0 {
+    if expr_profile.any_subquery_weight > 0 {
         let tables_vec = tables.to_vec();
         let outer = outer_table.clone();
         let profile_clone = profile.clone();
         weighted_strategies.push((
-            subquery_profile.any_subquery_weight,
+            expr_profile.any_subquery_weight,
             proptest::sample::select(tables_vec)
                 .prop_flat_map(move |table| {
                     comparison_subquery_condition(
@@ -525,12 +316,12 @@ fn subquery_condition_for_tables(
         ));
     }
 
-    if subquery_profile.all_subquery_weight > 0 {
+    if expr_profile.all_subquery_weight > 0 {
         let tables_vec = tables.to_vec();
         let outer = outer_table.clone();
         let profile_clone = profile.clone();
         weighted_strategies.push((
-            subquery_profile.all_subquery_weight,
+            expr_profile.all_subquery_weight,
             proptest::sample::select(tables_vec)
                 .prop_flat_map(move |table| {
                     comparison_subquery_condition(
@@ -583,9 +374,9 @@ pub fn order_by_for_table(
     table: &TableRef,
     profile: &StatementProfile,
 ) -> BoxedStrategy<Vec<OrderByItem>> {
-    let condition_profile = &profile.generation.condition;
-    let max_items = condition_profile.max_order_by_items;
-    let expr_max_depth = condition_profile.expression_max_depth;
+    let expr_profile = &profile.generation.expression.base;
+    let max_items = expr_profile.max_order_by_items;
+    let expr_max_depth = expr_profile.condition_expression_max_depth;
     let filterable = table.filterable_columns().collect::<Vec<_>>();
     if filterable.is_empty() {
         return Just(vec![]).boxed();
@@ -599,7 +390,7 @@ pub fn order_by_for_table(
 
     // When integer positions are not allowed, disable value expressions entirely
     // to prevent generating integer literals that would be interpreted as column positions
-    if !condition_profile.order_by_allow_integer_positions {
+    if !expr_profile.order_by_allow_integer_positions {
         ctx.profile = ctx.profile.with_weight(ExpressionKind::Value, 0);
     }
 
@@ -632,8 +423,8 @@ pub fn subquery_select_for_table(
     let table_name = table.name.clone();
     let columns = table.columns.clone();
     let table_clone = table.clone();
-    let subquery_profile = &profile.generation.condition.subquery_profile;
-    let limit_max = subquery_profile.subquery_limit_max;
+    let expr_profile = &profile.generation.expression.base;
+    let limit_max = expr_profile.subquery_limit_max;
 
     // Determine what columns to select based on target type
     let columns_strategy: BoxedStrategy<Vec<Expression>> = match target_type {
@@ -665,7 +456,8 @@ pub fn subquery_select_for_table(
 
     // Generate optional simple WHERE clause (no subqueries to avoid infinite recursion)
     let mut simple_profile = StatementProfile::default();
-    simple_profile.generation.condition = ConditionProfile::simple().with_max_depth(1);
+    simple_profile.generation.expression.base =
+        ExpressionProfile::simple().with_condition_max_depth(1);
     // Create a minimal schema with just this table for the simple condition
     let simple_schema = Schema {
         tables: Rc::new(vec![table_clone.clone()]),
@@ -1021,58 +813,40 @@ mod tests {
     }
 
     #[test]
-    fn test_subquery_profile_total_weight() {
-        let profile = SubqueryProfile::default();
+    fn test_subquery_weight_methods() {
+        let profile = ExpressionProfile::default();
         // exists(5) + not_exists(3) + in(8) + not_in(4) + any(3) + all(3) = 26
-        assert_eq!(profile.total_weight(), 26);
+        assert_eq!(profile.total_subquery_weight(), 26);
+        assert!(profile.any_subquery_enabled());
 
-        let disabled = SubqueryProfile::disabled();
-        assert_eq!(disabled.total_weight(), 0);
-
-        let exists_only = SubqueryProfile::exists_only();
-        // exists(5) + not_exists(3) = 8
-        assert_eq!(exists_only.total_weight(), 8);
-
-        let in_only = SubqueryProfile::in_only();
-        // in(8) + not_in(4) = 12
-        assert_eq!(in_only.total_weight(), 12);
+        let simple = ExpressionProfile::simple();
+        assert_eq!(simple.total_subquery_weight(), 0);
+        assert!(!simple.any_subquery_enabled());
     }
 
     #[test]
-    fn test_subquery_profile_any_enabled() {
-        let profile = SubqueryProfile::default();
-        assert!(profile.any_enabled());
-
-        let disabled = SubqueryProfile::disabled();
-        assert!(!disabled.any_enabled());
-    }
-
-    #[test]
-    fn test_condition_profile_with_subqueries() {
-        let profile = ConditionProfile::complex();
-        assert!(profile.subquery_profile.any_enabled());
+    fn test_expression_profile_condition_settings() {
+        let profile = ExpressionProfile::complex();
+        assert!(profile.any_subquery_enabled());
         assert_eq!(profile.simple_condition_weight, 60);
 
-        let simple = ConditionProfile::simple();
-        assert!(!simple.subquery_profile.any_enabled());
+        let simple = ExpressionProfile::simple();
+        assert!(!simple.any_subquery_enabled());
         assert_eq!(simple.simple_condition_weight, 100);
-
-        let no_subqueries = ConditionProfile::no_subqueries();
-        assert!(!no_subqueries.subquery_profile.any_enabled());
     }
 
     #[test]
     fn test_order_by_integer_positions_config() {
         // Default allows integer positions
-        let profile = ConditionProfile::default();
+        let profile = ExpressionProfile::default();
         assert!(profile.order_by_allow_integer_positions);
 
         // Simple profile disables them to avoid column position reference issues
-        let simple = ConditionProfile::simple();
+        let simple = ExpressionProfile::simple();
         assert!(!simple.order_by_allow_integer_positions);
 
         // Can be disabled via builder
-        let profile = ConditionProfile::default().with_order_by_integer_positions(false);
+        let profile = ExpressionProfile::default().with_order_by_integer_positions(false);
         assert!(!profile.order_by_allow_integer_positions);
     }
 
@@ -1093,7 +867,7 @@ mod tests {
 
         // Simple profile has integer positions disabled
         let mut profile = StatementProfile::default();
-        profile.generation.condition = ConditionProfile::simple();
+        profile.generation.expression.base = ExpressionProfile::simple();
         let strategy = order_by_for_table(&table, &profile);
 
         let mut runner = TestRunner::default();
@@ -1159,7 +933,7 @@ mod tests {
                     .add_table(orders_table)
                     .build();
                 let mut profile = StatementProfile::default();
-                profile.generation.condition = ConditionProfile::complex();
+                profile.generation.expression.base = ExpressionProfile::complex();
                 condition_for_table(&users_table, &schema, &profile)
             }
         ) {
