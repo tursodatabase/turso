@@ -148,6 +148,10 @@ pub enum Token {
     /// Newline
     #[token("\n")]
     Newline,
+
+    /// SQLite backend specifier
+    #[token("sqlite")]
+    SQLite,
 }
 
 impl fmt::Display for Token {
@@ -180,6 +184,7 @@ impl fmt::Display for Token {
             Token::Path(s) => write!(f, "{s}"),
             Token::Comment(s) => write!(f, "# {s}"),
             Token::Newline => write!(f, "\\n"),
+            Token::SQLite => write!(f, "sqlite"),
         }
     }
 }

@@ -347,6 +347,10 @@ impl Parser {
                 self.advance();
                 Ok(ast::SkipCondition::Mvcc)
             }
+            Some(Token::SQLite) => {
+                self.advance();
+                Ok(ast::SkipCondition::SQLite)
+            }
             Some(token) => Err(self.error(format!("expected skip condition (mvcc), got {token}"))),
             None => Err(self.error("expected skip condition, got EOF".to_string())),
         }

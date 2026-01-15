@@ -78,7 +78,7 @@ async fn load_single_file(
                             readonly: false,
                         },
                         outcome: TestOutcome::Error {
-                            message: format!("parse error: {}", e),
+                            message: format!("parse error: {e}"),
                         },
                         duration: Duration::ZERO,
                     }],
@@ -97,7 +97,7 @@ async fn load_single_file(
                         readonly: false,
                     },
                     outcome: TestOutcome::Error {
-                        message: format!("read error: {}", e),
+                        message: format!("read error: {e}"),
                     },
                     duration: Duration::ZERO,
                 }],
@@ -463,6 +463,7 @@ async fn run_single_test<B: SqlBackend>(
         let should_skip = match &skip.condition {
             None => true, // Unconditional skip
             Some(crate::parser::ast::SkipCondition::Mvcc) => mvcc,
+            Some(crate::parser::ast::SkipCondition::SQLite) => backend.name().contains("sqlite"),
         };
         if should_skip {
             return TestResult {
@@ -486,7 +487,7 @@ async fn run_single_test<B: SqlBackend>(
                 file: file_path,
                 database: db_config,
                 outcome: TestOutcome::Error {
-                    message: format!("failed to create database: {}", e),
+                    message: format!("failed to create database: {e}"),
                 },
                 duration: start.elapsed(),
             };

@@ -45,8 +45,8 @@ impl Default for RustBackend {
 
 #[async_trait]
 impl SqlBackend for RustBackend {
-    fn name(&self) -> &str {
-        "rust"
+    fn name(&self) -> String {
+        "rust".into()
     }
 
     fn backend_type(&self) -> Backend {

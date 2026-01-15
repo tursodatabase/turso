@@ -69,8 +69,15 @@ impl CliBackend {
 
 #[async_trait]
 impl SqlBackend for CliBackend {
-    fn name(&self) -> &str {
-        "cli"
+    fn name(&self) -> String {
+        let file_name = self
+            .binary_path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .ok_or_else(|| BackendError::Execute("binary path does not contain a file name".into()))
+            .unwrap_or("cli");
+        let is_sqlite = file_name.starts_with("sqlite");
+        format!("{}-cli", if is_sqlite { "sqlite" } else { "tursodb" })
     }
 
     fn backend_type(&self) -> Backend {
@@ -146,7 +153,7 @@ impl CliDatabaseInstance {
             .file_name()
             .and_then(|n| n.to_str())
             .ok_or_else(|| {
-                BackendError::Execute(format!("binary path does not contain a file name"))
+                BackendError::Execute("binary path does not contain a file name".into())
             })?;
         let is_sqlite = file_name.starts_with("sqlite");
         let is_turso_cli = file_name.starts_with("tursodb") || file_name.starts_with("turso");
@@ -182,11 +189,11 @@ impl CliDatabaseInstance {
         // Spawn the process
         let mut child = cmd
             .spawn()
-            .map_err(|e| BackendError::Execute(format!("failed to spawn tursodb: {}", e)))?;
+            .map_err(|e| BackendError::Execute(format!("failed to spawn tursodb: {e}")))?;
 
         // Prepend MVCC pragma if enabled (skip for readonly databases)
         let sql_to_execute = if self.mvcc && is_turso_cli && !self.readonly {
-            format!("PRAGMA journal_mode = 'experimental_mvcc';\n{}", sql)
+            format!("PRAGMA journal_mode = 'experimental_mvcc';\n{sql}")
         } else {
             sql.to_string()
         };
@@ -196,7 +203,7 @@ impl CliDatabaseInstance {
             stdin
                 .write_all(sql_to_execute.as_bytes())
                 .await
-                .map_err(|e| BackendError::Execute(format!("failed to write to stdin: {}", e)))?;
+                .map_err(|e| BackendError::Execute(format!("failed to write to stdin: {e}")))?;
         }
         child.stdin.take(); // Close stdin to signal end of input
 
@@ -204,7 +211,7 @@ impl CliDatabaseInstance {
         let output = timeout(self.timeout, child.wait_with_output())
             .await
             .map_err(|_| BackendError::Timeout(self.timeout))?
-            .map_err(|e| BackendError::Execute(format!("failed to read output: {}", e)))?;
+            .map_err(|e| BackendError::Execute(format!("failed to read output: {e}")))?;
 
         // Parse stdout
         let stdout = String::from_utf8_lossy(&output.stdout);

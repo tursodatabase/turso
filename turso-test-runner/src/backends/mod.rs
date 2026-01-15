@@ -46,7 +46,7 @@ impl QueryResult {
 #[async_trait]
 pub trait SqlBackend: Send + Sync {
     /// Name of this backend (for filtering and display)
-    fn name(&self) -> &str;
+    fn name(&self) -> String;
 
     /// Backend type enum variant
     fn backend_type(&self) -> Backend;
