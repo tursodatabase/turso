@@ -74,12 +74,22 @@ impl HeaderRef {
                     }
 
                     let (page, c) = pager.read_page(DatabaseHeader::PAGE_ID as i64)?;
-                    *pager.header_ref_state.write() = HeaderRefState::CreateHeader { page };
+                    *pager.header_ref_state.write() = HeaderRefState::CreateHeader {
+                        page,
+                        completion: c.clone(),
+                    };
                     if let Some(c) = c {
                         io_yield_one!(c);
                     }
                 }
-                HeaderRefState::CreateHeader { page } => {
+                HeaderRefState::CreateHeader { page, completion } => {
+                    // Check if the read failed (e.g., due to checksum/decryption error)
+                    if let Some(ref c) = completion {
+                        if let Some(err) = c.get_error() {
+                            *pager.header_ref_state.write() = HeaderRefState::Start;
+                            return Err(err.into());
+                        }
+                    }
                     turso_assert!(page.is_loaded(), "page should be loaded");
                     turso_assert!(
                         page.get().id == DatabaseHeader::PAGE_ID,
@@ -115,12 +125,22 @@ impl HeaderRefMut {
                     }
 
                     let (page, c) = pager.read_page(DatabaseHeader::PAGE_ID as i64)?;
-                    *pager.header_ref_state.write() = HeaderRefState::CreateHeader { page };
+                    *pager.header_ref_state.write() = HeaderRefState::CreateHeader {
+                        page,
+                        completion: c.clone(),
+                    };
                     if let Some(c) = c {
                         io_yield_one!(c);
                     }
                 }
-                HeaderRefState::CreateHeader { page } => {
+                HeaderRefState::CreateHeader { page, completion } => {
+                    // Check if the read failed (e.g., due to checksum/decryption error)
+                    if let Some(ref c) = completion {
+                        if let Some(err) = c.get_error() {
+                            *pager.header_ref_state.write() = HeaderRefState::Start;
+                            return Err(err.into());
+                        }
+                    }
                     turso_assert!(page.is_loaded(), "page should be loaded");
                     turso_assert!(
                         page.get().id == DatabaseHeader::PAGE_ID,
@@ -1072,7 +1092,10 @@ enum PtrMapPutState {
 #[derive(Debug, Clone)]
 enum HeaderRefState {
     Start,
-    CreateHeader { page: PageRef },
+    CreateHeader {
+        page: PageRef,
+        completion: Option<Completion>,
+    },
 }
 
 #[cfg(not(feature = "omit_autovacuum"))]

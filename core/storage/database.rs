@@ -133,6 +133,7 @@ impl DatabaseStorage for DatabaseFile {
                                 let original_buf = original_c.as_read().buf();
                                 original_buf.as_mut_slice().copy_from_slice(&decrypted_data);
                                 original_c.complete(bytes_read);
+                                None
                             }
                             Err(e) => {
                                 tracing::error!(
@@ -143,9 +144,9 @@ impl DatabaseStorage for DatabaseFile {
                                     "Original completion already has an error"
                                 );
                                 original_c.error(CompletionError::DecryptionError { page_idx });
+                                Some(CompletionError::DecryptionError { page_idx })
                             }
                         }
-                        None
                     });
                 let wrapped_completion = Completion::new_read(read_buffer, decrypt_complete);
                 self.file.pread(pos, wrapped_completion)
@@ -168,6 +169,7 @@ impl DatabaseStorage for DatabaseFile {
                         match checksum_ctx.verify_checksum(buf.as_mut_slice(), page_idx) {
                             Ok(_) => {
                                 original_c.complete(bytes_read);
+                                None
                             }
                             Err(e) => {
                                 tracing::error!(
@@ -178,9 +180,9 @@ impl DatabaseStorage for DatabaseFile {
                                     "Original completion already has an error"
                                 );
                                 original_c.error(e);
+                                Some(e)
                             }
                         }
-                        None
                     });
 
                 let wrapped_completion = Completion::new_read(read_buffer, verify_complete);
