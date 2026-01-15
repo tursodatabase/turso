@@ -105,8 +105,8 @@ impl Default for SelectProfile {
 }
 
 impl SelectProfile {
-    /// Create a profile for simple SELECT queries.
-    pub fn simple() -> Self {
+    /// Builder method to create a profile for simple SELECT queries.
+    pub fn simple(self) -> Self {
         Self {
             expression_max_depth: 1,
             allow_aggregates: false,
@@ -116,12 +116,12 @@ impl SelectProfile {
             expression_count_range: 1..=3,
             limit_range: 1..=100,
             offset_range: 0..=10,
-            expression_profile: ExpressionProfile::simple(),
+            expression_profile: self.expression_profile.simple(),
         }
     }
 
-    /// Create a profile for complex SELECT queries.
-    pub fn complex() -> Self {
+    /// Builder method to create a profile for complex SELECT queries.
+    pub fn complex(self) -> Self {
         Self {
             expression_max_depth: 4,
             allow_aggregates: true,
@@ -131,7 +131,7 @@ impl SelectProfile {
             expression_count_range: 1..=10,
             limit_range: 1..=10000,
             offset_range: 0..=1000,
-            expression_profile: ExpressionProfile::function_heavy(),
+            expression_profile: self.expression_profile.function_heavy(),
         }
     }
 

@@ -37,38 +37,8 @@ impl Default for DataTypeWeights {
 }
 
 impl DataTypeWeights {
-    /// Create weights with all types equally weighted.
-    pub fn uniform() -> Self {
-        Self {
-            integer: 25,
-            real: 25,
-            text: 25,
-            blob: 25,
-        }
-    }
-
-    /// Create weights favoring numeric types.
-    pub fn numeric_heavy() -> Self {
-        Self {
-            integer: 45,
-            real: 35,
-            text: 15,
-            blob: 5,
-        }
-    }
-
-    /// Create weights favoring text types.
-    pub fn text_heavy() -> Self {
-        Self {
-            integer: 20,
-            real: 10,
-            text: 60,
-            blob: 10,
-        }
-    }
-
-    /// Create weights for only integer types.
-    pub fn integer_only() -> Self {
+    /// Builder method to create weights for only integer types.
+    pub fn integer_only(self) -> Self {
         Self {
             integer: 100,
             real: 0,
@@ -143,33 +113,33 @@ impl Default for ColumnProfile {
 }
 
 impl ColumnProfile {
-    /// Create a profile where all columns are nullable with no constraints.
-    pub fn minimal() -> Self {
+    /// Builder method to create a profile where all columns are nullable with no constraints.
+    pub fn minimal(self) -> Self {
         Self {
             not_null_probability: 0,
             unique_probability: 0,
             default_probability: 0,
-            data_type_weights: DataTypeWeights::default(),
+            data_type_weights: self.data_type_weights,
         }
     }
 
-    /// Create a profile with strict constraints (many NOT NULL and UNIQUE).
-    pub fn strict() -> Self {
+    /// Builder method to create a profile with strict constraints (many NOT NULL and UNIQUE).
+    pub fn strict(self) -> Self {
         Self {
             not_null_probability: 70,
             unique_probability: 30,
             default_probability: 20,
-            data_type_weights: DataTypeWeights::default(),
+            data_type_weights: self.data_type_weights,
         }
     }
 
-    /// Create a profile with all constraints enabled at maximum probability.
-    pub fn full_constraints() -> Self {
+    /// Builder method to create a profile with all constraints enabled at maximum probability.
+    pub fn full_constraints(self) -> Self {
         Self {
             not_null_probability: 100,
             unique_probability: 50,
             default_probability: 40,
-            data_type_weights: DataTypeWeights::default(),
+            data_type_weights: self.data_type_weights,
         }
     }
 
@@ -231,33 +201,33 @@ impl Default for PrimaryKeyProfile {
 }
 
 impl PrimaryKeyProfile {
-    /// Create a profile that always uses INTEGER PRIMARY KEY.
-    pub fn integer_only() -> Self {
+    /// Builder method to create a profile that always uses INTEGER PRIMARY KEY.
+    pub fn integer_only(self) -> Self {
         Self {
             always_include: true,
             include_probability: 100,
             prefer_integer: true,
-            data_type_weights: DataTypeWeights::integer_only(),
+            data_type_weights: self.data_type_weights.integer_only(),
         }
     }
 
-    /// Create a profile that may omit primary keys.
-    pub fn optional() -> Self {
+    /// Builder method to create a profile that may omit primary keys.
+    pub fn optional(self) -> Self {
         Self {
             always_include: false,
             include_probability: 70,
             prefer_integer: true,
-            data_type_weights: DataTypeWeights::default(),
+            data_type_weights: self.data_type_weights,
         }
     }
 
-    /// Create a profile with no primary keys.
-    pub fn none() -> Self {
+    /// Builder method to create a profile with no primary keys.
+    pub fn none(self) -> Self {
         Self {
             always_include: false,
             include_probability: 0,
             prefer_integer: false,
-            data_type_weights: DataTypeWeights::default(),
+            data_type_weights: self.data_type_weights,
         }
     }
 
@@ -318,47 +288,47 @@ impl Default for CreateTableProfile {
 }
 
 impl CreateTableProfile {
-    /// Create a profile for small tables with minimal constraints.
-    pub fn small() -> Self {
+    /// Builder method to create a profile for small tables with minimal constraints.
+    pub fn small(self) -> Self {
         Self {
             identifier_pattern: "[a-z][a-z0-9_]{0,15}".to_string(),
             column_count_range: 1..=3,
             if_not_exists_probability: 50,
-            primary_key: PrimaryKeyProfile::integer_only(),
-            column: ColumnProfile::minimal(),
+            primary_key: self.primary_key.integer_only(),
+            column: self.column.minimal(),
         }
     }
 
-    /// Create a profile for large tables with varied constraints.
-    pub fn large() -> Self {
+    /// Builder method to create a profile for large tables with varied constraints.
+    pub fn large(self) -> Self {
         Self {
             identifier_pattern: "[a-z][a-z0-9_]{0,30}".to_string(),
             column_count_range: 5..=20,
             if_not_exists_probability: 30,
-            primary_key: PrimaryKeyProfile::default(),
-            column: ColumnProfile::strict(),
+            primary_key: self.primary_key,
+            column: self.column.strict(),
         }
     }
 
-    /// Create a profile for strict schema with many constraints.
-    pub fn strict() -> Self {
+    /// Builder method to create a profile for strict schema with many constraints.
+    pub fn strict(self) -> Self {
         Self {
             identifier_pattern: "[a-z][a-z0-9_]{0,30}".to_string(),
             column_count_range: 2..=8,
             if_not_exists_probability: 20,
-            primary_key: PrimaryKeyProfile::integer_only(),
-            column: ColumnProfile::full_constraints(),
+            primary_key: self.primary_key.integer_only(),
+            column: self.column.full_constraints(),
         }
     }
 
-    /// Create a profile for tables without primary keys.
-    pub fn no_primary_key() -> Self {
+    /// Builder method to create a profile for tables without primary keys.
+    pub fn no_primary_key(self) -> Self {
         Self {
             identifier_pattern: "[a-z][a-z0-9_]{0,30}".to_string(),
             column_count_range: 1..=10,
             if_not_exists_probability: 50,
-            primary_key: PrimaryKeyProfile::none(),
-            column: ColumnProfile::default(),
+            primary_key: self.primary_key.none(),
+            column: self.column,
         }
     }
 
@@ -753,7 +723,7 @@ mod tests {
 
     #[test]
     fn test_primary_key_profile_none() {
-        let profile = PrimaryKeyProfile::none();
+        let profile = PrimaryKeyProfile::default().none();
         assert!(!profile.always_include);
         assert_eq!(profile.include_probability, 0);
     }
@@ -767,21 +737,21 @@ mod tests {
 
     #[test]
     fn test_create_table_profile_strict() {
-        let profile = CreateTableProfile::strict();
+        let profile = CreateTableProfile::default().strict();
         assert_eq!(profile.column.not_null_probability, 100);
         assert_eq!(profile.column.unique_probability, 50);
     }
 
     #[test]
     fn test_create_table_profile_no_primary_key() {
-        let profile = CreateTableProfile::no_primary_key();
+        let profile = CreateTableProfile::default().no_primary_key();
         assert!(!profile.primary_key.always_include);
         assert_eq!(profile.primary_key.include_probability, 0);
     }
 
     #[test]
     fn test_integer_only_generates_integers() {
-        let weights = DataTypeWeights::integer_only();
+        let weights = DataTypeWeights::default().integer_only();
         let strategy = data_type_weighted(&weights);
 
         let mut runner = TestRunner::default();
@@ -804,7 +774,7 @@ mod tests {
             stmt in create_table(
                 &empty_schema(),
                 &StatementProfile::default()
-                    .with_create_table_profile(WeightedProfile::with_extra(1, CreateTableProfile::strict()))
+                    .with_create_table_profile(WeightedProfile::with_extra(1, CreateTableProfile::default().strict()))
             )
         ) {
             let sql = stmt.to_string();
@@ -818,7 +788,7 @@ mod tests {
             stmt in create_table(
                 &empty_schema(),
                 &StatementProfile::default()
-                    .with_create_table_profile(WeightedProfile::with_extra(1, CreateTableProfile::small()))
+                    .with_create_table_profile(WeightedProfile::with_extra(1, CreateTableProfile::default().small()))
             )
         ) {
             // Small profile: 1-3 columns plus optional PK
@@ -827,7 +797,7 @@ mod tests {
 
         #[test]
         fn generated_column_with_strict_profile(
-            col in column_def_with_profile(&ColumnProfile::full_constraints())
+            col in column_def_with_profile(&ColumnProfile::default().full_constraints())
         ) {
             // Full constraints profile has 100% NOT NULL probability
             prop_assert!(!col.nullable);
@@ -835,7 +805,7 @@ mod tests {
 
         #[test]
         fn generated_column_with_minimal_profile(
-            col in column_def_with_profile(&ColumnProfile::minimal())
+            col in column_def_with_profile(&ColumnProfile::default().minimal())
         ) {
             // Minimal profile has 0% UNIQUE and DEFAULT probability
             prop_assert!(!col.unique);

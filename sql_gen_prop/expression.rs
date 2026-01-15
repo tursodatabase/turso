@@ -552,36 +552,8 @@ fn weight_or(value: u32, default: u32) -> u32 {
 }
 
 impl ExpressionProfile {
-    /// Create a profile with all expression kinds equally weighted.
-    pub fn uniform() -> Self {
-        Self {
-            value_weight: 15,
-            column_weight: 15,
-            function_call_weight: 15,
-            binary_op_weight: 15,
-            unary_op_weight: 14,
-            case_weight: 13,
-            cast_weight: 13,
-            ..Self::default()
-        }
-    }
-
-    /// Create a profile with no function calls.
-    pub fn no_functions() -> Self {
-        Self {
-            value_weight: 40,
-            column_weight: 40,
-            function_call_weight: 0,
-            binary_op_weight: 10,
-            unary_op_weight: 5,
-            case_weight: 3,
-            cast_weight: 2,
-            ..Self::default()
-        }
-    }
-
-    /// Create a profile that heavily favors function calls.
-    pub fn function_heavy() -> Self {
+    /// Builder method to create a profile that heavily favors function calls.
+    pub fn function_heavy(self) -> Self {
         Self {
             value_weight: 10,
             column_weight: 10,
@@ -590,12 +562,20 @@ impl ExpressionProfile {
             unary_op_weight: 5,
             case_weight: 4,
             cast_weight: 3,
+            // Inherit settings from self
+            condition_max_depth: self.condition_max_depth,
+            max_order_by_items: self.max_order_by_items,
+            condition_expression_max_depth: self.condition_expression_max_depth,
+            simple_condition_weight: self.simple_condition_weight,
+            order_by_allow_integer_positions: self.order_by_allow_integer_positions,
+            subquery_limit_max: self.subquery_limit_max,
+            function_profile: self.function_profile,
             ..Self::default()
         }
     }
 
-    /// Create a profile for simple expressions (values and columns only, no subqueries).
-    pub fn simple() -> Self {
+    /// Builder method to create a profile for simple expressions (values and columns only, no subqueries).
+    pub fn simple(self) -> Self {
         Self {
             value_weight: 50,
             column_weight: 50,
@@ -621,27 +601,13 @@ impl ExpressionProfile {
             condition_expression_max_depth: 0,
             simple_condition_weight: 100,
             order_by_allow_integer_positions: false,
-            ..Self::default()
+            // Inherit settings from self
+            subquery_limit_max: self.subquery_limit_max,
+            function_profile: self.function_profile,
         }
     }
 
-    /// Create a complex profile for thorough testing.
-    pub fn complex() -> Self {
-        Self {
-            function_call_weight: 30,
-            binary_op_weight: 15,
-            case_weight: 8,
-            cast_weight: 5,
-            // Complex condition settings
-            condition_max_depth: 4,
-            max_order_by_items: 5,
-            condition_expression_max_depth: 2,
-            simple_condition_weight: 60,
-            ..Self::default()
-        }
-    }
-
-    /// Create a derived profile for WHERE clause conditions.
+    /// Builder method to create a derived profile for WHERE clause conditions.
     ///
     /// This adjusts weights to enable only condition-like expressions:
     /// - IS NULL / IS NOT NULL
@@ -853,19 +819,19 @@ impl Default for ExtendedExpressionProfile {
 }
 
 impl ExtendedExpressionProfile {
-    /// Create a simple expression profile.
-    pub fn simple() -> Self {
+    /// Builder method to create a simple expression profile.
+    pub fn simple(self) -> Self {
         Self {
-            base: ExpressionProfile::simple(),
+            base: self.base.simple(),
             case_when_clause_range: 1..=1,
             default_max_depth: 1,
         }
     }
 
-    /// Create a complex expression profile.
-    pub fn complex() -> Self {
+    /// Builder method to create a complex expression profile.
+    pub fn complex(self) -> Self {
         Self {
-            base: ExpressionProfile::function_heavy(),
+            base: self.base.function_heavy(),
             case_when_clause_range: 1..=5,
             default_max_depth: 5,
         }
@@ -1566,7 +1532,7 @@ mod tests {
 
     #[test]
     fn test_expression_profile_simple() {
-        let profile = ExpressionProfile::simple();
+        let profile = ExpressionProfile::default().simple();
         assert!(profile.value_weight > 0);
         assert!(profile.column_weight > 0);
         assert_eq!(profile.function_call_weight, 0);
@@ -1700,7 +1666,7 @@ mod tests {
         use proptest::test_runner::TestRunner;
 
         let registry = builtin_functions();
-        let profile = ExpressionProfile::simple();
+        let profile = ExpressionProfile::default().simple();
         let ctx = ExpressionContext::new(registry, Schema::default())
             .with_max_depth(3)
             .with_columns(vec![ColumnDef::new("id", DataType::Integer)])

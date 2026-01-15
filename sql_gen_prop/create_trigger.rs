@@ -167,8 +167,8 @@ impl Default for CreateTriggerOpWeights {
 }
 
 impl CreateTriggerOpWeights {
-    /// Create weights with all values set to zero.
-    pub fn none() -> Self {
+    /// Builder method to create weights with all values set to zero.
+    pub fn none(self) -> Self {
         Self {
             before_insert: 0,
             before_update: 0,
@@ -273,22 +273,6 @@ impl Default for CreateTriggerProfile {
 }
 
 impl CreateTriggerProfile {
-    /// Create a profile with minimal trigger bodies.
-    pub fn minimal() -> Self {
-        Self {
-            op_weights: CreateTriggerOpWeights::default(),
-            body_statement_count_range: 1..=1,
-        }
-    }
-
-    /// Create a profile with complex trigger bodies.
-    pub fn complex() -> Self {
-        Self {
-            op_weights: CreateTriggerOpWeights::default(),
-            body_statement_count_range: 2..=5,
-        }
-    }
-
     /// Builder method to set operation weights.
     pub fn with_op_weights(mut self, weights: CreateTriggerOpWeights) -> Self {
         self.op_weights = weights;
@@ -502,7 +486,7 @@ mod tests {
         #[test]
         fn create_trigger_before_only(stmt in {
             let mut profile = StatementProfile::default();
-            profile.create_trigger.extra.op_weights = CreateTriggerOpWeights::none()
+            profile.create_trigger.extra.op_weights = CreateTriggerOpWeights::default().none()
                 .with_before_insert(50)
                 .with_before_update(50);
             create_trigger_for_table(
@@ -526,7 +510,9 @@ mod tests {
 
     #[test]
     fn test_create_trigger_op_weights_builder() {
-        let weights = CreateTriggerOpWeights::none().with_after_insert(100);
+        let weights = CreateTriggerOpWeights::default()
+            .none()
+            .with_after_insert(100);
         assert_eq!(weights.after_insert, 100);
         assert_eq!(weights.before_insert, 0);
         assert_eq!(weights.total_weight(), 100);

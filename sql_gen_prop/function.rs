@@ -332,10 +332,10 @@ impl Default for ExtendedFunctionProfile {
 }
 
 impl ExtendedFunctionProfile {
-    /// Create a minimal function profile.
-    pub fn minimal() -> Self {
+    /// Builder method to create a minimal function profile.
+    pub fn minimal(self) -> Self {
         Self {
-            base: FunctionProfile::default(),
+            base: self.base,
             variadic_extra_args: 2,
             zeroblob_max_size: 256,
             variadic_max_args: 3,

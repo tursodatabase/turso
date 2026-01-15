@@ -34,15 +34,6 @@ impl Default for InsertProfile {
 }
 
 impl InsertProfile {
-    /// Create a profile for simple INSERT (values only, no functions).
-    pub fn simple() -> Self {
-        Self {
-            expression_max_depth: 0,
-            allow_aggregates: false,
-            expression_profile: ExpressionProfile::simple(),
-        }
-    }
-
     /// Builder method to set expression max depth.
     pub fn with_expression_max_depth(mut self, depth: u32) -> Self {
         self.expression_max_depth = depth;

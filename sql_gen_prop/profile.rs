@@ -93,21 +93,21 @@ pub struct GenerationProfile {
 }
 
 impl GenerationProfile {
-    /// Create a minimal profile for fast testing.
-    pub fn minimal() -> Self {
+    /// Builder method to create a minimal profile for fast testing.
+    pub fn minimal(self) -> Self {
         Self {
-            value: ValueProfile::minimal(),
-            expression: ExtendedExpressionProfile::simple(),
-            function: ExtendedFunctionProfile::minimal(),
+            value: self.value.minimal(),
+            expression: self.expression.simple(),
+            function: self.function.minimal(),
         }
     }
 
-    /// Create a complex profile for thorough testing.
-    pub fn complex() -> Self {
+    /// Builder method to create a complex profile for thorough testing.
+    pub fn complex(self) -> Self {
         Self {
-            value: ValueProfile::large(),
-            expression: ExtendedExpressionProfile::complex(),
-            function: ExtendedFunctionProfile::default(),
+            value: self.value.large(),
+            expression: self.expression.complex(),
+            function: self.function,
         }
     }
 
@@ -239,8 +239,8 @@ impl Default for StatementProfile {
 }
 
 impl StatementProfile {
-    /// Create a profile with all weights set to zero.
-    pub fn none() -> Self {
+    /// Builder method to create a profile with all weights set to zero.
+    pub fn none(self) -> Self {
         Self {
             select: WeightedProfile::new(0),
             insert: WeightedProfile::new(0),
@@ -263,47 +263,49 @@ impl StatementProfile {
             vacuum_weight: 0,
             analyze_weight: 0,
             reindex_weight: 0,
-            generation: GenerationProfile::default(),
+            generation: self.generation,
         }
     }
 
-    /// Create a DML-only profile (no DDL, no transactions, no utility).
-    pub fn dml_only() -> Self {
+    /// Builder method to create a DML-only profile (no DDL, no transactions, no utility).
+    pub fn dml_only(self) -> Self {
         Self {
             select: WeightedProfile::new(40),
             insert: WeightedProfile::new(30),
             update: WeightedProfile::new(20),
             delete: WeightedProfile::new(10),
-            ..Self::none()
+            generation: self.generation,
+            ..Self::default().none()
         }
     }
 
-    /// Create a read-only profile (SELECT only).
-    pub fn read_only() -> Self {
-        Self::none().with_select(100)
+    /// Builder method to create a read-only profile (SELECT only).
+    pub fn read_only(self) -> Self {
+        self.none().with_select(100)
     }
 
-    /// Create a write-heavy profile (mostly INSERT/UPDATE, no DDL).
-    pub fn write_heavy() -> Self {
+    /// Builder method to create a write-heavy profile (mostly INSERT/UPDATE, no DDL).
+    pub fn write_heavy(self) -> Self {
         Self {
             select: WeightedProfile::new(10),
             insert: WeightedProfile::new(50),
             update: WeightedProfile::new(30),
             delete: WeightedProfile::new(10),
-            ..Self::none()
+            generation: self.generation,
+            ..Self::default().none()
         }
     }
 
-    /// Create a profile without DELETE statements.
-    pub fn no_delete() -> Self {
+    /// Builder method to create a profile without DELETE statements.
+    pub fn no_delete(self) -> Self {
         Self {
             delete: WeightedProfile::new(0),
-            ..Self::default()
+            ..self
         }
     }
 
-    /// Create a DDL-only profile (schema changes only).
-    pub fn ddl_only() -> Self {
+    /// Builder method to create a DDL-only profile (schema changes only).
+    pub fn ddl_only(self) -> Self {
         Self {
             create_table: WeightedProfile::new(20),
             drop_table_weight: 15,
@@ -312,12 +314,13 @@ impl StatementProfile {
             drop_index_weight: 10,
             create_view_weight: 10,
             drop_view_weight: 10,
-            ..Self::none()
+            generation: self.generation,
+            ..Self::default().none()
         }
     }
 
-    /// Create a transaction-heavy profile for testing transaction handling.
-    pub fn transaction_heavy() -> Self {
+    /// Builder method to create a transaction-heavy profile for testing transaction handling.
+    pub fn transaction_heavy(self) -> Self {
         Self {
             select: WeightedProfile::new(20),
             insert: WeightedProfile::new(20),
@@ -328,7 +331,8 @@ impl StatementProfile {
             rollback_weight: 10,
             savepoint_weight: 8,
             release_weight: 7,
-            ..Self::none()
+            generation: self.generation,
+            ..Self::default().none()
         }
     }
 
@@ -687,7 +691,7 @@ mod tests {
 
     #[test]
     fn test_dml_only_profile() {
-        let profile = StatementProfile::dml_only();
+        let profile = StatementProfile::default().dml_only();
         assert!(profile.has_dml());
         assert!(!profile.has_ddl());
         assert!(!profile.has_transaction());
@@ -696,7 +700,7 @@ mod tests {
 
     #[test]
     fn test_ddl_only_profile() {
-        let profile = StatementProfile::ddl_only();
+        let profile = StatementProfile::default().ddl_only();
         assert!(!profile.has_dml());
         assert!(profile.has_ddl());
         assert!(!profile.has_transaction());
@@ -705,7 +709,7 @@ mod tests {
 
     #[test]
     fn test_transaction_heavy_profile() {
-        let profile = StatementProfile::transaction_heavy();
+        let profile = StatementProfile::default().transaction_heavy();
         assert!(profile.has_dml());
         assert!(!profile.has_ddl());
         assert!(profile.has_transaction());
@@ -713,7 +717,7 @@ mod tests {
 
     #[test]
     fn test_read_only_profile() {
-        let profile = StatementProfile::read_only();
+        let profile = StatementProfile::default().read_only();
         assert_eq!(profile.select.weight, 100);
         assert_eq!(profile.insert.weight, 0);
         assert_eq!(profile.update.weight, 0);
@@ -723,7 +727,7 @@ mod tests {
 
     #[test]
     fn test_no_delete_profile() {
-        let profile = StatementProfile::no_delete();
+        let profile = StatementProfile::default().no_delete();
         assert_eq!(profile.delete.weight, 0);
         assert!(profile.select.weight > 0);
         assert!(profile.insert.weight > 0);
@@ -732,7 +736,8 @@ mod tests {
 
     #[test]
     fn test_builder_pattern() {
-        let profile = StatementProfile::none()
+        let profile = StatementProfile::default()
+            .none()
             .with_select(50)
             .with_insert(30)
             .with_create_table(20);
@@ -748,7 +753,7 @@ mod tests {
         assert_eq!(profile.text_max_length, 100);
         assert_eq!(profile.blob_max_size, 100);
 
-        let minimal = ValueProfile::minimal();
+        let minimal = ValueProfile::default().minimal();
         assert_eq!(minimal.text_max_length, 10);
     }
 
@@ -758,7 +763,7 @@ mod tests {
         assert_eq!(profile.condition_max_depth, 2);
         assert_eq!(profile.max_order_by_items, 3);
 
-        let simple = ExpressionProfile::simple();
+        let simple = ExpressionProfile::default().simple();
         assert_eq!(simple.condition_max_depth, 0);
         assert!(!simple.any_subquery_enabled());
     }
@@ -771,7 +776,7 @@ mod tests {
         assert_eq!(*profile.limit_range.start(), 1);
         assert_eq!(*profile.limit_range.end(), 1000);
 
-        let simple = SelectProfile::simple();
+        let simple = SelectProfile::default().simple();
         assert!(!simple.allow_aggregates);
     }
 
@@ -781,16 +786,16 @@ mod tests {
         assert_eq!(profile.value.text_max_length, 100);
         assert_eq!(profile.expression.base.condition_max_depth, 2);
 
-        let minimal = GenerationProfile::minimal();
+        let minimal = GenerationProfile::default().minimal();
         assert_eq!(minimal.value.text_max_length, 10);
     }
 
     #[test]
     fn test_statement_profile_with_profiles() {
-        let select_profile = SelectProfile::complex();
+        let select_profile = SelectProfile::default().complex();
         let profile = StatementProfile::default()
             .with_select_profile(WeightedProfile::with_extra(50, select_profile.clone()))
-            .with_generation(GenerationProfile::minimal());
+            .with_generation(GenerationProfile::default().minimal());
 
         assert_eq!(profile.select.weight, 50);
         assert_eq!(profile.generation.value.text_max_length, 10);

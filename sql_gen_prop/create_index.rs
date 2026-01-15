@@ -25,16 +25,6 @@ impl Default for CreateIndexProfile {
 }
 
 impl CreateIndexProfile {
-    /// Create a profile for single-column indexes.
-    pub fn single_column() -> Self {
-        Self { max_columns: 1 }
-    }
-
-    /// Create a profile for composite indexes.
-    pub fn composite() -> Self {
-        Self { max_columns: 8 }
-    }
-
     /// Builder method to set max columns.
     pub fn with_max_columns(mut self, count: usize) -> Self {
         self.max_columns = count;

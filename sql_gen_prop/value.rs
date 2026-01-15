@@ -34,8 +34,8 @@ impl Default for ValueProfile {
 }
 
 impl ValueProfile {
-    /// Create a profile with minimal value sizes (for faster tests).
-    pub fn minimal() -> Self {
+    /// Builder method to create a profile with minimal value sizes (for faster tests).
+    pub fn minimal(self) -> Self {
         Self {
             text_max_length: 10,
             blob_max_size: 10,
@@ -43,8 +43,8 @@ impl ValueProfile {
         }
     }
 
-    /// Create a profile with large value sizes.
-    pub fn large() -> Self {
+    /// Builder method to create a profile with large value sizes.
+    pub fn large(self) -> Self {
         Self {
             text_max_length: 1000,
             blob_max_size: 1000,
