@@ -3270,6 +3270,7 @@ impl Pager {
         // Chain from previous batch if any
         let prev = commit_info.prepared_frames.last();
         let prepared = wal.prepare_frames(&pages, page_sz, commit_flag, prev)?;
+        tracing::debug!("prepare_collected_frames: offset={}", prepared.offset);
         commit_info.prepared_frames.push(prepared);
         Ok(())
     }

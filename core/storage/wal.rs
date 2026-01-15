@@ -2138,6 +2138,7 @@ impl WalFile {
                         let oc = self.ongoing_checkpoint.read();
                         (oc.min_frame, oc.max_frame)
                     };
+                    tracing::debug!("checkpoint_inner::Start: min_frame={oc_min_frame}, max_frame={oc_max_frame}");
                     let to_checkpoint = self.with_shared(|shared| {
                         let frame_cache = shared.frame_cache.lock();
                         let mut list = Vec::with_capacity(
@@ -2307,6 +2308,8 @@ impl WalFile {
                         let frames_checkpointed =
                             checkpoint_max_frame.saturating_sub(ongoing_chkpt.min_frame - 1);
 
+                        tracing::debug!("checkpoint: frames_checkpointed={frames_checkpointed}");
+
                         if matches!(mode, CheckpointMode::Truncate { .. }) {
                             // SQLite returns zeros for TRUNCATE mode on success, but we must
                             // first verify we actually checkpointed everything. If not, we need
@@ -2341,6 +2344,7 @@ impl WalFile {
                             )
                         }
                     });
+                    tracing::debug!("checkpoint_result={:?}", checkpoint_result);
 
                     // store the max frame we were able to successfully checkpoint.
                     // NOTE: we don't have a .shm file yet, so it's safe to update nbackfills here
