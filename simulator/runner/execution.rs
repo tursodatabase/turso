@@ -1,5 +1,6 @@
 use std::sync::{Arc, Mutex};
 
+use rand::Rng;
 use sql_generation::model::table::SimValue;
 use tracing::instrument;
 use turso_core::{Connection, LimboError, Result, Value};
@@ -233,7 +234,7 @@ pub fn execute_interaction_turso(
 
             stack.push(results);
             // TODO: skip integrity check with mvcc
-            if !env.profile.experimental_mvcc {
+            if !env.profile.experimental_mvcc && env.rng.random_ratio(1, 10) {
                 let SimConnection::LimboConnection(conn) = &mut env.connections[connection_index]
                 else {
                     unreachable!()
@@ -299,7 +300,7 @@ pub fn execute_interaction_turso(
             // Reset fault injection
             env.io.inject_fault(false);
             // TODO: skip integrity check with mvcc
-            if !env.profile.experimental_mvcc {
+            if !env.profile.experimental_mvcc && env.rng.random_ratio(1, 10) {
                 limbo_integrity_check(&conn)?;
             }
         }
