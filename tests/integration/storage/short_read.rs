@@ -1,12 +1,8 @@
-#[cfg(not(feature = "checksum"))]
 use crate::common::{do_flush, limbo_exec_rows_fallible, run_query, TempDatabase};
-#[cfg(not(feature = "checksum"))]
 use rand::{rng, RngCore};
-#[cfg(not(feature = "checksum"))]
 use std::fs::OpenOptions;
 
 /// Test that truncating a database file results in a ShortRead error.
-#[cfg(not(feature = "checksum"))]
 #[test]
 fn test_truncated_database_returns_short_read_error() {
     let _ = env_logger::try_init();
@@ -70,7 +66,6 @@ fn test_truncated_database_returns_short_read_error() {
 }
 
 /// Test that truncating a WAL file results in a ShortRead error.
-#[cfg(not(feature = "checksum"))]
 #[test]
 fn test_truncated_wal_returns_short_read_error() {
     let _ = env_logger::try_init();
@@ -141,7 +136,6 @@ fn test_truncated_wal_returns_short_read_error() {
 }
 
 /// Test that truncating the database header results in a ShortRead error.
-#[cfg(not(feature = "checksum"))]
 #[test]
 fn test_truncated_header_returns_short_read_error() {
     let _ = env_logger::try_init();
@@ -188,7 +182,6 @@ fn test_truncated_header_returns_short_read_error() {
 }
 
 /// Test that zeroing a database page results in a Corrupt error.
-#[cfg(not(feature = "checksum"))]
 #[test]
 fn test_zeroed_page_returns_corrupt_error() {
     let _ = env_logger::try_init();
