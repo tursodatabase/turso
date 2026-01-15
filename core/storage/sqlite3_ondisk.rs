@@ -1503,30 +1503,41 @@ impl StreamingWalReader {
             let fh = &buf[pos..pos + WAL_FRAME_HEADER_SIZE];
             let page = &buf[pos + WAL_FRAME_HEADER_SIZE..pos + frame_size];
 
-            let page_number = u32::from_be_bytes(fh[0..4].try_into().unwrap());
+            let page_no = u32::from_be_bytes(fh[0..4].try_into().unwrap());
             let db_size = u32::from_be_bytes(fh[4..8].try_into().unwrap());
             let s1 = u32::from_be_bytes(fh[8..12].try_into().unwrap());
             let s2 = u32::from_be_bytes(fh[12..16].try_into().unwrap());
             let c1 = u32::from_be_bytes(fh[16..20].try_into().unwrap());
             let c2 = u32::from_be_bytes(fh[20..24].try_into().unwrap());
 
-            if page_number == 0 {
+            tracing::debug!("process_frames: page_no={page_no}, db_size={db_size}, s1={s1}, s2={s2}, c1={c1}, c2={c2}");
+
+            if page_no == 0 {
+                tracing::debug!(
+                    "process_frames: unexpected page_no, stop reading WAL at initialization phase"
+                );
                 break;
             }
             if s1 != header.salt_1 || s2 != header.salt_2 {
+                tracing::debug!(
+                    "process_frames: salt mismatch, stop reading WAL at initialization phase"
+                );
                 break;
             }
 
             let seed = checksum_wal(&fh[0..8], header, st.cumulative_checksum, use_native);
             let calc = checksum_wal(page, header, seed, use_native);
             if calc != (c1, c2) {
+                tracing::debug!(
+                    "process_frames: checksum mismatch, stop reading WAL at initialization phase"
+                );
                 break;
             }
 
             st.cumulative_checksum = calc;
             let frame_idx = st.frame_idx;
             st.pending_frames
-                .entry(page_number as u64)
+                .entry(page_no as u64)
                 .or_default()
                 .push(frame_idx);
 

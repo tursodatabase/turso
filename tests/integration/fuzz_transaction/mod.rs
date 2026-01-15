@@ -497,6 +497,8 @@ async fn test_multiple_connections_fuzz_mvcc() {
                 weight_update: 25,
             },
         },
+        // FIXME: temporary disable reopen logic for MVCC because it will spam CI otherwise (due to some unfixed bug)
+        reopen_probability: 0.0,
         ..FuzzOptions::default()
     };
     multiple_connections_fuzz(mvcc_fuzz_options).await
@@ -506,6 +508,7 @@ async fn test_multiple_connections_fuzz_mvcc() {
 struct FuzzOptions {
     num_iterations: usize,
     operations_per_connection: usize,
+    reopen_probability: f64,
     max_num_connections: usize,
     query_gen_options: QueryGenOptions,
     mvcc_enabled: bool,
@@ -537,6 +540,7 @@ impl Default for FuzzOptions {
         Self {
             num_iterations: 50,
             operations_per_connection: 30,
+            reopen_probability: 0.1,
             max_num_connections: 8,
             query_gen_options: QueryGenOptions::default(),
             mvcc_enabled: false,
@@ -677,8 +681,23 @@ async fn multiple_connections_fuzz(opts: FuzzOptions) {
             panic!("Unexpected error: {e}");
         };
 
+        let mut db = Some(db);
+
         // Interleave operations between all connections
         for op_num in 0..opts.operations_per_connection {
+            if rng.random_bool(opts.reopen_probability) {
+                connections.clear();
+                let _ = db.take();
+                let reopened = Builder::new_local(db_path.to_str().unwrap())
+                    .build()
+                    .await
+                    .unwrap();
+                for conn_id in 0..num_connections {
+                    let conn = reopened.connect().unwrap();
+                    connections.push((conn, conn_id, None::<usize>)); // (connection, conn_id, current_tx_id)
+                }
+                db = Some(reopened);
+            }
             for (conn, conn_id, current_tx_id) in &mut connections {
                 // Generate operation based on current transaction state
                 let (operation, visible_rows) =
