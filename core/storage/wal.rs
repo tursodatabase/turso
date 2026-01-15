@@ -2854,7 +2854,7 @@ pub mod test {
         types::IOResult,
         util::IOExt,
         CheckpointMode, CheckpointResult, Completion, Connection, Database, LimboError, PlatformIO,
-        Wal, WalFileShared, IO,
+        WalFileShared, IO,
     };
     #[cfg(unix)]
     use std::os::unix::fs::MetadataExt;
@@ -2910,13 +2910,11 @@ pub mod test {
         }
         let pager = conn.pager.load();
         let _ = pager.cacheflush();
-        let wal = pager.wal.as_ref().unwrap();
 
         let stat = std::fs::metadata(&walpath).unwrap();
         let meta_before = std::fs::metadata(&walpath).unwrap();
         let bytes_before = meta_before.len();
         run_checkpoint_until_done(
-            wal.as_ref(),
             &pager,
             CheckpointMode::Truncate {
                 upper_bound_inclusive: None,
@@ -2961,12 +2959,13 @@ pub mod test {
         count
     }
 
-    fn run_checkpoint_until_done(
-        wal: &dyn Wal,
-        pager: &crate::Pager,
-        mode: CheckpointMode,
-    ) -> CheckpointResult {
-        pager.io.block(|| wal.checkpoint(pager, mode)).unwrap()
+    fn run_checkpoint_until_done(pager: &crate::Pager, mode: CheckpointMode) -> CheckpointResult {
+        // Use pager.checkpoint() instead of wal.checkpoint() directly because
+        // WAL truncation (for TRUNCATE mode) now happens in pager's TruncateWalFile phase.
+        pager
+            .io
+            .block(|| pager.checkpoint(mode, crate::SyncMode::Full, true))
+            .unwrap()
     }
 
     fn wal_header_snapshot(shared: &Arc<RwLock<WalFileShared>>) -> (u32, u32, u32, u32) {
@@ -3019,8 +3018,7 @@ pub mod test {
         // but NOT truncate the file.
         {
             let pager = conn.pager.load();
-            let wal = pager.wal.as_ref().unwrap();
-            let res = run_checkpoint_until_done(wal.as_ref(), &pager, CheckpointMode::Restart);
+            let res = run_checkpoint_until_done(&pager, CheckpointMode::Restart);
             assert_eq!(res.num_attempted, mx_before);
             assert_eq!(res.num_backfilled, mx_before);
         }
@@ -3113,9 +3111,7 @@ pub mod test {
         // Run passive checkpoint, expect partial
         let (res1, max_before) = {
             let pager = conn1.pager.load();
-            let wal = pager.wal.as_ref().unwrap();
             let res = run_checkpoint_until_done(
-                wal.as_ref(),
                 &pager,
                 CheckpointMode::Passive {
                     upper_bound_inclusive: None,
@@ -3144,9 +3140,7 @@ pub mod test {
 
         // Second passive checkpoint should finish
         let pager = conn1.pager.load();
-        let wal = pager.wal.as_ref().unwrap();
         let res2 = run_checkpoint_until_done(
-            wal.as_ref(),
             &pager,
             CheckpointMode::Passive {
                 upper_bound_inclusive: None,
@@ -3237,8 +3231,7 @@ pub mod test {
         // Checkpoint with restart
         {
             let pager = conn.pager.load();
-            let wal = pager.wal.as_ref().unwrap();
-            let result = run_checkpoint_until_done(wal.as_ref(), &pager, CheckpointMode::Restart);
+            let result = run_checkpoint_until_done(&pager, CheckpointMode::Restart);
             assert!(result.everything_backfilled());
         }
 
@@ -3295,9 +3288,7 @@ pub mod test {
         // try passive checkpoint, should only checkpoint up to R1's position
         let checkpoint_result = {
             let pager = conn_writer.pager.load();
-            let wal = pager.wal.as_ref().unwrap();
             run_checkpoint_until_done(
-                wal.as_ref(),
                 &pager,
                 CheckpointMode::Passive {
                     upper_bound_inclusive: None,
@@ -3337,9 +3328,7 @@ pub mod test {
 
         {
             let pager = conn.pager.load();
-            let wal = pager.wal.as_ref().unwrap();
             let _result = run_checkpoint_until_done(
-                wal.as_ref(),
                 &pager,
                 CheckpointMode::Passive {
                     upper_bound_inclusive: None,
@@ -3394,8 +3383,7 @@ pub mod test {
         // now restart should succeed
         let result = {
             let pager = conn1.pager.load();
-            let wal = pager.wal.as_ref().unwrap();
-            run_checkpoint_until_done(wal.as_ref(), &pager, CheckpointMode::Restart)
+            run_checkpoint_until_done(&pager, CheckpointMode::Restart)
         };
 
         assert!(result.everything_backfilled());
@@ -3468,9 +3456,7 @@ pub mod test {
         // passive checkpoint #1
         let result1 = {
             let pager = conn_writer.pager.load();
-            let wal = pager.wal.as_ref().unwrap();
             run_checkpoint_until_done(
-                wal.as_ref(),
                 &pager,
                 CheckpointMode::Passive {
                     upper_bound_inclusive: None,
@@ -3485,9 +3471,7 @@ pub mod test {
         // passive checkpoint #2
         let result2 = {
             let pager = conn_writer.pager.load();
-            let wal = pager.wal.as_ref().unwrap();
             run_checkpoint_until_done(
-                wal.as_ref(),
                 &pager,
                 CheckpointMode::Passive {
                     upper_bound_inclusive: None,
@@ -3526,9 +3510,7 @@ pub mod test {
         // Do a TRUNCATE checkpoint
         {
             let pager = conn.pager.load();
-            let wal = pager.wal.as_ref().unwrap();
             run_checkpoint_until_done(
-                wal.as_ref(),
                 &pager,
                 CheckpointMode::Truncate {
                     upper_bound_inclusive: None,
@@ -3587,9 +3569,7 @@ pub mod test {
         // Do a TRUNCATE checkpoint
         {
             let pager = conn.pager.load();
-            let wal = pager.wal.as_ref().unwrap();
             run_checkpoint_until_done(
-                wal.as_ref(),
                 &pager,
                 CheckpointMode::Truncate {
                     upper_bound_inclusive: None,
@@ -3625,9 +3605,7 @@ pub mod test {
         assert_eq!(hdr.checkpoint_seq, 1, "invalid checkpoint_seq");
         {
             let pager = conn.pager.load();
-            let wal = pager.wal.as_ref().unwrap();
             run_checkpoint_until_done(
-                wal.as_ref(),
                 &pager,
                 CheckpointMode::Passive {
                     upper_bound_inclusive: None,
@@ -3718,9 +3696,7 @@ pub mod test {
         // Do a full checkpoint to move all data to DB file
         {
             let pager = conn1.pager.load();
-            let wal = pager.wal.as_ref().unwrap();
             run_checkpoint_until_done(
-                wal.as_ref(),
                 &pager,
                 CheckpointMode::Passive {
                     upper_bound_inclusive: None,
@@ -3762,8 +3738,7 @@ pub mod test {
         }
         {
             let pager = conn1.pager.load();
-            let wal = pager.wal.as_ref().unwrap();
-            let result = run_checkpoint_until_done(wal.as_ref(), &pager, CheckpointMode::Restart);
+            let result = run_checkpoint_until_done(&pager, CheckpointMode::Restart);
             assert!(
                 result.everything_backfilled(),
                 "RESTART checkpoint should succeed after reader releases slot 0"
@@ -3797,8 +3772,7 @@ pub mod test {
         // Run FULL checkpoint - must backfill *all* frames up to mx_before
         let result = {
             let pager = conn.pager.load();
-            let wal = pager.wal.as_ref().unwrap();
-            run_checkpoint_until_done(wal.as_ref(), &pager, CheckpointMode::Full)
+            run_checkpoint_until_done(&pager, CheckpointMode::Full)
         };
 
         assert_eq!(result.num_attempted, mx_before);
@@ -3874,8 +3848,7 @@ pub mod test {
 
         let result = {
             let pager = writer.pager.load();
-            let wal = pager.wal.as_ref().unwrap();
-            run_checkpoint_until_done(wal.as_ref(), &pager, CheckpointMode::Full)
+            run_checkpoint_until_done(&pager, CheckpointMode::Full)
         };
 
         assert_eq!(result.num_attempted, mx_now - r_snapshot);
