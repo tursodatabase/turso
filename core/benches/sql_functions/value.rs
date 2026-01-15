@@ -953,7 +953,7 @@ fn exec_like_with_cache_miss(bencher: Bencher) {
 fn exec_like_with_cache_hit(bencher: Bencher) {
     let mut cache = HashMap::new();
     // Warm up the cache
-    Value::exec_like(Some(&mut cache), "hello%", "hello world");
+    let _ = Value::exec_like(Some(&mut cache), "hello%", "hello world");
 
     bencher.bench_local(|| {
         Value::exec_like(

@@ -1018,55 +1018,68 @@ impl Value {
         regex_cache: Option<&mut HashMap<String, Regex>>,
         pattern: &str,
         text: &str,
-    ) -> bool {
+    ) -> Result<bool, LimboError> {
+        const MAX_LIKE_PATTERN_LENGTH: usize = 50000;
+        if pattern.len() > MAX_LIKE_PATTERN_LENGTH {
+            return Err(LimboError::Constraint(
+                "LIKE or GLOB pattern too complex".to_string(),
+            ));
+        }
+
         // 1. Exact match (no wildcards)
         if !pattern.contains(['%', '_']) {
-            return pattern.eq_ignore_ascii_case(text);
+            return Ok(pattern.eq_ignore_ascii_case(text));
         }
 
         // 2. Fast Path: 'abc%' (Prefix)
         if pattern.ends_with('%') && !pattern[..pattern.len() - 1].contains(['%', '_']) {
             let prefix = &pattern[..pattern.len() - 1];
             if text.len() < prefix.len() {
-                return false;
+                return Ok(false);
             }
-            return text[..prefix.len()].eq_ignore_ascii_case(prefix);
+            return Ok(text[..prefix.len()].eq_ignore_ascii_case(prefix));
         }
 
         // 3. Fast Path: '%abc' (Suffix)
         if pattern.starts_with('%') && !pattern[1..].contains(['%', '_']) {
             let suffix = &pattern[1..];
             if text.len() < suffix.len() {
-                return false;
+                return Ok(false);
             }
-            return text[text.len() - suffix.len()..].eq_ignore_ascii_case(suffix);
+            return Ok(text[text.len() - suffix.len()..].eq_ignore_ascii_case(suffix));
         }
 
         // 4. Fast Path: '%abc%' (Contains)
         if pattern.len() > 1 && pattern.starts_with('%') && pattern.ends_with('%') {
             let inner = &pattern[1..pattern.len() - 1];
             if !inner.contains(['%', '_']) {
-                return text
+                return Ok(text
                     .to_ascii_lowercase()
                     .find(&inner.to_ascii_lowercase())
-                    .is_some();
+                    .is_some());
             }
         }
 
         // 5. Fallback to Regex
         if let Some(cache) = regex_cache {
             match cache.get(pattern) {
-                Some(re) => re.is_match(text),
+                Some(re) => Ok(re.is_match(text)),
                 None => {
-                    let re = construct_like_regex(pattern);
-                    let res = re.is_match(text);
-                    cache.insert(pattern.to_string(), re);
-                    res
+                    match construct_like_regex(pattern) {
+                        Ok(re) => {
+                            let res = re.is_match(text);
+                            cache.insert(pattern.to_string(), re);
+                            Ok(res)
+                        }
+                        Err(_) => Ok(false), // Suppress error, return 0
+                    }
                 }
             }
         } else {
-            let re = construct_like_regex(pattern);
-            re.is_match(text)
+            match construct_like_regex(pattern) {
+                Ok(re) => Ok(re.is_match(text)),
+                Err(_) => Ok(false),
+            }
         }
     }
 
@@ -1126,7 +1139,7 @@ impl Value {
     }
 }
 
-pub fn construct_like_regex(pattern: &str) -> Regex {
+pub fn construct_like_regex(pattern: &str) -> Result<Regex, LimboError> {
     let mut regex_pattern = String::with_capacity(pattern.len() * 2);
 
     regex_pattern.push('^');
@@ -1156,8 +1169,9 @@ pub fn construct_like_regex(pattern: &str) -> Regex {
 
     RegexBuilder::new(&regex_pattern)
         .dot_matches_new_line(true)
+        .size_limit(10 * (1 << 20))
         .build()
-        .expect("constructed LIKE regex pattern should be valid")
+        .map_err(|_| LimboError::Constraint("LIKE or GLOB pattern too complex".to_string()))
 }
 
 #[cfg(test)]
@@ -1876,34 +1890,34 @@ mod tests {
 
     #[test]
     fn test_like_with_escape_or_regexmeta_chars() {
-        assert!(Value::exec_like(None, r#"\%A"#, r#"\A"#));
-        assert!(Value::exec_like(None, "%a%a", "aaaa"));
+        assert!(Value::exec_like(None, r#"\%A"#, r#"\A"#).unwrap());
+        assert!(Value::exec_like(None, "%a%a", "aaaa").unwrap());
     }
 
     #[test]
     fn test_like_no_cache() {
-        assert!(Value::exec_like(None, "a%", "aaaa"));
-        assert!(Value::exec_like(None, "%a%a", "aaaa"));
-        assert!(!Value::exec_like(None, "%a.a", "aaaa"));
-        assert!(!Value::exec_like(None, "a.a%", "aaaa"));
-        assert!(!Value::exec_like(None, "%a.ab", "aaaa"));
+        assert!(Value::exec_like(None, "a%", "aaaa").unwrap());
+        assert!(Value::exec_like(None, "%a%a", "aaaa").unwrap());
+        assert!(!Value::exec_like(None, "%a.a", "aaaa").unwrap());
+        assert!(!Value::exec_like(None, "a.a%", "aaaa").unwrap());
+        assert!(!Value::exec_like(None, "%a.ab", "aaaa").unwrap());
     }
 
     #[test]
     fn test_like_with_cache() {
         let mut cache = HashMap::new();
-        assert!(Value::exec_like(Some(&mut cache), "a%", "aaaa"));
-        assert!(Value::exec_like(Some(&mut cache), "%a%a", "aaaa"));
-        assert!(!Value::exec_like(Some(&mut cache), "%a.a", "aaaa"));
-        assert!(!Value::exec_like(Some(&mut cache), "a.a%", "aaaa"));
-        assert!(!Value::exec_like(Some(&mut cache), "%a.ab", "aaaa"));
+        assert!(Value::exec_like(Some(&mut cache), "a%", "aaaa").unwrap());
+        assert!(Value::exec_like(Some(&mut cache), "%a%a", "aaaa").unwrap());
+        assert!(!Value::exec_like(Some(&mut cache), "%a.a", "aaaa").unwrap());
+        assert!(!Value::exec_like(Some(&mut cache), "a.a%", "aaaa").unwrap());
+        assert!(!Value::exec_like(Some(&mut cache), "%a.ab", "aaaa").unwrap());
 
         // again after values have been cached
-        assert!(Value::exec_like(Some(&mut cache), "a%", "aaaa"));
-        assert!(Value::exec_like(Some(&mut cache), "%a%a", "aaaa"));
-        assert!(!Value::exec_like(Some(&mut cache), "%a.a", "aaaa"));
-        assert!(!Value::exec_like(Some(&mut cache), "a.a%", "aaaa"));
-        assert!(!Value::exec_like(Some(&mut cache), "%a.ab", "aaaa"));
+        assert!(Value::exec_like(Some(&mut cache), "a%", "aaaa").unwrap());
+        assert!(Value::exec_like(Some(&mut cache), "%a%a", "aaaa").unwrap());
+        assert!(!Value::exec_like(Some(&mut cache), "%a.a", "aaaa").unwrap());
+        assert!(!Value::exec_like(Some(&mut cache), "a.a%", "aaaa").unwrap());
+        assert!(!Value::exec_like(Some(&mut cache), "%a.ab", "aaaa").unwrap());
     }
 
     #[test]
