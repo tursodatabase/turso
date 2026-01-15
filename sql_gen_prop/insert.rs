@@ -6,7 +6,7 @@ use std::fmt;
 use crate::expression::{Expression, ExpressionContext, ExpressionProfile};
 use crate::function::builtin_functions;
 use crate::profile::StatementProfile;
-use crate::schema::TableRef;
+use crate::schema::{Schema, TableRef};
 
 // =============================================================================
 // INSERT STATEMENT PROFILE
@@ -80,6 +80,7 @@ impl fmt::Display for InsertStatement {
 /// Generate an INSERT statement for a table with profile.
 pub fn insert_for_table(
     table: &TableRef,
+    schema: &Schema,
     profile: &StatementProfile,
 ) -> BoxedStrategy<InsertStatement> {
     let table_name = table.name.clone();
@@ -93,10 +94,12 @@ pub fn insert_for_table(
 
     let col_names: Vec<String> = columns.iter().map(|c| c.name.clone()).collect();
 
-    // Build expression context (no column refs for INSERT values)
-    let ctx = ExpressionContext::new(functions, crate::schema::Schema::default())
+    // Build expression context (no column refs or subqueries for INSERT values)
+    let expr_profile = ExpressionProfile::default().with_subqueries_disabled();
+    let ctx = ExpressionContext::new(functions, schema.clone())
         .with_max_depth(expression_max_depth)
-        .with_aggregates(allow_aggregates);
+        .with_aggregates(allow_aggregates)
+        .with_profile(expr_profile);
 
     let value_strategies: Vec<BoxedStrategy<Expression>> = columns
         .iter()
@@ -170,8 +173,11 @@ mod tests {
                         ColumnDef::new("id", DataType::Integer).primary_key(),
                         ColumnDef::new("name", DataType::Text),
                     ],
-                ).into();
-                insert_for_table(&table, &StatementProfile::default())
+                );
+                // Use empty schema - INSERT values don't need to reference other tables
+                let schema = Schema::default();
+                let table_ref: TableRef = table.into();
+                insert_for_table(&table_ref, &schema, &StatementProfile::default())
             }
         ) {
             let sql = stmt.to_string();

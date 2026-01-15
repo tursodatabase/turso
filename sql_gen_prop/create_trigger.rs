@@ -364,10 +364,11 @@ fn trigger_body(
     profile: &StatementProfile,
 ) -> BoxedStrategy<Vec<TriggerSqlStatement>> {
     // Generate 1-3 DML statements for the trigger body
+    // Subquery depth tracking in the profile will prevent infinite recursion
     proptest::collection::vec(
         prop_oneof![
             select_for_table(table, schema, profile).prop_map(TriggerSqlStatement::Select),
-            insert_for_table(table, profile).prop_map(TriggerSqlStatement::Insert),
+            insert_for_table(table, schema, profile).prop_map(TriggerSqlStatement::Insert),
             update_for_table(table, schema, profile).prop_map(TriggerSqlStatement::Update),
             delete_for_table(table, schema, profile).prop_map(TriggerSqlStatement::Delete),
         ],

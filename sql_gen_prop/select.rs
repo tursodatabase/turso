@@ -268,10 +268,12 @@ pub fn select_for_table(
     let offset_range = select_profile.offset_range.clone();
 
     // Build expression context for generating expressions
+    // Use the profile's expression settings to preserve subquery depth tracking
     let ctx = ExpressionContext::new(functions, schema.clone())
         .with_columns(table.columns.clone())
         .with_max_depth(expression_max_depth)
-        .with_aggregates(allow_aggregates);
+        .with_aggregates(allow_aggregates)
+        .with_profile(profile.generation.expression.base.clone());
 
     // Generate either SELECT * or a list of expressions
     let columns_strategy = proptest::strategy::Union::new_weighted(vec![
@@ -295,7 +297,7 @@ pub fn select_for_table(
     (
         columns_strategy,
         optional_where_clause(table, schema, profile),
-        order_by_for_table(table, profile),
+        order_by_for_table(table, schema, profile),
         proptest::option::of(limit_range),
         proptest::option::of(offset_range),
     )
@@ -371,10 +373,12 @@ fn single_condition(
     let expr_profile = &profile.generation.expression.base;
 
     // Context for generating value expressions in comparisons
+    // Use profile with subqueries disabled to avoid recursion in simple comparisons
     let ctx = ExpressionContext::new(functions.clone(), schema.clone())
         .with_columns(table.columns.clone())
         .with_max_depth(expr_profile.condition_expression_max_depth)
-        .with_aggregates(false);
+        .with_aggregates(false)
+        .with_profile(expr_profile.clone().with_subqueries_disabled());
 
     // Simple column comparisons
     let comparison_strategies: Vec<BoxedStrategy<Expression>> = filterable
@@ -383,8 +387,11 @@ fn single_condition(
         .collect();
     let simple_condition = proptest::strategy::Union::new(comparison_strategies).boxed();
 
-    // If subqueries are enabled, also generate subquery conditions using expression()
-    if expr_profile.any_subquery_enabled() && !schema.tables.is_empty() {
+    // If subqueries are enabled and depth allows, also generate subquery conditions using expression()
+    if expr_profile.any_subquery_enabled()
+        && expr_profile.subquery_max_depth > 0
+        && !schema.tables.is_empty()
+    {
         let subquery_ctx = ExpressionContext::new(functions, schema.clone())
             .with_columns(table.columns.clone())
             .with_max_depth(1)
@@ -458,6 +465,7 @@ pub fn optional_where_clause(
 /// to prevent integer position references like `ORDER BY 1, 2`.
 pub fn order_by_for_table(
     table: &TableRef,
+    schema: &Schema,
     profile: &StatementProfile,
 ) -> BoxedStrategy<Vec<OrderByItem>> {
     let expr_profile = &profile.generation.expression.base;
@@ -479,7 +487,7 @@ pub fn order_by_for_table(
         profile_for_order_by = profile_for_order_by.with_weight(ExpressionKind::Value, 0);
     }
 
-    let ctx = ExpressionContext::new(functions, Schema::default())
+    let ctx = ExpressionContext::new(functions, schema.clone())
         .with_columns(table.columns.clone())
         .with_max_depth(expr_max_depth)
         .with_aggregates(false)

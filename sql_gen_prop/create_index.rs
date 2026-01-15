@@ -6,6 +6,7 @@ use std::fmt;
 use crate::create_table::identifier_excluding;
 use crate::profile::StatementProfile;
 use crate::schema::{Schema, TableRef};
+use crate::select::OrderDirection;
 
 // =============================================================================
 // CREATE INDEX PROFILE

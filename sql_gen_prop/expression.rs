@@ -510,6 +510,8 @@ pub struct ExpressionProfile {
     pub order_by_allow_integer_positions: bool,
     /// Maximum LIMIT value for subqueries.
     pub subquery_limit_max: u32,
+    /// Maximum depth for nested subqueries. 0 means no subqueries allowed.
+    pub subquery_max_depth: u32,
 }
 
 impl Default for ExpressionProfile {
@@ -542,6 +544,7 @@ impl Default for ExpressionProfile {
             simple_condition_weight: 80,
             order_by_allow_integer_positions: true,
             subquery_limit_max: 100,
+            subquery_max_depth: 1,
         }
     }
 }
@@ -596,6 +599,7 @@ impl ExpressionProfile {
             order_by_allow_integer_positions: false,
             // Inherit settings from self
             subquery_limit_max: self.subquery_limit_max,
+            subquery_max_depth: 0, // No subqueries in simple profile
             function_profile: self.function_profile,
         }
     }
@@ -610,7 +614,12 @@ impl ExpressionProfile {
     ///
     /// Settings like `function_profile`, `order_by_allow_integer_positions`,
     /// and `subquery_limit_max` are inherited from `self`.
+    ///
+    /// Subqueries are disabled if `subquery_max_depth` is 0.
     pub fn for_where_clause(self) -> Self {
+        // Check if subqueries should be disabled (depth exhausted)
+        let subqueries_disabled = self.subquery_max_depth == 0;
+
         Self {
             // Disable non-condition expressions
             value_weight: 0,
@@ -624,14 +633,39 @@ impl ExpressionProfile {
             // Enable comparison via BinaryOp (used with filtering)
             binary_op_weight: 50,
             // Enable condition expressions - use self's weights if set, otherwise defaults
+            // But if subquery depth is exhausted, disable subquery conditions
             is_null_weight: weight_or(self.is_null_weight, 10),
             is_not_null_weight: weight_or(self.is_not_null_weight, 10),
-            exists_weight: weight_or(self.exists_weight, 5),
-            not_exists_weight: weight_or(self.not_exists_weight, 3),
-            in_subquery_weight: weight_or(self.in_subquery_weight, 8),
-            not_in_subquery_weight: weight_or(self.not_in_subquery_weight, 4),
-            any_subquery_weight: weight_or(self.any_subquery_weight, 3),
-            all_subquery_weight: weight_or(self.all_subquery_weight, 3),
+            exists_weight: if subqueries_disabled {
+                0
+            } else {
+                weight_or(self.exists_weight, 5)
+            },
+            not_exists_weight: if subqueries_disabled {
+                0
+            } else {
+                weight_or(self.not_exists_weight, 3)
+            },
+            in_subquery_weight: if subqueries_disabled {
+                0
+            } else {
+                weight_or(self.in_subquery_weight, 8)
+            },
+            not_in_subquery_weight: if subqueries_disabled {
+                0
+            } else {
+                weight_or(self.not_in_subquery_weight, 4)
+            },
+            any_subquery_weight: if subqueries_disabled {
+                0
+            } else {
+                weight_or(self.any_subquery_weight, 3)
+            },
+            all_subquery_weight: if subqueries_disabled {
+                0
+            } else {
+                weight_or(self.all_subquery_weight, 3)
+            },
             // Inherit settings from self
             condition_max_depth: self.condition_max_depth,
             max_order_by_items: self.max_order_by_items,
@@ -639,6 +673,7 @@ impl ExpressionProfile {
             simple_condition_weight: self.simple_condition_weight,
             order_by_allow_integer_positions: self.order_by_allow_integer_positions,
             subquery_limit_max: self.subquery_limit_max,
+            subquery_max_depth: self.subquery_max_depth,
             function_profile: self.function_profile,
         }
     }
@@ -774,8 +809,26 @@ impl ExpressionProfile {
         self
     }
 
-    /// Builder method to disable all subqueries.
+    /// Builder method to set the maximum subquery nesting depth.
+    pub fn with_subquery_max_depth(mut self, depth: u32) -> Self {
+        self.subquery_max_depth = depth;
+        self
+    }
+
+    /// Returns a new profile with the subquery depth decremented by 1.
+    /// Used when generating nested subqueries to track recursion depth.
+    pub fn with_decremented_subquery_depth(mut self) -> Self {
+        self.subquery_max_depth = self.subquery_max_depth.saturating_sub(1);
+        self
+    }
+
+    /// Builder method to disable all subqueries (both scalar and condition subqueries).
     pub fn with_subqueries_disabled(mut self) -> Self {
+        // Set depth to 0 to disable subqueries
+        self.subquery_max_depth = 0;
+        // Disable scalar subqueries
+        self.subquery_weight = 0;
+        // Disable condition subqueries
         self.exists_weight = 0;
         self.not_exists_weight = 0;
         self.in_subquery_weight = 0;
@@ -987,19 +1040,29 @@ impl SqlGeneratorKind for ExpressionKind {
             ExpressionKind::Cast => ctx.max_depth > 0,
             // Parenthesized just wraps another expression
             ExpressionKind::Parenthesized => ctx.max_depth > 0,
-            // Scalar subquery requires tables in schema
-            ExpressionKind::Subquery => ctx.max_depth > 0 && !ctx.schema.tables.is_empty(),
+            // Scalar subquery requires tables in schema and subquery depth > 0
+            ExpressionKind::Subquery => {
+                ctx.max_depth > 0
+                    && ctx.profile.subquery_max_depth > 0
+                    && !ctx.schema.tables.is_empty()
+            }
             // IS NULL / IS NOT NULL require columns
             ExpressionKind::IsNull | ExpressionKind::IsNotNull => !ctx.columns.is_empty(),
-            // Subquery conditions require tables in schema
-            ExpressionKind::Exists | ExpressionKind::NotExists => !ctx.schema.tables.is_empty(),
-            // IN/NOT IN subqueries require columns and tables in schema
-            ExpressionKind::InSubquery | ExpressionKind::NotInSubquery => {
-                !ctx.columns.is_empty() && !ctx.schema.tables.is_empty()
+            // Subquery conditions require tables in schema and subquery depth > 0
+            ExpressionKind::Exists | ExpressionKind::NotExists => {
+                ctx.profile.subquery_max_depth > 0 && !ctx.schema.tables.is_empty()
             }
-            // ANY/ALL subqueries require columns and tables in schema
+            // IN/NOT IN subqueries require columns, tables and subquery depth > 0
+            ExpressionKind::InSubquery | ExpressionKind::NotInSubquery => {
+                ctx.profile.subquery_max_depth > 0
+                    && !ctx.columns.is_empty()
+                    && !ctx.schema.tables.is_empty()
+            }
+            // ANY/ALL subqueries require columns, tables and subquery depth > 0
             ExpressionKind::AnySubquery | ExpressionKind::AllSubquery => {
-                !ctx.columns.is_empty() && !ctx.schema.tables.is_empty()
+                ctx.profile.subquery_max_depth > 0
+                    && !ctx.columns.is_empty()
+                    && !ctx.schema.tables.is_empty()
             }
         }
     }
@@ -1243,12 +1306,23 @@ fn subquery_expression_strategy(
     profile: &StatementProfile,
 ) -> BoxedStrategy<Expression> {
     let tables = ctx.schema.tables.clone();
+    let schema = ctx.schema.clone();
+
+    // Decrement subquery depth for inner query to prevent infinite recursion
+    let mut inner_profile = profile.clone();
+    inner_profile.generation.expression.base = inner_profile
+        .generation
+        .expression
+        .base
+        .with_decremented_subquery_depth();
 
     proptest::sample::select((*tables).clone())
         .prop_flat_map({
-            let profile = profile.clone();
+            let profile = inner_profile;
+            let schema = schema.clone();
             move |table| {
-                crate::select::select_for_table(&table, &crate::schema::Schema::default(), &profile)
+                let schema = schema.clone();
+                crate::select::select_for_table(&table, &schema, &profile)
                     .prop_map(|select| Expression::Subquery(Box::new(select)))
             }
         })
@@ -1281,12 +1355,23 @@ fn exists_expression_strategy(
     negated: bool,
 ) -> BoxedStrategy<Expression> {
     let tables = ctx.schema.tables.clone();
+    let schema = ctx.schema.clone();
+
+    // Decrement subquery depth for inner query to prevent infinite recursion
+    let mut inner_profile = profile.clone();
+    inner_profile.generation.expression.base = inner_profile
+        .generation
+        .expression
+        .base
+        .with_decremented_subquery_depth();
 
     proptest::sample::select((*tables).clone())
         .prop_flat_map({
-            let profile = profile.clone();
+            let profile = inner_profile;
+            let schema = schema.clone();
             move |table| {
-                crate::select::select_for_table(&table, &crate::schema::Schema::default(), &profile)
+                let schema = schema.clone();
+                crate::select::select_for_table(&table, &schema, &profile)
             }
         })
         .prop_map(move |select| {
@@ -1310,16 +1395,27 @@ fn in_subquery_expression_strategy(
     negated: bool,
 ) -> BoxedStrategy<Expression> {
     let tables = ctx.schema.tables.clone();
+    let schema = ctx.schema.clone();
     let col_names: Vec<String> = ctx.columns.iter().map(|c| c.name.clone()).collect();
+
+    // Decrement subquery depth for inner query to prevent infinite recursion
+    let mut inner_profile = profile.clone();
+    inner_profile.generation.expression.base = inner_profile
+        .generation
+        .expression
+        .base
+        .with_decremented_subquery_depth();
 
     (
         proptest::sample::select(col_names),
         proptest::sample::select((*tables).clone()),
     )
         .prop_flat_map({
-            let profile = profile.clone();
+            let profile = inner_profile;
+            let schema = schema.clone();
             move |(col_name, table)| {
-                crate::select::select_for_table(&table, &crate::schema::Schema::default(), &profile)
+                let schema = schema.clone();
+                crate::select::select_for_table(&table, &schema, &profile)
                     .prop_map(move |select| (col_name.clone(), select))
             }
         })
@@ -1347,7 +1443,16 @@ fn comparison_subquery_expression_strategy(
     is_all: bool,
 ) -> BoxedStrategy<Expression> {
     let tables = ctx.schema.tables.clone();
+    let schema = ctx.schema.clone();
     let col_names: Vec<String> = ctx.columns.iter().map(|c| c.name.clone()).collect();
+
+    // Decrement subquery depth for inner query to prevent infinite recursion
+    let mut inner_profile = profile.clone();
+    inner_profile.generation.expression.base = inner_profile
+        .generation
+        .expression
+        .base
+        .with_decremented_subquery_depth();
 
     (
         proptest::sample::select(col_names),
@@ -1362,9 +1467,11 @@ fn comparison_subquery_expression_strategy(
         proptest::sample::select((*tables).clone()),
     )
         .prop_flat_map({
-            let profile = profile.clone();
+            let profile = inner_profile;
+            let schema = schema.clone();
             move |(col_name, op, table)| {
-                crate::select::select_for_table(&table, &crate::schema::Schema::default(), &profile)
+                let schema = schema.clone();
+                crate::select::select_for_table(&table, &schema, &profile)
                     .prop_map(move |select| (col_name.clone(), op, select))
             }
         })
@@ -1389,7 +1496,11 @@ fn comparison_subquery_expression_strategy(
 
 /// Generate an expression using the context's profile.
 pub fn expression(ctx: &ExpressionContext) -> BoxedStrategy<Expression> {
-    let profile = StatementProfile::default();
+    // Build a StatementProfile that uses the context's expression profile settings
+    // This preserves subquery_max_depth and other settings from the context
+    let mut profile = StatementProfile::default();
+    profile.generation.expression.base = ctx.profile.clone();
+
     let weighted_strategies: Vec<(u32, BoxedStrategy<Expression>)> = ctx
         .profile
         .enabled_kinds()

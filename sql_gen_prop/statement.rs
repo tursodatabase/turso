@@ -255,8 +255,8 @@ impl SqlGeneratorKind for StatementKind {
                     .prop_map(SqlStatement::Select)
                     .boxed()
             }),
-            StatementKind::Insert => table_dml(tables, schema, profile, |t, _s, p| {
-                insert_for_table(t, p)
+            StatementKind::Insert => table_dml(tables, schema, profile, |t, s, p| {
+                insert_for_table(t, s, p)
                     .prop_map(SqlStatement::Insert)
                     .boxed()
             }),
@@ -366,7 +366,7 @@ pub fn dml_for_table(table: &TableRef, schema: &Schema) -> BoxedStrategy<SqlStat
     let profile = StatementProfile::default();
     prop_oneof![
         select_for_table(table, schema, &profile).prop_map(SqlStatement::Select),
-        insert_for_table(table, &profile).prop_map(SqlStatement::Insert),
+        insert_for_table(table, schema, &profile).prop_map(SqlStatement::Insert),
         update_for_table(table, schema, &profile).prop_map(SqlStatement::Update),
         delete_for_table(table, schema, &profile).prop_map(SqlStatement::Delete),
     ]
@@ -378,7 +378,7 @@ pub fn statement_for_table(table: &TableRef, schema: &Schema) -> BoxedStrategy<S
     let profile = StatementProfile::default();
     prop_oneof![
         select_for_table(table, schema, &profile).prop_map(SqlStatement::Select),
-        insert_for_table(table, &profile).prop_map(SqlStatement::Insert),
+        insert_for_table(table, schema, &profile).prop_map(SqlStatement::Insert),
         update_for_table(table, schema, &profile).prop_map(SqlStatement::Update),
         delete_for_table(table, schema, &profile).prop_map(SqlStatement::Delete),
         create_index_for_table(table, schema, &profile).prop_map(SqlStatement::CreateIndex),

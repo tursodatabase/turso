@@ -185,7 +185,10 @@ mod tests {
         }
 
         #[test]
-        fn generated_insert_is_valid_sql(stmt in strategies::insert_for_table(&test_schema().tables[0], &StatementProfile::default())) {
+        fn generated_insert_is_valid_sql(stmt in {
+            let schema = test_schema();
+            strategies::insert_for_table(&schema.tables[0], &schema, &StatementProfile::default())
+        }) {
             let sql = stmt.to_string();
             prop_assert!(sql.starts_with("INSERT INTO \"users\""));
             prop_assert!(sql.contains("VALUES"));

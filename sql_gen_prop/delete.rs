@@ -6,6 +6,7 @@ use std::fmt;
 use crate::expression::Expression;
 use crate::profile::StatementProfile;
 use crate::schema::{Schema, TableRef};
+use crate::select::optional_where_clause;
 
 // =============================================================================
 // DELETE STATEMENT PROFILE

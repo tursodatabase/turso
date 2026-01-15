@@ -7,6 +7,7 @@ use crate::expression::{Expression, ExpressionContext, ExpressionProfile};
 use crate::function::builtin_functions;
 use crate::profile::StatementProfile;
 use crate::schema::{ColumnDef, Schema, TableRef};
+use crate::select::optional_where_clause;
 
 // =============================================================================
 // UPDATE STATEMENT PROFILE
@@ -113,10 +114,18 @@ pub fn update_for_table(
     }
 
     // Build expression context with columns (allows `SET x = x + 1` style expressions)
+    // Disable subqueries to avoid infinite recursion
+    let expr_profile = profile
+        .generation
+        .expression
+        .base
+        .clone()
+        .with_subqueries_disabled();
     let ctx = ExpressionContext::new(functions, schema.clone())
         .with_columns(table.columns.clone())
         .with_max_depth(expression_max_depth)
-        .with_aggregates(allow_aggregates);
+        .with_aggregates(allow_aggregates)
+        .with_profile(expr_profile);
 
     let col_indices: Vec<usize> = (0..updatable.len()).collect();
     let updatable_clone = updatable.clone();
