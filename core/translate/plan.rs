@@ -1,6 +1,6 @@
 use std::{cmp::Ordering, collections::HashMap, marker::PhantomData, sync::Arc};
 use turso_parser::ast::{
-    self, FrameBound, FrameClause, FrameExclude, FrameMode, SortOrder, SubqueryType,
+    self, FrameBound, FrameClause, FrameExclude, FrameMode, ResolveType, SortOrder, SubqueryType,
 };
 
 use crate::{
@@ -569,6 +569,8 @@ pub struct DeletePlan {
 #[derive(Debug, Clone)]
 pub struct UpdatePlan {
     pub table_references: TableReferences,
+    /// Conflict resolution strategy (e.g., OR IGNORE, OR REPLACE)
+    pub or_conflict: Option<ResolveType>,
     // (colum index, new value) pairs
     pub set_clauses: Vec<(usize, Box<ast::Expr>)>,
     pub where_clause: Vec<WhereTerm>,

@@ -147,9 +147,6 @@ fn validate_update(
     {
         crate::bail_parse_error!("table {} may not be modified", table_name);
     }
-    if body.or_conflict.is_some() {
-        bail_parse_error!("ON CONFLICT clause is not supported in UPDATE");
-    }
     if body.from.is_some() {
         bail_parse_error!("FROM clause is not supported in UPDATE");
     }
@@ -206,8 +203,9 @@ pub fn prepare_update_plan(
         connection,
     )?;
 
-    // Extract WITH clause before borrowing body mutably
+    // Extract WITH and OR conflict clause before borrowing body mutably
     let with = body.with.take();
+    let or_conflict = body.or_conflict.take();
 
     let table_name = table.get_name();
     let iter_dir = body
@@ -424,6 +422,7 @@ pub fn prepare_update_plan(
 
     Ok(Plan::Update(UpdatePlan {
         table_references,
+        or_conflict,
         set_clauses,
         where_clause,
         returning: if result_columns.is_empty() {
