@@ -46,8 +46,9 @@ function formatValue(value) {
         return value.toString();
     }
     if (value instanceof Uint8Array || Buffer.isBuffer(value)) {
-        // Format blob as hex
-        return Array.from(value).map(b => b.toString(16).padStart(2, '0')).join('');
+        // Output blob as raw bytes (matches SQLite/Rust backend behavior)
+        // This will display as text if the bytes are printable ASCII
+        return Buffer.from(value).toString('binary');
     }
     return String(value);
 }
@@ -86,14 +87,13 @@ async function main() {
         // Split into individual statements, filtering out comments and empty lines
         const statements = splitStatements(sql);
 
-        // Track the last SELECT-like statement's results
-        let lastResults = [];
+        // Accumulate results from ALL queries (matches Rust backend behavior)
+        let allResults = [];
 
         for (const stmt of statements) {
             const trimmed = stmt.trim();
             if (!trimmed) continue;
 
-            // Check if this is a query that returns rows
             // Check if this is a query that returns rows (includes RETURNING clauses)
             const isQuery = /^\s*(SELECT|PRAGMA|EXPLAIN)/i.test(trimmed) ||
                            /\bRETURNING\b/i.test(trimmed);
@@ -102,17 +102,16 @@ async function main() {
                 const prepared = db.prepare(trimmed);
                 prepared.raw(true);
                 const rows = await prepared.all();
-                lastResults = rows;
+                allResults.push(...rows);
                 await prepared.close();
             } else {
                 // Non-query statement (INSERT, UPDATE, DELETE, CREATE, etc.)
                 await db.exec(trimmed);
-                lastResults = [];
             }
         }
 
-        // Output only the results from the last query
-        for (const row of lastResults) {
+        // Output all accumulated results
+        for (const row of allResults) {
             console.log(formatRow(row));
         }
 

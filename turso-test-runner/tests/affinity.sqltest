@@ -342,6 +342,12 @@ expect {
     real|3.14
     real|100000.0
 }
+# JS Number omits .0 for whole numbers
+expect @js {
+    real|3
+    real|3.14
+    real|100000
+}
 
 test affinity-real-mixed-signs {
     CREATE TABLE t0 (c0 REAL);
@@ -355,4 +361,12 @@ expect {
     real|-3.14
     real|100000.0
     real|-100000.0
+}
+expect @js {
+    real|3
+    real|-5
+    real|3.14
+    real|-3.14
+    real|100000
+    real|-100000
 }

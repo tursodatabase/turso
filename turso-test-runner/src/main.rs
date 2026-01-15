@@ -8,8 +8,8 @@ use std::time::Duration;
 use std::{path::PathBuf, time::Instant};
 use turso_test_runner::{
     DefaultDatabases, Format, OutputFormat, ParseError, RunnerConfig, TestRunner,
-    backends::cli::CliBackend, backends::js::JsBackend, backends::rust::RustBackend,
-    create_output, load_test_files, summarize, tcl_converter,
+    backends::cli::CliBackend, backends::js::JsBackend, backends::rust::RustBackend, create_output,
+    load_test_files, summarize, tcl_converter,
 };
 
 #[derive(Parser)]
@@ -108,7 +108,12 @@ async fn main() -> ExitCode {
             output,
             timeout,
             mvcc,
-        } => run_tests(paths, backend, binary, node, js_script, filter, jobs, output, timeout, mvcc).await,
+        } => {
+            run_tests(
+                paths, backend, binary, node, js_script, filter, jobs, output, timeout, mvcc,
+            )
+            .await
+        }
         Commands::Check { paths } => check_files(paths),
         Commands::Convert {
             paths,
@@ -280,7 +285,10 @@ async fn run_tests(
                 .await
         }
         other => {
-            eprintln!("Error: unknown backend '{}'. Use 'rust', 'cli', or 'js'", other);
+            eprintln!(
+                "Error: unknown backend '{}'. Use 'rust', 'cli', or 'js'",
+                other
+            );
             return ExitCode::from(2);
         }
     };

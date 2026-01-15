@@ -64,6 +64,14 @@ pub enum Token {
     #[token("@backend")]
     AtBackend,
 
+    /// `@<identifier>` - for backend-specific expect blocks (e.g., @js, @cli, @rust)
+    /// Uses priority 0 so specific @ tokens like @database take precedence
+    #[regex(r"@[a-zA-Z][a-zA-Z0-9_-]*", |lex| {
+        let s = lex.slice();
+        s[1..].to_string()  // Strip the @ prefix
+    }, priority = 0)]
+    AtIdentifier(String),
+
     /// `setup` keyword
     #[token("setup")]
     Setup,
@@ -153,6 +161,7 @@ impl fmt::Display for Token {
             Token::AtSkipFileIf => write!(f, "@skip-file-if"),
             Token::Mvcc => write!(f, "mvcc"),
             Token::AtBackend => write!(f, "@backend"),
+            Token::AtIdentifier(s) => write!(f, "@{s}"),
             Token::Setup => write!(f, "setup"),
             Token::Test => write!(f, "test"),
             Token::Expect => write!(f, "expect"),

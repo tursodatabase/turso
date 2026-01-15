@@ -206,7 +206,12 @@ impl Parser {
                 }
                 Some(Token::AtBackend) => {
                     self.advance();
-                    backend = Some(self.expect_identifier()?);
+                    let backend_name = self.expect_identifier()?;
+                    backend = Some(
+                        backend_name
+                            .parse::<ast::Backend>()
+                            .map_err(|e| self.error(e))?,
+                    );
                     self.skip_newlines_and_comments();
                 }
                 _ => break,
@@ -220,16 +225,59 @@ impl Parser {
 
         self.skip_newlines_and_comments();
 
-        // Parse expect
-        self.expect_token(Token::Expect)?;
+        // Parse expect blocks (at least one required, with optional backend-specific overrides)
+        let mut default_expectation: Option<Expectation> = None;
+        let mut overrides: HashMap<ast::Backend, Expectation> = HashMap::new();
 
-        let expectation = self.parse_expectation()?;
+        while matches!(self.peek(), Some(Token::Expect)) {
+            self.expect_token(Token::Expect)?;
+
+            // Check for backend qualifier: expect @js { ... }
+            let backend_qualifier = if let Some(Token::AtIdentifier(backend_name)) = self.peek() {
+                let backend_name = backend_name.clone();
+                self.advance();
+                let backend = backend_name
+                    .parse::<ast::Backend>()
+                    .map_err(|e| self.error(e))?;
+                Some(backend)
+            } else {
+                None
+            };
+
+            let expectation = self.parse_expectation()?;
+
+            if let Some(backend) = backend_qualifier {
+                if overrides.contains_key(&backend) {
+                    return Err(
+                        self.error(format!("duplicate expect block for backend '{}'", backend))
+                    );
+                }
+                overrides.insert(backend, expectation);
+            } else {
+                if default_expectation.is_some() {
+                    return Err(
+                        self.error("multiple default expect blocks (use @backend qualifier for backend-specific expectations)".to_string()),
+                    );
+                }
+                default_expectation = Some(expectation);
+            }
+
+            self.skip_newlines_and_comments();
+        }
+
+        // Validate at least one default expectation
+        let default = default_expectation.ok_or_else(|| {
+            self.error(
+                "at least one default expect block (without @backend qualifier) is required"
+                    .to_string(),
+            )
+        })?;
 
         Ok(TestCase {
             name,
             name_span,
             sql,
-            expectation,
+            expectations: Expectations { default, overrides },
             setups: test_setups,
             skip,
             backend,
@@ -604,7 +652,7 @@ expect error {
 
         let file = parse(input).unwrap();
         assert!(matches!(
-            file.tests[0].expectation,
+            file.tests[0].expectations.default,
             Expectation::Error(Some(_))
         ));
     }
@@ -623,7 +671,10 @@ expect pattern {
 "#;
 
         let file = parse(input).unwrap();
-        assert!(matches!(file.tests[0].expectation, Expectation::Pattern(_)));
+        assert!(matches!(
+            file.tests[0].expectations.default,
+            Expectation::Pattern(_)
+        ));
     }
 
     #[test]
@@ -683,7 +734,7 @@ expect {
         let file = parse(input).unwrap();
         // Raw mode preserves leading/trailing whitespace
         assert!(matches!(
-            &file.tests[0].expectation,
+            &file.tests[0].expectations.default,
             Expectation::Exact(rows) if rows == &vec!["  hello  ".to_string()]
         ));
     }
@@ -703,7 +754,7 @@ expect {
 "#;
         let file_normal = parse(input_normal).unwrap();
         assert!(matches!(
-            &file_normal.tests[0].expectation,
+            &file_normal.tests[0].expectations.default,
             Expectation::Exact(rows) if rows == &vec!["hello world".to_string()]
         ));
 
@@ -711,7 +762,7 @@ expect {
         let input_raw = "@database :memory:\n\ntest select-1 {\n    SELECT 1;\n}\nexpect raw {\n    hello world  \n}\n";
         let file_raw = parse(input_raw).unwrap();
         assert!(matches!(
-            &file_raw.tests[0].expectation,
+            &file_raw.tests[0].expectations.default,
             Expectation::Exact(rows) if rows == &vec!["    hello world  ".to_string()]
         ));
     }
@@ -846,6 +897,135 @@ expect {
         // All tests should have no per-test skip
         assert!(file.tests[0].skip.is_none());
         assert!(file.tests[1].skip.is_none());
+    }
+
+    #[test]
+    fn test_parse_backend_specific_expectations() {
+        let input = r#"
+@database :memory:
+
+test float-literal {
+    SELECT 1.0;
+}
+expect {
+    1.0
+}
+expect @js {
+    1
+}
+"#;
+
+        let file = parse(input).unwrap();
+        assert_eq!(file.tests.len(), 1);
+
+        // Check default expectation
+        assert!(matches!(
+            &file.tests[0].expectations.default,
+            Expectation::Exact(rows) if rows == &vec!["1.0".to_string()]
+        ));
+
+        // Check JS-specific override
+        assert!(matches!(
+            file.tests[0].expectations.for_backend(ast::Backend::Js),
+            Expectation::Exact(rows) if rows == &vec!["1".to_string()]
+        ));
+
+        // Check Rust backend gets default (no override)
+        assert!(matches!(
+            file.tests[0].expectations.for_backend(ast::Backend::Rust),
+            Expectation::Exact(rows) if rows == &vec!["1.0".to_string()]
+        ));
+    }
+
+    #[test]
+    fn test_parse_backend_specific_error_expectations() {
+        let input = r#"
+@database :memory:
+
+test error-test {
+    SELECT * FROM nonexistent;
+}
+expect error {
+    no such table
+}
+expect @cli error {
+    table not found
+}
+"#;
+
+        let file = parse(input).unwrap();
+
+        // Check default is Error
+        assert!(matches!(
+            &file.tests[0].expectations.default,
+            Expectation::Error(Some(s)) if s.contains("no such table")
+        ));
+
+        // Check CLI-specific override
+        assert!(matches!(
+            file.tests[0].expectations.for_backend(ast::Backend::Cli),
+            Expectation::Error(Some(s)) if s.contains("table not found")
+        ));
+    }
+
+    #[test]
+    fn test_parse_invalid_backend_name() {
+        let input = r#"
+@database :memory:
+
+test invalid-backend {
+    SELECT 1;
+}
+expect {
+    1
+}
+expect @invalid {
+    1
+}
+"#;
+
+        let result = parse(input);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_duplicate_backend_expectation() {
+        let input = r#"
+@database :memory:
+
+test duplicate-backend {
+    SELECT 1;
+}
+expect {
+    1
+}
+expect @js {
+    1
+}
+expect @js {
+    2
+}
+"#;
+
+        let result = parse(input);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_parse_missing_default_expectation() {
+        let input = r#"
+@database :memory:
+
+test no-default {
+    SELECT 1;
+}
+expect @js {
+    1
+}
+"#;
+
+        let result = parse(input);
+        assert!(result.is_err());
     }
 
     #[test]

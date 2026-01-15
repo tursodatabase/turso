@@ -2,7 +2,7 @@ pub mod cli;
 pub mod js;
 pub mod rust;
 
-use crate::{DatabaseLocation, parser::ast::DatabaseConfig};
+use crate::parser::ast::{Backend, DatabaseConfig, DatabaseLocation};
 use async_trait::async_trait;
 use std::{path::PathBuf, time::Duration};
 
@@ -47,6 +47,9 @@ impl QueryResult {
 pub trait SqlBackend: Send + Sync {
     /// Name of this backend (for filtering and display)
     fn name(&self) -> &str;
+
+    /// Backend type enum variant
+    fn backend_type(&self) -> Backend;
 
     /// Create a new isolated database instance
     async fn create_database(

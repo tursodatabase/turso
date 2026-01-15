@@ -1,6 +1,6 @@
-use super::{parse_list_output, BackendError, DatabaseInstance, QueryResult, SqlBackend};
+use super::{BackendError, DatabaseInstance, QueryResult, SqlBackend, parse_list_output};
 use crate::backends::DefaultDatabaseResolver;
-use crate::parser::ast::{DatabaseConfig, DatabaseLocation};
+use crate::parser::ast::{Backend, DatabaseConfig, DatabaseLocation};
 use async_trait::async_trait;
 use std::path::PathBuf;
 use std::process::Stdio;
@@ -60,6 +60,10 @@ impl JsBackend {
 impl SqlBackend for JsBackend {
     fn name(&self) -> &str {
         "js"
+    }
+
+    fn backend_type(&self) -> Backend {
+        Backend::Js
     }
 
     async fn create_database(
