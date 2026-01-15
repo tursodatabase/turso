@@ -241,21 +241,24 @@ fn test_corruption_turso_magic_bytes(tmp_db: TempDatabase) -> anyhow::Result<()>
         file.write_all(b"V")?;
     }
 
-    // try to connect to the corrupted database - this should fail
+    // try to connect to the corrupted database - this should return a decryption error
     {
         let uri = format!(
             "file:{}?cipher=aegis256&hexkey=b1bbfda4f589dc9daaf004fe21111e00dc00c98237102f5c7002a5669fc76327",
             db_path.to_str().unwrap()
         );
 
-        let should_panic = panic::catch_unwind(panic::AssertUnwindSafe(|| {
-            let (_io, conn) = turso_core::Connection::from_uri(&uri, opts).unwrap();
-            run_query_on_row(&tmp_db, &conn, "SELECT * FROM test", |_row: &Row| {}).unwrap();
-        }));
+        let (_io, conn) = turso_core::Connection::from_uri(&uri, opts)?;
+        let result = run_query_on_row(&tmp_db, &conn, "SELECT * FROM test", |_row: &Row| {});
 
         assert!(
-            should_panic.is_err(),
-            "should panic when accessing encrypted DB with corrupted Turso magic bytes"
+            result.is_err(),
+            "should return error when accessing encrypted DB with corrupted Turso magic bytes"
+        );
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("Decryption failed"),
+            "error should indicate decryption failure, got: {err_msg}"
         );
     }
 
