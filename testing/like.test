@@ -151,3 +151,15 @@ do_execsql_test unicode-like-with-escape-1 {
 do_execsql_test unicode-like-with-escape-2 {
     SELECT like('ÄX%', 'Ä%', 'X');
 } {1}
+
+do_execsql_test_error like-complexity-1 {
+    SELECT 'test' LIKE REPLACE(ZEROBLOB(135000), x'00', 'a');
+} {LIKE or GLOB pattern too complex}
+
+do_execsql_test like-complexity-2 {
+    SELECT 'test' LIKE REPLACE(ZEROBLOB(11000), x'00', '%');
+} {0}
+
+do_execsql_test like-trim-null {
+    SELECT trim('abc', NULL);
+} {}
