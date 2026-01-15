@@ -2833,7 +2833,8 @@ impl WalFileShared {
             self.max_frame.store(0, Ordering::Release);
             self.nbackfills.store(0, Ordering::Release);
             self.last_checksum = (hdr.checksum_1, hdr.checksum_2);
-            // without this - we will not write new WAL header and basically loose all new WAL frames after reopen of the database
+            // `ensure_header_if_needed` do the work only if WAL is not initialized yet (so, self.initialized is false)
+            // we change WAL state here, so on next write attempt `ensure_header_if_needed` will update WAL header
             self.initialized.store(false, Ordering::Release);
         }
 
