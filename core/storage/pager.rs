@@ -63,43 +63,8 @@ pub struct HeaderRef(PageRef);
 
 impl HeaderRef {
     pub fn from_pager(pager: &Pager) -> Result<IOResult<Self>> {
-        loop {
-            let state = pager.header_ref_state.read().clone();
-            tracing::trace!("HeaderRef::from_pager - {:?}", state);
-            match state {
-                HeaderRefState::Start => {
-                    // If db is not initialized, return the in-memory page
-                    if let Some(page1) = pager.init_page_1.load_full() {
-                        return Ok(IOResult::Done(Self(page1)));
-                    }
-
-                    let (page, c) = pager.read_page(DatabaseHeader::PAGE_ID as i64)?;
-                    *pager.header_ref_state.write() = HeaderRefState::CreateHeader {
-                        page,
-                        completion: c.clone(),
-                    };
-                    if let Some(c) = c {
-                        io_yield_one!(c);
-                    }
-                }
-                HeaderRefState::CreateHeader { page, completion } => {
-                    // Check if the read failed (e.g., due to checksum/decryption error)
-                    if let Some(ref c) = completion {
-                        if let Some(err) = c.get_error() {
-                            *pager.header_ref_state.write() = HeaderRefState::Start;
-                            return Err(err.into());
-                        }
-                    }
-                    turso_assert!(page.is_loaded(), "page should be loaded");
-                    turso_assert!(
-                        page.get().id == DatabaseHeader::PAGE_ID,
-                        "incorrect header page id"
-                    );
-                    *pager.header_ref_state.write() = HeaderRefState::Start;
-                    break Ok(IOResult::Done(Self(page)));
-                }
-            }
-        }
+        let page = return_if_io!(pager.read_header_page());
+        Ok(IOResult::Done(Self(page)))
     }
 
     pub fn borrow(&self) -> &DatabaseHeader {
@@ -114,45 +79,9 @@ pub struct HeaderRefMut(PageRef);
 
 impl HeaderRefMut {
     pub fn from_pager(pager: &Pager) -> Result<IOResult<Self>> {
-        loop {
-            let state = pager.header_ref_state.read().clone();
-            tracing::trace!(?state);
-            match state {
-                HeaderRefState::Start => {
-                    // If db is not initialized, return the in-memory page
-                    if let Some(page1) = pager.init_page_1.load_full() {
-                        return Ok(IOResult::Done(Self(page1)));
-                    }
-
-                    let (page, c) = pager.read_page(DatabaseHeader::PAGE_ID as i64)?;
-                    *pager.header_ref_state.write() = HeaderRefState::CreateHeader {
-                        page,
-                        completion: c.clone(),
-                    };
-                    if let Some(c) = c {
-                        io_yield_one!(c);
-                    }
-                }
-                HeaderRefState::CreateHeader { page, completion } => {
-                    // Check if the read failed (e.g., due to checksum/decryption error)
-                    if let Some(ref c) = completion {
-                        if let Some(err) = c.get_error() {
-                            *pager.header_ref_state.write() = HeaderRefState::Start;
-                            return Err(err.into());
-                        }
-                    }
-                    turso_assert!(page.is_loaded(), "page should be loaded");
-                    turso_assert!(
-                        page.get().id == DatabaseHeader::PAGE_ID,
-                        "incorrect header page id"
-                    );
-
-                    pager.add_dirty(&page)?;
-                    *pager.header_ref_state.write() = HeaderRefState::Start;
-                    break Ok(IOResult::Done(Self(page)));
-                }
-            }
-        }
+        let page = return_if_io!(pager.read_header_page());
+        pager.add_dirty(&page)?;
+        Ok(IOResult::Done(Self(page)))
     }
 
     pub fn borrow_mut(&self) -> &mut DatabaseHeader {
@@ -1382,6 +1311,48 @@ impl Pager {
         self.init_page_1.clone()
     }
 
+    /// Read page 1 (the database header page) using the header_ref_state state machine.
+    /// Used by HeaderRef and HeaderRefMut to avoid duplicating the page-loading logic.
+    fn read_header_page(&self) -> Result<IOResult<PageRef>> {
+        loop {
+            let state = self.header_ref_state.read().clone();
+            tracing::trace!("read_header_page - {:?}", state);
+            match state {
+                HeaderRefState::Start => {
+                    // If db is not initialized, return the in-memory page
+                    if let Some(page1) = self.init_page_1.load_full() {
+                        return Ok(IOResult::Done(page1));
+                    }
+
+                    let (page, c) = self.read_page(DatabaseHeader::PAGE_ID as i64)?;
+                    *self.header_ref_state.write() = HeaderRefState::CreateHeader {
+                        page,
+                        completion: c.clone(),
+                    };
+                    if let Some(c) = c {
+                        io_yield_one!(c);
+                    }
+                }
+                HeaderRefState::CreateHeader { page, completion } => {
+                    // Check if the read failed (e.g., due to checksum/decryption error)
+                    if let Some(ref c) = completion {
+                        if let Some(err) = c.get_error() {
+                            *self.header_ref_state.write() = HeaderRefState::Start;
+                            return Err(err.into());
+                        }
+                    }
+                    turso_assert!(page.is_loaded(), "page should be loaded");
+                    turso_assert!(
+                        page.get().id == DatabaseHeader::PAGE_ID,
+                        "incorrect header page id"
+                    );
+                    *self.header_ref_state.write() = HeaderRefState::Start;
+                    return Ok(IOResult::Done(page));
+                }
+            }
+        }
+    }
+
     /// Set whether cache spilling is enabled.
     pub fn set_spill_enabled(&self, enabled: bool) {
         self.page_cache.write().set_spill_enabled(enabled);
@@ -2138,14 +2109,8 @@ impl Pager {
 
     /// Set the schema cookie cache.
     pub fn set_schema_cookie(&self, cookie: Option<u32>) {
-        match cookie {
-            Some(value) => {
-                self.schema_cookie.store(value as u64, Ordering::SeqCst);
-            }
-            None => self
-                .schema_cookie
-                .store(Self::SCHEMA_COOKIE_NOT_SET, Ordering::SeqCst),
-        }
+        let value = cookie.map_or(Self::SCHEMA_COOKIE_NOT_SET, |v| v as u64);
+        self.schema_cookie.store(value, Ordering::SeqCst);
     }
 
     /// Get the schema cookie, using the cached value if available to avoid reading page 1.
@@ -2178,15 +2143,10 @@ impl Pager {
     pub fn maybe_allocate_page1(&self) -> Result<IOResult<()>> {
         if !self.db_initialized() {
             if let Some(_lock) = self.init_lock.try_lock() {
-                if let IOResult::IO(c) = self.allocate_page1()? {
-                    return Ok(IOResult::IO(c));
-                } else {
-                    return Ok(IOResult::Done(()));
-                }
-            } else {
-                // Give a chance for the allocation to happen elsewhere
-                io_yield_one!(Completion::new_yield());
+                return Ok(self.allocate_page1()?.map(|_| ()));
             }
+            // Give a chance for the allocation to happen elsewhere
+            io_yield_one!(Completion::new_yield());
         }
         Ok(IOResult::Done(()))
     }
@@ -2214,9 +2174,9 @@ impl Pager {
             return Ok(IOResult::Done(()));
         };
 
-        let (_, schema_did_change) = match connection.get_tx_state() {
-            TransactionState::Write { schema_did_change } => (true, schema_did_change),
-            _ => (false, false),
+        let schema_did_change = match connection.get_tx_state() {
+            TransactionState::Write { schema_did_change } => schema_did_change,
+            _ => false,
         };
 
         loop {
@@ -2793,10 +2753,7 @@ impl Pager {
                         }
                         let page_count = pages.len();
                         tracing::debug!("try_spill_dirty_pages: spilling {} pages", page_count);
-                        if self.wal.is_some() {
-                            let Some(wal) = self.wal.as_ref() else {
-                                unreachable!("wal checked above");
-                            };
+                        if let Some(wal) = self.wal.as_ref() {
                             let page_sz = self.get_page_size().unwrap_or_default();
 
                             // Ensure WAL is initialized. Most of the time this is a no-op.
