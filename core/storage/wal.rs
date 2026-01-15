@@ -2833,6 +2833,8 @@ impl WalFileShared {
             self.max_frame.store(0, Ordering::Release);
             self.nbackfills.store(0, Ordering::Release);
             self.last_checksum = (hdr.checksum_1, hdr.checksum_2);
+            // without this - we will not write new WAL header and basically loose all new WAL frames after reopen of the database
+            self.initialized.store(false, Ordering::Release);
         }
 
         self.frame_cache.lock().clear();
