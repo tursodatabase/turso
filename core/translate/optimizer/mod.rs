@@ -18,6 +18,7 @@ use crate::{
         },
         trigger_exec::has_relevant_triggers_type_only,
     },
+    turso_assert,
     types::SeekOp,
     util::{
         count_fts_column_args, exprs_are_equivalent, simple_bind_expr, try_capture_parameters,

@@ -156,6 +156,63 @@ pub fn plan_subqueries_from_where_clause(
     Ok(())
 }
 
+/// Compute query plans for subqueries in VALUES expressions.
+/// This is used by INSERT statements with VALUES clauses and SELECT with VALUES.
+/// The VALUES expressions may contain scalar subqueries that need to be planned.
+#[allow(clippy::vec_box)] // Vec<Box<Expr>> is the parser's output format
+pub fn plan_subqueries_from_values(
+    program: &mut ProgramBuilder,
+    non_from_clause_subqueries: &mut Vec<NonFromClauseSubquery>,
+    table_references: &mut TableReferences,
+    values: &mut [Vec<Box<ast::Expr>>],
+    resolver: &Resolver,
+    connection: &Arc<Connection>,
+) -> Result<()> {
+    plan_subqueries_with_outer_query_access(
+        program,
+        non_from_clause_subqueries,
+        table_references,
+        resolver,
+        values.iter_mut().flatten().map(|e| e.as_mut()),
+        connection,
+        SubqueryPosition::ResultColumn, // VALUES are similar to result columns in terms of subquery handling
+    )?;
+
+    update_column_used_masks(table_references, non_from_clause_subqueries);
+    Ok(())
+}
+
+/// Compute query plans for subqueries in RETURNING expressions.
+/// This is used by INSERT, UPDATE, and DELETE statements with RETURNING clauses.
+/// RETURNING expressions may contain scalar subqueries that need to be planned.
+pub fn plan_subqueries_from_returning(
+    program: &mut ProgramBuilder,
+    non_from_clause_subqueries: &mut Vec<NonFromClauseSubquery>,
+    table_references: &mut TableReferences,
+    returning: &mut [ast::ResultColumn],
+    resolver: &Resolver,
+    connection: &Arc<Connection>,
+) -> Result<()> {
+    // Extract mutable references to expressions from ResultColumn::Expr variants
+    let exprs = returning.iter_mut().filter_map(|rc| match rc {
+        ast::ResultColumn::Expr(expr, _) => Some(expr.as_mut()),
+        ast::ResultColumn::Star | ast::ResultColumn::TableStar(_) => None,
+    });
+
+    plan_subqueries_with_outer_query_access(
+        program,
+        non_from_clause_subqueries,
+        table_references,
+        resolver,
+        exprs,
+        connection,
+        SubqueryPosition::ResultColumn,
+    )?;
+
+    update_column_used_masks(table_references, non_from_clause_subqueries);
+    Ok(())
+}
+
 /// Compute query plans for subqueries in the WHERE clause and HAVING clause (both of which have access to the outer query scope)
 fn plan_subqueries_with_outer_query_access<'a>(
     program: &mut ProgramBuilder,
@@ -722,6 +779,24 @@ pub fn emit_non_from_clause_subquery(
     query_type: &SubqueryType,
     is_correlated: bool,
 ) -> Result<()> {
+    emit_non_from_clause_subquery_with_resolver(
+        program,
+        &t_ctx.resolver,
+        plan,
+        query_type,
+        is_correlated,
+    )
+}
+
+/// Same as `emit_non_from_clause_subquery` but takes a Resolver directly.
+/// This is useful for contexts that don't have a TranslateCtx (e.g., INSERT statements).
+pub fn emit_non_from_clause_subquery_with_resolver(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    plan: SelectPlan,
+    query_type: &SubqueryType,
+    is_correlated: bool,
+) -> Result<()> {
     program.incr_nesting();
 
     let label_skip_after_first_run = if !is_correlated {
@@ -745,7 +820,7 @@ pub fn emit_non_from_clause_subquery(
                 value: 0,
                 dest: *result_reg,
             });
-            emit_program_for_select(program, &t_ctx.resolver, plan)?;
+            emit_program_for_select(program, resolver, plan)?;
             program.emit_insn(Insn::Return {
                 return_reg: subroutine_reg,
                 can_fallthrough: true,
@@ -756,7 +831,7 @@ pub fn emit_non_from_clause_subquery(
                 cursor_id: *cursor_id,
                 is_table: false,
             });
-            emit_program_for_select(program, &t_ctx.resolver, plan)?;
+            emit_program_for_select(program, resolver, plan)?;
         }
         SubqueryType::RowValue {
             result_reg_start,
@@ -773,7 +848,7 @@ pub fn emit_non_from_clause_subquery(
                     dest_end: None,
                 });
             }
-            emit_program_for_select(program, &t_ctx.resolver, plan)?;
+            emit_program_for_select(program, resolver, plan)?;
             program.emit_insn(Insn::Return {
                 return_reg: subroutine_reg,
                 can_fallthrough: true,

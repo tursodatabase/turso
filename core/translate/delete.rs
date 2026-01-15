@@ -9,7 +9,8 @@ use crate::translate::plan::{
 };
 use crate::translate::planner::{parse_limit, parse_where, plan_ctes_as_outer_refs};
 use crate::translate::subquery::{
-    plan_subqueries_from_select_plan, plan_subqueries_from_where_clause,
+    plan_subqueries_from_returning, plan_subqueries_from_select_plan,
+    plan_subqueries_from_where_clause,
 };
 use crate::translate::trigger_exec::has_relevant_triggers_type_only;
 use crate::util::normalize_ident;
@@ -178,6 +179,18 @@ pub fn prepare_delete_plan(
         connection,
     )?;
 
+    // Plan subqueries in RETURNING expressions before processing
+    // (so SubqueryResult nodes are cloned into result_columns)
+    let mut non_from_clause_subqueries = vec![];
+    plan_subqueries_from_returning(
+        program,
+        &mut non_from_clause_subqueries,
+        &mut table_references,
+        &mut returning,
+        resolver,
+        connection,
+    )?;
+
     let result_columns =
         process_returning_clause(&mut returning, &mut table_references, connection)?;
 
@@ -248,7 +261,7 @@ pub fn prepare_delete_plan(
             indexes,
             rowset_plan: Some(rowset_plan),
             rowset_reg: Some(rowset_reg),
-            non_from_clause_subqueries: vec![],
+            non_from_clause_subqueries,
         }))
     } else {
         Ok(Plan::Delete(DeletePlan {
@@ -262,7 +275,7 @@ pub fn prepare_delete_plan(
             indexes,
             rowset_plan: None,
             rowset_reg: None,
-            non_from_clause_subqueries: vec![],
+            non_from_clause_subqueries,
         }))
     }
 }
