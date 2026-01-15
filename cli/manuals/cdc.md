@@ -79,12 +79,73 @@ The CDC table (default name: `turso_cdc`) contains the following columns:
 |--------|------|-------------|
 | `change_id` | INTEGER | Auto-incrementing unique identifier for each change |
 | `change_time` | INTEGER | Timestamp of the change (Unix epoch) |
-| `change_type` | INTEGER | Type of change: 1 (INSERT), 0 (UPDATE), -1 (DELETE) |
+| `change_type` | INTEGER | Type of change: 1 (INSERT), 0 (UPDATE), -1 (DELETE), 2 (COMMIT)* |
 | `table_name` | TEXT | Name of the table that was changed |
 | `id` | varies | Primary key/rowid of the changed row |
 | `before` | BLOB | Row data before the change (for modes: before, full) |
 | `after` | BLOB | Row data after the change (for modes: after, full) |
 | `updates` | BLOB | Details of updated columns (for mode: full) |
+| `change_txn_id` | INTEGER | Transaction ID for grouping changes by transaction |
+
+\* COMMIT records (change_type=2) are reserved for future use to mark transaction boundaries explicitly.
+
+## Transaction Boundaries
+
+The `change_txn_id` column allows you to group changes by transaction. All changes within the same transaction share the same transaction ID, enabling you to:
+
+- Replay changes in transaction-consistent order
+- Identify which changes were atomic
+- Build transaction-aware syncing systems
+
+### How Transaction IDs Work
+
+- In explicit transactions (BEGIN/COMMIT), all changes get the same `change_txn_id`
+- In auto-commit mode, each statement gets a unique transaction ID
+- The transaction ID is typically the `change_id` of the first change in that transaction
+- Rolled-back transactions do not appear in the CDC table
+
+### Examples
+
+Group changes by transaction:
+```sql
+-- Find all transactions and their change counts
+SELECT change_txn_id, COUNT(*) as changes_in_txn
+FROM turso_cdc
+GROUP BY change_txn_id;
+
+-- View all changes from a specific transaction
+SELECT * FROM turso_cdc WHERE change_txn_id = 42;
+
+-- Find multi-change transactions
+SELECT change_txn_id, COUNT(*) as num_changes
+FROM turso_cdc
+GROUP BY change_txn_id
+HAVING COUNT(*) > 1;
+```
+
+Replay changes in transaction order:
+```sql
+-- Get changes ordered by transaction, then by change order within transaction
+SELECT change_txn_id, change_id, change_type, table_name
+FROM turso_cdc
+ORDER BY change_txn_id, change_id;
+```
+
+Detect transaction boundaries:
+```sql
+-- Identify where one transaction ends and another begins
+SELECT
+    change_id,
+    change_txn_id,
+    LAG(change_txn_id) OVER (ORDER BY change_id) as prev_txn_id,
+    CASE
+        WHEN change_txn_id != LAG(change_txn_id) OVER (ORDER BY change_id)
+        THEN 'NEW_TRANSACTION'
+        ELSE 'SAME_TRANSACTION'
+    END as boundary
+FROM turso_cdc
+ORDER BY change_id;
+```
 
 ## Querying Changes
 
