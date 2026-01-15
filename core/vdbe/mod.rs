@@ -38,7 +38,7 @@ use crate::{
     return_if_io,
     schema::Trigger,
     state_machine::StateMachine,
-    storage::{pager::PagerCommitResult, sqlite3_ondisk::SmallVec},
+    storage::sqlite3_ondisk::SmallVec,
     translate::{collate::CollationSeq, plan::TableReferences},
     types::{IOCompletions, IOResult},
     vdbe::{
@@ -1313,7 +1313,7 @@ impl Program {
             }
         } else {
             pager.rollback_tx(connection);
-            IOResult::Done(PagerCommitResult::Rollback)
+            IOResult::Done(())
         };
         match cacheflush_status {
             IOResult::Done(_) => {
