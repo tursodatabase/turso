@@ -22,7 +22,9 @@ use crate::translate::schema::translate_create_table;
 use crate::util::{normalize_ident, parse_signed_number, parse_string, IOExt as _};
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::vdbe::insn::{Cookie, Insn};
-use crate::{bail_parse_error, CaptureDataChangesMode, LimboError, Value, CAPTURE_DATA_CHANGES_LATEST};
+use crate::{
+    bail_parse_error, CaptureDataChangesMode, LimboError, Value, CAPTURE_DATA_CHANGES_LATEST,
+};
 use std::str::FromStr;
 use strum::IntoEnumIterator;
 
