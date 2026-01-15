@@ -949,7 +949,45 @@ fn update_cache_size(
     Ok(())
 }
 
+pub const TURSO_CDC_METADATA_TABLE_NAME: &str = "turso_cdc_metadata";
 pub const TURSO_CDC_DEFAULT_TABLE_NAME: &str = "turso_cdc";
+
+fn turso_cdc_metadata_table_columns() -> Vec<ColumnDefinition> {
+    vec![
+        ast::ColumnDefinition {
+            col_name: ast::Name::exact("table_name".to_string()),
+            col_type: Some(ast::Type {
+                name: "TEXT".to_string(),
+                size: None,
+            }),
+            constraints: vec![ast::NamedColumnConstraint {
+                name: None,
+                constraint: ast::ColumnConstraint::PrimaryKey {
+                    order: None,
+                    conflict_clause: None,
+                    auto_increment: false,
+                },
+            }],
+        },
+        ast::ColumnDefinition {
+            col_name: ast::Name::exact("key".to_string()),
+            col_type: Some(ast::Type {
+                name: "TEXT".to_string(),
+                size: None,
+            }),
+            constraints: vec![],
+        },
+        ast::ColumnDefinition {
+            col_name: ast::Name::exact("value".to_string()),
+            col_type: Some(ast::Type {
+                name: "TEXT".to_string(),
+                size: None,
+            }),
+            constraints: vec![],
+        },
+    ]
+}
+
 fn turso_cdc_table_columns() -> Vec<ColumnDefinition> {
     vec![
         ast::ColumnDefinition {

@@ -3328,6 +3328,7 @@ mod tests {
             )],
             unique_sets: vec![],
             foreign_keys: vec![],
+            check_constraints: vec![],
         };
 
         let result =
