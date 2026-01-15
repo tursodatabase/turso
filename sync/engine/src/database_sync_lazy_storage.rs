@@ -404,10 +404,10 @@ async fn read_page<Ctx, IO: SyncEngineIo>(
     if prefetch {
         tracing::info!("read_page(page={page}): trying to prefetch more pages");
         let content = PageContent::new(buffer.clone());
-        if content.maybe_page_type().is_some() {
+        if content.page_type().is_ok() {
             tracing::info!(
                 "read_page(page={page}): detected valid page for prefetch load: {:?}",
-                content.maybe_page_type()
+                content.page_type().ok()
             );
             let mut page_refs = Vec::with_capacity(content.cell_count() + 1);
             for cell_id in 0..content.cell_count() {
@@ -417,7 +417,7 @@ async fn read_page<Ctx, IO: SyncEngineIo>(
                     );
                     break;
                 };
-                if let Some(pointer) = content.rightmost_pointer() {
+                if let Some(pointer) = content.rightmost_pointer().ok().flatten() {
                     page_refs.push(pointer);
                 }
                 match cell {
@@ -514,7 +514,7 @@ impl<IO: SyncEngineIo> DatabaseStorage for LazyDatabaseStorage<IO> {
             let check_buffer = Arc::new(Buffer::new_temporary(size));
             let check_c = dirty_file.pread(
                 page_offset,
-                Completion::new_read(check_buffer.clone(), |_| {}),
+                Completion::new_read(check_buffer.clone(), |_| None),
             )?;
             assert!(
                 check_c.finished(),
@@ -524,7 +524,7 @@ impl<IO: SyncEngineIo> DatabaseStorage for LazyDatabaseStorage<IO> {
             let clean_buffer = r.buf_arc();
             let clean_c = self.clean_file.pread(
                 page_offset,
-                Completion::new_read(clean_buffer.clone(), |_| {}),
+                Completion::new_read(clean_buffer.clone(), |_| None),
             )?;
             assert!(
                 clean_c.finished(),

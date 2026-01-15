@@ -534,22 +534,31 @@ pub fn begin_read_page(
     let complete = Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
         let Ok((buf, bytes_read)) = res else {
             page.clear_locked();
-            return;
+            return None; // IO error already captured in completion
         };
         let buf_len = buf.len();
         // Handle truncated database files: if we read fewer bytes than expected
-        // (and it's not an intentional empty read), the database is corrupt.
+        // (and it's not an intentional empty read), return a ShortRead error.
         if bytes_read == 0 {
             if !allow_empty_read {
-                turso_assert!(
-                    false,
-                    "read returned 0 bytes but empty reads are not allowed"
-                );
+                tracing::error!("short read on page {page_idx}: expected {buf_len} bytes, got 0");
+                page.clear_locked();
+                return Some(CompletionError::ShortRead {
+                    page_idx,
+                    expected: buf_len,
+                    actual: 0,
+                });
             }
         } else if bytes_read != buf_len as i32 {
-            panic!(
-                "database disk image is malformed: read {bytes_read} bytes but expected {buf_len}",
+            tracing::error!(
+                "short read on page {page_idx}: expected {buf_len} bytes, got {bytes_read}"
             );
+            page.clear_locked();
+            return Some(CompletionError::ShortRead {
+                page_idx,
+                expected: buf_len,
+                actual: bytes_read as usize,
+            });
         }
         let page = page.clone();
         let buffer = if bytes_read == 0 {
@@ -558,6 +567,7 @@ pub fn begin_read_page(
             buf
         };
         finish_read_page(page_idx, buffer, page.clone());
+        None
     });
     let c = Completion::new_read(buf, complete);
     db_file.read_page(page_idx, io_ctx, c)
@@ -774,7 +784,7 @@ pub fn read_btree_cell(
     pos: usize,
     usable_size: usize,
 ) -> Result<BTreeCell> {
-    let page_type = page_content.page_type();
+    let page_type = page_content.page_type()?;
     let max_local = payload_overflow_threshold_max(page_type, usable_size);
     let min_local = payload_overflow_threshold_min(page_type, usable_size);
     match page_type {
@@ -1381,6 +1391,7 @@ impl StreamingWalReader {
         let completion: Box<ReadComplete> = Box::new(move |res| {
             let _reader = reader.clone();
             _reader.handle_header_read(res);
+            None
         });
         let c = Completion::new_read(header_buf, completion);
         self.file.pread(0, c)
@@ -1415,6 +1426,7 @@ impl StreamingWalReader {
             tracing::debug!("WAL chunk read complete");
             let reader = me.clone();
             reader.handle_chunk_read(res);
+            None
         });
         let c = Completion::new_read(buf, completion);
         let guard = self.file.pread(offset, c)?;
@@ -1640,8 +1652,7 @@ pub fn begin_read_wal_frame<F: File + ?Sized>(
             let decrypt_complete =
                 Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
                     let Ok((encrypted_buf, bytes_read)) = res else {
-                        original_complete(res);
-                        return;
+                        return original_complete(res);
                     };
                     assert!(
                         bytes_read > 0,
@@ -1652,13 +1663,13 @@ pub fn begin_read_wal_frame<F: File + ?Sized>(
                             encrypted_buf
                                 .as_mut_slice()
                                 .copy_from_slice(&decrypted_data);
-                            original_complete(Ok((encrypted_buf, bytes_read)));
+                            original_complete(Ok((encrypted_buf, bytes_read)))
                         }
                         Err(e) => {
                             tracing::error!(
                                 "Failed to decrypt WAL frame data for page_idx={page_idx}: {e}"
                             );
-                            original_complete(Err(CompletionError::DecryptionError { page_idx }));
+                            original_complete(Err(CompletionError::DecryptionError { page_idx }))
                         }
                     }
                 });
@@ -1672,19 +1683,15 @@ pub fn begin_read_wal_frame<F: File + ?Sized>(
             let verify_complete =
                 Box::new(move |res: Result<(Arc<Buffer>, i32), CompletionError>| {
                     let Ok((buf, bytes_read)) = res else {
-                        original_c(res);
-                        return;
+                        return original_c(res);
                     };
                     if bytes_read <= 0 {
                         tracing::trace!("Read page {page_idx} with {} bytes", bytes_read);
-                        original_c(Ok((buf, bytes_read)));
-                        return;
+                        return original_c(Ok((buf, bytes_read)));
                     }
 
                     match checksum_ctx.verify_checksum(buf.as_mut_slice(), page_idx) {
-                        Ok(_) => {
-                            original_c(Ok((buf, bytes_read)));
-                        }
+                        Ok(_) => original_c(Ok((buf, bytes_read))),
                         Err(e) => {
                             tracing::error!(
                                 "Failed to verify checksum for page_id={page_idx}: {e}"

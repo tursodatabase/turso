@@ -76,8 +76,7 @@ impl File for GenericFile {
             let r = c.as_read();
             let buf = r.buf();
             let buf = buf.as_mut_slice();
-            file.read_exact(buf)?;
-            buf.len() as i32
+            file.read(buf)? as i32
         };
         c.complete(nr);
         Ok(c)

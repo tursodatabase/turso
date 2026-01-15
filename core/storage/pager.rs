@@ -262,13 +262,8 @@ impl PageInner {
     }
 
     #[inline]
-    pub fn page_type(&self) -> PageType {
-        self.read_u8(BTREE_PAGE_TYPE).try_into().unwrap()
-    }
-
-    #[inline]
-    pub fn maybe_page_type(&self) -> Option<PageType> {
-        self.read_u8(0).try_into().ok()
+    pub fn page_type(&self) -> crate::Result<PageType> {
+        self.read_u8(BTREE_PAGE_TYPE).try_into()
     }
 
     /// Read a u16 from the page content at the given absolute offset (no db header offset).
@@ -394,24 +389,24 @@ impl PageInner {
     }
 
     #[inline]
-    pub fn rightmost_pointer(&self) -> Option<u32> {
-        match self.page_type() {
+    pub fn rightmost_pointer(&self) -> crate::Result<Option<u32>> {
+        match self.page_type()? {
             PageType::IndexInterior | PageType::TableInterior => {
-                Some(self.read_u32(BTREE_RIGHTMOST_PTR))
+                Ok(Some(self.read_u32(BTREE_RIGHTMOST_PTR)))
             }
-            PageType::IndexLeaf | PageType::TableLeaf => None,
+            PageType::IndexLeaf | PageType::TableLeaf => Ok(None),
         }
     }
 
     #[inline]
-    pub fn rightmost_pointer_raw(&self) -> Option<*mut u8> {
-        match self.page_type() {
-            PageType::IndexInterior | PageType::TableInterior => Some(unsafe {
+    pub fn rightmost_pointer_raw(&self) -> crate::Result<Option<*mut u8>> {
+        match self.page_type()? {
+            PageType::IndexInterior | PageType::TableInterior => Ok(Some(unsafe {
                 self.as_ptr()
                     .as_mut_ptr()
                     .add(self.offset() + BTREE_RIGHTMOST_PTR)
-            }),
-            PageType::IndexLeaf | PageType::TableLeaf => None,
+            })),
+            PageType::IndexLeaf | PageType::TableLeaf => Ok(None),
         }
     }
 
@@ -435,7 +430,7 @@ impl PageInner {
 
     #[inline(always)]
     pub fn cell_table_interior_read_rowid(&self, idx: usize) -> crate::Result<i64> {
-        debug_assert!(self.page_type() == PageType::TableInterior);
+        debug_assert!(matches!(self.page_type(), Ok(PageType::TableInterior)));
         let buf = self.as_ptr();
         let cell_pointer_array_start = self.header_size();
         let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
@@ -447,10 +442,10 @@ impl PageInner {
 
     #[inline(always)]
     pub fn cell_interior_read_left_child_page(&self, idx: usize) -> u32 {
-        debug_assert!(
-            self.page_type() == PageType::TableInterior
-                || self.page_type() == PageType::IndexInterior
-        );
+        debug_assert!(matches!(
+            self.page_type(),
+            Ok(PageType::TableInterior) | Ok(PageType::IndexInterior)
+        ));
         let buf = self.as_ptr();
         let cell_pointer_array_start = self.header_size();
         let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
@@ -465,7 +460,7 @@ impl PageInner {
 
     #[inline(always)]
     pub fn cell_table_leaf_read_rowid(&self, idx: usize) -> crate::Result<i64> {
-        debug_assert!(self.page_type() == PageType::TableLeaf);
+        debug_assert!(matches!(self.page_type(), Ok(PageType::TableLeaf)));
         let buf = self.as_ptr();
         let cell_pointer_array_start = self.header_size();
         let cell_pointer = cell_pointer_array_start + (idx * CELL_PTR_SIZE_BYTES);
@@ -498,19 +493,23 @@ impl PageInner {
     }
 
     #[inline]
-    pub fn cell_get_raw_region(&self, idx: usize, usable_size: usize) -> (usize, usize) {
-        let page_type = self.page_type();
+    pub fn cell_get_raw_region(
+        &self,
+        idx: usize,
+        usable_size: usize,
+    ) -> crate::Result<(usize, usize)> {
+        let page_type = self.page_type()?;
         let max_local = payload_overflow_threshold_max(page_type, usable_size);
         let min_local = payload_overflow_threshold_min(page_type, usable_size);
         let cell_count = self.cell_count();
-        self._cell_get_raw_region_faster(
+        Ok(self._cell_get_raw_region_faster(
             idx,
             usable_size,
             cell_count,
             max_local,
             min_local,
             page_type,
-        )
+        ))
     }
 
     #[inline]
@@ -781,11 +780,11 @@ impl Page {
     }
 
     #[inline]
-    pub fn is_index(&self) -> bool {
-        match self.get_contents().page_type() {
+    pub fn is_index(&self) -> crate::Result<bool> {
+        Ok(match self.get_contents().page_type()? {
             PageType::IndexLeaf | PageType::IndexInterior => true,
             PageType::TableLeaf | PageType::TableInterior => false,
-        }
+        })
     }
 
     /// Increment the pin count by 1. A pin count >0 means the page is pinned and not eligible for eviction from the page cache.
@@ -2023,7 +2022,7 @@ impl Pager {
         tracing::debug!(
             "do_allocate_page(id={}, page_type={:?})",
             page.get().id,
-            page.get_contents().page_type()
+            page.get_contents().page_type().ok()
         );
         Ok(IOResult::Done(page))
     }
@@ -2614,7 +2613,7 @@ impl Pager {
                     trace!(
                         "cacheflush(page={}, page_type={:?})",
                         page_id,
-                        page.get_contents().maybe_page_type()
+                        page.get_contents().page_type().ok()
                     );
                     state.collected_pages.push(page);
                     state.current_idx += 1;
@@ -2641,7 +2640,7 @@ impl Pager {
                     trace!(
                         "cacheflush(page={}, page_type={:?}) [re-read sync]",
                         page_id,
-                        page.get_contents().maybe_page_type()
+                        page.get_contents().page_type().ok()
                     );
                     state.collected_pages.push(page);
                     state.current_idx += 1;
@@ -2679,7 +2678,7 @@ impl Pager {
         trace!(
             "cacheflush(page={}, page_type={:?}) [re-read complete]",
             page_id,
-            page.get_contents().maybe_page_type()
+            page.get_contents().page_type().ok()
         );
         state.collected_pages.push(page);
         state.current_idx += 1;

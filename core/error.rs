@@ -130,6 +130,18 @@ pub enum CompletionError {
     DecryptionError { page_idx: usize },
     #[error("I/O error: partial write")]
     ShortWrite,
+    #[error("I/O error: short read on page {page_idx}: expected {expected} bytes, got {actual}")]
+    ShortRead {
+        page_idx: usize,
+        expected: usize,
+        actual: usize,
+    },
+    #[error("I/O error: short read on WAL frame at offset {offset}: expected {expected} bytes, got {actual}")]
+    ShortReadWalFrame {
+        offset: u64,
+        expected: usize,
+        actual: usize,
+    },
     #[error("Checksum mismatch on page {page_id}: expected {expected}, got {actual}")]
     ChecksumMismatch {
         page_id: usize,
