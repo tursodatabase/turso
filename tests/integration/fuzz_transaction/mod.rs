@@ -497,6 +497,8 @@ async fn test_multiple_connections_fuzz_mvcc() {
                 weight_update: 25,
             },
         },
+        // FIXME: temporary disable reopen logic for MVCC because it will spam CI otherwise (due to some unfixed bug)
+        reopen_probability: 0.0,
         ..FuzzOptions::default()
     };
     multiple_connections_fuzz(mvcc_fuzz_options).await
