@@ -266,7 +266,7 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
         test_file: &TestFile,
     ) -> FuturesUnordered<tokio::task::JoinHandle<TestResult>> {
         let futures = FuturesUnordered::new();
-        let backend_name = self.backend.name();
+        let backend_type = self.backend.backend_type();
 
         // For each database configuration
         for db_config in &test_file.databases {
@@ -280,8 +280,8 @@ impl<B: SqlBackend + 'static> TestRunner<B> {
                 }
 
                 // Skip tests that don't match the current backend
-                if let Some(ref required_backend) = test.backend {
-                    if required_backend != backend_name {
+                if let Some(required_backend) = test.backend {
+                    if required_backend != backend_type {
                         continue;
                     }
                 }
@@ -542,8 +542,9 @@ async fn run_single_test<B: SqlBackend>(
     // Close database
     let _ = db.close().await;
 
-    // Compare result
-    let comparison = compare(&result, &test.expectation);
+    // Compare result (select expectation based on backend)
+    let expectation = test.expectations.for_backend(backend.backend_type());
+    let comparison = compare(&result, expectation);
     let outcome = match comparison {
         ComparisonResult::Match => TestOutcome::Passed,
         ComparisonResult::Mismatch { reason } => TestOutcome::Failed { reason },

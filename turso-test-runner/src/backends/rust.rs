@@ -1,7 +1,7 @@
 use super::{BackendError, DatabaseInstance, QueryResult, SqlBackend};
 use crate::{
     backends::DefaultDatabaseResolver,
-    parser::ast::{DatabaseConfig, DatabaseLocation},
+    parser::ast::{Backend, DatabaseConfig, DatabaseLocation},
 };
 use async_trait::async_trait;
 use std::sync::Arc;
@@ -47,6 +47,10 @@ impl Default for RustBackend {
 impl SqlBackend for RustBackend {
     fn name(&self) -> &str {
         "rust"
+    }
+
+    fn backend_type(&self) -> Backend {
+        Backend::Rust
     }
 
     async fn create_database(

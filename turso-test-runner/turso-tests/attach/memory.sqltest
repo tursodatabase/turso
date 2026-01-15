@@ -56,3 +56,6 @@ test attach-from-memory-db {
 expect {
     1|hat|79.0|1
 }
+expect @js {
+    1|hat|79|1
+}

@@ -23,6 +23,12 @@ expect {
     2.0
     -4.0
 }
+expect @js {
+    -11
+    0
+    2
+    -4
+}
 
 test vector-insert {
     CREATE TABLE IF NOT EXISTS vector_test (
@@ -85,7 +91,7 @@ test vector-distance-dot-table {
     );
     INSERT INTO dot_test (id, vec) VALUES (1, vector('[1, 1]'));
     INSERT INTO dot_test (id, vec) VALUES (2, vector('[2, 2]'));
-    
+
     SELECT vector_distance_dot(vec, vector('[1, 1]')) as dist
     FROM dot_test
     ORDER BY dist ASC;
@@ -93,5 +99,9 @@ test vector-distance-dot-table {
 expect {
     -4.0
     -2.0
+}
+expect @js {
+    -4
+    -2
 }
 

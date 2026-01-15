@@ -8,8 +8,8 @@ use std::time::Duration;
 use std::{path::PathBuf, time::Instant};
 use turso_test_runner::{
     DefaultDatabases, Format, OutputFormat, ParseError, RunnerConfig, TestRunner,
-    backends::cli::CliBackend, backends::rust::RustBackend, create_output, load_test_files,
-    summarize, tcl_converter,
+    backends::cli::CliBackend, backends::js::JsBackend, backends::rust::RustBackend, create_output,
+    load_test_files, summarize, tcl_converter,
 };
 
 #[derive(Parser)]
@@ -28,13 +28,21 @@ enum Commands {
         #[arg(required = true)]
         paths: Vec<PathBuf>,
 
-        /// Backend to use: "rust" (native) or "cli" (subprocess)
+        /// Backend to use: "rust" (native), "cli" (subprocess), or "js" (JavaScript bindings)
         #[arg(long, default_value = "rust")]
         backend: String,
 
         /// Path to tursodb binary (only used with --backend cli)
         #[arg(long, default_value = "tursodb")]
         binary: PathBuf,
+
+        /// Path to node binary (only used with --backend js)
+        #[arg(long, default_value = "node")]
+        node: PathBuf,
+
+        /// Path to JavaScript runner script (only used with --backend js)
+        #[arg(long)]
+        js_script: Option<PathBuf>,
 
         /// Filter tests by name pattern
         #[arg(short, long)]
@@ -48,7 +56,7 @@ enum Commands {
         #[arg(short, long, default_value = "pretty")]
         output: String,
 
-        /// Timeout per query in seconds (only used with --backend cli)
+        /// Timeout per query in seconds (only used with --backend cli or js)
         #[arg(long, default_value_t = 90)]
         timeout: u64,
 
@@ -93,12 +101,19 @@ async fn main() -> ExitCode {
             paths,
             backend,
             binary,
+            node,
+            js_script,
             filter,
             jobs,
             output,
             timeout,
             mvcc,
-        } => run_tests(paths, backend, binary, filter, jobs, output, timeout, mvcc).await,
+        } => {
+            run_tests(
+                paths, backend, binary, node, js_script, filter, jobs, output, timeout, mvcc,
+            )
+            .await
+        }
         Commands::Check { paths } => check_files(paths),
         Commands::Convert {
             paths,
@@ -118,6 +133,8 @@ async fn run_tests(
     paths: Vec<PathBuf>,
     backend_type: String,
     binary: PathBuf,
+    node: PathBuf,
+    js_script: Option<PathBuf>,
     filter: Option<String>,
     jobs: usize,
     output_format: String,
@@ -210,19 +227,9 @@ async fn run_tests(
     // Run tests based on backend selection
     let results = match backend_type.as_str() {
         "cli" => {
-            let mut backend = if let Some(ref dbs) = default_dbs {
-                CliBackend::new(&binary)
-                    .with_timeout(Duration::from_secs(timeout))
-                    .with_mvcc(mvcc)
-                    .with_default_db_resolver(Arc::new(DefaultDatabasesResolver(
-                        dbs.default_path.clone(),
-                        dbs.no_rowid_alias_path.clone(),
-                    )))
-            } else {
-                CliBackend::new(&binary)
-                    .with_timeout(Duration::from_secs(timeout))
-                    .with_mvcc(mvcc)
-            };
+            let mut backend = CliBackend::new(&binary)
+                .with_timeout(Duration::from_secs(timeout))
+                .with_mvcc(mvcc);
             if let Some(resolver) = resolver {
                 backend = backend.with_default_db_resolver(resolver);
             }
@@ -247,8 +254,70 @@ async fn run_tests(
                 })
                 .await
         }
+        "js" => {
+            // Default: script is in the bindings/javascript directory
+            let js_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../bindings/javascript");
+
+            // Determine script path - use provided or default to bundled script
+            let script_path = js_script.unwrap_or_else(|| js_dir.join("turso-sql-runner.mjs"));
+
+            if !script_path.exists() {
+                eprintln!(
+                    "Error: JavaScript runner script not found at {}",
+                    script_path.display()
+                );
+                eprintln!("Use --js-script to specify a custom script path");
+                return ExitCode::from(2);
+            }
+
+            // Check that native bindings are built
+            let native_dir = js_dir.join("packages/native");
+            let has_native_bindings = native_dir
+                .read_dir()
+                .map(|entries| {
+                    entries
+                        .filter_map(|e| e.ok())
+                        .any(|e| e.path().extension().is_some_and(|ext| ext == "node"))
+                })
+                .unwrap_or(false);
+
+            if !has_native_bindings {
+                eprintln!("Error: JavaScript native bindings not found");
+                eprintln!(
+                    "Expected .node file in {}",
+                    native_dir.display()
+                );
+                eprintln!();
+                eprintln!("Build the bindings first:");
+                eprintln!("  make -C turso-test-runner build-js-bindings");
+                eprintln!();
+                eprintln!("Or manually:");
+                eprintln!("  cd bindings/javascript");
+                eprintln!("  yarn install");
+                eprintln!("  yarn workspace @tursodatabase/database-common build");
+                eprintln!("  yarn workspace @tursodatabase/database build");
+                return ExitCode::from(2);
+            }
+
+            let mut backend = JsBackend::new(&node, &script_path)
+                .with_timeout(Duration::from_secs(timeout))
+                .with_mvcc(mvcc);
+            if let Some(resolver) = resolver {
+                backend = backend.with_default_db_resolver(resolver);
+            }
+            let runner = TestRunner::new(backend).with_config(config);
+            runner
+                .run_loaded_tests(loaded, |result| {
+                    output.write_test(result);
+                    output.flush();
+                })
+                .await
+        }
         other => {
-            eprintln!("Error: unknown backend '{}'. Use 'rust' or 'cli'", other);
+            eprintln!(
+                "Error: unknown backend '{}'. Use 'rust', 'cli', or 'js'",
+                other
+            );
             return ExitCode::from(2);
         }
     };

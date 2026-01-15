@@ -63,12 +63,20 @@ test numberic-literal-9 {
 expect {
     1000000000000.0
 }
+# JS Number doesn't distinguish between 1e12 and 1000000000000
+expect @js {
+    1000000000000
+}
 
 test numberic-literal-10 {
     SELECT 1.0;
 }
 expect {
     1.0
+}
+# JS Number doesn't distinguish between 1.0 and 1
+expect @js {
+    1
 }
 
 test numberic-literal-11 {
@@ -105,12 +113,20 @@ test numberic-literal-exceed-max-i64 {
 expect {
     9.22337203685478e+18
 }
+# JS outputs large numbers as full integers rather than scientific notation
+expect @js {
+    9223372036854776000
+}
 
 test numberic-literal-exceed-min-i64 {
     SELECT -9_223_372_036_854_775_809;
 }
 expect {
     -9.22337203685478e+18
+}
+# JS outputs large numbers as full integers rather than scientific notation
+expect @js {
+    -9223372036854776000
 }
 
 test invalid-numberic-literal-1 {

@@ -1,7 +1,8 @@
 pub mod cli;
+pub mod js;
 pub mod rust;
 
-use crate::{DatabaseLocation, parser::ast::DatabaseConfig};
+use crate::parser::ast::{Backend, DatabaseConfig, DatabaseLocation};
 use async_trait::async_trait;
 use std::{path::PathBuf, time::Duration};
 
@@ -46,6 +47,9 @@ impl QueryResult {
 pub trait SqlBackend: Send + Sync {
     /// Name of this backend (for filtering and display)
     fn name(&self) -> &str;
+
+    /// Backend type enum variant
+    fn backend_type(&self) -> Backend;
 
     /// Create a new isolated database instance
     async fn create_database(
@@ -97,4 +101,59 @@ pub enum BackendError {
 
     #[error("timeout after {0:?}")]
     Timeout(Duration),
+}
+
+/// Parse pipe-separated list output into rows
+pub fn parse_list_output(output: &str) -> Vec<Vec<String>> {
+    output
+        .lines()
+        .filter(|line| !line.is_empty())
+        .map(|line| line.split('|').map(|s| s.to_string()).collect())
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_list_output_empty() {
+        let output = "";
+        let rows = parse_list_output(output);
+        assert!(rows.is_empty());
+    }
+
+    #[test]
+    fn test_parse_list_output_single_column() {
+        let output = "1\n2\n3";
+        let rows = parse_list_output(output);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0], vec!["1"]);
+        assert_eq!(rows[1], vec!["2"]);
+        assert_eq!(rows[2], vec!["3"]);
+    }
+
+    #[test]
+    fn test_parse_list_output_multiple_columns() {
+        let output = "1|Alice|30\n2|Bob|25";
+        let rows = parse_list_output(output);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], vec!["1", "Alice", "30"]);
+        assert_eq!(rows[1], vec!["2", "Bob", "25"]);
+    }
+
+    #[test]
+    fn test_parse_list_output_empty_values() {
+        let output = "1||3";
+        let rows = parse_list_output(output);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0], vec!["1", "", "3"]);
+    }
+
+    #[test]
+    fn test_parse_list_output_trailing_newline() {
+        let output = "1|Alice\n2|Bob\n";
+        let rows = parse_list_output(output);
+        assert_eq!(rows.len(), 2);
+    }
 }
