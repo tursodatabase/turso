@@ -47,6 +47,12 @@ pub enum CheckpointState {
     TruncateLogicalLog,
     FsyncLogicalLog,
     CheckpointWal,
+    /// Fsync the database file after checkpoint, before truncating WAL.
+    /// This ensures durability: if we crash after WAL truncation but before DB fsync,
+    /// the data would be lost.
+    SyncDbFile,
+    /// Truncate the WAL file after DB file is safely synced (for TRUNCATE checkpoint mode)
+    TruncateWal,
     Finalize,
 }
 
@@ -1074,6 +1080,59 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                 match self.checkpoint_wal()? {
                     IOResult::Done(result) => {
                         self.checkpoint_result = Some(result);
+                        self.state = CheckpointState::SyncDbFile;
+                        Ok(TransitionResult::Continue)
+                    }
+                    IOResult::IO(io) => Ok(TransitionResult::Io(io)),
+                }
+            }
+
+            CheckpointState::SyncDbFile => {
+                // Fsync database file before truncating WAL.
+                // This ensures durability: if we crash after WAL truncation but before DB fsync,
+                // the checkpointed data would be lost.
+                if self.sync_mode == SyncMode::Off {
+                    tracing::debug!("Skipping fsync of database file (synchronous=off)");
+                    self.state = CheckpointState::TruncateWal;
+                    return Ok(TransitionResult::Continue);
+                }
+
+                let checkpoint_result = self
+                    .checkpoint_result
+                    .as_mut()
+                    .expect("checkpoint_result should be set");
+
+                // Only sync if we actually backfilled any frames
+                if checkpoint_result.num_backfilled == 0 {
+                    self.state = CheckpointState::TruncateWal;
+                    return Ok(TransitionResult::Continue);
+                }
+
+                // Check if we already sent the sync
+                if checkpoint_result.db_sync_sent {
+                    self.state = CheckpointState::TruncateWal;
+                    return Ok(TransitionResult::Continue);
+                }
+
+                tracing::debug!("Fsyncing database file before WAL truncation");
+                let c = self.pager.db_file.sync(Completion::new_sync(|_| {}))?;
+                checkpoint_result.db_sync_sent = true;
+                Ok(TransitionResult::Io(IOCompletions::Single(c)))
+            }
+
+            CheckpointState::TruncateWal => {
+                // Truncate WAL file after DB file is safely synced.
+                // This must be done explicitly because MVCC calls wal.checkpoint() directly,
+                // bypassing the pager's TruncateWalFile phase.
+                let Some(wal) = &self.pager.wal else {
+                    panic!("No WAL to truncate");
+                };
+                let checkpoint_result = self
+                    .checkpoint_result
+                    .as_mut()
+                    .expect("checkpoint_result should be set");
+                match wal.truncate_wal(checkpoint_result)? {
+                    IOResult::Done(()) => {
                         self.state = CheckpointState::Finalize;
                         Ok(TransitionResult::Continue)
                     }
