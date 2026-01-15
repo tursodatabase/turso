@@ -1261,7 +1261,6 @@ impl DatabaseCatalog {
         inverted.trailing_zeros() as usize
     }
 }
-
 pub struct QueryRunner<'a> {
     parser: Parser<'a>,
     conn: &'a Arc<Connection>,

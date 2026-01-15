@@ -206,6 +206,34 @@ impl TursoRwLock {
             .is_ok()
     }
 
+    /// upgrade read lock to the write lock
+    /// only possible if there is exactly single reader at the moment
+    /// return true if lock was upgraded succesfully - and false otherwise
+    #[inline]
+    pub fn upgrade(&self) -> bool {
+        let cur = self.0.load(Ordering::Acquire);
+        // Check for single reader: exactly one reader, any value
+        if (cur & !Self::VALUE_MASK) != Self::READER_INC {
+            return false;
+        }
+        // Preserve value bits, replace reader with writer
+        let desired = (cur & Self::VALUE_MASK) | Self::WRITER;
+        self.0
+            .compare_exchange(cur, desired, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+    }
+
+    /// downgrade write lock to the read lock
+    /// MUST be called for a lock acquired by the writer
+    #[inline]
+    pub fn downgrade(&self) {
+        let cur = self.0.load(Ordering::Acquire);
+        debug_assert!(Self::has_writer(cur));
+        // Preserve value bits, replace writer with one reader
+        let desired = (cur & Self::VALUE_MASK) | Self::READER_INC;
+        self.0.store(desired, Ordering::Release);
+    }
+
     #[inline]
     /// Unlock whatever lock is currently held.
     /// For write lock: clear writer bit
@@ -646,7 +674,6 @@ pub struct WalFile {
     shared: Arc<RwLock<WalFileShared>>,
     ongoing_checkpoint: RwLock<OngoingCheckpoint>,
     checkpoint_threshold: usize,
-    // min and max frames for this connection
     /// This is the index to the read_lock in WalFileShared that we are holding. This lock contains
     /// the max frame for this connection.
     max_frame_read_lock_index: AtomicUsize,
@@ -915,10 +942,13 @@ impl WalFile {
                     shared.transaction_count.load(Ordering::Acquire),
                 )
             });
+        tracing::debug!("try_begin_read_tx: shared_max={}, nbackfills={}, last_checksum={:?}, checkpoint_seq={:?}, transaction_count={}", shared_max, nbackfills, last_checksum, checkpoint_seq, transaction_count);
 
         // Check if database changed since this connection's last read transaction.
         // If it has, the connection will invalidate its page cache.
-        let db_changed = self.with_shared(|shared| self.db_changed(shared));
+        let db_changed = self.with_shared(|shared: &WalFileShared| self.db_changed(shared));
+
+        tracing::debug!("try_begin_read_tx: db_changed={}", db_changed);
 
         // If WAL is fully checkpointed (shared_max == nbackfills), readers can ignore
         // the WAL and read directly from the DB file by holding read_locks[0].
@@ -929,6 +959,7 @@ impl WalFile {
                 nbackfills
             );
             if !self.with_shared(|shared| shared.read_locks[0].read()) {
+                tracing::debug!("begin_read_tx: unable to acquire read-0 lock slot, retrying");
                 return TryBeginReadResult::Retry;
             }
             // Re-validate: a writer could have appended frames between our snapshot
@@ -947,6 +978,7 @@ impl WalFile {
                 || cksm2 != last_checksum
                 || ckpt_seq2 != checkpoint_seq
             {
+                tracing::debug!("begin_read_tx: shared data changed ({shared_max}, {nbackfills}, {last_checksum:?}, {checkpoint_seq}) != ({mx2}, {nb2}, {cksm2:?}, {ckpt_seq2}), retrying");
                 self.with_shared(|shared| shared.read_locks[0].unlock());
                 return TryBeginReadResult::Retry;
             }
@@ -976,6 +1008,11 @@ impl WalFile {
                 }
             }
         });
+        tracing::debug!(
+            "try_begin_read_tx: best_idx={}, best_mark={}",
+            best_idx,
+            best_mark
+        );
 
         // If none found or lagging, try to claim/update a slot
         if best_idx == -1 || (best_mark as u64) < shared_max {
@@ -1014,6 +1051,8 @@ impl WalFile {
                 shared.read_locks[best_idx as usize].get_value(),
             ))
         });
+
+        tracing::debug!("try_begin_read_tx: read_result={:?}", read_result);
 
         let Some((mx2, nb2, cksm2, ckpt_seq2, current_slot_mark)) = read_result else {
             return TryBeginReadResult::Retry;
@@ -1072,6 +1111,7 @@ impl Wal for WalFile {
         // here.
         let mut cnt = 0u32;
         loop {
+            tracing::trace!("begin_read_tx: cnt={cnt}");
             match self.try_begin_read_tx() {
                 TryBeginReadResult::Ok(changed) => return Ok(changed),
                 TryBeginReadResult::Retry => {
@@ -1116,6 +1156,7 @@ impl Wal for WalFile {
     /// Begin a write transaction
     #[instrument(skip_all, level = Level::DEBUG)]
     fn begin_write_tx(&self) -> Result<()> {
+        tracing::debug!("begin_write_tx");
         self.with_shared(|shared| {
             // sqlite/src/wal.c 3702
             // Cannot start a write transaction without first holding a read
@@ -1130,18 +1171,22 @@ impl Wal for WalFile {
                 return Err(LimboError::Busy);
             }
             let db_changed = self.db_changed(shared);
-            if !db_changed {
-                return Ok(());
+            if db_changed {
+                // Snapshot is stale, give up and let caller retry from scratch.
+                // Return BusySnapshot instead of Busy so the caller knows it must
+                // restart the read transaction to get a fresh snapshot.
+                // Retrying with busy_timeout will NEVER HELP.
+                tracing::debug!("unable to upgrade transaction from read to write: snapshot is stale, give up and let caller retry from scratch, self.max_frame={}, shared_max={}", self.max_frame.load(Ordering::Acquire), shared.max_frame.load(Ordering::Acquire));
+                shared.write_lock.unlock();
+                return Err(LimboError::BusySnapshot);
             }
 
-            // Snapshot is stale, give up and let caller retry from scratch.
-            // Return BusySnapshot instead of Busy so the caller knows it must
-            // restart the read transaction to get a fresh snapshot.
-            // Retrying with busy_timeout will NEVER HELP.
-            tracing::debug!("unable to upgrade transaction from read to write: snapshot is stale, give up and let caller retry from scratch, self.max_frame={}, shared_max={}", self.max_frame.load(Ordering::Acquire), shared.max_frame.load(Ordering::Acquire));
-            shared.write_lock.unlock();
-            Err(LimboError::BusySnapshot)
-        })
+            Ok(())
+        })?;
+
+        self.try_restart_log_before_write()?;
+
+        Ok(())
     }
 
     /// End a write transaction
@@ -2397,7 +2442,15 @@ impl WalFile {
                         return Err(LimboError::Busy);
                     }
                     if mode.should_restart_log() {
-                        self.restart_log(mode)?;
+                        turso_assert!(
+                            matches!(
+                                *self.checkpoint_guard.read(),
+                                Some(CheckpointLocks::Writer { .. })
+                            ),
+                            "We must hold writer and checkpoint locks to restart the log, found: {:?}",
+                            *self.checkpoint_guard.read()
+                        );
+                        self.restart_log()?;
                     }
                     ongoing_chkpt.state = CheckpointState::Finalize {
                         checkpoint_result: Some(checkpoint_result),
@@ -2521,22 +2574,52 @@ impl WalFile {
         })
     }
 
-    /// Called once the entire WAL has been back‑filled in RESTART or TRUNCATE mode.
-    /// Must be invoked while writer and checkpoint locks are still held.
-    fn restart_log(&self, mode: CheckpointMode) -> Result<()> {
+    /// attempt to restart WAL header before write in order to keep WAL file size under the control
+    /// The conditions for WAL restart are following:
+    /// 1. we can do that only under write transaction
+    /// 2. max_frame_read_lock_index == 0 - this means that transaction was initiated to read data from DB file
+    /// 3. nbackfills > 0 - otherwise nothing was backfilled and there is no reason to truncate header
+    /// 4. max_frame == nbackfills - otherwise there are some non-checkpointed frames in the WAL and we can't truncate the log
+    pub fn try_restart_log_before_write(&self) -> Result<()> {
+        let max_frame_read_lock_index = self.max_frame_read_lock_index.load(Ordering::Acquire);
+        if max_frame_read_lock_index != 0 {
+            tracing::debug!("try_restart_log_before_write: max_frame_read_lock_index={max_frame_read_lock_index}, writer use WAL - can't restart the log");
+            return Ok(());
+        }
+        let (max_frame, nbackfills) = self.with_shared(|s| {
+            (
+                s.max_frame.load(Ordering::Acquire),
+                s.nbackfills.load(Ordering::Acquire),
+            )
+        });
+        if nbackfills == 0 {
+            tracing::debug!("try_restart_log_before_write: nbackfills={nbackfills}, nothing were backfilled - can't restart the log");
+            return Ok(());
+        }
         turso_assert!(
-            mode.should_restart_log(),
-            "CheckpointMode must be Restart or Truncate"
+            max_frame >= nbackfills,
+            "backfills can't be more than max_frame"
         );
-        turso_assert!(
-            matches!(
-                *self.checkpoint_guard.read(),
-                Some(CheckpointLocks::Writer { .. })
-            ),
-            "We must hold writer and checkpoint locks to restart the log, found: {:?}",
-            *self.checkpoint_guard.read()
-        );
-        tracing::debug!("restart_log(mode={mode:?})");
+        if max_frame != nbackfills {
+            tracing::debug!("try_restart_log_before_write: max_frame={max_frame}, nbackfills={nbackfills}, not everything is backfilled to the DB file - can't restart the log");
+            return Ok(());
+        }
+        let read_lock_0 = self.with_shared(|s| s.read_locks[0].upgrade());
+        if !read_lock_0 {
+            return Ok(());
+        }
+        let result = self.restart_log();
+        if result.is_ok() {
+            let shared = self.shared.clone();
+            Self::unlock_after_restart(&shared, result.as_ref().err());
+        }
+        self.with_shared(|s| s.read_locks[0].downgrade());
+        tracing::debug!("try_restart_log_before_write: result={:?}", result);
+        result
+    }
+
+    fn restart_log(&self) -> Result<()> {
+        tracing::debug!("restart_log");
         self.with_shared(|shared| {
             // Block all readers
             for idx in 1..shared.read_locks.len() {
@@ -2556,7 +2639,7 @@ impl WalFile {
         })?;
 
         // reinitialize in‑memory state
-        self.with_shared_mut_dangerous(|shared| shared.restart_wal_header(&self.io, mode));
+        self.with_shared_mut_dangerous(|shared| shared.restart_wal_header(&self.io));
         let cksm = self.with_shared(|shared| shared.last_checksum);
         *self.last_checksum.write() = cksm;
         self.max_frame.store(0, Ordering::Release);
@@ -2833,14 +2916,7 @@ impl WalFileShared {
     /// This function updates the shared-memory structures so that the next
     /// client to write to the database (which may be this one) does so by
     /// writing frames into the start of the log file.
-    fn restart_wal_header(&mut self, io: &Arc<dyn IO>, mode: CheckpointMode) {
-        turso_assert!(
-            matches!(
-                mode,
-                CheckpointMode::Restart | CheckpointMode::Truncate { .. }
-            ),
-            "CheckpointMode must be Restart or Truncate"
-        );
+    fn restart_wal_header(&mut self, io: &Arc<dyn IO>) {
         {
             let mut hdr = self.wal_header.lock();
             hdr.checkpoint_seq = hdr.checkpoint_seq.wrapping_add(1);
