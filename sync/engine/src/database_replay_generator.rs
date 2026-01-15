@@ -168,6 +168,10 @@ impl DatabaseReplayGenerator {
                 }
                 values
             }
+            DatabaseChangeType::Commit => {
+                // COMMIT records are transaction boundary markers and should not be replayed
+                Vec::new()
+            }
         }
     }
     pub async fn replay_info<Ctx>(

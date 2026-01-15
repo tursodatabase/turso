@@ -3283,8 +3283,8 @@ pub fn emit_cdc_insns(
     updates_record_reg: Option<usize>,
     table_name: &str,
 ) -> Result<()> {
-    // (change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB)
-    let turso_cdc_registers = program.alloc_registers(8);
+    // (change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB, change_txn_id INTEGER)
+    let turso_cdc_registers = program.alloc_registers(9);
     program.emit_insn(Insn::Null {
         dest: turso_cdc_registers,
         dest_end: None,
@@ -3356,17 +3356,33 @@ pub fn emit_cdc_insns(
         program.mark_last_insn_constant();
     }
 
-    let rowid_reg = program.alloc_register();
+    // Allocate register for NewRowid early (needed for conn_txn_id call)
+    let new_rowid_reg = program.alloc_register();
     program.emit_insn(Insn::NewRowid {
         cursor: cdc_cursor_id,
-        rowid_reg,
+        rowid_reg: new_rowid_reg,
         prev_largest_reg: 0, // todo(sivukhin): properly set value here from sqlite_sequence table when AUTOINCREMENT will be properly implemented in Turso
+    });
+
+    // Call conn_txn_id(new_rowid_reg) to get/set transaction ID
+    let Some(conn_txn_id_fn) = resolver.resolve_function("conn_txn_id", 1) else {
+        bail_parse_error!("no function {}", "conn_txn_id");
+    };
+    let conn_txn_id_fn_ctx = crate::function::FuncCtx {
+        func: conn_txn_id_fn,
+        arg_count: 1,
+    };
+    program.emit_insn(Insn::Function {
+        constant_mask: 0,
+        start_reg: new_rowid_reg,
+        dest: turso_cdc_registers + 8,
+        func: conn_txn_id_fn_ctx,
     });
 
     let record_reg = program.alloc_register();
     program.emit_insn(Insn::MakeRecord {
         start_reg: to_u16(turso_cdc_registers),
-        count: to_u16(8),
+        count: to_u16(9),
         dest_reg: to_u16(record_reg),
         index_name: None,
         affinity_str: None,
@@ -3374,7 +3390,7 @@ pub fn emit_cdc_insns(
 
     program.emit_insn(Insn::Insert {
         cursor: cdc_cursor_id,
-        key_reg: rowid_reg,
+        key_reg: new_rowid_reg,
         record_reg,
         flag: InsertFlags::new(),
         table_name: "".to_string(),

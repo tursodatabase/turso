@@ -105,6 +105,7 @@ pub enum DatabaseChangeType {
     Delete,
     Update,
     Insert,
+    Commit,
 }
 
 pub const DATABASE_METADATA_VERSION: &str = "v1";
@@ -246,6 +247,8 @@ pub struct DatabaseChange {
     pub after: Option<Vec<u8>>,
     /// Binary record from "updates" column, if CDC pragma set to 'full'
     pub updates: Option<Vec<u8>>,
+    /// Transaction ID for grouping changes by transaction boundaries
+    pub change_txn_id: Option<i64>,
 }
 
 impl DatabaseChange {
@@ -279,6 +282,11 @@ impl DatabaseChange {
                     )
                 })?)?,
             },
+            DatabaseChangeType::Commit => {
+                return Err(Error::DatabaseTapeError(
+                    "COMMIT records should not be applied/reverted".to_string(),
+                ))
+            }
         };
         Ok(DatabaseTapeRowChange {
             change_id: self.change_id,
@@ -316,6 +324,11 @@ impl DatabaseChange {
                     )
                 })?)?,
             },
+            DatabaseChangeType::Commit => {
+                return Err(Error::DatabaseTapeError(
+                    "COMMIT records should not be applied/reverted".to_string(),
+                ))
+            }
         };
         Ok(DatabaseTapeRowChange {
             change_id: self.change_id,
@@ -353,14 +366,16 @@ impl TryFrom<&turso_core::Row> for DatabaseChange {
         let before = get_core_value_blob_or_null(row, 5)?;
         let after = get_core_value_blob_or_null(row, 6)?;
         let updates = get_core_value_blob_or_null(row, 7)?;
+        let change_txn_id = get_core_value_i64_or_null(row, 8)?;
 
         let change_type = match change_type {
             -1 => DatabaseChangeType::Delete,
             0 => DatabaseChangeType::Update,
             1 => DatabaseChangeType::Insert,
+            2 => DatabaseChangeType::Commit,
             v => {
                 return Err(Error::DatabaseTapeError(format!(
-                    "unexpected change type: expected -1|0|1, got '{v:?}'"
+                    "unexpected change type: expected -1|0|1|2, got '{v:?}'"
                 )))
             }
         };
@@ -373,6 +388,7 @@ impl TryFrom<&turso_core::Row> for DatabaseChange {
             before,
             after,
             updates,
+            change_txn_id,
         })
     }
 }
@@ -495,6 +511,16 @@ fn get_core_value_blob_or_null(row: &turso_core::Row, index: usize) -> Result<Op
         turso_core::Value::Blob(x) => Ok(Some(x.clone())),
         v => Err(Error::DatabaseTapeError(format!(
             "column {index} type mismatch: expected blob, got '{v:?}'"
+        ))),
+    }
+}
+
+fn get_core_value_i64_or_null(row: &turso_core::Row, index: usize) -> Result<Option<i64>> {
+    match row.get_value(index) {
+        turso_core::Value::Null => Ok(None),
+        turso_core::Value::Integer(x) => Ok(Some(*x)),
+        v => Err(Error::DatabaseTapeError(format!(
+            "column {index} type mismatch: expected integer, got '{v:?}'"
         ))),
     }
 }

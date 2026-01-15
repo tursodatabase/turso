@@ -41,6 +41,7 @@ pub enum DatabaseChangeTypeJs {
     Insert,
     Update,
     Delete,
+    Commit,
 }
 
 #[napi(string_enum = "lowercase")]
@@ -54,6 +55,7 @@ fn core_change_type_to_js(value: DatabaseChangeType) -> DatabaseChangeTypeJs {
         DatabaseChangeType::Delete => DatabaseChangeTypeJs::Delete,
         DatabaseChangeType::Update => DatabaseChangeTypeJs::Update,
         DatabaseChangeType::Insert => DatabaseChangeTypeJs::Insert,
+        DatabaseChangeType::Commit => DatabaseChangeTypeJs::Commit,
     }
 }
 fn js_value_to_core(value: Either5<Null, i64, f64, String, Vec<u8>>) -> turso_core::Value {

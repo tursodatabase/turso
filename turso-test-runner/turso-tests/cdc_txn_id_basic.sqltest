@@ -1,0 +1,110 @@
+@database :memory:
+
+test basic-txn-id {
+    PRAGMA unstable_capture_data_changes_conn='full';
+    CREATE TABLE t (x INT);
+
+    BEGIN;
+    INSERT INTO t VALUES (1);
+    INSERT INTO t VALUES (2);
+    COMMIT;
+
+    BEGIN;
+    INSERT INTO t VALUES (3);
+    COMMIT;
+
+    -- Check transaction IDs - all changes in same transaction should have same txn_id
+    SELECT change_type, table_name, change_txn_id
+    FROM turso_cdc
+    WHERE table_name != 'sqlite_schema'
+    ORDER BY change_id;
+}
+expect {
+    1|t|2
+    1|t|2
+    1|t|4
+}
+
+test auto-commit-txn-id {
+    PRAGMA unstable_capture_data_changes_conn='full';
+    CREATE TABLE t (x INT);
+
+    -- Single statements in auto-commit mode
+    INSERT INTO t VALUES (1);
+    INSERT INTO t VALUES (2);
+    INSERT INTO t VALUES (3);
+
+    -- Each should get unique txn_id
+    SELECT change_type, table_name, change_txn_id
+    FROM turso_cdc
+    WHERE table_name != 'sqlite_schema'
+    ORDER BY change_id;
+}
+expect {
+    1|t|2
+    1|t|3
+    1|t|4
+}
+
+test rollback-no-cdc-records {
+    PRAGMA unstable_capture_data_changes_conn='full';
+    CREATE TABLE t (x INT);
+
+    BEGIN;
+    INSERT INTO t VALUES (1);
+    ROLLBACK;
+
+    BEGIN;
+    INSERT INTO t VALUES (2);
+    COMMIT;
+
+    -- Only committed transaction should appear in CDC
+    SELECT change_type, table_name, change_txn_id
+    FROM turso_cdc
+    WHERE table_name != 'sqlite_schema'
+    ORDER BY change_id;
+}
+expect {
+    1|t|2
+}
+
+test empty-transaction-no-cdc {
+    PRAGMA unstable_capture_data_changes_conn='full';
+    CREATE TABLE t (x INT);
+
+    BEGIN;
+    COMMIT;
+
+    INSERT INTO t VALUES (1);
+
+    -- Empty transaction should not generate any CDC records for table_name=t
+    SELECT change_type, table_name, change_txn_id
+    FROM turso_cdc
+    WHERE table_name != 'sqlite_schema'
+    ORDER BY change_id;
+}
+expect {
+    1|t|2
+}
+
+test mixed-dml-same-txn-id {
+    PRAGMA unstable_capture_data_changes_conn='full';
+    CREATE TABLE t (x INT PRIMARY KEY, y INT);
+
+    BEGIN;
+    INSERT INTO t VALUES (1, 100);
+    UPDATE t SET y = 200 WHERE x = 1;
+    DELETE FROM t WHERE x = 1;
+    COMMIT;
+
+    -- All changes in same transaction should have same txn_id
+    SELECT change_type, change_txn_id
+    FROM turso_cdc
+    WHERE table_name != 'sqlite_schema'
+    ORDER BY change_id;
+}
+expect {
+    1|2
+    0|2
+    -1|2
+}

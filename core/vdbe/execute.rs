@@ -1902,6 +1902,10 @@ pub fn halt(
                 vtab_rollback_all(&program.connection)?;
                 pager.rollback_tx(&program.connection);
                 program.connection.set_tx_state(TransactionState::None);
+                program
+                    .connection
+                    .cdc_transaction_id
+                    .store(-1, Ordering::SeqCst);
                 program.connection.auto_commit.store(true, Ordering::SeqCst);
                 return Err(LimboError::Constraint(
                     "foreign key constraint failed".to_string(),
@@ -2183,6 +2187,7 @@ pub fn op_transaction_inner(
                             if matches!(current_state, TransactionState::None) {
                                 pager.end_read_tx();
                                 conn.set_tx_state(TransactionState::None);
+                                conn.cdc_transaction_id.store(-1, Ordering::SeqCst);
                                 state.auto_txn_cleanup = TxnCleanup::None;
                             }
                             assert_eq!(conn.get_tx_state(), current_state);
@@ -2320,6 +2325,7 @@ pub fn op_auto_commit(
                 pager.rollback_tx(&conn);
             }
             conn.set_tx_state(TransactionState::None);
+            conn.cdc_transaction_id.store(-1, Ordering::SeqCst);
             conn.auto_commit.store(true, Ordering::SeqCst);
         } else {
             // BEGIN (true->false) or COMMIT (false->true)
@@ -5037,6 +5043,47 @@ pub fn op_function(
                     registers_to_ref_values(&state.registers[*start_reg..*start_reg + arg_count]);
                 let result = exec_unixepoch(values);
                 state.registers[*dest] = Register::Value(result);
+            }
+            ScalarFunc::ConnTxnId => {
+                if arg_count > 1 {
+                    return Err(LimboError::InvalidArgument(
+                        "conn_txn_id requires at most 1 argument".to_string(),
+                    ));
+                }
+                // Get the optional txn_id_if_not_set parameter
+                let new_txn_id = if arg_count == 1 {
+                    match &state.registers[*start_reg] {
+                        Register::Value(Value::Integer(id)) => *id,
+                        Register::Value(Value::Null) => -1,
+                        _ => {
+                            return Err(LimboError::InvalidArgument(
+                                "conn_txn_id argument must be an integer".to_string(),
+                            ))
+                        }
+                    }
+                } else {
+                    -1
+                };
+                // Atomically get or set the CDC transaction ID
+                let current = program
+                    .connection
+                    .cdc_transaction_id
+                    .load(crate::sync::atomic::Ordering::SeqCst);
+                let result = if current == -1 && new_txn_id != -1 {
+                    // Try to set it atomically
+                    match program.connection.cdc_transaction_id.compare_exchange(
+                        -1,
+                        new_txn_id,
+                        crate::sync::atomic::Ordering::SeqCst,
+                        crate::sync::atomic::Ordering::SeqCst,
+                    ) {
+                        Ok(_) => new_txn_id,
+                        Err(actual) => actual,
+                    }
+                } else {
+                    current
+                };
+                state.registers[*dest] = Register::Value(Value::Integer(result));
             }
             ScalarFunc::TursoVersion => {
                 if !program.connection.is_db_initialized() {

@@ -784,6 +784,7 @@ impl Database {
             fk_pragma: AtomicBool::new(false),
             fk_deferred_violations: AtomicIsize::new(0),
             vtab_txn_states: RwLock::new(HashSet::new()),
+            cdc_transaction_id: AtomicI64::new(-1),
         });
         self.n_connections
             .fetch_add(1, crate::sync::atomic::Ordering::SeqCst);

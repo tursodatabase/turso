@@ -1024,6 +1024,9 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
                         self.lock_states.pager_write_tx = false;
                         if self.update_transaction_state {
                             self.connection.set_tx_state(TransactionState::None);
+                            self.connection
+                                .cdc_transaction_id
+                                .store(-1, crate::sync::atomic::Ordering::SeqCst);
                         }
                         let header = self.pager.io.block(|| {
                             self.pager.with_header_mut(|header| {
@@ -1160,11 +1163,17 @@ impl<Clock: LogicalClock> StateTransition for CheckpointStateMachine<Clock> {
                     self.pager.rollback_tx(self.connection.as_ref());
                     if self.update_transaction_state {
                         self.connection.set_tx_state(TransactionState::None);
+                        self.connection
+                            .cdc_transaction_id
+                            .store(-1, crate::sync::atomic::Ordering::SeqCst);
                     }
                 } else if self.lock_states.pager_read_tx {
                     self.pager.end_read_tx();
                     if self.update_transaction_state {
                         self.connection.set_tx_state(TransactionState::None);
+                        self.connection
+                            .cdc_transaction_id
+                            .store(-1, crate::sync::atomic::Ordering::SeqCst);
                     }
                 }
                 if self.lock_states.blocking_checkpoint_lock_held {

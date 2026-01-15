@@ -1207,6 +1207,24 @@ impl Program {
         }
     }
 
+    /// Emit a COMMIT record to CDC table when transaction commits successfully.
+    /// Only emits if CDC is enabled and transaction had CDC changes.
+    ///
+    /// NOTE: Currently disabled due to complexity of emitting as a separate transaction
+    /// after the main commit (causes WAL lock issues). The change_txn_id field on regular
+    /// CDC records is sufficient for transaction boundary detection. COMMIT records can
+    /// be added as a future enhancement if needed.
+    pub(crate) fn emit_cdc_commit_record(_connection: &Arc<Connection>) -> Result<()> {
+        // TODO: Implement COMMIT record emission properly
+        // The challenge is that this needs to be emitted after the transaction commits,
+        // but calling connection.execute() at that point causes WAL lock issues.
+        // Possible solutions:
+        // 1. Emit as part of the transaction before commit (requires direct btree insert)
+        // 2. Use a deferred mechanism to emit in the next transaction
+        // 3. Accept that COMMIT records are optional and rely on txn_id for boundary detection
+        Ok(())
+    }
+
     pub fn commit_txn(
         &self,
         pager: Arc<Pager>,
@@ -1251,7 +1269,11 @@ impl Program {
                     IOResult::Done(_) => {
                         assert!(state_machine.is_finalized());
                         *conn.mv_tx.write() = None;
+                        // Emit COMMIT CDC record before resetting transaction state
+                        Self::emit_cdc_commit_record(&conn)?;
                         conn.set_tx_state(TransactionState::None);
+                        // Reset CDC transaction ID after COMMIT record emission
+                        conn.cdc_transaction_id.store(-1, Ordering::SeqCst);
                         program_state.commit_state = CommitState::Ready;
                         return Ok(IOResult::Done(()));
                     }
@@ -1283,6 +1305,7 @@ impl Program {
                     }
                     TransactionState::Read => {
                         connection.set_tx_state(TransactionState::None);
+                        connection.cdc_transaction_id.store(-1, Ordering::SeqCst);
                         pager.end_read_tx();
                         Ok(IOResult::Done(()))
                     }
@@ -1328,7 +1351,11 @@ impl Program {
                         let schema = connection.schema.read().clone();
                         connection.db.update_schema_if_newer(schema);
                     }
+                    // Emit COMMIT CDC record even on checkpoint failure (commit succeeded)
+                    Self::emit_cdc_commit_record(&self.connection)?;
                     connection.set_tx_state(TransactionState::None);
+                    // Reset CDC transaction ID after COMMIT record emission
+                    connection.cdc_transaction_id.store(-1, Ordering::SeqCst);
                     *commit_state = CommitState::Ready;
                     return Err(LimboError::CheckpointFailed(msg));
                 }
@@ -1339,12 +1366,18 @@ impl Program {
             IOResult::Done(PagerCommitResult::Rollback)
         };
         match cacheflush_status {
-            IOResult::Done(_) => {
+            IOResult::Done(_result) => {
                 if self.change_cnt_on {
                     self.connection
                         .set_changes(program_state.n_change.load(Ordering::SeqCst));
                 }
+                if !rollback {
+                    // Emit COMMIT CDC record before resetting transaction state (only on successful commit)
+                    Self::emit_cdc_commit_record(&self.connection)?;
+                }
                 connection.set_tx_state(TransactionState::None);
+                // Reset CDC transaction ID after COMMIT record emission (or immediately on rollback)
+                connection.cdc_transaction_id.store(-1, Ordering::SeqCst);
                 *commit_state = CommitState::Ready;
             }
             IOResult::IO(io) => {
@@ -1438,6 +1471,10 @@ impl Program {
             self.connection.auto_commit.store(true, Ordering::SeqCst);
         }
         self.connection.set_tx_state(TransactionState::None);
+        // Reset CDC transaction ID on rollback (no COMMIT record)
+        self.connection
+            .cdc_transaction_id
+            .store(-1, Ordering::SeqCst);
     }
 
     pub fn is_trigger_subprogram(&self) -> bool {

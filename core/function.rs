@@ -386,6 +386,7 @@ pub enum ScalarFunc {
     StatInit,
     StatPush,
     StatGet,
+    ConnTxnId,
 }
 
 impl Deterministic for ScalarFunc {
@@ -453,6 +454,7 @@ impl Deterministic for ScalarFunc {
             ScalarFunc::StatInit => false, // internal ANALYZE function
             ScalarFunc::StatPush => false, // internal ANALYZE function
             ScalarFunc::StatGet => false,  // internal ANALYZE function
+            ScalarFunc::ConnTxnId => false, // depends on connection state
         }
     }
 }
@@ -522,6 +524,7 @@ impl Display for ScalarFunc {
             Self::StatInit => "stat_init",
             Self::StatPush => "stat_push",
             Self::StatGet => "stat_get",
+            Self::ConnTxnId => "conn_txn_id",
         };
         write!(f, "{str}")
     }
@@ -919,6 +922,12 @@ impl Func {
             #[cfg(feature = "json")]
             "json_quote" => Ok(Self::Json(JsonFunc::JsonQuote)),
             "unixepoch" => Ok(Self::Scalar(ScalarFunc::UnixEpoch)),
+            "conn_txn_id" => {
+                if arg_count > 1 {
+                    crate::bail_parse_error!("wrong number of arguments to function {}()", name)
+                }
+                Ok(Self::Scalar(ScalarFunc::ConnTxnId))
+            }
             "julianday" => Ok(Self::Scalar(ScalarFunc::JulianDay)),
             "hex" => Ok(Self::Scalar(ScalarFunc::Hex)),
             "unhex" => Ok(Self::Scalar(ScalarFunc::Unhex)),
