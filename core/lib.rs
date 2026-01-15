@@ -1095,6 +1095,9 @@ impl Database {
     }
 }
 
+// we put version metadata in the named check constraint of the cdc table like that CONSTRAINT VXXX CHECK (1)
+static CAPTURE_DATA_CHANGES_LATEST: &str = CAPTURE_DATA_CHANGES_V1;
+
 // V1 schema:
 // - change_id INTEGER PRIMARY KEY AUTOINCREMENT,
 // - change_time INTEGER,
@@ -1105,7 +1108,6 @@ impl Database {
 // - after BLOB,
 // - updates BLOB
 static CAPTURE_DATA_CHANGES_V1: &str = "V1";
-static CAPTURE_DATA_CHANGES_LATEST: &str = CAPTURE_DATA_CHANGES_V1;
 static CAPTURE_DATA_CHANGES_VERSIONS: &[&str] = &[CAPTURE_DATA_CHANGES_V1];
 
 #[derive(Debug, Clone)]
