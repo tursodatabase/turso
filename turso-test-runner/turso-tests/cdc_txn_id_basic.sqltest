@@ -205,12 +205,12 @@ test prepared-statement-reuse {
     -- Check: autocommit INSERTs should have COMMIT records (change_type=2)
     -- Transaction INSERTs should NOT have individual COMMIT records
     -- Only the explicit COMMIT should have a COMMIT record
-    -- CREATE TABLE (txn_id 1) + COMMIT
-    -- INSERT 1 (txn_id 3) + COMMIT
-    -- INSERT 2 (txn_id 5) no individual COMMIT
-    -- INSERT 3 (txn_id 5) no individual COMMIT
-    -- COMMIT (txn_id 5)
-    -- INSERT 4 (txn_id 7) + COMMIT
+    -- CREATE TABLE (change_id 1, txn_id 1) + COMMIT (change_id 2, txn_id 1)
+    -- INSERT 1 (change_id 3, txn_id 3) + COMMIT (change_id 4, txn_id 3)
+    -- INSERT 2 (change_id 5, txn_id 5) no individual COMMIT
+    -- INSERT 3 (change_id 6, txn_id 5) no individual COMMIT
+    -- COMMIT (change_id 7, txn_id 5)
+    -- INSERT 4 (change_id 8, txn_id 8) + COMMIT (change_id 9, txn_id 8)
     SELECT change_type, table_name, change_txn_id
     FROM turso_cdc
     WHERE table_name != 'sqlite_schema' OR table_name IS NULL
@@ -223,6 +223,6 @@ expect {
     1|t|5
     1|t|5
     2||5
-    1|t|7
-    2||7
+    1|t|8
+    2||8
 }

@@ -14,6 +14,235 @@ fn replace_column_with_null(rows: Vec<Vec<Value>>, column: usize) -> Vec<Vec<Val
         .collect()
 }
 
+/// Helper to create a CDC INSERT record entry (change_type=1) in 'id' mode
+fn insert_entry(change_id: i64, change_txn_id: i64, table_name: &str, id: i64) -> Vec<Value> {
+    vec![
+        Value::Integer(change_id),
+        Value::Null,       // change_time (replaced with null for testing)
+        Value::Integer(1), // change_type = INSERT
+        Value::Integer(change_txn_id),
+        Value::Text(table_name.to_string()),
+        Value::Integer(id),
+        Value::Null,
+        Value::Null,
+        Value::Null,
+    ]
+}
+
+/// Helper to create a CDC INSERT record entry with 'after' blob
+fn insert_entry_after(
+    change_id: i64,
+    change_txn_id: i64,
+    table_name: &str,
+    id: i64,
+    after: Vec<u8>,
+) -> Vec<Value> {
+    vec![
+        Value::Integer(change_id),
+        Value::Null,       // change_time
+        Value::Integer(1), // change_type = INSERT
+        Value::Integer(change_txn_id),
+        Value::Text(table_name.to_string()),
+        Value::Integer(id),
+        Value::Null,
+        Value::Blob(after),
+        Value::Null,
+    ]
+}
+
+/// Helper to create a CDC UPDATE record entry (change_type=0) in 'id' mode
+fn update_entry(change_id: i64, change_txn_id: i64, table_name: &str, id: i64) -> Vec<Value> {
+    vec![
+        Value::Integer(change_id),
+        Value::Null,       // change_time
+        Value::Integer(0), // change_type = UPDATE
+        Value::Integer(change_txn_id),
+        Value::Text(table_name.to_string()),
+        Value::Integer(id),
+        Value::Null,
+        Value::Null,
+        Value::Null,
+    ]
+}
+
+/// Helper to create a CDC UPDATE record entry with 'before' blob
+fn update_entry_before(
+    change_id: i64,
+    change_txn_id: i64,
+    table_name: &str,
+    id: i64,
+    before: Vec<u8>,
+) -> Vec<Value> {
+    vec![
+        Value::Integer(change_id),
+        Value::Null,       // change_time
+        Value::Integer(0), // change_type = UPDATE
+        Value::Integer(change_txn_id),
+        Value::Text(table_name.to_string()),
+        Value::Integer(id),
+        Value::Blob(before),
+        Value::Null,
+        Value::Null,
+    ]
+}
+
+/// Helper to create a CDC UPDATE record entry with 'after' blob
+fn update_entry_after(
+    change_id: i64,
+    change_txn_id: i64,
+    table_name: &str,
+    id: i64,
+    after: Vec<u8>,
+) -> Vec<Value> {
+    vec![
+        Value::Integer(change_id),
+        Value::Null,       // change_time
+        Value::Integer(0), // change_type = UPDATE
+        Value::Integer(change_txn_id),
+        Value::Text(table_name.to_string()),
+        Value::Integer(id),
+        Value::Null,
+        Value::Blob(after),
+        Value::Null,
+    ]
+}
+
+/// Helper to create a CDC UPDATE record entry with 'before', 'after', and 'updates' blobs (full mode)
+fn update_entry_full(
+    change_id: i64,
+    change_txn_id: i64,
+    table_name: &str,
+    id: i64,
+    before: Vec<u8>,
+    after: Vec<u8>,
+    updates: Vec<u8>,
+) -> Vec<Value> {
+    vec![
+        Value::Integer(change_id),
+        Value::Null,       // change_time
+        Value::Integer(0), // change_type = UPDATE
+        Value::Integer(change_txn_id),
+        Value::Text(table_name.to_string()),
+        Value::Integer(id),
+        Value::Blob(before),
+        Value::Blob(after),
+        Value::Blob(updates),
+    ]
+}
+
+/// Helper to create a CDC DELETE record entry (change_type=-1) in 'id' mode
+fn delete_entry(change_id: i64, change_txn_id: i64, table_name: &str, id: i64) -> Vec<Value> {
+    vec![
+        Value::Integer(change_id),
+        Value::Null,        // change_time
+        Value::Integer(-1), // change_type = DELETE
+        Value::Integer(change_txn_id),
+        Value::Text(table_name.to_string()),
+        Value::Integer(id),
+        Value::Null,
+        Value::Null,
+        Value::Null,
+    ]
+}
+
+/// Helper to create a CDC DELETE record entry with 'before' blob
+fn delete_entry_before(
+    change_id: i64,
+    change_txn_id: i64,
+    table_name: &str,
+    id: i64,
+    before: Vec<u8>,
+) -> Vec<Value> {
+    vec![
+        Value::Integer(change_id),
+        Value::Null,        // change_time
+        Value::Integer(-1), // change_type = DELETE
+        Value::Integer(change_txn_id),
+        Value::Text(table_name.to_string()),
+        Value::Integer(id),
+        Value::Blob(before),
+        Value::Null,
+        Value::Null,
+    ]
+}
+
+/// Helper to create a CDC COMMIT record entry (change_type=2)
+fn commit_entry(change_id: i64, change_txn_id: i64) -> Vec<Value> {
+    vec![
+        Value::Integer(change_id),
+        Value::Null,       // change_time
+        Value::Integer(2), // change_type = COMMIT
+        Value::Integer(change_txn_id),
+        Value::Null, // table_name
+        Value::Null, // id
+        Value::Null, // before
+        Value::Null, // after
+        Value::Null, // updates
+    ]
+}
+
+/// Helper to create a CDC schema INSERT entry (for CREATE TABLE/INDEX)
+fn schema_insert_entry(
+    change_id: i64,
+    change_txn_id: i64,
+    rowid: i64,
+    after: Vec<u8>,
+) -> Vec<Value> {
+    vec![
+        Value::Integer(change_id),
+        Value::Null,       // change_time
+        Value::Integer(1), // change_type = INSERT
+        Value::Integer(change_txn_id),
+        Value::Text("sqlite_schema".to_string()),
+        Value::Integer(rowid),
+        Value::Null,
+        Value::Blob(after),
+        Value::Null,
+    ]
+}
+
+/// Helper to create a CDC schema DELETE entry (for DROP TABLE/INDEX)
+fn schema_delete_entry(
+    change_id: i64,
+    change_txn_id: i64,
+    rowid: i64,
+    before: Vec<u8>,
+) -> Vec<Value> {
+    vec![
+        Value::Integer(change_id),
+        Value::Null,        // change_time
+        Value::Integer(-1), // change_type = DELETE
+        Value::Integer(change_txn_id),
+        Value::Text("sqlite_schema".to_string()),
+        Value::Integer(rowid),
+        Value::Blob(before),
+        Value::Null,
+        Value::Null,
+    ]
+}
+
+/// Helper to create a CDC schema UPDATE entry (for ALTER TABLE)
+fn schema_update_entry(
+    change_id: i64,
+    change_txn_id: i64,
+    rowid: i64,
+    before: Vec<u8>,
+    after: Vec<u8>,
+    updates: Vec<u8>,
+) -> Vec<Value> {
+    vec![
+        Value::Integer(change_id),
+        Value::Null,       // change_time
+        Value::Integer(0), // change_type = UPDATE
+        Value::Integer(change_txn_id),
+        Value::Text("sqlite_schema".to_string()),
+        Value::Integer(rowid),
+        Value::Blob(before),
+        Value::Blob(after),
+        Value::Blob(updates),
+    ]
+}
+
 #[turso_macros::test(mvcc)]
 fn test_cdc_simple_id(db: TempDatabase) {
     let conn = db.connect_limbo();
@@ -35,26 +264,9 @@ fn test_cdc_simple_id(db: TempDatabase) {
     assert_eq!(
         rows,
         vec![
-            vec![
-                Value::Integer(1),
-                Value::Null,
-                Value::Integer(1),
-                Value::Text("t".to_string()),
-                Value::Integer(10),
-                Value::Null,
-                Value::Null,
-                Value::Null,
-            ],
-            vec![
-                Value::Integer(2),
-                Value::Null,
-                Value::Integer(1),
-                Value::Text("t".to_string()),
-                Value::Integer(5),
-                Value::Null,
-                Value::Null,
-                Value::Null,
-            ]
+            insert_entry(1, 1, "t", 10),
+            insert_entry(2, 1, "t", 5),
+            commit_entry(3, 1),
         ]
     );
 }
@@ -91,56 +303,19 @@ fn test_cdc_simple_before(db: TempDatabase) {
     assert_eq!(
         rows,
         vec![
-            vec![
-                Value::Integer(1),
-                Value::Null,
-                Value::Integer(1),
-                Value::Text("t".to_string()),
-                Value::Integer(1),
-                Value::Null,
-                Value::Null,
-                Value::Null,
-            ],
-            vec![
-                Value::Integer(2),
-                Value::Null,
-                Value::Integer(1),
-                Value::Text("t".to_string()),
-                Value::Integer(3),
-                Value::Null,
-                Value::Null,
-                Value::Null,
-            ],
-            vec![
-                Value::Integer(3),
-                Value::Null,
-                Value::Integer(0),
-                Value::Text("t".to_string()),
-                Value::Integer(1),
-                Value::Blob(record([Value::Integer(1), Value::Integer(2)])),
-                Value::Null,
-                Value::Null,
-            ],
-            vec![
-                Value::Integer(4),
-                Value::Null,
-                Value::Integer(-1),
-                Value::Text("t".to_string()),
-                Value::Integer(3),
-                Value::Blob(record([Value::Integer(3), Value::Integer(4)])),
-                Value::Null,
-                Value::Null,
-            ],
-            vec![
-                Value::Integer(5),
-                Value::Null,
-                Value::Integer(-1),
-                Value::Text("t".to_string()),
-                Value::Integer(1),
-                Value::Blob(record([Value::Integer(1), Value::Integer(3)])),
-                Value::Null,
-                Value::Null,
-            ]
+            // INSERT INTO t VALUES (1, 2), (3, 4) - autocommit transaction with txn_id=1
+            insert_entry(1, 1, "t", 1),
+            insert_entry(2, 1, "t", 3),
+            commit_entry(3, 1),
+            // UPDATE t SET y = 3 WHERE x = 1 - autocommit transaction with txn_id=4
+            update_entry_before(4, 4, "t", 1, record([Value::Integer(1), Value::Integer(2)])),
+            commit_entry(5, 4),
+            // DELETE FROM t WHERE x = 3 - autocommit transaction with txn_id=6
+            delete_entry_before(6, 6, "t", 3, record([Value::Integer(3), Value::Integer(4)])),
+            commit_entry(7, 6),
+            // DELETE FROM t WHERE x = 1 - autocommit transaction with txn_id=8
+            delete_entry_before(8, 8, "t", 1, record([Value::Integer(1), Value::Integer(3)])),
+            commit_entry(9, 8),
         ]
     );
 }
@@ -161,56 +336,15 @@ fn test_cdc_simple_after(db: TempDatabase) {
     assert_eq!(
         rows,
         vec![
-            vec![
-                Value::Integer(1),
-                Value::Null,
-                Value::Integer(1),
-                Value::Text("t".to_string()),
-                Value::Integer(1),
-                Value::Null,
-                Value::Blob(record([Value::Integer(1), Value::Integer(2)])),
-                Value::Null,
-            ],
-            vec![
-                Value::Integer(2),
-                Value::Null,
-                Value::Integer(1),
-                Value::Text("t".to_string()),
-                Value::Integer(3),
-                Value::Null,
-                Value::Blob(record([Value::Integer(3), Value::Integer(4)])),
-                Value::Null,
-            ],
-            vec![
-                Value::Integer(3),
-                Value::Null,
-                Value::Integer(0),
-                Value::Text("t".to_string()),
-                Value::Integer(1),
-                Value::Null,
-                Value::Blob(record([Value::Integer(1), Value::Integer(3)])),
-                Value::Null,
-            ],
-            vec![
-                Value::Integer(4),
-                Value::Null,
-                Value::Integer(-1),
-                Value::Text("t".to_string()),
-                Value::Integer(3),
-                Value::Null,
-                Value::Null,
-                Value::Null,
-            ],
-            vec![
-                Value::Integer(5),
-                Value::Null,
-                Value::Integer(-1),
-                Value::Text("t".to_string()),
-                Value::Integer(1),
-                Value::Null,
-                Value::Null,
-                Value::Null,
-            ]
+            insert_entry_after(1, 1, "t", 1, record([Value::Integer(1), Value::Integer(2)])),
+            insert_entry_after(2, 1, "t", 3, record([Value::Integer(3), Value::Integer(4)])),
+            commit_entry(3, 1),
+            update_entry_after(4, 4, "t", 1, record([Value::Integer(1), Value::Integer(3)])),
+            commit_entry(5, 4),
+            delete_entry(6, 6, "t", 3),
+            commit_entry(7, 6),
+            delete_entry(8, 8, "t", 1),
+            commit_entry(9, 8),
         ]
     );
 }
@@ -231,61 +365,28 @@ fn test_cdc_simple_full(db: TempDatabase) {
     assert_eq!(
         rows,
         vec![
-            vec![
-                Value::Integer(1),
-                Value::Null,
-                Value::Integer(1),
-                Value::Text("t".to_string()),
-                Value::Integer(1),
-                Value::Null,
-                Value::Blob(record([Value::Integer(1), Value::Integer(2)])),
-                Value::Null,
-            ],
-            vec![
-                Value::Integer(2),
-                Value::Null,
-                Value::Integer(1),
-                Value::Text("t".to_string()),
-                Value::Integer(3),
-                Value::Null,
-                Value::Blob(record([Value::Integer(3), Value::Integer(4)])),
-                Value::Null,
-            ],
-            vec![
-                Value::Integer(3),
-                Value::Null,
-                Value::Integer(0),
-                Value::Text("t".to_string()),
-                Value::Integer(1),
-                Value::Blob(record([Value::Integer(1), Value::Integer(2)])),
-                Value::Blob(record([Value::Integer(1), Value::Integer(3)])),
-                Value::Blob(record([
+            insert_entry_after(1, 1, "t", 1, record([Value::Integer(1), Value::Integer(2)])),
+            insert_entry_after(2, 1, "t", 3, record([Value::Integer(3), Value::Integer(4)])),
+            commit_entry(3, 1),
+            update_entry_full(
+                4,
+                4,
+                "t",
+                1,
+                record([Value::Integer(1), Value::Integer(2)]),
+                record([Value::Integer(1), Value::Integer(3)]),
+                record([
                     Value::Integer(0),
                     Value::Integer(1),
                     Value::Null,
                     Value::Integer(3)
-                ])),
-            ],
-            vec![
-                Value::Integer(4),
-                Value::Null,
-                Value::Integer(-1),
-                Value::Text("t".to_string()),
-                Value::Integer(3),
-                Value::Blob(record([Value::Integer(3), Value::Integer(4)])),
-                Value::Null,
-                Value::Null,
-            ],
-            vec![
-                Value::Integer(5),
-                Value::Null,
-                Value::Integer(-1),
-                Value::Text("t".to_string()),
-                Value::Integer(1),
-                Value::Blob(record([Value::Integer(1), Value::Integer(3)])),
-                Value::Null,
-                Value::Null,
-            ]
+                ]),
+            ),
+            commit_entry(5, 4),
+            delete_entry_before(6, 6, "t", 3, record([Value::Integer(3), Value::Integer(4)])),
+            commit_entry(7, 6),
+            delete_entry_before(8, 8, "t", 1, record([Value::Integer(1), Value::Integer(3)])),
+            commit_entry(9, 8),
         ]
     );
 }
@@ -316,96 +417,20 @@ fn test_cdc_crud(db: TempDatabase) {
     assert_eq!(
         rows,
         vec![
-            vec![
-                Value::Integer(1),
-                Value::Null,
-                Value::Integer(1),
-                Value::Text("t".to_string()),
-                Value::Integer(20),
-                Value::Null,
-                Value::Null,
-                Value::Null,
-            ],
-            vec![
-                Value::Integer(2),
-                Value::Null,
-                Value::Integer(1),
-                Value::Text("t".to_string()),
-                Value::Integer(10),
-                Value::Null,
-                Value::Null,
-                Value::Null,
-            ],
-            vec![
-                Value::Integer(3),
-                Value::Null,
-                Value::Integer(1),
-                Value::Text("t".to_string()),
-                Value::Integer(5),
-                Value::Null,
-                Value::Null,
-                Value::Null,
-            ],
-            vec![
-                Value::Integer(4),
-                Value::Null,
-                Value::Integer(0),
-                Value::Text("t".to_string()),
-                Value::Integer(5),
-                Value::Null,
-                Value::Null,
-                Value::Null,
-            ],
-            vec![
-                Value::Integer(5),
-                Value::Null,
-                Value::Integer(-1),
-                Value::Text("t".to_string()),
-                Value::Integer(10),
-                Value::Null,
-                Value::Null,
-                Value::Null,
-            ],
-            vec![
-                Value::Integer(6),
-                Value::Null,
-                Value::Integer(-1),
-                Value::Text("t".to_string()),
-                Value::Integer(20),
-                Value::Null,
-                Value::Null,
-                Value::Null,
-            ],
-            vec![
-                Value::Integer(7),
-                Value::Null,
-                Value::Integer(1),
-                Value::Text("t".to_string()),
-                Value::Integer(1),
-                Value::Null,
-                Value::Null,
-                Value::Null,
-            ],
-            vec![
-                Value::Integer(8),
-                Value::Null,
-                Value::Integer(-1),
-                Value::Text("t".to_string()),
-                Value::Integer(1),
-                Value::Null,
-                Value::Null,
-                Value::Null,
-            ],
-            vec![
-                Value::Integer(9),
-                Value::Null,
-                Value::Integer(1),
-                Value::Text("t".to_string()),
-                Value::Integer(2),
-                Value::Null,
-                Value::Null,
-                Value::Null,
-            ],
+            insert_entry(1, 1, "t", 20),
+            insert_entry(2, 1, "t", 10),
+            insert_entry(3, 1, "t", 5),
+            commit_entry(4, 1),
+            update_entry(5, 5, "t", 5),
+            commit_entry(6, 5),
+            delete_entry(7, 7, "t", 10),
+            delete_entry(8, 7, "t", 20),
+            commit_entry(9, 7),
+            insert_entry(10, 10, "t", 1),
+            commit_entry(11, 10),
+            delete_entry(12, 12, "t", 1),
+            insert_entry(13, 12, "t", 2),
+            commit_entry(14, 12),
         ]
     );
 }
@@ -440,46 +465,12 @@ fn test_cdc_failed_op(db: TempDatabase) {
     assert_eq!(
         rows,
         vec![
-            vec![
-                Value::Integer(1),
-                Value::Null,
-                Value::Integer(1),
-                Value::Text("t".to_string()),
-                Value::Integer(1),
-                Value::Null,
-                Value::Null,
-                Value::Null,
-            ],
-            vec![
-                Value::Integer(2),
-                Value::Null,
-                Value::Integer(1),
-                Value::Text("t".to_string()),
-                Value::Integer(2),
-                Value::Null,
-                Value::Null,
-                Value::Null,
-            ],
-            vec![
-                Value::Integer(3),
-                Value::Null,
-                Value::Integer(1),
-                Value::Text("t".to_string()),
-                Value::Integer(6),
-                Value::Null,
-                Value::Null,
-                Value::Null,
-            ],
-            vec![
-                Value::Integer(4),
-                Value::Null,
-                Value::Integer(1),
-                Value::Text("t".to_string()),
-                Value::Integer(7),
-                Value::Null,
-                Value::Null,
-                Value::Null,
-            ],
+            insert_entry(1, 1, "t", 1),
+            insert_entry(2, 1, "t", 2),
+            commit_entry(3, 1),
+            insert_entry(4, 4, "t", 6),
+            insert_entry(5, 4, "t", 7),
+            commit_entry(6, 4),
         ]
     );
 }
@@ -530,36 +521,12 @@ fn test_cdc_uncaptured_connection(db: TempDatabase) {
     assert_eq!(
         rows,
         vec![
-            vec![
-                Value::Integer(1),
-                Value::Null,
-                Value::Integer(1),
-                Value::Text("t".to_string()),
-                Value::Integer(2),
-                Value::Null,
-                Value::Null,
-                Value::Null,
-            ],
-            vec![
-                Value::Integer(2),
-                Value::Null,
-                Value::Integer(1),
-                Value::Text("t".to_string()),
-                Value::Integer(4),
-                Value::Null,
-                Value::Null,
-                Value::Null,
-            ],
-            vec![
-                Value::Integer(3),
-                Value::Null,
-                Value::Integer(1),
-                Value::Text("t".to_string()),
-                Value::Integer(6),
-                Value::Null,
-                Value::Null,
-                Value::Null,
-            ],
+            insert_entry(1, 1, "t", 2),
+            commit_entry(2, 1),
+            insert_entry(3, 3, "t", 4),
+            commit_entry(4, 3),
+            insert_entry(5, 5, "t", 6),
+            commit_entry(6, 5),
         ]
     );
 }
@@ -588,26 +555,10 @@ fn test_cdc_custom_table(db: TempDatabase) {
     assert_eq!(
         rows,
         vec![
-            vec![
-                Value::Integer(1),
-                Value::Null,
-                Value::Integer(1),
-                Value::Text("t".to_string()),
-                Value::Integer(1),
-                Value::Null,
-                Value::Null,
-                Value::Null,
-            ],
-            vec![
-                Value::Integer(2),
-                Value::Null,
-                Value::Integer(1),
-                Value::Text("t".to_string()),
-                Value::Integer(2),
-                Value::Null,
-                Value::Null,
-                Value::Null,
-            ],
+            insert_entry(1, 1, "t", 1),
+            commit_entry(2, 1),
+            insert_entry(3, 3, "t", 2),
+            commit_entry(4, 3),
         ]
     );
 }
@@ -638,16 +589,13 @@ fn test_cdc_ignore_changes_in_cdc_table(db: TempDatabase) {
     let rows = replace_column_with_null(limbo_exec_rows(&conn1, "SELECT * FROM custom_cdc"), 1);
     assert_eq!(
         rows,
-        vec![vec![
-            Value::Integer(2),
-            Value::Null,
-            Value::Integer(1),
-            Value::Text("t".to_string()),
-            Value::Integer(2),
-            Value::Null,
-            Value::Null,
-            Value::Null,
-        ],]
+        vec![
+            commit_entry(2, 1),
+            insert_entry(3, 3, "t", 2),
+            commit_entry(4, 3),
+            // DELETE FROM custom_cdc itself generates a COMMIT record with uninitialized txn_id
+            commit_entry(5, -1),
+        ]
     );
 }
 
@@ -679,56 +627,12 @@ fn test_cdc_transaction(db: TempDatabase) {
     assert_eq!(
         rows,
         vec![
-            vec![
-                Value::Integer(1),
-                Value::Null,
-                Value::Integer(1),
-                Value::Text("t".to_string()),
-                Value::Integer(1),
-                Value::Null,
-                Value::Null,
-                Value::Null,
-            ],
-            vec![
-                Value::Integer(2),
-                Value::Null,
-                Value::Integer(1),
-                Value::Text("q".to_string()),
-                Value::Integer(2),
-                Value::Null,
-                Value::Null,
-                Value::Null,
-            ],
-            vec![
-                Value::Integer(3),
-                Value::Null,
-                Value::Integer(1),
-                Value::Text("t".to_string()),
-                Value::Integer(3),
-                Value::Null,
-                Value::Null,
-                Value::Null,
-            ],
-            vec![
-                Value::Integer(4),
-                Value::Null,
-                Value::Integer(-1),
-                Value::Text("t".to_string()),
-                Value::Integer(1),
-                Value::Null,
-                Value::Null,
-                Value::Null,
-            ],
-            vec![
-                Value::Integer(5),
-                Value::Null,
-                Value::Integer(0),
-                Value::Text("q".to_string()),
-                Value::Integer(2),
-                Value::Null,
-                Value::Null,
-                Value::Null,
-            ],
+            insert_entry(1, 1, "t", 1),
+            insert_entry(2, 1, "q", 2),
+            insert_entry(3, 1, "t", 3),
+            delete_entry(4, 1, "t", 1),
+            update_entry(5, 1, "q", 2),
+            commit_entry(6, 1),
         ]
     );
 }
@@ -758,33 +662,9 @@ fn test_cdc_independent_connections(db: TempDatabase) {
         ]
     );
     let rows = replace_column_with_null(limbo_exec_rows(&conn1, "SELECT * FROM custom_cdc1"), 1);
-    assert_eq!(
-        rows,
-        vec![vec![
-            Value::Integer(1),
-            Value::Null,
-            Value::Integer(1),
-            Value::Text("t".to_string()),
-            Value::Integer(1),
-            Value::Null,
-            Value::Null,
-            Value::Null,
-        ]]
-    );
+    assert_eq!(rows, vec![insert_entry(1, 1, "t", 1), commit_entry(2, 1),]);
     let rows = replace_column_with_null(limbo_exec_rows(&conn1, "SELECT * FROM custom_cdc2"), 1);
-    assert_eq!(
-        rows,
-        vec![vec![
-            Value::Integer(1),
-            Value::Null,
-            Value::Integer(1),
-            Value::Text("t".to_string()),
-            Value::Integer(2),
-            Value::Null,
-            Value::Null,
-            Value::Null,
-        ]]
-    );
+    assert_eq!(rows, vec![insert_entry(1, 1, "t", 2), commit_entry(2, 1),]);
 }
 
 // TODO: cannot use mvcc because of indexes
@@ -825,52 +705,22 @@ fn test_cdc_independent_connections_different_cdc_not_ignore(db: TempDatabase) {
     assert_eq!(
         rows,
         vec![
-            vec![
-                Value::Integer(2),
-                Value::Null,
-                Value::Integer(1),
-                Value::Text("t".to_string()),
-                Value::Integer(2),
-                Value::Null,
-                Value::Null,
-                Value::Null,
-            ],
-            vec![
-                Value::Integer(3),
-                Value::Null,
-                Value::Integer(-1),
-                Value::Text("custom_cdc2".to_string()),
-                Value::Integer(1),
-                Value::Null,
-                Value::Null,
-                Value::Null,
-            ]
+            commit_entry(2, 1),
+            insert_entry(3, 3, "t", 2),
+            commit_entry(4, 3),
+            delete_entry(5, 5, "custom_cdc2", 1),
+            commit_entry(6, 5),
         ]
     );
     let rows = replace_column_with_null(limbo_exec_rows(&conn2, "SELECT * FROM custom_cdc2"), 1);
     assert_eq!(
         rows,
         vec![
-            vec![
-                Value::Integer(2),
-                Value::Null,
-                Value::Integer(1),
-                Value::Text("t".to_string()),
-                Value::Integer(4),
-                Value::Null,
-                Value::Null,
-                Value::Null,
-            ],
-            vec![
-                Value::Integer(3),
-                Value::Null,
-                Value::Integer(-1),
-                Value::Text("custom_cdc1".to_string()),
-                Value::Integer(1),
-                Value::Null,
-                Value::Null,
-                Value::Null,
-            ]
+            commit_entry(2, 1),
+            insert_entry(3, 3, "t", 4),
+            commit_entry(4, 3),
+            delete_entry(5, 5, "custom_cdc1", 1),
+            commit_entry(6, 5),
         ]
     );
 }
@@ -936,14 +786,12 @@ fn test_cdc_schema_changes(db: TempDatabase) {
     assert_eq!(
         rows,
         vec![
-            vec![
-                Value::Integer(1),
-                Value::Null,
-                Value::Integer(1),
-                Value::Text("sqlite_schema".to_string()),
-                Value::Integer(3),
-                Value::Null,
-                Value::Blob(record([
+            // CREATE TABLE t
+            schema_insert_entry(
+                1,
+                1,
+                3,
+                record([
                     Value::Text("table".to_string()),
                     Value::Text("t".to_string()),
                     Value::Text("t".to_string()),
@@ -951,64 +799,57 @@ fn test_cdc_schema_changes(db: TempDatabase) {
                     Value::Text(
                         "CREATE TABLE t (x, y, z UNIQUE, q, PRIMARY KEY (x, y))".to_string()
                     )
-                ])),
-                Value::Null,
-            ],
-            vec![
-                Value::Integer(2),
-                Value::Null,
-                Value::Integer(1),
-                Value::Text("sqlite_schema".to_string()),
-                Value::Integer(6),
-                Value::Null,
-                Value::Blob(record([
+                ])
+            ),
+            commit_entry(2, 1),
+            // CREATE TABLE q
+            schema_insert_entry(
+                3,
+                3,
+                6,
+                record([
                     Value::Text("table".to_string()),
                     Value::Text("q".to_string()),
                     Value::Text("q".to_string()),
                     Value::Integer(7),
                     Value::Text("CREATE TABLE q (a, b, c)".to_string())
-                ])),
-                Value::Null,
-            ],
-            vec![
-                Value::Integer(3),
-                Value::Null,
-                Value::Integer(1),
-                Value::Text("sqlite_schema".to_string()),
-                Value::Integer(7),
-                Value::Null,
-                Value::Blob(record([
+                ])
+            ),
+            commit_entry(4, 3),
+            // CREATE INDEX t_q
+            schema_insert_entry(
+                5,
+                5,
+                7,
+                record([
                     Value::Text("index".to_string()),
                     Value::Text("t_q".to_string()),
                     Value::Text("t".to_string()),
                     Value::Integer(8),
                     Value::Text("CREATE INDEX t_q ON t (q)".to_string())
-                ])),
-                Value::Null,
-            ],
-            vec![
-                Value::Integer(4),
-                Value::Null,
-                Value::Integer(1),
-                Value::Text("sqlite_schema".to_string()),
-                Value::Integer(8),
-                Value::Null,
-                Value::Blob(record([
+                ])
+            ),
+            commit_entry(6, 5),
+            // CREATE INDEX q_abc
+            schema_insert_entry(
+                7,
+                7,
+                8,
+                record([
                     Value::Text("index".to_string()),
                     Value::Text("q_abc".to_string()),
                     Value::Text("q".to_string()),
                     Value::Integer(9),
                     Value::Text("CREATE INDEX q_abc ON q (a, b, c)".to_string())
-                ])),
-                Value::Null,
-            ],
-            vec![
-                Value::Integer(5),
-                Value::Null,
-                Value::Integer(-1),
-                Value::Text("sqlite_schema".to_string()),
-                Value::Integer(3),
-                Value::Blob(record([
+                ])
+            ),
+            commit_entry(8, 7),
+            // DROP TABLE t
+            schema_delete_entry(
+                9,
+                9,
+                3,
+                record([
                     Value::Text("table".to_string()),
                     Value::Text("t".to_string()),
                     Value::Text("t".to_string()),
@@ -1016,26 +857,23 @@ fn test_cdc_schema_changes(db: TempDatabase) {
                     Value::Text(
                         "CREATE TABLE t (x, y, z UNIQUE, q, PRIMARY KEY (x, y))".to_string()
                     )
-                ])),
-                Value::Null,
-                Value::Null,
-            ],
-            vec![
-                Value::Integer(6),
-                Value::Null,
-                Value::Integer(-1),
-                Value::Text("sqlite_schema".to_string()),
-                Value::Integer(8),
-                Value::Blob(record([
+                ])
+            ),
+            commit_entry(10, 9),
+            // DROP INDEX q_abc
+            schema_delete_entry(
+                11,
+                11,
+                8,
+                record([
                     Value::Text("index".to_string()),
                     Value::Text("q_abc".to_string()),
                     Value::Text("q".to_string()),
                     Value::Integer(9),
                     Value::Text("CREATE INDEX q_abc ON q (a, b, c)".to_string())
-                ])),
-                Value::Null,
-                Value::Null,
-            ]
+                ])
+            ),
+            commit_entry(12, 11),
         ]
     );
 }
@@ -1055,14 +893,12 @@ fn test_cdc_schema_changes_alter_table(db: TempDatabase) {
     assert_eq!(
         rows,
         vec![
-            vec![
-                Value::Integer(1),
-                Value::Null,
-                Value::Integer(1),
-                Value::Text("sqlite_schema".to_string()),
-                Value::Integer(3),
-                Value::Null,
-                Value::Blob(record([
+            // CREATE TABLE t
+            schema_insert_entry(
+                1,
+                1,
+                3,
+                record([
                     Value::Text("table".to_string()),
                     Value::Text("t".to_string()),
                     Value::Text("t".to_string()),
@@ -1070,16 +906,15 @@ fn test_cdc_schema_changes_alter_table(db: TempDatabase) {
                     Value::Text(
                         "CREATE TABLE t (x, y, z UNIQUE, q, PRIMARY KEY (x, y))".to_string()
                     )
-                ])),
-                Value::Null,
-            ],
-            vec![
-                Value::Integer(2),
-                Value::Null,
-                Value::Integer(0),
-                Value::Text("sqlite_schema".to_string()),
-                Value::Integer(3),
-                Value::Blob(record([
+                ])
+            ),
+            commit_entry(2, 1),
+            // ALTER TABLE t DROP COLUMN q
+            schema_update_entry(
+                3,
+                3,
+                3,
+                record([
                     Value::Text("table".to_string()),
                     Value::Text("t".to_string()),
                     Value::Text("t".to_string()),
@@ -1087,15 +922,15 @@ fn test_cdc_schema_changes_alter_table(db: TempDatabase) {
                     Value::Text(
                         "CREATE TABLE t (x, y, z UNIQUE, q, PRIMARY KEY (x, y))".to_string()
                     )
-                ])),
-                Value::Blob(record([
+                ]),
+                record([
                     Value::Text("table".to_string()),
                     Value::Text("t".to_string()),
                     Value::Text("t".to_string()),
                     Value::Integer(4),
                     Value::Text("CREATE TABLE t (x, y, z UNIQUE, PRIMARY KEY (x, y))".to_string())
-                ])),
-                Value::Blob(record([
+                ]),
+                record([
                     Value::Integer(0),
                     Value::Integer(0),
                     Value::Integer(0),
@@ -1106,22 +941,22 @@ fn test_cdc_schema_changes_alter_table(db: TempDatabase) {
                     Value::Null,
                     Value::Null,
                     Value::Text("ALTER TABLE t DROP COLUMN q".to_string())
-                ])),
-            ],
-            vec![
-                Value::Integer(3),
-                Value::Null,
-                Value::Integer(0),
-                Value::Text("sqlite_schema".to_string()),
-                Value::Integer(3),
-                Value::Blob(record([
+                ]),
+            ),
+            commit_entry(4, 3),
+            // ALTER TABLE t ADD COLUMN t
+            schema_update_entry(
+                5,
+                5,
+                3,
+                record([
                     Value::Text("table".to_string()),
                     Value::Text("t".to_string()),
                     Value::Text("t".to_string()),
                     Value::Integer(4),
                     Value::Text("CREATE TABLE t (x, y, z UNIQUE, PRIMARY KEY (x, y))".to_string())
-                ])),
-                Value::Blob(record([
+                ]),
+                record([
                     Value::Text("table".to_string()),
                     Value::Text("t".to_string()),
                     Value::Text("t".to_string()),
@@ -1129,8 +964,8 @@ fn test_cdc_schema_changes_alter_table(db: TempDatabase) {
                     Value::Text(
                         "CREATE TABLE t (x, y, z UNIQUE, t, PRIMARY KEY (x, y))".to_string()
                     )
-                ])),
-                Value::Blob(record([
+                ]),
+                record([
                     Value::Integer(0),
                     Value::Integer(0),
                     Value::Integer(0),
@@ -1141,8 +976,9 @@ fn test_cdc_schema_changes_alter_table(db: TempDatabase) {
                     Value::Null,
                     Value::Null,
                     Value::Text("ALTER TABLE t ADD COLUMN t".to_string())
-                ])),
-            ],
+                ]),
+            ),
+            commit_entry(6, 5),
         ]
     );
 }

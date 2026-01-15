@@ -107,7 +107,6 @@ pub fn translate(
         stmt => translate_inner(stmt, &mut resolver, program, &connection, input)?,
     };
 
-
     program.epilogue(schema);
 
     program.build(connection, change_cnt_on, input)
@@ -388,7 +387,9 @@ pub fn translate_inner(
             });
 
             // Emit CDC COMMIT record
-            if let Some(cdc_prepared) = emitter::prepare_cdc_if_necessary(&mut program, resolver.schema, "")? {
+            if let Some(cdc_prepared) =
+                emitter::prepare_cdc_if_necessary(&mut program, resolver.schema, "")?
+            {
                 let (cdc_cursor_id, _) = cdc_prepared;
                 emitter::emit_cdc_commit_record(&mut program, resolver, cdc_cursor_id)?;
             } else if let Some(turso_cdc_table) = resolver.schema.get_table(&cdc_table_name) {
