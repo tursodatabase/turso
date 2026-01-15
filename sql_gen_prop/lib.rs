@@ -83,16 +83,8 @@ pub mod strategies {
     };
     // Conditions and SELECT helpers
     pub use crate::select::{
-        comparison_op,
-        comparison_subquery_condition,
-        condition_for_table,
-        exists_condition,
-        expression_condition,
-        in_subquery_condition,
-        optional_where_clause,
-        order_by_for_table,
+        comparison_op, condition_for_table, optional_where_clause, order_by_for_table,
         order_direction,
-        subquery_select_for_table,
     };
     // CREATE INDEX
     pub use crate::create_index::{create_index, create_index_for_table, index_column};

@@ -182,6 +182,24 @@ impl BinaryOperator {
             DataType::Blob | DataType::Null => vec![],
         }
     }
+
+    /// Returns true if this is a comparison operator.
+    pub fn is_comparison(&self) -> bool {
+        matches!(
+            self,
+            BinaryOperator::Eq
+                | BinaryOperator::Ne
+                | BinaryOperator::Lt
+                | BinaryOperator::Le
+                | BinaryOperator::Gt
+                | BinaryOperator::Ge
+        )
+    }
+
+    /// Returns true if this is a logical operator (AND/OR).
+    pub fn is_logical(&self) -> bool {
+        matches!(self, BinaryOperator::And | BinaryOperator::Or)
+    }
 }
 
 /// Unary operators for expressions.
@@ -404,6 +422,30 @@ impl Expression {
     pub fn or(left: Expression, right: Expression) -> Self {
         Expression::binary(left, BinaryOperator::Or, right)
     }
+
+    /// Returns true if this expression is a valid WHERE clause condition.
+    ///
+    /// Valid conditions are:
+    /// - Comparisons (col = value, col > value, etc.)
+    /// - IS NULL / IS NOT NULL
+    /// - EXISTS / NOT EXISTS
+    /// - IN / NOT IN subqueries
+    /// - ANY / ALL comparison subqueries
+    /// - AND / OR combinations of the above
+    pub fn is_condition(&self) -> bool {
+        match self {
+            Expression::BinaryOp { op, .. } => op.is_comparison() || op.is_logical(),
+            Expression::IsNull { .. }
+            | Expression::IsNotNull { .. }
+            | Expression::Exists { .. }
+            | Expression::NotExists { .. }
+            | Expression::InSubquery { .. }
+            | Expression::NotInSubquery { .. }
+            | Expression::AnySubquery { .. }
+            | Expression::AllSubquery { .. } => true,
+            _ => false,
+        }
+    }
 }
 
 /// Profile for controlling expression generation weights.
@@ -504,6 +546,11 @@ impl Default for ExpressionProfile {
     }
 }
 
+/// Returns `value` if greater than 0, otherwise returns `default`.
+fn weight_or(value: u32, default: u32) -> u32 {
+    if value > 0 { value } else { default }
+}
+
 impl ExpressionProfile {
     /// Create a profile with all expression kinds equally weighted.
     pub fn uniform() -> Self {
@@ -591,6 +638,49 @@ impl ExpressionProfile {
             condition_expression_max_depth: 2,
             simple_condition_weight: 60,
             ..Self::default()
+        }
+    }
+
+    /// Create a derived profile for WHERE clause conditions.
+    ///
+    /// This adjusts weights to enable only condition-like expressions:
+    /// - IS NULL / IS NOT NULL
+    /// - EXISTS / NOT EXISTS
+    /// - IN / NOT IN subqueries
+    /// - ANY / ALL comparison subqueries
+    ///
+    /// Settings like `function_profile`, `order_by_allow_integer_positions`,
+    /// and `subquery_limit_max` are inherited from `self`.
+    pub fn for_where_clause(self) -> Self {
+        Self {
+            // Disable non-condition expressions
+            value_weight: 0,
+            column_weight: 0,
+            function_call_weight: 0,
+            unary_op_weight: 0,
+            case_weight: 0,
+            cast_weight: 0,
+            parenthesized_weight: 0,
+            subquery_weight: 0,
+            // Enable comparison via BinaryOp (used with filtering)
+            binary_op_weight: 50,
+            // Enable condition expressions - use self's weights if set, otherwise defaults
+            is_null_weight: weight_or(self.is_null_weight, 10),
+            is_not_null_weight: weight_or(self.is_not_null_weight, 10),
+            exists_weight: weight_or(self.exists_weight, 5),
+            not_exists_weight: weight_or(self.not_exists_weight, 3),
+            in_subquery_weight: weight_or(self.in_subquery_weight, 8),
+            not_in_subquery_weight: weight_or(self.not_in_subquery_weight, 4),
+            any_subquery_weight: weight_or(self.any_subquery_weight, 3),
+            all_subquery_weight: weight_or(self.all_subquery_weight, 3),
+            // Inherit settings from self
+            condition_max_depth: self.condition_max_depth,
+            max_order_by_items: self.max_order_by_items,
+            condition_expression_max_depth: self.condition_expression_max_depth,
+            simple_condition_weight: self.simple_condition_weight,
+            order_by_allow_integer_positions: self.order_by_allow_integer_positions,
+            subquery_limit_max: self.subquery_limit_max,
+            function_profile: self.function_profile,
         }
     }
 
