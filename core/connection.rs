@@ -944,9 +944,10 @@ impl Connection {
                 version: CAPTURE_DATA_CHANGES_LATEST,
             });
         };
-        for column in cdc_table.columns() {
+        for constraint in cdc_table.check_constraints() {
             for version in CAPTURE_DATA_CHANGES_VERSIONS {
-                if column.ty_str.contains(version) {
+                if constraint.name.as_deref() == Some(version) {
+                    tracing::debug!("get_capture_data_changes_info: detected CDC version from named constraint metadata: {:?}", constraint.name);
                     return Ok(CaptureDataChangesInfo { mode, version });
                 }
             }

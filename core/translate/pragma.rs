@@ -4,7 +4,7 @@
 use crate::sync::Arc;
 use chrono::Datelike;
 use turso_macros::match_ignore_ascii_case;
-use turso_parser::ast::{self, ColumnDefinition, Expr, Literal};
+use turso_parser::ast::{self, ColumnDefinition, Expr, Literal, Name, NamedTableConstraint};
 use turso_parser::ast::{PragmaName, QualifiedName};
 
 use super::integrity_check::{
@@ -22,9 +22,7 @@ use crate::translate::schema::translate_create_table;
 use crate::util::{normalize_ident, parse_signed_number, parse_string, IOExt as _};
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
 use crate::vdbe::insn::{Cookie, Insn};
-use crate::{
-    bail_parse_error, CaptureDataChangesMode, LimboError, Value, CAPTURE_DATA_CHANGES_LATEST,
-};
+use crate::{bail_parse_error, CaptureDataChangesMode, LimboError, Value, CAPTURE_DATA_CHANGES_LATEST};
 use std::str::FromStr;
 use strum::IntoEnumIterator;
 
@@ -362,7 +360,12 @@ fn update_pragma(
                         true, // if_not_exists
                         ast::CreateTableBody::ColumnsAndConstraints {
                             columns: turso_cdc_table_columns(),
-                            constraints: vec![],
+                            constraints: vec![NamedTableConstraint {
+                                name: Some(Name::exact(CAPTURE_DATA_CHANGES_LATEST.to_string())),
+                                constraint: ast::TableConstraint::Check(Box::new(Expr::Literal(
+                                    Literal::Numeric("1".to_string()),
+                                ))),
+                            }],
                             options: ast::TableOptions::NONE,
                         },
                         program,
@@ -973,8 +976,7 @@ fn turso_cdc_table_columns() -> Vec<ColumnDefinition> {
         ast::ColumnDefinition {
             col_name: ast::Name::exact("change_type".to_string()),
             col_type: Some(ast::Type {
-                // we put version of CDC in the change_type column because change_id must have INTEGER type in order to be rowid alias
-                name: format!("INTEGER {}", CAPTURE_DATA_CHANGES_LATEST),
+                name: "INTEGER".to_string(),
                 size: None,
             }),
             constraints: vec![],

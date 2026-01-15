@@ -512,6 +512,7 @@ fn emit_materialized_build_inputs(
             is_strict: false,
             unique_sets: vec![],
             foreign_keys: vec![],
+            check_constraints: vec![],
         });
         let cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(ephemeral_table.clone()));
 

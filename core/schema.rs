@@ -805,8 +805,8 @@ impl Schema {
                 is_strict: false,
                 has_autoincrement: false,
                 foreign_keys: vec![],
-
                 unique_sets: vec![],
+                check_constraints: vec![],
             })));
 
             // Only add to schema if compatible
@@ -1480,6 +1480,13 @@ impl Table {
         }
     }
 
+    pub fn check_constraints(&self) -> &[CheckConstraint] {
+        match self {
+            Self::BTree(table) => &table.check_constraints,
+            _ => &[],
+        }
+    }
+
     pub fn btree(&self) -> Option<Arc<BTreeTable>> {
         match self {
             Self::BTree(table) => Some(table.clone()),
@@ -1521,6 +1528,12 @@ pub struct UniqueSet {
 }
 
 #[derive(Clone, Debug)]
+pub struct CheckConstraint {
+    pub name: Option<String>,
+    pub expr: Box<Expr>,
+}
+
+#[derive(Clone, Debug)]
 pub struct BTreeTable {
     pub root_page: i64,
     pub name: String,
@@ -1531,6 +1544,7 @@ pub struct BTreeTable {
     pub has_autoincrement: bool,
     pub unique_sets: Vec<UniqueSet>,
     pub foreign_keys: Vec<Arc<ForeignKey>>,
+    pub check_constraints: Vec<CheckConstraint>,
 }
 
 impl BTreeTable {
@@ -1727,6 +1741,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
     let mut has_autoincrement = false;
     let mut primary_key_columns = vec![];
     let mut foreign_keys = vec![];
+    let mut check_constraints = vec![];
     let mut cols = vec![];
     let is_strict: bool;
     let mut unique_sets_columns: Vec<UniqueSet> = vec![];
@@ -1744,135 +1759,146 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
             // that's why we maintain 2 unique_set sequences and merge them together in the end
 
             for c in constraints {
-                if let ast::TableConstraint::PrimaryKey {
-                    columns,
-                    auto_increment,
-                    ..
-                } = &c.constraint
-                {
-                    if !primary_key_columns.is_empty() {
-                        crate::bail_parse_error!(
-                            "table \"{}\" has more than one primary key",
-                            tbl_name
-                        );
-                    }
-                    if *auto_increment {
-                        has_autoincrement = true;
-                    }
+                match &c.constraint {
+                    ast::TableConstraint::PrimaryKey {
+                        columns,
+                        auto_increment,
+                        ..
+                    } => {
+                        if !primary_key_columns.is_empty() {
+                            crate::bail_parse_error!(
+                                "table \"{}\" has more than one primary key",
+                                tbl_name
+                            );
+                        }
+                        if *auto_increment {
+                            has_autoincrement = true;
+                        }
 
-                    for column in columns {
-                        let col_name = match column.expr.as_ref() {
-                            Expr::Id(id) => normalize_ident(id.as_str()),
-                            Expr::Literal(Literal::String(value)) => {
-                                value.trim_matches('\'').to_owned()
-                            }
-                            expr => {
-                                bail_parse_error!("unsupported primary key expression: {}", expr)
-                            }
-                        };
-                        primary_key_columns
-                            .push((col_name, column.order.unwrap_or(SortOrder::Asc)));
+                        for column in columns {
+                            let col_name = match column.expr.as_ref() {
+                                Expr::Id(id) => normalize_ident(id.as_str()),
+                                Expr::Literal(Literal::String(value)) => {
+                                    value.trim_matches('\'').to_owned()
+                                }
+                                expr => {
+                                    bail_parse_error!(
+                                        "unsupported primary key expression: {}",
+                                        expr
+                                    )
+                                }
+                            };
+                            primary_key_columns
+                                .push((col_name, column.order.unwrap_or(SortOrder::Asc)));
+                        }
+                        unique_sets_constraints.push(UniqueSet {
+                            columns: primary_key_columns.clone(),
+                            is_primary_key: true,
+                        });
                     }
-                    unique_sets_constraints.push(UniqueSet {
-                        columns: primary_key_columns.clone(),
-                        is_primary_key: true,
-                    });
-                } else if let ast::TableConstraint::Unique {
-                    columns,
-                    conflict_clause,
-                } = &c.constraint
-                {
-                    if conflict_clause.is_some() {
-                        unimplemented!("ON CONFLICT not implemented");
-                    }
-                    let mut unique_columns = Vec::with_capacity(columns.len());
-                    for column in columns {
-                        match column.expr.as_ref() {
-                            Expr::Id(id) => unique_columns.push((
-                                id.as_str().to_string(),
-                                column.order.unwrap_or(SortOrder::Asc),
-                            )),
-                            Expr::Literal(Literal::String(value)) => unique_columns.push((
-                                value.trim_matches('\'').to_owned(),
-                                column.order.unwrap_or(SortOrder::Asc),
-                            )),
-                            expr => {
-                                bail_parse_error!("unsupported unique key expression: {}", expr)
+                    ast::TableConstraint::Unique {
+                        columns,
+                        conflict_clause,
+                    } => {
+                        if conflict_clause.is_some() {
+                            unimplemented!("ON CONFLICT not implemented");
+                        }
+                        let mut unique_columns = Vec::with_capacity(columns.len());
+                        for column in columns {
+                            match column.expr.as_ref() {
+                                Expr::Id(id) => unique_columns.push((
+                                    id.as_str().to_string(),
+                                    column.order.unwrap_or(SortOrder::Asc),
+                                )),
+                                Expr::Literal(Literal::String(value)) => unique_columns.push((
+                                    value.trim_matches('\'').to_owned(),
+                                    column.order.unwrap_or(SortOrder::Asc),
+                                )),
+                                expr => {
+                                    bail_parse_error!("unsupported unique key expression: {}", expr)
+                                }
                             }
                         }
+                        let unique_set = UniqueSet {
+                            columns: unique_columns,
+                            is_primary_key: false,
+                        };
+                        unique_sets_constraints.push(unique_set);
                     }
-                    let unique_set = UniqueSet {
-                        columns: unique_columns,
-                        is_primary_key: false,
-                    };
-                    unique_sets_constraints.push(unique_set);
-                } else if let ast::TableConstraint::ForeignKey {
-                    columns,
-                    clause,
-                    defer_clause,
-                } = &c.constraint
-                {
-                    let child_columns: Vec<String> = columns
-                        .iter()
-                        .map(|ic| normalize_ident(ic.col_name.as_str()))
-                        .collect();
-                    // derive parent columns: explicit or default to parent PK
-                    let parent_table = normalize_ident(clause.tbl_name.as_str());
-                    let parent_columns: Vec<String> = clause
-                        .columns
-                        .iter()
-                        .map(|ic| normalize_ident(ic.col_name.as_str()))
-                        .collect();
+                    ast::TableConstraint::ForeignKey {
+                        columns,
+                        clause,
+                        defer_clause,
+                    } => {
+                        let child_columns: Vec<String> = columns
+                            .iter()
+                            .map(|ic| normalize_ident(ic.col_name.as_str()))
+                            .collect();
+                        // derive parent columns: explicit or default to parent PK
+                        let parent_table = normalize_ident(clause.tbl_name.as_str());
+                        let parent_columns: Vec<String> = clause
+                            .columns
+                            .iter()
+                            .map(|ic| normalize_ident(ic.col_name.as_str()))
+                            .collect();
 
-                    // Only check arity if parent columns were explicitly listed
-                    if !parent_columns.is_empty() && child_columns.len() != parent_columns.len() {
-                        crate::bail_parse_error!(
+                        // Only check arity if parent columns were explicitly listed
+                        if !parent_columns.is_empty() && child_columns.len() != parent_columns.len()
+                        {
+                            crate::bail_parse_error!(
                             "foreign key on \"{}\" has {} child column(s) but {} parent column(s)",
                             tbl_name,
                             child_columns.len(),
                             parent_columns.len()
                         );
-                    }
-                    // deferrable semantics
-                    let deferred = match defer_clause {
-                        Some(d) => {
-                            d.deferrable
-                                && matches!(
-                                    d.init_deferred,
-                                    Some(InitDeferredPred::InitiallyDeferred)
-                                )
                         }
-                        None => false, // NOT DEFERRABLE INITIALLY IMMEDIATE by default
-                    };
-                    let fk = ForeignKey {
-                        parent_table,
-                        parent_columns,
-                        child_columns,
-                        on_delete: clause
-                            .args
-                            .iter()
-                            .find_map(|a| {
-                                if let ast::RefArg::OnDelete(x) = a {
-                                    Some(*x)
-                                } else {
-                                    None
-                                }
-                            })
-                            .unwrap_or(RefAct::NoAction),
-                        on_update: clause
-                            .args
-                            .iter()
-                            .find_map(|a| {
-                                if let ast::RefArg::OnUpdate(x) = a {
-                                    Some(*x)
-                                } else {
-                                    None
-                                }
-                            })
-                            .unwrap_or(RefAct::NoAction),
-                        deferred,
-                    };
-                    foreign_keys.push(Arc::new(fk));
+                        // deferrable semantics
+                        let deferred = match defer_clause {
+                            Some(d) => {
+                                d.deferrable
+                                    && matches!(
+                                        d.init_deferred,
+                                        Some(InitDeferredPred::InitiallyDeferred)
+                                    )
+                            }
+                            None => false, // NOT DEFERRABLE INITIALLY IMMEDIATE by default
+                        };
+                        let fk = ForeignKey {
+                            parent_table,
+                            parent_columns,
+                            child_columns,
+                            on_delete: clause
+                                .args
+                                .iter()
+                                .find_map(|a| {
+                                    if let ast::RefArg::OnDelete(x) = a {
+                                        Some(*x)
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .unwrap_or(RefAct::NoAction),
+                            on_update: clause
+                                .args
+                                .iter()
+                                .find_map(|a| {
+                                    if let ast::RefArg::OnUpdate(x) = a {
+                                        Some(*x)
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .unwrap_or(RefAct::NoAction),
+                            deferred,
+                        };
+                        foreign_keys.push(Arc::new(fk));
+                    }
+                    ast::TableConstraint::Check(check) => {
+                        check_constraints.push(CheckConstraint {
+                            name: c.name.as_ref().map(|n| n.as_str().to_string()).clone(),
+                            expr: check.clone(),
+                        });
+                    }
                 }
             }
 
@@ -2128,6 +2154,7 @@ pub fn create_table(tbl_name: &str, body: &CreateTableBody, root_page: i64) -> R
         primary_key_columns,
         has_autoincrement,
         columns: cols,
+        check_constraints,
         is_strict,
         foreign_keys,
         unique_sets: {
@@ -2607,6 +2634,7 @@ pub fn sqlite_schema_table() -> BTreeTable {
         ],
         foreign_keys: vec![],
         unique_sets: vec![],
+        check_constraints: vec![],
     }
 }
 

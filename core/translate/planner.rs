@@ -668,9 +668,9 @@ fn parse_table(
             has_rowid: true,
             is_strict: false,
             has_autoincrement: false,
-
             unique_sets: vec![],
             foreign_keys: vec![],
+            check_constraints: vec![],
         });
         drop(view_guard);
 
