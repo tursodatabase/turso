@@ -2833,8 +2833,8 @@ impl WalFileShared {
             self.max_frame.store(0, Ordering::Release);
             self.nbackfills.store(0, Ordering::Release);
             self.last_checksum = (hdr.checksum_1, hdr.checksum_2);
-            // `ensure_header_if_needed` do the work only if WAL is not initialized yet (so, self.initialized is false)
-            // we change WAL state here, so on next write attempt `ensure_header_if_needed` will update WAL header
+            // `prepare_wal_start` (used in the `commit_dirty_pages_inner`) do the work only if WAL is not initialized yet (so, self.initialized is false)
+            // we change WAL state here, so on next write attempt `prepare_wal_start` will update WAL header
             self.initialized.store(false, Ordering::Release);
         }
 
