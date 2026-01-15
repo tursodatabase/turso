@@ -1,0 +1,565 @@
+@database :memory:
+
+# =============================================================================
+# Basic CTE tests
+# =============================================================================
+
+test cte-basic {
+    WITH t AS (SELECT 1 as x) SELECT * FROM t;
+}
+expect {
+    1
+}
+
+test cte-multiple {
+    WITH t1 AS (SELECT 1 as x), t2 AS (SELECT 2 as y) SELECT * FROM t1, t2;
+}
+expect {
+    1|2
+}
+
+test cte-chain {
+    WITH a AS (SELECT 1 as x), b AS (SELECT x FROM a), c AS (SELECT x FROM b), d AS (SELECT x FROM c) SELECT * FROM d;
+}
+expect {
+    1
+}
+
+# =============================================================================
+# CTE with compound SELECT (UNION, UNION ALL, INTERSECT, EXCEPT)
+# =============================================================================
+
+test cte-union {
+    WITH t AS (SELECT 1 as x UNION SELECT 2) SELECT * FROM t ORDER BY 1;
+}
+expect {
+    1
+    2
+}
+
+test cte-union-all {
+    WITH t AS (SELECT 1 as x UNION ALL SELECT 2) SELECT * FROM t ORDER BY 1;
+}
+expect {
+    1
+    2
+}
+
+test cte-intersect {
+    WITH t AS (SELECT 1 as x INTERSECT SELECT 1) SELECT * FROM t;
+}
+expect {
+    1
+}
+
+test cte-except {
+    WITH t AS (SELECT 1 as x EXCEPT SELECT 2) SELECT * FROM t;
+}
+expect {
+    1
+}
+
+test cte-multiple-unions {
+    WITH t AS (SELECT 1 as x UNION SELECT 2 UNION SELECT 3) SELECT * FROM t ORDER BY 1;
+}
+expect {
+    1
+    2
+    3
+}
+
+test cte-union-ref {
+    WITH t AS (SELECT 1 as x UNION SELECT 2), u AS (SELECT * FROM t) SELECT * FROM u ORDER BY 1;
+}
+expect {
+    1
+    2
+}
+
+test cte-union-multi-ref {
+    WITH t AS (SELECT 1 as x UNION SELECT 2) SELECT * FROM t as a, t as b ORDER BY 1, 2;
+}
+expect {
+    1|1
+    1|2
+    2|1
+    2|2
+}
+
+test cte-union-aggregate {
+    WITH t AS (SELECT 1 UNION ALL SELECT 2 UNION ALL SELECT 3) SELECT COUNT(*) FROM t;
+}
+expect {
+    3
+}
+
+test cte-union-limit {
+    WITH t AS (SELECT 1 UNION SELECT 2 UNION SELECT 3 LIMIT 2) SELECT * FROM t ORDER BY 1;
+}
+expect {
+    1
+    2
+}
+
+test cte-union-limit-one {
+    WITH t AS (SELECT 1 UNION SELECT 2 LIMIT 1) SELECT * FROM t;
+}
+expect {
+    1
+}
+
+test cte-union-limit-offset {
+    WITH t AS (SELECT 1 UNION SELECT 2 UNION SELECT 3 LIMIT 2 OFFSET 1) SELECT * FROM t ORDER BY 1;
+}
+expect {
+    2
+    3
+}
+
+test cte-intersect-limit {
+    WITH t AS (SELECT 1 INTERSECT SELECT 1 LIMIT 1) SELECT * FROM t;
+}
+expect {
+    1
+}
+
+test cte-except-limit {
+    WITH t AS (SELECT 1 UNION SELECT 2 EXCEPT SELECT 2 LIMIT 2) SELECT * FROM t;
+}
+expect {
+    1
+}
+
+# =============================================================================
+# CTE with DML statements (INSERT, UPDATE, DELETE)
+# =============================================================================
+
+test cte-insert-basic {
+    CREATE TABLE t(x);
+    WITH c AS (SELECT 1 as x) INSERT INTO t SELECT * FROM c;
+    SELECT * FROM t;
+}
+expect {
+    1
+}
+
+test cte-insert-union {
+    CREATE TABLE t(x);
+    WITH c AS (SELECT 1 UNION SELECT 2 UNION SELECT 3) INSERT INTO t SELECT * FROM c;
+    SELECT * FROM t ORDER BY 1;
+}
+expect {
+    1
+    2
+    3
+}
+
+test cte-insert-chain {
+    CREATE TABLE t(x);
+    WITH a AS (SELECT 1 as x), b AS (SELECT x + 10 FROM a) INSERT INTO t SELECT * FROM b;
+    SELECT * FROM t;
+}
+expect {
+    11
+}
+
+test cte-delete-basic {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (1),(2),(3);
+    WITH vals AS (SELECT 1 as x) DELETE FROM t WHERE x IN (SELECT x FROM vals);
+    SELECT * FROM t ORDER BY 1;
+}
+expect {
+    2
+    3
+}
+
+test cte-delete-union {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (1),(2),(3),(4);
+    WITH odd AS (SELECT 1 UNION SELECT 3) DELETE FROM t WHERE x IN (SELECT * FROM odd);
+    SELECT * FROM t ORDER BY 1;
+}
+expect {
+    2
+    4
+}
+
+test cte-delete-chain {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (1),(2),(3);
+    WITH a AS (SELECT 1 as x), b AS (SELECT x FROM a) DELETE FROM t WHERE x IN (SELECT x FROM b);
+    SELECT * FROM t ORDER BY 1;
+}
+expect {
+    2
+    3
+}
+
+test cte-update-where {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (1),(2),(3);
+    WITH vals AS (SELECT 1 as x) UPDATE t SET x = x + 10 WHERE x IN (SELECT x FROM vals);
+    SELECT * FROM t ORDER BY 1;
+}
+expect {
+    2
+    3
+    11
+}
+
+test cte-update-chain {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (1),(2),(3);
+    WITH a AS (SELECT 2 as x), b AS (SELECT x FROM a) UPDATE t SET x = x * 100 WHERE x IN (SELECT x FROM b);
+    SELECT * FROM t ORDER BY 1;
+}
+expect {
+    1
+    3
+    200
+}
+
+test cte-delete-multiple-ctes {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (1),(2),(3),(4),(5);
+    WITH low AS (SELECT 1 UNION SELECT 2), high AS (SELECT 4 UNION SELECT 5)
+    DELETE FROM t WHERE x IN (SELECT * FROM low) OR x IN (SELECT * FROM high);
+    SELECT * FROM t;
+}
+expect {
+    3
+}
+
+test cte-multi-ref-where {
+    CREATE TABLE t(x, y);
+    INSERT INTO t VALUES (1, 10), (2, 20), (3, 30);
+    WITH vals AS (SELECT 2 as v)
+    DELETE FROM t WHERE x IN (SELECT v FROM vals) AND y IN (SELECT v * 10 FROM vals);
+    SELECT * FROM t ORDER BY 1;
+}
+expect {
+    1|10
+    3|30
+}
+
+test cte-insert-returning {
+    CREATE TABLE t(x);
+    WITH c AS (SELECT 42 as x) INSERT INTO t SELECT * FROM c RETURNING x;
+}
+expect {
+    42
+}
+
+test cte-delete-returning {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (1),(2),(3);
+    WITH vals AS (SELECT 2 as x) DELETE FROM t WHERE x IN (SELECT x FROM vals) RETURNING x;
+}
+expect {
+    2
+}
+
+test cte-update-returning {
+    CREATE TABLE t(x);
+    INSERT INTO t VALUES (1),(2),(3);
+    WITH vals AS (SELECT 1 as x) UPDATE t SET x = x + 100 WHERE x IN (SELECT x FROM vals) RETURNING x;
+}
+expect {
+    101
+}
+
+# =============================================================================
+# Compound SELECT column name propagation to downstream CTEs
+# =============================================================================
+
+test cte-compound-colname-union {
+    WITH t1 AS (SELECT 1 AS x UNION SELECT 2), t2 AS (SELECT x FROM t1) SELECT * FROM t2 ORDER BY 1;
+}
+expect {
+    1
+    2
+}
+
+test cte-compound-colname-union-all {
+    WITH t1 AS (SELECT 1 AS x UNION ALL SELECT 2), t2 AS (SELECT x FROM t1 WHERE x > 0) SELECT * FROM t2 ORDER BY 1;
+}
+expect {
+    1
+    2
+}
+
+test cte-compound-colname-intersect {
+    WITH t1 AS (SELECT 1 AS x INTERSECT SELECT 1), t2 AS (SELECT x FROM t1) SELECT * FROM t2;
+}
+expect {
+    1
+}
+
+test cte-compound-colname-except {
+    WITH t1 AS (SELECT 1 AS x EXCEPT SELECT 2), t2 AS (SELECT x FROM t1) SELECT * FROM t2;
+}
+expect {
+    1
+}
+
+test cte-compound-colname-multi {
+    WITH t1 AS (SELECT 1 AS a, 2 AS b UNION SELECT 3, 4), t2 AS (SELECT a, b, a + b AS sum FROM t1) SELECT * FROM t2 ORDER BY a;
+}
+expect {
+    1|2|3
+    3|4|7
+}
+
+# =============================================================================
+# Compound SELECT in FROM clause subqueries
+# =============================================================================
+
+test cte-compound-from-union {
+    SELECT * FROM (SELECT 1 UNION SELECT 2) ORDER BY 1;
+}
+expect {
+    1
+    2
+}
+
+test cte-compound-from-union-all {
+    SELECT * FROM (SELECT 1 UNION ALL SELECT 2) ORDER BY 1;
+}
+expect {
+    1
+    2
+}
+
+test cte-compound-from-intersect {
+    SELECT * FROM (SELECT 1 INTERSECT SELECT 1);
+}
+expect {
+    1
+}
+
+test cte-compound-from-except {
+    SELECT * FROM (SELECT 1 EXCEPT SELECT 2);
+}
+expect {
+    1
+}
+
+test cte-compound-from-alias {
+    SELECT * FROM (SELECT 1 UNION SELECT 2) AS t ORDER BY 1;
+}
+expect {
+    1
+    2
+}
+
+test cte-compound-from-aggregate {
+    SELECT COUNT(*), SUM(val) FROM (SELECT 1 AS val UNION ALL SELECT 2 UNION ALL SELECT 3);
+}
+expect {
+    3|6
+}
+
+# =============================================================================
+# CTEs visibility in scalar subqueries in SELECT list
+# =============================================================================
+
+test cte-scalar-subquery-no-from {
+    WITH t AS (SELECT 1 AS x) SELECT (SELECT x FROM t) AS subq;
+}
+expect {
+    1
+}
+
+test cte-scalar-subquery-aggregate {
+    WITH t AS (SELECT 1 AS x UNION ALL SELECT 2 UNION ALL SELECT 3) SELECT (SELECT SUM(x) FROM t) AS total;
+}
+expect {
+    6
+}
+
+test cte-scalar-subquery-with-from {
+    CREATE TABLE tbl(id);
+    INSERT INTO tbl VALUES (1),(2);
+    WITH c AS (SELECT 100 AS val) SELECT id, (SELECT val FROM c) AS const FROM tbl ORDER BY id;
+}
+expect {
+    1|100
+    2|100
+}
+
+test cte-scalar-subquery-multi-cte {
+    WITH a AS (SELECT 10 AS x), b AS (SELECT 20 AS y) SELECT (SELECT x FROM a), (SELECT y FROM b);
+}
+expect {
+    10|20
+}
+
+test cte-scalar-subquery-chain {
+    WITH a AS (SELECT 5 AS x), b AS (SELECT x * 2 AS y FROM a) SELECT (SELECT y FROM b);
+}
+expect {
+    10
+}
+
+test cte-scalar-subquery-compound {
+    WITH t AS (SELECT 1 UNION SELECT 2 UNION SELECT 3) SELECT (SELECT COUNT(*) FROM t);
+}
+expect {
+    3
+}
+
+# =============================================================================
+# CTE with explicit column names
+# =============================================================================
+
+test cte-explicit-columns-basic {
+    WITH t(a, b) AS (SELECT 1, 2) SELECT * FROM t;
+}
+expect {
+    1|2
+}
+
+test cte-explicit-columns-ref {
+    WITH t(a, b) AS (SELECT 1, 2) SELECT a, b FROM t;
+}
+expect {
+    1|2
+}
+
+test cte-explicit-columns-rename {
+    WITH t(x, y) AS (SELECT 1 as a, 2 as b) SELECT x, y FROM t;
+}
+expect {
+    1|2
+}
+
+test cte-explicit-columns-expr {
+    WITH t(sum, product) AS (SELECT 3 + 4, 3 * 4) SELECT sum, product FROM t;
+}
+expect {
+    7|12
+}
+
+test cte-explicit-columns-multi {
+    WITH t1(a) AS (SELECT 1), t2(b) AS (SELECT 2) SELECT a, b FROM t1, t2;
+}
+expect {
+    1|2
+}
+
+test cte-explicit-columns-chain {
+    WITH t1(a, b) AS (SELECT 1, 2), t2(x, y) AS (SELECT a, b FROM t1) SELECT x, y FROM t2;
+}
+expect {
+    1|2
+}
+
+@skip-if sqlite "sqlite has different error message"
+test cte-explicit-columns-count-mismatch {
+    WITH t(a, b, c) AS (SELECT 1, 2) SELECT * FROM t;
+}
+expect error {
+    table t has 2 columns but 3 column names were provided
+}
+
+# =============================================================================
+# CTE visibility in VALUES and RETURNING clause subqueries
+# =============================================================================
+
+test cte-insert-values-subquery {
+    CREATE TABLE t(a);
+    WITH test AS (SELECT 99 as x) INSERT INTO t VALUES ((SELECT x FROM test));
+    SELECT * FROM t;
+}
+expect {
+    99
+}
+
+test cte-insert-values-multi-subquery {
+    CREATE TABLE t(a, b);
+    WITH test AS (SELECT 1 as x, 2 as y) INSERT INTO t VALUES ((SELECT x FROM test), (SELECT y FROM test));
+    SELECT * FROM t;
+}
+expect {
+    1|2
+}
+
+test cte-insert-values-multiple-rows {
+    CREATE TABLE t(a);
+    WITH test AS (SELECT 10 as x) INSERT INTO t VALUES ((SELECT x FROM test)), ((SELECT x + 1 FROM test));
+    SELECT * FROM t ORDER BY a;
+}
+expect {
+    10
+    11
+}
+
+test cte-insert-returning-subquery {
+    CREATE TABLE t(a);
+    WITH test AS (SELECT 99 as x) INSERT INTO t VALUES (1) RETURNING (SELECT x FROM test);
+}
+expect {
+    99
+}
+
+test cte-insert-returning-multi-subquery {
+    CREATE TABLE t(a);
+    WITH test AS (SELECT 1 as x, 2 as y) INSERT INTO t VALUES (100) RETURNING (SELECT x FROM test), (SELECT y FROM test);
+}
+expect {
+    1|2
+}
+
+test cte-delete-returning-subquery {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1), (2), (3);
+    WITH test AS (SELECT 99 as x) DELETE FROM t WHERE a = 2 RETURNING (SELECT x FROM test);
+}
+expect {
+    99
+}
+
+test cte-update-returning-subquery {
+    CREATE TABLE t(a);
+    INSERT INTO t VALUES (1);
+    WITH test AS (SELECT 99 as x) UPDATE t SET a = 10 WHERE a = 1 RETURNING (SELECT x FROM test);
+}
+expect {
+    99
+}
+
+test cte-insert-values-and-returning-subquery {
+    CREATE TABLE t(a);
+    WITH test AS (SELECT 42 as x) INSERT INTO t VALUES ((SELECT x FROM test)) RETURNING (SELECT x + 1 FROM test);
+}
+expect {
+    43
+}
+
+# =============================================================================
+# Error cases
+# =============================================================================
+
+test cte-duplicate-name {
+    WITH t AS (SELECT 1), t AS (SELECT 2) SELECT * FROM t;
+}
+expect error {
+    duplicate WITH table name
+}
+
+@skip-if sqlite "sqlite supports recursive CTEs"
+test cte-recursive-unsupported {
+    WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM cnt WHERE x<5) SELECT * FROM cnt;
+}
+expect error {
+    Recursive CTEs are not yet supported
+}
+
+@skip-if sqlite "sqlite supports materialized CTEs"
+test cte-materialized-unsupported {
+    WITH t AS MATERIALIZED (SELECT 1) SELECT * FROM t;
+}
+expect error {
+    Materialized CTEs are not yet supported
+}
