@@ -5085,6 +5085,14 @@ pub fn op_function(
                 };
                 state.registers[*dest] = Register::Value(Value::Integer(result));
             }
+            ScalarFunc::IsAutocommit => {
+                let is_autocommit = program.connection.get_auto_commit();
+                state.registers[*dest] = Register::Value(Value::Integer(if is_autocommit {
+                    1
+                } else {
+                    0
+                }));
+            }
             ScalarFunc::TursoVersion => {
                 if !program.connection.is_db_initialized() {
                     state.registers[*dest] =

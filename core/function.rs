@@ -387,6 +387,7 @@ pub enum ScalarFunc {
     StatPush,
     StatGet,
     ConnTxnId,
+    IsAutocommit,
 }
 
 impl Deterministic for ScalarFunc {
@@ -455,6 +456,7 @@ impl Deterministic for ScalarFunc {
             ScalarFunc::StatPush => false, // internal ANALYZE function
             ScalarFunc::StatGet => false,  // internal ANALYZE function
             ScalarFunc::ConnTxnId => false, // depends on connection state
+            ScalarFunc::IsAutocommit => false, // depends on connection state
         }
     }
 }
@@ -525,6 +527,7 @@ impl Display for ScalarFunc {
             Self::StatPush => "stat_push",
             Self::StatGet => "stat_get",
             Self::ConnTxnId => "conn_txn_id",
+            Self::IsAutocommit => "is_autocommit",
         };
         write!(f, "{str}")
     }
@@ -927,6 +930,12 @@ impl Func {
                     crate::bail_parse_error!("wrong number of arguments to function {}()", name)
                 }
                 Ok(Self::Scalar(ScalarFunc::ConnTxnId))
+            }
+            "is_autocommit" => {
+                if arg_count != 0 {
+                    crate::bail_parse_error!("wrong number of arguments to function {}()", name)
+                }
+                Ok(Self::Scalar(ScalarFunc::IsAutocommit))
             }
             "julianday" => Ok(Self::Scalar(ScalarFunc::JulianDay)),
             "hex" => Ok(Self::Scalar(ScalarFunc::Hex)),
