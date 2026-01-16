@@ -26,6 +26,14 @@ function createErrorByName(name, message) {
 }
 
 /**
+ * Result of a mutation operation (INSERT, UPDATE, DELETE).
+ */
+interface RunResult {
+  changes: number;
+  lastInsertRowid: number;
+}
+
+/**
  * Database represents a connection that can prepare and execute SQL statements.
  */
 class Database {
@@ -65,16 +73,74 @@ class Database {
    * Prepares a SQL statement for execution.
    *
    * @param {string} sql - The SQL statement string to prepare.
+   * @returns A typed Statement instance.
+   *
+   * @example
+   * ```typescript
+   * interface User { id: number; name: string; }
+   * const stmt = db.prepare<User>('SELECT * FROM users');
+   * const users = stmt.all(); // User[]
+   * ```
    */
-  prepare(sql) {
+  prepare<T = unknown>(sql: string): Statement<T> {
     if (!sql) {
       throw new RangeError("The supplied SQL string contains no statements");
     }
 
     try {
-      return new Statement(this.db.prepare(sql), this.db);
+      return new Statement<T>(this.db.prepare(sql), this.db);
     } catch (err) {
       throw convertError(err);
+    }
+  }
+
+  /**
+   * Execute a query and return the first result row.
+   * This is a convenience method that prepares, executes, and closes the statement.
+   *
+   * @param {string} sql - The SQL query string.
+   * @param {any[]} params - Optional bind parameters.
+   * @returns The first row or undefined if no results.
+   *
+   * @example
+   * ```typescript
+   * const user = db.query<User>('SELECT * FROM users WHERE id = ?', [1]);
+   * ```
+   */
+  query<T = unknown>(sql: string, params?: unknown[]): T | undefined {
+    const stmt = this.prepare<T>(sql);
+    try {
+      if (params && params.length > 0) {
+        return stmt.get(...params);
+      }
+      return stmt.get();
+    } finally {
+      stmt.close();
+    }
+  }
+
+  /**
+   * Execute a query and return all result rows.
+   * This is a convenience method that prepares, executes, and closes the statement.
+   *
+   * @param {string} sql - The SQL query string.
+   * @param {any[]} params - Optional bind parameters.
+   * @returns An array of all result rows.
+   *
+   * @example
+   * ```typescript
+   * const users = db.queryAll<User>('SELECT * FROM users WHERE age > ?', [18]);
+   * ```
+   */
+  queryAll<T = unknown>(sql: string, params?: unknown[]): T[] {
+    const stmt = this.prepare<T>(sql);
+    try {
+      if (params && params.length > 0) {
+        return stmt.all(...params);
+      }
+      return stmt.all();
+    } finally {
+      stmt.close();
     }
   }
 
@@ -220,8 +286,10 @@ class Database {
 
 /**
  * Statement represents a prepared SQL statement that can be executed.
+ *
+ * @template T - The type of rows returned by this statement.
  */
-class Statement {
+class Statement<T = unknown> {
   stmt: NativeStatement;
   db: NativeDatabase;
 
@@ -235,7 +303,7 @@ class Statement {
    *
    * @param raw Enable or disable raw mode. If you don't pass the parameter, raw mode is enabled.
    */
-  raw(raw) {
+  raw(raw?: boolean): this {
     this.stmt.raw(raw);
     return this;
   }
@@ -245,7 +313,7 @@ class Statement {
    *
    * @param pluckMode Enable or disable pluck mode. If you don't pass the parameter, pluck mode is enabled.
    */
-  pluck(pluckMode) {
+  pluck(pluckMode?: boolean): this {
     this.stmt.pluck(pluckMode);
     return this;
   }
@@ -255,7 +323,7 @@ class Statement {
    *
    * @param {boolean} [toggle] - Whether to use safe integers.
    */
-  safeIntegers(toggle) {
+  safeIntegers(toggle?: boolean): this {
     this.stmt.safeIntegers(toggle);
     return this;
   }
@@ -283,8 +351,11 @@ class Statement {
 
   /**
    * Executes the SQL statement and returns an info object.
+   *
+   * @param bindParameters - The bind parameters for executing the statement.
+   * @returns An object with `changes` and `lastInsertRowid`.
    */
-  run(...bindParameters) {
+  run(...bindParameters: unknown[]): RunResult {
     const totalChangesBefore = this.db.totalChanges();
 
     this.stmt.reset();
@@ -314,11 +385,12 @@ class Statement {
    * Executes the SQL statement and returns the first row.
    *
    * @param bindParameters - The bind parameters for executing the statement.
+   * @returns The first row or undefined if no results.
    */
-  get(...bindParameters) {
+  get(...bindParameters: unknown[]): T | undefined {
     this.stmt.reset();
     bindParams(this.stmt, bindParameters);
-    let row = undefined;
+    let row: T | undefined = undefined;
     for (; ;) {
       const stepResult = this.stmt.stepSync();
       if (stepResult === STEP_IO) {
@@ -329,7 +401,7 @@ class Statement {
         break;
       }
       if (stepResult === STEP_ROW && row === undefined) {
-        row = this.stmt.row();
+        row = this.stmt.row() as T;
       }
     }
     return row;
@@ -339,8 +411,9 @@ class Statement {
    * Executes the SQL statement and returns an iterator to the resulting rows.
    *
    * @param bindParameters - The bind parameters for executing the statement.
+   * @returns An iterator yielding rows.
    */
-  *iterate(...bindParameters) {
+  *iterate(...bindParameters: unknown[]): IterableIterator<T> {
     this.stmt.reset();
     bindParams(this.stmt, bindParameters);
 
@@ -354,7 +427,7 @@ class Statement {
         break;
       }
       if (stepResult === STEP_ROW) {
-        yield this.stmt.row();
+        yield this.stmt.row() as T;
       }
     }
   }
@@ -363,11 +436,12 @@ class Statement {
    * Executes the SQL statement and returns an array of the resulting rows.
    *
    * @param bindParameters - The bind parameters for executing the statement.
+   * @returns An array of all result rows.
    */
-  all(...bindParameters) {
+  all(...bindParameters: unknown[]): T[] {
     this.stmt.reset();
     bindParams(this.stmt, bindParameters);
-    const rows: any[] = [];
+    const rows: T[] = [];
     for (; ;) {
       const stepResult = this.stmt.stepSync();
       if (stepResult === STEP_IO) {
@@ -378,10 +452,49 @@ class Statement {
         break;
       }
       if (stepResult === STEP_ROW) {
-        rows.push(this.stmt.row());
+        rows.push(this.stmt.row() as T);
       }
     }
     return rows;
+  }
+
+  /**
+   * Executes the SQL statement and returns results as an array of arrays.
+   * This is more memory-efficient than `all()` for large result sets.
+   *
+   * @param bindParameters - The bind parameters for executing the statement.
+   * @returns An array of arrays, where each inner array is a row's values.
+   *
+   * @example
+   * ```typescript
+   * const rows = stmt.values();
+   * // [['Alice', 1], ['Bob', 2]]
+   * ```
+   */
+  values(...bindParameters: unknown[]): unknown[][] {
+    // Temporarily enable raw mode, then restore
+    this.stmt.raw(true);
+    this.stmt.reset();
+    bindParams(this.stmt, bindParameters);
+    const rows: unknown[][] = [];
+    try {
+      for (; ;) {
+        const stepResult = this.stmt.stepSync();
+        if (stepResult === STEP_IO) {
+          this.db.ioLoopSync();
+          continue;
+        }
+        if (stepResult === STEP_DONE) {
+          break;
+        }
+        if (stepResult === STEP_ROW) {
+          rows.push(this.stmt.row() as unknown[]);
+        }
+      }
+      return rows;
+    } finally {
+      this.stmt.raw(false);
+    }
   }
 
   /**
@@ -393,12 +506,12 @@ class Statement {
 
 
   /**
-   * Binds the given parameters to the statement _permanently_
+   * Binds the given parameters to the statement _permanently_.
    *
    * @param bindParameters - The bind parameters for binding the statement.
-   * @returns this - Statement with binded parameters
+   * @returns this - Statement with bound parameters.
    */
-  bind(...bindParameters) {
+  bind(...bindParameters: unknown[]): this {
     try {
       bindParams(this.stmt, bindParameters);
       return this;
@@ -413,3 +526,4 @@ class Statement {
 }
 
 export { Database, Statement }
+export type { RunResult }
