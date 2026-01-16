@@ -2129,8 +2129,6 @@ fn emit_program_for_update(
 
         for index in all_indexes {
             // Check if this index already has a cursor opened (from indexes_to_update)
-            // We need to match by index name, not Arc identity, because the schema
-            // returns different Arc instances than what's in plan.indexes_to_update.
             let existing_cursor = plan
                 .indexes_to_update
                 .iter()
