@@ -46,6 +46,11 @@ do_execsql_test_in_memory_any_error create_table_multiple_table_primary_keys {
     CREATE TABLE t(a,b,c,d,primary key(a,b), primary key(c,d));
 }
 
+# https://github.com/tursodatabase/turso/issues/4674
+do_execsql_test_in_memory_any_error create_table_duplicate_primary_key_clause {
+    CREATE TABLE t(a primary key primary key);
+}
+
 # https://github.com/tursodatabase/turso/issues/3282
 do_execsql_test_on_specific_db {:memory:} col-named-rowid {
   create table t(rowid, a);

@@ -3403,6 +3403,7 @@ impl<'a> Parser<'a> {
         in_alter: bool,
     ) -> Result<Vec<NamedColumnConstraint>> {
         let mut result = vec![];
+        let mut has_primary_key = false;
 
         loop {
             let name = match self.peek()? {
@@ -3453,6 +3454,13 @@ impl<'a> Parser<'a> {
                                     .to_owned(),
                             ));
                         }
+
+                        if has_primary_key {
+                            return Err(Error::Custom(
+                                "multiple PRIMARY KEY constraints on a single column".to_owned(),
+                            ));
+                        }
+                        has_primary_key = true;
 
                         result.push(NamedColumnConstraint {
                             name,
