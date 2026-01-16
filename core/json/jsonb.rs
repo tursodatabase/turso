@@ -816,8 +816,19 @@ impl JsonbHeader {
                         Err(e) => return Err(e),
                     },
 
-                    // header_size 15 is invalid
-                    _ => bail_parse_error!("Invalid header size: {}", header_size),
+                    // 15 = 8-byte payload size (for future expansion per SQLite spec)
+                    15 => match Self::get_size_bytes(slice, cursor + 1, 8) {
+                        Ok(bytes) => {
+                            offset = 9;
+                            u64::from_be_bytes([
+                                bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5],
+                                bytes[6], bytes[7],
+                            ]) as usize
+                        }
+                        Err(e) => return Err(e),
+                    },
+
+                    _ => unreachable!(),
                 };
 
                 Ok((Self(element_type.try_into()?, total_size), offset))

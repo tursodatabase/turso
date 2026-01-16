@@ -15,7 +15,9 @@ mod incremental;
 pub mod index_method;
 mod info;
 pub mod io;
-#[cfg(feature = "json")]
+#[cfg(all(feature = "json", any(feature = "fuzz", feature = "bench")))]
+pub mod json;
+#[cfg(all(feature = "json", not(any(feature = "fuzz", feature = "bench"))))]
 mod json;
 pub mod mvcc;
 mod parameters;

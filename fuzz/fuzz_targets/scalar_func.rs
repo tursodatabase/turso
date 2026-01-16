@@ -7,7 +7,12 @@ use turso_core::functions::datetime::{
     exec_unixepoch,
 };
 use turso_core::functions::printf::exec_printf;
-use turso_core::vdbe::likeop::exec_glob;
+use turso_core::json::{
+    is_json_valid, json_array, json_array_length, json_error_position, json_extract, json_insert,
+    json_object, json_patch, json_quote, json_remove, json_replace, json_set, json_type,
+    JsonCacheCell,
+};
+use turso_core::vdbe::likeop::{construct_like_escape_arg, exec_glob, exec_like_with_escape};
 use turso_core::vdbe::Register;
 use turso_core::MathFunc;
 use turso_core::Value as CoreValue;
@@ -205,11 +210,26 @@ enum ScalarFuncCall {
     Cast(Value, CastType),
     Nullif(Value, Value),
     Like(Value, Value),
+    LikeEscape(Value, Value, Value),
     RandomBlob(Value),
     MathUnary(MathUnaryFunc, Value),
     MathBinary(MathBinaryFunc, Value, Value),
     MathLog(Value, Option<Value>),
     MathPi,
+    // JSON functions
+    JsonArray(Vec<Value>),
+    JsonObject(Vec<Value>),
+    JsonExtract(Vec<Value>),
+    JsonType(Value, Option<Value>),
+    JsonValid(Value),
+    JsonQuote(Value),
+    JsonArrayLength(Value, Option<Value>),
+    JsonErrorPosition(Value),
+    JsonSet(Vec<Value>),
+    JsonInsert(Vec<Value>),
+    JsonReplace(Vec<Value>),
+    JsonRemove(Vec<Value>),
+    JsonPatch(Value, Value),
 }
 
 fn execute_scalar_func(call: ScalarFuncCall) {
@@ -413,6 +433,14 @@ fn execute_scalar_func(call: ScalarFuncCall) {
             let text: CoreValue = text.into();
             let _ = CoreValue::exec_like(None, &pattern.to_string(), &text.to_string());
         }
+        ScalarFuncCall::LikeEscape(pattern, text, escape) => {
+            let pattern: CoreValue = pattern.into();
+            let text: CoreValue = text.into();
+            let escape: CoreValue = escape.into();
+            if let Ok(Some(escape_char)) = construct_like_escape_arg(&escape) {
+                let _ = exec_like_with_escape(&pattern.to_string(), &text.to_string(), escape_char);
+            }
+        }
         ScalarFuncCall::RandomBlob(val) => {
             let v: CoreValue = val.into();
             let _ = v.exec_randomblob(|bytes| {
@@ -440,6 +468,79 @@ fn execute_scalar_func(call: ScalarFuncCall) {
         ScalarFuncCall::MathPi => {
             // pi() has no inputs, just returns a constant - nothing to fuzz
             let _ = CoreValue::Float(std::f64::consts::PI);
+        }
+        // JSON functions
+        ScalarFuncCall::JsonArray(mut vals) => {
+            vals.truncate(MAX_VARIADIC_ARGS);
+            let vals: Vec<CoreValue> = vals.into_iter().map(|v| v.into()).collect();
+            let _ = json_array(vals.iter());
+        }
+        ScalarFuncCall::JsonObject(mut vals) => {
+            vals.truncate(MAX_VARIADIC_ARGS);
+            let vals: Vec<CoreValue> = vals.into_iter().map(|v| v.into()).collect();
+            let _ = json_object(vals.iter());
+        }
+        ScalarFuncCall::JsonExtract(mut vals) => {
+            if vals.len() >= 2 {
+                vals.truncate(MAX_VARIADIC_ARGS);
+                let vals: Vec<CoreValue> = vals.into_iter().map(|v| v.into()).collect();
+                let cache = JsonCacheCell::new();
+                let (json_val, paths) = vals.split_first().unwrap();
+                let _ = json_extract(json_val, paths, &cache);
+            }
+        }
+        ScalarFuncCall::JsonType(val, path) => {
+            let v: CoreValue = val.into();
+            let path_v: Option<CoreValue> = path.map(|p| p.into());
+            let _ = json_type(&v, path_v.as_ref());
+        }
+        ScalarFuncCall::JsonValid(val) => {
+            let v: CoreValue = val.into();
+            let _ = is_json_valid(&v);
+        }
+        ScalarFuncCall::JsonQuote(val) => {
+            let v: CoreValue = val.into();
+            let _ = json_quote(&v);
+        }
+        ScalarFuncCall::JsonArrayLength(val, path) => {
+            let v: CoreValue = val.into();
+            let path_v: Option<CoreValue> = path.map(|p| p.into());
+            let cache = JsonCacheCell::new();
+            let _ = json_array_length(&v, path_v.as_ref(), &cache);
+        }
+        ScalarFuncCall::JsonErrorPosition(val) => {
+            let v: CoreValue = val.into();
+            let _ = json_error_position(&v);
+        }
+        ScalarFuncCall::JsonSet(mut vals) => {
+            vals.truncate(MAX_VARIADIC_ARGS);
+            let vals: Vec<CoreValue> = vals.into_iter().map(|v| v.into()).collect();
+            let cache = JsonCacheCell::new();
+            let _ = json_set(vals.iter(), &cache);
+        }
+        ScalarFuncCall::JsonInsert(mut vals) => {
+            vals.truncate(MAX_VARIADIC_ARGS);
+            let vals: Vec<CoreValue> = vals.into_iter().map(|v| v.into()).collect();
+            let cache = JsonCacheCell::new();
+            let _ = json_insert(vals.iter(), &cache);
+        }
+        ScalarFuncCall::JsonReplace(mut vals) => {
+            vals.truncate(MAX_VARIADIC_ARGS);
+            let vals: Vec<CoreValue> = vals.into_iter().map(|v| v.into()).collect();
+            let cache = JsonCacheCell::new();
+            let _ = json_replace(vals.iter(), &cache);
+        }
+        ScalarFuncCall::JsonRemove(mut vals) => {
+            vals.truncate(MAX_VARIADIC_ARGS);
+            let vals: Vec<CoreValue> = vals.into_iter().map(|v| v.into()).collect();
+            let cache = JsonCacheCell::new();
+            let _ = json_remove(vals.iter(), &cache);
+        }
+        ScalarFuncCall::JsonPatch(v1, v2) => {
+            let v1: CoreValue = v1.into();
+            let v2: CoreValue = v2.into();
+            let cache = JsonCacheCell::new();
+            let _ = json_patch(&v1, &v2, &cache);
         }
     }
 }

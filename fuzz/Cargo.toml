@@ -11,7 +11,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 arbitrary = { version = "1.4.1", features = ["derive"] }
-turso_core = { path = "../core", features = ["fuzz"] }
+turso_core = { path = "../core", features = ["fuzz", "json"] }
 rusqlite = { version = "0.37.0", features = ["bundled"] }
 
 # Prevent this from interfering with workspaces

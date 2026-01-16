@@ -83,6 +83,12 @@ pub struct JsonCacheCell {
     accessed: Cell<bool>,
 }
 
+impl Default for JsonCacheCell {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl JsonCacheCell {
     pub fn new() -> Self {
         Self {
