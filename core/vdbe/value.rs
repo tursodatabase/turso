@@ -4,7 +4,7 @@ use regex::{Regex, RegexBuilder};
 
 use crate::{
     function::MathFunc,
-    numeric::{NullableInteger, Numeric},
+    numeric::{format_float, NullableInteger, Numeric},
     translate::collate::CollationSeq,
     types::{compare_immutable_single, AsValueRef, SeekOp},
     vdbe::affinity::Affinity,
@@ -341,7 +341,10 @@ impl Value {
         Value::Integer(generate_random_number())
     }
 
-    pub fn exec_randomblob<F>(&self, fill_bytes: F) -> Value
+    /// SQLite default max blob/string size (1GB)
+    pub const MAX_BLOB_LENGTH: i64 = 1_000_000_000;
+
+    pub fn exec_randomblob<F>(&self, fill_bytes: F) -> Result<Value>
     where
         F: Fn(&mut [u8]),
     {
@@ -351,11 +354,15 @@ impl Value {
             Value::Text(t) => t.as_str().parse().unwrap_or(1),
             _ => 1,
         }
-        .max(1) as usize;
+        .max(1);
 
-        let mut blob: Vec<u8> = vec![0; length];
+        if length > Self::MAX_BLOB_LENGTH {
+            return Err(LimboError::TooBig);
+        }
+
+        let mut blob: Vec<u8> = vec![0; length as usize];
         fill_bytes(&mut blob);
-        Value::Blob(blob)
+        Ok(Value::Blob(blob))
     }
 
     pub fn exec_quote(&self) -> Self {
@@ -431,36 +438,44 @@ impl Value {
             }
         }
 
+        // Match SQLite's substr algorithm exactly (func.c substrFunc)
+        // Uses wrapping arithmetic to match C overflow behavior
         fn calculate_postions(
-            start: i64,
-            bytes_len: usize,
+            mut p1: i64,
+            len: usize,
             length_value: Option<&Value>,
         ) -> (usize, usize) {
-            let bytes_len = bytes_len as i64;
-
-            // The left-most character of X is number 1.
-            // If Y is negative then the first character of the substring is found by counting from the right rather than the left.
-            let first_position = if start < 0 {
-                bytes_len.saturating_sub((start).abs())
-            } else {
-                start - 1
-            };
-            // If Z is negative then the abs(Z) characters preceding the Y-th character are returned.
-            let last_position = match length_value {
-                Some(Value::Integer(length)) => first_position + *length,
-                _ => bytes_len,
+            let len = len as i64;
+            let mut p2 = match length_value {
+                Some(Value::Integer(length)) => *length,
+                _ => len, // Default: rest of string
             };
 
-            let (start, end) = if first_position <= last_position {
-                (first_position, last_position)
-            } else {
-                (last_position, first_position)
-            };
+            // Handle negative start position (count from end)
+            if p1 < 0 {
+                p1 = p1.wrapping_add(len);
+                if p1 < 0 {
+                    p2 = p2.wrapping_add(p1);
+                    p1 = 0;
+                }
+            } else if p1 > 0 {
+                p1 -= 1; // Convert 1-indexed to 0-indexed
+            }
 
-            (
-                start.clamp(-0, bytes_len) as usize,
-                end.clamp(0, bytes_len) as usize,
-            )
+            // Handle negative length (characters preceding position)
+            if p2 < 0 {
+                if p2 < -p1 {
+                    p2 = p1;
+                } else {
+                    p2 = -p2;
+                }
+                p1 -= p2;
+            }
+
+            // Clamp to valid range
+            let start = p1.max(0).min(len) as usize;
+            let end = p1.saturating_add(p2).max(0).min(len) as usize;
+            (start, end)
         }
 
         let start_value = start_value.exec_cast("INT");
@@ -678,14 +693,20 @@ impl Value {
         self._exec_trim(pattern, TrimType::Left)
     }
 
-    pub fn exec_zeroblob(&self) -> Value {
+    pub fn exec_zeroblob(&self) -> Result<Value> {
         let length: i64 = match self {
             Value::Integer(i) => *i,
             Value::Float(f) => *f as i64,
             Value::Text(s) => s.as_str().parse().unwrap_or(0),
             _ => 0,
-        };
-        Value::Blob(vec![0; length.max(0) as usize])
+        }
+        .max(0);
+
+        if length > Self::MAX_BLOB_LENGTH {
+            return Err(LimboError::TooBig);
+        }
+
+        Ok(Value::Blob(vec![0; length as usize]))
     }
 
     // exec_if returns whether you should jump
@@ -1096,8 +1117,10 @@ impl Value {
         for val in registers {
             match val {
                 Value::Null => continue,
-                Value::Blob(_) => todo!("TODO concat blob"),
-                v => result.push_str(&format!("{v}")),
+                Value::Text(s) => result.push_str(s.as_str()),
+                Value::Blob(b) => result.push_str(&String::from_utf8_lossy(b)),
+                Value::Integer(i) => result.push_str(&i.to_string()),
+                Value::Float(f) => result.push_str(&format_float(*f)),
             }
         }
         Value::build_text(result)
@@ -1992,9 +2015,12 @@ mod tests {
         ];
 
         for test_case in &test_cases {
-            let result = test_case.input.exec_randomblob(|dest| {
-                rand::rng().fill_bytes(dest);
-            });
+            let result = test_case
+                .input
+                .exec_randomblob(|dest| {
+                    rand::rng().fill_bytes(dest);
+                })
+                .unwrap();
             match result {
                 Value::Blob(blob) => {
                     assert_eq!(blob.len(), test_case.expected_len);
@@ -2002,6 +2028,10 @@ mod tests {
                 _ => panic!("exec_randomblob did not return a Blob variant"),
             }
         }
+
+        // Test TooBig error
+        let input = Value::Integer(Value::MAX_BLOB_LENGTH + 1);
+        assert!(input.exec_randomblob(|_| {}).is_err());
     }
 
     #[test]
@@ -2318,39 +2348,43 @@ mod tests {
     fn test_exec_zeroblob() {
         let input = Value::Integer(0);
         let expected = Value::Blob(vec![]);
-        assert_eq!(input.exec_zeroblob(), expected);
+        assert_eq!(input.exec_zeroblob().unwrap(), expected);
 
         let input = Value::Null;
         let expected = Value::Blob(vec![]);
-        assert_eq!(input.exec_zeroblob(), expected);
+        assert_eq!(input.exec_zeroblob().unwrap(), expected);
 
         let input = Value::Integer(4);
         let expected = Value::Blob(vec![0; 4]);
-        assert_eq!(input.exec_zeroblob(), expected);
+        assert_eq!(input.exec_zeroblob().unwrap(), expected);
 
         let input = Value::Integer(-1);
         let expected = Value::Blob(vec![]);
-        assert_eq!(input.exec_zeroblob(), expected);
+        assert_eq!(input.exec_zeroblob().unwrap(), expected);
 
         let input = Value::build_text("5");
         let expected = Value::Blob(vec![0; 5]);
-        assert_eq!(input.exec_zeroblob(), expected);
+        assert_eq!(input.exec_zeroblob().unwrap(), expected);
 
         let input = Value::build_text("-5");
         let expected = Value::Blob(vec![]);
-        assert_eq!(input.exec_zeroblob(), expected);
+        assert_eq!(input.exec_zeroblob().unwrap(), expected);
 
         let input = Value::build_text("text");
         let expected = Value::Blob(vec![]);
-        assert_eq!(input.exec_zeroblob(), expected);
+        assert_eq!(input.exec_zeroblob().unwrap(), expected);
 
         let input = Value::Float(2.6);
         let expected = Value::Blob(vec![0; 2]);
-        assert_eq!(input.exec_zeroblob(), expected);
+        assert_eq!(input.exec_zeroblob().unwrap(), expected);
 
         let input = Value::Blob(vec![1]);
         let expected = Value::Blob(vec![]);
-        assert_eq!(input.exec_zeroblob(), expected);
+        assert_eq!(input.exec_zeroblob().unwrap(), expected);
+
+        // Test TooBig error
+        let input = Value::Integer(Value::MAX_BLOB_LENGTH + 1);
+        assert!(input.exec_zeroblob().is_err());
     }
 
     #[test]

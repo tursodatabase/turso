@@ -861,19 +861,19 @@ fn nullif_strings(bencher: Bencher) {
 #[divan::bench]
 fn zeroblob_small(bencher: Bencher) {
     let value = Value::Integer(10);
-    bencher.bench_local(|| black_box(&value).exec_zeroblob());
+    bencher.bench_local(|| black_box(&value).exec_zeroblob().unwrap());
 }
 
 #[divan::bench]
 fn zeroblob_medium(bencher: Bencher) {
     let value = Value::Integer(1000);
-    bencher.bench_local(|| black_box(&value).exec_zeroblob());
+    bencher.bench_local(|| black_box(&value).exec_zeroblob().unwrap());
 }
 
 #[divan::bench]
 fn zeroblob_large(bencher: Bencher) {
     let value = Value::Integer(10000);
-    bencher.bench_local(|| black_box(&value).exec_zeroblob());
+    bencher.bench_local(|| black_box(&value).exec_zeroblob().unwrap());
 }
 
 // =============================================================================
@@ -1016,17 +1016,17 @@ fn exec_random(bencher: Bencher) {
 #[divan::bench]
 fn exec_randomblob_small(bencher: Bencher) {
     let length = Value::Integer(10);
-    bencher.bench_local(|| black_box(&length).exec_randomblob(|buf| buf.fill(0)));
+    bencher.bench_local(|| black_box(&length).exec_randomblob(|buf| buf.fill(0)).unwrap());
 }
 
 #[divan::bench]
 fn exec_randomblob_medium(bencher: Bencher) {
     let length = Value::Integer(100);
-    bencher.bench_local(|| black_box(&length).exec_randomblob(|buf| buf.fill(0)));
+    bencher.bench_local(|| black_box(&length).exec_randomblob(|buf| buf.fill(0)).unwrap());
 }
 
 #[divan::bench]
 fn exec_randomblob_large(bencher: Bencher) {
     let length = Value::Integer(1000);
-    bencher.bench_local(|| black_box(&length).exec_randomblob(|buf| buf.fill(0)));
+    bencher.bench_local(|| black_box(&length).exec_randomblob(|buf| buf.fill(0)).unwrap());
 }

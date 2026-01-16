@@ -49,6 +49,8 @@ pub enum LimboError {
     ExtensionError(String),
     #[error("Runtime error: integer overflow")]
     IntegerOverflow,
+    #[error("Runtime error: string or blob too big")]
+    TooBig,
     #[error("Runtime error: database table is locked")]
     TableLocked,
     #[error("Error: Resource is read-only")]
