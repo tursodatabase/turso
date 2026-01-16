@@ -30,3 +30,7 @@ path = "fuzz_targets/expression.rs"
 [[bin]]
 name = "cast_real"
 path = "fuzz_targets/cast_real.rs"
+
+[[bin]]
+name = "scalar_func"
+path = "fuzz_targets/scalar_func.rs"
