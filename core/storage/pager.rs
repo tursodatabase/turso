@@ -2176,11 +2176,6 @@ impl Pager {
             return Ok(IOResult::Done(()));
         };
 
-        let schema_did_change = match connection.get_tx_state() {
-            TransactionState::Write { schema_did_change } => schema_did_change,
-            _ => false,
-        };
-
         loop {
             let commit_state = self.commit_info.read().state;
             tracing::debug!("commit_state: {:?}", commit_state);
@@ -2215,6 +2210,17 @@ impl Pager {
                         connection.get_sync_mode(),
                         connection.get_data_sync_retry()
                     ));
+
+                    let schema_did_change = match connection.get_tx_state() {
+                        TransactionState::Write { schema_did_change } => schema_did_change,
+                        _ => false,
+                    };
+
+                    if schema_did_change {
+                        let schema = connection.schema.read().clone();
+                        connection.db.update_schema_if_newer(schema);
+                    }
+
                     wal.end_write_tx();
                     wal.end_read_tx();
                     connection.set_tx_state(TransactionState::None);
@@ -2227,10 +2233,6 @@ impl Pager {
             }
         }
 
-        if schema_did_change {
-            let schema = connection.schema.read().clone();
-            connection.db.update_schema_if_newer(schema);
-        }
         Ok(IOResult::Done(()))
     }
 
