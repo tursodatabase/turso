@@ -730,7 +730,8 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut config = shuttle::Config::default();
     config.stack_size *= 10;
     // Use a very high step limit since Antithesis controls duration
-    config.max_steps = shuttle::MaxSteps::FailAfter(100_000_000);
+    config.max_steps = shuttle::MaxSteps::None;
+    config.failure_persistence = shuttle::FailurePersistence::None;
 
     let scheduler = AntithesisScheduler::new();
     let runner = shuttle::Runner::new(scheduler, config);
@@ -748,6 +749,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut config = shuttle::Config::default();
     config.stack_size *= 10;
     config.max_steps = shuttle::MaxSteps::FailAfter(10_000_000);
+    config.failure_persistence = shuttle::FailurePersistence::None;
 
     // let scheduler = DfsScheduler::new(None, false);
     let scheduler = RandomScheduler::new(5);
