@@ -534,7 +534,12 @@ impl Value {
         };
 
         match reg.find(pattern) {
-            Some(position) => Value::Integer(position as i64 + 1),
+            Some(byte_position) => {
+                // Convert byte position to character position
+                // SQLite's INSTR returns 1-based character position, not byte position
+                let char_position = reg[..byte_position].chars().count();
+                Value::Integer(char_position as i64 + 1)
+            }
             None => Value::Integer(0),
         }
     }
@@ -2237,6 +2242,34 @@ mod tests {
         let input = Value::build_text("abcde");
         let pattern = Value::build_text("");
         let expected = Value::Integer(1);
+        assert_eq!(input.exec_instr(&pattern), expected);
+
+        // UTF-8 multi-byte character tests
+        // Japanese characters (3 bytes each): 日=\xe6\x97\xa5, 本=\xe6\x9c\xac, 語=\xe8\xaa\x9e
+        let input = Value::build_text("日本語test");
+        let pattern = Value::build_text("test");
+        let expected = Value::Integer(4); // 4th character, not 10th byte
+        assert_eq!(input.exec_instr(&pattern), expected);
+
+        let input = Value::build_text("日本語test");
+        let pattern = Value::build_text("本");
+        let expected = Value::Integer(2); // 2nd character
+        assert_eq!(input.exec_instr(&pattern), expected);
+
+        let input = Value::build_text("hello日本語world");
+        let pattern = Value::build_text("world");
+        let expected = Value::Integer(9); // 9th character (5 + 3 + 1)
+        assert_eq!(input.exec_instr(&pattern), expected);
+
+        // Emoji test (4 bytes each)
+        let input = Value::build_text("🎉party");
+        let pattern = Value::build_text("party");
+        let expected = Value::Integer(2); // 2nd character, not 5th byte
+        assert_eq!(input.exec_instr(&pattern), expected);
+
+        let input = Value::build_text("a🎉b🎊c");
+        let pattern = Value::build_text("c");
+        let expected = Value::Integer(5); // 5th character
         assert_eq!(input.exec_instr(&pattern), expected);
     }
 
