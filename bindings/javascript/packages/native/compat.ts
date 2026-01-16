@@ -1,4 +1,4 @@
-import { DatabaseCompat, NativeDatabase, SqliteError, DatabaseOpts, EncryptionCipher } from "@tursodatabase/database-common"
+import { DatabaseCompat, NativeDatabase, SqliteError, DatabaseOpts, EncryptionCipher, sql, SqlQuery } from "@tursodatabase/database-common"
 import { Database as NativeDB, EncryptionCipher as NativeEncryptionCipher } from "#index";
 
 // Map string cipher names to native enum values (lazy to avoid errors if native module lacks encryption)
@@ -31,4 +31,4 @@ class Database extends DatabaseCompat {
     }
 }
 
-export { Database, SqliteError }
+export { Database, SqliteError, sql, SqlQuery }

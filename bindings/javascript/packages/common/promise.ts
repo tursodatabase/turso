@@ -1,6 +1,7 @@
 import { AsyncLock } from "./async-lock.js";
 import { bindParams } from "./bind.js";
 import { SqliteError } from "./sqlite-error.js";
+import { SqlQuery, isSqlQuery } from "./sql-template.js";
 import { NativeDatabase, NativeStatement, STEP_IO, STEP_ROW, STEP_DONE, DatabaseOpts } from "./types.js";
 
 const convertibleErrorTypes = { TypeError };
@@ -105,22 +106,24 @@ class Database {
    * Execute a query and return the first result row.
    * This is a convenience method that prepares, executes, and closes the statement.
    *
-   * @param {string} sql - The SQL query string.
-   * @param {any[]} params - Optional bind parameters.
+   * @param {string | SqlQuery} sql - The SQL query string or a SqlQuery from the `sql` tagged template.
+   * @param {any[]} params - Optional bind parameters (ignored if sql is a SqlQuery).
    * @returns The first row or undefined if no results.
    *
    * @example
    * ```typescript
+   * // With string and parameters
    * const user = await db.query<User>('SELECT * FROM users WHERE id = ?', [1]);
+   *
+   * // With sql tagged template
+   * const user = await db.query<User>(sql`SELECT * FROM users WHERE id = ${1}`);
    * ```
    */
-  async query<T = unknown>(sql: string, params?: unknown[]): Promise<T | undefined> {
-    const stmt = this.prepare<T>(sql);
+  async query<T = unknown>(sql: string | SqlQuery, params?: unknown[]): Promise<T | undefined> {
+    const [sqlStr, bindParams] = isSqlQuery(sql) ? [sql.sql, sql.params] : [sql, params];
+    const stmt = this.prepare<T>(sqlStr);
     try {
-      if (params && params.length > 0) {
-        return await stmt.get(...params);
-      }
-      return await stmt.get();
+      return bindParams?.length ? await stmt.get(...bindParams) : await stmt.get();
     } finally {
       stmt.close();
     }
@@ -130,22 +133,24 @@ class Database {
    * Execute a query and return all result rows.
    * This is a convenience method that prepares, executes, and closes the statement.
    *
-   * @param {string} sql - The SQL query string.
-   * @param {any[]} params - Optional bind parameters.
+   * @param {string | SqlQuery} sql - The SQL query string or a SqlQuery from the `sql` tagged template.
+   * @param {any[]} params - Optional bind parameters (ignored if sql is a SqlQuery).
    * @returns An array of all result rows.
    *
    * @example
    * ```typescript
+   * // With string and parameters
    * const users = await db.queryAll<User>('SELECT * FROM users WHERE age > ?', [18]);
+   *
+   * // With sql tagged template
+   * const users = await db.queryAll<User>(sql`SELECT * FROM users WHERE age > ${18}`);
    * ```
    */
-  async queryAll<T = unknown>(sql: string, params?: unknown[]): Promise<T[]> {
-    const stmt = this.prepare<T>(sql);
+  async queryAll<T = unknown>(sql: string | SqlQuery, params?: unknown[]): Promise<T[]> {
+    const [sqlStr, bindParams] = isSqlQuery(sql) ? [sql.sql, sql.params] : [sql, params];
+    const stmt = this.prepare<T>(sqlStr);
     try {
-      if (params && params.length > 0) {
-        return await stmt.all(...params);
-      }
-      return await stmt.all();
+      return bindParams?.length ? await stmt.all(...bindParams) : await stmt.all();
     } finally {
       stmt.close();
     }

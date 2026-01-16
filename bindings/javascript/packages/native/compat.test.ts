@@ -1,6 +1,6 @@
 import { unlinkSync } from "node:fs";
 import { expect, test } from 'vitest'
-import { Database } from './compat.js'
+import { Database, sql } from './compat.js'
 
 test('insert returning test', () => {
     const db = new Database(':memory:');
@@ -342,4 +342,134 @@ test('generic types - queryAll<T> returns typed array', () => {
     expect(products.length).toBe(2);
     expect(products[0].name).toBe('Widget');
     expect(products[1].price).toBe(19.99);
+})
+
+// ============================================
+// Tests for sql tagged template (Tier 2) - Sync API
+// ============================================
+
+test('sql template - basic query with single parameter', () => {
+    const db = new Database(':memory:');
+    db.exec('CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)');
+    db.exec("INSERT INTO users (name, age) VALUES ('Alice', 30), ('Bob', 25), ('Charlie', 35)");
+
+    const minAge = 28;
+    const users = db.queryAll(sql`SELECT * FROM users WHERE age > ${minAge} ORDER BY id`);
+
+    expect(users).toEqual([
+        { id: 1, name: 'Alice', age: 30 },
+        { id: 3, name: 'Charlie', age: 35 }
+    ]);
+})
+
+test('sql template - query with multiple parameters', () => {
+    const db = new Database(':memory:');
+    db.exec('CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)');
+    db.exec("INSERT INTO users (name, age) VALUES ('Alice', 30), ('Bob', 25), ('Charlie', 35)");
+
+    const minAge = 20;
+    const maxAge = 32;
+    const users = db.queryAll(sql`SELECT * FROM users WHERE age > ${minAge} AND age < ${maxAge} ORDER BY id`);
+
+    expect(users).toEqual([
+        { id: 1, name: 'Alice', age: 30 },
+        { id: 2, name: 'Bob', age: 25 }
+    ]);
+})
+
+test('sql template - query() returns first row', () => {
+    const db = new Database(':memory:');
+    db.exec('CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)');
+    db.exec("INSERT INTO users (name) VALUES ('Alice'), ('Bob')");
+
+    const id = 1;
+    const user = db.query(sql`SELECT * FROM users WHERE id = ${id}`);
+
+    expect(user).toEqual({ id: 1, name: 'Alice' });
+})
+
+test('sql template - query() returns undefined for no results', () => {
+    const db = new Database(':memory:');
+    db.exec('CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)');
+
+    const id = 999;
+    const user = db.query(sql`SELECT * FROM users WHERE id = ${id}`);
+
+    expect(user).toBeUndefined();
+})
+
+test('sql template - with string parameter', () => {
+    const db = new Database(':memory:');
+    db.exec('CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)');
+    db.exec("INSERT INTO users (name) VALUES ('Alice'), ('Bob')");
+
+    const name = 'Alice';
+    const user = db.query(sql`SELECT * FROM users WHERE name = ${name}`);
+
+    expect(user).toEqual({ id: 1, name: 'Alice' });
+})
+
+test('sql template - no parameters (static query)', () => {
+    const db = new Database(':memory:');
+    db.exec('CREATE TABLE config (key TEXT, value TEXT)');
+    db.exec("INSERT INTO config VALUES ('version', '1.0')");
+
+    const config = db.query(sql`SELECT * FROM config`);
+
+    expect(config).toEqual({ key: 'version', value: '1.0' });
+})
+
+test('sql template - with generic type parameter', () => {
+    interface User {
+        id: number;
+        name: string;
+        age: number;
+    }
+
+    const db = new Database(':memory:');
+    db.exec('CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)');
+    db.exec("INSERT INTO users (name, age) VALUES ('Alice', 30)");
+
+    const minAge = 25;
+    const users = db.queryAll<User>(sql`SELECT * FROM users WHERE age > ${minAge}`);
+
+    expect(users.length).toBe(1);
+    expect(users[0].id).toBe(1);
+    expect(users[0].name).toBe('Alice');
+    expect(users[0].age).toBe(30);
+})
+
+test('sql template - prevents SQL injection', () => {
+    const db = new Database(':memory:');
+    db.exec('CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)');
+    db.exec("INSERT INTO users (name) VALUES ('Alice'), ('Bob')");
+
+    // Attempt SQL injection - should be safely parameterized
+    const maliciousInput = "'; DROP TABLE users; --";
+    const user = db.query(sql`SELECT * FROM users WHERE name = ${maliciousInput}`);
+
+    // Should return no results, not execute the injection
+    expect(user).toBeUndefined();
+
+    // Table should still exist
+    const allUsers = db.queryAll(sql`SELECT * FROM users ORDER BY id`);
+    expect(allUsers.length).toBe(2);
+})
+
+test('sql template - mixed with regular query methods', () => {
+    const db = new Database(':memory:');
+    db.exec('CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)');
+    db.exec("INSERT INTO users (name, age) VALUES ('Alice', 30), ('Bob', 25)");
+
+    // Use sql template
+    const minAge = 20;
+    const templateResult = db.queryAll(sql`SELECT * FROM users WHERE age > ${minAge}`);
+    expect(templateResult.length).toBe(2);
+
+    // Use regular string with params array (should still work)
+    const regularResult = db.queryAll('SELECT * FROM users WHERE age > ?', [20]);
+    expect(regularResult.length).toBe(2);
+
+    // Results should be identical
+    expect(templateResult).toEqual(regularResult);
 })

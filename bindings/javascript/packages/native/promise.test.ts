@@ -1,7 +1,7 @@
 import { unlinkSync } from "node:fs";
 import { expect, test } from 'vitest'
-import { Database, connect } from './promise.js'
-import { sql } from 'drizzle-orm';
+import { Database, connect, sql } from './promise.js'
+import { sql as drizzleSql } from 'drizzle-orm';
 import { drizzle } from 'drizzle-orm/better-sqlite3';
 
 test('drizzle-orm', async () => {
@@ -12,7 +12,7 @@ test('drizzle-orm', async () => {
         await db.run('CREATE TABLE t(x, y)');
         let tasks = [];
         for (let i = 0; i < 1234; i++) {
-            tasks.push(db.run(sql`INSERT INTO t VALUES (${i}, randomblob(${i} * 5))`))
+            tasks.push(db.run(drizzleSql`INSERT INTO t VALUES (${i}, randomblob(${i} * 5))`))
         }
         await Promise.all(tasks);
         expect(await db.all("SELECT COUNT(*) as cnt FROM t")).toEqual([{ cnt: 1234 }])
@@ -468,4 +468,157 @@ test('generic types - queryAll<T> returns typed array', async () => {
     expect(products.length).toBe(2);
     expect(products[0].name).toBe('Widget');
     expect(products[1].price).toBe(19.99);
+})
+
+// ============================================
+// Tests for sql tagged template (Tier 2)
+// ============================================
+
+test('sql template - basic query with single parameter', async () => {
+    const db = await connect(':memory:');
+    await db.exec('CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)');
+    await db.exec("INSERT INTO users (name, age) VALUES ('Alice', 30), ('Bob', 25), ('Charlie', 35)");
+
+    const minAge = 28;
+    const users = await db.queryAll(sql`SELECT * FROM users WHERE age > ${minAge} ORDER BY id`);
+
+    expect(users).toEqual([
+        { id: 1, name: 'Alice', age: 30 },
+        { id: 3, name: 'Charlie', age: 35 }
+    ]);
+})
+
+test('sql template - query with multiple parameters', async () => {
+    const db = await connect(':memory:');
+    await db.exec('CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)');
+    await db.exec("INSERT INTO users (name, age) VALUES ('Alice', 30), ('Bob', 25), ('Charlie', 35)");
+
+    const minAge = 20;
+    const maxAge = 32;
+    const users = await db.queryAll(sql`SELECT * FROM users WHERE age > ${minAge} AND age < ${maxAge} ORDER BY id`);
+
+    expect(users).toEqual([
+        { id: 1, name: 'Alice', age: 30 },
+        { id: 2, name: 'Bob', age: 25 }
+    ]);
+})
+
+test('sql template - query() returns first row', async () => {
+    const db = await connect(':memory:');
+    await db.exec('CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)');
+    await db.exec("INSERT INTO users (name) VALUES ('Alice'), ('Bob')");
+
+    const id = 1;
+    const user = await db.query(sql`SELECT * FROM users WHERE id = ${id}`);
+
+    expect(user).toEqual({ id: 1, name: 'Alice' });
+})
+
+test('sql template - query() returns undefined for no results', async () => {
+    const db = await connect(':memory:');
+    await db.exec('CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)');
+
+    const id = 999;
+    const user = await db.query(sql`SELECT * FROM users WHERE id = ${id}`);
+
+    expect(user).toBeUndefined();
+})
+
+test('sql template - with string parameter', async () => {
+    const db = await connect(':memory:');
+    await db.exec('CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)');
+    await db.exec("INSERT INTO users (name) VALUES ('Alice'), ('Bob')");
+
+    const name = 'Alice';
+    const user = await db.query(sql`SELECT * FROM users WHERE name = ${name}`);
+
+    expect(user).toEqual({ id: 1, name: 'Alice' });
+})
+
+test('sql template - with null parameter', async () => {
+    const db = await connect(':memory:');
+    await db.exec('CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT)');
+    await db.exec("INSERT INTO users (name, email) VALUES ('Alice', NULL), ('Bob', 'bob@test.com')");
+
+    const email = null;
+    const users = await db.queryAll(sql`SELECT * FROM users WHERE email IS ${email}`);
+
+    expect(users).toEqual([{ id: 1, name: 'Alice', email: null }]);
+})
+
+test('sql template - with blob parameter', async () => {
+    const db = await connect(':memory:');
+    await db.exec('CREATE TABLE data (id INTEGER PRIMARY KEY, content BLOB)');
+
+    const blob = Buffer.from([1, 2, 3, 4]);
+    await db.exec("INSERT INTO data (content) VALUES (x'01020304')");
+
+    const row = await db.query(sql`SELECT * FROM data WHERE content = ${blob}`);
+
+    expect(row).toEqual({ id: 1, content: Buffer.from([1, 2, 3, 4]) });
+})
+
+test('sql template - no parameters (static query)', async () => {
+    const db = await connect(':memory:');
+    await db.exec('CREATE TABLE config (key TEXT, value TEXT)');
+    await db.exec("INSERT INTO config VALUES ('version', '1.0')");
+
+    const config = await db.query(sql`SELECT * FROM config`);
+
+    expect(config).toEqual({ key: 'version', value: '1.0' });
+})
+
+test('sql template - with generic type parameter', async () => {
+    interface User {
+        id: number;
+        name: string;
+        age: number;
+    }
+
+    const db = await connect(':memory:');
+    await db.exec('CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)');
+    await db.exec("INSERT INTO users (name, age) VALUES ('Alice', 30)");
+
+    const minAge = 25;
+    const users = await db.queryAll<User>(sql`SELECT * FROM users WHERE age > ${minAge}`);
+
+    expect(users.length).toBe(1);
+    expect(users[0].id).toBe(1);
+    expect(users[0].name).toBe('Alice');
+    expect(users[0].age).toBe(30);
+})
+
+test('sql template - prevents SQL injection', async () => {
+    const db = await connect(':memory:');
+    await db.exec('CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)');
+    await db.exec("INSERT INTO users (name) VALUES ('Alice'), ('Bob')");
+
+    // Attempt SQL injection - should be safely parameterized
+    const maliciousInput = "'; DROP TABLE users; --";
+    const user = await db.query(sql`SELECT * FROM users WHERE name = ${maliciousInput}`);
+
+    // Should return no results, not execute the injection
+    expect(user).toBeUndefined();
+
+    // Table should still exist
+    const allUsers = await db.queryAll(sql`SELECT * FROM users ORDER BY id`);
+    expect(allUsers.length).toBe(2);
+})
+
+test('sql template - mixed with regular query methods', async () => {
+    const db = await connect(':memory:');
+    await db.exec('CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)');
+    await db.exec("INSERT INTO users (name, age) VALUES ('Alice', 30), ('Bob', 25)");
+
+    // Use sql template
+    const minAge = 20;
+    const templateResult = await db.queryAll(sql`SELECT * FROM users WHERE age > ${minAge}`);
+    expect(templateResult.length).toBe(2);
+
+    // Use regular string with params array (should still work)
+    const regularResult = await db.queryAll('SELECT * FROM users WHERE age > ?', [20]);
+    expect(regularResult.length).toBe(2);
+
+    // Results should be identical
+    expect(templateResult).toEqual(regularResult);
 })
