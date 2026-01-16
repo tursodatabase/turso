@@ -448,7 +448,9 @@ impl Value {
             let len = len as i64;
             let mut p2 = match length_value {
                 Some(Value::Integer(length)) => *length,
-                _ => len, // Default: rest of string
+                // SQLite uses SQLITE_LIMIT_LENGTH (default 1 billion) when no explicit length.
+                // Using len causes wrong results when p1 is large negative number.
+                _ => Value::MAX_BLOB_LENGTH,
             };
 
             // Track if length was explicitly provided
