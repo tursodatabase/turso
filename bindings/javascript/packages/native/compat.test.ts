@@ -473,3 +473,81 @@ test('sql template - mixed with regular query methods', () => {
     // Results should be identical
     expect(templateResult).toEqual(regularResult);
 })
+
+// ============================================
+// Tests for db.batch() (Tier 2) - Sync API
+// ============================================
+
+test('batch - executes multiple inserts atomically', () => {
+    const db = new Database(':memory:');
+    db.exec('CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)');
+
+    const results = db.batch([
+        db.prepare('INSERT INTO users (name) VALUES (?)').bind('Alice'),
+        db.prepare('INSERT INTO users (name) VALUES (?)').bind('Bob'),
+        db.prepare('INSERT INTO users (name) VALUES (?)').bind('Charlie'),
+    ]);
+
+    expect(results.length).toBe(3);
+    // Note: changes is 0 inside transactions (pre-existing limitation)
+    expect(results[0].lastInsertRowid).toBe(1);
+    expect(results[1].lastInsertRowid).toBe(2);
+    expect(results[2].lastInsertRowid).toBe(3);
+
+    // Verify all rows were inserted
+    const users = db.queryAll('SELECT * FROM users ORDER BY id');
+    expect(users).toEqual([
+        { id: 1, name: 'Alice' },
+        { id: 2, name: 'Bob' },
+        { id: 3, name: 'Charlie' },
+    ]);
+})
+
+test('batch - rolls back on error', () => {
+    const db = new Database(':memory:');
+    db.exec('CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL)');
+
+    // First insert should succeed, second should fail (NULL name)
+    expect(() => db.batch([
+        db.prepare('INSERT INTO users (name) VALUES (?)').bind('Alice'),
+        db.prepare('INSERT INTO users (name) VALUES (?)').bind(null),
+    ])).toThrow();
+
+    // Verify the transaction was rolled back - no rows should exist
+    const users = db.queryAll('SELECT * FROM users');
+    expect(users).toEqual([]);
+})
+
+test('batch - empty array returns empty results', () => {
+    const db = new Database(':memory:');
+    const results = db.batch([]);
+    expect(results).toEqual([]);
+})
+
+test('batch - throws on non-array input', () => {
+    const db = new Database(':memory:');
+    // @ts-expect-error - Testing invalid input
+    expect(() => db.batch('not an array')).toThrow('Expected an array of statements');
+})
+
+test('batch - mixed insert and update', () => {
+    const db = new Database(':memory:');
+    db.exec('CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, active INTEGER DEFAULT 0)');
+    db.exec("INSERT INTO users (name) VALUES ('Alice'), ('Bob')");
+
+    const results = db.batch([
+        db.prepare('INSERT INTO users (name) VALUES (?)').bind('Charlie'),
+        db.prepare('UPDATE users SET active = 1 WHERE id <= 2'),
+    ]);
+
+    expect(results.length).toBe(2);
+    expect(results[0].lastInsertRowid).toBe(3);
+
+    // Verify the actual changes happened
+    const users = db.queryAll('SELECT * FROM users ORDER BY id');
+    expect(users).toEqual([
+        { id: 1, name: 'Alice', active: 1 },
+        { id: 2, name: 'Bob', active: 1 },
+        { id: 3, name: 'Charlie', active: 0 },
+    ]);
+})

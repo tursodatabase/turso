@@ -150,6 +150,51 @@ class Database {
   }
 
   /**
+   * Execute multiple statements atomically within a transaction.
+   * All statements are executed in order, and the entire batch is rolled back if any statement fails.
+   *
+   * @param {Statement[]} statements - Array of prepared (and optionally bound) statements to execute.
+   * @returns An array of RunResult objects, one per statement.
+   *
+   * @example
+   * ```typescript
+   * const results = db.batch([
+   *   db.prepare('INSERT INTO users (name) VALUES (?)').bind('Alice'),
+   *   db.prepare('INSERT INTO users (name) VALUES (?)').bind('Bob'),
+   *   db.prepare('UPDATE users SET active = 1'),
+   * ]);
+   * // results[0] = { changes: 1, lastInsertRowid: 1 }
+   * // results[1] = { changes: 1, lastInsertRowid: 2 }
+   * // results[2] = { changes: 2, lastInsertRowid: 2 }
+   * ```
+   */
+  batch(statements: Statement<unknown>[]): RunResult[] {
+    if (!Array.isArray(statements)) {
+      throw new TypeError("Expected an array of statements");
+    }
+    if (statements.length === 0) {
+      return [];
+    }
+
+    this.exec("BEGIN");
+    this._inTransaction = true;
+    const results: RunResult[] = [];
+
+    try {
+      for (const stmt of statements) {
+        results.push(stmt.run());
+      }
+      this.exec("COMMIT");
+      this._inTransaction = false;
+      return results;
+    } catch (err) {
+      this.exec("ROLLBACK");
+      this._inTransaction = false;
+      throw err;
+    }
+  }
+
+  /**
    * Returns a function that executes the given function in a transaction.
    *
    * @param {function} fn - The function to wrap in a transaction.

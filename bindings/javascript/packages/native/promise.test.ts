@@ -622,3 +622,111 @@ test('sql template - mixed with regular query methods', async () => {
     // Results should be identical
     expect(templateResult).toEqual(regularResult);
 })
+
+// ============================================
+// Tests for db.batch() (Tier 2)
+// ============================================
+
+test('batch - executes multiple inserts atomically', async () => {
+    const db = await connect(':memory:');
+    await db.exec('CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)');
+
+    const results = await db.batch([
+        db.prepare('INSERT INTO users (name) VALUES (?)').bind('Alice'),
+        db.prepare('INSERT INTO users (name) VALUES (?)').bind('Bob'),
+        db.prepare('INSERT INTO users (name) VALUES (?)').bind('Charlie'),
+    ]);
+
+    expect(results.length).toBe(3);
+    // Note: changes is 0 inside transactions (pre-existing limitation)
+    expect(results[0].lastInsertRowid).toBe(1);
+    expect(results[1].lastInsertRowid).toBe(2);
+    expect(results[2].lastInsertRowid).toBe(3);
+
+    // Verify all rows were inserted
+    const users = await db.queryAll('SELECT * FROM users ORDER BY id');
+    expect(users).toEqual([
+        { id: 1, name: 'Alice' },
+        { id: 2, name: 'Bob' },
+        { id: 3, name: 'Charlie' },
+    ]);
+})
+
+test('batch - rolls back on error', async () => {
+    const db = await connect(':memory:');
+    await db.exec('CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL)');
+
+    // First insert should succeed, second should fail (NULL name)
+    await expect(db.batch([
+        db.prepare('INSERT INTO users (name) VALUES (?)').bind('Alice'),
+        db.prepare('INSERT INTO users (name) VALUES (?)').bind(null), // This should fail
+    ])).rejects.toThrow();
+
+    // Verify the transaction was rolled back - no rows should exist
+    const users = await db.queryAll('SELECT * FROM users');
+    expect(users).toEqual([]);
+})
+
+test('batch - empty array returns empty results', async () => {
+    const db = await connect(':memory:');
+    const results = await db.batch([]);
+    expect(results).toEqual([]);
+})
+
+test('batch - throws on non-array input', async () => {
+    const db = await connect(':memory:');
+    // @ts-expect-error - Testing invalid input
+    await expect(db.batch('not an array')).rejects.toThrow('Expected an array of statements');
+})
+
+test('batch - mixed insert and update', async () => {
+    const db = await connect(':memory:');
+    await db.exec('CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, active INTEGER DEFAULT 0)');
+    await db.exec("INSERT INTO users (name) VALUES ('Alice'), ('Bob')");
+
+    const results = await db.batch([
+        db.prepare('INSERT INTO users (name) VALUES (?)').bind('Charlie'),
+        db.prepare('UPDATE users SET active = 1 WHERE id <= 2'),
+    ]);
+
+    expect(results.length).toBe(2);
+    expect(results[0].lastInsertRowid).toBe(3);
+
+    // Verify the actual changes happened
+    const users = await db.queryAll('SELECT * FROM users ORDER BY id');
+    expect(users).toEqual([
+        { id: 1, name: 'Alice', active: 1 },
+        { id: 2, name: 'Bob', active: 1 },
+        { id: 3, name: 'Charlie', active: 0 },
+    ]);
+})
+
+test('batch - sets inTransaction flag correctly', async () => {
+    const db = await connect(':memory:');
+    await db.exec('CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)');
+
+    expect(db.inTransaction).toBe(false);
+
+    await db.batch([
+        db.prepare('INSERT INTO users (name) VALUES (?)').bind('Alice'),
+    ]);
+
+    expect(db.inTransaction).toBe(false);
+})
+
+test('batch - resets inTransaction flag on error', async () => {
+    const db = await connect(':memory:');
+    await db.exec('CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL)');
+
+    expect(db.inTransaction).toBe(false);
+
+    try {
+        await db.batch([
+            db.prepare('INSERT INTO users (name) VALUES (?)').bind(null),
+        ]);
+    } catch (e) {
+        // Expected
+    }
+
+    expect(db.inTransaction).toBe(false);
+})
