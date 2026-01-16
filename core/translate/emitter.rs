@@ -2104,21 +2104,18 @@ fn emit_program_for_update(
     // conflicting row, we must delete from all indexes, not just those being updated.
     // We construct this AFTER open_loop so we can determine which index is used for
     // iteration and reuse that cursor instead of opening a new one.
-    let all_index_cursors: Vec<(Arc<Index>, usize)> = if or_conflict == ResolveType::Replace {
+    let all_index_cursors = if matches!(or_conflict, ResolveType::Replace) {
         let table_name = target_table.table.get_name();
-        let all_indexes: Vec<Arc<Index>> =
-            resolver.schema.get_indices(table_name).cloned().collect();
-        let mut result = Vec::with_capacity(all_indexes.len());
-        let internal_id = plan
+        let all_indexes = resolver.schema.get_indices(table_name);
+        let source_table = plan
             .table_references
             .joined_tables()
             .first()
-            .unwrap()
-            .internal_id;
+            .expect("UPDATE must have a joined table");
+        let internal_id = source_table.internal_id;
 
         // Determine which index (if any) is being used for iteration
         // We need to reuse that cursor to avoid corruption when deleting from it
-        let source_table = plan.table_references.joined_tables().first().unwrap();
         let iteration_index_name = match &source_table.op {
             Operation::Scan(Scan::BTreeTable { index, .. }) => index.as_ref().map(|i| &i.name),
             Operation::Search(Search::Seek {
@@ -2127,34 +2124,37 @@ fn emit_program_for_update(
             _ => None,
         };
 
-        for index in all_indexes {
-            // Check if this index already has a cursor opened (from indexes_to_update)
-            let existing_cursor = plan
-                .indexes_to_update
-                .iter()
-                .zip(&index_cursors)
-                .find(|(idx, _)| idx.name == index.name)
-                .map(|(_, (cursor_id, _))| *cursor_id);
+        all_indexes
+            .map(|index| {
+                // Check if this index already has a cursor opened (from indexes_to_update)
+                let existing_cursor = plan
+                    .indexes_to_update
+                    .iter()
+                    .zip(&index_cursors)
+                    .find(|(idx, _)| idx.name == index.name)
+                    .map(|(_, (cursor_id, _))| *cursor_id);
 
-            let cursor = if let Some(cursor) = existing_cursor {
-                cursor
-            } else if iteration_index_name == Some(&index.name) {
-                // This index is being used for iteration - reuse that cursor
-                program.resolve_cursor_id(&CursorKey::index(internal_id, index.clone()))
-            } else {
-                // This index is not in indexes_to_update and not used for iteration
-                // Open a new cursor
-                let cursor = program.alloc_cursor_index(None, &index)?;
-                program.emit_insn(Insn::OpenWrite {
-                    cursor_id: cursor,
-                    root_page: RegisterOrLiteral::Literal(index.root_page),
-                    db: 0,
-                });
-                cursor
-            };
-            result.push((index, cursor));
-        }
-        result
+                let cursor = if let Some(cursor) = existing_cursor {
+                    cursor
+                } else if iteration_index_name == Some(&index.name) {
+                    // This index is being used for iteration - reuse that cursor
+                    program.resolve_cursor_id(&CursorKey::index(internal_id, index.clone()))
+                } else {
+                    // This index is not in indexes_to_update and not used for iteration
+                    // Open a new cursor
+                    let cursor = program
+                        .alloc_cursor_index(None, index)
+                        .expect("to allocate index cursor");
+                    program.emit_insn(Insn::OpenWrite {
+                        cursor_id: cursor,
+                        root_page: RegisterOrLiteral::Literal(index.root_page),
+                        db: 0,
+                    });
+                    cursor
+                };
+                (index, cursor)
+            })
+            .collect::<Vec<(&Arc<Index>, usize)>>()
     } else {
         Vec::new()
     };
@@ -2170,8 +2170,8 @@ fn emit_program_for_update(
         plan.ephemeral_plan.as_ref(),
         &mut t_ctx,
         program,
-        index_cursors,
-        all_index_cursors,
+        &index_cursors,
+        &all_index_cursors,
         iteration_cursor_id,
         target_table_cursor_id,
         target_table,
@@ -2424,7 +2424,6 @@ fn emit_update_column_values<'a>(
 ///
 /// `all_index_cursors` contains cursors for ALL indexes on the table (used for REPLACE to delete
 /// conflicting rows from all indexes, not just those being updated).
-#[allow(clippy::too_many_arguments)]
 fn emit_update_insns<'a>(
     connection: &Arc<Connection>,
     table_references: &mut TableReferences,
@@ -2435,8 +2434,8 @@ fn emit_update_insns<'a>(
     ephemeral_plan: Option<&SelectPlan>,
     t_ctx: &mut TranslateCtx<'a>,
     program: &mut ProgramBuilder,
-    index_cursors: Vec<(usize, usize)>,
-    all_index_cursors: Vec<(Arc<Index>, usize)>,
+    index_cursors: &[(usize, usize)],
+    all_index_cursors: &[(&Arc<Index>, usize)],
     iteration_cursor_id: usize,
     target_table_cursor_id: usize,
     target_table: Arc<JoinedTable>,
@@ -2444,10 +2443,16 @@ fn emit_update_insns<'a>(
 ) -> crate::Result<()> {
     let internal_id = target_table.internal_id;
     // Copy loop labels early to avoid borrow conflicts with mutable t_ctx borrow later
-    let loop_labels = *t_ctx.labels_main_loop.first().unwrap();
+    let loop_labels = *t_ctx
+        .labels_main_loop
+        .first()
+        .expect("loop labels to exist");
     // Label to skip to the next row on conflict (for IGNORE mode)
     let skip_row_label = loop_labels.next;
-    let source_table = table_references.joined_tables().first().unwrap();
+    let source_table = table_references
+        .joined_tables()
+        .first()
+        .expect("UPDATE must have a source table");
     let (index, is_virtual) = match &source_table.op {
         Operation::Scan(Scan::BTreeTable { index, .. }) => (
             index.as_ref().map(|index| {
@@ -2798,7 +2803,7 @@ fn emit_update_insns<'a>(
     // a conflict, we don't corrupt the row by partially deleting index entries.
     if matches!(or_conflict, ResolveType::Ignore) {
         let rowid_reg = rowid_set_clause_reg.unwrap_or(beg);
-        for (index, (idx_cursor_id, _record_reg)) in indexes_to_update.iter().zip(&index_cursors) {
+        for (index, (idx_cursor_id, _record_reg)) in indexes_to_update.iter().zip(index_cursors) {
             if !index.unique {
                 continue;
             }
@@ -2902,7 +2907,7 @@ fn emit_update_insns<'a>(
         }
     }
 
-    for (index, (idx_cursor_id, record_reg)) in indexes_to_update.iter().zip(&index_cursors) {
+    for (index, (idx_cursor_id, record_reg)) in indexes_to_update.iter().zip(index_cursors) {
         // We need to know whether or not the OLD values satisfied the predicate on the
         // partial index, so we can know whether or not to delete the old index entry,
         // as well as whether or not the NEW values satisfy the predicate, to determine whether
@@ -3115,7 +3120,7 @@ fn emit_update_insns<'a>(
                     // We must delete from all indexes, not just indexes_to_update,
                     // because the conflicting row may have entries in indexes
                     // whose columns are not being modified by this UPDATE.
-                    for (other_index, other_idx_cursor_id) in &all_index_cursors {
+                    for (other_index, other_idx_cursor_id) in all_index_cursors {
                         // Build index key for the conflicting row
                         let other_num_regs = other_index.columns.len() + 1;
                         let other_start_reg = program.alloc_registers(other_num_regs);
@@ -3260,7 +3265,7 @@ fn emit_update_insns<'a>(
                     // We must delete from all indexes, not just indexes_to_update,
                     // because the conflicting row may have entries in indexes
                     // whose columns are not being modified by this UPDATE.
-                    for (other_index, other_idx_cursor_id) in &all_index_cursors {
+                    for (other_index, other_idx_cursor_id) in all_index_cursors {
                         // Build index key for the conflicting row
                         let other_num_regs = other_index.columns.len() + 1;
                         let other_start_reg = program.alloc_registers(other_num_regs);
