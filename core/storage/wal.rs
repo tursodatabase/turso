@@ -1184,9 +1184,18 @@ impl Wal for WalFile {
             Ok(())
         })?;
 
-        self.try_restart_log_before_write()?;
+        let result = self.try_restart_log_before_write();
+        if let Err(LimboError::Busy) | Ok(()) = &result {
+            // it's fine if we were unable to restart WAL file due to Busy errors
+            return Ok(());
+        }
 
-        Ok(())
+        // don't forget to release the write-lock if
+        self.with_shared(|shared| {
+            shared.write_lock.unlock();
+        });
+
+        Err(result.expect_err("Ok case handled above"))
     }
 
     /// End a write transaction
