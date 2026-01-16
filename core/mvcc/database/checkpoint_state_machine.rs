@@ -1022,15 +1022,14 @@ impl<Clock: LogicalClock> CheckpointStateMachine<Clock> {
 
             CheckpointState::CommitPagerTxn => {
                 tracing::debug!("Committing pager transaction");
-                let result = self.pager.commit_tx(&self.connection)?;
+                let result = self
+                    .pager
+                    .commit_tx(&self.connection, self.update_transaction_state)?;
                 match result {
                     IOResult::Done(_) => {
                         self.state = CheckpointState::TruncateLogicalLog;
                         self.lock_states.pager_read_tx = false;
                         self.lock_states.pager_write_tx = false;
-                        if self.update_transaction_state {
-                            self.connection.set_tx_state(TransactionState::None);
-                        }
                         let header = self.pager.io.block(|| {
                             self.pager.with_header_mut(|header| {
                                 header.schema_cookie =

@@ -198,18 +198,6 @@ enum TransactionState {
     None,
 }
 
-impl TransactionState {
-    /// Whether the transaction is a write transaction that changes the schema
-    pub fn is_ddl_write_tx(&self) -> bool {
-        matches!(
-            self,
-            TransactionState::Write {
-                schema_did_change: true
-            }
-        )
-    }
-}
-
 #[derive(Debug, AtomicEnum, Clone, Copy, PartialEq, Eq)]
 pub enum SyncMode {
     Off = 0,
@@ -477,6 +465,7 @@ impl Database {
             .unwrap_or_else(|| path.to_string());
 
         if let Some(db) = registry.get(&canonical_path).and_then(Weak::upgrade) {
+            tracing::debug!("took database {canonical_path:?} from the registry");
             return Ok(db);
         }
         let db = Self::open_with_flags_bypass_registry_internal(
@@ -958,7 +947,7 @@ impl Database {
             self.db_file.clone(),
             pager_wal,
             self.io.clone(),
-            Arc::new(RwLock::new(PageCache::default())),
+            PageCache::default(),
             buffer_pool.clone(),
             self.init_lock.clone(),
             self.init_page_1.clone(),

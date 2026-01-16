@@ -670,6 +670,7 @@ impl Page {
     }
 
     #[inline]
+    /// almost never should be called explicitly - instead [Pager::add_dirty] method must be used
     pub fn set_dirty(&self) {
         tracing::debug!("set_dirty(page={})", self.get().id);
         self.clear_wal_tag();
@@ -679,6 +680,7 @@ impl Page {
     }
 
     #[inline]
+    /// caller must ensure that [Pager::dirty_pages] will be updated accordingly
     pub fn clear_dirty(&self) {
         tracing::debug!("clear_dirty(page={})", self.get().id);
         self.get().flags.fetch_and(!PAGE_DIRTY, Ordering::Release);
@@ -1254,7 +1256,7 @@ impl Pager {
         db_file: Arc<dyn DatabaseStorage>,
         wal: Option<Arc<dyn Wal>>,
         io: Arc<dyn crate::io::IO>,
-        page_cache: Arc<RwLock<PageCache>>,
+        page_cache: PageCache,
         buffer_pool: Arc<BufferPool>,
         init_lock: Arc<Mutex<()>>,
         init_page_1: Arc<ArcSwapOption<Page>>,
@@ -1267,7 +1269,7 @@ impl Pager {
         Ok(Self {
             db_file,
             wal,
-            page_cache,
+            page_cache: Arc::new(RwLock::new(page_cache)),
             io,
             dirty_pages: Arc::new(RwLock::new(RoaringBitmap::new())),
             subjournal: RwLock::new(None),
@@ -2163,8 +2165,15 @@ impl Pager {
         Ok(IOResult::Done(wal.begin_write_tx()?))
     }
 
+    /// commit dirty pages from current transaction in WAL mode if this is not nested statement (for nested statements, parent will do the commit)
+    /// if update_transaction_state set to false, then [Connection::transaction_state] left unchanged
+    /// if update_transaction_state set to true, then [Connection::transaction_state] reset to [TransactionState::None] in case when method completes without error
     #[instrument(skip_all, level = Level::DEBUG)]
-    pub fn commit_tx(&self, connection: &Connection) -> Result<IOResult<()>> {
+    pub fn commit_tx(
+        &self,
+        connection: &Connection,
+        update_transaction_state: bool,
+    ) -> Result<IOResult<()>> {
         if connection.is_nested_stmt() {
             // Parent statement will handle the transaction commit.
             return Ok(IOResult::Done(()));
@@ -2174,25 +2183,38 @@ impl Pager {
             return Ok(IOResult::Done(()));
         };
 
-        let schema_did_change = match connection.get_tx_state() {
-            TransactionState::Write { schema_did_change } => schema_did_change,
-            _ => false,
+        let complete_commit = || {
+            if update_transaction_state {
+                connection.set_tx_state(TransactionState::None);
+            }
+            self.commit_dirty_pages_end();
         };
 
         loop {
             let commit_state = self.commit_info.read().state;
             tracing::debug!("commit_state: {:?}", commit_state);
+            // we separate auto-checkpoint from the commit in order for checkpoint to be able to backfill WAL till the end
+            // (including new frames from current transaction)
+            // otherwise, we will be unable to do WAL restart
             match commit_state {
                 CommitState::AutoCheckpoint => {
-                    return_if_io!(self.checkpoint(
+                    let checkpoint_result = self.checkpoint(
                         CheckpointMode::Passive {
                             upper_bound_inclusive: None,
                         },
                         connection.get_sync_mode(),
-                        true,
-                    ));
-                    self.commit_dirty_pages_end();
-                    break;
+                        false,
+                    );
+                    match checkpoint_result {
+                        Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
+                        Ok(IOResult::Done(_)) => complete_commit(),
+                        Err(err) => {
+                            tracing::info!("auto-checkpoint failed: {err}");
+                            complete_commit();
+                            self.cleanup_after_auto_checkpoint_failure();
+                        }
+                    }
+                    return Ok(IOResult::Done(()));
                 }
                 _ => {
                     return_if_io!(self.commit_dirty_pages(
@@ -2200,22 +2222,30 @@ impl Pager {
                         connection.get_sync_mode(),
                         connection.get_data_sync_retry()
                     ));
+
+                    let schema_did_change = match connection.get_tx_state() {
+                        TransactionState::Write { schema_did_change } => schema_did_change,
+                        _ => false,
+                    };
+
                     wal.end_write_tx();
                     wal.end_read_tx();
+                    // we do not set TransactionState::None here - because caller can decide that nothing should be done for this connection
+                    // and skip next calls of the commit_tx methods after IO
+
+                    tracing::debug!("commit_tx: schema_did_change={schema_did_change}");
+                    if schema_did_change {
+                        let schema = connection.schema.read().clone();
+                        connection.db.update_schema_if_newer(schema);
+                    }
 
                     if self.commit_info.read().state != CommitState::AutoCheckpoint {
-                        self.commit_dirty_pages_end();
-                        break;
+                        complete_commit();
+                        return Ok(IOResult::Done(()));
                     }
                 }
             }
         }
-
-        if schema_did_change {
-            let schema = connection.schema.read().clone();
-            connection.db.update_schema_if_newer(schema);
-        }
-        Ok(IOResult::Done(()))
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
@@ -3351,14 +3381,12 @@ impl Pager {
         state.mode = None;
     }
 
-    /// Clean up after a checkpoint failure. The WAL commit succeeded but checkpoint failed.
-    /// This ends the write and read transactions that would normally be ended in commit_tx().
-    pub fn finish_commit_after_checkpoint_failure(&self) {
+    /// Clean up after a auto-checkpoint failure.
+    /// Auto-checkpoint executed outside of the main transaction - so WAL transaction was already finalized
+    pub fn cleanup_after_auto_checkpoint_failure(&self) {
         self.reset_checkpoint_state();
         if let Some(wal) = self.wal.as_ref() {
             wal.abort_checkpoint();
-            wal.end_write_tx();
-            wal.end_read_tx();
         }
     }
 
@@ -4607,7 +4635,6 @@ mod ptrmap_tests {
         let pages = initial_db_pages + 10;
         let sz = std::cmp::max(std::cmp::min(pages, 64), pages);
         let buffer_pool = BufferPool::begin_init(&io, (sz * page_size) as usize);
-        let page_cache = Arc::new(RwLock::new(PageCache::new(sz as usize)));
 
         let wal_shared = WalFileShared::new_shared(
             io.open_file("test.db-wal", OpenFlags::Create, false)
@@ -4628,7 +4655,7 @@ mod ptrmap_tests {
             db_file,
             Some(wal),
             io,
-            page_cache,
+            PageCache::new(sz as usize),
             buffer_pool,
             Arc::new(Mutex::new(())),
             init_page_1,

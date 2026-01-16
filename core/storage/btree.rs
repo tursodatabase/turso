@@ -8161,7 +8161,7 @@ mod tests {
         // force allocate page1 with a transaction
         pager.begin_read_tx().unwrap();
         run_until_done(|| pager.begin_write_tx(), &pager).unwrap();
-        run_until_done(|| pager.commit_tx(&conn), &pager).unwrap();
+        run_until_done(|| pager.commit_tx(&conn, true), &pager).unwrap();
 
         let page2 = run_until_done(|| pager.allocate_page(), &pager).unwrap();
         btree_init_page(&page2, PageType::TableLeaf, 0, pager.usable_space());
@@ -8480,7 +8480,7 @@ mod tests {
                     pager.deref(),
                 )
                 .unwrap();
-                pager.io.block(|| pager.commit_tx(&conn)).unwrap();
+                pager.io.block(|| pager.commit_tx(&conn, true)).unwrap();
                 pager.begin_read_tx().unwrap();
                 // FIXME: add sorted vector instead, should be okay for small amounts of keys for now :P, too lazy to fix right now
                 let _c = cursor.move_to_root().unwrap();
@@ -8623,7 +8623,7 @@ mod tests {
                 if let Some(c) = c {
                     pager.io.wait_for_completion(c).unwrap();
                 }
-                pager.io.block(|| pager.commit_tx(&conn)).unwrap();
+                pager.io.block(|| pager.commit_tx(&conn, true)).unwrap();
             }
 
             // Check that all keys can be found by seeking
@@ -8846,7 +8846,7 @@ mod tests {
                 if let Some(c) = c {
                     pager.io.wait_for_completion(c).unwrap();
                 }
-                pager.io.block(|| pager.commit_tx(&conn)).unwrap();
+                pager.io.block(|| pager.commit_tx(&conn, true)).unwrap();
             }
 
             // Final validation
@@ -9115,7 +9115,7 @@ mod tests {
                 db_file,
                 Some(wal),
                 io,
-                Arc::new(crate::sync::RwLock::new(PageCache::new(10))),
+                PageCache::new(10),
                 buffer_pool,
                 Arc::new(crate::sync::Mutex::new(())),
                 init_page_1,
