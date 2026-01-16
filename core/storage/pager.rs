@@ -2182,10 +2182,6 @@ impl Pager {
             // TODO: Unsure what the semantics of "end_tx" is for in-memory databases, ephemeral tables and ephemeral indexes.
             return Ok(IOResult::Done(()));
         };
-        turso_assert!(
-            matches!(connection.get_tx_state(), TransactionState::Write { .. }),
-            "write transaction must be active"
-        );
 
         let complete_commit = || {
             if update_transaction_state {
