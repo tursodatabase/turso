@@ -987,6 +987,9 @@ impl Jsonb {
         if payload_end != end {
             bail_parse_error!("Size mismatch");
         }
+        if payload_end > self.data.len() {
+            bail_parse_error!("Payload extends beyond data");
+        }
 
         match header.element_type() {
             ElementType::NULL | ElementType::TRUE | ElementType::FALSE => {
@@ -1228,6 +1231,9 @@ impl Jsonb {
         kind: &ElementType,
         quote: bool,
     ) -> Result<usize> {
+        if cursor + len > self.data.len() {
+            bail_parse_error!("Invalid JSONB: string extends beyond data");
+        }
         let word_slice = &self.data[cursor..cursor + len];
         if quote {
             string.push('"');
@@ -1401,6 +1407,9 @@ impl Jsonb {
         kind: &ElementType,
     ) -> Result<usize> {
         let current_cursor = cursor + len;
+        if current_cursor > self.data.len() {
+            bail_parse_error!("Invalid JSONB: number extends beyond data");
+        }
         let num_slice = from_utf8(&self.data[cursor..current_cursor])
             .map_err(|_| LimboError::ParseError("Failed to parse integer".to_string()))?;
 
