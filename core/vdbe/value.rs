@@ -451,6 +451,9 @@ impl Value {
                 _ => len, // Default: rest of string
             };
 
+            // Track if length was explicitly provided
+            let explicit_length = length_value.is_some();
+
             // Handle negative start position (count from end)
             if p1 < 0 {
                 p1 = p1.wrapping_add(len);
@@ -460,6 +463,11 @@ impl Value {
                 }
             } else if p1 > 0 {
                 p1 -= 1; // Convert 1-indexed to 0-indexed
+            } else if p2 > 0 && explicit_length {
+                // SQLite quirk: when p1==0, p2>0, and explicit length, decrement p2
+                // This means substr('x', 0, 3) returns 2 chars, not 3
+                // But substr('x', 0) with no length returns whole string
+                p2 -= 1;
             }
 
             // Handle negative length (characters preceding position)
@@ -1105,11 +1113,21 @@ impl Value {
     }
 
     pub fn exec_min<'a, T: Iterator<Item = &'a Value>>(regs: T) -> Value {
-        regs.min().map(|v| v.to_owned()).unwrap_or(Value::Null)
+        // SQLite: multi-arg min() returns NULL if ANY argument is NULL
+        let values: Vec<_> = regs.collect();
+        if values.iter().any(|v| matches!(v, Value::Null)) {
+            return Value::Null;
+        }
+        values.into_iter().min().map(|v| v.to_owned()).unwrap_or(Value::Null)
     }
 
     pub fn exec_max<'a, T: Iterator<Item = &'a Value>>(regs: T) -> Value {
-        regs.max().map(|v| v.to_owned()).unwrap_or(Value::Null)
+        // SQLite: multi-arg max() returns NULL if ANY argument is NULL
+        let values: Vec<_> = regs.collect();
+        if values.iter().any(|v| matches!(v, Value::Null)) {
+            return Value::Null;
+        }
+        values.into_iter().max().map(|v| v.to_owned()).unwrap_or(Value::Null)
     }
 
     pub fn exec_concat_strings<'a, T: Iterator<Item = &'a Self>>(registers: T) -> Self {
@@ -1687,6 +1705,20 @@ mod tests {
         assert_eq!(
             Value::exec_max(input_mixed_vec.iter().map(|v| v.get_value())),
             Value::build_text("A")
+        );
+
+        // SQLite: multi-arg min/max returns NULL if ANY argument is NULL
+        let input_with_null = [
+            Register::Value(Value::Integer(1)),
+            Register::Value(Value::Null),
+        ];
+        assert_eq!(
+            Value::exec_min(input_with_null.iter().map(|v| v.get_value())),
+            Value::Null
+        );
+        assert_eq!(
+            Value::exec_max(input_with_null.iter().map(|v| v.get_value())),
+            Value::Null
         );
     }
 
