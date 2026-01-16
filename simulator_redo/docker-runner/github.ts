@@ -167,15 +167,15 @@ export class GithubClient {
 ### Run locally with Docker
 
 \`\`\`
-git checkout ${this.GIT_HASH}
-docker buildx build -t sim-redo:${gitShortHash} -f simulator_redo/runner/Dockerfile . --build-arg GIT_HASH=$(git rev-parse HEAD)
+gh pr checkout 4642
+docker buildx build -t sim-redo:${gitShortHash} -f simulator_redo/docker-runner/Dockerfile . --build-arg GIT_HASH=$(git rev-parse HEAD)
 docker run --network host sim-redo:${gitShortHash} ${fault.command}
 \`\`\`
 
 ### Run locally with Cargo
 
 \`\`\`
-git checkout ${this.GIT_HASH}
+gh pr checkout 4642
 cargo build -p sim_redo
 ./target/debug/sim_redo ${fault.command}
 \`\`\``;

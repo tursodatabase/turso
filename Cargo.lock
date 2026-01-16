@@ -4957,7 +4957,7 @@ dependencies = [
 
 [[package]]
 name = "sim_redo"
-version = "0.4.0"
+version = "0.5.0-pre.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -5071,7 +5071,7 @@ checksum = "d372029cb5195f9ab4e4b9aef550787dce78b124fcaee8d82519925defcd6f0d"
 
 [[package]]
 name = "sql_gen_prop"
-version = "0.4.0"
+version = "0.5.0-pre.1"
 dependencies = [
  "proptest",
  "serde",
