@@ -1034,19 +1034,20 @@ impl Value {
         // 2. Fast Path: 'abc%' (Prefix)
         if pattern.ends_with('%') && !pattern[..pattern.len() - 1].contains(['%', '_']) {
             let prefix = &pattern[..pattern.len() - 1];
-            if text.len() < prefix.len() {
-                return Ok(false);
+            if text.len() >= prefix.len() && text.is_char_boundary(prefix.len()) {
+                return Ok(text[..prefix.len()].eq_ignore_ascii_case(prefix));
             }
-            return Ok(text[..prefix.len()].eq_ignore_ascii_case(prefix));
+            // Fall through to regex if boundary check fails (multi-byte UTF-8)
         }
 
         // 3. Fast Path: '%abc' (Suffix)
         if pattern.starts_with('%') && !pattern[1..].contains(['%', '_']) {
             let suffix = &pattern[1..];
-            if text.len() < suffix.len() {
-                return Ok(false);
+            let start = text.len().wrapping_sub(suffix.len());
+            if text.len() >= suffix.len() && text.is_char_boundary(start) {
+                return Ok(text[start..].eq_ignore_ascii_case(suffix));
             }
-            return Ok(text[text.len() - suffix.len()..].eq_ignore_ascii_case(suffix));
+            // Fall through to regex if boundary check fails (multi-byte UTF-8)
         }
 
         // 4. Fast Path: '%abc%' (Contains)
