@@ -4842,11 +4842,9 @@ pub fn op_function(
                         } else {
                             None
                         };
-                        Value::Integer(Value::exec_like(
-                            cache,
-                            pattern.as_str(),
-                            match_expression.as_str(),
-                        ) as i64)
+                        let matches =
+                            Value::exec_like(cache, pattern.as_str(), match_expression.as_str())?;
+                        Value::Integer(matches as i64)
                     }
                     (Value::Null, _) | (_, Value::Null) => Value::Null,
                     _ => {
@@ -8376,7 +8374,6 @@ pub fn op_open_ephemeral(
             }
 
             let buffer_pool = program.connection.db.buffer_pool.clone();
-            let page_cache = Arc::new(RwLock::new(PageCache::default()));
 
             // Ephemeral databases always start empty, so create their own init_page_1
             let ephemeral_init_page_1 =
@@ -8386,7 +8383,7 @@ pub fn op_open_ephemeral(
                 db_file,
                 None,
                 db_file_io,
-                page_cache,
+                PageCache::default(),
                 buffer_pool.clone(),
                 Arc::new(Mutex::new(())),
                 ephemeral_init_page_1,

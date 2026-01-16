@@ -1915,11 +1915,11 @@ mod tests {
                 );
                 assert_eq!(sqlite3_step(stmt), SQLITE_ROW);
                 let count = sqlite3_column_int64(stmt, 0);
-                // with a sane `should_checkpoint` method we have no garuantee that all 2000 rows are present, as the checkpoint was
+                // with a sane `should_checkpoint` method we have no guarantee that all 2000 rows are present, as the checkpoint was
                 // triggered by cacheflush on insertions. the pattern will trigger a checkpoint when the wal has > 1000 frames,
                 // so it will be triggered but will no longer be triggered on each consecutive
                 // write. here we can assert that we have > 1500 rows.
-                assert!(count > 1500);
+                assert!(count > 1500, "count: {}", count);
                 assert_eq!(sqlite3_step(stmt), SQLITE_DONE);
                 assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
             }

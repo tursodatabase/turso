@@ -126,7 +126,7 @@ pub fn expr_to_value<T: TableContext>(
         } => {
             let lhs = expr_to_value(lhs, row, table)?;
             let rhs = expr_to_value(rhs, row, table)?;
-            let res = lhs.like_compare(&rhs, *op);
+            let res = lhs.like_compare(&rhs, *op).ok()?;
             let value: SimValue = if *not { !res } else { res }.into();
             Some(value)
         }

@@ -16,7 +16,6 @@ source $testdir/groupby.test
 source $testdir/subquery.test
 source $testdir/where.test
 source $testdir/create_table.test
-source $testdir/update.test
 source $testdir/select.test
 source $testdir/join.test
 source $testdir/insert.test

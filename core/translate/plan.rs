@@ -1,6 +1,6 @@
 use std::{cmp::Ordering, collections::HashMap, marker::PhantomData, sync::Arc};
 use turso_parser::ast::{
-    self, FrameBound, FrameClause, FrameExclude, FrameMode, SortOrder, SubqueryType,
+    self, FrameBound, FrameClause, FrameExclude, FrameMode, ResolveType, SortOrder, SubqueryType,
 };
 
 use crate::{
@@ -569,6 +569,8 @@ pub struct DeletePlan {
 #[derive(Debug, Clone)]
 pub struct UpdatePlan {
     pub table_references: TableReferences,
+    /// Conflict resolution strategy (e.g., OR IGNORE, OR REPLACE)
+    pub or_conflict: Option<ResolveType>,
     // (colum index, new value) pairs
     pub set_clauses: Vec<(usize, Box<ast::Expr>)>,
     pub where_clause: Vec<WhereTerm>,
@@ -1285,11 +1287,13 @@ impl JoinedTable {
     }
 
     /// Creates a new TableReference for a subquery from a Plan (either SelectPlan or CompoundSelect).
+    /// If `explicit_columns` is provided, those names override the derived column names from the SELECT.
     pub fn new_subquery_from_plan(
         identifier: String,
         plan: Plan,
         join_info: Option<JoinInfo>,
         internal_id: TableInternalId,
+        explicit_columns: Option<&[String]>,
     ) -> Result<Self> {
         // Get result columns and table references from the plan
         let (result_columns, table_references) = match &plan {
@@ -1312,11 +1316,28 @@ impl JoinedTable {
             }
         };
 
+        // Validate explicit column count if provided
+        if let Some(cols) = explicit_columns {
+            if cols.len() != result_columns.len() {
+                crate::bail_parse_error!(
+                    "table {} has {} columns but {} column names were provided",
+                    identifier,
+                    result_columns.len(),
+                    cols.len()
+                );
+            }
+        }
+
         let mut columns = result_columns
             .iter()
-            .map(|rc| {
+            .enumerate()
+            .map(|(i, rc)| {
+                // Use explicit column name if provided, otherwise derive from result column
+                let col_name = explicit_columns
+                    .and_then(|cols| cols.get(i).cloned())
+                    .or_else(|| rc.name(table_references).map(String::from));
                 Column::new(
-                    rc.name(table_references).map(String::from),
+                    col_name,
                     "BLOB".to_string(),
                     None,
                     None,

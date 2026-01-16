@@ -6802,6 +6802,181 @@ mod fuzz_tests {
         }
     }
 
+    /// Fuzz test for UPDATE OR REPLACE/IGNORE statements.
+    /// This test generates random UPDATE statements with conflict resolution
+    /// clauses and compares results between Limbo and SQLite to ensure correctness.
+    #[turso_macros::test(mvcc)]
+    pub fn update_or_conflict_fuzz(db: TempDatabase) {
+        let _ = env_logger::try_init();
+        let (mut rng, seed) = rng_from_time_or_env();
+        log::info!("update_or_conflict_fuzz seed: {seed}");
+
+        const NUM_FUZZ_ITERATIONS: usize = 200;
+        const ROWS_PER_TABLE: usize = 500;
+
+        let limbo_conn = db.connect_limbo();
+        let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
+
+        let mut debug_ddl_dml_string = String::new();
+
+        // Create table with UNIQUE constraints to trigger conflict resolution
+        let schema = "CREATE TABLE t1 (x INTEGER PRIMARY KEY, y INTEGER UNIQUE, z INTEGER NOT NULL DEFAULT 99);";
+        debug_ddl_dml_string.push_str(schema);
+        debug_ddl_dml_string.push('\n');
+        limbo_exec_rows(&limbo_conn, schema);
+        sqlite_exec_rows(&sqlite_conn, schema);
+
+        fn populate_table(
+            limbo_conn: &std::sync::Arc<turso_core::Connection>,
+            sqlite_conn: &rusqlite::Connection,
+            rng: &mut ChaCha8Rng,
+            debug_string: &mut String,
+        ) {
+            // Insert rows with unique y values
+            for i in 1..=ROWS_PER_TABLE {
+                let insert_sql = format!(
+                    "INSERT INTO t1 VALUES ({}, {}, {});",
+                    i,
+                    i * 10, // y values: 10, 20, 30, ...
+                    rng.random_range(1..ROWS_PER_TABLE as i64)
+                );
+                debug_string.push_str(&insert_sql);
+                debug_string.push('\n');
+                limbo_exec_rows(limbo_conn, &insert_sql);
+                sqlite_exec_rows(sqlite_conn, &insert_sql);
+            }
+        }
+
+        fn verify_tables_match(
+            limbo_conn: &std::sync::Arc<turso_core::Connection>,
+            sqlite_conn: &rusqlite::Connection,
+            query: &str,
+            seed: u64,
+            debug_string: &str,
+        ) {
+            let verify_query = "SELECT * FROM t1 ORDER BY x";
+            let limbo_rows = limbo_exec_rows(limbo_conn, verify_query);
+            let sqlite_rows = sqlite_exec_rows(sqlite_conn, verify_query);
+
+            if limbo_rows != sqlite_rows {
+                panic!(
+                    "Results mismatch after query: {query}\n\
+                     Limbo t1: {limbo_rows:?}\n\
+                     SQLite t1: {sqlite_rows:?}\n\
+                     Seed: {seed}\n\n\
+                     DDL/DML to reproduce:\n{debug_string}"
+                );
+            }
+        }
+
+        populate_table(
+            &limbo_conn,
+            &sqlite_conn,
+            &mut rng,
+            &mut debug_ddl_dml_string,
+        );
+
+        log::info!("DDL/DML to reproduce manually:\n{debug_ddl_dml_string}");
+
+        for iter_num in 0..NUM_FUZZ_ITERATIONS {
+            let query_type = rng.random_range(0..10);
+            let query = match query_type {
+                0 => {
+                    // UPDATE OR IGNORE - set y to existing value (should skip)
+                    let existing_y = rng.random_range(1..=20) * 10;
+                    let target_x = rng.random_range(1..=20);
+                    format!("UPDATE OR IGNORE t1 SET y = {existing_y} WHERE x = {target_x};",)
+                }
+                1 => {
+                    // UPDATE OR REPLACE - set y to existing value (should delete conflicting row)
+                    let existing_y = rng.random_range(1..=20) * 10;
+                    let target_x = rng.random_range(1..=20);
+                    format!("UPDATE OR REPLACE t1 SET y = {existing_y} WHERE x = {target_x};",)
+                }
+                2 => {
+                    // UPDATE OR IGNORE with expression (y - 10 may cause conflict)
+                    let target_x = rng.random_range(2..=20); // avoid x=1 since y-10=0
+                    format!("UPDATE OR IGNORE t1 SET y = y - 10 WHERE x = {target_x};",)
+                }
+                3 => {
+                    // UPDATE OR REPLACE with expression (y - 10 may cause conflict)
+                    let target_x = rng.random_range(2..=20);
+                    format!("UPDATE OR REPLACE t1 SET y = y - 10 WHERE x = {target_x};",)
+                }
+                4 => {
+                    // UPDATE OR IGNORE - multiple rows (WHERE x > ...)
+                    let min_x = rng.random_range(1..=15);
+                    let new_y = rng.random_range(-100..100);
+                    format!("UPDATE OR IGNORE t1 SET y = {new_y} WHERE x > {min_x};",)
+                }
+                5 => {
+                    // UPDATE OR REPLACE with no conflict (new unique value)
+                    let target_x = rng.random_range(1..=20);
+                    let new_y = rng.random_range(1000..2000); // unlikely to conflict
+                    format!("UPDATE OR REPLACE t1 SET y = {new_y} WHERE x = {target_x};",)
+                }
+                6 => {
+                    // UPDATE OR IGNORE with NOT NULL violation
+                    let target_x = rng.random_range(1..=20);
+                    format!("UPDATE OR IGNORE t1 SET z = NULL WHERE x = {target_x};",)
+                }
+                7 => {
+                    // UPDATE OR REPLACE with NOT NULL violation (should use default)
+                    let target_x = rng.random_range(1..=20);
+                    format!("UPDATE OR REPLACE t1 SET z = NULL WHERE x = {target_x};",)
+                }
+                8 => {
+                    // Regular UPDATE (no conflict clause) with safe value
+                    let target_x = rng.random_range(1..=20);
+                    let new_z = rng.random_range(1..500);
+                    format!("UPDATE t1 SET z = {new_z} WHERE x = {target_x};",)
+                }
+                9 => {
+                    // UPDATE OR REPLACE with multiple rows, expression may cause cascading conflicts
+                    let min_x = rng.random_range(5..=15);
+                    format!("UPDATE OR REPLACE t1 SET y = y - 10 WHERE x > {min_x};",)
+                }
+                _ => unreachable!(),
+            };
+
+            log::info!(
+                "Iteration {}/{NUM_FUZZ_ITERATIONS}: Query: {query}",
+                iter_num + 1,
+            );
+
+            debug_ddl_dml_string.push_str(&query);
+            debug_ddl_dml_string.push('\n');
+
+            // Execute on both databases (ignore errors from constraint violations for ABORT mode)
+            let _ = limbo_exec_rows_fallible(&db, &limbo_conn, &query);
+            let _ = sqlite_conn.execute(&query, params![]);
+
+            // Verify tables match
+            verify_tables_match(
+                &limbo_conn,
+                &sqlite_conn,
+                &query,
+                seed,
+                &debug_ddl_dml_string,
+            );
+
+            // Periodically repopulate table to ensure we have data to work with
+            if iter_num % 30 == 29 {
+                // Clear and repopulate
+                limbo_exec_rows(&limbo_conn, "DELETE FROM t1;");
+                sqlite_conn.execute("DELETE FROM t1;", params![]).unwrap();
+                debug_ddl_dml_string.push_str("DELETE FROM t1;\n");
+
+                populate_table(
+                    &limbo_conn,
+                    &sqlite_conn,
+                    &mut rng,
+                    &mut debug_ddl_dml_string,
+                );
+            }
+        }
+    }
+
     #[derive(Clone, Debug)]
     struct FuzzTestColumn {
         name: String,
