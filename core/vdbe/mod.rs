@@ -1310,10 +1310,7 @@ impl Program {
     ) -> Result<IOResult<()>> {
         let commit_state = &mut program_state.commit_state;
         let cacheflush_status = if !rollback {
-            match pager.commit_tx(connection) {
-                Ok(status) => status,
-                Err(e) => return Err(e),
-            }
+            pager.commit_tx(connection)?
         } else {
             pager.rollback_tx(connection);
             IOResult::Done(())
