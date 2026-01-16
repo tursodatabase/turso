@@ -2234,7 +2234,8 @@ fn test_savepoint_multiple_statements_last_fails() {
     let db = MvccTestDbNoConn::new_with_random_db();
     let conn = db.connect();
 
-    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)").unwrap();
+    conn.execute("CREATE TABLE t(id INTEGER PRIMARY KEY)")
+        .unwrap();
 
     // Start interactive transaction
     conn.execute("BEGIN CONCURRENT").unwrap();
@@ -2328,11 +2329,15 @@ fn test_savepoint_index_multiple_statements() {
     conn.execute("BEGIN CONCURRENT").unwrap();
 
     // Statement 1: Successfully change name for row 1
-    conn.execute("UPDATE t SET name = 'c' WHERE id = 1").unwrap();
+    conn.execute("UPDATE t SET name = 'c' WHERE id = 1")
+        .unwrap();
 
     // Statement 2: Try to change name to 'b' (conflict with row 2) - fails
     let result = conn.execute("UPDATE t SET name = 'b' WHERE id = 1");
-    assert!(result.is_err(), "Expected unique constraint violation on name");
+    assert!(
+        result.is_err(),
+        "Expected unique constraint violation on name"
+    );
 
     // COMMIT
     conn.execute("COMMIT").unwrap();
