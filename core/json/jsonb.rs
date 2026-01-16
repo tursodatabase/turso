@@ -1708,6 +1708,12 @@ impl Jsonb {
                 b',' if !first => {
                     pos += 1; // consume ','
                     pos = skip_whitespace(input, pos);
+                    if pos >= input.len() {
+                        return Err(PError::Message {
+                            msg: "Unexpected end of input after comma".to_string(),
+                            location: Some(pos),
+                        });
+                    }
                     if input[pos] == b',' {
                         return Err(PError::Message {
                             msg: "Two commas in a row".to_string(),
