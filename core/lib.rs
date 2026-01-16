@@ -958,7 +958,7 @@ impl Database {
             self.db_file.clone(),
             pager_wal,
             self.io.clone(),
-            Arc::new(RwLock::new(PageCache::default())),
+            PageCache::default(),
             buffer_pool.clone(),
             self.init_lock.clone(),
             self.init_page_1.clone(),

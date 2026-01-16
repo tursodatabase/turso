@@ -1254,7 +1254,7 @@ impl Pager {
         db_file: Arc<dyn DatabaseStorage>,
         wal: Option<Arc<dyn Wal>>,
         io: Arc<dyn crate::io::IO>,
-        page_cache: Arc<RwLock<PageCache>>,
+        page_cache: PageCache,
         buffer_pool: Arc<BufferPool>,
         init_lock: Arc<Mutex<()>>,
         init_page_1: Arc<ArcSwapOption<Page>>,
@@ -1267,7 +1267,7 @@ impl Pager {
         Ok(Self {
             db_file,
             wal,
-            page_cache,
+            page_cache: Arc::new(RwLock::new(page_cache)),
             io,
             dirty_pages: Arc::new(RwLock::new(RoaringBitmap::new())),
             subjournal: RwLock::new(None),
