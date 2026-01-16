@@ -600,6 +600,15 @@ fn optimize_update_plan(
             break 'requires true;
         }
 
+        // REPLACE mode requires ephemeral table because REPLACE deletes conflicting rows,
+        // which can corrupt the iteration order when iterating via an index.
+        if matches!(
+            plan.or_conflict,
+            Some(turso_parser::ast::ResolveType::Replace)
+        ) {
+            break 'requires true;
+        }
+
         let Some(index) = table_ref.op.index() else {
             let rowid_alias_used = plan.set_clauses.iter().fold(false, |accum, (idx, _)| {
                 accum || (*idx != ROWID_SENTINEL && btree_table.columns[*idx].is_rowid_alias())
