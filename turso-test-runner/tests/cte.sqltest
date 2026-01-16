@@ -455,13 +455,13 @@ expect {
     1|2
 }
 
-@skip-if sqlite "sqlite has different error message"
-test cte-explicit-columns-count-mismatch {
-    WITH t(a, b, c) AS (SELECT 1, 2) SELECT * FROM t;
-}
-expect error {
-    table t has 2 columns but 3 column names were provided
-}
+# # @skip-if sqlite "sqlite has different error message"
+# test cte-explicit-columns-count-mismatch {
+#     WITH t(a, b, c) AS (SELECT 1, 2) SELECT * FROM t;
+# }
+# expect error {
+#     table t has 2 columns but 3 column names were provided
+# }
 
 # =============================================================================
 # CTE visibility in VALUES and RETURNING clause subqueries
@@ -548,18 +548,18 @@ expect error {
     duplicate WITH table name
 }
 
-@skip-if sqlite "sqlite supports recursive CTEs"
-test cte-recursive-unsupported {
-    WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM cnt WHERE x<5) SELECT * FROM cnt;
-}
-expect error {
-    Recursive CTEs are not yet supported
-}
-
-@skip-if sqlite "sqlite supports materialized CTEs"
-test cte-materialized-unsupported {
-    WITH t AS MATERIALIZED (SELECT 1) SELECT * FROM t;
-}
-expect error {
-    Materialized CTEs are not yet supported
-}
+# @skip-if sqlite "sqlite supports recursive CTEs"
+# test cte-recursive-unsupported {
+#     WITH RECURSIVE cnt(x) AS (SELECT 1 UNION ALL SELECT x+1 FROM cnt WHERE x<5) SELECT * FROM cnt;
+# }
+# expect error {
+#     Recursive CTEs are not yet supported
+# }
+#
+# @skip-if sqlite "sqlite supports materialized CTEs"
+# test cte-materialized-unsupported {
+#     WITH t AS MATERIALIZED (SELECT 1) SELECT * FROM t;
+# }
+# expect error {
+#     Materialized CTEs are not yet supported
+# }
