@@ -1566,8 +1566,11 @@ impl Wal for WalFile {
     fn sync(&self) -> Result<Completion> {
         tracing::debug!("wal_sync");
         let syncing = self.syncing.clone();
-        let completion = Completion::new_sync(move |_| {
+        let completion = Completion::new_sync(move |result| {
             tracing::debug!("wal_sync finish");
+            if let Err(err) = result {
+                tracing::info!("wal_sync failed: {err}");
+            }
             syncing.store(false, Ordering::Release);
         });
         let file = self.with_shared(|shared| {
@@ -2466,7 +2469,7 @@ impl WalFile {
                     };
                 }
                 CheckpointState::Finalize { .. } => {
-                    // NOTE: For TRUNCATE mode,WAL truncation is NOT done here.
+                    // NOTE: For TRUNCATE mode, WAL truncation is NOT done here.
                     // It is deferred to pager.rs after the DB file has been synced,
                     // at which point it calls truncate_wal().
                     // This ensures data durability: if a crash occurs after WAL truncation
@@ -2670,37 +2673,25 @@ impl WalFile {
 
         if !result.wal_truncate_sent {
             let c = Completion::new_trunc({
-                let shared = self.shared.clone();
                 move |res| {
                     if let Err(err) = res {
-                        Self::unlock_after_restart(
-                            &shared,
-                            Some(&LimboError::InternalError(err.to_string())),
-                        );
+                        tracing::info!("WAL truncate failed: {err}")
                     } else {
                         tracing::trace!("WAL file truncated to 0 B");
                     }
                 }
             });
-            let c = file
-                .truncate(0, c)
-                .inspect_err(|e| Self::unlock_after_restart(&self.shared, Some(e)))?;
+            let c = file.truncate(0, c)?;
             result.wal_truncate_sent = true;
             io_yield_one!(c);
         } else if !result.wal_sync_sent {
-            let shared = self.shared.clone();
-            let c = file
-                .sync(Completion::new_sync(move |res| {
-                    if let Err(err) = res {
-                        Self::unlock_after_restart(
-                            &shared,
-                            Some(&LimboError::InternalError(err.to_string())),
-                        );
-                    } else {
-                        tracing::trace!("WAL file synced after truncation");
-                    }
-                }))
-                .inspect_err(|e| Self::unlock_after_restart(&self.shared, Some(e)))?;
+            let c = file.sync(Completion::new_sync(move |res| {
+                if let Err(err) = res {
+                    tracing::info!("WAL sync failed: {err}")
+                } else {
+                    tracing::trace!("WAL file synced after truncation");
+                }
+            }))?;
             result.wal_sync_sent = true;
             io_yield_one!(c);
         }
