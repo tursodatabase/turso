@@ -1335,8 +1335,7 @@ To know if a function does any sort of I/O we just have to look at the function 
 The `IOResult` struct looks as follows:
   ```rust
   pub enum IOCompletions {
-    Single(Arc<Completion>),
-    Many(Vec<Arc<Completion>>),
+    Single(Completion),
   }
 
   #[must_use]
@@ -1344,6 +1343,14 @@ The `IOResult` struct looks as follows:
     Done(T),
     IO(IOCompletions),
   }
+  ```
+
+To combine multiple completions, use `CompletionGroup`:
+  ```rust
+  let mut group = CompletionGroup::new(|_| {});
+  group.add(&completion1);
+  group.add(&completion2);
+  let combined = group.build();  // Single completion that waits for all
   ```
 
 This implies that when a function returns an `IOResult`, it must be called again until it returns an `IOResult::Done` variant. This works similarly to how `Future`s are polled in rust. When you receive a `Poll::Ready(None)`, it means that the future stopped it's execution. In a similar vein, if we receive `IOResult::Done`, the function/state machine has reached the end of it's execution. `IOCompletions` is here to signal that, if we are executing any I/O operation, that we need to propagate the completions that are generated from it. This design forces us to handle the fact that a function is asynchronous in nature. This is essentially [function coloring](https://www.tedinski.com/2018/11/13/function-coloring.html), but done at the application level instead of the compiler level.
