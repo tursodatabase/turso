@@ -2,6 +2,13 @@
 
 use arbitrary::Arbitrary;
 use libfuzzer_sys::fuzz_target;
+use turso_core::functions::datetime::{
+    exec_date, exec_datetime_full, exec_julianday, exec_strftime, exec_time, exec_timediff,
+    exec_unixepoch,
+};
+use turso_core::functions::printf::exec_printf;
+use turso_core::vdbe::likeop::exec_glob;
+use turso_core::vdbe::Register;
 use turso_core::MathFunc;
 use turso_core::Value as CoreValue;
 
@@ -76,6 +83,9 @@ enum BinaryFunc {
     Concat,
     And,
     Or,
+    Glob,
+    Substring2,
+    Timediff,
 }
 
 #[derive(Arbitrary, Debug, Clone)]
@@ -91,6 +101,13 @@ enum VariadicFunc {
     ConcatStrings,
     ConcatWs,
     Char,
+    Printf,
+    Date,
+    Time,
+    DateTime,
+    JulianDay,
+    UnixEpoch,
+    Strftime,
 }
 
 #[derive(Arbitrary, Debug, Clone)]
@@ -308,6 +325,15 @@ fn execute_scalar_func(call: ScalarFuncCall) {
                 BinaryFunc::Or => {
                     let _ = v1.exec_or(&v2);
                 }
+                BinaryFunc::Glob => {
+                    let _ = exec_glob(None, &v1.to_string(), &v2.to_string());
+                }
+                BinaryFunc::Substring2 => {
+                    let _ = CoreValue::exec_substring(&v1, &v2, None);
+                }
+                BinaryFunc::Timediff => {
+                    let _ = exec_timediff([v1, v2]);
+                }
             }
         }
         ScalarFuncCall::Ternary(func, v1, v2, v3) => {
@@ -341,6 +367,28 @@ fn execute_scalar_func(call: ScalarFuncCall) {
                 }
                 VariadicFunc::Char => {
                     let _ = CoreValue::exec_char(vals.iter());
+                }
+                VariadicFunc::Printf => {
+                    let regs: Vec<Register> = vals.into_iter().map(Register::Value).collect();
+                    let _ = exec_printf(&regs);
+                }
+                VariadicFunc::Date => {
+                    let _ = exec_date(vals.iter());
+                }
+                VariadicFunc::Time => {
+                    let _ = exec_time(vals.iter());
+                }
+                VariadicFunc::DateTime => {
+                    let _ = exec_datetime_full(vals.iter());
+                }
+                VariadicFunc::JulianDay => {
+                    let _ = exec_julianday(vals.iter());
+                }
+                VariadicFunc::UnixEpoch => {
+                    let _ = exec_unixepoch(vals.iter());
+                }
+                VariadicFunc::Strftime => {
+                    let _ = exec_strftime(vals.iter());
                 }
             }
         }
