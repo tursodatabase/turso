@@ -393,6 +393,10 @@ pub struct ProgramState {
     uses_subjournal: bool,
     pub n_change: AtomicI64,
     pub explain_state: RwLock<ExplainState>,
+    /// Pending error to return after FAIL mode commit completes.
+    /// When a constraint error occurs with FAIL resolve type in autocommit mode,
+    /// we need to commit partial changes before returning the error.
+    pub(crate) pending_fail_error: Option<LimboError>,
 }
 
 impl std::fmt::Debug for Program {
@@ -467,6 +471,7 @@ impl ProgramState {
             uses_subjournal: false,
             n_change: AtomicI64::new(0),
             explain_state: RwLock::new(ExplainState::default()),
+            pending_fail_error: None,
         }
     }
 
@@ -1023,7 +1028,7 @@ impl Program {
                 return Err(LimboError::InternalError("Connection closed".to_string()));
             }
             if matches!(state.execution_state, ProgramExecutionState::Interrupting) {
-                self.abort(&pager, None, state);
+                self.abort(&pager, None, state)?;
                 return Ok(StepResult::Interrupt);
             }
 
@@ -1041,11 +1046,17 @@ impl Program {
                         // the write itself succeeded.
                         let checkpoint_err = LimboError::CheckpointFailed(err.to_string());
                         tracing::error!("Checkpoint failed: {checkpoint_err}");
-                        self.abort(&pager, Some(&checkpoint_err), state);
+                        if let Err(abort_err) = self.abort(&pager, Some(&checkpoint_err), state) {
+                            tracing::error!(
+                                "Abort also failed during checkpoint error handling: {abort_err}"
+                            );
+                        }
                         return Err(checkpoint_err);
                     }
                     let err = err.into();
-                    self.abort(&pager, Some(&err), state);
+                    if let Err(abort_err) = self.abort(&pager, Some(&err), state) {
+                        tracing::error!("Abort failed during error handling: {abort_err}");
+                    }
                     return Err(err);
                 }
                 state.io_completions = None;
@@ -1096,7 +1107,9 @@ impl Program {
                     return Ok(StepResult::Busy);
                 }
                 Err(err) => {
-                    self.abort(&pager, Some(&err), state);
+                    if let Err(abort_err) = self.abort(&pager, Some(&err), state) {
+                        tracing::error!("Abort failed during error handling: {abort_err}");
+                    }
                     return Err(err);
                 }
             }
@@ -1343,18 +1356,30 @@ impl Program {
 
     /// Aborts the program due to various conditions (explicit error, interrupt or reset of unfinished statement) by rolling back the transaction
     /// This method is no-op if program was already finished (either aborted or executed to completion)
-    pub fn abort(&self, pager: &Arc<Pager>, err: Option<&LimboError>, state: &mut ProgramState) {
+    /// Returns an error if cleanup operations (savepoint rollback/release) fail.
+    pub fn abort(
+        &self,
+        pager: &Arc<Pager>,
+        err: Option<&LimboError>,
+        state: &mut ProgramState,
+    ) -> Result<()> {
         if self.is_trigger_subprogram() {
             self.connection.end_trigger_execution();
         }
         // Errors from nested statements are handled by the parent statement.
         if !self.connection.is_nested_stmt() && !self.is_trigger_subprogram() {
             if err.is_some() && !pager.is_checkpointing() {
-                // Any error apart from deferred FK violations and checkpoint failures causes the statement subtransaction to roll back.
-                let res =
-                    state.end_statement(&self.connection, pager, EndStatement::RollbackSavepoint);
-                if let Err(e) = res {
-                    tracing::error!("Error rolling back statement: {}", e);
+                // For FAIL resolve type with non-FK constraint errors, do NOT rollback the statement
+                // savepoint - changes made by the statement prior to the error should persist.
+                // For all other resolve types (ABORT, ROLLBACK, etc.), rollback the statement.
+                let should_rollback_stmt = !(self.resolve_type == ResolveType::Fail
+                    && matches!(err, Some(LimboError::Constraint(_))));
+                if should_rollback_stmt {
+                    state.end_statement(
+                        &self.connection,
+                        pager,
+                        EndStatement::RollbackSavepoint,
+                    )?;
                 }
             }
             match err {
@@ -1372,11 +1397,37 @@ impl Program {
                 // Schema updated errors do not cause a rollback; the statement will be reprepared and retried,
                 // and the caller is expected to handle transaction cleanup explicitly if needed.
                 Some(LimboError::SchemaUpdated) => {}
-                // Constraint errors do not cause a rollback of the transaction for interacative transactions;
-                // Instead individual statement subtransactions will roll back
-                // In the auto-commit mode - we rollback current active transaction
-                Some(LimboError::Constraint(_)) => {
+                // Foreign key constraint errors: ON CONFLICT does NOT apply to FK violations.
+                // FK errors always behave like ABORT: rollback statement,
+                // rollback transaction in autocommit mode.
+                Some(LimboError::ForeignKeyConstraint(_)) => {
                     if self.connection.get_auto_commit() {
+                        self.rollback_current_txn(pager);
+                    }
+                }
+                // Non-FK constraint errors: behavior depends on resolve_type
+                // - ROLLBACK: rollback the entire transaction regardless of autocommit mode
+                // - FAIL: don't rollback anything - changes persist, transaction stays active
+                // - ABORT: rollback statement, rollback transaction in autocommit mode
+                Some(LimboError::Constraint(_)) => {
+                    if self.resolve_type == ResolveType::Rollback {
+                        // ROLLBACK always rolls back the entire transaction
+                        self.rollback_current_txn(pager);
+                    } else if self.resolve_type == ResolveType::Fail {
+                        // FAIL: Don't rollback the transaction. Changes made before the error persist.
+                        // For autocommit mode, the commit was already handled in halt() before
+                        // the error was returned, so nothing more to do here.
+                        // For non-autocommit mode, release the savepoint so changes become part
+                        // of the outer transaction.
+                        if !self.connection.get_auto_commit() {
+                            state.end_statement(
+                                &self.connection,
+                                pager,
+                                EndStatement::ReleaseSavepoint,
+                            )?;
+                        }
+                    } else if self.connection.get_auto_commit() {
+                        // ABORT in autocommit: rollback the implicit transaction
                         self.rollback_current_txn(pager);
                     }
                 }
@@ -1388,6 +1439,7 @@ impl Program {
             }
         }
         state.auto_txn_cleanup = TxnCleanup::None;
+        Ok(())
     }
 
     fn rollback_current_txn(&self, pager: &Arc<Pager>) {

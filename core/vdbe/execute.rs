@@ -16,7 +16,7 @@ use crate::storage::pager::{default_page1, CreateBTreeFlags, PageRef};
 use crate::storage::sqlite3_ondisk::{DatabaseHeader, PageSize, RawVersion};
 use crate::translate::collate::CollationSeq;
 use crate::types::{
-    compare_immutable, compare_records_generic, AsValueRef, Extendable, IOCompletions,
+    compare_immutable, compare_records_generic, AsValueRef, Extendable, IOCompletions, IOResult,
     ImmutableRecord, IndexInfo, SeekResult, Text,
 };
 use crate::util::{
@@ -69,10 +69,7 @@ use crate::storage::btree::{BTreeCursor, BTreeKey};
 
 use crate::{
     storage::wal::CheckpointResult,
-    types::{
-        AggContext, Cursor, ExternalAggState, IOResult, SeekKey, SeekOp, SumAggState, Value,
-        ValueType,
-    },
+    types::{AggContext, Cursor, ExternalAggState, SeekKey, SeekOp, SumAggState, Value, ValueType},
     util::{cast_real_to_integer, checked_cast_text_to_numeric, parse_schema_rows},
     vdbe::{
         builder::CursorType,
@@ -1843,34 +1840,81 @@ pub fn halt(
     description: &str,
 ) -> Result<InsnFunctionStepResult> {
     let mv_store = program.connection.mv_store();
-    if err_code > 0 {
-        vtab_rollback_all(&program.connection)?;
-    }
-    match err_code {
-        0 => {}
-        SQLITE_CONSTRAINT_PRIMARYKEY => {
-            return Err(LimboError::Constraint(format!(
-                "UNIQUE constraint failed: {description} (19)"
-            )));
-        }
-        SQLITE_CONSTRAINT_NOTNULL => {
-            return Err(LimboError::Constraint(format!(
-                "NOT NULL constraint failed: {description} (19)"
-            )));
-        }
-        SQLITE_CONSTRAINT_UNIQUE => {
-            return Err(LimboError::Constraint(format!(
-                "UNIQUE constraint failed: {description} (19)"
-            )));
-        }
-        _ => {
-            return Err(LimboError::Constraint(format!(
-                "undocumented halt error code {description}"
-            )));
+    let auto_commit = program.connection.auto_commit.load(Ordering::SeqCst);
+
+    // Check if we're resuming from a FAIL commit I/O wait.
+    // If pending_fail_error is set, we were in the middle of committing partial changes
+    // for FAIL mode and need to continue the commit, then return the stored error.
+    if let Some(pending_error) = state.pending_fail_error.take() {
+        match program.commit_txn(pager.clone(), state, mv_store.as_ref(), false)? {
+            IOResult::Done(_) => return Err(pending_error),
+            IOResult::IO(io) => {
+                state.pending_fail_error = Some(pending_error); // put it back and wait
+                return Ok(InsnFunctionStepResult::IO(io));
+            }
         }
     }
 
-    let auto_commit = program.connection.auto_commit.load(Ordering::SeqCst);
+    if err_code > 0 {
+        vtab_rollback_all(&program.connection)?;
+    }
+
+    // Determine the constraint error (if any) based on error code
+    let constraint_error = match err_code {
+        0 => None,
+        SQLITE_CONSTRAINT_PRIMARYKEY => Some(LimboError::Constraint(format!(
+            "UNIQUE constraint failed: {description} (19)"
+        ))),
+        SQLITE_CONSTRAINT_NOTNULL => Some(LimboError::Constraint(format!(
+            "NOT NULL constraint failed: {description} (19)"
+        ))),
+        SQLITE_CONSTRAINT_UNIQUE => Some(LimboError::Constraint(format!(
+            "UNIQUE constraint failed: {description} (19)"
+        ))),
+        _ => Some(LimboError::Constraint(format!(
+            "undocumented halt error code {description}"
+        ))),
+    };
+
+    // Handle constraint errors
+    if let Some(error) = constraint_error {
+        // For FAIL mode with autocommit, commit partial changes before returning error.
+        // This matches SQLite behavior where FAIL keeps changes made before the error.
+        // Note: ON CONFLICT FAIL does NOT apply to FK violations, so we check for those first.
+        if program.resolve_type == ResolveType::Fail && auto_commit {
+            // Check for immediate FK violations - FK errors don't respect ON CONFLICT
+            if program.connection.foreign_keys_enabled()
+                && state
+                    .fk_immediate_violations_during_stmt
+                    .load(Ordering::Acquire)
+                    > 0
+            {
+                return Err(LimboError::ForeignKeyConstraint(
+                    "immediate foreign key constraint failed".to_string(),
+                ));
+            }
+
+            // Release savepoint to preserve partial changes, then commit
+            state.end_statement(&program.connection, pager, EndStatement::ReleaseSavepoint)?;
+            vtab_commit_all(&program.connection)?;
+            index_method_pre_commit_all(state, pager)?;
+
+            // Commit the transaction with partial changes
+            match program.commit_txn(pager.clone(), state, mv_store.as_ref(), false)? {
+                IOResult::Done(_) => return Err(error),
+                IOResult::IO(io) => {
+                    // store the error for reentrancy
+                    state.pending_fail_error = Some(error);
+                    return Ok(InsnFunctionStepResult::IO(io));
+                }
+            }
+        }
+
+        // For non-FAIL modes (or non-autocommit), just return the error.
+        // abort() will handle rollback based on resolve_type.
+        return Err(error);
+    }
+
     tracing::trace!("halt(auto_commit={})", auto_commit);
 
     // Check for immediate foreign key violations.
@@ -1881,8 +1925,8 @@ pub fn halt(
             .load(Ordering::Acquire)
             > 0
     {
-        return Err(LimboError::Constraint(
-            "foreign key constraint failed".to_string(),
+        return Err(LimboError::ForeignKeyConstraint(
+            "immediate foreign key constraint failed".to_string(),
         ));
     }
 
@@ -1903,8 +1947,8 @@ pub fn halt(
                 pager.rollback_tx(&program.connection);
                 program.connection.set_tx_state(TransactionState::None);
                 program.connection.auto_commit.store(true, Ordering::SeqCst);
-                return Err(LimboError::Constraint(
-                    "foreign key constraint failed".to_string(),
+                return Err(LimboError::ForeignKeyConstraint(
+                    "deferred foreign key constraint failed".to_string(),
                 ));
             }
         }
@@ -2382,8 +2426,8 @@ fn check_deferred_fk_on_commit(conn: &Connection) -> Result<()> {
         return Ok(());
     }
     if conn.get_deferred_foreign_key_violations() > 0 {
-        return Err(LimboError::Constraint(
-            "FOREIGN KEY constraint failed".into(),
+        return Err(LimboError::ForeignKeyConstraint(
+            "deferred foreign key constraint failed on commit".into(),
         ));
     }
     Ok(())

@@ -461,7 +461,9 @@ impl Statement {
             }
         }
         // as abort uses auto_txn_cleanup value - it needs to be called before state.reset
-        self.program.abort(&self.pager, None, &mut self.state);
+        if let Err(abort_err) = self.program.abort(&self.pager, None, &mut self.state) {
+            tracing::error!("Abort failed during statement reset: {abort_err}");
+        }
         self.state.reset(max_registers, max_cursors);
         self.state.n_change.store(0, Ordering::SeqCst);
         self.busy = false;
