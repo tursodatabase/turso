@@ -2513,7 +2513,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
         if let Some(savepoint) = savepoint {
             tracing::debug!("rollback_savepoint(tx_id={}, created_table={}, created_index={}, deleted_table={}, deleted_index={})",
-                tx_id, 
+                tx_id,
                 savepoint.created_table_versions.len(),
                 savepoint.created_index_versions.len(),
                 savepoint.deleted_table_versions.len(),
@@ -2535,8 +2535,11 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     if let Some(entry) = index.value().get(&key) {
                         let mut versions = entry.value().write();
                         versions.retain(|rv| rv.id != version_id);
-                        tracing::debug!("rollback_savepoint: removed index version(table_id={}, version_id={})",
-                            table_id, version_id);
+                        tracing::debug!(
+                            "rollback_savepoint: removed index version(table_id={}, version_id={})",
+                            table_id,
+                            version_id
+                        );
                     }
                 }
             }
@@ -2575,7 +2578,10 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
             Ok(true)
         } else {
-            tracing::debug!("rollback_savepoint(tx_id={}): no savepoint was active", tx_id);
+            tracing::debug!(
+                "rollback_savepoint(tx_id={}): no savepoint was active",
+                tx_id
+            );
             Ok(false)
         }
     }
