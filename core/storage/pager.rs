@@ -2182,6 +2182,9 @@ impl Pager {
         loop {
             let commit_state = self.commit_info.read().state;
             tracing::debug!("commit_state: {:?}", commit_state);
+            // we separate auto-checkpoint from the commit in order for checkpoint to be able to backfill WAL till the end
+            // (including new frames from current transaction)
+            // otherwise, we will be unable to do WAL restart
             match commit_state {
                 CommitState::AutoCheckpoint => {
                     return_if_io!(self.checkpoint(
