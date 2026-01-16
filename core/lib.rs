@@ -198,18 +198,6 @@ enum TransactionState {
     None,
 }
 
-impl TransactionState {
-    /// Whether the transaction is a write transaction that changes the schema
-    pub fn is_ddl_write_tx(&self) -> bool {
-        matches!(
-            self,
-            TransactionState::Write {
-                schema_did_change: true
-            }
-        )
-    }
-}
-
 #[derive(Debug, AtomicEnum, Clone, Copy, PartialEq, Eq)]
 pub enum SyncMode {
     Off = 0,

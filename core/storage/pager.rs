@@ -670,6 +670,7 @@ impl Page {
     }
 
     #[inline]
+    /// almost never should be called explicitly - instead [Pager::add_dirty] method must be used
     pub fn set_dirty(&self) {
         tracing::debug!("set_dirty(page={})", self.get().id);
         self.clear_wal_tag();
@@ -679,6 +680,7 @@ impl Page {
     }
 
     #[inline]
+    /// caller must ensure that [Pager::dirty_pages] will be updated accordingly
     pub fn clear_dirty(&self) {
         tracing::debug!("clear_dirty(page={})", self.get().id);
         self.get().flags.fetch_and(!PAGE_DIRTY, Ordering::Release);
@@ -2187,14 +2189,24 @@ impl Pager {
             // otherwise, we will be unable to do WAL restart
             match commit_state {
                 CommitState::AutoCheckpoint => {
-                    return_if_io!(self.checkpoint(
+                    let checkpoint_result = self.checkpoint(
                         CheckpointMode::Passive {
                             upper_bound_inclusive: None,
                         },
                         connection.get_sync_mode(),
-                        true,
-                    ));
-                    self.commit_dirty_pages_end();
+                        false,
+                    );
+                    match checkpoint_result {
+                        Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
+                        Ok(IOResult::Done(_)) => {
+                            self.commit_dirty_pages_end();
+                        }
+                        Err(err) => {
+                            tracing::info!("auto-checkpoint failed: {err}");
+                            self.commit_dirty_pages_end();
+                            self.cleanup_after_auto_checkpoint_failure();
+                        }
+                    }
                     break;
                 }
                 _ => {
@@ -3355,14 +3367,12 @@ impl Pager {
         state.mode = None;
     }
 
-    /// Clean up after a checkpoint failure. The WAL commit succeeded but checkpoint failed.
-    /// This ends the write and read transactions that would normally be ended in commit_tx().
-    pub fn finish_commit_after_checkpoint_failure(&self) {
+    /// Clean up after a auto-checkpoint failure.
+    /// Auto-checkpoint executed outside of the main transaction - so WAL transaction was already finalized
+    pub fn cleanup_after_auto_checkpoint_failure(&self) {
         self.reset_checkpoint_state();
         if let Some(wal) = self.wal.as_ref() {
             wal.abort_checkpoint();
-            wal.end_write_tx();
-            wal.end_read_tx();
         }
     }
 

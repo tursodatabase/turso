@@ -1312,25 +1312,6 @@ impl Program {
         let cacheflush_status = if !rollback {
             match pager.commit_tx(connection) {
                 Ok(status) => status,
-                Err(LimboError::CheckpointFailed(msg)) => {
-                    // CheckpointFailed means the WAL commit succeeded but autocheckpoint failed.
-                    // The transaction is durable - clean up transaction state and propagate the error.
-                    tracing::warn!("Commit succeeded but autocheckpoint failed: {}", msg);
-                    if self.change_cnt_on {
-                        self.connection
-                            .set_changes(program_state.n_change.load(Ordering::SeqCst));
-                    }
-                    // Update global schema if this was a DDL transaction.
-                    // Must be done before clearing TX state, otherwise abort() won't know
-                    // to update the schema.
-                    if connection.get_tx_state().is_ddl_write_tx() {
-                        let schema = connection.schema.read().clone();
-                        connection.db.update_schema_if_newer(schema);
-                    }
-                    connection.set_tx_state(TransactionState::None);
-                    *commit_state = CommitState::Ready;
-                    return Err(LimboError::CheckpointFailed(msg));
-                }
                 Err(e) => return Err(e),
             }
         } else {
@@ -1394,19 +1375,6 @@ impl Program {
                 // Schema updated errors do not cause a rollback; the statement will be reprepared and retried,
                 // and the caller is expected to handle transaction cleanup explicitly if needed.
                 Some(LimboError::SchemaUpdated) => {}
-                // CheckpointFailed means the WAL commit succeeded but autocheckpoint failed.
-                // The transaction is already committed and durable, so no rollback is needed.
-                // Clean up the WAL write/read transactions that would normally be cleaned up in commit_tx().
-                Some(LimboError::CheckpointFailed(_)) => {
-                    pager.finish_commit_after_checkpoint_failure();
-                    // If a checkpoint failed, that doesn't mean the transaction is not committed;
-                    // hence: if there were schema changes, we need to update the global schema.
-                    if self.connection.get_tx_state().is_ddl_write_tx() {
-                        let schema = self.connection.schema.read().clone();
-                        self.connection.db.update_schema_if_newer(schema);
-                    }
-                    self.connection.set_tx_state(TransactionState::None);
-                }
                 // Constraint errors do not cause a rollback of the transaction for interacative transactions;
                 // Instead individual statement subtransactions will roll back
                 // In the auto-commit mode - we rollback current active transaction
