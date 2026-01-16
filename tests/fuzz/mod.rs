@@ -1455,10 +1455,10 @@ mod fuzz_tests {
                         let b = rng.random_range(-5..=25);
                         format!(
                             "INSERT {} INTO p VALUES({id}, {a}, {b})",
-                            if rng.random_bool(0.4) {
+                            if rng.random_bool(0.5) {
                                 "OR REPLACE "
                             } else {
-                                ""
+                                "OR ROLLBACK"
                             }
                         )
                     }
@@ -1498,7 +1498,7 @@ mod fuzz_tests {
                             if rng.random_bool(0.4) {
                                 "OR REPLACE "
                             } else {
-                                ""
+                                "OR FAIL"
                             }
                         )
                     }
