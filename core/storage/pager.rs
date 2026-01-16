@@ -2202,6 +2202,7 @@ impl Pager {
                     ));
                     wal.end_write_tx();
                     wal.end_read_tx();
+                    connection.set_tx_state(TransactionState::None);
 
                     if self.commit_info.read().state != CommitState::AutoCheckpoint {
                         self.commit_dirty_pages_end();

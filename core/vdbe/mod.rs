@@ -1343,7 +1343,6 @@ impl Program {
                     self.connection
                         .set_changes(program_state.n_change.load(Ordering::SeqCst));
                 }
-                connection.set_tx_state(TransactionState::None);
                 *commit_state = CommitState::Ready;
             }
             IOResult::IO(io) => {
