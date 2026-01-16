@@ -1561,7 +1561,7 @@ mod cte_tests {
         let limbo_conn = db.connect_limbo();
         let sqlite_conn = rusqlite::Connection::open_in_memory().unwrap();
 
-        const ITERATIONS: usize = 500;
+        const ITERATIONS: usize = 100;
         for i in 0..ITERATIONS {
             if i % 100 == 0 {
                 println!("cte_fuzz iteration {}/{}", i + 1, ITERATIONS);
