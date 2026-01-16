@@ -43,7 +43,7 @@ RUN cargo chef prepare --bin sim_redo --recipe-path recipe.json
 FROM chef AS builder
 
 COPY --from=planner /app/recipe.json recipe.json
-RUN cargo chef cook --bin sim_redo --release --recipe-path recipe.json
+RUN cargo chef cook --bin sim_redo --recipe-path recipe.json
 COPY --from=planner /app/core ./core/
 COPY --from=planner /app/extensions ./extensions/
 COPY --from=planner /app/macros ./macros/
@@ -58,7 +58,7 @@ COPY --from=planner /app/sql_generation ./sql_generation/
 COPY --from=planner /app/sql_gen_prop ./sql_gen_prop/
 COPY --from=planner /app/Cargo.toml /app/Cargo.lock ./
 
-RUN cargo build --bin sim_redo --release
+RUN cargo build --bin sim_redo
 
 #
 # The final image.
@@ -81,10 +81,10 @@ ARG GIT_HASH
 ENV GIT_HASH=${GIT_HASH:-unknown}
 
 WORKDIR /app
-COPY --from=builder /app/target/release/sim_redo /app/sim_redo
-COPY simulator_redo/runner/package.json simulator_redo/runner/tsconfig.json ./
+COPY --from=builder /app/target/debug/sim_redo /app/sim_redo
+COPY simulator_redo/docker-runner/package.json simulator_redo/docker-runner/tsconfig.json ./
 RUN bun install
-COPY simulator_redo/runner/*.ts ./
+COPY simulator_redo/docker-runner/*.ts ./
 
 RUN chmod +x /app/docker-entrypoint.simulator.ts
 RUN chmod +x /app/sim_redo
