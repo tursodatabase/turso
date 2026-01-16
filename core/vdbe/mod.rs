@@ -1222,8 +1222,7 @@ impl Program {
         // Reset state for next use
         program_state.view_delta_state = ViewDeltaCommitState::NotStarted;
         if self.connection.get_tx_state() == TransactionState::None {
-            // No need to do any work here if not in tx. Current MVCC logic doesn't work with this assumption,
-            // hence the mv_store.is_none() check.
+            // No need to do any work here if not in tx
             return Ok(IOResult::Done(()));
         }
         if self.connection.is_nested_stmt() {
@@ -1309,13 +1308,14 @@ impl Program {
         rollback: bool,
     ) -> Result<IOResult<()>> {
         let commit_state = &mut program_state.commit_state;
-        let cacheflush_status = if !rollback {
-            pager.commit_tx(connection)?
+        let txn_finish_result = if !rollback {
+            pager.commit_tx(connection, true)
         } else {
             pager.rollback_tx(connection);
-            IOResult::Done(())
+            Ok(IOResult::Done(()))
         };
-        match cacheflush_status {
+        tracing::debug!("txn_finish_result: {:?}", txn_finish_result);
+        match txn_finish_result? {
             IOResult::Done(_) => {
                 if self.change_cnt_on {
                     self.connection

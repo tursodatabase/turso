@@ -465,6 +465,7 @@ impl Database {
             .unwrap_or_else(|| path.to_string());
 
         if let Some(db) = registry.get(&canonical_path).and_then(Weak::upgrade) {
+            tracing::debug!("took database {canonical_path:?} from the registry");
             return Ok(db);
         }
         let db = Self::open_with_flags_bypass_registry_internal(
