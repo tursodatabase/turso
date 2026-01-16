@@ -928,13 +928,8 @@ pub fn emit_query<'a>(
     let after_main_loop_label = program.allocate_label();
     t_ctx.label_main_loop_end = Some(after_main_loop_label);
 
-    if !plan.values.is_empty() {
-        let reg_result_cols_start = emit_values(program, plan, t_ctx)?;
-        program.preassign_label_to_next_insn(after_main_loop_label);
-        return Ok(reg_result_cols_start);
-    }
-
     // Evaluate uncorrelated subqueries as early as possible, because even LIMIT can reference a subquery.
+    // This must happen before VALUES emission since VALUES expressions may contain scalar subqueries.
     for subquery in plan
         .non_from_clause_subqueries
         .iter_mut()
@@ -948,11 +943,18 @@ pub fn emit_query<'a>(
 
         emit_non_from_clause_subquery(
             program,
-            t_ctx,
+            &t_ctx.resolver,
             *plan,
             &subquery.query_type,
             subquery.correlated,
         )?;
+    }
+
+    // Handle VALUES clause - emit values after subqueries are prepared
+    if !plan.values.is_empty() {
+        let reg_result_cols_start = emit_values(program, plan, t_ctx)?;
+        program.preassign_label_to_next_insn(after_main_loop_label);
+        return Ok(reg_result_cols_start);
     }
 
     // Emit FROM clause subqueries first so the results can be read in the main query loop.
@@ -1173,7 +1175,7 @@ fn emit_program_for_delete(
 
             emit_non_from_clause_subquery(
                 program,
-                &mut t_ctx,
+                &t_ctx.resolver,
                 *subquery_plan,
                 &subquery.query_type,
                 subquery.correlated,
@@ -2012,7 +2014,7 @@ fn emit_program_for_update(
 
             emit_non_from_clause_subquery(
                 program,
-                &mut t_ctx,
+                &t_ctx.resolver,
                 *subquery_plan,
                 &subquery.query_type,
                 subquery.correlated,

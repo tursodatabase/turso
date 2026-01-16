@@ -12,9 +12,9 @@ use crate::translate::optimizer::optimize_plan;
 use crate::translate::plan::{GroupBy, Plan, ResultSetColumn, SelectPlan};
 use crate::translate::planner::{
     break_predicate_at_and_boundaries, parse_from, parse_limit, parse_where,
-    resolve_window_and_aggregate_functions,
+    plan_ctes_as_outer_refs, resolve_window_and_aggregate_functions,
 };
-use crate::translate::subquery::plan_subqueries_from_select_plan;
+use crate::translate::subquery::{plan_subqueries_from_select_plan, plan_subqueries_from_values};
 use crate::translate::window::plan_windows;
 use crate::util::normalize_ident;
 use crate::vdbe::builder::ProgramBuilderOpts;
@@ -527,6 +527,10 @@ fn prepare_one_select_plan(
             }
 
             let mut table_references = TableReferences::new(vec![], outer_query_refs.to_vec());
+
+            // Plan CTEs from WITH clause so they're available for subqueries in VALUES
+            plan_ctes_as_outer_refs(with, resolver, program, &mut table_references, connection)?;
+
             for value_row in values.iter_mut() {
                 for value in value_row.iter_mut() {
                     // Before binding, we check for unquoted literals. Sqlite throws an error in this case
@@ -540,6 +544,17 @@ fn prepare_one_select_plan(
                     )?;
                 }
             }
+
+            // Plan subqueries in VALUES expressions
+            let mut non_from_clause_subqueries = vec![];
+            plan_subqueries_from_values(
+                program,
+                &mut non_from_clause_subqueries,
+                &mut table_references,
+                &mut values,
+                resolver,
+                connection,
+            )?;
 
             let plan = SelectPlan {
                 join_order: vec![],
@@ -559,7 +574,7 @@ fn prepare_one_select_plan(
                     .map(|values| values.iter().map(|value| *value.clone()).collect())
                     .collect(),
                 window: None,
-                non_from_clause_subqueries: vec![],
+                non_from_clause_subqueries,
             };
 
             validate_expr_correct_column_counts(&plan)?;

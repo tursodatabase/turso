@@ -22,7 +22,10 @@ use super::plan::{
     ColumnUsedMask, IterationDirection, JoinedTable, Plan, TableReferences, UpdatePlan,
 };
 use super::planner::{parse_where, plan_ctes_as_outer_refs};
-use super::subquery::{plan_subqueries_from_select_plan, plan_subqueries_from_where_clause};
+use super::subquery::{
+    plan_subqueries_from_returning, plan_subqueries_from_select_plan,
+    plan_subqueries_from_where_clause,
+};
 /*
 * Update is simple. By default we scan the table, and for each row, we check the WHERE
 * clause. If it evaluates to true, we build the new record with the updated value and insert.
@@ -315,6 +318,18 @@ pub fn prepare_update_plan(
         }
     }
 
+    // Plan subqueries in RETURNING expressions before processing
+    // (so SubqueryResult nodes are cloned into result_columns)
+    let mut non_from_clause_subqueries = vec![];
+    plan_subqueries_from_returning(
+        program,
+        &mut non_from_clause_subqueries,
+        &mut table_references,
+        &mut body.returning,
+        resolver,
+        connection,
+    )?;
+
     let result_columns =
         process_returning_clause(&mut body.returning, &mut table_references, connection)?;
 
@@ -423,7 +438,7 @@ pub fn prepare_update_plan(
         indexes_to_update,
         ephemeral_plan: None,
         cdc_update_alter_statement: None,
-        non_from_clause_subqueries: vec![],
+        non_from_clause_subqueries,
     }))
 }
 

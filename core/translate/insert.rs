@@ -1,8 +1,7 @@
-use crate::sync::Arc;
-use crate::translate::expr::rewrite_between_expr;
 use crate::{
     error::{SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE},
     schema::{self, BTreeTable, ColDef, Column, Index, IndexColumn, ResolvedFkRef, Schema, Table},
+    sync::Arc,
     translate::{
         emitter::{
             emit_cdc_full_record, emit_cdc_insns, emit_cdc_patch_record, prepare_cdc_if_necessary,
@@ -10,19 +9,20 @@ use crate::{
         },
         expr::{
             bind_and_rewrite_expr, emit_returning_results, process_returning_clause,
-            translate_expr, translate_expr_no_constant_opt, walk_expr_mut, BindingBehavior,
-            NoConstantOptReason, WalkControl,
+            rewrite_between_expr, translate_expr, translate_expr_no_constant_opt, walk_expr_mut,
+            BindingBehavior, NoConstantOptReason, WalkControl,
         },
         fkeys::{
             build_index_affinity_string, emit_fk_violation, emit_guarded_fk_decrement,
             fire_fk_delete_actions, index_probe, open_read_index, open_read_table,
         },
         plan::{
-            ColumnUsedMask, JoinedTable, Operation, QueryDestination, ResultSetColumn,
+            ColumnUsedMask, EvalAt, JoinedTable, Operation, QueryDestination, ResultSetColumn,
             TableReferences,
         },
-        planner::ROWID_STRS,
+        planner::{plan_ctes_as_outer_refs, ROWID_STRS},
         select::translate_select,
+        subquery::{emit_non_from_clause_subquery, plan_subqueries_from_returning},
         trigger_exec::{
             fire_trigger, get_relevant_triggers_type_and_time, has_relevant_triggers_type_only,
             TriggerContext,
@@ -218,7 +218,11 @@ pub fn translate_insert(
     };
     program.extend(&opts);
 
-    // Merge INSERT's WITH clause into the SELECT source's WITH clause
+    // Merge INSERT's WITH clause into the SELECT source's WITH clause.
+    // For VALUES/DEFAULT VALUES with subqueries, we route through the multi-row
+    // path which goes through translate_select and handles CTEs properly.
+    // We also keep a copy for RETURNING clause subqueries.
+    let with_for_returning = with.clone();
     if let Some(insert_with) = with {
         if let InsertBody::Select(select, _) = &mut body {
             match &mut select.with {
@@ -237,6 +241,8 @@ pub fn translate_insert(
             // but: we can, and indeed must, just ignore it instead of erroring.
             // leaving this empty else block here for documentation.
         }
+        // For DEFAULT VALUES/VALUES without SELECT body, CTEs are still needed
+        // for RETURNING clause subqueries - handled below via with_for_returning.
     }
 
     let table_name = &tbl_name.name;
@@ -301,6 +307,27 @@ pub fn translate_insert(
         vec![],
     );
 
+    // Plan CTEs and add them as outer query references for RETURNING subquery resolution
+    plan_ctes_as_outer_refs(
+        with_for_returning,
+        resolver,
+        &mut program,
+        &mut table_references,
+        connection,
+    )?;
+
+    // Plan subqueries in RETURNING expressions before processing
+    // (so SubqueryResult nodes are cloned into result_columns)
+    let mut returning_subqueries = vec![];
+    plan_subqueries_from_returning(
+        &mut program,
+        &mut returning_subqueries,
+        &mut table_references,
+        &mut returning,
+        resolver,
+        connection,
+    )?;
+
     // Process RETURNING clause using shared module
     let mut result_columns =
         process_returning_clause(&mut returning, &mut table_references, connection)?;
@@ -347,6 +374,26 @@ pub fn translate_insert(
         &values,
         inserting_multiple_rows,
     )?;
+
+    // Emit subqueries for RETURNING clause (uncorrelated subqueries are evaluated once)
+    for subquery in returning_subqueries
+        .iter_mut()
+        .filter(|s| !s.has_been_evaluated())
+    {
+        let eval_at = subquery.get_eval_at(&[], Some(&table_references))?;
+        if eval_at != EvalAt::BeforeLoop {
+            continue;
+        }
+        let subquery_plan = subquery.consume_plan(EvalAt::BeforeLoop);
+
+        emit_non_from_clause_subquery(
+            &mut program,
+            resolver,
+            *subquery_plan,
+            &subquery.query_type,
+            subquery.correlated,
+        )?;
+    }
 
     let has_user_provided_rowid = insertion.key.is_provided_by_user();
 
@@ -1152,6 +1199,25 @@ struct BoundInsertResult {
     inserting_multiple_rows: bool,
 }
 
+/// Check if an expression contains a subquery (Subquery, InSelect, or Exists).
+/// This is used to detect when single-row VALUES should be routed through the
+/// multi-row path which has proper subquery handling.
+fn expr_contains_subquery(expr: &Expr) -> bool {
+    use crate::translate::expr::{walk_expr, WalkControl};
+    let mut found_subquery = false;
+    let _ = walk_expr(expr, &mut |e| {
+        if matches!(
+            e,
+            Expr::Subquery(_) | Expr::InSelect { .. } | Expr::Exists(_)
+        ) {
+            found_subquery = true;
+            return Ok(WalkControl::SkipChildren);
+        }
+        Ok(WalkControl::Continue)
+    });
+    found_subquery
+}
+
 fn bind_insert(
     program: &mut ProgramBuilder,
     resolver: &Resolver,
@@ -1186,35 +1252,45 @@ fn bind_insert(
                         if values_expr.is_empty() {
                             crate::bail_parse_error!("no values to insert");
                         }
-                        for expr in values_expr.iter_mut().flat_map(|v| v.iter_mut()) {
-                            match expr.as_mut() {
-                                Expr::Id(name) => {
-                                    if name.quoted_with('"') {
-                                        *expr =
-                                            Expr::Literal(ast::Literal::String(name.as_literal()))
-                                                .into();
-                                    } else {
-                                        // an INSERT INTO ... VALUES (...) cannot reference columns
-                                        crate::bail_parse_error!("no such column: {name}");
+                        // Check if any VALUES expression contains a subquery.
+                        // If so, route through multi-row path which handles subqueries.
+                        let has_subquery = values_expr
+                            .iter()
+                            .any(|row| row.iter().any(|expr| expr_contains_subquery(expr)));
+                        if has_subquery {
+                            inserting_multiple_rows = true;
+                        } else {
+                            for expr in values_expr.iter_mut().flat_map(|v| v.iter_mut()) {
+                                match expr.as_mut() {
+                                    Expr::Id(name) => {
+                                        if name.quoted_with('"') {
+                                            *expr = Expr::Literal(ast::Literal::String(
+                                                name.as_literal(),
+                                            ))
+                                            .into();
+                                        } else {
+                                            // an INSERT INTO ... VALUES (...) cannot reference columns
+                                            crate::bail_parse_error!("no such column: {name}");
+                                        }
                                     }
+                                    Expr::Qualified(first_name, second_name) => {
+                                        // an INSERT INTO ... VALUES (...) cannot reference columns
+                                        crate::bail_parse_error!(
+                                            "no such column: {first_name}.{second_name}"
+                                        );
+                                    }
+                                    _ => {}
                                 }
-                                Expr::Qualified(first_name, second_name) => {
-                                    // an INSERT INTO ... VALUES (...) cannot reference columns
-                                    crate::bail_parse_error!(
-                                        "no such column: {first_name}.{second_name}"
-                                    );
-                                }
-                                _ => {}
+                                bind_and_rewrite_expr(
+                                    expr,
+                                    None,
+                                    None,
+                                    connection,
+                                    BindingBehavior::ResultColumnsNotAllowed,
+                                )?;
                             }
-                            bind_and_rewrite_expr(
-                                expr,
-                                None,
-                                None,
-                                connection,
-                                BindingBehavior::ResultColumnsNotAllowed,
-                            )?;
+                            values = values_expr.pop().unwrap_or_else(Vec::new);
                         }
-                        values = values_expr.pop().unwrap_or_else(Vec::new);
                     }
                     _ => inserting_multiple_rows = true,
                 }
@@ -1333,7 +1409,10 @@ fn init_source_emission<'a>(
     let (num_values, cursor_id) = match body {
         InsertBody::Select(select, _) => {
             // Simple common case of INSERT INTO <table> VALUES (...) without compounds.
-            if select.body.compounds.is_empty()
+            // Note: values.is_empty() check ensures we use the multi-row path when
+            // single-row VALUES contains subqueries (values extraction was skipped).
+            if !values.is_empty()
+                && select.body.compounds.is_empty()
                 && matches!(&select.body.select, OneSelect::Values(values) if values.len() <= 1)
             {
                 (

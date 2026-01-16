@@ -46,6 +46,8 @@ struct CteDefinition {
     name: String,
     /// The original AST SELECT statement (cloned for each reference)
     select: Select,
+    /// Explicit column names from WITH t(a, b) AS (...) syntax
+    explicit_columns: Vec<String>,
     /// Indexes of CTEs that this CTE directly references.
     /// Only includes CTEs that appear in this CTE's FROM clause,
     /// avoiding exponential re-planning when CTEs have transitive dependencies.
@@ -394,12 +396,18 @@ fn plan_cte(
     )?;
 
     // CTEs can be either simple SELECT or compound SELECT (UNION/INTERSECT/EXCEPT)
+    let explicit_cols = if cte_def.explicit_columns.is_empty() {
+        None
+    } else {
+        Some(cte_def.explicit_columns.as_slice())
+    };
     match cte_plan {
         Plan::Select(_) | Plan::CompoundSelect { .. } => JoinedTable::new_subquery_from_plan(
             cte_def.name.clone(),
             cte_plan,
             None,
             program.table_reference_counter.next(),
+            explicit_cols,
         ),
         Plan::Delete(_) | Plan::Update(_) => {
             crate::bail_parse_error!("DELETE/UPDATE queries are not supported in CTEs")
@@ -429,9 +437,13 @@ pub fn plan_ctes_as_outer_refs(
         if cte.materialized == Materialized::Yes {
             crate::bail_parse_error!("Materialized CTEs are not yet supported");
         }
-        if !cte.columns.is_empty() {
-            crate::bail_parse_error!("CTE columns are not yet supported");
-        }
+
+        // Normalize explicit column names
+        let explicit_columns: Vec<String> = cte
+            .columns
+            .iter()
+            .map(|c| normalize_ident(c.col_name.as_str()))
+            .collect();
 
         let cte_name = normalize_ident(cte.tbl_name.as_str());
 
@@ -463,12 +475,18 @@ pub fn plan_ctes_as_outer_refs(
         )?;
 
         // Convert plan to JoinedTable to extract column info
+        let explicit_cols = if explicit_columns.is_empty() {
+            None
+        } else {
+            Some(explicit_columns.as_slice())
+        };
         let joined_table = match cte_plan {
             Plan::Select(_) | Plan::CompoundSelect { .. } => JoinedTable::new_subquery_from_plan(
                 cte_name.clone(),
                 cte_plan,
                 None,
                 program.table_reference_counter.next(),
+                explicit_cols,
             )?,
             Plan::Delete(_) | Plan::Update(_) => {
                 crate::bail_parse_error!("Only SELECT queries are supported in CTEs")
@@ -566,6 +584,7 @@ fn parse_from_clause_table(
                 subplan,
                 None,
                 program.table_reference_counter.next(),
+                None, // No explicit columns for regular subqueries
             )?);
             Ok(())
         }
@@ -902,9 +921,12 @@ pub fn parse_from(
             if cte.materialized == Materialized::Yes {
                 crate::bail_parse_error!("Materialized CTEs are not yet supported");
             }
-            if !cte.columns.is_empty() {
-                crate::bail_parse_error!("CTE columns are not yet supported");
-            }
+            // Normalize explicit column names
+            let explicit_columns: Vec<String> = cte
+                .columns
+                .iter()
+                .map(|c| normalize_ident(c.col_name.as_str()))
+                .collect();
 
             // Check if normalized name conflicts with catalog tables or other CTEs
             // TODO: sqlite actually allows overriding a catalog table with a CTE.
@@ -948,6 +970,7 @@ pub fn parse_from(
             cte_definitions.push(CteDefinition {
                 name: cte_name_normalized,
                 select: cte.select,
+                explicit_columns,
                 referenced_cte_indices,
             });
         }
