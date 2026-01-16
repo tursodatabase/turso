@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::{fmt::Debug, pin::Pin};
 
 cfg_block! {
-   #[cfg(all(target_os = "linux", feature = "io_uring", not(miri)))] {
+    #[cfg(all(target_os = "linux", feature = "io_uring", not(miri)))] {
         mod io_uring;
         #[cfg(feature = "fs")]
         pub use io_uring::UringIO;
