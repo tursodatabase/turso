@@ -283,10 +283,7 @@ async fn run_tests(
 
             if !has_native_bindings {
                 eprintln!("Error: JavaScript native bindings not found");
-                eprintln!(
-                    "Expected .node file in {}",
-                    native_dir.display()
-                );
+                eprintln!("Expected .node file in {}", native_dir.display());
                 eprintln!();
                 eprintln!("Build the bindings first:");
                 eprintln!("  make -C turso-test-runner build-js-bindings");

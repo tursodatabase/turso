@@ -1,0 +1,65 @@
+@database :memory:
+
+test char-basic-ascii {
+    SELECT CHAR(65, 66, 67);
+}
+expect {
+    ABC
+}
+
+test char-mixed-case {
+    SELECT CHAR(65, 66, 67, 97, 98, 99);
+}
+expect {
+    ABCabc
+}
+
+test char-unicode-cjk {
+    SELECT CHAR(26085);
+}
+expect {
+    日
+}
+
+test char-unicode-mixed {
+    SELECT CHAR(65, 26085, 67);
+}
+expect {
+    A日C
+}
+
+test char-unicode-emoji {
+    SELECT CHAR(128512);
+}
+expect {
+    😀
+}
+
+test char-nul {
+    SELECT HEX(CHAR(0));
+}
+expect {
+    00
+}
+
+test char-negative-replacement {
+    SELECT CHAR(65, -1, 66);
+}
+expect {
+    A�B
+}
+
+test char-max-codepoint {
+    SELECT HEX(CHAR(1114111));
+}
+expect {
+    F48FBFBF
+}
+
+test char-over-max-replacement {
+    SELECT HEX(CHAR(0x110000));
+}
+expect {
+    EFBFBD
+}
+

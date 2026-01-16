@@ -1081,7 +1081,14 @@ impl Value {
         let result: String = values
             .filter_map(|x| {
                 if let Value::Integer(i) = x {
-                    Some(*i as u8 as char)
+                    // Convert integer to Unicode codepoint.
+                    // For invalid codepoints (negative, surrogates, or > U+10FFFF),
+                    // output U+FFFD (replacement character) to match SQLite behavior.
+                    if *i >= 0 {
+                        Some(char::from_u32(*i as u32).unwrap_or('\u{FFFD}'))
+                    } else {
+                        Some('\u{FFFD}')
+                    }
                 } else {
                     None
                 }
