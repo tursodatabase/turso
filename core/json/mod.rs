@@ -557,17 +557,20 @@ pub fn json_string_to_db_type(
             }
         }
         ElementType::FLOAT5 | ElementType::FLOAT => {
-            let float_val: f64 = json_string.parse().expect("Should be valid f64");
-            if float_val.is_infinite() && matches!(flag, OutputVariant::ElementType) {
-                // For json() function, SQLite returns bare infinity as "9e999" not "9.0e+999"
-                let simplified = if float_val.is_sign_negative() {
-                    "-9e999"
-                } else {
-                    "9e999"
-                };
-                Ok(Value::Text(Text::json(simplified.to_string())))
-            } else {
-                Ok(Value::Float(float_val))
+            match json_string.parse::<f64>() {
+                Ok(float_val)
+                    if float_val.is_infinite() && matches!(flag, OutputVariant::ElementType) =>
+                {
+                    // For json() function, SQLite returns bare infinity as "9e999" not "9.0e+999"
+                    let simplified = if float_val.is_sign_negative() {
+                        "-9e999"
+                    } else {
+                        "9e999"
+                    };
+                    Ok(Value::Text(Text::json(simplified.to_string())))
+                }
+                Ok(float_val) => Ok(Value::Float(float_val)),
+                Err(_) => Ok(Value::Null),
             }
         }
         ElementType::INT | ElementType::INT5 => {

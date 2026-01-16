@@ -816,7 +816,8 @@ impl JsonbHeader {
                         Err(e) => return Err(e),
                     },
 
-                    _ => unreachable!(),
+                    // header_size 15 is invalid
+                    _ => bail_parse_error!("Invalid header size: {}", header_size),
                 };
 
                 Ok((Self(element_type.try_into()?, total_size), offset))
