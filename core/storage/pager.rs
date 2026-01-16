@@ -4639,7 +4639,6 @@ mod ptrmap_tests {
         let pages = initial_db_pages + 10;
         let sz = std::cmp::max(std::cmp::min(pages, 64), pages);
         let buffer_pool = BufferPool::begin_init(&io, (sz * page_size) as usize);
-        let page_cache = Arc::new(RwLock::new(PageCache::new(sz as usize)));
 
         let wal_shared = WalFileShared::new_shared(
             io.open_file("test.db-wal", OpenFlags::Create, false)
@@ -4660,7 +4659,7 @@ mod ptrmap_tests {
             db_file,
             Some(wal),
             io,
-            page_cache,
+            PageCache::new(sz as usize),
             buffer_pool,
             Arc::new(Mutex::new(())),
             init_page_1,
