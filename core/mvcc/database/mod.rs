@@ -2317,6 +2317,12 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     }
 
     fn rollback_rowid(&self, tx_id: u64, rowid: &RowID) {
+        tracing::trace!(
+            "rollback_rowid: tx_id={}, rowid={:?}, is_int_key={}",
+            tx_id,
+            rowid,
+            rowid.row_id.is_int_key()
+        );
         if rowid.row_id.is_int_key() {
             self.rollback_table_rowid(tx_id, rowid);
         } else {
@@ -2325,6 +2331,12 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     }
 
     fn rollback_index_rowid(&self, tx_id: u64, rowid: &RowID) {
+        tracing::trace!(
+            "rollback_index_rowid: tx_id={}, table_id={}, rowid={:?}",
+            tx_id,
+            rowid.table_id,
+            rowid
+        );
         if let Some(index) = self.index_rows.get(&rowid.table_id) {
             let index = index.value();
             let RowKey::Record(ref index_key) = rowid.row_id else {
@@ -2332,34 +2344,87 @@ impl<Clock: LogicalClock> MvStore<Clock> {
             };
             if let Some(row_versions) = index.get(index_key) {
                 let mut row_versions = row_versions.value().write();
+                let versions_count = row_versions.len();
+                tracing::trace!(
+                    "rollback_index_rowid: tx_id={}, rolling back {} row versions",
+                    tx_id,
+                    versions_count
+                );
                 for rv in row_versions.iter_mut() {
                     rollback_row_version(tx_id, rv);
                 }
+            } else {
+                tracing::warn!(
+                    "rollback_index_rowid: tx_id={}, no row versions found for index_key={:?}",
+                    tx_id,
+                    index_key
+                );
             }
+        } else {
+            tracing::warn!(
+                "rollback_index_rowid: tx_id={}, no index found for table_id={}",
+                tx_id,
+                rowid.table_id
+            );
         }
     }
 
     fn rollback_table_rowid(&self, tx_id: u64, rowid: &RowID) {
+        tracing::trace!("rollback_table_rowid: tx_id={}, rowid={:?}", tx_id, rowid);
         if let Some(row_versions) = self.rows.get(rowid) {
             let mut row_versions = row_versions.value().write();
+            let versions_count = row_versions.len();
+            tracing::trace!(
+                "rollback_table_rowid: tx_id={}, rolling back {} row versions",
+                tx_id,
+                versions_count
+            );
             for rv in row_versions.iter_mut() {
                 rollback_row_version(tx_id, rv);
             }
+        } else {
+            tracing::warn!(
+                "rollback_table_rowid: tx_id={}, no row versions found for rowid={:?}",
+                tx_id,
+                rowid
+            );
         }
     }
 
     /// Rolls back a savepoint within a transaction.
     /// FIXME: implement open/close savepoint for individual statements
     pub fn rollback_first_savepoint(&self, tx_id: u64) -> Result<()> {
+        tracing::debug!(
+            "rollback_first_savepoint: tx_id={}, starting statement rollback",
+            tx_id
+        );
+
         let tx = self.txs.get(&tx_id).unwrap_or_else(|| {
             panic!("Transaction {tx_id} not found while rolling back savepoint")
         });
 
         let tx = tx.value();
+        let write_set_size = tx.write_set.len();
+        tracing::debug!(
+            "rollback_first_savepoint: tx_id={}, write_set_size={}",
+            tx_id,
+            write_set_size
+        );
+
         for rowid in &tx.write_set {
+            tracing::trace!(
+                "rollback_first_savepoint: tx_id={}, rolling back rowid={:?}",
+                tx_id,
+                rowid
+            );
             self.rollback_rowid(tx_id, &rowid);
         }
         tx.write_set.clear();
+
+        tracing::debug!(
+            "rollback_first_savepoint: tx_id={}, completed statement rollback",
+            tx_id
+        );
         Ok(())
     }
 
