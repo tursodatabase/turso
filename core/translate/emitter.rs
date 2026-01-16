@@ -3285,8 +3285,8 @@ pub fn emit_cdc_insns(
     updates_record_reg: Option<usize>,
     table_name: &str,
 ) -> Result<()> {
-    // (change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB)
-    let turso_cdc_registers = program.alloc_registers(8);
+    // (change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_type INTEGER, change_txn_id INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB)
+    let turso_cdc_registers = program.alloc_registers(9);
     program.emit_insn(Insn::Null {
         dest: turso_cdc_registers,
         dest_end: None,
@@ -3316,29 +3316,41 @@ pub fn emit_cdc_insns(
     program.emit_int(change_type, turso_cdc_registers + 2);
     program.mark_last_insn_constant();
 
-    program.emit_string8(table_name.to_string(), turso_cdc_registers + 3);
+    // Allocate register for NewRowid early (needed for conn_txn_id call)
+    let new_rowid_reg = program.alloc_register();
+    program.emit_insn(Insn::NewRowid {
+        cursor: cdc_cursor_id,
+        rowid_reg: new_rowid_reg,
+        prev_largest_reg: 0, // todo(sivukhin): properly set value here from sqlite_sequence table when AUTOINCREMENT will be properly implemented in Turso
+    });
+
+    // Call conn_txn_id(new_rowid_reg) to get/set transaction ID - now at register 3
+    let Some(conn_txn_id_fn) = resolver.resolve_function("conn_txn_id", 1) else {
+        bail_parse_error!("no function {}", "conn_txn_id");
+    };
+    let conn_txn_id_fn_ctx = crate::function::FuncCtx {
+        func: conn_txn_id_fn,
+        arg_count: 1,
+    };
+    program.emit_insn(Insn::Function {
+        constant_mask: 0,
+        start_reg: new_rowid_reg,
+        dest: turso_cdc_registers + 3,
+        func: conn_txn_id_fn_ctx,
+    });
+
+    program.emit_string8(table_name.to_string(), turso_cdc_registers + 4);
     program.mark_last_insn_constant();
 
     program.emit_insn(Insn::Copy {
         src_reg: rowid_reg,
-        dst_reg: turso_cdc_registers + 4,
+        dst_reg: turso_cdc_registers + 5,
         extra_amount: 0,
     });
 
     if let Some(before_record_reg) = before_record_reg {
         program.emit_insn(Insn::Copy {
             src_reg: before_record_reg,
-            dst_reg: turso_cdc_registers + 5,
-            extra_amount: 0,
-        });
-    } else {
-        program.emit_null(turso_cdc_registers + 5, None);
-        program.mark_last_insn_constant();
-    }
-
-    if let Some(after_record_reg) = after_record_reg {
-        program.emit_insn(Insn::Copy {
-            src_reg: after_record_reg,
             dst_reg: turso_cdc_registers + 6,
             extra_amount: 0,
         });
@@ -3347,9 +3359,9 @@ pub fn emit_cdc_insns(
         program.mark_last_insn_constant();
     }
 
-    if let Some(updates_record_reg) = updates_record_reg {
+    if let Some(after_record_reg) = after_record_reg {
         program.emit_insn(Insn::Copy {
-            src_reg: updates_record_reg,
+            src_reg: after_record_reg,
             dst_reg: turso_cdc_registers + 7,
             extra_amount: 0,
         });
@@ -3358,17 +3370,21 @@ pub fn emit_cdc_insns(
         program.mark_last_insn_constant();
     }
 
-    let rowid_reg = program.alloc_register();
-    program.emit_insn(Insn::NewRowid {
-        cursor: cdc_cursor_id,
-        rowid_reg,
-        prev_largest_reg: 0, // todo(sivukhin): properly set value here from sqlite_sequence table when AUTOINCREMENT will be properly implemented in Turso
-    });
+    if let Some(updates_record_reg) = updates_record_reg {
+        program.emit_insn(Insn::Copy {
+            src_reg: updates_record_reg,
+            dst_reg: turso_cdc_registers + 8,
+            extra_amount: 0,
+        });
+    } else {
+        program.emit_null(turso_cdc_registers + 8, None);
+        program.mark_last_insn_constant();
+    }
 
     let record_reg = program.alloc_register();
     program.emit_insn(Insn::MakeRecord {
         start_reg: to_u16(turso_cdc_registers),
-        count: to_u16(8),
+        count: to_u16(9),
         dest_reg: to_u16(record_reg),
         index_name: None,
         affinity_str: None,
@@ -3376,13 +3392,129 @@ pub fn emit_cdc_insns(
 
     program.emit_insn(Insn::Insert {
         cursor: cdc_cursor_id,
-        key_reg: rowid_reg,
+        key_reg: new_rowid_reg,
         record_reg,
         flag: InsertFlags::new(),
         table_name: "".to_string(),
     });
     Ok(())
 }
+
+/// Emit a CDC COMMIT record to mark the end of a transaction
+pub fn emit_cdc_commit_record(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    cdc_cursor_id: usize,
+) -> Result<()> {
+    // (change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_type INTEGER, change_txn_id INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB)
+    let turso_cdc_registers = program.alloc_registers(9);
+
+    // change_id (auto-generated, set to NULL)
+    program.emit_insn(Insn::Null {
+        dest: turso_cdc_registers,
+        dest_end: None,
+    });
+    program.mark_last_insn_constant();
+
+    // change_time (current timestamp)
+    let Some(unixepoch_fn) = resolver.resolve_function("unixepoch", 0) else {
+        bail_parse_error!("no function {}", "unixepoch");
+    };
+    let unixepoch_fn_ctx = crate::function::FuncCtx {
+        func: unixepoch_fn,
+        arg_count: 0,
+    };
+    program.emit_insn(Insn::Function {
+        constant_mask: 0,
+        start_reg: 0,
+        dest: turso_cdc_registers + 1,
+        func: unixepoch_fn_ctx,
+    });
+
+    // change_type = 2 (COMMIT)
+    program.emit_int(2, turso_cdc_registers + 2);
+    program.mark_last_insn_constant();
+
+    // change_txn_id (use conn_txn_id() with NULL parameter to read current value)
+    let Some(conn_txn_id_fn) = resolver.resolve_function("conn_txn_id", 0) else {
+        bail_parse_error!("no function {}", "conn_txn_id");
+    };
+    let conn_txn_id_fn_ctx = crate::function::FuncCtx {
+        func: conn_txn_id_fn,
+        arg_count: 0,
+    };
+    program.emit_insn(Insn::Function {
+        constant_mask: 0,
+        start_reg: 0,
+        dest: turso_cdc_registers + 3,
+        func: conn_txn_id_fn_ctx,
+    });
+
+    // table_name (NULL for COMMIT records)
+    program.emit_insn(Insn::Null {
+        dest: turso_cdc_registers + 4,
+        dest_end: None,
+    });
+    program.mark_last_insn_constant();
+
+    // id (NULL for COMMIT records)
+    program.emit_insn(Insn::Null {
+        dest: turso_cdc_registers + 5,
+        dest_end: None,
+    });
+    program.mark_last_insn_constant();
+
+    // before (NULL for COMMIT records)
+    program.emit_insn(Insn::Null {
+        dest: turso_cdc_registers + 6,
+        dest_end: None,
+    });
+    program.mark_last_insn_constant();
+
+    // after (NULL for COMMIT records)
+    program.emit_insn(Insn::Null {
+        dest: turso_cdc_registers + 7,
+        dest_end: None,
+    });
+    program.mark_last_insn_constant();
+
+    // updates (NULL for COMMIT records)
+    program.emit_insn(Insn::Null {
+        dest: turso_cdc_registers + 8,
+        dest_end: None,
+    });
+    program.mark_last_insn_constant();
+
+    // Create the record
+    let record_reg = program.alloc_register();
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: to_u16(turso_cdc_registers),
+        count: to_u16(9),
+        dest_reg: to_u16(record_reg),
+        index_name: None,
+        affinity_str: None,
+    });
+
+    // Get a new rowid for this CDC entry
+    let new_rowid_reg = program.alloc_register();
+    program.emit_insn(Insn::NewRowid {
+        cursor: cdc_cursor_id,
+        rowid_reg: new_rowid_reg,
+        prev_largest_reg: 0,
+    });
+
+    // Insert the record into the CDC table
+    program.emit_insn(Insn::Insert {
+        cursor: cdc_cursor_id,
+        key_reg: new_rowid_reg,
+        record_reg,
+        flag: InsertFlags::new(),
+        table_name: "".to_string(),
+    });
+
+    Ok(())
+}
+
 /// Initialize the limit/offset counters and registers.
 /// In case of compound SELECTs, the limit counter is initialized only once,
 /// hence [LimitCtx::initialize_counter] being false in those cases.

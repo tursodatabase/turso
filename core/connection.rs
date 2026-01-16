@@ -89,6 +89,9 @@ pub struct Connection {
     pub(crate) fk_deferred_violations: AtomicIsize,
     /// Track when each virtual table instance is currently in transaction.
     pub(crate) vtab_txn_states: RwLock<HashSet<u64>>,
+    /// CDC transaction ID for current transaction. -1 = unset, >= 0 = valid txn ID.
+    /// Set to rowid of first CDC change in transaction, used to group changes by transaction.
+    pub(super) cdc_transaction_id: AtomicI64,
 }
 
 // SAFETY: This needs to be audited for thread safety.
@@ -796,7 +799,12 @@ impl Connection {
             };
 
             self.auto_commit.store(true, Ordering::SeqCst);
+            if force_commit {
+                // Emit COMMIT CDC record on successful commit
+                crate::vdbe::Program::emit_cdc_commit_record(self)?;
+            }
             self.set_tx_state(TransactionState::None);
+            self.cdc_transaction_id.store(-1, Ordering::SeqCst);
             wal.end_write_tx();
             wal.end_read_tx();
 
@@ -869,6 +877,7 @@ impl Connection {
                     pager.rollback_tx(self);
                 }
                 self.set_tx_state(TransactionState::None);
+                self.cdc_transaction_id.store(-1, Ordering::SeqCst);
             }
         }
 
@@ -1008,6 +1017,11 @@ impl Connection {
 
     pub fn get_auto_commit(&self) -> bool {
         self.auto_commit.load(Ordering::SeqCst)
+    }
+
+    /// Returns true if the connection is in autocommit mode (not in an explicit transaction)
+    pub fn is_autocommit(&self) -> bool {
+        self.get_auto_commit()
     }
 
     pub fn parse_schema_rows(self: &Arc<Connection>) -> Result<()> {
@@ -1461,6 +1475,8 @@ impl Connection {
 
     pub(crate) fn set_tx_state(&self, state: TransactionState) {
         self.transaction_state.set(state);
+        // Note: CDC transaction ID reset is handled explicitly in commit/rollback paths
+        // to ensure COMMIT records can access the txn_id before reset
     }
 
     pub(crate) fn get_tx_state(&self) -> TransactionState {

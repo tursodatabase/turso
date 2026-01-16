@@ -50,6 +50,7 @@ use crate::sync::Arc;
 use crate::translate::delete::translate_delete;
 use crate::translate::emitter::Resolver;
 use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts, QueryMode};
+use crate::vdbe::insn::Insn;
 use crate::vdbe::Program;
 use crate::{bail_parse_error, Connection, Result, SymbolTable};
 use alter::translate_alter_table;
@@ -147,6 +148,8 @@ pub fn translate_inner(
 
     let is_select = matches!(stmt, ast::Stmt::Select { .. });
 
+    let is_explicit_commit = matches!(stmt, ast::Stmt::Commit { .. });
+
     let mut program = match stmt {
         ast::Stmt::AlterTable(alter) => {
             translate_alter_table(alter, resolver, program, connection, input)?
@@ -156,7 +159,9 @@ pub fn translate_inner(
             attach::translate_attach(&expr, resolver, &db_name, &key, program)?
         }
         ast::Stmt::Begin { typ, name } => translate_tx_begin(typ, name, resolver.schema, program)?,
-        ast::Stmt::Commit { name } => translate_tx_commit(name, program)?,
+        ast::Stmt::Commit { name } => {
+            translate_tx_commit(name, resolver.schema, resolver, program)?
+        }
         ast::Stmt::CreateIndex { .. } => {
             translate_create_index(program, connection, resolver, stmt)?
         }
@@ -338,6 +343,68 @@ pub fn translate_inner(
     // Indicate read operations so that in the epilogue we can emit the correct type of transaction
     if is_select && !program.table_references.is_empty() {
         program.begin_read_operation();
+    }
+
+    // Emit conditional CDC COMMIT record for write statements (excluding explicit COMMIT)
+    if is_write && !is_explicit_commit {
+        let cdc_table_name = program
+            .capture_data_changes_mode()
+            .table()
+            .map(|s| s.to_string());
+        if let Some(cdc_table_name) = cdc_table_name {
+            // Emit conditional logic: if is_autocommit() then emit CDC COMMIT record
+            let is_autocommit_reg = program.alloc_register();
+
+            // Call is_autocommit()
+            let Some(is_autocommit_fn) = resolver.resolve_function("is_autocommit", 0) else {
+                bail_parse_error!("no function {}", "is_autocommit");
+            };
+            let is_autocommit_fn_ctx = crate::function::FuncCtx {
+                func: is_autocommit_fn,
+                arg_count: 0,
+            };
+            program.emit_insn(Insn::Function {
+                constant_mask: 0,
+                start_reg: 0,
+                dest: is_autocommit_reg,
+                func: is_autocommit_fn_ctx,
+            });
+
+            // Create a label for the end (skip CDC COMMIT if not autocommit)
+            let end_label = program.allocate_label();
+
+            // If is_autocommit() returns 0 (false), jump to end
+            program.emit_insn(Insn::IfNot {
+                reg: is_autocommit_reg,
+                target_pc: end_label,
+                jump_if_null: true,
+            });
+
+            // Emit CDC COMMIT record
+            if let Some(cdc_prepared) =
+                emitter::prepare_cdc_if_necessary(&mut program, resolver.schema, "")?
+            {
+                let (cdc_cursor_id, _) = cdc_prepared;
+                emitter::emit_cdc_commit_record(&mut program, resolver, cdc_cursor_id)?;
+            } else if let Some(turso_cdc_table) = resolver.schema.get_table(&cdc_table_name) {
+                // CDC table exists but wasn't opened yet, open it now
+                let Some(cdc_btree) = turso_cdc_table.btree().clone() else {
+                    bail_parse_error!("no such table: {}", cdc_table_name);
+                };
+                let cdc_cursor_id = program.alloc_cursor_id(
+                    crate::vdbe::builder::CursorType::BTreeTable(cdc_btree.clone()),
+                );
+                program.emit_insn(Insn::OpenWrite {
+                    cursor_id: cdc_cursor_id,
+                    root_page: cdc_btree.root_page.into(),
+                    db: 0,
+                });
+                emitter::emit_cdc_commit_record(&mut program, resolver, cdc_cursor_id)?;
+            }
+
+            // End label
+            program.preassign_label_to_next_insn(end_label);
+        }
     }
 
     Ok(program)
