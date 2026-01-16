@@ -1053,7 +1053,7 @@ impl Schema {
     /// strategy (rowid vs. UNIQUE index or PK).
     pub fn resolved_fks_referencing(&self, table_name: &str) -> Result<Vec<ResolvedFkRef>> {
         let fk_mismatch_err = |child: &str, parent: &str| -> crate::LimboError {
-            crate::LimboError::Constraint(format!(
+            crate::LimboError::ForeignKeyConstraint(format!(
                 "foreign key mismatch - \"{child}\" referencing \"{parent}\""
             ))
         };
@@ -1171,7 +1171,7 @@ impl Schema {
     /// Compute all resolved FKs *declared by* `child_table`
     pub fn resolved_fks_for_child(&self, child_table: &str) -> crate::Result<Vec<ResolvedFkRef>> {
         let fk_mismatch_err = |child: &str, parent: &str| -> crate::LimboError {
-            crate::LimboError::Constraint(format!(
+            crate::LimboError::ForeignKeyConstraint(format!(
                 "foreign key mismatch - \"{child}\" referencing \"{parent}\""
             ))
         };
@@ -2212,7 +2212,7 @@ impl ForeignKey {
             .iter()
             .any(|c| ROWID_STRS.iter().any(|&r| r.eq_ignore_ascii_case(c)))
         {
-            return Err(crate::LimboError::Constraint(format!(
+            return Err(crate::LimboError::ForeignKeyConstraint(format!(
                 "foreign key mismatch referencing \"{}\"",
                 self.parent_table
             )));
