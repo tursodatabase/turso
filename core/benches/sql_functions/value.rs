@@ -934,7 +934,9 @@ fn construct_like_regex_complex(bencher: Bencher) {
 
 #[divan::bench]
 fn exec_like_no_cache(bencher: Bencher) {
-    bencher.bench_local(|| Value::exec_like(None, black_box("hello%"), black_box("hello world")));
+    bencher.bench_local(|| {
+        Value::exec_like(None, black_box("hello%"), black_box("hello world")).unwrap()
+    });
 }
 
 #[divan::bench]
@@ -946,6 +948,7 @@ fn exec_like_with_cache_miss(bencher: Bencher) {
             black_box("hello%"),
             black_box("hello world"),
         )
+        .unwrap()
     });
 }
 
@@ -953,7 +956,7 @@ fn exec_like_with_cache_miss(bencher: Bencher) {
 fn exec_like_with_cache_hit(bencher: Bencher) {
     let mut cache = HashMap::new();
     // Warm up the cache
-    Value::exec_like(Some(&mut cache), "hello%", "hello world");
+    let _ = Value::exec_like(Some(&mut cache), "hello%", "hello world");
 
     bencher.bench_local(|| {
         Value::exec_like(
@@ -961,6 +964,43 @@ fn exec_like_with_cache_hit(bencher: Bencher) {
             black_box("hello%"),
             black_box("hello world"),
         )
+        .unwrap()
+    });
+}
+
+#[divan::bench]
+fn exec_like_fallback_no_cache(bencher: Bencher) {
+    bencher.bench_local(|| {
+        Value::exec_like(None, black_box("hello_world"), black_box("hello world")).unwrap()
+    });
+}
+
+#[divan::bench]
+fn exec_like_fallback_with_cache_miss(bencher: Bencher) {
+    bencher.bench_local(|| {
+        let mut cache = HashMap::new();
+        Value::exec_like(
+            Some(&mut cache),
+            black_box("hello_world"),
+            black_box("hello world"),
+        )
+        .unwrap()
+    });
+}
+
+#[divan::bench]
+fn exec_like_fallback_with_cache_hit(bencher: Bencher) {
+    let mut cache = HashMap::new();
+    // Warm up the cache with the regex pattern
+    let _ = Value::exec_like(Some(&mut cache), "hello_world", "hello world").unwrap();
+
+    bencher.bench_local(|| {
+        Value::exec_like(
+            Some(black_box(&mut cache)),
+            black_box("hello_world"),
+            black_box("hello world"),
+        )
+        .unwrap()
     });
 }
 

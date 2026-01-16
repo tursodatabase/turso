@@ -167,16 +167,6 @@ enum TrimType {
     Right,
 }
 
-impl TrimType {
-    fn trim<'a>(&self, text: &'a str, pattern: &[char]) -> &'a str {
-        match self {
-            TrimType::All => text.trim_matches(pattern),
-            TrimType::Right => text.trim_end_matches(pattern),
-            TrimType::Left => text.trim_start_matches(pattern),
-        }
-    }
-}
-
 impl Value {
     pub fn exec_lower(&self) -> Option<Self> {
         self.cast_text()
@@ -644,24 +634,34 @@ impl Value {
     }
 
     fn _exec_trim(&self, pattern: Option<&Value>, trim_type: TrimType) -> Value {
-        match (self, pattern) {
-            (Value::Text(_) | Value::Integer(_) | Value::Float(_), Some(pattern)) => {
-                let pattern_chars: Vec<char> = pattern.to_string().chars().collect();
-                let text = self.to_string();
-                Value::build_text(trim_type.trim(&text, &pattern_chars).to_string())
+        let text_cow = match self {
+            Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
+            Value::Null => return Value::Null,
+            _ => std::borrow::Cow::Owned(self.to_string()),
+        };
+        let trimmed = match pattern {
+            Some(p) => {
+                if matches!(p, Value::Null) {
+                    return Value::Null;
+                }
+                let pat_cow = match p {
+                    Value::Text(s) => std::borrow::Cow::Borrowed(s.as_str()),
+                    _ => std::borrow::Cow::Owned(p.to_string()),
+                };
+                let p_str = pat_cow.as_ref();
+                match trim_type {
+                    TrimType::All => text_cow.trim_matches(|c| p_str.contains(c)),
+                    TrimType::Left => text_cow.trim_start_matches(|c| p_str.contains(c)),
+                    TrimType::Right => text_cow.trim_end_matches(|c| p_str.contains(c)),
+                }
             }
-            (Value::Text(t), None) => {
-                Value::build_text(trim_type.trim(t.as_str(), &[' ']).to_string())
-            }
-            // For Integer/Float without pattern, convert to text and trim spaces.
-            // TRIM() always returns TEXT in SQLite.
-            (Value::Integer(_) | Value::Float(_), None) => {
-                let text = self.to_string();
-                Value::build_text(trim_type.trim(&text, &[' ']).to_string())
-            }
-            // NULL and Blob return unchanged
-            (reg, _) => reg.to_owned(),
-        }
+            None => match trim_type {
+                TrimType::All => text_cow.trim_matches(' '),
+                TrimType::Left => text_cow.trim_start_matches(' '),
+                TrimType::Right => text_cow.trim_end_matches(' '),
+            },
+        };
+        Value::build_text(trimmed.to_string())
     }
 
     // Implements TRIM pattern matching.
@@ -1018,20 +1018,68 @@ impl Value {
         regex_cache: Option<&mut HashMap<String, Regex>>,
         pattern: &str,
         text: &str,
-    ) -> bool {
+    ) -> Result<bool, LimboError> {
+        const MAX_LIKE_PATTERN_LENGTH: usize = 50000;
+        if pattern.len() > MAX_LIKE_PATTERN_LENGTH {
+            return Err(LimboError::Constraint(
+                "LIKE or GLOB pattern too complex".to_string(),
+            ));
+        }
+
+        // 1. Exact match (no wildcards)
+        if !pattern.contains(['%', '_']) {
+            return Ok(pattern.eq_ignore_ascii_case(text));
+        }
+
+        // 2. Fast Path: 'abc%' (Prefix)
+        if pattern.ends_with('%') && !pattern[..pattern.len() - 1].contains(['%', '_']) {
+            let prefix = &pattern[..pattern.len() - 1];
+            if text.len() >= prefix.len() && text.is_char_boundary(prefix.len()) {
+                return Ok(text[..prefix.len()].eq_ignore_ascii_case(prefix));
+            }
+            // Fall through to regex if boundary check fails (multi-byte UTF-8)
+        }
+
+        // 3. Fast Path: '%abc' (Suffix)
+        if pattern.starts_with('%') && !pattern[1..].contains(['%', '_']) {
+            let suffix = &pattern[1..];
+            let start = text.len().wrapping_sub(suffix.len());
+            if text.len() >= suffix.len() && text.is_char_boundary(start) {
+                return Ok(text[start..].eq_ignore_ascii_case(suffix));
+            }
+            // Fall through to regex if boundary check fails (multi-byte UTF-8)
+        }
+
+        // 4. Fast Path: '%abc%' (Contains)
+        if pattern.len() > 1 && pattern.starts_with('%') && pattern.ends_with('%') {
+            let inner = &pattern[1..pattern.len() - 1];
+            if !inner.contains(['%', '_']) {
+                return Ok(text
+                    .to_ascii_lowercase()
+                    .contains(&inner.to_ascii_lowercase()));
+            }
+        }
+
+        // 5. Fallback to Regex
         if let Some(cache) = regex_cache {
             match cache.get(pattern) {
-                Some(re) => re.is_match(text),
+                Some(re) => Ok(re.is_match(text)),
                 None => {
-                    let re = construct_like_regex(pattern);
-                    let res = re.is_match(text);
-                    cache.insert(pattern.to_string(), re);
-                    res
+                    match construct_like_regex(pattern) {
+                        Ok(re) => {
+                            let res = re.is_match(text);
+                            cache.insert(pattern.to_string(), re);
+                            Ok(res)
+                        }
+                        Err(_) => Ok(false), // Suppress error, return 0
+                    }
                 }
             }
         } else {
-            let re = construct_like_regex(pattern);
-            re.is_match(text)
+            match construct_like_regex(pattern) {
+                Ok(re) => Ok(re.is_match(text)),
+                Err(_) => Ok(false),
+            }
         }
     }
 
@@ -1091,7 +1139,7 @@ impl Value {
     }
 }
 
-pub fn construct_like_regex(pattern: &str) -> Regex {
+pub fn construct_like_regex(pattern: &str) -> Result<Regex, LimboError> {
     let mut regex_pattern = String::with_capacity(pattern.len() * 2);
 
     regex_pattern.push('^');
@@ -1121,8 +1169,9 @@ pub fn construct_like_regex(pattern: &str) -> Regex {
 
     RegexBuilder::new(&regex_pattern)
         .dot_matches_new_line(true)
+        .size_limit(10 * (1 << 20))
         .build()
-        .expect("constructed LIKE regex pattern should be valid")
+        .map_err(|_| LimboError::Constraint("LIKE or GLOB pattern too complex".to_string()))
 }
 
 #[cfg(test)]
@@ -1841,34 +1890,34 @@ mod tests {
 
     #[test]
     fn test_like_with_escape_or_regexmeta_chars() {
-        assert!(Value::exec_like(None, r#"\%A"#, r#"\A"#));
-        assert!(Value::exec_like(None, "%a%a", "aaaa"));
+        assert!(Value::exec_like(None, r#"\%A"#, r#"\A"#).unwrap());
+        assert!(Value::exec_like(None, "%a%a", "aaaa").unwrap());
     }
 
     #[test]
     fn test_like_no_cache() {
-        assert!(Value::exec_like(None, "a%", "aaaa"));
-        assert!(Value::exec_like(None, "%a%a", "aaaa"));
-        assert!(!Value::exec_like(None, "%a.a", "aaaa"));
-        assert!(!Value::exec_like(None, "a.a%", "aaaa"));
-        assert!(!Value::exec_like(None, "%a.ab", "aaaa"));
+        assert!(Value::exec_like(None, "a%", "aaaa").unwrap());
+        assert!(Value::exec_like(None, "%a%a", "aaaa").unwrap());
+        assert!(!Value::exec_like(None, "%a.a", "aaaa").unwrap());
+        assert!(!Value::exec_like(None, "a.a%", "aaaa").unwrap());
+        assert!(!Value::exec_like(None, "%a.ab", "aaaa").unwrap());
     }
 
     #[test]
     fn test_like_with_cache() {
         let mut cache = HashMap::new();
-        assert!(Value::exec_like(Some(&mut cache), "a%", "aaaa"));
-        assert!(Value::exec_like(Some(&mut cache), "%a%a", "aaaa"));
-        assert!(!Value::exec_like(Some(&mut cache), "%a.a", "aaaa"));
-        assert!(!Value::exec_like(Some(&mut cache), "a.a%", "aaaa"));
-        assert!(!Value::exec_like(Some(&mut cache), "%a.ab", "aaaa"));
+        assert!(Value::exec_like(Some(&mut cache), "a%", "aaaa").unwrap());
+        assert!(Value::exec_like(Some(&mut cache), "%a%a", "aaaa").unwrap());
+        assert!(!Value::exec_like(Some(&mut cache), "%a.a", "aaaa").unwrap());
+        assert!(!Value::exec_like(Some(&mut cache), "a.a%", "aaaa").unwrap());
+        assert!(!Value::exec_like(Some(&mut cache), "%a.ab", "aaaa").unwrap());
 
         // again after values have been cached
-        assert!(Value::exec_like(Some(&mut cache), "a%", "aaaa"));
-        assert!(Value::exec_like(Some(&mut cache), "%a%a", "aaaa"));
-        assert!(!Value::exec_like(Some(&mut cache), "%a.a", "aaaa"));
-        assert!(!Value::exec_like(Some(&mut cache), "a.a%", "aaaa"));
-        assert!(!Value::exec_like(Some(&mut cache), "%a.ab", "aaaa"));
+        assert!(Value::exec_like(Some(&mut cache), "a%", "aaaa").unwrap());
+        assert!(Value::exec_like(Some(&mut cache), "%a%a", "aaaa").unwrap());
+        assert!(!Value::exec_like(Some(&mut cache), "%a.a", "aaaa").unwrap());
+        assert!(!Value::exec_like(Some(&mut cache), "a.a%", "aaaa").unwrap());
+        assert!(!Value::exec_like(Some(&mut cache), "%a.ab", "aaaa").unwrap());
     }
 
     #[test]

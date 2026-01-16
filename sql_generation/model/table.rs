@@ -2,7 +2,7 @@ use std::{fmt::Display, hash::Hash, ops::Deref};
 
 use itertools::Itertools;
 use serde::{Deserialize, Serialize};
-use turso_core::{numeric::Numeric, types};
+use turso_core::{numeric::Numeric, types, LimboError};
 use turso_parser::ast::{self, ColumnConstraint, SortOrder};
 
 use crate::model::query::predicate::Predicate;
@@ -250,7 +250,11 @@ impl SimValue {
     }
 
     // TODO: support more operators. Copy the implementation for exec_glob
-    pub fn like_compare(&self, other: &Self, operator: ast::LikeOperator) -> bool {
+    pub fn like_compare(
+        &self,
+        other: &Self,
+        operator: ast::LikeOperator,
+    ) -> Result<bool, LimboError> {
         match operator {
             ast::LikeOperator::Glob => todo!(),
             ast::LikeOperator::Like => {

@@ -151,3 +151,41 @@ do_execsql_test unicode-like-with-escape-1 {
 do_execsql_test unicode-like-with-escape-2 {
     SELECT like('ÄX%', 'Ä%', 'X');
 } {1}
+
+# UTF-8 multi-byte boundary tests for LIKE fast paths
+do_execsql_test unicode-like-prefix-multibyte-text-1 {
+    SELECT '日本語' LIKE 'ab%';
+} {0}
+do_execsql_test unicode-like-prefix-multibyte-text-2 {
+    SELECT '日本語' LIKE '日%';
+} {1}
+do_execsql_test unicode-like-prefix-multibyte-text-3 {
+    SELECT '日本語' LIKE '日本%';
+} {1}
+do_execsql_test unicode-like-suffix-multibyte-text-1 {
+    SELECT '日本a' LIKE '%ab';
+} {0}
+do_execsql_test unicode-like-suffix-multibyte-text-2 {
+    SELECT '日本語' LIKE '%語';
+} {1}
+do_execsql_test unicode-like-suffix-multibyte-text-3 {
+    SELECT 'a日本' LIKE '%本';
+} {1}
+do_execsql_test unicode-like-contains-multibyte-1 {
+    SELECT '日本語' LIKE '%本%';
+} {1}
+do_execsql_test unicode-like-contains-multibyte-2 {
+    SELECT 'hello日本world' LIKE '%日本%';
+} {1}
+
+do_execsql_test_error like-complexity-1 {
+    SELECT 'test' LIKE REPLACE(ZEROBLOB(135000), x'00', 'a');
+} {LIKE or GLOB pattern too complex}
+
+do_execsql_test like-complexity-2 {
+    SELECT 'test' LIKE REPLACE(ZEROBLOB(11000), x'00', '%');
+} {0}
+
+do_execsql_test like-trim-null {
+    SELECT trim('abc', NULL);
+} {}

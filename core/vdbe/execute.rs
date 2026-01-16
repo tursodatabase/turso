@@ -4842,11 +4842,9 @@ pub fn op_function(
                         } else {
                             None
                         };
-                        Value::Integer(Value::exec_like(
-                            cache,
-                            pattern.as_str(),
-                            match_expression.as_str(),
-                        ) as i64)
+                        let matches =
+                            Value::exec_like(cache, pattern.as_str(), match_expression.as_str())?;
+                        Value::Integer(matches as i64)
                     }
                     (Value::Null, _) | (_, Value::Null) => Value::Null,
                     _ => {
