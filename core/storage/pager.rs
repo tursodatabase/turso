@@ -2165,8 +2165,15 @@ impl Pager {
         Ok(IOResult::Done(wal.begin_write_tx()?))
     }
 
+    /// commit dirty pages from current transaction in WAL mode if this is not nested statement (for nested statements, parent will do the commit)
+    /// if update_transaction_state set to false, then [Connection::transaction_state] left unchanged
+    /// if update_transaction_state set to true, then [Connection::transaction_state] reset to [TransactionState::None] in case when method completes without error
     #[instrument(skip_all, level = Level::DEBUG)]
-    pub fn commit_tx(&self, connection: &Connection) -> Result<IOResult<()>> {
+    pub fn commit_tx(
+        &self,
+        connection: &Connection,
+        update_transaction_state: bool,
+    ) -> Result<IOResult<()>> {
         if connection.is_nested_stmt() {
             // Parent statement will handle the transaction commit.
             return Ok(IOResult::Done(()));
@@ -2174,6 +2181,17 @@ impl Pager {
         let Some(wal) = self.wal.as_ref() else {
             // TODO: Unsure what the semantics of "end_tx" is for in-memory databases, ephemeral tables and ephemeral indexes.
             return Ok(IOResult::Done(()));
+        };
+        turso_assert!(
+            matches!(connection.get_tx_state(), TransactionState::Write { .. }),
+            "write transaction must be active"
+        );
+
+        let complete_commit = || {
+            if update_transaction_state {
+                connection.set_tx_state(TransactionState::None);
+            }
+            self.commit_dirty_pages_end();
         };
 
         loop {
@@ -2193,16 +2211,14 @@ impl Pager {
                     );
                     match checkpoint_result {
                         Ok(IOResult::IO(io)) => return Ok(IOResult::IO(io)),
-                        Ok(IOResult::Done(_)) => {
-                            self.commit_dirty_pages_end();
-                        }
+                        Ok(IOResult::Done(_)) => complete_commit(),
                         Err(err) => {
                             tracing::info!("auto-checkpoint failed: {err}");
-                            self.commit_dirty_pages_end();
+                            complete_commit();
                             self.cleanup_after_auto_checkpoint_failure();
                         }
                     }
-                    break;
+                    return Ok(IOResult::Done(()));
                 }
                 _ => {
                     return_if_io!(self.commit_dirty_pages(
@@ -2216,24 +2232,24 @@ impl Pager {
                         _ => false,
                     };
 
+                    wal.end_write_tx();
+                    wal.end_read_tx();
+                    // we do not set TransactionState::None here - because caller can decide that nothing should be done for this connection
+                    // and skip next calls of the commit_tx methods after IO
+
+                    tracing::debug!("commit_tx: schema_did_change={schema_did_change}");
                     if schema_did_change {
                         let schema = connection.schema.read().clone();
                         connection.db.update_schema_if_newer(schema);
                     }
 
-                    wal.end_write_tx();
-                    wal.end_read_tx();
-                    connection.set_tx_state(TransactionState::None);
-
                     if self.commit_info.read().state != CommitState::AutoCheckpoint {
-                        self.commit_dirty_pages_end();
-                        break;
+                        complete_commit();
+                        return Ok(IOResult::Done(()));
                     }
                 }
             }
         }
-
-        Ok(IOResult::Done(()))
     }
 
     #[instrument(skip_all, level = Level::DEBUG)]
