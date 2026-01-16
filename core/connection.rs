@@ -1402,6 +1402,13 @@ impl Connection {
         Ok(())
     }
 
+    /// Get the reserved bytes value from the pager cache.
+    /// Returns None if not yet set (database not initialized).
+    pub fn get_reserved_bytes(&self) -> Option<u8> {
+        let pager = self.pager.load();
+        pager.get_reserved_space()
+    }
+
     pub fn get_encryption_cipher_mode(&self) -> Option<CipherMode> {
         match self.encryption_cipher_mode.get() {
             CipherMode::None => None,
