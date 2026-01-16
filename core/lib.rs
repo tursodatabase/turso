@@ -49,6 +49,9 @@ pub mod numeric;
 #[cfg(not(any(feature = "fuzz", feature = "bench")))]
 mod numeric;
 
+#[cfg(any(feature = "fuzz", feature = "bench"))]
+pub use function::MathFunc;
+
 use crate::busy::{BusyHandler, BusyHandlerCallback};
 use crate::index_method::IndexMethod;
 use crate::schema::Trigger;
