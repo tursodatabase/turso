@@ -1025,17 +1025,15 @@ mod cte_tests {
                     gen_expr(rng, depth - 1)
                 )
             }
-            // Function call
+            // Function call (non-aggregate only - aggregates are handled separately)
             2 => {
                 let (func, args) = [
                     ("ABS", 1),
                     ("COALESCE", 2),
                     ("IFNULL", 2),
                     ("NULLIF", 2),
-                    ("MAX", 1),
-                    ("MIN", 1),
                     ("length", 1),
-                ][rng.random_range(0..7)];
+                ][rng.random_range(0..5)];
                 let arg_strs: Vec<String> = (0..args).map(|_| gen_expr(rng, depth - 1)).collect();
                 format!("{}({})", func, arg_strs.join(", "))
             }
@@ -1557,6 +1555,7 @@ mod cte_tests {
     pub fn cte_fuzz(db: TempDatabase) {
         let _ = env_logger::try_init();
         let (mut rng, seed) = rng_from_time_or_env();
+        let verbose = std::env::var("VERBOSE").is_ok();
         println!("cte_fuzz seed: {seed}");
 
         let limbo_conn = db.connect_limbo();
@@ -1591,6 +1590,10 @@ mod cte_tests {
             let final_query = add_modifiers(&mut rng, &final_query, &ctes[ctes.len() - 1]);
 
             let query = format!("WITH {} {final_query}", cte_defs.join(", "));
+
+            if verbose {
+                println!("query: {query}");
+            }
 
             let limbo_result = limbo_exec_rows(&limbo_conn, &query);
             let sqlite_result = sqlite_exec_rows(&sqlite_conn, &query);
