@@ -31,11 +31,21 @@ jobs:
   build-native:
     timeout-minutes: 30
     strategy:
+      fail-fast: false
       matrix:
         os: [blacksmith-4vcpu-ubuntu-2404, macos-latest, windows-latest]
-
+        test:
+          - name: nextest
+            run: cargo nextest run --workspace --all-features --locked --no-fail-fast -E 'not test(/^fuzz_tests::/)' --failure-output=final
+            local_sync: true
+          - name: integrity
+            run: cargo nextest run -p core_tester --locked --no-fail-fast -E 'test(integrity_check) | test(short_read)' --failure-output=final
+            local_sync: false
+          - name: doctests
+            run: cargo test --workspace --all-features --doc --locked
+            local_sync: true
+    name: build-native (${{ matrix.os }}, ${{ matrix.test.name }})
     runs-on: ${{ matrix.os }}
-
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -59,26 +69,13 @@ jobs:
           SCCACHE_GHA_ENABLED: "true"
           RUSTC_WRAPPER: "sccache"
         run: cargo build --verbose --locked --all-features
-      - name: Test (nextest)
+      - name: Test
         env:
           RUST_LOG: ${{ runner.debug && 'turso_core::storage=trace' || '' }}
           SCCACHE_GHA_ENABLED: "true"
           RUSTC_WRAPPER: "sccache"
-          LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
-        run: cargo nextest run --workspace --all-features --locked --no-fail-fast -E 'not test(/^fuzz_tests::/)' --failure-output=final
-        timeout-minutes: 20
-      - name: Test integrity_check corruption and short reads (no checksum feature because it interferes with the test)
-        env:
-          SCCACHE_GHA_ENABLED: "true"
-          RUSTC_WRAPPER: "sccache"
-        run: cargo nextest run -p core_tester --locked --no-fail-fast -E 'test(integrity_check) | test(short_read)' --failure-output=final
-        timeout-minutes: 5
-      - name: Test doctests
-        env:
-          SCCACHE_GHA_ENABLED: "true"
-          RUSTC_WRAPPER: "sccache"
-          LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
-        run: cargo test --workspace --all-features --doc --locked
+          LOCAL_SYNC_SERVER: ${{ matrix.test.local_sync && '../../target/debug/tursodb' || '' }}
+        run: ${{ matrix.test.run }}
 
   shuttle-tests:
     runs-on: blacksmith-4vcpu-ubuntu-2404
@@ -122,6 +119,32 @@ jobs:
   simulator:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: default
+            args: "--min-tick 10 --max-tick 50 --io-backend=memory"
+            iterations: 10
+          - name: write_heavy
+            args: "--min-tick 10 --max-tick 50 --profile write_heavy --io-backend=memory"
+            iterations: 5
+          - name: write_heavy_spill
+            args: "--min-tick 10 --max-tick 50 --profile write_heavy_spill --io-backend=memory"
+            iterations: 5
+          - name: faultless
+            args: "--min-tick 10 --max-tick 50 --profile faultless --io-backend=memory"
+            iterations: 10
+          - name: iouring_write_heavy_spill
+            args: "--io-backend=io-uring --profile=write_heavy_spill"
+            iterations: 5
+          - name: iouring_differential
+            args: "--io-backend=io-uring --differential"
+            iterations: 10
+          - name: differential
+            args: "--differential --io-backend=memory"
+            iterations: 10
+    name: Simulator (${{ matrix.name }})
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -133,68 +156,27 @@ jobs:
           cache-on-failure: true
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.9
-      # Run these with for loops (instead of --loop flag in sim) so that each iteration gets a separate seed -- this produces much easier-to-debug traces when there's a failure since we don't have to potentially
-      # run 10 iterations of the same seed to get to the failure
-      - name: Simulator default
+      - name: Run simulator
         env:
           SCCACHE_GHA_ENABLED: "true"
           RUSTC_WRAPPER: "sccache"
         run: |
-          for i in {1..10}; do
-            ./scripts/run-sim --maximum-tests 1000 --min-tick 10 --max-tick 50 --io-backend=memory || exit 1
-          done
-      - name: Simulator InsertHeavy
-        env:
-          SCCACHE_GHA_ENABLED: "true"
-          RUSTC_WRAPPER: "sccache"
-        run: |
-          for i in {1..5}; do
-            ./scripts/run-sim --maximum-tests 1000 --min-tick 10 --max-tick 50 --profile write_heavy --io-backend=memory || exit 1
-          done
-      - name: Simulator InsertHeavySpill
-        env:
-          SCCACHE_GHA_ENABLED: "true"
-          RUSTC_WRAPPER: "sccache"
-        run: |
-          for i in {1..5}; do
-            ./scripts/run-sim --maximum-tests 1000 --min-tick 10 --max-tick 50 --profile write_heavy_spill --io-backend=memory || exit 1
-          done
-      - name: Simulator Faultless
-        env:
-          SCCACHE_GHA_ENABLED: "true"
-          RUSTC_WRAPPER: "sccache"
-        run: |
-          for i in {1..10}; do
-            ./scripts/run-sim --maximum-tests 1000 --min-tick 10 --max-tick 50 --profile faultless --io-backend=memory || exit 1
-          done
-      - name: Simulator IOUring InsertHeavySpill
-        env:
-          SCCACHE_GHA_ENABLED: "true"
-          RUSTC_WRAPPER: "sccache"
-        run: |
-          for i in {1..5}; do
-            ./scripts/run-sim --io-backend=io-uring --maximum-tests 1000 --profile=write_heavy_spill || exit 1
-          done
-      - name: Simulator IOUring Differential
-        env:
-          SCCACHE_GHA_ENABLED: "true"
-          RUSTC_WRAPPER: "sccache"
-        run: |
-          for i in {1..10}; do
-            ./scripts/run-sim --io-backend=io-uring --maximum-tests 1000 --differential || exit 1
-          done
-      - name: Simulator Differential
-        env:
-          SCCACHE_GHA_ENABLED: "true"
-          RUSTC_WRAPPER: "sccache"
-        run: |
-          for i in {1..10}; do
-            ./scripts/run-sim --maximum-tests 1000 --differential --io-backend=memory || exit 1
+          for i in $(seq 1 ${{ matrix.iterations }}); do
+            ./scripts/run-sim --maximum-tests 1000 ${{ matrix.args }} || exit 1
           done
 
   test-limbo:
     runs-on: blacksmith-4vcpu-ubuntu-2404
-    timeout-minutes: 20
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: compat
+            target: test
+          - name: mvcc
+            target: test-compat-mvcc
+    name: test-limbo (${{ matrix.name }})
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -206,28 +188,23 @@ jobs:
           cache-on-failure: true
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.9
-
       - name: Install uv
         uses: useblacksmith/setup-uv@v4
         with:
           enable-cache: true
-
       - name: Set up Python
         run: uv python install
-
       - uses: "./.github/shared/install_sqlite"
+      - name: Build
+        env:
+          SCCACHE_GHA_ENABLED: "true"
+          RUSTC_WRAPPER: "sccache"
+        run: cargo build --locked
       - name: Test
         env:
           SCCACHE_GHA_ENABLED: "true"
           RUSTC_WRAPPER: "sccache"
-        run: make test
-        timeout-minutes: 20
-      - name: Test mvcc
-        env:
-          SCCACHE_GHA_ENABLED: "true"
-          RUSTC_WRAPPER: "sccache"
-        run: make test-compat-mvcc
-        timeout-minutes: 10
+        run: make ${{ matrix.target }}
 
   test-sqlite:
     runs-on: blacksmith-4vcpu-ubuntu-2404
