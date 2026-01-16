@@ -1120,28 +1120,34 @@ impl Value {
 
     pub fn exec_min<'a, T: Iterator<Item = &'a Value>>(regs: T) -> Value {
         // SQLite: multi-arg min() returns NULL if ANY argument is NULL
-        let values: Vec<_> = regs.collect();
-        if values.iter().any(|v| matches!(v, Value::Null)) {
-            return Value::Null;
+        let mut result: Option<&Value> = None;
+        for v in regs {
+            if matches!(v, Value::Null) {
+                return Value::Null;
+            }
+            result = Some(match result {
+                None => v,
+                Some(cur) if v < cur => v,
+                Some(cur) => cur,
+            });
         }
-        values
-            .into_iter()
-            .min()
-            .map(|v| v.to_owned())
-            .unwrap_or(Value::Null)
+        result.map(|v| v.to_owned()).unwrap_or(Value::Null)
     }
 
     pub fn exec_max<'a, T: Iterator<Item = &'a Value>>(regs: T) -> Value {
         // SQLite: multi-arg max() returns NULL if ANY argument is NULL
-        let values: Vec<_> = regs.collect();
-        if values.iter().any(|v| matches!(v, Value::Null)) {
-            return Value::Null;
+        let mut result: Option<&Value> = None;
+        for v in regs {
+            if matches!(v, Value::Null) {
+                return Value::Null;
+            }
+            result = Some(match result {
+                None => v,
+                Some(cur) if v > cur => v,
+                Some(cur) => cur,
+            });
         }
-        values
-            .into_iter()
-            .max()
-            .map(|v| v.to_owned())
-            .unwrap_or(Value::Null)
+        result.map(|v| v.to_owned()).unwrap_or(Value::Null)
     }
 
     pub fn exec_concat_strings<'a, T: Iterator<Item = &'a Self>>(registers: T) -> Self {
