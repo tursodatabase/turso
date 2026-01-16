@@ -359,11 +359,15 @@ impl Transaction {
 
     /// Begin a new savepoint for statement-level tracking.
     fn begin_savepoint(&self) {
+        let depth = self.savepoint_stack.read().len();
+        tracing::debug!("begin_savepoint(tx_id={}, depth={})", self.tx_id, depth);
         self.savepoint_stack.write().push(Savepoint::default());
     }
 
     /// Release the newest savepoint (statement completed successfully).
     fn release_savepoint(&self) {
+        let depth = self.savepoint_stack.read().len();
+        tracing::debug!("release_savepoint(tx_id={}, depth={})", self.tx_id, depth);
         self.savepoint_stack.write().pop();
     }
 
@@ -375,6 +379,13 @@ impl Transaction {
     /// Record a version that was created during the current savepoint.
     fn record_created_table_version(&self, rowid: RowID, version_id: u64) {
         if let Some(savepoint) = self.savepoint_stack.write().last_mut() {
+            tracing::debug!(
+                "record_created_table_version(tx_id={}, table_id={}, row_id={}, version_id={})",
+                self.tx_id,
+                rowid.table_id,
+                rowid.row_id,
+                version_id
+            );
             savepoint.created_table_versions.push((rowid, version_id));
         }
     }
@@ -386,6 +397,12 @@ impl Transaction {
         version_id: u64,
     ) {
         if let Some(savepoint) = self.savepoint_stack.write().last_mut() {
+            tracing::debug!(
+                "record_created_index_version(tx_id={}, table_id={}, version_id={})",
+                self.tx_id,
+                key.0,
+                version_id
+            );
             savepoint.created_index_versions.push((key, version_id));
         }
     }
@@ -393,6 +410,13 @@ impl Transaction {
     /// Record a version that was deleted during the current savepoint.
     fn record_deleted_table_version(&self, rowid: RowID, version_id: u64) {
         if let Some(savepoint) = self.savepoint_stack.write().last_mut() {
+            tracing::debug!(
+                "record_deleted_table_version(tx_id={}, table_id={}, row_id={}, version_id={})",
+                self.tx_id,
+                rowid.table_id,
+                rowid.row_id,
+                version_id
+            );
             savepoint.deleted_table_versions.push((rowid, version_id));
         }
     }
@@ -404,6 +428,12 @@ impl Transaction {
         version_id: u64,
     ) {
         if let Some(savepoint) = self.savepoint_stack.write().last_mut() {
+            tracing::debug!(
+                "record_deleted_index_version(tx_id={}, table_id={}, version_id={})",
+                self.tx_id,
+                key.0,
+                version_id
+            );
             savepoint.deleted_index_versions.push((key, version_id));
         }
     }
@@ -2482,11 +2512,20 @@ impl<Clock: LogicalClock> MvStore<Clock> {
         let savepoint = tx.pop_savepoint();
 
         if let Some(savepoint) = savepoint {
+            tracing::debug!("rollback_savepoint(tx_id={}, created_table={}, created_index={}, deleted_table={}, deleted_index={})",
+                tx_id, 
+                savepoint.created_table_versions.len(),
+                savepoint.created_index_versions.len(),
+                savepoint.deleted_table_versions.len(),
+                savepoint.deleted_index_versions.len());
+
             // Remove created table versions
             for (rowid, version_id) in savepoint.created_table_versions {
                 if let Some(entry) = self.rows.get(&rowid) {
                     let mut versions = entry.value().write();
                     versions.retain(|rv| rv.id != version_id);
+                    tracing::debug!("rollback_savepoint: removed table version(table_id={}, row_id={}, version_id={})",
+                        rowid.table_id, rowid.row_id, version_id);
                 }
             }
 
@@ -2496,6 +2535,8 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     if let Some(entry) = index.value().get(&key) {
                         let mut versions = entry.value().write();
                         versions.retain(|rv| rv.id != version_id);
+                        tracing::debug!("rollback_savepoint: removed index version(table_id={}, version_id={})",
+                            table_id, version_id);
                     }
                 }
             }
@@ -2507,6 +2548,8 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                     for rv in versions.iter_mut() {
                         if rv.id == version_id {
                             rv.end = None;
+                            tracing::debug!("rollback_savepoint: restored table version(table_id={}, row_id={}, version_id={})",
+                                rowid.table_id, rowid.row_id, version_id);
                             break;
                         }
                     }
@@ -2521,6 +2564,8 @@ impl<Clock: LogicalClock> MvStore<Clock> {
                         for rv in versions.iter_mut() {
                             if rv.id == version_id {
                                 rv.end = None;
+                                tracing::debug!("rollback_savepoint: restored index version(table_id={}, version_id={})",
+                                    table_id, version_id);
                                 break;
                             }
                         }
@@ -2530,7 +2575,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
 
             Ok(true)
         } else {
-            // No savepoint was active
+            tracing::debug!("rollback_savepoint(tx_id={}): no savepoint was active", tx_id);
             Ok(false)
         }
     }
