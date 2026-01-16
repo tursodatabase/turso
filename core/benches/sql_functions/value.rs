@@ -1016,17 +1016,29 @@ fn exec_random(bencher: Bencher) {
 #[divan::bench]
 fn exec_randomblob_small(bencher: Bencher) {
     let length = Value::Integer(10);
-    bencher.bench_local(|| black_box(&length).exec_randomblob(|buf| buf.fill(0)).unwrap());
+    bencher.bench_local(|| {
+        black_box(&length)
+            .exec_randomblob(|buf| buf.fill(0))
+            .unwrap()
+    });
 }
 
 #[divan::bench]
 fn exec_randomblob_medium(bencher: Bencher) {
     let length = Value::Integer(100);
-    bencher.bench_local(|| black_box(&length).exec_randomblob(|buf| buf.fill(0)).unwrap());
+    bencher.bench_local(|| {
+        black_box(&length)
+            .exec_randomblob(|buf| buf.fill(0))
+            .unwrap()
+    });
 }
 
 #[divan::bench]
 fn exec_randomblob_large(bencher: Bencher) {
     let length = Value::Integer(1000);
-    bencher.bench_local(|| black_box(&length).exec_randomblob(|buf| buf.fill(0)).unwrap());
+    bencher.bench_local(|| {
+        black_box(&length)
+            .exec_randomblob(|buf| buf.fill(0))
+            .unwrap()
+    });
 }

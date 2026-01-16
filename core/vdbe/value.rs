@@ -1118,7 +1118,11 @@ impl Value {
         if values.iter().any(|v| matches!(v, Value::Null)) {
             return Value::Null;
         }
-        values.into_iter().min().map(|v| v.to_owned()).unwrap_or(Value::Null)
+        values
+            .into_iter()
+            .min()
+            .map(|v| v.to_owned())
+            .unwrap_or(Value::Null)
     }
 
     pub fn exec_max<'a, T: Iterator<Item = &'a Value>>(regs: T) -> Value {
@@ -1127,7 +1131,11 @@ impl Value {
         if values.iter().any(|v| matches!(v, Value::Null)) {
             return Value::Null;
         }
-        values.into_iter().max().map(|v| v.to_owned()).unwrap_or(Value::Null)
+        values
+            .into_iter()
+            .max()
+            .map(|v| v.to_owned())
+            .unwrap_or(Value::Null)
     }
 
     pub fn exec_concat_strings<'a, T: Iterator<Item = &'a Self>>(registers: T) -> Self {
