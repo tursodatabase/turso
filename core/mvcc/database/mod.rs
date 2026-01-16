@@ -1956,7 +1956,7 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     fn find_last_visible_index_version(
         &self,
         tx: &Transaction,
-        row: crossbeam_skiplist::map::Entry<'_, SortableIndexKey, RwLock<Vec<RowVersion>>>,
+        row: crossbeam_skiplist::map::Entry<'_, Arc<SortableIndexKey>, RwLock<Vec<RowVersion>>>,
     ) -> Option<RowID> {
         row.value()
             .read()
@@ -1969,7 +1969,11 @@ impl<Clock: LogicalClock> MvStore<Clock> {
     fn find_next_visible_index_row<'a, I>(&self, tx: &Transaction, mut rows: I) -> Option<RowID>
     where
         I: Iterator<
-            Item = crossbeam_skiplist::map::Entry<'a, SortableIndexKey, RwLock<Vec<RowVersion>>>,
+            Item = crossbeam_skiplist::map::Entry<
+                'a,
+                Arc<SortableIndexKey>,
+                RwLock<Vec<RowVersion>>,
+            >,
         >,
     {
         loop {
