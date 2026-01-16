@@ -2,11 +2,10 @@
 //! More info: https://www.sqlite.org/pragma.html.
 
 use crate::sync::Arc;
-use crate::translate::insert::translate_insert;
 use chrono::Datelike;
 use turso_macros::match_ignore_ascii_case;
-use turso_parser::ast::{self, ColumnDefinition, Expr, Literal, Select, SelectBody};
-use turso_parser::ast::{PragmaName, QualifiedName};
+use turso_parser::ast::{self, Expr, Literal};
+use turso_parser::ast::PragmaName;
 
 use super::integrity_check::{
     translate_integrity_check, translate_quick_check, MAX_INTEGRITY_CHECK_ERRORS,
@@ -16,13 +15,14 @@ use crate::schema::Schema;
 use crate::storage::encryption::{CipherMode, EncryptionKey};
 use crate::storage::pager::AutoVacuumMode;
 use crate::storage::pager::Pager;
+use crate::storage::pager::CreateBTreeFlags;
 use crate::storage::sqlite3_ondisk::CacheSize;
 use crate::storage::wal::CheckpointMode;
 use crate::translate::emitter::{Resolver, TransactionMode};
-use crate::translate::schema::translate_create_table;
+use crate::translate::schema::{SchemaEntryType, SQLITE_TABLEID};
 use crate::util::{normalize_ident, parse_signed_number, parse_string, IOExt as _};
-use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts};
-use crate::vdbe::insn::{Cookie, Insn};
+use crate::vdbe::builder::{ProgramBuilder, ProgramBuilderOpts, CursorType};
+use crate::vdbe::insn::{Cookie, Insn, InsertFlags, to_u16};
 use crate::{
     bail_parse_error, CaptureDataChangesMode, LimboError, Value, CAPTURE_DATA_CHANGES_LATEST,
 };
@@ -350,82 +350,9 @@ fn update_pragma(
             let opts = CaptureDataChangesMode::parse(&value)?;
             if let Some(table) = &opts.table() {
                 if resolver.schema.get_table(table).is_none() {
-                    let turso_cdc_metadata_name =
-                        ast::Name::exact(TURSO_CDC_METADATA_TABLE_NAME.to_string());
-                    let turso_cdc_metadata_columns = turso_cdc_metadata_table_columns();
-                    program = translate_create_table(
-                        QualifiedName {
-                            db_name: None,
-                            name: turso_cdc_metadata_name.clone(),
-                            alias: None,
-                        },
-                        resolver,
-                        false,
-                        true, // if_not_exists
-                        ast::CreateTableBody::ColumnsAndConstraints {
-                            columns: turso_cdc_metadata_columns.clone(),
-                            constraints: vec![],
-                            options: ast::TableOptions::NONE,
-                        },
-                        program,
-                        &connection,
-                    )?;
-                    program = translate_create_table(
-                        QualifiedName {
-                            db_name: None,
-                            name: ast::Name::exact(table.to_string()),
-                            alias: None,
-                        },
-                        resolver,
-                        false,
-                        true, // if_not_exists
-                        ast::CreateTableBody::ColumnsAndConstraints {
-                            columns: turso_cdc_table_columns(),
-                            constraints: vec![],
-                            options: ast::TableOptions::NONE,
-                        },
-                        program,
-                        &connection,
-                    )?;
-                    program = translate_insert(
-                        resolver,
-                        Some(ast::ResolveType::Ignore),
-                        QualifiedName {
-                            db_name: None,
-                            name: turso_cdc_metadata_name.clone(),
-                            alias: None,
-                        },
-                        vec![
-                            turso_cdc_metadata_columns[0].col_name.clone(),
-                            turso_cdc_metadata_columns[1].col_name.clone(),
-                            turso_cdc_metadata_columns[2].col_name.clone(),
-                        ],
-                        ast::InsertBody::Select(
-                            Select {
-                                limit: None,
-                                with: None,
-                                order_by: vec![],
-                                body: SelectBody {
-                                    select: ast::OneSelect::Values(vec![vec![
-                                        Box::new(ast::Expr::Literal(ast::Literal::String(
-                                            table.to_string(),
-                                        ))),
-                                        Box::new(ast::Expr::Literal(ast::Literal::String(
-                                            "version".to_string(),
-                                        ))),
-                                        Box::new(ast::Expr::Literal(ast::Literal::String(
-                                            CAPTURE_DATA_CHANGES_LATEST.to_string(),
-                                        ))),
-                                    ]]),
-                                    compounds: vec![],
-                                },
-                            },
-                            None,
-                        ),
-                        vec![],
-                        program,
-                        &connection,
-                    )?;
+                    // Use specialized CDC bytecode emission that creates btrees and inserts
+                    // metadata directly without requiring schema lookup
+                    emit_cdc_table_setup(&mut program, resolver, table)?;
                 }
             }
             connection.set_capture_data_changes(opts);
@@ -1005,113 +932,200 @@ fn update_cache_size(
 pub const TURSO_CDC_METADATA_TABLE_NAME: &str = "turso_cdc_metadata";
 pub const TURSO_CDC_DEFAULT_TABLE_NAME: &str = "turso_cdc";
 
-fn turso_cdc_metadata_table_columns() -> Vec<ColumnDefinition> {
-    vec![
-        ast::ColumnDefinition {
-            col_name: ast::Name::exact("table_name".to_string()),
-            col_type: Some(ast::Type {
-                name: "TEXT".to_string(),
-                size: None,
-            }),
-            constraints: vec![ast::NamedColumnConstraint {
-                name: None,
-                constraint: ast::ColumnConstraint::PrimaryKey {
-                    order: None,
-                    conflict_clause: None,
-                    auto_increment: false,
-                },
-            }],
-        },
-        ast::ColumnDefinition {
-            col_name: ast::Name::exact("key".to_string()),
-            col_type: Some(ast::Type {
-                name: "TEXT".to_string(),
-                size: None,
-            }),
-            constraints: vec![],
-        },
-        ast::ColumnDefinition {
-            col_name: ast::Name::exact("value".to_string()),
-            col_type: Some(ast::Type {
-                name: "TEXT".to_string(),
-                size: None,
-            }),
-            constraints: vec![],
-        },
-    ]
+/// Emit bytecode for creating CDC tables and inserting metadata.
+/// This is a simplified version specific to CDC setup that creates btrees
+/// and inserts the metadata row directly, avoiding the schema lookup issue.
+fn emit_cdc_table_setup(
+    program: &mut ProgramBuilder,
+    resolver: &Resolver,
+    cdc_table_name: &str,
+) -> crate::Result<()> {
+    // Open write cursor on sqlite_schema
+    let schema_master_table = resolver.schema.get_btree_table(SQLITE_TABLEID).unwrap();
+    let sqlite_schema_cursor_id =
+        program.alloc_cursor_id(CursorType::BTreeTable(schema_master_table.clone()));
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id: sqlite_schema_cursor_id,
+        root_page: 1i64.into(),
+        db: 0,
+    });
+
+    // Create metadata table btree
+    let metadata_table_root_reg = program.alloc_register();
+    program.emit_insn(Insn::CreateBtree {
+        db: 0,
+        root: metadata_table_root_reg,
+        flags: CreateBTreeFlags::new_table(),
+    });
+
+    // Generate SQL for metadata table
+    let metadata_sql = format!(
+        "CREATE TABLE {} (table_name TEXT PRIMARY KEY, key TEXT, value TEXT)",
+        TURSO_CDC_METADATA_TABLE_NAME
+    );
+
+    // Insert metadata table entry into sqlite_schema
+    emit_schema_entry_inline(
+        program,
+        sqlite_schema_cursor_id,
+        SchemaEntryType::Table,
+        TURSO_CDC_METADATA_TABLE_NAME,
+        TURSO_CDC_METADATA_TABLE_NAME,
+        metadata_table_root_reg,
+        Some(metadata_sql),
+    )?;
+
+    // Create CDC table btree
+    let cdc_table_root_reg = program.alloc_register();
+    program.emit_insn(Insn::CreateBtree {
+        db: 0,
+        root: cdc_table_root_reg,
+        flags: CreateBTreeFlags::new_table(),
+    });
+
+    // Generate SQL for CDC table
+    let cdc_sql = format!(
+        "CREATE TABLE {} (change_id INTEGER PRIMARY KEY AUTOINCREMENT, change_time INTEGER, change_type INTEGER, table_name TEXT, id, before BLOB, after BLOB, updates BLOB)",
+        cdc_table_name
+    );
+
+    // Insert CDC table entry into sqlite_schema
+    emit_schema_entry_inline(
+        program,
+        sqlite_schema_cursor_id,
+        SchemaEntryType::Table,
+        cdc_table_name,
+        cdc_table_name,
+        cdc_table_root_reg,
+        Some(cdc_sql),
+    )?;
+
+    // Now insert the metadata row directly into the metadata table
+    // We can't use the generic translate_insert because the table isn't in the schema yet.
+    // Instead, we open a write cursor using the btree root register we just created.
+
+    // Allocate a cursor for the metadata table
+    let metadata_cursor_id = program.alloc_cursor_id(CursorType::BTreeTable(schema_master_table.clone()));
+    program.emit_insn(Insn::OpenWrite {
+        cursor_id: metadata_cursor_id,
+        root_page: crate::vdbe::insn::RegisterOrLiteral::Register(metadata_table_root_reg),
+        db: 0,
+    });
+
+    // Generate the rowid
+    let rowid_reg = program.alloc_register();
+    program.emit_insn(Insn::NewRowid {
+        cursor: metadata_cursor_id,
+        rowid_reg,
+        prev_largest_reg: 0,
+    });
+
+    // Generate the values: (cdc_table_name, "version", CAPTURE_DATA_CHANGES_LATEST)
+    let value_start_reg = program.alloc_register();
+    program.emit_string8(cdc_table_name.to_string(), value_start_reg);
+    program.emit_string8("version".to_string(), value_start_reg + 1);
+    program.emit_string8(CAPTURE_DATA_CHANGES_LATEST.to_string(), value_start_reg + 2);
+
+    // Create the record
+    let record_reg = program.alloc_register();
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: to_u16(value_start_reg),
+        count: to_u16(3),
+        dest_reg: to_u16(record_reg),
+        index_name: None,
+        affinity_str: None,
+    });
+
+    // Insert the record
+    program.emit_insn(Insn::Insert {
+        cursor: metadata_cursor_id,
+        key_reg: rowid_reg,
+        record_reg,
+        flag: InsertFlags::new(),
+        table_name: TURSO_CDC_METADATA_TABLE_NAME.to_string(),
+    });
+
+    // Increment schema version
+    program.emit_insn(Insn::SetCookie {
+        db: 0,
+        cookie: Cookie::SchemaVersion,
+        value: resolver.schema.schema_version as i32 + 1,
+        p5: 0,
+    });
+
+    // Parse schema to update the in-memory schema
+    let parse_schema_where_clause = format!(
+        "tbl_name IN ('{}', '{}')",
+        TURSO_CDC_METADATA_TABLE_NAME, cdc_table_name
+    );
+    program.emit_insn(Insn::ParseSchema {
+        db: sqlite_schema_cursor_id,
+        where_clause: Some(parse_schema_where_clause),
+    });
+
+    Ok(())
 }
 
-fn turso_cdc_table_columns() -> Vec<ColumnDefinition> {
-    vec![
-        ast::ColumnDefinition {
-            col_name: ast::Name::exact("change_id".to_string()),
-            col_type: Some(ast::Type {
-                name: "INTEGER".to_string(),
-                size: None,
-            }),
-            constraints: vec![ast::NamedColumnConstraint {
-                name: None,
-                constraint: ast::ColumnConstraint::PrimaryKey {
-                    order: None,
-                    conflict_clause: None,
-                    auto_increment: true,
-                },
-            }],
-        },
-        ast::ColumnDefinition {
-            col_name: ast::Name::exact("change_time".to_string()),
-            col_type: Some(ast::Type {
-                name: "INTEGER".to_string(),
-                size: None,
-            }),
-            constraints: vec![],
-        },
-        ast::ColumnDefinition {
-            col_name: ast::Name::exact("change_type".to_string()),
-            col_type: Some(ast::Type {
-                name: "INTEGER".to_string(),
-                size: None,
-            }),
-            constraints: vec![],
-        },
-        ast::ColumnDefinition {
-            col_name: ast::Name::exact("table_name".to_string()),
-            col_type: Some(ast::Type {
-                name: "TEXT".to_string(),
-                size: None,
-            }),
-            constraints: vec![],
-        },
-        ast::ColumnDefinition {
-            col_name: ast::Name::exact("id".to_string()),
-            col_type: None,
-            constraints: vec![],
-        },
-        ast::ColumnDefinition {
-            col_name: ast::Name::exact("before".to_string()),
-            col_type: Some(ast::Type {
-                name: "BLOB".to_string(),
-                size: None,
-            }),
-            constraints: vec![],
-        },
-        ast::ColumnDefinition {
-            col_name: ast::Name::exact("after".to_string()),
-            col_type: Some(ast::Type {
-                name: "BLOB".to_string(),
-                size: None,
-            }),
-            constraints: vec![],
-        },
-        ast::ColumnDefinition {
-            col_name: ast::Name::exact("updates".to_string()),
-            col_type: Some(ast::Type {
-                name: "BLOB".to_string(),
-                size: None,
-            }),
-            constraints: vec![],
-        },
-    ]
+/// Inline version of emit_schema_entry to avoid circular dependencies.
+/// Emits bytecode to insert an entry into sqlite_schema.
+fn emit_schema_entry_inline(
+    program: &mut ProgramBuilder,
+    sqlite_schema_cursor_id: usize,
+    entry_type: SchemaEntryType,
+    name: &str,
+    tbl_name: &str,
+    root_page_reg: usize,
+    sql: Option<String>,
+) -> crate::Result<()> {
+    let rowid_reg = program.alloc_register();
+    program.emit_insn(Insn::NewRowid {
+        cursor: sqlite_schema_cursor_id,
+        rowid_reg,
+        prev_largest_reg: 0,
+    });
+
+    let entry_type_str = match entry_type {
+        SchemaEntryType::Table => "table",
+        SchemaEntryType::Index => "index",
+        SchemaEntryType::View => "view",
+        SchemaEntryType::Trigger => "trigger",
+    };
+    let type_reg = program.emit_string8_new_reg(entry_type_str.to_string());
+    program.emit_string8_new_reg(name.to_string());
+    program.emit_string8_new_reg(tbl_name.to_string());
+
+    let table_root_reg = program.alloc_register();
+    program.emit_insn(Insn::Copy {
+        src_reg: root_page_reg,
+        dst_reg: table_root_reg,
+        extra_amount: 0,
+    });
+
+    let sql_reg = program.alloc_register();
+    if let Some(sql) = sql {
+        program.emit_string8(sql, sql_reg);
+    } else {
+        program.emit_null(sql_reg, None);
+    }
+
+    let record_reg = program.alloc_register();
+    program.emit_insn(Insn::MakeRecord {
+        start_reg: to_u16(type_reg),
+        count: to_u16(5),
+        dest_reg: to_u16(record_reg),
+        index_name: None,
+        affinity_str: None,
+    });
+
+    program.emit_insn(Insn::Insert {
+        cursor: sqlite_schema_cursor_id,
+        key_reg: rowid_reg,
+        record_reg,
+        flag: InsertFlags::new(),
+        table_name: tbl_name.to_string(),
+    });
+
+    Ok(())
 }
 
 fn update_page_size(connection: Arc<crate::Connection>, page_size: u32) -> crate::Result<()> {
