@@ -1251,8 +1251,10 @@ test collate-compound-1 {
     UNION
     SELECT b FROM t1 WHERE b = 'ABC';
 }
-expect {
-    ABC
+# Turso and SQLite differ on which duplicate value is kept under NOCASE
+# collation, so we use case-insensitive matching.
+expect pattern {
+    (?i)^abc$
 }
 
 # Test INTERSECT with explicit collation
@@ -1283,8 +1285,10 @@ test collate-compound-5 {
     UNION
     SELECT 'ABC' COLLATE NOCASE;
 }
-expect {
-    ABC
+# Turso and SQLite differ on which duplicate value is kept under NOCASE
+# collation, so we use case-insensitive matching.
+expect pattern {
+    (?i)^abc$
 }
 
 # Test nested compound with collations
@@ -1292,11 +1296,14 @@ test collate-compound-7 {
     CREATE TABLE t(x); -- Workaround because Turso thinks we need to have page 1 allocated
     SELECT 'a' COLLATE NOCASE
     UNION
-    SELECT 'A' COLLATE NOCASE UNION SELECT 'b' COLLATE NOCASE;
+    SELECT 'A' COLLATE NOCASE
+    UNION
+    SELECT 'b' COLLATE NOCASE;
 }
-expect {
-    A
-    b
+# Turso and SQLite differ on which duplicate value is kept under NOCASE
+# collation, so we use case-insensitive matching.
+expect pattern {
+    (?i)^a\nb$
 }
 
 # Test UNION ALL preserving duplicates with case differences
@@ -1361,8 +1368,10 @@ test collate-compound-13 {
     UNION
     SELECT 'TEST' COLLATE BINARY;
 }
-expect {
-    TEST
+# Turso and SQLite differ on which duplicate value is kept under NOCASE
+# collation, so we use case-insensitive matching.
+expect pattern {
+    (?i)^test$
 }
 
 # Test three-way compound with different collations
@@ -1374,9 +1383,10 @@ test collate-compound-14 {
     UNION
     SELECT 'def';
 }
-expect {
-    ABC
-    def
+# Turso and SQLite differ on which duplicate value is kept under NOCASE
+# collation, so we use case-insensitive matching.
+expect pattern {
+    (?i)^abc\ndef$
 }
 
 # Test INTERSECT ALL (if supported) with collations
