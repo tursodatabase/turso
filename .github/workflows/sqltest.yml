@@ -30,9 +30,17 @@ jobs:
         run: make -C turso-test-runner check
 
   sqltest-run-cli:
-    name: Run SQL tests (CLI backend)
+    name: SQL tests CLI (${{ matrix.mode }})
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - mode: normal
+            mvcc_flag: ""
+          - mode: mvcc
+            mvcc_flag: "MVCC=1"
     steps:
       - uses: actions/checkout@v3
       - uses: useblacksmith/rust-cache@v3
@@ -51,14 +59,20 @@ jobs:
           RUSTC_WRAPPER: "sccache"
         run: make -C turso-test-runner build-runner
       - name: Run tests
-        run: make -C turso-test-runner run-cli
-      - name: Run tests (MVCC)
-        run: make -C turso-test-runner run-cli MVCC=1
+        run: make -C turso-test-runner run-cli ${{ matrix.mvcc_flag }}
 
   sqltest-run-rust:
-    name: Run SQL tests (Rust backend)
+    name: SQL tests Rust (${{ matrix.mode }})
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - mode: normal
+            mvcc_flag: ""
+          - mode: mvcc
+            mvcc_flag: "MVCC=1"
     steps:
       - uses: actions/checkout@v3
       - uses: useblacksmith/rust-cache@v3
@@ -67,14 +81,20 @@ jobs:
       - name: Build test runner
         run: make -C turso-test-runner build-runner
       - name: Run tests
-        run: make -C turso-test-runner run-rust
-      - name: Run tests (MVCC)
-        run: make -C turso-test-runner run-rust MVCC=1
+        run: make -C turso-test-runner run-rust ${{ matrix.mvcc_flag }}
 
   sqltest-run-js:
-    name: Run SQL tests (JS backend)
+    name: SQL tests JS (${{ matrix.mode }})
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - mode: normal
+            mvcc_flag: ""
+          - mode: mvcc
+            mvcc_flag: "MVCC=1"
     defaults:
       run:
         working-directory: bindings/javascript
@@ -108,10 +128,7 @@ jobs:
         run: cargo build --release
       - name: Run tests
         working-directory: turso-test-runner
-        run: make run-js
-      - name: Run tests (MVCC)
-        working-directory: turso-test-runner
-        run: make run-js MVCC=1
+        run: make run-js ${{ matrix.mvcc_flag }}
 
   sqltest-sqlite:
     name: Run SQL tests (SQLite)

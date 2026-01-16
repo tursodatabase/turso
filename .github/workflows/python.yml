@@ -34,91 +34,73 @@ jobs:
 
   test:
     needs: configure-strategy
-    timeout-minutes: 30
+    timeout-minutes: 20
     strategy:
+      fail-fast: false
       matrix:
         os:
           - blacksmith-4vcpu-ubuntu-2404
           - macos-latest
           - windows-latest
         python-version: ${{ fromJson(needs.configure-strategy.outputs.python-versions) }}
+        test-suite:
+          - name: database
+            file: tests/test_database.py
+            needs_sync: false
+          - name: database-aio
+            file: tests/test_database_aio.py
+            needs_sync: false
+          - name: database-sync
+            file: tests/test_database_sync.py
+            needs_sync: true
+          - name: database-sync-aio
+            file: tests/test_database_sync_aio.py
+            needs_sync: true
+    name: test (${{ matrix.os }}, py${{ matrix.python-version }}, ${{ matrix.test-suite.name }})
     runs-on: ${{ matrix.os }}
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-
       - name: Setup Rust toolchain
         uses: dtolnay/rust-toolchain@stable
-
       - name: Setup mold linker
         if: runner.os == 'Linux'
         uses: rui314/setup-mold@v1
-
       - name: Rust cache
         uses: Swatinem/rust-cache@v2
         with:
           prefix-key: "v1-rust"
           cache-on-failure: true
-
       - name: Setup sccache
         uses: mozilla-actions/sccache-action@v0.0.9
-
       - name: Build Rust (debug)
         env:
           SCCACHE_GHA_ENABLED: "true"
           RUSTC_WRAPPER: "sccache"
         run: cargo build --verbose --locked
-
       - name: Set up Python ${{ matrix.python-version }}
         uses: useblacksmith/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
-
       - name: Install uv
         uses: useblacksmith/setup-uv@v4
         with:
           enable-cache: true
-
       - name: Install the project
         working-directory: ${{ env.working-directory }}
         run: uv sync --all-extras --dev --all-packages
-
-      - name: Run Pytest
-        working-directory: ${{ env.working-directory }}
-        run: uv run pytest tests/test_database.py
-
-      - name: Run Pytest (async driver)
-        working-directory: ${{ env.working-directory }}
-        run: uv run pytest tests/test_database_aio.py
-
-      - name: Run Pytest (sync)
+      - name: Run Pytest (unix)
         working-directory: ${{ env.working-directory }}
         if: runner.os != 'Windows'
         env:
-          LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
-        run: uv run pytest tests/test_database_sync.py
-
-      - name: Run Pytest (sync, async driver)
-        working-directory: ${{ env.working-directory }}
-        if: runner.os != 'Windows'
-        env:
-          LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
-        run: uv run pytest tests/test_database_sync_aio.py
-
-      - name: Run Pytest (windows, sync)
+          LOCAL_SYNC_SERVER: ${{ matrix.test-suite.needs_sync && '../../target/debug/tursodb' || '' }}
+        run: uv run pytest ${{ matrix.test-suite.file }}
+      - name: Run Pytest (windows)
         working-directory: ${{ env.working-directory }}
         if: runner.os == 'Windows'
         env:
-          LOCAL_SYNC_SERVER: "..\\..\\target\\debug\\tursodb.exe"
-        run: uv run pytest tests/test_database_sync.py
-
-      - name: Run Pytest (windows, sync, async driver)
-        working-directory: ${{ env.working-directory }}
-        if: runner.os == 'Windows'
-        env:
-          LOCAL_SYNC_SERVER: "..\\..\\target\\debug\\tursodb.exe"
-        run: uv run pytest tests/test_database_sync_aio.py
+          LOCAL_SYNC_SERVER: ${{ matrix.test-suite.needs_sync && '..\..\target\debug\tursodb.exe' || '' }}
+        run: uv run pytest ${{ matrix.test-suite.file }}
 
   lint:
     runs-on: blacksmith-4vcpu-ubuntu-2404
