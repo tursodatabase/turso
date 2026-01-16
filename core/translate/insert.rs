@@ -1313,8 +1313,15 @@ fn bind_insert(
             // Abort is the default conflict resolution strategy for INSERT in SQLite,
             // and we implement Replace.
         }
-        _ => {
-            crate::bail_parse_error!("INSERT OR {} is not yet supported", on_conflict.to_string());
+        ResolveType::Fail => {
+            // FAIL: Abort statement with error but do NOT rollback changes made
+            // by the current statement. Prior changes persist.
+            program.set_resolve_type(ResolveType::Fail);
+        }
+        ResolveType::Rollback => {
+            // ROLLBACK: Abort statement with error AND rollback the entire
+            // transaction, not just the statement.
+            program.set_resolve_type(ResolveType::Rollback);
         }
     }
     while let Some(mut upsert_opt) = upsert.take() {
