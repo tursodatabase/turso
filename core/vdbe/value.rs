@@ -559,7 +559,11 @@ impl Value {
         };
 
         match reg.find(pattern) {
-            Some(position) => Value::Integer(position as i64 + 1),
+            Some(byte_pos) => {
+                // Convert byte position to character position (1-indexed)
+                let char_pos = reg[..byte_pos].chars().count() + 1;
+                Value::Integer(char_pos as i64)
+            }
             None => Value::Integer(0),
         }
     }
