@@ -149,3 +149,197 @@ test('encryption', () => {
         unlinkSync(path);
     }
 })
+
+// ============================================
+// Tests for new DX improvements (Tier 1) - Sync API
+// ============================================
+
+test('values() returns array of arrays', () => {
+    const db = new Database(':memory:');
+    db.exec('CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)');
+    db.exec("INSERT INTO users (name, age) VALUES ('Alice', 30), ('Bob', 25), ('Charlie', 35)");
+
+    const stmt = db.prepare('SELECT id, name, age FROM users ORDER BY id');
+    const values = stmt.values();
+
+    expect(values).toEqual([
+        [1, 'Alice', 30],
+        [2, 'Bob', 25],
+        [3, 'Charlie', 35]
+    ]);
+})
+
+test('values() with bind parameters', () => {
+    const db = new Database(':memory:');
+    db.exec('CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)');
+    db.exec("INSERT INTO users (name, age) VALUES ('Alice', 30), ('Bob', 25), ('Charlie', 35)");
+
+    const stmt = db.prepare('SELECT id, name, age FROM users WHERE age > ? ORDER BY id');
+    const values = stmt.values(28);
+
+    expect(values).toEqual([
+        [1, 'Alice', 30],
+        [3, 'Charlie', 35]
+    ]);
+})
+
+test('values() does not affect subsequent all() calls', () => {
+    const db = new Database(':memory:');
+    db.exec('CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)');
+    db.exec("INSERT INTO users (name) VALUES ('Alice'), ('Bob')");
+
+    const stmt = db.prepare('SELECT * FROM users ORDER BY id');
+
+    // First call values()
+    const values = stmt.values();
+    expect(values).toEqual([[1, 'Alice'], [2, 'Bob']]);
+
+    // Then call all() - should still return objects
+    const rows = stmt.all();
+    expect(rows).toEqual([{ id: 1, name: 'Alice' }, { id: 2, name: 'Bob' }]);
+})
+
+test('query() shorthand returns first row', () => {
+    const db = new Database(':memory:');
+    db.exec('CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)');
+    db.exec("INSERT INTO users (name) VALUES ('Alice'), ('Bob')");
+
+    const user = db.query('SELECT * FROM users WHERE id = ?', [1]);
+    expect(user).toEqual({ id: 1, name: 'Alice' });
+})
+
+test('query() returns undefined for no results', () => {
+    const db = new Database(':memory:');
+    db.exec('CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)');
+
+    const user = db.query('SELECT * FROM users WHERE id = ?', [999]);
+    expect(user).toBeUndefined();
+})
+
+test('query() without parameters', () => {
+    const db = new Database(':memory:');
+    db.exec('CREATE TABLE config (key TEXT, value TEXT)');
+    db.exec("INSERT INTO config VALUES ('version', '1.0')");
+
+    const config = db.query('SELECT * FROM config');
+    expect(config).toEqual({ key: 'version', value: '1.0' });
+})
+
+test('queryAll() shorthand returns all rows', () => {
+    const db = new Database(':memory:');
+    db.exec('CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, active INTEGER)');
+    db.exec("INSERT INTO users (name, active) VALUES ('Alice', 1), ('Bob', 0), ('Charlie', 1)");
+
+    const activeUsers = db.queryAll('SELECT * FROM users WHERE active = ? ORDER BY id', [1]);
+    expect(activeUsers).toEqual([
+        { id: 1, name: 'Alice', active: 1 },
+        { id: 3, name: 'Charlie', active: 1 }
+    ]);
+})
+
+test('queryAll() returns empty array for no results', () => {
+    const db = new Database(':memory:');
+    db.exec('CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)');
+
+    const users = db.queryAll('SELECT * FROM users WHERE id > ?', [100]);
+    expect(users).toEqual([]);
+})
+
+test('queryAll() without parameters', () => {
+    const db = new Database(':memory:');
+    db.exec('CREATE TABLE items (x INTEGER)');
+    db.exec("INSERT INTO items VALUES (1), (2), (3)");
+
+    const items = db.queryAll('SELECT * FROM items ORDER BY x');
+    expect(items).toEqual([{ x: 1 }, { x: 2 }, { x: 3 }]);
+})
+
+test('run() returns RunResult with changes and lastInsertRowid', () => {
+    const db = new Database(':memory:');
+    db.exec('CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)');
+
+    const insert = db.prepare('INSERT INTO users (name) VALUES (?)');
+    const result1 = insert.run('Alice');
+    expect(result1.changes).toBe(1);
+    expect(result1.lastInsertRowid).toBe(1);
+
+    const result2 = insert.run('Bob');
+    expect(result2.changes).toBe(1);
+    expect(result2.lastInsertRowid).toBe(2);
+})
+
+test('run() changes count for UPDATE', () => {
+    const db = new Database(':memory:');
+    db.exec('CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, active INTEGER DEFAULT 1)');
+    db.exec("INSERT INTO users (name) VALUES ('Alice'), ('Bob'), ('Charlie')");
+
+    const update = db.prepare('UPDATE users SET active = 0 WHERE id > ?');
+    const result = update.run(1);
+    expect(result.changes).toBe(2); // Bob and Charlie
+})
+
+test('run() changes count for DELETE', () => {
+    const db = new Database(':memory:');
+    db.exec('CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)');
+    db.exec("INSERT INTO users (name) VALUES ('Alice'), ('Bob'), ('Charlie')");
+
+    const del = db.prepare('DELETE FROM users WHERE id > ?');
+    const result = del.run(1);
+    expect(result.changes).toBe(2); // Bob and Charlie deleted
+})
+
+// TypeScript generic types - sync API
+test('generic types - prepare<T> returns typed results', () => {
+    interface User {
+        id: number;
+        name: string;
+        email: string;
+    }
+
+    const db = new Database(':memory:');
+    db.exec('CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT)');
+    db.exec("INSERT INTO users (name, email) VALUES ('Alice', 'alice@test.com')");
+
+    const stmt = db.prepare<User>('SELECT * FROM users');
+    const users = stmt.all();
+
+    expect(users.length).toBe(1);
+    expect(users[0].id).toBe(1);
+    expect(users[0].name).toBe('Alice');
+    expect(users[0].email).toBe('alice@test.com');
+})
+
+test('generic types - query<T> returns typed result', () => {
+    interface Config {
+        key: string;
+        value: string;
+    }
+
+    const db = new Database(':memory:');
+    db.exec('CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT)');
+    db.exec("INSERT INTO config VALUES ('app_name', 'MyApp')");
+
+    const config = db.query<Config>('SELECT * FROM config WHERE key = ?', ['app_name']);
+
+    expect(config).toBeDefined();
+    expect(config!.key).toBe('app_name');
+    expect(config!.value).toBe('MyApp');
+})
+
+test('generic types - queryAll<T> returns typed array', () => {
+    interface Product {
+        id: number;
+        name: string;
+        price: number;
+    }
+
+    const db = new Database(':memory:');
+    db.exec('CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, price REAL)');
+    db.exec("INSERT INTO products (name, price) VALUES ('Widget', 9.99), ('Gadget', 19.99)");
+
+    const products = db.queryAll<Product>('SELECT * FROM products ORDER BY id');
+
+    expect(products.length).toBe(2);
+    expect(products[0].name).toBe('Widget');
+    expect(products[1].price).toBe(19.99);
+})

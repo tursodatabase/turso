@@ -273,3 +273,199 @@ test('example-2', async () => {
         { name: 'Bob', email: 'bob@example.com' }
     ]);
 })
+
+// ============================================
+// Tests for new DX improvements (Tier 1)
+// ============================================
+
+test('values() returns array of arrays', async () => {
+    const db = await connect(':memory:');
+    await db.exec('CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)');
+    await db.exec("INSERT INTO users (name, age) VALUES ('Alice', 30), ('Bob', 25), ('Charlie', 35)");
+
+    const stmt = db.prepare('SELECT id, name, age FROM users ORDER BY id');
+    const values = await stmt.values();
+
+    expect(values).toEqual([
+        [1, 'Alice', 30],
+        [2, 'Bob', 25],
+        [3, 'Charlie', 35]
+    ]);
+})
+
+test('values() with bind parameters', async () => {
+    const db = await connect(':memory:');
+    await db.exec('CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, age INTEGER)');
+    await db.exec("INSERT INTO users (name, age) VALUES ('Alice', 30), ('Bob', 25), ('Charlie', 35)");
+
+    const stmt = db.prepare('SELECT id, name, age FROM users WHERE age > ? ORDER BY id');
+    const values = await stmt.values(28);
+
+    expect(values).toEqual([
+        [1, 'Alice', 30],
+        [3, 'Charlie', 35]
+    ]);
+})
+
+test('values() does not affect subsequent all() calls', async () => {
+    const db = await connect(':memory:');
+    await db.exec('CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)');
+    await db.exec("INSERT INTO users (name) VALUES ('Alice'), ('Bob')");
+
+    const stmt = db.prepare('SELECT * FROM users ORDER BY id');
+
+    // First call values()
+    const values = await stmt.values();
+    expect(values).toEqual([[1, 'Alice'], [2, 'Bob']]);
+
+    // Then call all() - should still return objects
+    const rows = await stmt.all();
+    expect(rows).toEqual([{ id: 1, name: 'Alice' }, { id: 2, name: 'Bob' }]);
+})
+
+test('query() shorthand returns first row', async () => {
+    const db = await connect(':memory:');
+    await db.exec('CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)');
+    await db.exec("INSERT INTO users (name) VALUES ('Alice'), ('Bob')");
+
+    const user = await db.query('SELECT * FROM users WHERE id = ?', [1]);
+    expect(user).toEqual({ id: 1, name: 'Alice' });
+})
+
+test('query() returns undefined for no results', async () => {
+    const db = await connect(':memory:');
+    await db.exec('CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)');
+
+    const user = await db.query('SELECT * FROM users WHERE id = ?', [999]);
+    expect(user).toBeUndefined();
+})
+
+test('query() without parameters', async () => {
+    const db = await connect(':memory:');
+    await db.exec('CREATE TABLE config (key TEXT, value TEXT)');
+    await db.exec("INSERT INTO config VALUES ('version', '1.0')");
+
+    const config = await db.query('SELECT * FROM config');
+    expect(config).toEqual({ key: 'version', value: '1.0' });
+})
+
+test('queryAll() shorthand returns all rows', async () => {
+    const db = await connect(':memory:');
+    await db.exec('CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, active INTEGER)');
+    await db.exec("INSERT INTO users (name, active) VALUES ('Alice', 1), ('Bob', 0), ('Charlie', 1)");
+
+    const activeUsers = await db.queryAll('SELECT * FROM users WHERE active = ? ORDER BY id', [1]);
+    expect(activeUsers).toEqual([
+        { id: 1, name: 'Alice', active: 1 },
+        { id: 3, name: 'Charlie', active: 1 }
+    ]);
+})
+
+test('queryAll() returns empty array for no results', async () => {
+    const db = await connect(':memory:');
+    await db.exec('CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)');
+
+    const users = await db.queryAll('SELECT * FROM users WHERE id > ?', [100]);
+    expect(users).toEqual([]);
+})
+
+test('queryAll() without parameters', async () => {
+    const db = await connect(':memory:');
+    await db.exec('CREATE TABLE items (x INTEGER)');
+    await db.exec("INSERT INTO items VALUES (1), (2), (3)");
+
+    const items = await db.queryAll('SELECT * FROM items ORDER BY x');
+    expect(items).toEqual([{ x: 1 }, { x: 2 }, { x: 3 }]);
+})
+
+test('run() returns RunResult with changes and lastInsertRowid', async () => {
+    const db = await connect(':memory:');
+    await db.exec('CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)');
+
+    const insert = db.prepare('INSERT INTO users (name) VALUES (?)');
+    const result1 = await insert.run('Alice');
+    expect(result1.changes).toBe(1);
+    expect(result1.lastInsertRowid).toBe(1);
+
+    const result2 = await insert.run('Bob');
+    expect(result2.changes).toBe(1);
+    expect(result2.lastInsertRowid).toBe(2);
+})
+
+test('run() changes count for UPDATE', async () => {
+    const db = await connect(':memory:');
+    await db.exec('CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, active INTEGER DEFAULT 1)');
+    await db.exec("INSERT INTO users (name) VALUES ('Alice'), ('Bob'), ('Charlie')");
+
+    const update = db.prepare('UPDATE users SET active = 0 WHERE id > ?');
+    const result = await update.run(1);
+    expect(result.changes).toBe(2); // Bob and Charlie
+})
+
+test('run() changes count for DELETE', async () => {
+    const db = await connect(':memory:');
+    await db.exec('CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)');
+    await db.exec("INSERT INTO users (name) VALUES ('Alice'), ('Bob'), ('Charlie')");
+
+    const del = db.prepare('DELETE FROM users WHERE id > ?');
+    const result = await del.run(1);
+    expect(result.changes).toBe(2); // Bob and Charlie deleted
+})
+
+// TypeScript generic types - these tests verify runtime behavior matches type expectations
+test('generic types - prepare<T> returns typed results', async () => {
+    interface User {
+        id: number;
+        name: string;
+        email: string;
+    }
+
+    const db = await connect(':memory:');
+    await db.exec('CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, email TEXT)');
+    await db.exec("INSERT INTO users (name, email) VALUES ('Alice', 'alice@test.com')");
+
+    // The generic type is for TypeScript compile-time checking
+    // At runtime, we verify the shape matches
+    const stmt = db.prepare<User>('SELECT * FROM users');
+    const users = await stmt.all();
+
+    expect(users.length).toBe(1);
+    expect(users[0].id).toBe(1);
+    expect(users[0].name).toBe('Alice');
+    expect(users[0].email).toBe('alice@test.com');
+})
+
+test('generic types - query<T> returns typed result', async () => {
+    interface Config {
+        key: string;
+        value: string;
+    }
+
+    const db = await connect(':memory:');
+    await db.exec('CREATE TABLE config (key TEXT PRIMARY KEY, value TEXT)');
+    await db.exec("INSERT INTO config VALUES ('app_name', 'MyApp')");
+
+    const config = await db.query<Config>('SELECT * FROM config WHERE key = ?', ['app_name']);
+
+    expect(config).toBeDefined();
+    expect(config!.key).toBe('app_name');
+    expect(config!.value).toBe('MyApp');
+})
+
+test('generic types - queryAll<T> returns typed array', async () => {
+    interface Product {
+        id: number;
+        name: string;
+        price: number;
+    }
+
+    const db = await connect(':memory:');
+    await db.exec('CREATE TABLE products (id INTEGER PRIMARY KEY, name TEXT, price REAL)');
+    await db.exec("INSERT INTO products (name, price) VALUES ('Widget', 9.99), ('Gadget', 19.99)");
+
+    const products = await db.queryAll<Product>('SELECT * FROM products ORDER BY id');
+
+    expect(products.length).toBe(2);
+    expect(products[0].name).toBe('Widget');
+    expect(products[1].price).toBe(19.99);
+})
