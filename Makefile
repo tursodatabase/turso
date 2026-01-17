@@ -168,7 +168,7 @@ bench-exclude-tpc-h:
 		echo "No benchmarks found (excluding tpc_h_benchmark)."; \
 		exit 1; \
 	else \
-		cargo bench $$benchmarks; \
+		cargo bench $$benchmarks --features bench; \
 	fi
 .PHONY: bench-exclude-tpc-h
 
