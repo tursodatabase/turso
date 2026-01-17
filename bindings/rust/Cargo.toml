@@ -32,6 +32,7 @@ thiserror = { workspace = true }
 tracing-subscriber.workspace = true
 tracing.workspace = true
 mimalloc = { workspace = true, optional = true }
+futures-timer = "3"
 
 hyper = { version = "1.8.1", features = ["http1"], optional = true }
 tokio = { workspace = true, features = ["full"], optional = true }

@@ -4,6 +4,7 @@ use std::{
     ops::Deref,
     sync::{atomic::Ordering, Arc},
     task::Waker,
+    time::Duration,
 };
 
 use tracing::{instrument, Level};
@@ -123,9 +124,6 @@ impl Statement {
         if let Some(busy_state) = self.busy_handler_state.as_ref() {
             if self.pager.io.current_time_monotonic() < busy_state.timeout() {
                 // Yield the query as the timeout has not been reached yet
-                if let Some(waker) = waker {
-                    waker.wake_by_ref();
-                }
                 return Ok(StepResult::IO);
             }
         }
@@ -182,9 +180,6 @@ impl Statement {
             // Invoke the busy handler to determine if we should retry
             if busy_state.invoke(&handler, now) {
                 // Handler says retry, yield with IO to wait for timeout
-                if let Some(waker) = waker {
-                    waker.wake_by_ref();
-                }
                 res = Ok(StepResult::IO);
                 #[cfg(shuttle)]
                 crate::thread::spin_loop();
@@ -201,6 +196,21 @@ impl Statement {
 
     pub fn step_with_waker(&mut self, waker: &Waker) -> Result<StepResult> {
         self._step(Some(waker))
+    }
+
+    /// Returns the remaining delay before the busy handler timeout expires.
+    ///
+    /// This is used by async callers to schedule a proper sleep instead of
+    /// busy-spinning. Returns `None` if there is no pending busy timeout.
+    pub fn get_busy_delay(&self) -> Option<Duration> {
+        let busy_state = self.busy_handler_state.as_ref()?;
+        let now = self.pager.io.current_time_monotonic();
+        let delay = busy_state.get_delay(now);
+        if delay.is_zero() {
+            None
+        } else {
+            Some(delay)
+        }
     }
 
     pub fn run_ignore_rows(&mut self) -> Result<()> {
