@@ -1408,27 +1408,32 @@ impl Program {
                 // Non-FK constraint errors: behavior depends on resolve_type
                 // - ROLLBACK: rollback the entire transaction regardless of autocommit mode
                 // - FAIL: don't rollback anything - changes persist, transaction stays active
-                // - ABORT: rollback statement, rollback transaction in autocommit mode
                 Some(LimboError::Constraint(_)) => {
-                    if self.resolve_type == ResolveType::Rollback {
-                        // ROLLBACK always rolls back the entire transaction
-                        self.rollback_current_txn(pager);
-                    } else if self.resolve_type == ResolveType::Fail {
-                        // FAIL: Don't rollback the transaction. Changes made before the error persist.
-                        // For autocommit mode, the commit was already handled in halt() before
-                        // the error was returned, so nothing more to do here.
-                        // For non-autocommit mode, release the savepoint so changes become part
-                        // of the outer transaction.
-                        if !self.connection.get_auto_commit() {
-                            state.end_statement(
-                                &self.connection,
-                                pager,
-                                EndStatement::ReleaseSavepoint,
-                            )?;
+                    match self.resolve_type {
+                        ResolveType::Rollback => {
+                            // ROLLBACK always rolls back the entire transaction
+                            self.rollback_current_txn(pager);
                         }
-                    } else if self.connection.get_auto_commit() {
-                        // ABORT in autocommit: rollback the implicit transaction
-                        self.rollback_current_txn(pager);
+                        ResolveType::Fail => {
+                            // FAIL: Don't rollback the transaction. Changes made before the error persist.
+                            // For autocommit mode, the commit was already handled in halt() before
+                            // the error was returned, so nothing more to do here.
+                            // For non-autocommit mode, release the savepoint so changes become part
+                            // of the outer transaction.
+                            if !self.connection.get_auto_commit() {
+                                state.end_statement(
+                                    &self.connection,
+                                    pager,
+                                    EndStatement::ReleaseSavepoint,
+                                )?;
+                            }
+                        }
+                        _ => {
+                            if self.connection.get_auto_commit() {
+                                // ABORT in autocommit: rollback the implicit transaction
+                                self.rollback_current_txn(pager);
+                            }
+                        }
                     }
                 }
                 _ => {
