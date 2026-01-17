@@ -3838,12 +3838,12 @@ impl Pager {
                 assert_eq!(default_header.database_size.get(), 0);
                 default_header.database_size = 1.into();
 
-                // based on the IOContext set, we will set the reserved space bytes as required by
-                // either the encryption or checksum, or None if they are not set.
-                let reserved_space_bytes = {
+                // Use cached reserved_space if set (e.g., by sync engine before page allocation),
+                // otherwise fall back to IOContext's encryption/checksum requirements.
+                let reserved_space_bytes = self.get_reserved_space().unwrap_or_else(|| {
                     let io_ctx = self.io_ctx.read();
                     io_ctx.get_reserved_space_bytes()
-                };
+                });
                 default_header.reserved_space = reserved_space_bytes;
                 self.set_reserved_space(reserved_space_bytes);
 

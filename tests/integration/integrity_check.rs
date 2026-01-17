@@ -1418,3 +1418,107 @@ fn test_integrity_check_multiple_tables_with_defaults(db: TempDatabase) {
         "Integrity check should pass with multiple tables and various DEFAULT types"
     );
 }
+
+#[turso_macros::test]
+fn test_reserved_bytes_set_before_page_allocation(db: TempDatabase) {
+    /// bug: previously, `set_reserved_bytes()` only updated the pager's cache, but
+    /// `allocate_page1()` read from IOContext which returned 0, causing pages to be
+    /// created with wrong `cell_content_area` and triggering integrity_check errors
+    use std::fs::File;
+    use std::io::{Read, Seek, SeekFrom};
+
+    const RESERVED_BYTES: u8 = 48;
+    // offset of reserved_space field in SQLite database header
+    const RESERVED_SPACE_OFFSET: u64 = 20;
+
+    let conn = db.connect_limbo();
+
+    // set reserved_bytes BEFORE any page allocation
+    // This is what the sync engine does for encrypted remotes
+    conn.set_reserved_bytes(RESERVED_BYTES).unwrap();
+
+    // trigger page 1 allocation via write transaction
+    // the bug was, this would read reserved_space from IOContext (0)
+    // instead of using the cached value (48)
+    conn.execute("BEGIN IMMEDIATE").unwrap();
+    conn.execute("COMMIT").unwrap();
+    conn.execute("CREATE TABLE test_table (id INTEGER PRIMARY KEY, data TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO test_table VALUES (1, 'yo v!')")
+        .unwrap();
+    checkpoint_database(&conn);
+
+    assert_eq!(
+        conn.get_reserved_bytes(),
+        Some(RESERVED_BYTES),
+        "Pager should have reserved_bytes={RESERVED_BYTES}"
+    );
+
+    // manually, verify reserved_space in the database header file, because why not
+    {
+        let mut file = File::open(&db.path).expect("Failed to open database file");
+        file.seek(SeekFrom::Start(RESERVED_SPACE_OFFSET)).unwrap();
+        let mut reserved_space_buf = [0u8; 1];
+        file.read_exact(&mut reserved_space_buf).unwrap();
+
+        assert_eq!(
+            reserved_space_buf[0], RESERVED_BYTES,
+            "Database header should have reserved_space={RESERVED_BYTES}, got {}",
+            reserved_space_buf[0]
+        );
+    }
+
+    let result = run_integrity_check(&conn);
+    assert_eq!(
+        result, "ok",
+        "Integrity check should pass when reserved_bytes is set before page allocation"
+    );
+}
+
+#[turso_macros::test]
+fn test_reserved_bytes_default(db: TempDatabase) {
+    use std::fs::File;
+    use std::io::{Read, Seek, SeekFrom};
+
+    const RESERVED_SPACE_OFFSET: u64 = 20;
+
+    // checksum feature reserves 8 bytes, otherwise 0
+    #[cfg(feature = "checksum")]
+    const EXPECTED_RESERVED_BYTES: u8 = 8;
+    #[cfg(not(feature = "checksum"))]
+    const EXPECTED_RESERVED_BYTES: u8 = 0;
+
+    let conn = db.connect_limbo();
+    conn.execute("BEGIN IMMEDIATE").unwrap();
+    conn.execute("COMMIT").unwrap();
+    conn.execute("CREATE TABLE test_table (id INTEGER PRIMARY KEY, data TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO test_table VALUES (1, 'test data')")
+        .unwrap();
+    checkpoint_database(&conn);
+
+    assert_eq!(
+        conn.get_reserved_bytes(),
+        Some(EXPECTED_RESERVED_BYTES),
+        "Pager should have reserved_bytes={EXPECTED_RESERVED_BYTES} by default"
+    );
+
+    {
+        let mut file = File::open(&db.path).expect("Failed to open database file");
+        file.seek(SeekFrom::Start(RESERVED_SPACE_OFFSET)).unwrap();
+        let mut reserved_space_buf = [0u8; 1];
+        file.read_exact(&mut reserved_space_buf).unwrap();
+
+        assert_eq!(
+            reserved_space_buf[0], EXPECTED_RESERVED_BYTES,
+            "Database header should have reserved_space={EXPECTED_RESERVED_BYTES} by default, got {}",
+            reserved_space_buf[0]
+        );
+    }
+
+    let result = run_integrity_check(&conn);
+    assert_eq!(
+        result, "ok",
+        "Integrity check should pass with default reserved_bytes"
+    );
+}
