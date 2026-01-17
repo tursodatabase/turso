@@ -184,8 +184,7 @@ impl CliDatabaseInstance {
             .spawn()
             .map_err(|e| BackendError::Execute(format!("failed to spawn tursodb: {}", e)))?;
 
-        // Prepend MVCC pragma if enabled (skip for readonly databases).
-        // FIXME: readonly default DB tests do not exercise MVCC code paths.
+        // Prepend MVCC pragma if enabled (skip for readonly databases; the generated readonly DBs are already in MVCC mode).
         let sql_to_execute = if self.mvcc && is_turso_cli && !self.readonly {
             format!("PRAGMA journal_mode = 'experimental_mvcc';\n{}", sql)
         } else {
