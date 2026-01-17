@@ -1365,52 +1365,12 @@ impl ImmutableRecord {
 
     /// Computes the header cache by parsing the record header once.
     fn compute_header_cache(&self) -> Result<CachedHeader> {
-        let payload = self.get_payload();
-        let (header_size, header_varint_len) = read_varint(payload)?;
-        let header_size = header_size as usize;
-
-        if unlikely(header_size > payload.len() || header_varint_len > payload.len()) {
-            return Err(LimboError::Corrupt(
-                "Payload too small for indicated header size".into(),
-            ));
-        }
-
-        let header = &payload[header_varint_len..header_size];
-        let data_start = header_size as u32;
-
-        let mut columns = Vec::new();
-        let mut header_pos = 0;
-        let mut data_offset: u32 = 0;
-
-        while header_pos < header.len() {
-            let (serial_type, bytes_read) = read_varint(&header[header_pos..])?;
-            header_pos += bytes_read;
-
-            columns.push((serial_type, data_offset));
-
-            // Calculate size of this column's data
-            let size = match serial_type {
-                0 => 0,                                              // NULL
-                1 => 1,                                              // I8
-                2 => 2,                                              // I16
-                3 => 3,                                              // I24
-                4 => 4,                                              // I32
-                5 => 6,                                              // I48
-                6 => 8,                                              // I64
-                7 => 8,                                              // F64
-                8 | 9 => 0,                                          // CONST_INT0, CONST_INT1
-                10 | 11 => 0,                                        // Reserved
-                n if n >= 12 && n & 1 == 0 => ((n - 12) / 2) as u32, // Blob
-                n if n >= 13 => ((n - 13) / 2) as u32,               // Text
-                _ => 0,
-            };
-            data_offset += size;
-        }
-
-        Ok(CachedHeader {
-            data_start,
-            columns,
-        })
+        let mut cache = CachedHeader {
+            data_start: 0,
+            columns: Vec::new(),
+        };
+        self.compute_header_cache_into(&mut cache)?;
+        Ok(cache)
     }
 
     /// Computes the header cache into an existing CachedHeader, reusing its Vec allocation.
@@ -1419,7 +1379,11 @@ impl ImmutableRecord {
         let (header_size, header_varint_len) = read_varint(payload)?;
         let header_size = header_size as usize;
 
-        if unlikely(header_size > payload.len() || header_varint_len > payload.len()) {
+        if unlikely(
+            header_size > payload.len()
+                || header_varint_len > payload.len()
+                || header_varint_len > header_size,
+        ) {
             return Err(LimboError::Corrupt(
                 "Payload too small for indicated header size".into(),
             ));
@@ -1427,13 +1391,19 @@ impl ImmutableRecord {
 
         let header = &payload[header_varint_len..header_size];
         cache.data_start = header_size as u32;
-        cache.columns.clear(); // Keep allocation
+        cache.columns.clear();
 
         let mut header_pos = 0;
         let mut data_offset: u32 = 0;
 
         while header_pos < header.len() {
-            let (serial_type, bytes_read) = read_varint(&header[header_pos..])?;
+            let (serial_type, bytes_read) = match read_varint(&header[header_pos..]) {
+                Ok(result) => result,
+                Err(e) => {
+                    cache.columns.clear();
+                    return Err(e);
+                }
+            };
             header_pos += bytes_read;
 
             cache.columns.push((serial_type, data_offset));
@@ -1452,7 +1422,7 @@ impl ImmutableRecord {
                 10 | 11 => 0,                                        // Reserved
                 n if n >= 12 && n & 1 == 0 => ((n - 12) / 2) as u32, // Blob
                 n if n >= 13 => ((n - 13) / 2) as u32,               // Text
-                _ => 0,
+                _ => unreachable!("all serial types covered"),
             };
             data_offset += size;
         }
@@ -1482,7 +1452,13 @@ impl ImmutableRecord {
         let (serial_type, data_offset) = *cache.columns.get(column)?;
         let payload = self.get_payload();
         let data_start = cache.data_start as usize;
-        let data = &payload[data_start + data_offset as usize..];
+        let data_pos = data_start + data_offset as usize;
+        if unlikely(data_pos > payload.len()) {
+            return Some(Err(LimboError::Corrupt(
+                "Data offset exceeds payload length".into(),
+            )));
+        }
+        let data = &payload[data_pos..];
 
         // Decode directly into register based on serial type
         match serial_type {
@@ -1555,14 +1531,7 @@ impl ImmutableRecord {
                 let val = f64::from_be_bytes([
                     data[0], data[1], data[2], data[3], data[4], data[5], data[6], data[7],
                 ]);
-                match dest {
-                    Register::Value(Value::Float(existing)) => {
-                        *existing = val;
-                    }
-                    _ => {
-                        *dest = Register::Value(Value::Float(val));
-                    }
-                }
+                dest.set_float(val);
             }
             // CONST_INT0
             8 => {
@@ -1585,15 +1554,7 @@ impl ImmutableRecord {
                 if unlikely(data.len() < len) {
                     return Some(Err(LimboError::Corrupt("Data too small for blob".into())));
                 }
-                let blob_data = &data[..len];
-                match dest {
-                    Register::Value(Value::Blob(existing_blob)) => {
-                        existing_blob.do_extend(&blob_data);
-                    }
-                    _ => {
-                        *dest = Register::Value(Value::Blob(blob_data.to_vec()));
-                    }
-                }
+                dest.set_blob(&data[..len]);
             }
             // TEXT (n >= 13 && n & 1 == 1)
             n if n >= 13 && n & 1 == 1 => {
@@ -1615,21 +1576,13 @@ impl ImmutableRecord {
                     // SAFETY: TEXT serial type contains valid UTF-8
                     unsafe { std::str::from_utf8_unchecked(text_data) }
                 };
-                match dest {
-                    Register::Value(Value::Text(existing_text)) => {
-                        existing_text.do_extend(&text_str);
-                    }
-                    _ => {
-                        *dest = Register::Value(Value::Text(Text::new(text_str.to_string())));
-                    }
-                }
+                dest.set_text(text_str);
             }
-            _ => {
-                mark_unlikely();
-                return Some(Err(LimboError::Corrupt(format!(
-                    "Invalid serial type: {serial_type}"
-                ))));
-            }
+            // All valid serial types are covered:
+            // 0-11: explicit cases above
+            // n >= 12 && even: BLOB
+            // n >= 13 && odd: TEXT
+            _ => unreachable!("all serial types covered"),
         }
 
         Some(Ok(()))
