@@ -1048,7 +1048,7 @@ impl Value {
         for val in registers {
             match val {
                 Value::Null => continue,
-                Value::Blob(_) => todo!("TODO concat blob"),
+                // Blobs are converted to text using lossy UTF-8 conversion (via Display)
                 v => result.push_str(&format!("{v}")),
             }
         }
@@ -1064,12 +1064,16 @@ impl Value {
             .next()
             .expect("registers should have at least one element after length check")
         {
-            Value::Null | Value::Blob(_) => return Value::Null,
+            Value::Null => return Value::Null,
+            // Blobs are converted to text using lossy UTF-8 conversion (via Display)
             v => format!("{v}"),
         };
 
         let parts = registers.filter_map(|val| match val {
-            Value::Text(_) | Value::Integer(_) | Value::Float(_) => Some(format!("{val}")),
+            // Blobs are converted to text using lossy UTF-8 conversion (via Display)
+            Value::Text(_) | Value::Integer(_) | Value::Float(_) | Value::Blob(_) => {
+                Some(format!("{val}"))
+            }
             _ => None,
         });
 
