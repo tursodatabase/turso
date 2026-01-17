@@ -40,7 +40,7 @@ Turso Database is an in-process SQL database written in Rust, compatible with SQ
 * **SQLite compatibility** for SQL dialect, file formats, and the C API [see [document](COMPAT.md) for details]
 * **Change data capture (CDC)** for real-time tracking of database changes.
 * **Multi-language support** for
-  * [Go](https://github.com/tursodatabase/turso-go)
+  * [Go](bindings/go)
   * [JavaScript](bindings/javascript)
   * [Java](bindings/java)
   * [Python](bindings/python)
@@ -175,15 +175,15 @@ print(res.fetchone())
 <br>
 
 ```console
-go get github.com/tursodatabase/turso-go
-go install github.com/tursodatabase/turso-go
+go get turso.tech/database/tursogo
+go install turso.tech/database/tursogo
 ```
 
 Example usage:
 ```go
 import (
     "database/sql"
-    _ "github.com/tursodatabase/turso-go"
+    _ "turso.tech/database/tursogo"
 )
 
 conn, _ = sql.Open("turso", "sqlite.db")
