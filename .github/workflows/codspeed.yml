@@ -67,7 +67,7 @@ jobs:
         run: make codspeed-build-bench-exclude-tpc-h
 
       - name: Run benchmarks (excluding TPC-H)
-        uses: CodSpeedHQ/action@v4.5.2
+        uses: CodSpeedHQ/action@v4.7.0
         with:
           mode: walltime
           run: cargo codspeed run
@@ -119,7 +119,7 @@ jobs:
   #       run: cargo codspeed build --features codspeed --bench tpc_h_benchmark 
 
   #     - name: Run TPC-H benchmark
-  #       uses: CodSpeedHQ/action@v4.5.2
+  #       uses: CodSpeedHQ/action@v4.7.0
   #       with:
   #         mode: simulation
   #         run: cargo codspeed run --bench tpc_h_benchmark
