@@ -57,7 +57,7 @@ use smallvec::SmallVec;
 use crate::{
     storage::pager::Pager,
     translate::plan::ResultSetColumn,
-    types::{AggContext, Cursor, ImmutableRecord, Value},
+    types::{AggContext, Cursor, Extendable, ImmutableRecord, Text, Value},
     vdbe::{builder::CursorType, insn::Insn},
 };
 
@@ -249,6 +249,48 @@ impl Register {
             }
             _ => {
                 *self = Register::Value(Value::Integer(val));
+            }
+        }
+    }
+
+    #[inline(always)]
+    /// Sets the value of the register to a float,
+    /// reusing the existing Register::Value(Value::Float(_)) if possible.
+    pub fn set_float(&mut self, val: f64) {
+        match self {
+            Register::Value(Value::Float(existing)) => {
+                *existing = val;
+            }
+            _ => {
+                *self = Register::Value(Value::Float(val));
+            }
+        }
+    }
+
+    #[inline(always)]
+    /// Sets the value of the register to a blob,
+    /// reusing the existing allocation if possible via do_extend.
+    pub fn set_blob(&mut self, data: &[u8]) {
+        match self {
+            Register::Value(Value::Blob(existing)) => {
+                existing.do_extend(&data);
+            }
+            _ => {
+                *self = Register::Value(Value::Blob(data.to_vec()));
+            }
+        }
+    }
+
+    #[inline(always)]
+    /// Sets the value of the register to a text value,
+    /// reusing the existing allocation if possible via do_extend.
+    pub fn set_text(&mut self, s: &str) {
+        match self {
+            Register::Value(Value::Text(existing)) => {
+                existing.do_extend(&s);
+            }
+            _ => {
+                *self = Register::Value(Value::Text(Text::new(s.to_string())));
             }
         }
     }
@@ -1585,8 +1627,6 @@ impl Row {
         self.count == 0
     }
 }
-
-
 
 /// Shuttle tests for validating the `unsafe impl Send + Sync for ProgramState` safety claims.
 ///
