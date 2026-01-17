@@ -66,7 +66,7 @@ jobs:
           RUSTC_WRAPPER: "sccache"
           LOCAL_SYNC_SERVER: "../../target/debug/tursodb"
         run: cargo nextest run --workspace --all-features --locked --no-fail-fast -E 'not test(/^fuzz_tests::/)' --failure-output=final
-        timeout-minutes: 20
+        timeout-minutes: ${{ matrix.os == 'windows-latest' && 60 || 20 }}
       - name: Test integrity_check corruption and short reads (no checksum feature because it interferes with the test)
         env:
           SCCACHE_GHA_ENABLED: "true"
