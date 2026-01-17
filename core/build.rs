@@ -14,14 +14,17 @@ fn main() {
     // where the git directory lives elsewhere (e.g., ../.git/worktrees/my-worktree).
     // Silently ignored if git unavailable (e.g., building from tarball) - that's fine,
     // we'll just rebuild every time which is the safe default.
-    if let Ok(output) = Command::new("git").args(["rev-parse", "--git-dir"]).output() {
+    if let Ok(output) = Command::new("git")
+        .args(["rev-parse", "--git-dir"])
+        .output()
+    {
         if output.status.success() {
             if let Ok(git_dir) = String::from_utf8(output.stdout) {
                 let git_dir = git_dir.trim();
                 // HEAD changes on checkout/switch
-                println!("cargo::rerun-if-changed={}/HEAD", git_dir);
+                println!("cargo::rerun-if-changed={git_dir}/HEAD");
                 // The ref file (e.g., refs/heads/main) changes on commit
-                if let Ok(head_content) = std::fs::read_to_string(format!("{}/HEAD", git_dir)) {
+                if let Ok(head_content) = std::fs::read_to_string(format!("{git_dir}/HEAD")) {
                     if let Some(ref_path) = head_content.strip_prefix("ref: ") {
                         println!("cargo::rerun-if-changed={}/{}", git_dir, ref_path.trim());
                     }
@@ -52,7 +55,7 @@ fn main() {
         .map(|s| s.trim().to_string());
 
     let git_hash_code = match git_hash {
-        Some(hash) => format!("pub const GIT_COMMIT_HASH: Option<&str> = Some(\"{}\");", hash),
+        Some(hash) => format!("pub const GIT_COMMIT_HASH: Option<&str> = Some(\"{hash}\");"),
         None => "pub const GIT_COMMIT_HASH: Option<&str> = None;".to_string(),
     };
 

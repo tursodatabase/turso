@@ -1919,7 +1919,7 @@ mod tests {
                 // triggered by cacheflush on insertions. the pattern will trigger a checkpoint when the wal has > 1000 frames,
                 // so it will be triggered but will no longer be triggered on each consecutive
                 // write. here we can assert that we have > 1500 rows.
-                assert!(count > 1500, "count: {}", count);
+                assert!(count > 1500, "count: {count}");
                 assert_eq!(sqlite3_step(stmt), SQLITE_DONE);
                 assert_eq!(sqlite3_finalize(stmt), SQLITE_OK);
             }
