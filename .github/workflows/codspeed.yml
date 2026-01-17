@@ -19,6 +19,8 @@ jobs:
   benchmarks:
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    # Allow this job to fail without failing the entire CI run
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v4
 

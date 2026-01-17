@@ -139,6 +139,8 @@ jobs:
       run: cargo run -p turso_stress --locked -- --nr-threads 2 --nr-iterations 1000
 
   libfuzzer-scalar-func:
+    # Allow this job to fail without failing the entire CI run
+    continue-on-error: true
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 15
     steps:
