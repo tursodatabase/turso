@@ -45,7 +45,7 @@ rustyline = { version = "15.0.0", default-features = true, features = [
     "derive",
 ] }
 shlex = "1.3.0"
-syntect = { git = "https://github.com/trishume/syntect.git", rev = "64644ffe064457265cbcee12a0c1baf9485ba6ee" }
+syntect = { git = "https://github.com/trishume/syntect.git", rev = "64644ffe064457265cbcee12a0c1baf9485ba6ee", default-features = false, features = ["default-fancy"] }
 tracing = { workspace = true }
 tracing-appender = { workspace = true }
 tracing-subscriber = { workspace = true, features = ["env-filter"] }
@@ -72,5 +72,5 @@ mimalloc = ["dep:mimalloc"]
 fts = ["turso_core/fts"]
 
 [build-dependencies]
-syntect = { git = "https://github.com/trishume/syntect.git", rev = "64644ffe064457265cbcee12a0c1baf9485ba6ee" }
+syntect = { git = "https://github.com/trishume/syntect.git", rev = "64644ffe064457265cbcee12a0c1baf9485ba6ee", default-features = false, features = ["default-fancy"] }
 include_dir = "0.7"
