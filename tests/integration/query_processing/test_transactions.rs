@@ -218,7 +218,7 @@ fn test_deferred_fk_violation_rollback_in_autocommit(tmp_db: TempDatabase) {
     // This insert should fail because parent(1) doesn't exist
     // and the deferred FK violation should be caught at statement end in autocommit mode
     let result = conn.execute("INSERT INTO child VALUES(1,1)");
-    assert!(matches!(result, Err(LimboError::Constraint(_))));
+    assert!(matches!(result, Err(LimboError::ForeignKeyConstraint(_))));
 
     // Do a truncating checkpoint
     conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").unwrap();
@@ -1575,4 +1575,297 @@ fn test_wal_savepoint_rollback_on_constraint_violation() {
     let stmt = conn.query("SELECT COUNT(*) FROM t").unwrap().unwrap();
     let row = helper_read_single_row(stmt);
     assert_eq!(row[0], Value::Integer(1001));
+}
+
+#[turso_macros::test]
+/// INSERT OR FAIL should keep changes made by the statement before the error.
+/// Unlike ABORT (the default), FAIL does not roll back successful inserts within the same statement.
+fn test_insert_or_fail_keeps_prior_changes(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'first'), (2, 'second')")
+        .unwrap();
+
+    // INSERT OR FAIL with multiple rows - (3, 'third') succeeds, then (1, 'conflict') fails
+    let result = conn.execute("INSERT OR FAIL INTO t VALUES (3, 'third'), (1, 'conflict')");
+    assert!(matches!(result, Err(LimboError::Constraint(_))));
+
+    // Verify that row 3 was inserted (FAIL keeps prior changes)
+    let stmt = conn.query("SELECT id FROM t ORDER BY id").unwrap().unwrap();
+    let rows = helper_read_all_rows(stmt);
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Integer(1)],
+            vec![Value::Integer(2)],
+            vec![Value::Integer(3)], // This row should exist due to FAIL semantics
+        ]
+    );
+}
+
+#[turso_macros::test]
+/// INSERT OR ABORT (default) should rollback all changes from the statement on error.
+fn test_insert_or_abort_rolls_back_statement(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'first'), (2, 'second')")
+        .unwrap();
+
+    // INSERT OR ABORT with multiple rows - (3, 'third') would succeed, but (1, 'conflict') fails
+    // and rolls back the entire statement
+    let result = conn.execute("INSERT OR ABORT INTO t VALUES (3, 'third'), (1, 'conflict')");
+    assert!(matches!(result, Err(LimboError::Constraint(_))));
+
+    // Verify that row 3 was NOT inserted (ABORT rolls back statement)
+    let stmt = conn.query("SELECT id FROM t ORDER BY id").unwrap().unwrap();
+    let rows = helper_read_all_rows(stmt);
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Integer(1)],
+            vec![Value::Integer(2)],
+            // Row 3 should NOT be here due to ABORT semantics
+        ]
+    );
+}
+
+#[turso_macros::test]
+/// INSERT OR ROLLBACK in a transaction should rollback the entire transaction on error.
+fn test_insert_or_rollback_rolls_back_transaction(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'outside')").unwrap();
+
+    // Start a transaction and insert a row
+    conn.execute("BEGIN").unwrap();
+    conn.execute("INSERT INTO t VALUES (2, 'inside')").unwrap();
+
+    // INSERT OR ROLLBACK causes the entire transaction to roll back
+    let result = conn.execute("INSERT OR ROLLBACK INTO t VALUES (1, 'conflict')");
+    assert!(matches!(result, Err(LimboError::Constraint(_))));
+
+    // Verify that row 2 was rolled back (ROLLBACK affects entire transaction)
+    let stmt = conn.query("SELECT id FROM t ORDER BY id").unwrap().unwrap();
+    let rows = helper_read_all_rows(stmt);
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Integer(1)], // Only the original row should remain
+        ]
+    );
+
+    // Verify we're back in autocommit mode
+    assert!(conn.get_auto_commit());
+}
+
+#[turso_macros::test]
+/// INSERT OR ROLLBACK with unique constraint in transaction should rollback the entire transaction.
+fn test_insert_or_rollback_unique_constraint_in_transaction(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT UNIQUE)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'alice')").unwrap();
+
+    // Start a transaction
+    conn.execute("BEGIN").unwrap();
+    conn.execute("INSERT INTO t VALUES (2, 'bob')").unwrap();
+
+    // INSERT OR ROLLBACK with unique constraint violation
+    let result = conn.execute("INSERT OR ROLLBACK INTO t VALUES (3, 'alice')");
+    assert!(matches!(result, Err(LimboError::Constraint(_))));
+
+    // Verify that row 2 (bob) was rolled back
+    let stmt = conn
+        .query("SELECT name FROM t ORDER BY id")
+        .unwrap()
+        .unwrap();
+    let rows = helper_read_all_rows(stmt);
+    assert_eq!(rows, vec![vec![Value::Text("alice".into())],]);
+
+    // Verify we're back in autocommit mode
+    assert!(conn.get_auto_commit());
+}
+
+#[turso_macros::test]
+/// INSERT OR ROLLBACK in autocommit mode should behave like ABORT (single statement = transaction).
+fn test_insert_or_rollback_in_autocommit(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val TEXT)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'first')").unwrap();
+
+    // INSERT OR ROLLBACK in autocommit mode
+    let result = conn.execute("INSERT OR ROLLBACK INTO t VALUES (1, 'conflict')");
+    assert!(matches!(result, Err(LimboError::Constraint(_))));
+
+    // Verify the original row is still there
+    let stmt = conn
+        .query("SELECT val FROM t WHERE id = 1")
+        .unwrap()
+        .unwrap();
+    let rows = helper_read_all_rows(stmt);
+    assert_eq!(rows, vec![vec![Value::Text("first".into())],]);
+}
+
+#[turso_macros::test]
+/// INSERT OR FAIL with unique constraint should keep successfully inserted rows.
+fn test_insert_or_fail_unique_constraint(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT UNIQUE)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 'alice'), (2, 'bob')")
+        .unwrap();
+
+    // INSERT OR FAIL - (3, 'charlie') succeeds, then (4, 'alice') fails
+    let result = conn.execute("INSERT OR FAIL INTO t VALUES (3, 'charlie'), (4, 'alice')");
+    assert!(matches!(result, Err(LimboError::Constraint(_))));
+
+    // Verify charlie was inserted (FAIL keeps prior changes)
+    let stmt = conn
+        .query("SELECT name FROM t ORDER BY id")
+        .unwrap()
+        .unwrap();
+    let rows = helper_read_all_rows(stmt);
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Text("alice".into())],
+            vec![Value::Text("bob".into())],
+            vec![Value::Text("charlie".into())], // This should exist due to FAIL
+        ]
+    );
+}
+
+#[turso_macros::test]
+/// UPDATE OR FAIL should keep changes made by the statement before the error.
+/// Unlike ABORT (the default), FAIL does not roll back successful updates within the same statement.
+fn test_update_or_fail_keeps_prior_changes(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER UNIQUE)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 10), (2, 20)")
+        .unwrap();
+
+    // UPDATE OR FAIL - try to set val=20 which conflicts with id=2
+    let result = conn.execute("UPDATE OR FAIL t SET val = 20 WHERE id = 1");
+    assert!(matches!(result, Err(LimboError::Constraint(_))));
+
+    // Verify original values (single row update, so nothing before the error to keep)
+    let stmt = conn
+        .query("SELECT id, val FROM t ORDER BY id")
+        .unwrap()
+        .unwrap();
+    let rows = helper_read_all_rows(stmt);
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Integer(1), Value::Integer(10)],
+            vec![Value::Integer(2), Value::Integer(20)],
+        ]
+    );
+}
+
+#[turso_macros::test]
+/// UPDATE OR ABORT (default) should rollback all changes from the statement on error.
+fn test_update_or_abort_rolls_back_statement(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER UNIQUE)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 10), (2, 20)")
+        .unwrap();
+
+    // UPDATE OR ABORT - try to set val=20 which conflicts with id=2
+    let result = conn.execute("UPDATE OR ABORT t SET val = 20 WHERE id = 1");
+    assert!(matches!(result, Err(LimboError::Constraint(_))));
+
+    // Verify original values (ABORT rolls back statement)
+    let stmt = conn
+        .query("SELECT id, val FROM t ORDER BY id")
+        .unwrap()
+        .unwrap();
+    let rows = helper_read_all_rows(stmt);
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Integer(1), Value::Integer(10)],
+            vec![Value::Integer(2), Value::Integer(20)],
+        ]
+    );
+}
+
+#[turso_macros::test]
+/// UPDATE OR ROLLBACK in a transaction should rollback the entire transaction on error.
+fn test_update_or_rollback_rolls_back_transaction(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER UNIQUE)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)")
+        .unwrap();
+
+    // Start a transaction and make some changes
+    conn.execute("BEGIN").unwrap();
+    conn.execute("UPDATE t SET val = 100 WHERE id = 1").unwrap();
+
+    // UPDATE OR ROLLBACK causes the entire transaction to roll back
+    let result = conn.execute("UPDATE OR ROLLBACK t SET val = 30 WHERE id = 2");
+    assert!(matches!(result, Err(LimboError::Constraint(_))));
+
+    // Verify that all changes were rolled back (including the first UPDATE)
+    let stmt = conn
+        .query("SELECT id, val FROM t ORDER BY id")
+        .unwrap()
+        .unwrap();
+    let rows = helper_read_all_rows(stmt);
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Integer(1), Value::Integer(10)], // Rolled back
+            vec![Value::Integer(2), Value::Integer(20)], // Unchanged
+            vec![Value::Integer(3), Value::Integer(30)], // Unchanged
+        ]
+    );
+
+    // Verify we're back in autocommit mode
+    assert!(conn.get_auto_commit());
+}
+
+#[turso_macros::test]
+/// UPDATE OR ROLLBACK in autocommit mode should work like ABORT.
+fn test_update_or_rollback_in_autocommit(tmp_db: TempDatabase) {
+    let conn = tmp_db.connect_limbo();
+
+    conn.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, val INTEGER UNIQUE)")
+        .unwrap();
+    conn.execute("INSERT INTO t VALUES (1, 10), (2, 20)")
+        .unwrap();
+
+    // UPDATE OR ROLLBACK in autocommit mode
+    let result = conn.execute("UPDATE OR ROLLBACK t SET val = 20 WHERE id = 1");
+    assert!(matches!(result, Err(LimboError::Constraint(_))));
+
+    // Verify original values
+    let stmt = conn
+        .query("SELECT id, val FROM t ORDER BY id")
+        .unwrap()
+        .unwrap();
+    let rows = helper_read_all_rows(stmt);
+    assert_eq!(
+        rows,
+        vec![
+            vec![Value::Integer(1), Value::Integer(10)],
+            vec![Value::Integer(2), Value::Integer(20)],
+        ]
+    );
 }

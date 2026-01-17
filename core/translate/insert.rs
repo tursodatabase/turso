@@ -1300,22 +1300,15 @@ fn bind_insert(
             upsert = upsert_opt.take();
         }
     }
-    match on_conflict {
-        ResolveType::Ignore => {
-            program.set_resolve_type(ResolveType::Ignore);
-            upsert.replace(Box::new(ast::Upsert {
-                do_clause: UpsertDo::Nothing,
-                index: None,
-                next: None,
-            }));
-        }
-        ResolveType::Abort | ResolveType::Replace => {
-            // Abort is the default conflict resolution strategy for INSERT in SQLite,
-            // and we implement Replace.
-        }
-        _ => {
-            crate::bail_parse_error!("INSERT OR {} is not yet supported", on_conflict.to_string());
-        }
+    if let ResolveType::Ignore = on_conflict {
+        program.set_resolve_type(ResolveType::Ignore);
+        upsert.replace(Box::new(ast::Upsert {
+            do_clause: UpsertDo::Nothing,
+            index: None,
+            next: None,
+        }));
+    } else {
+        program.set_resolve_type(on_conflict);
     }
     while let Some(mut upsert_opt) = upsert.take() {
         if let UpsertDo::Set {

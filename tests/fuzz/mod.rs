@@ -1455,10 +1455,10 @@ mod fuzz_tests {
                         let b = rng.random_range(-5..=25);
                         format!(
                             "INSERT {} INTO p VALUES({id}, {a}, {b})",
-                            if rng.random_bool(0.4) {
+                            if rng.random_bool(0.5) {
                                 "OR REPLACE "
                             } else {
-                                ""
+                                "OR ROLLBACK"
                             }
                         )
                     }
@@ -1498,7 +1498,7 @@ mod fuzz_tests {
                             if rng.random_bool(0.4) {
                                 "OR REPLACE "
                             } else {
-                                ""
+                                "OR FAIL"
                             }
                         )
                     }
@@ -6885,56 +6885,76 @@ mod fuzz_tests {
                     // UPDATE OR IGNORE - set y to existing value (should skip)
                     let existing_y = rng.random_range(1..=20) * 10;
                     let target_x = rng.random_range(1..=20);
-                    format!("UPDATE OR IGNORE t1 SET y = {existing_y} WHERE x = {target_x};",)
+                    format!("UPDATE OR IGNORE t1 SET y = {existing_y} WHERE x = {target_x};")
                 }
                 1 => {
                     // UPDATE OR REPLACE - set y to existing value (should delete conflicting row)
                     let existing_y = rng.random_range(1..=20) * 10;
                     let target_x = rng.random_range(1..=20);
-                    format!("UPDATE OR REPLACE t1 SET y = {existing_y} WHERE x = {target_x};",)
+                    format!("UPDATE OR REPLACE t1 SET y = {existing_y} WHERE x = {target_x};")
                 }
                 2 => {
                     // UPDATE OR IGNORE with expression (y - 10 may cause conflict)
                     let target_x = rng.random_range(2..=20); // avoid x=1 since y-10=0
-                    format!("UPDATE OR IGNORE t1 SET y = y - 10 WHERE x = {target_x};",)
+                    format!("UPDATE OR IGNORE t1 SET y = y - 10 WHERE x = {target_x};")
                 }
                 3 => {
                     // UPDATE OR REPLACE with expression (y - 10 may cause conflict)
                     let target_x = rng.random_range(2..=20);
-                    format!("UPDATE OR REPLACE t1 SET y = y - 10 WHERE x = {target_x};",)
+                    format!("UPDATE OR REPLACE t1 SET y = y - 10 WHERE x = {target_x};")
                 }
                 4 => {
                     // UPDATE OR IGNORE - multiple rows (WHERE x > ...)
                     let min_x = rng.random_range(1..=15);
                     let new_y = rng.random_range(-100..100);
-                    format!("UPDATE OR IGNORE t1 SET y = {new_y} WHERE x > {min_x};",)
+                    format!("UPDATE OR IGNORE t1 SET y = {new_y} WHERE x > {min_x};")
                 }
                 5 => {
                     // UPDATE OR REPLACE with no conflict (new unique value)
                     let target_x = rng.random_range(1..=20);
                     let new_y = rng.random_range(1000..2000); // unlikely to conflict
-                    format!("UPDATE OR REPLACE t1 SET y = {new_y} WHERE x = {target_x};",)
+                    format!("UPDATE OR REPLACE t1 SET y = {new_y} WHERE x = {target_x};")
                 }
                 6 => {
                     // UPDATE OR IGNORE with NOT NULL violation
                     let target_x = rng.random_range(1..=20);
-                    format!("UPDATE OR IGNORE t1 SET z = NULL WHERE x = {target_x};",)
+                    format!("UPDATE OR IGNORE t1 SET z = NULL WHERE x = {target_x};")
                 }
                 7 => {
                     // UPDATE OR REPLACE with NOT NULL violation (should use default)
                     let target_x = rng.random_range(1..=20);
-                    format!("UPDATE OR REPLACE t1 SET z = NULL WHERE x = {target_x};",)
+                    format!("UPDATE OR REPLACE t1 SET z = NULL WHERE x = {target_x};")
                 }
                 8 => {
                     // Regular UPDATE (no conflict clause) with safe value
                     let target_x = rng.random_range(1..=20);
                     let new_z = rng.random_range(1..500);
-                    format!("UPDATE t1 SET z = {new_z} WHERE x = {target_x};",)
+                    format!("UPDATE t1 SET z = {new_z} WHERE x = {target_x};")
                 }
                 9 => {
                     // UPDATE OR REPLACE with multiple rows, expression may cause cascading conflicts
                     let min_x = rng.random_range(5..=15);
-                    format!("UPDATE OR REPLACE t1 SET y = y - 10 WHERE x > {min_x};",)
+                    format!("UPDATE OR REPLACE t1 SET y = y - 10 WHERE x > {min_x};")
+                }
+                10 => {
+                    // UPDATE OR FAIL with existing value
+                    let min_x = rng.random_range(1..=15);
+                    format!("UPDATE OR FAIL t1 SET y = 10 WHERE x > {min_x};")
+                }
+                11 => {
+                    // UPDATE OR ROLLBACK with existing value (should error)
+                    let min_x = rng.random_range(1..=15);
+                    format!("UPDATE OR ROLLBACK t1 SET y = 10 WHERE x > {min_x};")
+                }
+                12 => {
+                    // UPDATE OR FAIL with safe value
+                    let value = rng.random_range(1000..2000);
+                    format!("UPDATE OR FAIL t1 SET y = y + 1 WHERE x <= {value};")
+                }
+                13 => {
+                    // UPDATE OR ROLLBACK with safe value
+                    let value = rng.random_range(1000..2000);
+                    format!("UPDATE OR ROLLBACK t1 SET y = y + 1 WHERE x <= {value};")
                 }
                 _ => unreachable!(),
             };

@@ -24,7 +24,7 @@ use super::plan::{
 };
 use super::select::emit_simple_count;
 use super::subquery::emit_from_clause_subqueries;
-use crate::error::SQLITE_CONSTRAINT_PRIMARYKEY;
+use crate::error::{SQLITE_CONSTRAINT_PRIMARYKEY, SQLITE_CONSTRAINT_UNIQUE};
 use crate::function::Func;
 use crate::schema::{BTreeTable, Column, Index, IndexColumn, Schema, Table, ROWID_SENTINEL};
 use crate::translate::compound_select::emit_program_for_compound_select;
@@ -1924,22 +1924,7 @@ fn emit_program_for_update(
     mut plan: UpdatePlan,
     after: impl FnOnce(&mut ProgramBuilder),
 ) -> Result<()> {
-    // Handle conflict resolution strategy
-    let or_conflict = plan.or_conflict.unwrap_or(ResolveType::Abort);
-    match or_conflict {
-        ResolveType::Ignore => {
-            program.set_resolve_type(ResolveType::Ignore);
-        }
-        ResolveType::Replace => {
-            program.set_resolve_type(ResolveType::Replace);
-        }
-        ResolveType::Abort => {
-            // Default behavior
-        }
-        ResolveType::Rollback | ResolveType::Fail => {
-            bail_parse_error!("UPDATE OR {} is not yet supported", or_conflict.to_string());
-        }
-    }
+    program.set_resolve_type(plan.or_conflict.unwrap_or(ResolveType::Abort));
 
     let mut t_ctx = TranslateCtx::new(
         program,
@@ -2104,7 +2089,7 @@ fn emit_program_for_update(
     // conflicting row, we must delete from all indexes, not just those being updated.
     // We construct this AFTER open_loop so we can determine which index is used for
     // iteration and reuse that cursor instead of opening a new one.
-    let all_index_cursors = if matches!(or_conflict, ResolveType::Replace) {
+    let all_index_cursors = if matches!(program.resolve_type, ResolveType::Replace) {
         let table_name = target_table.table.get_name();
         let all_indexes = resolver.schema.get_indices(table_name);
         let source_table = plan
@@ -2175,7 +2160,6 @@ fn emit_program_for_update(
         iteration_cursor_id,
         target_table_cursor_id,
         target_table,
-        or_conflict,
     )?;
 
     // Close the main loop
@@ -2218,9 +2202,9 @@ fn emit_update_column_values<'a>(
     cdc_updates_register: Option<usize>,
     t_ctx: &mut TranslateCtx<'a>,
     skip_set_clauses: bool,
-    or_conflict: ResolveType,
     skip_row_label: BranchOffset,
 ) -> crate::Result<()> {
+    let or_conflict = program.resolve_type;
     if has_direct_rowid_update {
         if let Some((_, expr)) = set_clauses.iter().find(|(i, _)| *i == ROWID_SENTINEL) {
             if !skip_set_clauses {
@@ -2439,8 +2423,8 @@ fn emit_update_insns<'a>(
     iteration_cursor_id: usize,
     target_table_cursor_id: usize,
     target_table: Arc<JoinedTable>,
-    or_conflict: ResolveType,
 ) -> crate::Result<()> {
+    let or_conflict = program.resolve_type;
     let internal_id = target_table.internal_id;
     // Copy loop labels early to avoid borrow conflicts with mutable t_ctx borrow later
     let loop_labels = *t_ctx
@@ -2592,7 +2576,6 @@ fn emit_update_insns<'a>(
         cdc_updates_register,
         t_ctx,
         skip_set_clauses,
-        or_conflict,
         skip_row_label,
     )?;
 
@@ -2740,7 +2723,6 @@ fn emit_update_insns<'a>(
                 cdc_updates_register,
                 t_ctx,
                 skip_set_clauses,
-                or_conflict,
                 skip_row_label,
             )?;
         }
@@ -2798,10 +2780,14 @@ fn emit_update_insns<'a>(
         }
     }
 
-    // For IGNORE mode, we need to do a preflight check for unique constraint violations
-    // BEFORE deleting any old index entries. This ensures that if we skip the row due to
-    // a conflict, we don't corrupt the row by partially deleting index entries.
-    if matches!(or_conflict, ResolveType::Ignore) {
+    // For IGNORE, FAIL, and ROLLBACK modes, we need to do a preflight check for unique
+    // constraint violations BEFORE deleting any old index entries. This ensures that:
+    // - IGNORE: We can skip the row without corrupting it by partially deleting index entries
+    // - FAIL/ROLLBACK: We can halt without partial state (index deleted but not re-inserted)
+    if matches!(
+        or_conflict,
+        ResolveType::Ignore | ResolveType::Fail | ResolveType::Rollback
+    ) {
         let rowid_reg = rowid_set_clause_reg.unwrap_or(beg);
         for (index, (idx_cursor_id, _record_reg)) in indexes_to_update.iter().zip(index_cursors) {
             if !index.unique {
@@ -2869,15 +2855,40 @@ fn emit_update_insns<'a>(
                 collation: program.curr_collation(),
             });
 
-            // Conflict with a different row - for IGNORE, skip this row's update
-            program.emit_insn(Insn::Goto {
-                target_pc: skip_row_label,
-            });
+            // Conflict with a different row - handle based on conflict resolution mode
+            match or_conflict {
+                ResolveType::Ignore => {
+                    // Skip this row's update and continue with the next row
+                    program.emit_insn(Insn::Goto {
+                        target_pc: skip_row_label,
+                    });
+                }
+                ResolveType::Fail | ResolveType::Rollback => {
+                    // Halt with UNIQUE constraint error
+                    let column_names = index.columns.iter().enumerate().fold(
+                        String::with_capacity(50),
+                        |mut accum, (idx, col)| {
+                            if idx > 0 {
+                                accum.push_str(", ");
+                            }
+                            accum.push_str(table_name);
+                            accum.push('.');
+                            accum.push_str(&col.name);
+                            accum
+                        },
+                    );
+                    program.emit_insn(Insn::Halt {
+                        err_code: SQLITE_CONSTRAINT_UNIQUE,
+                        description: column_names,
+                    });
+                }
+                _ => unreachable!("Only IGNORE, FAIL, and ROLLBACK should reach preflight check"),
+            }
 
             program.preassign_label_to_next_insn(no_conflict_label);
         }
 
-        // Also check for rowid conflict in preflight for IGNORE mode
+        // Also check for rowid conflict in preflight
         if has_user_provided_rowid {
             let target_reg = rowid_set_clause_reg.unwrap();
             let no_rowid_conflict_label = program.allocate_label();
@@ -2898,10 +2909,37 @@ fn emit_update_insns<'a>(
                 target_pc: no_rowid_conflict_label,
             });
 
-            // Conflict found - skip this row's update
-            program.emit_insn(Insn::Goto {
-                target_pc: skip_row_label,
-            });
+            // Conflict found - handle based on conflict resolution mode
+            match or_conflict {
+                ResolveType::Ignore => {
+                    // Skip this row's update and continue with the next row
+                    program.emit_insn(Insn::Goto {
+                        target_pc: skip_row_label,
+                    });
+                }
+                ResolveType::Fail | ResolveType::Rollback => {
+                    // Halt with PRIMARY KEY constraint error
+                    let description = if let Some(idx) = rowid_alias_index {
+                        String::from(table_name)
+                            + "."
+                            + target_table
+                                .table
+                                .columns()
+                                .get(idx)
+                                .expect("column to exist")
+                                .name
+                                .as_ref()
+                                .map_or("", |v| v)
+                    } else {
+                        String::from(table_name) + ".rowid"
+                    };
+                    program.emit_insn(Insn::Halt {
+                        err_code: SQLITE_CONSTRAINT_PRIMARYKEY,
+                        description,
+                    });
+                }
+                _ => unreachable!("Only IGNORE, FAIL, and ROLLBACK should reach preflight check"),
+            }
 
             program.preassign_label_to_next_insn(no_rowid_conflict_label);
         }

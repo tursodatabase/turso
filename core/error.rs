@@ -45,6 +45,10 @@ pub enum LimboError {
     InvalidFormatter(String),
     #[error("Runtime error: {0}")]
     Constraint(String),
+    #[error("Runtime error: {0}")]
+    /// We need to specify for ROLLBACK|FAIL resolve types when to roll the tx back
+    /// so instead of matching on the string, we introduce a specific ForeignKeyConstraint error
+    ForeignKeyConstraint(String),
     #[error("Extension error: {0}")]
     ExtensionError(String),
     #[error("Runtime error: integer overflow")]
