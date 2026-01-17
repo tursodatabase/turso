@@ -113,7 +113,7 @@ opt-level = 3
 
 [profile.release]
 debug = "line-tables-only"
-codegen-units = 16
+codegen-units = 4
 panic = "abort"
 lto = "thin"
 
